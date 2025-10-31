@@ -1,0 +1,19 @@
+{
+  "dsl_model_id": "typhoon",
+  "dsl_version": "1.0.0",
+  "config_hash": "df4058fa674bd9f841ab79cab43dcc51db81a2f32c295b86be4ca892f6cfe565",
+  "module_name": "typhoon",
+  "operation_count": 2,
+  "issues": [
+    {
+      "code": "NUMERICAL_FIDELITY_REVIEW",
+      "severity": "warning",
+      "message": "Operation requires numerical fidelity review before deploying to production.",
+      "location": {
+        "index": 5,
+        "statement": "STEP compute pressure !REQUIRES_NUMERICS"
+      }
+    }
+  ],
+  "metadata": {}
+}

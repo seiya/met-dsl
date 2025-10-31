@@ -1,0 +1,12 @@
+module {{ module_name }}
+  implicit none
+contains
+{% for op in operations %}
+  subroutine op_{{ loop.index0 }}()
+    ! {{ op.statement }}
+{% if op.requires_numerical_fidelity %}
+    ! REVIEW: Numerical fidelity required.
+{% endif %}
+  end subroutine op_{{ loop.index0 }}
+{% endfor %}
+end module {{ module_name }}
