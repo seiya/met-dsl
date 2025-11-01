@@ -1,0 +1,48 @@
+.codex/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+ENV/
+*.egg
+pip-wheel-metadata/
+
+# Virtualenvs
+*.env
+*.venv
+.env/
+venv/
+
+# Logs
+*.log
+
+# IDEs / Editors
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+
+# Coverage / Reports
+htmlcov/
+.coverage*
+.tox/
+.mypy_cache/
+.pytest_cache/
+
+# Build artefacts
+build/
+dist/
+*.whl
+
+# Misc
+__snapshots__/

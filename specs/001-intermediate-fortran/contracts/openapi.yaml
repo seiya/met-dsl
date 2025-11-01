@@ -1,0 +1,186 @@
+openapi: 3.1.0
+info:
+  title: Met DSL Emission Service (Conceptual)
+  version: 0.1.0
+  description: >
+    Conceptual REST contract mirroring the CLI workflow for the Intermediate IR and Fortran
+    emission feature. Each endpoint corresponds to a CLI stage and accepts the same inputs.
+servers:
+  - url: https://metdsl.internal/api
+paths:
+  /emit/ir:
+    post:
+      summary: Generate normalized IR for a DSL model
+      operationId: emitIR
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/EmitRequest'
+      responses:
+        '202':
+          description: IR emission accepted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/IROutput'
+        '400':
+          description: Invalid DSL model or configuration
+        '409':
+          description: Conflicting IR already exists with differing hash
+  /emit/fortran2003:
+    post:
+      summary: Emit Fortran 2003 artefacts using an existing IR package
+      operationId: emitFortran
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              allOf:
+                - $ref: '#/components/schemas/EmitRequest'
+                - type: object
+                  properties:
+                    irPackageId:
+                      type: string
+                      description: Composite identifier (dsl_model_id + config_hash)
+                  required: [irPackageId]
+      responses:
+        '202':
+          description: Fortran emission accepted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FortranOutput'
+        '400':
+          description: Validation error or unsupported target requested
+        '412':
+          description: IR package missing or invalid
+  /verify:
+    post:
+      summary: Run compiler smoke tests and update emission manifest
+      operationId: verifyCompilers
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                manifestId:
+                  type: string
+                compilers:
+                  type: array
+                  items:
+                    $ref: '#/components/schemas/CompilerName'
+                  description: >
+                    Optional override list; defaults to all supported compilers
+              required: [manifestId]
+      responses:
+        '200':
+          description: Verification results
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/VerificationResult'
+        '404':
+          description: Manifest not found
+  /targets:
+    get:
+      summary: List supported and candidate targets (discovery hook)
+      operationId: listTargets
+      responses:
+        '200':
+          description: Target catalogue
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  supported:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/TargetName'
+                  experimental:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/TargetName'
+components:
+  schemas:
+    EmitRequest:
+      type: object
+      properties:
+        dslModelPath:
+          type: string
+          description: Absolute or repo-relative path to the DSL source file
+        configPath:
+          type: string
+          description: Absolute or repo-relative path to the emission configuration
+        telemetrySink:
+          type: string
+          description: Optional override for telemetry NDJSON output
+      required: [dslModelPath, configPath]
+    IROutput:
+      type: object
+      properties:
+        irPackageId:
+          type: string
+          description: Composite identifier (dsl_model_id/config_hash)
+        normalizedIrPath:
+          type: string
+        reportPath:
+          type: string
+        telemetryPath:
+          type: string
+      required: [irPackageId, normalizedIrPath, reportPath, telemetryPath]
+    FortranOutput:
+      type: object
+      properties:
+        manifestId:
+          type: string
+        fortranPaths:
+          type: array
+          items:
+            type: string
+        traceReportPath:
+          type: string
+        telemetryPath:
+          type: string
+      required: [manifestId, fortranPaths, traceReportPath, telemetryPath]
+    VerificationResult:
+      type: object
+      properties:
+        manifestId:
+          type: string
+        validations:
+          type: array
+          items:
+            $ref: '#/components/schemas/CompilerValidationResult'
+        status:
+          type: string
+          enum: [passed, failed, partial]
+    CompilerValidationResult:
+      type: object
+      properties:
+        compiler:
+          $ref: '#/components/schemas/CompilerName'
+        exitCode:
+          type: integer
+        durationSeconds:
+          type: number
+          format: float
+        result:
+          type: string
+          enum: [passed, failed]
+        stdoutLog:
+          type: string
+        stderrLog:
+          type: string
+      required: [compiler, exitCode, durationSeconds, result]
+    CompilerName:
+      type: string
+      enum: [gfortran, oneapi, nvfortran]
+    TargetName:
+      type: string
+      enum: [fortran2003, experimental]
