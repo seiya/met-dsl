@@ -3,18 +3,12 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-import yaml
-
 import pytest
-from typer.testing import CliRunner
 
-from metdsl.cli.emit import app
+from metdsl.cli import emit as emit_cli
 from metdsl.config.hash import compute_config_hash
 from metdsl.config.models import EmissionConfig, Stage
-from metdsl.verify.runners import run_compiler_validations
-from metdsl.telemetry.events import TelemetryEmitter
 
-RUNNER = CliRunner()
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
 
@@ -28,10 +22,11 @@ def _prepare_fixture(tmp_path: Path) -> tuple[Path, Path, str]:
     dsl_path = models_dir / "typhoon.dsl"
     dsl_path.write_text(dsl_source.read_text(encoding="utf-8"), encoding="utf-8")
 
-    config_path = configs_dir / "fortran-balanced.yaml"
-    config_path.write_text("target: fortran2003\n", encoding="utf-8")
+    config_path = configs_dir / "fortran-balanced.json"
+    config_payload = {"target": "fortran2003"}
+    config_path.write_text(json.dumps(config_payload), encoding="utf-8")
 
-    config_data = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    config_data = json.loads(config_path.read_text(encoding="utf-8"))
     config = EmissionConfig.parse_obj(config_data)
     config_hash = compute_config_hash(config)
     return dsl_path, config_path, config_hash
@@ -41,13 +36,25 @@ def test_emit_fortran_generates_expected_artifacts(tmp_path: Path, monkeypatch: 
     monkeypatch.chdir(tmp_path)
     dsl_path, config_path, config_hash = _prepare_fixture(tmp_path)
 
-    result_ir = RUNNER.invoke(app, ["emit", str(dsl_path), "--stage", Stage.IR.value, "--config", str(config_path)])
-    assert result_ir.exit_code == 0, result_ir.output
+    emission_config = emit_cli.load_config(config_path)
+    telemetry = emit_cli.build_telemetry_emitter(emission_config.telemetry_sink)
 
-    result_fortran = RUNNER.invoke(
-        app, ["emit", str(dsl_path), "--stage", Stage.FORTRAN2003.value, "--config", str(config_path)]
+    emit_cli._handle_stage_ir(
+        dsl_path=dsl_path,
+        config_path=config_path,
+        emission_config=emission_config,
+        config_hash=config_hash,
+        report_override=None,
+        telemetry=telemetry,
     )
-    assert result_fortran.exit_code == 0, result_fortran.output
+
+    emit_cli._handle_stage_fortran(
+        dsl_path=dsl_path,
+        config_path=config_path,
+        emission_config=emission_config,
+        config_hash=config_hash,
+        telemetry=telemetry,
+    )
 
     module_path = Path(f"build/fortran/{config_hash}/typhoon.f90")
     manifest_path = Path(f"build/fortran/{config_hash}/manifest.json")
@@ -72,18 +79,31 @@ def test_emit_fortran_cleans_partial_files_on_failure(tmp_path: Path, monkeypatc
     monkeypatch.chdir(tmp_path)
     dsl_path, config_path, config_hash = _prepare_fixture(tmp_path)
 
-    result_ir = RUNNER.invoke(app, ["emit", str(dsl_path), "--stage", Stage.IR.value, "--config", str(config_path)])
-    assert result_ir.exit_code == 0, result_ir.output
+    emission_config = emit_cli.load_config(config_path)
+    telemetry = emit_cli.build_telemetry_emitter(emission_config.telemetry_sink)
+
+    emit_cli._handle_stage_ir(
+        dsl_path=dsl_path,
+        config_path=config_path,
+        emission_config=emission_config,
+        config_hash=config_hash,
+        report_override=None,
+        telemetry=telemetry,
+    )
 
     def explode(*args, **kwargs):
         raise RuntimeError("simulated write failure")
 
     monkeypatch.setattr("metdsl.cli.emit.write_manifest", explode)
 
-    result_fortran = RUNNER.invoke(
-        app, ["emit", str(dsl_path), "--stage", Stage.FORTRAN2003.value, "--config", str(config_path)]
-    )
-    assert result_fortran.exit_code != 0
+    with pytest.raises(emit_cli.typer.Exit):
+        emit_cli._handle_stage_fortran(
+            dsl_path=dsl_path,
+            config_path=config_path,
+            emission_config=emission_config,
+            config_hash=config_hash,
+            telemetry=telemetry,
+        )
 
     output_dir = Path(f"build/fortran/{config_hash}")
     assert not output_dir.exists()

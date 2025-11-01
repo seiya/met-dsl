@@ -7,7 +7,11 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 import typer
-import yaml
+
+try:
+    import yaml
+except ModuleNotFoundError:  # pragma: no cover - optional dependency guard
+    yaml = None  # type: ignore[assignment]
 
 from metdsl.config.hash import compute_config_hash
 from metdsl.config.models import EmissionConfig, Stage
@@ -28,6 +32,11 @@ def load_config(path: Path) -> EmissionConfig:
 
     data: Dict[str, Any]
     if path.suffix.lower() in {".yaml", ".yml"}:
+        if yaml is None:
+            raise typer.BadParameter(
+                "YAML configuration requested but PyYAML is not installed. "
+                "Install the 'pyyaml' extra or provide a JSON config."
+            )
         data = yaml.safe_load(path.read_text())
     elif path.suffix.lower() == ".json":
         data = json.loads(path.read_text())
@@ -120,11 +129,6 @@ def main() -> None:  # pragma: no cover
 
 if __name__ == "__main__":  # pragma: no cover
     main()
-
-
-from metdsl.fortran.generator import build_fortran_module
-from metdsl.fortran.manifest import build_manifest, build_trace
-from metdsl.io.fortran_writer import write_fortran_module, write_manifest, write_trace
 
 
 def _handle_stage_ir(
@@ -247,6 +251,7 @@ def _handle_stage_fortran(
     if temp_dir.exists():
         shutil.rmtree(temp_dir, ignore_errors=True)
     temp_dir.mkdir(parents=True, exist_ok=True)
+    promoted_dir: Optional[Path] = None
     try:
         telemetry.emit(
             "emit_started",
@@ -273,6 +278,7 @@ def _handle_stage_fortran(
         if output_dir.exists():
             shutil.rmtree(output_dir, ignore_errors=True)
         temp_dir.rename(output_dir)
+        promoted_dir = output_dir
 
         module_path = output_dir / module_path_tmp.name
         trace_path = output_dir / trace_path_tmp.name
@@ -309,15 +315,11 @@ def _handle_stage_fortran(
             config_hash=config_hash,
             error=str(exc),
         )
-        _cleanup_directory(temp_dir)
+        if promoted_dir and promoted_dir.exists():
+            shutil.rmtree(promoted_dir, ignore_errors=True)
+        else:
+            _cleanup_directory(temp_dir)
         raise typer.Exit(code=1) from exc
 
 
-def _cleanup_directory(path: Path) -> None:
-    if path.exists():
-        for item in path.iterdir():
-            if item.is_file():
-                item.unlink(missing_ok=True)
-            elif item.is_dir():
-                _cleanup_directory(item)
-                item.rmdir()
+__all__ = ["app", "emit", "list_targets", "main"]
