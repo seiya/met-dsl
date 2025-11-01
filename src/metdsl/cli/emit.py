@@ -268,15 +268,6 @@ def _handle_stage_fortran(
         module_name, source = build_fortran_module(ir_package, emission_config)
         module_path_tmp = write_fortran_module(module_name, source, temp_dir)
 
-        manifest = build_manifest(
-            ir_package=ir_package,
-            module_name=module_name,
-            module_path=str((temp_dir / module_path_tmp.name).resolve()),
-            config_hash=config_hash,
-            config_metadata=emission_config.metadata,
-            issues=ir_package.get("issues", []),
-        )
-        manifest_path_tmp = write_manifest(manifest, temp_dir)
         trace_path_tmp = write_trace(build_trace(ir_package), temp_dir)
 
         if output_dir.exists():
@@ -284,8 +275,17 @@ def _handle_stage_fortran(
         temp_dir.rename(output_dir)
 
         module_path = output_dir / module_path_tmp.name
-        manifest_path = output_dir / manifest_path_tmp.name
         trace_path = output_dir / trace_path_tmp.name
+
+        manifest = build_manifest(
+            ir_package=ir_package,
+            module_name=module_name,
+            module_path=str(module_path.resolve()),
+            config_hash=config_hash,
+            config_metadata=emission_config.metadata,
+            issues=ir_package.get("issues", []),
+        )
+        manifest_path = write_manifest(manifest, output_dir)
 
         duration_ms = round((time.perf_counter() - start_ts) * 1000, 3)
         telemetry.emit(
