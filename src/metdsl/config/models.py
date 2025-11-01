@@ -4,7 +4,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Dict, List, Optional
 
-from pydantic import BaseModel, Field, PositiveFloat, PositiveInt, model_validator
+from pydantic import BaseModel, Field, PositiveFloat, PositiveInt, root_validator
 
 
 class Stage(str, Enum):
@@ -79,9 +79,11 @@ class EmissionConfig(BaseModel):
     boundary_conditions: BoundaryConditions = Field(default_factory=BoundaryConditions)
     rk4: RK4Config = Field(default_factory=RK4Config)
 
-    @model_validator(mode="after")
-    def validate_target_rules(cls, values: "EmissionConfig") -> "EmissionConfig":
-        if values.target != Target.FORTRAN2003 and not values.discovery_only:
+    @root_validator
+    def validate_target_rules(cls, values: Dict[str, object]) -> Dict[str, object]:
+        target = values.get("target")
+        discovery_only = values.get("discovery_only")
+        if target != Target.FORTRAN2003 and not discovery_only:
             raise ValueError(
                 "Non-Fortran targets are discovery-only. Set discovery_only=true for experimental targets."
             )
