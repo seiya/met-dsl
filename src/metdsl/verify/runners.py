@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import subprocess
+import json
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import List, Sequence
+from typing import Dict, List, Sequence
 
 from metdsl.config.models import EmissionConfig
 from metdsl.config.hash import compute_config_hash
@@ -90,3 +92,57 @@ def run_compiler_validations(
     write_trace(trace, output_dir)
 
     return results
+
+
+def create_solver_manifest(
+    *,
+    run_dir: Path,
+    ir_package: Dict[str, object],
+    emission_config: EmissionConfig,
+    module_name: str,
+    module_path: Path,
+    benchmark: str,
+    config_path: Path,
+    dsl_path: Path,
+    benchmark_script: Path,
+    tolerance: Dict[str, float],
+) -> Path:
+    config_hash = compute_config_hash(emission_config)
+    manifest = build_manifest(
+        ir_package,
+        module_name,
+        str(module_path.resolve()),
+        config_hash,
+        emission_config.metadata,
+        ir_package.get("issues", []),
+    )
+    manifest.update(
+        {
+            "grid": json.loads(emission_config.grid.json()),
+            "boundary_conditions": json.loads(emission_config.boundary_conditions.json()),
+            "rk4": json.loads(emission_config.rk4.json()),
+            "analysis": {
+                "benchmark": benchmark,
+                "script": str(benchmark_script.resolve()),
+                "tolerance": tolerance,
+            },
+            "outputs": {
+                "results_path": str((run_dir / "outputs" / "results.json").resolve()),
+            },
+            "config_path": str(config_path.resolve()),
+            "dsl_path": str(dsl_path.resolve()),
+            "ir_package_path": str((run_dir / "ir" / "package.json").resolve()),
+        }
+    )
+    return write_manifest(manifest, run_dir)
+
+
+def record_solver_metrics(run_dir: Path, metrics: Dict[str, float]) -> Path:
+    payload = {
+        "generated_at": datetime.now(tz=timezone.utc).isoformat(),
+        "metrics": metrics,
+    }
+    path = run_dir / "outputs" / "results.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    return path

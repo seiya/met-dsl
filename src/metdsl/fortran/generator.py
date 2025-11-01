@@ -29,7 +29,12 @@ def build_fortran_module(
 
     module_name = _sanitize_module_name(str(ir_package.get("dsl_model_id", "module")))
     operations = ir_package.get("normalized_ir", [])
-    source = render_module(module_name=module_name, operations=operations)  # type: ignore[arg-type]
+    source = render_module(  # type: ignore[arg-type]
+        module_name=module_name,
+        operations=operations,
+        boundary_conditions=ir_package.get("boundary_conditions"),
+        stencils=ir_package.get("stencils"),
+    )
     return module_name, source
 
 

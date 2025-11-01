@@ -1,0 +1,53 @@
+{
+  "analysis": {
+    "benchmark": "rotating-cosine-bell",
+    "script": "<<DYNAMIC_PATH>>",
+    "tolerance": {
+      "conservation_drift": 0.01,
+      "max_absolute_error": 0.05
+    }
+  },
+  "boundary_conditions": {
+    "x": "periodic",
+    "y": "periodic"
+  },
+  "config_hash": "<<DYNAMIC_HASH>>",
+  "config_path": "<<DYNAMIC_PATH>>",
+  "dsl_model_id": "nonlinear_advection",
+  "dsl_path": "<<DYNAMIC_PATH>>",
+  "dsl_version": "1.0.0",
+  "generated_at": "<<DYNAMIC>>",
+  "grid": {
+    "dx": 1.0,
+    "dy": 1.0,
+    "nx": 256,
+    "ny": 256,
+    "staggering": "arakawa_c"
+  },
+  "ir_package_path": "<<DYNAMIC_PATH>>",
+  "issues": [],
+  "metadata": {
+    "created_at": "<<DYNAMIC>>",
+    "description": "Nonlinear advection-diffusion DSL example with dual periodic boundaries.",
+    "dsl_version": "1.0.0",
+    "spec_id": "advection-example",
+    "version_id": "v0001"
+  },
+  "module_name": "nonlinear_advection",
+  "module_path": "<<DYNAMIC_PATH>>",
+  "operation_count": 9,
+  "outputs": {
+    "results_path": "<<DYNAMIC_PATH>>"
+  },
+  "rk4": {
+    "stability_limit": null,
+    "stage_labels": [
+      "k1",
+      "k2",
+      "k3",
+      "k4"
+    ],
+    "time_step": 60.0,
+    "total_steps": 100
+  }
+}
