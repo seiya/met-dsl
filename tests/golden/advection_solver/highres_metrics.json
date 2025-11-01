@@ -1,0 +1,17 @@
+{
+  "benchmark": "rotating-cosine-bell",
+  "metrics": {
+    "max_absolute_error": 0.014953,
+    "conservation_drift": 0.007477
+  },
+  "tolerance": {
+    "max_absolute_error": 0.05,
+    "conservation_drift": 0.01
+  },
+  "status": "passed",
+  "metadata": {
+    "spec_id": "advection-example",
+    "config_hash": "<<DYNAMIC_HASH>>"
+  },
+  "generated_at": "<<DYNAMIC>>"
+}

@@ -1,0 +1,340 @@
+openapi: 3.1.0
+title: Met DSL Advection Example API
+version: 0.1.0
+servers:
+  - url: https://dsl.local/api
+paths:
+  /specifications:
+    post:
+      summary: Create or update a DSL specification example
+      operationId: createSpecification
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SpecificationPayload'
+      responses:
+        '201':
+          description: Specification saved and versioned
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SpecificationVersion'
+        '400':
+          description: Validation failed (missing RK4 stages, unsupported physics)
+  /specifications/{versionId}/generate:
+    post:
+      summary: Generate solver artifacts for a specific specification version
+      operationId: generateSolver
+      parameters:
+        - name: versionId
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/GenerationRequest'
+      responses:
+        '202':
+          description: Generation accepted and run id issued
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GenerationResponse'
+        '409':
+          description: Specification invalid or generation already in progress
+  /runs/{runId}/validate:
+    post:
+      summary: Trigger benchmark validation for a completed solver run
+      operationId: validateRun
+      parameters:
+        - name: runId
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ValidationRequest'
+      responses:
+        '200':
+          description: Validation script executed and results recorded
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ValidationResult'
+        '422':
+          description: Required manifest or NetCDF data missing
+  /specifications/{versionId}/clone:
+    post:
+      summary: Clone an existing specification version for derivative experiments
+      operationId: cloneSpecification
+      parameters:
+        - name: versionId
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CloneRequest'
+      responses:
+        '201':
+          description: New specification version created and linked to parent
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SpecificationVersion'
+  /benchmarks/{scenarioId}:
+    get:
+      summary: Retrieve benchmark scenario metadata for validation configuration
+      operationId: getBenchmark
+      parameters:
+        - name: scenarioId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Benchmark scenario details returned
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BenchmarkScenario'
+components:
+  schemas:
+    SpecificationPayload:
+      type: object
+      required:
+        - specId
+        - gridConfig
+        - boundaryConditions
+        - physicsTerms
+        - rk4Stages
+        - validationHooks
+      properties:
+        specId:
+          type: string
+        gridConfig:
+          $ref: '#/components/schemas/GridConfig'
+        boundaryConditions:
+          $ref: '#/components/schemas/BoundaryConditions'
+        physicsTerms:
+          type: array
+          items:
+            $ref: '#/components/schemas/PhysicsTerm'
+        rk4Stages:
+          type: array
+          minItems: 4
+          maxItems: 4
+          items:
+            $ref: '#/components/schemas/RK4Stage'
+        validationHooks:
+          $ref: '#/components/schemas/ValidationHooks'
+        derivedFrom:
+          type: string
+          nullable: true
+    SpecificationVersion:
+      type: object
+      required:
+        - specId
+        - versionId
+        - sequence
+        - timestamp
+      properties:
+        specId:
+          type: string
+        versionId:
+          type: string
+        sequence:
+          type: integer
+        timestamp:
+          type: string
+          format: date-time
+        changeSummary:
+          type: string
+        derivedFromVersion:
+          type: string
+          nullable: true
+    GenerationRequest:
+      type: object
+      required:
+        - benchmarkScenarioId
+        - totalSteps
+      properties:
+        benchmarkScenarioId:
+          type: string
+        totalSteps:
+          type: integer
+          maximum: 500
+        outputDir:
+          type: string
+        manifestPath:
+          type: string
+    GenerationResponse:
+      type: object
+      required:
+        - runId
+        - status
+      properties:
+        runId:
+          type: string
+        status:
+          type: string
+          enum: [pending, running]
+        versionId:
+          type: string
+    ValidationRequest:
+      type: object
+      required:
+        - analysisScriptPath
+        - metrics
+      properties:
+        analysisScriptPath:
+          type: string
+        metrics:
+          $ref: '#/components/schemas/ValidationMetrics'
+    ValidationResult:
+      type: object
+      required:
+        - runId
+        - status
+        - metrics
+      properties:
+        runId:
+          type: string
+        status:
+          type: string
+          enum: [passed, failed]
+        metrics:
+          $ref: '#/components/schemas/ValidationMetrics'
+        notes:
+          type: string
+    CloneRequest:
+      type: object
+      required:
+        - changeSummary
+      properties:
+        changeSummary:
+          type: string
+        overrides:
+          type: object
+          additionalProperties: true
+    BenchmarkScenario:
+      type: object
+      required:
+        - scenarioId
+        - analyticSolution
+        - toleranceMetrics
+        - analysisScriptPath
+      properties:
+        scenarioId:
+          type: string
+        analyticSolution:
+          type: string
+        toleranceMetrics:
+          $ref: '#/components/schemas/ValidationMetrics'
+        analysisScriptPath:
+          type: string
+        durationSteps:
+          type: integer
+          maximum: 500
+    GridConfig:
+      type: object
+      required:
+        - nx
+        - ny
+        - dx
+        - dy
+      properties:
+        nx:
+          type: integer
+          multipleOf: 2
+          maximum: 256
+        ny:
+          type: integer
+          multipleOf: 2
+          maximum: 256
+        dx:
+          type: number
+        dy:
+          type: number
+    BoundaryConditions:
+      type: object
+      properties:
+        x:
+          type: string
+          enum: [periodic]
+        y:
+          type: string
+          enum: [periodic]
+    PhysicsTerm:
+      type: object
+      required:
+        - name
+        - expression
+      properties:
+        name:
+          type: string
+        expression:
+          type: string
+        coefficient:
+          type: number
+    RK4Stage:
+      type: object
+      required:
+        - stage
+        - updates
+      properties:
+        stage:
+          type: integer
+          minimum: 1
+          maximum: 4
+        updates:
+          type: array
+          items:
+            type: object
+            required: [field, expression]
+            properties:
+              field:
+                type: string
+              expression:
+                type: string
+              weight:
+                type: number
+    ValidationHooks:
+      type: object
+      required:
+        - outputs
+        - manifestPath
+      properties:
+        outputs:
+          type: array
+          items:
+            type: string
+        manifestPath:
+          type: string
+    ValidationMetrics:
+      type: object
+      required:
+        - maxAbsoluteError
+        - conservationDrift
+      properties:
+        maxAbsoluteError:
+          type: number
+          maximum: 0.05
+        conservationDrift:
+          type: number
+          maximum: 0.01

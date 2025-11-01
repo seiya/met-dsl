@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import json
 import os
+from enum import Enum
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Union
 
 from pydantic import BaseModel, Field
 
@@ -53,8 +54,9 @@ class TelemetryEmitter:
             NDJSONTelemetryLogger(fallback_sink) if fallback_sink is not None else None
         )
 
-    def emit(self, event: str, **payload: Any) -> None:
-        telemetry_event = TelemetryEvent(event=event, payload=payload)
+    def emit(self, event: Union[str, "SolverLifecycleEvent"], **payload: Any) -> None:
+        event_name = event.value if isinstance(event, Enum) else event
+        telemetry_event = TelemetryEvent(event=event_name, payload=payload)
         try:
             self.primary.record(telemetry_event)
         except OSError:
@@ -62,10 +64,34 @@ class TelemetryEmitter:
                 raise
             self.fallback.record(
                 TelemetryEvent(
-                    event=f"{event}_fallback",
+                    event=f"{event_name}_fallback",
                     payload={"original": payload, "reason": "primary_sink_unavailable"},
                 )
             )
 
 
-__all__ = ["TelemetryEvent", "NDJSONTelemetryLogger", "TelemetryEmitter"]
+class SolverLifecycleEvent(str, Enum):
+    """
+    Canonical solver lifecycle telemetry events emitted by CLI workflows.
+    """
+
+    SPEC_CREATED = "solver.spec.created"
+    SPEC_CLONED = "solver.spec.cloned"
+    GENERATION_STARTED = "solver.generation.started"
+    GENERATION_COMPLETED = "solver.generation.completed"
+    GENERATION_FAILED = "solver.generation.failed"
+    VALIDATION_STARTED = "solver.validation.started"
+    VALIDATION_COMPLETED = "solver.validation.completed"
+    VALIDATION_FAILED = "solver.validation.failed"
+    TIMESTEP_WARNING = "solver.validation.timestep_warning"
+    COMPLETENESS_ERROR = "solver.validation.completeness_error"
+    ONBOARDING_DURATION_RECORDED = "solver.onboarding.session_recorded"
+    PILOT_FEEDBACK_CAPTURED = "solver.feedback.pilot_recorded"
+
+
+__all__ = [
+    "TelemetryEvent",
+    "NDJSONTelemetryLogger",
+    "TelemetryEmitter",
+    "SolverLifecycleEvent",
+]

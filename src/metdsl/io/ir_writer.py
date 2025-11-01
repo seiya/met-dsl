@@ -16,8 +16,19 @@ def _atomic_write(path: Path, content: str) -> None:
 
 
 def write_ir_package(ir_package: Dict[str, object], destination: Path) -> Path:
+    package = json.loads(json.dumps(ir_package))  # deep copy for mutation safety
+    metadata = package.get("metadata")
+    if isinstance(metadata, dict):
+        version_info = {
+            key: metadata.get(key)
+            for key in ("spec_id", "version_id", "derived_from", "change_summary")
+            if metadata.get(key) is not None
+        }
+        if version_info:
+            package["version_info"] = version_info
+
     package_path = destination / "package.json"
-    _atomic_write(package_path, json.dumps(ir_package, indent=2, sort_keys=True))
+    _atomic_write(package_path, json.dumps(package, indent=2, sort_keys=True))
     return package_path
 
 

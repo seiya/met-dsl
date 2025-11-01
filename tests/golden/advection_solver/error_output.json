@@ -1,0 +1,3 @@
+{
+  "stdout": "[metdsl] Specification failed validation:\n  - STENCILS_MISSING: At least one stencil definition is required in the DSL specification."
+}

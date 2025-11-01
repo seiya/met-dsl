@@ -15,7 +15,7 @@ except ModuleNotFoundError:  # pragma: no cover - optional dependency guard
 
 from metdsl.config.hash import compute_config_hash
 from metdsl.config.models import EmissionConfig, Stage
-from metdsl.telemetry.events import TelemetryEmitter
+from metdsl.telemetry.events import SolverLifecycleEvent, TelemetryEmitter
 from metdsl.fortran.generator import build_fortran_module
 from metdsl.fortran.manifest import build_manifest, build_trace
 from metdsl.io.fortran_writer import write_fortran_module, write_manifest, write_trace
@@ -24,6 +24,12 @@ from metdsl.ir.builder import build_ir_package, build_ir_report
 from metdsl.ir.validators import validate_ir_package
 
 app = typer.Typer(help="Met DSL emission CLI (IR, Fortran generation, verification).")
+
+from . import solver as solver_cli  # noqa: E402
+from . import specs as specs_cli  # noqa: E402
+
+app.add_typer(specs_cli.app, name="spec")
+app.add_typer(solver_cli.app, name="solver")
 
 
 def load_config(path: Path) -> EmissionConfig:
@@ -144,7 +150,7 @@ def _handle_stage_ir(
 
     try:
         telemetry.emit(
-            "emit_started",
+            SolverLifecycleEvent.GENERATION_STARTED,
             stage=Stage.IR.value,
             config_hash=config_hash,
             dsl_path=str(dsl_path.resolve()),
@@ -163,8 +169,22 @@ def _handle_stage_ir(
         report_dict["duration_ms"] = duration_ms
         write_ir_report(report_dict, report_path)
 
+        blocking_issues = [issue for issue in issues if issue.get("severity") == "error"]
+        if blocking_issues:
+            telemetry.emit(
+                SolverLifecycleEvent.COMPLETENESS_ERROR,
+                config_hash=config_hash,
+                issue_count=len(blocking_issues),
+                report_path=str(report_path.resolve()),
+                issues=blocking_issues,
+            )
+            typer.echo("[metdsl] Specification failed validation:")
+            for issue in blocking_issues:
+                typer.echo(f"  - {issue['code']}: {issue['message']}")
+            raise typer.Exit(code=1)
+
         telemetry.emit(
-            "emit_completed",
+            SolverLifecycleEvent.GENERATION_COMPLETED,
             stage=Stage.IR.value,
             config_hash=config_hash,
             issues=len(issues),
@@ -184,7 +204,7 @@ def _handle_stage_ir(
         }
     except Exception as exc:  # pragma: no cover - defensive telemetry
         telemetry.emit(
-            "emit_failed",
+            SolverLifecycleEvent.GENERATION_FAILED,
             stage=Stage.IR.value,
             config_hash=config_hash,
             error=str(exc),

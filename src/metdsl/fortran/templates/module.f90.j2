@@ -1,3 +1,5 @@
+{% set boundary = boundary_conditions or {} %}
+{% set stencils = stencils or [] %}
 module {{ module_name }}
   implicit none
 contains
@@ -6,6 +8,21 @@ contains
     ! {{ op.statement }}
 {% if op.requires_numerical_fidelity %}
     ! REVIEW: Numerical fidelity required.
+{% endif %}
+{% if op.verb == "STENCIL" and op.metadata %}
+    ! Stencil {{ op.metadata.name }} uses {{ op.metadata.scheme }} (order {{ op.metadata.order }})
+{% if op.metadata.fields %}
+    ! Fields: {{ op.metadata.fields | join(", ") }}
+{% endif %}
+{% endif %}
+{% if op.verb == "STENCIL" and boundary %}
+    ! Periodic flux wrapping enabled for axes:
+{% if boundary.x == "periodic" %}
+    !   - x-axis
+{% endif %}
+{% if boundary.y == "periodic" %}
+    !   - y-axis
+{% endif %}
 {% endif %}
   end subroutine op_{{ loop.index0 }}
 {% endfor %}

@@ -1,10 +1,9 @@
 {
   "dsl_model_id": "typhoon",
   "dsl_version": "1.0.0",
-  "config_hash": "df4058fa674bd9f841ab79cab43dcc51db81a2f32c295b86be4ca892f6cfe565",
+  "config_hash": "db45af047a63827c8ce97a04d99c5cdd83a11b2d8b089163fa11d30a4defbe98",
   "created_at": "2025-10-31T12:00:00+00:00",
   "source_path": "tests/golden/ir/typhoon.dsl",
-  "metadata": {},
   "normalized_ir": [
     {
       "index": 4,
@@ -19,6 +18,32 @@
       "requires_numerical_fidelity": true
     }
   ],
+  "metadata": {},
+  "grid": {
+    "nx": 128,
+    "ny": 128,
+    "dx": 1.0,
+    "dy": 1.0,
+    "staggering": "arakawa_c"
+  },
+  "boundary_conditions": {
+    "x": "periodic",
+    "y": "periodic"
+  },
+  "rk4": {
+    "total_steps": 100,
+    "time_step": 60.0,
+    "stability_limit": null,
+    "stage_labels": [
+      "k1",
+      "k2",
+      "k3",
+      "k4"
+    ]
+  },
+  "fields": [],
+  "stencils": [],
+  "rk4_stages": [],
   "issues": [
     {
       "code": "NUMERICAL_FIDELITY_REVIEW",
