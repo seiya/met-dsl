@@ -1,0 +1,12 @@
+catalog_version: 0.1.0
+updated_at: 2026-02-20
+specs:
+  - spec_id: advdiff1d_linear
+    spec_version: 0.2.0
+    status: controlled_draft
+    domain: transport
+    component: advection_diffusion
+    controlled_spec_path: spec/transport/advection_diffusion/advdiff1d_linear/controlled_spec.md
+    physical_test_suites:
+      - suite_id: advdiff1d_linear_physical_tests
+        path: spec/transport/advection_diffusion/advdiff1d_linear/physical_tests/advdiff1d_linear_physical_tests.yaml

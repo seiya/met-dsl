@@ -1,50 +1,103 @@
-# 全体仕様: 数理ドキュメントから気象モデルを生成するLLMベース開発基盤
+# 全体仕様: ドキュメント駆動で気象モデルを生成する基盤
 
-この文書は、本プロジェクトの目的、スコープ、契約（Artifacts）、成功条件を単独で理解できるように記述する。
-用語は `docs/GLOSSARY.md` を参照。
+## 最終ゴール
+**ドキュメント的文章（Controlled Spec + physical_tests）を正本**として、CPU/GPU などのハードウェア上で**準最適化された気象モデル**を生成できる基盤フレームワークと、実際に生成されたモデル群を実用水準で運用する。
 
-## 目的
-- 数理ドキュメント（方程式・離散化・境界条件・制約・診断量）から、気象モデル（当面は力学コア）を生成する。
-- bitwise一致は要求しないが、**物理的に妥当な一致**を満たす（定義はGLOSSARY）。
-- 将来的に GPU・将来HW向け最適化を可能にし、性能回帰も監視する。
+## スコープ
+### 対象
+- 入力: Controlled Spec（物理・アルゴリズム定義）と physical_tests（妥当性検証用の入力・判定プロファイル）
+- 出力: 実行コード（model + runner）、物理診断、性能診断、合否判定
+- 運用: Spec→Plan→Generate→Execute→Judge→Tune のループ
+- ハードウェア: CPU / GPU を含む（Phase 0 は CPU 参照、以降 GPU へ拡張）
+- 実行時入力はユーザーが科学目的に応じて設計でき、`physical_tests` はそのうち妥当性検証に使う既定プロファイルを与える。
+- 言語に依らず、物理計算を担う model と、入出力・判定連携を担う runner を分離する。
 
-## LLMの扱い
-- LLMはモデル種類を問わない（LLM限定ではない）。
-- LLMは主に「生成（テンプレ補完・小粒度パッチ・ドキュメント）」に用いる。
-- 品質はテストで担保し、モデル選択は交換可能にする。
+### 非対象（現時点）
+- bitwise 一致の保証
+- 完全自動での科学的妥当性の発見（妥当性の定義は人間が与える）
+- すべての気象・気候モデルの網羅
 
-## 重要設計: アルゴリズムの2分類とPlan分割
-- 物理結果に影響する **物理アルゴリズム（A）** は `case.resolved.yaml` で決定し、決定的である必要がある。
-- 計算過程にのみ影響する **実行アルゴリズム（B）** は `impl.resolved.yaml` で表現し、性能チューニングで探索可能にする。
-- これにより「物理再現性の決定性」と「性能探索の自由度」を両立する。
+## 運用原則（Spec-First）
+1. 物理仕様の変更は**必ず Controlled Spec を更新**してから実装へ反映する。
+2. 実験条件・判定条件の変更は**physical_tests を更新**してテストへ反映する。
+3. 実装のみを直接修正して物理仕様を変えることを禁止する（乖離防止）。
+4. 判定不能・曖昧な仕様は「仮実装で進める」のではなく、Spec へ差し戻して解消する。
 
-## 契約（Artifacts）
-- 入力（物理）: `case.resolved.yaml`
-- 入力（実装）: `impl.resolved.yaml`（任意だがv4以降推奨）
-- 出力（物理診断）: `diagnostics.json`
-- 出力（性能診断）: `perf.json`（仕様は `docs/PERFORMANCE_DIAGNOSTICS.md`）
-- 判定: `verdict.json`
-- 集計: `summary.json`
+## LLM の扱い
+- LLM はモデル種類を問わない（交換可能）。
+- 品質はテストで担保する。
 
-## スコープ（段階導入）
-### Phase 0（現在）
-- 線形移流（1D）で契約とテスト（L0-L3）を確立
-- 物理診断中心（perfは最小でも良い）
+## アーキテクチャ方針（現時点）
+- **物理アルゴリズム（A）**: 物理結果に影響する選択。`case.resolved.yaml` で決定し、決定的である必要がある。
+- **実行アルゴリズム（B）**: 計算過程や性能に影響する選択。`impl.resolved.yaml` で表現し、探索可能とする。
+- この分離により「物理再現性」と「性能探索」を両立する。
 
-### Phase 1
-- Controlled Spec正式化
-- 期待失敗（XFAIL）の一般化
-- `impl.resolved.yaml` の導入（まずは固定値で良い）
+## 大規模 `spec` 運用設計
+### 目的
+- 複数の `spec` を並行運用し、`spec` 間で再利用する `component` / `operation` を決定的に解決する。
+- 生成対象が増加しても、`spec` の識別子・依存関係・生成物の追跡可能性を維持する。
 
-### Phase 2
-- 浅水等へ拡張、診断量拡充
-- ルールベースの小規模チューニング（Bの探索）を導入
+### 適用範囲
+- `spec` の保管構造
+- `spec`・`component`・`operation` の命名規則
+- `spec` 間依存と再利用規則
+- 既存 `component` / `operation` の登録台帳
 
-### Phase 3
-- GPUターゲット導入
-- 物理同値性回帰 + 性能回帰（L3）を本格化
+### 要件
+1. `spec` 配置は階層構造を必須とする。最小構成を次に固定する。
 
-## Phase 0の成功条件
-- L0-L3全ケースが意図どおり判定される（期待失敗含む）
-- 解析解比較とrefinementが成立
-- artifactsが保存され再実行で同じ判定
+```text
+spec/
+  registry/
+    spec_catalog.yaml
+    component_catalog.yaml
+  <domain>/
+    <component>/
+      <spec_id>/
+        controlled_spec.md
+        physical_tests/
+          <suite_id>.yaml
+        deps.yaml
+```
+
+2. すべての `spec` は階層構造へ配置する。
+   - `domain` と `component` の定義は `GLOSSARY.md` の「`spec` 分類語彙」を参照する。
+3. `spec_id` はリポジトリ内で一意とし、形式は `^[a-z][a-z0-9_]{2,63}$` を必須とする。
+4. `suite_id` は `spec_id` を接頭辞に持つ形式（`<spec_id>_<purpose>`）を必須とする。
+5. `component_id` は `^[a-z][a-z0-9_]{2,63}$` を必須とし、推奨形式を `<domain>_<component>_<operator>_<dim>d_<scheme>` とする。
+6. `operation_id` は `component_id` を接頭辞に持つ形式（`<component_id>__<action>`）を必須とする。
+7. 生成コードの公開名は互換性管理を必須とする。`major` 互換が破壊される変更は別名に分離する。
+8. 各 `spec` は `deps.yaml` で依存 `component` を宣言し、直接パス参照（相対 import）を禁止する。
+9. 依存解決は `component_id` + `version constraint` で行い、解決結果を `case.resolved.yaml` に固定する。
+10. `registry/component_catalog.yaml` は `component` 単位の責務・公開 `operation`・互換性情報・実装状態を保持する。
+11. 未実装 `component` / `operation` を参照する `spec` は生成工程へ進めず、依存解決エラーとする。
+
+### 設計方針
+- `spec` は「物理仕様の定義」に限定し、再利用資産の正本は `registry/component_catalog.yaml` に集約する。
+- `component` の責務は物理演算単位で分割する。`runner` は台帳上の公開 `operation` のみ呼び出す。
+- `spec` 横断で共有する演算（境界処理、フラックス、時間積分、診断）は `component` として独立管理する。
+- `component` の API 変更は `major` を更新し、旧 `major` を同時運用可能にする。
+
+### 運用ルール
+- 新規 `spec` 追加時は `registry/spec_catalog.yaml` への登録を必須とする。
+- `spec` 更新で再利用境界が変わる場合は `registry/component_catalog.yaml` を同時更新する。
+- `deps.yaml` の依存解決結果は `case.resolved.yaml` に記録し、実行時の再解決を禁止する。
+- `component` の実装状態が `spec_defined_not_implemented` の間は、依存先 `spec` を `status=draft` 扱いに固定する。
+
+### 判定基準
+- `spec` の CI は `spec_id` / `component_id` / `operation_id` の形式検証を pass しなければならない。
+- `spec` の CI は未登録依存、未実装依存、互換性違反依存を fail としなければならない。
+- 生成実行ログ（`trial_meta.json`）には `spec_id`、`spec_version`、`component_id@api_version` の解決結果を必須記録とする。
+- `component_catalog.yaml` の公開 `operation` と生成コードの公開シンボルは 1 対 1 で対応しなければならない。
+
+## 成功条件（最小）
+- Controlled Spec → 実行モデルの変換が再現可能である。
+- runner が model を呼び出す構成が維持され、物理更新ロジックが二重実装されない。
+- 物理妥当性判定により合否が決定的に再現される。
+- impl（B）の探索で、物理合格を維持しつつ性能が改善できる。
+
+## 参照
+- Controlled Spec の書き方: `CONTROLLED_SPEC.md`
+- 物理妥当性判定: `PHYSICAL_VALIDATION.md`
+- 用語・Artifacts: `GLOSSARY.md`
+- 全体フロー: `WORKFLOW.md`
