@@ -19,7 +19,9 @@
 ### 1-2) 実装 Plan（impl.resolved.yaml）
 - target や環境に応じて、実行アルゴリズム（B）を決める。
 - この時点で `target.backend` と `toolchain.language`（例: Fortran/C++）を固定する。
+- この時点で `toolchain.build_system`（例: `make`,`cmake`）を固定する。
 - compiler 種別は任意（再現性が必要な運用でのみ固定）とする。
+- `toolchain.language` が `fortran` / `c` / `cpp` / `mixed` 系の場合、`toolchain.build_system` は `make` / `cmake` / `meson` / `ninja` のいずれかを使用する。既定値は `make` とする。
 - Phase 1 では固定値でもよい。
 - Phase 2 以降は tuner が複数候補を生成し探索する。
 
@@ -32,6 +34,7 @@
 
 ## 3. 実行（runner / simulate）
 - 入力: case.resolved.yaml と（任意で）impl.resolved.yaml
+- Build と Execute は MCP サーバー経由で実行する。`compile` は `compile_project`、`run` は `run_program` を使用する。
 - runner が model を呼び出し、diagnostics.json と perf.json を出力する。
 - perf.json の仕様は `PERFORMANCE_DIAGNOSTICS.md`
 

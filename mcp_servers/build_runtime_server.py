@@ -1,0 +1,530 @@
+#!/usr/bin/env python3
+"""Minimal MCP server for build/run/quality operations.
+
+This server intentionally has no external dependencies so that it can be used
+in constrained environments.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Callable
+
+JSONRPC_VERSION = "2.0"
+SERVER_NAME = "build-runtime-server"
+SERVER_VERSION = "0.1.0"
+DEFAULT_PROTOCOL_VERSION = "2024-11-05"
+
+FORTRAN_C_FAMILY = {
+    "fortran",
+    "c",
+    "cpp",
+    "c++",
+    "cuda_fortran",
+    "cuda_c",
+    "mixed",
+}
+
+DEPENDENCY_AWARE_BUILD_SYSTEMS = {
+    "make",
+    "cmake",
+    "meson",
+    "ninja",
+    "cargo",
+    "go",
+    "gradle",
+    "maven",
+    "npm",
+    "pnpm",
+    "poetry",
+}
+
+
+@dataclass(frozen=True)
+class Tool:
+    name: str
+    description: str
+    input_schema: dict[str, Any]
+    handler: Callable[[dict[str, Any]], dict[str, Any]]
+
+
+def _write_message(payload: dict[str, Any]) -> None:
+    encoded = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    out = sys.stdout.buffer
+    out.write(f"Content-Length: {len(encoded)}\r\n\r\n".encode("ascii"))
+    out.write(encoded)
+    out.flush()
+
+
+def _read_message() -> dict[str, Any] | None:
+    stream = sys.stdin.buffer
+    while True:
+        first_line = stream.readline()
+        if not first_line:
+            return None
+        if not first_line.strip():
+            continue
+
+        if first_line.lower().startswith(b"content-length:"):
+            length = int(first_line.split(b":", 1)[1].strip())
+            # Skip remaining headers.
+            while True:
+                header_line = stream.readline()
+                if not header_line:
+                    return None
+                if header_line in (b"\r\n", b"\n"):
+                    break
+            body = stream.read(length)
+            if not body:
+                return None
+            return json.loads(body.decode("utf-8"))
+
+        # Fallback for newline-delimited JSON.
+        return json.loads(first_line.decode("utf-8"))
+
+
+def _trim(text: str, limit: int) -> str:
+    if limit < 0:
+        return text
+    if len(text) <= limit:
+        return text
+    head = text[: limit // 2]
+    tail = text[-(limit // 2) :]
+    omitted = len(text) - len(head) - len(tail)
+    return f"{head}\n...<omitted {omitted} chars>...\n{tail}"
+
+
+def _run_command(
+    command: list[str],
+    cwd: str,
+    timeout_sec: int,
+    env: dict[str, str] | None,
+    capture_limit: int,
+) -> dict[str, Any]:
+    if not command:
+        raise ValueError("command must not be empty")
+
+    path = Path(cwd)
+    if not path.exists():
+        raise ValueError(f"project_dir does not exist: {cwd}")
+    if not path.is_dir():
+        raise ValueError(f"project_dir is not a directory: {cwd}")
+
+    merged_env = os.environ.copy()
+    if env:
+        merged_env.update({str(k): str(v) for k, v in env.items()})
+
+    try:
+        proc = subprocess.run(
+            command,
+            cwd=str(path),
+            env=merged_env,
+            text=True,
+            capture_output=True,
+            timeout=timeout_sec,
+            check=False,
+        )
+        return {
+            "ok": proc.returncode == 0,
+            "return_code": proc.returncode,
+            "command": command,
+            "cwd": str(path),
+            "stdout": _trim(proc.stdout, capture_limit),
+            "stderr": _trim(proc.stderr, capture_limit),
+        }
+    except subprocess.TimeoutExpired as exc:
+        return {
+            "ok": False,
+            "return_code": None,
+            "command": command,
+            "cwd": str(path),
+            "stdout": _trim(exc.stdout or "", capture_limit),
+            "stderr": _trim(exc.stderr or "", capture_limit),
+            "error": f"timeout: exceeded {timeout_sec} sec",
+        }
+
+
+def _recommended_build_system(project_dir: str, language: str) -> dict[str, str]:
+    root = Path(project_dir)
+    lang = (language or "").strip().lower()
+
+    checks = [
+        ("Makefile", "make"),
+        ("makefile", "make"),
+        ("CMakeLists.txt", "cmake"),
+        ("meson.build", "meson"),
+        ("build.ninja", "ninja"),
+        ("Cargo.toml", "cargo"),
+        ("go.mod", "go"),
+        ("pom.xml", "maven"),
+        ("build.gradle", "gradle"),
+        ("package.json", "npm"),
+        ("pyproject.toml", "poetry"),
+    ]
+    for marker, build_system in checks:
+        if (root / marker).exists():
+            return {
+                "build_system": build_system,
+                "reason": f"{marker} was detected",
+            }
+
+    if lang in FORTRAN_C_FAMILY:
+        return {
+            "build_system": "make",
+            "reason": "for Fortran/C family, make is the default standard build tool",
+        }
+
+    return {
+        "build_system": "make",
+        "reason": "fallback default",
+    }
+
+
+def _build_command(
+    build_system: str,
+    target: str | None,
+    jobs: int,
+    extra_args: list[str],
+) -> list[str]:
+    if build_system == "make":
+        cmd = ["make", f"-j{jobs}"]
+        if target:
+            cmd.append(target)
+        return cmd + extra_args
+    if build_system == "cmake":
+        cmd = ["cmake", "--build", ".", "-j", str(jobs)]
+        if target:
+            cmd += ["--target", target]
+        if extra_args:
+            cmd += ["--"] + extra_args
+        return cmd
+    if build_system == "meson":
+        cmd = ["meson", "compile", "-j", str(jobs)]
+        if target:
+            cmd.append(target)
+        return cmd + extra_args
+    if build_system == "ninja":
+        cmd = ["ninja", f"-j{jobs}"]
+        if target:
+            cmd.append(target)
+        return cmd + extra_args
+    if build_system == "cargo":
+        return ["cargo", "build"] + extra_args
+    if build_system == "go":
+        return ["go", "build"] + extra_args
+    if build_system == "maven":
+        return ["mvn", "package"] + extra_args
+    if build_system == "gradle":
+        cmd = ["gradle"]
+        cmd.append(target if target else "build")
+        return cmd + extra_args
+    if build_system == "npm":
+        cmd = ["npm", "run"]
+        cmd.append(target if target else "build")
+        return cmd + extra_args
+    if build_system == "pnpm":
+        cmd = ["pnpm", "run"]
+        cmd.append(target if target else "build")
+        return cmd + extra_args
+    if build_system == "poetry":
+        return ["poetry", "build"] + extra_args
+    raise ValueError(f"unsupported build_system: {build_system}")
+
+
+def tool_detect_build_system(args: dict[str, Any]) -> dict[str, Any]:
+    project_dir = str(args.get("project_dir", "."))
+    language = str(args.get("language", "")).strip().lower()
+    recommended = _recommended_build_system(project_dir, language)
+    return {
+        "project_dir": str(Path(project_dir).resolve()),
+        "language": language or None,
+        "recommended_build_system": recommended["build_system"],
+        "reason": recommended["reason"],
+    }
+
+
+def tool_compile_project(args: dict[str, Any]) -> dict[str, Any]:
+    project_dir = str(args.get("project_dir", "."))
+    language = str(args.get("language", "")).strip().lower()
+    target = args.get("target")
+    jobs = int(args.get("jobs", max(1, (os.cpu_count() or 1) // 2)))
+    timeout_sec = int(args.get("timeout_sec", 1800))
+    capture_limit = int(args.get("capture_limit", 120000))
+    extra_args = [str(x) for x in args.get("extra_args", [])]
+    env = args.get("env")
+    if env is not None and not isinstance(env, dict):
+        raise ValueError("env must be an object")
+
+    build_system = args.get("build_system")
+    if build_system:
+        build_system = str(build_system).strip().lower()
+    else:
+        build_system = _recommended_build_system(project_dir, language)["build_system"]
+
+    if build_system not in DEPENDENCY_AWARE_BUILD_SYSTEMS:
+        raise ValueError(
+            "build_system must be a standard dependency-aware build tool"
+        )
+
+    if language in FORTRAN_C_FAMILY and build_system not in {
+        "make",
+        "cmake",
+        "meson",
+        "ninja",
+    }:
+        raise ValueError(
+            "for Fortran/C family, use make/cmake/meson/ninja. make is the default."
+        )
+
+    command = _build_command(build_system, target, jobs, extra_args)
+    result = _run_command(command, project_dir, timeout_sec, env, capture_limit)
+    result["language"] = language or None
+    result["build_system"] = build_system
+    return result
+
+
+def tool_run_program(args: dict[str, Any]) -> dict[str, Any]:
+    project_dir = str(args.get("project_dir", "."))
+    timeout_sec = int(args.get("timeout_sec", 3600))
+    capture_limit = int(args.get("capture_limit", 120000))
+    env = args.get("env")
+    command = args.get("command")
+    if not isinstance(command, list) or not command:
+        raise ValueError("command must be a non-empty string array")
+    command = [str(item) for item in command]
+    if env is not None and not isinstance(env, dict):
+        raise ValueError("env must be an object")
+    return _run_command(command, project_dir, timeout_sec, env, capture_limit)
+
+
+def tool_run_quality_checks(args: dict[str, Any]) -> dict[str, Any]:
+    project_dir = str(args.get("project_dir", "."))
+    timeout_sec = int(args.get("timeout_sec", 1800))
+    capture_limit = int(args.get("capture_limit", 120000))
+    env = args.get("env")
+    preset = str(args.get("preset", "make_test"))
+
+    presets: dict[str, list[str]] = {
+        "make_test": ["make", "test"],
+        "make_check": ["make", "check"],
+        "ctest": ["ctest", "--output-on-failure"],
+        "pytest": ["pytest", "-q"],
+    }
+
+    if preset == "custom":
+        command = args.get("command")
+        if not isinstance(command, list) or not command:
+            raise ValueError("preset=custom requires non-empty command array")
+        command = [str(item) for item in command]
+    elif preset in presets:
+        command = presets[preset]
+    else:
+        supported = ", ".join(sorted(list(presets.keys()) + ["custom"]))
+        raise ValueError(f"unsupported preset: {preset}. supported={supported}")
+
+    result = _run_command(command, project_dir, timeout_sec, env, capture_limit)
+    result["preset"] = preset
+    return result
+
+
+TOOLS: dict[str, Tool] = {
+    "detect_build_system": Tool(
+        name="detect_build_system",
+        description="Detect and recommend a dependency-aware build system in a project directory.",
+        input_schema={
+            "type": "object",
+            "properties": {
+                "project_dir": {"type": "string", "default": "."},
+                "language": {"type": "string"},
+            },
+        },
+        handler=tool_detect_build_system,
+    ),
+    "compile_project": Tool(
+        name="compile_project",
+        description=(
+            "Compile using a dependency-aware standard build tool. "
+            "For Fortran/C family, make/cmake/meson/ninja are allowed, and make is default."
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "project_dir": {"type": "string", "default": "."},
+                "language": {"type": "string"},
+                "build_system": {"type": "string"},
+                "target": {"type": "string"},
+                "jobs": {"type": "integer", "minimum": 1},
+                "extra_args": {"type": "array", "items": {"type": "string"}},
+                "timeout_sec": {"type": "integer", "minimum": 1},
+                "capture_limit": {"type": "integer", "minimum": 1000},
+                "env": {
+                    "type": "object",
+                    "additionalProperties": {"type": "string"},
+                },
+            },
+            "required": ["project_dir"],
+        },
+        handler=tool_compile_project,
+    ),
+    "run_program": Tool(
+        name="run_program",
+        description="Run a program without shell expansion and capture stdout/stderr.",
+        input_schema={
+            "type": "object",
+            "properties": {
+                "project_dir": {"type": "string", "default": "."},
+                "command": {"type": "array", "items": {"type": "string"}},
+                "timeout_sec": {"type": "integer", "minimum": 1},
+                "capture_limit": {"type": "integer", "minimum": 1000},
+                "env": {
+                    "type": "object",
+                    "additionalProperties": {"type": "string"},
+                },
+            },
+            "required": ["project_dir", "command"],
+        },
+        handler=tool_run_program,
+    ),
+    "run_quality_checks": Tool(
+        name="run_quality_checks",
+        description=(
+            "Run quality checks through standard workflows. "
+            "Supports presets (make_test/make_check/ctest/pytest) or custom."
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "project_dir": {"type": "string", "default": "."},
+                "preset": {"type": "string", "default": "make_test"},
+                "command": {"type": "array", "items": {"type": "string"}},
+                "timeout_sec": {"type": "integer", "minimum": 1},
+                "capture_limit": {"type": "integer", "minimum": 1000},
+                "env": {
+                    "type": "object",
+                    "additionalProperties": {"type": "string"},
+                },
+            },
+            "required": ["project_dir"],
+        },
+        handler=tool_run_quality_checks,
+    ),
+}
+
+
+def _tool_descriptor(tool: Tool) -> dict[str, Any]:
+    return {
+        "name": tool.name,
+        "description": tool.description,
+        "inputSchema": tool.input_schema,
+    }
+
+
+def _error_response(message_id: Any, code: int, message: str) -> dict[str, Any]:
+    return {
+        "jsonrpc": JSONRPC_VERSION,
+        "id": message_id,
+        "error": {
+            "code": code,
+            "message": message,
+        },
+    }
+
+
+def _success_response(message_id: Any, result: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "jsonrpc": JSONRPC_VERSION,
+        "id": message_id,
+        "result": result,
+    }
+
+
+def _handle_request(message: dict[str, Any]) -> dict[str, Any] | None:
+    method = message.get("method")
+    message_id = message.get("id")
+    params = message.get("params", {}) or {}
+
+    if method == "initialize":
+        protocol_version = params.get("protocolVersion", DEFAULT_PROTOCOL_VERSION)
+        return _success_response(
+            message_id,
+            {
+                "protocolVersion": protocol_version,
+                "capabilities": {
+                    "tools": {},
+                },
+                "serverInfo": {
+                    "name": SERVER_NAME,
+                    "version": SERVER_VERSION,
+                },
+            },
+        )
+
+    if method == "notifications/initialized":
+        return None
+
+    if method == "ping":
+        return _success_response(message_id, {})
+
+    if method == "tools/list":
+        return _success_response(
+            message_id,
+            {
+                "tools": [_tool_descriptor(tool) for tool in TOOLS.values()],
+            },
+        )
+
+    if method == "tools/call":
+        tool_name = params.get("name")
+        arguments = params.get("arguments", {}) or {}
+        if tool_name not in TOOLS:
+            return _error_response(message_id, -32602, f"unknown tool: {tool_name}")
+        tool = TOOLS[tool_name]
+        try:
+            data = tool.handler(arguments)
+            text = json.dumps(data, ensure_ascii=False, indent=2)
+            return _success_response(
+                message_id,
+                {
+                    "content": [{"type": "text", "text": text}],
+                    "structuredContent": data,
+                    "isError": False,
+                },
+            )
+        except Exception as exc:  # noqa: BLE001
+            error_data = {
+                "error": str(exc),
+            }
+            text = json.dumps(error_data, ensure_ascii=False, indent=2)
+            return _success_response(
+                message_id,
+                {
+                    "content": [{"type": "text", "text": text}],
+                    "structuredContent": error_data,
+                    "isError": True,
+                },
+            )
+
+    if message_id is None:
+        return None
+    return _error_response(message_id, -32601, f"method not found: {method}")
+
+
+def main() -> int:
+    while True:
+        message = _read_message()
+        if message is None:
+            return 0
+        if not isinstance(message, dict):
+            continue
+        response = _handle_request(message)
+        if response is not None:
+            _write_message(response)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

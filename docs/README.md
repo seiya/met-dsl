@@ -36,3 +36,4 @@
 - 仕様の追加・変更は `SPEC.md` と `CONTROLLED_SPEC.md` と `physical_tests` を更新する。
 - 言語に依らず、生成コードは `model`（物理計算）と `runner`（実行・判定連携）を分離する。
 - 試行手順が固まり次第、`RUNBOOK.md` を前提に自動化を進める。
+- `compile` / `run` / `quality check` は MCP サーバー（`mcp_servers/build_runtime_server.py`）経由で実行する。

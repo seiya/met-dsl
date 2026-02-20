@@ -72,12 +72,17 @@ bitwise 一致は要求しない。以下の性質で一致を判定する。
 - 1 回のテスト実行に付与する識別子。
 - 推奨: `YYYYMMDD_HHMMSS_<gitsha>_<target>`
 
-## 8. 自動微分（AD: Automatic Differentiation）
+## 8. MCP（Model Context Protocol）
+- ツール実行を標準化するためのプロトコル。
+- 本プロジェクトでは `compile` / `run` / `quality check` を MCP サーバー経由で実行する。
+- `fortran` / `c` / `cpp` / `mixed` 系の `compile` は、依存関係を扱える標準ビルドツール（既定値 `make`）を介して実行する。
+
+## 9. 自動微分（AD: Automatic Differentiation）
 - 離散実装された計算グラフに対して導関数（JVP/VJP,gradient）を機械的に求める手法。
 - 本プロジェクトでは将来対応を前提とし、現段階では「AD を阻害しない仕様・実装構造」を要求する。
 - 非微分演算（例: clip,limiter, 分岐）を含む場合は、仕様上で扱いを明示する。
 
-## 9. `spec` 分類語彙（`domain` / `component`）
+## 10. `spec` 分類語彙（`domain` / `component`）
 - **domain**: 物理モデルの上位分類。`spec` 配置と `component_id` 接頭辞の一貫性を保つための固定語彙である。例: `transport`, `dynamics`, `microphysics`, `radiation`, `land_surface`。
 - **component**: `domain` 内の機能単位。方程式系または離散化責務で分割する。例: `advection_diffusion`, `compressible_core`, `bulk_cloud`。
 - **operation**: `component` が公開する呼び出し単位。言語固有の関数・手続き・メソッドなどの実体を抽象化した語彙である。

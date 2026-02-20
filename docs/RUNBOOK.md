@@ -27,11 +27,12 @@
 3. **Plan 生成**: `case.resolved.yaml` を決定的に生成
 4. **実装 Plan 決定**: `impl.resolved.yaml` を固定（探索する場合は候補集合を用意）
 5. **生成**: LLM またはテンプレ補完で `model` と `runner` を分離して生成
-6. **実行**: runner（例: `simulate`）を実行し、runner 経由で model を呼び出して diagnostics/perf を出力
-7. **判定**: 物理判定を実施し、verdict を生成
-8. **記録**: spec_version / test_suite_version / case_hash / impl_hash / git_sha を保存
+6. **Build**: MCP サーバーの `compile_project` で依存関係を扱える標準ビルドツールを実行する（`fortran` / `c` 系の既定値は `make`）
+7. **実行**: MCP サーバーの `run_program` で runner（例: `simulate`）を実行し、runner 経由で model を呼び出して diagnostics/perf を出力
+8. **判定**: 物理判定を実施し、verdict を生成
+9. **記録**: spec_version / test_suite_version / case_hash / impl_hash / git_sha を保存
    - `plan_id` / `pipeline_id` / `generation_id` / `build_id` / `execution_id` を保存する
-9. **次アクション**: 失敗分類に応じて戻る場所を決める
+10. **次アクション**: 失敗分類に応じて戻る場所を決める
 
 ## 3. 失敗時の戻り先（指針）
 - **Spec 不備**: 曖昧・欠落・単位不整合 → Spec へ戻る

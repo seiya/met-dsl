@@ -23,18 +23,21 @@
 - `target.backend`（例: `cpu_fortran_reference`,`cuda_fortran`）
 - `toolchain.language`（例: `fortran`,`cpp`,`cuda_fortran`）
 - `toolchain.standard`（例: `2008`,`c++17`）
+- `toolchain.build_system`（例: `make`,`cmake`,`meson`,`ninja`）
 - `abstract`（言語非依存ノブ）
 - `backend_overrides`（言語/バックエンド依存ノブ）
 - `selected.backend_key`
 
 ルール:
 - **プログラミング言語は 1-2（実装 Plan）で必ず固定する。**
-- `toolchain.language` / `toolchain.standard` が未定義の場合、生成工程へ進めずエラーとする。
+- `toolchain.language` / `toolchain.standard` / `toolchain.build_system` が未定義の場合、生成工程へ進めずエラーとする。
+- `toolchain.language` が `fortran` / `c` / `cpp` / `mixed` 系の場合、`toolchain.build_system` は `make` / `cmake` / `meson` / `ninja` のいずれかとする。既定値は `make` とする。
 
 ## 3. 任意項目（環境依存）
 - `toolchain.compiler` / `toolchain.linker` は**任意**とする。
 - compiler 種別・バージョンを固定したい場合（CI 再現性重視）のみ記載する。
 - 固定しない場合は、実行環境の既定コンパイラを使う。
+- 直接 `gcc` / `clang` / `gfortran` を呼び出して単発ビルドする運用を禁止し、必ず `toolchain.build_system` を介してビルドする。
 
 ## 4. 生成物の構成ルール（言語共通）
 - 生成コードは言語に依らず、`model`（物理計算）と `runner`（入出力・判定連携）を分離する。

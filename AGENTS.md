@@ -41,3 +41,14 @@
 - 議論ログ調の表現が残っていない。
 - 各節が単独で読める完結文になっている。
 - 要件・制約・入出力・判定条件が具体化されている。
+
+## MCP 実行ルール
+- `compile` / `run` / `quality check` は、必ず MCP サーバー経由で実行する。
+- 標準サーバーは `mcp_servers/build_runtime_server.py` とし、`detect_build_system` / `compile_project` / `run_program` / `run_quality_checks` を使用する。
+- `compile` で `fortran` / `c` / `cpp` / `mixed` 系を扱う場合、依存関係を扱える標準ビルドツールのみを許可する。既定値は `make` とする。
+- `gcc` / `clang` / `gfortran` を直接呼び出す単発ビルドを禁止する。
+- `compile` / `run` 以外で MCP 適用が有効な処理（例: build system 判定、test 実行、check 実行）は、同様に MCP ツールを実装し、直接シェル実行を避ける。
+
+## MCP 設定参照
+- MCP クライアント設定は `mcp_servers/mcp_servers.example.json` を参照する。
+- 運用詳細は `mcp_servers/README.md` を参照する。

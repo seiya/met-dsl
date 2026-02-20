@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "build-runtime": {
+      "command": "python",
+      "args": [
+        "./mcp_servers/build_runtime_server.py"
+      ]
+    }
+  }
+}
