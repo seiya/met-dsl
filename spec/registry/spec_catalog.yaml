@@ -10,3 +10,4 @@ specs:
     physical_test_suites:
       - suite_id: advdiff1d_linear_physical_tests
         path: spec/transport/advection_diffusion/advdiff1d_linear/physical_tests/advdiff1d_linear_physical_tests.yaml
+    official_releases: []

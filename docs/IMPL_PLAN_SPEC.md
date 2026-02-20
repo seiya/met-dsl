@@ -21,6 +21,7 @@
 
 - `target.class`（cpu/gpu など）
 - `target.backend`（例: `cpu_fortran_reference`,`cuda_fortran`）
+- `target.architecture`（例: `x86_64`,`aarch64`,`nvidia_sm80`）
 - `toolchain.language`（例: `fortran`,`cpp`,`cuda_fortran`）
 - `toolchain.standard`（例: `2008`,`c++17`）
 - `toolchain.build_system`（例: `make`,`cmake`,`meson`,`ninja`）
@@ -30,7 +31,11 @@
 
 ルール:
 - **プログラミング言語は 1-2（実装 Plan）で必ず固定する。**
-- `toolchain.language` / `toolchain.standard` / `toolchain.build_system` が未定義の場合、生成工程へ進めずエラーとする。
+- **ターゲットアーキテクチャは 1-2（実装 Plan）で必ず固定する。**
+- `toolchain.language` は Plan 生成時に固定する。`target.class=cpu` の既定値は `fortran`、`target.class=gpu` の既定値は `cuda_fortran` とする。
+- `target.class` が `cpu` / `gpu` 以外の場合、`toolchain.language` の既定値補完を禁止する。
+- `impl.resolved.yaml` で `toolchain.language` / `toolchain.standard` / `toolchain.build_system` が未定義の場合、生成工程へ進めずエラーとする。
+- `target.architecture` が未定義の場合、生成工程へ進めずエラーとする。
 - `toolchain.language` が `fortran` / `c` / `cpp` / `mixed` 系の場合、`toolchain.build_system` は `make` / `cmake` / `meson` / `ninja` のいずれかとする。既定値は `make` とする。
 
 ## 3. 任意項目（環境依存）

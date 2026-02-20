@@ -7,7 +7,7 @@
 ### 対象
 - 入力: Controlled Spec（物理・アルゴリズム定義）と physical_tests（妥当性検証用の入力・判定プロファイル）
 - 出力: 実行コード（model + runner）、物理診断、性能診断、合否判定
-- 運用: Spec→Plan→Generate→Execute→Judge→Tune のループ
+- 運用: Spec→Plan→Generate→Execute→Judge→Tune→Promote のループ
 - ハードウェア: CPU / GPU を含む（Phase 0 は CPU 参照、以降 GPU へ拡張）
 - 実行時入力はユーザーが科学目的に応じて設計でき、`physical_tests` はそのうち妥当性検証に使う既定プロファイルを与える。
 - 言語に依らず、物理計算を担う model と、入出力・判定連携を担う runner を分離する。
@@ -25,7 +25,18 @@
 
 ## LLM の扱い
 - LLM はモデル種類を問わない（交換可能）。
-- 品質はテストで担保する。
+- 最終的な品質保証は Execute 後の実行診断で行う。判定の正本は `diagnostics.json` / `verdict.json` / `perf.json` とする。
+- LLM を使う各ステージは、ステージ内部で `generate -> verify -> regenerate` を反復し、検証合格後のみ成果物を確定する。
+- ステージ内部の verify は、当該ステージの入力契約に対する出力整合性を検査する狭いスコープの判定とする。
+- ステージ内部の verify は主に構造・契約・トレーサビリティの整合確認を目的とし、物理妥当性の最終保証を代替しない。
+- ステージ内部の verify 合格は必要条件であり、十分条件ではない。
+- verifier は generator と独立したコンテキスト（別セッションまたは別エージェント）での実行を可能な限り優先する。
+- 実行環境の制約で独立コンテキストを確保できない場合は、同一コンテキスト実行を許容し、制約理由をメタデータへ記録する。
+- 失敗試行の中間成果物は標準運用で永続保存せず、最終合格成果物のみを保存する。
+- `LLM` 利用ステージは、ステージメタデータの出力を必須とする。正本は各ステージの `<stage>_meta.json` とする。コード生成ステージでは `generate_meta.json` とする。
+- `LLM` 利用ステージのメタデータ必須項目は、`attempt_count`、`verification_status`、`last_fail_reason`、`context_isolated`、`debug_mode` とする。`context_isolated=false` の場合は `constraint_reason` を必須とする。
+- `debug_mode` の既定値は `false` とする。`debug_mode=false` では失敗試行の中間成果物を保存しない。
+- `debug_mode=true` の場合のみ失敗試行の成果物保存を許可する。保存時は各ステージのメタデータに `retained_failed_attempts`（保存件数）と保存先を記録する。
 
 ## アーキテクチャ方針（現時点）
 - **物理アルゴリズム（A）**: 物理結果に影響する選択。`case.resolved.yaml` で決定し、決定的である必要がある。
@@ -50,7 +61,6 @@
 spec/
   registry/
     spec_catalog.yaml
-    component_catalog.yaml
   <domain>/
     <component>/
       <spec_id>/
@@ -58,31 +68,46 @@ spec/
         physical_tests/
           <suite_id>.yaml
         deps.yaml
+releases/
+  registry/
+    component_catalog.yaml
+  <domain>/
+    <component>/
+      <spec_id>/
+        <target_architecture>/
+          <toolchain_language>/
+            <release_id>/
 ```
 
 2. すべての `spec` は階層構造へ配置する。
    - `domain` と `component` の定義は `GLOSSARY.md` の「`spec` 分類語彙」を参照する。
-3. `spec_id` はリポジトリ内で一意とし、形式は `^[a-z][a-z0-9_]{2,63}$` を必須とする。
-4. `suite_id` は `spec_id` を接頭辞に持つ形式（`<spec_id>_<purpose>`）を必須とする。
-5. `component_id` は `^[a-z][a-z0-9_]{2,63}$` を必須とし、推奨形式を `<domain>_<component>_<operator>_<dim>d_<scheme>` とする。
-6. `operation_id` は `component_id` を接頭辞に持つ形式（`<component_id>__<action>`）を必須とする。
-7. 生成コードの公開名は互換性管理を必須とする。`major` 互換が破壊される変更は別名に分離する。
-8. 各 `spec` は `deps.yaml` で依存 `component` を宣言し、直接パス参照（相対 import）を禁止する。
-9. 依存解決は `component_id` + `version constraint` で行い、解決結果を `case.resolved.yaml` に固定する。
-10. `registry/component_catalog.yaml` は `component` 単位の責務・公開 `operation`・互換性情報・実装状態を保持する。
-11. 未実装 `component` / `operation` を参照する `spec` は生成工程へ進めず、依存解決エラーとする。
+3. 正式版成果物は `spec` 配下に配置してはならない。保存先は `releases/<domain>/<component>/<spec_id>/<target_architecture>/<toolchain_language>/<release_id>/` を必須とする。
+4. `spec_id` はリポジトリ内で一意とし、形式は `^[a-z][a-z0-9_]{2,63}$` を必須とする。
+5. `suite_id` は `spec_id` を接頭辞に持つ形式（`<spec_id>_<purpose>`）を必須とする。
+6. `component_id` は `^[a-z][a-z0-9_]{2,63}$` を必須とし、推奨形式を `<domain>_<component>_<operator>_<dim>d_<scheme>` とする。
+7. `operation_id` は `component_id` を接頭辞に持つ形式（`<component_id>__<action>`）を必須とする。
+8. 生成コードの公開名は互換性管理を必須とする。`major` 互換が破壊される変更は別名に分離する。
+9. 各 `spec` は `deps.yaml` で依存 `component` を宣言し、直接パス参照（相対 import）を禁止する。
+10. 依存解決は `component_id` + `version constraint` で行い、解決結果を `case.resolved.yaml` に固定する。
+11. `releases/registry/component_catalog.yaml` は `component` 単位の責務・公開 `operation`・互換性情報・実装状態を保持する。
+12. 未実装 `component` / `operation` を参照する `spec` は生成工程へ進めず、依存解決エラーとする。
 
 ### 設計方針
-- `spec` は「物理仕様の定義」に限定し、再利用資産の正本は `registry/component_catalog.yaml` に集約する。
+- `spec` は「物理仕様の定義」に限定し、再利用資産の正本は `releases/registry/component_catalog.yaml` に集約する。
 - `component` の責務は物理演算単位で分割する。`runner` は台帳上の公開 `operation` のみ呼び出す。
 - `spec` 横断で共有する演算（境界処理、フラックス、時間積分、診断）は `component` として独立管理する。
 - `component` の API 変更は `major` を更新し、旧 `major` を同時運用可能にする。
 
 ### 運用ルール
 - 新規 `spec` 追加時は `registry/spec_catalog.yaml` への登録を必須とする。
-- `spec` 更新で再利用境界が変わる場合は `registry/component_catalog.yaml` を同時更新する。
+- `spec` 更新で再利用境界が変わる場合は `releases/registry/component_catalog.yaml` を同時更新する。
 - `deps.yaml` の依存解決結果は `case.resolved.yaml` に記録し、実行時の再解決を禁止する。
 - `component` の実装状態が `spec_defined_not_implemented` の間は、依存先 `spec` を `status=draft` 扱いに固定する。
+- `workspace` は試行成果物の作業領域とし、正式版成果物の正本に使ってはならない。
+- `toolchain.language` の既定値は `target.class=cpu` で `fortran`、`target.class=gpu` で `cuda_fortran` とし、`impl.resolved.yaml` へ補完後の値を明示記録する。
+- 採用する実装は `releases/<domain>/<component>/<spec_id>/<target_architecture>/<toolchain_language>/<release_id>/` へ昇格保存する。
+- 昇格時は `registry/spec_catalog.yaml` の対象 `spec_id` に `official_releases` を追加し、`release_id` / `target_architecture` / `toolchain_language` / `target_backend` / `source_pipeline_id` / `source_generation_id` / `source_build_id` / `source_execution_id` / `artifact_root` / `promoted_at` / `status` を必須記録する。
+- `official_releases` の `status=active` は各 `spec_id` の `target_architecture + toolchain_language` ごとに 1 件のみ許可し、切替は新規 `release` 追加と旧 `release` の `deprecated` 化で管理する。
 
 ### 判定基準
 - `spec` の CI は `spec_id` / `component_id` / `operation_id` の形式検証を pass しなければならない。

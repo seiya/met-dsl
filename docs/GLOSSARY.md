@@ -5,8 +5,8 @@
 ## 1. 成果物（Artifacts）
 - **controlled_spec.md**: 物理・数値アルゴリズム定義の正本。生成器が model（実装本体）を作るために参照する。
 - **physical_tests.yaml**: 妥当性検証用プロファイル（入力インスタンス、ケース展開、判定条件）の正本。テストランナーが参照する。
-- **spec_catalog.yaml**: `spec` の台帳。`spec_id`、配置先、状態、移行要否を保持する。
-- **component_catalog.yaml**: 再利用 `component` / `operation` の台帳。責務、公開 API、互換性、実装状態を保持する。
+- **spec_catalog.yaml**: `spec` の台帳。`spec_id`、配置先、状態、`official_releases`（正式版実装の登録情報）を保持する。
+- **component_catalog.yaml**: 再利用 `component` / `operation` の台帳。保存先は `releases/registry/component_catalog.yaml` とし、責務、公開 API、互換性、実装状態を保持する。
 - **deps.yaml**: 各 `spec` が要求する `component` 依存宣言。`component_id` と `version constraint` を定義する。
 - **case.yaml**: 人間が書く（または将来 Spec から生成する）テストケース定義。 sweep/refinement などを含み得る。
 - **case.resolved.yaml**: テストランナーが生成する“決定済み”入力。 sweep 展開、物理アルゴリズム（後述）と数値条件を決定したもの。 runner（例: `simulate`）がこれを読む。
@@ -14,17 +14,28 @@
 - **plan_id**: `case.resolved.yaml` と `impl.resolved.yaml` の組を識別する ID。推奨形式は `<spec_id>_<case_hash12>_<impl_hash12>`。
 - **pipeline_id**: Generate→Build→Execute の 1 系列を識別する ID。推奨形式は `<plan_id>_<utc_ts>_<seq3>`。
 - **generation_id / build_id / execution_id**: 各段階の試行を識別する ID。
+- **release_id**: 各 `spec` の正式版実装を識別する ID。推奨形式は `<spec_version>_<utc_ts>_<seq3>`。
+- **target_architecture**: 正式版成果物を分離するアーキテクチャ識別子。例: `x86_64`,`aarch64`,`nvidia_sm80`。
+- **release artifact root**: 正式版成果物の保存ルート。`releases/<domain>/<component>/<spec_id>/<target_architecture>/<toolchain_language>/<release_id>/` を正本とする。
+- **official_releases**: `spec_catalog.yaml` に保持する正式版実装の登録配列。`target_architecture`、`toolchain_language`、`target_backend`、`source_pipeline_id`、`source_generation_id`、`source_build_id`、`source_execution_id`、`artifact_root`、`promoted_at`、`status` を持つ。
 - **lineage.json**: `spec_ref`、`plan_ref`、`pipeline_id`、各段階 ID の関係を記録する来歴ファイル。
 - **model**: 物理計算を実行する計算コンポーネント/ライブラリ。入力状態から次状態を計算する責務を持つ。
 - **runner（例: `simulate`）**: 実行エントリポイント。入力読込・ model 呼び出し・ diagnostics/perf 出力を担当する。
+- **`<stage>_meta.json`**: `LLM` 利用ステージの実行メタデータ。`attempt_count`、`verification_status`、`last_fail_reason`、`context_isolated`、`debug_mode` を保持する。`context_isolated=false` では `constraint_reason` を必須とする。`debug_mode=true` で失敗試行を保存した場合は `retained_failed_attempts` と保存先を保持する。
+- **generate_meta.json**: コード生成ステージの `<stage>_meta.json`。
+- **verifier（in-stage）**: LLM ステージ内部で実行される整合チェック担当。成果物のみを入力に取り、`generate -> verify -> regenerate` ループで合否を返す。
 - **diagnostics.json**: runner が出す物理・数値診断（保存量、誤差、CFL など）。合否は含めない。
 - **perf.json**: runner が出す性能診断（最低限 `walltime_sec`、`throughput_cells_per_sec`、`parallelism`）。合否は含めない。
 - **verdict.json**: テストランナーが出す合否判定と根拠。
 - **summary.json**: run 全体の集計（pass/fail/skipped、失敗分類別件数など）。
 - **stdout.log / stderr.log**: 実行ログ（必ず保存し、後追いデバッグ可能にする）。
+- **attempts/**: `debug_mode=true` のときにのみ作成される失敗試行保存ディレクトリ。標準運用（`debug_mode=false`）では作成しない。
 
 補足:
 - `perf.json` は `diagnostics.json` とは分離して出力する（同居しない）。
+- verifier は generator と独立したコンテキストでの実行を可能な限り優先する。
+- 実行環境の制約で独立コンテキストを確保できない場合は、同一コンテキスト実行を許容し、各ステージの `<stage>_meta.json` に制約理由を記録する。
+- 失敗試行の中間成果物は標準運用で保存しない。保存は `debug_mode=true` の場合のみ許可する。
 
 ## 2. テストレベル（L0-L3）の意味
 L0-L3 は「テストの粒度と目的」を表す分類であり、実装の層番号ではない。

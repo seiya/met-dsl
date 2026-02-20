@@ -22,6 +22,7 @@ tuner は generator から分離し、次のループを標準運用とする。
 
 ### Per-trial Outputs
 - `impl.resolved.yaml`（selected を確定）
+- `<stage>_meta.json`（`LLM` 利用ステージ内検証の結果）
 - `diagnostics.json`（物理）
 - `perf.json`（性能）
 - `verdict.json`（物理合否 + 可能なら性能判定）
@@ -30,6 +31,8 @@ tuner は generator から分離し、次のループを標準運用とする。
 ### Loop
 - 候補生成（LLM 支援/BO/ ルール）
 - （必要なら）generator でコード差分生成
+- `LLM` を利用する候補生成・コード生成は `SPEC.md` の「LLM の扱い」を適用する
+- 標準運用は `debug_mode=false` とし、失敗試行成果物を保存しない。調査時のみ `debug_mode=true` を許可する
 - 推奨: **コードの構造はテンプレで固定し、impl ノブで分岐**。 LLM は新しい実装パターン追加時のみ使う。
 - ビルド（ターゲット別）
 - quick physics gate（L0-L2 のサブセット）
