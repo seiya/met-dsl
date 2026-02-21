@@ -9,3 +9,11 @@ specs:
     controlled_spec_path: spec/transport/advection_diffusion/advdiff1d_linear/controlled_spec.md
     physical_tests_path: spec/transport/advection_diffusion/advdiff1d_linear/physical_tests.md
     official_releases: []
+  - spec_id: shallow_water2d
+    spec_version: 0.1.0
+    status: controlled_draft
+    domain: dynamics
+    component: shallow_water
+    controlled_spec_path: spec/dynamics/shallow_water/shallow_water2d/controlled_spec.md
+    physical_tests_path: spec/dynamics/shallow_water/shallow_water2d/physical_tests.md
+    official_releases: []

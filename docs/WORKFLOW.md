@@ -28,6 +28,7 @@
 - この時点で `target.backend` と `toolchain.language`（例: Fortran/C++）を固定する。
 - ユーザーからプログラミング言語の明示指定がない場合、`target.class=cpu` では `fortran`、`target.class=gpu` では `cuda_fortran` を必ず採用する。
 - `toolchain.language` の既定値からの逸脱は、ユーザーがプログラミング言語を明示指定した場合にのみ許可する。
+- `target.class=cpu` でユーザーがループ並列化方式を指定しない場合、並列化可能ループは `OpenMP` を既定で適用する。
 - この時点で `target.architecture`（例: `x86_64`,`nvidia_sm80`）を固定する。
 - この時点で `toolchain.build_system`（例: `make`,`cmake`）を固定する。
 - compiler 種別は任意（再現性が必要な運用でのみ固定）とする。
@@ -40,6 +41,7 @@
 - 出力: 実装コード（model + runner）と付随ドキュメント
 - 言語に依らず、**モデル本体（物理計算）** と **テスト runner（入出力・判定連携）** を分離して生成する。
 - runner は model を `call` / `use` / `import` で呼び出し、物理更新ロジックを重複実装しない。
+- `target.class=cpu` では、ループ並列化方式の明示指定がない限り、並列化可能ループに `OpenMP` を付与する。
 - コード生成で `LLM` を利用する場合は、共通規約（`SPEC.md`）を適用する。
 
 ## 3. 実行（runner / simulate）
@@ -50,6 +52,8 @@
 
 ## 4. 判定（runner）
 - 物理判定: diagnostics を用いて checks/thresholds を評価（詳細は `PHYSICAL_VALIDATION.md`）
+- 実装品質判定: `target.class=cpu` の場合、同一 `case.resolved.yaml` を `threads_per_rank=1` と `threads_per_rank>1` で実行し、結果を比較する。比較対象は `diagnostics.json` と `verdict.json` とする。
+- スレッド並列あり/なしの比較は `physical_tests` の判定対象に含めず、`quality check` として扱う。
 - 性能判定（任意）: perf を用いて performance regression を評価
 - 物理 fail 時は性能評価をスキップする。
 

@@ -26,19 +26,20 @@
 1. **Spec 更新**: Controlled Spec を修正し、曖昧さ・欠落を解消する
 2. **Test 更新**: 実験条件・判定条件を `physical_tests.md` で更新する
 3. **Plan 生成**: `case.resolved.yaml` を決定的に生成する。`LLM` を利用する場合は `SPEC.md` の「LLM の扱い」を適用する
-4. **実装 Plan 決定**: `impl.resolved.yaml` を固定（探索する場合は候補集合を用意）。ユーザーからプログラミング言語の明示指定がない場合、`target.class=cpu` では `fortran`、`target.class=gpu` では `cuda_fortran` を必ず採用する。`toolchain.language` の既定値からの逸脱は、ユーザーがプログラミング言語を明示指定した場合にのみ許可する
+4. **実装 Plan 決定**: `impl.resolved.yaml` を固定（探索する場合は候補集合を用意）。ユーザーからプログラミング言語の明示指定がない場合、`target.class=cpu` では `fortran`、`target.class=gpu` では `cuda_fortran` を必ず採用する。`toolchain.language` の既定値からの逸脱は、ユーザーがプログラミング言語を明示指定した場合にのみ許可する。`target.class=cpu` でループ並列化方式の明示指定がない場合は、並列化可能ループに `OpenMP` を既定適用する
 5. **生成**: `LLM` またはテンプレ補完で `model` と `runner` を分離して生成する。`LLM` を利用する場合は `SPEC.md` の「LLM の扱い」を適用する
 6. **Build**: MCP サーバーの `compile_project` で依存関係を扱える標準ビルドツールを実行する（`fortran` / `c` 系の既定値は `make`）
 7. **実行**: MCP サーバーの `run_program` で runner（例: `simulate`）を実行し、runner 経由で model を呼び出して diagnostics/perf を出力
-8. **判定**: 物理判定を実施し、verdict を生成
-9. **記録**: spec_version / test_profile_version / case_hash / impl_hash / git_sha を保存
+8. **品質比較**: `target.class=cpu` の場合、`quality check` として `threads_per_rank=1` と `threads_per_rank>1` の実行結果を比較する。比較対象は `diagnostics.json` と `verdict.json` とする。
+9. **判定**: 物理判定を実施し、verdict を生成
+10. **記録**: spec_version / test_profile_version / case_hash / impl_hash / git_sha を保存
    - `plan_id` / `pipeline_id` / `generation_id` / `build_id` / `execution_id` を保存する
    - `LLM` 利用ステージは各ステージの `<stage>_meta.json`（コード生成は `generate_meta.json`）に `attempt_count` / `verification_status` / `last_fail_reason` / `debug_mode` を保存する
    - `context_isolated=false` の場合は制約理由を記録する
    - `debug_mode=true` で失敗試行を保存した場合は保存件数と保存先を記録する
-10. **チューニング**: 物理合格を満たす候補の中から性能目的関数で最良候補を選定し、採用する `impl.resolved` を確定する
-11. **正式版昇格**: 採用する試行は `releases/<domain>/<component>/<spec_id>/<target_architecture>/<toolchain_language>/<release_id>/` へ昇格保存し、`spec/registry/spec_catalog.yaml` の `official_releases` に `release_id` / `target_architecture` / `toolchain_language` / `target_backend` / `source_pipeline_id` / `source_generation_id` / `source_build_id` / `source_execution_id` / `artifact_root` / `promoted_at` / `status` を記録する
-12. **次アクション**: 失敗分類に応じて戻る場所を決める
+11. **チューニング**: 物理合格を満たす候補の中から性能目的関数で最良候補を選定し、採用する `impl.resolved` を確定する
+12. **正式版昇格**: 採用する試行は `releases/<domain>/<component>/<spec_id>/<target_architecture>/<toolchain_language>/<release_id>/` へ昇格保存し、`spec/registry/spec_catalog.yaml` の `official_releases` に `release_id` / `target_architecture` / `toolchain_language` / `target_backend` / `source_pipeline_id` / `source_generation_id` / `source_build_id` / `source_execution_id` / `artifact_root` / `promoted_at` / `status` を記録する
+13. **次アクション**: 失敗分類に応じて戻る場所を決める
 
 ## 3. 失敗時の戻り先（指針）
 - **Spec 不備**: 曖昧・欠落・単位不整合 → Spec へ戻る

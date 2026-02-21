@@ -23,6 +23,7 @@
 - `Controlled Spec` にはケース固有の検証条件を書かない。
 - `physical_tests` には離散化スキーム定義や物理方程式の変更を書かない。
 - `physical_tests` は入力と判定の「検証プロファイル」を定義し、ランナー実装の都合を正本化しない。
+- `OpenMP` 有無やスレッド数変更の比較など、実装品質を対象とする比較は `physical_tests` に含めず、`quality check` で扱う。
 - `case.resolved.yaml` の生成は決定的でなければならない。同一 `Controlled Spec` と同一 `physical_tests` から同一 `case_id` 群を生成する。
 
 ## 記述フォーマット（固定テンプレート）
