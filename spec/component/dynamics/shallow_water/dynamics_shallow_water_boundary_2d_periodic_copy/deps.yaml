@@ -1,0 +1,5 @@
+spec_id: dynamics_shallow_water_boundary_2d_periodic_copy
+spec_kind: component
+dependencies:
+  components: []
+  profiles: []

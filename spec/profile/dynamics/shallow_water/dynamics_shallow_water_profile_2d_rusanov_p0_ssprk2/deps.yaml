@@ -1,0 +1,11 @@
+spec_id: dynamics_shallow_water_profile_2d_rusanov_p0_ssprk2
+spec_kind: profile
+dependencies:
+  components:
+    - component_id: dynamics_shallow_water_flux_2d_rusanov_p0
+      version_constraint: ">=0.1.0 <1.0.0"
+    - component_id: dynamics_shallow_water_boundary_2d_periodic_copy
+      version_constraint: ">=0.1.0 <1.0.0"
+    - component_id: dynamics_shallow_water_time_update_2d_ssprk2
+      version_constraint: ">=0.1.0 <1.0.0"
+  profiles: []

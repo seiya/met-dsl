@@ -1,0 +1,5 @@
+spec_id: transport_advection_diffusion_flux_1d_upwind_center2
+spec_kind: component
+dependencies:
+  components: []
+  profiles: []

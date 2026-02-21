@@ -1,0 +1,5 @@
+spec_id: dynamics_shallow_water_time_update_2d_ssprk2
+spec_kind: component
+dependencies:
+  components: []
+  profiles: []

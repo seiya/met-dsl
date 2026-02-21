@@ -1,19 +1,112 @@
-catalog_version: 0.1.0
+catalog_version: 0.2.0
 updated_at: 2026-02-21
 specs:
-  - spec_id: advdiff1d_linear
-    spec_version: 0.2.0
+  - spec_kind: problem
+    spec_id: advdiff1d_linear
+    spec_version: 0.3.0
     status: controlled_draft
     domain: transport
-    component: advection_diffusion
-    controlled_spec_path: spec/transport/advection_diffusion/advdiff1d_linear/controlled_spec.md
-    physical_tests_path: spec/transport/advection_diffusion/advdiff1d_linear/physical_tests.md
+    family: advection_diffusion
+    controlled_spec_path: spec/problem/transport/advection_diffusion/advdiff1d_linear/controlled_spec.md
+    tests_path: spec/problem/transport/advection_diffusion/advdiff1d_linear/tests.md
+    deps_path: spec/problem/transport/advection_diffusion/advdiff1d_linear/deps.yaml
     official_releases: []
-  - spec_id: shallow_water2d
+
+  - spec_kind: problem
+    spec_id: shallow_water2d
+    spec_version: 0.2.0
+    status: controlled_draft
+    domain: dynamics
+    family: shallow_water
+    controlled_spec_path: spec/problem/dynamics/shallow_water/shallow_water2d/controlled_spec.md
+    tests_path: spec/problem/dynamics/shallow_water/shallow_water2d/tests.md
+    deps_path: spec/problem/dynamics/shallow_water/shallow_water2d/deps.yaml
+    official_releases: []
+
+  - spec_kind: component
+    spec_id: transport_advection_diffusion_flux_1d_upwind_center2
+    spec_version: 0.1.0
+    status: controlled_draft
+    domain: transport
+    family: advection_diffusion
+    controlled_spec_path: spec/component/transport/advection_diffusion/transport_advection_diffusion_flux_1d_upwind_center2/controlled_spec.md
+    tests_path: spec/component/transport/advection_diffusion/transport_advection_diffusion_flux_1d_upwind_center2/tests.md
+    deps_path: spec/component/transport/advection_diffusion/transport_advection_diffusion_flux_1d_upwind_center2/deps.yaml
+    official_releases: []
+
+  - spec_kind: component
+    spec_id: transport_advection_diffusion_boundary_1d_periodic_copy
+    spec_version: 0.1.0
+    status: controlled_draft
+    domain: transport
+    family: advection_diffusion
+    controlled_spec_path: spec/component/transport/advection_diffusion/transport_advection_diffusion_boundary_1d_periodic_copy/controlled_spec.md
+    tests_path: spec/component/transport/advection_diffusion/transport_advection_diffusion_boundary_1d_periodic_copy/tests.md
+    deps_path: spec/component/transport/advection_diffusion/transport_advection_diffusion_boundary_1d_periodic_copy/deps.yaml
+    official_releases: []
+
+  - spec_kind: component
+    spec_id: transport_advection_diffusion_time_update_1d_euler1
+    spec_version: 0.1.0
+    status: controlled_draft
+    domain: transport
+    family: advection_diffusion
+    controlled_spec_path: spec/component/transport/advection_diffusion/transport_advection_diffusion_time_update_1d_euler1/controlled_spec.md
+    tests_path: spec/component/transport/advection_diffusion/transport_advection_diffusion_time_update_1d_euler1/tests.md
+    deps_path: spec/component/transport/advection_diffusion/transport_advection_diffusion_time_update_1d_euler1/deps.yaml
+    official_releases: []
+
+  - spec_kind: profile
+    spec_id: transport_advection_diffusion_profile_1d_upwind_center2_euler1
+    spec_version: 0.1.0
+    status: controlled_draft
+    domain: transport
+    family: advection_diffusion
+    controlled_spec_path: spec/profile/transport/advection_diffusion/transport_advection_diffusion_profile_1d_upwind_center2_euler1/controlled_spec.md
+    tests_path: spec/profile/transport/advection_diffusion/transport_advection_diffusion_profile_1d_upwind_center2_euler1/tests.md
+    deps_path: spec/profile/transport/advection_diffusion/transport_advection_diffusion_profile_1d_upwind_center2_euler1/deps.yaml
+    official_releases: []
+
+  - spec_kind: component
+    spec_id: dynamics_shallow_water_flux_2d_rusanov_p0
     spec_version: 0.1.0
     status: controlled_draft
     domain: dynamics
-    component: shallow_water
-    controlled_spec_path: spec/dynamics/shallow_water/shallow_water2d/controlled_spec.md
-    physical_tests_path: spec/dynamics/shallow_water/shallow_water2d/physical_tests.md
+    family: shallow_water
+    controlled_spec_path: spec/component/dynamics/shallow_water/dynamics_shallow_water_flux_2d_rusanov_p0/controlled_spec.md
+    tests_path: spec/component/dynamics/shallow_water/dynamics_shallow_water_flux_2d_rusanov_p0/tests.md
+    deps_path: spec/component/dynamics/shallow_water/dynamics_shallow_water_flux_2d_rusanov_p0/deps.yaml
+    official_releases: []
+
+  - spec_kind: component
+    spec_id: dynamics_shallow_water_boundary_2d_periodic_copy
+    spec_version: 0.1.0
+    status: controlled_draft
+    domain: dynamics
+    family: shallow_water
+    controlled_spec_path: spec/component/dynamics/shallow_water/dynamics_shallow_water_boundary_2d_periodic_copy/controlled_spec.md
+    tests_path: spec/component/dynamics/shallow_water/dynamics_shallow_water_boundary_2d_periodic_copy/tests.md
+    deps_path: spec/component/dynamics/shallow_water/dynamics_shallow_water_boundary_2d_periodic_copy/deps.yaml
+    official_releases: []
+
+  - spec_kind: component
+    spec_id: dynamics_shallow_water_time_update_2d_ssprk2
+    spec_version: 0.1.0
+    status: controlled_draft
+    domain: dynamics
+    family: shallow_water
+    controlled_spec_path: spec/component/dynamics/shallow_water/dynamics_shallow_water_time_update_2d_ssprk2/controlled_spec.md
+    tests_path: spec/component/dynamics/shallow_water/dynamics_shallow_water_time_update_2d_ssprk2/tests.md
+    deps_path: spec/component/dynamics/shallow_water/dynamics_shallow_water_time_update_2d_ssprk2/deps.yaml
+    official_releases: []
+
+  - spec_kind: profile
+    spec_id: dynamics_shallow_water_profile_2d_rusanov_p0_ssprk2
+    spec_version: 0.1.0
+    status: controlled_draft
+    domain: dynamics
+    family: shallow_water
+    controlled_spec_path: spec/profile/dynamics/shallow_water/dynamics_shallow_water_profile_2d_rusanov_p0_ssprk2/controlled_spec.md
+    tests_path: spec/profile/dynamics/shallow_water/dynamics_shallow_water_profile_2d_rusanov_p0_ssprk2/tests.md
+    deps_path: spec/profile/dynamics/shallow_water/dynamics_shallow_water_profile_2d_rusanov_p0_ssprk2/deps.yaml
     official_releases: []

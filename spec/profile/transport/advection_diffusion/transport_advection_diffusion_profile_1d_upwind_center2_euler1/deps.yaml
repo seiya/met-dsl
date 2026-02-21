@@ -1,0 +1,11 @@
+spec_id: transport_advection_diffusion_profile_1d_upwind_center2_euler1
+spec_kind: profile
+dependencies:
+  components:
+    - component_id: transport_advection_diffusion_flux_1d_upwind_center2
+      version_constraint: ">=0.1.0 <1.0.0"
+    - component_id: transport_advection_diffusion_boundary_1d_periodic_copy
+      version_constraint: ">=0.1.0 <1.0.0"
+    - component_id: transport_advection_diffusion_time_update_1d_euler1
+      version_constraint: ">=0.1.0 <1.0.0"
+  profiles: []

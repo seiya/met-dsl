@@ -1,12 +1,13 @@
-# Physical Tests: 1 次元線形移流拡散（検証入力・判定条件）
+# Tests: 1 次元線形移流拡散（検証入力・判定条件）
 
 ## 0. メタ情報
 - `status`: `draft`
 - `test_profile_id`: `advdiff1d_linear_baseline`
 - `test_profile_version`: `0.1.1`
+- `spec_ref.spec_kind`: `problem`
 - `spec_ref.spec_id`: `advdiff1d_linear`
-- `spec_ref.spec_version`: `0.2.0`
-- `spec_ref.controlled_spec_path`: `spec/transport/advection_diffusion/advdiff1d_linear/controlled_spec.md`
+- `spec_ref.spec_version`: `0.3.0`
+- `spec_ref.controlled_spec_path`: `spec/problem/transport/advection_diffusion/advdiff1d_linear/controlled_spec.md`
 
 ## 1. 目的
 本スイートは、1 次元線形移流拡散方程式の離散実装について、精度・保存性・平行移動同値性・CFL ガードを検証する。判定対象は `L0` から `L3` とし、期待失敗（`xfail`）を含む。

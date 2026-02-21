@@ -1,12 +1,13 @@
-# Physical Tests: 2 次元 shallow water equation（検証入力・判定条件）
+# Tests: 2 次元 shallow water equation（検証入力・判定条件）
 
 ## 0. メタ情報
 - `status`: `draft`
 - `test_profile_id`: `shallow_water2d_baseline`
 - `test_profile_version`: `0.1.0`
+- `spec_ref.spec_kind`: `problem`
 - `spec_ref.spec_id`: `shallow_water2d`
-- `spec_ref.spec_version`: `0.1.0`
-- `spec_ref.controlled_spec_path`: `spec/dynamics/shallow_water/shallow_water2d/controlled_spec.md`
+- `spec_ref.spec_version`: `0.2.0`
+- `spec_ref.controlled_spec_path`: `spec/problem/dynamics/shallow_water/shallow_water2d/controlled_spec.md`
 
 ## 1. 目的
 本スイートは、2 次元 shallow water equation の離散実装について、精度・保存性・静水不変性・平行移動同値性・`CFL` ガードを検証する。判定対象は `L0` から `L3` とし、期待失敗（`xfail`）を含む。
