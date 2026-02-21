@@ -32,7 +32,8 @@
 ルール:
 - **プログラミング言語は 1-2（実装 Plan）で必ず固定する。**
 - **ターゲットアーキテクチャは 1-2（実装 Plan）で必ず固定する。**
-- `toolchain.language` は Plan 生成時に固定する。`target.class=cpu` の既定値は `fortran`、`target.class=gpu` の既定値は `cuda_fortran` とする。
+- `toolchain.language` は Plan 生成時に固定する。ユーザーからプログラミング言語の明示指定がない場合、`target.class=cpu` では `fortran`、`target.class=gpu` では `cuda_fortran` を必ず採用する。
+- `toolchain.language` の既定値からの逸脱は、ユーザーがプログラミング言語を明示指定した場合にのみ許可する。
 - `target.class` が `cpu` / `gpu` 以外の場合、`toolchain.language` の既定値補完を禁止する。
 - `impl.resolved.yaml` で `toolchain.language` / `toolchain.standard` / `toolchain.build_system` が未定義の場合、生成工程へ進めずエラーとする。
 - `target.architecture` が未定義の場合、生成工程へ進めずエラーとする。

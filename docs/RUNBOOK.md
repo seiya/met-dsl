@@ -8,7 +8,7 @@
 
 ## 1. 入力と成果物（最小）
 - 入力: `CONTROLLED_SPEC`（物理・アルゴリズム定義）
-- 入力: `physical_tests`（ケース展開・実行条件・判定閾値）
+- 入力: `physical_tests`（自然言語中心の ケース展開・実行条件・判定閾値）
 - 生成: `case.resolved.yaml`（物理アルゴリズム A の固定）
 - 生成: `impl.resolved.yaml`（実行アルゴリズム B の固定または探索候補）
 - 生成: `model`（物理計算モジュール）と `runner`（実行・判定連携）
@@ -24,14 +24,14 @@
 
 ## 2. 最小ループ
 1. **Spec 更新**: Controlled Spec を修正し、曖昧さ・欠落を解消する
-2. **Test 更新**: 実験条件・判定条件を physical_tests で更新する
+2. **Test 更新**: 実験条件・判定条件を `physical_tests.md` で更新する
 3. **Plan 生成**: `case.resolved.yaml` を決定的に生成する。`LLM` を利用する場合は `SPEC.md` の「LLM の扱い」を適用する
-4. **実装 Plan 決定**: `impl.resolved.yaml` を固定（探索する場合は候補集合を用意）。`toolchain.language` の既定値は `target.class=cpu` で `fortran`、`target.class=gpu` で `cuda_fortran` とする
+4. **実装 Plan 決定**: `impl.resolved.yaml` を固定（探索する場合は候補集合を用意）。ユーザーからプログラミング言語の明示指定がない場合、`target.class=cpu` では `fortran`、`target.class=gpu` では `cuda_fortran` を必ず採用する。`toolchain.language` の既定値からの逸脱は、ユーザーがプログラミング言語を明示指定した場合にのみ許可する
 5. **生成**: `LLM` またはテンプレ補完で `model` と `runner` を分離して生成する。`LLM` を利用する場合は `SPEC.md` の「LLM の扱い」を適用する
 6. **Build**: MCP サーバーの `compile_project` で依存関係を扱える標準ビルドツールを実行する（`fortran` / `c` 系の既定値は `make`）
 7. **実行**: MCP サーバーの `run_program` で runner（例: `simulate`）を実行し、runner 経由で model を呼び出して diagnostics/perf を出力
 8. **判定**: 物理判定を実施し、verdict を生成
-9. **記録**: spec_version / test_suite_version / case_hash / impl_hash / git_sha を保存
+9. **記録**: spec_version / test_profile_version / case_hash / impl_hash / git_sha を保存
    - `plan_id` / `pipeline_id` / `generation_id` / `build_id` / `execution_id` を保存する
    - `LLM` 利用ステージは各ステージの `<stage>_meta.json`（コード生成は `generate_meta.json`）に `attempt_count` / `verification_status` / `last_fail_reason` / `debug_mode` を保存する
    - `context_isolated=false` の場合は制約理由を記録する

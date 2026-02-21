@@ -1,21 +1,21 @@
 # 全体仕様: ドキュメント駆動で気象モデルを生成する基盤
 
 ## 最終ゴール
-**ドキュメント的文章（Controlled Spec + physical_tests）を正本**として、CPU/GPU などのハードウェア上で**準最適化された気象モデル**を生成できる基盤フレームワークと、実際に生成されたモデル群を実用水準で運用する。
+**ドキュメント的文章（`Controlled Spec` + `physical_tests`）を正本**として、CPU/GPU などのハードウェア上で **最適化された気象モデル** を生成できる基盤フレームワークと、実際に生成されたモデル群を実用水準で運用する。
 
 ## スコープ
 ### 対象
-- 入力: Controlled Spec（物理・アルゴリズム定義）と physical_tests（妥当性検証用の入力・判定プロファイル）
+- 入力: 自然言語中心の `Controlled Spec`（物理・アルゴリズム定義）と `physical_tests`（妥当性検証用入力・判定プロファイル）
 - 出力: 実行コード（model + runner）、物理診断、性能診断、合否判定
 - 運用: Spec→Plan→Generate→Execute→Judge→Tune→Promote のループ
 - ハードウェア: CPU / GPU を含む（Phase 0 は CPU 参照、以降 GPU へ拡張）
 - 実行時入力はユーザーが科学目的に応じて設計でき、`physical_tests` はそのうち妥当性検証に使う既定プロファイルを与える。
-- 言語に依らず、物理計算を担う model と、入出力・判定連携を担う runner を分離する。
+- `Controlled Spec` と `physical_tests` の正本形式は `Markdown` とし、自然言語で一意に定義できる項目は文章で記述する。
+- 出力プログラミング言語に依らず、物理計算を担う model と、入出力・判定連携を担う runner を分離する。
 
 ### 非対象（現時点）
 - bitwise 一致の保証
 - 完全自動での科学的妥当性の発見（妥当性の定義は人間が与える）
-- すべての気象・気候モデルの網羅
 
 ## 運用原則（Spec-First）
 1. 物理仕様の変更は**必ず Controlled Spec を更新**してから実装へ反映する。
@@ -65,8 +65,7 @@ spec/
     <component>/
       <spec_id>/
         controlled_spec.md
-        physical_tests/
-          <suite_id>.yaml
+        physical_tests.md
         deps.yaml
 releases/
   registry/
@@ -83,7 +82,7 @@ releases/
    - `domain` と `component` の定義は `GLOSSARY.md` の「`spec` 分類語彙」を参照する。
 3. 正式版成果物は `spec` 配下に配置してはならない。保存先は `releases/<domain>/<component>/<spec_id>/<target_architecture>/<toolchain_language>/<release_id>/` を必須とする。
 4. `spec_id` はリポジトリ内で一意とし、形式は `^[a-z][a-z0-9_]{2,63}$` を必須とする。
-5. `suite_id` は `spec_id` を接頭辞に持つ形式（`<spec_id>_<purpose>`）を必須とする。
+5. `physical_tests` は `spec/<domain>/<component>/<spec_id>/physical_tests.md` に配置する。`spec_id` ごとに 1 ファイルのみを許可する。
 6. `component_id` は `^[a-z][a-z0-9_]{2,63}$` を必須とし、推奨形式を `<domain>_<component>_<operator>_<dim>d_<scheme>` とする。
 7. `operation_id` は `component_id` を接頭辞に持つ形式（`<component_id>__<action>`）を必須とする。
 8. 生成コードの公開名は互換性管理を必須とする。`major` 互換が破壊される変更は別名に分離する。
@@ -104,7 +103,8 @@ releases/
 - `deps.yaml` の依存解決結果は `case.resolved.yaml` に記録し、実行時の再解決を禁止する。
 - `component` の実装状態が `spec_defined_not_implemented` の間は、依存先 `spec` を `status=draft` 扱いに固定する。
 - `workspace` は試行成果物の作業領域とし、正式版成果物の正本に使ってはならない。
-- `toolchain.language` の既定値は `target.class=cpu` で `fortran`、`target.class=gpu` で `cuda_fortran` とし、`impl.resolved.yaml` へ補完後の値を明示記録する。
+- ユーザーからプログラミング言語の明示指定がない場合、`target.class=cpu` では `fortran`、`target.class=gpu` では `cuda_fortran` を必ず採用し、`impl.resolved.yaml` へ補完後の値を明示記録する。
+- `toolchain.language` の既定値からの逸脱は、ユーザーがプログラミング言語を明示指定した場合にのみ許可する。
 - 採用する実装は `releases/<domain>/<component>/<spec_id>/<target_architecture>/<toolchain_language>/<release_id>/` へ昇格保存する。
 - 昇格時は `registry/spec_catalog.yaml` の対象 `spec_id` に `official_releases` を追加し、`release_id` / `target_architecture` / `toolchain_language` / `target_backend` / `source_pipeline_id` / `source_generation_id` / `source_build_id` / `source_execution_id` / `artifact_root` / `promoted_at` / `status` を必須記録する。
 - `official_releases` の `status=active` は各 `spec_id` の `target_architecture + toolchain_language` ごとに 1 件のみ許可し、切替は新規 `release` 追加と旧 `release` の `deprecated` 化で管理する。
@@ -123,6 +123,7 @@ releases/
 
 ## 参照
 - Controlled Spec の書き方: `CONTROLLED_SPEC.md`
+- physical_tests の書き方: `PHYSICAL_TESTS.md`
 - 物理妥当性判定: `PHYSICAL_VALIDATION.md`
 - 用語・Artifacts: `GLOSSARY.md`
 - 全体フロー: `WORKFLOW.md`

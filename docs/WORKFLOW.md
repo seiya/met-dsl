@@ -4,12 +4,12 @@
 
 ## 0. 仕様作成（人間）
 - Controlled Spec（文章＋構造化ブロック）で物理アルゴリズム（A）を決定する。
-- physical_tests（構造化定義）で実験条件と判定条件を決定する。
+- physical_tests（自然言語中心 + 必要最小限の構造化ブロック）で実験条件と判定条件を決定する。
 - 実行アルゴリズム（B）はここでは固定しない（将来探索する）。
 
 成果物:
 - `spec/<domain>/<component>/<spec_id>/controlled_spec.md`（Controlled Spec）
-- `spec/<domain>/<component>/<spec_id>/physical_tests/<suite_id>.yaml`（テスト入力・判定条件）
+- `spec/<domain>/<component>/<spec_id>/physical_tests.md`（テスト入力・判定条件）
 - `releases/<domain>/<component>/<spec_id>/<target_architecture>/<toolchain_language>/<release_id>/`（採用した正式版実装）
 
 ## 共通規約（LLM 利用ステージ）
@@ -19,14 +19,15 @@
 
 ## 1. Plan 生成（決定的）
 ### 1-1) 物理 Plan（case.resolved.yaml）
-- Controlled Spec から物理アルゴリズム（A）を読み、physical_tests から入力条件と sweep/refinement を展開する。
+- Controlled Spec から物理アルゴリズム（A）を読み、physical_tests から入力条件と sweep/refinement を決定的に展開する。
 - この層は「物理結果を保証するために決定的」である必要がある。
 - Plan 生成で `LLM` を利用する場合も、共通規約（`SPEC.md`）を適用し、決定性要件を満たすこと。
 
 ### 1-2) 実装 Plan（impl.resolved.yaml）
 - target や環境に応じて、実行アルゴリズム（B）を決める。
 - この時点で `target.backend` と `toolchain.language`（例: Fortran/C++）を固定する。
-- `toolchain.language` の既定値は `target.class=cpu` で `fortran`、`target.class=gpu` で `cuda_fortran` とする。
+- ユーザーからプログラミング言語の明示指定がない場合、`target.class=cpu` では `fortran`、`target.class=gpu` では `cuda_fortran` を必ず採用する。
+- `toolchain.language` の既定値からの逸脱は、ユーザーがプログラミング言語を明示指定した場合にのみ許可する。
 - この時点で `target.architecture`（例: `x86_64`,`nvidia_sm80`）を固定する。
 - この時点で `toolchain.build_system`（例: `make`,`cmake`）を固定する。
 - compiler 種別は任意（再現性が必要な運用でのみ固定）とする。

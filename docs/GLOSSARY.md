@@ -4,7 +4,7 @@
 
 ## 1. 成果物（Artifacts）
 - **controlled_spec.md**: 物理・数値アルゴリズム定義の正本。生成器が model（実装本体）を作るために参照する。
-- **physical_tests.yaml**: 妥当性検証用プロファイル（入力インスタンス、ケース展開、判定条件）の正本。テストランナーが参照する。
+- **physical_tests.md**: 妥当性検証用プロファイル（入力インスタンス、ケース展開、判定条件）の正本。自然言語中心で記述し、テストランナーは必要箇所を決定的に解釈して参照する。
 - **spec_catalog.yaml**: `spec` の台帳。`spec_id`、配置先、状態、`official_releases`（正式版実装の登録情報）を保持する。
 - **component_catalog.yaml**: 再利用 `component` / `operation` の台帳。保存先は `releases/registry/component_catalog.yaml` とし、責務、公開 API、互換性、実装状態を保持する。
 - **deps.yaml**: 各 `spec` が要求する `component` 依存宣言。`component_id` と `version constraint` を定義する。
