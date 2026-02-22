@@ -16,15 +16,27 @@ Generate ステージの生成責務を固定し、`Build` 可能な実装成果
 - 入力は `case.resolved.yaml` と `impl.resolved.yaml` と `dependency.resolved.yaml` とする。
 - 実装コードは `model` と `runner` を分離し、`runner` は `model` を `call` / `use` / `import` で利用する。
 - `runner` に物理更新ロジックを重複実装しない。
+- `toolchain.language` が `fortran` / `c` / `cpp` / `mixed` 系の場合、`runner` から `python` / `bash` / `sh` / `node` などの外部インタプリタを起動してはならない。
+- `model` は対象 `node` の演算契約を実装し、固定値返却専用、固定 `JSON` 出力専用、`no-op` 専用実装を禁止する。
+- 依存を持つ `node` は、`dependency.resolved.yaml` の `direct_deps` で解決された依存 `node` の公開 `operation` を呼び出す実装を必須とする。
+- 依存 `operation` と同等機能を依存元 `node` の `model` / `runner` に再実装してはならない。
+- 依存先が `profile` で公開 `operation` を持たない構成では、依存元 `problem` が `profile` の選択結果と拘束条件を参照する実装にしなければならない。
 - `target.class=cpu` かつ並列化方式未指定のとき、並列化可能ループへ `OpenMP` を既定適用する。
 - 生成成果物は対象 `node_key` と整合する構成にする。
+- 生成成果物は `node_key` ごとの差分を保持し、共通ライブラリ明示なしに `src` 全体を複製してはならない。
+- `toolchain.language=fortran` の場合、`module` 名とソースファイル名を一致させ、`<module_name>.f90` 形式で出力する。
+- `toolchain.language=fortran` の場合、`module` 名と公開 `subroutine` 名に `spec_id` 由来接頭辞を付与し、名前衝突を回避する。
 - `generate_meta.json` に `attempt_count` と `verification_status` と `last_fail_reason` と `debug_mode` を記録する。
+- workflow 成果物の保存先ルートは `workspace/` のみを許可し、workflow ルート判定は `workspace/` のみを対象とする。
 
 ## 運用ルール
 1. `generation_id` を発行し、出力先を `workspace/pipelines/<pipeline_id>/generate/<generation_id>/` に固定する。
 2. `debug_mode=false` では `attempts/` を作成しない。
 3. `debug_mode=true` の場合のみ失敗試行を `attempts/<attempt_id>/` に保存する。
 4. `verification_status=pass` の成果物のみ `Build` に引き渡す。
+5. 出力先が `workspace/` でない場合は `Generate fail` とする。
+6. workflow 実行開始前に `workspace/` が存在しない場合、リポジトリルート直下へ `workspace/` を作成する。
+7. 開始前と完了前に `python3 tools/validate_workspace_root.py` を実行し、`fail` 時は `Generate fail` とする。
 
 ## 判定基準
 - `model` と `runner` の責務分離が保持される。

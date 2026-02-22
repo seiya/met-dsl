@@ -15,8 +15,11 @@
 - **case.resolved.yaml**: テストランナーが生成する「決定済み」入力。`sweep` 展開、物理アルゴリズム（後述）と数値条件を決定したもの。`runner`（例: `simulate`）がこれを読む。
 - **impl.resolved.yaml**: 実装計画（`Implementation Plan`）。計算過程（並列化、メモリ配置、融合、ブロッキング等）に関する可変パラメタを決定したもの。性能チューニングの探索対象になり得る。
 - **dependency.resolved.yaml**: 依存解決結果の正本。`node_key`、`direct_deps`、`transitive_deps`、`topo_level` を保持する。
-- **plan_id**: `case.resolved.yaml` と `impl.resolved.yaml` と `dependency.resolved.yaml` の組を識別する `ID`。推奨形式は `<spec_id>_<case_hash12>_<impl_hash12>`。
-- **pipeline_id**: `Generate -> Build -> Execute` の 1 系列を識別する `ID`。推奨形式は `<plan_id>_<utc_ts>_<seq3>`。
+- **expected_node_set**: `deps.yaml` と `spec_catalog.yaml` から再構成した期待 `node` 集合。`dependency.resolved.yaml` の網羅検証に使用する。
+- **node workflow**: 単一 `node_key` を対象にした `Plan -> Generate -> Build -> Execute -> Judge` の 1 系列実行。
+- **node_key_safe**: `node_key` の保存用表記。推奨形式は `<spec_kind>__<spec_id>__<spec_version>`。
+- **plan_id**: `node` 単位で `case.resolved.yaml` と `impl.resolved.yaml` と `dependency.resolved.yaml` の組を識別する `ID`。推奨形式は `<node_key_safe>_<case_hash12>_<impl_hash12>`。
+- **pipeline_id**: `node` 単位の `Generate -> Build -> Execute` 系列を識別する `ID`。推奨形式は `<plan_id>_<utc_ts>_<seq3>`。
 - **generation_id / build_id / execution_id**: 各段階の試行を識別する `ID`。
 - **node_key**: 実行 / 判定対象 `node` の識別子。形式は `<spec_kind>/<spec_id>@<spec_version>` とする。
 - **topo_level**: 依存 `DAG` におけるトポロジカル階層。小さい値ほど下層 `node` を表す。
@@ -36,8 +39,14 @@
 - **aggregate_verdict.json**: 当該 `node` と推移依存 `node` を含む集約合否判定。
 - **summary.json**: `run` 全体の集計。`self_summary` と `dependency_summary` を必須保持する。
 - **dependency_summary**: 依存集約件数。`total`、`pass`、`xfail`、`fail`、`blocked` を保持する。
+- **dependency workflow 網羅チェック**: `dependency.resolved.yaml` の `node_key` 集合と `workspace/plans` / `workspace/pipelines` の `node` 集合が 1 対 1 で一致することを確認する検証。
+- **blocked_reason**: `node` が `blocked` で終了した直接理由。依存 `node` の `fail` / `blocked` を識別可能に記録する。
+- **blocking_direct_deps**: `blocked` を引き起こした直下依存 `node_key` の配列。
 - **stdout.log / stderr.log**: 実行ログ（必ず保存し、後追いデバッグ可能にする）。
 - **attempts/**: `debug_mode=true` のときにのみ作成される失敗試行保存ディレクトリ。標準運用（`debug_mode=false`）では作成しない。
+- **dummy 出力**: workflow 進行または `tests` 合格を目的に、実行根拠なしで人工生成した成果物。`diagnostics` / `perf` / `verdict` / `aggregate_verdict` を含む。
+- **dummy 計算**: 物理計算を実行せず、固定値や定型文字列のみで計算結果を代替する実装。
+- **fail-fast 停止**: 工程入力不足または契約不一致を検知した時点で当該工程を `fail` で停止し、推測補完や人工生成で継続しない運用規則。
 
 補足:
 - `perf.json` は `diagnostics.json` とは分離して出力する（同居しない）。
@@ -61,6 +70,7 @@
 ## 3-1. 依存ブロック（Blocked）
 - 直下依存 `node` の `fail` または依存未解決により、上位 `node` の判定を開始できない状態。
 - `blocked` は `aggregate_verdict` と `dependency_summary` に必須記録する。
+- `blocked` が発生した上位 `node` の workflow 実行結果は `fail` とする。
 
 ## 4. 物理的に妥当な一致（Physical Validity）
 bitwise 一致は要求しない。以下の性質で一致を判定する。

@@ -63,3 +63,10 @@
 - 工程と `SKILL` の対応は `docs/AGENT_SKILLS.md` を参照する。
 - `generate -> verify -> regenerate` ループを持つ工程では、対応する `generate` 用 `SKILL` と `verify` 用 `SKILL` を分離して適用する。
 - `Codex` / `Gemini` / `Claude Code` のいずれでも、作業開始前に対象工程の `SKILL.md` を読み、定義された入出力契約と判定基準に従う。
+
+## 過去成果物の参照禁止ルール
+- 過去実行で生成された成果物は、ディレクトリ名に関係なく閲覧・参照・コピー・比較・流用を禁止する。
+- `workspace/` 配下に過去成果物が存在する場合も、中身の閲覧と入力参照を禁止する。
+- workflow は毎回独立実行し、`workspace/plans/<node_key_safe>/<plan_id>/` と `workspace/pipelines/<node_key_safe>/<pipeline_id>/` の既定構造で、`plan_id` / `pipeline_id` / `generation_id` / `build_id` / `execution_id` を毎回新規発行する。
+- workflow 入力は `spec` 正本と当該実行で生成した前段成果物のみに限定する。
+- 本規則に違反した workflow は `fail` とし、当該実行を破棄して再実行する。
