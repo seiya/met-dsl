@@ -17,6 +17,7 @@
 - `fortran` / `c` / `cpp` / `mixed` 系は、`make/cmake/meson/ninja` のみ許可する。
 - `fortran` / `c` 系でビルドツールが未指定の場合、既定値は `make` とする。
 - `gcc` / `clang` / `gfortran` を直接呼び出して単発ビルドする運用は禁止する。
+- `run_program` で `target.class=cpu`（または `target_class=cpu`）かつ `threads_per_rank` を指定した場合、`OMP_NUM_THREADS` と `OMP_THREAD_LIMIT` を自動設定する。
 
 ## MCP 設定例
 以下は一般的な MCP クライアント設定の例である。実際の設定形式はクライアント実装に合わせて調整する。
@@ -27,7 +28,7 @@
     "build-runtime": {
       "command": "python",
       "args": [
-        "/home/seiya/met-dsl/mcp_servers/build_runtime_server.py"
+        "/path/to/met-dsl/mcp_servers/build_runtime_server.py"
       ]
     }
   }
@@ -58,6 +59,8 @@
   "arguments": {
     "project_dir": "/path/to/project",
     "command": ["./bin/simulate", "--case", "case.resolved.yaml"],
+    "target.class": "cpu",
+    "threads_per_rank": 8,
     "timeout_sec": 1800
   }
 }

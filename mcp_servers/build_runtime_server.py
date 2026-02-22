@@ -149,6 +149,35 @@ def _run_command(
         }
 
 
+def _resolve_target_class(args: dict[str, Any]) -> str | None:
+    raw_target_class = args.get("target_class")
+    if raw_target_class is None:
+        raw_target_class = args.get("target.class")
+
+    if raw_target_class is None:
+        target_obj = args.get("target")
+        if isinstance(target_obj, dict):
+            raw_target_class = target_obj.get("class")
+
+    if raw_target_class is None:
+        return None
+
+    target_class = str(raw_target_class).strip().lower()
+    if not target_class:
+        return None
+    return target_class
+
+
+def _parse_threads_per_rank(args: dict[str, Any]) -> int | None:
+    raw_threads = args.get("threads_per_rank")
+    if raw_threads is None:
+        return None
+    threads_per_rank = int(raw_threads)
+    if threads_per_rank < 1:
+        raise ValueError("threads_per_rank must be >= 1")
+    return threads_per_rank
+
+
 def _recommended_build_system(project_dir: str, language: str) -> dict[str, str]:
     root = Path(project_dir)
     lang = (language or "").strip().lower()
@@ -293,13 +322,40 @@ def tool_run_program(args: dict[str, Any]) -> dict[str, Any]:
     timeout_sec = int(args.get("timeout_sec", 3600))
     capture_limit = int(args.get("capture_limit", 120000))
     env = args.get("env")
+    target_class = _resolve_target_class(args)
+    threads_per_rank = _parse_threads_per_rank(args)
     command = args.get("command")
     if not isinstance(command, list) or not command:
         raise ValueError("command must be a non-empty string array")
     command = [str(item) for item in command]
     if env is not None and not isinstance(env, dict):
         raise ValueError("env must be an object")
-    return _run_command(command, project_dir, timeout_sec, env, capture_limit)
+
+    run_env: dict[str, str] | None
+    if env is None:
+        run_env = None
+    else:
+        run_env = {str(k): str(v) for k, v in env.items()}
+
+    openmp_env_applied = False
+    if target_class == "cpu" and threads_per_rank is not None:
+        if run_env is None:
+            run_env = {}
+        thread_count = str(threads_per_rank)
+        run_env["OMP_NUM_THREADS"] = thread_count
+        run_env["OMP_THREAD_LIMIT"] = thread_count
+        openmp_env_applied = True
+
+    result = _run_command(command, project_dir, timeout_sec, run_env, capture_limit)
+    result["target_class"] = target_class
+    result["threads_per_rank"] = threads_per_rank
+    result["openmp_env_applied"] = openmp_env_applied
+    if openmp_env_applied:
+        result["openmp_env"] = {
+            "OMP_NUM_THREADS": str(threads_per_rank),
+            "OMP_THREAD_LIMIT": str(threads_per_rank),
+        }
+    return result
 
 
 def tool_run_quality_checks(args: dict[str, Any]) -> dict[str, Any]:
@@ -373,7 +429,11 @@ TOOLS: dict[str, Tool] = {
     ),
     "run_program": Tool(
         name="run_program",
-        description="Run a program without shell expansion and capture stdout/stderr.",
+        description=(
+            "Run a program without shell expansion and capture stdout/stderr. "
+            "When target_class is cpu and threads_per_rank is specified, "
+            "set OpenMP thread env vars."
+        ),
         input_schema={
             "type": "object",
             "properties": {
@@ -381,6 +441,16 @@ TOOLS: dict[str, Tool] = {
                 "command": {"type": "array", "items": {"type": "string"}},
                 "timeout_sec": {"type": "integer", "minimum": 1},
                 "capture_limit": {"type": "integer", "minimum": 1000},
+                "target_class": {"type": "string"},
+                "target.class": {"type": "string"},
+                "target": {
+                    "type": "object",
+                    "properties": {
+                        "class": {"type": "string"},
+                    },
+                    "additionalProperties": True,
+                },
+                "threads_per_rank": {"type": "integer", "minimum": 1},
                 "env": {
                     "type": "object",
                     "additionalProperties": {"type": "string"},
