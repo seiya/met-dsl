@@ -57,3 +57,9 @@
 ## MCP 設定参照
 - MCP クライアント設定は `mcp_servers/mcp_servers.example.json` を参照する。
 - 運用詳細は `mcp_servers/README.md` を参照する。
+
+## Project Local Skills 運用ルール
+- `skills/` 配下の `SKILL.md` を、ワークフロー工程ごとの実行手順の正本として扱う。
+- 工程と `SKILL` の対応は `docs/AGENT_SKILLS.md` を参照する。
+- `generate -> verify -> regenerate` ループを持つ工程では、対応する `generate` 用 `SKILL` と `verify` 用 `SKILL` を分離して適用する。
+- `Codex` / `Gemini` / `Claude Code` のいずれでも、作業開始前に対象工程の `SKILL.md` を読み、定義された入出力契約と判定基準に従う。
