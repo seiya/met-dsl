@@ -47,6 +47,8 @@
 - **dummy 出力**: workflow 進行または `tests` 合格を目的に、実行根拠なしで人工生成した成果物。`diagnostics` / `perf` / `verdict` / `aggregate_verdict` を含む。
 - **dummy 計算**: 物理計算を実行せず、固定値や定型文字列のみで計算結果を代替する実装。
 - **fail-fast 停止**: 工程入力不足または契約不一致を検知した時点で当該工程を `fail` で停止し、推測補完や人工生成で継続しない運用規則。
+- **pipeline semantic validation**: `python3 tools/validate_pipeline_semantics.py` による内容検証ゲート。`raw` 一次証跡、`trial_meta` 追跡整合、`quality check` 比較正本、固定値生成パターン、`copy_based_artifact_reuse` を機械検証する。
+- **raw snapshot schema**: `problem` `node` の `raw/state_snapshots/snapshot_schema.json` に保存する項目定義。`state_variables` と `time_variable` により、各問題設定で判定再計算に使用する状態量と時刻情報を表す。
 
 補足:
 - `perf.json` は `diagnostics.json` とは分離して出力する（同居しない）。

@@ -31,6 +31,7 @@
 - 工程契約（`node_key` ごとの個別 workflow、依存 `DAG` 実行順、`blocked` 伝播、`copy_based_artifact_reuse` 判定）は `WORKFLOW.md` を正本とする。
 - `spec_kind` を問わない workflow 実行は、各ステージを `LLM` により実行し、リポジトリ管理外パス（例: `/tmp`）の補助スクリプトを実行経路へ含めてはならない。
 - `Judge` 開始前に、対象 `node_key` の同一 `execution_id` 配下へ `run_program` 実行記録と `diagnostics.json` と `perf.json` と `raw` 実行証跡が揃っていることを検証する。未達時は `Judge fail` とする。
+- `Judge` 開始前と `Judge` 完了前に `python3 tools/validate_pipeline_semantics.py` を実行し、`fail` 時は当該 `pipeline` を `invalid` とする。
 - `trial_meta.json` は `generated_by_stage` と `source_execution_id` と `source_command_ref` と `source_artifact_hash` を必須記録とし、欠落または不整合時は `fail` とする。
 - 本節の検証に違反した試行は当該ステージで停止し、下流ステージ開始条件を満たす目的の人工成果物生成を禁止する。
 
@@ -45,19 +46,20 @@
 8. **生成**: 対象 `node` ごとに `LLM` またはテンプレ補完で `model` と `runner` を分離して生成する。`LLM` を利用する場合は `SPEC.md` の「`LLM` の扱い」を適用する。生成直後に `runner` の外部インタプリタ起動禁止と、`model` の `no-op` / 固定値返却専用実装禁止を検査し、違反時は `Generate fail` とする。依存を持つ `node` は、`dependency.resolved.yaml` の `direct_deps` で解決された依存 `node` の公開 `operation` を呼び出す実装を必須とし、同等機能の再実装を禁止する。`Generate verify` は `derived_contract.json` に基づき、依存 `operation` と出力指標のデータ依存、および解析式直接代入による `diagnostics` 生成を検査する。`toolchain.language=fortran` の場合は `module` 名とソースファイル名を一致させ、`<module_name>.f90` 形式で出力する。
 9. **Build**: 対象 `node` ごとに `MCP` サーバーの `compile_project` で依存関係を扱える標準ビルドツールを実行する（`fortran` / `c` 系の既定値は `make`）。依存を持つ `node` は、依存 `operation` の解決先が `dependency.resolved.yaml` と一致することを検証し、不一致時は `Build fail` とする。
 10. **実行**: 対象 `node` ごとに `MCP` サーバーの `run_program` で `runner`（例: `simulate`）を実行し、`runner` 経由で `model` を呼び出して `diagnostics` / `perf` を出力する。対象 `node` ごとに `execution_id/<node_key>/raw/` へ判定再計算用の一次証跡を保存する。`raw` へ `diagnostics` の複写を保存してはならない。
-11. **品質比較**: `target.class=cpu` の場合、対象 `node` ごとに `quality check` として `threads_per_rank=1` と `threads_per_rank>1` の実行結果を比較する。比較対象は `diagnostics.json` と `verdict.json` とし、合否確定規則は `SPEC.md` を適用する。
-12. **判定**: `tests.md` の規則に基づく判定を対象 `node` ごとに実施し、`verdict` を生成する。依存込み判定は `aggregate_verdict.json` へ出力する。直下依存 `node` が `fail` または `blocked` の場合、上位 `node` は `blocked` として終了する。この場合も `aggregate_verdict.json` と `summary.json` と `trial_meta.json` を必須出力し、`blocked_reason` と `blocking_direct_deps` を記録する。`verdict.json` は `self_verdict=not_evaluated` を明示する。`Judge` は `raw` 一次証跡のみを入力として判定指標を再計算し、`diagnostics` と一致しない場合は `Judge fail` とする。
-13. **強制停止**: 入力不足または前段成果物不足で当該工程を進められない場合、当該工程を `fail` で停止する。推定補完や人工ファイル生成で進めてはならない。
-14. **記録**: `spec_version` / `test_profile_version` / `case_hash` / `impl_hash` / `git_sha` を保存する。
+11. **実行証跡検証**: `python3 tools/validate_pipeline_semantics.py` を実行し、`raw` の一次証跡、`quality check`、`trial_meta` の追跡情報、`Generate` 由来の固定値生成パターンを検証する。`fail` の場合は `Judge` を開始しない。
+12. **品質比較**: `target.class=cpu` の場合、対象 `node` ごとに `quality check` として `threads_per_rank=1` と `threads_per_rank>1` の実行結果を比較する。比較対象は `diagnostics.json` と `verdict.json` とし、合否確定規則は `SPEC.md` を適用する。
+13. **判定**: `tests.md` の規則に基づく判定を対象 `node` ごとに実施し、`verdict` を生成する。依存込み判定は `aggregate_verdict.json` へ出力する。直下依存 `node` が `fail` または `blocked` の場合、上位 `node` は `blocked` として終了する。この場合も `aggregate_verdict.json` と `summary.json` と `trial_meta.json` を必須出力し、`blocked_reason` と `blocking_direct_deps` を記録する。`verdict.json` は `self_verdict=not_evaluated` を明示する。`Judge` は `raw` 一次証跡のみを入力として判定指標を再計算し、`diagnostics` と一致しない場合は `Judge fail` とする。
+14. **強制停止**: 入力不足または前段成果物不足で当該工程を進められない場合、当該工程を `fail` で停止する。推定補完や人工ファイル生成で進めてはならない。
+15. **記録**: `spec_version` / `test_profile_version` / `case_hash` / `impl_hash` / `git_sha` を保存する。
 - `plan_id` / `pipeline_id` / `generation_id` / `build_id` / `execution_id` を保存する。
 - `node_key` / `topo_level` / `dependency_ref` を保存する。
 - `LLM` 利用ステージは各ステージの `<stage>_meta.json`（コード生成は `generate_meta.json`）に `attempt_count` / `verification_status` / `last_fail_reason` / `debug_mode` を保存する。
 - `context_isolated=false` の場合は制約理由を記録する。
 - `debug_mode=true` で失敗試行を保存した場合は保存件数と保存先を記録する。
 - `dependency.resolved.yaml` の全 `node_key` について、`workspace/plans` と `workspace/pipelines` の対応が 1 対 1 で成立することを保存前に検証する。
-15. **チューニング**: 物理合格を満たす候補の中から性能目的関数で最良候補を選定し、採用する `impl.resolved` を確定する。
-16. **正式版昇格**: 採用する試行は `releases/<spec_kind>/<domain>/<family>/<spec_id>/<target_architecture>/<toolchain_language>/<release_id>/` へ昇格保存し、`spec/registry/spec_catalog.yaml` の `official_releases` に `release_id` / `target_architecture` / `toolchain_language` / `target_backend` / `source_pipeline_id` / `source_generation_id` / `source_build_id` / `source_execution_id` / `artifact_root` / `promoted_at` / `status` を記録する。`problem` の昇格は `aggregate_verdict.overall=pass` を必須とする。
-17. **次アクション**: 失敗分類に応じて戻る場所を決める。
+16. **チューニング**: 物理合格を満たす候補の中から性能目的関数で最良候補を選定し、採用する `impl.resolved` を確定する。
+17. **正式版昇格**: 採用する試行は `releases/<spec_kind>/<domain>/<family>/<spec_id>/<target_architecture>/<toolchain_language>/<release_id>/` へ昇格保存し、`spec/registry/spec_catalog.yaml` の `official_releases` に `release_id` / `target_architecture` / `toolchain_language` / `target_backend` / `source_pipeline_id` / `source_generation_id` / `source_build_id` / `source_execution_id` / `artifact_root` / `promoted_at` / `status` を記録する。`problem` の昇格は `aggregate_verdict.overall=pass` を必須とする。
+18. **次アクション**: 失敗分類に応じて戻る場所を決める。
 
 ## 3. 失敗時の戻り先（指針）
 - **`LLM` ステージ実行不能**: workflow の各ステージで `LLM` による実行ができない -> 入力契約または `MCP` 接続定義へ戻る。手動 `copy` 運用を禁止する。
@@ -104,5 +106,6 @@
 - `raw/metrics_basis.json` が `diagnostics.json` の複写ではなく、一次証跡から構成されている。
 - workflow ルート判定が `workspace/` のみに対して実施されている。
 - `python3 tools/validate_workspace_root.py` が `PASS` を返している。
+- `python3 tools/validate_pipeline_semantics.py` が `PASS` を返している。
 - 異なる `node_key` の `generate/src` が不正に完全一致していない。
 - `copy_based_artifact_reuse` が未検出である。

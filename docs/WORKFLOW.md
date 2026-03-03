@@ -4,7 +4,7 @@
 
 ## 文書責務
 - 本書は workflow の工程順序と段階間入出力契約を定義する。
-- workflow 共通の不変規範（不正防止、過去成果物参照禁止、`workspace/` ルート制約、`quality check` 判定軸、`validate_workspace_root.py` 実行規則）は `SPEC.md` を正本とする。
+- workflow 共通の不変規範（不正防止、過去成果物参照禁止、`workspace/` ルート制約、`quality check` 判定軸、`validate_workspace_root.py` と `validate_pipeline_semantics.py` の実行規則）は `SPEC.md` を正本とする。
 - 実装 Plan の既定値適用規則は `IMPL_PLAN_SPEC.md` を正本とする。
 
 ## 0. 仕様作成（人間）
@@ -99,6 +99,7 @@
 - `Build` は、依存を持つ `node` に対して、依存 `operation` の解決先が `dependency.resolved.yaml` と一致することを検証しなければならない。不一致時は `Build fail` とする。
 - `runner` が `model` を呼び出し、`diagnostics.json` と `perf.json` を出力する。
 - `Execute` は `Judge` が再計算可能な実行証跡を同一 `execution_id` 配下に保存しなければならない。`raw/` 配下の状態スナップショット、ケース別メトリクス元データ、実行トレースを必須とする。
+- `problem` `node` の `raw/state_snapshots/` は、`snapshot_schema.json` に `state_variables` と `time_variable` を保持し、宣言した項目を少なくとも 1 つ以上の状態ファイルへ保持しなければならない。ダミー文字列のみの状態ファイルを禁止する。
 - `raw` 成果物は一次証跡のみを保持し、`diagnostics.json` の複写を `metrics_basis` として保存してはならない。
 - 実行証跡が不足する場合、`diagnostics.json` と `perf.json` が存在しても当該 `node` を `Execute fail` とする。
 - `perf.json` の仕様は `PERFORMANCE_DIAGNOSTICS.md` を参照する。
@@ -115,6 +116,7 @@
 - 物理判定: `diagnostics` を用いて `checks` / `thresholds` を評価する（詳細は `PHYSICAL_VALIDATION.md`）。
 - `Judge` は `raw/` の実行証跡から判定指標を再計算し、再計算値と `diagnostics` の整合を確認しなければならない。再計算不能または不整合時は `Judge fail` とする。
 - `Judge` の再計算入力は `raw/` 一次証跡に限定する。`diagnostics.json` を再計算入力へ流用してはならない。
+- `Judge` 開始前と `Judge` 完了前に `python3 tools/validate_pipeline_semantics.py` を実行し、`fail` 時は当該 `pipeline` を `invalid` としなければならない。
 - 実装品質判定: `target.class=cpu` の場合、同一 `case.resolved.yaml` を `threads_per_rank=1` と `threads_per_rank>1` で実行し、結果を比較する。比較対象は `diagnostics.json` と `verdict.json` とする。
 - `quality check` の合否確定規則は `SPEC.md` の不正防止原則を適用する。
 - スレッド並列あり / なしの比較は `tests` の判定対象に含めず、`quality check` として扱う。
@@ -142,7 +144,7 @@
 ## 7. 成果物配置規約（Plan / Generate / Build / Execute）
 ### 7-1) ルート構造
 ワークフロー成果物の保存先は `workspace/` を正本とし、次の構造を必須とする。
-- 成果物保存先ルート制約と `python3 tools/validate_workspace_root.py` 実行規則は `SPEC.md` の規範を適用する。
+- 成果物保存先ルート制約と `python3 tools/validate_workspace_root.py` 実行規則、および `python3 tools/validate_pipeline_semantics.py` 実行規則は `SPEC.md` の規範を適用する。
 
 ```text
 workspace/
@@ -212,6 +214,7 @@ workspace/
 - `debug_mode=false` の `Generate` は `attempts/` を生成してはならない。
 - `Judge` の入力は常に `execution_id` 配下成果物とし、他 `execution_id` との混在を禁止する。
 - `Judge` 開始条件は「対象 `node_key` の直下依存 `node` が `pass` または `xfail`」である。未達時は `blocked` を返し、当該 `node` の workflow を `fail` で終了する。
+- `Judge` 開始直前と `Judge` 完了直前に `python3 tools/validate_pipeline_semantics.py` を実行し、`fail` 時は `Judge` を成立させてはならない。
 - `spec_kind` を問わない workflow 実行では、同一 `topo_level` の独立 `node` を並列再実行してよい。
 - 各ステージ `fail` 時は、下流ステージ開始条件を満たすためのファイル後付け生成を禁止する。
 

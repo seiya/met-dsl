@@ -23,6 +23,7 @@ Execute ステージの実行責務を固定し、判定可能なランタイム
 - `target.class=cpu` の品質比較は `threads_per_rank=1` と `threads_per_rank>1` の実行結果を比較対象として保存する。
 - `quality check` の比較正本は `diagnostics.json` と `verdict.json` とし、`stdout` 差分のみで合否を確定してはならない。
 - workflow 成果物の保存先ルートは `workspace/` のみを許可し、workflow ルート判定は `workspace/` のみを対象とする。
+- `Execute` 完了前に `python3 tools/validate_pipeline_semantics.py` を実行し、`fail` 時は `Execute fail` とする。
 
 ## 運用ルール
 1. `execution_id` を発行し、成果物を `execution_id` 単位で分離保存する。
@@ -33,9 +34,11 @@ Execute ステージの実行責務を固定し、判定可能なランタイム
 6. 出力先が `workspace/` でない場合は `Execute fail` とし、当該 `execution` を無効化する。
 7. workflow 実行開始前に `workspace/` が存在しない場合、リポジトリルート直下へ `workspace/` を作成する。
 8. 開始前と完了前に `python3 tools/validate_workspace_root.py` を実行し、`fail` 時は `Execute fail` とする。
+9. `python3 tools/validate_pipeline_semantics.py` を実行し、`fail` 時は `Judge` を開始してはならない。
 
 ## 判定基準
 - `diagnostics.json` と `perf.json` とログ群が揃っている。
 - `raw` 実行証跡と `trial_meta.json` の参照情報が整合している。
 - `node_key` 単位で成果物が分離されている。
 - 実行方式が `MCP run_program` と `MCP run_quality_checks` に限定される。
+- `python3 tools/validate_pipeline_semantics.py` が `PASS` を返す。

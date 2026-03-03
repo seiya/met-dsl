@@ -39,6 +39,7 @@
 14. 検証契約の導出で必須情報が不足する場合は当該ステージを `fail` で停止しなければならない。推測補完で進行してはならない。
 15. `raw/metrics_basis.json` へ `diagnostics.json` を複写してはならない。`raw` は `diagnostics` 再計算に必要な一次証跡のみを保持しなければならない。
 16. `quality check` は `diagnostics.json` と `verdict.json` の比較を正本とし、`stdout` 差分のみで合否を確定してはならない。
+17. `Judge` 開始前と `Judge` 完了前に `python3 tools/validate_pipeline_semantics.py` を実行し、`fail` 時は当該 `pipeline` を `invalid` としなければならない。
 
 ## 運用原則（Spec-First）
 1. 物理仕様の変更は**必ず `Controlled Spec` を更新**してから実装へ反映する。
@@ -184,6 +185,9 @@ releases/
 61. `Execute` は、`Judge` が独立再計算に使用する一次証跡を `raw/` 配下へ保存しなければならない。一次証跡には状態スナップショット、ケース別指標計算に必要な中間データ、実行トレースを含める。
 62. `Judge` は、`raw` 一次証跡から独立経路で判定指標を再計算しなければならない。`diagnostics.json` を再計算入力へ流用してはならない。
 63. `Judge` は、再計算値と `diagnostics` が一致しない場合、または `raw` 一次証跡のみで再計算できない場合に `fail` としなければならない。
+64. `problem` `node` の `raw/state_snapshots/` は、`snapshot_schema.json` で `Judge` 再計算に使用する状態量名配列（`state_variables`）と時刻情報キー（`time_variable`）を宣言しなければならない。少なくとも 1 つ以上の状態ファイルへ当該項目を保持し、ダミー文字列のみの状態ファイルを禁止する。
+65. `quality_check.json` は `checks.verdict_available=true` と `checks.diagnostics_match=true` と `checks.verdict_match=true` を同時に満たさなければならない。いずれかが `false` または欠落の場合は `Execute fail` とする。
+66. `Generate verify` は、`model` が `case_id` 分岐と固定数値代入のみで判定指標を構成する実装を検出した場合、`verification_status=fail` としなければならない。
 
 ### 設計方針
 - `problem spec` は統合シナリオを定義する。目的は、複数 `component` を組み合わせた整合性と回帰判定である。
@@ -235,6 +239,7 @@ releases/
 - `CI` は、`toolchain.language=fortran` の成果物で公開シンボル名に `spec_id` 由来接頭辞がない場合に `fail` しなければならない。
 - `CI` は workflow 成果物の保存先ルートが `workspace/` 以外の場合に `fail` しなければならない。
 - `CI` は `python3 tools/validate_workspace_root.py` を実行し、終了コードが 0 でない場合に `fail` しなければならない。
+- `CI` は `python3 tools/validate_pipeline_semantics.py` を実行し、終了コードが 0 でない場合に `fail` しなければならない。
 - `CI` は `lineage.json` と `trial_meta.json` の成果物参照パスが `workspace/` 起点でない場合に `fail` しなければならない。
 - `CI` は `copy_based_artifact_reuse` 検出時に当該 `pipeline` を `invalid` として `fail` しなければならない。
 
