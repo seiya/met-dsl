@@ -2,6 +2,11 @@
 この文書はプロジェクト全体の流れを単独で把握できるようにまとめる。
 用語は `GLOSSARY.md` を参照する。
 
+## 文書責務
+- 本書は workflow の工程順序と段階間入出力契約を定義する。
+- workflow 共通の不変規範（不正防止、過去成果物参照禁止、`workspace/` ルート制約、`quality check` 判定軸、`validate_workspace_root.py` 実行規則）は `SPEC.md` を正本とする。
+- 実装 Plan の既定値適用規則は `IMPL_PLAN_SPEC.md` を正本とする。
+
 ## 0. 仕様作成（人間）
 - `Controlled Spec`（文章 + 構造化ブロック）で物理アルゴリズム（A）を決定する。
 - `problem spec` は依存 `component` と採用 `profile` を参照し、統合順序を固定する。
@@ -17,10 +22,7 @@
 - `LLM` を利用する全ステージ（`Plan` 生成、コード生成、`Tune` 候補生成など）に、`SPEC.md` の「`LLM` の扱い」を適用する。
 - ステージ内 `verify` の適用、コンテキスト分離方針、失敗試行保存規則、最終品質保証の定義は `SPEC.md` を正本とする。
 - `LLM` 利用ステージでは各ステージの `<stage>_meta.json` を必須出力とし、`debug_mode` 規則を含む必須項目を満たすこと。コード生成ステージでは `generate_meta.json` とする。
-- すべてのステージで `dummy` 出力、`dummy` データ、`dummy` 計算を禁止する。
-- ステージ入力が不足する場合は当該ステージを `fail` で停止し、下流ステージ開始条件を満たす目的の人工成果物生成を禁止する。
-- 明示的な指定がない場合、既存 workflow 出力（過去試行の `workspace/plans` / `workspace/pipelines` 成果物）を参照してはならない。内容閲覧を禁止し、`spec` 正本と当該実行で生成した前段成果物のみで workflow を独立実行する。
-- 検証契約は `controlled_spec.md` と `tests.md` と `deps.yaml` から導出しなければならない。導出不能の場合は当該ステージを `fail` で停止し、推測補完を禁止する。
+- 共通不変規範は `SPEC.md` の規定を適用し、工程固有契約のみを本書で定義する。
 
 ## 1. Plan 生成（決定的）
 ### 1-1) 物理 Plan（`case.resolved.yaml`）
@@ -32,13 +34,10 @@
 ### 1-2) 実装 Plan（`impl.resolved.yaml`）
 - `target` や環境に応じて、実行アルゴリズム（B）を決める。
 - この時点で `target.backend` と `toolchain.language`（例: `Fortran` / `C++`）を固定する。
-- ユーザーからプログラミング言語の明示指定がない場合、`target.class=cpu` では `fortran`、`target.class=gpu` では `cuda_fortran` を必ず採用する。
-- `toolchain.language` の既定値からの逸脱は、ユーザーがプログラミング言語を明示指定した場合にのみ許可する。
-- `target.class=cpu` でユーザーがループ並列化方式を指定しない場合、並列化可能ループは `OpenMP` を既定で適用する。
 - この時点で `target.architecture`（例: `x86_64`,`nvidia_sm80`）を固定する。
 - この時点で `toolchain.build_system`（例: `make`,`cmake`）を固定する。
 - `compiler` 種別は任意（再現性が必要な運用でのみ固定）とする。
-- `toolchain.language` が `fortran` / `c` / `cpp` / `mixed` 系の場合、`toolchain.build_system` は `make` / `cmake` / `meson` / `ninja` のいずれかを使用する。既定値は `make` とする。
+- `toolchain.language` と `toolchain.build_system` とループ並列既定値の適用規則、および既定値からの逸脱条件は `IMPL_PLAN_SPEC.md` を適用する。
 - `Phase 1` では固定値でもよい。
 - `Phase 2` 以降は `tuner` が複数候補を生成し探索する。
 
@@ -115,7 +114,7 @@
 - `Judge` は `raw/` の実行証跡から判定指標を再計算し、再計算値と `diagnostics` の整合を確認しなければならない。再計算不能または不整合時は `Judge fail` とする。
 - `Judge` の再計算入力は `raw/` 一次証跡に限定する。`diagnostics.json` を再計算入力へ流用してはならない。
 - 実装品質判定: `target.class=cpu` の場合、同一 `case.resolved.yaml` を `threads_per_rank=1` と `threads_per_rank>1` で実行し、結果を比較する。比較対象は `diagnostics.json` と `verdict.json` とする。
-- `quality check` は `diagnostics.json` と `verdict.json` の比較結果を正本とし、`stdout` 差分のみで合否を確定してはならない。
+- `quality check` の合否確定規則は `SPEC.md` の不正防止原則を適用する。
 - スレッド並列あり / なしの比較は `tests` の判定対象に含めず、`quality check` として扱う。
 - 性能判定（任意）: `perf` を用いて `performance regression` を評価する。
 - 物理 `fail` 時は性能評価をスキップする。
@@ -141,11 +140,7 @@
 ## 7. 成果物配置規約（Plan / Generate / Build / Execute）
 ### 7-1) ルート構造
 ワークフロー成果物の保存先は `workspace/` を正本とし、次の構造を必須とする。
-- 成果物保存先のルートは、リポジトリルート直下の `workspace/` のみを許可する。
-- workflow ルート判定は `workspace/` のみを対象とし、`workspace/` 以外のディレクトリは判定対象に含めない。
-- `Plan` / `Generate` / `Build` / `Execute` / `Judge` / `Tune` / `Promote` は、保存先が `workspace/` でない場合に `fail` で停止しなければならない。
-- workflow 実行開始前に `workspace/` が存在しない場合、リポジトリルート直下へ `workspace/` を作成しなければならない。
-- workflow 実行の開始前と完了前に `python3 tools/validate_workspace_root.py` を必須実行し、終了コードが 0 でない場合は当該 workflow を `fail` で停止しなければならない。
+- 成果物保存先ルート制約と `python3 tools/validate_workspace_root.py` 実行規則は `SPEC.md` の規範を適用する。
 
 ```text
 workspace/
@@ -229,8 +224,7 @@ workspace/
 ### 7-6) 依存 workflow 網羅チェック
 - `dependency.resolved.yaml` の `node_key` 集合と `workspace/plans/*/<plan_id>/` の `node_key_safe` 集合は 1 対 1 で一致しなければならない。
 - `dependency.resolved.yaml` の `node_key` 集合と `workspace/pipelines/*/<pipeline_id>/lineage.json` の `node_key` 集合は 1 対 1 で一致しなければならない。
-- workflow ルートの網羅チェックは `workspace/` のみを対象とし、`workspace/` 以外のディレクトリを検査対象に含めない。
-- `lineage.json` と `trial_meta.json` の成果物参照パスは、`python3 tools/validate_workspace_root.py` の検査を `pass` しなければならない。
+- workflow ルート網羅チェックの対象範囲と検査手順は `SPEC.md` の規範を適用する。
 - 異なる `node_key` の `generate/<generation_id>/src/` が完全一致する場合は `copy_based_artifact_reuse` として検出し、共通ライブラリ明示がない限り `invalid` とする。
 - `spec_kind` を問わない workflow 実行の完了宣言前に、対象依存 `DAG` の `workspace/plans` / `workspace/pipelines` 成果物を削除してはならない。
 

@@ -12,32 +12,10 @@
 ## 要件
 - エージェントは、作業対象工程を特定してから対応 `SKILL.md` を読み込む。
 - `generate -> verify -> regenerate` を持つ工程は、`generate` 用と `verify` 用の 2 つの `SKILL` を必ず分離適用する。
-- `spec_kind` を問わず依存 `DAG` を実行する場合、各 `node_key` を個別 workflow として扱い、個別 `Plan` と個別 `pipeline` を発行する。
-- 明示的な指定がない場合、既存 workflow 出力（過去試行の `workspace/plans` / `workspace/pipelines` 成果物）を参照してはならない。中身の閲覧を禁止し、各工程を独立実行する。
-- 過去実行で生成された成果物は、ディレクトリ名に関係なく閲覧・参照・コピー・リンクを禁止する。`workspace/` 配下に存在する過去成果物も同様に扱う。
-- workflow は毎回独立実行し、`workspace/plans/<node_key_safe>/<plan_id>/` と `workspace/pipelines/<node_key_safe>/<pipeline_id>/` の既定構造で、`plan_id` / `pipeline_id` / `generation_id` / `build_id` / `execution_id` を毎回新規発行する。入力は `spec` 正本と当該実行で生成した前段成果物のみに限定する。
-- 検証契約は `controlled_spec.md` と `tests.md` と `deps.yaml` から導出する。追加必須項目の記述をユーザーへ要求してはならない。
-- 検証契約の導出に必要な情報が不足する場合は当該工程を `fail` で停止し、推測補完を禁止する。
-- `Build` / `Execute` / `quality check` は `MCP` サーバー経由で実行する。
-- `SKILL` に記載された必須出力（例: `<stage>_meta.json`、`verdict.json`）を欠落させない。
-- `dummy` 出力、`dummy` データ、`dummy` 計算、進行目的の人工成果物生成を禁止する。
-- `Generate verify` は、`runner` の外部インタプリタ起動（`python` / `bash` / `sh` / `node`）を検出した場合に `fail` とする。
-- `Generate verify` は、`model` の `no-op` 実装、固定値返却専用実装、固定 `JSON` 出力専用実装を検出した場合に `fail` とする。
-- `Generate verify` は、依存 `operation` と出力指標のデータ依存を検証し、定数出力または解析式直接代入による `diagnostics` 生成を検出した場合に `fail` とする。
-- 依存を持つ `node` の `Generate verify` は、`dependency.resolved.yaml` の `direct_deps` で解決された依存 `node` の公開 `operation` 呼び出しを必須検証とし、欠落時は `fail` とする。
-- 依存を持つ `node` の `Generate verify` は、依存 `operation` と同等機能の再実装を検出した場合に `fail` とする。
-- `toolchain.language=fortran` の `Generate verify` は、`module` 名とソースファイル名の一致、および `spec_id` 由来接頭辞の有無を必須検証とし、違反時は `fail` とする。
-- `Execute` は、`execution_id/<node_key>/raw/` の実行証跡を必須出力とし、欠落時は `fail` とする。
-- `Execute` は、`raw` に一次証跡のみを保存し、`diagnostics.json` の複写を `metrics_basis` として保存してはならない。
-- `Judge` は、`raw` 実行証跡から判定指標を再計算して `diagnostics` と照合し、不整合時は `fail` とする。
-- `Judge` の再計算入力は `raw` 一次証跡に限定し、`diagnostics.json` を再計算入力へ流用してはならない。
-- `quality check` は `diagnostics.json` と `verdict.json` の比較を正本とし、`stdout` 差分のみで合否を確定してはならない。
-- 異なる `node_key` の `generate/src` が共通ライブラリ明示なしで完全一致した場合、`copy_based_artifact_reuse` として `invalid` にする。
-- workflow 成果物の保存先ルートは `workspace/` のみを許可し、workflow ルート判定は `workspace/` のみを対象とする。
-- workflow 実行開始前に `workspace/` が存在しない場合は、リポジトリルート直下へ `workspace/` を作成する。
-- workflow 実行の開始前と完了前に `python3 tools/validate_workspace_root.py` を必須実行し、`fail` 時は当該 workflow を停止する。
-- `dependency.resolved.yaml` の `node_key` 集合と `workspace/plans` / `workspace/pipelines` の `node` 集合一致を必須検証とする。
-- `blocked` 終了 `node` でも `aggregate_verdict.json`、`summary.json`、`trial_meta.json` を必須出力し、`blocked_reason` を記録する。
+- workflow 共通の不変規範（過去成果物参照禁止、`dummy` 禁止、検証契約導出、`workspace/` ルート制約、`quality check` 判定軸）は `SPEC.md` を正本とする。
+- 工程契約（依存 `DAG` 展開、`node` 単位 `plan_id` / `pipeline_id`、`blocked` 伝播、`lineage.json` / `trial_meta.json` 必須項目、`copy_based_artifact_reuse` 判定）は `WORKFLOW.md` を正本とする。
+- `Build` / `Execute` / `quality check` は `MCP` サーバー経由で実行し、`AGENTS.md` の `MCP 実行ルール` と対応 `SKILL.md` の契約を同時適用する。
+- 各工程は、対応 `SKILL.md` に定義された必須出力（例: `<stage>_meta.json`、`verdict.json`）を欠落させてはならない。
 
 ## 工程と Skill 対応表
 - `Plan generate`: `skills/workflow-plan-generate/SKILL.md`
