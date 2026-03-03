@@ -188,6 +188,9 @@ releases/
 64. `problem` `node` の `raw/state_snapshots/` は、`snapshot_schema.json` で `Judge` 再計算に使用する状態量名配列（`state_variables`）と時刻情報キー（`time_variable`）を宣言しなければならない。少なくとも 1 つ以上の状態ファイルへ当該項目を保持し、ダミー文字列のみの状態ファイルを禁止する。
 65. `quality_check.json` は `checks.verdict_available=true` と `checks.diagnostics_match=true` と `checks.verdict_match=true` を同時に満たさなければならない。いずれかが `false` または欠落の場合は `Execute fail` とする。
 66. `Generate verify` は、`model` が `case_id` 分岐と固定数値代入のみで判定指標を構成する実装を検出した場合、`verification_status=fail` としなければならない。
+67. `toolchain.language=fortran` で依存 `component` を持つ `node` の `model` は、依存 `spec_id` ごとに `use <spec_id>_model` と `call <spec_id>__*` を必須とし、`subroutine <spec_id>__*` の再定義を禁止する。
+68. `runner` は `diagnostics.json` と `perf.json` と `raw/` 一次証跡のみを出力対象とし、`verdict.json` と `aggregate_verdict.json` と `summary.json` と `trial_meta.json` の書き込みを禁止する。
+69. `run_program` の実行コマンドは `case.resolved.yaml` を入力引数として必ず含まなければならない。欠落時は `Execute fail` とする。
 
 ### 設計方針
 - `problem spec` は統合シナリオを定義する。目的は、複数 `component` を組み合わせた整合性と回帰判定である。
@@ -235,8 +238,11 @@ releases/
 - `CI` は `quality check` の比較対象が `diagnostics.json` と `verdict.json` でない場合に `fail` しなければならない。
 - `CI` は、依存を持つ `node` が `dependency.resolved.yaml` で解決された依存 `operation` を呼び出していることを `pass` 条件にしなければならない。
 - `CI` は、依存 `operation` と同等機能の再実装を検出した場合に `fail` しなければならない。
+- `CI` は、`toolchain.language=fortran` の依存 `component` を持つ `node` で `use <spec_id>_model` または `call <spec_id>__*` の欠落、または `subroutine <spec_id>__*` の再定義を検出した場合に `fail` しなければならない。
 - `CI` は、`toolchain.language=fortran` の成果物で `module` 名とソースファイル名の不一致を検出した場合に `fail` しなければならない。
 - `CI` は、`toolchain.language=fortran` の成果物で公開シンボル名に `spec_id` 由来接頭辞がない場合に `fail` しなければならない。
+- `CI` は、`runner` が `verdict.json` と `aggregate_verdict.json` と `summary.json` と `trial_meta.json` の書き込みを行う構成を検出した場合に `fail` しなければならない。
+- `CI` は、`run_program` の実行コマンドが `case.resolved.yaml` を含まない場合に `fail` しなければならない。
 - `CI` は workflow 成果物の保存先ルートが `workspace/` 以外の場合に `fail` しなければならない。
 - `CI` は `python3 tools/validate_workspace_root.py` を実行し、終了コードが 0 でない場合に `fail` しなければならない。
 - `CI` は `python3 tools/validate_pipeline_semantics.py` を実行し、終了コードが 0 でない場合に `fail` しなければならない。

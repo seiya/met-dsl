@@ -14,8 +14,10 @@ Execute ステージの実行責務を固定し、判定可能なランタイム
 
 ## 要件
 - `run` は `MCP` サーバーの `run_program` を使用する。
+- `run_program` の実行コマンドは `case.resolved.yaml` を入力引数として必ず含まなければならない。
 - `quality check` は `MCP` サーバーの `run_quality_checks` を使用する。
 - `runner` が `model` を呼び出し、`diagnostics.json` と `perf.json` を出力する。
+- `runner` が `verdict.json` と `aggregate_verdict.json` と `summary.json` と `trial_meta.json` を直接出力してはならない。
 - `execution_id/<node_key>/raw/` に `Judge` 再計算用の実行証跡を必須保存する。最小構成は状態スナップショット、ケース別メトリクス元データ、実行トレースとする。
 - `raw` は一次証跡のみを保存し、`diagnostics.json` の複写を `metrics_basis` として保存してはならない。
 - `stdout.log` と `stderr.log` と `trial_meta.json` を必須保存する。

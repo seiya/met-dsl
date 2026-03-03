@@ -18,6 +18,12 @@ PLACEHOLDER_TEXT_PATTERNS = (
 )
 
 SNAPSHOT_SCHEMA_FILE = "snapshot_schema.json"
+FORBIDDEN_RUNNER_OUTPUTS = (
+    "verdict.json",
+    "aggregate_verdict.json",
+    "summary.json",
+    "trial_meta.json",
+)
 
 
 @dataclass
@@ -341,6 +347,163 @@ def _validate_generate_outputs(execution: NodeExecution, violations: list[str]) 
             )
 
 
+def _dependency_resolved_for_execution(repo_root: Path, execution: NodeExecution) -> dict[str, Any] | None:
+    lineage_path = execution.pipeline_dir / "lineage.json"
+    if not lineage_path.exists():
+        return None
+
+    lineage = _read_json(lineage_path)
+    dependency_ref = lineage.get("dependency_ref")
+    if not isinstance(dependency_ref, str) or not dependency_ref.startswith("workspace/"):
+        return None
+
+    dep_path = repo_root / dependency_ref
+    if not dep_path.exists():
+        return None
+    try:
+        dep_data = _read_json(dep_path)
+    except json.JSONDecodeError:
+        return None
+    return dep_data if isinstance(dep_data, dict) else None
+
+
+def _component_dep_spec_ids(repo_root: Path, execution: NodeExecution) -> list[str]:
+    dep_data = _dependency_resolved_for_execution(repo_root, execution)
+    if dep_data is None:
+        return []
+
+    direct_deps = dep_data.get("direct_deps")
+    if not isinstance(direct_deps, list):
+        return []
+
+    result: list[str] = []
+    for item in direct_deps:
+        dep_token: str | None = None
+        if isinstance(item, str):
+            dep_token = item
+        elif isinstance(item, dict):
+            node_key = item.get("node_key")
+            if isinstance(node_key, str):
+                dep_token = node_key
+
+        if not isinstance(dep_token, str):
+            continue
+        # Expected format: component/<spec_id>@<spec_version>
+        if not dep_token.startswith("component/"):
+            continue
+        body = dep_token[len("component/") :]
+        spec_id = body.split("@", 1)[0].strip()
+        if spec_id:
+            result.append(spec_id)
+    return sorted(set(result))
+
+
+def _validate_dependency_operation_usage(
+    repo_root: Path, execution: NodeExecution, violations: list[str]
+) -> None:
+    dep_spec_ids = _component_dep_spec_ids(repo_root, execution)
+    if not dep_spec_ids:
+        return
+
+    generate_root = execution.pipeline_dir / "generate"
+    model_files = sorted(generate_root.glob("*/src/*_model.f90"))
+    if not model_files:
+        return
+
+    for model_file in model_files:
+        text = model_file.read_text(encoding="utf-8", errors="ignore")
+        lowered = text.lower()
+
+        for spec_id in dep_spec_ids:
+            spec_id_l = spec_id.lower()
+            op_prefix = re.escape(spec_id_l + "__")
+            module_name = re.escape(spec_id_l + "_model")
+
+            if not re.search(rf"\buse\s+{module_name}\b", lowered):
+                violations.append(
+                    f"{model_file}: missing dependency module use ({spec_id}_model)"
+                )
+
+            if re.search(rf"\bsubroutine\s+{op_prefix}[a-z0-9_]*\b", lowered):
+                violations.append(
+                    f"{model_file}: dependency operation redefinition detected ({spec_id}__*)"
+                )
+
+            if not re.search(rf"\bcall\s+{op_prefix}[a-z0-9_]*\b", lowered):
+                violations.append(
+                    f"{model_file}: missing dependency operation call ({spec_id}__*)"
+                )
+
+
+def _validate_runner_outputs(execution: NodeExecution, violations: list[str]) -> None:
+    generate_root = execution.pipeline_dir / "generate"
+    runner_files = sorted(generate_root.glob("*/src/*_runner.f90"))
+    if not runner_files:
+        return
+
+    for runner_file in runner_files:
+        text = runner_file.read_text(encoding="utf-8", errors="ignore").lower()
+        for output_name in FORBIDDEN_RUNNER_OUTPUTS:
+            if output_name in text:
+                violations.append(
+                    f"{runner_file}: forbidden runner output write detected ({output_name})"
+                )
+
+
+def _validate_run_program_inputs(
+    repo_root: Path, execution: NodeExecution, violations: list[str]
+) -> None:
+    trial_meta_path = execution.node_dir / "trial_meta.json"
+    if not trial_meta_path.exists():
+        return
+
+    data = _read_json(trial_meta_path)
+    source_command_ref = data.get("source_command_ref")
+    if source_command_ref is None:
+        return
+
+    for entry in _iter_command_ref_entries(source_command_ref):
+        command_id = entry.get("command_id")
+        log_ref = entry.get("command_log_ref") or entry.get("command_log_path")
+        if not isinstance(command_id, str) or not isinstance(log_ref, str):
+            continue
+
+        log_path = repo_root / log_ref if log_ref.startswith("workspace/") else Path(log_ref)
+        if not log_path.exists():
+            continue
+
+        matched: dict[str, Any] | None = None
+        for line in log_path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if obj.get("command_id") == command_id:
+                matched = obj
+                break
+
+        if matched is None:
+            continue
+        if matched.get("tool_name") != "run_program":
+            continue
+
+        command = matched.get("command")
+        if not isinstance(command, list):
+            continue
+
+        has_case_resolved = any(
+            isinstance(arg, str) and arg.endswith("case.resolved.yaml")
+            for arg in command
+        )
+        if not has_case_resolved:
+            violations.append(
+                f"{trial_meta_path}:run_program command_id={command_id} must include case.resolved.yaml"
+            )
+
+
 def _source_fingerprint(execution: NodeExecution) -> SourceFingerprint | None:
     generate_root = execution.pipeline_dir / "generate"
     gen_dirs = sorted(d for d in generate_root.iterdir() if d.is_dir()) if generate_root.exists() else []
@@ -417,6 +580,9 @@ def validate(
         _validate_trial_meta(repo_root, execution, violations)
         _validate_raw_evidence(execution, violations)
         _validate_generate_outputs(execution, violations)
+        _validate_dependency_operation_usage(repo_root, execution, violations)
+        _validate_runner_outputs(execution, violations)
+        _validate_run_program_inputs(repo_root, execution, violations)
 
         fp = _source_fingerprint(execution)
         if fp is not None:

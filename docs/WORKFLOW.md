@@ -82,6 +82,7 @@
 - `Generate verify` は、`model` 出力と無関係な定数出力、固定 `JSON` 出力、解析式直接代入による `diagnostics` 生成を検出した場合に `fail` とする。
 - 依存を持つ `node` の `model` は、`dependency.resolved.yaml` の `direct_deps` で解決された依存 `node` の公開 `operation` を呼び出さなければならない。
 - 依存 `operation` と同等機能を依存元 `node` の `model` / `runner` に再実装してはならない。検出時は `Generate fail` とする。
+- `toolchain.language=fortran` で依存 `component` を持つ `node` の `model` は、依存 `spec_id` ごとに `use <spec_id>_model` と `call <spec_id>__*` を必須とし、`subroutine <spec_id>__*` の再定義を禁止する。
 - 依存先が `profile` の場合、`profile` が公開 `operation` を持たない構成では、依存元 `problem` は `profile` の選択結果と拘束条件を参照した実装にしなければならない。参照痕跡が欠落する場合は `Generate fail` とする。
 - `toolchain.language=fortran` では、`module` 名とソースファイル名を一致させ、`<module_name>.f90` 形式で出力しなければならない。汎用ファイル名 `model.f90` への集約を禁止する。
 - `toolchain.language=fortran` では、`module` 名と公開 `subroutine` 名に `spec_id` 由来の接頭辞を付与し、`node` 間の名前衝突を防止しなければならない。
@@ -94,10 +95,12 @@
 - 入力: `case.resolved.yaml` と（任意で）`impl.resolved.yaml` と `dependency.resolved.yaml`
 - `Build` と `Execute` は `MCP` サーバー経由で実行する。`compile` は `compile_project`、`run` は `run_program` を使用する。
 - `compile_project` と `run_program` の実行では、実コマンド記録を `JSONL` 形式で保存しなければならない。既定の保存先は `project_dir/mcp_command_log.jsonl` とする。
+- `run_program` の実行コマンドは `case.resolved.yaml` を入力引数として必ず含まなければならない。欠落時は `Execute fail` とする。
 - `Build` と `Execute` の試行メタデータは、`MCP` 実行結果の `command_id` を識別子として記録し、`source_command_ref` には `command_log_ref`（または `command_log_path`）を追跡可能に記録しなければならない。
 - `Build` と `Execute` は `node` 単位に個別実行し、他 `node` の成果物を混在させない。
 - `Build` は、依存を持つ `node` に対して、依存 `operation` の解決先が `dependency.resolved.yaml` と一致することを検証しなければならない。不一致時は `Build fail` とする。
 - `runner` が `model` を呼び出し、`diagnostics.json` と `perf.json` を出力する。
+- `runner` は `diagnostics.json` と `perf.json` と `raw/` 一次証跡のみを出力対象とし、`verdict.json` と `aggregate_verdict.json` と `summary.json` と `trial_meta.json` の書き込みを禁止する。
 - `Execute` は `Judge` が再計算可能な実行証跡を同一 `execution_id` 配下に保存しなければならない。`raw/` 配下の状態スナップショット、ケース別メトリクス元データ、実行トレースを必須とする。
 - `problem` `node` の `raw/state_snapshots/` は、`snapshot_schema.json` に `state_variables` と `time_variable` を保持し、宣言した項目を少なくとも 1 つ以上の状態ファイルへ保持しなければならない。ダミー文字列のみの状態ファイルを禁止する。
 - `raw` 成果物は一次証跡のみを保持し、`diagnostics.json` の複写を `metrics_basis` として保存してはならない。

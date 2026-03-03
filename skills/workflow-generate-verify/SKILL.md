@@ -21,7 +21,9 @@ Generate ステージ出力の検証責務を固定し、`Build` 失敗を事前
 - 生成コードが対象 `node_key` の入出力契約に一致することを検査する。
 - 依存を持つ `node` は、`dependency.resolved.yaml` の `direct_deps` で解決された依存 `node` の公開 `operation` 呼び出しを実装していることを検査する。欠落時は `fail` とする。
 - 依存 `operation` と同等機能の再実装を検出した場合は `fail` とする。
+- `toolchain.language=fortran` で依存 `component` を持つ `node` は、依存 `spec_id` ごとに `model` 内の `use <spec_id>_model` と `call <spec_id>__*` を必須検査し、`subroutine <spec_id>__*` の再定義を検出した場合は `fail` とする。
 - 依存先が `profile` で公開 `operation` を持たない構成では、依存元 `problem` の実装が `profile` の選択結果と拘束条件を参照していることを検査する。欠落時は `fail` とする。
+- `runner` が `verdict.json` と `aggregate_verdict.json` と `summary.json` と `trial_meta.json` を書き込む実装を検出した場合は `fail` とする。
 - `impl.resolved.yaml` の言語と `build_system` に整合する構成であることを検査する。
 - 異なる `node_key` の `generate/src` との完全一致を検査し、共通ライブラリ明示がない複製を `copy_based_artifact_reuse` として `fail` にする。
 - `toolchain.language=fortran` の場合、`module` 名とソースファイル名が `<module_name>.f90` で一致することを検査する。

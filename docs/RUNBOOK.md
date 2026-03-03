@@ -43,9 +43,9 @@
 5. **実装 Plan 決定**: `impl.resolved.yaml` を固定（探索する場合は候補集合を用意）する。言語既定値、`OpenMP` 既定値、既定値逸脱条件は `IMPL_PLAN_SPEC.md` を適用する。
 6. **階層実行順序の固定**: `dependency.resolved.yaml` の `topo_level` 昇順で実行順序を固定する。親 `node` は直下依存 `node` が `pass` または `xfail` になるまで開始してはならない。同一 `topo_level` の独立 `node` は並列実行してよいが、ある `node` が `fail` しても同一 `topo_level` の独立 `node` の実行を中断しない。
 7. **`node` 単位 workflow 発行**: 各 `node_key` ごとに個別 `plan_id` と個別 `pipeline_id` を発行する。同一 `topo_level` の独立 `node` は並列実行してよい。
-8. **生成**: 対象 `node` ごとに `LLM` またはテンプレ補完で `model` と `runner` を分離して生成する。`LLM` を利用する場合は `SPEC.md` の「`LLM` の扱い」を適用する。生成直後に `runner` の外部インタプリタ起動禁止と、`model` の `no-op` / 固定値返却専用実装禁止を検査し、違反時は `Generate fail` とする。依存を持つ `node` は、`dependency.resolved.yaml` の `direct_deps` で解決された依存 `node` の公開 `operation` を呼び出す実装を必須とし、同等機能の再実装を禁止する。`Generate verify` は `derived_contract.json` に基づき、依存 `operation` と出力指標のデータ依存、および解析式直接代入による `diagnostics` 生成を検査する。`toolchain.language=fortran` の場合は `module` 名とソースファイル名を一致させ、`<module_name>.f90` 形式で出力する。
+8. **生成**: 対象 `node` ごとに `LLM` またはテンプレ補完で `model` と `runner` を分離して生成する。`LLM` を利用する場合は `SPEC.md` の「`LLM` の扱い」を適用する。生成直後に `runner` の外部インタプリタ起動禁止と、`model` の `no-op` / 固定値返却専用実装禁止を検査し、違反時は `Generate fail` とする。依存を持つ `node` は、`dependency.resolved.yaml` の `direct_deps` で解決された依存 `node` の公開 `operation` を呼び出す実装を必須とし、同等機能の再実装を禁止する。`toolchain.language=fortran` で依存 `component` を持つ `node` は、依存 `spec_id` ごとに `model` 内の `use <spec_id>_model` と `call <spec_id>__*` を必須とし、`subroutine <spec_id>__*` の再定義を禁止する。`Generate verify` は `derived_contract.json` に基づき、依存 `operation` と出力指標のデータ依存、および解析式直接代入による `diagnostics` 生成を検査する。`toolchain.language=fortran` の場合は `module` 名とソースファイル名を一致させ、`<module_name>.f90` 形式で出力する。
 9. **Build**: 対象 `node` ごとに `MCP` サーバーの `compile_project` で依存関係を扱える標準ビルドツールを実行する（`fortran` / `c` 系の既定値は `make`）。依存を持つ `node` は、依存 `operation` の解決先が `dependency.resolved.yaml` と一致することを検証し、不一致時は `Build fail` とする。
-10. **実行**: 対象 `node` ごとに `MCP` サーバーの `run_program` で `runner`（例: `simulate`）を実行し、`runner` 経由で `model` を呼び出して `diagnostics` / `perf` を出力する。対象 `node` ごとに `execution_id/<node_key>/raw/` へ判定再計算用の一次証跡を保存する。`raw` へ `diagnostics` の複写を保存してはならない。
+10. **実行**: 対象 `node` ごとに `MCP` サーバーの `run_program` で `runner`（例: `simulate`）を実行し、`run_program` 実行コマンドに `case.resolved.yaml` を必ず含める。`runner` 経由で `model` を呼び出して `diagnostics` / `perf` を出力し、`verdict.json` と `aggregate_verdict.json` と `summary.json` と `trial_meta.json` の直接出力を禁止する。対象 `node` ごとに `execution_id/<node_key>/raw/` へ判定再計算用の一次証跡を保存する。`raw` へ `diagnostics` の複写を保存してはならない。
 11. **実行証跡検証**: `python3 tools/validate_pipeline_semantics.py` を実行し、`raw` の一次証跡、`quality check`、`trial_meta` の追跡情報、`Generate` 由来の固定値生成パターンを検証する。`fail` の場合は `Judge` を開始しない。
 12. **品質比較**: `target.class=cpu` の場合、対象 `node` ごとに `quality check` として `threads_per_rank=1` と `threads_per_rank>1` の実行結果を比較する。比較対象は `diagnostics.json` と `verdict.json` とし、合否確定規則は `SPEC.md` を適用する。
 13. **判定**: `tests.md` の規則に基づく判定を対象 `node` ごとに実施し、`verdict` を生成する。依存込み判定は `aggregate_verdict.json` へ出力する。直下依存 `node` が `fail` または `blocked` の場合、上位 `node` は `blocked` として終了する。この場合も `aggregate_verdict.json` と `summary.json` と `trial_meta.json` を必須出力し、`blocked_reason` と `blocking_direct_deps` を記録する。`verdict.json` は `self_verdict=not_evaluated` を明示する。`Judge` は `raw` 一次証跡のみを入力として判定指標を再計算し、`diagnostics` と一致しない場合は `Judge fail` とする。
@@ -91,10 +91,12 @@
 - `Judge` 入力は同一 `execution_id` の `run_program` 実行記録と `diagnostics` / `perf` に限定されている。
 - 依存を持つ `node` が `dependency.resolved.yaml` で解決された依存 `operation` を呼び出している。
 - 依存 `operation` と同等機能を依存元 `node` へ再実装していない。
+- `toolchain.language=fortran` の依存 `component` を持つ `node` で `use <spec_id>_model` と `call <spec_id>__*` が実装され、`subroutine <spec_id>__*` の再定義がない。
 - `toolchain.language=fortran` の成果物で `module` 名とソースファイル名が一致している。
 - `toolchain.language=fortran` の公開 `module` / `subroutine` 名に `spec_id` 由来接頭辞が付与されている。
 - `trial_meta.json` の `generated_by_stage` / `source_execution_id` / `source_command_ref` / `source_artifact_hash` が欠落していない。
 - `trial_meta.json` の `runner_command` / `process_trace_ref` / `raw_artifact_refs` が欠落していない。
+- `trial_meta.json` の `source_command_ref` が参照する `run_program` 実行コマンドに `case.resolved.yaml` が含まれている。
 - `lineage.json` と `trial_meta.json` の成果物参照パスが `workspace/` 起点で記録されている。
 - `blocked` で終了した `node` に `aggregate_verdict.json` / `summary.json` / `trial_meta.json` が存在し、`blocked_reason` が記録されている。
 - `spec_kind` を問わない workflow 実行の完了前に、対象 `DAG` の `plans` / `pipelines` 成果物が削除されていない。
@@ -102,6 +104,7 @@
 - 正式版昇格を実施した試行は `spec_catalog.yaml` の `official_releases` と `release` 成果物配置が一致する。
 - `dummy` 出力や人工生成ファイルが存在しない。
 - `runner` が `python` / `bash` / `sh` / `node` など外部インタプリタを起動していない。
+- `runner` が `verdict.json` / `aggregate_verdict.json` / `summary.json` / `trial_meta.json` を書き込んでいない。
 - `execution_id/<node_key>/raw/` が存在し、`Judge` 再計算に必要なファイルが揃っている。
 - `raw/metrics_basis.json` が `diagnostics.json` の複写ではなく、一次証跡から構成されている。
 - workflow ルート判定が `workspace/` のみに対して実施されている。
