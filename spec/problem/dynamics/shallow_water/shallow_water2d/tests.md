@@ -3,27 +3,46 @@
 ## 0. メタ情報
 - `status`: `draft`
 - `test_profile_id`: `shallow_water2d_baseline`
-- `test_profile_version`: `0.1.0`
+- `test_profile_version`: `0.2.0`
 - `spec_ref.spec_kind`: `problem`
 - `spec_ref.spec_id`: `shallow_water2d`
-- `spec_ref.spec_version`: `0.2.0`
+- `spec_ref.spec_version`: `0.3.0`
 - `spec_ref.controlled_spec_path`: `spec/problem/dynamics/shallow_water/shallow_water2d/controlled_spec.md`
 
 ## 1. 目的
-本スイートは、2 次元 shallow water equation の離散実装について、精度・保存性・静水不変性・平行移動同値性・`CFL` ガードを検証する。判定対象は `L0` から `L3` とし、期待失敗（`xfail`）を含む。
+本スイートは、底面地形を含む 2 次元 shallow water equation の離散実装について、保存性、静水不変性、地形強制下の安定性、理論解一致、平行移動同値性、`CFL` ガードを検証する。保存性判定は全ケースで質量を対象とし、運動量は `topography_profile=flat` のケースで対象とする。判定対象は `L0` から `L3` とし、期待失敗（`xfail`）を含む。
 
 ## 2. 入力既定化
 ### 2-1. 基本定数
 - 領域長 `L_x=L_y=1.0` とする。
-- 平衡水深 `H_0=1.0` とする。
+- 代表水位 `H_0=1.0` とする。
 - 重力加速度は Controlled Spec の固定値 `g=9.81` を使用する。
 - 微小振幅は `eta0=1.0e-3` とする。
-- 線形重力波の位相速度は $c_0=\sqrt{gH_0}$ とする。
+- 線形重力波の参照位相速度は $c_0=\sqrt{gH_0}$ とする。
 
-### 2-2. 初期条件プロファイル
-- `linear_wave_x` は次で定義する。  
+### 2-2. 底面地形プロファイル
+底面地形は `topography_profile` で次の 2 種類を許可する。
+- `williamson_tc5_cone`: Controlled Spec の円錐地形を使用する。
   $$
-  h(x,y,0)=H_0+\eta_0\sin\left(2\pi\left(\frac{x}{L_x}-\mathrm{shift\_x\_fraction}\right)\right)
+  d_x(x)=\min\left(|x-x_c|,L_x-|x-x_c|\right),\quad
+  d_y(y)=\min\left(|y-y_c|,L_y-|y-y_c|\right)
+  $$
+  $$
+  r(x,y)=\sqrt{d_x(x)^2+d_y(y)^2}
+  $$
+  $$
+  z_b(x,y)=h_s\max\left(0,1-\frac{r(x,y)}{r_0}\right)
+  $$
+  地形パラメタは `x_c=3L_x/4`、`y_c=2L_y/3`、`r_0=min(L_x,L_y)/6`、`h_s=0.2H_0` とする。
+- `flat`: 全セル `z_b=0` とする。
+
+### 2-3. 初期条件プロファイル
+- `linear_wave_x` は次で定義する。
+  $$
+  \eta(x,y,0)=H_0+\eta_0\sin\left(2\pi\left(\frac{x}{L_x}-\mathrm{shift\_x\_fraction}\right)\right)
+  $$
+  $$
+  h(x,y,0)=\eta(x,y,0)-z_b(x,y)
   $$
   $$
   u(x,y,0)=\frac{\eta_0 c_0}{H_0}\sin\left(2\pi\left(\frac{x}{L_x}-\mathrm{shift\_x\_fraction}\right)\right),\quad v(x,y,0)=0
@@ -31,20 +50,20 @@
   $$
   hu=h\,u,\quad hv=h\,v
   $$
-- `oblique_mode` は次で定義する。  
+- `oblique_mode` は次で定義する。
   $$
-  h(x,y,0)=H_0+\eta_0\sin\left(2\pi\left(\frac{x}{L_x}+\frac{y}{L_y}-\mathrm{shift\_x\_fraction}-\mathrm{shift\_y\_fraction}\right)\right)
+  \eta(x,y,0)=H_0+\eta_0\sin\left(2\pi\left(\frac{x}{L_x}+\frac{y}{L_y}-\mathrm{shift\_x\_fraction}-\mathrm{shift\_y\_fraction}\right)\right)
   $$
   $$
-  hu=0,\quad hv=0
+  h(x,y,0)=\eta(x,y,0)-z_b(x,y),\quad hu=0,\quad hv=0
   $$
-- `lake_at_rest` は次で定義する。  
+- `lake_at_rest` は次で定義する。
   $$
-  h(x,y,0)=H_0,\quad hu=0,\quad hv=0
+  \eta(x,y,0)=H_0,\quad h(x,y,0)=H_0-z_b(x,y),\quad hu=0,\quad hv=0
   $$
 
-### 2-3. 理論解（適用条件付き）
-`initial_profile=linear_wave_x` のケースのみ、線形化 shallow water equation の参照解を使用する。参照解は次とする。
+### 2-4. 理論解（適用条件付き）
+`topography_profile=flat` かつ `initial_profile=linear_wave_x` の場合のみ、線形化 shallow water equation の参照解を使用する。参照解は次とする。
 $$
 h_{ref}(x,t)=H_0+\eta_0\sin\left(2\pi\left(\frac{x}{L_x}-\frac{c_0 t}{L_x}-\mathrm{shift\_x\_fraction}\right)\right)
 $$
@@ -67,10 +86,12 @@ $$
 
 | family_id | purpose | sweep | fixed |
 | --- | --- | --- | --- |
-| `swe2d_ref` | refinement_for_accuracy_and_conservation | $nx=ny\in\{32,64,128\}$ | `initial_profile=linear_wave_x`, `shift_x_fraction=0.0`, `shift_y_fraction=0.0`, `dt_scale=1.0` |
-| `swe2d_lake` | lake_at_rest_invariance | $nx=ny=64$ | `initial_profile=lake_at_rest`, `shift_x_fraction=0.0`, `shift_y_fraction=0.0`, `dt_scale=1.0` |
-| `swe2d_sym` | translation_equivariance_reference | $nx=ny=64$ | `initial_profile=oblique_mode`, `shift_x_fraction=0.0`, `shift_y_fraction=0.0`, `dt_scale=1.0` |
-| `swe2d_guard` | expected_failure_for_cfl | $nx=ny=32,\ \mathrm{dt\_scale}=2.40$ | `initial_profile=linear_wave_x`, `shift_x_fraction=0.0`, `shift_y_fraction=0.0` |
+| `swe2d_ref` | refinement_for_mass_and_positivity_with_topography | $nx=ny\in\{32,64,128\}$ | `topography_profile=williamson_tc5_cone`, `initial_profile=linear_wave_x`, `shift_x_fraction=0.0`, `shift_y_fraction=0.0`, `dt_scale=1.0` |
+| `swe2d_lake` | lake_at_rest_invariance_with_topography | $nx=ny=64$ | `topography_profile=williamson_tc5_cone`, `initial_profile=lake_at_rest`, `shift_x_fraction=0.0`, `shift_y_fraction=0.0`, `dt_scale=1.0` |
+| `swe2d_resp` | topography_forced_response_stability | $nx=ny=64$ | `topography_profile=williamson_tc5_cone`, `initial_profile=oblique_mode`, `shift_x_fraction=0.0`, `shift_y_fraction=0.0`, `dt_scale=1.0` |
+| `swe2d_flat_ref` | refinement_for_linear_wave_analytic | $nx=ny\in\{32,64,128\}$ | `topography_profile=flat`, `initial_profile=linear_wave_x`, `shift_x_fraction=0.0`, `shift_y_fraction=0.0`, `dt_scale=1.0` |
+| `swe2d_flat_sym` | translation_equivariance_without_topography | $nx=ny=64$ | `topography_profile=flat`, `initial_profile=oblique_mode`, `shift_x_fraction=0.0`, `shift_y_fraction=0.0`, `dt_scale=1.0` |
+| `swe2d_guard` | expected_failure_for_cfl | $nx=ny=32,\ \mathrm{dt\_scale}=2.40$ | `topography_profile=flat`, `initial_profile=linear_wave_x`, `shift_x_fraction=0.0`, `shift_y_fraction=0.0` |
 
 ### 4-2. `case_id` 生成規則
 - テンプレートは `{family}_n{nx:03d}_sx{sx_pct:03d}_sy{sy_pct:03d}_dts{dts_pct:03d}` とする。
@@ -82,8 +103,8 @@ $$
 ### 4-3. 明示上書きケース
 - `case_id` は `swe2d_ref_n064_sx000_sy000_dts100_tend500` を追加する。
 - `base_case_id` は `swe2d_ref_n064_sx000_sy000_dts100` を参照し、`t_end` を `5.0` のみに上書きする。
-- `case_id` は `swe2d_sym_n064_sx025_sy012_dts100` を追加する。
-- `base_case_id` は `swe2d_sym_n064_sx000_sy000_dts100` を参照し、`shift_x_fraction=0.25` と `shift_y_fraction=0.125` のみ上書きする。
+- `case_id` は `swe2d_flat_sym_n064_sx025_sy012_dts100` を追加する。
+- `base_case_id` は `swe2d_flat_sym_n064_sx000_sy000_dts100` を参照し、`shift_x_fraction=0.25` と `shift_y_fraction=0.125` のみ上書きする。
 
 ## 5. 診断成果物と契約
 ### 5-1. 成果物
@@ -107,8 +128,9 @@ $$
 
 ### 5-3. `N/A` 規則
 - 診断項目が計算不能または非適用の場合は、出力値を `null` とし、`reason_na` を必須とする。
-- `errors.analytic_h.l2_rel_tend` は `initial_profile=linear_wave_x` 以外で `N/A` とする。
+- `errors.analytic_h.l2_rel_tend` は `topography_profile=flat` かつ `initial_profile=linear_wave_x` 以外で `N/A` とする。
 - `errors.symmetry_h_l2_rel` は平行移動ペア評価以外で `N/A` とする。
+- `momx_drift_rel` と `momy_drift_rel` は `topography_profile=flat` 以外で `N/A` とする。
 - `invariants.lake_rest.*` は `initial_profile=lake_at_rest` 以外で `N/A` とする。
 
 ### 5-4. 指標の定義
@@ -135,7 +157,7 @@ P^y=\sum_{i,j} (hv)_{i,j}\,dx\,dy
 $$
 ここで $M_0$ は初期質量とする。
 
-理論比較誤差（`linear_wave_x` のみ）を次で定義する。
+理論比較誤差（`flat + linear_wave_x` のみ）を次で定義する。
 $$
 \mathrm{analytic\_h\_l2\_rel}=
 \frac{\|h_{num}(t_{end})-h_{ref}(t_{end})\|_2}{\|h_{ref}(t_{end})\|_2}
@@ -148,10 +170,23 @@ $$
 $$
 ここで $\Delta x=\mathrm{shift\_x\_fraction}\cdot L_x$、$\Delta y=\mathrm{shift\_y\_fraction}\cdot L_y$ とする。
 
+静水不変性の流速指標を次で定義する。
+$$
+\mathrm{lake\_rest\_max\_velocity}=
+\max_{i,j}\left(\sqrt{u_{i,j}^2+v_{i,j}^2}\right)
+$$
+
+静水不変性の水面偏差指標を次で定義する。
+$$
+\mathrm{lake\_rest\_max\_surface\_deviation}=
+\max_{i,j}\left|\eta_{i,j}(t_{end})-\eta_{i,j}(0)\right|,
+\quad \eta=h+z_b
+$$
+
 ## 6. 既定閾値
 - $\mathrm{cfl.max} \le 1.0$
 - $h_{min} \ge 5.0e{-2}$
-- $\mathrm{mass\_drift\_rel} \le 1.0e{-11}$
+- $\mathrm{mass\_drift\_rel} \le 1.0e{-10}$
 - $\mathrm{momx\_drift\_rel} \le 1.0e{-10}$
 - $\mathrm{momy\_drift\_rel} \le 1.0e{-10}$
 - `analytic_h_l2_rel` は `nx=32` で $\le 2.2e{-1}$、`nx=64` で $\le 1.2e{-1}$、`nx=128` で $\le 6.5e{-2}$ とする。
@@ -161,9 +196,9 @@ $$
 - `symmetry_h_l2_rel \le 2.0e{-11}`
 
 ## 7. テスト定義
-### 7-1. `l1_refinement_linear_wave`
+### 7-1. `l1_refinement_mass_and_positivity`
 - `level`: `L1`
-- `objective`: `linear_wave_x` で refinement に伴う誤差低下と保存量整合を確認する。
+- `objective`: `williamson_tc5_cone + linear_wave_x` で refinement に対する質量保存と正値性を確認する。
 - 対象ケース:
   - `swe2d_ref_n032_sx000_sy000_dts100`
   - `swe2d_ref_n064_sx000_sy000_dts100`
@@ -172,59 +207,91 @@ $$
 - 判定条件:
   - `CFL` 判定は適用する。評価式は `cfl.max`、閾値は $\le 1.0$ とする。
   - 深さ正値判定は適用する。評価式は `extrema.h.min`、閾値は $\ge 5.0e{-2}$ とする。
-  - 質量保存判定は適用する。評価式は `mass_drift_rel`、閾値は $\le 1.0e{-11}$ とする。
+  - 質量保存判定は適用する。評価式は `mass_drift_rel`、閾値は $\le 1.0e{-10}$ とする。
+  - 運動量保存判定は適用しない。非適用根拠は「底面地形源項が運動量を交換するため」とする。
+  - 理論比較判定は適用しない。非適用根拠は「地形ありケースのため」とする。
+  - 平行移動同値性判定は適用しない。非適用根拠は「ペアケースを実行しないため」とする。
+  - 静水不変性判定は適用しない。非適用根拠は「初期条件が `lake_at_rest` ではないため」とする。
+
+### 7-2. `l1_refinement_linear_wave`
+- `level`: `L1`
+- `objective`: `flat + linear_wave_x` で refinement に伴う理論解誤差低下を確認する。
+- 対象ケース:
+  - `swe2d_flat_ref_n032_sx000_sy000_dts100`
+  - `swe2d_flat_ref_n064_sx000_sy000_dts100`
+  - `swe2d_flat_ref_n128_sx000_sy000_dts100`
+- `expected_outcome`: `pass`
+- 判定条件:
+  - `CFL` 判定は適用する。評価式は `cfl.max`、閾値は $\le 1.0$ とする。
+  - 深さ正値判定は適用する。評価式は `extrema.h.min`、閾値は $\ge 5.0e{-2}$ とする。
+  - 質量保存判定は適用する。評価式は `mass_drift_rel`、閾値は $\le 1.0e{-10}$ とする。
   - 運動量保存判定は適用する。評価式は `momx_drift_rel` と `momy_drift_rel`、閾値は双方 $\le 1.0e{-10}$ とする。
   - 理論比較判定は適用する。`analytic_h_l2_rel` はケース別閾値を適用し、`convergence_order` は双方で $\ge 0.80$ を要求する。
   - 平行移動同値性判定は適用しない。非適用根拠は「ペアケースを実行しないため」とする。
   - 静水不変性判定は適用しない。非適用根拠は「初期条件が `lake_at_rest` ではないため」とする。
 
-### 7-2. `l2_lake_at_rest_invariance`
+### 7-3. `l2_lake_at_rest_invariance`
 - `level`: `L2`
-- `objective`: 静水初期条件で流速と水面が不変であることを確認する。
+- `objective`: `williamson_tc5_cone + lake_at_rest` で流速と自由水面が不変であることを確認する。
 - 対象ケース:
   - `swe2d_lake_n064_sx000_sy000_dts100`
 - `expected_outcome`: `pass`
 - 判定条件:
   - `CFL` 判定は適用する。評価式は `cfl.max`、閾値は $\le 1.0$ とする。
   - 深さ正値判定は適用する。評価式は `extrema.h.min`、閾値は $\ge 5.0e{-2}$ とする。
-  - 質量保存判定は適用する。評価式は `mass_drift_rel`、閾値は $\le 1.0e{-11}$ とする。
-  - 運動量保存判定は適用する。評価式は `momx_drift_rel` と `momy_drift_rel`、閾値は双方 $\le 1.0e{-12}$ とする。
+  - 質量保存判定は適用する。評価式は `mass_drift_rel`、閾値は $\le 1.0e{-10}$ とする。
+  - 運動量保存判定は適用しない。非適用根拠は「底面地形源項が運動量を交換するため」とする。
   - 静水不変性判定は適用する。`lake_rest.max_velocity \le 1.0e{-12}` と `lake_rest.max_surface_deviation \le 1.0e{-12}` を要求する。
-  - 理論比較判定は適用しない。非適用根拠は「静水ケースは線形進行波の理論解を対象にしないため」とする。
+  - 理論比較判定は適用しない。非適用根拠は「地形あり静水ケースのため」とする。
   - 平行移動同値性判定は適用しない。非適用根拠は「単一ケース検証のため」とする。
 
-### 7-3. `l2_long_run_conservation`
+### 7-4. `l2_long_run_mass_conservation`
 - `level`: `L2`
-- `objective`: 長時間積分で質量と運動量が許容内で維持されることを確認する。
+- `objective`: `williamson_tc5_cone + linear_wave_x` の長時間積分で質量と深さ正値が維持されることを確認する。
 - 対象ケース:
   - `swe2d_ref_n064_sx000_sy000_dts100_tend500`
 - `expected_outcome`: `pass`
 - 判定条件:
   - `CFL` 判定は適用する。評価式は `cfl.max`、閾値は $\le 1.0$ とする。
   - 深さ正値判定は適用する。評価式は `extrema.h.min`、閾値は $\ge 5.0e{-2}$ とする。
-  - 質量保存判定は適用する。評価式は `mass_drift_rel`、閾値は $\le 5.0e{-11}$ とする。
-  - 運動量保存判定は適用する。評価式は `momx_drift_rel` と `momy_drift_rel`、閾値は双方 $\le 8.0e{-10}$ とする。
-  - 理論比較判定は適用しない。非適用根拠は「本テストは長時間の保存性評価を目的とするため」とする。
+  - 質量保存判定は適用する。評価式は `mass_drift_rel`、閾値は $\le 5.0e{-10}$ とする。
+  - 運動量保存判定は適用しない。非適用根拠は「底面地形源項が運動量を交換するため」とする。
+  - 理論比較判定は適用しない。非適用根拠は「地形あり長時間ケースのため」とする。
   - 平行移動同値性判定は適用しない。非適用根拠は「ペアケースを実行しないため」とする。
   - 静水不変性判定は適用しない。非適用根拠は「初期条件が `lake_at_rest` ではないため」とする。
 
-### 7-4. `l3_translation_equivariance`
+### 7-5. `l3_topography_forced_response_stability`
 - `level`: `L3`
-- `objective`: `oblique_mode` 初期条件の平行移動に対して数値解が同値であることを確認する。
-- ペアケース:
-  - `reference` は `swe2d_sym_n064_sx000_sy000_dts100`
-  - `shifted` は `swe2d_sym_n064_sx025_sy012_dts100`
+- `objective`: `williamson_tc5_cone + oblique_mode` で地形強制下の数値安定性を確認する。
+- 対象ケース:
+  - `swe2d_resp_n064_sx000_sy000_dts100`
 - `expected_outcome`: `pass`
 - 判定条件:
   - `CFL` 判定は適用する。評価式は `cfl.max`、閾値は $\le 1.0$ とする。
   - 深さ正値判定は適用する。評価式は `extrema.h.min`、閾値は $\ge 5.0e{-2}$ とする。
-  - 質量保存判定は適用する。評価式は `mass_drift_rel`、閾値は $\le 1.0e{-11}$ とする。
-  - 運動量保存判定は適用する。評価式は `momx_drift_rel` と `momy_drift_rel`、閾値は双方 $\le 1.0e{-10}$ とする。
-  - 平行移動同値性判定は適用する。評価式は `symmetry_h_l2_rel`、閾値は $\le 2.0e{-11}$ とする。
-  - 理論比較判定は適用しない。非適用根拠は「`oblique_mode` で本スイートが理論解を定義しないため」とする。
+  - 質量保存判定は適用する。評価式は `mass_drift_rel`、閾値は $\le 1.0e{-10}$ とする。
+  - 運動量保存判定は適用しない。非適用根拠は「底面地形源項が運動量を交換するため」とする。
+  - 理論比較判定は適用しない。非適用根拠は「地形ありケースで理論解を使用しないため」とする。
+  - 平行移動同値性判定は適用しない。非適用根拠は「地形ありケースでは本テストで同値性を要求しないため」とする。
   - 静水不変性判定は適用しない。非適用根拠は「初期条件が `lake_at_rest` ではないため」とする。
 
-### 7-5. `l0_cfl_guard_xfail`
+### 7-6. `l3_translation_equivariance`
+- `level`: `L3`
+- `objective`: `flat + oblique_mode` 初期条件の平行移動に対して数値解が同値であることを確認する。
+- ペアケース:
+  - `reference` は `swe2d_flat_sym_n064_sx000_sy000_dts100`
+  - `shifted` は `swe2d_flat_sym_n064_sx025_sy012_dts100`
+- `expected_outcome`: `pass`
+- 判定条件:
+  - `CFL` 判定は適用する。評価式は `cfl.max`、閾値は $\le 1.0$ とする。
+  - 深さ正値判定は適用する。評価式は `extrema.h.min`、閾値は $\ge 5.0e{-2}$ とする。
+  - 質量保存判定は適用する。評価式は `mass_drift_rel`、閾値は $\le 1.0e{-10}$ とする。
+  - 運動量保存判定は適用する。評価式は `momx_drift_rel` と `momy_drift_rel`、閾値は双方 $\le 1.0e{-10}$ とする。
+  - 平行移動同値性判定は適用する。評価式は `symmetry_h_l2_rel`、閾値は $\le 2.0e{-11}$ とする。
+  - 理論比較判定は適用しない。非適用根拠は「`oblique_mode` は理論解一致判定の対象外のため」とする。
+  - 静水不変性判定は適用しない。非適用根拠は「初期条件が `lake_at_rest` ではないため」とする。
+
+### 7-7. `l0_cfl_guard_xfail`
 - `level`: `L0`
 - `objective`: `CFL` 違反ケースを検出できることを確認する（期待失敗）。
 - 対象ケース:

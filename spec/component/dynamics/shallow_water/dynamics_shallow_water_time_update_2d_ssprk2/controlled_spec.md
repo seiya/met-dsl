@@ -2,7 +2,7 @@
 
 ## 0. メタ情報
 - `spec_id`: `dynamics_shallow_water_time_update_2d_ssprk2`
-- `spec_version`: `0.1.0`
+- `spec_version`: `0.2.0`
 - `status`: `controlled_draft`
 - `spec_kind`: `component`
 - `domain`: `dynamics`
@@ -12,15 +12,15 @@
 本 `component` は shallow water 問題の時間積分を `SSPRK2` で実行する責務を持つ。
 
 ## 2. 入出力契約
-入力は `U^n`、界面フラックス差分、`dt`、`dx`、`dy` とする。出力は `U^{n+1}` とする。
+入力は `U^n`、界面フラックス差分、底面地形源項 `S_b`、`dt`、`dx`、`dy` とする。出力は `U^{n+1}` とする。
 
 ## 3. 演算定義
-公開 `operation` は `dynamics_shallow_water_time_update_2d_ssprk2__advance` とする。更新は
+公開 `operation` は `dynamics_shallow_water_time_update_2d_ssprk2__advance` とする。ここで $L_{flux}(U)$ を界面フラックス差分、$S_b(U,z_b)$ を底面地形源項とする。更新は
 $$
-U^{(1)}=U^n+\Delta t\,L(U^n)
+U^{(1)}=U^n+\Delta t\left(L_{flux}(U^n)+S_b(U^n,z_b)\right)
 $$
 $$
-U^{n+1}=\frac{1}{2}U^n+\frac{1}{2}\left(U^{(1)}+\Delta t\,L(U^{(1)})\right)
+U^{n+1}=\frac{1}{2}U^n+\frac{1}{2}\left(U^{(1)}+\Delta t\left(L_{flux}(U^{(1)})+S_b(U^{(1)},z_b)\right)\right)
 $$
 で定義する。
 
@@ -40,4 +40,4 @@ $$
 `ad_readiness.enabled` は `true` とする。非微分演算として `ceil`（`dt` 規則に用いる場合）を明示する。
 
 ## 9. tests 参照
-対応する `tests.md` を同一ディレクトリに配置し、`test_profile_version` を `0.1.0` とする。
+対応する `tests.md` を同一ディレクトリに配置し、`test_profile_version` を `0.2.0` とする。

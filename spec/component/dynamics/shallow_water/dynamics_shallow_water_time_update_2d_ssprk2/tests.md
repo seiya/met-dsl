@@ -2,18 +2,18 @@
 
 ## 0. メタ情報
 - `test_profile_id`: `dynamics_shallow_water_time_update_2d_ssprk2_l0`
-- `test_profile_version`: `0.1.0`
+- `test_profile_version`: `0.2.0`
 - `status`: `draft`
 - `spec_ref.spec_kind`: `component`
 - `spec_ref.spec_id`: `dynamics_shallow_water_time_update_2d_ssprk2`
-- `spec_ref.spec_version`: `0.1.0`
+- `spec_ref.spec_version`: `0.2.0`
 - `spec_ref.controlled_spec_path`: `spec/component/dynamics/shallow_water/dynamics_shallow_water_time_update_2d_ssprk2/controlled_spec.md`
 
 ## 1. テスト対象 `operation`
 - `dynamics_shallow_water_time_update_2d_ssprk2__advance`
 
 ## 2. 入力既定化規則
-- 正常系は `dt>0`, `dx>0`, `dy>0` を使用する。
+- 正常系は `dt>0`, `dx>0`, `dy>0` を使用し、`S_b=0` と `S_b!=0` の双方を評価対象に含める。
 - 異常系は `dt<=0` を使用する。
 
 ## 3. 診断契約
