@@ -9,9 +9,13 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import subprocess
 import sys
+import time
+import uuid
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
@@ -19,6 +23,7 @@ JSONRPC_VERSION = "2.0"
 SERVER_NAME = "build-runtime-server"
 SERVER_VERSION = "0.1.0"
 DEFAULT_PROTOCOL_VERSION = "2024-11-05"
+DEFAULT_COMMAND_LOG_FILE = "mcp_command_log.jsonl"
 
 FORTRAN_C_FAMILY = {
     "fortran",
@@ -99,12 +104,45 @@ def _trim(text: str, limit: int) -> str:
     return f"{head}\n...<omitted {omitted} chars>...\n{tail}"
 
 
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _resolve_command_log_path(project_dir: str, command_log_path: str | None) -> Path:
+    base_dir = Path(project_dir).resolve()
+    if command_log_path is None or not str(command_log_path).strip():
+        return base_dir / DEFAULT_COMMAND_LOG_FILE
+
+    raw_path = Path(str(command_log_path))
+    if raw_path.is_absolute():
+        return raw_path
+    return base_dir / raw_path
+
+
+def _path_to_ref(path: Path) -> str | None:
+    repo_root = Path.cwd().resolve()
+    try:
+        relative = path.resolve().relative_to(repo_root)
+    except ValueError:
+        return None
+    return relative.as_posix()
+
+
+def _append_command_log(log_path: Path, entry: dict[str, Any]) -> None:
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    with log_path.open("a", encoding="utf-8") as stream:
+        stream.write(json.dumps(entry, ensure_ascii=False))
+        stream.write("\n")
+
+
 def _run_command(
     command: list[str],
     cwd: str,
+    tool_name: str,
     timeout_sec: int,
     env: dict[str, str] | None,
     capture_limit: int,
+    command_log_path: str | None,
 ) -> dict[str, Any]:
     if not command:
         raise ValueError("command must not be empty")
@@ -119,6 +157,11 @@ def _run_command(
     if env:
         merged_env.update({str(k): str(v) for k, v in env.items()})
 
+    log_path = _resolve_command_log_path(cwd, command_log_path)
+    command_id = uuid.uuid4().hex
+    started_at = _utc_now_iso()
+    started = time.monotonic()
+
     try:
         proc = subprocess.run(
             command,
@@ -129,24 +172,75 @@ def _run_command(
             timeout=timeout_sec,
             check=False,
         )
-        return {
+        elapsed_ms = int((time.monotonic() - started) * 1000)
+        result = {
             "ok": proc.returncode == 0,
             "return_code": proc.returncode,
             "command": command,
+            "executed_command": shlex.join(command),
             "cwd": str(path),
             "stdout": _trim(proc.stdout, capture_limit),
             "stderr": _trim(proc.stderr, capture_limit),
         }
+        entry = {
+            "version": 1,
+            "command_id": command_id,
+            "tool_name": tool_name,
+            "started_at_utc": started_at,
+            "ended_at_utc": _utc_now_iso(),
+            "elapsed_ms": elapsed_ms,
+            "cwd": str(path),
+            "command": command,
+            "executed_command": shlex.join(command),
+            "timeout_sec": timeout_sec,
+            "capture_limit": capture_limit,
+            "env_override_keys": sorted(env.keys()) if env else [],
+            "ok": result["ok"],
+            "return_code": result["return_code"],
+        }
+        _append_command_log(log_path, entry)
+        result["command_id"] = command_id
+        result["command_log_path"] = str(log_path)
+        log_ref = _path_to_ref(log_path)
+        if log_ref is not None:
+            result["command_log_ref"] = log_ref
+        return result
     except subprocess.TimeoutExpired as exc:
-        return {
+        elapsed_ms = int((time.monotonic() - started) * 1000)
+        result = {
             "ok": False,
             "return_code": None,
             "command": command,
+            "executed_command": shlex.join(command),
             "cwd": str(path),
             "stdout": _trim(exc.stdout or "", capture_limit),
             "stderr": _trim(exc.stderr or "", capture_limit),
             "error": f"timeout: exceeded {timeout_sec} sec",
         }
+        entry = {
+            "version": 1,
+            "command_id": command_id,
+            "tool_name": tool_name,
+            "started_at_utc": started_at,
+            "ended_at_utc": _utc_now_iso(),
+            "elapsed_ms": elapsed_ms,
+            "cwd": str(path),
+            "command": command,
+            "executed_command": shlex.join(command),
+            "timeout_sec": timeout_sec,
+            "capture_limit": capture_limit,
+            "env_override_keys": sorted(env.keys()) if env else [],
+            "ok": result["ok"],
+            "return_code": result["return_code"],
+            "error": result["error"],
+        }
+        _append_command_log(log_path, entry)
+        result["command_id"] = command_id
+        result["command_log_path"] = str(log_path)
+        log_ref = _path_to_ref(log_path)
+        if log_ref is not None:
+            result["command_log_ref"] = log_ref
+        return result
 
 
 def _resolve_target_class(args: dict[str, Any]) -> str | None:
@@ -284,6 +378,9 @@ def tool_compile_project(args: dict[str, Any]) -> dict[str, Any]:
     jobs = int(args.get("jobs", max(1, (os.cpu_count() or 1) // 2)))
     timeout_sec = int(args.get("timeout_sec", 1800))
     capture_limit = int(args.get("capture_limit", 120000))
+    command_log_path = args.get("command_log_path")
+    if command_log_path is not None and not isinstance(command_log_path, str):
+        raise ValueError("command_log_path must be a string")
     extra_args = [str(x) for x in args.get("extra_args", [])]
     env = args.get("env")
     if env is not None and not isinstance(env, dict):
@@ -311,7 +408,15 @@ def tool_compile_project(args: dict[str, Any]) -> dict[str, Any]:
         )
 
     command = _build_command(build_system, target, jobs, extra_args)
-    result = _run_command(command, project_dir, timeout_sec, env, capture_limit)
+    result = _run_command(
+        command=command,
+        cwd=project_dir,
+        tool_name="compile_project",
+        timeout_sec=timeout_sec,
+        env=env,
+        capture_limit=capture_limit,
+        command_log_path=command_log_path,
+    )
     result["language"] = language or None
     result["build_system"] = build_system
     return result
@@ -321,6 +426,9 @@ def tool_run_program(args: dict[str, Any]) -> dict[str, Any]:
     project_dir = str(args.get("project_dir", "."))
     timeout_sec = int(args.get("timeout_sec", 3600))
     capture_limit = int(args.get("capture_limit", 120000))
+    command_log_path = args.get("command_log_path")
+    if command_log_path is not None and not isinstance(command_log_path, str):
+        raise ValueError("command_log_path must be a string")
     env = args.get("env")
     target_class = _resolve_target_class(args)
     threads_per_rank = _parse_threads_per_rank(args)
@@ -346,7 +454,15 @@ def tool_run_program(args: dict[str, Any]) -> dict[str, Any]:
         run_env["OMP_THREAD_LIMIT"] = thread_count
         openmp_env_applied = True
 
-    result = _run_command(command, project_dir, timeout_sec, run_env, capture_limit)
+    result = _run_command(
+        command=command,
+        cwd=project_dir,
+        tool_name="run_program",
+        timeout_sec=timeout_sec,
+        env=run_env,
+        capture_limit=capture_limit,
+        command_log_path=command_log_path,
+    )
     result["target_class"] = target_class
     result["threads_per_rank"] = threads_per_rank
     result["openmp_env_applied"] = openmp_env_applied
@@ -362,6 +478,9 @@ def tool_run_quality_checks(args: dict[str, Any]) -> dict[str, Any]:
     project_dir = str(args.get("project_dir", "."))
     timeout_sec = int(args.get("timeout_sec", 1800))
     capture_limit = int(args.get("capture_limit", 120000))
+    command_log_path = args.get("command_log_path")
+    if command_log_path is not None and not isinstance(command_log_path, str):
+        raise ValueError("command_log_path must be a string")
     env = args.get("env")
     preset = str(args.get("preset", "make_test"))
 
@@ -383,7 +502,15 @@ def tool_run_quality_checks(args: dict[str, Any]) -> dict[str, Any]:
         supported = ", ".join(sorted(list(presets.keys()) + ["custom"]))
         raise ValueError(f"unsupported preset: {preset}. supported={supported}")
 
-    result = _run_command(command, project_dir, timeout_sec, env, capture_limit)
+    result = _run_command(
+        command=command,
+        cwd=project_dir,
+        tool_name="run_quality_checks",
+        timeout_sec=timeout_sec,
+        env=env,
+        capture_limit=capture_limit,
+        command_log_path=command_log_path,
+    )
     result["preset"] = preset
     return result
 
@@ -418,6 +545,10 @@ TOOLS: dict[str, Tool] = {
                 "extra_args": {"type": "array", "items": {"type": "string"}},
                 "timeout_sec": {"type": "integer", "minimum": 1},
                 "capture_limit": {"type": "integer", "minimum": 1000},
+                "command_log_path": {
+                    "type": "string",
+                    "description": "JSONL path for command logs. Relative paths are resolved from project_dir.",
+                },
                 "env": {
                     "type": "object",
                     "additionalProperties": {"type": "string"},
@@ -441,6 +572,10 @@ TOOLS: dict[str, Tool] = {
                 "command": {"type": "array", "items": {"type": "string"}},
                 "timeout_sec": {"type": "integer", "minimum": 1},
                 "capture_limit": {"type": "integer", "minimum": 1000},
+                "command_log_path": {
+                    "type": "string",
+                    "description": "JSONL path for command logs. Relative paths are resolved from project_dir.",
+                },
                 "target_class": {"type": "string"},
                 "target.class": {"type": "string"},
                 "target": {
@@ -474,6 +609,10 @@ TOOLS: dict[str, Tool] = {
                 "command": {"type": "array", "items": {"type": "string"}},
                 "timeout_sec": {"type": "integer", "minimum": 1},
                 "capture_limit": {"type": "integer", "minimum": 1000},
+                "command_log_path": {
+                    "type": "string",
+                    "description": "JSONL path for command logs. Relative paths are resolved from project_dir.",
+                },
                 "env": {
                     "type": "object",
                     "additionalProperties": {"type": "string"},

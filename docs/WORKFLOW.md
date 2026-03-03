@@ -93,6 +93,8 @@
 ## 3. 実行（runner / simulate）
 - 入力: `case.resolved.yaml` と（任意で）`impl.resolved.yaml` と `dependency.resolved.yaml`
 - `Build` と `Execute` は `MCP` サーバー経由で実行する。`compile` は `compile_project`、`run` は `run_program` を使用する。
+- `compile_project` と `run_program` の実行では、実コマンド記録を `JSONL` 形式で保存しなければならない。既定の保存先は `project_dir/mcp_command_log.jsonl` とする。
+- `Build` と `Execute` の試行メタデータは、`MCP` 実行結果の `command_id` を識別子として記録し、`source_command_ref` には `command_log_ref`（または `command_log_path`）を追跡可能に記録しなければならない。
 - `Build` と `Execute` は `node` 単位に個別実行し、他 `node` の成果物を混在させない。
 - `Build` は、依存を持つ `node` に対して、依存 `operation` の解決先が `dependency.resolved.yaml` と一致することを検証しなければならない。不一致時は `Build fail` とする。
 - `runner` が `model` を呼び出し、`diagnostics.json` と `perf.json` を出力する。

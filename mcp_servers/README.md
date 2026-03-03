@@ -18,6 +18,9 @@
 - `fortran` / `c` 系でビルドツールが未指定の場合、既定値は `make` とする。
 - `gcc` / `clang` / `gfortran` を直接呼び出して単発ビルドする運用は禁止する。
 - `run_program` で `target.class=cpu`（または `target_class=cpu`）かつ `threads_per_rank` を指定した場合、`OMP_NUM_THREADS` と `OMP_THREAD_LIMIT` を自動設定する。
+- `compile_project` / `run_program` / `run_quality_checks` は、実行したコマンドを `JSONL` 形式で必ず記録する。
+- `command_log_path` 未指定時の既定値は `<project_dir>/mcp_command_log.jsonl` とする。
+- 実行結果は `command_id` と `executed_command` と `command_log_path` を返却し、リポジトリ配下にログがある場合は `command_log_ref` を返却する。
 
 ## MCP 設定例
 以下は一般的な MCP クライアント設定の例である。実際の設定形式はクライアント実装に合わせて調整する。
@@ -43,6 +46,7 @@
   "name": "compile_project",
   "arguments": {
     "project_dir": "/path/to/project",
+    "command_log_path": "logs/build_commands.jsonl",
     "language": "fortran",
     "build_system": "make",
     "target": "all",
@@ -58,6 +62,7 @@
   "name": "run_program",
   "arguments": {
     "project_dir": "/path/to/project",
+    "command_log_path": "logs/run_commands.jsonl",
     "command": ["./bin/simulate", "--case", "case.resolved.yaml"],
     "target.class": "cpu",
     "threads_per_rank": 8,
