@@ -1,13 +1,13 @@
 # Tests: 1 次元 移流拡散 既定プロファイル
 
 ## 0. メタ情報
-- `test_profile_id`: `transport_advection_diffusion_profile_1d_upwind_center2_euler1_validation`
+- `test_profile_id`: `dynamics_advection_diffusion_profile_1d_upwind_center2_euler1_validation`
 - `test_profile_version`: `0.1.0`
 - `status`: `draft`
 - `spec_ref.spec_kind`: `profile`
-- `spec_ref.spec_id`: `transport_advection_diffusion_profile_1d_upwind_center2_euler1`
+- `spec_ref.spec_id`: `dynamics_advection_diffusion_profile_1d_upwind_center2_euler1`
 - `spec_ref.spec_version`: `0.1.0`
-- `spec_ref.controlled_spec_path`: `spec/profile/transport/advection_diffusion/transport_advection_diffusion_profile_1d_upwind_center2_euler1/controlled_spec.md`
+- `spec_ref.controlled_spec_path`: `spec/profile/dynamics/advection_diffusion/dynamics_advection_diffusion_profile_1d_upwind_center2_euler1/controlled_spec.md`
 
 ## 1. テスト目的
 本スイートは、`advection_diffusion` 問題に対する既定プロファイル選択規則と互換性ガードを検証する。
@@ -15,10 +15,10 @@
 ## 2. 入力既定化規則
 - 正常系は `problem.family=advection_diffusion`、`dimension=1d`、`boundary=periodic` を入力とする。
 - 正常系の `component` 版は次を使用する。
-  - `transport_advection_diffusion_flux_1d_upwind_center2@0.1.0`
-  - `transport_advection_diffusion_boundary_1d_periodic_copy@0.1.0`
-  - `transport_advection_diffusion_time_update_1d_euler1@0.1.0`
-- 異常系は互換範囲外版として `transport_advection_diffusion_flux_1d_upwind_center2@1.0.0` を使用する。
+  - `dynamics_advection_diffusion_flux_1d_upwind_center2@0.1.0`
+  - `dynamics_advection_diffusion_boundary_1d_periodic_copy@0.1.0`
+  - `dynamics_advection_diffusion_time_update_1d_euler1@0.1.0`
+- 異常系は互換範囲外版として `dynamics_advection_diffusion_flux_1d_upwind_center2@1.0.0` を使用する。
 
 ## 3. 実行制御規則
 本スイートは `profile` 選択ロジックの判定のみを対象とする。時刻積分の実行制御は `N/A` とする。理由は「本スイートがプロファイル解決のみを検証対象とするため」とする。
@@ -39,7 +39,7 @@
   - `level`: `L0`
   - `expected_outcome`: `pass`
   - `target_case`: `profile_select_default`
-  - `判定`: `profile_id=transport_advection_diffusion_profile_1d_upwind_center2_euler1` が選択され、`checks.profile_selected=true` を満たす。
+  - `判定`: `profile_id=dynamics_advection_diffusion_profile_1d_upwind_center2_euler1` が選択され、`checks.profile_selected=true` を満たす。
 
 - `test_id`: `l0_guard_incompatible_component_version_xfail`
   - `level`: `L0`

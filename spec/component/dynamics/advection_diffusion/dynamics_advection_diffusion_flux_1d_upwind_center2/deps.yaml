@@ -1,4 +1,4 @@
-spec_id: transport_advection_diffusion_flux_1d_upwind_center2
+spec_id: dynamics_advection_diffusion_flux_1d_upwind_center2
 spec_kind: component
 dependencies:
   components: []

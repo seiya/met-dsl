@@ -5,7 +5,7 @@
 - `spec_version`: `0.3.0`
 - `status`: `controlled_draft`
 - `spec_kind`: `problem`
-- `domain`: `transport`
+- `domain`: `dynamics`
 - `family`: `advection_diffusion`
 
 ## 1. 問題定義
@@ -26,17 +26,17 @@ $$
 
 ## 4. 依存 `component` と採用 `profile`
 本 `problem spec` は次の `component` を参照する。
-- `transport_advection_diffusion_flux_1d_upwind_center2`
-- `transport_advection_diffusion_boundary_1d_periodic_copy`
-- `transport_advection_diffusion_time_update_1d_euler1`
+- `dynamics_advection_diffusion_flux_1d_upwind_center2`
+- `dynamics_advection_diffusion_boundary_1d_periodic_copy`
+- `dynamics_advection_diffusion_time_update_1d_euler1`
 
-採用 `profile` は `transport_advection_diffusion_profile_1d_upwind_center2_euler1` とする。
+採用 `profile` は `dynamics_advection_diffusion_profile_1d_upwind_center2_euler1` とする。
 
 ## 5. 統合アルゴリズム
 更新ステップは次の順序に固定する。
-1. `transport_advection_diffusion_boundary_1d_periodic_copy__apply` で ghost 領域を更新する。
-2. `transport_advection_diffusion_flux_1d_upwind_center2__compute_flux` で移流・拡散 フラックスを計算する。
-3. `transport_advection_diffusion_time_update_1d_euler1__advance` で前進 Euler 更新を実行する。
+1. `dynamics_advection_diffusion_boundary_1d_periodic_copy__apply` で ghost 領域を更新する。
+2. `dynamics_advection_diffusion_flux_1d_upwind_center2__compute_flux` で移流・拡散 フラックスを計算する。
+3. `dynamics_advection_diffusion_time_update_1d_euler1__advance` で前進 Euler 更新を実行する。
 
 安定指標は
 $$
@@ -62,7 +62,7 @@ $$
 ## 8. トレーサビリティ
 `case.resolved.yaml` には `spec_kind`, `spec_id`, `spec_version`, `component_id@version`, `profile_id@version` の解決結果を必須記録とする。
 
-参照根拠は LeVeque（2002）とする。検証プロファイルは `spec/problem/transport/advection_diffusion/advdiff1d_linear/tests.md` を参照する。
+参照根拠は LeVeque（2002）とする。検証プロファイルは `spec/problem/dynamics/advection_diffusion/advdiff1d_linear/tests.md` を参照する。
 
 ## 9. AD 準備情報
 `ad_readiness.enabled` は `true` とする。状態更新は $u_{next}=F(u_{now}, params)$ の形で表現し、微分対象外演算として `ceil` と 周期インデックス wrap を明示する。

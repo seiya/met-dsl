@@ -17,8 +17,8 @@ The source of truth is `controlled_spec.md` and `tests.md`, and AI-assisted stag
 
 - Workflow and contract specifications for the full pipeline (`Spec -> Plan -> Generate -> Build -> Execute -> Judge -> Tune -> Promote`).
 - MCP build/runtime server implementation at `mcp_servers/build_runtime_server.py`.
-- Sample `advdiff1d` controlled spec at `spec/problem/transport/advection_diffusion/advdiff1d_linear/controlled_spec.md`.
-- Sample `advdiff1d` tests at `spec/problem/transport/advection_diffusion/advdiff1d_linear/tests.md`.
+- Sample `advdiff1d` controlled spec at `spec/problem/dynamics/advection_diffusion/advdiff1d_linear/controlled_spec.md`.
+- Sample `advdiff1d` tests at `spec/problem/dynamics/advection_diffusion/advdiff1d_linear/tests.md`.
 
 ## Core Workflow (Summary)
 
@@ -58,8 +58,8 @@ Minimal MCP client config:
 
 ## Quick Start (Minimal)
 
-1. Read `spec/problem/transport/advection_diffusion/advdiff1d_linear/controlled_spec.md`.
-2. Read `spec/problem/transport/advection_diffusion/advdiff1d_linear/tests.md`.
+1. Read `spec/problem/dynamics/advection_diffusion/advdiff1d_linear/controlled_spec.md`.
+2. Read `spec/problem/dynamics/advection_diffusion/advdiff1d_linear/tests.md`.
 3. Configure your MCP client with `mcp_servers/build_runtime_server.py`.
 4. Run build and execution via MCP tools (`compile_project`, `run_program`).
 5. Evaluate `diagnostics.json`, `perf.json`, and `verdict.json` with the workflow documents.

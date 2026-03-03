@@ -1,4 +1,4 @@
-spec_id: transport_advection_diffusion_boundary_1d_periodic_copy
+spec_id: dynamics_advection_diffusion_boundary_1d_periodic_copy
 spec_kind: component
 dependencies:
   components: []

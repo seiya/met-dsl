@@ -117,7 +117,7 @@ bitwise 一致は要求しない。以下の性質で一致を判定する。
 
 ## 10. `spec` 分類語彙（`spec_kind` / `domain` / `family`）
 - **spec_kind**: `spec` の種別。`problem` / `component` / `profile` の 3 値のみを許可する。
-- **domain**: 物理モデルの上位分類。`spec` 配置と `component_id` 接頭辞の一貫性を保つための固定語彙。例: `transport`, `dynamics`, `microphysics`, `radiation`, `land_surface`。
+- **domain**: 物理モデルの上位分類。`spec` 配置と `component_id` 接頭辞の一貫性を保つための固定語彙。例: `dynamics`, `microphysics`, `radiation`, `land_surface`。
 - **family**: `domain` 内の分類単位。`problem` では方程式群、`component` では再利用演算群、`profile` では選択規則群を表す。
 - **component**: `component spec` が定義する再利用可能な物理演算単位。方程式系または離散化責務で分割する。例: `advection_flux`, `time_integrator`, `boundary_periodic`。
 - **operation**: `component` が公開する呼び出し単位。言語固有の関数・手続き・メソッドなどの実体を抽象化した語彙。
