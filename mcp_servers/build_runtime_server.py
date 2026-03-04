@@ -491,15 +491,13 @@ def tool_run_quality_checks(args: dict[str, Any]) -> dict[str, Any]:
         "pytest": ["pytest", "-q"],
     }
 
-    if preset == "custom":
-        command = args.get("command")
-        if not isinstance(command, list) or not command:
-            raise ValueError("preset=custom requires non-empty command array")
-        command = [str(item) for item in command]
-    elif preset in presets:
+    if "command" in args:
+        raise ValueError("run_quality_checks does not allow custom command; use preset")
+
+    if preset in presets:
         command = presets[preset]
     else:
-        supported = ", ".join(sorted(list(presets.keys()) + ["custom"]))
+        supported = ", ".join(sorted(presets.keys()))
         raise ValueError(f"unsupported preset: {preset}. supported={supported}")
 
     result = _run_command(
@@ -599,14 +597,13 @@ TOOLS: dict[str, Tool] = {
         name="run_quality_checks",
         description=(
             "Run quality checks through standard workflows. "
-            "Supports presets (make_test/make_check/ctest/pytest) or custom."
+            "Supports presets (make_test/make_check/ctest/pytest)."
         ),
         input_schema={
             "type": "object",
             "properties": {
                 "project_dir": {"type": "string", "default": "."},
                 "preset": {"type": "string", "default": "make_test"},
-                "command": {"type": "array", "items": {"type": "string"}},
                 "timeout_sec": {"type": "integer", "minimum": 1},
                 "capture_limit": {"type": "integer", "minimum": 1000},
                 "command_log_path": {

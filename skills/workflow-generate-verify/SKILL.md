@@ -18,6 +18,8 @@ Generate ステージ出力の検証責務を固定し、`Build` 失敗を事前
 - `model` が対象 `node` の演算契約を実装していることを検査する。固定値返却専用、固定 `JSON` 出力専用、`no-op` 専用実装を `fail` とする。
 - `model` が `derived_contract.json` で要求された依存 `operation` と出力指標のデータ依存（`semantic_dependency.required_sources` と `io_contract.outputs`）を満たすことを検査する。時空間ループなど特定制御構造を一律必須にしてはならない。
 - 出力指標が `model` 実行結果に依存しない定数出力、固定 `JSON` 出力、解析式直接代入を検出した場合は `fail` とする。
+- `problem` かつ `spec_id` が `2d` または `3d` を含む `node` は、`derived_contract.json` の `numerical_kernel_contract` を必須検査し、欠落または `fallback_policy!=fail_closed` を検出した場合は `fail` とする。
+- `problem` かつ `spec_id` が `2d` または `3d` を含む `node` は、複数 `intent(out)` 指標を出力する `subroutine` が `state_variables` 配列参照を持たない場合を `metric-only scalar kernel` として `fail` とする。
 - 生成コードが対象 `node_key` の入出力契約に一致することを検査する。
 - 依存を持つ `node` は、`dependency.resolved.yaml` の `direct_deps` で解決された依存 `node` の公開 `operation` 呼び出しを実装していることを検査する。欠落時は `fail` とする。
 - 依存 `operation` と同等機能の再実装を検出した場合は `fail` とする。

@@ -15,7 +15,7 @@
 - **case.resolved.yaml**: テストランナーが生成する「決定済み」入力。`sweep` 展開、物理アルゴリズム（後述）と数値条件を決定したもの。`runner`（例: `simulate`）がこれを読む。出力契約を保持してはならない。
 - **impl.resolved.yaml**: 実装計画（`Implementation Plan`）。計算過程（並列化、メモリ配置、融合、ブロッキング等）に関する可変パラメタを決定したもの。性能チューニングの探索対象になり得る。
 - **dependency.resolved.yaml**: 依存解決結果の正本。`node_key`、`direct_deps`、`transitive_deps`、`topo_level` を保持する。
-- **derived_contract.json**: `Plan verify` が導出する検証契約。`io_contract.inputs` / `io_contract.outputs` と `semantic_dependency.required_sources` と `raw_requirements.required_evidence` を保持し、`Generate verify` と `Execute` / `Judge` の判定正本として使用する。
+- **derived_contract.json**: `Plan verify` が導出する検証契約。`io_contract.inputs` / `io_contract.outputs` と `semantic_dependency.required_sources` と `raw_requirements.required_evidence` と `test_evidence_requirements` を保持し、`Generate verify` と `Execute` / `Judge` の判定正本として使用する。
 - **expected_node_set**: `deps.yaml` と `spec_catalog.yaml` から再構成した期待 `node` 集合。`dependency.resolved.yaml` の網羅検証に使用する。
 - **node workflow**: 単一 `node_key` を対象にした `Plan -> Generate -> Build -> Execute -> Judge` の 1 系列実行。
 - **node_key_safe**: `node_key` の保存用表記。推奨形式は `<spec_kind>__<spec_id>__<spec_version>`。
@@ -49,7 +49,7 @@
 - **dummy 計算**: 物理計算を実行せず、固定値や定型文字列のみで計算結果を代替する実装。
 - **fail-fast 停止**: 工程入力不足または契約不一致を検知した時点で当該工程を `fail` で停止し、推測補完や人工生成で継続しない運用規則。
 - **pipeline semantic validation**: `python3 tools/validate_pipeline_semantics.py` による内容検証ゲート。`raw` 一次証跡、`trial_meta` 追跡整合、`quality check` 比較正本、固定値生成パターン、`copy_based_artifact_reuse` を機械検証する。
-- **raw snapshot schema**: `problem` `node` の `raw/state_snapshots/snapshot_schema.json` に保存する項目定義。`state_variables` と `time_variable` により、各問題設定で判定再計算に使用する状態量と時刻情報を表す。
+- **raw snapshot schema**: `problem` `node` の `raw/state_snapshots/snapshot_schema.json` に保存する項目定義。`variables[].name` と `variables[].shape_expr` と `time_variable` と `time_shape_expr` により、各問題設定で判定再計算に使用する状態量と時刻情報を表す。
 
 補足:
 - `perf.json` は `diagnostics.json` とは分離して出力する（同居しない）。

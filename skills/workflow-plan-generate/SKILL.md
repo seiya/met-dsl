@@ -24,7 +24,13 @@ Plan ステージの生成責務を固定し、入力 spec から決定的な re
 - `dependency.resolved.yaml` は `node_key` と `direct_deps` と `transitive_deps` と `topo_level` を必須記録する。
 - `derived_contract.json` を必須出力とし、`controlled_spec.md` と `tests.md` と `deps.yaml` から導出した検証契約を保持する。
 - `derived_contract.json` は `io_contract.inputs` と `io_contract.outputs` を必須保持し、`outputs` は `name` と `evidence_ref` と `shape_expr` を必須保持する。
+- `derived_contract.json` の `io_contract.outputs` で `evidence_ref` が `raw/state_snapshots` 以外を参照し、かつ `artifact=state_snapshots` を必須宣言する場合、当該 `output` は `raw_variables` で判定再計算に必要な `raw` 変数名を必須記録する。
 - `derived_contract.json` は `raw_requirements.required_evidence` を必須保持し、`artifact` と `required` と `min_samples` と `schema`（必要時）を定義する。
+- `raw_requirements.required_evidence` で `artifact=state_snapshots` を `required=true` で宣言する場合、`schema.variables[].name` と `schema.variables[].shape_expr` と `schema.time_variable` と `schema.time_shape_expr` を必須記録する。
+- `derived_contract.json` は `test_evidence_requirements` を必須保持し、`tests.md` の各 `test_id` ごとに `required_raw_variables` を記録する。
+- `problem` かつ `spec_id` が `2d` または `3d` を含む `node` では、`derived_contract.json` に `numerical_kernel_contract` を必須保持する。
+- `numerical_kernel_contract` は `state_variables[].name` と `state_variables[].shape_expr` と `required_update_paths` と `diagnostics_from_state=true` と `fallback_policy=fail_closed` を必須保持する。
+- `numerical_kernel_contract` を導出できない場合は `Plan fail` とし、不完全な契約で `Generate` へ進めてはならない。
 - 未登録依存、未実装依存、互換性違反依存は解決エラーにし、該当 `node` を `blocked` にする。
 
 ## 運用ルール

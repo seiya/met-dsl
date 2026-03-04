@@ -18,6 +18,7 @@
 - `fortran` / `c` 系でビルドツールが未指定の場合、既定値は `make` とする。
 - `gcc` / `clang` / `gfortran` を直接呼び出して単発ビルドする運用は禁止する。
 - `run_program` で `target.class=cpu`（または `target_class=cpu`）かつ `threads_per_rank` を指定した場合、`OMP_NUM_THREADS` と `OMP_THREAD_LIMIT` を自動設定する。
+- `run_quality_checks` は `preset` 指定のみを許可し、任意 `command` の実行を禁止する。
 - `compile_project` / `run_program` / `run_quality_checks` は、実行したコマンドを `JSONL` 形式で必ず記録する。
 - `command_log_path` 未指定時の既定値は `<project_dir>/mcp_command_log.jsonl` とする。
 - 実行結果は `command_id` と `executed_command` と `command_log_path` を返却し、リポジトリ配下にログがある場合は `command_log_ref` を返却する。

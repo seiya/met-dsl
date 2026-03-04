@@ -67,6 +67,30 @@ FORTRAN_KEYWORDS = {
     "true",
     "false",
 }
+QUALITY_CHECK_ALLOWED_COMMANDS = {"make", "ctest", "pytest"}
+FORBIDDEN_QUALITY_CHECK_EXECUTABLES = {"python", "python3", "pypy", "bash", "sh", "zsh"}
+TEST_ID_HEADING_PATTERN = re.compile(r"^###\s+\d+-\d+\.\s+`([^`]+)`\s*$")
+TEST_OUTCOME_VALUES = {"pass", "fail", "xfail", "skipped", "blocked"}
+SHAPE_EXPR_PATTERN = re.compile(r"^\[\s*([^\]]+?)\s*\]$")
+
+
+def _normalize_workspace_root_token(workspace_root: str) -> str:
+    token = workspace_root.strip().replace("\\", "/")
+    token = token.lstrip("./")
+    while "//" in token:
+        token = token.replace("//", "/")
+    return token.rstrip("/")
+
+
+def _normalize_node_key_token(raw: str) -> str:
+    token = raw.strip()
+    if "/" not in token:
+        return token
+    kind, body = token.split("/", 1)
+    spec_id = body.split("@", 1)[0].strip()
+    if not kind.strip() or not spec_id:
+        return token
+    return f"{kind.strip()}/{spec_id}"
 
 
 def _split_fortran_names(raw: str) -> list[str]:
@@ -261,6 +285,119 @@ def _validate_problem_model_dependency_dataflow(
                 f"{model_file}: subroutine {sub_name} does not include required semantic sources "
                 f"in intent(out) dataflow (required={sorted(required_sources)})"
             )
+
+
+def _is_multidim_problem_node(execution: NodeExecution) -> bool:
+    if not execution.node_key.startswith("problem/"):
+        return False
+    spec_id = _spec_id_from_node_key(execution.node_key)
+    if spec_id is None:
+        return False
+    spec_id_l = spec_id.lower()
+    return "2d" in spec_id_l or "3d" in spec_id_l
+
+
+def _validate_problem_state_array_usage(
+    repo_root: Path,
+    execution: NodeExecution,
+    model_file: Path,
+    lowered: str,
+    violations: list[str],
+) -> None:
+    if not _is_multidim_problem_node(execution):
+        return
+
+    contract = _derived_contract_for_execution(repo_root, execution)
+    if not isinstance(contract, dict):
+        return
+    kernel_contract = contract.get("numerical_kernel_contract")
+    if not isinstance(kernel_contract, dict):
+        return
+
+    raw_state_variables = kernel_contract.get("state_variables")
+    if not isinstance(raw_state_variables, list):
+        return
+
+    state_names: list[str] = []
+    for item in raw_state_variables:
+        if not isinstance(item, dict):
+            continue
+        name = item.get("name")
+        if isinstance(name, str) and name.strip():
+            state_names.append(name.strip().lower())
+
+    if not state_names:
+        return
+
+    subroutine_pattern = re.compile(
+        r"subroutine\s+([a-z_][a-z0-9_]*)\s*\((.*?)\)(.*?)end\s+subroutine",
+        re.DOTALL,
+    )
+    intent_out_pattern = re.compile(r"intent\s*\(\s*out\s*\)\s*::\s*([^\n!]+)")
+    candidate_found = False
+    for match in subroutine_pattern.finditer(lowered):
+        sub_name = match.group(1)
+        body = match.group(3)
+        out_vars: set[str] = set()
+        for out_match in intent_out_pattern.finditer(body):
+            out_vars.update(_split_fortran_names(out_match.group(1)))
+        if len(out_vars) < 3:
+            continue
+        candidate_found = True
+
+        missing_array_refs: list[str] = []
+        for name in sorted(set(state_names)):
+            array_ref = re.search(rf"\b{re.escape(name)}\s*\(", body)
+            if array_ref is None:
+                missing_array_refs.append(name)
+        if missing_array_refs:
+            violations.append(
+                f"{model_file}: subroutine {sub_name} must reference state arrays declared in numerical_kernel_contract ({missing_array_refs})"
+            )
+
+    if not candidate_found:
+        return
+
+
+def _validate_problem_metric_only_scalar_kernel(
+    execution: NodeExecution,
+    model_file: Path,
+    lowered: str,
+    violations: list[str],
+) -> None:
+    if not _is_multidim_problem_node(execution):
+        return
+    spec_id = _spec_id_from_node_key(execution.node_key) or execution.node_key
+
+    subroutine_pattern = re.compile(
+        r"subroutine\s+([a-z_][a-z0-9_]*)\s*\((.*?)\)(.*?)end\s+subroutine",
+        re.DOTALL,
+    )
+    intent_out_pattern = re.compile(r"intent\s*\(\s*out\s*\)\s*::\s*([^\n!]+)")
+    intent_in_or_inout_array_pattern = re.compile(
+        r"intent\s*\(\s*(?:in|inout)\s*\)\s*::\s*[^\n]*\([^)]+\)"
+    )
+    do_loop_pattern = re.compile(r"^\s*do\s+[a-z_][a-z0-9_]*\s*=", re.MULTILINE)
+    forall_pattern = re.compile(r"^\s*forall\s*\(", re.MULTILINE)
+
+    for match in subroutine_pattern.finditer(lowered):
+        sub_name = match.group(1)
+        body = match.group(3)
+        out_vars: set[str] = set()
+        for out_match in intent_out_pattern.finditer(body):
+            out_vars.update(_split_fortran_names(out_match.group(1)))
+        if len(out_vars) < 5:
+            continue
+
+        has_array_inputs = bool(intent_in_or_inout_array_pattern.search(body))
+        has_loop = bool(do_loop_pattern.search(body) or forall_pattern.search(body))
+        if has_array_inputs or has_loop:
+            continue
+
+        violations.append(
+            f"{model_file}: subroutine {sub_name} is metric-only scalar kernel for {spec_id}; "
+            "2d/3d problem model must not derive many intent(out) metrics without array inputs or update loops"
+        )
 
 
 def _extract_first_diagnostics_block(lowered: str) -> str | None:
@@ -509,12 +646,51 @@ def _validate_problem_runner_diagnostics_dependency(
         )
 
 
+def _validate_problem_runner_nonphysical_casepath_input(
+    execution: NodeExecution,
+    runner_file: Path,
+    lowered: str,
+    violations: list[str],
+) -> None:
+    if not execution.node_key.startswith("problem/"):
+        return
+
+    if "get_command_argument(1,case_path)" in lowered.replace(" ", ""):
+        call_args = _extract_call_arg_vars(lowered)
+        if not call_args:
+            return
+
+        suspicious_inputs: set[str] = set()
+        assign_pattern = re.compile(
+            r"^\s*([a-z_][a-z0-9_]*)\s*=\s*([^\n!]+)",
+            re.MULTILINE,
+        )
+        for match in assign_pattern.finditer(lowered):
+            lhs = match.group(1).strip()
+            rhs = match.group(2).lower()
+            if "len_trim(case_path)" in rhs or "command_argument_count()" in rhs:
+                suspicious_inputs.add(lhs)
+
+        if suspicious_inputs.intersection(call_args):
+            violations.append(
+                f"{runner_file}: model call input depends on case_path length/argument count and is non-physical"
+            )
+
+
 @dataclass
 class NodeExecution:
     node_key: str
     node_dir: Path
     exec_dir: Path
     pipeline_dir: Path
+
+
+@dataclass
+class NodeLineage:
+    node_key: str
+    pipeline_dir: Path
+    plan_ref: str | None
+    dependency_ref: str | None
 
 
 @dataclass
@@ -536,19 +712,7 @@ def _node_executions(
     workspace_root: Path, pipeline_roots: list[Path] | None = None
 ) -> list[NodeExecution]:
     result: list[NodeExecution] = []
-    if pipeline_roots is None:
-        pipelines_root = workspace_root / "pipelines"
-        if not pipelines_root.exists():
-            return result
-        targets: list[Path] = []
-        for node_safe_dir in sorted(pipelines_root.iterdir()):
-            if not node_safe_dir.is_dir():
-                continue
-            for pipeline_dir in sorted(node_safe_dir.iterdir()):
-                if pipeline_dir.is_dir():
-                    targets.append(pipeline_dir)
-    else:
-        targets = sorted(pipeline_roots)
+    targets = _pipeline_targets(workspace_root, pipeline_roots)
 
     def has_execution_artifacts(node_dir: Path) -> bool:
         markers = (
@@ -587,6 +751,61 @@ def _node_executions(
                         )
                     )
     return result
+
+
+def _pipeline_targets(
+    workspace_root: Path, pipeline_roots: list[Path] | None
+) -> list[Path]:
+    if pipeline_roots is None:
+        pipelines_root = workspace_root / "pipelines"
+        if not pipelines_root.exists():
+            return []
+        targets: list[Path] = []
+        for node_safe_dir in sorted(pipelines_root.iterdir()):
+            if not node_safe_dir.is_dir():
+                continue
+            for pipeline_dir in sorted(node_safe_dir.iterdir()):
+                if pipeline_dir.is_dir():
+                    targets.append(pipeline_dir)
+        return targets
+    deduped: list[Path] = []
+    seen: set[Path] = set()
+    for pipeline_dir in sorted(pipeline_roots):
+        if pipeline_dir in seen:
+            continue
+        seen.add(pipeline_dir)
+        deduped.append(pipeline_dir)
+    return deduped
+
+
+def _lineage_records(
+    workspace_root: Path, pipeline_roots: list[Path] | None
+) -> list[NodeLineage]:
+    records: list[NodeLineage] = []
+    for pipeline_dir in _pipeline_targets(workspace_root, pipeline_roots):
+        lineage_path = pipeline_dir / "lineage.json"
+        if not lineage_path.exists():
+            continue
+        try:
+            lineage = _read_json(lineage_path)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(lineage, dict):
+            continue
+        node_key = lineage.get("node_key")
+        if not isinstance(node_key, str) or not node_key.strip():
+            continue
+        plan_ref = lineage.get("plan_ref")
+        dep_ref = lineage.get("dependency_ref")
+        records.append(
+            NodeLineage(
+                node_key=node_key.strip(),
+                pipeline_dir=pipeline_dir,
+                plan_ref=plan_ref if isinstance(plan_ref, str) else None,
+                dependency_ref=dep_ref if isinstance(dep_ref, str) else None,
+            )
+        )
+    return records
 
 
 def _iter_command_ref_entries(node: Any) -> list[dict[str, Any]]:
@@ -682,6 +901,7 @@ def _validate_raw_evidence(
     (
         expected_state_variables,
         expected_time_variable,
+        expected_time_shape_expr,
         required_snapshot_min_samples,
     ) = _state_snapshot_requirement_details(repo_root, execution)
 
@@ -732,16 +952,40 @@ def _validate_raw_evidence(
                         schema_data = None
 
                     state_variables: list[str] = []
+                    state_variable_shapes: dict[str, str] = {}
                     time_variable = ""
+                    time_shape_expr = "scalar"
                     if isinstance(schema_data, dict):
+                        raw_variables = schema_data.get("variables")
+                        if isinstance(raw_variables, list):
+                            for raw_variable in raw_variables:
+                                if not isinstance(raw_variable, dict):
+                                    continue
+                                raw_name = raw_variable.get("name")
+                                raw_shape_expr = raw_variable.get("shape_expr")
+                                if (
+                                    isinstance(raw_name, str)
+                                    and raw_name.strip()
+                                    and isinstance(raw_shape_expr, str)
+                                    and raw_shape_expr.strip()
+                                ):
+                                    name = raw_name.strip()
+                                    state_variables.append(name)
+                                    state_variable_shapes[name] = _canonical_shape_expr(raw_shape_expr)
+
                         raw_state_vars = schema_data.get("state_variables")
                         raw_time_var = schema_data.get("time_variable")
                         if isinstance(raw_state_vars, list):
                             for item in raw_state_vars:
                                 if isinstance(item, str) and item.strip():
-                                    state_variables.append(item.strip())
+                                    token = item.strip()
+                                    state_variables.append(token)
+                                    state_variable_shapes.setdefault(token, "[*]")
                         if isinstance(raw_time_var, str) and raw_time_var.strip():
                             time_variable = raw_time_var.strip()
+                        raw_time_shape = schema_data.get("time_shape_expr")
+                        if isinstance(raw_time_shape, str) and raw_time_shape.strip():
+                            time_shape_expr = _canonical_shape_expr(raw_time_shape)
                     else:
                         violations.append(
                             f"{schema_path}: must be json object"
@@ -749,7 +993,7 @@ def _validate_raw_evidence(
 
                     if not state_variables:
                         violations.append(
-                            f"{schema_path}: state_variables must be non-empty string list"
+                            f"{schema_path}: variables/state_variables must be non-empty"
                         )
                     if not time_variable:
                         violations.append(
@@ -761,8 +1005,8 @@ def _validate_raw_evidence(
                             f"{snapshots_dir}: snapshot data file missing"
                         )
                     elif state_variables and time_variable:
-                        missing_state = set(state_variables)
-                        found_time = False
+                        missing_state_by_file: dict[str, list[str]] = {}
+                        missing_time = set()
                         for snapshot in snapshot_data_files:
                             if snapshot.suffix.lower() != ".json":
                                 continue
@@ -773,28 +1017,67 @@ def _validate_raw_evidence(
                             if not isinstance(data, dict):
                                 continue
                             keys = set(data.keys())
-                            missing_state -= keys
-                            if time_variable in keys:
-                                found_time = True
-                        if missing_state:
+                            missing_state = sorted(name for name in state_variables if name not in keys)
+                            if missing_state:
+                                missing_state_by_file[snapshot.name] = missing_state
+                            if time_variable not in keys:
+                                missing_time.add(snapshot.name)
+
+                            for name, shape_expr in state_variable_shapes.items():
+                                if name not in data:
+                                    continue
+                                value_shape = _infer_json_shape(data.get(name))
+                                if value_shape is None:
+                                    violations.append(
+                                        f"{snapshot}:{name} has unsupported or ragged shape"
+                                    )
+                                    continue
+                                if not _shape_matches_expr(shape_expr, value_shape):
+                                    violations.append(
+                                        f"{snapshot}:{name} shape {value_shape} does not match declared shape_expr {shape_expr}"
+                                    )
+
+                            if time_variable in data:
+                                time_shape = _infer_json_shape(data.get(time_variable))
+                                if time_shape is None:
+                                    violations.append(
+                                        f"{snapshot}:{time_variable} has unsupported or ragged shape"
+                                    )
+                                elif not _shape_matches_expr(time_shape_expr, time_shape):
+                                    violations.append(
+                                        f"{snapshot}:{time_variable} shape {time_shape} does not match declared time_shape_expr {time_shape_expr}"
+                                    )
+                        if missing_state_by_file:
                             violations.append(
-                                f"{snapshots_dir}: missing declared state variables in snapshots ({sorted(missing_state)})"
+                                f"{snapshots_dir}: declared state_variables missing in snapshot files ({missing_state_by_file})"
                             )
-                        if not found_time:
+                        if missing_time:
                             violations.append(
-                                f"{snapshots_dir}: declared time_variable not found in snapshots ({time_variable})"
+                                f"{snapshots_dir}: declared time_variable missing in snapshots ({time_variable}, files={sorted(missing_time)})"
                             )
 
                     if expected_state_variables:
-                        missing_required = set(expected_state_variables) - set(state_variables)
+                        missing_required = set(expected_state_variables.keys()) - set(state_variables)
                         if missing_required:
                             violations.append(
                                 f"{schema_path}: missing required state_variables from derived_contract ({sorted(missing_required)})"
                             )
+                        for name, expected_shape in expected_state_variables.items():
+                            declared_shape = state_variable_shapes.get(name)
+                            if declared_shape is None:
+                                continue
+                            if _canonical_shape_expr(expected_shape) != _canonical_shape_expr(declared_shape):
+                                violations.append(
+                                    f"{schema_path}: variable {name} shape_expr must match derived_contract ({expected_shape})"
+                                )
 
                     if expected_time_variable and expected_time_variable != time_variable:
                         violations.append(
                             f"{schema_path}: time_variable must match derived_contract ({expected_time_variable})"
+                        )
+                    if expected_time_variable and _canonical_shape_expr(expected_time_shape_expr) != _canonical_shape_expr(time_shape_expr):
+                        violations.append(
+                            f"{schema_path}: time_shape_expr must match derived_contract ({expected_time_shape_expr})"
                         )
 
                 if len(snapshot_data_files) < required_snapshot_min_samples:
@@ -843,9 +1126,14 @@ def _validate_generate_outputs(
         violations.append(f"{generate_root}: missing")
         return
 
-    model_files = sorted(generate_root.glob("*/src/*_model.f90"))
+    model_files, expected_model_name = _node_model_files(generate_root, execution)
     if not model_files:
-        violations.append(f"{generate_root}: model source not found")
+        if expected_model_name is None:
+            violations.append(f"{generate_root}: model source not found")
+        else:
+            violations.append(
+                f"{generate_root}: node model source not found ({expected_model_name})"
+            )
         return
 
     dep_spec_ids = _component_dep_spec_ids(repo_root, execution)
@@ -889,6 +1177,19 @@ def _validate_generate_outputs(
             lowered=lowered,
             dep_spec_ids=dep_spec_ids,
             required_sources=required_sources,
+            violations=violations,
+        )
+        _validate_problem_metric_only_scalar_kernel(
+            execution=execution,
+            model_file=model_file,
+            lowered=lowered,
+            violations=violations,
+        )
+        _validate_problem_state_array_usage(
+            repo_root=repo_root,
+            execution=execution,
+            model_file=model_file,
+            lowered=lowered,
             violations=violations,
         )
 
@@ -961,6 +1262,197 @@ def _derived_contract_path_for_execution(
     return plan_dir / "derived_contract.json"
 
 
+def _tests_path_from_contract(repo_root: Path, contract: dict[str, Any]) -> Path | None:
+    source = contract.get("source")
+    if not isinstance(source, dict):
+        return None
+    tests_ref = source.get("tests")
+    if not isinstance(tests_ref, str) or not tests_ref.strip():
+        return None
+
+    tests_path = Path(tests_ref.strip())
+    if not tests_path.is_absolute():
+        tests_path = repo_root / tests_path
+    return tests_path
+
+
+def _tests_path_for_execution(repo_root: Path, execution: NodeExecution) -> Path | None:
+    contract = _derived_contract_for_execution(repo_root, execution)
+    if not isinstance(contract, dict):
+        return None
+    return _tests_path_from_contract(repo_root, contract)
+
+
+def _parse_test_ids_from_tests_md(tests_path: Path) -> list[str]:
+    test_ids: list[str] = []
+    seen: set[str] = set()
+    for raw_line in tests_path.read_text(encoding="utf-8", errors="ignore").splitlines():
+        line = raw_line.strip()
+        match = TEST_ID_HEADING_PATTERN.match(line)
+        if not match:
+            continue
+        test_id = match.group(1).strip()
+        if not test_id or test_id in seen:
+            continue
+        seen.add(test_id)
+        test_ids.append(test_id)
+    return test_ids
+
+
+def _find_command_log_record(
+    repo_root: Path, command_id: str, log_ref: str
+) -> dict[str, Any] | None:
+    log_path = repo_root / log_ref if log_ref.startswith("workspace/") else Path(log_ref)
+    if not log_path.exists():
+        return None
+
+    for raw_line in log_path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if obj.get("command_id") == command_id:
+            return obj if isinstance(obj, dict) else None
+    return None
+
+
+def _parse_shape_expr(expr: str) -> tuple[bool, list[str], str]:
+    token = expr.strip()
+    if not token:
+        return False, [], "shape_expr must be non-empty"
+    if token.lower() == "scalar":
+        return True, [], ""
+
+    match = SHAPE_EXPR_PATTERN.fullmatch(token)
+    if match is None:
+        return False, [], "shape_expr must be scalar or [dim1,dim2,...]"
+
+    dims: list[str] = []
+    for raw_dim in match.group(1).split(","):
+        dim = raw_dim.strip()
+        if not dim:
+            return False, [], "shape_expr has empty dimension token"
+        dims.append(dim)
+    return True, dims, ""
+
+
+def _canonical_shape_expr(expr: str) -> str:
+    ok, dims, _ = _parse_shape_expr(expr)
+    if not ok:
+        return expr.strip().lower()
+    if not dims:
+        return "scalar"
+    return "[" + ",".join(dim.lower() for dim in dims) + "]"
+
+
+def _infer_json_shape(value: Any) -> list[int] | None:
+    if isinstance(value, (int, float, str, bool)) or value is None:
+        return []
+    if isinstance(value, list):
+        if not value:
+            return [0]
+        first_shape = _infer_json_shape(value[0])
+        if first_shape is None:
+            return None
+        for item in value[1:]:
+            shape = _infer_json_shape(item)
+            if shape is None or shape != first_shape:
+                return None
+        return [len(value), *first_shape]
+    return None
+
+
+def _shape_matches_expr(shape_expr: str, actual_shape: list[int]) -> bool:
+    ok, dims, _ = _parse_shape_expr(shape_expr)
+    if not ok:
+        return False
+    if not dims:
+        return actual_shape == []
+    if len(dims) != len(actual_shape):
+        return False
+    for expected_dim, actual_dim in zip(dims, actual_shape):
+        token = expected_dim.strip().lower()
+        if token == "*":
+            continue
+        if token.isdigit():
+            if int(token) != actual_dim:
+                return False
+            continue
+        if actual_dim < 0:
+            return False
+    return True
+
+
+def _state_snapshot_requirement_details(
+    repo_root: Path, execution: NodeExecution
+) -> tuple[dict[str, str], str, str, int]:
+    required_variables: dict[str, str] = {}
+    required_time_variable = ""
+    required_time_shape_expr = "scalar"
+    min_samples = 1
+
+    raw_requirements = _raw_requirements_for_execution(repo_root, execution)
+    if not isinstance(raw_requirements, dict):
+        return required_variables, required_time_variable, required_time_shape_expr, min_samples
+
+    required_evidence = raw_requirements.get("required_evidence")
+    if not isinstance(required_evidence, list):
+        return required_variables, required_time_variable, required_time_shape_expr, min_samples
+
+    for item in required_evidence:
+        if not isinstance(item, dict):
+            continue
+        raw_artifact = item.get("artifact")
+        if not isinstance(raw_artifact, str):
+            continue
+        artifact = _normalize_raw_evidence_artifact(raw_artifact)
+        if artifact != "state_snapshots":
+            continue
+        if isinstance(item.get("required"), bool) and not item["required"]:
+            return required_variables, required_time_variable, required_time_shape_expr, min_samples
+
+        raw_min_samples = item.get("min_samples")
+        if isinstance(raw_min_samples, int) and raw_min_samples >= 1:
+            min_samples = raw_min_samples
+
+        schema = item.get("schema")
+        if isinstance(schema, dict):
+            raw_variables = schema.get("variables")
+            if isinstance(raw_variables, list):
+                for variable in raw_variables:
+                    if not isinstance(variable, dict):
+                        continue
+                    raw_name = variable.get("name")
+                    raw_shape_expr = variable.get("shape_expr")
+                    if (
+                        isinstance(raw_name, str)
+                        and raw_name.strip()
+                        and isinstance(raw_shape_expr, str)
+                        and raw_shape_expr.strip()
+                    ):
+                        required_variables[raw_name.strip()] = _canonical_shape_expr(raw_shape_expr)
+
+            raw_state_vars = schema.get("state_variables")
+            if isinstance(raw_state_vars, list):
+                for token in raw_state_vars:
+                    if isinstance(token, str) and token.strip():
+                        required_variables.setdefault(token.strip(), "[*]")
+
+            raw_time_var = schema.get("time_variable")
+            if isinstance(raw_time_var, str) and raw_time_var.strip():
+                required_time_variable = raw_time_var.strip()
+            raw_time_shape = schema.get("time_shape_expr")
+            if isinstance(raw_time_shape, str) and raw_time_shape.strip():
+                required_time_shape_expr = _canonical_shape_expr(raw_time_shape)
+
+        return required_variables, required_time_variable, required_time_shape_expr, min_samples
+
+    return required_variables, required_time_variable, required_time_shape_expr, min_samples
+
+
 def _normalize_raw_evidence_artifact(token: str) -> str | None:
     normalized = token.strip().lower().replace("\\", "/")
     return RAW_EVIDENCE_ALIASES.get(normalized)
@@ -1010,56 +1502,6 @@ def _required_raw_evidence(
     elif raw_requirements.get("state_snapshot_required") is False:
         required.discard("state_snapshots")
     return required
-
-
-def _state_snapshot_requirement_details(
-    repo_root: Path, execution: NodeExecution
-) -> tuple[list[str], str, int]:
-    required_state_variables: list[str] = []
-    required_time_variable = ""
-    min_samples = 1
-
-    raw_requirements = _raw_requirements_for_execution(repo_root, execution)
-    if not isinstance(raw_requirements, dict):
-        return required_state_variables, required_time_variable, min_samples
-
-    required_evidence = raw_requirements.get("required_evidence")
-    if not isinstance(required_evidence, list):
-        return required_state_variables, required_time_variable, min_samples
-
-    for item in required_evidence:
-        if not isinstance(item, dict):
-            continue
-        raw_artifact = item.get("artifact")
-        if not isinstance(raw_artifact, str):
-            continue
-        artifact = _normalize_raw_evidence_artifact(raw_artifact)
-        if artifact != "state_snapshots":
-            continue
-        if isinstance(item.get("required"), bool) and not item["required"]:
-            return required_state_variables, required_time_variable, min_samples
-
-        raw_min_samples = item.get("min_samples")
-        if isinstance(raw_min_samples, int) and raw_min_samples >= 1:
-            min_samples = raw_min_samples
-
-        schema = item.get("schema")
-        if isinstance(schema, dict):
-            raw_state_vars = schema.get("state_variables")
-            if isinstance(raw_state_vars, list):
-                required_state_variables = [
-                    token.strip()
-                    for token in raw_state_vars
-                    if isinstance(token, str) and token.strip()
-                ]
-
-            raw_time_var = schema.get("time_variable")
-            if isinstance(raw_time_var, str) and raw_time_var.strip():
-                required_time_variable = raw_time_var.strip()
-
-        return required_state_variables, required_time_variable, min_samples
-
-    return required_state_variables, required_time_variable, min_samples
 
 
 def _state_snapshot_required(repo_root: Path, execution: NodeExecution) -> bool:
@@ -1147,6 +1589,7 @@ def _validate_derived_contract_schema(
         violations.append(f"{contract_path}: must be json object")
         return
 
+    output_items: list[tuple[int, dict[str, Any]]] = []
     io_contract = contract.get("io_contract")
     if not isinstance(io_contract, dict):
         violations.append(f"{contract_path}:io_contract must be object")
@@ -1182,6 +1625,7 @@ def _validate_derived_contract_schema(
                     violations.append(
                         f"{contract_path}:io_contract.outputs[{idx}].shape_expr must be non-empty string when present"
                     )
+                output_items.append((idx, item))
 
     raw_requirements = contract.get("raw_requirements")
     if not isinstance(raw_requirements, dict):
@@ -1194,6 +1638,11 @@ def _validate_derived_contract_schema(
             f"{contract_path}:raw_requirements.required_evidence must be non-empty list"
         )
         return
+
+    snapshot_required = False
+    snapshot_variables: dict[str, str] = {}
+    snapshot_time_variable = ""
+    snapshot_time_shape_expr = "scalar"
 
     for idx, item in enumerate(required_evidence):
         if not isinstance(item, dict):
@@ -1233,6 +1682,9 @@ def _validate_derived_contract_schema(
         if artifact != "state_snapshots":
             continue
 
+        if item.get("required") is not False:
+            snapshot_required = True
+
         schema = item.get("schema")
         if schema is None:
             continue
@@ -1241,6 +1693,44 @@ def _validate_derived_contract_schema(
                 f"{contract_path}:raw_requirements.required_evidence[{idx}].schema must be object"
             )
             continue
+
+        raw_variables = schema.get("variables")
+        if raw_variables is None and item.get("required") is not False:
+            violations.append(
+                f"{contract_path}:raw_requirements.required_evidence[{idx}].schema.variables must be non-empty list when state_snapshots is required"
+            )
+        elif raw_variables is not None:
+            if not isinstance(raw_variables, list) or not raw_variables:
+                violations.append(
+                    f"{contract_path}:raw_requirements.required_evidence[{idx}].schema.variables must be non-empty list when present"
+                )
+            else:
+                for var_idx, variable in enumerate(raw_variables):
+                    if not isinstance(variable, dict):
+                        violations.append(
+                            f"{contract_path}:raw_requirements.required_evidence[{idx}].schema.variables[{var_idx}] must be object"
+                        )
+                        continue
+                    raw_name = variable.get("name")
+                    raw_shape_expr = variable.get("shape_expr")
+                    if not isinstance(raw_name, str) or not raw_name.strip():
+                        violations.append(
+                            f"{contract_path}:raw_requirements.required_evidence[{idx}].schema.variables[{var_idx}].name must be non-empty string"
+                        )
+                        continue
+                    if not isinstance(raw_shape_expr, str) or not raw_shape_expr.strip():
+                        violations.append(
+                            f"{contract_path}:raw_requirements.required_evidence[{idx}].schema.variables[{var_idx}].shape_expr must be non-empty string"
+                        )
+                        continue
+                    ok_shape, _, shape_err = _parse_shape_expr(raw_shape_expr)
+                    if not ok_shape:
+                        violations.append(
+                            f"{contract_path}:raw_requirements.required_evidence[{idx}].schema.variables[{var_idx}].shape_expr invalid ({shape_err})"
+                        )
+                        continue
+                    snapshot_variables[raw_name.strip()] = _canonical_shape_expr(raw_shape_expr)
+
         raw_state_vars = schema.get("state_variables")
         if raw_state_vars is not None:
             if not isinstance(raw_state_vars, list) or not all(
@@ -1249,6 +1739,10 @@ def _validate_derived_contract_schema(
                 violations.append(
                     f"{contract_path}:raw_requirements.required_evidence[{idx}].schema.state_variables must be non-empty string list when present"
                 )
+            else:
+                for token in raw_state_vars:
+                    if isinstance(token, str) and token.strip():
+                        snapshot_variables.setdefault(token.strip(), "[*]")
         raw_time_var = schema.get("time_variable")
         if raw_time_var is not None and (
             not isinstance(raw_time_var, str) or not raw_time_var.strip()
@@ -1256,6 +1750,201 @@ def _validate_derived_contract_schema(
             violations.append(
                 f"{contract_path}:raw_requirements.required_evidence[{idx}].schema.time_variable must be non-empty string when present"
             )
+        elif isinstance(raw_time_var, str) and raw_time_var.strip():
+            snapshot_time_variable = raw_time_var.strip()
+
+        raw_time_shape = schema.get("time_shape_expr")
+        if raw_time_shape is not None and (
+            not isinstance(raw_time_shape, str) or not raw_time_shape.strip()
+        ):
+            violations.append(
+                f"{contract_path}:raw_requirements.required_evidence[{idx}].schema.time_shape_expr must be non-empty string when present"
+            )
+        elif isinstance(raw_time_shape, str) and raw_time_shape.strip():
+            ok_shape, _, shape_err = _parse_shape_expr(raw_time_shape)
+            if not ok_shape:
+                violations.append(
+                    f"{contract_path}:raw_requirements.required_evidence[{idx}].schema.time_shape_expr invalid ({shape_err})"
+                )
+            else:
+                snapshot_time_shape_expr = _canonical_shape_expr(raw_time_shape)
+
+    if snapshot_required and not snapshot_variables:
+        violations.append(
+            f"{contract_path}:state_snapshots schema must declare variables with shape_expr when required"
+        )
+    if snapshot_required and not snapshot_time_variable:
+        violations.append(
+            f"{contract_path}:state_snapshots schema must declare time_variable when required"
+        )
+    snapshot_reference_variables = set(snapshot_variables)
+    if snapshot_time_variable:
+        snapshot_reference_variables.add(snapshot_time_variable)
+
+    for idx, item in output_items:
+        evidence_ref = item.get("evidence_ref")
+        has_snapshot_ref = isinstance(evidence_ref, str) and "state_snapshots" in evidence_ref
+        if has_snapshot_ref or not snapshot_required:
+            continue
+
+        raw_variables = item.get("raw_variables")
+        if not isinstance(raw_variables, list) or not raw_variables:
+            violations.append(
+                f"{contract_path}:io_contract.outputs[{idx}].raw_variables must be non-empty list when evidence_ref is non-snapshot and state_snapshots is required"
+            )
+            continue
+        unknown_variables: list[str] = []
+        for var_idx, token in enumerate(raw_variables):
+            if not isinstance(token, str) or not token.strip():
+                violations.append(
+                    f"{contract_path}:io_contract.outputs[{idx}].raw_variables[{var_idx}] must be non-empty string"
+                )
+                continue
+            name = token.strip()
+            if name not in snapshot_reference_variables:
+                unknown_variables.append(name)
+        if unknown_variables:
+            violations.append(
+                f"{contract_path}:io_contract.outputs[{idx}].raw_variables must reference declared state_snapshots variables/time_variable ({sorted(set(unknown_variables))})"
+            )
+
+    if _is_multidim_problem_node(execution):
+        kernel_contract = contract.get("numerical_kernel_contract")
+        if not isinstance(kernel_contract, dict):
+            violations.append(
+                f"{contract_path}:numerical_kernel_contract must be object for multidimensional problem node"
+            )
+        else:
+            state_variables = kernel_contract.get("state_variables")
+            if not isinstance(state_variables, list) or not state_variables:
+                violations.append(
+                    f"{contract_path}:numerical_kernel_contract.state_variables must be non-empty list"
+                )
+            else:
+                for idx, item in enumerate(state_variables):
+                    if not isinstance(item, dict):
+                        violations.append(
+                            f"{contract_path}:numerical_kernel_contract.state_variables[{idx}] must be object"
+                        )
+                        continue
+                    name = item.get("name")
+                    shape_expr = item.get("shape_expr")
+                    if not isinstance(name, str) or not name.strip():
+                        violations.append(
+                            f"{contract_path}:numerical_kernel_contract.state_variables[{idx}].name must be non-empty string"
+                        )
+                    if not isinstance(shape_expr, str) or not shape_expr.strip():
+                        violations.append(
+                            f"{contract_path}:numerical_kernel_contract.state_variables[{idx}].shape_expr must be non-empty string"
+                        )
+                    elif not _parse_shape_expr(shape_expr)[0]:
+                        violations.append(
+                            f"{contract_path}:numerical_kernel_contract.state_variables[{idx}].shape_expr invalid"
+                        )
+
+            update_paths = kernel_contract.get("required_update_paths")
+            if not isinstance(update_paths, list) or not update_paths or not all(
+                isinstance(item, str) and item.strip() for item in update_paths
+            ):
+                violations.append(
+                    f"{contract_path}:numerical_kernel_contract.required_update_paths must be non-empty string list"
+                )
+
+            diagnostics_from_state = kernel_contract.get("diagnostics_from_state")
+            if diagnostics_from_state is not True:
+                violations.append(
+                    f"{contract_path}:numerical_kernel_contract.diagnostics_from_state must be true"
+                )
+
+            fallback_policy = kernel_contract.get("fallback_policy")
+            if fallback_policy != "fail_closed":
+                violations.append(
+                    f"{contract_path}:numerical_kernel_contract.fallback_policy must be fail_closed"
+                )
+
+    _validate_test_evidence_requirements(
+        repo_root=repo_root,
+        contract_path=contract_path,
+        contract=contract,
+        snapshot_reference_variables=snapshot_reference_variables,
+        snapshot_required=snapshot_required,
+        violations=violations,
+    )
+
+
+def _validate_test_evidence_requirements(
+    repo_root: Path,
+    contract_path: Path,
+    contract: dict[str, Any],
+    snapshot_reference_variables: set[str],
+    snapshot_required: bool,
+    violations: list[str],
+) -> None:
+    tests_path = _tests_path_from_contract(repo_root, contract)
+    if tests_path is None or not tests_path.exists():
+        return
+
+    test_ids = _parse_test_ids_from_tests_md(tests_path)
+    if not test_ids:
+        return
+
+    raw_reqs = contract.get("test_evidence_requirements")
+    if not isinstance(raw_reqs, list) or not raw_reqs:
+        violations.append(f"{contract_path}:test_evidence_requirements must be non-empty list")
+        return
+
+    seen_test_ids: set[str] = set()
+    mapped_test_ids: set[str] = set()
+    for idx, item in enumerate(raw_reqs):
+        if not isinstance(item, dict):
+            violations.append(
+                f"{contract_path}:test_evidence_requirements[{idx}] must be object"
+            )
+            continue
+        raw_test_id = item.get("test_id")
+        if not isinstance(raw_test_id, str) or not raw_test_id.strip():
+            violations.append(
+                f"{contract_path}:test_evidence_requirements[{idx}].test_id must be non-empty string"
+            )
+            continue
+        test_id = raw_test_id.strip()
+        if test_id in seen_test_ids:
+            violations.append(
+                f"{contract_path}:test_evidence_requirements has duplicated test_id ({test_id})"
+            )
+            continue
+        seen_test_ids.add(test_id)
+        mapped_test_ids.add(test_id)
+
+        raw_variables = item.get("required_raw_variables")
+        if not isinstance(raw_variables, list) or not raw_variables:
+            violations.append(
+                f"{contract_path}:test_evidence_requirements[{idx}].required_raw_variables must be non-empty list"
+            )
+            continue
+        for var_idx, token in enumerate(raw_variables):
+            if not isinstance(token, str) or not token.strip():
+                violations.append(
+                    f"{contract_path}:test_evidence_requirements[{idx}].required_raw_variables[{var_idx}] must be non-empty string"
+                )
+                continue
+            name = token.strip()
+            if snapshot_required and name not in snapshot_reference_variables:
+                violations.append(
+                    f"{contract_path}:test_evidence_requirements[{idx}].required_raw_variables[{var_idx}] must reference declared state_snapshots variable/time_variable ({name})"
+                )
+
+    expected = set(test_ids)
+    missing = sorted(expected - mapped_test_ids)
+    extra = sorted(mapped_test_ids - expected)
+    if missing:
+        violations.append(
+            f"{contract_path}:test_evidence_requirements missing tests from tests.md ({missing})"
+        )
+    if extra:
+        violations.append(
+            f"{contract_path}:test_evidence_requirements has unknown test_id ({extra})"
+        )
 
 
 def _component_dep_spec_ids(repo_root: Path, execution: NodeExecution) -> list[str]:
@@ -1289,6 +1978,80 @@ def _component_dep_spec_ids(repo_root: Path, execution: NodeExecution) -> list[s
     return sorted(set(result))
 
 
+def _dep_node_key_tokens(node: Any) -> list[str]:
+    tokens: list[str] = []
+    if isinstance(node, str):
+        token = node.strip()
+        if token:
+            tokens.append(_normalize_node_key_token(token))
+    elif isinstance(node, dict):
+        raw = node.get("node_key")
+        if isinstance(raw, str):
+            token = raw.strip()
+            if token:
+                tokens.append(_normalize_node_key_token(token))
+    return tokens
+
+
+def _dependency_expected_node_keys(dep_data: dict[str, Any]) -> set[str]:
+    expected: set[str] = set()
+
+    all_nodes = dep_data.get("all_nodes")
+    if isinstance(all_nodes, list):
+        for item in all_nodes:
+            expected.update(_dep_node_key_tokens(item))
+
+    node_key = dep_data.get("node_key")
+    if isinstance(node_key, str) and node_key.strip():
+        expected.update(_dep_node_key_tokens(node_key))
+
+    if not expected:
+        for field in ("direct_deps", "transitive_deps"):
+            deps = dep_data.get(field)
+            if not isinstance(deps, list):
+                continue
+            for item in deps:
+                expected.update(_dep_node_key_tokens(item))
+        if isinstance(node_key, str) and node_key.strip():
+            expected.update(_dep_node_key_tokens(node_key))
+
+    return expected
+
+
+def _dependency_run_token(dep_data: dict[str, Any]) -> str | None:
+    resolved_at = dep_data.get("resolved_at")
+    if isinstance(resolved_at, str) and resolved_at.strip():
+        return resolved_at.strip()
+    return None
+
+
+def _spec_id_from_node_key(node_key: str) -> str | None:
+    if "/" not in node_key:
+        return None
+    body = node_key.split("/", 1)[1]
+    spec_id = body.split("@", 1)[0].strip()
+    return spec_id or None
+
+
+def _node_model_files(
+    generate_root: Path, execution: NodeExecution
+) -> tuple[list[Path], str | None]:
+    spec_id = _spec_id_from_node_key(execution.node_key)
+    if spec_id is None:
+        return sorted(generate_root.glob("*/src/*_model.f90")), None
+
+    expected_name = f"{spec_id}_model.f90"
+    targets: list[Path] = []
+    for gen_dir in sorted(d for d in generate_root.iterdir() if d.is_dir()):
+        src_dir = gen_dir / "src"
+        if not src_dir.exists():
+            continue
+        candidate = src_dir / expected_name
+        if candidate.exists():
+            targets.append(candidate)
+    return targets, expected_name
+
+
 def _validate_dependency_operation_usage(
     repo_root: Path, execution: NodeExecution, violations: list[str]
 ) -> None:
@@ -1297,8 +2060,15 @@ def _validate_dependency_operation_usage(
         return
 
     generate_root = execution.pipeline_dir / "generate"
-    model_files = sorted(generate_root.glob("*/src/*_model.f90"))
+    if not generate_root.exists():
+        return
+
+    model_files, expected_model_name = _node_model_files(generate_root, execution)
     if not model_files:
+        if expected_model_name is not None:
+            violations.append(
+                f"{generate_root}: node model source not found ({expected_model_name})"
+            )
         return
 
     for model_file in model_files:
@@ -1345,6 +2115,12 @@ def _validate_runner_outputs(execution: NodeExecution, violations: list[str]) ->
             lowered=text,
             violations=violations,
         )
+        _validate_problem_runner_nonphysical_casepath_input(
+            execution=execution,
+            runner_file=runner_file,
+            lowered=text,
+            violations=violations,
+        )
 
 
 def _validate_run_program_inputs(
@@ -1365,23 +2141,11 @@ def _validate_run_program_inputs(
         if not isinstance(command_id, str) or not isinstance(log_ref, str):
             continue
 
-        log_path = repo_root / log_ref if log_ref.startswith("workspace/") else Path(log_ref)
-        if not log_path.exists():
-            continue
-
-        matched: dict[str, Any] | None = None
-        for line in log_path.read_text(encoding="utf-8").splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                obj = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if obj.get("command_id") == command_id:
-                matched = obj
-                break
-
+        matched = _find_command_log_record(
+            repo_root=repo_root,
+            command_id=command_id,
+            log_ref=log_ref,
+        )
         if matched is None:
             continue
         if matched.get("tool_name") != "run_program":
@@ -1398,6 +2162,202 @@ def _validate_run_program_inputs(
         if not has_case_resolved:
             violations.append(
                 f"{trial_meta_path}:run_program command_id={command_id} must include case.resolved.yaml"
+            )
+
+
+def _validate_quality_check_commands(
+    repo_root: Path, execution: NodeExecution, violations: list[str]
+) -> None:
+    trial_meta_path = execution.node_dir / "trial_meta.json"
+    if not trial_meta_path.exists():
+        return
+
+    data = _read_json(trial_meta_path)
+    source_command_ref = data.get("source_command_ref")
+    if source_command_ref is None:
+        return
+
+    for entry in _iter_command_ref_entries(source_command_ref):
+        command_id = entry.get("command_id")
+        log_ref = entry.get("command_log_ref") or entry.get("command_log_path")
+        if not isinstance(command_id, str) or not isinstance(log_ref, str):
+            continue
+
+        matched = _find_command_log_record(
+            repo_root=repo_root,
+            command_id=command_id,
+            log_ref=log_ref,
+        )
+        if matched is None:
+            continue
+        if matched.get("tool_name") != "run_quality_checks":
+            continue
+
+        command = matched.get("command")
+        if not isinstance(command, list) or not command:
+            violations.append(
+                f"{trial_meta_path}:run_quality_checks command_id={command_id} must have non-empty command array"
+            )
+            continue
+
+        normalized = [str(token).strip() for token in command if str(token).strip()]
+        if not normalized:
+            violations.append(
+                f"{trial_meta_path}:run_quality_checks command_id={command_id} must have non-empty command array"
+            )
+            continue
+
+        executable = Path(normalized[0]).name.lower()
+        if executable in FORBIDDEN_QUALITY_CHECK_EXECUTABLES:
+            violations.append(
+                f"{trial_meta_path}:run_quality_checks command_id={command_id} uses forbidden executable ({executable})"
+            )
+            continue
+
+        if any("quality_check.py" in token.lower() for token in normalized):
+            violations.append(
+                f"{trial_meta_path}:run_quality_checks command_id={command_id} must not execute quality_check.py directly"
+            )
+            continue
+
+        if executable not in QUALITY_CHECK_ALLOWED_COMMANDS:
+            allowed = sorted(QUALITY_CHECK_ALLOWED_COMMANDS)
+            violations.append(
+                f"{trial_meta_path}:run_quality_checks command_id={command_id} executable must be one of {allowed}"
+            )
+            continue
+
+        if executable == "make":
+            targets = {token.lower() for token in normalized[1:]}
+            if "test" not in targets and "check" not in targets:
+                violations.append(
+                    f"{trial_meta_path}:run_quality_checks command_id={command_id} make command must include test/check target"
+                )
+
+
+def _validate_tests_verdict_summary_consistency(
+    repo_root: Path, execution: NodeExecution, violations: list[str]
+) -> None:
+    tests_path = _tests_path_for_execution(repo_root, execution)
+    if tests_path is None or not tests_path.exists():
+        return
+
+    test_ids = _parse_test_ids_from_tests_md(tests_path)
+    if not test_ids:
+        violations.append(f"{tests_path}: test_id heading not found")
+        return
+
+    verdict_path = execution.node_dir / "verdict.json"
+    summary_path = execution.node_dir / "summary.json"
+    if not verdict_path.exists():
+        violations.append(f"{verdict_path}: missing")
+        return
+    if not summary_path.exists():
+        violations.append(f"{summary_path}: missing")
+        return
+
+    try:
+        verdict = _read_json(verdict_path)
+    except json.JSONDecodeError:
+        violations.append(f"{verdict_path}: invalid json")
+        return
+    if not isinstance(verdict, dict):
+        violations.append(f"{verdict_path}: must be json object")
+        return
+
+    per_test = verdict.get("per_test")
+    if not isinstance(per_test, list) or not per_test:
+        violations.append(f"{verdict_path}:per_test must be non-empty list")
+        return
+
+    status_by_test: dict[str, str] = {}
+    duplicate_test_ids: set[str] = set()
+    invalid_entries = False
+    for idx, item in enumerate(per_test):
+        if not isinstance(item, dict):
+            violations.append(f"{verdict_path}:per_test[{idx}] must be object")
+            invalid_entries = True
+            continue
+        raw_test_id = item.get("test_id")
+        if not isinstance(raw_test_id, str) or not raw_test_id.strip():
+            violations.append(f"{verdict_path}:per_test[{idx}].test_id must be non-empty string")
+            invalid_entries = True
+            continue
+        test_id = raw_test_id.strip()
+        raw_status = item.get("status")
+        if raw_status is None:
+            raw_status = item.get("outcome")
+        if not isinstance(raw_status, str):
+            violations.append(
+                f"{verdict_path}:per_test[{idx}] must define status/outcome string"
+            )
+            invalid_entries = True
+            continue
+        status = raw_status.strip().lower()
+        if status not in TEST_OUTCOME_VALUES:
+            violations.append(
+                f"{verdict_path}:per_test[{idx}].status/outcome must be one of {sorted(TEST_OUTCOME_VALUES)}"
+            )
+            invalid_entries = True
+            continue
+
+        if test_id in status_by_test:
+            duplicate_test_ids.add(test_id)
+        status_by_test[test_id] = status
+
+    if duplicate_test_ids:
+        violations.append(
+            f"{verdict_path}:per_test has duplicated test_id entries ({sorted(duplicate_test_ids)})"
+        )
+    if invalid_entries:
+        return
+
+    expected_ids = set(test_ids)
+    actual_ids = set(status_by_test.keys())
+    missing = sorted(expected_ids - actual_ids)
+    extra = sorted(actual_ids - expected_ids)
+    if missing:
+        violations.append(f"{verdict_path}:per_test missing test_id entries from tests.md ({missing})")
+    if extra:
+        violations.append(f"{verdict_path}:per_test has unknown test_id entries ({extra})")
+    if missing or extra:
+        return
+
+    computed_counts = {key: 0 for key in TEST_OUTCOME_VALUES}
+    for status in status_by_test.values():
+        computed_counts[status] += 1
+
+    try:
+        summary = _read_json(summary_path)
+    except json.JSONDecodeError:
+        violations.append(f"{summary_path}: invalid json")
+        return
+    if not isinstance(summary, dict):
+        violations.append(f"{summary_path}: must be json object")
+        return
+
+    counts = summary.get("counts")
+    if not isinstance(counts, dict):
+        violations.append(f"{summary_path}:counts must be object")
+        return
+
+    for key in ("pass", "fail", "xfail", "skipped"):
+        value = counts.get(key)
+        if not isinstance(value, int) or value < 0:
+            violations.append(f"{summary_path}:counts.{key} must be integer >= 0")
+            continue
+        if value != computed_counts[key]:
+            violations.append(
+                f"{summary_path}:counts.{key} must equal verdict.per_test aggregate ({computed_counts[key]})"
+            )
+
+    blocked_value = counts.get("blocked")
+    if blocked_value is not None:
+        if not isinstance(blocked_value, int) or blocked_value < 0:
+            violations.append(f"{summary_path}:counts.blocked must be integer >= 0 when present")
+        elif blocked_value != computed_counts["blocked"]:
+            violations.append(
+                f"{summary_path}:counts.blocked must equal verdict.per_test aggregate ({computed_counts['blocked']})"
             )
 
 
@@ -1513,6 +2473,7 @@ def _resolve_pipeline_roots(
         return None
 
     workspace_path = repo_root / workspace_root
+    pipelines_path = workspace_path / "pipelines"
     roots: list[Path] = []
     for raw in raw_values:
         candidate = Path(raw)
@@ -1525,6 +2486,12 @@ def _resolve_pipeline_roots(
             raise ValueError(
                 f"pipeline_root must be under {workspace_path}: {candidate}"
             ) from None
+        try:
+            candidate.relative_to(pipelines_path.resolve())
+        except ValueError:
+            raise ValueError(
+                f"pipeline_root must be under {pipelines_path}: {candidate}"
+            ) from None
         roots.append(candidate)
     return roots
 
@@ -1536,6 +2503,10 @@ def validate(
     require_llm_review: bool = True,
 ) -> list[str]:
     violations: list[str] = []
+    normalized_workspace_root = _normalize_workspace_root_token(workspace_root)
+    if normalized_workspace_root != "workspace":
+        return [f"workspace_root must be exactly 'workspace' (given: {workspace_root})"]
+
     workspace_path = repo_root / workspace_root
     if not workspace_path.exists():
         return [f"{workspace_path}: workspace root does not exist"]
@@ -1545,6 +2516,9 @@ def validate(
         return [f"{workspace_path}/pipelines: no execution artifacts found"]
 
     source_hash_map: dict[str, list[SourceFingerprint]] = {}
+    dep_contexts: list[tuple[NodeExecution, set[str], str | None]] = []
+    lineage_contexts: list[tuple[NodeLineage, set[str], str | None]] = []
+    lineages = _lineage_records(workspace_path, pipeline_roots)
 
     for execution in executions:
         _validate_derived_contract_schema(repo_root, execution, violations)
@@ -1554,6 +2528,8 @@ def validate(
         _validate_dependency_operation_usage(repo_root, execution, violations)
         _validate_runner_outputs(execution, violations)
         _validate_run_program_inputs(repo_root, execution, violations)
+        _validate_quality_check_commands(repo_root, execution, violations)
+        _validate_tests_verdict_summary_consistency(repo_root, execution, violations)
         _validate_llm_semantic_review(
             repo_root,
             execution,
@@ -1564,6 +2540,110 @@ def validate(
         fp = _source_fingerprint(execution)
         if fp is not None:
             source_hash_map.setdefault(fp.digest, []).append(fp)
+        dep_data = _dependency_resolved_for_execution(repo_root, execution)
+        if isinstance(dep_data, dict):
+            expected_nodes = _dependency_expected_node_keys(dep_data)
+            if expected_nodes:
+                dep_contexts.append(
+                    (
+                        execution,
+                        expected_nodes,
+                        _dependency_run_token(dep_data),
+                    )
+                )
+    for lineage in lineages:
+        if not lineage.dependency_ref or not lineage.dependency_ref.startswith("workspace/"):
+            continue
+        dep_path = repo_root / lineage.dependency_ref
+        if not dep_path.exists():
+            continue
+        try:
+            dep_data = _read_json(dep_path)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(dep_data, dict):
+            continue
+        all_nodes = dep_data.get("all_nodes")
+        if not isinstance(all_nodes, list) or not all_nodes:
+            continue
+        expected_nodes = _dependency_expected_node_keys(dep_data)
+        if expected_nodes:
+            lineage_contexts.append((lineage, expected_nodes, _dependency_run_token(dep_data)))
+
+    scope_nodes = {_normalize_node_key_token(execution.node_key) for execution in executions}
+    scope_nodes_by_token: dict[str, set[str]] = {}
+    for execution, _, token in dep_contexts:
+        if token is None:
+            continue
+        scope_nodes_by_token.setdefault(token, set()).add(_normalize_node_key_token(execution.node_key))
+
+    seen_dag_violations: set[tuple[Path, str, tuple[str, ...]]] = set()
+    for execution, expected_nodes, token in dep_contexts:
+        if token is None:
+            available_nodes = scope_nodes
+            scope_label = "validation scope"
+        else:
+            available_nodes = scope_nodes_by_token.get(token, set())
+            scope_label = f"resolved_at={token}"
+        missing = sorted(expected_nodes - available_nodes)
+        if missing:
+            key = (execution.pipeline_dir, scope_label, tuple(missing))
+            if key in seen_dag_violations:
+                continue
+            seen_dag_violations.add(key)
+            violations.append(
+                f"{execution.pipeline_dir / 'lineage.json'}: dependency DAG incomplete for {scope_label}; missing node workflows {missing}"
+            )
+
+    scope_lineage_nodes = {_normalize_node_key_token(item.node_key) for item in lineages}
+    scope_lineage_nodes_by_token: dict[str, set[str]] = {}
+    scope_plan_nodes = set()
+    scope_plan_nodes_by_token: dict[str, set[str]] = {}
+
+    for lineage, _, token in lineage_contexts:
+        node_token = _normalize_node_key_token(lineage.node_key)
+        if token is not None:
+            scope_lineage_nodes_by_token.setdefault(token, set()).add(node_token)
+        plan_ok = False
+        if isinstance(lineage.plan_ref, str) and lineage.plan_ref.startswith("workspace/"):
+            plan_path = repo_root / lineage.plan_ref
+            plan_ok = plan_path.exists() and plan_path.is_dir()
+        if plan_ok:
+            scope_plan_nodes.add(node_token)
+            if token is not None:
+                scope_plan_nodes_by_token.setdefault(token, set()).add(node_token)
+
+    seen_issue_violations: set[tuple[Path, str, tuple[str, ...], tuple[str, ...]]] = set()
+    for lineage, expected_nodes, token in lineage_contexts:
+        if token is None:
+            available_pipeline_nodes = scope_lineage_nodes
+            available_plan_nodes = scope_plan_nodes
+            scope_label = "validation scope"
+        else:
+            available_pipeline_nodes = scope_lineage_nodes_by_token.get(token, set())
+            available_plan_nodes = scope_plan_nodes_by_token.get(token, set())
+            scope_label = f"resolved_at={token}"
+        missing_pipeline_nodes = sorted(expected_nodes - available_pipeline_nodes)
+        missing_plan_nodes = sorted(expected_nodes - available_plan_nodes)
+        if not missing_pipeline_nodes and not missing_plan_nodes:
+            continue
+        key = (
+            lineage.pipeline_dir,
+            scope_label,
+            tuple(missing_plan_nodes),
+            tuple(missing_pipeline_nodes),
+        )
+        if key in seen_issue_violations:
+            continue
+        seen_issue_violations.add(key)
+        if missing_plan_nodes:
+            violations.append(
+                f"{lineage.pipeline_dir / 'lineage.json'}: node plans not issued for {scope_label}; missing nodes {missing_plan_nodes}"
+            )
+        if missing_pipeline_nodes:
+            violations.append(
+                f"{lineage.pipeline_dir / 'lineage.json'}: node pipelines not issued for {scope_label}; missing nodes {missing_pipeline_nodes}"
+            )
 
     for digest, items in sorted(source_hash_map.items()):
         node_keys = sorted({item.node_key for item in items})
