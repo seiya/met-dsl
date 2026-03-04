@@ -23,6 +23,8 @@ def _create_minimal_execution_tree(
     model_text: str,
     runner_text: str,
     run_command: list[str],
+    extra_sources: dict[str, str] | None = None,
+    makefile_text: str | None = None,
 ) -> None:
     workspace = repo_root / "workspace"
     node_safe = "problem__shallow_water2d__0.3.0"
@@ -111,6 +113,24 @@ def _create_minimal_execution_tree(
     src_dir.mkdir(parents=True, exist_ok=True)
     (src_dir / "shallow_water2d_model.f90").write_text(model_text, encoding="utf-8")
     (src_dir / "shallow_water2d_runner.f90").write_text(runner_text, encoding="utf-8")
+    if extra_sources:
+        for filename, content in extra_sources.items():
+            (src_dir / filename).write_text(content, encoding="utf-8")
+
+    if makefile_text is None:
+        makefile_text = """FC ?= gfortran
+OBJS = shallow_water2d_model.o shallow_water2d_runner.o
+
+simulate: $(OBJS)
+\t$(FC) -o $@ $(OBJS)
+
+shallow_water2d_model.o shallow_water2d_model.mod: shallow_water2d_model.f90
+\t$(FC) -c $<
+
+shallow_water2d_runner.o: shallow_water2d_runner.f90 shallow_water2d_model.mod
+\t$(FC) -c $<
+"""
+    (src_dir / "Makefile").write_text(makefile_text, encoding="utf-8")
 
 
 class ValidatePipelineSemanticsTests(unittest.TestCase):
@@ -266,6 +286,69 @@ end program shallow_water2d_runner
             )
             self.assertTrue(
                 any("diagnostics block does not reference model call arguments" in v for v in violations)
+            )
+
+    def test_detects_makefile_missing_fortran_module_dependency(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            dep_spec_id = "dynamics_shallow_water_flux_2d_rusanov_p0"
+            model_text = """module shallow_water2d_model
+use dynamics_shallow_water_flux_2d_rusanov_p0_model
+implicit none
+contains
+subroutine solve(flag)
+  logical, intent(out) :: flag
+  call dynamics_shallow_water_flux_2d_rusanov_p0__compute_flux(flag)
+end subroutine solve
+end module shallow_water2d_model
+"""
+            runner_text = """program shallow_water2d_runner
+use shallow_water2d_model
+implicit none
+logical :: flag
+call solve(flag)
+write(*,*) flag
+end program shallow_water2d_runner
+"""
+            dep_model_text = """module dynamics_shallow_water_flux_2d_rusanov_p0_model
+implicit none
+contains
+subroutine dynamics_shallow_water_flux_2d_rusanov_p0__compute_flux(flag)
+  logical, intent(out) :: flag
+  flag = .true.
+end subroutine dynamics_shallow_water_flux_2d_rusanov_p0__compute_flux
+end module dynamics_shallow_water_flux_2d_rusanov_p0_model
+"""
+            makefile_text = """FC ?= gfortran
+OBJS = dynamics_shallow_water_flux_2d_rusanov_p0_model.o shallow_water2d_model.o shallow_water2d_runner.o
+
+simulate: $(OBJS)
+\t$(FC) -o $@ $(OBJS)
+
+dynamics_shallow_water_flux_2d_rusanov_p0_model.o dynamics_shallow_water_flux_2d_rusanov_p0_model.mod: dynamics_shallow_water_flux_2d_rusanov_p0_model.f90
+\t$(FC) -c $<
+
+shallow_water2d_model.o shallow_water2d_model.mod: shallow_water2d_model.f90
+\t$(FC) -c $<
+
+shallow_water2d_runner.o: shallow_water2d_runner.f90 shallow_water2d_model.mod
+\t$(FC) -c $<
+"""
+            _create_minimal_execution_tree(
+                repo_root,
+                dep_spec_id=dep_spec_id,
+                model_text=model_text,
+                runner_text=runner_text,
+                run_command=["./simulate", "workspace/case.resolved.yaml", "workspace/outdir"],
+                extra_sources={
+                    "dynamics_shallow_water_flux_2d_rusanov_p0_model.f90": dep_model_text
+                },
+                makefile_text=makefile_text,
+            )
+
+            violations = validate(repo_root=repo_root, workspace_root="workspace")
+            self.assertTrue(
+                any("missing prerequisite for used module" in v for v in violations)
             )
 
 

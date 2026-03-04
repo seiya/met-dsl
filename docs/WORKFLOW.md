@@ -92,6 +92,8 @@
 - `toolchain.language=fortran` のソースファイル名は定義 `module` 名と一致する `<module_name>.f90` を必須とする。
 - `toolchain.language=fortran` では、汎用ファイル名 `model.f90` への集約を禁止する。
 - `toolchain.language=fortran` で依存 `component` を持つ `node` の `model` は依存 `spec_id` ごとに `use <spec_id>_model` と `call <spec_id>__*` を必須とし、`subroutine <spec_id>__*` の再定義を禁止する。
+- `toolchain.build_system=make` かつ `toolchain.language=fortran` の場合、生成 `src/Makefile` は `use` 依存に対応したオブジェクト依存関係を明示し、依存 `module` の `.mod` または依存 `.o` を各ターゲット前提条件へ必須記述する。
+- `toolchain.build_system=make` かつ `toolchain.language=fortran` の場合、`src/Makefile` は並列ビルド（例: `make -j 4`）で依存欠落による失敗を起こしてはならない。
 - 同一 `pipeline` 内で異なる `node_key` に同一 `src` を複製してはならない。共通化は共通ライブラリとして明示する。
 - `target.class=cpu` でループ並列化方式の明示指定がない場合、並列化可能ループへ `OpenMP` を付与する。
 - 物理更新を実装できない場合は `Generate fail` とし、代替として固定文字列や固定 `JSON` を出力してはならない。
@@ -99,6 +101,8 @@
 ## 3. Build / Execute
 - `Build` と `Execute` は `MCP` サーバー経由で実行する。
 - `Build` は `compile_project` を使用し、`fortran` / `c` / `cpp` / `mixed` 系では依存関係を扱える標準ビルドツール（既定 `make`）を使用する。
+- `toolchain.build_system=make` の `Build` 入力は、`src/Makefile` が言語依存のコンパイル順序依存を前提条件として明示した依存関係完全版でなければならない。
+- `toolchain.build_system=make` の `Build` は、`make -j` で成否が変化しない依存記述を必須とする。
 - `Execute` は `run_program` を使用し、実行コマンドへ `case.resolved.yaml` を必ず含める。
 - `compile_project` と `run_program` の実コマンド記録は `JSONL` 形式で保存し、既定の保存先は `project_dir/mcp_command_log.jsonl` とする。
 - `Build` と `Execute` の試行メタデータは `command_id` と `command_log_ref`（または `command_log_path`）を追跡可能に記録する。

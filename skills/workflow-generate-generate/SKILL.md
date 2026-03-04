@@ -28,6 +28,8 @@ Generate ステージの生成責務を固定し、`Build` 可能な実装成果
 - 生成成果物は `node_key` ごとの差分を保持し、共通ライブラリ明示なしに `src` 全体を複製してはならない。
 - `toolchain.language=fortran` の場合、`module` 名とソースファイル名を一致させ、`<module_name>.f90` 形式で出力する。
 - `toolchain.language=fortran` の場合、`module` 名と公開 `subroutine` 名に `spec_id` 由来接頭辞を付与し、名前衝突を回避する。
+- `toolchain.build_system=make` かつ `toolchain.language=fortran` の場合、`src/Makefile` は `use` 依存に対応したオブジェクト依存関係を明示し、依存 `module` の `.mod` または依存 `.o` を各オブジェクトターゲットの前提条件へ必須記述する。
+- `toolchain.build_system=make` かつ `toolchain.language=fortran` の場合、`src/Makefile` は `make -j` で依存欠落による不定失敗を起こしてはならない。
 - `generate_meta.json` に `attempt_count` と `verification_status` と `last_fail_reason` と `debug_mode` を記録する。
 - workflow 成果物の保存先ルートは `workspace/` のみを許可し、workflow ルート判定は `workspace/` のみを対象とする。
 

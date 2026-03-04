@@ -135,6 +135,168 @@ def _strip_quoted_strings(text: str) -> str:
     return re.sub(r"\"(?:\"\"|[^\"])*\"", "\"\"", no_single)
 
 
+def _makefile_logical_lines(text: str) -> list[str]:
+    lines: list[str] = []
+    buffer = ""
+    for raw_line in text.splitlines():
+        if raw_line.startswith("\t"):
+            continue
+
+        line_no_comment = raw_line.split("#", 1)[0].rstrip()
+        if not line_no_comment.strip():
+            continue
+
+        chunk = line_no_comment.strip()
+        if chunk.endswith("\\"):
+            buffer += chunk[:-1].strip() + " "
+            continue
+
+        logical = (buffer + chunk).strip()
+        buffer = ""
+        if logical:
+            lines.append(logical)
+
+    if buffer.strip():
+        lines.append(buffer.strip())
+    return lines
+
+
+def _normalize_make_token(token: str) -> str | None:
+    cleaned = token.strip().rstrip("\\")
+    if not cleaned:
+        return None
+    if "%" in cleaned:
+        return None
+
+    cleaned = re.sub(r"\$\([^)]+\)", "", cleaned)
+    cleaned = re.sub(r"\$\{[^}]+\}", "", cleaned)
+    cleaned = cleaned.strip()
+    if not cleaned:
+        return None
+    if cleaned.startswith("$"):
+        return None
+
+    name = Path(cleaned).name.lower()
+    if not name or "$" in name:
+        return None
+    return name
+
+
+def _parse_makefile_rules(makefile_text: str) -> dict[str, set[str]]:
+    rules: dict[str, set[str]] = {}
+    assignment_pattern = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*\s*[:+?]?=")
+
+    for line in _makefile_logical_lines(makefile_text):
+        if assignment_pattern.match(line):
+            continue
+        if ":" not in line:
+            continue
+
+        target_raw, prereq_raw = line.split(":", 1)
+        target_tokens = target_raw.split()
+        if not target_tokens:
+            continue
+
+        prereq_expr = prereq_raw.split(";", 1)[0].replace("|", " ")
+        prereq_tokens = prereq_expr.split()
+        prereqs = {
+            norm
+            for token in prereq_tokens
+            if (norm := _normalize_make_token(token)) is not None
+        }
+
+        for target_token in target_tokens:
+            target = _normalize_make_token(target_token)
+            if target is None:
+                continue
+            rules.setdefault(target, set()).update(prereqs)
+    return rules
+
+
+def _local_fortran_module_map(src_files: list[Path]) -> dict[str, str]:
+    module_map: dict[str, str] = {}
+    pattern = re.compile(r"^\s*module\s+(?!procedure\b)([a-z_][a-z0-9_]*)\b", re.MULTILINE)
+    for src_file in src_files:
+        text = src_file.read_text(encoding="utf-8", errors="ignore").lower()
+        stem = src_file.stem.lower()
+        for match in pattern.finditer(text):
+            module_name = match.group(1)
+            module_map.setdefault(module_name, stem)
+    return module_map
+
+
+def _fortran_source_module_deps(src_files: list[Path]) -> dict[str, set[str]]:
+    module_map = _local_fortran_module_map(src_files)
+    use_pattern = re.compile(
+        r"^\s*use(?:\s*,\s*(?:intrinsic|non_intrinsic)\s*::|\s*::|\s+)?\s*([a-z_][a-z0-9_]*)\b",
+        re.MULTILINE,
+    )
+    deps_by_stem: dict[str, set[str]] = {}
+    for src_file in src_files:
+        text = src_file.read_text(encoding="utf-8", errors="ignore").lower()
+        stem = src_file.stem.lower()
+        deps: set[str] = set()
+        for match in use_pattern.finditer(text):
+            used_module = match.group(1)
+            provider_stem = module_map.get(used_module)
+            if provider_stem is None or provider_stem == stem:
+                continue
+            deps.add(provider_stem)
+        deps_by_stem[stem] = deps
+    return deps_by_stem
+
+
+def _validate_fortran_makefile_dependencies(generate_root: Path, violations: list[str]) -> None:
+    if not generate_root.exists():
+        return
+
+    gen_dirs = sorted(d for d in generate_root.iterdir() if d.is_dir())
+    for gen_dir in gen_dirs:
+        src_dir = gen_dir / "src"
+        if not src_dir.exists():
+            continue
+
+        src_files = sorted(
+            p for p in src_dir.iterdir() if p.is_file() and p.suffix.lower() == ".f90"
+        )
+        if len(src_files) < 2:
+            continue
+
+        deps_by_stem = _fortran_source_module_deps(src_files)
+        required_object_deps = {
+            stem: deps for stem, deps in deps_by_stem.items() if deps
+        }
+        if not required_object_deps:
+            continue
+
+        makefile_path = src_dir / "Makefile"
+        if not makefile_path.exists():
+            violations.append(
+                f"{makefile_path}: missing for fortran module dependency build"
+            )
+            continue
+
+        rules = _parse_makefile_rules(
+            makefile_path.read_text(encoding="utf-8", errors="ignore")
+        )
+        for stem, deps in sorted(required_object_deps.items()):
+            object_target = f"{stem}.o"
+            prereqs = rules.get(object_target)
+            if prereqs is None:
+                violations.append(
+                    f"{makefile_path}: missing explicit object dependency rule ({object_target})"
+                )
+                continue
+
+            for dep_stem in sorted(deps):
+                dep_mod = f"{dep_stem}.mod"
+                dep_obj = f"{dep_stem}.o"
+                if dep_mod not in prereqs and dep_obj not in prereqs:
+                    violations.append(
+                        f"{makefile_path}: {object_target} missing prerequisite for used module ({dep_mod} or {dep_obj})"
+                    )
+
+
 def _validate_problem_runner_diagnostics_dependency(
     execution: NodeExecution,
     runner_file: Path,
@@ -505,6 +667,11 @@ def _validate_generate_outputs(execution: NodeExecution, violations: list[str]) 
             lowered=lowered,
             violations=violations,
         )
+
+    _validate_fortran_makefile_dependencies(
+        generate_root=generate_root,
+        violations=violations,
+    )
 
 
 def _dependency_resolved_for_execution(repo_root: Path, execution: NodeExecution) -> dict[str, Any] | None:

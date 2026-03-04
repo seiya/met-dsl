@@ -28,6 +28,8 @@ Generate ステージ出力の検証責務を固定し、`Build` 失敗を事前
 - 異なる `node_key` の `generate/src` との完全一致を検査し、共通ライブラリ明示がない複製を `copy_based_artifact_reuse` として `fail` にする。
 - `toolchain.language=fortran` の場合、`module` 名とソースファイル名が `<module_name>.f90` で一致することを検査する。
 - `toolchain.language=fortran` の場合、`module` 名と公開 `subroutine` 名に `spec_id` 由来接頭辞が付与されていることを検査する。
+- `toolchain.build_system=make` かつ `toolchain.language=fortran` の場合、`src/Makefile` の各オブジェクトターゲットが `use` 依存に対応した `.mod` または依存 `.o` の前提条件を明示していることを検査する。
+- `toolchain.build_system=make` かつ `toolchain.language=fortran` の場合、`src/Makefile` が `make -j` 互換の依存関係記述を欠落していないことを検査する。
 - `generate_meta.json` の必須項目を検査する。
 - `debug_mode=false` の場合に `attempts/` が存在しないことを検査する。
 - 検査対象成果物の保存先ルートが `workspace/` であることを検査し、workflow ルート判定は `workspace/` のみを対象とする。
