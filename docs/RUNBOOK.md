@@ -14,7 +14,7 @@
 - 生成: `dependency.resolved.yaml`（依存 `DAG` と `topo_level` の固定）
 - 生成: `derived_contract.json`（`controlled_spec.md` と `tests.md` と `deps.yaml` から導出した検証契約）
 - 生成: `model`（物理計算モジュール）と `runner`（実行・判定連携）
-- 出力: `diagnostics.json`,`perf.json`,`verdict.json`,`aggregate_verdict.json`,`summary.json`
+- 出力: `diagnostics.json`,`perf.json`,`verdict.json`,`aggregate_verdict.json`,`summary.json`,`semantic_review.json`
 - 禁止: `dummy` 出力、`dummy` データ、`dummy` 計算、workflow 進行目的の人工成果物生成
 
 ## 1-1. 成果物配置（運用必須）
@@ -30,6 +30,12 @@
 - workflow 共通の不変規範（不正防止、過去成果物参照禁止、検証契約導出、`workspace/` ルート制約、`quality check` 判定軸）は `WORKFLOW.md` を正本とする。
 - 全体方針と `spec` 管理要件（`spec_kind` / 台帳 / 正式版配置 / 命名規則）は `SPEC.md` を正本とする。
 - `spec_kind` を問わない workflow 実行は、各ステージを `LLM` により実行し、リポジトリ管理外パス（例: `/tmp`）の補助スクリプトを実行経路へ含めてはならない。
+- 各ステージ開始前に `write_scope_baseline` を取得し、各ステージ完了前に `workspace/` 配下以外の差分を検出する `write_scope` 検査を必須実行する。
+- `python` 実行を workflow 経路で使用する場合、`__pycache__` を `workspace/` 配下へ限定する。`PYTHONDONTWRITEBYTECODE=1` または `PYTHONPYCACHEPREFIX=workspace/.pycache/<pipeline_id>/` を必須適用する。
+- `write_scope` 検査で `workspace/` 配下以外の差分を検出した場合、当該ステージを `fail` とし、`write_scope_violation.json` を `workspace/` 配下へ記録する。
+- `Generate verify` のデータ依存判定は `derived_contract.json` の `semantic_dependency.required_sources` を正本とし、特定計算様式の一律必須化を禁止する。
+- `Generate verify` の出力契約判定は `derived_contract.json` の `io_contract.outputs` を正本とし、`evidence_ref` と `shape_expr` の整合を必須検査する。
+- `Judge` は固定スクリプト検査に加えて `LLM` 意味検査を必須実行し、`semantic_review.json` の `decision=pass` を開始条件に含める。
 - `Judge` 開始前に、対象 `node_key` の同一 `execution_id` 配下へ `run_program` 実行記録と `diagnostics.json` と `perf.json` と `raw` 実行証跡が揃っていることを検証する。未達時は `Judge fail` とする。
 - `Judge` 開始前と `Judge` 完了前に `python3 tools/validate_pipeline_semantics.py` を実行し、`fail` 時は当該 `pipeline` を `invalid` とする。
 - `trial_meta.json` は `generated_by_stage` と `source_execution_id` と `source_command_ref` と `source_artifact_hash` を必須記録とし、欠落または不整合時は `fail` とする。
@@ -45,10 +51,10 @@
 7. **`node` 単位 workflow 発行**: 各 `node_key` ごとに個別 `plan_id` と個別 `pipeline_id` を発行する。同一 `topo_level` の独立 `node` は並列実行してよい。
 8. **生成**: 対象 `node` ごとに `LLM` またはテンプレ補完で `model` と `runner` を分離して生成する。`LLM` を利用する場合は `SPEC.md` の「`LLM` の扱い」を適用する。生成直後に `runner` の外部インタプリタ起動禁止と、`model` の `no-op` / 固定値返却専用実装禁止を検査し、違反時は `Generate fail` とする。依存を持つ `node` は、`dependency.resolved.yaml` の `direct_deps` で解決された依存 `node` の公開 `operation` を呼び出す実装を必須とし、同等機能の再実装を禁止する。`toolchain.language=fortran` で依存 `component` を持つ `node` は、依存 `spec_id` ごとに `model` 内の `use <spec_id>_model` と `call <spec_id>__*` を必須とし、`subroutine <spec_id>__*` の再定義を禁止する。`Generate verify` は `derived_contract.json` に基づき、依存 `operation` と出力指標のデータ依存、および解析式直接代入による `diagnostics` 生成を検査する。`toolchain.language=fortran` の場合は `module` 名とソースファイル名を一致させ、`<module_name>.f90` 形式で出力する。`toolchain.build_system=make` かつ `toolchain.language=fortran` の場合は `src/Makefile` に `use` 依存に対応した `.mod` または依存 `.o` の前提条件を各オブジェクトターゲットへ明示し、依存欠落を禁止する。
 9. **Build**: 対象 `node` ごとに `MCP` サーバーの `compile_project` で依存関係を扱える標準ビルドツールを実行する（`fortran` / `c` 系の既定値は `make`）。依存を持つ `node` は、依存 `operation` の解決先が `dependency.resolved.yaml` と一致することを検証し、不一致時は `Build fail` とする。`toolchain.build_system=make` の場合は `make -j` で成否が変化しない依存記述を必須とする。
-10. **実行**: 対象 `node` ごとに `MCP` サーバーの `run_program` で `runner`（例: `simulate`）を実行し、`run_program` 実行コマンドに `case.resolved.yaml` を必ず含める。`runner` 経由で `model` を呼び出して `diagnostics` / `perf` を出力し、`verdict.json` と `aggregate_verdict.json` と `summary.json` と `trial_meta.json` の直接出力を禁止する。対象 `node` ごとに `execution_id/<node_key>/raw/` へ判定再計算用の一次証跡を保存する。`raw` へ `diagnostics` の複写を保存してはならない。
+10. **実行**: 対象 `node` ごとに `MCP` サーバーの `run_program` で `runner`（例: `simulate`）を実行し、`run_program` 実行コマンドに `case.resolved.yaml` を必ず含める。`runner` 経由で `model` を呼び出して `diagnostics` / `perf` を出力し、`verdict.json` と `aggregate_verdict.json` と `summary.json` と `trial_meta.json` の直接出力を禁止する。対象 `node` ごとに `execution_id/<node_key>/raw/` へ判定再計算用の一次証跡を保存する。`raw` 構成の必須条件は `derived_contract.json` の `raw_requirements.required_evidence` を正本とする。`artifact=state_snapshots` を必須宣言しない `spec` では状態スナップショットを必須化してはならない。`raw` へ `diagnostics` の複写を保存してはならない。
 11. **実行証跡検証**: `python3 tools/validate_pipeline_semantics.py` を実行し、`raw` の一次証跡、`quality check`、`trial_meta` の追跡情報、`Generate` 由来の固定値生成パターンを検証する。`fail` の場合は `Judge` を開始しない。
 12. **品質比較**: `target.class=cpu` の場合、対象 `node` ごとに `quality check` として `threads_per_rank=1` と `threads_per_rank>1` の実行結果を比較する。比較対象は `diagnostics.json` と `verdict.json` とし、合否確定規則は `WORKFLOW.md` を適用する。
-13. **判定**: `tests.md` の規則に基づく判定を対象 `node` ごとに実施し、`verdict` を生成する。依存込み判定は `aggregate_verdict.json` へ出力する。直下依存 `node` が `fail` または `blocked` の場合、上位 `node` は `blocked` として終了する。この場合も `aggregate_verdict.json` と `summary.json` と `trial_meta.json` を必須出力し、`blocked_reason` と `blocking_direct_deps` を記録する。`verdict.json` は `self_verdict=not_evaluated` を明示する。`Judge` は `raw` 一次証跡のみを入力として判定指標を再計算し、`diagnostics` と一致しない場合は `Judge fail` とする。
+13. **判定**: `tests.md` の規則に基づく判定を対象 `node` ごとに実施し、`verdict` を生成する。依存込み判定は `aggregate_verdict.json` へ出力する。直下依存 `node` が `fail` または `blocked` の場合、上位 `node` は `blocked` として終了する。この場合も `aggregate_verdict.json` と `summary.json` と `trial_meta.json` を必須出力し、`blocked_reason` と `blocking_direct_deps` を記録する。`verdict.json` は `self_verdict=not_evaluated` を明示する。`Judge` は `raw` 一次証跡のみを入力として判定指標を再計算し、`diagnostics` と一致しない場合は `Judge fail` とする。固定スクリプト検査に加えて `LLM` 意味検査を実施し、`semantic_review.json` の `decision=pass` を必須条件にする。
 14. **強制停止**: 入力不足または前段成果物不足で当該工程を進められない場合、当該工程を `fail` で停止する。推定補完や人工ファイル生成で進めてはならない。
 15. **記録**: `spec_version` / `test_profile_version` / `case_hash` / `impl_hash` / `git_sha` を保存する。
 - `plan_id` / `pipeline_id` / `generation_id` / `build_id` / `execution_id` を保存する。
@@ -80,6 +86,12 @@
 - `Spec` に未定義項目がない。
 - `case.resolved` が決定的に生成できる。
 - `derived_contract.json` が `controlled_spec.md` と `tests.md` と `deps.yaml` から導出されている。
+- `derived_contract.json` が `io_contract.inputs` と `io_contract.outputs` を保持し、`outputs` の `evidence_ref` が `raw` 実体に解決できる。
+- 各ステージで `write_scope_baseline` を取得し、完了前に差分比較を実施している。
+- `write_scope` 検査で `workspace/` 配下以外の差分が検出されていない。
+- `python` 実行時の `__pycache__` 出力先が `workspace/` 配下に限定されている。
+- `derived_contract.json` の `semantic_dependency.required_sources` に基づく `Generate verify` 判定が実施されている。
+- `raw` の必須構成が `derived_contract.json` の `raw_requirements.required_evidence` と一致している。
 - `LLM` 利用ステージのメタデータで `verification_status` が `pass` である。
 - `debug_mode=false` の試行で失敗試行成果物が保存されていない。
 - `diagnostics` / `perf` / `verdict` が揃って出る。
@@ -111,5 +123,7 @@
 - workflow ルート判定が `workspace/` のみに対して実施されている。
 - `python3 tools/validate_workspace_root.py` が `PASS` を返している。
 - `python3 tools/validate_pipeline_semantics.py` が `PASS` を返している。
+- `semantic_review.json` が存在し、`decision=pass` である。
 - 異なる `node_key` の `generate/src` が不正に完全一致していない。
 - `copy_based_artifact_reuse` が未検出である。
+- `write_scope_violation.json` が未生成である。

@@ -16,7 +16,7 @@ Generate ステージ出力の検証責務を固定し、`Build` 失敗を事前
 - `runner` が `model` 呼び出しに集約され、物理更新ロジックを重複実装していないことを検査する。
 - `toolchain.language` が `fortran` / `c` / `cpp` / `mixed` 系の場合、`runner` から `python` / `bash` / `sh` / `node` などの外部インタプリタ起動がないことを検査する。
 - `model` が対象 `node` の演算契約を実装していることを検査する。固定値返却専用、固定 `JSON` 出力専用、`no-op` 専用実装を `fail` とする。
-- `model` が `derived_contract.json` で要求された依存 `operation` と出力指標のデータ依存を満たすことを検査する。時空間ループなど特定制御構造を一律必須にしてはならない。
+- `model` が `derived_contract.json` で要求された依存 `operation` と出力指標のデータ依存（`semantic_dependency.required_sources` と `io_contract.outputs`）を満たすことを検査する。時空間ループなど特定制御構造を一律必須にしてはならない。
 - 出力指標が `model` 実行結果に依存しない定数出力、固定 `JSON` 出力、解析式直接代入を検出した場合は `fail` とする。
 - 生成コードが対象 `node_key` の入出力契約に一致することを検査する。
 - 依存を持つ `node` は、`dependency.resolved.yaml` の `direct_deps` で解決された依存 `node` の公開 `operation` 呼び出しを実装していることを検査する。欠落時は `fail` とする。

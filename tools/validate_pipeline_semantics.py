@@ -24,12 +24,67 @@ FORBIDDEN_RUNNER_OUTPUTS = (
     "summary.json",
     "trial_meta.json",
 )
+LLM_REVIEW_FILENAME = "semantic_review.json"
 FORTRAN_IDENTIFIER_PATTERN = re.compile(r"[a-z_][a-z0-9_]*")
+RAW_EVIDENCE_ARTIFACTS = {
+    "metrics_basis.json",
+    "execution_trace.json",
+    "state_snapshots",
+}
+RAW_EVIDENCE_ALIASES = {
+    "metrics_basis.json": "metrics_basis.json",
+    "raw/metrics_basis.json": "metrics_basis.json",
+    "execution_trace.json": "execution_trace.json",
+    "raw/execution_trace.json": "execution_trace.json",
+    "state_snapshots": "state_snapshots",
+    "raw/state_snapshots": "state_snapshots",
+    "raw/state_snapshots/": "state_snapshots",
+}
+FORTRAN_KEYWORDS = {
+    "if",
+    "then",
+    "else",
+    "endif",
+    "do",
+    "enddo",
+    "call",
+    "subroutine",
+    "module",
+    "contains",
+    "intent",
+    "in",
+    "out",
+    "inout",
+    "real",
+    "integer",
+    "logical",
+    "character",
+    "type",
+    "public",
+    "private",
+    "use",
+    "only",
+    "true",
+    "false",
+}
 
 
 def _split_fortran_names(raw: str) -> list[str]:
+    parts: list[str] = []
+    depth = 0
+    start = 0
+    for idx, ch in enumerate(raw):
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth = max(depth - 1, 0)
+        elif ch == "," and depth == 0:
+            parts.append(raw[start:idx])
+            start = idx + 1
+    parts.append(raw[start:])
+
     names: list[str] = []
-    for token in raw.split(","):
+    for token in parts:
         part = token.strip().lower()
         if not part:
             continue
@@ -106,6 +161,108 @@ def _validate_problem_model_literal_outputs(
             )
 
 
+def _extract_identifiers(expr: str) -> set[str]:
+    return {
+        token
+        for token in FORTRAN_IDENTIFIER_PATTERN.findall(expr.lower())
+        if token not in FORTRAN_KEYWORDS
+    }
+
+
+def _assignment_records(body: str) -> list[tuple[str, set[str], int]]:
+    records: list[tuple[str, set[str], int]] = []
+    assign_pattern = re.compile(
+        r"^\s*([a-z_][a-z0-9_]*(?:\s*\([^\n=]*\))?)\s*=\s*([^\n!]+)",
+        re.MULTILINE,
+    )
+    for match in assign_pattern.finditer(body):
+        lhs_expr = match.group(1)
+        lhs_match = FORTRAN_IDENTIFIER_PATTERN.search(lhs_expr.lower())
+        if lhs_match is None:
+            continue
+        lhs = lhs_match.group(0)
+        rhs_ids = _extract_identifiers(match.group(2))
+        records.append((lhs, rhs_ids, match.start()))
+    return records
+
+
+def _validate_problem_model_dependency_dataflow(
+    execution: NodeExecution,
+    model_file: Path,
+    lowered: str,
+    dep_spec_ids: list[str],
+    required_sources: set[str],
+    violations: list[str],
+) -> None:
+    if not execution.node_key.startswith("problem/"):
+        return
+    if not dep_spec_ids:
+        return
+
+    dep_prefixes = tuple(f"{spec_id.lower()}__" for spec_id in dep_spec_ids)
+    if not dep_prefixes:
+        return
+
+    subroutine_pattern = re.compile(
+        r"subroutine\s+([a-z_][a-z0-9_]*)\s*\((.*?)\)(.*?)end\s+subroutine",
+        re.DOTALL,
+    )
+    intent_out_pattern = re.compile(r"intent\s*\(\s*out\s*\)\s*::\s*([^\n!]+)")
+
+    for sub_match in subroutine_pattern.finditer(lowered):
+        sub_name = sub_match.group(1)
+        arg_names = set(_split_fortran_names(sub_match.group(2)))
+        body = sub_match.group(3)
+        assignments = _assignment_records(body)
+
+        out_vars: set[str] = set()
+        for out_match in intent_out_pattern.finditer(body):
+            out_vars.update(_split_fortran_names(out_match.group(1)))
+        if not out_vars:
+            continue
+
+        dep_output_candidates: set[str] = set()
+        for callee, args_raw, call_pos in _iter_fortran_calls(body):
+            if not any(callee.startswith(prefix) for prefix in dep_prefixes):
+                continue
+            call_vars = _split_fortran_names(args_raw)
+            for var in call_vars:
+                if var in arg_names:
+                    continue
+                assigned_before_call = any(
+                    lhs == var and pos < call_pos for lhs, _, pos in assignments
+                )
+                if not assigned_before_call:
+                    dep_output_candidates.add(var)
+
+        if not dep_output_candidates:
+            continue
+
+        dependency_sources = set(out_vars)
+        changed = True
+        while changed:
+            changed = False
+            for lhs, rhs_ids, _ in assignments:
+                if lhs not in dependency_sources:
+                    continue
+                for src in rhs_ids:
+                    if src not in dependency_sources:
+                        dependency_sources.add(src)
+                        changed = True
+
+        if dep_output_candidates.isdisjoint(dependency_sources):
+            violations.append(
+                f"{model_file}: subroutine {sub_name} does not propagate dependency operation outputs "
+                f"to intent(out) dataflow (candidates={sorted(dep_output_candidates)})"
+            )
+
+        if required_sources and required_sources.isdisjoint(dependency_sources):
+            violations.append(
+                f"{model_file}: subroutine {sub_name} does not include required semantic sources "
+                f"in intent(out) dataflow (required={sorted(required_sources)})"
+            )
+
+
 def _extract_first_diagnostics_block(lowered: str) -> str | None:
     start = -1
     for marker in ("/diagnostics.json", "'diagnostics.json'", "\"diagnostics.json\""):
@@ -121,9 +278,32 @@ def _extract_first_diagnostics_block(lowered: str) -> str | None:
     return lowered[start:close_idx]
 
 
+def _iter_fortran_calls(text: str) -> list[tuple[str, str, int]]:
+    calls: list[tuple[str, str, int]] = []
+    call_start_pattern = re.compile(r"\bcall\s+([a-z_][a-z0-9_]*)\s*\(")
+    for match in call_start_pattern.finditer(text):
+        name = match.group(1).lower()
+        start = match.start()
+        open_pos = match.end() - 1
+        depth = 1
+        idx = open_pos + 1
+        while idx < len(text) and depth > 0:
+            ch = text[idx]
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+            idx += 1
+        if depth == 0:
+            args = text[open_pos + 1 : idx - 1]
+        else:
+            args = text[open_pos + 1 :]
+        calls.append((name, args, start))
+    return calls
+
+
 def _extract_call_arg_vars(lowered: str) -> list[str]:
-    for match in re.finditer(r"\bcall\s+[a-z_][a-z0-9_]*\s*\((.*?)\)", lowered):
-        args_raw = match.group(1)
+    for _, args_raw, _ in _iter_fortran_calls(lowered):
         names = _split_fortran_names(args_raw)
         if names:
             return names
@@ -494,15 +674,28 @@ def _validate_trial_meta(repo_root: Path, execution: NodeExecution, violations: 
             )
 
 
-def _validate_raw_evidence(execution: NodeExecution, violations: list[str]) -> None:
+def _validate_raw_evidence(
+    repo_root: Path, execution: NodeExecution, violations: list[str]
+) -> None:
+    state_snapshot_required = _state_snapshot_required(repo_root, execution)
+    required_raw_evidence = _required_raw_evidence(repo_root, execution)
+    (
+        expected_state_variables,
+        expected_time_variable,
+        required_snapshot_min_samples,
+    ) = _state_snapshot_requirement_details(repo_root, execution)
+
     required = [
         execution.node_dir / "diagnostics.json",
         execution.node_dir / "perf.json",
-        execution.node_dir / "raw" / "metrics_basis.json",
-        execution.node_dir / "raw" / "execution_trace.json",
-        execution.node_dir / "raw" / "state_snapshots",
         execution.node_dir / "quality_check.json",
     ]
+    if "metrics_basis.json" in required_raw_evidence:
+        required.append(execution.node_dir / "raw" / "metrics_basis.json")
+    if "execution_trace.json" in required_raw_evidence:
+        required.append(execution.node_dir / "raw" / "execution_trace.json")
+    if state_snapshot_required or "state_snapshots" in required_raw_evidence:
+        required.append(execution.node_dir / "raw" / "state_snapshots")
     for path in required:
         if not path.exists():
             violations.append(f"{path}: missing")
@@ -524,10 +717,10 @@ def _validate_raw_evidence(execution: NodeExecution, violations: list[str]) -> N
                             f"{snapshot}: placeholder content detected ({patt})"
                         )
 
-            if execution.node_key.startswith("problem/"):
+            if state_snapshot_required:
                 if not schema_path.exists():
                     violations.append(
-                        f"{schema_path}: missing for problem node"
+                        f"{schema_path}: missing for required state_snapshots evidence"
                     )
                 else:
                     try:
@@ -592,6 +785,23 @@ def _validate_raw_evidence(execution: NodeExecution, violations: list[str]) -> N
                                 f"{snapshots_dir}: declared time_variable not found in snapshots ({time_variable})"
                             )
 
+                    if expected_state_variables:
+                        missing_required = set(expected_state_variables) - set(state_variables)
+                        if missing_required:
+                            violations.append(
+                                f"{schema_path}: missing required state_variables from derived_contract ({sorted(missing_required)})"
+                            )
+
+                    if expected_time_variable and expected_time_variable != time_variable:
+                        violations.append(
+                            f"{schema_path}: time_variable must match derived_contract ({expected_time_variable})"
+                        )
+
+                if len(snapshot_data_files) < required_snapshot_min_samples:
+                    violations.append(
+                        f"{snapshots_dir}: snapshot data files must be >= {required_snapshot_min_samples}"
+                    )
+
     diagnostics_path = execution.node_dir / "diagnostics.json"
     metrics_basis_path = execution.node_dir / "raw" / "metrics_basis.json"
     if diagnostics_path.exists() and metrics_basis_path.exists():
@@ -625,7 +835,9 @@ def _validate_raw_evidence(execution: NodeExecution, violations: list[str]) -> N
             violations.append(f"{quality_path}:status must be pass")
 
 
-def _validate_generate_outputs(execution: NodeExecution, violations: list[str]) -> None:
+def _validate_generate_outputs(
+    repo_root: Path, execution: NodeExecution, violations: list[str]
+) -> None:
     generate_root = execution.pipeline_dir / "generate"
     if not generate_root.exists():
         violations.append(f"{generate_root}: missing")
@@ -635,6 +847,9 @@ def _validate_generate_outputs(execution: NodeExecution, violations: list[str]) 
     if not model_files:
         violations.append(f"{generate_root}: model source not found")
         return
+
+    dep_spec_ids = _component_dep_spec_ids(repo_root, execution)
+    required_sources = _semantic_required_sources(repo_root, execution)
 
     for model_file in model_files:
         text = model_file.read_text(encoding="utf-8", errors="ignore")
@@ -668,6 +883,15 @@ def _validate_generate_outputs(execution: NodeExecution, violations: list[str]) 
             violations=violations,
         )
 
+        _validate_problem_model_dependency_dataflow(
+            execution=execution,
+            model_file=model_file,
+            lowered=lowered,
+            dep_spec_ids=dep_spec_ids,
+            required_sources=required_sources,
+            violations=violations,
+        )
+
     _validate_fortran_makefile_dependencies(
         generate_root=generate_root,
         violations=violations,
@@ -692,6 +916,346 @@ def _dependency_resolved_for_execution(repo_root: Path, execution: NodeExecution
     except json.JSONDecodeError:
         return None
     return dep_data if isinstance(dep_data, dict) else None
+
+
+def _plan_dir_for_execution(repo_root: Path, execution: NodeExecution) -> Path | None:
+    lineage_path = execution.pipeline_dir / "lineage.json"
+    if not lineage_path.exists():
+        return None
+
+    lineage = _read_json(lineage_path)
+    plan_ref = lineage.get("plan_ref")
+    if not isinstance(plan_ref, str) or not plan_ref.startswith("workspace/"):
+        return None
+
+    plan_dir = repo_root / plan_ref
+    if not plan_dir.exists() or not plan_dir.is_dir():
+        return None
+    return plan_dir
+
+
+def _derived_contract_for_execution(
+    repo_root: Path, execution: NodeExecution
+) -> dict[str, Any] | None:
+    plan_dir = _plan_dir_for_execution(repo_root, execution)
+    if plan_dir is None:
+        return None
+
+    contract_path = plan_dir / "derived_contract.json"
+    if not contract_path.exists():
+        return None
+
+    try:
+        data = _read_json(contract_path)
+    except json.JSONDecodeError:
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _derived_contract_path_for_execution(
+    repo_root: Path, execution: NodeExecution
+) -> Path | None:
+    plan_dir = _plan_dir_for_execution(repo_root, execution)
+    if plan_dir is None:
+        return None
+    return plan_dir / "derived_contract.json"
+
+
+def _normalize_raw_evidence_artifact(token: str) -> str | None:
+    normalized = token.strip().lower().replace("\\", "/")
+    return RAW_EVIDENCE_ALIASES.get(normalized)
+
+
+def _raw_requirements_for_execution(
+    repo_root: Path, execution: NodeExecution
+) -> dict[str, Any] | None:
+    contract = _derived_contract_for_execution(repo_root, execution)
+    if not isinstance(contract, dict):
+        return None
+
+    raw_requirements = contract.get("raw_requirements")
+    if not isinstance(raw_requirements, dict):
+        return None
+    return raw_requirements
+
+
+def _required_raw_evidence(
+    repo_root: Path, execution: NodeExecution
+) -> set[str]:
+    required: set[str] = {"metrics_basis.json", "execution_trace.json"}
+    raw_requirements = _raw_requirements_for_execution(repo_root, execution)
+    if not isinstance(raw_requirements, dict):
+        return required
+
+    required_evidence = raw_requirements.get("required_evidence")
+    if isinstance(required_evidence, list):
+        for item in required_evidence:
+            if not isinstance(item, dict):
+                continue
+            raw_artifact = item.get("artifact")
+            if not isinstance(raw_artifact, str):
+                continue
+            artifact = _normalize_raw_evidence_artifact(raw_artifact)
+            if artifact is None:
+                continue
+            item_required = item.get("required")
+            if item_required is False:
+                required.discard(artifact)
+            else:
+                required.add(artifact)
+        return required
+
+    if raw_requirements.get("state_snapshot_required") is True:
+        required.add("state_snapshots")
+    elif raw_requirements.get("state_snapshot_required") is False:
+        required.discard("state_snapshots")
+    return required
+
+
+def _state_snapshot_requirement_details(
+    repo_root: Path, execution: NodeExecution
+) -> tuple[list[str], str, int]:
+    required_state_variables: list[str] = []
+    required_time_variable = ""
+    min_samples = 1
+
+    raw_requirements = _raw_requirements_for_execution(repo_root, execution)
+    if not isinstance(raw_requirements, dict):
+        return required_state_variables, required_time_variable, min_samples
+
+    required_evidence = raw_requirements.get("required_evidence")
+    if not isinstance(required_evidence, list):
+        return required_state_variables, required_time_variable, min_samples
+
+    for item in required_evidence:
+        if not isinstance(item, dict):
+            continue
+        raw_artifact = item.get("artifact")
+        if not isinstance(raw_artifact, str):
+            continue
+        artifact = _normalize_raw_evidence_artifact(raw_artifact)
+        if artifact != "state_snapshots":
+            continue
+        if isinstance(item.get("required"), bool) and not item["required"]:
+            return required_state_variables, required_time_variable, min_samples
+
+        raw_min_samples = item.get("min_samples")
+        if isinstance(raw_min_samples, int) and raw_min_samples >= 1:
+            min_samples = raw_min_samples
+
+        schema = item.get("schema")
+        if isinstance(schema, dict):
+            raw_state_vars = schema.get("state_variables")
+            if isinstance(raw_state_vars, list):
+                required_state_variables = [
+                    token.strip()
+                    for token in raw_state_vars
+                    if isinstance(token, str) and token.strip()
+                ]
+
+            raw_time_var = schema.get("time_variable")
+            if isinstance(raw_time_var, str) and raw_time_var.strip():
+                required_time_variable = raw_time_var.strip()
+
+        return required_state_variables, required_time_variable, min_samples
+
+    return required_state_variables, required_time_variable, min_samples
+
+
+def _state_snapshot_required(repo_root: Path, execution: NodeExecution) -> bool:
+    default_required = False
+    raw_requirements = _raw_requirements_for_execution(repo_root, execution)
+    if not isinstance(raw_requirements, dict):
+        return default_required
+
+    required_evidence = raw_requirements.get("required_evidence")
+    if isinstance(required_evidence, list):
+        for item in required_evidence:
+            if not isinstance(item, dict):
+                continue
+            raw_artifact = item.get("artifact")
+            if not isinstance(raw_artifact, str):
+                continue
+            artifact = _normalize_raw_evidence_artifact(raw_artifact)
+            if artifact != "state_snapshots":
+                continue
+            item_required = item.get("required")
+            if isinstance(item_required, bool):
+                return item_required
+            return True
+
+    value = raw_requirements.get("state_snapshot_required")
+    if isinstance(value, bool):
+        return value
+    return default_required
+
+
+def _semantic_required_sources(repo_root: Path, execution: NodeExecution) -> set[str]:
+    contract = _derived_contract_for_execution(repo_root, execution)
+    if not isinstance(contract, dict):
+        return set()
+
+    required: set[str] = set()
+
+    semantic_dep = contract.get("semantic_dependency")
+    if isinstance(semantic_dep, dict):
+        raw_sources = semantic_dep.get("required_sources")
+        if isinstance(raw_sources, list):
+            for item in raw_sources:
+                if not isinstance(item, str):
+                    continue
+                token = item.strip().lower()
+                if FORTRAN_IDENTIFIER_PATTERN.fullmatch(token):
+                    required.add(token)
+
+    io_contract = contract.get("io_contract")
+    if isinstance(io_contract, dict):
+        outputs = io_contract.get("outputs")
+        if isinstance(outputs, list):
+            for item in outputs:
+                if not isinstance(item, dict):
+                    continue
+                name = item.get("name")
+                if not isinstance(name, str):
+                    continue
+                token = name.strip().lower()
+                if FORTRAN_IDENTIFIER_PATTERN.fullmatch(token):
+                    required.add(token)
+    return required
+
+
+def _validate_derived_contract_schema(
+    repo_root: Path, execution: NodeExecution, violations: list[str]
+) -> None:
+    contract_path = _derived_contract_path_for_execution(repo_root, execution)
+    if contract_path is None:
+        violations.append(
+            f"{execution.pipeline_dir / 'lineage.json'}: plan_ref missing; cannot resolve derived_contract.json"
+        )
+        return
+    if not contract_path.exists():
+        violations.append(f"{contract_path}: missing")
+        return
+
+    try:
+        contract = _read_json(contract_path)
+    except json.JSONDecodeError:
+        violations.append(f"{contract_path}: invalid json")
+        return
+
+    if not isinstance(contract, dict):
+        violations.append(f"{contract_path}: must be json object")
+        return
+
+    io_contract = contract.get("io_contract")
+    if not isinstance(io_contract, dict):
+        violations.append(f"{contract_path}:io_contract must be object")
+    else:
+        inputs = io_contract.get("inputs")
+        if not isinstance(inputs, list):
+            violations.append(f"{contract_path}:io_contract.inputs must be list")
+
+        outputs = io_contract.get("outputs")
+        if not isinstance(outputs, list) or not outputs:
+            violations.append(f"{contract_path}:io_contract.outputs must be non-empty list")
+        elif isinstance(outputs, list):
+            for idx, item in enumerate(outputs):
+                if not isinstance(item, dict):
+                    violations.append(
+                        f"{contract_path}:io_contract.outputs[{idx}] must be object"
+                    )
+                    continue
+                name = item.get("name")
+                if not isinstance(name, str) or not name.strip():
+                    violations.append(
+                        f"{contract_path}:io_contract.outputs[{idx}].name must be non-empty string"
+                    )
+                evidence_ref = item.get("evidence_ref")
+                if not isinstance(evidence_ref, str) or not evidence_ref.strip():
+                    violations.append(
+                        f"{contract_path}:io_contract.outputs[{idx}].evidence_ref must be non-empty string"
+                    )
+                shape_expr = item.get("shape_expr")
+                if shape_expr is not None and (
+                    not isinstance(shape_expr, str) or not shape_expr.strip()
+                ):
+                    violations.append(
+                        f"{contract_path}:io_contract.outputs[{idx}].shape_expr must be non-empty string when present"
+                    )
+
+    raw_requirements = contract.get("raw_requirements")
+    if not isinstance(raw_requirements, dict):
+        violations.append(f"{contract_path}:raw_requirements must be object")
+        return
+
+    required_evidence = raw_requirements.get("required_evidence")
+    if not isinstance(required_evidence, list) or not required_evidence:
+        violations.append(
+            f"{contract_path}:raw_requirements.required_evidence must be non-empty list"
+        )
+        return
+
+    for idx, item in enumerate(required_evidence):
+        if not isinstance(item, dict):
+            violations.append(
+                f"{contract_path}:raw_requirements.required_evidence[{idx}] must be object"
+            )
+            continue
+        raw_artifact = item.get("artifact")
+        if not isinstance(raw_artifact, str) or not raw_artifact.strip():
+            violations.append(
+                f"{contract_path}:raw_requirements.required_evidence[{idx}].artifact must be non-empty string"
+            )
+            continue
+
+        artifact = _normalize_raw_evidence_artifact(raw_artifact)
+        if artifact is None:
+            violations.append(
+                f"{contract_path}:raw_requirements.required_evidence[{idx}].artifact "
+                f"must be one of {sorted(RAW_EVIDENCE_ARTIFACTS)}"
+            )
+            continue
+
+        required_value = item.get("required")
+        if required_value is not None and not isinstance(required_value, bool):
+            violations.append(
+                f"{contract_path}:raw_requirements.required_evidence[{idx}].required must be bool when present"
+            )
+
+        min_samples = item.get("min_samples")
+        if min_samples is not None and (
+            not isinstance(min_samples, int) or min_samples < 1
+        ):
+            violations.append(
+                f"{contract_path}:raw_requirements.required_evidence[{idx}].min_samples must be integer >= 1 when present"
+            )
+
+        if artifact != "state_snapshots":
+            continue
+
+        schema = item.get("schema")
+        if schema is None:
+            continue
+        if not isinstance(schema, dict):
+            violations.append(
+                f"{contract_path}:raw_requirements.required_evidence[{idx}].schema must be object"
+            )
+            continue
+        raw_state_vars = schema.get("state_variables")
+        if raw_state_vars is not None:
+            if not isinstance(raw_state_vars, list) or not all(
+                isinstance(token, str) and token.strip() for token in raw_state_vars
+            ):
+                violations.append(
+                    f"{contract_path}:raw_requirements.required_evidence[{idx}].schema.state_variables must be non-empty string list when present"
+                )
+        raw_time_var = schema.get("time_variable")
+        if raw_time_var is not None and (
+            not isinstance(raw_time_var, str) or not raw_time_var.strip()
+        ):
+            violations.append(
+                f"{contract_path}:raw_requirements.required_evidence[{idx}].schema.time_variable must be non-empty string when present"
+            )
 
 
 def _component_dep_spec_ids(repo_root: Path, execution: NodeExecution) -> list[str]:
@@ -837,6 +1401,76 @@ def _validate_run_program_inputs(
             )
 
 
+def _validate_llm_semantic_review(
+    repo_root: Path,
+    execution: NodeExecution,
+    violations: list[str],
+    *,
+    require_llm_review: bool,
+) -> None:
+    review_path = execution.node_dir / LLM_REVIEW_FILENAME
+    if not review_path.exists():
+        if require_llm_review:
+            violations.append(f"{review_path}: missing")
+        return
+
+    try:
+        data = _read_json(review_path)
+    except json.JSONDecodeError:
+        violations.append(f"{review_path}: invalid json")
+        return
+
+    if not isinstance(data, dict):
+        violations.append(f"{review_path}: must be json object")
+        return
+
+    review_method = data.get("review_method")
+    if review_method != "llm_semantic_review":
+        violations.append(
+            f"{review_path}:review_method must be llm_semantic_review"
+        )
+
+    decision = data.get("decision")
+    if decision not in {"pass", "fail"}:
+        violations.append(f"{review_path}:decision must be pass/fail")
+    elif decision != "pass":
+        violations.append(f"{review_path}:decision is fail")
+
+    scope = data.get("scope")
+    if not isinstance(scope, dict):
+        violations.append(f"{review_path}:scope must be object")
+        return
+
+    for key in ("model_ref", "runner_ref"):
+        ref = scope.get(key)
+        if not isinstance(ref, str) or not ref.startswith("workspace/"):
+            violations.append(
+                f"{review_path}:scope.{key} must start with workspace/"
+            )
+            continue
+        target = repo_root / ref
+        if not target.exists():
+            violations.append(
+                f"{review_path}:scope.{key} target not found ({ref})"
+            )
+
+    raw_refs = scope.get("raw_refs")
+    if not isinstance(raw_refs, list) or not raw_refs:
+        violations.append(f"{review_path}:scope.raw_refs must be non-empty list")
+    else:
+        for idx, ref in enumerate(raw_refs):
+            if not isinstance(ref, str) or not ref.startswith("workspace/"):
+                violations.append(
+                    f"{review_path}:scope.raw_refs[{idx}] must start with workspace/"
+                )
+                continue
+            target = repo_root / ref
+            if not target.exists():
+                violations.append(
+                    f"{review_path}:scope.raw_refs[{idx}] target not found ({ref})"
+                )
+
+
 def _source_fingerprint(execution: NodeExecution) -> SourceFingerprint | None:
     generate_root = execution.pipeline_dir / "generate"
     gen_dirs = sorted(d for d in generate_root.iterdir() if d.is_dir()) if generate_root.exists() else []
@@ -896,7 +1530,10 @@ def _resolve_pipeline_roots(
 
 
 def validate(
-    repo_root: Path, workspace_root: str, pipeline_roots: list[Path] | None = None
+    repo_root: Path,
+    workspace_root: str,
+    pipeline_roots: list[Path] | None = None,
+    require_llm_review: bool = True,
 ) -> list[str]:
     violations: list[str] = []
     workspace_path = repo_root / workspace_root
@@ -910,12 +1547,19 @@ def validate(
     source_hash_map: dict[str, list[SourceFingerprint]] = {}
 
     for execution in executions:
+        _validate_derived_contract_schema(repo_root, execution, violations)
         _validate_trial_meta(repo_root, execution, violations)
-        _validate_raw_evidence(execution, violations)
-        _validate_generate_outputs(execution, violations)
+        _validate_raw_evidence(repo_root, execution, violations)
+        _validate_generate_outputs(repo_root, execution, violations)
         _validate_dependency_operation_usage(repo_root, execution, violations)
         _validate_runner_outputs(execution, violations)
         _validate_run_program_inputs(repo_root, execution, violations)
+        _validate_llm_semantic_review(
+            repo_root,
+            execution,
+            violations,
+            require_llm_review=require_llm_review,
+        )
 
         fp = _source_fingerprint(execution)
         if fp is not None:
@@ -952,6 +1596,11 @@ def main() -> int:
             "Can be repeated. Path must be under workspace/."
         ),
     )
+    parser.add_argument(
+        "--allow-missing-llm-review",
+        action="store_true",
+        help="Allow missing semantic_review.json for legacy pipelines.",
+    )
     args = parser.parse_args()
 
     repo_root = Path(args.repo_root).resolve()
@@ -969,6 +1618,7 @@ def main() -> int:
         repo_root=repo_root,
         workspace_root=args.workspace_root,
         pipeline_roots=pipeline_roots,
+        require_llm_review=not args.allow_missing_llm_review,
     )
 
     if violations:

@@ -46,6 +46,9 @@
 ## アーキテクチャ方針
 - 物理アルゴリズム（A）は物理結果に影響する選択とし、`case.resolved.yaml` で決定する。
 - 実行アルゴリズム（B）は性能・計算過程に影響する選択とし、`impl.resolved.yaml` で表現する。
+- `case.resolved.yaml` は実行時入力契約の決定値のみを保持し、出力契約を保持しない。
+- 判定対象出力の `name` と `shape_expr` と `evidence_ref` は `derived_contract.json` の `io_contract.outputs` で管理する。
+- `raw` 一次証跡の必須有無は `derived_contract.json` の `raw_requirements.required_evidence` で管理し、固定の計算様式や固定の証跡構成を一律必須にしてはならない。
 - A と B の分離により、物理再現性と性能探索を両立する。
 
 ## 大規模 spec 運用設計

@@ -17,11 +17,14 @@ Plan ステージの生成責務を固定し、入力 spec から決定的な re
 - 入力は `spec/<...>/controlled_spec.md` と `spec/<...>/tests.md` と `spec/<...>/deps.yaml` と `spec/registry/spec_catalog.yaml` を正本にする。
 - 追加必須項目を `Controlled Spec` へ要求してはならない。検証契約は既存入力から導出する。
 - `case.resolved.yaml` の `sweep` と `refinement` は決定的な順序で展開する。
+- `case.resolved.yaml` は実行時入力の決定値のみを保持し、検証出力契約を保持してはならない。
 - ユーザーが言語を明示しない場合は `target.class=cpu` で `fortran`、`target.class=gpu` で `cuda_fortran` を採用する。
 - `toolchain.language` が `fortran` / `c` / `cpp` / `mixed` 系の場合、`toolchain.build_system` は `make` / `cmake` / `meson` / `ninja` から選択し、未指定時は `make` を採用する。
 - `target.class=cpu` でループ並列化方式の指定がない場合、並列化可能ループへ `OpenMP` を既定適用として記録する。
 - `dependency.resolved.yaml` は `node_key` と `direct_deps` と `transitive_deps` と `topo_level` を必須記録する。
 - `derived_contract.json` を必須出力とし、`controlled_spec.md` と `tests.md` と `deps.yaml` から導出した検証契約を保持する。
+- `derived_contract.json` は `io_contract.inputs` と `io_contract.outputs` を必須保持し、`outputs` は `name` と `evidence_ref` と `shape_expr` を必須保持する。
+- `derived_contract.json` は `raw_requirements.required_evidence` を必須保持し、`artifact` と `required` と `min_samples` と `schema`（必要時）を定義する。
 - 未登録依存、未実装依存、互換性違反依存は解決エラーにし、該当 `node` を `blocked` にする。
 
 ## 運用ルール

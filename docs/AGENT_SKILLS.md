@@ -16,6 +16,9 @@
 - 全体方針と `spec` 管理要件（`spec_kind` / 台帳 / 正式版配置 / 命名規則）は `SPEC.md` を正本とする。
 - `Build` / `Execute` / `quality check` は `MCP` サーバー経由で実行し、`AGENTS.md` の `MCP 実行ルール` と対応 `SKILL.md` の契約を同時適用する。
 - 各工程は、対応 `SKILL.md` に定義された必須出力（例: `<stage>_meta.json`、`verdict.json`）を欠落させてはならない。
+- `Promote` 以外の全工程は `workspace/` 配下以外への書き込みを禁止し、各工程開始前後で `write_scope` 検査を実施しなければならない。
+- `Generate verify` は `derived_contract.json` の `semantic_dependency.required_sources` と `io_contract.outputs` を正本として `intent(out)` のデータ依存を判定し、特定計算様式の一律必須化を禁止しなければならない。
+- `Judge` は固定スクリプト検査に加えて `LLM` 意味検査を実施し、`semantic_review.json` を必須成果物として扱わなければならない。
 
 ## 責務判定フロー
 1. 追加・変更する規則が workflow 成果物の正当性を直接左右するかを判定する。
@@ -49,8 +52,15 @@
 9. 直下依存に起因して `blocked` で終了する `node` は、`self_verdict=not_evaluated` を明示し、停止理由を `trial_meta.json` に記録する。
 10. 工程入力不足で開始条件を満たせない場合、当該工程を `fail` で停止する。推測補完で進めない。
 11. `spec_kind` を問わない workflow 実行で、リポジトリ管理外パス（例: `/tmp`）の補助スクリプトを workflow 実行経路に使用してはならない。
+12. 各工程開始前に `write_scope_baseline` を取得し、工程完了前に `workspace/` 配下以外の差分を検出する `write_scope` 検査を必須実行する。
+13. `python` 実行を workflow 経路で使用する場合、`__pycache__` を `workspace/` 配下に限定する。`PYTHONDONTWRITEBYTECODE=1` または `PYTHONPYCACHEPREFIX=workspace/.pycache/<pipeline_id>/` を必須適用する。
+14. `write_scope` 検査で違反を検出した場合、当該工程を `fail` とし、`write_scope_violation.json` を `workspace/` 配下へ記録して下流工程を停止する。
+15. `Execute` と `Judge` は `derived_contract.json` の `raw_requirements.required_evidence` に基づいて一次証跡の必須構成を判定しなければならない。
+16. `Judge` は `semantic_review.json` の `decision=pass` を満たさない場合、`fail` として終了しなければならない。
 
 ## 判定基準
 - 対象工程で使用した `SKILL` パスを説明できる。
 - 生成成果物と判定成果物が、対応 `SKILL` の契約と一致する。
 - エージェント間で同一入力に対する工程選択が一致する。
+- `write_scope` 検査結果が `pass` であり、`workspace/` 配下以外の差分が検出されない。
+- `semantic_review.json` が存在し、`decision=pass` と一次証跡参照が記録されている。

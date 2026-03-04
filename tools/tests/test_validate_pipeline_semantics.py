@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 import tempfile
 import unittest
 from pathlib import Path
@@ -25,6 +26,7 @@ def _create_minimal_execution_tree(
     run_command: list[str],
     extra_sources: dict[str, str] | None = None,
     makefile_text: str | None = None,
+    derived_contract: dict[str, object] | None = None,
 ) -> None:
     workspace = repo_root / "workspace"
     node_safe = "problem__shallow_water2d__0.3.0"
@@ -42,6 +44,7 @@ def _create_minimal_execution_tree(
         pipeline_dir / "lineage.json",
         {
             "node_key": "problem/shallow_water2d@0.3.0",
+            "plan_ref": "workspace/plans/problem__shallow_water2d__0.3.0/plan_test",
             "dependency_ref": "workspace/plans/problem__shallow_water2d__0.3.0/plan_test/dependency.resolved.yaml",
         },
     )
@@ -53,6 +56,44 @@ def _create_minimal_execution_tree(
             "transitive_deps": [f"component/{dep_spec_id}@0.1.0"],
             "topo_level": 1,
         },
+    )
+    if derived_contract is None:
+        derived_contract = {
+            "io_contract": {
+                "inputs": [
+                    {
+                        "name": "case_resolved",
+                        "source": "case.resolved.yaml",
+                    }
+                ],
+                "outputs": [
+                    {
+                        "name": "metric",
+                        "shape_expr": "scalar",
+                        "evidence_ref": "raw/metrics_basis.json",
+                    }
+                ],
+            },
+            "semantic_dependency": {"required_sources": []},
+            "raw_requirements": {
+                "required_evidence": [
+                    {"artifact": "metrics_basis.json", "required": True},
+                    {"artifact": "execution_trace.json", "required": True},
+                    {
+                        "artifact": "state_snapshots",
+                        "required": True,
+                        "min_samples": 1,
+                        "schema": {
+                            "state_variables": ["h", "hu", "hv"],
+                            "time_variable": "time",
+                        },
+                    },
+                ]
+            },
+        }
+    _write_json(
+        workspace / "plans" / "problem__shallow_water2d__0.3.0" / "plan_test" / "derived_contract.json",
+        derived_contract,
     )
 
     _write_json(node_dir / "diagnostics.json", {"metric": 1.0})
@@ -131,6 +172,23 @@ shallow_water2d_runner.o: shallow_water2d_runner.f90 shallow_water2d_model.mod
 \t$(FC) -c $<
 """
     (src_dir / "Makefile").write_text(makefile_text, encoding="utf-8")
+
+    _write_json(
+        node_dir / "semantic_review.json",
+        {
+            "review_method": "llm_semantic_review",
+            "decision": "pass",
+            "scope": {
+                "model_ref": f"workspace/{(src_dir / 'shallow_water2d_model.f90').relative_to(workspace).as_posix()}",
+                "runner_ref": f"workspace/{(src_dir / 'shallow_water2d_runner.f90').relative_to(workspace).as_posix()}",
+                "raw_refs": [
+                    f"workspace/{(raw_dir / 'metrics_basis.json').relative_to(workspace).as_posix()}",
+                    f"workspace/{(raw_dir / 'execution_trace.json').relative_to(workspace).as_posix()}",
+                ],
+            },
+            "findings": [],
+        },
+    )
 
 
 class ValidatePipelineSemanticsTests(unittest.TestCase):
@@ -349,6 +407,203 @@ shallow_water2d_runner.o: shallow_water2d_runner.f90 shallow_water2d_model.mod
             violations = validate(repo_root=repo_root, workspace_root="workspace")
             self.assertTrue(
                 any("missing prerequisite for used module" in v for v in violations)
+            )
+
+    def test_detects_missing_llm_semantic_review(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            model_text = """module shallow_water2d_model
+use dynamics_shallow_water_flux_2d_rusanov_p0_model
+implicit none
+contains
+subroutine solve(flag)
+  logical, intent(out) :: flag
+  call dynamics_shallow_water_flux_2d_rusanov_p0__compute_flux(flag)
+end subroutine solve
+end module shallow_water2d_model
+"""
+            runner_text = """program shallow_water2d_runner
+implicit none
+write(*,*) 'ok'
+end program shallow_water2d_runner
+"""
+            _create_minimal_execution_tree(
+                repo_root,
+                dep_spec_id="dynamics_shallow_water_flux_2d_rusanov_p0",
+                model_text=model_text,
+                runner_text=runner_text,
+                run_command=["./simulate", "workspace/case.resolved.yaml", "workspace/outdir"],
+            )
+
+            review_path = (
+                repo_root
+                / "workspace"
+                / "pipelines"
+                / "problem__shallow_water2d__0.3.0"
+                / "problem__shallow_water2d__0.3.0_test_pipeline"
+                / "execute"
+                / "exe_test_001"
+                / "problem"
+                / "shallow_water2d"
+                / "semantic_review.json"
+            )
+            review_path.unlink()
+
+            violations = validate(repo_root=repo_root, workspace_root="workspace")
+            self.assertTrue(any("semantic_review.json: missing" in v for v in violations))
+
+    def test_detects_dependency_call_outputs_not_used_in_out_dataflow(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            model_text = """module shallow_water2d_model
+use dynamics_shallow_water_flux_2d_rusanov_p0_model
+implicit none
+contains
+subroutine solve(scale, metrics)
+  real(8), intent(in) :: scale
+  real(8), intent(out) :: metrics(2)
+  real(8) :: dep_checks(3,3)
+  integer :: dep_istat
+  call dynamics_shallow_water_flux_2d_rusanov_p0__compute_flux(scale, dep_checks(:,1), dep_istat)
+  metrics(1) = 0.5d0
+  metrics(2) = 1.0d0
+end subroutine solve
+end module shallow_water2d_model
+"""
+            runner_text = """program shallow_water2d_runner
+use shallow_water2d_model
+implicit none
+real(8) :: metrics(2)
+call solve(1.0d0, metrics)
+write(*,*) metrics
+end program shallow_water2d_runner
+"""
+            _create_minimal_execution_tree(
+                repo_root,
+                dep_spec_id="dynamics_shallow_water_flux_2d_rusanov_p0",
+                model_text=model_text,
+                runner_text=runner_text,
+                run_command=["./simulate", "workspace/case.resolved.yaml", "workspace/outdir"],
+            )
+
+            violations = validate(repo_root=repo_root, workspace_root="workspace")
+            self.assertTrue(
+                any("does not propagate dependency operation outputs" in v for v in violations)
+            )
+
+    def test_state_snapshots_can_be_optional_by_contract(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            model_text = """module shallow_water2d_model
+use dynamics_shallow_water_flux_2d_rusanov_p0_model
+implicit none
+contains
+subroutine solve(flag)
+  logical, intent(out) :: flag
+  call dynamics_shallow_water_flux_2d_rusanov_p0__compute_flux(flag)
+end subroutine solve
+end module shallow_water2d_model
+"""
+            runner_text = """program shallow_water2d_runner
+implicit none
+write(*,*) 'ok'
+end program shallow_water2d_runner
+"""
+            _create_minimal_execution_tree(
+                repo_root,
+                dep_spec_id="dynamics_shallow_water_flux_2d_rusanov_p0",
+                model_text=model_text,
+                runner_text=runner_text,
+                run_command=["./simulate", "workspace/case.resolved.yaml", "workspace/outdir"],
+                derived_contract={
+                    "io_contract": {
+                        "inputs": [{"name": "case_resolved", "source": "case.resolved.yaml"}],
+                        "outputs": [
+                            {
+                                "name": "metric",
+                                "shape_expr": "scalar",
+                                "evidence_ref": "raw/metrics_basis.json",
+                            }
+                        ],
+                    },
+                    "semantic_dependency": {"required_sources": []},
+                    "raw_requirements": {
+                        "required_evidence": [
+                            {"artifact": "metrics_basis.json", "required": True},
+                            {"artifact": "execution_trace.json", "required": True},
+                            {"artifact": "state_snapshots", "required": False},
+                        ]
+                    },
+                },
+            )
+
+            node_dir = (
+                repo_root
+                / "workspace"
+                / "pipelines"
+                / "problem__shallow_water2d__0.3.0"
+                / "problem__shallow_water2d__0.3.0_test_pipeline"
+                / "execute"
+                / "exe_test_001"
+                / "problem"
+                / "shallow_water2d"
+            )
+            trial_meta_path = node_dir / "trial_meta.json"
+            trial_meta = json.loads(trial_meta_path.read_text(encoding="utf-8"))
+            trial_meta["raw_artifact_refs"] = [
+                ref
+                for ref in trial_meta["raw_artifact_refs"]
+                if "state_snapshots" not in str(ref)
+            ]
+            _write_json(trial_meta_path, trial_meta)
+
+            shutil.rmtree(node_dir / "raw" / "state_snapshots")
+
+            violations = validate(repo_root=repo_root, workspace_root="workspace")
+            self.assertFalse(any("state_snapshots" in v for v in violations))
+
+    def test_detects_invalid_io_contract_outputs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            model_text = """module shallow_water2d_model
+use dynamics_shallow_water_flux_2d_rusanov_p0_model
+implicit none
+contains
+subroutine solve(flag)
+  logical, intent(out) :: flag
+  call dynamics_shallow_water_flux_2d_rusanov_p0__compute_flux(flag)
+end subroutine solve
+end module shallow_water2d_model
+"""
+            runner_text = """program shallow_water2d_runner
+implicit none
+write(*,*) 'ok'
+end program shallow_water2d_runner
+"""
+            _create_minimal_execution_tree(
+                repo_root,
+                dep_spec_id="dynamics_shallow_water_flux_2d_rusanov_p0",
+                model_text=model_text,
+                runner_text=runner_text,
+                run_command=["./simulate", "workspace/case.resolved.yaml", "workspace/outdir"],
+                derived_contract={
+                    "io_contract": {
+                        "inputs": [{"name": "case_resolved", "source": "case.resolved.yaml"}],
+                        "outputs": [],
+                    },
+                    "semantic_dependency": {"required_sources": []},
+                    "raw_requirements": {
+                        "required_evidence": [
+                            {"artifact": "metrics_basis.json", "required": True},
+                            {"artifact": "execution_trace.json", "required": True},
+                        ]
+                    },
+                },
+            )
+
+            violations = validate(repo_root=repo_root, workspace_root="workspace")
+            self.assertTrue(
+                any("io_contract.outputs must be non-empty list" in v for v in violations)
             )
 
 

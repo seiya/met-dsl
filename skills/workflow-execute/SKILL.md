@@ -18,7 +18,8 @@ Execute ステージの実行責務を固定し、判定可能なランタイム
 - `quality check` は `MCP` サーバーの `run_quality_checks` を使用する。
 - `runner` が `model` を呼び出し、`diagnostics.json` と `perf.json` を出力する。
 - `runner` が `verdict.json` と `aggregate_verdict.json` と `summary.json` と `trial_meta.json` を直接出力してはならない。
-- `execution_id/<node_key>/raw/` に `Judge` 再計算用の実行証跡を必須保存する。最小構成は状態スナップショット、ケース別メトリクス元データ、実行トレースとする。
+- `execution_id/<node_key>/raw/` に `Judge` 再計算用の実行証跡を必須保存する。必須構成は `derived_contract.json` の `raw_requirements.required_evidence` を正本とする。
+- `raw_requirements.required_evidence` が `artifact=state_snapshots` を必須宣言する場合のみ、状態スナップショットを必須保存する。
 - `raw` は一次証跡のみを保存し、`diagnostics.json` の複写を `metrics_basis` として保存してはならない。
 - `stdout.log` と `stderr.log` と `trial_meta.json` を必須保存する。
 - `trial_meta.json` に `runner_command` と `process_trace_ref` と `raw_artifact_refs` を必須記録する。

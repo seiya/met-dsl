@@ -24,6 +24,11 @@
 14. 異なる `pipeline_id` 間で `id` 系メタデータのみを変更して成果物本文を流用してはならない。検出時は `copy_based_artifact_reuse` として `invalid` とする。
 15. 本規範違反は workflow 仕様違反とし、当該 `pipeline` を `invalid` とする。
 16. `Promote` 以外のステージは、`workspace/` 配下以外へ書き込みを行ってはならない。`Promote` は `releases/` 配下と `spec/registry/spec_catalog.yaml` への書き込みのみを許可する。
+17. `Promote` 以外のステージ開始前に、リポジトリルート配下ファイル集合の `baseline` を取得し、当該ステージ完了前に差分比較を実施しなければならない。
+18. 差分比較は `workspace/` 配下以外の `add` / `modify` / `delete` を違反として検出しなければならない。`Promote` は `releases/` 配下と `spec/registry/spec_catalog.yaml` のみを例外許可する。
+19. `python` 実行を workflow 経路で使用する場合、`__pycache__` が `workspace/` 配下以外へ生成されない設定を必須とする。`PYTHONDONTWRITEBYTECODE=1` または `PYTHONPYCACHEPREFIX=workspace/.pycache/<pipeline_id>/` を使用する。
+20. 書き込み範囲違反を検出したステージは `fail` とし、下流ステージを開始してはならない。違反内容は `workspace/` 配下のメタデータへ記録しなければならない。
+21. 書き込み範囲違反を検出した `pipeline` は `invalid` とする。違反状態を解消せずに同一試行を継続してはならない。
 
 ## 0. 仕様作成（人間）
 - `Controlled Spec` で物理アルゴリズム（A）を定義する。
@@ -45,6 +50,9 @@
 ### 1-1) 物理 Plan（`case.resolved.yaml`）
 - `Controlled Spec` から物理アルゴリズム（A）を読み、`tests` から入力条件と `sweep` / `refinement` を決定的に展開する。
 - `Plan verify` は `controlled_spec.md` と `tests.md` と `deps.yaml` から導出した検証契約を `derived_contract.json` として保存する。
+- `case.resolved.yaml` は実行時入力の決定値のみを保持し、検証出力契約を保持してはならない。
+- `derived_contract.json` は `io_contract.inputs` と `io_contract.outputs` を必須保持し、`io_contract.outputs` は `name` と `evidence_ref` と `shape_expr` で判定対象出力の一次証跡参照を定義しなければならない。
+- `derived_contract.json` は `raw_requirements.required_evidence` を必須保持し、`artifact` と `required` と `min_samples` と `schema`（必要時）で `raw` 一次証跡の必須構成を定義しなければならない。
 
 ### 1-2) 実装 Plan（`impl.resolved.yaml`）
 - 実行アルゴリズム（B）を決定し、`target.backend`、`target.architecture`、`toolchain.language`、`toolchain.build_system` を固定する。
@@ -88,6 +96,8 @@
 - 依存先が `profile` で公開 `operation` を持たない場合、依存元 `problem` は `profile` の選択結果と拘束条件を参照する実装痕跡を必須記録とする。
 - `Generate verify` は `derived_contract.json` を入力として、依存 `operation` と出力指標のデータ依存を検証しなければならない。制御構造の形式（時空間ループ有無など）を固定要件にしてはならない。
 - `Generate verify` は `model` 出力と無関係な定数出力、固定 `JSON` 出力、解析式直接代入による `diagnostics` 生成を検出した場合に `fail` とする。
+- `Generate verify` は、`intent(out)` 変数の最終式木が `derived_contract.json` の `semantic_dependency.required_sources` と `io_contract.outputs` で宣言された出力変数群へ到達することを検証しなければならない。
+- `Generate verify` は、`spec` の目的に依存しない固定計算様式（例: 常に `flux` や常に時刻積分）を一律必須にしてはならない。判定は `derived_contract.json` の要求計算種別に基づいて実施しなければならない。
 - `toolchain.language=fortran` の `module` 名と公開 `subroutine` 名は `spec_id` 由来接頭辞を含む一意名とする。
 - `toolchain.language=fortran` のソースファイル名は定義 `module` 名と一致する `<module_name>.f90` を必須とする。
 - `toolchain.language=fortran` では、汎用ファイル名 `model.f90` への集約を禁止する。
@@ -111,8 +121,10 @@
 - `runner` の出力対象は `diagnostics.json`、`perf.json`、`raw/` 一次証跡、`stdout.log`、`stderr.log` に限定する。
 - `runner` は `verdict.json`、`aggregate_verdict.json`、`summary.json`、`trial_meta.json` を書き込んではならない。
 - `Execute` は `Judge` 再計算に必要な一次証跡を `execution_id/<node_key>/raw/` に保存しなければならない。
-- 一次証跡には状態スナップショット、ケース別指標計算に必要な中間データ、実行トレースを含める。
-- `problem` `node` の `raw/state_snapshots/` は `snapshot_schema.json` で `state_variables` と `time_variable` を宣言し、少なくとも 1 件の状態ファイルへ当該項目を保持しなければならない。
+- 一次証跡の必須構成は `derived_contract.json` の `raw_requirements.required_evidence` を正本とする。固定の最小構成を全 `spec` に一律適用してはならない。
+- `raw_requirements.required_evidence` は `metrics_basis.json` と `execution_trace.json` と `state_snapshots` などの `artifact` ごとに必須有無を宣言しなければならない。
+- `raw_requirements.required_evidence` が `artifact=state_snapshots` かつ `required=true` を宣言する場合、`raw/state_snapshots/` は `snapshot_schema.json` で `state_variables` と `time_variable` を宣言し、`min_samples` 件以上の状態ファイルへ当該項目を保持しなければならない。
+- `raw_requirements.required_evidence` が `artifact=state_snapshots` を必須宣言しない場合、`raw/state_snapshots/` を必須にしてはならない。スカラー目的 `spec` を含む任意の計算課題を許容しなければならない。
 - `raw/metrics_basis.json` は一次証跡のみを保持し、`diagnostics.json` の複写を禁止する。
 - `Build` または `Execute` が失敗した場合、`diagnostics.json` / `perf.json` の人工生成を禁止し、当該 `node` を `fail` とする。
 - `quality_check.json` は `checks.verdict_available=true` と `checks.diagnostics_match=true` と `checks.verdict_match=true` を同時に満たさなければならない。いずれかが `false` または欠落の場合は `Execute fail` とする。
@@ -125,6 +137,9 @@
 - `Judge` は `raw/` 一次証跡から独立経路で判定指標を再計算し、`diagnostics.json` と整合確認しなければならない。
 - `Judge` 再計算入力は `raw/` のみに限定する。`diagnostics.json` を再計算入力へ流用してはならない。
 - `Judge` は再計算不能または不整合時に `fail` としなければならない。
+- `Judge` は固定スクリプト検査に加え、`LLM` による意味検査を必須実行し、`model` / `runner` / `raw` 一次証跡の整合性と捏造疑義を判定しなければならない。
+- `LLM` 意味検査の結果は `semantic_review.json` として `execution_id/<node_key>/` 配下へ保存し、`review_method`、`decision`、`scope.model_ref`、`scope.runner_ref`、`scope.raw_refs`、`findings` を必須記録とする。
+- `semantic_review.json` の `decision` が `fail` または欠落の場合、当該 `node` を `Judge fail` としなければならない。
 - 直下依存 `node` に `fail` または `blocked` がある場合、上位 `node` は `self_verdict` を評価せず `aggregate_verdict=blocked` として終了する。
 - `blocked` 終了時も `aggregate_verdict.json`、`summary.json`、`trial_meta.json` を必須出力とし、`blocked_reason` と `blocking_direct_deps` を記録する。
 - `summary.json` は `self_summary` と `dependency_summary` を必須保持とする。`dependency_summary` は `total`、`pass`、`xfail`、`fail`、`blocked` を保持する。
@@ -191,6 +206,7 @@ workspace/
               verdict.json
               aggregate_verdict.json
               summary.json
+              semantic_review.json
               trial_meta.json
               stdout.log
               stderr.log
@@ -235,9 +251,18 @@ workspace/
 - 異なる `node_key` で生成された `generate/<generation_id>/src/` のコードハッシュが一致した場合、共通ライブラリとして明示されたファイルを除き `copy_based_artifact_reuse` として `invalid` にしなければならない。
 - `spec_kind` を問わない workflow 実行の完了宣言前に、対象依存 `DAG` の `workspace/plans` / `workspace/pipelines` 成果物を削除してはならない。
 
+### 7-7) 書き込み範囲ガード
+- 各ステージ開始時に `write_scope_baseline.json` を `workspace/` 配下へ保存し、比較対象の `baseline` を固定しなければならない。
+- `write_scope_baseline.json` は、少なくとも `stage`、`node_key`、`pipeline_id`、`captured_at`、`tracked_diff`、`untracked_files` を保持しなければならない。
+- 各ステージ完了前に `write_scope_baseline.json` との差分を計算し、`workspace/` 配下以外の変化を `write_scope_violation` として判定しなければならない。
+- 違反未検出時は `write_scope_check.status=pass` をステージメタデータへ記録しなければならない。
+- 違反検出時は `write_scope_violation.json` を `workspace/` 配下へ出力し、`violation_paths` と `stage` と `node_key` と `pipeline_id` と `detected_at` を必須記録しなければならない。
+- `write_scope_violation` 検出時は当該ステージを `fail` とし、当該 `pipeline` の `aggregate_verdict` 確定を禁止する。
+
 ## 8. 完了判定基準
 - workflow 完了条件は、`dependency.resolved.yaml` の全 `node_key` に対して `workspace/plans/<node_key_safe>/<plan_id>/` と `workspace/pipelines/<node_key_safe>/<pipeline_id>/` が存在し、`lineage.json` の `node_key` と `dependency_ref` が一致することとする。
 - workflow 完了宣言は、`dependency workflow` 網羅チェックと `trial_meta` 完整性チェックと `copy_based_artifact_reuse` 非検出を同時に満たす場合のみ許可する。
+- workflow 完了宣言は、全ステージで `write_scope_violation` 非検出を同時に満たす場合のみ許可する。
 - `CI` は `python3 tools/validate_workspace_root.py` と `python3 tools/validate_pipeline_semantics.py` の実行結果を `pass` 条件として扱う。
 
 補足:

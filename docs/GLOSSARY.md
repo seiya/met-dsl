@@ -12,9 +12,10 @@
 - **component_catalog.yaml**: 再利用 `component` / `operation` の台帳。保存先は `releases/registry/component_catalog.yaml` とし、責務、公開 `API`、互換性、実装状態を保持する。
 - **deps.yaml**: 各 `spec` が要求する依存宣言。`component_id` / `profile_id` と `version constraint` を定義する。
 - **case.yaml**: 人間が書く（または将来 `Spec` から生成する）テストケース定義。`sweep` / `refinement` などを含み得る。
-- **case.resolved.yaml**: テストランナーが生成する「決定済み」入力。`sweep` 展開、物理アルゴリズム（後述）と数値条件を決定したもの。`runner`（例: `simulate`）がこれを読む。
+- **case.resolved.yaml**: テストランナーが生成する「決定済み」入力。`sweep` 展開、物理アルゴリズム（後述）と数値条件を決定したもの。`runner`（例: `simulate`）がこれを読む。出力契約を保持してはならない。
 - **impl.resolved.yaml**: 実装計画（`Implementation Plan`）。計算過程（並列化、メモリ配置、融合、ブロッキング等）に関する可変パラメタを決定したもの。性能チューニングの探索対象になり得る。
 - **dependency.resolved.yaml**: 依存解決結果の正本。`node_key`、`direct_deps`、`transitive_deps`、`topo_level` を保持する。
+- **derived_contract.json**: `Plan verify` が導出する検証契約。`io_contract.inputs` / `io_contract.outputs` と `semantic_dependency.required_sources` と `raw_requirements.required_evidence` を保持し、`Generate verify` と `Execute` / `Judge` の判定正本として使用する。
 - **expected_node_set**: `deps.yaml` と `spec_catalog.yaml` から再構成した期待 `node` 集合。`dependency.resolved.yaml` の網羅検証に使用する。
 - **node workflow**: 単一 `node_key` を対象にした `Plan -> Generate -> Build -> Execute -> Judge` の 1 系列実行。
 - **node_key_safe**: `node_key` の保存用表記。推奨形式は `<spec_kind>__<spec_id>__<spec_version>`。
