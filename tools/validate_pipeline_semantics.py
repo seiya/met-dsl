@@ -24,6 +24,147 @@ FORBIDDEN_RUNNER_OUTPUTS = (
     "summary.json",
     "trial_meta.json",
 )
+FORTRAN_IDENTIFIER_PATTERN = re.compile(r"[a-z_][a-z0-9_]*")
+
+
+def _split_fortran_names(raw: str) -> list[str]:
+    names: list[str] = []
+    for token in raw.split(","):
+        part = token.strip().lower()
+        if not part:
+            continue
+        part = re.sub(r"\(.*\)", "", part).strip()
+        if FORTRAN_IDENTIFIER_PATTERN.fullmatch(part):
+            names.append(part)
+    return names
+
+
+def _is_literal_like_expr(expr: str) -> bool:
+    lowered = expr.strip().lower()
+    if not lowered:
+        return False
+    if lowered in {".true.", ".false.", "true", "false"}:
+        return True
+    return bool(re.fullmatch(r"[0-9dDeE\.\+\-\*\/\(\)\s,_]+", lowered))
+
+
+def _validate_problem_model_literal_outputs(
+    execution: NodeExecution,
+    model_file: Path,
+    lowered: str,
+    violations: list[str],
+) -> None:
+    if not execution.node_key.startswith("problem/"):
+        return
+
+    subroutine_pattern = re.compile(
+        r"subroutine\s+([a-z_][a-z0-9_]*)\s*\((.*?)\)(.*?)end\s+subroutine",
+        re.DOTALL,
+    )
+    intent_out_pattern = re.compile(r"intent\s*\(\s*out\s*\)\s*::\s*([^\n!]+)")
+
+    for match in subroutine_pattern.finditer(lowered):
+        sub_name = match.group(1)
+        arg_names = set(_split_fortran_names(match.group(2)))
+        body = match.group(3)
+
+        out_vars: set[str] = set()
+        for out_match in intent_out_pattern.finditer(body):
+            out_vars.update(_split_fortran_names(out_match.group(1)))
+        if not out_vars:
+            continue
+
+        assign_map: dict[str, list[str]] = {}
+        for out_var in sorted(out_vars):
+            exprs = re.findall(
+                rf"\b{re.escape(out_var)}\s*=\s*([^\n!]+)",
+                body,
+            )
+            if exprs:
+                assign_map[out_var] = [expr.strip() for expr in exprs]
+
+        if set(assign_map.keys()) != out_vars:
+            continue
+
+        all_literal = True
+        input_dependent = False
+        for out_var, exprs in assign_map.items():
+            for expr in exprs:
+                if not _is_literal_like_expr(expr):
+                    all_literal = False
+                    expr_ids = {
+                        token
+                        for token in FORTRAN_IDENTIFIER_PATTERN.findall(expr)
+                        if token not in {"d", "e", "true", "false"}
+                    }
+                    if expr_ids & (arg_names - {out_var}):
+                        input_dependent = True
+
+        if all_literal and not input_dependent:
+            violations.append(
+                f"{model_file}: subroutine {sub_name} has literal-only assignments for all intent(out) vars"
+            )
+
+
+def _extract_first_diagnostics_block(lowered: str) -> str | None:
+    start = -1
+    for marker in ("/diagnostics.json", "'diagnostics.json'", "\"diagnostics.json\""):
+        start = lowered.find(marker)
+        if start >= 0:
+            break
+    if start < 0:
+        return None
+
+    close_idx = lowered.find("close(", start)
+    if close_idx < 0:
+        return lowered[start:]
+    return lowered[start:close_idx]
+
+
+def _extract_call_arg_vars(lowered: str) -> list[str]:
+    for match in re.finditer(r"\bcall\s+[a-z_][a-z0-9_]*\s*\((.*?)\)", lowered):
+        args_raw = match.group(1)
+        names = _split_fortran_names(args_raw)
+        if names:
+            return names
+    return []
+
+
+def _strip_quoted_strings(text: str) -> str:
+    no_single = re.sub(r"'(?:''|[^'])*'", "''", text)
+    return re.sub(r"\"(?:\"\"|[^\"])*\"", "\"\"", no_single)
+
+
+def _validate_problem_runner_diagnostics_dependency(
+    execution: NodeExecution,
+    runner_file: Path,
+    lowered: str,
+    violations: list[str],
+) -> None:
+    if not execution.node_key.startswith("problem/"):
+        return
+
+    diagnostics_block = _extract_first_diagnostics_block(lowered)
+    if diagnostics_block is None:
+        return
+
+    call_args = _extract_call_arg_vars(lowered)
+    if not call_args:
+        return
+
+    diagnostics_no_strings = _strip_quoted_strings(diagnostics_block)
+    referenced_args = [
+        name
+        for name in call_args
+        if re.search(rf"\b{re.escape(name)}\b", diagnostics_no_strings)
+    ]
+    numeric_literal_count = len(
+        re.findall(r"[-+]?\d+(?:\.\d+)?(?:d|e)?[-+]?\d*", diagnostics_block)
+    )
+    if not referenced_args and numeric_literal_count >= 5:
+        violations.append(
+            f"{runner_file}: diagnostics block does not reference model call arguments and appears constant-heavy"
+        )
 
 
 @dataclass
@@ -67,6 +208,16 @@ def _node_executions(
     else:
         targets = sorted(pipeline_roots)
 
+    def has_execution_artifacts(node_dir: Path) -> bool:
+        markers = (
+            node_dir / "diagnostics.json",
+            node_dir / "perf.json",
+            node_dir / "trial_meta.json",
+            node_dir / "quality_check.json",
+            node_dir / "raw" / "metrics_basis.json",
+        )
+        return any(path.exists() for path in markers)
+
     for pipeline_dir in targets:
         if not pipeline_dir.is_dir():
             continue
@@ -81,6 +232,8 @@ def _node_executions(
                     continue
                 for spec_dir in sorted(kind_dir.iterdir()):
                     if not spec_dir.is_dir():
+                        continue
+                    if not has_execution_artifacts(spec_dir):
                         continue
                     node_key = f"{kind_dir.name}/{spec_dir.name}"
                     result.append(
@@ -346,6 +499,13 @@ def _validate_generate_outputs(execution: NodeExecution, violations: list[str]) 
                 f"{model_file}: many literal metric assignments detected ({literal_like}/{len(assignments)})"
             )
 
+        _validate_problem_model_literal_outputs(
+            execution=execution,
+            model_file=model_file,
+            lowered=lowered,
+            violations=violations,
+        )
+
 
 def _dependency_resolved_for_execution(repo_root: Path, execution: NodeExecution) -> dict[str, Any] | None:
     lineage_path = execution.pipeline_dir / "lineage.json"
@@ -448,6 +608,12 @@ def _validate_runner_outputs(execution: NodeExecution, violations: list[str]) ->
                 violations.append(
                     f"{runner_file}: forbidden runner output write detected ({output_name})"
                 )
+        _validate_problem_runner_diagnostics_dependency(
+            execution=execution,
+            runner_file=runner_file,
+            lowered=text,
+            violations=violations,
+        )
 
 
 def _validate_run_program_inputs(

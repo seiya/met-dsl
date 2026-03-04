@@ -114,6 +114,48 @@ def _create_minimal_execution_tree(
 
 
 class ValidatePipelineSemanticsTests(unittest.TestCase):
+    def test_ignores_empty_execution_node_directories(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            model_text = """module shallow_water2d_model
+use dynamics_shallow_water_flux_2d_rusanov_p0_model
+implicit none
+contains
+subroutine solve(flag)
+  logical, intent(out) :: flag
+  call dynamics_shallow_water_flux_2d_rusanov_p0__compute_flux(flag)
+end subroutine solve
+end module shallow_water2d_model
+"""
+            runner_text = """program shallow_water2d_runner
+implicit none
+write(*,*) 'diagnostics only'
+end program shallow_water2d_runner
+"""
+            _create_minimal_execution_tree(
+                repo_root,
+                dep_spec_id="dynamics_shallow_water_flux_2d_rusanov_p0",
+                model_text=model_text,
+                runner_text=runner_text,
+                run_command=["./simulate", "workspace/case.resolved.yaml", "workspace/outdir"],
+            )
+
+            empty_node_dir = (
+                repo_root
+                / "workspace"
+                / "pipelines"
+                / "problem__shallow_water2d__0.3.0"
+                / "problem__shallow_water2d__0.3.0_empty_pipeline"
+                / "execute"
+                / "exe_empty_001"
+                / "problem"
+                / "shallow_water2d"
+            )
+            empty_node_dir.mkdir(parents=True, exist_ok=True)
+
+            violations = validate(repo_root=repo_root, workspace_root="workspace")
+            self.assertEqual([], violations)
+
     def test_detects_dependency_dummy_and_runner_output_and_missing_case_input(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
@@ -177,6 +219,54 @@ end program shallow_water2d_runner
 
             violations = validate(repo_root=repo_root, workspace_root="workspace")
             self.assertEqual([], violations)
+
+    def test_detects_problem_constant_model_and_runner_diagnostics(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            model_text = """module shallow_water2d_model
+use dynamics_shallow_water_flux_2d_rusanov_p0_model
+implicit none
+contains
+subroutine shallow_water2d__step(cfl_max, h_min, mass_drift_rel)
+  real(8), intent(out) :: cfl_max, h_min, mass_drift_rel
+  if (.true.) then
+    cfl_max = 0.72d0
+    h_min = 0.91d0
+    mass_drift_rel = 1.0d-12
+  else
+    cfl_max = 1.5d0
+    h_min = 0.01d0
+    mass_drift_rel = 1.0d-3
+  end if
+end subroutine shallow_water2d__step
+end module shallow_water2d_model
+"""
+            runner_text = """program shallow_water2d_runner
+use shallow_water2d_model
+implicit none
+real(8) :: cfl_max, h_min, mass_drift_rel
+integer :: u
+call shallow_water2d__step(cfl_max, h_min, mass_drift_rel)
+open(newunit=u, file='diagnostics.json', status='replace', action='write')
+write(u,'(a)') '{"cfl":{"max":0.72},"extrema":{"h":{"min":0.91}},"mass_drift_rel":1.0e-12,"momx_drift_rel":1.0e-12,"momy_drift_rel":1.0e-12,"convergence_order":{"n32_to_n64":1.0}}'
+close(u)
+end program shallow_water2d_runner
+"""
+            _create_minimal_execution_tree(
+                repo_root,
+                dep_spec_id="dynamics_shallow_water_flux_2d_rusanov_p0",
+                model_text=model_text,
+                runner_text=runner_text,
+                run_command=["./simulate", "workspace/case.resolved.yaml", "workspace/outdir"],
+            )
+
+            violations = validate(repo_root=repo_root, workspace_root="workspace")
+            self.assertTrue(
+                any("literal-only assignments for all intent(out) vars" in v for v in violations)
+            )
+            self.assertTrue(
+                any("diagnostics block does not reference model call arguments" in v for v in violations)
+            )
 
 
 if __name__ == "__main__":

@@ -23,6 +23,7 @@
 13. `trial_meta.json` は `generated_by_stage`、`source_execution_id`、`source_command_ref`、`source_artifact_hash` を必須記録とする。
 14. 異なる `pipeline_id` 間で `id` 系メタデータのみを変更して成果物本文を流用してはならない。検出時は `copy_based_artifact_reuse` として `invalid` とする。
 15. 本規範違反は workflow 仕様違反とし、当該 `pipeline` を `invalid` とする。
+16. `Promote` 以外のステージは、`workspace/` 配下以外へ書き込みを行ってはならない。`Promote` は `releases/` 配下と `spec/registry/spec_catalog.yaml` への書き込みのみを許可する。
 
 ## 0. 仕様作成（人間）
 - `Controlled Spec` で物理アルゴリズム（A）を定義する。
@@ -124,6 +125,7 @@
 - `blocked` 終了時も `aggregate_verdict.json`、`summary.json`、`trial_meta.json` を必須出力とし、`blocked_reason` と `blocking_direct_deps` を記録する。
 - `summary.json` は `self_summary` と `dependency_summary` を必須保持とする。`dependency_summary` は `total`、`pass`、`xfail`、`fail`、`blocked` を保持する。
 - 判定入力不足時は `Judge fail` とし、推定値や仮定値で `verdict` を成立させてはならない。
+- `python3 tools/validate_pipeline_semantics.py` は、`problem node` の `model` で `intent(out)` 変数が固定値代入のみで構成される実装と、`runner` の `diagnostics.json` が `model` 呼び出し結果を参照しない固定値埋め込み実装を検出した場合に `fail` とする。
 - `Judge` 開始前と `Judge` 完了前に `python3 tools/validate_pipeline_semantics.py` を実行し、`fail` 時は当該 `pipeline` を `invalid` とする。
 - 実装品質判定（`target.class=cpu`）は `threads_per_rank=1` と `threads_per_rank>1` の比較で実施し、比較対象は `diagnostics.json` と `verdict.json` とする。
 - スレッド並列あり / なしの比較は `tests` の判定対象に含めず、`quality check` として扱う。

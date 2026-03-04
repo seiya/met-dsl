@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 from pathlib import Path
 from typing import Any
 
@@ -21,6 +22,11 @@ STRICT_WORKSPACE_REF_KEYS = {
     "source_command_ref",
     "process_trace_ref",
 }
+
+ALLOWED_WORKSPACE_PY_PATTERNS = (
+    re.compile(r"^pipelines/[^/]+/[^/]+/generate/[^/]+/src/quality_check\.py$"),
+    re.compile(r"^pipelines/[^/]+/[^/]+/build/[^/]+/bin/quality_check\.py$"),
+)
 
 
 def _scan_json_for_violations(json_path: Path) -> list[str]:
@@ -65,6 +71,18 @@ def _scan_json_for_violations(json_path: Path) -> list[str]:
     return violations
 
 
+def _scan_workspace_for_forbidden_scripts(workspace_root: Path) -> list[str]:
+    violations: list[str] = []
+    for py_path in sorted(workspace_root.rglob("*.py")):
+        rel = py_path.relative_to(workspace_root).as_posix()
+        if any(pattern.fullmatch(rel) for pattern in ALLOWED_WORKSPACE_PY_PATTERNS):
+            continue
+        violations.append(
+            f"{py_path}: python script under workspace/ is forbidden except approved quality_check.py paths"
+        )
+    return violations
+
+
 def validate(repo_root: Path, workspace_root: str) -> tuple[list[str], bool]:
     violations: list[str] = []
     created_workspace = False
@@ -82,6 +100,9 @@ def validate(repo_root: Path, workspace_root: str) -> tuple[list[str], bool]:
     if canonical_root.exists() and canonical_root.is_dir():
         for json_file in sorted(canonical_root.rglob("*.json")):
             violations.extend(_scan_json_for_violations(json_file))
+
+    if canonical_root.exists() and canonical_root.is_dir():
+        violations.extend(_scan_workspace_for_forbidden_scripts(canonical_root))
 
     return violations, created_workspace
 
