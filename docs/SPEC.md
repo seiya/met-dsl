@@ -36,8 +36,7 @@
 ## LLM の扱い（全体原則）
 - `LLM` はモデル種類を問わず交換可能とする。
 - `LLM` 利用ステージは `generate -> verify -> regenerate` を反復し、検証合格後のみ成果物を確定する。
-- `verifier` は `generator` と独立したコンテキスト（別セッションまたは別エージェント）での実行を可能な限り優先する。
-- 実行環境の制約で独立コンテキストを確保できない場合は、同一コンテキスト実行を許容し、制約理由を `<stage>_meta.json` へ記録する。
+- `verifier` は `generator` と独立したコンテキスト（別セッションまたは別エージェント）での実行を必須とする。
 - ステージ内 `verify` は構造・契約・トレーサビリティ整合の確認を目的とし、物理妥当性の最終保証を代替しない。
 - `LLM` 利用ステージは `<stage>_meta.json`（コード生成は `generate_meta.json`）を必須出力とする。
 - メタデータの必須項目は `attempt_count`、`verification_status`、`last_fail_reason`、`context_isolated`、`debug_mode` とする。`context_isolated=false` の場合は `constraint_reason` を必須とする。

@@ -9,10 +9,11 @@
 4. `PHYSICAL_VALIDATION.md`（物理妥当性判定の要件）
 5. `GLOSSARY.md`（`Artifacts` / 用語）
 6. `WORKFLOW.md`（`Spec -> Plan -> Generate -> Execute -> Judge -> Tune -> Promote`。依存 `DAG` に基づく下層優先実行と `aggregate_verdict` を含む）
-7. `RUNBOOK.md`（試行を回すための最小運用手順）
-8. `IMPL_PLAN_SPEC.md`（`impl.resolved.yaml` 仕様）
-9. `PERFORMANCE_DIAGNOSTICS.md`（`perf.json` 仕様）
-10. `TUNING_WORKFLOW.md`（性能探索の運用指針）
+7. `ORCHESTRATION.md`（`orchestration agent -> substep agent` と `orchestration agent -> step agent` の実行規約）
+8. `RUNBOOK.md`（試行を回すための最小運用手順）
+9. `IMPL_PLAN_SPEC.md`（`impl.resolved.yaml` 仕様）
+10. `PERFORMANCE_DIAGNOSTICS.md`（`perf.json` 仕様）
+11. `TUNING_WORKFLOW.md`（性能探索の運用指針）
 
 ## 役割別の構成
 ### Core（方向性・契約）
@@ -24,6 +25,7 @@
 
 ### Loop（試行を回す）
 - `WORKFLOW.md`
+- `ORCHESTRATION.md`
 - `RUNBOOK.md`
 
 ### Execution / Performance（実装と性能）
@@ -38,5 +40,6 @@
 - 言語に依らず、生成コードは `model`（物理計算）と `runner`（実行・判定連携）を分離する。
 - `LLM` を使うステージは、ステージ内部で `generate -> verify -> regenerate` を実施し、最終合格成果物のみを保存する。
 - `LLM` 利用ステージは各ステージの `<stage>_meta.json` を必須出力とし、標準運用（`debug_mode=false`）では失敗試行成果物を保存しない。
+- `workflow` 実行は `ORCHESTRATION.md` の規約に従い、`orchestration agent` 起点で開始する。
 - 試行手順が固まり次第、`RUNBOOK.md` を前提に自動化を進める。
 - `compile` / `run` / `quality check` は `MCP` サーバー（`mcp_servers/build_runtime_server.py`）経由で実行する。

@@ -26,6 +26,7 @@ STRICT_WORKSPACE_REF_KEYS = {
 }
 
 ALLOWED_WORKSPACE_TOP_LEVEL_DIRS = {
+    "orchestrations",
     "plans",
     "pipelines",
     "index",

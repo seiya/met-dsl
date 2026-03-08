@@ -226,6 +226,173 @@ shallow_water2d_runner.o: shallow_water2d_runner.f90 shallow_water2d_model.mod
     )
 
 
+def _create_minimal_orchestration_tree(
+    repo_root: Path,
+    *,
+    node_safe: str = "problem__shallow_water2d__0.3.0",
+    node_key: str = "problem/shallow_water2d@0.3.0",
+    orchestration_id: str = "orch_test_001",
+) -> None:
+    orchestration_root = repo_root / "workspace" / "orchestrations" / orchestration_id
+    launches_root = orchestration_root / "launches"
+    launches_root.mkdir(parents=True, exist_ok=True)
+    _write_json(
+        orchestration_root / "orchestration_meta.json",
+        {
+            "orchestration_id": orchestration_id,
+            "status": "pass",
+        },
+    )
+    _write_json(
+        orchestration_root / "preflight.json",
+        {
+            "can_launch_step_agents": True,
+            "can_launch_substep_agents": True,
+        },
+    )
+    step_ids = {
+        step: f"step_run_{step}_001" for step in ("build", "execute", "judge")
+    }
+    substep_ids = {
+        "plan": ["substep_run_plan_generate_001", "substep_run_plan_verify_001"],
+        "generate": ["substep_run_generate_generate_001", "substep_run_generate_verify_001"],
+    }
+    graph_data = {"edges": []}
+    for step in ("build", "execute", "judge"):
+        graph_data["edges"].append(
+            {
+                "parent_agent_run_id": "orch_run_001",
+                "child_agent_run_id": step_ids[step],
+                "relation_type": "launch",
+            }
+        )
+    for substeps in substep_ids.values():
+        for substep_id in substeps:
+            graph_data["edges"].append(
+                {
+                    "parent_agent_run_id": "orch_run_001",
+                    "child_agent_run_id": substep_id,
+                    "relation_type": "launch",
+                }
+            )
+    _write_json(orchestration_root / "agent_graph.json", graph_data)
+
+    agent_runs_path = orchestration_root / "agent_runs.jsonl"
+    agent_runs_path.parent.mkdir(parents=True, exist_ok=True)
+    run_items = [
+        {
+            "agent_run_id": "orch_run_001",
+            "agent_role": "orchestration",
+            "status": "pass",
+            "started_at": "2026-03-01T00:00:00Z",
+            "finished_at": "2026-03-01T00:10:00Z",
+        }
+    ]
+    for step in ("build", "execute", "judge"):
+        step_request_ref = f"workspace/orchestrations/{orchestration_id}/launches/{step_ids[step]}.request.json"
+        step_response_ref = f"workspace/orchestrations/{orchestration_id}/launches/{step_ids[step]}.response.json"
+
+        _write_json(
+            launches_root / f"{step_ids[step]}.request.json",
+            {"agent_run_id": step_ids[step], "role": "step", "step": step},
+        )
+        _write_json(
+            launches_root / f"{step_ids[step]}.response.json",
+            {"agent_run_id": step_ids[step], "accepted": True},
+        )
+        run_items.append(
+            {
+                "agent_run_id": step_ids[step],
+                "parent_agent_run_id": "orch_run_001",
+                "agent_role": "step",
+                "node_key": node_key,
+                "step": step,
+                "status": "pass",
+                "agent_backend": "openai_responses",
+                "agent_model": "gpt-5-codex",
+                "context_id": f"ctx_step_{step}",
+                "context_isolated": True,
+                "agent_session_id": f"sess_step_{step}",
+                "launch_request_ref": step_request_ref,
+                "launch_response_ref": step_response_ref,
+                "started_at": "2026-03-01T00:00:10Z",
+                "finished_at": "2026-03-01T00:01:10Z",
+            }
+        )
+    for step, substeps in substep_ids.items():
+        for idx, substep_id in enumerate(substeps, start=1):
+            substep_request_ref = f"workspace/orchestrations/{orchestration_id}/launches/{substep_id}.request.json"
+            substep_response_ref = f"workspace/orchestrations/{orchestration_id}/launches/{substep_id}.response.json"
+
+            _write_json(
+                launches_root / f"{substep_id}.request.json",
+                {"agent_run_id": substep_id, "role": "substep", "step": step},
+            )
+            _write_json(
+                launches_root / f"{substep_id}.response.json",
+                {"agent_run_id": substep_id, "accepted": True},
+            )
+
+            run_items.append(
+                {
+                    "agent_run_id": substep_id,
+                    "parent_agent_run_id": "orch_run_001",
+                    "agent_role": "substep",
+                    "node_key": node_key,
+                    "step": step,
+                    "substep": f"part_{idx}",
+                    "status": "pass",
+                    "agent_backend": "openai_responses",
+                    "agent_model": "gpt-5-codex",
+                    "context_id": f"ctx_substep_{step}_{idx}",
+                    "context_isolated": True,
+                    "agent_session_id": f"sess_substep_{step}_{idx}",
+                    "launch_request_ref": substep_request_ref,
+                    "launch_response_ref": substep_response_ref,
+                    "started_at": "2026-03-01T00:00:20Z",
+                    "finished_at": "2026-03-01T00:00:50Z",
+                }
+            )
+    agent_runs_path.write_text(
+        "\n".join(json.dumps(item, ensure_ascii=False) for item in run_items) + "\n",
+        encoding="utf-8",
+    )
+
+    for step in ("plan", "generate"):
+        _write_json(
+            orchestration_root
+            / "steps"
+            / node_safe
+            / step
+            / "orch_run_001"
+            / "step_result.json",
+            {
+                "status": "pass",
+                "required_outputs": [],
+                "failed_substeps": [],
+                "executor_agent_run_id": "orch_run_001",
+                "substep_agent_run_ids": substep_ids[step],
+            },
+        )
+
+    for step in ("build", "execute", "judge"):
+        _write_json(
+            orchestration_root
+            / "steps"
+            / node_safe
+            / step
+            / step_ids[step]
+            / "step_result.json",
+            {
+                "status": "pass",
+                "required_outputs": [],
+                "failed_substeps": [],
+                "executor_agent_run_id": step_ids[step],
+                "substep_agent_run_ids": [],
+            },
+        )
+
+
 class ValidatePipelineSemanticsTests(unittest.TestCase):
     def test_rejects_noncanonical_workspace_root_argument(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1271,6 +1438,129 @@ end program shallow_water2d_runner
             violations = validate(repo_root=repo_root, workspace_root="workspace")
             self.assertTrue(
                 any("shape [1, 2] does not match declared shape_expr [2,2]" in v for v in violations)
+            )
+
+    def test_detects_missing_orchestration_when_required(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            model_text = """module shallow_water2d_model
+use dynamics_shallow_water_flux_2d_rusanov_p0_model
+implicit none
+contains
+subroutine solve(flag)
+  logical, intent(out) :: flag
+  call dynamics_shallow_water_flux_2d_rusanov_p0__compute_flux(flag)
+end subroutine solve
+end module shallow_water2d_model
+"""
+            runner_text = """program shallow_water2d_runner
+implicit none
+write(*,*) 'ok'
+end program shallow_water2d_runner
+"""
+            _create_minimal_execution_tree(
+                repo_root,
+                dep_spec_id="dynamics_shallow_water_flux_2d_rusanov_p0",
+                model_text=model_text,
+                runner_text=runner_text,
+                run_command=["./simulate", "workspace/case.resolved.yaml", "workspace/outdir"],
+            )
+
+            violations = validate(
+                repo_root=repo_root,
+                workspace_root="workspace",
+                require_orchestration=True,
+            )
+            self.assertTrue(
+                any("orchestrations" in v and "missing" in v for v in violations)
+            )
+
+    def test_passes_with_orchestration_when_required(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            model_text = """module shallow_water2d_model
+use dynamics_shallow_water_flux_2d_rusanov_p0_model
+implicit none
+contains
+subroutine solve(flag)
+  logical, intent(out) :: flag
+  call dynamics_shallow_water_flux_2d_rusanov_p0__compute_flux(flag)
+end subroutine solve
+end module shallow_water2d_model
+"""
+            runner_text = """program shallow_water2d_runner
+implicit none
+write(*,*) 'ok'
+end program shallow_water2d_runner
+"""
+            _create_minimal_execution_tree(
+                repo_root,
+                dep_spec_id="dynamics_shallow_water_flux_2d_rusanov_p0",
+                model_text=model_text,
+                runner_text=runner_text,
+                run_command=["./simulate", "workspace/case.resolved.yaml", "workspace/outdir"],
+            )
+            _create_minimal_orchestration_tree(repo_root)
+
+            violations = validate(
+                repo_root=repo_root,
+                workspace_root="workspace",
+                require_orchestration=True,
+            )
+            self.assertEqual([], violations)
+
+    def test_detects_non_isolated_step_context_when_required(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            model_text = """module shallow_water2d_model
+use dynamics_shallow_water_flux_2d_rusanov_p0_model
+implicit none
+contains
+subroutine solve(flag)
+  logical, intent(out) :: flag
+  call dynamics_shallow_water_flux_2d_rusanov_p0__compute_flux(flag)
+end subroutine solve
+end module shallow_water2d_model
+"""
+            runner_text = """program shallow_water2d_runner
+implicit none
+write(*,*) 'ok'
+end program shallow_water2d_runner
+"""
+            _create_minimal_execution_tree(
+                repo_root,
+                dep_spec_id="dynamics_shallow_water_flux_2d_rusanov_p0",
+                model_text=model_text,
+                runner_text=runner_text,
+                run_command=["./simulate", "workspace/case.resolved.yaml", "workspace/outdir"],
+            )
+            _create_minimal_orchestration_tree(repo_root)
+
+            runs_path = (
+                repo_root
+                / "workspace"
+                / "orchestrations"
+                / "orch_test_001"
+                / "agent_runs.jsonl"
+            )
+            lines = [line for line in runs_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+            items = [json.loads(line) for line in lines]
+            for item in items:
+                if item.get("agent_run_id") == "step_run_build_001":
+                    item["context_isolated"] = False
+                    break
+            runs_path.write_text(
+                "\n".join(json.dumps(item, ensure_ascii=False) for item in items) + "\n",
+                encoding="utf-8",
+            )
+
+            violations = validate(
+                repo_root=repo_root,
+                workspace_root="workspace",
+                require_orchestration=True,
+            )
+            self.assertTrue(
+                any("context_isolated must be true for step" in v for v in violations)
             )
 
 

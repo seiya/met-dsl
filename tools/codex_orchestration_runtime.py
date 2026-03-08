@@ -1,0 +1,414 @@
+#!/usr/bin/env python3
+"""Helpers for Codex workflow orchestration artifacts."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import subprocess
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Callable
+
+
+TERMINAL_STATUSES = {"pass", "fail", "blocked", "timeout", "cancel"}
+
+
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _read_json(path: Path) -> Any:
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _write_json(path: Path, payload: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+
+def _orchestration_root(repo_root: Path, orchestration_id: str) -> Path:
+    return repo_root / "workspace" / "orchestrations" / orchestration_id
+
+
+def _launch_refs(orchestration_id: str, agent_run_id: str) -> tuple[str, str]:
+    prefix = f"workspace/orchestrations/{orchestration_id}/launches/{agent_run_id}"
+    return f"{prefix}.request.json", f"{prefix}.response.json"
+
+
+def _node_key_to_safe(node_key: str) -> str:
+    token = node_key.strip()
+    if "/" not in token or "@" not in token:
+        raise ValueError(f"invalid node_key: {node_key}")
+    spec_kind, tail = token.split("/", 1)
+    spec_id, spec_version = tail.rsplit("@", 1)
+    spec_kind = spec_kind.strip()
+    spec_id = spec_id.strip()
+    spec_version = spec_version.strip()
+    if not spec_kind or not spec_id or not spec_version:
+        raise ValueError(f"invalid node_key: {node_key}")
+    return f"{spec_kind}__{spec_id}__{spec_version}"
+
+
+def parse_feature_list(raw: str) -> dict[str, bool]:
+    features: dict[str, bool] = {}
+    for line in raw.splitlines():
+        parts = line.strip().split()
+        if len(parts) < 3:
+            continue
+        enabled = parts[-1].lower()
+        if enabled not in {"true", "false"}:
+            continue
+        feature_name = parts[0].strip()
+        if feature_name:
+            features[feature_name] = enabled == "true"
+    return features
+
+
+def probe_codex_cli(
+    codex_command: str = "codex",
+    runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
+) -> dict[str, Any]:
+    version_proc = runner(
+        [codex_command, "--version"],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    features_proc = runner(
+        [codex_command, "features", "list"],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    codex_available = version_proc.returncode == 0 and features_proc.returncode == 0
+    features = parse_feature_list(features_proc.stdout) if features_proc.returncode == 0 else {}
+    multi_agent_enabled = features.get("multi_agent") is True
+
+    checks = [
+        {
+            "name": "codex_version_available",
+            "pass": version_proc.returncode == 0,
+            "detail": version_proc.stdout.strip() or version_proc.stderr.strip(),
+        },
+        {
+            "name": "codex_features_available",
+            "pass": features_proc.returncode == 0,
+            "detail": features_proc.stdout.strip() or features_proc.stderr.strip(),
+        },
+        {
+            "name": "multi_agent_enabled",
+            "pass": multi_agent_enabled,
+            "detail": f"multi_agent={features.get('multi_agent')}",
+        },
+    ]
+
+    can_launch_agents = codex_available and multi_agent_enabled
+    return {
+        "checked_at": _utc_now_iso(),
+        "codex_command": codex_command,
+        "codex_version": version_proc.stdout.strip(),
+        "feature_states": features,
+        "checks": checks,
+        "can_launch_step_agents": can_launch_agents,
+        "can_launch_substep_agents": can_launch_agents,
+        "status": "pass" if can_launch_agents else "fail",
+    }
+
+
+def init_orchestration(
+    repo_root: Path,
+    orchestration_id: str,
+    *,
+    spec_ref: str | None = None,
+    dependency_ref: str | None = None,
+    status: str = "running",
+) -> dict[str, Any]:
+    root = _orchestration_root(repo_root, orchestration_id)
+    root.mkdir(parents=True, exist_ok=True)
+    (root / "launches").mkdir(parents=True, exist_ok=True)
+    (root / "steps").mkdir(parents=True, exist_ok=True)
+
+    meta = {
+        "orchestration_id": orchestration_id,
+        "status": status,
+        "started_at": _utc_now_iso(),
+    }
+    if spec_ref:
+        meta["spec_ref"] = spec_ref
+    if dependency_ref:
+        meta["dependency_ref"] = dependency_ref
+    _write_json(root / "orchestration_meta.json", meta)
+
+    graph_path = root / "agent_graph.json"
+    if not graph_path.exists():
+        _write_json(graph_path, {"edges": []})
+
+    runs_path = root / "agent_runs.jsonl"
+    if not runs_path.exists():
+        runs_path.write_text("", encoding="utf-8")
+
+    return meta
+
+
+def write_preflight(repo_root: Path, orchestration_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+    root = _orchestration_root(repo_root, orchestration_id)
+    root.mkdir(parents=True, exist_ok=True)
+    _write_json(root / "preflight.json", payload)
+    return payload
+
+
+def _load_graph(graph_path: Path) -> dict[str, Any]:
+    if graph_path.exists():
+        graph = _read_json(graph_path)
+        if isinstance(graph, dict) and isinstance(graph.get("edges"), list):
+            return graph
+    return {"edges": []}
+
+
+def record_launch(
+    repo_root: Path,
+    orchestration_id: str,
+    *,
+    parent_agent_run_id: str,
+    child_agent_run_id: str,
+    request_payload: dict[str, Any],
+    response_payload: dict[str, Any],
+    relation_type: str = "launch",
+) -> dict[str, str]:
+    root = _orchestration_root(repo_root, orchestration_id)
+    launches_root = root / "launches"
+    launches_root.mkdir(parents=True, exist_ok=True)
+
+    request_path = launches_root / f"{child_agent_run_id}.request.json"
+    response_path = launches_root / f"{child_agent_run_id}.response.json"
+    _write_json(request_path, request_payload)
+    _write_json(response_path, response_payload)
+
+    graph_path = root / "agent_graph.json"
+    graph = _load_graph(graph_path)
+    edge = {
+        "parent_agent_run_id": parent_agent_run_id,
+        "child_agent_run_id": child_agent_run_id,
+        "relation_type": relation_type,
+    }
+    if edge not in graph["edges"]:
+        graph["edges"].append(edge)
+    _write_json(graph_path, graph)
+
+    request_ref, response_ref = _launch_refs(orchestration_id, child_agent_run_id)
+    return {
+        "launch_request_ref": request_ref,
+        "launch_response_ref": response_ref,
+    }
+
+
+def _read_existing_run_ids(path: Path) -> set[str]:
+    if not path.exists():
+        return set()
+    run_ids: set[str] = set()
+    for raw in path.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        item = json.loads(line)
+        run_id = item.get("agent_run_id")
+        if isinstance(run_id, str) and run_id.strip():
+            run_ids.add(run_id.strip())
+    return run_ids
+
+
+def record_agent_run(
+    repo_root: Path,
+    orchestration_id: str,
+    payload: dict[str, Any],
+) -> dict[str, Any]:
+    root = _orchestration_root(repo_root, orchestration_id)
+    root.mkdir(parents=True, exist_ok=True)
+    runs_path = root / "agent_runs.jsonl"
+
+    agent_run_id = payload.get("agent_run_id")
+    if not isinstance(agent_run_id, str) or not agent_run_id.strip():
+        raise ValueError("agent_run_id must be non-empty string")
+    agent_run_id = agent_run_id.strip()
+
+    role = payload.get("agent_role") or payload.get("agent_type") or payload.get("role")
+    role_token = role.strip().lower() if isinstance(role, str) and role.strip() else None
+    if role_token is None:
+        raise ValueError("agent_role must be non-empty string")
+
+    existing = _read_existing_run_ids(runs_path)
+    if agent_run_id in existing:
+        raise ValueError(f"duplicate agent_run_id: {agent_run_id}")
+
+    payload = dict(payload)
+    payload["agent_run_id"] = agent_run_id
+    payload["agent_role"] = role_token
+    payload.setdefault("started_at", _utc_now_iso())
+
+    status = payload.get("status")
+    if isinstance(status, str) and status.strip().lower() in TERMINAL_STATUSES:
+        payload.setdefault("finished_at", _utc_now_iso())
+
+    if role_token in {"step", "substep"}:
+        payload.setdefault("context_isolated", True)
+        request_ref, response_ref = _launch_refs(orchestration_id, agent_run_id)
+        payload.setdefault("launch_request_ref", request_ref)
+        payload.setdefault("launch_response_ref", response_ref)
+
+    with runs_path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
+
+    return payload
+
+
+def write_step_result(
+    repo_root: Path,
+    orchestration_id: str,
+    *,
+    node_key: str,
+    step: str,
+    agent_run_id: str,
+    payload: dict[str, Any],
+) -> dict[str, Any]:
+    node_safe = _node_key_to_safe(node_key)
+    step_token = step.strip().lower()
+    root = _orchestration_root(repo_root, orchestration_id)
+    result_path = root / "steps" / node_safe / step_token / agent_run_id / "step_result.json"
+
+    result = dict(payload)
+    result.setdefault("executor_agent_run_id", agent_run_id)
+    result.setdefault("required_outputs", [])
+    result.setdefault("failed_substeps", [])
+
+    _write_json(result_path, result)
+    return result
+
+
+def update_orchestration_status(
+    repo_root: Path,
+    orchestration_id: str,
+    *,
+    status: str,
+) -> dict[str, Any]:
+    meta_path = _orchestration_root(repo_root, orchestration_id) / "orchestration_meta.json"
+    if not meta_path.exists():
+        raise FileNotFoundError(meta_path)
+    meta = _read_json(meta_path)
+    if not isinstance(meta, dict):
+        raise ValueError(f"invalid orchestration_meta.json: {meta_path}")
+    meta["status"] = status
+    if status in TERMINAL_STATUSES:
+        meta["finished_at"] = _utc_now_iso()
+    _write_json(meta_path, meta)
+    return meta
+
+
+def _json_arg(raw: str) -> dict[str, Any]:
+    value = json.loads(raw)
+    if not isinstance(value, dict):
+        raise argparse.ArgumentTypeError("json payload must be object")
+    return value
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser()
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    init_parser = subparsers.add_parser("init")
+    init_parser.add_argument("--repo-root", required=True)
+    init_parser.add_argument("--orchestration-id", required=True)
+    init_parser.add_argument("--spec-ref")
+    init_parser.add_argument("--dependency-ref")
+    init_parser.add_argument("--status", default="running")
+
+    preflight_parser = subparsers.add_parser("preflight")
+    preflight_parser.add_argument("--repo-root", required=True)
+    preflight_parser.add_argument("--orchestration-id", required=True)
+    preflight_parser.add_argument("--codex-command", default="codex")
+
+    launch_parser = subparsers.add_parser("record-launch")
+    launch_parser.add_argument("--repo-root", required=True)
+    launch_parser.add_argument("--orchestration-id", required=True)
+    launch_parser.add_argument("--parent-agent-run-id", required=True)
+    launch_parser.add_argument("--child-agent-run-id", required=True)
+    launch_parser.add_argument("--request-json", required=True, type=_json_arg)
+    launch_parser.add_argument("--response-json", required=True, type=_json_arg)
+    launch_parser.add_argument("--relation-type", default="launch")
+
+    run_parser = subparsers.add_parser("record-agent-run")
+    run_parser.add_argument("--repo-root", required=True)
+    run_parser.add_argument("--orchestration-id", required=True)
+    run_parser.add_argument("--agent-run-json", required=True, type=_json_arg)
+
+    step_parser = subparsers.add_parser("write-step-result")
+    step_parser.add_argument("--repo-root", required=True)
+    step_parser.add_argument("--orchestration-id", required=True)
+    step_parser.add_argument("--node-key", required=True)
+    step_parser.add_argument("--step", required=True)
+    step_parser.add_argument("--agent-run-id", required=True)
+    step_parser.add_argument("--result-json", required=True, type=_json_arg)
+
+    status_parser = subparsers.add_parser("set-status")
+    status_parser.add_argument("--repo-root", required=True)
+    status_parser.add_argument("--orchestration-id", required=True)
+    status_parser.add_argument("--status", required=True)
+
+    args = parser.parse_args(argv)
+    repo_root = Path(getattr(args, "repo_root")).resolve()
+
+    if args.command == "init":
+        result = init_orchestration(
+            repo_root=repo_root,
+            orchestration_id=args.orchestration_id,
+            spec_ref=args.spec_ref,
+            dependency_ref=args.dependency_ref,
+            status=args.status,
+        )
+    elif args.command == "preflight":
+        result = write_preflight(
+            repo_root=repo_root,
+            orchestration_id=args.orchestration_id,
+            payload=probe_codex_cli(codex_command=args.codex_command),
+        )
+    elif args.command == "record-launch":
+        result = record_launch(
+            repo_root=repo_root,
+            orchestration_id=args.orchestration_id,
+            parent_agent_run_id=args.parent_agent_run_id,
+            child_agent_run_id=args.child_agent_run_id,
+            request_payload=args.request_json,
+            response_payload=args.response_json,
+            relation_type=args.relation_type,
+        )
+    elif args.command == "record-agent-run":
+        result = record_agent_run(
+            repo_root=repo_root,
+            orchestration_id=args.orchestration_id,
+            payload=args.agent_run_json,
+        )
+    elif args.command == "write-step-result":
+        result = write_step_result(
+            repo_root=repo_root,
+            orchestration_id=args.orchestration_id,
+            node_key=args.node_key,
+            step=args.step,
+            agent_run_id=args.agent_run_id,
+            payload=args.result_json,
+        )
+    else:
+        result = update_orchestration_status(
+            repo_root=repo_root,
+            orchestration_id=args.orchestration_id,
+            status=args.status,
+        )
+
+    json.dump(result, sys.stdout, ensure_ascii=False, indent=2)
+    sys.stdout.write("\n")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

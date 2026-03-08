@@ -157,6 +157,16 @@ class ValidateWorkspaceRootTests(unittest.TestCase):
                 any("non-canonical workspace directory name" in v for v in violations)
             )
 
+    def test_allows_orchestrations_top_level_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            orchestration_dir = repo_root / "workspace" / "orchestrations" / "orch_001"
+            orchestration_dir.mkdir(parents=True, exist_ok=True)
+            violations, _ = validate(repo_root=repo_root, workspace_root="workspace")
+            self.assertFalse(
+                any("non-canonical workspace directory name" in v for v in violations)
+            )
+
     def test_detects_invalid_node_key_safe_directory_name(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)

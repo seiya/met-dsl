@@ -18,10 +18,15 @@
 - **derived_contract.json**: `Plan verify` が導出する検証契約。`io_contract.inputs` / `io_contract.outputs` と `semantic_dependency.required_sources` と `raw_requirements.required_evidence` と `test_evidence_requirements` を保持し、`Generate verify` と `Execute` / `Judge` の判定正本として使用する。
 - **expected_node_set**: `deps.yaml` と `spec_catalog.yaml` から再構成した期待 `node` 集合。`dependency.resolved.yaml` の網羅検証に使用する。
 - **node workflow**: 単一 `node_key` を対象にした `Plan -> Generate -> Build -> Execute -> Judge` の 1 系列実行。
+- **orchestration agent**: `workflow` 全体の進行制御を担当する統括エージェント。`step` / `substep` 起動、依存順序管理、状態集約を担当し、工程成果物を直接生成しない。`substep` を持つ工程では `substep agent` を直接管理し、`step_result.json` を集約する。
+- **step agent**: 単一 `node` の単一 `step` を担当するエージェント。標準 `substep` を持たない工程の成果物生成と検証を担当する。
+- **substep agent**: 単一 `substep` を担当するエージェント。入力契約に従って成果物を生成し、`orchestration agent` へ返却する。
 - **node_key_safe**: `node_key` の保存用表記。推奨形式は `<spec_kind>__<spec_id>__<spec_version>`。
+- **orchestration_id**: 1 回の `workflow` 実行全体を識別する `ID`。`workspace/orchestrations/<orchestration_id>/` の保存キーとして使用する。
 - **plan_id**: `node` 単位で `case.resolved.yaml` と `impl.resolved.yaml` と `dependency.resolved.yaml` の組を識別する `ID`。推奨形式は `<node_key_safe>_<case_hash12>_<impl_hash12>`。
 - **pipeline_id**: `node` 単位の `Generate -> Build -> Execute` 系列を識別する `ID`。推奨形式は `<plan_id>_<utc_ts>_<seq3>`。
 - **generation_id / build_id / execution_id**: 各段階の試行を識別する `ID`。
+- **agent_run_id**: `step agent` / `substep agent` / `orchestration agent` の 1 回の実行を識別する `ID`。`parent_agent_run_id` と組で親子関係を表す。
 - **node_key**: 実行 / 判定対象 `node` の識別子。形式は `<spec_kind>/<spec_id>@<spec_version>` とする。
 - **topo_level**: 依存 `DAG` におけるトポロジカル階層。小さい値ほど下層 `node` を表す。
 - **release_id**: 各 `spec` の正式版実装を識別する `ID`。推奨形式は `<spec_version>_<utc_ts>_<seq3>`。
@@ -29,6 +34,12 @@
 - **release artifact root**: 正式版成果物の保存ルート。`releases/<spec_kind>/<domain>/<family>/<spec_id>/<target_architecture>/<toolchain_language>/<release_id>/` を正本とする。
 - **official_releases**: `spec_catalog.yaml` に保持する正式版実装の登録配列。`target_architecture`、`toolchain_language`、`target_backend`、`source_pipeline_id`、`source_generation_id`、`source_build_id`、`source_execution_id`、`artifact_root`、`promoted_at`、`status` を持つ。
 - **lineage.json**: `spec_ref`、`plan_ref`、`pipeline_id`、各段階 `ID` の関係を記録する来歴ファイル。
+- **orchestration_meta.json**: `orchestration` 実行メタデータ。`orchestration_id`、対象 `spec_ref`、`dependency_ref`、開始時刻、実行状態を記録する。
+- **agent_graph.json**: `orchestration` における `agent` 親子関係。`parent_agent_run_id` と `child_agent_run_id` と `relation_type` を記録する。
+- **context_id**: `LLM` 実行コンテキスト識別子。`step agent` / `substep agent` ごとに固有値を持ち、同一 `orchestration_id` 内で重複を禁止する。
+- **context_isolated**: `step agent` / `substep agent` が独立コンテキストで実行されたことを示す真偽値。`true` を必須とする。
+- **agent_runs.jsonl**: `agent` 実行イベントの時系列ログ。`agent_run_id`、`parent_agent_run_id`、`agent_role`、`status`、`started_at`、`finished_at`、`agent_backend`、`agent_model`、`context_id`、`context_isolated` を記録する。
+- **step_result.json**: 工程集約結果。`status`、`required_outputs`、`failed_substeps`、`executor_agent_run_id`、`substep_agent_run_ids` を記録する。`substep` を持つ工程では `executor_agent_run_id` は `orchestration agent_run_id`、標準 `substep` を持たない工程では `step agent_run_id` とする。`substep_agent_run_ids` は `substep` を持たない工程で空配列を許可する。
 - **model**: 物理計算を実行する計算コンポーネント / ライブラリ。入力状態から次状態を計算する責務を持つ。
 - **runner（例: `simulate`）**: 実行エントリポイント。入力読込・`model` 呼び出し・`diagnostics` / `perf` 出力を担当する。
 - **`<stage>_meta.json`**: `LLM` 利用ステージの実行メタデータ。`attempt_count`、`verification_status`、`last_fail_reason`、`context_isolated`、`debug_mode` を保持する。`context_isolated=false` では `constraint_reason` を必須とする。`debug_mode=true` で失敗試行を保存した場合は `retained_failed_attempts` と保存先を保持する。

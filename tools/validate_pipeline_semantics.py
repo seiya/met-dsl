@@ -72,6 +72,9 @@ FORBIDDEN_QUALITY_CHECK_EXECUTABLES = {"python", "python3", "pypy", "bash", "sh"
 TEST_ID_HEADING_PATTERN = re.compile(r"^###\s+\d+-\d+\.\s+`([^`]+)`\s*$")
 TEST_OUTCOME_VALUES = {"pass", "fail", "xfail", "skipped", "blocked"}
 SHAPE_EXPR_PATTERN = re.compile(r"^\[\s*([^\]]+?)\s*\]$")
+REQUIRED_WORKFLOW_STEPS = ("plan", "generate", "build", "execute", "judge")
+SUBSTEP_WORKFLOW_STEPS = frozenset({"plan", "generate", "tune"})
+AGENT_TERMINAL_STATUSES = {"pass", "fail", "blocked", "timeout", "cancel"}
 
 
 def _normalize_workspace_root_token(workspace_root: str) -> str:
@@ -91,6 +94,28 @@ def _normalize_node_key_token(raw: str) -> str:
     if not kind.strip() or not spec_id:
         return token
     return f"{kind.strip()}/{spec_id}"
+
+
+def _node_key_to_safe(node_key: str) -> str | None:
+    token = node_key.strip()
+    if "/" not in token or "@" not in token:
+        return None
+    spec_kind, tail = token.split("/", 1)
+    spec_id, spec_version = tail.rsplit("@", 1)
+    spec_kind = spec_kind.strip()
+    spec_id = spec_id.strip()
+    spec_version = spec_version.strip()
+    if not spec_kind or not spec_id or not spec_version:
+        return None
+    return f"{spec_kind}__{spec_id}__{spec_version}"
+
+
+def _agent_role(item: dict[str, Any]) -> str | None:
+    for key in ("agent_role", "agent_type", "role"):
+        raw = item.get(key)
+        if isinstance(raw, str) and raw.strip():
+            return raw.strip().lower()
+    return None
 
 
 def _split_fortran_names(raw: str) -> list[str]:
@@ -2496,11 +2521,421 @@ def _resolve_pipeline_roots(
     return roots
 
 
+def _validate_orchestration_hierarchy(
+    workspace_path: Path,
+    executions: list[NodeExecution],
+    violations: list[str],
+) -> None:
+    orchestrations_root = workspace_path / "orchestrations"
+    if not orchestrations_root.exists() or not orchestrations_root.is_dir():
+        violations.append(
+            f"{orchestrations_root}: missing; workflow must start with orchestration agent"
+        )
+        return
+
+    orchestration_dirs = sorted(
+        path for path in orchestrations_root.iterdir() if path.is_dir()
+    )
+    if not orchestration_dirs:
+        violations.append(
+            f"{orchestrations_root}: no orchestration run found"
+        )
+        return
+
+    node_safes = sorted({execution.pipeline_dir.parent.name for execution in executions})
+    step_coverage = {
+        (node_safe, step): False
+        for node_safe in node_safes
+        for step in REQUIRED_WORKFLOW_STEPS
+    }
+    has_orchestration_role = False
+    has_step_role = False
+    has_substep_role = False
+
+    for orchestration_dir in orchestration_dirs:
+        meta_path = orchestration_dir / "orchestration_meta.json"
+        graph_path = orchestration_dir / "agent_graph.json"
+        runs_path = orchestration_dir / "agent_runs.jsonl"
+        preflight_path = orchestration_dir / "preflight.json"
+        graph_edges: list[tuple[int, str, str]] = []
+        run_records: dict[str, dict[str, Any]] = {}
+        run_roles: dict[str, str] = {}
+        seen_context_ids: dict[str, str] = {}
+        for required in (meta_path, graph_path, runs_path, preflight_path):
+            if not required.exists():
+                violations.append(f"{required}: missing")
+
+        if preflight_path.exists():
+            try:
+                preflight = _read_json(preflight_path)
+            except json.JSONDecodeError:
+                violations.append(f"{preflight_path}: invalid json")
+            else:
+                if not isinstance(preflight, dict):
+                    violations.append(f"{preflight_path}: must be json object")
+                else:
+                    if preflight.get("can_launch_step_agents") is not True:
+                        violations.append(
+                            f"{preflight_path}:can_launch_step_agents must be true"
+                        )
+                    if preflight.get("can_launch_substep_agents") is not True:
+                        violations.append(
+                            f"{preflight_path}:can_launch_substep_agents must be true"
+                        )
+
+        if meta_path.exists():
+            try:
+                meta = _read_json(meta_path)
+            except json.JSONDecodeError:
+                violations.append(f"{meta_path}: invalid json")
+            else:
+                if not isinstance(meta, dict):
+                    violations.append(f"{meta_path}: must be json object")
+                else:
+                    orchestration_id = meta.get("orchestration_id")
+                    if not isinstance(orchestration_id, str) or not orchestration_id.strip():
+                        violations.append(
+                            f"{meta_path}:orchestration_id must be non-empty string"
+                        )
+
+        if graph_path.exists():
+            try:
+                graph = _read_json(graph_path)
+            except json.JSONDecodeError:
+                violations.append(f"{graph_path}: invalid json")
+            else:
+                if not isinstance(graph, dict):
+                    violations.append(f"{graph_path}: must be json object")
+                else:
+                    edges = graph.get("edges")
+                    if not isinstance(edges, list) or not edges:
+                        violations.append(f"{graph_path}:edges must be non-empty list")
+                    else:
+                        for idx, edge in enumerate(edges):
+                            if not isinstance(edge, dict):
+                                violations.append(f"{graph_path}:edges[{idx}] must be object")
+                                continue
+                            parent = edge.get("parent_agent_run_id")
+                            child = edge.get("child_agent_run_id")
+                            relation = edge.get("relation_type")
+                            if not isinstance(parent, str) or not parent.strip():
+                                violations.append(
+                                    f"{graph_path}:edges[{idx}].parent_agent_run_id must be non-empty string"
+                                )
+                            if not isinstance(child, str) or not child.strip():
+                                violations.append(
+                                    f"{graph_path}:edges[{idx}].child_agent_run_id must be non-empty string"
+                                )
+                            if not isinstance(relation, str) or not relation.strip():
+                                violations.append(
+                                    f"{graph_path}:edges[{idx}].relation_type must be non-empty string"
+                                )
+                            if (
+                                isinstance(parent, str)
+                                and parent.strip()
+                                and isinstance(child, str)
+                                and child.strip()
+                            ):
+                                graph_edges.append((idx, parent.strip(), child.strip()))
+
+        if runs_path.exists():
+            lines = [line.strip() for line in runs_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+            if not lines:
+                violations.append(f"{runs_path}: must be non-empty jsonl")
+            for idx, line in enumerate(lines):
+                try:
+                    item = json.loads(line)
+                except json.JSONDecodeError:
+                    violations.append(f"{runs_path}:line {idx + 1} invalid json")
+                    continue
+                if not isinstance(item, dict):
+                    violations.append(f"{runs_path}:line {idx + 1} must be json object")
+                    continue
+                run_id = item.get("agent_run_id")
+                status = item.get("status")
+                if not isinstance(run_id, str) or not run_id.strip():
+                    violations.append(f"{runs_path}:line {idx + 1} missing agent_run_id")
+                    continue
+                run_id = run_id.strip()
+                if run_id in run_records:
+                    violations.append(
+                        f"{runs_path}:line {idx + 1} duplicate agent_run_id ({run_id})"
+                    )
+                    continue
+                if not isinstance(status, str) or not status.strip():
+                    violations.append(f"{runs_path}:line {idx + 1} missing status")
+                    continue
+                status = status.strip().lower()
+                started_at = item.get("started_at")
+                if not isinstance(started_at, str) or not started_at.strip():
+                    violations.append(f"{runs_path}:line {idx + 1} missing started_at")
+                if status in AGENT_TERMINAL_STATUSES:
+                    finished_at = item.get("finished_at")
+                    if not isinstance(finished_at, str) or not finished_at.strip():
+                        violations.append(
+                            f"{runs_path}:line {idx + 1} terminal status requires finished_at"
+                        )
+
+                role_l = _agent_role(item)
+                if role_l is None:
+                    violations.append(f"{runs_path}:line {idx + 1} missing agent role")
+                    continue
+                run_records[run_id] = item
+                run_roles[run_id] = role_l
+
+                if role_l == "orchestration":
+                    has_orchestration_role = True
+                elif role_l == "step":
+                    has_step_role = True
+                elif role_l == "substep":
+                    has_substep_role = True
+
+                if role_l in {"step", "substep"}:
+                    parent = item.get("parent_agent_run_id")
+                    if not isinstance(parent, str) or not parent.strip():
+                        violations.append(
+                            f"{runs_path}:line {idx + 1} missing parent_agent_run_id for {role_l}"
+                        )
+                    backend = item.get("agent_backend")
+                    if not isinstance(backend, str) or not backend.strip():
+                        violations.append(
+                            f"{runs_path}:line {idx + 1} missing agent_backend for {role_l}"
+                        )
+                    model = item.get("agent_model")
+                    if not isinstance(model, str) or not model.strip():
+                        violations.append(
+                            f"{runs_path}:line {idx + 1} missing agent_model for {role_l}"
+                        )
+                    context_id = item.get("context_id")
+                    if not isinstance(context_id, str) or not context_id.strip():
+                        violations.append(
+                            f"{runs_path}:line {idx + 1} missing context_id for {role_l}"
+                        )
+                    else:
+                        context_token = context_id.strip()
+                        previous = seen_context_ids.get(context_token)
+                        if previous is not None and previous != run_id:
+                            violations.append(
+                                f"{runs_path}:line {idx + 1} context_id must be unique across step/substep ({context_token})"
+                            )
+                        else:
+                            seen_context_ids[context_token] = run_id
+                    context_isolated = item.get("context_isolated")
+                    if context_isolated is not True:
+                        violations.append(
+                            f"{runs_path}:line {idx + 1} context_isolated must be true for {role_l}"
+                        )
+                    agent_session_id = item.get("agent_session_id")
+                    if not isinstance(agent_session_id, str) or not agent_session_id.strip():
+                        violations.append(
+                            f"{runs_path}:line {idx + 1} missing agent_session_id for {role_l}"
+                        )
+
+                    expected_launch_prefix = (
+                        f"workspace/orchestrations/{orchestration_dir.name}/launches/"
+                    )
+                    for key in ("launch_request_ref", "launch_response_ref"):
+                        launch_ref = item.get(key)
+                        if not isinstance(launch_ref, str) or not launch_ref.strip():
+                            violations.append(
+                                f"{runs_path}:line {idx + 1} missing {key} for {role_l}"
+                            )
+                            continue
+                        ref_token = launch_ref.strip()
+                        if not ref_token.startswith(expected_launch_prefix):
+                            violations.append(
+                                f"{runs_path}:line {idx + 1} {key} must start with {expected_launch_prefix} ({ref_token})"
+                            )
+                            continue
+                        launch_path = workspace_path.parent / ref_token
+                        if not launch_path.exists():
+                            violations.append(
+                                f"{runs_path}:line {idx + 1} {key} target not found ({ref_token})"
+                            )
+
+        for edge_idx, parent_id, child_id in graph_edges:
+            parent_role = run_roles.get(parent_id)
+            child_role = run_roles.get(child_id)
+            if parent_role is None:
+                violations.append(
+                    f"{graph_path}:edges[{edge_idx}] parent_agent_run_id not found in agent_runs.jsonl ({parent_id})"
+                )
+                continue
+            if child_role is None:
+                violations.append(
+                    f"{graph_path}:edges[{edge_idx}] child_agent_run_id not found in agent_runs.jsonl ({child_id})"
+                )
+                continue
+            if parent_role == "orchestration" and child_role not in {"step", "substep"}:
+                violations.append(
+                    f"{graph_path}:edges[{edge_idx}] orchestration parent must connect to step or substep child"
+                )
+            if parent_role == "step" and child_role != "substep":
+                violations.append(
+                    f"{graph_path}:edges[{edge_idx}] step parent must connect to substep child"
+                )
+            if parent_role == "substep":
+                violations.append(
+                    f"{graph_path}:edges[{edge_idx}] substep must not be parent role"
+                )
+
+        for run_id, role_l in run_roles.items():
+            item = run_records[run_id]
+            parent = item.get("parent_agent_run_id")
+            if role_l == "step":
+                if not isinstance(parent, str) or not parent.strip():
+                    continue
+                parent_role = run_roles.get(parent.strip())
+                if parent_role not in {None, "orchestration"}:
+                    violations.append(
+                        f"{runs_path}:agent_run_id={run_id} step parent must be orchestration role"
+                    )
+            if role_l == "substep":
+                if not isinstance(parent, str) or not parent.strip():
+                    continue
+                parent_role = run_roles.get(parent.strip())
+                if parent_role not in {None, "step", "orchestration"}:
+                    violations.append(
+                        f"{runs_path}:agent_run_id={run_id} substep parent must be orchestration or step role"
+                    )
+
+        steps_root = orchestration_dir / "steps"
+        if not steps_root.exists() or not steps_root.is_dir():
+            violations.append(f"{steps_root}: missing")
+            continue
+
+        for node_safe in node_safes:
+            for step in REQUIRED_WORKFLOW_STEPS:
+                step_dir = steps_root / node_safe / step
+                if not step_dir.exists() or not step_dir.is_dir():
+                    continue
+                result_files = sorted(step_dir.glob("*/step_result.json"))
+                if result_files:
+                    step_coverage[(node_safe, step)] = True
+                    for result_path in result_files:
+                        executor_run_id = result_path.parent.name
+                        executor_role = run_roles.get(executor_run_id)
+                        if executor_role is None:
+                            violations.append(
+                                f"{result_path}: parent directory must match existing executor agent_run_id ({executor_run_id})"
+                            )
+                        elif step in SUBSTEP_WORKFLOW_STEPS and executor_role not in {"orchestration", "step"}:
+                            violations.append(
+                                f"{result_path}: parent directory must be orchestration or step role agent_run_id ({executor_run_id})"
+                            )
+                        elif step not in SUBSTEP_WORKFLOW_STEPS and executor_role != "step":
+                            violations.append(
+                                f"{result_path}: parent directory must be step role agent_run_id ({executor_run_id})"
+                            )
+                        step_run_record = run_records.get(executor_run_id, {})
+                        run_step = step_run_record.get("step")
+                        if executor_role == "step" and isinstance(run_step, str) and run_step.strip().lower() != step:
+                            violations.append(
+                                f"{result_path}: step directory name ({step}) does not match agent_runs step field ({run_step})"
+                            )
+                        run_node_key = step_run_record.get("node_key")
+                        if isinstance(run_node_key, str) and run_node_key.strip():
+                            run_node_safe = _node_key_to_safe(run_node_key)
+                            if run_node_safe is not None and run_node_safe != node_safe:
+                                violations.append(
+                                    f"{result_path}: node_key mismatch between step_result path ({node_safe}) and agent_runs ({run_node_key})"
+                                )
+                        try:
+                            result_data = _read_json(result_path)
+                        except json.JSONDecodeError:
+                            violations.append(f"{result_path}: invalid json")
+                            continue
+                        if not isinstance(result_data, dict):
+                            violations.append(f"{result_path}: must be json object")
+                            continue
+                        required_outputs = result_data.get("required_outputs")
+                        failed_substeps = result_data.get("failed_substeps")
+                        if not isinstance(required_outputs, list):
+                            violations.append(
+                                f"{result_path}:required_outputs must be list"
+                            )
+                        if not isinstance(failed_substeps, list):
+                            violations.append(
+                                f"{result_path}:failed_substeps must be list"
+                            )
+                        executor = result_data.get("executor_agent_run_id")
+                        if not isinstance(executor, str) or not executor.strip():
+                            violations.append(
+                                f"{result_path}:executor_agent_run_id must be non-empty string"
+                            )
+                        elif executor.strip() != executor_run_id:
+                            violations.append(
+                                f"{result_path}:executor_agent_run_id must match step_result directory agent_run_id"
+                            )
+                        substep_run_ids = result_data.get("substep_agent_run_ids")
+                        if not isinstance(substep_run_ids, list):
+                            violations.append(
+                                f"{result_path}:substep_agent_run_ids must be list"
+                            )
+                        elif step in SUBSTEP_WORKFLOW_STEPS and not substep_run_ids:
+                            violations.append(
+                                f"{result_path}:substep_agent_run_ids must be non-empty list for {step}"
+                            )
+                        else:
+                            for sub_idx, sub_id in enumerate(substep_run_ids):
+                                if not isinstance(sub_id, str) or not sub_id.strip():
+                                    violations.append(
+                                        f"{result_path}:substep_agent_run_ids[{sub_idx}] must be non-empty string"
+                                    )
+                                    continue
+                                sub_item = run_records.get(sub_id.strip())
+                                sub_role = run_roles.get(sub_id.strip())
+                                if sub_role != "substep":
+                                    violations.append(
+                                        f"{result_path}:substep_agent_run_ids[{sub_idx}] must reference substep role run"
+                                    )
+                                    continue
+                                parent = sub_item.get("parent_agent_run_id")
+                                if not isinstance(parent, str) or parent.strip() != executor_run_id:
+                                    violations.append(
+                                        f"{result_path}:substep_agent_run_ids[{sub_idx}] parent_agent_run_id must equal executor_agent_run_id"
+                                    )
+
+    if not has_orchestration_role:
+        violations.append(
+            f"{orchestrations_root}: agent_runs.jsonl must include orchestration role"
+        )
+    if not has_step_role:
+        step_required = any(
+            covered and step not in SUBSTEP_WORKFLOW_STEPS
+            for (_, step), covered in step_coverage.items()
+        )
+        if step_required:
+            violations.append(
+                f"{orchestrations_root}: agent_runs.jsonl must include step role"
+            )
+    if not has_substep_role:
+        substep_required = any(
+            covered and step in SUBSTEP_WORKFLOW_STEPS
+            for (_, step), covered in step_coverage.items()
+        )
+        if substep_required:
+            violations.append(
+                f"{orchestrations_root}: agent_runs.jsonl must include substep role"
+            )
+
+    missing_step_results = [
+        f"{node_safe}/{step}"
+        for (node_safe, step), covered in sorted(step_coverage.items())
+        if not covered
+    ]
+    if missing_step_results:
+        violations.append(
+            f"{orchestrations_root}: missing step_result.json for {missing_step_results}"
+        )
+
+
 def validate(
     repo_root: Path,
     workspace_root: str,
     pipeline_roots: list[Path] | None = None,
     require_llm_review: bool = True,
+    require_orchestration: bool = False,
 ) -> list[str]:
     violations: list[str] = []
     normalized_workspace_root = _normalize_workspace_root_token(workspace_root)
@@ -2514,6 +2949,13 @@ def validate(
     executions = _node_executions(workspace_path, pipeline_roots=pipeline_roots)
     if not executions:
         return [f"{workspace_path}/pipelines: no execution artifacts found"]
+
+    if require_orchestration:
+        _validate_orchestration_hierarchy(
+            workspace_path=workspace_path,
+            executions=executions,
+            violations=violations,
+        )
 
     source_hash_map: dict[str, list[SourceFingerprint]] = {}
     dep_contexts: list[tuple[NodeExecution, set[str], str | None]] = []
@@ -2681,7 +3123,27 @@ def main() -> int:
         action="store_true",
         help="Allow missing semantic_review.json for legacy pipelines.",
     )
+    parser.add_argument(
+        "--allow-missing-orchestration",
+        action="store_true",
+        help="Allow missing orchestration artifacts for legacy pipelines.",
+    )
+    parser.add_argument(
+        "--legacy-mode",
+        action="store_true",
+        help=(
+            "Allow legacy compatibility options. "
+            "Without this flag, --allow-missing-* options are rejected."
+        ),
+    )
     args = parser.parse_args()
+
+    if (args.allow_missing_llm_review or args.allow_missing_orchestration) and not args.legacy_mode:
+        print(
+            "pipeline semantic validation: FAIL\n"
+            "- --allow-missing-llm-review/--allow-missing-orchestration require --legacy-mode"
+        )
+        return 1
 
     repo_root = Path(args.repo_root).resolve()
     try:
@@ -2699,6 +3161,7 @@ def main() -> int:
         workspace_root=args.workspace_root,
         pipeline_roots=pipeline_roots,
         require_llm_review=not args.allow_missing_llm_review,
+        require_orchestration=not args.allow_missing_orchestration,
     )
 
     if violations:
