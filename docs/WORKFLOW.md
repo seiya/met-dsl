@@ -7,6 +7,7 @@
 - `ORCHESTRATION.md` は `workflow` のエージェント階層実行規約を正本として定義する。
 - `SPEC.md` は全体方針、`spec` 管理要件、台帳要件を正本として定義する。
 - 実装 `Plan` の既定値適用規則は `IMPL_PLAN_SPEC.md` を正本とする。
+- 各工程の実行手順、再試行手順、ツール呼び出し順、失敗時オペレーションは対応 `SKILL.md` を正本とする。
 
 ## workflow 共通不変規範
 1. `tests` 合格または workflow 進行を目的とした `dummy` 出力を禁止する。
@@ -15,35 +16,24 @@
 4. 工程入力が不足する場合は当該工程を `fail` で停止し、推測補完を禁止する。
 5. 工程失敗時に下流工程開始条件を満たす目的で成果物ファイルを人工生成してはならない。
 6. 明示的な指定がない場合、既存 workflow 出力（過去 `plan_id` / `pipeline_id` / `generation_id` / `build_id` / `execution_id`）の内容参照を禁止する。
-7. `spec_kind` を問わない workflow 実行は、リポジトリ管理下の `spec` 正本と当該試行で生成した前段成果物のみを入力として使用する。
-8. `spec_kind` を問わない workflow 実行は、各ステージ（`Plan` / `Generate` / `Build` / `Execute` / `Judge`）を `LLM` で実行しなければならない。専用実行スクリプト前提、手動 `copy`、手動 `json` 生成、手動 `id` 差し替えを禁止する。
-9. `workflow` 実行のために、複数ステージを一括代行する `script`（例: `python` / `bash`）を新規生成または実行してはならない。ステージ実行は `orchestration agent -> step agent` または `orchestration agent -> substep agent` のみを許可する。
-10. workflow 成果物の保存先ルートは `workspace/` のみを許可する。`workspace/` が存在しない場合はリポジトリルート直下へ作成する。
-11. workflow 実行中は対象 `DAG` の `workspace/plans` と `workspace/pipelines` 配下成果物を削除してはならない。
-12. `quality check` は `diagnostics.json` と `verdict.json` の比較を正本とし、`stdout` 差分のみで合否を確定してはならない。
-13. `lineage.json` と `trial_meta.json` の成果物参照パスは `workspace/` 起点で記録しなければならない。
-14. `trial_meta.json` は `generated_by_stage`、`source_execution_id`、`source_command_ref`、`source_artifact_hash` を必須記録とする。
-15. 異なる `pipeline_id` 間で `id` 系メタデータのみを変更して成果物本文を流用してはならない。検出時は `copy_based_artifact_reuse` として `invalid` とする。
-16. 本規範違反は workflow 仕様違反とし、当該 `pipeline` を `invalid` とする。
-17. `Promote` 以外のステージは、`workspace/` 配下以外へ書き込みを行ってはならない。`Promote` は `releases/` 配下と `spec/registry/spec_catalog.yaml` への書き込みのみを許可する。
-18. `Promote` 以外のステージ開始前に、リポジトリルート配下ファイル集合の `baseline` を取得し、当該ステージ完了前に差分比較を実施しなければならない。
-19. 差分比較は `workspace/` 配下以外の `add` / `modify` / `delete` を違反として検出しなければならない。`Promote` は `releases/` 配下と `spec/registry/spec_catalog.yaml` のみを例外許可する。
-20. `python` 実行を workflow 経路で使用する場合、`__pycache__` が `workspace/` 配下以外へ生成されない設定を必須とする。`PYTHONDONTWRITEBYTECODE=1` または `PYTHONPYCACHEPREFIX=workspace/.pycache/<pipeline_id>/` を使用する。
-21. 書き込み範囲違反を検出したステージは `fail` とし、下流ステージを開始してはならない。違反内容は `workspace/` 配下のメタデータへ記録しなければならない。
-22. 書き込み範囲違反を検出した `pipeline` は `invalid` とする。違反状態を解消せずに同一試行を継続してはならない。
-23. `workflow` 実行は必ず `orchestration agent` を最初に起動して開始しなければならない。
-24. 標準 `substep` を持たない各 `step` は `step agent` を独立起動して実行しなければならない。
-25. `substep` を持つ各工程は `orchestration agent` が各 `substep` の `substep agent` を独立起動して実行しなければならない。
-26. `orchestration agent` は工程成果物を直接生成してはならない。工程成果物の生成は `step agent` または `substep agent` のみが行わなければならない。
-27. `orchestration` 実行の親子関係と状態遷移は `workspace/orchestrations/<orchestration_id>/` 配下へ保存し、`agent_run_id` と `parent_agent_run_id` と `status` を欠落させてはならない。
-28. `step agent` と `substep agent` は、`agent_run_id` ごとに固有の `LLM` コンテキストを使用しなければならない。`context_id` 共有を禁止する。
-29. `step` / `substep` の `agent_runs.jsonl` は `context_isolated=true` と `agent_backend` と `agent_model` と `context_id` を必須記録とする。
-30. `agent_graph.json` は `orchestration -> step` と `orchestration -> substep` を正本とし、互換運用として `step -> substep` を許可してもよい。`substep` 親ロールの `edge` を禁止する。
-31. `step_result.json` は `executor_agent_run_id` と `substep_agent_run_ids` を必須記録とし、`executor_agent_run_id` は当該ディレクトリ名の `agent_run_id` と一致しなければならない。標準 `substep` を持たない工程の `substep_agent_run_ids` は空配列を許可する。
-32. `workflow` 開始前に `step agent` と `substep agent` の独立起動可否を検証する `preflight` を必須実行し、`pass` でない場合は開始してはならない。
-33. `step` / `substep` の `agent_runs.jsonl` は `agent_session_id` と `launch_request_ref` と `launch_response_ref` を必須記録し、`launches` 一次証跡から追跡可能でなければならない。
-34. `launch_request_ref` と `launch_response_ref` は `workspace/orchestrations/<orchestration_id>/launches/` 配下を参照し、参照先ファイルが存在しなければならない。
-35. `agent_runs.jsonl` と `agent_graph.json` と `step_result.json` を後生成または手動整形して独立実行を偽装した試行は `invalid` とする。
+7. `workspace/` 配下に過去成果物が存在する場合も、中身の閲覧と入力参照を禁止する。
+8. `spec_kind` を問わない workflow 実行は、リポジトリ管理下の `spec` 正本と当該試行で生成した前段成果物のみを入力として使用する。
+9. `spec_kind` を問わない workflow 実行は、各ステージ（`Plan` / `Generate` / `Build` / `Execute` / `Judge`）を `LLM` で実行しなければならない。専用実行スクリプト前提、手動 `copy`、手動 `json` 生成、手動 `id` 差し替えを禁止する。
+10. `workflow` 実行のために、複数ステージを一括代行する `script`（例: `python` / `bash`）を新規生成または実行してはならない。ステージ実行は `orchestration agent -> step agent` または `orchestration agent -> substep agent` のみを許可する。
+11. workflow 成果物の保存先ルートは `workspace/` のみを許可する。`workspace/` が存在しない場合はリポジトリルート直下へ作成する。
+12. workflow 実行中は対象 `DAG` の `workspace/plans` と `workspace/pipelines` 配下成果物を削除してはならない。
+13. `quality check` は `diagnostics.json` と `verdict.json` の比較を正本とし、`stdout` 差分のみで合否を確定してはならない。
+14. `lineage.json` と `trial_meta.json` の成果物参照パスは `workspace/` 起点で記録しなければならない。
+15. `trial_meta.json` は `generated_by_stage`、`source_execution_id`、`source_command_ref`、`source_artifact_hash` を必須記録とする。
+16. 異なる `pipeline_id` 間で `id` 系メタデータのみを変更して成果物本文を流用してはならない。検出時は `copy_based_artifact_reuse` として `invalid` とする。
+17. 本規範違反は workflow 仕様違反とし、当該 `pipeline` を `invalid` とする。
+18. `Promote` 以外のステージは、`workspace/` 配下以外へ書き込みを行ってはならない。`Promote` は `releases/` 配下と `spec/registry/spec_catalog.yaml` への書き込みのみを許可する。
+19. `Promote` 以外のステージ開始前に、リポジトリルート配下ファイル集合の `baseline` を取得し、当該ステージ完了前に差分比較を実施しなければならない。
+20. 差分比較は `workspace/` 配下以外の `add` / `modify` / `delete` を違反として検出しなければならない。`Promote` は `releases/` 配下と `spec/registry/spec_catalog.yaml` のみを例外許可する。
+21. `python` 実行を workflow 経路で使用する場合、`__pycache__` が `workspace/` 配下以外へ生成されない設定を必須とする。`PYTHONDONTWRITEBYTECODE=1` または `PYTHONPYCACHEPREFIX=workspace/.pycache/<pipeline_id>/` を使用する。
+22. 書き込み範囲違反を検出したステージは `fail` とし、下流ステージを開始してはならない。違反内容は `workspace/` 配下のメタデータへ記録しなければならない。
+23. 書き込み範囲違反を検出した `pipeline` は `invalid` とする。違反状態を解消せずに同一試行を継続してはならない。
+24. `workflow` の階層実行契約、`preflight`、`agent_runs.jsonl`、`agent_graph.json`、`step_result.json` の要件は `ORCHESTRATION.md` を正本として適用しなければならない。
 
 ## 0. 仕様作成（人間）
 - `Controlled Spec` で物理アルゴリズム（A）を定義する。
@@ -63,14 +53,8 @@
 - `debug_mode=false` では失敗試行成果物を保存しない。`debug_mode=true` で保存した場合は保存件数と保存先をメタデータへ記録する。
 
 ### 0-2) エージェント階層実行
-- `workflow` 開始時は `orchestration_id` を発行し、`orchestration agent` を起動する。
-- `orchestration agent` は `dependency.resolved.yaml` の `topo_level` と依存充足状態に基づいて `step agent` または `substep agent` の起動順を逐次決定する。
-- `substep` を持つ工程では `orchestration agent` が対象 `step` の入力契約を分解し、必要 `substep` を `substep agent` として独立起動する。
-- `substep agent` は契約された入力のみを参照し、契約された成果物のみを出力する。
-- `substep` を持つ工程では `orchestration agent` が `substep` 完了後に `step_result.json` を出力し、標準 `substep` を持たない工程では `step agent` が `step_result.json` を出力する。`step_result.json` は `status` と `required_outputs` と `failed_substeps` と `executor_agent_run_id` と `substep_agent_run_ids` を記録する。
-- `orchestration agent` は `step_result.json` を集約し、次工程開始可否を判定する。
-- `step agent` または `substep agent` が `fail` / `timeout` / `cancel` の場合、推測補完を禁止し、当該 `step` を停止する。
-- 具体的な実行記録形式と運用手順は `ORCHESTRATION.md` を適用する。
+- `workflow` の階層実行契約、親子関係、起動順、停止条件、実行記録形式は `ORCHESTRATION.md` を適用する。
+- 本書は `orchestration agent` が子 `agent` へ渡す工程契約の正本として、各ステージの `実行入力` と `検証入力` と `出力` を定義する。
 
 ## ステージ別 input / output
 本節では、各ステージの入力を `実行入力` と `検証入力` に分けて記述する。両者の役割が重なる場合、同一成果物を両方へ記載してよい。
@@ -333,6 +317,7 @@ workspace/
 - `plan_id` は `node` 単位で `case.resolved.yaml` と `impl.resolved.yaml` と `dependency.resolved.yaml` の組を識別する `ID` とする。推奨形式は `<node_key_safe>_<case_hash12>_<impl_hash12>` とする。
 - `pipeline_id` は `node` 単位で 1 回の `Generate -> Build -> Execute` 系列を識別する `ID` とする。推奨形式は `<plan_id>_<utc_ts>_<seq3>` とする。
 - `generation_id` / `build_id` / `execution_id` は各段階の試行単位 `ID` とする。
+- workflow は毎回独立実行し、`plan_id` / `pipeline_id` / `generation_id` / `build_id` / `execution_id` を毎回新規発行しなければならない。
 - `agent_run_id` は `step agent` / `substep agent` / `orchestration agent` の実行単位 `ID` とし、`step` / `substep` では `parent_agent_run_id` を必須記録とする。
 - `agent_runs.jsonl` の `step` / `substep` ロールは `agent_backend` と `agent_model` と `context_id` と `context_isolated` を必須記録とする。
 - `agent_runs.jsonl` の終端状態行（`pass` / `fail` / `blocked` / `timeout` / `cancel`）は `finished_at` を必須記録とする。

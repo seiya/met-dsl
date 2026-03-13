@@ -12,24 +12,28 @@
 
 ## 要件
 - `workflow` 実行は、必ず 1 つの `orchestration agent` を最初に起動して開始する。
-- `workflow` 開始前に、`step agent` と `substep agent` を独立起動できる実行基盤の事前検査を必須実行しなければならない。事前検査が `pass` でない場合は `workflow` を開始してはならない。
+- `workflow` 開始前に、`step agent` と `substep agent` を独立起動できる実行基盤の事前検査を必須実行しなければならない。事前検査は `multi_agent` 機能と子 `agent` 起動可否を検証対象に含め、`pass` でない場合は `workflow` を開始してはならない。
 - `orchestration agent` は `workflow` 全体の進行制御のみを担当し、工程本体の成果物（例: `case.resolved.yaml`、`diagnostics.json`）を直接生成してはならない。
 - `workflow` 実行の代替として、ステージ進行と成果物生成を一括自動化する `script`（例: `python` / `bash`）を新規生成または実行してはならない。
-- `orchestration` の責務を `script` へ委譲してはならない。`Plan` / `Generate` / `Build` / `Execute` / `Judge` の各 `step` は必ず独立 `step agent` で実行しなければならない。
-- 標準 `substep` を持たない各 `step` は、`step agent` を独立起動して実行しなければならない。
-- `substep` を持つ各工程は、`orchestration agent` が各 `substep` の `substep agent` を独立起動して実行しなければならない。
+- `orchestration` の責務を `script` へ委譲してはならない。`Build` / `Execute` / `Judge` / `Promote` の各 `step` は必ず `spawn_agent` で起動した独立 `step agent` で実行しなければならない。
+- `Plan` / `Generate` / `Tune` のように `substep` を持つ各工程は、`orchestration agent` が `generate` と `verify` などの各 `substep agent` を `spawn_agent` で直接起動しなければならない。
 - `step agent` と `substep agent` は、同一 `LLM` コンテキストを共有してはならない。各 `agent_run_id` は固有の `context_id` を持ち、`context_isolated=true` を必須記録とする。
 - `orchestration agent` は `substep` を持つ工程で必要な `substep` 群を起動し、完了判定を行った後に `step_result.json` を確定しなければならない。
 - `orchestration agent` は `dependency.resolved.yaml` の `topo_level` 昇順と依存充足条件に基づいて `step agent` または `substep agent` の起動可否を判定しなければならない。
 - すべての `agent` 実行は `agent_run_id` を持ち、入力参照・出力参照・親子関係を記録しなければならない。
 - `agent_runs.jsonl` の各行は `started_at` と `status` を必須記録とし、`status` が終端状態（`pass` / `fail` / `blocked` / `timeout` / `cancel`）の場合は `finished_at` を必須記録とする。
 - `step` / `substep` ロールの `agent_runs.jsonl` は `parent_agent_run_id` と `agent_backend` と `agent_model` と `context_id` と `context_isolated` と `agent_session_id` と `launch_request_ref` と `launch_response_ref` を必須記録とする。
+- `substep agent` の `parent_agent_run_id` は、当該 `substep` を起動した `orchestration agent_run_id` を指すことを許可する。
+- `spawn_agent` の応答で得た子 `agent` 識別子は `agent_session_id` として記録しなければならない。
 - `launch_request_ref` と `launch_response_ref` は `workspace/orchestrations/<orchestration_id>/launches/` 配下を参照し、参照先実体が存在しなければならない。
 - `agent_graph.json` の `edge` は、`orchestration -> step` または `orchestration -> substep` を正本とする。互換運用として `step -> substep` を許容してもよいが、`substep` を親ロールとする `edge` を禁止する。
 - `agent` 実行の失敗、`timeout`、`cancel` はメタデータへ記録し、推測補完で継続してはならない。
+- `orchestration agent` は子 `agent` の完了待機中に当該子 `agent` の責務を代行してはならない。標準 `substep` を持たない工程では `step agent` も同様に子 `agent` の責務を代行してはならない。
+- 再試行が必要な場合も同一 `agent_session_id` を使い回してはならない。再試行ごとに新規 `agent_run_id` と新規 `agent_session_id` を発行しなければならない。
 - `agent_runs.jsonl` と `agent_graph.json` は、実行中イベントを逐次追記して生成しなければならない。workflow 完了後に固定値テンプレートを一括出力する運用を禁止する。
 - `agent_runs.jsonl` と `agent_graph.json` と `step_result.json` を後生成または手動整形して独立実行を偽装してはならない。起動時に記録した一次証跡との突合で整合しない試行は `fail` とする。
 - `orchestration agent` は、子 `agent` 起動時に `docs/WORKFLOW.md` を正本として対象 `step` または `substep` の `実行入力` と `検証入力` と `期待出力` を明示しなければならない。`step agent` を使用する工程では `step agent` も自身の契約入力と期待出力を明示しなければならない。
+- `skills/*/agents/openai.yaml` の表示名または説明文だけで独立 `agent` 起動契約を満たしたとみなしてはならない。起動要求本文に `spawn_agent` の使用義務、入力契約、期待出力、保存先、失敗時停止条件を明示しなければならない。
 
 ## 設計方針
 - 単一責務: 1 つの `agent` は 1 つの責務のみを持つ。
@@ -68,6 +72,7 @@
 15. `orchestration agent` は親子関係を `workspace/orchestrations/<orchestration_id>/agent_graph.json` へ保存し、`parent_agent_run_id` と `child_agent_run_id` と `relation_type` を必須記録とする。
 16. `Promote` 以外の `agent` は `workspace/` 配下以外へ書き込んではならない。
 17. `workflow` 実行時に `step` / `substep` の実処理を `script` で代行した場合は `fail` とし、当該試行を破棄しなければならない。
+18. 再試行時は新規 `agent_run_id` と新規 `agent_session_id` を発行し、既存 `launch` 証跡や `agent_runs` 行を上書きしてはならない。
 
 ## 判定基準
 - `workflow` ごとに `orchestration_id` が発行され、`orchestration_meta.json` が存在する。
