@@ -27,6 +27,9 @@
 - **pipeline_id**: `node` 単位の `Generate -> Build -> Execute` 系列を識別する `ID`。推奨形式は `<plan_id>_<utc_ts>_<seq3>`。
 - **generation_id / build_id / execution_id**: 各段階の試行を識別する `ID`。
 - **agent_run_id**: `step agent` / `substep agent` / `orchestration agent` の 1 回の実行を識別する `ID`。`parent_agent_run_id` と組で親子関係を表す。
+- **issue_severity**: 子 `agent` 成果物の問題重大度。`minor` / `major` / `critical` の 3 値を使用する。
+- **repair_strategy**: 子 `agent` への再投入方針。`reuse` は同一 `agent_session_id` 継続修正、`restart` は新規 `agent_session_id` 再起動を表す。
+- **repair_target_agent_run_id**: 再投入判断の対象にした直前 `agent_run` を示す参照 `ID`。
 - **node_key**: 実行 / 判定対象 `node` の識別子。形式は `<spec_kind>/<spec_id>@<spec_version>` とする。
 - **topo_level**: 依存 `DAG` におけるトポロジカル階層。小さい値ほど下層 `node` を表す。
 - **release_id**: 各 `spec` の正式版実装を識別する `ID`。推奨形式は `<spec_version>_<utc_ts>_<seq3>`。
@@ -38,8 +41,8 @@
 - **agent_graph.json**: `orchestration` における `agent` 親子関係。`parent_agent_run_id` と `child_agent_run_id` と `relation_type` を記録する。
 - **context_id**: `LLM` 実行コンテキスト識別子。`step agent` / `substep agent` ごとに固有値を持ち、同一 `orchestration_id` 内で重複を禁止する。
 - **context_isolated**: `step agent` / `substep agent` が独立コンテキストで実行されたことを示す真偽値。`true` を必須とする。
-- **agent_runs.jsonl**: `agent` 実行イベントの時系列ログ。`agent_run_id`、`parent_agent_run_id`、`agent_role`、`status`、`started_at`、`finished_at`、`agent_backend`、`agent_model`、`context_id`、`context_isolated` を記録する。
-- **step_result.json**: 工程集約結果。`status`、`required_outputs`、`failed_substeps`、`executor_agent_run_id`、`substep_agent_run_ids` を記録する。`substep` を持つ工程では `executor_agent_run_id` は `orchestration agent_run_id`、標準 `substep` を持たない工程では `step agent_run_id` とする。`substep_agent_run_ids` は `substep` を持たない工程で空配列を許可する。
+- **agent_runs.jsonl**: `agent` 実行イベントの時系列ログ。`agent_run_id`、`parent_agent_run_id`、`agent_role`、`status`、`started_at`、`finished_at`、`agent_backend`、`agent_model`、`context_id`、`context_isolated` を記録する。再投入時は `launch_request_ref` 先へ `issue_severity` と `repair_strategy` と `repair_target_agent_run_id` と `repair_reason` を記録する。
+- **step_result.json**: 工程集約結果。`status`、`required_outputs`、`failed_substeps`、`executor_agent_run_id`、`substep_agent_run_ids` を記録する。`substep` を持つ工程では `executor_agent_run_id` は `orchestration agent_run_id`、標準 `substep` を持たない工程では `step agent_run_id` とする。`substep_agent_run_ids` は `substep` を持たない工程で空配列を許可する。再投入を実施した工程は `retry_decisions` を追加し、`issue_severity` と `repair_strategy` と `repair_target_agent_run_id` と `new_agent_run_id` と `repair_reason` を保持する。
 - **model**: 物理計算を実行する計算コンポーネント / ライブラリ。入力状態から次状態を計算する責務を持つ。
 - **runner（例: `simulate`）**: 実行エントリポイント。入力読込・`model` 呼び出し・`diagnostics` / `perf` 出力を担当する。
 - **`<stage>_meta.json`**: `LLM` 利用ステージの実行メタデータ。`attempt_count`、`verification_status`、`last_fail_reason`、`context_isolated`、`debug_mode` を保持する。`context_isolated=false` では `constraint_reason` を必須とする。`debug_mode=true` で失敗試行を保存した場合は `retained_failed_attempts` と保存先を保持する。

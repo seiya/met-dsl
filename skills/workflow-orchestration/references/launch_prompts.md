@@ -12,6 +12,10 @@ parent_agent_run_id: <parent_agent_run_id>
 plan_ref: <plan_ref>
 pipeline_ref: <pipeline_ref>
 dependency_ref: <dependency_ref>
+issue_severity: <issue_severity>
+repair_strategy: <repair_strategy>
+repair_target_agent_run_id: <repair_target_agent_run_id>
+repair_reason: <repair_reason>
 
 必須要件:
 - あなたは工程成果物を直接生成する担当である。
@@ -33,11 +37,17 @@ parent_agent_run_id: <parent_agent_run_id>
 plan_ref: <plan_ref>
 pipeline_ref: <pipeline_ref>
 dependency_ref: <dependency_ref>
+issue_severity: <issue_severity>
+repair_strategy: <repair_strategy>
+repair_target_agent_run_id: <repair_target_agent_run_id>
+repair_reason: <repair_reason>
 
 必須要件:
 - 契約された入力だけを読むこと。
 - 契約された成果物だけを書くこと。
 - 期待出力と保存先を守ること。
 - 入力不足時は推測補完せず fail で停止すること。
+- `repair_strategy=reuse` の場合は、`repair_target_agent_run_id` の出力との差分修正に限定すること。
+- `repair_strategy=restart` の場合は、過去出力を流用せず契約入力から再生成すること。
 - 完了時は成果物参照と status を `orchestration agent` へ返すこと。
 ```

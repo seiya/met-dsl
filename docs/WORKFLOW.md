@@ -339,6 +339,7 @@ workspace/
 - `debug_mode=false` の `Generate` は `attempts/` を生成してはならない。
 - `Judge` 入力は常に同一 `execution_id` 配下成果物とし、他 `execution_id` との混在を禁止する。
 - 各ステージ `fail` 時は下流ステージ開始条件を満たす目的のファイル後付け生成を禁止する。
+- `substep` を持つ工程の再投入戦略（`repair_strategy=reuse` / `restart`）と記録要件は `ORCHESTRATION.md` を正本として適用する。
 
 ### 7-5) 参照規則
 - `orchestration` から `step` / `substep` 実行を参照するときは `orchestration_id + agent_run_id` を使用し、ログ本文の全文検索だけで追跡してはならない。
