@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -27,6 +28,16 @@ class _FakeCompletedProcess:
 
 
 class CodexOrchestrationRuntimeTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._old_live_preflight = os.environ.get("CODEX_ORCHESTRATION_ENFORCE_LIVE_PREFLIGHT")
+        os.environ["CODEX_ORCHESTRATION_ENFORCE_LIVE_PREFLIGHT"] = "0"
+
+    def tearDown(self) -> None:
+        if self._old_live_preflight is None:
+            os.environ.pop("CODEX_ORCHESTRATION_ENFORCE_LIVE_PREFLIGHT", None)
+        else:
+            os.environ["CODEX_ORCHESTRATION_ENFORCE_LIVE_PREFLIGHT"] = self._old_live_preflight
+
     def test_parse_feature_list_extracts_boolean_flags(self) -> None:
         raw = """
 multi_agent                      experimental       true
@@ -91,6 +102,10 @@ shell_tool                       stable             true
                     "status": "pass",
                     "can_launch_step_agents": True,
                     "can_launch_substep_agents": True,
+                    "feature_states": {"multi_agent": True},
+                    "checks": [
+                        {"name": "multi_agent_enabled", "pass": True},
+                    ],
                 },
             )
             launch_refs = record_launch(
@@ -223,6 +238,19 @@ shell_tool                       stable             true
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
             init_orchestration(repo_root=repo_root, orchestration_id="orch_001")
+            write_preflight(
+                repo_root=repo_root,
+                orchestration_id="orch_001",
+                payload={
+                    "status": "pass",
+                    "can_launch_step_agents": True,
+                    "can_launch_substep_agents": True,
+                    "feature_states": {"multi_agent": True},
+                    "checks": [
+                        {"name": "multi_agent_enabled", "pass": True},
+                    ],
+                },
+            )
             payload = {
                 "agent_run_id": "step_run_001",
                 "agent_role": "step",
@@ -237,6 +265,83 @@ shell_tool                       stable             true
             record_agent_run(repo_root=repo_root, orchestration_id="orch_001", payload=payload)
             with self.assertRaisesRegex(ValueError, "duplicate agent_run_id"):
                 record_agent_run(repo_root=repo_root, orchestration_id="orch_001", payload=payload)
+
+    def test_rejects_launch_when_preflight_cannot_launch_agents(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            init_orchestration(repo_root=repo_root, orchestration_id="orch_001")
+            write_preflight(
+                repo_root=repo_root,
+                orchestration_id="orch_001",
+                payload={
+                    "status": "fail",
+                    "can_launch_step_agents": False,
+                    "can_launch_substep_agents": False,
+                    "feature_states": {"multi_agent": False},
+                    "checks": [
+                        {"name": "multi_agent_enabled", "pass": False},
+                    ],
+                },
+            )
+            with self.assertRaisesRegex(RuntimeError, "preflight gate failed"):
+                record_launch(
+                    repo_root=repo_root,
+                    orchestration_id="orch_001",
+                    parent_agent_run_id="orch_run_001",
+                    child_agent_run_id="step_run_plan_001",
+                    request_payload={"step": "plan"},
+                    response_payload={"accepted": True},
+                )
+
+    def test_rejects_step_agent_run_when_preflight_cannot_launch_agents(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            init_orchestration(repo_root=repo_root, orchestration_id="orch_001")
+            write_preflight(
+                repo_root=repo_root,
+                orchestration_id="orch_001",
+                payload={
+                    "status": "fail",
+                    "can_launch_step_agents": False,
+                    "can_launch_substep_agents": False,
+                },
+            )
+            with self.assertRaisesRegex(RuntimeError, "preflight gate failed"):
+                record_agent_run(
+                    repo_root=repo_root,
+                    orchestration_id="orch_001",
+                    payload={
+                        "agent_run_id": "step_run_plan_001",
+                        "agent_role": "step",
+                        "parent_agent_run_id": "orch_run_001",
+                        "step": "plan",
+                        "node_key": "problem/shallow_water2d@0.3.0",
+                        "status": "pass",
+                        "agent_backend": "openai_responses",
+                        "agent_model": "gpt-5-codex",
+                        "context_id": "ctx_step_plan_001",
+                        "agent_session_id": "sess_step_plan_001",
+                    },
+                )
+
+    def test_rejects_inconsistent_preflight_payload(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            init_orchestration(repo_root=repo_root, orchestration_id="orch_001")
+            with self.assertRaisesRegex(ValueError, "feature_states.multi_agent=false"):
+                write_preflight(
+                    repo_root=repo_root,
+                    orchestration_id="orch_001",
+                    payload={
+                        "status": "pass",
+                        "can_launch_step_agents": True,
+                        "can_launch_substep_agents": True,
+                        "feature_states": {"multi_agent": False},
+                        "checks": [
+                            {"name": "multi_agent_enabled", "pass": False},
+                        ],
+                    },
+                )
 
 
 if __name__ == "__main__":

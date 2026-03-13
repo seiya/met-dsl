@@ -34,6 +34,9 @@
 22. 書き込み範囲違反を検出したステージは `fail` とし、下流ステージを開始してはならない。違反内容は `workspace/` 配下のメタデータへ記録しなければならない。
 23. 書き込み範囲違反を検出した `pipeline` は `invalid` とする。違反状態を解消せずに同一試行を継続してはならない。
 24. `workflow` の階層実行契約、`preflight`、`agent_runs.jsonl`、`agent_graph.json`、`step_result.json` の要件は `ORCHESTRATION.md` を正本として適用しなければならない。
+25. `preflight` が `fail` の場合、`orchestration agent` は子 `agent` を起動してはならない。`workflow` は `fail` で停止しなければならない。
+26. `preflight.json` を手動編集または後編集して `pass` 化してはならない。`preflight` 正本は `tools/codex_orchestration_runtime.py preflight` の実行結果とする。
+27. 子 `agent` 起動直前に実行基盤の live 検査を再実行し、`multi_agent=true` と子 `agent` 起動可否の充足を確認しなければならない。未充足時は即時 `fail` とする。
 
 ## 0. 仕様作成（人間）
 - `Controlled Spec` で物理アルゴリズム（A）を定義する。

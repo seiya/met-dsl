@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
 import sys
 from datetime import datetime, timezone
@@ -30,6 +31,123 @@ def _write_json(path: Path, payload: Any) -> None:
 
 def _orchestration_root(repo_root: Path, orchestration_id: str) -> Path:
     return repo_root / "workspace" / "orchestrations" / orchestration_id
+
+
+def _preflight_path(repo_root: Path, orchestration_id: str) -> Path:
+    return _orchestration_root(repo_root, orchestration_id) / "preflight.json"
+
+
+def _preflight_allows_agent_launch(payload: dict[str, Any]) -> bool:
+    feature_states = payload.get("feature_states")
+    if not isinstance(feature_states, dict):
+        return False
+    if feature_states.get("multi_agent") is not True:
+        return False
+
+    checks = payload.get("checks")
+    if not isinstance(checks, list):
+        return False
+    multi_agent_check_pass: bool | None = None
+    for item in checks:
+        if not isinstance(item, dict):
+            continue
+        if item.get("name") != "multi_agent_enabled":
+            continue
+        pass_value = item.get("pass")
+        if isinstance(pass_value, bool):
+            multi_agent_check_pass = pass_value
+            break
+
+    return (
+        payload.get("status") == "pass"
+        and payload.get("can_launch_step_agents") is True
+        and payload.get("can_launch_substep_agents") is True
+        and multi_agent_check_pass is True
+    )
+
+
+def _validate_preflight_payload(payload: dict[str, Any]) -> None:
+    if (
+        payload.get("can_launch_step_agents") is True
+        or payload.get("can_launch_substep_agents") is True
+    ) and payload.get("status") != "pass":
+        raise ValueError(
+            "preflight status must be pass when can_launch_step_agents/can_launch_substep_agents is true"
+        )
+
+    feature_states = payload.get("feature_states")
+    if isinstance(feature_states, dict):
+        multi_agent = feature_states.get("multi_agent")
+        if isinstance(multi_agent, bool) and not multi_agent:
+            if payload.get("can_launch_step_agents") is True or payload.get(
+                "can_launch_substep_agents"
+            ) is True:
+                raise ValueError(
+                    "feature_states.multi_agent=false is incompatible with launchable preflight"
+                )
+
+    checks = payload.get("checks")
+    if isinstance(checks, list):
+        multi_agent_check_pass: bool | None = None
+        for item in checks:
+            if not isinstance(item, dict):
+                continue
+            if item.get("name") != "multi_agent_enabled":
+                continue
+            pass_value = item.get("pass")
+            if isinstance(pass_value, bool):
+                multi_agent_check_pass = pass_value
+                break
+        if multi_agent_check_pass is False:
+            if payload.get("can_launch_step_agents") is True or payload.get(
+                "can_launch_substep_agents"
+            ) is True:
+                raise ValueError(
+                    "checks.multi_agent_enabled.pass=false is incompatible with launchable preflight"
+                )
+    elif (
+        payload.get("status") == "pass"
+        and payload.get("can_launch_step_agents") is True
+        and payload.get("can_launch_substep_agents") is True
+    ):
+        raise ValueError(
+            "checks must include multi_agent_enabled.pass=true when preflight is launchable"
+        )
+
+    if (
+        payload.get("status") == "pass"
+        and payload.get("can_launch_step_agents") is True
+        and payload.get("can_launch_substep_agents") is True
+    ):
+        if not isinstance(feature_states, dict) or feature_states.get("multi_agent") is not True:
+            raise ValueError(
+                "feature_states.multi_agent=true is required when preflight is launchable"
+            )
+
+
+def _require_preflight_launchable(repo_root: Path, orchestration_id: str) -> dict[str, Any]:
+    path = _preflight_path(repo_root, orchestration_id)
+    if not path.exists():
+        raise RuntimeError(f"preflight missing: {path}")
+    payload = _read_json(path)
+    if not isinstance(payload, dict):
+        raise RuntimeError(f"preflight must be object: {path}")
+    if not _preflight_allows_agent_launch(payload):
+        raise RuntimeError(
+            "preflight gate failed: launchable preflight with multi_agent=true is required"
+        )
+    if _live_preflight_enforced():
+        live_probe = probe_codex_cli()
+        if not _preflight_allows_agent_launch(live_probe):
+            raise RuntimeError(
+                "live preflight gate failed: codex multi_agent must be enabled at launch time"
+            )
+    return payload
+
+
+def _live_preflight_enforced() -> bool:
+    raw = os.environ.get("CODEX_ORCHESTRATION_ENFORCE_LIVE_PREFLIGHT", "1").strip().lower()
+    return raw not in {"0", "false", "no"}
 
 
 def _launch_refs(orchestration_id: str, agent_run_id: str) -> tuple[str, str]:
@@ -154,6 +272,7 @@ def init_orchestration(
 
 
 def write_preflight(repo_root: Path, orchestration_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+    _validate_preflight_payload(payload)
     root = _orchestration_root(repo_root, orchestration_id)
     root.mkdir(parents=True, exist_ok=True)
     _write_json(root / "preflight.json", payload)
@@ -178,6 +297,7 @@ def record_launch(
     response_payload: dict[str, Any],
     relation_type: str = "launch",
 ) -> dict[str, str]:
+    _require_preflight_launchable(repo_root, orchestration_id)
     root = _orchestration_root(repo_root, orchestration_id)
     launches_root = root / "launches"
     launches_root.mkdir(parents=True, exist_ok=True)
@@ -238,6 +358,8 @@ def record_agent_run(
     role_token = role.strip().lower() if isinstance(role, str) and role.strip() else None
     if role_token is None:
         raise ValueError("agent_role must be non-empty string")
+    if role_token in {"step", "substep"}:
+        _require_preflight_launchable(repo_root, orchestration_id)
 
     existing = _read_existing_run_ids(runs_path)
     if agent_run_id in existing:
@@ -273,6 +395,7 @@ def write_step_result(
     agent_run_id: str,
     payload: dict[str, Any],
 ) -> dict[str, Any]:
+    _require_preflight_launchable(repo_root, orchestration_id)
     node_safe = _node_key_to_safe(node_key)
     step_token = step.strip().lower()
     root = _orchestration_root(repo_root, orchestration_id)
@@ -293,6 +416,8 @@ def update_orchestration_status(
     *,
     status: str,
 ) -> dict[str, Any]:
+    if status == "pass":
+        _require_preflight_launchable(repo_root, orchestration_id)
     meta_path = _orchestration_root(repo_root, orchestration_id) / "orchestration_meta.json"
     if not meta_path.exists():
         raise FileNotFoundError(meta_path)

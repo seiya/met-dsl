@@ -20,6 +20,8 @@ description: `Codex CLI` で `workflow` 全体を開始し、`orchestration agen
 - `Plan` / `Generate` / `Tune` のように `substep` を持つ工程では、`orchestration agent` が `generate` と `verify` を別々の `substep agent` として `spawn_agent` で直接起動しなければならない。
 - `Build` / `Execute` / `Judge` / `Promote` の `step` は、単一 `step agent` で完了させなければならない。
 - `Codex CLI` の起動可否確認と証跡書き出しは `tools/codex_orchestration_runtime.py` を正本実装として使用しなければならない。
+- `preflight.json` の手動編集または後編集による `pass` 化を禁止する。`preflight` は `tools/codex_orchestration_runtime.py preflight` の実行結果を正本とする。
+- 子 `agent` 起動直前に live preflight gate を満たすことを必須とし、live 検査が `fail` の場合は `record-launch` を実行してはならない。
 - `step agent` / `substep agent` の起動要求本文には、入力契約、期待出力、保存先、失敗時停止条件、`spawn_agent` 義務を明示しなければならない。
 - `openai.yaml` の表示名だけで orchestration 契約を満たしたとみなしてはならない。
 - 子 `agent` の返却結果を評価した後、`issue_severity`（`minor` / `major` / `critical`）を判定し、再投入が必要な場合は `repair_strategy`（`reuse` / `restart`）を選択しなければならない。
@@ -37,6 +39,8 @@ description: `Codex CLI` で `workflow` 全体を開始し、`orchestration agen
 7. `repair_strategy=reuse` の再投入では、対象 `substep` の契約を変更せず差分修正だけを要求する。`repair_strategy=restart` の再投入では、対象 `substep` の契約入力から再生成させる。
 8. 標準 `substep` を持たない工程では `step agent` 完了後に、`substep` を持つ工程では `orchestration agent` 集約完了後に、`python3 tools/codex_orchestration_runtime.py write-step-result --repo-root <repo_root> --orchestration-id <orchestration_id> --node-key <node_key> --step <step> --agent-run-id <agent_run_id> --result-json '<json>'` を実行する。再投入を実施した場合は `step_result.json` に `retry_decisions` を含める。
 9. workflow 終了時は `python3 tools/codex_orchestration_runtime.py set-status --repo-root <repo_root> --orchestration-id <orchestration_id> --status <status>` を実行し、`orchestration_meta.json` を終端状態へ更新する。
+10. `preflight.json` を手動編集または後編集して `status` と `can_launch_*` を変更してはならない。検査条件の変化は `preflight` 再実行でのみ反映する。
+11. `record-launch` / `record-agent-run` / `write-step-result` 実行時に live preflight gate が `fail` の場合、当該実行を停止し、`set-status --status fail` のみを許可する。
 
 ## 参照
 - launch 要求テンプレート: `references/launch_prompts.md`

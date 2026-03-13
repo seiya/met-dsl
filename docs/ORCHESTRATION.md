@@ -13,6 +13,8 @@
 ## 要件
 - `workflow` 実行は、必ず 1 つの `orchestration agent` を最初に起動して開始する。
 - `workflow` 開始前に、`step agent` と `substep agent` を独立起動できる実行基盤の事前検査を必須実行しなければならない。事前検査は `multi_agent` 機能と子 `agent` 起動可否を検証対象に含め、`pass` でない場合は `workflow` を開始してはならない。
+- `preflight.json` の手動編集または後編集による `pass` 化を禁止する。事前検査結果は実行時検査の一次証跡としてのみ記録しなければならない。
+- 子 `agent` 起動直前に、`Codex CLI` の live probe で `multi_agent` と子 `agent` 起動可否を再検査しなければならない。live probe が `fail` の場合、`record-launch` と子 `agent` 起動を禁止し、当該 `workflow` を `fail` へ遷移させなければならない。
 - `orchestration agent` は `workflow` 全体の進行制御のみを担当し、工程本体の成果物（例: `case.resolved.yaml`、`diagnostics.json`）を直接生成してはならない。
 - `workflow` 実行の代替として、ステージ進行と成果物生成を一括自動化する `script`（例: `python` / `bash`）を新規生成または実行してはならない。
 - `orchestration` の責務を `script` へ委譲してはならない。`Build` / `Execute` / `Judge` / `Promote` の各 `step` は必ず `spawn_agent` で起動した独立 `step agent` で実行しなければならない。
@@ -84,6 +86,8 @@
 20. `Promote` 以外の `agent` は `workspace/` 配下以外へ書き込んではならない。
 21. `workflow` 実行時に `step` / `substep` の実処理を `script` で代行した場合は `fail` とし、当該試行を破棄しなければならない。
 22. 再投入時は新規 `agent_run_id` を発行し、既存 `launch` 証跡や `agent_runs` 行を上書きしてはならない。`agent_session_id` の扱いは `repair_strategy` 規則に従う。
+23. `preflight.json` の手動編集または後編集で `status` と `can_launch_*` を変更してはならない。変更が必要な場合は `preflight` を再実行して新しい検査結果を記録しなければならない。
+24. 子 `agent` 起動直前の live probe が `fail` の場合、`record-launch` と `record-agent-run`（`step` / `substep`）と `write-step-result` を実行してはならない。`orchestration_meta.status=fail` を記録して停止しなければならない。
 
 ## 判定基準
 - `workflow` ごとに `orchestration_id` が発行され、`orchestration_meta.json` が存在する。
@@ -91,6 +95,7 @@
 - `step` と `substep` の `context_id` が重複せず、全件で `context_isolated=true` が記録される。
 - `step` と `substep` の `agent_runs.jsonl` に `agent_session_id` と `launch_request_ref` と `launch_response_ref` が記録され、参照先実体が存在する。
 - `preflight.json` が存在し、`can_launch_step_agents=true` と `can_launch_substep_agents=true` を満たす。
+- `preflight.json` の `pass` 条件と、子 `agent` 起動直前 live probe の `pass` 条件が同時に満たされる。
 - `agent_graph.json` で `orchestration -> step` または `orchestration -> substep` の親子関係を追跡できる。
 - `agent_runs.jsonl` から `queued` / `running` / `pass` / `fail` / `blocked` / `timeout` / `cancel` の遷移を追跡できる。
 - `step_result.json` の `executor_agent_run_id` が当該ディレクトリ名と一致し、`substep_agent_run_ids` が親子関係と整合する。標準 `substep` を持たない工程では `substep_agent_run_ids=[]` を許可する。

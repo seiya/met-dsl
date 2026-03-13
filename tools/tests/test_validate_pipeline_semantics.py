@@ -246,8 +246,18 @@ def _create_minimal_orchestration_tree(
     _write_json(
         orchestration_root / "preflight.json",
         {
+            "status": "pass",
             "can_launch_step_agents": True,
             "can_launch_substep_agents": True,
+            "feature_states": {
+                "multi_agent": True,
+            },
+            "checks": [
+                {
+                    "name": "multi_agent_enabled",
+                    "pass": True,
+                }
+            ],
         },
     )
     step_ids = {

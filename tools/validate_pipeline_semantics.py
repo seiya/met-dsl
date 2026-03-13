@@ -2574,6 +2574,8 @@ def _validate_orchestration_hierarchy(
                 if not isinstance(preflight, dict):
                     violations.append(f"{preflight_path}: must be json object")
                 else:
+                    if preflight.get("status") != "pass":
+                        violations.append(f"{preflight_path}:status must be pass")
                     if preflight.get("can_launch_step_agents") is not True:
                         violations.append(
                             f"{preflight_path}:can_launch_step_agents must be true"
@@ -2582,6 +2584,34 @@ def _validate_orchestration_hierarchy(
                         violations.append(
                             f"{preflight_path}:can_launch_substep_agents must be true"
                         )
+                    feature_states = preflight.get("feature_states")
+                    if not isinstance(feature_states, dict):
+                        violations.append(
+                            f"{preflight_path}:feature_states must be object"
+                        )
+                    elif feature_states.get("multi_agent") is not True:
+                        violations.append(
+                            f"{preflight_path}:feature_states.multi_agent must be true"
+                        )
+
+                    checks = preflight.get("checks")
+                    if not isinstance(checks, list):
+                        violations.append(f"{preflight_path}:checks must be list")
+                    else:
+                        multi_agent_check_pass = None
+                        for item in checks:
+                            if not isinstance(item, dict):
+                                continue
+                            if item.get("name") != "multi_agent_enabled":
+                                continue
+                            pass_value = item.get("pass")
+                            if isinstance(pass_value, bool):
+                                multi_agent_check_pass = pass_value
+                                break
+                        if multi_agent_check_pass is not True:
+                            violations.append(
+                                f"{preflight_path}:checks.multi_agent_enabled.pass must be true"
+                            )
 
         if meta_path.exists():
             try:
