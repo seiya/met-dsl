@@ -62,7 +62,7 @@ def _is_under_workspace(rel_path: str, workspace_root: str) -> bool:
     return normalized_path == normalized_ws or normalized_path.startswith(normalized_ws + "/")
 
 
-def _git_status_paths(repo_root: Path) -> tuple[set[str], set[str]]:
+def _git_status_paths(repo_root: Path) -> tuple[set[str], set[str], str | None]:
     proc = subprocess.run(
         ["git", "-C", str(repo_root), "status", "--porcelain"],
         text=True,
@@ -70,7 +70,10 @@ def _git_status_paths(repo_root: Path) -> tuple[set[str], set[str]]:
         check=False,
     )
     if proc.returncode != 0:
-        return set(), set()
+        detail = (proc.stderr or proc.stdout or "").strip()
+        if not detail:
+            detail = f"git status failed with returncode={proc.returncode}"
+        return set(), set(), detail
 
     tracked_diff: set[str] = set()
     untracked_files: set[str] = set()
@@ -89,7 +92,7 @@ def _git_status_paths(repo_root: Path) -> tuple[set[str], set[str]]:
             untracked_files.add(payload)
         else:
             tracked_diff.add(payload)
-    return tracked_diff, untracked_files
+    return tracked_diff, untracked_files, None
 
 
 def _validate_write_scope_from_baseline(
@@ -114,7 +117,12 @@ def _validate_write_scope_from_baseline(
 
     baseline_tracked = {_normalize_relpath(str(item)) for item in baseline_tracked_raw}
     baseline_untracked = {_normalize_relpath(str(item)) for item in baseline_untracked_raw}
-    current_tracked, current_untracked = _git_status_paths(repo_root)
+    current_tracked, current_untracked, git_error = _git_status_paths(repo_root)
+    if git_error is not None:
+        violations.append(
+            f"{baseline_path}: write_scope check requires git status but failed ({git_error})"
+        )
+        return violations
 
     new_paths = sorted((current_tracked - baseline_tracked) | (current_untracked - baseline_untracked))
     outside_workspace = [path for path in new_paths if not _is_under_workspace(path, workspace_root)]
@@ -133,8 +141,10 @@ def _capture_write_scope_baseline(
     stage: str,
     node_key: str,
     pipeline_id: str,
-) -> None:
-    tracked_diff, untracked_files = _git_status_paths(repo_root)
+) -> str | None:
+    tracked_diff, untracked_files, git_error = _git_status_paths(repo_root)
+    if git_error is not None:
+        return git_error
     payload = {
         "stage": stage,
         "node_key": node_key,
@@ -145,6 +155,7 @@ def _capture_write_scope_baseline(
     }
     baseline_path.parent.mkdir(parents=True, exist_ok=True)
     baseline_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    return None
 
 
 def _scan_json_for_violations(json_path: Path) -> list[str]:
@@ -300,7 +311,7 @@ def validate_with_scope(
                 )
             )
         else:
-            _capture_write_scope_baseline(
+            git_error = _capture_write_scope_baseline(
                 repo_root=repo_root,
                 workspace_root=workspace_root,
                 baseline_path=baseline_path,
@@ -308,6 +319,10 @@ def validate_with_scope(
                 node_key=node_key,
                 pipeline_id=pipeline_id,
             )
+            if git_error is not None:
+                violations.append(
+                    f"{baseline_path}: write_scope baseline capture failed ({git_error})"
+                )
 
     return violations, created_workspace
 

@@ -7,7 +7,7 @@
 ### 対象
 - 入力: 自然言語中心の `Controlled Spec`（物理・アルゴリズム定義）と `tests`（検証入力・判定プロファイル）
 - 出力: 実行コード（`model` + `runner`）と判定成果物（`diagnostics.json` / `perf.json` / `verdict.json` / `aggregate_verdict.json` / `summary.json`）
-- 運用: `Spec -> Plan -> Generate -> Execute -> Judge -> Tune -> Promote` の反復運用
+- 運用: `Spec -> Plan -> Generate -> Build -> Execute -> Judge -> Tune -> Promote` の反復運用
 - ハードウェア: `CPU` / `GPU` を含む（`Phase 0` は `CPU` 参照、以降 `GPU` へ拡張）
 - `Controlled Spec` と `tests` の正本形式は `Markdown` とし、自然言語で一意に定義できる項目は文章で記述する。
 

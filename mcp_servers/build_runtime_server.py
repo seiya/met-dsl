@@ -482,6 +482,8 @@ def tool_run_quality_checks(args: dict[str, Any]) -> dict[str, Any]:
     if command_log_path is not None and not isinstance(command_log_path, str):
         raise ValueError("command_log_path must be a string")
     env = args.get("env")
+    if env is not None and not isinstance(env, dict):
+        raise ValueError("env must be an object")
     preset = str(args.get("preset", "make_test"))
 
     presets: dict[str, list[str]] = {
@@ -500,12 +502,28 @@ def tool_run_quality_checks(args: dict[str, Any]) -> dict[str, Any]:
         supported = ", ".join(sorted(presets.keys()))
         raise ValueError(f"unsupported preset: {preset}. supported={supported}")
 
+    run_env: dict[str, str] | None
+    if env is None:
+        run_env = None
+    else:
+        run_env = {str(k): str(v) for k, v in env.items()}
+
+    if preset == "pytest":
+        if run_env is None:
+            run_env = {}
+        project_path = str(Path(project_dir).resolve())
+        existing = run_env.get("PYTHONPATH") or os.environ.get("PYTHONPATH", "")
+        if existing:
+            run_env["PYTHONPATH"] = f"{project_path}{os.pathsep}{existing}"
+        else:
+            run_env["PYTHONPATH"] = project_path
+
     result = _run_command(
         command=command,
         cwd=project_dir,
         tool_name="run_quality_checks",
         timeout_sec=timeout_sec,
-        env=env,
+        env=run_env,
         capture_limit=capture_limit,
         command_log_path=command_log_path,
     )

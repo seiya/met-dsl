@@ -1139,6 +1139,66 @@ end program shallow_water2d_runner
                 any("run_quality_checks command_id=cmd_quality_001 uses forbidden executable" in v for v in violations)
             )
 
+    def test_rejects_source_command_log_outside_workspace(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            model_text = """module shallow_water2d_model
+use dynamics_shallow_water_flux_2d_rusanov_p0_model
+implicit none
+contains
+subroutine solve(flag)
+  logical, intent(out) :: flag
+  call dynamics_shallow_water_flux_2d_rusanov_p0__compute_flux(flag)
+end subroutine solve
+end module shallow_water2d_model
+"""
+            runner_text = """program shallow_water2d_runner
+implicit none
+write(*,*) 'ok'
+end program shallow_water2d_runner
+"""
+            _create_minimal_execution_tree(
+                repo_root,
+                dep_spec_id="dynamics_shallow_water_flux_2d_rusanov_p0",
+                model_text=model_text,
+                runner_text=runner_text,
+                run_command=["./simulate", "workspace/case.resolved.yaml", "workspace/outdir"],
+            )
+
+            node_dir = (
+                repo_root
+                / "workspace"
+                / "pipelines"
+                / "problem__shallow_water2d__0.3.0"
+                / "problem__shallow_water2d__0.3.0_test_pipeline"
+                / "execute"
+                / "exe_test_001"
+                / "problem"
+                / "shallow_water2d"
+            )
+            trial_meta_path = node_dir / "trial_meta.json"
+            trial_meta = json.loads(trial_meta_path.read_text(encoding="utf-8"))
+            outside_log = repo_root / "mcp_command_log.jsonl"
+            outside_log.write_text(
+                json.dumps(
+                    {
+                        "command_id": "cmd_run_001",
+                        "tool_name": "run_program",
+                        "command": ["./simulate", "workspace/case.resolved.yaml", "workspace/outdir"],
+                    },
+                    ensure_ascii=False,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            trial_meta["source_command_ref"]["run_threads_1"]["command_log_ref"] = "mcp_command_log.jsonl"
+            _write_json(trial_meta_path, trial_meta)
+
+            violations = validate(repo_root=repo_root, workspace_root="workspace")
+            self.assertTrue(
+                any("command_log_ref/path must start with workspace/" in v for v in violations)
+            )
+
     def test_validates_tests_md_and_per_test_counts(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)

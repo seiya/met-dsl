@@ -35,3 +35,4 @@ Thumbs.db
 # Generic temporary/log files
 *.log
 *.tmp
+mcp_command_log.jsonl

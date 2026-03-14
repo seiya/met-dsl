@@ -139,6 +139,21 @@ class ValidateWorkspaceRootTests(unittest.TestCase):
                 any("write_scope_violation detected outside workspace" in v for v in violations)
             )
 
+    def test_write_scope_fails_closed_when_git_is_unavailable(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            violations, _ = validate_with_scope(
+                repo_root=repo_root,
+                workspace_root="workspace",
+                write_scope_baseline="workspace/write_scope_baseline.json",
+                stage="Generate",
+                node_key="problem/shallow_water2d@0.3.0",
+                pipeline_id="pipe_001",
+            )
+            self.assertTrue(
+                any("write_scope baseline capture failed" in v for v in violations)
+            )
+
     def test_rejects_noncanonical_workspace_root_argument(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)

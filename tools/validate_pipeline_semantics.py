@@ -896,6 +896,11 @@ def _validate_trial_meta(repo_root: Path, execution: NodeExecution, violations: 
         if not isinstance(log_ref, str):
             violations.append(f"{trial_meta_path}:command_log_ref/path invalid in source_command_ref")
             continue
+        if not log_ref.startswith("workspace/"):
+            violations.append(
+                f"{trial_meta_path}:command_log_ref/path must start with workspace/ ({log_ref})"
+            )
+            continue
         log_path = repo_root / log_ref if log_ref.startswith("workspace/") else Path(log_ref)
         if not log_path.exists():
             violations.append(f"{trial_meta_path}:command log missing ({log_ref})")
