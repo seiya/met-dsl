@@ -29,6 +29,12 @@ def _write_json(path: Path, payload: Any) -> None:
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
 
+def _write_text(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    body = text if text.endswith("\n") else f"{text}\n"
+    path.write_text(body, encoding="utf-8")
+
+
 def _orchestration_root(repo_root: Path, orchestration_id: str) -> Path:
     return repo_root / "workspace" / "orchestrations" / orchestration_id
 
@@ -155,6 +161,73 @@ def _launch_refs(orchestration_id: str, agent_run_id: str) -> tuple[str, str]:
     return f"{prefix}.request.json", f"{prefix}.response.json"
 
 
+def _launch_dialog_refs(orchestration_id: str, agent_run_id: str) -> tuple[str, str]:
+    prefix = f"workspace/orchestrations/{orchestration_id}/launches/{agent_run_id}"
+    return f"{prefix}.prompt.txt", f"{prefix}.reply.txt"
+
+
+def _child_launch_refs(orchestration_id: str, agent_run_id: str) -> tuple[str, str]:
+    prefix = f"workspace/orchestrations/{orchestration_id}/agents/{agent_run_id}/dialogs/child"
+    return f"{prefix}.request.json", f"{prefix}.response.json"
+
+
+def _child_dialog_refs(orchestration_id: str, agent_run_id: str) -> tuple[str, str]:
+    prefix = f"workspace/orchestrations/{orchestration_id}/agents/{agent_run_id}/dialogs/child"
+    return f"{prefix}.prompt.txt", f"{prefix}.reply.txt"
+
+
+def _coerce_launch_text(value: Any) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return value if value.strip() else None
+    if isinstance(value, (dict, list)):
+        return json.dumps(value, ensure_ascii=False, indent=2)
+    if isinstance(value, (bool, int, float)):
+        return str(value)
+    return None
+
+
+def _coerce_nested_launch_text(payload: dict[str, Any], path: tuple[str, ...]) -> str | None:
+    current: Any = payload
+    for key in path:
+        if not isinstance(current, dict):
+            return None
+        current = current.get(key)
+    return _coerce_launch_text(current)
+
+
+def _extract_launch_prompt_text(request_payload: dict[str, Any]) -> str:
+    # Prefer explicit full execution prompts, then fall back to short launch summaries.
+    for path in (
+        ("launch_prompt_full",),
+        ("execution_prompt",),
+        ("prompt",),
+        ("task",),
+        ("instruction",),
+        ("instructions",),
+        ("message",),
+        ("spawn_request", "prompt"),
+        ("spawn_request", "task"),
+        ("spawn_request", "instruction"),
+        ("spawn_request", "instructions"),
+        ("spawn_request", "message"),
+        ("launch_prompt",),
+    ):
+        text = _coerce_nested_launch_text(request_payload, path)
+        if text is not None:
+            return text
+    return json.dumps(request_payload, ensure_ascii=False, indent=2)
+
+
+def _extract_launch_reply_text(response_payload: dict[str, Any]) -> str:
+    for key in ("launch_reply", "reply", "response_text", "message", "result"):
+        text = _coerce_launch_text(response_payload.get(key))
+        if text is not None:
+            return text
+    return json.dumps(response_payload, ensure_ascii=False, indent=2)
+
+
 def _node_key_to_safe(node_key: str) -> str:
     token = node_key.strip()
     if "/" not in token or "@" not in token:
@@ -247,6 +320,7 @@ def init_orchestration(
     root = _orchestration_root(repo_root, orchestration_id)
     root.mkdir(parents=True, exist_ok=True)
     (root / "launches").mkdir(parents=True, exist_ok=True)
+    (root / "agents").mkdir(parents=True, exist_ok=True)
     (root / "steps").mkdir(parents=True, exist_ok=True)
 
     meta = {
@@ -301,11 +375,46 @@ def record_launch(
     root = _orchestration_root(repo_root, orchestration_id)
     launches_root = root / "launches"
     launches_root.mkdir(parents=True, exist_ok=True)
+    child_dialog_root = root / "agents" / child_agent_run_id / "dialogs"
+    child_dialog_root.mkdir(parents=True, exist_ok=True)
+
+    request_payload = dict(request_payload)
+    response_payload = dict(response_payload)
+
+    prompt_text = _extract_launch_prompt_text(request_payload)
+    reply_text = _extract_launch_reply_text(response_payload)
+    if not prompt_text.strip():
+        raise ValueError("launch prompt text must be non-empty")
+    if not reply_text.strip():
+        raise ValueError("launch reply text must be non-empty")
+
+    request_ref, response_ref = _launch_refs(orchestration_id, child_agent_run_id)
+    prompt_ref, reply_ref = _launch_dialog_refs(orchestration_id, child_agent_run_id)
+    child_request_ref, child_response_ref = _child_launch_refs(orchestration_id, child_agent_run_id)
+    child_prompt_ref, child_reply_ref = _child_dialog_refs(orchestration_id, child_agent_run_id)
+    request_payload.setdefault("launch_prompt_ref", prompt_ref)
+    request_payload.setdefault("child_launch_request_ref", child_request_ref)
+    request_payload.setdefault("child_launch_prompt_ref", child_prompt_ref)
+    response_payload.setdefault("launch_reply_ref", reply_ref)
+    response_payload.setdefault("child_launch_response_ref", child_response_ref)
+    response_payload.setdefault("child_launch_reply_ref", child_reply_ref)
 
     request_path = launches_root / f"{child_agent_run_id}.request.json"
     response_path = launches_root / f"{child_agent_run_id}.response.json"
+    prompt_path = launches_root / f"{child_agent_run_id}.prompt.txt"
+    reply_path = launches_root / f"{child_agent_run_id}.reply.txt"
+    child_request_path = child_dialog_root / "child.request.json"
+    child_response_path = child_dialog_root / "child.response.json"
+    child_prompt_path = child_dialog_root / "child.prompt.txt"
+    child_reply_path = child_dialog_root / "child.reply.txt"
     _write_json(request_path, request_payload)
     _write_json(response_path, response_payload)
+    _write_text(prompt_path, prompt_text)
+    _write_text(reply_path, reply_text)
+    _write_json(child_request_path, request_payload)
+    _write_json(child_response_path, response_payload)
+    _write_text(child_prompt_path, prompt_text)
+    _write_text(child_reply_path, reply_text)
 
     graph_path = root / "agent_graph.json"
     graph = _load_graph(graph_path)
@@ -318,10 +427,15 @@ def record_launch(
         graph["edges"].append(edge)
     _write_json(graph_path, graph)
 
-    request_ref, response_ref = _launch_refs(orchestration_id, child_agent_run_id)
     return {
         "launch_request_ref": request_ref,
         "launch_response_ref": response_ref,
+        "launch_prompt_ref": prompt_ref,
+        "launch_reply_ref": reply_ref,
+        "child_launch_request_ref": child_request_ref,
+        "child_launch_response_ref": child_response_ref,
+        "child_launch_prompt_ref": child_prompt_ref,
+        "child_launch_reply_ref": child_reply_ref,
     }
 
 
@@ -377,8 +491,11 @@ def record_agent_run(
     if role_token in {"step", "substep"}:
         payload.setdefault("context_isolated", True)
         request_ref, response_ref = _launch_refs(orchestration_id, agent_run_id)
+        prompt_ref, reply_ref = _launch_dialog_refs(orchestration_id, agent_run_id)
         payload.setdefault("launch_request_ref", request_ref)
         payload.setdefault("launch_response_ref", response_ref)
+        payload.setdefault("launch_prompt_ref", prompt_ref)
+        payload.setdefault("launch_reply_ref", reply_ref)
 
     with runs_path.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(payload, ensure_ascii=False) + "\n")

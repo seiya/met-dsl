@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import tempfile
 import unittest
@@ -118,11 +119,13 @@ shell_tool                       stable             true
                     "agent_role": "substep",
                     "step": "plan",
                     "substep": "generate",
+                    "launch_prompt": "Plan generate substep for node problem/shallow_water2d@0.3.0",
                 },
                 response_payload={
                     "agent_run_id": "substep_run_plan_generate_001",
                     "agent_session_id": "sess_substep_plan_generate_001",
                     "accepted": True,
+                    "launch_reply": "accepted: sess_substep_plan_generate_001",
                 },
             )
             record_launch(
@@ -134,11 +137,13 @@ shell_tool                       stable             true
                     "agent_run_id": "step_run_build_001",
                     "agent_role": "step",
                     "step": "build",
+                    "launch_prompt": "Build step for node problem/shallow_water2d@0.3.0",
                 },
                 response_payload={
                     "agent_run_id": "step_run_build_001",
                     "agent_session_id": "sess_step_build_001",
                     "accepted": True,
+                    "launch_reply": "accepted: sess_step_build_001",
                 },
             )
 
@@ -169,6 +174,8 @@ shell_tool                       stable             true
                     "agent_session_id": "sess_substep_plan_generate_001",
                     "launch_request_ref": launch_refs["launch_request_ref"],
                     "launch_response_ref": launch_refs["launch_response_ref"],
+                    "launch_prompt_ref": launch_refs["launch_prompt_ref"],
+                    "launch_reply_ref": launch_refs["launch_reply_ref"],
                     "started_at": "2026-03-11T00:00:10Z",
                     "finished_at": "2026-03-11T00:00:50Z",
                 },
@@ -219,6 +226,44 @@ shell_tool                       stable             true
             self.assertTrue((orch_root / "preflight.json").exists())
             self.assertTrue((orch_root / "agent_graph.json").exists())
             self.assertTrue((orch_root / "launches" / "substep_run_plan_generate_001.request.json").exists())
+            self.assertTrue((orch_root / "launches" / "substep_run_plan_generate_001.prompt.txt").exists())
+            self.assertTrue((orch_root / "launches" / "substep_run_plan_generate_001.reply.txt").exists())
+            self.assertTrue(
+                (
+                    orch_root
+                    / "agents"
+                    / "substep_run_plan_generate_001"
+                    / "dialogs"
+                    / "child.request.json"
+                ).exists()
+            )
+            self.assertTrue(
+                (
+                    orch_root
+                    / "agents"
+                    / "substep_run_plan_generate_001"
+                    / "dialogs"
+                    / "child.response.json"
+                ).exists()
+            )
+            self.assertTrue(
+                (
+                    orch_root
+                    / "agents"
+                    / "substep_run_plan_generate_001"
+                    / "dialogs"
+                    / "child.prompt.txt"
+                ).exists()
+            )
+            self.assertTrue(
+                (
+                    orch_root
+                    / "agents"
+                    / "substep_run_plan_generate_001"
+                    / "dialogs"
+                    / "child.reply.txt"
+                ).exists()
+            )
             self.assertTrue(
                 (
                     orch_root
@@ -233,6 +278,189 @@ shell_tool                       stable             true
             runs_text = (orch_root / "agent_runs.jsonl").read_text(encoding="utf-8")
             self.assertIn('"agent_run_id": "substep_run_plan_generate_001"', runs_text)
             self.assertIn('"agent_session_id": "sess_step_build_001"', runs_text)
+            self.assertIn('"launch_prompt_ref": "workspace/orchestrations/orch_001/launches/step_run_build_001.prompt.txt"', runs_text)
+            self.assertIn('"launch_reply_ref": "workspace/orchestrations/orch_001/launches/step_run_build_001.reply.txt"', runs_text)
+            request_payload = json.loads(
+                (
+                    orch_root / "launches" / "substep_run_plan_generate_001.request.json"
+                ).read_text(encoding="utf-8")
+            )
+            response_payload = json.loads(
+                (
+                    orch_root / "launches" / "substep_run_plan_generate_001.response.json"
+                ).read_text(encoding="utf-8")
+            )
+            self.assertEqual(
+                request_payload["child_launch_request_ref"],
+                "workspace/orchestrations/orch_001/agents/substep_run_plan_generate_001/dialogs/child.request.json",
+            )
+            self.assertEqual(
+                request_payload["child_launch_prompt_ref"],
+                "workspace/orchestrations/orch_001/agents/substep_run_plan_generate_001/dialogs/child.prompt.txt",
+            )
+            self.assertEqual(
+                response_payload["child_launch_response_ref"],
+                "workspace/orchestrations/orch_001/agents/substep_run_plan_generate_001/dialogs/child.response.json",
+            )
+            self.assertEqual(
+                response_payload["child_launch_reply_ref"],
+                "workspace/orchestrations/orch_001/agents/substep_run_plan_generate_001/dialogs/child.reply.txt",
+            )
+            self.assertEqual(
+                (orch_root / "launches" / "substep_run_plan_generate_001.prompt.txt").read_text(
+                    encoding="utf-8"
+                ),
+                (
+                    orch_root
+                    / "agents"
+                    / "substep_run_plan_generate_001"
+                    / "dialogs"
+                    / "child.prompt.txt"
+                ).read_text(encoding="utf-8"),
+            )
+            self.assertEqual(
+                (orch_root / "launches" / "substep_run_plan_generate_001.reply.txt").read_text(
+                    encoding="utf-8"
+                ),
+                (
+                    orch_root
+                    / "agents"
+                    / "substep_run_plan_generate_001"
+                    / "dialogs"
+                    / "child.reply.txt"
+                ).read_text(encoding="utf-8"),
+            )
+
+    def test_record_launch_prefers_prompt_over_launch_prompt_summary(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            init_orchestration(repo_root=repo_root, orchestration_id="orch_001")
+            write_preflight(
+                repo_root=repo_root,
+                orchestration_id="orch_001",
+                payload={
+                    "status": "pass",
+                    "can_launch_step_agents": True,
+                    "can_launch_substep_agents": True,
+                    "feature_states": {"multi_agent": True},
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}],
+                },
+            )
+            full_prompt = (
+                "Owner: workspace/plans/problem__shallow_water2d__0.3.0/ only.\n"
+                "Task: execute Plan generate for node problem/shallow_water2d@0.3.0.\n"
+                "Inputs: controlled_spec.md, tests.md, deps.yaml."
+            )
+            record_launch(
+                repo_root=repo_root,
+                orchestration_id="orch_001",
+                parent_agent_run_id="orch_run_001",
+                child_agent_run_id="substep_run_plan_generate_001",
+                request_payload={
+                    "launch_prompt": "short summary",
+                    "prompt": full_prompt,
+                },
+                response_payload={
+                    "agent_session_id": "sess_substep_plan_generate_001",
+                    "launch_reply": "accepted",
+                },
+            )
+            prompt_path = (
+                repo_root
+                / "workspace"
+                / "orchestrations"
+                / "orch_001"
+                / "launches"
+                / "substep_run_plan_generate_001.prompt.txt"
+            )
+            self.assertEqual(prompt_path.read_text(encoding="utf-8"), f"{full_prompt}\n")
+
+    def test_record_launch_prefers_launch_prompt_full_over_prompt(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            init_orchestration(repo_root=repo_root, orchestration_id="orch_001")
+            write_preflight(
+                repo_root=repo_root,
+                orchestration_id="orch_001",
+                payload={
+                    "status": "pass",
+                    "can_launch_step_agents": True,
+                    "can_launch_substep_agents": True,
+                    "feature_states": {"multi_agent": True},
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}],
+                },
+            )
+            record_launch(
+                repo_root=repo_root,
+                orchestration_id="orch_001",
+                parent_agent_run_id="orch_run_001",
+                child_agent_run_id="substep_run_plan_generate_001",
+                request_payload={
+                    "launch_prompt": "summary",
+                    "prompt": "less detailed prompt",
+                    "launch_prompt_full": "most detailed execution prompt",
+                },
+                response_payload={
+                    "agent_session_id": "sess_substep_plan_generate_001",
+                    "launch_reply": "accepted",
+                },
+            )
+            prompt_path = (
+                repo_root
+                / "workspace"
+                / "orchestrations"
+                / "orch_001"
+                / "launches"
+                / "substep_run_plan_generate_001.prompt.txt"
+            )
+            self.assertEqual(
+                prompt_path.read_text(encoding="utf-8"),
+                "most detailed execution prompt\n",
+            )
+
+    def test_record_launch_uses_spawn_request_task_when_present(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            init_orchestration(repo_root=repo_root, orchestration_id="orch_001")
+            write_preflight(
+                repo_root=repo_root,
+                orchestration_id="orch_001",
+                payload={
+                    "status": "pass",
+                    "can_launch_step_agents": True,
+                    "can_launch_substep_agents": True,
+                    "feature_states": {"multi_agent": True},
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}],
+                },
+            )
+            record_launch(
+                repo_root=repo_root,
+                orchestration_id="orch_001",
+                parent_agent_run_id="orch_run_001",
+                child_agent_run_id="substep_run_plan_generate_001",
+                request_payload={
+                    "launch_prompt": "summary only",
+                    "spawn_request": {
+                        "task": "Owner: workspace/plans/... only.\nTask: execute Plan generate.",
+                    },
+                },
+                response_payload={
+                    "agent_session_id": "sess_substep_plan_generate_001",
+                    "launch_reply": "accepted",
+                },
+            )
+            prompt_path = (
+                repo_root
+                / "workspace"
+                / "orchestrations"
+                / "orch_001"
+                / "launches"
+                / "substep_run_plan_generate_001.prompt.txt"
+            )
+            self.assertEqual(
+                prompt_path.read_text(encoding="utf-8"),
+                "Owner: workspace/plans/... only.\nTask: execute Plan generate.\n",
+            )
 
     def test_rejects_duplicate_agent_run_id(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

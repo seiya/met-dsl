@@ -24,10 +24,12 @@
 - `orchestration agent` は `dependency.resolved.yaml` の `topo_level` 昇順と依存充足条件に基づいて `step agent` または `substep agent` の起動可否を判定しなければならない。
 - すべての `agent` 実行は `agent_run_id` を持ち、入力参照・出力参照・親子関係を記録しなければならない。
 - `agent_runs.jsonl` の各行は `started_at` と `status` を必須記録とし、`status` が終端状態（`pass` / `fail` / `blocked` / `timeout` / `cancel`）の場合は `finished_at` を必須記録とする。
-- `step` / `substep` ロールの `agent_runs.jsonl` は `parent_agent_run_id` と `agent_backend` と `agent_model` と `context_id` と `context_isolated` と `agent_session_id` と `launch_request_ref` と `launch_response_ref` を必須記録とする。
+- `step` / `substep` ロールの `agent_runs.jsonl` は `parent_agent_run_id` と `agent_backend` と `agent_model` と `context_id` と `context_isolated` と `agent_session_id` と `launch_request_ref` と `launch_response_ref` と `launch_prompt_ref` と `launch_reply_ref` を必須記録とする。
 - `substep agent` の `parent_agent_run_id` は、当該 `substep` を起動した `orchestration agent_run_id` を指すことを許可する。
 - `spawn_agent` の応答で得た子 `agent` 識別子は `agent_session_id` として記録しなければならない。
 - `launch_request_ref` と `launch_response_ref` は `workspace/orchestrations/<orchestration_id>/launches/` 配下を参照し、参照先実体が存在しなければならない。
+- `launch_prompt_ref` と `launch_reply_ref` は `workspace/orchestrations/<orchestration_id>/launches/` 配下を参照し、参照先のテキスト証跡が存在しなければならない。
+- `launches/<agent_run_id>.request.json` には `launch_prompt_ref` を、`launches/<agent_run_id>.response.json` には `launch_reply_ref` を保持し、`agent_runs.jsonl` の参照値と一致させなければならない。
 - `agent_graph.json` の `edge` は、`orchestration -> step` または `orchestration -> substep` を正本とする。互換運用として `step -> substep` を許容してもよいが、`substep` を親ロールとする `edge` を禁止する。
 - `agent` 実行の失敗、`timeout`、`cancel` はメタデータへ記録し、推測補完で継続してはならない。
 - `orchestration agent` は子 `agent` の完了待機中に当該子 `agent` の責務を代行してはならない。標準 `substep` を持たない工程では `step agent` も同様に子 `agent` の責務を代行してはならない。
@@ -66,7 +68,7 @@
 ## 運用ルール
 1. `workflow` 開始時に `orchestration_id` を発行し、`workspace/orchestrations/<orchestration_id>/orchestration_meta.json` を作成する。
 2. `workflow` 開始前に事前検査結果を `workspace/orchestrations/<orchestration_id>/preflight.json` へ記録し、`can_launch_step_agents=true` と `can_launch_substep_agents=true` を満たさない場合は `fail` として停止する。
-3. `orchestration agent` は `step agent` または `substep agent` の起動要求ごとに `launches/<agent_run_id>.request.json` と `launches/<agent_run_id>.response.json` を保存し、`agent_runs.jsonl` の `launch_request_ref` と `launch_response_ref` へ参照を記録する。
+3. `orchestration agent` は `step agent` または `substep agent` の起動要求ごとに `launches/<agent_run_id>.request.json` と `launches/<agent_run_id>.response.json` と `launches/<agent_run_id>.prompt.txt` と `launches/<agent_run_id>.reply.txt` を保存し、`agent_runs.jsonl` の `launch_request_ref` と `launch_response_ref` と `launch_prompt_ref` と `launch_reply_ref` へ参照を記録する。
 4. `orchestration agent` は `dependency.resolved.yaml` を読み、`node_key` と `topo_level` に基づく実行キューを確定する。
 5. `orchestration agent` は起動対象ごとに `step agent` または `substep agent` を発行し、`node_key`、`step`、`plan_ref`、`pipeline_ref`、`dependency_ref` を入力として渡す。
 6. `orchestration agent` は `step` を持つ工程では対象 `step` の `実行入力` と `検証入力` と `期待出力` を明示し、`substep` を持つ工程では対象 `substep` の `実行入力` と `検証入力` と `期待出力` を明示しなければならない。
@@ -93,7 +95,8 @@
 - `workflow` ごとに `orchestration_id` が発行され、`orchestration_meta.json` が存在する。
 - 各 `step` または各 `substep` が独立 `agent_run_id` を持つ。
 - `step` と `substep` の `context_id` が重複せず、全件で `context_isolated=true` が記録される。
-- `step` と `substep` の `agent_runs.jsonl` に `agent_session_id` と `launch_request_ref` と `launch_response_ref` が記録され、参照先実体が存在する。
+- `step` と `substep` の `agent_runs.jsonl` に `agent_session_id` と `launch_request_ref` と `launch_response_ref` と `launch_prompt_ref` と `launch_reply_ref` が記録され、参照先実体が存在する。
+- `launches/<agent_run_id>.request.json` の `launch_prompt_ref` と `launches/<agent_run_id>.response.json` の `launch_reply_ref` が `agent_runs.jsonl` の参照値と一致する。
 - `preflight.json` が存在し、`can_launch_step_agents=true` と `can_launch_substep_agents=true` を満たす。
 - `preflight.json` の `pass` 条件と、子 `agent` 起動直前 live probe の `pass` 条件が同時に満たされる。
 - `agent_graph.json` で `orchestration -> step` または `orchestration -> substep` の親子関係を追跡できる。

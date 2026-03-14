@@ -22,6 +22,7 @@ repair_reason: <repair_reason>
 - この step は標準 substep を持たない工程である。自身で step 契約を完了させること。
 - 入力不足時は推測補完せず fail で停止すること。
 - 完了後は required_outputs と failed_substeps と substep_agent_run_ids を親へ返すこと。
+- 完了返答には `launch_reply` として、実施内容と判定結果を平文で含めること。
 ```
 
 ## `substep agent` 起動要求テンプレート
@@ -50,4 +51,5 @@ repair_reason: <repair_reason>
 - `repair_strategy=reuse` の場合は、`repair_target_agent_run_id` の出力との差分修正に限定すること。
 - `repair_strategy=restart` の場合は、過去出力を流用せず契約入力から再生成すること。
 - 完了時は成果物参照と status を `orchestration agent` へ返すこと。
+- 完了返答には `launch_reply` として、実施内容と判定結果を平文で含めること。
 ```

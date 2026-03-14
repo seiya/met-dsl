@@ -23,6 +23,7 @@ description: `Codex CLI` で `workflow` 全体を開始し、`orchestration agen
 - `preflight.json` の手動編集または後編集による `pass` 化を禁止する。`preflight` は `tools/codex_orchestration_runtime.py preflight` の実行結果を正本とする。
 - 子 `agent` 起動直前に live preflight gate を満たすことを必須とし、live 検査が `fail` の場合は `record-launch` を実行してはならない。
 - `step agent` / `substep agent` の起動要求本文には、入力契約、期待出力、保存先、失敗時停止条件、`spawn_agent` 義務を明示しなければならない。
+- 子 `agent` 起動ごとに、起動要求本文を `launches/<agent_run_id>.prompt.txt`、起動返答本文を `launches/<agent_run_id>.reply.txt` へ保存し、`agent_runs.jsonl` の `launch_prompt_ref` と `launch_reply_ref` に参照を記録しなければならない。
 - `openai.yaml` の表示名だけで orchestration 契約を満たしたとみなしてはならない。
 - 子 `agent` の返却結果を評価した後、`issue_severity`（`minor` / `major` / `critical`）を判定し、再投入が必要な場合は `repair_strategy`（`reuse` / `restart`）を選択しなければならない。
 - `repair_strategy=reuse` は契約不変の局所修正に限定し、`repair_strategy=restart` は契約再解釈または広範囲再生成が必要な場合に選択しなければならない。
@@ -33,7 +34,7 @@ description: `Codex CLI` で `workflow` 全体を開始し、`orchestration agen
 1. `python3 tools/codex_orchestration_runtime.py init --repo-root <repo_root> --orchestration-id <orchestration_id> --spec-ref <spec_ref> --dependency-ref <dependency_ref>` を実行し、`workspace/orchestrations/<orchestration_id>/` を初期化する。
 2. `python3 tools/codex_orchestration_runtime.py preflight --repo-root <repo_root> --orchestration-id <orchestration_id>` を実行し、`preflight.json` を生成する。
 3. `preflight.json` の `can_launch_step_agents=true` と `can_launch_substep_agents=true` を満たさない場合は workflow を開始しない。
-4. `orchestration agent` は `references/launch_prompts.md` の `step agent` 用または `substep agent` 用テンプレートに従って子 `agent` を起動し、起動要求と起動応答を `record-launch` で保存する。
+4. `orchestration agent` は `references/launch_prompts.md` の `step agent` 用または `substep agent` 用テンプレートに従って子 `agent` を起動し、起動要求と起動応答を `record-launch` で保存する。`record-launch` では `launch_prompt_ref` と `launch_reply_ref` も同時に記録する。
 5. 子 `agent` 完了後は `python3 tools/codex_orchestration_runtime.py record-agent-run --repo-root <repo_root> --orchestration-id <orchestration_id> --agent-run-json '<json>'` を実行し、`agent_runs.jsonl` へ 1 行追記する。
 6. `substep` を持つ工程では、返却結果を評価して `issue_severity` と `repair_strategy` を決定する。再投入が必要な場合は `repair_target_agent_run_id` と `repair_reason` を起動要求へ付与して再起動し、`record-launch` を追加する。
 7. `repair_strategy=reuse` の再投入では、対象 `substep` の契約を変更せず差分修正だけを要求する。`repair_strategy=restart` の再投入では、対象 `substep` の契約入力から再生成させる。
@@ -50,6 +51,7 @@ description: `Codex CLI` で `workflow` 全体を開始し、`orchestration agen
 - `workspace/orchestrations/<orchestration_id>/preflight.json` が存在し、`pass` 条件を満たしている。
 - `agent_runs.jsonl` に `orchestration` と、必要に応じて `step` / `substep` の各ロールが記録されている。
 - `launches/` の要求と応答が `agent_runs.jsonl` の `launch_request_ref` / `launch_response_ref` と一致する。
+- `launches/` の prompt と reply が `agent_runs.jsonl` の `launch_prompt_ref` / `launch_reply_ref` と一致する。
 - `step_result.json` が `executor_agent_run_id` と `substep_agent_run_ids` を保持している。
 - 再投入を実施した場合、該当 `launch` 要求に `issue_severity` と `repair_strategy` と `repair_target_agent_run_id` と `repair_reason` が含まれている。
 - `repair_strategy=reuse` と `repair_strategy=restart` の選択が、`ORCHESTRATION.md` の判定条件と一致している。

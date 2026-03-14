@@ -2764,7 +2764,13 @@ def _validate_orchestration_hierarchy(
                     expected_launch_prefix = (
                         f"workspace/orchestrations/{orchestration_dir.name}/launches/"
                     )
-                    for key in ("launch_request_ref", "launch_response_ref"):
+                    launch_refs: dict[str, str] = {}
+                    for key in (
+                        "launch_request_ref",
+                        "launch_response_ref",
+                        "launch_prompt_ref",
+                        "launch_reply_ref",
+                    ):
                         launch_ref = item.get(key)
                         if not isinstance(launch_ref, str) or not launch_ref.strip():
                             violations.append(
@@ -2777,11 +2783,78 @@ def _validate_orchestration_hierarchy(
                                 f"{runs_path}:line {idx + 1} {key} must start with {expected_launch_prefix} ({ref_token})"
                             )
                             continue
+                        launch_refs[key] = ref_token
                         launch_path = workspace_path.parent / ref_token
                         if not launch_path.exists():
                             violations.append(
                                 f"{runs_path}:line {idx + 1} {key} target not found ({ref_token})"
                             )
+                            continue
+                        if key in {"launch_prompt_ref", "launch_reply_ref"}:
+                            if not launch_path.is_file():
+                                violations.append(
+                                    f"{runs_path}:line {idx + 1} {key} target must be file ({ref_token})"
+                                )
+                                continue
+                            launch_text = launch_path.read_text(
+                                encoding="utf-8", errors="ignore"
+                            )
+                            if not launch_text.strip():
+                                violations.append(
+                                    f"{runs_path}:line {idx + 1} {key} target must be non-empty ({ref_token})"
+                                )
+
+                    request_ref = launch_refs.get("launch_request_ref")
+                    prompt_ref = launch_refs.get("launch_prompt_ref")
+                    if request_ref is not None and prompt_ref is not None:
+                        request_path = workspace_path.parent / request_ref
+                        if request_path.exists():
+                            try:
+                                request_payload = _read_json(request_path)
+                            except json.JSONDecodeError:
+                                violations.append(
+                                    f"{request_path}: launch request must be valid json object"
+                                )
+                            else:
+                                if not isinstance(request_payload, dict):
+                                    violations.append(
+                                        f"{request_path}: launch request must be json object"
+                                    )
+                                else:
+                                    payload_prompt_ref = request_payload.get("launch_prompt_ref")
+                                    if (
+                                        not isinstance(payload_prompt_ref, str)
+                                        or payload_prompt_ref.strip() != prompt_ref
+                                    ):
+                                        violations.append(
+                                            f"{request_path}:launch_prompt_ref must equal agent_runs launch_prompt_ref ({prompt_ref})"
+                                        )
+
+                    response_ref = launch_refs.get("launch_response_ref")
+                    reply_ref = launch_refs.get("launch_reply_ref")
+                    if response_ref is not None and reply_ref is not None:
+                        response_path = workspace_path.parent / response_ref
+                        if response_path.exists():
+                            try:
+                                response_payload = _read_json(response_path)
+                            except json.JSONDecodeError:
+                                violations.append(
+                                    f"{response_path}: launch response must be valid json object"
+                                )
+                            else:
+                                if not isinstance(response_payload, dict):
+                                    violations.append(
+                                        f"{response_path}: launch response must be json object"
+                                    )
+                                else:
+                                    payload_reply_ref = response_payload.get("launch_reply_ref")
+                                    if (
+                                        not isinstance(payload_reply_ref, str)
+                                        or payload_reply_ref.strip() != reply_ref
+                                    ):
+                                        violations.append(
+                                            f"{response_path}:launch_reply_ref must equal agent_runs launch_reply_ref ({reply_ref})"
+                                        )
 
         for edge_idx, parent_id, child_id in graph_edges:
             parent_role = run_roles.get(parent_id)
