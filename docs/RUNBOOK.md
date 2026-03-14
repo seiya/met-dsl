@@ -10,6 +10,7 @@
 - 入力: `CONTROLLED_SPEC`（物理・アルゴリズム定義）
 - 入力: `tests`（自然言語中心のケース展開・実行条件・判定閾値）
 - 生成: `case.resolved.yaml`（物理アルゴリズム A の固定）
+- 生成: `algorithm.resolved.yaml`（生成契約の固定）
 - 生成: `impl.resolved.yaml`（実行アルゴリズム B の固定または探索候補）
 - 生成: `dependency.resolved.yaml`（依存 `DAG` と `topo_level` の固定）
 - 生成: `derived_contract.json`（`controlled_spec.md` と `tests.md` と `deps.yaml` から導出した検証契約）
@@ -36,7 +37,7 @@
 - `write_scope` 検査で `workspace/` 配下以外の差分を検出した場合、当該ステージを `fail` とし、`write_scope_violation.json` を `workspace/` 配下へ記録する。
 - `Generate verify` のデータ依存判定は `derived_contract.json` の `semantic_dependency.required_sources` を正本とし、特定計算様式の一律必須化を禁止する。
 - `Generate verify` の出力契約判定は `derived_contract.json` の `io_contract.outputs` を正本とし、`evidence_ref` と `shape_expr` の整合を必須検査する。
-- 出力形式、入出力契約、判定条件の要求定義は `controlled_spec.md` と `tests.md` と `deps.yaml` と `derived_contract.json` と `docs/` 正本から取得し、`tools/` 配下の検証 `python` スクリプトと `quality check` 実装を要求定義入力へ使用してはならない。
+- 出力形式、入出力契約、判定条件の要求定義は `controlled_spec.md` と `tests.md` と `deps.yaml` と `algorithm.resolved.yaml` と `derived_contract.json` と `docs/` 正本から取得し、`tools/` 配下の検証 `python` スクリプトと `quality check` 実装を要求定義入力へ使用してはならない。
 - 要求定義の不足を検証実装から逆算補完してはならない。不足時は当該ステージを `fail` とする。
 - `Judge` は固定スクリプト検査に加えて `LLM` 意味検査を必須実行し、`semantic_review.json` の `decision=pass` を開始条件に含める。
 - `Judge` 開始前に、対象 `node_key` の同一 `execution_id` 配下へ `run_program` 実行記録と `diagnostics.json` と `perf.json` と `raw` 実行証跡が揃っていることを検証する。未達時は `Judge fail` とする。
@@ -67,12 +68,12 @@
 ## 2. 最小ループ
 1. **Spec 更新**: `Controlled Spec` を修正し、曖昧さ・欠落を解消する。
 2. **Test 更新**: 実験条件・判定条件を `tests.md` で更新する。
-3. **Plan 生成**: `case.resolved.yaml` を決定的に生成し、`controlled_spec.md` と `tests.md` と `deps.yaml` から `derived_contract.json` を導出する。`derived_contract.json` は `tests.md` の全 `test_id` を対象に `test_evidence_requirements` を定義し、各判定再計算に必要な `required_raw_variables` を明示する。`artifact=state_snapshots` を必須宣言する場合は `raw_requirements.required_evidence[].schema` に `variables[].name` と `variables[].shape_expr` と `time_variable` と `time_shape_expr` を必須記録する。`LLM` を利用する場合は `SPEC.md` の「`LLM` の扱い」を適用する。
+3. **Plan 生成**: `case.resolved.yaml` を決定的に生成し、`controlled_spec.md` と `deps.yaml` と依存解決結果から `algorithm.resolved.yaml` を導出し、`controlled_spec.md` と `tests.md` と `deps.yaml` から `derived_contract.json` を導出する。`algorithm.resolved.yaml` は `execution_mode` と `steps[]` と `ordering` と `control_condition` と `iteration_contract` と `update_semantics` と `temporaries` と `derived_field_rules` と `invariants` と `splitting_policy` を保持し、`Generate` の正本入力として使用する。`derived_contract.json` は `tests.md` の全 `test_id` を対象に `test_evidence_requirements` を定義し、各判定再計算に必要な `required_raw_variables` を明示する。`artifact=state_snapshots` を必須宣言する場合は `raw_requirements.required_evidence[].schema` に `variables[].name` と `variables[].shape_expr` と `time_variable` と `time_shape_expr` を必須記録する。`LLM` を利用する場合は `SPEC.md` の「`LLM` の扱い」を適用する。
 4. **依存解決 Plan 生成**: `deps.yaml` と `spec_catalog.yaml` から `dependency.resolved.yaml` を生成し、`node_key`、`direct_deps`、`transitive_deps`、`topo_level` を固定する。`deps.yaml` と `spec_catalog.yaml` から再構成した `expected_node_set` と `dependency.resolved.yaml` の `node_key` 集合一致を確認し、重複と欠落を `fail` とする。
 5. **実装 Plan 決定**: `impl.resolved.yaml` を固定（探索する場合は候補集合を用意）する。言語既定値、`OpenMP` 既定値、既定値逸脱条件は `IMPL_PLAN_SPEC.md` を適用する。
 6. **階層実行順序の固定**: `dependency.resolved.yaml` の `topo_level` 昇順で実行順序を固定する。親 `node` は直下依存 `node` が `pass` または `xfail` になるまで開始してはならない。同一 `topo_level` の独立 `node` も 1 件ずつ逐次実行する。
 7. **`node` 単位 workflow 発行**: `orchestration agent` が各 `node_key` ごとに個別 `plan_id` と個別 `pipeline_id` を発行する。`substep` を持つ工程では `substep agent` を直接起動し、標準 `substep` を持たない工程では `step agent` を起動する。
-8. **生成**: 対象 `node` ごとに `LLM` またはテンプレ補完で `model` と `runner` を分離して生成する。`LLM` を利用する場合は `SPEC.md` の「`LLM` の扱い」を適用する。生成直後に `runner` の外部インタプリタ起動禁止と、`model` の `no-op` / 固定値返却専用実装禁止を検査し、違反時は `Generate fail` とする。依存を持つ `node` は、`dependency.resolved.yaml` の `direct_deps` で解決された依存 `node` の公開 `operation` を呼び出す実装を必須とし、同等機能の再実装を禁止する。`toolchain.language=fortran` で依存 `component` を持つ `node` は、依存 `spec_id` ごとに `model` 内の `use <spec_id>_model` と `call <spec_id>__*` を必須とし、`subroutine <spec_id>__*` の再定義を禁止する。`Generate verify` は `derived_contract.json` に基づき、依存 `operation` と出力指標のデータ依存、および解析式直接代入による `diagnostics` 生成を検査する。`toolchain.language=fortran` の場合は `module` 名とソースファイル名を一致させ、`<module_name>.f90` 形式で出力する。`toolchain.build_system=make` かつ `toolchain.language=fortran` の場合は `src/Makefile` に `use` 依存に対応した `.mod` または依存 `.o` の前提条件を各オブジェクトターゲットへ明示し、依存欠落を禁止する。
+8. **生成**: 対象 `node` ごとに `LLM` またはテンプレ補完で `model` と `runner` を分離して生成する。`LLM` を利用する場合は `SPEC.md` の「`LLM` の扱い」を適用する。`Generate` は `controlled_spec.md` を直接入力にしてはならず、演算構成の要求定義は `algorithm.resolved.yaml` から解釈する。生成直後に `runner` の外部インタプリタ起動禁止と、`model` の `no-op` / 固定値返却専用実装禁止を検査し、違反時は `Generate fail` とする。依存を持つ `node` は、`dependency.resolved.yaml` の `direct_deps` で解決された依存 `node` の公開 `operation` を呼び出す実装を必須とし、同等機能の再実装を禁止する。`toolchain.language=fortran` で依存 `component` を持つ `node` は、依存 `spec_id` ごとに `model` 内の `use <spec_id>_model` と `call <spec_id>__*` を必須とし、`subroutine <spec_id>__*` の再定義を禁止する。`Generate verify` は `algorithm.resolved.yaml` と `derived_contract.json` に基づき、演算構成、依存 `operation`、出力指標のデータ依存、および解析式直接代入による `diagnostics` 生成を検査する。`toolchain.language=fortran` の場合は `module` 名とソースファイル名を一致させ、`<module_name>.f90` 形式で出力する。`toolchain.build_system=make` かつ `toolchain.language=fortran` の場合は `src/Makefile` に `use` 依存に対応した `.mod` または依存 `.o` の前提条件を各オブジェクトターゲットへ明示し、依存欠落を禁止する。
 9. **Build**: 対象 `node` ごとに `MCP` サーバーの `compile_project` で依存関係を扱える標準ビルドツールを実行する（`fortran` / `c` 系の既定値は `make`）。依存を持つ `node` は、依存 `operation` の解決先が `dependency.resolved.yaml` と一致することを検証し、不一致時は `Build fail` とする。`toolchain.build_system=make` の場合は `make -j` で成否が変化しない依存記述を必須とする。
 10. **実行**: 対象 `node` ごとに `MCP` サーバーの `run_program` で `runner`（例: `simulate`）を実行し、`run_program` 実行コマンドに `case.resolved.yaml` を必ず含める。`runner` 経由で `model` を呼び出して `diagnostics` / `perf` を出力し、`verdict.json` と `aggregate_verdict.json` と `summary.json` と `trial_meta.json` の直接出力を禁止する。対象 `node` ごとに `execution_id/<node_key>/raw/` へ判定再計算用の一次証跡を保存する。`raw` 構成の必須条件は `derived_contract.json` の `raw_requirements.required_evidence` と `test_evidence_requirements` を正本とする。`artifact=state_snapshots` を必須宣言しない `spec` では状態スナップショットを必須化してはならない。`raw` へ `diagnostics` の複写を保存してはならない。
 11. **実行証跡検証**: `python3 tools/validate_pipeline_semantics.py` を実行し、`raw` の一次証跡、`quality check`、`trial_meta` の追跡情報、`Generate` 由来の固定値生成パターンを検証する。`derived_contract.json` が宣言する `state_snapshots` の変数名と形状式、および `time_variable` の形状式と `test_evidence_requirements` の整合を必須検証する。検証対象は `dependency.resolved.yaml` の `all_nodes` に対応する全 `pipeline_root` とし、`all_nodes` の未発行 `plan` または未発行 `pipeline` を検出した場合を含めて `fail` の場合は `Judge` を開始しない。
@@ -81,6 +82,7 @@
 14. **強制停止**: 入力不足または前段成果物不足で当該工程を進められない場合、当該工程を `fail` で停止する。推定補完や人工ファイル生成で進めてはならない。
 15. **記録**: `spec_version` / `test_profile_version` / `case_hash` / `impl_hash` / `git_sha` を保存する。
 - `plan_id` / `pipeline_id` / `generation_id` / `build_id` / `execution_id` を保存する。
+- `plan_id` は `case_hash12` と `algorithm_hash12` と `impl_hash12` を識別できる形式にする。
 - `node_key` / `topo_level` / `dependency_ref` を保存する。
 - `LLM` 利用ステージは各ステージの `<stage>_meta.json`（コード生成は `generate_meta.json`）に `attempt_count` / `verification_status` / `last_fail_reason` / `debug_mode` を保存する。
 - `step` / `substep` の `agent_runs.jsonl` は `agent_backend` / `agent_model` / `context_id` / `context_isolated=true` を記録する。
@@ -108,7 +110,9 @@
 ## 4. 運用の最小チェックリスト
 - `Spec` に未定義項目がない。
 - `case.resolved` が決定的に生成できる。
+- `algorithm.resolved.yaml` が `Generate` に必要な演算構成を単独で保持している。
 - `derived_contract.json` が `controlled_spec.md` と `tests.md` と `deps.yaml` から導出されている。
+- `derived_contract.json` が生成契約を保持していない。
 - `derived_contract.json` が `io_contract.inputs` と `io_contract.outputs` を保持し、`outputs` の `evidence_ref` が `raw` 実体に解決できる。
 - `derived_contract.json` の `test_evidence_requirements` が `tests.md` の全 `test_id` を過不足なく保持している。
 - `derived_contract.json` の `raw_requirements.required_evidence` で `artifact=state_snapshots` を必須宣言する場合、`schema.variables[].name` と `schema.variables[].shape_expr` と `schema.time_variable` と `schema.time_shape_expr` が定義されている。
@@ -116,6 +120,7 @@
 - `write_scope` 検査で `workspace/` 配下以外の差分が検出されていない。
 - `python` 実行時の `__pycache__` 出力先が `workspace/` 配下に限定されている。
 - `derived_contract.json` の `semantic_dependency.required_sources` に基づく `Generate verify` 判定が実施されている。
+- `algorithm.resolved.yaml` の `steps` と `ordering` と `control_condition` と `iteration_contract` に基づく `Generate verify` 判定が実施されている。
 - `raw` の必須構成が `derived_contract.json` の `raw_requirements.required_evidence` と一致している。
 - `raw/state_snapshots` の各 `snapshot*.json` が `derived_contract.json` の `schema` で宣言された変数名とサイズを満たしている。
 - `LLM` 利用ステージのメタデータで `verification_status` が `pass` である。

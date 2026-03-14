@@ -12,10 +12,11 @@
 - **component_catalog.yaml**: 再利用 `component` / `operation` の台帳。保存先は `releases/registry/component_catalog.yaml` とし、責務、公開 `API`、互換性、実装状態を保持する。
 - **deps.yaml**: 各 `spec` が要求する依存宣言。`component_id` / `profile_id` と `version constraint` を定義する。
 - **case.yaml**: 人間が書く（または将来 `Spec` から生成する）テストケース定義。`sweep` / `refinement` などを含み得る。
-- **case.resolved.yaml**: テストランナーが生成する「決定済み」入力。`sweep` 展開、物理アルゴリズム（後述）と数値条件を決定したもの。`runner`（例: `simulate`）がこれを読む。出力契約を保持してはならない。
+- **case.resolved.yaml**: テストランナーが生成する「決定済み」入力。`sweep` 展開と実行時入力の決定値を保持する。`runner`（例: `simulate`）がこれを読む。演算構成、出力契約、検証契約を保持してはならない。
 - **impl.resolved.yaml**: 実装計画（`Implementation Plan`）。計算過程（並列化、メモリ配置、融合、ブロッキング等）に関する可変パラメタを決定したもの。性能チューニングの探索対象になり得る。
 - **dependency.resolved.yaml**: 依存解決結果の正本。`node_key`、`direct_deps`、`transitive_deps`、`topo_level` を保持する。
-- **derived_contract.json**: `Plan verify` が導出する検証契約。`io_contract.inputs` / `io_contract.outputs` と `semantic_dependency.required_sources` と `raw_requirements.required_evidence` と `test_evidence_requirements` を保持し、`Generate verify` と `Execute` / `Judge` の判定正本として使用する。
+- **algorithm.resolved.yaml**: `Plan` が導出する生成契約。`problem` の統合順序、`component operation` の呼び出し順序、条件分岐、反復、列処理、派生量定義、更新対象、`invariants` を保持し、`Generate` の正本入力として使用する。
+- **derived_contract.json**: `Plan verify` が導出する検証契約。`io_contract.inputs` / `io_contract.outputs` と `semantic_dependency.required_sources` と `raw_requirements.required_evidence` と `test_evidence_requirements` を保持し、`Generate verify` と `Execute` / `Judge` の判定正本として使用する。生成契約を保持してはならない。
 - **expected_node_set**: `deps.yaml` と `spec_catalog.yaml` から再構成した期待 `node` 集合。`dependency.resolved.yaml` の網羅検証に使用する。
 - **node workflow**: 単一 `node_key` を対象にした `Plan -> Generate -> Build -> Execute -> Judge` の 1 系列実行。
 - **orchestration agent**: `workflow` 全体の進行制御を担当する統括エージェント。`step` / `substep` 起動、依存順序管理、状態集約を担当し、工程成果物を直接生成しない。`substep` を持つ工程では `substep agent` を直接管理し、`step_result.json` を集約する。
@@ -23,7 +24,7 @@
 - **substep agent**: 単一 `substep` を担当するエージェント。入力契約に従って成果物を生成し、`orchestration agent` へ返却する。
 - **node_key_safe**: `node_key` の保存用表記。推奨形式は `<spec_kind>__<spec_id>__<spec_version>`。
 - **orchestration_id**: 1 回の `workflow` 実行全体を識別する `ID`。`workspace/orchestrations/<orchestration_id>/` の保存キーとして使用する。
-- **plan_id**: `node` 単位で `case.resolved.yaml` と `impl.resolved.yaml` と `dependency.resolved.yaml` の組を識別する `ID`。推奨形式は `<node_key_safe>_<case_hash12>_<impl_hash12>`。
+- **plan_id**: `node` 単位で `case.resolved.yaml` と `algorithm.resolved.yaml` と `impl.resolved.yaml` と `dependency.resolved.yaml` の組を識別する `ID`。推奨形式は `<node_key_safe>_<case_hash12>_<algorithm_hash12>_<impl_hash12>`。
 - **pipeline_id**: `node` 単位の `Generate -> Build -> Execute` 系列を識別する `ID`。推奨形式は `<plan_id>_<utc_ts>_<seq3>`。
 - **generation_id / build_id / execution_id**: 各段階の試行を識別する `ID`。
 - **agent_run_id**: `step agent` / `substep agent` / `orchestration agent` の 1 回の実行を識別する `ID`。`parent_agent_run_id` と組で親子関係を表す。
@@ -64,6 +65,7 @@
 - **fail-fast 停止**: 工程入力不足または契約不一致を検知した時点で当該工程を `fail` で停止し、推測補完や人工生成で継続しない運用規則。
 - **pipeline semantic validation**: `python3 tools/validate_pipeline_semantics.py` による内容検証ゲート。`raw` 一次証跡、`trial_meta` 追跡整合、`quality check` 比較正本、固定値生成パターン、`copy_based_artifact_reuse` を機械検証する。
 - **raw snapshot schema**: `problem` `node` の `raw/state_snapshots/snapshot_schema.json` に保存する項目定義。`variables[].name` と `variables[].shape_expr` と `time_variable` と `time_shape_expr` により、各問題設定で判定再計算に使用する状態量と時刻情報を表す。
+- **algorithm contract**: `algorithm.resolved.yaml` が保持する演算構成 `IR`。`execution_mode` と `steps[]` と `ordering` と `control_condition` と `iteration_contract` と `update_semantics` と `temporaries` と `derived_field_rules` と `invariants` と `splitting_policy` を必須語彙とする。
 
 補足:
 - `perf.json` は `diagnostics.json` とは分離して出力する（同居しない）。
@@ -103,7 +105,7 @@ bitwise 一致は要求しない。以下の性質で一致を判定する。
 ### A) 物理アルゴリズム（Physics-affecting）
 - 物理結果（精度・安定性）に影響する選択。
 - 例: 空間離散化（中央 2 次、一次風上、`WENO` 等）、時間積分、フィルタ、拡散、物理過程の近似、境界条件の数値実装。
-- **`case.resolved.yaml` で決定し、決定的である必要がある**（同じ `case` なら同じ物理解が期待される）。
+- **`case.resolved.yaml` と `algorithm.resolved.yaml` で決定し、決定的である必要がある**（同じ `case` と同じ `algorithm` なら同じ物理解が期待される）。
 
 ### B) 実行アルゴリズム（Execution-only / Performance-affecting）
 - 物理結果（理想的には）を変えず、計算過程（性能、メモリ、並列効率）に影響する選択。

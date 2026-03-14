@@ -1,6 +1,6 @@
 ---
 name: workflow-generate-generate
-description: Generate ステージの generate を実行し、`case.resolved.yaml` と `impl.resolved.yaml` と `dependency.resolved.yaml` から `model` と `runner` を分離した実装コードを作成するときに使用する。`generation_id` 発行と `generate_meta.json` 出力に適用する。
+description: Generate ステージの generate を実行し、`case.resolved.yaml` と `algorithm.resolved.yaml` と `impl.resolved.yaml` と `dependency.resolved.yaml` から `model` と `runner` を分離した実装コードを作成するときに使用する。`generation_id` 発行と `generate_meta.json` 出力に適用する。
 ---
 
 # Workflow Generate Generate
@@ -13,14 +13,16 @@ Generate ステージの生成責務を固定し、`Build` 可能な実装成果
 - `generate_meta.json` を生成する作業
 
 ## 要件
-- 入力は `case.resolved.yaml` と `impl.resolved.yaml` と `dependency.resolved.yaml` とする。
+- 入力は `case.resolved.yaml` と `algorithm.resolved.yaml` と `impl.resolved.yaml` と `dependency.resolved.yaml` とする。
+- `controlled_spec.md` を直接入力にしてはならない。演算構成の要求定義は `algorithm.resolved.yaml` から解釈しなければならない。
 - 実装コードは `model` と `runner` を分離し、`runner` は `model` を `call` / `use` / `import` で利用する。
 - `runner` に物理更新ロジックを重複実装しない。
 - `toolchain.language` が `fortran` / `c` / `cpp` / `mixed` 系の場合、`runner` から `python` / `bash` / `sh` / `node` などの外部インタプリタを起動してはならない。
 - `model` は対象 `node` の演算契約を実装し、固定値返却専用、固定 `JSON` 出力専用、`no-op` 専用実装を禁止する。
-- `problem` かつ `spec_id` が `2d` または `3d` を含む `node` は、`derived_contract.json` の `numerical_kernel_contract` を入力契約として読み取り、`state_variables` を更新計算へ必須利用する。
+- `problem` かつ `spec_id` が `2d` または `3d` を含む `node` は、`algorithm.resolved.yaml` の状態更新契約を入力として読み取り、`state_variables` を更新計算へ必須利用する。
 - `problem` かつ `spec_id` が `2d` または `3d` を含む `node` は、`case_id` 分岐とスカラー定数代入のみで複数の `diagnostics` 指標を生成してはならない。
-- `numerical_kernel_contract` が欠落、または `state_variables` と `required_update_paths` が欠落する場合は `Generate fail` とし、推測補完で生成を継続してはならない。
+- `algorithm.resolved.yaml` の状態更新契約が欠落、または `state_variables` と `required_update_paths` が欠落する場合は `Generate fail` とし、推測補完で生成を継続してはならない。
+- `algorithm.resolved.yaml` の `steps[]` と `ordering` と `control_condition` と `iteration_contract` を満たす実装構成を生成しなければならない。
 - 依存を持つ `node` は、`dependency.resolved.yaml` の `direct_deps` で解決された依存 `node` の公開 `operation` を呼び出す実装を必須とする。
 - 依存 `operation` と同等機能を依存元 `node` の `model` / `runner` に再実装してはならない。
 - `toolchain.language=fortran` で依存 `component` を持つ `node` の `model` は、依存 `spec_id` ごとに `use <spec_id>_model` と `call <spec_id>__*` を必須とし、`subroutine <spec_id>__*` の再定義を禁止する。

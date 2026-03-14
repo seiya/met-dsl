@@ -26,6 +26,7 @@ def _create_minimal_execution_tree(
     run_command: list[str],
     extra_sources: dict[str, str] | None = None,
     makefile_text: str | None = None,
+    algorithm_contract: dict[str, object] | None = None,
     derived_contract: dict[str, object] | None = None,
     dependency_resolved: dict[str, object] | None = None,
 ) -> None:
@@ -60,6 +61,42 @@ def _create_minimal_execution_tree(
         workspace / "plans" / "problem__shallow_water2d__0.3.0" / "plan_test" / "dependency.resolved.yaml",
         dependency_resolved,
     )
+    if algorithm_contract is None:
+        algorithm_contract = {
+            "algorithm_id": "shallow_water2d_test_algorithm",
+            "execution_mode": "sequence",
+            "steps": [
+                {
+                    "step_id": "compute_flux",
+                    "step_kind": "flux_compute",
+                    "operation_ref": f"{dep_spec_id}__compute_flux",
+                    "inputs": ["h", "hu", "hv"],
+                    "outputs": ["h", "hu", "hv"],
+                }
+            ],
+            "ordering": [],
+            "control_condition": [],
+            "iteration_contract": [],
+            "update_semantics": {"mode": "in_place"},
+            "temporaries": [],
+            "derived_field_rules": [],
+            "invariants": [],
+            "splitting_policy": {"mode": "none"},
+            "state_contract": {
+                "state_variables": [
+                    {"name": "h", "shape_expr": "[2,2]"},
+                    {"name": "hu", "shape_expr": "[2,2]"},
+                    {"name": "hv", "shape_expr": "[2,2]"},
+                ],
+                "required_update_paths": ["h", "hu", "hv"],
+                "diagnostics_from_state": True,
+                "fallback_policy": "fail_closed",
+            },
+        }
+    _write_json(
+        workspace / "plans" / "problem__shallow_water2d__0.3.0" / "plan_test" / "algorithm.resolved.yaml",
+        algorithm_contract,
+    )
     if derived_contract is None:
         derived_contract = {
             "io_contract": {
@@ -79,16 +116,6 @@ def _create_minimal_execution_tree(
                 ],
             },
             "semantic_dependency": {"required_sources": []},
-            "numerical_kernel_contract": {
-                "state_variables": [
-                    {"name": "h", "shape_expr": "[2,2]"},
-                    {"name": "hu", "shape_expr": "[2,2]"},
-                    {"name": "hv", "shape_expr": "[2,2]"},
-                ],
-                "required_update_paths": ["h", "hu", "hv"],
-                "diagnostics_from_state": True,
-                "fallback_policy": "fail_closed",
-            },
             "raw_requirements": {
                 "required_evidence": [
                     {"artifact": "metrics_basis.json", "required": True},
@@ -749,7 +776,7 @@ end program shallow_water2d_runner
                 any("metric-only scalar kernel" in v for v in violations)
             )
 
-    def test_requires_numerical_kernel_contract_for_2d_problem(self) -> None:
+    def test_requires_algorithm_state_contract_for_2d_problem(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
             model_text = """module shallow_water2d_model
@@ -773,45 +800,32 @@ end program shallow_water2d_runner
                 model_text=model_text,
                 runner_text=runner_text,
                 run_command=["./simulate", "workspace/case.resolved.yaml", "workspace/outdir"],
-                derived_contract={
-                    "io_contract": {
-                        "inputs": [{"name": "case_resolved", "source": "case.resolved.yaml"}],
-                        "outputs": [
-                            {
-                                "name": "metric",
-                                "shape_expr": "scalar",
-                                "evidence_ref": "raw/metrics_basis.json",
-                                "raw_variables": ["h", "hu", "hv", "time"],
-                            }
-                        ],
-                    },
-                    "semantic_dependency": {"required_sources": []},
-                    "raw_requirements": {
-                        "required_evidence": [
-                            {"artifact": "metrics_basis.json", "required": True},
-                            {"artifact": "execution_trace.json", "required": True},
-                            {
-                                "artifact": "state_snapshots",
-                                "required": True,
-                                "min_samples": 1,
-                                "schema": {
-                                    "variables": [
-                                        {"name": "h", "shape_expr": "[2,2]"},
-                                        {"name": "hu", "shape_expr": "[2,2]"},
-                                        {"name": "hv", "shape_expr": "[2,2]"},
-                                    ],
-                                    "time_variable": "time",
-                                    "time_shape_expr": "scalar",
-                                },
-                            },
-                        ]
-                    },
+                algorithm_contract={
+                    "algorithm_id": "broken_algorithm",
+                    "execution_mode": "sequence",
+                    "steps": [
+                        {
+                            "step_id": "compute_flux",
+                            "step_kind": "flux_compute",
+                            "operation_ref": "dynamics_shallow_water_flux_2d_rusanov_p0__compute_flux",
+                            "inputs": ["h", "hu", "hv"],
+                            "outputs": ["h", "hu", "hv"],
+                        }
+                    ],
+                    "ordering": [],
+                    "control_condition": [],
+                    "iteration_contract": [],
+                    "update_semantics": {"mode": "in_place"},
+                    "temporaries": [],
+                    "derived_field_rules": [],
+                    "invariants": [],
+                    "splitting_policy": {"mode": "none"},
                 },
             )
 
             violations = validate(repo_root=repo_root, workspace_root="workspace")
             self.assertTrue(
-                any("numerical_kernel_contract must be object for multidimensional problem node" in v for v in violations)
+                any("state_contract must be object for multidimensional problem node" in v for v in violations)
             )
 
     def test_detects_makefile_missing_fortran_module_dependency(self) -> None:

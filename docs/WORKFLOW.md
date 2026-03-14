@@ -73,11 +73,11 @@
 ### 1. Plan
 - 実行入力: `controlled_spec.md`、`tests.md`、`deps.yaml`、`spec/registry/spec_catalog.yaml`
 - 検証入力: `controlled_spec.md`、`tests.md`、`deps.yaml`、`spec/registry/spec_catalog.yaml`
-- 出力: `case.resolved.yaml`、`impl.resolved.yaml`、`dependency.resolved.yaml`、`derived_contract.json`、`plan_meta.json`
+- 出力: `case.resolved.yaml`、`algorithm.resolved.yaml`、`impl.resolved.yaml`、`dependency.resolved.yaml`、`derived_contract.json`、`algorithm.summary.md`、`plan_meta.json`
 
 ### 2. Generate
-- 実行入力: `case.resolved.yaml`、`impl.resolved.yaml`、`dependency.resolved.yaml`
-- 検証入力: `derived_contract.json`、`dependency.resolved.yaml`、`impl.resolved.yaml`
+- 実行入力: `case.resolved.yaml`、`algorithm.resolved.yaml`、`impl.resolved.yaml`、`dependency.resolved.yaml`
+- 検証入力: `algorithm.resolved.yaml`、`derived_contract.json`、`dependency.resolved.yaml`、`impl.resolved.yaml`
 - 出力: `generate/<generation_id>/src/`、`generate_meta.json`
 
 ### 3. Build
@@ -108,37 +108,53 @@
 ## 1. Plan 生成（決定的）
 - 実行入力: `controlled_spec.md`、`tests.md`、`deps.yaml`、`spec/registry/spec_catalog.yaml`
 - 検証入力: `controlled_spec.md`、`tests.md`、`deps.yaml`、`spec/registry/spec_catalog.yaml`
-- 出力: `case.resolved.yaml`、`impl.resolved.yaml`、`dependency.resolved.yaml`、`derived_contract.json`、`plan_meta.json`
+- 出力: `case.resolved.yaml`、`algorithm.resolved.yaml`、`impl.resolved.yaml`、`dependency.resolved.yaml`、`derived_contract.json`、`algorithm.summary.md`、`plan_meta.json`
 
 ### 1-1) 物理 Plan（`case.resolved.yaml`）
 - `Controlled Spec` から物理アルゴリズム（A）を読み、`tests` から入力条件と `sweep` / `refinement` を決定的に展開する。
-- `Plan verify` は `controlled_spec.md` と `tests.md` と `deps.yaml` から導出した検証契約を `derived_contract.json` として保存する。
 - `case.resolved.yaml` は実行時入力の決定値のみを保持し、検証出力契約を保持してはならない。
+- `case.resolved.yaml` は演算構成、依存 `operation` 呼び出し順序、条件分岐、反復条件を保持してはならない。
+
+### 1-2) 生成契約 Plan（`algorithm.resolved.yaml`）
+- `Plan` は `controlled_spec.md` と `deps.yaml` と `profile` 解決結果から `algorithm contract` を導出し、`algorithm.resolved.yaml` として保存する。
+- `algorithm.resolved.yaml` は `Generate` の正本入力であり、`Generate` は元の `controlled_spec.md` を直接読んではならない。
+- `algorithm.resolved.yaml` は `algorithm_id` と `execution_mode` と `steps[]` と `ordering` と `control_condition` と `iteration_contract` と `update_semantics` と `temporaries` と `derived_field_rules` と `invariants` と `splitting_policy` を必須保持しなければならない。
+- `execution_mode` は `sequence` / `conditional` / `iterative` / `columnwise` のみを許可する。
+- `steps[]` の各要素は `step_id` と `step_kind` と `operation_ref` と `inputs` と `outputs` を必須保持しなければならない。
+- `step_kind` は `boundary_apply` / `reconstruct` / `flux_compute` / `source_term` / `time_integrate` / `column_process` / `pointwise_process` / `iterative_solve` / `filter` / `reduction` / `diagnostic` のみを許可する。
+- `algorithm.resolved.yaml` は `problem` の統合順序と `profile` が選択した `component` 群の拘束を分離表現しなければならない。
+- `algorithm.resolved.yaml` は力学、`microphysics`、`radiation`、`land_surface`、`turbulence` を含む気象計算一般で使用できる表現力を持たなければならない。
+- `algorithm.summary.md` は `algorithm.resolved.yaml` から自動生成する閲覧専用成果物とし、`plan_id` 算出や下流工程入力に含めてはならない。
+- `Plan verify` は `controlled_spec.md` と `tests.md` と `deps.yaml` から導出した検証契約を `derived_contract.json` として保存する。
+- `Plan verify` は `algorithm.resolved.yaml` の演算構成と `derived_contract.json` の検証契約を混在させてはならない。
+
+### 1-3) 検証契約 Plan（`derived_contract.json`）
 - `derived_contract.json` は `io_contract.inputs` と `io_contract.outputs` を必須保持し、`io_contract.outputs` は `name` と `evidence_ref` と `shape_expr` で判定対象出力の一次証跡参照を定義しなければならない。
 - `io_contract.outputs` で `evidence_ref` が `raw/state_snapshots` 以外を参照し、かつ `raw_requirements.required_evidence` で `artifact=state_snapshots` を必須宣言する場合、当該 `output` は `raw_variables`（非空配列）で再計算に必要な `raw/state_snapshots` 変数名を明示しなければならない。
 - `derived_contract.json` は `raw_requirements.required_evidence` を必須保持し、`artifact` と `required` と `min_samples` と `schema`（必要時）で `raw` 一次証跡の必須構成を定義しなければならない。
 - `derived_contract.json` は `test_evidence_requirements` を保持し、`tests.md` の各 `test_id` ごとに `required_raw_variables` を明示しなければならない。
+- `derived_contract.json` は生成契約を保持してはならない。`numerical_kernel_contract`、統合順序、更新段数、反復条件は `algorithm.resolved.yaml` 側へ保持しなければならない。
 
-### 1-2) 実装 Plan（`impl.resolved.yaml`）
+### 1-4) 実装 Plan（`impl.resolved.yaml`）
 - 実行アルゴリズム（B）を決定し、`target.backend`、`target.architecture`、`toolchain.language`、`toolchain.build_system` を固定する。
 - `toolchain.language` と `toolchain.build_system` の既定値規則、および既定値逸脱条件は `IMPL_PLAN_SPEC.md` を適用する。
 - `Phase 1` は固定値を許可する。`Phase 2` 以降は `Tune` で探索可能とする。
 
-### 1-3) 依存解決 Plan（`dependency.resolved.yaml`）
+### 1-5) 依存解決 Plan（`dependency.resolved.yaml`）
 - `deps.yaml` と `spec_catalog.yaml` から依存 `DAG` を生成し、`Plan` 段階で固定する。
 - `dependency.resolved.yaml` は `node_key`、`direct_deps`、`transitive_deps`、`topo_level` を必須記録とする。
 - `dependency.resolved.yaml` は起点 `node` と推移依存 `node` の閉包を過不足なく 1 回ずつ保持し、`node_key` の重複と欠落を禁止する。
 - `deps.yaml` と `spec_catalog.yaml` から再構成した `expected_node_set` と `dependency.resolved.yaml` の `node_key` 集合一致を `Plan pass` 条件とする。
 - 未登録依存、未実装依存、互換性違反依存を `dependency` 解決エラーとする。
 
-### 1-4) 階層実行順序
+### 1-6) 階層実行順序
 - 実行順序は `dependency.resolved.yaml` の `topo_level` 昇順に固定する。
 - 親 `node` は直下依存 `node` がすべて `pass` または `xfail` になるまで開始してはならない。
 - `component` / `profile` / `problem` の実行順序は `spec_kind` 固定で判定せず、`dependency DAG` の `topo_level` で判定する。
 - 同一 `topo_level` 内の独立 `node` も逐次実行しなければならない。
 - 同一 `topo_level` 内で一部 `node` が `fail` した場合も、未処理 `node` の起動可否を 1 件ずつ再判定しなければならない。
 
-### 1-5) `node` 単位 workflow 実行規則
+### 1-7) `node` 単位 workflow 実行規則
 - `dependency.resolved.yaml` の各 `node_key` に対して個別 workflow を完了させる。
 - 直下依存が充足する `node` は `Plan -> Generate -> Build -> Execute -> Judge` を実行する。
 - 直下依存が不充足の `node` は `blocked` 終端成果物を生成して完了とする。
@@ -148,10 +164,11 @@
 - `blocked` 停止時も `aggregate_verdict.json`、`summary.json`、`trial_meta.json` を必須出力とする。`verdict.json` は `self_verdict=not_evaluated` を記録する。
 
 ## 2. 生成（Generate）
-- 実行入力: `case.resolved.yaml`、`impl.resolved.yaml`、`dependency.resolved.yaml`
-- 検証入力: `derived_contract.json`、`dependency.resolved.yaml`、`impl.resolved.yaml`
+- 実行入力: `case.resolved.yaml`、`algorithm.resolved.yaml`、`impl.resolved.yaml`、`dependency.resolved.yaml`
+- 検証入力: `algorithm.resolved.yaml`、`derived_contract.json`、`dependency.resolved.yaml`、`impl.resolved.yaml`
 - 出力: 実装コード（`model` + `runner`）と `generate_meta.json`
 - `Generate` は `node` 単位で実行し、対象 `node_key` 専用のソースを生成する。
+- `Generate` は `controlled_spec.md` を直接入力にしてはならない。必要な演算構成は `algorithm.resolved.yaml` から解釈しなければならない。
 - 言語に依らず `model`（物理計算）と `runner`（入出力・実行連携）を分離して生成する。
 - `runner` は `model` を `call` / `use` / `import` で呼び出し、物理更新ロジックを重複実装してはならない。
 - `toolchain.language` が `fortran` / `c` / `cpp` / `mixed` 系の場合、`runner` が `python` / `bash` / `sh` / `node` など外部インタプリタを起動してはならない。
@@ -160,7 +177,7 @@
 - 依存を持つ `node` の `model` は、`dependency.resolved.yaml` の `direct_deps` で解決された依存 `node` の公開 `operation` 呼び出しを必須とする。
 - 依存 `operation` と同等機能を依存元 `node` の `model` / `runner` に再実装してはならない。検出時は `Generate fail` とする。
 - 依存先が `profile` で公開 `operation` を持たない場合、依存元 `problem` は `profile` の選択結果と拘束条件を参照する実装痕跡を必須記録とする。
-- `Generate verify` は `derived_contract.json` を入力として、依存 `operation` と出力指標のデータ依存を検証しなければならない。制御構造の形式（時空間ループ有無など）を固定要件にしてはならない。
+- `Generate verify` は `algorithm.resolved.yaml` と `derived_contract.json` を入力として、演算構成と依存 `operation` と出力指標のデータ依存を検証しなければならない。制御構造の形式を固定要件にしてはならず、判定は `algorithm.resolved.yaml` の `steps` と `ordering` と `control_condition` と `iteration_contract` に基づいて実施しなければならない。
 - `Generate verify` は `model` 出力と無関係な定数出力、固定 `JSON` 出力、解析式直接代入による `diagnostics` 生成を検出した場合に `fail` とする。
 - `model` / `runner` は、判定指標（例: `mass_drift_rel`、`momx_drift_rel`、`momy_drift_rel`、`analytic_h_l2_rel`）へ物理的根拠のない任意の定数スケーリング、定数オフセット、ケース依存補正を導入してはならない。`Controlled Spec` または `tests.md` で明示定義された評価式以外の補正を禁止する。
 - `Generate verify` は、`intent(out)` 変数の最終式木が `derived_contract.json` の `semantic_dependency.required_sources` と `io_contract.outputs` で宣言された出力変数群へ到達することを検証しなければならない。
@@ -320,7 +337,7 @@ workspace/
 ### 7-2) ID と不変条件
 - `orchestration_id` は 1 回の `workflow` 全体を識別する `ID` とする。
 - `node_key_safe` は `node_key` の保存用表記とし、推奨形式は `<spec_kind>__<spec_id>__<spec_version>` とする。
-- `plan_id` は `node` 単位で `case.resolved.yaml` と `impl.resolved.yaml` と `dependency.resolved.yaml` の組を識別する `ID` とする。推奨形式は `<node_key_safe>_<case_hash12>_<impl_hash12>` とする。
+- `plan_id` は `node` 単位で `case.resolved.yaml` と `algorithm.resolved.yaml` と `impl.resolved.yaml` と `dependency.resolved.yaml` の組を識別する `ID` とする。推奨形式は `<node_key_safe>_<case_hash12>_<algorithm_hash12>_<impl_hash12>` とする。
 - `pipeline_id` は `node` 単位で 1 回の `Generate -> Build -> Execute` 系列を識別する `ID` とする。推奨形式は `<plan_id>_<utc_ts>_<seq3>` とする。
 - `generation_id` / `build_id` / `execution_id` は各段階の試行単位 `ID` とする。
 - workflow は毎回独立実行し、`plan_id` / `pipeline_id` / `generation_id` / `build_id` / `execution_id` を毎回新規発行しなければならない。
