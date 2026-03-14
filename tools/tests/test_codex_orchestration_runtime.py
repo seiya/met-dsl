@@ -8,6 +8,7 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from tools.codex_orchestration_runtime import (
     init_orchestration,
@@ -569,6 +570,90 @@ shell_tool                       stable             true
                             {"name": "multi_agent_enabled", "pass": False},
                         ],
                     },
+                )
+
+    def test_record_launch_runs_live_probe_when_enforced(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            init_orchestration(repo_root=repo_root, orchestration_id="orch_001")
+            write_preflight(
+                repo_root=repo_root,
+                orchestration_id="orch_001",
+                payload={
+                    "status": "pass",
+                    "can_launch_step_agents": True,
+                    "can_launch_substep_agents": True,
+                    "feature_states": {"multi_agent": True},
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}],
+                },
+            )
+            os.environ["CODEX_ORCHESTRATION_ENFORCE_LIVE_PREFLIGHT"] = "1"
+            with patch("tools.codex_orchestration_runtime.probe_codex_cli") as probe_mock:
+                probe_mock.return_value = {
+                    "status": "pass",
+                    "can_launch_step_agents": True,
+                    "can_launch_substep_agents": True,
+                    "feature_states": {"multi_agent": True},
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}],
+                }
+                record_launch(
+                    repo_root=repo_root,
+                    orchestration_id="orch_001",
+                    parent_agent_run_id="orch_run_001",
+                    child_agent_run_id="substep_run_plan_generate_001",
+                    request_payload={"launch_prompt": "do task"},
+                    response_payload={"launch_reply": "accepted"},
+                )
+                self.assertEqual(probe_mock.call_count, 1)
+
+    def test_record_and_finalize_do_not_run_live_probe_after_launch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            init_orchestration(repo_root=repo_root, orchestration_id="orch_001")
+            write_preflight(
+                repo_root=repo_root,
+                orchestration_id="orch_001",
+                payload={
+                    "status": "pass",
+                    "can_launch_step_agents": True,
+                    "can_launch_substep_agents": True,
+                    "feature_states": {"multi_agent": True},
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}],
+                },
+            )
+            os.environ["CODEX_ORCHESTRATION_ENFORCE_LIVE_PREFLIGHT"] = "1"
+            with patch(
+                "tools.codex_orchestration_runtime.probe_codex_cli",
+                side_effect=AssertionError("live probe must not run"),
+            ):
+                record_agent_run(
+                    repo_root=repo_root,
+                    orchestration_id="orch_001",
+                    payload={
+                        "agent_run_id": "step_run_plan_001",
+                        "agent_role": "step",
+                        "parent_agent_run_id": "orch_run_001",
+                        "step": "plan",
+                        "node_key": "problem/shallow_water2d@0.3.0",
+                        "status": "pass",
+                        "agent_backend": "openai_responses",
+                        "agent_model": "gpt-5-codex",
+                        "context_id": "ctx_step_plan_001",
+                        "agent_session_id": "sess_step_plan_001",
+                    },
+                )
+                write_step_result(
+                    repo_root=repo_root,
+                    orchestration_id="orch_001",
+                    node_key="problem/shallow_water2d@0.3.0",
+                    step="plan",
+                    agent_run_id="orch_run_001",
+                    payload={"status": "pass"},
+                )
+                update_orchestration_status(
+                    repo_root=repo_root,
+                    orchestration_id="orch_001",
+                    status="pass",
                 )
 
 

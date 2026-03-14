@@ -131,7 +131,12 @@ def _validate_preflight_payload(payload: dict[str, Any]) -> None:
             )
 
 
-def _require_preflight_launchable(repo_root: Path, orchestration_id: str) -> dict[str, Any]:
+def _require_preflight_launchable(
+    repo_root: Path,
+    orchestration_id: str,
+    *,
+    enforce_live_probe: bool = True,
+) -> dict[str, Any]:
     path = _preflight_path(repo_root, orchestration_id)
     if not path.exists():
         raise RuntimeError(f"preflight missing: {path}")
@@ -142,7 +147,7 @@ def _require_preflight_launchable(repo_root: Path, orchestration_id: str) -> dic
         raise RuntimeError(
             "preflight gate failed: launchable preflight with multi_agent=true is required"
         )
-    if _live_preflight_enforced():
+    if enforce_live_probe and _live_preflight_enforced():
         live_probe = probe_codex_cli()
         if not _preflight_allows_agent_launch(live_probe):
             raise RuntimeError(
@@ -371,7 +376,11 @@ def record_launch(
     response_payload: dict[str, Any],
     relation_type: str = "launch",
 ) -> dict[str, str]:
-    _require_preflight_launchable(repo_root, orchestration_id)
+    _require_preflight_launchable(
+        repo_root,
+        orchestration_id,
+        enforce_live_probe=True,
+    )
     root = _orchestration_root(repo_root, orchestration_id)
     launches_root = root / "launches"
     launches_root.mkdir(parents=True, exist_ok=True)
@@ -473,7 +482,11 @@ def record_agent_run(
     if role_token is None:
         raise ValueError("agent_role must be non-empty string")
     if role_token in {"step", "substep"}:
-        _require_preflight_launchable(repo_root, orchestration_id)
+        _require_preflight_launchable(
+            repo_root,
+            orchestration_id,
+            enforce_live_probe=False,
+        )
 
     existing = _read_existing_run_ids(runs_path)
     if agent_run_id in existing:
@@ -512,7 +525,11 @@ def write_step_result(
     agent_run_id: str,
     payload: dict[str, Any],
 ) -> dict[str, Any]:
-    _require_preflight_launchable(repo_root, orchestration_id)
+    _require_preflight_launchable(
+        repo_root,
+        orchestration_id,
+        enforce_live_probe=False,
+    )
     node_safe = _node_key_to_safe(node_key)
     step_token = step.strip().lower()
     root = _orchestration_root(repo_root, orchestration_id)
@@ -534,7 +551,11 @@ def update_orchestration_status(
     status: str,
 ) -> dict[str, Any]:
     if status == "pass":
-        _require_preflight_launchable(repo_root, orchestration_id)
+        _require_preflight_launchable(
+            repo_root,
+            orchestration_id,
+            enforce_live_probe=False,
+        )
     meta_path = _orchestration_root(repo_root, orchestration_id) / "orchestration_meta.json"
     if not meta_path.exists():
         raise FileNotFoundError(meta_path)
