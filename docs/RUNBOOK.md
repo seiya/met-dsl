@@ -36,6 +36,8 @@
 - `write_scope` 検査で `workspace/` 配下以外の差分を検出した場合、当該ステージを `fail` とし、`write_scope_violation.json` を `workspace/` 配下へ記録する。
 - `Generate verify` のデータ依存判定は `derived_contract.json` の `semantic_dependency.required_sources` を正本とし、特定計算様式の一律必須化を禁止する。
 - `Generate verify` の出力契約判定は `derived_contract.json` の `io_contract.outputs` を正本とし、`evidence_ref` と `shape_expr` の整合を必須検査する。
+- 出力形式、入出力契約、判定条件の要求定義は `controlled_spec.md` と `tests.md` と `deps.yaml` と `derived_contract.json` と `docs/` 正本から取得し、`tools/` 配下の検証 `python` スクリプトと `quality check` 実装を要求定義入力へ使用してはならない。
+- 要求定義の不足を検証実装から逆算補完してはならない。不足時は当該ステージを `fail` とする。
 - `Judge` は固定スクリプト検査に加えて `LLM` 意味検査を必須実行し、`semantic_review.json` の `decision=pass` を開始条件に含める。
 - `Judge` 開始前に、対象 `node_key` の同一 `execution_id` 配下へ `run_program` 実行記録と `diagnostics.json` と `perf.json` と `raw` 実行証跡が揃っていることを検証する。未達時は `Judge fail` とする。
 - `Judge` 開始前と `Judge` 完了前に `python3 tools/validate_pipeline_semantics.py` を実行し、`fail` 時は当該 `pipeline` を `invalid` とする。

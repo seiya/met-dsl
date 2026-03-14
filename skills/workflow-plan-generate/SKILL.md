@@ -15,6 +15,7 @@ Plan ステージの生成責務を固定し、入力 spec から決定的な re
 
 ## 要件
 - 入力は `spec/<...>/controlled_spec.md` と `spec/<...>/tests.md` と `spec/<...>/deps.yaml` と `spec/registry/spec_catalog.yaml` を正本にする。
+- 出力形式、入出力契約、判定条件の要求定義は `controlled_spec.md` と `tests.md` と `deps.yaml` と `derived_contract.json` と `docs/` 正本を参照し、`tools/` 配下の検証 `python` スクリプトと `quality check` 実装を参照してはならない。
 - 追加必須項目を `Controlled Spec` へ要求してはならない。検証契約は既存入力から導出する。
 - `case.resolved.yaml` の `sweep` と `refinement` は決定的な順序で展開する。
 - `case.resolved.yaml` は実行時入力の決定値のみを保持し、検証出力契約を保持してはならない。
