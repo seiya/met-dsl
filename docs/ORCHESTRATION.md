@@ -10,13 +10,19 @@
 - `Plan` / `Generate` / `Build` / `Execute` / `Judge` / `Tune` / `Promote`
 - `node workflow` 単位の工程実行と、工程内 `substep`（例: `generate` / `verify`）の実行
 
+## 用語規約
+- `工程` は `docs/WORKFLOW.md` で定義する workflow の論理単位を指す。
+- `step` は 1 つの工程に対応するオーケストレーション上の実行単位を指す。
+- `substep` は `step` を分解した下位実行単位を指す。
+- `stage` は `generated_by_stage` や `<stage>_meta.json` など既存フィールド名または既存プレースホルダー名としてのみ使用する。本文では `工程` または `step` の同義語として使用してはならない。
+
 ## 要件
 - `workflow` 実行は、必ず 1 つの `orchestration agent` を最初に起動して開始する。
 - `workflow` 開始前に、`step agent` と `substep agent` を独立起動できる実行基盤の事前検査を必須実行しなければならない。事前検査は `multi_agent` 機能と子 `agent` 起動可否を検証対象に含め、`pass` でない場合は `workflow` を開始してはならない。
 - `preflight.json` の手動編集または後編集による `pass` 化を禁止する。事前検査結果は実行時検査の一次証跡としてのみ記録しなければならない。
 - 子 `agent` 起動直前に、`Codex CLI` の live probe で `multi_agent` と子 `agent` 起動可否を再検査しなければならない。live probe は `record-launch` 実行時に適用し、`fail` の場合は `record-launch` と子 `agent` 起動を禁止し、当該 `workflow` を `fail` へ遷移させなければならない。
 - `orchestration agent` は `workflow` 全体の進行制御のみを担当し、工程本体の成果物（例: `case.resolved.yaml`、`diagnostics.json`）を直接生成してはならない。
-- `workflow` 実行の代替として、ステージ進行と成果物生成を一括自動化する `script`（例: `python` / `bash`）を新規生成または実行してはならない。
+- `workflow` 実行の代替として、複数工程の進行と成果物生成を一括自動化する `script`（例: `python` / `bash`）を新規生成または実行してはならない。
 - `orchestration` の責務を `script` へ委譲してはならない。`Build` / `Execute` / `Judge` / `Promote` の各 `step` は必ず `spawn_agent` で起動した独立 `step agent` で実行しなければならない。
 - `Plan` / `Generate` / `Tune` のように `substep` を持つ各工程は、`orchestration agent` が `generate` と `verify` などの各 `substep agent` を `spawn_agent` で直接起動しなければならない。
 - `step agent` と `substep agent` は、同一 `LLM` コンテキストを共有してはならない。各 `agent_run_id` は固有の `context_id` を持ち、`context_isolated=true` を必須記録とする。
@@ -74,7 +80,7 @@
 5. `orchestration agent` は起動対象ごとに `step agent` または `substep agent` を発行し、`node_key`、`step`、`plan_ref`、`pipeline_ref`、`dependency_ref` を入力として渡す。
 6. `orchestration agent` は `step` を持つ工程では対象 `step` の `実行入力` と `検証入力` と `期待出力` を明示し、`substep` を持つ工程では対象 `substep` の `実行入力` と `検証入力` と `期待出力` を明示しなければならない。
 7. `substep` を持つ工程では、`orchestration agent` が `generate` と `verify` などの `substep agent` を逐次起動する。
-8. `substep agent` は自身の成果物と `<stage>_meta.json` を生成し、`agent_output_ref` を `orchestration agent` へ返却する。
+8. `substep agent` は自身の成果物と対応工程のメタデータを生成し、`agent_output_ref` を `orchestration agent` へ返却する。
 9. `orchestration agent` は子 `agent` の返却結果を評価し、`issue_severity` と再投入要否を確定する。再投入が必要な場合は `repair_strategy` と `repair_target_agent_run_id` と `repair_reason` を確定する。
 10. 再投入が必要で `repair_strategy=reuse` の場合、`orchestration agent` は同一 `agent_session_id` の継続修正を許可してよい。この場合も新規 `agent_run_id` を発行し、`relation_type` を `reuse` として `record-launch` 記録を追加しなければならない。
 11. 再投入が必要で `repair_strategy=restart` の場合、`orchestration agent` は新規 `agent_session_id` を持つ `substep agent` を再起動し、`relation_type` を `restart` として `record-launch` 記録を追加しなければならない。

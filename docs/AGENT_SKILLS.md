@@ -17,7 +17,7 @@
 - エージェント階層の実行契約（`orchestration -> step` と `orchestration -> substep`）は `ORCHESTRATION.md` を正本とする。
 - 全体方針と `spec` 管理要件（`spec_kind` / 台帳 / 正式版配置 / 命名規則）は `SPEC.md` を正本とする。
 - `Build` / `Execute` / `quality check` は `MCP` サーバー経由で実行し、`AGENTS.md` の `MCP 実行ルール` と対応 `SKILL.md` の契約を同時適用する。
-- 各工程は、対応 `SKILL.md` に定義された必須出力（例: `<stage>_meta.json`、`verdict.json`）を欠落させてはならない。
+- 各工程は、対応 `SKILL.md` に定義された必須出力（例: `plan_meta.json`、`build_meta.json`、`verdict.json`）を欠落させてはならない。
 
 ## 責務判定フロー
 1. 追加・変更する規則が workflow 成果物の正当性を直接左右するかを判定する。
