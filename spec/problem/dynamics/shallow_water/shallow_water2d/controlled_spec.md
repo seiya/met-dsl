@@ -65,7 +65,7 @@ $$
 $$
 と定義する。閾値は `tests.md` の判定条件を参照する。
 
-## 6. モデルパラメタと実行時入力契約
+## 6. モデルパラメタと実行時 input contract
 物理定数は `g=9.81 m/s2`、`H_0=1.0 m` とする。底面地形プロファイルは `topography_profile` で指定し、`williamson_tc5_cone` と `flat` の 2 値のみを許可する。`topography_profile=williamson_tc5_cone` の場合、底面地形 `z_b` は Williamson et al.（1992）に倣い、孤立円錐山形で次に固定する。
 $$
 d_x(x)=\min\left(|x-x_c|,L_x-|x-x_c|\right),\quad

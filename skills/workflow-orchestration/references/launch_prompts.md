@@ -21,8 +21,8 @@ repair_target_agent_run_id: <repair_target_agent_run_id>
 repair_reason: <repair_reason>
 
 必須要件:
-- あなたは工程成果物を直接生成する担当である。
-- この step は標準 substep を持たない工程である。自身で step 契約を完了させること。
+- あなたは phase artifacts を直接生成する担当である。
+- この step は標準 substep を持たない phase である。自身で step 契約を完了させること。
 - 起動直後に `skill_ref` を読み、`skill_must_read_refs` と矛盾しない契約で実行すること。
 - `skill_name` と `skill_ref` が未指定の場合は fail で停止すること。
 - 入力不足時は推測補完せず fail で停止すること。
@@ -53,13 +53,13 @@ repair_reason: <repair_reason>
 
 必須要件:
 - 契約された入力だけを読むこと。
-- 契約された成果物だけを書くこと。
-- 期待出力と保存先を守ること。
+- 契約された artifacts だけを書くこと。
+- expected output と保存先を守ること。
 - 起動直後に `skill_ref` を読み、`skill_must_read_refs` と矛盾しない契約で実行すること。
 - `skill_name` と `skill_ref` が未指定の場合は fail で停止すること。
 - 入力不足時は推測補完せず fail で停止すること。
 - `repair_strategy=reuse` の場合は、`repair_target_agent_run_id` の出力との差分修正に限定すること。
 - `repair_strategy=restart` の場合は、過去出力を流用せず契約入力から再生成すること。
-- 完了時は成果物参照と status を `orchestration agent` へ返すこと。
+- 完了時は artifact 参照と status を `orchestration agent` へ返すこと。
 - 完了返答には `launch_reply` として、実施内容と判定結果を平文で含めること。
 ```

@@ -8,7 +8,7 @@
 - 子 `agent` の初回起動前
 
 ## 要件
-- 起動前確認は `tools/codex_orchestration_runtime.py` を正本実装として実施しなければならない。
+- 起動前確認は `tools/codex_orchestration_runtime.py` を canonical source 実装として実施しなければならない。
 - `init` と `preflight` は各 1 回以上実行しなければならない。
 - `preflight.json` が `status=pass` かつ `can_launch_step_agents=true` かつ `can_launch_substep_agents=true` を満たさない場合、子 `agent` を起動してはならない。
 - 子 `agent` 起動直前の live 検査は `record-launch` 実行時にのみ必須とする。
@@ -21,7 +21,7 @@
 3. `preflight` 判定が `pass` でない場合は `set-status --status fail` を実行して停止する。
 4. 子 `agent` 起動時は `record-launch` を実行する。
 5. 子 `agent` 完了後は `record-agent-run` を追記する。
-6. 工程完了後は `write-step-result` を記録する。
+6. phase 完了後は `write-step-result` を記録する。
 
 ## 判定基準
 - `preflight.json` が存在し、`pass` 条件を満たしている。

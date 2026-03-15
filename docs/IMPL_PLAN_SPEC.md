@@ -37,8 +37,8 @@
 - `target.class=cpu` でユーザーがループ並列化方式を明示指定しない場合、生成器は並列化可能ループへ `OpenMP` を適用する。
 - ユーザーがループ並列化方式を明示指定した場合は、その指定を優先する。並列化不可能ループへの強制 `OpenMP` 付与を禁止する。
 - `target.class` が `cpu` / `gpu` 以外の場合、`toolchain.language` の既定値補完を禁止する。
-- `impl.resolved.yaml` で `toolchain.language` / `toolchain.standard` / `toolchain.build_system` が未定義の場合、生成工程へ進めずエラーとする。
-- `target.architecture` が未定義の場合、生成工程へ進めずエラーとする。
+- `impl.resolved.yaml` で `toolchain.language` / `toolchain.standard` / `toolchain.build_system` が未定義の場合、生成 phase へ進めずエラーとする。
+- `target.architecture` が未定義の場合、生成 phase へ進めずエラーとする。
 - `toolchain.language` が `fortran` / `c` / `cpp` / `mixed` 系の場合、`toolchain.build_system` は `make` / `cmake` / `meson` / `ninja` のいずれかとする。既定値は `make` とする。
 
 ## 3. 任意項目（環境依存）
@@ -48,6 +48,6 @@
 - 直接 `gcc` / `clang` / `gfortran` を呼び出して単発ビルドする運用を禁止し、必ず `toolchain.build_system` を介してビルドする。
 
 ## 4. 生成物の構成ルール（言語共通）
-- 生成コードは言語に依らず、`model`（物理計算）と `runner`（入出力・判定連携）を分離する。
+- 生成コードは言語に依らず、`model`（物理計算）と `runner`（input/output・判定連携）を分離する。
 - `runner` は `model` を `call` / `use` / `import` で呼び出す。
 - 物理更新ロジックを `runner` 側に重複実装してはならない。

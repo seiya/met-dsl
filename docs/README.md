@@ -7,7 +7,7 @@
 2. `CONTROLLED_SPEC.md`（`problem` / `component` / `profile` の書式と必須要件）
 3. `TESTS.md`（`tests` の書式と必須要件）
 4. `PHYSICAL_VALIDATION.md`（物理妥当性判定の要件）
-5. `GLOSSARY.md`（`Artifacts` / 用語）
+5. `GLOSSARY.md`（`Artifacts` / `terms`）
 6. `WORKFLOW.md`（`Spec -> Plan -> Generate -> Build -> Execute -> Judge -> Tune -> Promote`。依存 `DAG` に基づく下層優先実行と `aggregate_verdict` を含む）
 7. `ORCHESTRATION.md`（`orchestration agent -> substep agent` と `orchestration agent -> step agent` の実行規約）
 8. `RUNBOOK.md`（試行を回すための最小運用手順）
@@ -15,7 +15,7 @@
 10. `PERFORMANCE_DIAGNOSTICS.md`（`perf.json` 仕様）
 11. `TUNING_WORKFLOW.md`（性能探索の運用指針）
 
-## 役割別の構成
+## Role-based Structure
 ### Core（方向性・契約）
 - `SPEC.md`
 - `CONTROLLED_SPEC.md`
@@ -38,8 +38,8 @@
 - 仕様の追加・変更は `SPEC.md` と `CONTROLLED_SPEC.md` と `TESTS.md` と対象 `spec` の `tests.md` を更新する。
 - `problem` / `component` / `profile` の責務境界を跨ぐ変更は、関連する `spec` を同一変更で更新する。
 - 言語に依らず、生成コードは `model`（物理計算）と `runner`（実行・判定連携）を分離する。
-- `LLM` を使うステージは、ステージ内部で `generate -> verify -> regenerate` を実施し、最終合格成果物のみを保存する。
-- `LLM` 利用ステージは各ステージの `<stage>_meta.json` を必須出力とし、標準運用（`debug_mode=false`）では失敗試行成果物を保存しない。
+- `LLM` を使うステージは、ステージ内部で `generate -> verify -> regenerate` を実施し、最終合格 artifact のみを保存する。
+- `LLM` 利用ステージは各ステージの `<stage>_meta.json` を必須出力とし、標準運用（`debug_mode=false`）では失敗試行 artifact を保存しない。
 - `workflow` 実行は `ORCHESTRATION.md` の規約に従い、`orchestration agent` 起点で開始する。
 - 試行手順が固まり次第、`RUNBOOK.md` を前提に自動化を進める。
 - `compile` / `run` / `quality check` は `MCP` サーバー（`mcp_servers/build_runtime_server.py`）経由で実行する。

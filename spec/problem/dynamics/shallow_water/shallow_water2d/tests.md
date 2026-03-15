@@ -1,4 +1,4 @@
-# Tests: 2 次元 shallow water equation（検証入力・判定条件）
+# Tests: 2 次元 shallow water equation（verification input・判定条件）
 
 ## 0. メタ情報
 - `status`: `draft`
@@ -10,7 +10,7 @@
 - `spec_ref.controlled_spec_path`: `spec/problem/dynamics/shallow_water/shallow_water2d/controlled_spec.md`
 
 ## 1. 目的
-本スイートは、底面地形を含む 2 次元 shallow water equation の離散実装について、保存性、静水不変性、地形強制下の安定性、理論解一致、平行移動同値性、`CFL` ガードを検証する。保存性判定は全ケースで質量を対象とし、運動量は `topography_profile=flat` のケースで対象とする。判定対象は `L0` から `L3` とし、期待失敗（`xfail`）を含む。
+本スイートは、底面地形を含む 2 次元 shallow water equation の離散実装について、保存性、静水不変性、地形強制下の安定性、理論解一致、平行移動同値性、`CFL` ガードを検証する。保存性判定は全ケースで質量を対象とし、運動量は `topography_profile=flat` のケースで対象とする。判定対象は `L0` から `L3` とし、expected failure（`xfail`）を含む。
 
 ## 2. 入力既定化
 ### 2-1. 基本定数
@@ -106,8 +106,8 @@ $$
 - `case_id` は `swe2d_flat_sym_n064_sx025_sy012_dts100` を追加する。
 - `base_case_id` は `swe2d_flat_sym_n064_sx000_sy000_dts100` を参照し、`shift_x_fraction=0.25` と `shift_y_fraction=0.125` のみ上書きする。
 
-## 5. 診断成果物と契約
-### 5-1. 成果物
+## 5. 診断 artifact と契約
+### 5-1. Artifacts
 - 診断出力ファイルは `diagnostics.json` とする。
 - 判定出力ファイルは `verdict.json` とする。
 
@@ -293,7 +293,7 @@ $$
 
 ### 7-7. `l0_cfl_guard_xfail`
 - `level`: `L0`
-- `objective`: `CFL` 違反ケースを検出できることを確認する（期待失敗）。
+- `objective`: `CFL` 違反ケースを検出できることを確認する（expected failure）。
 - 対象ケース:
   - `swe2d_guard_n032_sx000_sy000_dts240`
 - `expected_outcome`: `xfail`

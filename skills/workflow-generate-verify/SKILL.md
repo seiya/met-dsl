@@ -1,6 +1,6 @@
 ---
 name: workflow-generate-verify
-description: Generate ステージの verify を実行し、生成コードの責務分離、入出力契約、`generate_meta.json` の整合性を検査するときに使用する。`Build` 開始条件である `verification_status=pass` 判定に適用する。
+description: Generate ステージの verify を実行し、生成コードの責務分離、input/output contract、`generate_meta.json` の整合性を検査するときに使用する。`Build` 開始条件である `verification_status=pass` 判定に適用する。
 ---
 
 # Workflow Generate Verify
@@ -18,10 +18,10 @@ Generate ステージ出力の検証責務を固定し、`Build` 失敗を事前
 - `model` が対象 `node` の演算契約を実装していることを検査する。固定値返却専用、固定 `JSON` 出力専用、`no-op` 専用実装を `fail` とする。
 - `model` が `algorithm.resolved.yaml` で要求された `steps[]` と `ordering` と `control_condition` と `iteration_contract` を満たすことを検査する。
 - `model` が `derived_contract.json` で要求された依存 `operation` と出力指標のデータ依存（`semantic_dependency.required_sources` と `io_contract.outputs`）を満たすことを検査する。時空間ループなど特定制御構造を一律必須にしてはならない。
-- 出力指標が `model` 実行結果に依存しない定数出力、固定 `JSON` 出力、解析式直接代入を検出した場合は `fail` とする。
+- 出力指標が `model` execution result に依存しない定数出力、固定 `JSON` 出力、解析式直接代入を検出した場合は `fail` とする。
 - `problem` かつ `spec_id` が `2d` または `3d` を含む `node` は、`algorithm.resolved.yaml` の状態更新契約を必須検査し、欠落または `fallback_policy!=fail_closed` を検出した場合は `fail` とする。
 - `problem` かつ `spec_id` が `2d` または `3d` を含む `node` は、複数 `intent(out)` 指標を出力する `subroutine` が `state_variables` 配列参照を持たない場合を `metric-only scalar kernel` として `fail` とする。
-- 生成コードが対象 `node_key` の入出力契約に一致することを検査する。
+- 生成コードが対象 `node_key` の input/output contract に一致することを検査する。
 - 依存を持つ `node` は、`dependency.resolved.yaml` の `direct_deps` で解決された依存 `node` の公開 `operation` 呼び出しを実装していることを検査する。欠落時は `fail` とする。
 - 依存 `operation` と同等機能の再実装を検出した場合は `fail` とする。
 - `toolchain.language=fortran` で依存 `component` を持つ `node` は、依存 `spec_id` ごとに `model` 内の `use <spec_id>_model` と `call <spec_id>__*` を必須検査し、`subroutine <spec_id>__*` の再定義を検出した場合は `fail` とする。
@@ -35,7 +35,7 @@ Generate ステージ出力の検証責務を固定し、`Build` 失敗を事前
 - `toolchain.build_system=make` かつ `toolchain.language=fortran` の場合、`src/Makefile` が `make -j` 互換の依存関係記述を欠落していないことを検査する。
 - `generate_meta.json` の必須項目を検査する。
 - `debug_mode=false` の場合に `attempts/` が存在しないことを検査する。
-- 検査対象成果物の保存先ルートが `workspace/` であることを検査し、workflow ルート判定は `workspace/` のみを対象とする。
+- 検査対象 artifact の保存先ルートが `workspace/` であることを検査し、workflow ルート判定は `workspace/` のみを対象とする。
 
 ## 運用ルール
 1. 検査結果に基づき `generate_meta.json` の `verification_status` を更新する。

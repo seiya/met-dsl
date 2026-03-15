@@ -22,7 +22,7 @@
 - `run_quality_checks` の `preset=pytest` は、`project_dir` を `PYTHONPATH` へ先頭追加して import 解決の再現性を確保する。
 - `compile_project` / `run_program` / `run_quality_checks` は、実行したコマンドを `JSONL` 形式で必ず記録する。
 - `command_log_path` 未指定時の既定値は `<project_dir>/mcp_command_log.jsonl` とする。
-- 実行結果は `command_id` と `executed_command` と `command_log_path` を返却し、リポジトリ配下にログがある場合は `command_log_ref` を返却する。
+- execution result は `command_id` と `executed_command` と `command_log_path` を返却し、リポジトリ配下にログがある場合は `command_log_ref` を返却する。
 
 ## MCP 設定例
 以下は一般的な MCP クライアント設定の例である。実際の設定形式はクライアント実装に合わせて調整する。

@@ -1,7 +1,7 @@
-# tests（正本）の要件と書式
+# tests（canonical source）の要件と書式
 
 ## 目的
-`tests.md` は `spec` の検証入力と判定条件の正本である。`problem` / `component` / `profile` の全 `spec_kind` で共通利用する。
+`tests.md` は `spec` の verification input と判定条件の canonical source である。`problem` / `component` / `profile` の全 `spec_kind` で共通利用する。
 `tests.md` の評価結果は当該 `node` の `self_verdict` として `verdict.json` へ写像し、依存込みの集約判定は `aggregate_verdict.json` で扱う。
 
 ## 適用範囲
@@ -10,7 +10,7 @@
 - `spec/profile/<domain>/<family>/<spec_id>/tests.md`
 
 ## 要件
-1. 正本形式は `Markdown` とする。
+1. canonical source 形式は `Markdown` とする。
 2. 文書先頭に `test_profile_id`、`test_profile_version`、`status`、`spec_ref` を必須記載する。
 3. `spec_ref` は `spec_kind`、`spec_id`、`spec_version`、`controlled_spec_path` を必須とする。
 4. 各 `spec` は `L0` テストを少なくとも 1 件定義する。

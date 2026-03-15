@@ -22,7 +22,7 @@ Tune ステージの候補生成責務を固定し、物理固定条件下で性
 ## 運用ルール
 1. 候補ごとに `impl_hash` を発行し、重複候補を再実行しない。
 2. 候補生成後は `Generate` / `Build` / `Execute` / `Judge` を同一 `case` で実行する。
-3. `debug_mode=false` を標準にし、失敗試行成果物を保存しない。
+3. `debug_mode=false` を標準にし、失敗試行 artifact を保存しない。
 4. 候補生成失敗時は `last_fail_reason` を更新し、verify に引き渡す。
 
 ## 判定基準

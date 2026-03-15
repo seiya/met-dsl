@@ -1,4 +1,4 @@
-# Tests: 1 次元線形移流拡散（検証入力・判定条件）
+# Tests: 1 次元線形移流拡散（verification input・判定条件）
 
 ## 0. メタ情報
 - `status`: `draft`
@@ -10,7 +10,7 @@
 - `spec_ref.controlled_spec_path`: `spec/problem/dynamics/advection_diffusion/advdiff1d_linear/controlled_spec.md`
 
 ## 1. 目的
-本スイートは、1 次元線形移流拡散方程式の離散実装について、精度・保存性・平行移動同値性・CFL ガードを検証する。判定対象は `L0` から `L3` とし、期待失敗（`xfail`）を含む。
+本スイートは、1 次元線形移流拡散方程式の離散実装について、精度・保存性・平行移動同値性・CFL ガードを検証する。判定対象は `L0` から `L3` とし、expected failure（`xfail`）を含む。
 
 ## 2. 入力既定化
 ### 2-1. 入力インスタンス
@@ -52,8 +52,8 @@
 - `case_id` は `advdiff1d_ref_nx128_shift000_dts100_tend200` を追加する。
 - `base_case_id` は `advdiff1d_ref_nx128_shift000_dts100` を参照し、`t_end` は $2.0$ のみ上書きする。
 
-## 4. 診断成果物と契約
-### 4-1. 成果物
+## 4. 診断 artifact と契約
+### 4-1. Artifacts
 - 診断出力ファイルは `diagnostics.json` とする。
 - 判定出力ファイルは `verdict.json` とする。
 
@@ -156,7 +156,7 @@ $$
 
 ### 6-4. `l0_cfl_guard_xfail`
 - `level`: `L0`
-- `objective`: CFL 違反ケースを検出できることを確認する（期待失敗）。
+- `objective`: CFL 違反ケースを検出できることを確認する（expected failure）。
 - 対象ケース:
   - `advdiff1d_guard_nx064_shift000_dts120`
 - `expected_outcome`: `xfail`

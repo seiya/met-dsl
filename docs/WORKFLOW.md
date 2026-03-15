@@ -1,32 +1,32 @@
 # 全体ワークフロー: Spec -> Plan -> Generate -> Build -> Execute -> Judge -> Tune -> Promote
-この文書は workflow の工程順序、工程間入出力契約、workflow 共通規範を定義する。
-用語は `GLOSSARY.md` を参照する。
+この文書は workflow の phase sequence、inter-phase input/output contract、workflow 共通規範を定義する。
+terms は `GLOSSARY.md` を参照する。
 
 ## 目的
 - workflow を `Spec -> Plan -> Generate -> Build -> Execute -> Judge -> Tune -> Promote` の順で定義する。
-- 各工程の `実行入力` と `検証入力` と `出力` を一意に定義する。
-- workflow 横断の不変条件、成果物配置規約、完了判定基準を定義する。
+- 各 phase の `execution input` と `verification input` と `output` を一意に定義する。
+- workflow 横断の不変条件、artifact layout rules、完了判定基準を定義する。
 
 ## 適用範囲
 - `spec` 起点モードと `resolved` 起点モードの workflow 実行
 - `Plan` / `Generate` / `Build` / `Execute` / `Judge` / `Tune` / `Promote`
-- `node` 単位 workflow、依存 `DAG` 展開、`workspace/` 配下成果物、正式版昇格
+- `node` 単位 workflow、依存 `DAG` 展開、`workspace/` 配下 artifact、正式版昇格
 
 ## 文書責務
-- 本書は workflow 共通の不変規範、工程順序、工程契約、成果物配置規約を正本として定義する。
-- `ORCHESTRATION.md` は workflow のエージェント階層実行規約を正本として定義する。
-- `SPEC.md` は全体方針、`spec` 管理要件、台帳要件を正本として定義する。
-- 実装 `Plan` の既定値適用規則は `IMPL_PLAN_SPEC.md` を正本とする。
-- 各工程の実行手順、再試行手順、ツール呼び出し順、失敗時オペレーションは対応 `SKILL.md` を正本とする。
+- 本書は workflow 共通の不変規範、phase sequence、phase contract、artifact layout rules を canonical source として定義する。
+- `ORCHESTRATION.md` は workflow のエージェント階層実行規約を canonical source として定義する。
+- `SPEC.md` は全体方針、`spec` 管理要件、registry 要件を canonical source として定義する。
+- 実装 `Plan` の既定値適用規則は `IMPL_PLAN_SPEC.md` を canonical source とする。
+- 各 phase の実行手順、再試行手順、ツール呼び出し順、失敗時オペレーションは対応 `SKILL.md` を canonical source とする。
 
-## 用語規約
-- `工程` は workflow を構成する論理単位を指し、`Spec` / `Plan` / `Generate` / `Build` / `Execute` / `Judge` / `Tune` / `Promote` を含む。
-- `step` は `ORCHESTRATION.md` で定義する実行単位を指し、1 つの工程に対応するオーケストレーション上の実行単位として扱う。
+## term rules
+- `phase` は workflow を構成する論理単位を指し、`Spec` / `Plan` / `Generate` / `Build` / `Execute` / `Judge` / `Tune` / `Promote` を含む。
+- `step` は `ORCHESTRATION.md` で定義する実行単位を指し、1 つの phase に対応するオーケストレーション上の実行単位として扱う。
 - `substep` は `step` を分解した下位実行単位を指し、例として `generate` / `verify` を含む。
-- `stage` は `generated_by_stage`、`<stage>_meta.json`、`write_scope_baseline.json.stage` など既存フィールド名または既存プレースホルダー名としてのみ使用する。本文では `工程` または `step` の同義語として使用してはならない。
+- `stage` は `generated_by_stage`、`<stage>_meta.json`、`write_scope_baseline.json.stage` など既存フィールド名または既存プレースホルダー名としてのみ使用する。本文では `phase` または `step` の同義語として使用してはならない。
 
 ## workflow 全体像
-### 工程順序
+### phase sequence
 0. 仕様作成（人間）: `Controlled Spec`、`tests`、`deps` を定義する。
 1. `Plan`: 実行条件、生成契約、検証契約、実装方針、依存 `DAG` を確定する。
 2. `Generate`: `Plan` に基づいて `model` と `runner` を生成する。
@@ -34,53 +34,53 @@
 4. `Execute`: 実行バイナリを起動し、一次証跡と `diagnostics` を記録する。
 5. `Judge`: `raw/` 一次証跡から判定指標を再計算し、`verdict` を確定する。
 6. `Tune`: 物理合格を維持したまま実装候補を探索する。
-7. `Promote`: 合格成果物を正式版として `releases/` へ昇格する。
+7. `Promote`: 合格 artifact を正式版として `releases/` へ昇格する。
 
 ## workflow 共通不変規範
 1. `tests` 合格または workflow 進行を目的とした `dummy` 出力を禁止する。
-2. `diagnostics.json` と `perf.json` は対象 `runner` の実行結果としてのみ生成する。手書き生成、固定値埋め込み、外部後編集を禁止する。
-3. `verdict.json` と `aggregate_verdict.json` は `tests.md` と同一 `execution_id` の実行成果物から導出しなければならない。
-4. 工程入力が不足する場合は当該工程を `fail` で停止し、推測補完を禁止する。
-5. 工程失敗時に下流工程開始条件を満たす目的で成果物ファイルを人工生成してはならない。
+2. `diagnostics.json` と `perf.json` は対象 `runner` の execution result としてのみ生成する。手書き生成、固定値埋め込み、外部後編集を禁止する。
+3. `verdict.json` と `aggregate_verdict.json` は `tests.md` と同一 `execution_id` の実行 artifact から導出しなければならない。
+4. phase inputが不足する場合は当該 phase を `fail` で停止し、推測補完を禁止する。
+5. phase 失敗時に下流 phase 開始条件を満たす目的で artifact ファイルを人工生成してはならない。
 6. 明示的な指定がない場合、既存 workflow 出力（過去 `plan_id` / `pipeline_id` / `generation_id` / `build_id` / `execution_id`）の内容参照を禁止する。
-7. `workspace/` 配下に過去成果物が存在する場合も、中身の閲覧と入力参照を禁止する。
-8. `spec_kind` を問わない workflow 実行は、リポジトリ管理下の `spec` 正本と当該試行で生成した前段成果物のみを入力として使用する。
-9. `spec_kind` を問わない workflow 実行は、各工程（`Plan` / `Generate` / `Build` / `Execute` / `Judge`）を `LLM` で実行しなければならない。専用実行スクリプト前提、手動 `copy`、手動 `json` 生成、手動 `id` 差し替えを禁止する。
-10. `workflow` 実行のために、複数工程を一括代行する `script`（例: `python` / `bash`）を新規生成または実行してはならない。工程実行は `orchestration agent -> step agent` または `orchestration agent -> substep agent` のみを許可する。
-11. workflow 成果物の保存先ルートは `workspace/` のみを許可する。`workspace/` が存在しない場合はリポジトリルート直下へ作成する。
-12. workflow 実行中は対象 `DAG` の `workspace/plans` と `workspace/pipelines` 配下成果物を削除してはならない。
-13. `quality check` は `diagnostics.json` と `verdict.json` の比較を正本とし、`stdout` 差分のみで合否を確定してはならない。
-14. `lineage.json` と `trial_meta.json` の成果物参照パスは `workspace/` 起点で記録しなければならない。
+7. `workspace/` 配下に過去 artifact が存在する場合も、中身の閲覧と入力参照を禁止する。
+8. `spec_kind` を問わない workflow 実行は、リポジトリ管理下の `spec` canonical source と当該試行で生成した前段 artifact のみを入力として使用する。
+9. `spec_kind` を問わない workflow 実行は、各 phase（`Plan` / `Generate` / `Build` / `Execute` / `Judge`）を `LLM` で実行しなければならない。専用実行スクリプト前提、手動 `copy`、手動 `json` 生成、手動 `id` 差し替えを禁止する。
+10. `workflow` 実行のために、複数 phase を一括代行する `script`（例: `python` / `bash`）を新規生成または実行してはならない。phase 実行は `orchestration agent -> step agent` または `orchestration agent -> substep agent` のみを許可する。
+11. workflow artifact の保存先ルートは `workspace/` のみを許可する。`workspace/` が存在しない場合はリポジトリルート直下へ作成する。
+12. workflow 実行中は対象 `DAG` の `workspace/plans` と `workspace/pipelines` 配下 artifact を削除してはならない。
+13. `quality check` は `diagnostics.json` と `verdict.json` の比較を canonical source とし、`stdout` 差分のみで合否を確定してはならない。
+14. `lineage.json` と `trial_meta.json` の artifact 参照パスは `workspace/` 起点で記録しなければならない。
 15. `trial_meta.json` は `generated_by_stage`、`source_execution_id`、`source_command_ref`、`source_artifact_hash` を必須記録とする。
-16. 異なる `pipeline_id` 間で `id` 系メタデータのみを変更して成果物本文を流用してはならない。検出時は `copy_based_artifact_reuse` として `invalid` とする。
+16. 異なる `pipeline_id` 間で `id` 系メタデータのみを変更して artifact 本文を流用してはならない。検出時は `copy_based_artifact_reuse` として `invalid` とする。
 17. 本規範違反は workflow 仕様違反とし、当該 `pipeline` を `invalid` とする。
-18. `Promote` 以外の工程は、`workspace/` 配下以外へ書き込みを行ってはならない。`Promote` は `releases/` 配下と `spec/registry/spec_catalog.yaml` への書き込みのみを許可する。
-19. `Promote` 以外の工程開始前に、リポジトリルート配下ファイル集合の `baseline` を取得し、当該工程完了前に差分比較を実施しなければならない。
+18. `Promote` 以外の phase は、`workspace/` 配下以外へ書き込みを行ってはならない。`Promote` は `releases/` 配下と `spec/registry/spec_catalog.yaml` への書き込みのみを許可する。
+19. `Promote` 以外の phase 開始前に、リポジトリルート配下ファイル集合の `baseline` を取得し、当該 phase 完了前に差分比較を実施しなければならない。
 20. 差分比較は `workspace/` 配下以外の `add` / `modify` / `delete` を違反として検出しなければならない。`Promote` は `releases/` 配下と `spec/registry/spec_catalog.yaml` のみを例外許可する。
 21. `python` 実行を workflow 経路で使用する場合、`__pycache__` が `workspace/` 配下以外へ生成されない設定を必須とする。`PYTHONDONTWRITEBYTECODE=1` または `PYTHONPYCACHEPREFIX=workspace/.pycache/<pipeline_id>/` を使用する。
-22. 書き込み範囲違反を検出した工程は `fail` とし、下流工程を開始してはならない。違反内容は `workspace/` 配下のメタデータへ記録しなければならない。
+22. 書き込み範囲違反を検出した phase は `fail` とし、下流 phase を開始してはならない。違反内容は `workspace/` 配下のメタデータへ記録しなければならない。
 23. 書き込み範囲違反を検出した `pipeline` は `invalid` とする。違反状態を解消せずに同一試行を継続してはならない。
-24. `workflow` の階層実行契約、`preflight`、`agent_runs.jsonl`、`agent_graph.json`、`step_result.json` の要件は `ORCHESTRATION.md` を正本として適用しなければならない。
+24. `workflow` の階層実行契約、`preflight`、`agent_runs.jsonl`、`agent_graph.json`、`step_result.json` の要件は `ORCHESTRATION.md` を canonical source として適用しなければならない。
 25. `preflight` が `fail` の場合、`orchestration agent` は子 `agent` を起動してはならない。`workflow` は `fail` で停止しなければならない。
-26. `preflight.json` を手動編集または後編集して `pass` 化してはならない。`preflight` 正本は `tools/codex_orchestration_runtime.py preflight` の実行結果とする。
-27. 子 `agent` 起動直前に実行基盤の live 検査を再実行し、`multi_agent=true` と子 `agent` 起動可否の充足を確認しなければならない。未充足時は即時 `fail` とする。
-28. 出力形式、入出力契約、判定条件の要求定義は `controlled_spec.md` と `tests.md` と `deps.yaml` と `derived_contract.json` と `docs/` 正本文書のみを参照しなければならない。
+26. `preflight.json` を手動編集または後編集して `pass` 化してはならない。`preflight` canonical source は `tools/codex_orchestration_runtime.py preflight` の execution result とする。
+27. 子 `agent` 起動直前に execution platform の live 検査を再実行し、`multi_agent=true` と子 `agent` 起動可否の充足を確認しなければならない。未充足時は即時 `fail` とする。
+28. 出力形式、input/output contract、判定条件の要求定義は `controlled_spec.md` と `tests.md` と `deps.yaml` と `derived_contract.json` と `docs/` canonical source 文書のみを参照しなければならない。
 29. `tools/` 配下の検証 `python` スクリプト、`quality check` 実装、`verify` 実装は妥当性確認専用入力として扱い、要求定義または出力形式定義の入力として参照してはならない。
-30. 要求定義が不足する場合、検証実装からの逆算補完を禁止し、当該工程を `fail` で停止しなければならない。
+30. 要求定義が不足する場合、検証実装からの逆算補完を禁止し、当該 phase を `fail` で停止しなければならない。
 
 ## 共通規約
-### `LLM` 利用工程
-- `LLM` を利用する全工程に `SPEC.md` の「`LLM` の扱い（全体原則）」を適用する。
-- `LLM` 利用工程は各工程の `<stage>_meta.json`（コード生成は `generate_meta.json`）を必須出力とする。
-- `debug_mode=false` では失敗試行成果物を保存しない。`debug_mode=true` で保存した場合は保存件数と保存先をメタデータへ記録する。
+### `LLM` 利用 phase
+- `LLM` を利用する全 phase に `SPEC.md` の「`LLM` の扱い（全体原則）」を適用する。
+- `LLM` 利用 phase は各 phase の `<stage>_meta.json`（コード生成は `generate_meta.json`）を必須出力とする。
+- `debug_mode=false` では失敗試行 artifact を保存しない。`debug_mode=true` で保存した場合は保存件数と保存先をメタデータへ記録する。
 
 ### エージェント階層実行
 - `workflow` の階層実行契約、親子関係、起動順、停止条件、実行記録形式は `ORCHESTRATION.md` を適用する。
-- 本書は `orchestration agent` が子 `agent` へ渡す工程契約の正本として、各工程の `実行入力` と `検証入力` と `出力` を定義する。
+- 本書は `orchestration agent` が子 `agent` へ渡す phase contractの canonical source として、各 phase の `execution input` と `verification input` と `出力` を定義する。
 
-### 成果物配置規約
+### artifact layout rules
 #### ルート構造
-workflow 成果物の保存先は `workspace/` を正本とし、次の構造を必須とする。
+workflow artifact の保存先は `workspace/` を canonical source とし、次の構造を必須とする。
 
 ```text
 workspace/
@@ -150,7 +150,7 @@ workspace/
 - `agent_runs.jsonl` の `step` / `substep` ロールは `agent_backend` と `agent_model` と `context_id` と `context_isolated` を必須記録とする。
 - `agent_runs.jsonl` の終端状態行（`pass` / `fail` / `blocked` / `timeout` / `cancel`）は `finished_at` を必須記録とする。
 - `step` / `substep` ロールの `context_id` は `orchestration_id` 内で一意でなければならない。
-- `execution` の判定単位は `node_key` とする。`execution_id` 配下で複数 `node_key` を扱う場合は `node_key` ごとの成果物分離を必須とする。
+- `execution` の判定単位は `node_key` とする。`execution_id` 配下で複数 `node_key` を扱う場合は `node_key` ごとの artifact 分離を必須とする。
 - `plan_id` 配下の `resolved` ファイルは `immutable` とし、更新時は新規 `plan_id` を発行する。
 - `pipeline_id` 配下は `append-only` とし、既存 `execution_id` の上書きを禁止する。
 
@@ -165,17 +165,17 @@ workspace/
 - 同一 `build_id` で `Execute` を複数回実行してよい。各試行は別 `execution_id` とする。
 - `Build` 開始条件は対象 `generation_id` の `generate_meta.json` で `verification_status=pass` であることとする。
 - `debug_mode=false` の `Generate` は `attempts/` を生成してはならない。
-- `Judge` 入力は常に同一 `execution_id` 配下成果物とし、他 `execution_id` との混在を禁止する。
-- 各工程 `fail` 時は下流工程開始条件を満たす目的のファイル後付け生成を禁止する。
-- `substep` を持つ工程の再投入戦略（`repair_strategy=reuse` / `restart`）と記録要件は `ORCHESTRATION.md` を正本として適用する。
+- `Judge` 入力は常に同一 `execution_id` 配下 artifact とし、他 `execution_id` との混在を禁止する。
+- 各 phase `fail` 時は下流 phase 開始条件を満たす目的のファイル後付け生成を禁止する。
+- `substep` を持つ phase の再投入戦略（`repair_strategy=reuse` / `restart`）と記録要件は `ORCHESTRATION.md` を canonical source として適用する。
 
 #### 参照規則
 - `orchestration` から `step` / `substep` 実行を参照するときは `orchestration_id + agent_run_id` を使用し、ログ本文の全文検索だけで追跡してはならない。
-- `step` 完了判定は `workspace/orchestrations/<orchestration_id>/steps/<node_key_safe>/<step>/<agent_run_id>/step_result.json` を正本とし、`stdout` 文字列のみで代替してはならない。`substep` を持つ工程では `agent_run_id=orchestration agent_run_id`、標準 `substep` を持たない工程では `agent_run_id=step agent_run_id` を正本とする。
+- `step` 完了判定は `workspace/orchestrations/<orchestration_id>/steps/<node_key_safe>/<step>/<agent_run_id>/step_result.json` を canonical source とし、`stdout` 文字列のみで代替してはならない。`substep` を持つ phase では `agent_run_id=orchestration agent_run_id`、標準 `substep` を持たない phase では `agent_run_id=step agent_run_id` を canonical source とする。
 - `pipeline` から `plan` を参照するときは `node_key_safe + plan_id` を使用し、相対ファイルパス直参照を禁止する。
 - `execution` の再現は `lineage.json` と `trial_meta.json` のみで可能でなければならない。
 - `trial_meta.json` は `runner_command`、`process_trace_ref`、`raw_artifact_refs` を必須記録とする。
-- `index/plan_index.json` と `index/pipeline_index.json` は探索専用とし、判定ロジックの正本に使ってはならない。
+- `index/plan_index.json` と `index/pipeline_index.json` は探索専用とし、判定ロジックの canonical source に使ってはならない。
 - `aggregate_verdict.json` は常に `dependency.resolved.yaml` と整合し、依存集合の省略を禁止する。
 
 #### 依存 workflow 網羅チェック
@@ -183,63 +183,63 @@ workspace/
 - `dependency.resolved.yaml` の `node_key` 集合と `workspace/pipelines/*/<pipeline_id>/lineage.json` の `node_key` 集合は 1 対 1 で一致しなければならない。
 - `dependency.resolved.yaml` が `all_nodes` を保持する場合、`python3 tools/validate_pipeline_semantics.py` は `all_nodes` の全 `node_key` について `lineage` と `plan_ref` の両方を検証し、未発行 `node` を `fail` としなければならない。
 - 異なる `node_key` で生成された `generate/<generation_id>/src/` のコードハッシュが一致した場合、共通ライブラリとして明示されたファイルを除き `copy_based_artifact_reuse` として `invalid` にしなければならない。
-- `spec_kind` を問わない workflow 実行の完了宣言前に、対象依存 `DAG` の `workspace/plans` / `workspace/pipelines` 成果物を削除してはならない。
+- `spec_kind` を問わない workflow 実行の完了宣言前に、対象依存 `DAG` の `workspace/plans` / `workspace/pipelines` artifact を削除してはならない。
 
 #### 書き込み範囲ガード
-- 各工程開始時に `write_scope_baseline.json` を `workspace/` 配下へ保存し、比較対象の `baseline` を固定しなければならない。
+- 各 phase 開始時に `write_scope_baseline.json` を `workspace/` 配下へ保存し、比較対象の `baseline` を固定しなければならない。
 - `write_scope_baseline.json` は、少なくとも `stage`、`node_key`、`pipeline_id`、`captured_at`、`tracked_diff`、`untracked_files` を保持しなければならない。
-- 各工程完了前に `write_scope_baseline.json` との差分を計算し、`workspace/` 配下以外の変化を `write_scope_violation` として判定しなければならない。
-- 違反未検出時は `write_scope_check.status=pass` を工程メタデータへ記録しなければならない。
+- 各 phase 完了前に `write_scope_baseline.json` との差分を計算し、`workspace/` 配下以外の変化を `write_scope_violation` として判定しなければならない。
+- 違反未検出時は `write_scope_check.status=pass` を phase メタデータへ記録しなければならない。
 - 違反検出時は `write_scope_violation.json` を `workspace/` 配下へ出力し、`violation_paths` と `stage` と `node_key` と `pipeline_id` と `detected_at` を必須記録しなければならない。
-- `write_scope_violation` 検出時は当該工程を `fail` とし、当該 `pipeline` の `aggregate_verdict` 確定を禁止する。
+- `write_scope_violation` 検出時は当該 phase を `fail` とし、当該 `pipeline` の `aggregate_verdict` 確定を禁止する。
 
-## 工程別入出力契約一覧
-本節では、各工程の入力を `実行入力` と `検証入力` に分けて記述する。両者の役割が重なる場合、同一成果物を両方へ記載してよい。
+## phase 別 input/output contract 一覧
+本節では、各 phase の入力を `execution input` と `verification input` に分けて記述する。両者の role が重なる場合、同一 artifact を両方へ記載してよい。
 
 ### 0. 仕様作成（人間）
-- 実行入力: workflow 外部で与える要求事項、物理要件、依存選択方針
-- 検証入力: なし
+- execution input: workflow 外部で与える要求事項、物理要件、依存選択方針
+- verification input: なし
 - 出力: `spec/<spec_kind>/<domain>/<family>/<spec_id>/controlled_spec.md`、`spec/<spec_kind>/<domain>/<family>/<spec_id>/tests.md`、`spec/<spec_kind>/<domain>/<family>/<spec_id>/deps.yaml`
 
 ### 1. Plan
-- 実行入力: `controlled_spec.md`、`tests.md`、`deps.yaml`、`spec/registry/spec_catalog.yaml`
-- 検証入力: `controlled_spec.md`、`tests.md`、`deps.yaml`、`spec/registry/spec_catalog.yaml`
+- execution input: `controlled_spec.md`、`tests.md`、`deps.yaml`、`spec/registry/spec_catalog.yaml`
+- verification input: `controlled_spec.md`、`tests.md`、`deps.yaml`、`spec/registry/spec_catalog.yaml`
 - 出力: `case.resolved.yaml`、`algorithm.resolved.yaml`、`impl.resolved.yaml`、`dependency.resolved.yaml`、`derived_contract.json`、`algorithm.summary.md`、`plan_meta.json`
 
 ### 2. Generate
-- 実行入力: `case.resolved.yaml`、`algorithm.resolved.yaml`、`impl.resolved.yaml`、`dependency.resolved.yaml`
-- 検証入力: `algorithm.resolved.yaml`、`derived_contract.json`、`dependency.resolved.yaml`、`impl.resolved.yaml`
+- execution input: `case.resolved.yaml`、`algorithm.resolved.yaml`、`impl.resolved.yaml`、`dependency.resolved.yaml`
+- verification input: `algorithm.resolved.yaml`、`derived_contract.json`、`dependency.resolved.yaml`、`impl.resolved.yaml`
 - 出力: `generate/<generation_id>/src/`、`generate_meta.json`
 
 ### 3. Build
-- 実行入力: `generate/<generation_id>/src/`、`impl.resolved.yaml`
-- 検証入力: `dependency.resolved.yaml`、`generate_meta.json`、`impl.resolved.yaml`
+- execution input: `generate/<generation_id>/src/`、`impl.resolved.yaml`
+- verification input: `dependency.resolved.yaml`、`generate_meta.json`、`impl.resolved.yaml`
 - 出力: `build/<build_id>/bin/`、`build_meta.json`、`compile_project` の `command_id` と `command_log_ref`
 
 ### 4. Execute
-- 実行入力: `build/<build_id>/bin/`、`case.resolved.yaml`
-- 検証入力: `derived_contract.json`、`dependency.resolved.yaml`、`build/<build_id>/bin/`
+- execution input: `build/<build_id>/bin/`、`case.resolved.yaml`
+- verification input: `derived_contract.json`、`dependency.resolved.yaml`、`build/<build_id>/bin/`
 - 出力: `diagnostics.json`、`perf.json`、`quality_check.json`、`raw/`、`stdout.log`、`stderr.log`、`run_program` の `command_id` と `command_log_ref`
 
 ### 5. Judge
-- 実行入力: `tests.md`、`derived_contract.json`、同一 `execution_id` 配下の `raw/`
-- 検証入力: `dependency.resolved.yaml`、同一 `execution_id` 配下の `diagnostics.json` / `perf.json` / `quality_check.json` / `raw/`、対象 `generation_id` の `model` / `runner`
+- execution input: `tests.md`、`derived_contract.json`、同一 `execution_id` 配下の `raw/`
+- verification input: `dependency.resolved.yaml`、同一 `execution_id` 配下の `diagnostics.json` / `perf.json` / `quality_check.json` / `raw/`、対象 `generation_id` の `model` / `runner`
 - 出力: `semantic_review.json`、`verdict.json`、`aggregate_verdict.json`、`summary.json`、`trial_meta.json`
 
 ### 6. Tune
-- 実行入力: 固定した `case.resolved.yaml`、探索対象 `impl` 候補
-- 検証入力: 候補ごとの `diagnostics.json` / `perf.json` / `verdict.json`
+- execution input: 固定した `case.resolved.yaml`、探索対象 `impl` 候補
+- verification input: 候補ごとの `diagnostics.json` / `perf.json` / `verdict.json`
 - 出力: 採用 `impl.resolved.yaml`、チューニング試行ごとの評価結果
 
 ### 7. Promote
-- 実行入力: 採用 `impl.resolved.yaml`、`lineage.json`、採用対象の生成物
-- 検証入力: `verdict.json`、`aggregate_verdict.json`、`trial_meta.json`、`lineage.json`
-- 出力: `releases/<spec_kind>/<domain>/<family>/<spec_id>/<target_architecture>/<toolchain_language>/<release_id>/` 配下の正式版成果物、`spec/registry/spec_catalog.yaml` の `official_releases` 更新
+- execution input: 採用 `impl.resolved.yaml`、`lineage.json`、採用対象の生成物
+- verification input: `verdict.json`、`aggregate_verdict.json`、`trial_meta.json`、`lineage.json`
+- 出力: `releases/<spec_kind>/<domain>/<family>/<spec_id>/<target_architecture>/<toolchain_language>/<release_id>/` 配下の正式版 artifact、`spec/registry/spec_catalog.yaml` の `official_releases` 更新
 
-## 工程詳細
+## phase 詳細
 ### 0. 仕様作成（人間）
-- 実行入力: workflow 外部で与える要求事項、物理要件、依存選択方針
-- 検証入力: なし
+- execution input: workflow 外部で与える要求事項、物理要件、依存選択方針
+- verification input: なし
 - 出力: `spec/<spec_kind>/<domain>/<family>/<spec_id>/controlled_spec.md`、`spec/<spec_kind>/<domain>/<family>/<spec_id>/tests.md`、`spec/<spec_kind>/<domain>/<family>/<spec_id>/deps.yaml`
 - `Controlled Spec` で物理アルゴリズム（A）を定義する。
 - `problem spec` は依存 `component` と採用 `profile` を定義する。
@@ -247,25 +247,25 @@ workspace/
 - 検証契約は `Plan` が `controlled_spec.md` と `tests.md` と `deps.yaml` から導出する。
 
 ### 1. Plan 生成（決定的）
-- 実行入力: `controlled_spec.md`、`tests.md`、`deps.yaml`、`spec/registry/spec_catalog.yaml`
-- 検証入力: `controlled_spec.md`、`tests.md`、`deps.yaml`、`spec/registry/spec_catalog.yaml`
+- execution input: `controlled_spec.md`、`tests.md`、`deps.yaml`、`spec/registry/spec_catalog.yaml`
+- verification input: `controlled_spec.md`、`tests.md`、`deps.yaml`、`spec/registry/spec_catalog.yaml`
 - 出力: `case.resolved.yaml`、`algorithm.resolved.yaml`、`impl.resolved.yaml`、`dependency.resolved.yaml`、`derived_contract.json`、`algorithm.summary.md`、`plan_meta.json`
 
 #### 1-1) 物理 Plan（`case.resolved.yaml`）
 - `Controlled Spec` から物理アルゴリズム（A）を読み、`tests` から入力条件と `sweep` / `refinement` を決定的に展開する。
-- `case.resolved.yaml` は実行時入力の決定値のみを保持し、検証出力契約を保持してはならない。
+- `case.resolved.yaml` は実行時入力の決定値のみを保持し、検証 output contract を保持してはならない。
 - `case.resolved.yaml` は演算構成、依存 `operation` 呼び出し順序、条件分岐、反復条件を保持してはならない。
 
 #### 1-2) 生成契約 Plan（`algorithm.resolved.yaml`）
 - `Plan` は `controlled_spec.md` と `deps.yaml` と `profile` 解決結果から `algorithm contract` を導出し、`algorithm.resolved.yaml` として保存する。
-- `algorithm.resolved.yaml` は `Generate` の正本入力であり、`Generate` は元の `controlled_spec.md` を直接読んではならない。
+- `algorithm.resolved.yaml` は `Generate` の canonical source 入力であり、`Generate` は元の `controlled_spec.md` を直接読んではならない。
 - `algorithm.resolved.yaml` は `algorithm_id` と `execution_mode` と `steps[]` と `ordering` と `control_condition` と `iteration_contract` と `update_semantics` と `temporaries` と `derived_field_rules` と `invariants` と `splitting_policy` を必須保持しなければならない。
 - `execution_mode` は `sequence` / `conditional` / `iterative` / `columnwise` のみを許可する。
 - `steps[]` の各要素は `step_id` と `step_kind` と `operation_ref` と `inputs` と `outputs` を必須保持しなければならない。
 - `step_kind` は `boundary_apply` / `reconstruct` / `flux_compute` / `source_term` / `time_integrate` / `column_process` / `pointwise_process` / `iterative_solve` / `filter` / `reduction` / `diagnostic` のみを許可する。
 - `algorithm.resolved.yaml` は `problem` の統合順序と `profile` が選択した `component` 群の拘束を分離表現しなければならない。
 - `algorithm.resolved.yaml` は力学、`microphysics`、`radiation`、`land_surface`、`turbulence` を含む気象計算一般で使用できる表現力を持たなければならない。
-- `algorithm.summary.md` は `algorithm.resolved.yaml` から自動生成する閲覧専用成果物とし、`plan_id` 算出や下流工程入力に含めてはならない。
+- `algorithm.summary.md` は `algorithm.resolved.yaml` から自動生成する閲覧専用 artifact とし、`plan_id` 算出や下流 phase inputに含めてはならない。
 - `Plan verify` は `controlled_spec.md` と `tests.md` と `deps.yaml` から導出した検証契約を `derived_contract.json` として保存する。
 - `Plan verify` は `algorithm.resolved.yaml` の演算構成と `derived_contract.json` の検証契約を混在させてはならない。
 
@@ -298,19 +298,19 @@ workspace/
 #### 1-7) `node` 単位 workflow 実行規則
 - `dependency.resolved.yaml` の各 `node_key` に対して個別 workflow を完了させる。
 - 直下依存が充足する `node` は `Plan -> Generate -> Build -> Execute -> Judge` を実行する。
-- 直下依存が不充足の `node` は `blocked` 終端成果物を生成して完了とする。
+- 直下依存が不充足の `node` は `blocked` 終端 artifact を生成して完了とする。
 - 各 `node_key` は個別の `plan_id` と個別の `pipeline_id` を必須発行する。
 - `spec_kind` を問わない workflow 実行では、依存 `DAG` を展開した全 `node` の workflow 完了を必須とする。
 - 直下依存 `node` の `aggregate_verdict` に `fail` または `blocked` がある場合、上位 `node` は `self_verdict` を評価せず `aggregate_verdict=blocked` で終了する。
 - `blocked` 停止時も `aggregate_verdict.json`、`summary.json`、`trial_meta.json` を必須出力とする。`verdict.json` は `self_verdict=not_evaluated` を記録する。
 
 ### 2. 生成（Generate）
-- 実行入力: `case.resolved.yaml`、`algorithm.resolved.yaml`、`impl.resolved.yaml`、`dependency.resolved.yaml`
-- 検証入力: `algorithm.resolved.yaml`、`derived_contract.json`、`dependency.resolved.yaml`、`impl.resolved.yaml`
+- execution input: `case.resolved.yaml`、`algorithm.resolved.yaml`、`impl.resolved.yaml`、`dependency.resolved.yaml`
+- verification input: `algorithm.resolved.yaml`、`derived_contract.json`、`dependency.resolved.yaml`、`impl.resolved.yaml`
 - 出力: `generate/<generation_id>/src/`、`generate_meta.json`
 - `Generate` は `node` 単位で実行し、対象 `node_key` 専用のソースを生成する。
 - `Generate` は `controlled_spec.md` を直接入力にしてはならない。必要な演算構成は `algorithm.resolved.yaml` から解釈しなければならない。
-- 言語に依らず `model`（物理計算）と `runner`（入出力・実行連携）を分離して生成する。
+- 言語に依らず `model`（物理計算）と `runner`（input/output・実行連携）を分離して生成する。
 - `runner` は `model` を `call` / `use` / `import` で呼び出し、物理更新ロジックを重複実装してはならない。
 - `toolchain.language` が `fortran` / `c` / `cpp` / `mixed` 系の場合、`runner` が `python` / `bash` / `sh` / `node` など外部インタプリタを起動してはならない。
 - `model` は数値状態更新または判定対象演算を実行しなければならない。固定値返却専用、固定 `JSON` 出力専用、`no-op` 専用実装を禁止する。
@@ -333,8 +333,8 @@ workspace/
 - 物理更新を実装できない場合は `Generate fail` とし、代替として固定文字列や固定 `JSON` を出力してはならない。
 
 ### 3. Build
-- 実行入力: `generate/<generation_id>/src/`、`impl.resolved.yaml`
-- 検証入力: `dependency.resolved.yaml`、`generate_meta.json`、`impl.resolved.yaml`
+- execution input: `generate/<generation_id>/src/`、`impl.resolved.yaml`
+- verification input: `dependency.resolved.yaml`、`generate_meta.json`、`impl.resolved.yaml`
 - 出力: `build/<build_id>/bin/`、`build_meta.json`、`compile_project` の `command_id` と `command_log_ref`
 - `Build` は `MCP` サーバー経由で実行する。
 - `Build` は `compile_project` を使用し、`fortran` / `c` / `cpp` / `mixed` 系では依存関係を扱える標準ビルドツール（既定 `make`）を使用する。
@@ -343,21 +343,21 @@ workspace/
 - `compile_project` の実コマンド記録は `JSONL` 形式で保存し、既定の保存先は `project_dir/mcp_command_log.jsonl` とする。
 - `Build` の試行メタデータは `command_id` と `command_log_ref`（または `command_log_path`）を追跡可能に記録する。
 - `Build` は依存を持つ `node` で、依存 `operation` 解決先が `dependency.resolved.yaml` と一致することを必須検証とする。不一致時は `Build fail` とする。
-- `Build` は `node` 単位で個別実行し、他 `node` の成果物を混在させてはならない。
+- `Build` は `node` 単位で個別実行し、他 `node` の artifact を混在させてはならない。
 
 ### 4. Execute
-- 実行入力: `build/<build_id>/bin/`、`case.resolved.yaml`
-- 検証入力: `derived_contract.json`、`dependency.resolved.yaml`、`build/<build_id>/bin/`
+- execution input: `build/<build_id>/bin/`、`case.resolved.yaml`
+- verification input: `derived_contract.json`、`dependency.resolved.yaml`、`build/<build_id>/bin/`
 - 出力: `diagnostics.json`、`perf.json`、`quality_check.json`、`raw/`、`stdout.log`、`stderr.log`、`run_program` の `command_id` と `command_log_ref`
 - `Execute` は `MCP` サーバー経由で実行する。
 - `Execute` は `run_program` を使用し、実行コマンドへ `case.resolved.yaml` を必ず含める。
 - `run_program` の実コマンド記録は `JSONL` 形式で保存し、既定の保存先は `project_dir/mcp_command_log.jsonl` とする。
 - `Execute` の試行メタデータは `command_id` と `command_log_ref`（または `command_log_path`）を追跡可能に記録する。
-- `Execute` は `node` 単位で個別実行し、他 `node` の成果物を混在させてはならない。
+- `Execute` は `node` 単位で個別実行し、他 `node` の artifact を混在させてはならない。
 - `runner` の出力対象は `diagnostics.json`、`perf.json`、`raw/` 一次証跡、`stdout.log`、`stderr.log` に限定する。
 - `runner` は `verdict.json`、`aggregate_verdict.json`、`summary.json`、`trial_meta.json` を書き込んではならない。
 - `Execute` は `Judge` 再計算に必要な一次証跡を `execution_id/<node_key>/raw/` に保存しなければならない。
-- 一次証跡の必須構成は `derived_contract.json` の `raw_requirements.required_evidence` を正本とする。固定の最小構成を全 `spec` に一律適用してはならない。
+- 一次証跡の必須構成は `derived_contract.json` の `raw_requirements.required_evidence` を canonical source とする。固定の最小構成を全 `spec` に一律適用してはならない。
 - `raw_requirements.required_evidence` は `metrics_basis.json` と `execution_trace.json` と `state_snapshots` などの `artifact` ごとに必須有無を宣言しなければならない。
 - `raw_requirements.required_evidence` が `artifact=state_snapshots` かつ `required=true` を宣言する場合、`raw/state_snapshots/` は `snapshot_schema.json` で `variables[].name` と `variables[].shape_expr` と `time_variable` と `time_shape_expr` を宣言し、`min_samples` 件以上の状態ファイルへ当該項目を保持しなければならない。
 - `raw_requirements.required_evidence` が `artifact=state_snapshots` を必須宣言しない場合、`raw/state_snapshots/` を必須にしてはならない。スカラー目的 `spec` を含む任意の計算課題を許容しなければならない。
@@ -369,12 +369,12 @@ workspace/
 - `perf.json` の仕様は `PERFORMANCE_DIAGNOSTICS.md` を参照する。
 
 ### 5. 判定（Judge）
-- 実行入力: `tests.md`、`derived_contract.json`、同一 `execution_id` 配下の `raw/`
-- 検証入力: `dependency.resolved.yaml`、同一 `execution_id` 配下の `diagnostics.json` / `perf.json` / `quality_check.json` / `raw/`、対象 `generation_id` の `model` / `runner`
+- execution input: `tests.md`、`derived_contract.json`、同一 `execution_id` 配下の `raw/`
+- verification input: `dependency.resolved.yaml`、同一 `execution_id` 配下の `diagnostics.json` / `perf.json` / `quality_check.json` / `raw/`、対象 `generation_id` の `model` / `runner`
 - 出力: `semantic_review.json`、`verdict.json`、`aggregate_verdict.json`、`summary.json`、`trial_meta.json`
-- 判定正本は `tests.md` とする。
+- 判定 canonical source は `tests.md` とする。
 - 判定は `self_verdict`（`verdict.json`）と `aggregate_verdict`（`aggregate_verdict.json`）の 2 層で実施する。
-- `Judge` 開始条件は、対象 `execution_id` 配下に `run_program` 実行記録と `diagnostics.json` と `perf.json` と `raw/` 一次証跡が存在し、同一 `execution_id` 成果物として追跡可能であることとする。
+- `Judge` 開始条件は、対象 `execution_id` 配下に `run_program` 実行記録と `diagnostics.json` と `perf.json` と `raw/` 一次証跡が存在し、同一 `execution_id` artifact として追跡可能であることとする。
 - `Judge` は `raw/` 一次証跡から独立経路で判定指標を再計算し、`diagnostics.json` と整合確認しなければならない。
 - `Judge` 再計算入力は `raw/` のみに限定する。`diagnostics.json` を再計算入力へ流用してはならない。
 - `Judge` は再計算不能または不整合時に `fail` としなければならない。
@@ -397,21 +397,21 @@ workspace/
 - 物理 `fail` 時は性能評価をスキップする。
 
 ### 6. チューニング（Tune: Phase 2+）
-- 実行入力: 固定した `case.resolved.yaml`、探索対象 `impl` 候補
-- 検証入力: 候補ごとの `diagnostics.json` / `perf.json` / `verdict.json`
+- execution input: 固定した `case.resolved.yaml`、探索対象 `impl` 候補
+- verification input: 候補ごとの `diagnostics.json` / `perf.json` / `verdict.json`
 - 出力: 採用 `impl.resolved.yaml`、チューニング試行ごとの評価結果
 - 同一 `case.resolved.yaml` に対して複数 `impl.resolved.yaml` を生成し、物理合格を満たす範囲で性能目的関数を最大化する。
 - 詳細は `TUNING_WORKFLOW.md` を参照する。
 
 ### 7. 正式版昇格（Promote）
-- 実行入力: 採用 `impl.resolved.yaml`、`lineage.json`、採用対象の生成物
-- 検証入力: `verdict.json`、`aggregate_verdict.json`、`trial_meta.json`、`lineage.json`
-- 出力: `releases/<spec_kind>/<domain>/<family>/<spec_id>/<target_architecture>/<toolchain_language>/<release_id>/` 配下の正式版成果物、`spec/registry/spec_catalog.yaml` の `official_releases` 更新
+- execution input: 採用 `impl.resolved.yaml`、`lineage.json`、採用対象の生成物
+- verification input: `verdict.json`、`aggregate_verdict.json`、`trial_meta.json`、`lineage.json`
+- 出力: `releases/<spec_kind>/<domain>/<family>/<spec_id>/<target_architecture>/<toolchain_language>/<release_id>/` 配下の正式版 artifact、`spec/registry/spec_catalog.yaml` の `official_releases` 更新
 - 入力条件: `verdict.json` の `overall=pass`
 - 入力条件: `aggregate_verdict.json` の `overall=pass`
 - 入力条件: 採用対象 `generation_id` / `build_id` / `execution_id` が `lineage.json` と `trial_meta.json` で追跡可能であること
 - 入力条件: 採用対象 `impl.resolved.yaml` が確定していること
-- 実施内容: `workspace` から採用成果物を `releases/<spec_kind>/<domain>/<family>/<spec_id>/<target_architecture>/<toolchain_language>/<release_id>/` へ保存する。
+- 実施内容: `workspace` から採用 artifact を `releases/<spec_kind>/<domain>/<family>/<spec_id>/<target_architecture>/<toolchain_language>/<release_id>/` へ保存する。
 - 実施内容: `spec/registry/spec_catalog.yaml` の対象 `spec_id` に `official_releases` を追加する。
 - 登録必須項目: `release_id`、`target_architecture`、`toolchain_language`、`target_backend`、`source_pipeline_id`、`source_generation_id`、`source_build_id`、`source_execution_id`、`artifact_root`、`promoted_at`、`status`
 - 不変条件: 既存 `release_id` の上書きを禁止する。更新時は新規 `release_id` を追加し、同一 `target_architecture + toolchain_language` の旧 `release` を `deprecated` へ更新する。
@@ -421,8 +421,8 @@ workspace/
 - workflow 完了条件は、対象 workflow の `orchestration_id` 配下に `orchestration_meta.json` と `agent_graph.json` と `agent_runs.jsonl` が存在することとする。
 - workflow 完了条件は、`dependency.resolved.yaml` の全 `node_key` に対して `workspace/plans/<node_key_safe>/<plan_id>/` と `workspace/pipelines/<node_key_safe>/<pipeline_id>/` が存在し、`lineage.json` の `node_key` と `dependency_ref` が一致することとする。
 - workflow 完了宣言は、`dependency workflow` 網羅チェックと `trial_meta` 完整性チェックと `copy_based_artifact_reuse` 非検出を同時に満たす場合のみ許可する。
-- workflow 完了宣言は、全工程で `write_scope_violation` 非検出を同時に満たす場合のみ許可する。
-- `CI` は `python3 tools/validate_workspace_root.py` と `python3 tools/validate_pipeline_semantics.py` の実行結果を `pass` 条件として扱う。
+- workflow 完了宣言は、全 phase で `write_scope_violation` 非検出を同時に満たす場合のみ許可する。
+- `CI` は `python3 tools/validate_workspace_root.py` と `python3 tools/validate_pipeline_semantics.py` の execution result を `pass` 条件として扱う。
 
 ## 参照文書
 - `IMPL_PLAN_SPEC.md`

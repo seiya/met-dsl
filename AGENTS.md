@@ -14,9 +14,15 @@
 
 ## 全角・半角の表記ルール
 - 和文文字（漢字・ひらがな・カタカナ）と英数字トークンの境界には、半角スペースを 1 つ入れる。
-- 英数字トークンは、用語・識別子・略語・ファイル名を含む。
+- 英数字トークンは、terms・識別子・略語・ファイル名を含む。
 - 英数字トークン内部の記号連結（例: `CPU/GPU`,`pass/fail`,`L0-L3`,`case.resolved.yaml`）には空白を入れない。
 - インラインコード（バッククォート内）は文字列を変更しない。
+
+## Term 表記ルール
+- 本文は日本語で記述するが、terms の canonical source 表記は英語とする。
+- terms・artifact 名・role 名・phase 名・classification 名は、`docs/GLOSSARY.md` に定義した英語表記を使用する。
+- 日本語訳を併記する場合は初出の説明に限定し、以後は英語表記へ統一する。
+- 新規 term を追加する場合は、先に `docs/GLOSSARY.md` へ英語表記で定義し、その後に各文書で使用する。
 
 ## Markdown 数式表記ルール
 - インライン数式は `$...$` を使用する。
@@ -40,12 +46,14 @@
 - 「なぜそうなったか」ではなく「何を要求するか」を書く。
 - 判断が分岐する箇所は、条件と選択規則を明示する。
 - 未定義項目は保留せず、未定義であることと扱い（禁止・エラー）を明記する。
-- 略語は初出で定義し、用語は既存文書（`docs/GLOSSARY.md`）と整合させる。
+- 略語は初出で定義し、terms は既存文書（`docs/GLOSSARY.md`）と整合させる。
+- 日本語本文中でも、terms は日本語訳へ置換せず英語表記を維持する。
 
 ## 変更時チェック
 - 議論ログ調の表現が残っていない。
 - 各節が単独で読める完結文になっている。
-- 要件・制約・入出力・判定条件が具体化されている。
+- 要件・制約・input/output・判定条件が具体化されている。
+- terms・artifact 名・role 名・phase 名・classification 名が `docs/GLOSSARY.md` の英語表記と一致している。
 
 ## MCP 実行ルール
 - `compile` / `run` / `quality check` は、必ず MCP サーバー経由で実行する。
@@ -59,13 +67,13 @@
 - 運用詳細は `mcp_servers/README.md` を参照する。
 
 ## Project Local Skills 運用ルール
-- `skills/` 配下の `SKILL.md` を、ワークフロー工程ごとの実行手順の正本として扱う。
-- 工程と `SKILL` の対応は `docs/AGENT_SKILLS.md` を参照する。
-- `generate -> verify -> regenerate` ループを持つ工程では、対応する `generate` 用 `SKILL` と `verify` 用 `SKILL` を分離して適用する。
-- `Codex` / `Gemini` / `Claude Code` のいずれでも、作業開始前に対象工程の `SKILL.md` を読み、定義された入出力契約と判定基準に従う。
+- `skills/` 配下の `SKILL.md` を、ワークフロー phase ごとの実行手順の canonical source として扱う。
+- phase と `SKILL` の対応は `docs/AGENT_SKILLS.md` を参照する。
+- `generate -> verify -> regenerate` ループを持つ phase では、対応する `generate` 用 `SKILL` と `verify` 用 `SKILL` を分離して適用する。
+- `Codex` / `Gemini` / `Claude Code` のいずれでも、作業開始前に対象 phase の `SKILL.md` を読み、定義された input/output contract と判定基準に従う。
 
 ## Workflow 文書参照ルール
-- workflow 共通の不変規範、工程順序、工程入出力契約は `docs/WORKFLOW.md` を正本とする。
-- `orchestration agent` と `step agent` / `substep agent` の階層実行契約は `docs/ORCHESTRATION.md` を正本とする。
-- 工程と `SKILL` の対応、規則の記載先判定、工程切替規則は `docs/AGENT_SKILLS.md` を正本とする。
-- workflow 固有の禁止事項、過去成果物参照禁止、独立 `agent` 実行証跡要件は、`AGENTS.md` へ再掲せず対応正本を参照する。
+- workflow 共通の不変規範、phase sequence、phase input/output contract は `docs/WORKFLOW.md` を canonical source とする。
+- `orchestration agent` と `step agent` / `substep agent` の階層実行契約は `docs/ORCHESTRATION.md` を canonical source とする。
+- phase と `SKILL` の対応、規則の記載先判定、phase 切替規則は `docs/AGENT_SKILLS.md` を canonical source とする。
+- workflow 固有の禁止事項、過去 artifact 参照禁止、独立 `agent` 実行証跡要件は、`AGENTS.md` へ再掲せず対応 canonical source を参照する。

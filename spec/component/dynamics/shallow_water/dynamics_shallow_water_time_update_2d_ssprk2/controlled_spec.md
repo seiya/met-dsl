@@ -11,7 +11,7 @@
 ## 1. 責務と適用範囲
 本 `component` は shallow water 問題の時間積分を `SSPRK2` で実行する責務を持つ。
 
-## 2. 入出力契約
+## 2. input/output contract
 入力は `U^n`、界面フラックス差分、底面地形源項 `S_b`、`dt`、`dx`、`dy` とする。出力は `U^{n+1}` とする。
 
 ## 3. 演算定義

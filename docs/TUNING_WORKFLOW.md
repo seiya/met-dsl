@@ -32,7 +32,7 @@ tuner は generator から分離し、次のループを標準運用とする。
 - 候補生成（LLM 支援/BO/ ルール）
 - （必要なら）generator でコード差分生成
 - `LLM` を利用する候補生成・コード生成は `SPEC.md` の「LLM の扱い」を適用する
-- 標準運用は `debug_mode=false` とし、失敗試行成果物を保存しない。調査時のみ `debug_mode=true` を許可する
+- 標準運用は `debug_mode=false` とし、失敗試行 artifact を保存しない。調査時のみ `debug_mode=true` を許可する
 - 推奨: **コードの構造はテンプレで固定し、impl ノブで分岐**。 LLM は新しい実装パターン追加時のみ使う。
 - ビルド（ターゲット別）
 - quick physics gate（L0-L2 のサブセット）
@@ -70,7 +70,7 @@ tuner は generator から分離し、次のループを標準運用とする。
 
 ## 5. キャッシュと再利用
 - `case_hash` と `impl_hash` で結果をキャッシュし、同一試行を再実行しない
-- ビルド成果物も hash で再利用する（可能なら）
+- ビルド artifact も hash で再利用する（可能なら）
 
 ## 6. いつ“決め打ち”するか
 - チューニングで得た best impl を `impl.resolved.yaml` として固定する。
