@@ -39,6 +39,7 @@ Plan ステージの生成責務を固定し、入力 spec から決定的な re
 - `derived_contract.json` は `test_evidence_requirements` を必須保持し、`tests.md` の各 `test_id` ごとに `required_raw_variables` を記録する。
 - `problem` かつ `spec_id` が `2d` または `3d` を含む `node` では、`algorithm.resolved.yaml` に状態更新対象と更新順序を必須保持しなければならない。
 - `algorithm.resolved.yaml` の多次元 `problem` 向け契約は `state_variables[].name` と `state_variables[].shape_expr` と `required_update_paths` と `diagnostics_from_state=true` と `fallback_policy=fail_closed` を必須保持する。
+- 上位 `node` の `Plan` は、直下依存 `node` の `plan_ref` と `plan_meta.json.verification_status` を確認し、`direct dependency plan readiness` を満たさない場合は開始してはならない。
 - 上記の生成契約を導出できない場合は `Plan fail` とし、不完全な契約で `Generate` へ進めてはならない。
 - 未登録依存、未実装依存、互換性違反依存は解決エラーにし、該当 `node` を `blocked` にする。
 

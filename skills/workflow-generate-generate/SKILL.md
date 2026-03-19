@@ -23,8 +23,10 @@ Generate ステージの生成責務を固定し、`Build` 可能な実装 artif
 - `problem` かつ `spec_id` が `2d` または `3d` を含む `node` は、`case_id` 分岐とスカラー定数代入のみで複数の `diagnostics` 指標を生成してはならない。
 - `algorithm.resolved.yaml` の状態更新契約が欠落、または `state_variables` と `required_update_paths` が欠落する場合は `Generate fail` とし、推測補完で生成を継続してはならない。
 - `algorithm.resolved.yaml` の `steps[]` と `ordering` と `control_condition` と `iteration_contract` を満たす実装構成を生成しなければならない。
+- 直下依存 `node` の `plan_ref` と `pipeline_ref` と `aggregate_verdict` を確認し、`direct dependency execution readiness` を満たさない場合は生成を開始してはならない。
 - 依存を持つ `node` は、`dependency.resolved.yaml` の `direct_deps` で解決された依存 `node` の公開 `operation` を呼び出す実装を必須とする。
 - 依存 `operation` と同等機能を依存元 `node` の `model` / `runner` に再実装してはならない。
+- 依存 `node` の `model` / `runner` / `module` / `subroutine` / `Makefile` 断片を依存元 `src/` へ複製、再配置、再定義してはならない。
 - `toolchain.language=fortran` で依存 `component` を持つ `node` の `model` は、依存 `spec_id` ごとに `use <spec_id>_model` と `call <spec_id>__*` を必須とし、`subroutine <spec_id>__*` の再定義を禁止する。
 - 依存先が `profile` で公開 `operation` を持たない構成では、依存元 `problem` が `profile` の選択結果と拘束条件を参照する実装にしなければならない。
 - `runner` は `diagnostics.json` と `perf.json` と `raw/` 一次証跡のみを出力対象とし、`verdict.json` と `aggregate_verdict.json` と `summary.json` と `trial_meta.json` を書き込んではならない。

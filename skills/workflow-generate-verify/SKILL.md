@@ -22,8 +22,10 @@ Generate ステージ出力の検証責務を固定し、`Build` 失敗を事前
 - `problem` かつ `spec_id` が `2d` または `3d` を含む `node` は、`algorithm.resolved.yaml` の状態更新契約を必須検査し、欠落または `fallback_policy!=fail_closed` を検出した場合は `fail` とする。
 - `problem` かつ `spec_id` が `2d` または `3d` を含む `node` は、複数 `intent(out)` 指標を出力する `subroutine` が `state_variables` 配列参照を持たない場合を `metric-only scalar kernel` として `fail` とする。
 - 生成コードが対象 `node_key` の input/output contract に一致することを検査する。
+- 直下依存 `node` の `plan_ref` と `pipeline_ref` と `aggregate_verdict` を確認できない場合を `dependency workflow missing` として `fail` とする。
 - 依存を持つ `node` は、`dependency.resolved.yaml` の `direct_deps` で解決された依存 `node` の公開 `operation` 呼び出しを実装していることを検査する。欠落時は `fail` とする。
 - 依存 `operation` と同等機能の再実装を検出した場合は `fail` とする。
+- 依存 `node` の `model` / `runner` / `module` / `subroutine` / `Makefile` 断片が依存元 `src/` に複製、再配置、再定義されている場合を `dependency implementation encapsulation` 違反として `fail` とする。
 - `toolchain.language=fortran` で依存 `component` を持つ `node` は、依存 `spec_id` ごとに `model` 内の `use <spec_id>_model` と `call <spec_id>__*` を必須検査し、`subroutine <spec_id>__*` の再定義を検出した場合は `fail` とする。
 - 依存先が `profile` で公開 `operation` を持たない構成では、依存元 `problem` の実装が `profile` の選択結果と拘束条件を参照していることを検査する。欠落時は `fail` とする。
 - `runner` が `verdict.json` と `aggregate_verdict.json` と `summary.json` と `trial_meta.json` を書き込む実装を検出した場合は `fail` とする。

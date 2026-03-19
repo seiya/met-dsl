@@ -15,6 +15,8 @@
 - **case.resolved.yaml**: テストランナーが生成する「決定済み」入力。`sweep` 展開と実行時入力の決定値を保持する。`runner`（例: `simulate`）がこれを読む。演算構成、output contract、検証契約を保持してはならない。
 - **impl.resolved.yaml**: 実装計画（`Implementation Plan`）。計算過程（並列化、メモリ配置、融合、ブロッキング等）に関する可変パラメタを決定したもの。性能チューニングの探索対象になり得る。
 - **dependency.resolved.yaml**: 依存解決結果の canonical source。`node_key`、`direct_deps`、`transitive_deps`、`topo_level` を保持する。
+- **direct dependency plan readiness**: 対象 `node` の直下依存 `node` について、対応する `plan_id` が発行済みであり、`plan_meta.json.verification_status=pass` を満たす状態。この条件を満たさない上位 `node` は `Plan` を開始してはならない。
+- **direct dependency execution readiness**: 対象 `node` の直下依存 `node` について、対応する `plan_id` と `pipeline_id` が発行済みであり、最新 `aggregate_verdict` が `pass` または `xfail` である状態。この条件を満たさない上位 `node` は `Generate` 以降を開始してはならない。
 - **algorithm.resolved.yaml**: `Plan` が導出する生成契約。`problem` の統合順序、`component operation` の呼び出し順序、条件分岐、反復、列処理、派生量定義、更新対象、`invariants` を保持し、`Generate` の canonical source 入力として使用する。
 - **derived_contract.json**: `Plan verify` が導出する検証契約。`io_contract.inputs` / `io_contract.outputs` と `semantic_dependency.required_sources` と `raw_requirements.required_evidence` と `test_evidence_requirements` を保持し、`Generate verify` と `Execute` / `Judge` の判定 canonical source として使用する。生成契約を保持してはならない。
 - **expected_node_set**: `deps.yaml` と `spec_catalog.yaml` から再構成した期待 `node` 集合。`dependency.resolved.yaml` の網羅検証に使用する。
@@ -56,6 +58,7 @@
 - **summary.json**: `run` 全体の集計。`self_summary` と `dependency_summary` を必須保持する。
 - **dependency_summary**: 依存集約件数。`total`、`pass`、`xfail`、`fail`、`blocked` を保持する。
 - **dependency workflow coverage check**: `dependency.resolved.yaml` の `node_key` 集合と `workspace/plans` / `workspace/pipelines` の `node` 集合が 1 対 1 で一致することを確認する検証。
+- **dependency implementation encapsulation**: 依存 `node` の実装本体を依存元 `node` の `generate/<generation_id>/src/` 配下へ複製・再配置・再定義しない境界規則。依存元 `node` は依存 `node` の公開 `operation` 呼び出し、共有 `library`、または `profile` 参照のみを保持できる。
 - **blocked_reason**: `node` が `blocked` で終了した直接理由。依存 `node` の `fail` / `blocked` を識別可能に記録する。
 - **blocking_direct_deps**: `blocked` を引き起こした直下依存 `node_key` の配列。
 - **stdout.log / stderr.log**: 実行ログ（必ず保存し、後追いデバッグ可能にする）。

@@ -290,17 +290,20 @@ workspace/
 
 #### 1-6) 階層実行順序
 - 実行順序は `dependency.resolved.yaml` の `topo_level` 昇順に固定する。
-- 親 `node` は直下依存 `node` がすべて `pass` または `xfail` になるまで開始してはならない。
+- 親 `node` の `Plan` は、直下依存 `node` の `direct dependency plan readiness` を確認できない場合に `fail-fast stop` しなければならない。`plan` 未発行、`plan_meta.json.verification_status!=pass`、依存 `node` の `node_key` 未解決のいずれかを推測補完で通過させてはならない。
+- 親 `node` の `Generate` / `Build` / `Execute` / `Judge` は、直下依存 `node` の `direct dependency execution readiness` を確認できない場合に `fail-fast stop` しなければならない。`plan` 未発行、`pipeline` 未発行、`aggregate_verdict` 未確定、`aggregate_verdict=fail/blocked` のいずれかを推測補完で通過させてはならない。
 - `component` / `profile` / `problem` の実行順序は `spec_kind` 固定で判定せず、`dependency DAG` の `topo_level` で判定する。
 - 同一 `topo_level` 内の独立 `node` も逐次実行しなければならない。
 - 同一 `topo_level` 内で一部 `node` が `fail` した場合も、未処理 `node` の起動可否を 1 件ずつ再判定しなければならない。
 
 #### 1-7) `node` 単位 workflow 実行規則
 - `dependency.resolved.yaml` の各 `node_key` に対して個別 workflow を完了させる。
-- 直下依存が充足する `node` は `Plan -> Generate -> Build -> Execute -> Judge` を実行する。
+- `direct dependency plan readiness` が充足する `node` は `Plan` を実行する。
+- `direct dependency execution readiness` が充足する `node` は `Generate -> Build -> Execute -> Judge` を実行する。
 - 直下依存が不充足の `node` は `blocked` 終端 artifact を生成して完了とする。
 - 各 `node_key` は個別の `plan_id` と個別の `pipeline_id` を必須発行する。
 - `spec_kind` を問わない workflow 実行では、依存 `DAG` を展開した全 `node` の workflow 完了を必須とする。
+- 起点 `problem` の workflow 完了だけで依存 `node` の未実行を正当化してはならない。`dependency workflow coverage check` 不成立の試行は workflow 未完了として扱う。
 - 直下依存 `node` の `aggregate_verdict` に `fail` または `blocked` がある場合、上位 `node` は `self_verdict` を評価せず `aggregate_verdict=blocked` で終了する。
 - `blocked` 停止時も `aggregate_verdict.json`、`summary.json`、`trial_meta.json` を必須出力とする。`verdict.json` は `self_verdict=not_evaluated` を記録する。
 
@@ -318,6 +321,8 @@ workspace/
 - 依存を持つ `node` の `model` は、`dependency.resolved.yaml` の `direct_deps` で解決された依存 `node` の公開 `operation` 呼び出しを必須とする。
 - 依存 `operation` と同等機能を依存元 `node` の `model` / `runner` に再実装してはならない。検出時は `Generate fail` とする。
 - 依存先が `profile` で公開 `operation` を持たない場合、依存元 `problem` は `profile` の選択結果と拘束条件を参照する実装痕跡を必須記録とする。
+- `Generate` は依存 `node` の `generate/<generation_id>/src/` 相当の実装本体を依存元 `node` の `src/` へ複製、再配置、再定義してはならない。依存先 code の内包、`component` 群のまとめ書き、依存 `module` の貼り込みを検出した場合は `Generate fail` とする。
+- `Generate` は直下依存 `node` の `plan_ref` と `pipeline_ref` と `aggregate_verdict` を入力整合として確認しなければならない。依存 `node` の workflow 未完了を検出した場合、依存先 code を代替生成せず `blocked` または `fail` で停止しなければならない。
 - `Generate verify` は `algorithm.resolved.yaml` と `derived_contract.json` を入力として、演算構成と依存 `operation` と出力指標のデータ依存を検証しなければならない。制御構造の形式を固定要件にしてはならず、判定は `algorithm.resolved.yaml` の `steps` と `ordering` と `control_condition` と `iteration_contract` に基づいて実施しなければならない。
 - `Generate verify` は `model` 出力と無関係な定数出力、固定 `JSON` 出力、解析式直接代入による `diagnostics` 生成を検出した場合に `fail` とする。
 - `model` / `runner` は、判定指標（例: `mass_drift_rel`、`momx_drift_rel`、`momy_drift_rel`、`analytic_h_l2_rel`）へ物理的根拠のない任意の定数スケーリング、定数オフセット、ケース依存補正を導入してはならない。`Controlled Spec` または `tests.md` で明示定義された評価式以外の補正を禁止する。
@@ -344,6 +349,7 @@ workspace/
 - `Build` の試行メタデータは `command_id` と `command_log_ref`（または `command_log_path`）を追跡可能に記録する。
 - `Build` は依存を持つ `node` で、依存 `operation` 解決先が `dependency.resolved.yaml` と一致することを必須検証とする。不一致時は `Build fail` とする。
 - `Build` は `node` 単位で個別実行し、他 `node` の artifact を混在させてはならない。
+- `Build` は、依存元 `src/` に依存 `node` 固有の `module`、`subroutine`、または `runner` 実装が混入している場合を `dependency implementation encapsulation` 違反として `fail` にしなければならない。
 
 ### 4. Execute
 - execution input: `build/<build_id>/bin/`、`case.resolved.yaml`
@@ -421,6 +427,7 @@ workspace/
 - workflow 完了条件は、対象 workflow の `orchestration_id` 配下に `orchestration_meta.json` と `agent_graph.json` と `agent_runs.jsonl` が存在することとする。
 - workflow 完了条件は、`dependency.resolved.yaml` の全 `node_key` に対して `workspace/plans/<node_key_safe>/<plan_id>/` と `workspace/pipelines/<node_key_safe>/<pipeline_id>/` が存在し、`lineage.json` の `node_key` と `dependency_ref` が一致することとする。
 - workflow 完了宣言は、`dependency workflow` 網羅チェックと `trial_meta` 完整性チェックと `copy_based_artifact_reuse` 非検出を同時に満たす場合のみ許可する。
+- workflow 完了宣言は、上位 `node` の `src/` に依存 `node` 実装の内包が存在しないことを同時に満たす場合のみ許可する。
 - workflow 完了宣言は、全 phase で `write_scope_violation` 非検出を同時に満たす場合のみ許可する。
 - `CI` は `python3 tools/validate_workspace_root.py` と `python3 tools/validate_pipeline_semantics.py` の execution result を `pass` 条件として扱う。
 
