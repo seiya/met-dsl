@@ -4,6 +4,7 @@ terms は `GLOSSARY.md` を参照する。
 
 ## 目的
 - workflow を `Spec -> Plan -> Generate -> Build -> Execute -> Judge -> Tune -> Promote` の順で定義する。
+- `node` 間の実行順序を `spec` の依存宣言から決定し、各 `node` 内では `Plan -> Generate -> Build -> Execute -> Judge` の順で実行する。
 - 各 phase の `execution input` と `verification input` と `output` を一意に定義する。
 - workflow 横断の不変条件、artifact layout rules、完了判定基準を定義する。
 
@@ -268,6 +269,12 @@ workspace/
 - `algorithm.summary.md` は `algorithm.resolved.yaml` から自動生成する閲覧専用 artifact とし、`plan_id` 算出や下流 phase inputに含めてはならない。
 - `Plan verify` は `controlled_spec.md` と `tests.md` と `deps.yaml` から導出した検証契約を `derived_contract.json` として保存する。
 - `Plan verify` は `algorithm.resolved.yaml` の演算構成と `derived_contract.json` の検証契約を混在させてはならない。
+- `Plan verify` は `dependency.resolved.yaml` の整合性検証を `verify substep` の必須責務として実行しなければならない。
+- `Plan verify` は `deps.yaml` と `spec_catalog.yaml` から再構成した `expected_node_set` と `dependency.resolved.yaml` の `node_key` 集合一致を検証しなければならない。
+- `Plan verify` は `dependency.resolved.yaml` の各依存辺について、対象 `node` の `controlled_spec.md` と依存先 `node` の `controlled_spec.md` と `deps.yaml` と照合し、依存方向、依存種別、公開 `operation` 参照、`profile` 選択拘束が矛盾しないことを検証しなければならない。
+- `Plan verify` は依存先 `node` に既存 `plan` が存在する場合、依存先 `node` の `case.resolved.yaml` と `algorithm.resolved.yaml` と `impl.resolved.yaml` と `dependency.resolved.yaml` と `plan_meta.json` を照合し、`dependency.resolved.yaml` が依存先 `plan` 文書と矛盾しないことを検証しなければならない。
+- `Plan verify` は `dependency.resolved.yaml` が `deps.yaml` の転記に留まらず、`spec` 文書および依存先 `node` の `plan` 文書と整合する解決結果であることを検証しなければならない。
+- 前項の照合で矛盾、欠落、未解決参照、依存先 `node` の公開契約不一致を検出した場合、`Plan fail` としなければならない。
 
 #### 1-3) 検証契約 Plan（`derived_contract.json`）
 - `derived_contract.json` は `io_contract.inputs` と `io_contract.outputs` を必須保持し、`io_contract.outputs` は `name` と `evidence_ref` と `shape_expr` で判定対象出力の一次証跡参照を定義しなければならない。
@@ -286,26 +293,15 @@ workspace/
 - `dependency.resolved.yaml` は `node_key`、`direct_deps`、`transitive_deps`、`topo_level` を必須記録とする。
 - `dependency.resolved.yaml` は起点 `node` と推移依存 `node` の閉包を過不足なく 1 回ずつ保持し、`node_key` の重複と欠落を禁止する。
 - `deps.yaml` と `spec_catalog.yaml` から再構成した `expected_node_set` と `dependency.resolved.yaml` の `node_key` 集合一致を `Plan pass` 条件とする。
+- `dependency.resolved.yaml` の各依存辺は、対象 `node` の `controlled_spec.md` と依存先 `node` の `controlled_spec.md` と `deps.yaml` に記載された依存要求および公開契約と両立しなければならない。
+- 依存先 `node` に既存 `plan` が存在する場合、`dependency.resolved.yaml` の依存解決結果は依存先 `node` の `case.resolved.yaml` と `algorithm.resolved.yaml` と `impl.resolved.yaml` と `dependency.resolved.yaml` と `plan_meta.json` に記録された契約と矛盾してはならない。
+- `workflow` の `node` 実行順序は `spec` の canonical source である `deps.yaml` と `spec_catalog.yaml` から再構成した依存関係に基づいて決定しなければならない。
+- `dependency.resolved.yaml` は依存解決結果の記録と整合性検証に使用する artifact とし、`workflow` の実行順序決定の canonical source にしてはならない。
+- 依存を持つ `node` は、`deps.yaml` と `spec_catalog.yaml` から再構成した直下依存 `node` の `direct dependency plan readiness` を満たす場合にのみ `Plan` を開始してよい。
+- 依存を持つ `node` は、`deps.yaml` と `spec_catalog.yaml` から再構成した直下依存 `node` の `direct dependency execution readiness` を満たす場合にのみ `Generate -> Build -> Execute -> Judge` を開始してよい。
+- `component` / `profile` / `problem` の実行順序は `spec_kind` 固定で判定してはならず、`spec` 依存関係に基づいて判定しなければならない。
+- `dependency` 不充足の `node` は `blocked` とし、推測補完で起動してはならない。
 - 未登録依存、未実装依存、互換性違反依存を `dependency` 解決エラーとする。
-
-#### 1-6) 階層実行順序
-- 実行順序は `dependency.resolved.yaml` の `topo_level` 昇順に固定する。
-- 親 `node` の `Plan` は、直下依存 `node` の `direct dependency plan readiness` を確認できない場合に `fail-fast stop` しなければならない。`plan` 未発行、`plan_meta.json.verification_status!=pass`、依存 `node` の `node_key` 未解決のいずれかを推測補完で通過させてはならない。
-- 親 `node` の `Generate` / `Build` / `Execute` / `Judge` は、直下依存 `node` の `direct dependency execution readiness` を確認できない場合に `fail-fast stop` しなければならない。`plan` 未発行、`pipeline` 未発行、`aggregate_verdict` 未確定、`aggregate_verdict=fail/blocked` のいずれかを推測補完で通過させてはならない。
-- `component` / `profile` / `problem` の実行順序は `spec_kind` 固定で判定せず、`dependency DAG` の `topo_level` で判定する。
-- 同一 `topo_level` 内の独立 `node` も逐次実行しなければならない。
-- 同一 `topo_level` 内で一部 `node` が `fail` した場合も、未処理 `node` の起動可否を 1 件ずつ再判定しなければならない。
-
-#### 1-7) `node` 単位 workflow 実行規則
-- `dependency.resolved.yaml` の各 `node_key` に対して個別 workflow を完了させる。
-- `direct dependency plan readiness` が充足する `node` は `Plan` を実行する。
-- `direct dependency execution readiness` が充足する `node` は `Generate -> Build -> Execute -> Judge` を実行する。
-- 直下依存が不充足の `node` は `blocked` 終端 artifact を生成して完了とする。
-- 各 `node_key` は個別の `plan_id` と個別の `pipeline_id` を必須発行する。
-- `spec_kind` を問わない workflow 実行では、依存 `DAG` を展開した全 `node` の workflow 完了を必須とする。
-- 起点 `problem` の workflow 完了だけで依存 `node` の未実行を正当化してはならない。`dependency workflow coverage check` 不成立の試行は workflow 未完了として扱う。
-- 直下依存 `node` の `aggregate_verdict` に `fail` または `blocked` がある場合、上位 `node` は `self_verdict` を評価せず `aggregate_verdict=blocked` で終了する。
-- `blocked` 停止時も `aggregate_verdict.json`、`summary.json`、`trial_meta.json` を必須出力とする。`verdict.json` は `self_verdict=not_evaluated` を記録する。
 
 ### 2. 生成（Generate）
 - execution input: `case.resolved.yaml`、`algorithm.resolved.yaml`、`impl.resolved.yaml`、`dependency.resolved.yaml`
