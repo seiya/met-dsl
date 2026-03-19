@@ -50,6 +50,8 @@
 - `agent_runs.jsonl` と `agent_graph.json` は、実行中イベントを逐次追記して生成しなければならない。workflow 完了後に固定値テンプレートを一括出力する運用を禁止する。
 - `agent_runs.jsonl` と `agent_graph.json` と `step_result.json` を後生成または手動整形して独立実行を偽装してはならない。起動時に記録した一次証跡との突合で整合しない試行は `fail` とする。
 - `orchestration agent` は、子 `agent` 起動時に `docs/WORKFLOW.md` を canonical source として対象 `step` または `substep` の `execution input` と `verification input` と `expected output` を明示しなければならない。`step agent` を使用する phase では `step agent` も自身の契約入力と expected output を明示しなければならない。
+- `orchestration agent` は、子 `agent` 起動要求本文を `skills/workflow-orchestration/references/launch_prompts.md` の対応テンプレートから生成しなければならない。`step agent` には `step agent` 起動要求テンプレート、`substep agent` には `substep agent` 起動要求テンプレートを適用し、テンプレートを使わない任意の自由形式 prompt を禁止する。
+- 起動要求本文のテンプレート必須項目は、省略、改名、意味変更をしてはならない。追加記述は、テンプレート必須項目と矛盾せず、対象 `step` または `substep` の契約具体化に必要な情報に限定しなければならない。
 - `skills/*/agents/openai.yaml` の表示名または説明文だけで独立 `agent` 起動契約を満たしたとみなしてはならない。起動要求本文に `spawn_agent` の使用義務、input contract、expected output、保存先、失敗時停止条件を明示しなければならない。
 
 ## 設計方針
@@ -61,6 +63,7 @@
 ## オーケストレーション指示契約
 ### 共通必須項目
 - `orchestration agent` は、子 `agent` への起動要求に `orchestration_id` と `agent_run_id` と `parent_agent_run_id` と `node_key` と `step` と `substep`（存在する場合）と `plan_ref` と `pipeline_ref` と `dependency_ref` を必須記録しなければならない。
+- 子 `agent` への起動要求本文は `skills/workflow-orchestration/references/launch_prompts.md` の対応テンプレートを基底とし、テンプレート内プレースホルダーを対象 `agent_run` の実値で置換して生成しなければならない。
 - 子 `agent` への起動要求には、`execution input` と `verification input` と `expected output` と `write_root` と `read_roots` を必須記録しなければならない。
 - `execution input` は当該 `agent` が artifact を生成するために直接参照してよい入力に限定しなければならない。
 - `verification input` は当該 `agent` が pass/fail 判定、整合確認、依存確認にのみ使用してよい入力として明示しなければならない。
@@ -76,30 +79,31 @@
 1. `workflow` 開始時に `orchestration_id` を発行し、`workspace/orchestrations/<orchestration_id>/orchestration_meta.json` を作成する。
 2. `workflow` 開始前にpreflight結果を `workspace/orchestrations/<orchestration_id>/preflight.json` へ記録し、`can_launch_step_agents=true` と `can_launch_substep_agents=true` を満たさない場合は `fail` として停止する。
 3. `orchestration agent` は `step agent` または `substep agent` の起動要求ごとに `launches/<agent_run_id>.request.json` と `launches/<agent_run_id>.response.json` と `launches/<agent_run_id>.prompt.txt` と `launches/<agent_run_id>.reply.txt` を保存し、`agent_runs.jsonl` の `launch_request_ref` と `launch_response_ref` と `launch_prompt_ref` と `launch_reply_ref` へ参照を記録する。
-4. `orchestration agent` は `dependency.resolved.yaml` を読み、`node_key` と `topo_level` に基づく実行キューを確定する。
-5. `orchestration agent` は起動対象ごとに `step agent` または `substep agent` を発行し、`node_key`、`step`、`plan_ref`、`pipeline_ref`、`dependency_ref` を入力として渡す。
-6. `orchestration agent` は上位 `node` の `Plan` を起動する前に、直下依存 `node` ごとの `plan_ref` と `plan_meta.json.verification_status` を照合し、`direct dependency plan readiness` を満たさない場合は起動してはならない。
-7. `orchestration agent` は上位 `node` の `Generate` 以降を起動する前に、直下依存 `node` ごとの `plan_ref` と `pipeline_ref` と最新 `aggregate_verdict` を照合し、`direct dependency execution readiness` を満たさない場合は起動してはならない。
-8. `direct dependency plan readiness` または `direct dependency execution readiness` を満たさない場合、`orchestration agent` は当該 `node` を `blocked` または `fail` として記録し、依存 `node` の未完了を親 `node` の `Plan` または `Generate` で代替してはならない。
-9. `orchestration agent` は `step` を持つ phase では対象 `step` の `execution input` と `verification input` と `expected output` を明示し、`substep` を持つ phase では対象 `substep` の `execution input` と `verification input` と `expected output` を明示しなければならない。
-10. `substep` を持つ phase では、`orchestration agent` が `generate` と `verify` などの `substep agent` を逐次起動する。
-11. `substep agent` は自身の artifact と対応 phase のメタデータを生成し、`agent_output_ref` を `orchestration agent` へ返却する。
-12. `orchestration agent` は子 `agent` の返却結果を評価し、`issue_severity` と再投入要否を確定する。再投入が必要な場合は `repair_strategy` と `repair_target_agent_run_id` と `repair_reason` を確定する。
-13. 再投入が必要で `repair_strategy=reuse` の場合、`orchestration agent` は同一 `agent_session_id` の継続修正を許可してよい。この場合も新規 `agent_run_id` を発行し、`relation_type` を `reuse` として `record-launch` 記録を追加しなければならない。
-14. 再投入が必要で `repair_strategy=restart` の場合、`orchestration agent` は新規 `agent_session_id` を持つ `substep agent` を再起動し、`relation_type` を `restart` として `record-launch` 記録を追加しなければならない。
-15. `orchestration agent` は `substep` を持つ phase で全 `substep` の必須 artifact を検証し、`workspace/orchestrations/<orchestration_id>/steps/<node_key_safe>/<step>/<agent_run_id>/step_result.json` へ `step_result.json` を出力する。この場合の `agent_run_id` は `orchestration agent_run_id` とする。
-16. `step_result.json` は、再投入を実施した場合に `retry_decisions` 配列を保持し、各要素へ `issue_severity` と `repair_strategy` と `repair_target_agent_run_id` と `new_agent_run_id` と `repair_reason` を記録しなければならない。
-17. `step agent` は標準 `substep` を持たない phase で自身の artifact を検証し、`workspace/orchestrations/<orchestration_id>/steps/<node_key_safe>/<step>/<agent_run_id>/step_result.json` へ `step_result.json` を出力する。
-18. `orchestration agent` は `step_result.json` を受け取り、次 `step` の起動可否を判定する。
-19. `node` 実行は `dependency.resolved.yaml` の `topo_level` 昇順で逐次実行する。依存関係を持つ `node` は依存 `node` の完了前に起動してはならない。同一 `topo_level` の独立 `node` も並列実行してはならない。
-20. `step agent` または `substep agent` が `fail` / `timeout` / `cancel` の場合、当該 `node` の当該 `step` を `fail` とし、下流 `step` 起動を禁止する。
-21. `orchestration agent` は各 `agent` 実行イベントを `workspace/orchestrations/<orchestration_id>/agent_runs.jsonl` へ追記しなければならない。
-22. `orchestration agent` は親子関係を `workspace/orchestrations/<orchestration_id>/agent_graph.json` へ保存し、`parent_agent_run_id` と `child_agent_run_id` と `relation_type` を必須記録とする。
-23. `Promote` 以外の `agent` は `workspace/` 配下以外へ書き込んではならない。
-24. `workflow` 実行時に `step` / `substep` の実処理を `script` で代行した場合は `fail` とし、当該試行を破棄しなければならない。
-25. 再投入時は新規 `agent_run_id` を発行し、既存 `launch` 証跡や `agent_runs` 行を上書きしてはならない。`agent_session_id` の扱いは `repair_strategy` 規則に従う。
-26. `preflight.json` の手動編集または後編集で `status` と `can_launch_*` を変更してはならない。変更が必要な場合は `preflight` を再実行して新しい検査結果を記録しなければならない。
-27. 子 `agent` 起動直前の live probe が `fail` の場合、`record-launch` を実行してはならない。`orchestration_meta.status=fail` を記録して停止しなければならない。`record-agent-run`（`step` / `substep`）と `write-step-result` は `preflight.json` の整合確認を満たす場合のみ実行してよい。
+4. `launches/<agent_run_id>.prompt.txt` は `skills/workflow-orchestration/references/launch_prompts.md` の対応テンプレートを具体化した本文としなければならない。テンプレート必須項目の欠落、別テンプレート混用、自由形式への全面置換を禁止する。
+5. `orchestration agent` は `dependency.resolved.yaml` を読み、`node_key` と `topo_level` に基づく実行キューを確定する。
+6. `orchestration agent` は起動対象ごとに `step agent` または `substep agent` を発行し、`node_key`、`step`、`plan_ref`、`pipeline_ref`、`dependency_ref` を入力として渡す。
+7. `orchestration agent` は上位 `node` の `Plan` を起動する前に、直下依存 `node` ごとの `plan_ref` と `plan_meta.json.verification_status` を照合し、`direct dependency plan readiness` を満たさない場合は起動してはならない。
+8. `orchestration agent` は上位 `node` の `Generate` 以降を起動する前に、直下依存 `node` ごとの `plan_ref` と `pipeline_ref` と最新 `aggregate_verdict` を照合し、`direct dependency execution readiness` を満たさない場合は起動してはならない。
+9. `direct dependency plan readiness` または `direct dependency execution readiness` を満たさない場合、`orchestration agent` は当該 `node` を `blocked` または `fail` として記録し、依存 `node` の未完了を親 `node` の `Plan` または `Generate` で代替してはならない。
+10. `orchestration agent` は `step` を持つ phase では対象 `step` の `execution input` と `verification input` と `expected output` を明示し、`substep` を持つ phase では対象 `substep` の `execution input` と `verification input` と `expected output` を明示しなければならない。
+11. `substep` を持つ phase では、`orchestration agent` が `generate` と `verify` などの `substep agent` を逐次起動する。
+12. `substep agent` は自身の artifact と対応 phase のメタデータを生成し、`agent_output_ref` を `orchestration agent` へ返却する。
+13. `orchestration agent` は子 `agent` の返却結果を評価し、`issue_severity` と再投入要否を確定する。再投入が必要な場合は `repair_strategy` と `repair_target_agent_run_id` と `repair_reason` を確定する。
+14. 再投入が必要で `repair_strategy=reuse` の場合、`orchestration agent` は同一 `agent_session_id` の継続修正を許可してよい。この場合も新規 `agent_run_id` を発行し、`relation_type` を `reuse` として `record-launch` 記録を追加しなければならない。
+15. 再投入が必要で `repair_strategy=restart` の場合、`orchestration agent` は新規 `agent_session_id` を持つ `substep agent` を再起動し、`relation_type` を `restart` として `record-launch` 記録を追加しなければならない。
+16. `orchestration agent` は `substep` を持つ phase で全 `substep` の必須 artifact を検証し、`workspace/orchestrations/<orchestration_id>/steps/<node_key_safe>/<step>/<agent_run_id>/step_result.json` へ `step_result.json` を出力する。この場合の `agent_run_id` は `orchestration agent_run_id` とする。
+17. `step_result.json` は、再投入を実施した場合に `retry_decisions` 配列を保持し、各要素へ `issue_severity` と `repair_strategy` と `repair_target_agent_run_id` と `new_agent_run_id` と `repair_reason` を記録しなければならない。
+18. `step agent` は標準 `substep` を持たない phase で自身の artifact を検証し、`workspace/orchestrations/<orchestration_id>/steps/<node_key_safe>/<step>/<agent_run_id>/step_result.json` へ `step_result.json` を出力する。
+19. `orchestration agent` は `step_result.json` を受け取り、次 `step` の起動可否を判定する。
+20. `node` 実行は `dependency.resolved.yaml` の `topo_level` 昇順で逐次実行する。依存関係を持つ `node` は依存 `node` の完了前に起動してはならない。同一 `topo_level` の独立 `node` も並列実行してはならない。
+21. `step agent` または `substep agent` が `fail` / `timeout` / `cancel` の場合、当該 `node` の当該 `step` を `fail` とし、下流 `step` 起動を禁止する。
+22. `orchestration agent` は各 `agent` 実行イベントを `workspace/orchestrations/<orchestration_id>/agent_runs.jsonl` へ追記しなければならない。
+23. `orchestration agent` は親子関係を `workspace/orchestrations/<orchestration_id>/agent_graph.json` へ保存し、`parent_agent_run_id` と `child_agent_run_id` と `relation_type` を必須記録とする。
+24. `Promote` 以外の `agent` は `workspace/` 配下以外へ書き込んではならない。
+25. `workflow` 実行時に `step` / `substep` の実処理を `script` で代行した場合は `fail` とし、当該試行を破棄しなければならない。
+26. 再投入時は新規 `agent_run_id` を発行し、既存 `launch` 証跡や `agent_runs` 行を上書きしてはならない。`agent_session_id` の扱いは `repair_strategy` 規則に従う。
+27. `preflight.json` の手動編集または後編集で `status` と `can_launch_*` を変更してはならない。変更が必要な場合は `preflight` を再実行して新しい検査結果を記録しなければならない。
+28. 子 `agent` 起動直前の live probe が `fail` の場合、`record-launch` を実行してはならない。`orchestration_meta.status=fail` を記録して停止しなければならない。`record-agent-run`（`step` / `substep`）と `write-step-result` は `preflight.json` の整合確認を満たす場合のみ実行してよい。
 
 ## 判定基準
 - `workflow` ごとに `orchestration_id` が発行され、`orchestration_meta.json` が存在する。
@@ -107,6 +111,7 @@
 - `step` と `substep` の `context_id` が重複せず、全件で `context_isolated=true` が記録される。
 - `step` と `substep` の `agent_runs.jsonl` に `agent_session_id` と `launch_request_ref` と `launch_response_ref` と `launch_prompt_ref` と `launch_reply_ref` が記録され、参照先実体が存在する。
 - `launches/<agent_run_id>.request.json` の `launch_prompt_ref` と `launches/<agent_run_id>.response.json` の `launch_reply_ref` が `agent_runs.jsonl` の参照値と一致する。
+- `launches/<agent_run_id>.prompt.txt` が `skills/workflow-orchestration/references/launch_prompts.md` の対応テンプレートを基底としており、テンプレート必須項目の欠落または意味変更が存在しない。
 - 子 `agent` の全 `launches/<agent_run_id>.request.json` に `skill_name` と `skill_ref` と `skill_must_read_refs` が記録されている。
 - `preflight.json` が存在し、`can_launch_step_agents=true` と `can_launch_substep_agents=true` を満たす。
 - `preflight.json` の `pass` 条件と、子 `agent` 起動直前 live probe の `pass` 条件が同時に満たされる。
