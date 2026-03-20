@@ -261,7 +261,14 @@ workspace/
 - `case.resolved.yaml` は演算構成、依存 `operation` 呼び出し順序、条件分岐、反復条件を保持してはならない。
 - `Plan` は `controlled_spec.md` と `deps.yaml` と `profile` 解決結果から `algorithm contract` を導出し、`algorithm.resolved.yaml` として保存する。
 - `algorithm.resolved.yaml` は `Generate` の canonical source 入力であり、`Generate` は元の `controlled_spec.md` を直接読んではならない。
+- `algorithm.resolved.yaml` は `YAML` mapping artifact とし、`JSON` 文字列として検証してはならない。
 - `algorithm.resolved.yaml` は `algorithm_id` と `execution_mode` と `steps[]` と `ordering` と `control_condition` と `iteration_contract` と `update_semantics` と `temporaries` と `derived_field_rules` と `invariants` と `splitting_policy` を必須保持しなければならない。
+- `ordering` は `step_id` の列、または `before` / `after` を持つ dependency object の列として表現しなければならない。
+- `control_condition` は文字列、文字列配列、または object のいずれかで表現しなければならない。
+- `iteration_contract` は object とし、`execution_mode=iterative` の場合は空 object を禁止する。
+- `temporaries` は文字列配列、または `name` と任意の `shape_expr` を持つ object 配列として表現しなければならない。
+- `invariants` は非空文字列配列としなければならない。
+- `splitting_policy` は `kind` を持つ object としなければならない。
 - `execution_mode` は `sequence` / `conditional` / `iterative` / `columnwise` のみを許可する。
 - `steps[]` の各要素は `step_id` と `step_kind` と `operation_ref` と `inputs` と `outputs` を必須保持しなければならない。
 - `step_kind` は `boundary_apply` / `reconstruct` / `flux_compute` / `source_term` / `time_integrate` / `column_process` / `pointwise_process` / `iterative_solve` / `filter` / `reduction` / `diagnostic` のみを許可する。
@@ -286,9 +293,13 @@ workspace/
 - `verify substep` は `controlled_spec.md` と `tests.md` と `deps.yaml` から導出した検証契約を `derived_contract.json` として保存する。
 - `verify substep` は `algorithm.resolved.yaml` の演算構成と `derived_contract.json` の検証契約を混在させてはならない。
 - `derived_contract.json` は `io_contract.inputs` と `io_contract.outputs` を必須保持し、`io_contract.outputs` は `name` と `evidence_ref` と `shape_expr` で判定対象出力の一次証跡参照を定義しなければならない。
+- `io_contract.outputs[].evidence_ref` が `raw/state_snapshots` を参照する場合、`raw_variables` を非空配列で必須記録し、各要素は `raw_requirements.required_evidence[].schema.variables[].name` または `time_variable` を参照しなければならない。
+- `io_contract.outputs[].evidence_ref` が `raw/state_snapshots` を参照し、`raw_variables` が単一の `state variable` または `time_variable` を指す場合、`io_contract.outputs[].shape_expr` は参照先 schema の `shape_expr` と一致しなければならない。
 - `io_contract.outputs` で `evidence_ref` が `raw/state_snapshots` 以外を参照し、かつ `raw_requirements.required_evidence` で `artifact=state_snapshots` を必須宣言する場合、当該 `output` は `raw_variables`（非空配列）で再計算に必要な `raw/state_snapshots` 変数名を明示しなければならない。
 - `derived_contract.json` は `raw_requirements.required_evidence` を必須保持し、`artifact` と `required` と `min_samples` と `schema`（必要時）で `raw` 一次証跡の必須構成を定義しなければならない。
 - `derived_contract.json` は `test_evidence_requirements` を保持し、`tests.md` の各 `test_id` ごとに `required_raw_variables` を明示しなければならない。
+- `test_evidence_requirements[].required_raw_variables` は、`artifact=state_snapshots` を参照する場合に `schema.variables[].name` または `time_variable` のみを許可する。未定義語彙は `fail` とする。
+- `semantic_dependency.required_sources` は非空文字列の配列を canonical form とする。object 配列は互換入力としてのみ許可し、生成側は出力してはならない。
 - `derived_contract.json` は生成契約を保持してはならない。`numerical_kernel_contract`、統合順序、更新段数、反復条件は `algorithm.resolved.yaml` 側へ保持しなければならない。
 - `verify substep` は `dependency.resolved.yaml` の整合性検証を必須責務として実行しなければならない。
 - `deps.yaml` と `spec_catalog.yaml` から再構成した `expected_node_set` と `dependency.resolved.yaml` の `node_key` 集合一致を `Plan pass` 条件とする。
@@ -299,7 +310,7 @@ workspace/
 
 ### 2. Generate
 - execution input: `case.resolved.yaml`、`algorithm.resolved.yaml`、`impl.resolved.yaml`、`dependency.resolved.yaml`
-- verification input: `algorithm.resolved.yaml`、`derived_contract.json`、`dependency.resolved.yaml`、`impl.resolved.yaml`
+- verification input: `case.resolved.yaml`、`algorithm.resolved.yaml`、`derived_contract.json`、`dependency.resolved.yaml`、`impl.resolved.yaml`
 - 出力: `generate/<generation_id>/src/`、`generate_meta.json`
 
 #### 2-1. generate substep
@@ -330,7 +341,7 @@ workspace/
 - `Generate verify` は `case.resolved.yaml` を入力として、記載された `test case set` の全 `case_id` と全展開 `case` が `runner` または `model` の実装経路から到達可能であることを検証しなければならない。未実装 `case`、到達不能分岐、固定 `case_id` 限定実装を検出した場合は `fail` とする。
 - `Generate verify` は `case.resolved.yaml` の実行時入力を `runner` と `model` が受理していることを検証しなければならない。少なくとも `case_id`、格子条件、時間条件、初期条件識別子、境界条件識別子、`profile` または `component` 選択結果、`tests.md` 由来の `test_profile_id` と `test_profile_version` に対応する入力伝播または記録経路を確認できない場合は `fail` とする。
 - `Generate verify` は `case.resolved.yaml` で許可される選択値ごとの差分実装が、固定定数または単一既定値に潰されていないことを検証しなければならない。`boundary`、`initial_profile`、`topography_profile`、`dt_rule`、`refinement`、`sweep` 展開結果などの case-dependent な入力を無視した実装を検出した場合は `fail` とする。
-- `Generate verify` は `case.resolved.yaml` と `algorithm.resolved.yaml` と `derived_contract.json` を入力として、`test case set` 網羅、演算構成、依存 `operation`、出力指標のデータ依存を検証しなければならない。制御構造の形式を固定要件にしてはならず、判定は `case.resolved.yaml` の `test case set` と `algorithm.resolved.yaml` の `steps` と `ordering` と `control_condition` と `iteration_contract` に基づいて実施しなければならない。
+- `Generate verify` は `case.resolved.yaml` と `algorithm.resolved.yaml` と `derived_contract.json` と `dependency.resolved.yaml` と `impl.resolved.yaml` を入力として、`test case set` 網羅、演算構成、依存 `operation`、出力指標のデータ依存を検証しなければならない。制御構造の形式を固定要件にしてはならず、判定は `case.resolved.yaml` の `test case set` と `algorithm.resolved.yaml` の `steps` と `ordering` と `control_condition` と `iteration_contract` に基づいて実施しなければならない。
 - `Generate verify` は `algorithm.resolved.yaml` の `update_semantics` と `temporaries` と `derived_field_rules` と `invariants` と `splitting_policy` が生成コードへ反映されていることを検証しなければならない。状態更新対象の欠落、派生量計算の未実装、保存するべき invariant を破る更新順序、`splitting_policy` 不一致を検出した場合は `fail` とする。
 - `Generate verify` は `algorithm.resolved.yaml` に記載されていない追加演算、追加反復、追加条件分岐、追加依存 `operation` 呼び出しを生成コードが導入していないことを検証しなければならない。`controlled_spec.md` 由来情報の推測再導入や、`resolved artifact` に存在しない実行経路を検出した場合は `fail` とする。
 - `Generate verify` は `model` 出力と無関係な定数出力、固定 `JSON` 出力、解析式直接代入による `diagnostics` 生成を検出した場合に `fail` とする。

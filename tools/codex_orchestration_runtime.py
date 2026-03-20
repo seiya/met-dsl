@@ -233,6 +233,18 @@ def _extract_launch_reply_text(response_payload: dict[str, Any]) -> str:
     return json.dumps(response_payload, ensure_ascii=False, indent=2)
 
 
+def _split_skill_refs(value: Any) -> list[str]:
+    if isinstance(value, str):
+        return [item.strip() for item in value.split(",") if item.strip()]
+    if isinstance(value, list):
+        refs: list[str] = []
+        for item in value:
+            if isinstance(item, str) and item.strip():
+                refs.append(item.strip())
+        return refs
+    return []
+
+
 def _node_key_to_safe(node_key: str) -> str:
     token = node_key.strip()
     if "/" not in token or "@" not in token:
@@ -245,6 +257,150 @@ def _node_key_to_safe(node_key: str) -> str:
     if not spec_kind or not spec_id or not spec_version:
         raise ValueError(f"invalid node_key: {node_key}")
     return f"{spec_kind}__{spec_id}__{spec_version}"
+
+
+def _validate_launch_request_payload(request_payload: dict[str, Any]) -> None:
+    step = request_payload.get("step")
+    substep = request_payload.get("substep")
+    is_verify_substep = (
+        isinstance(step, str)
+        and step.strip().lower() in {"plan", "generate"}
+        and isinstance(substep, str)
+        and substep.strip().lower() == "verify"
+    )
+    if not is_verify_substep:
+        return
+
+    skill_name = request_payload.get("skill_name")
+    skill_ref = request_payload.get("skill_ref")
+    skill_must_read_refs = _split_skill_refs(request_payload.get("skill_must_read_refs"))
+
+    if not isinstance(skill_name, str) or not skill_name.strip():
+        raise ValueError("verify launch request must include non-empty skill_name")
+    if not isinstance(skill_ref, str) or not skill_ref.strip():
+        raise ValueError("verify launch request must include non-empty skill_ref")
+    if not skill_must_read_refs:
+        raise ValueError("verify launch request must include non-empty skill_must_read_refs")
+
+    plan_ref = request_payload.get("plan_ref")
+    required_refs: list[str] = []
+    if isinstance(plan_ref, str) and plan_ref.strip():
+        plan_root = plan_ref.strip().rstrip("/")
+        if isinstance(step, str) and step.strip().lower() == "plan" and isinstance(substep, str) and substep.strip().lower() == "verify":
+            required_refs.extend(
+                [
+                    f"{plan_root}/case.resolved.yaml",
+                    f"{plan_root}/algorithm.resolved.yaml",
+                    f"{plan_root}/impl.resolved.yaml",
+                    f"{plan_root}/dependency.resolved.yaml",
+                    f"{plan_root}/derived_contract.json",
+                ]
+            )
+        if isinstance(step, str) and step.strip().lower() == "generate" and isinstance(substep, str) and substep.strip().lower() == "verify":
+            required_refs.extend(
+                [
+                    f"{plan_root}/case.resolved.yaml",
+                    f"{plan_root}/algorithm.resolved.yaml",
+                    f"{plan_root}/impl.resolved.yaml",
+                    f"{plan_root}/dependency.resolved.yaml",
+                    f"{plan_root}/derived_contract.json",
+                ]
+            )
+
+    missing_refs = [ref for ref in required_refs if ref not in skill_must_read_refs]
+    if missing_refs:
+        raise ValueError(
+            "request payload skill_must_read_refs missing required verify inputs: "
+            + ", ".join(missing_refs)
+        )
+
+
+def _load_run_records(orchestration_root: Path) -> dict[str, dict[str, Any]]:
+    runs_path = orchestration_root / "agent_runs.jsonl"
+    records: dict[str, dict[str, Any]] = {}
+    if not runs_path.exists():
+        return records
+    for raw in runs_path.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        item = json.loads(line)
+        if not isinstance(item, dict):
+            continue
+        run_id = item.get("agent_run_id")
+        if isinstance(run_id, str) and run_id.strip():
+            records[run_id.strip()] = item
+    return records
+
+
+def _validate_terminal_run_payload(
+    repo_root: Path,
+    orchestration_id: str,
+    payload: dict[str, Any],
+) -> None:
+    role = payload.get("agent_role")
+    status = payload.get("status")
+    if not isinstance(role, str) or role not in {"step", "substep"}:
+        return
+    if not isinstance(status, str) or status.strip().lower() != "pass":
+        return
+
+    output_refs = payload.get("output_refs")
+    if not isinstance(output_refs, list) or not output_refs:
+        raise ValueError("pass status for step/substep requires non-empty output_refs")
+    for idx, item in enumerate(output_refs):
+        if not isinstance(item, str) or not item.strip():
+            raise ValueError(f"output_refs[{idx}] must be non-empty string")
+
+
+def _validate_step_result_payload(
+    repo_root: Path,
+    orchestration_id: str,
+    *,
+    node_key: str,
+    step: str,
+    agent_run_id: str,
+    payload: dict[str, Any],
+) -> None:
+    step_token = step.strip().lower()
+    if step_token not in {"plan", "generate", "tune"}:
+        return
+    status = payload.get("status")
+    if not isinstance(status, str) or status.strip().lower() != "pass":
+        return
+    substep_run_ids = payload.get("substep_agent_run_ids")
+    if not isinstance(substep_run_ids, list) or not substep_run_ids:
+        raise ValueError(f"pass step_result for {step_token} requires non-empty substep_agent_run_ids")
+
+    run_records = _load_run_records(_orchestration_root(repo_root, orchestration_id))
+    required_outputs = payload.get("required_outputs")
+    if not isinstance(required_outputs, list):
+        raise ValueError("step_result.required_outputs must be list")
+    declared_outputs = {item.strip() for item in required_outputs if isinstance(item, str) and item.strip()}
+
+    substep_outputs: set[str] = set()
+    for idx, substep_run_id in enumerate(substep_run_ids):
+        if not isinstance(substep_run_id, str) or not substep_run_id.strip():
+            raise ValueError(f"substep_agent_run_ids[{idx}] must be non-empty string")
+        substep_record = run_records.get(substep_run_id.strip())
+        if not isinstance(substep_record, dict):
+            raise ValueError(f"missing substep run record: {substep_run_id}")
+        substep_status = substep_record.get("status")
+        if not isinstance(substep_status, str) or substep_status.strip().lower() != "pass":
+            raise ValueError(f"substep {substep_run_id} must be pass before step_result can pass")
+        output_refs = substep_record.get("output_refs")
+        if not isinstance(output_refs, list) or not output_refs:
+            raise ValueError(f"substep {substep_run_id} must publish non-empty output_refs")
+        for output_ref in output_refs:
+            if isinstance(output_ref, str) and output_ref.strip():
+                substep_outputs.add(output_ref.strip())
+
+    missing_outputs = sorted(ref for ref in declared_outputs if ref not in substep_outputs)
+    if missing_outputs:
+        raise ValueError(
+            "step_result.required_outputs must be satisfied by substep output_refs: "
+            + ", ".join(missing_outputs)
+        )
 
 
 def parse_feature_list(raw: str) -> dict[str, bool]:
@@ -390,6 +546,8 @@ def record_launch(
     request_payload = dict(request_payload)
     response_payload = dict(response_payload)
 
+    _validate_launch_request_payload(request_payload)
+
     prompt_text = _extract_launch_prompt_text(request_payload)
     reply_text = _extract_launch_reply_text(response_payload)
     if not prompt_text.strip():
@@ -497,6 +655,8 @@ def record_agent_run(
     payload["agent_role"] = role_token
     payload.setdefault("started_at", _utc_now_iso())
 
+    _validate_terminal_run_payload(repo_root, orchestration_id, payload)
+
     status = payload.get("status")
     if isinstance(status, str) and status.strip().lower() in TERMINAL_STATUSES:
         payload.setdefault("finished_at", _utc_now_iso())
@@ -539,6 +699,15 @@ def write_step_result(
     result.setdefault("executor_agent_run_id", agent_run_id)
     result.setdefault("required_outputs", [])
     result.setdefault("failed_substeps", [])
+
+    _validate_step_result_payload(
+        repo_root,
+        orchestration_id,
+        node_key=node_key,
+        step=step,
+        agent_run_id=agent_run_id,
+        payload=result,
+    )
 
     _write_json(result_path, result)
     return result

@@ -179,6 +179,9 @@ shell_tool                       stable             true
                     "launch_reply_ref": launch_refs["launch_reply_ref"],
                     "started_at": "2026-03-11T00:00:10Z",
                     "finished_at": "2026-03-11T00:00:50Z",
+                    "output_refs": [
+                        "workspace/plans/problem__shallow_water2d__0.3.0/plan_001/case.resolved.yaml"
+                    ],
                 },
             )
             record_agent_run(
@@ -197,6 +200,9 @@ shell_tool                       stable             true
                     "agent_session_id": "sess_step_build_001",
                     "started_at": "2026-03-11T00:00:20Z",
                     "finished_at": "2026-03-11T00:01:10Z",
+                    "output_refs": [
+                        "workspace/pipelines/problem__shallow_water2d__0.3.0/pipeline_001/build/build_001/bin/simulate"
+                    ],
                 },
             )
 
@@ -463,6 +469,98 @@ shell_tool                       stable             true
                 "Owner: workspace/plans/... only.\nTask: execute Plan generate.\n",
             )
 
+    def test_rejects_verify_launch_without_required_resolved_artifacts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            init_orchestration(repo_root=repo_root, orchestration_id="orch_001")
+            write_preflight(
+                repo_root=repo_root,
+                orchestration_id="orch_001",
+                payload={
+                    "status": "pass",
+                    "can_launch_step_agents": True,
+                    "can_launch_substep_agents": True,
+                    "feature_states": {"multi_agent": True},
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}],
+                },
+            )
+            with self.assertRaisesRegex(ValueError, "missing required verify inputs"):
+                record_launch(
+                    repo_root=repo_root,
+                    orchestration_id="orch_001",
+                    parent_agent_run_id="orch_run_001",
+                    child_agent_run_id="substep_run_generate_verify_001",
+                    request_payload={
+                        "step": "Generate",
+                        "substep": "verify",
+                        "plan_ref": "workspace/plans/problem__shallow_water2d__0.3.0/plan_001",
+                        "skill_name": "workflow-generate-verify",
+                        "skill_ref": "skills/workflow-generate-verify/SKILL.md",
+                        "skill_must_read_refs": "docs/WORKFLOW.md,workspace/pipelines/problem__shallow_water2d__0.3.0/pipeline_001/generate/gen_001/generate_meta.json",
+                        "launch_prompt_full": "verify generate",
+                    },
+                    response_payload={"launch_reply": "accepted"},
+                )
+
+    def test_rejects_pass_step_result_when_required_outputs_are_missing_from_substeps(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            init_orchestration(repo_root=repo_root, orchestration_id="orch_001")
+            write_preflight(
+                repo_root=repo_root,
+                orchestration_id="orch_001",
+                payload={
+                    "status": "pass",
+                    "can_launch_step_agents": True,
+                    "can_launch_substep_agents": True,
+                    "feature_states": {"multi_agent": True},
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}],
+                },
+            )
+            record_agent_run(
+                repo_root=repo_root,
+                orchestration_id="orch_001",
+                payload={
+                    "agent_run_id": "orch_run_001",
+                    "agent_role": "orchestration",
+                    "status": "running",
+                },
+            )
+            record_agent_run(
+                repo_root=repo_root,
+                orchestration_id="orch_001",
+                payload={
+                    "agent_run_id": "substep_run_plan_generate_001",
+                    "parent_agent_run_id": "orch_run_001",
+                    "agent_role": "substep",
+                    "node_key": "problem/shallow_water2d@0.3.0",
+                    "step": "plan",
+                    "substep": "generate",
+                    "status": "pass",
+                    "agent_backend": "openai_responses",
+                    "agent_model": "gpt-5-codex",
+                    "context_id": "ctx_substep_plan_generate_001",
+                    "agent_session_id": "sess_substep_plan_generate_001",
+                    "output_refs": ["workspace/plans/problem__shallow_water2d__0.3.0/plan_001/impl.resolved.yaml"],
+                },
+            )
+            with self.assertRaisesRegex(ValueError, "required_outputs must be satisfied"):
+                write_step_result(
+                    repo_root=repo_root,
+                    orchestration_id="orch_001",
+                    node_key="problem/shallow_water2d@0.3.0",
+                    step="plan",
+                    agent_run_id="orch_run_001",
+                    payload={
+                        "status": "pass",
+                        "required_outputs": [
+                            "workspace/plans/problem__shallow_water2d__0.3.0/plan_001/case.resolved.yaml"
+                        ],
+                        "failed_substeps": [],
+                        "substep_agent_run_ids": ["substep_run_plan_generate_001"],
+                    },
+                )
+
     def test_rejects_duplicate_agent_run_id(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
@@ -490,6 +588,7 @@ shell_tool                       stable             true
                 "agent_model": "gpt-5-codex",
                 "context_id": "ctx_step_001",
                 "agent_session_id": "sess_step_001",
+                "output_refs": ["workspace/pipelines/problem__shallow_water2d__0.3.0/pipeline_001/build/build_001/bin/simulate"],
             }
             record_agent_run(repo_root=repo_root, orchestration_id="orch_001", payload=payload)
             with self.assertRaisesRegex(ValueError, "duplicate agent_run_id"):
@@ -540,16 +639,17 @@ shell_tool                       stable             true
                     repo_root=repo_root,
                     orchestration_id="orch_001",
                     payload={
-                        "agent_run_id": "step_run_plan_001",
+                        "agent_run_id": "step_run_build_001",
                         "agent_role": "step",
                         "parent_agent_run_id": "orch_run_001",
-                        "step": "plan",
+                        "step": "build",
                         "node_key": "problem/shallow_water2d@0.3.0",
                         "status": "pass",
                         "agent_backend": "openai_responses",
                         "agent_model": "gpt-5-codex",
                         "context_id": "ctx_step_plan_001",
                         "agent_session_id": "sess_step_plan_001",
+                        "output_refs": ["workspace/pipelines/problem__shallow_water2d__0.3.0/pipeline_001/build/build_001/bin/simulate"],
                     },
                 )
 
@@ -630,25 +730,26 @@ shell_tool                       stable             true
                     repo_root=repo_root,
                     orchestration_id="orch_001",
                     payload={
-                        "agent_run_id": "step_run_plan_001",
+                        "agent_run_id": "step_run_build_001",
                         "agent_role": "step",
                         "parent_agent_run_id": "orch_run_001",
-                        "step": "plan",
+                        "step": "build",
                         "node_key": "problem/shallow_water2d@0.3.0",
                         "status": "pass",
                         "agent_backend": "openai_responses",
                         "agent_model": "gpt-5-codex",
-                        "context_id": "ctx_step_plan_001",
-                        "agent_session_id": "sess_step_plan_001",
+                        "context_id": "ctx_step_build_001",
+                        "agent_session_id": "sess_step_build_001",
+                        "output_refs": ["workspace/pipelines/problem__shallow_water2d__0.3.0/pipeline_001/build/build_001/bin/simulate"],
                     },
                 )
                 write_step_result(
                     repo_root=repo_root,
                     orchestration_id="orch_001",
                     node_key="problem/shallow_water2d@0.3.0",
-                    step="plan",
-                    agent_run_id="orch_run_001",
-                    payload={"status": "pass"},
+                    step="build",
+                    agent_run_id="step_run_build_001",
+                    payload={"status": "pass", "required_outputs": [], "failed_substeps": [], "substep_agent_run_ids": []},
                 )
                 update_orchestration_status(
                     repo_root=repo_root,

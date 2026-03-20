@@ -7,6 +7,8 @@ import argparse
 import hashlib
 import json
 import re
+
+import yaml
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -85,7 +87,8 @@ QUALITY_CHECK_ALLOWED_COMMANDS = {"make", "ctest", "pytest"}
 FORBIDDEN_QUALITY_CHECK_EXECUTABLES = {"python", "python3", "pypy", "bash", "sh", "zsh"}
 TEST_ID_HEADING_PATTERN = re.compile(r"^###\s+\d+-\d+\.\s+`([^`]+)`\s*$")
 TEST_OUTCOME_VALUES = {"pass", "fail", "xfail", "skipped", "blocked"}
-SHAPE_EXPR_PATTERN = re.compile(r"^\[\s*([^\]]+?)\s*\]$")
+BRACKET_SHAPE_EXPR_PATTERN = re.compile(r"^\[\s*([^\]]+?)\s*\]$")
+PAREN_SHAPE_EXPR_PATTERN = re.compile(r"^\(\s*([^\)]+?)\s*\)$")
 REQUIRED_WORKFLOW_STEPS = ("plan", "generate", "build", "execute", "judge")
 SUBSTEP_WORKFLOW_STEPS = frozenset({"plan", "generate", "tune"})
 AGENT_TERMINAL_STATUSES = {"pass", "fail", "blocked", "timeout", "cancel"}
@@ -1297,6 +1300,10 @@ def _derived_contract_for_execution(
     return data if isinstance(data, dict) else None
 
 
+def _read_yaml(path: Path) -> Any:
+    return yaml.safe_load(path.read_text(encoding="utf-8"))
+
+
 def _algorithm_contract_for_execution(
     repo_root: Path, execution: NodeExecution
 ) -> dict[str, Any] | None:
@@ -1308,10 +1315,7 @@ def _algorithm_contract_for_execution(
     if not contract_path.exists():
         return None
 
-    try:
-        data = _read_json(contract_path)
-    except json.JSONDecodeError:
-        return None
+    data = _read_yaml(contract_path)
     return data if isinstance(data, dict) else None
 
 
@@ -1328,6 +1332,18 @@ def _algorithm_state_contract(contract: dict[str, Any]) -> dict[str, Any] | None
     state_contract = contract.get("state_contract")
     if isinstance(state_contract, dict):
         return state_contract
+
+    update_semantics = contract.get("update_semantics")
+    if isinstance(update_semantics, dict) and any(
+        key in update_semantics
+        for key in (
+            "state_variables",
+            "required_update_paths",
+            "diagnostics_from_state",
+            "fallback_policy",
+        )
+    ):
+        return update_semantics
 
     state_variables = contract.get("state_variables")
     required_update_paths = contract.get("required_update_paths")
@@ -1424,9 +1440,11 @@ def _parse_shape_expr(expr: str) -> tuple[bool, list[str], str]:
     if token.lower() == "scalar":
         return True, [], ""
 
-    match = SHAPE_EXPR_PATTERN.fullmatch(token)
+    match = BRACKET_SHAPE_EXPR_PATTERN.fullmatch(token)
     if match is None:
-        return False, [], "shape_expr must be scalar or [dim1,dim2,...]"
+        match = PAREN_SHAPE_EXPR_PATTERN.fullmatch(token)
+    if match is None:
+        return False, [], "shape_expr must be scalar or [dim1,dim2,...] or (dim1,dim2,...)"
 
     dims: list[str] = []
     for raw_dim in match.group(1).split(","):
@@ -1642,10 +1660,14 @@ def _semantic_required_sources(repo_root: Path, execution: NodeExecution) -> set
         raw_sources = semantic_dep.get("required_sources")
         if isinstance(raw_sources, list):
             for item in raw_sources:
-                if not isinstance(item, str):
-                    continue
-                token = item.strip().lower()
-                if FORTRAN_IDENTIFIER_PATTERN.fullmatch(token):
+                token = None
+                if isinstance(item, str):
+                    token = item.strip().lower()
+                elif isinstance(item, dict):
+                    name = item.get("name")
+                    if isinstance(name, str):
+                        token = name.strip().lower()
+                if token and FORTRAN_IDENTIFIER_PATTERN.fullmatch(token):
                     required.add(token)
 
     io_contract = contract.get("io_contract")
@@ -1699,7 +1721,7 @@ def _validate_derived_contract_schema(
         outputs = io_contract.get("outputs")
         if not isinstance(outputs, list) or not outputs:
             violations.append(f"{contract_path}:io_contract.outputs must be non-empty list")
-        elif isinstance(outputs, list):
+        else:
             for idx, item in enumerate(outputs):
                 if not isinstance(item, dict):
                     violations.append(
@@ -1723,6 +1745,12 @@ def _validate_derived_contract_schema(
                     violations.append(
                         f"{contract_path}:io_contract.outputs[{idx}].shape_expr must be non-empty string when present"
                     )
+                elif isinstance(shape_expr, str):
+                    ok_shape, _, shape_err = _parse_shape_expr(shape_expr)
+                    if not ok_shape:
+                        violations.append(
+                            f"{contract_path}:io_contract.outputs[{idx}].shape_expr invalid ({shape_err})"
+                        )
                 output_items.append((idx, item))
 
     raw_requirements = contract.get("raw_requirements")
@@ -1758,7 +1786,7 @@ def _validate_derived_contract_schema(
         artifact = _normalize_raw_evidence_artifact(raw_artifact)
         if artifact is None:
             violations.append(
-                f"{contract_path}:raw_requirements.required_evidence[{idx}].artifact "
+                f"{contract_path}:raw_requirements.required_evidence[{idx}].artifact {raw_artifact!r} "
                 f"must be one of {sorted(RAW_EVIDENCE_ARTIFACTS)}"
             )
             continue
@@ -1882,15 +1910,25 @@ def _validate_derived_contract_schema(
     for idx, item in output_items:
         evidence_ref = item.get("evidence_ref")
         has_snapshot_ref = isinstance(evidence_ref, str) and "state_snapshots" in evidence_ref
-        if has_snapshot_ref or not snapshot_required:
-            continue
 
         raw_variables = item.get("raw_variables")
-        if not isinstance(raw_variables, list) or not raw_variables:
-            violations.append(
-                f"{contract_path}:io_contract.outputs[{idx}].raw_variables must be non-empty list when evidence_ref is non-snapshot and state_snapshots is required"
-            )
+        if has_snapshot_ref:
+            if not isinstance(raw_variables, list) or not raw_variables:
+                violations.append(
+                    f"{contract_path}:io_contract.outputs[{idx}].raw_variables must be non-empty list when evidence_ref references state_snapshots"
+                )
+                continue
+        elif snapshot_required:
+            if not isinstance(raw_variables, list) or not raw_variables:
+                violations.append(
+                    f"{contract_path}:io_contract.outputs[{idx}].raw_variables must be non-empty list when evidence_ref is non-snapshot and state_snapshots is required"
+                )
+                continue
+            
+        if not isinstance(raw_variables, list):
             continue
+
+        referenced_shapes: set[str] = set()
         unknown_variables: list[str] = []
         for var_idx, token in enumerate(raw_variables):
             if not isinstance(token, str) or not token.strip():
@@ -1899,12 +1937,30 @@ def _validate_derived_contract_schema(
                 )
                 continue
             name = token.strip()
-            if name not in snapshot_reference_variables:
+            if name == snapshot_time_variable:
+                referenced_shapes.add(snapshot_time_shape_expr)
+            elif name in snapshot_variables:
+                referenced_shapes.add(snapshot_variables[name])
+            else:
                 unknown_variables.append(name)
         if unknown_variables:
             violations.append(
                 f"{contract_path}:io_contract.outputs[{idx}].raw_variables must reference declared state_snapshots variables/time_variable ({sorted(set(unknown_variables))})"
             )
+            continue
+        if has_snapshot_ref and referenced_shapes:
+            shape_expr = item.get("shape_expr")
+            if isinstance(shape_expr, str) and shape_expr.strip() and len(referenced_shapes) == 1:
+                declared_shape = _canonical_shape_expr(shape_expr)
+                expected_shape = next(iter(referenced_shapes))
+                if declared_shape != expected_shape:
+                    violations.append(
+                        f"{contract_path}:io_contract.outputs[{idx}].shape_expr must match referenced state_snapshots schema shape ({expected_shape})"
+                    )
+            elif isinstance(shape_expr, str) and shape_expr.strip() and len(referenced_shapes) > 1:
+                violations.append(
+                    f"{contract_path}:io_contract.outputs[{idx}].shape_expr must resolve to a single referenced state_snapshots variable/time_variable shape"
+                )
 
     if "numerical_kernel_contract" in contract:
         violations.append(
@@ -1935,13 +1991,13 @@ def _validate_algorithm_contract_schema(
         return
 
     try:
-        contract = _read_json(contract_path)
-    except json.JSONDecodeError:
-        violations.append(f"{contract_path}: invalid json")
+        contract = _read_yaml(contract_path)
+    except yaml.YAMLError:
+        violations.append(f"{contract_path}: invalid yaml")
         return
 
     if not isinstance(contract, dict):
-        violations.append(f"{contract_path}: must be json object")
+        violations.append(f"{contract_path}: must be mapping")
         return
 
     algorithm_id = contract.get("algorithm_id")
@@ -1997,8 +2053,15 @@ def _validate_algorithm_contract_schema(
         violations.append(f"{contract_path}:ordering must be non-empty when steps has multiple entries")
     else:
         for idx, item in enumerate(ordering):
+            if isinstance(item, str):
+                token = item.strip()
+                if not token:
+                    violations.append(f"{contract_path}:ordering[{idx}] must be non-empty string when scalar")
+                elif step_ids and token not in step_ids:
+                    violations.append(f"{contract_path}:ordering[{idx}] must reference known step_id")
+                continue
             if not isinstance(item, dict):
-                violations.append(f"{contract_path}:ordering[{idx}] must be object")
+                violations.append(f"{contract_path}:ordering[{idx}] must be string or object")
                 continue
             before = item.get("before")
             after = item.get("after")
@@ -2012,14 +2075,20 @@ def _validate_algorithm_contract_schema(
                 violations.append(f"{contract_path}:ordering[{idx}].after must reference known step_id")
 
     control_condition = contract.get("control_condition")
-    if not isinstance(control_condition, list):
-        violations.append(f"{contract_path}:control_condition must be list")
-    elif execution_mode == "conditional" and not control_condition:
-        violations.append(f"{contract_path}:control_condition must be non-empty when execution_mode=conditional")
+    if not isinstance(control_condition, (str, list, dict)):
+        violations.append(f"{contract_path}:control_condition must be string, list, or object")
+    elif execution_mode == "conditional":
+        is_empty = (
+            (isinstance(control_condition, str) and not control_condition.strip())
+            or (isinstance(control_condition, list) and not control_condition)
+            or (isinstance(control_condition, dict) and not control_condition)
+        )
+        if is_empty:
+            violations.append(f"{contract_path}:control_condition must be non-empty when execution_mode=conditional")
 
     iteration_contract = contract.get("iteration_contract")
-    if not isinstance(iteration_contract, list):
-        violations.append(f"{contract_path}:iteration_contract must be list")
+    if not isinstance(iteration_contract, dict):
+        violations.append(f"{contract_path}:iteration_contract must be object")
     elif execution_mode == "iterative" and not iteration_contract:
         violations.append(f"{contract_path}:iteration_contract must be non-empty when execution_mode=iterative")
 
@@ -2030,6 +2099,23 @@ def _validate_algorithm_contract_schema(
     temporaries = contract.get("temporaries")
     if not isinstance(temporaries, list):
         violations.append(f"{contract_path}:temporaries must be list")
+    else:
+        for idx, item in enumerate(temporaries):
+            if isinstance(item, str):
+                if not item.strip():
+                    violations.append(f"{contract_path}:temporaries[{idx}] must be non-empty string when scalar")
+                continue
+            if not isinstance(item, dict):
+                violations.append(f"{contract_path}:temporaries[{idx}] must be string or object")
+                continue
+            name = item.get("name")
+            if not isinstance(name, str) or not name.strip():
+                violations.append(f"{contract_path}:temporaries[{idx}].name must be non-empty string")
+            shape_expr = item.get("shape_expr")
+            if shape_expr is not None and (
+                not isinstance(shape_expr, str) or not shape_expr.strip() or not _parse_shape_expr(shape_expr)[0]
+            ):
+                violations.append(f"{contract_path}:temporaries[{idx}].shape_expr invalid")
 
     derived_field_rules = contract.get("derived_field_rules")
     if not isinstance(derived_field_rules, list):
@@ -2038,10 +2124,14 @@ def _validate_algorithm_contract_schema(
     invariants = contract.get("invariants")
     if not isinstance(invariants, list):
         violations.append(f"{contract_path}:invariants must be list")
+    elif not all(isinstance(item, str) and item.strip() for item in invariants):
+        violations.append(f"{contract_path}:invariants must be non-empty string list")
 
     splitting_policy = contract.get("splitting_policy")
     if not isinstance(splitting_policy, dict):
         violations.append(f"{contract_path}:splitting_policy must be object")
+    elif not isinstance(splitting_policy.get("kind"), str) or not splitting_policy.get("kind", "").strip():
+        violations.append(f"{contract_path}:splitting_policy.kind must be non-empty string")
 
     if execution_mode == "columnwise":
         has_column_step = False
@@ -2091,8 +2181,8 @@ def _validate_algorithm_contract_schema(
                     )
 
         update_paths = state_contract.get("required_update_paths")
-        if not isinstance(update_paths, list) or not update_paths or not all(
-            isinstance(item, str) and item.strip() for item in update_paths
+        if not isinstance(update_paths, list) or not all(
+            isinstance(token, str) and token.strip() for token in update_paths
         ):
             violations.append(
                 f"{contract_path}:state_contract.required_update_paths must be non-empty string list"
@@ -2109,7 +2199,6 @@ def _validate_algorithm_contract_schema(
             violations.append(
                 f"{contract_path}:state_contract.fallback_policy must be fail_closed"
             )
-
 
 def _validate_test_evidence_requirements(
     repo_root: Path,
