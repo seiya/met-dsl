@@ -3067,6 +3067,9 @@ def _validate_orchestration_hierarchy(
                     expected_launch_prefix = (
                         f"workspace/orchestrations/{orchestration_dir.name}/launches/"
                     )
+                    expected_agent_prefix = (
+                        f"workspace/orchestrations/{orchestration_dir.name}/agents/{run_id}/dialogs/"
+                    )
                     launch_refs: dict[str, str] = {}
                     for key in (
                         "launch_request_ref",
@@ -3103,6 +3106,58 @@ def _validate_orchestration_hierarchy(
                                 encoding="utf-8", errors="ignore"
                             )
                             if not launch_text.strip():
+                                violations.append(
+                                    f"{runs_path}:line {idx + 1} {key} target must be non-empty ({ref_token})"
+                                )
+
+                    for key in ("agent_result_ref", "agent_summary_ref"):
+                        agent_ref = item.get(key)
+                        if not isinstance(agent_ref, str) or not agent_ref.strip():
+                            violations.append(
+                                f"{runs_path}:line {idx + 1} missing {key} for {role_l}"
+                            )
+                            continue
+                        ref_token = agent_ref.strip()
+                        if not ref_token.startswith(expected_agent_prefix):
+                            violations.append(
+                                f"{runs_path}:line {idx + 1} {key} must start with {expected_agent_prefix} ({ref_token})"
+                            )
+                            continue
+                        agent_path = workspace_path.parent / ref_token
+                        if not agent_path.exists():
+                            violations.append(
+                                f"{runs_path}:line {idx + 1} {key} target not found ({ref_token})"
+                            )
+                            continue
+                        if key == "agent_result_ref":
+                            try:
+                                result_payload = _read_json(agent_path)
+                            except json.JSONDecodeError:
+                                violations.append(
+                                    f"{agent_path}: agent result must be valid json object"
+                                )
+                            else:
+                                if not isinstance(result_payload, dict):
+                                    violations.append(
+                                        f"{agent_path}: agent result must be json object"
+                                    )
+                                else:
+                                    result_run_id = result_payload.get("agent_run_id")
+                                    if (
+                                        not isinstance(result_run_id, str)
+                                        or result_run_id.strip() != run_id
+                                    ):
+                                        violations.append(
+                                            f"{agent_path}:agent_run_id must equal agent_runs agent_run_id ({run_id})"
+                                        )
+                        else:
+                            if not agent_path.is_file():
+                                violations.append(
+                                    f"{runs_path}:line {idx + 1} {key} target must be file ({ref_token})"
+                                )
+                                continue
+                            summary_text = agent_path.read_text(encoding="utf-8", errors="ignore")
+                            if not summary_text.strip():
                                 violations.append(
                                     f"{runs_path}:line {idx + 1} {key} target must be non-empty ({ref_token})"
                                 )

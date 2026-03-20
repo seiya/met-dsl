@@ -44,7 +44,7 @@
 - **agent_graph.json**: `orchestration` における `agent` 親子関係。`parent_agent_run_id` と `child_agent_run_id` と `relation_type` を記録する。
 - **context_id**: `LLM` 実行コンテキスト識別子。`step agent` / `substep agent` ごとに固有値を持ち、同一 `orchestration_id` 内で重複を禁止する。
 - **context_isolated**: `step agent` / `substep agent` が独立コンテキストで実行されたことを示す真偽値。`true` を必須とする。
-- **agent_runs.jsonl**: `agent` 実行イベントの時系列ログ。`agent_run_id`、`parent_agent_run_id`、`agent_role`、`status`、`started_at`、`finished_at`、`agent_backend`、`agent_model`、`context_id`、`context_isolated` を記録する。再投入時は `launch_request_ref` 先へ `issue_severity` と `repair_strategy` と `repair_target_agent_run_id` と `repair_reason` を記録する。
+- **agent_runs.jsonl**: `agent` 実行イベントの時系列ログ。`agent_run_id`、`parent_agent_run_id`、`agent_role`、`status`、`started_at`、`finished_at`、`agent_backend`、`agent_model`、`context_id`、`context_isolated`、`launch_request_ref`、`launch_response_ref`、`launch_prompt_ref`、`launch_reply_ref`、`agent_result_ref`、`agent_summary_ref` を記録する。再投入時は `launch_request_ref` 先へ `issue_severity` と `repair_strategy` と `repair_target_agent_run_id` と `repair_reason` を記録する。
 - **step_result.json**: phase 集約結果。`status`、`required_outputs`、`failed_substeps`、`executor_agent_run_id`、`substep_agent_run_ids` を記録する。`substep` を持つ phase では `executor_agent_run_id` は `orchestration agent_run_id`、標準 `substep` を持たない phase では `step agent_run_id` とする。`substep_agent_run_ids` は `substep` を持たない phase で空配列を許可する。再投入を実施した phase は `retry_decisions` を追加し、`issue_severity` と `repair_strategy` と `repair_target_agent_run_id` と `new_agent_run_id` と `repair_reason` を保持する。
 - **model**: 物理計算を実行する計算コンポーネント / ライブラリ。入力状態から次状態を計算する責務を持つ。
 - **runner（例: `simulate`）**: 実行エントリポイント。入力読込・`model` 呼び出し・`diagnostics` / `perf` 出力を担当する。

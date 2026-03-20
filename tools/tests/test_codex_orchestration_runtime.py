@@ -274,6 +274,24 @@ shell_tool                       stable             true
             self.assertTrue(
                 (
                     orch_root
+                    / "agents"
+                    / "substep_run_plan_generate_001"
+                    / "dialogs"
+                    / "agent.result.json"
+                ).exists()
+            )
+            self.assertTrue(
+                (
+                    orch_root
+                    / "agents"
+                    / "substep_run_plan_generate_001"
+                    / "dialogs"
+                    / "agent.summary.txt"
+                ).exists()
+            )
+            self.assertTrue(
+                (
+                    orch_root
                     / "steps"
                     / "problem__shallow_water2d__0.3.0"
                     / "plan"
@@ -287,6 +305,8 @@ shell_tool                       stable             true
             self.assertIn('"agent_session_id": "sess_step_build_001"', runs_text)
             self.assertIn('"launch_prompt_ref": "workspace/orchestrations/orch_001/launches/step_run_build_001.prompt.txt"', runs_text)
             self.assertIn('"launch_reply_ref": "workspace/orchestrations/orch_001/launches/step_run_build_001.reply.txt"', runs_text)
+            self.assertIn('"agent_result_ref": "workspace/orchestrations/orch_001/agents/step_run_build_001/dialogs/agent.result.json"', runs_text)
+            self.assertIn('"agent_summary_ref": "workspace/orchestrations/orch_001/agents/step_run_build_001/dialogs/agent.summary.txt"', runs_text)
             request_payload = json.loads(
                 (
                     orch_root / "launches" / "substep_run_plan_generate_001.request.json"
@@ -337,6 +357,26 @@ shell_tool                       stable             true
                     / "child.reply.txt"
                 ).read_text(encoding="utf-8"),
             )
+            result_payload = json.loads(
+                (
+                    orch_root
+                    / "agents"
+                    / "substep_run_plan_generate_001"
+                    / "dialogs"
+                    / "agent.result.json"
+                ).read_text(encoding="utf-8")
+            )
+            self.assertEqual(result_payload["agent_run_id"], "substep_run_plan_generate_001")
+            self.assertEqual(result_payload["status"], "pass")
+            summary_text = (
+                orch_root
+                / "agents"
+                / "substep_run_plan_generate_001"
+                / "dialogs"
+                / "agent.summary.txt"
+            ).read_text(encoding="utf-8")
+            self.assertIn("agent_run_id: substep_run_plan_generate_001", summary_text)
+            self.assertIn("output_refs:", summary_text)
 
     def test_record_launch_prefers_prompt_over_launch_prompt_summary(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -560,6 +600,44 @@ shell_tool                       stable             true
                         "substep_agent_run_ids": ["substep_run_plan_generate_001"],
                     },
                 )
+
+    def test_record_agent_run_writes_explicit_summary_when_provided(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            init_orchestration(repo_root=repo_root, orchestration_id="orch_001")
+            write_preflight(
+                repo_root=repo_root,
+                orchestration_id="orch_001",
+                payload={
+                    "status": "pass",
+                    "can_launch_step_agents": True,
+                    "can_launch_substep_agents": True,
+                    "feature_states": {"multi_agent": True},
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}],
+                },
+            )
+            payload = record_agent_run(
+                repo_root=repo_root,
+                orchestration_id="orch_001",
+                payload={
+                    "agent_run_id": "step_run_build_001",
+                    "agent_role": "step",
+                    "parent_agent_run_id": "orch_run_001",
+                    "step": "build",
+                    "node_key": "problem/shallow_water2d@0.3.0",
+                    "status": "fail",
+                    "agent_backend": "openai_responses",
+                    "agent_model": "gpt-5-codex",
+                    "context_id": "ctx_step_build_001",
+                    "agent_session_id": "sess_step_build_001",
+                    "result_summary": "compile diagnostics show missing dependency metadata",
+                },
+            )
+            summary_path = repo_root / payload["agent_summary_ref"]
+            self.assertEqual(
+                summary_path.read_text(encoding="utf-8").strip(),
+                "compile diagnostics show missing dependency metadata",
+            )
 
     def test_rejects_duplicate_agent_run_id(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

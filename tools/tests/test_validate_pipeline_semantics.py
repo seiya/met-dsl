@@ -358,27 +358,37 @@ def _create_minimal_orchestration_tree(
             f"accepted step {step}\n",
             encoding="utf-8",
         )
-        run_items.append(
-            {
-                "agent_run_id": step_ids[step],
-                "parent_agent_run_id": "orch_run_001",
-                "agent_role": "step",
-                "node_key": node_key,
-                "step": step,
-                "status": "pass",
-                "agent_backend": "openai_responses",
-                "agent_model": "gpt-5-codex",
-                "context_id": f"ctx_step_{step}",
-                "context_isolated": True,
-                "agent_session_id": f"sess_step_{step}",
-                "launch_request_ref": step_request_ref,
-                "launch_response_ref": step_response_ref,
-                "launch_prompt_ref": step_prompt_ref,
-                "launch_reply_ref": step_reply_ref,
-                "started_at": "2026-03-01T00:00:10Z",
-                "finished_at": "2026-03-01T00:01:10Z",
-            }
+        step_agent_dir = orchestration_root / "agents" / step_ids[step] / "dialogs"
+        step_agent_dir.mkdir(parents=True, exist_ok=True)
+        step_agent_result_ref = f"workspace/orchestrations/{orchestration_id}/agents/{step_ids[step]}/dialogs/agent.result.json"
+        step_agent_summary_ref = f"workspace/orchestrations/{orchestration_id}/agents/{step_ids[step]}/dialogs/agent.summary.txt"
+        step_payload = {
+            "agent_run_id": step_ids[step],
+            "parent_agent_run_id": "orch_run_001",
+            "agent_role": "step",
+            "node_key": node_key,
+            "step": step,
+            "status": "pass",
+            "agent_backend": "openai_responses",
+            "agent_model": "gpt-5-codex",
+            "context_id": f"ctx_step_{step}",
+            "context_isolated": True,
+            "agent_session_id": f"sess_step_{step}",
+            "launch_request_ref": step_request_ref,
+            "launch_response_ref": step_response_ref,
+            "launch_prompt_ref": step_prompt_ref,
+            "launch_reply_ref": step_reply_ref,
+            "agent_result_ref": step_agent_result_ref,
+            "agent_summary_ref": step_agent_summary_ref,
+            "started_at": "2026-03-01T00:00:10Z",
+            "finished_at": "2026-03-01T00:01:10Z",
+        }
+        _write_json(step_agent_dir / "agent.result.json", step_payload)
+        (step_agent_dir / "agent.summary.txt").write_text(
+            f"agent_run_id: {step_ids[step]}\nstatus: pass\n",
+            encoding="utf-8",
         )
+        run_items.append(step_payload)
     for step, substeps in substep_ids.items():
         for idx, substep_id in enumerate(substeps, start=1):
             substep_request_ref = f"workspace/orchestrations/{orchestration_id}/launches/{substep_id}.request.json"
@@ -414,28 +424,38 @@ def _create_minimal_orchestration_tree(
                 encoding="utf-8",
             )
 
-            run_items.append(
-                {
-                    "agent_run_id": substep_id,
-                    "parent_agent_run_id": "orch_run_001",
-                    "agent_role": "substep",
-                    "node_key": node_key,
-                    "step": step,
-                    "substep": f"part_{idx}",
-                    "status": "pass",
-                    "agent_backend": "openai_responses",
-                    "agent_model": "gpt-5-codex",
-                    "context_id": f"ctx_substep_{step}_{idx}",
-                    "context_isolated": True,
-                    "agent_session_id": f"sess_substep_{step}_{idx}",
-                    "launch_request_ref": substep_request_ref,
-                    "launch_response_ref": substep_response_ref,
-                    "launch_prompt_ref": substep_prompt_ref,
-                    "launch_reply_ref": substep_reply_ref,
-                    "started_at": "2026-03-01T00:00:20Z",
-                    "finished_at": "2026-03-01T00:00:50Z",
-                }
+            substep_agent_dir = orchestration_root / "agents" / substep_id / "dialogs"
+            substep_agent_dir.mkdir(parents=True, exist_ok=True)
+            substep_agent_result_ref = f"workspace/orchestrations/{orchestration_id}/agents/{substep_id}/dialogs/agent.result.json"
+            substep_agent_summary_ref = f"workspace/orchestrations/{orchestration_id}/agents/{substep_id}/dialogs/agent.summary.txt"
+            substep_payload = {
+                "agent_run_id": substep_id,
+                "parent_agent_run_id": "orch_run_001",
+                "agent_role": "substep",
+                "node_key": node_key,
+                "step": step,
+                "substep": f"part_{idx}",
+                "status": "pass",
+                "agent_backend": "openai_responses",
+                "agent_model": "gpt-5-codex",
+                "context_id": f"ctx_substep_{step}_{idx}",
+                "context_isolated": True,
+                "agent_session_id": f"sess_substep_{step}_{idx}",
+                "launch_request_ref": substep_request_ref,
+                "launch_response_ref": substep_response_ref,
+                "launch_prompt_ref": substep_prompt_ref,
+                "launch_reply_ref": substep_reply_ref,
+                "agent_result_ref": substep_agent_result_ref,
+                "agent_summary_ref": substep_agent_summary_ref,
+                "started_at": "2026-03-01T00:00:20Z",
+                "finished_at": "2026-03-01T00:00:50Z",
+            }
+            _write_json(substep_agent_dir / "agent.result.json", substep_payload)
+            (substep_agent_dir / "agent.summary.txt").write_text(
+                f"agent_run_id: {substep_id}\nstatus: pass\n",
+                encoding="utf-8",
             )
+            run_items.append(substep_payload)
     agent_runs_path.write_text(
         "\n".join(json.dumps(item, ensure_ascii=False) for item in run_items) + "\n",
         encoding="utf-8",
@@ -1691,6 +1711,60 @@ end program shallow_water2d_runner
             )
             self.assertTrue(
                 any("context_isolated must be true for step" in v for v in violations)
+            )
+
+    def test_detects_missing_agent_summary_ref_when_required(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            model_text = """module shallow_water2d_model
+use dynamics_shallow_water_flux_2d_rusanov_p0_model
+implicit none
+contains
+subroutine solve(flag)
+  logical, intent(out) :: flag
+  call dynamics_shallow_water_flux_2d_rusanov_p0__compute_flux(flag)
+end subroutine solve
+end module shallow_water2d_model
+"""
+            runner_text = """program shallow_water2d_runner
+implicit none
+write(*,*) 'ok'
+end program shallow_water2d_runner
+"""
+            _create_minimal_execution_tree(
+                repo_root,
+                dep_spec_id="dynamics_shallow_water_flux_2d_rusanov_p0",
+                model_text=model_text,
+                runner_text=runner_text,
+                run_command=["./simulate", "workspace/case.resolved.yaml", "workspace/outdir"],
+            )
+            _create_minimal_orchestration_tree(repo_root)
+
+            runs_path = (
+                repo_root
+                / "workspace"
+                / "orchestrations"
+                / "orch_test_001"
+                / "agent_runs.jsonl"
+            )
+            lines = [line for line in runs_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+            items = [json.loads(line) for line in lines]
+            for item in items:
+                if item.get("agent_run_id") == "step_run_build_001":
+                    item.pop("agent_summary_ref", None)
+                    break
+            runs_path.write_text(
+                "\n".join(json.dumps(item, ensure_ascii=False) for item in items) + "\n",
+                encoding="utf-8",
+            )
+
+            violations = validate(
+                repo_root=repo_root,
+                workspace_root="workspace",
+                require_orchestration=True,
+            )
+            self.assertTrue(
+                any("missing agent_summary_ref for step" in v for v in violations)
             )
 
     def test_detects_missing_launch_prompt_ref_when_required(self) -> None:

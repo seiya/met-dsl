@@ -58,6 +58,8 @@
 - 各 `step` / `substep` の実処理を `script` で代行してはならない。必ず独立 `agent_run_id` を持つ `LLM agent` で実行する。
 - `step agent` と `substep agent` は `agent_run_id` ごとに固有 `context_id` を持ち、`context_isolated=true` を必須記録とする。
 - `step` / `substep` の起動要求と起動応答は `workspace/orchestrations/<orchestration_id>/launches/` 配下へ保存し、`agent_runs.jsonl` の `launch_request_ref` と `launch_response_ref` から追跡可能にする。
+- 各 `step` / `substep` の完了時には `workspace/orchestrations/<orchestration_id>/agents/<agent_run_id>/dialogs/agent.result.json` と `agent.summary.txt` を保存し、`agent_runs.jsonl` の `agent_result_ref` と `agent_summary_ref` から追跡可能にする。
+- `agent.summary.txt` は失敗時の原因要約、再投入要否判断材料、主要 `output_refs` を含む調査用ログとして扱い、空ファイルまたは定型句のみを禁止する。
 - `orchestration agent` は `dependency.resolved.yaml` の `topo_level` と依存充足状態に基づいて起動順序を逐次決定する。
 - `substep` を持つ phase では `orchestration agent` が対象 `step` の `SKILL` を適用して `substep` を直接起動し、`step_result.json` を返却する。
 - `orchestration` の実行記録は `workspace/orchestrations/<orchestration_id>/` に保存し、`orchestration_meta.json` と `agent_graph.json` と `agent_runs.jsonl` を必須とする。
@@ -137,7 +139,7 @@
 - 各 `step` と各 `substep` が独立 `agent_run_id` を持ち、`parent_agent_run_id` で親子関係を追跡できる。
 - 各 `step` と各 `substep` の `context_id` が重複せず、全件で `context_isolated=true` が記録されている。
 - `workspace/orchestrations/<orchestration_id>/preflight.json` が存在し、`can_launch_step_agents=true` と `can_launch_substep_agents=true` を満たしている。
-- `agent_runs.jsonl` の `step` / `substep` ロールが `agent_session_id` と `launch_request_ref` と `launch_response_ref` を保持し、参照先ファイルが存在している。
+- `agent_runs.jsonl` の `step` / `substep` ロールが `agent_session_id` と `launch_request_ref` と `launch_response_ref` と `agent_result_ref` と `agent_summary_ref` を保持し、参照先ファイルが存在している。
 - `spec_kind` を問わない workflow 実行で各 `node_key` の個別 `plan_id` と個別 `pipeline_id` が発行されている。
 - 実行証跡から、`script` 一括実行ではなく `orchestration -> step` または `orchestration -> substep` の独立 `agent` 実行であることを確認できる。
 - 明示的な指定がない試行で、既存 workflow 出力の参照または閲覧が実施されていない。

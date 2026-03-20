@@ -181,6 +181,11 @@ def _child_dialog_refs(orchestration_id: str, agent_run_id: str) -> tuple[str, s
     return f"{prefix}.prompt.txt", f"{prefix}.reply.txt"
 
 
+def _agent_result_refs(orchestration_id: str, agent_run_id: str) -> tuple[str, str]:
+    prefix = f"workspace/orchestrations/{orchestration_id}/agents/{agent_run_id}/dialogs/agent"
+    return f"{prefix}.result.json", f"{prefix}.summary.txt"
+
+
 def _coerce_launch_text(value: Any) -> str | None:
     if value is None:
         return None
@@ -231,6 +236,53 @@ def _extract_launch_reply_text(response_payload: dict[str, Any]) -> str:
         if text is not None:
             return text
     return json.dumps(response_payload, ensure_ascii=False, indent=2)
+
+
+def _extract_agent_summary_text(payload: dict[str, Any]) -> str:
+    for key in (
+        "result_summary",
+        "summary",
+        "completion_message",
+        "final_message",
+        "message",
+        "reply",
+        "response_text",
+        "result",
+    ):
+        text = _coerce_launch_text(payload.get(key))
+        if text is not None:
+            return text
+
+    lines: list[str] = []
+    for key in (
+        "agent_run_id",
+        "agent_role",
+        "node_key",
+        "step",
+        "substep",
+        "status",
+        "agent_backend",
+        "agent_model",
+        "context_id",
+        "agent_session_id",
+        "started_at",
+        "finished_at",
+    ):
+        value = payload.get(key)
+        if value is None:
+            continue
+        lines.append(f"{key}: {value}")
+
+    output_refs = payload.get("output_refs")
+    if isinstance(output_refs, list) and output_refs:
+        lines.append("output_refs:")
+        for item in output_refs:
+            if isinstance(item, str) and item.strip():
+                lines.append(f"- {item.strip()}")
+
+    if lines:
+        return "\n".join(lines)
+    return json.dumps(payload, ensure_ascii=False, indent=2)
 
 
 def _split_skill_refs(value: Any) -> list[str]:
@@ -669,6 +721,14 @@ def record_agent_run(
         payload.setdefault("launch_response_ref", response_ref)
         payload.setdefault("launch_prompt_ref", prompt_ref)
         payload.setdefault("launch_reply_ref", reply_ref)
+
+    dialogs_root = root / "agents" / agent_run_id / "dialogs"
+    dialogs_root.mkdir(parents=True, exist_ok=True)
+    result_ref, summary_ref = _agent_result_refs(orchestration_id, agent_run_id)
+    payload.setdefault("agent_result_ref", result_ref)
+    payload.setdefault("agent_summary_ref", summary_ref)
+    _write_json(dialogs_root / "agent.result.json", payload)
+    _write_text(dialogs_root / "agent.summary.txt", _extract_agent_summary_text(payload))
 
     with runs_path.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
