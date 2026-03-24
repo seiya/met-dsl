@@ -72,6 +72,14 @@ repair_reason: none
 """
 
 
+def _spawn_response_payload(session_id: str) -> dict[str, object]:
+    return {
+        "agent_session_id": session_id,
+        "accepted": True,
+        "launch_reply": f"accepted: {session_id}",
+    }
+
+
 class _FakeCompletedProcess:
     def __init__(self, returncode: int, stdout: str = "", stderr: str = "") -> None:
         self.returncode = returncode
@@ -238,9 +246,7 @@ shell_tool                       stable             true
                 },
                 response_payload={
                     "agent_run_id": "substep_run_plan_generate_001",
-                    "agent_session_id": "sess_substep_plan_generate_001",
-                    "accepted": True,
-                    "launch_reply": "accepted: sess_substep_plan_generate_001",
+                    **_spawn_response_payload("sess_substep_plan_generate_001"),
                 },
             )
             record_launch(
@@ -269,9 +275,7 @@ shell_tool                       stable             true
                 },
                 response_payload={
                     "agent_run_id": "step_run_build_001",
-                    "agent_session_id": "sess_step_build_001",
-                    "accepted": True,
-                    "launch_reply": "accepted: sess_step_build_001",
+                    **_spawn_response_payload("sess_step_build_001"),
                 },
             )
 
@@ -562,10 +566,7 @@ shell_tool                       stable             true
                     "launch_prompt": "short summary",
                     "prompt": full_prompt,
                 },
-                response_payload={
-                    "agent_session_id": "sess_substep_plan_generate_001",
-                    "launch_reply": "accepted",
-                },
+                response_payload=_spawn_response_payload("sess_substep_plan_generate_001"),
             )
             prompt_path = (
                 repo_root
@@ -624,10 +625,7 @@ shell_tool                       stable             true
                     )
                     + "\n追加指示: 最詳細 prompt を保存すること。",
                 },
-                response_payload={
-                    "agent_session_id": "sess_substep_plan_generate_001",
-                    "launch_reply": "accepted",
-                },
+                response_payload=_spawn_response_payload("sess_substep_plan_generate_001"),
             )
             prompt_path = (
                 repo_root
@@ -690,10 +688,7 @@ shell_tool                       stable             true
                         ),
                     },
                 },
-                response_payload={
-                    "agent_session_id": "sess_substep_plan_generate_001",
-                    "launch_reply": "accepted",
-                },
+                response_payload=_spawn_response_payload("sess_substep_plan_generate_001"),
             )
             prompt_path = (
                 repo_root
@@ -752,7 +747,7 @@ shell_tool                       stable             true
                         "repair_reason": "none",
                         "launch_prompt_full": "Build step for node problem/shallow_water2d@0.3.0",
                     },
-                    response_payload={"launch_reply": "accepted"},
+                    response_payload=_spawn_response_payload("sess_step_build_001"),
                 )
 
     def test_record_launch_autofills_verify_required_resolved_artifacts(self) -> None:
@@ -789,7 +784,7 @@ shell_tool                       stable             true
                     "skill_ref": "skills/workflow-generate-verify/SKILL.md",
                     "skill_must_read_refs": "docs/WORKFLOW.md,workspace/pipelines/problem__shallow_water2d__0.3.0/pipeline_001/generate/gen_001/generate_meta.json",
                 },
-                response_payload={"launch_reply": "accepted"},
+                response_payload=_spawn_response_payload("sess_substep_run_generate_verify_001"),
             )
             request_payload = json.loads(
                 (repo_root / launch_refs["launch_request_ref"]).read_text(encoding="utf-8")
@@ -844,7 +839,7 @@ shell_tool                       stable             true
                             "substep_run_plan_generate_001",
                         ),
                     },
-                    response_payload={"launch_reply": "accepted"},
+                    response_payload=_spawn_response_payload("sess_substep_plan_generate_001"),
                 )
 
     def test_record_launch_autofills_prompt_and_skill_refs(self) -> None:
@@ -878,7 +873,7 @@ shell_tool                       stable             true
                     "pipeline_ref": "workspace/pipelines/problem__shallow_water2d__0.3.0/pipeline_001",
                     "dependency_ref": "workspace/plans/problem__shallow_water2d__0.3.0/plan_001/dependency.resolved.yaml",
                 },
-                response_payload={"launch_reply": "accepted"},
+                response_payload=_spawn_response_payload("sess_substep_run_plan_verify_001"),
             )
             request_path = repo_root / launch_refs["launch_request_ref"]
             prompt_path = repo_root / launch_refs["launch_prompt_ref"]
@@ -947,7 +942,7 @@ shell_tool                       stable             true
                     parent_agent_run_id="orch_run_001",
                     child_agent_run_id="substep_run_plan_verify_001",
                     request_payload={**payload, "launch_prompt_full": prompt},
-                    response_payload={"launch_reply": "accepted"},
+                    response_payload=_spawn_response_payload("sess_substep_run_plan_verify_001"),
                 )
 
     def test_rejects_pass_step_result_when_required_outputs_are_missing_from_substeps(self) -> None:
@@ -999,10 +994,7 @@ shell_tool                       stable             true
                         "substep_run_plan_generate_001",
                     ),
                 },
-                response_payload={
-                    "agent_session_id": "sess_substep_plan_generate_001",
-                    "launch_reply": "accepted",
-                },
+                response_payload=_spawn_response_payload("sess_substep_plan_generate_001"),
             )
             record_agent_run(
                 repo_root=repo_root,
@@ -1039,7 +1031,7 @@ shell_tool                       stable             true
                     },
                 )
 
-    def test_record_agent_run_writes_explicit_summary_when_provided(self) -> None:
+    def test_record_agent_run_writes_informative_summary_when_result_summary_is_provided(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
             init_orchestration(repo_root=repo_root, orchestration_id="orch_001")
@@ -1068,10 +1060,115 @@ shell_tool                       stable             true
                 },
             )
             summary_path = repo_root / payload["agent_summary_ref"]
-            self.assertEqual(
-                summary_path.read_text(encoding="utf-8").strip(),
-                "compile diagnostics show missing dependency metadata",
+            summary_text = summary_path.read_text(encoding="utf-8")
+            self.assertIn("status: fail", summary_text)
+            self.assertIn(
+                "result_summary: compile diagnostics show missing dependency metadata",
+                summary_text,
             )
+
+    def test_rejects_launch_response_without_child_agent_identifier(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            init_orchestration(repo_root=repo_root, orchestration_id="orch_001")
+            write_preflight(
+                repo_root=repo_root,
+                orchestration_id="orch_001",
+                payload={
+                    "status": "pass",
+                    "can_launch_step_agents": True,
+                    "can_launch_substep_agents": True,
+                    "feature_states": {"multi_agent": True},
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}],
+                },
+            )
+            with self.assertRaisesRegex(ValueError, "child agent identifier"):
+                record_launch(
+                    repo_root=repo_root,
+                    orchestration_id="orch_001",
+                    parent_agent_run_id="orch_run_001",
+                    child_agent_run_id="step_run_build_001",
+                    request_payload={
+                        "node_key": "problem/shallow_water2d@0.3.0",
+                        "step": "build",
+                        "orchestration_id": "orch_001",
+                        "agent_run_id": "step_run_build_001",
+                        "parent_agent_run_id": "orch_run_001",
+                        "plan_ref": "workspace/plans/problem__shallow_water2d__0.3.0/plan_001",
+                        "pipeline_ref": "workspace/pipelines/problem__shallow_water2d__0.3.0/pipeline_001",
+                        "dependency_ref": "workspace/plans/problem__shallow_water2d__0.3.0/plan_001/dependency.resolved.yaml",
+                        "skill_name": "workflow-build",
+                        "skill_ref": "skills/workflow-build/SKILL.md",
+                        "skill_must_read_refs": "docs/WORKFLOW.md,docs/ORCHESTRATION.md",
+                        "launch_prompt_full": _step_launch_prompt(
+                            "problem/shallow_water2d@0.3.0",
+                            "build",
+                            "step_run_build_001",
+                        ),
+                    },
+                    response_payload={"launch_reply": "accepted: missing-id"},
+                )
+
+    def test_rejects_agent_run_when_launch_response_session_id_differs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            init_orchestration(repo_root=repo_root, orchestration_id="orch_001")
+            write_preflight(
+                repo_root=repo_root,
+                orchestration_id="orch_001",
+                payload={
+                    "status": "pass",
+                    "can_launch_step_agents": True,
+                    "can_launch_substep_agents": True,
+                    "feature_states": {"multi_agent": True},
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}],
+                },
+            )
+            record_launch(
+                repo_root=repo_root,
+                orchestration_id="orch_001",
+                parent_agent_run_id="orch_run_001",
+                child_agent_run_id="step_run_build_001",
+                request_payload={
+                    "node_key": "problem/shallow_water2d@0.3.0",
+                    "step": "build",
+                    "orchestration_id": "orch_001",
+                    "agent_run_id": "step_run_build_001",
+                    "parent_agent_run_id": "orch_run_001",
+                    "plan_ref": "workspace/plans/problem__shallow_water2d__0.3.0/plan_001",
+                    "pipeline_ref": "workspace/pipelines/problem__shallow_water2d__0.3.0/pipeline_001",
+                    "dependency_ref": "workspace/plans/problem__shallow_water2d__0.3.0/plan_001/dependency.resolved.yaml",
+                    "skill_name": "workflow-build",
+                    "skill_ref": "skills/workflow-build/SKILL.md",
+                    "skill_must_read_refs": "docs/WORKFLOW.md,docs/ORCHESTRATION.md",
+                    "launch_prompt_full": _step_launch_prompt(
+                        "problem/shallow_water2d@0.3.0",
+                        "build",
+                        "step_run_build_001",
+                    ),
+                },
+                response_payload=_spawn_response_payload("sess_step_build_001"),
+            )
+            with self.assertRaisesRegex(ValueError, "agent_session_id must match"):
+                record_agent_run(
+                    repo_root=repo_root,
+                    orchestration_id="orch_001",
+                    payload={
+                        "agent_run_id": "step_run_build_001",
+                        "agent_role": "step",
+                        "parent_agent_run_id": "orch_run_001",
+                        "step": "build",
+                        "node_key": "problem/shallow_water2d@0.3.0",
+                        "status": "pass",
+                        "agent_backend": "openai_responses",
+                        "agent_model": "gpt-5-codex",
+                        "context_id": "ctx_step_build_001",
+                        "agent_session_id": "sess_step_build_999",
+                        "output_refs": [
+                            "workspace/pipelines/problem__shallow_water2d__0.3.0/pipeline_001/build/build_001/bin/simulate"
+                        ],
+                    },
+                )
 
     def test_rejects_duplicate_agent_run_id(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1126,7 +1223,7 @@ shell_tool                       stable             true
                     parent_agent_run_id="orch_run_001",
                     child_agent_run_id="step_run_plan_001",
                     request_payload={"step": "plan"},
-                    response_payload={"accepted": True},
+                    response_payload=_spawn_response_payload("sess_step_plan_001"),
                 )
 
     def test_rejects_step_agent_run_when_preflight_cannot_launch_agents(self) -> None:
@@ -1233,7 +1330,7 @@ shell_tool                       stable             true
                             "substep_run_plan_generate_001",
                         ),
                     },
-                    response_payload={"launch_reply": "accepted"},
+                    response_payload=_spawn_response_payload("sess_substep_plan_generate_001"),
                 )
                 self.assertEqual(probe_mock.call_count, 1)
 
@@ -1290,10 +1387,7 @@ shell_tool                       stable             true
                             "step_run_build_001",
                         ),
                     },
-                    response_payload={
-                        "agent_session_id": "sess_step_build_001",
-                        "launch_reply": "accepted",
-                    },
+                    response_payload=_spawn_response_payload("sess_step_build_001"),
                 )
                 record_agent_run(
                     repo_root=repo_root,
@@ -1380,7 +1474,7 @@ shell_tool                       stable             true
                         "step_run_build_001",
                     ),
                 },
-                response_payload={"launch_reply": "accepted"},
+                response_payload=_spawn_response_payload("sess_step_build_001"),
             )
             with self.assertRaisesRegex(RuntimeError, "child_agent_run_id missing from agent_runs.jsonl"):
                 update_orchestration_status(

@@ -60,6 +60,15 @@ skill_must_read_refs: docs/WORKFLOW.md,docs/ORCHESTRATION.md
 """
 
 
+def _spawn_response_payload(session_id: str, launch_reply: str) -> dict[str, object]:
+    return {
+        "accepted": True,
+        "agent_session_id": session_id,
+        "launch_reply_ref": "",
+        "launch_reply": launch_reply,
+    }
+
+
 def _create_minimal_execution_tree(
     repo_root: Path,
     *,
@@ -434,9 +443,11 @@ def _create_minimal_orchestration_tree(
             launches_root / f"{step_ids[step]}.response.json",
             {
                 "agent_run_id": step_ids[step],
-                "accepted": True,
+                **_spawn_response_payload(
+                    f"sess_step_{step}",
+                    f"accepted: sess_step_{step}",
+                ),
                 "launch_reply_ref": step_reply_ref,
-                "launch_reply": f"accepted step {step}",
             },
         )
         (launches_root / f"{step_ids[step]}.prompt.txt").write_text(
@@ -444,7 +455,7 @@ def _create_minimal_orchestration_tree(
             encoding="utf-8",
         )
         (launches_root / f"{step_ids[step]}.reply.txt").write_text(
-            f"accepted step {step}\n",
+            f"accepted: sess_step_{step}\n",
             encoding="utf-8",
         )
         step_agent_dir = orchestration_root / "agents" / step_ids[step] / "dialogs"
@@ -473,8 +484,19 @@ def _create_minimal_orchestration_tree(
             "finished_at": "2026-03-01T00:01:10Z",
         }
         _write_json(step_agent_dir / "agent.result.json", step_payload)
+        _write_json(
+            step_agent_dir / "child.response.json",
+            {
+                "agent_run_id": step_ids[step],
+                **_spawn_response_payload(
+                    f"sess_step_{step}",
+                    f"accepted: sess_step_{step}",
+                ),
+                "launch_reply_ref": step_reply_ref,
+            },
+        )
         (step_agent_dir / "agent.summary.txt").write_text(
-            f"agent_run_id: {step_ids[step]}\nstatus: pass\n",
+            f"agent_run_id: {step_ids[step]}\nstatus: pass\noutput_refs:\n- workspace/pipelines/{node_safe}/pipeline_step_{step}\n",
             encoding="utf-8",
         )
         run_items.append(step_payload)
@@ -499,9 +521,11 @@ def _create_minimal_orchestration_tree(
                 launches_root / f"{substep_id}.response.json",
                 {
                     "agent_run_id": substep_id,
-                    "accepted": True,
+                    **_spawn_response_payload(
+                        f"sess_substep_{step}_{idx}",
+                        f"accepted: sess_substep_{step}_{idx}",
+                    ),
                     "launch_reply_ref": substep_reply_ref,
-                    "launch_reply": f"accepted substep {step} part {idx}",
                 },
             )
             (launches_root / f"{substep_id}.prompt.txt").write_text(
@@ -516,7 +540,7 @@ def _create_minimal_orchestration_tree(
                 encoding="utf-8",
             )
             (launches_root / f"{substep_id}.reply.txt").write_text(
-                f"accepted substep {step} part {idx}\n",
+                f"accepted: sess_substep_{step}_{idx}\n",
                 encoding="utf-8",
             )
 
@@ -547,8 +571,19 @@ def _create_minimal_orchestration_tree(
                 "finished_at": "2026-03-01T00:00:50Z",
             }
             _write_json(substep_agent_dir / "agent.result.json", substep_payload)
+            _write_json(
+                substep_agent_dir / "child.response.json",
+                {
+                    "agent_run_id": substep_id,
+                    **_spawn_response_payload(
+                        f"sess_substep_{step}_{idx}",
+                        f"accepted: sess_substep_{step}_{idx}",
+                    ),
+                    "launch_reply_ref": substep_reply_ref,
+                },
+            )
             (substep_agent_dir / "agent.summary.txt").write_text(
-                f"agent_run_id: {substep_id}\nstatus: pass\n",
+                f"agent_run_id: {substep_id}\nstatus: pass\noutput_refs:\n- workspace/plans/{node_safe}/plan_{step}_{idx}\n",
                 encoding="utf-8",
             )
             run_items.append(substep_payload)
@@ -2341,6 +2376,240 @@ end program shallow_water2d_runner
             )
             self.assertTrue(
                 any("missing launch_prompt_ref for step" in v for v in violations)
+            )
+
+    def test_detects_missing_child_agent_identifier_in_launch_response(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            model_text = """module shallow_water2d_model
+use dynamics_shallow_water_flux_2d_rusanov_p0_model
+implicit none
+contains
+subroutine solve(flag)
+  logical, intent(out) :: flag
+  call dynamics_shallow_water_flux_2d_rusanov_p0__compute_flux(flag)
+end subroutine solve
+end module shallow_water2d_model
+"""
+            runner_text = """program shallow_water2d_runner
+implicit none
+write(*,*) 'ok'
+end program shallow_water2d_runner
+"""
+            _create_minimal_execution_tree(
+                repo_root,
+                dep_spec_id="dynamics_shallow_water_flux_2d_rusanov_p0",
+                model_text=model_text,
+                runner_text=runner_text,
+                run_command=["./simulate", "workspace/case.resolved.yaml", "workspace/outdir"],
+            )
+            _create_minimal_orchestration_tree(repo_root)
+
+            response_path = (
+                repo_root
+                / "workspace"
+                / "orchestrations"
+                / "orch_test_001"
+                / "launches"
+                / "step_run_build_001.response.json"
+            )
+            payload = json.loads(response_path.read_text(encoding="utf-8"))
+            payload.pop("agent_session_id", None)
+            _write_json(response_path, payload)
+
+            child_response_path = (
+                repo_root
+                / "workspace"
+                / "orchestrations"
+                / "orch_test_001"
+                / "agents"
+                / "step_run_build_001"
+                / "dialogs"
+                / "child.response.json"
+            )
+            _write_json(child_response_path, payload)
+
+            violations = validate(
+                repo_root=repo_root,
+                workspace_root="workspace",
+                require_orchestration=True,
+            )
+            self.assertTrue(
+                any("child agent identifier missing from launch response" in v for v in violations)
+            )
+
+    def test_detects_mismatched_agent_session_id_against_launch_response(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            model_text = """module shallow_water2d_model
+use dynamics_shallow_water_flux_2d_rusanov_p0_model
+implicit none
+contains
+subroutine solve(flag)
+  logical, intent(out) :: flag
+  call dynamics_shallow_water_flux_2d_rusanov_p0__compute_flux(flag)
+end subroutine solve
+end module shallow_water2d_model
+"""
+            runner_text = """program shallow_water2d_runner
+implicit none
+write(*,*) 'ok'
+end program shallow_water2d_runner
+"""
+            _create_minimal_execution_tree(
+                repo_root,
+                dep_spec_id="dynamics_shallow_water_flux_2d_rusanov_p0",
+                model_text=model_text,
+                runner_text=runner_text,
+                run_command=["./simulate", "workspace/case.resolved.yaml", "workspace/outdir"],
+            )
+            _create_minimal_orchestration_tree(repo_root)
+
+            runs_path = (
+                repo_root
+                / "workspace"
+                / "orchestrations"
+                / "orch_test_001"
+                / "agent_runs.jsonl"
+            )
+            items = [
+                json.loads(line)
+                for line in runs_path.read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+            for item in items:
+                if item.get("agent_run_id") == "step_run_build_001":
+                    item["agent_session_id"] = "sess_step_build_mismatch"
+                    break
+            runs_path.write_text(
+                "\n".join(json.dumps(item, ensure_ascii=False) for item in items) + "\n",
+                encoding="utf-8",
+            )
+
+            violations = validate(
+                repo_root=repo_root,
+                workspace_root="workspace",
+                require_orchestration=True,
+            )
+            self.assertTrue(
+                any("child agent identifier must equal agent_runs agent_session_id" in v for v in violations)
+            )
+
+    def test_detects_uninformative_agent_summary_when_required(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            model_text = """module shallow_water2d_model
+use dynamics_shallow_water_flux_2d_rusanov_p0_model
+implicit none
+contains
+subroutine solve(flag)
+  logical, intent(out) :: flag
+  call dynamics_shallow_water_flux_2d_rusanov_p0__compute_flux(flag)
+end subroutine solve
+end module shallow_water2d_model
+"""
+            runner_text = """program shallow_water2d_runner
+implicit none
+write(*,*) 'ok'
+end program shallow_water2d_runner
+"""
+            _create_minimal_execution_tree(
+                repo_root,
+                dep_spec_id="dynamics_shallow_water_flux_2d_rusanov_p0",
+                model_text=model_text,
+                runner_text=runner_text,
+                run_command=["./simulate", "workspace/case.resolved.yaml", "workspace/outdir"],
+            )
+            _create_minimal_orchestration_tree(repo_root)
+
+            summary_path = (
+                repo_root
+                / "workspace"
+                / "orchestrations"
+                / "orch_test_001"
+                / "agents"
+                / "step_run_build_001"
+                / "dialogs"
+                / "agent.summary.txt"
+            )
+            summary_path.write_text("pass\n", encoding="utf-8")
+
+            violations = validate(
+                repo_root=repo_root,
+                workspace_root="workspace",
+                require_orchestration=True,
+            )
+            self.assertTrue(
+                any("agent.summary.txt must include status and output_refs or failure reason" in v for v in violations)
+            )
+
+    def test_detects_fabricated_orchestration_pattern_with_generic_launch_reply_and_sequential_ids(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            model_text = """module shallow_water2d_model
+use dynamics_shallow_water_flux_2d_rusanov_p0_model
+implicit none
+contains
+subroutine solve(flag)
+  logical, intent(out) :: flag
+  call dynamics_shallow_water_flux_2d_rusanov_p0__compute_flux(flag)
+end subroutine solve
+end module shallow_water2d_model
+"""
+            runner_text = """program shallow_water2d_runner
+implicit none
+write(*,*) 'ok'
+end program shallow_water2d_runner
+"""
+            _create_minimal_execution_tree(
+                repo_root,
+                dep_spec_id="dynamics_shallow_water_flux_2d_rusanov_p0",
+                model_text=model_text,
+                runner_text=runner_text,
+                run_command=["./simulate", "workspace/case.resolved.yaml", "workspace/outdir"],
+            )
+            _create_minimal_orchestration_tree(repo_root)
+
+            orch_root = repo_root / "workspace" / "orchestrations" / "orch_test_001"
+            response_path = orch_root / "launches" / "step_run_build_001.response.json"
+            response_payload = json.loads(response_path.read_text(encoding="utf-8"))
+            response_payload["agent_session_id"] = "session_1_1"
+            response_payload["launch_reply"] = "problem/shallow_water2d@0.3.0 build step launched."
+            _write_json(response_path, response_payload)
+            _write_json(
+                orch_root / "agents" / "step_run_build_001" / "dialogs" / "child.response.json",
+                response_payload,
+            )
+
+            runs_path = orch_root / "agent_runs.jsonl"
+            items = [
+                json.loads(line)
+                for line in runs_path.read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+            for item in items:
+                if item.get("agent_run_id") == "step_run_build_001":
+                    item["agent_session_id"] = "session_1_1"
+                    item["context_id"] = "ctx_1_1"
+                    break
+            runs_path.write_text(
+                "\n".join(json.dumps(item, ensure_ascii=False) for item in items) + "\n",
+                encoding="utf-8",
+            )
+
+            violations = validate(
+                repo_root=repo_root,
+                workspace_root="workspace",
+                require_orchestration=True,
+            )
+            self.assertTrue(
+                any("launch_reply must not be generic launched-only text" in v for v in violations)
+            )
+            self.assertTrue(
+                any("agent_session_id must not be sequential placeholder" in v for v in violations)
+            )
+            self.assertTrue(
+                any("context_id must not be sequential placeholder" in v for v in violations)
             )
 
     def test_accepts_algorithm_contract_yaml_artifact(self) -> None:

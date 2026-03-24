@@ -95,6 +95,55 @@ SUBSTEP_WORKFLOW_STEPS = frozenset({"plan", "generate", "tune"})
 AGENT_TERMINAL_STATUSES = {"pass", "fail", "blocked", "timeout", "cancel"}
 
 
+def _extract_launch_response_agent_session_id(payload: dict[str, Any]) -> str | None:
+    candidate_paths: tuple[tuple[str, ...], ...] = (
+        ("agent_session_id",),
+        ("agent_id",),
+        ("session_id",),
+        ("child_agent_id",),
+        ("child_agent_session_id",),
+        ("id",),
+        ("agent", "id"),
+        ("agent", "session_id"),
+        ("child_agent", "id"),
+        ("child_agent", "session_id"),
+        ("data", "id"),
+        ("data", "session_id"),
+    )
+    for path in candidate_paths:
+        current: Any = payload
+        for key in path:
+            if not isinstance(current, dict):
+                current = None
+                break
+            current = current.get(key)
+        if isinstance(current, str) and current.strip():
+            return current.strip()
+    return None
+
+
+def _is_sequential_agent_token(value: str) -> bool:
+    token = value.strip()
+    if not token:
+        return False
+    return bool(re.fullmatch(r"(?:ctx|session)_[0-9]+(?:_[0-9]+)*", token))
+
+
+def _has_informative_agent_summary(text: str) -> bool:
+    non_empty_lines = [line.strip() for line in text.splitlines() if line.strip()]
+    if len(non_empty_lines) < 2:
+        return False
+    if not any(line.startswith("status: ") for line in non_empty_lines):
+        return False
+    if any(line == "output_refs:" for line in non_empty_lines):
+        return True
+    return any(
+        line.startswith(prefix)
+        for prefix in ("result_summary: ", "summary: ", "reason: ", "failure_reason: ")
+        for line in non_empty_lines
+    )
+
+
 def _required_launch_prompt_markers_for_role(
     role: str,
 ) -> list[str]:
@@ -3535,6 +3584,10 @@ def _validate_orchestration_hierarchy(
                         violations.append(
                             f"{runs_path}:line {idx + 1} missing agent_session_id for {role_l}"
                         )
+                    elif _is_sequential_agent_token(agent_session_id):
+                        violations.append(
+                            f"{runs_path}:line {idx + 1} agent_session_id must not be sequential placeholder ({agent_session_id})"
+                        )
 
                     expected_launch_prefix = (
                         f"workspace/orchestrations/{orchestration_dir.name}/launches/"
@@ -3642,6 +3695,10 @@ def _validate_orchestration_hierarchy(
                                 violations.append(
                                     f"{runs_path}:line {idx + 1} {key} target must be non-empty ({ref_token})"
                                 )
+                            elif not _has_informative_agent_summary(summary_text):
+                                violations.append(
+                                    f"{runs_path}:line {idx + 1} agent.summary.txt must include status and output_refs or failure reason"
+                                )
 
                     request_ref = launch_refs.get("launch_request_ref")
                     prompt_ref = launch_refs.get("launch_prompt_ref")
@@ -3686,6 +3743,22 @@ def _validate_orchestration_hierarchy(
                                         f"{response_path}: launch response must be json object"
                                     )
                                 else:
+                                    launch_session_id = _extract_launch_response_agent_session_id(
+                                        response_payload
+                                    )
+                                    if launch_session_id is None:
+                                        violations.append(
+                                            f"{response_path}: child agent identifier missing from launch response"
+                                        )
+                                    else:
+                                        if (
+                                            isinstance(agent_session_id, str)
+                                            and agent_session_id.strip()
+                                            and agent_session_id.strip() != launch_session_id
+                                        ):
+                                            violations.append(
+                                                f"{response_path}: child agent identifier must equal agent_runs agent_session_id ({agent_session_id})"
+                                            )
                                     payload_reply_ref = response_payload.get("launch_reply_ref")
                                     if (
                                         not isinstance(payload_reply_ref, str)
@@ -3694,6 +3767,42 @@ def _validate_orchestration_hierarchy(
                                         violations.append(
                                             f"{response_path}:launch_reply_ref must equal agent_runs launch_reply_ref ({reply_ref})"
                                         )
+                                    launch_reply = response_payload.get("launch_reply")
+                                    if (
+                                        isinstance(launch_reply, str)
+                                        and re.fullmatch(r"[^\n]+ launched\.", launch_reply.strip()) is not None
+                                    ):
+                                        violations.append(
+                                            f"{response_path}: launch_reply must not be generic launched-only text"
+                                        )
+
+                                    child_response_path = (
+                                        workspace_path.parent
+                                        / expected_agent_prefix
+                                        / "child.response.json"
+                                    )
+                                    if not child_response_path.exists():
+                                        violations.append(
+                                            f"{child_response_path}: missing"
+                                        )
+                                    else:
+                                        try:
+                                            child_response_payload = _read_json(child_response_path)
+                                        except json.JSONDecodeError:
+                                            violations.append(
+                                                f"{child_response_path}: launch response must be valid json object"
+                                            )
+                                        else:
+                                            if child_response_payload != response_payload:
+                                                violations.append(
+                                                    f"{child_response_path}: must equal launches response payload"
+                                                )
+
+                    context_id = item.get("context_id")
+                    if isinstance(context_id, str) and _is_sequential_agent_token(context_id):
+                        violations.append(
+                            f"{runs_path}:line {idx + 1} context_id must not be sequential placeholder ({context_id})"
+                        )
 
         for edge_idx, parent_id, child_id in graph_edges:
             parent_role = run_roles.get(parent_id)

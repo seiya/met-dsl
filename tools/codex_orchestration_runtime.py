@@ -410,6 +410,42 @@ def _extract_launch_reply_text(response_payload: dict[str, Any]) -> str:
     return json.dumps(response_payload, ensure_ascii=False, indent=2)
 
 
+def _extract_response_agent_session_id(response_payload: dict[str, Any]) -> str | None:
+    candidate_paths: tuple[tuple[str, ...], ...] = (
+        ("agent_session_id",),
+        ("agent_id",),
+        ("session_id",),
+        ("child_agent_id",),
+        ("child_agent_session_id",),
+        ("id",),
+        ("agent", "id"),
+        ("agent", "session_id"),
+        ("child_agent", "id"),
+        ("child_agent", "session_id"),
+        ("data", "id"),
+        ("data", "session_id"),
+    )
+    for path in candidate_paths:
+        current: Any = response_payload
+        for key in path:
+            if not isinstance(current, dict):
+                current = None
+                break
+            current = current.get(key)
+        if isinstance(current, str) and current.strip():
+            return current.strip()
+    return None
+
+
+def _validate_response_agent_session_id(response_payload: dict[str, Any]) -> str:
+    session_id = _extract_response_agent_session_id(response_payload)
+    if session_id is None:
+        raise ValueError("launch response must include child agent identifier from spawn_agent")
+    if _is_placeholder_ref(session_id):
+        raise ValueError("launch response child agent identifier must not contain placeholder tokens")
+    return session_id
+
+
 def _required_launch_prompt_markers(request_payload: dict[str, Any]) -> list[str]:
     step = request_payload.get("step")
     if not isinstance(step, str) or not step.strip():
@@ -470,20 +506,6 @@ def _validate_launch_prompt_text(request_payload: dict[str, Any], prompt_text: s
 
 
 def _extract_agent_summary_text(payload: dict[str, Any]) -> str:
-    for key in (
-        "result_summary",
-        "summary",
-        "completion_message",
-        "final_message",
-        "message",
-        "reply",
-        "response_text",
-        "result",
-    ):
-        text = _coerce_launch_text(payload.get(key))
-        if text is not None:
-            return text
-
     lines: list[str] = []
     for key in (
         "agent_run_id",
@@ -498,6 +520,7 @@ def _extract_agent_summary_text(payload: dict[str, Any]) -> str:
         "agent_session_id",
         "started_at",
         "finished_at",
+        "result_summary",
     ):
         value = payload.get(key)
         if value is None:
@@ -514,6 +537,36 @@ def _extract_agent_summary_text(payload: dict[str, Any]) -> str:
     if lines:
         return "\n".join(lines)
     return json.dumps(payload, ensure_ascii=False, indent=2)
+
+
+def _validate_agent_summary_text(payload: dict[str, Any], summary_text: str) -> None:
+    text = summary_text.strip()
+    if not text:
+        raise ValueError("agent.summary.txt must be non-empty")
+    non_empty_lines = [line.strip() for line in text.splitlines() if line.strip()]
+    if len(non_empty_lines) < 2:
+        raise ValueError("agent.summary.txt must not be single-line summary")
+
+    status = payload.get("status")
+    if isinstance(status, str) and status.strip():
+        marker = f"status: {status.strip()}"
+        if marker not in text:
+            raise ValueError("agent.summary.txt must include final status line")
+
+    agent_role = payload.get("agent_role")
+    if isinstance(agent_role, str) and agent_role.strip().lower() == "orchestration":
+        return
+
+    output_refs = payload.get("output_refs")
+    if isinstance(output_refs, list) and any(isinstance(item, str) and item.strip() for item in output_refs):
+        if "output_refs:" not in text:
+            raise ValueError("agent.summary.txt must include output_refs section for pass result")
+    elif (
+        isinstance(status, str)
+        and status.strip().lower() in TERMINAL_STATUSES
+        and not any(token in text for token in ("result_summary:", "summary:", "reason:", "failure_reason:"))
+    ):
+        raise ValueError("agent.summary.txt must include summary or failure reason")
 
 
 def _split_skill_refs(value: Any) -> list[str]:
@@ -949,6 +1002,8 @@ def record_launch(
     request_payload.setdefault("parent_agent_run_id", parent_agent_run_id)
     request_payload = prepare_launch_request_payload(request_payload)
     response_payload = dict(response_payload)
+    response_agent_session_id = _validate_response_agent_session_id(response_payload)
+    response_payload.setdefault("agent_session_id", response_agent_session_id)
 
     _validate_launch_request_payload(request_payload)
 
@@ -1075,14 +1130,28 @@ def record_agent_run(
         payload.setdefault("launch_prompt_ref", prompt_ref)
         payload.setdefault("launch_reply_ref", reply_ref)
         _validate_step_or_substep_launch_refs(repo_root, payload)
+        launch_response_path = repo_root / payload["launch_response_ref"]
+        launch_response_payload = _read_json(launch_response_path)
+        if not isinstance(launch_response_payload, dict):
+            raise ValueError("launch response must be json object")
+        response_agent_session_id = _validate_response_agent_session_id(launch_response_payload)
+        payload_agent_session_id = payload.get("agent_session_id")
+        if not isinstance(payload_agent_session_id, str) or not payload_agent_session_id.strip():
+            raise ValueError("agent_session_id must be non-empty string")
+        if payload_agent_session_id.strip() != response_agent_session_id:
+            raise ValueError(
+                "agent_session_id must match child agent identifier in launch response"
+            )
 
     dialogs_root = root / "agents" / agent_run_id / "dialogs"
     dialogs_root.mkdir(parents=True, exist_ok=True)
     result_ref, summary_ref = _agent_result_refs(orchestration_id, agent_run_id)
     payload.setdefault("agent_result_ref", result_ref)
     payload.setdefault("agent_summary_ref", summary_ref)
+    summary_text = _extract_agent_summary_text(payload)
+    _validate_agent_summary_text(payload, summary_text)
     _write_json(dialogs_root / "agent.result.json", payload)
-    _write_text(dialogs_root / "agent.summary.txt", _extract_agent_summary_text(payload))
+    _write_text(dialogs_root / "agent.summary.txt", summary_text)
 
     with runs_path.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
