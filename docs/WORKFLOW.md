@@ -352,6 +352,7 @@ workspace/
 - `Generate verify` は `algorithm.resolved.yaml` に記載されていない追加演算、追加反復、追加条件分岐、追加依存 `operation` 呼び出しを生成コードが導入していないことを検証しなければならない。`controlled_spec.md` 由来情報の推測再導入や、`resolved artifact` に存在しない実行経路を検出した場合は `fail` とする。
 - `Generate verify` は `model` 出力と無関係な定数出力、固定 `JSON` 出力、解析式直接代入による `diagnostics` 生成を検出した場合に `fail` とする。
 - `Generate verify` は、`intent(out)` 変数の最終式木が `derived_contract.json` の `semantic_dependency.required_sources` と `io_contract.outputs` で宣言された出力変数群へ到達することを検証しなければならない。
+- `Generate verify` は `derived_contract.json` の `raw_requirements.required_evidence` と `test_evidence_requirements` を `runner` の raw evidence 出力設計と照合し、全 `test_id` ごとに Judge 再計算に必要な raw evidence が保持されることを検証しなければならない。`runner` が suite 全体 summary のみを書き出す構成、複数 `test` の一次証跡を 1 件へ上書き集約する構成、`required_raw_variables` の欠落を検出した場合は `fail` とする。
 - `Generate verify` は、`spec` の目的に依存しない固定計算様式（例: 常に `flux` や常に時刻積分）を一律必須にしてはならない。判定は `derived_contract.json` の要求計算種別に基づいて実施しなければならない。
 - `Generate verify` は `impl.resolved.yaml` の `target.class` と `target.backend` と `target.architecture` と `toolchain.language` と `toolchain.standard` と `toolchain.build_system` と `selected.backend_key` が、生成されたソース構成と `build` 用 artifact に反映されていることを検証しなければならない。言語不一致、`build_system` 不一致、未選択 backend の code path 出力、`selected.backend_key` 未反映を検出した場合は `fail` とする。
 - `Generate verify` は `impl.resolved.yaml` の `abstract` と `backend_overrides` で指定された並列化、レイアウト、融合、タイル、ベクトル化、非同期化などの実行アルゴリズム選択が、対象言語と target で表現可能な範囲で生成コードまたは `build` 設定へ反映されていることを検証しなければならない。指定済み knob の無視、禁止 target 向け最適化の混入、`target.class=cpu` の既定 `OpenMP` 規則違反を検出した場合は `fail` とする。
@@ -393,6 +394,8 @@ workspace/
 - `raw_requirements.required_evidence` が `artifact=state_snapshots` を必須宣言しない場合、`raw/state_snapshots/` を必須にしてはならない。スカラー目的 `spec` を含む任意の計算課題を許容しなければならない。
 - `python3 tools/validate_pipeline_semantics.py` は `derived_contract.json` で宣言された `state_snapshots` の変数名と形状式、および `time_variable` の形状式が `raw/state_snapshots/snapshot_schema.json` と各 `snapshot*.json` に一致することを検証しなければならない。
 - `raw/metrics_basis.json` は一次証跡のみを保持し、`diagnostics.json` の複写を禁止する。
+- `raw/metrics_basis.json` は `test_evidence_requirements` の全 `test_id` を対象とする per-test evidence index を保持しなければならない。各 `test_id` の entry は `required_raw_variables` を欠落なく保持し、suite 全体 summary のみで代替してはならない。
+- 同一 `metrics_basis.json` 内で異なる `test_id` の一次証跡を相互上書きしてはならない。単一の最後勝ち `case` 結果で複数 `test` の raw evidence を代表させる構成を禁止する。
 - `Build` または `Execute` が失敗した場合、`diagnostics.json` / `perf.json` の人工生成を禁止し、当該 `node` を `fail` とする。
 - `quality_check.json` は `checks.verdict_available=true` と `checks.diagnostics_match=true` と `checks.verdict_match=true` を同時に満たさなければならない。いずれかが `false` または欠落の場合は `Execute fail` とする。
 - `quality check` 実行は `run_quality_checks` の `preset` 指定のみを許可し、`python3 quality_check.py` など任意コマンド実行を禁止する。
@@ -410,6 +413,7 @@ workspace/
 - `Judge` 開始条件は、対象 `execution_id` 配下に `run_program` 実行記録と `diagnostics.json` と `perf.json` と `raw/` 一次証跡が存在し、同一 `execution_id` artifact として追跡可能であることとする。
 - `Judge` は `raw/` 一次証跡から独立経路で判定指標を再計算し、`diagnostics.json` と整合確認しなければならない。
 - `Judge` 再計算入力は `raw/` のみに限定する。`diagnostics.json` を再計算入力へ流用してはならない。
+- `Judge` は `raw/metrics_basis.json` が `test_evidence_requirements` の全 `test_id` を保持し、各 entry が当該 `test_id` の `required_raw_variables` を欠落なく保持していることを開始条件として検証しなければならない。不足時は `Judge fail` とする。
 - `Judge` は再計算不能または不整合時に `fail` としなければならない。
 - `Judge` は固定スクリプト検査に加え、`LLM` による意味検査を必須実行し、`model` / `runner` / `raw` 一次証跡の整合性と捏造疑義を判定しなければならない。
 - `LLM` 意味検査の結果は `semantic_review.json` として `execution_id/<node_key>/` 配下へ保存し、`review_method`、`decision`、`scope.model_ref`、`scope.runner_ref`、`scope.raw_refs`、`findings` を必須記録とする。

@@ -127,6 +127,7 @@
 - `python` 実行時の `__pycache__` 出力先が `workspace/` 配下に限定されている。
 - `derived_contract.json` の `semantic_dependency.required_sources` に基づく `Generate verify` 判定が実施されている。
 - `algorithm.resolved.yaml` の `steps` と `ordering` と `control_condition` と `iteration_contract` に基づく `Generate verify` 判定が実施されている。
+- `Generate verify` が `runner` の raw evidence 出力設計と `derived_contract.json` の `raw_requirements.required_evidence` / `test_evidence_requirements` を照合し、Judge 再計算に必要な per-test evidence を静的に確認している。
 - `raw` の必須構成が `derived_contract.json` の `raw_requirements.required_evidence` と一致している。
 - `raw/state_snapshots` の各 `snapshot*.json` が `derived_contract.json` の `schema` で宣言された変数名とサイズを満たしている。
 - `LLM` 利用ステージのメタデータで `verification_status` が `pass` である。
@@ -165,6 +166,7 @@
 - `runner` が `verdict.json` / `aggregate_verdict.json` / `summary.json` / `trial_meta.json` を書き込んでいない。
 - `execution_id/<node_key>/raw/` が存在し、`Judge` 再計算に必要なファイルが揃っている。
 - `raw/metrics_basis.json` が `diagnostics.json` の複写ではなく、一次証跡から構成されている。
+- `raw/metrics_basis.json` が `test_evidence_requirements` の全 `test_id` を対象とする per-test evidence index を保持し、各 `test_id` の `required_raw_variables` を欠落なく記録している。
 - workflow ルート判定が `workspace/` のみに対して実施されている。
 - `python3 tools/validate_workspace_root.py` が `PASS` を返している。
 - `python3 tools/validate_pipeline_semantics.py` が `PASS` を返している。

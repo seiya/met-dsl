@@ -73,6 +73,7 @@ def _create_minimal_execution_tree(
     derived_contract: dict[str, object] | None = None,
     dependency_resolved: dict[str, object] | None = None,
     impl_resolved: dict[str, object] | None = None,
+    metrics_basis: object | None = None,
 ) -> None:
     workspace = repo_root / "workspace"
     node_safe = "problem__shallow_water2d__0.3.0"
@@ -230,7 +231,9 @@ def _create_minimal_execution_tree(
             },
         },
     )
-    _write_json(raw_dir / "metrics_basis.json", {"basis": 2.0})
+    if metrics_basis is None:
+        metrics_basis = {"basis": 2.0}
+    _write_json(raw_dir / "metrics_basis.json", metrics_basis)
     _write_json(raw_dir / "execution_trace.json", {"trace": ["step1", "step2"]})
     _write_json(
         snapshots_dir / "snapshot_schema.json",
@@ -1866,6 +1869,193 @@ end program shallow_water2d_runner
             violations = validate(repo_root=repo_root, workspace_root="workspace")
             self.assertTrue(
                 any("test_evidence_requirements must be non-empty list" in v for v in violations)
+            )
+
+    def test_detects_metrics_basis_without_per_test_evidence_index(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            tests_path = (
+                repo_root
+                / "spec"
+                / "problem"
+                / "mock_domain"
+                / "mock_family"
+                / "mock_spec"
+                / "tests.md"
+            )
+            tests_path.parent.mkdir(parents=True, exist_ok=True)
+            tests_path.write_text(
+                "## 7. テスト定義\n"
+                "### 7-1. `test_a`\n"
+                "### 7-2. `test_b`\n",
+                encoding="utf-8",
+            )
+            model_text = """module shallow_water2d_model
+use dynamics_shallow_water_flux_2d_rusanov_p0_model
+implicit none
+contains
+subroutine solve(flag)
+  logical, intent(out) :: flag
+  call dynamics_shallow_water_flux_2d_rusanov_p0__compute_flux(flag)
+end subroutine solve
+end module shallow_water2d_model
+"""
+            runner_text = """program shallow_water2d_runner
+implicit none
+write(*,*) 'ok'
+end program shallow_water2d_runner
+"""
+            _create_minimal_execution_tree(
+                repo_root,
+                dep_spec_id="dynamics_shallow_water_flux_2d_rusanov_p0",
+                model_text=model_text,
+                runner_text=runner_text,
+                run_command=["./simulate", "workspace/case.resolved.yaml", "workspace/outdir"],
+                derived_contract={
+                    "source": {"tests": "spec/problem/mock_domain/mock_family/mock_spec/tests.md"},
+                    "io_contract": {
+                        "inputs": [{"name": "case_resolved", "source": "case.resolved.yaml"}],
+                        "outputs": [
+                            {
+                                "name": "metric",
+                                "shape_expr": "scalar",
+                                "evidence_ref": "raw/metrics_basis.json",
+                                "raw_variables": ["h", "time"],
+                            }
+                        ],
+                    },
+                    "semantic_dependency": {"required_sources": []},
+                    "raw_requirements": {
+                        "required_evidence": [
+                            {"artifact": "metrics_basis.json", "required": True},
+                            {"artifact": "execution_trace.json", "required": True},
+                            {
+                                "artifact": "state_snapshots",
+                                "required": True,
+                                "min_samples": 1,
+                                "schema": {
+                                    "variables": [
+                                        {"name": "h", "shape_expr": "[2,2]"}
+                                    ],
+                                    "time_variable": "time",
+                                    "time_shape_expr": "scalar",
+                                },
+                            },
+                        ]
+                    },
+                    "test_evidence_requirements": [
+                        {
+                            "test_id": "test_a",
+                            "required_raw_variables": ["h", "time"],
+                        },
+                        {
+                            "test_id": "test_b",
+                            "required_raw_variables": ["h", "time"],
+                        },
+                    ],
+                },
+                metrics_basis={
+                    "wave_speed_x": -1.0,
+                    "wave_speed_y": -1.0,
+                },
+            )
+            violations = validate(repo_root=repo_root, workspace_root="workspace")
+            self.assertTrue(
+                any("metrics_basis.json: must contain per_test list or tests object" in v for v in violations)
+            )
+
+    def test_detects_metrics_basis_missing_required_variable_in_per_test_entry(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            tests_path = (
+                repo_root
+                / "spec"
+                / "problem"
+                / "mock_domain"
+                / "mock_family"
+                / "mock_spec"
+                / "tests.md"
+            )
+            tests_path.parent.mkdir(parents=True, exist_ok=True)
+            tests_path.write_text(
+                "## 7. テスト定義\n"
+                "### 7-1. `test_a`\n",
+                encoding="utf-8",
+            )
+            model_text = """module shallow_water2d_model
+use dynamics_shallow_water_flux_2d_rusanov_p0_model
+implicit none
+contains
+subroutine solve(flag)
+  logical, intent(out) :: flag
+  call dynamics_shallow_water_flux_2d_rusanov_p0__compute_flux(flag)
+end subroutine solve
+end module shallow_water2d_model
+"""
+            runner_text = """program shallow_water2d_runner
+implicit none
+write(*,*) 'ok'
+end program shallow_water2d_runner
+"""
+            _create_minimal_execution_tree(
+                repo_root,
+                dep_spec_id="dynamics_shallow_water_flux_2d_rusanov_p0",
+                model_text=model_text,
+                runner_text=runner_text,
+                run_command=["./simulate", "workspace/case.resolved.yaml", "workspace/outdir"],
+                derived_contract={
+                    "source": {"tests": "spec/problem/mock_domain/mock_family/mock_spec/tests.md"},
+                    "io_contract": {
+                        "inputs": [{"name": "case_resolved", "source": "case.resolved.yaml"}],
+                        "outputs": [
+                            {
+                                "name": "metric",
+                                "shape_expr": "scalar",
+                                "evidence_ref": "raw/metrics_basis.json",
+                                "raw_variables": ["h", "time"],
+                            }
+                        ],
+                    },
+                    "semantic_dependency": {"required_sources": []},
+                    "raw_requirements": {
+                        "required_evidence": [
+                            {"artifact": "metrics_basis.json", "required": True},
+                            {"artifact": "execution_trace.json", "required": True},
+                            {
+                                "artifact": "state_snapshots",
+                                "required": True,
+                                "min_samples": 1,
+                                "schema": {
+                                    "variables": [
+                                        {"name": "h", "shape_expr": "[2,2]"}
+                                    ],
+                                    "time_variable": "time",
+                                    "time_shape_expr": "scalar",
+                                },
+                            },
+                        ]
+                    },
+                    "test_evidence_requirements": [
+                        {
+                            "test_id": "test_a",
+                            "required_raw_variables": ["h", "time"],
+                        }
+                    ],
+                },
+                metrics_basis={
+                    "per_test": [
+                        {
+                            "test_id": "test_a",
+                            "raw_variables": {
+                                "h": [[1.0, 1.0], [1.0, 1.0]],
+                            },
+                        }
+                    ]
+                },
+            )
+            violations = validate(repo_root=repo_root, workspace_root="workspace")
+            self.assertTrue(
+                any("metrics_basis.json: test_id test_a missing required_raw_variables (['time'])" in v for v in violations)
             )
 
     def test_detects_snapshot_shape_mismatch_against_derived_contract(self) -> None:

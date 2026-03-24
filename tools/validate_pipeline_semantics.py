@@ -1244,6 +1244,8 @@ def _validate_raw_evidence(
             violations.append(
                 f"{metrics_basis_path}: must not be identical copy of diagnostics.json"
             )
+        if isinstance(metrics_basis, dict):
+            _validate_metrics_basis_per_test(repo_root, execution, metrics_basis, violations)
 
     quality_path = execution.node_dir / "quality_check.json"
     if quality_path.exists():
@@ -1650,6 +1652,104 @@ def _parse_test_ids_from_tests_md(tests_path: Path) -> list[str]:
         seen.add(test_id)
         test_ids.append(test_id)
     return test_ids
+
+
+def _contract_test_evidence_requirements(
+    contract: dict[str, Any],
+) -> dict[str, set[str]]:
+    raw_reqs = contract.get("test_evidence_requirements")
+    if not isinstance(raw_reqs, list):
+        return {}
+
+    result: dict[str, set[str]] = {}
+    for item in raw_reqs:
+        if not isinstance(item, dict):
+            continue
+        raw_test_id = item.get("test_id")
+        raw_variables = item.get("required_raw_variables")
+        if (
+            not isinstance(raw_test_id, str)
+            or not raw_test_id.strip()
+            or not isinstance(raw_variables, list)
+        ):
+            continue
+        variables = {
+            token.strip()
+            for token in raw_variables
+            if isinstance(token, str) and token.strip()
+        }
+        if variables:
+            result[raw_test_id.strip()] = variables
+    return result
+
+
+def _metrics_basis_entries(
+    metrics_basis: dict[str, Any],
+) -> tuple[dict[str, dict[str, Any]], list[str]]:
+    raw_entries = metrics_basis.get("per_test")
+    if raw_entries is None:
+        raw_entries = metrics_basis.get("tests")
+
+    entries: dict[str, dict[str, Any]] = {}
+    problems: list[str] = []
+
+    if isinstance(raw_entries, list):
+        for idx, item in enumerate(raw_entries):
+            if not isinstance(item, dict):
+                problems.append(f"per_test[{idx}] must be object")
+                continue
+            raw_test_id = item.get("test_id")
+            if not isinstance(raw_test_id, str) or not raw_test_id.strip():
+                problems.append(f"per_test[{idx}].test_id must be non-empty string")
+                continue
+            test_id = raw_test_id.strip()
+            if test_id in entries:
+                problems.append(f"per_test has duplicated test_id ({test_id})")
+                continue
+            entries[test_id] = item
+        return entries, problems
+
+    if isinstance(raw_entries, dict):
+        for raw_test_id, item in raw_entries.items():
+            if not isinstance(raw_test_id, str) or not raw_test_id.strip():
+                problems.append("tests keys must be non-empty strings")
+                continue
+            if not isinstance(item, dict):
+                problems.append(f"tests[{raw_test_id!r}] must be object")
+                continue
+            entries[raw_test_id.strip()] = item
+        return entries, problems
+
+    problems.append("must contain per_test list or tests object")
+    return entries, problems
+
+
+def _metrics_basis_variable_keys(entry: dict[str, Any]) -> set[str]:
+    for field_name in ("raw_variables", "variables", "evidence"):
+        raw_value = entry.get(field_name)
+        if isinstance(raw_value, dict):
+            return {
+                key.strip()
+                for key in raw_value
+                if isinstance(key, str) and key.strip()
+            }
+
+    ignored_keys = {
+        "test_id",
+        "case_id",
+        "case_ids",
+        "cases",
+        "status",
+        "summary",
+        "notes",
+        "meta",
+        "artifacts",
+    }
+    return {
+        key.strip()
+        for key in entry
+        if isinstance(key, str) and key.strip() and key not in ignored_keys
+    }
 
 
 def _find_command_log_record(
@@ -2439,6 +2539,7 @@ def _validate_algorithm_contract_schema(
                 f"{contract_path}:state_contract.fallback_policy must be fail_closed"
             )
 
+
 def _validate_test_evidence_requirements(
     repo_root: Path,
     contract_path: Path,
@@ -2512,6 +2613,72 @@ def _validate_test_evidence_requirements(
         violations.append(
             f"{contract_path}:test_evidence_requirements has unknown test_id ({extra})"
         )
+
+
+def _validate_metrics_basis_per_test(
+    repo_root: Path,
+    execution: NodeExecution,
+    metrics_basis: dict[str, Any],
+    violations: list[str],
+) -> None:
+    contract = _derived_contract_for_execution(repo_root, execution)
+    if not isinstance(contract, dict):
+        return
+
+    raw_requirements = _raw_requirements_for_execution(repo_root, execution)
+    if not isinstance(raw_requirements, dict):
+        return
+
+    required_evidence = raw_requirements.get("required_evidence")
+    metrics_basis_required = False
+    if isinstance(required_evidence, list):
+        for item in required_evidence:
+            if not isinstance(item, dict):
+                continue
+            raw_artifact = item.get("artifact")
+            if not isinstance(raw_artifact, str):
+                continue
+            if _normalize_raw_evidence_artifact(raw_artifact) != "metrics_basis.json":
+                continue
+            metrics_basis_required = item.get("required") is not False
+            break
+    if not metrics_basis_required:
+        return
+
+    test_requirements = _contract_test_evidence_requirements(contract)
+    if not test_requirements:
+        return
+
+    metrics_basis_path = execution.node_dir / "raw" / "metrics_basis.json"
+    entries, problems = _metrics_basis_entries(metrics_basis)
+    for problem in problems:
+        violations.append(f"{metrics_basis_path}: {problem}")
+    if problems:
+        return
+
+    expected_test_ids = set(test_requirements)
+    actual_test_ids = set(entries)
+    missing = sorted(expected_test_ids - actual_test_ids)
+    extra = sorted(actual_test_ids - expected_test_ids)
+    if missing:
+        violations.append(
+            f"{metrics_basis_path}: missing per-test evidence for test_id ({missing})"
+        )
+    if extra:
+        violations.append(
+            f"{metrics_basis_path}: has unknown per-test evidence test_id ({extra})"
+        )
+
+    for test_id, required_variables in sorted(test_requirements.items()):
+        entry = entries.get(test_id)
+        if not isinstance(entry, dict):
+            continue
+        variable_keys = _metrics_basis_variable_keys(entry)
+        missing_variables = sorted(required_variables - variable_keys)
+        if missing_variables:
+            violations.append(
+                f"{metrics_basis_path}: test_id {test_id} missing required_raw_variables ({missing_variables})"
+            )
 
 
 def _component_dep_spec_ids(repo_root: Path, execution: NodeExecution) -> list[str]:

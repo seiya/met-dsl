@@ -23,6 +23,8 @@ Generate ステージ出力の検証責務を固定し、`Build` 失敗を事前
 - `model` と `runner` が `algorithm.resolved.yaml` の `update_semantics` と `temporaries` と `derived_field_rules` と `invariants` と `splitting_policy` を欠落なく反映していることを検査する。状態更新対象の欠落、派生量計算の未実装、保存するべき invariant を破る更新順序、`splitting_policy` 不一致を `fail` とする。
 - `model` と `runner` が `algorithm.resolved.yaml` に記載されていない追加演算、追加反復、追加条件分岐、追加依存 `operation` 呼び出しを導入していないことを検査する。`resolved artifact` に存在しない実行経路を `fail` とする。
 - `model` が `derived_contract.json` で要求された依存 `operation` と出力指標のデータ依存（`semantic_dependency.required_sources` と `io_contract.outputs`）を満たすことを検査する。時空間ループなど特定制御構造を一律必須にしてはならない。
+- `runner` の raw evidence 出力設計が `derived_contract.json` の `raw_requirements.required_evidence` と `test_evidence_requirements` を満たすことを検査する。少なくとも `raw/metrics_basis.json` が `test_id` 単位の evidence index を保持し、全 `test_id` について `required_raw_variables` を欠落なく記録できる設計でなければならない。
+- 複数 `test` の一次証跡を 1 件の summary へ潰す設計、最後に実行した `case` の値で raw evidence を上書きする設計、`diagnostics.json` の suite-level 真偽値のみを Judge 入力へ流用する設計を検出した場合は `fail` とする。
 - 出力指標が `model` execution result に依存しない定数出力、固定 `JSON` 出力、解析式直接代入を検出した場合は `fail` とする。
 - `problem` かつ `spec_id` が `2d` または `3d` を含む `node` は、`algorithm.resolved.yaml` の状態更新契約を必須検査し、欠落または `fallback_policy!=fail_closed` を検出した場合は `fail` とする。
 - `problem` かつ `spec_id` が `2d` または `3d` を含む `node` は、複数 `intent(out)` 指標を出力する `subroutine` が `state_variables` 配列参照を持たない場合を `metric-only scalar kernel` として `fail` とする。
