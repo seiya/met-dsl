@@ -42,6 +42,7 @@ Plan ステージの生成責務を固定し、入力 spec から決定的な re
 - 上位 `node` の `Plan` は、直下依存 `node` の `plan_ref` と `plan_meta.json.verification_status` を確認し、`direct dependency plan readiness` を満たさない場合は開始してはならない。
 - 上記の生成契約を導出できない場合は `Plan fail` とし、不完全な契約で `Generate` へ進めてはならない。
 - 未登録依存、未実装依存、互換性違反依存は解決エラーにし、該当 `node` を `blocked` にする。
+- `Plan` 完了前に `python3 tools/check_artifact_syntax.py --expect-top object` を実行し、`case.resolved.yaml` と `algorithm.resolved.yaml` と `impl.resolved.yaml` と `dependency.resolved.yaml` と `derived_contract.json` と `plan_meta.json` が標準 parser で復元可能な mapping / object であることを確認しなければならない。
 
 ## 運用ルール
 1. `plan_id` を `<node_key_safe>_<case_hash12>_<algorithm_hash12>_<impl_hash12>` 形式で発行する。
@@ -51,6 +52,7 @@ Plan ステージの生成責務を固定し、入力 spec から決定的な re
 5. 開始前と完了前に `python3 tools/validate_workspace_root.py` を実行し、`fail` 時は `Plan fail` とする。
 6. `plan_meta.json` に `attempt_count` と `verification_status` と `last_fail_reason` と `debug_mode` を記録する。
 7. `debug_mode=false` では失敗試行 artifact を保存しない。
+8. 完了前に `python3 tools/check_artifact_syntax.py --expect-top object` を対象 resolved artifact と `derived_contract.json` と `plan_meta.json` へ実行し、`fail` 時は `Plan fail` とする。
 
 ## 判定基準
 - 同一入力で再生成したとき、`case.resolved.yaml` と `algorithm.resolved.yaml` と `impl.resolved.yaml` と `dependency.resolved.yaml` が一致する。

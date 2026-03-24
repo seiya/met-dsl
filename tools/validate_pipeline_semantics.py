@@ -457,6 +457,21 @@ def _extract_first_diagnostics_block(lowered: str) -> str | None:
     return lowered[start:close_idx]
 
 
+def _extract_first_output_block(lowered: str, output_name: str) -> str | None:
+    start = -1
+    for marker in (f"/{output_name}", f"'{output_name}'", f'"{output_name}"'):
+        start = lowered.find(marker)
+        if start >= 0:
+            break
+    if start < 0:
+        return None
+
+    close_idx = lowered.find("close(", start)
+    if close_idx < 0:
+        return lowered[start:]
+    return lowered[start:close_idx]
+
+
 def _iter_fortran_calls(text: str) -> list[tuple[str, str, int]]:
     calls: list[tuple[str, str, int]] = []
     call_start_pattern = re.compile(r"\bcall\s+([a-z_][a-z0-9_]*)\s*\(")
@@ -717,6 +732,21 @@ def _validate_problem_runner_nonphysical_casepath_input(
             violations.append(
                 f"{runner_file}: model call input depends on case_path length/argument count and is non-physical"
             )
+
+
+def _validate_runner_perf_json_serialization(
+    runner_file: Path,
+    lowered: str,
+    violations: list[str],
+) -> None:
+    perf_block = _extract_first_output_block(lowered, "perf.json")
+    if perf_block is None:
+        return
+
+    if re.search(r"write\s*\([^)]*,\s*['\"][^'\"]*f0\.\d+[^'\"]*['\"]", perf_block):
+        violations.append(
+            f"{runner_file}: perf.json block uses Fortran F0 formatting; JSON numeric serialization must be leading-zero safe"
+        )
 
 
 @dataclass
@@ -1135,16 +1165,32 @@ def _validate_raw_evidence(
     diagnostics_path = execution.node_dir / "diagnostics.json"
     metrics_basis_path = execution.node_dir / "raw" / "metrics_basis.json"
     if diagnostics_path.exists() and metrics_basis_path.exists():
-        diagnostics = _read_json(diagnostics_path)
-        metrics_basis = _read_json(metrics_basis_path)
-        if _canonical_json(diagnostics) == _canonical_json(metrics_basis):
+        try:
+            diagnostics = _read_json(diagnostics_path)
+        except json.JSONDecodeError:
+            violations.append(f"{diagnostics_path}: invalid json")
+            diagnostics = None
+        try:
+            metrics_basis = _read_json(metrics_basis_path)
+        except json.JSONDecodeError:
+            violations.append(f"{metrics_basis_path}: invalid json")
+            metrics_basis = None
+        if (
+            diagnostics is not None
+            and metrics_basis is not None
+            and _canonical_json(diagnostics) == _canonical_json(metrics_basis)
+        ):
             violations.append(
                 f"{metrics_basis_path}: must not be identical copy of diagnostics.json"
             )
 
     quality_path = execution.node_dir / "quality_check.json"
     if quality_path.exists():
-        quality = _read_json(quality_path)
+        try:
+            quality = _read_json(quality_path)
+        except json.JSONDecodeError:
+            violations.append(f"{quality_path}: invalid json")
+            return
         checks = quality.get("checks", {})
         if not isinstance(checks, dict):
             violations.append(f"{quality_path}:checks must be object")
@@ -1163,6 +1209,57 @@ def _validate_raw_evidence(
                 )
         if quality.get("status") != "pass":
             violations.append(f"{quality_path}:status must be pass")
+
+
+def _validate_execution_json_outputs(execution: NodeExecution, violations: list[str]) -> None:
+    diagnostics_path = execution.node_dir / "diagnostics.json"
+    if diagnostics_path.exists():
+        try:
+            diagnostics = _read_json(diagnostics_path)
+        except json.JSONDecodeError:
+            violations.append(f"{diagnostics_path}: invalid json")
+        else:
+            if not isinstance(diagnostics, dict):
+                violations.append(f"{diagnostics_path}: must be json object")
+
+    perf_path = execution.node_dir / "perf.json"
+    if not perf_path.exists():
+        return
+
+    try:
+        perf = _read_json(perf_path)
+    except json.JSONDecodeError:
+        violations.append(f"{perf_path}: invalid json")
+        return
+    if not isinstance(perf, dict):
+        violations.append(f"{perf_path}: must be json object")
+        return
+
+    for key in ("walltime_sec", "throughput_cells_per_sec", "parallelism"):
+        if key not in perf:
+            violations.append(f"{perf_path}: missing required field ({key})")
+
+    for key in ("walltime_sec", "throughput_cells_per_sec"):
+        if key not in perf:
+            continue
+        value = perf.get(key)
+        if not isinstance(value, (int, float)) or isinstance(value, bool):
+            violations.append(f"{perf_path}:{key} must be number")
+        elif value < 0:
+            violations.append(f"{perf_path}:{key} must be >= 0")
+
+    parallelism = perf.get("parallelism")
+    if parallelism is None:
+        return
+    if not isinstance(parallelism, dict):
+        violations.append(f"{perf_path}:parallelism must be object")
+        return
+    for key in ("mpi_ranks", "threads_per_rank", "gpu_devices", "parallel_degree_total"):
+        value = parallelism.get(key)
+        if not isinstance(value, int) or isinstance(value, bool):
+            violations.append(f"{perf_path}:parallelism.{key} must be integer")
+        elif value < 0:
+            violations.append(f"{perf_path}:parallelism.{key} must be >= 0")
 
 
 def _validate_generate_outputs(
@@ -2449,6 +2546,11 @@ def _validate_runner_outputs(execution: NodeExecution, violations: list[str]) ->
             lowered=text,
             violations=violations,
         )
+        _validate_runner_perf_json_serialization(
+            runner_file=runner_file,
+            lowered=text,
+            violations=violations,
+        )
 
 
 def _validate_run_program_inputs(
@@ -3427,6 +3529,7 @@ def validate(
         _validate_algorithm_contract_schema(repo_root, execution, violations)
         _validate_derived_contract_schema(repo_root, execution, violations)
         _validate_trial_meta(repo_root, execution, violations)
+        _validate_execution_json_outputs(execution, violations)
         _validate_raw_evidence(repo_root, execution, violations)
         _validate_generate_outputs(repo_root, execution, violations)
         _validate_dependency_operation_usage(repo_root, execution, violations)

@@ -43,3 +43,6 @@
 - runner は `perf.json` を読み、性能チェックを `verdict.json` に追記できる。
 - 物理 fail 時は性能評価をスキップする（意味が薄い）。
 - `parallelism` が欠落している `perf.json` は不正入力として扱い、判定不能（error）にする。
+- `perf.json` は UTF-8 の単一 `JSON object` として標準 parser で復元可能でなければならない。
+- 数値 token は `RFC 8259` に従い、先頭 0 を欠落させた `.123` と `-.123` を禁止する。
+- `toolchain.language=fortran` の `runner` は、`F0.d` 書式を `JSON` 数値 token へ直接埋め込んではならない。

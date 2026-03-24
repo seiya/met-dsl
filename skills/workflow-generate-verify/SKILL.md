@@ -34,6 +34,7 @@ Generate ステージ出力の検証責務を固定し、`Build` 失敗を事前
 - `toolchain.language=fortran` で依存 `component` を持つ `node` は、依存 `spec_id` ごとに `model` 内の `use <spec_id>_model` と `call <spec_id>__*` を必須検査し、`subroutine <spec_id>__*` の再定義を検出した場合は `fail` とする。
 - 依存先が `profile` で公開 `operation` を持たない構成では、依存元 `problem` の実装が `profile` の選択結果と拘束条件を参照していることを検査する。欠落時は `fail` とする。
 - `runner` が `verdict.json` と `aggregate_verdict.json` と `summary.json` と `trial_meta.json` を書き込む実装を検出した場合は `fail` とする。
+- `runner` の `diagnostics.json` と `perf.json` 出力が、標準 `JSON` parser で復元可能な UTF-8 `JSON object` を満たすことを検査する。`toolchain.language=fortran` の `runner` が `F0.d` など leading zero を欠落し得る書式を `perf.json` または `diagnostics.json` の数値 token へ直接使用する場合は `fail` とする。
 - `impl.resolved.yaml` の言語と `build_system` に整合する構成であることを検査する。
 - `impl.resolved.yaml` の `target.class` と `target.backend` と `target.architecture` と `toolchain.language` と `toolchain.standard` と `toolchain.build_system` と `selected.backend_key` が、生成されたソース構成と `build` 用 artifact に反映されていることを検査する。言語不一致、`build_system` 不一致、未選択 backend の code path 出力、`selected.backend_key` 未反映を `fail` とする。
 - `impl.resolved.yaml` の `abstract` と `backend_overrides` で指定された並列化、レイアウト、融合、タイル、ベクトル化、非同期化などの実行アルゴリズム選択が、対象言語と target で表現可能な範囲で生成コードまたは `build` 設定へ反映されていることを検査する。指定済み knob の無視、禁止 target 向け最適化の混入、`target.class=cpu` の既定 `OpenMP` 規則違反を `fail` とする。

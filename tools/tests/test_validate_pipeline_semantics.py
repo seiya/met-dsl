@@ -143,7 +143,23 @@ def _create_minimal_execution_tree(
     )
 
     _write_json(node_dir / "diagnostics.json", {"metric": 1.0})
-    _write_json(node_dir / "perf.json", {"runtime_sec": 0.01})
+    _write_json(
+        node_dir / "perf.json",
+        {
+            "case_id": "case-001",
+            "target": "cpu",
+            "walltime_sec": 0.01,
+            "steps": 1,
+            "cells_updated": 4,
+            "throughput_cells_per_sec": 400.0,
+            "parallelism": {
+                "mpi_ranks": 1,
+                "threads_per_rank": 1,
+                "gpu_devices": 0,
+                "parallel_degree_total": 1,
+            },
+        },
+    )
     _write_json(raw_dir / "metrics_basis.json", {"basis": 2.0})
     _write_json(raw_dir / "execution_trace.json", {"trace": ["step1", "step2"]})
     _write_json(
@@ -753,6 +769,81 @@ end program shallow_water2d_runner
             )
             self.assertTrue(
                 any("diagnostics block does not reference model call arguments" in v for v in violations)
+            )
+
+    def test_detects_invalid_perf_json(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            model_text = """module shallow_water2d_model
+use dynamics_shallow_water_flux_2d_rusanov_p0_model
+implicit none
+contains
+subroutine shallow_water2d__step(metric)
+  real(8), intent(out) :: metric
+  metric = 1.0d0
+end subroutine shallow_water2d__step
+end module shallow_water2d_model
+"""
+            runner_text = """program shallow_water2d_runner
+use shallow_water2d_model
+implicit none
+real(8) :: metric
+call shallow_water2d__step(metric)
+end program shallow_water2d_runner
+"""
+            _create_minimal_execution_tree(
+                repo_root,
+                dep_spec_id="dynamics_shallow_water_flux_2d_rusanov_p0",
+                model_text=model_text,
+                runner_text=runner_text,
+                run_command=["./simulate", "workspace/case.resolved.yaml", "workspace/outdir"],
+            )
+            perf_path = (
+                repo_root
+                / "workspace/pipelines/problem__shallow_water2d__0.3.0/problem__shallow_water2d__0.3.0_test_pipeline/execute/exe_test_001/problem/shallow_water2d/perf.json"
+            )
+            perf_path.write_text('{"walltime_sec":.000002}\n', encoding="utf-8")
+
+            violations = validate(repo_root=repo_root, workspace_root="workspace")
+            self.assertTrue(
+                any(v == f"{perf_path}: invalid json" for v in violations)
+            )
+
+    def test_detects_unsafe_fortran_f0_perf_serialization(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            model_text = """module shallow_water2d_model
+use dynamics_shallow_water_flux_2d_rusanov_p0_model
+implicit none
+contains
+subroutine shallow_water2d__step(walltime_sec)
+  real(8), intent(out) :: walltime_sec
+  walltime_sec = 2.0d-6
+end subroutine shallow_water2d__step
+end module shallow_water2d_model
+"""
+            runner_text = """program shallow_water2d_runner
+use shallow_water2d_model
+implicit none
+real(8) :: walltime_sec
+integer :: u
+call shallow_water2d__step(walltime_sec)
+open(newunit=u, file='perf.json', status='replace', action='write')
+write(u,'(a,f0.6,a)') '{"walltime_sec":', walltime_sec, '}'
+close(u)
+end program shallow_water2d_runner
+"""
+            _create_minimal_execution_tree(
+                repo_root,
+                dep_spec_id="dynamics_shallow_water_flux_2d_rusanov_p0",
+                model_text=model_text,
+                runner_text=runner_text,
+                run_command=["./simulate", "workspace/case.resolved.yaml", "workspace/outdir"],
+            )
+
+            violations = validate(repo_root=repo_root, workspace_root="workspace")
+            self.assertTrue(
+                any("perf.json block uses Fortran F0 formatting" in v for v in violations)
             )
 
     def test_detects_metric_only_scalar_kernel_for_2d_problem(self) -> None:

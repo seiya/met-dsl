@@ -18,6 +18,8 @@ Execute ステージの実行責務を固定し、判定可能なランタイム
 - `quality check` は `MCP` サーバーの `run_quality_checks` を使用する。
 - `runner` が `model` を呼び出し、`diagnostics.json` と `perf.json` を出力する。
 - `runner` が `verdict.json` と `aggregate_verdict.json` と `summary.json` と `trial_meta.json` を直接出力してはならない。
+- `Execute` 完了条件は `diagnostics.json` と `perf.json` が標準 `JSON` parser で復元可能な UTF-8 `JSON object` であることを含む。不正 `JSON` を検出した場合は `Execute fail` とし、`Judge` を開始してはならない。
+- `Execute` 完了前に `python3 tools/check_artifact_syntax.py --format json --expect-top object` を実行し、`diagnostics.json` と `perf.json` と `quality_check.json` と `trial_meta.json` の構文妥当性を検査しなければならない。
 - `execution_id/<node_key>/raw/` に `Judge` 再計算用の実行証跡を必須保存する。必須構成は `derived_contract.json` の `raw_requirements.required_evidence` を canonical source とする。
 - `raw_requirements.required_evidence` が `artifact=state_snapshots` を必須宣言する場合のみ、状態スナップショットを必須保存する。
 - `raw` は一次証跡のみを保存し、`diagnostics.json` の複写を `metrics_basis` として保存してはならない。
@@ -38,6 +40,7 @@ Execute ステージの実行責務を固定し、判定可能なランタイム
 7. workflow 実行開始前に `workspace/` が存在しない場合、リポジトリルート直下へ `workspace/` を作成する。
 8. 開始前と完了前に `python3 tools/validate_workspace_root.py` を実行し、`fail` 時は `Execute fail` とする。
 9. `python3 tools/validate_pipeline_semantics.py` を `--allow-missing-orchestration` と `--allow-missing-llm-review` を指定せずに実行し、`fail` 時は `Judge` を開始してはならない。
+10. 完了前に `python3 tools/check_artifact_syntax.py --format json --expect-top object` を `diagnostics.json` と `perf.json` と `quality_check.json` と `trial_meta.json` へ実行し、`fail` 時は `Execute fail` とする。
 
 ## 判定基準
 - `diagnostics.json` と `perf.json` とログ群が揃っている。

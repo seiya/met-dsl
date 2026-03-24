@@ -263,6 +263,7 @@ workspace/
 - `algorithm.resolved.yaml` は `Generate` の canonical source 入力であり、`Generate` は元の `controlled_spec.md` を直接読んではならない。
 - `algorithm.resolved.yaml` は `YAML` mapping artifact とし、`JSON` 文字列として検証してはならない。
 - `algorithm.resolved.yaml` は `algorithm_id` と `execution_mode` と `steps[]` と `ordering` と `control_condition` と `iteration_contract` と `update_semantics` と `temporaries` と `derived_field_rules` と `invariants` と `splitting_policy` を必須保持しなければならない。
+- `Plan` 完了前に `python3 tools/check_artifact_syntax.py --expect-top object` を用いて `case.resolved.yaml` と `algorithm.resolved.yaml` と `impl.resolved.yaml` と `dependency.resolved.yaml` と `derived_contract.json` と `plan_meta.json` の構文妥当性を検査し、`fail` 時は `Plan fail` としなければならない。
 - `ordering` は `step_id` の列、または `before` / `after` を持つ dependency object の列として表現しなければならない。
 - `control_condition` は文字列、文字列配列、または object のいずれかで表現しなければならない。
 - `iteration_contract` は object とし、`execution_mode=iterative` の場合は空 object を禁止する。
@@ -378,6 +379,8 @@ workspace/
 - `Execute` は `node` 単位で個別実行し、他 `node` の artifact を混在させてはならない。
 - `runner` の出力対象は `diagnostics.json`、`perf.json`、`raw/` 一次証跡、`stdout.log`、`stderr.log` に限定する。
 - `runner` は `verdict.json`、`aggregate_verdict.json`、`summary.json`、`trial_meta.json` を書き込んではならない。
+- `diagnostics.json` と `perf.json` は、標準 `JSON` parser で復元可能な UTF-8 `JSON object` として出力しなければならない。不正 `JSON`、先頭 0 欠落数値、言語依存整形による非互換 token を禁止する。
+- `Execute` 完了前に `python3 tools/check_artifact_syntax.py --format json --expect-top object` を用いて `diagnostics.json` と `perf.json` と `quality_check.json` と `trial_meta.json` を検査し、`fail` 時は `Execute fail` としなければならない。
 - `Execute` は `Judge` 再計算に必要な一次証跡を `execution_id/<node_key>/raw/` に保存しなければならない。
 - 一次証跡の必須構成は `derived_contract.json` の `raw_requirements.required_evidence` を canonical source とする。固定の最小構成を全 `spec` に一律適用してはならない。
 - `raw_requirements.required_evidence` は `metrics_basis.json` と `execution_trace.json` と `state_snapshots` などの `artifact` ごとに必須有無を宣言しなければならない。
