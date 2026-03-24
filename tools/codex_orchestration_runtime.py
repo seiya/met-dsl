@@ -6,8 +6,10 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
+from functools import lru_cache
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
@@ -207,6 +209,176 @@ def _coerce_nested_launch_text(payload: dict[str, Any], path: tuple[str, ...]) -
     return _coerce_launch_text(current)
 
 
+def _is_placeholder_ref(value: str) -> bool:
+    token = value.strip()
+    if not token:
+        return False
+    return "agent-determined" in token or ("<" in token and ">" in token)
+
+
+def _launch_prompt_template_path() -> Path:
+    return (
+        Path(__file__).resolve().parent.parent
+        / "skills"
+        / "workflow-orchestration"
+        / "references"
+        / "launch_prompts.md"
+    )
+
+
+@lru_cache(maxsize=1)
+def _load_launch_prompt_templates() -> dict[str, str]:
+    text = _launch_prompt_template_path().read_text(encoding="utf-8")
+    pattern = re.compile(
+        r"## `(?P<name>step agent|substep agent)` 起動要求テンプレート\s+```text\n(?P<body>.*?)\n```",
+        re.DOTALL,
+    )
+    templates: dict[str, str] = {}
+    for match in pattern.finditer(text):
+        templates[match.group("name")] = match.group("body")
+    if set(templates) != {"step agent", "substep agent"}:
+        raise RuntimeError("launch prompt templates must define step agent and substep agent")
+    return templates
+
+
+def _launch_prompt_template_name(request_payload: dict[str, Any]) -> str:
+    substep = request_payload.get("substep")
+    if isinstance(substep, str) and substep.strip():
+        return "substep agent"
+    return "step agent"
+
+
+def _template_placeholder_values(request_payload: dict[str, Any]) -> dict[str, str]:
+    return {
+        "node_key": str(request_payload.get("node_key", "")),
+        "step": str(request_payload.get("step", "")),
+        "substep": str(request_payload.get("substep", "")),
+        "orchestration_id": str(request_payload.get("orchestration_id", "")),
+        "agent_run_id": str(request_payload.get("agent_run_id", "")),
+        "parent_agent_run_id": str(request_payload.get("parent_agent_run_id", "")),
+        "plan_ref": str(request_payload.get("plan_ref", "")),
+        "pipeline_ref": str(request_payload.get("pipeline_ref", "")),
+        "dependency_ref": str(request_payload.get("dependency_ref", "")),
+        "skill_name": str(request_payload.get("skill_name", "")),
+        "skill_ref": str(request_payload.get("skill_ref", "")),
+        "skill_must_read_refs": str(request_payload.get("skill_must_read_refs", "")),
+        "issue_severity": str(request_payload.get("issue_severity", "")),
+        "repair_strategy": str(request_payload.get("repair_strategy", "")),
+        "repair_target_agent_run_id": str(request_payload.get("repair_target_agent_run_id", "")),
+        "repair_reason": str(request_payload.get("repair_reason", "")),
+    }
+
+
+def _render_launch_prompt_template(request_payload: dict[str, Any]) -> str:
+    template = _load_launch_prompt_templates()[_launch_prompt_template_name(request_payload)]
+    rendered = template
+    for key, value in _template_placeholder_values(request_payload).items():
+        rendered = rendered.replace(f"<{key}>", value)
+    return rendered
+
+
+def build_launch_prompt_text(request_payload: dict[str, Any]) -> str:
+    return _render_launch_prompt_template(request_payload).split("\n\n", 1)[0]
+
+
+def _skill_name_for_request(request_payload: dict[str, Any]) -> str | None:
+    step = request_payload.get("step")
+    if not isinstance(step, str) or not step.strip():
+        return None
+    step_token = step.strip().lower()
+    substep = request_payload.get("substep")
+    if isinstance(substep, str) and substep.strip():
+        return f"workflow-{step_token}-{substep.strip().lower()}"
+    return f"workflow-{step_token}"
+
+
+def _required_verify_skill_refs(request_payload: dict[str, Any]) -> list[str]:
+    step = request_payload.get("step")
+    substep = request_payload.get("substep")
+    plan_ref = request_payload.get("plan_ref")
+    if (
+        not isinstance(step, str)
+        or step.strip().lower() not in {"plan", "generate"}
+        or not isinstance(substep, str)
+        or substep.strip().lower() != "verify"
+        or not isinstance(plan_ref, str)
+        or not plan_ref.strip()
+    ):
+        return []
+    plan_root = plan_ref.strip().rstrip("/")
+    return [
+        f"{plan_root}/case.resolved.yaml",
+        f"{plan_root}/algorithm.resolved.yaml",
+        f"{plan_root}/impl.resolved.yaml",
+        f"{plan_root}/dependency.resolved.yaml",
+        f"{plan_root}/derived_contract.json",
+    ]
+
+
+def _merge_unique_refs(*ref_groups: list[str]) -> list[str]:
+    merged: list[str] = []
+    seen: set[str] = set()
+    for group in ref_groups:
+        for ref in group:
+            token = ref.strip()
+            if not token or token in seen:
+                continue
+            merged.append(token)
+            seen.add(token)
+    return merged
+
+
+def build_skill_must_read_refs(request_payload: dict[str, Any]) -> list[str]:
+    skill_ref = request_payload.get("skill_ref")
+    skill_refs = [skill_ref.strip()] if isinstance(skill_ref, str) and skill_ref.strip() else []
+    existing_refs = _split_skill_refs(request_payload.get("skill_must_read_refs"))
+    common_refs = ["docs/WORKFLOW.md", "docs/ORCHESTRATION.md"]
+    verify_refs = _required_verify_skill_refs(request_payload)
+    return _merge_unique_refs(skill_refs, common_refs, existing_refs, verify_refs)
+
+
+def render_launch_prompt_text(request_payload: dict[str, Any]) -> str:
+    return _render_launch_prompt_template(request_payload)
+
+
+def prepare_launch_request_payload(request_payload: dict[str, Any]) -> dict[str, Any]:
+    payload = dict(request_payload)
+    if not isinstance(payload.get("skill_name"), str) or not payload.get("skill_name", "").strip():
+        skill_name = _skill_name_for_request(payload)
+        if skill_name is not None:
+            payload["skill_name"] = skill_name
+    if not isinstance(payload.get("skill_ref"), str) or not payload.get("skill_ref", "").strip():
+        skill_name = payload.get("skill_name")
+        if isinstance(skill_name, str) and skill_name.strip():
+            payload["skill_ref"] = f"skills/{skill_name.strip()}/SKILL.md"
+    payload.setdefault("issue_severity", "none")
+    payload.setdefault("repair_strategy", "none")
+    payload.setdefault("repair_target_agent_run_id", "none")
+    payload.setdefault("repair_reason", "none")
+    payload["skill_must_read_refs"] = ",".join(build_skill_must_read_refs(payload))
+    explicit_prompt_present = any(
+        _coerce_nested_launch_text(payload, path) is not None
+        for path in (
+            ("launch_prompt_full",),
+            ("execution_prompt",),
+            ("prompt",),
+            ("task",),
+            ("instruction",),
+            ("instructions",),
+            ("message",),
+            ("spawn_request", "prompt"),
+            ("spawn_request", "task"),
+            ("spawn_request", "instruction"),
+            ("spawn_request", "instructions"),
+            ("spawn_request", "message"),
+            ("launch_prompt",),
+        )
+    )
+    if not explicit_prompt_present:
+        payload["launch_prompt_full"] = render_launch_prompt_text(payload)
+    return payload
+
+
 def _extract_launch_prompt_text(request_payload: dict[str, Any]) -> str:
     # Prefer explicit full execution prompts, then fall back to short launch summaries.
     for path in (
@@ -271,6 +443,13 @@ def _required_launch_prompt_markers(request_payload: dict[str, Any]) -> list[str
     ]
 
 
+def _required_launch_prompt_lines(request_payload: dict[str, Any]) -> list[str]:
+    step = request_payload.get("step")
+    if not isinstance(step, str) or not step.strip():
+        return []
+    return build_launch_prompt_text(request_payload).splitlines()
+
+
 def _validate_launch_prompt_text(request_payload: dict[str, Any], prompt_text: str) -> None:
     required_markers = _required_launch_prompt_markers(request_payload)
     if not required_markers:
@@ -280,6 +459,13 @@ def _validate_launch_prompt_text(request_payload: dict[str, Any], prompt_text: s
         raise ValueError(
             "launch prompt text must preserve workflow-orchestration template markers: "
             + ", ".join(missing_markers)
+        )
+    required_lines = _required_launch_prompt_lines(request_payload)
+    missing_lines = [line for line in required_lines if line not in prompt_text]
+    if missing_lines:
+        raise ValueError(
+            "launch prompt text must preserve workflow-orchestration template field values: "
+            + ", ".join(missing_lines)
         )
 
 
@@ -357,8 +543,39 @@ def _node_key_to_safe(node_key: str) -> str:
 
 
 def _validate_launch_request_payload(request_payload: dict[str, Any]) -> None:
+    node_key = request_payload.get("node_key")
     step = request_payload.get("step")
     substep = request_payload.get("substep")
+    if isinstance(node_key, str) and node_key.strip():
+        node_safe = _node_key_to_safe(node_key.strip())
+    else:
+        node_safe = None
+
+    for key in ("plan_ref", "pipeline_ref", "dependency_ref"):
+        value = request_payload.get(key)
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(f"launch request must include non-empty {key}")
+        if _is_placeholder_ref(value):
+            raise ValueError(f"launch request {key} must not contain placeholder tokens")
+
+    plan_ref = request_payload.get("plan_ref")
+    pipeline_ref = request_payload.get("pipeline_ref")
+    dependency_ref = request_payload.get("dependency_ref")
+    if isinstance(plan_ref, str) and node_safe is not None:
+        expected_prefix = f"workspace/plans/{node_safe}/"
+        if not plan_ref.startswith(expected_prefix):
+            raise ValueError(
+                f"launch request plan_ref must start with canonical node root {expected_prefix}"
+            )
+    if isinstance(pipeline_ref, str) and node_safe is not None:
+        expected_prefix = f"workspace/pipelines/{node_safe}/"
+        if not pipeline_ref.startswith(expected_prefix):
+            raise ValueError(
+                f"launch request pipeline_ref must start with canonical node root {expected_prefix}"
+            )
+    if isinstance(dependency_ref, str) and _is_placeholder_ref(dependency_ref):
+        raise ValueError("launch request dependency_ref must not contain placeholder tokens")
+
     is_verify_substep = (
         isinstance(step, str)
         and step.strip().lower() in {"plan", "generate"}
@@ -379,30 +596,7 @@ def _validate_launch_request_payload(request_payload: dict[str, Any]) -> None:
     if not skill_must_read_refs:
         raise ValueError("verify launch request must include non-empty skill_must_read_refs")
 
-    plan_ref = request_payload.get("plan_ref")
-    required_refs: list[str] = []
-    if isinstance(plan_ref, str) and plan_ref.strip():
-        plan_root = plan_ref.strip().rstrip("/")
-        if isinstance(step, str) and step.strip().lower() == "plan" and isinstance(substep, str) and substep.strip().lower() == "verify":
-            required_refs.extend(
-                [
-                    f"{plan_root}/case.resolved.yaml",
-                    f"{plan_root}/algorithm.resolved.yaml",
-                    f"{plan_root}/impl.resolved.yaml",
-                    f"{plan_root}/dependency.resolved.yaml",
-                    f"{plan_root}/derived_contract.json",
-                ]
-            )
-        if isinstance(step, str) and step.strip().lower() == "generate" and isinstance(substep, str) and substep.strip().lower() == "verify":
-            required_refs.extend(
-                [
-                    f"{plan_root}/case.resolved.yaml",
-                    f"{plan_root}/algorithm.resolved.yaml",
-                    f"{plan_root}/impl.resolved.yaml",
-                    f"{plan_root}/dependency.resolved.yaml",
-                    f"{plan_root}/derived_contract.json",
-                ]
-            )
+    required_refs = _required_verify_skill_refs(request_payload)
 
     missing_refs = [ref for ref in required_refs if ref not in skill_must_read_refs]
     if missing_refs:
@@ -750,6 +944,10 @@ def record_launch(
     child_dialog_root.mkdir(parents=True, exist_ok=True)
 
     request_payload = dict(request_payload)
+    request_payload.setdefault("orchestration_id", orchestration_id)
+    request_payload.setdefault("agent_run_id", child_agent_run_id)
+    request_payload.setdefault("parent_agent_run_id", parent_agent_run_id)
+    request_payload = prepare_launch_request_payload(request_payload)
     response_payload = dict(response_payload)
 
     _validate_launch_request_payload(request_payload)

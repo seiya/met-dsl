@@ -11,11 +11,14 @@ from pathlib import Path
 from unittest.mock import patch
 
 from tools.codex_orchestration_runtime import (
+    build_launch_prompt_text,
     init_orchestration,
     parse_feature_list,
+    prepare_launch_request_payload,
     probe_codex_cli,
     record_agent_run,
     record_launch,
+    render_launch_prompt_text,
     update_orchestration_status,
     write_preflight,
     write_step_result,
@@ -34,7 +37,7 @@ pipeline_ref: workspace/pipelines/problem__shallow_water2d__0.3.0/pipeline_001
 dependency_ref: workspace/plans/problem__shallow_water2d__0.3.0/plan_001/dependency.resolved.yaml
 skill_name: workflow-{step}
 skill_ref: skills/workflow-{step}/SKILL.md
-skill_must_read_refs: docs/WORKFLOW.md,docs/ORCHESTRATION.md
+skill_must_read_refs: skills/workflow-{step}/SKILL.md,docs/WORKFLOW.md,docs/ORCHESTRATION.md
 issue_severity: none
 repair_strategy: none
 repair_target_agent_run_id: none
@@ -58,7 +61,7 @@ pipeline_ref: workspace/pipelines/problem__shallow_water2d__0.3.0/pipeline_001
 dependency_ref: workspace/plans/problem__shallow_water2d__0.3.0/plan_001/dependency.resolved.yaml
 skill_name: workflow-{step}-{substep}
 skill_ref: skills/workflow-{step}-{substep}/SKILL.md
-skill_must_read_refs: docs/WORKFLOW.md,docs/ORCHESTRATION.md
+skill_must_read_refs: skills/workflow-{step}-{substep}/SKILL.md,docs/WORKFLOW.md,docs/ORCHESTRATION.md
 issue_severity: none
 repair_strategy: none
 repair_target_agent_run_id: none
@@ -134,6 +137,56 @@ shell_tool                       stable             true
         self.assertEqual(result["status"], "fail")
         self.assertFalse(result["can_launch_step_agents"])
         self.assertFalse(result["can_launch_substep_agents"])
+
+    def test_prepare_launch_request_payload_fills_verify_defaults(self) -> None:
+        payload = prepare_launch_request_payload(
+            {
+                "node_key": "problem/shallow_water2d@0.3.0",
+                "step": "plan",
+                "substep": "verify",
+                "orchestration_id": "orch_001",
+                "agent_run_id": "substep_run_plan_verify_001",
+                "parent_agent_run_id": "orch_run_001",
+                "plan_ref": "workspace/plans/problem__shallow_water2d__0.3.0/plan_001",
+                "pipeline_ref": "workspace/pipelines/problem__shallow_water2d__0.3.0/pipeline_001",
+                "dependency_ref": "workspace/plans/problem__shallow_water2d__0.3.0/plan_001/dependency.resolved.yaml",
+            }
+        )
+        self.assertEqual(payload["skill_name"], "workflow-plan-verify")
+        self.assertEqual(payload["skill_ref"], "skills/workflow-plan-verify/SKILL.md")
+        self.assertEqual(payload["issue_severity"], "none")
+        self.assertIn("docs/WORKFLOW.md", payload["skill_must_read_refs"])
+        self.assertIn("docs/ORCHESTRATION.md", payload["skill_must_read_refs"])
+        self.assertIn("skills/workflow-plan-verify/SKILL.md", payload["skill_must_read_refs"])
+        self.assertIn(
+            "workspace/plans/problem__shallow_water2d__0.3.0/plan_001/derived_contract.json",
+            payload["skill_must_read_refs"],
+        )
+        self.assertIn("必須要件:", payload["launch_prompt_full"])
+
+    def test_render_launch_prompt_text_renders_full_template_body(self) -> None:
+        prompt = render_launch_prompt_text(
+            {
+                "node_key": "problem/shallow_water2d@0.3.0",
+                "step": "build",
+                "orchestration_id": "orch_001",
+                "agent_run_id": "step_run_build_001",
+                "parent_agent_run_id": "orch_run_001",
+                "plan_ref": "workspace/plans/problem__shallow_water2d__0.3.0/plan_001",
+                "pipeline_ref": "workspace/pipelines/problem__shallow_water2d__0.3.0/pipeline_001",
+                "dependency_ref": "workspace/plans/problem__shallow_water2d__0.3.0/plan_001/dependency.resolved.yaml",
+                "skill_name": "workflow-build",
+                "skill_ref": "skills/workflow-build/SKILL.md",
+                "skill_must_read_refs": "skills/workflow-build/SKILL.md,docs/WORKFLOW.md,docs/ORCHESTRATION.md",
+                "issue_severity": "none",
+                "repair_strategy": "none",
+                "repair_target_agent_run_id": "none",
+                "repair_reason": "none",
+            }
+        )
+        self.assertIn("あなたは step agent である。", prompt)
+        self.assertIn("必須要件:", prompt)
+        self.assertIn("完了返答には `launch_reply`", prompt)
 
     def test_writes_orchestration_artifacts_in_canonical_layout(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -684,12 +737,25 @@ shell_tool                       stable             true
                     request_payload={
                         "node_key": "problem/shallow_water2d@0.3.0",
                         "step": "build",
+                        "orchestration_id": "orch_001",
+                        "agent_run_id": "step_run_build_001",
+                        "parent_agent_run_id": "orch_run_001",
+                        "plan_ref": "workspace/plans/problem__shallow_water2d__0.3.0/plan_001",
+                        "pipeline_ref": "workspace/pipelines/problem__shallow_water2d__0.3.0/pipeline_001",
+                        "dependency_ref": "workspace/plans/problem__shallow_water2d__0.3.0/plan_001/dependency.resolved.yaml",
+                        "skill_name": "workflow-build",
+                        "skill_ref": "skills/workflow-build/SKILL.md",
+                        "skill_must_read_refs": "docs/WORKFLOW.md,docs/ORCHESTRATION.md",
+                        "issue_severity": "none",
+                        "repair_strategy": "none",
+                        "repair_target_agent_run_id": "none",
+                        "repair_reason": "none",
                         "launch_prompt_full": "Build step for node problem/shallow_water2d@0.3.0",
                     },
                     response_payload={"launch_reply": "accepted"},
                 )
 
-    def test_rejects_verify_launch_without_required_resolved_artifacts(self) -> None:
+    def test_record_launch_autofills_verify_required_resolved_artifacts(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
             init_orchestration(repo_root=repo_root, orchestration_id="orch_001")
@@ -704,32 +770,183 @@ shell_tool                       stable             true
                     "checks": [{"name": "multi_agent_enabled", "pass": True}],
                 },
             )
-            with self.assertRaisesRegex(ValueError, "missing required verify inputs"):
+            launch_refs = record_launch(
+                repo_root=repo_root,
+                orchestration_id="orch_001",
+                parent_agent_run_id="orch_run_001",
+                child_agent_run_id="substep_run_generate_verify_001",
+                request_payload={
+                    "node_key": "problem/shallow_water2d@0.3.0",
+                    "step": "Generate",
+                    "substep": "verify",
+                    "orchestration_id": "orch_001",
+                    "agent_run_id": "substep_run_generate_verify_001",
+                    "parent_agent_run_id": "orch_run_001",
+                    "plan_ref": "workspace/plans/problem__shallow_water2d__0.3.0/plan_001",
+                    "pipeline_ref": "workspace/pipelines/problem__shallow_water2d__0.3.0/pipeline_001",
+                    "dependency_ref": "workspace/plans/problem__shallow_water2d__0.3.0/plan_001/dependency.resolved.yaml",
+                    "skill_name": "workflow-generate-verify",
+                    "skill_ref": "skills/workflow-generate-verify/SKILL.md",
+                    "skill_must_read_refs": "docs/WORKFLOW.md,workspace/pipelines/problem__shallow_water2d__0.3.0/pipeline_001/generate/gen_001/generate_meta.json",
+                },
+                response_payload={"launch_reply": "accepted"},
+            )
+            request_payload = json.loads(
+                (repo_root / launch_refs["launch_request_ref"]).read_text(encoding="utf-8")
+            )
+            self.assertIn(
+                "workspace/plans/problem__shallow_water2d__0.3.0/plan_001/case.resolved.yaml",
+                request_payload["skill_must_read_refs"],
+            )
+            self.assertIn(
+                "workspace/plans/problem__shallow_water2d__0.3.0/plan_001/derived_contract.json",
+                request_payload["skill_must_read_refs"],
+            )
+
+    def test_rejects_launch_with_placeholder_plan_or_pipeline_refs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            init_orchestration(repo_root=repo_root, orchestration_id="orch_001")
+            write_preflight(
+                repo_root=repo_root,
+                orchestration_id="orch_001",
+                payload={
+                    "status": "pass",
+                    "can_launch_step_agents": True,
+                    "can_launch_substep_agents": True,
+                    "feature_states": {"multi_agent": True},
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}],
+                },
+            )
+            with self.assertRaisesRegex(ValueError, "plan_ref must not contain placeholder"):
                 record_launch(
                     repo_root=repo_root,
                     orchestration_id="orch_001",
                     parent_agent_run_id="orch_run_001",
-                    child_agent_run_id="substep_run_generate_verify_001",
+                    child_agent_run_id="substep_run_plan_generate_001",
                     request_payload={
                         "node_key": "problem/shallow_water2d@0.3.0",
-                        "step": "Generate",
-                        "substep": "verify",
+                        "step": "plan",
+                        "substep": "generate",
                         "orchestration_id": "orch_001",
-                        "agent_run_id": "substep_run_generate_verify_001",
+                        "agent_run_id": "substep_run_plan_generate_001",
                         "parent_agent_run_id": "orch_run_001",
-                        "plan_ref": "workspace/plans/problem__shallow_water2d__0.3.0/plan_001",
+                        "plan_ref": "workspace/plans/problem__shallow_water2d__0.3.0/<agent-determined-plan-id>",
                         "pipeline_ref": "workspace/pipelines/problem__shallow_water2d__0.3.0/pipeline_001",
                         "dependency_ref": "workspace/plans/problem__shallow_water2d__0.3.0/plan_001/dependency.resolved.yaml",
-                        "skill_name": "workflow-generate-verify",
-                        "skill_ref": "skills/workflow-generate-verify/SKILL.md",
-                        "skill_must_read_refs": "docs/WORKFLOW.md,workspace/pipelines/problem__shallow_water2d__0.3.0/pipeline_001/generate/gen_001/generate_meta.json",
+                        "skill_name": "workflow-plan-generate",
+                        "skill_ref": "skills/workflow-plan-generate/SKILL.md",
+                        "skill_must_read_refs": "docs/WORKFLOW.md,docs/ORCHESTRATION.md",
                         "launch_prompt_full": _substep_launch_prompt(
                             "problem/shallow_water2d@0.3.0",
-                            "Generate",
-                            "verify",
-                            "substep_run_generate_verify_001",
+                            "plan",
+                            "generate",
+                            "substep_run_plan_generate_001",
                         ),
                     },
+                    response_payload={"launch_reply": "accepted"},
+                )
+
+    def test_record_launch_autofills_prompt_and_skill_refs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            init_orchestration(repo_root=repo_root, orchestration_id="orch_001")
+            write_preflight(
+                repo_root=repo_root,
+                orchestration_id="orch_001",
+                payload={
+                    "status": "pass",
+                    "can_launch_step_agents": True,
+                    "can_launch_substep_agents": True,
+                    "feature_states": {"multi_agent": True},
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}],
+                },
+            )
+            launch_refs = record_launch(
+                repo_root=repo_root,
+                orchestration_id="orch_001",
+                parent_agent_run_id="orch_run_001",
+                child_agent_run_id="substep_run_plan_verify_001",
+                request_payload={
+                    "node_key": "problem/shallow_water2d@0.3.0",
+                    "step": "plan",
+                    "substep": "verify",
+                    "orchestration_id": "orch_001",
+                    "agent_run_id": "substep_run_plan_verify_001",
+                    "parent_agent_run_id": "orch_run_001",
+                    "plan_ref": "workspace/plans/problem__shallow_water2d__0.3.0/plan_001",
+                    "pipeline_ref": "workspace/pipelines/problem__shallow_water2d__0.3.0/pipeline_001",
+                    "dependency_ref": "workspace/plans/problem__shallow_water2d__0.3.0/plan_001/dependency.resolved.yaml",
+                },
+                response_payload={"launch_reply": "accepted"},
+            )
+            request_path = repo_root / launch_refs["launch_request_ref"]
+            prompt_path = repo_root / launch_refs["launch_prompt_ref"]
+            request_payload = json.loads(request_path.read_text(encoding="utf-8"))
+            self.assertEqual(request_payload["skill_name"], "workflow-plan-verify")
+            self.assertEqual(request_payload["skill_ref"], "skills/workflow-plan-verify/SKILL.md")
+            self.assertIn(
+                "workspace/plans/problem__shallow_water2d__0.3.0/plan_001/derived_contract.json",
+                request_payload["skill_must_read_refs"],
+            )
+            prompt_text = prompt_path.read_text(encoding="utf-8")
+            self.assertIn("必須要件:", prompt_text)
+            self.assertIn("skill_name: workflow-plan-verify", prompt_text)
+
+    def test_rejects_launch_prompt_when_field_values_do_not_match_request_payload(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            init_orchestration(repo_root=repo_root, orchestration_id="orch_001")
+            write_preflight(
+                repo_root=repo_root,
+                orchestration_id="orch_001",
+                payload={
+                    "status": "pass",
+                    "can_launch_step_agents": True,
+                    "can_launch_substep_agents": True,
+                    "feature_states": {"multi_agent": True},
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}],
+                },
+            )
+            payload = {
+                "node_key": "problem/shallow_water2d@0.3.0",
+                "step": "plan",
+                "substep": "verify",
+                "orchestration_id": "orch_001",
+                "agent_run_id": "substep_run_plan_verify_001",
+                "parent_agent_run_id": "orch_run_001",
+                "plan_ref": "workspace/plans/problem__shallow_water2d__0.3.0/plan_001",
+                "pipeline_ref": "workspace/pipelines/problem__shallow_water2d__0.3.0/pipeline_001",
+                "dependency_ref": "workspace/plans/problem__shallow_water2d__0.3.0/plan_001/dependency.resolved.yaml",
+                "skill_name": "workflow-plan-verify",
+                "skill_ref": "skills/workflow-plan-verify/SKILL.md",
+                "skill_must_read_refs": ",".join(
+                    [
+                        "docs/WORKFLOW.md",
+                        "docs/ORCHESTRATION.md",
+                        "workspace/plans/problem__shallow_water2d__0.3.0/plan_001/case.resolved.yaml",
+                        "workspace/plans/problem__shallow_water2d__0.3.0/plan_001/algorithm.resolved.yaml",
+                        "workspace/plans/problem__shallow_water2d__0.3.0/plan_001/impl.resolved.yaml",
+                        "workspace/plans/problem__shallow_water2d__0.3.0/plan_001/dependency.resolved.yaml",
+                        "workspace/plans/problem__shallow_water2d__0.3.0/plan_001/derived_contract.json",
+                    ]
+                ),
+                "issue_severity": "none",
+                "repair_strategy": "none",
+                "repair_target_agent_run_id": "none",
+                "repair_reason": "none",
+            }
+            prompt = build_launch_prompt_text(payload).replace(
+                "skill_name: workflow-plan-verify",
+                "skill_name: workflow-plan-generate",
+            ) + "\n\n必須要件:\n- 契約された substep を完了すること。\n"
+            with self.assertRaisesRegex(ValueError, "template field values"):
+                record_launch(
+                    repo_root=repo_root,
+                    orchestration_id="orch_001",
+                    parent_agent_run_id="orch_run_001",
+                    child_agent_run_id="substep_run_plan_verify_001",
+                    request_payload={**payload, "launch_prompt_full": prompt},
                     response_payload={"launch_reply": "accepted"},
                 )
 
@@ -992,7 +1209,30 @@ shell_tool                       stable             true
                     orchestration_id="orch_001",
                     parent_agent_run_id="orch_run_001",
                     child_agent_run_id="substep_run_plan_generate_001",
-                    request_payload={"launch_prompt": "do task"},
+                    request_payload={
+                        "node_key": "problem/shallow_water2d@0.3.0",
+                        "step": "plan",
+                        "substep": "generate",
+                        "orchestration_id": "orch_001",
+                        "agent_run_id": "substep_run_plan_generate_001",
+                        "parent_agent_run_id": "orch_run_001",
+                        "plan_ref": "workspace/plans/problem__shallow_water2d__0.3.0/plan_001",
+                        "pipeline_ref": "workspace/pipelines/problem__shallow_water2d__0.3.0/pipeline_001",
+                        "dependency_ref": "workspace/plans/problem__shallow_water2d__0.3.0/plan_001/dependency.resolved.yaml",
+                        "skill_name": "workflow-plan-generate",
+                        "skill_ref": "skills/workflow-plan-generate/SKILL.md",
+                        "skill_must_read_refs": "docs/WORKFLOW.md,docs/ORCHESTRATION.md",
+                        "issue_severity": "none",
+                        "repair_strategy": "none",
+                        "repair_target_agent_run_id": "none",
+                        "repair_reason": "none",
+                        "launch_prompt_full": _substep_launch_prompt(
+                            "problem/shallow_water2d@0.3.0",
+                            "plan",
+                            "generate",
+                            "substep_run_plan_generate_001",
+                        ),
+                    },
                     response_payload={"launch_reply": "accepted"},
                 )
                 self.assertEqual(probe_mock.call_count, 1)

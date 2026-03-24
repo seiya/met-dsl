@@ -53,6 +53,8 @@
 - `orchestration agent` は、子 `agent` 起動時に `docs/WORKFLOW.md` を canonical source として対象 `step` または `substep` の `execution input` と `verification input` と `expected output` を明示しなければならない。`step agent` を使用する phase では `step agent` も自身の契約入力と expected output を明示しなければならない。
 - `orchestration agent` は、子 `agent` 起動要求本文を `skills/workflow-orchestration/references/launch_prompts.md` の対応テンプレートから生成しなければならない。`step agent` には `step agent` 起動要求テンプレート、`substep agent` には `substep agent` 起動要求テンプレートを適用し、テンプレートを使わない任意の自由形式 prompt を禁止する。
 - 起動要求本文のテンプレート必須項目は、省略、改名、意味変更をしてはならない。追加記述は、テンプレート必須項目と矛盾せず、対象 `step` または `substep` の契約具体化に必要な情報に限定しなければならない。
+- `plan_ref` と `pipeline_ref` と `dependency_ref` は、子 `agent` 起動前に canonical path を確定しなければならない。`<agent-determined-...>` などの placeholder を起動要求へ記録してはならない。
+- `launches/<agent_run_id>.request.json` の各必須フィールド値と `launches/<agent_run_id>.prompt.txt` の対応行は一致しなければならない。要約 prompt、再構成 prompt、テンプレート marker のみを残した省略 prompt を禁止する。
 - `skills/*/agents/openai.yaml` の表示名または説明文だけで独立 `agent` 起動契約を満たしたとみなしてはならない。起動要求本文に `spawn_agent` の使用義務、input contract、expected output、保存先、失敗時停止条件を明示しなければならない。
 
 ## 設計方針
@@ -65,6 +67,7 @@
 ### 共通必須項目
 - `orchestration agent` は、子 `agent` への起動要求に `orchestration_id` と `agent_run_id` と `parent_agent_run_id` と `node_key` と `step` と `substep`（存在する場合）と `plan_ref` と `pipeline_ref` と `dependency_ref` を必須記録しなければならない。
 - 子 `agent` への起動要求本文は `skills/workflow-orchestration/references/launch_prompts.md` の対応テンプレートを基底とし、テンプレート内プレースホルダーを対象 `agent_run` の実値で置換して生成しなければならない。
+- 起動要求本文と `skill_must_read_refs` は、同一 request payload から機械的に再生成可能でなければならない。手作業連結や後編集で request と prompt の値を乖離させてはならない。
 - 子 `agent` への起動要求には、`execution input` と `verification input` と `expected output` と `write_root` と `read_roots` を必須記録しなければならない。
 - `execution input` は当該 `agent` が artifact を生成するために直接参照してよい入力に限定しなければならない。
 - `verification input` は当該 `agent` が pass/fail 判定、整合確認、依存確認にのみ使用してよい入力として明示しなければならない。
@@ -76,6 +79,7 @@
 - `Build` / `Execute` / `Judge` / `Promote` のように現行標準で `substep` を定義しない `step` では、`orchestration agent` は `step` 契約をそのまま単一 `step agent` へ渡さなければならない。
 - `Plan generate/verify`、`Generate generate/verify`、`Tune generate/verify` のように `substep` を持つ `step` では、`orchestration agent` は `step` 契約を分解したうえで、対応 `SKILL.md` の責務境界に一致する `substep` 契約だけを直接渡さなければならない。
 - `Plan verify substep` の契約には、`dependency.resolved.yaml` の網羅性検証、依存辺整合検証、依存先 `node` の `plan` 文書との照合検証を必ず含めなければならない。
+- `Plan verify` と `Generate verify` の起動要求では、`skill_must_read_refs` に `plan_ref` 配下の `case.resolved.yaml` と `algorithm.resolved.yaml` と `impl.resolved.yaml` と `dependency.resolved.yaml` と `derived_contract.json` を必須記録しなければならない。不足時は起動前に `fail_closed` とする。
 
 ## 運用ルール
 1. `workflow` 開始時に `orchestration_id` を発行し、`workspace/orchestrations/<orchestration_id>/orchestration_meta.json` を作成する。
