@@ -7,6 +7,7 @@ terms は `GLOSSARY.md` を参照する。
 - `node` 間の実行順序を `spec` の依存宣言から決定し、各 `node` 内では `Plan -> Generate -> Build -> Execute -> Judge` の順で実行する。
 - 各 phase の `execution input` と `verification input` と `output` を一意に定義する。
 - workflow 横断の不変条件、artifact layout rules、完了判定基準を定義する。
+- 独立 `node` の並列実行は明示的な指示がある場合に限定し、既定では逐次実行する。
 
 ## 適用範囲
 - `spec` 起点モードと `resolved` 起点モードの workflow 実行
@@ -70,6 +71,7 @@ terms は `GLOSSARY.md` を参照する。
 30. 要求定義が不足する場合、検証実装からの逆算補完を禁止し、当該 phase を `fail` で停止しなければならない。
 31. `quality check` 実行に必要な preset-compatible quality path は `Generate` の正式出力だけで成立しなければならない。下流 phase が `workspace/` 配下へ `test` source、harness、補助 `script`、一時 `Makefile` を追加生成して成立させる運用を禁止する。
 32. `quality check` 実行方式は `impl.resolved.yaml` の `toolchain.language` と `toolchain.build_system` に整合しなければならない。`toolchain.build_system=make` かつ `toolchain.language=fortran` / `c` / `cpp` / `mixed` 系では `make_test` または `make_check` を使用し、`pytest` による代替を禁止する。
+33. 依存関係上は独立な `node` であっても、workflow は明示的な並列実行指示が存在しない限り逐次実行しなければならない。依存充足のみを根拠に自動並列実行してはならない。
 
 ## 共通規約
 ### `LLM` 利用 phase
@@ -289,6 +291,7 @@ workspace/
 - `dependency.resolved.yaml` は起点 `node` と推移依存 `node` の閉包を過不足なく 1 回ずつ保持し、`node_key` の重複と欠落を禁止する。
 - `workflow` の `node` 実行順序は `spec` の canonical source である `deps.yaml` と `spec_catalog.yaml` から再構成した依存関係に基づいて決定しなければならない。
 - `dependency.resolved.yaml` は依存解決結果の記録と整合性検証に使用する artifact とし、`workflow` の実行順序決定の canonical source にしてはならない。
+- 依存関係上は独立な `node` の並列実行は、workflow 入力または orchestration 指示で明示的に許可された場合にのみ開始してよい。許可がない場合は `topo_level` が同一でも逐次実行しなければならない。
 - 依存を持つ `node` は、`deps.yaml` と `spec_catalog.yaml` から再構成した直下依存 `node` の `direct dependency plan readiness` を満たす場合にのみ `Plan` を開始してよい。
 - 依存を持つ `node` は、`deps.yaml` と `spec_catalog.yaml` から再構成した直下依存 `node` の `direct dependency execution readiness` を満たす場合にのみ `Generate -> Build -> Execute -> Judge` を開始してよい。
 - `component` / `profile` / `problem` の実行順序は `spec_kind` 固定で判定してはならず、`spec` 依存関係に基づいて判定しなければならない。

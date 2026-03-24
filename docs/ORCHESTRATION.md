@@ -99,7 +99,7 @@
 19. `step_result.json` は、再投入を実施した場合に `retry_decisions` 配列を保持し、各要素へ `issue_severity` と `repair_strategy` と `repair_target_agent_run_id` と `new_agent_run_id` と `repair_reason` を記録しなければならない。
 20. `step agent` は標準 `substep` を持たない phase で自身の artifact を検証し、`workspace/orchestrations/<orchestration_id>/steps/<node_key_safe>/<step>/<agent_run_id>/step_result.json` へ `step_result.json` を出力する。
 21. `orchestration agent` は `step_result.json` を受け取り、次 `step` の起動可否を判定する。
-22. `node` 実行は `deps.yaml` と `spec_catalog.yaml` から再構成した依存順で逐次実行する。依存関係を持つ `node` は依存 `node` の完了前に起動してはならない。独立 `node` の並列実行可否は `WORKFLOW.md` の依存充足規則に従って判定しなければならない。
+22. `node` 実行は `deps.yaml` と `spec_catalog.yaml` から再構成した依存順で逐次実行する。依存関係を持つ `node` は依存 `node` の完了前に起動してはならない。独立 `node` の並列実行は、workflow 入力または orchestration 指示で明示的に許可された場合にのみ開始してよい。明示指示がない場合、`orchestration agent` は独立 `node` を逐次起動しなければならない。
 23. `step agent` または `substep agent` が `fail` / `timeout` / `cancel` の場合、当該 `node` の当該 `step` を `fail` とし、下流 `step` 起動を禁止する。
 24. `orchestration agent` は各 `agent` 実行イベントを `workspace/orchestrations/<orchestration_id>/agent_runs.jsonl` へ追記しなければならない。
 25. `orchestration agent` は親子関係を `workspace/orchestrations/<orchestration_id>/agent_graph.json` へ保存し、`parent_agent_run_id` と `child_agent_run_id` と `relation_type` を必須記録とする。
