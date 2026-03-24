@@ -24,6 +24,7 @@ description: `Codex CLI` で `workflow` 全体を開始し、`orchestration agen
 - 子 `agent` 起動直前に live preflight gate を満たすことを必須とし、live 検査が `fail` の場合は `record-launch` を実行してはならない。
 - 起動前の初期読込は `references/startup_contract.md` を第一参照とし、詳細契約が必要な場合のみ `docs/WORKFLOW.md` と `docs/ORCHESTRATION.md` を追加参照しなければならない。
 - `step agent` / `substep agent` の起動要求本文は、必ず `references/launch_prompts.md` の対応テンプレートを基底として生成しなければならない。テンプレートを使わない任意の自由形式 prompt、別テンプレートの混用、必須項目の省略または改名を禁止する。
+- 子 `agent` 起動要求本文には、要求定義と判定規則の canonical source が `docs/` と `spec/` と当該試行 artifact であること、`tools/` 配下の実装、検証 `script`、test code、validator code を読んで rule を抽出してはならないことを明示しなければならない。
 - `plan_ref` と `pipeline_ref` と `dependency_ref` は、起動要求生成時点で canonical path を確定しなければならない。`<agent-determined-...>` などの placeholder を禁止する。
 - `step agent` / `substep agent` の起動要求本文には、input contract、expected output、保存先、失敗時停止条件、`spawn_agent` 義務を明示しなければならない。
 - `step agent` / `substep agent` の起動要求本文には、`skill_name` と `skill_ref` と `skill_must_read_refs` を必須記録し、子 `agent` が起動直後に対象 `SKILL` を読める状態にしなければならない。
@@ -47,7 +48,7 @@ description: `Codex CLI` で `workflow` 全体を開始し、`orchestration agen
 3. `preflight.json` の `can_launch_step_agents=true` と `can_launch_substep_agents=true` を満たさない場合は workflow を開始しない。
 4. `orchestration agent` は `references/startup_contract.md` を読んで起動条件を確定し、`references/launch_prompts.md` の `step agent` 用または `substep agent` 用テンプレートを選択する。
 5. 起動要求本文と `skill_must_read_refs` は、`tools/codex_orchestration_runtime.py` の `prepare_launch_request_payload` と `render_launch_prompt_text` に相当する canonical 生成規則で組み立てる。手作業連結での field 欠落、verify 必須 ref 欠落、prompt と request の値不一致を禁止する。
-6. `record-launch` 実行前に、`plan_ref` と `pipeline_ref` と `dependency_ref` に placeholder が残存していないこと、`verify` 起動要求の `skill_must_read_refs` が必須 resolved artifact を網羅していることを検査する。
+6. `record-launch` 実行前に、`plan_ref` と `pipeline_ref` と `dependency_ref` に placeholder が残存していないこと、`verify` 起動要求の `skill_must_read_refs` が必須 resolved artifact を網羅していること、起動要求本文に non-canonical な `tools/` / validator 参照禁止が含まれていることを検査する。
 7. 生成した起動要求本文で子 `agent` を起動する。起動要求と起動応答は `record-launch` で保存し、`launch_prompt_ref` と `launch_reply_ref` も同時に記録する。
 8. `Plan` の子 `agent` 起動前に、対象 `node` の直下依存 `node` ごとの `plan_ref` と `plan_meta.json.verification_status` を照合し、`direct dependency plan readiness` 不成立なら子 `agent` を起動せず `blocked` または `fail` を記録する。
 9. `Generate` 以降の子 `agent` 起動前に、対象 `node` の直下依存 `node` ごとの `plan_ref` と `pipeline_ref` と `aggregate_verdict` を照合し、`direct dependency execution readiness` 不成立なら子 `agent` を起動せず `blocked` または `fail` を記録する。
@@ -73,6 +74,7 @@ description: `Codex CLI` で `workflow` 全体を開始し、`orchestration agen
 - `launches/` の prompt が `references/launch_prompts.md` の対応テンプレートを基底としており、テンプレート必須項目の欠落または意味変更が存在しない。
 - `launches/` の request に placeholder ref が存在しない。
 - `verify` の `launches/` request が、必須 resolved artifact を `skill_must_read_refs` へ記録している。
+- 子 `agent` の `launches/` prompt が、`tools/` 配下の実装、検証 `script`、test code、validator code を rule source として読むことを禁止している。
 - `step_result.json` が `executor_agent_run_id` と `substep_agent_run_ids` を保持している。
 - 再投入を実施した場合、該当 `launch` 要求に `issue_severity` と `repair_strategy` と `repair_target_agent_run_id` と `repair_reason` が含まれている。
 - 子 `agent` の全 `launch` 要求に `skill_name` と `skill_ref` と `skill_must_read_refs` が含まれている。

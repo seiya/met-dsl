@@ -9,6 +9,7 @@
 
 ## 要件
 - 起動前確認は `tools/codex_orchestration_runtime.py` を canonical source 実装として実施しなければならない。
+- 子 `agent` へ渡す要求定義と判定規則の canonical source は `docs/` と `spec/` と当該試行 artifact に限定し、`tools/` 配下の実装、検証 `script`、test code、validator code を rule source として参照してはならない。
 - `init` と `preflight` は各 1 回以上実行しなければならない。
 - `preflight.json` が `status=pass` かつ `can_launch_step_agents=true` かつ `can_launch_substep_agents=true` を満たさない場合、子 `agent` を起動してはならない。
 - `Plan` の子 `agent` を起動する前に、対象 `node` の直下依存 `node` が `direct dependency plan readiness` を満たすことを確認しなければならない。

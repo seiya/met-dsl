@@ -51,6 +51,7 @@
 - `agent_runs.jsonl` と `agent_graph.json` は、実行中イベントを逐次追記して生成しなければならない。workflow 完了後に固定値テンプレートを一括出力する運用を禁止する。
 - `agent_runs.jsonl` と `agent_graph.json` と `step_result.json` を後生成または手動整形して独立実行を偽装してはならない。起動時に記録した一次証跡との突合で整合しない試行は `fail` とする。
 - `orchestration agent` は、子 `agent` 起動時に `docs/WORKFLOW.md` を canonical source として対象 `step` または `substep` の `execution input` と `verification input` と `expected output` を明示しなければならない。`step agent` を使用する phase では `step agent` も自身の契約入力と expected output を明示しなければならない。
+- `orchestration agent` は、子 `agent` 起動要求に要求定義と判定規則の canonical source が `docs/` と `spec/` と当該試行 artifact であることを明示しなければならない。`tools/` 配下の実装、検証 `script`、test code、validator code を読んで rule を抽出する指示または黙示を禁止する。
 - `orchestration agent` は、子 `agent` 起動要求本文を `skills/workflow-orchestration/references/launch_prompts.md` の対応テンプレートから生成しなければならない。`step agent` には `step agent` 起動要求テンプレート、`substep agent` には `substep agent` 起動要求テンプレートを適用し、テンプレートを使わない任意の自由形式 prompt を禁止する。
 - 起動要求本文のテンプレート必須項目は、省略、改名、意味変更をしてはならない。追加記述は、テンプレート必須項目と矛盾せず、対象 `step` または `substep` の契約具体化に必要な情報に限定しなければならない。
 - `plan_ref` と `pipeline_ref` と `dependency_ref` は、子 `agent` 起動前に canonical path を確定しなければならない。`<agent-determined-...>` などの placeholder を起動要求へ記録してはならない。
@@ -74,6 +75,7 @@
 - `expected output` はファイル名、保存先、更新責務を含めて明示しなければならない。親 `agent` は `expected output` に含まれない artifact を子 `agent` へ要求してはならない。
 - 親 `agent` は入力不足時に推測補完を指示してはならない。不足入力がある場合は `fail-fast` 停止を指示しなければならない。
 - 子 `agent` への起動要求には `skill_name` と `skill_ref` と `skill_must_read_refs` を必須記録し、子 `agent` が起動直後に対象 `SKILL` を読める状態を保証しなければならない。
+- 子 `agent` への起動要求には、`tools/` 配下の実装、検証 `script`、test code、validator code が canonical source ではないことと、要求不足時はそれらから逆算補完せず `fail-fast` 停止することを明示しなければならない。
 - `step` ごとの具体的な `execution input` と `verification input` と `expected output` は `docs/WORKFLOW.md` を canonical source とし、親 `agent` は対象 `step` 節の定義を参照して起動要求へ展開しなければならない。
 - `substep` ごとの具体的な `execution input` と `verification input` と `expected output` は、対応 `SKILL.md` と `docs/WORKFLOW.md` の両方を参照して決定しなければならない。`WORKFLOW.md` に明示された phase contractと矛盾する `substep` 契約を定義してはならない。
 - `Build` / `Execute` / `Judge` / `Promote` のように現行標準で `substep` を定義しない `step` では、`orchestration agent` は `step` 契約をそのまま単一 `step agent` へ渡さなければならない。

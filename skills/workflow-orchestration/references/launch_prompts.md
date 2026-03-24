@@ -24,6 +24,7 @@ repair_reason: <repair_reason>
 - あなたは phase artifacts を直接生成する担当である。
 - この step は標準 substep を持たない phase である。自身で step 契約を完了させること。
 - 起動直後に `skill_ref` を読み、`skill_must_read_refs` と矛盾しない契約で実行すること。
+- 要求定義と判定規則は `docs/` と `spec/` と `skill_must_read_refs` に含まれる当該試行 artifact だけから解釈すること。`tools/` 配下の実装、検証 `script`、test code、validator code から rule を抽出してはならない。
 - `skill_name` と `skill_ref` が未指定の場合は fail で停止すること。
 - 入力不足時は推測補完せず fail で停止すること。
 - `Plan` の場合、直下依存 `node` の `direct dependency plan readiness` を満たさない限り開始してはならない。
@@ -59,6 +60,7 @@ repair_reason: <repair_reason>
 - 契約された artifacts だけを書くこと。
 - expected output と保存先を守ること。
 - 起動直後に `skill_ref` を読み、`skill_must_read_refs` と矛盾しない契約で実行すること。
+- 要求定義と判定規則は `docs/` と `spec/` と `skill_must_read_refs` に含まれる当該試行 artifact だけから解釈すること。`tools/` 配下の実装、検証 `script`、test code、validator code から rule を抽出してはならない。
 - `skill_name` と `skill_ref` が未指定の場合は fail で停止すること。
 - 入力不足時は推測補完せず fail で停止すること。
 - `Plan` の substep は、直下依存 `node` の `direct dependency plan readiness` を満たさない限り開始してはならない。
