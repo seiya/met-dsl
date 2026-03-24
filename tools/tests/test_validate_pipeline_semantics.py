@@ -29,6 +29,7 @@ def _create_minimal_execution_tree(
     algorithm_contract: dict[str, object] | None = None,
     derived_contract: dict[str, object] | None = None,
     dependency_resolved: dict[str, object] | None = None,
+    impl_resolved: dict[str, object] | None = None,
 ) -> None:
     workspace = repo_root / "workspace"
     node_safe = "problem__shallow_water2d__0.3.0"
@@ -140,6 +141,32 @@ def _create_minimal_execution_tree(
     _write_json(
         workspace / "plans" / "problem__shallow_water2d__0.3.0" / "plan_test" / "derived_contract.json",
         derived_contract,
+    )
+    if impl_resolved is None:
+        impl_resolved = {
+            "target": {
+                "class": "cpu",
+                "backend": "fortran",
+                "architecture": "x86_64",
+            },
+            "toolchain": {
+                "language": "fortran",
+                "standard": "f2008",
+                "build_system": "make",
+            },
+            "selected": {
+                "backend_key": "cpu/x86_64/fortran/make",
+            },
+            "abstract": {
+                "parallelism": "none",
+                "layout": "scalar_interfaces",
+                "fusion": "none",
+            },
+            "backend_overrides": [],
+        }
+    _write_json(
+        workspace / "plans" / "problem__shallow_water2d__0.3.0" / "plan_test" / "impl.resolved.yaml",
+        impl_resolved,
     )
 
     _write_json(node_dir / "diagnostics.json", {"metric": 1.0})
@@ -1262,6 +1289,170 @@ end program shallow_water2d_runner
             violations = validate(repo_root=repo_root, workspace_root="workspace")
             self.assertTrue(
                 any("run_quality_checks command_id=cmd_quality_001 uses forbidden executable" in v for v in violations)
+            )
+
+    def test_rejects_pytest_quality_check_for_fortran_make_pipeline(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            model_text = """module shallow_water2d_model
+use dynamics_shallow_water_flux_2d_rusanov_p0_model
+implicit none
+contains
+subroutine solve(flag)
+  logical, intent(out) :: flag
+  call dynamics_shallow_water_flux_2d_rusanov_p0__compute_flux(flag)
+end subroutine solve
+end module shallow_water2d_model
+"""
+            runner_text = """program shallow_water2d_runner
+implicit none
+write(*,*) 'ok'
+end program shallow_water2d_runner
+"""
+            _create_minimal_execution_tree(
+                repo_root,
+                dep_spec_id="dynamics_shallow_water_flux_2d_rusanov_p0",
+                model_text=model_text,
+                runner_text=runner_text,
+                run_command=["./simulate", "workspace/case.resolved.yaml", "workspace/outdir"],
+            )
+
+            node_dir = (
+                repo_root
+                / "workspace"
+                / "pipelines"
+                / "problem__shallow_water2d__0.3.0"
+                / "problem__shallow_water2d__0.3.0_test_pipeline"
+                / "execute"
+                / "exe_test_001"
+                / "problem"
+                / "shallow_water2d"
+            )
+            src_dir = (
+                repo_root
+                / "workspace"
+                / "pipelines"
+                / "problem__shallow_water2d__0.3.0"
+                / "problem__shallow_water2d__0.3.0_test_pipeline"
+                / "generate"
+                / "gen_test_001"
+                / "src"
+            )
+            trial_meta_path = node_dir / "trial_meta.json"
+            trial_meta = json.loads(trial_meta_path.read_text(encoding="utf-8"))
+            run_log_ref = trial_meta["source_command_ref"]["run_threads_1"]["command_log_ref"]
+            trial_meta["source_command_ref"]["run_quality_checks"] = {
+                "command_id": "cmd_quality_001",
+                "command_log_ref": run_log_ref,
+            }
+            _write_json(trial_meta_path, trial_meta)
+
+            run_log_path = repo_root / run_log_ref
+            with run_log_path.open("a", encoding="utf-8") as handle:
+                handle.write(
+                    json.dumps(
+                        {
+                            "command_id": "cmd_quality_001",
+                            "tool_name": "run_quality_checks",
+                            "cwd": str(src_dir),
+                            "command": ["pytest", "-q"],
+                        },
+                        ensure_ascii=False,
+                    )
+                    + "\n"
+                )
+
+            violations = validate(repo_root=repo_root, workspace_root="workspace")
+            self.assertTrue(
+                any("must use make_test/make_check for toolchain.language=fortran and toolchain.build_system=make" in v for v in violations)
+            )
+
+    def test_rejects_make_quality_check_without_declared_test_target(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            model_text = """module shallow_water2d_model
+use dynamics_shallow_water_flux_2d_rusanov_p0_model
+implicit none
+contains
+subroutine solve(flag)
+  logical, intent(out) :: flag
+  call dynamics_shallow_water_flux_2d_rusanov_p0__compute_flux(flag)
+end subroutine solve
+end module shallow_water2d_model
+"""
+            runner_text = """program shallow_water2d_runner
+implicit none
+write(*,*) 'ok'
+end program shallow_water2d_runner
+"""
+            _create_minimal_execution_tree(
+                repo_root,
+                dep_spec_id="dynamics_shallow_water_flux_2d_rusanov_p0",
+                model_text=model_text,
+                runner_text=runner_text,
+                run_command=["./simulate", "workspace/case.resolved.yaml", "workspace/outdir"],
+                makefile_text="""FC ?= gfortran
+OBJS = shallow_water2d_model.o shallow_water2d_runner.o
+
+simulate: $(OBJS)
+\t$(FC) -o $@ $(OBJS)
+
+shallow_water2d_model.o shallow_water2d_model.mod: shallow_water2d_model.f90
+\t$(FC) -c $<
+
+shallow_water2d_runner.o: shallow_water2d_runner.f90 shallow_water2d_model.mod
+\t$(FC) -c $<
+""",
+            )
+
+            node_dir = (
+                repo_root
+                / "workspace"
+                / "pipelines"
+                / "problem__shallow_water2d__0.3.0"
+                / "problem__shallow_water2d__0.3.0_test_pipeline"
+                / "execute"
+                / "exe_test_001"
+                / "problem"
+                / "shallow_water2d"
+            )
+            src_dir = (
+                repo_root
+                / "workspace"
+                / "pipelines"
+                / "problem__shallow_water2d__0.3.0"
+                / "problem__shallow_water2d__0.3.0_test_pipeline"
+                / "generate"
+                / "gen_test_001"
+                / "src"
+            )
+            trial_meta_path = node_dir / "trial_meta.json"
+            trial_meta = json.loads(trial_meta_path.read_text(encoding="utf-8"))
+            run_log_ref = trial_meta["source_command_ref"]["run_threads_1"]["command_log_ref"]
+            trial_meta["source_command_ref"]["run_quality_checks"] = {
+                "command_id": "cmd_quality_001",
+                "command_log_ref": run_log_ref,
+            }
+            _write_json(trial_meta_path, trial_meta)
+
+            run_log_path = repo_root / run_log_ref
+            with run_log_path.open("a", encoding="utf-8") as handle:
+                handle.write(
+                    json.dumps(
+                        {
+                            "command_id": "cmd_quality_001",
+                            "tool_name": "run_quality_checks",
+                            "cwd": str(src_dir),
+                            "command": ["make", "test"],
+                        },
+                        ensure_ascii=False,
+                    )
+                    + "\n"
+                )
+
+            violations = validate(repo_root=repo_root, workspace_root="workspace")
+            self.assertTrue(
+                any("Makefile: missing test target required by run_quality_checks command_id=cmd_quality_001" in v for v in violations)
             )
 
     def test_rejects_source_command_log_outside_workspace(self) -> None:

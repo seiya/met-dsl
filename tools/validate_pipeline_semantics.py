@@ -85,6 +85,7 @@ FORTRAN_KEYWORDS = {
 }
 QUALITY_CHECK_ALLOWED_COMMANDS = {"make", "ctest", "pytest"}
 FORBIDDEN_QUALITY_CHECK_EXECUTABLES = {"python", "python3", "pypy", "bash", "sh", "zsh"}
+MAKE_QUALITY_CHECK_REQUIRED_LANGUAGES = {"fortran", "c", "cpp", "mixed"}
 TEST_ID_HEADING_PATTERN = re.compile(r"^###\s+\d+-\d+\.\s+`([^`]+)`\s*$")
 TEST_OUTCOME_VALUES = {"pass", "fail", "xfail", "skipped", "blocked"}
 BRACKET_SHAPE_EXPR_PATTERN = re.compile(r"^\[\s*([^\]]+?)\s*\]$")
@@ -1425,6 +1426,87 @@ def _algorithm_contract_path_for_execution(
     return plan_dir / "algorithm.resolved.yaml"
 
 
+def _impl_contract_for_execution(
+    repo_root: Path, execution: NodeExecution
+) -> dict[str, Any] | None:
+    plan_dir = _plan_dir_for_execution(repo_root, execution)
+    if plan_dir is None:
+        return None
+
+    contract_path = plan_dir / "impl.resolved.yaml"
+    if not contract_path.exists():
+        return None
+
+    try:
+        data = _read_yaml(contract_path)
+    except yaml.YAMLError:
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _resolve_logged_path(repo_root: Path, raw_path: str) -> Path:
+    path = Path(raw_path)
+    if path.is_absolute():
+        return path
+    return repo_root / path
+
+
+def _quality_check_preset_from_command(command: list[str]) -> str | None:
+    normalized = [str(token).strip().lower() for token in command if str(token).strip()]
+    if not normalized:
+        return None
+    executable = Path(normalized[0]).name.lower()
+    if executable == "make":
+        targets = set(normalized[1:])
+        if "test" in targets:
+            return "make_test"
+        if "check" in targets:
+            return "make_check"
+        return None
+    if executable == "ctest":
+        return "ctest"
+    if executable == "pytest":
+        return "pytest"
+    return None
+
+
+def _generate_src_dirs(pipeline_dir: Path) -> list[Path]:
+    generate_root = pipeline_dir / "generate"
+    if not generate_root.exists():
+        return []
+    return sorted(
+        gen_dir / "src"
+        for gen_dir in generate_root.iterdir()
+        if gen_dir.is_dir() and (gen_dir / "src").exists()
+    )
+
+
+def _path_is_same_or_under(path: Path, root: Path) -> bool:
+    try:
+        path.resolve().relative_to(root.resolve())
+    except ValueError:
+        return False
+    return True
+
+
+def _make_targets(makefile_path: Path) -> set[str]:
+    targets: set[str] = set()
+    for raw_line in makefile_path.read_text(encoding="utf-8", errors="ignore").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or raw_line.startswith("\t"):
+            continue
+        if ":" not in raw_line:
+            continue
+        head, _ = raw_line.split(":", 1)
+        if "=" in head:
+            continue
+        for token in head.split():
+            token_l = token.strip().lower()
+            if token_l:
+                targets.add(token_l)
+    return targets
+
+
 def _algorithm_state_contract(contract: dict[str, Any]) -> dict[str, Any] | None:
     state_contract = contract.get("state_contract")
     if isinstance(state_contract, dict):
@@ -2607,6 +2689,20 @@ def _validate_quality_check_commands(
     if source_command_ref is None:
         return
 
+    impl_contract = _impl_contract_for_execution(repo_root, execution)
+    toolchain = impl_contract.get("toolchain") if isinstance(impl_contract, dict) else None
+    language = None
+    build_system = None
+    if isinstance(toolchain, dict):
+        raw_language = toolchain.get("language")
+        raw_build_system = toolchain.get("build_system")
+        if isinstance(raw_language, str) and raw_language.strip():
+            language = raw_language.strip().lower()
+        if isinstance(raw_build_system, str) and raw_build_system.strip():
+            build_system = raw_build_system.strip().lower()
+
+    generate_src_dirs = _generate_src_dirs(execution.pipeline_dir)
+
     for entry in _iter_command_ref_entries(source_command_ref):
         command_id = entry.get("command_id")
         log_ref = entry.get("command_log_ref") or entry.get("command_log_path")
@@ -2662,6 +2758,53 @@ def _validate_quality_check_commands(
             if "test" not in targets and "check" not in targets:
                 violations.append(
                     f"{trial_meta_path}:run_quality_checks command_id={command_id} make command must include test/check target"
+                )
+
+        preset = _quality_check_preset_from_command(normalized)
+        raw_cwd = matched.get("cwd")
+        cwd_path = (
+            _resolve_logged_path(repo_root, raw_cwd)
+            if isinstance(raw_cwd, str) and raw_cwd.strip()
+            else None
+        )
+
+        if build_system == "make" and language in MAKE_QUALITY_CHECK_REQUIRED_LANGUAGES:
+            if preset not in {"make_test", "make_check"}:
+                violations.append(
+                    f"{trial_meta_path}:run_quality_checks command_id={command_id} "
+                    f"must use make_test/make_check for toolchain.language={language} and toolchain.build_system=make"
+                )
+                continue
+
+            if cwd_path is None:
+                violations.append(
+                    f"{trial_meta_path}:run_quality_checks command_id={command_id} "
+                    "must record cwd under generate/<generation_id>/src"
+                )
+                continue
+
+            if not generate_src_dirs or not any(
+                _path_is_same_or_under(cwd_path, src_dir) for src_dir in generate_src_dirs
+            ):
+                violations.append(
+                    f"{trial_meta_path}:run_quality_checks command_id={command_id} "
+                    "must run inside generate/<generation_id>/src for make-based quality check"
+                )
+                continue
+
+            makefile_path = cwd_path / "Makefile"
+            if not makefile_path.exists():
+                violations.append(
+                    f"{trial_meta_path}:run_quality_checks command_id={command_id} "
+                    f"requires Makefile in quality check cwd ({makefile_path})"
+                )
+                continue
+
+            required_target = "test" if preset == "make_test" else "check"
+            if required_target not in _make_targets(makefile_path):
+                violations.append(
+                    f"{makefile_path}: missing {required_target} target required by run_quality_checks "
+                    f"command_id={command_id}"
                 )
 
 

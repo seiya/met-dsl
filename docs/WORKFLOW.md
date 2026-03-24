@@ -68,6 +68,8 @@ terms は `GLOSSARY.md` を参照する。
 28. 出力形式、input/output contract、判定条件の要求定義は `controlled_spec.md` と `tests.md` と `deps.yaml` と `derived_contract.json` と `docs/` canonical source 文書のみを参照しなければならない。
 29. `tools/` 配下の検証 `python` スクリプト、`quality check` 実装、`verify` 実装は妥当性確認専用入力として扱い、要求定義または出力形式定義の入力として参照してはならない。
 30. 要求定義が不足する場合、検証実装からの逆算補完を禁止し、当該 phase を `fail` で停止しなければならない。
+31. `quality check` 実行に必要な preset-compatible quality path は `Generate` の正式出力だけで成立しなければならない。下流 phase が `workspace/` 配下へ `test` source、harness、補助 `script`、一時 `Makefile` を追加生成して成立させる運用を禁止する。
+32. `quality check` 実行方式は `impl.resolved.yaml` の `toolchain.language` と `toolchain.build_system` に整合しなければならない。`toolchain.build_system=make` かつ `toolchain.language=fortran` / `c` / `cpp` / `mixed` 系では `make_test` または `make_check` を使用し、`pytest` による代替を禁止する。
 
 ## 共通規約
 ### `LLM` 利用 phase
@@ -211,6 +213,9 @@ workspace/
 - execution input: `case.resolved.yaml`、`algorithm.resolved.yaml`、`impl.resolved.yaml`、`dependency.resolved.yaml`
 - verification input: `case.resolved.yaml`、`algorithm.resolved.yaml`、`derived_contract.json`、`dependency.resolved.yaml`、`impl.resolved.yaml`
 - 出力: `generate/<generation_id>/src/`、`generate_meta.json`
+- `Generate` は `Execute` が `run_quality_checks` の `preset` だけで実行可能な preset-compatible quality path を正式出力へ含めなければならない。不足時は `Generate fail` とする。
+- `toolchain.build_system=make` かつ `toolchain.language=fortran` / `c` / `cpp` / `mixed` 系では、`generate/<generation_id>/src/Makefile` に `test` または `check` target を必須定義しなければならない。欠落時は `Generate fail` とする。
+- `Generate verify` は、`quality check` 成立のために下流 phase で追加 source 生成が不要であることを検査しなければならない。
 
 ### 3. Build
 - execution input: `generate/<generation_id>/src/`、`impl.resolved.yaml`
@@ -391,6 +396,8 @@ workspace/
 - `Build` または `Execute` が失敗した場合、`diagnostics.json` / `perf.json` の人工生成を禁止し、当該 `node` を `fail` とする。
 - `quality_check.json` は `checks.verdict_available=true` と `checks.diagnostics_match=true` と `checks.verdict_match=true` を同時に満たさなければならない。いずれかが `false` または欠落の場合は `Execute fail` とする。
 - `quality check` 実行は `run_quality_checks` の `preset` 指定のみを許可し、`python3 quality_check.py` など任意コマンド実行を禁止する。
+- `Execute` は `quality check` 成立のために `execute/<execution_id>/<node_key>/` 配下へ `test` source、harness、補助 `script`、一時 `Makefile` を生成してはならない。必要 artifact が `Generate` または `Build` 出力に存在しない場合は `Execute fail` とする。
+- `toolchain.build_system=make` かつ `toolchain.language=fortran` / `c` / `cpp` / `mixed` 系では、`quality check` は `generate/<generation_id>/src/` を `project_dir` とする `make_test` または `make_check` で実行しなければならない。
 - `perf.json` の仕様は `PERFORMANCE_DIAGNOSTICS.md` を参照する。
 
 ### 5. Judge

@@ -16,6 +16,8 @@ Execute ステージの実行責務を固定し、判定可能なランタイム
 - `run` は `MCP` サーバーの `run_program` を使用する。
 - `run_program` の実行コマンドは `case.resolved.yaml` を入力引数として必ず含まなければならない。
 - `quality check` は `MCP` サーバーの `run_quality_checks` を使用する。
+- `quality check` 成立のために `execute/<execution_id>/<node_key>/` 配下へ `test` source、harness、補助 `script`、一時 `Makefile` を追加生成してはならない。
+- `toolchain.build_system=make` かつ `toolchain.language=fortran` / `c` / `cpp` / `mixed` 系の場合、`quality check` は `generate/<generation_id>/src/` に対する `run_quality_checks preset=make_test` または `preset=make_check` で実行しなければならない。適合経路が存在しない場合は `Execute fail` とする。
 - `runner` が `model` を呼び出し、`diagnostics.json` と `perf.json` を出力する。
 - `runner` が `verdict.json` と `aggregate_verdict.json` と `summary.json` と `trial_meta.json` を直接出力してはならない。
 - `Execute` 完了条件は `diagnostics.json` と `perf.json` が標準 `JSON` parser で復元可能な UTF-8 `JSON object` であることを含む。不正 `JSON` を検出した場合は `Execute fail` とし、`Judge` を開始してはならない。

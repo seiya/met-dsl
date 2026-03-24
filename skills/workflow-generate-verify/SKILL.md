@@ -43,6 +43,8 @@ Generate ステージ出力の検証責務を固定し、`Build` 失敗を事前
 - `toolchain.language=fortran` の場合、`module` 名と公開 `subroutine` 名に `spec_id` 由来接頭辞が付与されていることを検査する。
 - `toolchain.build_system=make` かつ `toolchain.language=fortran` の場合、`src/Makefile` の各オブジェクトターゲットが `use` 依存に対応した `.mod` または依存 `.o` の前提条件を明示していることを検査する。
 - `toolchain.build_system=make` かつ `toolchain.language=fortran` の場合、`src/Makefile` が `make -j` 互換の依存関係記述を欠落していないことを検査する。
+- `quality check` 実行に必要な preset-compatible quality path が `Generate` 出力だけで成立することを検査する。`Execute` で追加 `test` source、harness、補助 `script`、一時 `Makefile` を生成しなければ成立しない構成を `fail` とする。
+- `toolchain.build_system=make` かつ `toolchain.language=fortran` / `c` / `cpp` / `mixed` 系の場合、`src/Makefile` に `test` または `check` target が存在し、`run_quality_checks preset=make_test` または `preset=make_check` に適合することを検査する。
 - `dependency.resolved.yaml` に存在しない依存 `node` または未宣言 `operation` への参照を生成コードが導入していないことを検査する。`direct_deps` 外の呼び出し、未解決 `component` 参照、`profile` 拘束と矛盾する実装選択を `fail` とする。
 - `generate_meta.json` の必須項目を検査する。
 - `debug_mode=false` の場合に `attempts/` が存在しないことを検査する。
