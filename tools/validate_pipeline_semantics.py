@@ -95,6 +95,39 @@ SUBSTEP_WORKFLOW_STEPS = frozenset({"plan", "generate", "tune"})
 AGENT_TERMINAL_STATUSES = {"pass", "fail", "blocked", "timeout", "cancel"}
 
 
+def _required_launch_prompt_markers_for_role(
+    role: str,
+) -> list[str]:
+    markers = [
+        "orchestration_id:",
+        "agent_run_id:",
+        "parent_agent_run_id:",
+        "plan_ref:",
+        "pipeline_ref:",
+        "dependency_ref:",
+        "skill_name:",
+        "skill_ref:",
+        "skill_must_read_refs:",
+        "必須要件:",
+    ]
+    if role == "substep":
+        return [
+            "あなたは substep agent である。",
+            "対象 node_key:",
+            "対象 step:",
+            "対象 substep:",
+            *markers,
+        ]
+    if role == "step":
+        return [
+            "あなたは step agent である。",
+            "対象 node_key:",
+            "対象 step:",
+            *markers,
+        ]
+    return []
+
+
 def _normalize_workspace_root_token(workspace_root: str) -> str:
     token = workspace_root.strip().replace("\\", "/")
     token = token.lstrip("./")
@@ -879,6 +912,33 @@ def _lineage_records(
             )
         )
     return records
+
+
+def _validate_pipeline_lineage_presence(
+    executions: list[NodeExecution],
+    violations: list[str],
+) -> None:
+    seen: set[Path] = set()
+    for execution in executions:
+        pipeline_dir = execution.pipeline_dir
+        if pipeline_dir in seen:
+            continue
+        seen.add(pipeline_dir)
+        lineage_path = pipeline_dir / "lineage.json"
+        if not lineage_path.exists():
+            violations.append(f"{lineage_path}: missing")
+            continue
+        try:
+            lineage = _read_json(lineage_path)
+        except json.JSONDecodeError:
+            violations.append(f"{lineage_path}: invalid json")
+            continue
+        if not isinstance(lineage, dict):
+            violations.append(f"{lineage_path}: must be json object")
+            continue
+        node_key = lineage.get("node_key")
+        if not isinstance(node_key, str) or not node_key.strip():
+            violations.append(f"{lineage_path}:node_key must be non-empty string")
 
 
 def _iter_command_ref_entries(node: Any) -> list[dict[str, Any]]:
@@ -3354,6 +3414,15 @@ def _validate_orchestration_hierarchy(
                                 violations.append(
                                     f"{runs_path}:line {idx + 1} {key} target must be non-empty ({ref_token})"
                                 )
+                            if key == "launch_prompt_ref":
+                                required_markers = _required_launch_prompt_markers_for_role(role_l)
+                                missing_markers = [
+                                    marker for marker in required_markers if marker not in launch_text
+                                ]
+                                if missing_markers:
+                                    violations.append(
+                                        f"{runs_path}:line {idx + 1} {key} missing workflow-orchestration template markers ({', '.join(missing_markers)})"
+                                    )
 
                     for key in ("agent_result_ref", "agent_summary_ref"):
                         agent_ref = item.get(key)
@@ -3655,6 +3724,11 @@ def validate(
     executions = _node_executions(workspace_path, pipeline_roots=pipeline_roots)
     if not executions:
         return [f"{workspace_path}/pipelines: no execution artifacts found"]
+
+    _validate_pipeline_lineage_presence(
+        executions=executions,
+        violations=violations,
+    )
 
     if require_orchestration:
         _validate_orchestration_hierarchy(

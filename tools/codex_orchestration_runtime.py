@@ -238,6 +238,51 @@ def _extract_launch_reply_text(response_payload: dict[str, Any]) -> str:
     return json.dumps(response_payload, ensure_ascii=False, indent=2)
 
 
+def _required_launch_prompt_markers(request_payload: dict[str, Any]) -> list[str]:
+    step = request_payload.get("step")
+    if not isinstance(step, str) or not step.strip():
+        return []
+    markers = [
+        "orchestration_id:",
+        "agent_run_id:",
+        "parent_agent_run_id:",
+        "plan_ref:",
+        "pipeline_ref:",
+        "dependency_ref:",
+        "skill_name:",
+        "skill_ref:",
+        "skill_must_read_refs:",
+        "必須要件:",
+    ]
+    substep = request_payload.get("substep")
+    if isinstance(substep, str) and substep.strip():
+        return [
+            "あなたは substep agent である。",
+            "対象 node_key:",
+            "対象 step:",
+            "対象 substep:",
+            *markers,
+        ]
+    return [
+        "あなたは step agent である。",
+        "対象 node_key:",
+        "対象 step:",
+        *markers,
+    ]
+
+
+def _validate_launch_prompt_text(request_payload: dict[str, Any], prompt_text: str) -> None:
+    required_markers = _required_launch_prompt_markers(request_payload)
+    if not required_markers:
+        return
+    missing_markers = [marker for marker in required_markers if marker not in prompt_text]
+    if missing_markers:
+        raise ValueError(
+            "launch prompt text must preserve workflow-orchestration template markers: "
+            + ", ".join(missing_markers)
+        )
+
+
 def _extract_agent_summary_text(payload: dict[str, Any]) -> str:
     for key in (
         "result_summary",
@@ -403,6 +448,115 @@ def _validate_terminal_run_payload(
     for idx, item in enumerate(output_refs):
         if not isinstance(item, str) or not item.strip():
             raise ValueError(f"output_refs[{idx}] must be non-empty string")
+
+
+def _validate_step_or_substep_launch_refs(repo_root: Path, payload: dict[str, Any]) -> None:
+    for key in (
+        "launch_request_ref",
+        "launch_response_ref",
+        "launch_prompt_ref",
+        "launch_reply_ref",
+    ):
+        ref = payload.get(key)
+        if not isinstance(ref, str) or not ref.strip():
+            raise ValueError(f"{key} must be non-empty string")
+        target = repo_root / ref.strip()
+        if not target.exists():
+            raise ValueError(f"{key} target not found: {ref}")
+        if key in {"launch_prompt_ref", "launch_reply_ref"}:
+            text = target.read_text(encoding="utf-8", errors="ignore")
+            if not text.strip():
+                raise ValueError(f"{key} target must be non-empty: {ref}")
+
+
+def _iter_step_result_paths(root: Path) -> list[Path]:
+    steps_root = root / "steps"
+    if not steps_root.exists():
+        return []
+    return sorted(steps_root.glob("*/*/*/step_result.json"))
+
+
+def _validate_orchestration_completion_for_pass(
+    repo_root: Path,
+    orchestration_id: str,
+) -> None:
+    root = _orchestration_root(repo_root, orchestration_id)
+    graph_path = root / "agent_graph.json"
+    runs = _load_run_records(root)
+    if not runs:
+        raise RuntimeError("cannot mark orchestration pass without agent_runs.jsonl records")
+
+    orchestration_runs = [
+        payload
+        for payload in runs.values()
+        if isinstance(payload.get("agent_role"), str)
+        and payload.get("agent_role") == "orchestration"
+    ]
+    if not orchestration_runs:
+        raise RuntimeError("cannot mark orchestration pass without orchestration agent run record")
+
+    graph = _load_graph(graph_path)
+    edges = graph.get("edges")
+    if not isinstance(edges, list) or not edges:
+        raise RuntimeError("cannot mark orchestration pass without agent_graph edges")
+
+    step_result_refs_by_substep: dict[str, Path] = {}
+    for result_path in _iter_step_result_paths(root):
+        try:
+            result = _read_json(result_path)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(f"invalid step_result.json: {result_path}") from exc
+        if not isinstance(result, dict):
+            raise RuntimeError(f"step_result.json must be object: {result_path}")
+        executor_run_id = result.get("executor_agent_run_id")
+        if not isinstance(executor_run_id, str) or not executor_run_id.strip():
+            raise RuntimeError(f"executor_agent_run_id missing: {result_path}")
+        substep_run_ids = result.get("substep_agent_run_ids")
+        if not isinstance(substep_run_ids, list):
+            raise RuntimeError(f"substep_agent_run_ids must be list: {result_path}")
+        for substep_run_id in substep_run_ids:
+            if isinstance(substep_run_id, str) and substep_run_id.strip():
+                step_result_refs_by_substep[substep_run_id.strip()] = result_path
+
+    for idx, edge in enumerate(edges):
+        if not isinstance(edge, dict):
+            raise RuntimeError(f"agent_graph edge must be object: index={idx}")
+        parent_id = edge.get("parent_agent_run_id")
+        child_id = edge.get("child_agent_run_id")
+        if not isinstance(parent_id, str) or not parent_id.strip() or parent_id.strip() not in runs:
+            raise RuntimeError(
+                f"agent_graph edge parent_agent_run_id missing from agent_runs.jsonl: index={idx}"
+            )
+        if not isinstance(child_id, str) or not child_id.strip() or child_id.strip() not in runs:
+            raise RuntimeError(
+                f"agent_graph edge child_agent_run_id missing from agent_runs.jsonl: index={idx}"
+            )
+
+    for run_id, payload in runs.items():
+        role = payload.get("agent_role")
+        if not isinstance(role, str) or role not in {"step", "substep"}:
+            continue
+        status = payload.get("status")
+        if not isinstance(status, str) or status.strip().lower() not in TERMINAL_STATUSES:
+            raise RuntimeError(f"{role} agent_run_id must be terminal before pass: {run_id}")
+        _validate_step_or_substep_launch_refs(repo_root, payload)
+        node_key = payload.get("node_key")
+        step = payload.get("step")
+        if not isinstance(node_key, str) or not node_key.strip():
+            raise RuntimeError(f"{role} node_key missing: {run_id}")
+        if not isinstance(step, str) or not step.strip():
+            raise RuntimeError(f"{role} step missing: {run_id}")
+        node_safe = _node_key_to_safe(node_key.strip())
+        step_token = step.strip().lower()
+        if role == "step":
+            result_path = root / "steps" / node_safe / step_token / run_id / "step_result.json"
+            if not result_path.exists():
+                raise RuntimeError(f"step_result.json missing for step agent_run_id={run_id}")
+        else:
+            if run_id not in step_result_refs_by_substep:
+                raise RuntimeError(
+                    f"step_result.json missing substep_agent_run_ids entry for substep agent_run_id={run_id}"
+                )
 
 
 def _validate_step_result_payload(
@@ -606,6 +760,7 @@ def record_launch(
         raise ValueError("launch prompt text must be non-empty")
     if not reply_text.strip():
         raise ValueError("launch reply text must be non-empty")
+    _validate_launch_prompt_text(request_payload, prompt_text)
 
     request_ref, response_ref = _launch_refs(orchestration_id, child_agent_run_id)
     prompt_ref, reply_ref = _launch_dialog_refs(orchestration_id, child_agent_run_id)
@@ -721,6 +876,7 @@ def record_agent_run(
         payload.setdefault("launch_response_ref", response_ref)
         payload.setdefault("launch_prompt_ref", prompt_ref)
         payload.setdefault("launch_reply_ref", reply_ref)
+        _validate_step_or_substep_launch_refs(repo_root, payload)
 
     dialogs_root = root / "agents" / agent_run_id / "dialogs"
     dialogs_root.mkdir(parents=True, exist_ok=True)
@@ -785,6 +941,7 @@ def update_orchestration_status(
             orchestration_id,
             enforce_live_probe=False,
         )
+        _validate_orchestration_completion_for_pass(repo_root, orchestration_id)
     meta_path = _orchestration_root(repo_root, orchestration_id) / "orchestration_meta.json"
     if not meta_path.exists():
         raise FileNotFoundError(meta_path)

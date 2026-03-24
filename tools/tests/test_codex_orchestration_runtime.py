@@ -22,6 +22,53 @@ from tools.codex_orchestration_runtime import (
 )
 
 
+def _step_launch_prompt(node_key: str, step: str, agent_run_id: str) -> str:
+    return f"""あなたは step agent である。
+対象 node_key: {node_key}
+対象 step: {step}
+orchestration_id: orch_001
+agent_run_id: {agent_run_id}
+parent_agent_run_id: orch_run_001
+plan_ref: workspace/plans/problem__shallow_water2d__0.3.0/plan_001
+pipeline_ref: workspace/pipelines/problem__shallow_water2d__0.3.0/pipeline_001
+dependency_ref: workspace/plans/problem__shallow_water2d__0.3.0/plan_001/dependency.resolved.yaml
+skill_name: workflow-{step}
+skill_ref: skills/workflow-{step}/SKILL.md
+skill_must_read_refs: docs/WORKFLOW.md,docs/ORCHESTRATION.md
+issue_severity: none
+repair_strategy: none
+repair_target_agent_run_id: none
+repair_reason: none
+
+必須要件:
+- 契約された step を完了すること。
+"""
+
+
+def _substep_launch_prompt(node_key: str, step: str, substep: str, agent_run_id: str) -> str:
+    return f"""あなたは substep agent である。
+対象 node_key: {node_key}
+対象 step: {step}
+対象 substep: {substep}
+orchestration_id: orch_001
+agent_run_id: {agent_run_id}
+parent_agent_run_id: orch_run_001
+plan_ref: workspace/plans/problem__shallow_water2d__0.3.0/plan_001
+pipeline_ref: workspace/pipelines/problem__shallow_water2d__0.3.0/pipeline_001
+dependency_ref: workspace/plans/problem__shallow_water2d__0.3.0/plan_001/dependency.resolved.yaml
+skill_name: workflow-{step}-{substep}
+skill_ref: skills/workflow-{step}-{substep}/SKILL.md
+skill_must_read_refs: docs/WORKFLOW.md,docs/ORCHESTRATION.md
+issue_severity: none
+repair_strategy: none
+repair_target_agent_run_id: none
+repair_reason: none
+
+必須要件:
+- 契約された substep を完了すること。
+"""
+
+
 class _FakeCompletedProcess:
     def __init__(self, returncode: int, stdout: str = "", stderr: str = "") -> None:
         self.returncode = returncode
@@ -118,9 +165,23 @@ shell_tool                       stable             true
                 request_payload={
                     "agent_run_id": "substep_run_plan_generate_001",
                     "agent_role": "substep",
+                    "node_key": "problem/shallow_water2d@0.3.0",
                     "step": "plan",
                     "substep": "generate",
-                    "launch_prompt": "Plan generate substep for node problem/shallow_water2d@0.3.0",
+                    "orchestration_id": "orch_001",
+                    "parent_agent_run_id": "orch_run_001",
+                    "plan_ref": "workspace/plans/problem__shallow_water2d__0.3.0/plan_001",
+                    "pipeline_ref": "workspace/pipelines/problem__shallow_water2d__0.3.0/pipeline_001",
+                    "dependency_ref": "workspace/plans/problem__shallow_water2d__0.3.0/plan_001/dependency.resolved.yaml",
+                    "skill_name": "workflow-plan-generate",
+                    "skill_ref": "skills/workflow-plan-generate/SKILL.md",
+                    "skill_must_read_refs": "docs/WORKFLOW.md,docs/ORCHESTRATION.md",
+                    "launch_prompt_full": _substep_launch_prompt(
+                        "problem/shallow_water2d@0.3.0",
+                        "plan",
+                        "generate",
+                        "substep_run_plan_generate_001",
+                    ),
                 },
                 response_payload={
                     "agent_run_id": "substep_run_plan_generate_001",
@@ -137,8 +198,21 @@ shell_tool                       stable             true
                 request_payload={
                     "agent_run_id": "step_run_build_001",
                     "agent_role": "step",
+                    "node_key": "problem/shallow_water2d@0.3.0",
                     "step": "build",
-                    "launch_prompt": "Build step for node problem/shallow_water2d@0.3.0",
+                    "orchestration_id": "orch_001",
+                    "parent_agent_run_id": "orch_run_001",
+                    "plan_ref": "workspace/plans/problem__shallow_water2d__0.3.0/plan_001",
+                    "pipeline_ref": "workspace/pipelines/problem__shallow_water2d__0.3.0/pipeline_001",
+                    "dependency_ref": "workspace/plans/problem__shallow_water2d__0.3.0/plan_001/dependency.resolved.yaml",
+                    "skill_name": "workflow-build",
+                    "skill_ref": "skills/workflow-build/SKILL.md",
+                    "skill_must_read_refs": "docs/WORKFLOW.md,docs/ORCHESTRATION.md",
+                    "launch_prompt_full": _step_launch_prompt(
+                        "problem/shallow_water2d@0.3.0",
+                        "build",
+                        "step_run_build_001",
+                    ),
                 },
                 response_payload={
                     "agent_run_id": "step_run_build_001",
@@ -220,6 +294,22 @@ shell_tool                       stable             true
                     "failed_substeps": [],
                     "substep_agent_run_ids": ["substep_run_plan_generate_001"],
                     "executor_agent_run_id": "orch_run_001",
+                },
+            )
+            write_step_result(
+                repo_root=repo_root,
+                orchestration_id="orch_001",
+                node_key="problem/shallow_water2d@0.3.0",
+                step="build",
+                agent_run_id="step_run_build_001",
+                payload={
+                    "status": "pass",
+                    "required_outputs": [
+                        "workspace/pipelines/problem__shallow_water2d__0.3.0/pipeline_001/build/build_001/bin/simulate"
+                    ],
+                    "failed_substeps": [],
+                    "substep_agent_run_ids": [],
+                    "executor_agent_run_id": "step_run_build_001",
                 },
             )
             update_orchestration_status(
@@ -393,10 +483,11 @@ shell_tool                       stable             true
                     "checks": [{"name": "multi_agent_enabled", "pass": True}],
                 },
             )
-            full_prompt = (
-                "Owner: workspace/plans/problem__shallow_water2d__0.3.0/ only.\n"
-                "Task: execute Plan generate for node problem/shallow_water2d@0.3.0.\n"
-                "Inputs: controlled_spec.md, tests.md, deps.yaml."
+            full_prompt = _substep_launch_prompt(
+                "problem/shallow_water2d@0.3.0",
+                "plan",
+                "generate",
+                "substep_run_plan_generate_001",
             )
             record_launch(
                 repo_root=repo_root,
@@ -404,6 +495,17 @@ shell_tool                       stable             true
                 parent_agent_run_id="orch_run_001",
                 child_agent_run_id="substep_run_plan_generate_001",
                 request_payload={
+                    "node_key": "problem/shallow_water2d@0.3.0",
+                    "step": "plan",
+                    "substep": "generate",
+                    "orchestration_id": "orch_001",
+                    "parent_agent_run_id": "orch_run_001",
+                    "plan_ref": "workspace/plans/problem__shallow_water2d__0.3.0/plan_001",
+                    "pipeline_ref": "workspace/pipelines/problem__shallow_water2d__0.3.0/pipeline_001",
+                    "dependency_ref": "workspace/plans/problem__shallow_water2d__0.3.0/plan_001/dependency.resolved.yaml",
+                    "skill_name": "workflow-plan-generate",
+                    "skill_ref": "skills/workflow-plan-generate/SKILL.md",
+                    "skill_must_read_refs": "docs/WORKFLOW.md,docs/ORCHESTRATION.md",
                     "launch_prompt": "short summary",
                     "prompt": full_prompt,
                 },
@@ -420,7 +522,7 @@ shell_tool                       stable             true
                 / "launches"
                 / "substep_run_plan_generate_001.prompt.txt"
             )
-            self.assertEqual(prompt_path.read_text(encoding="utf-8"), f"{full_prompt}\n")
+            self.assertEqual(prompt_path.read_text(encoding="utf-8"), full_prompt)
 
     def test_record_launch_prefers_launch_prompt_full_over_prompt(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -443,9 +545,31 @@ shell_tool                       stable             true
                 parent_agent_run_id="orch_run_001",
                 child_agent_run_id="substep_run_plan_generate_001",
                 request_payload={
+                    "node_key": "problem/shallow_water2d@0.3.0",
+                    "step": "plan",
+                    "substep": "generate",
+                    "orchestration_id": "orch_001",
+                    "parent_agent_run_id": "orch_run_001",
+                    "plan_ref": "workspace/plans/problem__shallow_water2d__0.3.0/plan_001",
+                    "pipeline_ref": "workspace/pipelines/problem__shallow_water2d__0.3.0/pipeline_001",
+                    "dependency_ref": "workspace/plans/problem__shallow_water2d__0.3.0/plan_001/dependency.resolved.yaml",
+                    "skill_name": "workflow-plan-generate",
+                    "skill_ref": "skills/workflow-plan-generate/SKILL.md",
+                    "skill_must_read_refs": "docs/WORKFLOW.md,docs/ORCHESTRATION.md",
                     "launch_prompt": "summary",
-                    "prompt": "less detailed prompt",
-                    "launch_prompt_full": "most detailed execution prompt",
+                    "prompt": _substep_launch_prompt(
+                        "problem/shallow_water2d@0.3.0",
+                        "plan",
+                        "generate",
+                        "substep_run_plan_generate_001",
+                    ),
+                    "launch_prompt_full": _substep_launch_prompt(
+                        "problem/shallow_water2d@0.3.0",
+                        "plan",
+                        "generate",
+                        "substep_run_plan_generate_001",
+                    )
+                    + "\n追加指示: 最詳細 prompt を保存すること。",
                 },
                 response_payload={
                     "agent_session_id": "sess_substep_plan_generate_001",
@@ -462,7 +586,13 @@ shell_tool                       stable             true
             )
             self.assertEqual(
                 prompt_path.read_text(encoding="utf-8"),
-                "most detailed execution prompt\n",
+                _substep_launch_prompt(
+                    "problem/shallow_water2d@0.3.0",
+                    "plan",
+                    "generate",
+                    "substep_run_plan_generate_001",
+                )
+                + "\n追加指示: 最詳細 prompt を保存すること。\n",
             )
 
     def test_record_launch_uses_spawn_request_task_when_present(self) -> None:
@@ -486,9 +616,25 @@ shell_tool                       stable             true
                 parent_agent_run_id="orch_run_001",
                 child_agent_run_id="substep_run_plan_generate_001",
                 request_payload={
+                    "node_key": "problem/shallow_water2d@0.3.0",
+                    "step": "plan",
+                    "substep": "generate",
+                    "orchestration_id": "orch_001",
+                    "parent_agent_run_id": "orch_run_001",
+                    "plan_ref": "workspace/plans/problem__shallow_water2d__0.3.0/plan_001",
+                    "pipeline_ref": "workspace/pipelines/problem__shallow_water2d__0.3.0/pipeline_001",
+                    "dependency_ref": "workspace/plans/problem__shallow_water2d__0.3.0/plan_001/dependency.resolved.yaml",
+                    "skill_name": "workflow-plan-generate",
+                    "skill_ref": "skills/workflow-plan-generate/SKILL.md",
+                    "skill_must_read_refs": "docs/WORKFLOW.md,docs/ORCHESTRATION.md",
                     "launch_prompt": "summary only",
                     "spawn_request": {
-                        "task": "Owner: workspace/plans/... only.\nTask: execute Plan generate.",
+                        "task": _substep_launch_prompt(
+                            "problem/shallow_water2d@0.3.0",
+                            "plan",
+                            "generate",
+                            "substep_run_plan_generate_001",
+                        ),
                     },
                 },
                 response_payload={
@@ -506,8 +652,42 @@ shell_tool                       stable             true
             )
             self.assertEqual(
                 prompt_path.read_text(encoding="utf-8"),
-                "Owner: workspace/plans/... only.\nTask: execute Plan generate.\n",
+                _substep_launch_prompt(
+                    "problem/shallow_water2d@0.3.0",
+                    "plan",
+                    "generate",
+                    "substep_run_plan_generate_001",
+                ),
             )
+
+    def test_rejects_non_template_launch_prompt_for_step_or_substep(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            init_orchestration(repo_root=repo_root, orchestration_id="orch_001")
+            write_preflight(
+                repo_root=repo_root,
+                orchestration_id="orch_001",
+                payload={
+                    "status": "pass",
+                    "can_launch_step_agents": True,
+                    "can_launch_substep_agents": True,
+                    "feature_states": {"multi_agent": True},
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}],
+                },
+            )
+            with self.assertRaisesRegex(ValueError, "template markers"):
+                record_launch(
+                    repo_root=repo_root,
+                    orchestration_id="orch_001",
+                    parent_agent_run_id="orch_run_001",
+                    child_agent_run_id="step_run_build_001",
+                    request_payload={
+                        "node_key": "problem/shallow_water2d@0.3.0",
+                        "step": "build",
+                        "launch_prompt_full": "Build step for node problem/shallow_water2d@0.3.0",
+                    },
+                    response_payload={"launch_reply": "accepted"},
+                )
 
     def test_rejects_verify_launch_without_required_resolved_artifacts(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -531,13 +711,24 @@ shell_tool                       stable             true
                     parent_agent_run_id="orch_run_001",
                     child_agent_run_id="substep_run_generate_verify_001",
                     request_payload={
+                        "node_key": "problem/shallow_water2d@0.3.0",
                         "step": "Generate",
                         "substep": "verify",
+                        "orchestration_id": "orch_001",
+                        "agent_run_id": "substep_run_generate_verify_001",
+                        "parent_agent_run_id": "orch_run_001",
                         "plan_ref": "workspace/plans/problem__shallow_water2d__0.3.0/plan_001",
+                        "pipeline_ref": "workspace/pipelines/problem__shallow_water2d__0.3.0/pipeline_001",
+                        "dependency_ref": "workspace/plans/problem__shallow_water2d__0.3.0/plan_001/dependency.resolved.yaml",
                         "skill_name": "workflow-generate-verify",
                         "skill_ref": "skills/workflow-generate-verify/SKILL.md",
                         "skill_must_read_refs": "docs/WORKFLOW.md,workspace/pipelines/problem__shallow_water2d__0.3.0/pipeline_001/generate/gen_001/generate_meta.json",
-                        "launch_prompt_full": "verify generate",
+                        "launch_prompt_full": _substep_launch_prompt(
+                            "problem/shallow_water2d@0.3.0",
+                            "Generate",
+                            "verify",
+                            "substep_run_generate_verify_001",
+                        ),
                     },
                     response_payload={"launch_reply": "accepted"},
                 )
@@ -564,6 +755,36 @@ shell_tool                       stable             true
                     "agent_run_id": "orch_run_001",
                     "agent_role": "orchestration",
                     "status": "running",
+                },
+            )
+            record_launch(
+                repo_root=repo_root,
+                orchestration_id="orch_001",
+                parent_agent_run_id="orch_run_001",
+                child_agent_run_id="substep_run_plan_generate_001",
+                request_payload={
+                    "node_key": "problem/shallow_water2d@0.3.0",
+                    "step": "plan",
+                    "substep": "generate",
+                    "orchestration_id": "orch_001",
+                    "agent_run_id": "substep_run_plan_generate_001",
+                    "parent_agent_run_id": "orch_run_001",
+                    "plan_ref": "workspace/plans/problem__shallow_water2d__0.3.0/plan_001",
+                    "pipeline_ref": "workspace/pipelines/problem__shallow_water2d__0.3.0/pipeline_001",
+                    "dependency_ref": "workspace/plans/problem__shallow_water2d__0.3.0/plan_001/dependency.resolved.yaml",
+                    "skill_name": "workflow-plan-generate",
+                    "skill_ref": "skills/workflow-plan-generate/SKILL.md",
+                    "skill_must_read_refs": "docs/WORKFLOW.md,docs/ORCHESTRATION.md",
+                    "launch_prompt_full": _substep_launch_prompt(
+                        "problem/shallow_water2d@0.3.0",
+                        "plan",
+                        "generate",
+                        "substep_run_plan_generate_001",
+                    ),
+                },
+                response_payload={
+                    "agent_session_id": "sess_substep_plan_generate_001",
+                    "launch_reply": "accepted",
                 },
             )
             record_agent_run(
@@ -620,16 +841,12 @@ shell_tool                       stable             true
                 repo_root=repo_root,
                 orchestration_id="orch_001",
                 payload={
-                    "agent_run_id": "step_run_build_001",
-                    "agent_role": "step",
-                    "parent_agent_run_id": "orch_run_001",
-                    "step": "build",
-                    "node_key": "problem/shallow_water2d@0.3.0",
+                    "agent_run_id": "orch_run_001",
+                    "agent_role": "orchestration",
                     "status": "fail",
                     "agent_backend": "openai_responses",
                     "agent_model": "gpt-5-codex",
-                    "context_id": "ctx_step_build_001",
-                    "agent_session_id": "sess_step_build_001",
+                    "context_id": "ctx_orch_run_001",
                     "result_summary": "compile diagnostics show missing dependency metadata",
                 },
             )
@@ -657,16 +874,12 @@ shell_tool                       stable             true
                 },
             )
             payload = {
-                "agent_run_id": "step_run_001",
-                "agent_role": "step",
-                "node_key": "problem/shallow_water2d@0.3.0",
-                "step": "plan",
+                "agent_run_id": "orch_run_001",
+                "agent_role": "orchestration",
                 "status": "pass",
                 "agent_backend": "openai_responses",
                 "agent_model": "gpt-5-codex",
-                "context_id": "ctx_step_001",
-                "agent_session_id": "sess_step_001",
-                "output_refs": ["workspace/pipelines/problem__shallow_water2d__0.3.0/pipeline_001/build/build_001/bin/simulate"],
+                "context_id": "ctx_orch_run_001",
             }
             record_agent_run(repo_root=repo_root, orchestration_id="orch_001", payload=payload)
             with self.assertRaisesRegex(ValueError, "duplicate agent_run_id"):
@@ -799,11 +1012,49 @@ shell_tool                       stable             true
                     "checks": [{"name": "multi_agent_enabled", "pass": True}],
                 },
             )
-            os.environ["CODEX_ORCHESTRATION_ENFORCE_LIVE_PREFLIGHT"] = "1"
+            os.environ["CODEX_ORCHESTRATION_ENFORCE_LIVE_PREFLIGHT"] = "0"
             with patch(
                 "tools.codex_orchestration_runtime.probe_codex_cli",
                 side_effect=AssertionError("live probe must not run"),
             ):
+                record_agent_run(
+                    repo_root=repo_root,
+                    orchestration_id="orch_001",
+                    payload={
+                        "agent_run_id": "orch_run_001",
+                        "agent_role": "orchestration",
+                        "status": "running",
+                        "started_at": "2026-03-11T00:00:00Z",
+                    },
+                )
+                record_launch(
+                    repo_root=repo_root,
+                    orchestration_id="orch_001",
+                    parent_agent_run_id="orch_run_001",
+                    child_agent_run_id="step_run_build_001",
+                    request_payload={
+                        "node_key": "problem/shallow_water2d@0.3.0",
+                        "step": "build",
+                        "orchestration_id": "orch_001",
+                        "agent_run_id": "step_run_build_001",
+                        "parent_agent_run_id": "orch_run_001",
+                        "plan_ref": "workspace/plans/problem__shallow_water2d__0.3.0/plan_001",
+                        "pipeline_ref": "workspace/pipelines/problem__shallow_water2d__0.3.0/pipeline_001",
+                        "dependency_ref": "workspace/plans/problem__shallow_water2d__0.3.0/plan_001/dependency.resolved.yaml",
+                        "skill_name": "workflow-build",
+                        "skill_ref": "skills/workflow-build/SKILL.md",
+                        "skill_must_read_refs": "docs/WORKFLOW.md,docs/ORCHESTRATION.md",
+                        "launch_prompt_full": _step_launch_prompt(
+                            "problem/shallow_water2d@0.3.0",
+                            "build",
+                            "step_run_build_001",
+                        ),
+                    },
+                    response_payload={
+                        "agent_session_id": "sess_step_build_001",
+                        "launch_reply": "accepted",
+                    },
+                )
                 record_agent_run(
                     repo_root=repo_root,
                     orchestration_id="orch_001",
@@ -827,8 +1078,71 @@ shell_tool                       stable             true
                     node_key="problem/shallow_water2d@0.3.0",
                     step="build",
                     agent_run_id="step_run_build_001",
-                    payload={"status": "pass", "required_outputs": [], "failed_substeps": [], "substep_agent_run_ids": []},
+                    payload={
+                        "status": "pass",
+                        "required_outputs": [
+                            "workspace/pipelines/problem__shallow_water2d__0.3.0/pipeline_001/build/build_001/bin/simulate"
+                        ],
+                        "failed_substeps": [],
+                        "substep_agent_run_ids": [],
+                    },
                 )
+                update_orchestration_status(
+                    repo_root=repo_root,
+                    orchestration_id="orch_001",
+                    status="pass",
+                )
+
+    def test_rejects_pass_status_when_graph_child_run_is_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            init_orchestration(repo_root=repo_root, orchestration_id="orch_001")
+            write_preflight(
+                repo_root=repo_root,
+                orchestration_id="orch_001",
+                payload={
+                    "status": "pass",
+                    "can_launch_step_agents": True,
+                    "can_launch_substep_agents": True,
+                    "feature_states": {"multi_agent": True},
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}],
+                },
+            )
+            record_agent_run(
+                repo_root=repo_root,
+                orchestration_id="orch_001",
+                payload={
+                    "agent_run_id": "orch_run_001",
+                    "agent_role": "orchestration",
+                    "status": "running",
+                },
+            )
+            record_launch(
+                repo_root=repo_root,
+                orchestration_id="orch_001",
+                parent_agent_run_id="orch_run_001",
+                child_agent_run_id="step_run_build_001",
+                request_payload={
+                    "node_key": "problem/shallow_water2d@0.3.0",
+                    "step": "build",
+                    "orchestration_id": "orch_001",
+                    "agent_run_id": "step_run_build_001",
+                    "parent_agent_run_id": "orch_run_001",
+                    "plan_ref": "workspace/plans/problem__shallow_water2d__0.3.0/plan_001",
+                    "pipeline_ref": "workspace/pipelines/problem__shallow_water2d__0.3.0/pipeline_001",
+                    "dependency_ref": "workspace/plans/problem__shallow_water2d__0.3.0/plan_001/dependency.resolved.yaml",
+                    "skill_name": "workflow-build",
+                    "skill_ref": "skills/workflow-build/SKILL.md",
+                    "skill_must_read_refs": "docs/WORKFLOW.md,docs/ORCHESTRATION.md",
+                    "launch_prompt_full": _step_launch_prompt(
+                        "problem/shallow_water2d@0.3.0",
+                        "build",
+                        "step_run_build_001",
+                    ),
+                },
+                response_payload={"launch_reply": "accepted"},
+            )
+            with self.assertRaisesRegex(RuntimeError, "child_agent_run_id missing from agent_runs.jsonl"):
                 update_orchestration_status(
                     repo_root=repo_root,
                     orchestration_id="orch_001",

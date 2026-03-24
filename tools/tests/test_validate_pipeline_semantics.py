@@ -17,6 +17,49 @@ def _write_json(path: Path, data: object) -> None:
     path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
 
+def _step_prompt_fixture(orchestration_id: str, node_key: str, step: str, run_id: str) -> str:
+    return f"""あなたは step agent である。
+対象 node_key: {node_key}
+対象 step: {step}
+orchestration_id: {orchestration_id}
+agent_run_id: {run_id}
+parent_agent_run_id: orch_run_001
+plan_ref: workspace/plans/problem__shallow_water2d__0.3.0/plan_test
+pipeline_ref: workspace/pipelines/problem__shallow_water2d__0.3.0/problem__shallow_water2d__0.3.0_test_pipeline
+dependency_ref: workspace/plans/problem__shallow_water2d__0.3.0/plan_test/dependency.resolved.yaml
+skill_name: workflow-{step}
+skill_ref: skills/workflow-{step}/SKILL.md
+skill_must_read_refs: docs/WORKFLOW.md,docs/ORCHESTRATION.md
+必須要件:
+- 契約を完了すること。
+"""
+
+
+def _substep_prompt_fixture(
+    orchestration_id: str,
+    node_key: str,
+    step: str,
+    substep: str,
+    run_id: str,
+) -> str:
+    return f"""あなたは substep agent である。
+対象 node_key: {node_key}
+対象 step: {step}
+対象 substep: {substep}
+orchestration_id: {orchestration_id}
+agent_run_id: {run_id}
+parent_agent_run_id: orch_run_001
+plan_ref: workspace/plans/problem__shallow_water2d__0.3.0/plan_test
+pipeline_ref: workspace/pipelines/problem__shallow_water2d__0.3.0/problem__shallow_water2d__0.3.0_test_pipeline
+dependency_ref: workspace/plans/problem__shallow_water2d__0.3.0/plan_test/dependency.resolved.yaml
+skill_name: workflow-{step}-{substep}
+skill_ref: skills/workflow-{step}-{substep}/SKILL.md
+skill_must_read_refs: docs/WORKFLOW.md,docs/ORCHESTRATION.md
+必須要件:
+- 契約を完了すること。
+"""
+
+
 def _create_minimal_execution_tree(
     repo_root: Path,
     *,
@@ -394,7 +437,7 @@ def _create_minimal_orchestration_tree(
             },
         )
         (launches_root / f"{step_ids[step]}.prompt.txt").write_text(
-            f"run step {step}\n",
+            _step_prompt_fixture(orchestration_id, node_key, step, step_ids[step]) + "\n",
             encoding="utf-8",
         )
         (launches_root / f"{step_ids[step]}.reply.txt").write_text(
@@ -459,7 +502,14 @@ def _create_minimal_orchestration_tree(
                 },
             )
             (launches_root / f"{substep_id}.prompt.txt").write_text(
-                f"run substep {step} part {idx}\n",
+                _substep_prompt_fixture(
+                    orchestration_id,
+                    node_key,
+                    step,
+                    f"part_{idx}",
+                    substep_id,
+                )
+                + "\n",
                 encoding="utf-8",
             )
             (launches_root / f"{substep_id}.reply.txt").write_text(
@@ -2400,6 +2450,143 @@ end program shallow_water2d_runner
                 require_orchestration=True,
             )
             self.assertTrue(any("missing step_result.json" in v and "problem__shallow_water2d__0.3.0/plan" in v for v in violations))
+
+    def test_detects_missing_pipeline_lineage_json(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            model_text = """module shallow_water2d_model
+use dynamics_shallow_water_flux_2d_rusanov_p0_model
+implicit none
+contains
+subroutine solve(flag)
+  logical, intent(out) :: flag
+  call dynamics_shallow_water_flux_2d_rusanov_p0__compute_flux(flag)
+end subroutine solve
+end module shallow_water2d_model
+"""
+            runner_text = """program shallow_water2d_runner
+implicit none
+write(*,*) 'ok'
+end program shallow_water2d_runner
+"""
+            _create_minimal_execution_tree(
+                repo_root,
+                dep_spec_id="dynamics_shallow_water_flux_2d_rusanov_p0",
+                model_text=model_text,
+                runner_text=runner_text,
+                run_command=["./simulate", "workspace/case.resolved.yaml", "workspace/outdir"],
+            )
+            (
+                repo_root
+                / "workspace"
+                / "pipelines"
+                / "problem__shallow_water2d__0.3.0"
+                / "problem__shallow_water2d__0.3.0_test_pipeline"
+                / "lineage.json"
+            ).unlink()
+            violations = validate(repo_root=repo_root, workspace_root="workspace")
+            self.assertTrue(any("lineage.json: missing" in v for v in violations))
+
+    def test_detects_missing_graph_child_run_when_orchestration_required(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            model_text = """module shallow_water2d_model
+use dynamics_shallow_water_flux_2d_rusanov_p0_model
+implicit none
+contains
+subroutine solve(flag)
+  logical, intent(out) :: flag
+  call dynamics_shallow_water_flux_2d_rusanov_p0__compute_flux(flag)
+end subroutine solve
+end module shallow_water2d_model
+"""
+            runner_text = """program shallow_water2d_runner
+implicit none
+write(*,*) 'ok'
+end program shallow_water2d_runner
+"""
+            _create_minimal_execution_tree(
+                repo_root,
+                dep_spec_id="dynamics_shallow_water_flux_2d_rusanov_p0",
+                model_text=model_text,
+                runner_text=runner_text,
+                run_command=["./simulate", "workspace/case.resolved.yaml", "workspace/outdir"],
+            )
+            _create_minimal_orchestration_tree(repo_root)
+            runs_path = (
+                repo_root
+                / "workspace"
+                / "orchestrations"
+                / "orch_test_001"
+                / "agent_runs.jsonl"
+            )
+            items = [
+                json.loads(line)
+                for line in runs_path.read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+            items = [
+                item for item in items if item.get("agent_run_id") != "step_run_execute_001"
+            ]
+            runs_path.write_text(
+                "\n".join(json.dumps(item, ensure_ascii=False) for item in items) + "\n",
+                encoding="utf-8",
+            )
+            violations = validate(
+                repo_root=repo_root,
+                workspace_root="workspace",
+                require_orchestration=True,
+            )
+            self.assertTrue(
+                any("child_agent_run_id not found in agent_runs.jsonl" in v for v in violations)
+            )
+
+    def test_detects_non_template_launch_prompt_when_orchestration_required(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            model_text = """module shallow_water2d_model
+use dynamics_shallow_water_flux_2d_rusanov_p0_model
+implicit none
+contains
+subroutine solve(flag)
+  logical, intent(out) :: flag
+  call dynamics_shallow_water_flux_2d_rusanov_p0__compute_flux(flag)
+end subroutine solve
+end module shallow_water2d_model
+"""
+            runner_text = """program shallow_water2d_runner
+implicit none
+write(*,*) 'ok'
+end program shallow_water2d_runner
+"""
+            _create_minimal_execution_tree(
+                repo_root,
+                dep_spec_id="dynamics_shallow_water_flux_2d_rusanov_p0",
+                model_text=model_text,
+                runner_text=runner_text,
+                run_command=["./simulate", "workspace/case.resolved.yaml", "workspace/outdir"],
+            )
+            _create_minimal_orchestration_tree(repo_root)
+            prompt_path = (
+                repo_root
+                / "workspace"
+                / "orchestrations"
+                / "orch_test_001"
+                / "launches"
+                / "step_run_build_001.prompt.txt"
+            )
+            prompt_path.write_text(
+                "Build step for node problem/shallow_water2d@0.3.0\n",
+                encoding="utf-8",
+            )
+            violations = validate(
+                repo_root=repo_root,
+                workspace_root="workspace",
+                require_orchestration=True,
+            )
+            self.assertTrue(
+                any("launch_prompt_ref missing workflow-orchestration template markers" in v for v in violations)
+            )
 
 
 if __name__ == "__main__":
