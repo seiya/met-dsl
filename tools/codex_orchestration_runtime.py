@@ -16,6 +16,12 @@ from typing import Any, Callable
 
 
 TERMINAL_STATUSES = {"pass", "fail", "blocked", "timeout", "cancel"}
+SUPPORTED_BACKENDS = {"codex", "cursor", "claude"}
+DEFAULT_BACKEND_COMMANDS = {
+    "codex": "codex",
+    "cursor": "agent",
+    "claude": "claude",
+}
 
 
 def _utc_now_iso() -> str:
@@ -150,10 +156,15 @@ def _require_preflight_launchable(
             "preflight gate failed: launchable preflight with multi_agent=true is required"
         )
     if enforce_live_probe and _live_preflight_enforced():
-        live_probe = probe_codex_cli()
+        backend = payload.get("backend")
+        if not isinstance(backend, str) or backend.strip() not in SUPPORTED_BACKENDS:
+            backend = "codex"
+        command = payload.get("probe_command")
+        probe_command = command.strip() if isinstance(command, str) and command.strip() else None
+        live_probe = probe_execution_platform(backend=backend, agent_command=probe_command)
         if not _preflight_allows_agent_launch(live_probe):
             raise RuntimeError(
-                "live preflight gate failed: codex multi_agent must be enabled at launch time"
+                "live preflight gate failed: execution platform multi_agent must be enabled at launch time"
             )
     return payload
 
@@ -871,37 +882,78 @@ def parse_feature_list(raw: str) -> dict[str, bool]:
     return features
 
 
-def probe_codex_cli(
-    codex_command: str = "codex",
+def probe_execution_platform(
+    *,
+    backend: str,
+    agent_command: str | None = None,
     runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
 ) -> dict[str, Any]:
+    backend_token = backend.strip().lower()
+    if backend_token not in SUPPORTED_BACKENDS:
+        raise ValueError(f"unsupported backend: {backend}")
+
+    default_command = DEFAULT_BACKEND_COMMANDS[backend_token]
+    command = agent_command.strip() if isinstance(agent_command, str) and agent_command.strip() else default_command
+    for known_backend, known_command in DEFAULT_BACKEND_COMMANDS.items():
+        if command != known_command:
+            continue
+        if known_backend != backend_token:
+            raise ValueError(
+                f"agent_command/backend mismatch: backend={backend_token} requires "
+                f"{DEFAULT_BACKEND_COMMANDS[backend_token]} (or custom command), got {command}"
+            )
+        break
+
     version_proc = runner(
-        [codex_command, "--version"],
+        [command, "--version"],
         text=True,
         capture_output=True,
         check=False,
     )
     features_proc = runner(
-        [codex_command, "features", "list"],
+        [command, "features", "list"],
         text=True,
         capture_output=True,
         check=False,
     )
 
-    codex_available = version_proc.returncode == 0 and features_proc.returncode == 0
-    features = parse_feature_list(features_proc.stdout) if features_proc.returncode == 0 else {}
-    multi_agent_enabled = features.get("multi_agent") is True
+    features: dict[str, bool] = {}
+    features_detail = features_proc.stdout.strip() or features_proc.stderr.strip()
+    features_available = features_proc.returncode == 0
+    multi_agent_enabled = False
+    if features_proc.returncode == 0:
+        features = parse_feature_list(features_proc.stdout)
+        multi_agent_enabled = features.get("multi_agent") is True
+    if backend_token == "cursor" and not multi_agent_enabled:
+        # Cursor agent CLI may not expose `features list`.
+        # In that case this fallback is a best-effort launchability probe, not
+        # a hard guarantee that multi-agent launch will always succeed.
+        # Launch-time live preflight in `record_launch` remains the fail-safe.
+        help_proc = runner(
+            [command, "--help"],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        if help_proc.returncode == 0:
+            features_available = True
+            multi_agent_enabled = True
+            features = {"multi_agent": True}
+            help_detail = help_proc.stdout.strip() or help_proc.stderr.strip()
+            features_detail = "cursor backend multi_agent could not be confirmed from features list; fallback to --help succeeded"
+            if help_detail:
+                features_detail += f"\n{help_detail}"
 
     checks = [
         {
-            "name": "codex_version_available",
+            "name": f"{backend_token}_version_available",
             "pass": version_proc.returncode == 0,
             "detail": version_proc.stdout.strip() or version_proc.stderr.strip(),
         },
         {
-            "name": "codex_features_available",
-            "pass": features_proc.returncode == 0,
-            "detail": features_proc.stdout.strip() or features_proc.stderr.strip(),
+            "name": f"{backend_token}_features_available",
+            "pass": features_available,
+            "detail": features_detail,
         },
         {
             "name": "multi_agent_enabled",
@@ -910,17 +962,29 @@ def probe_codex_cli(
         },
     ]
 
-    can_launch_agents = codex_available and multi_agent_enabled
+    can_launch_agents = version_proc.returncode == 0 and features_available and multi_agent_enabled
     return {
         "checked_at": _utc_now_iso(),
-        "codex_command": codex_command,
-        "codex_version": version_proc.stdout.strip(),
+        "backend": backend_token,
+        "probe_command": command,
+        "agent_version": version_proc.stdout.strip(),
         "feature_states": features,
         "checks": checks,
         "can_launch_step_agents": can_launch_agents,
         "can_launch_substep_agents": can_launch_agents,
         "status": "pass" if can_launch_agents else "fail",
     }
+
+
+def probe_codex_cli(
+    codex_command: str = "codex",
+    runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
+) -> dict[str, Any]:
+    return probe_execution_platform(
+        backend="codex",
+        agent_command=codex_command,
+        runner=runner,
+    )
 
 
 def init_orchestration(
@@ -985,11 +1049,23 @@ def record_launch(
     response_payload: dict[str, Any],
     relation_type: str = "launch",
 ) -> dict[str, str]:
-    _require_preflight_launchable(
-        repo_root,
-        orchestration_id,
-        enforce_live_probe=True,
-    )
+    try:
+        _require_preflight_launchable(
+            repo_root,
+            orchestration_id,
+            enforce_live_probe=True,
+        )
+    except RuntimeError:
+        # Launch gate failure must terminate orchestration immediately.
+        try:
+            update_orchestration_status(
+                repo_root,
+                orchestration_id,
+                status="fail",
+            )
+        except Exception:
+            pass
+        raise
     root = _orchestration_root(repo_root, orchestration_id)
     launches_root = root / "launches"
     launches_root.mkdir(parents=True, exist_ok=True)
@@ -1243,6 +1319,8 @@ def main(argv: list[str] | None = None) -> int:
     preflight_parser = subparsers.add_parser("preflight")
     preflight_parser.add_argument("--repo-root", required=True)
     preflight_parser.add_argument("--orchestration-id", required=True)
+    preflight_parser.add_argument("--backend", default="codex", choices=sorted(SUPPORTED_BACKENDS))
+    preflight_parser.add_argument("--agent-command")
     preflight_parser.add_argument("--codex-command", default="codex")
 
     launch_parser = subparsers.add_parser("record-launch")
@@ -1284,10 +1362,20 @@ def main(argv: list[str] | None = None) -> int:
             status=args.status,
         )
     elif args.command == "preflight":
+        agent_command = args.agent_command
+        if (
+            (not isinstance(agent_command, str) or not agent_command.strip())
+            and args.backend == "codex"
+        ):
+            # Keep backward compatibility only for codex backend.
+            agent_command = args.codex_command
         result = write_preflight(
             repo_root=repo_root,
             orchestration_id=args.orchestration_id,
-            payload=probe_codex_cli(codex_command=args.codex_command),
+            payload=probe_execution_platform(
+                backend=args.backend,
+                agent_command=agent_command,
+            ),
         )
     elif args.command == "record-launch":
         result = record_launch(

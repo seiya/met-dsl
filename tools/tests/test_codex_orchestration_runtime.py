@@ -14,6 +14,7 @@ from tools.codex_orchestration_runtime import (
     build_launch_prompt_text,
     init_orchestration,
     parse_feature_list,
+    probe_execution_platform,
     prepare_launch_request_payload,
     probe_codex_cli,
     record_agent_run,
@@ -145,6 +146,112 @@ shell_tool                       stable             true
         self.assertEqual(result["status"], "fail")
         self.assertFalse(result["can_launch_step_agents"])
         self.assertFalse(result["can_launch_substep_agents"])
+
+    def test_probe_execution_platform_supports_cursor_backend(self) -> None:
+        def runner(args, **kwargs):  # type: ignore[no-untyped-def]
+            if args[0] == "agent" and args[1:] == ["--version"]:
+                return _FakeCompletedProcess(0, stdout="agent 1.0.0\n")
+            if args[0] == "agent" and args[1:] == ["features", "list"]:
+                return _FakeCompletedProcess(0, stdout="multi_agent experimental true\n")
+            raise AssertionError(args)
+
+        result = probe_execution_platform(backend="cursor", runner=runner)
+        self.assertEqual(result["backend"], "cursor")
+        self.assertEqual(result["probe_command"], "agent")
+        self.assertEqual(result["status"], "pass")
+        self.assertTrue(result["can_launch_step_agents"])
+
+    def test_probe_execution_platform_cursor_fallback_when_features_list_unavailable(self) -> None:
+        def runner(args, **kwargs):  # type: ignore[no-untyped-def]
+            if args[0] == "agent" and args[1:] == ["--version"]:
+                return _FakeCompletedProcess(0, stdout="agent 1.0.0\n")
+            if args[0] == "agent" and args[1:] == ["features", "list"]:
+                return _FakeCompletedProcess(1, stderr="unknown command: features\n")
+            if args[0] == "agent" and args[1:] == ["--help"]:
+                return _FakeCompletedProcess(0, stdout="Usage: agent [options] [command] [prompt...]\n")
+            raise AssertionError(args)
+
+        result = probe_execution_platform(backend="cursor", runner=runner)
+        self.assertEqual(result["backend"], "cursor")
+        self.assertEqual(result["probe_command"], "agent")
+        self.assertEqual(result["status"], "pass")
+        self.assertTrue(result["can_launch_step_agents"])
+        self.assertEqual(result["feature_states"].get("multi_agent"), True)
+
+    def test_probe_execution_platform_cursor_fallback_when_features_list_has_no_multi_agent(self) -> None:
+        def runner(args, **kwargs):  # type: ignore[no-untyped-def]
+            if args[0] == "agent" and args[1:] == ["--version"]:
+                return _FakeCompletedProcess(0, stdout="agent 1.0.0\n")
+            if args[0] == "agent" and args[1:] == ["features", "list"]:
+                return _FakeCompletedProcess(0, stdout="some_feature stable true\n")
+            if args[0] == "agent" and args[1:] == ["--help"]:
+                return _FakeCompletedProcess(0, stdout="Usage: agent [options] [command] [prompt...]\n")
+            raise AssertionError(args)
+
+        result = probe_execution_platform(backend="cursor", runner=runner)
+        self.assertEqual(result["backend"], "cursor")
+        self.assertEqual(result["probe_command"], "agent")
+        self.assertEqual(result["status"], "pass")
+        self.assertTrue(result["can_launch_step_agents"])
+        self.assertEqual(result["feature_states"].get("multi_agent"), True)
+
+    def test_probe_execution_platform_supports_claude_backend(self) -> None:
+        def runner(args, **kwargs):  # type: ignore[no-untyped-def]
+            if args[0] == "claude" and args[1:] == ["--version"]:
+                return _FakeCompletedProcess(0, stdout="claude 1.0.0\n")
+            if args[0] == "claude" and args[1:] == ["features", "list"]:
+                return _FakeCompletedProcess(0, stdout="multi_agent experimental false\n")
+            raise AssertionError(args)
+
+        result = probe_execution_platform(backend="claude", runner=runner)
+        self.assertEqual(result["backend"], "claude")
+        self.assertEqual(result["status"], "fail")
+        self.assertFalse(result["can_launch_substep_agents"])
+
+    def test_probe_execution_platform_uses_explicit_agent_command(self) -> None:
+        seen = {"command": ""}
+
+        def runner(args, **kwargs):  # type: ignore[no-untyped-def]
+            seen["command"] = args[0]
+            if args[1:] == ["--version"]:
+                return _FakeCompletedProcess(0, stdout="custom 1.0.0\n")
+            if args[1:] == ["features", "list"]:
+                return _FakeCompletedProcess(0, stdout="multi_agent experimental true\n")
+            raise AssertionError(args)
+
+        result = probe_execution_platform(
+            backend="codex",
+            agent_command="custom-codex",
+            runner=runner,
+        )
+        self.assertEqual(seen["command"], "custom-codex")
+        self.assertEqual(result["probe_command"], "custom-codex")
+
+    def test_probe_execution_platform_rejects_backend_command_mismatch(self) -> None:
+        with self.assertRaisesRegex(ValueError, "agent_command/backend mismatch"):
+            probe_execution_platform(
+                backend="cursor",
+                agent_command="codex",
+            )
+
+    def test_probe_execution_platform_uses_backend_default_when_no_override(self) -> None:
+        seen = {"command": ""}
+
+        def runner(args, **kwargs):  # type: ignore[no-untyped-def]
+            seen["command"] = args[0]
+            if args[0] == "agent" and args[1:] == ["--version"]:
+                return _FakeCompletedProcess(0, stdout="agent 1.0.0\n")
+            if args[0] == "agent" and args[1:] == ["features", "list"]:
+                return _FakeCompletedProcess(0, stdout="multi_agent experimental true\n")
+            raise AssertionError(args)
+
+        result = probe_execution_platform(
+            backend="cursor",
+            agent_command=None,
+            runner=runner,
+        )
+        self.assertEqual(seen["command"], "agent")
+        self.assertEqual(result["probe_command"], "agent")
 
     def test_prepare_launch_request_payload_fills_verify_defaults(self) -> None:
         payload = prepare_launch_request_payload(
@@ -1225,6 +1332,13 @@ shell_tool                       stable             true
                     request_payload={"step": "plan"},
                     response_payload=_spawn_response_payload("sess_step_plan_001"),
                 )
+            meta = json.loads(
+                (repo_root / "workspace" / "orchestrations" / "orch_001" / "orchestration_meta.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(meta.get("status"), "fail")
+            self.assertIsInstance(meta.get("finished_at"), str)
 
     def test_rejects_step_agent_run_when_preflight_cannot_launch_agents(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1293,7 +1407,7 @@ shell_tool                       stable             true
                 },
             )
             os.environ["CODEX_ORCHESTRATION_ENFORCE_LIVE_PREFLIGHT"] = "1"
-            with patch("tools.codex_orchestration_runtime.probe_codex_cli") as probe_mock:
+            with patch("tools.codex_orchestration_runtime.probe_execution_platform") as probe_mock:
                 probe_mock.return_value = {
                     "status": "pass",
                     "can_launch_step_agents": True,
@@ -1351,7 +1465,7 @@ shell_tool                       stable             true
             )
             os.environ["CODEX_ORCHESTRATION_ENFORCE_LIVE_PREFLIGHT"] = "0"
             with patch(
-                "tools.codex_orchestration_runtime.probe_codex_cli",
+                "tools.codex_orchestration_runtime.probe_execution_platform",
                 side_effect=AssertionError("live probe must not run"),
             ):
                 record_agent_run(

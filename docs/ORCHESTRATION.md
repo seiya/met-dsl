@@ -20,7 +20,7 @@
 - `workflow` 実行は、必ず 1 つの `orchestration agent` を最初に起動して開始する。
 - `workflow` 開始前に、`step agent` と `substep agent` を独立起動できる execution platform の preflight を必須実行しなければならない。preflight は `multi_agent` 機能と子 `agent` 起動可否を検証対象に含め、`pass` でない場合は `workflow` を開始してはならない。
 - `preflight.json` の手動編集または後編集による `pass` 化を禁止する。preflight 結果は実行時検査の一次証跡としてのみ記録しなければならない。
-- 子 `agent` 起動直前に、`Codex CLI` の live probe で `multi_agent` と子 `agent` 起動可否を再検査しなければならない。live probe は `record-launch` 実行時に適用し、`fail` の場合は `record-launch` と子 `agent` 起動を禁止し、当該 `workflow` を `fail` へ遷移させなければならない。
+- 子 `agent` 起動直前に、execution platform の live probe で `multi_agent` と子 `agent` 起動可否を再検査しなければならない。live probe は `record-launch` 実行時に適用し、`fail` の場合は `record-launch` と子 `agent` 起動を禁止し、当該 `workflow` を `fail` へ遷移させなければならない。
 - 各 phase の着手前に、対象 phase が `step agent` 必須か `substep agent` 必須かを phase 種別で明示判定しなければならない。`Plan` / `Generate` / `Tune` は `substep agent` 必須、`Build` / `Execute` / `Judge` / `Promote` は `step agent` 必須とする。
 - phase 着手前判定で子 `agent` 必須と確定した場合、親 `agent` は `spawn_agent` 完了前に phase artifact 生成、`MCP` 実行、検証目的の仮実装、依存 code の一時内包を開始してはならない。
 - `orchestration agent` は `workflow` 全体の進行制御のみを担当し、phase 本体の artifact（例: `case.resolved.yaml`、`diagnostics.json`）を直接生成してはならない。

@@ -65,7 +65,7 @@ terms は `GLOSSARY.md` を参照する。
 24. 書き込み範囲違反を検出した `pipeline` は `invalid` とする。違反状態を解消せずに同一試行を継続してはならない。
 25. `workflow` の階層実行契約、`preflight`、`agent_runs.jsonl`、`agent_graph.json`、`step_result.json` の要件は `ORCHESTRATION.md` を canonical source として適用しなければならない。
 26. `preflight` が `fail` の場合、`orchestration agent` は子 `agent` を起動してはならない。`workflow` は `fail` で停止しなければならない。
-27. `preflight.json` を手動編集または後編集して `pass` 化してはならない。`preflight` canonical source は `tools/codex_orchestration_runtime.py preflight` の execution result とする。
+27. `preflight.json` を手動編集または後編集して `pass` 化してはならない。`preflight` canonical source は `tools/codex_orchestration_runtime.py preflight --backend <backend>` の execution result とする。`backend` 未指定時は既定値 `codex` とする。
 28. 子 `agent` 起動直前に execution platform の live 検査を再実行し、`multi_agent=true` と子 `agent` 起動可否の充足を確認しなければならない。未充足時は即時 `fail` とする。
 29. 出力形式、input/output contract、判定条件の要求定義は `controlled_spec.md` と `tests.md` と `deps.yaml` と `derived_contract.json` と `docs/` canonical source 文書のみを参照しなければならない。
 30. `tools/` 配下の検証 `python` スクリプト、`quality check` 実装、`verify` 実装は妥当性確認専用入力として扱い、要求定義または出力形式定義の入力として参照してはならない。

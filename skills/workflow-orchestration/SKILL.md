@@ -1,12 +1,12 @@
 ---
 name: workflow-orchestration
-description: `Codex CLI` で `workflow` 全体を開始し、`orchestration agent -> step agent` または `orchestration agent -> substep agent` の独立 `agent` 起動で進行制御するときに使用する。`tools/codex_orchestration_runtime.py` を使った `preflight`、launch 証跡、`agent_runs.jsonl`、`step_result.json` の記録に適用する。
+description: 対応 execution platform で `workflow` 全体を開始し、`orchestration agent -> step agent` または `orchestration agent -> substep agent` の独立 `agent` 起動で進行制御するときに使用する。`tools/codex_orchestration_runtime.py` を使った `preflight`、launch 証跡、`agent_runs.jsonl`、`step_result.json` の記録に適用する。
 ---
 
 # Workflow Orchestration
 
 ## 目的
-`Codex CLI` に対して、workflow 全体を親 `agent` の単一スレッド処理ではなく、独立した子 `agent` の階層起動として実行させる。
+対応 execution platform に対して、workflow 全体を親 `agent` の単一スレッド処理ではなく、独立した子 `agent` の階層起動として実行させる。
 
 ## 適用範囲
 - `workflow` 開始時の `orchestration_id` 発行
@@ -19,7 +19,7 @@ description: `Codex CLI` で `workflow` 全体を開始し、`orchestration agen
 - 標準 `substep` を持たない各 `step` は `spawn_agent` で起動した独立 `step agent` へ委譲しなければならない。
 - `Plan` / `Generate` / `Tune` のように `substep` を持つ phase では、`orchestration agent` が `generate` と `verify` を別々の `substep agent` として `spawn_agent` で直接起動しなければならない。
 - `Build` / `Execute` / `Judge` / `Promote` の `step` は、単一 `step agent` で完了させなければならない。
-- `Codex CLI` の起動可否確認と証跡書き出しは `tools/codex_orchestration_runtime.py` を canonical source 実装として使用しなければならない。
+- execution platform の起動可否確認と証跡書き出しは `tools/codex_orchestration_runtime.py` を canonical source 実装として使用しなければならない。
 - `preflight.json` の手動編集または後編集による `pass` 化を禁止する。`preflight` は `tools/codex_orchestration_runtime.py preflight` の execution result を canonical source とする。
 - 子 `agent` 起動直前に live preflight gate を満たすことを必須とし、live 検査が `fail` の場合は `record-launch` を実行してはならない。
 - 起動前の初期読込は `references/startup_contract.md` を第一参照とし、詳細契約が必要な場合のみ `docs/WORKFLOW.md` と `docs/ORCHESTRATION.md` を追加参照しなければならない。
@@ -50,7 +50,7 @@ description: `Codex CLI` で `workflow` 全体を開始し、`orchestration agen
 
 ## 運用ルール
 1. `python3 tools/codex_orchestration_runtime.py init --repo-root <repo_root> --orchestration-id <orchestration_id> --spec-ref <spec_ref> --dependency-ref <dependency_ref>` を実行し、`workspace/orchestrations/<orchestration_id>/` を初期化する。
-2. `python3 tools/codex_orchestration_runtime.py preflight --repo-root <repo_root> --orchestration-id <orchestration_id>` を実行し、`preflight.json` を生成する。
+2. `python3 tools/codex_orchestration_runtime.py preflight --repo-root <repo_root> --orchestration-id <orchestration_id> --backend <backend>` を実行し、`preflight.json` を生成する。`backend` 未指定時は既定値 `codex` を使用する。
 3. `preflight.json` の `can_launch_step_agents=true` と `can_launch_substep_agents=true` を満たさない場合は workflow を開始しない。
 4. `orchestration agent` は `references/startup_contract.md` を読んで起動条件を確定し、最初の `commentary` で対象 phase、使用する `SKILL`、起動する `agent` 種別、`MCP` 使用箇所を実行宣言する。
 5. 実行宣言後に phase 種別を固定表で再確認し、`Plan` / `Generate` / `Tune` では `substep agent`、`Build` / `Execute` / `Judge` / `Promote` では `step agent` を選択する。

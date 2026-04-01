@@ -59,11 +59,11 @@ class Tool:
 
 
 def _write_message(payload: dict[str, Any]) -> None:
-    encoded = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-    out = sys.stdout.buffer
-    out.write(f"Content-Length: {len(encoded)}\r\n\r\n".encode("ascii"))
-    out.write(encoded)
-    out.flush()
+    # Cursor MCP client expects newline-delimited JSON on stdio.
+    # Keep this server compatible with that transport by default.
+    sys.stdout.write(json.dumps(payload, ensure_ascii=False))
+    sys.stdout.write("\n")
+    sys.stdout.flush()
 
 
 def _read_message() -> dict[str, Any] | None:
