@@ -25,6 +25,7 @@ env/
 .python-version
 
 # Editor and OS noise
+.cursor/mcp.json
 .DS_Store
 Thumbs.db
 .idea/
