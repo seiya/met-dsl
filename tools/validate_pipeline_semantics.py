@@ -94,6 +94,18 @@ REQUIRED_WORKFLOW_STEPS = ("plan", "generate", "build", "execute", "judge")
 SUBSTEP_WORKFLOW_STEPS = frozenset({"plan", "generate", "tune"})
 AGENT_TERMINAL_STATUSES = {"pass", "fail", "blocked", "timeout", "cancel"}
 
+# RUNBOOK + GLOSSARY: LLM stage meta for generate
+_GENERATE_META_REQUIRED_KEYS = (
+    "attempt_count",
+    "verification_status",
+    "last_fail_reason",
+    "debug_mode",
+    "context_isolated",
+)
+_NODE_KEY_SAFE_PATTERN_LINEAGE = re.compile(
+    r"^[a-z][a-z0-9_]*__[a-z0-9][a-z0-9_]*__[0-9][0-9A-Za-z._-]*$"
+)
+
 
 def _extract_launch_response_agent_session_id(payload: dict[str, Any]) -> str | None:
     candidate_paths: tuple[tuple[str, ...], ...] = (
@@ -988,6 +1000,64 @@ def _validate_pipeline_lineage_presence(
         node_key = lineage.get("node_key")
         if not isinstance(node_key, str) or not node_key.strip():
             violations.append(f"{lineage_path}:node_key must be non-empty string")
+        raw_pid = lineage.get("pipeline_id")
+        if not isinstance(raw_pid, str) or not raw_pid.strip():
+            violations.append(f"{lineage_path}:pipeline_id must be non-empty string")
+        else:
+            pid = raw_pid.strip()
+            if pid != pipeline_dir.name:
+                violations.append(
+                    f"{lineage_path}:pipeline_id {pid!r} must match directory name {pipeline_dir.name!r}"
+                )
+            node_safe_dir = pipeline_dir.parent.name
+            if not _NODE_KEY_SAFE_PATTERN_LINEAGE.match(node_safe_dir):
+                violations.append(
+                    f"{pipeline_dir.parent}: invalid node_key_safe directory name for lineage check"
+                )
+            elif not pid.startswith(f"{node_safe_dir}_"):
+                violations.append(
+                    f"{lineage_path}:pipeline_id must start with {node_safe_dir + '_'}; got {pid!r}"
+                )
+
+
+def _validate_generate_meta_json_files(
+    pipeline_dir: Path,
+    violations: list[str],
+) -> None:
+    generate_root = pipeline_dir / "generate"
+    if not generate_root.exists() or not generate_root.is_dir():
+        return
+    for gen_dir in sorted(generate_root.iterdir()):
+        if not gen_dir.is_dir():
+            continue
+        meta_path = gen_dir / "generate_meta.json"
+        if not meta_path.exists():
+            continue
+        try:
+            data = _read_json(meta_path)
+        except json.JSONDecodeError:
+            violations.append(f"{meta_path}: invalid json")
+            continue
+        if not isinstance(data, dict):
+            violations.append(f"{meta_path}: must be json object")
+            continue
+        for key in _GENERATE_META_REQUIRED_KEYS:
+            if key not in data:
+                violations.append(f"{meta_path}: missing required key {key!r}")
+        for key in _GENERATE_META_REQUIRED_KEYS:
+            if key not in data:
+                continue
+            val = data.get(key)
+            if key == "attempt_count" and not isinstance(val, int):
+                violations.append(f"{meta_path}:attempt_count must be integer")
+            elif key == "verification_status" and (not isinstance(val, str) or not val.strip()):
+                violations.append(f"{meta_path}:verification_status must be non-empty string")
+            elif key == "last_fail_reason" and val is not None and not isinstance(val, str):
+                violations.append(f"{meta_path}:last_fail_reason must be string or null")
+            elif key == "debug_mode" and not isinstance(val, bool):
+                violations.append(f"{meta_path}:debug_mode must be boolean")
+            elif key == "context_isolated" and not isinstance(val, bool):
+                violations.append(f"{meta_path}:context_isolated must be boolean")
 
 
 def _iter_command_ref_entries(node: Any) -> list[dict[str, Any]]:
@@ -4005,6 +4075,14 @@ def validate(
         executions=executions,
         violations=violations,
     )
+
+    seen_pipeline_dirs: set[Path] = set()
+    for execution in executions:
+        pd = execution.pipeline_dir
+        if pd in seen_pipeline_dirs:
+            continue
+        seen_pipeline_dirs.add(pd)
+        _validate_generate_meta_json_files(pd, violations)
 
     if require_orchestration:
         _validate_orchestration_hierarchy(

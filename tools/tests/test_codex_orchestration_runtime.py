@@ -33,9 +33,9 @@ def _step_launch_prompt(node_key: str, step: str, agent_run_id: str) -> str:
 orchestration_id: orch_001
 agent_run_id: {agent_run_id}
 parent_agent_run_id: orch_run_001
-plan_ref: workspace/plans/problem__shallow_water2d__0.3.0/plan_001
-pipeline_ref: workspace/pipelines/problem__shallow_water2d__0.3.0/pipeline_001
-dependency_ref: workspace/plans/problem__shallow_water2d__0.3.0/plan_001/dependency.resolved.yaml
+plan_ref: workspace/plans/problem__shallow_water2d__0.3.0/problem__shallow_water2d__0.3.0_plan001
+pipeline_ref: workspace/pipelines/problem__shallow_water2d__0.3.0/problem__shallow_water2d__0.3.0_pl001
+dependency_ref: workspace/plans/problem__shallow_water2d__0.3.0/problem__shallow_water2d__0.3.0_plan001/dependency.resolved.yaml
 skill_name: workflow-{step}
 skill_ref: skills/workflow-{step}/SKILL.md
 skill_must_read_refs: skills/workflow-{step}/SKILL.md,docs/WORKFLOW.md,docs/ORCHESTRATION.md
@@ -57,9 +57,9 @@ def _substep_launch_prompt(node_key: str, step: str, substep: str, agent_run_id:
 orchestration_id: orch_001
 agent_run_id: {agent_run_id}
 parent_agent_run_id: orch_run_001
-plan_ref: workspace/plans/problem__shallow_water2d__0.3.0/plan_001
-pipeline_ref: workspace/pipelines/problem__shallow_water2d__0.3.0/pipeline_001
-dependency_ref: workspace/plans/problem__shallow_water2d__0.3.0/plan_001/dependency.resolved.yaml
+plan_ref: workspace/plans/problem__shallow_water2d__0.3.0/problem__shallow_water2d__0.3.0_plan001
+pipeline_ref: workspace/pipelines/problem__shallow_water2d__0.3.0/problem__shallow_water2d__0.3.0_pl001
+dependency_ref: workspace/plans/problem__shallow_water2d__0.3.0/problem__shallow_water2d__0.3.0_plan001/dependency.resolved.yaml
 skill_name: workflow-{step}-{substep}
 skill_ref: skills/workflow-{step}-{substep}/SKILL.md
 skill_must_read_refs: skills/workflow-{step}-{substep}/SKILL.md,docs/WORKFLOW.md,docs/ORCHESTRATION.md
@@ -262,9 +262,9 @@ shell_tool                       stable             true
                 "orchestration_id": "orch_001",
                 "agent_run_id": "substep_run_plan_verify_001",
                 "parent_agent_run_id": "orch_run_001",
-                "plan_ref": "workspace/plans/problem__shallow_water2d__0.3.0/plan_001",
-                "pipeline_ref": "workspace/pipelines/problem__shallow_water2d__0.3.0/pipeline_001",
-                "dependency_ref": "workspace/plans/problem__shallow_water2d__0.3.0/plan_001/dependency.resolved.yaml",
+                "plan_ref": "workspace/plans/problem__shallow_water2d__0.3.0/problem__shallow_water2d__0.3.0_plan001",
+                "pipeline_ref": "workspace/pipelines/problem__shallow_water2d__0.3.0/problem__shallow_water2d__0.3.0_pl001",
+                "dependency_ref": "workspace/plans/problem__shallow_water2d__0.3.0/problem__shallow_water2d__0.3.0_plan001/dependency.resolved.yaml",
             }
         )
         self.assertEqual(payload["skill_name"], "workflow-plan-verify")
@@ -274,7 +274,7 @@ shell_tool                       stable             true
         self.assertIn("docs/ORCHESTRATION.md", payload["skill_must_read_refs"])
         self.assertIn("skills/workflow-plan-verify/SKILL.md", payload["skill_must_read_refs"])
         self.assertIn(
-            "workspace/plans/problem__shallow_water2d__0.3.0/plan_001/derived_contract.json",
+            "workspace/plans/problem__shallow_water2d__0.3.0/problem__shallow_water2d__0.3.0_plan001/derived_contract.json",
             payload["skill_must_read_refs"],
         )
         self.assertIn("必須要件:", payload["launch_prompt_full"])
@@ -287,9 +287,9 @@ shell_tool                       stable             true
                 "orchestration_id": "orch_001",
                 "agent_run_id": "step_run_build_001",
                 "parent_agent_run_id": "orch_run_001",
-                "plan_ref": "workspace/plans/problem__shallow_water2d__0.3.0/plan_001",
-                "pipeline_ref": "workspace/pipelines/problem__shallow_water2d__0.3.0/pipeline_001",
-                "dependency_ref": "workspace/plans/problem__shallow_water2d__0.3.0/plan_001/dependency.resolved.yaml",
+                "plan_ref": "workspace/plans/problem__shallow_water2d__0.3.0/problem__shallow_water2d__0.3.0_plan001",
+                "pipeline_ref": "workspace/pipelines/problem__shallow_water2d__0.3.0/problem__shallow_water2d__0.3.0_pl001",
+                "dependency_ref": "workspace/plans/problem__shallow_water2d__0.3.0/problem__shallow_water2d__0.3.0_plan001/dependency.resolved.yaml",
                 "skill_name": "workflow-build",
                 "skill_ref": "skills/workflow-build/SKILL.md",
                 "skill_must_read_refs": "skills/workflow-build/SKILL.md,docs/WORKFLOW.md,docs/ORCHESTRATION.md",
@@ -310,7 +310,7 @@ shell_tool                       stable             true
                 repo_root=repo_root,
                 orchestration_id="orch_001",
                 spec_ref="spec/problem/shallow_water2d/controlled_spec.md",
-                dependency_ref="workspace/plans/problem__shallow_water2d__0.3.0/plan_001/dependency.resolved.yaml",
+                dependency_ref="workspace/plans/problem__shallow_water2d__0.3.0/problem__shallow_water2d__0.3.0_plan001/dependency.resolved.yaml",
             )
             write_preflight(
                 repo_root=repo_root,
@@ -338,9 +338,9 @@ shell_tool                       stable             true
                     "substep": "generate",
                     "orchestration_id": "orch_001",
                     "parent_agent_run_id": "orch_run_001",
-                    "plan_ref": "workspace/plans/problem__shallow_water2d__0.3.0/plan_001",
-                    "pipeline_ref": "workspace/pipelines/problem__shallow_water2d__0.3.0/pipeline_001",
-                    "dependency_ref": "workspace/plans/problem__shallow_water2d__0.3.0/plan_001/dependency.resolved.yaml",
+                    "plan_ref": "workspace/plans/problem__shallow_water2d__0.3.0/problem__shallow_water2d__0.3.0_plan001",
+                    "pipeline_ref": "workspace/pipelines/problem__shallow_water2d__0.3.0/problem__shallow_water2d__0.3.0_pl001",
+                    "dependency_ref": "workspace/plans/problem__shallow_water2d__0.3.0/problem__shallow_water2d__0.3.0_plan001/dependency.resolved.yaml",
                     "skill_name": "workflow-plan-generate",
                     "skill_ref": "skills/workflow-plan-generate/SKILL.md",
                     "skill_must_read_refs": "docs/WORKFLOW.md,docs/ORCHESTRATION.md",
@@ -368,9 +368,9 @@ shell_tool                       stable             true
                     "step": "build",
                     "orchestration_id": "orch_001",
                     "parent_agent_run_id": "orch_run_001",
-                    "plan_ref": "workspace/plans/problem__shallow_water2d__0.3.0/plan_001",
-                    "pipeline_ref": "workspace/pipelines/problem__shallow_water2d__0.3.0/pipeline_001",
-                    "dependency_ref": "workspace/plans/problem__shallow_water2d__0.3.0/plan_001/dependency.resolved.yaml",
+                    "plan_ref": "workspace/plans/problem__shallow_water2d__0.3.0/problem__shallow_water2d__0.3.0_plan001",
+                    "pipeline_ref": "workspace/pipelines/problem__shallow_water2d__0.3.0/problem__shallow_water2d__0.3.0_pl001",
+                    "dependency_ref": "workspace/plans/problem__shallow_water2d__0.3.0/problem__shallow_water2d__0.3.0_plan001/dependency.resolved.yaml",
                     "skill_name": "workflow-build",
                     "skill_ref": "skills/workflow-build/SKILL.md",
                     "skill_must_read_refs": "docs/WORKFLOW.md,docs/ORCHESTRATION.md",
@@ -418,7 +418,7 @@ shell_tool                       stable             true
                     "started_at": "2026-03-11T00:00:10Z",
                     "finished_at": "2026-03-11T00:00:50Z",
                     "output_refs": [
-                        "workspace/plans/problem__shallow_water2d__0.3.0/plan_001/case.resolved.yaml"
+                        "workspace/plans/problem__shallow_water2d__0.3.0/problem__shallow_water2d__0.3.0_plan001/case.resolved.yaml"
                     ],
                 },
             )
@@ -439,7 +439,7 @@ shell_tool                       stable             true
                     "started_at": "2026-03-11T00:00:20Z",
                     "finished_at": "2026-03-11T00:01:10Z",
                     "output_refs": [
-                        "workspace/pipelines/problem__shallow_water2d__0.3.0/pipeline_001/build/build_001/bin/simulate"
+                        "workspace/pipelines/problem__shallow_water2d__0.3.0/problem__shallow_water2d__0.3.0_pl001/build/build_001/bin/simulate"
                     ],
                 },
             )
@@ -453,7 +453,7 @@ shell_tool                       stable             true
                 payload={
                     "status": "pass",
                     "required_outputs": [
-                        "workspace/plans/problem__shallow_water2d__0.3.0/plan_001/case.resolved.yaml"
+                        "workspace/plans/problem__shallow_water2d__0.3.0/problem__shallow_water2d__0.3.0_plan001/case.resolved.yaml"
                     ],
                     "failed_substeps": [],
                     "substep_agent_run_ids": ["substep_run_plan_generate_001"],
@@ -469,7 +469,7 @@ shell_tool                       stable             true
                 payload={
                     "status": "pass",
                     "required_outputs": [
-                        "workspace/pipelines/problem__shallow_water2d__0.3.0/pipeline_001/build/build_001/bin/simulate"
+                        "workspace/pipelines/problem__shallow_water2d__0.3.0/problem__shallow_water2d__0.3.0_pl001/build/build_001/bin/simulate"
                     ],
                     "failed_substeps": [],
                     "substep_agent_run_ids": [],
@@ -664,9 +664,9 @@ shell_tool                       stable             true
                     "substep": "generate",
                     "orchestration_id": "orch_001",
                     "parent_agent_run_id": "orch_run_001",
-                    "plan_ref": "workspace/plans/problem__shallow_water2d__0.3.0/plan_001",
-                    "pipeline_ref": "workspace/pipelines/problem__shallow_water2d__0.3.0/pipeline_001",
-                    "dependency_ref": "workspace/plans/problem__shallow_water2d__0.3.0/plan_001/dependency.resolved.yaml",
+                    "plan_ref": "workspace/plans/problem__shallow_water2d__0.3.0/problem__shallow_water2d__0.3.0_plan001",
+                    "pipeline_ref": "workspace/pipelines/problem__shallow_water2d__0.3.0/problem__shallow_water2d__0.3.0_pl001",
+                    "dependency_ref": "workspace/plans/problem__shallow_water2d__0.3.0/problem__shallow_water2d__0.3.0_plan001/dependency.resolved.yaml",
                     "skill_name": "workflow-plan-generate",
                     "skill_ref": "skills/workflow-plan-generate/SKILL.md",
                     "skill_must_read_refs": "docs/WORKFLOW.md,docs/ORCHESTRATION.md",
@@ -711,9 +711,9 @@ shell_tool                       stable             true
                     "substep": "generate",
                     "orchestration_id": "orch_001",
                     "parent_agent_run_id": "orch_run_001",
-                    "plan_ref": "workspace/plans/problem__shallow_water2d__0.3.0/plan_001",
-                    "pipeline_ref": "workspace/pipelines/problem__shallow_water2d__0.3.0/pipeline_001",
-                    "dependency_ref": "workspace/plans/problem__shallow_water2d__0.3.0/plan_001/dependency.resolved.yaml",
+                    "plan_ref": "workspace/plans/problem__shallow_water2d__0.3.0/problem__shallow_water2d__0.3.0_plan001",
+                    "pipeline_ref": "workspace/pipelines/problem__shallow_water2d__0.3.0/problem__shallow_water2d__0.3.0_pl001",
+                    "dependency_ref": "workspace/plans/problem__shallow_water2d__0.3.0/problem__shallow_water2d__0.3.0_plan001/dependency.resolved.yaml",
                     "skill_name": "workflow-plan-generate",
                     "skill_ref": "skills/workflow-plan-generate/SKILL.md",
                     "skill_must_read_refs": "docs/WORKFLOW.md,docs/ORCHESTRATION.md",
@@ -779,9 +779,9 @@ shell_tool                       stable             true
                     "substep": "generate",
                     "orchestration_id": "orch_001",
                     "parent_agent_run_id": "orch_run_001",
-                    "plan_ref": "workspace/plans/problem__shallow_water2d__0.3.0/plan_001",
-                    "pipeline_ref": "workspace/pipelines/problem__shallow_water2d__0.3.0/pipeline_001",
-                    "dependency_ref": "workspace/plans/problem__shallow_water2d__0.3.0/plan_001/dependency.resolved.yaml",
+                    "plan_ref": "workspace/plans/problem__shallow_water2d__0.3.0/problem__shallow_water2d__0.3.0_plan001",
+                    "pipeline_ref": "workspace/pipelines/problem__shallow_water2d__0.3.0/problem__shallow_water2d__0.3.0_pl001",
+                    "dependency_ref": "workspace/plans/problem__shallow_water2d__0.3.0/problem__shallow_water2d__0.3.0_plan001/dependency.resolved.yaml",
                     "skill_name": "workflow-plan-generate",
                     "skill_ref": "skills/workflow-plan-generate/SKILL.md",
                     "skill_must_read_refs": "docs/WORKFLOW.md,docs/ORCHESTRATION.md",
@@ -842,9 +842,9 @@ shell_tool                       stable             true
                         "orchestration_id": "orch_001",
                         "agent_run_id": "step_run_build_001",
                         "parent_agent_run_id": "orch_run_001",
-                        "plan_ref": "workspace/plans/problem__shallow_water2d__0.3.0/plan_001",
-                        "pipeline_ref": "workspace/pipelines/problem__shallow_water2d__0.3.0/pipeline_001",
-                        "dependency_ref": "workspace/plans/problem__shallow_water2d__0.3.0/plan_001/dependency.resolved.yaml",
+                        "plan_ref": "workspace/plans/problem__shallow_water2d__0.3.0/problem__shallow_water2d__0.3.0_plan001",
+                        "pipeline_ref": "workspace/pipelines/problem__shallow_water2d__0.3.0/problem__shallow_water2d__0.3.0_pl001",
+                        "dependency_ref": "workspace/plans/problem__shallow_water2d__0.3.0/problem__shallow_water2d__0.3.0_plan001/dependency.resolved.yaml",
                         "skill_name": "workflow-build",
                         "skill_ref": "skills/workflow-build/SKILL.md",
                         "skill_must_read_refs": "docs/WORKFLOW.md,docs/ORCHESTRATION.md",
@@ -884,12 +884,13 @@ shell_tool                       stable             true
                     "orchestration_id": "orch_001",
                     "agent_run_id": "substep_run_generate_verify_001",
                     "parent_agent_run_id": "orch_run_001",
-                    "plan_ref": "workspace/plans/problem__shallow_water2d__0.3.0/plan_001",
-                    "pipeline_ref": "workspace/pipelines/problem__shallow_water2d__0.3.0/pipeline_001",
-                    "dependency_ref": "workspace/plans/problem__shallow_water2d__0.3.0/plan_001/dependency.resolved.yaml",
+                    "plan_ref": "workspace/plans/problem__shallow_water2d__0.3.0/problem__shallow_water2d__0.3.0_plan001",
+                    "pipeline_ref": "workspace/pipelines/problem__shallow_water2d__0.3.0/problem__shallow_water2d__0.3.0_pl001",
+                    "dependency_ref": "workspace/plans/problem__shallow_water2d__0.3.0/problem__shallow_water2d__0.3.0_plan001/dependency.resolved.yaml",
+                    "generation_id": "gen_001",
                     "skill_name": "workflow-generate-verify",
                     "skill_ref": "skills/workflow-generate-verify/SKILL.md",
-                    "skill_must_read_refs": "docs/WORKFLOW.md,workspace/pipelines/problem__shallow_water2d__0.3.0/pipeline_001/generate/gen_001/generate_meta.json",
+                    "skill_must_read_refs": "docs/WORKFLOW.md,workspace/pipelines/problem__shallow_water2d__0.3.0/problem__shallow_water2d__0.3.0_pl001/generate/gen_001/generate_meta.json",
                 },
                 response_payload=_spawn_response_payload("sess_substep_run_generate_verify_001"),
             )
@@ -897,11 +898,19 @@ shell_tool                       stable             true
                 (repo_root / launch_refs["launch_request_ref"]).read_text(encoding="utf-8")
             )
             self.assertIn(
-                "workspace/plans/problem__shallow_water2d__0.3.0/plan_001/case.resolved.yaml",
+                "workspace/plans/problem__shallow_water2d__0.3.0/problem__shallow_water2d__0.3.0_plan001/case.resolved.yaml",
                 request_payload["skill_must_read_refs"],
             )
             self.assertIn(
-                "workspace/plans/problem__shallow_water2d__0.3.0/plan_001/derived_contract.json",
+                "workspace/plans/problem__shallow_water2d__0.3.0/problem__shallow_water2d__0.3.0_plan001/derived_contract.json",
+                request_payload["skill_must_read_refs"],
+            )
+            self.assertIn(
+                "workspace/pipelines/problem__shallow_water2d__0.3.0/problem__shallow_water2d__0.3.0_pl001/lineage.json",
+                request_payload["skill_must_read_refs"],
+            )
+            self.assertIn(
+                "workspace/pipelines/problem__shallow_water2d__0.3.0/problem__shallow_water2d__0.3.0_pl001/generate/gen_001/generate_meta.json",
                 request_payload["skill_must_read_refs"],
             )
 
@@ -934,8 +943,8 @@ shell_tool                       stable             true
                         "agent_run_id": "substep_run_plan_generate_001",
                         "parent_agent_run_id": "orch_run_001",
                         "plan_ref": "workspace/plans/problem__shallow_water2d__0.3.0/<agent-determined-plan-id>",
-                        "pipeline_ref": "workspace/pipelines/problem__shallow_water2d__0.3.0/pipeline_001",
-                        "dependency_ref": "workspace/plans/problem__shallow_water2d__0.3.0/plan_001/dependency.resolved.yaml",
+                        "pipeline_ref": "workspace/pipelines/problem__shallow_water2d__0.3.0/problem__shallow_water2d__0.3.0_pl001",
+                        "dependency_ref": "workspace/plans/problem__shallow_water2d__0.3.0/problem__shallow_water2d__0.3.0_plan001/dependency.resolved.yaml",
                         "skill_name": "workflow-plan-generate",
                         "skill_ref": "skills/workflow-plan-generate/SKILL.md",
                         "skill_must_read_refs": "docs/WORKFLOW.md,docs/ORCHESTRATION.md",
@@ -947,6 +956,88 @@ shell_tool                       stable             true
                         ),
                     },
                     response_payload=_spawn_response_payload("sess_substep_plan_generate_001"),
+                )
+
+    def test_rejects_launch_when_pipeline_ref_is_not_pipeline_root_only(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            init_orchestration(repo_root=repo_root, orchestration_id="orch_001")
+            write_preflight(
+                repo_root=repo_root,
+                orchestration_id="orch_001",
+                payload={
+                    "status": "pass",
+                    "can_launch_step_agents": True,
+                    "can_launch_substep_agents": True,
+                    "feature_states": {"multi_agent": True},
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}],
+                },
+            )
+            bad_pipeline = (
+                "workspace/pipelines/problem__shallow_water2d__0.3.0/"
+                "problem__shallow_water2d__0.3.0_pl001/generate/gen_001/generate_meta.json"
+            )
+            with self.assertRaisesRegex(ValueError, "pipeline_ref must be exactly"):
+                record_launch(
+                    repo_root=repo_root,
+                    orchestration_id="orch_001",
+                    parent_agent_run_id="orch_run_001",
+                    child_agent_run_id="substep_bad_pipeline_001",
+                    request_payload={
+                        "node_key": "problem/shallow_water2d@0.3.0",
+                        "step": "generate",
+                        "substep": "generate",
+                        "orchestration_id": "orch_001",
+                        "agent_run_id": "substep_bad_pipeline_001",
+                        "parent_agent_run_id": "orch_run_001",
+                        "plan_ref": "workspace/plans/problem__shallow_water2d__0.3.0/problem__shallow_water2d__0.3.0_plan001",
+                        "pipeline_ref": bad_pipeline,
+                        "dependency_ref": "workspace/plans/problem__shallow_water2d__0.3.0/problem__shallow_water2d__0.3.0_plan001/dependency.resolved.yaml",
+                        "skill_name": "workflow-generate-generate",
+                        "skill_ref": "skills/workflow-generate-generate/SKILL.md",
+                        "skill_must_read_refs": "docs/WORKFLOW.md,docs/ORCHESTRATION.md",
+                        "launch_prompt_full": "prompt",
+                    },
+                    response_payload=_spawn_response_payload("sess_bad_pipeline_001"),
+                )
+
+    def test_rejects_generate_verify_without_generation_id(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            init_orchestration(repo_root=repo_root, orchestration_id="orch_001")
+            write_preflight(
+                repo_root=repo_root,
+                orchestration_id="orch_001",
+                payload={
+                    "status": "pass",
+                    "can_launch_step_agents": True,
+                    "can_launch_substep_agents": True,
+                    "feature_states": {"multi_agent": True},
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}],
+                },
+            )
+            with self.assertRaisesRegex(ValueError, "generation_id"):
+                record_launch(
+                    repo_root=repo_root,
+                    orchestration_id="orch_001",
+                    parent_agent_run_id="orch_run_001",
+                    child_agent_run_id="substep_gen_verify_no_gid",
+                    request_payload={
+                        "node_key": "problem/shallow_water2d@0.3.0",
+                        "step": "generate",
+                        "substep": "verify",
+                        "orchestration_id": "orch_001",
+                        "agent_run_id": "substep_gen_verify_no_gid",
+                        "parent_agent_run_id": "orch_run_001",
+                        "plan_ref": "workspace/plans/problem__shallow_water2d__0.3.0/problem__shallow_water2d__0.3.0_plan001",
+                        "pipeline_ref": "workspace/pipelines/problem__shallow_water2d__0.3.0/problem__shallow_water2d__0.3.0_pl001",
+                        "dependency_ref": "workspace/plans/problem__shallow_water2d__0.3.0/problem__shallow_water2d__0.3.0_plan001/dependency.resolved.yaml",
+                        "skill_name": "workflow-generate-verify",
+                        "skill_ref": "skills/workflow-generate-verify/SKILL.md",
+                        "skill_must_read_refs": "docs/WORKFLOW.md,docs/ORCHESTRATION.md",
+                        "launch_prompt_full": "gv verify",
+                    },
+                    response_payload=_spawn_response_payload("sess_gv_no_gid"),
                 )
 
     def test_record_launch_autofills_prompt_and_skill_refs(self) -> None:
@@ -976,9 +1067,9 @@ shell_tool                       stable             true
                     "orchestration_id": "orch_001",
                     "agent_run_id": "substep_run_plan_verify_001",
                     "parent_agent_run_id": "orch_run_001",
-                    "plan_ref": "workspace/plans/problem__shallow_water2d__0.3.0/plan_001",
-                    "pipeline_ref": "workspace/pipelines/problem__shallow_water2d__0.3.0/pipeline_001",
-                    "dependency_ref": "workspace/plans/problem__shallow_water2d__0.3.0/plan_001/dependency.resolved.yaml",
+                    "plan_ref": "workspace/plans/problem__shallow_water2d__0.3.0/problem__shallow_water2d__0.3.0_plan001",
+                    "pipeline_ref": "workspace/pipelines/problem__shallow_water2d__0.3.0/problem__shallow_water2d__0.3.0_pl001",
+                    "dependency_ref": "workspace/plans/problem__shallow_water2d__0.3.0/problem__shallow_water2d__0.3.0_plan001/dependency.resolved.yaml",
                 },
                 response_payload=_spawn_response_payload("sess_substep_run_plan_verify_001"),
             )
@@ -988,7 +1079,7 @@ shell_tool                       stable             true
             self.assertEqual(request_payload["skill_name"], "workflow-plan-verify")
             self.assertEqual(request_payload["skill_ref"], "skills/workflow-plan-verify/SKILL.md")
             self.assertIn(
-                "workspace/plans/problem__shallow_water2d__0.3.0/plan_001/derived_contract.json",
+                "workspace/plans/problem__shallow_water2d__0.3.0/problem__shallow_water2d__0.3.0_plan001/derived_contract.json",
                 request_payload["skill_must_read_refs"],
             )
             prompt_text = prompt_path.read_text(encoding="utf-8")
@@ -1017,20 +1108,20 @@ shell_tool                       stable             true
                 "orchestration_id": "orch_001",
                 "agent_run_id": "substep_run_plan_verify_001",
                 "parent_agent_run_id": "orch_run_001",
-                "plan_ref": "workspace/plans/problem__shallow_water2d__0.3.0/plan_001",
-                "pipeline_ref": "workspace/pipelines/problem__shallow_water2d__0.3.0/pipeline_001",
-                "dependency_ref": "workspace/plans/problem__shallow_water2d__0.3.0/plan_001/dependency.resolved.yaml",
+                "plan_ref": "workspace/plans/problem__shallow_water2d__0.3.0/problem__shallow_water2d__0.3.0_plan001",
+                "pipeline_ref": "workspace/pipelines/problem__shallow_water2d__0.3.0/problem__shallow_water2d__0.3.0_pl001",
+                "dependency_ref": "workspace/plans/problem__shallow_water2d__0.3.0/problem__shallow_water2d__0.3.0_plan001/dependency.resolved.yaml",
                 "skill_name": "workflow-plan-verify",
                 "skill_ref": "skills/workflow-plan-verify/SKILL.md",
                 "skill_must_read_refs": ",".join(
                     [
                         "docs/WORKFLOW.md",
                         "docs/ORCHESTRATION.md",
-                        "workspace/plans/problem__shallow_water2d__0.3.0/plan_001/case.resolved.yaml",
-                        "workspace/plans/problem__shallow_water2d__0.3.0/plan_001/algorithm.resolved.yaml",
-                        "workspace/plans/problem__shallow_water2d__0.3.0/plan_001/impl.resolved.yaml",
-                        "workspace/plans/problem__shallow_water2d__0.3.0/plan_001/dependency.resolved.yaml",
-                        "workspace/plans/problem__shallow_water2d__0.3.0/plan_001/derived_contract.json",
+                        "workspace/plans/problem__shallow_water2d__0.3.0/problem__shallow_water2d__0.3.0_plan001/case.resolved.yaml",
+                        "workspace/plans/problem__shallow_water2d__0.3.0/problem__shallow_water2d__0.3.0_plan001/algorithm.resolved.yaml",
+                        "workspace/plans/problem__shallow_water2d__0.3.0/problem__shallow_water2d__0.3.0_plan001/impl.resolved.yaml",
+                        "workspace/plans/problem__shallow_water2d__0.3.0/problem__shallow_water2d__0.3.0_plan001/dependency.resolved.yaml",
+                        "workspace/plans/problem__shallow_water2d__0.3.0/problem__shallow_water2d__0.3.0_plan001/derived_contract.json",
                     ]
                 ),
                 "issue_severity": "none",
@@ -1088,9 +1179,9 @@ shell_tool                       stable             true
                     "orchestration_id": "orch_001",
                     "agent_run_id": "substep_run_plan_generate_001",
                     "parent_agent_run_id": "orch_run_001",
-                    "plan_ref": "workspace/plans/problem__shallow_water2d__0.3.0/plan_001",
-                    "pipeline_ref": "workspace/pipelines/problem__shallow_water2d__0.3.0/pipeline_001",
-                    "dependency_ref": "workspace/plans/problem__shallow_water2d__0.3.0/plan_001/dependency.resolved.yaml",
+                    "plan_ref": "workspace/plans/problem__shallow_water2d__0.3.0/problem__shallow_water2d__0.3.0_plan001",
+                    "pipeline_ref": "workspace/pipelines/problem__shallow_water2d__0.3.0/problem__shallow_water2d__0.3.0_pl001",
+                    "dependency_ref": "workspace/plans/problem__shallow_water2d__0.3.0/problem__shallow_water2d__0.3.0_plan001/dependency.resolved.yaml",
                     "skill_name": "workflow-plan-generate",
                     "skill_ref": "skills/workflow-plan-generate/SKILL.md",
                     "skill_must_read_refs": "docs/WORKFLOW.md,docs/ORCHESTRATION.md",
@@ -1118,7 +1209,7 @@ shell_tool                       stable             true
                     "agent_model": "gpt-5-codex",
                     "context_id": "ctx_substep_plan_generate_001",
                     "agent_session_id": "sess_substep_plan_generate_001",
-                    "output_refs": ["workspace/plans/problem__shallow_water2d__0.3.0/plan_001/impl.resolved.yaml"],
+                    "output_refs": ["workspace/plans/problem__shallow_water2d__0.3.0/problem__shallow_water2d__0.3.0_plan001/impl.resolved.yaml"],
                 },
             )
             with self.assertRaisesRegex(ValueError, "required_outputs must be satisfied"):
@@ -1131,7 +1222,7 @@ shell_tool                       stable             true
                     payload={
                         "status": "pass",
                         "required_outputs": [
-                            "workspace/plans/problem__shallow_water2d__0.3.0/plan_001/case.resolved.yaml"
+                            "workspace/plans/problem__shallow_water2d__0.3.0/problem__shallow_water2d__0.3.0_plan001/case.resolved.yaml"
                         ],
                         "failed_substeps": [],
                         "substep_agent_run_ids": ["substep_run_plan_generate_001"],
@@ -1201,9 +1292,9 @@ shell_tool                       stable             true
                         "orchestration_id": "orch_001",
                         "agent_run_id": "step_run_build_001",
                         "parent_agent_run_id": "orch_run_001",
-                        "plan_ref": "workspace/plans/problem__shallow_water2d__0.3.0/plan_001",
-                        "pipeline_ref": "workspace/pipelines/problem__shallow_water2d__0.3.0/pipeline_001",
-                        "dependency_ref": "workspace/plans/problem__shallow_water2d__0.3.0/plan_001/dependency.resolved.yaml",
+                        "plan_ref": "workspace/plans/problem__shallow_water2d__0.3.0/problem__shallow_water2d__0.3.0_plan001",
+                        "pipeline_ref": "workspace/pipelines/problem__shallow_water2d__0.3.0/problem__shallow_water2d__0.3.0_pl001",
+                        "dependency_ref": "workspace/plans/problem__shallow_water2d__0.3.0/problem__shallow_water2d__0.3.0_plan001/dependency.resolved.yaml",
                         "skill_name": "workflow-build",
                         "skill_ref": "skills/workflow-build/SKILL.md",
                         "skill_must_read_refs": "docs/WORKFLOW.md,docs/ORCHESTRATION.md",
@@ -1242,9 +1333,9 @@ shell_tool                       stable             true
                     "orchestration_id": "orch_001",
                     "agent_run_id": "step_run_build_001",
                     "parent_agent_run_id": "orch_run_001",
-                    "plan_ref": "workspace/plans/problem__shallow_water2d__0.3.0/plan_001",
-                    "pipeline_ref": "workspace/pipelines/problem__shallow_water2d__0.3.0/pipeline_001",
-                    "dependency_ref": "workspace/plans/problem__shallow_water2d__0.3.0/plan_001/dependency.resolved.yaml",
+                    "plan_ref": "workspace/plans/problem__shallow_water2d__0.3.0/problem__shallow_water2d__0.3.0_plan001",
+                    "pipeline_ref": "workspace/pipelines/problem__shallow_water2d__0.3.0/problem__shallow_water2d__0.3.0_pl001",
+                    "dependency_ref": "workspace/plans/problem__shallow_water2d__0.3.0/problem__shallow_water2d__0.3.0_plan001/dependency.resolved.yaml",
                     "skill_name": "workflow-build",
                     "skill_ref": "skills/workflow-build/SKILL.md",
                     "skill_must_read_refs": "docs/WORKFLOW.md,docs/ORCHESTRATION.md",
@@ -1272,7 +1363,7 @@ shell_tool                       stable             true
                         "context_id": "ctx_step_build_001",
                         "agent_session_id": "sess_step_build_999",
                         "output_refs": [
-                            "workspace/pipelines/problem__shallow_water2d__0.3.0/pipeline_001/build/build_001/bin/simulate"
+                            "workspace/pipelines/problem__shallow_water2d__0.3.0/problem__shallow_water2d__0.3.0_pl001/build/build_001/bin/simulate"
                         ],
                     },
                 )
@@ -1368,7 +1459,7 @@ shell_tool                       stable             true
                         "agent_model": "gpt-5-codex",
                         "context_id": "ctx_step_plan_001",
                         "agent_session_id": "sess_step_plan_001",
-                        "output_refs": ["workspace/pipelines/problem__shallow_water2d__0.3.0/pipeline_001/build/build_001/bin/simulate"],
+                        "output_refs": ["workspace/pipelines/problem__shallow_water2d__0.3.0/problem__shallow_water2d__0.3.0_pl001/build/build_001/bin/simulate"],
                     },
                 )
 
@@ -1427,9 +1518,9 @@ shell_tool                       stable             true
                         "orchestration_id": "orch_001",
                         "agent_run_id": "substep_run_plan_generate_001",
                         "parent_agent_run_id": "orch_run_001",
-                        "plan_ref": "workspace/plans/problem__shallow_water2d__0.3.0/plan_001",
-                        "pipeline_ref": "workspace/pipelines/problem__shallow_water2d__0.3.0/pipeline_001",
-                        "dependency_ref": "workspace/plans/problem__shallow_water2d__0.3.0/plan_001/dependency.resolved.yaml",
+                        "plan_ref": "workspace/plans/problem__shallow_water2d__0.3.0/problem__shallow_water2d__0.3.0_plan001",
+                        "pipeline_ref": "workspace/pipelines/problem__shallow_water2d__0.3.0/problem__shallow_water2d__0.3.0_pl001",
+                        "dependency_ref": "workspace/plans/problem__shallow_water2d__0.3.0/problem__shallow_water2d__0.3.0_plan001/dependency.resolved.yaml",
                         "skill_name": "workflow-plan-generate",
                         "skill_ref": "skills/workflow-plan-generate/SKILL.md",
                         "skill_must_read_refs": "docs/WORKFLOW.md,docs/ORCHESTRATION.md",
@@ -1489,9 +1580,9 @@ shell_tool                       stable             true
                         "orchestration_id": "orch_001",
                         "agent_run_id": "step_run_build_001",
                         "parent_agent_run_id": "orch_run_001",
-                        "plan_ref": "workspace/plans/problem__shallow_water2d__0.3.0/plan_001",
-                        "pipeline_ref": "workspace/pipelines/problem__shallow_water2d__0.3.0/pipeline_001",
-                        "dependency_ref": "workspace/plans/problem__shallow_water2d__0.3.0/plan_001/dependency.resolved.yaml",
+                        "plan_ref": "workspace/plans/problem__shallow_water2d__0.3.0/problem__shallow_water2d__0.3.0_plan001",
+                        "pipeline_ref": "workspace/pipelines/problem__shallow_water2d__0.3.0/problem__shallow_water2d__0.3.0_pl001",
+                        "dependency_ref": "workspace/plans/problem__shallow_water2d__0.3.0/problem__shallow_water2d__0.3.0_plan001/dependency.resolved.yaml",
                         "skill_name": "workflow-build",
                         "skill_ref": "skills/workflow-build/SKILL.md",
                         "skill_must_read_refs": "docs/WORKFLOW.md,docs/ORCHESTRATION.md",
@@ -1517,7 +1608,7 @@ shell_tool                       stable             true
                         "agent_model": "gpt-5-codex",
                         "context_id": "ctx_step_build_001",
                         "agent_session_id": "sess_step_build_001",
-                        "output_refs": ["workspace/pipelines/problem__shallow_water2d__0.3.0/pipeline_001/build/build_001/bin/simulate"],
+                        "output_refs": ["workspace/pipelines/problem__shallow_water2d__0.3.0/problem__shallow_water2d__0.3.0_pl001/build/build_001/bin/simulate"],
                     },
                 )
                 write_step_result(
@@ -1529,7 +1620,7 @@ shell_tool                       stable             true
                     payload={
                         "status": "pass",
                         "required_outputs": [
-                            "workspace/pipelines/problem__shallow_water2d__0.3.0/pipeline_001/build/build_001/bin/simulate"
+                            "workspace/pipelines/problem__shallow_water2d__0.3.0/problem__shallow_water2d__0.3.0_pl001/build/build_001/bin/simulate"
                         ],
                         "failed_substeps": [],
                         "substep_agent_run_ids": [],
@@ -1576,9 +1667,9 @@ shell_tool                       stable             true
                     "orchestration_id": "orch_001",
                     "agent_run_id": "step_run_build_001",
                     "parent_agent_run_id": "orch_run_001",
-                    "plan_ref": "workspace/plans/problem__shallow_water2d__0.3.0/plan_001",
-                    "pipeline_ref": "workspace/pipelines/problem__shallow_water2d__0.3.0/pipeline_001",
-                    "dependency_ref": "workspace/plans/problem__shallow_water2d__0.3.0/plan_001/dependency.resolved.yaml",
+                    "plan_ref": "workspace/plans/problem__shallow_water2d__0.3.0/problem__shallow_water2d__0.3.0_plan001",
+                    "pipeline_ref": "workspace/pipelines/problem__shallow_water2d__0.3.0/problem__shallow_water2d__0.3.0_pl001",
+                    "dependency_ref": "workspace/plans/problem__shallow_water2d__0.3.0/problem__shallow_water2d__0.3.0_plan001/dependency.resolved.yaml",
                     "skill_name": "workflow-build",
                     "skill_ref": "skills/workflow-build/SKILL.md",
                     "skill_must_read_refs": "docs/WORKFLOW.md,docs/ORCHESTRATION.md",

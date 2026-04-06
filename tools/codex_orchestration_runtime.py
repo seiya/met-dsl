@@ -17,6 +17,11 @@ from typing import Any, Callable
 
 TERMINAL_STATUSES = {"pass", "fail", "blocked", "timeout", "cancel"}
 SUPPORTED_BACKENDS = {"codex", "cursor", "claude"}
+
+# Must match tools/validate_workspace_root.py (canonical pipeline/plan id directory naming).
+_NODE_KEY_SAFE_PATTERN = re.compile(
+    r"^[a-z][a-z0-9_]*__[a-z0-9][a-z0-9_]*__[0-9][0-9A-Za-z._-]*$"
+)
 DEFAULT_BACKEND_COMMANDS = {
     "codex": "codex",
     "cursor": "agent",
@@ -317,13 +322,29 @@ def _required_verify_skill_refs(request_payload: dict[str, Any]) -> list[str]:
     ):
         return []
     plan_root = plan_ref.strip().rstrip("/")
-    return [
+    refs = [
         f"{plan_root}/case.resolved.yaml",
         f"{plan_root}/algorithm.resolved.yaml",
         f"{plan_root}/impl.resolved.yaml",
         f"{plan_root}/dependency.resolved.yaml",
         f"{plan_root}/derived_contract.json",
     ]
+    if step.strip().lower() == "generate":
+        pipeline_ref = request_payload.get("pipeline_ref")
+        generation_id = request_payload.get("generation_id")
+        if not isinstance(pipeline_ref, str) or not pipeline_ref.strip():
+            raise ValueError("generate verify launch request must include non-empty pipeline_ref")
+        if not isinstance(generation_id, str) or not generation_id.strip():
+            raise ValueError("generate verify launch request must include non-empty generation_id")
+        pr = pipeline_ref.strip().rstrip("/")
+        gid = generation_id.strip()
+        refs.extend(
+            [
+                f"{pr}/lineage.json",
+                f"{pr}/generate/{gid}/generate_meta.json",
+            ]
+        )
+    return refs
 
 
 def _merge_unique_refs(*ref_groups: list[str]) -> list[str]:
@@ -606,6 +627,97 @@ def _node_key_to_safe(node_key: str) -> str:
     return f"{spec_kind}__{spec_id}__{spec_version}"
 
 
+def _validate_canonical_workspace_root_ref(
+    *,
+    ref: str,
+    node_safe: str,
+    kind: str,
+    label: str,
+) -> None:
+    """Require ref == workspace/{kind}/{node_safe}/{root_id} with no extra path segments."""
+    token = ref.strip().strip("/")
+    parts = token.split("/")
+    if len(parts) != 4:
+        raise ValueError(
+            f"launch request {label} must be exactly workspace/{kind}/<node_key_safe>/<id> "
+            f"(directory root only); got {ref!r}"
+        )
+    if parts[0] != "workspace" or parts[1] != kind:
+        raise ValueError(f"launch request {label} must be under workspace/{kind}/; got {ref!r}")
+    seg_node = parts[2]
+    root_id = parts[3]
+    if seg_node != node_safe:
+        raise ValueError(
+            f"launch request {label} node directory must be {node_safe!r}; got {ref!r}"
+        )
+    if not _NODE_KEY_SAFE_PATTERN.match(seg_node):
+        raise ValueError(f"launch request {label} has invalid node_key_safe segment: {ref!r}")
+    if not root_id.startswith(f"{node_safe}_"):
+        raise ValueError(
+            f"launch request {label} root id must start with {node_safe + '_'}; got {ref!r}"
+        )
+
+
+def _workspace_path_is_under_ref(path: str, base: str) -> bool:
+    p = path.strip().rstrip("/")
+    b = base.strip().rstrip("/")
+    return p == b or p.startswith(b + "/")
+
+
+def _validate_pass_output_refs_against_launch(
+    repo_root: Path,
+    payload: dict[str, Any],
+) -> None:
+    """Require each output_ref to lie under plan_ref or pipeline_ref from the saved launch request.
+
+    Only applies to ``step`` / ``substep`` runs that have a launch request on disk.
+    ``orchestration`` and other roles do not set ``launch_request_ref``; skip validation.
+    """
+    role = payload.get("agent_role")
+    if not isinstance(role, str) or role.strip().lower() not in {"step", "substep"}:
+        return
+
+    output_refs = payload.get("output_refs")
+    if not isinstance(output_refs, list) or not output_refs:
+        return
+
+    launch_request_ref = payload.get("launch_request_ref")
+    if not isinstance(launch_request_ref, str) or not launch_request_ref.strip():
+        raise ValueError("launch_request_ref must be non-empty string for pass output_refs validation")
+    launch_path = repo_root / launch_request_ref.strip()
+    if not launch_path.exists():
+        raise ValueError(f"launch_request_ref target not found: {launch_request_ref}")
+    try:
+        launch_payload = _read_json(launch_path)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"launch_request_ref must be valid json: {launch_request_ref}") from exc
+    if not isinstance(launch_payload, dict):
+        raise ValueError(f"launch request must be object: {launch_request_ref}")
+
+    plan_ref = launch_payload.get("plan_ref")
+    pipeline_ref = launch_payload.get("pipeline_ref")
+    if not isinstance(plan_ref, str) or not plan_ref.strip():
+        raise ValueError("launch request plan_ref missing for output_refs validation")
+    if not isinstance(pipeline_ref, str) or not pipeline_ref.strip():
+        raise ValueError("launch request pipeline_ref missing for output_refs validation")
+
+    plan_root = plan_ref.strip().rstrip("/")
+    pipe_root = pipeline_ref.strip().rstrip("/")
+
+    for idx, ref in enumerate(output_refs):
+        if not isinstance(ref, str) or not ref.strip():
+            raise ValueError(f"output_refs[{idx}] must be non-empty string")
+        r = ref.strip()
+        if not r.startswith("workspace/"):
+            raise ValueError(f"output_refs[{idx}] must start with workspace/: {r!r}")
+        if _workspace_path_is_under_ref(r, plan_root) or _workspace_path_is_under_ref(r, pipe_root):
+            continue
+        raise ValueError(
+            f"output_refs[{idx}] must be under plan_ref or pipeline_ref root "
+            f"({plan_root!r} or {pipe_root!r}); got {r!r}"
+        )
+
+
 def _validate_launch_request_payload(request_payload: dict[str, Any]) -> None:
     node_key = request_payload.get("node_key")
     step = request_payload.get("step")
@@ -625,17 +737,20 @@ def _validate_launch_request_payload(request_payload: dict[str, Any]) -> None:
     plan_ref = request_payload.get("plan_ref")
     pipeline_ref = request_payload.get("pipeline_ref")
     dependency_ref = request_payload.get("dependency_ref")
-    if isinstance(plan_ref, str) and node_safe is not None:
-        expected_prefix = f"workspace/plans/{node_safe}/"
-        if not plan_ref.startswith(expected_prefix):
-            raise ValueError(
-                f"launch request plan_ref must start with canonical node root {expected_prefix}"
+    if node_safe is not None:
+        if isinstance(plan_ref, str) and plan_ref.strip():
+            _validate_canonical_workspace_root_ref(
+                ref=plan_ref,
+                node_safe=node_safe,
+                kind="plans",
+                label="plan_ref",
             )
-    if isinstance(pipeline_ref, str) and node_safe is not None:
-        expected_prefix = f"workspace/pipelines/{node_safe}/"
-        if not pipeline_ref.startswith(expected_prefix):
-            raise ValueError(
-                f"launch request pipeline_ref must start with canonical node root {expected_prefix}"
+        if isinstance(pipeline_ref, str) and pipeline_ref.strip():
+            _validate_canonical_workspace_root_ref(
+                ref=pipeline_ref,
+                node_safe=node_safe,
+                kind="pipelines",
+                label="pipeline_ref",
             )
     if isinstance(dependency_ref, str) and _is_placeholder_ref(dependency_ref):
         raise ValueError("launch request dependency_ref must not contain placeholder tokens")
@@ -646,6 +761,11 @@ def _validate_launch_request_payload(request_payload: dict[str, Any]) -> None:
         and isinstance(substep, str)
         and substep.strip().lower() == "verify"
     )
+    if is_verify_substep and isinstance(step, str) and step.strip().lower() == "generate":
+        gen_id = request_payload.get("generation_id")
+        if not isinstance(gen_id, str) or not gen_id.strip():
+            raise ValueError("generate verify launch request must include non-empty generation_id")
+
     if not is_verify_substep:
         return
 
@@ -706,6 +826,8 @@ def _validate_terminal_run_payload(
     for idx, item in enumerate(output_refs):
         if not isinstance(item, str) or not item.strip():
             raise ValueError(f"output_refs[{idx}] must be non-empty string")
+
+    _validate_pass_output_refs_against_launch(repo_root, payload)
 
 
 def _validate_step_or_substep_launch_refs(repo_root: Path, payload: dict[str, Any]) -> None:
@@ -1191,12 +1313,6 @@ def record_agent_run(
     payload["agent_role"] = role_token
     payload.setdefault("started_at", _utc_now_iso())
 
-    _validate_terminal_run_payload(repo_root, orchestration_id, payload)
-
-    status = payload.get("status")
-    if isinstance(status, str) and status.strip().lower() in TERMINAL_STATUSES:
-        payload.setdefault("finished_at", _utc_now_iso())
-
     if role_token in {"step", "substep"}:
         payload.setdefault("context_isolated", True)
         request_ref, response_ref = _launch_refs(orchestration_id, agent_run_id)
@@ -1206,6 +1322,14 @@ def record_agent_run(
         payload.setdefault("launch_prompt_ref", prompt_ref)
         payload.setdefault("launch_reply_ref", reply_ref)
         _validate_step_or_substep_launch_refs(repo_root, payload)
+
+    _validate_terminal_run_payload(repo_root, orchestration_id, payload)
+
+    status = payload.get("status")
+    if isinstance(status, str) and status.strip().lower() in TERMINAL_STATUSES:
+        payload.setdefault("finished_at", _utc_now_iso())
+
+    if role_token in {"step", "substep"}:
         launch_response_path = repo_root / payload["launch_response_ref"]
         launch_response_payload = _read_json(launch_response_path)
         if not isinstance(launch_response_payload, dict):

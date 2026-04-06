@@ -88,6 +88,10 @@
 - `Plan generate/verify`、`Generate generate/verify`、`Tune generate/verify` のように `substep` を持つ `step` では、`orchestration agent` は `step` 契約を分解したうえで、対応 `SKILL.md` の責務境界に一致する `substep` 契約だけを直接渡さなければならない。
 - `Plan verify substep` の契約には、`dependency.resolved.yaml` の網羅性検証、依存辺整合検証、依存先 `node` の `plan` 文書との照合検証を必ず含めなければならない。
 - `Plan verify` と `Generate verify` の起動要求では、`skill_must_read_refs` に `plan_ref` 配下の `case.resolved.yaml` と `algorithm.resolved.yaml` と `impl.resolved.yaml` と `dependency.resolved.yaml` と `derived_contract.json` を必須記録しなければならない。不足時は起動前に `fail_closed` とする。
+- `plan_ref` は `workspace/plans/<node_key_safe>/<plan_id>` のみとし、追加のパスセグメント（ファイルパスを含む）を付けてはならない。`<plan_id>` は `<node_key_safe>_` で始まるディレクトリ名とする。
+- `pipeline_ref` は `workspace/pipelines/<node_key_safe>/<pipeline_id>` のみとし、追加のパスセグメント（`generate/` や `generate_meta.json` を含む）を付けてはならない。`<pipeline_id>` は `<node_key_safe>_` で始まるディレクトリ名とする。
+- `Generate verify` の起動要求では、`generation_id` を必須記録しなければならない。`record-launch` は上記の `plan_ref` / `pipeline_ref` 形と `generation_id` と `skill_must_read_refs` 充足を検査する。
+- `step agent` / `substep agent` が `pass` で終了するとき、`output_refs` の各パスは、対応する起動要求に記録された `plan_ref` または `pipeline_ref` ディレクトリ配下に含まれなければならない。`record_agent_run` がこれを検査する。
 
 ## 運用ルール
 1. `workflow` 開始時に `orchestration_id` を発行し、`workspace/orchestrations/<orchestration_id>/orchestration_meta.json` を作成する。

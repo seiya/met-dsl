@@ -100,8 +100,19 @@ def _create_minimal_execution_tree(
         pipeline_dir / "lineage.json",
         {
             "node_key": "problem/shallow_water2d@0.3.0",
+            "pipeline_id": pipeline_id,
             "plan_ref": "workspace/plans/problem__shallow_water2d__0.3.0/plan_test",
             "dependency_ref": "workspace/plans/problem__shallow_water2d__0.3.0/plan_test/dependency.resolved.yaml",
+        },
+    )
+    _write_json(
+        pipeline_dir / "generate" / "gen_test_001" / "generate_meta.json",
+        {
+            "attempt_count": 1,
+            "verification_status": "pass",
+            "last_fail_reason": "",
+            "debug_mode": False,
+            "context_isolated": True,
         },
     )
     if dependency_resolved is None:
