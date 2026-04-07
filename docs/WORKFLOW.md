@@ -187,7 +187,7 @@ workspace/
 #### 依存 workflow 網羅チェック
 - `dependency.resolved.yaml` の `node_key` 集合と `workspace/plans/*/<plan_id>/` の `node_key_safe` 集合は 1 対 1 で一致しなければならない。
 - `dependency.resolved.yaml` の `node_key` 集合と `workspace/pipelines/*/<pipeline_id>/lineage.json` の `node_key` 集合は 1 対 1 で一致しなければならない。
-- `dependency.resolved.yaml` が `all_nodes` を保持する場合、`python3 tools/validate_pipeline_semantics.py` は `all_nodes` の全 `node_key` について `lineage` と `plan_ref` の両方を検証し、未発行 `node` を `fail` としなければならない。
+- `dependency.resolved.yaml` が `all_nodes` を保持する場合、`python3 tools/validate_pipeline_semantics.py` の `--stage post_execute`、`--stage pre_judge`、および省略時（`--stage full` 相当）の invocation は、`all_nodes` の全 `node_key` について `lineage` と `plan_ref` の両方を検証し、未発行 `node` を `fail` としなければならない。
 - 異なる `node_key` で生成された `generate/<generation_id>/src/` のコードハッシュが一致した場合、共通ライブラリとして明示されたファイルを除き `copy_based_artifact_reuse` として `invalid` にしなければならない。
 - `spec_kind` を問わない workflow 実行の完了宣言前に、対象依存 `DAG` の `workspace/plans` / `workspace/pipelines` artifact を削除してはならない。
 
@@ -272,6 +272,7 @@ workspace/
 - `algorithm.resolved.yaml` は `YAML` mapping artifact とし、`JSON` 文字列として検証してはならない。
 - `algorithm.resolved.yaml` は `algorithm_id` と `execution_mode` と `steps[]` と `ordering` と `control_condition` と `iteration_contract` と `update_semantics` と `temporaries` と `derived_field_rules` と `invariants` と `splitting_policy` を必須保持しなければならない。
 - `Plan` 完了前に `python3 tools/check_artifact_syntax.py --expect-top object` を用いて `case.resolved.yaml` と `algorithm.resolved.yaml` と `impl.resolved.yaml` と `dependency.resolved.yaml` と `derived_contract.json` と `plan_meta.json` の構文妥当性を検査し、`fail` 時は `Plan fail` としなければならない。
+- `Plan verify` 完了前に `python3 tools/validate_pipeline_semantics.py --stage plan --plan-ref workspace/plans/<node_key_safe>/<plan_id>/` を実行し、`exit code 0` を必須としなければならない。`fail` 時は `plan_meta.json` の `verification_status=pass` を付与してはならない。
 - `ordering` は `step_id` の列、または `before` / `after` を持つ dependency object の列として表現しなければならない。
 - `control_condition` は文字列、文字列配列、または object のいずれかで表現しなければならない。
 - `iteration_contract` は object とし、`execution_mode=iterative` の場合は空 object を禁止する。
@@ -347,6 +348,7 @@ workspace/
 - 物理更新を実装できない場合は `Generate fail` とし、代替として固定文字列や固定 `JSON` を出力してはならない。
 
 #### 2-2. verify substep
+- `Generate verify` 完了前に `python3 tools/validate_pipeline_semantics.py --stage post_generate --pipeline-root workspace/pipelines/<node_key_safe>/<pipeline_id>/` を実行し、検証対象の `generation_id` を固定する場合は `--generation-id <generation_id>` を付与しなければならない。`exit code 0` を必須とする。`fail` 時は `generate_meta.json` の `verification_status=pass` を付与してはならない。
 - `Generate verify` は、`model` が `case_id` 分岐と固定数値代入のみで判定指標を構成する実装を検出した場合に `fail` とする。
 - `Generate verify` は `case.resolved.yaml` を入力として、記載された `test case set` の全 `case_id` と全展開 `case` が `runner` または `model` の実装経路から到達可能であることを検証しなければならない。未実装 `case`、到達不能分岐、固定 `case_id` 限定実装を検出した場合は `fail` とする。
 - `Generate verify` は `case.resolved.yaml` の実行時入力を `runner` と `model` が受理していることを検証しなければならない。少なくとも `case_id`、格子条件、時間条件、初期条件識別子、境界条件識別子、`profile` または `component` 選択結果、`tests.md` 由来の `test_profile_id` と `test_profile_version` に対応する入力伝播または記録経路を確認できない場合は `fail` とする。
@@ -376,6 +378,7 @@ workspace/
 - `Build` は依存を持つ `node` で、依存 `operation` 解決先が `dependency.resolved.yaml` と一致することを必須検証とする。不一致時は `Build fail` とする。
 - `Build` は `node` 単位で個別実行し、他 `node` の artifact を混在させてはならない。
 - `Build` は、依存元 `src/` に依存 `node` 固有の `module`、`subroutine`、または `runner` 実装が混入している場合を `dependency implementation encapsulation` 違反として `fail` にしなければならない。
+- `Build` 完了前に `python3 tools/validate_pipeline_semantics.py --stage post_build --pipeline-root workspace/pipelines/<node_key_safe>/<pipeline_id>/` を実行し、必要に応じて `--generation-id <generation_id>` を付与しなければならない。`exit code 0` を必須とし、`fail` 時は `Build` を `fail` としなければならない。
 
 ### 4. Execute
 - execution input: `build/<build_id>/bin/`、`case.resolved.yaml`
@@ -391,12 +394,13 @@ workspace/
 - `runner` は `verdict.json`、`aggregate_verdict.json`、`summary.json`、`trial_meta.json` を書き込んではならない。
 - `diagnostics.json` と `perf.json` は、標準 `JSON` parser で復元可能な UTF-8 `JSON object` として出力しなければならない。不正 `JSON`、先頭 0 欠落数値、言語依存整形による非互換 token を禁止する。
 - `Execute` 完了前に `python3 tools/check_artifact_syntax.py --format json --expect-top object` を用いて `diagnostics.json` と `perf.json` と `quality_check.json` と `trial_meta.json` を検査し、`fail` 時は `Execute fail` としなければならない。
+- `Execute` 完了前に `python3 tools/validate_pipeline_semantics.py --stage post_execute` を実行し、`exit code 0` を必須としなければならない。`--pipeline-root` は繰り返し指定可能とし、`dependency.resolved.yaml` が `all_nodes` を保持する試行では `all_nodes` に対応する全 `pipeline_root` を指定しなければならない。`fail` 時は `Execute fail` とし、`Judge` を開始してはならない。
 - `Execute` は `Judge` 再計算に必要な一次証跡を `execution_id/<node_key>/raw/` に保存しなければならない。
 - 一次証跡の必須構成は `derived_contract.json` の `raw_requirements.required_evidence` を canonical source とする。固定の最小構成を全 `spec` に一律適用してはならない。
 - `raw_requirements.required_evidence` は `metrics_basis.json` と `execution_trace.json` と `state_snapshots` などの `artifact` ごとに必須有無を宣言しなければならない。
 - `raw_requirements.required_evidence` が `artifact=state_snapshots` かつ `required=true` を宣言する場合、`raw/state_snapshots/` は `snapshot_schema.json` で `variables[].name` と `variables[].shape_expr` と `time_variable` と `time_shape_expr` を宣言し、`min_samples` 件以上の状態ファイルへ当該項目を保持しなければならない。
 - `raw_requirements.required_evidence` が `artifact=state_snapshots` を必須宣言しない場合、`raw/state_snapshots/` を必須にしてはならない。スカラー目的 `spec` を含む任意の計算課題を許容しなければならない。
-- `python3 tools/validate_pipeline_semantics.py` は `derived_contract.json` で宣言された `state_snapshots` の変数名と形状式、および `time_variable` の形状式が `raw/state_snapshots/snapshot_schema.json` と各 `snapshot*.json` に一致することを検証しなければならない。
+- `python3 tools/validate_pipeline_semantics.py` の `--stage post_execute`、`--stage pre_judge`、および省略時（`--stage full` 相当）の invocation は、`derived_contract.json` で宣言された `state_snapshots` の変数名と形状式、および `time_variable` の形状式が `raw/state_snapshots/snapshot_schema.json` と各 `snapshot*.json` に一致することを検証しなければならない。
 - `raw/metrics_basis.json` は一次証跡のみを保持し、`diagnostics.json` の複写を禁止する。
 - `raw/metrics_basis.json` は `test_evidence_requirements` の全 `test_id` を対象とする per-test evidence index を保持しなければならない。各 `test_id` の entry は `required_raw_variables` を欠落なく保持し、suite 全体 summary のみで代替してはならない。
 - 同一 `metrics_basis.json` 内で異なる `test_id` の一次証跡を相互上書きしてはならない。単一の最後勝ち `case` 結果で複数 `test` の raw evidence を代表させる構成を禁止する。
@@ -428,11 +432,11 @@ workspace/
 - `verdict.json` は `per_test` を必須保持とし、`tests.md` の全 `test_id` を重複なく記録しなければならない。
 - `summary.json` の `counts` は `verdict.json.per_test` の集計値と一致しなければならない。
 - 判定入力不足時は `Judge fail` とし、推定値や仮定値で `verdict` を成立させてはならない。
-- `python3 tools/validate_pipeline_semantics.py` は、`problem node` の `model` で `intent(out)` 変数が固定値代入のみで構成される実装と、`runner` の `diagnostics.json` が `model` 呼び出し結果を参照しない固定値埋め込み実装を検出した場合に `fail` とする。
-- `Judge` 開始前と `Judge` 完了前に `python3 tools/validate_pipeline_semantics.py` を実行し、`fail` 時は当該 `pipeline` を `invalid` とする。
-- `python3 tools/validate_pipeline_semantics.py` は `--allow-missing-orchestration` と `--allow-missing-llm-review` を指定せずに実行しなければならない。互換移行を明示した例外運用以外で当該オプションを指定した試行は `invalid` とする。
-- `Judge` 開始前の `python3 tools/validate_pipeline_semantics.py` は、対象 `dependency.resolved.yaml` の `all_nodes` で解決された全 `node` の `pipeline_root` を検証対象に含めなければならない。起点 `problem` の単独 `pipeline_root` のみを対象にしてはならない。
-- `python3 tools/validate_pipeline_semantics.py` は、`dependency.resolved.yaml` の `all_nodes` に対して `plan` または `pipeline` が未発行の `node` を検出した場合に `fail` とし、当該試行の `Judge` 開始を禁止しなければならない。
+- `python3 tools/validate_pipeline_semantics.py --stage pre_judge` は、`problem node` の `model` で `intent(out)` 変数が固定値代入のみで構成される実装と、`runner` の `diagnostics.json` が `model` 呼び出し結果を参照しない固定値埋め込み実装を検出した場合に `fail` とする。
+- `Judge` 開始前と `Judge` 完了前に `python3 tools/validate_pipeline_semantics.py --stage pre_judge` を実行し、`fail` 時は当該 `pipeline` を `invalid` とする。
+- `python3 tools/validate_pipeline_semantics.py --stage pre_judge` は `--allow-missing-orchestration` と `--allow-missing-llm-review` を指定してはならない。
+- `Judge` 開始前の `python3 tools/validate_pipeline_semantics.py --stage pre_judge` は、対象 `dependency.resolved.yaml` の `all_nodes` で解決された全 `node` の `pipeline_root` を `--pipeline-root` へ繰り返し指定して検証対象に含めなければならない。起点 `problem` の単独 `pipeline_root` のみを対象にしてはならない。
+- `python3 tools/validate_pipeline_semantics.py --stage pre_judge` は、`dependency.resolved.yaml` の `all_nodes` に対して `plan` または `pipeline` が未発行の `node` を検出した場合に `fail` とし、当該試行の `Judge` 開始を禁止しなければならない。
 - 実装品質判定（`target.class=cpu`）は `threads_per_rank=1` と `threads_per_rank>1` の比較で実施し、比較対象は `diagnostics.json` と `verdict.json` とする。
 - スレッド並列あり / なしの比較は `tests` の判定対象に含めず、`quality check` として扱う。
 - 物理 `fail` 時は性能評価をスキップする。
@@ -470,7 +474,7 @@ workspace/
 - workflow 完了宣言は、`dependency workflow` 網羅チェックと `trial_meta` 完整性チェックと `copy_based_artifact_reuse` 非検出を同時に満たす場合のみ許可する。
 - workflow 完了宣言は、上位 `node` の `src/` に依存 `node` 実装の内包が存在しないことを同時に満たす場合のみ許可する。
 - workflow 完了宣言は、全 phase で `write_scope_violation` 非検出を同時に満たす場合のみ許可する。
-- `CI` は `python3 tools/validate_workspace_root.py` と `python3 tools/validate_pipeline_semantics.py` の execution result を `pass` 条件として扱う。
+- `CI` は `python3 tools/validate_workspace_root.py` と `python3 tools/validate_pipeline_semantics.py`（`--stage full` または省略時）の execution result を `pass` 条件として扱う。
 
 ## 参照文書
 - `IMPL_PLAN_SPEC.md`

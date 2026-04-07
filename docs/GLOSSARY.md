@@ -66,7 +66,7 @@
 - **dummy output**: workflow 進行または `tests` 合格を目的に、実行根拠なしで人工生成した artifact。`diagnostics` / `perf` / `verdict` / `aggregate_verdict` を含む。
 - **dummy computation**: 物理計算を実行せず、固定値や定型文字列のみで計算結果を代替する実装。
 - **fail-fast stop**: phase input 不足または契約不一致を検知した時点で当該 phase を `fail` で停止し、推測補完や人工生成で継続しない運用規則。
-- **pipeline semantic validation**: `python3 tools/validate_pipeline_semantics.py` による内容検証ゲート。`raw` 一次証跡、`trial_meta` 追跡整合、`quality check` 比較 canonical source、固定値生成パターン、`copy_based_artifact_reuse` を機械検証する。
+- **pipeline semantic validation**: `python3 tools/validate_pipeline_semantics.py` の `--stage` invocation による内容検証ゲートである。`--stage plan` / `post_generate` / `post_build` は execution artifact 無しで該当段階の契約と生成物を検証し、`post_execute` / `pre_judge` / 省略時（`full`）は `raw` 一次証跡、`trial_meta` 追跡整合、`quality check` 比較 canonical source、固定値生成パターン、`copy_based_artifact_reuse` 等を機械検証する。
 - **metrics basis**: `raw/metrics_basis.json` に保存する per-test evidence index。`test_evidence_requirements` の全 `test_id` を保持し、各 `test_id` の Judge 再計算に必要な `required_raw_variables` を raw 値または raw 参照として保持する。suite 全体 summary や `diagnostics.json` の複写で代替してはならない。
 - **raw snapshot schema**: `problem` `node` の `raw/state_snapshots/snapshot_schema.json` に保存する項目定義。`variables[].name` と `variables[].shape_expr` と `time_variable` と `time_shape_expr` により、各問題設定で判定再計算に使用する状態量と時刻情報を表す。
 - **algorithm contract**: `algorithm.resolved.yaml` が保持する演算構成 `IR`。`execution_mode` と `steps[]` と `ordering` と `control_condition` と `iteration_contract` と `update_semantics` と `temporaries` と `derived_field_rules` と `invariants` と `splitting_policy` を必須語彙とする。

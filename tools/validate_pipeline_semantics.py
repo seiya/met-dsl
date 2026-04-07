@@ -424,14 +424,18 @@ def _validate_problem_model_dependency_dataflow(
             )
 
 
-def _is_multidim_problem_node(execution: NodeExecution) -> bool:
-    if not execution.node_key.startswith("problem/"):
+def _is_multidim_problem_node_key(node_key: str) -> bool:
+    if not node_key.startswith("problem/"):
         return False
-    spec_id = _spec_id_from_node_key(execution.node_key)
+    spec_id = _spec_id_from_node_key(node_key)
     if spec_id is None:
         return False
     spec_id_l = spec_id.lower()
     return "2d" in spec_id_l or "3d" in spec_id_l
+
+
+def _is_multidim_problem_node(execution: NodeExecution) -> bool:
+    return _is_multidim_problem_node_key(execution.node_key)
 
 
 def _validate_problem_state_array_usage(
@@ -715,6 +719,51 @@ def _fortran_source_module_deps(src_files: list[Path]) -> dict[str, set[str]]:
     return deps_by_stem
 
 
+def _validate_fortran_makefile_src_dir(src_dir: Path, violations: list[str]) -> None:
+    if not src_dir.is_dir():
+        return
+
+    src_files = sorted(
+        p for p in src_dir.iterdir() if p.is_file() and p.suffix.lower() == ".f90"
+    )
+    if len(src_files) < 2:
+        return
+
+    deps_by_stem = _fortran_source_module_deps(src_files)
+    required_object_deps = {
+        stem: deps for stem, deps in deps_by_stem.items() if deps
+    }
+    if not required_object_deps:
+        return
+
+    makefile_path = src_dir / "Makefile"
+    if not makefile_path.exists():
+        violations.append(
+            f"{makefile_path}: missing for fortran module dependency build"
+        )
+        return
+
+    rules = _parse_makefile_rules(
+        makefile_path.read_text(encoding="utf-8", errors="ignore")
+    )
+    for stem, deps in sorted(required_object_deps.items()):
+        object_target = f"{stem}.o"
+        prereqs = rules.get(object_target)
+        if prereqs is None:
+            violations.append(
+                f"{makefile_path}: missing explicit object dependency rule ({object_target})"
+            )
+            continue
+
+        for dep_stem in sorted(deps):
+            dep_mod = f"{dep_stem}.mod"
+            dep_obj = f"{dep_stem}.o"
+            if dep_mod not in prereqs and dep_obj not in prereqs:
+                violations.append(
+                    f"{makefile_path}: {object_target} missing prerequisite for used module ({dep_mod} or {dep_obj})"
+                )
+
+
 def _validate_fortran_makefile_dependencies(generate_root: Path, violations: list[str]) -> None:
     if not generate_root.exists():
         return
@@ -724,46 +773,7 @@ def _validate_fortran_makefile_dependencies(generate_root: Path, violations: lis
         src_dir = gen_dir / "src"
         if not src_dir.exists():
             continue
-
-        src_files = sorted(
-            p for p in src_dir.iterdir() if p.is_file() and p.suffix.lower() == ".f90"
-        )
-        if len(src_files) < 2:
-            continue
-
-        deps_by_stem = _fortran_source_module_deps(src_files)
-        required_object_deps = {
-            stem: deps for stem, deps in deps_by_stem.items() if deps
-        }
-        if not required_object_deps:
-            continue
-
-        makefile_path = src_dir / "Makefile"
-        if not makefile_path.exists():
-            violations.append(
-                f"{makefile_path}: missing for fortran module dependency build"
-            )
-            continue
-
-        rules = _parse_makefile_rules(
-            makefile_path.read_text(encoding="utf-8", errors="ignore")
-        )
-        for stem, deps in sorted(required_object_deps.items()):
-            object_target = f"{stem}.o"
-            prereqs = rules.get(object_target)
-            if prereqs is None:
-                violations.append(
-                    f"{makefile_path}: missing explicit object dependency rule ({object_target})"
-                )
-                continue
-
-            for dep_stem in sorted(deps):
-                dep_mod = f"{dep_stem}.mod"
-                dep_obj = f"{dep_stem}.o"
-                if dep_mod not in prereqs and dep_obj not in prereqs:
-                    violations.append(
-                        f"{makefile_path}: {object_target} missing prerequisite for used module ({dep_mod} or {dep_obj})"
-                    )
+        _validate_fortran_makefile_src_dir(src_dir, violations)
 
 
 def _validate_problem_runner_diagnostics_dependency(
@@ -1525,6 +1535,100 @@ def _validate_generate_outputs(
     )
 
 
+def _validate_generate_outputs_for_generation(
+    repo_root: Path,
+    execution: NodeExecution,
+    generation_id: str,
+    violations: list[str],
+) -> None:
+    gen_dir = execution.pipeline_dir / "generate" / generation_id
+    if not gen_dir.is_dir():
+        violations.append(
+            f"{gen_dir}: missing generate directory for generation_id={generation_id!r}"
+        )
+        return
+    src_dir = gen_dir / "src"
+    if not src_dir.is_dir():
+        violations.append(f"{src_dir}: missing src directory")
+        return
+
+    model_files, expected_model_name = _model_files_in_src_dir(src_dir, execution)
+    if not model_files:
+        if expected_model_name is None:
+            violations.append(f"{src_dir}: model source not found")
+        else:
+            violations.append(
+                f"{src_dir}: node model source not found ({expected_model_name})"
+            )
+        return
+
+    dep_spec_ids = _component_dep_spec_ids(repo_root, execution)
+    required_sources = _semantic_required_sources(repo_root, execution)
+
+    for model_file in model_files:
+        text = model_file.read_text(encoding="utf-8", errors="ignore")
+        lowered = text.lower()
+
+        if re.search(r"index\s*\(\s*case_id", lowered) and re.search(
+            r"metrics\s*\(\s*\d+\s*\)", lowered
+        ):
+            violations.append(
+                f"{model_file}: hardcoded case_id -> metrics assignment pattern detected"
+            )
+
+        assignments = re.findall(
+            r"metrics\s*\(\s*\d+\s*\)\s*=\s*([^\n!]+)",
+            lowered,
+            flags=re.MULTILINE,
+        )
+        literal_like = 0
+        for rhs in assignments:
+            if re.search(r"[-+]?\d+(?:\.\d+)?(?:d|e)?[-+]?\d*", rhs):
+                literal_like += 1
+        if len(assignments) >= 6 and literal_like >= 6:
+            violations.append(
+                f"{model_file}: many literal metric assignments detected ({literal_like}/{len(assignments)})"
+            )
+
+        _validate_problem_model_literal_outputs(
+            execution=execution,
+            model_file=model_file,
+            lowered=lowered,
+            violations=violations,
+        )
+
+        _validate_problem_model_dependency_dataflow(
+            execution=execution,
+            model_file=model_file,
+            lowered=lowered,
+            dep_spec_ids=dep_spec_ids,
+            required_sources=required_sources,
+            violations=violations,
+        )
+        _validate_problem_metric_only_scalar_kernel(
+            execution=execution,
+            model_file=model_file,
+            lowered=lowered,
+            violations=violations,
+        )
+        _validate_problem_state_array_usage(
+            repo_root=repo_root,
+            execution=execution,
+            model_file=model_file,
+            lowered=lowered,
+            violations=violations,
+        )
+
+    _validate_fortran_makefile_src_dir(src_dir, violations)
+    runner_files = sorted(src_dir.glob("*_runner.f90"))
+    _validate_runner_source_files(execution, runner_files, violations)
+
+    if dep_spec_ids:
+        _validate_dependency_operation_on_model_files(
+            model_files, dep_spec_ids, violations
+        )
+
+
 def _dependency_resolved_for_execution(repo_root: Path, execution: NodeExecution) -> dict[str, Any] | None:
     lineage_path = execution.pipeline_dir / "lineage.json"
     if not lineage_path.exists():
@@ -2144,19 +2248,9 @@ def _semantic_required_sources(repo_root: Path, execution: NodeExecution) -> set
     return required
 
 
-def _validate_derived_contract_schema(
-    repo_root: Path, execution: NodeExecution, violations: list[str]
+def _validate_derived_contract_file(
+    repo_root: Path, contract_path: Path, violations: list[str]
 ) -> None:
-    contract_path = _derived_contract_path_for_execution(repo_root, execution)
-    if contract_path is None:
-        violations.append(
-            f"{execution.pipeline_dir / 'lineage.json'}: plan_ref missing; cannot resolve derived_contract.json"
-        )
-        return
-    if not contract_path.exists():
-        violations.append(f"{contract_path}: missing")
-        return
-
     try:
         contract = _read_json(contract_path)
     except json.JSONDecodeError:
@@ -2435,19 +2529,28 @@ def _validate_derived_contract_schema(
     )
 
 
-def _validate_algorithm_contract_schema(
+def _validate_derived_contract_schema(
     repo_root: Path, execution: NodeExecution, violations: list[str]
 ) -> None:
-    contract_path = _algorithm_contract_path_for_execution(repo_root, execution)
+    contract_path = _derived_contract_path_for_execution(repo_root, execution)
     if contract_path is None:
         violations.append(
-            f"{execution.pipeline_dir / 'lineage.json'}: plan_ref missing; cannot resolve algorithm.resolved.yaml"
+            f"{execution.pipeline_dir / 'lineage.json'}: plan_ref missing; cannot resolve derived_contract.json"
         )
         return
     if not contract_path.exists():
         violations.append(f"{contract_path}: missing")
         return
+    _validate_derived_contract_file(repo_root, contract_path, violations)
 
+
+def _validate_algorithm_contract_file(
+    repo_root: Path,
+    contract_path: Path,
+    violations: list[str],
+    *,
+    multidim_node_key: str | None,
+) -> None:
     try:
         contract = _read_yaml(contract_path)
     except yaml.YAMLError:
@@ -2603,7 +2706,7 @@ def _validate_algorithm_contract_schema(
                 f"{contract_path}:execution_mode=columnwise requires at least one column_process step"
             )
 
-    if _is_multidim_problem_node(execution):
+    if multidim_node_key and _is_multidim_problem_node_key(multidim_node_key):
         state_contract = _algorithm_state_contract(contract)
         if not isinstance(state_contract, dict):
             violations.append(
@@ -2657,6 +2760,26 @@ def _validate_algorithm_contract_schema(
             violations.append(
                 f"{contract_path}:state_contract.fallback_policy must be fail_closed"
             )
+
+
+def _validate_algorithm_contract_schema(
+    repo_root: Path, execution: NodeExecution, violations: list[str]
+) -> None:
+    contract_path = _algorithm_contract_path_for_execution(repo_root, execution)
+    if contract_path is None:
+        violations.append(
+            f"{execution.pipeline_dir / 'lineage.json'}: plan_ref missing; cannot resolve algorithm.resolved.yaml"
+        )
+        return
+    if not contract_path.exists():
+        violations.append(f"{contract_path}: missing")
+        return
+    _validate_algorithm_contract_file(
+        repo_root,
+        contract_path,
+        violations,
+        multidim_node_key=execution.node_key,
+    )
 
 
 def _validate_test_evidence_requirements(
@@ -2905,25 +3028,24 @@ def _node_model_files(
     return targets, expected_name
 
 
-def _validate_dependency_operation_usage(
-    repo_root: Path, execution: NodeExecution, violations: list[str]
+def _model_files_in_src_dir(
+    src_dir: Path, execution: NodeExecution
+) -> tuple[list[Path], str | None]:
+    spec_id = _spec_id_from_node_key(execution.node_key)
+    if spec_id is None:
+        return sorted(p for p in src_dir.glob("*_model.f90") if p.is_file()), None
+    expected_name = f"{spec_id}_model.f90"
+    candidate = src_dir / expected_name
+    if candidate.exists():
+        return [candidate], expected_name
+    return [], expected_name
+
+
+def _validate_dependency_operation_on_model_files(
+    model_files: list[Path],
+    dep_spec_ids: list[str],
+    violations: list[str],
 ) -> None:
-    dep_spec_ids = _component_dep_spec_ids(repo_root, execution)
-    if not dep_spec_ids:
-        return
-
-    generate_root = execution.pipeline_dir / "generate"
-    if not generate_root.exists():
-        return
-
-    model_files, expected_model_name = _node_model_files(generate_root, execution)
-    if not model_files:
-        if expected_model_name is not None:
-            violations.append(
-                f"{generate_root}: node model source not found ({expected_model_name})"
-            )
-        return
-
     for model_file in model_files:
         text = model_file.read_text(encoding="utf-8", errors="ignore")
         lowered = text.lower()
@@ -2949,12 +3071,35 @@ def _validate_dependency_operation_usage(
                 )
 
 
-def _validate_runner_outputs(execution: NodeExecution, violations: list[str]) -> None:
-    generate_root = execution.pipeline_dir / "generate"
-    runner_files = sorted(generate_root.glob("*/src/*_runner.f90"))
-    if not runner_files:
+def _validate_dependency_operation_usage(
+    repo_root: Path, execution: NodeExecution, violations: list[str]
+) -> None:
+    dep_spec_ids = _component_dep_spec_ids(repo_root, execution)
+    if not dep_spec_ids:
         return
 
+    generate_root = execution.pipeline_dir / "generate"
+    if not generate_root.exists():
+        return
+
+    model_files, expected_model_name = _node_model_files(generate_root, execution)
+    if not model_files:
+        if expected_model_name is not None:
+            violations.append(
+                f"{generate_root}: node model source not found ({expected_model_name})"
+            )
+        return
+
+    _validate_dependency_operation_on_model_files(
+        model_files, dep_spec_ids, violations
+    )
+
+
+def _validate_runner_source_files(
+    execution: NodeExecution,
+    runner_files: list[Path],
+    violations: list[str],
+) -> None:
     for runner_file in runner_files:
         text = runner_file.read_text(encoding="utf-8", errors="ignore").lower()
         for output_name in FORBIDDEN_RUNNER_OUTPUTS:
@@ -2979,6 +3124,14 @@ def _validate_runner_outputs(execution: NodeExecution, violations: list[str]) ->
             lowered=text,
             violations=violations,
         )
+
+
+def _validate_runner_outputs(execution: NodeExecution, violations: list[str]) -> None:
+    generate_root = execution.pipeline_dir / "generate"
+    runner_files = sorted(generate_root.glob("*/src/*_runner.f90"))
+    if not runner_files:
+        return
+    _validate_runner_source_files(execution, runner_files, violations)
 
 
 def _validate_run_program_inputs(
@@ -4051,6 +4204,231 @@ def _validate_orchestration_hierarchy(
         )
 
 
+def _resolve_plan_dir(repo_root: Path, workspace_root: str, raw_plan_ref: str) -> Path:
+    workspace_path = (repo_root / workspace_root).resolve()
+    candidate = Path(raw_plan_ref)
+    if not candidate.is_absolute():
+        candidate = (repo_root / candidate).resolve()
+    else:
+        candidate = candidate.resolve()
+    try:
+        candidate.relative_to(workspace_path.resolve())
+    except ValueError as exc:
+        raise ValueError(
+            f"plan_ref must be under {workspace_path}: {candidate}"
+        ) from exc
+    plans_root = workspace_path / "plans"
+    try:
+        candidate.relative_to(plans_root.resolve())
+    except ValueError as exc:
+        raise ValueError(
+            f"plan_ref must be under {plans_root}: {candidate}"
+        ) from exc
+    return candidate
+
+
+def _resolve_pipeline_dir_for_stage(
+    repo_root: Path, workspace_root: str, raw_pipeline_ref: str
+) -> Path:
+    workspace_path = (repo_root / workspace_root).resolve()
+    candidate = Path(raw_pipeline_ref)
+    if not candidate.is_absolute():
+        candidate = (repo_root / candidate).resolve()
+    else:
+        candidate = candidate.resolve()
+    try:
+        candidate.relative_to(workspace_path.resolve())
+    except ValueError as exc:
+        raise ValueError(
+            f"pipeline_root must be under {workspace_path}: {candidate}"
+        ) from exc
+    pipelines_root = workspace_path / "pipelines"
+    try:
+        candidate.relative_to(pipelines_root.resolve())
+    except ValueError as exc:
+        raise ValueError(
+            f"pipeline_root must be under {pipelines_root}: {candidate}"
+        ) from exc
+    return candidate
+
+
+def _plan_dependency_node_key(plan_dir: Path) -> str | None:
+    dep_path = plan_dir / "dependency.resolved.yaml"
+    if not dep_path.exists():
+        return None
+    try:
+        data = _read_yaml(dep_path)
+    except yaml.YAMLError:
+        return None
+    if isinstance(data, dict):
+        nk = data.get("node_key")
+        if isinstance(nk, str) and nk.strip():
+            return nk.strip()
+    return None
+
+
+def _try_load_optional_plan_yaml(plan_dir: Path, name: str, violations: list[str]) -> None:
+    path = plan_dir / name
+    if not path.exists():
+        return
+    try:
+        data = _read_yaml(path)
+    except yaml.YAMLError:
+        violations.append(f"{path}: invalid yaml")
+        return
+    if data is None:
+        violations.append(f"{path}: must be non-null yaml document")
+        return
+    if not isinstance(data, dict):
+        violations.append(f"{path}: must be mapping at top level")
+
+
+def validate_plan_stage(
+    repo_root: Path,
+    workspace_root: str,
+    plan_ref: str,
+) -> list[str]:
+    violations: list[str] = []
+    normalized_workspace_root = _normalize_workspace_root_token(workspace_root)
+    if normalized_workspace_root != "workspace":
+        return [f"workspace_root must be exactly 'workspace' (given: {workspace_root})"]
+    try:
+        plan_dir = _resolve_plan_dir(repo_root, workspace_root, plan_ref)
+    except ValueError as exc:
+        return [str(exc)]
+
+    derived_path = plan_dir / "derived_contract.json"
+    if not derived_path.exists():
+        violations.append(f"{derived_path}: missing")
+    else:
+        _validate_derived_contract_file(repo_root, derived_path, violations)
+
+    algo_path = plan_dir / "algorithm.resolved.yaml"
+    if not algo_path.exists():
+        violations.append(f"{algo_path}: missing")
+    else:
+        nk = _plan_dependency_node_key(plan_dir)
+        _validate_algorithm_contract_file(
+            repo_root,
+            algo_path,
+            violations,
+            multidim_node_key=nk,
+        )
+
+    for optional in ("case.resolved.yaml", "impl.resolved.yaml", "dependency.resolved.yaml"):
+        _try_load_optional_plan_yaml(plan_dir, optional, violations)
+
+    return violations
+
+
+def _lineage_node_key_and_plan_ref(
+    pipeline_dir: Path,
+) -> tuple[str | None, str | None]:
+    lineage_path = pipeline_dir / "lineage.json"
+    if not lineage_path.exists():
+        return None, None
+    try:
+        data = _read_json(lineage_path)
+    except json.JSONDecodeError:
+        return None, None
+    if not isinstance(data, dict):
+        return None, None
+    nk = data.get("node_key")
+    pr = data.get("plan_ref")
+    node_key = nk.strip() if isinstance(nk, str) else None
+    plan_ref = pr.strip() if isinstance(pr, str) else None
+    return node_key, plan_ref
+
+
+def _stub_execution(pipeline_dir: Path, node_key: str) -> NodeExecution:
+    stub_dir = pipeline_dir / ".semantic_stage_stub"
+    return NodeExecution(
+        node_key=node_key,
+        node_dir=stub_dir,
+        exec_dir=stub_dir,
+        pipeline_dir=pipeline_dir,
+    )
+
+
+def _latest_generation_id(pipeline_dir: Path) -> str | None:
+    gen_root = pipeline_dir / "generate"
+    if not gen_root.is_dir():
+        return None
+    gen_dirs = sorted(d for d in gen_root.iterdir() if d.is_dir())
+    if not gen_dirs:
+        return None
+    return gen_dirs[-1].name
+
+
+def validate_post_generate_stage(
+    repo_root: Path,
+    workspace_root: str,
+    pipeline_ref: str,
+    generation_id: str | None,
+) -> list[str]:
+    violations: list[str] = []
+    normalized_workspace_root = _normalize_workspace_root_token(workspace_root)
+    if normalized_workspace_root != "workspace":
+        return [f"workspace_root must be exactly 'workspace' (given: {workspace_root})"]
+    try:
+        pipeline_dir = _resolve_pipeline_dir_for_stage(
+            repo_root, workspace_root, pipeline_ref
+        )
+    except ValueError as exc:
+        return [str(exc)]
+
+    node_key, plan_ref = _lineage_node_key_and_plan_ref(pipeline_dir)
+    if not node_key:
+        violations.append(f"{pipeline_dir / 'lineage.json'}: missing node_key")
+        return violations
+
+    gen_id = generation_id or _latest_generation_id(pipeline_dir)
+    if not gen_id:
+        violations.append(f"{pipeline_dir / 'generate'}: no generation directory found")
+        return violations
+
+    if plan_ref:
+        plan_dir = (repo_root / plan_ref).resolve()
+        derived_path = plan_dir / "derived_contract.json"
+        if derived_path.exists():
+            _validate_derived_contract_file(repo_root, derived_path, violations)
+        else:
+            violations.append(f"{derived_path}: missing (plan_ref {plan_ref})")
+
+    execution = _stub_execution(pipeline_dir, node_key)
+    _validate_generate_outputs_for_generation(
+        repo_root, execution, gen_id, violations
+    )
+    return violations
+
+
+def validate_post_build_stage(
+    repo_root: Path,
+    workspace_root: str,
+    pipeline_ref: str,
+    generation_id: str | None,
+) -> list[str]:
+    violations: list[str] = []
+    normalized_workspace_root = _normalize_workspace_root_token(workspace_root)
+    if normalized_workspace_root != "workspace":
+        return [f"workspace_root must be exactly 'workspace' (given: {workspace_root})"]
+    try:
+        pipeline_dir = _resolve_pipeline_dir_for_stage(
+            repo_root, workspace_root, pipeline_ref
+        )
+    except ValueError as exc:
+        return [str(exc)]
+
+    gen_id = generation_id or _latest_generation_id(pipeline_dir)
+    if not gen_id:
+        violations.append(f"{pipeline_dir / 'generate'}: no generation directory found")
+        return violations
+
+    src_dir = pipeline_dir / "generate" / gen_id / "src"
+    _validate_fortran_makefile_src_dir(src_dir, violations)
+    return violations
+
+
 def validate(
     repo_root: Path,
     workspace_root: str,
@@ -4246,12 +4624,45 @@ def main() -> int:
     parser.add_argument("--repo-root", default=".")
     parser.add_argument("--workspace-root", default="workspace")
     parser.add_argument(
+        "--stage",
+        choices=(
+            "full",
+            "plan",
+            "post_generate",
+            "post_build",
+            "post_execute",
+            "pre_judge",
+        ),
+        default="full",
+        help=(
+            "full: default end-to-end validation (requires execution artifacts). "
+            "plan: validate plan directory only (derived_contract + algorithm + optional YAML). "
+            "post_generate / post_build: validate one pipeline generate tree (requires --pipeline-root). "
+            "post_execute: full validation with LLM review and orchestration optional. "
+            "pre_judge: full validation with LLM review and orchestration required."
+        ),
+    )
+    parser.add_argument(
+        "--plan-ref",
+        default=None,
+        help="Workspace-relative plan directory (required for --stage plan).",
+    )
+    parser.add_argument(
+        "--generation-id",
+        default=None,
+        help=(
+            "generate/<generation_id> under the pipeline (optional for post_generate/post_build; "
+            "defaults to latest lexicographic directory name)."
+        ),
+    )
+    parser.add_argument(
         "--pipeline-root",
         action="append",
         default=None,
         help=(
             "Optional pipeline directory to validate. "
-            "Can be repeated. Path must be under workspace/."
+            "Can be repeated. Path must be under workspace/. "
+            "Required as a single path for post_generate/post_build."
         ),
     )
     parser.add_argument(
@@ -4281,24 +4692,87 @@ def main() -> int:
         )
         return 1
 
-    repo_root = Path(args.repo_root).resolve()
-    try:
-        pipeline_roots = _resolve_pipeline_roots(
-            repo_root=repo_root,
-            workspace_root=args.workspace_root,
-            raw_values=args.pipeline_root,
+    if args.stage == "pre_judge" and (
+        args.allow_missing_llm_review or args.allow_missing_orchestration
+    ):
+        print(
+            "pipeline semantic validation: FAIL\n"
+            "- --stage pre_judge is incompatible with --allow-missing-llm-review "
+            "and --allow-missing-orchestration"
         )
-    except ValueError as exc:
-        print(f"pipeline semantic validation: FAIL\n- {exc}")
         return 1
 
-    violations = validate(
-        repo_root=repo_root,
-        workspace_root=args.workspace_root,
-        pipeline_roots=pipeline_roots,
-        require_llm_review=not args.allow_missing_llm_review,
-        require_orchestration=not args.allow_missing_orchestration,
-    )
+    repo_root = Path(args.repo_root).resolve()
+
+    if args.stage == "plan":
+        if not args.plan_ref or not str(args.plan_ref).strip():
+            print(
+                "pipeline semantic validation: FAIL\n"
+                "- --stage plan requires non-empty --plan-ref"
+            )
+            return 1
+        violations = validate_plan_stage(
+            repo_root, args.workspace_root, str(args.plan_ref).strip()
+        )
+    elif args.stage in ("post_generate", "post_build"):
+        roots = args.pipeline_root or []
+        if len(roots) != 1:
+            print(
+                "pipeline semantic validation: FAIL\n"
+                f"- --stage {args.stage} requires exactly one --pipeline-root "
+                f"(got {len(roots)})"
+            )
+            return 1
+        pipeline_ref = roots[0].strip()
+        if args.stage == "post_generate":
+            violations = validate_post_generate_stage(
+                repo_root,
+                args.workspace_root,
+                pipeline_ref,
+                args.generation_id,
+            )
+        else:
+            violations = validate_post_build_stage(
+                repo_root,
+                args.workspace_root,
+                pipeline_ref,
+                args.generation_id,
+            )
+    else:
+        try:
+            pipeline_roots = _resolve_pipeline_roots(
+                repo_root=repo_root,
+                workspace_root=args.workspace_root,
+                raw_values=args.pipeline_root,
+            )
+        except ValueError as exc:
+            print(f"pipeline semantic validation: FAIL\n- {exc}")
+            return 1
+
+        if args.stage == "post_execute":
+            violations = validate(
+                repo_root=repo_root,
+                workspace_root=args.workspace_root,
+                pipeline_roots=pipeline_roots,
+                require_llm_review=False,
+                require_orchestration=False,
+            )
+        elif args.stage == "pre_judge":
+            violations = validate(
+                repo_root=repo_root,
+                workspace_root=args.workspace_root,
+                pipeline_roots=pipeline_roots,
+                require_llm_review=True,
+                require_orchestration=True,
+            )
+        else:
+            violations = validate(
+                repo_root=repo_root,
+                workspace_root=args.workspace_root,
+                pipeline_roots=pipeline_roots,
+                require_llm_review=not args.allow_missing_llm_review,
+                require_orchestration=not args.allow_missing_orchestration,
+            )
 
     if violations:
         print("pipeline semantic validation: FAIL")

@@ -60,6 +60,7 @@ Generate ステージ出力の検証責務を固定し、`Build` 失敗を事前
 4. `verification_status=pass` の場合のみ `Build` を開始する。
 5. workflow 実行開始前に `workspace/` が存在しない場合、リポジトリルート直下へ `workspace/` を作成する。
 6. 開始前と完了前に `python3 tools/validate_workspace_root.py` を実行し、`fail` 時は `Generate fail` とする。
+7. verify 完了前に `python3 tools/validate_pipeline_semantics.py --stage post_generate --pipeline-root workspace/pipelines/<node_key_safe>/<pipeline_id>/` を実行する。検証対象の `generation_id` を固定する場合は `--generation-id <generation_id>` を付与する。`exit code 0` を必須とし、`fail` 時は `generate_meta.json` の `verification_status=pass` を付与してはならない。
 
 ## 判定基準
 - 検査項目がすべて `pass` の場合のみ `verification_status=pass` とする。

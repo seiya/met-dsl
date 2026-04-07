@@ -30,7 +30,7 @@ Execute ステージの実行責務を固定し、判定可能なランタイム
 - `target.class=cpu` の品質比較は `threads_per_rank=1` と `threads_per_rank>1` の execution result を比較対象として保存する。
 - `quality check` の比較 canonical source は `diagnostics.json` と `verdict.json` とし、`stdout` 差分のみで合否を確定してはならない。
 - workflow artifact の保存先ルートは `workspace/` のみを許可し、workflow ルート判定は `workspace/` のみを対象とする。
-- `Execute` 完了前に `python3 tools/validate_pipeline_semantics.py` を `--allow-missing-orchestration` と `--allow-missing-llm-review` を指定せずに実行し、`fail` 時は `Execute fail` とする。
+- `Execute` 完了前に `python3 tools/validate_pipeline_semantics.py --stage post_execute` を実行し、`fail` 時は `Execute fail` とする。`--pipeline-root` は繰り返し指定可能とし、`dependency.resolved.yaml` が `all_nodes` を保持する試行では `all_nodes` に対応する全 `pipeline_root` を指定しなければならない。
 
 ## 運用ルール
 1. `execution_id` を発行し、artifact を `execution_id` 単位で分離保存する。
@@ -41,7 +41,7 @@ Execute ステージの実行責務を固定し、判定可能なランタイム
 6. 出力先が `workspace/` でない場合は `Execute fail` とし、当該 `execution` を無効化する。
 7. workflow 実行開始前に `workspace/` が存在しない場合、リポジトリルート直下へ `workspace/` を作成する。
 8. 開始前と完了前に `python3 tools/validate_workspace_root.py` を実行し、`fail` 時は `Execute fail` とする。
-9. `python3 tools/validate_pipeline_semantics.py` を `--allow-missing-orchestration` と `--allow-missing-llm-review` を指定せずに実行し、`fail` 時は `Judge` を開始してはならない。
+9. `python3 tools/validate_pipeline_semantics.py --stage post_execute` を実行し、`fail` 時は `Judge` を開始してはならない。
 10. 完了前に `python3 tools/check_artifact_syntax.py --format json --expect-top object` を `diagnostics.json` と `perf.json` と `quality_check.json` と `trial_meta.json` へ実行し、`fail` 時は `Execute fail` とする。
 
 ## 判定基準
@@ -49,4 +49,4 @@ Execute ステージの実行責務を固定し、判定可能なランタイム
 - `raw` 実行証跡と `trial_meta.json` の参照情報が整合している。
 - `node_key` 単位で artifact が分離されている。
 - 実行方式が `MCP run_program` と `MCP run_quality_checks` に限定される。
-- `python3 tools/validate_pipeline_semantics.py` が `PASS` を返す。
+- `python3 tools/validate_pipeline_semantics.py --stage post_execute` が `exit code 0` を返す。

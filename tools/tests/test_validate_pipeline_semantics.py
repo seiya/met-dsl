@@ -9,7 +9,12 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from tools.validate_pipeline_semantics import validate
+from tools.validate_pipeline_semantics import (
+    validate,
+    validate_plan_stage,
+    validate_post_build_stage,
+    validate_post_generate_stage,
+)
 
 
 def _write_json(path: Path, data: object) -> None:
@@ -3057,6 +3062,159 @@ end program shallow_water2d_runner
             self.assertTrue(
                 any("launch_prompt_ref missing workflow-orchestration template markers" in v for v in violations)
             )
+
+    def test_validate_plan_stage_passes_for_resolved_plan_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            _create_minimal_execution_tree(
+                repo_root,
+                dep_spec_id="dynamics_shallow_water_flux_2d_rusanov_p0",
+                model_text="module m\nimplicit none\nend module m\n",
+                runner_text="program r\nimplicit none\nend program r\n",
+                run_command=["x", "y"],
+            )
+            violations = validate_plan_stage(
+                repo_root,
+                "workspace",
+                "workspace/plans/problem__shallow_water2d__0.3.0/plan_test",
+            )
+            self.assertEqual(violations, [])
+
+    def test_validate_plan_stage_rejects_non_plans_path(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            violations = validate_plan_stage(
+                repo_root,
+                "workspace",
+                "workspace/pipelines/foo/bar",
+            )
+            self.assertTrue(
+                any("plan_ref must be under" in v for v in violations), violations
+            )
+
+    def test_validate_post_generate_stage_passes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            dep_model_text = """module dynamics_shallow_water_flux_2d_rusanov_p0_model
+implicit none
+contains
+subroutine dynamics_shallow_water_flux_2d_rusanov_p0__compute_flux(flag)
+  logical, intent(out) :: flag
+  flag = .true.
+end subroutine dynamics_shallow_water_flux_2d_rusanov_p0__compute_flux
+end module dynamics_shallow_water_flux_2d_rusanov_p0_model
+"""
+            model_text = """module shallow_water2d_model
+use dynamics_shallow_water_flux_2d_rusanov_p0_model
+implicit none
+contains
+subroutine solve(flag)
+  logical, intent(out) :: flag
+  call dynamics_shallow_water_flux_2d_rusanov_p0__compute_flux(flag)
+end subroutine solve
+end module shallow_water2d_model
+"""
+            runner_text = """program shallow_water2d_runner
+implicit none
+write(*,*) 'ok'
+end program shallow_water2d_runner
+"""
+            makefile_text = """FC ?= gfortran
+OBJS = dynamics_shallow_water_flux_2d_rusanov_p0_model.o shallow_water2d_model.o shallow_water2d_runner.o
+
+simulate: $(OBJS)
+\t$(FC) -o $@ $(OBJS)
+
+dynamics_shallow_water_flux_2d_rusanov_p0_model.o dynamics_shallow_water_flux_2d_rusanov_p0_model.mod: dynamics_shallow_water_flux_2d_rusanov_p0_model.f90
+\t$(FC) -c $<
+
+shallow_water2d_model.o shallow_water2d_model.mod: shallow_water2d_model.f90 dynamics_shallow_water_flux_2d_rusanov_p0_model.mod
+\t$(FC) -c $<
+
+shallow_water2d_runner.o: shallow_water2d_runner.f90 shallow_water2d_model.mod
+\t$(FC) -c $<
+"""
+            _create_minimal_execution_tree(
+                repo_root,
+                dep_spec_id="dynamics_shallow_water_flux_2d_rusanov_p0",
+                model_text=model_text,
+                runner_text=runner_text,
+                run_command=["x", "y"],
+                extra_sources={
+                    "dynamics_shallow_water_flux_2d_rusanov_p0_model.f90": dep_model_text
+                },
+                makefile_text=makefile_text,
+            )
+            violations = validate_post_generate_stage(
+                repo_root,
+                "workspace",
+                "workspace/pipelines/problem__shallow_water2d__0.3.0/"
+                "problem__shallow_water2d__0.3.0_test_pipeline",
+                generation_id="gen_test_001",
+            )
+            self.assertEqual(violations, [])
+
+    def test_validate_post_build_stage_passes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            dep_model_text = """module dynamics_shallow_water_flux_2d_rusanov_p0_model
+implicit none
+contains
+subroutine dynamics_shallow_water_flux_2d_rusanov_p0__compute_flux(flag)
+  logical, intent(out) :: flag
+  flag = .true.
+end subroutine dynamics_shallow_water_flux_2d_rusanov_p0__compute_flux
+end module dynamics_shallow_water_flux_2d_rusanov_p0_model
+"""
+            model_text = """module shallow_water2d_model
+use dynamics_shallow_water_flux_2d_rusanov_p0_model
+implicit none
+contains
+subroutine solve(flag)
+  logical, intent(out) :: flag
+  call dynamics_shallow_water_flux_2d_rusanov_p0__compute_flux(flag)
+end subroutine solve
+end module shallow_water2d_model
+"""
+            runner_text = """program shallow_water2d_runner
+implicit none
+write(*,*) 'ok'
+end program shallow_water2d_runner
+"""
+            makefile_text = """FC ?= gfortran
+OBJS = dynamics_shallow_water_flux_2d_rusanov_p0_model.o shallow_water2d_model.o shallow_water2d_runner.o
+
+simulate: $(OBJS)
+\t$(FC) -o $@ $(OBJS)
+
+dynamics_shallow_water_flux_2d_rusanov_p0_model.o dynamics_shallow_water_flux_2d_rusanov_p0_model.mod: dynamics_shallow_water_flux_2d_rusanov_p0_model.f90
+\t$(FC) -c $<
+
+shallow_water2d_model.o shallow_water2d_model.mod: shallow_water2d_model.f90 dynamics_shallow_water_flux_2d_rusanov_p0_model.mod
+\t$(FC) -c $<
+
+shallow_water2d_runner.o: shallow_water2d_runner.f90 shallow_water2d_model.mod
+\t$(FC) -c $<
+"""
+            _create_minimal_execution_tree(
+                repo_root,
+                dep_spec_id="dynamics_shallow_water_flux_2d_rusanov_p0",
+                model_text=model_text,
+                runner_text=runner_text,
+                run_command=["x", "y"],
+                extra_sources={
+                    "dynamics_shallow_water_flux_2d_rusanov_p0_model.f90": dep_model_text
+                },
+                makefile_text=makefile_text,
+            )
+            violations = validate_post_build_stage(
+                repo_root,
+                "workspace",
+                "workspace/pipelines/problem__shallow_water2d__0.3.0/"
+                "problem__shallow_water2d__0.3.0_test_pipeline",
+                generation_id="gen_test_001",
+            )
+            self.assertEqual(violations, [])
 
 
 if __name__ == "__main__":

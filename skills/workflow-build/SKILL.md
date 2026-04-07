@@ -30,6 +30,7 @@ Build ステージの実行責務を固定し、再現可能なビルド artifac
 5. 出力先が `workspace/` でない場合は `Build fail` とする。
 6. workflow 実行開始前に `workspace/` が存在しない場合、リポジトリルート直下へ `workspace/` を作成する。
 7. 開始前と完了前に `python3 tools/validate_workspace_root.py` を実行し、`fail` 時は `Build fail` とする。
+8. 完了前に `python3 tools/validate_pipeline_semantics.py --stage post_build --pipeline-root workspace/pipelines/<node_key_safe>/<pipeline_id>/` を実行し、必要に応じて `--generation-id <generation_id>` を付与する。`exit code 0` を必須とし、`fail` 時は `Build fail` とする。
 
 ## 判定基準
 - ビルド手段が `MCP compile_project` のみである。

@@ -42,6 +42,7 @@ description: 対応 execution platform で `workflow` 全体を開始し、`orch
 - 子 `agent` 起動ごとに、起動要求本文を `launches/<agent_run_id>.prompt.txt`、起動返答本文を `launches/<agent_run_id>.reply.txt` へ保存し、`agent_runs.jsonl` の `launch_prompt_ref` と `launch_reply_ref` に参照を記録しなければならない。
 - 各 `step agent` / `substep agent` の完了時に、`agents/<agent_run_id>/dialogs/agent.result.json` と `agents/<agent_run_id>/dialogs/agent.summary.txt` を保存し、`agent_runs.jsonl` の `agent_result_ref` と `agent_summary_ref` に参照を記録しなければならない。
 - `agent.summary.txt` は最終 `status` と主要 `output_refs` または失敗原因を含む調査用ログとし、単一行の `pass` / `fail` のみで終えてはならない。
+- 子 `agent` は、担当 `SKILL.md` が定める段階別 `python3 tools/validate_pipeline_semantics.py --stage ...` invocation を当該 phase 完了前に実行し、成功または失敗の要約を `agent.summary.txt` に記録しなければならない。
 - `openai.yaml` の表示名だけで orchestration 契約を満たしたとみなしてはならない。
 - 子 `agent` の返却結果を評価した後、`issue_severity`（`minor` / `major` / `critical`）を判定し、再投入が必要な場合は `repair_strategy`（`reuse` / `restart`）を選択しなければならない。
 - `repair_strategy=reuse` は契約不変の局所修正に限定し、`repair_strategy=restart` は契約再解釈または広範囲再生成が必要な場合に選択しなければならない。
@@ -68,6 +69,7 @@ description: 対応 execution platform で `workflow` 全体を開始し、`orch
 17. workflow 終了時は `python3 tools/codex_orchestration_runtime.py set-status --repo-root <repo_root> --orchestration-id <orchestration_id> --status <status>` を実行し、`orchestration_meta.json` を終端状態へ更新する。
 18. `preflight.json` を手動編集または後編集して `status` と `can_launch_*` を変更してはならない。検査条件の変化は `preflight` 再実行でのみ反映する。
 19. `record-launch` 実行時に live preflight gate が `fail` の場合、当該起動を停止し、`set-status --status fail` のみを許可する。
+20. `Plan verify` / `Generate verify` / `Build` / `Execute` / `Judge` の各子 `agent` 完了記録において、`validate_pipeline_semantics.py` の該当 `--stage` 実行有無を `step_result.json` へ直接記録する契約は `codex_orchestration_runtime` に必須化していない。監査時は `agent.summary.txt` と MCP `command` ログを照合する。
 
 ## 参照
 - 起動最小契約: `references/startup_contract.md`
