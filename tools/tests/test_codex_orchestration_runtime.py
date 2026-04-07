@@ -237,9 +237,45 @@ shell_tool                       stable             true
     def test_probe_execution_platform_supports_claude_backend(self) -> None:
         def runner(args, **kwargs):  # type: ignore[no-untyped-def]
             if args[0] == "claude" and args[1:] == ["--version"]:
-                return _FakeCompletedProcess(0, stdout="claude 1.0.0\n")
+                return _FakeCompletedProcess(0, stdout="2.1.0 (Claude Code)\n")
+            if args[0] == "claude" and args[1:] == ["features", "list"]:
+                return _FakeCompletedProcess(1, stderr="unknown command\n")
+            if args[0] == "claude" and args[1:] == ["--help"]:
+                return _FakeCompletedProcess(0, stdout="Usage: claude [options] [command] [prompt]\n")
+            raise AssertionError(args)
+
+        result = probe_execution_platform(backend="claude", runner=runner)
+        self.assertEqual(result["backend"], "claude")
+        self.assertEqual(result["probe_command"], "claude")
+        self.assertEqual(result["status"], "pass")
+        self.assertTrue(result["can_launch_step_agents"])
+        self.assertTrue(result["can_launch_substep_agents"])
+        self.assertEqual(result["feature_states"].get("multi_agent"), True)
+
+    def test_probe_execution_platform_claude_fallback_when_features_list_has_no_multi_agent(self) -> None:
+        def runner(args, **kwargs):  # type: ignore[no-untyped-def]
+            if args[0] == "claude" and args[1:] == ["--version"]:
+                return _FakeCompletedProcess(0, stdout="2.1.0 (Claude Code)\n")
             if args[0] == "claude" and args[1:] == ["features", "list"]:
                 return _FakeCompletedProcess(0, stdout="multi_agent experimental false\n")
+            if args[0] == "claude" and args[1:] == ["--help"]:
+                return _FakeCompletedProcess(0, stdout="Usage: claude [options] [command] [prompt]\n")
+            raise AssertionError(args)
+
+        result = probe_execution_platform(backend="claude", runner=runner)
+        self.assertEqual(result["backend"], "claude")
+        self.assertEqual(result["status"], "pass")
+        self.assertTrue(result["can_launch_step_agents"])
+        self.assertEqual(result["feature_states"].get("multi_agent"), True)
+
+    def test_probe_execution_platform_claude_fails_when_help_also_unavailable(self) -> None:
+        def runner(args, **kwargs):  # type: ignore[no-untyped-def]
+            if args[0] == "claude" and args[1:] == ["--version"]:
+                return _FakeCompletedProcess(0, stdout="2.1.0 (Claude Code)\n")
+            if args[0] == "claude" and args[1:] == ["features", "list"]:
+                return _FakeCompletedProcess(1, stderr="error\n")
+            if args[0] == "claude" and args[1:] == ["--help"]:
+                return _FakeCompletedProcess(1, stderr="error\n")
             raise AssertionError(args)
 
         result = probe_execution_platform(backend="claude", runner=runner)

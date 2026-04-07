@@ -42,3 +42,7 @@
 - phase 種別と起動した `agent` 種別が固定表と一致している。
 - `launches/` と `agent_runs.jsonl` と `step_result.json` の参照整合が取れている。
 - 子 `agent` の起動失敗時に `set-status --status fail` が記録されている。
+
+## execution platform 別の補足
+
+execution platform ごとの子 `agent` 起動ツールと `preflight` 引数の対応は `CLAUDE.md` の「execution platform 別の子 `agent` 起動ツール」を参照する。

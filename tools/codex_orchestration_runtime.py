@@ -1068,10 +1068,9 @@ def probe_execution_platform(
     if features_proc.returncode == 0:
         features = parse_feature_list(features_proc.stdout)
         multi_agent_enabled = features.get("multi_agent") is True
-    if backend_token == "cursor" and not multi_agent_enabled:
-        # Cursor agent CLI may not expose `features list`.
-        # In that case this fallback is a best-effort launchability probe, not
-        # a hard guarantee that multi-agent launch will always succeed.
+    if backend_token in {"cursor", "claude"} and not multi_agent_enabled:
+        # Cursor and Claude Code CLIs do not expose `features list` as a structured command.
+        # Use --help as a best-effort launchability probe instead.
         # Launch-time live preflight in `record_launch` remains the fail-safe.
         help_proc = runner(
             [command, "--help"],
@@ -1084,7 +1083,7 @@ def probe_execution_platform(
             multi_agent_enabled = True
             features = {"multi_agent": True}
             help_detail = help_proc.stdout.strip() or help_proc.stderr.strip()
-            features_detail = "cursor backend multi_agent could not be confirmed from features list; fallback to --help succeeded"
+            features_detail = f"{backend_token} backend multi_agent could not be confirmed from features list; fallback to --help succeeded"
             if help_detail:
                 features_detail += f"\n{help_detail}"
 
@@ -1468,6 +1467,7 @@ def main(argv: list[str] | None = None) -> int:
     preflight_parser.add_argument("--backend", default="codex", choices=sorted(SUPPORTED_BACKENDS))
     preflight_parser.add_argument("--agent-command")
     preflight_parser.add_argument("--codex-command", default="codex")
+    preflight_parser.add_argument("--claude-command", default="claude")
 
     launch_parser = subparsers.add_parser("record-launch")
     launch_parser.add_argument("--repo-root", required=True)
@@ -1509,12 +1509,12 @@ def main(argv: list[str] | None = None) -> int:
         )
     elif args.command == "preflight":
         agent_command = args.agent_command
-        if (
-            (not isinstance(agent_command, str) or not agent_command.strip())
-            and args.backend == "codex"
-        ):
-            # Keep backward compatibility only for codex backend.
-            agent_command = args.codex_command
+        if not isinstance(agent_command, str) or not agent_command.strip():
+            if args.backend == "codex":
+                # Keep backward compatibility only for codex backend.
+                agent_command = args.codex_command
+            elif args.backend == "claude":
+                agent_command = args.claude_command
         result = write_preflight(
             repo_root=repo_root,
             orchestration_id=args.orchestration_id,

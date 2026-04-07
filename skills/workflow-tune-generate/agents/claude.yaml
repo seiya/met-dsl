@@ -1,0 +1,5 @@
+interface:
+  display_name: "Workflow Tune Generate"
+  short_description: "Help with Workflow Tune Generate tasks"
+  backend: "claude"
+  spawn_agent_tool: "Agent"

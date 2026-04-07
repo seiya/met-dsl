@@ -1,0 +1,5 @@
+interface:
+  display_name: "Workflow Execute"
+  short_description: "Help with Workflow Execute tasks"
+  backend: "claude"
+  spawn_agent_tool: "Agent"

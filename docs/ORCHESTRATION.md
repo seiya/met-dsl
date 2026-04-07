@@ -62,7 +62,7 @@
 - 起動要求本文のテンプレート必須項目は、省略、改名、意味変更をしてはならない。追加記述は、テンプレート必須項目と矛盾せず、対象 `step` または `substep` の契約具体化に必要な情報に限定しなければならない。
 - `plan_ref` と `pipeline_ref` と `dependency_ref` は、子 `agent` 起動前に canonical path を確定しなければならない。`<agent-determined-...>` などの placeholder を起動要求へ記録してはならない。
 - `launches/<agent_run_id>.request.json` の各必須フィールド値と `launches/<agent_run_id>.prompt.txt` の対応行は一致しなければならない。要約 prompt、再構成 prompt、テンプレート marker のみを残した省略 prompt を禁止する。
-- `skills/*/agents/openai.yaml` の表示名または説明文だけで独立 `agent` 起動契約を満たしたとみなしてはならない。起動要求本文に `spawn_agent` の使用義務、input contract、expected output、保存先、失敗時停止条件を明示しなければならない。
+- `skills/*/agents/<platform>.yaml` などの表示名または説明文だけで独立 `agent` 起動契約を満たしたとみなしてはならない。起動要求本文に子 `agent` 起動ツール（`spawn_agent` または `Agent` tool、execution platform に依存）の使用義務、input contract、expected output、保存先、失敗時停止条件を明示しなければならない。execution platform ごとの起動ツール対応は `CLAUDE.md` の「execution platform 別の子 `agent` 起動ツール」を参照する。
 
 ## 設計方針
 - 単一責務: 1 つの `agent` は 1 つの責務のみを持つ。
