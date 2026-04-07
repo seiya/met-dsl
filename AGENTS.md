@@ -57,9 +57,10 @@
 
 ## MCP 実行ルール
 - `compile` / `run` / `quality check` は、必ず MCP サーバー経由で実行する。
-- 標準サーバーは `mcp_servers/build_runtime_server.py` とし、`detect_build_system` / `compile_project` / `run_program` / `run_quality_checks` を使用する。
+- 標準サーバーは `mcp_servers/build_runtime_server.py` とし、`detect_build_system` / `compile_project` / `run_program` / `run_quality_checks` / `run_linter` を使用する。
 - `compile` で `fortran` / `c` / `cpp` / `mixed` 系を扱う場合、依存関係を扱える標準ビルドツールのみを許可する。既定値は `make` とする。
 - `gcc` / `clang` / `gfortran` を直接呼び出す単発ビルドを禁止する。
+- `Generate` は `static lint` を MCP `run_linter` で実行する。`run_linter` は `compile` / `compile_project` / `toolchain.build_system` 経由のビルドとは別手順であり、`compile` を標準ビルドツール経由とする原則の対象外として扱う。
 - `compile` / `run` 以外で MCP 適用が有効な処理（例: build system 判定、test 実行、check 実行）は、同様に MCP ツールを実装し、直接シェル実行を避ける。
 
 ## MCP 設定参照

@@ -10,6 +10,8 @@ import unittest
 from pathlib import Path
 
 from tools.validate_pipeline_semantics import (
+    _validate_generate_lint_command_logs,
+    _validate_generate_meta_json_files,
     validate,
     validate_plan_stage,
     validate_post_build_stage,
@@ -110,15 +112,9 @@ def _create_minimal_execution_tree(
             "dependency_ref": "workspace/plans/problem__shallow_water2d__0.3.0/plan_test/dependency.resolved.yaml",
         },
     )
-    _write_json(
-        pipeline_dir / "generate" / "gen_test_001" / "generate_meta.json",
-        {
-            "attempt_count": 1,
-            "verification_status": "pass",
-            "last_fail_reason": "",
-            "debug_mode": False,
-            "context_isolated": True,
-        },
+    lint_command_id = "lint_cmd_fixture_001"
+    rel_lint_log = (
+        f"workspace/pipelines/{node_safe}/{pipeline_id}/generate/gen_test_001/src/mcp_command_log.jsonl"
     )
     if dependency_resolved is None:
         dependency_resolved = {
@@ -348,6 +344,39 @@ shallow_water2d_runner.o: shallow_water2d_runner.f90 shallow_water2d_model.mod
 \t$(FC) -c $<
 """
     (src_dir / "Makefile").write_text(makefile_text, encoding="utf-8")
+
+    (src_dir / "mcp_command_log.jsonl").write_text(
+        json.dumps(
+            {
+                "command_id": lint_command_id,
+                "tool_name": "run_linter",
+                "command": ["fortitude", "check", "."],
+                "ok": True,
+            },
+            ensure_ascii=False,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    _write_json(
+        pipeline_dir / "generate" / "gen_test_001" / "generate_meta.json",
+        {
+            "attempt_count": 1,
+            "verification_status": "pass",
+            "last_fail_reason": "",
+            "debug_mode": False,
+            "context_isolated": True,
+            "lint_command_ref": {
+                "run_linter": [
+                    {
+                        "command_id": lint_command_id,
+                        "command_log_ref": rel_lint_log,
+                        "preset": "fortitude",
+                    }
+                ]
+            },
+        },
+    )
 
     _write_json(
         node_dir / "semantic_review.json",
@@ -3153,6 +3182,174 @@ shallow_water2d_runner.o: shallow_water2d_runner.f90 shallow_water2d_model.mod
                 generation_id="gen_test_001",
             )
             self.assertEqual(violations, [])
+
+    def test_validate_post_generate_stage_rejects_failed_run_linter_log(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            _create_minimal_execution_tree(
+                repo_root,
+                dep_spec_id="dynamics_shallow_water_flux_2d_rusanov_p0",
+                model_text="module m\nimplicit none\nend module m\n",
+                runner_text="program r\nimplicit none\nend program r\n",
+                run_command=["x", "y"],
+            )
+            pipeline_dir = (
+                repo_root
+                / "workspace"
+                / "pipelines"
+                / "problem__shallow_water2d__0.3.0"
+                / "problem__shallow_water2d__0.3.0_test_pipeline"
+            )
+            log_path = pipeline_dir / "generate" / "gen_test_001" / "src" / "mcp_command_log.jsonl"
+            log_path.write_text(
+                json.dumps(
+                    {
+                        "command_id": "lint_cmd_fixture_001",
+                        "tool_name": "run_linter",
+                        "command": ["fortitude", "check", "."],
+                        "ok": False,
+                    },
+                    ensure_ascii=False,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            violations = validate_post_generate_stage(
+                repo_root,
+                "workspace",
+                "workspace/pipelines/problem__shallow_water2d__0.3.0/"
+                "problem__shallow_water2d__0.3.0_test_pipeline",
+                generation_id="gen_test_001",
+            )
+            self.assertTrue(
+                any("run_linter did not succeed" in v for v in violations), violations
+            )
+
+    def test_validate_post_generate_stage_rejects_lint_command_mismatch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            _create_minimal_execution_tree(
+                repo_root,
+                dep_spec_id="dynamics_shallow_water_flux_2d_rusanov_p0",
+                model_text="module m\nimplicit none\nend module m\n",
+                runner_text="program r\nimplicit none\nend program r\n",
+                run_command=["x", "y"],
+            )
+            pipeline_dir = (
+                repo_root
+                / "workspace"
+                / "pipelines"
+                / "problem__shallow_water2d__0.3.0"
+                / "problem__shallow_water2d__0.3.0_test_pipeline"
+            )
+            log_path = pipeline_dir / "generate" / "gen_test_001" / "src" / "mcp_command_log.jsonl"
+            log_path.write_text(
+                json.dumps(
+                    {
+                        "command_id": "lint_cmd_fixture_001",
+                        "tool_name": "run_linter",
+                        "command": ["cppcheck", "--error-exitcode=1", "."],
+                        "ok": True,
+                    },
+                    ensure_ascii=False,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            violations = validate_post_generate_stage(
+                repo_root,
+                "workspace",
+                "workspace/pipelines/problem__shallow_water2d__0.3.0/"
+                "problem__shallow_water2d__0.3.0_test_pipeline",
+                generation_id="gen_test_001",
+            )
+            self.assertTrue(
+                any("logged command does not match preset" in v for v in violations),
+                violations,
+            )
+
+    def test_validate_generate_meta_accepts_fail_without_lint_command_ref(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            pipeline_dir = Path(tmp) / "pipeline"
+            gen_dir = pipeline_dir / "generate" / "gen_fail_001"
+            gen_dir.mkdir(parents=True)
+            _write_json(
+                gen_dir / "generate_meta.json",
+                {
+                    "attempt_count": 1,
+                    "verification_status": "fail",
+                    "last_fail_reason": "lint failed",
+                    "debug_mode": False,
+                    "context_isolated": True,
+                },
+            )
+            violations: list[str] = []
+            _validate_generate_meta_json_files(pipeline_dir, violations)
+            self.assertEqual(violations, [])
+
+    def test_validate_generate_lint_rejects_pass_without_lint_command_ref(self) -> None:
+        violations: list[str] = []
+        meta_path = Path("/tmp/generate_meta.json")
+        _validate_generate_lint_command_logs(
+            Path("/repo"),
+            meta_path,
+            {"verification_status": "pass"},
+            "fortran",
+            violations,
+        )
+        self.assertTrue(
+            any("missing lint_command_ref when verification_status=pass" in v for v in violations),
+            violations,
+        )
+
+    def test_validate_generate_lint_rejects_non_dict_lint_command_ref_when_pass(self) -> None:
+        violations: list[str] = []
+        meta_path = Path("/tmp/generate_meta.json")
+        _validate_generate_lint_command_logs(
+            Path("/repo"),
+            meta_path,
+            {"verification_status": "pass", "lint_command_ref": []},
+            "fortran",
+            violations,
+        )
+        self.assertTrue(
+            any(
+                "lint_command_ref must be json object when verification_status=pass" in v
+                for v in violations
+            ),
+            violations,
+        )
+
+    def test_validate_generate_lint_mixed_requires_exactly_two_entries(self) -> None:
+        violations: list[str] = []
+        meta_path = Path("/tmp/generate_meta.json")
+        data = {
+            "verification_status": "pass",
+            "lint_command_ref": {
+                "run_linter": [
+                    {
+                        "command_id": "a",
+                        "command_log_ref": "workspace/pipelines/x/y/z/mcp_command_log.jsonl",
+                        "preset": "fortitude",
+                    },
+                    {
+                        "command_id": "b",
+                        "command_log_ref": "workspace/pipelines/x/y/z/mcp_command_log.jsonl",
+                        "preset": "fortitude",
+                    },
+                    {
+                        "command_id": "c",
+                        "command_log_ref": "workspace/pipelines/x/y/z/mcp_command_log.jsonl",
+                        "preset": "cppcheck",
+                    },
+                ]
+            },
+        }
+        _validate_generate_lint_command_logs(Path("/repo"), meta_path, data, "mixed", violations)
+        self.assertTrue(
+            any("requires exactly two run_linter entries" in v for v in violations),
+            violations,
+        )
 
     def test_validate_post_build_stage_passes(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

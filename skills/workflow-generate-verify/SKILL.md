@@ -49,7 +49,7 @@ Generate ステージ出力の検証責務を固定し、`Build` 失敗を事前
 - `quality check` 実行に必要な preset-compatible quality path が `Generate` 出力だけで成立することを検査する。`Execute` で追加 `test` source、harness、補助 `script`、一時 `Makefile` を生成しなければ成立しない構成を `fail` とする。
 - `toolchain.build_system=make` かつ `toolchain.language=fortran` / `c` / `cpp` / `mixed` 系の場合、`src/Makefile` に `test` または `check` target が存在し、`run_quality_checks preset=make_test` または `preset=make_check` に適合することを検査する。
 - `dependency.resolved.yaml` に存在しない依存 `node` または未宣言 `operation` への参照を生成コードが導入していないことを検査する。`direct_deps` 外の呼び出し、未解決 `component` 参照、`profile` 拘束と矛盾する実装選択を `fail` とする。
-- `generate_meta.json` の必須項目を検査する。
+- `generate_meta.json` の必須項目を検査する。`lint_command_ref.run_linter` が `verification_status=pass` のとき、`impl.resolved.yaml` の `toolchain.language` に整合する `preset` と MCP `run_linter` 成功ログ（`command_id` と `command_log_ref`）が記録されていることを検査する。`static lint` は `quality check`（`run_quality_checks`）とは別物である。
 - `debug_mode=false` の場合に `attempts/` が存在しないことを検査する。
 - 検査対象 artifact の保存先ルートが `workspace/` であることを検査し、workflow ルート判定は `workspace/` のみを対象とする。
 

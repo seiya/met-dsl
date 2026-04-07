@@ -40,7 +40,9 @@ Generate ステージの生成責務を固定し、`Build` 可能な実装 artif
 - `toolchain.build_system=make` かつ `toolchain.language=fortran` の場合、`src/Makefile` は `make -j` で依存欠落による不定失敗を起こしてはならない。
 - `quality check` 実行に必要な preset-compatible quality path は `Generate` 出力だけで成立しなければならない。`Execute` で追加 `test` source、harness、補助 `script`、一時 `Makefile` を生成する前提を禁止する。
 - `toolchain.build_system=make` かつ `toolchain.language=fortran` / `c` / `cpp` / `mixed` 系の場合、`src/Makefile` は `run_quality_checks preset=make_test` または `preset=make_check` で使用できる `test` または `check` target を必須定義する。
-- `generate_meta.json` に `attempt_count` と `verification_status` と `last_fail_reason` と `debug_mode` を記録する。
+- `generate_meta.json` に `attempt_count` と `verification_status` と `last_fail_reason` と `debug_mode` と `lint_command_ref` を記録する。
+- `static lint` は MCP `run_linter` のみで実行する。`project_dir` は `generate/<generation_id>/src` とする。`impl.resolved.yaml` の `toolchain.language` に応じて `preset` を選ぶ（例: `fortran` / `cuda_fortran` は `fortitude`、`c` / `cpp` / `cuda_c` は `cppcheck`、`python` は `ruff`、`mixed` は `fortitude` と `cppcheck` を別々に実行し、それぞれの `command_id` と `command_log_ref` を `lint_command_ref.run_linter` 配列へ記録する）。`Makefile` の `lint` target や `compile_project` 経由でリンターを起動してはならない。
+- `lint_command_ref.run_linter` は `preset` と MCP ログの `command_id` と `command_log_ref` を対応付けた object の配列とする。`quality check` 用の `run_quality_checks` とは別手順である。
 - `generate_meta.json` の `verification_status` は `fail_closed` を前提とし、検証未実施や判定不能を `pass` にしてはならない。
 - workflow artifact の保存先ルートは `workspace/` のみを許可し、workflow ルート判定は `workspace/` のみを対象とする。
 
@@ -52,6 +54,7 @@ Generate ステージの生成責務を固定し、`Build` 可能な実装 artif
 5. 出力先が `workspace/` でない場合は `Generate fail` とする。
 6. workflow 実行開始前に `workspace/` が存在しない場合、リポジトリルート直下へ `workspace/` を作成する。
 7. 開始前と完了前に `python3 tools/validate_workspace_root.py` を実行し、`fail` 時は `Generate fail` とする。
+8. ソース生成後、`MCP` の `run_linter` で `static lint` を成功させ、`generate_meta.json` の `lint_command_ref` を埋めてから `Generate verify` へ渡す。
 
 ## 判定基準
 - `model` と `runner` の責務分離が保持される。

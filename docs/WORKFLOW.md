@@ -216,6 +216,7 @@ workspace/
 - execution input: `case.resolved.yaml`、`algorithm.resolved.yaml`、`impl.resolved.yaml`、`dependency.resolved.yaml`
 - verification input: `case.resolved.yaml`、`algorithm.resolved.yaml`、`derived_contract.json`、`dependency.resolved.yaml`、`impl.resolved.yaml`
 - 出力: `generate/<generation_id>/src/`、`generate_meta.json`
+- `Generate` 完了前に、`impl.resolved.yaml` の `toolchain.language` に整合する MCP `run_linter` を成功させ、`generate_meta.json` の `lint_command_ref.run_linter` へ MCP 証跡（各要素に `command_id` と `command_log_ref` と `preset`）を記録しなければならない。`static lint` は `Build` の `compile_project` や `toolchain.build_system` が経由するビルドではなく、専用リンター（例: `fortitude` / `cppcheck` / `ruff`）を `run_linter` の `preset` のみで起動する。`Execute` の `quality check`（`run_quality_checks`）とは別物であり、`diagnostics.json` や `verdict.json` の比較を canonical source としない。
 - `Generate` は `Execute` が `run_quality_checks` の `preset` だけで実行可能な preset-compatible quality path を正式出力へ含めなければならない。不足時は `Generate fail` とする。
 - `toolchain.build_system=make` かつ `toolchain.language=fortran` / `c` / `cpp` / `mixed` 系では、`generate/<generation_id>/src/Makefile` に `test` または `check` target を必須定義しなければならない。欠落時は `Generate fail` とする。
 - `Generate verify` は、`quality check` 成立のために下流 phase で追加 source 生成が不要であることを検査しなければならない。
@@ -327,6 +328,7 @@ workspace/
 #### 2-1. generate substep
 - `Generate` は `node` 単位で実行し、対象 `node_key` 専用のソースを生成する。
 - `generate substep` は `generate/<generation_id>/src/` と `generate_meta.json` を生成する。
+- `generate substep` は `generate/<generation_id>/src/` を `project_dir` とし、`toolchain.language` に応じた `run_linter` の `preset`（例: `fortran` / `cuda_fortran` は `fortitude`、`c` / `cpp` / `cuda_c` は `cppcheck`、`mixed` は `fortitude` と `cppcheck` の 2 回の証跡、`python` は `ruff`）で `static lint` を実行しなければならない。`Makefile` の `lint` target や `compile_project` 経由での実行を要求してはならない。
 - `Generate` は `controlled_spec.md` を直接入力にしてはならない。必要な演算構成は `algorithm.resolved.yaml` から解釈しなければならない。
 - 言語に依らず `model`（物理計算）と `runner`（input/output・実行連携）を分離して生成する。
 - `runner` は `model` を `call` / `use` / `import` で呼び出し、物理更新ロジックを重複実装してはならない。

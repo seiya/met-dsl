@@ -531,6 +531,112 @@ def tool_run_quality_checks(args: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
+def tool_run_linter(args: dict[str, Any]) -> dict[str, Any]:
+    """Run static analysis linters for generated sources (Generate stage only).
+
+    Presets invoke fixed commands; arbitrary user commands are not allowed.
+    This is not compile_project and does not route through build_system.
+    """
+    project_dir = str(args.get("project_dir", "."))
+    timeout_sec = int(args.get("timeout_sec", 1800))
+    capture_limit = int(args.get("capture_limit", 120000))
+    command_log_path = args.get("command_log_path")
+    if command_log_path is not None and not isinstance(command_log_path, str):
+        raise ValueError("command_log_path must be a string")
+    env = args.get("env")
+    if env is not None and not isinstance(env, dict):
+        raise ValueError("env must be an object")
+    preset = str(args.get("preset", "fortitude")).strip().lower()
+
+    if "command" in args:
+        raise ValueError("run_linter does not allow custom command; use preset")
+
+    run_env: dict[str, str] | None
+    if env is None:
+        run_env = None
+    else:
+        run_env = {str(k): str(v) for k, v in env.items()}
+
+    if preset == "fortitude":
+        command = ["fortitude", "check", "."]
+        return _run_command(
+            command=command,
+            cwd=project_dir,
+            tool_name="run_linter",
+            timeout_sec=timeout_sec,
+            env=run_env,
+            capture_limit=capture_limit,
+            command_log_path=command_log_path,
+        ) | {"preset": preset}
+
+    if preset == "cppcheck":
+        command = [
+            "cppcheck",
+            "--error-exitcode=1",
+            "--enable=warning,style,performance",
+            "--inline-suppr",
+            ".",
+        ]
+        return _run_command(
+            command=command,
+            cwd=project_dir,
+            tool_name="run_linter",
+            timeout_sec=timeout_sec,
+            env=run_env,
+            capture_limit=capture_limit,
+            command_log_path=command_log_path,
+        ) | {"preset": preset}
+
+    if preset == "ruff":
+        command = ["ruff", "check", "."]
+        return _run_command(
+            command=command,
+            cwd=project_dir,
+            tool_name="run_linter",
+            timeout_sec=timeout_sec,
+            env=run_env,
+            capture_limit=capture_limit,
+            command_log_path=command_log_path,
+        ) | {"preset": preset}
+
+    if preset == "mixed":
+        r1 = _run_command(
+            command=["fortitude", "check", "."],
+            cwd=project_dir,
+            tool_name="run_linter",
+            timeout_sec=timeout_sec,
+            env=run_env,
+            capture_limit=capture_limit,
+            command_log_path=command_log_path,
+        )
+        r2 = _run_command(
+            command=[
+                "cppcheck",
+                "--error-exitcode=1",
+                "--enable=warning,style,performance",
+                "--inline-suppr",
+                ".",
+            ],
+            cwd=project_dir,
+            tool_name="run_linter",
+            timeout_sec=timeout_sec,
+            env=run_env,
+            capture_limit=capture_limit,
+            command_log_path=command_log_path,
+        )
+        return {
+            "ok": bool(r1.get("ok")) and bool(r2.get("ok")),
+            "preset": "mixed",
+            "runs": [
+                {"sub_preset": "fortitude", **r1},
+                {"sub_preset": "cppcheck", **r2},
+            ],
+        }
+
+    supported = "fortitude, cppcheck, ruff, mixed"
+    raise ValueError(f"unsupported preset: {preset}. supported={supported}")
+
+
 TOOLS: dict[str, Tool] = {
     "detect_build_system": Tool(
         name="detect_build_system",
@@ -636,6 +742,36 @@ TOOLS: dict[str, Tool] = {
             "required": ["project_dir"],
         },
         handler=tool_run_quality_checks,
+    ),
+    "run_linter": Tool(
+        name="run_linter",
+        description=(
+            "Run static linters for Generate-stage source (fortitude/cppcheck/ruff/mixed). "
+            "Does not use build_system or compile_project; preset-only, no custom command."
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "project_dir": {"type": "string", "default": "."},
+                "preset": {
+                    "type": "string",
+                    "default": "fortitude",
+                    "description": "fortitude | cppcheck | ruff | mixed",
+                },
+                "timeout_sec": {"type": "integer", "minimum": 1},
+                "capture_limit": {"type": "integer", "minimum": 1000},
+                "command_log_path": {
+                    "type": "string",
+                    "description": "JSONL path for command logs. Relative paths are resolved from project_dir.",
+                },
+                "env": {
+                    "type": "object",
+                    "additionalProperties": {"type": "string"},
+                },
+            },
+            "required": ["project_dir"],
+        },
+        handler=tool_run_linter,
     ),
 }
 

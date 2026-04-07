@@ -1,0 +1,39 @@
+{
+  "name": "run_linter",
+  "description": "Run static linters for Generate-stage source (fortitude/cppcheck/ruff/mixed). Does not use build_system or compile_project; preset-only, no custom command.",
+  "arguments": {
+    "type": "object",
+    "properties": {
+      "project_dir": {
+        "type": "string",
+        "default": "."
+      },
+      "preset": {
+        "type": "string",
+        "default": "fortitude",
+        "description": "fortitude | cppcheck | ruff | mixed"
+      },
+      "timeout_sec": {
+        "type": "integer",
+        "minimum": 1
+      },
+      "capture_limit": {
+        "type": "integer",
+        "minimum": 1000
+      },
+      "command_log_path": {
+        "type": "string",
+        "description": "JSONL path for command logs. Relative paths are resolved from project_dir."
+      },
+      "env": {
+        "type": "object",
+        "additionalProperties": {
+          "type": "string"
+        }
+      }
+    },
+    "required": [
+      "project_dir"
+    ]
+  }
+}

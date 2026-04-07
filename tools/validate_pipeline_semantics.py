@@ -94,7 +94,8 @@ REQUIRED_WORKFLOW_STEPS = ("plan", "generate", "build", "execute", "judge")
 SUBSTEP_WORKFLOW_STEPS = frozenset({"plan", "generate", "tune"})
 AGENT_TERMINAL_STATUSES = {"pass", "fail", "blocked", "timeout", "cancel"}
 
-# RUNBOOK + GLOSSARY: LLM stage meta for generate
+# RUNBOOK + GLOSSARY: LLM stage meta for generate.
+# lint_command_ref is required only when verification_status=pass; see _validate_generate_lint_command_logs.
 _GENERATE_META_REQUIRED_KEYS = (
     "attempt_count",
     "verification_status",
@@ -102,6 +103,19 @@ _GENERATE_META_REQUIRED_KEYS = (
     "debug_mode",
     "context_isolated",
 )
+
+# Generate-stage static lint (MCP run_linter); see docs/WORKFLOW.md
+_LINT_PRESET_FOR_LANGUAGE: dict[str, str] = {
+    "fortran": "fortitude",
+    "cuda_fortran": "fortitude",
+    "c": "cppcheck",
+    "cpp": "cppcheck",
+    "c++": "cppcheck",
+    "cuda_c": "cppcheck",
+    "mixed": "mixed",
+    "python": "ruff",
+}
+_LINT_ALLOWED_PRESETS = frozenset({"fortitude", "cppcheck", "ruff", "mixed"})
 _NODE_KEY_SAFE_PATTERN_LINEAGE = re.compile(
     r"^[a-z][a-z0-9_]*__[a-z0-9][a-z0-9_]*__[0-9][0-9A-Za-z._-]*$"
 )
@@ -1068,6 +1082,8 @@ def _validate_generate_meta_json_files(
                 violations.append(f"{meta_path}:debug_mode must be boolean")
             elif key == "context_isolated" and not isinstance(val, bool):
                 violations.append(f"{meta_path}:context_isolated must be boolean")
+        if "lint_command_ref" in data:
+            _validate_generate_meta_lint_shape(meta_path, data, violations)
 
 
 def _iter_command_ref_entries(node: Any) -> list[dict[str, Any]]:
@@ -1973,6 +1989,225 @@ def _metrics_basis_variable_keys(entry: dict[str, Any]) -> set[str]:
         for key in entry
         if isinstance(key, str) and key.strip() and key not in ignored_keys
     }
+
+
+def _impl_language_from_plan_dir(repo_root: Path, plan_dir: Path) -> str | None:
+    impl_path = plan_dir / "impl.resolved.yaml"
+    if not impl_path.exists():
+        return None
+    try:
+        data = _read_yaml(impl_path)
+    except yaml.YAMLError:
+        return None
+    if not isinstance(data, dict):
+        return None
+    toolchain = data.get("toolchain")
+    if not isinstance(toolchain, dict):
+        return None
+    raw = toolchain.get("language")
+    if not isinstance(raw, str) or not raw.strip():
+        return None
+    return raw.strip().lower()
+
+
+def _infer_run_linter_preset_from_command(command: list[Any]) -> str | None:
+    if not command:
+        return None
+    head = str(command[0]).strip().lower()
+    exe = Path(head).name
+    if exe == "fortitude":
+        return "fortitude"
+    if exe == "cppcheck":
+        return "cppcheck"
+    if exe == "ruff":
+        return "ruff"
+    return None
+
+
+def _validate_generate_meta_lint_shape(
+    meta_path: Path, data: dict[str, Any], violations: list[str]
+) -> None:
+    ref = data.get("lint_command_ref")
+    if ref is None:
+        violations.append(f"{meta_path}: missing lint_command_ref")
+        return
+    if not isinstance(ref, dict):
+        violations.append(f"{meta_path}: lint_command_ref must be json object")
+        return
+    run_entries = ref.get("run_linter")
+    if run_entries is None:
+        violations.append(f"{meta_path}: lint_command_ref.run_linter must be present")
+        return
+    if not isinstance(run_entries, list):
+        violations.append(f"{meta_path}: lint_command_ref.run_linter must be array")
+        return
+
+
+def _validate_generate_lint_command_logs(
+    repo_root: Path,
+    meta_path: Path,
+    data: dict[str, Any],
+    impl_language: str | None,
+    violations: list[str],
+) -> None:
+    """Validate MCP run_linter command logs for Generate static lint."""
+    status = data.get("verification_status")
+    if not isinstance(status, str) or status.strip().lower() != "pass":
+        return
+
+    if not impl_language:
+        violations.append(
+            f"{meta_path}: cannot validate static lint without impl.resolved.yaml toolchain.language"
+        )
+        return
+
+    expected = _LINT_PRESET_FOR_LANGUAGE.get(impl_language)
+    if expected is None:
+        violations.append(
+            f"{meta_path}: toolchain.language={impl_language!r} has no static lint mapping"
+        )
+        return
+
+    ref = data.get("lint_command_ref")
+    if ref is None:
+        violations.append(
+            f"{meta_path}: missing lint_command_ref when verification_status=pass"
+        )
+        return
+    if not isinstance(ref, dict):
+        violations.append(
+            f"{meta_path}: lint_command_ref must be json object when verification_status=pass"
+        )
+        return
+    run_entries = ref.get("run_linter")
+    if run_entries is None:
+        violations.append(
+            f"{meta_path}: lint_command_ref.run_linter must be present when verification_status=pass"
+        )
+        return
+    if not isinstance(run_entries, list):
+        violations.append(
+            f"{meta_path}: lint_command_ref.run_linter must be array when verification_status=pass"
+        )
+        return
+
+    if not run_entries:
+        violations.append(
+            f"{meta_path}: lint_command_ref.run_linter must be non-empty when "
+            "verification_status=pass and static lint applies"
+        )
+        return
+
+    if expected == "mixed":
+        if len(run_entries) != 2:
+            violations.append(
+                f"{meta_path}: toolchain.language=mixed requires exactly two run_linter entries "
+                f"(found {len(run_entries)})"
+            )
+        presets_found: set[str] = set()
+        for entry in run_entries:
+            if not isinstance(entry, dict):
+                violations.append(
+                    f"{meta_path}: lint_command_ref.run_linter entries must be objects"
+                )
+                continue
+            p = entry.get("preset")
+            if isinstance(p, str) and p.strip():
+                presets_found.add(p.strip().lower())
+        if presets_found != {"fortitude", "cppcheck"}:
+            violations.append(
+                f"{meta_path}: toolchain.language=mixed requires run_linter entries with "
+                f"preset fortitude and cppcheck (found {sorted(presets_found)})"
+            )
+    else:
+        if len(run_entries) != 1:
+            violations.append(
+                f"{meta_path}: lint_command_ref.run_linter must have exactly one entry "
+                f"for toolchain.language={impl_language}"
+            )
+        else:
+            entry = run_entries[0]
+            if not isinstance(entry, dict):
+                violations.append(
+                    f"{meta_path}: lint_command_ref.run_linter[0] must be object"
+                )
+            else:
+                p = entry.get("preset")
+                if not isinstance(p, str) or p.strip().lower() != expected:
+                    violations.append(
+                        f"{meta_path}: lint preset must be {expected!r} for "
+                        f"toolchain.language={impl_language} (got {p!r})"
+                    )
+
+    for idx, entry in enumerate(run_entries):
+        if not isinstance(entry, dict):
+            violations.append(
+                f"{meta_path}: lint_command_ref.run_linter[{idx}] must be object"
+            )
+            continue
+        command_id = entry.get("command_id")
+        log_ref = entry.get("command_log_ref")
+        preset_decl = entry.get("preset")
+        if not isinstance(command_id, str) or not command_id.strip():
+            violations.append(
+                f"{meta_path}: lint_command_ref.run_linter[{idx}].command_id invalid"
+            )
+            continue
+        if not isinstance(log_ref, str) or not log_ref.strip():
+            violations.append(
+                f"{meta_path}: lint_command_ref.run_linter[{idx}].command_log_ref invalid"
+            )
+            continue
+        if not isinstance(preset_decl, str) or not preset_decl.strip():
+            violations.append(
+                f"{meta_path}: lint_command_ref.run_linter[{idx}].preset invalid"
+            )
+            continue
+        preset_decl_l = preset_decl.strip().lower()
+        if preset_decl_l not in _LINT_ALLOWED_PRESETS:
+            violations.append(
+                f"{meta_path}: lint_command_ref.run_linter[{idx}].preset must be one of "
+                f"{sorted(_LINT_ALLOWED_PRESETS)}"
+            )
+            continue
+        if preset_decl_l == "mixed":
+            violations.append(
+                f"{meta_path}: lint_command_ref.run_linter[{idx}].preset must not be "
+                "'mixed'; record separate fortitude and cppcheck entries"
+            )
+            continue
+
+        matched = _find_command_log_record(repo_root, command_id.strip(), log_ref.strip())
+        if matched is None:
+            violations.append(
+                f"{meta_path}: lint_command_ref.run_linter[{idx}]: command log not found "
+                f"for command_id={command_id!r}"
+            )
+            continue
+        if matched.get("tool_name") != "run_linter":
+            violations.append(
+                f"{meta_path}: lint_command_ref.run_linter[{idx}]: command_id={command_id!r} "
+                f"tool_name must be run_linter"
+            )
+            continue
+        if matched.get("ok") is not True:
+            violations.append(
+                f"{meta_path}: lint_command_ref.run_linter[{idx}]: command_id={command_id!r} "
+                "run_linter did not succeed (ok must be true)"
+            )
+            continue
+        command = matched.get("command")
+        if not isinstance(command, list) or not command:
+            violations.append(
+                f"{meta_path}: lint_command_ref.run_linter[{idx}]: command log missing command"
+            )
+            continue
+        inferred = _infer_run_linter_preset_from_command(command)
+        if inferred != preset_decl_l:
+            violations.append(
+                f"{meta_path}: lint_command_ref.run_linter[{idx}]: logged command does not match "
+                f"preset {preset_decl_l!r} (inferred {inferred!r})"
+            )
 
 
 def _find_command_log_record(
@@ -4399,6 +4634,25 @@ def validate_post_generate_stage(
     _validate_generate_outputs_for_generation(
         repo_root, execution, gen_id, violations
     )
+
+    gen_dir = pipeline_dir / "generate" / gen_id
+    meta_path = gen_dir / "generate_meta.json"
+    if meta_path.exists():
+        try:
+            meta_data = _read_json(meta_path)
+        except json.JSONDecodeError:
+            violations.append(f"{meta_path}: invalid json")
+        else:
+            if isinstance(meta_data, dict):
+                impl_lang: str | None = None
+                if plan_ref:
+                    impl_lang = _impl_language_from_plan_dir(
+                        repo_root, (repo_root / plan_ref).resolve()
+                    )
+                _validate_generate_lint_command_logs(
+                    repo_root, meta_path, meta_data, impl_lang, violations
+                )
+
     return violations
 
 

@@ -94,7 +94,7 @@
 - `plan_id` / `pipeline_id` / `generation_id` / `build_id` / `execution_id` を保存する。
 - `plan_id` は `case_hash12` と `algorithm_hash12` と `impl_hash12` を識別できる形式にする。
 - `node_key` / `topo_level` / `dependency_ref` を保存する。
-- `LLM` 利用ステージは各ステージの `<stage>_meta.json`（コード生成は `generate_meta.json`）に `attempt_count` / `verification_status` / `last_fail_reason` / `debug_mode` を保存する。
+- `LLM` 利用ステージは各ステージの `<stage>_meta.json`（コード生成は `generate_meta.json`）に `attempt_count` / `verification_status` / `last_fail_reason` / `debug_mode` / `lint_command_ref` を保存する。
 - `step` / `substep` の `agent_runs.jsonl` は `agent_backend` / `agent_model` / `context_id` / `context_isolated=true` を記録する。
 - `debug_mode=true` で失敗試行を保存した場合は保存件数と保存先を記録する。
 - `dependency.resolved.yaml` の全 `node_key` について、`workspace/plans` と `workspace/pipelines` の対応が 1 対 1 で成立することを保存前に検証する。
