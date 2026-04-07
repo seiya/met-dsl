@@ -57,4 +57,4 @@ Plan ステージの生成責務を固定し、入力 spec から決定的な re
 ## 判定基準
 - 同一入力で再生成したとき、`case.resolved.yaml` と `algorithm.resolved.yaml` と `impl.resolved.yaml` と `dependency.resolved.yaml` が一致する。
 - `dependency.resolved.yaml` の `topo_level` が循環依存を含まない。
-- 出力が `docs/WORKFLOW.md` と `docs/RUNBOOK.md` の契約に整合する。
+- 出力が `docs/workflow/WORKFLOW_CORE.md` と `docs/workflow/phases/phase_01_plan.md` と `docs/RUNBOOK.md` の契約に整合する。

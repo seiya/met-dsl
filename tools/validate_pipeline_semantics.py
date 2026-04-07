@@ -104,7 +104,7 @@ _GENERATE_META_REQUIRED_KEYS = (
     "context_isolated",
 )
 
-# Generate-stage static lint (MCP run_linter); see docs/WORKFLOW.md
+# Generate-stage static lint (MCP run_linter); see docs/workflow/WORKFLOW_CORE.md and docs/workflow/phases/phase_02_generate.md
 _LINT_PRESET_FOR_LANGUAGE: dict[str, str] = {
     "fortran": "fortitude",
     "cuda_fortran": "fortitude",

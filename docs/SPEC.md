@@ -155,7 +155,7 @@ releases/
 ## 参照
 - `CONTROLLED_SPEC.md`
 - `TESTS.md`
-- `WORKFLOW.md`
+- `WORKFLOW.md`（入口） / `workflow/WORKFLOW_CORE.md` / `workflow/phases/`
 - `IMPL_PLAN_SPEC.md`
 - `PHYSICAL_VALIDATION.md`
 - `GLOSSARY.md`

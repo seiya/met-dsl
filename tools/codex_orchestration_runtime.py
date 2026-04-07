@@ -28,6 +28,18 @@ DEFAULT_BACKEND_COMMANDS = {
     "claude": "claude",
 }
 
+# Child agent `skill_must_read_refs`: split workflow spec (see docs/workflow/).
+WORKFLOW_CORE_REF = "docs/workflow/WORKFLOW_CORE.md"
+WORKFLOW_PHASE_DOC_BY_STEP: dict[str, str] = {
+    "plan": "docs/workflow/phases/phase_01_plan.md",
+    "generate": "docs/workflow/phases/phase_02_generate.md",
+    "build": "docs/workflow/phases/phase_03_build.md",
+    "execute": "docs/workflow/phases/phase_04_execute.md",
+    "judge": "docs/workflow/phases/phase_05_judge.md",
+    "tune": "docs/workflow/phases/phase_06_tune.md",
+    "promote": "docs/workflow/phases/phase_07_promote.md",
+}
+
 
 def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
@@ -360,11 +372,21 @@ def _merge_unique_refs(*ref_groups: list[str]) -> list[str]:
     return merged
 
 
+def _workflow_contract_refs_for_launch(request_payload: dict[str, Any]) -> list[str]:
+    refs = [WORKFLOW_CORE_REF, "docs/ORCHESTRATION.md"]
+    step = request_payload.get("step")
+    if isinstance(step, str) and step.strip():
+        phase_doc = WORKFLOW_PHASE_DOC_BY_STEP.get(step.strip().lower())
+        if phase_doc:
+            refs.append(phase_doc)
+    return refs
+
+
 def build_skill_must_read_refs(request_payload: dict[str, Any]) -> list[str]:
     skill_ref = request_payload.get("skill_ref")
     skill_refs = [skill_ref.strip()] if isinstance(skill_ref, str) and skill_ref.strip() else []
     existing_refs = _split_skill_refs(request_payload.get("skill_must_read_refs"))
-    common_refs = ["docs/WORKFLOW.md", "docs/ORCHESTRATION.md"]
+    common_refs = _workflow_contract_refs_for_launch(request_payload)
     verify_refs = _required_verify_skill_refs(request_payload)
     return _merge_unique_refs(skill_refs, common_refs, existing_refs, verify_refs)
 

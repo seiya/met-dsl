@@ -35,4 +35,4 @@ Build ステージの実行責務を固定し、再現可能なビルド artifac
 ## 判定基準
 - ビルド手段が `MCP compile_project` のみである。
 - `build_meta.json` の必須項目が欠落しない。
-- `workspace` 配置規約が `docs/WORKFLOW.md` と一致する。
+- `workspace` 配置規約が `docs/workflow/WORKFLOW_CORE.md` と `docs/workflow/phases/phase_03_build.md` と一致する。

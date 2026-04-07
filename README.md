@@ -77,7 +77,7 @@ mcp_servers/  MCP server implementation and examples
 ## Minimal Documentation Entry Points
 
 - `docs/SPEC.md`
-- `docs/WORKFLOW.md`
+- `docs/WORKFLOW.md`（入口） / `docs/workflow/WORKFLOW_CORE.md` / `docs/workflow/phases/`
 - `docs/RUNBOOK.md`
 - `docs/GLOSSARY.md`
 

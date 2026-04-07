@@ -8,7 +8,7 @@
 3. `TESTS.md`（`tests` の書式と必須要件）
 4. `PHYSICAL_VALIDATION.md`（物理妥当性判定の要件）
 5. `GLOSSARY.md`（`Artifacts` / `terms`）
-6. `WORKFLOW.md`（`Spec -> Plan -> Generate -> Build -> Execute -> Judge -> Tune -> Promote`。依存 `DAG` に基づく下層優先実行と `aggregate_verdict` を含む）
+6. `WORKFLOW.md`（workflow 仕様への入口。本文は `workflow/WORKFLOW_CORE.md` と `workflow/phases/` に分割）
 7. `ORCHESTRATION.md`（`orchestration agent -> substep agent` と `orchestration agent -> step agent` の実行規約）
 8. `RUNBOOK.md`（試行を回すための最小運用手順）
 9. `IMPL_PLAN_SPEC.md`（`impl.resolved.yaml` 仕様）
@@ -24,7 +24,7 @@
 - `GLOSSARY.md`
 
 ### Loop（試行を回す）
-- `WORKFLOW.md`
+- `WORKFLOW.md` / `workflow/WORKFLOW_CORE.md` / `workflow/phases/`
 - `ORCHESTRATION.md`
 - `RUNBOOK.md`
 

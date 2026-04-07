@@ -74,7 +74,7 @@
 - `Codex` / `Gemini` / `Claude Code` のいずれでも、作業開始前に対象 phase の `SKILL.md` を読み、定義された input/output contract と判定基準に従う。
 
 ## Workflow 文書参照ルール
-- workflow 共通の不変規範、phase sequence、phase input/output contract は `docs/WORKFLOW.md` を canonical source とする。
+- workflow 仕様への入口は `docs/WORKFLOW.md` とする。workflow 共通の不変規範、phase sequence、`phase` 別 I/O 契約一覧は `docs/workflow/WORKFLOW_CORE.md` を、各 `phase` の詳細契約は `docs/workflow/phases/` 配下を canonical source とする。
 - `orchestration agent` と `step agent` / `substep agent` の階層実行契約は `docs/ORCHESTRATION.md` を canonical source とする。
 - phase と `SKILL` の対応、規則の記載先判定、phase 切替規則は `docs/AGENT_SKILLS.md` を canonical source とする。
 - workflow 固有の禁止事項、過去 artifact 参照禁止、独立 `agent` 実行証跡要件は、`AGENTS.md` へ再掲せず対応 canonical source を参照する。

@@ -58,5 +58,5 @@ Generate ステージの生成責務を固定し、`Build` 可能な実装 artif
 
 ## 判定基準
 - `model` と `runner` の責務分離が保持される。
-- 出力ファイル集合が `docs/WORKFLOW.md` と `docs/RUNBOOK.md` の契約に一致する。
+- 出力ファイル集合が `docs/workflow/WORKFLOW_CORE.md` と `docs/workflow/phases/phase_02_generate.md` と `docs/RUNBOOK.md` の契約に一致する。
 - `generate_meta.json` の必須項目が欠落しない。

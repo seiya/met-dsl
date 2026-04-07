@@ -24,7 +24,21 @@ def _write_json(path: Path, data: object) -> None:
     path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
 
+_STEP_PHASE_PATH = {
+    "plan": "docs/workflow/phases/phase_01_plan.md",
+    "generate": "docs/workflow/phases/phase_02_generate.md",
+    "build": "docs/workflow/phases/phase_03_build.md",
+    "execute": "docs/workflow/phases/phase_04_execute.md",
+    "judge": "docs/workflow/phases/phase_05_judge.md",
+}
+
+
 def _step_prompt_fixture(orchestration_id: str, node_key: str, step: str, run_id: str) -> str:
+    phase_path = _STEP_PHASE_PATH.get(step, "docs/workflow/phases/phase_01_plan.md")
+    refs = (
+        f"skills/workflow-{step}/SKILL.md,"
+        f"docs/workflow/WORKFLOW_CORE.md,docs/ORCHESTRATION.md,{phase_path}"
+    )
     return f"""あなたは step agent である。
 対象 node_key: {node_key}
 対象 step: {step}
@@ -36,7 +50,7 @@ pipeline_ref: workspace/pipelines/problem__shallow_water2d__0.3.0/problem__shall
 dependency_ref: workspace/plans/problem__shallow_water2d__0.3.0/plan_test/dependency.resolved.yaml
 skill_name: workflow-{step}
 skill_ref: skills/workflow-{step}/SKILL.md
-skill_must_read_refs: docs/WORKFLOW.md,docs/ORCHESTRATION.md
+skill_must_read_refs: {refs}
 必須要件:
 - 契約を完了すること。
 """
@@ -49,6 +63,11 @@ def _substep_prompt_fixture(
     substep: str,
     run_id: str,
 ) -> str:
+    phase_path = _STEP_PHASE_PATH.get(step, "docs/workflow/phases/phase_01_plan.md")
+    refs = (
+        f"skills/workflow-{step}-{substep}/SKILL.md,"
+        f"docs/workflow/WORKFLOW_CORE.md,docs/ORCHESTRATION.md,{phase_path}"
+    )
     return f"""あなたは substep agent である。
 対象 node_key: {node_key}
 対象 step: {step}
@@ -61,7 +80,7 @@ pipeline_ref: workspace/pipelines/problem__shallow_water2d__0.3.0/problem__shall
 dependency_ref: workspace/plans/problem__shallow_water2d__0.3.0/plan_test/dependency.resolved.yaml
 skill_name: workflow-{step}-{substep}
 skill_ref: skills/workflow-{step}-{substep}/SKILL.md
-skill_must_read_refs: docs/WORKFLOW.md,docs/ORCHESTRATION.md
+skill_must_read_refs: {refs}
 必須要件:
 - 契約を完了すること。
 """

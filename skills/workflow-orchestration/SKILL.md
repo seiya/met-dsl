@@ -22,7 +22,7 @@ description: 対応 execution platform で `workflow` 全体を開始し、`orch
 - execution platform の起動可否確認と証跡書き出しは `tools/codex_orchestration_runtime.py` を canonical source 実装として使用しなければならない。
 - `preflight.json` の手動編集または後編集による `pass` 化を禁止する。`preflight` は `tools/codex_orchestration_runtime.py preflight` の execution result を canonical source とする。
 - 子 `agent` 起動直前に live preflight gate を満たすことを必須とし、live 検査が `fail` の場合は `record-launch` を実行してはならない。
-- 起動前の初期読込は `references/startup_contract.md` を第一参照とし、詳細契約が必要な場合のみ `docs/WORKFLOW.md` と `docs/ORCHESTRATION.md` を追加参照しなければならない。
+- 起動前の初期読込は `references/startup_contract.md` を第一参照とし、詳細契約が必要な場合のみ `docs/workflow/WORKFLOW_CORE.md` と `docs/ORCHESTRATION.md` を追加参照しなければならない。
 - phase 着手前に、対象 phase が `substep agent` 必須か `step agent` 必須かを固定表で判定しなければならない。`Plan` / `Generate` / `Tune` は `substep agent`、`Build` / `Execute` / `Judge` / `Promote` は `step agent` とする。
 - 最初の `commentary` では、対象 phase、使用する `SKILL`、起動する `agent` 種別、`MCP` を使用する箇所を実行宣言として明示しなければならない。実行宣言と実作業が一致しない場合は停止して宣言からやり直さなければならない。
 - `step agent` / `substep agent` の起動要求本文は、必ず `references/launch_prompts.md` の対応テンプレートを基底として生成しなければならない。テンプレートを使わない任意の自由形式 prompt、別テンプレートの混用、必須項目の省略または改名を禁止する。
