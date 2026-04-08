@@ -36,7 +36,7 @@ Generate ステージ出力の検証責務を固定し、`Build` 失敗を事前
 - 依存 `node` の `model` / `runner` / `module` / `subroutine` / `Makefile` 断片が依存元 `src/` に複製、再配置、再定義されている場合を `dependency implementation encapsulation` 違反として `fail` とする。
 - `toolchain.language=fortran` で依存 `component` を持つ `node` は、依存 `spec_id` ごとに `model` 内の `use <spec_id>_model` と `call <spec_id>__*` を必須検査し、`subroutine <spec_id>__*` の再定義を検出した場合は `fail` とする。
 - 依存先が `profile` で公開 `operation` を持たない構成では、依存元 `problem` の実装が `profile` の選択結果と拘束条件を参照していることを検査する。欠落時は `fail` とする。
-- `runner` が `verdict.json` と `aggregate_verdict.json` と `summary.json` と `trial_meta.json` を書き込む実装を検出した場合は `fail` とする。
+- `runner` が `verdict.json` と `aggregate_verdict.json` と `summary.json` と `trial_meta.json` を書き込む実装を検出した場合は `fail` とする。当該禁止名は `docs/workflow/phases/phase_02_generate.md` と `docs/RUNBOOK.md` のとおり、**コメントを含む runner ソース全文** への substring 照合対象であり、コメント内の例示に同一文字列があっても `fail` となる。
 - `runner` の `diagnostics.json` と `perf.json` 出力が、標準 `JSON` parser で復元可能な UTF-8 `JSON object` を満たすことを検査する。`toolchain.language=fortran` の `runner` が `F0.d` など leading zero を欠落し得る書式を `perf.json` または `diagnostics.json` の数値 token へ直接使用する場合は `fail` とする。
 - `impl.resolved.yaml` の言語と `build_system` に整合する構成であることを検査する。
 - `impl.resolved.yaml` の `target.class` と `target.backend` と `target.architecture` と `toolchain.language` と `toolchain.standard` と `toolchain.build_system` と `selected.backend_key` が、生成されたソース構成と `build` 用 artifact に反映されていることを検査する。言語不一致、`build_system` 不一致、未選択 backend の code path 出力、`selected.backend_key` 未反映を `fail` とする。
@@ -44,7 +44,7 @@ Generate ステージ出力の検証責務を固定し、`Build` 失敗を事前
 - 異なる `node_key` の `generate/src` との完全一致を検査し、共通ライブラリ明示がない複製を `copy_based_artifact_reuse` として `fail` にする。
 - `toolchain.language=fortran` の場合、`module` 名とソースファイル名が `<module_name>.f90` で一致することを検査する。
 - `toolchain.language=fortran` の場合、`module` 名と公開 `subroutine` 名に `spec_id` 由来接頭辞が付与されていることを検査する。
-- `toolchain.build_system=make` かつ `toolchain.language=fortran` の場合、`src/Makefile` の各オブジェクトターゲットが `use` 依存に対応した `.mod` または依存 `.o` の前提条件を明示していることを検査する。
+- `toolchain.build_system=make` かつ `toolchain.language=fortran` の場合、`src/Makefile` の各オブジェクトターゲットが `use` 依存に対応した `.mod` または依存 `.o` の前提条件を明示していることを検査する。規則行のターゲットは **literal** 名で記述されていること（`$(VAR):` だけのターゲットに依存していないこと）を確認する。補足は `docs/RUNBOOK.md` の 1-2-1 を参照する。
 - `toolchain.build_system=make` かつ `toolchain.language=fortran` の場合、`src/Makefile` が `make -j` 互換の依存関係記述を欠落していないことを検査する。
 - `quality check` 実行に必要な preset-compatible quality path が `Generate` 出力だけで成立することを検査する。`Execute` で追加 `test` source、harness、補助 `script`、一時 `Makefile` を生成しなければ成立しない構成を `fail` とする。
 - `toolchain.build_system=make` かつ `toolchain.language=fortran` / `c` / `cpp` / `mixed` 系の場合、`src/Makefile` に `test` または `check` target が存在し、`run_quality_checks preset=make_test` または `preset=make_check` に適合することを検査する。

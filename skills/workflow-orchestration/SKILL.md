@@ -48,6 +48,7 @@ description: 対応 execution platform で `workflow` 全体を開始し、`orch
 - `repair_strategy=reuse` は契約不変の局所修正に限定し、`repair_strategy=restart` は契約再解釈または広範囲再生成が必要な場合に選択しなければならない。
 - 再投入時の起動要求には、`issue_severity` と `repair_strategy` と `repair_target_agent_run_id` と `repair_reason` を必須記録しなければならない。
 - 再投入時は `repair_strategy` を問わず新規 `agent_run_id` を発行し、`repair_strategy=reuse` の場合のみ `agent_session_id` 再利用を許可する。
+- `substep` を持つ phase の `write-step-result` において、`substep_agent_run_ids` は当該 `step` の `agent_runs.jsonl` 上の全 `substep` を欠落なく列挙しなければならない。終端 `status` が `pass` 以外の `substep` であっても `agent_run_id` を省略してはならない。補足は `docs/ORCHESTRATION.md` の運用ルール 20 と `docs/RUNBOOK.md` 1-3 を参照する。
 
 ## 運用ルール
 1. `python3 tools/codex_orchestration_runtime.py init --repo-root <repo_root> --orchestration-id <orchestration_id> --spec-ref <spec_ref> --dependency-ref <dependency_ref>` を実行し、`workspace/orchestrations/<orchestration_id>/` を初期化する。
@@ -65,7 +66,7 @@ description: 対応 execution platform で `workflow` 全体を開始し、`orch
 13. `substep` を持つ phase では、返却結果を評価して `issue_severity` と `repair_strategy` を決定する。再投入が必要な場合は `repair_target_agent_run_id` と `repair_reason` を起動要求へ付与して再起動し、`record-launch` を追加する。
 14. `repair_strategy=reuse` の再投入では、対象 `substep` の契約を変更せず差分修正だけを要求する。`repair_strategy=restart` の再投入では、対象 `substep` の契約入力から再生成させる。
 15. 契約に反する近道を取りたくなった場合は、子 `agent` 起動必須であることを `commentary` で明示し、launch 手順へ戻る。ローカル実装を継続してはならない。
-16. 標準 `substep` を持たない phase では `step agent` 完了後に、`substep` を持つ phase では `orchestration agent` 集約完了後に、`python3 tools/codex_orchestration_runtime.py write-step-result --repo-root <repo_root> --orchestration-id <orchestration_id> --node-key <node_key> --step <step> --agent-run-id <agent_run_id> --result-json '<json>'` を実行する。再投入を実施した場合は `step_result.json` に `retry_decisions` を含める。
+16. 標準 `substep` を持たない phase では `step agent` 完了後に、`substep` を持つ phase では `orchestration agent` 集約完了後に、`python3 tools/codex_orchestration_runtime.py write-step-result --repo-root <repo_root> --orchestration-id <orchestration_id> --node-key <node_key> --step <step> --agent-run-id <agent_run_id> --result-json '<json>'` を実行する。再投入を実施した場合は `step_result.json` に `retry_decisions` を含める。`substep_agent_run_ids` には当該 `step` の `agent_runs.jsonl` に記録された **全** `substep` の `agent_run_id` を欠落なく含め、`fail` / `cancel` 等で終端した ID を省略してはならない。`status=pass` の `step_result` では列挙した各 `substep` が `pass` であることと `required_outputs` 被覆は従来どおり必須とする。
 17. workflow 終了時は `python3 tools/codex_orchestration_runtime.py set-status --repo-root <repo_root> --orchestration-id <orchestration_id> --status <status>` を実行し、`orchestration_meta.json` を終端状態へ更新する。
 18. `preflight.json` を手動編集または後編集して `status` と `can_launch_*` を変更してはならない。検査条件の変化は `preflight` 再実行でのみ反映する。
 19. `record-launch` 実行時に live preflight gate が `fail` の場合、当該起動を停止し、`set-status --status fail` のみを許可する。
@@ -90,7 +91,7 @@ description: 対応 execution platform で `workflow` 全体を開始し、`orch
 - `launches/` の request に placeholder ref が存在しない。
 - `verify` の `launches/` request が、必須 resolved artifact を `skill_must_read_refs` へ記録している。
 - 子 `agent` の `launches/` prompt が、`tools/` 配下の実装、検証 `script`、test code、validator code を rule source として読むことを禁止している。
-- `step_result.json` が `executor_agent_run_id` と `substep_agent_run_ids` を保持している。
+- `step_result.json` が `executor_agent_run_id` と `substep_agent_run_ids` を保持している。`substep` を持つ `step` では `substep_agent_run_ids` が当該 `step` の全 `substep` の `agent_run_id` を網羅している。
 - 再投入を実施した場合、該当 `launch` 要求に `issue_severity` と `repair_strategy` と `repair_target_agent_run_id` と `repair_reason` が含まれている。
 - 子 `agent` の全 `launch` 要求に `skill_name` と `skill_ref` と `skill_must_read_refs` が含まれている。
 - `repair_strategy=reuse` と `repair_strategy=restart` の選択が、`ORCHESTRATION.md` の判定条件と一致している。

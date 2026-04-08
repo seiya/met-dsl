@@ -54,6 +54,13 @@
 - `trial_meta.json` は `generated_by_stage` と `source_execution_id` と `source_command_ref` と `source_artifact_hash` を必須記録とし、欠落または不整合時は `fail` とする。
 - 本節の検証に違反した試行は当該ステージで停止し、下流ステージ開始条件を満たす目的の人工 artifact generation を禁止する。
 
+### 1-2-1. `validate_pipeline_semantics.py` の補足静的規則（Generate 周辺）
+以下は `python3 tools/validate_pipeline_semantics.py --stage post_generate` 等で機械検査される規則のうち、`phase` 契約本文からは読み取りにくい実装寄りの要件である。エージェントは `tools/` 実装を要求定義の canonical source にしてはならないが、同一試行内の再生成ループを避けるため、ここに要件として明示する。
+
+- **`Makefile` オブジェクト規則のターゲット表記**: `toolchain.language=fortran` かつ複数 `module` から成る `src/` に対し、`use` 依存から機械導出されるオブジェクト依存検査が走る。検査は `src/Makefile` の規則行を字句解析し、ターゲット token から `$(NAME)` / `${NAME}` を除去したあとに残る **literal** なベース名（例: `foo.o`）だけを規則として採用する。ターゲットが変数展開のみ（例: `$(FOO_OBJ):` のみ）で literal 名が残らない行は規則として無視される。各 `.o` の前提に必要な `.mod` / `.o` は **literal ターゲット行**（例: `foo.o: bar.o baz.mod`）として列挙しなければならない。
+- **`runner` の禁止出力名 substring 検査の範囲**: `*_runner.f90`（対象 glob は検査実装に依存）の全文を小文字化したうえで、禁止名の **部分文字列** として検出する。**コメント行を除外しない**。`verdict.json`、`aggregate_verdict.json`、`summary.json`、`trial_meta.json` のいずれも、コメントや文字列リテラル内に含めてはならない（説明用途であっても同一 substring が存在すれば `fail` となる）。
+- **各 `pipeline` の `lineage.json`**: `workspace/pipelines/<node_key_safe>/<pipeline_id>/lineage.json` は検査対象の `pipeline` ごとに必須であり、欠落時は `post_generate` / `post_execute` 等で `fail` となる。内容要件は `docs/workflow/WORKFLOW_CORE.md` を canonical source とする。
+
 ## 1-3. エージェント起動規約（運用必須）
 - `workflow` 実行は `orchestration agent` を起点に開始し、`orchestration_id` を必須発行する。
 - `workflow` 開始前に、`step agent` と `substep agent` の独立起動可否を検証する `preflight` を実行し、`pass` でない場合は開始してはならない。
@@ -71,6 +78,7 @@
 - `orchestration` の実行記録は `workspace/orchestrations/<orchestration_id>/` に保存し、`orchestration_meta.json` と `agent_graph.json` と `agent_runs.jsonl` を必須とする。
 - `step_result.json` は `workspace/orchestrations/<orchestration_id>/steps/<node_key_safe>/<step>/<agent_run_id>/` に保存する。
 - `step_result.json` は `executor_agent_run_id` と `substep_agent_run_ids` を必須記録し、`executor_agent_run_id` は保存先 `agent_run_id` と一致させる。`substep` を持たない phase の `substep_agent_run_ids` は空配列を許可する。
+- `substep` を持つ phase の `step_result.json` では、`substep_agent_run_ids` に当該 `step` で起動し `agent_runs.jsonl` に記録された **全** `substep` の `agent_run_id` を欠落なく含めなければならない。`status` が `pass` 以外の `substep`（`fail` / `cancel` 等）であっても省略してはならない。`tools/codex_orchestration_runtime.py` の orchestration 完了検査は、この網羅性と終端 `status` を別条件として扱う。
 - `Plan` / `Generate` / `Tune` の完了判定は `step_result.json` を canonical source とし、`launches/*.reply.txt` の文言のみで `pass` を確定してはならない。
 - `substep` を持つ phase で `status=pass` を記録する場合、`step_result.json.required_outputs` は参照先 `substep_agent_run_ids` の `agent_runs.jsonl.output_refs` で全件被覆されなければならない。不一致または `step_result.json` 欠落時は `fail_closed` とする。
 - `step agent` または `substep agent` の `fail` / `timeout` / `cancel` 発生時は、当該 `step` を停止し推測補完を禁止する。

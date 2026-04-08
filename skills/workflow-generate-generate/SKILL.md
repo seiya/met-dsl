@@ -13,6 +13,7 @@ Generate ステージの生成責務を固定し、`Build` 可能な実装 artif
 - `generate_meta.json` を生成する作業
 
 ## 要件
+- 作業開始直後に `plan_ref` の `derived_contract.json` を読み、`raw_requirements.required_evidence` の全要素について `artifact` と `required` と `min_samples` と（`artifact=state_snapshots` かつ `required=true` のとき）`schema.variables[].name` と `time_variable` を列挙し、`runner` の `raw/` 出力設計・`raw/metrics_basis.json` の索引設計と突合してから実装に入る。
 - 入力は `case.resolved.yaml` と `algorithm.resolved.yaml` と `impl.resolved.yaml` と `dependency.resolved.yaml` とする。
 - `controlled_spec.md` を直接入力にしてはならない。演算構成の要求定義は `algorithm.resolved.yaml` から解釈しなければならない。
 - 実装コードは `model` と `runner` を分離し、`runner` は `model` を `call` / `use` / `import` で利用する。
@@ -30,13 +31,14 @@ Generate ステージの生成責務を固定し、`Build` 可能な実装 artif
 - `toolchain.language=fortran` で依存 `component` を持つ `node` の `model` は、依存 `spec_id` ごとに `use <spec_id>_model` と `call <spec_id>__*` を必須とし、`subroutine <spec_id>__*` の再定義を禁止する。
 - 依存先が `profile` で公開 `operation` を持たない構成では、依存元 `problem` が `profile` の選択結果と拘束条件を参照する実装にしなければならない。
 - `runner` は `diagnostics.json` と `perf.json` と `raw/` 一次証跡のみを出力対象とし、`verdict.json` と `aggregate_verdict.json` と `summary.json` と `trial_meta.json` を書き込んではならない。
+- `runner` ソース（`Fortran` では慣例として `*_runner.f90`）に上記 4 ファイル名を **コメントを含むソース全体** の substring として含めてはならない。部分一致検査はコメントを除外しない。
 - `runner` が出力する `diagnostics.json` と `perf.json` は、標準 `JSON` parser で復元可能な UTF-8 `JSON object` でなければならない。`toolchain.language=fortran` の場合、`F0.d` など leading zero を欠落し得る数値整形を `JSON` 数値 token へ直接使用してはならない。
 - `target.class=cpu` かつ並列化方式未指定のとき、並列化可能ループへ `OpenMP` を既定適用する。
 - 生成 artifact は対象 `node_key` と整合する構成にする。
 - 生成 artifact は `node_key` ごとの差分を保持し、共通ライブラリ明示なしに `src` 全体を複製してはならない。
 - `toolchain.language=fortran` の場合、`module` 名とソースファイル名を一致させ、`<module_name>.f90` 形式で出力する。
 - `toolchain.language=fortran` の場合、`module` 名と公開 `subroutine` 名に `spec_id` 由来接頭辞を付与し、名前衝突を回避する。
-- `toolchain.build_system=make` かつ `toolchain.language=fortran` の場合、`src/Makefile` は `use` 依存に対応したオブジェクト依存関係を明示し、依存 `module` の `.mod` または依存 `.o` を各オブジェクトターゲットの前提条件へ必須記述する。
+- `toolchain.build_system=make` かつ `toolchain.language=fortran` の場合、`src/Makefile` は `use` 依存に対応したオブジェクト依存関係を明示し、依存 `module` の `.mod` または依存 `.o` を各オブジェクトターゲットの前提条件へ必須記述する。オブジェクト規則は **literal** ターゲット名（例: `foo.o:`）で書く。ターゲットが `$(VAR)` のみで literal が残らない行は静的解析から除外され、依存欠落扱いとなる。
 - `toolchain.build_system=make` かつ `toolchain.language=fortran` の場合、`src/Makefile` は `make -j` で依存欠落による不定失敗を起こしてはならない。
 - `quality check` 実行に必要な preset-compatible quality path は `Generate` 出力だけで成立しなければならない。`Execute` で追加 `test` source、harness、補助 `script`、一時 `Makefile` を生成する前提を禁止する。
 - `toolchain.build_system=make` かつ `toolchain.language=fortran` / `c` / `cpp` / `mixed` 系の場合、`src/Makefile` は `run_quality_checks preset=make_test` または `preset=make_check` で使用できる `test` または `check` target を必須定義する。
@@ -45,6 +47,7 @@ Generate ステージの生成責務を固定し、`Build` 可能な実装 artif
 - `lint_command_ref.run_linter` は `preset` と MCP ログの `command_id` と `command_log_ref` を対応付けた object の配列とする。`quality check` 用の `run_quality_checks` とは別手順である。
 - `generate_meta.json` の `verification_status` は `fail_closed` を前提とし、検証未実施や判定不能を `pass` にしてはならない。
 - workflow artifact の保存先ルートは `workspace/` のみを許可し、workflow ルート判定は `workspace/` のみを対象とする。
+- 対象 `pipeline` ルートに `lineage.json` を必須配置する（`workspace/pipelines/<node_key_safe>/<pipeline_id>/lineage.json`）。フィールド要件は `docs/workflow/WORKFLOW_CORE.md` を canonical source とし、`post_generate` 検査で欠落は `fail` となる。
 
 ## 運用ルール
 1. `generation_id` を発行し、出力先を `workspace/pipelines/<pipeline_id>/generate/<generation_id>/` に固定する。
