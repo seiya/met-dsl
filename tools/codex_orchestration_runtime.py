@@ -22,6 +22,7 @@ SUPPORTED_BACKENDS = {"codex", "cursor", "claude"}
 _NODE_KEY_SAFE_PATTERN = re.compile(
     r"^[a-z][a-z0-9_]*__[a-z0-9][a-z0-9_]*__[0-9][0-9A-Za-z._-]*$"
 )
+_SLUG_DATE_SEQ3_PATTERN = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*_[0-9]{8}_[0-9]{3}$")
 DEFAULT_BACKEND_COMMANDS = {
     "codex": "codex",
     "cursor": "agent",
@@ -674,9 +675,9 @@ def _validate_canonical_workspace_root_ref(
         )
     if not _NODE_KEY_SAFE_PATTERN.match(seg_node):
         raise ValueError(f"launch request {label} has invalid node_key_safe segment: {ref!r}")
-    if not root_id.startswith(f"{node_safe}_"):
+    if not _SLUG_DATE_SEQ3_PATTERN.match(root_id):
         raise ValueError(
-            f"launch request {label} root id must start with {node_safe + '_'}; got {ref!r}"
+            f"launch request {label} root id must match <slug>_<YYYYMMDD>_<seq3>; got {ref!r}"
         )
 
 

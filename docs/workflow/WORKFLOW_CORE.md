@@ -148,9 +148,9 @@ workspace/
 #### `ID` と不変条件
 - `orchestration_id` は 1 回の workflow 全体を識別する `ID` とする。
 - `node_key_safe` は `node_key` の保存用表記とし、推奨形式は `<spec_kind>__<spec_id>__<spec_version>` とする。
-- `plan_id` は `node` 単位で `case.resolved.yaml` と `algorithm.resolved.yaml` と `impl.resolved.yaml` と `dependency.resolved.yaml` の組を識別する `ID` とする。推奨形式は `<node_key_safe>_<case_hash12>_<algorithm_hash12>_<impl_hash12>` とする。
-- `pipeline_id` は `node` 単位で 1 回の `Generate -> Build -> Execute` 系列を識別する `ID` とする。推奨形式は `<plan_id>_<utc_ts>_<seq3>` とする。
-- `generation_id` / `build_id` / `execution_id` は各段階の試行単位 `ID` とする。
+- `plan_id` は `node` 単位で `case.resolved.yaml` と `algorithm.resolved.yaml` と `impl.resolved.yaml` と `dependency.resolved.yaml` の組を識別する `ID` とする。推奨形式は `<slug>_<date>_<seq3>` とする。`slug` は `spec_id` 由来の短い可読 token、`date` は `YYYYMMDD`、`seq3` は同日内 3 桁連番とする。
+- `pipeline_id` は `node` 単位で 1 回の `Generate -> Build -> Execute` 系列を識別する `ID` とする。推奨形式は `<slug>_<date>_<seq3>` とする。`slug` は `spec_id` 由来の短い可読 token、`date` は `YYYYMMDD`、`seq3` は同日内 3 桁連番とする。
+- `generation_id` / `build_id` / `execution_id` は各段階の試行単位 `ID` とし、推奨形式は `<prefix>_<date>_<seq3>` とする。`prefix` は `gen` / `build` / `exec` を使用する。
 - workflow は毎回独立実行し、`plan_id` / `pipeline_id` / `generation_id` / `build_id` / `execution_id` を毎回新規発行しなければならない。
 - `agent_run_id` は `step agent` / `substep agent` / `orchestration agent` の実行単位 `ID` とし、`step` / `substep` では `parent_agent_run_id` を必須記録とする。
 - `agent_runs.jsonl` の `step` / `substep` ロールは `agent_backend` と `agent_model` と `context_id` と `context_isolated` を必須記録とする。

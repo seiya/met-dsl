@@ -33,6 +33,8 @@
 
 #### 2-2. verify substep
 - `Generate verify` 完了前に `python3 tools/validate_pipeline_semantics.py --stage post_generate --pipeline-root workspace/pipelines/<node_key_safe>/<pipeline_id>/` を実行し、検証対象の `generation_id` を固定する場合は `--generation-id <generation_id>` を付与しなければならない。`exit code 0` を必須とする。`fail` 時は `generate_meta.json` の `verification_status=pass` を付与してはならない。
+- `pipeline_id` は `<slug>_<date>_<seq3>` 形式を必須とし、`slug` は `spec_id` 由来の短い可読 token、`date` は `YYYYMMDD`、`seq3` は同日内 3 桁連番とする。
+- `generation_id` は `gen_<date>_<seq3>` 形式を必須とし、`date` は `YYYYMMDD`、`seq3` は同日内 3 桁連番とする。
 - `Generate verify` は、`model` が `case_id` 分岐と固定数値代入のみで判定指標を構成する実装を検出した場合に `fail` とする。
 - `Generate verify` は `case.resolved.yaml` を入力として、記載された `test case set` の全 `case_id` と全展開 `case` が `runner` または `model` の実装経路から到達可能であることを検証しなければならない。未実装 `case`、到達不能分岐、固定 `case_id` 限定実装を検出した場合は `fail` とする。
 - `Generate verify` は `case.resolved.yaml` の実行時入力を `runner` と `model` が受理していることを検証しなければならない。少なくとも `case_id`、格子条件、時間条件、初期条件識別子、境界条件識別子、`profile` または `component` 選択結果、`tests.md` 由来の `test_profile_id` と `test_profile_version` に対応する入力伝播または記録経路を確認できない場合は `fail` とする。

@@ -26,9 +26,9 @@
 - **substep agent**: 単一 `substep` を担当するエージェント。input contract に従って artifact を生成し、`orchestration agent` へ返却する。
 - **node_key_safe**: `node_key` の保存用表記。推奨形式は `<spec_kind>__<spec_id>__<spec_version>`。
 - **orchestration_id**: 1 回の `workflow` 実行全体を識別する `ID`。`workspace/orchestrations/<orchestration_id>/` の保存キーとして使用する。
-- **plan_id**: `node` 単位で `case.resolved.yaml` と `algorithm.resolved.yaml` と `impl.resolved.yaml` と `dependency.resolved.yaml` の組を識別する `ID`。推奨形式は `<node_key_safe>_<case_hash12>_<algorithm_hash12>_<impl_hash12>`。
-- **pipeline_id**: `node` 単位の `Generate -> Build -> Execute` 系列を識別する `ID`。推奨形式は `<plan_id>_<utc_ts>_<seq3>`。
-- **generation_id / build_id / execution_id**: 各段階の試行を識別する `ID`。
+- **plan_id**: `node` 単位で `case.resolved.yaml` と `algorithm.resolved.yaml` と `impl.resolved.yaml` と `dependency.resolved.yaml` の組を識別する `ID`。推奨形式は `<slug>_<date>_<seq3>`。
+- **pipeline_id**: `node` 単位の `Generate -> Build -> Execute` 系列を識別する `ID`。推奨形式は `<slug>_<date>_<seq3>`。
+- **generation_id / build_id / execution_id**: 各段階の試行を識別する `ID`。推奨形式は `<prefix>_<date>_<seq3>`（`prefix` は `gen` / `build` / `exec`）。
 - **agent_run_id**: `step agent` / `substep agent` / `orchestration agent` の 1 回の実行を識別する `ID`。`parent_agent_run_id` と組で親子関係を表す。
 - **issue_severity**: 子 `agent` artifact の問題重大度。`minor` / `major` / `critical` の 3 値を使用する。
 - **repair_strategy**: 子 `agent` への再投入方針。`reuse` は同一 `agent_session_id` 継続修正、`restart` は新規 `agent_session_id` 再起動を表す。

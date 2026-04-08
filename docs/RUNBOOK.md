@@ -100,7 +100,7 @@
 14. **強制停止**: 入力不足または前段 artifact 不足で当該 phase を進められない場合、当該 phase を `fail` で停止する。推定補完や人工ファイル生成で進めてはならない。
 15. **記録**: `spec_version` / `test_profile_version` / `case_hash` / `impl_hash` / `git_sha` を保存する。
 - `plan_id` / `pipeline_id` / `generation_id` / `build_id` / `execution_id` を保存する。
-- `plan_id` は `case_hash12` と `algorithm_hash12` と `impl_hash12` を識別できる形式にする。
+- `plan_id` は `<slug>_<date>_<seq3>` 形式にする。`slug` は `spec_id` 由来の短い可読 token、`date` は `YYYYMMDD`、`seq3` は同日内 3 桁連番とする。
 - `node_key` / `topo_level` / `dependency_ref` を保存する。
 - `LLM` 利用ステージは各ステージの `<stage>_meta.json`（コード生成は `generate_meta.json`）に `attempt_count` / `verification_status` / `last_fail_reason` / `debug_mode` / `lint_command_ref` を保存する。
 - `step` / `substep` の `agent_runs.jsonl` は `agent_backend` / `agent_model` / `context_id` / `context_isolated=true` を記録する。

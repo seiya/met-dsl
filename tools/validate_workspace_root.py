@@ -35,6 +35,7 @@ ALLOWED_WORKSPACE_TOP_LEVEL_DIRS = {
 NODE_KEY_SAFE_PATTERN = re.compile(
     r"^[a-z][a-z0-9_]*__[a-z0-9][a-z0-9_]*__[0-9][0-9A-Za-z._-]*$"
 )
+SLUG_DATE_SEQ3_PATTERN = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*_[0-9]{8}_[0-9]{3}$")
 
 
 def _normalize_workspace_root_token(workspace_root: str) -> str:
@@ -238,10 +239,9 @@ def _scan_workspace_layout(workspace_root: Path) -> list[str]:
             for id_dir in sorted(node_safe_dir.iterdir()):
                 if not id_dir.is_dir():
                     continue
-                expected_prefix = node_safe + "_"
-                if not id_dir.name.startswith(expected_prefix):
+                if not SLUG_DATE_SEQ3_PATTERN.match(id_dir.name):
                     violations.append(
-                        f"{id_dir}: invalid {stage_root_name} id directory name; expected prefix {expected_prefix}"
+                        f"{id_dir}: invalid {stage_root_name} id directory name; expected <slug>_<YYYYMMDD>_<seq3>"
                     )
     return violations
 

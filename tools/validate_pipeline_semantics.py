@@ -119,6 +119,12 @@ _LINT_ALLOWED_PRESETS = frozenset({"fortitude", "cppcheck", "ruff", "mixed"})
 _NODE_KEY_SAFE_PATTERN_LINEAGE = re.compile(
     r"^[a-z][a-z0-9_]*__[a-z0-9][a-z0-9_]*__[0-9][0-9A-Za-z._-]*$"
 )
+_SLUG_DATE_SEQ3_PATTERN = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*_(\d{8})_(\d{3})$")
+_STAGE_DATE_SEQ3_PATTERNS: dict[str, re.Pattern[str]] = {
+    "gen": re.compile(r"^gen_(\d{8})_(\d{3})$"),
+    "build": re.compile(r"^build_(\d{8})_(\d{3})$"),
+    "exec": re.compile(r"^exec_(\d{8})_(\d{3})$"),
+}
 
 
 def _extract_launch_response_agent_session_id(payload: dict[str, Any]) -> str | None:
@@ -234,6 +240,21 @@ def _node_key_to_safe(node_key: str) -> str | None:
     if not spec_kind or not spec_id or not spec_version:
         return None
     return f"{spec_kind}__{spec_id}__{spec_version}"
+
+
+def _parse_slug_date_seq3_id(value: str) -> tuple[int, int] | None:
+    match = _SLUG_DATE_SEQ3_PATTERN.fullmatch(value.strip())
+    if not match:
+        return None
+    return int(match.group(1)), int(match.group(2))
+
+
+def _parse_stage_attempt_id(value: str, prefix: str) -> tuple[int, int] | None:
+    pattern = _STAGE_DATE_SEQ3_PATTERNS[prefix]
+    match = pattern.fullmatch(value.strip())
+    if not match:
+        return None
+    return int(match.group(1)), int(match.group(2))
 
 
 def _agent_role(item: dict[str, Any]) -> str | None:
@@ -1038,9 +1059,9 @@ def _validate_pipeline_lineage_presence(
                 violations.append(
                     f"{pipeline_dir.parent}: invalid node_key_safe directory name for lineage check"
                 )
-            elif not pid.startswith(f"{node_safe_dir}_"):
+            elif _parse_slug_date_seq3_id(pid) is None:
                 violations.append(
-                    f"{lineage_path}:pipeline_id must start with {node_safe_dir + '_'}; got {pid!r}"
+                    f"{lineage_path}:pipeline_id must match <slug>_<YYYYMMDD>_<seq3>; got {pid!r}"
                 )
 
 
@@ -4589,10 +4610,18 @@ def _latest_generation_id(pipeline_dir: Path) -> str | None:
     gen_root = pipeline_dir / "generate"
     if not gen_root.is_dir():
         return None
-    gen_dirs = sorted(d for d in gen_root.iterdir() if d.is_dir())
-    if not gen_dirs:
+    latest_name: str | None = None
+    latest_key: tuple[int, int] | None = None
+    for gen_dir in sorted(d for d in gen_root.iterdir() if d.is_dir()):
+        parsed = _parse_stage_attempt_id(gen_dir.name, "gen")
+        if parsed is None:
+            continue
+        if latest_key is None or parsed > latest_key:
+            latest_key = parsed
+            latest_name = gen_dir.name
+    if latest_name is None:
         return None
-    return gen_dirs[-1].name
+    return latest_name
 
 
 def validate_post_generate_stage(
@@ -4620,6 +4649,11 @@ def validate_post_generate_stage(
     gen_id = generation_id or _latest_generation_id(pipeline_dir)
     if not gen_id:
         violations.append(f"{pipeline_dir / 'generate'}: no generation directory found")
+        return violations
+    if _parse_stage_attempt_id(gen_id, "gen") is None:
+        violations.append(
+            f"{pipeline_dir / 'generate' / gen_id}: invalid generation_id; expected gen_<YYYYMMDD>_<seq3>"
+        )
         return violations
 
     if plan_ref:
@@ -4676,6 +4710,11 @@ def validate_post_build_stage(
     gen_id = generation_id or _latest_generation_id(pipeline_dir)
     if not gen_id:
         violations.append(f"{pipeline_dir / 'generate'}: no generation directory found")
+        return violations
+    if _parse_stage_attempt_id(gen_id, "gen") is None:
+        violations.append(
+            f"{pipeline_dir / 'generate' / gen_id}: invalid generation_id; expected gen_<YYYYMMDD>_<seq3>"
+        )
         return violations
 
     src_dir = pipeline_dir / "generate" / gen_id / "src"

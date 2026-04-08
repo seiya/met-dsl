@@ -45,7 +45,7 @@ Plan ステージの生成責務を固定し、入力 spec から決定的な re
 - `Plan` 完了前に `python3 tools/check_artifact_syntax.py --expect-top object` を実行し、`case.resolved.yaml` と `algorithm.resolved.yaml` と `impl.resolved.yaml` と `dependency.resolved.yaml` と `derived_contract.json` と `plan_meta.json` が標準 parser で復元可能な mapping / object であることを確認しなければならない。
 
 ## 運用ルール
-1. `plan_id` を `<node_key_safe>_<case_hash12>_<algorithm_hash12>_<impl_hash12>` 形式で発行する。
+1. `plan_id` を `<slug>_<date>_<seq3>` 形式で発行する。`slug` は `spec_id` 由来の短い可読 token、`date` は `YYYYMMDD`、`seq3` は同日内 3 桁連番とする。
 2. 出力先は `workspace/plans/<node_key_safe>/<plan_id>/` に固定する。
 3. workflow artifact の保存先ルートは `workspace/` のみを許可し、workflow ルート判定は `workspace/` のみを対象とする。
 4. workflow 実行開始前に `workspace/` が存在しない場合、リポジトリルート直下へ `workspace/` を作成する。
