@@ -1326,6 +1326,16 @@ def record_agent_run(
             enforce_live_probe=False,
         )
 
+    agent_backend = payload.get("agent_backend")
+    if not isinstance(agent_backend, str) or not agent_backend.strip():
+        raise ValueError("agent_backend must be non-empty string")
+    backend_token = agent_backend.strip().lower()
+    if backend_token not in SUPPORTED_BACKENDS:
+        raise ValueError(
+            f"agent_backend must be one of {sorted(SUPPORTED_BACKENDS)}; got {agent_backend!r}"
+        )
+    payload["agent_backend"] = backend_token
+
     existing = _read_existing_run_ids(runs_path)
     if agent_run_id in existing:
         raise ValueError(f"duplicate agent_run_id: {agent_run_id}")

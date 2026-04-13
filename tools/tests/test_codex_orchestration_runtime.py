@@ -469,6 +469,7 @@ shell_tool                       stable             true
                     "agent_run_id": "orch_run_001",
                     "agent_role": "orchestration",
                     "status": "running",
+                    "agent_backend": "claude",
                     "started_at": "2026-03-11T00:00:00Z",
                 },
             )
@@ -483,7 +484,7 @@ shell_tool                       stable             true
                     "step": "plan",
                     "substep": "generate",
                     "status": "pass",
-                    "agent_backend": "openai_responses",
+                    "agent_backend": "codex",
                     "agent_model": "gpt-5-codex",
                     "context_id": "ctx_substep_plan_generate_001",
                     "agent_session_id": "sess_substep_plan_generate_001",
@@ -508,7 +509,7 @@ shell_tool                       stable             true
                     "node_key": "problem/shallow_water2d@0.3.0",
                     "step": "build",
                     "status": "pass",
-                    "agent_backend": "openai_responses",
+                    "agent_backend": "codex",
                     "agent_model": "gpt-5-codex",
                     "context_id": "ctx_step_build_001",
                     "agent_session_id": "sess_step_build_001",
@@ -1231,6 +1232,7 @@ shell_tool                       stable             true
                     "agent_run_id": "orch_run_001",
                     "agent_role": "orchestration",
                     "status": "running",
+                    "agent_backend": "claude",
                 },
             )
             record_launch(
@@ -1271,7 +1273,7 @@ shell_tool                       stable             true
                     "step": "plan",
                     "substep": "generate",
                     "status": "pass",
-                    "agent_backend": "openai_responses",
+                    "agent_backend": "codex",
                     "agent_model": "gpt-5-codex",
                     "context_id": "ctx_substep_plan_generate_001",
                     "agent_session_id": "sess_substep_plan_generate_001",
@@ -1317,7 +1319,7 @@ shell_tool                       stable             true
                     "agent_run_id": "orch_run_001",
                     "agent_role": "orchestration",
                     "status": "fail",
-                    "agent_backend": "openai_responses",
+                    "agent_backend": "claude",
                     "agent_model": "gpt-5-codex",
                     "context_id": "ctx_orch_run_001",
                     "result_summary": "compile diagnostics show missing dependency metadata",
@@ -1424,7 +1426,7 @@ shell_tool                       stable             true
                         "step": "build",
                         "node_key": "problem/shallow_water2d@0.3.0",
                         "status": "pass",
-                        "agent_backend": "openai_responses",
+                        "agent_backend": "codex",
                         "agent_model": "gpt-5-codex",
                         "context_id": "ctx_step_build_001",
                         "agent_session_id": "sess_step_build_999",
@@ -1455,7 +1457,7 @@ shell_tool                       stable             true
                 "agent_run_id": "orch_run_001",
                 "agent_role": "orchestration",
                 "status": "pass",
-                "agent_backend": "openai_responses",
+                "agent_backend": "claude",
                 "agent_model": "gpt-5-codex",
                 "context_id": "ctx_orch_run_001",
             }
@@ -1521,7 +1523,7 @@ shell_tool                       stable             true
                         "step": "build",
                         "node_key": "problem/shallow_water2d@0.3.0",
                         "status": "pass",
-                        "agent_backend": "openai_responses",
+                        "agent_backend": "codex",
                         "agent_model": "gpt-5-codex",
                         "context_id": "ctx_step_plan_001",
                         "agent_session_id": "sess_step_plan_001",
@@ -1632,6 +1634,7 @@ shell_tool                       stable             true
                         "agent_run_id": "orch_run_001",
                         "agent_role": "orchestration",
                         "status": "running",
+                        "agent_backend": "claude",
                         "started_at": "2026-03-11T00:00:00Z",
                     },
                 )
@@ -1670,7 +1673,7 @@ shell_tool                       stable             true
                         "step": "build",
                         "node_key": "problem/shallow_water2d@0.3.0",
                         "status": "pass",
-                        "agent_backend": "openai_responses",
+                        "agent_backend": "codex",
                         "agent_model": "gpt-5-codex",
                         "context_id": "ctx_step_build_001",
                         "agent_session_id": "sess_step_build_001",
@@ -1720,6 +1723,7 @@ shell_tool                       stable             true
                     "agent_run_id": "orch_run_001",
                     "agent_role": "orchestration",
                     "status": "running",
+                    "agent_backend": "claude",
                 },
             )
             record_launch(
@@ -1753,6 +1757,83 @@ shell_tool                       stable             true
                     orchestration_id="orch_001",
                     status="pass",
                 )
+
+    def test_record_agent_run_requires_agent_backend(self) -> None:
+        """agent_backend を含まないペイロードが ValueError を上げること。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            init_orchestration(repo_root=repo_root, orchestration_id="orch_001")
+            with self.assertRaisesRegex(ValueError, "agent_backend must be non-empty string"):
+                record_agent_run(
+                    repo_root=repo_root,
+                    orchestration_id="orch_001",
+                    payload={
+                        "agent_run_id": "orch_run_001",
+                        "agent_role": "orchestration",
+                        "status": "running",
+                    },
+                )
+
+    def test_record_agent_run_rejects_unknown_backend(self) -> None:
+        """agent_backend に未知のバックエンド名を指定すると ValueError を上げること。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            init_orchestration(repo_root=repo_root, orchestration_id="orch_001")
+            with self.assertRaisesRegex(ValueError, "agent_backend must be one of"):
+                record_agent_run(
+                    repo_root=repo_root,
+                    orchestration_id="orch_001",
+                    payload={
+                        "agent_run_id": "orch_run_001",
+                        "agent_role": "orchestration",
+                        "status": "running",
+                        "agent_backend": "unknown_backend",
+                    },
+                )
+
+    def test_record_agent_run_accepts_valid_backends(self) -> None:
+        """codex / cursor / claude がそれぞれ受け付けられること。"""
+        for backend in ("codex", "cursor", "claude"):
+            with self.subTest(backend=backend):
+                with tempfile.TemporaryDirectory() as tmp:
+                    repo_root = Path(tmp)
+                    init_orchestration(repo_root=repo_root, orchestration_id="orch_001")
+                    payload = record_agent_run(
+                        repo_root=repo_root,
+                        orchestration_id="orch_001",
+                        payload={
+                            "agent_run_id": f"orch_run_{backend}_001",
+                            "agent_role": "orchestration",
+                            "status": "running",
+                            "agent_backend": backend,
+                        },
+                    )
+                    self.assertEqual(payload["agent_backend"], backend)
+
+    def test_record_agent_run_normalizes_backend_to_lowercase(self) -> None:
+        """大文字混在・前後スペース付きの agent_backend が小文字・トリム済みに正規化されること。"""
+        cases = [
+            ("Claude", "claude"),
+            ("  Claude  ", "claude"),
+            ("CODEX", "codex"),
+            ("Cursor", "cursor"),
+        ]
+        for idx, (raw, expected) in enumerate(cases):
+            with self.subTest(raw=raw):
+                with tempfile.TemporaryDirectory() as tmp:
+                    repo_root = Path(tmp)
+                    init_orchestration(repo_root=repo_root, orchestration_id="orch_001")
+                    payload = record_agent_run(
+                        repo_root=repo_root,
+                        orchestration_id="orch_001",
+                        payload={
+                            "agent_run_id": f"orch_run_{idx:03d}",
+                            "agent_role": "orchestration",
+                            "status": "running",
+                            "agent_backend": raw,
+                        },
+                    )
+                    self.assertEqual(payload["agent_backend"], expected)
 
 
 if __name__ == "__main__":
