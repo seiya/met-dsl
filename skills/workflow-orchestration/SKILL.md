@@ -70,7 +70,7 @@ description: 対応 execution platform で `workflow` 全体を開始し、`orch
 17. workflow 終了時は `python3 tools/codex_orchestration_runtime.py set-status --repo-root <repo_root> --orchestration-id <orchestration_id> --status <status>` を実行し、`orchestration_meta.json` を終端状態へ更新する。
 18. `preflight.json` を手動編集または後編集して `status` と `can_launch_*` を変更してはならない。検査条件の変化は `preflight` 再実行でのみ反映する。
 19. `record-launch` 実行時に live preflight gate が `fail` の場合、当該起動を停止し、`set-status --status fail` のみを許可する。
-20. `Plan verify` / `Generate verify` / `Build` / `Execute` / `Judge` の各子 `agent` 完了記録において、`validate_pipeline_semantics.py` の該当 `--stage` 実行有無を `step_result.json` へ直接記録する契約は `codex_orchestration_runtime` に必須化していない。監査時は `agent.summary.txt` と MCP `command` ログを照合する。
+20. `Generate` / `Build` / `Execute` / `Judge` の各子 `agent` 完了記録において、`step_result.json` の `validation_stage` フィールドに `validate_pipeline_semantics.py` で実行した `--stage` 値を記録しなければならない。`status=pass` の `step_result` では、当該 `step` に対応する許容 `validation_stage` 値（`generate`: `post_generate`/`post_build`/`full`、`build`: `post_build`/`full`、`execute`: `post_execute`/`pre_judge`/`full`、`judge`: `pre_judge`/`full`）が記録されていない場合、`write-step-result` は失敗する。`Plan` および `Tune` の `step_result` には `validation_stage` を要求しない。
 
 ## 参照
 - 起動最小契約: `references/startup_contract.md`

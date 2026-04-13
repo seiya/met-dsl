@@ -962,6 +962,14 @@ def _validate_orchestration_completion_for_pass(
                 )
 
 
+STEP_REQUIRED_VALIDATION_STAGES: dict[str, frozenset[str]] = {
+    "generate": frozenset({"post_generate", "post_build", "full"}),
+    "build": frozenset({"post_build", "full"}),
+    "execute": frozenset({"post_execute", "pre_judge", "full"}),
+    "judge": frozenset({"pre_judge", "full"}),
+}
+
+
 def _validate_step_result_payload(
     repo_root: Path,
     orchestration_id: str,
@@ -972,10 +980,23 @@ def _validate_step_result_payload(
     payload: dict[str, Any],
 ) -> None:
     step_token = step.strip().lower()
+    status = payload.get("status")
+    status_token = status.strip().lower() if isinstance(status, str) else ""
+
+    # validation_stage チェック（generate/build/execute/judge の pass 時のみ）
+    if step_token in STEP_REQUIRED_VALIDATION_STAGES and status_token == "pass":
+        allowed = STEP_REQUIRED_VALIDATION_STAGES[step_token]
+        validation_stage = payload.get("validation_stage")
+        if not isinstance(validation_stage, str) or validation_stage.strip() not in allowed:
+            raise ValueError(
+                f"pass step_result for {step_token} requires validation_stage in "
+                f"{sorted(allowed)}; got {validation_stage!r}"
+            )
+
+    # 以下は既存の substep 検証（plan/generate/tune のみ）
     if step_token not in {"plan", "generate", "tune"}:
         return
-    status = payload.get("status")
-    if not isinstance(status, str) or status.strip().lower() != "pass":
+    if status_token != "pass":
         return
     substep_run_ids = payload.get("substep_agent_run_ids")
     if not isinstance(substep_run_ids, list) or not substep_run_ids:

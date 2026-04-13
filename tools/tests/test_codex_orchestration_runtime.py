@@ -545,6 +545,7 @@ shell_tool                       stable             true
                 agent_run_id="step_run_build_001",
                 payload={
                     "status": "pass",
+                    "validation_stage": "post_build",
                     "required_outputs": [
                         "workspace/pipelines/problem__shallow_water2d__0.3.0/problem__shallow_water2d__0.3.0_pl001/build/build_001/bin/simulate"
                     ],
@@ -1688,6 +1689,7 @@ shell_tool                       stable             true
                     agent_run_id="step_run_build_001",
                     payload={
                         "status": "pass",
+                        "validation_stage": "post_build",
                         "required_outputs": [
                             "workspace/pipelines/problem__shallow_water2d__0.3.0/problem__shallow_water2d__0.3.0_pl001/build/build_001/bin/simulate"
                         ],
@@ -1809,6 +1811,138 @@ shell_tool                       stable             true
                         },
                     )
                     self.assertEqual(payload["agent_backend"], backend)
+
+    def _setup_preflight_and_orch_agent(self, repo_root: Path) -> None:
+        """共通セットアップ: init_orchestration + write_preflight + orchestration record_agent_run。"""
+        init_orchestration(repo_root=repo_root, orchestration_id="orch_001")
+        write_preflight(
+            repo_root=repo_root,
+            orchestration_id="orch_001",
+            payload={
+                "status": "pass",
+                "can_launch_step_agents": True,
+                "can_launch_substep_agents": True,
+                "feature_states": {"multi_agent": True},
+                "checks": [{"name": "multi_agent_enabled", "pass": True}],
+            },
+        )
+        record_agent_run(
+            repo_root=repo_root,
+            orchestration_id="orch_001",
+            payload={
+                "agent_run_id": "orch_run_001",
+                "agent_role": "orchestration",
+                "status": "running",
+                "agent_backend": "claude",
+            },
+        )
+
+    def test_write_step_result_requires_validation_stage_for_build_pass(self) -> None:
+        """validation_stage のない pass build step_result が ValueError を上げること。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._setup_preflight_and_orch_agent(repo_root)
+            with self.assertRaisesRegex(ValueError, "validation_stage"):
+                write_step_result(
+                    repo_root=repo_root,
+                    orchestration_id="orch_001",
+                    node_key="problem/shallow_water2d@0.3.0",
+                    step="build",
+                    agent_run_id="step_run_build_001",
+                    payload={
+                        "status": "pass",
+                        "required_outputs": [
+                            "workspace/pipelines/problem__shallow_water2d__0.3.0/problem__shallow_water2d__0.3.0_pl001/build/build_001/bin/simulate"
+                        ],
+                        "failed_substeps": [],
+                        "substep_agent_run_ids": [],
+                    },
+                )
+
+    def test_write_step_result_accepts_valid_validation_stage_for_build(self) -> None:
+        """validation_stage="post_build" を持つ pass build step_result が通ること。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._setup_preflight_and_orch_agent(repo_root)
+            # validation_stage="post_build" を含む payload で write_step_result が成功することを確認
+            write_step_result(
+                repo_root=repo_root,
+                orchestration_id="orch_001",
+                node_key="problem/shallow_water2d@0.3.0",
+                step="build",
+                agent_run_id="step_run_build_001",
+                payload={
+                    "status": "pass",
+                    "validation_stage": "post_build",
+                    "required_outputs": [
+                        "workspace/pipelines/problem__shallow_water2d__0.3.0/problem__shallow_water2d__0.3.0_pl001/build/build_001/bin/simulate"
+                    ],
+                    "failed_substeps": [],
+                    "substep_agent_run_ids": [],
+                },
+            )
+
+    def test_write_step_result_requires_validation_stage_for_execute_pass(self) -> None:
+        """validation_stage のない pass execute step_result が ValueError を上げること。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._setup_preflight_and_orch_agent(repo_root)
+            with self.assertRaisesRegex(ValueError, "validation_stage"):
+                write_step_result(
+                    repo_root=repo_root,
+                    orchestration_id="orch_001",
+                    node_key="problem/shallow_water2d@0.3.0",
+                    step="execute",
+                    agent_run_id="step_run_execute_001",
+                    payload={
+                        "status": "pass",
+                        "required_outputs": [
+                            "workspace/pipelines/problem__shallow_water2d__0.3.0/problem__shallow_water2d__0.3.0_pl001/execute/run_001/results.json"
+                        ],
+                        "failed_substeps": [],
+                        "substep_agent_run_ids": [],
+                    },
+                )
+
+    def test_write_step_result_does_not_require_validation_stage_for_plan_pass(self) -> None:
+        """plan step の pass step_result には validation_stage を要求しないこと（後方互換）。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._setup_preflight_and_orch_agent(repo_root)
+            # substep record が必要なので agent_runs.jsonl に直接追記する
+            orch_root = repo_root / "workspace" / "orchestrations" / "orch_001"
+            runs_path = orch_root / "agent_runs.jsonl"
+            substep_record = {
+                "agent_run_id": "substep_run_plan_generate_001",
+                "parent_agent_run_id": "orch_run_001",
+                "agent_role": "substep",
+                "node_key": "problem/shallow_water2d@0.3.0",
+                "step": "plan",
+                "substep": "generate",
+                "status": "pass",
+                "agent_backend": "claude",
+                "output_refs": [
+                    "workspace/plans/problem__shallow_water2d__0.3.0/problem__shallow_water2d__0.3.0_plan001/case.resolved.yaml"
+                ],
+            }
+            with runs_path.open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps(substep_record) + "\n")
+            # plan step には validation_stage がなくても成功することを確認
+            write_step_result(
+                repo_root=repo_root,
+                orchestration_id="orch_001",
+                node_key="problem/shallow_water2d@0.3.0",
+                step="plan",
+                agent_run_id="orch_run_001",
+                payload={
+                    "status": "pass",
+                    "required_outputs": [
+                        "workspace/plans/problem__shallow_water2d__0.3.0/problem__shallow_water2d__0.3.0_plan001/case.resolved.yaml"
+                    ],
+                    "failed_substeps": [],
+                    "substep_agent_run_ids": ["substep_run_plan_generate_001"],
+                },
+            )
 
     def test_record_agent_run_normalizes_backend_to_lowercase(self) -> None:
         """大文字混在・前後スペース付きの agent_backend が小文字・トリム済みに正規化されること。"""
