@@ -1922,11 +1922,23 @@ shell_tool                       stable             true
                 "status": "pass",
                 "agent_backend": "claude",
                 "output_refs": [
-                    "workspace/plans/problem__shallow_water2d__0.3.0/problem__shallow_water2d__0.3.0_plan001/case.resolved.yaml"
+                    "workspace/plans/problem__shallow_water2d__0.3.0/problem__shallow_water2d__0.3.0_plan001/case.resolved.yaml",
+                    "workspace/plans/problem__shallow_water2d__0.3.0/problem__shallow_water2d__0.3.0_plan001/plan_meta.json",
                 ],
             }
             with runs_path.open("a", encoding="utf-8") as fh:
                 fh.write(json.dumps(substep_record) + "\n")
+            # plan_meta.json をディスクに作成する
+            plan_meta_path = repo_root / "workspace" / "plans" / "problem__shallow_water2d__0.3.0" / "problem__shallow_water2d__0.3.0_plan001" / "plan_meta.json"
+            plan_meta_path.parent.mkdir(parents=True, exist_ok=True)
+            plan_meta_path.write_text(
+                json.dumps({
+                    "attempt_count": 1,
+                    "verification_status": "pass",
+                    "context_isolated": True,
+                }),
+                encoding="utf-8",
+            )
             # plan step には validation_stage がなくても成功することを確認
             write_step_result(
                 repo_root=repo_root,
@@ -1937,7 +1949,8 @@ shell_tool                       stable             true
                 payload={
                     "status": "pass",
                     "required_outputs": [
-                        "workspace/plans/problem__shallow_water2d__0.3.0/problem__shallow_water2d__0.3.0_plan001/case.resolved.yaml"
+                        "workspace/plans/problem__shallow_water2d__0.3.0/problem__shallow_water2d__0.3.0_plan001/case.resolved.yaml",
+                        "workspace/plans/problem__shallow_water2d__0.3.0/problem__shallow_water2d__0.3.0_plan001/plan_meta.json",
                     ],
                     "failed_substeps": [],
                     "substep_agent_run_ids": ["substep_run_plan_generate_001"],
@@ -1968,6 +1981,176 @@ shell_tool                       stable             true
                         },
                     )
                     self.assertEqual(payload["agent_backend"], expected)
+
+
+    def test_write_step_result_requires_generate_meta_in_substep_outputs(self) -> None:
+        """generate pass step_result で generate_meta.json が substep output_refs にない場合 ValueError。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._setup_preflight_and_orch_agent(repo_root)
+            orch_root = repo_root / "workspace" / "orchestrations" / "orch_001"
+            runs_path = orch_root / "agent_runs.jsonl"
+            # substep record: generate_meta.json を含まない
+            substep_record = {
+                "agent_run_id": "substep_run_gen_verify_001",
+                "agent_role": "substep",
+                "node_key": "problem/shallow_water2d@0.3.0",
+                "step": "generate",
+                "substep": "verify",
+                "status": "pass",
+                "agent_backend": "claude",
+                "output_refs": [
+                    "workspace/pipelines/problem__shallow_water2d__0.3.0/problem__shallow_water2d__0.3.0_pl001/generate/gen_20260413_001/src/model.f90"
+                ],
+            }
+            with runs_path.open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps(substep_record) + "\n")
+            with self.assertRaisesRegex(ValueError, "generate_meta.json"):
+                write_step_result(
+                    repo_root=repo_root,
+                    orchestration_id="orch_001",
+                    node_key="problem/shallow_water2d@0.3.0",
+                    step="generate",
+                    agent_run_id="orch_run_001",
+                    payload={
+                        "status": "pass",
+                        "validation_stage": "post_generate",
+                        "required_outputs": [
+                            "workspace/pipelines/problem__shallow_water2d__0.3.0/problem__shallow_water2d__0.3.0_pl001/generate/gen_20260413_001/src/model.f90"
+                        ],
+                        "failed_substeps": [],
+                        "substep_agent_run_ids": ["substep_run_gen_verify_001"],
+                    },
+                )
+
+    def test_write_step_result_validates_generate_meta_required_keys(self) -> None:
+        """generate_meta.json に必須キーが欠けている場合 ValueError。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._setup_preflight_and_orch_agent(repo_root)
+            orch_root = repo_root / "workspace" / "orchestrations" / "orch_001"
+            runs_path = orch_root / "agent_runs.jsonl"
+            meta_ref = "workspace/pipelines/problem__shallow_water2d__0.3.0/problem__shallow_water2d__0.3.0_pl001/generate/gen_20260413_001/generate_meta.json"
+            # 不完全な generate_meta.json を作成（attempt_count のみ）
+            meta_path = repo_root / meta_ref
+            meta_path.parent.mkdir(parents=True, exist_ok=True)
+            meta_path.write_text(json.dumps({"attempt_count": 1}), encoding="utf-8")
+            substep_record = {
+                "agent_run_id": "substep_run_gen_verify_001",
+                "agent_role": "substep",
+                "node_key": "problem/shallow_water2d@0.3.0",
+                "step": "generate",
+                "substep": "verify",
+                "status": "pass",
+                "agent_backend": "claude",
+                "output_refs": [meta_ref],
+            }
+            with runs_path.open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps(substep_record) + "\n")
+            with self.assertRaisesRegex(ValueError, "missing required keys"):
+                write_step_result(
+                    repo_root=repo_root,
+                    orchestration_id="orch_001",
+                    node_key="problem/shallow_water2d@0.3.0",
+                    step="generate",
+                    agent_run_id="orch_run_001",
+                    payload={
+                        "status": "pass",
+                        "validation_stage": "post_generate",
+                        "required_outputs": [meta_ref],
+                        "failed_substeps": [],
+                        "substep_agent_run_ids": ["substep_run_gen_verify_001"],
+                    },
+                )
+
+    def test_write_step_result_validates_plan_meta_required_keys(self) -> None:
+        """plan_meta.json に必須キーが欠けている場合 ValueError。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._setup_preflight_and_orch_agent(repo_root)
+            orch_root = repo_root / "workspace" / "orchestrations" / "orch_001"
+            runs_path = orch_root / "agent_runs.jsonl"
+            meta_ref = "workspace/plans/problem__shallow_water2d__0.3.0/problem__shallow_water2d__0.3.0_plan001/plan_meta.json"
+            # 不完全な plan_meta.json（verification_status が欠けている）
+            meta_path = repo_root / meta_ref
+            meta_path.parent.mkdir(parents=True, exist_ok=True)
+            meta_path.write_text(json.dumps({"attempt_count": 1, "context_isolated": True}), encoding="utf-8")
+            substep_record = {
+                "agent_run_id": "substep_run_plan_generate_001",
+                "agent_role": "substep",
+                "node_key": "problem/shallow_water2d@0.3.0",
+                "step": "plan",
+                "substep": "generate",
+                "status": "pass",
+                "agent_backend": "claude",
+                "output_refs": [meta_ref],
+            }
+            with runs_path.open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps(substep_record) + "\n")
+            with self.assertRaisesRegex(ValueError, "missing required keys"):
+                write_step_result(
+                    repo_root=repo_root,
+                    orchestration_id="orch_001",
+                    node_key="problem/shallow_water2d@0.3.0",
+                    step="plan",
+                    agent_run_id="orch_run_001",
+                    payload={
+                        "status": "pass",
+                        "required_outputs": [meta_ref],
+                        "failed_substeps": [],
+                        "substep_agent_run_ids": ["substep_run_plan_generate_001"],
+                    },
+                )
+
+    def test_write_step_result_accepts_valid_generate_meta(self) -> None:
+        """必須キーがすべて揃った generate_meta.json を含む pass generate step_result が成功する。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._setup_preflight_and_orch_agent(repo_root)
+            orch_root = repo_root / "workspace" / "orchestrations" / "orch_001"
+            runs_path = orch_root / "agent_runs.jsonl"
+            meta_ref = "workspace/pipelines/problem__shallow_water2d__0.3.0/problem__shallow_water2d__0.3.0_pl001/generate/gen_20260413_001/generate_meta.json"
+            # 完全な generate_meta.json を作成
+            meta_path = repo_root / meta_ref
+            meta_path.parent.mkdir(parents=True, exist_ok=True)
+            meta_path.write_text(
+                json.dumps({
+                    "attempt_count": 1,
+                    "verification_status": "pass",
+                    "last_fail_reason": None,
+                    "debug_mode": False,
+                    "context_isolated": True,
+                }),
+                encoding="utf-8",
+            )
+            substep_record = {
+                "agent_run_id": "substep_run_gen_verify_001",
+                "agent_role": "substep",
+                "node_key": "problem/shallow_water2d@0.3.0",
+                "step": "generate",
+                "substep": "verify",
+                "status": "pass",
+                "agent_backend": "claude",
+                "output_refs": [meta_ref],
+            }
+            with runs_path.open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps(substep_record) + "\n")
+            # 例外なく完了することを確認
+            result = write_step_result(
+                repo_root=repo_root,
+                orchestration_id="orch_001",
+                node_key="problem/shallow_water2d@0.3.0",
+                step="generate",
+                agent_run_id="orch_run_001",
+                payload={
+                    "status": "pass",
+                    "validation_stage": "post_generate",
+                    "required_outputs": [meta_ref],
+                    "failed_substeps": [],
+                    "substep_agent_run_ids": ["substep_run_gen_verify_001"],
+                },
+            )
+            self.assertEqual(result.get("status"), "pass")
 
 
 if __name__ == "__main__":

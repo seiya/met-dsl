@@ -962,6 +962,15 @@ def _validate_orchestration_completion_for_pass(
                 )
 
 
+_STEP_META_REQUIRED_KEYS: dict[str, tuple[str, ...]] = {
+    "generate": ("attempt_count", "verification_status", "last_fail_reason", "debug_mode", "context_isolated"),
+    "plan": ("attempt_count", "verification_status", "context_isolated"),
+}
+_STEP_META_FILENAME: dict[str, str] = {
+    "generate": "generate_meta.json",
+    "plan": "plan_meta.json",
+}
+
 STEP_REQUIRED_VALIDATION_STAGES: dict[str, frozenset[str]] = {
     "generate": frozenset({"post_generate", "post_build", "full"}),
     "build": frozenset({"post_build", "full"}),
@@ -1024,6 +1033,38 @@ def _validate_step_result_payload(
         for output_ref in output_refs:
             if isinstance(output_ref, str) and output_ref.strip():
                 substep_outputs.add(output_ref.strip())
+
+    # meta ファイル検証（plan/generate の pass 時のみ）
+    if step_token in _STEP_META_REQUIRED_KEYS:
+        meta_filename = _STEP_META_FILENAME[step_token]
+        required_meta_keys = _STEP_META_REQUIRED_KEYS[step_token]
+        meta_ref = next(
+            (ref for ref in substep_outputs if ref.endswith(meta_filename)),
+            None,
+        )
+        if meta_ref is None:
+            raise ValueError(
+                f"pass step_result for {step_token} requires a substep output_ref ending in "
+                f"{meta_filename}"
+            )
+        meta_path = repo_root / meta_ref
+        if not meta_path.exists():
+            raise ValueError(
+                f"{meta_filename} not found at output_ref: {meta_ref}"
+            )
+        try:
+            meta_data = json.loads(meta_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as exc:
+            raise ValueError(
+                f"{meta_filename} is not valid JSON: {meta_ref}"
+            ) from exc
+        if not isinstance(meta_data, dict):
+            raise ValueError(f"{meta_filename} must be a JSON object: {meta_ref}")
+        missing_keys = [k for k in required_meta_keys if k not in meta_data]
+        if missing_keys:
+            raise ValueError(
+                f"{meta_filename} missing required keys: {missing_keys} (ref={meta_ref})"
+            )
 
     missing_outputs = sorted(ref for ref in declared_outputs if ref not in substep_outputs)
     if missing_outputs:
