@@ -17,6 +17,8 @@ from typing import Any, Callable
 
 TERMINAL_STATUSES = {"pass", "fail", "blocked", "timeout", "cancel"}
 SUPPORTED_BACKENDS = {"codex", "cursor", "claude"}
+VALID_REPAIR_STRATEGIES = frozenset({"none", "reuse", "restart"})
+VALID_ISSUE_SEVERITIES = frozenset({"none", "minor", "major", "critical"})
 
 # Must match tools/validate_workspace_root.py (canonical pipeline/plan id directory naming).
 _NODE_KEY_SAFE_PATTERN = re.compile(
@@ -777,6 +779,36 @@ def _validate_launch_request_payload(request_payload: dict[str, Any]) -> None:
             )
     if isinstance(dependency_ref, str) and _is_placeholder_ref(dependency_ref):
         raise ValueError("launch request dependency_ref must not contain placeholder tokens")
+
+    # repair_strategy / issue_severity の値検証
+    repair_strategy = str(request_payload.get("repair_strategy", "none")).strip()
+    if repair_strategy not in VALID_REPAIR_STRATEGIES:
+        raise ValueError(
+            f"launch request repair_strategy must be one of {sorted(VALID_REPAIR_STRATEGIES)}; "
+            f"got {repair_strategy!r}"
+        )
+
+    issue_severity = str(request_payload.get("issue_severity", "none")).strip()
+    if issue_severity not in VALID_ISSUE_SEVERITIES:
+        raise ValueError(
+            f"launch request issue_severity must be one of {sorted(VALID_ISSUE_SEVERITIES)}; "
+            f"got {issue_severity!r}"
+        )
+
+    # repair_strategy が reuse/restart のとき repair フィールドを必須にする
+    if repair_strategy in {"reuse", "restart"}:
+        repair_target = str(request_payload.get("repair_target_agent_run_id", "none")).strip()
+        if not repair_target or repair_target == "none":
+            raise ValueError(
+                "repair launch request requires non-empty repair_target_agent_run_id "
+                f"(repair_strategy={repair_strategy!r})"
+            )
+        repair_reason = str(request_payload.get("repair_reason", "none")).strip()
+        if not repair_reason or repair_reason == "none":
+            raise ValueError(
+                "repair launch request requires non-empty repair_reason "
+                f"(repair_strategy={repair_strategy!r})"
+            )
 
     is_verify_substep = (
         isinstance(step, str)

@@ -2153,5 +2153,121 @@ shell_tool                       stable             true
             self.assertEqual(result.get("status"), "pass")
 
 
+    def _minimal_preflight_setup(self, repo_root: Path) -> None:
+        """orchestration / preflight / orchestration agent run を最小構成でセットアップする。"""
+        init_orchestration(repo_root=repo_root, orchestration_id="orch_001")
+        write_preflight(
+            repo_root=repo_root,
+            orchestration_id="orch_001",
+            payload={
+                "status": "pass",
+                "can_launch_step_agents": True,
+                "can_launch_substep_agents": True,
+                "feature_states": {"multi_agent": True},
+                "checks": [{"name": "multi_agent_enabled", "pass": True}],
+            },
+        )
+        record_agent_run(
+            repo_root=repo_root,
+            orchestration_id="orch_001",
+            payload={
+                "agent_run_id": "orch_run_001",
+                "agent_role": "orchestration",
+                "status": "running",
+                "agent_backend": "claude",
+            },
+        )
+
+    def _minimal_request_payload(self, **overrides: object) -> dict[str, object]:
+        """repair_strategy / issue_severity テスト用の最小 request_payload を返す。
+        node_key / step を含まないことで plan_ref の canonical format 検証をスキップする。
+        """
+        base: dict[str, object] = {
+            "orchestration_id": "orch_001",
+            "agent_run_id": "step_run_repair_001",
+            "parent_agent_run_id": "orch_run_001",
+            "plan_ref": "workspace/plans/problem__shallow_water2d__0.3.0/swec-plan_20260413_001",
+            "pipeline_ref": "workspace/pipelines/problem__shallow_water2d__0.3.0/swec-pl_20260413_001",
+            "dependency_ref": "workspace/plans/problem__shallow_water2d__0.3.0/swec-plan_20260413_001/dependency.resolved.yaml",
+            "issue_severity": "none",
+            "repair_strategy": "none",
+            "repair_target_agent_run_id": "none",
+            "repair_reason": "none",
+            "launch_prompt_full": "orchestration summary for repair validation test\nstatus: running\n",
+        }
+        base.update(overrides)
+        return base
+
+    def test_record_launch_rejects_invalid_repair_strategy(self) -> None:
+        """repair_strategy に未定義の値を渡すと ValueError が発生すること。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._minimal_preflight_setup(repo_root)
+            with self.assertRaisesRegex(ValueError, "repair_strategy"):
+                record_launch(
+                    repo_root=repo_root,
+                    orchestration_id="orch_001",
+                    parent_agent_run_id="orch_run_001",
+                    child_agent_run_id="step_run_repair_001",
+                    request_payload=self._minimal_request_payload(repair_strategy="retry"),
+                    response_payload=_spawn_response_payload("sess_step_repair_001"),
+                )
+
+    def test_record_launch_rejects_invalid_issue_severity(self) -> None:
+        """issue_severity に未定義の値を渡すと ValueError が発生すること。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._minimal_preflight_setup(repo_root)
+            with self.assertRaisesRegex(ValueError, "issue_severity"):
+                record_launch(
+                    repo_root=repo_root,
+                    orchestration_id="orch_001",
+                    parent_agent_run_id="orch_run_001",
+                    child_agent_run_id="step_run_repair_001",
+                    request_payload=self._minimal_request_payload(issue_severity="blocker"),
+                    response_payload=_spawn_response_payload("sess_step_repair_001"),
+                )
+
+    def test_record_launch_requires_repair_target_for_reuse(self) -> None:
+        """repair_strategy=reuse で repair_target_agent_run_id が "none" のとき ValueError。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._minimal_preflight_setup(repo_root)
+            with self.assertRaisesRegex(ValueError, "repair_target_agent_run_id"):
+                record_launch(
+                    repo_root=repo_root,
+                    orchestration_id="orch_001",
+                    parent_agent_run_id="orch_run_001",
+                    child_agent_run_id="step_run_repair_001",
+                    request_payload=self._minimal_request_payload(
+                        issue_severity="minor",
+                        repair_strategy="reuse",
+                        repair_target_agent_run_id="none",
+                        repair_reason="fix indentation",
+                    ),
+                    response_payload=_spawn_response_payload("sess_step_repair_001"),
+                )
+
+    def test_record_launch_accepts_none_strategy_without_repair_fields(self) -> None:
+        """repair_strategy=none では repair_target と repair_reason が "none" でも成功する。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._minimal_preflight_setup(repo_root)
+            # repair_strategy=none では repair フィールドが "none" でも成功すること
+            result = record_launch(
+                repo_root=repo_root,
+                orchestration_id="orch_001",
+                parent_agent_run_id="orch_run_001",
+                child_agent_run_id="step_run_repair_001",
+                request_payload=self._minimal_request_payload(
+                    repair_strategy="none",
+                    repair_target_agent_run_id="none",
+                    repair_reason="none",
+                ),
+                response_payload=_spawn_response_payload("sess_step_repair_001"),
+            )
+            self.assertIsInstance(result, dict)
+
+
 if __name__ == "__main__":
     unittest.main()
