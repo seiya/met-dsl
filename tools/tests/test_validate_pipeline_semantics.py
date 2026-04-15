@@ -3433,5 +3433,138 @@ shallow_water2d_runner.o: shallow_water2d_runner.f90 shallow_water2d_model.mod
             self.assertEqual(violations, [])
 
 
+    def test_validate_rejects_all_zero_metrics_basis(self) -> None:
+        """metrics_basis.json の全数値が 0.0 のとき violation が発生すること。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            model_text = """module shallow_water2d_model
+use dynamics_shallow_water_flux_2d_rusanov_p0_model
+implicit none
+contains
+subroutine solve(flag)
+  logical, intent(out) :: flag
+  call dynamics_shallow_water_flux_2d_rusanov_p0__compute_flux(flag)
+end subroutine solve
+end module shallow_water2d_model
+"""
+            runner_text = """program shallow_water2d_runner
+implicit none
+write(*,*) 'ok'
+end program shallow_water2d_runner
+"""
+            _create_minimal_execution_tree(
+                repo_root,
+                dep_spec_id="dynamics_shallow_water_flux_2d_rusanov_p0",
+                model_text=model_text,
+                runner_text=runner_text,
+                run_command=["./simulate", "workspace/case.resolved.yaml", "workspace/outdir"],
+                metrics_basis={"value_a": 0.0, "value_b": 0.0},
+            )
+            violations = validate(repo_root, workspace_root="workspace")
+            self.assertTrue(
+                any("trivial placeholder" in v for v in violations),
+                f"Expected trivial placeholder violation, got: {violations}",
+            )
+
+    def test_validate_rejects_all_null_metrics_basis(self) -> None:
+        """metrics_basis.json の全フィールドが null のとき violation が発生すること。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            model_text = """module shallow_water2d_model
+use dynamics_shallow_water_flux_2d_rusanov_p0_model
+implicit none
+contains
+subroutine solve(flag)
+  logical, intent(out) :: flag
+  call dynamics_shallow_water_flux_2d_rusanov_p0__compute_flux(flag)
+end subroutine solve
+end module shallow_water2d_model
+"""
+            runner_text = """program shallow_water2d_runner
+implicit none
+write(*,*) 'ok'
+end program shallow_water2d_runner
+"""
+            _create_minimal_execution_tree(
+                repo_root,
+                dep_spec_id="dynamics_shallow_water_flux_2d_rusanov_p0",
+                model_text=model_text,
+                runner_text=runner_text,
+                run_command=["./simulate", "workspace/case.resolved.yaml", "workspace/outdir"],
+                metrics_basis={"value_a": None, "value_b": None},
+            )
+            violations = validate(repo_root, workspace_root="workspace")
+            self.assertTrue(
+                any("trivial placeholder" in v for v in violations),
+                f"Expected trivial placeholder violation, got: {violations}",
+            )
+
+    def test_validate_accepts_partially_nonzero_metrics_basis(self) -> None:
+        """metrics_basis.json の一部に非ゼロ実数値があれば通過すること。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            model_text = """module shallow_water2d_model
+use dynamics_shallow_water_flux_2d_rusanov_p0_model
+implicit none
+contains
+subroutine solve(flag)
+  logical, intent(out) :: flag
+  call dynamics_shallow_water_flux_2d_rusanov_p0__compute_flux(flag)
+end subroutine solve
+end module shallow_water2d_model
+"""
+            runner_text = """program shallow_water2d_runner
+implicit none
+write(*,*) 'ok'
+end program shallow_water2d_runner
+"""
+            _create_minimal_execution_tree(
+                repo_root,
+                dep_spec_id="dynamics_shallow_water_flux_2d_rusanov_p0",
+                model_text=model_text,
+                runner_text=runner_text,
+                run_command=["./simulate", "workspace/case.resolved.yaml", "workspace/outdir"],
+                metrics_basis={"value_a": 0.0, "value_b": 1.5},
+            )
+            violations = validate(repo_root, workspace_root="workspace")
+            self.assertFalse(
+                any("trivial placeholder" in v for v in violations),
+                f"Expected no trivial placeholder violation, got: {violations}",
+            )
+
+    def test_validate_skips_metrics_basis_check_if_no_numeric_fields(self) -> None:
+        """metrics_basis.json に数値フィールドが一切なければ trivial チェックをスキップする。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            model_text = """module shallow_water2d_model
+use dynamics_shallow_water_flux_2d_rusanov_p0_model
+implicit none
+contains
+subroutine solve(flag)
+  logical, intent(out) :: flag
+  call dynamics_shallow_water_flux_2d_rusanov_p0__compute_flux(flag)
+end subroutine solve
+end module shallow_water2d_model
+"""
+            runner_text = """program shallow_water2d_runner
+implicit none
+write(*,*) 'ok'
+end program shallow_water2d_runner
+"""
+            _create_minimal_execution_tree(
+                repo_root,
+                dep_spec_id="dynamics_shallow_water_flux_2d_rusanov_p0",
+                model_text=model_text,
+                runner_text=runner_text,
+                run_command=["./simulate", "workspace/case.resolved.yaml", "workspace/outdir"],
+                metrics_basis={"label": "test", "tags": ["a", "b"]},
+            )
+            violations = validate(repo_root, workspace_root="workspace")
+            self.assertFalse(
+                any("trivial placeholder" in v for v in violations),
+                f"Expected no trivial placeholder violation, got: {violations}",
+            )
+
+
 if __name__ == "__main__":
     unittest.main()

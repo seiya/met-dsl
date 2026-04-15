@@ -3689,6 +3689,60 @@ def _validate_tests_verdict_summary_consistency(
             )
 
 
+def _collect_numeric_leaves(obj: Any, _depth: int = 0) -> list[float | None]:
+    """JSON オブジェクト/配列から数値・null リーフを再帰収集する（深さ上限 8）。"""
+    if _depth > 8:
+        return []
+    if isinstance(obj, bool):
+        return []  # bool は int のサブクラスなので先にチェック
+    if isinstance(obj, (int, float)):
+        return [float(obj)]
+    if obj is None:
+        return [None]
+    if isinstance(obj, list):
+        result: list[float | None] = []
+        for item in obj:
+            result.extend(_collect_numeric_leaves(item, _depth + 1))
+        return result
+    if isinstance(obj, dict):
+        result = []
+        for v in obj.values():
+            result.extend(_collect_numeric_leaves(v, _depth + 1))
+        return result
+    return []
+
+
+def _validate_metrics_basis_not_trivial(
+    execution: NodeExecution,
+    violations: list[str],
+) -> None:
+    """metrics_basis.json が全ゼロ/全 null でないことを検証する。"""
+    metrics_path = execution.node_dir / "raw" / "metrics_basis.json"
+    if not metrics_path.exists():
+        return  # 存在チェックは _validate_raw_evidence が担当
+
+    try:
+        data = _read_json(metrics_path)
+    except json.JSONDecodeError:
+        return  # JSON 構文エラーは他の関数で処理済み
+
+    if not isinstance(data, dict):
+        return
+
+    numeric_values = _collect_numeric_leaves(data)
+    if not numeric_values:
+        return  # 数値フィールドが一切なければスキップ
+
+    non_trivial_count = sum(
+        1 for v in numeric_values if v is not None and v != 0.0
+    )
+    if non_trivial_count == 0:
+        violations.append(
+            f"{metrics_path}: all numeric fields are zero or null "
+            "(trivial placeholder detected)"
+        )
+
+
 def _validate_llm_semantic_review(
     repo_root: Path,
     execution: NodeExecution,
@@ -4773,6 +4827,7 @@ def validate(
         _validate_trial_meta(repo_root, execution, violations)
         _validate_execution_json_outputs(execution, violations)
         _validate_raw_evidence(repo_root, execution, violations)
+        _validate_metrics_basis_not_trivial(execution, violations)
         _validate_generate_outputs(repo_root, execution, violations)
         _validate_dependency_operation_usage(repo_root, execution, violations)
         _validate_runner_outputs(execution, violations)
