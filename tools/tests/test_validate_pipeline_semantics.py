@@ -45,9 +45,9 @@ def _step_prompt_fixture(orchestration_id: str, node_key: str, step: str, run_id
 orchestration_id: {orchestration_id}
 agent_run_id: {run_id}
 parent_agent_run_id: orch_run_001
-plan_ref: workspace/plans/problem__shallow_water2d__0.3.0/plan_test
-pipeline_ref: workspace/pipelines/problem__shallow_water2d__0.3.0/problem__shallow_water2d__0.3.0_test_pipeline
-dependency_ref: workspace/plans/problem__shallow_water2d__0.3.0/plan_test/dependency.resolved.yaml
+plan_ref: workspace/plans/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001
+pipeline_ref: workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001
+dependency_ref: workspace/plans/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/dependency.resolved.yaml
 skill_name: workflow-{step}
 skill_ref: skills/workflow-{step}/SKILL.md
 skill_must_read_refs: {refs}
@@ -75,9 +75,9 @@ def _substep_prompt_fixture(
 orchestration_id: {orchestration_id}
 agent_run_id: {run_id}
 parent_agent_run_id: orch_run_001
-plan_ref: workspace/plans/problem__shallow_water2d__0.3.0/plan_test
-pipeline_ref: workspace/pipelines/problem__shallow_water2d__0.3.0/problem__shallow_water2d__0.3.0_test_pipeline
-dependency_ref: workspace/plans/problem__shallow_water2d__0.3.0/plan_test/dependency.resolved.yaml
+plan_ref: workspace/plans/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001
+pipeline_ref: workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001
+dependency_ref: workspace/plans/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/dependency.resolved.yaml
 skill_name: workflow-{step}-{substep}
 skill_ref: skills/workflow-{step}-{substep}/SKILL.md
 skill_must_read_refs: {refs}
@@ -112,14 +112,14 @@ def _create_minimal_execution_tree(
 ) -> None:
     workspace = repo_root / "workspace"
     node_safe = "problem__shallow_water2d__0.3.0"
-    pipeline_id = "problem__shallow_water2d__0.3.0_test_pipeline"
+    pipeline_id = "shallow-water2d_20260415_001"
     exec_id = "exe_test_001"
 
     pipeline_dir = workspace / "pipelines" / node_safe / pipeline_id
     node_dir = pipeline_dir / "execute" / exec_id / "problem" / "shallow_water2d"
     raw_dir = node_dir / "raw"
     snapshots_dir = raw_dir / "state_snapshots"
-    src_dir = pipeline_dir / "generate" / "gen_test_001" / "src"
+    src_dir = pipeline_dir / "generate" / "gen_20260415_001" / "src"
     log_path = node_dir / "run_commands.jsonl"
 
     _write_json(
@@ -127,13 +127,13 @@ def _create_minimal_execution_tree(
         {
             "node_key": "problem/shallow_water2d@0.3.0",
             "pipeline_id": pipeline_id,
-            "plan_ref": "workspace/plans/problem__shallow_water2d__0.3.0/plan_test",
-            "dependency_ref": "workspace/plans/problem__shallow_water2d__0.3.0/plan_test/dependency.resolved.yaml",
+            "plan_ref": "workspace/plans/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001",
+            "dependency_ref": "workspace/plans/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/dependency.resolved.yaml",
         },
     )
     lint_command_id = "lint_cmd_fixture_001"
     rel_lint_log = (
-        f"workspace/pipelines/{node_safe}/{pipeline_id}/generate/gen_test_001/src/mcp_command_log.jsonl"
+        f"workspace/pipelines/{node_safe}/{pipeline_id}/generate/gen_20260415_001/src/mcp_command_log.jsonl"
     )
     if dependency_resolved is None:
         dependency_resolved = {
@@ -143,7 +143,7 @@ def _create_minimal_execution_tree(
             "topo_level": 1,
         }
     _write_json(
-        workspace / "plans" / "problem__shallow_water2d__0.3.0" / "plan_test" / "dependency.resolved.yaml",
+        workspace / "plans" / "problem__shallow_water2d__0.3.0" / "shallow-water2d_20260415_001" / "dependency.resolved.yaml",
         dependency_resolved,
     )
     if algorithm_contract is None:
@@ -179,7 +179,7 @@ def _create_minimal_execution_tree(
             },
         }
     _write_json(
-        workspace / "plans" / "problem__shallow_water2d__0.3.0" / "plan_test" / "algorithm.resolved.yaml",
+        workspace / "plans" / "problem__shallow_water2d__0.3.0" / "shallow-water2d_20260415_001" / "algorithm.resolved.yaml",
         algorithm_contract,
     )
     if derived_contract is None:
@@ -223,7 +223,7 @@ def _create_minimal_execution_tree(
             },
         }
     _write_json(
-        workspace / "plans" / "problem__shallow_water2d__0.3.0" / "plan_test" / "derived_contract.json",
+        workspace / "plans" / "problem__shallow_water2d__0.3.0" / "shallow-water2d_20260415_001" / "derived_contract.json",
         derived_contract,
     )
     if impl_resolved is None:
@@ -249,7 +249,7 @@ def _create_minimal_execution_tree(
             "backend_overrides": [],
         }
     _write_json(
-        workspace / "plans" / "problem__shallow_water2d__0.3.0" / "plan_test" / "impl.resolved.yaml",
+        workspace / "plans" / "problem__shallow_water2d__0.3.0" / "shallow-water2d_20260415_001" / "impl.resolved.yaml",
         impl_resolved,
     )
 
@@ -378,7 +378,7 @@ shallow_water2d_runner.o: shallow_water2d_runner.f90 shallow_water2d_model.mod
         encoding="utf-8",
     )
     _write_json(
-        pipeline_dir / "generate" / "gen_test_001" / "generate_meta.json",
+        pipeline_dir / "generate" / "gen_20260415_001" / "generate_meta.json",
         {
             "attempt_count": 1,
             "verification_status": "pass",
@@ -887,7 +887,7 @@ end program shallow_water2d_runner
                 / "workspace"
                 / "pipelines"
                 / "problem__shallow_water2d__0.3.0"
-                / "problem__shallow_water2d__0.3.0_test_pipeline"
+                / "shallow-water2d_20260415_001"
             )
 
             violations = validate(
@@ -979,7 +979,7 @@ end program shallow_water2d_runner
             )
             perf_path = (
                 repo_root
-                / "workspace/pipelines/problem__shallow_water2d__0.3.0/problem__shallow_water2d__0.3.0_test_pipeline/execute/exe_test_001/problem/shallow_water2d/perf.json"
+                / "workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/execute/exe_test_001/problem/shallow_water2d/perf.json"
             )
             perf_path.write_text('{"walltime_sec":.000002}\n', encoding="utf-8")
 
@@ -1212,7 +1212,7 @@ end program shallow_water2d_runner
                 / "workspace"
                 / "pipelines"
                 / "problem__shallow_water2d__0.3.0"
-                / "problem__shallow_water2d__0.3.0_test_pipeline"
+                / "shallow-water2d_20260415_001"
                 / "execute"
                 / "exe_test_001"
                 / "problem"
@@ -1314,7 +1314,7 @@ end program shallow_water2d_runner
                 / "workspace"
                 / "pipelines"
                 / "problem__shallow_water2d__0.3.0"
-                / "problem__shallow_water2d__0.3.0_test_pipeline"
+                / "shallow-water2d_20260415_001"
                 / "execute"
                 / "exe_test_001"
                 / "problem"
@@ -1409,7 +1409,7 @@ end program shallow_water2d_runner
                 / "workspace"
                 / "pipelines"
                 / "problem__shallow_water2d__0.3.0"
-                / "problem__shallow_water2d__0.3.0_test_pipeline"
+                / "shallow-water2d_20260415_001"
                 / "execute"
                 / "exe_test_001"
                 / "problem"
@@ -1474,7 +1474,7 @@ end program shallow_water2d_runner
                 / "workspace"
                 / "pipelines"
                 / "problem__shallow_water2d__0.3.0"
-                / "problem__shallow_water2d__0.3.0_test_pipeline"
+                / "shallow-water2d_20260415_001"
                 / "execute"
                 / "exe_test_001"
                 / "problem"
@@ -1485,9 +1485,9 @@ end program shallow_water2d_runner
                 / "workspace"
                 / "pipelines"
                 / "problem__shallow_water2d__0.3.0"
-                / "problem__shallow_water2d__0.3.0_test_pipeline"
+                / "shallow-water2d_20260415_001"
                 / "generate"
-                / "gen_test_001"
+                / "gen_20260415_001"
                 / "src"
             )
             trial_meta_path = node_dir / "trial_meta.json"
@@ -1562,7 +1562,7 @@ shallow_water2d_runner.o: shallow_water2d_runner.f90 shallow_water2d_model.mod
                 / "workspace"
                 / "pipelines"
                 / "problem__shallow_water2d__0.3.0"
-                / "problem__shallow_water2d__0.3.0_test_pipeline"
+                / "shallow-water2d_20260415_001"
                 / "execute"
                 / "exe_test_001"
                 / "problem"
@@ -1573,9 +1573,9 @@ shallow_water2d_runner.o: shallow_water2d_runner.f90 shallow_water2d_model.mod
                 / "workspace"
                 / "pipelines"
                 / "problem__shallow_water2d__0.3.0"
-                / "problem__shallow_water2d__0.3.0_test_pipeline"
+                / "shallow-water2d_20260415_001"
                 / "generate"
-                / "gen_test_001"
+                / "gen_20260415_001"
                 / "src"
             )
             trial_meta_path = node_dir / "trial_meta.json"
@@ -1638,7 +1638,7 @@ end program shallow_water2d_runner
                 / "workspace"
                 / "pipelines"
                 / "problem__shallow_water2d__0.3.0"
-                / "problem__shallow_water2d__0.3.0_test_pipeline"
+                / "shallow-water2d_20260415_001"
                 / "execute"
                 / "exe_test_001"
                 / "problem"
@@ -1729,7 +1729,7 @@ end program shallow_water2d_runner
                 / "workspace"
                 / "pipelines"
                 / "problem__shallow_water2d__0.3.0"
-                / "problem__shallow_water2d__0.3.0_test_pipeline"
+                / "shallow-water2d_20260415_001"
                 / "execute"
                 / "exe_test_001"
                 / "problem"
@@ -1853,7 +1853,7 @@ end program shallow_water2d_runner
                 / "workspace"
                 / "pipelines"
                 / "problem__shallow_water2d__0.3.0"
-                / "problem__shallow_water2d__0.3.0_test_pipeline"
+                / "shallow-water2d_20260415_001"
                 / "execute"
                 / "exe_test_001"
                 / "problem"
@@ -2188,7 +2188,7 @@ end program shallow_water2d_runner
                 / "workspace"
                 / "pipelines"
                 / "problem__shallow_water2d__0.3.0"
-                / "problem__shallow_water2d__0.3.0_test_pipeline"
+                / "shallow-water2d_20260415_001"
                 / "execute"
                 / "exe_test_001"
                 / "problem"
@@ -2706,7 +2706,7 @@ end program shallow_water2d_runner
                 / "workspace"
                 / "plans"
                 / "problem__shallow_water2d__0.3.0"
-                / "plan_test"
+                / "shallow-water2d_20260415_001"
                 / "algorithm.resolved.yaml"
             )
             algorithm_path.write_text(
@@ -3004,7 +3004,7 @@ end program shallow_water2d_runner
                 / "workspace"
                 / "pipelines"
                 / "problem__shallow_water2d__0.3.0"
-                / "problem__shallow_water2d__0.3.0_test_pipeline"
+                / "shallow-water2d_20260415_001"
                 / "lineage.json"
             ).unlink()
             violations = validate(repo_root=repo_root, workspace_root="workspace")
@@ -3124,7 +3124,7 @@ end program shallow_water2d_runner
             violations = validate_plan_stage(
                 repo_root,
                 "workspace",
-                "workspace/plans/problem__shallow_water2d__0.3.0/plan_test",
+                "workspace/plans/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001",
             )
             self.assertEqual(violations, [])
 
@@ -3197,8 +3197,8 @@ shallow_water2d_runner.o: shallow_water2d_runner.f90 shallow_water2d_model.mod
                 repo_root,
                 "workspace",
                 "workspace/pipelines/problem__shallow_water2d__0.3.0/"
-                "problem__shallow_water2d__0.3.0_test_pipeline",
-                generation_id="gen_test_001",
+                "shallow-water2d_20260415_001",
+                generation_id="gen_20260415_001",
             )
             self.assertEqual(violations, [])
 
@@ -3217,9 +3217,9 @@ shallow_water2d_runner.o: shallow_water2d_runner.f90 shallow_water2d_model.mod
                 / "workspace"
                 / "pipelines"
                 / "problem__shallow_water2d__0.3.0"
-                / "problem__shallow_water2d__0.3.0_test_pipeline"
+                / "shallow-water2d_20260415_001"
             )
-            log_path = pipeline_dir / "generate" / "gen_test_001" / "src" / "mcp_command_log.jsonl"
+            log_path = pipeline_dir / "generate" / "gen_20260415_001" / "src" / "mcp_command_log.jsonl"
             log_path.write_text(
                 json.dumps(
                     {
@@ -3237,8 +3237,8 @@ shallow_water2d_runner.o: shallow_water2d_runner.f90 shallow_water2d_model.mod
                 repo_root,
                 "workspace",
                 "workspace/pipelines/problem__shallow_water2d__0.3.0/"
-                "problem__shallow_water2d__0.3.0_test_pipeline",
-                generation_id="gen_test_001",
+                "shallow-water2d_20260415_001",
+                generation_id="gen_20260415_001",
             )
             self.assertTrue(
                 any("run_linter did not succeed" in v for v in violations), violations
@@ -3259,9 +3259,9 @@ shallow_water2d_runner.o: shallow_water2d_runner.f90 shallow_water2d_model.mod
                 / "workspace"
                 / "pipelines"
                 / "problem__shallow_water2d__0.3.0"
-                / "problem__shallow_water2d__0.3.0_test_pipeline"
+                / "shallow-water2d_20260415_001"
             )
-            log_path = pipeline_dir / "generate" / "gen_test_001" / "src" / "mcp_command_log.jsonl"
+            log_path = pipeline_dir / "generate" / "gen_20260415_001" / "src" / "mcp_command_log.jsonl"
             log_path.write_text(
                 json.dumps(
                     {
@@ -3279,8 +3279,8 @@ shallow_water2d_runner.o: shallow_water2d_runner.f90 shallow_water2d_model.mod
                 repo_root,
                 "workspace",
                 "workspace/pipelines/problem__shallow_water2d__0.3.0/"
-                "problem__shallow_water2d__0.3.0_test_pipeline",
-                generation_id="gen_test_001",
+                "shallow-water2d_20260415_001",
+                generation_id="gen_20260415_001",
             )
             self.assertTrue(
                 any("logged command does not match preset" in v for v in violations),
@@ -3427,10 +3427,54 @@ shallow_water2d_runner.o: shallow_water2d_runner.f90 shallow_water2d_model.mod
                 repo_root,
                 "workspace",
                 "workspace/pipelines/problem__shallow_water2d__0.3.0/"
-                "problem__shallow_water2d__0.3.0_test_pipeline",
-                generation_id="gen_test_001",
+                "shallow-water2d_20260415_001",
+                generation_id="gen_20260415_001",
             )
             self.assertEqual(violations, [])
+
+    def test_create_minimal_execution_tree_writes_metrics_basis_to_raw(self) -> None:
+        """metrics_basis 引数が raw/metrics_basis.json に反映されること（trivial 検証テストの前提）。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            model_text = """module shallow_water2d_model
+use dynamics_shallow_water_flux_2d_rusanov_p0_model
+implicit none
+contains
+subroutine solve(flag)
+  logical, intent(out) :: flag
+  call dynamics_shallow_water_flux_2d_rusanov_p0__compute_flux(flag)
+end subroutine solve
+end module shallow_water2d_model
+"""
+            runner_text = """program shallow_water2d_runner
+implicit none
+write(*,*) 'ok'
+end program shallow_water2d_runner
+"""
+            payload = {"probe": 3.25}
+            _create_minimal_execution_tree(
+                repo_root,
+                dep_spec_id="dynamics_shallow_water_flux_2d_rusanov_p0",
+                model_text=model_text,
+                runner_text=runner_text,
+                run_command=["./simulate", "workspace/case.resolved.yaml", "workspace/outdir"],
+                metrics_basis=payload,
+            )
+            metrics_path = (
+                repo_root
+                / "workspace"
+                / "pipelines"
+                / "problem__shallow_water2d__0.3.0"
+                / "shallow-water2d_20260415_001"
+                / "execute"
+                / "exe_test_001"
+                / "problem"
+                / "shallow_water2d"
+                / "raw"
+                / "metrics_basis.json"
+            )
+            self.assertTrue(metrics_path.is_file())
+            self.assertEqual(json.loads(metrics_path.read_text(encoding="utf-8")), payload)
 
 
     def test_validate_rejects_all_zero_metrics_basis(self) -> None:

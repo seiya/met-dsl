@@ -1130,12 +1130,12 @@ def _probe_codex_backend(
     version_proc = runner([command, "--version"], text=True, capture_output=True, check=False)
     features_proc = runner([command, "features", "list"], text=True, capture_output=True, check=False)
     features: dict[str, bool] = {}
-    features_available = features_proc.returncode == 0
+    features_list_available = features_proc.returncode == 0
     multi_agent_enabled = False
     if features_proc.returncode == 0:
         features = parse_feature_list(features_proc.stdout)
         multi_agent_enabled = features.get("multi_agent") is True
-    features_detail = features_proc.stdout.strip() or features_proc.stderr.strip()
+    features_list_detail = features_proc.stdout.strip() or features_proc.stderr.strip()
     checks = [
         {
             "name": f"{backend_token}_version_available",
@@ -1143,9 +1143,9 @@ def _probe_codex_backend(
             "detail": version_proc.stdout.strip() or version_proc.stderr.strip(),
         },
         {
-            "name": f"{backend_token}_features_available",
-            "pass": features_available,
-            "detail": features_detail,
+            "name": f"{backend_token}_features_list_available",
+            "pass": features_list_available,
+            "detail": features_list_detail,
         },
         {
             "name": "multi_agent_enabled",
@@ -1154,6 +1154,55 @@ def _probe_codex_backend(
         },
     ]
     return checks, features, multi_agent_enabled, version_proc.stdout.strip()
+
+
+def _pass_values_by_check_name(checks: list[dict[str, Any]]) -> dict[str, Any]:
+    """各 check の `pass` を名前で引けるようにする。`pass` は bool または None（未実行スキップ）。"""
+    by_name: dict[str, Any] = {}
+    for item in checks:
+        if not isinstance(item, dict):
+            continue
+        name = item.get("name")
+        if isinstance(name, str):
+            by_name[name] = item.get("pass")
+    return by_name
+
+
+def _can_launch_from_help_fallback_checks(
+    backend_token: str, checks: list[dict[str, Any]]
+) -> bool:
+    """cursor/claude 用。`features list` が無くても `--help` が通れば起動可能とみなす。"""
+    passes = _pass_values_by_check_name(checks)
+    version_ok = passes.get(f"{backend_token}_version_available") is True
+    features_list_ok = passes.get(f"{backend_token}_features_list_available") is True
+    help_pass = passes.get(f"{backend_token}_help_probe_available")
+    multi_ok = passes.get("multi_agent_enabled") is True
+    # `pass` が None のときは --help を実行していない（features list で multi_agent 確定済み）。
+    # その場合は `features_list_ok` に委ね、`None` を黙って False 相当にしない。
+    help_confirms_launch = help_pass is True
+    return version_ok and multi_ok and (features_list_ok or help_confirms_launch)
+
+
+def _all_strict_boolean_probe_checks_pass(checks: list[dict[str, Any]]) -> bool:
+    """codex 等。`pass` キーは必須。値が None の check は未実行プローブとして評価から除外する。
+
+    明示的に False の `pass` は不合格。少なくとも 1 件は None 以外の `pass` が存在し、
+    それらがすべて True でなければならない。help fallback 由来の check 列を誤って渡した
+    場合でも、`pass: None` のみを黙って不合格にしない。
+    """
+    evaluated_any = False
+    for item in checks:
+        if not isinstance(item, dict):
+            return False
+        if "pass" not in item:
+            return False
+        p = item["pass"]
+        if p is None:
+            continue
+        evaluated_any = True
+        if p is not True:
+            return False
+    return evaluated_any
 
 
 def _probe_help_fallback_backend(
@@ -1165,9 +1214,10 @@ def _probe_help_fallback_backend(
     version_proc = runner([command, "--version"], text=True, capture_output=True, check=False)
     features_proc = runner([command, "features", "list"], text=True, capture_output=True, check=False)
     features: dict[str, bool] = {}
-    features_available = features_proc.returncode == 0
+    features_list_available = features_proc.returncode == 0
     multi_agent_enabled = False
-    features_detail = features_proc.stdout.strip() or features_proc.stderr.strip()
+    features_list_detail = features_proc.stdout.strip() or features_proc.stderr.strip()
+    help_proc: subprocess.CompletedProcess[str] | None = None
     if features_proc.returncode == 0:
         features = parse_feature_list(features_proc.stdout)
         multi_agent_enabled = features.get("multi_agent") is True
@@ -1177,16 +1227,31 @@ def _probe_help_fallback_backend(
         # Launch-time live preflight in `record_launch` remains the fail-safe.
         help_proc = runner([command, "--help"], text=True, capture_output=True, check=False)
         if help_proc.returncode == 0:
-            features_available = True
             multi_agent_enabled = True
             features = {"multi_agent": True}
-            help_detail = help_proc.stdout.strip() or help_proc.stderr.strip()
-            features_detail = (
+    if help_proc is None:
+        # Do not record pass=true for a probe that was not executed; launchability
+        # still uses features_list_ok in _can_launch_from_help_fallback_checks.
+        help_probe_pass: bool | None = None
+        help_probe_detail = (
+            "skipped; multi_agent was already confirmed from features list output "
+            "(no --help probe run)"
+        )
+    else:
+        help_probe_pass = help_proc.returncode == 0
+        help_detail = help_proc.stdout.strip() or help_proc.stderr.strip()
+        if help_probe_pass:
+            help_probe_detail = (
                 f"{backend_token} backend multi_agent could not be confirmed from features list; "
                 "fallback to --help succeeded"
             )
+            if features_list_detail:
+                help_probe_detail += f"\nfeatures list: {features_list_detail}"
             if help_detail:
-                features_detail += f"\n{help_detail}"
+                help_probe_detail += f"\n{help_detail}"
+        else:
+            help_probe_detail = help_detail or "(no stdout/stderr from --help)"
+
     checks = [
         {
             "name": f"{backend_token}_version_available",
@@ -1194,9 +1259,14 @@ def _probe_help_fallback_backend(
             "detail": version_proc.stdout.strip() or version_proc.stderr.strip(),
         },
         {
-            "name": f"{backend_token}_features_available",
-            "pass": features_available,
-            "detail": features_detail,
+            "name": f"{backend_token}_features_list_available",
+            "pass": features_list_available,
+            "detail": features_list_detail,
+        },
+        {
+            "name": f"{backend_token}_help_probe_available",
+            "pass": help_probe_pass,
+            "detail": help_probe_detail,
         },
         {
             "name": "multi_agent_enabled",
@@ -1249,7 +1319,10 @@ def probe_execution_platform(
     prober = _BACKEND_PROBERS[backend_token]
     checks, features, multi_agent_enabled, agent_version = prober(backend_token, command, runner)
 
-    can_launch_agents = all(c["pass"] for c in checks)
+    if backend_token in ("cursor", "claude"):
+        can_launch_agents = _can_launch_from_help_fallback_checks(backend_token, checks)
+    else:
+        can_launch_agents = _all_strict_boolean_probe_checks_pass(checks)
     return {
         "checked_at": _utc_now_iso(),
         "backend": backend_token,
