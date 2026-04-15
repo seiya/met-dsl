@@ -127,6 +127,10 @@
 31. `preflight.json` の手動編集または後編集で `status` と `can_launch_*` を変更してはならない。変更が必要な場合は `preflight` を再実行して新しい検査結果を記録しなければならない。
 32. 子 `agent` 起動直前の live probe が `fail` の場合、`record-launch` を実行してはならない。`orchestration_meta.status=fail` を記録して停止しなければならない。`record-agent-run`（`step` / `substep`）と `write-step-result` は `preflight.json` の整合確認を満たす場合のみ実行してよい。
 33. 子 `agent` 必須 phase で契約に反する近道へ逸脱しそうな場合、`orchestration agent` は当該 phase が子 `agent` 起動必須であることを明示し、正規の起動手順へ復帰しなければならない。逸脱を理由とするローカル継続実装を禁止する。
+34. `write-step-result` が `status=pass` で完了した後、`orchestration_checkpoint.json` が `tools/codex_orchestration_runtime.py` により自動更新される。`orchestration_checkpoint.json` の手動編集を禁止する。
+35. `resume_enabled=true` の orchestration において、`orchestration agent` は `check-step-completed` を各 `step` 起動前に実行し、`completed=true` かつ `integrity=ok` の場合のみ当該 `step` のスキップを許可する。
+36. チェックポイントによりスキップした `step` は `agent_runs.jsonl` に `agent_role=skipped_by_checkpoint` として記録しなければならない。
+37. `resume_enabled=false` の orchestration（未設定を含む）では `orchestration_checkpoint.json` を信頼して `step` をスキップしてはならない。`docs/workflow/WORKFLOW_CORE.md` の該当ハードニング規範における「明示的な指定」は `orchestration_meta.json` の `resume_enabled=true` のみが満たす。
 
 ## 判定基準
 - `workflow` ごとに `orchestration_id` が発行され、`orchestration_meta.json` が存在する。

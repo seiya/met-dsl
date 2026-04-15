@@ -40,7 +40,10 @@
 - **release artifact root**: 正式版 artifact の保存ルート。`releases/<spec_kind>/<domain>/<family>/<spec_id>/<target_architecture>/<toolchain_language>/<release_id>/` を canonical source とする。
 - **official_releases**: `spec_catalog.yaml` に保持する正式版実装の登録配列。`target_architecture`、`toolchain_language`、`target_backend`、`source_pipeline_id`、`source_generation_id`、`source_build_id`、`source_execution_id`、`artifact_root`、`promoted_at`、`status` を持つ。
 - **lineage.json**: `spec_ref`、`plan_ref`、`pipeline_id`、各段階 `ID` の関係を記録する来歴ファイル。
-- **orchestration_meta.json**: `orchestration` 実行メタデータ。`orchestration_id`、対象 `spec_ref`、`dependency_ref`、開始時刻、実行状態を記録する。
+- **orchestration_meta.json**: `orchestration` 実行メタデータ。`orchestration_id`、対象 `spec_ref`、`dependency_ref`、開始時刻、実行状態を記録する。チェックポイント再開を許可する場合は `resume_enabled`（真偽）と `resumed_at`（任意）を追加する。
+- **orchestration_checkpoint.json**: `pass` 完了済み `step` と `output_refs` の SHA-256 を保持する orchestration 証跡。`write-step-result` が `status=pass` で完了したときに `tools/codex_orchestration_runtime.py` により更新される。手動編集を禁止する。
+- **resume_enabled**: `orchestration_meta.json` の真偽フィールド。`true` の orchestration のみ `orchestration_checkpoint.json` をスキップ判定の入力として使用してよい。
+- **skipped_by_checkpoint**: `agent_runs.jsonl` の `agent_role` 値のひとつ。チェックポイント整合性が確認でき当該 `step` を起動しなかったことを記録する。
 - **agent_graph.json**: `orchestration` における `agent` 親子関係。`parent_agent_run_id` と `child_agent_run_id` と `relation_type` を記録する。
 - **context_id**: `LLM` 実行コンテキスト識別子。`step agent` / `substep agent` ごとに固有値を持ち、同一 `orchestration_id` 内で重複を禁止する。
 - **context_isolated**: `step agent` / `substep agent` が独立コンテキストで実行されたことを示す真偽値。`true` を必須とする。

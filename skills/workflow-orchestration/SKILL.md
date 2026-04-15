@@ -49,6 +49,9 @@ description: 対応 execution platform で `workflow` 全体を開始し、`orch
 - 再投入時の起動要求には、`issue_severity` と `repair_strategy` と `repair_target_agent_run_id` と `repair_reason` を必須記録しなければならない。
 - 再投入時は `repair_strategy` を問わず新規 `agent_run_id` を発行し、`repair_strategy=reuse` の場合のみ `agent_session_id` 再利用を許可する。
 - `substep` を持つ phase の `write-step-result` において、`substep_agent_run_ids` は当該 `step` の `agent_runs.jsonl` 上の全 `substep` を欠落なく列挙しなければならない。終端 `status` が `pass` 以外の `substep` であっても `agent_run_id` を省略してはならない。補足は `docs/ORCHESTRATION.md` の運用ルール 20 と `docs/RUNBOOK.md` 1-3 を参照する。
+- `orchestration_checkpoint.json` は `write-step-result` が `status=pass` で完了した後に `tools/codex_orchestration_runtime.py` により自動更新される。`orchestration_checkpoint.json` を手動編集してはならない。
+- `resume_enabled=true` を設定した orchestration では、`check-step-completed` の結果のみをスキップ判定の canonical source とする。`step_result.json` の直接参照でスキップを判断してはならない。
+- `verify-checkpoint-integrity` で `stale` が検出された `step` をスキップしてはならない。
 
 ## 運用ルール
 1. `python3 tools/codex_orchestration_runtime.py init --repo-root <repo_root> --orchestration-id <orchestration_id> --spec-ref <spec_ref> --dependency-ref <dependency_ref>` を実行し、`workspace/orchestrations/<orchestration_id>/` を初期化する。
@@ -68,9 +71,10 @@ description: 対応 execution platform で `workflow` 全体を開始し、`orch
 15. 契約に反する近道を取りたくなった場合は、子 `agent` 起動必須であることを `commentary` で明示し、launch 手順へ戻る。ローカル実装を継続してはならない。
 16. 標準 `substep` を持たない phase では `step agent` 完了後に、`substep` を持つ phase では `orchestration agent` 集約完了後に、`python3 tools/codex_orchestration_runtime.py write-step-result --repo-root <repo_root> --orchestration-id <orchestration_id> --node-key <node_key> --step <step> --agent-run-id <agent_run_id> --result-json '<json>'` を実行する。再投入を実施した場合は `step_result.json` に `retry_decisions` を含める。`substep_agent_run_ids` には当該 `step` の `agent_runs.jsonl` に記録された **全** `substep` の `agent_run_id` を欠落なく含め、`fail` / `cancel` 等で終端した ID を省略してはならない。`status=pass` の `step_result` では列挙した各 `substep` が `pass` であることと `required_outputs` 被覆は従来どおり必須とする。
 17. workflow 終了時は `python3 tools/codex_orchestration_runtime.py set-status --repo-root <repo_root> --orchestration-id <orchestration_id> --status <status>` を実行し、`orchestration_meta.json` を終端状態へ更新する。
-18. `preflight.json` を手動編集または後編集して `status` と `can_launch_*` を変更してはならない。検査条件の変化は `preflight` 再実行でのみ反映する。
-19. `record-launch` 実行時に live preflight gate が `fail` の場合、当該起動を停止し、`set-status --status fail` のみを許可する。
-20. `Generate` / `Build` / `Execute` / `Judge` の各子 `agent` 完了記録において、`step_result.json` の `validation_stage` フィールドに `validate_pipeline_semantics.py` で実行した `--stage` 値を記録しなければならない。`status=pass` の `step_result` では、当該 `step` に対応する許容 `validation_stage` 値（`generate`: `post_generate`/`post_build`/`full`、`build`: `post_build`/`full`、`execute`: `post_execute`/`pre_judge`/`full`、`judge`: `pre_judge`/`full`）が記録されていない場合、`write-step-result` は失敗する。`Plan` および `Tune` の `step_result` には `validation_stage` を要求しない。
+18. `orchestration_meta.json` の `resume_enabled=true` が設定されている orchestration では、各 `step` / `node` の起動前に次の確認を行ってよい。`python3 tools/codex_orchestration_runtime.py check-step-completed --repo-root <repo_root> --orchestration-id <orchestration_id> --node-key <node_key> --step <step>` を実行する。`completed=true` かつ `integrity=ok` が返却された場合、当該 `step` の起動をスキップし、返却された `plan_ref` / `pipeline_ref` / `output_refs` を後続 `step` へ渡す。`completed=false` または整合性が失敗している場合、当該 `step` を通常どおり実行する。スキップした `step` は `python3 tools/codex_orchestration_runtime.py record-agent-run` で `agent_role=skipped_by_checkpoint` として新規 `agent_run_id` を発行し、`skipped_step` と `reason=checkpoint_integrity_ok` を含む最小限のエントリを `agent_runs.jsonl` へ追記しなければならない。`resume_enabled=false`（デフォルト）の orchestration では本ルールを適用せず、チェックポイントが存在しても全 `step` を新規実行しなければならない。
+19. `preflight.json` を手動編集または後編集して `status` と `can_launch_*` を変更してはならない。検査条件の変化は `preflight` 再実行でのみ反映する。
+20. `record-launch` 実行時に live preflight gate が `fail` の場合、当該起動を停止し、`set-status --status fail` のみを許可する。
+21. `Generate` / `Build` / `Execute` / `Judge` の各子 `agent` 完了記録において、`step_result.json` の `validation_stage` フィールドに `validate_pipeline_semantics.py` で実行した `--stage` 値を記録しなければならない。`status=pass` の `step_result` では、当該 `step` に対応する許容 `validation_stage` 値（`generate`: `post_generate`/`post_build`/`full`、`build`: `post_build`/`full`、`execute`: `post_execute`/`pre_judge`/`full`、`judge`: `pre_judge`/`full`）が記録されていない場合、`write-step-result` は失敗する。`Plan` および `Tune` の `step_result` には `validation_stage` を要求しない。
 
 ## 参照
 - 起動最小契約: `references/startup_contract.md`
@@ -95,5 +99,8 @@ description: 対応 execution platform で `workflow` 全体を開始し、`orch
 - 再投入を実施した場合、該当 `launch` 要求に `issue_severity` と `repair_strategy` と `repair_target_agent_run_id` と `repair_reason` が含まれている。
 - 子 `agent` の全 `launch` 要求に `skill_name` と `skill_ref` と `skill_must_read_refs` が含まれている。
 - `repair_strategy=reuse` と `repair_strategy=restart` の選択が、`ORCHESTRATION.md` の判定条件と一致している。
+- `resume_enabled=true` の orchestration で `check-step-completed` を使用した場合、スキップした `step` が `agent_runs.jsonl` に `agent_role=skipped_by_checkpoint` で記録されている。
+- スキップした `step` の `output_refs` が後続 `step` の `plan_ref` / `pipeline_ref` と整合している。
+- `verify-checkpoint-integrity` で `valid=false` が返却されたとき、該当 `step` を再実行している。
 - 子 `agent` 必須 phase で、child `agent` 起動前の phase artifact 直接編集、`MCP` 実行、検証目的の仮実装が存在しない。
 - `agent.summary.txt` が、単一行の定型 `pass` / `fail` のみではなく、最終状態と主要 `output_refs` または失敗原因を含んでいる。

@@ -4,11 +4,13 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
 import subprocess
 import sys
+import traceback
 from functools import lru_cache
 from datetime import datetime, timezone
 from pathlib import Path
@@ -65,6 +67,63 @@ def _write_text(path: Path, text: str) -> None:
 
 def _orchestration_root(repo_root: Path, orchestration_id: str) -> Path:
     return repo_root / "workspace" / "orchestrations" / orchestration_id
+
+
+def _checkpoint_path(repo_root: Path, orchestration_id: str) -> Path:
+    return _orchestration_root(repo_root, orchestration_id) / "orchestration_checkpoint.json"
+
+
+def _compute_sha256(path: Path) -> str:
+    """ファイルの SHA-256 ハッシュを "sha256:<hex>" 形式で返す。
+
+    ファイルが存在しない場合は "sha256:missing" を返す（エラーにしない）。
+    """
+    if not path.exists():
+        return "sha256:missing"
+    digest = hashlib.sha256()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(65536), b""):
+            digest.update(chunk)
+    return f"sha256:{digest.hexdigest()}"
+
+
+def _build_artifact_hashes(
+    repo_root: Path,
+    output_refs: list[str],
+) -> dict[str, str]:
+    """output_refs の各パスを repo_root 起点で解決し SHA-256 を計算する。"""
+    hashes: dict[str, str] = {}
+    for ref in output_refs:
+        if not isinstance(ref, str) or not ref.strip():
+            continue
+        r = ref.strip()
+        hashes[r] = _compute_sha256(repo_root / r)
+    return hashes
+
+
+def _load_checkpoint(
+    repo_root: Path,
+    orchestration_id: str,
+) -> dict[str, Any] | None:
+    """orchestration_checkpoint.json を読み込む。存在しない場合は None を返す。
+
+    JSON 構造が不正な場合は RuntimeError を送出する。
+    """
+    path = _checkpoint_path(repo_root, orchestration_id)
+    if not path.exists():
+        return None
+    try:
+        data = _read_json(path)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"orchestration_checkpoint.json is invalid JSON: {path}") from exc
+    if not isinstance(data, dict):
+        raise RuntimeError(f"orchestration_checkpoint.json must be object: {path}")
+    if data.get("orchestration_id") != orchestration_id:
+        raise RuntimeError(
+            "orchestration_checkpoint.json orchestration_id mismatch: "
+            f"expected {orchestration_id!r}, got {data.get('orchestration_id')!r}"
+        )
+    return data
 
 
 def _preflight_path(repo_root: Path, orchestration_id: str) -> Path:
@@ -600,6 +659,10 @@ def _validate_agent_summary_text(payload: dict[str, Any], summary_text: str) -> 
     text = summary_text.strip()
     if not text:
         raise ValueError("agent.summary.txt must be non-empty")
+    agent_role = payload.get("agent_role")
+    if isinstance(agent_role, str) and agent_role.strip().lower() == "skipped_by_checkpoint":
+        return
+
     non_empty_lines = [line.strip() for line in text.splitlines() if line.strip()]
     if len(non_empty_lines) < 2:
         raise ValueError("agent.summary.txt must not be single-line summary")
@@ -609,10 +672,6 @@ def _validate_agent_summary_text(payload: dict[str, Any], summary_text: str) -> 
         marker = f"status: {status.strip()}"
         if marker not in text:
             raise ValueError("agent.summary.txt must include final status line")
-
-    agent_role = payload.get("agent_role")
-    if isinstance(agent_role, str) and agent_role.strip().lower() == "orchestration":
-        return
 
     output_refs = payload.get("output_refs")
     if isinstance(output_refs, list) and any(isinstance(item, str) and item.strip() for item in output_refs):
@@ -650,6 +709,260 @@ def _node_key_to_safe(node_key: str) -> str:
     if not spec_kind or not spec_id or not spec_version:
         raise ValueError(f"invalid node_key: {node_key}")
     return f"{spec_kind}__{spec_id}__{spec_version}"
+
+
+def update_checkpoint(
+    repo_root: Path,
+    orchestration_id: str,
+    *,
+    node_key: str,
+    step: str,
+    agent_run_id: str,
+    result: dict[str, Any],
+) -> dict[str, Any]:
+    """write_step_result 完了後にチェックポイントへ完了エントリを追記/更新する。
+
+    status=pass の場合のみ記録する。それ以外は即時 return する。
+
+    既に同一 (node_key, step) のエントリが存在する場合は上書きする。
+    """
+    status = result.get("status")
+    if not isinstance(status, str) or status.strip().lower() != "pass":
+        return {}
+
+    node_safe = _node_key_to_safe(node_key)
+    output_refs: list[str] = []
+    required = result.get("required_outputs")
+    if isinstance(required, list) and required:
+        output_refs = [r.strip() for r in required if isinstance(r, str) and r.strip()]
+    if not output_refs:
+        raw = result.get("output_refs")
+        if isinstance(raw, list):
+            output_refs = [r.strip() for r in raw if isinstance(r, str) and r.strip()]
+
+    plan_ref = str(result.get("plan_ref") or "")
+    pipeline_ref = str(result.get("pipeline_ref") or "")
+
+    if not plan_ref or not pipeline_ref:
+        lr_ref = result.get("launch_request_ref")
+        if isinstance(lr_ref, str) and lr_ref.strip():
+            lr_path = repo_root / lr_ref.strip()
+            if lr_path.exists():
+                try:
+                    lr_data = _read_json(lr_path)
+                    if isinstance(lr_data, dict):
+                        plan_ref = plan_ref or str(lr_data.get("plan_ref") or "")
+                        pipeline_ref = pipeline_ref or str(
+                            lr_data.get("pipeline_ref") or ""
+                        )
+                except json.JSONDecodeError:
+                    pass
+
+    artifact_hashes = _build_artifact_hashes(repo_root, output_refs)
+
+    entry: dict[str, Any] = {
+        "node_key": node_key.strip(),
+        "node_key_safe": node_safe,
+        "step": step.strip().lower(),
+        "agent_run_id": agent_run_id.strip(),
+        "status": "pass",
+        "completed_at": _utc_now_iso(),
+        "plan_ref": plan_ref.strip(),
+        "pipeline_ref": pipeline_ref.strip(),
+        "output_refs": output_refs,
+        "artifact_hashes": artifact_hashes,
+    }
+
+    path = _checkpoint_path(repo_root, orchestration_id)
+    checkpoint = _load_checkpoint(repo_root, orchestration_id) or {
+        "orchestration_id": orchestration_id,
+        "schema_version": "1",
+        "completed_steps": [],
+    }
+
+    steps: list[dict[str, Any]] = list(checkpoint.get("completed_steps", []))
+    steps = [
+        s
+        for s in steps
+        if not (s.get("node_key") == entry["node_key"] and s.get("step") == entry["step"])
+    ]
+    steps.append(entry)
+    checkpoint["completed_steps"] = steps
+    checkpoint["last_updated_at"] = _utc_now_iso()
+
+    _write_json(path, checkpoint)
+    return entry
+
+
+def read_checkpoint(
+    repo_root: Path,
+    orchestration_id: str,
+) -> dict[str, Any] | None:
+    """orchestration_checkpoint.json を読んで返す。存在しない場合は None。"""
+    return _load_checkpoint(repo_root, orchestration_id)
+
+
+def verify_checkpoint_integrity(
+    repo_root: Path,
+    orchestration_id: str,
+) -> dict[str, Any]:
+    """チェックポイントの全 artifact ハッシュを再計算し整合性を検証する。"""
+    checkpoint = _load_checkpoint(repo_root, orchestration_id)
+    if checkpoint is None:
+        return {
+            "orchestration_id": orchestration_id,
+            "valid": False,
+            "error": "orchestration_checkpoint.json not found",
+            "steps": [],
+        }
+
+    step_results: list[dict[str, Any]] = []
+    all_ok = True
+
+    for entry in checkpoint.get("completed_steps", []):
+        node_key = entry.get("node_key", "")
+        step = entry.get("step", "")
+        stored_hashes: dict[str, str] = entry.get("artifact_hashes", {})
+        if not isinstance(stored_hashes, dict):
+            stored_hashes = {}
+        mismatches: list[dict[str, str]] = []
+        missing: list[str] = []
+
+        for ref, expected_hash in stored_hashes.items():
+            if not isinstance(ref, str):
+                continue
+            if not isinstance(expected_hash, str):
+                continue
+            if expected_hash == "sha256:missing":
+                missing.append(ref)
+                continue
+            actual_hash = _compute_sha256(repo_root / ref)
+            if actual_hash != expected_hash:
+                mismatches.append(
+                    {
+                        "ref": ref,
+                        "expected": expected_hash,
+                        "actual": actual_hash,
+                    }
+                )
+
+        if missing:
+            integrity = "missing_artifacts"
+            all_ok = False
+        elif mismatches:
+            integrity = "stale"
+            all_ok = False
+        else:
+            integrity = "ok"
+
+        step_results.append(
+            {
+                "node_key": node_key,
+                "step": step,
+                "integrity": integrity,
+                "mismatches": mismatches,
+                "missing_artifacts": missing,
+            }
+        )
+
+    return {
+        "orchestration_id": orchestration_id,
+        "valid": all_ok,
+        "steps": step_results,
+    }
+
+
+def check_step_completed(
+    repo_root: Path,
+    orchestration_id: str,
+    *,
+    node_key: str,
+    step: str,
+    verify_integrity: bool = True,
+) -> dict[str, Any] | None:
+    """指定 (node_key, step) の完了状況を返す。
+
+    未完了またはチェックポイントが存在しない場合は None を返す。
+    verify_integrity=True の場合はハッシュ検証を実施し、stale なら None を返す。
+    """
+    meta_path = _orchestration_root(repo_root, orchestration_id) / "orchestration_meta.json"
+    if meta_path.exists():
+        try:
+            meta = _read_json(meta_path)
+            if isinstance(meta, dict) and not meta.get("resume_enabled"):
+                return None
+        except json.JSONDecodeError:
+            return None
+    else:
+        return None
+
+    checkpoint = _load_checkpoint(repo_root, orchestration_id)
+    if checkpoint is None:
+        return None
+
+    node_key_norm = node_key.strip()
+    step_norm = step.strip().lower()
+
+    entry = next(
+        (
+            s
+            for s in checkpoint.get("completed_steps", [])
+            if s.get("node_key") == node_key_norm and s.get("step") == step_norm
+        ),
+        None,
+    )
+    if entry is None:
+        return None
+
+    if verify_integrity:
+        stored_hashes: dict[str, str] = entry.get("artifact_hashes", {})
+        if not isinstance(stored_hashes, dict):
+            return None
+        for ref, expected_hash in stored_hashes.items():
+            if not isinstance(ref, str) or not isinstance(expected_hash, str):
+                return None
+            if expected_hash == "sha256:missing":
+                continue
+            actual_hash = _compute_sha256(repo_root / ref)
+            if actual_hash != expected_hash:
+                return None
+
+    return {
+        "node_key": entry.get("node_key"),
+        "step": entry.get("step"),
+        "agent_run_id": entry.get("agent_run_id"),
+        "plan_ref": entry.get("plan_ref"),
+        "pipeline_ref": entry.get("pipeline_ref"),
+        "output_refs": entry.get("output_refs", []),
+        "completed_at": entry.get("completed_at"),
+        "integrity": "ok",
+    }
+
+
+def enable_checkpoint_resume(
+    repo_root: Path,
+    orchestration_id: str,
+) -> dict[str, Any]:
+    """orchestration_meta.json に resume_enabled=true を設定する。
+
+    orchestration が存在しない場合は RuntimeError を送出する。
+    """
+    meta_path = _orchestration_root(repo_root, orchestration_id) / "orchestration_meta.json"
+    if not meta_path.exists():
+        raise RuntimeError(
+            f"orchestration not found: {orchestration_id}. "
+            "Run 'init' before enabling checkpoint resume."
+        )
+    try:
+        meta = _read_json(meta_path)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"orchestration_meta.json is invalid: {meta_path}") from exc
+    if not isinstance(meta, dict):
+        raise RuntimeError(f"orchestration_meta.json is invalid: {meta_path}")
+    meta["resume_enabled"] = True
+    meta["resumed_at"] = _utc_now_iso()
+    _write_json(meta_path, meta)
+    return meta
 
 
 def _validate_canonical_workspace_root_ref(
@@ -1517,6 +1830,18 @@ def _read_existing_run_ids(path: Path) -> set[str]:
     return run_ids
 
 
+def _validate_skipped_by_checkpoint_payload(payload: dict[str, Any]) -> None:
+    for key in ("node_key", "step", "skipped_step", "reason", "checkpoint_agent_run_id"):
+        val = payload.get(key)
+        if not isinstance(val, str) or not val.strip():
+            raise ValueError(f"{key} must be non-empty string for skipped_by_checkpoint")
+    status = payload.get("status")
+    if not isinstance(status, str) or status.strip().lower() != "skipped":
+        raise ValueError("skipped_by_checkpoint requires status=skipped")
+    if payload["step"].strip().lower() != payload["skipped_step"].strip().lower():
+        raise ValueError("skipped_step must match step for skipped_by_checkpoint")
+
+
 def record_agent_run(
     repo_root: Path,
     orchestration_id: str,
@@ -1535,7 +1860,9 @@ def record_agent_run(
     role_token = role.strip().lower() if isinstance(role, str) and role.strip() else None
     if role_token is None:
         raise ValueError("agent_role must be non-empty string")
-    if role_token in {"step", "substep"}:
+    if role_token == "skipped_by_checkpoint":
+        _validate_skipped_by_checkpoint_payload(payload)
+    elif role_token in {"step", "substep"}:
         _require_preflight_launchable(
             repo_root,
             orchestration_id,
@@ -1641,6 +1968,24 @@ def write_step_result(
     )
 
     _write_json(result_path, result)
+
+    if result.get("status", "").strip().lower() == "pass":
+        try:
+            update_checkpoint(
+                repo_root,
+                orchestration_id,
+                node_key=node_key,
+                step=step,
+                agent_run_id=agent_run_id,
+                result=result,
+            )
+        except Exception:
+            print(
+                f"[WARN] checkpoint update failed for {node_key}/{step}: "
+                + traceback.format_exc(),
+                file=sys.stderr,
+            )
+
     return result
 
 
@@ -1687,6 +2032,11 @@ def main(argv: list[str] | None = None) -> int:
     init_parser.add_argument("--spec-ref")
     init_parser.add_argument("--dependency-ref")
     init_parser.add_argument("--status", default="running")
+    init_parser.add_argument(
+        "--resume-from-checkpoint",
+        action="store_true",
+        help="Enable checkpoint resume on an existing orchestration (sets resume_enabled).",
+    )
 
     preflight_parser = subparsers.add_parser("preflight")
     preflight_parser.add_argument("--repo-root", required=True)
@@ -1723,17 +2073,42 @@ def main(argv: list[str] | None = None) -> int:
     status_parser.add_argument("--orchestration-id", required=True)
     status_parser.add_argument("--status", required=True)
 
+    read_cp_parser = subparsers.add_parser("read-checkpoint")
+    read_cp_parser.add_argument("--repo-root", required=True)
+    read_cp_parser.add_argument("--orchestration-id", required=True)
+
+    verify_cp_parser = subparsers.add_parser("verify-checkpoint-integrity")
+    verify_cp_parser.add_argument("--repo-root", required=True)
+    verify_cp_parser.add_argument("--orchestration-id", required=True)
+
+    check_step_parser = subparsers.add_parser("check-step-completed")
+    check_step_parser.add_argument("--repo-root", required=True)
+    check_step_parser.add_argument("--orchestration-id", required=True)
+    check_step_parser.add_argument("--node-key", required=True)
+    check_step_parser.add_argument("--step", required=True)
+    check_step_parser.add_argument(
+        "--skip-integrity-check",
+        action="store_true",
+        help="Skip artifact hash verification (testing only).",
+    )
+
     args = parser.parse_args(argv)
     repo_root = Path(getattr(args, "repo_root")).resolve()
 
     if args.command == "init":
-        result = init_orchestration(
-            repo_root=repo_root,
-            orchestration_id=args.orchestration_id,
-            spec_ref=args.spec_ref,
-            dependency_ref=args.dependency_ref,
-            status=args.status,
-        )
+        if getattr(args, "resume_from_checkpoint", False):
+            result = enable_checkpoint_resume(
+                repo_root=repo_root,
+                orchestration_id=args.orchestration_id,
+            )
+        else:
+            result = init_orchestration(
+                repo_root=repo_root,
+                orchestration_id=args.orchestration_id,
+                spec_ref=args.spec_ref,
+                dependency_ref=args.dependency_ref,
+                status=args.status,
+            )
     elif args.command == "preflight":
         agent_command = args.agent_command
         if not isinstance(agent_command, str) or not agent_command.strip():
@@ -1775,12 +2150,42 @@ def main(argv: list[str] | None = None) -> int:
             agent_run_id=args.agent_run_id,
             payload=args.result_json,
         )
-    else:
+    elif args.command == "read-checkpoint":
+        loaded = read_checkpoint(repo_root=repo_root, orchestration_id=args.orchestration_id)
+        result = (
+            loaded
+            if loaded is not None
+            else {"orchestration_id": args.orchestration_id, "completed_steps": []}
+        )
+    elif args.command == "verify-checkpoint-integrity":
+        result = verify_checkpoint_integrity(
+            repo_root=repo_root,
+            orchestration_id=args.orchestration_id,
+        )
+    elif args.command == "check-step-completed":
+        info = check_step_completed(
+            repo_root=repo_root,
+            orchestration_id=args.orchestration_id,
+            node_key=args.node_key,
+            step=args.step,
+            verify_integrity=not args.skip_integrity_check,
+        )
+        if info:
+            result = {"completed": True, **info}
+        else:
+            result = {
+                "completed": False,
+                "node_key": args.node_key,
+                "step": args.step.strip().lower(),
+            }
+    elif args.command == "set-status":
         result = update_orchestration_status(
             repo_root=repo_root,
             orchestration_id=args.orchestration_id,
             status=args.status,
         )
+    else:
+        raise RuntimeError(f"unhandled command: {args.command}")
 
     json.dump(result, sys.stdout, ensure_ascii=False, indent=2)
     sys.stdout.write("\n")

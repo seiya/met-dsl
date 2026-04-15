@@ -3,17 +3,25 @@
 
 from __future__ import annotations
 
+import io
 import json
 import os
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
 
 from tools.codex_orchestration_runtime import (
+    _build_artifact_hashes,
+    _compute_sha256,
+    _validate_agent_summary_text,
     build_launch_prompt_text,
     build_skill_must_read_refs,
+    check_step_completed,
+    enable_checkpoint_resume,
     init_orchestration,
+    main,
     parse_feature_list,
     probe_execution_platform,
     prepare_launch_request_payload,
@@ -21,7 +29,9 @@ from tools.codex_orchestration_runtime import (
     record_agent_run,
     record_launch,
     render_launch_prompt_text,
+    update_checkpoint,
     update_orchestration_status,
+    verify_checkpoint_integrity,
     write_preflight,
     write_step_result,
 )
@@ -1589,6 +1599,7 @@ shell_tool                       stable             true
                 "agent_backend": "claude",
                 "agent_model": "gpt-5-codex",
                 "context_id": "ctx_orch_run_001",
+                "result_summary": "fixture orchestration summary for duplicate agent_run_id test",
             }
             record_agent_run(repo_root=repo_root, orchestration_id="orch_001", payload=payload)
             with self.assertRaisesRegex(ValueError, "duplicate agent_run_id"):
@@ -2395,6 +2406,799 @@ shell_tool                       stable             true
                 response_payload=_spawn_response_payload("sess_step_repair_001"),
             )
             self.assertIsInstance(result, dict)
+
+
+class CheckpointResumeRuntimeTests(unittest.TestCase):
+    """Item 8: orchestration checkpoint / resume のユニットテスト。"""
+
+    _NK = "component/solver@0.1.0"
+    _OUT = "workspace/plans/component__solver__0.1.0/solver_20260415_001/out.txt"
+
+    def _setup_preflight_and_orch_agent(self, repo_root: Path) -> None:
+        init_orchestration(repo_root=repo_root, orchestration_id="orch_001")
+        write_preflight(
+            repo_root=repo_root,
+            orchestration_id="orch_001",
+            payload={
+                "status": "pass",
+                "can_launch_step_agents": True,
+                "can_launch_substep_agents": True,
+                "feature_states": {"multi_agent": True},
+                "checks": [{"name": "multi_agent_enabled", "pass": True}],
+            },
+        )
+        record_agent_run(
+            repo_root=repo_root,
+            orchestration_id="orch_001",
+            payload={
+                "agent_run_id": "orch_run_001",
+                "agent_role": "orchestration",
+                "status": "running",
+                "agent_backend": "claude",
+            },
+        )
+
+    def test_compute_sha256_returns_consistent_hash(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            p = Path(tmp) / "a.bin"
+            p.write_bytes(b"hello")
+            self.assertEqual(_compute_sha256(p), _compute_sha256(p))
+
+    def test_compute_sha256_returns_missing_for_nonexistent_file(self) -> None:
+        p = Path("/nonexistent/path/that/does/not/exist_12345.bin")
+        self.assertEqual(_compute_sha256(p), "sha256:missing")
+
+    def test_compute_sha256_detects_content_change(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            p = Path(tmp) / "a.bin"
+            p.write_bytes(b"v1")
+            h1 = _compute_sha256(p)
+            p.write_bytes(b"v2")
+            h2 = _compute_sha256(p)
+            self.assertNotEqual(h1, h2)
+
+    def test_build_artifact_hashes_maps_refs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            rel = "workspace/x/y.txt"
+            (repo / rel).parent.mkdir(parents=True, exist_ok=True)
+            (repo / rel).write_text("z", encoding="utf-8")
+            h = _build_artifact_hashes(repo, [rel, "", "  "])
+            self.assertIn(rel, h)
+            self.assertTrue(h[rel].startswith("sha256:"))
+
+    def test_update_checkpoint_writes_entry_on_pass(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            init_orchestration(repo_root=repo, orchestration_id="o1")
+            out = repo / self._OUT
+            out.parent.mkdir(parents=True, exist_ok=True)
+            out.write_text("data", encoding="utf-8")
+            entry = update_checkpoint(
+                repo,
+                "o1",
+                node_key=self._NK,
+                step="plan",
+                agent_run_id="run-1",
+                result={
+                    "status": "pass",
+                    "required_outputs": [self._OUT],
+                    "plan_ref": "workspace/plans/component__solver__0.1.0/solver_20260415_001",
+                    "pipeline_ref": "",
+                },
+            )
+            self.assertEqual(entry.get("step"), "plan")
+            cp = repo / "workspace/orchestrations/o1/orchestration_checkpoint.json"
+            self.assertTrue(cp.exists())
+            data = json.loads(cp.read_text(encoding="utf-8"))
+            self.assertEqual(data["orchestration_id"], "o1")
+            self.assertEqual(len(data["completed_steps"]), 1)
+
+    def test_update_checkpoint_fills_refs_from_launch_request_when_result_refs_are_none(
+        self,
+    ) -> None:
+        """plan_ref / pipeline_ref が JSON で明示的に null のとき、launch_request から補完する。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            init_orchestration(repo_root=repo, orchestration_id="o1")
+            out = repo / self._OUT
+            out.parent.mkdir(parents=True, exist_ok=True)
+            out.write_text("data", encoding="utf-8")
+            lr_rel = "workspace/orchestrations/o1/step_launch.request.json"
+            lr_path = repo / lr_rel
+            lr_path.parent.mkdir(parents=True, exist_ok=True)
+            exp_plan = "workspace/plans/component__solver__0.1.0/solver_20260415_001"
+            exp_pipe = (
+                "workspace/pipelines/component__solver__0.1.0/solver_20260415_001"
+            )
+            lr_path.write_text(
+                json.dumps({"plan_ref": exp_plan, "pipeline_ref": exp_pipe}),
+                encoding="utf-8",
+            )
+            update_checkpoint(
+                repo,
+                "o1",
+                node_key=self._NK,
+                step="plan",
+                agent_run_id="run-1",
+                result={
+                    "status": "pass",
+                    "required_outputs": [self._OUT],
+                    "plan_ref": None,
+                    "pipeline_ref": None,
+                    "launch_request_ref": lr_rel,
+                },
+            )
+            data = json.loads(
+                (
+                    repo / "workspace/orchestrations/o1/orchestration_checkpoint.json"
+                ).read_text(encoding="utf-8")
+            )
+            step0 = data["completed_steps"][0]
+            self.assertEqual(step0["plan_ref"], exp_plan)
+            self.assertEqual(step0["pipeline_ref"], exp_pipe)
+
+    def test_update_checkpoint_skips_on_fail(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            init_orchestration(repo_root=repo, orchestration_id="o1")
+            r = update_checkpoint(
+                repo,
+                "o1",
+                node_key=self._NK,
+                step="plan",
+                agent_run_id="run-1",
+                result={"status": "fail"},
+            )
+            self.assertEqual(r, {})
+            self.assertFalse(
+                (repo / "workspace/orchestrations/o1/orchestration_checkpoint.json").exists()
+            )
+
+    def test_update_checkpoint_overwrites_same_node_step(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            init_orchestration(repo_root=repo, orchestration_id="o1")
+            out = repo / self._OUT
+            out.parent.mkdir(parents=True, exist_ok=True)
+            out.write_text("a", encoding="utf-8")
+            base = {
+                "status": "pass",
+                "required_outputs": [self._OUT],
+                "plan_ref": "workspace/plans/component__solver__0.1.0/solver_20260415_001",
+                "pipeline_ref": "",
+            }
+            update_checkpoint(
+                repo, "o1", node_key=self._NK, step="plan", agent_run_id="r1", result=base
+            )
+            out.write_text("b", encoding="utf-8")
+            update_checkpoint(
+                repo, "o1", node_key=self._NK, step="plan", agent_run_id="r2", result=base
+            )
+            data = json.loads(
+                (repo / "workspace/orchestrations/o1/orchestration_checkpoint.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(len(data["completed_steps"]), 1)
+            self.assertEqual(data["completed_steps"][0]["agent_run_id"], "r2")
+
+    def test_update_checkpoint_computes_artifact_hashes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            init_orchestration(repo_root=repo, orchestration_id="o1")
+            out = repo / self._OUT
+            out.parent.mkdir(parents=True, exist_ok=True)
+            out.write_text("fixed", encoding="utf-8")
+            entry = update_checkpoint(
+                repo,
+                "o1",
+                node_key=self._NK,
+                step="plan",
+                agent_run_id="r1",
+                result={
+                    "status": "pass",
+                    "required_outputs": [self._OUT],
+                    "plan_ref": "p",
+                    "pipeline_ref": "",
+                },
+            )
+            self.assertEqual(entry["artifact_hashes"][self._OUT], _compute_sha256(out))
+
+    def test_update_checkpoint_handles_missing_output_ref_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            init_orchestration(repo_root=repo, orchestration_id="o1")
+            missing_ref = "workspace/plans/component__solver__0.1.0/solver_20260415_001/missing.txt"
+            entry = update_checkpoint(
+                repo,
+                "o1",
+                node_key=self._NK,
+                step="plan",
+                agent_run_id="r1",
+                result={
+                    "status": "pass",
+                    "required_outputs": [missing_ref],
+                    "plan_ref": "p",
+                    "pipeline_ref": "",
+                },
+            )
+            self.assertEqual(entry["artifact_hashes"][missing_ref], "sha256:missing")
+
+    def test_verify_checkpoint_integrity_ok(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            init_orchestration(repo_root=repo, orchestration_id="o1")
+            out = repo / self._OUT
+            out.parent.mkdir(parents=True, exist_ok=True)
+            out.write_text("ok", encoding="utf-8")
+            update_checkpoint(
+                repo,
+                "o1",
+                node_key=self._NK,
+                step="plan",
+                agent_run_id="r1",
+                result={
+                    "status": "pass",
+                    "required_outputs": [self._OUT],
+                    "plan_ref": "p",
+                    "pipeline_ref": "",
+                },
+            )
+            vr = verify_checkpoint_integrity(repo, "o1")
+            self.assertTrue(vr["valid"])
+            self.assertEqual(vr["steps"][0]["integrity"], "ok")
+
+    def test_verify_checkpoint_integrity_stale(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            init_orchestration(repo_root=repo, orchestration_id="o1")
+            out = repo / self._OUT
+            out.parent.mkdir(parents=True, exist_ok=True)
+            out.write_text("v1", encoding="utf-8")
+            update_checkpoint(
+                repo,
+                "o1",
+                node_key=self._NK,
+                step="plan",
+                agent_run_id="r1",
+                result={
+                    "status": "pass",
+                    "required_outputs": [self._OUT],
+                    "plan_ref": "p",
+                    "pipeline_ref": "",
+                },
+            )
+            out.write_text("v2", encoding="utf-8")
+            vr = verify_checkpoint_integrity(repo, "o1")
+            self.assertFalse(vr["valid"])
+            self.assertEqual(vr["steps"][0]["integrity"], "stale")
+
+    def test_verify_checkpoint_integrity_missing_artifacts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            init_orchestration(repo_root=repo, orchestration_id="o1")
+            path = repo / "workspace/orchestrations/o1/orchestration_checkpoint.json"
+            path.write_text(
+                json.dumps({
+                    "orchestration_id": "o1",
+                    "schema_version": "1",
+                    "last_updated_at": "2026-04-15T00:00:00Z",
+                    "completed_steps": [
+                        {
+                            "node_key": self._NK,
+                            "node_key_safe": "component__solver__0.1.0",
+                            "step": "plan",
+                            "agent_run_id": "r1",
+                            "status": "pass",
+                            "completed_at": "2026-04-15T00:00:00Z",
+                            "plan_ref": "p",
+                            "pipeline_ref": "",
+                            "output_refs": ["x"],
+                            "artifact_hashes": {"x": "sha256:missing"},
+                        }
+                    ],
+                }),
+                encoding="utf-8",
+            )
+            vr = verify_checkpoint_integrity(repo, "o1")
+            self.assertFalse(vr["valid"])
+            self.assertEqual(vr["steps"][0]["integrity"], "missing_artifacts")
+
+    def test_verify_checkpoint_integrity_no_checkpoint(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            init_orchestration(repo_root=repo, orchestration_id="o1")
+            vr = verify_checkpoint_integrity(repo, "o1")
+            self.assertFalse(vr["valid"])
+            self.assertIn("error", vr)
+
+    def test_check_step_completed_returns_none_when_no_checkpoint(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            init_orchestration(repo_root=repo, orchestration_id="o1")
+            meta = json.loads(
+                (repo / "workspace/orchestrations/o1/orchestration_meta.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            meta["resume_enabled"] = True
+            (repo / "workspace/orchestrations/o1/orchestration_meta.json").write_text(
+                json.dumps(meta), encoding="utf-8"
+            )
+            self.assertIsNone(
+                check_step_completed(
+                    repo, "o1", node_key=self._NK, step="plan", verify_integrity=True
+                )
+            )
+
+    def test_check_step_completed_returns_none_when_resume_disabled(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            init_orchestration(repo_root=repo, orchestration_id="o1")
+            out = repo / self._OUT
+            out.parent.mkdir(parents=True, exist_ok=True)
+            out.write_text("x", encoding="utf-8")
+            update_checkpoint(
+                repo,
+                "o1",
+                node_key=self._NK,
+                step="plan",
+                agent_run_id="r1",
+                result={
+                    "status": "pass",
+                    "required_outputs": [self._OUT],
+                    "plan_ref": "p",
+                    "pipeline_ref": "",
+                },
+            )
+            self.assertIsNone(
+                check_step_completed(
+                    repo, "o1", node_key=self._NK, step="plan", verify_integrity=True
+                )
+            )
+
+    def test_check_step_completed_returns_entry_when_valid(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            init_orchestration(repo_root=repo, orchestration_id="o1")
+            enable_checkpoint_resume(repo, "o1")
+            out = repo / self._OUT
+            out.parent.mkdir(parents=True, exist_ok=True)
+            out.write_text("x", encoding="utf-8")
+            update_checkpoint(
+                repo,
+                "o1",
+                node_key=self._NK,
+                step="plan",
+                agent_run_id="r1",
+                result={
+                    "status": "pass",
+                    "required_outputs": [self._OUT],
+                    "plan_ref": "p",
+                    "pipeline_ref": "",
+                },
+            )
+            info = check_step_completed(
+                repo, "o1", node_key=self._NK, step="plan", verify_integrity=True
+            )
+            self.assertIsNotNone(info)
+            assert info is not None
+            self.assertEqual(info["integrity"], "ok")
+            self.assertEqual(info["agent_run_id"], "r1")
+
+    def test_check_step_completed_allows_resume_when_stored_hash_is_sha256_missing(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            init_orchestration(repo_root=repo, orchestration_id="o1")
+            enable_checkpoint_resume(repo, "o1")
+            missing_output = (
+                "workspace/plans/component__solver__0.1.0/solver_20260415_001/absent.txt"
+            )
+            update_checkpoint(
+                repo,
+                "o1",
+                node_key=self._NK,
+                step="plan",
+                agent_run_id="r1",
+                result={
+                    "status": "pass",
+                    "required_outputs": [missing_output],
+                    "plan_ref": "p",
+                    "pipeline_ref": "",
+                },
+            )
+            self.assertEqual(
+                _compute_sha256(repo / missing_output),
+                "sha256:missing",
+            )
+            info = check_step_completed(
+                repo, "o1", node_key=self._NK, step="plan", verify_integrity=True
+            )
+            self.assertIsNotNone(info)
+            assert info is not None
+            self.assertEqual(info["integrity"], "ok")
+            self.assertEqual(info["agent_run_id"], "r1")
+
+    def test_check_step_completed_returns_none_on_hash_mismatch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            init_orchestration(repo_root=repo, orchestration_id="o1")
+            enable_checkpoint_resume(repo, "o1")
+            out = repo / self._OUT
+            out.parent.mkdir(parents=True, exist_ok=True)
+            out.write_text("x", encoding="utf-8")
+            update_checkpoint(
+                repo,
+                "o1",
+                node_key=self._NK,
+                step="plan",
+                agent_run_id="r1",
+                result={
+                    "status": "pass",
+                    "required_outputs": [self._OUT],
+                    "plan_ref": "p",
+                    "pipeline_ref": "",
+                },
+            )
+            out.write_text("y", encoding="utf-8")
+            self.assertIsNone(
+                check_step_completed(
+                    repo, "o1", node_key=self._NK, step="plan", verify_integrity=True
+                )
+            )
+
+    def test_check_step_completed_returns_none_for_uncompleted_step(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            init_orchestration(repo_root=repo, orchestration_id="o1")
+            enable_checkpoint_resume(repo, "o1")
+            self.assertIsNone(
+                check_step_completed(
+                    repo, "o1", node_key=self._NK, step="build", verify_integrity=True
+                )
+            )
+
+    def test_check_step_completed_skip_integrity_returns_stale_hashes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            init_orchestration(repo_root=repo, orchestration_id="o1")
+            enable_checkpoint_resume(repo, "o1")
+            out = repo / self._OUT
+            out.parent.mkdir(parents=True, exist_ok=True)
+            out.write_text("x", encoding="utf-8")
+            update_checkpoint(
+                repo,
+                "o1",
+                node_key=self._NK,
+                step="plan",
+                agent_run_id="r1",
+                result={
+                    "status": "pass",
+                    "required_outputs": [self._OUT],
+                    "plan_ref": "p",
+                    "pipeline_ref": "",
+                },
+            )
+            out.write_text("y", encoding="utf-8")
+            info = check_step_completed(
+                repo, "o1", node_key=self._NK, step="plan", verify_integrity=False
+            )
+            self.assertIsNotNone(info)
+
+    def test_enable_checkpoint_resume_sets_resume_enabled(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            init_orchestration(repo_root=repo, orchestration_id="o1")
+            meta = enable_checkpoint_resume(repo, "o1")
+            self.assertTrue(meta.get("resume_enabled"))
+            self.assertIn("resumed_at", meta)
+
+    def test_enable_checkpoint_resume_raises_for_nonexistent_orchestration(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            with self.assertRaisesRegex(RuntimeError, "orchestration not found"):
+                enable_checkpoint_resume(repo, "missing")
+
+    def test_enable_checkpoint_resume_preserves_existing_fields(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            init_orchestration(
+                repo_root=repo,
+                orchestration_id="o1",
+                spec_ref="spec/a.md",
+                dependency_ref="dep.yaml",
+            )
+            enable_checkpoint_resume(repo, "o1")
+            meta = json.loads(
+                (repo / "workspace/orchestrations/o1/orchestration_meta.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(meta.get("spec_ref"), "spec/a.md")
+            self.assertTrue(meta.get("resume_enabled"))
+
+    def test_write_step_result_updates_checkpoint_on_pass(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._setup_preflight_and_orch_agent(repo_root)
+            out_ref = (
+                "workspace/pipelines/problem__shallow_water2d__0.3.0/"
+                "shallow-water2d_20260415_001/build/build_001/bin/simulate"
+            )
+            out_path = repo_root / out_ref
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            out_path.write_bytes(b"\x00")
+            write_step_result(
+                repo_root=repo_root,
+                orchestration_id="orch_001",
+                node_key="problem/shallow_water2d@0.3.0",
+                step="build",
+                agent_run_id="step_run_build_001",
+                payload={
+                    "status": "pass",
+                    "validation_stage": "post_build",
+                    "required_outputs": [out_ref],
+                    "failed_substeps": [],
+                    "substep_agent_run_ids": [],
+                },
+            )
+            cp = (
+                repo_root
+                / "workspace/orchestrations/orch_001/orchestration_checkpoint.json"
+            )
+            self.assertTrue(cp.exists())
+            data = json.loads(cp.read_text(encoding="utf-8"))
+            self.assertTrue(any(s.get("step") == "build" for s in data["completed_steps"]))
+
+    def test_write_step_result_does_not_update_checkpoint_on_fail(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._setup_preflight_and_orch_agent(repo_root)
+            out_ref = (
+                "workspace/pipelines/problem__shallow_water2d__0.3.0/"
+                "shallow-water2d_20260415_001/build/build_001/bin/simulate"
+            )
+            out_path = repo_root / out_ref
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            out_path.write_bytes(b"\x00")
+            write_step_result(
+                repo_root=repo_root,
+                orchestration_id="orch_001",
+                node_key="problem/shallow_water2d@0.3.0",
+                step="build",
+                agent_run_id="step_run_build_001",
+                payload={
+                    "status": "fail",
+                    "required_outputs": [out_ref],
+                    "failed_substeps": [],
+                    "substep_agent_run_ids": [],
+                },
+            )
+            cp = (
+                repo_root
+                / "workspace/orchestrations/orch_001/orchestration_checkpoint.json"
+            )
+            self.assertFalse(cp.exists())
+
+    def test_write_step_result_succeeds_even_if_checkpoint_update_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._setup_preflight_and_orch_agent(repo_root)
+            out_ref = (
+                "workspace/pipelines/problem__shallow_water2d__0.3.0/"
+                "shallow-water2d_20260415_001/build/build_001/bin/simulate"
+            )
+            out_path = repo_root / out_ref
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            out_path.write_bytes(b"\x00")
+            stderr = io.StringIO()
+            with patch(
+                "tools.codex_orchestration_runtime.update_checkpoint",
+                side_effect=RuntimeError("boom"),
+            ), patch("tools.codex_orchestration_runtime.sys.stderr", stderr):
+                write_step_result(
+                    repo_root=repo_root,
+                    orchestration_id="orch_001",
+                    node_key="problem/shallow_water2d@0.3.0",
+                    step="build",
+                    agent_run_id="step_run_build_001",
+                    payload={
+                        "status": "pass",
+                        "validation_stage": "post_build",
+                        "required_outputs": [out_ref],
+                        "failed_substeps": [],
+                        "substep_agent_run_ids": [],
+                    },
+                )
+            self.assertIn("checkpoint update failed", stderr.getvalue())
+            step_path = (
+                repo_root
+                / "workspace/orchestrations/orch_001/steps/"
+                "problem__shallow_water2d__0.3.0/build/step_run_build_001/step_result.json"
+            )
+            self.assertTrue(step_path.exists())
+
+    def test_init_resume_from_checkpoint_sets_flag(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            init_orchestration(repo_root=repo, orchestration_id="o1")
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                rc = main(
+                    [
+                        "init",
+                        "--repo-root",
+                        str(repo),
+                        "--orchestration-id",
+                        "o1",
+                        "--resume-from-checkpoint",
+                    ]
+                )
+            self.assertEqual(rc, 0)
+            meta = json.loads(buf.getvalue())
+            self.assertTrue(meta.get("resume_enabled"))
+
+    def test_init_resume_from_checkpoint_fails_if_orchestration_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            with self.assertRaises(RuntimeError):
+                main(
+                    [
+                        "init",
+                        "--repo-root",
+                        str(repo),
+                        "--orchestration-id",
+                        "ghost",
+                        "--resume-from-checkpoint",
+                    ]
+                )
+
+    def test_init_resume_from_checkpoint_does_not_overwrite_meta(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            init_orchestration(
+                repo_root=repo,
+                orchestration_id="o1",
+                spec_ref="keep-me",
+            )
+            main(
+                [
+                    "init",
+                    "--repo-root",
+                    str(repo),
+                    "--orchestration-id",
+                    "o1",
+                    "--resume-from-checkpoint",
+                ]
+            )
+            meta = json.loads(
+                (repo / "workspace/orchestrations/o1/orchestration_meta.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(meta.get("spec_ref"), "keep-me")
+
+    def test_check_step_completed_cli_json(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            init_orchestration(repo_root=repo, orchestration_id="o1")
+            enable_checkpoint_resume(repo, "o1")
+            out = repo / self._OUT
+            out.parent.mkdir(parents=True, exist_ok=True)
+            out.write_text("x", encoding="utf-8")
+            update_checkpoint(
+                repo,
+                "o1",
+                node_key=self._NK,
+                step="plan",
+                agent_run_id="r1",
+                result={
+                    "status": "pass",
+                    "required_outputs": [self._OUT],
+                    "plan_ref": "p",
+                    "pipeline_ref": "",
+                },
+            )
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                rc = main(
+                    [
+                        "check-step-completed",
+                        "--repo-root",
+                        str(repo),
+                        "--orchestration-id",
+                        "o1",
+                        "--node-key",
+                        self._NK,
+                        "--step",
+                        "plan",
+                    ]
+                )
+            self.assertEqual(rc, 0)
+            outj = json.loads(buf.getvalue())
+            self.assertTrue(outj["completed"])
+
+    def test_read_checkpoint_cli_empty(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            init_orchestration(repo_root=repo, orchestration_id="o1")
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                rc = main(
+                    [
+                        "read-checkpoint",
+                        "--repo-root",
+                        str(repo),
+                        "--orchestration-id",
+                        "o1",
+                    ]
+                )
+            self.assertEqual(rc, 0)
+            outj = json.loads(buf.getvalue())
+            self.assertEqual(outj["completed_steps"], [])
+
+    def test_verify_checkpoint_integrity_cli(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            init_orchestration(repo_root=repo, orchestration_id="o1")
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                rc = main(
+                    [
+                        "verify-checkpoint-integrity",
+                        "--repo-root",
+                        str(repo),
+                        "--orchestration-id",
+                        "o1",
+                    ]
+                )
+            self.assertEqual(rc, 0)
+            outj = json.loads(buf.getvalue())
+            self.assertFalse(outj["valid"])
+
+    def test_record_agent_run_accepts_skipped_by_checkpoint(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            init_orchestration(repo_root=repo, orchestration_id="o1")
+            record_agent_run(
+                repo_root=repo,
+                orchestration_id="o1",
+                payload={
+                    "agent_run_id": "skip-001",
+                    "agent_role": "skipped_by_checkpoint",
+                    "status": "skipped",
+                    "agent_backend": "codex",
+                    "node_key": self._NK,
+                    "step": "plan",
+                    "skipped_step": "plan",
+                    "reason": "checkpoint_integrity_ok",
+                    "checkpoint_agent_run_id": "orig-run-1",
+                    "result_summary": "skipped by checkpoint",
+                },
+            )
+            runs = (repo / "workspace/orchestrations/o1/agent_runs.jsonl").read_text(encoding="utf-8")
+            self.assertIn("skipped_by_checkpoint", runs)
+            self.assertIn("skip-001", runs)
+
+    def test_validate_agent_summary_text_skipped_by_checkpoint_allows_single_line(
+        self,
+    ) -> None:
+        _validate_agent_summary_text(
+            {"agent_role": "skipped_by_checkpoint", "status": "skipped"},
+            "skipped by checkpoint resume marker",
+        )
+
+    def test_validate_agent_summary_text_orchestration_rejects_single_line(
+        self,
+    ) -> None:
+        with self.assertRaisesRegex(ValueError, "single-line"):
+            _validate_agent_summary_text(
+                {"agent_role": "orchestration", "status": "running"},
+                "status: running",
+            )
 
 
 if __name__ == "__main__":

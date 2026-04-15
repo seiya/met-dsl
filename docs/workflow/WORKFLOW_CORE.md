@@ -44,7 +44,7 @@ terms は `GLOSSARY.md` を参照する。
 3. `verdict.json` と `aggregate_verdict.json` は `tests.md` と同一 `execution_id` の実行 artifact から導出しなければならない。
 4. phase inputが不足する場合は当該 phase を `fail` で停止し、推測補完を禁止する。
 5. phase 失敗時に下流 phase 開始条件を満たす目的で artifact ファイルを人工生成してはならない。
-6. 明示的な指定がない場合、既存 workflow 出力（過去 `plan_id` / `pipeline_id` / `generation_id` / `build_id` / `execution_id`）の内容参照を禁止する。
+6. 明示的な指定がない場合、既存 workflow 出力（過去 `plan_id` / `pipeline_id` / `generation_id` / `build_id` / `execution_id`）の内容参照を禁止する。`orchestration_meta.json` に `resume_enabled=true` が記録されている orchestration では、`orchestration_checkpoint.json` に記録された完了済みステップの artifact 参照を許可する。このとき参照前に `python3 tools/codex_orchestration_runtime.py verify-checkpoint-integrity` による整合性確認を必須とする。
 7. `workspace/` 配下に過去 artifact が存在する場合も、中身の閲覧と入力参照を禁止する。
 8. `spec_kind` を問わない workflow 実行は、リポジトリ管理下の `spec` canonical source と当該試行で生成した前段 artifact のみを入力として使用する。
 9. `docs/` と `spec/` と当該試行 artifact に定義されていない要求、判定規則、入出力契約を、`tools/` 配下の実装、検証 `script`、test code、validator code から抽出して補完してはならない。これらの実装は execution mechanism または gate implementation であり、要求定義の canonical source ではない。
