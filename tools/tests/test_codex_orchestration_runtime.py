@@ -9,17 +9,24 @@ import os
 import tempfile
 import unittest
 from contextlib import redirect_stdout
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
 
 from tools.codex_orchestration_runtime import (
     _build_artifact_hashes,
     _compute_sha256,
+    _is_within_preflight_ttl,
+    _live_preflight_mode,
+    _live_preflight_ttl_seconds,
+    _require_preflight_launchable,
+    _update_preflight_probed_at,
     _validate_agent_summary_text,
     build_launch_prompt_text,
     build_skill_must_read_refs,
     check_step_completed,
     enable_checkpoint_resume,
+    get_preflight_ttl_status,
     init_orchestration,
     main,
     parse_feature_list,
@@ -1708,6 +1715,7 @@ shell_tool                       stable             true
             os.environ["CODEX_ORCHESTRATION_ENFORCE_LIVE_PREFLIGHT"] = "1"
             with patch("tools.codex_orchestration_runtime.probe_execution_platform") as probe_mock:
                 probe_mock.return_value = {
+                    "checked_at": "2026-04-15T12:00:00Z",
                     "status": "pass",
                     "can_launch_step_agents": True,
                     "can_launch_substep_agents": True,
@@ -3199,6 +3207,589 @@ class CheckpointResumeRuntimeTests(unittest.TestCase):
                 {"agent_role": "orchestration", "status": "running"},
                 "status: running",
             )
+
+
+def _iso_utc_z(dt: datetime) -> str:
+    return dt.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _launchable_preflight_dict(**extra: object) -> dict[str, object]:
+    base: dict[str, object] = {
+        "status": "pass",
+        "backend": "codex",
+        "probe_command": "codex",
+        "can_launch_step_agents": True,
+        "can_launch_substep_agents": True,
+        "feature_states": {"multi_agent": True},
+        "checks": [{"name": "multi_agent_enabled", "pass": True}],
+    }
+    base.update(extra)
+    return base
+
+
+class PreflightLiveProbeTtlTests(unittest.TestCase):
+    def test_live_preflight_mode_never_on_zero(self) -> None:
+        with patch.dict(os.environ, {"CODEX_ORCHESTRATION_ENFORCE_LIVE_PREFLIGHT": "0"}):
+            self.assertEqual(_live_preflight_mode(), "never")
+
+    def test_live_preflight_mode_never_on_false(self) -> None:
+        with patch.dict(os.environ, {"CODEX_ORCHESTRATION_ENFORCE_LIVE_PREFLIGHT": "false"}):
+            self.assertEqual(_live_preflight_mode(), "never")
+
+    def test_live_preflight_mode_always_on_one(self) -> None:
+        with patch.dict(os.environ, {"CODEX_ORCHESTRATION_ENFORCE_LIVE_PREFLIGHT": "1"}):
+            self.assertEqual(_live_preflight_mode(), "always")
+
+    def test_live_preflight_mode_ttl_when_unset(self) -> None:
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("CODEX_ORCHESTRATION_ENFORCE_LIVE_PREFLIGHT", None)
+            self.assertEqual(_live_preflight_mode(), "ttl")
+
+    def test_live_preflight_mode_ttl_on_unknown_value(self) -> None:
+        with patch.dict(os.environ, {"CODEX_ORCHESTRATION_ENFORCE_LIVE_PREFLIGHT": "auto"}):
+            self.assertEqual(_live_preflight_mode(), "ttl")
+
+    def test_live_preflight_ttl_seconds_default(self) -> None:
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("CODEX_PREFLIGHT_TTL_SECONDS", None)
+            self.assertEqual(_live_preflight_ttl_seconds(), 1800)
+
+    def test_live_preflight_ttl_seconds_custom(self) -> None:
+        with patch.dict(os.environ, {"CODEX_PREFLIGHT_TTL_SECONDS": "300"}):
+            self.assertEqual(_live_preflight_ttl_seconds(), 300)
+
+    def test_live_preflight_ttl_seconds_zero(self) -> None:
+        with patch.dict(os.environ, {"CODEX_PREFLIGHT_TTL_SECONDS": "0"}):
+            self.assertEqual(_live_preflight_ttl_seconds(), 0)
+
+    def test_live_preflight_ttl_seconds_invalid_value(self) -> None:
+        with patch.dict(os.environ, {"CODEX_PREFLIGHT_TTL_SECONDS": "abc"}):
+            self.assertEqual(_live_preflight_ttl_seconds(), 1800)
+
+    def test_live_preflight_ttl_seconds_negative(self) -> None:
+        with patch.dict(os.environ, {"CODEX_PREFLIGHT_TTL_SECONDS": "-1"}):
+            self.assertEqual(_live_preflight_ttl_seconds(), 0)
+
+    def test_is_within_preflight_ttl_true_when_recent(self) -> None:
+        ts = _iso_utc_z(datetime.now(timezone.utc) - timedelta(seconds=10))
+        self.assertTrue(_is_within_preflight_ttl(ts, 1800))
+
+    def test_is_within_preflight_ttl_false_when_expired(self) -> None:
+        ts = _iso_utc_z(datetime.now(timezone.utc) - timedelta(seconds=2000))
+        self.assertFalse(_is_within_preflight_ttl(ts, 1800))
+
+    def test_is_within_preflight_ttl_false_when_ttl_zero(self) -> None:
+        ts = _iso_utc_z(datetime.now(timezone.utc) - timedelta(seconds=1))
+        self.assertFalse(_is_within_preflight_ttl(ts, 0))
+
+    def test_is_within_preflight_ttl_false_on_invalid_timestamp(self) -> None:
+        self.assertFalse(_is_within_preflight_ttl("not-a-date", 1800))
+
+    def test_write_preflight_adds_probed_at_from_checked_at(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            init_orchestration(repo_root=repo, orchestration_id="o1")
+            checked = "2026-04-15T10:00:00Z"
+            out = write_preflight(
+                repo_root=repo,
+                orchestration_id="o1",
+                payload=_launchable_preflight_dict(checked_at=checked),
+            )
+            self.assertEqual(out["probed_at"], checked)
+            raw = json.loads(
+                (repo / "workspace/orchestrations/o1/preflight.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(raw["probed_at"], checked)
+
+    def test_write_preflight_keeps_explicit_probed_at(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            init_orchestration(repo_root=repo, orchestration_id="o1")
+            checked = "2026-04-15T10:00:00Z"
+            explicit = "2026-04-15T09:00:00Z"
+            out = write_preflight(
+                repo_root=repo,
+                orchestration_id="o1",
+                payload=_launchable_preflight_dict(checked_at=checked, probed_at=explicit),
+            )
+            self.assertEqual(out["probed_at"], explicit)
+
+    def test_write_preflight_falls_back_to_utc_now_when_no_checked_at(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            init_orchestration(repo_root=repo, orchestration_id="o1")
+            out = write_preflight(
+                repo_root=repo,
+                orchestration_id="o1",
+                payload=_launchable_preflight_dict(),
+            )
+            self.assertIn("probed_at", out)
+            self.assertIsInstance(out["probed_at"], str)
+            self.assertGreater(len(out["probed_at"]), 10)
+
+    def test_update_preflight_probed_at_updates_only_probed_at(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            init_orchestration(repo_root=repo, orchestration_id="o1")
+            write_preflight(
+                repo_root=repo,
+                orchestration_id="o1",
+                payload=_launchable_preflight_dict(
+                    checked_at="2026-04-15T10:00:00Z",
+                    status="pass",
+                ),
+            )
+            path = repo / "workspace/orchestrations/o1/preflight.json"
+            before = json.loads(path.read_text(encoding="utf-8"))
+            _update_preflight_probed_at(repo, "o1", "2026-04-16T12:00:00Z")
+            after = json.loads(path.read_text(encoding="utf-8"))
+            self.assertEqual(after["probed_at"], "2026-04-16T12:00:00Z")
+            self.assertEqual(after["status"], before["status"])
+            self.assertEqual(after["can_launch_step_agents"], before["can_launch_step_agents"])
+
+    def test_update_preflight_probed_at_noop_when_file_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            init_orchestration(repo_root=repo, orchestration_id="o1")
+            _update_preflight_probed_at(repo, "o1", "2026-04-16T12:00:00Z")
+
+    def test_update_preflight_probed_at_noop_on_corrupted_json(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            init_orchestration(repo_root=repo, orchestration_id="o1")
+            path = repo / "workspace/orchestrations/o1/preflight.json"
+            path.write_text("{not-json", encoding="utf-8")
+            _update_preflight_probed_at(repo, "o1", "2026-04-16T12:00:00Z")
+            self.assertEqual(path.read_text(encoding="utf-8"), "{not-json")
+
+    def test_require_preflight_launchable_skips_probe_within_ttl(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            init_orchestration(repo_root=repo, orchestration_id="o1")
+            write_preflight(
+                repo_root=repo,
+                orchestration_id="o1",
+                payload=_launchable_preflight_dict(
+                    checked_at="2026-04-15T10:00:00Z",
+                    probed_at=_iso_utc_z(datetime.now(timezone.utc) - timedelta(seconds=10)),
+                ),
+            )
+            env = {
+                "CODEX_ORCHESTRATION_ENFORCE_LIVE_PREFLIGHT": "auto",
+                "CODEX_PREFLIGHT_TTL_SECONDS": "1800",
+            }
+            with patch.dict(os.environ, env):
+                with patch(
+                    "tools.codex_orchestration_runtime.probe_execution_platform",
+                    side_effect=AssertionError("probe must not run"),
+                ):
+                    _require_preflight_launchable(repo, "o1", enforce_live_probe=True)
+
+    def test_require_preflight_launchable_probes_when_ttl_expired(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            init_orchestration(repo_root=repo, orchestration_id="o1")
+            write_preflight(
+                repo_root=repo,
+                orchestration_id="o1",
+                payload=_launchable_preflight_dict(
+                    checked_at="2026-04-15T10:00:00Z",
+                    probed_at=_iso_utc_z(datetime.now(timezone.utc) - timedelta(seconds=2000)),
+                ),
+            )
+            env = {
+                "CODEX_ORCHESTRATION_ENFORCE_LIVE_PREFLIGHT": "auto",
+                "CODEX_PREFLIGHT_TTL_SECONDS": "1800",
+            }
+            with patch.dict(os.environ, env):
+                with patch("tools.codex_orchestration_runtime.probe_execution_platform") as probe_mock:
+                    probe_mock.return_value = _launchable_preflight_dict(
+                        checked_at="2026-04-15T11:00:00Z",
+                    )
+                    _require_preflight_launchable(repo, "o1", enforce_live_probe=True)
+                    self.assertEqual(probe_mock.call_count, 1)
+
+    def test_require_preflight_launchable_probes_when_no_probed_at(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            init_orchestration(repo_root=repo, orchestration_id="o1")
+            path = repo / "workspace/orchestrations/o1/preflight.json"
+            body = _launchable_preflight_dict(checked_at="2026-04-15T10:00:00Z")
+            path.write_text(json.dumps(body, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+            env = {
+                "CODEX_ORCHESTRATION_ENFORCE_LIVE_PREFLIGHT": "auto",
+                "CODEX_PREFLIGHT_TTL_SECONDS": "1800",
+            }
+            with patch.dict(os.environ, env):
+                with patch("tools.codex_orchestration_runtime.probe_execution_platform") as probe_mock:
+                    probe_mock.return_value = _launchable_preflight_dict(
+                        checked_at="2026-04-15T11:00:00Z",
+                    )
+                    _require_preflight_launchable(repo, "o1", enforce_live_probe=True)
+                    self.assertEqual(probe_mock.call_count, 1)
+
+    def test_require_preflight_launchable_always_probes_in_always_mode(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            init_orchestration(repo_root=repo, orchestration_id="o1")
+            write_preflight(
+                repo_root=repo,
+                orchestration_id="o1",
+                payload=_launchable_preflight_dict(
+                    checked_at="2026-04-15T10:00:00Z",
+                    probed_at=_iso_utc_z(datetime.now(timezone.utc) - timedelta(seconds=5)),
+                ),
+            )
+            with patch.dict(os.environ, {"CODEX_ORCHESTRATION_ENFORCE_LIVE_PREFLIGHT": "1"}):
+                with patch("tools.codex_orchestration_runtime.probe_execution_platform") as probe_mock:
+                    probe_mock.return_value = _launchable_preflight_dict(
+                        checked_at="2026-04-15T11:00:00Z",
+                    )
+                    _require_preflight_launchable(repo, "o1", enforce_live_probe=True)
+                    self.assertEqual(probe_mock.call_count, 1)
+
+    def test_require_preflight_launchable_skips_probe_in_never_mode(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            init_orchestration(repo_root=repo, orchestration_id="o1")
+            write_preflight(
+                repo_root=repo,
+                orchestration_id="o1",
+                payload=_launchable_preflight_dict(
+                    probed_at=_iso_utc_z(datetime.now(timezone.utc) - timedelta(seconds=2000)),
+                ),
+            )
+            with patch.dict(os.environ, {"CODEX_ORCHESTRATION_ENFORCE_LIVE_PREFLIGHT": "0"}):
+                with patch(
+                    "tools.codex_orchestration_runtime.probe_execution_platform",
+                    side_effect=AssertionError("probe must not run"),
+                ):
+                    _require_preflight_launchable(repo, "o1", enforce_live_probe=True)
+
+    def test_require_preflight_launchable_updates_probed_at_after_ttl_probe(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            init_orchestration(repo_root=repo, orchestration_id="o1")
+            write_preflight(
+                repo_root=repo,
+                orchestration_id="o1",
+                payload=_launchable_preflight_dict(
+                    probed_at=_iso_utc_z(datetime.now(timezone.utc) - timedelta(seconds=2000)),
+                ),
+            )
+            new_checked = "2026-04-15T15:30:00Z"
+            env = {
+                "CODEX_ORCHESTRATION_ENFORCE_LIVE_PREFLIGHT": "auto",
+                "CODEX_PREFLIGHT_TTL_SECONDS": "1800",
+            }
+            with patch.dict(os.environ, env):
+                with patch("tools.codex_orchestration_runtime.probe_execution_platform") as probe_mock:
+                    probe_mock.return_value = _launchable_preflight_dict(checked_at=new_checked)
+                    _require_preflight_launchable(repo, "o1", enforce_live_probe=True)
+            raw = json.loads(
+                (repo / "workspace/orchestrations/o1/preflight.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(raw["probed_at"], new_checked)
+
+    def test_require_preflight_launchable_missing_checked_at_falls_back_to_utc_now(self) -> None:
+        """live probe が checked_at を返さない場合でも probed_at 更新で KeyError としない。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            init_orchestration(repo_root=repo, orchestration_id="o1")
+            write_preflight(
+                repo_root=repo,
+                orchestration_id="o1",
+                payload=_launchable_preflight_dict(
+                    probed_at=_iso_utc_z(datetime.now(timezone.utc) - timedelta(seconds=2000)),
+                ),
+            )
+            fallback = "2099-01-01T00:00:00Z"
+            env = {
+                "CODEX_ORCHESTRATION_ENFORCE_LIVE_PREFLIGHT": "auto",
+                "CODEX_PREFLIGHT_TTL_SECONDS": "1800",
+            }
+            with patch.dict(os.environ, env):
+                with patch("tools.codex_orchestration_runtime.probe_execution_platform") as probe_mock:
+                    probe_ret = _launchable_preflight_dict()
+                    self.assertNotIn("checked_at", probe_ret)
+                    probe_mock.return_value = probe_ret
+                    with patch(
+                        "tools.codex_orchestration_runtime._utc_now_iso",
+                        return_value=fallback,
+                    ):
+                        _require_preflight_launchable(repo, "o1", enforce_live_probe=True)
+            raw = json.loads(
+                (repo / "workspace/orchestrations/o1/preflight.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(raw["probed_at"], fallback)
+
+    def test_require_preflight_launchable_ttl_zero_always_probes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            init_orchestration(repo_root=repo, orchestration_id="o1")
+            write_preflight(
+                repo_root=repo,
+                orchestration_id="o1",
+                payload=_launchable_preflight_dict(
+                    probed_at=_iso_utc_z(datetime.now(timezone.utc) - timedelta(seconds=1)),
+                ),
+            )
+            env = {
+                "CODEX_ORCHESTRATION_ENFORCE_LIVE_PREFLIGHT": "auto",
+                "CODEX_PREFLIGHT_TTL_SECONDS": "0",
+            }
+            with patch.dict(os.environ, env):
+                with patch("tools.codex_orchestration_runtime.probe_execution_platform") as probe_mock:
+                    probe_mock.return_value = _launchable_preflight_dict(
+                        checked_at="2026-04-15T11:00:00Z",
+                    )
+                    _require_preflight_launchable(repo, "o1", enforce_live_probe=True)
+                    self.assertEqual(probe_mock.call_count, 1)
+
+    def test_record_launch_skips_probe_on_second_call_within_ttl(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            init_orchestration(repo_root=repo, orchestration_id="orch_001")
+            path = repo / "workspace/orchestrations/orch_001/preflight.json"
+            path.write_text(
+                json.dumps(_launchable_preflight_dict(checked_at="2026-04-15T10:00:00Z"), indent=2)
+                + "\n",
+                encoding="utf-8",
+            )
+            probe_ret = _launchable_preflight_dict(
+                checked_at=_iso_utc_z(datetime.now(timezone.utc) - timedelta(seconds=30)),
+            )
+            env = {
+                "CODEX_ORCHESTRATION_ENFORCE_LIVE_PREFLIGHT": "auto",
+                "CODEX_PREFLIGHT_TTL_SECONDS": "1800",
+            }
+            with patch.dict(os.environ, env):
+                with patch("tools.codex_orchestration_runtime.probe_execution_platform") as probe_mock:
+                    probe_mock.return_value = dict(probe_ret)
+                    record_launch(
+                        repo_root=repo,
+                        orchestration_id="orch_001",
+                        parent_agent_run_id="orch_run_001",
+                        child_agent_run_id="substep_run_plan_generate_001",
+                        request_payload={
+                            "node_key": "problem/shallow_water2d@0.3.0",
+                            "step": "plan",
+                            "substep": "generate",
+                            "orchestration_id": "orch_001",
+                            "agent_run_id": "substep_run_plan_generate_001",
+                            "parent_agent_run_id": "orch_run_001",
+                            "plan_ref": "workspace/plans/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001",
+                            "pipeline_ref": "workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001",
+                            "dependency_ref": "workspace/plans/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/dependency.resolved.yaml",
+                            "skill_name": "workflow-plan-generate",
+                            "skill_ref": "skills/workflow-plan-generate/SKILL.md",
+                            "skill_must_read_refs": "",
+                            "issue_severity": "none",
+                            "repair_strategy": "none",
+                            "repair_target_agent_run_id": "none",
+                            "repair_reason": "none",
+                            "launch_prompt_full": _substep_launch_prompt(
+                                "problem/shallow_water2d@0.3.0",
+                                "plan",
+                                "generate",
+                                "substep_run_plan_generate_001",
+                            ),
+                        },
+                        response_payload=_spawn_response_payload("sess_substep_plan_generate_001"),
+                    )
+                    self.assertEqual(probe_mock.call_count, 1)
+                    record_launch(
+                        repo_root=repo,
+                        orchestration_id="orch_001",
+                        parent_agent_run_id="orch_run_001",
+                        child_agent_run_id="step_run_build_001",
+                        request_payload={
+                            "node_key": "problem/shallow_water2d@0.3.0",
+                            "step": "build",
+                            "orchestration_id": "orch_001",
+                            "agent_run_id": "step_run_build_001",
+                            "parent_agent_run_id": "orch_run_001",
+                            "plan_ref": "workspace/plans/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001",
+                            "pipeline_ref": "workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001",
+                            "dependency_ref": "workspace/plans/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/dependency.resolved.yaml",
+                            "skill_name": "workflow-build",
+                            "skill_ref": "skills/workflow-build/SKILL.md",
+                            "skill_must_read_refs": "",
+                            "launch_prompt_full": _step_launch_prompt(
+                                "problem/shallow_water2d@0.3.0",
+                                "build",
+                                "step_run_build_001",
+                            ),
+                        },
+                        response_payload=_spawn_response_payload("sess_step_build_001"),
+                    )
+                    self.assertEqual(probe_mock.call_count, 1)
+
+    def test_record_launch_re_probes_after_ttl_expiry(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            init_orchestration(repo_root=repo, orchestration_id="orch_001")
+            path = repo / "workspace/orchestrations/orch_001/preflight.json"
+            path.write_text(
+                json.dumps(_launchable_preflight_dict(checked_at="2026-04-15T10:00:00Z"), indent=2)
+                + "\n",
+                encoding="utf-8",
+            )
+            env = {
+                "CODEX_ORCHESTRATION_ENFORCE_LIVE_PREFLIGHT": "auto",
+                "CODEX_PREFLIGHT_TTL_SECONDS": "1800",
+            }
+            with patch.dict(os.environ, env):
+                with patch("tools.codex_orchestration_runtime.probe_execution_platform") as probe_mock:
+                    probe_mock.return_value = _launchable_preflight_dict(
+                        checked_at=_iso_utc_z(datetime.now(timezone.utc) - timedelta(seconds=30)),
+                    )
+                    record_launch(
+                        repo_root=repo,
+                        orchestration_id="orch_001",
+                        parent_agent_run_id="orch_run_001",
+                        child_agent_run_id="substep_run_plan_generate_001",
+                        request_payload={
+                            "node_key": "problem/shallow_water2d@0.3.0",
+                            "step": "plan",
+                            "substep": "generate",
+                            "orchestration_id": "orch_001",
+                            "agent_run_id": "substep_run_plan_generate_001",
+                            "parent_agent_run_id": "orch_run_001",
+                            "plan_ref": "workspace/plans/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001",
+                            "pipeline_ref": "workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001",
+                            "dependency_ref": "workspace/plans/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/dependency.resolved.yaml",
+                            "skill_name": "workflow-plan-generate",
+                            "skill_ref": "skills/workflow-plan-generate/SKILL.md",
+                            "skill_must_read_refs": "",
+                            "issue_severity": "none",
+                            "repair_strategy": "none",
+                            "repair_target_agent_run_id": "none",
+                            "repair_reason": "none",
+                            "launch_prompt_full": _substep_launch_prompt(
+                                "problem/shallow_water2d@0.3.0",
+                                "plan",
+                                "generate",
+                                "substep_run_plan_generate_001",
+                            ),
+                        },
+                        response_payload=_spawn_response_payload("sess_substep_plan_generate_001"),
+                    )
+                    self.assertEqual(probe_mock.call_count, 1)
+                    raw = json.loads(path.read_text(encoding="utf-8"))
+                    raw["probed_at"] = _iso_utc_z(datetime.now(timezone.utc) - timedelta(seconds=2000))
+                    path.write_text(json.dumps(raw, indent=2) + "\n", encoding="utf-8")
+                    record_launch(
+                        repo_root=repo,
+                        orchestration_id="orch_001",
+                        parent_agent_run_id="orch_run_001",
+                        child_agent_run_id="step_run_build_001",
+                        request_payload={
+                            "node_key": "problem/shallow_water2d@0.3.0",
+                            "step": "build",
+                            "orchestration_id": "orch_001",
+                            "agent_run_id": "step_run_build_001",
+                            "parent_agent_run_id": "orch_run_001",
+                            "plan_ref": "workspace/plans/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001",
+                            "pipeline_ref": "workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001",
+                            "dependency_ref": "workspace/plans/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/dependency.resolved.yaml",
+                            "skill_name": "workflow-build",
+                            "skill_ref": "skills/workflow-build/SKILL.md",
+                            "skill_must_read_refs": "",
+                            "launch_prompt_full": _step_launch_prompt(
+                                "problem/shallow_water2d@0.3.0",
+                                "build",
+                                "step_run_build_001",
+                            ),
+                        },
+                        response_payload=_spawn_response_payload("sess_step_build_001"),
+                    )
+                    self.assertEqual(probe_mock.call_count, 2)
+
+    def test_get_preflight_ttl_status_within_ttl(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            init_orchestration(repo_root=repo, orchestration_id="o1")
+            write_preflight(
+                repo_root=repo,
+                orchestration_id="o1",
+                payload=_launchable_preflight_dict(
+                    probed_at=_iso_utc_z(datetime.now(timezone.utc) - timedelta(seconds=10)),
+                ),
+            )
+            with patch.dict(
+                os.environ,
+                {
+                    "CODEX_ORCHESTRATION_ENFORCE_LIVE_PREFLIGHT": "auto",
+                    "CODEX_PREFLIGHT_TTL_SECONDS": "1800",
+                },
+            ):
+                st = get_preflight_ttl_status(repo, "o1")
+            self.assertTrue(st["preflight_exists"])
+            self.assertTrue(st["within_ttl"])
+            self.assertTrue(st["probe_skippable"])
+            self.assertIsNotNone(st["ttl_remaining_seconds"])
+
+    def test_get_preflight_ttl_status_no_preflight(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            init_orchestration(repo_root=repo, orchestration_id="o1")
+            with patch.dict(os.environ, {"CODEX_ORCHESTRATION_ENFORCE_LIVE_PREFLIGHT": "auto"}):
+                st = get_preflight_ttl_status(repo, "o1")
+            self.assertFalse(st["preflight_exists"])
+            self.assertFalse(st["probe_skippable"])
+
+    def test_get_preflight_ttl_status_always_mode(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            init_orchestration(repo_root=repo, orchestration_id="o1")
+            write_preflight(
+                repo_root=repo,
+                orchestration_id="o1",
+                payload=_launchable_preflight_dict(
+                    probed_at=_iso_utc_z(datetime.now(timezone.utc) - timedelta(seconds=5)),
+                ),
+            )
+            with patch.dict(os.environ, {"CODEX_ORCHESTRATION_ENFORCE_LIVE_PREFLIGHT": "1"}):
+                st = get_preflight_ttl_status(repo, "o1")
+            self.assertFalse(st["probe_skippable"])
+
+    def test_preflight_status_cli_outputs_json(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            init_orchestration(repo_root=repo, orchestration_id="o1")
+            write_preflight(
+                repo_root=repo,
+                orchestration_id="o1",
+                payload=_launchable_preflight_dict(
+                    probed_at=_iso_utc_z(datetime.now(timezone.utc) - timedelta(seconds=10)),
+                ),
+            )
+            buf = io.StringIO()
+            with patch.dict(
+                os.environ,
+                {
+                    "CODEX_ORCHESTRATION_ENFORCE_LIVE_PREFLIGHT": "auto",
+                    "CODEX_PREFLIGHT_TTL_SECONDS": "1800",
+                },
+            ):
+                with redirect_stdout(buf):
+                    rc = main(
+                        [
+                            "preflight-status",
+                            "--repo-root",
+                            str(repo),
+                            "--orchestration-id",
+                            "o1",
+                        ]
+                    )
+            self.assertEqual(rc, 0)
+            out = json.loads(buf.getvalue())
+            self.assertEqual(out["orchestration_id"], "o1")
+            self.assertTrue(out["preflight_exists"])
+            self.assertIn("ttl_remaining_seconds", out)
+            self.assertTrue(out["probe_skippable"])
 
 
 if __name__ == "__main__":

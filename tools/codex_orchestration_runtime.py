@@ -19,6 +19,7 @@ from typing import Any, Callable
 
 TERMINAL_STATUSES = {"pass", "fail", "blocked", "timeout", "cancel"}
 SUPPORTED_BACKENDS = {"codex", "cursor", "claude"}
+PREFLIGHT_TTL_DEFAULT_SECONDS: int = 1800
 VALID_REPAIR_STRATEGIES = frozenset({"none", "reuse", "restart"})
 VALID_ISSUE_SEVERITIES = frozenset({"none", "minor", "major", "critical"})
 
@@ -218,6 +219,108 @@ def _validate_preflight_payload(payload: dict[str, Any]) -> None:
             )
 
 
+def _live_preflight_mode() -> str:
+    """CODEX_ORCHESTRATION_ENFORCE_LIVE_PREFLIGHT の値から動作モードを返す。
+
+    戻り値: 'never' | 'always' | 'ttl'
+    - 'never' : プローブをスキップ
+    - 'always': 毎回プローブ（TTL 無視、後方互換）
+    - 'ttl'   : TTL キャッシュ付きプローブ（デフォルト）
+    """
+    raw = os.environ.get("CODEX_ORCHESTRATION_ENFORCE_LIVE_PREFLIGHT", "").strip().lower()
+    if raw in {"0", "false", "no"}:
+        return "never"
+    if raw == "1":
+        return "always"
+    return "ttl"
+
+
+def _live_preflight_ttl_seconds() -> int:
+    """CODEX_PREFLIGHT_TTL_SECONDS を読み非負整数を返す。
+
+    未設定または無効値の場合は PREFLIGHT_TTL_DEFAULT_SECONDS を返す。
+    """
+    raw = os.environ.get("CODEX_PREFLIGHT_TTL_SECONDS", "").strip()
+    if not raw:
+        return PREFLIGHT_TTL_DEFAULT_SECONDS
+    try:
+        value = int(raw)
+        return max(0, value)
+    except ValueError:
+        return PREFLIGHT_TTL_DEFAULT_SECONDS
+
+
+def _is_within_preflight_ttl(probed_at_iso: str, ttl_seconds: int) -> bool:
+    """probed_at_iso からの経過秒が ttl_seconds 未満なら True。
+
+    ttl_seconds == 0 の場合は常に False（キャッシュなし）。
+    パース失敗時は False（安全側に倒してプローブを実行する）。
+    """
+    if ttl_seconds <= 0:
+        return False
+    try:
+        probed_at = datetime.fromisoformat(probed_at_iso.replace("Z", "+00:00"))
+        elapsed = (datetime.now(timezone.utc) - probed_at).total_seconds()
+        return elapsed < ttl_seconds
+    except (ValueError, TypeError):
+        return False
+
+
+def _live_preflight_enforced() -> bool:
+    """後方互換ラッパー。
+
+    新規コードは _live_preflight_mode() を使用すること。
+    """
+    return _live_preflight_mode() != "never"
+
+
+def _update_preflight_probed_at(
+    repo_root: Path,
+    orchestration_id: str,
+    probed_at_iso: str,
+) -> None:
+    """preflight.json の probed_at フィールドのみを更新する。
+
+    他のフィールド（status / can_launch_* 等）は変更しない。
+    preflight.json が存在しない場合は何もしない（エラーにしない）。
+    """
+    path = _preflight_path(repo_root, orchestration_id)
+    if not path.exists():
+        return
+    try:
+        file_payload = _read_json(path)
+    except json.JSONDecodeError:
+        return
+    if not isinstance(file_payload, dict):
+        return
+    file_payload["probed_at"] = probed_at_iso
+    _write_json(path, file_payload)
+
+
+def _run_live_probe_and_update(
+    repo_root: Path,
+    orchestration_id: str,
+    cached_payload: dict[str, Any],
+) -> None:
+    """live probe を実行し、成功時に preflight.json の probed_at を更新する。
+
+    失敗時は RuntimeError を送出する（呼び出し元で orchestration を fail に遷移させる）。
+    """
+    backend = cached_payload.get("backend")
+    if not isinstance(backend, str) or backend.strip() not in SUPPORTED_BACKENDS:
+        backend = "codex"
+    command = cached_payload.get("probe_command")
+    probe_command = command.strip() if isinstance(command, str) and command.strip() else None
+
+    live_probe = probe_execution_platform(backend=backend, agent_command=probe_command)
+    if not _preflight_allows_agent_launch(live_probe):
+        raise RuntimeError(
+            "live preflight gate failed: execution platform multi_agent must be enabled at launch time"
+        )
+    probed_at = live_probe.get("checked_at") or _utc_now_iso()
+    _update_preflight_probed_at(repo_root, orchestration_id, probed_at)
+
+
 def _require_preflight_launchable(
     repo_root: Path,
     orchestration_id: str,
@@ -234,23 +337,86 @@ def _require_preflight_launchable(
         raise RuntimeError(
             "preflight gate failed: launchable preflight with multi_agent=true is required"
         )
-    if enforce_live_probe and _live_preflight_enforced():
-        backend = payload.get("backend")
-        if not isinstance(backend, str) or backend.strip() not in SUPPORTED_BACKENDS:
-            backend = "codex"
-        command = payload.get("probe_command")
-        probe_command = command.strip() if isinstance(command, str) and command.strip() else None
-        live_probe = probe_execution_platform(backend=backend, agent_command=probe_command)
-        if not _preflight_allows_agent_launch(live_probe):
-            raise RuntimeError(
-                "live preflight gate failed: execution platform multi_agent must be enabled at launch time"
-            )
+
+    if not enforce_live_probe:
+        return payload
+
+    mode = _live_preflight_mode()
+
+    if mode == "never":
+        return payload
+
+    if mode == "always":
+        _run_live_probe_and_update(repo_root, orchestration_id, payload)
+        return payload
+
+    ttl_seconds = _live_preflight_ttl_seconds()
+    probed_at = payload.get("probed_at")
+
+    if isinstance(probed_at, str) and _is_within_preflight_ttl(probed_at, ttl_seconds):
+        return payload
+
+    _run_live_probe_and_update(repo_root, orchestration_id, payload)
     return payload
 
 
-def _live_preflight_enforced() -> bool:
-    raw = os.environ.get("CODEX_ORCHESTRATION_ENFORCE_LIVE_PREFLIGHT", "1").strip().lower()
-    return raw not in {"0", "false", "no"}
+def get_preflight_ttl_status(
+    repo_root: Path,
+    orchestration_id: str,
+) -> dict[str, Any]:
+    """preflight-status コマンド向け: TTL 状態の詳細を返す。"""
+    mode = _live_preflight_mode()
+    ttl_seconds = _live_preflight_ttl_seconds()
+    path = _preflight_path(repo_root, orchestration_id)
+
+    if not path.exists():
+        return {
+            "orchestration_id": orchestration_id,
+            "preflight_exists": False,
+            "live_probe_mode": mode,
+            "ttl_seconds": ttl_seconds,
+            "within_ttl": None,
+            "ttl_remaining_seconds": None,
+            "probe_skippable": False,
+        }
+
+    try:
+        file_payload = _read_json(path)
+    except json.JSONDecodeError:
+        file_payload = {}
+
+    probed_at = file_payload.get("probed_at") if isinstance(file_payload, dict) else None
+    checked_at = file_payload.get("checked_at") if isinstance(file_payload, dict) else None
+    preflight_status = file_payload.get("status") if isinstance(file_payload, dict) else None
+    backend = file_payload.get("backend") if isinstance(file_payload, dict) else None
+
+    within_ttl: bool | None = None
+    ttl_remaining: float | None = None
+    if mode == "ttl" and isinstance(probed_at, str):
+        within_ttl = _is_within_preflight_ttl(probed_at, ttl_seconds)
+        if within_ttl and ttl_seconds > 0:
+            try:
+                pa = datetime.fromisoformat(probed_at.replace("Z", "+00:00"))
+                elapsed = (datetime.now(timezone.utc) - pa).total_seconds()
+                ttl_remaining = max(0.0, ttl_seconds - elapsed)
+            except (ValueError, TypeError):
+                ttl_remaining = None
+
+    probe_skippable = mode == "never" or (mode == "ttl" and within_ttl is True)
+
+    return {
+        "orchestration_id": orchestration_id,
+        "preflight_exists": True,
+        "preflight_status": preflight_status,
+        "backend": backend,
+        "checked_at": checked_at,
+        "probed_at": probed_at,
+        "live_probe_mode": mode,
+        "ttl_seconds": ttl_seconds,
+        "within_ttl": within_ttl,
+        "ttl_remaining_seconds": ttl_remaining,
+        "probe_skippable": probe_skippable,
+    }
 
 
 def _launch_refs(orchestration_id: str, agent_run_id: str) -> tuple[str, str]:
@@ -1700,8 +1866,13 @@ def write_preflight(repo_root: Path, orchestration_id: str, payload: dict[str, A
     _validate_preflight_payload(payload)
     root = _orchestration_root(repo_root, orchestration_id)
     root.mkdir(parents=True, exist_ok=True)
-    _write_json(root / "preflight.json", payload)
-    return payload
+
+    stored = dict(payload)
+    if "probed_at" not in stored:
+        stored["probed_at"] = stored.get("checked_at") or _utc_now_iso()
+
+    _write_json(root / "preflight.json", stored)
+    return stored
 
 
 def _load_graph(graph_path: Path) -> dict[str, Any]:
@@ -2046,6 +2217,10 @@ def main(argv: list[str] | None = None) -> int:
     preflight_parser.add_argument("--codex-command", default="codex")
     preflight_parser.add_argument("--claude-command", default="claude")
 
+    preflight_status_parser = subparsers.add_parser("preflight-status")
+    preflight_status_parser.add_argument("--repo-root", required=True)
+    preflight_status_parser.add_argument("--orchestration-id", required=True)
+
     launch_parser = subparsers.add_parser("record-launch")
     launch_parser.add_argument("--repo-root", required=True)
     launch_parser.add_argument("--orchestration-id", required=True)
@@ -2124,6 +2299,11 @@ def main(argv: list[str] | None = None) -> int:
                 backend=args.backend,
                 agent_command=agent_command,
             ),
+        )
+    elif args.command == "preflight-status":
+        result = get_preflight_ttl_status(
+            repo_root=repo_root,
+            orchestration_id=args.orchestration_id,
         )
     elif args.command == "record-launch":
         result = record_launch(
