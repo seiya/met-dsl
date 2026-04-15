@@ -1121,67 +1121,21 @@ def parse_feature_list(raw: str) -> dict[str, bool]:
     return features
 
 
-def probe_execution_platform(
-    *,
-    backend: str,
-    agent_command: str | None = None,
-    runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
-) -> dict[str, Any]:
-    backend_token = backend.strip().lower()
-    if backend_token not in SUPPORTED_BACKENDS:
-        raise ValueError(f"unsupported backend: {backend}")
-
-    default_command = DEFAULT_BACKEND_COMMANDS[backend_token]
-    command = agent_command.strip() if isinstance(agent_command, str) and agent_command.strip() else default_command
-    for known_backend, known_command in DEFAULT_BACKEND_COMMANDS.items():
-        if command != known_command:
-            continue
-        if known_backend != backend_token:
-            raise ValueError(
-                f"agent_command/backend mismatch: backend={backend_token} requires "
-                f"{DEFAULT_BACKEND_COMMANDS[backend_token]} (or custom command), got {command}"
-            )
-        break
-
-    version_proc = runner(
-        [command, "--version"],
-        text=True,
-        capture_output=True,
-        check=False,
-    )
-    features_proc = runner(
-        [command, "features", "list"],
-        text=True,
-        capture_output=True,
-        check=False,
-    )
-
+def _probe_codex_backend(
+    backend_token: str,
+    command: str,
+    runner: Callable[..., subprocess.CompletedProcess[str]],
+) -> tuple[list[dict[str, Any]], dict[str, bool], bool, str]:
+    """codex バックエンドのプローブを実行し (checks, features, multi_agent_enabled, agent_version) を返す。"""
+    version_proc = runner([command, "--version"], text=True, capture_output=True, check=False)
+    features_proc = runner([command, "features", "list"], text=True, capture_output=True, check=False)
     features: dict[str, bool] = {}
-    features_detail = features_proc.stdout.strip() or features_proc.stderr.strip()
     features_available = features_proc.returncode == 0
     multi_agent_enabled = False
     if features_proc.returncode == 0:
         features = parse_feature_list(features_proc.stdout)
         multi_agent_enabled = features.get("multi_agent") is True
-    if backend_token in {"cursor", "claude"} and not multi_agent_enabled:
-        # Cursor and Claude Code CLIs do not expose `features list` as a structured command.
-        # Use --help as a best-effort launchability probe instead.
-        # Launch-time live preflight in `record_launch` remains the fail-safe.
-        help_proc = runner(
-            [command, "--help"],
-            text=True,
-            capture_output=True,
-            check=False,
-        )
-        if help_proc.returncode == 0:
-            features_available = True
-            multi_agent_enabled = True
-            features = {"multi_agent": True}
-            help_detail = help_proc.stdout.strip() or help_proc.stderr.strip()
-            features_detail = f"{backend_token} backend multi_agent could not be confirmed from features list; fallback to --help succeeded"
-            if help_detail:
-                features_detail += f"\n{help_detail}"
-
+    features_detail = features_proc.stdout.strip() or features_proc.stderr.strip()
     checks = [
         {
             "name": f"{backend_token}_version_available",
@@ -1199,13 +1153,108 @@ def probe_execution_platform(
             "detail": f"multi_agent={features.get('multi_agent')}",
         },
     ]
+    return checks, features, multi_agent_enabled, version_proc.stdout.strip()
 
-    can_launch_agents = version_proc.returncode == 0 and features_available and multi_agent_enabled
+
+def _probe_help_fallback_backend(
+    backend_token: str,
+    command: str,
+    runner: Callable[..., subprocess.CompletedProcess[str]],
+) -> tuple[list[dict[str, Any]], dict[str, bool], bool, str]:
+    """cursor/claude バックエンドのプローブを実行し (checks, features, multi_agent_enabled, agent_version) を返す。"""
+    version_proc = runner([command, "--version"], text=True, capture_output=True, check=False)
+    features_proc = runner([command, "features", "list"], text=True, capture_output=True, check=False)
+    features: dict[str, bool] = {}
+    features_available = features_proc.returncode == 0
+    multi_agent_enabled = False
+    features_detail = features_proc.stdout.strip() or features_proc.stderr.strip()
+    if features_proc.returncode == 0:
+        features = parse_feature_list(features_proc.stdout)
+        multi_agent_enabled = features.get("multi_agent") is True
+    if not multi_agent_enabled:
+        # Cursor and Claude Code CLIs do not expose `features list` as a structured command.
+        # Use --help as a best-effort launchability probe instead.
+        # Launch-time live preflight in `record_launch` remains the fail-safe.
+        help_proc = runner([command, "--help"], text=True, capture_output=True, check=False)
+        if help_proc.returncode == 0:
+            features_available = True
+            multi_agent_enabled = True
+            features = {"multi_agent": True}
+            help_detail = help_proc.stdout.strip() or help_proc.stderr.strip()
+            features_detail = (
+                f"{backend_token} backend multi_agent could not be confirmed from features list; "
+                "fallback to --help succeeded"
+            )
+            if help_detail:
+                features_detail += f"\n{help_detail}"
+    checks = [
+        {
+            "name": f"{backend_token}_version_available",
+            "pass": version_proc.returncode == 0,
+            "detail": version_proc.stdout.strip() or version_proc.stderr.strip(),
+        },
+        {
+            "name": f"{backend_token}_features_available",
+            "pass": features_available,
+            "detail": features_detail,
+        },
+        {
+            "name": "multi_agent_enabled",
+            "pass": multi_agent_enabled,
+            "detail": f"multi_agent={features.get('multi_agent')}",
+        },
+    ]
+    return checks, features, multi_agent_enabled, version_proc.stdout.strip()
+
+
+_BACKEND_PROBERS: dict[
+    str,
+    Callable[
+        [str, str, Callable[..., subprocess.CompletedProcess[str]]],
+        tuple[list[dict[str, Any]], dict[str, bool], bool, str],
+    ],
+] = {
+    "codex": _probe_codex_backend,
+    "cursor": _probe_help_fallback_backend,
+    "claude": _probe_help_fallback_backend,
+}
+
+
+def probe_execution_platform(
+    *,
+    backend: str,
+    agent_command: str | None = None,
+    runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
+) -> dict[str, Any]:
+    backend_token = backend.strip().lower()
+    if backend_token not in SUPPORTED_BACKENDS:
+        raise ValueError(f"unsupported backend: {backend}")
+
+    default_command = DEFAULT_BACKEND_COMMANDS[backend_token]
+    command = (
+        agent_command.strip()
+        if isinstance(agent_command, str) and agent_command.strip()
+        else default_command
+    )
+    for known_backend, known_command in DEFAULT_BACKEND_COMMANDS.items():
+        if command != known_command:
+            continue
+        if known_backend != backend_token:
+            raise ValueError(
+                f"agent_command/backend mismatch: backend={backend_token} requires "
+                f"{DEFAULT_BACKEND_COMMANDS[backend_token]} (or custom command), got {command}"
+            )
+        break
+
+    prober = _BACKEND_PROBERS[backend_token]
+    checks, features, multi_agent_enabled, agent_version = prober(backend_token, command, runner)
+
+    can_launch_agents = all(c["pass"] for c in checks)
     return {
         "checked_at": _utc_now_iso(),
         "backend": backend_token,
         "probe_command": command,
-        "agent_version": version_proc.stdout.strip(),
+        "agent_version": agent_version,
         "feature_states": features,
         "checks": checks,
         "can_launch_step_agents": can_launch_agents,

@@ -328,6 +328,50 @@ shell_tool                       stable             true
         self.assertEqual(seen["command"], "agent")
         self.assertEqual(result["probe_command"], "agent")
 
+    def test_probe_codex_backend_calls_features_list(self) -> None:
+        """_probe_codex_backend が features list コマンドを呼び、multi_agent を検出すること。"""
+        import subprocess as _subprocess
+        from tools.codex_orchestration_runtime import _probe_codex_backend
+        calls: list[list[str]] = []
+
+        def runner(cmd, **kwargs):  # type: ignore[no-untyped-def]
+            calls.append(list(cmd))
+            if cmd[-1] == "--version":
+                return _FakeCompletedProcess(0, stdout="codex 1.0.0")
+            if cmd[-2:] == ["features", "list"]:
+                return _FakeCompletedProcess(0, stdout="multi_agent  available  true")
+            return _FakeCompletedProcess(1, stdout="")
+
+        checks, features, multi_agent_enabled, agent_version = _probe_codex_backend(
+            "codex", "codex", runner
+        )
+        self.assertTrue(multi_agent_enabled)
+        self.assertTrue(features.get("multi_agent"))
+        called_cmds = [" ".join(c) for c in calls]
+        self.assertTrue(any("features" in c for c in called_cmds))
+
+    def test_probe_help_fallback_uses_help_when_features_list_fails(self) -> None:
+        """_probe_help_fallback_backend が features list 失敗時に --help fallback を試みること。"""
+        from tools.codex_orchestration_runtime import _probe_help_fallback_backend
+        calls: list[list[str]] = []
+
+        def runner(cmd, **kwargs):  # type: ignore[no-untyped-def]
+            calls.append(list(cmd))
+            if cmd[-1] == "--version":
+                return _FakeCompletedProcess(0, stdout="claude 1.0.0")
+            if cmd[-2:] == ["features", "list"]:
+                return _FakeCompletedProcess(1, stdout="")  # features list 失敗
+            if cmd[-1] == "--help":
+                return _FakeCompletedProcess(0, stdout="Usage: claude ...")
+            return _FakeCompletedProcess(1, stdout="")
+
+        checks, features, multi_agent_enabled, agent_version = _probe_help_fallback_backend(
+            "claude", "claude", runner
+        )
+        self.assertTrue(multi_agent_enabled)
+        called_cmds = [" ".join(c) for c in calls]
+        self.assertTrue(any("--help" in c for c in called_cmds))
+
     def test_prepare_launch_request_payload_fills_verify_defaults(self) -> None:
         payload = prepare_launch_request_payload(
             {
