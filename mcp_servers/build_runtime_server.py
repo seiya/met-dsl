@@ -16,11 +16,60 @@ import time
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Callable
 
 JSONRPC_VERSION = "2.0"
 SERVER_NAME = "build-runtime-server"
+
+
+@lru_cache(maxsize=1)
+def _load_codex_orchestration_runtime() -> Any:
+    """Load `tools/codex_orchestration_runtime.py` without requiring `tools` as a package."""
+    root = Path(__file__).resolve().parent.parent
+    path = root / "tools" / "codex_orchestration_runtime.py"
+    pycache_root = (root / "workspace" / ".pycache").resolve()
+    pycache_root.mkdir(parents=True, exist_ok=True)
+    os.environ.setdefault("PYTHONDONTWRITEBYTECODE", "1")
+    os.environ["PYTHONPYCACHEPREFIX"] = str(pycache_root)
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("codex_orchestration_runtime", path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"cannot load orchestration runtime from {path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _maybe_enforce_orchestration_mcp_gate(
+    *,
+    tool_name: str,
+    project_dir: str,
+    args: dict[str, Any],
+) -> None:
+    """When `orchestration_id` is set, require launch + capability token + phase_state."""
+    orch_raw = args.get("orchestration_id")
+    if orch_raw is None or not str(orch_raw).strip():
+        return
+    orch_id = str(orch_raw).strip()
+    agent_raw = args.get("agent_run_id")
+    cap_raw = args.get("capability_token")
+    if agent_raw is None or not str(agent_raw).strip():
+        raise ValueError(f"{tool_name} requires agent_run_id when orchestration_id is set")
+    if cap_raw is None or not str(cap_raw).strip():
+        raise ValueError(f"{tool_name} requires capability_token when orchestration_id is set")
+    rr_raw = args.get("repo_root")
+    repo_root = Path(str(rr_raw if rr_raw is not None else project_dir)).resolve()
+    rt = _load_codex_orchestration_runtime()
+    rt.validate_mcp_build_tool_invocation(
+        repo_root,
+        orchestration_id=orch_id,
+        agent_run_id=str(agent_raw).strip(),
+        capability_token=str(cap_raw).strip(),
+        tool_name=tool_name,
+    )
 SERVER_VERSION = "0.1.0"
 DEFAULT_PROTOCOL_VERSION = "2024-11-05"
 DEFAULT_COMMAND_LOG_FILE = "mcp_command_log.jsonl"
@@ -47,6 +96,28 @@ DEPENDENCY_AWARE_BUILD_SYSTEMS = {
     "npm",
     "pnpm",
     "poetry",
+}
+
+_ORCHESTRATION_GATE_PROPERTIES: dict[str, Any] = {
+    "orchestration_id": {
+        "type": "string",
+        "description": (
+            "When set together with agent_run_id and capability_token, enforces preflight, "
+            "record-launch artifacts, phase_state child_running, and capability permissions."
+        ),
+    },
+    "agent_run_id": {
+        "type": "string",
+        "description": "Child agent_run_id that owns the capability token.",
+    },
+    "capability_token": {
+        "type": "string",
+        "description": "Secret from workspace/orchestrations/<id>/capabilities/<agent_run_id>.json.",
+    },
+    "repo_root": {
+        "type": "string",
+        "description": "Repository root containing workspace/orchestrations/. Defaults to project_dir.",
+    },
 }
 
 
@@ -373,6 +444,11 @@ def tool_detect_build_system(args: dict[str, Any]) -> dict[str, Any]:
 
 def tool_compile_project(args: dict[str, Any]) -> dict[str, Any]:
     project_dir = str(args.get("project_dir", "."))
+    _maybe_enforce_orchestration_mcp_gate(
+        tool_name="compile_project",
+        project_dir=project_dir,
+        args=args,
+    )
     language = str(args.get("language", "")).strip().lower()
     target = args.get("target")
     jobs = int(args.get("jobs", max(1, (os.cpu_count() or 1) // 2)))
@@ -424,6 +500,11 @@ def tool_compile_project(args: dict[str, Any]) -> dict[str, Any]:
 
 def tool_run_program(args: dict[str, Any]) -> dict[str, Any]:
     project_dir = str(args.get("project_dir", "."))
+    _maybe_enforce_orchestration_mcp_gate(
+        tool_name="run_program",
+        project_dir=project_dir,
+        args=args,
+    )
     timeout_sec = int(args.get("timeout_sec", 3600))
     capture_limit = int(args.get("capture_limit", 120000))
     command_log_path = args.get("command_log_path")
@@ -476,6 +557,11 @@ def tool_run_program(args: dict[str, Any]) -> dict[str, Any]:
 
 def tool_run_quality_checks(args: dict[str, Any]) -> dict[str, Any]:
     project_dir = str(args.get("project_dir", "."))
+    _maybe_enforce_orchestration_mcp_gate(
+        tool_name="run_quality_checks",
+        project_dir=project_dir,
+        args=args,
+    )
     timeout_sec = int(args.get("timeout_sec", 1800))
     capture_limit = int(args.get("capture_limit", 120000))
     command_log_path = args.get("command_log_path")
@@ -538,6 +624,11 @@ def tool_run_linter(args: dict[str, Any]) -> dict[str, Any]:
     This is not compile_project and does not route through build_system.
     """
     project_dir = str(args.get("project_dir", "."))
+    _maybe_enforce_orchestration_mcp_gate(
+        tool_name="run_linter",
+        project_dir=project_dir,
+        args=args,
+    )
     timeout_sec = int(args.get("timeout_sec", 1800))
     capture_limit = int(args.get("capture_limit", 120000))
     command_log_path = args.get("command_log_path")
@@ -675,6 +766,7 @@ TOOLS: dict[str, Tool] = {
                     "type": "object",
                     "additionalProperties": {"type": "string"},
                 },
+                **_ORCHESTRATION_GATE_PROPERTIES,
             },
             "required": ["project_dir"],
         },
@@ -712,6 +804,7 @@ TOOLS: dict[str, Tool] = {
                     "type": "object",
                     "additionalProperties": {"type": "string"},
                 },
+                **_ORCHESTRATION_GATE_PROPERTIES,
             },
             "required": ["project_dir", "command"],
         },
@@ -738,6 +831,7 @@ TOOLS: dict[str, Tool] = {
                     "type": "object",
                     "additionalProperties": {"type": "string"},
                 },
+                **_ORCHESTRATION_GATE_PROPERTIES,
             },
             "required": ["project_dir"],
         },
@@ -768,6 +862,7 @@ TOOLS: dict[str, Tool] = {
                     "type": "object",
                     "additionalProperties": {"type": "string"},
                 },
+                **_ORCHESTRATION_GATE_PROPERTIES,
             },
             "required": ["project_dir"],
         },

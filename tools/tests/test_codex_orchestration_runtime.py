@@ -8,10 +8,12 @@ import json
 import os
 import tempfile
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
+
+from mcp_servers.build_runtime_server import tool_compile_project
 
 from tools.codex_orchestration_runtime import (
     _build_artifact_hashes,
@@ -26,9 +28,13 @@ from tools.codex_orchestration_runtime import (
     build_skill_must_read_refs,
     check_step_completed,
     enable_checkpoint_resume,
+    gate_apply_patch_writes,
     get_preflight_ttl_status,
+    guarded_apply_patch,
     init_orchestration,
+    log_orchestration_read,
     main,
+    merge_phase_state_for_resume,
     parse_feature_list,
     probe_execution_platform,
     prepare_launch_request_payload,
@@ -36,8 +42,10 @@ from tools.codex_orchestration_runtime import (
     record_agent_run,
     record_launch,
     render_launch_prompt_text,
+    run_gate,
     update_checkpoint,
     update_orchestration_status,
+    validate_mcp_build_tool_invocation,
     verify_checkpoint_integrity,
     write_preflight,
     write_step_result,
@@ -135,6 +143,43 @@ def _spawn_response_payload(session_id: str) -> dict[str, object]:
         "accepted": True,
         "launch_reply": f"accepted: {session_id}",
     }
+
+
+def _write_apply_patch_gate_evidence(
+    repo_root: Path,
+    *,
+    orchestration_id: str,
+    agent_run_id: str,
+    actor_role: str,
+    changed_paths: list[str],
+) -> None:
+    gate_path = (
+        repo_root
+        / "workspace"
+        / "orchestrations"
+        / orchestration_id
+        / "gates"
+        / agent_run_id
+        / "apply_patch_writes.json"
+    )
+    gate_path.parent.mkdir(parents=True, exist_ok=True)
+    gate_path.write_text(
+        json.dumps(
+            {
+                "orchestration_id": orchestration_id,
+                "agent_run_id": agent_run_id,
+                "gate": "apply_patch_writes",
+                "args_json": {"actor_role": actor_role, "changed_paths": changed_paths},
+                "status": "pass",
+                "exit_code": 0,
+                "violations": [],
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
 
 
 class _FakeCompletedProcess:
@@ -501,6 +546,7 @@ shell_tool                       stable             true
         self.assertIn("あなたは step agent である。", prompt)
         self.assertIn("必須要件:", prompt)
         self.assertIn("完了返答には `launch_reply`", prompt)
+        self.assertIn("guarded-apply-patch", prompt)
 
     def test_writes_orchestration_artifacts_in_canonical_layout(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -596,6 +642,16 @@ shell_tool                       stable             true
                     "started_at": "2026-03-11T00:00:00Z",
                 },
             )
+            _write_apply_patch_gate_evidence(
+                repo_root,
+                orchestration_id="orch_001",
+                agent_run_id="substep_run_plan_generate_001",
+                actor_role="substep",
+                changed_paths=[
+                    "workspace/plans/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/case.resolved.yaml",
+                    "workspace/plans/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/plan_meta.json",
+                ],
+            )
             record_agent_run(
                 repo_root=repo_root,
                 orchestration_id="orch_001",
@@ -622,6 +678,15 @@ shell_tool                       stable             true
                         "workspace/plans/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/plan_meta.json",
                     ],
                 },
+            )
+            _write_apply_patch_gate_evidence(
+                repo_root,
+                orchestration_id="orch_001",
+                agent_run_id="step_run_build_001",
+                actor_role="step",
+                changed_paths=[
+                    "workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/build/build_001/bin/simulate"
+                ],
             )
             record_agent_run(
                 repo_root=repo_root,
@@ -1396,6 +1461,16 @@ shell_tool                       stable             true
                 },
                 response_payload=_spawn_response_payload("sess_substep_plan_generate_001"),
             )
+            _write_apply_patch_gate_evidence(
+                repo_root,
+                orchestration_id="orch_001",
+                agent_run_id="substep_run_plan_generate_001",
+                actor_role="substep",
+                changed_paths=[
+                    "workspace/plans/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/impl.resolved.yaml",
+                    "workspace/plans/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/plan_meta.json",
+                ],
+            )
             record_agent_run(
                 repo_root=repo_root,
                 orchestration_id="orch_001",
@@ -1810,6 +1885,15 @@ shell_tool                       stable             true
                         ),
                     },
                     response_payload=_spawn_response_payload("sess_step_build_001"),
+                )
+                _write_apply_patch_gate_evidence(
+                    repo_root,
+                    orchestration_id="orch_001",
+                    agent_run_id="step_run_build_001",
+                    actor_role="step",
+                    changed_paths=[
+                        "workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/build/build_001/bin/simulate"
+                    ],
                 )
                 record_agent_run(
                     repo_root=repo_root,
@@ -3790,6 +3874,900 @@ class PreflightLiveProbeTtlTests(unittest.TestCase):
             self.assertTrue(out["preflight_exists"])
             self.assertIn("ttl_remaining_seconds", out)
             self.assertTrue(out["probe_skippable"])
+
+
+class TestPhase1RuleSourceAudit(unittest.TestCase):
+    def test_phase1_init_preflight_record_launch_writes_audit_artifacts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            init_orchestration(repo_root=repo_root, orchestration_id="orch_001")
+            orch = repo_root / "workspace/orchestrations/orch_001"
+            self.assertTrue((orch / "access_policies").is_dir())
+            self.assertTrue((orch / "access_logs").is_dir())
+            self.assertTrue((orch / "violations").is_dir())
+            ps0 = json.loads((orch / "phase_state.json").read_text(encoding="utf-8"))
+            self.assertEqual(ps0.get("current_state"), "initialized")
+            self.assertEqual(ps0.get("orchestration_id"), "orch_001")
+            self.assertIsInstance(ps0.get("node_states"), dict)
+
+            write_preflight(
+                repo_root=repo_root,
+                orchestration_id="orch_001",
+                payload={
+                    "status": "pass",
+                    "can_launch_step_agents": True,
+                    "can_launch_substep_agents": True,
+                    "feature_states": {"multi_agent": True},
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}],
+                },
+            )
+            ps1 = json.loads((orch / "phase_state.json").read_text(encoding="utf-8"))
+            self.assertEqual(ps1.get("current_state"), "preflight_passed")
+            log_lines = (orch / "phase_state_log.jsonl").read_text(encoding="utf-8").strip().splitlines()
+            self.assertGreaterEqual(len(log_lines), 2)
+            last = json.loads(log_lines[-1])
+            self.assertEqual(last.get("event"), "preflight_written")
+            self.assertEqual(last.get("to"), "preflight_passed")
+
+            record_launch(
+                repo_root=repo_root,
+                orchestration_id="orch_001",
+                parent_agent_run_id="orch_run_001",
+                child_agent_run_id="substep_p1_001",
+                request_payload={
+                    "agent_run_id": "substep_p1_001",
+                    "agent_role": "substep",
+                    "node_key": "problem/shallow_water2d@0.3.0",
+                    "step": "plan",
+                    "substep": "generate",
+                    "orchestration_id": "orch_001",
+                    "parent_agent_run_id": "orch_run_001",
+                    "plan_ref": _FIX_PLAN_REF,
+                    "pipeline_ref": _FIX_PIPE_REF,
+                    "dependency_ref": _FIX_DEP_REF,
+                    "skill_name": "workflow-plan-generate",
+                    "skill_ref": "skills/workflow-plan-generate/SKILL.md",
+                    "skill_must_read_refs": "",
+                    "launch_prompt_full": _substep_launch_prompt(
+                        "problem/shallow_water2d@0.3.0",
+                        "plan",
+                        "generate",
+                        "substep_p1_001",
+                    ),
+                },
+                response_payload={
+                    "agent_run_id": "substep_p1_001",
+                    **_spawn_response_payload("sess_substep_p1"),
+                },
+            )
+            pol_path = orch / "access_policies" / "substep_p1_001.json"
+            self.assertTrue(pol_path.exists())
+            policy = json.loads(pol_path.read_text(encoding="utf-8"))
+            self.assertEqual(policy.get("agent_run_id"), "substep_p1_001")
+            self.assertEqual(policy.get("step"), "plan")
+            self.assertEqual(policy.get("substep"), "generate")
+            self.assertEqual(policy.get("denied_read_roots"), ["tools/"])
+            self.assertIn("docs/", policy.get("allowed_read_roots", []))
+            self.assertIn("spec/", policy.get("allowed_read_roots", []))
+            self.assertIn(
+                _FIX_PLAN_REF.rstrip("/") + "/",
+                policy.get("allowed_read_roots", []),
+            )
+            self.assertIn(
+                _FIX_PIPE_REF.rstrip("/") + "/",
+                policy.get("allowed_read_roots", []),
+            )
+            self.assertEqual(
+                policy.get("allowed_gate_services"),
+                [
+                    "validate_pipeline_semantics",
+                    "check_artifact_syntax",
+                    "validate_workspace_root",
+                    "orchestration_read",
+                    "apply_patch_writes",
+                ],
+            )
+            cap_path = orch / "capabilities" / "substep_p1_001.json"
+            self.assertTrue(cap_path.exists())
+            cap = json.loads(cap_path.read_text(encoding="utf-8"))
+            self.assertEqual(cap.get("agent_run_id"), "substep_p1_001")
+            self.assertEqual(cap.get("step"), "plan")
+            self.assertTrue(isinstance(cap.get("capability_token"), str) and cap["capability_token"])
+            self.assertIn(_FIX_PLAN_REF.rstrip("/") + "/", cap.get("write_roots", []))
+            ps_launch = json.loads((orch / "phase_state.json").read_text(encoding="utf-8"))
+            node_safe = "problem__shallow_water2d__0.3.0"
+            self.assertEqual(
+                ps_launch.get("node_states", {}).get(node_safe, {}).get("plan"),
+                "child_running",
+            )
+
+    def test_phase2_orchestration_read_denied_tools_emits_rule_source_violation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            (repo_root / "tools").mkdir(parents=True, exist_ok=True)
+            (repo_root / "tools" / "p1_dummy.txt").write_text("dummy-tools-read\n", encoding="utf-8")
+            init_orchestration(repo_root=repo_root, orchestration_id="orch_001")
+            write_preflight(
+                repo_root=repo_root,
+                orchestration_id="orch_001",
+                payload={
+                    "status": "pass",
+                    "can_launch_step_agents": True,
+                    "can_launch_substep_agents": True,
+                    "feature_states": {"multi_agent": True},
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}],
+                },
+            )
+            record_launch(
+                repo_root=repo_root,
+                orchestration_id="orch_001",
+                parent_agent_run_id="orch_run_001",
+                child_agent_run_id="child_p1r",
+                request_payload={
+                    "agent_run_id": "child_p1r",
+                    "agent_role": "substep",
+                    "node_key": "problem/shallow_water2d@0.3.0",
+                    "step": "plan",
+                    "substep": "generate",
+                    "orchestration_id": "orch_001",
+                    "parent_agent_run_id": "orch_run_001",
+                    "plan_ref": _FIX_PLAN_REF,
+                    "pipeline_ref": _FIX_PIPE_REF,
+                    "dependency_ref": _FIX_DEP_REF,
+                    "skill_name": "workflow-plan-generate",
+                    "skill_ref": "skills/workflow-plan-generate/SKILL.md",
+                    "skill_must_read_refs": "",
+                    "launch_prompt_full": _substep_launch_prompt(
+                        "problem/shallow_water2d@0.3.0",
+                        "plan",
+                        "generate",
+                        "child_p1r",
+                    ),
+                },
+                response_payload={"agent_run_id": "child_p1r", **_spawn_response_payload("sess_p1r")},
+            )
+            with self.assertRaisesRegex(RuntimeError, "orchestration-read denied"):
+                log_orchestration_read(
+                    repo_root=repo_root,
+                    orchestration_id="orch_001",
+                    agent_run_id="child_p1r",
+                    read_path="tools/p1_dummy.txt",
+                )
+            viol = (
+                repo_root
+                / "workspace/orchestrations/orch_001/violations/child_p1r.rule_source_violation.json"
+            )
+            self.assertTrue(viol.exists())
+            vdoc = json.loads(viol.read_text(encoding="utf-8"))
+            self.assertEqual(vdoc.get("kind"), "rule_source_violation")
+            self.assertEqual(vdoc.get("read_path"), "tools/p1_dummy.txt")
+            meta = json.loads(
+                (repo_root / "workspace/orchestrations/orch_001/orchestration_meta.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(meta.get("status"), "fail")
+            log_path = (
+                repo_root
+                / "workspace/orchestrations/orch_001/access_logs/child_p1r.jsonl"
+            )
+            self.assertTrue(log_path.exists())
+            log_entry = json.loads(log_path.read_text(encoding="utf-8").strip().splitlines()[-1])
+            self.assertTrue(log_entry.get("denied_match"))
+            self.assertEqual(log_entry.get("path"), "tools/p1_dummy.txt")
+
+    def test_phase2_orchestration_read_rejects_path_outside_allowed_roots(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            (repo_root / "plans").mkdir(parents=True, exist_ok=True)
+            (repo_root / "plans" / "outside.txt").write_text("ng\n", encoding="utf-8")
+            init_orchestration(repo_root=repo_root, orchestration_id="orch_001")
+            write_preflight(
+                repo_root=repo_root,
+                orchestration_id="orch_001",
+                payload={
+                    "status": "pass",
+                    "can_launch_step_agents": True,
+                    "can_launch_substep_agents": True,
+                    "feature_states": {"multi_agent": True},
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}],
+                },
+            )
+            record_launch(
+                repo_root=repo_root,
+                orchestration_id="orch_001",
+                parent_agent_run_id="orch_run_001",
+                child_agent_run_id="child_p1r",
+                request_payload={
+                    "agent_run_id": "child_p1r",
+                    "agent_role": "substep",
+                    "node_key": "problem/shallow_water2d@0.3.0",
+                    "step": "plan",
+                    "substep": "generate",
+                    "orchestration_id": "orch_001",
+                    "parent_agent_run_id": "orch_run_001",
+                    "plan_ref": _FIX_PLAN_REF,
+                    "pipeline_ref": _FIX_PIPE_REF,
+                    "dependency_ref": _FIX_DEP_REF,
+                    "skill_name": "workflow-plan-generate",
+                    "skill_ref": "skills/workflow-plan-generate/SKILL.md",
+                    "skill_must_read_refs": "",
+                    "launch_prompt_full": _substep_launch_prompt(
+                        "problem/shallow_water2d@0.3.0",
+                        "plan",
+                        "generate",
+                        "child_p1r",
+                    ),
+                },
+                response_payload={"agent_run_id": "child_p1r", **_spawn_response_payload("sess_p1r")},
+            )
+            with self.assertRaisesRegex(RuntimeError, "outside allowed_read_roots"):
+                log_orchestration_read(
+                    repo_root=repo_root,
+                    orchestration_id="orch_001",
+                    agent_run_id="child_p1r",
+                    read_path="plans/outside.txt",
+                )
+            log_path = (
+                repo_root
+                / "workspace/orchestrations/orch_001/access_logs/child_p1r.jsonl"
+            )
+            self.assertTrue(log_path.exists())
+            log_entry = json.loads(log_path.read_text(encoding="utf-8").strip().splitlines()[-1])
+            self.assertFalse(log_entry.get("allowed_match"))
+            self.assertFalse(log_entry.get("denied_match"))
+            self.assertEqual(log_entry.get("path"), "plans/outside.txt")
+
+    def test_phase1_resume_missing_phase_state_infers_preflight_passed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            init_orchestration(repo_root=repo_root, orchestration_id="orch_p1m")
+            write_preflight(
+                repo_root=repo_root,
+                orchestration_id="orch_p1m",
+                payload={
+                    "status": "pass",
+                    "can_launch_step_agents": True,
+                    "can_launch_substep_agents": True,
+                    "feature_states": {"multi_agent": True},
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}],
+                },
+            )
+            orch = repo_root / "workspace/orchestrations/orch_p1m"
+            (orch / "phase_state.json").unlink()
+            (orch / "phase_state_log.jsonl").unlink()
+            doc = merge_phase_state_for_resume(repo_root, "orch_p1m")
+            self.assertEqual(doc.get("current_state"), "preflight_passed")
+
+    def test_phase1_orchestration_read_cli_outputs_json(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            (repo_root / "docs").mkdir(parents=True, exist_ok=True)
+            (repo_root / "docs" / "p1_doc.txt").write_text("ok\n", encoding="utf-8")
+            init_orchestration(repo_root=repo_root, orchestration_id="orch_001")
+            write_preflight(
+                repo_root=repo_root,
+                orchestration_id="orch_001",
+                payload={
+                    "status": "pass",
+                    "can_launch_step_agents": True,
+                    "can_launch_substep_agents": True,
+                    "feature_states": {"multi_agent": True},
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}],
+                },
+            )
+            record_launch(
+                repo_root=repo_root,
+                orchestration_id="orch_001",
+                parent_agent_run_id="orch_run_001",
+                child_agent_run_id="c_cli",
+                request_payload={
+                    "agent_run_id": "c_cli",
+                    "agent_role": "substep",
+                    "node_key": "problem/shallow_water2d@0.3.0",
+                    "step": "plan",
+                    "substep": "generate",
+                    "orchestration_id": "orch_001",
+                    "parent_agent_run_id": "orch_run_001",
+                    "plan_ref": _FIX_PLAN_REF,
+                    "pipeline_ref": _FIX_PIPE_REF,
+                    "dependency_ref": _FIX_DEP_REF,
+                    "skill_name": "workflow-plan-generate",
+                    "skill_ref": "skills/workflow-plan-generate/SKILL.md",
+                    "skill_must_read_refs": "",
+                    "launch_prompt_full": _substep_launch_prompt(
+                        "problem/shallow_water2d@0.3.0",
+                        "plan",
+                        "generate",
+                        "c_cli",
+                    ),
+                },
+                response_payload={"agent_run_id": "c_cli", **_spawn_response_payload("s_cli")},
+            )
+            cap = json.loads(
+                (
+                    repo_root / "workspace/orchestrations/orch_001/capabilities/c_cli.json"
+                ).read_text(encoding="utf-8")
+            )
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                rc = main(
+                    [
+                        "orchestration-read",
+                        "--repo-root",
+                        str(repo_root),
+                        "--orchestration-id",
+                        "orch_001",
+                        "--agent-run-id",
+                        "c_cli",
+                        "--read-path",
+                        "docs/p1_doc.txt",
+                        "--capability-token",
+                        str(cap["capability_token"]),
+                    ]
+                )
+            self.assertEqual(rc, 0)
+            cli_out = json.loads(buf.getvalue())
+            self.assertFalse(cli_out.get("denied_match"))
+            self.assertEqual(cli_out.get("content"), "ok\n")
+
+
+class TestPhase2PlanGuardsIntegration(unittest.TestCase):
+    def test_validate_mcp_rejects_when_launch_response_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            init_orchestration(repo_root=repo_root, orchestration_id="g1")
+            write_preflight(
+                repo_root=repo_root,
+                orchestration_id="g1",
+                payload={
+                    "status": "pass",
+                    "can_launch_step_agents": True,
+                    "can_launch_substep_agents": True,
+                    "feature_states": {"multi_agent": True},
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}],
+                },
+            )
+            with self.assertRaises(RuntimeError) as ctx:
+                validate_mcp_build_tool_invocation(
+                    repo_root,
+                    orchestration_id="g1",
+                    agent_run_id="ghost_child",
+                    capability_token="unused",
+                    tool_name="compile_project",
+                )
+            self.assertIn("record-launch", str(ctx.exception).lower())
+
+    def test_validate_mcp_accepts_after_record_launch_build_child(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            init_orchestration(repo_root=repo_root, orchestration_id="g2")
+            write_preflight(
+                repo_root=repo_root,
+                orchestration_id="g2",
+                payload={
+                    "status": "pass",
+                    "can_launch_step_agents": True,
+                    "can_launch_substep_agents": True,
+                    "feature_states": {"multi_agent": True},
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}],
+                },
+            )
+            g2_req = {
+                "agent_run_id": "build_child_1",
+                "agent_role": "step",
+                "node_key": "problem/shallow_water2d@0.3.0",
+                "step": "build",
+                "orchestration_id": "g2",
+                "parent_agent_run_id": "orch_g2",
+                "plan_ref": _FIX_PLAN_REF,
+                "pipeline_ref": _FIX_PIPE_REF,
+                "dependency_ref": _FIX_DEP_REF,
+                "skill_name": "workflow-build",
+                "skill_ref": "skills/workflow-build/SKILL.md",
+                "skill_must_read_refs": _fixture_skill_must_read_refs_step("build"),
+                "issue_severity": "none",
+                "repair_strategy": "none",
+                "repair_target_agent_run_id": "none",
+                "repair_reason": "none",
+                "launch_prompt_full": render_launch_prompt_text(
+                    {
+                        "agent_run_id": "build_child_1",
+                        "node_key": "problem/shallow_water2d@0.3.0",
+                        "step": "build",
+                        "orchestration_id": "g2",
+                        "parent_agent_run_id": "orch_g2",
+                        "plan_ref": _FIX_PLAN_REF,
+                        "pipeline_ref": _FIX_PIPE_REF,
+                        "dependency_ref": _FIX_DEP_REF,
+                        "skill_name": "workflow-build",
+                        "skill_ref": "skills/workflow-build/SKILL.md",
+                        "skill_must_read_refs": _fixture_skill_must_read_refs_step("build"),
+                        "issue_severity": "none",
+                        "repair_strategy": "none",
+                        "repair_target_agent_run_id": "none",
+                        "repair_reason": "none",
+                    }
+                ),
+            }
+            record_launch(
+                repo_root=repo_root,
+                orchestration_id="g2",
+                parent_agent_run_id="orch_g2",
+                child_agent_run_id="build_child_1",
+                request_payload=g2_req,
+                response_payload={
+                    "agent_run_id": "build_child_1",
+                    **_spawn_response_payload("sess_build_child_1"),
+                },
+            )
+            cap_path = repo_root / "workspace/orchestrations/g2/capabilities/build_child_1.json"
+            cap = json.loads(cap_path.read_text(encoding="utf-8"))
+            validate_mcp_build_tool_invocation(
+                repo_root,
+                orchestration_id="g2",
+                agent_run_id="build_child_1",
+                capability_token=str(cap["capability_token"]),
+                tool_name="compile_project",
+            )
+
+    def test_tool_compile_project_enforces_gate_when_orchestration_id_set(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            init_orchestration(repo_root=repo_root, orchestration_id="g3")
+            write_preflight(
+                repo_root=repo_root,
+                orchestration_id="g3",
+                payload={
+                    "status": "pass",
+                    "can_launch_step_agents": True,
+                    "can_launch_substep_agents": True,
+                    "feature_states": {"multi_agent": True},
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}],
+                },
+            )
+            with self.assertRaises(RuntimeError) as ctx:
+                tool_compile_project(
+                    {
+                        "project_dir": str(repo_root),
+                        "language": "python",
+                        "build_system": "poetry",
+                        "orchestration_id": "g3",
+                        "agent_run_id": "nolaunch",
+                        "capability_token": "x",
+                        "repo_root": str(repo_root),
+                    }
+                )
+            self.assertIn("record-launch", str(ctx.exception).lower())
+
+    def test_apply_patch_gate_orchestration_rejects_plan_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            init_orchestration(repo_root=repo_root, orchestration_id="g4")
+            bad = f"{_FIX_PLAN_REF}/case.resolved.yaml"
+            with self.assertRaises(RuntimeError):
+                gate_apply_patch_writes(
+                    repo_root,
+                    orchestration_id="g4",
+                    actor_role="orchestration",
+                    changed_paths=[bad],
+                    agent_run_id="orch_actor",
+                    capability_token=None,
+                )
+
+    def test_apply_patch_gate_orchestration_allows_orchestration_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            init_orchestration(repo_root=repo_root, orchestration_id="g5")
+            out = gate_apply_patch_writes(
+                repo_root,
+                orchestration_id="g5",
+                actor_role="orchestration",
+                changed_paths=["workspace/orchestrations/g5/orchestration_meta.json"],
+                agent_run_id="orch_actor",
+                capability_token=None,
+            )
+            self.assertTrue(out.get("allowed"))
+
+    def test_apply_patch_gate_plan_child_rejects_pipeline_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            init_orchestration(repo_root=repo_root, orchestration_id="g6")
+            write_preflight(
+                repo_root=repo_root,
+                orchestration_id="g6",
+                payload={
+                    "status": "pass",
+                    "can_launch_step_agents": True,
+                    "can_launch_substep_agents": True,
+                    "feature_states": {"multi_agent": True},
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}],
+                },
+            )
+            g6_req = {
+                "agent_run_id": "plan_sub_1",
+                "agent_role": "substep",
+                "node_key": "problem/shallow_water2d@0.3.0",
+                "step": "plan",
+                "substep": "generate",
+                "orchestration_id": "g6",
+                "parent_agent_run_id": "orch_g6",
+                "plan_ref": _FIX_PLAN_REF,
+                "pipeline_ref": _FIX_PIPE_REF,
+                "dependency_ref": _FIX_DEP_REF,
+                "skill_name": "workflow-plan-generate",
+                "skill_ref": "skills/workflow-plan-generate/SKILL.md",
+                "skill_must_read_refs": _fixture_skill_must_read_refs_substep("plan", "generate"),
+                "issue_severity": "none",
+                "repair_strategy": "none",
+                "repair_target_agent_run_id": "none",
+                "repair_reason": "none",
+                "launch_prompt_full": render_launch_prompt_text(
+                    {
+                        "agent_run_id": "plan_sub_1",
+                        "node_key": "problem/shallow_water2d@0.3.0",
+                        "step": "plan",
+                        "substep": "generate",
+                        "orchestration_id": "g6",
+                        "parent_agent_run_id": "orch_g6",
+                        "plan_ref": _FIX_PLAN_REF,
+                        "pipeline_ref": _FIX_PIPE_REF,
+                        "dependency_ref": _FIX_DEP_REF,
+                        "skill_name": "workflow-plan-generate",
+                        "skill_ref": "skills/workflow-plan-generate/SKILL.md",
+                        "skill_must_read_refs": _fixture_skill_must_read_refs_substep("plan", "generate"),
+                        "issue_severity": "none",
+                        "repair_strategy": "none",
+                        "repair_target_agent_run_id": "none",
+                        "repair_reason": "none",
+                    }
+                ),
+            }
+            record_launch(
+                repo_root=repo_root,
+                orchestration_id="g6",
+                parent_agent_run_id="orch_g6",
+                child_agent_run_id="plan_sub_1",
+                request_payload=g6_req,
+                response_payload={"agent_run_id": "plan_sub_1", **_spawn_response_payload("sess_ps1")},
+            )
+            cap = json.loads(
+                (repo_root / "workspace/orchestrations/g6/capabilities/plan_sub_1.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            bad = f"{_FIX_PIPE_REF}/generate/out.txt"
+            with self.assertRaises(RuntimeError):
+                gate_apply_patch_writes(
+                    repo_root,
+                    orchestration_id="g6",
+                    actor_role="substep",
+                    changed_paths=[bad],
+                    agent_run_id="plan_sub_1",
+                    capability_token=str(cap["capability_token"]),
+                )
+
+
+class TestPhase3RunGate(unittest.TestCase):
+    def _setup_run_gate_fixture(self, repo_root: Path) -> str:
+        (repo_root / "workspace").mkdir(parents=True, exist_ok=True)
+        (repo_root / "workspace" / "probe.json").write_text('{"ok": true}\n', encoding="utf-8")
+        init_orchestration(repo_root=repo_root, orchestration_id="rg1")
+        write_preflight(
+            repo_root=repo_root,
+            orchestration_id="rg1",
+            payload={
+                "status": "pass",
+                "can_launch_step_agents": True,
+                "can_launch_substep_agents": True,
+                "feature_states": {"multi_agent": True},
+                "checks": [{"name": "multi_agent_enabled", "pass": True}],
+            },
+        )
+        req = {
+            "agent_run_id": "build_child_rg1",
+            "agent_role": "step",
+            "node_key": "problem/shallow_water2d@0.3.0",
+            "step": "build",
+            "orchestration_id": "rg1",
+            "parent_agent_run_id": "orch_rg1",
+            "plan_ref": _FIX_PLAN_REF,
+            "pipeline_ref": _FIX_PIPE_REF,
+            "dependency_ref": _FIX_DEP_REF,
+            "skill_name": "workflow-build",
+            "skill_ref": "skills/workflow-build/SKILL.md",
+            "skill_must_read_refs": _fixture_skill_must_read_refs_step("build"),
+            "issue_severity": "none",
+            "repair_strategy": "none",
+            "repair_target_agent_run_id": "none",
+            "repair_reason": "none",
+            "launch_prompt_full": render_launch_prompt_text(
+                {
+                    "agent_run_id": "build_child_rg1",
+                    "node_key": "problem/shallow_water2d@0.3.0",
+                    "step": "build",
+                    "orchestration_id": "rg1",
+                    "parent_agent_run_id": "orch_rg1",
+                    "plan_ref": _FIX_PLAN_REF,
+                    "pipeline_ref": _FIX_PIPE_REF,
+                    "dependency_ref": _FIX_DEP_REF,
+                    "skill_name": "workflow-build",
+                    "skill_ref": "skills/workflow-build/SKILL.md",
+                    "skill_must_read_refs": _fixture_skill_must_read_refs_step("build"),
+                    "issue_severity": "none",
+                    "repair_strategy": "none",
+                    "repair_target_agent_run_id": "none",
+                    "repair_reason": "none",
+                }
+            ),
+        }
+        record_launch(
+            repo_root=repo_root,
+            orchestration_id="rg1",
+            parent_agent_run_id="orch_rg1",
+            child_agent_run_id="build_child_rg1",
+            request_payload=req,
+            response_payload={
+                "agent_run_id": "build_child_rg1",
+                **_spawn_response_payload("sess_build_child_rg1"),
+            },
+        )
+        cap = json.loads(
+            (
+                repo_root
+                / "workspace/orchestrations/rg1/capabilities/build_child_rg1.json"
+            ).read_text(encoding="utf-8")
+        )
+        return str(cap["capability_token"])
+
+    def test_run_gate_writes_artifact_and_cli_stdout_contract(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            token = self._setup_run_gate_fixture(repo_root)
+            out = run_gate(
+                repo_root,
+                orchestration_id="rg1",
+                gate_name="check_artifact_syntax",
+                agent_run_id="build_child_rg1",
+                args_json={"paths": ["workspace/probe.json"]},
+                capability_token=token,
+            )
+            self.assertEqual(list(out.keys()), ["violations", "gate_result_ref"])
+            self.assertEqual(out["violations"], [])
+            gate_ref = out["gate_result_ref"]
+            self.assertEqual(
+                gate_ref,
+                "workspace/orchestrations/rg1/gates/build_child_rg1/check_artifact_syntax.json",
+            )
+            gate_path = repo_root / gate_ref
+            self.assertTrue(gate_path.exists())
+            gate_doc = json.loads(gate_path.read_text(encoding="utf-8"))
+            self.assertEqual(gate_doc.get("gate"), "check_artifact_syntax")
+            self.assertEqual(gate_doc.get("status"), "pass")
+            self.assertEqual(gate_doc.get("violations"), [])
+
+            buf = io.StringIO()
+            rc = None
+            with redirect_stdout(buf):
+                rc = main(
+                    [
+                        "run-gate",
+                        "--repo-root",
+                        str(repo_root),
+                        "--orchestration-id",
+                        "rg1",
+                        "--gate",
+                        "check_artifact_syntax",
+                        "--agent-run-id",
+                        "build_child_rg1",
+                        "--args-json",
+                        json.dumps({"paths": ["workspace/probe.json"]}),
+                        "--capability-token",
+                        token,
+                    ]
+                )
+            self.assertEqual(rc, 0)
+            cli_out = json.loads(buf.getvalue())
+            self.assertEqual(set(cli_out.keys()), {"violations", "gate_result_ref"})
+
+    def test_run_gate_orchestration_read_uses_inline_gate(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            (repo_root / "docs").mkdir(parents=True, exist_ok=True)
+            (repo_root / "docs" / "inline_gate.txt").write_text("inline\n", encoding="utf-8")
+            token = self._setup_run_gate_fixture(repo_root)
+            out = run_gate(
+                repo_root,
+                orchestration_id="rg1",
+                gate_name="orchestration_read",
+                agent_run_id="build_child_rg1",
+                args_json={"read_path": "docs/inline_gate.txt"},
+                capability_token=token,
+            )
+            self.assertEqual(out.get("violations"), [])
+            gate_ref = out.get("gate_result_ref")
+            self.assertEqual(
+                gate_ref,
+                "workspace/orchestrations/rg1/gates/build_child_rg1/orchestration_read.json",
+            )
+            self.assertEqual(out.get("result", {}).get("content"), "inline\n")
+            gate_doc = json.loads((repo_root / str(gate_ref)).read_text(encoding="utf-8"))
+            self.assertEqual(gate_doc.get("status"), "pass")
+            self.assertEqual(gate_doc.get("result", {}).get("content"), "inline\n")
+
+    def test_run_gate_apply_patch_writes_uses_inline_gate(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            token = self._setup_run_gate_fixture(repo_root)
+            out = run_gate(
+                repo_root,
+                orchestration_id="rg1",
+                gate_name="apply_patch_writes",
+                agent_run_id="build_child_rg1",
+                args_json={
+                    "actor_role": "step",
+                    "changed_paths": [f"{_FIX_PIPE_REF}/build/new_artifact.json"],
+                },
+                capability_token=token,
+            )
+            self.assertEqual(out.get("violations"), [])
+            result = out.get("result", {})
+            self.assertTrue(result.get("allowed"))
+            self.assertEqual(
+                result.get("checked_paths"),
+                [f"{_FIX_PIPE_REF}/build/new_artifact.json"],
+            )
+
+    def test_guarded_apply_patch_calls_git_apply_after_gate(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            token = self._setup_run_gate_fixture(repo_root)
+            patch_text = "\n".join(
+                [
+                    "diff --git a/workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/build/new_artifact.json b/workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/build/new_artifact.json",
+                    "--- a/workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/build/new_artifact.json",
+                    "+++ b/workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/build/new_artifact.json",
+                    "@@ -0,0 +1 @@",
+                    "+{\"ok\": true}",
+                    "",
+                ]
+            )
+            with patch("tools.codex_orchestration_runtime.subprocess.run") as run_mock:
+                run_mock.return_value = _FakeCompletedProcess(returncode=0, stdout="", stderr="")
+                out = guarded_apply_patch(
+                    repo_root,
+                    orchestration_id="rg1",
+                    actor_role="step",
+                    agent_run_id="build_child_rg1",
+                    changed_paths=[f"{_FIX_PIPE_REF}/build/new_artifact.json"],
+                    patch_text=patch_text,
+                    capability_token=token,
+                )
+            self.assertTrue(out.get("applied"))
+            self.assertEqual(
+                out.get("gate_result_ref"),
+                "workspace/orchestrations/rg1/gates/build_child_rg1/apply_patch_writes.json",
+            )
+            self.assertEqual(run_mock.call_count, 1)
+
+    def test_guarded_apply_patch_rejects_patch_outside_declared_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            token = self._setup_run_gate_fixture(repo_root)
+            patch_text = "\n".join(
+                [
+                    "diff --git a/workspace/orchestrations/rg1/orchestration_meta.json b/workspace/orchestrations/rg1/orchestration_meta.json",
+                    "--- a/workspace/orchestrations/rg1/orchestration_meta.json",
+                    "+++ b/workspace/orchestrations/rg1/orchestration_meta.json",
+                    "@@ -1 +1 @@",
+                    "-{}",
+                    "+{\"status\": \"running\"}",
+                    "",
+                ]
+            )
+            with patch("tools.codex_orchestration_runtime.subprocess.run") as run_mock:
+                with self.assertRaisesRegex(RuntimeError, "not covered by changed_paths"):
+                    guarded_apply_patch(
+                        repo_root,
+                        orchestration_id="rg1",
+                        actor_role="step",
+                        agent_run_id="build_child_rg1",
+                        changed_paths=[f"{_FIX_PIPE_REF}/build/"],
+                        patch_text=patch_text,
+                        capability_token=token,
+                    )
+            self.assertEqual(run_mock.call_count, 0)
+
+    def test_main_guarded_apply_patch_returns_nonzero_on_gate_rejection(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            token = self._setup_run_gate_fixture(repo_root)
+            patch_text = "\n".join(
+                [
+                    "diff --git a/workspace/orchestrations/rg1/orchestration_meta.json b/workspace/orchestrations/rg1/orchestration_meta.json",
+                    "--- a/workspace/orchestrations/rg1/orchestration_meta.json",
+                    "+++ b/workspace/orchestrations/rg1/orchestration_meta.json",
+                    "@@ -1 +1 @@",
+                    "-{}",
+                    "+{\"status\": \"running\"}",
+                    "",
+                ]
+            )
+            err = io.StringIO()
+            with redirect_stderr(err):
+                rc = main(
+                    [
+                        "guarded-apply-patch",
+                        "--repo-root",
+                        str(repo_root),
+                        "--orchestration-id",
+                        "rg1",
+                        "--actor-role",
+                        "step",
+                        "--agent-run-id",
+                        "build_child_rg1",
+                        "--paths-json",
+                        json.dumps([f"{_FIX_PIPE_REF}/build/new_artifact.json"]),
+                        "--patch-text",
+                        patch_text,
+                        "--capability-token",
+                        token,
+                    ]
+                )
+            self.assertEqual(rc, 1)
+            self.assertIn("not covered by changed_paths", err.getvalue())
+
+    def test_run_gate_rejects_gate_not_allowed_by_policy(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            token = self._setup_run_gate_fixture(repo_root)
+            pol = repo_root / "workspace/orchestrations/rg1/access_policies/build_child_rg1.json"
+            body = json.loads(pol.read_text(encoding="utf-8"))
+            body["allowed_gate_services"] = ["validate_workspace_root"]
+            pol.write_text(json.dumps(body, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+            with self.assertRaisesRegex(RuntimeError, "not permitted by access policy"):
+                run_gate(
+                    repo_root,
+                    orchestration_id="rg1",
+                    gate_name="check_artifact_syntax",
+                    agent_run_id="build_child_rg1",
+                    args_json={"paths": ["workspace/probe.json"]},
+                    capability_token=token,
+                )
+
+    def test_run_gate_stdout_does_not_expose_input_file_body(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            secret = "SENSITIVE_PAYLOAD_DO_NOT_EXPOSE"
+            (repo_root / "workspace").mkdir(parents=True, exist_ok=True)
+            (repo_root / "workspace" / "broken.json").write_text(secret + "\n", encoding="utf-8")
+            token = self._setup_run_gate_fixture(repo_root)
+            out_buf = io.StringIO()
+            rc = None
+            with redirect_stdout(out_buf):
+                rc = main(
+                    [
+                        "run-gate",
+                        "--repo-root",
+                        str(repo_root),
+                        "--orchestration-id",
+                        "rg1",
+                        "--gate",
+                        "check_artifact_syntax",
+                        "--agent-run-id",
+                        "build_child_rg1",
+                        "--args-json",
+                        json.dumps({"paths": ["workspace/broken.json"]}),
+                        "--capability-token",
+                        token,
+                    ]
+                )
+            self.assertEqual(rc, 0)
+            stdout_text = out_buf.getvalue()
+            self.assertNotIn(secret, stdout_text)
+            cli_out = json.loads(stdout_text)
+            self.assertIn("violations", cli_out)
+            self.assertGreaterEqual(len(cli_out["violations"]), 1)
 
 
 if __name__ == "__main__":

@@ -8,13 +8,14 @@ import hashlib
 import json
 import os
 import re
+import secrets
 import subprocess
 import sys
 import traceback
 from functools import lru_cache
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Sequence
 
 
 TERMINAL_STATUSES = {"pass", "fail", "blocked", "timeout", "cancel"}
@@ -68,6 +69,1143 @@ def _write_text(path: Path, text: str) -> None:
 
 def _orchestration_root(repo_root: Path, orchestration_id: str) -> Path:
     return repo_root / "workspace" / "orchestrations" / orchestration_id
+
+
+# --- Phase 1: access policy / phase state artifact layout (Item 10) ---
+
+DEFAULT_ALLOWED_GATE_SERVICES: tuple[str, ...] = (
+    "validate_pipeline_semantics",
+    "check_artifact_syntax",
+    "validate_workspace_root",
+    "orchestration_read",
+    "apply_patch_writes",
+)
+
+STEP_KEYS_FOR_NODE_STATE: tuple[str, ...] = (
+    "plan",
+    "generate",
+    "build",
+    "execute",
+    "judge",
+)
+
+
+def _access_policies_dir(repo_root: Path, orchestration_id: str) -> Path:
+    return _orchestration_root(repo_root, orchestration_id) / "access_policies"
+
+
+def _access_logs_dir(repo_root: Path, orchestration_id: str) -> Path:
+    return _orchestration_root(repo_root, orchestration_id) / "access_logs"
+
+
+def _violations_dir(repo_root: Path, orchestration_id: str) -> Path:
+    return _orchestration_root(repo_root, orchestration_id) / "violations"
+
+
+def _capabilities_dir(repo_root: Path, orchestration_id: str) -> Path:
+    return _orchestration_root(repo_root, orchestration_id) / "capabilities"
+
+
+def _gates_dir(repo_root: Path, orchestration_id: str) -> Path:
+    return _orchestration_root(repo_root, orchestration_id) / "gates"
+
+
+def _phase_state_path(repo_root: Path, orchestration_id: str) -> Path:
+    return _orchestration_root(repo_root, orchestration_id) / "phase_state.json"
+
+
+def _phase_state_log_path(repo_root: Path, orchestration_id: str) -> Path:
+    return _orchestration_root(repo_root, orchestration_id) / "phase_state_log.jsonl"
+
+
+def _ensure_orchestration_audit_dirs(repo_root: Path, orchestration_id: str) -> None:
+    root = _orchestration_root(repo_root, orchestration_id)
+    for sub in ("access_policies", "access_logs", "violations", "capabilities"):
+        (root / sub).mkdir(parents=True, exist_ok=True)
+
+
+def _new_phase_state_document(orchestration_id: str) -> dict[str, Any]:
+    return {
+        "orchestration_id": orchestration_id,
+        "current_state": "initialized",
+        "node_states": {},
+    }
+
+
+def _append_phase_state_log(
+    repo_root: Path,
+    orchestration_id: str,
+    entry: dict[str, Any],
+) -> None:
+    path = _phase_state_log_path(repo_root, orchestration_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    line = json.dumps(entry, ensure_ascii=False)
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(line + "\n")
+
+
+def _write_phase_state(repo_root: Path, orchestration_id: str, doc: dict[str, Any]) -> None:
+    _write_json(_phase_state_path(repo_root, orchestration_id), doc)
+
+
+def _load_phase_state(repo_root: Path, orchestration_id: str) -> dict[str, Any] | None:
+    path = _phase_state_path(repo_root, orchestration_id)
+    if not path.exists():
+        return None
+    try:
+        data = _read_json(path)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"phase_state.json is invalid JSON: {path}") from exc
+    if not isinstance(data, dict):
+        raise RuntimeError(f"phase_state.json must be object: {path}")
+    return data
+
+
+def _merge_node_states(
+    existing: Any,
+    orchestration_id: str,
+) -> dict[str, dict[str, str]]:
+    """checkpoint と矛盾しないよう既存 node_states を保持しつつ欠損キーを補う。"""
+    merged: dict[str, dict[str, str]] = {}
+    if isinstance(existing, dict):
+        for node_key, steps in existing.items():
+            if not isinstance(node_key, str) or not node_key.strip():
+                continue
+            if not isinstance(steps, dict):
+                continue
+            inner: dict[str, str] = {}
+            for sk in STEP_KEYS_FOR_NODE_STATE:
+                v = steps.get(sk)
+                if isinstance(v, str) and v.strip():
+                    inner[sk] = v.strip()
+                else:
+                    inner[sk] = "not_started"
+            merged[node_key.strip()] = inner
+    return merged
+
+
+def init_phase_state_json(
+    repo_root: Path,
+    orchestration_id: str,
+    *,
+    reason: str = "init",
+) -> dict[str, Any]:
+    """`phase_state.json` を新規 orchestration 用に書き出す。"""
+    _ensure_orchestration_audit_dirs(repo_root, orchestration_id)
+    doc = _new_phase_state_document(orchestration_id)
+    _write_phase_state(repo_root, orchestration_id, doc)
+    _append_phase_state_log(
+        repo_root,
+        orchestration_id,
+        {
+            "ts": _utc_now_iso(),
+            "event": reason,
+            "from": None,
+            "to": doc["current_state"],
+        },
+    )
+    return doc
+
+
+def _initial_current_state_when_phase_state_missing(
+    repo_root: Path,
+    orchestration_id: str,
+) -> str:
+    """レガシー orchestration で `phase_state.json` が無い場合の `current_state` 推定値。"""
+    path = _preflight_path(repo_root, orchestration_id)
+    if not path.exists():
+        return "initialized"
+    try:
+        payload = _read_json(path)
+    except (json.JSONDecodeError, OSError):
+        return "initialized"
+    if isinstance(payload, dict) and _preflight_allows_agent_launch(payload):
+        return "preflight_passed"
+    return "initialized"
+
+
+def merge_phase_state_for_resume(
+    repo_root: Path,
+    orchestration_id: str,
+) -> dict[str, Any]:
+    """`--resume-from-checkpoint` 時: 既存 `phase_state` を破棄せず `node_states` を保持する。
+
+    `orchestration_checkpoint.json` の完了情報とは別ファイルのため直接マージは行わない。
+    欠損の `phase_state.json` のみ初期化し、既存がある場合は `current_state` と
+    `node_states` を上書きしない。監査用に `phase_state_log.jsonl` へ `resume_enabled` を追記する。
+    """
+    _ensure_orchestration_audit_dirs(repo_root, orchestration_id)
+    existing = _load_phase_state(repo_root, orchestration_id)
+    if existing is None:
+        inferred = _initial_current_state_when_phase_state_missing(repo_root, orchestration_id)
+        _ensure_orchestration_audit_dirs(repo_root, orchestration_id)
+        doc = _new_phase_state_document(orchestration_id)
+        doc["current_state"] = inferred
+        _write_phase_state(repo_root, orchestration_id, doc)
+        _append_phase_state_log(
+            repo_root,
+            orchestration_id,
+            {
+                "ts": _utc_now_iso(),
+                "event": "resume_missing_phase_state",
+                "from": None,
+                "to": inferred,
+                "note": "created for checkpoint resume; inferred from preflight when possible",
+            },
+        )
+        return doc
+    orch_id = existing.get("orchestration_id")
+    if orch_id != orchestration_id:
+        raise RuntimeError(
+            f"phase_state.json orchestration_id mismatch: expected {orchestration_id!r}, got {orch_id!r}"
+        )
+    merged = dict(existing)
+    merged["node_states"] = _merge_node_states(merged.get("node_states"), orchestration_id)
+    _write_phase_state(repo_root, orchestration_id, merged)
+    _append_phase_state_log(
+        repo_root,
+        orchestration_id,
+        {
+            "ts": _utc_now_iso(),
+            "event": "checkpoint_resume_enabled",
+            "from": merged.get("current_state"),
+            "to": merged.get("current_state"),
+            "note": "orchestration_meta resume_enabled; phase_state preserved",
+        },
+    )
+    return merged
+
+
+def _transition_phase_state(
+    repo_root: Path,
+    orchestration_id: str,
+    *,
+    new_state: str,
+    event: str,
+) -> dict[str, Any]:
+    doc = _load_phase_state(repo_root, orchestration_id)
+    if doc is None:
+        doc = _new_phase_state_document(orchestration_id)
+    elif doc.get("orchestration_id") not in (orchestration_id, None):
+        raise RuntimeError(
+            "phase_state.json orchestration_id mismatch: "
+            f"expected {orchestration_id!r}, got {doc.get('orchestration_id')!r}"
+        )
+    prev = doc.get("current_state")
+    doc["current_state"] = new_state
+    if doc.get("orchestration_id") != orchestration_id:
+        doc["orchestration_id"] = orchestration_id
+    if not isinstance(doc.get("node_states"), dict):
+        doc["node_states"] = _merge_node_states({}, orchestration_id)
+    _write_phase_state(repo_root, orchestration_id, doc)
+    _append_phase_state_log(
+        repo_root,
+        orchestration_id,
+        {
+            "ts": _utc_now_iso(),
+            "event": event,
+            "from": prev,
+            "to": new_state,
+        },
+    )
+    return doc
+
+
+def _default_capability_expires_at_iso() -> str:
+    return (datetime.now(timezone.utc) + timedelta(days=7)).isoformat().replace("+00:00", "Z")
+
+
+def _parse_iso_z_expiry(raw: str) -> datetime | None:
+    token = raw.strip()
+    if not token:
+        return None
+    try:
+        return datetime.fromisoformat(token.replace("Z", "+00:00"))
+    except (ValueError, TypeError):
+        return None
+
+
+def _mcp_permissions_for_launch(role: str, step: str) -> list[str]:
+    r = role.strip().lower()
+    st = step.strip().lower()
+    if r == "orchestration":
+        return []
+    if r not in {"step", "substep"}:
+        return []
+    if st == "generate":
+        return ["run_linter"]
+    if st == "build":
+        return ["compile_project"]
+    if st == "execute":
+        return ["run_program", "run_quality_checks"]
+    return []
+
+
+def _write_roots_for_launch(
+    *,
+    role: str,
+    step: str,
+    orchestration_id: str,
+    plan_ref: str,
+    pipeline_ref: str,
+) -> list[str]:
+    r = role.strip().lower()
+    st = step.strip().lower()
+    orch_root = _with_trailing_slash(_normalize_rel_posix(f"workspace/orchestrations/{orchestration_id}"))
+    plan_norm = _with_trailing_slash(_normalize_rel_posix(plan_ref))
+    pipe_norm = _with_trailing_slash(_normalize_rel_posix(pipeline_ref))
+    if r == "orchestration":
+        return [orch_root]
+    if r not in {"step", "substep"}:
+        return []
+    if st == "plan":
+        return [plan_norm]
+    if st == "generate":
+        return [_with_trailing_slash(_normalize_rel_posix(f"{pipeline_ref.rstrip('/')}/generate"))]
+    if st == "build":
+        return [_with_trailing_slash(_normalize_rel_posix(f"{pipeline_ref.rstrip('/')}/build"))]
+    if st == "execute":
+        return [_with_trailing_slash(_normalize_rel_posix(f"{pipeline_ref.rstrip('/')}/execute"))]
+    if st == "judge":
+        return [_with_trailing_slash(_normalize_rel_posix(f"{pipeline_ref.rstrip('/')}/judge"))]
+    return []
+
+
+def build_capability_document(
+    *,
+    agent_run_id: str,
+    orchestration_id: str,
+    request_payload: dict[str, Any],
+) -> dict[str, Any]:
+    """`capabilities/<agent_run_id>.json` のペイロードを組み立てる。"""
+    role_raw = request_payload.get("agent_role")
+    role = role_raw.strip().lower() if isinstance(role_raw, str) and role_raw.strip() else ""
+    if role not in {"orchestration", "step", "substep"}:
+        ss0 = request_payload.get("substep")
+        if isinstance(ss0, str) and ss0.strip():
+            role = "substep"
+        elif isinstance(request_payload.get("step"), str) and str(request_payload.get("step")).strip():
+            role = "step"
+    if role not in {"orchestration", "step", "substep"}:
+        raise ValueError("capability requires agent_role orchestration|step|substep")
+    step_raw = request_payload.get("step")
+    if not isinstance(step_raw, str) or not step_raw.strip():
+        raise ValueError("capability requires step")
+    step = step_raw.strip().lower()
+    node_raw = request_payload.get("node_key")
+    if not isinstance(node_raw, str) or not node_raw.strip():
+        raise ValueError("capability requires node_key")
+    node_key = node_raw.strip()
+    plan_ref = str(request_payload.get("plan_ref") or "").strip()
+    pipeline_ref = str(request_payload.get("pipeline_ref") or "").strip()
+    if not plan_ref or not pipeline_ref:
+        raise ValueError("capability requires plan_ref and pipeline_ref")
+
+    substep_val: str | None = None
+    ss = request_payload.get("substep")
+    if isinstance(ss, str) and ss.strip():
+        substep_val = ss.strip().lower()
+
+    token = secrets.token_hex(32)
+    body: dict[str, Any] = {
+        "agent_run_id": agent_run_id.strip(),
+        "capability_token": token,
+        "orchestration_id": orchestration_id,
+        "agent_role": role,
+        "node_key": node_key,
+        "step": step,
+        "write_roots": _write_roots_for_launch(
+            role=role,
+            step=step,
+            orchestration_id=orchestration_id,
+            plan_ref=plan_ref,
+            pipeline_ref=pipeline_ref,
+        ),
+        "mcp_permissions": _mcp_permissions_for_launch(role, step),
+        "expires_at": _default_capability_expires_at_iso(),
+    }
+    if substep_val is not None:
+        body["substep"] = substep_val
+    return body
+
+
+def _write_capability_for_launch(
+    repo_root: Path,
+    orchestration_id: str,
+    child_agent_run_id: str,
+    request_payload: dict[str, Any],
+) -> dict[str, Any]:
+    _ensure_orchestration_audit_dirs(repo_root, orchestration_id)
+    cap = build_capability_document(
+        agent_run_id=child_agent_run_id,
+        orchestration_id=orchestration_id,
+        request_payload=request_payload,
+    )
+    out = _capabilities_dir(repo_root, orchestration_id) / f"{child_agent_run_id}.json"
+    _write_json(out, cap)
+    return cap
+
+
+def _transition_node_step_phase_state(
+    repo_root: Path,
+    orchestration_id: str,
+    *,
+    node_key: str,
+    step: str,
+    new_state: str,
+    event: str,
+    agent_run_id: str | None = None,
+) -> dict[str, Any]:
+    """`phase_state.json` の `node_states[node_key_safe][step]` を更新する。"""
+    node_safe = _node_key_to_safe(node_key.strip())
+    step_key = step.strip().lower()
+    if step_key not in STEP_KEYS_FOR_NODE_STATE:
+        raise ValueError(f"unsupported workflow step for phase_state: {step_key!r}")
+
+    doc = _load_phase_state(repo_root, orchestration_id)
+    if doc is None:
+        doc = _new_phase_state_document(orchestration_id)
+    elif doc.get("orchestration_id") not in (orchestration_id, None):
+        raise RuntimeError(
+            "phase_state.json orchestration_id mismatch: "
+            f"expected {orchestration_id!r}, got {doc.get('orchestration_id')!r}"
+        )
+    doc["orchestration_id"] = orchestration_id
+    ns_any = doc.get("node_states")
+    ns: dict[str, Any] = ns_any if isinstance(ns_any, dict) else {}
+    inner_any = ns.get(node_safe)
+    inner: dict[str, str]
+    if isinstance(inner_any, dict):
+        inner = {}
+        for sk in STEP_KEYS_FOR_NODE_STATE:
+            v = inner_any.get(sk)
+            inner[sk] = v.strip() if isinstance(v, str) and v.strip() else "not_started"
+    else:
+        inner = {sk: "not_started" for sk in STEP_KEYS_FOR_NODE_STATE}
+    prev = inner.get(step_key, "not_started")
+    inner[step_key] = new_state
+    ns[node_safe] = inner
+    doc["node_states"] = ns
+    _write_phase_state(repo_root, orchestration_id, doc)
+
+    log_entry: dict[str, Any] = {
+        "ts": _utc_now_iso(),
+        "event": event,
+        "node_key_safe": node_safe,
+        "step": step_key,
+        "from": prev,
+        "to": new_state,
+    }
+    if agent_run_id:
+        log_entry["agent_run_id"] = agent_run_id
+    _append_phase_state_log(repo_root, orchestration_id, log_entry)
+    return doc
+
+
+def _phase_state_allows_write_step_result(
+    repo_root: Path,
+    orchestration_id: str,
+    *,
+    node_key: str,
+    step: str,
+) -> None:
+    """`record_launch` 済みの step は `child_finished` まで `write_step_result` を禁止する。"""
+    doc = _load_phase_state(repo_root, orchestration_id)
+    if doc is None:
+        return
+    node_safe = _node_key_to_safe(node_key.strip())
+    step_key = step.strip().lower()
+    ns = doc.get("node_states")
+    if not isinstance(ns, dict):
+        return
+    inner = ns.get(node_safe)
+    if not isinstance(inner, dict):
+        return
+    st = inner.get(step_key)
+    if not isinstance(st, str):
+        return
+    token = st.strip()
+    if token in ("", "not_started"):
+        return
+    if token == "child_finished":
+        return
+    raise RuntimeError(
+        "write_step_result phase gate: node step must be child_finished "
+        f"(node_key_safe={node_safe!r}, step={step_key!r}, current={token!r})"
+    )
+
+
+def _write_rule_source_violation(
+    repo_root: Path,
+    orchestration_id: str,
+    *,
+    agent_run_id: str,
+    read_path: str,
+    matched_prefix: str | None,
+) -> Path:
+    _ensure_orchestration_audit_dirs(repo_root, orchestration_id)
+    out = _violations_dir(repo_root, orchestration_id) / f"{agent_run_id}.rule_source_violation.json"
+    payload = {
+        "kind": "rule_source_violation",
+        "agent_run_id": agent_run_id,
+        "read_path": read_path,
+        "matched_denied_prefix": matched_prefix,
+        "evaluated_at": _utc_now_iso(),
+    }
+    _write_json(out, payload)
+    return out
+
+
+def _write_phase_authority_violation(
+    repo_root: Path,
+    orchestration_id: str,
+    *,
+    agent_run_id: str,
+    actor_role: str,
+    rejected_paths: list[str],
+    reason: str,
+) -> Path:
+    _ensure_orchestration_audit_dirs(repo_root, orchestration_id)
+    out = _violations_dir(repo_root, orchestration_id) / f"{agent_run_id}.phase_authority_violation.json"
+    payload = {
+        "kind": "phase_authority_violation",
+        "actor_role": actor_role,
+        "agent_run_id": agent_run_id,
+        "rejected_paths": rejected_paths,
+        "reason": reason,
+        "evaluated_at": _utc_now_iso(),
+    }
+    _write_json(out, payload)
+    return out
+
+
+def _path_under_any_write_root(rel_posix: str, write_roots: list[str]) -> bool:
+    p = _normalize_rel_posix(rel_posix)
+    for root in write_roots:
+        if not isinstance(root, str) or not root.strip():
+            continue
+        base = _with_trailing_slash(_normalize_rel_posix(root))
+        if not base:
+            continue
+        base_no = base.rstrip("/")
+        if _repo_path_under_prefix(p, base_no):
+            return True
+    return False
+
+
+def gate_apply_patch_writes(
+    repo_root: Path,
+    *,
+    orchestration_id: str,
+    actor_role: str,
+    changed_paths: Sequence[str],
+    agent_run_id: str,
+    capability_token: str | None = None,
+) -> dict[str, Any]:
+    """`apply_patch` 相当の書き込み先が actor の権限と整合するか検査する。
+
+    違反時は `phase_authority_violation` を書き、RuntimeError を送出する。
+    """
+    role = actor_role.strip().lower()
+    if not agent_run_id.strip():
+        raise ValueError("agent_run_id must be non-empty for apply-patch gate")
+
+    normalized_paths = [_normalize_rel_posix(p) for p in changed_paths if str(p).strip()]
+    if not normalized_paths:
+        return {"allowed": True, "checked_paths": []}
+
+    if role == "orchestration":
+        bad = [
+            p
+            for p in normalized_paths
+            if p.startswith("workspace/plans/") or p.startswith("workspace/pipelines/")
+        ]
+        if bad:
+            _write_phase_authority_violation(
+                repo_root,
+                orchestration_id,
+                agent_run_id=agent_run_id.strip(),
+                actor_role=role,
+                rejected_paths=bad,
+                reason="orchestration agent must not write under workspace/plans or workspace/pipelines",
+            )
+            raise RuntimeError(
+                "apply_patch gate: orchestration agent cannot write plan or pipeline artifacts"
+            )
+        return {"allowed": True, "checked_paths": normalized_paths}
+
+    if role in {"step", "substep"}:
+        if not capability_token or not str(capability_token).strip():
+            raise ValueError("capability_token is required for step/substep apply-patch gate")
+        cap_path = _capabilities_dir(repo_root, orchestration_id) / f"{agent_run_id.strip()}.json"
+        if not cap_path.exists():
+            raise RuntimeError(f"capability file not found: {cap_path}")
+        cap = _read_json(cap_path)
+        if not isinstance(cap, dict):
+            raise RuntimeError(f"capability must be object: {cap_path}")
+        if str(cap.get("capability_token", "")).strip() != str(capability_token).strip():
+            _write_phase_authority_violation(
+                repo_root,
+                orchestration_id,
+                agent_run_id=agent_run_id.strip(),
+                actor_role=role,
+                rejected_paths=normalized_paths,
+                reason="capability_token mismatch",
+            )
+            raise RuntimeError("apply_patch gate: invalid capability_token")
+        roots_obj = cap.get("write_roots")
+        roots = [str(x) for x in roots_obj] if isinstance(roots_obj, list) else []
+        bad = [p for p in normalized_paths if not _path_under_any_write_root(p, roots)]
+        if bad:
+            _write_phase_authority_violation(
+                repo_root,
+                orchestration_id,
+                agent_run_id=agent_run_id.strip(),
+                actor_role=role,
+                rejected_paths=bad,
+                reason="path not under capability write_roots",
+            )
+            raise RuntimeError("apply_patch gate: path outside write_roots for child agent")
+        return {"allowed": True, "checked_paths": normalized_paths}
+
+    raise ValueError(f"unsupported actor_role for apply-patch gate: {actor_role!r}")
+
+
+def validate_mcp_build_tool_invocation(
+    repo_root: Path,
+    *,
+    orchestration_id: str,
+    agent_run_id: str,
+    capability_token: str,
+    tool_name: str,
+) -> None:
+    """`compile_project` / `run_linter` / `run_program` / `run_quality_checks` 呼び出し前の位相ゲート。"""
+    _require_preflight_launchable(repo_root, orchestration_id, enforce_live_probe=False)
+
+    root = _orchestration_root(repo_root, orchestration_id)
+    launch_resp = root / "launches" / f"{agent_run_id.strip()}.response.json"
+    if not launch_resp.exists():
+        raise RuntimeError(
+            "MCP phase gate: record-launch did not complete (missing launches/*.response.json) "
+            f"for agent_run_id={agent_run_id!r}"
+        )
+
+    doc = _load_phase_state(repo_root, orchestration_id)
+    if doc is None:
+        raise RuntimeError("MCP phase gate: phase_state.json missing")
+    cur = doc.get("current_state")
+    if cur != "preflight_passed":
+        raise RuntimeError(f"MCP phase gate: unexpected orchestration current_state: {cur!r}")
+
+    cap_path = _capabilities_dir(repo_root, orchestration_id) / f"{agent_run_id.strip()}.json"
+    if not cap_path.exists():
+        raise RuntimeError(f"MCP phase gate: capability file missing: {cap_path}")
+    cap = _read_json(cap_path)
+    if not isinstance(cap, dict):
+        raise RuntimeError(f"MCP phase gate: capability must be object: {cap_path}")
+    if str(cap.get("capability_token", "")).strip() != str(capability_token).strip():
+        raise RuntimeError("MCP phase gate: capability_token mismatch")
+
+    exp = cap.get("expires_at")
+    if isinstance(exp, str):
+        exp_dt = _parse_iso_z_expiry(exp)
+        if exp_dt is not None and datetime.now(timezone.utc) > exp_dt:
+            raise RuntimeError("MCP phase gate: capability token expired")
+
+    perms = cap.get("mcp_permissions")
+    allowed = [str(x) for x in perms] if isinstance(perms, list) else []
+    if tool_name not in allowed:
+        raise RuntimeError(
+            f"MCP phase gate: tool {tool_name!r} not permitted by capability "
+            f"(allowed={allowed!r})"
+        )
+
+    node_raw = cap.get("node_key")
+    step_raw = cap.get("step")
+    if not isinstance(node_raw, str) or not node_raw.strip():
+        raise RuntimeError("MCP phase gate: capability.node_key missing")
+    if not isinstance(step_raw, str) or not step_raw.strip():
+        raise RuntimeError("MCP phase gate: capability.step missing")
+    node_safe = _node_key_to_safe(node_raw.strip())
+    step_key = step_raw.strip().lower()
+    ns = doc.get("node_states")
+    if not isinstance(ns, dict):
+        raise RuntimeError("MCP phase gate: phase_state.node_states missing")
+    inner = ns.get(node_safe)
+    if not isinstance(inner, dict):
+        raise RuntimeError(f"MCP phase gate: phase_state missing node {node_safe!r}")
+    st = inner.get(step_key)
+    if st != "child_running":
+        raise RuntimeError(
+            "MCP phase gate: node step must be child_running "
+            f"(node_key_safe={node_safe!r}, step={step_key!r}, current={st!r})"
+        )
+
+
+def _gate_script_command(
+    *,
+    repo_root: Path,
+    gate_name: str,
+    args_json: dict[str, Any],
+) -> list[str]:
+    gate = gate_name.strip()
+    tools_dir = Path(__file__).resolve().parent
+    tool_path: Path
+    if gate == "validate_pipeline_semantics":
+        tool_path = tools_dir / "validate_pipeline_semantics.py"
+    elif gate == "check_artifact_syntax":
+        tool_path = tools_dir / "check_artifact_syntax.py"
+    elif gate == "validate_workspace_root":
+        tool_path = tools_dir / "validate_workspace_root.py"
+    else:
+        raise ValueError(f"unsupported gate name: {gate_name!r}")
+    if not tool_path.exists():
+        raise RuntimeError(f"gate script not found: {tool_path}")
+
+    cmd: list[str] = [sys.executable, str(tool_path)]
+    positionals = args_json.get("paths")
+    if positionals is None:
+        positionals = args_json.get("positional_args")
+    if positionals is not None:
+        if not isinstance(positionals, list) or not all(isinstance(x, str) for x in positionals):
+            raise ValueError("args_json.paths/positional_args must be array of strings")
+    positional_list: list[str] = [str(x) for x in (positionals or []) if str(x).strip()]
+
+    for key in sorted(args_json.keys()):
+        if key in {"paths", "positional_args"}:
+            continue
+        value = args_json[key]
+        if value is None:
+            continue
+        if isinstance(key, str) and key.startswith("--"):
+            flag = key
+        else:
+            flag = "--" + str(key).strip().replace("_", "-")
+        if not flag.strip():
+            continue
+        if isinstance(value, bool):
+            if value:
+                cmd.append(flag)
+            continue
+        if isinstance(value, list):
+            for item in value:
+                if isinstance(item, (str, int, float)) and str(item).strip():
+                    cmd.extend([flag, str(item)])
+            continue
+        if isinstance(value, (str, int, float)) and str(value).strip():
+            cmd.extend([flag, str(value)])
+
+    cmd.extend(positional_list)
+    return cmd
+
+
+def _extract_gate_violations(stdout: str, stderr: str, returncode: int) -> list[str]:
+    lines: list[str] = []
+    for source in (stdout, stderr):
+        for raw in source.splitlines():
+            token = raw.strip()
+            if not token:
+                continue
+            if token.startswith("- ") or token.startswith("FAIL:"):
+                lines.append(token)
+                continue
+            if token.endswith(": FAIL") or " validation: FAIL" in token:
+                lines.append(token)
+                continue
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for item in lines:
+        if item in seen:
+            continue
+        seen.add(item)
+        deduped.append(item)
+    if returncode != 0 and not deduped:
+        deduped.append(f"gate command failed with exit code {returncode}")
+    return deduped
+
+
+def _inline_gate_result(
+    repo_root: Path,
+    *,
+    orchestration_id: str,
+    gate_name: str,
+    agent_run_id: str,
+    args_json: dict[str, Any],
+    capability_token: str,
+) -> dict[str, Any]:
+    gate = gate_name.strip()
+    if gate == "orchestration_read":
+        read_path = args_json.get("read_path")
+        if not isinstance(read_path, str) or not read_path.strip():
+            raise ValueError("run-gate orchestration_read requires non-empty args_json.read_path")
+        return log_orchestration_read(
+            repo_root,
+            orchestration_id,
+            agent_run_id=agent_run_id,
+            read_path=read_path,
+        )
+    if gate == "apply_patch_writes":
+        actor_role = args_json.get("actor_role")
+        if not isinstance(actor_role, str) or not actor_role.strip():
+            raise ValueError("run-gate apply_patch_writes requires non-empty args_json.actor_role")
+        changed_paths = args_json.get("changed_paths")
+        if not isinstance(changed_paths, list) or not all(isinstance(x, str) for x in changed_paths):
+            raise ValueError("run-gate apply_patch_writes requires args_json.changed_paths as string array")
+        tok_raw = args_json.get("capability_token")
+        token_for_gate = str(tok_raw).strip() if isinstance(tok_raw, str) and tok_raw.strip() else capability_token
+        return gate_apply_patch_writes(
+            repo_root,
+            orchestration_id=orchestration_id,
+            actor_role=actor_role,
+            changed_paths=changed_paths,
+            agent_run_id=agent_run_id,
+            capability_token=token_for_gate,
+        )
+    raise ValueError(f"unsupported inline gate name: {gate_name!r}")
+
+
+def _validate_run_gate_permissions(
+    repo_root: Path,
+    *,
+    orchestration_id: str,
+    gate_name: str,
+    agent_run_id: str,
+    capability_token: str,
+) -> None:
+    _require_preflight_launchable(repo_root, orchestration_id, enforce_live_probe=False)
+    root = _orchestration_root(repo_root, orchestration_id)
+
+    launch_resp = root / "launches" / f"{agent_run_id.strip()}.response.json"
+    if not launch_resp.exists():
+        raise RuntimeError(
+            "run-gate phase gate: record-launch did not complete "
+            f"(missing launches/{agent_run_id.strip()}.response.json)"
+        )
+
+    cap_path = _capabilities_dir(repo_root, orchestration_id) / f"{agent_run_id.strip()}.json"
+    if not cap_path.exists():
+        raise RuntimeError(f"run-gate phase gate: capability file missing: {cap_path}")
+    cap = _read_json(cap_path)
+    if not isinstance(cap, dict):
+        raise RuntimeError(f"run-gate phase gate: capability must be object: {cap_path}")
+    if str(cap.get("capability_token", "")).strip() != capability_token.strip():
+        raise RuntimeError("run-gate phase gate: capability_token mismatch")
+    exp = cap.get("expires_at")
+    if isinstance(exp, str):
+        exp_dt = _parse_iso_z_expiry(exp)
+        if exp_dt is not None and datetime.now(timezone.utc) > exp_dt:
+            raise RuntimeError("run-gate phase gate: capability token expired")
+
+    policy_path = _access_policies_dir(repo_root, orchestration_id) / f"{agent_run_id.strip()}.json"
+    if not policy_path.exists():
+        raise RuntimeError(f"run-gate phase gate: access policy missing: {policy_path}")
+    policy = _read_json(policy_path)
+    if not isinstance(policy, dict):
+        raise RuntimeError(f"run-gate phase gate: access policy must be object: {policy_path}")
+    allowed_svcs = policy.get("allowed_gate_services")
+    allowed = [str(x) for x in allowed_svcs] if isinstance(allowed_svcs, list) else []
+    if gate_name not in allowed:
+        raise RuntimeError(
+            f"run-gate phase gate: gate {gate_name!r} not permitted by access policy (allowed={allowed!r})"
+        )
+
+    doc = _load_phase_state(repo_root, orchestration_id)
+    if doc is None:
+        raise RuntimeError("run-gate phase gate: phase_state.json missing")
+    if doc.get("current_state") != "preflight_passed":
+        raise RuntimeError(
+            f"run-gate phase gate: unexpected orchestration current_state: {doc.get('current_state')!r}"
+        )
+    node_raw = cap.get("node_key")
+    step_raw = cap.get("step")
+    if not isinstance(node_raw, str) or not node_raw.strip():
+        raise RuntimeError("run-gate phase gate: capability.node_key missing")
+    if not isinstance(step_raw, str) or not step_raw.strip():
+        raise RuntimeError("run-gate phase gate: capability.step missing")
+    node_safe = _node_key_to_safe(node_raw.strip())
+    step_key = step_raw.strip().lower()
+    ns = doc.get("node_states")
+    if not isinstance(ns, dict):
+        raise RuntimeError("run-gate phase gate: phase_state.node_states missing")
+    node_state = ns.get(node_safe)
+    if not isinstance(node_state, dict):
+        raise RuntimeError(f"run-gate phase gate: phase_state missing node {node_safe!r}")
+    if node_state.get(step_key) != "child_running":
+        raise RuntimeError(
+            "run-gate phase gate: node step must be child_running "
+            f"(node_key_safe={node_safe!r}, step={step_key!r}, current={node_state.get(step_key)!r})"
+        )
+
+
+def run_gate(
+    repo_root: Path,
+    *,
+    orchestration_id: str,
+    gate_name: str,
+    agent_run_id: str,
+    args_json: dict[str, Any],
+    capability_token: str,
+) -> dict[str, Any]:
+    gate = gate_name.strip()
+    if gate not in DEFAULT_ALLOWED_GATE_SERVICES:
+        raise ValueError(f"unsupported gate name: {gate_name!r}")
+    if not capability_token.strip():
+        raise ValueError("capability_token is required for run-gate")
+    if not isinstance(args_json, dict):
+        raise ValueError("args_json must be object")
+
+    _validate_run_gate_permissions(
+        repo_root,
+        orchestration_id=orchestration_id,
+        gate_name=gate,
+        agent_run_id=agent_run_id,
+        capability_token=capability_token,
+    )
+    inline_result: dict[str, Any] | None = None
+    if gate in {"orchestration_read", "apply_patch_writes"}:
+        inline_result = _inline_gate_result(
+            repo_root,
+            orchestration_id=orchestration_id,
+            gate_name=gate,
+            agent_run_id=agent_run_id,
+            args_json=args_json,
+            capability_token=capability_token,
+        )
+        violations: list[str] = []
+        status = "pass"
+        exit_code = 0
+    else:
+        cmd = _gate_script_command(repo_root=repo_root, gate_name=gate, args_json=args_json)
+        gate_env = os.environ.copy()
+        gate_env.setdefault("PYTHONDONTWRITEBYTECODE", "1")
+        gate_env["PYTHONPYCACHEPREFIX"] = str((repo_root / "workspace" / ".pycache").resolve())
+        proc = subprocess.run(
+            cmd,
+            cwd=str(repo_root),
+            env=gate_env,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        violations = _extract_gate_violations(proc.stdout or "", proc.stderr or "", proc.returncode)
+        status = "pass" if proc.returncode == 0 else "fail"
+        exit_code = proc.returncode
+    gate_doc: dict[str, Any] = {
+        "orchestration_id": orchestration_id,
+        "agent_run_id": agent_run_id,
+        "gate": gate,
+        "args_json": args_json,
+        "status": status,
+        "exit_code": exit_code,
+        "violations": violations,
+        "evaluated_at": _utc_now_iso(),
+    }
+    if inline_result is not None:
+        gate_doc["result"] = inline_result
+    out_path = _gates_dir(repo_root, orchestration_id) / agent_run_id.strip() / f"{gate}.json"
+    _write_json(out_path, gate_doc)
+    gate_ref = (
+        f"workspace/orchestrations/{orchestration_id}/gates/"
+        f"{agent_run_id.strip()}/{gate}.json"
+    )
+    result: dict[str, Any] = {"violations": violations, "gate_result_ref": gate_ref}
+    if inline_result is not None:
+        result["result"] = inline_result
+    return result
+
+
+def _normalize_rel_posix(path_token: str) -> str:
+    """リポジトリ相対 path を POSIX 形式の先頭無し・末尾スラッシュなしに正規化する。"""
+    t = path_token.strip().replace("\\", "/").lstrip("/")
+    while "//" in t:
+        t = t.replace("//", "/")
+    return t.rstrip("/")
+
+
+def _with_trailing_slash(rel_posix: str) -> str:
+    if not rel_posix:
+        return ""
+    return rel_posix if rel_posix.endswith("/") else rel_posix + "/"
+
+
+def _repo_path_under_prefix(rel_posix: str, prefix_rel: str) -> bool:
+    p = _normalize_rel_posix(rel_posix)
+    base = _normalize_rel_posix(prefix_rel)
+    if not base:
+        return False
+    return p == base or p.startswith(base + "/")
+
+
+def build_access_policy_payload(
+    *,
+    agent_run_id: str,
+    request_payload: dict[str, Any],
+) -> dict[str, Any]:
+    """`access_policies/<agent_run_id>.json` の内容を組み立てる。"""
+    node_key = request_payload.get("node_key")
+    step = request_payload.get("step")
+    if not isinstance(node_key, str) or not node_key.strip():
+        raise ValueError("access policy requires node_key")
+    if not isinstance(step, str) or not step.strip():
+        raise ValueError("access policy requires step")
+    plan_ref = request_payload.get("plan_ref")
+    pipeline_ref = request_payload.get("pipeline_ref")
+    if not isinstance(plan_ref, str) or not plan_ref.strip():
+        raise ValueError("access policy requires plan_ref")
+    if not isinstance(pipeline_ref, str) or not pipeline_ref.strip():
+        raise ValueError("access policy requires pipeline_ref")
+
+    allowed_read_roots = [
+        "docs/",
+        "spec/",
+        _with_trailing_slash(_normalize_rel_posix(plan_ref)),
+        _with_trailing_slash(_normalize_rel_posix(pipeline_ref)),
+    ]
+    body: dict[str, Any] = {
+        "agent_run_id": agent_run_id.strip(),
+        "node_key": node_key.strip(),
+        "step": step.strip().lower(),
+        "allowed_read_roots": allowed_read_roots,
+        "denied_read_roots": ["tools/"],
+        "allowed_gate_services": list(DEFAULT_ALLOWED_GATE_SERVICES),
+    }
+    substep = request_payload.get("substep")
+    if isinstance(substep, str) and substep.strip():
+        body["substep"] = substep.strip().lower()
+    return body
+
+
+def _write_access_policy_for_launch(
+    repo_root: Path,
+    orchestration_id: str,
+    child_agent_run_id: str,
+    request_payload: dict[str, Any],
+) -> dict[str, Any]:
+    _ensure_orchestration_audit_dirs(repo_root, orchestration_id)
+    policy = build_access_policy_payload(agent_run_id=child_agent_run_id, request_payload=request_payload)
+    out = _access_policies_dir(repo_root, orchestration_id) / f"{child_agent_run_id}.json"
+    _write_json(out, policy)
+    return policy
+
+
+def _append_access_log_line(
+    repo_root: Path,
+    orchestration_id: str,
+    agent_run_id: str,
+    entry: dict[str, Any],
+) -> None:
+    _ensure_orchestration_audit_dirs(repo_root, orchestration_id)
+    path = _access_logs_dir(repo_root, orchestration_id) / f"{agent_run_id}.jsonl"
+    line = json.dumps(entry, ensure_ascii=False)
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(line + "\n")
+
+
+def log_orchestration_read(
+    repo_root: Path,
+    orchestration_id: str,
+    *,
+    agent_run_id: str,
+    read_path: str,
+) -> dict[str, Any]:
+    """read 監査: `denied_read_roots`（`tools/`）一致時は `rule_source_violation` を記録し orchestration を fail にする。
+
+    許可された read のみ本文を返す。
+    """
+    policies_dir = _access_policies_dir(repo_root, orchestration_id)
+    policy_path = policies_dir / f"{agent_run_id}.json"
+    if not policy_path.exists():
+        raise FileNotFoundError(f"access policy not found: {policy_path}")
+    policy = _read_json(policy_path)
+    if not isinstance(policy, dict):
+        raise ValueError(f"access policy must be object: {policy_path}")
+
+    denied = policy.get("denied_read_roots")
+    if not isinstance(denied, list):
+        denied = []
+    allowed = policy.get("allowed_read_roots")
+    if not isinstance(allowed, list):
+        allowed = []
+
+    rel = _normalize_rel_posix(read_path)
+    hit_denied = False
+    matched_prefix: str | None = None
+    for item in denied:
+        if not isinstance(item, str) or not item.strip():
+            continue
+        prefix = _with_trailing_slash(_normalize_rel_posix(item))
+        if not prefix:
+            continue
+        base_no_slash = prefix.rstrip("/")
+        if _repo_path_under_prefix(rel, base_no_slash):
+            hit_denied = True
+            matched_prefix = prefix
+            break
+
+    matched_allowed_prefix: str | None = None
+    hit_allowed = False
+    for item in allowed:
+        if not isinstance(item, str) or not item.strip():
+            continue
+        prefix = _with_trailing_slash(_normalize_rel_posix(item))
+        if not prefix:
+            continue
+        base_no_slash = prefix.rstrip("/")
+        if _repo_path_under_prefix(rel, base_no_slash):
+            hit_allowed = True
+            matched_allowed_prefix = prefix
+            break
+
+    log_entry = {
+        "ts": _utc_now_iso(),
+        "path": rel,
+        "allowed_match": hit_allowed,
+        "matched_allowed_prefix": matched_allowed_prefix,
+        "denied_match": hit_denied,
+        "matched_denied_prefix": matched_prefix,
+    }
+    _append_access_log_line(repo_root, orchestration_id, agent_run_id, log_entry)
+
+    abs_path = (repo_root / rel).resolve()
+    try:
+        abs_path.relative_to(repo_root.resolve())
+    except ValueError as exc:
+        raise ValueError(f"path escapes repo_root: {read_path!r}") from exc
+
+    if hit_denied or not hit_allowed:
+        _write_rule_source_violation(
+            repo_root,
+            orchestration_id,
+            agent_run_id=agent_run_id.strip(),
+            read_path=rel,
+            matched_prefix=matched_prefix if hit_denied else None,
+        )
+        try:
+            update_orchestration_status(repo_root, orchestration_id, status="fail")
+        except Exception:
+            pass
+        if hit_denied:
+            raise RuntimeError(
+                f"orchestration-read denied: path {rel!r} matches rule-source deny list "
+                f"(prefix={matched_prefix!r}, agent_run_id={agent_run_id})"
+            )
+        raise RuntimeError(
+            f"orchestration-read denied: path {rel!r} is outside allowed_read_roots "
+            f"(agent_run_id={agent_run_id})"
+        )
+
+    content: str | None = None
+    file_exists = abs_path.is_file()
+    if file_exists:
+        content = abs_path.read_text(encoding="utf-8")
+
+    return {
+        "read_path": rel,
+        "file_exists": file_exists,
+        "denied_match": False,
+        "logged": True,
+        "content": content,
+    }
 
 
 def _checkpoint_path(repo_root: Path, orchestration_id: str) -> Path:
@@ -1128,6 +2266,7 @@ def enable_checkpoint_resume(
     meta["resume_enabled"] = True
     meta["resumed_at"] = _utc_now_iso()
     _write_json(meta_path, meta)
+    merge_phase_state_for_resume(repo_root, orchestration_id)
     return meta
 
 
@@ -1362,6 +2501,73 @@ def _validate_terminal_run_payload(
             raise ValueError(f"output_refs[{idx}] must be non-empty string")
 
     _validate_pass_output_refs_against_launch(repo_root, payload)
+    _validate_apply_patch_gate_coverage(repo_root, orchestration_id, payload)
+
+
+def _validate_apply_patch_gate_coverage(
+    repo_root: Path,
+    orchestration_id: str,
+    payload: dict[str, Any],
+) -> None:
+    """`apply_patch` 書き込み経路の gate 実行証跡を終端時に強制する。"""
+    role = payload.get("agent_role")
+    if not isinstance(role, str):
+        return
+    actor_role = role.strip().lower()
+    if actor_role not in {"step", "substep"}:
+        return
+
+    agent_run_id = payload.get("agent_run_id")
+    if not isinstance(agent_run_id, str) or not agent_run_id.strip():
+        raise ValueError("agent_run_id must be non-empty string for apply_patch gate coverage")
+    run_id = agent_run_id.strip()
+
+    output_refs_obj = payload.get("output_refs")
+    output_refs = (
+        [str(item).strip() for item in output_refs_obj if isinstance(item, str) and item.strip()]
+        if isinstance(output_refs_obj, list)
+        else []
+    )
+    if not output_refs:
+        return
+
+    gate_path = _gates_dir(repo_root, orchestration_id) / run_id / "apply_patch_writes.json"
+    if not gate_path.exists():
+        raise ValueError(
+            "pass status for step/substep requires apply_patch_writes gate evidence: "
+            f"{gate_path}"
+        )
+    gate_doc = _read_json(gate_path)
+    if not isinstance(gate_doc, dict):
+        raise ValueError(f"apply_patch_writes gate artifact must be object: {gate_path}")
+    if str(gate_doc.get("status", "")).strip().lower() != "pass":
+        raise ValueError(f"apply_patch_writes gate must pass before terminal run record: {gate_path}")
+    args_json = gate_doc.get("args_json")
+    if not isinstance(args_json, dict):
+        raise ValueError(f"apply_patch_writes gate args_json must be object: {gate_path}")
+    gate_actor_role = args_json.get("actor_role")
+    if not isinstance(gate_actor_role, str) or gate_actor_role.strip().lower() != actor_role:
+        raise ValueError(
+            "apply_patch_writes gate actor_role mismatch: "
+            f"expected={actor_role!r} got={gate_actor_role!r}"
+        )
+    changed_paths_obj = args_json.get("changed_paths")
+    if not isinstance(changed_paths_obj, list) or not all(isinstance(x, str) for x in changed_paths_obj):
+        raise ValueError(f"apply_patch_writes gate changed_paths must be string array: {gate_path}")
+    changed_paths = [_normalize_rel_posix(x) for x in changed_paths_obj if x.strip()]
+    if not changed_paths:
+        raise ValueError(f"apply_patch_writes gate changed_paths must be non-empty: {gate_path}")
+
+    uncovered: list[str] = []
+    for output_ref in output_refs:
+        rel = _normalize_rel_posix(output_ref)
+        if not any(_repo_path_under_prefix(rel, cp) for cp in changed_paths):
+            uncovered.append(output_ref)
+    if uncovered:
+        raise ValueError(
+            "apply_patch_writes gate does not cover terminal output_refs: "
+            + ", ".join(uncovered)
+        )
 
 
 def _validate_step_or_substep_launch_refs(repo_root: Path, payload: dict[str, Any]) -> None:
@@ -1839,6 +3045,8 @@ def init_orchestration(
     (root / "launches").mkdir(parents=True, exist_ok=True)
     (root / "agents").mkdir(parents=True, exist_ok=True)
     (root / "steps").mkdir(parents=True, exist_ok=True)
+    _ensure_orchestration_audit_dirs(repo_root, orchestration_id)
+    init_phase_state_json(repo_root, orchestration_id, reason="init_orchestration")
 
     meta = {
         "orchestration_id": orchestration_id,
@@ -1872,6 +3080,25 @@ def write_preflight(repo_root: Path, orchestration_id: str, payload: dict[str, A
         stored["probed_at"] = stored.get("checked_at") or _utc_now_iso()
 
     _write_json(root / "preflight.json", stored)
+    if _preflight_allows_agent_launch(stored):
+        _transition_phase_state(
+            repo_root,
+            orchestration_id,
+            new_state="preflight_passed",
+            event="preflight_written",
+        )
+    else:
+        _ensure_orchestration_audit_dirs(repo_root, orchestration_id)
+        _append_phase_state_log(
+            repo_root,
+            orchestration_id,
+            {
+                "ts": _utc_now_iso(),
+                "event": "preflight_written_not_launchable",
+                "from": None,
+                "to": None,
+            },
+        )
     return stored
 
 
@@ -1892,7 +3119,7 @@ def record_launch(
     request_payload: dict[str, Any],
     response_payload: dict[str, Any],
     relation_type: str = "launch",
-) -> dict[str, str]:
+) -> dict[str, Any]:
     try:
         _require_preflight_launchable(
             repo_root,
@@ -1974,7 +3201,9 @@ def record_launch(
         graph["edges"].append(edge)
     _write_json(graph_path, graph)
 
-    return {
+    nk = request_payload.get("node_key")
+    st = request_payload.get("step")
+    out_refs: dict[str, Any] = {
         "launch_request_ref": request_ref,
         "launch_response_ref": response_ref,
         "launch_prompt_ref": prompt_ref,
@@ -1984,6 +3213,43 @@ def record_launch(
         "child_launch_prompt_ref": child_prompt_ref,
         "child_launch_reply_ref": child_reply_ref,
     }
+    if isinstance(nk, str) and nk.strip() and isinstance(st, str) and st.strip():
+        _write_access_policy_for_launch(
+            repo_root,
+            orchestration_id,
+            child_agent_run_id,
+            request_payload,
+        )
+        cap_doc = _write_capability_for_launch(
+            repo_root,
+            orchestration_id,
+            child_agent_run_id,
+            request_payload,
+        )
+        cap_rel = f"workspace/orchestrations/{orchestration_id}/capabilities/{child_agent_run_id}.json"
+        out_refs["capability_ref"] = cap_rel
+        out_refs["capability_token"] = cap_doc.get("capability_token", "")
+        step_tok = st.strip().lower()
+        _transition_node_step_phase_state(
+            repo_root,
+            orchestration_id,
+            node_key=nk.strip(),
+            step=step_tok,
+            new_state="launch_recorded",
+            event="record_launch",
+            agent_run_id=child_agent_run_id,
+        )
+        _transition_node_step_phase_state(
+            repo_root,
+            orchestration_id,
+            node_key=nk.strip(),
+            step=step_tok,
+            new_state="child_running",
+            event="child_launched",
+            agent_run_id=child_agent_run_id,
+        )
+
+    return out_refs
 
 
 def _read_existing_run_ids(path: Path) -> set[str]:
@@ -2069,8 +3335,6 @@ def record_agent_run(
         payload.setdefault("launch_reply_ref", reply_ref)
         _validate_step_or_substep_launch_refs(repo_root, payload)
 
-    _validate_terminal_run_payload(repo_root, orchestration_id, payload)
-
     status = payload.get("status")
     if isinstance(status, str) and status.strip().lower() in TERMINAL_STATUSES:
         payload.setdefault("finished_at", _utc_now_iso())
@@ -2089,6 +3353,8 @@ def record_agent_run(
                 "agent_session_id must match child agent identifier in launch response"
             )
 
+    _validate_terminal_run_payload(repo_root, orchestration_id, payload)
+
     dialogs_root = root / "agents" / agent_run_id / "dialogs"
     dialogs_root.mkdir(parents=True, exist_ok=True)
     result_ref, summary_ref = _agent_result_refs(orchestration_id, agent_run_id)
@@ -2101,6 +3367,23 @@ def record_agent_run(
 
     with runs_path.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
+
+    if role_token in {"step", "substep"}:
+        status_raw = payload.get("status")
+        status_lower = status_raw.strip().lower() if isinstance(status_raw, str) else ""
+        if status_lower in TERMINAL_STATUSES:
+            nk_done = payload.get("node_key")
+            st_done = payload.get("step")
+            if isinstance(nk_done, str) and nk_done.strip() and isinstance(st_done, str) and st_done.strip():
+                _transition_node_step_phase_state(
+                    repo_root,
+                    orchestration_id,
+                    node_key=nk_done.strip(),
+                    step=st_done.strip().lower(),
+                    new_state="child_finished",
+                    event="record_agent_run_terminal",
+                    agent_run_id=agent_run_id,
+                )
 
     return payload
 
@@ -2118,6 +3401,12 @@ def write_step_result(
         repo_root,
         orchestration_id,
         enforce_live_probe=False,
+    )
+    _phase_state_allows_write_step_result(
+        repo_root,
+        orchestration_id,
+        node_key=node_key,
+        step=step,
     )
     node_safe = _node_key_to_safe(node_key)
     step_token = step.strip().lower()
@@ -2139,6 +3428,16 @@ def write_step_result(
     )
 
     _write_json(result_path, result)
+
+    _transition_node_step_phase_state(
+        repo_root,
+        orchestration_id,
+        node_key=node_key,
+        step=step_token,
+        new_state="step_result_written",
+        event="write_step_result",
+        agent_run_id=agent_run_id,
+    )
 
     if result.get("status", "").strip().lower() == "pass":
         try:
@@ -2193,6 +3492,86 @@ def _json_arg(raw: str) -> dict[str, Any]:
     return value
 
 
+def _json_string_list_arg(raw: str) -> list[str]:
+    value = json.loads(raw)
+    if not isinstance(value, list) or not all(isinstance(x, str) for x in value):
+        raise argparse.ArgumentTypeError("json payload must be array of strings")
+    return [x for x in value if x.strip()]
+
+
+def _extract_patch_target_paths(patch_text: str) -> list[str]:
+    targets: list[str] = []
+    for raw in patch_text.splitlines():
+        line = raw.strip()
+        if not line.startswith("+++ "):
+            continue
+        token = line[4:].strip()
+        if token == "/dev/null":
+            continue
+        if token.startswith("b/"):
+            token = token[2:]
+        norm = _normalize_rel_posix(token)
+        if norm:
+            targets.append(norm)
+    return sorted(set(targets))
+
+
+def guarded_apply_patch(
+    repo_root: Path,
+    *,
+    orchestration_id: str,
+    actor_role: str,
+    agent_run_id: str,
+    changed_paths: Sequence[str],
+    patch_text: str,
+    capability_token: str,
+) -> dict[str, Any]:
+    if not patch_text.strip():
+        raise ValueError("patch_text must be non-empty")
+    normalized_paths = [_normalize_rel_posix(p) for p in changed_paths if str(p).strip()]
+    if not normalized_paths:
+        raise ValueError("changed_paths must be non-empty")
+
+    patch_targets = _extract_patch_target_paths(patch_text)
+    if not patch_targets:
+        raise ValueError("patch_text must include at least one '+++ <path>' target")
+    not_covered = [
+        p for p in patch_targets if not any(_repo_path_under_prefix(p, cp) for cp in normalized_paths)
+    ]
+    if not_covered:
+        raise RuntimeError(
+            "guarded-apply-patch: patch targets are not covered by changed_paths: "
+            + ", ".join(not_covered)
+        )
+
+    gate_out = run_gate(
+        repo_root,
+        orchestration_id=orchestration_id,
+        gate_name="apply_patch_writes",
+        agent_run_id=agent_run_id,
+        args_json={"actor_role": actor_role, "changed_paths": normalized_paths},
+        capability_token=capability_token,
+    )
+    proc = subprocess.run(
+        ["git", "apply", "--recount", "--whitespace=nowarn", "-"],
+        cwd=str(repo_root),
+        text=True,
+        input=patch_text,
+        capture_output=True,
+        check=False,
+    )
+    if proc.returncode != 0:
+        msg = (proc.stderr or proc.stdout or "").strip()
+        raise RuntimeError(f"guarded-apply-patch: git apply failed: {msg}")
+
+    return {
+        "applied": True,
+        "changed_paths": normalized_paths,
+        "patch_targets": patch_targets,
+        "gate_result_ref": gate_out.get("gate_result_ref", ""),
+    }
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -2229,6 +3608,38 @@ def main(argv: list[str] | None = None) -> int:
     launch_parser.add_argument("--request-json", required=True, type=_json_arg)
     launch_parser.add_argument("--response-json", required=True, type=_json_arg)
     launch_parser.add_argument("--relation-type", default="launch")
+
+    orch_read_parser = subparsers.add_parser("orchestration-read")
+    orch_read_parser.add_argument("--repo-root", required=True)
+    orch_read_parser.add_argument("--orchestration-id", required=True)
+    orch_read_parser.add_argument("--agent-run-id", required=True)
+    orch_read_parser.add_argument("--read-path", required=True)
+    orch_read_parser.add_argument("--capability-token", required=True)
+
+    patch_gate_parser = subparsers.add_parser("apply-patch-gate")
+    patch_gate_parser.add_argument("--repo-root", required=True)
+    patch_gate_parser.add_argument("--orchestration-id", required=True)
+    patch_gate_parser.add_argument("--actor-role", required=True)
+    patch_gate_parser.add_argument("--agent-run-id", required=True)
+    patch_gate_parser.add_argument("--paths-json", required=True, type=_json_string_list_arg)
+    patch_gate_parser.add_argument("--capability-token", required=True)
+
+    guarded_patch_parser = subparsers.add_parser("guarded-apply-patch")
+    guarded_patch_parser.add_argument("--repo-root", required=True)
+    guarded_patch_parser.add_argument("--orchestration-id", required=True)
+    guarded_patch_parser.add_argument("--actor-role", required=True)
+    guarded_patch_parser.add_argument("--agent-run-id", required=True)
+    guarded_patch_parser.add_argument("--paths-json", required=True, type=_json_string_list_arg)
+    guarded_patch_parser.add_argument("--patch-text", required=True)
+    guarded_patch_parser.add_argument("--capability-token", required=True)
+
+    gate_parser = subparsers.add_parser("run-gate")
+    gate_parser.add_argument("--repo-root", required=True)
+    gate_parser.add_argument("--orchestration-id", required=True)
+    gate_parser.add_argument("--gate", required=True)
+    gate_parser.add_argument("--agent-run-id", required=True)
+    gate_parser.add_argument("--args-json", required=True, type=_json_arg)
+    gate_parser.add_argument("--capability-token", required=True)
 
     run_parser = subparsers.add_parser("record-agent-run")
     run_parser.add_argument("--repo-root", required=True)
@@ -2315,6 +3726,64 @@ def main(argv: list[str] | None = None) -> int:
             response_payload=args.response_json,
             relation_type=args.relation_type,
         )
+    elif args.command == "orchestration-read":
+        try:
+            gate_out = run_gate(
+                repo_root=repo_root,
+                orchestration_id=args.orchestration_id,
+                gate_name="orchestration_read",
+                agent_run_id=args.agent_run_id,
+                args_json={"read_path": args.read_path},
+                capability_token=args.capability_token,
+            )
+            result = gate_out.get("result", {})
+        except (RuntimeError, ValueError, FileNotFoundError) as exc:
+            print(str(exc), file=sys.stderr)
+            return 1
+    elif args.command == "apply-patch-gate":
+        try:
+            gate_out = run_gate(
+                repo_root,
+                orchestration_id=args.orchestration_id,
+                gate_name="apply_patch_writes",
+                agent_run_id=args.agent_run_id,
+                args_json={
+                    "actor_role": args.actor_role,
+                    "changed_paths": args.paths_json,
+                },
+                capability_token=args.capability_token,
+            )
+            result = gate_out.get("result", {})
+        except (RuntimeError, ValueError) as exc:
+            print(str(exc), file=sys.stderr)
+            return 1
+    elif args.command == "guarded-apply-patch":
+        try:
+            result = guarded_apply_patch(
+                repo_root,
+                orchestration_id=args.orchestration_id,
+                actor_role=args.actor_role,
+                agent_run_id=args.agent_run_id,
+                changed_paths=args.paths_json,
+                patch_text=args.patch_text,
+                capability_token=args.capability_token,
+            )
+        except (RuntimeError, ValueError) as exc:
+            print(str(exc), file=sys.stderr)
+            return 1
+    elif args.command == "run-gate":
+        try:
+            result = run_gate(
+                repo_root,
+                orchestration_id=args.orchestration_id,
+                gate_name=args.gate,
+                agent_run_id=args.agent_run_id,
+                args_json=args.args_json,
+                capability_token=args.capability_token,
+            )
+        except (RuntimeError, ValueError) as exc:
+            print(str(exc), file=sys.stderr)
+            return 1
     elif args.command == "record-agent-run":
         result = record_agent_run(
             repo_root=repo_root,

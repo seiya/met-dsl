@@ -38,19 +38,19 @@
 - `Generate verify` のデータ依存判定は `derived_contract.json` の `semantic_dependency.required_sources` を canonical source とし、特定計算様式の一律必須化を禁止する。
 - `Generate verify` の output contract 判定は `derived_contract.json` の `io_contract.outputs` を canonical source とし、`evidence_ref` と `shape_expr` の整合を必須検査する。
 - 出力形式、input/output contract、判定条件の要求定義は `controlled_spec.md` と `tests.md` と `deps.yaml` と `algorithm.resolved.yaml` と `derived_contract.json` と `docs/` canonical source から取得し、`tools/` 配下の検証 `python` スクリプトと `quality check` 実装を要求定義入力へ使用してはならない。
-- 機械的合否を確定する手順の canonical implementation は、当節および `docs/workflow/WORKFLOW_CORE.md` で列挙する `python3 tools/validate_pipeline_semantics.py` の invocation（`--stage` を含む）とする。エージェントは当該コマンドを `exit code 0` まで実行しなければならない。検証スクリプトの実装を読み替えて要求定義を補完してはならない。
+- 機械的合否を確定する手順の canonical implementation は、当節および `docs/workflow/WORKFLOW_CORE.md` で列挙する `validate_pipeline_semantics.py` 相当 invocation を `python3 tools/codex_orchestration_runtime.py run-gate --gate validate_pipeline_semantics --agent-run-id <agent_run_id> --capability-token <capability_token> --args-json '<json>'` 経由で実行する手順とする。エージェントは当該 `run-gate` 実行を `exit code 0` まで完了しなければならない。検証スクリプトの実装を読み替えて要求定義を補完してはならない。
 - 要求定義の不足を検証実装から逆算補完してはならない。不足時は当該ステージを `fail` とする。
 - `Judge` は固定スクリプト検査に加えて `LLM` 意味検査を必須実行し、`semantic_review.json` の `decision=pass` を開始条件に含める。
 - `Judge` 開始前に、対象 `node_key` の同一 `execution_id` 配下へ `run_program` 実行記録と `diagnostics.json` と `perf.json` と `raw` 実行証跡が揃っていることを検証する。未達時は `Judge fail` とする。
-- `Plan verify` 完了前に、`python3 tools/validate_pipeline_semantics.py --stage plan --plan-ref workspace/plans/<node_key_safe>/<plan_id>/` を実行し、`fail` 時は `plan_meta.json` の `verification_status=pass` を付与してはならない。
-- `Generate verify` 完了前に、`python3 tools/validate_pipeline_semantics.py --stage post_generate --pipeline-root workspace/pipelines/<node_key_safe>/<pipeline_id>/` を実行する。検証対象の `generation_id` を固定する場合は `--generation-id <generation_id>` を付与する。`fail` 時は `generate_meta.json` の `verification_status=pass` を付与してはならない。
-- `Build` 完了前に、`python3 tools/validate_pipeline_semantics.py --stage post_build --pipeline-root workspace/pipelines/<node_key_safe>/<pipeline_id>/` を実行し、必要に応じて `--generation-id` を付与する。`fail` 時は `Build` を `fail` としなければならない。
-- `Execute` 完了前に、`python3 tools/validate_pipeline_semantics.py --stage post_execute` を実行する。`--pipeline-root` は繰り返し指定可能とし、省略時は当該 `workspace/` 配下で execution artifact を保持する `pipeline` を検証対象とする。`dependency.resolved.yaml` が `all_nodes` を保持する試行では、`all_nodes` に対応する全 `pipeline_root` を `--pipeline-root` へ展開して実行しなければならない。`fail` 時は `Execute` を `fail` とし、`Judge` を開始してはならない。
-- `Judge` 開始前と `Judge` 完了前に `python3 tools/validate_pipeline_semantics.py --stage pre_judge` を実行し、`fail` 時は当該 `pipeline` を `invalid` とする。
-- `python3 tools/validate_pipeline_semantics.py --stage pre_judge` は `--allow-missing-orchestration` と `--allow-missing-llm-review` と併用してはならない。
-- `python3 tools/validate_pipeline_semantics.py` の `--stage full`（省略時）における `--allow-missing-orchestration` と `--allow-missing-llm-review` は、`--legacy-mode` 併用時に限り許可する。互換移行を明示した例外運用以外で当該緩和を試みる場合は `fail` とする。
-- `Judge` 開始前の `python3 tools/validate_pipeline_semantics.py --stage pre_judge` は、対象 `dependency.resolved.yaml` の `all_nodes` に対応する全 `pipeline_root` を `--pipeline-root` へ繰り返し指定して実行しなければならない。起点 `problem` の単独 `pipeline_root` のみを対象にしてはならない。
-- `python3 tools/validate_pipeline_semantics.py` が `all_nodes` の未発行 `plan` または未発行 `pipeline` を検出した場合、`Judge` を開始してはならない。
+- `Plan verify` 完了前に、`run-gate` で `validate_pipeline_semantics` を `--stage plan --plan-ref workspace/plans/<node_key_safe>/<plan_id>/` 相当引数で実行し、`fail` 時は `plan_meta.json` の `verification_status=pass` を付与してはならない。
+- `Generate verify` 完了前に、`run-gate` で `validate_pipeline_semantics` を `--stage post_generate --pipeline-root workspace/pipelines/<node_key_safe>/<pipeline_id>/` 相当引数で実行する。検証対象の `generation_id` を固定する場合は `--generation-id <generation_id>` 相当引数を付与する。`fail` 時は `generate_meta.json` の `verification_status=pass` を付与してはならない。
+- `Build` 完了前に、`run-gate` で `validate_pipeline_semantics` を `--stage post_build --pipeline-root workspace/pipelines/<node_key_safe>/<pipeline_id>/` 相当引数で実行し、必要に応じて `--generation-id` 相当引数を付与する。`fail` 時は `Build` を `fail` としなければならない。
+- `Execute` 完了前に、`run-gate` で `validate_pipeline_semantics` を `--stage post_execute` 相当引数で実行する。`--pipeline-root` は繰り返し指定可能とし、省略時は当該 `workspace/` 配下で execution artifact を保持する `pipeline` を検証対象とする。`dependency.resolved.yaml` が `all_nodes` を保持する試行では、`all_nodes` に対応する全 `pipeline_root` を `--pipeline-root` へ展開して実行しなければならない。`fail` 時は `Execute` を `fail` とし、`Judge` を開始してはならない。
+- `Judge` 開始前と `Judge` 完了前に、`run-gate` で `validate_pipeline_semantics` を `--stage pre_judge` 相当引数で実行し、`fail` 時は当該 `pipeline` を `invalid` とする。
+- `run-gate` で実行する `validate_pipeline_semantics --stage pre_judge` 相当引数は、`--allow-missing-orchestration` と `--allow-missing-llm-review` と併用してはならない。
+- `run-gate` で実行する `validate_pipeline_semantics --stage full`（省略時）相当引数における `--allow-missing-orchestration` と `--allow-missing-llm-review` は、`--legacy-mode` 併用時に限り許可する。互換移行を明示した例外運用以外で当該緩和を試みる場合は `fail` とする。
+- `Judge` 開始前の `run-gate` による `validate_pipeline_semantics --stage pre_judge` 相当引数は、対象 `dependency.resolved.yaml` の `all_nodes` に対応する全 `pipeline_root` を `--pipeline-root` へ繰り返し指定して実行しなければならない。起点 `problem` の単独 `pipeline_root` のみを対象にしてはならない。
+- `run-gate` で実行する `validate_pipeline_semantics` が `all_nodes` の未発行 `plan` または未発行 `pipeline` を検出した場合、`Judge` を開始してはならない。
 - `trial_meta.json` は `generated_by_stage` と `source_execution_id` と `source_command_ref` と `source_artifact_hash` を必須記録とし、欠落または不整合時は `fail` とする。
 - 本節の検証に違反した試行は当該ステージで停止し、下流ステージ開始条件を満たす目的の人工 artifact generation を禁止する。
 
@@ -182,9 +182,9 @@
 - `raw/metrics_basis.json` が `diagnostics.json` の複写ではなく、一次証跡から構成されている。
 - `raw/metrics_basis.json` が `test_evidence_requirements` の全 `test_id` を対象とする per-test evidence index を保持し、各 `test_id` の `required_raw_variables` を欠落なく記録している。
 - workflow ルート判定が `workspace/` のみに対して実施されている。
-- `python3 tools/validate_workspace_root.py` が `PASS` を返している。
-- `python3 tools/validate_pipeline_semantics.py --stage pre_judge` が `PASS` を返している。
-- `python3 tools/validate_pipeline_semantics.py --stage pre_judge` の実行引数に `--allow-missing-orchestration` と `--allow-missing-llm-review` が含まれていない。
+- `run-gate` による `validate_workspace_root` 実行が `PASS` を返している。
+- `run-gate` による `validate_pipeline_semantics --stage pre_judge` 相当実行が `PASS` を返している。
+- `run-gate` による `validate_pipeline_semantics --stage pre_judge` 相当実行引数に `--allow-missing-orchestration` と `--allow-missing-llm-review` が含まれていない。
 - `semantic_review.json` が存在し、`decision=pass` である。
 - 異なる `node_key` の `generate/src` が不正に完全一致していない。
 - `copy_based_artifact_reuse` が未検出である。
