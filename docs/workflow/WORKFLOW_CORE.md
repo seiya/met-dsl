@@ -93,8 +93,31 @@ workspace/
   orchestrations/
     <orchestration_id>/
       orchestration_meta.json
+      preflight.json
+      phase_state.json
+      phase_state_log.jsonl
+      orchestration_checkpoint.json
       agent_graph.json
       agent_runs.jsonl
+      launches/
+        <agent_run_id>.request.json
+        <agent_run_id>.response.json
+        <agent_run_id>.prompt.txt
+        <agent_run_id>.reply.txt
+      agents/
+        <agent_run_id>/
+          dialogs/
+            child.request.json
+            child.response.json
+            child.prompt.txt
+            child.reply.txt
+            agent.result.json
+            agent.summary.txt
+      access_policies/
+      access_logs/
+      capabilities/
+      gates/
+      violations/
       steps/
         <node_key_safe>/
           <step>/

@@ -89,9 +89,10 @@
 - `Build` / `Execute` / `Judge` / `Promote` のように現行標準で `substep` を定義しない `step` では、`orchestration agent` は `step` 契約をそのまま単一 `step agent` へ渡さなければならない。
 - `Plan generate/verify`、`Generate generate/verify`、`Tune generate/verify` のように `substep` を持つ `step` では、`orchestration agent` は `step` 契約を分解したうえで、対応 `SKILL.md` の責務境界に一致する `substep` 契約だけを直接渡さなければならない。
 - `Plan verify substep` の契約には、`dependency.resolved.yaml` の網羅性検証、依存辺整合検証、依存先 `node` の `plan` 文書との照合検証を必ず含めなければならない。
-- `Plan verify` と `Generate verify` の起動要求では、`skill_must_read_refs` に `plan_ref` 配下の `case.resolved.yaml` と `algorithm.resolved.yaml` と `impl.resolved.yaml` と `dependency.resolved.yaml` と `derived_contract.json` を必須記録しなければならない。不足時は起動前に `fail_closed` とする。
+- `Plan verify` の起動要求では、`skill_must_read_refs` に `plan_ref` 配下の `case.resolved.yaml` と `algorithm.resolved.yaml` と `impl.resolved.yaml` と `dependency.resolved.yaml` と `derived_contract.json` を必須記録しなければならない。不足時は起動前に `fail_closed` とする。
+- `Generate verify` の起動要求では、`skill_must_read_refs` に `plan_ref` 配下の `case.resolved.yaml` と `algorithm.resolved.yaml` と `impl.resolved.yaml` と `dependency.resolved.yaml` と `derived_contract.json` に加えて、`pipeline_ref` を基準とする相対パスとして `lineage.json` と `generate/<generation_id>/generate_meta.json` を必須記録しなければならない。不足時は起動前に `fail_closed` とする。
 - `plan_ref` は `workspace/plans/<node_key_safe>/<plan_id>` のみとし、追加のパスセグメント（ファイルパスを含む）を付けてはならない。`<plan_id>` は `<node_key_safe>_` で始まるディレクトリ名とする。
-- `pipeline_ref` は `workspace/pipelines/<node_key_safe>/<pipeline_id>` のみとし、追加のパスセグメント（`generate/` や `generate_meta.json` を含む）を付けてはならない。`<pipeline_id>` は `<node_key_safe>_` で始まるディレクトリ名とする。
+- `pipeline_ref` は `workspace/pipelines/<node_key_safe>/<pipeline_id>` のみとし、追加のパスセグメント（`generate/` や `generate_meta.json` を含む）を付けてはならない。`<pipeline_id>` は `<node_key_safe>_` で始まるディレクトリ名とする。この制約は `pipeline_ref` フィールド値にのみ適用し、`skill_must_read_refs` には `pipeline_ref` 配下 artifact の相対パス記録を許可する。
 - `Generate verify` の起動要求では、`generation_id` を必須記録しなければならない。`record-launch` は上記の `plan_ref` / `pipeline_ref` 形と `generation_id` と `skill_must_read_refs` 充足を検査する。
 - `step agent` / `substep agent` が `pass` で終了するとき、`output_refs` の各パスは、対応する起動要求に記録された `plan_ref` または `pipeline_ref` ディレクトリ配下に含まれなければならない。`record_agent_run` がこれを検査する。
 
@@ -135,6 +136,7 @@
 37. `resume_enabled=true` の orchestration において、`orchestration agent` は `check-step-completed` を各 `step` 起動前に実行し、`completed=true` かつ `integrity=ok` の場合のみ当該 `step` のスキップを許可する。
 38. チェックポイントによりスキップした `step` は `agent_runs.jsonl` に `agent_role=skipped_by_checkpoint` として記録しなければならない。
 39. `resume_enabled=false` の orchestration（未設定を含む）では `orchestration_checkpoint.json` を信頼して `step` をスキップしてはならない。`docs/workflow/WORKFLOW_CORE.md` の該当ハードニング規範における「明示的な指定」は `orchestration_meta.json` の `resume_enabled=true` のみが満たす。
+40. `write-step-result` の `status=pass` では、`Generate` / `Build` / `Execute` / `Judge` の `step_result.json` に `validation_stage` を必須記録しなければならない。許容値は `Generate: post_generate|full`、`Build: post_build|full`、`Execute: post_execute|pre_judge|full`、`Judge: pre_judge|full` とする。`Plan` と `Tune` は `validation_stage` を必須にしない。
 
 ## 判定基準
 - `workflow` ごとに `orchestration_id` が発行され、`orchestration_meta.json` が存在する。
@@ -154,6 +156,7 @@
 - `step_result.json` の `executor_agent_run_id` が当該ディレクトリ名と一致し、`substep_agent_run_ids` が親子関係と整合する。標準 `substep` を持たない phase では `substep_agent_run_ids=[]` を許可する。
 - `substep` を持つ `step` では、`agent_runs.jsonl` に記録された当該 `step` の全 `substep` の `agent_run_id` が、いずれかの `step_result.json` の `substep_agent_run_ids` に含まれる。欠落時は `tools/codex_orchestration_runtime.py` の orchestration 完了検査で `fail` となる。
 - `step_result.json` の `required_outputs` が `docs/workflow/WORKFLOW_CORE.md` および対応する `docs/workflow/phases/phase_*.md` の phase contract と一致する。
+- `step_result.json` が `status=pass` の `Generate` / `Build` / `Execute` / `Judge` では、`validation_stage` が phase ごとの許容値に一致する。
 - 再投入を実施した `substep` は、対応する `launches/<agent_run_id>.request.json` に `issue_severity` と `repair_strategy` と `repair_target_agent_run_id` と `repair_reason` を保持している。
 - `repair_strategy=reuse` の再投入を実施した場合、対象 `agent_run` の `agent_session_id` は `repair_target_agent_run_id` の `agent_session_id` と一致する。
 - `repair_strategy=restart` の再投入を実施した場合、対象 `agent_run` の `agent_session_id` は `repair_target_agent_run_id` の `agent_session_id` と一致しない。
