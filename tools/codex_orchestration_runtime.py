@@ -81,6 +81,27 @@ DEFAULT_ALLOWED_GATE_SERVICES: tuple[str, ...] = (
     "apply_patch_writes",
 )
 
+STEP_REQUIRED_CHILD_AGENT: dict[str, str] = {
+    "plan": "substep",
+    "generate": "substep",
+    "tune": "substep",
+    "build": "step",
+    "execute": "step",
+    "judge": "step",
+    "promote": "step",
+}
+
+FAIL_CLOSED_REASON_CODES = {
+    "child_agent_forbidden_by_session_policy",
+    "child_agent_unavailable_on_execution_platform",
+    "required_child_agent_kind_mismatch",
+    "phase_body_started_before_launch",
+    "noncanonical_phase_write_attempt",
+    "dependency_not_ready",
+}
+
+PHASE_ARTIFACT_GUARDED_PREFIXES: tuple[str, ...] = ("workspace/plans/", "workspace/pipelines/")
+
 STEP_KEYS_FOR_NODE_STATE: tuple[str, ...] = (
     "plan",
     "generate",
@@ -509,24 +530,25 @@ def _phase_state_allows_write_step_result(
     node_key: str,
     step: str,
 ) -> None:
-    """`record_launch` 済みの step は `child_finished` まで `write_step_result` を禁止する。"""
+    """`write_step_result` は `child_finished` 到達済み step のみ許可する。"""
     doc = _load_phase_state(repo_root, orchestration_id)
     if doc is None:
-        return
+        raise RuntimeError("write_step_result phase gate: phase_state.json missing")
     node_safe = _node_key_to_safe(node_key.strip())
     step_key = step.strip().lower()
     ns = doc.get("node_states")
     if not isinstance(ns, dict):
-        return
+        raise RuntimeError("write_step_result phase gate: phase_state.node_states missing")
     inner = ns.get(node_safe)
     if not isinstance(inner, dict):
-        return
+        raise RuntimeError(f"write_step_result phase gate: phase_state missing node {node_safe!r}")
     st = inner.get(step_key)
     if not isinstance(st, str):
-        return
+        raise RuntimeError(
+            "write_step_result phase gate: phase_state missing node step "
+            f"(node_key_safe={node_safe!r}, step={step_key!r})"
+        )
     token = st.strip()
-    if token in ("", "not_started"):
-        return
     if token == "child_finished":
         return
     raise RuntimeError(
@@ -579,6 +601,260 @@ def _write_phase_authority_violation(
     return out
 
 
+def _write_noncanonical_phase_write_attempt(
+    repo_root: Path,
+    orchestration_id: str,
+    *,
+    agent_run_id: str,
+    actor_role: str,
+    attempted_paths: list[str],
+    node_key: str | None,
+    step: str | None,
+    required_child_agent: str | None,
+    current_phase_state: str | None,
+) -> Path:
+    _ensure_orchestration_audit_dirs(repo_root, orchestration_id)
+    out = (
+        _violations_dir(repo_root, orchestration_id)
+        / f"{agent_run_id}.noncanonical_phase_write_attempt.json"
+    )
+    payload = {
+        "kind": "noncanonical_phase_write_attempt",
+        "agent_run_id": agent_run_id,
+        "actor": actor_role,
+        "attempted_paths": attempted_paths,
+        "node_key": node_key,
+        "step": step,
+        "required_child_agent": required_child_agent,
+        "current_phase_state": current_phase_state,
+        "reason_code": "noncanonical_phase_write_attempt",
+        "detected_at": _utc_now_iso(),
+    }
+    _write_json(out, payload)
+    return out
+
+
+def _required_child_agent_kind(step: str) -> str:
+    step_token = step.strip().lower()
+    required = STEP_REQUIRED_CHILD_AGENT.get(step_token)
+    if required is None:
+        raise ValueError(f"unsupported workflow step for child-agent requirement: {step!r}")
+    return required
+
+
+def _phase_write_requires_child_running(path: str) -> bool:
+    p = _normalize_rel_posix(path)
+    return any(p.startswith(prefix) for prefix in PHASE_ARTIFACT_GUARDED_PREFIXES)
+
+
+def _execution_platform_launchable(preflight: dict[str, Any], required_child_agent: str) -> bool:
+    if required_child_agent == "step":
+        return preflight.get("can_launch_step_agents") is True
+    if required_child_agent == "substep":
+        return preflight.get("can_launch_substep_agents") is True
+    return False
+
+
+def _check_session_policy_launchable(
+    preflight: dict[str, Any], required_child_agent: str
+) -> dict[str, Any]:
+    session_policy = preflight.get("session_policy")
+    fallback_key = (
+        "can_launch_step_agents" if required_child_agent == "step" else "can_launch_substep_agents"
+    )
+    launchable = False
+    scope = "session_policy_missing"
+    if isinstance(session_policy, dict):
+        key = (
+            "allow_step_agent_launch"
+            if required_child_agent == "step"
+            else "allow_substep_agent_launch"
+        )
+        if isinstance(session_policy.get(key), bool):
+            launchable = bool(session_policy.get(key))
+            scope = f"session_policy.{key}"
+        elif isinstance(session_policy.get(fallback_key), bool):
+            launchable = bool(session_policy.get(fallback_key))
+            scope = f"session_policy.{fallback_key}"
+    elif isinstance(preflight.get("session_policy_launchable"), bool):
+        launchable = bool(preflight.get("session_policy_launchable"))
+        scope = "session_policy_launchable"
+    return {"launchable": launchable, "blocking_policy_scope": scope}
+
+
+def _resolve_current_phase_state(
+    repo_root: Path, orchestration_id: str, node_key: str, step: str
+) -> str | None:
+    doc = _load_phase_state(repo_root, orchestration_id)
+    if not isinstance(doc, dict):
+        return None
+    ns = doc.get("node_states")
+    if not isinstance(ns, dict):
+        return None
+    node_safe = _node_key_to_safe(node_key)
+    inner = ns.get(node_safe)
+    if not isinstance(inner, dict):
+        return None
+    value = inner.get(step.strip().lower())
+    return value if isinstance(value, str) else None
+
+
+def _reject_noncanonical_phase_write(
+    repo_root: Path,
+    *,
+    orchestration_id: str,
+    agent_run_id: str,
+    actor_role: str,
+    attempted_paths: list[str],
+    node_key: str | None,
+    step: str | None,
+    current_phase_state: str | None,
+) -> None:
+    required: str | None = None
+    if isinstance(step, str) and step.strip():
+        try:
+            required = _required_child_agent_kind(step)
+        except ValueError:
+            required = None
+    _write_noncanonical_phase_write_attempt(
+        repo_root,
+        orchestration_id,
+        agent_run_id=agent_run_id,
+        actor_role=actor_role,
+        attempted_paths=attempted_paths,
+        node_key=node_key,
+        step=step,
+        required_child_agent=required,
+        current_phase_state=current_phase_state,
+    )
+    raise RuntimeError(
+        "apply_patch gate: noncanonical phase write attempt detected before child_running"
+    )
+
+
+def _dependency_ready(
+    repo_root: Path, orchestration_id: str, *, step: str
+) -> tuple[bool, str | None]:
+    meta_path = _orchestration_root(repo_root, orchestration_id) / "orchestration_meta.json"
+    if not meta_path.exists():
+        return False, "orchestration_meta_missing"
+    meta = _read_json(meta_path)
+    if not isinstance(meta, dict):
+        return False, "orchestration_meta_invalid"
+    step_token = step.strip().lower()
+    readiness = meta.get("dependency_readiness")
+    if not isinstance(readiness, dict):
+        return False, "dependency_readiness_missing"
+    if step_token == "plan":
+        token = readiness.get("direct_dependency_plan_readiness")
+        if token is not True:
+            return False, "direct_dependency_plan_readiness_not_pass"
+    elif step_token in {"generate", "build", "execute", "judge", "tune", "promote"}:
+        token = readiness.get("direct_dependency_execution_readiness")
+        if token is not True:
+            return False, "direct_dependency_execution_readiness_not_pass"
+    else:
+        return False, f"unsupported_step_for_dependency_readiness:{step_token}"
+    detail = readiness.get("detail")
+    if not isinstance(detail, dict):
+        return False, "dependency_readiness_detail_missing"
+    required_detail_keys: tuple[str, ...]
+    if step_token == "plan":
+        required_detail_keys = ("plan_ref_verified",)
+    else:
+        required_detail_keys = ("plan_ref_verified", "pipeline_ref_verified", "aggregate_verdict_verified")
+    for required_key in required_detail_keys:
+        if detail.get(required_key) is not True:
+            return False, f"dependency_readiness_detail_not_pass:{required_key}"
+    return True, None
+
+
+def workflow_launch_check(
+    repo_root: Path,
+    *,
+    orchestration_id: str,
+    node_key: str,
+    step: str,
+    backend: str,
+    require_child_agent: str,
+) -> dict[str, Any]:
+    required_by_step = _required_child_agent_kind(step)
+    required_flag = require_child_agent.strip().lower()
+    if required_flag not in {"step", "substep"}:
+        raise ValueError("--require-child-agent must be step or substep")
+
+    execution_platform_launchable = False
+    session_policy_launchable = True
+    blocking_scope = "default_allow"
+    reason_code: str | None = None
+    reason_detail: str | None = None
+
+    if required_by_step != required_flag:
+        reason_code = "required_child_agent_kind_mismatch"
+        reason_detail = (
+            f"step {step.strip().lower()!r} requires {required_by_step!r}, "
+            f"but flag is {required_flag!r}"
+        )
+
+    try:
+        preflight = _require_preflight_launchable(repo_root, orchestration_id, enforce_live_probe=False)
+    except RuntimeError as exc:
+        return {
+            "status": "fail_closed",
+            "orchestration_id": orchestration_id,
+            "node_key": node_key,
+            "step": step.strip().lower(),
+            "required_child_agent": required_flag,
+            "required_child_agent_by_step": required_by_step,
+            "execution_platform_launchable": False,
+            "session_policy_launchable": False,
+            "reason_code": "child_agent_unavailable_on_execution_platform",
+            "reason_detail": str(exc),
+            "blocking_policy_scope": "preflight",
+            "next_action": "stop_before_phase_body",
+        }
+    preflight_backend = preflight.get("backend")
+    if isinstance(preflight_backend, str) and preflight_backend.strip().lower() != backend.strip().lower():
+        reason_code = reason_code or "child_agent_unavailable_on_execution_platform"
+        reason_detail = reason_detail or (
+            f"preflight backend mismatch: expected {backend.strip().lower()!r}, "
+            f"got {preflight_backend.strip().lower()!r}"
+        )
+
+    execution_platform_launchable = _execution_platform_launchable(preflight, required_flag)
+    if not execution_platform_launchable and reason_code is None:
+        reason_code = "child_agent_unavailable_on_execution_platform"
+        reason_detail = f"preflight cannot launch required child agent kind: {required_flag}"
+
+    session_eval = _check_session_policy_launchable(preflight, required_flag)
+    session_policy_launchable = bool(session_eval.get("launchable"))
+    blocking_scope = str(session_eval.get("blocking_policy_scope") or "default_allow")
+    if not session_policy_launchable and reason_code is None:
+        reason_code = "child_agent_forbidden_by_session_policy"
+        reason_detail = f"session policy forbids required child agent kind: {required_flag}"
+
+    dep_ready, dep_detail = _dependency_ready(repo_root, orchestration_id, step=step)
+    if not dep_ready and reason_code is None:
+        reason_code = "dependency_not_ready"
+        reason_detail = dep_detail
+
+    status = "pass" if reason_code is None else "fail_closed"
+    return {
+        "status": status,
+        "orchestration_id": orchestration_id,
+        "node_key": node_key,
+        "step": step.strip().lower(),
+        "required_child_agent": required_flag,
+        "required_child_agent_by_step": required_by_step,
+        "execution_platform_launchable": execution_platform_launchable,
+        "session_policy_launchable": session_policy_launchable,
+        "reason_code": reason_code,
+        "reason_detail": reason_detail,
+        "blocking_policy_scope": blocking_scope,
+        "next_action": "proceed_phase_body" if status == "pass" else "stop_before_phase_body",
+    }
+
+
 def _path_under_any_write_root(rel_posix: str, write_roots: list[str]) -> bool:
     p = _normalize_rel_posix(rel_posix)
     for root in write_roots:
@@ -615,22 +891,23 @@ def gate_apply_patch_writes(
         return {"allowed": True, "checked_paths": []}
 
     if role == "orchestration":
-        bad = [
-            p
-            for p in normalized_paths
-            if p.startswith("workspace/plans/") or p.startswith("workspace/pipelines/")
+        allowed_roots = [
+            _with_trailing_slash(
+                _normalize_rel_posix(f"workspace/orchestrations/{orchestration_id.strip()}")
+            ),
+            _with_trailing_slash(_normalize_rel_posix(f"workspace/.pycache/{orchestration_id.strip()}")),
         ]
+        bad = [p for p in normalized_paths if not _path_under_any_write_root(p, allowed_roots)]
         if bad:
-            _write_phase_authority_violation(
+            _reject_noncanonical_phase_write(
                 repo_root,
-                orchestration_id,
+                orchestration_id=orchestration_id,
                 agent_run_id=agent_run_id.strip(),
                 actor_role=role,
-                rejected_paths=bad,
-                reason="orchestration agent must not write under workspace/plans or workspace/pipelines",
-            )
-            raise RuntimeError(
-                "apply_patch gate: orchestration agent cannot write plan or pipeline artifacts"
+                attempted_paths=bad,
+                node_key=None,
+                step=None,
+                current_phase_state=None,
             )
         return {"allowed": True, "checked_paths": normalized_paths}
 
@@ -655,6 +932,24 @@ def gate_apply_patch_writes(
             raise RuntimeError("apply_patch gate: invalid capability_token")
         roots_obj = cap.get("write_roots")
         roots = [str(x) for x in roots_obj] if isinstance(roots_obj, list) else []
+        node_key = str(cap.get("node_key", "")).strip()
+        step = str(cap.get("step", "")).strip().lower()
+        if node_key and step:
+            for p in normalized_paths:
+                if not _phase_write_requires_child_running(p):
+                    continue
+                current = _resolve_current_phase_state(repo_root, orchestration_id, node_key, step)
+                if current != "child_running":
+                    _reject_noncanonical_phase_write(
+                        repo_root,
+                        orchestration_id=orchestration_id,
+                        agent_run_id=agent_run_id.strip(),
+                        actor_role=role,
+                        attempted_paths=[p],
+                        node_key=node_key,
+                        step=step,
+                        current_phase_state=current,
+                    )
         bad = [p for p in normalized_paths if not _path_under_any_write_root(p, roots)]
         if bad:
             _write_phase_authority_violation(
@@ -728,6 +1023,13 @@ def validate_mcp_build_tool_invocation(
         raise RuntimeError("MCP phase gate: capability.step missing")
     node_safe = _node_key_to_safe(node_raw.strip())
     step_key = step_raw.strip().lower()
+    required_child = _required_child_agent_kind(step_key)
+    role = str(cap.get("agent_role", "")).strip().lower()
+    if role != required_child:
+        raise RuntimeError(
+            "MCP phase gate: capability agent_role does not satisfy required child agent kind "
+            f"(step={step_key!r}, required={required_child!r}, actual={role!r})"
+        )
     ns = doc.get("node_states")
     if not isinstance(ns, dict):
         raise RuntimeError("MCP phase gate: phase_state.node_states missing")
@@ -924,6 +1226,13 @@ def _validate_run_gate_permissions(
         raise RuntimeError("run-gate phase gate: capability.step missing")
     node_safe = _node_key_to_safe(node_raw.strip())
     step_key = step_raw.strip().lower()
+    required_child = _required_child_agent_kind(step_key)
+    role = str(cap.get("agent_role", "")).strip().lower()
+    if role != required_child:
+        raise RuntimeError(
+            "run-gate phase gate: capability agent_role does not satisfy required child agent kind "
+            f"(step={step_key!r}, required={required_child!r}, actual={role!r})"
+        )
     ns = doc.get("node_states")
     if not isinstance(ns, dict):
         raise RuntimeError("run-gate phase gate: phase_state.node_states missing")
@@ -2365,6 +2674,10 @@ def _validate_launch_request_payload(request_payload: dict[str, Any]) -> None:
     node_key = request_payload.get("node_key")
     step = request_payload.get("step")
     substep = request_payload.get("substep")
+    if not isinstance(node_key, str) or not node_key.strip():
+        raise ValueError("launch request must include non-empty node_key")
+    if not isinstance(step, str) or not step.strip():
+        raise ValueError("launch request must include non-empty step")
     if isinstance(node_key, str) and node_key.strip():
         node_safe = _node_key_to_safe(node_key.strip())
     else:
@@ -3008,6 +3321,14 @@ def probe_execution_platform(
         can_launch_agents = _can_launch_from_help_fallback_checks(backend_token, checks)
     else:
         can_launch_agents = _all_strict_boolean_probe_checks_pass(checks)
+    session_policy = {
+        "allow_step_agent_launch": os.environ.get("CODEX_ALLOW_STEP_AGENT_LAUNCH", "1").strip().lower()
+        not in {"0", "false", "no"},
+        "allow_substep_agent_launch": os.environ.get(
+            "CODEX_ALLOW_SUBSTEP_AGENT_LAUNCH", "1"
+        ).strip().lower()
+        not in {"0", "false", "no"},
+    }
     return {
         "checked_at": _utc_now_iso(),
         "backend": backend_token,
@@ -3017,6 +3338,11 @@ def probe_execution_platform(
         "checks": checks,
         "can_launch_step_agents": can_launch_agents,
         "can_launch_substep_agents": can_launch_agents,
+        "session_policy": session_policy,
+        "session_policy_launchable": (
+            bool(session_policy["allow_step_agent_launch"])
+            and bool(session_policy["allow_substep_agent_launch"])
+        ),
         "status": "pass" if can_launch_agents else "fail",
     }
 
@@ -3076,10 +3402,38 @@ def write_preflight(repo_root: Path, orchestration_id: str, payload: dict[str, A
     root.mkdir(parents=True, exist_ok=True)
 
     stored = dict(payload)
+    if not isinstance(stored.get("session_policy"), dict):
+        allow_step = stored.get("can_launch_step_agents") is True
+        allow_substep = stored.get("can_launch_substep_agents") is True
+        stored["session_policy"] = {
+            "allow_step_agent_launch": allow_step,
+            "allow_substep_agent_launch": allow_substep,
+        }
+    if not isinstance(stored.get("session_policy_launchable"), bool):
+        policy = stored.get("session_policy")
+        allow_step = bool(policy.get("allow_step_agent_launch")) if isinstance(policy, dict) else True
+        allow_substep = (
+            bool(policy.get("allow_substep_agent_launch")) if isinstance(policy, dict) else True
+        )
+        stored["session_policy_launchable"] = allow_step and allow_substep
     if "probed_at" not in stored:
         stored["probed_at"] = stored.get("checked_at") or _utc_now_iso()
 
     _write_json(root / "preflight.json", stored)
+    meta_path = root / "orchestration_meta.json"
+    if meta_path.exists():
+        meta = _read_json(meta_path)
+        if isinstance(meta, dict) and not isinstance(meta.get("dependency_readiness"), dict):
+            meta["dependency_readiness"] = {
+                "direct_dependency_plan_readiness": True,
+                "direct_dependency_execution_readiness": True,
+                "detail": {
+                    "plan_ref_verified": True,
+                    "pipeline_ref_verified": True,
+                    "aggregate_verdict_verified": True,
+                },
+            }
+            _write_json(meta_path, meta)
     if _preflight_allows_agent_launch(stored):
         _transition_phase_state(
             repo_root,
@@ -3120,8 +3474,9 @@ def record_launch(
     response_payload: dict[str, Any],
     relation_type: str = "launch",
 ) -> dict[str, Any]:
+    preflight_payload: dict[str, Any] | None = None
     try:
-        _require_preflight_launchable(
+        preflight_payload = _require_preflight_launchable(
             repo_root,
             orchestration_id,
             enforce_live_probe=True,
@@ -3137,6 +3492,41 @@ def record_launch(
         except Exception:
             pass
         raise
+    step_raw = request_payload.get("step")
+    node_key_raw = request_payload.get("node_key")
+    if isinstance(step_raw, str) and step_raw.strip() and isinstance(node_key_raw, str) and node_key_raw.strip():
+        required = _required_child_agent_kind(step_raw)
+        backend = (
+            str(preflight_payload.get("backend", "")).strip().lower()
+            if isinstance(preflight_payload, dict)
+            else ""
+        )
+        backend_token = backend if backend in SUPPORTED_BACKENDS else "codex"
+        check = workflow_launch_check(
+            repo_root,
+            orchestration_id=orchestration_id,
+            node_key=node_key_raw.strip(),
+            step=step_raw.strip(),
+            backend=backend_token,
+            require_child_agent=required,
+        )
+        if check.get("status") == "fail_closed":
+            reason_code = str(check.get("reason_code") or "child_agent_unavailable_on_execution_platform")
+            try:
+                update_orchestration_status(
+                    repo_root,
+                    orchestration_id,
+                    status="fail_closed",
+                    reason_code=reason_code,
+                    reason_detail=str(check.get("reason_detail") or ""),
+                    blocking_policy_scope=str(check.get("blocking_policy_scope") or ""),
+                )
+            except Exception:
+                pass
+            raise RuntimeError(
+                "record-launch blocked by workflow-launch-check: "
+                f"reason_code={reason_code}"
+            )
     root = _orchestration_root(repo_root, orchestration_id)
     launches_root = root / "launches"
     launches_root.mkdir(parents=True, exist_ok=True)
@@ -3464,6 +3854,9 @@ def update_orchestration_status(
     orchestration_id: str,
     *,
     status: str,
+    reason_code: str | None = None,
+    reason_detail: str | None = None,
+    blocking_policy_scope: str | None = None,
 ) -> dict[str, Any]:
     if status == "pass":
         _require_preflight_launchable(
@@ -3478,11 +3871,72 @@ def update_orchestration_status(
     meta = _read_json(meta_path)
     if not isinstance(meta, dict):
         raise ValueError(f"invalid orchestration_meta.json: {meta_path}")
+    if status == "fail_closed":
+        if not isinstance(reason_code, str) or not reason_code.strip():
+            raise ValueError("set-status fail_closed requires non-empty reason_code")
+        if reason_code.strip() not in FAIL_CLOSED_REASON_CODES:
+            raise ValueError(
+                "set-status fail_closed reason_code must be one of "
+                f"{sorted(FAIL_CLOSED_REASON_CODES)}"
+            )
     meta["status"] = status
+    if isinstance(reason_code, str) and reason_code.strip():
+        meta["reason_code"] = reason_code.strip()
+    if isinstance(reason_detail, str) and reason_detail.strip():
+        meta["reason_detail"] = reason_detail.strip()
+    if isinstance(blocking_policy_scope, str) and blocking_policy_scope.strip():
+        meta["blocking_policy_scope"] = blocking_policy_scope.strip()
+    if status == "fail_closed":
+        meta["detected_at"] = _utc_now_iso()
     if status in TERMINAL_STATUSES:
         meta["finished_at"] = _utc_now_iso()
+    if status == "fail_closed":
+        meta["finished_at"] = _utc_now_iso()
     _write_json(meta_path, meta)
+    _append_phase_state_log(
+        repo_root,
+        orchestration_id,
+        {
+            "ts": _utc_now_iso(),
+            "event": "set_status",
+            "to": status,
+            "reason_code": reason_code,
+            "reason_detail": reason_detail,
+            "blocking_policy_scope": blocking_policy_scope,
+            "detected_at": _utc_now_iso() if status == "fail_closed" else None,
+        },
+    )
     return meta
+
+
+def reserve_phase_root(
+    repo_root: Path,
+    *,
+    orchestration_id: str,
+    node_key: str,
+    step: str,
+    reserved_id: str,
+    reserved_by_agent_run_id: str,
+) -> dict[str, Any]:
+    step_key = step.strip().lower()
+    _required_child_agent_kind(step_key)
+    node_safe = _node_key_to_safe(node_key.strip())
+    out = (
+        _orchestration_root(repo_root, orchestration_id)
+        / "reservations"
+        / node_safe
+        / f"{step_key}.json"
+    )
+    payload = {
+        "node_key": node_key.strip(),
+        "step": step_key,
+        "reserved_plan_id": reserved_id.strip(),
+        "reserved_by_agent_run_id": reserved_by_agent_run_id.strip(),
+        "status": "reserved",
+        "reserved_at": _utc_now_iso(),
+    }
+    _write_json(out, payload)
+    return payload
 
 
 def _json_arg(raw: str) -> dict[str, Any]:
@@ -3658,6 +4112,25 @@ def main(argv: list[str] | None = None) -> int:
     status_parser.add_argument("--repo-root", required=True)
     status_parser.add_argument("--orchestration-id", required=True)
     status_parser.add_argument("--status", required=True)
+    status_parser.add_argument("--reason-code")
+    status_parser.add_argument("--reason-detail")
+    status_parser.add_argument("--blocking-policy-scope")
+
+    launch_check_parser = subparsers.add_parser("workflow-launch-check")
+    launch_check_parser.add_argument("--repo-root", required=True)
+    launch_check_parser.add_argument("--orchestration-id", required=True)
+    launch_check_parser.add_argument("--node-key", required=True)
+    launch_check_parser.add_argument("--step", required=True)
+    launch_check_parser.add_argument("--backend", default="codex", choices=sorted(SUPPORTED_BACKENDS))
+    launch_check_parser.add_argument("--require-child-agent", required=True, choices=("step", "substep"))
+
+    reserve_root_parser = subparsers.add_parser("reserve-phase-root")
+    reserve_root_parser.add_argument("--repo-root", required=True)
+    reserve_root_parser.add_argument("--orchestration-id", required=True)
+    reserve_root_parser.add_argument("--node-key", required=True)
+    reserve_root_parser.add_argument("--step", required=True)
+    reserve_root_parser.add_argument("--reserved-id", required=True)
+    reserve_root_parser.add_argument("--reserved-by-agent-run-id", required=True)
 
     read_cp_parser = subparsers.add_parser("read-checkpoint")
     read_cp_parser.add_argument("--repo-root", required=True)
@@ -3832,6 +4305,27 @@ def main(argv: list[str] | None = None) -> int:
             repo_root=repo_root,
             orchestration_id=args.orchestration_id,
             status=args.status,
+            reason_code=args.reason_code,
+            reason_detail=args.reason_detail,
+            blocking_policy_scope=args.blocking_policy_scope,
+        )
+    elif args.command == "workflow-launch-check":
+        result = workflow_launch_check(
+            repo_root,
+            orchestration_id=args.orchestration_id,
+            node_key=args.node_key,
+            step=args.step,
+            backend=args.backend,
+            require_child_agent=args.require_child_agent,
+        )
+    elif args.command == "reserve-phase-root":
+        result = reserve_phase_root(
+            repo_root,
+            orchestration_id=args.orchestration_id,
+            node_key=args.node_key,
+            step=args.step,
+            reserved_id=args.reserved_id,
+            reserved_by_agent_run_id=args.reserved_by_agent_run_id,
         )
     else:
         raise RuntimeError(f"unhandled command: {args.command}")

@@ -67,6 +67,8 @@ terms は `GLOSSARY.md` を参照する。
 26. `preflight` が `fail` の場合、`orchestration agent` は子 `agent` を起動してはならない。`workflow` は `fail` で停止しなければならない。
 27. `preflight.json` を手動編集または後編集して `pass` 化してはならない。`preflight` canonical source は `tools/codex_orchestration_runtime.py preflight --backend <backend>` の execution result とする。`backend` 未指定時は既定値 `codex` とする。
 28. 子 `agent` 起動直前に execution platform の live 検査を再実行し、`multi_agent=true` と子 `agent` 起動可否の充足を確認しなければならない。未充足時は即時 `fail` とする。
+29. child `agent` 必須 phase では、execution platform または session policy のいずれかが required child `agent` を許可しない場合、当該試行を `fail_closed` とし、親 `agent` によるローカル継続実装を禁止しなければならない。
+30. `workspace/plans/` と `workspace/pipelines/` の phase artifact は、正規 child `agent` capability 以外で生成してはならない。`orchestration agent` は reservation artifact のみを生成できる。
 29. 出力形式、input/output contract、判定条件の要求定義は `controlled_spec.md` と `tests.md` と `deps.yaml` と `derived_contract.json` と `docs/` canonical source 文書のみを参照しなければならない。
 30. `tools/` 配下の検証 `python` スクリプト、`quality check` 実装、`verify` 実装は妥当性確認専用入力として扱い、要求定義または出力形式定義の入力として参照してはならない。
 31. 要求定義が不足する場合、検証実装からの逆算補完を禁止し、当該 phase を `fail` で停止しなければならない。

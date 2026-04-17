@@ -24,6 +24,8 @@ description: 対応 execution platform で `workflow` 全体を開始し、`orch
 - 子 `agent` 起動直前に live preflight gate を満たすことを必須とし、live 検査が `fail` の場合は `record-launch` を実行してはならない。
 - 起動前の初期読込は `references/startup_contract.md` を第一参照とし、詳細契約が必要な場合のみ `docs/workflow/WORKFLOW_CORE.md` と `docs/ORCHESTRATION.md` を追加参照しなければならない。
 - phase 着手前に、対象 phase が `substep agent` 必須か `step agent` 必須かを固定表で判定しなければならない。`Plan` / `Generate` / `Tune` は `substep agent`、`Build` / `Execute` / `Judge` / `Promote` は `step agent` とする。
+- 最初の phase 着手前に `python3 tools/codex_orchestration_runtime.py workflow-launch-check --repo-root <repo_root> --orchestration-id <orchestration_id> --node-key <node_key> --step <step> --backend <backend> --require-child-agent <step|substep>` を実行しなければならない。
+- `workflow-launch-check` が `status=fail_closed` を返した場合、`python3 tools/codex_orchestration_runtime.py set-status --repo-root <repo_root> --orchestration-id <orchestration_id> --status fail_closed --reason-code <reason_code>` を実行して停止し、phase artifact を生成してはならない。
 - 最初の `commentary` では、対象 phase、使用する `SKILL`、起動する `agent` 種別、`MCP` を使用する箇所を実行宣言として明示しなければならない。実行宣言と実作業が一致しない場合は停止して宣言からやり直さなければならない。
 - `step agent` / `substep agent` の起動要求本文は、必ず `references/launch_prompts.md` の対応テンプレートを基底として生成しなければならない。テンプレートを使わない任意の自由形式 prompt、別テンプレートの混用、必須項目の省略または改名を禁止する。
 - 子 `agent` 起動要求本文には、要求定義と判定規則の canonical source が `docs/` と `spec/` と当該試行 artifact であること、`tools/` 配下の実装、検証 `script`、test code、validator code を読んで rule を抽出してはならないことを明示しなければならない。
@@ -36,8 +38,10 @@ description: 対応 execution platform で `workflow` 全体を開始し、`orch
 - `launch response` は子 `agent` 識別子を必須記録し、`record-agent-run` の `agent_session_id` は当該識別子と一致しなければならない。
 - 上位 `node` の `Plan` を起動する前に、直下依存 `node` の `plan_ref` と `plan_meta.json.verification_status` を確認し、`direct dependency plan readiness` を満たすことを必須とする。
 - 上位 `node` の `Generate` / `Build` / `Execute` / `Judge` を起動する前に、直下依存 `node` の `plan_ref` と `pipeline_ref` と最新 `aggregate_verdict` を確認し、`direct dependency execution readiness` を満たすことを必須とする。
+- `workflow-launch-check` の dependency readiness 判定を通すため、`orchestration_meta.json.dependency_readiness` に `direct_dependency_plan_readiness` と `direct_dependency_execution_readiness` と `detail.plan_ref_verified` と `detail.pipeline_ref_verified` と `detail.aggregate_verdict_verified` を必須記録する。未記録または未充足の場合、`workflow-launch-check` は `fail_closed` を返す。
 - 直下依存 `node` が未完了の場合、依存先 code を上位 `node` の `src/` へ内包する代替実装を指示してはならない。
 - phase artifact を直接編集または `MCP` 実行する前に、`preflight` 済み、launch prompt 準備済み、child `agent` 起動済みの 3 条件を満たさなければならない。いずれかが未充足の場合は phase 本体の編集と実行を開始してはならない。
+- child `agent` 起動前に path 予約が必要な場合は、`python3 tools/codex_orchestration_runtime.py reserve-phase-root --repo-root <repo_root> --orchestration-id <orchestration_id> --node-key <node_key> --step <step> --reserved-id <id> --reserved-by-agent-run-id <agent_run_id>` を使用し、`workspace/plans/` と `workspace/pipelines/` の実体化を禁止する。
 - workflow の正当性確認、検証、疎通確認を目的とした仮実装であっても、親 `agent` が子 `agent` 必須 phase の本体処理を代行してはならない。
 - 子 `agent` 起動ごとに、起動要求本文を `launches/<agent_run_id>.prompt.txt`、起動返答本文を `launches/<agent_run_id>.reply.txt` へ保存し、`agent_runs.jsonl` の `launch_prompt_ref` と `launch_reply_ref` に参照を記録しなければならない。
 - 各 `step agent` / `substep agent` の完了時に、`agents/<agent_run_id>/dialogs/agent.result.json` と `agents/<agent_run_id>/dialogs/agent.summary.txt` を保存し、`agent_runs.jsonl` の `agent_result_ref` と `agent_summary_ref` に参照を記録しなければならない。

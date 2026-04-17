@@ -16,6 +16,8 @@ from unittest.mock import patch
 from mcp_servers.build_runtime_server import tool_compile_project
 
 from tools.codex_orchestration_runtime import (
+    TERMINAL_STATUSES,
+    _required_child_agent_kind,
     _build_artifact_hashes,
     _compute_sha256,
     _is_within_preflight_ttl,
@@ -41,12 +43,14 @@ from tools.codex_orchestration_runtime import (
     probe_codex_cli,
     record_agent_run,
     record_launch,
+    reserve_phase_root,
     render_launch_prompt_text,
     run_gate,
     update_checkpoint,
     update_orchestration_status,
     validate_mcp_build_tool_invocation,
     verify_checkpoint_integrity,
+    workflow_launch_check,
     write_preflight,
     write_step_result,
 )
@@ -199,6 +203,9 @@ class CodexOrchestrationRuntimeTests(unittest.TestCase):
             os.environ.pop("CODEX_ORCHESTRATION_ENFORCE_LIVE_PREFLIGHT", None)
         else:
             os.environ["CODEX_ORCHESTRATION_ENFORCE_LIVE_PREFLIGHT"] = self._old_live_preflight
+
+    def test_terminal_statuses_do_not_include_fail_closed(self) -> None:
+        self.assertEqual(TERMINAL_STATUSES, {"pass", "fail", "blocked", "timeout", "cancel"})
 
     def test_parse_feature_list_extracts_boolean_flags(self) -> None:
         raw = """
@@ -2067,6 +2074,19 @@ shell_tool                       stable             true
                 "agent_backend": "claude",
             },
         )
+        phase_state_path = repo_root / "workspace/orchestrations/orch_001/phase_state.json"
+        phase_state = json.loads(phase_state_path.read_text(encoding="utf-8"))
+        phase_state["node_states"]["problem__shallow_water2d__0.3.0"] = {
+            "plan": "child_finished",
+            "generate": "child_finished",
+            "build": "child_finished",
+            "execute": "child_finished",
+            "judge": "child_finished",
+        }
+        phase_state_path.write_text(
+            json.dumps(phase_state, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
 
     def test_write_step_result_requires_validation_stage_for_build_pass(self) -> None:
         """validation_stage のない pass build step_result が ValueError を上げること。"""
@@ -2085,6 +2105,36 @@ shell_tool                       stable             true
                         "required_outputs": [
                             "workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/build/build_001/bin/simulate"
                         ],
+                        "failed_substeps": [],
+                        "substep_agent_run_ids": [],
+                    },
+                )
+
+    def test_write_step_result_rejects_when_phase_not_child_finished(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            init_orchestration(repo_root=repo_root, orchestration_id="orch_001")
+            write_preflight(
+                repo_root=repo_root,
+                orchestration_id="orch_001",
+                payload={
+                    "status": "pass",
+                    "can_launch_step_agents": True,
+                    "can_launch_substep_agents": True,
+                    "feature_states": {"multi_agent": True},
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}],
+                },
+            )
+            with self.assertRaisesRegex(RuntimeError, "write_step_result phase gate"):
+                write_step_result(
+                    repo_root=repo_root,
+                    orchestration_id="orch_001",
+                    node_key="problem/shallow_water2d@0.3.0",
+                    step="build",
+                    agent_run_id="step_run_build_001",
+                    payload={
+                        "status": "fail",
+                        "required_outputs": [],
                         "failed_substeps": [],
                         "substep_agent_run_ids": [],
                     },
@@ -2410,23 +2460,27 @@ shell_tool                       stable             true
         )
 
     def _minimal_request_payload(self, **overrides: object) -> dict[str, object]:
-        """repair_strategy / issue_severity テスト用の最小 request_payload を返す。
-        node_key / step を含まないことで plan_ref の canonical format 検証をスキップする。
-        """
+        """repair_strategy / issue_severity テスト用の最小 request_payload を返す。"""
         base: dict[str, object] = {
             "orchestration_id": "orch_001",
             "agent_run_id": "step_run_repair_001",
             "parent_agent_run_id": "orch_run_001",
-            "plan_ref": "workspace/plans/problem__shallow_water2d__0.3.0/swec-plan_20260413_001",
-            "pipeline_ref": "workspace/pipelines/problem__shallow_water2d__0.3.0/swec-pl_20260413_001",
-            "dependency_ref": "workspace/plans/problem__shallow_water2d__0.3.0/swec-plan_20260413_001/dependency.resolved.yaml",
+            "node_key": "problem/shallow_water2d@0.3.0",
+            "step": "build",
+            "plan_ref": _FIX_PLAN_REF,
+            "pipeline_ref": _FIX_PIPE_REF,
+            "dependency_ref": _FIX_DEP_REF,
+            "skill_name": "workflow-build",
+            "skill_ref": "skills/workflow-build/SKILL.md",
+            "skill_must_read_refs": _fixture_skill_must_read_refs_step("build"),
             "issue_severity": "none",
             "repair_strategy": "none",
             "repair_target_agent_run_id": "none",
             "repair_reason": "none",
-            "launch_prompt_full": "orchestration summary for repair validation test\nstatus: running\n",
         }
         base.update(overrides)
+        if "launch_prompt_full" not in base:
+            base["launch_prompt_full"] = render_launch_prompt_text(base)
         return base
 
     def test_record_launch_rejects_invalid_repair_strategy(self) -> None:
@@ -2528,6 +2582,26 @@ class CheckpointResumeRuntimeTests(unittest.TestCase):
                 "status": "running",
                 "agent_backend": "claude",
             },
+        )
+        phase_state_path = repo_root / "workspace/orchestrations/orch_001/phase_state.json"
+        phase_state = json.loads(phase_state_path.read_text(encoding="utf-8"))
+        phase_state["node_states"]["problem__shallow_water2d__0.3.0"] = {
+            "plan": "child_finished",
+            "generate": "child_finished",
+            "build": "child_finished",
+            "execute": "child_finished",
+            "judge": "child_finished",
+        }
+        phase_state["node_states"]["component__solver__0.1.0"] = {
+            "plan": "child_finished",
+            "generate": "child_finished",
+            "build": "child_finished",
+            "execute": "child_finished",
+            "judge": "child_finished",
+        }
+        phase_state_path.write_text(
+            json.dumps(phase_state, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
         )
 
     def test_compute_sha256_returns_consistent_hash(self) -> None:
@@ -3304,6 +3378,11 @@ def _launchable_preflight_dict(**extra: object) -> dict[str, object]:
         "probe_command": "codex",
         "can_launch_step_agents": True,
         "can_launch_substep_agents": True,
+        "session_policy": {
+            "allow_step_agent_launch": True,
+            "allow_substep_agent_launch": True,
+        },
+        "session_policy_launchable": True,
         "feature_states": {"multi_agent": True},
         "checks": [{"name": "multi_agent_enabled", "pass": True}],
     }
@@ -3635,6 +3714,18 @@ class PreflightLiveProbeTtlTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp)
             init_orchestration(repo_root=repo, orchestration_id="orch_001")
+            meta_path = repo / "workspace/orchestrations/orch_001/orchestration_meta.json"
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            meta["dependency_readiness"] = {
+                "direct_dependency_plan_readiness": True,
+                "direct_dependency_execution_readiness": True,
+                "detail": {
+                    "plan_ref_verified": True,
+                    "pipeline_ref_verified": True,
+                    "aggregate_verdict_verified": True,
+                },
+            }
+            meta_path.write_text(json.dumps(meta, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
             path = repo / "workspace/orchestrations/orch_001/preflight.json"
             path.write_text(
                 json.dumps(_launchable_preflight_dict(checked_at="2026-04-15T10:00:00Z"), indent=2)
@@ -3714,6 +3805,18 @@ class PreflightLiveProbeTtlTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp)
             init_orchestration(repo_root=repo, orchestration_id="orch_001")
+            meta_path = repo / "workspace/orchestrations/orch_001/orchestration_meta.json"
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            meta["dependency_readiness"] = {
+                "direct_dependency_plan_readiness": True,
+                "direct_dependency_execution_readiness": True,
+                "detail": {
+                    "plan_ref_verified": True,
+                    "pipeline_ref_verified": True,
+                    "aggregate_verdict_verified": True,
+                },
+            }
+            meta_path.write_text(json.dumps(meta, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
             path = repo / "workspace/orchestrations/orch_001/preflight.json"
             path.write_text(
                 json.dumps(_launchable_preflight_dict(checked_at="2026-04-15T10:00:00Z"), indent=2)
@@ -4213,6 +4316,271 @@ class TestPhase1RuleSourceAudit(unittest.TestCase):
 
 
 class TestPhase2PlanGuardsIntegration(unittest.TestCase):
+    def test_required_child_agent_kind_plan_and_build(self) -> None:
+        self.assertEqual(_required_child_agent_kind("plan"), "substep")
+        self.assertEqual(_required_child_agent_kind("build"), "step")
+
+    def test_workflow_launch_check_fail_closed_by_session_policy(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            init_orchestration(repo_root=repo_root, orchestration_id="wf1")
+            dep_path = repo_root / _FIX_DEP_REF
+            dep_path.parent.mkdir(parents=True, exist_ok=True)
+            dep_path.write_text("ok\n", encoding="utf-8")
+            meta_path = repo_root / "workspace/orchestrations/wf1/orchestration_meta.json"
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            meta["dependency_ref"] = _FIX_DEP_REF
+            meta_path.write_text(json.dumps(meta, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+            write_preflight(
+                repo_root=repo_root,
+                orchestration_id="wf1",
+                payload={
+                    "status": "pass",
+                    "backend": "codex",
+                    "can_launch_step_agents": True,
+                    "can_launch_substep_agents": True,
+                    "session_policy": {"allow_substep_agent_launch": False},
+                    "feature_states": {"multi_agent": True},
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}],
+                },
+            )
+            out = workflow_launch_check(
+                repo_root,
+                orchestration_id="wf1",
+                node_key="problem/shallow_water2d@0.3.0",
+                step="plan",
+                backend="codex",
+                require_child_agent="substep",
+            )
+            self.assertEqual(out.get("status"), "fail_closed")
+            self.assertEqual(out.get("reason_code"), "child_agent_forbidden_by_session_policy")
+            self.assertEqual(out.get("next_action"), "stop_before_phase_body")
+
+    def test_workflow_launch_check_fail_closed_when_session_policy_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            init_orchestration(repo_root=repo_root, orchestration_id="wf2")
+            dep_path = repo_root / _FIX_DEP_REF
+            dep_path.parent.mkdir(parents=True, exist_ok=True)
+            dep_path.write_text("ok\n", encoding="utf-8")
+            meta_path = repo_root / "workspace/orchestrations/wf2/orchestration_meta.json"
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            meta["dependency_ref"] = _FIX_DEP_REF
+            meta["dependency_readiness"] = {
+                "direct_dependency_plan_readiness": True,
+                "direct_dependency_execution_readiness": True,
+                "detail": {
+                    "plan_ref_verified": True,
+                    "pipeline_ref_verified": True,
+                    "aggregate_verdict_verified": True,
+                },
+            }
+            meta_path.write_text(json.dumps(meta, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+            # Simulate a legacy/manual preflight payload that has no session policy fields.
+            preflight_path = repo_root / "workspace/orchestrations/wf2/preflight.json"
+            preflight_path.parent.mkdir(parents=True, exist_ok=True)
+            preflight_path.write_text(
+                json.dumps(
+                    {
+                        "status": "pass",
+                        "backend": "codex",
+                        "can_launch_step_agents": True,
+                        "can_launch_substep_agents": True,
+                        "feature_states": {"multi_agent": True},
+                        "checks": [{"name": "multi_agent_enabled", "pass": True}],
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            out = workflow_launch_check(
+                repo_root,
+                orchestration_id="wf2",
+                node_key="problem/shallow_water2d@0.3.0",
+                step="plan",
+                backend="codex",
+                require_child_agent="substep",
+            )
+            self.assertEqual(out.get("status"), "fail_closed")
+            self.assertEqual(out.get("reason_code"), "child_agent_forbidden_by_session_policy")
+            self.assertEqual(out.get("blocking_policy_scope"), "session_policy_missing")
+
+    def test_record_launch_rejects_missing_step_or_node_key(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            init_orchestration(repo_root=repo_root, orchestration_id="wf5")
+            write_preflight(
+                repo_root=repo_root,
+                orchestration_id="wf5",
+                payload={
+                    "status": "pass",
+                    "backend": "codex",
+                    "can_launch_step_agents": True,
+                    "can_launch_substep_agents": True,
+                    "session_policy": {
+                        "allow_step_agent_launch": True,
+                        "allow_substep_agent_launch": True,
+                    },
+                    "feature_states": {"multi_agent": True},
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}],
+                },
+            )
+            base = {
+                "agent_run_id": "child_missing_fields",
+                "agent_role": "substep",
+                "orchestration_id": "wf5",
+                "parent_agent_run_id": "orch_wf5",
+                "plan_ref": _FIX_PLAN_REF,
+                "pipeline_ref": _FIX_PIPE_REF,
+                "dependency_ref": _FIX_DEP_REF,
+                "skill_name": "workflow-plan-generate",
+                "skill_ref": "skills/workflow-plan-generate/SKILL.md",
+                "skill_must_read_refs": _fixture_skill_must_read_refs_substep("plan", "generate"),
+                "issue_severity": "none",
+                "repair_strategy": "none",
+                "repair_target_agent_run_id": "none",
+                "repair_reason": "none",
+            }
+            for missing_key in ("step", "node_key"):
+                req = dict(base)
+                req["step"] = "plan"
+                req["substep"] = "generate"
+                req["node_key"] = "problem/shallow_water2d@0.3.0"
+                del req[missing_key]
+                req["launch_prompt_full"] = render_launch_prompt_text(req)
+                with self.subTest(missing_key=missing_key):
+                    with self.assertRaisesRegex(ValueError, f"non-empty {missing_key}"):
+                        record_launch(
+                            repo_root=repo_root,
+                            orchestration_id="wf5",
+                            parent_agent_run_id="orch_wf5",
+                            child_agent_run_id=f"child_missing_{missing_key}",
+                            request_payload=req,
+                            response_payload={
+                                "agent_run_id": f"child_missing_{missing_key}",
+                                **_spawn_response_payload(f"sess_child_missing_{missing_key}"),
+                            },
+                        )
+
+    def test_workflow_launch_check_fail_closed_without_readiness_snapshot(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            init_orchestration(repo_root=repo_root, orchestration_id="wf3")
+
+            def runner(args, **kwargs):  # type: ignore[no-untyped-def]
+                if args[1:] == ["--version"]:
+                    return _FakeCompletedProcess(0, stdout="codex-cli 0.114.0\n")
+                if args[1:] == ["features", "list"]:
+                    return _FakeCompletedProcess(0, stdout="multi_agent experimental true\n")
+                raise AssertionError(args)
+
+            preflight_payload = probe_execution_platform(backend="codex", runner=runner)
+            preflight_path = repo_root / "workspace/orchestrations/wf3/preflight.json"
+            preflight_path.parent.mkdir(parents=True, exist_ok=True)
+            preflight_path.write_text(
+                json.dumps(preflight_payload, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
+            phase_state_path = repo_root / "workspace/orchestrations/wf3/phase_state.json"
+            phase_state = json.loads(phase_state_path.read_text(encoding="utf-8"))
+            phase_state["current_state"] = "preflight_passed"
+            phase_state_path.write_text(
+                json.dumps(phase_state, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
+            out = workflow_launch_check(
+                repo_root,
+                orchestration_id="wf3",
+                node_key="problem/shallow_water2d@0.3.0",
+                step="plan",
+                backend="codex",
+                require_child_agent="substep",
+            )
+            self.assertEqual(out.get("status"), "fail_closed")
+            self.assertEqual(out.get("reason_code"), "dependency_not_ready")
+            self.assertEqual(out.get("reason_detail"), "dependency_readiness_missing")
+            self.assertEqual(out.get("next_action"), "stop_before_phase_body")
+
+    def test_record_launch_enforces_workflow_launch_check_fail_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            init_orchestration(repo_root=repo_root, orchestration_id="wf4")
+            write_preflight(
+                repo_root=repo_root,
+                orchestration_id="wf4",
+                payload={
+                    "status": "pass",
+                    "backend": "codex",
+                    "can_launch_step_agents": True,
+                    "can_launch_substep_agents": True,
+                    "session_policy": {"allow_substep_agent_launch": False},
+                    "feature_states": {"multi_agent": True},
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}],
+                },
+            )
+            req = {
+                "agent_run_id": "plan_sub_fail_closed",
+                "agent_role": "substep",
+                "node_key": "problem/shallow_water2d@0.3.0",
+                "step": "plan",
+                "substep": "generate",
+                "orchestration_id": "wf4",
+                "parent_agent_run_id": "orch_wf4",
+                "plan_ref": _FIX_PLAN_REF,
+                "pipeline_ref": _FIX_PIPE_REF,
+                "dependency_ref": _FIX_DEP_REF,
+                "skill_name": "workflow-plan-generate",
+                "skill_ref": "skills/workflow-plan-generate/SKILL.md",
+                "skill_must_read_refs": _fixture_skill_must_read_refs_substep("plan", "generate"),
+                "issue_severity": "none",
+                "repair_strategy": "none",
+                "repair_target_agent_run_id": "none",
+                "repair_reason": "none",
+                "launch_prompt_full": render_launch_prompt_text(
+                    {
+                        "agent_run_id": "plan_sub_fail_closed",
+                        "node_key": "problem/shallow_water2d@0.3.0",
+                        "step": "plan",
+                        "substep": "generate",
+                        "orchestration_id": "wf4",
+                        "parent_agent_run_id": "orch_wf4",
+                        "plan_ref": _FIX_PLAN_REF,
+                        "pipeline_ref": _FIX_PIPE_REF,
+                        "dependency_ref": _FIX_DEP_REF,
+                        "skill_name": "workflow-plan-generate",
+                        "skill_ref": "skills/workflow-plan-generate/SKILL.md",
+                        "skill_must_read_refs": _fixture_skill_must_read_refs_substep(
+                            "plan", "generate"
+                        ),
+                        "issue_severity": "none",
+                        "repair_strategy": "none",
+                        "repair_target_agent_run_id": "none",
+                        "repair_reason": "none",
+                    }
+                ),
+            }
+            with self.assertRaisesRegex(RuntimeError, "workflow-launch-check"):
+                record_launch(
+                    repo_root=repo_root,
+                    orchestration_id="wf4",
+                    parent_agent_run_id="orch_wf4",
+                    child_agent_run_id="plan_sub_fail_closed",
+                    request_payload=req,
+                    response_payload={
+                        "agent_run_id": "plan_sub_fail_closed",
+                        **_spawn_response_payload("sess_plan_sub_fail_closed"),
+                    },
+                )
+            meta = json.loads(
+                (repo_root / "workspace/orchestrations/wf4/orchestration_meta.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(meta.get("status"), "fail_closed")
+            self.assertEqual(meta.get("reason_code"), "child_agent_forbidden_by_session_policy")
+
     def test_validate_mcp_rejects_when_launch_response_missing(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
@@ -4354,6 +4722,8 @@ class TestPhase2PlanGuardsIntegration(unittest.TestCase):
                     agent_run_id="orch_actor",
                     capability_token=None,
                 )
+            vio = repo_root / "workspace/orchestrations/g4/violations/orch_actor.noncanonical_phase_write_attempt.json"
+            self.assertTrue(vio.exists())
 
     def test_apply_patch_gate_orchestration_allows_orchestration_paths(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -4446,6 +4816,102 @@ class TestPhase2PlanGuardsIntegration(unittest.TestCase):
                     agent_run_id="plan_sub_1",
                     capability_token=str(cap["capability_token"]),
                 )
+
+    def test_apply_patch_gate_rejects_plan_write_before_child_running(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            init_orchestration(repo_root=repo_root, orchestration_id="g7")
+            phase_state_path = repo_root / "workspace/orchestrations/g7/phase_state.json"
+            phase_state = json.loads(phase_state_path.read_text(encoding="utf-8"))
+            node_safe = "problem__shallow_water2d__0.3.0"
+            phase_state["current_state"] = "preflight_passed"
+            phase_state["node_states"][node_safe] = {
+                "plan": "launch_recorded",
+                "generate": "not_started",
+                "build": "not_started",
+                "execute": "not_started",
+                "judge": "not_started",
+            }
+            phase_state_path.write_text(json.dumps(phase_state, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+            cap_path = repo_root / "workspace/orchestrations/g7/capabilities/prelaunch_sub.json"
+            cap_path.parent.mkdir(parents=True, exist_ok=True)
+            cap_path.write_text(
+                json.dumps(
+                    {
+                        "agent_run_id": "prelaunch_sub",
+                        "capability_token": "tok_prelaunch",
+                        "orchestration_id": "g7",
+                        "agent_role": "substep",
+                        "node_key": "problem/shallow_water2d@0.3.0",
+                        "step": "plan",
+                        "write_roots": [_FIX_PLAN_REF + "/"],
+                        "mcp_permissions": [],
+                        "expires_at": "2099-01-01T00:00:00Z",
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            with self.assertRaises(RuntimeError):
+                gate_apply_patch_writes(
+                    repo_root,
+                    orchestration_id="g7",
+                    actor_role="substep",
+                    changed_paths=[f"{_FIX_PLAN_REF}/case.resolved.yaml"],
+                    agent_run_id="prelaunch_sub",
+                    capability_token="tok_prelaunch",
+                )
+            vio = (
+                repo_root
+                / "workspace/orchestrations/g7/violations/prelaunch_sub.noncanonical_phase_write_attempt.json"
+            )
+            self.assertTrue(vio.exists())
+
+    def test_reserve_phase_root_allows_reservation_but_not_phase_root_write(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            init_orchestration(repo_root=repo_root, orchestration_id="g8")
+            reserved = reserve_phase_root(
+                repo_root,
+                orchestration_id="g8",
+                node_key="problem/shallow_water2d@0.3.0",
+                step="plan",
+                reserved_id="sw_flux_rusanov_p0_20260415_001",
+                reserved_by_agent_run_id="orch_run_001",
+            )
+            self.assertEqual(reserved.get("status"), "reserved")
+            reservation_path = (
+                repo_root
+                / "workspace/orchestrations/g8/reservations/problem__shallow_water2d__0.3.0/plan.json"
+            )
+            self.assertTrue(reservation_path.exists())
+            with self.assertRaises(RuntimeError):
+                gate_apply_patch_writes(
+                    repo_root,
+                    orchestration_id="g8",
+                    actor_role="orchestration",
+                    changed_paths=[f"{_FIX_PLAN_REF}/case.resolved.yaml"],
+                    agent_run_id="orch_run_001",
+                    capability_token=None,
+                )
+
+    def test_set_status_fail_closed_persists_reason_code(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            init_orchestration(repo_root=repo_root, orchestration_id="g9")
+            meta = update_orchestration_status(
+                repo_root=repo_root,
+                orchestration_id="g9",
+                status="fail_closed",
+                reason_code="child_agent_forbidden_by_session_policy",
+                reason_detail="session policy denied substep launch",
+                blocking_policy_scope="session_policy.allow_substep_agent_launch",
+            )
+            self.assertEqual(meta.get("status"), "fail_closed")
+            self.assertEqual(meta.get("reason_code"), "child_agent_forbidden_by_session_policy")
+            self.assertEqual(meta.get("blocking_policy_scope"), "session_policy.allow_substep_agent_launch")
 
 
 class TestPhase3RunGate(unittest.TestCase):

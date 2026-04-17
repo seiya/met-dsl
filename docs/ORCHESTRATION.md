@@ -21,8 +21,11 @@
 - `workflow` 開始前に、`step agent` と `substep agent` を独立起動できる execution platform の preflight を必須実行しなければならない。preflight は `multi_agent` 機能と子 `agent` 起動可否を検証対象に含め、`pass` でない場合は `workflow` を開始してはならない。
 - `preflight.json` の手動編集または後編集による `pass` 化を禁止する。preflight 結果は実行時検査の一次証跡としてのみ記録しなければならない。
 - 子 `agent` 起動直前に、execution platform の live probe で `multi_agent` と子 `agent` 起動可否を再検査しなければならない。live probe は `record-launch` 実行時に適用し、`fail` の場合は `record-launch` と子 `agent` 起動を禁止し、当該 `workflow` を `fail` へ遷移させなければならない。
+- 各 phase の着手前に `workflow-launch-check` を実行し、required child `agent` 種別判定、execution platform 可否、session policy 可否、dependency readiness を同時に検査しなければならない。dependency readiness は `orchestration_meta.json.dependency_readiness` を canonical source とし、`direct_dependency_plan_readiness` と `direct_dependency_execution_readiness` と `detail`（`plan_ref_verified` と `pipeline_ref_verified` と `aggregate_verdict_verified`）を検査する。`dependency_readiness` 未記録または未充足のいずれも `fail_closed` とし、phase 本体へ進めてはならない。
 - 各 phase の着手前に、対象 phase が `step agent` 必須か `substep agent` 必須かを phase 種別で明示判定しなければならない。`Plan` / `Generate` / `Tune` は `substep agent` 必須、`Build` / `Execute` / `Judge` / `Promote` は `step agent` 必須とする。
 - phase 着手前判定で子 `agent` 必須と確定した場合、親 `agent` は `spawn_agent` 完了前に phase artifact 生成、`MCP` 実行、検証目的の仮実装、依存 code の一時内包を開始してはならない。
+- `workspace/plans/` と `workspace/pipelines/` の phase artifact root は、`record-launch` と capability token と `phase_state=child_running` の 3 条件を満たした child `agent` だけが実体化できる。`orchestration agent` による直接生成を禁止する。
+- child `agent` 起動前に root path 予約が必要な場合は、`workspace/orchestrations/<orchestration_id>/reservations/<node_key_safe>/<step>.json` の reservation artifact のみを生成し、`workspace/plans/` と `workspace/pipelines/` の実ディレクトリを作成してはならない。
 - `orchestration agent` は `workflow` 全体の進行制御のみを担当し、phase 本体の artifact（例: `case.resolved.yaml`、`diagnostics.json`）を直接生成してはならない。
 - `workflow` 実行の代替として、複数 phase の進行と artifact generation を一括自動化する `script`（例: `python` / `bash`）を新規生成または実行してはならない。
 - `orchestration` の責務を `script` へ委譲してはならない。`Build` / `Execute` / `Judge` / `Promote` の各 `step` は必ず `spawn_agent` で起動した独立 `step agent` で実行しなければならない。
@@ -32,6 +35,7 @@
 - `orchestration agent` は `deps.yaml` と `spec_catalog.yaml` から再構成した依存関係と依存充足条件に基づいて `step agent` または `substep agent` の起動可否を判定しなければならない。
 - すべての `agent` 実行は `agent_run_id` を持ち、入力参照・出力参照・親子関係を記録しなければならない。
 - `agent_runs.jsonl` の各行は `started_at` と `status` を必須記録とし、`status` が終端状態（`pass` / `fail` / `blocked` / `timeout` / `cancel`）の場合は `finished_at` を必須記録とする。
+- `fail_closed` は `orchestration_meta.status` の終端状態としてのみ使用する。`agent_runs.jsonl.status` の終端語彙へ追加してはならない。
 - `step` / `substep` ロールの `agent_runs.jsonl` は `parent_agent_run_id` と `agent_backend` と `agent_model` と `context_id` と `context_isolated` と `agent_session_id` と `launch_request_ref` と `launch_response_ref` と `launch_prompt_ref` と `launch_reply_ref` と `agent_result_ref` と `agent_summary_ref` を必須記録とする。
 - `substep agent` の `parent_agent_run_id` は、当該 `substep` を起動した `orchestration agent_run_id` を指すことを許可する。
 - `spawn_agent` の応答で得た子 `agent` 識別子は `agent_session_id` として記録しなければならない。
