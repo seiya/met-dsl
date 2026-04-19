@@ -24,6 +24,8 @@ from tools.codex_orchestration_runtime import (
     _live_preflight_mode,
     _live_preflight_ttl_seconds,
     _require_preflight_launchable,
+    _write_run_write_baseline,
+    _write_roots_for_launch,
     _update_preflight_probed_at,
     _validate_agent_summary_text,
     build_launch_prompt_text,
@@ -101,9 +103,9 @@ def _step_launch_prompt(node_key: str, step: str, agent_run_id: str) -> str:
 orchestration_id: orch_001
 agent_run_id: {agent_run_id}
 parent_agent_run_id: orch_run_001
-plan_ref: workspace/plans/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001
-pipeline_ref: workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001
-dependency_ref: workspace/plans/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/dependency.resolved.yaml
+plan_ref: {_FIX_PLAN_REF}
+pipeline_ref: {_FIX_PIPE_REF}
+dependency_ref: {_FIX_DEP_REF}
 skill_name: workflow-{step}
 skill_ref: skills/workflow-{step}/SKILL.md
 skill_must_read_refs: {_fixture_skill_must_read_refs_step(step)}
@@ -113,8 +115,20 @@ repair_target_agent_run_id: none
 repair_reason: none
 
 必須要件:
-- 契約された step を完了すること。
-"""
+- あなたは phase artifacts を直接生成する担当である。
+- この step は標準 substep を持たない phase である。自身で step 契約を完了させること。
+- 起動直後に `skill_ref` を読み、`skill_must_read_refs` と矛盾しない契約で実行すること。
+- 要求定義と判定規則は `docs/` と `spec/` と `skill_must_read_refs` に含まれる当該試行 artifact だけから解釈すること。`tools/` 配下の実装、検証 `script`、test code、validator code から rule を抽出してはならない。
+- `orchestration-read` は `python3 tools/codex_orchestration_runtime.py run-gate --gate orchestration_read --agent-run-id <agent_run_id> --capability-token <capability_token> --args-json '{{"read_path":"..."}}'` を唯一の経路として実行し、`orchestration-read` 直呼びを禁止する。
+- `apply_patch` は `python3 tools/codex_orchestration_runtime.py guarded-apply-patch --repo-root <repo_root> --orchestration-id <orchestration_id> --actor-role step --agent-run-id <agent_run_id> --paths-json '["..."]' --patch-text '<patch_text>' --capability-token <capability_token>` を唯一の経路として実行し、拒否時は編集を停止すること。
+- 書き込みは `apply_patch_writes` gate を通過した `guarded-apply-patch` 経由に限定し、shell redirection・直接 `write_text`・任意コマンドによる file write を禁止する。
+- `skill_name` と `skill_ref` が未指定の場合は fail で停止すること。
+- 入力不足時は推測補完せず fail で停止すること。
+- `Plan` の場合、直下依存 `node` の `direct dependency plan readiness` を満たさない限り開始してはならない。
+- `Generate` / `Build` / `Execute` / `Judge` の場合、直下依存 `node` の `direct dependency execution readiness` を満たさない限り開始してはならない。
+- 直下依存 `node` が未完了でも、依存先 code を自身の `src/` へ内包して代替してはならない。
+- 完了後は required_outputs と failed_substeps と substep_agent_run_ids を親へ返すこと。
+- 完了返答には `launch_reply` として、実施内容と判定結果を平文で含めること。"""
 
 
 def _substep_launch_prompt(node_key: str, step: str, substep: str, agent_run_id: str) -> str:
@@ -125,9 +139,9 @@ def _substep_launch_prompt(node_key: str, step: str, substep: str, agent_run_id:
 orchestration_id: orch_001
 agent_run_id: {agent_run_id}
 parent_agent_run_id: orch_run_001
-plan_ref: workspace/plans/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001
-pipeline_ref: workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001
-dependency_ref: workspace/plans/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/dependency.resolved.yaml
+plan_ref: {_FIX_PLAN_REF}
+pipeline_ref: {_FIX_PIPE_REF}
+dependency_ref: {_FIX_DEP_REF}
 skill_name: workflow-{step}-{substep}
 skill_ref: skills/workflow-{step}-{substep}/SKILL.md
 skill_must_read_refs: {_fixture_skill_must_read_refs_substep(step, substep)}
@@ -137,8 +151,23 @@ repair_target_agent_run_id: none
 repair_reason: none
 
 必須要件:
-- 契約された substep を完了すること。
-"""
+- 契約された入力だけを読むこと。
+- 契約された artifacts だけを書くこと。
+- expected output と保存先を守ること。
+- 起動直後に `skill_ref` を読み、`skill_must_read_refs` と矛盾しない契約で実行すること。
+- 要求定義と判定規則は `docs/` と `spec/` と `skill_must_read_refs` に含まれる当該試行 artifact だけから解釈すること。`tools/` 配下の実装、検証 `script`、test code、validator code から rule を抽出してはならない。
+- `orchestration-read` は `python3 tools/codex_orchestration_runtime.py run-gate --gate orchestration_read --agent-run-id <agent_run_id> --capability-token <capability_token> --args-json '{{"read_path":"..."}}'` を唯一の経路として実行し、`orchestration-read` 直呼びを禁止する。
+- `apply_patch` は `python3 tools/codex_orchestration_runtime.py guarded-apply-patch --repo-root <repo_root> --orchestration-id <orchestration_id> --actor-role substep --agent-run-id <agent_run_id> --paths-json '["..."]' --patch-text '<patch_text>' --capability-token <capability_token>` を唯一の経路として実行し、拒否時は編集を停止すること。
+- 書き込みは `apply_patch_writes` gate を通過した `guarded-apply-patch` 経由に限定し、shell redirection・直接 `write_text`・任意コマンドによる file write を禁止する。
+- `skill_name` と `skill_ref` が未指定の場合は fail で停止すること。
+- 入力不足時は推測補完せず fail で停止すること。
+- `Plan` の substep は、直下依存 `node` の `direct dependency plan readiness` を満たさない限り開始してはならない。
+- `Generate` / `Build` / `Execute` / `Judge` の substep は、直下依存 `node` の `direct dependency execution readiness` を満たさない限り開始してはならない。
+- 直下依存 `node` が未完了でも、依存先 code を対象 `node` の `src/` へ内包して代替してはならない。
+- `repair_strategy=reuse` の場合は、`repair_target_agent_run_id` の出力との差分修正に限定すること。
+- `repair_strategy=restart` の場合は、過去出力を流用せず契約入力から再生成すること。
+- 完了時は artifact 参照と status を `orchestration agent` へ返すこと。
+- 完了返答には `launch_reply` として、実施内容と判定結果を平文で含めること。"""
 
 
 def _spawn_response_payload(session_id: str) -> dict[str, object]:
@@ -723,7 +752,7 @@ shell_tool                       stable             true
             )
             plan_meta_path.parent.mkdir(parents=True, exist_ok=True)
             plan_meta_path.write_text(
-                json.dumps({"attempt_count": 1, "verification_status": "pass", "context_isolated": True}),
+                json.dumps(self._valid_plan_meta()),
                 encoding="utf-8",
             )
             write_step_result(
@@ -966,7 +995,7 @@ shell_tool                       stable             true
                 / "launches"
                 / "substep_run_plan_generate_001.prompt.txt"
             )
-            self.assertEqual(prompt_path.read_text(encoding="utf-8"), full_prompt)
+            self.assertEqual(prompt_path.read_text(encoding="utf-8"), f"{full_prompt}\n")
 
     def test_record_launch_prefers_launch_prompt_full_over_prompt(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1095,7 +1124,8 @@ shell_tool                       stable             true
                     "plan",
                     "generate",
                     "substep_run_plan_generate_001",
-                ),
+                )
+                + "\n",
             )
 
     def test_rejects_non_template_launch_prompt_for_step_or_substep(self) -> None:
@@ -1406,7 +1436,9 @@ shell_tool                       stable             true
                 "skill_name: workflow-plan-verify",
                 "skill_name: workflow-plan-generate",
             ) + "\n\n必須要件:\n- 契約された substep を完了すること。\n"
-            with self.assertRaisesRegex(ValueError, "template field values"):
+            with self.assertRaisesRegex(
+                ValueError, "must preserve workflow-orchestration template field values"
+            ):
                 record_launch(
                     repo_root=repo_root,
                     orchestration_id="orch_001",
@@ -1414,6 +1446,53 @@ shell_tool                       stable             true
                     child_agent_run_id="substep_run_plan_verify_001",
                     request_payload={**prepared, "launch_prompt_full": prompt},
                     response_payload=_spawn_response_payload("sess_substep_run_plan_verify_001"),
+                )
+
+    def test_rejects_launch_prompt_when_shell_write_constraint_line_is_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            init_orchestration(repo_root=repo_root, orchestration_id="orch_001")
+            write_preflight(
+                repo_root=repo_root,
+                orchestration_id="orch_001",
+                payload={
+                    "status": "pass",
+                    "can_launch_step_agents": True,
+                    "can_launch_substep_agents": True,
+                    "feature_states": {"multi_agent": True},
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}],
+                },
+            )
+            prepared = prepare_launch_request_payload(
+                {
+                    "node_key": "problem/shallow_water2d@0.3.0",
+                    "step": "build",
+                    "orchestration_id": "orch_001",
+                    "agent_run_id": "step_run_build_001",
+                    "parent_agent_run_id": "orch_run_001",
+                    "plan_ref": _FIX_PLAN_REF,
+                    "pipeline_ref": _FIX_PIPE_REF,
+                    "dependency_ref": _FIX_DEP_REF,
+                    "skill_name": "workflow-build",
+                    "skill_ref": "skills/workflow-build/SKILL.md",
+                    "issue_severity": "none",
+                    "repair_strategy": "none",
+                    "repair_target_agent_run_id": "none",
+                    "repair_reason": "none",
+                }
+            )
+            prompt = render_launch_prompt_text(prepared).replace(
+                "- 書き込みは `apply_patch_writes` gate を通過した `guarded-apply-patch` 経由に限定し、shell redirection・直接 `write_text`・任意コマンドによる file write を禁止する。\n",
+                "",
+            )
+            with self.assertRaisesRegex(ValueError, "shell-write constraints"):
+                record_launch(
+                    repo_root=repo_root,
+                    orchestration_id="orch_001",
+                    parent_agent_run_id="orch_run_001",
+                    child_agent_run_id="step_run_build_001",
+                    request_payload={**prepared, "launch_prompt_full": prompt},
+                    response_payload=_spawn_response_payload("sess_step_build_001"),
                 )
 
     def test_rejects_pass_step_result_when_required_outputs_are_missing_from_substeps(self) -> None:
@@ -1505,10 +1584,10 @@ shell_tool                       stable             true
             )
             plan_meta_path2.parent.mkdir(parents=True, exist_ok=True)
             plan_meta_path2.write_text(
-                json.dumps({"attempt_count": 1, "verification_status": "pass", "context_isolated": True}),
+                json.dumps(self._valid_plan_meta()),
                 encoding="utf-8",
             )
-            with self.assertRaisesRegex(ValueError, "required_outputs must be satisfied"):
+            with self.assertRaisesRegex(ValueError, "effective substep output_refs"):
                 write_step_result(
                     repo_root=repo_root,
                     orchestration_id="orch_001",
@@ -1561,6 +1640,986 @@ shell_tool                       stable             true
                 summary_text,
             )
 
+    def test_record_agent_run_rejects_orchestration_pass_output_refs_without_gate_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            init_orchestration(repo_root=repo_root, orchestration_id="orch_001")
+            write_preflight(
+                repo_root=repo_root,
+                orchestration_id="orch_001",
+                payload={
+                    "status": "pass",
+                    "can_launch_step_agents": True,
+                    "can_launch_substep_agents": True,
+                    "feature_states": {"multi_agent": True},
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}],
+                },
+            )
+            with self.assertRaisesRegex(
+                ValueError, "pass status for orchestration requires apply_patch_writes gate evidence"
+            ):
+                record_agent_run(
+                    repo_root=repo_root,
+                    orchestration_id="orch_001",
+                    payload={
+                        "agent_run_id": "orch_run_001",
+                        "agent_role": "orchestration",
+                        "status": "pass",
+                        "agent_backend": "claude",
+                        "output_refs": [
+                            "workspace/plans/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/plan_meta.json"
+                        ],
+                    },
+                )
+
+    def test_record_agent_run_accepts_orchestration_pass_output_refs_with_gate_coverage(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            init_orchestration(repo_root=repo_root, orchestration_id="orch_001")
+            write_preflight(
+                repo_root=repo_root,
+                orchestration_id="orch_001",
+                payload={
+                    "status": "pass",
+                    "can_launch_step_agents": True,
+                    "can_launch_substep_agents": True,
+                    "feature_states": {"multi_agent": True},
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}],
+                },
+            )
+            out_ref = "workspace/orchestrations/orch_001/logs/orchestrator.note.txt"
+            out_path = repo_root / out_ref
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            out_path.write_text("note\n", encoding="utf-8")
+            _write_apply_patch_gate_evidence(
+                repo_root,
+                orchestration_id="orch_001",
+                agent_run_id="orch_run_001",
+                actor_role="orchestration",
+                changed_paths=[out_ref],
+            )
+            payload = record_agent_run(
+                repo_root=repo_root,
+                orchestration_id="orch_001",
+                payload={
+                    "agent_run_id": "orch_run_001",
+                    "agent_role": "orchestration",
+                    "status": "pass",
+                    "agent_backend": "claude",
+                    "output_refs": [out_ref],
+                },
+            )
+            self.assertEqual(payload["output_refs"], [out_ref])
+
+    def test_record_agent_run_accepts_orchestration_pass_without_output_refs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            init_orchestration(repo_root=repo_root, orchestration_id="orch_001")
+            write_preflight(
+                repo_root=repo_root,
+                orchestration_id="orch_001",
+                payload={
+                    "status": "pass",
+                    "can_launch_step_agents": True,
+                    "can_launch_substep_agents": True,
+                    "feature_states": {"multi_agent": True},
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}],
+                },
+            )
+            payload = record_agent_run(
+                repo_root=repo_root,
+                orchestration_id="orch_001",
+                payload={
+                    "agent_run_id": "orch_run_001",
+                    "agent_role": "orchestration",
+                    "status": "pass",
+                    "agent_backend": "claude",
+                    "result_summary": "orchestration completed without direct artifact edits",
+                },
+            )
+            self.assertEqual(payload["status"], "pass")
+            self.assertNotIn("output_refs", payload)
+
+    def test_record_agent_run_rejects_orchestration_pass_when_gate_paths_do_not_cover_output_refs(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            init_orchestration(repo_root=repo_root, orchestration_id="orch_001")
+            write_preflight(
+                repo_root=repo_root,
+                orchestration_id="orch_001",
+                payload={
+                    "status": "pass",
+                    "can_launch_step_agents": True,
+                    "can_launch_substep_agents": True,
+                    "feature_states": {"multi_agent": True},
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}],
+                },
+            )
+            out_ref = "workspace/orchestrations/orch_001/logs/orchestrator.note.txt"
+            out_path = repo_root / out_ref
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            out_path.write_text("note\n", encoding="utf-8")
+            _write_apply_patch_gate_evidence(
+                repo_root,
+                orchestration_id="orch_001",
+                agent_run_id="orch_run_001",
+                actor_role="orchestration",
+                changed_paths=["workspace/orchestrations/orch_001/logs/other.note.txt"],
+            )
+            with self.assertRaisesRegex(
+                ValueError, "apply_patch_writes gate does not cover terminal output_refs"
+            ):
+                record_agent_run(
+                    repo_root=repo_root,
+                    orchestration_id="orch_001",
+                    payload={
+                        "agent_run_id": "orch_run_001",
+                        "agent_role": "orchestration",
+                        "status": "pass",
+                        "agent_backend": "claude",
+                        "output_refs": [out_ref],
+                    },
+                )
+
+    def test_record_agent_run_rejects_orchestration_pass_when_gate_actor_role_mismatches(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            init_orchestration(repo_root=repo_root, orchestration_id="orch_001")
+            write_preflight(
+                repo_root=repo_root,
+                orchestration_id="orch_001",
+                payload={
+                    "status": "pass",
+                    "can_launch_step_agents": True,
+                    "can_launch_substep_agents": True,
+                    "feature_states": {"multi_agent": True},
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}],
+                },
+            )
+            out_ref = "workspace/orchestrations/orch_001/logs/orchestrator.note.txt"
+            out_path = repo_root / out_ref
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            out_path.write_text("note\n", encoding="utf-8")
+            _write_apply_patch_gate_evidence(
+                repo_root,
+                orchestration_id="orch_001",
+                agent_run_id="orch_run_001",
+                actor_role="step",
+                changed_paths=[out_ref],
+            )
+            with self.assertRaisesRegex(ValueError, "apply_patch_writes gate actor_role mismatch"):
+                record_agent_run(
+                    repo_root=repo_root,
+                    orchestration_id="orch_001",
+                    payload={
+                        "agent_run_id": "orch_run_001",
+                        "agent_role": "orchestration",
+                        "status": "pass",
+                        "agent_backend": "claude",
+                        "output_refs": [out_ref],
+                    },
+                )
+
+    def test_record_agent_run_rejects_orchestration_terminal_with_noncanonical_phase_write(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            init_orchestration(repo_root=repo_root, orchestration_id="orch_001")
+            write_preflight(
+                repo_root=repo_root,
+                orchestration_id="orch_001",
+                payload={
+                    "status": "pass",
+                    "can_launch_step_agents": True,
+                    "can_launch_substep_agents": True,
+                    "feature_states": {"multi_agent": True},
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}],
+                },
+            )
+            bad_ref = (
+                "workspace/plans/problem__shallow_water2d__0.3.0/"
+                "shallow-water2d_20260415_001/plan_meta.json"
+            )
+            bad_path = repo_root / bad_ref
+            bad_path.parent.mkdir(parents=True, exist_ok=True)
+            bad_path.write_text('{"verification_status":"pass"}\n', encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "terminal run has unauthorized write paths"):
+                record_agent_run(
+                    repo_root=repo_root,
+                    orchestration_id="orch_001",
+                    payload={
+                        "agent_run_id": "orch_run_001",
+                        "agent_role": "orchestration",
+                        "status": "fail",
+                        "agent_backend": "claude",
+                        "result_summary": "orchestration wrote a phase artifact directly",
+                    },
+                )
+
+    def test_record_agent_run_rejects_step_terminal_with_undeclared_actual_write(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            init_orchestration(repo_root=repo_root, orchestration_id="orch_001")
+            write_preflight(
+                repo_root=repo_root,
+                orchestration_id="orch_001",
+                payload={
+                    "status": "pass",
+                    "can_launch_step_agents": True,
+                    "can_launch_substep_agents": True,
+                    "feature_states": {"multi_agent": True},
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}],
+                },
+            )
+            record_agent_run(
+                repo_root=repo_root,
+                orchestration_id="orch_001",
+                payload={
+                    "agent_run_id": "orch_run_001",
+                    "agent_role": "orchestration",
+                    "status": "running",
+                    "agent_backend": "claude",
+                },
+            )
+            record_launch(
+                repo_root=repo_root,
+                orchestration_id="orch_001",
+                parent_agent_run_id="orch_run_001",
+                child_agent_run_id="step_run_build_001",
+                request_payload={
+                    "node_key": "problem/shallow_water2d@0.3.0",
+                    "step": "build",
+                    "orchestration_id": "orch_001",
+                    "agent_run_id": "step_run_build_001",
+                    "parent_agent_run_id": "orch_run_001",
+                    "plan_ref": _FIX_PLAN_REF,
+                    "pipeline_ref": _FIX_PIPE_REF,
+                    "dependency_ref": _FIX_DEP_REF,
+                    "skill_name": "workflow-build",
+                    "skill_ref": "skills/workflow-build/SKILL.md",
+                    "skill_must_read_refs": _fixture_skill_must_read_refs_step("build"),
+                    "launch_prompt_full": _step_launch_prompt(
+                        "problem/shallow_water2d@0.3.0",
+                        "build",
+                        "step_run_build_001",
+                    ),
+                },
+                response_payload=_spawn_response_payload("sess_step_build_001"),
+            )
+            out_ref = f"{_FIX_PIPE_REF}/build/build_001/bin/simulate"
+            out_path = repo_root / out_ref
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            out_path.write_text("binary\n", encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "terminal run has unauthorized write paths"):
+                record_agent_run(
+                    repo_root=repo_root,
+                    orchestration_id="orch_001",
+                    payload={
+                        "agent_run_id": "step_run_build_001",
+                        "agent_role": "step",
+                        "parent_agent_run_id": "orch_run_001",
+                        "step": "build",
+                        "node_key": "problem/shallow_water2d@0.3.0",
+                        "status": "fail",
+                        "agent_backend": "codex",
+                        "agent_model": "gpt-5-codex",
+                        "context_id": "ctx_step_build_001",
+                        "agent_session_id": "sess_step_build_001",
+                        "result_summary": "shell write bypassed apply_patch gate",
+                    },
+                )
+
+    def test_record_agent_run_rejects_step_pass_output_ref_write_without_gate_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            init_orchestration(repo_root=repo_root, orchestration_id="orch_001")
+            write_preflight(
+                repo_root=repo_root,
+                orchestration_id="orch_001",
+                payload={
+                    "status": "pass",
+                    "can_launch_step_agents": True,
+                    "can_launch_substep_agents": True,
+                    "feature_states": {"multi_agent": True},
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}],
+                },
+            )
+            record_agent_run(
+                repo_root=repo_root,
+                orchestration_id="orch_001",
+                payload={
+                    "agent_run_id": "orch_run_001",
+                    "agent_role": "orchestration",
+                    "status": "running",
+                    "agent_backend": "claude",
+                },
+            )
+            record_launch(
+                repo_root=repo_root,
+                orchestration_id="orch_001",
+                parent_agent_run_id="orch_run_001",
+                child_agent_run_id="step_run_build_001",
+                request_payload={
+                    "node_key": "problem/shallow_water2d@0.3.0",
+                    "step": "build",
+                    "orchestration_id": "orch_001",
+                    "agent_run_id": "step_run_build_001",
+                    "parent_agent_run_id": "orch_run_001",
+                    "plan_ref": _FIX_PLAN_REF,
+                    "pipeline_ref": _FIX_PIPE_REF,
+                    "dependency_ref": _FIX_DEP_REF,
+                    "skill_name": "workflow-build",
+                    "skill_ref": "skills/workflow-build/SKILL.md",
+                    "skill_must_read_refs": _fixture_skill_must_read_refs_step("build"),
+                    "launch_prompt_full": _step_launch_prompt(
+                        "problem/shallow_water2d@0.3.0",
+                        "build",
+                        "step_run_build_001",
+                    ),
+                },
+                response_payload=_spawn_response_payload("sess_step_build_001"),
+            )
+            out_ref = f"{_FIX_PIPE_REF}/build/build_001/bin/simulate"
+            out_path = repo_root / out_ref
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            out_path.write_text("binary\n", encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "terminal run has unauthorized write paths"):
+                record_agent_run(
+                    repo_root=repo_root,
+                    orchestration_id="orch_001",
+                    payload={
+                        "agent_run_id": "step_run_build_001",
+                        "agent_role": "step",
+                        "parent_agent_run_id": "orch_run_001",
+                        "step": "build",
+                        "node_key": "problem/shallow_water2d@0.3.0",
+                        "status": "pass",
+                        "agent_backend": "codex",
+                        "agent_model": "gpt-5-codex",
+                        "context_id": "ctx_step_build_001",
+                        "agent_session_id": "sess_step_build_001",
+                        "output_refs": [out_ref],
+                    },
+                )
+
+    def test_record_agent_run_rejects_step_terminal_write_outside_gate_changed_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            init_orchestration(repo_root=repo_root, orchestration_id="orch_001")
+            write_preflight(
+                repo_root=repo_root,
+                orchestration_id="orch_001",
+                payload={
+                    "status": "pass",
+                    "can_launch_step_agents": True,
+                    "can_launch_substep_agents": True,
+                    "feature_states": {"multi_agent": True},
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}],
+                },
+            )
+            record_agent_run(
+                repo_root=repo_root,
+                orchestration_id="orch_001",
+                payload={
+                    "agent_run_id": "orch_run_001",
+                    "agent_role": "orchestration",
+                    "status": "running",
+                    "agent_backend": "claude",
+                },
+            )
+            record_launch(
+                repo_root=repo_root,
+                orchestration_id="orch_001",
+                parent_agent_run_id="orch_run_001",
+                child_agent_run_id="step_run_build_001",
+                request_payload={
+                    "node_key": "problem/shallow_water2d@0.3.0",
+                    "step": "build",
+                    "orchestration_id": "orch_001",
+                    "agent_run_id": "step_run_build_001",
+                    "parent_agent_run_id": "orch_run_001",
+                    "plan_ref": _FIX_PLAN_REF,
+                    "pipeline_ref": _FIX_PIPE_REF,
+                    "dependency_ref": _FIX_DEP_REF,
+                    "skill_name": "workflow-build",
+                    "skill_ref": "skills/workflow-build/SKILL.md",
+                    "skill_must_read_refs": _fixture_skill_must_read_refs_step("build"),
+                    "launch_prompt_full": _step_launch_prompt(
+                        "problem/shallow_water2d@0.3.0",
+                        "build",
+                        "step_run_build_001",
+                    ),
+                },
+                response_payload=_spawn_response_payload("sess_step_build_001"),
+            )
+            out_ref = f"{_FIX_PIPE_REF}/build/build_001/bin/simulate"
+            out_path = repo_root / out_ref
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            out_path.write_text("binary\n", encoding="utf-8")
+            _write_apply_patch_gate_evidence(
+                repo_root,
+                orchestration_id="orch_001",
+                agent_run_id="step_run_build_001",
+                actor_role="step",
+                changed_paths=[f"{_FIX_PIPE_REF}/build/build_001/bin/other"],
+            )
+            with self.assertRaisesRegex(ValueError, "terminal run has unauthorized write paths"):
+                record_agent_run(
+                    repo_root=repo_root,
+                    orchestration_id="orch_001",
+                    payload={
+                        "agent_run_id": "step_run_build_001",
+                        "agent_role": "step",
+                        "parent_agent_run_id": "orch_run_001",
+                        "step": "build",
+                        "node_key": "problem/shallow_water2d@0.3.0",
+                        "status": "pass",
+                        "agent_backend": "codex",
+                        "agent_model": "gpt-5-codex",
+                        "context_id": "ctx_step_build_001",
+                        "agent_session_id": "sess_step_build_001",
+                        "output_refs": [out_ref],
+                    },
+                )
+
+    def test_record_agent_run_accepts_step_terminal_when_gate_matches_actual_write(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            init_orchestration(repo_root=repo_root, orchestration_id="orch_001")
+            write_preflight(
+                repo_root=repo_root,
+                orchestration_id="orch_001",
+                payload={
+                    "status": "pass",
+                    "can_launch_step_agents": True,
+                    "can_launch_substep_agents": True,
+                    "feature_states": {"multi_agent": True},
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}],
+                },
+            )
+            record_agent_run(
+                repo_root=repo_root,
+                orchestration_id="orch_001",
+                payload={
+                    "agent_run_id": "orch_run_001",
+                    "agent_role": "orchestration",
+                    "status": "running",
+                    "agent_backend": "claude",
+                },
+            )
+            record_launch(
+                repo_root=repo_root,
+                orchestration_id="orch_001",
+                parent_agent_run_id="orch_run_001",
+                child_agent_run_id="step_run_build_001",
+                request_payload={
+                    "node_key": "problem/shallow_water2d@0.3.0",
+                    "step": "build",
+                    "orchestration_id": "orch_001",
+                    "agent_run_id": "step_run_build_001",
+                    "parent_agent_run_id": "orch_run_001",
+                    "plan_ref": _FIX_PLAN_REF,
+                    "pipeline_ref": _FIX_PIPE_REF,
+                    "dependency_ref": _FIX_DEP_REF,
+                    "skill_name": "workflow-build",
+                    "skill_ref": "skills/workflow-build/SKILL.md",
+                    "skill_must_read_refs": _fixture_skill_must_read_refs_step("build"),
+                    "launch_prompt_full": _step_launch_prompt(
+                        "problem/shallow_water2d@0.3.0",
+                        "build",
+                        "step_run_build_001",
+                    ),
+                },
+                response_payload=_spawn_response_payload("sess_step_build_001"),
+            )
+            out_ref = f"{_FIX_PIPE_REF}/build/build_001/bin/simulate"
+            out_path = repo_root / out_ref
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            out_path.write_text("binary\n", encoding="utf-8")
+            _write_apply_patch_gate_evidence(
+                repo_root,
+                orchestration_id="orch_001",
+                agent_run_id="step_run_build_001",
+                actor_role="step",
+                changed_paths=[out_ref],
+            )
+            payload = record_agent_run(
+                repo_root=repo_root,
+                orchestration_id="orch_001",
+                payload={
+                    "agent_run_id": "step_run_build_001",
+                    "agent_role": "step",
+                    "parent_agent_run_id": "orch_run_001",
+                    "step": "build",
+                    "node_key": "problem/shallow_water2d@0.3.0",
+                    "status": "pass",
+                    "agent_backend": "codex",
+                    "agent_model": "gpt-5-codex",
+                    "context_id": "ctx_step_build_001",
+                    "agent_session_id": "sess_step_build_001",
+                    "output_refs": [out_ref],
+                },
+            )
+            self.assertEqual(payload["output_refs"], [out_ref])
+
+    def test_record_agent_run_accepts_step_terminal_when_gate_changed_paths_uses_directory_prefix(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            init_orchestration(repo_root=repo_root, orchestration_id="orch_001")
+            write_preflight(
+                repo_root=repo_root,
+                orchestration_id="orch_001",
+                payload={
+                    "status": "pass",
+                    "can_launch_step_agents": True,
+                    "can_launch_substep_agents": True,
+                    "feature_states": {"multi_agent": True},
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}],
+                },
+            )
+            record_agent_run(
+                repo_root=repo_root,
+                orchestration_id="orch_001",
+                payload={
+                    "agent_run_id": "orch_run_001",
+                    "agent_role": "orchestration",
+                    "status": "running",
+                    "agent_backend": "claude",
+                },
+            )
+            record_launch(
+                repo_root=repo_root,
+                orchestration_id="orch_001",
+                parent_agent_run_id="orch_run_001",
+                child_agent_run_id="step_run_build_001",
+                request_payload={
+                    "node_key": "problem/shallow_water2d@0.3.0",
+                    "step": "build",
+                    "orchestration_id": "orch_001",
+                    "agent_run_id": "step_run_build_001",
+                    "parent_agent_run_id": "orch_run_001",
+                    "plan_ref": _FIX_PLAN_REF,
+                    "pipeline_ref": _FIX_PIPE_REF,
+                    "dependency_ref": _FIX_DEP_REF,
+                    "skill_name": "workflow-build",
+                    "skill_ref": "skills/workflow-build/SKILL.md",
+                    "skill_must_read_refs": _fixture_skill_must_read_refs_step("build"),
+                    "launch_prompt_full": _step_launch_prompt(
+                        "problem/shallow_water2d@0.3.0",
+                        "build",
+                        "step_run_build_001",
+                    ),
+                },
+                response_payload=_spawn_response_payload("sess_step_build_001"),
+            )
+            out_ref = f"{_FIX_PIPE_REF}/build/build_001/bin/simulate"
+            out_path = repo_root / out_ref
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            out_path.write_text("binary\n", encoding="utf-8")
+            _write_apply_patch_gate_evidence(
+                repo_root,
+                orchestration_id="orch_001",
+                agent_run_id="step_run_build_001",
+                actor_role="step",
+                changed_paths=[f"{_FIX_PIPE_REF}/build/build_001/bin/"],
+            )
+            payload = record_agent_run(
+                repo_root=repo_root,
+                orchestration_id="orch_001",
+                payload={
+                    "agent_run_id": "step_run_build_001",
+                    "agent_role": "step",
+                    "parent_agent_run_id": "orch_run_001",
+                    "step": "build",
+                    "node_key": "problem/shallow_water2d@0.3.0",
+                    "status": "pass",
+                    "agent_backend": "codex",
+                    "agent_model": "gpt-5-codex",
+                    "context_id": "ctx_step_build_001",
+                    "agent_session_id": "sess_step_build_001",
+                    "output_refs": [out_ref],
+                },
+            )
+            self.assertEqual(payload["output_refs"], [out_ref])
+
+    def test_record_agent_run_accepts_orchestration_terminal_when_child_deleted_file_matches_tombstone_snapshot(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            out_ref = f"{_FIX_PIPE_REF}/build/build_001/bin/simulate"
+            out_path = repo_root / out_ref
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            out_path.write_text("binary-baseline\n", encoding="utf-8")
+            init_orchestration(repo_root=repo_root, orchestration_id="orch_001")
+            write_preflight(
+                repo_root=repo_root,
+                orchestration_id="orch_001",
+                payload={
+                    "status": "pass",
+                    "can_launch_step_agents": True,
+                    "can_launch_substep_agents": True,
+                    "feature_states": {"multi_agent": True},
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}],
+                },
+            )
+            record_agent_run(
+                repo_root=repo_root,
+                orchestration_id="orch_001",
+                payload={
+                    "agent_run_id": "orch_run_001",
+                    "agent_role": "orchestration",
+                    "status": "running",
+                    "agent_backend": "claude",
+                },
+            )
+            record_launch(
+                repo_root=repo_root,
+                orchestration_id="orch_001",
+                parent_agent_run_id="orch_run_001",
+                child_agent_run_id="step_run_build_001",
+                request_payload={
+                    "node_key": "problem/shallow_water2d@0.3.0",
+                    "step": "build",
+                    "orchestration_id": "orch_001",
+                    "agent_run_id": "step_run_build_001",
+                    "parent_agent_run_id": "orch_run_001",
+                    "plan_ref": _FIX_PLAN_REF,
+                    "pipeline_ref": _FIX_PIPE_REF,
+                    "dependency_ref": _FIX_DEP_REF,
+                    "skill_name": "workflow-build",
+                    "skill_ref": "skills/workflow-build/SKILL.md",
+                    "skill_must_read_refs": _fixture_skill_must_read_refs_step("build"),
+                    "launch_prompt_full": _step_launch_prompt(
+                        "problem/shallow_water2d@0.3.0",
+                        "build",
+                        "step_run_build_001",
+                    ),
+                },
+                response_payload=_spawn_response_payload("sess_step_build_001"),
+            )
+            out_path.unlink()
+            _write_apply_patch_gate_evidence(
+                repo_root,
+                orchestration_id="orch_001",
+                agent_run_id="step_run_build_001",
+                actor_role="step",
+                changed_paths=[out_ref],
+            )
+            record_agent_run(
+                repo_root=repo_root,
+                orchestration_id="orch_001",
+                payload={
+                    "agent_run_id": "step_run_build_001",
+                    "agent_role": "step",
+                    "parent_agent_run_id": "orch_run_001",
+                    "step": "build",
+                    "node_key": "problem/shallow_water2d@0.3.0",
+                    "status": "pass",
+                    "agent_backend": "codex",
+                    "agent_model": "gpt-5-codex",
+                    "context_id": "ctx_step_build_001",
+                    "agent_session_id": "sess_step_build_001",
+                    "output_refs": [out_ref],
+                },
+            )
+            payload = record_agent_run(
+                repo_root=repo_root,
+                orchestration_id="orch_001",
+                payload={
+                    "agent_run_id": "orch_run_002",
+                    "agent_role": "orchestration",
+                    "status": "pass",
+                    "agent_backend": "claude",
+                    "result_summary": "child deletion remained unchanged after terminal snapshot",
+                },
+            )
+            self.assertEqual(payload["status"], "pass")
+
+    def test_record_agent_run_accepts_orchestration_terminal_when_only_child_declared_writes_changed(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            init_orchestration(repo_root=repo_root, orchestration_id="orch_001")
+            write_preflight(
+                repo_root=repo_root,
+                orchestration_id="orch_001",
+                payload={
+                    "status": "pass",
+                    "can_launch_step_agents": True,
+                    "can_launch_substep_agents": True,
+                    "feature_states": {"multi_agent": True},
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}],
+                },
+            )
+            record_agent_run(
+                repo_root=repo_root,
+                orchestration_id="orch_001",
+                payload={
+                    "agent_run_id": "orch_run_001",
+                    "agent_role": "orchestration",
+                    "status": "running",
+                    "agent_backend": "claude",
+                },
+            )
+            record_launch(
+                repo_root=repo_root,
+                orchestration_id="orch_001",
+                parent_agent_run_id="orch_run_001",
+                child_agent_run_id="step_run_build_001",
+                request_payload={
+                    "node_key": "problem/shallow_water2d@0.3.0",
+                    "step": "build",
+                    "orchestration_id": "orch_001",
+                    "agent_run_id": "step_run_build_001",
+                    "parent_agent_run_id": "orch_run_001",
+                    "plan_ref": _FIX_PLAN_REF,
+                    "pipeline_ref": _FIX_PIPE_REF,
+                    "dependency_ref": _FIX_DEP_REF,
+                    "skill_name": "workflow-build",
+                    "skill_ref": "skills/workflow-build/SKILL.md",
+                    "skill_must_read_refs": _fixture_skill_must_read_refs_step("build"),
+                    "launch_prompt_full": _step_launch_prompt(
+                        "problem/shallow_water2d@0.3.0",
+                        "build",
+                        "step_run_build_001",
+                    ),
+                },
+                response_payload=_spawn_response_payload("sess_step_build_001"),
+            )
+            out_ref = f"{_FIX_PIPE_REF}/build/build_001/bin/simulate"
+            out_path = repo_root / out_ref
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            out_path.write_text("binary\n", encoding="utf-8")
+            _write_apply_patch_gate_evidence(
+                repo_root,
+                orchestration_id="orch_001",
+                agent_run_id="step_run_build_001",
+                actor_role="step",
+                changed_paths=[out_ref],
+            )
+            record_agent_run(
+                repo_root=repo_root,
+                orchestration_id="orch_001",
+                payload={
+                    "agent_run_id": "step_run_build_001",
+                    "agent_role": "step",
+                    "parent_agent_run_id": "orch_run_001",
+                    "step": "build",
+                    "node_key": "problem/shallow_water2d@0.3.0",
+                    "status": "pass",
+                    "agent_backend": "codex",
+                    "agent_model": "gpt-5-codex",
+                    "context_id": "ctx_step_build_001",
+                    "agent_session_id": "sess_step_build_001",
+                    "output_refs": [out_ref],
+                },
+            )
+            payload = record_agent_run(
+                repo_root=repo_root,
+                orchestration_id="orch_001",
+                payload={
+                    "agent_run_id": "orch_run_002",
+                    "agent_role": "orchestration",
+                    "status": "pass",
+                    "agent_backend": "claude",
+                    "result_summary": "child-managed writes were excluded from orchestration diff",
+                },
+            )
+            self.assertEqual(payload["status"], "pass")
+
+    def test_record_agent_run_rejects_orchestration_terminal_when_it_overwrites_child_output(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            init_orchestration(repo_root=repo_root, orchestration_id="orch_001")
+            write_preflight(
+                repo_root=repo_root,
+                orchestration_id="orch_001",
+                payload={
+                    "status": "pass",
+                    "can_launch_step_agents": True,
+                    "can_launch_substep_agents": True,
+                    "feature_states": {"multi_agent": True},
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}],
+                },
+            )
+            record_agent_run(
+                repo_root=repo_root,
+                orchestration_id="orch_001",
+                payload={
+                    "agent_run_id": "orch_run_001",
+                    "agent_role": "orchestration",
+                    "status": "running",
+                    "agent_backend": "claude",
+                },
+            )
+            record_launch(
+                repo_root=repo_root,
+                orchestration_id="orch_001",
+                parent_agent_run_id="orch_run_001",
+                child_agent_run_id="step_run_build_001",
+                request_payload={
+                    "node_key": "problem/shallow_water2d@0.3.0",
+                    "step": "build",
+                    "orchestration_id": "orch_001",
+                    "agent_run_id": "step_run_build_001",
+                    "parent_agent_run_id": "orch_run_001",
+                    "plan_ref": _FIX_PLAN_REF,
+                    "pipeline_ref": _FIX_PIPE_REF,
+                    "dependency_ref": _FIX_DEP_REF,
+                    "skill_name": "workflow-build",
+                    "skill_ref": "skills/workflow-build/SKILL.md",
+                    "skill_must_read_refs": _fixture_skill_must_read_refs_step("build"),
+                    "launch_prompt_full": _step_launch_prompt(
+                        "problem/shallow_water2d@0.3.0",
+                        "build",
+                        "step_run_build_001",
+                    ),
+                },
+                response_payload=_spawn_response_payload("sess_step_build_001"),
+            )
+            out_ref = f"{_FIX_PIPE_REF}/build/build_001/bin/simulate"
+            out_path = repo_root / out_ref
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            out_path.write_text("binary-v1\n", encoding="utf-8")
+            _write_apply_patch_gate_evidence(
+                repo_root,
+                orchestration_id="orch_001",
+                agent_run_id="step_run_build_001",
+                actor_role="step",
+                changed_paths=[out_ref],
+            )
+            record_agent_run(
+                repo_root=repo_root,
+                orchestration_id="orch_001",
+                payload={
+                    "agent_run_id": "step_run_build_001",
+                    "agent_role": "step",
+                    "parent_agent_run_id": "orch_run_001",
+                    "step": "build",
+                    "node_key": "problem/shallow_water2d@0.3.0",
+                    "status": "pass",
+                    "agent_backend": "codex",
+                    "agent_model": "gpt-5-codex",
+                    "context_id": "ctx_step_build_001",
+                    "agent_session_id": "sess_step_build_001",
+                    "output_refs": [out_ref],
+                },
+            )
+            out_path.write_text("binary-v2\n", encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "terminal run has unauthorized write paths"):
+                record_agent_run(
+                    repo_root=repo_root,
+                    orchestration_id="orch_001",
+                    payload={
+                        "agent_run_id": "orch_run_002",
+                        "agent_role": "orchestration",
+                        "status": "fail",
+                        "agent_backend": "claude",
+                        "result_summary": "orchestration overwrote child output",
+                    },
+                )
+
+    def test_record_agent_run_rejects_orchestration_terminal_when_it_overwrites_existing_child_output(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            out_ref = f"{_FIX_PIPE_REF}/build/build_001/bin/simulate"
+            out_path = repo_root / out_ref
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            out_path.write_text("binary-baseline\n", encoding="utf-8")
+            init_orchestration(repo_root=repo_root, orchestration_id="orch_001")
+            write_preflight(
+                repo_root=repo_root,
+                orchestration_id="orch_001",
+                payload={
+                    "status": "pass",
+                    "can_launch_step_agents": True,
+                    "can_launch_substep_agents": True,
+                    "feature_states": {"multi_agent": True},
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}],
+                },
+            )
+            record_agent_run(
+                repo_root=repo_root,
+                orchestration_id="orch_001",
+                payload={
+                    "agent_run_id": "orch_run_001",
+                    "agent_role": "orchestration",
+                    "status": "running",
+                    "agent_backend": "claude",
+                },
+            )
+            record_launch(
+                repo_root=repo_root,
+                orchestration_id="orch_001",
+                parent_agent_run_id="orch_run_001",
+                child_agent_run_id="step_run_build_001",
+                request_payload={
+                    "node_key": "problem/shallow_water2d@0.3.0",
+                    "step": "build",
+                    "orchestration_id": "orch_001",
+                    "agent_run_id": "step_run_build_001",
+                    "parent_agent_run_id": "orch_run_001",
+                    "plan_ref": _FIX_PLAN_REF,
+                    "pipeline_ref": _FIX_PIPE_REF,
+                    "dependency_ref": _FIX_DEP_REF,
+                    "skill_name": "workflow-build",
+                    "skill_ref": "skills/workflow-build/SKILL.md",
+                    "skill_must_read_refs": _fixture_skill_must_read_refs_step("build"),
+                    "launch_prompt_full": _step_launch_prompt(
+                        "problem/shallow_water2d@0.3.0",
+                        "build",
+                        "step_run_build_001",
+                    ),
+                },
+                response_payload=_spawn_response_payload("sess_step_build_001"),
+            )
+            _write_apply_patch_gate_evidence(
+                repo_root,
+                orchestration_id="orch_001",
+                agent_run_id="step_run_build_001",
+                actor_role="step",
+                changed_paths=[out_ref],
+            )
+            record_agent_run(
+                repo_root=repo_root,
+                orchestration_id="orch_001",
+                payload={
+                    "agent_run_id": "step_run_build_001",
+                    "agent_role": "step",
+                    "parent_agent_run_id": "orch_run_001",
+                    "step": "build",
+                    "node_key": "problem/shallow_water2d@0.3.0",
+                    "status": "pass",
+                    "agent_backend": "codex",
+                    "agent_model": "gpt-5-codex",
+                    "context_id": "ctx_step_build_001",
+                    "agent_session_id": "sess_step_build_001",
+                    "output_refs": [out_ref],
+                },
+            )
+            out_path.write_text("binary-overwritten\n", encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "terminal run has unauthorized write paths"):
+                record_agent_run(
+                    repo_root=repo_root,
+                    orchestration_id="orch_001",
+                    payload={
+                        "agent_run_id": "orch_run_002",
+                        "agent_role": "orchestration",
+                        "status": "fail",
+                        "agent_backend": "claude",
+                        "result_summary": "orchestration overwrote existing child output",
+                    },
+                )
+
     def test_rejects_launch_response_without_child_agent_identifier(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
@@ -1601,6 +2660,160 @@ shell_tool                       stable             true
                         ),
                     },
                     response_payload={"launch_reply": "accepted: missing-id"},
+                )
+
+    def test_write_roots_for_launch_includes_tune_canonical_root(self) -> None:
+        self.assertEqual(
+            _write_roots_for_launch(
+                role="substep",
+                step="tune",
+                orchestration_id="orch_001",
+                plan_ref=_FIX_PLAN_REF,
+                pipeline_ref=_FIX_PIPE_REF,
+            ),
+            [f"{_FIX_PIPE_REF}/tune/"],
+        )
+
+    def test_record_agent_run_rejects_tune_substep_terminal_write_outside_tune_root(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            init_orchestration(repo_root=repo_root, orchestration_id="orch_001")
+            write_preflight(
+                repo_root=repo_root,
+                orchestration_id="orch_001",
+                payload={
+                    "status": "pass",
+                    "can_launch_step_agents": True,
+                    "can_launch_substep_agents": True,
+                    "feature_states": {"multi_agent": True},
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}],
+                },
+            )
+            record_agent_run(
+                repo_root=repo_root,
+                orchestration_id="orch_001",
+                payload={
+                    "agent_run_id": "orch_run_001",
+                    "agent_role": "orchestration",
+                    "status": "running",
+                    "agent_backend": "claude",
+                },
+            )
+            cap_path = (
+                repo_root
+                / "workspace/orchestrations/orch_001/capabilities/substep_run_tune_001.json"
+            )
+            cap_path.parent.mkdir(parents=True, exist_ok=True)
+            cap_path.write_text(
+                json.dumps(
+                    {
+                        "agent_run_id": "substep_run_tune_001",
+                        "capability_token": "tok_tune_001",
+                        "orchestration_id": "orch_001",
+                        "agent_role": "substep",
+                        "node_key": "problem/shallow_water2d@0.3.0",
+                        "step": "tune",
+                        "substep": "generate",
+                        "write_roots": [f"{_FIX_PIPE_REF}/tune/"],
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            launch_request_path = (
+                repo_root
+                / "workspace/orchestrations/orch_001/launches/substep_run_tune_001.request.json"
+            )
+            launch_request_path.parent.mkdir(parents=True, exist_ok=True)
+            launch_request_path.write_text(
+                json.dumps(
+                    {
+                        "node_key": "problem/shallow_water2d@0.3.0",
+                        "step": "tune",
+                        "substep": "generate",
+                        "orchestration_id": "orch_001",
+                        "agent_run_id": "substep_run_tune_001",
+                        "parent_agent_run_id": "orch_run_001",
+                        "plan_ref": _FIX_PLAN_REF,
+                        "pipeline_ref": _FIX_PIPE_REF,
+                        "dependency_ref": _FIX_DEP_REF,
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            launch_response_path = (
+                repo_root
+                / "workspace/orchestrations/orch_001/launches/substep_run_tune_001.response.json"
+            )
+            launch_response_path.write_text(
+                json.dumps(
+                    {
+                        "agent_run_id": "substep_run_tune_001",
+                        **_spawn_response_payload("sess_substep_tune_001"),
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            launch_prompt_path = (
+                repo_root
+                / "workspace/orchestrations/orch_001/launches/substep_run_tune_001.prompt.txt"
+            )
+            launch_prompt_path.write_text(
+                _substep_launch_prompt(
+                    "problem/shallow_water2d@0.3.0",
+                    "tune",
+                    "generate",
+                    "substep_run_tune_001",
+                ),
+                encoding="utf-8",
+            )
+            launch_reply_path = (
+                repo_root
+                / "workspace/orchestrations/orch_001/launches/substep_run_tune_001.reply.txt"
+            )
+            launch_reply_path.write_text("accepted: sess_substep_tune_001\n", encoding="utf-8")
+            _write_run_write_baseline(
+                repo_root,
+                "orch_001",
+                agent_run_id="substep_run_tune_001",
+            )
+            bad_ref = f"{_FIX_PIPE_REF}/generate/leaked.txt"
+            bad_path = repo_root / bad_ref
+            bad_path.parent.mkdir(parents=True, exist_ok=True)
+            bad_path.write_text("leak\n", encoding="utf-8")
+            _write_apply_patch_gate_evidence(
+                repo_root,
+                orchestration_id="orch_001",
+                agent_run_id="substep_run_tune_001",
+                actor_role="substep",
+                changed_paths=[bad_ref],
+            )
+            with self.assertRaisesRegex(ValueError, "terminal run has unauthorized write paths"):
+                record_agent_run(
+                    repo_root=repo_root,
+                    orchestration_id="orch_001",
+                    payload={
+                        "agent_run_id": "substep_run_tune_001",
+                        "agent_role": "substep",
+                        "parent_agent_run_id": "orch_run_001",
+                        "step": "tune",
+                        "substep": "generate",
+                        "node_key": "problem/shallow_water2d@0.3.0",
+                        "status": "pass",
+                        "agent_backend": "codex",
+                        "agent_model": "gpt-5-codex",
+                        "context_id": "ctx_substep_tune_001",
+                        "agent_session_id": "sess_substep_tune_001",
+                        "output_refs": [bad_ref],
+                    },
                 )
 
     def test_rejects_agent_run_when_launch_response_session_id_differs(self) -> None:
@@ -2088,6 +3301,41 @@ shell_tool                       stable             true
             encoding="utf-8",
         )
 
+    @staticmethod
+    def _valid_plan_meta(*, context_isolated: bool = True) -> dict[str, object]:
+        payload: dict[str, object] = {
+            "attempt_count": 1,
+            "verification_status": "pass",
+            "last_fail_reason": None,
+            "debug_mode": False,
+            "context_isolated": context_isolated,
+        }
+        if not context_isolated:
+            payload["constraint_reason"] = "shared verifier context"
+        return payload
+
+    @staticmethod
+    def _valid_generate_meta(*, context_isolated: bool = True) -> dict[str, object]:
+        payload: dict[str, object] = {
+            "attempt_count": 1,
+            "verification_status": "pass",
+            "last_fail_reason": None,
+            "debug_mode": False,
+            "context_isolated": context_isolated,
+            "lint_command_ref": {
+                "run_linter": [
+                    {
+                        "command_id": "lint_001",
+                        "command_log_ref": "workspace/orchestrations/orch_001/gates/lint_001.json",
+                        "preset": "fortitude",
+                    }
+                ]
+            },
+        }
+        if not context_isolated:
+            payload["constraint_reason"] = "shared verifier context"
+        return payload
+
     def test_write_step_result_requires_validation_stage_for_build_pass(self) -> None:
         """validation_stage のない pass build step_result が ValueError を上げること。"""
         with tempfile.TemporaryDirectory() as tmp:
@@ -2213,11 +3461,7 @@ shell_tool                       stable             true
             plan_meta_path = repo_root / "workspace" / "plans" / "problem__shallow_water2d__0.3.0" / "shallow-water2d_20260415_001" / "plan_meta.json"
             plan_meta_path.parent.mkdir(parents=True, exist_ok=True)
             plan_meta_path.write_text(
-                json.dumps({
-                    "attempt_count": 1,
-                    "verification_status": "pass",
-                    "context_isolated": True,
-                }),
+                json.dumps(self._valid_plan_meta()),
                 encoding="utf-8",
             )
             # plan step には validation_stage がなくても成功することを確認
@@ -2344,6 +3588,96 @@ shell_tool                       stable             true
                     },
                 )
 
+    def test_write_step_result_requires_generate_meta_lint_command_ref(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._setup_preflight_and_orch_agent(repo_root)
+            orch_root = repo_root / "workspace" / "orchestrations" / "orch_001"
+            runs_path = orch_root / "agent_runs.jsonl"
+            meta_ref = "workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/generate/gen_20260413_001/generate_meta.json"
+            meta_path = repo_root / meta_ref
+            meta_path.parent.mkdir(parents=True, exist_ok=True)
+            meta_payload = self._valid_generate_meta()
+            del meta_payload["lint_command_ref"]
+            meta_path.write_text(json.dumps(meta_payload), encoding="utf-8")
+            with runs_path.open("a", encoding="utf-8") as fh:
+                fh.write(
+                    json.dumps(
+                        {
+                            "agent_run_id": "substep_run_gen_verify_001",
+                            "agent_role": "substep",
+                            "node_key": "problem/shallow_water2d@0.3.0",
+                            "step": "generate",
+                            "substep": "verify",
+                            "status": "pass",
+                            "agent_backend": "claude",
+                            "output_refs": [meta_ref],
+                        }
+                    )
+                    + "\n"
+                )
+            with self.assertRaisesRegex(ValueError, "lint_command_ref"):
+                write_step_result(
+                    repo_root=repo_root,
+                    orchestration_id="orch_001",
+                    node_key="problem/shallow_water2d@0.3.0",
+                    step="generate",
+                    agent_run_id="orch_run_001",
+                    payload={
+                        "status": "pass",
+                        "validation_stage": "post_generate",
+                        "required_outputs": [meta_ref],
+                        "failed_substeps": [],
+                        "substep_agent_run_ids": ["substep_run_gen_verify_001"],
+                    },
+                )
+
+    def test_write_step_result_requires_final_meta_in_required_outputs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._setup_preflight_and_orch_agent(repo_root)
+            orch_root = repo_root / "workspace" / "orchestrations" / "orch_001"
+            runs_path = orch_root / "agent_runs.jsonl"
+            meta_ref = "workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/generate/gen_20260413_001/generate_meta.json"
+            src_ref = "workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/generate/gen_20260413_001/src/model.f90"
+            meta_path = repo_root / meta_ref
+            meta_path.parent.mkdir(parents=True, exist_ok=True)
+            meta_path.write_text(json.dumps(self._valid_generate_meta()), encoding="utf-8")
+            src_path = repo_root / src_ref
+            src_path.parent.mkdir(parents=True, exist_ok=True)
+            src_path.write_text("program model\nend program model\n", encoding="utf-8")
+            with runs_path.open("a", encoding="utf-8") as fh:
+                fh.write(
+                    json.dumps(
+                        {
+                            "agent_run_id": "substep_run_gen_verify_001",
+                            "agent_role": "substep",
+                            "node_key": "problem/shallow_water2d@0.3.0",
+                            "step": "generate",
+                            "substep": "verify",
+                            "status": "pass",
+                            "agent_backend": "claude",
+                            "output_refs": [src_ref, meta_ref],
+                        }
+                    )
+                    + "\n"
+                )
+            with self.assertRaisesRegex(ValueError, "required_outputs to include final generate_meta.json"):
+                write_step_result(
+                    repo_root=repo_root,
+                    orchestration_id="orch_001",
+                    node_key="problem/shallow_water2d@0.3.0",
+                    step="generate",
+                    agent_run_id="orch_run_001",
+                    payload={
+                        "status": "pass",
+                        "validation_stage": "post_generate",
+                        "required_outputs": [src_ref],
+                        "failed_substeps": [],
+                        "substep_agent_run_ids": ["substep_run_gen_verify_001"],
+                    },
+                )
+
     def test_write_step_result_validates_plan_meta_required_keys(self) -> None:
         """plan_meta.json に必須キーが欠けている場合 ValueError。"""
         with tempfile.TemporaryDirectory() as tmp:
@@ -2383,6 +3717,49 @@ shell_tool                       stable             true
                     },
                 )
 
+    def test_write_step_result_requires_constraint_reason_when_context_not_isolated(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._setup_preflight_and_orch_agent(repo_root)
+            orch_root = repo_root / "workspace" / "orchestrations" / "orch_001"
+            runs_path = orch_root / "agent_runs.jsonl"
+            meta_ref = "workspace/plans/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/plan_meta.json"
+            meta_path = repo_root / meta_ref
+            meta_path.parent.mkdir(parents=True, exist_ok=True)
+            meta_payload = self._valid_plan_meta(context_isolated=False)
+            del meta_payload["constraint_reason"]
+            meta_path.write_text(json.dumps(meta_payload), encoding="utf-8")
+            with runs_path.open("a", encoding="utf-8") as fh:
+                fh.write(
+                    json.dumps(
+                        {
+                            "agent_run_id": "substep_run_plan_generate_001",
+                            "agent_role": "substep",
+                            "node_key": "problem/shallow_water2d@0.3.0",
+                            "step": "plan",
+                            "substep": "generate",
+                            "status": "pass",
+                            "agent_backend": "claude",
+                            "output_refs": [meta_ref],
+                        }
+                    )
+                    + "\n"
+                )
+            with self.assertRaisesRegex(ValueError, "constraint_reason"):
+                write_step_result(
+                    repo_root=repo_root,
+                    orchestration_id="orch_001",
+                    node_key="problem/shallow_water2d@0.3.0",
+                    step="plan",
+                    agent_run_id="orch_run_001",
+                    payload={
+                        "status": "pass",
+                        "required_outputs": [meta_ref],
+                        "failed_substeps": [],
+                        "substep_agent_run_ids": ["substep_run_plan_generate_001"],
+                    },
+                )
+
     def test_write_step_result_accepts_valid_generate_meta(self) -> None:
         """必須キーがすべて揃った generate_meta.json を含む pass generate step_result が成功する。"""
         with tempfile.TemporaryDirectory() as tmp:
@@ -2395,13 +3772,7 @@ shell_tool                       stable             true
             meta_path = repo_root / meta_ref
             meta_path.parent.mkdir(parents=True, exist_ok=True)
             meta_path.write_text(
-                json.dumps({
-                    "attempt_count": 1,
-                    "verification_status": "pass",
-                    "last_fail_reason": None,
-                    "debug_mode": False,
-                    "context_isolated": True,
-                }),
+                json.dumps(self._valid_generate_meta()),
                 encoding="utf-8",
             )
             substep_record = {
@@ -2432,6 +3803,267 @@ shell_tool                       stable             true
                 },
             )
             self.assertEqual(result.get("status"), "pass")
+
+    def test_write_step_result_accepts_retry_pass_when_old_failed_substep_is_listed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._setup_preflight_and_orch_agent(repo_root)
+            orch_root = repo_root / "workspace" / "orchestrations" / "orch_001"
+            runs_path = orch_root / "agent_runs.jsonl"
+            old_meta_ref = "workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/generate/gen_20260413_001/generate_meta.json"
+            new_meta_ref = "workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/generate/gen_20260413_002/generate_meta.json"
+            old_meta_path = repo_root / old_meta_ref
+            old_meta_path.parent.mkdir(parents=True, exist_ok=True)
+            old_meta_path.write_text(json.dumps(self._valid_generate_meta()), encoding="utf-8")
+            new_meta_path = repo_root / new_meta_ref
+            new_meta_path.parent.mkdir(parents=True, exist_ok=True)
+            new_meta_path.write_text(json.dumps(self._valid_generate_meta()), encoding="utf-8")
+            with runs_path.open("a", encoding="utf-8") as fh:
+                fh.write(
+                    json.dumps(
+                        {
+                            "agent_run_id": "substep_run_gen_generate_001",
+                            "agent_role": "substep",
+                            "node_key": "problem/shallow_water2d@0.3.0",
+                            "step": "generate",
+                            "substep": "generate",
+                            "status": "fail",
+                            "agent_backend": "claude",
+                            "output_refs": [old_meta_ref],
+                        }
+                    )
+                    + "\n"
+                )
+                fh.write(
+                    json.dumps(
+                        {
+                            "agent_run_id": "substep_run_gen_generate_002",
+                            "agent_role": "substep",
+                            "node_key": "problem/shallow_water2d@0.3.0",
+                            "step": "generate",
+                            "substep": "generate",
+                            "status": "pass",
+                            "agent_backend": "claude",
+                            "output_refs": [new_meta_ref],
+                        }
+                    )
+                    + "\n"
+                )
+            result = write_step_result(
+                repo_root=repo_root,
+                orchestration_id="orch_001",
+                node_key="problem/shallow_water2d@0.3.0",
+                step="generate",
+                agent_run_id="orch_run_001",
+                payload={
+                    "status": "pass",
+                    "validation_stage": "post_generate",
+                    "required_outputs": [new_meta_ref],
+                    "failed_substeps": ["substep_run_gen_generate_001"],
+                    "substep_agent_run_ids": [
+                        "substep_run_gen_generate_001",
+                        "substep_run_gen_generate_002",
+                    ],
+                    "retry_decisions": [
+                        {
+                            "issue_severity": "major",
+                            "repair_strategy": "restart",
+                            "repair_target_agent_run_id": "substep_run_gen_generate_001",
+                            "new_agent_run_id": "substep_run_gen_generate_002",
+                            "repair_reason": "retry after failed generation",
+                        }
+                    ],
+                },
+            )
+            self.assertEqual(result.get("status"), "pass")
+
+    def test_write_step_result_rejects_failed_substeps_that_reference_pass_run(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._setup_preflight_and_orch_agent(repo_root)
+            orch_root = repo_root / "workspace" / "orchestrations" / "orch_001"
+            runs_path = orch_root / "agent_runs.jsonl"
+            meta_ref = "workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/generate/gen_20260413_001/generate_meta.json"
+            meta_path = repo_root / meta_ref
+            meta_path.parent.mkdir(parents=True, exist_ok=True)
+            meta_path.write_text(json.dumps(self._valid_generate_meta()), encoding="utf-8")
+            with runs_path.open("a", encoding="utf-8") as fh:
+                fh.write(
+                    json.dumps(
+                        {
+                            "agent_run_id": "substep_run_gen_generate_001",
+                            "agent_role": "substep",
+                            "node_key": "problem/shallow_water2d@0.3.0",
+                            "step": "generate",
+                            "substep": "generate",
+                            "status": "pass",
+                            "agent_backend": "claude",
+                            "output_refs": [meta_ref],
+                        }
+                    )
+                    + "\n"
+                )
+            with self.assertRaisesRegex(ValueError, "actual non-pass run"):
+                write_step_result(
+                    repo_root=repo_root,
+                    orchestration_id="orch_001",
+                    node_key="problem/shallow_water2d@0.3.0",
+                    step="generate",
+                    agent_run_id="orch_run_001",
+                    payload={
+                        "status": "pass",
+                        "validation_stage": "post_generate",
+                        "required_outputs": [meta_ref],
+                        "failed_substeps": ["substep_run_gen_generate_001"],
+                        "substep_agent_run_ids": ["substep_run_gen_generate_001"],
+                    },
+                )
+
+    def test_write_step_result_rejects_retry_target_that_references_pass_run(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._setup_preflight_and_orch_agent(repo_root)
+            orch_root = repo_root / "workspace" / "orchestrations" / "orch_001"
+            runs_path = orch_root / "agent_runs.jsonl"
+            old_meta_ref = "workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/generate/gen_20260413_001/generate_meta.json"
+            new_meta_ref = "workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/generate/gen_20260413_002/generate_meta.json"
+            old_meta_path = repo_root / old_meta_ref
+            old_meta_path.parent.mkdir(parents=True, exist_ok=True)
+            old_meta_path.write_text(json.dumps(self._valid_generate_meta()), encoding="utf-8")
+            new_meta_path = repo_root / new_meta_ref
+            new_meta_path.parent.mkdir(parents=True, exist_ok=True)
+            new_meta_path.write_text(json.dumps(self._valid_generate_meta()), encoding="utf-8")
+            with runs_path.open("a", encoding="utf-8") as fh:
+                fh.write(
+                    json.dumps(
+                        {
+                            "agent_run_id": "substep_run_gen_generate_001",
+                            "agent_role": "substep",
+                            "node_key": "problem/shallow_water2d@0.3.0",
+                            "step": "generate",
+                            "substep": "generate",
+                            "status": "pass",
+                            "agent_backend": "claude",
+                            "output_refs": [old_meta_ref],
+                        }
+                    )
+                    + "\n"
+                )
+                fh.write(
+                    json.dumps(
+                        {
+                            "agent_run_id": "substep_run_gen_generate_002",
+                            "agent_role": "substep",
+                            "node_key": "problem/shallow_water2d@0.3.0",
+                            "step": "generate",
+                            "substep": "generate",
+                            "status": "pass",
+                            "agent_backend": "claude",
+                            "output_refs": [new_meta_ref],
+                        }
+                    )
+                    + "\n"
+                )
+            with self.assertRaisesRegex(ValueError, "actual non-pass run"):
+                write_step_result(
+                    repo_root=repo_root,
+                    orchestration_id="orch_001",
+                    node_key="problem/shallow_water2d@0.3.0",
+                    step="generate",
+                    agent_run_id="orch_run_001",
+                    payload={
+                        "status": "pass",
+                        "validation_stage": "post_generate",
+                        "required_outputs": [new_meta_ref],
+                        "failed_substeps": [],
+                        "substep_agent_run_ids": [
+                            "substep_run_gen_generate_001",
+                            "substep_run_gen_generate_002",
+                        ],
+                        "retry_decisions": [
+                            {
+                                "issue_severity": "major",
+                                "repair_strategy": "restart",
+                                "repair_target_agent_run_id": "substep_run_gen_generate_001",
+                                "new_agent_run_id": "substep_run_gen_generate_002",
+                                "repair_reason": "invalid retry declaration",
+                            }
+                        ],
+                    },
+                )
+
+    def test_write_step_result_rejects_required_outputs_covered_only_by_failed_retry_run(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._setup_preflight_and_orch_agent(repo_root)
+            orch_root = repo_root / "workspace" / "orchestrations" / "orch_001"
+            runs_path = orch_root / "agent_runs.jsonl"
+            old_meta_ref = "workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/generate/gen_20260413_001/generate_meta.json"
+            new_meta_ref = "workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/generate/gen_20260413_002/generate_meta.json"
+            old_meta_path = repo_root / old_meta_ref
+            old_meta_path.parent.mkdir(parents=True, exist_ok=True)
+            old_meta_path.write_text(json.dumps(self._valid_generate_meta()), encoding="utf-8")
+            new_meta_path = repo_root / new_meta_ref
+            new_meta_path.parent.mkdir(parents=True, exist_ok=True)
+            new_meta_path.write_text(json.dumps(self._valid_generate_meta()), encoding="utf-8")
+            with runs_path.open("a", encoding="utf-8") as fh:
+                fh.write(
+                    json.dumps(
+                        {
+                            "agent_run_id": "substep_run_gen_generate_001",
+                            "agent_role": "substep",
+                            "node_key": "problem/shallow_water2d@0.3.0",
+                            "step": "generate",
+                            "substep": "generate",
+                            "status": "fail",
+                            "agent_backend": "claude",
+                            "output_refs": [old_meta_ref],
+                        }
+                    )
+                    + "\n"
+                )
+                fh.write(
+                    json.dumps(
+                        {
+                            "agent_run_id": "substep_run_gen_generate_002",
+                            "agent_role": "substep",
+                            "node_key": "problem/shallow_water2d@0.3.0",
+                            "step": "generate",
+                            "substep": "generate",
+                            "status": "pass",
+                            "agent_backend": "claude",
+                            "output_refs": [new_meta_ref],
+                        }
+                    )
+                    + "\n"
+                )
+            with self.assertRaisesRegex(ValueError, "effective substep output_refs"):
+                write_step_result(
+                    repo_root=repo_root,
+                    orchestration_id="orch_001",
+                    node_key="problem/shallow_water2d@0.3.0",
+                    step="generate",
+                    agent_run_id="orch_run_001",
+                    payload={
+                        "status": "pass",
+                        "validation_stage": "post_generate",
+                        "required_outputs": [old_meta_ref],
+                        "failed_substeps": ["substep_run_gen_generate_001"],
+                        "substep_agent_run_ids": [
+                            "substep_run_gen_generate_001",
+                            "substep_run_gen_generate_002",
+                        ],
+                        "retry_decisions": [
+                            {
+                                "issue_severity": "major",
+                                "repair_strategy": "restart",
+                                "repair_target_agent_run_id": "substep_run_gen_generate_001",
+                                "new_agent_run_id": "substep_run_gen_generate_002",
+                                "repair_reason": "retry after failed generation",
+                            }
+                        ],
+                    },
+                )
 
 
     def _minimal_preflight_setup(self, repo_root: Path) -> None:

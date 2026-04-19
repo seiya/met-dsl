@@ -389,6 +389,8 @@ def _write_roots_for_launch(
         return [_with_trailing_slash(_normalize_rel_posix(f"{pipeline_ref.rstrip('/')}/execute"))]
     if st == "judge":
         return [_with_trailing_slash(_normalize_rel_posix(f"{pipeline_ref.rstrip('/')}/judge"))]
+    if st == "tune":
+        return [_with_trailing_slash(_normalize_rel_posix(f"{pipeline_ref.rstrip('/')}/tune"))]
     return []
 
 
@@ -1549,6 +1551,462 @@ def _build_artifact_hashes(
     return hashes
 
 
+def _run_write_baseline_path(
+    repo_root: Path,
+    orchestration_id: str,
+    *,
+    agent_run_id: str | None = None,
+) -> Path:
+    if agent_run_id is not None and agent_run_id.strip():
+        return (
+            _orchestration_root(repo_root, orchestration_id)
+            / "agents"
+            / agent_run_id.strip()
+            / "run_write_baseline.json"
+        )
+    return _orchestration_root(repo_root, orchestration_id) / "orchestration_run_write_baseline.json"
+
+
+def _should_ignore_runtime_snapshot_path(
+    rel_posix: str,
+    *,
+    orchestration_id: str,
+    agent_run_id: str,
+) -> bool:
+    token = _normalize_rel_posix(rel_posix)
+    if not token or token.startswith(".git/"):
+        return True
+    orch_root = _normalize_rel_posix(f"workspace/orchestrations/{orchestration_id}")
+    runtime_prefixes = (
+        f"{orch_root}/access_logs/",
+        f"{orch_root}/access_policies/",
+        f"{orch_root}/agents/",
+        f"{orch_root}/capabilities/",
+        f"{orch_root}/gates/",
+        f"{orch_root}/launches/",
+        f"{orch_root}/violations/",
+        f"{orch_root}/steps/",
+        f"{orch_root}/reservations/",
+    )
+    if any(token.startswith(prefix) for prefix in runtime_prefixes):
+        return True
+    runtime_files = {
+        f"{orch_root}/agent_graph.json",
+        f"{orch_root}/agent_runs.jsonl",
+        f"{orch_root}/orchestration_meta.json",
+        f"{orch_root}/orchestration_checkpoint.json",
+        f"{orch_root}/phase_state.json",
+        f"{orch_root}/phase_state_log.jsonl",
+        f"{orch_root}/preflight.json",
+        f"{orch_root}/orchestration_run_write_baseline.json",
+    }
+    return token in runtime_files
+
+
+def _snapshot_repo_files(
+    repo_root: Path,
+    *,
+    orchestration_id: str,
+    agent_run_id: str,
+) -> dict[str, str]:
+    snapshot: dict[str, str] = {}
+    for path in repo_root.rglob("*"):
+        if not path.is_file():
+            continue
+        rel = _normalize_rel_posix(path.relative_to(repo_root).as_posix())
+        if _should_ignore_runtime_snapshot_path(
+            rel,
+            orchestration_id=orchestration_id,
+            agent_run_id=agent_run_id,
+        ):
+            continue
+        snapshot[rel] = _compute_sha256(path)
+    return snapshot
+
+
+def _write_run_write_baseline(
+    repo_root: Path,
+    orchestration_id: str,
+    *,
+    agent_run_id: str | None = None,
+) -> dict[str, Any]:
+    run_id = agent_run_id.strip() if isinstance(agent_run_id, str) and agent_run_id.strip() else "orchestration"
+    payload = {
+        "orchestration_id": orchestration_id,
+        "agent_run_id": agent_run_id.strip() if isinstance(agent_run_id, str) and agent_run_id.strip() else None,
+        "created_at": _utc_now_iso(),
+        "files": _snapshot_repo_files(
+            repo_root,
+            orchestration_id=orchestration_id,
+            agent_run_id=run_id,
+        ),
+    }
+    _write_json(
+        _run_write_baseline_path(repo_root, orchestration_id, agent_run_id=agent_run_id),
+        payload,
+    )
+    return payload
+
+
+def _load_run_write_baseline(
+    repo_root: Path,
+    orchestration_id: str,
+    *,
+    agent_run_id: str | None = None,
+) -> dict[str, Any]:
+    path = _run_write_baseline_path(repo_root, orchestration_id, agent_run_id=agent_run_id)
+    if not path.exists():
+        who = agent_run_id.strip() if isinstance(agent_run_id, str) and agent_run_id.strip() else "orchestration"
+        raise ValueError(f"run write baseline missing for {who}: {path}")
+    payload = _read_json(path)
+    if not isinstance(payload, dict):
+        raise ValueError(f"run write baseline must be object: {path}")
+    files = payload.get("files")
+    if not isinstance(files, dict) or not all(isinstance(k, str) and isinstance(v, str) for k, v in files.items()):
+        raise ValueError(f"run write baseline files must be string map: {path}")
+    return payload
+
+
+def _actual_changed_paths_since_baseline(
+    repo_root: Path,
+    orchestration_id: str,
+    *,
+    agent_run_id: str | None = None,
+) -> list[str]:
+    baseline = _load_run_write_baseline(
+        repo_root,
+        orchestration_id,
+        agent_run_id=agent_run_id,
+    )
+    run_id = agent_run_id.strip() if isinstance(agent_run_id, str) and agent_run_id.strip() else "orchestration"
+    before = {
+        _normalize_rel_posix(str(path)): str(digest)
+        for path, digest in dict(baseline.get("files", {})).items()
+    }
+    after = _snapshot_repo_files(
+        repo_root,
+        orchestration_id=orchestration_id,
+        agent_run_id=run_id,
+    )
+    changed = {
+        rel
+        for rel in set(before) | set(after)
+        if before.get(rel) != after.get(rel)
+    }
+    return sorted(changed)
+
+
+def _gate_changed_paths_for_run(
+    repo_root: Path,
+    orchestration_id: str,
+    *,
+    agent_run_id: str,
+) -> list[str]:
+    gate_path = _gates_dir(repo_root, orchestration_id) / agent_run_id.strip() / "apply_patch_writes.json"
+    if not gate_path.exists():
+        return []
+    gate_doc = _read_json(gate_path)
+    if not isinstance(gate_doc, dict):
+        return []
+    if str(gate_doc.get("status", "")).strip().lower() != "pass":
+        return []
+    args_json = gate_doc.get("args_json")
+    if not isinstance(args_json, dict):
+        return []
+    changed_paths = args_json.get("changed_paths")
+    if not isinstance(changed_paths, list):
+        return []
+    return [
+        _normalize_rel_posix(item)
+        for item in changed_paths
+        if isinstance(item, str) and item.strip()
+    ]
+
+
+def _declared_output_refs(payload: dict[str, Any]) -> list[str]:
+    output_refs_obj = payload.get("output_refs")
+    if not isinstance(output_refs_obj, list):
+        return []
+    return [
+        _normalize_rel_posix(item)
+        for item in output_refs_obj
+        if isinstance(item, str) and item.strip()
+    ]
+
+
+def _orchestration_allowed_write_roots(orchestration_id: str) -> list[str]:
+    return [
+        _with_trailing_slash(_normalize_rel_posix(f"workspace/orchestrations/{orchestration_id}")),
+        _with_trailing_slash(_normalize_rel_posix(f"workspace/.pycache/{orchestration_id}")),
+    ]
+
+
+def _declared_child_managed_paths(
+    repo_root: Path,
+    orchestration_id: str,
+    *,
+    current_agent_run_id: str,
+) -> list[str]:
+    declared: set[str] = set()
+    records = _load_run_records(_orchestration_root(repo_root, orchestration_id))
+    for run_id, record in records.items():
+        if run_id == current_agent_run_id.strip():
+            continue
+        role = str(record.get("agent_role") or "").strip().lower()
+        if role not in {"step", "substep"}:
+            continue
+        declared.update(_declared_output_refs(record))
+        declared.update(
+            _gate_changed_paths_for_run(
+                repo_root,
+                orchestration_id,
+                agent_run_id=run_id,
+            )
+        )
+    return sorted(declared)
+
+
+def _managed_write_snapshot_path(
+    repo_root: Path,
+    orchestration_id: str,
+    *,
+    agent_run_id: str,
+) -> Path:
+    return (
+        _orchestration_root(repo_root, orchestration_id)
+        / "agents"
+        / agent_run_id.strip()
+        / "managed_write_snapshot.json"
+    )
+
+
+def _write_managed_write_snapshot(
+    repo_root: Path,
+    orchestration_id: str,
+    *,
+    agent_run_id: str,
+    declared_paths: Sequence[str],
+    actual_changed_paths: Sequence[str],
+) -> None:
+    normalized = sorted({_normalize_rel_posix(path) for path in declared_paths if str(path).strip()})
+    if not normalized:
+        return
+    actual_paths = sorted(
+        {
+            _normalize_rel_posix(path)
+            for path in actual_changed_paths
+            if str(path).strip()
+        }
+    )
+    tracked_paths = sorted(
+        {
+            path
+            for path in actual_paths
+            if any(_repo_path_under_prefix(path, decl) for decl in normalized)
+        }
+    )
+    if not tracked_paths:
+        return
+    files: dict[str, str] = {}
+    for path in tracked_paths:
+        abs_path = repo_root / path
+        if abs_path.exists():
+            files[path] = _compute_sha256(abs_path)
+        else:
+            files[path] = "__MISSING__"
+    _write_json(
+        _managed_write_snapshot_path(
+            repo_root,
+            orchestration_id,
+            agent_run_id=agent_run_id,
+        ),
+        {
+            "agent_run_id": agent_run_id.strip(),
+            "recorded_at": _utc_now_iso(),
+            "files": files,
+        },
+    )
+
+
+def _child_managed_paths_excludable_from_orchestration_diff(
+    repo_root: Path,
+    orchestration_id: str,
+    *,
+    current_agent_run_id: str,
+) -> set[str]:
+    baseline = _load_run_write_baseline(repo_root, orchestration_id)
+    baseline_files_obj = baseline.get("files")
+    baseline_files = (
+        {
+            _normalize_rel_posix(str(path)): str(digest)
+            for path, digest in baseline_files_obj.items()
+            if isinstance(path, str) and path.strip() and isinstance(digest, str)
+        }
+        if isinstance(baseline_files_obj, dict)
+        else {}
+    )
+    excludable: set[str] = set()
+    records = _load_run_records(_orchestration_root(repo_root, orchestration_id))
+    for run_id, record in records.items():
+        if run_id == current_agent_run_id.strip():
+            continue
+        role = str(record.get("agent_role") or "").strip().lower()
+        if role not in {"step", "substep"}:
+            continue
+        snap_path = _managed_write_snapshot_path(
+            repo_root,
+            orchestration_id,
+            agent_run_id=run_id,
+        )
+        if not snap_path.exists():
+            continue
+        snap_doc = _read_json(snap_path)
+        if not isinstance(snap_doc, dict):
+            continue
+        files_obj = snap_doc.get("files")
+        if not isinstance(files_obj, dict):
+            continue
+        for path, digest in files_obj.items():
+            if not isinstance(path, str) or not path.strip() or not isinstance(digest, str):
+                continue
+            rel = _normalize_rel_posix(path)
+            current_path = repo_root / rel
+            current_digest = "__MISSING__" if not current_path.exists() else _compute_sha256(current_path)
+            if current_digest != digest:
+                continue
+            if baseline_files.get(rel) == current_digest:
+                continue
+            excludable.add(rel)
+    return excludable
+
+
+def _write_unauthorized_write_violation(
+    repo_root: Path,
+    orchestration_id: str,
+    *,
+    agent_run_id: str,
+    actor_role: str,
+    actual_changed_paths: list[str],
+    unauthorized_paths: list[str],
+    output_refs: list[str],
+    gate_changed_paths: list[str],
+    write_roots: list[str],
+) -> Path:
+    out = _violations_dir(repo_root, orchestration_id) / f"{agent_run_id}.unauthorized_write_violation.json"
+    _write_json(
+        out,
+        {
+            "kind": "unauthorized_write_violation",
+            "orchestration_id": orchestration_id,
+            "agent_run_id": agent_run_id,
+            "actor_role": actor_role,
+            "detected_at": _utc_now_iso(),
+            "actual_changed_paths": actual_changed_paths,
+            "unauthorized_paths": unauthorized_paths,
+            "output_refs": output_refs,
+            "gate_changed_paths": gate_changed_paths,
+            "write_roots": write_roots,
+        },
+    )
+    return out
+
+
+def _validate_actual_write_paths(
+    repo_root: Path,
+    orchestration_id: str,
+    payload: dict[str, Any],
+) -> None:
+    role_obj = payload.get("agent_role")
+    agent_run_id_obj = payload.get("agent_run_id")
+    if not isinstance(role_obj, str) or not isinstance(agent_run_id_obj, str) or not agent_run_id_obj.strip():
+        return
+    actor_role = role_obj.strip().lower()
+    if actor_role not in {"orchestration", "step", "substep"}:
+        return
+    status_obj = payload.get("status")
+    if not isinstance(status_obj, str) or status_obj.strip().lower() not in TERMINAL_STATUSES:
+        return
+
+    run_id = agent_run_id_obj.strip()
+    baseline_agent_run_id = run_id if actor_role in {"step", "substep"} else None
+    actual_changed_paths = _actual_changed_paths_since_baseline(
+        repo_root,
+        orchestration_id,
+        agent_run_id=baseline_agent_run_id,
+    )
+    output_refs = _declared_output_refs(payload)
+    gate_changed_paths = _gate_changed_paths_for_run(
+        repo_root,
+        orchestration_id,
+        agent_run_id=run_id,
+    )
+
+    if actor_role == "orchestration":
+        child_excludable = _child_managed_paths_excludable_from_orchestration_diff(
+            repo_root,
+            orchestration_id,
+            current_agent_run_id=run_id,
+        )
+        actual_changed_paths = [
+            path
+            for path in actual_changed_paths
+            if path not in child_excludable
+        ]
+        write_roots = _orchestration_allowed_write_roots(orchestration_id)
+    else:
+        cap_path = _capabilities_dir(repo_root, orchestration_id) / f"{run_id}.json"
+        if not cap_path.exists():
+            raise ValueError(f"capability file not found for terminal write validation: {cap_path}")
+        cap_doc = _read_json(cap_path)
+        if not isinstance(cap_doc, dict):
+            raise ValueError(f"capability must be object for terminal write validation: {cap_path}")
+        roots_obj = cap_doc.get("write_roots")
+        write_roots = [str(item) for item in roots_obj] if isinstance(roots_obj, list) else []
+
+    unauthorized: list[str] = []
+    declared_paths = (
+        sorted(set(output_refs) | set(gate_changed_paths))
+        if actor_role == "orchestration"
+        else sorted(set(gate_changed_paths))
+    )
+    for path in actual_changed_paths:
+        if write_roots and not _path_under_any_write_root(path, write_roots):
+            unauthorized.append(path)
+            continue
+        if declared_paths and any(_repo_path_under_prefix(path, decl) for decl in declared_paths):
+            continue
+        if not declared_paths:
+            unauthorized.append(path)
+            continue
+        unauthorized.append(path)
+
+    if unauthorized:
+        violation_path = _write_unauthorized_write_violation(
+            repo_root,
+            orchestration_id,
+            agent_run_id=run_id,
+            actor_role=actor_role,
+            actual_changed_paths=actual_changed_paths,
+            unauthorized_paths=unauthorized,
+            output_refs=output_refs,
+            gate_changed_paths=gate_changed_paths,
+            write_roots=write_roots,
+        )
+        raise ValueError(
+            "terminal run has unauthorized write paths: "
+            + ", ".join(unauthorized)
+            + f" (violation: {violation_path})"
+        )
+    if actor_role in {"step", "substep"}:
+        _write_managed_write_snapshot(
+            repo_root,
+            orchestration_id,
+            agent_run_id=run_id,
+            declared_paths=declared_paths,
+            actual_changed_paths=actual_changed_paths,
+        )
+
+
 def _load_checkpoint(
     repo_root: Path,
     orchestration_id: str,
@@ -2215,6 +2673,17 @@ def _required_launch_prompt_lines(request_payload: dict[str, Any]) -> list[str]:
     return build_launch_prompt_text(request_payload).splitlines()
 
 
+def _required_launch_prompt_constraint_lines(request_payload: dict[str, Any]) -> list[str]:
+    step = request_payload.get("step")
+    if not isinstance(step, str) or not step.strip():
+        return []
+    return [
+        line
+        for line in render_launch_prompt_text(request_payload).splitlines()
+        if "書き込みは `apply_patch_writes` gate を通過した `guarded-apply-patch` 経由に限定し" in line
+    ]
+
+
 def _validate_launch_prompt_text(request_payload: dict[str, Any], prompt_text: str) -> None:
     required_markers = _required_launch_prompt_markers(request_payload)
     if not required_markers:
@@ -2231,6 +2700,13 @@ def _validate_launch_prompt_text(request_payload: dict[str, Any], prompt_text: s
         raise ValueError(
             "launch prompt text must preserve workflow-orchestration template field values: "
             + ", ".join(missing_lines)
+        )
+    required_constraint_lines = _required_launch_prompt_constraint_lines(request_payload)
+    missing_constraint_lines = [line for line in required_constraint_lines if line not in prompt_text]
+    if missing_constraint_lines:
+        raise ValueError(
+            "launch prompt text must preserve workflow-orchestration shell-write constraints: "
+            + ", ".join(missing_constraint_lines)
         )
 
 
@@ -2801,19 +3277,31 @@ def _validate_terminal_run_payload(
 ) -> None:
     role = payload.get("agent_role")
     status = payload.get("status")
-    if not isinstance(role, str) or role not in {"step", "substep"}:
+    if not isinstance(role, str):
         return
+    role_token = role.strip().lower()
+    if role_token not in {"orchestration", "step", "substep"}:
+        return
+    _validate_actual_write_paths(repo_root, orchestration_id, payload)
     if not isinstance(status, str) or status.strip().lower() != "pass":
         return
 
     output_refs = payload.get("output_refs")
+    if role_token in {"step", "substep"}:
+        if not isinstance(output_refs, list) or not output_refs:
+            raise ValueError("pass status for step/substep requires non-empty output_refs")
+        for idx, item in enumerate(output_refs):
+            if not isinstance(item, str) or not item.strip():
+                raise ValueError(f"output_refs[{idx}] must be non-empty string")
+        _validate_pass_output_refs_against_launch(repo_root, payload)
+        _validate_apply_patch_gate_coverage(repo_root, orchestration_id, payload)
+        return
+
     if not isinstance(output_refs, list) or not output_refs:
-        raise ValueError("pass status for step/substep requires non-empty output_refs")
+        return
     for idx, item in enumerate(output_refs):
         if not isinstance(item, str) or not item.strip():
             raise ValueError(f"output_refs[{idx}] must be non-empty string")
-
-    _validate_pass_output_refs_against_launch(repo_root, payload)
     _validate_apply_patch_gate_coverage(repo_root, orchestration_id, payload)
 
 
@@ -2827,7 +3315,7 @@ def _validate_apply_patch_gate_coverage(
     if not isinstance(role, str):
         return
     actor_role = role.strip().lower()
-    if actor_role not in {"step", "substep"}:
+    if actor_role not in {"orchestration", "step", "substep"}:
         return
 
     agent_run_id = payload.get("agent_run_id")
@@ -2847,7 +3335,7 @@ def _validate_apply_patch_gate_coverage(
     gate_path = _gates_dir(repo_root, orchestration_id) / run_id / "apply_patch_writes.json"
     if not gate_path.exists():
         raise ValueError(
-            "pass status for step/substep requires apply_patch_writes gate evidence: "
+            f"pass status for {actor_role} requires apply_patch_writes gate evidence: "
             f"{gate_path}"
         )
     gate_doc = _read_json(gate_path)
@@ -2993,8 +3481,21 @@ def _validate_orchestration_completion_for_pass(
 
 
 _STEP_META_REQUIRED_KEYS: dict[str, tuple[str, ...]] = {
-    "generate": ("attempt_count", "verification_status", "last_fail_reason", "debug_mode", "context_isolated"),
-    "plan": ("attempt_count", "verification_status", "context_isolated"),
+    "generate": (
+        "attempt_count",
+        "verification_status",
+        "last_fail_reason",
+        "debug_mode",
+        "context_isolated",
+        "lint_command_ref",
+    ),
+    "plan": (
+        "attempt_count",
+        "verification_status",
+        "last_fail_reason",
+        "debug_mode",
+        "context_isolated",
+    ),
 }
 _STEP_META_FILENAME: dict[str, str] = {
     "generate": "generate_meta.json",
@@ -3007,6 +3508,174 @@ STEP_REQUIRED_VALIDATION_STAGES: dict[str, frozenset[str]] = {
     "execute": frozenset({"post_execute", "pre_judge", "full"}),
     "judge": frozenset({"pre_judge", "full"}),
 }
+
+_RETRY_DECISION_REQUIRED_KEYS: tuple[str, ...] = (
+    "issue_severity",
+    "repair_strategy",
+    "repair_target_agent_run_id",
+    "new_agent_run_id",
+    "repair_reason",
+)
+
+
+def _validate_lint_command_ref(meta_data: dict[str, Any], *, meta_filename: str, meta_ref: str) -> None:
+    lint_command_ref = meta_data.get("lint_command_ref")
+    if meta_filename != "generate_meta.json":
+        return
+    if not isinstance(lint_command_ref, dict):
+        raise ValueError(f"{meta_filename} lint_command_ref must be object: {meta_ref}")
+    run_linter = lint_command_ref.get("run_linter")
+    if not isinstance(run_linter, list) or not run_linter:
+        raise ValueError(f"{meta_filename} lint_command_ref.run_linter must be non-empty list: {meta_ref}")
+    for idx, item in enumerate(run_linter):
+        if not isinstance(item, dict):
+            raise ValueError(
+                f"{meta_filename} lint_command_ref.run_linter[{idx}] must be object: {meta_ref}"
+            )
+        for key in ("command_id", "command_log_ref", "preset"):
+            value = item.get(key)
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(
+                    f"{meta_filename} lint_command_ref.run_linter[{idx}].{key} must be non-empty string: {meta_ref}"
+                )
+
+
+def _validate_step_meta_payload(meta_data: dict[str, Any], *, step_token: str, meta_ref: str) -> None:
+    meta_filename = _STEP_META_FILENAME[step_token]
+    required_meta_keys = _STEP_META_REQUIRED_KEYS[step_token]
+    missing_keys = [k for k in required_meta_keys if k not in meta_data]
+    if missing_keys:
+        raise ValueError(
+            f"{meta_filename} missing required keys: {missing_keys} (ref={meta_ref})"
+        )
+    if not isinstance(meta_data.get("context_isolated"), bool):
+        raise ValueError(f"{meta_filename} context_isolated must be boolean: {meta_ref}")
+    if not isinstance(meta_data.get("debug_mode"), bool):
+        raise ValueError(f"{meta_filename} debug_mode must be boolean: {meta_ref}")
+    if meta_data.get("context_isolated") is False:
+        constraint_reason = meta_data.get("constraint_reason")
+        if not isinstance(constraint_reason, str) or not constraint_reason.strip():
+            raise ValueError(
+                f"{meta_filename} requires non-empty constraint_reason when context_isolated=false: {meta_ref}"
+            )
+    _validate_lint_command_ref(meta_data, meta_filename=meta_filename, meta_ref=meta_ref)
+
+
+def _effective_pass_substep_run_ids(
+    payload: dict[str, Any],
+    *,
+    run_records: dict[str, dict[str, Any]],
+    node_key: str,
+    step_token: str,
+) -> tuple[list[str], dict[str, set[str]]]:
+    substep_run_ids = payload.get("substep_agent_run_ids")
+    if not isinstance(substep_run_ids, list) or not substep_run_ids:
+        raise ValueError(f"pass step_result for {step_token} requires non-empty substep_agent_run_ids")
+
+    listed_run_ids: list[str] = []
+    listed_run_id_set: set[str] = set()
+    for idx, substep_run_id in enumerate(substep_run_ids):
+        if not isinstance(substep_run_id, str) or not substep_run_id.strip():
+            raise ValueError(f"substep_agent_run_ids[{idx}] must be non-empty string")
+        token = substep_run_id.strip()
+        if token in listed_run_id_set:
+            raise ValueError(f"substep_agent_run_ids must not contain duplicates: {token}")
+        listed_run_ids.append(token)
+        listed_run_id_set.add(token)
+
+        substep_record = run_records.get(token)
+        if not isinstance(substep_record, dict):
+            raise ValueError(f"missing substep run record: {token}")
+        role = str(substep_record.get("agent_role") or "").strip().lower()
+        if role != "substep":
+            raise ValueError(f"listed run must be substep role: {token}")
+        record_node_key = str(substep_record.get("node_key") or "").strip()
+        if record_node_key != node_key:
+            raise ValueError(f"listed substep run node_key mismatch: {token}")
+        record_step = str(substep_record.get("step") or "").strip().lower()
+        if record_step != step_token:
+            raise ValueError(f"listed substep run step mismatch: {token}")
+
+    failed_substeps = payload.get("failed_substeps", [])
+    if not isinstance(failed_substeps, list):
+        raise ValueError("step_result.failed_substeps must be list")
+    explicit_failed_run_ids: set[str] = set()
+    for idx, failed_run_id in enumerate(failed_substeps):
+        if not isinstance(failed_run_id, str) or not failed_run_id.strip():
+            raise ValueError(f"failed_substeps[{idx}] must be non-empty string")
+        token = failed_run_id.strip()
+        if token not in listed_run_id_set:
+            raise ValueError(f"failed_substeps[{idx}] must be listed in substep_agent_run_ids: {token}")
+        failed_status = str(run_records[token].get("status") or "").strip().lower()
+        if failed_status == "pass":
+            raise ValueError(f"failed_substeps[{idx}] must reference actual non-pass run: {token}")
+        explicit_failed_run_ids.add(token)
+
+    retry_decisions = payload.get("retry_decisions", [])
+    if retry_decisions is None:
+        retry_decisions = []
+    if not isinstance(retry_decisions, list):
+        raise ValueError("step_result.retry_decisions must be list when provided")
+    replaced_run_ids: set[str] = set()
+    adopted_run_ids: set[str] = set()
+    for idx, item in enumerate(retry_decisions):
+        if not isinstance(item, dict):
+            raise ValueError(f"retry_decisions[{idx}] must be object")
+        missing_keys = [
+            key for key in _RETRY_DECISION_REQUIRED_KEYS
+            if not isinstance(item.get(key), str) or not str(item.get(key)).strip()
+        ]
+        if missing_keys:
+            raise ValueError(
+                f"retry_decisions[{idx}] missing required string keys: {missing_keys}"
+            )
+        repair_target = str(item["repair_target_agent_run_id"]).strip()
+        new_run_id = str(item["new_agent_run_id"]).strip()
+        if repair_target not in listed_run_id_set:
+            raise ValueError(
+                f"retry_decisions[{idx}].repair_target_agent_run_id must be listed in substep_agent_run_ids: {repair_target}"
+            )
+        if new_run_id not in listed_run_id_set:
+            raise ValueError(
+                f"retry_decisions[{idx}].new_agent_run_id must be listed in substep_agent_run_ids: {new_run_id}"
+            )
+        if repair_target == new_run_id:
+            raise ValueError(f"retry_decisions[{idx}] must replace a different run_id")
+        if repair_target in replaced_run_ids:
+            raise ValueError(f"retry_decisions must not replace the same run twice: {repair_target}")
+        repair_target_status = str(run_records[repair_target].get("status") or "").strip().lower()
+        if repair_target_status == "pass":
+            raise ValueError(
+                f"retry_decisions[{idx}].repair_target_agent_run_id must reference actual non-pass run: {repair_target}"
+            )
+        replaced_run_ids.add(repair_target)
+        adopted_run_ids.add(new_run_id)
+
+    effective_run_ids: list[str] = []
+    for run_id in listed_run_ids:
+        if run_id in replaced_run_ids or run_id in explicit_failed_run_ids:
+            continue
+        substep_record = run_records[run_id]
+        substep_status = str(substep_record.get("status") or "").strip().lower()
+        if substep_status != "pass":
+            raise ValueError(
+                f"non-pass substep {run_id} must be excluded by failed_substeps or retry_decisions before step_result can pass"
+            )
+        effective_run_ids.append(run_id)
+
+    for run_id in adopted_run_ids:
+        substep_status = str(run_records[run_id].get("status") or "").strip().lower()
+        if substep_status != "pass":
+            raise ValueError(f"retry_decisions new_agent_run_id must be pass for step_result pass: {run_id}")
+    if not effective_run_ids:
+        raise ValueError(f"pass step_result for {step_token} requires at least one effective pass substep")
+
+    return effective_run_ids, {
+        "listed_run_ids": listed_run_id_set,
+        "explicit_failed_run_ids": explicit_failed_run_ids,
+        "replaced_run_ids": replaced_run_ids,
+        "adopted_run_ids": adopted_run_ids,
+    }
 
 
 def _validate_step_result_payload(
@@ -3037,26 +3706,22 @@ def _validate_step_result_payload(
         return
     if status_token != "pass":
         return
-    substep_run_ids = payload.get("substep_agent_run_ids")
-    if not isinstance(substep_run_ids, list) or not substep_run_ids:
-        raise ValueError(f"pass step_result for {step_token} requires non-empty substep_agent_run_ids")
 
     run_records = _load_run_records(_orchestration_root(repo_root, orchestration_id))
+    effective_run_ids, _ = _effective_pass_substep_run_ids(
+        payload,
+        run_records=run_records,
+        node_key=node_key,
+        step_token=step_token,
+    )
     required_outputs = payload.get("required_outputs")
     if not isinstance(required_outputs, list):
         raise ValueError("step_result.required_outputs must be list")
     declared_outputs = {item.strip() for item in required_outputs if isinstance(item, str) and item.strip()}
 
     substep_outputs: set[str] = set()
-    for idx, substep_run_id in enumerate(substep_run_ids):
-        if not isinstance(substep_run_id, str) or not substep_run_id.strip():
-            raise ValueError(f"substep_agent_run_ids[{idx}] must be non-empty string")
-        substep_record = run_records.get(substep_run_id.strip())
-        if not isinstance(substep_record, dict):
-            raise ValueError(f"missing substep run record: {substep_run_id}")
-        substep_status = substep_record.get("status")
-        if not isinstance(substep_status, str) or substep_status.strip().lower() != "pass":
-            raise ValueError(f"substep {substep_run_id} must be pass before step_result can pass")
+    for substep_run_id in effective_run_ids:
+        substep_record = run_records[substep_run_id]
         output_refs = substep_record.get("output_refs")
         if not isinstance(output_refs, list) or not output_refs:
             raise ValueError(f"substep {substep_run_id} must publish non-empty output_refs")
@@ -3067,15 +3732,19 @@ def _validate_step_result_payload(
     # meta ファイル検証（plan/generate の pass 時のみ）
     if step_token in _STEP_META_REQUIRED_KEYS:
         meta_filename = _STEP_META_FILENAME[step_token]
-        required_meta_keys = _STEP_META_REQUIRED_KEYS[step_token]
-        meta_ref = next(
-            (ref for ref in substep_outputs if ref.endswith(meta_filename)),
-            None,
-        )
-        if meta_ref is None:
+        meta_refs = [ref for ref in declared_outputs if ref.endswith(meta_filename)]
+        if not meta_refs:
             raise ValueError(
-                f"pass step_result for {step_token} requires a substep output_ref ending in "
-                f"{meta_filename}"
+                f"pass step_result for {step_token} requires required_outputs to include final {meta_filename}"
+            )
+        if len(meta_refs) != 1:
+            raise ValueError(
+                f"pass step_result for {step_token} requires exactly one final {meta_filename} in required_outputs"
+            )
+        meta_ref = meta_refs[0]
+        if meta_ref not in substep_outputs:
+            raise ValueError(
+                f"step_result.required_outputs must reference final {meta_filename} from effective substep output_refs: {meta_ref}"
             )
         meta_path = repo_root / meta_ref
         if not meta_path.exists():
@@ -3090,11 +3759,11 @@ def _validate_step_result_payload(
             ) from exc
         if not isinstance(meta_data, dict):
             raise ValueError(f"{meta_filename} must be a JSON object: {meta_ref}")
-        missing_keys = [k for k in required_meta_keys if k not in meta_data]
-        if missing_keys:
-            raise ValueError(
-                f"{meta_filename} missing required keys: {missing_keys} (ref={meta_ref})"
-            )
+        _validate_step_meta_payload(
+            meta_data,
+            step_token=step_token,
+            meta_ref=meta_ref,
+        )
 
     missing_outputs = sorted(ref for ref in declared_outputs if ref not in substep_outputs)
     if missing_outputs:
@@ -3393,6 +4062,8 @@ def init_orchestration(
     if not runs_path.exists():
         runs_path.write_text("", encoding="utf-8")
 
+    _write_run_write_baseline(repo_root, orchestration_id)
+
     return meta
 
 
@@ -3638,6 +4309,11 @@ def record_launch(
             event="child_launched",
             agent_run_id=child_agent_run_id,
         )
+    _write_run_write_baseline(
+        repo_root,
+        orchestration_id,
+        agent_run_id=child_agent_run_id,
+    )
 
     return out_refs
 

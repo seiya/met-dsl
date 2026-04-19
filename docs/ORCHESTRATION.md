@@ -30,6 +30,9 @@
 - `workflow` 実行の代替として、複数 phase の進行と artifact generation を一括自動化する `script`（例: `python` / `bash`）を新規生成または実行してはならない。
 - `orchestration` の責務を `script` へ委譲してはならない。`Build` / `Execute` / `Judge` / `Promote` の各 `step` は必ず `spawn_agent` で起動した独立 `step agent` で実行しなければならない。
 - `Plan` / `Generate` / `Tune` のように `substep` を持つ各 phase は、`orchestration agent` が `generate` と `verify` などの各 `substep agent` を `spawn_agent` で直接起動しなければならない。
+- child `agent` に許可する phase artifact の変更は、capability token が許可した `write_root` 配下に限定しなければならない。`plan_ref` / `pipeline_ref` 配下の変更は、`guarded-apply-patch` または対応 gate を通過した canonical path に限定し、許可 root 外の変更を禁止する。
+- `step agent` / `substep agent` は phase artifact を変更する場合、`apply_patch_writes` gate を通過した `guarded-apply-patch` を canonical invocation としなければならない。通常 `apply_patch` の直接実行、shell redirection、`tee`、`sed -i`、`perl -0pi`、`python` / `sh` / `bash` による file write など、gate を経由しない file write を禁止する。
+- shell による file write は、対象 path が phase artifact かどうかを問わず、child `agent` 起動要求で明示した canonical invocation に含まれない限り禁止しなければならない。shell file write を事前 gate または `record-agent-run` が検出した場合、当該 gate または `record-agent-run` は当該 `agent_run` を reject しなければならない。reject 後は `orchestration agent` が `orchestration_meta.status=fail_closed` を記録して停止しなければならない。
 - `step agent` と `substep agent` は、同一 `LLM` コンテキストを共有してはならない。各 `agent_run_id` は固有の `context_id` を持ち、`context_isolated=true` を必須記録とする。
 - `orchestration agent` は `substep` を持つ phase で必要な `substep` 群を起動し、完了判定を行った後に `step_result.json` を確定しなければならない。
 - `orchestration agent` は `deps.yaml` と `spec_catalog.yaml` から再構成した依存関係と依存充足条件に基づいて `step agent` または `substep agent` の起動可否を判定しなければならない。
@@ -51,6 +54,7 @@
 - `workflow` の正当性確認、検証、疎通確認、暫定回避を目的としても、親 `agent` が子 `agent` 必須 phase の本体処理を代行してはならない。`leaf node` を先にローカル実装してから正規経路へ戻す運用を禁止する。
 - `orchestration agent` は、子 `agent` の返却結果を評価して `issue_severity`（`minor` / `major` / `critical`）を判定しなければならない。
 - `orchestration agent` は、`issue_severity` と契約逸脱範囲に基づいて再投入要否を判定し、再投入が必要な場合は `repair_strategy`（`reuse` / `restart`）を選択しなければならない。
+- `orchestration agent` は、phase artifact の repair を自身で直接実施してはならない。repair が必要な場合は、対象 `step` または `substep` の child `agent` へ再委譲しなければならない。
 - `repair_strategy=reuse` は、対象 `step` または `substep` の input contract と expected output を変更せず、局所修正で収束可能な場合にのみ選択してよい。
 - `repair_strategy=restart` は、契約再解釈、設計再構成、広範囲再生成のいずれかが必要な場合に選択しなければならない。
 - 再投入時は `repair_strategy` を問わず、新規 `agent_run_id` と新規 `context_id` を発行しなければならない。
@@ -64,6 +68,7 @@
 - `orchestration agent` は、子 `agent` 起動要求に要求定義と判定規則の canonical source が `docs/` と `spec/` と当該試行 artifact であることを明示しなければならない。`tools/` 配下の実装、検証 `script`、test code、validator code を読んで rule を抽出する指示または黙示を禁止する。
 - 子 `agent` は validator internal service を実行する場合、`python3 tools/codex_orchestration_runtime.py run-gate --gate <gate_name> --agent-run-id <agent_run_id> --capability-token <capability_token> --args-json '<json>'` を canonical invocation とし、validator script の直接実行を禁止する。
 - 子 `agent` が `apply_patch` を実行する場合、`python3 tools/codex_orchestration_runtime.py guarded-apply-patch --repo-root <repo_root> --orchestration-id <orchestration_id> --actor-role <step|substep> --agent-run-id <agent_run_id> --paths-json '["..."]' --patch-text '<patch_text>' --capability-token <capability_token>` を canonical invocation とし、`run-gate --gate apply_patch_writes` と通常 `apply_patch` の分離実行を禁止する。
+- `record-agent-run` は、child `agent` が申告した `output_refs` と `apply_patch_writes` gate 記録に加えて、baseline との差分で実変更 path を検査しなければならない。実変更 path が capability token の `write_root` または gate 許可 path に含まれない場合、`unauthorized write` として reject しなければならない。reject 発生時は `orchestration agent` が `orchestration_meta.status=fail_closed` を記録して停止しなければならない。
 - `orchestration agent` は、子 `agent` 起動要求本文を `skills/workflow-orchestration/references/launch_prompts.md` の対応テンプレートから生成しなければならない。`step agent` には `step agent` 起動要求テンプレート、`substep agent` には `substep agent` 起動要求テンプレートを適用し、テンプレートを使わない任意の自由形式 prompt を禁止する。
 - 起動要求本文のテンプレート必須項目は、省略、改名、意味変更をしてはならない。追加記述は、テンプレート必須項目と矛盾せず、対象 `step` または `substep` の契約具体化に必要な情報に限定しなければならない。
 - `plan_ref` と `pipeline_ref` と `dependency_ref` は、子 `agent` 起動前に canonical path を確定しなければならない。`<agent-determined-...>` などの placeholder を起動要求へ記録してはならない。
@@ -120,27 +125,30 @@
 17. `orchestration agent` は子 `agent` の返却結果を評価し、`issue_severity` と再投入要否を確定する。再投入が必要な場合は `repair_strategy` と `repair_target_agent_run_id` と `repair_reason` を確定する。
 18. 再投入が必要で `repair_strategy=reuse` の場合、`orchestration agent` は同一 `agent_session_id` の継続修正を許可してよい。この場合も新規 `agent_run_id` を発行し、`relation_type` を `reuse` として `record-launch` 記録を追加しなければならない。
 19. 再投入が必要で `repair_strategy=restart` の場合、`orchestration agent` は新規 `agent_session_id` を持つ `substep agent` を再起動し、`relation_type` を `restart` として `record-launch` 記録を追加しなければならない。
-20. `orchestration agent` は `substep` を持つ phase で全 `substep` の必須 artifact を検証し、`workspace/orchestrations/<orchestration_id>/steps/<node_key_safe>/<step>/<agent_run_id>/step_result.json` へ `step_result.json` を出力する。この場合の `agent_run_id` は `orchestration agent_run_id` とする。`step_result.json` の `substep_agent_run_ids` は、当該 `step` で起動して `agent_runs.jsonl` に記録された **全** `substep` の `agent_run_id` を欠落なく列挙しなければならない。`pass` 以外で終端した `substep`（`fail` / `cancel` 等）を省略してはならない。`status=pass` の `step_result` においては、列挙した各 `substep` がすべて `pass` であり `required_outputs` が全 `substep` の `output_refs` で被覆されることは別条件として検査される。
-21. `step_result.json` は、再投入を実施した場合に `retry_decisions` 配列を保持し、各要素へ `issue_severity` と `repair_strategy` と `repair_target_agent_run_id` と `new_agent_run_id` と `repair_reason` を記録しなければならない。
-22. `step agent` は標準 `substep` を持たない phase で自身の artifact を検証し、`workspace/orchestrations/<orchestration_id>/steps/<node_key_safe>/<step>/<agent_run_id>/step_result.json` へ `step_result.json` を出力する。
-23. `orchestration agent` は `step_result.json` を受け取り、次 `step` の起動可否を判定する。
-24. `node` 実行は `deps.yaml` と `spec_catalog.yaml` から再構成した依存順で逐次実行する。依存関係を持つ `node` は依存 `node` の完了前に起動してはならない。独立 `node` の並列実行は、workflow 入力または orchestration 指示で明示的に許可された場合にのみ開始してよい。明示指示がない場合、`orchestration agent` は独立 `node` を逐次起動しなければならない。
-25. `step agent` または `substep agent` が `fail` / `timeout` / `cancel` の場合、当該 `node` の当該 `step` を `fail` とし、下流 `step` 起動を禁止する。
-26. `orchestration agent` は各 `agent` 実行イベントを `workspace/orchestrations/<orchestration_id>/agent_runs.jsonl` へ追記しなければならない。
-27. `orchestration agent` は親子関係を `workspace/orchestrations/<orchestration_id>/agent_graph.json` へ保存し、`parent_agent_run_id` と `child_agent_run_id` と `relation_type` を必須記録とする。
-28. `Promote` 以外の `agent` は `workspace/` 配下以外へ書き込んではならない。
-29. `workflow` 実行時に `step` / `substep` の実処理を `script` で代行した場合は `fail` とし、当該試行を破棄しなければならない。
-30. 再投入時は新規 `agent_run_id` を発行し、既存 `launch` 証跡や `agent_runs` 行を上書きしてはならない。`agent_session_id` の扱いは `repair_strategy` 規則に従う。
-31. `preflight.json` の手動編集または後編集で `status` と `can_launch_*` を変更してはならない。変更が必要な場合は `preflight` を再実行して新しい検査結果を記録しなければならない。
-32. 子 `agent` 起動直前の live probe が `fail` の場合、`record-launch` を実行してはならない。`orchestration_meta.status=fail` を記録して停止しなければならない。`record-agent-run`（`step` / `substep`）と `write-step-result` は `preflight.json` の整合確認を満たす場合のみ実行してよい。
-33. `record-launch` が実行する live probe は、`CODEX_PREFLIGHT_TTL_SECONDS` で設定した TTL（デフォルト 30 分）以内に成功済みのプローブが存在する場合はスキップされる。この最適化は `CODEX_ORCHESTRATION_ENFORCE_LIVE_PREFLIGHT=1` が明示設定されている場合は無効化され、常に live probe が実行される（後方互換）。
-34. `preflight.json` の `probed_at` フィールドは live probe 成功時に自動更新される。`status` / `can_launch_*` を含むその他フィールドの変更は引き続き禁止する。
-35. 子 `agent` 必須 phase で契約に反する近道へ逸脱しそうな場合、`orchestration agent` は当該 phase が子 `agent` 起動必須であることを明示し、正規の起動手順へ復帰しなければならない。逸脱を理由とするローカル継続実装を禁止する。
-36. `write-step-result` が `status=pass` で完了した後、`orchestration_checkpoint.json` が `tools/codex_orchestration_runtime.py` により自動更新される。`orchestration_checkpoint.json` の手動編集を禁止する。
-37. `resume_enabled=true` の orchestration において、`orchestration agent` は `check-step-completed` を各 `step` 起動前に実行し、`completed=true` かつ `integrity=ok` の場合のみ当該 `step` のスキップを許可する。
-38. チェックポイントによりスキップした `step` は `agent_runs.jsonl` に `agent_role=skipped_by_checkpoint` として記録しなければならない。
-39. `resume_enabled=false` の orchestration（未設定を含む）では `orchestration_checkpoint.json` を信頼して `step` をスキップしてはならない。`docs/workflow/WORKFLOW_CORE.md` の該当ハードニング規範における「明示的な指定」は `orchestration_meta.json` の `resume_enabled=true` のみが満たす。
-40. `write-step-result` の `status=pass` では、`Generate` / `Build` / `Execute` / `Judge` の `step_result.json` に `validation_stage` を必須記録しなければならない。許容値は `Generate: post_generate|full`、`Build: post_build|full`、`Execute: post_execute|pre_judge|full`、`Judge: pre_judge|full` とする。`Plan` と `Tune` は `validation_stage` を必須にしない。
+20. `orchestration agent` は `substep` を持つ phase で全 `substep` の必須 artifact を検証し、`workspace/orchestrations/<orchestration_id>/steps/<node_key_safe>/<step>/<agent_run_id>/step_result.json` へ `step_result.json` を出力する。この場合の `agent_run_id` は `orchestration agent_run_id` とする。`step_result.json` の `substep_agent_run_ids` は、当該 `step` で起動して `agent_runs.jsonl` に記録された **全** `substep` の `agent_run_id` を欠落なく列挙しなければならない。`pass` 以外で終端した `substep`（`fail` / `cancel` 等）を省略してはならない。
+21. `step_result.json` は、再投入を実施した場合に `retry_decisions` 配列を保持し、各要素へ `issue_severity` と `repair_strategy` と `repair_target_agent_run_id` と `new_agent_run_id` と `repair_reason` を記録しなければならない。`retry_decisions` は retry 履歴の canonical source とし、`repair_target_agent_run_id` から `new_agent_run_id` への置換関係を一意に復元できなければならない。`status=pass` の `write-step-result` に記録する `retry_decisions` では、各 `new_agent_run_id` は `effective pass substep` 集合へ最終採用された `pass` run に限らなければならない。後続 `retry_decisions.repair_target_agent_run_id` で再度置換される中間 run を `new_agent_run_id` として残してはならない。
+22. `substep` を持つ phase の `step_result.json` における `status=pass` 判定は、`substep_agent_run_ids` 全件ではなく `retry_decisions` を適用した最終採用集合、すなわち `effective pass substep` 集合に対して行わなければならない。`effective pass substep` 集合は、`substep_agent_run_ids` に含まれる `agent_run_id` のうち、後続 `retry_decisions.repair_target_agent_run_id` として置換されていない run と、置換先 `new_agent_run_id` を反映した最終 run の集合と定義する。`status=pass` の `step_result.json` では、`retry_decisions` は `effective pass substep` 集合へ残る最終 run だけを保持しなければならない。中間 retry run を経由した連鎖置換を `status=pass` の `step_result.json` に残してはならない。
+23. `status=pass` の `step_result` では、`effective pass substep` 集合に含まれる各 run が `pass` で終端していなければならない。retry 前の failed run は `substep_agent_run_ids` と `retry_decisions` に履歴として保持してよいが、`status=pass` 判定対象へ含めてはならない。
+24. `status=pass` の `step_result` における `required_outputs` 被覆判定は、`effective pass substep` 集合の `output_refs` のみを対象に行わなければならない。retry 前の failed run または superseded run の `output_refs` に依存して `required_outputs` を満たしてはならない。
+25. `step agent` は標準 `substep` を持たない phase で自身の artifact を検証し、`workspace/orchestrations/<orchestration_id>/steps/<node_key_safe>/<step>/<agent_run_id>/step_result.json` へ `step_result.json` を出力する。
+26. `orchestration agent` は `step_result.json` を受け取り、次 `step` の起動可否を判定する。
+27. `node` 実行は `deps.yaml` と `spec_catalog.yaml` から再構成した依存順で逐次実行する。依存関係を持つ `node` は依存 `node` の完了前に起動してはならない。独立 `node` の並列実行は、workflow 入力または orchestration 指示で明示的に許可された場合にのみ開始してよい。明示指示がない場合、`orchestration agent` は独立 `node` を逐次起動しなければならない。
+28. `step agent` または `substep agent` が `fail` / `timeout` / `cancel` の場合、当該 `node` の当該 `step` を `fail` とし、下流 `step` 起動を禁止する。
+29. `orchestration agent` は各 `agent` 実行イベントを `workspace/orchestrations/<orchestration_id>/agent_runs.jsonl` へ追記しなければならない。
+30. `orchestration agent` は親子関係を `workspace/orchestrations/<orchestration_id>/agent_graph.json` へ保存し、`parent_agent_run_id` と `child_agent_run_id` と `relation_type` を必須記録とする。
+31. `Promote` 以外の `agent` は `workspace/` 配下以外へ書き込んではならない。
+32. `workflow` 実行時に `step` / `substep` の実処理を `script` で代行した場合は `fail` とし、当該試行を破棄しなければならない。
+33. 再投入時は新規 `agent_run_id` を発行し、既存 `launch` 証跡や `agent_runs` 行を上書きしてはならない。`agent_session_id` の扱いは `repair_strategy` 規則に従う。
+34. `preflight.json` の手動編集または後編集で `status` と `can_launch_*` を変更してはならない。変更が必要な場合は `preflight` を再実行して新しい検査結果を記録しなければならない。
+35. 子 `agent` 起動直前の live probe が `fail` の場合、`record-launch` を実行してはならない。`orchestration_meta.status=fail` を記録して停止しなければならない。`record-agent-run`（`step` / `substep`）と `write-step-result` は `preflight.json` の整合確認を満たす場合のみ実行してよい。
+36. `record-launch` が実行する live probe は、`CODEX_PREFLIGHT_TTL_SECONDS` で設定した TTL（デフォルト 30 分）以内に成功済みのプローブが存在する場合はスキップされる。この最適化は `CODEX_ORCHESTRATION_ENFORCE_LIVE_PREFLIGHT=1` が明示設定されている場合は無効化され、常に live probe が実行される（後方互換）。
+37. `preflight.json` の `probed_at` フィールドは live probe 成功時に自動更新される。`status` / `can_launch_*` を含むその他フィールドの変更は引き続き禁止する。
+38. 子 `agent` 必須 phase で契約に反する近道へ逸脱しそうな場合、`orchestration agent` は当該 phase が子 `agent` 起動必須であることを明示し、正規の起動手順へ復帰しなければならない。逸脱を理由とするローカル継続実装を禁止する。
+39. `write-step-result` が `status=pass` で完了した後、`orchestration_checkpoint.json` が `tools/codex_orchestration_runtime.py` により自動更新される。`orchestration_checkpoint.json` の手動編集を禁止する。
+40. `resume_enabled=true` の orchestration において、`orchestration agent` は `check-step-completed` を各 `step` 起動前に実行し、`completed=true` かつ `integrity=ok` の場合のみ当該 `step` のスキップを許可する。
+41. チェックポイントによりスキップした `step` は `agent_runs.jsonl` に `agent_role=skipped_by_checkpoint` として記録しなければならない。
+42. `resume_enabled=false` の orchestration（未設定を含む）では `orchestration_checkpoint.json` を信頼して `step` をスキップしてはならない。`docs/workflow/WORKFLOW_CORE.md` の該当ハードニング規範における「明示的な指定」は `orchestration_meta.json` の `resume_enabled=true` のみが満たす。
+43. `write-step-result` の `status=pass` では、`Generate` / `Build` / `Execute` / `Judge` の `step_result.json` に `validation_stage` を必須記録しなければならない。許容値は `Generate: post_generate|full`、`Build: post_build|full`、`Execute: post_execute|pre_judge|full`、`Judge: pre_judge|full` とする。`Plan` と `Tune` は `validation_stage` を必須にしない。
 
 ## 判定基準
 - `workflow` ごとに `orchestration_id` が発行され、`orchestration_meta.json` が存在する。
@@ -160,6 +168,10 @@
 - `step_result.json` の `executor_agent_run_id` が当該ディレクトリ名と一致し、`substep_agent_run_ids` が親子関係と整合する。標準 `substep` を持たない phase では `substep_agent_run_ids=[]` を許可する。
 - `substep` を持つ `step` では、`agent_runs.jsonl` に記録された当該 `step` の全 `substep` の `agent_run_id` が、いずれかの `step_result.json` の `substep_agent_run_ids` に含まれる。欠落時は `tools/codex_orchestration_runtime.py` の orchestration 完了検査で `fail` となる。
 - `step_result.json` の `required_outputs` が `docs/workflow/WORKFLOW_CORE.md` および対応する `docs/workflow/phases/phase_*.md` の phase contract と一致する。
+- `step_result.json` が `retry_decisions` を保持する場合、`repair_target_agent_run_id` と `new_agent_run_id` の置換関係から `effective pass substep` 集合を一意に復元できる。
+- `step_result.json` が `status=pass` の場合、各 `retry_decisions.new_agent_run_id` は `effective pass substep` 集合へ残る最終採用 `pass` run であり、後続 retry で再置換される中間 run を含んでいない。
+- `step_result.json` が `status=pass` の場合、`effective pass substep` 集合に含まれる各 run が `pass` で終端している。
+- `step_result.json` が `status=pass` の場合、`required_outputs` は `effective pass substep` 集合の `output_refs` のみで被覆されている。retry 前の failed run または superseded run の `output_refs` に依存していない。
 - `step_result.json` が `status=pass` の `Generate` / `Build` / `Execute` / `Judge` では、`validation_stage` が phase ごとの許容値に一致する。
 - 再投入を実施した `substep` は、対応する `launches/<agent_run_id>.request.json` に `issue_severity` と `repair_strategy` と `repair_target_agent_run_id` と `repair_reason` を保持している。
 - `repair_strategy=reuse` の再投入を実施した場合、対象 `agent_run` の `agent_session_id` は `repair_target_agent_run_id` の `agent_session_id` と一致する。

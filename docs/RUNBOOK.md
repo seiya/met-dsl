@@ -79,8 +79,11 @@
 - `step_result.json` は `workspace/orchestrations/<orchestration_id>/steps/<node_key_safe>/<step>/<agent_run_id>/` に保存する。
 - `step_result.json` は `executor_agent_run_id` と `substep_agent_run_ids` を必須記録し、`executor_agent_run_id` は保存先 `agent_run_id` と一致させる。`substep` を持たない phase の `substep_agent_run_ids` は空配列を許可する。
 - `substep` を持つ phase の `step_result.json` では、`substep_agent_run_ids` に当該 `step` で起動し `agent_runs.jsonl` に記録された **全** `substep` の `agent_run_id` を欠落なく含めなければならない。`status` が `pass` 以外の `substep`（`fail` / `cancel` 等）であっても省略してはならない。`tools/codex_orchestration_runtime.py` の orchestration 完了検査は、この網羅性と終端 `status` を別条件として扱う。
+- `retry_decisions` を保持する `step_result.json` では、`repair_target_agent_run_id -> new_agent_run_id` の置換関係から `effective pass substep` 集合を一意に復元できなければならない。旧 failed run は retry 履歴として `substep_agent_run_ids` に残してよいが、最終採用集合からは除外する。`status=pass` の `step_result.json` では、各 `new_agent_run_id` は `effective pass substep` 集合へ残る最終採用 `pass` run に限る。後続 retry で再置換される連鎖 retry の中間 run を `retry_decisions` に残してはならない。
 - `Plan` / `Generate` / `Tune` の完了判定は `step_result.json` を canonical source とし、`launches/*.reply.txt` の文言のみで `pass` を確定してはならない。
-- `substep` を持つ phase で `status=pass` を記録する場合、`step_result.json.required_outputs` は参照先 `substep_agent_run_ids` の `agent_runs.jsonl.output_refs` で全件被覆されなければならない。不一致または `step_result.json` 欠落時は `fail_closed` とする。
+- `substep` を持つ phase で `status=pass` を記録する場合、pass 判定対象は `substep_agent_run_ids` 全件ではなく `effective pass substep` 集合とする。`effective pass substep` 集合の各 run は `pass` で終端していなければならない。
+- `substep` を持つ phase で `status=pass` を記録する場合、`step_result.json.required_outputs` は `effective pass substep` 集合の `agent_runs.jsonl.output_refs` で全件被覆されなければならない。retry 前の failed run または superseded run の `output_refs` を被覆根拠に使用してはならない。不一致または `step_result.json` 欠落時は `fail_closed` とする。
+- shell file write または `unauthorized write` を事前 gate または `record-agent-run` が検出した場合、当該 gate または `record-agent-run` は当該 `agent_run` を reject しなければならない。reject 後は `orchestration agent` が `orchestration_meta.status=fail_closed` を記録して停止しなければならない。
 - `step agent` または `substep agent` の `fail` / `timeout` / `cancel` 発生時は、当該 `step` を停止し推測補完を禁止する。
 
 ## 2. 最小ループ
