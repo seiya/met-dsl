@@ -19,6 +19,8 @@ from typing import Any, Callable, Sequence
 
 
 TERMINAL_STATUSES = {"pass", "fail", "blocked", "timeout", "cancel"}
+# Judge の pre_phase_complete 検証で semantic_review を要求しない終了理由（未完了扱い）。
+JUDGE_SEMANTIC_REVIEW_SKIPPED_STATUSES = frozenset({"timeout", "cancel"})
 SUPPORTED_BACKENDS = {"codex", "cursor", "claude"}
 PREFLIGHT_TTL_DEFAULT_SECONDS: int = 1800
 VALID_REPAIR_STRATEGIES = frozenset({"none", "reuse", "restart"})
@@ -91,6 +93,19 @@ STEP_REQUIRED_CHILD_AGENT: dict[str, str] = {
     "promote": "step",
 }
 
+# `run-gate` の `validate_pipeline_semantics` で許可する `--stage` と capability `step` の対応。
+_PIPELINE_SEMANTICS_STAGES_FOR_STEP: dict[str, frozenset[str]] = {
+    "plan": frozenset({"plan", "full"}),
+    "generate": frozenset({"post_generate", "post_build", "full"}),
+    "tune": frozenset({"post_generate", "post_build", "full"}),
+    "build": frozenset({"post_build", "full"}),
+    "execute": frozenset({"post_execute", "full"}),
+    "judge": frozenset({"pre_judge", "full"}),
+    "promote": frozenset(
+        {"plan", "post_generate", "post_build", "post_execute", "pre_judge", "full"}
+    ),
+}
+
 FAIL_CLOSED_REASON_CODES = {
     "child_agent_forbidden_by_session_policy",
     "child_agent_unavailable_on_execution_platform",
@@ -98,7 +113,13 @@ FAIL_CLOSED_REASON_CODES = {
     "phase_body_started_before_launch",
     "noncanonical_phase_write_attempt",
     "dependency_not_ready",
+    "downstream_artifact_not_ready",
+    "checkpoint_read_forbidden_without_resume",
+    "post_phase_complete_violation",
+    "parallel_nodes_not_explicitly_allowed",
 }
+
+PARALLEL_NODES_ENV_VAR = "CODEX_ALLOW_PARALLEL_NODES"
 
 PHASE_ARTIFACT_GUARDED_PREFIXES: tuple[str, ...] = ("workspace/plans/", "workspace/pipelines/")
 
@@ -129,6 +150,25 @@ def _capabilities_dir(repo_root: Path, orchestration_id: str) -> Path:
 
 def _gates_dir(repo_root: Path, orchestration_id: str) -> Path:
     return _orchestration_root(repo_root, orchestration_id) / "gates"
+
+
+def _hooks_log_path(repo_root: Path, orchestration_id: str) -> Path:
+    return _orchestration_root(repo_root, orchestration_id) / "hooks" / "workflow_hooks.jsonl"
+
+
+def _append_workflow_hook_log(
+    repo_root: Path,
+    orchestration_id: str,
+    *,
+    hook_name: str,
+    status: str,
+    detail: dict[str, Any],
+) -> None:
+    path = _hooks_log_path(repo_root, orchestration_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    entry: dict[str, Any] = {"ts": _utc_now_iso(), "hook": hook_name, "status": status, **detail}
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(entry, ensure_ascii=False) + "\n")
 
 
 def _phase_state_path(repo_root: Path, orchestration_id: str) -> Path:
@@ -857,6 +897,216 @@ def workflow_launch_check(
     }
 
 
+def _resolve_judge_execution_dir(
+    repo_root: Path,
+    *,
+    pipeline_ref: str,
+    node_key: str,
+    launch_request: dict[str, Any],
+) -> tuple[Path | None, str | None]:
+    """`Judge` 入力となる `execute/<execution_id>/<node_key_safe>/` を返す。失敗時は (None, reason)。"""
+    rel = _normalize_rel_posix(pipeline_ref)
+    pr_abs = repo_root / rel
+    if not pr_abs.is_dir():
+        return None, "pipeline_missing"
+    nk_safe = _node_key_to_safe(node_key)
+    ex_id = launch_request.get("execution_id")
+    if isinstance(ex_id, str) and ex_id.strip():
+        cand = pr_abs / "execute" / ex_id.strip() / nk_safe
+        if cand.is_dir():
+            return cand, None
+        return None, "judge_execution_path_missing"
+    exec_root = pr_abs / "execute"
+    candidates: list[Path] = []
+    if exec_root.is_dir():
+        for eid_dir in sorted(exec_root.iterdir()):
+            if not eid_dir.is_dir():
+                continue
+            cand = eid_dir / nk_safe
+            if cand.is_dir():
+                candidates.append(cand)
+    if len(candidates) != 1:
+        return None, "judge_execution_id_unresolved_or_ambiguous"
+    return candidates[0], None
+
+
+def _downstream_phase_launch_gate(
+    repo_root: Path,
+    *,
+    node_key: str,
+    step: str,
+    pipeline_ref: str,
+    launch_request: dict[str, Any],
+) -> tuple[bool, str | None]:
+    """`pipeline_ref` がディスク上に存在する場合のみ下流 phase 開始条件を検査する。"""
+    rel = _normalize_rel_posix(pipeline_ref)
+    pr_abs = repo_root / rel
+    if not pr_abs.is_dir():
+        return True, None
+    st = step.strip().lower()
+    if st == "build":
+        gen_root = pr_abs / "generate"
+        if not gen_root.is_dir():
+            return False, "downstream:generate_dir_missing"
+        for gen_dir in sorted(gen_root.iterdir()):
+            if not gen_dir.is_dir():
+                continue
+            meta = gen_dir / "generate_meta.json"
+            if not meta.is_file():
+                continue
+            try:
+                data = _read_json(meta)
+            except (OSError, json.JSONDecodeError):
+                continue
+            if isinstance(data, dict) and str(data.get("verification_status", "")).strip().lower() == "pass":
+                return True, None
+        return False, "downstream:generate_meta_verification_status_not_pass"
+    if st == "execute":
+        build_root = pr_abs / "build"
+        if not build_root.is_dir():
+            return False, "downstream:build_dir_missing"
+        for bdir in sorted(build_root.iterdir()):
+            if not bdir.is_dir():
+                continue
+            bin_dir = bdir / "bin"
+            if bin_dir.is_dir() and any(bin_dir.iterdir()):
+                return True, None
+        return False, "downstream:build_bin_dir_missing"
+    if st == "judge":
+        base, err = _resolve_judge_execution_dir(
+            repo_root,
+            pipeline_ref=pipeline_ref,
+            node_key=node_key,
+            launch_request=launch_request,
+        )
+        if base is None:
+            return False, f"downstream:{err or 'judge_path'}"
+        for name in ("diagnostics.json", "perf.json"):
+            if not (base / name).is_file():
+                return False, f"downstream:judge_missing:{name}"
+        raw_dir = base / "raw"
+        if not raw_dir.is_dir():
+            return False, "downstream:judge_raw_dir_missing"
+        exec_ok = (base / "mcp_command_log.jsonl").is_file() or (
+            (base / "stdout.log").is_file() and (base / "stderr.log").is_file()
+        )
+        if not exec_ok:
+            return False, "downstream:judge_execution_record_missing"
+        return True, None
+    return True, None
+
+
+def pre_phase_launch(
+    repo_root: Path,
+    *,
+    orchestration_id: str,
+    node_key: str,
+    step: str,
+    backend: str,
+    require_child_agent: str,
+    launch_request: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """`workflow_launch_check` と下流 artifact 開始条件（`pipeline_ref` がディスク上に存在する場合）をまとめる hook。"""
+    base = workflow_launch_check(
+        repo_root,
+        orchestration_id=orchestration_id,
+        node_key=node_key,
+        step=step,
+        backend=backend,
+        require_child_agent=require_child_agent,
+    )
+    merged: dict[str, Any] = dict(base)
+    merged["hook"] = "pre_phase_launch"
+    if merged.get("status") != "pass":
+        _append_workflow_hook_log(
+            repo_root,
+            orchestration_id,
+            hook_name="pre_phase_launch",
+            status="deny",
+            detail={"reason": merged.get("reason_code"), "detail": merged.get("reason_detail")},
+        )
+        return merged
+    if launch_request:
+        pr = launch_request.get("pipeline_ref")
+        if isinstance(pr, str) and pr.strip():
+            ok, reason = _downstream_phase_launch_gate(
+                repo_root,
+                node_key=node_key,
+                step=step,
+                pipeline_ref=pr.strip(),
+                launch_request=launch_request,
+            )
+            if not ok:
+                merged["status"] = "fail_closed"
+                merged["reason_code"] = "downstream_artifact_not_ready"
+                merged["reason_detail"] = reason
+                merged["next_action"] = "stop_before_phase_body"
+                merged["blocking_policy_scope"] = "downstream_artifacts"
+                _append_workflow_hook_log(
+                    repo_root,
+                    orchestration_id,
+                    hook_name="pre_phase_launch",
+                    status="deny",
+                    detail={"reason": "downstream_artifact_not_ready", "detail": reason},
+                )
+                return merged
+    _append_workflow_hook_log(
+        repo_root,
+        orchestration_id,
+        hook_name="pre_phase_launch",
+        status="allow",
+        detail={"node_key": node_key, "step": step.strip().lower()},
+    )
+    return merged
+
+
+def pre_orchestration_start(
+    repo_root: Path,
+    orchestration_id: str,
+    *,
+    event: str,
+) -> dict[str, Any]:
+    """`init` / `preflight` 入口で冪等に適用する workflow 開始前 hook。"""
+    ws = repo_root / "workspace"
+    created_ws: str | None = None
+    if not ws.exists():
+        ws.mkdir(parents=True, exist_ok=True)
+        created_ws = "created_workspace_root"
+    parallel_explicit = os.environ.get(PARALLEL_NODES_ENV_VAR, "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+    }
+    orch_root = _orchestration_root(repo_root, orchestration_id)
+    orch_root.mkdir(parents=True, exist_ok=True)
+    meta_path = orch_root / "orchestration_meta.json"
+    meta: dict[str, Any] = {}
+    if meta_path.is_file():
+        try:
+            loaded = _read_json(meta_path)
+        except (OSError, json.JSONDecodeError):
+            loaded = None
+        if isinstance(loaded, dict):
+            meta = loaded
+    meta.setdefault("parallel_nodes_explicit", parallel_explicit)
+    meta.setdefault("parallel_nodes_policy", "sequential_default")
+    parallel_nodes_explicit_persisted = meta["parallel_nodes_explicit"]
+    _write_json(meta_path, meta)
+    detail = {
+        "event": event,
+        "workspace_bootstrap": created_ws,
+        "parallel_nodes_explicit": parallel_nodes_explicit_persisted,
+    }
+    _append_workflow_hook_log(
+        repo_root,
+        orchestration_id,
+        hook_name="pre_orchestration_start",
+        status="allow",
+        detail=detail,
+    )
+    return {"status": "pass", "hook": "pre_orchestration_start", **detail}
+
+
 def _path_under_any_write_root(rel_posix: str, write_roots: list[str]) -> bool:
     p = _normalize_rel_posix(rel_posix)
     for root in write_roots:
@@ -975,6 +1225,7 @@ def validate_mcp_build_tool_invocation(
     agent_run_id: str,
     capability_token: str,
     tool_name: str,
+    mcp_args: dict[str, Any] | None = None,
 ) -> None:
     """`compile_project` / `run_linter` / `run_program` / `run_quality_checks` 呼び出し前の位相ゲート。"""
     _require_preflight_launchable(repo_root, orchestration_id, enforce_live_probe=False)
@@ -1044,6 +1295,77 @@ def validate_mcp_build_tool_invocation(
             "MCP phase gate: node step must be child_running "
             f"(node_key_safe={node_safe!r}, step={step_key!r}, current={st!r})"
         )
+
+    args_obj = mcp_args if isinstance(mcp_args, dict) else {}
+    if tool_name == "run_program" and step_key == "execute":
+        cmd = args_obj.get("command")
+        if not isinstance(cmd, list) or not cmd:
+            raise RuntimeError("MCP phase gate: run_program requires non-empty command array")
+        joined = " ".join(str(x) for x in cmd)
+        if "case.resolved.yaml" not in joined:
+            raise RuntimeError(
+                "MCP phase gate: Execute run_program command must reference case.resolved.yaml"
+            )
+    if tool_name in {"compile_project", "run_quality_checks"}:
+        plan_ref = _launch_plan_ref_for_agent(repo_root, orchestration_id, agent_run_id)
+        if plan_ref:
+            bs = _impl_resolved_build_system(repo_root, plan_ref)
+            if bs == "make":
+                if tool_name == "compile_project":
+                    req_bs = str(args_obj.get("build_system", "")).strip().lower()
+                    if req_bs and req_bs != "make":
+                        raise RuntimeError(
+                            "MCP phase gate: toolchain.build_system=make requires compile_project "
+                            f"build_system make (got {req_bs!r})"
+                        )
+                if tool_name == "run_quality_checks":
+                    preset = str(args_obj.get("preset", "")).strip().lower()
+                    if preset not in {"make_test", "make_check"}:
+                        raise RuntimeError(
+                            "MCP phase gate: toolchain.build_system=make requires run_quality_checks "
+                            f"preset make_test or make_check (got {preset!r})"
+                        )
+
+    _append_workflow_hook_log(
+        repo_root,
+        orchestration_id,
+        hook_name="pre_command_execute",
+        status="allow",
+        detail={"mcp_tool": tool_name, "step": step_key},
+    )
+
+
+def _launch_plan_ref_for_agent(
+    repo_root: Path, orchestration_id: str, agent_run_id: str
+) -> str | None:
+    req_path = _orchestration_root(repo_root, orchestration_id) / "launches" / f"{agent_run_id.strip()}.request.json"
+    if not req_path.is_file():
+        return None
+    try:
+        doc = _read_json(req_path)
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(doc, dict):
+        return None
+    pr = doc.get("plan_ref")
+    return pr.strip() if isinstance(pr, str) and pr.strip() else None
+
+
+def _impl_resolved_build_system(repo_root: Path, plan_ref: str) -> str | None:
+    path = repo_root / _normalize_rel_posix(plan_ref) / "impl.resolved.yaml"
+    if not path.is_file():
+        return None
+    text = path.read_text(encoding="utf-8", errors="ignore")
+    for raw in text.splitlines():
+        line = raw.split("#", 1)[0].strip()
+        if not line or ":" not in line:
+            continue
+        key, _, rest = line.partition(":")
+        if "build_system" not in key.strip().lower():
+            continue
+        val = rest.strip().strip("\"'")
+        return val.lower() or None
+    return None
 
 
 def _gate_script_command(
@@ -1168,6 +1490,61 @@ def _inline_gate_result(
     raise ValueError(f"unsupported inline gate name: {gate_name!r}")
 
 
+def _gate_python_env(repo_root: Path) -> dict[str, str]:
+    env = os.environ.copy()
+    env.setdefault("PYTHONDONTWRITEBYTECODE", "1")
+    env["PYTHONPYCACHEPREFIX"] = str((repo_root / "workspace" / ".pycache").resolve())
+    return env
+
+
+def _pre_command_execute_validate_pipeline_semantics(
+    repo_root: Path,
+    orchestration_id: str,
+    agent_run_id: str,
+    args_json: dict[str, Any],
+) -> None:
+    cap_path = _capabilities_dir(repo_root, orchestration_id) / f"{agent_run_id.strip()}.json"
+    cap = _read_json(cap_path)
+    if not isinstance(cap, dict):
+        return
+    step_key = str(cap.get("step", "")).strip().lower()
+    stage = args_json.get("stage") or args_json.get("--stage")
+    if not isinstance(stage, str) or not stage.strip():
+        raise ValueError(
+            "pre_command_execute hook: validate_pipeline_semantics requires args_json.stage "
+            "(or --stage) as non-empty string"
+        )
+    stage_l = stage.strip().lower()
+    allowed = _PIPELINE_SEMANTICS_STAGES_FOR_STEP.get(step_key)
+    if allowed is not None and stage_l not in allowed:
+        raise ValueError(
+            "pre_command_execute hook: validate_pipeline_semantics "
+            f"--stage {stage_l!r} not permitted for capability step={step_key!r} "
+            f"(allowed={sorted(allowed)})"
+        )
+    if stage_l == "pre_judge":
+        for key, val in args_json.items():
+            key_s = str(key).lower().replace("_", "-")
+            if "allow-missing-orchestration" in key_s or "allow-missing-llm-review" in key_s:
+                if val is True or val == 1:
+                    raise ValueError(
+                        "pre_command_execute hook: pre_judge forbids allow-missing-orchestration "
+                        "and allow-missing-llm-review"
+                    )
+                if isinstance(val, str) and val.strip().lower() in {"true", "1", "yes"}:
+                    raise ValueError(
+                        "pre_command_execute hook: pre_judge forbids allow-missing-orchestration "
+                        "and allow-missing-llm-review"
+                    )
+    _append_workflow_hook_log(
+        repo_root,
+        orchestration_id,
+        hook_name="pre_command_execute",
+        status="allow",
+        detail={"gate": "validate_pipeline_semantics", "stage": stage_l, "step": step_key},
+    )
+
+
 def _validate_run_gate_permissions(
     repo_root: Path,
     *,
@@ -1272,6 +1649,13 @@ def run_gate(
         agent_run_id=agent_run_id,
         capability_token=capability_token,
     )
+    if gate == "validate_pipeline_semantics":
+        _pre_command_execute_validate_pipeline_semantics(
+            repo_root,
+            orchestration_id,
+            agent_run_id,
+            args_json,
+        )
     inline_result: dict[str, Any] | None = None
     if gate in {"orchestration_read", "apply_patch_writes"}:
         inline_result = _inline_gate_result(
@@ -1287,9 +1671,7 @@ def run_gate(
         exit_code = 0
     else:
         cmd = _gate_script_command(repo_root=repo_root, gate_name=gate, args_json=args_json)
-        gate_env = os.environ.copy()
-        gate_env.setdefault("PYTHONDONTWRITEBYTECODE", "1")
-        gate_env["PYTHONPYCACHEPREFIX"] = str((repo_root / "workspace" / ".pycache").resolve())
+        gate_env = _gate_python_env(repo_root)
         proc = subprocess.run(
             cmd,
             cwd=str(repo_root),
@@ -1583,6 +1965,7 @@ def _should_ignore_runtime_snapshot_path(
         f"{orch_root}/agents/",
         f"{orch_root}/capabilities/",
         f"{orch_root}/gates/",
+        f"{orch_root}/hooks/",
         f"{orch_root}/launches/",
         f"{orch_root}/violations/",
         f"{orch_root}/steps/",
@@ -2883,11 +3266,40 @@ def update_checkpoint(
     return entry
 
 
+def _guard_checkpoint_read_requires_resume(repo_root: Path, orchestration_id: str) -> None:
+    ck_path = _checkpoint_path(repo_root, orchestration_id)
+    if not ck_path.is_file():
+        return
+    try:
+        ck = _read_json(ck_path)
+    except (OSError, json.JSONDecodeError):
+        return
+    if not isinstance(ck, dict):
+        return
+    steps = ck.get("completed_steps")
+    if not isinstance(steps, list) or not steps:
+        return
+    meta_path = _orchestration_root(repo_root, orchestration_id) / "orchestration_meta.json"
+    if not meta_path.is_file():
+        return
+    try:
+        meta = _read_json(meta_path)
+    except (OSError, json.JSONDecodeError):
+        return
+    if isinstance(meta, dict) and meta.get("resume_enabled") is True:
+        return
+    raise RuntimeError(
+        "read_checkpoint forbidden unless orchestration_meta.resume_enabled is true "
+        f"(orchestration_id={orchestration_id!r})"
+    )
+
+
 def read_checkpoint(
     repo_root: Path,
     orchestration_id: str,
 ) -> dict[str, Any] | None:
     """orchestration_checkpoint.json を読んで返す。存在しない場合は None。"""
+    _guard_checkpoint_read_requires_resume(repo_root, orchestration_id)
     return _load_checkpoint(repo_root, orchestration_id)
 
 
@@ -3678,6 +4090,128 @@ def _effective_pass_substep_run_ids(
     }
 
 
+def _pre_phase_complete_judge_checks(
+    repo_root: Path,
+    *,
+    node_key: str,
+    status_token: str,
+    payload: dict[str, Any],
+) -> None:
+    lr_ref = payload.get("launch_request_ref")
+    if not isinstance(lr_ref, str) or not lr_ref.strip():
+        raise ValueError("judge step_result requires launch_request_ref for pre_phase_complete hook")
+    lr_path = repo_root / lr_ref.strip()
+    if not lr_path.is_file():
+        raise ValueError(f"judge launch_request_ref not found: {lr_ref}")
+    try:
+        lr = _read_json(lr_path)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"judge launch_request_ref invalid json: {lr_ref}") from exc
+    if not isinstance(lr, dict):
+        raise ValueError(f"judge launch_request must be object: {lr_ref}")
+    pr = lr.get("pipeline_ref")
+    if not isinstance(pr, str) or not pr.strip():
+        raise ValueError("judge launch_request missing pipeline_ref")
+    base, err = _resolve_judge_execution_dir(
+        repo_root,
+        pipeline_ref=pr.strip(),
+        node_key=node_key,
+        launch_request=lr,
+    )
+    if base is None:
+        raise ValueError(f"judge execution directory not resolved: {err}")
+    if status_token in JUDGE_SEMANTIC_REVIEW_SKIPPED_STATUSES:
+        return
+    sem = base / "semantic_review.json"
+    if not sem.is_file():
+        raise ValueError("pre_phase_complete: judge requires semantic_review.json")
+    try:
+        sdoc = _read_json(sem)
+    except json.JSONDecodeError as exc:
+        raise ValueError("semantic_review.json must be valid json") from exc
+    if not isinstance(sdoc, dict):
+        raise ValueError("semantic_review.json must be a json object")
+    dec = sdoc.get("decision")
+    if dec is None or (isinstance(dec, str) and not str(dec).strip()):
+        raise ValueError("semantic_review.json decision missing (completion forbidden)")
+    dec_norm = str(dec).strip().lower()
+    if dec_norm == "fail" and status_token == "pass":
+        raise ValueError("semantic_review.json decision=fail cannot accompany pass step_result")
+    if dec_norm == "pass" and status_token in {"fail", "blocked"}:
+        raise ValueError(
+            "semantic_review.json decision=pass cannot accompany fail or blocked step_result"
+        )
+    if status_token == "blocked":
+        for name in ("aggregate_verdict.json", "summary.json", "trial_meta.json"):
+            if not (base / name).is_file():
+                raise ValueError(f"blocked judge requires {name} under execution directory")
+
+
+def post_phase_complete(
+    repo_root: Path,
+    orchestration_id: str,
+    *,
+    node_key: str,
+    step: str,
+    agent_run_id: str,
+    payload: dict[str, Any],
+) -> None:
+    from tools.validate_workspace_root import _validate_write_scope_from_baseline
+
+    step_token = step.strip().lower()
+    violations: list[str] = []
+    baseline_ref = payload.get("write_scope_baseline_ref")
+    if isinstance(baseline_ref, str) and baseline_ref.strip():
+        bp = repo_root / _normalize_rel_posix(baseline_ref.strip())
+        if bp.is_file():
+            violations.extend(
+                _validate_write_scope_from_baseline(
+                    repo_root=repo_root,
+                    workspace_root="workspace/",
+                    baseline_path=bp,
+                )
+            )
+    orch_root = _orchestration_root(repo_root, orchestration_id)
+    resp_path = orch_root / "launches" / f"{agent_run_id.strip()}.response.json"
+    req_path = orch_root / "launches" / f"{agent_run_id.strip()}.request.json"
+    if resp_path.is_file() and req_path.is_file():
+        try:
+            rsp = _read_json(resp_path)
+            req = _read_json(req_path)
+        except (OSError, json.JSONDecodeError):
+            rsp = {}
+            req = {}
+        if isinstance(req, dict) and isinstance(rsp, dict):
+            rq_sid = req.get("agent_session_id")
+            rs_sid = rsp.get("agent_session_id")
+            if (
+                isinstance(rq_sid, str)
+                and rq_sid.strip()
+                and isinstance(rs_sid, str)
+                and rs_sid.strip()
+                and rq_sid.strip() != rs_sid.strip()
+            ):
+                violations.append(
+                    "post_phase_complete: launch response agent_session_id mismatch vs request"
+                )
+    if violations:
+        _append_workflow_hook_log(
+            repo_root,
+            orchestration_id,
+            hook_name="post_phase_complete",
+            status="deny",
+            detail={"violations": violations, "step": step_token},
+        )
+        raise RuntimeError("post_phase_complete denied: " + "; ".join(violations))
+    _append_workflow_hook_log(
+        repo_root,
+        orchestration_id,
+        hook_name="post_phase_complete",
+        status="allow",
+        detail={"step": step_token, "agent_run_id": agent_run_id},
+    )
+
+
 def _validate_step_result_payload(
     repo_root: Path,
     orchestration_id: str,
@@ -3691,15 +4225,30 @@ def _validate_step_result_payload(
     status = payload.get("status")
     status_token = status.strip().lower() if isinstance(status, str) else ""
 
-    # validation_stage チェック（generate/build/execute/judge の pass 時のみ）
-    if step_token in STEP_REQUIRED_VALIDATION_STAGES and status_token == "pass":
+    # validation_stage チェック（generate/build/execute/judge の terminal 時）
+    if step_token in STEP_REQUIRED_VALIDATION_STAGES and status_token in TERMINAL_STATUSES:
         allowed = STEP_REQUIRED_VALIDATION_STAGES[step_token]
         validation_stage = payload.get("validation_stage")
         if not isinstance(validation_stage, str) or validation_stage.strip() not in allowed:
             raise ValueError(
-                f"pass step_result for {step_token} requires validation_stage in "
-                f"{sorted(allowed)}; got {validation_stage!r}"
+                f"terminal step_result for {step_token} requires validation_stage in "
+                f"{sorted(allowed)}; status={status_token!r} validation_stage={validation_stage!r}"
             )
+        _append_workflow_hook_log(
+            repo_root,
+            orchestration_id,
+            hook_name="pre_phase_complete",
+            status="allow",
+            detail={"step": step_token, "status": status_token, "validation_stage": validation_stage},
+        )
+
+    if step_token == "judge" and status_token in TERMINAL_STATUSES:
+        _pre_phase_complete_judge_checks(
+            repo_root,
+            node_key=node_key,
+            status_token=status_token,
+            payload=payload,
+        )
 
     # 以下は既存の substep 検証（plan/generate/tune のみ）
     if step_token not in {"plan", "generate", "tune"}:
@@ -4052,7 +4601,17 @@ def init_orchestration(
         meta["spec_ref"] = spec_ref
     if dependency_ref:
         meta["dependency_ref"] = dependency_ref
-    _write_json(root / "orchestration_meta.json", meta)
+    meta_path = root / "orchestration_meta.json"
+    if meta_path.is_file():
+        try:
+            existing = _read_json(meta_path)
+        except (OSError, json.JSONDecodeError):
+            existing = None
+        if isinstance(existing, dict):
+            for key in ("parallel_nodes_explicit", "parallel_nodes_policy"):
+                if key in existing:
+                    meta.setdefault(key, existing[key])
+    _write_json(meta_path, meta)
 
     graph_path = root / "agent_graph.json"
     if not graph_path.exists():
@@ -4062,8 +4621,8 @@ def init_orchestration(
     if not runs_path.exists():
         runs_path.write_text("", encoding="utf-8")
 
+    pre_orchestration_start(repo_root, orchestration_id, event="init")
     _write_run_write_baseline(repo_root, orchestration_id)
-
     return meta
 
 
@@ -4071,6 +4630,7 @@ def write_preflight(repo_root: Path, orchestration_id: str, payload: dict[str, A
     _validate_preflight_payload(payload)
     root = _orchestration_root(repo_root, orchestration_id)
     root.mkdir(parents=True, exist_ok=True)
+    pre_orchestration_start(repo_root, orchestration_id, event="preflight")
 
     stored = dict(payload)
     if not isinstance(stored.get("session_policy"), dict):
@@ -4173,13 +4733,15 @@ def record_launch(
             else ""
         )
         backend_token = backend if backend in SUPPORTED_BACKENDS else "codex"
-        check = workflow_launch_check(
+        launch_ctx = dict(request_payload)
+        check = pre_phase_launch(
             repo_root,
             orchestration_id=orchestration_id,
             node_key=node_key_raw.strip(),
             step=step_raw.strip(),
             backend=backend_token,
             require_child_agent=required,
+            launch_request=launch_ctx,
         )
         if check.get("status") == "fail_closed":
             reason_code = str(check.get("reason_code") or "child_agent_unavailable_on_execution_platform")
@@ -4195,7 +4757,7 @@ def record_launch(
             except Exception:
                 pass
             raise RuntimeError(
-                "record-launch blocked by workflow-launch-check: "
+                "record-launch blocked by pre_phase_launch / workflow-launch-check: "
                 f"reason_code={reason_code}"
             )
     root = _orchestration_root(repo_root, orchestration_id)
@@ -4222,6 +4784,13 @@ def record_launch(
     if not reply_text.strip():
         raise ValueError("launch reply text must be non-empty")
     _validate_launch_prompt_text(request_payload, prompt_text)
+    _append_workflow_hook_log(
+        repo_root,
+        orchestration_id,
+        hook_name="pre_agent_launch",
+        status="allow",
+        detail={"child_agent_run_id": child_agent_run_id},
+    )
 
     request_ref, response_ref = _launch_refs(orchestration_id, child_agent_run_id)
     prompt_ref, reply_ref = _launch_dialog_refs(orchestration_id, child_agent_run_id)
@@ -4494,6 +5063,22 @@ def write_step_result(
     )
 
     _write_json(result_path, result)
+
+    try:
+        post_phase_complete(
+            repo_root,
+            orchestration_id,
+            node_key=node_key,
+            step=step,
+            agent_run_id=agent_run_id,
+            payload=result,
+        )
+    except RuntimeError:
+        try:
+            result_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
 
     _transition_node_step_phase_state(
         repo_root,
@@ -4799,6 +5384,12 @@ def main(argv: list[str] | None = None) -> int:
     launch_check_parser.add_argument("--step", required=True)
     launch_check_parser.add_argument("--backend", default="codex", choices=sorted(SUPPORTED_BACKENDS))
     launch_check_parser.add_argument("--require-child-agent", required=True, choices=("step", "substep"))
+    launch_check_parser.add_argument(
+        "--launch-request-json",
+        default=None,
+        type=_json_arg,
+        help="Optional launch request object for downstream artifact checks (pre_phase_launch).",
+    )
 
     reserve_root_parser = subparsers.add_parser("reserve-phase-root")
     reserve_root_parser.add_argument("--repo-root", required=True)
@@ -4986,13 +5577,14 @@ def main(argv: list[str] | None = None) -> int:
             blocking_policy_scope=args.blocking_policy_scope,
         )
     elif args.command == "workflow-launch-check":
-        result = workflow_launch_check(
+        result = pre_phase_launch(
             repo_root,
             orchestration_id=args.orchestration_id,
             node_key=args.node_key,
             step=args.step,
             backend=args.backend,
             require_child_agent=args.require_child_agent,
+            launch_request=getattr(args, "launch_request_json", None),
         )
     elif args.command == "reserve-phase-root":
         result = reserve_phase_root(

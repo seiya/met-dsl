@@ -17,6 +17,7 @@ from mcp_servers.build_runtime_server import tool_compile_project
 
 from tools.codex_orchestration_runtime import (
     TERMINAL_STATUSES,
+    _pre_phase_complete_judge_checks,
     _required_child_agent_kind,
     _build_artifact_hashes,
     _compute_sha256,
@@ -40,9 +41,12 @@ from tools.codex_orchestration_runtime import (
     main,
     merge_phase_state_for_resume,
     parse_feature_list,
+    pre_orchestration_start,
+    pre_phase_launch,
     probe_execution_platform,
     prepare_launch_request_payload,
     probe_codex_cli,
+    read_checkpoint,
     record_agent_run,
     record_launch,
     reserve_phase_root,
@@ -60,6 +64,16 @@ from tools.codex_orchestration_runtime import (
 _FIX_PLAN_REF = "workspace/plans/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001"
 _FIX_PIPE_REF = "workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001"
 _FIX_DEP_REF = f"{_FIX_PLAN_REF}/dependency.resolved.yaml"
+
+
+def _fixture_generate_downstream_ready(repo_root: Path, *, generation_id: str = "gen_fixture_001") -> None:
+    """`build` の `pre_phase_launch` downstream gate 用に verification pass の generate ツリーを置く。"""
+    gen_dir = repo_root / _FIX_PIPE_REF / "generate" / generation_id
+    gen_dir.mkdir(parents=True, exist_ok=True)
+    (gen_dir / "generate_meta.json").write_text(
+        json.dumps({"verification_status": "pass"}),
+        encoding="utf-8",
+    )
 
 
 def _fixture_skill_must_read_refs_step(step: str) -> str:
@@ -764,7 +778,8 @@ shell_tool                       stable             true
                 payload={
                     "status": "pass",
                     "required_outputs": [
-                        "workspace/plans/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/case.resolved.yaml"
+                        "workspace/plans/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/case.resolved.yaml",
+                        "workspace/plans/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/plan_meta.json",
                     ],
                     "failed_substeps": [],
                     "substep_agent_run_ids": ["substep_run_plan_generate_001"],
@@ -1547,6 +1562,12 @@ shell_tool                       stable             true
                 },
                 response_payload=_spawn_response_payload("sess_substep_plan_generate_001"),
             )
+            impl_path = (
+                repo_root
+                / "workspace/plans/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/impl.resolved.yaml"
+            )
+            impl_path.parent.mkdir(parents=True, exist_ok=True)
+            impl_path.write_text("{}\n", encoding="utf-8")
             _write_apply_patch_gate_evidence(
                 repo_root,
                 orchestration_id="orch_001",
@@ -1554,7 +1575,6 @@ shell_tool                       stable             true
                 actor_role="substep",
                 changed_paths=[
                     "workspace/plans/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/impl.resolved.yaml",
-                    "workspace/plans/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/plan_meta.json",
                 ],
             )
             record_agent_run(
@@ -1574,7 +1594,6 @@ shell_tool                       stable             true
                     "agent_session_id": "sess_substep_plan_generate_001",
                     "output_refs": [
                         "workspace/plans/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/impl.resolved.yaml",
-                        "workspace/plans/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/plan_meta.json",
                     ],
                 },
             )
@@ -1597,7 +1616,7 @@ shell_tool                       stable             true
                     payload={
                         "status": "pass",
                         "required_outputs": [
-                            "workspace/plans/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/case.resolved.yaml"
+                            "workspace/plans/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/plan_meta.json"
                         ],
                         "failed_substeps": [],
                         "substep_agent_run_ids": ["substep_run_plan_generate_001"],
@@ -2256,6 +2275,7 @@ shell_tool                       stable             true
             out_path = repo_root / out_ref
             out_path.parent.mkdir(parents=True, exist_ok=True)
             out_path.write_text("binary-baseline\n", encoding="utf-8")
+            _fixture_generate_downstream_ready(repo_root)
             init_orchestration(repo_root=repo_root, orchestration_id="orch_001")
             write_preflight(
                 repo_root=repo_root,
@@ -2535,6 +2555,7 @@ shell_tool                       stable             true
             out_path = repo_root / out_ref
             out_path.parent.mkdir(parents=True, exist_ok=True)
             out_path.write_text("binary-baseline\n", encoding="utf-8")
+            _fixture_generate_downstream_ready(repo_root)
             init_orchestration(repo_root=repo_root, orchestration_id="orch_001")
             write_preflight(
                 repo_root=repo_root,
@@ -3382,6 +3403,7 @@ shell_tool                       stable             true
                     agent_run_id="step_run_build_001",
                     payload={
                         "status": "fail",
+                        "validation_stage": "post_build",
                         "required_outputs": [],
                         "failed_substeps": [],
                         "substep_agent_run_ids": [],
@@ -4770,6 +4792,7 @@ class CheckpointResumeRuntimeTests(unittest.TestCase):
                 agent_run_id="step_run_build_001",
                 payload={
                     "status": "fail",
+                    "validation_stage": "post_build",
                     "required_outputs": [out_ref],
                     "failed_substeps": [],
                     "substep_agent_run_ids": [],
@@ -4938,6 +4961,44 @@ class CheckpointResumeRuntimeTests(unittest.TestCase):
             outj = json.loads(buf.getvalue())
             self.assertEqual(outj["completed_steps"], [])
 
+    def test_read_checkpoint_forbidden_without_resume(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            init_orchestration(repo_root=repo, orchestration_id="o2")
+            ck_path = repo / "workspace/orchestrations/o2/orchestration_checkpoint.json"
+            ck_path.write_text(
+                json.dumps(
+                    {
+                        "orchestration_id": "o2",
+                        "schema_version": "1",
+                        "completed_steps": [{"node_key": "problem/shallow_water2d@0.3.0", "step": "plan"}],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(RuntimeError, "read_checkpoint forbidden"):
+                read_checkpoint(repo_root=repo, orchestration_id="o2")
+
+    def test_read_checkpoint_allowed_when_resume_enabled(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            init_orchestration(repo_root=repo, orchestration_id="o3")
+            enable_checkpoint_resume(repo_root=repo, orchestration_id="o3")
+            ck_path = repo / "workspace/orchestrations/o3/orchestration_checkpoint.json"
+            ck_path.write_text(
+                json.dumps(
+                    {
+                        "orchestration_id": "o3",
+                        "schema_version": "1",
+                        "completed_steps": [{"node_key": "problem/shallow_water2d@0.3.0", "step": "plan"}],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            out = read_checkpoint(repo_root=repo, orchestration_id="o3")
+            self.assertIsInstance(out, dict)
+            self.assertEqual(len(out.get("completed_steps", [])), 1)
+
     def test_verify_checkpoint_integrity_cli(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp)
@@ -5020,6 +5081,117 @@ def _launchable_preflight_dict(**extra: object) -> dict[str, object]:
     }
     base.update(extra)
     return base
+
+
+class OrchestrationMetaAndJudgeHookTests(unittest.TestCase):
+    def test_write_preflight_persists_parallel_nodes_meta_without_init(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            orch = "preflight_only_orch"
+            with patch.dict(os.environ, {"CODEX_ALLOW_PARALLEL_NODES": "1"}):
+                write_preflight(
+                    repo_root=repo,
+                    orchestration_id=orch,
+                    payload=_launchable_preflight_dict(checked_at="2026-04-15T10:00:00Z"),
+                )
+            meta_path = repo / "workspace" / "orchestrations" / orch / "orchestration_meta.json"
+            self.assertTrue(meta_path.is_file())
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            self.assertTrue(meta.get("parallel_nodes_explicit"))
+            self.assertEqual(meta.get("parallel_nodes_policy"), "sequential_default")
+
+    def test_init_orchestration_merges_parallel_nodes_from_preflight_meta(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            orch = "preflight_then_init"
+            with patch.dict(os.environ, {"CODEX_ALLOW_PARALLEL_NODES": "true"}):
+                write_preflight(
+                    repo_root=repo,
+                    orchestration_id=orch,
+                    payload=_launchable_preflight_dict(checked_at="2026-04-15T10:00:00Z"),
+                )
+            init_orchestration(repo_root=repo, orchestration_id=orch)
+            meta_path = repo / "workspace" / "orchestrations" / orch / "orchestration_meta.json"
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            self.assertTrue(meta.get("parallel_nodes_explicit"))
+            self.assertEqual(meta.get("parallel_nodes_policy"), "sequential_default")
+            self.assertEqual(meta.get("orchestration_id"), orch)
+
+    def test_pre_orchestration_start_logs_persisted_parallel_nodes_explicit(self) -> None:
+        """setdefault で保持した値と hook 返却・ログ用 detail が一致すること。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            orch = "orch_parallel_audit"
+            with patch.dict(os.environ, {"CODEX_ALLOW_PARALLEL_NODES": "1"}):
+                out1 = pre_orchestration_start(repo, orch, event="init")
+            self.assertTrue(out1["parallel_nodes_explicit"])
+            meta_path = repo / "workspace" / "orchestrations" / orch / "orchestration_meta.json"
+            meta1 = json.loads(meta_path.read_text(encoding="utf-8"))
+            self.assertTrue(meta1.get("parallel_nodes_explicit"))
+            with patch.dict(os.environ, {}, clear=False):
+                os.environ.pop("CODEX_ALLOW_PARALLEL_NODES", None)
+                out2 = pre_orchestration_start(repo, orch, event="preflight")
+            self.assertTrue(out2["parallel_nodes_explicit"])
+            meta2 = json.loads(meta_path.read_text(encoding="utf-8"))
+            self.assertEqual(meta2.get("parallel_nodes_explicit"), meta1.get("parallel_nodes_explicit"))
+
+    def test_pre_phase_complete_judge_checks_rejects_pass_decision_with_fail_or_blocked(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            node_key = "problem/shallow_water2d@0.3.0"
+            nk_safe = "problem__shallow_water2d__0.3.0"
+            pipe_rel = "workspace/pipelines/judge_test_pipe"
+            base = repo / pipe_rel / "execute" / "ex_j1" / nk_safe
+            base.mkdir(parents=True)
+            (base / "semantic_review.json").write_text(
+                json.dumps({"decision": "pass"}),
+                encoding="utf-8",
+            )
+            lr_rel = "workspace/launches/judge_lr.json"
+            (repo / lr_rel).parent.mkdir(parents=True, exist_ok=True)
+            (repo / lr_rel).write_text(
+                json.dumps({"pipeline_ref": pipe_rel, "execution_id": "ex_j1"}),
+                encoding="utf-8",
+            )
+            payload = {"launch_request_ref": lr_rel}
+            for bad_status in ("fail", "blocked"):
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "decision=pass cannot accompany fail or blocked",
+                ):
+                    _pre_phase_complete_judge_checks(
+                        repo,
+                        node_key=node_key,
+                        status_token=bad_status,
+                        payload=payload,
+                    )
+
+    def test_pre_phase_complete_judge_checks_skips_semantic_review_on_timeout_or_cancel(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            node_key = "problem/shallow_water2d@0.3.0"
+            nk_safe = "problem__shallow_water2d__0.3.0"
+            pipe_rel = "workspace/pipelines/judge_timeout_pipe"
+            base = repo / pipe_rel / "execute" / "ex_to1" / nk_safe
+            base.mkdir(parents=True)
+            lr_rel = "workspace/launches/judge_lr_timeout.json"
+            (repo / lr_rel).parent.mkdir(parents=True, exist_ok=True)
+            (repo / lr_rel).write_text(
+                json.dumps({"pipeline_ref": pipe_rel, "execution_id": "ex_to1"}),
+                encoding="utf-8",
+            )
+            payload = {"launch_request_ref": lr_rel}
+            for st in ("timeout", "cancel"):
+                _pre_phase_complete_judge_checks(
+                    repo,
+                    node_key=node_key,
+                    status_token=st,
+                    payload=payload,
+                )
 
 
 class PreflightLiveProbeTtlTests(unittest.TestCase):
@@ -6832,6 +7004,74 @@ class TestPhase3RunGate(unittest.TestCase):
                     args_json={"paths": ["workspace/probe.json"]},
                     capability_token=token,
                 )
+
+    def test_run_gate_validate_pipeline_semantics_requires_stage(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            token = self._setup_run_gate_fixture(repo_root)
+            with self.assertRaisesRegex(ValueError, "pre_command_execute hook"):
+                run_gate(
+                    repo_root,
+                    orchestration_id="rg1",
+                    gate_name="validate_pipeline_semantics",
+                    agent_run_id="build_child_rg1",
+                    args_json={"pipeline-root": _FIX_PIPE_REF},
+                    capability_token=token,
+                )
+
+    def test_run_gate_validate_pipeline_semantics_rejects_wrong_stage_for_build(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            token = self._setup_run_gate_fixture(repo_root)
+            with self.assertRaisesRegex(ValueError, "pre_command_execute hook"):
+                run_gate(
+                    repo_root,
+                    orchestration_id="rg1",
+                    gate_name="validate_pipeline_semantics",
+                    agent_run_id="build_child_rg1",
+                    args_json={"stage": "plan", "pipeline-root": _FIX_PIPE_REF},
+                    capability_token=token,
+                )
+
+    def test_pre_phase_launch_blocks_build_when_generate_meta_not_pass(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            init_orchestration(repo_root=repo_root, orchestration_id="pl1")
+            write_preflight(
+                repo_root=repo_root,
+                orchestration_id="pl1",
+                payload={
+                    "status": "pass",
+                    "backend": "codex",
+                    "can_launch_step_agents": True,
+                    "can_launch_substep_agents": True,
+                    "feature_states": {"multi_agent": True},
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}],
+                },
+            )
+            pipe = repo_root / _FIX_PIPE_REF
+            (pipe / "generate" / "g1").mkdir(parents=True, exist_ok=True)
+            (pipe / "generate" / "g1" / "generate_meta.json").write_text(
+                json.dumps({"verification_status": "fail"}),
+                encoding="utf-8",
+            )
+            out = pre_phase_launch(
+                repo_root,
+                orchestration_id="pl1",
+                node_key="problem/shallow_water2d@0.3.0",
+                step="build",
+                backend="codex",
+                require_child_agent="step",
+                launch_request={
+                    "node_key": "problem/shallow_water2d@0.3.0",
+                    "step": "build",
+                    "pipeline_ref": _FIX_PIPE_REF,
+                    "plan_ref": _FIX_PLAN_REF,
+                    "dependency_ref": _FIX_DEP_REF,
+                },
+            )
+            self.assertEqual(out.get("status"), "fail_closed")
+            self.assertEqual(out.get("reason_code"), "downstream_artifact_not_ready")
 
     def test_run_gate_stdout_does_not_expose_input_file_body(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -69,6 +69,7 @@ def _maybe_enforce_orchestration_mcp_gate(
         agent_run_id=str(agent_raw).strip(),
         capability_token=str(cap_raw).strip(),
         tool_name=tool_name,
+        mcp_args=args,
     )
 SERVER_VERSION = "0.1.0"
 DEFAULT_PROTOCOL_VERSION = "2024-11-05"
