@@ -66,6 +66,47 @@ class HookCommonTests(unittest.TestCase):
         loaded = json.loads(stdout_text)
         self.assertEqual(loaded.get("decision"), "allow")
 
+    def test_claude_adapter_supported_events(self) -> None:
+        adapter = ClaudeHookAdapter()
+        events = adapter.supported_events()
+        self.assertIn(HookEventName.USER_PROMPT_SUBMIT, events)
+        self.assertIn(HookEventName.PRE_COMMAND_EXECUTE, events)
+        self.assertIn(HookEventName.POST_COMMAND_EXECUTE, events)
+        self.assertIn(HookEventName.STOP, events)
+        self.assertNotIn(HookEventName.SESSION_START, events)
+        self.assertNotIn(HookEventName.PERMISSION_REQUEST, events)
+
+    def test_claude_adapter_decode_event_extracts_command(self) -> None:
+        adapter = ClaudeHookAdapter()
+        decoded = adapter.decode_event(
+            "PreToolUse",
+            {"tool_name": "Bash", "tool_input": {"command": "echo hello"}},
+        )
+        self.assertEqual(decoded.event_name, HookEventName.PRE_COMMAND_EXECUTE)
+        self.assertEqual(decoded.tool_name, "Bash")
+        self.assertEqual(decoded.command, "echo hello")
+        self.assertEqual(decoded.backend, "claude")
+
+    def test_claude_adapter_decode_event_extracts_prompt(self) -> None:
+        adapter = ClaudeHookAdapter()
+        decoded = adapter.decode_event("UserPromptSubmit", {"prompt": "do something"})
+        self.assertEqual(decoded.event_name, HookEventName.USER_PROMPT_SUBMIT)
+        self.assertEqual(decoded.prompt, "do something")
+
+    def test_claude_adapter_decode_event_stop(self) -> None:
+        adapter = ClaudeHookAdapter()
+        decoded = adapter.decode_event("Stop", {"stop_reason": "end_turn"})
+        self.assertEqual(decoded.event_name, HookEventName.STOP)
+
+    def test_claude_adapter_common_policy_blocks_git_reset_hard(self) -> None:
+        adapter = ClaudeHookAdapter()
+        decoded = adapter.decode_event(
+            "PreToolUse",
+            {"tool_name": "Bash", "tool_input": {"command": "git reset --hard HEAD~1"}},
+        )
+        decision = evaluate_common_policy(decoded)
+        self.assertEqual(decision.action, HookDecisionAction.BLOCK)
+
     def test_claude_adapter_encode_decision_block_uses_nonzero_exit(self) -> None:
         adapter = ClaudeHookAdapter()
         code, stdout_text = adapter.encode_decision(
@@ -76,14 +117,23 @@ class HookCommonTests(unittest.TestCase):
         self.assertEqual(loaded.get("decision"), "block")
         self.assertEqual(loaded.get("reason"), "denied")
 
-    def test_claude_adapter_encode_decision_allow_matches_codex_shape(self) -> None:
-        claude = ClaudeHookAdapter()
-        codex = CodexHookAdapter()
-        decision = HookDecision(action=HookDecisionAction.ALLOW)
-        self.assertEqual(
-            claude.encode_decision(decision),
-            codex.encode_decision(decision),
+    def test_claude_adapter_encode_decision_allow_omits_continue_processing(self) -> None:
+        adapter = ClaudeHookAdapter()
+        code, stdout_text = adapter.encode_decision(HookDecision(action=HookDecisionAction.ALLOW))
+        self.assertEqual(code, 0)
+        body = json.loads(stdout_text)
+        self.assertEqual(body.get("decision"), "allow")
+        self.assertNotIn("continue_processing", body)
+
+    def test_claude_adapter_encode_decision_block_omits_continue_processing(self) -> None:
+        adapter = ClaudeHookAdapter()
+        code, stdout_text = adapter.encode_decision(
+            HookDecision(action=HookDecisionAction.BLOCK, reason="denied")
         )
+        self.assertEqual(code, 2)
+        body = json.loads(stdout_text)
+        self.assertEqual(body.get("decision"), "block")
+        self.assertNotIn("continue_processing", body)
 
 
 if __name__ == "__main__":

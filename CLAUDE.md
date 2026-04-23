@@ -21,7 +21,9 @@
 - backend 固有の呼び出し仕様は `tools/hooks/adapters/` 配下の adapter で吸収する。
 - `Codex` の hook 呼び出し定義は `.codex/hooks.json` を canonical source とする。
 - `codex` backend の `preflight` は `feature_states.codex_hooks=true` を必須とする。`codex_hooks` が未有効な環境は `status=fail` として停止する。
-- `Claude Code` は現時点で hook adapter の skeleton のみを提供し、runtime gate を継続使用する。
+- `Claude Code` の hook 呼び出し定義は `.claude/settings.json` の `hooks` セクションを canonical source とする。`PreToolUse` / `PostToolUse` / `UserPromptSubmit` / `Stop` の 4 イベントを配線する。
+- `Claude Code` backend は feature flag probe が不要であり、`codex_hooks` 必須チェックは Codex backend 限定。共通ポリシーは `tools/hooks/common.py` の `evaluate_common_policy()` に従う。
+- `.claude/settings.json` の `matcher` は **完全一致文字列**（正規表現ではない）。`.codex/hooks.json` の `^Bash$` とは異なり、`"Bash"` と記述する。
 
 ## Claude Code 固有の実行規約
 

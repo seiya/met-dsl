@@ -1,0 +1,48 @@
+{
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh -lc 'ROOT=$(git rev-parse --show-toplevel) || exit 2; PYTHONPATH=\"$ROOT${PYTHONPATH:+:$PYTHONPATH}\" CLAUDE_HOOK_REPO_ROOT=\"$ROOT\" CODEX_HOOK_MISSING_ORCHESTRATION_ID_POLICY=global python3 -m tools.hooks.cli --backend claude --event UserPromptSubmit --repo-root \"$ROOT\"'"
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh -lc 'ROOT=$(git rev-parse --show-toplevel) || exit 2; PYTHONPATH=\"$ROOT${PYTHONPATH:+:$PYTHONPATH}\" CLAUDE_HOOK_REPO_ROOT=\"$ROOT\" CODEX_HOOK_MISSING_ORCHESTRATION_ID_POLICY=global python3 -m tools.hooks.cli --backend claude --event PreToolUse --repo-root \"$ROOT\"'"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh -lc 'ROOT=$(git rev-parse --show-toplevel) || exit 2; PYTHONPATH=\"$ROOT${PYTHONPATH:+:$PYTHONPATH}\" CLAUDE_HOOK_REPO_ROOT=\"$ROOT\" CODEX_HOOK_MISSING_ORCHESTRATION_ID_POLICY=global python3 -m tools.hooks.cli --backend claude --event PostToolUse --repo-root \"$ROOT\"'"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh -lc 'ROOT=$(git rev-parse --show-toplevel) || exit 2; PYTHONPATH=\"$ROOT${PYTHONPATH:+:$PYTHONPATH}\" CLAUDE_HOOK_REPO_ROOT=\"$ROOT\" CODEX_HOOK_MISSING_ORCHESTRATION_ID_POLICY=global python3 -m tools.hooks.cli --backend claude --event Stop --repo-root \"$ROOT\"'"
+          }
+        ]
+      }
+    ]
+  }
+}

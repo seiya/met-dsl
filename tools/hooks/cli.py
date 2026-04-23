@@ -38,7 +38,7 @@ def _load_payload(args: argparse.Namespace) -> dict[str, Any]:
 def _resolve_event_name(args: argparse.Namespace, payload: dict[str, Any]) -> HookEventName:
     if args.event:
         return normalize_hook_event_name(args.event)
-    for key in ("event_name", "event", "hook_event"):
+    for key in ("event_name", "event", "hook_event", "hook_event_name"):
         value = payload.get(key)
         if isinstance(value, str) and value.strip():
             return normalize_hook_event_name(value)
@@ -111,8 +111,11 @@ def _append_hook_audit(
         handle.write(json.dumps(entry, ensure_ascii=False) + "\n")
 
 
-def _resolve_repo_root(payload: dict[str, Any]) -> Path:
-    env_repo_root = os.environ.get("CODEX_HOOK_REPO_ROOT", "").strip()
+def _resolve_repo_root(payload: dict[str, Any], backend: str = "") -> Path:
+    env_key = (
+        "CLAUDE_HOOK_REPO_ROOT" if backend.strip().lower() == "claude" else "CODEX_HOOK_REPO_ROOT"
+    )
+    env_repo_root = os.environ.get(env_key, "").strip()
     if env_repo_root:
         return Path(env_repo_root).resolve()
     repo_root_raw = payload.get("repo_root")
@@ -242,7 +245,7 @@ def main(argv: list[str] | None = None) -> int:
         event_name = _resolve_event_name(args, payload)
         adapter = _adapter_for_backend(args.backend)
         orchestration_id = _extract_orchestration_id(payload)
-        repo_root = _resolve_repo_root(payload)
+        repo_root = _resolve_repo_root(payload, backend=args.backend)
         missing_id_policy = os.environ.get(
             "CODEX_HOOK_MISSING_ORCHESTRATION_ID_POLICY", "error"
         ).strip().lower()

@@ -496,5 +496,208 @@ class HookCliTests(unittest.TestCase):
                     self.assertEqual(code, 2)
 
 
+class ClaudeHookCliTests(unittest.TestCase):
+    def test_claude_backend_allows_safe_command(self) -> None:
+        repo_root = Path(__file__).resolve().parents[2]
+        payload = {
+            "orchestration_id": "orch_claude_allow_001",
+            "tool_name": "Bash",
+            "tool_input": {"command": "echo hello"},
+        }
+        proc = subprocess.run(
+            [
+                "python3",
+                "-m",
+                "tools.hooks.cli",
+                "--backend",
+                "claude",
+                "--event",
+                "PreToolUse",
+                "--input-json",
+                json.dumps(payload),
+            ],
+            cwd=str(repo_root),
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(proc.returncode, 0)
+        body = json.loads(proc.stdout.strip())
+        self.assertEqual(body.get("decision"), "allow")
+
+    def test_claude_backend_blocks_git_reset_hard(self) -> None:
+        repo_root = Path(__file__).resolve().parents[2]
+        payload = {
+            "orchestration_id": "orch_claude_block_001",
+            "tool_name": "Bash",
+            "tool_input": {"command": "git reset --hard HEAD~1"},
+        }
+        proc = subprocess.run(
+            [
+                "python3",
+                "-m",
+                "tools.hooks.cli",
+                "--backend",
+                "claude",
+                "--event",
+                "PreToolUse",
+                "--input-json",
+                json.dumps(payload),
+            ],
+            cwd=str(repo_root),
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(proc.returncode, 2)
+        body = json.loads(proc.stdout.strip())
+        self.assertEqual(body.get("decision"), "block")
+
+    def test_claude_backend_does_not_require_codex_hooks_feature(self) -> None:
+        """Claude backend must not invoke the Codex feature probe at all."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root_path = Path(tmp)
+            payload = {
+                "orchestration_id": "orch_claude_noprobe_001",
+                "repo_root": str(repo_root_path),
+                "tool_name": "Bash",
+                "tool_input": {"command": "echo hi"},
+            }
+            with patch("tools.hooks.cli.codex_hooks_feature_enabled") as probe_mock:
+                probe_mock.side_effect = AssertionError("codex probe must not be called for claude")
+                out = io.StringIO()
+                with redirect_stdout(out):
+                    code = cli.main(
+                        [
+                            "--backend",
+                            "claude",
+                            "--event",
+                            "PreToolUse",
+                            "--input-json",
+                            json.dumps(payload),
+                        ]
+                    )
+                self.assertEqual(code, 0)
+                body = json.loads(out.getvalue().strip())
+                self.assertEqual(body.get("decision"), "allow")
+
+    def test_claude_backend_uses_global_policy_for_missing_orchestration_id(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root_path = Path(tmp)
+            payload = {
+                "repo_root": str(repo_root_path),
+                "tool_name": "Bash",
+                "tool_input": {"command": "echo hi"},
+            }
+            with patch.dict(os.environ, {"CODEX_HOOK_MISSING_ORCHESTRATION_ID_POLICY": "global"}):
+                out = io.StringIO()
+                with redirect_stdout(out):
+                    code = cli.main(
+                        [
+                            "--backend",
+                            "claude",
+                            "--event",
+                            "PreToolUse",
+                            "--input-json",
+                            json.dumps(payload),
+                        ]
+                    )
+                self.assertEqual(code, 0)
+                log_path = (
+                    repo_root_path
+                    / "workspace"
+                    / "orchestrations"
+                    / "_global"
+                    / "hooks"
+                    / "native_hook_events.jsonl"
+                )
+                self.assertTrue(log_path.is_file())
+                entry = json.loads(log_path.read_text(encoding="utf-8").strip())
+                self.assertEqual(entry.get("backend"), "claude")
+
+    def test_claude_backend_settings_json_command_works(self) -> None:
+        repo_root = Path(__file__).resolve().parents[2]
+        settings_doc = json.loads(
+            (repo_root / ".claude" / "settings.json").read_text(encoding="utf-8")
+        )
+        command = settings_doc["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
+        payload = {
+            "orchestration_id": "orch_claude_settings_001",
+            "tool_name": "Bash",
+            "tool_input": {"command": "echo hello"},
+        }
+        proc = subprocess.run(
+            command,
+            cwd=str(repo_root / "tools"),
+            text=True,
+            capture_output=True,
+            input=json.dumps(payload),
+            shell=True,
+            check=False,
+        )
+        self.assertEqual(proc.returncode, 0)
+        body = json.loads(proc.stdout.strip())
+        self.assertEqual(body.get("decision"), "allow")
+
+    def test_resolve_repo_root_uses_claude_env_for_claude_backend(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            # Include CODEX_HOOK_REPO_ROOT in patch.dict so it is restored on exit,
+            # then pop it so only CLAUDE_HOOK_REPO_ROOT is active.
+            with patch.dict(os.environ, {"CLAUDE_HOOK_REPO_ROOT": tmp, "CODEX_HOOK_REPO_ROOT": ""}):
+                os.environ.pop("CODEX_HOOK_REPO_ROOT", None)
+                result = cli._resolve_repo_root({}, backend="claude")
+                self.assertEqual(result, Path(tmp).resolve())
+
+    def test_resolve_repo_root_uses_codex_env_for_codex_backend(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            # Include CLAUDE_HOOK_REPO_ROOT in patch.dict so it is restored on exit,
+            # then pop it so only CODEX_HOOK_REPO_ROOT is active.
+            with patch.dict(os.environ, {"CODEX_HOOK_REPO_ROOT": tmp, "CLAUDE_HOOK_REPO_ROOT": ""}):
+                os.environ.pop("CLAUDE_HOOK_REPO_ROOT", None)
+                result = cli._resolve_repo_root({}, backend="codex")
+                self.assertEqual(result, Path(tmp).resolve())
+
+    def test_resolve_repo_root_claude_backend_ignores_codex_env(self) -> None:
+        """Claude backend must not pick up CODEX_HOOK_REPO_ROOT."""
+        with tempfile.TemporaryDirectory() as codex_tmp:
+            with tempfile.TemporaryDirectory() as claude_tmp:
+                with patch.dict(
+                    os.environ,
+                    {"CODEX_HOOK_REPO_ROOT": codex_tmp, "CLAUDE_HOOK_REPO_ROOT": claude_tmp},
+                ):
+                    result = cli._resolve_repo_root({}, backend="claude")
+                    self.assertEqual(result, Path(claude_tmp).resolve())
+                    self.assertNotEqual(result, Path(codex_tmp).resolve())
+
+    def test_claude_backend_user_prompt_submit_uses_global_without_orchestration_id(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root_path = Path(tmp)
+            payload = {"repo_root": str(repo_root_path), "prompt": "do something"}
+            out = io.StringIO()
+            with redirect_stdout(out):
+                code = cli.main(
+                    [
+                        "--backend",
+                        "claude",
+                        "--event",
+                        "UserPromptSubmit",
+                        "--input-json",
+                        json.dumps(payload),
+                    ]
+                )
+            self.assertEqual(code, 0)
+            log_path = (
+                repo_root_path
+                / "workspace"
+                / "orchestrations"
+                / "_global"
+                / "hooks"
+                / "native_hook_events.jsonl"
+            )
+            self.assertTrue(log_path.is_file())
+            entry = json.loads(log_path.read_text(encoding="utf-8").strip())
+            self.assertEqual(entry.get("event"), "user_prompt_submit")
+
+
 if __name__ == "__main__":
     unittest.main()
