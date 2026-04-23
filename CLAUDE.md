@@ -16,6 +16,13 @@
 | Cursor | `cursor` | `spawn_agent` | `spawn_agent` 実応答から取得 |
 | Claude Code | `claude` | `Agent` tool | 起動前に発行した `agent_run_id` を `agent_session_id` として代用する |
 
+## hook 実装方針
+- backend 非依存の検証は `tools/hooks/common.py` を canonical source とする。
+- backend 固有の呼び出し仕様は `tools/hooks/adapters/` 配下の adapter で吸収する。
+- `Codex` の hook 呼び出し定義は `.codex/hooks.json` を canonical source とする。
+- `codex` backend の `preflight` は `feature_states.codex_hooks=true` を必須とする。`codex_hooks` が未有効な環境は `status=fail` として停止する。
+- `Claude Code` は現時点で hook adapter の skeleton のみを提供し、runtime gate を継続使用する。
+
 ## Claude Code 固有の実行規約
 
 ### preflight

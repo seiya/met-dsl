@@ -19,6 +19,8 @@
 - `Build` / `Execute` / `quality check` は `MCP` サーバー経由で実行し、`AGENTS.md` の `MCP 実行ルール` と対応 `SKILL.md` の契約を同時適用する。
 - 各 phase は、対応 `SKILL.md` に定義された必須出力（例: `plan_meta.json`、`build_meta.json`、`verdict.json`）を欠落させてはならない。
 - `SKILL.md` へは実行手順と当該 `SKILL` 固有の手続きを記述し、`phase` の I/O 契約・artifact 形式・数値的正規要件を `docs/workflow/WORKFLOW_CORE.md` または `docs/workflow/phases/phase_*.md` と矛盾する形で重複定義してはならない。
+- hook 実装は backend 非依存の `common validation` と backend 固有の adapter を分離し、`common validation` は `tools/hooks/common.py`、backend adapter は `tools/hooks/adapters/` を canonical source とする。
+- `codex` backend では `.codex/hooks.json` を hook 呼び出し定義の canonical source とし、`preflight` 判定で `feature_states.codex_hooks=true` を必須とする。
 
 ## 責務判定フロー
 1. 追加・変更する規則が workflow artifact の正当性を直接左右するかを判定する。

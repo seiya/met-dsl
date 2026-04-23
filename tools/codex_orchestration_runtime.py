@@ -17,6 +17,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Sequence
 
+from tools.hooks.common import validate_pipeline_semantics_stage
 
 TERMINAL_STATUSES = {"pass", "fail", "blocked", "timeout", "cancel"}
 # Judge の pre_phase_complete 検証で semantic_review を要求しない終了理由（未完了扱い）。
@@ -91,19 +92,6 @@ STEP_REQUIRED_CHILD_AGENT: dict[str, str] = {
     "execute": "step",
     "judge": "step",
     "promote": "step",
-}
-
-# `run-gate` の `validate_pipeline_semantics` で許可する `--stage` と capability `step` の対応。
-_PIPELINE_SEMANTICS_STAGES_FOR_STEP: dict[str, frozenset[str]] = {
-    "plan": frozenset({"plan", "full"}),
-    "generate": frozenset({"post_generate", "post_build", "full"}),
-    "tune": frozenset({"post_generate", "post_build", "full"}),
-    "build": frozenset({"post_build", "full"}),
-    "execute": frozenset({"post_execute", "full"}),
-    "judge": frozenset({"pre_judge", "full"}),
-    "promote": frozenset(
-        {"plan", "post_generate", "post_build", "post_execute", "pre_judge", "full"}
-    ),
 }
 
 FAIL_CLOSED_REASON_CODES = {
@@ -1508,34 +1496,7 @@ def _pre_command_execute_validate_pipeline_semantics(
     if not isinstance(cap, dict):
         return
     step_key = str(cap.get("step", "")).strip().lower()
-    stage = args_json.get("stage") or args_json.get("--stage")
-    if not isinstance(stage, str) or not stage.strip():
-        raise ValueError(
-            "pre_command_execute hook: validate_pipeline_semantics requires args_json.stage "
-            "(or --stage) as non-empty string"
-        )
-    stage_l = stage.strip().lower()
-    allowed = _PIPELINE_SEMANTICS_STAGES_FOR_STEP.get(step_key)
-    if allowed is not None and stage_l not in allowed:
-        raise ValueError(
-            "pre_command_execute hook: validate_pipeline_semantics "
-            f"--stage {stage_l!r} not permitted for capability step={step_key!r} "
-            f"(allowed={sorted(allowed)})"
-        )
-    if stage_l == "pre_judge":
-        for key, val in args_json.items():
-            key_s = str(key).lower().replace("_", "-")
-            if "allow-missing-orchestration" in key_s or "allow-missing-llm-review" in key_s:
-                if val is True or val == 1:
-                    raise ValueError(
-                        "pre_command_execute hook: pre_judge forbids allow-missing-orchestration "
-                        "and allow-missing-llm-review"
-                    )
-                if isinstance(val, str) and val.strip().lower() in {"true", "1", "yes"}:
-                    raise ValueError(
-                        "pre_command_execute hook: pre_judge forbids allow-missing-orchestration "
-                        "and allow-missing-llm-review"
-                    )
+    stage_l = validate_pipeline_semantics_stage(step_key=step_key, args_json=args_json)
     _append_workflow_hook_log(
         repo_root,
         orchestration_id,
@@ -2425,27 +2386,35 @@ def _preflight_allows_agent_launch(payload: dict[str, Any]) -> bool:
         return False
     if feature_states.get("multi_agent") is not True:
         return False
+    backend_token = str(payload.get("backend", "")).strip().lower()
+    codex_hooks = feature_states.get("codex_hooks")
+    if backend_token == "codex" and codex_hooks is not True:
+        return False
 
     checks = payload.get("checks")
     if not isinstance(checks, list):
         return False
     multi_agent_check_pass: bool | None = None
+    codex_hooks_check_pass: bool | None = None
     for item in checks:
         if not isinstance(item, dict):
             continue
-        if item.get("name") != "multi_agent_enabled":
-            continue
+        check_name = item.get("name")
         pass_value = item.get("pass")
-        if isinstance(pass_value, bool):
+        if check_name == "multi_agent_enabled" and isinstance(pass_value, bool):
             multi_agent_check_pass = pass_value
-            break
+        if check_name == "codex_hooks_enabled" and isinstance(pass_value, bool):
+            codex_hooks_check_pass = pass_value
 
-    return (
+    launchable = (
         payload.get("status") == "pass"
         and payload.get("can_launch_step_agents") is True
         and payload.get("can_launch_substep_agents") is True
         and multi_agent_check_pass is True
     )
+    if backend_token == "codex":
+        launchable = launchable and codex_hooks_check_pass is True
+    return launchable
 
 
 def _validate_preflight_payload(payload: dict[str, Any]) -> None:
@@ -2458,6 +2427,7 @@ def _validate_preflight_payload(payload: dict[str, Any]) -> None:
         )
 
     feature_states = payload.get("feature_states")
+    backend_token = str(payload.get("backend", "")).strip().lower()
     if isinstance(feature_states, dict):
         multi_agent = feature_states.get("multi_agent")
         if isinstance(multi_agent, bool) and not multi_agent:
@@ -2467,19 +2437,32 @@ def _validate_preflight_payload(payload: dict[str, Any]) -> None:
                 raise ValueError(
                     "feature_states.multi_agent=false is incompatible with launchable preflight"
                 )
+        codex_hooks = feature_states.get("codex_hooks")
+        if (
+            backend_token == "codex"
+            and codex_hooks is not True
+            and (
+                payload.get("can_launch_step_agents") is True
+                or payload.get("can_launch_substep_agents") is True
+            )
+        ):
+            raise ValueError(
+                "feature_states.codex_hooks=true is required for codex launchable preflight"
+            )
 
     checks = payload.get("checks")
     if isinstance(checks, list):
         multi_agent_check_pass: bool | None = None
+        codex_hooks_check_pass: bool | None = None
         for item in checks:
             if not isinstance(item, dict):
                 continue
-            if item.get("name") != "multi_agent_enabled":
-                continue
+            check_name = item.get("name")
             pass_value = item.get("pass")
-            if isinstance(pass_value, bool):
+            if check_name == "multi_agent_enabled" and isinstance(pass_value, bool):
                 multi_agent_check_pass = pass_value
-                break
+            if check_name == "codex_hooks_enabled" and isinstance(pass_value, bool):
+                codex_hooks_check_pass = pass_value
         if multi_agent_check_pass is False:
             if payload.get("can_launch_step_agents") is True or payload.get(
                 "can_launch_substep_agents"
@@ -2487,6 +2470,17 @@ def _validate_preflight_payload(payload: dict[str, Any]) -> None:
                 raise ValueError(
                     "checks.multi_agent_enabled.pass=false is incompatible with launchable preflight"
                 )
+        if (
+            backend_token == "codex"
+            and codex_hooks_check_pass is not True
+            and (
+                payload.get("can_launch_step_agents") is True
+                or payload.get("can_launch_substep_agents") is True
+            )
+        ):
+            raise ValueError(
+                "checks.codex_hooks_enabled.pass=true is required for codex launchable preflight"
+            )
     elif (
         payload.get("status") == "pass"
         and payload.get("can_launch_step_agents") is True
@@ -2504,6 +2498,10 @@ def _validate_preflight_payload(payload: dict[str, Any]) -> None:
         if not isinstance(feature_states, dict) or feature_states.get("multi_agent") is not True:
             raise ValueError(
                 "feature_states.multi_agent=true is required when preflight is launchable"
+            )
+        if backend_token == "codex" and feature_states.get("codex_hooks") is not True:
+            raise ValueError(
+                "feature_states.codex_hooks=true is required when codex preflight is launchable"
             )
 
 
@@ -4539,6 +4537,15 @@ def probe_execution_platform(
         can_launch_agents = _can_launch_from_help_fallback_checks(backend_token, checks)
     else:
         can_launch_agents = _all_strict_boolean_probe_checks_pass(checks)
+        codex_hooks_enabled = features.get("codex_hooks") is True
+        checks.append(
+            {
+                "name": "codex_hooks_enabled",
+                "pass": codex_hooks_enabled,
+                "detail": f"codex_hooks={features.get('codex_hooks')}",
+            }
+        )
+        can_launch_agents = can_launch_agents and codex_hooks_enabled
     session_policy = {
         "allow_step_agent_launch": os.environ.get("CODEX_ALLOW_STEP_AGENT_LAUNCH", "1").strip().lower()
         not in {"0", "false", "no"},
@@ -4554,6 +4561,7 @@ def probe_execution_platform(
         "agent_version": agent_version,
         "feature_states": features,
         "checks": checks,
+        "codex_hooks_enabled": (features.get("codex_hooks") is True) if backend_token == "codex" else None,
         "can_launch_step_agents": can_launch_agents,
         "can_launch_substep_agents": can_launch_agents,
         "session_policy": session_policy,

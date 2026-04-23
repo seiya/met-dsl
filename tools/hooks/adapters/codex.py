@@ -1,0 +1,82 @@
+#!/usr/bin/env python3
+"""Codex hook adapter."""
+
+from __future__ import annotations
+
+import json
+from typing import Any
+
+from tools.hooks.common import (
+    HookBackendAdapter,
+    HookDecision,
+    HookDecisionAction,
+    HookEventName,
+    HookInput,
+    normalize_hook_event_name,
+)
+
+
+def _event_payload_value(payload: dict[str, Any], key: str) -> Any:
+    value = payload.get(key)
+    if value is not None:
+        return value
+    event_payload = payload.get("payload")
+    if isinstance(event_payload, dict):
+        return event_payload.get(key)
+    return None
+
+
+class CodexHookAdapter(HookBackendAdapter):
+    def supported_events(self) -> set[HookEventName]:
+        return {
+            HookEventName.SESSION_START,
+            HookEventName.USER_PROMPT_SUBMIT,
+            HookEventName.PRE_COMMAND_EXECUTE,
+            HookEventName.PERMISSION_REQUEST,
+            HookEventName.POST_COMMAND_EXECUTE,
+            HookEventName.STOP,
+        }
+
+    def decode_event(self, event_name: str, payload: dict[str, Any]) -> HookInput:
+        normalized = normalize_hook_event_name(event_name)
+        command = _event_payload_value(payload, "command")
+        if not isinstance(command, str) or not command.strip():
+            tool_input = _event_payload_value(payload, "tool_input")
+            if isinstance(tool_input, dict):
+                ti_command = tool_input.get("command")
+                if isinstance(ti_command, str) and ti_command.strip():
+                    command = ti_command.strip()
+                else:
+                    command = None
+            else:
+                command = None
+        prompt = _event_payload_value(payload, "prompt")
+        tool_name = _event_payload_value(payload, "tool_name")
+        return HookInput(
+            event_name=normalized,
+            backend="codex",
+            payload=payload,
+            command=command if isinstance(command, str) else None,
+            prompt=prompt if isinstance(prompt, str) else None,
+            tool_name=tool_name if isinstance(tool_name, str) else None,
+        )
+
+    def encode_decision(self, decision: HookDecision) -> tuple[int, str]:
+        if decision.action == HookDecisionAction.BLOCK:
+            body = {
+                "decision": "block",
+                "reason": decision.reason or "blocked by policy",
+                "continue_processing": bool(decision.continue_processing),
+            }
+            return 2, json.dumps(body, ensure_ascii=False)
+
+        if decision.action == HookDecisionAction.CONTINUE_WITH_MESSAGE:
+            body = {
+                "decision": "continue",
+                "message": decision.additional_context or "",
+                "continue_processing": bool(decision.continue_processing),
+            }
+            return 0, json.dumps(body, ensure_ascii=False)
+
+        body = {"decision": "allow", "continue_processing": bool(decision.continue_processing)}
+        return 0, json.dumps(body, ensure_ascii=False)

@@ -19,6 +19,8 @@
 ## 要件
 - `workflow` 実行は、必ず 1 つの `orchestration agent` を最初に起動して開始する。
 - `workflow` 開始前に、`step agent` と `substep agent` を独立起動できる execution platform の preflight を必須実行しなければならない。preflight は `multi_agent` 機能と子 `agent` 起動可否を検証対象に含め、`pass` でない場合は `workflow` を開始してはならない。
+- `backend=codex` の preflight は、`feature_states.codex_hooks=true` と `checks.codex_hooks_enabled.pass=true` を同時に満たさなければならない。いずれかが未充足または未定義の場合、`workflow` を開始してはならない。
+- native hook 実行時の `codex_hooks` feature 判定は、`orchestration_id` ごとに最初の 1 回だけ実行し、結果を `workspace/orchestrations/<orchestration_id>/hooks/codex_feature_check.json` へキャッシュしなければならない。
 - `preflight.json` の手動編集または後編集による `pass` 化を禁止する。preflight 結果は実行時検査の一次証跡としてのみ記録しなければならない。
 - 子 `agent` 起動直前に、execution platform の live probe で `multi_agent` と子 `agent` 起動可否を再検査しなければならない。live probe は `record-launch` 実行時に適用し、`fail` の場合は `record-launch` と子 `agent` 起動を禁止し、当該 `workflow` を `fail` へ遷移させなければならない。
 - 各 phase の着手前に `workflow-launch-check` を実行し、required child `agent` 種別判定、execution platform 可否、session policy 可否、dependency readiness を同時に検査しなければならない。dependency readiness は `orchestration_meta.json.dependency_readiness` を canonical source とし、`direct_dependency_plan_readiness` と `direct_dependency_execution_readiness` と `detail`（`plan_ref_verified` と `pipeline_ref_verified` と `aggregate_verdict_verified`）を検査する。`dependency_readiness` 未記録または未充足のいずれも `fail_closed` とし、phase 本体へ進めてはならない。
@@ -143,12 +145,15 @@
 35. 子 `agent` 起動直前の live probe が `fail` の場合、`record-launch` を実行してはならない。`orchestration_meta.status=fail` を記録して停止しなければならない。`record-agent-run`（`step` / `substep`）と `write-step-result` は `preflight.json` の整合確認を満たす場合のみ実行してよい。
 36. `record-launch` が実行する live probe は、`CODEX_PREFLIGHT_TTL_SECONDS` で設定した TTL（デフォルト 30 分）以内に成功済みのプローブが存在する場合はスキップされる。この最適化は `CODEX_ORCHESTRATION_ENFORCE_LIVE_PREFLIGHT=1` が明示設定されている場合は無効化され、常に live probe が実行される（後方互換）。
 37. `preflight.json` の `probed_at` フィールドは live probe 成功時に自動更新される。`status` / `can_launch_*` を含むその他フィールドの変更は引き続き禁止する。
-38. 子 `agent` 必須 phase で契約に反する近道へ逸脱しそうな場合、`orchestration agent` は当該 phase が子 `agent` 起動必須であることを明示し、正規の起動手順へ復帰しなければならない。逸脱を理由とするローカル継続実装を禁止する。
-39. `write-step-result` が `status=pass` で完了した後、`orchestration_checkpoint.json` が `tools/codex_orchestration_runtime.py` により自動更新される。`orchestration_checkpoint.json` の手動編集を禁止する。
-40. `resume_enabled=true` の orchestration において、`orchestration agent` は `check-step-completed` を各 `step` 起動前に実行し、`completed=true` かつ `integrity=ok` の場合のみ当該 `step` のスキップを許可する。
-41. チェックポイントによりスキップした `step` は `agent_runs.jsonl` に `agent_role=skipped_by_checkpoint` として記録しなければならない。
-42. `resume_enabled=false` の orchestration（未設定を含む）では `orchestration_checkpoint.json` を信頼して `step` をスキップしてはならない。`docs/workflow/WORKFLOW_CORE.md` の該当ハードニング規範における「明示的な指定」は `orchestration_meta.json` の `resume_enabled=true` のみが満たす。
-43. `write-step-result` の `status=pass` では、`Generate` / `Build` / `Execute` / `Judge` の `step_result.json` に `validation_stage` を必須記録しなければならない。許容値は `Generate: post_generate|full`、`Build: post_build|full`、`Execute: post_execute|pre_judge|full`、`Judge: pre_judge|full` とする。`Plan` と `Tune` は `validation_stage` を必須にしない。
+38. native hook の実行結果は `workspace/orchestrations/<orchestration_id>/hooks/native_hook_events.jsonl` へ追記し、`backend` と `event` と `action` と `reason` を追跡可能にしなければならない。
+39. native hook 実行 payload に `orchestration_id` が存在しない場合、既定動作は `error` として当該 hook を失敗させなければならない。`SessionStart` と `UserPromptSubmit` は例外として `workspace/orchestrations/_global/hooks/native_hook_events.jsonl` への記録を既定許可してよい。その他の event で `global` 記録を許可する場合は `CODEX_HOOK_MISSING_ORCHESTRATION_ID_POLICY=global` を明示しなければならない。
+40. 子 `agent` 必須 phase で契約に反する近道へ逸脱しそうな場合、`orchestration agent` は当該 phase が子 `agent` 起動必須であることを明示し、正規の起動手順へ復帰しなければならない。逸脱を理由とするローカル継続実装を禁止する。
+41. `write-step-result` が `status=pass` で完了した後、`orchestration_checkpoint.json` が `tools/codex_orchestration_runtime.py` により自動更新される。`orchestration_checkpoint.json` の手動編集を禁止する。
+42. `resume_enabled=true` の orchestration において、`orchestration agent` は `check-step-completed` を各 `step` 起動前に実行し、`completed=true` かつ `integrity=ok` の場合のみ当該 `step` のスキップを許可する。
+43. チェックポイントによりスキップした `step` は `agent_runs.jsonl` に `agent_role=skipped_by_checkpoint` として記録しなければならない。
+44. `resume_enabled=false` の orchestration（未設定を含む）では `orchestration_checkpoint.json` を信頼して `step` をスキップしてはならない。`docs/workflow/WORKFLOW_CORE.md` の該当ハードニング規範における「明示的な指定」は `orchestration_meta.json` の `resume_enabled=true` のみが満たす。
+45. `write-step-result` の `status=pass` では、`Generate` / `Build` / `Execute` / `Judge` の `step_result.json` に `validation_stage` を必須記録しなければならない。許容値は `Generate: post_generate|full`、`Build: post_build|full`、`Execute: post_execute|pre_judge|full`、`Judge: pre_judge|full` とする。`Plan` と `Tune` は `validation_stage` を必須にしない。
+46. `codex_feature_check.json` の `status_kind=probe_error`（timeout や command failure）の結果は永続固定してはならない。`CODEX_HOOK_FEATURE_RETRY_TTL_SECONDS`（既定 30 秒）経過後に再プローブを許可しなければならない。
 
 ## 判定基準
 - `workflow` ごとに `orchestration_id` が発行され、`orchestration_meta.json` が存在する。
@@ -161,10 +166,12 @@
 - `launches/<agent_run_id>.prompt.txt` が `skills/workflow-orchestration/references/launch_prompts.md` の対応テンプレートを基底としており、テンプレート必須項目の欠落または意味変更が存在しない。
 - 子 `agent` の全 `launches/<agent_run_id>.request.json` に `skill_name` と `skill_ref` と `skill_must_read_refs` が記録されている。
 - `preflight.json` が存在し、`can_launch_step_agents=true` と `can_launch_substep_agents=true` を満たす。
+- `backend=codex` の preflight では、`feature_states.codex_hooks=true` と `checks.codex_hooks_enabled.pass=true` が記録されている。
 - `preflight.json` の `pass` 条件と、子 `agent` 起動直前 live probe の `pass` 条件が同時に満たされる。
 - 各 phase の実行記録から、`Plan` / `Generate` / `Tune` は `substep agent`、`Build` / `Execute` / `Judge` / `Promote` は `step agent` を使用したことを追跡できる。
 - `agent_graph.json` で `orchestration -> step` または `orchestration -> substep` の親子関係を追跡できる。
 - `agent_runs.jsonl` から `queued` / `running` / `pass` / `fail` / `blocked` / `timeout` / `cancel` の遷移を追跡できる。
+- `hooks/native_hook_events.jsonl` から native hook の decision を追跡できる。
 - `step_result.json` の `executor_agent_run_id` が当該ディレクトリ名と一致し、`substep_agent_run_ids` が親子関係と整合する。標準 `substep` を持たない phase では `substep_agent_run_ids=[]` を許可する。
 - `substep` を持つ `step` では、`agent_runs.jsonl` に記録された当該 `step` の全 `substep` の `agent_run_id` が、いずれかの `step_result.json` の `substep_agent_run_ids` に含まれる。欠落時は `tools/codex_orchestration_runtime.py` の orchestration 完了検査で `fail` となる。
 - `step_result.json` の `required_outputs` が `docs/workflow/WORKFLOW_CORE.md` および対応する `docs/workflow/phases/phase_*.md` の phase contract と一致する。

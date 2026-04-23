@@ -273,7 +273,11 @@ shell_tool                       stable             true
             if args[1:] == ["features", "list"]:
                 return _FakeCompletedProcess(
                     0,
-                    stdout="multi_agent experimental true\nchild_agents_md under development false\n",
+                    stdout=(
+                        "multi_agent experimental true\n"
+                        "codex_hooks under-development true\n"
+                        "child_agents_md under development false\n"
+                    ),
                 )
             raise AssertionError(args)
 
@@ -289,7 +293,7 @@ shell_tool                       stable             true
             if args[1:] == ["features", "list"]:
                 return _FakeCompletedProcess(
                     0,
-                    stdout="multi_agent experimental false\n",
+                    stdout="multi_agent experimental false\ncodex_hooks under-development true\n",
                 )
             raise AssertionError(args)
 
@@ -406,7 +410,9 @@ shell_tool                       stable             true
             if args[1:] == ["--version"]:
                 return _FakeCompletedProcess(0, stdout="custom 1.0.0\n")
             if args[1:] == ["features", "list"]:
-                return _FakeCompletedProcess(0, stdout="multi_agent experimental true\n")
+                return _FakeCompletedProcess(
+                    0, stdout="multi_agent experimental true\ncodex_hooks under-development true\n"
+                )
             raise AssertionError(args)
 
         result = probe_execution_platform(
@@ -467,6 +473,24 @@ shell_tool                       stable             true
         by_name = {c["name"]: c for c in checks}
         self.assertIn("codex_features_list_available", by_name)
         self.assertNotIn("codex_features_available", by_name)
+
+    def test_probe_codex_cli_fails_when_codex_hooks_is_disabled(self) -> None:
+        def runner(args, **kwargs):  # type: ignore[no-untyped-def]
+            if args[1:] == ["--version"]:
+                return _FakeCompletedProcess(0, stdout="codex-cli 0.120.0\n")
+            if args[1:] == ["features", "list"]:
+                return _FakeCompletedProcess(
+                    0,
+                    stdout="multi_agent stable true\ncodex_hooks under-development false\n",
+                )
+            raise AssertionError(args)
+
+        result = probe_codex_cli(codex_command="codex", runner=runner)
+        self.assertEqual(result["status"], "fail")
+        self.assertFalse(result["can_launch_step_agents"])
+        by_name = {c["name"]: c for c in result["checks"]}
+        self.assertIn("codex_hooks_enabled", by_name)
+        self.assertFalse(by_name["codex_hooks_enabled"]["pass"])
 
     def test_all_strict_boolean_probe_checks_pass_skips_none_pass(self) -> None:
         """`pass: None` の check は未実行扱いとし、それ以外がすべて True なら合格とする。"""
@@ -614,7 +638,7 @@ shell_tool                       stable             true
                     "status": "pass",
                     "can_launch_step_agents": True,
                     "can_launch_substep_agents": True,
-                    "feature_states": {"multi_agent": True},
+                    "feature_states": {"multi_agent": True, "codex_hooks": True},
                     "checks": [
                         {"name": "multi_agent_enabled", "pass": True},
                     ],
@@ -970,8 +994,8 @@ shell_tool                       stable             true
                     "status": "pass",
                     "can_launch_step_agents": True,
                     "can_launch_substep_agents": True,
-                    "feature_states": {"multi_agent": True},
-                    "checks": [{"name": "multi_agent_enabled", "pass": True}],
+                    "feature_states": {"multi_agent": True, "codex_hooks": True},
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}],
                 },
             )
             full_prompt = _substep_launch_prompt(
@@ -1023,8 +1047,8 @@ shell_tool                       stable             true
                     "status": "pass",
                     "can_launch_step_agents": True,
                     "can_launch_substep_agents": True,
-                    "feature_states": {"multi_agent": True},
-                    "checks": [{"name": "multi_agent_enabled", "pass": True}],
+                    "feature_states": {"multi_agent": True, "codex_hooks": True},
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}],
                 },
             )
             record_launch(
@@ -1091,8 +1115,8 @@ shell_tool                       stable             true
                     "status": "pass",
                     "can_launch_step_agents": True,
                     "can_launch_substep_agents": True,
-                    "feature_states": {"multi_agent": True},
-                    "checks": [{"name": "multi_agent_enabled", "pass": True}],
+                    "feature_states": {"multi_agent": True, "codex_hooks": True},
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}],
                 },
             )
             record_launch(
@@ -1154,8 +1178,8 @@ shell_tool                       stable             true
                     "status": "pass",
                     "can_launch_step_agents": True,
                     "can_launch_substep_agents": True,
-                    "feature_states": {"multi_agent": True},
-                    "checks": [{"name": "multi_agent_enabled", "pass": True}],
+                    "feature_states": {"multi_agent": True, "codex_hooks": True},
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}],
                 },
             )
             with self.assertRaisesRegex(ValueError, "template markers"):
@@ -1196,8 +1220,8 @@ shell_tool                       stable             true
                     "status": "pass",
                     "can_launch_step_agents": True,
                     "can_launch_substep_agents": True,
-                    "feature_states": {"multi_agent": True},
-                    "checks": [{"name": "multi_agent_enabled", "pass": True}],
+                    "feature_states": {"multi_agent": True, "codex_hooks": True},
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}],
                 },
             )
             launch_refs = record_launch(
@@ -1253,8 +1277,8 @@ shell_tool                       stable             true
                     "status": "pass",
                     "can_launch_step_agents": True,
                     "can_launch_substep_agents": True,
-                    "feature_states": {"multi_agent": True},
-                    "checks": [{"name": "multi_agent_enabled", "pass": True}],
+                    "feature_states": {"multi_agent": True, "codex_hooks": True},
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}],
                 },
             )
             with self.assertRaisesRegex(ValueError, "plan_ref must not contain placeholder"):
@@ -1297,8 +1321,8 @@ shell_tool                       stable             true
                     "status": "pass",
                     "can_launch_step_agents": True,
                     "can_launch_substep_agents": True,
-                    "feature_states": {"multi_agent": True},
-                    "checks": [{"name": "multi_agent_enabled", "pass": True}],
+                    "feature_states": {"multi_agent": True, "codex_hooks": True},
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}],
                 },
             )
             bad_pipeline = (
@@ -1340,8 +1364,8 @@ shell_tool                       stable             true
                     "status": "pass",
                     "can_launch_step_agents": True,
                     "can_launch_substep_agents": True,
-                    "feature_states": {"multi_agent": True},
-                    "checks": [{"name": "multi_agent_enabled", "pass": True}],
+                    "feature_states": {"multi_agent": True, "codex_hooks": True},
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}],
                 },
             )
             with self.assertRaisesRegex(ValueError, "generation_id"):
@@ -1379,8 +1403,8 @@ shell_tool                       stable             true
                     "status": "pass",
                     "can_launch_step_agents": True,
                     "can_launch_substep_agents": True,
-                    "feature_states": {"multi_agent": True},
-                    "checks": [{"name": "multi_agent_enabled", "pass": True}],
+                    "feature_states": {"multi_agent": True, "codex_hooks": True},
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}],
                 },
             )
             launch_refs = record_launch(
@@ -1425,8 +1449,8 @@ shell_tool                       stable             true
                     "status": "pass",
                     "can_launch_step_agents": True,
                     "can_launch_substep_agents": True,
-                    "feature_states": {"multi_agent": True},
-                    "checks": [{"name": "multi_agent_enabled", "pass": True}],
+                    "feature_states": {"multi_agent": True, "codex_hooks": True},
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}],
                 },
             )
             base = {
@@ -1474,8 +1498,8 @@ shell_tool                       stable             true
                     "status": "pass",
                     "can_launch_step_agents": True,
                     "can_launch_substep_agents": True,
-                    "feature_states": {"multi_agent": True},
-                    "checks": [{"name": "multi_agent_enabled", "pass": True}],
+                    "feature_states": {"multi_agent": True, "codex_hooks": True},
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}],
                 },
             )
             prepared = prepare_launch_request_payload(
@@ -1521,8 +1545,8 @@ shell_tool                       stable             true
                     "status": "pass",
                     "can_launch_step_agents": True,
                     "can_launch_substep_agents": True,
-                    "feature_states": {"multi_agent": True},
-                    "checks": [{"name": "multi_agent_enabled", "pass": True}],
+                    "feature_states": {"multi_agent": True, "codex_hooks": True},
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}],
                 },
             )
             record_agent_run(
@@ -1634,8 +1658,8 @@ shell_tool                       stable             true
                     "status": "pass",
                     "can_launch_step_agents": True,
                     "can_launch_substep_agents": True,
-                    "feature_states": {"multi_agent": True},
-                    "checks": [{"name": "multi_agent_enabled", "pass": True}],
+                    "feature_states": {"multi_agent": True, "codex_hooks": True},
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}],
                 },
             )
             payload = record_agent_run(
@@ -1670,8 +1694,8 @@ shell_tool                       stable             true
                     "status": "pass",
                     "can_launch_step_agents": True,
                     "can_launch_substep_agents": True,
-                    "feature_states": {"multi_agent": True},
-                    "checks": [{"name": "multi_agent_enabled", "pass": True}],
+                    "feature_states": {"multi_agent": True, "codex_hooks": True},
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}],
                 },
             )
             with self.assertRaisesRegex(
@@ -1702,8 +1726,8 @@ shell_tool                       stable             true
                     "status": "pass",
                     "can_launch_step_agents": True,
                     "can_launch_substep_agents": True,
-                    "feature_states": {"multi_agent": True},
-                    "checks": [{"name": "multi_agent_enabled", "pass": True}],
+                    "feature_states": {"multi_agent": True, "codex_hooks": True},
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}],
                 },
             )
             out_ref = "workspace/orchestrations/orch_001/logs/orchestrator.note.txt"
@@ -1741,8 +1765,8 @@ shell_tool                       stable             true
                     "status": "pass",
                     "can_launch_step_agents": True,
                     "can_launch_substep_agents": True,
-                    "feature_states": {"multi_agent": True},
-                    "checks": [{"name": "multi_agent_enabled", "pass": True}],
+                    "feature_states": {"multi_agent": True, "codex_hooks": True},
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}],
                 },
             )
             payload = record_agent_run(
@@ -1772,8 +1796,8 @@ shell_tool                       stable             true
                     "status": "pass",
                     "can_launch_step_agents": True,
                     "can_launch_substep_agents": True,
-                    "feature_states": {"multi_agent": True},
-                    "checks": [{"name": "multi_agent_enabled", "pass": True}],
+                    "feature_states": {"multi_agent": True, "codex_hooks": True},
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}],
                 },
             )
             out_ref = "workspace/orchestrations/orch_001/logs/orchestrator.note.txt"
@@ -1815,8 +1839,8 @@ shell_tool                       stable             true
                     "status": "pass",
                     "can_launch_step_agents": True,
                     "can_launch_substep_agents": True,
-                    "feature_states": {"multi_agent": True},
-                    "checks": [{"name": "multi_agent_enabled", "pass": True}],
+                    "feature_states": {"multi_agent": True, "codex_hooks": True},
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}],
                 },
             )
             out_ref = "workspace/orchestrations/orch_001/logs/orchestrator.note.txt"
@@ -1856,8 +1880,8 @@ shell_tool                       stable             true
                     "status": "pass",
                     "can_launch_step_agents": True,
                     "can_launch_substep_agents": True,
-                    "feature_states": {"multi_agent": True},
-                    "checks": [{"name": "multi_agent_enabled", "pass": True}],
+                    "feature_states": {"multi_agent": True, "codex_hooks": True},
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}],
                 },
             )
             bad_ref = (
@@ -1891,8 +1915,8 @@ shell_tool                       stable             true
                     "status": "pass",
                     "can_launch_step_agents": True,
                     "can_launch_substep_agents": True,
-                    "feature_states": {"multi_agent": True},
-                    "checks": [{"name": "multi_agent_enabled", "pass": True}],
+                    "feature_states": {"multi_agent": True, "codex_hooks": True},
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}],
                 },
             )
             record_agent_run(
@@ -1964,8 +1988,8 @@ shell_tool                       stable             true
                     "status": "pass",
                     "can_launch_step_agents": True,
                     "can_launch_substep_agents": True,
-                    "feature_states": {"multi_agent": True},
-                    "checks": [{"name": "multi_agent_enabled", "pass": True}],
+                    "feature_states": {"multi_agent": True, "codex_hooks": True},
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}],
                 },
             )
             record_agent_run(
@@ -2037,8 +2061,8 @@ shell_tool                       stable             true
                     "status": "pass",
                     "can_launch_step_agents": True,
                     "can_launch_substep_agents": True,
-                    "feature_states": {"multi_agent": True},
-                    "checks": [{"name": "multi_agent_enabled", "pass": True}],
+                    "feature_states": {"multi_agent": True, "codex_hooks": True},
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}],
                 },
             )
             record_agent_run(
@@ -2117,8 +2141,8 @@ shell_tool                       stable             true
                     "status": "pass",
                     "can_launch_step_agents": True,
                     "can_launch_substep_agents": True,
-                    "feature_states": {"multi_agent": True},
-                    "checks": [{"name": "multi_agent_enabled", "pass": True}],
+                    "feature_states": {"multi_agent": True, "codex_hooks": True},
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}],
                 },
             )
             record_agent_run(
@@ -2197,8 +2221,8 @@ shell_tool                       stable             true
                     "status": "pass",
                     "can_launch_step_agents": True,
                     "can_launch_substep_agents": True,
-                    "feature_states": {"multi_agent": True},
-                    "checks": [{"name": "multi_agent_enabled", "pass": True}],
+                    "feature_states": {"multi_agent": True, "codex_hooks": True},
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}],
                 },
             )
             record_agent_run(
@@ -2284,8 +2308,8 @@ shell_tool                       stable             true
                     "status": "pass",
                     "can_launch_step_agents": True,
                     "can_launch_substep_agents": True,
-                    "feature_states": {"multi_agent": True},
-                    "checks": [{"name": "multi_agent_enabled", "pass": True}],
+                    "feature_states": {"multi_agent": True, "codex_hooks": True},
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}],
                 },
             )
             record_agent_run(
@@ -2374,8 +2398,8 @@ shell_tool                       stable             true
                     "status": "pass",
                     "can_launch_step_agents": True,
                     "can_launch_substep_agents": True,
-                    "feature_states": {"multi_agent": True},
-                    "checks": [{"name": "multi_agent_enabled", "pass": True}],
+                    "feature_states": {"multi_agent": True, "codex_hooks": True},
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}],
                 },
             )
             record_agent_run(
@@ -2465,8 +2489,8 @@ shell_tool                       stable             true
                     "status": "pass",
                     "can_launch_step_agents": True,
                     "can_launch_substep_agents": True,
-                    "feature_states": {"multi_agent": True},
-                    "checks": [{"name": "multi_agent_enabled", "pass": True}],
+                    "feature_states": {"multi_agent": True, "codex_hooks": True},
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}],
                 },
             )
             record_agent_run(
@@ -2564,8 +2588,8 @@ shell_tool                       stable             true
                     "status": "pass",
                     "can_launch_step_agents": True,
                     "can_launch_substep_agents": True,
-                    "feature_states": {"multi_agent": True},
-                    "checks": [{"name": "multi_agent_enabled", "pass": True}],
+                    "feature_states": {"multi_agent": True, "codex_hooks": True},
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}],
                 },
             )
             record_agent_run(
@@ -2652,8 +2676,8 @@ shell_tool                       stable             true
                     "status": "pass",
                     "can_launch_step_agents": True,
                     "can_launch_substep_agents": True,
-                    "feature_states": {"multi_agent": True},
-                    "checks": [{"name": "multi_agent_enabled", "pass": True}],
+                    "feature_states": {"multi_agent": True, "codex_hooks": True},
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}],
                 },
             )
             with self.assertRaisesRegex(ValueError, "child agent identifier"):
@@ -2706,8 +2730,8 @@ shell_tool                       stable             true
                     "status": "pass",
                     "can_launch_step_agents": True,
                     "can_launch_substep_agents": True,
-                    "feature_states": {"multi_agent": True},
-                    "checks": [{"name": "multi_agent_enabled", "pass": True}],
+                    "feature_states": {"multi_agent": True, "codex_hooks": True},
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}],
                 },
             )
             record_agent_run(
@@ -2848,8 +2872,8 @@ shell_tool                       stable             true
                     "status": "pass",
                     "can_launch_step_agents": True,
                     "can_launch_substep_agents": True,
-                    "feature_states": {"multi_agent": True},
-                    "checks": [{"name": "multi_agent_enabled", "pass": True}],
+                    "feature_states": {"multi_agent": True, "codex_hooks": True},
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}],
                 },
             )
             record_launch(
@@ -2909,7 +2933,7 @@ shell_tool                       stable             true
                     "status": "pass",
                     "can_launch_step_agents": True,
                     "can_launch_substep_agents": True,
-                    "feature_states": {"multi_agent": True},
+                    "feature_states": {"multi_agent": True, "codex_hooks": True},
                     "checks": [
                         {"name": "multi_agent_enabled", "pass": True},
                     ],
@@ -3013,6 +3037,47 @@ shell_tool                       stable             true
                     },
                 )
 
+    def test_rejects_codex_launchable_preflight_when_codex_hooks_state_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            init_orchestration(repo_root=repo_root, orchestration_id="orch_001")
+            with self.assertRaisesRegex(ValueError, "feature_states.codex_hooks=true"):
+                write_preflight(
+                    repo_root=repo_root,
+                    orchestration_id="orch_001",
+                    payload={
+                        "status": "pass",
+                        "backend": "codex",
+                        "can_launch_step_agents": True,
+                        "can_launch_substep_agents": True,
+                        "feature_states": {"multi_agent": True},
+                        "checks": [
+                            {"name": "multi_agent_enabled", "pass": True},
+                            {"name": "codex_hooks_enabled", "pass": True},
+                        ],
+                    },
+                )
+
+    def test_rejects_codex_launchable_preflight_when_codex_hooks_check_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            init_orchestration(repo_root=repo_root, orchestration_id="orch_001")
+            with self.assertRaisesRegex(ValueError, "checks.codex_hooks_enabled.pass=true"):
+                write_preflight(
+                    repo_root=repo_root,
+                    orchestration_id="orch_001",
+                    payload={
+                        "status": "pass",
+                        "backend": "codex",
+                        "can_launch_step_agents": True,
+                        "can_launch_substep_agents": True,
+                        "feature_states": {"multi_agent": True, "codex_hooks": True},
+                        "checks": [
+                            {"name": "multi_agent_enabled", "pass": True},
+                        ],
+                    },
+                )
+
     def test_record_launch_runs_live_probe_when_enforced(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
@@ -3024,8 +3089,8 @@ shell_tool                       stable             true
                     "status": "pass",
                     "can_launch_step_agents": True,
                     "can_launch_substep_agents": True,
-                    "feature_states": {"multi_agent": True},
-                    "checks": [{"name": "multi_agent_enabled", "pass": True}],
+                    "feature_states": {"multi_agent": True, "codex_hooks": True},
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}],
                 },
             )
             os.environ["CODEX_ORCHESTRATION_ENFORCE_LIVE_PREFLIGHT"] = "1"
@@ -3035,8 +3100,8 @@ shell_tool                       stable             true
                     "status": "pass",
                     "can_launch_step_agents": True,
                     "can_launch_substep_agents": True,
-                    "feature_states": {"multi_agent": True},
-                    "checks": [{"name": "multi_agent_enabled", "pass": True}],
+                    "feature_states": {"multi_agent": True, "codex_hooks": True},
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}],
                 }
                 record_launch(
                     repo_root=repo_root,
@@ -3082,8 +3147,8 @@ shell_tool                       stable             true
                     "status": "pass",
                     "can_launch_step_agents": True,
                     "can_launch_substep_agents": True,
-                    "feature_states": {"multi_agent": True},
-                    "checks": [{"name": "multi_agent_enabled", "pass": True}],
+                    "feature_states": {"multi_agent": True, "codex_hooks": True},
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}],
                 },
             )
             os.environ["CODEX_ORCHESTRATION_ENFORCE_LIVE_PREFLIGHT"] = "0"
@@ -3186,8 +3251,8 @@ shell_tool                       stable             true
                     "status": "pass",
                     "can_launch_step_agents": True,
                     "can_launch_substep_agents": True,
-                    "feature_states": {"multi_agent": True},
-                    "checks": [{"name": "multi_agent_enabled", "pass": True}],
+                    "feature_states": {"multi_agent": True, "codex_hooks": True},
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}],
                 },
             )
             record_agent_run(
@@ -3294,8 +3359,8 @@ shell_tool                       stable             true
                 "status": "pass",
                 "can_launch_step_agents": True,
                 "can_launch_substep_agents": True,
-                "feature_states": {"multi_agent": True},
-                "checks": [{"name": "multi_agent_enabled", "pass": True}],
+                "feature_states": {"multi_agent": True, "codex_hooks": True},
+                "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}],
             },
         )
         record_agent_run(
@@ -3390,8 +3455,8 @@ shell_tool                       stable             true
                     "status": "pass",
                     "can_launch_step_agents": True,
                     "can_launch_substep_agents": True,
-                    "feature_states": {"multi_agent": True},
-                    "checks": [{"name": "multi_agent_enabled", "pass": True}],
+                    "feature_states": {"multi_agent": True, "codex_hooks": True},
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}],
                 },
             )
             with self.assertRaisesRegex(RuntimeError, "write_step_result phase gate"):
@@ -4098,8 +4163,8 @@ shell_tool                       stable             true
                 "status": "pass",
                 "can_launch_step_agents": True,
                 "can_launch_substep_agents": True,
-                "feature_states": {"multi_agent": True},
-                "checks": [{"name": "multi_agent_enabled", "pass": True}],
+                "feature_states": {"multi_agent": True, "codex_hooks": True},
+                "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}],
             },
         )
         record_agent_run(
@@ -4223,8 +4288,8 @@ class CheckpointResumeRuntimeTests(unittest.TestCase):
                 "status": "pass",
                 "can_launch_step_agents": True,
                 "can_launch_substep_agents": True,
-                "feature_states": {"multi_agent": True},
-                "checks": [{"name": "multi_agent_enabled", "pass": True}],
+                "feature_states": {"multi_agent": True, "codex_hooks": True},
+                "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}],
             },
         )
         record_agent_run(
@@ -5076,8 +5141,8 @@ def _launchable_preflight_dict(**extra: object) -> dict[str, object]:
             "allow_substep_agent_launch": True,
         },
         "session_policy_launchable": True,
-        "feature_states": {"multi_agent": True},
-        "checks": [{"name": "multi_agent_enabled", "pass": True}],
+        "feature_states": {"multi_agent": True, "codex_hooks": True},
+        "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}],
     }
     base.update(extra)
     return base
@@ -5804,8 +5869,8 @@ class TestPhase1RuleSourceAudit(unittest.TestCase):
                     "status": "pass",
                     "can_launch_step_agents": True,
                     "can_launch_substep_agents": True,
-                    "feature_states": {"multi_agent": True},
-                    "checks": [{"name": "multi_agent_enabled", "pass": True}],
+                    "feature_states": {"multi_agent": True, "codex_hooks": True},
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}],
                 },
             )
             ps1 = json.loads((orch / "phase_state.json").read_text(encoding="utf-8"))
@@ -5901,8 +5966,8 @@ class TestPhase1RuleSourceAudit(unittest.TestCase):
                     "status": "pass",
                     "can_launch_step_agents": True,
                     "can_launch_substep_agents": True,
-                    "feature_states": {"multi_agent": True},
-                    "checks": [{"name": "multi_agent_enabled", "pass": True}],
+                    "feature_states": {"multi_agent": True, "codex_hooks": True},
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}],
                 },
             )
             record_launch(
@@ -5976,8 +6041,8 @@ class TestPhase1RuleSourceAudit(unittest.TestCase):
                     "status": "pass",
                     "can_launch_step_agents": True,
                     "can_launch_substep_agents": True,
-                    "feature_states": {"multi_agent": True},
-                    "checks": [{"name": "multi_agent_enabled", "pass": True}],
+                    "feature_states": {"multi_agent": True, "codex_hooks": True},
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}],
                 },
             )
             record_launch(
@@ -6036,8 +6101,8 @@ class TestPhase1RuleSourceAudit(unittest.TestCase):
                     "status": "pass",
                     "can_launch_step_agents": True,
                     "can_launch_substep_agents": True,
-                    "feature_states": {"multi_agent": True},
-                    "checks": [{"name": "multi_agent_enabled", "pass": True}],
+                    "feature_states": {"multi_agent": True, "codex_hooks": True},
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}],
                 },
             )
             orch = repo_root / "workspace/orchestrations/orch_p1m"
@@ -6059,8 +6124,8 @@ class TestPhase1RuleSourceAudit(unittest.TestCase):
                     "status": "pass",
                     "can_launch_step_agents": True,
                     "can_launch_substep_agents": True,
-                    "feature_states": {"multi_agent": True},
-                    "checks": [{"name": "multi_agent_enabled", "pass": True}],
+                    "feature_states": {"multi_agent": True, "codex_hooks": True},
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}],
                 },
             )
             record_launch(
@@ -6144,8 +6209,8 @@ class TestPhase2PlanGuardsIntegration(unittest.TestCase):
                     "can_launch_step_agents": True,
                     "can_launch_substep_agents": True,
                     "session_policy": {"allow_substep_agent_launch": False},
-                    "feature_states": {"multi_agent": True},
-                    "checks": [{"name": "multi_agent_enabled", "pass": True}],
+                    "feature_states": {"multi_agent": True, "codex_hooks": True},
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}],
                 },
             )
             out = workflow_launch_check(
@@ -6190,8 +6255,8 @@ class TestPhase2PlanGuardsIntegration(unittest.TestCase):
                         "backend": "codex",
                         "can_launch_step_agents": True,
                         "can_launch_substep_agents": True,
-                        "feature_states": {"multi_agent": True},
-                        "checks": [{"name": "multi_agent_enabled", "pass": True}],
+                        "feature_states": {"multi_agent": True, "codex_hooks": True},
+                        "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}],
                     },
                     ensure_ascii=False,
                     indent=2,
@@ -6227,8 +6292,8 @@ class TestPhase2PlanGuardsIntegration(unittest.TestCase):
                         "allow_step_agent_launch": True,
                         "allow_substep_agent_launch": True,
                     },
-                    "feature_states": {"multi_agent": True},
-                    "checks": [{"name": "multi_agent_enabled", "pass": True}],
+                    "feature_states": {"multi_agent": True, "codex_hooks": True},
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}],
                 },
             )
             base = {
@@ -6277,7 +6342,10 @@ class TestPhase2PlanGuardsIntegration(unittest.TestCase):
                 if args[1:] == ["--version"]:
                     return _FakeCompletedProcess(0, stdout="codex-cli 0.114.0\n")
                 if args[1:] == ["features", "list"]:
-                    return _FakeCompletedProcess(0, stdout="multi_agent experimental true\n")
+                    return _FakeCompletedProcess(
+                        0,
+                        stdout="multi_agent experimental true\ncodex_hooks under-development true\n",
+                    )
                 raise AssertionError(args)
 
             preflight_payload = probe_execution_platform(backend="codex", runner=runner)
@@ -6320,8 +6388,8 @@ class TestPhase2PlanGuardsIntegration(unittest.TestCase):
                     "can_launch_step_agents": True,
                     "can_launch_substep_agents": True,
                     "session_policy": {"allow_substep_agent_launch": False},
-                    "feature_states": {"multi_agent": True},
-                    "checks": [{"name": "multi_agent_enabled", "pass": True}],
+                    "feature_states": {"multi_agent": True, "codex_hooks": True},
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}],
                 },
             )
             req = {
@@ -6396,8 +6464,8 @@ class TestPhase2PlanGuardsIntegration(unittest.TestCase):
                     "status": "pass",
                     "can_launch_step_agents": True,
                     "can_launch_substep_agents": True,
-                    "feature_states": {"multi_agent": True},
-                    "checks": [{"name": "multi_agent_enabled", "pass": True}],
+                    "feature_states": {"multi_agent": True, "codex_hooks": True},
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}],
                 },
             )
             with self.assertRaises(RuntimeError) as ctx:
@@ -6421,8 +6489,8 @@ class TestPhase2PlanGuardsIntegration(unittest.TestCase):
                     "status": "pass",
                     "can_launch_step_agents": True,
                     "can_launch_substep_agents": True,
-                    "feature_states": {"multi_agent": True},
-                    "checks": [{"name": "multi_agent_enabled", "pass": True}],
+                    "feature_states": {"multi_agent": True, "codex_hooks": True},
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}],
                 },
             )
             g2_req = {
@@ -6494,8 +6562,8 @@ class TestPhase2PlanGuardsIntegration(unittest.TestCase):
                     "status": "pass",
                     "can_launch_step_agents": True,
                     "can_launch_substep_agents": True,
-                    "feature_states": {"multi_agent": True},
-                    "checks": [{"name": "multi_agent_enabled", "pass": True}],
+                    "feature_states": {"multi_agent": True, "codex_hooks": True},
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}],
                 },
             )
             with self.assertRaises(RuntimeError) as ctx:
@@ -6554,8 +6622,8 @@ class TestPhase2PlanGuardsIntegration(unittest.TestCase):
                     "status": "pass",
                     "can_launch_step_agents": True,
                     "can_launch_substep_agents": True,
-                    "feature_states": {"multi_agent": True},
-                    "checks": [{"name": "multi_agent_enabled", "pass": True}],
+                    "feature_states": {"multi_agent": True, "codex_hooks": True},
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}],
                 },
             )
             g6_req = {
@@ -6730,8 +6798,8 @@ class TestPhase3RunGate(unittest.TestCase):
                 "status": "pass",
                 "can_launch_step_agents": True,
                 "can_launch_substep_agents": True,
-                "feature_states": {"multi_agent": True},
-                "checks": [{"name": "multi_agent_enabled", "pass": True}],
+                "feature_states": {"multi_agent": True, "codex_hooks": True},
+                "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}],
             },
         )
         req = {
@@ -7045,8 +7113,8 @@ class TestPhase3RunGate(unittest.TestCase):
                     "backend": "codex",
                     "can_launch_step_agents": True,
                     "can_launch_substep_agents": True,
-                    "feature_states": {"multi_agent": True},
-                    "checks": [{"name": "multi_agent_enabled", "pass": True}],
+                    "feature_states": {"multi_agent": True, "codex_hooks": True},
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}],
                 },
             )
             pipe = repo_root / _FIX_PIPE_REF
