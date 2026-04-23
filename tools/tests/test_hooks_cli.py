@@ -522,8 +522,7 @@ class ClaudeHookCliTests(unittest.TestCase):
             check=False,
         )
         self.assertEqual(proc.returncode, 0)
-        body = json.loads(proc.stdout.strip())
-        self.assertEqual(body.get("decision"), "allow")
+        self.assertEqual(proc.stdout.strip(), "")
 
     def test_claude_backend_blocks_git_reset_hard(self) -> None:
         repo_root = Path(__file__).resolve().parents[2]
@@ -578,8 +577,7 @@ class ClaudeHookCliTests(unittest.TestCase):
                         ]
                     )
                 self.assertEqual(code, 0)
-                body = json.loads(out.getvalue().strip())
-                self.assertEqual(body.get("decision"), "allow")
+                self.assertEqual(out.getvalue().strip(), "")
 
     def test_claude_backend_uses_global_policy_for_missing_orchestration_id(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -636,8 +634,7 @@ class ClaudeHookCliTests(unittest.TestCase):
             check=False,
         )
         self.assertEqual(proc.returncode, 0)
-        body = json.loads(proc.stdout.strip())
-        self.assertEqual(body.get("decision"), "allow")
+        self.assertEqual(proc.stdout.strip(), "")
 
     def test_resolve_repo_root_uses_claude_env_for_claude_backend(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -729,6 +726,42 @@ class ClaudeHookCliTests(unittest.TestCase):
                 body = json.loads(out.getvalue().strip())
                 self.assertEqual(body.get("decision"), "block")
                 self.assertIn("orchestration_id is required for workflow hook execution", body.get("reason", ""))
+
+    def test_workflow_mode_accepts_orchestration_id_from_environment(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root_path = Path(tmp)
+            payload = {
+                "repo_root": str(repo_root_path),
+                "tool_name": "Bash",
+                "tool_input": {"command": "echo hi"},
+            }
+            with patch.dict(
+                os.environ,
+                {
+                    "METDSL_WORKFLOW_MODE": "1",
+                    "METDSL_ORCHESTRATION_ID": "orch_env_001",
+                },
+            ):
+                code = cli.main(
+                    [
+                        "--backend",
+                        "codex",
+                        "--event",
+                        "PreToolUse",
+                        "--input-json",
+                        json.dumps(payload),
+                    ]
+                )
+            self.assertEqual(code, 0)
+            log_path = (
+                repo_root_path
+                / "workspace"
+                / "orchestrations"
+                / "orch_env_001"
+                / "hooks"
+                / "native_hook_events.jsonl"
+            )
+            self.assertTrue(log_path.is_file())
 
 
 if __name__ == "__main__":

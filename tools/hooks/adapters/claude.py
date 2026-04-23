@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-import json
+import json  # kept for BLOCK path
 from typing import Any
 
 from tools.hooks.common import (
@@ -74,10 +74,10 @@ class ClaudeHookAdapter(HookBackendAdapter):
             return 2, json.dumps(body, ensure_ascii=False)
 
         if decision.action == HookDecisionAction.CONTINUE_WITH_MESSAGE:
-            body = {
-                "decision": "continue",
-                "message": decision.additional_context or "",
-            }
-            return 0, json.dumps(body, ensure_ascii=False)
+            # Claude Code expects plain text (or empty) on the allow path;
+            # "continue" is not a recognised JSON decision value.
+            return 0, decision.additional_context or ""
 
-        return 0, json.dumps({"decision": "allow"}, ensure_ascii=False)
+        # Exit 0 with empty stdout = allow. Claude Code does not recognise
+        # "allow" as a valid JSON decision value and raises a validation error.
+        return 0, ""

@@ -64,8 +64,9 @@
 ## 1-3. エージェント起動規約（運用必須）
 - `workflow` 実行は `orchestration agent` を起点に開始し、`orchestration_id` を必須発行する。
 - `workflow` 開始前に、`step agent` と `substep agent` の独立起動可否を検証する `preflight` を実行し、`pass` でない場合は開始してはならない。
+- workflow 起動は `python3 tools/run_workflow.py <spec_ref> <until_phase> [--llm <codex|cursor|claude>]` を canonical entrypoint とし、手動 `init` / 手動 `preflight` を通常経路として使用してはならない。
 - `tools/codex_orchestration_runtime.py` を使用する execution platform では、`preflight.json` と `launches/` と `agent_runs.jsonl` と `step_result.json` の保存を同 runtime の canonical source 実装で行う。
-- `tools/codex_orchestration_runtime.py` を使用する execution platform では、`preflight` を `python3 tools/codex_orchestration_runtime.py preflight --repo-root <repo_root> --orchestration-id <orchestration_id> --backend <backend>` で生成しなければならない。`backend` 未指定時は既定値 `codex` を使用する。
+- `preflight` は `tools/run_workflow.py` 実行の一部として生成しなければならない。`backend` は `--llm` 引数で指定する。
 - 標準 `substep` を持たない各 `step` は `step agent` を独立起動して実行する。
 - `substep` を持つ各 phase は `orchestration agent` が各 `substep` の `substep agent` を独立起動して実行する。
 - 各 `step` / `substep` の実処理を `script` で代行してはならない。必ず独立 `agent_run_id` を持つ `LLM agent` で実行する。

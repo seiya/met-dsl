@@ -8,7 +8,8 @@
 - 子 `agent` の初回起動前
 
 ## 要件
-- 起動前確認は `tools/codex_orchestration_runtime.py` を canonical source 実装として実施しなければならない。`preflight` は `--backend` で execution platform を指定する。
+- workflow 起動は `python3 tools/run_workflow.py <spec_ref> <until_phase> [--llm <codex|cursor|claude>]` を canonical entrypoint としなければならない。
+- 起動前確認の canonical implementation は `tools/run_workflow.py` と `tools/codex_orchestration_runtime.py` の組み合わせとし、`preflight` の backend 指定は `tools/run_workflow.py --llm` を通じて行わなければならない。
 - 子 `agent` へ渡す要求定義と判定規則の canonical source は `docs/` と `spec/` と当該試行 artifact に限定し、`tools/` 配下の実装、検証 `script`、test code、validator code を rule source として参照してはならない。
 - `init` と `preflight` は各 1 回以上実行しなければならない。
 - `preflight.json` が `status=pass` かつ `can_launch_step_agents=true` かつ `can_launch_substep_agents=true` を満たさない場合、子 `agent` を起動してはならない。
@@ -23,8 +24,8 @@
 - workflow の正当性確認、検証、疎通確認を目的とした仮実装であっても、親 `agent` が子 `agent` 必須 phase の本体処理を代行してはならない。
 
 ## 運用ルール
-1. `init` を実行して `workspace/orchestrations/<orchestration_id>/` を初期化する。
-2. `preflight` を実行して `preflight.json` を生成する。
+1. `tools/run_workflow.py` を実行して `workspace/orchestrations/<orchestration_id>/` の初期化と `preflight.json` 生成を行う。
+2. `tools/run_workflow.py` 以外の経路で workflow を開始してはならない。
 3. `preflight` 判定が `pass` でない場合は `set-status --status fail` を実行して停止する。
 4. 最初の `commentary` で、対象 phase、使用する `SKILL`、起動する `agent` 種別、`MCP` 使用箇所を宣言する。
 5. 固定表で phase 種別を確認し、`Plan` / `Generate` / `Tune` では `substep agent`、`Build` / `Execute` / `Judge` / `Promote` では `step agent` を起動対象として確定する。

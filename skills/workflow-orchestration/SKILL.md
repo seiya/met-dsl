@@ -1,6 +1,6 @@
 ---
 name: workflow-orchestration
-description: 対応 execution platform で `workflow` 全体を開始し、`orchestration agent -> step agent` または `orchestration agent -> substep agent` の独立 `agent` 起動で進行制御するときに使用する。`tools/codex_orchestration_runtime.py` を使った `preflight`、launch 証跡、`agent_runs.jsonl`、`step_result.json` の記録に適用する。
+description: 対応 execution platform で `workflow` 全体を開始し、`orchestration agent -> step agent` または `orchestration agent -> substep agent` の独立 `agent` 起動で進行制御するときに使用する。workflow 起動の canonical entrypoint は `tools/run_workflow.py` とし、`tools/codex_orchestration_runtime.py` を使った `preflight`、launch 証跡、`agent_runs.jsonl`、`step_result.json` の記録に適用する。
 ---
 
 # Workflow Orchestration
@@ -20,6 +20,7 @@ description: 対応 execution platform で `workflow` 全体を開始し、`orch
 - `Plan` / `Generate` / `Tune` のように `substep` を持つ phase では、`orchestration agent` が `generate` と `verify` を別々の `substep agent` として `spawn_agent` で直接起動しなければならない。
 - `Build` / `Execute` / `Judge` / `Promote` の `step` は、単一 `step agent` で完了させなければならない。
 - execution platform の起動可否確認と証跡書き出しは `tools/codex_orchestration_runtime.py` を canonical source 実装として使用しなければならない。
+- workflow 起動は `python3 tools/run_workflow.py <spec_ref> <until_phase> [--llm <codex|cursor|claude>]` を canonical entrypoint とし、手動 `init` / 手動 `preflight` を通常経路として使用してはならない。
 - `preflight.json` の手動編集または後編集による `pass` 化を禁止する。`preflight` は `tools/codex_orchestration_runtime.py preflight` の execution result を canonical source とする。
 - 子 `agent` 起動直前に live preflight gate を満たすことを必須とし、live 検査が `fail` の場合は `record-launch` を実行してはならない。
 - 起動前の初期読込は `references/startup_contract.md` を第一参照とし、詳細契約が必要な場合のみ `docs/workflow/WORKFLOW_CORE.md` と `docs/ORCHESTRATION.md` を追加参照しなければならない。
@@ -63,8 +64,8 @@ description: 対応 execution platform で `workflow` 全体を開始し、`orch
 - `verify-checkpoint-integrity` で `stale` が検出された `step` をスキップしてはならない。
 
 ## 運用ルール
-1. `python3 tools/codex_orchestration_runtime.py init --repo-root <repo_root> --orchestration-id <orchestration_id> --spec-ref <spec_ref> --dependency-ref <dependency_ref>` を実行し、`workspace/orchestrations/<orchestration_id>/` を初期化する。
-2. `python3 tools/codex_orchestration_runtime.py preflight --repo-root <repo_root> --orchestration-id <orchestration_id> --backend <backend>` を実行し、`preflight.json` を生成する。`backend` 未指定時は既定値 `codex` を使用する。
+1. `python3 tools/run_workflow.py <spec_ref> <until_phase> --llm <backend>` を実行し、`workspace/orchestrations/<orchestration_id>/` の初期化、`preflight.json` 生成、起動 prompt 生成を一括で行う。
+2. `tools/run_workflow.py` 以外の経路で workflow を開始してはならない。例外運用で `tools/codex_orchestration_runtime.py` を直接実行する場合は、理由と差分を記録し、通常運用へ復帰しなければならない。
 3. `preflight.json` の `probed_at` フィールドは、`record-launch` 実行時に TTL キャッシュの判定に使用され、TTL 期限切れ後の live probe 成功時に `tools/codex_orchestration_runtime.py` によって自動更新される。この自動更新は `status` / `can_launch_*` 等の判定結果フィールドを変更しないため、手動編集禁止ルールの適用外とする。
 4. `preflight.json` の `can_launch_step_agents=true` と `can_launch_substep_agents=true` を満たさない場合は workflow を開始しない。
 5. `orchestration agent` は `references/startup_contract.md` を読んで起動条件を確定し、最初の `commentary` で対象 phase、使用する `SKILL`、起動する `agent` 種別、`MCP` 使用箇所を実行宣言する。

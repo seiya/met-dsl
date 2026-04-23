@@ -7,7 +7,8 @@
 - `orchestration agent` と `step agent` / `substep agent` の階層実行契約は [docs/ORCHESTRATION.md](docs/ORCHESTRATION.md) を canonical source とする。
 - `orchestration agent` の起動手順は [skills/workflow-orchestration/SKILL.md](skills/workflow-orchestration/SKILL.md) を参照する。
 - 起動前の最小確認手順は [skills/workflow-orchestration/references/startup_contract.md](skills/workflow-orchestration/references/startup_contract.md) を参照する。
-- workflow 実行時は、環境変数 `METDSL_WORKFLOW_MODE=1` を設定する。
+- workflow 起動は `python3 tools/run_workflow.py <spec_ref> <until_phase> [--llm <codex|cursor|claude>]` を canonical entrypoint とする。
+- workflow 実行時の `METDSL_WORKFLOW_MODE=1` と `METDSL_ORCHESTRATION_ID=<orchestration_id>` は `tools/run_workflow.py` が設定する値を canonical source とする。
 
 ## execution platform 別の子 `agent` 起動ツール
 
@@ -30,7 +31,7 @@
 
 ### preflight
 - `preflight` 実行時は `--backend claude` を指定する。
-- コマンド例: `python3 tools/codex_orchestration_runtime.py preflight --repo-root . --orchestration-id <id> --backend claude`
+- コマンド例: `python3 tools/run_workflow.py <spec_ref> <until_phase> --llm claude`
 
 ### 子 `agent` 起動
 - Claude Code では `spawn_agent` の代わりに `Agent` tool を使用して子 `agent` を起動する。

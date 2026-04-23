@@ -275,6 +275,9 @@ def _extract_orchestration_id(payload: dict[str, Any]) -> str | None:
         inner_id = inner.get("orchestration_id")
         if isinstance(inner_id, str) and inner_id.strip():
             return inner_id.strip()
+    env_value = os.environ.get("METDSL_ORCHESTRATION_ID")
+    if isinstance(env_value, str) and env_value.strip():
+        return env_value.strip()
     return None
 
 
