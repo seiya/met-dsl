@@ -78,5 +78,6 @@ class CodexHookAdapter(HookBackendAdapter):
             }
             return 0, json.dumps(body, ensure_ascii=False)
 
-        body = {"decision": "allow", "continue_processing": bool(decision.continue_processing)}
-        return 0, json.dumps(body, ensure_ascii=False)
+        # Codex hook runtime does not require payload on allow-path and some events
+        # reject non-empty JSON outputs. Return empty stdout for compatibility.
+        return 0, ""

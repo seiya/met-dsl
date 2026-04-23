@@ -215,6 +215,57 @@ def _safe_retry_ttl_seconds() -> int:
     return ttl
 
 
+def _env_flag_true(name: str, default: str = "0") -> bool:
+    raw = os.environ.get(name, default).strip().lower()
+    return raw in {"1", "true", "yes", "on"}
+
+
+def _extract_command_for_policy(payload: dict[str, Any]) -> str | None:
+    command = payload.get("command")
+    if isinstance(command, str) and command.strip():
+        return command.strip()
+    tool_input = payload.get("tool_input")
+    if isinstance(tool_input, dict):
+        inner = tool_input.get("command")
+        if isinstance(inner, str) and inner.strip():
+            return inner.strip()
+    inner_payload = payload.get("payload")
+    if isinstance(inner_payload, dict):
+        command = inner_payload.get("command")
+        if isinstance(command, str) and command.strip():
+            return command.strip()
+        tool_input = inner_payload.get("tool_input")
+        if isinstance(tool_input, dict):
+            inner = tool_input.get("command")
+            if isinstance(inner, str) and inner.strip():
+                return inner.strip()
+    return None
+
+
+def _is_workflow_command(command: str) -> bool:
+    normalized = command.lower()
+    workflow_markers = (
+        "tools/codex_orchestration_runtime.py",
+        "codex_orchestration_runtime.py",
+    )
+    return any(marker in normalized for marker in workflow_markers)
+
+
+def _is_workflow_context(event_name: HookEventName, payload: dict[str, Any]) -> bool:
+    if event_name in {
+        HookEventName.SESSION_START,
+        HookEventName.USER_PROMPT_SUBMIT,
+        HookEventName.STOP,
+    }:
+        return False
+    if _env_flag_true("METDSL_WORKFLOW_MODE", "0"):
+        return True
+    command = _extract_command_for_policy(payload)
+    if isinstance(command, str) and _is_workflow_command(command):
+        return True
+    return False
+
+
 def _extract_orchestration_id(payload: dict[str, Any]) -> str | None:
     orchestration_id = payload.get("orchestration_id")
     if isinstance(orchestration_id, str) and orchestration_id.strip():
@@ -225,6 +276,34 @@ def _extract_orchestration_id(payload: dict[str, Any]) -> str | None:
         if isinstance(inner_id, str) and inner_id.strip():
             return inner_id.strip()
     return None
+
+
+def _emit_hook_response(
+    exit_code: int,
+    stdout_text: str,
+    *,
+    event_name: HookEventName | None = None,
+) -> int:
+    suppress_stdout = event_name == HookEventName.STOP and exit_code == 0
+    if stdout_text and not suppress_stdout:
+        sys.stdout.write(stdout_text + "\n")
+    if exit_code != 0:
+        message = "hook failed"
+        if stdout_text:
+            try:
+                body = json.loads(stdout_text)
+                if isinstance(body, dict):
+                    reason = body.get("reason")
+                    if isinstance(reason, str) and reason.strip():
+                        message = reason.strip()
+                    else:
+                        decision = body.get("decision")
+                        if isinstance(decision, str) and decision.strip():
+                            message = f"hook decision={decision.strip()}"
+            except json.JSONDecodeError:
+                message = stdout_text.strip() or message
+        sys.stderr.write(message + "\n")
+    return exit_code
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -247,11 +326,29 @@ def main(argv: list[str] | None = None) -> int:
         orchestration_id = _extract_orchestration_id(payload)
         repo_root = _resolve_repo_root(payload, backend=args.backend)
         missing_id_policy = os.environ.get(
-            "CODEX_HOOK_MISSING_ORCHESTRATION_ID_POLICY", "error"
+            "CODEX_HOOK_MISSING_ORCHESTRATION_ID_POLICY", "global"
         ).strip().lower()
+        workflow_context = _is_workflow_context(event_name, payload)
         if orchestration_id is None:
-            if event_name in {HookEventName.SESSION_START, HookEventName.USER_PROMPT_SUBMIT}:
+            if event_name in {
+                HookEventName.SESSION_START,
+                HookEventName.USER_PROMPT_SUBMIT,
+                HookEventName.STOP,
+            }:
                 orchestration_id = "_global"
+            elif workflow_context:
+                decision = _decision_error(
+                    "orchestration_id is required for workflow hook execution"
+                )
+                _append_hook_audit(
+                    backend=args.backend,
+                    event_name=event_name,
+                    payload=payload,
+                    decision=decision,
+                    orchestration_id_override="_global",
+                )
+                exit_code, stdout_text = adapter.encode_decision(decision)
+                return _emit_hook_response(exit_code, stdout_text, event_name=event_name)
             elif missing_id_policy == "global":
                 orchestration_id = "_global"
             else:
@@ -266,9 +363,7 @@ def main(argv: list[str] | None = None) -> int:
                     orchestration_id_override="_global",
                 )
                 exit_code, stdout_text = adapter.encode_decision(decision)
-                if stdout_text:
-                    sys.stdout.write(stdout_text + "\n")
-                return exit_code
+                return _emit_hook_response(exit_code, stdout_text, event_name=event_name)
 
         if args.backend == "codex":
             require_flag = os.environ.get("CODEX_REQUIRE_CODEX_HOOKS_FEATURE", "1").strip().lower()
@@ -314,9 +409,7 @@ def main(argv: list[str] | None = None) -> int:
                         orchestration_id_override=orchestration_id,
                     )
                     exit_code, stdout_text = adapter.encode_decision(decision)
-                    if stdout_text:
-                        sys.stdout.write(stdout_text + "\n")
-                    return exit_code
+                    return _emit_hook_response(exit_code, stdout_text, event_name=event_name)
 
         if event_name not in adapter.supported_events():
             decision = _decision_error(
@@ -345,9 +438,7 @@ def main(argv: list[str] | None = None) -> int:
             orchestration_id_override=fallback_orchestration_id,
         )
         exit_code, stdout_text = fallback_adapter.encode_decision(decision)
-    if stdout_text:
-        sys.stdout.write(stdout_text + "\n")
-    return exit_code
+    return _emit_hook_response(exit_code, stdout_text, event_name=event_name)
 
 
 if __name__ == "__main__":

@@ -698,6 +698,38 @@ class ClaudeHookCliTests(unittest.TestCase):
             entry = json.loads(log_path.read_text(encoding="utf-8").strip())
             self.assertEqual(entry.get("event"), "user_prompt_submit")
 
+    def test_claude_backend_blocks_missing_orchestration_id_in_workflow_mode(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root_path = Path(tmp)
+            payload = {
+                "repo_root": str(repo_root_path),
+                "tool_name": "Bash",
+                "tool_input": {"command": "echo hi"},
+            }
+            with patch.dict(
+                os.environ,
+                {
+                    "METDSL_WORKFLOW_MODE": "1",
+                    "CODEX_HOOK_MISSING_ORCHESTRATION_ID_POLICY": "global",
+                },
+            ):
+                out = io.StringIO()
+                with redirect_stdout(out):
+                    code = cli.main(
+                        [
+                            "--backend",
+                            "claude",
+                            "--event",
+                            "PreToolUse",
+                            "--input-json",
+                            json.dumps(payload),
+                        ]
+                    )
+                self.assertEqual(code, 2)
+                body = json.loads(out.getvalue().strip())
+                self.assertEqual(body.get("decision"), "block")
+                self.assertIn("orchestration_id is required for workflow hook execution", body.get("reason", ""))
+
 
 if __name__ == "__main__":
     unittest.main()

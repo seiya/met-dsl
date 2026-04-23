@@ -7,6 +7,7 @@
 - `orchestration agent` と `step agent` / `substep agent` の階層実行契約は [docs/ORCHESTRATION.md](docs/ORCHESTRATION.md) を canonical source とする。
 - `orchestration agent` の起動手順は [skills/workflow-orchestration/SKILL.md](skills/workflow-orchestration/SKILL.md) を参照する。
 - 起動前の最小確認手順は [skills/workflow-orchestration/references/startup_contract.md](skills/workflow-orchestration/references/startup_contract.md) を参照する。
+- workflow 実行時は、環境変数 `METDSL_WORKFLOW_MODE=1` を設定する。
 
 ## execution platform 別の子 `agent` 起動ツール
 
