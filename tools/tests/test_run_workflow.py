@@ -55,15 +55,19 @@ class RunWorkflowTests(unittest.TestCase):
             spec_ref="spec/problem/sample.md",
             dependency_ref=None,
             until_phase="Judge",
+            workflow_mode="dev",
         )
         self.assertIn("orch_test", text)
         self.assertIn("spec/problem/sample.md", text)
         self.assertIn("Judge", text)
+        self.assertIn("workflow_mode: `dev`", text)
         self.assertIn("METDSL_WORKFLOW_MODE=1", text)
         self.assertIn("不足している場合は即停止", text)
+        self.assertIn("issue_severity", text)
 
     def test_parse_args_defaults(self) -> None:
         ns = run_workflow._parse_args(["spec/problem.md", "generate"])
+        self.assertEqual(ns.mode, "dev")
         self.assertEqual(ns.llm, "codex")
         self.assertTrue(ns.invoke_llm)
 
@@ -235,6 +239,60 @@ class RunWorkflowTests(unittest.TestCase):
             self.assertEqual(payload["reason"], "runtime_command_failed")
             self.assertEqual(payload["orchestration_id"], "orch_preflight_fail")
             self.assertIn("preflight", payload["detail"])
+
+    def test_main_dev_mode_writes_failure_analysis_on_llm_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            (repo_root / "tools").mkdir(parents=True, exist_ok=True)
+            (repo_root / "workspace").mkdir(parents=True, exist_ok=True)
+            (repo_root / "spec" / "problem").mkdir(parents=True, exist_ok=True)
+            (repo_root / "spec" / "problem" / "test.md").write_text("spec\n", encoding="utf-8")
+
+            def fake_runtime_command(root: Path, env: dict[str, str], args: list[str]) -> run_workflow.RuntimeResult:
+                if args[0] == "preflight":
+                    return run_workflow.RuntimeResult(
+                        payload={
+                            "status": "pass",
+                            "can_launch_step_agents": True,
+                            "can_launch_substep_agents": True,
+                        },
+                        raw_stdout="{}",
+                    )
+                return run_workflow.RuntimeResult(payload={"status": "ok"}, raw_stdout="{}")
+
+            class DummyCompletedProcess:
+                def __init__(self, returncode: int) -> None:
+                    self.returncode = returncode
+
+            original_runtime = run_workflow._runtime_command
+            original_subprocess_run = run_workflow.subprocess.run
+            try:
+                run_workflow._runtime_command = fake_runtime_command  # type: ignore[assignment]
+                run_workflow.subprocess.run = lambda *args, **kwargs: DummyCompletedProcess(1)  # type: ignore[assignment]
+                stdout = io.StringIO()
+                with redirect_stdout(stdout):
+                    code = run_workflow.main(
+                        [
+                            "spec/problem/test.md",
+                            "build",
+                            "--repo-root",
+                            str(repo_root),
+                            "--orchestration-id",
+                            "orch_dev_fail",
+                        ]
+                    )
+            finally:
+                run_workflow._runtime_command = original_runtime  # type: ignore[assignment]
+                run_workflow.subprocess.run = original_subprocess_run  # type: ignore[assignment]
+
+            self.assertEqual(code, 2)
+            payload = json.loads(stdout.getvalue().strip())
+            self.assertEqual(payload["status"], "fail")
+            self.assertEqual(payload["reason"], "workflow_failed")
+            self.assertEqual(payload["workflow_mode"], "dev")
+            analysis_ref = payload.get("analysis_ref")
+            self.assertIsInstance(analysis_ref, str)
+            self.assertTrue((repo_root / str(analysis_ref)).exists())
 
 
 if __name__ == "__main__":

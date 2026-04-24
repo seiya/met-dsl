@@ -17,6 +17,15 @@ from tools.hooks import cli
 
 
 class HookCliTests(unittest.TestCase):
+    @staticmethod
+    def _assert_allow_output(raw_stdout: str) -> None:
+        token = raw_stdout.strip()
+        if not token:
+            return
+        body = json.loads(token)
+        assert isinstance(body, dict)
+        assert body.get("decision") == "allow"
+
     def test_subprocess_command_works_with_module_entrypoint(self) -> None:
         repo_root = Path(__file__).resolve().parents[2]
         payload = {
@@ -45,8 +54,7 @@ class HookCliTests(unittest.TestCase):
             check=False,
         )
         self.assertEqual(proc.returncode, 0)
-        body = json.loads(proc.stdout.strip())
-        self.assertEqual(body.get("decision"), "allow")
+        self._assert_allow_output(proc.stdout)
 
     def test_subprocess_command_works_from_subdirectory(self) -> None:
         repo_root = Path(__file__).resolve().parents[2]
@@ -74,8 +82,7 @@ class HookCliTests(unittest.TestCase):
             check=False,
         )
         self.assertEqual(proc.returncode, 0)
-        body = json.loads(proc.stdout.strip())
-        self.assertEqual(body.get("decision"), "allow")
+        self._assert_allow_output(proc.stdout)
 
     def test_hooks_json_command_works_from_subdirectory(self) -> None:
         repo_root = Path(__file__).resolve().parents[2]
@@ -99,8 +106,7 @@ class HookCliTests(unittest.TestCase):
             check=False,
         )
         self.assertEqual(proc.returncode, 0)
-        body = json.loads(proc.stdout.strip())
-        self.assertEqual(body.get("decision"), "allow")
+        self._assert_allow_output(proc.stdout)
 
     def test_hooks_json_command_fail_fast_when_not_in_git_repo(self) -> None:
         repo_root = Path(__file__).resolve().parents[2]
@@ -261,8 +267,98 @@ class HookCliTests(unittest.TestCase):
                         ]
                     )
                 self.assertEqual(code, 0)
-                body = json.loads(out.getvalue().strip())
-                self.assertEqual(body.get("decision"), "allow")
+                self._assert_allow_output(out.getvalue())
+
+    def test_dev_mode_blocks_verify_bypass_flags(self) -> None:
+        with patch("tools.hooks.cli.codex_hooks_feature_enabled") as feature_mock:
+            feature_mock.return_value = (True, "codex_hooks=true")
+            payload = {
+                "orchestration_id": "orch_dev_policy_001",
+                "tool_name": "Bash",
+                "tool_input": {
+                    "command": (
+                        "python3 tools/validate_pipeline_semantics.py --stage pre_judge "
+                        "--allow-missing-orchestration"
+                    )
+                },
+            }
+            out = io.StringIO()
+            with patch.dict(os.environ, {"METDSL_WORKFLOW_EXEC_MODE": "dev"}):
+                with redirect_stdout(out):
+                    code = cli.main(
+                        [
+                            "--backend",
+                            "codex",
+                            "--event",
+                            "PreToolUse",
+                            "--input-json",
+                            json.dumps(payload),
+                        ]
+                    )
+            self.assertEqual(code, 2)
+            body = json.loads(out.getvalue().strip())
+            self.assertEqual(body.get("decision"), "block")
+            self.assertIn("dev mode forbids verify bypass flags", body.get("reason", ""))
+
+    def test_unset_workflow_mode_defaults_to_dev_and_blocks_verify_bypass_flags(self) -> None:
+        with patch("tools.hooks.cli.codex_hooks_feature_enabled") as feature_mock:
+            feature_mock.return_value = (True, "codex_hooks=true")
+            payload = {
+                "orchestration_id": "orch_default_dev_policy_001",
+                "tool_name": "Bash",
+                "tool_input": {
+                    "command": (
+                        "python3 tools/validate_pipeline_semantics.py --stage pre_judge "
+                        "--allow-missing-orchestration"
+                    )
+                },
+            }
+            out = io.StringIO()
+            with patch.dict(os.environ, {}, clear=True):
+                with redirect_stdout(out):
+                    code = cli.main(
+                        [
+                            "--backend",
+                            "codex",
+                            "--event",
+                            "PreToolUse",
+                            "--input-json",
+                            json.dumps(payload),
+                        ]
+                    )
+            self.assertEqual(code, 2)
+            body = json.loads(out.getvalue().strip())
+            self.assertEqual(body.get("decision"), "block")
+            self.assertIn("dev mode forbids verify bypass flags", body.get("reason", ""))
+
+    def test_prod_mode_allows_same_command(self) -> None:
+        with patch("tools.hooks.cli.codex_hooks_feature_enabled") as feature_mock:
+            feature_mock.return_value = (True, "codex_hooks=true")
+            payload = {
+                "orchestration_id": "orch_prod_policy_001",
+                "tool_name": "Bash",
+                "tool_input": {
+                    "command": (
+                        "python3 tools/validate_pipeline_semantics.py --stage pre_judge "
+                        "--allow-missing-orchestration"
+                    )
+                },
+            }
+            out = io.StringIO()
+            with patch.dict(os.environ, {"METDSL_WORKFLOW_EXEC_MODE": "prod"}):
+                with redirect_stdout(out):
+                    code = cli.main(
+                        [
+                            "--backend",
+                            "codex",
+                            "--event",
+                            "PreToolUse",
+                            "--input-json",
+                            json.dumps(payload),
+                        ]
+                    )
+            self.assertEqual(code, 0)
+            self._assert_allow_output(out.getvalue())
 
     def test_writes_native_hook_audit_log_when_orchestration_id_is_provided(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -301,7 +397,7 @@ class HookCliTests(unittest.TestCase):
                 self.assertEqual(entry.get("backend"), "codex")
                 self.assertEqual(entry.get("event"), "pre_command_execute")
 
-    def test_missing_orchestration_id_blocks_by_default(self) -> None:
+    def test_missing_orchestration_id_uses_global_policy_by_default(self) -> None:
         with patch("tools.hooks.cli.codex_hooks_feature_enabled") as feature_mock:
             feature_mock.return_value = (True, "codex_hooks=true")
             payload = {
@@ -320,9 +416,8 @@ class HookCliTests(unittest.TestCase):
                         json.dumps(payload),
                     ]
                 )
-            self.assertEqual(code, 2)
-            body = json.loads(out.getvalue().strip())
-            self.assertIn("orchestration_id is required", body.get("reason", ""))
+            self.assertEqual(code, 0)
+            self._assert_allow_output(out.getvalue())
 
     def test_session_start_without_orchestration_id_uses_global_log(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

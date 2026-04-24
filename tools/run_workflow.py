@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any
 
 SUPPORTED_LLMS = ("codex", "cursor", "claude")
+SUPPORTED_WORKFLOW_MODES = ("dev", "prod")
 DEFAULT_LLM_COMMANDS = {
     "codex": "codex",
     "cursor": "cursor",
@@ -39,6 +40,14 @@ PHASE_ORDER = ["Plan", "Generate", "Build", "Execute", "Judge", "Tune", "Promote
 class RuntimeResult:
     payload: dict[str, Any]
     raw_stdout: str
+
+
+def _normalize_workflow_mode(token: str) -> str:
+    normalized = token.strip().lower()
+    if normalized not in SUPPORTED_WORKFLOW_MODES:
+        choices = ", ".join(SUPPORTED_WORKFLOW_MODES)
+        raise ValueError(f"unknown workflow mode: {token!r} (expected one of: {choices})")
+    return normalized
 
 
 def _normalize_phase(token: str) -> str:
@@ -99,6 +108,7 @@ def _build_orchestration_prompt(
     spec_ref: str,
     dependency_ref: str | None,
     until_phase: str,
+    workflow_mode: str,
 ) -> str:
     phase_list = ", ".join(PHASE_ORDER[: PHASE_ORDER.index(until_phase) + 1])
     dependency_line = (
@@ -106,12 +116,13 @@ def _build_orchestration_prompt(
         if isinstance(dependency_ref, str) and dependency_ref.strip()
         else "- dependency_ref: `(not specified)`"
     )
-    return textwrap.dedent(
+    base = textwrap.dedent(
         f"""
         Workflow を起動する。
 
         ## startup context
         - orchestration_id: `{orchestration_id}`
+        - workflow_mode: `{workflow_mode}`
         - target_spec_ref: `{spec_ref}`
         {dependency_line}
         - target_phases: `{phase_list}`（終了 phase: `{until_phase}`）
@@ -128,6 +139,148 @@ def _build_orchestration_prompt(
         - 進行は開始 phase から `{until_phase}` までとし、それ以降の phase には進まない。
         """
     ).strip() + "\n"
+
+    if workflow_mode == "dev":
+        base += textwrap.dedent(
+            """
+            - verify substep で `issue_severity` が `minor` 以外の場合は fail として停止する。
+            - fail 時は一次証跡（`agent_runs.jsonl`、`step_result.json`、`agent.summary.txt`、`launches/*.reply.txt`）を優先して原因を調査し、根拠とともに報告する。
+            - 途中経過の調査に必要な情報は、可能な限り `workspace/orchestrations/<orchestration_id>/` 配下へ保存する。
+            """
+        )
+    return base
+
+
+def _read_json_if_exists(path: Path) -> dict[str, Any] | None:
+    if not path.exists():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _read_jsonl(path: Path) -> list[dict[str, Any]]:
+    if not path.exists():
+        return []
+    records: list[dict[str, Any]] = []
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return []
+    for line in text.splitlines():
+        token = line.strip()
+        if not token:
+            continue
+        try:
+            payload = json.loads(token)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(payload, dict):
+            records.append(payload)
+    return records
+
+
+def _tail_text(path: Path, *, max_chars: int = 4000) -> str:
+    if not path.exists():
+        return ""
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return ""
+    if len(text) <= max_chars:
+        return text
+    return text[-max_chars:]
+
+
+def _collect_failure_analysis(repo_root: Path, orchestration_id: str) -> dict[str, Any]:
+    orch_root = repo_root / "workspace" / "orchestrations" / orchestration_id
+    meta_path = orch_root / "orchestration_meta.json"
+    meta = _read_json_if_exists(meta_path) or {}
+    runs = _read_jsonl(orch_root / "agent_runs.jsonl")
+    terminal_fail_statuses = {"fail", "blocked", "timeout", "cancel"}
+    failed_runs = [
+        run
+        for run in runs
+        if isinstance(run.get("status"), str) and str(run.get("status")).strip().lower() in terminal_fail_statuses
+    ]
+    failed_run = failed_runs[-1] if failed_runs else None
+
+    failed_step_results: list[dict[str, Any]] = []
+    for step_result_path in sorted(orch_root.glob("steps/*/*/*/step_result.json")):
+        payload = _read_json_if_exists(step_result_path)
+        if not payload:
+            continue
+        status = str(payload.get("status") or "").strip().lower()
+        if status and status != "pass":
+            failed_step_results.append(
+                {
+                    "path": str(step_result_path.relative_to(repo_root)),
+                    "status": status,
+                    "required_outputs": payload.get("required_outputs"),
+                    "failed_substeps": payload.get("failed_substeps"),
+                }
+            )
+
+    launch_reply_tail = ""
+    agent_summary_tail = ""
+    if isinstance(failed_run, dict):
+        launch_reply_ref = failed_run.get("launch_reply_ref")
+        if isinstance(launch_reply_ref, str) and launch_reply_ref.strip():
+            launch_reply_tail = _tail_text(repo_root / launch_reply_ref.strip())
+        agent_summary_ref = failed_run.get("agent_summary_ref")
+        if isinstance(agent_summary_ref, str) and agent_summary_ref.strip():
+            agent_summary_tail = _tail_text(repo_root / agent_summary_ref.strip())
+
+    return {
+        "status": "fail",
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "orchestration_id": orchestration_id,
+        "orchestration_status": meta.get("status"),
+        "reason_code": meta.get("reason_code"),
+        "reason_detail": meta.get("reason_detail"),
+        "failed_agent_run": failed_run,
+        "failed_step_results": failed_step_results,
+        "launch_reply_tail": launch_reply_tail,
+        "agent_summary_tail": agent_summary_tail,
+    }
+
+
+def _write_failure_analysis(repo_root: Path, orchestration_id: str, payload: dict[str, Any]) -> str:
+    rel = Path("workspace") / "orchestrations" / orchestration_id / "failure_analysis.json"
+    path = repo_root / rel
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    return str(rel)
+
+
+def _detect_non_minor_verify_issue(repo_root: Path, orchestration_id: str) -> dict[str, Any] | None:
+    orch_root = repo_root / "workspace" / "orchestrations" / orchestration_id
+    verify_steps = {"plan", "generate", "tune"}
+    for step_result_path in sorted(orch_root.glob("steps/*/*/*/step_result.json")):
+        payload = _read_json_if_exists(step_result_path)
+        if not payload:
+            continue
+        step_token = step_result_path.parts[-3].strip().lower()
+        if step_token not in verify_steps:
+            continue
+        retry_decisions = payload.get("retry_decisions")
+        if not isinstance(retry_decisions, list):
+            continue
+        for idx, decision in enumerate(retry_decisions):
+            if not isinstance(decision, dict):
+                continue
+            severity = str(decision.get("issue_severity") or "").strip().lower()
+            if severity and severity != "minor":
+                return {
+                    "step_result_ref": str(step_result_path.relative_to(repo_root)),
+                    "step": step_token,
+                    "retry_decision_index": idx,
+                    "issue_severity": severity,
+                    "repair_reason": decision.get("repair_reason"),
+                }
+    return None
 
 
 def _ensure_preflight_pass(preflight: dict[str, Any]) -> tuple[bool, str]:
@@ -152,6 +305,12 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     )
     parser.add_argument("spec_ref", help="Target spec path/reference.")
     parser.add_argument("until_phase", help="Final phase to execute (plan/generate/build/execute/judge/tune/promote).")
+    parser.add_argument(
+        "--mode",
+        default="dev",
+        choices=SUPPORTED_WORKFLOW_MODES,
+        help="Workflow execution mode: dev (default) or prod.",
+    )
     parser.add_argument("--llm", default="codex", choices=SUPPORTED_LLMS)
     parser.add_argument("--llm-command", help="Override backend command used by preflight and optional launch.")
     parser.add_argument("--repo-root", default=".")
@@ -186,6 +345,7 @@ def _resolve_existing_ref_path(repo_root: Path, ref: str, *, field_name: str) ->
 def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
     try:
+        workflow_mode = _normalize_workflow_mode(args.mode)
         until_phase = _normalize_phase(args.until_phase)
         repo_root = Path(args.repo_root).resolve()
         orchestration_id = args.orchestration_id or _new_orchestration_id()
@@ -209,6 +369,7 @@ def main(argv: list[str] | None = None) -> int:
     env = dict(os.environ)
     env["METDSL_WORKFLOW_MODE"] = "1"
     env["METDSL_ORCHESTRATION_ID"] = orchestration_id
+    env["METDSL_WORKFLOW_EXEC_MODE"] = workflow_mode
     env["PYTHONPATH"] = str(repo_root) + (f":{env['PYTHONPATH']}" if env.get("PYTHONPATH") else "")
 
     init_args = [
@@ -293,6 +454,7 @@ def main(argv: list[str] | None = None) -> int:
         spec_ref=args.spec_ref,
         dependency_ref=args.dependency_ref,
         until_phase=until_phase,
+        workflow_mode=workflow_mode,
     )
     prompt_path = (
         repo_root
@@ -306,6 +468,7 @@ def main(argv: list[str] | None = None) -> int:
     prompt_path.write_text(prompt_text, encoding="utf-8")
 
     launched = False
+    workflow_status = "running"
     if args.invoke_llm:
         launch_command, launch_input = _launch_command_and_input(
             llm=args.llm,
@@ -321,8 +484,60 @@ def main(argv: list[str] | None = None) -> int:
             check=False,
         )
         launched = proc.returncode == 0
-        if proc.returncode != 0:
-            return proc.returncode
+        meta_after_launch = _read_json_if_exists(
+            repo_root / "workspace" / "orchestrations" / orchestration_id / "orchestration_meta.json"
+        )
+        if isinstance(meta_after_launch, dict):
+            workflow_status = str(meta_after_launch.get("status") or "running")
+        if workflow_mode == "dev":
+            severe_verify_issue = _detect_non_minor_verify_issue(repo_root, orchestration_id)
+            if severe_verify_issue is not None:
+                try:
+                    _runtime_command(
+                        repo_root,
+                        env,
+                        [
+                            "set-status",
+                            "--repo-root",
+                            str(repo_root),
+                            "--orchestration-id",
+                            orchestration_id,
+                            "--status",
+                            "fail",
+                            "--reason-code",
+                            "verify_issue_severity_violation",
+                            "--reason-detail",
+                            (
+                                "verify substep severity must be minor in dev mode: "
+                                f"{severe_verify_issue['issue_severity']} ({severe_verify_issue['step_result_ref']})"
+                            ),
+                            "--blocking-policy-scope",
+                            "verify",
+                        ],
+                    )
+                    workflow_status = "fail"
+                except RuntimeError:
+                    workflow_status = "fail"
+        if proc.returncode != 0 or workflow_status.lower() in {"fail", "fail_closed", "blocked", "timeout", "cancel"}:
+            if workflow_mode == "dev":
+                analysis = _collect_failure_analysis(repo_root, orchestration_id)
+                analysis_ref = _write_failure_analysis(repo_root, orchestration_id, analysis)
+                print(
+                    json.dumps(
+                        {
+                            "status": "fail",
+                            "reason": "workflow_failed",
+                            "detail": analysis.get("reason_detail") or "workflow execution failed",
+                            "orchestration_id": orchestration_id,
+                            "workflow_mode": workflow_mode,
+                            "workflow_status": workflow_status,
+                            "analysis_ref": analysis_ref,
+                        },
+                        ensure_ascii=False,
+                    )
+                )
+                return 2
+            return proc.returncode if proc.returncode != 0 else 2
 
     print(
         json.dumps(
@@ -333,7 +548,10 @@ def main(argv: list[str] | None = None) -> int:
                 "llm_command": llm_command,
                 "target_spec_ref": args.spec_ref,
                 "until_phase": until_phase,
+                "workflow_mode": workflow_mode,
                 "metdsl_workflow_mode": env["METDSL_WORKFLOW_MODE"],
+                "metdsl_workflow_exec_mode": env["METDSL_WORKFLOW_EXEC_MODE"],
+                "workflow_status": workflow_status,
                 "prompt_ref": str(prompt_path.relative_to(repo_root)),
                 "llm_invoked": launched,
             },

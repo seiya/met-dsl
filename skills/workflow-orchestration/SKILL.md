@@ -21,6 +21,9 @@ description: 対応 execution platform で `workflow` 全体を開始し、`orch
 - `Build` / `Execute` / `Judge` / `Promote` の `step` は、単一 `step agent` で完了させなければならない。
 - execution platform の起動可否確認と証跡書き出しは `tools/codex_orchestration_runtime.py` を canonical source 実装として使用しなければならない。
 - workflow 起動は `python3 tools/run_workflow.py <spec_ref> <until_phase> [--llm <codex|cursor|claude>]` を canonical entrypoint とし、手動 `init` / 手動 `preflight` を通常経路として使用してはならない。
+- workflow mode は `tools/run_workflow.py --mode <dev|prod>` を canonical source とし、既定値は `dev` とする。
+- `dev` mode では verify 判定を厳格運用し、`issue_severity=major|critical` を検出した場合は `fail` として停止しなければならない。
+- `dev` mode で fail が発生した場合、`workspace/orchestrations/<orchestration_id>/failure_analysis.json` を必須出力として原因調査結果を保存しなければならない。
 - `preflight.json` の手動編集または後編集による `pass` 化を禁止する。`preflight` は `tools/codex_orchestration_runtime.py preflight` の execution result を canonical source とする。
 - 子 `agent` 起動直前に live preflight gate を満たすことを必須とし、live 検査が `fail` の場合は `record-launch` を実行してはならない。
 - 起動前の初期読込は `references/startup_contract.md` を第一参照とし、詳細契約が必要な場合のみ `docs/workflow/WORKFLOW_CORE.md` と `docs/ORCHESTRATION.md` を追加参照しなければならない。

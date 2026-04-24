@@ -4,7 +4,9 @@
 from __future__ import annotations
 
 import json
+import os
 import unittest
+from unittest.mock import patch
 
 from tools.hooks.adapters.claude import ClaudeHookAdapter
 from tools.hooks.adapters.codex import CodexHookAdapter
@@ -49,6 +51,26 @@ class HookCommonTests(unittest.TestCase):
                 command="git reset --hard HEAD~1",
             )
         )
+        self.assertEqual(decision.action, HookDecisionAction.BLOCK)
+
+    def test_evaluate_common_policy_treats_unset_workflow_mode_as_dev(self) -> None:
+        with patch.dict(os.environ, {}, clear=True):
+            decision = evaluate_common_policy(
+                HookInput(
+                    event_name=HookEventName.PRE_COMMAND_EXECUTE,
+                    backend="codex",
+                    payload={
+                        "command": (
+                            "python3 tools/validate_pipeline_semantics.py --stage pre_judge "
+                            "--allow-missing-orchestration"
+                        )
+                    },
+                    command=(
+                        "python3 tools/validate_pipeline_semantics.py --stage pre_judge "
+                        "--allow-missing-orchestration"
+                    ),
+                )
+            )
         self.assertEqual(decision.action, HookDecisionAction.BLOCK)
 
     def test_codex_adapter_roundtrip(self) -> None:

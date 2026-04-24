@@ -82,6 +82,9 @@ terms は `GLOSSARY.md` を参照する。
 - `LLM` を利用する全 phase に `SPEC.md` の「`LLM` の扱い（全体原則）」を適用する。
 - `LLM` 利用 phase は各 phase の `<stage>_meta.json`（コード生成は `generate_meta.json`）を必須出力とする。
 - `debug_mode=false` では失敗試行 artifact を保存しない。`debug_mode=true` で保存した場合は保存件数と保存先をメタデータへ記録する。
+- workflow 起動時の execution mode は `tools/run_workflow.py` の `--mode` で指定し、既定値は `dev` とする。`prod` は現行互換の最小ログ運用とし、`dev` は失敗時の原因調査に必要な証跡保存を優先する。
+- `dev` mode の `verify substep` は、`issue_severity=minor` のみを軽微問題として継続可能とし、`major` / `critical` は `fail` としなければならない。
+- `dev` mode で workflow が `fail` した場合、`workspace/orchestrations/<orchestration_id>/failure_analysis.json` を生成し、失敗理由、関連 `agent_run`、関連 `step_result`、補助ログ要約を記録しなければならない。
 
 ### エージェント階層実行
 - `workflow` の階層実行契約、親子関係、起動順、停止条件、実行記録形式は `ORCHESTRATION.md` を適用する。

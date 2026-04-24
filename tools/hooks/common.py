@@ -5,6 +5,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
+import os
 from typing import Any, Protocol
 
 
@@ -150,4 +151,31 @@ def evaluate_common_policy(hook_input: HookInput) -> HookDecision:
             continue_processing=False,
             audit_detail={"policy": "forbid_git_reset_hard", "command": command},
         )
+    workflow_mode_raw = os.environ.get("METDSL_WORKFLOW_EXEC_MODE")
+    workflow_mode = (workflow_mode_raw or "dev").strip().lower()
+    if workflow_mode == "dev":
+        forbidden_tokens = (
+            "--allow-missing-orchestration",
+            "--allow-missing-llm-review",
+            "--allow-soft-fail",
+            "--allow-soft-verify",
+            "--ignore-verify-fail",
+            "--force-pass",
+        )
+        matched = [token for token in forbidden_tokens if token in lowered]
+        if matched:
+            return HookDecision(
+                action=HookDecisionAction.BLOCK,
+                reason=(
+                    "blocked by common hook policy: dev mode forbids verify bypass flags: "
+                    + ", ".join(matched)
+                ),
+                continue_processing=False,
+                audit_detail={
+                    "policy": "forbid_verify_bypass_flags_in_dev_mode",
+                    "workflow_mode": workflow_mode,
+                    "command": command,
+                    "matched_tokens": matched,
+                },
+            )
     return HookDecision(action=HookDecisionAction.ALLOW)

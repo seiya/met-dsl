@@ -2798,6 +2798,7 @@ def _template_placeholder_values(request_payload: dict[str, Any]) -> dict[str, s
         "orchestration_id": str(request_payload.get("orchestration_id", "")),
         "agent_run_id": str(request_payload.get("agent_run_id", "")),
         "parent_agent_run_id": str(request_payload.get("parent_agent_run_id", "")),
+        "workflow_mode": str(request_payload.get("workflow_mode", "")),
         "plan_ref": str(request_payload.get("plan_ref", "")),
         "pipeline_ref": str(request_payload.get("pipeline_ref", "")),
         "dependency_ref": str(request_payload.get("dependency_ref", "")),
@@ -2920,6 +2921,7 @@ def prepare_launch_request_payload(request_payload: dict[str, Any]) -> dict[str,
         if isinstance(skill_name, str) and skill_name.strip():
             payload["skill_ref"] = f"skills/{skill_name.strip()}/SKILL.md"
     payload.setdefault("issue_severity", "none")
+    payload.setdefault("workflow_mode", os.environ.get("METDSL_WORKFLOW_EXEC_MODE", "dev"))
     payload.setdefault("repair_strategy", "none")
     payload.setdefault("repair_target_agent_run_id", "none")
     payload.setdefault("repair_reason", "none")
@@ -3051,7 +3053,13 @@ def _required_launch_prompt_lines(request_payload: dict[str, Any]) -> list[str]:
     step = request_payload.get("step")
     if not isinstance(step, str) or not step.strip():
         return []
-    return build_launch_prompt_text(request_payload).splitlines()
+    # Backward compatibility: workflow_mode line is recommended but not mandatory
+    # for manually provided legacy launch prompts.
+    return [
+        line
+        for line in build_launch_prompt_text(request_payload).splitlines()
+        if not line.strip().startswith("workflow_mode:")
+    ]
 
 
 def _required_launch_prompt_constraint_lines(request_payload: dict[str, Any]) -> list[str]:

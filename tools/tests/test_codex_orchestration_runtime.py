@@ -117,6 +117,7 @@ def _step_launch_prompt(node_key: str, step: str, agent_run_id: str) -> str:
 orchestration_id: orch_001
 agent_run_id: {agent_run_id}
 parent_agent_run_id: orch_run_001
+workflow_mode: dev
 plan_ref: {_FIX_PLAN_REF}
 pipeline_ref: {_FIX_PIPE_REF}
 dependency_ref: {_FIX_DEP_REF}
@@ -138,6 +139,8 @@ repair_reason: none
 - 書き込みは `apply_patch_writes` gate を通過した `guarded-apply-patch` 経由に限定し、shell redirection・直接 `write_text`・任意コマンドによる file write を禁止する。
 - `skill_name` と `skill_ref` が未指定の場合は fail で停止すること。
 - 入力不足時は推測補完せず fail で停止すること。
+- `workflow_mode=dev` の場合、verify 系判定で `issue_severity=major|critical` を検出した時点で fail 停止すること。
+- `workflow_mode=dev` で fail した場合、`failure_analysis.json` 生成に必要な根拠（失敗理由、関連 output_refs、主要ログ要約）を返答へ含めること。
 - `Plan` の場合、直下依存 `node` の `direct dependency plan readiness` を満たさない限り開始してはならない。
 - `Generate` / `Build` / `Execute` / `Judge` の場合、直下依存 `node` の `direct dependency execution readiness` を満たさない限り開始してはならない。
 - 直下依存 `node` が未完了でも、依存先 code を自身の `src/` へ内包して代替してはならない。
@@ -153,6 +156,7 @@ def _substep_launch_prompt(node_key: str, step: str, substep: str, agent_run_id:
 orchestration_id: orch_001
 agent_run_id: {agent_run_id}
 parent_agent_run_id: orch_run_001
+workflow_mode: dev
 plan_ref: {_FIX_PLAN_REF}
 pipeline_ref: {_FIX_PIPE_REF}
 dependency_ref: {_FIX_DEP_REF}
@@ -175,6 +179,8 @@ repair_reason: none
 - 書き込みは `apply_patch_writes` gate を通過した `guarded-apply-patch` 経由に限定し、shell redirection・直接 `write_text`・任意コマンドによる file write を禁止する。
 - `skill_name` と `skill_ref` が未指定の場合は fail で停止すること。
 - 入力不足時は推測補完せず fail で停止すること。
+- `workflow_mode=dev` の場合、verify 系判定で `issue_severity=major|critical` を検出した時点で fail 停止すること。
+- `workflow_mode=dev` で fail した場合、`failure_analysis.json` 生成に必要な根拠（失敗理由、関連 output_refs、主要ログ要約）を返答へ含めること。
 - `Plan` の substep は、直下依存 `node` の `direct dependency plan readiness` を満たさない限り開始してはならない。
 - `Generate` / `Build` / `Execute` / `Judge` の substep は、直下依存 `node` の `direct dependency execution readiness` を満たさない限り開始してはならない。
 - 直下依存 `node` が未完了でも、依存先 code を対象 `node` の `src/` へ内包して代替してはならない。
