@@ -242,28 +242,15 @@ def _extract_command_for_policy(payload: dict[str, Any]) -> str | None:
     return None
 
 
-def _is_workflow_command(command: str) -> bool:
-    normalized = command.lower()
-    workflow_markers = (
-        "tools/codex_orchestration_runtime.py",
-        "codex_orchestration_runtime.py",
-    )
-    return any(marker in normalized for marker in workflow_markers)
-
-
 def _is_workflow_context(event_name: HookEventName, payload: dict[str, Any]) -> bool:
+    del payload
     if event_name in {
         HookEventName.SESSION_START,
         HookEventName.USER_PROMPT_SUBMIT,
         HookEventName.STOP,
     }:
         return False
-    if _env_flag_true("METDSL_WORKFLOW_MODE", "0"):
-        return True
-    command = _extract_command_for_policy(payload)
-    if isinstance(command, str) and _is_workflow_command(command):
-        return True
-    return False
+    return _env_flag_true("METDSL_WORKFLOW_MODE", "0")
 
 
 def _extract_orchestration_id(payload: dict[str, Any]) -> str | None:

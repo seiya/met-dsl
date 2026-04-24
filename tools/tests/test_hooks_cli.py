@@ -858,6 +858,44 @@ class ClaudeHookCliTests(unittest.TestCase):
             )
             self.assertTrue(log_path.is_file())
 
+    def test_missing_orchestration_id_allowed_when_workflow_mode_disabled(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root_path = Path(tmp)
+            payload = {
+                "repo_root": str(repo_root_path),
+                "tool_name": "Bash",
+                "tool_input": {
+                    "command": "python3 tools/codex_orchestration_runtime.py run-gate --gate orchestration_read"
+                },
+            }
+            with patch.dict(
+                os.environ,
+                {
+                    "METDSL_WORKFLOW_MODE": "0",
+                    "CODEX_HOOK_MISSING_ORCHESTRATION_ID_POLICY": "global",
+                },
+            ):
+                code = cli.main(
+                    [
+                        "--backend",
+                        "codex",
+                        "--event",
+                        "PreToolUse",
+                        "--input-json",
+                        json.dumps(payload),
+                    ]
+                )
+            self.assertEqual(code, 0)
+            log_path = (
+                repo_root_path
+                / "workspace"
+                / "orchestrations"
+                / "_global"
+                / "hooks"
+                / "native_hook_events.jsonl"
+            )
+            self.assertTrue(log_path.is_file())
+
 
 if __name__ == "__main__":
     unittest.main()
