@@ -9,8 +9,10 @@ import json
 import os
 import re
 import secrets
+import shutil
 import subprocess
 import sys
+import tempfile
 import traceback
 from functools import lru_cache
 from datetime import datetime, timedelta, timezone
@@ -81,7 +83,6 @@ DEFAULT_ALLOWED_GATE_SERVICES: tuple[str, ...] = (
     "check_artifact_syntax",
     "validate_workspace_root",
     "orchestration_read",
-    "apply_patch_writes",
 )
 
 STEP_REQUIRED_CHILD_AGENT: dict[str, str] = {
@@ -138,6 +139,14 @@ def _capabilities_dir(repo_root: Path, orchestration_id: str) -> Path:
 
 def _gates_dir(repo_root: Path, orchestration_id: str) -> Path:
     return _orchestration_root(repo_root, orchestration_id) / "gates"
+
+
+def _output_manifests_dir(repo_root: Path, orchestration_id: str) -> Path:
+    return _orchestration_root(repo_root, orchestration_id) / "output_manifests"
+
+
+def _read_manifests_dir(repo_root: Path, orchestration_id: str) -> Path:
+    return _orchestration_root(repo_root, orchestration_id) / "read_manifests"
 
 
 def _hooks_log_path(repo_root: Path, orchestration_id: str) -> Path:
@@ -1458,23 +1467,6 @@ def _inline_gate_result(
             agent_run_id=agent_run_id,
             read_path=read_path,
         )
-    if gate == "apply_patch_writes":
-        actor_role = args_json.get("actor_role")
-        if not isinstance(actor_role, str) or not actor_role.strip():
-            raise ValueError("run-gate apply_patch_writes requires non-empty args_json.actor_role")
-        changed_paths = args_json.get("changed_paths")
-        if not isinstance(changed_paths, list) or not all(isinstance(x, str) for x in changed_paths):
-            raise ValueError("run-gate apply_patch_writes requires args_json.changed_paths as string array")
-        tok_raw = args_json.get("capability_token")
-        token_for_gate = str(tok_raw).strip() if isinstance(tok_raw, str) and tok_raw.strip() else capability_token
-        return gate_apply_patch_writes(
-            repo_root,
-            orchestration_id=orchestration_id,
-            actor_role=actor_role,
-            changed_paths=changed_paths,
-            agent_run_id=agent_run_id,
-            capability_token=token_for_gate,
-        )
     raise ValueError(f"unsupported inline gate name: {gate_name!r}")
 
 
@@ -1618,7 +1610,7 @@ def run_gate(
             args_json,
         )
     inline_result: dict[str, Any] | None = None
-    if gate in {"orchestration_read", "apply_patch_writes"}:
+    if gate == "orchestration_read":
         inline_result = _inline_gate_result(
             repo_root,
             orchestration_id=orchestration_id,
@@ -1666,6 +1658,111 @@ def run_gate(
     if inline_result is not None:
         result["result"] = inline_result
     return result
+
+
+def _write_apply_patch_gate_evidence(
+    repo_root: Path,
+    *,
+    orchestration_id: str,
+    agent_run_id: str,
+    actor_role: str,
+    changed_paths: Sequence[str],
+    result_payload: dict[str, Any],
+) -> str:
+    gate = "apply_patch_writes"
+    gate_doc: dict[str, Any] = {
+        "orchestration_id": orchestration_id,
+        "agent_run_id": agent_run_id,
+        "gate": gate,
+        "args_json": {
+            "actor_role": actor_role,
+            "changed_paths": [_normalize_rel_posix(p) for p in changed_paths if str(p).strip()],
+        },
+        "status": "pass",
+        "exit_code": 0,
+        "violations": [],
+        "evaluated_at": _utc_now_iso(),
+        "result": result_payload,
+    }
+    out_path = _gates_dir(repo_root, orchestration_id) / agent_run_id.strip() / f"{gate}.json"
+    _write_json(out_path, gate_doc)
+    return f"workspace/orchestrations/{orchestration_id}/gates/{agent_run_id.strip()}/{gate}.json"
+
+
+def _allowed_output_manifest_path(
+    repo_root: Path,
+    orchestration_id: str,
+    agent_run_id: str,
+) -> Path:
+    return _output_manifests_dir(repo_root, orchestration_id) / f"{agent_run_id.strip()}.json"
+
+
+def _write_allowed_output_manifest(
+    repo_root: Path,
+    *,
+    orchestration_id: str,
+    agent_run_id: str,
+    allowed_output_paths: Sequence[str],
+) -> str:
+    normalized = [
+        _with_trailing_slash(_normalize_rel_posix(p))
+        for p in allowed_output_paths
+        if isinstance(p, str) and p.strip()
+    ]
+    payload = {
+        "orchestration_id": orchestration_id,
+        "agent_run_id": agent_run_id.strip(),
+        "allowed_output_paths": sorted(set(normalized)),
+        "generated_at": _utc_now_iso(),
+    }
+    out_path = _allowed_output_manifest_path(repo_root, orchestration_id, agent_run_id)
+    _write_json(out_path, payload)
+    return f"workspace/orchestrations/{orchestration_id}/output_manifests/{agent_run_id.strip()}.json"
+
+
+def _load_allowed_output_manifest(
+    repo_root: Path,
+    *,
+    orchestration_id: str,
+    agent_run_id: str,
+) -> dict[str, Any]:
+    path = _allowed_output_manifest_path(repo_root, orchestration_id, agent_run_id)
+    if not path.exists():
+        raise ValueError(f"allowed_output_paths manifest not found: {path}")
+    payload = _read_json(path)
+    if not isinstance(payload, dict):
+        raise ValueError(f"allowed_output_paths manifest must be object: {path}")
+    return payload
+
+
+def _validate_paths_against_allowed_output_manifest(
+    repo_root: Path,
+    *,
+    orchestration_id: str,
+    agent_run_id: str,
+    paths: Sequence[str],
+) -> None:
+    manifest = _load_allowed_output_manifest(
+        repo_root,
+        orchestration_id=orchestration_id,
+        agent_run_id=agent_run_id,
+    )
+    allowed_obj = manifest.get("allowed_output_paths")
+    if not isinstance(allowed_obj, list) or not all(isinstance(x, str) for x in allowed_obj):
+        raise ValueError("allowed_output_paths manifest must include string array allowed_output_paths")
+    allowed = [_with_trailing_slash(_normalize_rel_posix(p)) for p in allowed_obj if p.strip()]
+    if not allowed:
+        raise ValueError("allowed_output_paths manifest must include non-empty allowed_output_paths")
+    denied: list[str] = []
+    for raw in paths:
+        rel = _normalize_rel_posix(str(raw))
+        if not rel:
+            continue
+        if any(_repo_path_under_prefix(rel, prefix.rstrip("/")) for prefix in allowed):
+            continue
+        denied.append(rel)
+    if denied:
+        raise ValueError("allowed_output_paths manifest violation: " + ", ".join(denied))
 
 
 def _normalize_rel_posix(path_token: str) -> str:
@@ -1752,6 +1849,58 @@ def _write_access_policy_for_launch(
     return policy
 
 
+def _read_access_manifest_path(
+    repo_root: Path,
+    orchestration_id: str,
+    *,
+    agent_run_id: str,
+) -> Path:
+    return _read_manifests_dir(repo_root, orchestration_id) / f"{agent_run_id.strip()}.json"
+
+
+def _write_read_access_manifest(
+    repo_root: Path,
+    *,
+    orchestration_id: str,
+    agent_run_id: str,
+    allowed_read_roots: Sequence[str],
+    denied_read_roots: Sequence[str],
+) -> str:
+    payload = {
+        "orchestration_id": orchestration_id,
+        "agent_run_id": agent_run_id.strip(),
+        "allowed_read_roots": [
+            _with_trailing_slash(_normalize_rel_posix(p))
+            for p in allowed_read_roots
+            if isinstance(p, str) and p.strip()
+        ],
+        "denied_read_roots": [
+            _with_trailing_slash(_normalize_rel_posix(p))
+            for p in denied_read_roots
+            if isinstance(p, str) and p.strip()
+        ],
+        "generated_at": _utc_now_iso(),
+    }
+    out = _read_access_manifest_path(repo_root, orchestration_id, agent_run_id=agent_run_id)
+    _write_json(out, payload)
+    return f"workspace/orchestrations/{orchestration_id}/read_manifests/{agent_run_id.strip()}.json"
+
+
+def _load_read_access_manifest(
+    repo_root: Path,
+    *,
+    orchestration_id: str,
+    agent_run_id: str,
+) -> dict[str, Any]:
+    path = _read_access_manifest_path(repo_root, orchestration_id, agent_run_id=agent_run_id)
+    if not path.exists():
+        raise FileNotFoundError(f"read access manifest not found: {path}")
+    payload = _read_json(path)
+    if not isinstance(payload, dict):
+        raise ValueError(f"read access manifest must be object: {path}")
+    return payload
+
+
 def _append_access_log_line(
     repo_root: Path,
     orchestration_id: str,
@@ -1776,18 +1925,15 @@ def log_orchestration_read(
 
     許可された read のみ本文を返す。
     """
-    policies_dir = _access_policies_dir(repo_root, orchestration_id)
-    policy_path = policies_dir / f"{agent_run_id}.json"
-    if not policy_path.exists():
-        raise FileNotFoundError(f"access policy not found: {policy_path}")
-    policy = _read_json(policy_path)
-    if not isinstance(policy, dict):
-        raise ValueError(f"access policy must be object: {policy_path}")
-
-    denied = policy.get("denied_read_roots")
+    manifest = _load_read_access_manifest(
+        repo_root,
+        orchestration_id=orchestration_id,
+        agent_run_id=agent_run_id,
+    )
+    denied = manifest.get("denied_read_roots")
     if not isinstance(denied, list):
         denied = []
-    allowed = policy.get("allowed_read_roots")
+    allowed = manifest.get("allowed_read_roots")
     if not isinstance(allowed, list):
         allowed = []
 
@@ -1938,6 +2084,8 @@ def _should_ignore_runtime_snapshot_path(
         f"{orch_root}/gates/",
         f"{orch_root}/hooks/",
         f"{orch_root}/launches/",
+        f"{orch_root}/output_manifests/",
+        f"{orch_root}/read_manifests/",
         f"{orch_root}/violations/",
         f"{orch_root}/steps/",
         f"{orch_root}/reservations/",
@@ -2231,6 +2379,17 @@ def _child_managed_paths_excludable_from_orchestration_diff(
             if baseline_files.get(rel) == current_digest:
                 continue
             excludable.add(rel)
+        manifest_path = _allowed_output_manifest_path(
+            repo_root,
+            orchestration_id,
+            run_id,
+        )
+        manifest_rel = _normalize_rel_posix(str(manifest_path.relative_to(repo_root)))
+        manifest_digest = (
+            "__MISSING__" if not manifest_path.exists() else _compute_sha256(manifest_path)
+        )
+        if manifest_digest != "__MISSING__" and baseline_files.get(manifest_rel) != manifest_digest:
+            excludable.add(manifest_rel)
     return excludable
 
 
@@ -2406,6 +2565,7 @@ def _preflight_allows_agent_launch(payload: dict[str, Any]) -> bool:
         return False
     multi_agent_check_pass: bool | None = None
     codex_hooks_check_pass: bool | None = None
+    codex_home_writable_check_pass: bool | None = None
     for item in checks:
         if not isinstance(item, dict):
             continue
@@ -2415,15 +2575,22 @@ def _preflight_allows_agent_launch(payload: dict[str, Any]) -> bool:
             multi_agent_check_pass = pass_value
         if check_name == "codex_hooks_enabled" and isinstance(pass_value, bool):
             codex_hooks_check_pass = pass_value
+        if check_name == "codex_home_writable" and isinstance(pass_value, bool):
+            codex_home_writable_check_pass = pass_value
 
     launchable = (
         payload.get("status") == "pass"
         and payload.get("can_launch_step_agents") is True
         and payload.get("can_launch_substep_agents") is True
+        and payload.get("sandbox_enforced") is True
         and multi_agent_check_pass is True
     )
     if backend_token == "codex":
-        launchable = launchable and codex_hooks_check_pass is True
+        launchable = (
+            launchable
+            and codex_hooks_check_pass is True
+            and codex_home_writable_check_pass is True
+        )
     return launchable
 
 
@@ -2464,6 +2631,7 @@ def _validate_preflight_payload(payload: dict[str, Any]) -> None:
     if isinstance(checks, list):
         multi_agent_check_pass: bool | None = None
         codex_hooks_check_pass: bool | None = None
+        codex_home_writable_check_pass: bool | None = None
         for item in checks:
             if not isinstance(item, dict):
                 continue
@@ -2473,6 +2641,8 @@ def _validate_preflight_payload(payload: dict[str, Any]) -> None:
                 multi_agent_check_pass = pass_value
             if check_name == "codex_hooks_enabled" and isinstance(pass_value, bool):
                 codex_hooks_check_pass = pass_value
+            if check_name == "codex_home_writable" and isinstance(pass_value, bool):
+                codex_home_writable_check_pass = pass_value
         if multi_agent_check_pass is False:
             if payload.get("can_launch_step_agents") is True or payload.get(
                 "can_launch_substep_agents"
@@ -2490,6 +2660,17 @@ def _validate_preflight_payload(payload: dict[str, Any]) -> None:
         ):
             raise ValueError(
                 "checks.codex_hooks_enabled.pass=true is required for codex launchable preflight"
+            )
+        if (
+            backend_token == "codex"
+            and codex_home_writable_check_pass is not True
+            and (
+                payload.get("can_launch_step_agents") is True
+                or payload.get("can_launch_substep_agents") is True
+            )
+        ):
+            raise ValueError(
+                "checks.codex_home_writable.pass=true is required for codex launchable preflight"
             )
     elif (
         payload.get("status") == "pass"
@@ -2513,6 +2694,8 @@ def _validate_preflight_payload(payload: dict[str, Any]) -> None:
             raise ValueError(
                 "feature_states.codex_hooks=true is required when codex preflight is launchable"
             )
+        if payload.get("sandbox_enforced") is not True:
+            raise ValueError("sandbox_enforced=true is required when preflight is launchable")
 
 
 def _live_preflight_mode() -> str:
@@ -3079,7 +3262,10 @@ def _required_launch_prompt_constraint_lines(request_payload: dict[str, Any]) ->
     return [
         line
         for line in render_launch_prompt_text(request_payload).splitlines()
-        if "書き込みは `apply_patch_writes` gate を通過した `guarded-apply-patch` 経由に限定し" in line
+        if (
+            "`run-gate --gate apply_patch_writes` と `apply-patch-gate`" in line
+            or "`output_manifests/<agent_run_id>.json` を参照して manifest 外 path を reject" in line
+        )
     ]
 
 
@@ -3722,6 +3908,12 @@ def _validate_terminal_run_payload(
             if not isinstance(item, str) or not item.strip():
                 raise ValueError(f"output_refs[{idx}] must be non-empty string")
         _validate_pass_output_refs_against_launch(repo_root, payload)
+        _validate_paths_against_allowed_output_manifest(
+            repo_root,
+            orchestration_id=orchestration_id,
+            agent_run_id=str(payload.get("agent_run_id") or ""),
+            paths=[str(item) for item in output_refs if isinstance(item, str)],
+        )
         _validate_apply_patch_gate_coverage(repo_root, orchestration_id, payload)
         return
 
@@ -4353,6 +4545,91 @@ def parse_feature_list(raw: str) -> dict[str, bool]:
     return features
 
 
+def _probe_existing_directory_writable(path: Path) -> tuple[bool, str]:
+    if not path.exists():
+        return False, f"{path} does not exist"
+    if not path.is_dir():
+        return False, f"{path} is not a directory"
+    try:
+        with tempfile.NamedTemporaryFile(
+            dir=str(path),
+            prefix=".codex-orchestration-preflight-",
+            delete=True,
+        ) as handle:
+            handle.write(b"probe")
+            handle.flush()
+    except OSError as exc:
+        return False, f"{path}: {exc}"
+    return True, str(path)
+
+
+def _probe_codex_home_writable() -> dict[str, Any]:
+    raw = os.environ.get("CODEX_HOME")
+    source = "env:CODEX_HOME" if isinstance(raw, str) and raw.strip() else "default:~/.codex"
+    codex_home = (
+        Path(raw).expanduser()
+        if isinstance(raw, str) and raw.strip()
+        else (Path.home() / ".codex")
+    )
+    if codex_home.exists():
+        ok, detail = _probe_existing_directory_writable(codex_home)
+        return {
+            "name": "codex_home_writable",
+            "pass": ok,
+            "detail": f"{source} path={codex_home} detail={detail}",
+        }
+    parent = codex_home.parent
+    ok, detail = _probe_existing_directory_writable(parent)
+    detail_text = (
+        f"{source} path={codex_home} parent={parent} "
+        + ("parent writable; codex_home can be created" if ok else f"parent not writable: {detail}")
+    )
+    return {"name": "codex_home_writable", "pass": ok, "detail": detail_text}
+
+
+def _probe_bwrap_sandbox() -> tuple[list[dict[str, Any]], bool]:
+    checks: list[dict[str, Any]] = []
+    assume = os.environ.get("CODEX_ORCHESTRATION_ASSUME_BWRAP", "").strip().lower()
+    if assume in {"1", "true", "yes"}:
+        checks.extend(
+            [
+                {"name": "sandbox_bwrap_available", "pass": True, "detail": "assumed via env override"},
+                {"name": "sandbox_bwrap_userns", "pass": True, "detail": "assumed via env override"},
+            ]
+        )
+        return checks, True
+
+    bwrap_path = shutil.which("bwrap")
+    bwrap_available = bool(bwrap_path)
+    checks.append(
+        {
+            "name": "sandbox_bwrap_available",
+            "pass": bwrap_available,
+            "detail": bwrap_path if bwrap_path else "bwrap not found in PATH",
+        }
+    )
+    if not bwrap_available:
+        checks.append(
+            {
+                "name": "sandbox_bwrap_userns",
+                "pass": False,
+                "detail": "skipped because bwrap is unavailable",
+            }
+        )
+        return checks, False
+
+    proc = subprocess.run(["bwrap", "--version"], text=True, capture_output=True, check=False)
+    userns_ok = proc.returncode == 0
+    checks.append(
+        {
+            "name": "sandbox_bwrap_userns",
+            "pass": userns_ok,
+            "detail": (proc.stdout.strip() or proc.stderr.strip() or f"exit={proc.returncode}"),
+        }
+    )
+    return checks, userns_ok
+
+
 def _probe_codex_backend(
     backend_token: str,
     command: str,
@@ -4564,6 +4841,12 @@ def probe_execution_platform(
             }
         )
         can_launch_agents = can_launch_agents and codex_hooks_enabled
+        codex_home_check = _probe_codex_home_writable()
+        checks.append(codex_home_check)
+        can_launch_agents = can_launch_agents and (codex_home_check.get("pass") is True)
+    sandbox_checks, sandbox_enforced = _probe_bwrap_sandbox()
+    checks.extend(sandbox_checks)
+    can_launch_agents = can_launch_agents and sandbox_enforced
     session_policy = {
         "allow_step_agent_launch": os.environ.get("CODEX_ALLOW_STEP_AGENT_LAUNCH", "1").strip().lower()
         not in {"0", "false", "no"},
@@ -4579,6 +4862,8 @@ def probe_execution_platform(
         "agent_version": agent_version,
         "feature_states": features,
         "checks": checks,
+        "sandbox_runtime": "bwrap",
+        "sandbox_enforced": sandbox_enforced,
         "codex_hooks_enabled": (features.get("codex_hooks") is True) if backend_token == "codex" else None,
         "can_launch_step_agents": can_launch_agents,
         "can_launch_substep_agents": can_launch_agents,
@@ -4876,6 +5161,31 @@ def record_launch(
             child_agent_run_id,
             request_payload,
         )
+        policy_doc = _read_json(
+            _access_policies_dir(repo_root, orchestration_id) / f"{child_agent_run_id}.json"
+        )
+        if not isinstance(policy_doc, dict):
+            raise ValueError("access policy must be object for read manifest generation")
+        allowed_read_roots_obj = policy_doc.get("allowed_read_roots")
+        denied_read_roots_obj = policy_doc.get("denied_read_roots")
+        allowed_read_roots = (
+            [str(item) for item in allowed_read_roots_obj]
+            if isinstance(allowed_read_roots_obj, list)
+            else []
+        )
+        denied_read_roots = (
+            [str(item) for item in denied_read_roots_obj]
+            if isinstance(denied_read_roots_obj, list)
+            else []
+        )
+        read_manifest_ref = _write_read_access_manifest(
+            repo_root,
+            orchestration_id=orchestration_id,
+            agent_run_id=child_agent_run_id,
+            allowed_read_roots=allowed_read_roots,
+            denied_read_roots=denied_read_roots,
+        )
+        out_refs["read_access_manifest_ref"] = read_manifest_ref
         cap_doc = _write_capability_for_launch(
             repo_root,
             orchestration_id,
@@ -4885,6 +5195,15 @@ def record_launch(
         cap_rel = f"workspace/orchestrations/{orchestration_id}/capabilities/{child_agent_run_id}.json"
         out_refs["capability_ref"] = cap_rel
         out_refs["capability_token"] = cap_doc.get("capability_token", "")
+        write_roots_obj = cap_doc.get("write_roots")
+        write_roots = [str(item) for item in write_roots_obj] if isinstance(write_roots_obj, list) else []
+        manifest_ref = _write_allowed_output_manifest(
+            repo_root,
+            orchestration_id=orchestration_id,
+            agent_run_id=child_agent_run_id,
+            allowed_output_paths=write_roots,
+        )
+        out_refs["allowed_output_manifest_ref"] = manifest_ref
         step_tok = st.strip().lower()
         _transition_node_step_phase_state(
             repo_root,
@@ -5284,14 +5603,30 @@ def guarded_apply_patch(
             "guarded-apply-patch: patch targets are not covered by changed_paths: "
             + ", ".join(not_covered)
         )
+    actor_role_token = actor_role.strip().lower()
+    if actor_role_token in {"step", "substep"}:
+        _validate_paths_against_allowed_output_manifest(
+            repo_root,
+            orchestration_id=orchestration_id,
+            agent_run_id=agent_run_id,
+            paths=normalized_paths,
+        )
 
-    gate_out = run_gate(
+    gate_result = gate_apply_patch_writes(
         repo_root,
         orchestration_id=orchestration_id,
-        gate_name="apply_patch_writes",
+        actor_role=actor_role,
+        changed_paths=normalized_paths,
         agent_run_id=agent_run_id,
-        args_json={"actor_role": actor_role, "changed_paths": normalized_paths},
         capability_token=capability_token,
+    )
+    gate_ref = _write_apply_patch_gate_evidence(
+        repo_root,
+        orchestration_id=orchestration_id,
+        agent_run_id=agent_run_id,
+        actor_role=actor_role,
+        changed_paths=normalized_paths,
+        result_payload=gate_result,
     )
     proc = subprocess.run(
         ["git", "apply", "--recount", "--whitespace=nowarn", "-"],
@@ -5309,7 +5644,7 @@ def guarded_apply_patch(
         "applied": True,
         "changed_paths": normalized_paths,
         "patch_targets": patch_targets,
-        "gate_result_ref": gate_out.get("gate_result_ref", ""),
+        "gate_result_ref": gate_ref,
     }
 
 
@@ -5356,14 +5691,6 @@ def main(argv: list[str] | None = None) -> int:
     orch_read_parser.add_argument("--agent-run-id", required=True)
     orch_read_parser.add_argument("--read-path", required=True)
     orch_read_parser.add_argument("--capability-token", required=True)
-
-    patch_gate_parser = subparsers.add_parser("apply-patch-gate")
-    patch_gate_parser.add_argument("--repo-root", required=True)
-    patch_gate_parser.add_argument("--orchestration-id", required=True)
-    patch_gate_parser.add_argument("--actor-role", required=True)
-    patch_gate_parser.add_argument("--agent-run-id", required=True)
-    patch_gate_parser.add_argument("--paths-json", required=True, type=_json_string_list_arg)
-    patch_gate_parser.add_argument("--capability-token", required=True)
 
     guarded_patch_parser = subparsers.add_parser("guarded-apply-patch")
     guarded_patch_parser.add_argument("--repo-root", required=True)
@@ -5504,23 +5831,6 @@ def main(argv: list[str] | None = None) -> int:
             )
             result = gate_out.get("result", {})
         except (RuntimeError, ValueError, FileNotFoundError) as exc:
-            print(str(exc), file=sys.stderr)
-            return 1
-    elif args.command == "apply-patch-gate":
-        try:
-            gate_out = run_gate(
-                repo_root,
-                orchestration_id=args.orchestration_id,
-                gate_name="apply_patch_writes",
-                agent_run_id=args.agent_run_id,
-                args_json={
-                    "actor_role": args.actor_role,
-                    "changed_paths": args.paths_json,
-                },
-                capability_token=args.capability_token,
-            )
-            result = gate_out.get("result", {})
-        except (RuntimeError, ValueError) as exc:
             print(str(exc), file=sys.stderr)
             return 1
     elif args.command == "guarded-apply-patch":

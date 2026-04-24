@@ -64,6 +64,8 @@
 ## 1-3. エージェント起動規約（運用必須）
 - `workflow` 実行は `orchestration agent` を起点に開始し、`orchestration_id` を必須発行する。
 - `workflow` 開始前に、`step agent` と `substep agent` の独立起動可否を検証する `preflight` を実行し、`pass` でない場合は開始してはならない。
+- `backend=codex` の preflight は、`checks.codex_hooks_enabled.pass=true` と `checks.codex_home_writable.pass=true` を同時に満たさなければならない。いずれかが未充足の場合は開始してはならない。
+- `preflight` は `sandbox_runtime=bwrap` と `sandbox_enforced=true` を必須条件に含める。`checks.sandbox_bwrap_available.pass=true` と `checks.sandbox_bwrap_userns.pass=true` を満たさない場合は開始してはならない。
 - workflow 起動は `python3 tools/run_workflow.py <spec_ref> <until_phase> [--llm <codex|cursor|claude>]` を canonical entrypoint とし、手動 `init` / 手動 `preflight` を通常経路として使用してはならない。
 - `tools/codex_orchestration_runtime.py` を使用する execution platform では、`preflight.json` と `launches/` と `agent_runs.jsonl` と `step_result.json` の保存を同 runtime の canonical source 実装で行う。
 - `preflight` は `tools/run_workflow.py` 実行の一部として生成しなければならない。`backend` は `--llm` 引数で指定する。
@@ -72,6 +74,8 @@
 - 各 `step` / `substep` の実処理を `script` で代行してはならない。必ず独立 `agent_run_id` を持つ `LLM agent` で実行する。
 - `step agent` と `substep agent` は `agent_run_id` ごとに固有 `context_id` を持ち、`context_isolated=true` を必須記録とする。
 - `step` / `substep` の起動要求と起動応答は `workspace/orchestrations/<orchestration_id>/launches/` 配下へ保存し、`agent_runs.jsonl` の `launch_request_ref` と `launch_response_ref` から追跡可能にする。
+- `record-launch` は `workspace/orchestrations/<orchestration_id>/output_manifests/<agent_run_id>.json` を生成し、`allowed_output_paths` を確定する。`guarded-apply-patch` と `record-agent-run` は当該 manifest 外 path を reject しなければならない。
+- `record-launch` は `workspace/orchestrations/<orchestration_id>/read_manifests/<agent_run_id>.json` を生成し、`allowed_read_roots` と `denied_read_roots` を確定する。`orchestration_read` は当該 manifest 外 path を reject しなければならない。
 - 各 `step` / `substep` の完了時には `workspace/orchestrations/<orchestration_id>/agents/<agent_run_id>/dialogs/agent.result.json` と `agent.summary.txt` を保存し、`agent_runs.jsonl` の `agent_result_ref` と `agent_summary_ref` から追跡可能にする。
 - `agent.summary.txt` は失敗時の原因要約、再投入要否判断材料、主要 `output_refs` を含む調査用ログとして扱い、空ファイルまたは定型句のみを禁止する。
 - `orchestration agent` は `dependency.resolved.yaml` の `topo_level` と依存充足状態に基づいて起動順序を逐次決定する。
@@ -157,7 +161,8 @@
 - `step_result.json` が `workspace/orchestrations/<orchestration_id>/steps/<node_key_safe>/<step>/<agent_run_id>/` に存在し、`required_outputs` と `executor_agent_run_id` と `substep_agent_run_ids` を保持している。
 - 各 `step` と各 `substep` が独立 `agent_run_id` を持ち、`parent_agent_run_id` で親子関係を追跡できる。
 - 各 `step` と各 `substep` の `context_id` が重複せず、全件で `context_isolated=true` が記録されている。
-- `workspace/orchestrations/<orchestration_id>/preflight.json` が存在し、`can_launch_step_agents=true` と `can_launch_substep_agents=true` を満たしている。
+- `workspace/orchestrations/<orchestration_id>/preflight.json` が存在し、`can_launch_step_agents=true` と `can_launch_substep_agents=true` と `sandbox_enforced=true` を満たしている。
+- `backend=codex` の `preflight.json` が `checks.codex_hooks_enabled.pass=true` と `checks.codex_home_writable.pass=true` を記録している。
 - `agent_runs.jsonl` の `step` / `substep` ロールが `agent_session_id` と `launch_request_ref` と `launch_response_ref` と `agent_result_ref` と `agent_summary_ref` を保持し、参照先ファイルが存在している。
 - `spec_kind` を問わない workflow 実行で各 `node_key` の個別 `plan_id` と個別 `pipeline_id` が発行されている。
 - 実行証跡から、`script` 一括実行ではなく `orchestration -> step` または `orchestration -> substep` の独立 `agent` 実行であることを確認できる。

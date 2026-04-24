@@ -136,7 +136,8 @@ repair_reason: none
 - 要求定義と判定規則は `docs/` と `spec/` と `skill_must_read_refs` に含まれる当該試行 artifact だけから解釈すること。`tools/` 配下の実装、検証 `script`、test code、validator code から rule を抽出してはならない。
 - `orchestration-read` は `python3 tools/codex_orchestration_runtime.py run-gate --gate orchestration_read --agent-run-id <agent_run_id> --capability-token <capability_token> --args-json '{{"read_path":"..."}}'` を唯一の経路として実行し、`orchestration-read` 直呼びを禁止する。
 - `apply_patch` は `python3 tools/codex_orchestration_runtime.py guarded-apply-patch --repo-root <repo_root> --orchestration-id <orchestration_id> --actor-role step --agent-run-id <agent_run_id> --paths-json '["..."]' --patch-text '<patch_text>' --capability-token <capability_token>` を唯一の経路として実行し、拒否時は編集を停止すること。
-- 書き込みは `apply_patch_writes` gate を通過した `guarded-apply-patch` 経由に限定し、shell redirection・直接 `write_text`・任意コマンドによる file write を禁止する。
+- 書き込みは `guarded-apply-patch` 経由に限定し、`run-gate --gate apply_patch_writes` と `apply-patch-gate` と shell redirection・直接 `write_text`・任意コマンドによる file write を禁止する。
+- `guarded-apply-patch` は `output_manifests/<agent_run_id>.json` を参照して manifest 外 path を reject する。manifest 外 path へ書いてはならない。
 - `skill_name` と `skill_ref` が未指定の場合は fail で停止すること。
 - 入力不足時は推測補完せず fail で停止すること。
 - `workflow_mode=dev` の場合、verify 系判定で `issue_severity=major|critical` を検出した時点で fail 停止すること。
@@ -176,7 +177,8 @@ repair_reason: none
 - 要求定義と判定規則は `docs/` と `spec/` と `skill_must_read_refs` に含まれる当該試行 artifact だけから解釈すること。`tools/` 配下の実装、検証 `script`、test code、validator code から rule を抽出してはならない。
 - `orchestration-read` は `python3 tools/codex_orchestration_runtime.py run-gate --gate orchestration_read --agent-run-id <agent_run_id> --capability-token <capability_token> --args-json '{{"read_path":"..."}}'` を唯一の経路として実行し、`orchestration-read` 直呼びを禁止する。
 - `apply_patch` は `python3 tools/codex_orchestration_runtime.py guarded-apply-patch --repo-root <repo_root> --orchestration-id <orchestration_id> --actor-role substep --agent-run-id <agent_run_id> --paths-json '["..."]' --patch-text '<patch_text>' --capability-token <capability_token>` を唯一の経路として実行し、拒否時は編集を停止すること。
-- 書き込みは `apply_patch_writes` gate を通過した `guarded-apply-patch` 経由に限定し、shell redirection・直接 `write_text`・任意コマンドによる file write を禁止する。
+- 書き込みは `guarded-apply-patch` 経由に限定し、`run-gate --gate apply_patch_writes` と `apply-patch-gate` と shell redirection・直接 `write_text`・任意コマンドによる file write を禁止する。
+- `guarded-apply-patch` は `output_manifests/<agent_run_id>.json` を参照して manifest 外 path を reject する。manifest 外 path へ書いてはならない。
 - `skill_name` と `skill_ref` が未指定の場合は fail で停止すること。
 - 入力不足時は推測補完せず fail で停止すること。
 - `workflow_mode=dev` の場合、verify 系判定で `issue_severity=major|critical` を検出した時点で fail 停止すること。
@@ -245,13 +247,25 @@ class _FakeCompletedProcess:
 class CodexOrchestrationRuntimeTests(unittest.TestCase):
     def setUp(self) -> None:
         self._old_live_preflight = os.environ.get("CODEX_ORCHESTRATION_ENFORCE_LIVE_PREFLIGHT")
+        self._old_assume_bwrap = os.environ.get("CODEX_ORCHESTRATION_ASSUME_BWRAP")
+        self._old_codex_home = os.environ.get("CODEX_HOME")
         os.environ["CODEX_ORCHESTRATION_ENFORCE_LIVE_PREFLIGHT"] = "0"
+        os.environ["CODEX_ORCHESTRATION_ASSUME_BWRAP"] = "1"
+        os.environ["CODEX_HOME"] = "/tmp/codex-orchestration-test-home"
 
     def tearDown(self) -> None:
         if self._old_live_preflight is None:
             os.environ.pop("CODEX_ORCHESTRATION_ENFORCE_LIVE_PREFLIGHT", None)
         else:
             os.environ["CODEX_ORCHESTRATION_ENFORCE_LIVE_PREFLIGHT"] = self._old_live_preflight
+        if self._old_assume_bwrap is None:
+            os.environ.pop("CODEX_ORCHESTRATION_ASSUME_BWRAP", None)
+        else:
+            os.environ["CODEX_ORCHESTRATION_ASSUME_BWRAP"] = self._old_assume_bwrap
+        if self._old_codex_home is None:
+            os.environ.pop("CODEX_HOME", None)
+        else:
+            os.environ["CODEX_HOME"] = self._old_codex_home
 
     def test_terminal_statuses_do_not_include_fail_closed(self) -> None:
         self.assertEqual(TERMINAL_STATUSES, {"pass", "fail", "blocked", "timeout", "cancel"})
@@ -428,6 +442,50 @@ shell_tool                       stable             true
         )
         self.assertEqual(seen["command"], "custom-codex")
         self.assertEqual(result["probe_command"], "custom-codex")
+
+    def test_probe_execution_platform_fails_when_bwrap_is_unavailable(self) -> None:
+        def runner(args, **kwargs):  # type: ignore[no-untyped-def]
+            if args[1:] == ["--version"]:
+                return _FakeCompletedProcess(0, stdout="codex-cli 0.114.0\n")
+            if args[1:] == ["features", "list"]:
+                return _FakeCompletedProcess(
+                    0,
+                    stdout="multi_agent experimental true\ncodex_hooks under-development true\n",
+                )
+            raise AssertionError(args)
+
+        with patch.dict(os.environ, {"CODEX_ORCHESTRATION_ASSUME_BWRAP": "0"}):
+            with patch("tools.codex_orchestration_runtime.shutil.which", return_value=None):
+                result = probe_execution_platform(backend="codex", runner=runner)
+        self.assertEqual(result["status"], "fail")
+        self.assertFalse(result["can_launch_step_agents"])
+        by_name = {c["name"]: c for c in result["checks"]}
+        self.assertFalse(by_name["sandbox_bwrap_available"]["pass"])
+
+    def test_probe_execution_platform_fails_when_codex_home_is_not_writable(self) -> None:
+        def runner(args, **kwargs):  # type: ignore[no-untyped-def]
+            if args[1:] == ["--version"]:
+                return _FakeCompletedProcess(0, stdout="codex-cli 0.114.0\n")
+            if args[1:] == ["features", "list"]:
+                return _FakeCompletedProcess(
+                    0,
+                    stdout="multi_agent experimental true\ncodex_hooks under-development true\n",
+                )
+            raise AssertionError(args)
+
+        with patch.dict(
+            os.environ,
+            {
+                "CODEX_HOME": "/__codex_preflight_missing_parent__/home/.codex",
+                "CODEX_ORCHESTRATION_ASSUME_BWRAP": "1",
+            },
+        ):
+            result = probe_execution_platform(backend="codex", runner=runner)
+        self.assertEqual(result["status"], "fail")
+        self.assertFalse(result["can_launch_step_agents"])
+        by_name = {c["name"]: c for c in result["checks"]}
+        self.assertIn("codex_home_writable", by_name)
+        self.assertFalse(by_name["codex_home_writable"]["pass"])
 
     def test_probe_execution_platform_rejects_backend_command_mismatch(self) -> None:
         with self.assertRaisesRegex(ValueError, "agent_command/backend mismatch"):
@@ -642,6 +700,8 @@ shell_tool                       stable             true
                 orchestration_id="orch_001",
                 payload={
                     "status": "pass",
+                    "sandbox_runtime": "bwrap",
+                    "sandbox_enforced": True,
                     "can_launch_step_agents": True,
                     "can_launch_substep_agents": True,
                     "feature_states": {"multi_agent": True, "codex_hooks": True},
@@ -998,10 +1058,12 @@ shell_tool                       stable             true
                 orchestration_id="orch_001",
                 payload={
                     "status": "pass",
+                    "sandbox_runtime": "bwrap",
+                    "sandbox_enforced": True,
                     "can_launch_step_agents": True,
                     "can_launch_substep_agents": True,
                     "feature_states": {"multi_agent": True, "codex_hooks": True},
-                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}],
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
                 },
             )
             full_prompt = _substep_launch_prompt(
@@ -1051,10 +1113,12 @@ shell_tool                       stable             true
                 orchestration_id="orch_001",
                 payload={
                     "status": "pass",
+                    "sandbox_runtime": "bwrap",
+                    "sandbox_enforced": True,
                     "can_launch_step_agents": True,
                     "can_launch_substep_agents": True,
                     "feature_states": {"multi_agent": True, "codex_hooks": True},
-                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}],
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
                 },
             )
             record_launch(
@@ -1119,10 +1183,12 @@ shell_tool                       stable             true
                 orchestration_id="orch_001",
                 payload={
                     "status": "pass",
+                    "sandbox_runtime": "bwrap",
+                    "sandbox_enforced": True,
                     "can_launch_step_agents": True,
                     "can_launch_substep_agents": True,
                     "feature_states": {"multi_agent": True, "codex_hooks": True},
-                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}],
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
                 },
             )
             record_launch(
@@ -1182,10 +1248,12 @@ shell_tool                       stable             true
                 orchestration_id="orch_001",
                 payload={
                     "status": "pass",
+                    "sandbox_runtime": "bwrap",
+                    "sandbox_enforced": True,
                     "can_launch_step_agents": True,
                     "can_launch_substep_agents": True,
                     "feature_states": {"multi_agent": True, "codex_hooks": True},
-                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}],
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
                 },
             )
             with self.assertRaisesRegex(ValueError, "template markers"):
@@ -1224,10 +1292,12 @@ shell_tool                       stable             true
                 orchestration_id="orch_001",
                 payload={
                     "status": "pass",
+                    "sandbox_runtime": "bwrap",
+                    "sandbox_enforced": True,
                     "can_launch_step_agents": True,
                     "can_launch_substep_agents": True,
                     "feature_states": {"multi_agent": True, "codex_hooks": True},
-                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}],
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
                 },
             )
             launch_refs = record_launch(
@@ -1281,10 +1351,12 @@ shell_tool                       stable             true
                 orchestration_id="orch_001",
                 payload={
                     "status": "pass",
+                    "sandbox_runtime": "bwrap",
+                    "sandbox_enforced": True,
                     "can_launch_step_agents": True,
                     "can_launch_substep_agents": True,
                     "feature_states": {"multi_agent": True, "codex_hooks": True},
-                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}],
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
                 },
             )
             with self.assertRaisesRegex(ValueError, "plan_ref must not contain placeholder"):
@@ -1325,10 +1397,12 @@ shell_tool                       stable             true
                 orchestration_id="orch_001",
                 payload={
                     "status": "pass",
+                    "sandbox_runtime": "bwrap",
+                    "sandbox_enforced": True,
                     "can_launch_step_agents": True,
                     "can_launch_substep_agents": True,
                     "feature_states": {"multi_agent": True, "codex_hooks": True},
-                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}],
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
                 },
             )
             with self.assertRaisesRegex(ValueError, "launch request must include non-empty dependency_ref"):
@@ -1368,10 +1442,12 @@ shell_tool                       stable             true
                 orchestration_id="orch_001",
                 payload={
                     "status": "pass",
+                    "sandbox_runtime": "bwrap",
+                    "sandbox_enforced": True,
                     "can_launch_step_agents": True,
                     "can_launch_substep_agents": True,
                     "feature_states": {"multi_agent": True, "codex_hooks": True},
-                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}],
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
                 },
             )
             with self.assertRaisesRegex(ValueError, "launch request dependency_ref must not contain placeholder tokens"):
@@ -1412,10 +1488,12 @@ shell_tool                       stable             true
                 orchestration_id="orch_001",
                 payload={
                     "status": "pass",
+                    "sandbox_runtime": "bwrap",
+                    "sandbox_enforced": True,
                     "can_launch_step_agents": True,
                     "can_launch_substep_agents": True,
                     "feature_states": {"multi_agent": True, "codex_hooks": True},
-                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}],
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
                 },
             )
             bad_pipeline = (
@@ -1455,10 +1533,12 @@ shell_tool                       stable             true
                 orchestration_id="orch_001",
                 payload={
                     "status": "pass",
+                    "sandbox_runtime": "bwrap",
+                    "sandbox_enforced": True,
                     "can_launch_step_agents": True,
                     "can_launch_substep_agents": True,
                     "feature_states": {"multi_agent": True, "codex_hooks": True},
-                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}],
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
                 },
             )
             with self.assertRaisesRegex(ValueError, "generation_id"):
@@ -1494,10 +1574,12 @@ shell_tool                       stable             true
                 orchestration_id="orch_001",
                 payload={
                     "status": "pass",
+                    "sandbox_runtime": "bwrap",
+                    "sandbox_enforced": True,
                     "can_launch_step_agents": True,
                     "can_launch_substep_agents": True,
                     "feature_states": {"multi_agent": True, "codex_hooks": True},
-                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}],
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
                 },
             )
             launch_refs = record_launch(
@@ -1540,10 +1622,12 @@ shell_tool                       stable             true
                 orchestration_id="orch_001",
                 payload={
                     "status": "pass",
+                    "sandbox_runtime": "bwrap",
+                    "sandbox_enforced": True,
                     "can_launch_step_agents": True,
                     "can_launch_substep_agents": True,
                     "feature_states": {"multi_agent": True, "codex_hooks": True},
-                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}],
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
                 },
             )
             base = {
@@ -1589,10 +1673,12 @@ shell_tool                       stable             true
                 orchestration_id="orch_001",
                 payload={
                     "status": "pass",
+                    "sandbox_runtime": "bwrap",
+                    "sandbox_enforced": True,
                     "can_launch_step_agents": True,
                     "can_launch_substep_agents": True,
                     "feature_states": {"multi_agent": True, "codex_hooks": True},
-                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}],
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
                 },
             )
             prepared = prepare_launch_request_payload(
@@ -1613,9 +1699,11 @@ shell_tool                       stable             true
                     "repair_reason": "none",
                 }
             )
-            prompt = render_launch_prompt_text(prepared).replace(
-                "- 書き込みは `apply_patch_writes` gate を通過した `guarded-apply-patch` 経由に限定し、shell redirection・直接 `write_text`・任意コマンドによる file write を禁止する。\n",
-                "",
+            prompt = "\n".join(
+                line
+                for line in render_launch_prompt_text(prepared).splitlines()
+                if "`run-gate --gate apply_patch_writes`" not in line
+                and "`output_manifests/" not in line
             )
             with self.assertRaisesRegex(ValueError, "shell-write constraints"):
                 record_launch(
@@ -1636,10 +1724,12 @@ shell_tool                       stable             true
                 orchestration_id="orch_001",
                 payload={
                     "status": "pass",
+                    "sandbox_runtime": "bwrap",
+                    "sandbox_enforced": True,
                     "can_launch_step_agents": True,
                     "can_launch_substep_agents": True,
                     "feature_states": {"multi_agent": True, "codex_hooks": True},
-                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}],
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
                 },
             )
             record_agent_run(
@@ -1749,10 +1839,12 @@ shell_tool                       stable             true
                 orchestration_id="orch_001",
                 payload={
                     "status": "pass",
+                    "sandbox_runtime": "bwrap",
+                    "sandbox_enforced": True,
                     "can_launch_step_agents": True,
                     "can_launch_substep_agents": True,
                     "feature_states": {"multi_agent": True, "codex_hooks": True},
-                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}],
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
                 },
             )
             payload = record_agent_run(
@@ -1785,10 +1877,12 @@ shell_tool                       stable             true
                 orchestration_id="orch_001",
                 payload={
                     "status": "pass",
+                    "sandbox_runtime": "bwrap",
+                    "sandbox_enforced": True,
                     "can_launch_step_agents": True,
                     "can_launch_substep_agents": True,
                     "feature_states": {"multi_agent": True, "codex_hooks": True},
-                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}],
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
                 },
             )
             with self.assertRaisesRegex(
@@ -1817,10 +1911,12 @@ shell_tool                       stable             true
                 orchestration_id="orch_001",
                 payload={
                     "status": "pass",
+                    "sandbox_runtime": "bwrap",
+                    "sandbox_enforced": True,
                     "can_launch_step_agents": True,
                     "can_launch_substep_agents": True,
                     "feature_states": {"multi_agent": True, "codex_hooks": True},
-                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}],
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
                 },
             )
             out_ref = "workspace/orchestrations/orch_001/logs/orchestrator.note.txt"
@@ -1856,10 +1952,12 @@ shell_tool                       stable             true
                 orchestration_id="orch_001",
                 payload={
                     "status": "pass",
+                    "sandbox_runtime": "bwrap",
+                    "sandbox_enforced": True,
                     "can_launch_step_agents": True,
                     "can_launch_substep_agents": True,
                     "feature_states": {"multi_agent": True, "codex_hooks": True},
-                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}],
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
                 },
             )
             payload = record_agent_run(
@@ -1887,10 +1985,12 @@ shell_tool                       stable             true
                 orchestration_id="orch_001",
                 payload={
                     "status": "pass",
+                    "sandbox_runtime": "bwrap",
+                    "sandbox_enforced": True,
                     "can_launch_step_agents": True,
                     "can_launch_substep_agents": True,
                     "feature_states": {"multi_agent": True, "codex_hooks": True},
-                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}],
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
                 },
             )
             out_ref = "workspace/orchestrations/orch_001/logs/orchestrator.note.txt"
@@ -1930,10 +2030,12 @@ shell_tool                       stable             true
                 orchestration_id="orch_001",
                 payload={
                     "status": "pass",
+                    "sandbox_runtime": "bwrap",
+                    "sandbox_enforced": True,
                     "can_launch_step_agents": True,
                     "can_launch_substep_agents": True,
                     "feature_states": {"multi_agent": True, "codex_hooks": True},
-                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}],
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
                 },
             )
             out_ref = "workspace/orchestrations/orch_001/logs/orchestrator.note.txt"
@@ -1971,10 +2073,12 @@ shell_tool                       stable             true
                 orchestration_id="orch_001",
                 payload={
                     "status": "pass",
+                    "sandbox_runtime": "bwrap",
+                    "sandbox_enforced": True,
                     "can_launch_step_agents": True,
                     "can_launch_substep_agents": True,
                     "feature_states": {"multi_agent": True, "codex_hooks": True},
-                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}],
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
                 },
             )
             bad_ref = (
@@ -2006,10 +2110,12 @@ shell_tool                       stable             true
                 orchestration_id="orch_001",
                 payload={
                     "status": "pass",
+                    "sandbox_runtime": "bwrap",
+                    "sandbox_enforced": True,
                     "can_launch_step_agents": True,
                     "can_launch_substep_agents": True,
                     "feature_states": {"multi_agent": True, "codex_hooks": True},
-                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}],
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
                 },
             )
             record_agent_run(
@@ -2079,10 +2185,12 @@ shell_tool                       stable             true
                 orchestration_id="orch_001",
                 payload={
                     "status": "pass",
+                    "sandbox_runtime": "bwrap",
+                    "sandbox_enforced": True,
                     "can_launch_step_agents": True,
                     "can_launch_substep_agents": True,
                     "feature_states": {"multi_agent": True, "codex_hooks": True},
-                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}],
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
                 },
             )
             record_agent_run(
@@ -2152,10 +2260,12 @@ shell_tool                       stable             true
                 orchestration_id="orch_001",
                 payload={
                     "status": "pass",
+                    "sandbox_runtime": "bwrap",
+                    "sandbox_enforced": True,
                     "can_launch_step_agents": True,
                     "can_launch_substep_agents": True,
                     "feature_states": {"multi_agent": True, "codex_hooks": True},
-                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}],
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
                 },
             )
             record_agent_run(
@@ -2232,10 +2342,12 @@ shell_tool                       stable             true
                 orchestration_id="orch_001",
                 payload={
                     "status": "pass",
+                    "sandbox_runtime": "bwrap",
+                    "sandbox_enforced": True,
                     "can_launch_step_agents": True,
                     "can_launch_substep_agents": True,
                     "feature_states": {"multi_agent": True, "codex_hooks": True},
-                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}],
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
                 },
             )
             record_agent_run(
@@ -2312,10 +2424,12 @@ shell_tool                       stable             true
                 orchestration_id="orch_001",
                 payload={
                     "status": "pass",
+                    "sandbox_runtime": "bwrap",
+                    "sandbox_enforced": True,
                     "can_launch_step_agents": True,
                     "can_launch_substep_agents": True,
                     "feature_states": {"multi_agent": True, "codex_hooks": True},
-                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}],
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
                 },
             )
             record_agent_run(
@@ -2399,10 +2513,12 @@ shell_tool                       stable             true
                 orchestration_id="orch_001",
                 payload={
                     "status": "pass",
+                    "sandbox_runtime": "bwrap",
+                    "sandbox_enforced": True,
                     "can_launch_step_agents": True,
                     "can_launch_substep_agents": True,
                     "feature_states": {"multi_agent": True, "codex_hooks": True},
-                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}],
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
                 },
             )
             record_agent_run(
@@ -2489,10 +2605,12 @@ shell_tool                       stable             true
                 orchestration_id="orch_001",
                 payload={
                     "status": "pass",
+                    "sandbox_runtime": "bwrap",
+                    "sandbox_enforced": True,
                     "can_launch_step_agents": True,
                     "can_launch_substep_agents": True,
                     "feature_states": {"multi_agent": True, "codex_hooks": True},
-                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}],
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
                 },
             )
             record_agent_run(
@@ -2580,10 +2698,12 @@ shell_tool                       stable             true
                 orchestration_id="orch_001",
                 payload={
                     "status": "pass",
+                    "sandbox_runtime": "bwrap",
+                    "sandbox_enforced": True,
                     "can_launch_step_agents": True,
                     "can_launch_substep_agents": True,
                     "feature_states": {"multi_agent": True, "codex_hooks": True},
-                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}],
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
                 },
             )
             record_agent_run(
@@ -2679,10 +2799,12 @@ shell_tool                       stable             true
                 orchestration_id="orch_001",
                 payload={
                     "status": "pass",
+                    "sandbox_runtime": "bwrap",
+                    "sandbox_enforced": True,
                     "can_launch_step_agents": True,
                     "can_launch_substep_agents": True,
                     "feature_states": {"multi_agent": True, "codex_hooks": True},
-                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}],
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
                 },
             )
             record_agent_run(
@@ -2767,10 +2889,12 @@ shell_tool                       stable             true
                 orchestration_id="orch_001",
                 payload={
                     "status": "pass",
+                    "sandbox_runtime": "bwrap",
+                    "sandbox_enforced": True,
                     "can_launch_step_agents": True,
                     "can_launch_substep_agents": True,
                     "feature_states": {"multi_agent": True, "codex_hooks": True},
-                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}],
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
                 },
             )
             with self.assertRaisesRegex(ValueError, "child agent identifier"):
@@ -2821,10 +2945,12 @@ shell_tool                       stable             true
                 orchestration_id="orch_001",
                 payload={
                     "status": "pass",
+                    "sandbox_runtime": "bwrap",
+                    "sandbox_enforced": True,
                     "can_launch_step_agents": True,
                     "can_launch_substep_agents": True,
                     "feature_states": {"multi_agent": True, "codex_hooks": True},
-                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}],
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
                 },
             )
             record_agent_run(
@@ -2963,10 +3089,12 @@ shell_tool                       stable             true
                 orchestration_id="orch_001",
                 payload={
                     "status": "pass",
+                    "sandbox_runtime": "bwrap",
+                    "sandbox_enforced": True,
                     "can_launch_step_agents": True,
                     "can_launch_substep_agents": True,
                     "feature_states": {"multi_agent": True, "codex_hooks": True},
-                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}],
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
                 },
             )
             record_launch(
@@ -3024,6 +3152,8 @@ shell_tool                       stable             true
                 orchestration_id="orch_001",
                 payload={
                     "status": "pass",
+                    "sandbox_runtime": "bwrap",
+                    "sandbox_enforced": True,
                     "can_launch_step_agents": True,
                     "can_launch_substep_agents": True,
                     "feature_states": {"multi_agent": True, "codex_hooks": True},
@@ -3121,6 +3251,8 @@ shell_tool                       stable             true
                     orchestration_id="orch_001",
                     payload={
                         "status": "pass",
+                        "sandbox_runtime": "bwrap",
+                        "sandbox_enforced": True,
                         "can_launch_step_agents": True,
                         "can_launch_substep_agents": True,
                         "feature_states": {"multi_agent": False},
@@ -3141,12 +3273,15 @@ shell_tool                       stable             true
                     payload={
                         "status": "pass",
                         "backend": "codex",
+                        "sandbox_runtime": "bwrap",
+                        "sandbox_enforced": True,
                         "can_launch_step_agents": True,
                         "can_launch_substep_agents": True,
                         "feature_states": {"multi_agent": True},
                         "checks": [
                             {"name": "multi_agent_enabled", "pass": True},
                             {"name": "codex_hooks_enabled", "pass": True},
+                            {"name": "codex_home_writable", "pass": True},
                         ],
                     },
                 )
@@ -3162,11 +3297,36 @@ shell_tool                       stable             true
                     payload={
                         "status": "pass",
                         "backend": "codex",
+                        "sandbox_runtime": "bwrap",
+                        "sandbox_enforced": True,
                         "can_launch_step_agents": True,
                         "can_launch_substep_agents": True,
                         "feature_states": {"multi_agent": True, "codex_hooks": True},
                         "checks": [
                             {"name": "multi_agent_enabled", "pass": True},
+                        ],
+                    },
+                )
+
+    def test_rejects_codex_launchable_preflight_when_codex_home_check_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            init_orchestration(repo_root=repo_root, orchestration_id="orch_001")
+            with self.assertRaisesRegex(ValueError, "checks.codex_home_writable.pass=true"):
+                write_preflight(
+                    repo_root=repo_root,
+                    orchestration_id="orch_001",
+                    payload={
+                        "status": "pass",
+                        "backend": "codex",
+                        "sandbox_runtime": "bwrap",
+                        "sandbox_enforced": True,
+                        "can_launch_step_agents": True,
+                        "can_launch_substep_agents": True,
+                        "feature_states": {"multi_agent": True, "codex_hooks": True},
+                        "checks": [
+                            {"name": "multi_agent_enabled", "pass": True},
+                            {"name": "codex_hooks_enabled", "pass": True},
                         ],
                     },
                 )
@@ -3180,10 +3340,12 @@ shell_tool                       stable             true
                 orchestration_id="orch_001",
                 payload={
                     "status": "pass",
+                    "sandbox_runtime": "bwrap",
+                    "sandbox_enforced": True,
                     "can_launch_step_agents": True,
                     "can_launch_substep_agents": True,
                     "feature_states": {"multi_agent": True, "codex_hooks": True},
-                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}],
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
                 },
             )
             os.environ["CODEX_ORCHESTRATION_ENFORCE_LIVE_PREFLIGHT"] = "1"
@@ -3191,10 +3353,12 @@ shell_tool                       stable             true
                 probe_mock.return_value = {
                     "checked_at": "2026-04-15T12:00:00Z",
                     "status": "pass",
+                    "sandbox_runtime": "bwrap",
+                    "sandbox_enforced": True,
                     "can_launch_step_agents": True,
                     "can_launch_substep_agents": True,
                     "feature_states": {"multi_agent": True, "codex_hooks": True},
-                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}],
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
                 }
                 record_launch(
                     repo_root=repo_root,
@@ -3238,10 +3402,12 @@ shell_tool                       stable             true
                 orchestration_id="orch_001",
                 payload={
                     "status": "pass",
+                    "sandbox_runtime": "bwrap",
+                    "sandbox_enforced": True,
                     "can_launch_step_agents": True,
                     "can_launch_substep_agents": True,
                     "feature_states": {"multi_agent": True, "codex_hooks": True},
-                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}],
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
                 },
             )
             os.environ["CODEX_ORCHESTRATION_ENFORCE_LIVE_PREFLIGHT"] = "0"
@@ -3342,10 +3508,12 @@ shell_tool                       stable             true
                 orchestration_id="orch_001",
                 payload={
                     "status": "pass",
+                    "sandbox_runtime": "bwrap",
+                    "sandbox_enforced": True,
                     "can_launch_step_agents": True,
                     "can_launch_substep_agents": True,
                     "feature_states": {"multi_agent": True, "codex_hooks": True},
-                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}],
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
                 },
             )
             record_agent_run(
@@ -3450,10 +3618,12 @@ shell_tool                       stable             true
             orchestration_id="orch_001",
             payload={
                 "status": "pass",
+                "sandbox_runtime": "bwrap",
+                "sandbox_enforced": True,
                 "can_launch_step_agents": True,
                 "can_launch_substep_agents": True,
                 "feature_states": {"multi_agent": True, "codex_hooks": True},
-                "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}],
+                "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
             },
         )
         record_agent_run(
@@ -3546,10 +3716,12 @@ shell_tool                       stable             true
                 orchestration_id="orch_001",
                 payload={
                     "status": "pass",
+                    "sandbox_runtime": "bwrap",
+                    "sandbox_enforced": True,
                     "can_launch_step_agents": True,
                     "can_launch_substep_agents": True,
                     "feature_states": {"multi_agent": True, "codex_hooks": True},
-                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}],
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
                 },
             )
             with self.assertRaisesRegex(RuntimeError, "write_step_result phase gate"):
@@ -4254,10 +4426,12 @@ shell_tool                       stable             true
             orchestration_id="orch_001",
             payload={
                 "status": "pass",
+                "sandbox_runtime": "bwrap",
+                "sandbox_enforced": True,
                 "can_launch_step_agents": True,
                 "can_launch_substep_agents": True,
                 "feature_states": {"multi_agent": True, "codex_hooks": True},
-                "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}],
+                "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
             },
         )
         record_agent_run(
@@ -4379,10 +4553,12 @@ class CheckpointResumeRuntimeTests(unittest.TestCase):
             orchestration_id="orch_001",
             payload={
                 "status": "pass",
+                "sandbox_runtime": "bwrap",
+                "sandbox_enforced": True,
                 "can_launch_step_agents": True,
                 "can_launch_substep_agents": True,
                 "feature_states": {"multi_agent": True, "codex_hooks": True},
-                "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}],
+                "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
             },
         )
         record_agent_run(
@@ -5227,6 +5403,8 @@ def _launchable_preflight_dict(**extra: object) -> dict[str, object]:
         "status": "pass",
         "backend": "codex",
         "probe_command": "codex",
+        "sandbox_runtime": "bwrap",
+        "sandbox_enforced": True,
         "can_launch_step_agents": True,
         "can_launch_substep_agents": True,
         "session_policy": {
@@ -5235,7 +5413,13 @@ def _launchable_preflight_dict(**extra: object) -> dict[str, object]:
         },
         "session_policy_launchable": True,
         "feature_states": {"multi_agent": True, "codex_hooks": True},
-        "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}],
+        "checks": [
+            {"name": "multi_agent_enabled", "pass": True},
+            {"name": "codex_hooks_enabled", "pass": True},
+            {"name": "codex_home_writable", "pass": True},
+            {"name": "sandbox_bwrap_available", "pass": True},
+            {"name": "sandbox_bwrap_userns", "pass": True},
+        ],
     }
     base.update(extra)
     return base
@@ -5960,10 +6144,12 @@ class TestPhase1RuleSourceAudit(unittest.TestCase):
                 orchestration_id="orch_001",
                 payload={
                     "status": "pass",
+                    "sandbox_runtime": "bwrap",
+                    "sandbox_enforced": True,
                     "can_launch_step_agents": True,
                     "can_launch_substep_agents": True,
                     "feature_states": {"multi_agent": True, "codex_hooks": True},
-                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}],
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
                 },
             )
             ps1 = json.loads((orch / "phase_state.json").read_text(encoding="utf-8"))
@@ -6033,7 +6219,6 @@ class TestPhase1RuleSourceAudit(unittest.TestCase):
                     "check_artifact_syntax",
                     "validate_workspace_root",
                     "orchestration_read",
-                    "apply_patch_writes",
                 ],
             )
             cap_path = orch / "capabilities" / "substep_p1_001.json"
@@ -6043,6 +6228,17 @@ class TestPhase1RuleSourceAudit(unittest.TestCase):
             self.assertEqual(cap.get("step"), "plan")
             self.assertTrue(isinstance(cap.get("capability_token"), str) and cap["capability_token"])
             self.assertIn(_FIX_PLAN_REF.rstrip("/") + "/", cap.get("write_roots", []))
+            manifest_path = orch / "output_manifests" / "substep_p1_001.json"
+            self.assertTrue(manifest_path.exists())
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            self.assertEqual(manifest.get("agent_run_id"), "substep_p1_001")
+            self.assertEqual(manifest.get("allowed_output_paths"), cap.get("write_roots"))
+            read_manifest_path = orch / "read_manifests" / "substep_p1_001.json"
+            self.assertTrue(read_manifest_path.exists())
+            read_manifest = json.loads(read_manifest_path.read_text(encoding="utf-8"))
+            self.assertEqual(read_manifest.get("agent_run_id"), "substep_p1_001")
+            self.assertIn("docs/", read_manifest.get("allowed_read_roots", []))
+            self.assertIn("tools/", read_manifest.get("denied_read_roots", []))
             ps_launch = json.loads((orch / "phase_state.json").read_text(encoding="utf-8"))
             node_safe = "problem__shallow_water2d__0.3.0"
             self.assertEqual(
@@ -6061,10 +6257,12 @@ class TestPhase1RuleSourceAudit(unittest.TestCase):
                 orchestration_id="orch_001",
                 payload={
                     "status": "pass",
+                    "sandbox_runtime": "bwrap",
+                    "sandbox_enforced": True,
                     "can_launch_step_agents": True,
                     "can_launch_substep_agents": True,
                     "feature_states": {"multi_agent": True, "codex_hooks": True},
-                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}],
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
                 },
             )
             record_launch(
@@ -6136,10 +6334,12 @@ class TestPhase1RuleSourceAudit(unittest.TestCase):
                 orchestration_id="orch_001",
                 payload={
                     "status": "pass",
+                    "sandbox_runtime": "bwrap",
+                    "sandbox_enforced": True,
                     "can_launch_step_agents": True,
                     "can_launch_substep_agents": True,
                     "feature_states": {"multi_agent": True, "codex_hooks": True},
-                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}],
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
                 },
             )
             record_launch(
@@ -6200,10 +6400,12 @@ class TestPhase1RuleSourceAudit(unittest.TestCase):
                 orchestration_id="orch_001",
                 payload={
                     "status": "pass",
+                    "sandbox_runtime": "bwrap",
+                    "sandbox_enforced": True,
                     "can_launch_step_agents": True,
                     "can_launch_substep_agents": True,
                     "feature_states": {"multi_agent": True, "codex_hooks": True},
-                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}],
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
                 },
             )
             record_launch(
@@ -6244,6 +6446,66 @@ class TestPhase1RuleSourceAudit(unittest.TestCase):
             self.assertEqual(out.get("read_path"), "skills/workflow-plan-generate/SKILL.md")
             self.assertIn("workflow-plan-generate", str(out.get("content")))
 
+    def test_phase2_orchestration_read_rejects_when_read_manifest_is_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            (repo_root / "docs").mkdir(parents=True, exist_ok=True)
+            (repo_root / "docs" / "probe.txt").write_text("ok\n", encoding="utf-8")
+            init_orchestration(repo_root=repo_root, orchestration_id="orch_001")
+            write_preflight(
+                repo_root=repo_root,
+                orchestration_id="orch_001",
+                payload={
+                    "status": "pass",
+                    "sandbox_runtime": "bwrap",
+                    "sandbox_enforced": True,
+                    "can_launch_step_agents": True,
+                    "can_launch_substep_agents": True,
+                    "feature_states": {"multi_agent": True, "codex_hooks": True},
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
+                },
+            )
+            record_launch(
+                repo_root=repo_root,
+                orchestration_id="orch_001",
+                parent_agent_run_id="orch_run_001",
+                child_agent_run_id="child_p1r",
+                request_payload={
+                    "agent_run_id": "child_p1r",
+                    "agent_role": "substep",
+                    "node_key": "problem/shallow_water2d@0.3.0",
+                    "step": "plan",
+                    "substep": "generate",
+                    "orchestration_id": "orch_001",
+                    "parent_agent_run_id": "orch_run_001",
+                    "plan_ref": _FIX_PLAN_REF,
+                    "pipeline_ref": _FIX_PIPE_REF,
+                    "dependency_ref": _FIX_DEP_REF,
+                    "skill_name": "workflow-plan-generate",
+                    "skill_ref": "skills/workflow-plan-generate/SKILL.md",
+                    "skill_must_read_refs": "",
+                    "launch_prompt_full": _substep_launch_prompt(
+                        "problem/shallow_water2d@0.3.0",
+                        "plan",
+                        "generate",
+                        "child_p1r",
+                    ),
+                },
+                response_payload={"agent_run_id": "child_p1r", **_spawn_response_payload("sess_p1r")},
+            )
+            manifest = (
+                repo_root
+                / "workspace/orchestrations/orch_001/read_manifests/child_p1r.json"
+            )
+            manifest.unlink()
+            with self.assertRaisesRegex(FileNotFoundError, "read access manifest not found"):
+                log_orchestration_read(
+                    repo_root=repo_root,
+                    orchestration_id="orch_001",
+                    agent_run_id="child_p1r",
+                    read_path="docs/probe.txt",
+                )
+
     def test_phase1_resume_missing_phase_state_infers_preflight_passed(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
@@ -6253,10 +6515,12 @@ class TestPhase1RuleSourceAudit(unittest.TestCase):
                 orchestration_id="orch_p1m",
                 payload={
                     "status": "pass",
+                    "sandbox_runtime": "bwrap",
+                    "sandbox_enforced": True,
                     "can_launch_step_agents": True,
                     "can_launch_substep_agents": True,
                     "feature_states": {"multi_agent": True, "codex_hooks": True},
-                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}],
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
                 },
             )
             orch = repo_root / "workspace/orchestrations/orch_p1m"
@@ -6276,10 +6540,12 @@ class TestPhase1RuleSourceAudit(unittest.TestCase):
                 orchestration_id="orch_001",
                 payload={
                     "status": "pass",
+                    "sandbox_runtime": "bwrap",
+                    "sandbox_enforced": True,
                     "can_launch_step_agents": True,
                     "can_launch_substep_agents": True,
                     "feature_states": {"multi_agent": True, "codex_hooks": True},
-                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}],
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
                 },
             )
             record_launch(
@@ -6360,11 +6626,13 @@ class TestPhase2PlanGuardsIntegration(unittest.TestCase):
                 payload={
                     "status": "pass",
                     "backend": "codex",
+                    "sandbox_runtime": "bwrap",
+                    "sandbox_enforced": True,
                     "can_launch_step_agents": True,
                     "can_launch_substep_agents": True,
                     "session_policy": {"allow_substep_agent_launch": False},
                     "feature_states": {"multi_agent": True, "codex_hooks": True},
-                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}],
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
                 },
             )
             out = workflow_launch_check(
@@ -6407,10 +6675,12 @@ class TestPhase2PlanGuardsIntegration(unittest.TestCase):
                     {
                         "status": "pass",
                         "backend": "codex",
+                        "sandbox_runtime": "bwrap",
+                        "sandbox_enforced": True,
                         "can_launch_step_agents": True,
                         "can_launch_substep_agents": True,
                         "feature_states": {"multi_agent": True, "codex_hooks": True},
-                        "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}],
+                        "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
                     },
                     ensure_ascii=False,
                     indent=2,
@@ -6440,6 +6710,8 @@ class TestPhase2PlanGuardsIntegration(unittest.TestCase):
                 payload={
                     "status": "pass",
                     "backend": "codex",
+                    "sandbox_runtime": "bwrap",
+                    "sandbox_enforced": True,
                     "can_launch_step_agents": True,
                     "can_launch_substep_agents": True,
                     "session_policy": {
@@ -6447,7 +6719,7 @@ class TestPhase2PlanGuardsIntegration(unittest.TestCase):
                         "allow_substep_agent_launch": True,
                     },
                     "feature_states": {"multi_agent": True, "codex_hooks": True},
-                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}],
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
                 },
             )
             base = {
@@ -6502,7 +6774,8 @@ class TestPhase2PlanGuardsIntegration(unittest.TestCase):
                     )
                 raise AssertionError(args)
 
-            preflight_payload = probe_execution_platform(backend="codex", runner=runner)
+            with patch.dict(os.environ, {"CODEX_HOME": "/tmp/codex-orchestration-test-home"}):
+                preflight_payload = probe_execution_platform(backend="codex", runner=runner)
             preflight_path = repo_root / "workspace/orchestrations/wf3/preflight.json"
             preflight_path.parent.mkdir(parents=True, exist_ok=True)
             preflight_path.write_text(
@@ -6539,11 +6812,13 @@ class TestPhase2PlanGuardsIntegration(unittest.TestCase):
                 payload={
                     "status": "pass",
                     "backend": "codex",
+                    "sandbox_runtime": "bwrap",
+                    "sandbox_enforced": True,
                     "can_launch_step_agents": True,
                     "can_launch_substep_agents": True,
                     "session_policy": {"allow_substep_agent_launch": False},
                     "feature_states": {"multi_agent": True, "codex_hooks": True},
-                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}],
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
                 },
             )
             req = {
@@ -6616,10 +6891,12 @@ class TestPhase2PlanGuardsIntegration(unittest.TestCase):
                 orchestration_id="g1",
                 payload={
                     "status": "pass",
+                    "sandbox_runtime": "bwrap",
+                    "sandbox_enforced": True,
                     "can_launch_step_agents": True,
                     "can_launch_substep_agents": True,
                     "feature_states": {"multi_agent": True, "codex_hooks": True},
-                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}],
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
                 },
             )
             with self.assertRaises(RuntimeError) as ctx:
@@ -6641,10 +6918,12 @@ class TestPhase2PlanGuardsIntegration(unittest.TestCase):
                 orchestration_id="g2",
                 payload={
                     "status": "pass",
+                    "sandbox_runtime": "bwrap",
+                    "sandbox_enforced": True,
                     "can_launch_step_agents": True,
                     "can_launch_substep_agents": True,
                     "feature_states": {"multi_agent": True, "codex_hooks": True},
-                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}],
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
                 },
             )
             g2_req = {
@@ -6714,10 +6993,12 @@ class TestPhase2PlanGuardsIntegration(unittest.TestCase):
                 orchestration_id="g3",
                 payload={
                     "status": "pass",
+                    "sandbox_runtime": "bwrap",
+                    "sandbox_enforced": True,
                     "can_launch_step_agents": True,
                     "can_launch_substep_agents": True,
                     "feature_states": {"multi_agent": True, "codex_hooks": True},
-                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}],
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
                 },
             )
             with self.assertRaises(RuntimeError) as ctx:
@@ -6774,10 +7055,12 @@ class TestPhase2PlanGuardsIntegration(unittest.TestCase):
                 orchestration_id="g6",
                 payload={
                     "status": "pass",
+                    "sandbox_runtime": "bwrap",
+                    "sandbox_enforced": True,
                     "can_launch_step_agents": True,
                     "can_launch_substep_agents": True,
                     "feature_states": {"multi_agent": True, "codex_hooks": True},
-                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}],
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
                 },
             )
             g6_req = {
@@ -6950,10 +7233,12 @@ class TestPhase3RunGate(unittest.TestCase):
             orchestration_id="rg1",
             payload={
                 "status": "pass",
+                "sandbox_runtime": "bwrap",
+                "sandbox_enforced": True,
                 "can_launch_step_agents": True,
                 "can_launch_substep_agents": True,
                 "feature_states": {"multi_agent": True, "codex_hooks": True},
-                "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}],
+                "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
             },
         )
         req = {
@@ -7087,28 +7372,22 @@ class TestPhase3RunGate(unittest.TestCase):
             self.assertEqual(gate_doc.get("status"), "pass")
             self.assertEqual(gate_doc.get("result", {}).get("content"), "inline\n")
 
-    def test_run_gate_apply_patch_writes_uses_inline_gate(self) -> None:
+    def test_run_gate_rejects_apply_patch_writes(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
             token = self._setup_run_gate_fixture(repo_root)
-            out = run_gate(
-                repo_root,
-                orchestration_id="rg1",
-                gate_name="apply_patch_writes",
-                agent_run_id="build_child_rg1",
-                args_json={
-                    "actor_role": "step",
-                    "changed_paths": [f"{_FIX_PIPE_REF}/build/new_artifact.json"],
-                },
-                capability_token=token,
-            )
-            self.assertEqual(out.get("violations"), [])
-            result = out.get("result", {})
-            self.assertTrue(result.get("allowed"))
-            self.assertEqual(
-                result.get("checked_paths"),
-                [f"{_FIX_PIPE_REF}/build/new_artifact.json"],
-            )
+            with self.assertRaisesRegex(ValueError, "unsupported gate name"):
+                run_gate(
+                    repo_root,
+                    orchestration_id="rg1",
+                    gate_name="apply_patch_writes",
+                    agent_run_id="build_child_rg1",
+                    args_json={
+                        "actor_role": "step",
+                        "changed_paths": [f"{_FIX_PIPE_REF}/build/new_artifact.json"],
+                    },
+                    capability_token=token,
+                )
 
     def test_guarded_apply_patch_calls_git_apply_after_gate(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -7169,6 +7448,72 @@ class TestPhase3RunGate(unittest.TestCase):
                         capability_token=token,
                     )
             self.assertEqual(run_mock.call_count, 0)
+
+    def test_guarded_apply_patch_rejects_patch_outside_output_manifest(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            token = self._setup_run_gate_fixture(repo_root)
+            patch_text = "\n".join(
+                [
+                    "diff --git a/workspace/plans/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/case.resolved.yaml b/workspace/plans/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/case.resolved.yaml",
+                    "--- a/workspace/plans/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/case.resolved.yaml",
+                    "+++ b/workspace/plans/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/case.resolved.yaml",
+                    "@@ -0,0 +1 @@",
+                    "+cases: []",
+                    "",
+                ]
+            )
+            with patch("tools.codex_orchestration_runtime.subprocess.run") as run_mock:
+                with self.assertRaisesRegex(ValueError, "allowed_output_paths manifest violation"):
+                    guarded_apply_patch(
+                        repo_root,
+                        orchestration_id="rg1",
+                        actor_role="step",
+                        agent_run_id="build_child_rg1",
+                        changed_paths=["workspace/plans/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/"],
+                        patch_text=patch_text,
+                        capability_token=token,
+                    )
+            self.assertEqual(run_mock.call_count, 0)
+
+    def test_guarded_apply_patch_validates_manifest_with_declared_changed_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            patch_text = "\n".join(
+                [
+                    "diff --git a/workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/build/new_artifact.json b/workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/build/new_artifact.json",
+                    "--- a/workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/build/new_artifact.json",
+                    "+++ b/workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/build/new_artifact.json",
+                    "@@ -0,0 +1 @@",
+                    "+{\"ok\": true}",
+                    "",
+                ]
+            )
+            with (
+                patch(
+                    "tools.codex_orchestration_runtime._validate_paths_against_allowed_output_manifest"
+                ) as manifest_mock,
+                patch("tools.codex_orchestration_runtime.gate_apply_patch_writes") as gate_mock,
+                patch("tools.codex_orchestration_runtime._write_apply_patch_gate_evidence") as evidence_mock,
+                patch("tools.codex_orchestration_runtime.subprocess.run") as run_mock,
+            ):
+                gate_mock.return_value = {"allowed": True, "checked_paths": [f"{_FIX_PIPE_REF}/build/"]}
+                evidence_mock.return_value = "workspace/orchestrations/rg1/gates/build_child_rg1/apply_patch_writes.json"
+                run_mock.return_value = _FakeCompletedProcess(returncode=0, stdout="", stderr="")
+                guarded_apply_patch(
+                    repo_root,
+                    orchestration_id="rg1",
+                    actor_role="step",
+                    agent_run_id="build_child_rg1",
+                    changed_paths=[f"{_FIX_PIPE_REF}/build/"],
+                    patch_text=patch_text,
+                    capability_token="token",
+                )
+            self.assertEqual(manifest_mock.call_count, 1)
+            self.assertEqual(
+                manifest_mock.call_args.kwargs.get("paths"),
+                [f"{_FIX_PIPE_REF}/build"],
+            )
 
     def test_main_guarded_apply_patch_returns_nonzero_on_gate_rejection(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -7265,10 +7610,12 @@ class TestPhase3RunGate(unittest.TestCase):
                 payload={
                     "status": "pass",
                     "backend": "codex",
+                    "sandbox_runtime": "bwrap",
+                    "sandbox_enforced": True,
                     "can_launch_step_agents": True,
                     "can_launch_substep_agents": True,
                     "feature_states": {"multi_agent": True, "codex_hooks": True},
-                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}],
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
                 },
             )
             pipe = repo_root / _FIX_PIPE_REF

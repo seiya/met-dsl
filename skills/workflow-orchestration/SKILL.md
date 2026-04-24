@@ -25,6 +25,7 @@ description: 対応 execution platform で `workflow` 全体を開始し、`orch
 - `dev` mode では verify 判定を厳格運用し、`issue_severity=major|critical` を検出した場合は `fail` として停止しなければならない。
 - `dev` mode で fail が発生した場合、`workspace/orchestrations/<orchestration_id>/failure_analysis.json` を必須出力として原因調査結果を保存しなければならない。
 - `preflight.json` の手動編集または後編集による `pass` 化を禁止する。`preflight` は `tools/codex_orchestration_runtime.py preflight` の execution result を canonical source とする。
+- `backend=codex` の preflight は、`checks.codex_hooks_enabled.pass=true` と `checks.codex_home_writable.pass=true` を同時に満たさなければならない。未充足時は workflow を開始してはならない。
 - 子 `agent` 起動直前に live preflight gate を満たすことを必須とし、live 検査が `fail` の場合は `record-launch` を実行してはならない。
 - 起動前の初期読込は `references/startup_contract.md` を第一参照とし、詳細契約が必要な場合のみ `docs/workflow/WORKFLOW_CORE.md` と `docs/ORCHESTRATION.md` を追加参照しなければならない。
 - phase 着手前に、対象 phase が `substep agent` 必須か `step agent` 必須かを固定表で判定しなければならない。`Plan` / `Generate` / `Tune` は `substep agent`、`Build` / `Execute` / `Judge` / `Promote` は `step agent` とする。
@@ -35,7 +36,8 @@ description: 対応 execution platform で `workflow` 全体を開始し、`orch
 - 子 `agent` 起動要求本文には、要求定義と判定規則の canonical source が `docs/` と `spec/` と当該試行 artifact であること、`tools/` 配下の実装、検証 `script`、test code、validator code を読んで rule を抽出してはならないことを明示しなければならない。
 - `plan_ref` と `pipeline_ref` と `dependency_ref` は、起動要求生成時点で canonical path を確定しなければならない。`<agent-determined-...>` などの placeholder を禁止する。
 - child `agent` に許可する phase artifact の変更は、capability token が許可した `write_root` 配下に限定しなければならない。`plan_ref` / `pipeline_ref` 配下の変更は `guarded-apply-patch` または対応 gate を通過した canonical path に限定し、許可 root 外の変更を禁止する。
-- phase artifact を変更する場合、`step agent` / `substep agent` は `apply_patch_writes` gate を通過した `guarded-apply-patch` を使用しなければならない。通常 `apply_patch` の直接実行、shell redirection、`tee`、`sed -i`、`perl -0pi`、`python` / `sh` / `bash` による file write など、gate を経由しない file write を禁止する。
+- phase artifact を変更する場合、`step agent` / `substep agent` は `guarded-apply-patch` を使用しなければならない。`apply_patch_writes` は内部 gate であり、`run-gate --gate apply_patch_writes` と `apply-patch-gate` を公開経路として使用してはならない。通常 `apply_patch` の直接実行、shell redirection、`tee`、`sed -i`、`perl -0pi`、`python` / `sh` / `bash` による file write を禁止する。
+- `record-launch` は `output_manifests/<agent_run_id>.json` と `read_manifests/<agent_run_id>.json` を生成しなければならない。`guarded-apply-patch` と `record-agent-run` は output manifest を参照し、`orchestration-read` は read manifest を参照して manifest 外 path を reject しなければならない。
 - shell による file write は、対象 path が phase artifact かどうかを問わず禁止対象とし、事前 gate または `record-agent-run` が検出した場合は当該 gate または `record-agent-run` が当該 `agent_run` を reject しなければならない。reject 後は `orchestration agent` が `orchestration_meta.status=fail_closed` を記録して停止しなければならない。
 - `step agent` / `substep agent` の起動要求本文には、input contract、expected output、保存先、失敗時停止条件、`spawn_agent` 義務を明示しなければならない。
 - `step agent` / `substep agent` の起動要求本文には、`skill_name` と `skill_ref` と `skill_must_read_refs` を必須記録し、子 `agent` が起動直後に対象 `SKILL` を読める状態にしなければならない。
@@ -79,7 +81,7 @@ description: 対応 execution platform で `workflow` 全体を開始し、`orch
 10. `Generate` 以降の子 `agent` 起動前に、対象 `node` の直下依存 `node` ごとの `plan_ref` と `pipeline_ref` と `aggregate_verdict` を照合し、`direct dependency execution readiness` 不成立なら子 `agent` を起動せず `blocked` または `fail` を記録する。
 11. phase 本体へ進む前に、`preflight` 済み、launch prompt 準備済み、child `agent` 起動済みの 3 条件を確認する。未充足なら編集、`MCP` 実行、phase artifact 生成を開始してはならない。
 12. 生成した起動要求本文で子 `agent` を起動する。起動成功直後の実 `spawn_agent` 応答だけを `record-launch` で保存し、`launch_prompt_ref` と `launch_reply_ref` も同時に記録する。実起動前の仮記録、起動失敗後の補完記録、任意 `response_payload` の後投入を禁止する。
-13. 子 `agent` 完了後は `python3 tools/codex_orchestration_runtime.py record-agent-run --repo-root <repo_root> --orchestration-id <orchestration_id> --agent-run-json '<json>'` を実行し、`agent_runs.jsonl` へ 1 行追記する。`record-agent-run` により `agent.result.json` と `agent.summary.txt` も同時に保存しなければならない。`record-agent-run` は、申告した `output_refs` と `apply_patch_writes` gate 記録に加えて baseline との差分で実変更 path を検査するため、capability token の `write_root` または gate 許可 path に含まれない `unauthorized write` が存在する場合は当該 `agent_run` を reject する。reject 発生後は `orchestration agent` が `orchestration_meta.status=fail_closed` を記録して停止しなければならない。
+13. 子 `agent` 完了後は `python3 tools/codex_orchestration_runtime.py record-agent-run --repo-root <repo_root> --orchestration-id <orchestration_id> --agent-run-json '<json>'` を実行し、`agent_runs.jsonl` へ 1 行追記する。`record-agent-run` により `agent.result.json` と `agent.summary.txt` も同時に保存しなければならない。`record-agent-run` は、申告した `output_refs` と `apply_patch_writes` internal gate 記録と output manifest 記録に加えて baseline との差分で実変更 path を検査するため、capability token の `write_root` または gate 許可 path または manifest 許可 path に含まれない `unauthorized write` が存在する場合は当該 `agent_run` を reject する。reject 発生後は `orchestration agent` が `orchestration_meta.status=fail_closed` を記録して停止しなければならない。
 14. `substep` を持つ phase では、返却結果を評価して `issue_severity` と `repair_strategy` を決定する。再投入が必要な場合は `repair_target_agent_run_id` と `repair_reason` を起動要求へ付与して再起動し、`record-launch` を追加する。
 15. `repair_strategy=reuse` の再投入では、対象 `substep` の契約を変更せず差分修正だけを要求する。`repair_strategy=restart` の再投入では、対象 `substep` の契約入力から再生成させる。
 16. 契約に反する近道を取りたくなった場合は、子 `agent` 起動必須であることを `commentary` で明示し、launch 手順へ戻る。ローカル実装を継続してはならない。
