@@ -1715,6 +1715,16 @@ def build_access_policy_payload(
         _with_trailing_slash(_normalize_rel_posix(plan_ref)),
         _with_trailing_slash(_normalize_rel_posix(pipeline_ref)),
     ]
+    skill_must_read_refs = _split_skill_refs(request_payload.get("skill_must_read_refs"))
+    skill_ref = request_payload.get("skill_ref")
+    if isinstance(skill_ref, str) and skill_ref.strip():
+        skill_must_read_refs = _merge_unique_refs([skill_ref.strip()], skill_must_read_refs)
+    skill_allowed_roots = [
+        _with_trailing_slash(_normalize_rel_posix(ref))
+        for ref in skill_must_read_refs
+        if isinstance(ref, str) and ref.strip()
+    ]
+    allowed_read_roots = _merge_unique_refs(allowed_read_roots, skill_allowed_roots)
     body: dict[str, Any] = {
         "agent_run_id": agent_run_id.strip(),
         "node_key": node_key.strip(),

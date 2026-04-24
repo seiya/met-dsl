@@ -5935,6 +5935,10 @@ class TestPhase1RuleSourceAudit(unittest.TestCase):
                 _FIX_PIPE_REF.rstrip("/") + "/",
                 policy.get("allowed_read_roots", []),
             )
+            self.assertIn(
+                "skills/workflow-plan-generate/SKILL.md/",
+                policy.get("allowed_read_roots", []),
+            )
             self.assertEqual(
                 policy.get("allowed_gate_services"),
                 [
@@ -6095,6 +6099,63 @@ class TestPhase1RuleSourceAudit(unittest.TestCase):
             self.assertFalse(log_entry.get("allowed_match"))
             self.assertFalse(log_entry.get("denied_match"))
             self.assertEqual(log_entry.get("path"), "plans/outside.txt")
+
+    def test_phase2_orchestration_read_allows_skill_ref_path(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            (repo_root / "skills" / "workflow-plan-generate").mkdir(parents=True, exist_ok=True)
+            (repo_root / "skills" / "workflow-plan-generate" / "SKILL.md").write_text(
+                "# workflow-plan-generate\n", encoding="utf-8"
+            )
+            init_orchestration(repo_root=repo_root, orchestration_id="orch_001")
+            write_preflight(
+                repo_root=repo_root,
+                orchestration_id="orch_001",
+                payload={
+                    "status": "pass",
+                    "can_launch_step_agents": True,
+                    "can_launch_substep_agents": True,
+                    "feature_states": {"multi_agent": True, "codex_hooks": True},
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}],
+                },
+            )
+            record_launch(
+                repo_root=repo_root,
+                orchestration_id="orch_001",
+                parent_agent_run_id="orch_run_001",
+                child_agent_run_id="child_p1r",
+                request_payload={
+                    "agent_run_id": "child_p1r",
+                    "agent_role": "substep",
+                    "node_key": "problem/shallow_water2d@0.3.0",
+                    "step": "plan",
+                    "substep": "generate",
+                    "orchestration_id": "orch_001",
+                    "parent_agent_run_id": "orch_run_001",
+                    "plan_ref": _FIX_PLAN_REF,
+                    "pipeline_ref": _FIX_PIPE_REF,
+                    "dependency_ref": _FIX_DEP_REF,
+                    "skill_name": "workflow-plan-generate",
+                    "skill_ref": "skills/workflow-plan-generate/SKILL.md",
+                    "skill_must_read_refs": "",
+                    "launch_prompt_full": _substep_launch_prompt(
+                        "problem/shallow_water2d@0.3.0",
+                        "plan",
+                        "generate",
+                        "child_p1r",
+                    ),
+                },
+                response_payload={"agent_run_id": "child_p1r", **_spawn_response_payload("sess_p1r")},
+            )
+            out = log_orchestration_read(
+                repo_root=repo_root,
+                orchestration_id="orch_001",
+                agent_run_id="child_p1r",
+                read_path="skills/workflow-plan-generate/SKILL.md",
+            )
+            self.assertTrue(out.get("file_exists"))
+            self.assertEqual(out.get("read_path"), "skills/workflow-plan-generate/SKILL.md")
+            self.assertIn("workflow-plan-generate", str(out.get("content")))
 
     def test_phase1_resume_missing_phase_state_infers_preflight_passed(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
