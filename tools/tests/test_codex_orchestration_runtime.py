@@ -1316,6 +1316,93 @@ shell_tool                       stable             true
                     response_payload=_spawn_response_payload("sess_substep_plan_generate_001"),
                 )
 
+    def test_rejects_launch_when_dependency_ref_is_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            init_orchestration(repo_root=repo_root, orchestration_id="orch_001")
+            write_preflight(
+                repo_root=repo_root,
+                orchestration_id="orch_001",
+                payload={
+                    "status": "pass",
+                    "can_launch_step_agents": True,
+                    "can_launch_substep_agents": True,
+                    "feature_states": {"multi_agent": True, "codex_hooks": True},
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}],
+                },
+            )
+            with self.assertRaisesRegex(ValueError, "launch request must include non-empty dependency_ref"):
+                record_launch(
+                    repo_root=repo_root,
+                    orchestration_id="orch_001",
+                    parent_agent_run_id="orch_run_001",
+                    child_agent_run_id="substep_run_plan_generate_001",
+                    request_payload={
+                        "node_key": "problem/shallow_water2d@0.3.0",
+                        "step": "plan",
+                        "substep": "generate",
+                        "orchestration_id": "orch_001",
+                        "agent_run_id": "substep_run_plan_generate_001",
+                        "parent_agent_run_id": "orch_run_001",
+                        "plan_ref": "workspace/plans/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001",
+                        "pipeline_ref": "workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001",
+                        "skill_name": "workflow-plan-generate",
+                        "skill_ref": "skills/workflow-plan-generate/SKILL.md",
+                        "skill_must_read_refs": "",
+                        "launch_prompt_full": _substep_launch_prompt(
+                            "problem/shallow_water2d@0.3.0",
+                            "plan",
+                            "generate",
+                            "substep_run_plan_generate_001",
+                        ),
+                    },
+                    response_payload=_spawn_response_payload("sess_substep_plan_generate_001"),
+                )
+
+    def test_rejects_launch_with_placeholder_dependency_ref(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            init_orchestration(repo_root=repo_root, orchestration_id="orch_001")
+            write_preflight(
+                repo_root=repo_root,
+                orchestration_id="orch_001",
+                payload={
+                    "status": "pass",
+                    "can_launch_step_agents": True,
+                    "can_launch_substep_agents": True,
+                    "feature_states": {"multi_agent": True, "codex_hooks": True},
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}],
+                },
+            )
+            with self.assertRaisesRegex(ValueError, "launch request dependency_ref must not contain placeholder tokens"):
+                record_launch(
+                    repo_root=repo_root,
+                    orchestration_id="orch_001",
+                    parent_agent_run_id="orch_run_001",
+                    child_agent_run_id="substep_run_plan_generate_001",
+                    request_payload={
+                        "node_key": "problem/shallow_water2d@0.3.0",
+                        "step": "plan",
+                        "substep": "generate",
+                        "orchestration_id": "orch_001",
+                        "agent_run_id": "substep_run_plan_generate_001",
+                        "parent_agent_run_id": "orch_run_001",
+                        "plan_ref": "workspace/plans/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001",
+                        "pipeline_ref": "workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001",
+                        "dependency_ref": "workspace/plans/problem__shallow_water2d__0.3.0/<agent-determined-dependency-ref>",
+                        "skill_name": "workflow-plan-generate",
+                        "skill_ref": "skills/workflow-plan-generate/SKILL.md",
+                        "skill_must_read_refs": "",
+                        "launch_prompt_full": _substep_launch_prompt(
+                            "problem/shallow_water2d@0.3.0",
+                            "plan",
+                            "generate",
+                            "substep_run_plan_generate_001",
+                        ),
+                    },
+                    response_payload=_spawn_response_payload("sess_substep_plan_generate_001"),
+                )
+
     def test_rejects_launch_when_pipeline_ref_is_not_pipeline_root_only(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)

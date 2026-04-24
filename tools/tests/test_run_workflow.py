@@ -14,6 +14,20 @@ from tools import run_workflow
 
 
 class RunWorkflowTests(unittest.TestCase):
+    def test_spec_ref_matches_directory_and_file_path(self) -> None:
+        self.assertTrue(run_workflow._spec_ref_matches("spec/problem", "spec/problem/test.md"))
+        self.assertTrue(run_workflow._spec_ref_matches("spec/problem/test.md", "spec/problem"))
+        self.assertTrue(
+            run_workflow._spec_ref_matches(
+                "spec/problem/controlled_spec.md",
+                "spec/problem/test.md",
+            )
+        )
+
+    def test_spec_ref_matches_distinguishes_other_directories(self) -> None:
+        self.assertFalse(run_workflow._spec_ref_matches("spec/problem", "spec/another/test.md"))
+        self.assertFalse(run_workflow._spec_ref_matches("spec/problem/test.md", "spec/another"))
+
     def test_normalize_phase_accepts_known_values(self) -> None:
         self.assertEqual(run_workflow._normalize_phase("plan"), "Plan")
         self.assertEqual(run_workflow._normalize_phase("PROMOTE"), "Promote")
@@ -53,7 +67,7 @@ class RunWorkflowTests(unittest.TestCase):
         text = run_workflow._build_orchestration_prompt(
             orchestration_id="orch_test",
             spec_ref="spec/problem/sample.md",
-            dependency_ref=None,
+            dependency_ref="workspace/plans/sample/sample_20260424_001/dependency.resolved.yaml",
             until_phase="Judge",
             workflow_mode="dev",
         )
@@ -61,6 +75,7 @@ class RunWorkflowTests(unittest.TestCase):
         self.assertIn("spec/problem/sample.md", text)
         self.assertIn("Judge", text)
         self.assertIn("workflow_mode: `dev`", text)
+        self.assertIn("dependency.resolved.yaml", text)
         self.assertIn("METDSL_WORKFLOW_MODE=1", text)
         self.assertIn("不足している場合は即停止", text)
         self.assertIn("issue_severity", text)
@@ -72,7 +87,13 @@ class RunWorkflowTests(unittest.TestCase):
         self.assertTrue(ns.invoke_llm)
 
     def test_parse_args_supports_no_invoke_flag(self) -> None:
-        ns = run_workflow._parse_args(["spec/problem.md", "generate", "--no-invoke-llm"])
+        ns = run_workflow._parse_args(
+            [
+                "spec/problem.md",
+                "generate",
+                "--no-invoke-llm",
+            ]
+        )
         self.assertFalse(ns.invoke_llm)
 
     def test_launch_command_for_codex_uses_exec_subcommand(self) -> None:
@@ -100,6 +121,9 @@ class RunWorkflowTests(unittest.TestCase):
             (repo_root / "workspace").mkdir(parents=True, exist_ok=True)
             (repo_root / "spec" / "problem").mkdir(parents=True, exist_ok=True)
             (repo_root / "spec" / "problem" / "test.md").write_text("spec\n", encoding="utf-8")
+            dep_ref = "workspace/plans/sample/sample_20260424_001/dependency.resolved.yaml"
+            (repo_root / dep_ref).parent.mkdir(parents=True, exist_ok=True)
+            (repo_root / dep_ref).write_text("nodes: []\n", encoding="utf-8")
 
             observed_calls: list[list[str]] = []
 
@@ -149,6 +173,9 @@ class RunWorkflowTests(unittest.TestCase):
     def test_main_fails_when_spec_ref_does_not_exist(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
+            dep_ref = "workspace/plans/sample/sample_20260424_001/dependency.resolved.yaml"
+            (repo_root / dep_ref).parent.mkdir(parents=True, exist_ok=True)
+            (repo_root / dep_ref).write_text("nodes: []\n", encoding="utf-8")
             code = run_workflow.main(
                 [
                     "spec/problem/missing.md",
@@ -169,6 +196,9 @@ class RunWorkflowTests(unittest.TestCase):
             (repo_root / "workspace").mkdir(parents=True, exist_ok=True)
             (repo_root / "spec" / "problem").mkdir(parents=True, exist_ok=True)
             (repo_root / "spec" / "problem" / "test.md").write_text("spec\n", encoding="utf-8")
+            dep_ref = "workspace/plans/sample/sample_20260424_001/dependency.resolved.yaml"
+            (repo_root / dep_ref).parent.mkdir(parents=True, exist_ok=True)
+            (repo_root / dep_ref).write_text("nodes: []\n", encoding="utf-8")
 
             def fake_runtime_command(root: Path, env: dict[str, str], args: list[str]) -> run_workflow.RuntimeResult:
                 if args[0] == "init":
@@ -208,6 +238,9 @@ class RunWorkflowTests(unittest.TestCase):
             (repo_root / "workspace").mkdir(parents=True, exist_ok=True)
             (repo_root / "spec" / "problem").mkdir(parents=True, exist_ok=True)
             (repo_root / "spec" / "problem" / "test.md").write_text("spec\n", encoding="utf-8")
+            dep_ref = "workspace/plans/sample/sample_20260424_001/dependency.resolved.yaml"
+            (repo_root / dep_ref).parent.mkdir(parents=True, exist_ok=True)
+            (repo_root / dep_ref).write_text("nodes: []\n", encoding="utf-8")
 
             def fake_runtime_command(root: Path, env: dict[str, str], args: list[str]) -> run_workflow.RuntimeResult:
                 if args[0] == "preflight":
@@ -247,6 +280,9 @@ class RunWorkflowTests(unittest.TestCase):
             (repo_root / "workspace").mkdir(parents=True, exist_ok=True)
             (repo_root / "spec" / "problem").mkdir(parents=True, exist_ok=True)
             (repo_root / "spec" / "problem" / "test.md").write_text("spec\n", encoding="utf-8")
+            dep_ref = "workspace/plans/sample/sample_20260424_001/dependency.resolved.yaml"
+            (repo_root / dep_ref).parent.mkdir(parents=True, exist_ok=True)
+            (repo_root / dep_ref).write_text("nodes: []\n", encoding="utf-8")
 
             def fake_runtime_command(root: Path, env: dict[str, str], args: list[str]) -> run_workflow.RuntimeResult:
                 if args[0] == "preflight":
@@ -293,6 +329,117 @@ class RunWorkflowTests(unittest.TestCase):
             analysis_ref = payload.get("analysis_ref")
             self.assertIsInstance(analysis_ref, str)
             self.assertTrue((repo_root / str(analysis_ref)).exists())
+
+    def test_main_auto_resolves_dependency_ref_from_orchestration_meta(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            (repo_root / "tools").mkdir(parents=True, exist_ok=True)
+            (repo_root / "workspace").mkdir(parents=True, exist_ok=True)
+            (repo_root / "spec" / "problem").mkdir(parents=True, exist_ok=True)
+            (repo_root / "spec" / "problem" / "test.md").write_text("spec\n", encoding="utf-8")
+            dep_ref = "workspace/plans/sample/sample_20260424_001/dependency.resolved.yaml"
+            (repo_root / dep_ref).parent.mkdir(parents=True, exist_ok=True)
+            (repo_root / dep_ref).write_text("nodes: []\n", encoding="utf-8")
+
+            prev_meta = repo_root / "workspace" / "orchestrations" / "orch_prev" / "orchestration_meta.json"
+            prev_meta.parent.mkdir(parents=True, exist_ok=True)
+            prev_meta.write_text(
+                json.dumps(
+                    {
+                        "orchestration_id": "orch_prev",
+                        "spec_ref": "spec/problem/test.md",
+                        "dependency_ref": dep_ref,
+                        "started_at": "2026-04-24T07:00:00Z",
+                        "finished_at": "2026-04-24T07:10:00Z",
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            observed_calls: list[list[str]] = []
+
+            def fake_runtime_command(root: Path, env: dict[str, str], args: list[str]) -> run_workflow.RuntimeResult:
+                observed_calls.append(args)
+                if args[0] == "preflight":
+                    return run_workflow.RuntimeResult(
+                        payload={
+                            "status": "pass",
+                            "can_launch_step_agents": True,
+                            "can_launch_substep_agents": True,
+                        },
+                        raw_stdout="{}",
+                    )
+                return run_workflow.RuntimeResult(payload={"status": "ok"}, raw_stdout="{}")
+
+            original_runtime = run_workflow._runtime_command
+            try:
+                run_workflow._runtime_command = fake_runtime_command  # type: ignore[assignment]
+                code = run_workflow.main(
+                    [
+                        "spec/problem/test.md",
+                        "build",
+                        "--repo-root",
+                        str(repo_root),
+                        "--orchestration-id",
+                        "orch_auto_dep",
+                        "--no-invoke-llm",
+                    ]
+                )
+            finally:
+                run_workflow._runtime_command = original_runtime  # type: ignore[assignment]
+
+            self.assertEqual(code, 0)
+            init_call = next(call for call in observed_calls if call[0] == "init")
+            self.assertIn("--dependency-ref", init_call)
+            dep_idx = init_call.index("--dependency-ref") + 1
+            self.assertEqual(init_call[dep_idx], dep_ref)
+
+    def test_main_allows_startup_without_dependency_ref(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            (repo_root / "tools").mkdir(parents=True, exist_ok=True)
+            (repo_root / "workspace").mkdir(parents=True, exist_ok=True)
+            (repo_root / "spec" / "problem").mkdir(parents=True, exist_ok=True)
+            (repo_root / "spec" / "problem" / "test.md").write_text("spec\n", encoding="utf-8")
+
+            observed_calls: list[list[str]] = []
+
+            def fake_runtime_command(root: Path, env: dict[str, str], args: list[str]) -> run_workflow.RuntimeResult:
+                observed_calls.append(args)
+                if args[0] == "preflight":
+                    return run_workflow.RuntimeResult(
+                        payload={
+                            "status": "pass",
+                            "can_launch_step_agents": True,
+                            "can_launch_substep_agents": True,
+                        },
+                        raw_stdout="{}",
+                    )
+                return run_workflow.RuntimeResult(payload={"status": "ok"}, raw_stdout="{}")
+
+            original_runtime = run_workflow._runtime_command
+            try:
+                run_workflow._runtime_command = fake_runtime_command  # type: ignore[assignment]
+                code = run_workflow.main(
+                    [
+                        "spec/problem/test.md",
+                        "build",
+                        "--repo-root",
+                        str(repo_root),
+                        "--orchestration-id",
+                        "orch_no_dep",
+                        "--no-invoke-llm",
+                    ]
+                )
+            finally:
+                run_workflow._runtime_command = original_runtime  # type: ignore[assignment]
+
+            self.assertEqual(code, 0)
+            init_call = next(call for call in observed_calls if call[0] == "init")
+            self.assertNotIn("--dependency-ref", init_call)
 
 
 if __name__ == "__main__":
