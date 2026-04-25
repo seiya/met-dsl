@@ -88,6 +88,15 @@ workspace/pipelines/<node_key_safe>/<pipeline_id>
 - **Plan substep** でも `pipeline_ref` は必須。パイプラインはまだ存在しないが、`reserve-phase-root --step generate` で pipeline_id を先行予約し、`workspace/pipelines/<node_key_safe>/<pipeline_id>` 形式で指定する。
 - `record-launch` の `--request-json` に `pipeline_ref="none"` や空文字は渡せない。
 
+### orchestration_agent_run_id の取得
+
+orchestration agent 自身の `agent_run_id` は startup context の `orchestration_agent_run_id` フィールドを canonical source とする。
+
+- `tools/run_workflow.py` が `init_orchestration()` 経由で生成し、`orchestration_meta.json` に記録済みである。
+- orchestration agent は `uuid.uuid4()` などで独自生成してはならない。
+- `record-agent-run`（orchestration role）の `running` 初期 entry は `init_orchestration()` が自動挿入するため、orchestration agent が手動で呼び出す必要はない。
+- `record-agent-run`（orchestration role）の終端 entry（`pass` / `fail` / `fail_closed`）は orchestration agent が `set-status` 実行後に呼び出す。
+
 ## `record-launch` 手順（Claude Code backend）
 
 Claude Code では `spawn_agent` が存在しないため、以下の順序で実行する。

@@ -5668,6 +5668,51 @@ class OrchestrationMetaAndJudgeHookTests(unittest.TestCase):
             self.assertEqual(meta.get("parallel_nodes_policy"), "sequential_default")
             self.assertEqual(meta.get("orchestration_id"), orch)
 
+    def test_init_orchestration_reuses_existing_orchestration_agent_run_id(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            orch = "orch_reinit_same_run_id"
+            init_orchestration(repo_root=repo, orchestration_id=orch)
+            meta_path = repo / "workspace" / "orchestrations" / orch / "orchestration_meta.json"
+            first_meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            first_run_id = str(first_meta.get("orchestration_agent_run_id", "")).strip()
+            self.assertTrue(first_run_id)
+
+            init_orchestration(repo_root=repo, orchestration_id=orch)
+            second_meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            second_run_id = str(second_meta.get("orchestration_agent_run_id", "")).strip()
+            self.assertEqual(second_run_id, first_run_id)
+
+            read_manifest_path = (
+                repo / "workspace" / "orchestrations" / orch / "read_manifests" / f"{first_run_id}.json"
+            )
+            self.assertTrue(read_manifest_path.is_file())
+
+    def test_init_orchestration_does_not_duplicate_orchestration_running_entry_on_reinit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            orch = "orch_reinit_no_duplicate_running"
+            init_orchestration(repo_root=repo, orchestration_id=orch)
+            init_orchestration(repo_root=repo, orchestration_id=orch)
+
+            meta_path = repo / "workspace" / "orchestrations" / orch / "orchestration_meta.json"
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            run_id = str(meta.get("orchestration_agent_run_id", "")).strip()
+            self.assertTrue(run_id)
+
+            runs_path = repo / "workspace" / "orchestrations" / orch / "agent_runs.jsonl"
+            lines = [line.strip() for line in runs_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+            matching_running = []
+            for line in lines:
+                item = json.loads(line)
+                if (
+                    str(item.get("agent_run_id", "")).strip() == run_id
+                    and item.get("agent_role") == "orchestration"
+                    and item.get("status") == "running"
+                ):
+                    matching_running.append(item)
+            self.assertEqual(len(matching_running), 1)
+
     def test_pre_orchestration_start_logs_persisted_parallel_nodes_explicit(self) -> None:
         """setdefault で保持した値と hook 返却・ログ用 detail が一致すること。"""
         with tempfile.TemporaryDirectory() as tmp:

@@ -7,6 +7,8 @@ from dataclasses import dataclass
 from enum import Enum
 import json
 import os
+import re
+import shlex
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -200,6 +202,48 @@ def evaluate_common_policy(hook_input: HookInput) -> HookDecision:
                     "matched_tokens": matched,
                 },
             )
+    workflow_mode_val = os.environ.get("METDSL_WORKFLOW_MODE", "0").strip()
+    if workflow_mode_val == "1":
+        bash_read_cmds = frozenset({"cat", "head", "tail", "less", "more", "bat", "pygmentize"})
+        try:
+            cmd_tokens = shlex.split(command)
+        except ValueError:
+            cmd_tokens = command.split()
+        lowered_tokens = [tok.lower() for tok in cmd_tokens]
+        first_cmd = lowered_tokens[0].split("/")[-1] if lowered_tokens else ""
+        if first_cmd in bash_read_cmds:
+            repo_root_raw = hook_input.payload.get("repo_root")
+            repo_root = (
+                Path(repo_root_raw).resolve()
+                if isinstance(repo_root_raw, str) and repo_root_raw.strip()
+                else Path.cwd()
+            )
+            repo_tools_root = (repo_root / "tools").resolve()
+            read_targets = [tok for tok in cmd_tokens[1:] if not tok.startswith("-")]
+            if any(
+                _is_path_under_root(_resolve_target_path(repo_root, target), repo_tools_root)
+                for target in read_targets
+            ):
+                return HookDecision(
+                    action=HookDecisionAction.BLOCK,
+                    reason=(
+                        "blocked: direct read from tools/ via Bash is forbidden in workflow mode. "
+                        "Derive rules only from docs/, spec/, and skill_must_read_refs artifacts."
+                    ),
+                    continue_processing=False,
+                    audit_detail={"policy": "forbid_tools_direct_read", "command": command},
+                )
+        if "python" in lowered and "-c" in lowered:
+            if re.search(r"""open\s*\([^)]*,\s*['"][wax]""", command):
+                return HookDecision(
+                    action=HookDecisionAction.BLOCK,
+                    reason=(
+                        "blocked: python -c with file write (open(..., 'w'/'a'/'x')) detected. "
+                        "Use guarded-apply-patch for file writes in workflow mode."
+                    ),
+                    continue_processing=False,
+                    audit_detail={"policy": "forbid_python_inline_write", "command": command},
+                )
     return HookDecision(action=HookDecisionAction.ALLOW)
 
 

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import os
+import tempfile
 import unittest
 from unittest.mock import patch
 
@@ -72,6 +73,60 @@ class HookCommonTests(unittest.TestCase):
                 )
             )
         self.assertEqual(decision.action, HookDecisionAction.BLOCK)
+
+    def test_evaluate_common_policy_blocks_direct_tools_read_via_cat_in_workflow_mode(self) -> None:
+        with patch.dict(os.environ, {"METDSL_WORKFLOW_MODE": "1"}, clear=False):
+            decision = evaluate_common_policy(
+                HookInput(
+                    event_name=HookEventName.PRE_COMMAND_EXECUTE,
+                    backend="claude",
+                    payload={"command": "cat tools/hooks/cli.py"},
+                    command="cat tools/hooks/cli.py",
+                )
+            )
+        self.assertEqual(decision.action, HookDecisionAction.BLOCK)
+        self.assertIn("direct read from tools/ via Bash is forbidden", decision.reason or "")
+
+    def test_evaluate_common_policy_allows_non_repo_tools_path_in_workflow_mode(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.dict(os.environ, {"METDSL_WORKFLOW_MODE": "1"}, clear=False):
+                decision = evaluate_common_policy(
+                    HookInput(
+                        event_name=HookEventName.PRE_COMMAND_EXECUTE,
+                        backend="claude",
+                        payload={
+                            "repo_root": tmp,
+                            "command": "cat /usr/local/tools/config.yaml",
+                        },
+                        command="cat /usr/local/tools/config.yaml",
+                    )
+                )
+        self.assertEqual(decision.action, HookDecisionAction.ALLOW)
+
+    def test_evaluate_common_policy_blocks_python_inline_open_write(self) -> None:
+        with patch.dict(os.environ, {"METDSL_WORKFLOW_MODE": "1"}, clear=False):
+            decision = evaluate_common_policy(
+                HookInput(
+                    event_name=HookEventName.PRE_COMMAND_EXECUTE,
+                    backend="claude",
+                    payload={"command": "python3 -c \"open('workspace/a.txt', 'w').write('x')\""},
+                    command="python3 -c \"open('workspace/a.txt', 'w').write('x')\"",
+                )
+            )
+        self.assertEqual(decision.action, HookDecisionAction.BLOCK)
+        self.assertIn("python -c with file write", decision.reason or "")
+
+    def test_evaluate_common_policy_allows_python_inline_open_write_outside_workflow_mode(self) -> None:
+        with patch.dict(os.environ, {"METDSL_WORKFLOW_MODE": "0"}, clear=False):
+            decision = evaluate_common_policy(
+                HookInput(
+                    event_name=HookEventName.PRE_COMMAND_EXECUTE,
+                    backend="claude",
+                    payload={"command": "python3 -c \"open('workspace/a.txt', 'w').write('x')\""},
+                    command="python3 -c \"open('workspace/a.txt', 'w').write('x')\"",
+                )
+            )
+        self.assertEqual(decision.action, HookDecisionAction.ALLOW)
 
     def test_codex_adapter_roundtrip(self) -> None:
         adapter = CodexHookAdapter()

@@ -699,6 +699,19 @@ class ClaudeHookCliTests(unittest.TestCase):
             body = json.loads(proc.stdout.strip())
             self.assertEqual(body.get("decision"), "block")
 
+    def test_detect_bash_write_targets_collects_all_tee_output_paths(self) -> None:
+        targets = cli._detect_bash_write_targets("echo test | tee file1.txt file2.txt")
+        self.assertIn("file1.txt", targets)
+        self.assertIn("file2.txt", targets)
+
+    def test_detect_bash_write_targets_detects_sed_inplace_without_space_after_i(self) -> None:
+        targets = cli._detect_bash_write_targets("sed -i's/a/b/' file.txt")
+        self.assertIn("file.txt", targets)
+
+    def test_detect_bash_write_targets_detects_sed_inplace_when_i_comes_after_script(self) -> None:
+        targets = cli._detect_bash_write_targets("sed -e 's/a/b/' -i file.txt")
+        self.assertIn("file.txt", targets)
+
     def test_claude_backend_does_not_require_codex_hooks_feature(self) -> None:
         """Claude backend must not invoke the Codex feature probe at all."""
         with tempfile.TemporaryDirectory() as tmp:
@@ -1121,6 +1134,10 @@ class ClaudeHookCliTests(unittest.TestCase):
             orch = "orch_file_guard_005"
             orch_root = repo_root / "workspace" / "orchestrations" / orch
             orch_root.mkdir(parents=True, exist_ok=True)
+            (orch_root / "orchestration_meta.json").write_text(
+                json.dumps({"orchestration_agent_run_id": "orch_agent_001"}, ensure_ascii=False),
+                encoding="utf-8",
+            )
             payload = {
                 "orchestration_id": orch,
                 "repo_root": str(repo_root),
@@ -1143,7 +1160,7 @@ class ClaudeHookCliTests(unittest.TestCase):
             self.assertEqual(code, 2)
             body = json.loads(out.getvalue().strip())
             self.assertEqual(body.get("decision"), "block")
-            self.assertIn("active child agent_run_id not found", body.get("reason", ""))
+            self.assertIn("orchestration agent must not use Write/Edit tools directly", body.get("reason", ""))
             self.assertIn("guarded-apply-patch", body.get("reason", ""))
 
     def test_claude_file_tool_blocks_when_active_agent_run_id_file_empty(self) -> None:

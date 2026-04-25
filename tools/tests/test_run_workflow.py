@@ -66,12 +66,14 @@ class RunWorkflowTests(unittest.TestCase):
     def test_prompt_contains_required_inputs(self) -> None:
         text = run_workflow._build_orchestration_prompt(
             orchestration_id="orch_test",
+            orchestration_agent_run_id="run_orch_001",
             spec_ref="spec/problem/sample.md",
             dependency_ref="workspace/plans/sample/sample_20260424_001/dependency.resolved.yaml",
             until_phase="Judge",
             workflow_mode="dev",
         )
         self.assertIn("orch_test", text)
+        self.assertIn("run_orch_001", text)
         self.assertIn("spec/problem/sample.md", text)
         self.assertIn("Judge", text)
         self.assertIn("workflow_mode: `dev`", text)
@@ -129,6 +131,11 @@ class RunWorkflowTests(unittest.TestCase):
 
             def fake_runtime_command(root: Path, env: dict[str, str], args: list[str]) -> run_workflow.RuntimeResult:
                 observed_calls.append(args)
+                if args[0] == "init":
+                    return run_workflow.RuntimeResult(
+                        payload={"status": "ok", "orchestration_agent_run_id": "orch_agent_run_001"},
+                        raw_stdout="{}",
+                    )
                 if args[0] == "preflight":
                     return run_workflow.RuntimeResult(
                         payload={
@@ -169,6 +176,8 @@ class RunWorkflowTests(unittest.TestCase):
                 / "orchestration.start.prompt.txt"
             )
             self.assertTrue(prompt_path.exists())
+            prompt_text = prompt_path.read_text(encoding="utf-8")
+            self.assertIn("orchestration_agent_run_id: `orch_agent_run_001`", prompt_text)
 
     def test_main_fails_when_spec_ref_does_not_exist(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

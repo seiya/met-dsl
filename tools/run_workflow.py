@@ -106,6 +106,7 @@ def _launch_command_and_input(*, llm: str, llm_command: str, prompt_text: str) -
 def _build_orchestration_prompt(
     *,
     orchestration_id: str,
+    orchestration_agent_run_id: str,
     spec_ref: str,
     dependency_ref: str | None,
     until_phase: str,
@@ -123,6 +124,7 @@ def _build_orchestration_prompt(
 
         ## startup context
         - orchestration_id: `{orchestration_id}`
+        - orchestration_agent_run_id: `{orchestration_agent_run_id}`
         - workflow_mode: `{workflow_mode}`
         - target_spec_ref: `{spec_ref}`
         {dependency_line}
@@ -524,7 +526,8 @@ def main(argv: list[str] | None = None) -> int:
     if isinstance(dependency_ref, str) and dependency_ref.strip():
         init_args.extend(["--dependency-ref", dependency_ref])
     try:
-        _runtime_command(repo_root, env, init_args)
+        init_result = _runtime_command(repo_root, env, init_args).payload
+        orchestration_agent_run_id = str(init_result.get("orchestration_agent_run_id", "")).strip()
         preflight_result = _runtime_command(
             repo_root,
             env,
@@ -589,6 +592,7 @@ def main(argv: list[str] | None = None) -> int:
 
     prompt_text = _build_orchestration_prompt(
         orchestration_id=orchestration_id,
+        orchestration_agent_run_id=orchestration_agent_run_id,
         spec_ref=spec_ref,
         dependency_ref=dependency_ref,
         until_phase=until_phase,

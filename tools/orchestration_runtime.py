@@ -14,6 +14,7 @@ import subprocess
 import sys
 import tempfile
 import traceback
+import uuid
 from functools import lru_cache
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -1861,6 +1862,13 @@ def build_access_policy_payload(
         if isinstance(ref, str) and ref.strip()
     ]
     allowed_read_roots = _merge_unique_refs(allowed_read_roots, skill_allowed_roots)
+    orchestration_id_val = str(request_payload.get("orchestration_id", "")).strip()
+    if orchestration_id_val:
+        cap_file = (
+            f"workspace/orchestrations/{orchestration_id_val}"
+            f"/capabilities/{agent_run_id}.json"
+        )
+        allowed_read_roots = _merge_unique_refs(allowed_read_roots, [cap_file])
     body: dict[str, Any] = {
         "agent_run_id": agent_run_id.strip(),
         "node_key": node_key.strip(),
@@ -5118,6 +5126,8 @@ def init_orchestration(
     if dependency_ref:
         meta["dependency_ref"] = dependency_ref
     meta_path = root / "orchestration_meta.json"
+    orchestration_agent_run_id: str | None = None
+    existing: dict[str, Any] | None = None
     if meta_path.is_file():
         try:
             existing = _read_json(meta_path)
@@ -5127,7 +5137,20 @@ def init_orchestration(
             for key in ("parallel_nodes_explicit", "parallel_nodes_policy"):
                 if key in existing:
                     meta.setdefault(key, existing[key])
+            existing_run_id = existing.get("orchestration_agent_run_id")
+            if isinstance(existing_run_id, str) and existing_run_id.strip():
+                orchestration_agent_run_id = existing_run_id.strip()
+    if not orchestration_agent_run_id:
+        orchestration_agent_run_id = str(uuid.uuid4())
+    meta["orchestration_agent_run_id"] = orchestration_agent_run_id
     _write_json(meta_path, meta)
+    _write_read_access_manifest(
+        repo_root,
+        orchestration_id=orchestration_id,
+        agent_run_id=orchestration_agent_run_id,
+        allowed_read_roots=["docs/", "spec/", "skills/", "workspace/"],
+        denied_read_roots=["tools/"],
+    )
 
     graph_path = root / "agent_graph.json"
     if not graph_path.exists():
@@ -5136,6 +5159,40 @@ def init_orchestration(
     runs_path = root / "agent_runs.jsonl"
     if not runs_path.exists():
         runs_path.write_text("", encoding="utf-8")
+    has_orchestration_running_entry = False
+    with runs_path.open("r", encoding="utf-8") as fh:
+        for raw in fh:
+            line = raw.strip()
+            if not line:
+                continue
+            try:
+                item = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(item, dict):
+                continue
+            if (
+                str(item.get("agent_run_id", "")).strip() == orchestration_agent_run_id
+                and str(item.get("agent_role", "")).strip() == "orchestration"
+                and str(item.get("status", "")).strip() == "running"
+            ):
+                has_orchestration_running_entry = True
+                break
+    if not has_orchestration_running_entry:
+        with runs_path.open("a", encoding="utf-8") as fh:
+            fh.write(
+                json.dumps(
+                    {
+                        "agent_run_id": orchestration_agent_run_id,
+                        "agent_role": "orchestration",
+                        "agent_backend": "claude",
+                        "status": "running",
+                        "started_at": _utc_now_iso(),
+                    },
+                    ensure_ascii=False,
+                )
+                + "\n"
+            )
 
     pre_orchestration_start(repo_root, orchestration_id, event="init")
     _write_run_write_baseline(repo_root, orchestration_id)

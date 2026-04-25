@@ -6,6 +6,8 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
+import shlex
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -308,6 +310,104 @@ def _active_child_agent_run_id_path(repo_root: Path, orchestration_id: str) -> P
     )
 
 
+def _get_orchestration_agent_run_id(repo_root: Path, orchestration_id: str) -> str | None:
+    """orchestration_meta.json から orchestration_agent_run_id を取得する。"""
+    meta_path = (
+        repo_root
+        / "workspace"
+        / "orchestrations"
+        / orchestration_id
+        / "orchestration_meta.json"
+    )
+    if not meta_path.exists():
+        return None
+    try:
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    run_id = meta.get("orchestration_agent_run_id")
+    return run_id.strip() if isinstance(run_id, str) and run_id.strip() else None
+
+
+# shell redirection: cmd > path, cmd >> path
+_BASH_REDIRECT_RE = re.compile(r"(?:>>?)\s+([^\s;&|<>]+)")
+# tee: tee [-opts] path
+_BASH_TEE_RE = re.compile(r"\btee\b(?:\s+-\w+)*\s+([^\n;&|<>]+)")
+_REDIRECT_SKIP = frozenset({
+    "/dev/null", "/dev/stderr", "/dev/stdout", "/dev/stdin", "1", "2",
+})
+_SHELL_CONTROL_TOKENS = frozenset({"|", "||", "&&", ";"})
+
+
+def _looks_like_sed_script(token: str) -> bool:
+    if not token:
+        return False
+    lowered = token.lower()
+    if lowered.startswith(("s/", "y/", "c\\", "i\\", "a\\")):
+        return True
+    return "=" in token and lowered.split("=", 1)[0] in {"s", "y"}
+
+
+def _detect_sed_inplace_targets(command: str) -> list[str]:
+    try:
+        tokens = shlex.split(command)
+    except ValueError:
+        tokens = command.split()
+    targets: list[str] = []
+    i = 0
+    while i < len(tokens):
+        tok = tokens[i]
+        if tok.split("/")[-1] != "sed":
+            i += 1
+            continue
+        j = i + 1
+        segment: list[str] = []
+        while j < len(tokens) and tokens[j] not in _SHELL_CONTROL_TOKENS:
+            segment.append(tokens[j])
+            j += 1
+        k = 0
+        while k < len(segment):
+            arg = segment[k]
+            if arg == "-i" or arg.startswith("-i"):
+                candidate_idx = k + 1
+                if candidate_idx >= len(segment):
+                    k += 1
+                    continue
+                candidate = segment[candidate_idx]
+                if _looks_like_sed_script(candidate) and candidate_idx + 1 < len(segment):
+                    candidate = segment[candidate_idx + 1]
+                if candidate and not candidate.startswith("-"):
+                    targets.append(candidate)
+            k += 1
+        i = j + 1 if j < len(tokens) else j
+    return targets
+
+
+def _detect_bash_write_targets(command: str | None) -> list[str]:
+    """Bash コマンドから書き込み先パスを抽出する。"""
+    if not command:
+        return []
+    targets: list[str] = []
+    for m in _BASH_REDIRECT_RE.finditer(command):
+        path = m.group(1)
+        if path not in _REDIRECT_SKIP and not path.startswith("&"):
+            targets.append(path)
+    for m in _BASH_TEE_RE.finditer(command):
+        blob = m.group(1)
+        try:
+            tee_args = shlex.split(blob)
+        except ValueError:
+            tee_args = blob.split()
+        for arg in tee_args:
+            if arg.startswith("-"):
+                continue
+            if arg in {"|", "||", "&&", ";"}:
+                break
+            targets.append(arg)
+    targets.extend(_detect_sed_inplace_targets(command))
+    return targets
+
+
 def _resolve_codex_agent_run_id_from_session(
     *,
     repo_root: Path,
@@ -471,6 +571,24 @@ def main(argv: list[str] | None = None) -> int:
             )
             if not is_file_tool_pre:
                 decision = evaluate_common_policy(decoded)
+                if (
+                    decision.action == HookDecisionAction.ALLOW
+                    and event_name == HookEventName.PRE_COMMAND_EXECUTE
+                    and tool_name == "Bash"
+                    and os.environ.get("METDSL_WORKFLOW_MODE", "0").strip() == "1"
+                    and args.backend == "claude"
+                ):
+                    active_path = _active_child_agent_run_id_path(repo_root, orchestration_id)
+                    if active_path.exists():
+                        active_id = active_path.read_text(encoding="utf-8").strip()
+                        if active_id:
+                            for target in _detect_bash_write_targets(decoded.command):
+                                candidate = validate_write_access(
+                                    repo_root, orchestration_id, active_id, target
+                                )
+                                if candidate.action == HookDecisionAction.BLOCK:
+                                    decision = candidate
+                                    break
             else:
                 workflow_mode = os.environ.get("METDSL_WORKFLOW_MODE", "0").strip()
                 if workflow_mode != "1":
@@ -480,15 +598,33 @@ def main(argv: list[str] | None = None) -> int:
                 elif args.backend == "claude":
                     active_path = _active_child_agent_run_id_path(repo_root, orchestration_id)
                     if not active_path.exists():
-                        hint = _hint_for_file_tool(tool_name)
-                        decision = HookDecision(
-                            action=HookDecisionAction.BLOCK,
-                            reason=(
-                                "active child agent_run_id not found for Claude backend. "
-                                f"{hint}"
-                            ),
-                            continue_processing=False,
-                        )
+                        orch_agent_run_id = _get_orchestration_agent_run_id(repo_root, orchestration_id)
+                        if orch_agent_run_id and tool_name == "Read":
+                            decision = validate_read_access(
+                                repo_root,
+                                orchestration_id,
+                                orch_agent_run_id,
+                                decoded.file_path,
+                            )
+                        elif orch_agent_run_id and tool_name in {"Write", "Edit"}:
+                            decision = HookDecision(
+                                action=HookDecisionAction.BLOCK,
+                                reason=(
+                                    "orchestration agent must not use Write/Edit tools directly. "
+                                    "Use Bash + guarded-apply-patch for orchestration artifacts."
+                                ),
+                                continue_processing=False,
+                            )
+                        else:
+                            hint = _hint_for_file_tool(tool_name)
+                            decision = HookDecision(
+                                action=HookDecisionAction.BLOCK,
+                                reason=(
+                                    "no orchestration_agent_run_id found in orchestration_meta.json. "
+                                    f"{hint}"
+                                ),
+                                continue_processing=False,
+                            )
                     else:
                         active_agent_run_id = active_path.read_text(encoding="utf-8").strip()
                         if not active_agent_run_id:
