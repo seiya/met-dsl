@@ -7031,18 +7031,25 @@ class TestPhase2PlanGuardsIntegration(unittest.TestCase):
                     "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
                 },
             )
-            with self.assertRaises(RuntimeError) as ctx:
-                tool_compile_project(
-                    {
-                        "project_dir": str(repo_root),
-                        "language": "python",
-                        "build_system": "poetry",
-                        "orchestration_id": "g3",
-                        "agent_run_id": "nolaunch",
-                        "capability_token": "x",
-                        "repo_root": str(repo_root),
-                    }
-                )
+            class _FakeRuntime:
+                @staticmethod
+                def validate_mcp_build_tool_invocation(*args: Any, **kwargs: Any) -> None:
+                    raise RuntimeError("record-launch is required before MCP build tool invocation")
+
+            with patch("mcp_servers.build_runtime_server._load_codex_orchestration_runtime") as load_mock:
+                load_mock.return_value = _FakeRuntime()
+                with self.assertRaises(RuntimeError) as ctx:
+                    tool_compile_project(
+                        {
+                            "project_dir": str(repo_root),
+                            "language": "python",
+                            "build_system": "poetry",
+                            "orchestration_id": "g3",
+                            "agent_run_id": "nolaunch",
+                            "capability_token": "x",
+                            "repo_root": str(repo_root),
+                        }
+                    )
             self.assertIn("record-launch", str(ctx.exception).lower())
 
     def test_apply_patch_gate_orchestration_rejects_plan_paths(self) -> None:

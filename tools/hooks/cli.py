@@ -83,17 +83,56 @@ def _append_hook_audit(
                 orchestration_id = inner.get("orchestration_id")
     if not isinstance(orchestration_id, str) or not orchestration_id.strip():
         return
-    repo_root_raw = payload.get("repo_root")
-    repo_root = (
-        Path(repo_root_raw).resolve()
-        if isinstance(repo_root_raw, str) and repo_root_raw.strip()
-        else Path.cwd()
+    normalized_orch = orchestration_id.strip()
+    inner_payload = payload.get("payload")
+    inner_tool_name = inner_payload.get("tool_name") if isinstance(inner_payload, dict) else None
+    tool_name_raw = payload.get("tool_name")
+    tool_name = tool_name_raw if isinstance(tool_name_raw, str) and tool_name_raw.strip() else inner_tool_name
+    workflow_mode = os.environ.get("METDSL_WORKFLOW_MODE", "").strip().lower()
+    if (
+        normalized_orch == "_global"
+        and isinstance(tool_name, str)
+        and tool_name.strip().lower() == "shell"
+        and workflow_mode not in {"1", "true", "yes"}
+    ):
+        return
+    payload_has_repo_root = isinstance(payload.get("repo_root"), str) and bool(
+        str(payload.get("repo_root")).strip()
     )
+    inner_has_repo_root = isinstance(inner_payload, dict) and isinstance(
+        inner_payload.get("repo_root"), str
+    ) and bool(str(inner_payload.get("repo_root")).strip())
+    env_repo_root = os.environ.get("METDSL_HOOK_REPO_ROOT", "").strip()
+    if (
+        normalized_orch == "_global"
+        and workflow_mode not in {"1", "true", "yes"}
+        and not payload_has_repo_root
+        and not inner_has_repo_root
+        and not env_repo_root
+    ):
+        return
+    repo_root_raw = payload.get("repo_root")
+    if not (isinstance(repo_root_raw, str) and repo_root_raw.strip()):
+        if isinstance(inner_payload, dict):
+            inner_repo_root = inner_payload.get("repo_root")
+            if isinstance(inner_repo_root, str) and inner_repo_root.strip():
+                repo_root_raw = inner_repo_root
+
+    # `repo_root` が未指定の ambient hook 呼び出しでは実 workspace を汚染しない。
+    # 監査ログを永続化する場合は、明示的に `repo_root`（または env 経由の
+    # `METDSL_HOOK_REPO_ROOT`）を与える。
+    if not (isinstance(repo_root_raw, str) and repo_root_raw.strip()):
+        if env_repo_root:
+            repo_root = Path(env_repo_root).resolve()
+        else:
+            return
+    else:
+        repo_root = Path(repo_root_raw).resolve()
     path = (
         repo_root
         / "workspace"
         / "orchestrations"
-        / orchestration_id.strip()
+        / normalized_orch
         / "hooks"
         / "native_hook_events.jsonl"
     )
@@ -301,26 +340,15 @@ def main(argv: list[str] | None = None) -> int:
         event_name = _resolve_event_name(args, payload)
         adapter = _adapter_for_backend(args.backend)
         orchestration_id = _extract_orchestration_id(payload)
-        repo_root = _resolve_repo_root(payload, backend=args.backend)
-        missing_id_policy = os.environ.get(
-            "METDSL_MISSING_ORCHESTRATION_ID_POLICY", ""
-        ).strip().lower()
         if orchestration_id is None:
-            if missing_id_policy == "strict":
-                decision = _decision_error(
-                    "orchestration_id is required for hook execution"
-                )
-                _append_hook_audit(
-                    backend=args.backend,
-                    event_name=event_name,
-                    payload=payload,
-                    decision=decision,
-                    orchestration_id_override="_global",
-                )
-                exit_code, stdout_text = adapter.encode_decision(decision)
-                return _emit_hook_response(exit_code, stdout_text, event_name=event_name)
-            else:
-                orchestration_id = "_global"
+            orchestration_id = "_global"
+        if orchestration_id == "_global":
+            exit_code, stdout_text = adapter.encode_decision(
+                HookDecision(action=HookDecisionAction.ALLOW)
+            )
+            return _emit_hook_response(exit_code, stdout_text, event_name=event_name)
+
+        repo_root = _resolve_repo_root(payload, backend=args.backend)
 
         if args.backend == "codex":
             require_flag = os.environ.get("METDSL_REQUIRE_CODEX_HOOKS_FEATURE", "1").strip().lower()
