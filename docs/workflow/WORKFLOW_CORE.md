@@ -175,10 +175,25 @@ workspace/
 ```
 
 #### `ID` と不変条件
+
+##### `node_key` フォーマット
+- `node_key` は `<spec_kind>/<spec_id>@<spec_version>` 形式とする。ファイルシステムパス（`spec/component/.../...`）とは異なる。
+  - `spec_kind`: `deps.yaml` の `spec_kind` フィールド値（例: `component`、`problem`、`profile`）
+  - `spec_id`: `deps.yaml` の `spec_id` フィールド値（例: `dynamics_shallow_water_flux_2d_rusanov_p0`）
+  - `spec_version`: `controlled_spec.md` の `spec_version` フィールド値（例: `0.1.0`）
+  - 例: `component/dynamics_shallow_water_flux_2d_rusanov_p0@0.1.0`
+- `node_key_safe` は `node_key` の保存用表記とし、`<spec_kind>__<spec_id>__<spec_version>` 形式とする（スラッシュと `@` をアンダースコア 2 つに置換）。
+  - 例: `component__dynamics_shallow_water_flux_2d_rusanov_p0__0.1.0`
+  - 正規表現: `^[a-z][a-z0-9_]*__[a-z0-9][a-z0-9_]*__[0-9][0-9A-Za-z._-]*$`
+
+##### `ID` 命名規則
 - `orchestration_id` は 1 回の workflow 全体を識別する `ID` とする。
-- `node_key_safe` は `node_key` の保存用表記とし、推奨形式は `<spec_kind>__<spec_id>__<spec_version>` とする。
-- `plan_id` は `node` 単位で `case.resolved.yaml` と `algorithm.resolved.yaml` と `impl.resolved.yaml` と `dependency.resolved.yaml` の組を識別する `ID` とする。推奨形式は `<slug>_<date>_<seq3>` とする。`slug` は `spec_id` 由来の短い可読 token、`date` は `YYYYMMDD`、`seq3` は同日内 3 桁連番とする。
-- `pipeline_id` は `node` 単位で 1 回の `Generate -> Build -> Execute` 系列を識別する `ID` とする。推奨形式は `<slug>_<date>_<seq3>` とする。`slug` は `spec_id` 由来の短い可読 token、`date` は `YYYYMMDD`、`seq3` は同日内 3 桁連番とする。
+- `plan_id` は `node` 単位で `case.resolved.yaml` と `algorithm.resolved.yaml` と `impl.resolved.yaml` と `dependency.resolved.yaml` の組を識別する `ID` とする。
+  - 形式: `<slug>_<YYYYMMDD>_<seq3>`
+  - `slug` は `spec_id` 由来の短い可読 token。**ハイフン区切り**（アンダースコア不可）の英数字とする。
+  - 正規表現: `^[a-z0-9]+(?:-[a-z0-9]+)*_[0-9]{8}_[0-9]{3}$`
+  - 例: `flux-rsn-p0_20260425_001`（`flux_rsn_p0_20260425_001` は不正）
+- `pipeline_id` は `node` 単位で 1 回の `Generate -> Build -> Execute` 系列を識別する `ID` とする。`plan_id` と同一形式・同一正規表現とする。
 - `generation_id` / `build_id` / `execution_id` は各段階の試行単位 `ID` とし、推奨形式は `<prefix>_<date>_<seq3>` とする。`prefix` は `gen` / `build` / `exec` を使用する。
 - workflow は毎回独立実行し、`plan_id` / `pipeline_id` / `generation_id` / `build_id` / `execution_id` を毎回新規発行しなければならない。
 - `agent_run_id` は `step agent` / `substep agent` / `orchestration agent` の実行単位 `ID` とし、`step` / `substep` では `parent_agent_run_id` を必須記録とする。

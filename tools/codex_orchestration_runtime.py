@@ -5955,13 +5955,53 @@ def main(argv: list[str] | None = None) -> int:
     preflight_status_parser.add_argument("--repo-root", required=True)
     preflight_status_parser.add_argument("--orchestration-id", required=True)
 
-    launch_parser = subparsers.add_parser("record-launch")
+    _NODE_KEY_HELP = (
+        "node_key in '<spec_kind>/<spec_id>@<spec_version>' format "
+        "(e.g. 'component/dynamics_shallow_water_flux_2d_rusanov_p0@0.1.0'). "
+        "Derived from deps.yaml (spec_kind, spec_id) and controlled_spec.md (spec_version). "
+        "NOT a filesystem path."
+    )
+    _RECORD_LAUNCH_REQUEST_HELP = (
+        "JSON object with launch parameters. Required fields: "
+        "agent_role ('step'|'substep'), node_key (<spec_kind>/<spec_id>@<spec_version>), "
+        "step, substep (for substep agents), orchestration_id, agent_run_id, "
+        "parent_agent_run_id, workflow_mode ('dev'|'prod'), "
+        "plan_ref (workspace/plans/<node_key_safe>/<plan_id>), "
+        "pipeline_ref (workspace/pipelines/<node_key_safe>/<pipeline_id> -- required for ALL "
+        "phases including Plan; reserve via reserve-phase-root --step generate if not yet created), "
+        "dependency_ref, skill_name, skill_ref. "
+        "plan_id/pipeline_id format: <slug>_<YYYYMMDD>_<seq3> where slug uses hyphens only "
+        "(e.g. 'flux-rsn-p0_20260425_001'; underscores in slug are invalid)."
+    )
+    _RECORD_LAUNCH_RESPONSE_HELP = (
+        "JSON object with child agent response. For Claude Code backend use: "
+        '{"agent_run_id": "<uuid>", "agent_session_id": "<same uuid>", '
+        '"started_at": "<ISO8601>", "backend": "claude"}. '
+        "sandbox_runtime/sandbox_enforced/sandbox_profile_ref are added automatically. "
+        "Call record-launch BEFORE Agent tool so capability_token is available to the child agent; "
+        "then overwrite launches/<child_agent_run_id>.reply.txt with the actual Agent tool response."
+    )
+
+    launch_parser = subparsers.add_parser(
+        "record-launch",
+        description=(
+            "Record a child agent launch: runs live preflight, generates capability_token, "
+            "sandbox profile, output/read manifests, and writes launches/<child_id>.* artifacts. "
+            "For Claude Code: call this BEFORE Agent tool invocation so the child can read "
+            "its capability_token from capabilities/<child_id>.json during execution."
+        ),
+    )
     launch_parser.add_argument("--repo-root", required=True)
     launch_parser.add_argument("--orchestration-id", required=True)
-    launch_parser.add_argument("--parent-agent-run-id", required=True)
-    launch_parser.add_argument("--child-agent-run-id", required=True)
-    launch_parser.add_argument("--request-json", required=True, type=_json_arg)
-    launch_parser.add_argument("--response-json", required=True, type=_json_arg)
+    launch_parser.add_argument("--parent-agent-run-id", required=True,
+                               help="UUID of the orchestration (parent) agent.")
+    launch_parser.add_argument("--child-agent-run-id", required=True,
+                               help="UUID pre-generated for the child agent. "
+                                    "For Claude Code this also becomes agent_session_id.")
+    launch_parser.add_argument("--request-json", required=True, type=_json_arg,
+                               help=_RECORD_LAUNCH_REQUEST_HELP)
+    launch_parser.add_argument("--response-json", required=True, type=_json_arg,
+                               help=_RECORD_LAUNCH_RESPONSE_HELP)
     launch_parser.add_argument("--relation-type", default="launch")
 
     orch_read_parser = subparsers.add_parser("orchestration-read")
@@ -5988,10 +6028,31 @@ def main(argv: list[str] | None = None) -> int:
     gate_parser.add_argument("--args-json", required=True, type=_json_arg)
     gate_parser.add_argument("--capability-token", required=True)
 
-    run_parser = subparsers.add_parser("record-agent-run")
+    run_parser = subparsers.add_parser(
+        "record-agent-run",
+        description=(
+            "Append one agent run record to agent_runs.jsonl. "
+            "For step/substep roles also writes agent.result.json and agent.summary.txt, "
+            "and validates that output_refs lie within the capability write_roots."
+        ),
+    )
     run_parser.add_argument("--repo-root", required=True)
     run_parser.add_argument("--orchestration-id", required=True)
-    run_parser.add_argument("--agent-run-json", required=True, type=_json_arg)
+    run_parser.add_argument(
+        "--agent-run-json", required=True, type=_json_arg,
+        help=(
+            "JSON object for the agent run record. "
+            "Always required: agent_run_id (UUID), agent_role ('orchestration'|'step'|'substep'), "
+            "agent_backend ('claude'|'codex'|'cursor'), status ('running'|'pass'|'fail'|...), "
+            "started_at (ISO8601). "
+            "Required for step/substep: agent_session_id (for Claude Code = agent_run_id), "
+            "context_id (unique UUID per run), context_isolated (true), node_key "
+            "(<spec_kind>/<spec_id>@<spec_version>). "
+            "Required when status is a terminal state (pass/fail/blocked/timeout/cancel): "
+            "finished_at (ISO8601). "
+            "Required on pass: output_refs (list of written artifact paths)."
+        ),
+    )
 
     step_parser = subparsers.add_parser("write-step-result")
     step_parser.add_argument("--repo-root", required=True)
@@ -6009,13 +6070,29 @@ def main(argv: list[str] | None = None) -> int:
     status_parser.add_argument("--reason-detail")
     status_parser.add_argument("--blocking-policy-scope")
 
-    launch_check_parser = subparsers.add_parser("workflow-launch-check")
+    launch_check_parser = subparsers.add_parser(
+        "workflow-launch-check",
+        description=(
+            "Pre-phase gate: checks execution platform availability, session policy, "
+            "dependency readiness, and required child agent kind. "
+            "Returns JSON with status ('pass'|'fail_closed') and next_action. "
+            "Run once before the first phase; fail_closed must stop the orchestration."
+        ),
+    )
     launch_check_parser.add_argument("--repo-root", required=True)
     launch_check_parser.add_argument("--orchestration-id", required=True)
-    launch_check_parser.add_argument("--node-key", required=True)
-    launch_check_parser.add_argument("--step", required=True)
+    launch_check_parser.add_argument(
+        "--node-key", required=True,
+        help=_NODE_KEY_HELP,
+    )
+    launch_check_parser.add_argument("--step", required=True,
+                                     help="Workflow step name: plan, generate, build, execute, judge, etc.")
     launch_check_parser.add_argument("--backend", default="codex", choices=sorted(SUPPORTED_BACKENDS))
-    launch_check_parser.add_argument("--require-child-agent", required=True, choices=("step", "substep"))
+    launch_check_parser.add_argument(
+        "--require-child-agent", required=True, choices=("step", "substep"),
+        help="Expected child agent kind. Plan/Generate/Tune require 'substep'; "
+             "Build/Execute/Judge/Promote require 'step'.",
+    )
     launch_check_parser.add_argument(
         "--launch-request-json",
         default=None,
@@ -6023,13 +6100,37 @@ def main(argv: list[str] | None = None) -> int:
         help="Optional launch request object for downstream artifact checks (pre_phase_launch).",
     )
 
-    reserve_root_parser = subparsers.add_parser("reserve-phase-root")
+    reserve_root_parser = subparsers.add_parser(
+        "reserve-phase-root",
+        description=(
+            "Reserve a plan_id or pipeline_id before the child agent creates the directory. "
+            "Writes a reservation marker only; does NOT create workspace/plans/ or "
+            "workspace/pipelines/ directories. "
+            "Use --step plan to reserve a plan_id; --step generate to reserve a pipeline_id. "
+            "Both reservations are typically needed before launching Plan phase substeps, "
+            "because record-launch requires a valid pipeline_ref even for Plan."
+        ),
+    )
     reserve_root_parser.add_argument("--repo-root", required=True)
     reserve_root_parser.add_argument("--orchestration-id", required=True)
-    reserve_root_parser.add_argument("--node-key", required=True)
-    reserve_root_parser.add_argument("--step", required=True)
-    reserve_root_parser.add_argument("--reserved-id", required=True)
-    reserve_root_parser.add_argument("--reserved-by-agent-run-id", required=True)
+    reserve_root_parser.add_argument(
+        "--node-key", required=True,
+        help=_NODE_KEY_HELP,
+    )
+    reserve_root_parser.add_argument("--step", required=True,
+                                     help="'plan' to reserve a plan_id; 'generate' to reserve a pipeline_id.")
+    reserve_root_parser.add_argument(
+        "--reserved-id", required=True,
+        help=(
+            "The plan_id or pipeline_id to reserve. "
+            "Format: <slug>_<YYYYMMDD>_<seq3> where slug is hyphen-separated lowercase alphanumeric "
+            "(regex: ^[a-z0-9]+(?:-[a-z0-9]+)*_[0-9]{8}_[0-9]{3}$). "
+            "Example: 'flux-rsn-p0_20260425_001'. "
+            "Underscores inside the slug are INVALID (use hyphens instead)."
+        ),
+    )
+    reserve_root_parser.add_argument("--reserved-by-agent-run-id", required=True,
+                                     help="UUID of the agent that will use this reserved ID.")
 
     read_cp_parser = subparsers.add_parser("read-checkpoint")
     read_cp_parser.add_argument("--repo-root", required=True)

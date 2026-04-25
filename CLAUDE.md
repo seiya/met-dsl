@@ -37,11 +37,39 @@
 - Claude Code では `spawn_agent` の代わりに `Agent` tool を使用して子 `agent` を起動する。
 - `Agent` tool の `prompt` 引数には [skills/workflow-orchestration/references/launch_prompts.md](skills/workflow-orchestration/references/launch_prompts.md) の対応テンプレートを適用する。
 - `Agent` tool の `subagent_type` は `general-purpose` を既定とし、起動する phase に応じて適切な値を選択する。
-- `Agent` tool を呼び出す前に `agent_run_id`（UUID 形式）を発行し、その値を `agent_session_id` として `record-launch` に記録する。
-- `Agent` tool の戻り値（agent の最終応答テキスト）を `launch_reply_ref` に保存する `launches/<agent_run_id>.reply.txt` の内容とする。
 - `context_isolated=true` は Claude Code の `Agent` tool が独立コンテキストで実行されることを指し、常に `true` として記録する。
+
+### Claude Code における `record-launch` の実行順序
+
+Claude Code では `record-launch` を **Agent tool より前** に呼び出す。Codex の `spawn_agent` と異なり、同期的に `Agent` tool を呼び出すためには子 agent が実行中に参照する `capability_token` と `output_manifest` を事前に生成しておく必要がある。
+
+```
+手順:
+1. agent_run_id（UUID）を発行する
+2. reserve-phase-root で plan_id / pipeline_id を予約する（未予約なら）
+3. record-launch を実行する（Agent tool 起動 前）
+   → capability_token / sandbox_profile / output manifest / read manifest が生成される
+   → launches/<agent_run_id>.reply.txt には暫定内容が書き込まれる
+4. Agent tool を起動する（子 agent は capabilities/<agent_run_id>.json から
+   capability_token を読み取って guarded-apply-patch 等を実行する）
+5. Agent tool の戻り値（最終応答テキスト）を
+   launches/<agent_run_id>.reply.txt に上書き保存する
+6. record-agent-run を実行して agent_runs.jsonl へ追記する
+```
 
 ### `record-launch` の `response.json`
 - `Agent` tool の起動応答には Codex の `spawn_agent` のような構造化 JSON が存在しない。
-- `launches/<agent_run_id>.response.json` には、`agent_run_id`、`agent_session_id`（= 発行した `agent_run_id`）、`started_at`、`backend: "claude"` を最低限含む JSON を記録する。
-- `child.response.json` は上記と同一内容を保存する。
+- `record-launch --response-json` には以下の最小構成 JSON を渡す。`sandbox_runtime`・`sandbox_enforced`・`sandbox_profile_ref` は `record-launch` が自動付与する。
+
+```json
+{
+  "agent_run_id": "<agent_run_id>",
+  "agent_session_id": "<agent_run_id>",
+  "started_at": "<ISO8601>",
+  "backend": "claude"
+}
+```
+
+- `agent_session_id` は発行した `agent_run_id` と同一値を使用する（Claude Code には Codex のような固有 session ID が存在しないため）。
+- `launches/<agent_run_id>.response.json` と `agents/<agent_run_id>/dialogs/child.response.json` には上記と `record-launch` が付与したフィールドを含む内容が保存される。
+- `launches/<agent_run_id>.reply.txt` は手順 3 で record-launch が暫定書き込みし、手順 5 で Agent tool の実際の応答テキストに上書きする。

@@ -47,6 +47,103 @@
 - `launches/` と `agent_runs.jsonl` と `step_result.json` の参照整合が取れている。
 - 子 `agent` の起動失敗時に `set-status --status fail` が記録されている。
 
+## node_key / ID フォーマット早見表
+
+### `node_key` の構成
+
+```
+<spec_kind>/<spec_id>@<spec_version>
+```
+
+- `spec_kind` / `spec_id` は対象 `deps.yaml` の同名フィールドから取得する。
+- `spec_version` は対象 `controlled_spec.md` の `spec_version` フィールドから取得する。
+- **ファイルシステムパス**（`spec/component/dynamics/...`）とは別物。`workflow-launch-check` / `record-launch` / `reserve-phase-root` 等の `--node-key` には常にこの形式を渡す。
+
+例:
+```
+deps.yaml    → spec_kind: component, spec_id: dynamics_shallow_water_flux_2d_rusanov_p0
+controlled_spec.md → spec_version: 0.1.0
+node_key     → component/dynamics_shallow_water_flux_2d_rusanov_p0@0.1.0
+node_key_safe → component__dynamics_shallow_water_flux_2d_rusanov_p0__0.1.0
+```
+
+### `plan_id` / `pipeline_id` の命名規則
+
+形式: `<slug>_<YYYYMMDD>_<seq3>`
+
+- `slug` は **ハイフン区切り** の英小文字・数字（アンダースコア不可）。
+- 正規表現: `^[a-z0-9]+(?:-[a-z0-9]+)*_[0-9]{8}_[0-9]{3}$`
+- 例: `flux-rsn-p0_20260425_001` ✓　`flux_rsn_p0_20260425_001` ✗
+
+`reserve-phase-root` の `--reserved-id` にはこの形式で渡す。
+
+### `plan_ref` / `pipeline_ref` の形式
+
+```
+workspace/plans/<node_key_safe>/<plan_id>
+workspace/pipelines/<node_key_safe>/<pipeline_id>
+```
+
+- **Plan substep** でも `pipeline_ref` は必須。パイプラインはまだ存在しないが、`reserve-phase-root --step generate` で pipeline_id を先行予約し、`workspace/pipelines/<node_key_safe>/<pipeline_id>` 形式で指定する。
+- `record-launch` の `--request-json` に `pipeline_ref="none"` や空文字は渡せない。
+
+## `record-launch` 手順（Claude Code backend）
+
+Claude Code では `spawn_agent` が存在しないため、以下の順序で実行する。
+
+```
+1. agent_run_id (UUID) を生成する
+2. reserve-phase-root で plan_id / pipeline_id を先行予約する（未実行なら）
+3. record-launch を呼び出す（Agent tool 起動 前）
+   - request-json: node_key / step / substep / plan_ref / pipeline_ref / dependency_ref /
+                   skill_name / skill_ref 等の起動パラメータを含む JSON
+   - response-json: {"agent_session_id": "<agent_run_id>",
+                     "agent_run_id": "<agent_run_id>",
+                     "started_at": "<ISO8601>",
+                     "backend": "claude"}
+   → capability_token / sandbox_profile / output manifest / read manifest が生成される
+4. Agent tool を起動する（子 agent は capabilities/<agent_run_id>.json から
+   capability_token を読んで guarded-apply-patch 等を実行する）
+5. Agent tool の戻り値（最終応答テキスト）を
+   launches/<agent_run_id>.reply.txt へ書き込む（record-launch が書いた暫定内容を上書き）
+6. record-agent-run を実行して agent_runs.jsonl へ追記する
+```
+
+`record-launch` を Agent tool より前に呼ぶ理由: capability_token と output manifest を子 agent が実行開始前に参照できるようにするため。
+
+## `record-launch --request-json` の最小必須フィールド
+
+| フィールド | 説明 |
+|---|---|
+| `agent_role` | `"substep"` または `"step"` |
+| `node_key` | `<spec_kind>/<spec_id>@<spec_version>` 形式 |
+| `step` | `"plan"` / `"generate"` / `"build"` / `"execute"` / `"judge"` 等 |
+| `substep` | `"generate"` / `"verify"`（substep agent の場合）|
+| `orchestration_id` | orchestration ID |
+| `agent_run_id` | 子 agent の UUID |
+| `parent_agent_run_id` | 親（orchestration）agent の UUID |
+| `workflow_mode` | `"dev"` または `"prod"` |
+| `plan_ref` | `workspace/plans/<node_key_safe>/<plan_id>` 形式 |
+| `pipeline_ref` | `workspace/pipelines/<node_key_safe>/<pipeline_id>` 形式（Plan phase でも必須）|
+| `dependency_ref` | `spec/.../deps.yaml` 等の deps ファイルパス |
+| `skill_name` | 例: `"workflow-plan-generate"` |
+| `skill_ref` | 例: `"skills/workflow-plan-generate/SKILL.md"` |
+
+## `record-agent-run --agent-run-json` の最小必須フィールド
+
+| フィールド | 説明 | 備考 |
+|---|---|---|
+| `agent_run_id` | UUID | |
+| `agent_role` | `"orchestration"` / `"step"` / `"substep"` | |
+| `agent_backend` | `"claude"` / `"codex"` / `"cursor"` | |
+| `status` | `"running"` / `"pass"` / `"fail"` 等 | |
+| `started_at` | ISO8601 | |
+| `agent_session_id` | step/substep では必須。Claude Code では agent_run_id と同値 | |
+| `context_id` | step/substep では必須 | |
+| `context_isolated` | step/substep では必須（常に `true`）| |
+| `node_key` | step/substep では必須 | |
+| `output_refs` | pass 終端時に必須 | |
+
 ## execution platform 別の補足
 
 execution platform ごとの子 `agent` 起動ツールと `preflight` 引数の対応は `CLAUDE.md` の「execution platform 別の子 `agent` 起動ツール」を参照する。
