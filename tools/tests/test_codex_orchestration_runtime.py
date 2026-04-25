@@ -7713,6 +7713,199 @@ class TestPhase3RunGate(unittest.TestCase):
             self.assertIn("violations", cli_out)
             self.assertGreaterEqual(len(cli_out["violations"]), 1)
 
+    def test_record_launch_claude_creates_active_child_file_and_rejects_parallel_launch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            init_orchestration(repo_root=repo_root, orchestration_id="orch_001")
+            write_preflight(
+                repo_root=repo_root,
+                orchestration_id="orch_001",
+                payload={
+                    "status": "pass",
+                    "backend": "claude",
+                    "sandbox_runtime": "bwrap",
+                    "sandbox_enforced": True,
+                    "can_launch_step_agents": True,
+                    "can_launch_substep_agents": True,
+                    "feature_states": {"multi_agent": True},
+                    "checks": [
+                        {"name": "multi_agent_enabled", "pass": True},
+                        {"name": "sandbox_bwrap_available", "pass": True},
+                        {"name": "sandbox_bwrap_userns", "pass": True},
+                    ],
+                },
+            )
+            _fixture_generate_downstream_ready(repo_root)
+            record_launch(
+                repo_root=repo_root,
+                orchestration_id="orch_001",
+                parent_agent_run_id="orch_run_001",
+                child_agent_run_id="step_run_build_001",
+                request_payload={
+                    "agent_run_id": "step_run_build_001",
+                    "agent_role": "step",
+                    "node_key": "problem/shallow_water2d@0.3.0",
+                    "step": "build",
+                    "orchestration_id": "orch_001",
+                    "parent_agent_run_id": "orch_run_001",
+                    "plan_ref": _FIX_PLAN_REF,
+                    "pipeline_ref": _FIX_PIPE_REF,
+                    "dependency_ref": _FIX_DEP_REF,
+                    "skill_name": "workflow-build",
+                    "skill_ref": "skills/workflow-build/SKILL.md",
+                    "skill_must_read_refs": "",
+                    "launch_prompt_full": _step_launch_prompt(
+                        "problem/shallow_water2d@0.3.0",
+                        "build",
+                        "step_run_build_001",
+                    ),
+                },
+                response_payload={
+                    "agent_run_id": "step_run_build_001",
+                    **_spawn_response_payload("sess_step_build_001"),
+                },
+            )
+            active_path = (
+                repo_root
+                / "workspace"
+                / "orchestrations"
+                / "orch_001"
+                / "active_child_agent_run_id.txt"
+            )
+            self.assertTrue(active_path.is_file())
+            self.assertEqual(active_path.read_text(encoding="utf-8").strip(), "step_run_build_001")
+            with self.assertRaisesRegex(RuntimeError, "sequential violation"):
+                record_launch(
+                    repo_root=repo_root,
+                    orchestration_id="orch_001",
+                    parent_agent_run_id="orch_run_001",
+                    child_agent_run_id="step_run_execute_001",
+                    request_payload={
+                        "agent_run_id": "step_run_execute_001",
+                        "agent_role": "step",
+                        "node_key": "problem/shallow_water2d@0.3.0",
+                        "step": "execute",
+                        "orchestration_id": "orch_001",
+                        "parent_agent_run_id": "orch_run_001",
+                        "plan_ref": _FIX_PLAN_REF,
+                        "pipeline_ref": _FIX_PIPE_REF,
+                        "dependency_ref": _FIX_DEP_REF,
+                        "skill_name": "workflow-execute",
+                        "skill_ref": "skills/workflow-execute/SKILL.md",
+                        "skill_must_read_refs": "",
+                        "launch_prompt_full": _step_launch_prompt(
+                            "problem/shallow_water2d@0.3.0",
+                            "execute",
+                            "step_run_execute_001",
+                        ),
+                    },
+                    response_payload={
+                        "agent_run_id": "step_run_execute_001",
+                        **_spawn_response_payload("sess_step_execute_001"),
+                    },
+                )
+            meta_path = (
+                repo_root
+                / "workspace"
+                / "orchestrations"
+                / "orch_001"
+                / "orchestration_meta.json"
+            )
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            self.assertEqual(meta.get("status"), "fail_closed")
+            self.assertEqual(meta.get("reason_code"), "parallel_nodes_not_explicitly_allowed")
+
+    def test_record_agent_run_claude_terminal_status_clears_active_child_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            init_orchestration(repo_root=repo_root, orchestration_id="orch_001")
+            write_preflight(
+                repo_root=repo_root,
+                orchestration_id="orch_001",
+                payload={
+                    "status": "pass",
+                    "backend": "claude",
+                    "sandbox_runtime": "bwrap",
+                    "sandbox_enforced": True,
+                    "can_launch_step_agents": True,
+                    "can_launch_substep_agents": True,
+                    "feature_states": {"multi_agent": True},
+                    "checks": [
+                        {"name": "multi_agent_enabled", "pass": True},
+                        {"name": "sandbox_bwrap_available", "pass": True},
+                        {"name": "sandbox_bwrap_userns", "pass": True},
+                    ],
+                },
+            )
+            _fixture_generate_downstream_ready(repo_root)
+            launch_refs = record_launch(
+                repo_root=repo_root,
+                orchestration_id="orch_001",
+                parent_agent_run_id="orch_run_001",
+                child_agent_run_id="step_run_build_001",
+                request_payload={
+                    "agent_run_id": "step_run_build_001",
+                    "agent_role": "step",
+                    "node_key": "problem/shallow_water2d@0.3.0",
+                    "step": "build",
+                    "orchestration_id": "orch_001",
+                    "parent_agent_run_id": "orch_run_001",
+                    "plan_ref": _FIX_PLAN_REF,
+                    "pipeline_ref": _FIX_PIPE_REF,
+                    "dependency_ref": _FIX_DEP_REF,
+                    "skill_name": "workflow-build",
+                    "skill_ref": "skills/workflow-build/SKILL.md",
+                    "skill_must_read_refs": "",
+                    "launch_prompt_full": _step_launch_prompt(
+                        "problem/shallow_water2d@0.3.0",
+                        "build",
+                        "step_run_build_001",
+                    ),
+                },
+                response_payload={
+                    "agent_run_id": "step_run_build_001",
+                    **_spawn_response_payload("sess_step_build_001"),
+                },
+            )
+            active_path = (
+                repo_root
+                / "workspace"
+                / "orchestrations"
+                / "orch_001"
+                / "active_child_agent_run_id.txt"
+            )
+            self.assertTrue(active_path.exists())
+            out_ref = f"{_FIX_PIPE_REF}/build/build_001/bin/simulate"
+            _write_apply_patch_gate_evidence(
+                repo_root,
+                orchestration_id="orch_001",
+                agent_run_id="step_run_build_001",
+                actor_role="step",
+                changed_paths=[out_ref],
+            )
+            record_agent_run(
+                repo_root=repo_root,
+                orchestration_id="orch_001",
+                payload={
+                    "agent_run_id": "step_run_build_001",
+                    "parent_agent_run_id": "orch_run_001",
+                    "agent_role": "step",
+                    "node_key": "problem/shallow_water2d@0.3.0",
+                    "step": "build",
+                    "status": "pass",
+                    "agent_backend": "claude",
+                    "agent_model": "claude-opus",
+                    "context_id": "ctx_step_build_001",
+                    "agent_session_id": "sess_step_build_001",
+                    "launch_request_ref": launch_refs["launch_request_ref"],
+                    "launch_response_ref": launch_refs["launch_response_ref"],
+                    "launch_prompt_ref": launch_refs["launch_prompt_ref"],
+                    "launch_reply_ref": launch_refs["launch_reply_ref"],
+                    "output_refs": [out_ref],
+                },
+            )
+            self.assertFalse(active_path.exists())
+
 
 if __name__ == "__main__":
     unittest.main()

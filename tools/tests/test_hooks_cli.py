@@ -956,6 +956,314 @@ class ClaudeHookCliTests(unittest.TestCase):
             )
             self.assertFalse(log_path.exists())
 
+    def test_claude_file_tool_blocks_write_outside_manifest_when_active_child_exists(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            orch = "orch_file_guard_001"
+            run_id = "step_run_build_001"
+            orch_root = repo_root / "workspace" / "orchestrations" / orch
+            (orch_root / "output_manifests").mkdir(parents=True, exist_ok=True)
+            (orch_root / "read_manifests").mkdir(parents=True, exist_ok=True)
+            (orch_root / "active_child_agent_run_id.txt").write_text(run_id, encoding="utf-8")
+            (orch_root / "output_manifests" / f"{run_id}.json").write_text(
+                json.dumps({"write_roots": ["workspace/pipelines/safe"]}),
+                encoding="utf-8",
+            )
+            payload = {
+                "orchestration_id": orch,
+                "repo_root": str(repo_root),
+                "tool_name": "Write",
+                "tool_input": {"file_path": "workspace/forbidden.txt"},
+            }
+            out = io.StringIO()
+            with patch.dict(os.environ, {"METDSL_WORKFLOW_MODE": "1"}, clear=False):
+                with redirect_stdout(out):
+                    code = cli.main(
+                        [
+                            "--backend",
+                            "claude",
+                            "--event",
+                            "PreToolUse",
+                            "--input-json",
+                            json.dumps(payload),
+                        ]
+                    )
+            self.assertEqual(code, 2)
+            body = json.loads(out.getvalue().strip())
+            self.assertEqual(body.get("decision"), "block")
+            self.assertIn("unauthorized write", body.get("reason", ""))
+            self.assertIn("guarded-apply-patch", body.get("reason", ""))
+
+    def test_codex_file_tool_resolves_session_to_agent_run_and_allows_manifest_path(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            orch = "orch_file_guard_002"
+            run_id = "step_run_build_001"
+            session_id = "sess_step_build_001"
+            orch_root = repo_root / "workspace" / "orchestrations" / orch
+            (orch_root / "output_manifests").mkdir(parents=True, exist_ok=True)
+            (orch_root / "read_manifests").mkdir(parents=True, exist_ok=True)
+            (orch_root / "output_manifests" / f"{run_id}.json").write_text(
+                json.dumps({"write_roots": ["workspace/pipelines/safe"]}),
+                encoding="utf-8",
+            )
+            (orch_root / "agent_runs.jsonl").write_text(
+                json.dumps(
+                    {
+                        "agent_run_id": run_id,
+                        "agent_backend": "codex",
+                        "agent_session_id": session_id,
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            payload = {
+                "orchestration_id": orch,
+                "repo_root": str(repo_root),
+                "tool_name": "Write",
+                "session_id": session_id,
+                "tool_input": {"file_path": "workspace/pipelines/safe/out.txt"},
+            }
+            with patch.dict(
+                os.environ,
+                {"METDSL_WORKFLOW_MODE": "1", "METDSL_REQUIRE_CODEX_HOOKS_FEATURE": "0"},
+                clear=False,
+            ):
+                code = cli.main(
+                    [
+                        "--backend",
+                        "codex",
+                        "--event",
+                        "PreToolUse",
+                        "--input-json",
+                        json.dumps(payload),
+                    ]
+                )
+            self.assertEqual(code, 0)
+
+    def test_codex_file_tool_blocks_when_session_mapping_not_found(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            orch = "orch_file_guard_003"
+            orch_root = repo_root / "workspace" / "orchestrations" / orch
+            orch_root.mkdir(parents=True, exist_ok=True)
+            payload = {
+                "orchestration_id": orch,
+                "repo_root": str(repo_root),
+                "tool_name": "Read",
+                "session_id": "sess_unknown_001",
+                "tool_input": {"file_path": "workspace/pipelines/safe/out.txt"},
+            }
+            out = io.StringIO()
+            with patch.dict(
+                os.environ,
+                {"METDSL_WORKFLOW_MODE": "1", "METDSL_REQUIRE_CODEX_HOOKS_FEATURE": "0"},
+                clear=False,
+            ):
+                with redirect_stdout(out):
+                    code = cli.main(
+                        [
+                            "--backend",
+                            "codex",
+                            "--event",
+                            "PreToolUse",
+                            "--input-json",
+                            json.dumps(payload),
+                        ]
+                    )
+            self.assertEqual(code, 2)
+            body = json.loads(out.getvalue().strip())
+            self.assertEqual(body.get("decision"), "block")
+            self.assertIn("session-to-run mapping not found", body.get("reason", ""))
+            self.assertIn("orchestration_read", body.get("reason", ""))
+
+    def test_codex_write_tool_blocks_with_write_hint_when_session_mapping_not_found(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            orch = "orch_file_guard_004"
+            orch_root = repo_root / "workspace" / "orchestrations" / orch
+            orch_root.mkdir(parents=True, exist_ok=True)
+            payload = {
+                "orchestration_id": orch,
+                "repo_root": str(repo_root),
+                "tool_name": "Write",
+                "session_id": "sess_unknown_002",
+                "tool_input": {"file_path": "workspace/pipelines/safe/out.txt"},
+            }
+            out = io.StringIO()
+            with patch.dict(
+                os.environ,
+                {"METDSL_WORKFLOW_MODE": "1", "METDSL_REQUIRE_CODEX_HOOKS_FEATURE": "0"},
+                clear=False,
+            ):
+                with redirect_stdout(out):
+                    code = cli.main(
+                        [
+                            "--backend",
+                            "codex",
+                            "--event",
+                            "PreToolUse",
+                            "--input-json",
+                            json.dumps(payload),
+                        ]
+                    )
+            self.assertEqual(code, 2)
+            body = json.loads(out.getvalue().strip())
+            self.assertEqual(body.get("decision"), "block")
+            self.assertIn("session-to-run mapping not found", body.get("reason", ""))
+            self.assertIn("guarded-apply-patch", body.get("reason", ""))
+            self.assertNotIn("orchestration_read", body.get("reason", ""))
+
+    def test_claude_file_tool_blocks_when_active_agent_run_id_file_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            orch = "orch_file_guard_005"
+            orch_root = repo_root / "workspace" / "orchestrations" / orch
+            orch_root.mkdir(parents=True, exist_ok=True)
+            payload = {
+                "orchestration_id": orch,
+                "repo_root": str(repo_root),
+                "tool_name": "Write",
+                "tool_input": {"file_path": "workspace/pipelines/safe/out.txt"},
+            }
+            out = io.StringIO()
+            with patch.dict(os.environ, {"METDSL_WORKFLOW_MODE": "1"}, clear=False):
+                with redirect_stdout(out):
+                    code = cli.main(
+                        [
+                            "--backend",
+                            "claude",
+                            "--event",
+                            "PreToolUse",
+                            "--input-json",
+                            json.dumps(payload),
+                        ]
+                    )
+            self.assertEqual(code, 2)
+            body = json.loads(out.getvalue().strip())
+            self.assertEqual(body.get("decision"), "block")
+            self.assertIn("active child agent_run_id not found", body.get("reason", ""))
+            self.assertIn("guarded-apply-patch", body.get("reason", ""))
+
+    def test_claude_file_tool_blocks_when_active_agent_run_id_file_empty(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            orch = "orch_file_guard_006"
+            orch_root = repo_root / "workspace" / "orchestrations" / orch
+            orch_root.mkdir(parents=True, exist_ok=True)
+            (orch_root / "active_child_agent_run_id.txt").write_text("   \n", encoding="utf-8")
+            payload = {
+                "orchestration_id": orch,
+                "repo_root": str(repo_root),
+                "tool_name": "Read",
+                "tool_input": {"file_path": "workspace/pipelines/safe/out.txt"},
+            }
+            out = io.StringIO()
+            with patch.dict(os.environ, {"METDSL_WORKFLOW_MODE": "1"}, clear=False):
+                with redirect_stdout(out):
+                    code = cli.main(
+                        [
+                            "--backend",
+                            "claude",
+                            "--event",
+                            "PreToolUse",
+                            "--input-json",
+                            json.dumps(payload),
+                        ]
+                    )
+            self.assertEqual(code, 2)
+            body = json.loads(out.getvalue().strip())
+            self.assertEqual(body.get("decision"), "block")
+            self.assertIn("active child agent_run_id is empty", body.get("reason", ""))
+            self.assertIn("orchestration_read", body.get("reason", ""))
+
+    def test_claude_write_blocks_with_manifest_hint_when_output_manifest_invalid(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            orch = "orch_file_guard_007"
+            run_id = "step_run_build_001"
+            orch_root = repo_root / "workspace" / "orchestrations" / orch
+            (orch_root / "output_manifests").mkdir(parents=True, exist_ok=True)
+            (orch_root / "active_child_agent_run_id.txt").write_text(run_id, encoding="utf-8")
+            (orch_root / "output_manifests" / f"{run_id}.json").write_text(
+                "{invalid-json",
+                encoding="utf-8",
+            )
+            payload = {
+                "orchestration_id": orch,
+                "repo_root": str(repo_root),
+                "tool_name": "Write",
+                "tool_input": {"file_path": "workspace/pipelines/safe/out.txt"},
+            }
+            out = io.StringIO()
+            with patch.dict(os.environ, {"METDSL_WORKFLOW_MODE": "1"}, clear=False):
+                with redirect_stdout(out):
+                    code = cli.main(
+                        [
+                            "--backend",
+                            "claude",
+                            "--event",
+                            "PreToolUse",
+                            "--input-json",
+                            json.dumps(payload),
+                        ]
+                    )
+            self.assertEqual(code, 2)
+            body = json.loads(out.getvalue().strip())
+            self.assertEqual(body.get("decision"), "block")
+            self.assertIn("invalid JSON", body.get("reason", ""))
+            self.assertIn("Ensure record-launch generated the manifest", body.get("reason", ""))
+
+    def test_codex_read_blocks_with_manifest_hint_when_read_manifest_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            orch = "orch_file_guard_008"
+            run_id = "step_run_build_001"
+            session_id = "sess_step_build_001"
+            orch_root = repo_root / "workspace" / "orchestrations" / orch
+            orch_root.mkdir(parents=True, exist_ok=True)
+            (orch_root / "agent_runs.jsonl").write_text(
+                json.dumps(
+                    {
+                        "agent_run_id": run_id,
+                        "agent_backend": "codex",
+                        "agent_session_id": session_id,
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            payload = {
+                "orchestration_id": orch,
+                "repo_root": str(repo_root),
+                "tool_name": "Read",
+                "session_id": session_id,
+                "tool_input": {"file_path": "workspace/pipelines/safe/out.txt"},
+            }
+            out = io.StringIO()
+            with patch.dict(
+                os.environ,
+                {"METDSL_WORKFLOW_MODE": "1", "METDSL_REQUIRE_CODEX_HOOKS_FEATURE": "0"},
+                clear=False,
+            ):
+                with redirect_stdout(out):
+                    code = cli.main(
+                        [
+                            "--backend",
+                            "codex",
+                            "--event",
+                            "PreToolUse",
+                            "--input-json",
+                            json.dumps(payload),
+                        ]
+                    )
+            self.assertEqual(code, 2)
+            body = json.loads(out.getvalue().strip())
+            self.assertEqual(body.get("decision"), "block")
+            self.assertIn("read manifest not found", body.get("reason", ""))
+            self.assertIn("Ensure record-launch generated the manifest", body.get("reason", ""))
+
 
 if __name__ == "__main__":
     unittest.main()

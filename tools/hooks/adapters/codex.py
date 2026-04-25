@@ -40,8 +40,8 @@ class CodexHookAdapter(HookBackendAdapter):
     def decode_event(self, event_name: str, payload: dict[str, Any]) -> HookInput:
         normalized = normalize_hook_event_name(event_name)
         command = _event_payload_value(payload, "command")
+        tool_input = _event_payload_value(payload, "tool_input")
         if not isinstance(command, str) or not command.strip():
-            tool_input = _event_payload_value(payload, "tool_input")
             if isinstance(tool_input, dict):
                 ti_command = tool_input.get("command")
                 if isinstance(ti_command, str) and ti_command.strip():
@@ -52,6 +52,13 @@ class CodexHookAdapter(HookBackendAdapter):
                 command = None
         prompt = _event_payload_value(payload, "prompt")
         tool_name = _event_payload_value(payload, "tool_name")
+        file_path: str | None = None
+        if isinstance(tool_input, dict):
+            fp = tool_input.get("file_path")
+            if isinstance(fp, str) and fp.strip():
+                file_path = fp.strip()
+        session_id = _event_payload_value(payload, "session_id")
+        agent_session_id = _event_payload_value(payload, "agent_session_id")
         return HookInput(
             event_name=normalized,
             backend="codex",
@@ -59,6 +66,13 @@ class CodexHookAdapter(HookBackendAdapter):
             command=command if isinstance(command, str) else None,
             prompt=prompt if isinstance(prompt, str) else None,
             tool_name=tool_name if isinstance(tool_name, str) else None,
+            file_path=file_path,
+            session_id=session_id if isinstance(session_id, str) and session_id.strip() else None,
+            agent_session_id=(
+                agent_session_id
+                if isinstance(agent_session_id, str) and agent_session_id.strip()
+                else None
+            ),
         )
 
     def encode_decision(self, decision: HookDecision) -> tuple[int, str]:

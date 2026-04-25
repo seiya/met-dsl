@@ -19,6 +19,10 @@ from tools.hooks.common import (
     HookEventName,
     evaluate_common_policy,
     normalize_hook_event_name,
+    READ_HINT,
+    WRITE_HINT,
+    validate_read_access,
+    validate_write_access,
 )
 
 
@@ -294,6 +298,64 @@ def _extract_orchestration_id(payload: dict[str, Any]) -> str | None:
     return None
 
 
+def _active_child_agent_run_id_path(repo_root: Path, orchestration_id: str) -> Path:
+    return (
+        repo_root
+        / "workspace"
+        / "orchestrations"
+        / orchestration_id
+        / "active_child_agent_run_id.txt"
+    )
+
+
+def _resolve_codex_agent_run_id_from_session(
+    *,
+    repo_root: Path,
+    orchestration_id: str,
+    session_id: str | None,
+    agent_session_id: str | None,
+) -> str | None:
+    tokens = {
+        value.strip()
+        for value in (session_id, agent_session_id)
+        if isinstance(value, str) and value.strip()
+    }
+    if not tokens:
+        return None
+    runs_path = repo_root / "workspace" / "orchestrations" / orchestration_id / "agent_runs.jsonl"
+    if not runs_path.is_file():
+        return None
+    resolved: str | None = None
+    with runs_path.open("r", encoding="utf-8") as handle:
+        for raw in handle:
+            line = raw.strip()
+            if not line:
+                continue
+            try:
+                item = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(item, dict):
+                continue
+            backend = str(item.get("agent_backend", "")).strip().lower()
+            if backend != "codex":
+                continue
+            entry_session = str(item.get("agent_session_id", "")).strip()
+            if entry_session not in tokens:
+                continue
+            run_id = item.get("agent_run_id")
+            if not isinstance(run_id, str) or not run_id.strip():
+                continue
+            if resolved is not None and resolved != run_id.strip():
+                return None
+            resolved = run_id.strip()
+    return resolved
+
+
+def _hint_for_file_tool(tool_name: str) -> str:
+    return READ_HINT if tool_name == "Read" else WRITE_HINT
+
+
 def _emit_hook_response(
     exit_code: int,
     stdout_text: str,
@@ -402,7 +464,85 @@ def main(argv: list[str] | None = None) -> int:
             )
         else:
             decoded = adapter.decode_event(event_name.value, payload)
-            decision = evaluate_common_policy(decoded)
+            tool_name = (decoded.tool_name or "").strip()
+            is_file_tool_pre = (
+                event_name == HookEventName.PRE_COMMAND_EXECUTE
+                and tool_name in {"Write", "Edit", "Read"}
+            )
+            if not is_file_tool_pre:
+                decision = evaluate_common_policy(decoded)
+            else:
+                workflow_mode = os.environ.get("METDSL_WORKFLOW_MODE", "0").strip()
+                if workflow_mode != "1":
+                    decision = HookDecision(action=HookDecisionAction.ALLOW)
+                elif not decoded.file_path:
+                    decision = HookDecision(action=HookDecisionAction.ALLOW)
+                elif args.backend == "claude":
+                    active_path = _active_child_agent_run_id_path(repo_root, orchestration_id)
+                    if not active_path.exists():
+                        hint = _hint_for_file_tool(tool_name)
+                        decision = HookDecision(
+                            action=HookDecisionAction.BLOCK,
+                            reason=(
+                                "active child agent_run_id not found for Claude backend. "
+                                f"{hint}"
+                            ),
+                            continue_processing=False,
+                        )
+                    else:
+                        active_agent_run_id = active_path.read_text(encoding="utf-8").strip()
+                        if not active_agent_run_id:
+                            hint = _hint_for_file_tool(tool_name)
+                            decision = HookDecision(
+                                action=HookDecisionAction.BLOCK,
+                                reason=(
+                                    "active child agent_run_id is empty for Claude backend. "
+                                    f"{hint}"
+                                ),
+                                continue_processing=False,
+                            )
+                        elif tool_name == "Read":
+                            decision = validate_read_access(
+                                repo_root,
+                                orchestration_id,
+                                active_agent_run_id,
+                                decoded.file_path,
+                            )
+                        else:
+                            decision = validate_write_access(
+                                repo_root,
+                                orchestration_id,
+                                active_agent_run_id,
+                                decoded.file_path,
+                            )
+                else:
+                    mapped_agent_run_id = _resolve_codex_agent_run_id_from_session(
+                        repo_root=repo_root,
+                        orchestration_id=orchestration_id,
+                        session_id=decoded.session_id,
+                        agent_session_id=decoded.agent_session_id,
+                    )
+                    if not mapped_agent_run_id:
+                        hint = _hint_for_file_tool(tool_name)
+                        decision = HookDecision(
+                            action=HookDecisionAction.BLOCK,
+                            reason=f"session-to-run mapping not found. {hint}",
+                            continue_processing=False,
+                        )
+                    elif tool_name == "Read":
+                        decision = validate_read_access(
+                            repo_root,
+                            orchestration_id,
+                            mapped_agent_run_id,
+                            decoded.file_path,
+                        )
+                    else:
+                        decision = validate_write_access(
+                            repo_root,
+                            orchestration_id,
+                            mapped_agent_run_id,
+                            decoded.file_path,
+                        )
         _append_hook_audit(
             backend=args.backend,
             event_name=event_name,

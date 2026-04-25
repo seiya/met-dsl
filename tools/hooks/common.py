@@ -5,8 +5,27 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
+import json
 import os
+from pathlib import Path
 from typing import Any, Protocol
+
+READ_HINT = (
+    "Hint: Read only via 'run-gate --gate orchestration_read' and only within "
+    "read_manifests/<agent_run_id>.json allowed_read_roots. "
+    "Interpret requirements only from docs/, spec/, and skill_must_read_refs artifacts; "
+    "do not derive rules from tools/, validator scripts, or tests."
+)
+
+WRITE_HINT = (
+    "Hint: Write only via 'guarded-apply-patch' (tools/codex_orchestration_runtime.py) "
+    "and only within output_manifests/<agent_run_id>.json write_roots."
+)
+
+MANIFEST_HINT = (
+    "Hint: Ensure record-launch generated the manifest for this agent_run_id and that the manifest "
+    "JSON structure is valid."
+)
 
 
 class HookEventName(str, Enum):
@@ -32,6 +51,9 @@ class HookInput:
     command: str | None = None
     prompt: str | None = None
     tool_name: str | None = None
+    file_path: str | None = None
+    session_id: str | None = None
+    agent_session_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -179,3 +201,179 @@ def evaluate_common_policy(hook_input: HookInput) -> HookDecision:
                 },
             )
     return HookDecision(action=HookDecisionAction.ALLOW)
+
+
+def _resolve_target_path(repo_root: Path, path_token: str) -> Path:
+    raw = path_token.strip()
+    candidate = Path(raw)
+    if candidate.is_absolute():
+        return candidate.resolve()
+    return (repo_root / candidate).resolve()
+
+
+def _resolve_manifest_root(repo_root: Path, root_token: str) -> Path:
+    raw = root_token.strip()
+    if not raw:
+        return repo_root
+    candidate = Path(raw)
+    if candidate.is_absolute():
+        return candidate.resolve()
+    return (repo_root / candidate).resolve()
+
+
+def _is_path_under_root(target: Path, root: Path) -> bool:
+    target_s = str(target)
+    root_s = str(root)
+    return target_s == root_s or target_s.startswith(root_s.rstrip("/") + "/")
+
+
+def validate_write_access(
+    repo_root: Path,
+    orchestration_id: str,
+    agent_run_id: str,
+    file_path: str,
+) -> HookDecision:
+    """output manifest の write_roots に対して write/edit 対象を検証する。"""
+    manifest_path = (
+        repo_root
+        / "workspace"
+        / "orchestrations"
+        / orchestration_id
+        / "output_manifests"
+        / f"{agent_run_id}.json"
+    )
+    if not manifest_path.exists():
+        return HookDecision(
+            action=HookDecisionAction.BLOCK,
+            reason=(
+                f"output manifest not found for agent_run_id={agent_run_id!r}. "
+                f"{MANIFEST_HINT}"
+            ),
+            continue_processing=False,
+        )
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return HookDecision(
+            action=HookDecisionAction.BLOCK,
+            reason=(
+                f"output manifest is unreadable or invalid JSON for agent_run_id={agent_run_id!r}. "
+                f"{MANIFEST_HINT}"
+            ),
+            continue_processing=False,
+        )
+    if not isinstance(manifest, dict):
+        return HookDecision(
+            action=HookDecisionAction.BLOCK,
+            reason=(
+                f"output manifest must be a JSON object for agent_run_id={agent_run_id!r}. "
+                f"{MANIFEST_HINT}"
+            ),
+            continue_processing=False,
+        )
+    write_roots_obj = manifest.get("write_roots")
+    if not isinstance(write_roots_obj, list):
+        return HookDecision(
+            action=HookDecisionAction.BLOCK,
+            reason=(
+                f"output manifest missing write_roots list for agent_run_id={agent_run_id!r}. "
+                f"{MANIFEST_HINT}"
+            ),
+            continue_processing=False,
+        )
+    write_roots = [str(item) for item in write_roots_obj]
+    abs_target = _resolve_target_path(repo_root, file_path)
+    for root in write_roots:
+        abs_root = _resolve_manifest_root(repo_root, root)
+        if _is_path_under_root(abs_target, abs_root):
+            return HookDecision(action=HookDecisionAction.ALLOW)
+    return HookDecision(
+        action=HookDecisionAction.BLOCK,
+        reason=(
+            f"unauthorized write: {file_path!r} is not in output_manifest write_roots "
+            f"(agent_run_id={agent_run_id!r}). {WRITE_HINT}"
+        ),
+        continue_processing=False,
+        audit_detail={
+            "policy": "output_manifest_write_guard",
+            "file_path": file_path,
+            "agent_run_id": agent_run_id,
+            "write_roots": write_roots,
+        },
+    )
+
+
+def validate_read_access(
+    repo_root: Path,
+    orchestration_id: str,
+    agent_run_id: str,
+    file_path: str,
+) -> HookDecision:
+    """read manifest の allowed_read_roots に対して read 対象を検証する。"""
+    manifest_path = (
+        repo_root
+        / "workspace"
+        / "orchestrations"
+        / orchestration_id
+        / "read_manifests"
+        / f"{agent_run_id}.json"
+    )
+    if not manifest_path.exists():
+        return HookDecision(
+            action=HookDecisionAction.BLOCK,
+            reason=(
+                f"read manifest not found for agent_run_id={agent_run_id!r}. "
+                f"{MANIFEST_HINT}"
+            ),
+            continue_processing=False,
+        )
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return HookDecision(
+            action=HookDecisionAction.BLOCK,
+            reason=(
+                f"read manifest is unreadable or invalid JSON for agent_run_id={agent_run_id!r}. "
+                f"{MANIFEST_HINT}"
+            ),
+            continue_processing=False,
+        )
+    if not isinstance(manifest, dict):
+        return HookDecision(
+            action=HookDecisionAction.BLOCK,
+            reason=(
+                f"read manifest must be a JSON object for agent_run_id={agent_run_id!r}. "
+                f"{MANIFEST_HINT}"
+            ),
+            continue_processing=False,
+        )
+    allowed_roots_obj = manifest.get("allowed_read_roots")
+    if not isinstance(allowed_roots_obj, list):
+        return HookDecision(
+            action=HookDecisionAction.BLOCK,
+            reason=(
+                f"read manifest missing allowed_read_roots list for agent_run_id={agent_run_id!r}. "
+                f"{MANIFEST_HINT}"
+            ),
+            continue_processing=False,
+        )
+    allowed_roots = [str(item) for item in allowed_roots_obj]
+    abs_target = _resolve_target_path(repo_root, file_path)
+    for root in allowed_roots:
+        abs_root = _resolve_manifest_root(repo_root, root.rstrip("/"))
+        if _is_path_under_root(abs_target, abs_root):
+            return HookDecision(action=HookDecisionAction.ALLOW)
+    return HookDecision(
+        action=HookDecisionAction.BLOCK,
+        reason=(
+            f"unauthorized read: {file_path!r} is not in read_manifest allowed_read_roots "
+            f"(agent_run_id={agent_run_id!r}). {READ_HINT}"
+        ),
+        continue_processing=False,
+        audit_detail={
+            "policy": "read_manifest_read_guard",
+            "file_path": file_path,
+            "agent_run_id": agent_run_id,
+            "allowed_read_roots": allowed_roots,
+        },
+    )

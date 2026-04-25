@@ -76,6 +76,11 @@ def _orchestration_root(repo_root: Path, orchestration_id: str) -> Path:
     return repo_root / "workspace" / "orchestrations" / orchestration_id
 
 
+def _active_child_agent_run_id_path(repo_root: Path, orchestration_id: str) -> Path:
+    """Claude backend 専用の active child `agent_run_id` 管理ファイル。"""
+    return _orchestration_root(repo_root, orchestration_id) / "active_child_agent_run_id.txt"
+
+
 # --- Phase 1: access policy / phase state artifact layout (Item 10) ---
 
 DEFAULT_ALLOWED_GATE_SERVICES: tuple[str, ...] = (
@@ -5223,16 +5228,37 @@ def record_launch(
         except Exception:
             pass
         raise
+    preflight_backend = (
+        str(preflight_payload.get("backend", "")).strip().lower()
+        if isinstance(preflight_payload, dict)
+        else ""
+    )
+    backend_token = preflight_backend if preflight_backend in SUPPORTED_BACKENDS else "codex"
+
+    # Claude backend は active file で sequential child launch を強制する。
+    if backend_token == "claude":
+        active_path = _active_child_agent_run_id_path(repo_root, orchestration_id)
+        if active_path.exists():
+            existing_id = active_path.read_text(encoding="utf-8").strip()
+            try:
+                update_orchestration_status(
+                    repo_root,
+                    orchestration_id,
+                    status="fail_closed",
+                    reason_code="parallel_nodes_not_explicitly_allowed",
+                )
+            except Exception:
+                pass
+            raise RuntimeError(
+                "Claude backend sequential violation: "
+                f"active child agent {existing_id!r} is still running. "
+                "Parallel child agent launch is not permitted on Claude backend."
+            )
+
     step_raw = request_payload.get("step")
     node_key_raw = request_payload.get("node_key")
     if isinstance(step_raw, str) and step_raw.strip() and isinstance(node_key_raw, str) and node_key_raw.strip():
         required = _required_child_agent_kind(step_raw)
-        backend = (
-            str(preflight_payload.get("backend", "")).strip().lower()
-            if isinstance(preflight_payload, dict)
-            else ""
-        )
-        backend_token = backend if backend in SUPPORTED_BACKENDS else "codex"
         launch_ctx = dict(request_payload)
         check = pre_phase_launch(
             repo_root,
@@ -5466,6 +5492,11 @@ def record_launch(
         orchestration_id,
         agent_run_id=child_agent_run_id,
     )
+    if backend_token == "claude":
+        _active_child_agent_run_id_path(repo_root, orchestration_id).write_text(
+            child_agent_run_id,
+            encoding="utf-8",
+        )
 
     return out_refs
 
@@ -5643,6 +5674,8 @@ def record_agent_run(
                     event="record_agent_run_terminal",
                     agent_run_id=agent_run_id,
                 )
+            if backend_token == "claude":
+                _active_child_agent_run_id_path(repo_root, orchestration_id).unlink(missing_ok=True)
 
     return payload
 

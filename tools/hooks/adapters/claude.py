@@ -53,6 +53,11 @@ class ClaudeHookAdapter(HookBackendAdapter):
                 command = raw_cmd.strip()
         prompt = _payload_value(payload, "prompt")
         tool_name = _payload_value(payload, "tool_name")
+        file_path: str | None = None
+        if isinstance(tool_input, dict):
+            fp = tool_input.get("file_path")
+            if isinstance(fp, str) and fp.strip():
+                file_path = fp.strip()
         return HookInput(
             event_name=normalized,
             backend="claude",
@@ -60,6 +65,7 @@ class ClaudeHookAdapter(HookBackendAdapter):
             command=command,
             prompt=prompt if isinstance(prompt, str) else None,
             tool_name=tool_name if isinstance(tool_name, str) else None,
+            file_path=file_path,
         )
 
     def encode_decision(self, decision: HookDecision) -> tuple[int, str]:

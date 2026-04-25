@@ -31,6 +31,33 @@
             "command": "sh -lc 'ROOT=$(git rev-parse --show-toplevel) || exit 2; PYTHONPATH=\"$ROOT${PYTHONPATH:+:$PYTHONPATH}\" METDSL_HOOK_REPO_ROOT=\"$ROOT\" python3 -m tools.hooks.cli --backend codex --event PreToolUse --repo-root \"$ROOT\"'"
           }
         ]
+      },
+      {
+        "matcher": "^Write$",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh -lc 'ROOT=$(git rev-parse --show-toplevel) || exit 2; PYTHONPATH=\"$ROOT${PYTHONPATH:+:$PYTHONPATH}\" METDSL_HOOK_REPO_ROOT=\"$ROOT\" python3 -m tools.hooks.cli --backend codex --event PreToolUse --repo-root \"$ROOT\"'"
+          }
+        ]
+      },
+      {
+        "matcher": "^Edit$",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh -lc 'ROOT=$(git rev-parse --show-toplevel) || exit 2; PYTHONPATH=\"$ROOT${PYTHONPATH:+:$PYTHONPATH}\" METDSL_HOOK_REPO_ROOT=\"$ROOT\" python3 -m tools.hooks.cli --backend codex --event PreToolUse --repo-root \"$ROOT\"'"
+          }
+        ]
+      },
+      {
+        "matcher": "^Read$",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh -lc 'ROOT=$(git rev-parse --show-toplevel) || exit 2; PYTHONPATH=\"$ROOT${PYTHONPATH:+:$PYTHONPATH}\" METDSL_HOOK_REPO_ROOT=\"$ROOT\" python3 -m tools.hooks.cli --backend codex --event PreToolUse --repo-root \"$ROOT\"'"
+          }
+        ]
       }
     ],
     "PermissionRequest": [
