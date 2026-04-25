@@ -17,6 +17,7 @@ from mcp_servers.build_runtime_server import tool_compile_project
 
 from tools.orchestration_runtime import (
     TERMINAL_STATUSES,
+    _required_launch_prompt_constraint_lines,
     _pre_phase_complete_judge_checks,
     _required_child_agent_kind,
     _build_artifact_hashes,
@@ -134,6 +135,8 @@ repair_reason: none
 - この step は標準 substep を持たない phase である。自身で step 契約を完了させること。
 - 起動直後に `skill_ref` を読み、`skill_must_read_refs` と矛盾しない契約で実行すること。
 - 要求定義と判定規則は `docs/` と `spec/` と `skill_must_read_refs` に含まれる当該試行 artifact だけから解釈すること。`tools/` 配下の実装、検証 `script`、test code、validator code から rule を抽出してはならない。
+- `capability_token` は `workspace/orchestrations/<orchestration_id>/capabilities/<agent_run_id>.json` を canonical source とし、起動直後に同 file を読み `capability_token` を抽出して以後の `run-gate` / `guarded-apply-patch` へ渡すこと。
+- `capability_token` が未取得または不一致の場合は処理を開始せず fail で停止すること。
 - `orchestration-read` は `python3 tools/orchestration_runtime.py run-gate --gate orchestration_read --agent-run-id <agent_run_id> --capability-token <capability_token> --args-json '{{"read_path":"..."}}'` を唯一の経路として実行し、`orchestration-read` 直呼びを禁止する。
 - `apply_patch` は `python3 tools/orchestration_runtime.py guarded-apply-patch --repo-root <repo_root> --orchestration-id <orchestration_id> --actor-role step --agent-run-id <agent_run_id> --paths-json '["..."]' --patch-text '<patch_text>' --capability-token <capability_token>` を唯一の経路として実行し、拒否時は編集を停止すること。
 - 書き込みは `guarded-apply-patch` 経由に限定し、`run-gate --gate apply_patch_writes` と `apply-patch-gate` と shell redirection・直接 `write_text`・任意コマンドによる file write を禁止する。
@@ -175,6 +178,8 @@ repair_reason: none
 - expected output と保存先を守ること。
 - 起動直後に `skill_ref` を読み、`skill_must_read_refs` と矛盾しない契約で実行すること。
 - 要求定義と判定規則は `docs/` と `spec/` と `skill_must_read_refs` に含まれる当該試行 artifact だけから解釈すること。`tools/` 配下の実装、検証 `script`、test code、validator code から rule を抽出してはならない。
+- `capability_token` は `workspace/orchestrations/<orchestration_id>/capabilities/<agent_run_id>.json` を canonical source とし、起動直後に同 file を読み `capability_token` を抽出して以後の `run-gate` / `guarded-apply-patch` へ渡すこと。
+- `capability_token` が未取得または不一致の場合は処理を開始せず fail で停止すること。
 - `orchestration-read` は `python3 tools/orchestration_runtime.py run-gate --gate orchestration_read --agent-run-id <agent_run_id> --capability-token <capability_token> --args-json '{{"read_path":"..."}}'` を唯一の経路として実行し、`orchestration-read` 直呼びを禁止する。
 - `apply_patch` は `python3 tools/orchestration_runtime.py guarded-apply-patch --repo-root <repo_root> --orchestration-id <orchestration_id> --actor-role substep --agent-run-id <agent_run_id> --paths-json '["..."]' --patch-text '<patch_text>' --capability-token <capability_token>` を唯一の経路として実行し、拒否時は編集を停止すること。
 - 書き込みは `guarded-apply-patch` 経由に限定し、`run-gate --gate apply_patch_writes` と `apply-patch-gate` と shell redirection・直接 `write_text`・任意コマンドによる file write を禁止する。
@@ -1714,6 +1719,130 @@ shell_tool                       stable             true
                     request_payload={**prepared, "launch_prompt_full": prompt},
                     response_payload=_spawn_response_payload("sess_step_build_001"),
                 )
+
+    def test_rejects_launch_prompt_when_capability_token_constraint_line_is_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            init_orchestration(repo_root=repo_root, orchestration_id="orch_001")
+            write_preflight(
+                repo_root=repo_root,
+                orchestration_id="orch_001",
+                payload={
+                    "status": "pass",
+                    "sandbox_runtime": "bwrap",
+                    "sandbox_enforced": True,
+                    "can_launch_step_agents": True,
+                    "can_launch_substep_agents": True,
+                    "feature_states": {"multi_agent": True, "codex_hooks": True},
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
+                },
+            )
+            prepared = prepare_launch_request_payload(
+                {
+                    "node_key": "problem/shallow_water2d@0.3.0",
+                    "step": "build",
+                    "orchestration_id": "orch_001",
+                    "agent_run_id": "step_run_build_001",
+                    "parent_agent_run_id": "orch_run_001",
+                    "plan_ref": _FIX_PLAN_REF,
+                    "pipeline_ref": _FIX_PIPE_REF,
+                    "dependency_ref": _FIX_DEP_REF,
+                    "skill_name": "workflow-build",
+                    "skill_ref": "skills/workflow-build/SKILL.md",
+                    "issue_severity": "none",
+                    "repair_strategy": "none",
+                    "repair_target_agent_run_id": "none",
+                    "repair_reason": "none",
+                }
+            )
+            prompt = "\n".join(
+                line
+                for line in render_launch_prompt_text(prepared).splitlines()
+                if "/capabilities/" not in line
+                and "`capability_token` が未取得または不一致の場合" not in line
+            )
+            with self.assertRaisesRegex(ValueError, "shell-write constraints"):
+                record_launch(
+                    repo_root=repo_root,
+                    orchestration_id="orch_001",
+                    parent_agent_run_id="orch_run_001",
+                    child_agent_run_id="step_run_build_001",
+                    request_payload={**prepared, "launch_prompt_full": prompt},
+                    response_payload=_spawn_response_payload("sess_step_build_001"),
+                )
+
+    def test_rejects_launch_prompt_when_output_manifest_constraint_line_is_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            init_orchestration(repo_root=repo_root, orchestration_id="orch_001")
+            write_preflight(
+                repo_root=repo_root,
+                orchestration_id="orch_001",
+                payload={
+                    "status": "pass",
+                    "sandbox_runtime": "bwrap",
+                    "sandbox_enforced": True,
+                    "can_launch_step_agents": True,
+                    "can_launch_substep_agents": True,
+                    "feature_states": {"multi_agent": True, "codex_hooks": True},
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
+                },
+            )
+            prepared = prepare_launch_request_payload(
+                {
+                    "node_key": "problem/shallow_water2d@0.3.0",
+                    "step": "build",
+                    "orchestration_id": "orch_001",
+                    "agent_run_id": "step_run_build_001",
+                    "parent_agent_run_id": "orch_run_001",
+                    "plan_ref": _FIX_PLAN_REF,
+                    "pipeline_ref": _FIX_PIPE_REF,
+                    "dependency_ref": _FIX_DEP_REF,
+                    "skill_name": "workflow-build",
+                    "skill_ref": "skills/workflow-build/SKILL.md",
+                    "issue_severity": "none",
+                    "repair_strategy": "none",
+                    "repair_target_agent_run_id": "none",
+                    "repair_reason": "none",
+                }
+            )
+            prompt = "\n".join(
+                line
+                for line in render_launch_prompt_text(prepared).splitlines()
+                if "`output_manifests/" not in line
+            )
+            with self.assertRaisesRegex(ValueError, "shell-write constraints"):
+                record_launch(
+                    repo_root=repo_root,
+                    orchestration_id="orch_001",
+                    parent_agent_run_id="orch_run_001",
+                    child_agent_run_id="step_run_build_001",
+                    request_payload={**prepared, "launch_prompt_full": prompt},
+                    response_payload=_spawn_response_payload("sess_step_build_001"),
+                )
+
+    def test_constraint_line_selector_excludes_read_manifest_canonical_source_line(self) -> None:
+        prepared = prepare_launch_request_payload(
+            {
+                "node_key": "problem/shallow_water2d@0.3.0",
+                "step": "build",
+                "orchestration_id": "orch_001",
+                "agent_run_id": "step_run_build_001",
+                "parent_agent_run_id": "orch_run_001",
+                "plan_ref": _FIX_PLAN_REF,
+                "pipeline_ref": _FIX_PIPE_REF,
+                "dependency_ref": _FIX_DEP_REF,
+                "skill_name": "workflow-build",
+                "skill_ref": "skills/workflow-build/SKILL.md",
+                "issue_severity": "none",
+                "repair_strategy": "none",
+                "repair_target_agent_run_id": "none",
+                "repair_reason": "none",
+            }
+        )
+        constraint_lines = _required_launch_prompt_constraint_lines(prepared)
+        self.assertTrue(constraint_lines)
+        self.assertFalse(any("read_manifests/" in line for line in constraint_lines))
 
     def test_rejects_pass_step_result_when_required_outputs_are_missing_from_substeps(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -4562,6 +4691,62 @@ shell_tool                       stable             true
                 response_payload=_spawn_response_payload("sess_step_repair_001"),
             )
             self.assertIsInstance(result, dict)
+
+    def test_main_help_run_gate_includes_args_json_schema_examples(self) -> None:
+        """`run-gate --help` が gate 別 args_json schema 要約を表示すること。"""
+        stdout = io.StringIO()
+        with redirect_stdout(stdout):
+            with self.assertRaises(SystemExit) as ctx:
+                main(["run-gate", "--help"])
+        self.assertEqual(ctx.exception.code, 0)
+        out = stdout.getvalue()
+        self.assertIn("orchestration_read => {'read_path': 'docs/...'}", out)
+        self.assertIn("validate_pipeline_semantics => {'stage':", out)
+
+    def test_main_help_write_step_result_includes_result_json_schema(self) -> None:
+        """`write-step-result --help` が result_json schema 要約を表示すること。"""
+        stdout = io.StringIO()
+        with redirect_stdout(stdout):
+            with self.assertRaises(SystemExit) as ctx:
+                main(["write-step-result", "--help"])
+        self.assertEqual(ctx.exception.code, 0)
+        out = stdout.getvalue()
+        self.assertIn("required_outputs (list[str])", out)
+        self.assertIn("validation_stage is required", out)
+
+    def test_main_help_record_launch_includes_dependency_ref_phase_rule(self) -> None:
+        """`record-launch --help` が dependency_ref の phase 規則を表示すること。"""
+        stdout = io.StringIO()
+        with redirect_stdout(stdout):
+            with self.assertRaises(SystemExit) as ctx:
+                main(["record-launch", "--help"])
+        self.assertEqual(ctx.exception.code, 0)
+        out = stdout.getvalue()
+        self.assertIn("Plan => spec/.../deps.yaml; Generate+ => workspace phase root", out)
+
+    def test_render_launch_prompt_includes_capability_token_source_line(self) -> None:
+        """launch prompt が capability_token の取得元と fail-fast 条件を含むこと。"""
+        payload = {
+            "node_key": "problem/shallow_water2d@0.3.0",
+            "step": "build",
+            "orchestration_id": "orch_001",
+            "agent_run_id": "step_run_build_001",
+            "parent_agent_run_id": "orch_run_001",
+            "workflow_mode": "dev",
+            "plan_ref": _FIX_PLAN_REF,
+            "pipeline_ref": _FIX_PIPE_REF,
+            "dependency_ref": _FIX_DEP_REF,
+            "skill_name": "workflow-build",
+            "skill_ref": "skills/workflow-build/SKILL.md",
+            "skill_must_read_refs": _fixture_skill_must_read_refs_step("build"),
+            "issue_severity": "none",
+            "repair_strategy": "none",
+            "repair_target_agent_run_id": "none",
+            "repair_reason": "none",
+        }
+        prompt = render_launch_prompt_text(payload)
+        self.assertIn("capabilities/<agent_run_id>.json", prompt)
+        self.assertIn("`capability_token` が未取得または不一致の場合", prompt)
 
 
 class CheckpointResumeRuntimeTests(unittest.TestCase):

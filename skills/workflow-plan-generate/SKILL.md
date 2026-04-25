@@ -42,6 +42,7 @@ Plan ステージの生成責務を固定し、入力 spec から決定的な re
 - 上位 `node` の `Plan` は、直下依存 `node` の `plan_ref` と `plan_meta.json.verification_status` を確認し、`direct dependency plan readiness` を満たさない場合は開始してはならない。
 - 上記の生成契約を導出できない場合は `Plan fail` とし、不完全な契約で `Generate` へ進めてはならない。
 - 未登録依存、未実装依存、互換性違反依存は解決エラーにし、該当 `node` を `blocked` にする。
+- `Plan` 完了前の validator invocation は `run-gate` を原則とする。`check_artifact_syntax.py` と `validate_workspace_root.py` は read-only 検査かつ gate 非依存検査に限り直接実行を許可する。
 - `Plan` 完了前に `python3 tools/check_artifact_syntax.py --expect-top object` を実行し、`case.resolved.yaml` と `algorithm.resolved.yaml` と `impl.resolved.yaml` と `dependency.resolved.yaml` と `derived_contract.json` と `plan_meta.json` が標準 parser で復元可能な mapping / object であることを確認しなければならない。
 
 ## 運用ルール
@@ -49,10 +50,10 @@ Plan ステージの生成責務を固定し、入力 spec から決定的な re
 2. 出力先は `workspace/plans/<node_key_safe>/<plan_id>/` に固定する。
 3. workflow artifact の保存先ルートは `workspace/` のみを許可し、workflow ルート判定は `workspace/` のみを対象とする。
 4. workflow 実行開始前に `workspace/` が存在しない場合、リポジトリルート直下へ `workspace/` を作成する。
-5. 開始前と完了前に `python3 tools/validate_workspace_root.py` を実行し、`fail` 時は `Plan fail` とする。
+5. 開始前と完了前に `python3 tools/validate_workspace_root.py` を実行してよい。`run-gate --gate validate_workspace_root` が利用可能な実行環境では `run-gate` を優先し、`fail` 時は `Plan fail` とする。
 6. `plan_meta.json` に `attempt_count` と `verification_status` と `last_fail_reason` と `debug_mode` を記録する。
 7. `debug_mode=false` では失敗試行 artifact を保存しない。
-8. 完了前に `python3 tools/check_artifact_syntax.py --expect-top object` を対象 resolved artifact と `derived_contract.json` と `plan_meta.json` へ実行し、`fail` 時は `Plan fail` とする。
+8. 完了前に `python3 tools/check_artifact_syntax.py --expect-top object` を対象 resolved artifact と `derived_contract.json` と `plan_meta.json` へ実行してよい。`run-gate` 経由の同等検査が利用可能な実行環境では `run-gate` を優先し、`fail` 時は `Plan fail` とする。
 
 ## 判定基準
 - 同一入力で再生成したとき、`case.resolved.yaml` と `algorithm.resolved.yaml` と `impl.resolved.yaml` と `dependency.resolved.yaml` が一致する。

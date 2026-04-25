@@ -39,6 +39,7 @@
 - `Generate verify` の output contract 判定は `derived_contract.json` の `io_contract.outputs` を canonical source とし、`evidence_ref` と `shape_expr` の整合を必須検査する。
 - 出力形式、input/output contract、判定条件の要求定義は `controlled_spec.md` と `tests.md` と `deps.yaml` と `algorithm.resolved.yaml` と `derived_contract.json` と `docs/` canonical source から取得し、`tools/` 配下の検証 `python` スクリプトと `quality check` 実装を要求定義入力へ使用してはならない。
 - 機械的合否を確定する手順の canonical implementation は、当節および `docs/workflow/WORKFLOW_CORE.md` で列挙する `validate_pipeline_semantics.py` 相当 invocation を `python3 tools/orchestration_runtime.py run-gate --gate validate_pipeline_semantics --agent-run-id <agent_run_id> --capability-token <capability_token> --args-json '<json>'` 経由で実行する手順とする。エージェントは当該 `run-gate` 実行を `exit code 0` まで完了しなければならない。検証スクリプトの実装を読み替えて要求定義を補完してはならない。
+- validator invocation は `run-gate` を原則とする。直接実行を許可する場合は read-only 検査かつ gate 非依存検査に限定し、許可対象は `validate_workspace_root.py` と `check_artifact_syntax.py` のみとする。許可条件外の直接実行は `fail` とする。
 - 要求定義の不足を検証実装から逆算補完してはならない。不足時は当該ステージを `fail` とする。
 - `Judge` は固定スクリプト検査に加えて `LLM` 意味検査を必須実行し、`semantic_review.json` の `decision=pass` を開始条件に含める。
 - `Judge` 開始前に、対象 `node_key` の同一 `execution_id` 配下へ `run_program` 実行記録と `diagnostics.json` と `perf.json` と `raw` 実行証跡が揃っていることを検証する。未達時は `Judge fail` とする。
@@ -110,6 +111,7 @@
 - `plan_id` / `pipeline_id` / `generation_id` / `build_id` / `execution_id` を保存する。
 - `plan_id` は `<slug>_<date>_<seq3>` 形式にする。`slug` は `spec_id` 由来の短い可読 token、`date` は `YYYYMMDD`、`seq3` は同日内 3 桁連番とする。
 - `node_key` / `topo_level` / `dependency_ref` を保存する。
+- `dependency_ref` は phase 別 canonical path を保存する。`Plan` は `spec/.../deps.yaml`、`Generate` 以降は `workspace/...` の phase root（`plan_ref` または `pipeline_ref`）を記録する。
 - `LLM` 利用ステージは各ステージの `<stage>_meta.json`（コード生成は `generate_meta.json`）に `attempt_count` / `verification_status` / `last_fail_reason` / `debug_mode` / `lint_command_ref` を保存する。
 - `step` / `substep` の `agent_runs.jsonl` は `agent_backend` / `agent_model` / `context_id` / `context_isolated=true` を記録する。
 - `debug_mode=true` で失敗試行を保存した場合は保存件数と保存先を記録する。

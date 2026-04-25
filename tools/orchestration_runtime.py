@@ -19,7 +19,14 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Sequence
 
-from tools.hooks.common import validate_pipeline_semantics_stage
+try:
+    from tools.hooks.common import validate_pipeline_semantics_stage
+except ModuleNotFoundError:  # pragma: no cover - import bootstrap for direct CLI execution
+    _THIS_FILE = Path(__file__).resolve()
+    _REPO_ROOT = _THIS_FILE.parent.parent
+    if str(_REPO_ROOT) not in sys.path:
+        sys.path.insert(0, str(_REPO_ROOT))
+    from tools.hooks.common import validate_pipeline_semantics_stage
 
 TERMINAL_STATUSES = {"pass", "fail", "blocked", "timeout", "cancel"}
 # Judge の pre_phase_complete 検証で semantic_review を要求しない終了理由（未完了扱い）。
@@ -3426,13 +3433,16 @@ def _required_launch_prompt_constraint_lines(request_payload: dict[str, Any]) ->
     step = request_payload.get("step")
     if not isinstance(step, str) or not step.strip():
         return []
+    required_fragments = (
+        "`run-gate --gate apply_patch_writes` と `apply-patch-gate`",
+        "`output_manifests/",
+        "/capabilities/",
+        "`capability_token` が未取得または不一致の場合は処理を開始せず fail",
+    )
     return [
         line
         for line in render_launch_prompt_text(request_payload).splitlines()
-        if (
-            "`run-gate --gate apply_patch_writes` と `apply-patch-gate`" in line
-            or "`output_manifests/<agent_run_id>.json` を参照して manifest 外 path を reject" in line
-        )
+        if any(fragment in line for fragment in required_fragments)
     ]
 
 
@@ -6003,7 +6013,8 @@ def main(argv: list[str] | None = None) -> int:
         "plan_ref (workspace/plans/<node_key_safe>/<plan_id>), "
         "pipeline_ref (workspace/pipelines/<node_key_safe>/<pipeline_id> -- required for ALL "
         "phases including Plan; reserve via reserve-phase-root --step generate if not yet created), "
-        "dependency_ref, skill_name, skill_ref. "
+        "dependency_ref (phase rule: Plan => spec/.../deps.yaml; Generate+ => workspace phase root), "
+        "skill_name, skill_ref. "
         "plan_id/pipeline_id format: <slug>_<YYYYMMDD>_<seq3> where slug uses hyphens only "
         "(e.g. 'flux-rsn-p0_20260425_001'; underscores in slug are invalid)."
     )
@@ -6014,6 +6025,29 @@ def main(argv: list[str] | None = None) -> int:
         "sandbox_runtime/sandbox_enforced/sandbox_profile_ref are added automatically. "
         "Call record-launch BEFORE Agent tool so capability_token is available to the child agent; "
         "then overwrite launches/<child_agent_run_id>.reply.txt with the actual Agent tool response."
+    )
+    _RUN_GATE_ARGS_HELP = (
+        "JSON object for gate-specific arguments. Allowed gates and minimal args_json schema: "
+        "orchestration_read => {'read_path': 'docs/...'}; "
+        "validate_workspace_root => {'paths': ['workspace']} (optional, defaults to repo workspace); "
+        "check_artifact_syntax => {'expect_top': 'object', 'paths': ['workspace/.../file.yaml', ...]}; "
+        "validate_pipeline_semantics => {'stage': 'plan|post_generate|post_build|post_execute|pre_judge|full', "
+        "'plan_ref': 'workspace/plans/...'(plan stage), "
+        "'pipeline_root': 'workspace/pipelines/...' or ['workspace/pipelines/...', ...], "
+        "'generation_id': '<id>' (optional)}. "
+        "Keys are converted to CLI flags (e.g. pipeline_root -> --pipeline-root)."
+    )
+    _STEP_RESULT_HELP = (
+        "JSON object for step_result. Required: status, required_outputs (list[str]), "
+        "executor_agent_run_id, substep_agent_run_ids (list[str], empty list allowed for step-only phases), "
+        "failed_substeps (list[str], optional), retry_decisions (list[object], optional). "
+        "retry_decisions items require: issue_severity, repair_strategy, repair_target_agent_run_id, "
+        "new_agent_run_id, repair_reason. "
+        "When step in {generate,build,execute,judge} and status is terminal "
+        "(pass/fail/blocked/timeout/cancel), validation_stage is required: "
+        "generate=>post_generate|full, build=>post_build|full, execute=>post_execute|pre_judge|full, "
+        "judge=>pre_judge|full. "
+        "For plan/generate/tune pass, required_outputs must be covered by effective substep output_refs."
     )
 
     launch_parser = subparsers.add_parser(
@@ -6054,12 +6088,26 @@ def main(argv: list[str] | None = None) -> int:
     guarded_patch_parser.add_argument("--patch-text", required=True)
     guarded_patch_parser.add_argument("--capability-token", required=True)
 
-    gate_parser = subparsers.add_parser("run-gate")
+    gate_parser = subparsers.add_parser(
+        "run-gate",
+        description=(
+            "Execute a validator gate under orchestration policy. "
+            "Use this as the canonical validator invocation path when capability-token/gate enforcement is required."
+        ),
+    )
     gate_parser.add_argument("--repo-root", required=True)
     gate_parser.add_argument("--orchestration-id", required=True)
-    gate_parser.add_argument("--gate", required=True)
+    gate_parser.add_argument(
+        "--gate",
+        required=True,
+        choices=sorted(DEFAULT_ALLOWED_GATE_SERVICES),
+        help=(
+            "Gate name. "
+            "validate_pipeline_semantics | check_artifact_syntax | validate_workspace_root | orchestration_read"
+        ),
+    )
     gate_parser.add_argument("--agent-run-id", required=True)
-    gate_parser.add_argument("--args-json", required=True, type=_json_arg)
+    gate_parser.add_argument("--args-json", required=True, type=_json_arg, help=_RUN_GATE_ARGS_HELP)
     gate_parser.add_argument("--capability-token", required=True)
 
     run_parser = subparsers.add_parser(
@@ -6088,13 +6136,19 @@ def main(argv: list[str] | None = None) -> int:
         ),
     )
 
-    step_parser = subparsers.add_parser("write-step-result")
+    step_parser = subparsers.add_parser(
+        "write-step-result",
+        description=(
+            "Write step_result.json for one step run and validate required fields, "
+            "retry semantics, and required_outputs coverage."
+        ),
+    )
     step_parser.add_argument("--repo-root", required=True)
     step_parser.add_argument("--orchestration-id", required=True)
     step_parser.add_argument("--node-key", required=True)
     step_parser.add_argument("--step", required=True)
     step_parser.add_argument("--agent-run-id", required=True)
-    step_parser.add_argument("--result-json", required=True, type=_json_arg)
+    step_parser.add_argument("--result-json", required=True, type=_json_arg, help=_STEP_RESULT_HELP)
 
     status_parser = subparsers.add_parser("set-status")
     status_parser.add_argument("--repo-root", required=True)
