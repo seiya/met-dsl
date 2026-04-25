@@ -2256,6 +2256,7 @@ def _should_ignore_runtime_snapshot_path(
         f"{orch_root}/agent_runs.jsonl",
         f"{orch_root}/orchestration_meta.json",
         f"{orch_root}/orchestration_checkpoint.json",
+        f"{orch_root}/active_child_agent_run_id.txt",
         f"{orch_root}/phase_state.json",
         f"{orch_root}/phase_state_log.jsonl",
         f"{orch_root}/preflight.json",
