@@ -106,6 +106,7 @@ FAIL_CLOSED_REASON_CODES = {
     "checkpoint_read_forbidden_without_resume",
     "post_phase_complete_violation",
     "parallel_nodes_not_explicitly_allowed",
+    "sandbox_enforcement_violation",
 }
 
 PARALLEL_NODES_ENV_VAR = "METDSL_ALLOW_PARALLEL_NODES"
@@ -149,6 +150,10 @@ def _read_manifests_dir(repo_root: Path, orchestration_id: str) -> Path:
     return _orchestration_root(repo_root, orchestration_id) / "read_manifests"
 
 
+def _sandbox_profiles_dir(repo_root: Path, orchestration_id: str) -> Path:
+    return _orchestration_root(repo_root, orchestration_id) / "sandbox_profiles"
+
+
 def _hooks_log_path(repo_root: Path, orchestration_id: str) -> Path:
     return _orchestration_root(repo_root, orchestration_id) / "hooks" / "workflow_hooks.jsonl"
 
@@ -178,7 +183,7 @@ def _phase_state_log_path(repo_root: Path, orchestration_id: str) -> Path:
 
 def _ensure_orchestration_audit_dirs(repo_root: Path, orchestration_id: str) -> None:
     root = _orchestration_root(repo_root, orchestration_id)
-    for sub in ("access_policies", "access_logs", "violations", "capabilities"):
+    for sub in ("access_policies", "access_logs", "violations", "capabilities", "sandbox_profiles"):
         (root / sub).mkdir(parents=True, exist_ok=True)
 
 
@@ -636,6 +641,28 @@ def _write_phase_authority_violation(
         "reason": reason,
         "evaluated_at": _utc_now_iso(),
     }
+    _write_json(out, payload)
+    return out
+
+
+def _write_sandbox_enforcement_violation(
+    repo_root: Path,
+    orchestration_id: str,
+    *,
+    agent_run_id: str,
+    reason: str,
+    detail: dict[str, Any] | None = None,
+) -> Path:
+    _ensure_orchestration_audit_dirs(repo_root, orchestration_id)
+    out = _violations_dir(repo_root, orchestration_id) / f"{agent_run_id}.sandbox_enforcement_violation.json"
+    payload: dict[str, Any] = {
+        "kind": "sandbox_enforcement_violation",
+        "agent_run_id": agent_run_id,
+        "reason": reason,
+        "evaluated_at": _utc_now_iso(),
+    }
+    if isinstance(detail, dict):
+        payload["detail"] = detail
     _write_json(out, payload)
     return out
 
@@ -1901,6 +1928,131 @@ def _load_read_access_manifest(
     return payload
 
 
+def _runtime_ro_bind_paths() -> list[str]:
+    runtime_paths = ["/usr", "/bin", "/sbin", "/lib", "/lib64", "/etc"]
+    return [p for p in runtime_paths if Path(p).exists()]
+
+
+def _safe_host_env_for_child() -> dict[str, str]:
+    allowed = ("PATH", "HOME", "LANG", "LC_ALL", "TERM", "USER", "LOGNAME")
+    body: dict[str, str] = {}
+    for key in allowed:
+        value = os.environ.get(key)
+        if isinstance(value, str) and value:
+            body[key] = value
+    body.setdefault("PATH", "/usr/bin:/bin")
+    return body
+
+
+def build_bwrap_profile(
+    *,
+    repo_root: Path,
+    orchestration_id: str,
+    agent_run_id: str,
+    backend_command: str,
+) -> dict[str, Any]:
+    read_manifest = _load_read_access_manifest(
+        repo_root,
+        orchestration_id=orchestration_id,
+        agent_run_id=agent_run_id,
+    )
+    cap_path = _capabilities_dir(repo_root, orchestration_id) / f"{agent_run_id}.json"
+    if not cap_path.exists():
+        raise ValueError(f"capability file not found: {cap_path}")
+    cap_payload = _read_json(cap_path)
+    if not isinstance(cap_payload, dict):
+        raise ValueError(f"capability file must be object: {cap_path}")
+    reads_obj = read_manifest.get("allowed_read_roots")
+    if not isinstance(reads_obj, list):
+        raise ValueError("read manifest must include allowed_read_roots list")
+    writes_obj = cap_payload.get("write_roots")
+    if not isinstance(writes_obj, list):
+        raise ValueError("capability must include write_roots list")
+    read_roots = sorted(
+        {
+            _normalize_rel_posix(str(p))
+            for p in reads_obj
+            if isinstance(p, str) and _normalize_rel_posix(str(p))
+        }
+    )
+    write_roots = sorted(
+        {
+            _normalize_rel_posix(str(p))
+            for p in writes_obj
+            if isinstance(p, str) and _normalize_rel_posix(str(p))
+        }
+    )
+    for rel in write_roots:
+        abs_write_root = (repo_root / rel).resolve()
+        abs_write_root.mkdir(parents=True, exist_ok=True)
+    sandbox_root = _orchestration_root(repo_root, orchestration_id) / "sandboxes" / agent_run_id
+    tmp_root = sandbox_root / "tmp"
+    tmp_root.mkdir(parents=True, exist_ok=True)
+    return {
+        "orchestration_id": orchestration_id,
+        "agent_run_id": agent_run_id,
+        "sandbox_runtime": "bwrap",
+        "backend_command": backend_command.strip(),
+        "repo_root": str(repo_root),
+        "read_roots": read_roots,
+        "write_roots": write_roots,
+        "runtime_ro_bind_paths": _runtime_ro_bind_paths(),
+        "tmp_dir": str(tmp_root),
+        "workdir": str(repo_root),
+        "env": _safe_host_env_for_child(),
+        "generated_at": _utc_now_iso(),
+    }
+
+
+def render_bwrap_command(
+    *,
+    profile: dict[str, Any],
+    command_argv: Sequence[str],
+) -> list[str]:
+    if not command_argv:
+        raise ValueError("command_argv must be non-empty")
+    repo_root = str(profile.get("repo_root") or "").strip()
+    tmp_dir = str(profile.get("tmp_dir") or "").strip()
+    if not repo_root or not tmp_dir:
+        raise ValueError("profile must include repo_root and tmp_dir")
+    cmd: list[str] = [
+        "bwrap",
+        "--die-with-parent",
+        "--new-session",
+        "--proc",
+        "/proc",
+        "--dev",
+        "/dev",
+        "--tmpfs",
+        "/tmp",
+        "--chdir",
+        repo_root,
+    ]
+    for item in profile.get("runtime_ro_bind_paths", []):
+        if isinstance(item, str) and item.strip():
+            cmd.extend(["--ro-bind", item.strip(), item.strip()])
+    cmd.extend(["--ro-bind", repo_root, repo_root])
+    for rel in profile.get("read_roots", []):
+        if not isinstance(rel, str) or not rel.strip():
+            continue
+        abs_path = (Path(repo_root) / _normalize_rel_posix(rel)).resolve()
+        if abs_path.exists():
+            abs_token = str(abs_path)
+            cmd.extend(["--ro-bind", abs_token, abs_token])
+    for rel in profile.get("write_roots", []):
+        if not isinstance(rel, str) or not rel.strip():
+            continue
+        abs_path = (Path(repo_root) / _normalize_rel_posix(rel)).resolve()
+        if not abs_path.exists():
+            continue
+        abs_token = str(abs_path)
+        cmd.extend(["--bind", abs_token, abs_token])
+    cmd.extend(["--bind", tmp_dir, tmp_dir])
+    cmd.append("--")
+    cmd.extend([str(part) for part in command_argv])
+    return cmd
+
+
 def _append_access_log_line(
     repo_root: Path,
     orchestration_id: str,
@@ -2086,6 +2238,8 @@ def _should_ignore_runtime_snapshot_path(
         f"{orch_root}/launches/",
         f"{orch_root}/output_manifests/",
         f"{orch_root}/read_manifests/",
+        f"{orch_root}/sandbox_profiles/",
+        f"{orch_root}/sandboxes/",
         f"{orch_root}/violations/",
         f"{orch_root}/steps/",
         f"{orch_root}/reservations/",
@@ -2241,6 +2395,13 @@ def _orchestration_allowed_write_roots(orchestration_id: str) -> list[str]:
         _with_trailing_slash(_normalize_rel_posix(f"workspace/orchestrations/{orchestration_id}")),
         _with_trailing_slash(_normalize_rel_posix(f"workspace/.pycache/{orchestration_id}")),
     ]
+
+
+def _is_runtime_audit_artifact_path(orchestration_id: str, rel_path: str) -> bool:
+    orch_root = _normalize_rel_posix(f"workspace/orchestrations/{orchestration_id}")
+    rel = _normalize_rel_posix(rel_path)
+    prefixes: tuple[str, ...] = ()
+    return any(_repo_path_under_prefix(rel, prefix.rstrip("/")) for prefix in prefixes)
 
 
 def _declared_child_managed_paths(
@@ -4595,6 +4756,7 @@ def _probe_bwrap_sandbox() -> tuple[list[dict[str, Any]], bool]:
             [
                 {"name": "sandbox_bwrap_available", "pass": True, "detail": "assumed via env override"},
                 {"name": "sandbox_bwrap_userns", "pass": True, "detail": "assumed via env override"},
+                {"name": "sandbox_bwrap_exec", "pass": True, "detail": "assumed via env override"},
             ]
         )
         return checks, True
@@ -4616,6 +4778,13 @@ def _probe_bwrap_sandbox() -> tuple[list[dict[str, Any]], bool]:
                 "detail": "skipped because bwrap is unavailable",
             }
         )
+        checks.append(
+            {
+                "name": "sandbox_bwrap_exec",
+                "pass": False,
+                "detail": "skipped because bwrap is unavailable",
+            }
+        )
         return checks, False
 
     proc = subprocess.run(["bwrap", "--version"], text=True, capture_output=True, check=False)
@@ -4627,7 +4796,27 @@ def _probe_bwrap_sandbox() -> tuple[list[dict[str, Any]], bool]:
             "detail": (proc.stdout.strip() or proc.stderr.strip() or f"exit={proc.returncode}"),
         }
     )
-    return checks, userns_ok
+    dry_run = subprocess.run(
+        ["bwrap", "--ro-bind", "/", "/", "--", "sh", "-lc", "true"],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    checks.append(
+        {
+            "name": "sandbox_bwrap_exec",
+            "pass": dry_run.returncode == 0,
+            "detail": (dry_run.stdout.strip() or dry_run.stderr.strip() or f"exit={dry_run.returncode}"),
+        }
+    )
+    required_names = {"sandbox_bwrap_available", "sandbox_bwrap_userns", "sandbox_bwrap_exec"}
+    by_name = {
+        str(item.get("name")): item.get("pass")
+        for item in checks
+        if isinstance(item, dict) and isinstance(item.get("name"), str)
+    }
+    sandbox_enforced = all(by_name.get(name) is True for name in required_names)
+    return checks, sandbox_enforced
 
 
 def _probe_codex_backend(
@@ -5071,6 +5260,11 @@ def record_launch(
                 "record-launch blocked by pre_phase_launch / workflow-launch-check: "
                 f"reason_code={reason_code}"
             )
+    backend_command = "codex"
+    if isinstance(preflight_payload, dict):
+        probe_command = preflight_payload.get("probe_command")
+        if isinstance(probe_command, str) and probe_command.strip():
+            backend_command = probe_command.strip()
     root = _orchestration_root(repo_root, orchestration_id)
     launches_root = root / "launches"
     launches_root.mkdir(parents=True, exist_ok=True)
@@ -5122,14 +5316,6 @@ def record_launch(
     child_response_path = child_dialog_root / "child.response.json"
     child_prompt_path = child_dialog_root / "child.prompt.txt"
     child_reply_path = child_dialog_root / "child.reply.txt"
-    _write_json(request_path, request_payload)
-    _write_json(response_path, response_payload)
-    _write_text(prompt_path, prompt_text)
-    _write_text(reply_path, reply_text)
-    _write_json(child_request_path, request_payload)
-    _write_json(child_response_path, response_payload)
-    _write_text(child_prompt_path, prompt_text)
-    _write_text(child_reply_path, reply_text)
 
     graph_path = root / "agent_graph.json"
     graph = _load_graph(graph_path)
@@ -5154,6 +5340,8 @@ def record_launch(
         "child_launch_prompt_ref": child_prompt_ref,
         "child_launch_reply_ref": child_reply_ref,
     }
+    if not (isinstance(nk, str) and nk.strip() and isinstance(st, str) and st.strip()):
+        raise ValueError("record-launch requires non-empty node_key and step for sandbox-enforced launch")
     if isinstance(nk, str) and nk.strip() and isinstance(st, str) and st.strip():
         _write_access_policy_for_launch(
             repo_root,
@@ -5204,6 +5392,56 @@ def record_launch(
             allowed_output_paths=write_roots,
         )
         out_refs["allowed_output_manifest_ref"] = manifest_ref
+        try:
+            profile = build_bwrap_profile(
+                repo_root=repo_root,
+                orchestration_id=orchestration_id,
+                agent_run_id=child_agent_run_id,
+                backend_command=backend_command,
+            )
+            command_argv = [backend_command]
+            rendered = render_bwrap_command(profile=profile, command_argv=command_argv)
+            profile["rendered_command"] = rendered
+            profile_path = _sandbox_profiles_dir(
+                repo_root,
+                orchestration_id,
+            ) / f"{child_agent_run_id}.json"
+            _write_json(profile_path, profile)
+            sandbox_ref = (
+                f"workspace/orchestrations/{orchestration_id}/sandbox_profiles/{child_agent_run_id}.json"
+            )
+            out_refs["sandbox_profile_ref"] = sandbox_ref
+            request_payload.setdefault("sandbox_profile_ref", sandbox_ref)
+            response_payload.setdefault("sandbox_runtime", "bwrap")
+            response_payload.setdefault("sandbox_enforced", True)
+            response_payload.setdefault("sandbox_profile_ref", sandbox_ref)
+            response_payload.setdefault("sandbox_command", rendered)
+        except Exception as exc:
+            _write_sandbox_enforcement_violation(
+                repo_root,
+                orchestration_id,
+                agent_run_id=child_agent_run_id,
+                reason="sandbox_profile_build_failed",
+                detail={"error": str(exc)},
+            )
+            update_orchestration_status(
+                repo_root,
+                orchestration_id,
+                status="fail_closed",
+                reason_code="sandbox_enforcement_violation",
+                reason_detail=str(exc),
+                blocking_policy_scope="sandbox",
+            )
+            raise RuntimeError(f"record-launch sandbox enforcement failed: {exc}") from exc
+    _write_json(request_path, request_payload)
+    _write_json(response_path, response_payload)
+    _write_text(prompt_path, prompt_text)
+    _write_text(reply_path, reply_text)
+    _write_json(child_request_path, request_payload)
+    _write_json(child_response_path, response_payload)
+    _write_text(child_prompt_path, prompt_text)
+    _write_text(child_reply_path, reply_text)
+    if isinstance(nk, str) and nk.strip() and isinstance(st, str) and st.strip():
         step_tok = st.strip().lower()
         _transition_node_step_phase_state(
             repo_root,
@@ -5332,6 +5570,47 @@ def record_agent_run(
             raise ValueError(
                 "agent_session_id must match child agent identifier in launch response"
             )
+        sandbox_ref = launch_response_payload.get("sandbox_profile_ref")
+        if launch_response_payload.get("sandbox_runtime") != "bwrap":
+            _write_sandbox_enforcement_violation(
+                repo_root,
+                orchestration_id,
+                agent_run_id=agent_run_id,
+                reason="sandbox_runtime_not_bwrap",
+                detail={"launch_response_ref": payload["launch_response_ref"]},
+            )
+            raise ValueError("launch response must record sandbox_runtime=bwrap")
+        if launch_response_payload.get("sandbox_enforced") is not True:
+            _write_sandbox_enforcement_violation(
+                repo_root,
+                orchestration_id,
+                agent_run_id=agent_run_id,
+                reason="sandbox_not_enforced",
+                detail={"launch_response_ref": payload["launch_response_ref"]},
+            )
+            raise ValueError("launch response must record sandbox_enforced=true")
+        if not isinstance(sandbox_ref, str) or not sandbox_ref.strip():
+            _write_sandbox_enforcement_violation(
+                repo_root,
+                orchestration_id,
+                agent_run_id=agent_run_id,
+                reason="sandbox_profile_missing",
+                detail={"launch_response_ref": payload["launch_response_ref"]},
+            )
+            raise ValueError("launch response must include sandbox_profile_ref")
+        sandbox_path = repo_root / str(sandbox_ref).strip()
+        if not sandbox_path.exists():
+            _write_sandbox_enforcement_violation(
+                repo_root,
+                orchestration_id,
+                agent_run_id=agent_run_id,
+                reason="sandbox_profile_not_found",
+                detail={"sandbox_profile_ref": sandbox_ref},
+            )
+            raise ValueError(f"sandbox_profile_ref target not found: {sandbox_ref}")
+        payload.setdefault("sandbox_runtime", "bwrap")
+        payload.setdefault("sandbox_enforced", True)
+        payload.setdefault("sandbox_profile_ref", str(sandbox_ref).strip())
 
     _validate_terminal_run_payload(repo_root, orchestration_id, payload)
 

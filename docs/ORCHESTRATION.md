@@ -20,7 +20,7 @@
 - `workflow` 実行は、必ず 1 つの `orchestration agent` を最初に起動して開始する。
 - `workflow` 開始前に、`step agent` と `substep agent` を独立起動できる execution platform の preflight を必須実行しなければならない。preflight は `multi_agent` 機能と子 `agent` 起動可否を検証対象に含め、`pass` でない場合は `workflow` を開始してはならない。
 - `backend=codex` の preflight は、`feature_states.codex_hooks=true` と `checks.codex_hooks_enabled.pass=true` と `checks.codex_home_writable.pass=true` を同時に満たさなければならない。いずれかが未充足または未定義の場合、`workflow` を開始してはならない。
-- preflight は `sandbox_runtime=bwrap` と `sandbox_enforced=true` を必須条件に含めなければならない。`checks.sandbox_bwrap_available.pass=true` または `checks.sandbox_bwrap_userns.pass=true` のいずれかが未充足の場合、`workflow` を開始してはならない。
+- preflight は `sandbox_runtime=bwrap` と `sandbox_enforced=true` を必須条件に含めなければならない。`checks.sandbox_bwrap_available.pass=true` または `checks.sandbox_bwrap_userns.pass=true` または `checks.sandbox_bwrap_exec.pass=true` の少なくとも 1 つを満たさない場合、`workflow` を開始してはならない。
 - native hook 実行時の `codex_hooks` feature 判定は、`orchestration_id` ごとに最初の 1 回だけ実行し、結果を `workspace/orchestrations/<orchestration_id>/hooks/codex_feature_check.json` へキャッシュしなければならない。
 - `preflight.json` の手動編集または後編集による `pass` 化を禁止する。preflight 結果は実行時検査の一次証跡としてのみ記録しなければならない。
 - 子 `agent` 起動直前に、execution platform の live probe で `multi_agent` と子 `agent` 起動可否を再検査しなければならない。live probe は `record-launch` 実行時に適用し、`fail` の場合は `record-launch` と子 `agent` 起動を禁止し、当該 `workflow` を `fail` へ遷移させなければならない。
@@ -36,6 +36,7 @@
 - child `agent` に許可する phase artifact の変更は、capability token が許可した `write_root` 配下に限定しなければならない。`plan_ref` / `pipeline_ref` 配下の変更は、`guarded-apply-patch` または対応 gate を通過した canonical path に限定し、許可 root 外の変更を禁止する。
 - `record-launch` は child `agent_run_id` ごとに `workspace/orchestrations/<orchestration_id>/output_manifests/<agent_run_id>.json` を生成し、`allowed_output_paths` を確定しなければならない。`guarded-apply-patch` と `record-agent-run` は当該 manifest を必須参照し、manifest 外 path の変更または `output_refs` を reject しなければならない。
 - `record-launch` は child `agent_run_id` ごとに `workspace/orchestrations/<orchestration_id>/read_manifests/<agent_run_id>.json` を生成し、`allowed_read_roots` と `denied_read_roots` を確定しなければならない。`orchestration_read` は当該 manifest を canonical source とし、manifest 外 path を reject しなければならない。
+- `record-launch` は child `agent_run_id` ごとに `workspace/orchestrations/<orchestration_id>/sandbox_profiles/<agent_run_id>.json` を生成し、`bwrap` 実行に必要な `read_roots` と `write_roots` と runtime bind 構成を確定しなければならない。child 起動は当該 profile を用いた `bwrap` 実行のみを許可し、非 sandbox 実行を禁止しなければならない。
 - `step agent` / `substep agent` は phase artifact を変更する場合、`apply_patch_writes` gate を通過した `guarded-apply-patch` を canonical invocation としなければならない。通常 `apply_patch` の直接実行、shell redirection、`tee`、`sed -i`、`perl -0pi`、`python` / `sh` / `bash` による file write など、gate を経由しない file write を禁止する。
 - shell による file write は、対象 path が phase artifact かどうかを問わず、child `agent` 起動要求で明示した canonical invocation に含まれない限り禁止しなければならない。shell file write を事前 gate または `record-agent-run` が検出した場合、当該 gate または `record-agent-run` は当該 `agent_run` を reject しなければならない。reject 後は `orchestration agent` が `orchestration_meta.status=fail_closed` を記録して停止しなければならない。
 - `step agent` と `substep agent` は、同一 `LLM` コンテキストを共有してはならない。各 `agent_run_id` は固有の `context_id` を持ち、`context_isolated=true` を必須記録とする。
@@ -69,6 +70,7 @@
 - `agent_runs.jsonl` と `agent_graph.json` は、実行中イベントを逐次追記して生成しなければならない。workflow 完了後に固定値テンプレートを一括出力する運用を禁止する。
 - `agent_runs.jsonl` と `agent_graph.json` と `step_result.json` を後生成または手動整形して独立実行を偽装してはならない。起動時に記録した一次証跡との突合で整合しない試行は `fail` とする。
 - `record-launch` は、`spawn_agent` 成功直後の request/response 保存専用処理としなければならない。実起動前の予約記録、実起動失敗後の補完記録、任意 `response_payload` の後投入を禁止する。
+- `record-launch` は launch response に `sandbox_runtime=bwrap` と `sandbox_enforced=true` と `sandbox_profile_ref` を記録しなければならない。`record-agent-run` は当該項目を必須検証し、未充足時は `sandbox_enforcement_violation` として reject しなければならない。
 - `orchestration agent` は、子 `agent` 起動時に `docs/workflow/WORKFLOW_CORE.md` と対象 `step` に対応する `docs/workflow/phases/phase_*.md` を canonical source として、対象 `step` または `substep` の `execution input` と `verification input` と `expected output` を明示しなければならない。`step agent` を使用する phase では `step agent` も自身の契約入力と expected output を明示しなければならない。
 - `orchestration agent` は、子 `agent` 起動要求に要求定義と判定規則の canonical source が `docs/` と `spec/` と当該試行 artifact であることを明示しなければならない。`tools/` 配下の実装、検証 `script`、test code、validator code を読んで rule を抽出する指示または黙示を禁止する。
 - 子 `agent` は validator internal service を実行する場合、`python3 tools/codex_orchestration_runtime.py run-gate --gate <gate_name> --agent-run-id <agent_run_id> --capability-token <capability_token> --args-json '<json>'` を canonical invocation とし、validator script の直接実行を禁止する。

@@ -3014,11 +3014,35 @@ shell_tool                       stable             true
                 repo_root
                 / "workspace/orchestrations/orch_001/launches/substep_run_tune_001.response.json"
             )
+            sandbox_profile_path = (
+                repo_root
+                / "workspace/orchestrations/orch_001/sandbox_profiles/substep_run_tune_001.json"
+            )
+            sandbox_profile_path.parent.mkdir(parents=True, exist_ok=True)
+            sandbox_profile_path.write_text(
+                json.dumps(
+                    {
+                        "orchestration_id": "orch_001",
+                        "agent_run_id": "substep_run_tune_001",
+                        "sandbox_runtime": "bwrap",
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
             launch_response_path.write_text(
                 json.dumps(
                     {
                         "agent_run_id": "substep_run_tune_001",
                         **_spawn_response_payload("sess_substep_tune_001"),
+                        "sandbox_runtime": "bwrap",
+                        "sandbox_enforced": True,
+                        "sandbox_profile_ref": (
+                            "workspace/orchestrations/orch_001/"
+                            "sandbox_profiles/substep_run_tune_001.json"
+                        ),
                     },
                     ensure_ascii=False,
                     indent=2,
@@ -6774,7 +6798,13 @@ class TestPhase2PlanGuardsIntegration(unittest.TestCase):
                     )
                 raise AssertionError(args)
 
-            with patch.dict(os.environ, {"METDSL_HOME": "/tmp/codex-orchestration-test-home"}):
+            with patch.dict(
+                os.environ,
+                {
+                    "METDSL_HOME": "/tmp/codex-orchestration-test-home",
+                    "METDSL_ORCHESTRATION_ASSUME_BWRAP": "1",
+                },
+            ):
                 preflight_payload = probe_execution_platform(backend="codex", runner=runner)
             preflight_path = repo_root / "workspace/orchestrations/wf3/preflight.json"
             preflight_path.parent.mkdir(parents=True, exist_ok=True)
