@@ -73,8 +73,8 @@
 - `record-launch` は launch response に `sandbox_runtime=bwrap` と `sandbox_enforced=true` と `sandbox_profile_ref` を記録しなければならない。`record-agent-run` は当該項目を必須検証し、未充足時は `sandbox_enforcement_violation` として reject しなければならない。
 - `orchestration agent` は、子 `agent` 起動時に `docs/workflow/WORKFLOW_CORE.md` と対象 `step` に対応する `docs/workflow/phases/phase_*.md` を canonical source として、対象 `step` または `substep` の `execution input` と `verification input` と `expected output` を明示しなければならない。`step agent` を使用する phase では `step agent` も自身の契約入力と expected output を明示しなければならない。
 - `orchestration agent` は、子 `agent` 起動要求に要求定義と判定規則の canonical source が `docs/` と `spec/` と当該試行 artifact であることを明示しなければならない。`tools/` 配下の実装、検証 `script`、test code、validator code を読んで rule を抽出する指示または黙示を禁止する。
-- 子 `agent` は validator internal service を実行する場合、`python3 tools/codex_orchestration_runtime.py run-gate --gate <gate_name> --agent-run-id <agent_run_id> --capability-token <capability_token> --args-json '<json>'` を canonical invocation とし、validator script の直接実行を禁止する。
-- 子 `agent` が `apply_patch` を実行する場合、`python3 tools/codex_orchestration_runtime.py guarded-apply-patch --repo-root <repo_root> --orchestration-id <orchestration_id> --actor-role <step|substep> --agent-run-id <agent_run_id> --paths-json '["..."]' --patch-text '<patch_text>' --capability-token <capability_token>` を canonical invocation とし、`run-gate --gate apply_patch_writes` と通常 `apply_patch` の分離実行を禁止する。
+- 子 `agent` は validator internal service を実行する場合、`python3 tools/orchestration_runtime.py run-gate --gate <gate_name> --agent-run-id <agent_run_id> --capability-token <capability_token> --args-json '<json>'` を canonical invocation とし、validator script の直接実行を禁止する。
+- 子 `agent` が `apply_patch` を実行する場合、`python3 tools/orchestration_runtime.py guarded-apply-patch --repo-root <repo_root> --orchestration-id <orchestration_id> --actor-role <step|substep> --agent-run-id <agent_run_id> --paths-json '["..."]' --patch-text '<patch_text>' --capability-token <capability_token>` を canonical invocation とし、`run-gate --gate apply_patch_writes` と通常 `apply_patch` の分離実行を禁止する。
 - `apply_patch_writes` は `guarded-apply-patch` 内部処理専用 `gate` とし、`run-gate --gate apply_patch_writes` を公開経路として使用してはならない。
 - `record-agent-run` は、child `agent` が申告した `output_refs` と `apply_patch_writes` gate 記録に加えて、baseline との差分で実変更 path を検査しなければならない。実変更 path が capability token の `write_root` または gate 許可 path に含まれない場合、`unauthorized write` として reject しなければならない。reject 発生時は `orchestration agent` が `orchestration_meta.status=fail_closed` を記録して停止しなければならない。
 - `orchestration agent` は、子 `agent` 起動要求本文を `skills/workflow-orchestration/references/launch_prompts.md` の対応テンプレートから生成しなければならない。`step agent` には `step agent` 起動要求テンプレート、`substep agent` には `substep agent` 起動要求テンプレートを適用し、テンプレートを使わない任意の自由形式 prompt を禁止する。
@@ -154,7 +154,7 @@
 38. native hook の実行結果は `workspace/orchestrations/<orchestration_id>/hooks/native_hook_events.jsonl` へ追記し、`backend` と `event` と `action` と `reason` を追跡可能にしなければならない。
 39. native hook 実行 payload に `orchestration_id` が存在しない場合の動作は `METDSL_MISSING_ORCHESTRATION_ID_POLICY` で制御する。`strict` の場合はすべての hook event でエラーとして失敗させなければならない。未設定（既定）の場合は `workspace/orchestrations/_global/hooks/native_hook_events.jsonl` へのフォールバック記録を許可する。`tools/run_workflow.py` はワークフロー起動時に `METDSL_MISSING_ORCHESTRATION_ID_POLICY=strict` を設定し、orchestration_id なしの hook 実行を禁止しなければならない。
 40. 子 `agent` 必須 phase で契約に反する近道へ逸脱しそうな場合、`orchestration agent` は当該 phase が子 `agent` 起動必須であることを明示し、正規の起動手順へ復帰しなければならない。逸脱を理由とするローカル継続実装を禁止する。
-41. `write-step-result` が `status=pass` で完了した後、`orchestration_checkpoint.json` が `tools/codex_orchestration_runtime.py` により自動更新される。`orchestration_checkpoint.json` の手動編集を禁止する。
+41. `write-step-result` が `status=pass` で完了した後、`orchestration_checkpoint.json` が `tools/orchestration_runtime.py` により自動更新される。`orchestration_checkpoint.json` の手動編集を禁止する。
 42. `resume_enabled=true` の orchestration において、`orchestration agent` は `check-step-completed` を各 `step` 起動前に実行し、`completed=true` かつ `integrity=ok` の場合のみ当該 `step` のスキップを許可する。
 43. チェックポイントによりスキップした `step` は `agent_runs.jsonl` に `agent_role=skipped_by_checkpoint` として記録しなければならない。
 44. `resume_enabled=false` の orchestration（未設定を含む）では `orchestration_checkpoint.json` を信頼して `step` をスキップしてはならない。`docs/workflow/WORKFLOW_CORE.md` の該当ハードニング規範における「明示的な指定」は `orchestration_meta.json` の `resume_enabled=true` のみが満たす。
@@ -180,7 +180,7 @@
 - `agent_runs.jsonl` から `queued` / `running` / `pass` / `fail` / `blocked` / `timeout` / `cancel` の遷移を追跡できる。
 - `hooks/native_hook_events.jsonl` から native hook の decision を追跡できる。
 - `step_result.json` の `executor_agent_run_id` が当該ディレクトリ名と一致し、`substep_agent_run_ids` が親子関係と整合する。標準 `substep` を持たない phase では `substep_agent_run_ids=[]` を許可する。
-- `substep` を持つ `step` では、`agent_runs.jsonl` に記録された当該 `step` の全 `substep` の `agent_run_id` が、いずれかの `step_result.json` の `substep_agent_run_ids` に含まれる。欠落時は `tools/codex_orchestration_runtime.py` の orchestration 完了検査で `fail` となる。
+- `substep` を持つ `step` では、`agent_runs.jsonl` に記録された当該 `step` の全 `substep` の `agent_run_id` が、いずれかの `step_result.json` の `substep_agent_run_ids` に含まれる。欠落時は `tools/orchestration_runtime.py` の orchestration 完了検査で `fail` となる。
 - `step_result.json` の `required_outputs` が `docs/workflow/WORKFLOW_CORE.md` および対応する `docs/workflow/phases/phase_*.md` の phase contract と一致する。
 - `step_result.json` が `retry_decisions` を保持する場合、`repair_target_agent_run_id` と `new_agent_run_id` の置換関係から `effective pass substep` 集合を一意に復元できる。
 - `step_result.json` が `status=pass` の場合、各 `retry_decisions.new_agent_run_id` は `effective pass substep` 集合へ残る最終採用 `pass` run であり、後続 retry で再置換される中間 run を含んでいない。

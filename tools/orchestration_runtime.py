@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Helpers for Codex workflow orchestration artifacts."""
+"""Helpers for workflow orchestration artifacts."""
 
 from __future__ import annotations
 

@@ -925,7 +925,7 @@ class ClaudeHookCliTests(unittest.TestCase):
                 "repo_root": str(repo_root_path),
                 "tool_name": "Bash",
                 "tool_input": {
-                    "command": "python3 tools/codex_orchestration_runtime.py run-gate --gate orchestration_read"
+                    "command": "python3 tools/orchestration_runtime.py run-gate --gate orchestration_read"
                 },
             }
             with patch.dict(

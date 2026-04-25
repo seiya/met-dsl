@@ -15,7 +15,7 @@ from unittest.mock import patch
 
 from mcp_servers.build_runtime_server import tool_compile_project
 
-from tools.codex_orchestration_runtime import (
+from tools.orchestration_runtime import (
     TERMINAL_STATUSES,
     _pre_phase_complete_judge_checks,
     _required_child_agent_kind,
@@ -134,8 +134,8 @@ repair_reason: none
 - この step は標準 substep を持たない phase である。自身で step 契約を完了させること。
 - 起動直後に `skill_ref` を読み、`skill_must_read_refs` と矛盾しない契約で実行すること。
 - 要求定義と判定規則は `docs/` と `spec/` と `skill_must_read_refs` に含まれる当該試行 artifact だけから解釈すること。`tools/` 配下の実装、検証 `script`、test code、validator code から rule を抽出してはならない。
-- `orchestration-read` は `python3 tools/codex_orchestration_runtime.py run-gate --gate orchestration_read --agent-run-id <agent_run_id> --capability-token <capability_token> --args-json '{{"read_path":"..."}}'` を唯一の経路として実行し、`orchestration-read` 直呼びを禁止する。
-- `apply_patch` は `python3 tools/codex_orchestration_runtime.py guarded-apply-patch --repo-root <repo_root> --orchestration-id <orchestration_id> --actor-role step --agent-run-id <agent_run_id> --paths-json '["..."]' --patch-text '<patch_text>' --capability-token <capability_token>` を唯一の経路として実行し、拒否時は編集を停止すること。
+- `orchestration-read` は `python3 tools/orchestration_runtime.py run-gate --gate orchestration_read --agent-run-id <agent_run_id> --capability-token <capability_token> --args-json '{{"read_path":"..."}}'` を唯一の経路として実行し、`orchestration-read` 直呼びを禁止する。
+- `apply_patch` は `python3 tools/orchestration_runtime.py guarded-apply-patch --repo-root <repo_root> --orchestration-id <orchestration_id> --actor-role step --agent-run-id <agent_run_id> --paths-json '["..."]' --patch-text '<patch_text>' --capability-token <capability_token>` を唯一の経路として実行し、拒否時は編集を停止すること。
 - 書き込みは `guarded-apply-patch` 経由に限定し、`run-gate --gate apply_patch_writes` と `apply-patch-gate` と shell redirection・直接 `write_text`・任意コマンドによる file write を禁止する。
 - `guarded-apply-patch` は `output_manifests/<agent_run_id>.json` を参照して manifest 外 path を reject する。manifest 外 path へ書いてはならない。
 - `skill_name` と `skill_ref` が未指定の場合は fail で停止すること。
@@ -175,8 +175,8 @@ repair_reason: none
 - expected output と保存先を守ること。
 - 起動直後に `skill_ref` を読み、`skill_must_read_refs` と矛盾しない契約で実行すること。
 - 要求定義と判定規則は `docs/` と `spec/` と `skill_must_read_refs` に含まれる当該試行 artifact だけから解釈すること。`tools/` 配下の実装、検証 `script`、test code、validator code から rule を抽出してはならない。
-- `orchestration-read` は `python3 tools/codex_orchestration_runtime.py run-gate --gate orchestration_read --agent-run-id <agent_run_id> --capability-token <capability_token> --args-json '{{"read_path":"..."}}'` を唯一の経路として実行し、`orchestration-read` 直呼びを禁止する。
-- `apply_patch` は `python3 tools/codex_orchestration_runtime.py guarded-apply-patch --repo-root <repo_root> --orchestration-id <orchestration_id> --actor-role substep --agent-run-id <agent_run_id> --paths-json '["..."]' --patch-text '<patch_text>' --capability-token <capability_token>` を唯一の経路として実行し、拒否時は編集を停止すること。
+- `orchestration-read` は `python3 tools/orchestration_runtime.py run-gate --gate orchestration_read --agent-run-id <agent_run_id> --capability-token <capability_token> --args-json '{{"read_path":"..."}}'` を唯一の経路として実行し、`orchestration-read` 直呼びを禁止する。
+- `apply_patch` は `python3 tools/orchestration_runtime.py guarded-apply-patch --repo-root <repo_root> --orchestration-id <orchestration_id> --actor-role substep --agent-run-id <agent_run_id> --paths-json '["..."]' --patch-text '<patch_text>' --capability-token <capability_token>` を唯一の経路として実行し、拒否時は編集を停止すること。
 - 書き込みは `guarded-apply-patch` 経由に限定し、`run-gate --gate apply_patch_writes` と `apply-patch-gate` と shell redirection・直接 `write_text`・任意コマンドによる file write を禁止する。
 - `guarded-apply-patch` は `output_manifests/<agent_run_id>.json` を参照して manifest 外 path を reject する。manifest 外 path へ書いてはならない。
 - `skill_name` と `skill_ref` が未指定の場合は fail で停止すること。
@@ -455,7 +455,7 @@ shell_tool                       stable             true
             raise AssertionError(args)
 
         with patch.dict(os.environ, {"METDSL_ORCHESTRATION_ASSUME_BWRAP": "0"}):
-            with patch("tools.codex_orchestration_runtime.shutil.which", return_value=None):
+            with patch("tools.orchestration_runtime.shutil.which", return_value=None):
                 result = probe_execution_platform(backend="codex", runner=runner)
         self.assertEqual(result["status"], "fail")
         self.assertFalse(result["can_launch_step_agents"])
@@ -516,7 +516,7 @@ shell_tool                       stable             true
     def test_probe_codex_backend_calls_features_list(self) -> None:
         """_probe_codex_backend が features list コマンドを呼び、multi_agent を検出すること。"""
         import subprocess as _subprocess
-        from tools.codex_orchestration_runtime import _probe_codex_backend
+        from tools.orchestration_runtime import _probe_codex_backend
         calls: list[list[str]] = []
 
         def runner(cmd, **kwargs):  # type: ignore[no-untyped-def]
@@ -558,7 +558,7 @@ shell_tool                       stable             true
 
     def test_all_strict_boolean_probe_checks_pass_skips_none_pass(self) -> None:
         """`pass: None` の check は未実行扱いとし、それ以外がすべて True なら合格とする。"""
-        from tools.codex_orchestration_runtime import _all_strict_boolean_probe_checks_pass
+        from tools.orchestration_runtime import _all_strict_boolean_probe_checks_pass
 
         checks_ok = [
             {"name": "codex_version_available", "pass": True},
@@ -577,7 +577,7 @@ shell_tool                       stable             true
         self.assertFalse(_all_strict_boolean_probe_checks_pass(checks_bad))
 
     def test_all_strict_boolean_probe_checks_pass_requires_pass_key(self) -> None:
-        from tools.codex_orchestration_runtime import _all_strict_boolean_probe_checks_pass
+        from tools.orchestration_runtime import _all_strict_boolean_probe_checks_pass
 
         self.assertFalse(
             _all_strict_boolean_probe_checks_pass([{"name": "x"}])
@@ -585,7 +585,7 @@ shell_tool                       stable             true
 
     def test_probe_help_fallback_uses_help_when_features_list_fails(self) -> None:
         """_probe_help_fallback_backend が features list 失敗時に --help fallback を試みること。"""
-        from tools.codex_orchestration_runtime import _probe_help_fallback_backend
+        from tools.orchestration_runtime import _probe_help_fallback_backend
         calls: list[list[str]] = []
 
         def runner(cmd, **kwargs):  # type: ignore[no-untyped-def]
@@ -610,7 +610,7 @@ shell_tool                       stable             true
 
     def test_probe_help_fallback_skips_help_when_features_list_confirms_multi_agent(self) -> None:
         """features list で multi_agent が分かる場合は --help を走らせず、help プローブは pass=null とする。"""
-        from tools.codex_orchestration_runtime import (
+        from tools.orchestration_runtime import (
             _can_launch_from_help_fallback_checks,
             _probe_help_fallback_backend,
         )
@@ -3373,7 +3373,7 @@ shell_tool                       stable             true
                 },
             )
             os.environ["METDSL_ORCHESTRATION_ENFORCE_LIVE_PREFLIGHT"] = "1"
-            with patch("tools.codex_orchestration_runtime.probe_execution_platform") as probe_mock:
+            with patch("tools.orchestration_runtime.probe_execution_platform") as probe_mock:
                 probe_mock.return_value = {
                     "checked_at": "2026-04-15T12:00:00Z",
                     "status": "pass",
@@ -3436,7 +3436,7 @@ shell_tool                       stable             true
             )
             os.environ["METDSL_ORCHESTRATION_ENFORCE_LIVE_PREFLIGHT"] = "0"
             with patch(
-                "tools.codex_orchestration_runtime.probe_execution_platform",
+                "tools.orchestration_runtime.probe_execution_platform",
                 side_effect=AssertionError("live probe must not run"),
             ):
                 record_agent_run(
@@ -5175,9 +5175,9 @@ class CheckpointResumeRuntimeTests(unittest.TestCase):
             out_path.write_bytes(b"\x00")
             stderr = io.StringIO()
             with patch(
-                "tools.codex_orchestration_runtime.update_checkpoint",
+                "tools.orchestration_runtime.update_checkpoint",
                 side_effect=RuntimeError("boom"),
-            ), patch("tools.codex_orchestration_runtime.sys.stderr", stderr):
+            ), patch("tools.orchestration_runtime.sys.stderr", stderr):
                 write_step_result(
                     repo_root=repo_root,
                     orchestration_id="orch_001",
@@ -5713,7 +5713,7 @@ class PreflightLiveProbeTtlTests(unittest.TestCase):
             }
             with patch.dict(os.environ, env):
                 with patch(
-                    "tools.codex_orchestration_runtime.probe_execution_platform",
+                    "tools.orchestration_runtime.probe_execution_platform",
                     side_effect=AssertionError("probe must not run"),
                 ):
                     _require_preflight_launchable(repo, "o1", enforce_live_probe=True)
@@ -5735,7 +5735,7 @@ class PreflightLiveProbeTtlTests(unittest.TestCase):
                 "METDSL_PREFLIGHT_TTL_SECONDS": "1800",
             }
             with patch.dict(os.environ, env):
-                with patch("tools.codex_orchestration_runtime.probe_execution_platform") as probe_mock:
+                with patch("tools.orchestration_runtime.probe_execution_platform") as probe_mock:
                     probe_mock.return_value = _launchable_preflight_dict(
                         checked_at="2026-04-15T11:00:00Z",
                     )
@@ -5755,7 +5755,7 @@ class PreflightLiveProbeTtlTests(unittest.TestCase):
                 "METDSL_PREFLIGHT_TTL_SECONDS": "1800",
             }
             with patch.dict(os.environ, env):
-                with patch("tools.codex_orchestration_runtime.probe_execution_platform") as probe_mock:
+                with patch("tools.orchestration_runtime.probe_execution_platform") as probe_mock:
                     probe_mock.return_value = _launchable_preflight_dict(
                         checked_at="2026-04-15T11:00:00Z",
                     )
@@ -5775,7 +5775,7 @@ class PreflightLiveProbeTtlTests(unittest.TestCase):
                 ),
             )
             with patch.dict(os.environ, {"METDSL_ORCHESTRATION_ENFORCE_LIVE_PREFLIGHT": "1"}):
-                with patch("tools.codex_orchestration_runtime.probe_execution_platform") as probe_mock:
+                with patch("tools.orchestration_runtime.probe_execution_platform") as probe_mock:
                     probe_mock.return_value = _launchable_preflight_dict(
                         checked_at="2026-04-15T11:00:00Z",
                     )
@@ -5795,7 +5795,7 @@ class PreflightLiveProbeTtlTests(unittest.TestCase):
             )
             with patch.dict(os.environ, {"METDSL_ORCHESTRATION_ENFORCE_LIVE_PREFLIGHT": "0"}):
                 with patch(
-                    "tools.codex_orchestration_runtime.probe_execution_platform",
+                    "tools.orchestration_runtime.probe_execution_platform",
                     side_effect=AssertionError("probe must not run"),
                 ):
                     _require_preflight_launchable(repo, "o1", enforce_live_probe=True)
@@ -5817,7 +5817,7 @@ class PreflightLiveProbeTtlTests(unittest.TestCase):
                 "METDSL_PREFLIGHT_TTL_SECONDS": "1800",
             }
             with patch.dict(os.environ, env):
-                with patch("tools.codex_orchestration_runtime.probe_execution_platform") as probe_mock:
+                with patch("tools.orchestration_runtime.probe_execution_platform") as probe_mock:
                     probe_mock.return_value = _launchable_preflight_dict(checked_at=new_checked)
                     _require_preflight_launchable(repo, "o1", enforce_live_probe=True)
             raw = json.loads(
@@ -5843,12 +5843,12 @@ class PreflightLiveProbeTtlTests(unittest.TestCase):
                 "METDSL_PREFLIGHT_TTL_SECONDS": "1800",
             }
             with patch.dict(os.environ, env):
-                with patch("tools.codex_orchestration_runtime.probe_execution_platform") as probe_mock:
+                with patch("tools.orchestration_runtime.probe_execution_platform") as probe_mock:
                     probe_ret = _launchable_preflight_dict()
                     self.assertNotIn("checked_at", probe_ret)
                     probe_mock.return_value = probe_ret
                     with patch(
-                        "tools.codex_orchestration_runtime._utc_now_iso",
+                        "tools.orchestration_runtime._utc_now_iso",
                         return_value=fallback,
                     ):
                         _require_preflight_launchable(repo, "o1", enforce_live_probe=True)
@@ -5873,7 +5873,7 @@ class PreflightLiveProbeTtlTests(unittest.TestCase):
                 "METDSL_PREFLIGHT_TTL_SECONDS": "0",
             }
             with patch.dict(os.environ, env):
-                with patch("tools.codex_orchestration_runtime.probe_execution_platform") as probe_mock:
+                with patch("tools.orchestration_runtime.probe_execution_platform") as probe_mock:
                     probe_mock.return_value = _launchable_preflight_dict(
                         checked_at="2026-04-15T11:00:00Z",
                     )
@@ -5910,7 +5910,7 @@ class PreflightLiveProbeTtlTests(unittest.TestCase):
                 "METDSL_PREFLIGHT_TTL_SECONDS": "1800",
             }
             with patch.dict(os.environ, env):
-                with patch("tools.codex_orchestration_runtime.probe_execution_platform") as probe_mock:
+                with patch("tools.orchestration_runtime.probe_execution_platform") as probe_mock:
                     probe_mock.return_value = dict(probe_ret)
                     record_launch(
                         repo_root=repo,
@@ -5998,7 +5998,7 @@ class PreflightLiveProbeTtlTests(unittest.TestCase):
                 "METDSL_PREFLIGHT_TTL_SECONDS": "1800",
             }
             with patch.dict(os.environ, env):
-                with patch("tools.codex_orchestration_runtime.probe_execution_platform") as probe_mock:
+                with patch("tools.orchestration_runtime.probe_execution_platform") as probe_mock:
                     probe_mock.return_value = _launchable_preflight_dict(
                         checked_at=_iso_utc_z(datetime.now(timezone.utc) - timedelta(seconds=30)),
                     )
@@ -7036,7 +7036,7 @@ class TestPhase2PlanGuardsIntegration(unittest.TestCase):
                 def validate_mcp_build_tool_invocation(*args: Any, **kwargs: Any) -> None:
                     raise RuntimeError("record-launch is required before MCP build tool invocation")
 
-            with patch("mcp_servers.build_runtime_server._load_codex_orchestration_runtime") as load_mock:
+            with patch("mcp_servers.build_runtime_server._load_orchestration_runtime") as load_mock:
                 load_mock.return_value = _FakeRuntime()
                 with self.assertRaises(RuntimeError) as ctx:
                     tool_compile_project(
@@ -7440,7 +7440,7 @@ class TestPhase3RunGate(unittest.TestCase):
                     "",
                 ]
             )
-            with patch("tools.codex_orchestration_runtime.subprocess.run") as run_mock:
+            with patch("tools.orchestration_runtime.subprocess.run") as run_mock:
                 run_mock.return_value = _FakeCompletedProcess(returncode=0, stdout="", stderr="")
                 out = guarded_apply_patch(
                     repo_root,
@@ -7473,7 +7473,7 @@ class TestPhase3RunGate(unittest.TestCase):
                     "",
                 ]
             )
-            with patch("tools.codex_orchestration_runtime.subprocess.run") as run_mock:
+            with patch("tools.orchestration_runtime.subprocess.run") as run_mock:
                 with self.assertRaisesRegex(RuntimeError, "not covered by changed_paths"):
                     guarded_apply_patch(
                         repo_root,
@@ -7500,7 +7500,7 @@ class TestPhase3RunGate(unittest.TestCase):
                     "",
                 ]
             )
-            with patch("tools.codex_orchestration_runtime.subprocess.run") as run_mock:
+            with patch("tools.orchestration_runtime.subprocess.run") as run_mock:
                 with self.assertRaisesRegex(ValueError, "allowed_output_paths manifest violation"):
                     guarded_apply_patch(
                         repo_root,
@@ -7528,11 +7528,11 @@ class TestPhase3RunGate(unittest.TestCase):
             )
             with (
                 patch(
-                    "tools.codex_orchestration_runtime._validate_paths_against_allowed_output_manifest"
+                    "tools.orchestration_runtime._validate_paths_against_allowed_output_manifest"
                 ) as manifest_mock,
-                patch("tools.codex_orchestration_runtime.gate_apply_patch_writes") as gate_mock,
-                patch("tools.codex_orchestration_runtime._write_apply_patch_gate_evidence") as evidence_mock,
-                patch("tools.codex_orchestration_runtime.subprocess.run") as run_mock,
+                patch("tools.orchestration_runtime.gate_apply_patch_writes") as gate_mock,
+                patch("tools.orchestration_runtime._write_apply_patch_gate_evidence") as evidence_mock,
+                patch("tools.orchestration_runtime.subprocess.run") as run_mock,
             ):
                 gate_mock.return_value = {"allowed": True, "checked_paths": [f"{_FIX_PIPE_REF}/build/"]}
                 evidence_mock.return_value = "workspace/orchestrations/rg1/gates/build_child_rg1/apply_patch_writes.json"

@@ -25,17 +25,17 @@ SERVER_NAME = "build-runtime-server"
 
 
 @lru_cache(maxsize=1)
-def _load_codex_orchestration_runtime() -> Any:
-    """Load `tools/codex_orchestration_runtime.py` without requiring `tools` as a package."""
+def _load_orchestration_runtime() -> Any:
+    """Load `tools/orchestration_runtime.py` without requiring `tools` as a package."""
     root = Path(__file__).resolve().parent.parent
-    path = root / "tools" / "codex_orchestration_runtime.py"
+    path = root / "tools" / "orchestration_runtime.py"
     pycache_root = (root / "workspace" / ".pycache").resolve()
     pycache_root.mkdir(parents=True, exist_ok=True)
     os.environ.setdefault("PYTHONDONTWRITEBYTECODE", "1")
     os.environ["PYTHONPYCACHEPREFIX"] = str(pycache_root)
     import importlib.util
 
-    spec = importlib.util.spec_from_file_location("codex_orchestration_runtime", path)
+    spec = importlib.util.spec_from_file_location("orchestration_runtime", path)
     if spec is None or spec.loader is None:
         raise RuntimeError(f"cannot load orchestration runtime from {path}")
     module = importlib.util.module_from_spec(spec)
@@ -62,7 +62,7 @@ def _maybe_enforce_orchestration_mcp_gate(
         raise ValueError(f"{tool_name} requires capability_token when orchestration_id is set")
     rr_raw = args.get("repo_root")
     repo_root = Path(str(rr_raw if rr_raw is not None else project_dir)).resolve()
-    rt = _load_codex_orchestration_runtime()
+    rt = _load_orchestration_runtime()
     rt.validate_mcp_build_tool_invocation(
         repo_root,
         orchestration_id=orch_id,

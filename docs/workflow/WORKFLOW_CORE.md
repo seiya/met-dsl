@@ -44,7 +44,7 @@ terms は `GLOSSARY.md` を参照する。
 3. `verdict.json` と `aggregate_verdict.json` は `tests.md` と同一 `execution_id` の実行 artifact から導出しなければならない。
 4. phase inputが不足する場合は当該 phase を `fail` で停止し、推測補完を禁止する。
 5. phase 失敗時に下流 phase 開始条件を満たす目的で artifact ファイルを人工生成してはならない。
-6. 明示的な指定がない場合、既存 workflow 出力（過去 `plan_id` / `pipeline_id` / `generation_id` / `build_id` / `execution_id`）の内容参照を禁止する。`orchestration_meta.json` に `resume_enabled=true` が記録されている orchestration では、`orchestration_checkpoint.json` に記録された完了済みステップの artifact 参照を許可する。このとき参照前に `python3 tools/codex_orchestration_runtime.py verify-checkpoint-integrity` による整合性確認を必須とする。
+6. 明示的な指定がない場合、既存 workflow 出力（過去 `plan_id` / `pipeline_id` / `generation_id` / `build_id` / `execution_id`）の内容参照を禁止する。`orchestration_meta.json` に `resume_enabled=true` が記録されている orchestration では、`orchestration_checkpoint.json` に記録された完了済みステップの artifact 参照を許可する。このとき参照前に `python3 tools/orchestration_runtime.py verify-checkpoint-integrity` による整合性確認を必須とする。
 7. `workspace/` 配下に過去 artifact が存在する場合も、中身の閲覧と入力参照を禁止する。
 8. `spec_kind` を問わない workflow 実行は、リポジトリ管理下の `spec` canonical source と当該試行で生成した前段 artifact のみを入力として使用する。
 9. `docs/` と `spec/` と当該試行 artifact に定義されていない要求、判定規則、入出力契約を、`tools/` 配下の実装、検証 `script`、test code、validator code から抽出して補完してはならない。これらの実装は execution mechanism または gate implementation であり、要求定義の canonical source ではない。
@@ -66,7 +66,7 @@ terms は `GLOSSARY.md` を参照する。
 25. `workflow` の階層実行契約、`preflight`、`agent_runs.jsonl`、`agent_graph.json`、`step_result.json` の要件は `ORCHESTRATION.md` を canonical source として適用しなければならない。
 26. workflow 起動は `python3 tools/run_workflow.py <spec_ref> <until_phase> [--llm <codex|cursor|claude>]` を canonical entrypoint とし、手動 `init` / 手動 `preflight` を通常経路として使用してはならない。
 26. `preflight` が `fail` の場合、`orchestration agent` は子 `agent` を起動してはならない。`workflow` は `fail` で停止しなければならない。
-27. `preflight.json` を手動編集または後編集して `pass` 化してはならない。`preflight` canonical source は `tools/codex_orchestration_runtime.py preflight --backend <backend>` の execution result とする。`backend` 未指定時は既定値 `codex` とする。
+27. `preflight.json` を手動編集または後編集して `pass` 化してはならない。`preflight` canonical source は `tools/orchestration_runtime.py preflight --backend <backend>` の execution result とする。`backend` 未指定時は既定値 `codex` とする。
 28. 子 `agent` 起動直前に execution platform の live 検査を再実行し、`multi_agent=true` と子 `agent` 起動可否の充足を確認しなければならない。未充足時は即時 `fail` とする。
 29. child `agent` 必須 phase では、execution platform または session policy のいずれかが required child `agent` を許可しない場合、当該試行を `fail_closed` とし、親 `agent` によるローカル継続実装を禁止しなければならない。
 30. `workspace/plans/` と `workspace/pipelines/` の phase artifact は、正規 child `agent` capability 以外で生成してはならない。`orchestration agent` は reservation artifact のみを生成できる。
@@ -309,7 +309,7 @@ phase ごとの契約詳細は [phases/](phases/) 配下のファイルを canon
 
 ## エージェント参照範囲
 
-- 子 `step agent` / `substep agent` の `skill_must_read_refs` は `tools/codex_orchestration_runtime.py` の `build_skill_must_read_refs` で組み立てられる。
+- 子 `step agent` / `substep agent` の `skill_must_read_refs` は `tools/orchestration_runtime.py` の `build_skill_must_read_refs` で組み立てられる。
 - 既定では `docs/workflow/WORKFLOW_CORE.md` と `docs/ORCHESTRATION.md` と対象 phase の `docs/workflow/phases/phase_*.md` と `skill_ref` と verify 必須 artifact を含む。`docs/WORKFLOW.md` は仕様への入口である。
 
 ## 完了判定基準

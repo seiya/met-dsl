@@ -66,7 +66,7 @@ def _new_orchestration_id() -> str:
 
 
 def _runtime_command(repo_root: Path, env: dict[str, str], args: list[str]) -> RuntimeResult:
-    command = ["python3", "tools/codex_orchestration_runtime.py", *args]
+    command = ["python3", "tools/orchestration_runtime.py", *args]
     completed = subprocess.run(
         command,
         cwd=repo_root,

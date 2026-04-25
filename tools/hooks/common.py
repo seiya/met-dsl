@@ -18,7 +18,7 @@ READ_HINT = (
 )
 
 WRITE_HINT = (
-    "Hint: Write only via 'guarded-apply-patch' (tools/codex_orchestration_runtime.py) "
+    "Hint: Write only via 'guarded-apply-patch' (tools/orchestration_runtime.py) "
     "and only within output_manifests/<agent_run_id>.json write_roots."
 )
 

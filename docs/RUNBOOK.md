@@ -38,7 +38,7 @@
 - `Generate verify` のデータ依存判定は `derived_contract.json` の `semantic_dependency.required_sources` を canonical source とし、特定計算様式の一律必須化を禁止する。
 - `Generate verify` の output contract 判定は `derived_contract.json` の `io_contract.outputs` を canonical source とし、`evidence_ref` と `shape_expr` の整合を必須検査する。
 - 出力形式、input/output contract、判定条件の要求定義は `controlled_spec.md` と `tests.md` と `deps.yaml` と `algorithm.resolved.yaml` と `derived_contract.json` と `docs/` canonical source から取得し、`tools/` 配下の検証 `python` スクリプトと `quality check` 実装を要求定義入力へ使用してはならない。
-- 機械的合否を確定する手順の canonical implementation は、当節および `docs/workflow/WORKFLOW_CORE.md` で列挙する `validate_pipeline_semantics.py` 相当 invocation を `python3 tools/codex_orchestration_runtime.py run-gate --gate validate_pipeline_semantics --agent-run-id <agent_run_id> --capability-token <capability_token> --args-json '<json>'` 経由で実行する手順とする。エージェントは当該 `run-gate` 実行を `exit code 0` まで完了しなければならない。検証スクリプトの実装を読み替えて要求定義を補完してはならない。
+- 機械的合否を確定する手順の canonical implementation は、当節および `docs/workflow/WORKFLOW_CORE.md` で列挙する `validate_pipeline_semantics.py` 相当 invocation を `python3 tools/orchestration_runtime.py run-gate --gate validate_pipeline_semantics --agent-run-id <agent_run_id> --capability-token <capability_token> --args-json '<json>'` 経由で実行する手順とする。エージェントは当該 `run-gate` 実行を `exit code 0` まで完了しなければならない。検証スクリプトの実装を読み替えて要求定義を補完してはならない。
 - 要求定義の不足を検証実装から逆算補完してはならない。不足時は当該ステージを `fail` とする。
 - `Judge` は固定スクリプト検査に加えて `LLM` 意味検査を必須実行し、`semantic_review.json` の `decision=pass` を開始条件に含める。
 - `Judge` 開始前に、対象 `node_key` の同一 `execution_id` 配下へ `run_program` 実行記録と `diagnostics.json` と `perf.json` と `raw` 実行証跡が揃っていることを検証する。未達時は `Judge fail` とする。
@@ -67,7 +67,7 @@
 - `backend=codex` の preflight は、`checks.codex_hooks_enabled.pass=true` と `checks.codex_home_writable.pass=true` を同時に満たさなければならない。いずれかが未充足の場合は開始してはならない。
 - `preflight` は `sandbox_runtime=bwrap` と `sandbox_enforced=true` を必須条件に含める。`checks.sandbox_bwrap_available.pass=true` と `checks.sandbox_bwrap_userns.pass=true` を満たさない場合は開始してはならない。
 - workflow 起動は `python3 tools/run_workflow.py <spec_ref> <until_phase> [--llm <codex|cursor|claude>]` を canonical entrypoint とし、手動 `init` / 手動 `preflight` を通常経路として使用してはならない。
-- `tools/codex_orchestration_runtime.py` を使用する execution platform では、`preflight.json` と `launches/` と `agent_runs.jsonl` と `step_result.json` の保存を同 runtime の canonical source 実装で行う。
+- `tools/orchestration_runtime.py` を使用する execution platform では、`preflight.json` と `launches/` と `agent_runs.jsonl` と `step_result.json` の保存を同 runtime の canonical source 実装で行う。
 - `preflight` は `tools/run_workflow.py` 実行の一部として生成しなければならない。`backend` は `--llm` 引数で指定する。
 - 標準 `substep` を持たない各 `step` は `step agent` を独立起動して実行する。
 - `substep` を持つ各 phase は `orchestration agent` が各 `substep` の `substep agent` を独立起動して実行する。
@@ -83,7 +83,7 @@
 - `orchestration` の実行記録は `workspace/orchestrations/<orchestration_id>/` に保存し、`orchestration_meta.json` と `agent_graph.json` と `agent_runs.jsonl` を必須とする。
 - `step_result.json` は `workspace/orchestrations/<orchestration_id>/steps/<node_key_safe>/<step>/<agent_run_id>/` に保存する。
 - `step_result.json` は `executor_agent_run_id` と `substep_agent_run_ids` を必須記録し、`executor_agent_run_id` は保存先 `agent_run_id` と一致させる。`substep` を持たない phase の `substep_agent_run_ids` は空配列を許可する。
-- `substep` を持つ phase の `step_result.json` では、`substep_agent_run_ids` に当該 `step` で起動し `agent_runs.jsonl` に記録された **全** `substep` の `agent_run_id` を欠落なく含めなければならない。`status` が `pass` 以外の `substep`（`fail` / `cancel` 等）であっても省略してはならない。`tools/codex_orchestration_runtime.py` の orchestration 完了検査は、この網羅性と終端 `status` を別条件として扱う。
+- `substep` を持つ phase の `step_result.json` では、`substep_agent_run_ids` に当該 `step` で起動し `agent_runs.jsonl` に記録された **全** `substep` の `agent_run_id` を欠落なく含めなければならない。`status` が `pass` 以外の `substep`（`fail` / `cancel` 等）であっても省略してはならない。`tools/orchestration_runtime.py` の orchestration 完了検査は、この網羅性と終端 `status` を別条件として扱う。
 - `retry_decisions` を保持する `step_result.json` では、`repair_target_agent_run_id -> new_agent_run_id` の置換関係から `effective pass substep` 集合を一意に復元できなければならない。旧 failed run は retry 履歴として `substep_agent_run_ids` に残してよいが、最終採用集合からは除外する。`status=pass` の `step_result.json` では、各 `new_agent_run_id` は `effective pass substep` 集合へ残る最終採用 `pass` run に限る。後続 retry で再置換される連鎖 retry の中間 run を `retry_decisions` に残してはならない。
 - `Plan` / `Generate` / `Tune` の完了判定は `step_result.json` を canonical source とし、`launches/*.reply.txt` の文言のみで `pass` を確定してはならない。
 - `substep` を持つ phase で `status=pass` を記録する場合、pass 判定対象は `substep_agent_run_ids` 全件ではなく `effective pass substep` 集合とする。`effective pass substep` 集合の各 run は `pass` で終端していなければならない。
