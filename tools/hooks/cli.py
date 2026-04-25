@@ -112,10 +112,8 @@ def _append_hook_audit(
 
 
 def _resolve_repo_root(payload: dict[str, Any], backend: str = "") -> Path:
-    env_key = (
-        "CLAUDE_HOOK_REPO_ROOT" if backend.strip().lower() == "claude" else "CODEX_HOOK_REPO_ROOT"
-    )
-    env_repo_root = os.environ.get(env_key, "").strip()
+    del backend
+    env_repo_root = os.environ.get("METDSL_HOOK_REPO_ROOT", "").strip()
     if env_repo_root:
         return Path(env_repo_root).resolve()
     repo_root_raw = payload.get("repo_root")
@@ -205,7 +203,7 @@ def _is_recent_iso_timestamp(ts: str, ttl_seconds: int) -> bool:
 
 
 def _safe_retry_ttl_seconds() -> int:
-    raw = os.environ.get("CODEX_HOOK_FEATURE_RETRY_TTL_SECONDS", "30").strip()
+    raw = os.environ.get("METDSL_HOOK_FEATURE_RETRY_TTL_SECONDS", "30").strip()
     try:
         ttl = int(raw or "30")
     except ValueError:
@@ -240,17 +238,6 @@ def _extract_command_for_policy(payload: dict[str, Any]) -> str | None:
             if isinstance(inner, str) and inner.strip():
                 return inner.strip()
     return None
-
-
-def _is_workflow_context(event_name: HookEventName, payload: dict[str, Any]) -> bool:
-    del payload
-    if event_name in {
-        HookEventName.SESSION_START,
-        HookEventName.USER_PROMPT_SUBMIT,
-        HookEventName.STOP,
-    }:
-        return False
-    return _env_flag_true("METDSL_WORKFLOW_MODE", "0")
 
 
 def _extract_orchestration_id(payload: dict[str, Any]) -> str | None:
@@ -316,19 +303,12 @@ def main(argv: list[str] | None = None) -> int:
         orchestration_id = _extract_orchestration_id(payload)
         repo_root = _resolve_repo_root(payload, backend=args.backend)
         missing_id_policy = os.environ.get(
-            "CODEX_HOOK_MISSING_ORCHESTRATION_ID_POLICY", "global"
+            "METDSL_MISSING_ORCHESTRATION_ID_POLICY", ""
         ).strip().lower()
-        workflow_context = _is_workflow_context(event_name, payload)
         if orchestration_id is None:
-            if event_name in {
-                HookEventName.SESSION_START,
-                HookEventName.USER_PROMPT_SUBMIT,
-                HookEventName.STOP,
-            }:
-                orchestration_id = "_global"
-            elif workflow_context:
+            if missing_id_policy == "strict":
                 decision = _decision_error(
-                    "orchestration_id is required for workflow hook execution"
+                    "orchestration_id is required for hook execution"
                 )
                 _append_hook_audit(
                     backend=args.backend,
@@ -339,24 +319,11 @@ def main(argv: list[str] | None = None) -> int:
                 )
                 exit_code, stdout_text = adapter.encode_decision(decision)
                 return _emit_hook_response(exit_code, stdout_text, event_name=event_name)
-            elif missing_id_policy == "global":
-                orchestration_id = "_global"
             else:
-                decision = _decision_error(
-                    "orchestration_id is required for native hook execution"
-                )
-                _append_hook_audit(
-                    backend=args.backend,
-                    event_name=event_name,
-                    payload=payload,
-                    decision=decision,
-                    orchestration_id_override="_global",
-                )
-                exit_code, stdout_text = adapter.encode_decision(decision)
-                return _emit_hook_response(exit_code, stdout_text, event_name=event_name)
+                orchestration_id = "_global"
 
         if args.backend == "codex":
-            require_flag = os.environ.get("CODEX_REQUIRE_CODEX_HOOKS_FEATURE", "1").strip().lower()
+            require_flag = os.environ.get("METDSL_REQUIRE_CODEX_HOOKS_FEATURE", "1").strip().lower()
             if require_flag not in {"0", "false", "no"}:
                 cached = _read_codex_feature_cache(
                     repo_root=repo_root,

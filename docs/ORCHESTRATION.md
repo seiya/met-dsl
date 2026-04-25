@@ -147,17 +147,17 @@
 33. 再投入時は新規 `agent_run_id` を発行し、既存 `launch` 証跡や `agent_runs` 行を上書きしてはならない。`agent_session_id` の扱いは `repair_strategy` 規則に従う。
 34. `preflight.json` の手動編集または後編集で `status` と `can_launch_*` を変更してはならない。変更が必要な場合は `preflight` を再実行して新しい検査結果を記録しなければならない。
 35. 子 `agent` 起動直前の live probe が `fail` の場合、`record-launch` を実行してはならない。`orchestration_meta.status=fail` を記録して停止しなければならない。`record-agent-run`（`step` / `substep`）と `write-step-result` は `preflight.json` の整合確認を満たす場合のみ実行してよい。
-36. `record-launch` が実行する live probe は、`CODEX_PREFLIGHT_TTL_SECONDS` で設定した TTL（デフォルト 30 分）以内に成功済みのプローブが存在する場合はスキップされる。この最適化は `CODEX_ORCHESTRATION_ENFORCE_LIVE_PREFLIGHT=1` が明示設定されている場合は無効化され、常に live probe が実行される（後方互換）。
+36. `record-launch` が実行する live probe は、`METDSL_PREFLIGHT_TTL_SECONDS` で設定した TTL（デフォルト 30 分）以内に成功済みのプローブが存在する場合はスキップされる。この最適化は `METDSL_ORCHESTRATION_ENFORCE_LIVE_PREFLIGHT=1` が明示設定されている場合は無効化され、常に live probe が実行される（後方互換）。
 37. `preflight.json` の `probed_at` フィールドは live probe 成功時に自動更新される。`status` / `can_launch_*` を含むその他フィールドの変更は引き続き禁止する。
 38. native hook の実行結果は `workspace/orchestrations/<orchestration_id>/hooks/native_hook_events.jsonl` へ追記し、`backend` と `event` と `action` と `reason` を追跡可能にしなければならない。
-39. native hook 実行 payload に `orchestration_id` が存在しない場合、既定動作は `error` として当該 hook を失敗させなければならない。`SessionStart` と `UserPromptSubmit` は例外として `workspace/orchestrations/_global/hooks/native_hook_events.jsonl` への記録を既定許可してよい。その他の event で `global` 記録を許可する場合は `CODEX_HOOK_MISSING_ORCHESTRATION_ID_POLICY=global` を明示しなければならない。
+39. native hook 実行 payload に `orchestration_id` が存在しない場合の動作は `METDSL_MISSING_ORCHESTRATION_ID_POLICY` で制御する。`strict` の場合はすべての hook event でエラーとして失敗させなければならない。未設定（既定）の場合は `workspace/orchestrations/_global/hooks/native_hook_events.jsonl` へのフォールバック記録を許可する。`tools/run_workflow.py` はワークフロー起動時に `METDSL_MISSING_ORCHESTRATION_ID_POLICY=strict` を設定し、orchestration_id なしの hook 実行を禁止しなければならない。
 40. 子 `agent` 必須 phase で契約に反する近道へ逸脱しそうな場合、`orchestration agent` は当該 phase が子 `agent` 起動必須であることを明示し、正規の起動手順へ復帰しなければならない。逸脱を理由とするローカル継続実装を禁止する。
 41. `write-step-result` が `status=pass` で完了した後、`orchestration_checkpoint.json` が `tools/codex_orchestration_runtime.py` により自動更新される。`orchestration_checkpoint.json` の手動編集を禁止する。
 42. `resume_enabled=true` の orchestration において、`orchestration agent` は `check-step-completed` を各 `step` 起動前に実行し、`completed=true` かつ `integrity=ok` の場合のみ当該 `step` のスキップを許可する。
 43. チェックポイントによりスキップした `step` は `agent_runs.jsonl` に `agent_role=skipped_by_checkpoint` として記録しなければならない。
 44. `resume_enabled=false` の orchestration（未設定を含む）では `orchestration_checkpoint.json` を信頼して `step` をスキップしてはならない。`docs/workflow/WORKFLOW_CORE.md` の該当ハードニング規範における「明示的な指定」は `orchestration_meta.json` の `resume_enabled=true` のみが満たす。
 45. `write-step-result` の `status=pass` では、`Generate` / `Build` / `Execute` / `Judge` の `step_result.json` に `validation_stage` を必須記録しなければならない。許容値は `Generate: post_generate|full`、`Build: post_build|full`、`Execute: post_execute|pre_judge|full`、`Judge: pre_judge|full` とする。`Plan` と `Tune` は `validation_stage` を必須にしない。
-46. `codex_feature_check.json` の `status_kind=probe_error`（timeout や command failure）の結果は永続固定してはならない。`CODEX_HOOK_FEATURE_RETRY_TTL_SECONDS`（既定 30 秒）経過後に再プローブを許可しなければならない。
+46. `codex_feature_check.json` の `status_kind=probe_error`（timeout や command failure）の結果は永続固定してはならない。`METDSL_HOOK_FEATURE_RETRY_TTL_SECONDS`（既定 30 秒）経過後に再プローブを許可しなければならない。
 
 ## 判定基準
 - `workflow` ごとに `orchestration_id` が発行され、`orchestration_meta.json` が存在する。

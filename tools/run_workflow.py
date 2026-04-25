@@ -507,6 +507,7 @@ def main(argv: list[str] | None = None) -> int:
     env["METDSL_WORKFLOW_MODE"] = "1"
     env["METDSL_ORCHESTRATION_ID"] = orchestration_id
     env["METDSL_WORKFLOW_EXEC_MODE"] = workflow_mode
+    env["METDSL_MISSING_ORCHESTRATION_ID_POLICY"] = "strict"
     env["PYTHONPATH"] = str(repo_root) + (f":{env['PYTHONPATH']}" if env.get("PYTHONPATH") else "")
 
     init_args = [

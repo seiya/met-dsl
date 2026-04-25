@@ -246,26 +246,26 @@ class _FakeCompletedProcess:
 
 class CodexOrchestrationRuntimeTests(unittest.TestCase):
     def setUp(self) -> None:
-        self._old_live_preflight = os.environ.get("CODEX_ORCHESTRATION_ENFORCE_LIVE_PREFLIGHT")
-        self._old_assume_bwrap = os.environ.get("CODEX_ORCHESTRATION_ASSUME_BWRAP")
-        self._old_codex_home = os.environ.get("CODEX_HOME")
-        os.environ["CODEX_ORCHESTRATION_ENFORCE_LIVE_PREFLIGHT"] = "0"
-        os.environ["CODEX_ORCHESTRATION_ASSUME_BWRAP"] = "1"
-        os.environ["CODEX_HOME"] = "/tmp/codex-orchestration-test-home"
+        self._old_live_preflight = os.environ.get("METDSL_ORCHESTRATION_ENFORCE_LIVE_PREFLIGHT")
+        self._old_assume_bwrap = os.environ.get("METDSL_ORCHESTRATION_ASSUME_BWRAP")
+        self._old_codex_home = os.environ.get("METDSL_HOME")
+        os.environ["METDSL_ORCHESTRATION_ENFORCE_LIVE_PREFLIGHT"] = "0"
+        os.environ["METDSL_ORCHESTRATION_ASSUME_BWRAP"] = "1"
+        os.environ["METDSL_HOME"] = "/tmp/codex-orchestration-test-home"
 
     def tearDown(self) -> None:
         if self._old_live_preflight is None:
-            os.environ.pop("CODEX_ORCHESTRATION_ENFORCE_LIVE_PREFLIGHT", None)
+            os.environ.pop("METDSL_ORCHESTRATION_ENFORCE_LIVE_PREFLIGHT", None)
         else:
-            os.environ["CODEX_ORCHESTRATION_ENFORCE_LIVE_PREFLIGHT"] = self._old_live_preflight
+            os.environ["METDSL_ORCHESTRATION_ENFORCE_LIVE_PREFLIGHT"] = self._old_live_preflight
         if self._old_assume_bwrap is None:
-            os.environ.pop("CODEX_ORCHESTRATION_ASSUME_BWRAP", None)
+            os.environ.pop("METDSL_ORCHESTRATION_ASSUME_BWRAP", None)
         else:
-            os.environ["CODEX_ORCHESTRATION_ASSUME_BWRAP"] = self._old_assume_bwrap
+            os.environ["METDSL_ORCHESTRATION_ASSUME_BWRAP"] = self._old_assume_bwrap
         if self._old_codex_home is None:
-            os.environ.pop("CODEX_HOME", None)
+            os.environ.pop("METDSL_HOME", None)
         else:
-            os.environ["CODEX_HOME"] = self._old_codex_home
+            os.environ["METDSL_HOME"] = self._old_codex_home
 
     def test_terminal_statuses_do_not_include_fail_closed(self) -> None:
         self.assertEqual(TERMINAL_STATUSES, {"pass", "fail", "blocked", "timeout", "cancel"})
@@ -454,7 +454,7 @@ shell_tool                       stable             true
                 )
             raise AssertionError(args)
 
-        with patch.dict(os.environ, {"CODEX_ORCHESTRATION_ASSUME_BWRAP": "0"}):
+        with patch.dict(os.environ, {"METDSL_ORCHESTRATION_ASSUME_BWRAP": "0"}):
             with patch("tools.codex_orchestration_runtime.shutil.which", return_value=None):
                 result = probe_execution_platform(backend="codex", runner=runner)
         self.assertEqual(result["status"], "fail")
@@ -476,8 +476,8 @@ shell_tool                       stable             true
         with patch.dict(
             os.environ,
             {
-                "CODEX_HOME": "/__codex_preflight_missing_parent__/home/.codex",
-                "CODEX_ORCHESTRATION_ASSUME_BWRAP": "1",
+                "METDSL_HOME": "/__codex_preflight_missing_parent__/home/.codex",
+                "METDSL_ORCHESTRATION_ASSUME_BWRAP": "1",
             },
         ):
             result = probe_execution_platform(backend="codex", runner=runner)
@@ -3348,7 +3348,7 @@ shell_tool                       stable             true
                     "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
                 },
             )
-            os.environ["CODEX_ORCHESTRATION_ENFORCE_LIVE_PREFLIGHT"] = "1"
+            os.environ["METDSL_ORCHESTRATION_ENFORCE_LIVE_PREFLIGHT"] = "1"
             with patch("tools.codex_orchestration_runtime.probe_execution_platform") as probe_mock:
                 probe_mock.return_value = {
                     "checked_at": "2026-04-15T12:00:00Z",
@@ -3410,7 +3410,7 @@ shell_tool                       stable             true
                     "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
                 },
             )
-            os.environ["CODEX_ORCHESTRATION_ENFORCE_LIVE_PREFLIGHT"] = "0"
+            os.environ["METDSL_ORCHESTRATION_ENFORCE_LIVE_PREFLIGHT"] = "0"
             with patch(
                 "tools.codex_orchestration_runtime.probe_execution_platform",
                 side_effect=AssertionError("live probe must not run"),
@@ -5430,7 +5430,7 @@ class OrchestrationMetaAndJudgeHookTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp)
             orch = "preflight_only_orch"
-            with patch.dict(os.environ, {"CODEX_ALLOW_PARALLEL_NODES": "1"}):
+            with patch.dict(os.environ, {"METDSL_ALLOW_PARALLEL_NODES": "1"}):
                 write_preflight(
                     repo_root=repo,
                     orchestration_id=orch,
@@ -5446,7 +5446,7 @@ class OrchestrationMetaAndJudgeHookTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp)
             orch = "preflight_then_init"
-            with patch.dict(os.environ, {"CODEX_ALLOW_PARALLEL_NODES": "true"}):
+            with patch.dict(os.environ, {"METDSL_ALLOW_PARALLEL_NODES": "true"}):
                 write_preflight(
                     repo_root=repo,
                     orchestration_id=orch,
@@ -5464,14 +5464,14 @@ class OrchestrationMetaAndJudgeHookTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp)
             orch = "orch_parallel_audit"
-            with patch.dict(os.environ, {"CODEX_ALLOW_PARALLEL_NODES": "1"}):
+            with patch.dict(os.environ, {"METDSL_ALLOW_PARALLEL_NODES": "1"}):
                 out1 = pre_orchestration_start(repo, orch, event="init")
             self.assertTrue(out1["parallel_nodes_explicit"])
             meta_path = repo / "workspace" / "orchestrations" / orch / "orchestration_meta.json"
             meta1 = json.loads(meta_path.read_text(encoding="utf-8"))
             self.assertTrue(meta1.get("parallel_nodes_explicit"))
             with patch.dict(os.environ, {}, clear=False):
-                os.environ.pop("CODEX_ALLOW_PARALLEL_NODES", None)
+                os.environ.pop("METDSL_ALLOW_PARALLEL_NODES", None)
                 out2 = pre_orchestration_start(repo, orch, event="preflight")
             self.assertTrue(out2["parallel_nodes_explicit"])
             meta2 = json.loads(meta_path.read_text(encoding="utf-8"))
@@ -5538,45 +5538,45 @@ class OrchestrationMetaAndJudgeHookTests(unittest.TestCase):
 
 class PreflightLiveProbeTtlTests(unittest.TestCase):
     def test_live_preflight_mode_never_on_zero(self) -> None:
-        with patch.dict(os.environ, {"CODEX_ORCHESTRATION_ENFORCE_LIVE_PREFLIGHT": "0"}):
+        with patch.dict(os.environ, {"METDSL_ORCHESTRATION_ENFORCE_LIVE_PREFLIGHT": "0"}):
             self.assertEqual(_live_preflight_mode(), "never")
 
     def test_live_preflight_mode_never_on_false(self) -> None:
-        with patch.dict(os.environ, {"CODEX_ORCHESTRATION_ENFORCE_LIVE_PREFLIGHT": "false"}):
+        with patch.dict(os.environ, {"METDSL_ORCHESTRATION_ENFORCE_LIVE_PREFLIGHT": "false"}):
             self.assertEqual(_live_preflight_mode(), "never")
 
     def test_live_preflight_mode_always_on_one(self) -> None:
-        with patch.dict(os.environ, {"CODEX_ORCHESTRATION_ENFORCE_LIVE_PREFLIGHT": "1"}):
+        with patch.dict(os.environ, {"METDSL_ORCHESTRATION_ENFORCE_LIVE_PREFLIGHT": "1"}):
             self.assertEqual(_live_preflight_mode(), "always")
 
     def test_live_preflight_mode_ttl_when_unset(self) -> None:
         with patch.dict(os.environ, {}, clear=False):
-            os.environ.pop("CODEX_ORCHESTRATION_ENFORCE_LIVE_PREFLIGHT", None)
+            os.environ.pop("METDSL_ORCHESTRATION_ENFORCE_LIVE_PREFLIGHT", None)
             self.assertEqual(_live_preflight_mode(), "ttl")
 
     def test_live_preflight_mode_ttl_on_unknown_value(self) -> None:
-        with patch.dict(os.environ, {"CODEX_ORCHESTRATION_ENFORCE_LIVE_PREFLIGHT": "auto"}):
+        with patch.dict(os.environ, {"METDSL_ORCHESTRATION_ENFORCE_LIVE_PREFLIGHT": "auto"}):
             self.assertEqual(_live_preflight_mode(), "ttl")
 
     def test_live_preflight_ttl_seconds_default(self) -> None:
         with patch.dict(os.environ, {}, clear=False):
-            os.environ.pop("CODEX_PREFLIGHT_TTL_SECONDS", None)
+            os.environ.pop("METDSL_PREFLIGHT_TTL_SECONDS", None)
             self.assertEqual(_live_preflight_ttl_seconds(), 1800)
 
     def test_live_preflight_ttl_seconds_custom(self) -> None:
-        with patch.dict(os.environ, {"CODEX_PREFLIGHT_TTL_SECONDS": "300"}):
+        with patch.dict(os.environ, {"METDSL_PREFLIGHT_TTL_SECONDS": "300"}):
             self.assertEqual(_live_preflight_ttl_seconds(), 300)
 
     def test_live_preflight_ttl_seconds_zero(self) -> None:
-        with patch.dict(os.environ, {"CODEX_PREFLIGHT_TTL_SECONDS": "0"}):
+        with patch.dict(os.environ, {"METDSL_PREFLIGHT_TTL_SECONDS": "0"}):
             self.assertEqual(_live_preflight_ttl_seconds(), 0)
 
     def test_live_preflight_ttl_seconds_invalid_value(self) -> None:
-        with patch.dict(os.environ, {"CODEX_PREFLIGHT_TTL_SECONDS": "abc"}):
+        with patch.dict(os.environ, {"METDSL_PREFLIGHT_TTL_SECONDS": "abc"}):
             self.assertEqual(_live_preflight_ttl_seconds(), 1800)
 
     def test_live_preflight_ttl_seconds_negative(self) -> None:
-        with patch.dict(os.environ, {"CODEX_PREFLIGHT_TTL_SECONDS": "-1"}):
+        with patch.dict(os.environ, {"METDSL_PREFLIGHT_TTL_SECONDS": "-1"}):
             self.assertEqual(_live_preflight_ttl_seconds(), 0)
 
     def test_is_within_preflight_ttl_true_when_recent(self) -> None:
@@ -5684,8 +5684,8 @@ class PreflightLiveProbeTtlTests(unittest.TestCase):
                 ),
             )
             env = {
-                "CODEX_ORCHESTRATION_ENFORCE_LIVE_PREFLIGHT": "auto",
-                "CODEX_PREFLIGHT_TTL_SECONDS": "1800",
+                "METDSL_ORCHESTRATION_ENFORCE_LIVE_PREFLIGHT": "auto",
+                "METDSL_PREFLIGHT_TTL_SECONDS": "1800",
             }
             with patch.dict(os.environ, env):
                 with patch(
@@ -5707,8 +5707,8 @@ class PreflightLiveProbeTtlTests(unittest.TestCase):
                 ),
             )
             env = {
-                "CODEX_ORCHESTRATION_ENFORCE_LIVE_PREFLIGHT": "auto",
-                "CODEX_PREFLIGHT_TTL_SECONDS": "1800",
+                "METDSL_ORCHESTRATION_ENFORCE_LIVE_PREFLIGHT": "auto",
+                "METDSL_PREFLIGHT_TTL_SECONDS": "1800",
             }
             with patch.dict(os.environ, env):
                 with patch("tools.codex_orchestration_runtime.probe_execution_platform") as probe_mock:
@@ -5727,8 +5727,8 @@ class PreflightLiveProbeTtlTests(unittest.TestCase):
             path.write_text(json.dumps(body, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
             env = {
-                "CODEX_ORCHESTRATION_ENFORCE_LIVE_PREFLIGHT": "auto",
-                "CODEX_PREFLIGHT_TTL_SECONDS": "1800",
+                "METDSL_ORCHESTRATION_ENFORCE_LIVE_PREFLIGHT": "auto",
+                "METDSL_PREFLIGHT_TTL_SECONDS": "1800",
             }
             with patch.dict(os.environ, env):
                 with patch("tools.codex_orchestration_runtime.probe_execution_platform") as probe_mock:
@@ -5750,7 +5750,7 @@ class PreflightLiveProbeTtlTests(unittest.TestCase):
                     probed_at=_iso_utc_z(datetime.now(timezone.utc) - timedelta(seconds=5)),
                 ),
             )
-            with patch.dict(os.environ, {"CODEX_ORCHESTRATION_ENFORCE_LIVE_PREFLIGHT": "1"}):
+            with patch.dict(os.environ, {"METDSL_ORCHESTRATION_ENFORCE_LIVE_PREFLIGHT": "1"}):
                 with patch("tools.codex_orchestration_runtime.probe_execution_platform") as probe_mock:
                     probe_mock.return_value = _launchable_preflight_dict(
                         checked_at="2026-04-15T11:00:00Z",
@@ -5769,7 +5769,7 @@ class PreflightLiveProbeTtlTests(unittest.TestCase):
                     probed_at=_iso_utc_z(datetime.now(timezone.utc) - timedelta(seconds=2000)),
                 ),
             )
-            with patch.dict(os.environ, {"CODEX_ORCHESTRATION_ENFORCE_LIVE_PREFLIGHT": "0"}):
+            with patch.dict(os.environ, {"METDSL_ORCHESTRATION_ENFORCE_LIVE_PREFLIGHT": "0"}):
                 with patch(
                     "tools.codex_orchestration_runtime.probe_execution_platform",
                     side_effect=AssertionError("probe must not run"),
@@ -5789,8 +5789,8 @@ class PreflightLiveProbeTtlTests(unittest.TestCase):
             )
             new_checked = "2026-04-15T15:30:00Z"
             env = {
-                "CODEX_ORCHESTRATION_ENFORCE_LIVE_PREFLIGHT": "auto",
-                "CODEX_PREFLIGHT_TTL_SECONDS": "1800",
+                "METDSL_ORCHESTRATION_ENFORCE_LIVE_PREFLIGHT": "auto",
+                "METDSL_PREFLIGHT_TTL_SECONDS": "1800",
             }
             with patch.dict(os.environ, env):
                 with patch("tools.codex_orchestration_runtime.probe_execution_platform") as probe_mock:
@@ -5815,8 +5815,8 @@ class PreflightLiveProbeTtlTests(unittest.TestCase):
             )
             fallback = "2099-01-01T00:00:00Z"
             env = {
-                "CODEX_ORCHESTRATION_ENFORCE_LIVE_PREFLIGHT": "auto",
-                "CODEX_PREFLIGHT_TTL_SECONDS": "1800",
+                "METDSL_ORCHESTRATION_ENFORCE_LIVE_PREFLIGHT": "auto",
+                "METDSL_PREFLIGHT_TTL_SECONDS": "1800",
             }
             with patch.dict(os.environ, env):
                 with patch("tools.codex_orchestration_runtime.probe_execution_platform") as probe_mock:
@@ -5845,8 +5845,8 @@ class PreflightLiveProbeTtlTests(unittest.TestCase):
                 ),
             )
             env = {
-                "CODEX_ORCHESTRATION_ENFORCE_LIVE_PREFLIGHT": "auto",
-                "CODEX_PREFLIGHT_TTL_SECONDS": "0",
+                "METDSL_ORCHESTRATION_ENFORCE_LIVE_PREFLIGHT": "auto",
+                "METDSL_PREFLIGHT_TTL_SECONDS": "0",
             }
             with patch.dict(os.environ, env):
                 with patch("tools.codex_orchestration_runtime.probe_execution_platform") as probe_mock:
@@ -5882,8 +5882,8 @@ class PreflightLiveProbeTtlTests(unittest.TestCase):
                 checked_at=_iso_utc_z(datetime.now(timezone.utc) - timedelta(seconds=30)),
             )
             env = {
-                "CODEX_ORCHESTRATION_ENFORCE_LIVE_PREFLIGHT": "auto",
-                "CODEX_PREFLIGHT_TTL_SECONDS": "1800",
+                "METDSL_ORCHESTRATION_ENFORCE_LIVE_PREFLIGHT": "auto",
+                "METDSL_PREFLIGHT_TTL_SECONDS": "1800",
             }
             with patch.dict(os.environ, env):
                 with patch("tools.codex_orchestration_runtime.probe_execution_platform") as probe_mock:
@@ -5970,8 +5970,8 @@ class PreflightLiveProbeTtlTests(unittest.TestCase):
                 encoding="utf-8",
             )
             env = {
-                "CODEX_ORCHESTRATION_ENFORCE_LIVE_PREFLIGHT": "auto",
-                "CODEX_PREFLIGHT_TTL_SECONDS": "1800",
+                "METDSL_ORCHESTRATION_ENFORCE_LIVE_PREFLIGHT": "auto",
+                "METDSL_PREFLIGHT_TTL_SECONDS": "1800",
             }
             with patch.dict(os.environ, env):
                 with patch("tools.codex_orchestration_runtime.probe_execution_platform") as probe_mock:
@@ -6054,8 +6054,8 @@ class PreflightLiveProbeTtlTests(unittest.TestCase):
             with patch.dict(
                 os.environ,
                 {
-                    "CODEX_ORCHESTRATION_ENFORCE_LIVE_PREFLIGHT": "auto",
-                    "CODEX_PREFLIGHT_TTL_SECONDS": "1800",
+                    "METDSL_ORCHESTRATION_ENFORCE_LIVE_PREFLIGHT": "auto",
+                    "METDSL_PREFLIGHT_TTL_SECONDS": "1800",
                 },
             ):
                 st = get_preflight_ttl_status(repo, "o1")
@@ -6068,7 +6068,7 @@ class PreflightLiveProbeTtlTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp)
             init_orchestration(repo_root=repo, orchestration_id="o1")
-            with patch.dict(os.environ, {"CODEX_ORCHESTRATION_ENFORCE_LIVE_PREFLIGHT": "auto"}):
+            with patch.dict(os.environ, {"METDSL_ORCHESTRATION_ENFORCE_LIVE_PREFLIGHT": "auto"}):
                 st = get_preflight_ttl_status(repo, "o1")
             self.assertFalse(st["preflight_exists"])
             self.assertFalse(st["probe_skippable"])
@@ -6084,7 +6084,7 @@ class PreflightLiveProbeTtlTests(unittest.TestCase):
                     probed_at=_iso_utc_z(datetime.now(timezone.utc) - timedelta(seconds=5)),
                 ),
             )
-            with patch.dict(os.environ, {"CODEX_ORCHESTRATION_ENFORCE_LIVE_PREFLIGHT": "1"}):
+            with patch.dict(os.environ, {"METDSL_ORCHESTRATION_ENFORCE_LIVE_PREFLIGHT": "1"}):
                 st = get_preflight_ttl_status(repo, "o1")
             self.assertFalse(st["probe_skippable"])
 
@@ -6103,8 +6103,8 @@ class PreflightLiveProbeTtlTests(unittest.TestCase):
             with patch.dict(
                 os.environ,
                 {
-                    "CODEX_ORCHESTRATION_ENFORCE_LIVE_PREFLIGHT": "auto",
-                    "CODEX_PREFLIGHT_TTL_SECONDS": "1800",
+                    "METDSL_ORCHESTRATION_ENFORCE_LIVE_PREFLIGHT": "auto",
+                    "METDSL_PREFLIGHT_TTL_SECONDS": "1800",
                 },
             ):
                 with redirect_stdout(buf):
@@ -6774,7 +6774,7 @@ class TestPhase2PlanGuardsIntegration(unittest.TestCase):
                     )
                 raise AssertionError(args)
 
-            with patch.dict(os.environ, {"CODEX_HOME": "/tmp/codex-orchestration-test-home"}):
+            with patch.dict(os.environ, {"METDSL_HOME": "/tmp/codex-orchestration-test-home"}):
                 preflight_payload = probe_execution_platform(backend="codex", runner=runner)
             preflight_path = repo_root / "workspace/orchestrations/wf3/preflight.json"
             preflight_path.parent.mkdir(parents=True, exist_ok=True)

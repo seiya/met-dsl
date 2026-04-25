@@ -108,7 +108,7 @@ FAIL_CLOSED_REASON_CODES = {
     "parallel_nodes_not_explicitly_allowed",
 }
 
-PARALLEL_NODES_ENV_VAR = "CODEX_ALLOW_PARALLEL_NODES"
+PARALLEL_NODES_ENV_VAR = "METDSL_ALLOW_PARALLEL_NODES"
 
 PHASE_ARTIFACT_GUARDED_PREFIXES: tuple[str, ...] = ("workspace/plans/", "workspace/pipelines/")
 
@@ -2699,14 +2699,14 @@ def _validate_preflight_payload(payload: dict[str, Any]) -> None:
 
 
 def _live_preflight_mode() -> str:
-    """CODEX_ORCHESTRATION_ENFORCE_LIVE_PREFLIGHT の値から動作モードを返す。
+    """METDSL_ORCHESTRATION_ENFORCE_LIVE_PREFLIGHT の値から動作モードを返す。
 
     戻り値: 'never' | 'always' | 'ttl'
     - 'never' : プローブをスキップ
     - 'always': 毎回プローブ（TTL 無視、後方互換）
     - 'ttl'   : TTL キャッシュ付きプローブ（デフォルト）
     """
-    raw = os.environ.get("CODEX_ORCHESTRATION_ENFORCE_LIVE_PREFLIGHT", "").strip().lower()
+    raw = os.environ.get("METDSL_ORCHESTRATION_ENFORCE_LIVE_PREFLIGHT", "").strip().lower()
     if raw in {"0", "false", "no"}:
         return "never"
     if raw == "1":
@@ -2715,11 +2715,11 @@ def _live_preflight_mode() -> str:
 
 
 def _live_preflight_ttl_seconds() -> int:
-    """CODEX_PREFLIGHT_TTL_SECONDS を読み非負整数を返す。
+    """METDSL_PREFLIGHT_TTL_SECONDS を読み非負整数を返す。
 
     未設定または無効値の場合は PREFLIGHT_TTL_DEFAULT_SECONDS を返す。
     """
-    raw = os.environ.get("CODEX_PREFLIGHT_TTL_SECONDS", "").strip()
+    raw = os.environ.get("METDSL_PREFLIGHT_TTL_SECONDS", "").strip()
     if not raw:
         return PREFLIGHT_TTL_DEFAULT_SECONDS
     try:
@@ -4564,8 +4564,8 @@ def _probe_existing_directory_writable(path: Path) -> tuple[bool, str]:
 
 
 def _probe_codex_home_writable() -> dict[str, Any]:
-    raw = os.environ.get("CODEX_HOME")
-    source = "env:CODEX_HOME" if isinstance(raw, str) and raw.strip() else "default:~/.codex"
+    raw = os.environ.get("METDSL_HOME")
+    source = "env:METDSL_HOME" if isinstance(raw, str) and raw.strip() else "default:~/.codex"
     codex_home = (
         Path(raw).expanduser()
         if isinstance(raw, str) and raw.strip()
@@ -4589,7 +4589,7 @@ def _probe_codex_home_writable() -> dict[str, Any]:
 
 def _probe_bwrap_sandbox() -> tuple[list[dict[str, Any]], bool]:
     checks: list[dict[str, Any]] = []
-    assume = os.environ.get("CODEX_ORCHESTRATION_ASSUME_BWRAP", "").strip().lower()
+    assume = os.environ.get("METDSL_ORCHESTRATION_ASSUME_BWRAP", "").strip().lower()
     if assume in {"1", "true", "yes"}:
         checks.extend(
             [
@@ -4848,10 +4848,10 @@ def probe_execution_platform(
     checks.extend(sandbox_checks)
     can_launch_agents = can_launch_agents and sandbox_enforced
     session_policy = {
-        "allow_step_agent_launch": os.environ.get("CODEX_ALLOW_STEP_AGENT_LAUNCH", "1").strip().lower()
+        "allow_step_agent_launch": os.environ.get("METDSL_ALLOW_STEP_AGENT_LAUNCH", "1").strip().lower()
         not in {"0", "false", "no"},
         "allow_substep_agent_launch": os.environ.get(
-            "CODEX_ALLOW_SUBSTEP_AGENT_LAUNCH", "1"
+            "METDSL_ALLOW_SUBSTEP_AGENT_LAUNCH", "1"
         ).strip().lower()
         not in {"0", "false", "no"},
     }

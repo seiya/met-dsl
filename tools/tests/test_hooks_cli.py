@@ -34,7 +34,7 @@ class HookCliTests(unittest.TestCase):
             "tool_input": {"command": "echo hello"},
         }
         env = os.environ.copy()
-        env["CODEX_REQUIRE_CODEX_HOOKS_FEATURE"] = "0"
+        env["METDSL_REQUIRE_CODEX_HOOKS_FEATURE"] = "0"
         proc = subprocess.run(
             [
                 "python3",
@@ -65,11 +65,11 @@ class HookCliTests(unittest.TestCase):
             "tool_input": {"command": "echo hello"},
         }
         env = os.environ.copy()
-        env["CODEX_REQUIRE_CODEX_HOOKS_FEATURE"] = "0"
+        env["METDSL_REQUIRE_CODEX_HOOKS_FEATURE"] = "0"
         cmd = (
             "ROOT=$(git rev-parse --show-toplevel); "
             "PYTHONPATH=\"$ROOT${PYTHONPATH:+:$PYTHONPATH}\" "
-            "CODEX_HOOK_REPO_ROOT=\"$ROOT\" "
+            "METDSL_HOOK_REPO_ROOT=\"$ROOT\" "
             "python3 -m tools.hooks.cli --backend codex --event PreToolUse --repo-root \"$ROOT\""
         )
         proc = subprocess.run(
@@ -94,7 +94,7 @@ class HookCliTests(unittest.TestCase):
             "tool_input": {"command": "echo hello"},
         }
         env = os.environ.copy()
-        env["CODEX_REQUIRE_CODEX_HOOKS_FEATURE"] = "0"
+        env["METDSL_REQUIRE_CODEX_HOOKS_FEATURE"] = "0"
         proc = subprocess.run(
             command,
             cwd=str(repo_root / "tools"),
@@ -119,7 +119,7 @@ class HookCliTests(unittest.TestCase):
                 "tool_input": {"command": "echo hello"},
             }
             env = os.environ.copy()
-            env["CODEX_REQUIRE_CODEX_HOOKS_FEATURE"] = "0"
+            env["METDSL_REQUIRE_CODEX_HOOKS_FEATURE"] = "0"
             proc = subprocess.run(
                 command,
                 cwd=tmp,
@@ -448,39 +448,38 @@ class HookCliTests(unittest.TestCase):
                 )
                 self.assertTrue(log_path.is_file())
 
-    def test_missing_orchestration_id_can_use_global_policy(self) -> None:
+    def test_missing_orchestration_id_falls_back_to_global_by_default(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
-            with patch.dict(os.environ, {"CODEX_HOOK_MISSING_ORCHESTRATION_ID_POLICY": "global"}):
-                with patch("tools.hooks.cli.codex_hooks_feature_enabled") as feature_mock:
-                    feature_mock.return_value = (True, "codex_hooks=true")
-                    payload = {
-                        "repo_root": str(repo_root),
-                        "tool_name": "Bash",
-                        "tool_input": {"command": "echo hello"},
-                    }
-                    out = io.StringIO()
-                    with redirect_stdout(out):
-                        code = cli.main(
-                            [
-                                "--backend",
-                                "codex",
-                                "--event",
-                                "PreToolUse",
-                                "--input-json",
-                                json.dumps(payload),
-                            ]
-                        )
-                    self.assertEqual(code, 0)
-                    log_path = (
-                        repo_root
-                        / "workspace"
-                        / "orchestrations"
-                        / "_global"
-                        / "hooks"
-                        / "native_hook_events.jsonl"
+            with patch("tools.hooks.cli.codex_hooks_feature_enabled") as feature_mock:
+                feature_mock.return_value = (True, "codex_hooks=true")
+                payload = {
+                    "repo_root": str(repo_root),
+                    "tool_name": "Bash",
+                    "tool_input": {"command": "echo hello"},
+                }
+                out = io.StringIO()
+                with redirect_stdout(out):
+                    code = cli.main(
+                        [
+                            "--backend",
+                            "codex",
+                            "--event",
+                            "PreToolUse",
+                            "--input-json",
+                            json.dumps(payload),
+                        ]
                     )
-                    self.assertTrue(log_path.is_file())
+                self.assertEqual(code, 0)
+                log_path = (
+                    repo_root
+                    / "workspace"
+                    / "orchestrations"
+                    / "_global"
+                    / "hooks"
+                    / "native_hook_events.jsonl"
+                )
+                self.assertTrue(log_path.is_file())
 
     def test_codex_feature_check_is_cached_after_first_call(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -530,7 +529,7 @@ class HookCliTests(unittest.TestCase):
                 "tool_name": "Bash",
                 "tool_input": {"command": "echo hello"},
             }
-            with patch.dict(os.environ, {"CODEX_HOOK_FEATURE_RETRY_TTL_SECONDS": "0"}):
+            with patch.dict(os.environ, {"METDSL_HOOK_FEATURE_RETRY_TTL_SECONDS": "0"}):
                 with patch("tools.hooks.cli.codex_hooks_feature_enabled") as feature_mock:
                     feature_mock.side_effect = [
                         (False, "codex features list timed out after 2.0s"),
@@ -573,7 +572,7 @@ class HookCliTests(unittest.TestCase):
                 "tool_name": "Bash",
                 "tool_input": {"command": "echo hello"},
             }
-            with patch.dict(os.environ, {"CODEX_HOOK_FEATURE_RETRY_TTL_SECONDS": "abc"}):
+            with patch.dict(os.environ, {"METDSL_HOOK_FEATURE_RETRY_TTL_SECONDS": "abc"}):
                 with patch("tools.hooks.cli.codex_hooks_feature_enabled") as feature_mock:
                     feature_mock.return_value = (False, "codex features list timed out after 2.0s")
                     out = io.StringIO()
@@ -674,7 +673,7 @@ class ClaudeHookCliTests(unittest.TestCase):
                 self.assertEqual(code, 0)
                 self.assertEqual(out.getvalue().strip(), "")
 
-    def test_claude_backend_uses_global_policy_for_missing_orchestration_id(self) -> None:
+    def test_claude_backend_falls_back_to_global_without_policy(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo_root_path = Path(tmp)
             payload = {
@@ -682,31 +681,30 @@ class ClaudeHookCliTests(unittest.TestCase):
                 "tool_name": "Bash",
                 "tool_input": {"command": "echo hi"},
             }
-            with patch.dict(os.environ, {"CODEX_HOOK_MISSING_ORCHESTRATION_ID_POLICY": "global"}):
-                out = io.StringIO()
-                with redirect_stdout(out):
-                    code = cli.main(
-                        [
-                            "--backend",
-                            "claude",
-                            "--event",
-                            "PreToolUse",
-                            "--input-json",
-                            json.dumps(payload),
-                        ]
-                    )
-                self.assertEqual(code, 0)
-                log_path = (
-                    repo_root_path
-                    / "workspace"
-                    / "orchestrations"
-                    / "_global"
-                    / "hooks"
-                    / "native_hook_events.jsonl"
+            out = io.StringIO()
+            with redirect_stdout(out):
+                code = cli.main(
+                    [
+                        "--backend",
+                        "claude",
+                        "--event",
+                        "PreToolUse",
+                        "--input-json",
+                        json.dumps(payload),
+                    ]
                 )
-                self.assertTrue(log_path.is_file())
-                entry = json.loads(log_path.read_text(encoding="utf-8").strip())
-                self.assertEqual(entry.get("backend"), "claude")
+            self.assertEqual(code, 0)
+            log_path = (
+                repo_root_path
+                / "workspace"
+                / "orchestrations"
+                / "_global"
+                / "hooks"
+                / "native_hook_events.jsonl"
+            )
+            self.assertTrue(log_path.is_file())
+            entry = json.loads(log_path.read_text(encoding="utf-8").strip())
+            self.assertEqual(entry.get("backend"), "claude")
 
     def test_claude_backend_settings_json_command_works(self) -> None:
         repo_root = Path(__file__).resolve().parents[2]
@@ -731,35 +729,12 @@ class ClaudeHookCliTests(unittest.TestCase):
         self.assertEqual(proc.returncode, 0)
         self.assertEqual(proc.stdout.strip(), "")
 
-    def test_resolve_repo_root_uses_claude_env_for_claude_backend(self) -> None:
+    def test_resolve_repo_root_uses_metdsl_hook_repo_root_env(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            # Include CODEX_HOOK_REPO_ROOT in patch.dict so it is restored on exit,
-            # then pop it so only CLAUDE_HOOK_REPO_ROOT is active.
-            with patch.dict(os.environ, {"CLAUDE_HOOK_REPO_ROOT": tmp, "CODEX_HOOK_REPO_ROOT": ""}):
-                os.environ.pop("CODEX_HOOK_REPO_ROOT", None)
-                result = cli._resolve_repo_root({}, backend="claude")
-                self.assertEqual(result, Path(tmp).resolve())
-
-    def test_resolve_repo_root_uses_codex_env_for_codex_backend(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            # Include CLAUDE_HOOK_REPO_ROOT in patch.dict so it is restored on exit,
-            # then pop it so only CODEX_HOOK_REPO_ROOT is active.
-            with patch.dict(os.environ, {"CODEX_HOOK_REPO_ROOT": tmp, "CLAUDE_HOOK_REPO_ROOT": ""}):
-                os.environ.pop("CLAUDE_HOOK_REPO_ROOT", None)
-                result = cli._resolve_repo_root({}, backend="codex")
-                self.assertEqual(result, Path(tmp).resolve())
-
-    def test_resolve_repo_root_claude_backend_ignores_codex_env(self) -> None:
-        """Claude backend must not pick up CODEX_HOOK_REPO_ROOT."""
-        with tempfile.TemporaryDirectory() as codex_tmp:
-            with tempfile.TemporaryDirectory() as claude_tmp:
-                with patch.dict(
-                    os.environ,
-                    {"CODEX_HOOK_REPO_ROOT": codex_tmp, "CLAUDE_HOOK_REPO_ROOT": claude_tmp},
-                ):
-                    result = cli._resolve_repo_root({}, backend="claude")
-                    self.assertEqual(result, Path(claude_tmp).resolve())
-                    self.assertNotEqual(result, Path(codex_tmp).resolve())
+            with patch.dict(os.environ, {"METDSL_HOOK_REPO_ROOT": tmp}):
+                for backend in ("claude", "codex"):
+                    result = cli._resolve_repo_root({}, backend=backend)
+                    self.assertEqual(result, Path(tmp).resolve())
 
     def test_claude_backend_user_prompt_submit_uses_global_without_orchestration_id(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -790,7 +765,7 @@ class ClaudeHookCliTests(unittest.TestCase):
             entry = json.loads(log_path.read_text(encoding="utf-8").strip())
             self.assertEqual(entry.get("event"), "user_prompt_submit")
 
-    def test_claude_backend_blocks_missing_orchestration_id_in_workflow_mode(self) -> None:
+    def test_strict_policy_blocks_missing_orchestration_id(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo_root_path = Path(tmp)
             payload = {
@@ -800,10 +775,7 @@ class ClaudeHookCliTests(unittest.TestCase):
             }
             with patch.dict(
                 os.environ,
-                {
-                    "METDSL_WORKFLOW_MODE": "1",
-                    "CODEX_HOOK_MISSING_ORCHESTRATION_ID_POLICY": "global",
-                },
+                {"METDSL_MISSING_ORCHESTRATION_ID_POLICY": "strict"},
             ):
                 out = io.StringIO()
                 with redirect_stdout(out):
@@ -820,7 +792,7 @@ class ClaudeHookCliTests(unittest.TestCase):
                 self.assertEqual(code, 2)
                 body = json.loads(out.getvalue().strip())
                 self.assertEqual(body.get("decision"), "block")
-                self.assertIn("orchestration_id is required for workflow hook execution", body.get("reason", ""))
+                self.assertIn("orchestration_id is required for hook execution", body.get("reason", ""))
 
     def test_workflow_mode_accepts_orchestration_id_from_environment(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -868,13 +840,7 @@ class ClaudeHookCliTests(unittest.TestCase):
                     "command": "python3 tools/codex_orchestration_runtime.py run-gate --gate orchestration_read"
                 },
             }
-            with patch.dict(
-                os.environ,
-                {
-                    "METDSL_WORKFLOW_MODE": "0",
-                    "CODEX_HOOK_MISSING_ORCHESTRATION_ID_POLICY": "global",
-                },
-            ):
+            with patch.dict(os.environ, {"METDSL_WORKFLOW_MODE": "0"}):
                 code = cli.main(
                     [
                         "--backend",

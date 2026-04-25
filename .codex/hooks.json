@@ -6,7 +6,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "sh -lc 'ROOT=$(git rev-parse --show-toplevel) || exit 2; PYTHONPATH=\"$ROOT${PYTHONPATH:+:$PYTHONPATH}\" CODEX_HOOK_REPO_ROOT=\"$ROOT\" python3 -m tools.hooks.cli --backend codex --event SessionStart --repo-root \"$ROOT\"'"
+            "command": "sh -lc 'ROOT=$(git rev-parse --show-toplevel) || exit 2; PYTHONPATH=\"$ROOT${PYTHONPATH:+:$PYTHONPATH}\" METDSL_HOOK_REPO_ROOT=\"$ROOT\" python3 -m tools.hooks.cli --backend codex --event SessionStart --repo-root \"$ROOT\"'"
           }
         ]
       }
@@ -17,7 +17,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "sh -lc 'ROOT=$(git rev-parse --show-toplevel) || exit 2; PYTHONPATH=\"$ROOT${PYTHONPATH:+:$PYTHONPATH}\" CODEX_HOOK_REPO_ROOT=\"$ROOT\" python3 -m tools.hooks.cli --backend codex --event UserPromptSubmit --repo-root \"$ROOT\"'"
+            "command": "sh -lc 'ROOT=$(git rev-parse --show-toplevel) || exit 2; PYTHONPATH=\"$ROOT${PYTHONPATH:+:$PYTHONPATH}\" METDSL_HOOK_REPO_ROOT=\"$ROOT\" python3 -m tools.hooks.cli --backend codex --event UserPromptSubmit --repo-root \"$ROOT\"'"
           }
         ]
       }
@@ -28,7 +28,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "sh -lc 'ROOT=$(git rev-parse --show-toplevel) || exit 2; PYTHONPATH=\"$ROOT${PYTHONPATH:+:$PYTHONPATH}\" CODEX_HOOK_REPO_ROOT=\"$ROOT\" python3 -m tools.hooks.cli --backend codex --event PreToolUse --repo-root \"$ROOT\"'"
+            "command": "sh -lc 'ROOT=$(git rev-parse --show-toplevel) || exit 2; PYTHONPATH=\"$ROOT${PYTHONPATH:+:$PYTHONPATH}\" METDSL_HOOK_REPO_ROOT=\"$ROOT\" python3 -m tools.hooks.cli --backend codex --event PreToolUse --repo-root \"$ROOT\"'"
           }
         ]
       }
@@ -39,7 +39,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "sh -lc 'ROOT=$(git rev-parse --show-toplevel) || exit 2; PYTHONPATH=\"$ROOT${PYTHONPATH:+:$PYTHONPATH}\" CODEX_HOOK_REPO_ROOT=\"$ROOT\" python3 -m tools.hooks.cli --backend codex --event PermissionRequest --repo-root \"$ROOT\"'"
+            "command": "sh -lc 'ROOT=$(git rev-parse --show-toplevel) || exit 2; PYTHONPATH=\"$ROOT${PYTHONPATH:+:$PYTHONPATH}\" METDSL_HOOK_REPO_ROOT=\"$ROOT\" python3 -m tools.hooks.cli --backend codex --event PermissionRequest --repo-root \"$ROOT\"'"
           }
         ]
       }
@@ -50,7 +50,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "sh -lc 'ROOT=$(git rev-parse --show-toplevel) || exit 2; PYTHONPATH=\"$ROOT${PYTHONPATH:+:$PYTHONPATH}\" CODEX_HOOK_REPO_ROOT=\"$ROOT\" python3 -m tools.hooks.cli --backend codex --event PostToolUse --repo-root \"$ROOT\"'"
+            "command": "sh -lc 'ROOT=$(git rev-parse --show-toplevel) || exit 2; PYTHONPATH=\"$ROOT${PYTHONPATH:+:$PYTHONPATH}\" METDSL_HOOK_REPO_ROOT=\"$ROOT\" python3 -m tools.hooks.cli --backend codex --event PostToolUse --repo-root \"$ROOT\"'"
           }
         ]
       }
@@ -61,7 +61,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "sh -lc 'ROOT=$(git rev-parse --show-toplevel) || exit 2; PYTHONPATH=\"$ROOT${PYTHONPATH:+:$PYTHONPATH}\" CODEX_HOOK_REPO_ROOT=\"$ROOT\" python3 -m tools.hooks.cli --backend codex --event Stop --repo-root \"$ROOT\"'"
+            "command": "sh -lc 'ROOT=$(git rev-parse --show-toplevel) || exit 2; PYTHONPATH=\"$ROOT${PYTHONPATH:+:$PYTHONPATH}\" METDSL_HOOK_REPO_ROOT=\"$ROOT\" python3 -m tools.hooks.cli --backend codex --event Stop --repo-root \"$ROOT\"'"
           }
         ]
       }
