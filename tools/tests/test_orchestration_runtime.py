@@ -118,93 +118,46 @@ def _fixture_skill_must_read_refs_substep(step: str, substep: str, *, generation
 
 
 def _step_launch_prompt(node_key: str, step: str, agent_run_id: str) -> str:
-    return f"""あなたは step agent である。
-対象 node_key: {node_key}
-対象 step: {step}
-orchestration_id: orch_001
-agent_run_id: {agent_run_id}
-parent_agent_run_id: orch_run_001
-workflow_mode: dev
-plan_ref: {_FIX_PLAN_REF}
-pipeline_ref: {_FIX_PIPE_REF}
-dependency_ref: {_FIX_DEP_REF}
-skill_name: workflow-{step}
-skill_ref: skills/workflow-{step}/SKILL.md
-skill_must_read_refs: {_fixture_skill_must_read_refs_step(step)}
-issue_severity: none
-repair_strategy: none
-repair_target_agent_run_id: none
-repair_reason: none
-
-必須要件:
-- あなたは phase artifacts を直接生成する担当である。
-- この step は標準 substep を持たない phase である。自身で step 契約を完了させること。
-- 起動直後に `skill_ref` を読み、`skill_must_read_refs` と矛盾しない契約で実行すること。
-- 要求定義と判定規則は `docs/` と `spec/` と `skill_must_read_refs` に含まれる当該試行 artifact だけから解釈すること。`tools/` 配下の実装、検証 `script`、test code、validator code から rule を抽出してはならない。
-- `capability_token` は `workspace/orchestrations/<orchestration_id>/capabilities/<agent_run_id>.json` を canonical source とし、起動直後に同 file を読み `capability_token` を抽出して以後の `run-gate` / `guarded-apply-patch` へ渡すこと。
-- `capability_token` が未取得または不一致の場合は処理を開始せず fail で停止すること。
-- `orchestration-read` は `python3 tools/orchestration_runtime.py run-gate --gate orchestration_read --agent-run-id <agent_run_id> --capability-token <capability_token> --args-json '{{"read_path":"..."}}'` を唯一の経路として実行し、`orchestration-read` 直呼びを禁止する。
-- 書き込み経路は出力 path の extension で分岐する。`output_manifests/<agent_run_id>.json` を canonical source として参照し、`allowed_output_paths` と `allowed_file_tool_paths` の両 list を起動直後に確認すること。
-- `.json` と `.txt` の出力は `python3 tools/orchestration_runtime.py guarded-apply-patch --repo-root <repo_root> --orchestration-id <orchestration_id> --actor-role step --agent-run-id <agent_run_id> --paths-json '["..."]' --patch-text '<patch_text>' --capability-token <capability_token>` を唯一の経路として実行し、拒否時は編集を停止すること。
-- `.yaml` / `.yml` / `.md` および source code 等の上記以外の出力は、`output_manifests/<agent_run_id>.json` の `allowed_file_tool_paths` に列挙された path に限り、`Edit` / `Write` tool で直接書き込むこと。
-- `run-gate --gate apply_patch_writes` と `apply-patch-gate` の公開経路としての使用、shell redirection・`tee`・`sed -i`・任意コマンドによる file write、`allowed_output_paths` 外への書き込みは引き続き禁止する。
-- `guarded-apply-patch` と `Edit` / `Write` のいずれも `output_manifests/<agent_run_id>.json` を参照して manifest 外 path を reject する。manifest 外 path へ書いてはならない。
-- `skill_name` と `skill_ref` が未指定の場合は fail で停止すること。
-- 入力不足時は推測補完せず fail で停止すること。
-- `workflow_mode=dev` の場合、verify 系判定で `issue_severity=major|critical` を検出した時点で fail 停止すること。
-- `workflow_mode=dev` で fail した場合、`failure_analysis.json` 生成に必要な根拠（失敗理由、関連 output_refs、主要ログ要約）を返答へ含めること。
-- `Plan` の場合、直下依存 `node` の `direct dependency plan readiness` を満たさない限り開始してはならない。
-- `Generate` / `Build` / `Execute` / `Judge` の場合、直下依存 `node` の `direct dependency execution readiness` を満たさない限り開始してはならない。
-- 直下依存 `node` が未完了でも、依存先 code を自身の `src/` へ内包して代替してはならない。
-- 完了後は required_outputs と failed_substeps と substep_agent_run_ids を親へ返すこと。
-- 完了返答には `launch_reply` として、実施内容と判定結果を平文で含めること。"""
+    return render_launch_prompt_text({
+        "node_key": node_key,
+        "step": step,
+        "agent_run_id": agent_run_id,
+        "orchestration_id": "orch_001",
+        "parent_agent_run_id": "orch_run_001",
+        "workflow_mode": "dev",
+        "plan_ref": _FIX_PLAN_REF,
+        "pipeline_ref": _FIX_PIPE_REF,
+        "dependency_ref": _FIX_DEP_REF,
+        "skill_name": f"workflow-{step}",
+        "skill_ref": f"skills/workflow-{step}/SKILL.md",
+        "skill_must_read_refs": _fixture_skill_must_read_refs_step(step),
+        "issue_severity": "none",
+        "repair_strategy": "none",
+        "repair_target_agent_run_id": "none",
+        "repair_reason": "none",
+    })
 
 
 def _substep_launch_prompt(node_key: str, step: str, substep: str, agent_run_id: str) -> str:
-    return f"""あなたは substep agent である。
-対象 node_key: {node_key}
-対象 step: {step}
-対象 substep: {substep}
-orchestration_id: orch_001
-agent_run_id: {agent_run_id}
-parent_agent_run_id: orch_run_001
-workflow_mode: dev
-plan_ref: {_FIX_PLAN_REF}
-pipeline_ref: {_FIX_PIPE_REF}
-dependency_ref: {_FIX_DEP_REF}
-skill_name: workflow-{step}-{substep}
-skill_ref: skills/workflow-{step}-{substep}/SKILL.md
-skill_must_read_refs: {_fixture_skill_must_read_refs_substep(step, substep)}
-issue_severity: none
-repair_strategy: none
-repair_target_agent_run_id: none
-repair_reason: none
-
-必須要件:
-- 契約された入力だけを読むこと。
-- 契約された artifacts だけを書くこと。
-- expected output と保存先を守ること。
-- 起動直後に `skill_ref` を読み、`skill_must_read_refs` と矛盾しない契約で実行すること。
-- 要求定義と判定規則は `docs/` と `spec/` と `skill_must_read_refs` に含まれる当該試行 artifact だけから解釈すること。`tools/` 配下の実装、検証 `script`、test code、validator code から rule を抽出してはならない。
-- `capability_token` は `workspace/orchestrations/<orchestration_id>/capabilities/<agent_run_id>.json` を canonical source とし、起動直後に同 file を読み `capability_token` を抽出して以後の `run-gate` / `guarded-apply-patch` へ渡すこと。
-- `capability_token` が未取得または不一致の場合は処理を開始せず fail で停止すること。
-- `orchestration-read` は `python3 tools/orchestration_runtime.py run-gate --gate orchestration_read --agent-run-id <agent_run_id> --capability-token <capability_token> --args-json '{{"read_path":"..."}}'` を唯一の経路として実行し、`orchestration-read` 直呼びを禁止する。
-- 書き込み経路は出力 path の extension で分岐する。`output_manifests/<agent_run_id>.json` を canonical source として参照し、`allowed_output_paths` と `allowed_file_tool_paths` の両 list を起動直後に確認すること。
-- `.json` と `.txt` の出力は `python3 tools/orchestration_runtime.py guarded-apply-patch --repo-root <repo_root> --orchestration-id <orchestration_id> --actor-role substep --agent-run-id <agent_run_id> --paths-json '["..."]' --patch-text '<patch_text>' --capability-token <capability_token>` を唯一の経路として実行し、拒否時は編集を停止すること。
-- `.yaml` / `.yml` / `.md` および source code 等の上記以外の出力は、`output_manifests/<agent_run_id>.json` の `allowed_file_tool_paths` に列挙された path に限り、`Edit` / `Write` tool で直接書き込むこと。
-- `run-gate --gate apply_patch_writes` と `apply-patch-gate` の公開経路としての使用、shell redirection・`tee`・`sed -i`・任意コマンドによる file write、`allowed_output_paths` 外への書き込みは引き続き禁止する。
-- `guarded-apply-patch` と `Edit` / `Write` のいずれも `output_manifests/<agent_run_id>.json` を参照して manifest 外 path を reject する。manifest 外 path へ書いてはならない。
-- `skill_name` と `skill_ref` が未指定の場合は fail で停止すること。
-- 入力不足時は推測補完せず fail で停止すること。
-- `workflow_mode=dev` の場合、verify 系判定で `issue_severity=major|critical` を検出した時点で fail 停止すること。
-- `workflow_mode=dev` で fail した場合、`failure_analysis.json` 生成に必要な根拠（失敗理由、関連 output_refs、主要ログ要約）を返答へ含めること。
-- `Plan` の substep は、直下依存 `node` の `direct dependency plan readiness` を満たさない限り開始してはならない。
-- `Generate` / `Build` / `Execute` / `Judge` の substep は、直下依存 `node` の `direct dependency execution readiness` を満たさない限り開始してはならない。
-- 直下依存 `node` が未完了でも、依存先 code を対象 `node` の `src/` へ内包して代替してはならない。
-- `repair_strategy=reuse` の場合は、`repair_target_agent_run_id` の出力との差分修正に限定すること。
-- `repair_strategy=restart` の場合は、過去出力を流用せず契約入力から再生成すること。
-- 完了時は artifact 参照と status を `orchestration agent` へ返すこと。
-- 完了返答には `launch_reply` として、実施内容と判定結果を平文で含めること。"""
+    return render_launch_prompt_text({
+        "node_key": node_key,
+        "step": step,
+        "substep": substep,
+        "agent_run_id": agent_run_id,
+        "orchestration_id": "orch_001",
+        "parent_agent_run_id": "orch_run_001",
+        "workflow_mode": "dev",
+        "plan_ref": _FIX_PLAN_REF,
+        "pipeline_ref": _FIX_PIPE_REF,
+        "dependency_ref": _FIX_DEP_REF,
+        "skill_name": f"workflow-{step}-{substep}",
+        "skill_ref": f"skills/workflow-{step}-{substep}/SKILL.md",
+        "skill_must_read_refs": _fixture_skill_must_read_refs_substep(step, substep),
+        "issue_severity": "none",
+        "repair_strategy": "none",
+        "repair_target_agent_run_id": "none",
+        "repair_reason": "none",
+    })
 
 
 def _spawn_response_payload(session_id: str) -> dict[str, object]:
@@ -785,6 +738,10 @@ shell_tool                       stable             true
                     "skill_name": "workflow-plan-generate",
                     "skill_ref": "skills/workflow-plan-generate/SKILL.md",
                     "skill_must_read_refs": "",
+                    "allowed_output_paths": [
+                        "workspace/plans/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/case.resolved.yaml",
+                        "workspace/plans/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/plan_meta.json",
+                    ],
                     "launch_prompt_full": _substep_launch_prompt(
                         "problem/shallow_water2d@0.3.0",
                         "plan",
@@ -815,6 +772,9 @@ shell_tool                       stable             true
                     "skill_name": "workflow-build",
                     "skill_ref": "skills/workflow-build/SKILL.md",
                     "skill_must_read_refs": "",
+                    "allowed_output_paths": [
+                        "workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/build/build_001/bin/simulate",
+                    ],
                     "launch_prompt_full": _step_launch_prompt(
                         "problem/shallow_water2d@0.3.0",
                         "build",
@@ -1938,6 +1898,7 @@ shell_tool                       stable             true
                     "node_key": "problem/shallow_water2d@0.3.0",
                     "step": "plan",
                     "substep": "generate",
+                    "agent_role": "substep",
                     "orchestration_id": "orch_001",
                     "agent_run_id": "substep_run_plan_generate_001",
                     "parent_agent_run_id": "orch_run_001",
@@ -1947,6 +1908,9 @@ shell_tool                       stable             true
                     "skill_name": "workflow-plan-generate",
                     "skill_ref": "skills/workflow-plan-generate/SKILL.md",
                     "skill_must_read_refs": "",
+                    "allowed_output_paths": [
+                        "workspace/plans/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/impl.resolved.yaml",
+                    ],
                     "launch_prompt_full": _substep_launch_prompt(
                         "problem/shallow_water2d@0.3.0",
                         "plan",
@@ -2323,6 +2287,7 @@ shell_tool                       stable             true
                 request_payload={
                     "node_key": "problem/shallow_water2d@0.3.0",
                     "step": "build",
+                    "agent_role": "step",
                     "orchestration_id": "orch_001",
                     "agent_run_id": "step_run_build_001",
                     "parent_agent_run_id": "orch_run_001",
@@ -2332,6 +2297,7 @@ shell_tool                       stable             true
                     "skill_name": "workflow-build",
                     "skill_ref": "skills/workflow-build/SKILL.md",
                     "skill_must_read_refs": _fixture_skill_must_read_refs_step("build"),
+                    "allowed_output_paths": [f"{_FIX_PIPE_REF}/build/build_001/build_meta.json"],
                     "launch_prompt_full": _step_launch_prompt(
                         "problem/shallow_water2d@0.3.0",
                         "build",
@@ -2340,10 +2306,10 @@ shell_tool                       stable             true
                 },
                 response_payload=_spawn_response_payload("sess_step_build_001"),
             )
-            out_ref = f"{_FIX_PIPE_REF}/build/build_001/bin/simulate"
+            out_ref = f"{_FIX_PIPE_REF}/build/build_001/build_meta.json"
             out_path = repo_root / out_ref
             out_path.parent.mkdir(parents=True, exist_ok=True)
-            out_path.write_text("binary\n", encoding="utf-8")
+            out_path.write_text('{"status":"ok"}\n', encoding="utf-8")
             with self.assertRaisesRegex(ValueError, "terminal run has unauthorized write paths"):
                 record_agent_run(
                     repo_root=repo_root,
@@ -2398,6 +2364,7 @@ shell_tool                       stable             true
                 request_payload={
                     "node_key": "problem/shallow_water2d@0.3.0",
                     "step": "build",
+                    "agent_role": "step",
                     "orchestration_id": "orch_001",
                     "agent_run_id": "step_run_build_001",
                     "parent_agent_run_id": "orch_run_001",
@@ -2407,6 +2374,7 @@ shell_tool                       stable             true
                     "skill_name": "workflow-build",
                     "skill_ref": "skills/workflow-build/SKILL.md",
                     "skill_must_read_refs": _fixture_skill_must_read_refs_step("build"),
+                    "allowed_output_paths": [f"{_FIX_PIPE_REF}/build/build_001/build_meta.json"],
                     "launch_prompt_full": _step_launch_prompt(
                         "problem/shallow_water2d@0.3.0",
                         "build",
@@ -2415,10 +2383,10 @@ shell_tool                       stable             true
                 },
                 response_payload=_spawn_response_payload("sess_step_build_001"),
             )
-            out_ref = f"{_FIX_PIPE_REF}/build/build_001/bin/simulate"
+            out_ref = f"{_FIX_PIPE_REF}/build/build_001/build_meta.json"
             out_path = repo_root / out_ref
             out_path.parent.mkdir(parents=True, exist_ok=True)
-            out_path.write_text("binary\n", encoding="utf-8")
+            out_path.write_text('{"status":"ok"}\n', encoding="utf-8")
             with self.assertRaisesRegex(ValueError, "terminal run has unauthorized write paths"):
                 record_agent_run(
                     repo_root=repo_root,
@@ -2473,6 +2441,7 @@ shell_tool                       stable             true
                 request_payload={
                     "node_key": "problem/shallow_water2d@0.3.0",
                     "step": "build",
+                    "agent_role": "step",
                     "orchestration_id": "orch_001",
                     "agent_run_id": "step_run_build_001",
                     "parent_agent_run_id": "orch_run_001",
@@ -2482,6 +2451,7 @@ shell_tool                       stable             true
                     "skill_name": "workflow-build",
                     "skill_ref": "skills/workflow-build/SKILL.md",
                     "skill_must_read_refs": _fixture_skill_must_read_refs_step("build"),
+                    "allowed_output_paths": [f"{_FIX_PIPE_REF}/build/build_001/build_meta.json"],
                     "launch_prompt_full": _step_launch_prompt(
                         "problem/shallow_water2d@0.3.0",
                         "build",
@@ -2490,10 +2460,10 @@ shell_tool                       stable             true
                 },
                 response_payload=_spawn_response_payload("sess_step_build_001"),
             )
-            out_ref = f"{_FIX_PIPE_REF}/build/build_001/bin/simulate"
+            out_ref = f"{_FIX_PIPE_REF}/build/build_001/build_meta.json"
             out_path = repo_root / out_ref
             out_path.parent.mkdir(parents=True, exist_ok=True)
-            out_path.write_text("binary\n", encoding="utf-8")
+            out_path.write_text('{"status":"ok"}\n', encoding="utf-8")
             _write_apply_patch_gate_evidence(
                 repo_root,
                 orchestration_id="orch_001",
@@ -2555,6 +2525,7 @@ shell_tool                       stable             true
                 request_payload={
                     "node_key": "problem/shallow_water2d@0.3.0",
                     "step": "build",
+                    "agent_role": "step",
                     "orchestration_id": "orch_001",
                     "agent_run_id": "step_run_build_001",
                     "parent_agent_run_id": "orch_run_001",
@@ -2564,6 +2535,7 @@ shell_tool                       stable             true
                     "skill_name": "workflow-build",
                     "skill_ref": "skills/workflow-build/SKILL.md",
                     "skill_must_read_refs": _fixture_skill_must_read_refs_step("build"),
+                    "allowed_output_paths": [f"{_FIX_PIPE_REF}/build/build_001/bin/simulate"],
                     "launch_prompt_full": _step_launch_prompt(
                         "problem/shallow_water2d@0.3.0",
                         "build",
@@ -2637,6 +2609,7 @@ shell_tool                       stable             true
                 request_payload={
                     "node_key": "problem/shallow_water2d@0.3.0",
                     "step": "build",
+                    "agent_role": "step",
                     "orchestration_id": "orch_001",
                     "agent_run_id": "step_run_build_001",
                     "parent_agent_run_id": "orch_run_001",
@@ -2646,6 +2619,7 @@ shell_tool                       stable             true
                     "skill_name": "workflow-build",
                     "skill_ref": "skills/workflow-build/SKILL.md",
                     "skill_must_read_refs": _fixture_skill_must_read_refs_step("build"),
+                    "allowed_output_paths": [f"{_FIX_PIPE_REF}/build/build_001/bin/simulate"],
                     "launch_prompt_full": _step_launch_prompt(
                         "problem/shallow_water2d@0.3.0",
                         "build",
@@ -2726,6 +2700,7 @@ shell_tool                       stable             true
                 request_payload={
                     "node_key": "problem/shallow_water2d@0.3.0",
                     "step": "build",
+                    "agent_role": "step",
                     "orchestration_id": "orch_001",
                     "agent_run_id": "step_run_build_001",
                     "parent_agent_run_id": "orch_run_001",
@@ -2735,6 +2710,7 @@ shell_tool                       stable             true
                     "skill_name": "workflow-build",
                     "skill_ref": "skills/workflow-build/SKILL.md",
                     "skill_must_read_refs": _fixture_skill_must_read_refs_step("build"),
+                    "allowed_output_paths": [f"{_FIX_PIPE_REF}/build/build_001/bin/simulate"],
                     "launch_prompt_full": _step_launch_prompt(
                         "problem/shallow_water2d@0.3.0",
                         "build",
@@ -2818,6 +2794,7 @@ shell_tool                       stable             true
                 request_payload={
                     "node_key": "problem/shallow_water2d@0.3.0",
                     "step": "build",
+                    "agent_role": "step",
                     "orchestration_id": "orch_001",
                     "agent_run_id": "step_run_build_001",
                     "parent_agent_run_id": "orch_run_001",
@@ -2827,6 +2804,7 @@ shell_tool                       stable             true
                     "skill_name": "workflow-build",
                     "skill_ref": "skills/workflow-build/SKILL.md",
                     "skill_must_read_refs": _fixture_skill_must_read_refs_step("build"),
+                    "allowed_output_paths": [f"{_FIX_PIPE_REF}/build/build_001/bin/simulate"],
                     "launch_prompt_full": _step_launch_prompt(
                         "problem/shallow_water2d@0.3.0",
                         "build",
@@ -2911,6 +2889,7 @@ shell_tool                       stable             true
                 request_payload={
                     "node_key": "problem/shallow_water2d@0.3.0",
                     "step": "build",
+                    "agent_role": "step",
                     "orchestration_id": "orch_001",
                     "agent_run_id": "step_run_build_001",
                     "parent_agent_run_id": "orch_run_001",
@@ -2920,6 +2899,7 @@ shell_tool                       stable             true
                     "skill_name": "workflow-build",
                     "skill_ref": "skills/workflow-build/SKILL.md",
                     "skill_must_read_refs": _fixture_skill_must_read_refs_step("build"),
+                    "allowed_output_paths": [f"{_FIX_PIPE_REF}/build/build_001/bin/simulate"],
                     "launch_prompt_full": _step_launch_prompt(
                         "problem/shallow_water2d@0.3.0",
                         "build",
@@ -3012,6 +2992,7 @@ shell_tool                       stable             true
                 request_payload={
                     "node_key": "problem/shallow_water2d@0.3.0",
                     "step": "build",
+                    "agent_role": "step",
                     "orchestration_id": "orch_001",
                     "agent_run_id": "step_run_build_001",
                     "parent_agent_run_id": "orch_run_001",
@@ -3021,6 +3002,7 @@ shell_tool                       stable             true
                     "skill_name": "workflow-build",
                     "skill_ref": "skills/workflow-build/SKILL.md",
                     "skill_must_read_refs": _fixture_skill_must_read_refs_step("build"),
+                    "allowed_output_paths": [f"{_FIX_PIPE_REF}/build/build_001/bin/simulate"],
                     "launch_prompt_full": _step_launch_prompt(
                         "problem/shallow_water2d@0.3.0",
                         "build",
@@ -3316,6 +3298,7 @@ shell_tool                       stable             true
                 request_payload={
                     "node_key": "problem/shallow_water2d@0.3.0",
                     "step": "build",
+                    "agent_role": "step",
                     "orchestration_id": "orch_001",
                     "agent_run_id": "step_run_build_001",
                     "parent_agent_run_id": "orch_run_001",
@@ -3325,6 +3308,7 @@ shell_tool                       stable             true
                     "skill_name": "workflow-build",
                     "skill_ref": "skills/workflow-build/SKILL.md",
                     "skill_must_read_refs": "",
+                    "allowed_output_paths": ["workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/build/build_001/bin/simulate"],
                     "launch_prompt_full": _step_launch_prompt(
                         "problem/shallow_water2d@0.3.0",
                         "build",
@@ -3645,6 +3629,7 @@ shell_tool                       stable             true
                     request_payload={
                         "node_key": "problem/shallow_water2d@0.3.0",
                         "step": "build",
+                        "agent_role": "step",
                         "orchestration_id": "orch_001",
                         "agent_run_id": "step_run_build_001",
                         "parent_agent_run_id": "orch_run_001",
@@ -3654,6 +3639,9 @@ shell_tool                       stable             true
                         "skill_name": "workflow-build",
                         "skill_ref": "skills/workflow-build/SKILL.md",
                         "skill_must_read_refs": "",
+                        "allowed_output_paths": [
+                            "workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/build/build_001/bin/simulate",
+                        ],
                         "launch_prompt_full": _step_launch_prompt(
                             "problem/shallow_water2d@0.3.0",
                             "build",
@@ -3745,6 +3733,7 @@ shell_tool                       stable             true
                 request_payload={
                     "node_key": "problem/shallow_water2d@0.3.0",
                     "step": "build",
+                    "agent_role": "step",
                     "orchestration_id": "orch_001",
                     "agent_run_id": "step_run_build_001",
                     "parent_agent_run_id": "orch_run_001",
@@ -3754,6 +3743,7 @@ shell_tool                       stable             true
                     "skill_name": "workflow-build",
                     "skill_ref": "skills/workflow-build/SKILL.md",
                     "skill_must_read_refs": "",
+                    "allowed_output_paths": ["workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/build/build_001/bin/simulate"],
                     "launch_prompt_full": _step_launch_prompt(
                         "problem/shallow_water2d@0.3.0",
                         "build",
@@ -4752,34 +4742,37 @@ shell_tool                       stable             true
 
     def test_main_help_run_gate_includes_args_json_schema_examples(self) -> None:
         """`run-gate --help` が gate 別 args_json schema 要約を表示すること。"""
+        import re as _re
         stdout = io.StringIO()
         with redirect_stdout(stdout):
             with self.assertRaises(SystemExit) as ctx:
                 main(["run-gate", "--help"])
         self.assertEqual(ctx.exception.code, 0)
-        out = stdout.getvalue()
+        out = _re.sub(r"\n\s+", " ", stdout.getvalue())
         self.assertIn("orchestration_read => {'read_path': 'docs/...'}", out)
         self.assertIn("validate_pipeline_semantics => {'stage':", out)
 
     def test_main_help_write_step_result_includes_result_json_schema(self) -> None:
         """`write-step-result --help` が result_json schema 要約を表示すること。"""
+        import re as _re
         stdout = io.StringIO()
         with redirect_stdout(stdout):
             with self.assertRaises(SystemExit) as ctx:
                 main(["write-step-result", "--help"])
         self.assertEqual(ctx.exception.code, 0)
-        out = stdout.getvalue()
+        out = _re.sub(r"\n\s+", " ", stdout.getvalue())
         self.assertIn("required_outputs (list[str])", out)
         self.assertIn("validation_stage is required", out)
 
     def test_main_help_record_launch_includes_dependency_ref_phase_rule(self) -> None:
         """`record-launch --help` が dependency_ref の phase 規則を表示すること。"""
+        import re as _re
         stdout = io.StringIO()
         with redirect_stdout(stdout):
             with self.assertRaises(SystemExit) as ctx:
                 main(["record-launch", "--help"])
         self.assertEqual(ctx.exception.code, 0)
-        out = stdout.getvalue()
+        out = _re.sub(r"\n\s+", " ", stdout.getvalue())
         self.assertIn("Plan => spec/.../deps.yaml; Generate+ => workspace phase root", out)
 
     def test_render_launch_prompt_includes_capability_token_source_line(self) -> None:
@@ -4803,7 +4796,7 @@ shell_tool                       stable             true
             "repair_reason": "none",
         }
         prompt = render_launch_prompt_text(payload)
-        self.assertIn("capabilities/<agent_run_id>.json", prompt)
+        self.assertIn("capabilities/step_run_build_001.json", prompt)
         self.assertIn("`capability_token` が未取得または不一致の場合", prompt)
 
 
@@ -6600,6 +6593,10 @@ class TestPhase1RuleSourceAudit(unittest.TestCase):
                     "skill_name": "workflow-plan-generate",
                     "skill_ref": "skills/workflow-plan-generate/SKILL.md",
                     "skill_must_read_refs": "",
+                    "allowed_output_paths": [
+                        f"{_FIX_PLAN_REF}/case.resolved.yaml",
+                        f"{_FIX_PLAN_REF}/plan_meta.json",
+                    ],
                     "launch_prompt_full": _substep_launch_prompt(
                         "problem/shallow_water2d@0.3.0",
                         "plan",
@@ -6677,6 +6674,10 @@ class TestPhase1RuleSourceAudit(unittest.TestCase):
                     "skill_name": "workflow-plan-generate",
                     "skill_ref": "skills/workflow-plan-generate/SKILL.md",
                     "skill_must_read_refs": "",
+                    "allowed_output_paths": [
+                        f"{_FIX_PLAN_REF}/case.resolved.yaml",
+                        f"{_FIX_PLAN_REF}/plan_meta.json",
+                    ],
                     "launch_prompt_full": _substep_launch_prompt(
                         "problem/shallow_water2d@0.3.0",
                         "plan",
@@ -6743,6 +6744,10 @@ class TestPhase1RuleSourceAudit(unittest.TestCase):
                     "skill_name": "workflow-plan-generate",
                     "skill_ref": "skills/workflow-plan-generate/SKILL.md",
                     "skill_must_read_refs": "",
+                    "allowed_output_paths": [
+                        f"{_FIX_PLAN_REF}/case.resolved.yaml",
+                        f"{_FIX_PLAN_REF}/plan_meta.json",
+                    ],
                     "launch_prompt_full": _substep_launch_prompt(
                         "problem/shallow_water2d@0.3.0",
                         "plan",
@@ -6800,6 +6805,10 @@ class TestPhase1RuleSourceAudit(unittest.TestCase):
                     "skill_name": "workflow-plan-generate",
                     "skill_ref": "skills/workflow-plan-generate/SKILL.md",
                     "skill_must_read_refs": "",
+                    "allowed_output_paths": [
+                        f"{_FIX_PLAN_REF}/case.resolved.yaml",
+                        f"{_FIX_PLAN_REF}/plan_meta.json",
+                    ],
                     "launch_prompt_full": _substep_launch_prompt(
                         "problem/shallow_water2d@0.3.0",
                         "plan",
@@ -6883,6 +6892,10 @@ class TestPhase1RuleSourceAudit(unittest.TestCase):
                     "skill_name": "workflow-plan-generate",
                     "skill_ref": "skills/workflow-plan-generate/SKILL.md",
                     "skill_must_read_refs": "",
+                    "allowed_output_paths": [
+                        f"{_FIX_PLAN_REF}/case.resolved.yaml",
+                        f"{_FIX_PLAN_REF}/plan_meta.json",
+                    ],
                     "launch_prompt_full": _substep_launch_prompt(
                         "problem/shallow_water2d@0.3.0",
                         "plan",
@@ -7265,6 +7278,7 @@ class TestPhase2PlanGuardsIntegration(unittest.TestCase):
                 "repair_strategy": "none",
                 "repair_target_agent_run_id": "none",
                 "repair_reason": "none",
+                "allowed_output_paths": [f"{_FIX_PIPE_REF}/build/build_001/bin/simulate"],
                 "launch_prompt_full": render_launch_prompt_text(
                     {
                         "agent_run_id": "build_child_1",
@@ -7410,6 +7424,10 @@ class TestPhase2PlanGuardsIntegration(unittest.TestCase):
                 "repair_strategy": "none",
                 "repair_target_agent_run_id": "none",
                 "repair_reason": "none",
+                "allowed_output_paths": [
+                    f"{_FIX_PLAN_REF}/case.resolved.yaml",
+                    f"{_FIX_PLAN_REF}/plan_meta.json",
+                ],
                 "launch_prompt_full": render_launch_prompt_text(
                     {
                         "agent_run_id": "plan_sub_1",
@@ -8300,6 +8318,7 @@ class TestPhase3RunGate(unittest.TestCase):
                     "skill_name": "workflow-build",
                     "skill_ref": "skills/workflow-build/SKILL.md",
                     "skill_must_read_refs": "",
+                    "allowed_output_paths": [f"{_FIX_PIPE_REF}/build/build_001/bin/simulate"],
                     "launch_prompt_full": _step_launch_prompt(
                         "problem/shallow_water2d@0.3.0",
                         "build",
@@ -8402,6 +8421,7 @@ class TestPhase3RunGate(unittest.TestCase):
                     "skill_name": "workflow-build",
                     "skill_ref": "skills/workflow-build/SKILL.md",
                     "skill_must_read_refs": "",
+                    "allowed_output_paths": [f"{_FIX_PIPE_REF}/build/build_001/bin/simulate"],
                     "launch_prompt_full": _step_launch_prompt(
                         "problem/shallow_water2d@0.3.0",
                         "build",
