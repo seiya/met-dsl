@@ -108,7 +108,7 @@
 - `Build` / `Execute` / `Judge` / `Promote` のように現行標準で `substep` を定義しない `step` では、`orchestration agent` は `step` 契約をそのまま単一 `step agent` へ渡さなければならない。
 - `Plan generate/verify`、`Generate generate/verify`、`Tune generate/verify` のように `substep` を持つ `step` では、`orchestration agent` は `step` 契約を分解したうえで、対応 `SKILL.md` の責務境界に一致する `substep` 契約だけを直接渡さなければならない。
 - `Plan verify substep` の契約には、`dependency.resolved.yaml` の網羅性検証、依存辺整合検証、依存先 `node` の `plan` 文書との照合検証を必ず含めなければならない。
-- `Plan verify` の起動要求では、`skill_must_read_refs` に `plan_ref` 配下の `case.resolved.yaml` と `algorithm.resolved.yaml` と `impl.resolved.yaml` と `dependency.resolved.yaml` と `derived_contract.json` を必須記録しなければならない。不足時は起動前に `fail_closed` とする。
+- `Plan verify` の起動要求では、`skill_must_read_refs` に `plan_ref` 配下の `case.resolved.yaml` と `algorithm.resolved.yaml` と `impl.resolved.yaml` と `dependency.resolved.yaml` を必須記録しなければならない。不足時は起動前に `fail_closed` とする。
 - `Generate verify` の起動要求では、`skill_must_read_refs` に `plan_ref` 配下の `case.resolved.yaml` と `algorithm.resolved.yaml` と `impl.resolved.yaml` と `dependency.resolved.yaml` と `derived_contract.json` に加えて、`pipeline_ref` を基準とする相対パスとして `lineage.json` と `generate/<generation_id>/generate_meta.json` を必須記録しなければならない。不足時は起動前に `fail_closed` とする。
 - `plan_ref` は `workspace/plans/<node_key_safe>/<plan_id>` のみとし、追加のパスセグメント（ファイルパスを含む）を付けてはならない。`<plan_id>` は `<node_key_safe>_` で始まるディレクトリ名とする。
 - `pipeline_ref` は `workspace/pipelines/<node_key_safe>/<pipeline_id>` のみとし、追加のパスセグメント（`generate/` や `generate_meta.json` を含む）を付けてはならない。`<pipeline_id>` は `<node_key_safe>_` で始まるディレクトリ名とする。この制約は `pipeline_ref` フィールド値にのみ適用し、`skill_must_read_refs` には `pipeline_ref` 配下 artifact の相対パス記録を許可する。

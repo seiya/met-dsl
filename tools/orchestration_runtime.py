@@ -3533,9 +3533,9 @@ def _required_verify_skill_refs(request_payload: dict[str, Any]) -> list[str]:
         f"{plan_root}/algorithm.resolved.yaml",
         f"{plan_root}/impl.resolved.yaml",
         f"{plan_root}/dependency.resolved.yaml",
-        f"{plan_root}/derived_contract.json",
     ]
     if step.strip().lower() == "generate":
+        refs.append(f"{plan_root}/derived_contract.json")
         pipeline_ref = request_payload.get("pipeline_ref")
         generation_id = request_payload.get("generation_id")
         if not isinstance(pipeline_ref, str) or not pipeline_ref.strip():

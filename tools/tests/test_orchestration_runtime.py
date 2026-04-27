@@ -711,7 +711,7 @@ shell_tool                       stable             true
         self.assertIn("docs/workflow/phases/phase_01_plan.md", payload["skill_must_read_refs"])
         self.assertIn("docs/ORCHESTRATION.md", payload["skill_must_read_refs"])
         self.assertIn("skills/workflow-plan-verify/SKILL.md", payload["skill_must_read_refs"])
-        self.assertIn(
+        self.assertNotIn(
             "workspace/plans/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/derived_contract.json",
             payload["skill_must_read_refs"],
         )
@@ -1661,7 +1661,7 @@ shell_tool                       stable             true
             request_payload = json.loads(request_path.read_text(encoding="utf-8"))
             self.assertEqual(request_payload["skill_name"], "workflow-plan-verify")
             self.assertEqual(request_payload["skill_ref"], "skills/workflow-plan-verify/SKILL.md")
-            self.assertIn(
+            self.assertNotIn(
                 "workspace/plans/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/derived_contract.json",
                 request_payload["skill_must_read_refs"],
             )

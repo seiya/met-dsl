@@ -42,7 +42,8 @@ description: 対応 execution platform で `workflow` 全体を開始し、`orch
 - shell による file write は、対象 path が phase artifact かどうかを問わず禁止対象とし、事前 gate または `record-agent-run` が検出した場合は当該 gate または `record-agent-run` が当該 `agent_run` を reject しなければならない。reject 後は `orchestration agent` が `orchestration_meta.status=fail_closed` を記録して停止しなければならない。
 - `step agent` / `substep agent` の起動要求本文には、input contract、expected output、保存先、失敗時停止条件、`spawn_agent` 義務を明示しなければならない。
 - `step agent` / `substep agent` の起動要求本文には、`skill_name` と `skill_ref` と `skill_must_read_refs` を必須記録し、子 `agent` が起動直後に対象 `SKILL` を読める状態にしなければならない。
-- `Plan verify` と `Generate verify` の起動要求では、`skill_must_read_refs` に `plan_ref` 配下の `case.resolved.yaml` と `algorithm.resolved.yaml` と `impl.resolved.yaml` と `dependency.resolved.yaml` と `derived_contract.json` を必須記録しなければならない。
+- `Plan verify` の起動要求では、`skill_must_read_refs` に `plan_ref` 配下の `case.resolved.yaml` と `algorithm.resolved.yaml` と `impl.resolved.yaml` と `dependency.resolved.yaml` を必須記録しなければならない。
+- `Generate verify` の起動要求では、`skill_must_read_refs` に `plan_ref` 配下の `case.resolved.yaml` と `algorithm.resolved.yaml` と `impl.resolved.yaml` と `dependency.resolved.yaml` と `derived_contract.json` を必須記録しなければならない。
 - `launch` 記録時に保存する prompt は、request payload の必須フィールド値と一致するテンプレート完全体でなければならない。要約 prompt や marker のみ保持した簡略 prompt を禁止する。
 - `record-launch` に保存する `launch response` は、`spawn_agent` 成功直後の実応答完全体でなければならない。後生成、固定文言、要約文のみの代替を禁止する。
 - `launch response` は子 `agent` 識別子を必須記録し、`record-agent-run` の `agent_session_id` は当該識別子と一致しなければならない。
