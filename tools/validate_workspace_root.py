@@ -17,7 +17,6 @@ from typing import Any
 
 
 STRICT_WORKSPACE_REF_KEYS = {
-    "dependency_ref",
     "plan_dir",
     "pipeline_dir",
     "build_log_ref",
@@ -61,6 +60,33 @@ def _is_under_workspace(rel_path: str, workspace_root: str) -> bool:
     normalized_path = _normalize_relpath(rel_path)
     normalized_ws = _normalize_relpath(workspace_root).rstrip("/")
     return normalized_path == normalized_ws or normalized_path.startswith(normalized_ws + "/")
+
+
+def _normalize_step_token(value: Any) -> str:
+    if not isinstance(value, str):
+        return ""
+    return value.strip().lower()
+
+
+def _validate_dependency_ref(json_path: Path, dotted_path: str, value: str, step: str) -> list[str]:
+    if value.startswith("/"):
+        return [f"{json_path}:{dotted_path}: absolute path is not allowed ({value})"]
+
+    normalized = _normalize_relpath(value)
+    if step == "plan":
+        if normalized.startswith("spec/") and normalized.endswith("/deps.yaml"):
+            return []
+        return [
+            f"{json_path}:{dotted_path}: Plan dependency_ref must be spec/.../deps.yaml ({value})"
+        ]
+
+    if normalized.startswith("workspace/"):
+        return []
+    if step:
+        return [
+            f"{json_path}:{dotted_path}: {step} dependency_ref must start with workspace/ ({value})"
+        ]
+    return [f"{json_path}:{dotted_path}: must start with workspace/ ({value})"]
 
 
 def _git_status_paths(repo_root: Path) -> tuple[set[str], set[str], str | None]:
@@ -168,6 +194,7 @@ def _scan_json_for_violations(json_path: Path) -> list[str]:
 
     def walk(node: Any, dotted_path: str) -> None:
         if isinstance(node, dict):
+            step = _normalize_step_token(node.get("step"))
             for key, value in node.items():
                 child_path = f"{dotted_path}.{key}" if dotted_path else key
 
@@ -180,6 +207,9 @@ def _scan_json_for_violations(json_path: Path) -> list[str]:
                         violations.append(
                             f"{json_path}:{child_path}: must start with workspace/ ({value})"
                         )
+
+                if key == "dependency_ref" and isinstance(value, str):
+                    violations.extend(_validate_dependency_ref(json_path, child_path, value, step))
 
                 if key == "raw_artifact_refs" and isinstance(value, list):
                     for i, item in enumerate(value):

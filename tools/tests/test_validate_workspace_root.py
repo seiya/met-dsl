@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import json
 import subprocess
 import tempfile
 import unittest
@@ -180,6 +181,64 @@ class ValidateWorkspaceRootTests(unittest.TestCase):
             violations, _ = validate(repo_root=repo_root, workspace_root="workspace")
             self.assertFalse(
                 any("non-canonical workspace directory name" in v for v in violations)
+            )
+
+    def test_allows_plan_dependency_ref_to_spec_deps_yaml(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            request = repo_root / "workspace" / "orchestrations" / "orch_001" / "launches" / "run.request.json"
+            request.parent.mkdir(parents=True, exist_ok=True)
+            request.write_text(
+                json.dumps(
+                    {
+                        "step": "plan",
+                        "dependency_ref": "spec/component/example/deps.yaml",
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            violations, _ = validate(repo_root=repo_root, workspace_root="workspace")
+            self.assertFalse(any("dependency_ref" in v for v in violations))
+
+    def test_rejects_generate_dependency_ref_to_spec_deps_yaml(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            request = repo_root / "workspace" / "orchestrations" / "orch_001" / "launches" / "run.request.json"
+            request.parent.mkdir(parents=True, exist_ok=True)
+            request.write_text(
+                json.dumps(
+                    {
+                        "step": "generate",
+                        "dependency_ref": "spec/component/example/deps.yaml",
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            violations, _ = validate(repo_root=repo_root, workspace_root="workspace")
+            self.assertTrue(
+                any("generate dependency_ref must start with workspace/" in v for v in violations)
+            )
+
+    def test_rejects_plan_dependency_ref_outside_spec_deps_yaml(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            request = repo_root / "workspace" / "orchestrations" / "orch_001" / "launches" / "run.request.json"
+            request.parent.mkdir(parents=True, exist_ok=True)
+            request.write_text(
+                json.dumps(
+                    {
+                        "step": "plan",
+                        "dependency_ref": "workspace/plans/example/dependency.resolved.yaml",
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            violations, _ = validate(repo_root=repo_root, workspace_root="workspace")
+            self.assertTrue(
+                any("Plan dependency_ref must be spec/.../deps.yaml" in v for v in violations)
             )
 
     def test_detects_invalid_node_key_safe_directory_name(self) -> None:
