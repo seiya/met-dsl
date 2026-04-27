@@ -19,6 +19,7 @@ from tools.hooks.common import (
     HookDecision,
     HookDecisionAction,
     HookEventName,
+    check_cli_managed_path,
     evaluate_common_policy,
     normalize_hook_event_name,
     READ_HINT,
@@ -583,6 +584,10 @@ def main(argv: list[str] | None = None) -> int:
                         active_id = active_path.read_text(encoding="utf-8").strip()
                         if active_id:
                             for target in _detect_bash_write_targets(decoded.command):
+                                cli_guard = check_cli_managed_path(repo_root, target)
+                                if cli_guard is not None:
+                                    decision = cli_guard
+                                    break
                                 candidate = validate_write_access(
                                     repo_root, orchestration_id, active_id, target
                                 )
@@ -645,7 +650,8 @@ def main(argv: list[str] | None = None) -> int:
                                 decoded.file_path,
                             )
                         else:
-                            decision = validate_write_access(
+                            cli_guard = check_cli_managed_path(repo_root, decoded.file_path)
+                            decision = cli_guard if cli_guard is not None else validate_write_access(
                                 repo_root,
                                 orchestration_id,
                                 active_agent_run_id,
@@ -673,7 +679,8 @@ def main(argv: list[str] | None = None) -> int:
                             decoded.file_path,
                         )
                     else:
-                        decision = validate_write_access(
+                        cli_guard = check_cli_managed_path(repo_root, decoded.file_path)
+                        decision = cli_guard if cli_guard is not None else validate_write_access(
                             repo_root,
                             orchestration_id,
                             mapped_agent_run_id,

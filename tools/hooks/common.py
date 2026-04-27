@@ -271,6 +271,73 @@ def _is_path_under_root(target: Path, root: Path) -> bool:
     return target_s == root_s or target_s.startswith(root_s.rstrip("/") + "/")
 
 
+@dataclass(frozen=True)
+class _CliManagedPath:
+    pattern: re.Pattern[str]
+    cli_hint: str
+
+
+_CLI_MANAGED_PATHS: list[_CliManagedPath] = [
+    _CliManagedPath(
+        re.compile(r"workspace/orchestrations/[^/]+/launches/[^/]+\.(?:response\.json|reply\.txt|prompt\.txt|request\.json)$"),
+        "python3 tools/orchestration_runtime.py record-launch ...",
+    ),
+    _CliManagedPath(
+        re.compile(r"workspace/orchestrations/[^/]+/agent_runs\.jsonl$"),
+        "python3 tools/orchestration_runtime.py record-agent-run ...",
+    ),
+    _CliManagedPath(
+        re.compile(r"workspace/orchestrations/[^/]+/step_results/[^/]+\.json$"),
+        "python3 tools/orchestration_runtime.py write-step-result ...",
+    ),
+    _CliManagedPath(
+        re.compile(r"workspace/orchestrations/[^/]+/orchestration_meta\.json$"),
+        "python3 tools/orchestration_runtime.py init-orchestration / run_workflow.py (auto-generated)",
+    ),
+    _CliManagedPath(
+        re.compile(r"workspace/orchestrations/[^/]+/(?:output|read)_manifests/[^/]+\.json$"),
+        "python3 tools/orchestration_runtime.py record-launch (manifests are auto-generated)",
+    ),
+    _CliManagedPath(
+        re.compile(r"workspace/orchestrations/[^/]+/preflight\.json$"),
+        "python3 tools/run_workflow.py ... (preflight is auto-generated)",
+    ),
+    _CliManagedPath(
+        re.compile(r"workspace/orchestrations/[^/]+/capabilities/[^/]+\.json$"),
+        "python3 tools/orchestration_runtime.py record-launch (capability is auto-generated)",
+    ),
+    _CliManagedPath(
+        re.compile(r"workspace/orchestrations/[^/]+/orchestration_checkpoint\.json$"),
+        "python3 tools/orchestration_runtime.py write-step-result (checkpoint is auto-updated)",
+    ),
+    _CliManagedPath(
+        re.compile(r"workspace/orchestrations/[^/]+/phase_state\.json$"),
+        "python3 tools/orchestration_runtime.py (phase_state is managed by the runtime)",
+    ),
+]
+
+
+def check_cli_managed_path(repo_root: Path, file_path: str) -> "HookDecision | None":
+    """CLI 管理パスに一致するなら BLOCK の HookDecision を返す。一致なしは None。"""
+    abs_target = _resolve_target_path(repo_root, file_path)
+    try:
+        rel = abs_target.relative_to(repo_root).as_posix()
+    except ValueError:
+        rel = file_path
+    for entry in _CLI_MANAGED_PATHS:
+        if entry.pattern.search(rel):
+            return HookDecision(
+                action=HookDecisionAction.BLOCK,
+                reason=(
+                    f"Direct write to CLI-managed path is forbidden: {rel!r}\n"
+                    f"Use: {entry.cli_hint}"
+                ),
+                continue_processing=False,
+                audit_detail={"policy": "cli_managed_path", "path": rel, "cli_hint": entry.cli_hint},
+            )
+    return None
+
+
 def validate_write_access(
     repo_root: Path,
     orchestration_id: str,

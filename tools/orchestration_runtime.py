@@ -6028,6 +6028,71 @@ def guarded_apply_patch(
     }
 
 
+def _validate_record_launch_response_fields(payload: dict[str, Any]) -> None:
+    """record-launch --response-json の必須フィールドを CLI dispatch 時点で検証する。"""
+    label = "record-launch --response-json"
+    for key in ("agent_run_id", "agent_session_id", "started_at", "backend"):
+        value = payload.get(key)
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(
+                f"{label}: required field {key!r} is missing or empty. "
+                f"For Claude Code use: {{\"agent_run_id\": \"<uuid>\", "
+                f"\"agent_session_id\": \"<same uuid>\", "
+                f"\"started_at\": \"<ISO8601>\", \"backend\": \"claude\"}}"
+            )
+    backend = payload["backend"].strip()
+    if backend not in SUPPORTED_BACKENDS:
+        raise ValueError(
+            f"{label}: 'backend' must be one of {sorted(SUPPORTED_BACKENDS)}; got {backend!r}"
+        )
+
+
+def _validate_record_agent_run_fields(payload: dict[str, Any]) -> None:
+    """record-agent-run --agent-run-json の必須フィールドを CLI dispatch 時点で検証する。"""
+    label = "record-agent-run --agent-run-json"
+    for key in ("agent_run_id", "agent_backend", "status"):
+        value = payload.get(key)
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(f"{label}: required field {key!r} is missing or empty")
+    role_raw = payload.get("agent_role") or payload.get("agent_type") or payload.get("role")
+    if not isinstance(role_raw, str) or not role_raw.strip():
+        raise ValueError(f"{label}: required field 'agent_role' is missing or empty")
+    role_token = role_raw.strip().lower()
+    if role_token in {"step", "substep"}:
+        for key in ("node_key", "agent_session_id"):
+            value = payload.get(key)
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(
+                    f"{label}: field {key!r} is required for agent_role={role_token!r}"
+                )
+
+
+def _validate_write_step_result_fields(payload: dict[str, Any], step: str) -> None:
+    """write-step-result --result-json の必須フィールドを CLI dispatch 時点で検証する。"""
+    label = "write-step-result --result-json"
+    status_raw = payload.get("status")
+    if not isinstance(status_raw, str) or not status_raw.strip():
+        raise ValueError(f"{label}: required field 'status' is missing or empty")
+    status_token = status_raw.strip().lower()
+    substep_ids = payload.get("substep_agent_run_ids")
+    if not isinstance(substep_ids, list):
+        type_name = type(substep_ids).__name__ if substep_ids is not None else "missing"
+        raise ValueError(
+            f"{label}: required field 'substep_agent_run_ids' must be a list (got {type_name}). "
+            "Use an empty list [] for step-only phases (build/execute/judge/promote)."
+        )
+    step_token = step.strip().lower()
+    if step_token in STEP_REQUIRED_VALIDATION_STAGES and status_token in TERMINAL_STATUSES:
+        allowed = STEP_REQUIRED_VALIDATION_STAGES[step_token]
+        validation_stage = payload.get("validation_stage")
+        if not isinstance(validation_stage, str) or validation_stage.strip() not in allowed:
+            raise ValueError(
+                f"{label}: step={step_token!r} with terminal status={status_token!r} requires "
+                f"'validation_stage' to be one of {sorted(allowed)}; "
+                f"got {validation_stage!r}"
+            )
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -6335,15 +6400,20 @@ def main(argv: list[str] | None = None) -> int:
             orchestration_id=args.orchestration_id,
         )
     elif args.command == "record-launch":
-        result = record_launch(
-            repo_root=repo_root,
-            orchestration_id=args.orchestration_id,
-            parent_agent_run_id=args.parent_agent_run_id,
-            child_agent_run_id=args.child_agent_run_id,
-            request_payload=args.request_json,
-            response_payload=args.response_json,
-            relation_type=args.relation_type,
-        )
+        try:
+            _validate_record_launch_response_fields(args.response_json)
+            result = record_launch(
+                repo_root=repo_root,
+                orchestration_id=args.orchestration_id,
+                parent_agent_run_id=args.parent_agent_run_id,
+                child_agent_run_id=args.child_agent_run_id,
+                request_payload=args.request_json,
+                response_payload=args.response_json,
+                relation_type=args.relation_type,
+            )
+        except (ValueError, RuntimeError) as exc:
+            print(str(exc), file=sys.stderr)
+            return 1
     elif args.command == "orchestration-read":
         try:
             gate_out = run_gate(
@@ -6386,20 +6456,30 @@ def main(argv: list[str] | None = None) -> int:
             print(str(exc), file=sys.stderr)
             return 1
     elif args.command == "record-agent-run":
-        result = record_agent_run(
-            repo_root=repo_root,
-            orchestration_id=args.orchestration_id,
-            payload=args.agent_run_json,
-        )
+        try:
+            _validate_record_agent_run_fields(args.agent_run_json)
+            result = record_agent_run(
+                repo_root=repo_root,
+                orchestration_id=args.orchestration_id,
+                payload=args.agent_run_json,
+            )
+        except (ValueError, RuntimeError) as exc:
+            print(str(exc), file=sys.stderr)
+            return 1
     elif args.command == "write-step-result":
-        result = write_step_result(
-            repo_root=repo_root,
-            orchestration_id=args.orchestration_id,
-            node_key=args.node_key,
-            step=args.step,
-            agent_run_id=args.agent_run_id,
-            payload=args.result_json,
-        )
+        try:
+            _validate_write_step_result_fields(args.result_json, args.step)
+            result = write_step_result(
+                repo_root=repo_root,
+                orchestration_id=args.orchestration_id,
+                node_key=args.node_key,
+                step=args.step,
+                agent_run_id=args.agent_run_id,
+                payload=args.result_json,
+            )
+        except (ValueError, RuntimeError) as exc:
+            print(str(exc), file=sys.stderr)
+            return 1
     elif args.command == "read-checkpoint":
         loaded = read_checkpoint(repo_root=repo_root, orchestration_id=args.orchestration_id)
         result = (
