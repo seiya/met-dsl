@@ -140,8 +140,7 @@ class HookCommonTests(unittest.TestCase):
             HookDecision(action=HookDecisionAction.ALLOW)
         )
         self.assertEqual(code, 0)
-        loaded = json.loads(stdout_text)
-        self.assertEqual(loaded.get("decision"), "allow")
+        self.assertEqual(stdout_text, "")
 
     def test_claude_adapter_supported_events(self) -> None:
         adapter = ClaudeHookAdapter()
@@ -194,13 +193,11 @@ class HookCommonTests(unittest.TestCase):
         self.assertEqual(loaded.get("decision"), "block")
         self.assertEqual(loaded.get("reason"), "denied")
 
-    def test_claude_adapter_encode_decision_allow_omits_continue_processing(self) -> None:
+    def test_claude_adapter_encode_decision_allow_returns_empty_stdout(self) -> None:
         adapter = ClaudeHookAdapter()
         code, stdout_text = adapter.encode_decision(HookDecision(action=HookDecisionAction.ALLOW))
         self.assertEqual(code, 0)
-        body = json.loads(stdout_text)
-        self.assertEqual(body.get("decision"), "allow")
-        self.assertNotIn("continue_processing", body)
+        self.assertEqual(stdout_text, "")
 
     def test_claude_adapter_encode_decision_block_omits_continue_processing(self) -> None:
         adapter = ClaudeHookAdapter()

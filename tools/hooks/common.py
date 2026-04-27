@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from enum import Enum
 import json
 import os
@@ -11,6 +12,20 @@ import re
 import shlex
 from pathlib import Path
 from typing import Any, Protocol
+
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _lookup_payload_field(payload: dict[str, Any], key: str) -> Any:
+    value = payload.get(key)
+    if value is not None:
+        return value
+    inner = payload.get("payload")
+    if isinstance(inner, dict):
+        return inner.get(key)
+    return None
+
 
 READ_HINT = (
     "Hint: Read only via 'run-gate --gate orchestration_read' and only within "

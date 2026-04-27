@@ -12,18 +12,9 @@ from tools.hooks.common import (
     HookDecisionAction,
     HookEventName,
     HookInput,
+    _lookup_payload_field,
     normalize_hook_event_name,
 )
-
-
-def _event_payload_value(payload: dict[str, Any], key: str) -> Any:
-    value = payload.get(key)
-    if value is not None:
-        return value
-    event_payload = payload.get("payload")
-    if isinstance(event_payload, dict):
-        return event_payload.get(key)
-    return None
 
 
 class CodexHookAdapter(HookBackendAdapter):
@@ -39,8 +30,8 @@ class CodexHookAdapter(HookBackendAdapter):
 
     def decode_event(self, event_name: str, payload: dict[str, Any]) -> HookInput:
         normalized = normalize_hook_event_name(event_name)
-        command = _event_payload_value(payload, "command")
-        tool_input = _event_payload_value(payload, "tool_input")
+        command = _lookup_payload_field(payload, "command")
+        tool_input = _lookup_payload_field(payload, "tool_input")
         if not isinstance(command, str) or not command.strip():
             if isinstance(tool_input, dict):
                 ti_command = tool_input.get("command")
@@ -50,15 +41,15 @@ class CodexHookAdapter(HookBackendAdapter):
                     command = None
             else:
                 command = None
-        prompt = _event_payload_value(payload, "prompt")
-        tool_name = _event_payload_value(payload, "tool_name")
+        prompt = _lookup_payload_field(payload, "prompt")
+        tool_name = _lookup_payload_field(payload, "tool_name")
         file_path: str | None = None
         if isinstance(tool_input, dict):
             fp = tool_input.get("file_path")
             if isinstance(fp, str) and fp.strip():
                 file_path = fp.strip()
-        session_id = _event_payload_value(payload, "session_id")
-        agent_session_id = _event_payload_value(payload, "agent_session_id")
+        session_id = _lookup_payload_field(payload, "session_id")
+        agent_session_id = _lookup_payload_field(payload, "agent_session_id")
         return HookInput(
             event_name=normalized,
             backend="codex",
