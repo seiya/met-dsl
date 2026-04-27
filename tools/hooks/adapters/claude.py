@@ -12,20 +12,9 @@ from tools.hooks.common import (
     HookDecisionAction,
     HookEventName,
     HookInput,
+    _lookup_payload_field,
     normalize_hook_event_name,
 )
-
-
-def _payload_value(payload: dict[str, Any], key: str) -> Any:
-    value = payload.get(key)
-    if value is not None:
-        return value
-    # Claude Code does not nest its payload under a "payload" key, but this
-    # defensive fallback mirrors the Codex adapter for future compatibility.
-    inner = payload.get("payload")
-    if isinstance(inner, dict):
-        return inner.get(key)
-    return None
 
 
 class ClaudeHookAdapter(HookBackendAdapter):
@@ -42,17 +31,17 @@ class ClaudeHookAdapter(HookBackendAdapter):
         command: str | None = None
         # Claude Code wraps the command inside tool_input; check there first.
         # (Codex checks the top-level command field first — the opposite order.)
-        tool_input = _payload_value(payload, "tool_input")
+        tool_input = _lookup_payload_field(payload, "tool_input")
         if isinstance(tool_input, dict):
             raw_cmd = tool_input.get("command")
             if isinstance(raw_cmd, str) and raw_cmd.strip():
                 command = raw_cmd.strip()
         if command is None:
-            raw_cmd = _payload_value(payload, "command")
+            raw_cmd = _lookup_payload_field(payload, "command")
             if isinstance(raw_cmd, str) and raw_cmd.strip():
                 command = raw_cmd.strip()
-        prompt = _payload_value(payload, "prompt")
-        tool_name = _payload_value(payload, "tool_name")
+        prompt = _lookup_payload_field(payload, "prompt")
+        tool_name = _lookup_payload_field(payload, "tool_name")
         file_path: str | None = None
         if isinstance(tool_input, dict):
             fp = tool_input.get("file_path")

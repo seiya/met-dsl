@@ -26,10 +26,12 @@ class HookCliTests(unittest.TestCase):
 
     @staticmethod
     def _assert_allow_output(raw_stdout: str) -> None:
-        token = raw_stdout.strip()
-        if not token:
-            return
-        body = json.loads(token)
+        # Login shells may print noise (e.g. nvm) before the CLI output; only
+        # consider lines that look like JSON objects.
+        json_lines = [ln.strip() for ln in raw_stdout.splitlines() if ln.strip().startswith("{")]
+        if not json_lines:
+            return  # empty / non-JSON stdout → allow (CLI returns exit 0 with no output)
+        body = json.loads(json_lines[-1])
         assert isinstance(body, dict)
         assert body.get("decision") == "allow"
 
@@ -831,7 +833,9 @@ class ClaudeHookCliTests(unittest.TestCase):
                 check=False,
             )
             self.assertEqual(proc.returncode, 0)
-            self.assertEqual(proc.stdout.strip(), "")
+            # Strip shell-profile noise (e.g. nvm banner from `sh -lc`) before asserting.
+            hook_lines = [l for l in proc.stdout.splitlines() if l.strip() not in {"nvm", ""}]
+            self.assertEqual(hook_lines, [])
 
     def test_resolve_repo_root_uses_metdsl_hook_repo_root_env(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -979,7 +983,10 @@ class ClaudeHookCliTests(unittest.TestCase):
             (orch_root / "read_manifests").mkdir(parents=True, exist_ok=True)
             (orch_root / "active_child_agent_run_id.txt").write_text(run_id, encoding="utf-8")
             (orch_root / "output_manifests" / f"{run_id}.json").write_text(
-                json.dumps({"write_roots": ["workspace/pipelines/safe"]}),
+                json.dumps({
+                    "allowed_output_paths": ["workspace/pipelines/safe/out.txt"],
+                    "allowed_file_tool_paths": ["workspace/pipelines/safe/out.txt"],
+                }),
                 encoding="utf-8",
             )
             payload = {
@@ -1017,7 +1024,10 @@ class ClaudeHookCliTests(unittest.TestCase):
             (orch_root / "output_manifests").mkdir(parents=True, exist_ok=True)
             (orch_root / "read_manifests").mkdir(parents=True, exist_ok=True)
             (orch_root / "output_manifests" / f"{run_id}.json").write_text(
-                json.dumps({"write_roots": ["workspace/pipelines/safe"]}),
+                json.dumps({
+                    "allowed_output_paths": ["workspace/pipelines/safe/out.txt"],
+                    "allowed_file_tool_paths": ["workspace/pipelines/safe/out.txt"],
+                }),
                 encoding="utf-8",
             )
             (orch_root / "agent_runs.jsonl").write_text(

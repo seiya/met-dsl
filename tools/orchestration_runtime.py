@@ -21,13 +21,21 @@ from pathlib import Path
 from typing import Any, Callable, Sequence
 
 try:
-    from tools.hooks.common import validate_pipeline_semantics_stage
+    from tools.hooks.common import (
+        _normalize_rel_posix,
+        _utc_now_iso,
+        validate_pipeline_semantics_stage,
+    )
 except ModuleNotFoundError:  # pragma: no cover - import bootstrap for direct CLI execution
     _THIS_FILE = Path(__file__).resolve()
     _REPO_ROOT = _THIS_FILE.parent.parent
     if str(_REPO_ROOT) not in sys.path:
         sys.path.insert(0, str(_REPO_ROOT))
-    from tools.hooks.common import validate_pipeline_semantics_stage
+    from tools.hooks.common import (
+        _normalize_rel_posix,
+        _utc_now_iso,
+        validate_pipeline_semantics_stage,
+    )
 
 TERMINAL_STATUSES = {"pass", "fail", "blocked", "timeout", "cancel"}
 # Judge の pre_phase_complete 検証で semantic_review を要求しない終了理由（未完了扱い）。
@@ -59,10 +67,6 @@ WORKFLOW_PHASE_DOC_BY_STEP: dict[str, str] = {
     "tune": "docs/workflow/phases/phase_06_tune.md",
     "promote": "docs/workflow/phases/phase_07_promote.md",
 }
-
-
-def _utc_now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
 def _read_json(path: Path) -> Any:
@@ -2087,13 +2091,6 @@ def _validate_child_write_contract_preflight(
                 f"{path!r}"
             )
 
-
-def _normalize_rel_posix(path_token: str) -> str:
-    """リポジトリ相対 path を POSIX 形式の先頭無し・末尾スラッシュなしに正規化する。"""
-    t = path_token.strip().replace("\\", "/").lstrip("/")
-    while "//" in t:
-        t = t.replace("//", "/")
-    return t.rstrip("/")
 
 
 def _with_trailing_slash(rel_posix: str) -> str:

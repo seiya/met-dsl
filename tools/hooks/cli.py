@@ -19,6 +19,7 @@ from tools.hooks.common import (
     HookDecision,
     HookDecisionAction,
     HookEventName,
+    _utc_now_iso,
     check_cli_managed_path,
     evaluate_common_policy,
     normalize_hook_event_name,
@@ -67,10 +68,6 @@ def _decision_error(message: str) -> HookDecision:
         reason=message,
         continue_processing=False,
     )
-
-
-def _utc_now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
 def _append_hook_audit(
@@ -262,28 +259,6 @@ def _safe_retry_ttl_seconds() -> int:
 def _env_flag_true(name: str, default: str = "0") -> bool:
     raw = os.environ.get(name, default).strip().lower()
     return raw in {"1", "true", "yes", "on"}
-
-
-def _extract_command_for_policy(payload: dict[str, Any]) -> str | None:
-    command = payload.get("command")
-    if isinstance(command, str) and command.strip():
-        return command.strip()
-    tool_input = payload.get("tool_input")
-    if isinstance(tool_input, dict):
-        inner = tool_input.get("command")
-        if isinstance(inner, str) and inner.strip():
-            return inner.strip()
-    inner_payload = payload.get("payload")
-    if isinstance(inner_payload, dict):
-        command = inner_payload.get("command")
-        if isinstance(command, str) and command.strip():
-            return command.strip()
-        tool_input = inner_payload.get("tool_input")
-        if isinstance(tool_input, dict):
-            inner = tool_input.get("command")
-            if isinstance(inner, str) and inner.strip():
-                return inner.strip()
-    return None
 
 
 def _extract_orchestration_id(payload: dict[str, Any]) -> str | None:
@@ -612,12 +587,14 @@ def main(argv: list[str] | None = None) -> int:
                                 decoded.file_path,
                             )
                         elif orch_agent_run_id and tool_name in {"Write", "Edit"}:
-                            decision = validate_write_access(
-                                repo_root,
-                                orchestration_id,
-                                orch_agent_run_id,
-                                decoded.file_path,
-                                tool_name=tool_name,
+                            decision = HookDecision(
+                                action=HookDecisionAction.BLOCK,
+                                reason=(
+                                    "orchestration agent must not use Write/Edit tools directly. "
+                                    "Use guarded-apply-patch instead: "
+                                    "python3 tools/orchestration_runtime.py guarded-apply-patch ..."
+                                ),
+                                continue_processing=False,
                             )
                         else:
                             hint = _hint_for_file_tool(tool_name)
