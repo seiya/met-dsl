@@ -37,6 +37,7 @@ description: 対応 execution platform で `workflow` 全体を開始し、`orch
 - `plan_ref` と `pipeline_ref` と `dependency_ref` は、起動要求生成時点で canonical path を確定しなければならない。`<agent-determined-...>` などの placeholder を禁止する。
 - child `agent` に許可する phase artifact の変更は、capability token が許可した `write_root` 配下に限定しなければならない。`plan_ref` / `pipeline_ref` 配下の変更は `guarded-apply-patch` または対応 gate を通過した canonical path に限定し、許可 root 外の変更を禁止する。
 - phase artifact を変更する場合、`step agent` / `substep agent` は `guarded-apply-patch` を使用しなければならない。`apply_patch_writes` は内部 gate であり、`run-gate --gate apply_patch_writes` と `apply-patch-gate` を公開経路として使用してはならない。通常 `apply_patch` の直接実行、shell redirection、`tee`、`sed -i`、`perl -0pi`、`python` / `sh` / `bash` による file write を禁止する。
+- `guarded-apply-patch` の疎通確認は dry-run または no-op patch で実施しなければならない。dummy file を新規作成して疎通確認してはならない。
 - `record-launch` は `output_manifests/<agent_run_id>.json` と `read_manifests/<agent_run_id>.json` を生成しなければならない。`guarded-apply-patch` と `record-agent-run` は output manifest を参照し、`orchestration-read` は read manifest を参照して manifest 外 path を reject しなければならない。
 - shell による file write は、対象 path が phase artifact かどうかを問わず禁止対象とし、事前 gate または `record-agent-run` が検出した場合は当該 gate または `record-agent-run` が当該 `agent_run` を reject しなければならない。reject 後は `orchestration agent` が `orchestration_meta.status=fail_closed` を記録して停止しなければならない。
 - `step agent` / `substep agent` の起動要求本文には、input contract、expected output、保存先、失敗時停止条件、`spawn_agent` 義務を明示しなければならない。

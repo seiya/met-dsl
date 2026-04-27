@@ -443,7 +443,8 @@ def _write_roots_for_launch(
     if st == "execute":
         return [_with_trailing_slash(_normalize_rel_posix(f"{pipeline_ref.rstrip('/')}/execute"))]
     if st == "judge":
-        return [_with_trailing_slash(_normalize_rel_posix(f"{pipeline_ref.rstrip('/')}/judge"))]
+        # Judge artifacts are written under execute/<execution_id>/<node_key_safe>/.
+        return [_with_trailing_slash(_normalize_rel_posix(f"{pipeline_ref.rstrip('/')}/execute"))]
     if st == "tune":
         return [_with_trailing_slash(_normalize_rel_posix(f"{pipeline_ref.rstrip('/')}/tune"))]
     return []
@@ -806,6 +807,17 @@ def _reject_noncanonical_phase_write(
         required_child_agent=required,
         current_phase_state=current_phase_state,
     )
+    try:
+        update_orchestration_status(
+            repo_root,
+            orchestration_id,
+            status="fail_closed",
+            reason_code="noncanonical_phase_write_attempt",
+            reason_detail="; ".join(attempted_paths),
+            blocking_policy_scope="apply_patch_writes",
+        )
+    except Exception:
+        pass
     raise RuntimeError(
         "apply_patch gate: noncanonical phase write attempt detected before child_running"
     )
@@ -1745,7 +1757,7 @@ def _write_allowed_output_manifest(
     allowed_output_paths: Sequence[str],
 ) -> str:
     normalized = [
-        _with_trailing_slash(_normalize_rel_posix(p))
+        _normalize_rel_posix(p)
         for p in allowed_output_paths
         if isinstance(p, str) and p.strip()
     ]
@@ -1790,19 +1802,217 @@ def _validate_paths_against_allowed_output_manifest(
     allowed_obj = manifest.get("allowed_output_paths")
     if not isinstance(allowed_obj, list) or not all(isinstance(x, str) for x in allowed_obj):
         raise ValueError("allowed_output_paths manifest must include string array allowed_output_paths")
-    allowed = [_with_trailing_slash(_normalize_rel_posix(p)) for p in allowed_obj if p.strip()]
+    allowed = {_normalize_rel_posix(str(p)) for p in allowed_obj if isinstance(p, str) and str(p).strip()}
     if not allowed:
         raise ValueError("allowed_output_paths manifest must include non-empty allowed_output_paths")
     denied: list[str] = []
+    invalid_paths: list[str] = []
     for raw in paths:
         rel = _normalize_rel_posix(str(raw))
         if not rel:
+            invalid_paths.append(str(raw))
             continue
-        if any(_repo_path_under_prefix(rel, prefix.rstrip("/")) for prefix in allowed):
+        if rel in allowed:
             continue
         denied.append(rel)
-    if denied:
-        raise ValueError("allowed_output_paths manifest violation: " + ", ".join(denied))
+    if denied or invalid_paths:
+        details = [*denied, *[f"<invalid:{token}>" for token in invalid_paths]]
+        raise ValueError("allowed_output_paths manifest violation: " + ", ".join(details))
+
+
+def _allowed_output_paths_for_launch(
+    *,
+    request_payload: dict[str, Any],
+    write_roots: Sequence[str],
+) -> list[str]:
+    role = str(request_payload.get("agent_role") or "").strip().lower()
+    if role not in {"step", "substep"}:
+        return [
+            _normalize_rel_posix(item)
+            for item in write_roots
+            if isinstance(item, str) and item.strip()
+        ]
+    raw_candidates = (
+        request_payload.get("allowed_output_paths")
+        or request_payload.get("required_outputs")
+        or request_payload.get("output_refs")
+    )
+    if not isinstance(raw_candidates, list):
+        raise ValueError(
+            "record-launch requires explicit allowed_output_paths list for step/substep agents"
+        )
+    allowed: list[str] = []
+    for idx, item in enumerate(raw_candidates):
+        if not isinstance(item, str) or not item.strip():
+            raise ValueError(f"allowed_output_paths[{idx}] must be non-empty string")
+        token_raw = item.strip().replace("\\", "/")
+        if token_raw.endswith("/"):
+            raise ValueError(
+                f"allowed_output_paths[{idx}] must be file path (directory is forbidden): {item!r}"
+            )
+        token = _normalize_rel_posix(token_raw)
+        if not token:
+            raise ValueError(f"allowed_output_paths[{idx}] must be valid relative path")
+        allowed.append(token)
+    normalized_roots = [
+        _normalize_rel_posix(root)
+        for root in write_roots
+        if isinstance(root, str) and str(root).strip()
+    ]
+    step_token = str(request_payload.get("step") or "").strip().lower()
+    plan_ref = _normalize_rel_posix(str(request_payload.get("plan_ref") or ""))
+    pipeline_ref = _normalize_rel_posix(str(request_payload.get("pipeline_ref") or ""))
+    node_key = str(request_payload.get("node_key") or "").strip()
+    node_safe = _node_key_to_safe(node_key) if node_key else ""
+    plan_required = {
+        f"{plan_ref}/case.resolved.yaml",
+        f"{plan_ref}/algorithm.resolved.yaml",
+        f"{plan_ref}/impl.resolved.yaml",
+        f"{plan_ref}/dependency.resolved.yaml",
+        f"{plan_ref}/derived_contract.json",
+        f"{plan_ref}/algorithm.summary.md",
+        f"{plan_ref}/plan_meta.json",
+    } if plan_ref else set()
+    generate_prefix = f"{pipeline_ref}/generate/" if pipeline_ref else ""
+    build_prefix = f"{pipeline_ref}/build/" if pipeline_ref else ""
+    execute_prefix = f"{pipeline_ref}/execute/" if pipeline_ref else ""
+    tune_prefix = f"{pipeline_ref}/tune/" if pipeline_ref else ""
+
+    def _matches_phase_contract(path: str) -> bool:
+        if step_token == "plan":
+            return path in plan_required
+        if step_token == "generate":
+            if pipeline_ref and path == f"{pipeline_ref}/lineage.json":
+                return True
+            if generate_prefix and path.startswith(generate_prefix):
+                if "/src/" in path:
+                    return True
+                if path.endswith("/generate_meta.json"):
+                    return True
+            return False
+        if step_token == "build":
+            if build_prefix and path.startswith(build_prefix):
+                return "/bin/" in path or path.endswith("/build_meta.json")
+            return False
+        if step_token == "execute":
+            if not execute_prefix or not node_safe:
+                return False
+            if not path.startswith(execute_prefix):
+                return False
+            tail = path[len(execute_prefix):]
+            tail_parts = [part for part in tail.split("/") if part]
+            # execute contract must be under execute/<execution_id>/<node_safe>/...
+            if len(tail_parts) < 3 or tail_parts[1] != node_safe:
+                return False
+            rel_under_node = "/".join(tail_parts[2:])
+            allowed_files = {
+                "diagnostics.json",
+                "perf.json",
+                "quality_check.json",
+                "verdict.json",
+                "aggregate_verdict.json",
+                "summary.json",
+                "semantic_review.json",
+                "trial_meta.json",
+                "stdout.log",
+                "stderr.log",
+                "metrics_basis.json",
+                "execution_trace.json",
+            }
+            return rel_under_node in allowed_files or rel_under_node.startswith("raw/")
+        if step_token == "judge":
+            if not execute_prefix or not node_safe:
+                return False
+            if not path.startswith(execute_prefix):
+                return False
+            tail = path[len(execute_prefix):]
+            tail_parts = [part for part in tail.split("/") if part]
+            # judge contract must be under execute/<execution_id>/<node_safe>/...
+            if len(tail_parts) < 3 or tail_parts[1] != node_safe:
+                return False
+            rel_under_node = "/".join(tail_parts[2:])
+            allowed_files = {
+                "semantic_review.json",
+                "verdict.json",
+                "aggregate_verdict.json",
+                "summary.json",
+                "trial_meta.json",
+            }
+            return rel_under_node in allowed_files
+        if step_token == "tune":
+            if not tune_prefix or not path.startswith(tune_prefix):
+                return False
+            rel_under_tune = path[len(tune_prefix):]
+            rel_parts = [part for part in rel_under_tune.split("/") if part]
+            # tune contract must be tune/<trial_id>/<artifact>; deeper nesting is forbidden.
+            if len(rel_parts) != 2:
+                return False
+            allowed_files = {
+                "impl.resolved.yaml",
+                "diagnostics.json",
+                "perf.json",
+                "verdict.json",
+                "trial_meta.json",
+                "evaluation.json",
+                "tune_meta.json",
+            }
+            base = rel_parts[1]
+            return (
+                base in allowed_files
+                or base.endswith("_meta.json")
+            )
+        return False
+
+    for idx, path in enumerate(allowed):
+        if normalized_roots and not any(_repo_path_under_prefix(path, root) for root in normalized_roots):
+            raise ValueError(
+                f"allowed_output_paths[{idx}] must be under capability write_roots: {path!r}"
+            )
+        if not _matches_phase_contract(path):
+            raise ValueError(
+                f"allowed_output_paths[{idx}] is outside phase contract outputs for step={step_token!r}: {path!r}"
+            )
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for path in allowed:
+        if path in seen:
+            continue
+        deduped.append(path)
+        seen.add(path)
+    if not deduped:
+        raise ValueError("allowed_output_paths must be non-empty for step/substep agents")
+    return deduped
+
+
+def _validate_child_write_contract_preflight(
+    *,
+    request_payload: dict[str, Any],
+    capability_doc: dict[str, Any],
+    allowed_output_paths: Sequence[str],
+) -> None:
+    role = str(request_payload.get("agent_role") or "").strip().lower()
+    if role not in {"step", "substep"}:
+        return
+    cap_token = str(capability_doc.get("capability_token") or "").strip()
+    if not cap_token:
+        raise ValueError("child_write_contract_preflight: capability_token must be non-empty")
+    roots_obj = capability_doc.get("write_roots")
+    if not isinstance(roots_obj, list):
+        raise ValueError("child_write_contract_preflight: capability write_roots must be list")
+    roots = [_normalize_rel_posix(str(item)) for item in roots_obj if isinstance(item, str) and item.strip()]
+    allowed = [_normalize_rel_posix(str(item)) for item in allowed_output_paths if isinstance(item, str) and item.strip()]
+    if not allowed:
+        raise ValueError("child_write_contract_preflight: allowed_output_paths must be non-empty")
+    for idx, path in enumerate(allowed):
+        if path.endswith("/"):
+            raise ValueError(
+                f"child_write_contract_preflight: allowed_output_paths[{idx}] must be file path, got {path!r}"
+            )
+        if roots and not any(_repo_path_under_prefix(path, root) for root in roots):
+            raise ValueError(
+                "child_write_contract_preflight: allowed_output_path must be under capability write_roots: "
+                f"{path!r}"
+            )
 
 
 def _normalize_rel_posix(path_token: str) -> str:
@@ -4369,6 +4579,8 @@ def _validate_step_meta_payload(meta_data: dict[str, Any], *, step_token: str, m
 def _effective_pass_substep_run_ids(
     payload: dict[str, Any],
     *,
+    repo_root: Path,
+    orchestration_id: str,
     run_records: dict[str, dict[str, Any]],
     node_key: str,
     step_token: str,
@@ -4436,6 +4648,8 @@ def _effective_pass_substep_run_ids(
             )
         repair_target = str(item["repair_target_agent_run_id"]).strip()
         new_run_id = str(item["new_agent_run_id"]).strip()
+        repair_strategy = str(item.get("repair_strategy") or "").strip().lower()
+        repair_reason = str(item.get("repair_reason") or "").strip().lower()
         if repair_target not in listed_run_id_set:
             raise ValueError(
                 f"retry_decisions[{idx}].repair_target_agent_run_id must be listed in substep_agent_run_ids: {repair_target}"
@@ -4452,6 +4666,15 @@ def _effective_pass_substep_run_ids(
         if repair_target_status == "pass":
             raise ValueError(
                 f"retry_decisions[{idx}].repair_target_agent_run_id must reference actual non-pass run: {repair_target}"
+            )
+        violation_path = (
+            _violations_dir(repo_root, orchestration_id)
+            / f"{repair_target}.noncanonical_phase_write_attempt.json"
+        )
+        has_noncanonical_violation = violation_path.exists()
+        if (has_noncanonical_violation or "noncanonical_phase_write_attempt" in repair_reason) and repair_strategy != "restart":
+            raise ValueError(
+                f"retry_decisions[{idx}] must use repair_strategy='restart' for noncanonical_phase_write_attempt"
             )
         replaced_run_ids.add(repair_target)
         adopted_run_ids.add(new_run_id)
@@ -4652,6 +4875,8 @@ def _validate_step_result_payload(
     run_records = _load_run_records(_orchestration_root(repo_root, orchestration_id))
     effective_run_ids, _ = _effective_pass_substep_run_ids(
         payload,
+        repo_root=repo_root,
+        orchestration_id=orchestration_id,
         run_records=run_records,
         node_key=node_key,
         step_token=step_token,
@@ -5479,11 +5704,20 @@ def record_launch(
         out_refs["capability_token"] = cap_doc.get("capability_token", "")
         write_roots_obj = cap_doc.get("write_roots")
         write_roots = [str(item) for item in write_roots_obj] if isinstance(write_roots_obj, list) else []
+        allowed_output_paths = _allowed_output_paths_for_launch(
+            request_payload=request_payload,
+            write_roots=write_roots,
+        )
+        _validate_child_write_contract_preflight(
+            request_payload=request_payload,
+            capability_doc=cap_doc,
+            allowed_output_paths=allowed_output_paths,
+        )
         manifest_ref = _write_allowed_output_manifest(
             repo_root,
             orchestration_id=orchestration_id,
             agent_run_id=child_agent_run_id,
-            allowed_output_paths=write_roots,
+            allowed_output_paths=allowed_output_paths,
         )
         out_refs["allowed_output_manifest_ref"] = manifest_ref
         try:
@@ -6137,6 +6371,8 @@ def main(argv: list[str] | None = None) -> int:
         "phases including Plan; reserve via reserve-phase-root --step generate if not yet created), "
         "dependency_ref (phase rule: Plan => spec/.../deps.yaml; Generate+ => workspace phase root), "
         "skill_name, skill_ref. "
+        "For step/substep launch, one of allowed_output_paths|required_outputs|output_refs must be provided "
+        "as file-path list; runtime validates each path against phase contract outputs and capability write_roots. "
         "plan_id/pipeline_id format: <slug>_<YYYYMMDD>_<seq3> where slug uses hyphens only "
         "(e.g. 'flux-rsn-p0_20260425_001'; underscores in slug are invalid)."
     )

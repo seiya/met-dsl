@@ -344,7 +344,7 @@ def validate_write_access(
     agent_run_id: str,
     file_path: str,
 ) -> HookDecision:
-    """output manifest の write_roots に対して write/edit 対象を検証する。"""
+    """output manifest の allowed_output_paths に対して write/edit 対象を検証する。"""
     manifest_path = (
         repo_root
         / "workspace"
@@ -382,12 +382,39 @@ def validate_write_access(
             ),
             continue_processing=False,
         )
+    allowed_paths_obj = manifest.get("allowed_output_paths")
+    if isinstance(allowed_paths_obj, list):
+        allowed_paths = [str(item).strip() for item in allowed_paths_obj if isinstance(item, str) and item.strip()]
+        abs_target = _resolve_target_path(repo_root, file_path)
+        try:
+            rel_target = abs_target.relative_to(repo_root).as_posix()
+        except ValueError:
+            rel_target = str(abs_target).replace("\\", "/")
+        rel_target_norm = rel_target.strip("/").replace("\\", "/")
+        if rel_target_norm in [p.strip("/").replace("\\", "/") for p in allowed_paths]:
+            return HookDecision(action=HookDecisionAction.ALLOW)
+        return HookDecision(
+            action=HookDecisionAction.BLOCK,
+            reason=(
+                f"unauthorized write: {file_path!r} is not in output_manifest allowed_output_paths "
+                f"(agent_run_id={agent_run_id!r}). {WRITE_HINT}"
+            ),
+            continue_processing=False,
+            audit_detail={
+                "policy": "output_manifest_write_guard",
+                "file_path": file_path,
+                "agent_run_id": agent_run_id,
+                "allowed_output_paths": allowed_paths,
+            },
+        )
+
+    # Backward compatibility for legacy manifests.
     write_roots_obj = manifest.get("write_roots")
     if not isinstance(write_roots_obj, list):
         return HookDecision(
             action=HookDecisionAction.BLOCK,
             reason=(
-                f"output manifest missing write_roots list for agent_run_id={agent_run_id!r}. "
+                f"output manifest missing allowed_output_paths/write_roots list for agent_run_id={agent_run_id!r}. "
                 f"{MANIFEST_HINT}"
             ),
             continue_processing=False,

@@ -17,6 +17,9 @@ from mcp_servers.build_runtime_server import tool_compile_project
 
 from tools.orchestration_runtime import (
     TERMINAL_STATUSES,
+    _allowed_output_paths_for_launch,
+    _effective_pass_substep_run_ids,
+    _validate_paths_against_allowed_output_manifest,
     _required_launch_prompt_constraint_lines,
     _pre_phase_complete_judge_checks,
     _required_child_agent_kind,
@@ -274,6 +277,47 @@ class CodexOrchestrationRuntimeTests(unittest.TestCase):
 
     def test_terminal_statuses_do_not_include_fail_closed(self) -> None:
         self.assertEqual(TERMINAL_STATUSES, {"pass", "fail", "blocked", "timeout", "cancel"})
+
+    def test_effective_pass_substep_run_ids_uses_violation_file_without_nameerror(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            orchestration_id = "orch_retry"
+            violation_path = (
+                repo_root
+                / "workspace"
+                / "orchestrations"
+                / orchestration_id
+                / "violations"
+                / "sub_old.noncanonical_phase_write_attempt.json"
+            )
+            violation_path.parent.mkdir(parents=True, exist_ok=True)
+            violation_path.write_text("{}", encoding="utf-8")
+            payload = {
+                "substep_agent_run_ids": ["sub_old", "sub_new"],
+                "failed_substeps": [],
+                "retry_decisions": [
+                    {
+                        "issue_severity": "major",
+                        "repair_strategy": "reuse",
+                        "repair_target_agent_run_id": "sub_old",
+                        "new_agent_run_id": "sub_new",
+                        "repair_reason": "repair",
+                    }
+                ],
+            }
+            run_records = {
+                "sub_old": {"agent_role": "substep", "node_key": "problem/shallow_water2d@0.3.0", "step": "plan", "status": "fail"},
+                "sub_new": {"agent_role": "substep", "node_key": "problem/shallow_water2d@0.3.0", "step": "plan", "status": "pass"},
+            }
+            with self.assertRaisesRegex(ValueError, "must use repair_strategy='restart'"):
+                _effective_pass_substep_run_ids(
+                    payload,
+                    repo_root=repo_root,
+                    orchestration_id=orchestration_id,
+                    run_records=run_records,
+                    node_key="problem/shallow_water2d@0.3.0",
+                    step_token="plan",
+                )
 
     def test_parse_feature_list_extracts_boolean_flags(self) -> None:
         raw = """
@@ -6433,6 +6477,7 @@ class TestPhase1RuleSourceAudit(unittest.TestCase):
                     "skill_name": "workflow-plan-generate",
                     "skill_ref": "skills/workflow-plan-generate/SKILL.md",
                     "skill_must_read_refs": "",
+                    "allowed_output_paths": [f"{_FIX_PLAN_REF}/case.resolved.yaml"],
                     "launch_prompt_full": _substep_launch_prompt(
                         "problem/shallow_water2d@0.3.0",
                         "plan",
@@ -6486,7 +6531,10 @@ class TestPhase1RuleSourceAudit(unittest.TestCase):
             self.assertTrue(manifest_path.exists())
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
             self.assertEqual(manifest.get("agent_run_id"), "substep_p1_001")
-            self.assertEqual(manifest.get("allowed_output_paths"), cap.get("write_roots"))
+            self.assertEqual(
+                manifest.get("allowed_output_paths"),
+                [f"{_FIX_PLAN_REF}/case.resolved.yaml"],
+            )
             read_manifest_path = orch / "read_manifests" / "substep_p1_001.json"
             self.assertTrue(read_manifest_path.exists())
             read_manifest = json.loads(read_manifest_path.read_text(encoding="utf-8"))
@@ -7525,6 +7573,7 @@ class TestPhase3RunGate(unittest.TestCase):
             "repair_strategy": "none",
             "repair_target_agent_run_id": "none",
             "repair_reason": "none",
+            "allowed_output_paths": [f"{_FIX_PIPE_REF}/build/build_001/build_meta.json"],
             "launch_prompt_full": render_launch_prompt_text(
                 {
                     "agent_run_id": "build_child_rg1",
@@ -7563,6 +7612,232 @@ class TestPhase3RunGate(unittest.TestCase):
             ).read_text(encoding="utf-8")
         )
         return str(cap["capability_token"])
+
+    def test_record_launch_rejects_allowed_output_paths_outside_phase_contract(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            init_orchestration(repo_root=repo_root, orchestration_id="rg_bad")
+            write_preflight(
+                repo_root=repo_root,
+                orchestration_id="rg_bad",
+                payload={
+                    "status": "pass",
+                    "sandbox_runtime": "bwrap",
+                    "sandbox_enforced": True,
+                    "can_launch_step_agents": True,
+                    "can_launch_substep_agents": True,
+                    "feature_states": {"multi_agent": True, "codex_hooks": True},
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
+                },
+            )
+            bad_req = {
+                "agent_run_id": "build_bad_001",
+                "agent_role": "step",
+                "node_key": "problem/shallow_water2d@0.3.0",
+                "step": "build",
+                "orchestration_id": "rg_bad",
+                "parent_agent_run_id": "orch_bad",
+                "plan_ref": _FIX_PLAN_REF,
+                "pipeline_ref": _FIX_PIPE_REF,
+                "dependency_ref": _FIX_DEP_REF,
+                "skill_name": "workflow-build",
+                "skill_ref": "skills/workflow-build/SKILL.md",
+                "skill_must_read_refs": _fixture_skill_must_read_refs_step("build"),
+                "issue_severity": "none",
+                "repair_strategy": "none",
+                "repair_target_agent_run_id": "none",
+                "repair_reason": "none",
+                "allowed_output_paths": [f"{_FIX_PIPE_REF}/build/test3.tmp"],
+                "launch_prompt_full": render_launch_prompt_text(
+                    {
+                        "agent_run_id": "build_bad_001",
+                        "node_key": "problem/shallow_water2d@0.3.0",
+                        "step": "build",
+                        "orchestration_id": "rg_bad",
+                        "parent_agent_run_id": "orch_bad",
+                        "plan_ref": _FIX_PLAN_REF,
+                        "pipeline_ref": _FIX_PIPE_REF,
+                        "dependency_ref": _FIX_DEP_REF,
+                        "skill_name": "workflow-build",
+                        "skill_ref": "skills/workflow-build/SKILL.md",
+                        "skill_must_read_refs": _fixture_skill_must_read_refs_step("build"),
+                        "issue_severity": "none",
+                        "repair_strategy": "none",
+                        "repair_target_agent_run_id": "none",
+                        "repair_reason": "none",
+                    }
+                ),
+            }
+            with self.assertRaisesRegex(ValueError, "outside phase contract outputs"):
+                record_launch(
+                    repo_root=repo_root,
+                    orchestration_id="rg_bad",
+                    parent_agent_run_id="orch_bad",
+                    child_agent_run_id="build_bad_001",
+                    request_payload=bad_req,
+                    response_payload={"agent_run_id": "build_bad_001", **_spawn_response_payload("sess_bad")},
+                )
+
+    def test_record_launch_rejects_execute_path_without_node_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            init_orchestration(repo_root=repo_root, orchestration_id="rg_exec_bad")
+            write_preflight(
+                repo_root=repo_root,
+                orchestration_id="rg_exec_bad",
+                payload={
+                    "status": "pass",
+                    "sandbox_runtime": "bwrap",
+                    "sandbox_enforced": True,
+                    "can_launch_step_agents": True,
+                    "can_launch_substep_agents": True,
+                    "feature_states": {"multi_agent": True, "codex_hooks": True},
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
+                },
+            )
+            bad_req = {
+                "agent_run_id": "execute_bad_001",
+                "agent_role": "step",
+                "node_key": "problem/shallow_water2d@0.3.0",
+                "step": "execute",
+                "orchestration_id": "rg_exec_bad",
+                "parent_agent_run_id": "orch_exec_bad",
+                "plan_ref": _FIX_PLAN_REF,
+                "pipeline_ref": _FIX_PIPE_REF,
+                "dependency_ref": _FIX_DEP_REF,
+                "skill_name": "workflow-execute",
+                "skill_ref": "skills/workflow-execute/SKILL.md",
+                "skill_must_read_refs": _fixture_skill_must_read_refs_step("execute"),
+                "issue_severity": "none",
+                "repair_strategy": "none",
+                "repair_target_agent_run_id": "none",
+                "repair_reason": "none",
+                "allowed_output_paths": [f"{_FIX_PIPE_REF}/execute/exec_001/diagnostics.json"],
+                "launch_prompt_full": render_launch_prompt_text(
+                    {
+                        "agent_run_id": "execute_bad_001",
+                        "node_key": "problem/shallow_water2d@0.3.0",
+                        "step": "execute",
+                        "orchestration_id": "rg_exec_bad",
+                        "parent_agent_run_id": "orch_exec_bad",
+                        "plan_ref": _FIX_PLAN_REF,
+                        "pipeline_ref": _FIX_PIPE_REF,
+                        "dependency_ref": _FIX_DEP_REF,
+                        "skill_name": "workflow-execute",
+                        "skill_ref": "skills/workflow-execute/SKILL.md",
+                        "skill_must_read_refs": _fixture_skill_must_read_refs_step("execute"),
+                        "issue_severity": "none",
+                        "repair_strategy": "none",
+                        "repair_target_agent_run_id": "none",
+                        "repair_reason": "none",
+                    }
+                ),
+            }
+            with self.assertRaisesRegex(ValueError, "outside phase contract outputs"):
+                record_launch(
+                    repo_root=repo_root,
+                    orchestration_id="rg_exec_bad",
+                    parent_agent_run_id="orch_exec_bad",
+                    child_agent_run_id="execute_bad_001",
+                    request_payload=bad_req,
+                    response_payload={"agent_run_id": "execute_bad_001", **_spawn_response_payload("sess_exec_bad")},
+                )
+
+    def test_allowed_output_paths_for_launch_allows_tune_contract_output_path(self) -> None:
+        req = {
+            "agent_role": "substep",
+            "node_key": "problem/shallow_water2d@0.3.0",
+            "step": "tune",
+            "plan_ref": _FIX_PLAN_REF,
+            "pipeline_ref": _FIX_PIPE_REF,
+            "allowed_output_paths": [f"{_FIX_PIPE_REF}/tune/trial_001/impl.resolved.yaml"],
+        }
+        out = _allowed_output_paths_for_launch(
+            request_payload=req,
+            write_roots=[f"{_FIX_PIPE_REF}/tune/"],
+        )
+        self.assertEqual(out, [f"{_FIX_PIPE_REF}/tune/trial_001/impl.resolved.yaml"])
+
+    def test_allowed_output_paths_for_launch_rejects_nested_tune_subdirectory(self) -> None:
+        req = {
+            "agent_role": "substep",
+            "node_key": "problem/shallow_water2d@0.3.0",
+            "step": "tune",
+            "plan_ref": _FIX_PLAN_REF,
+            "pipeline_ref": _FIX_PIPE_REF,
+            "allowed_output_paths": [f"{_FIX_PIPE_REF}/tune/trial_001/subdir/impl.resolved.yaml"],
+        }
+        with self.assertRaisesRegex(ValueError, "outside phase contract outputs"):
+            _allowed_output_paths_for_launch(
+                request_payload=req,
+                write_roots=[f"{_FIX_PIPE_REF}/tune/"],
+            )
+
+    def test_allowed_output_paths_for_launch_allows_judge_contract_path(self) -> None:
+        req = {
+            "agent_role": "step",
+            "node_key": "problem/shallow_water2d@0.3.0",
+            "step": "judge",
+            "plan_ref": _FIX_PLAN_REF,
+            "pipeline_ref": _FIX_PIPE_REF,
+            "allowed_output_paths": [
+                f"{_FIX_PIPE_REF}/execute/ex_001/problem__shallow_water2d__0.3.0/summary.json"
+            ],
+        }
+        out = _allowed_output_paths_for_launch(
+            request_payload=req,
+            write_roots=[f"{_FIX_PIPE_REF}/execute/"],
+        )
+        self.assertEqual(
+            out,
+            [f"{_FIX_PIPE_REF}/execute/ex_001/problem__shallow_water2d__0.3.0/summary.json"],
+        )
+
+    def test_allowed_output_paths_for_launch_rejects_judge_path_under_legacy_judge_root(self) -> None:
+        req = {
+            "agent_role": "step",
+            "node_key": "problem/shallow_water2d@0.3.0",
+            "step": "judge",
+            "plan_ref": _FIX_PLAN_REF,
+            "pipeline_ref": _FIX_PIPE_REF,
+            "allowed_output_paths": [
+                f"{_FIX_PIPE_REF}/judge/jdg_001/problem__shallow_water2d__0.3.0/summary.json"
+            ],
+        }
+        with self.assertRaisesRegex(ValueError, "must be under capability write_roots"):
+            _allowed_output_paths_for_launch(
+                request_payload=req,
+                write_roots=[f"{_FIX_PIPE_REF}/execute/"],
+            )
+
+    def test_validate_paths_against_allowed_output_manifest_rejects_empty_normalized_path(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            manifest_path = (
+                repo_root
+                / "workspace/orchestrations/rg_invalid/output_manifests/build_child_rg1.json"
+            )
+            manifest_path.parent.mkdir(parents=True, exist_ok=True)
+            manifest_path.write_text(
+                json.dumps(
+                    {
+                        "orchestration_id": "rg_invalid",
+                        "agent_run_id": "build_child_rg1",
+                        "allowed_output_paths": [f"{_FIX_PIPE_REF}/build/build_001/build_meta.json"],
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(ValueError, "allowed_output_paths manifest violation"):
+                _validate_paths_against_allowed_output_manifest(
+                    repo_root,
+                    orchestration_id="rg_invalid",
+                    agent_run_id="build_child_rg1",
+                    paths=["/"],
+                )
 
     def test_run_gate_writes_artifact_and_cli_stdout_contract(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -7662,9 +7937,9 @@ class TestPhase3RunGate(unittest.TestCase):
             token = self._setup_run_gate_fixture(repo_root)
             patch_text = "\n".join(
                 [
-                    "diff --git a/workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/build/new_artifact.json b/workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/build/new_artifact.json",
-                    "--- a/workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/build/new_artifact.json",
-                    "+++ b/workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/build/new_artifact.json",
+                    "diff --git a/workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/build/build_001/build_meta.json b/workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/build/build_001/build_meta.json",
+                    "--- a/workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/build/build_001/build_meta.json",
+                    "+++ b/workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/build/build_001/build_meta.json",
                     "@@ -0,0 +1 @@",
                     "+{\"ok\": true}",
                     "",
@@ -7677,7 +7952,7 @@ class TestPhase3RunGate(unittest.TestCase):
                     orchestration_id="rg1",
                     actor_role="step",
                     agent_run_id="build_child_rg1",
-                    changed_paths=[f"{_FIX_PIPE_REF}/build/new_artifact.json"],
+                    changed_paths=[f"{_FIX_PIPE_REF}/build/build_001/build_meta.json"],
                     patch_text=patch_text,
                     capability_token=token,
                 )
@@ -7687,6 +7962,33 @@ class TestPhase3RunGate(unittest.TestCase):
                 "workspace/orchestrations/rg1/gates/build_child_rg1/apply_patch_writes.json",
             )
             self.assertEqual(run_mock.call_count, 1)
+
+    def test_guarded_apply_patch_rejects_file_under_directory_when_not_listed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            token = self._setup_run_gate_fixture(repo_root)
+            patch_text = "\n".join(
+                [
+                    "diff --git a/workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/build/subdir/new_artifact.json b/workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/build/subdir/new_artifact.json",
+                    "--- a/workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/build/subdir/new_artifact.json",
+                    "+++ b/workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/build/subdir/new_artifact.json",
+                    "@@ -0,0 +1 @@",
+                    "+{\"ok\": true}",
+                    "",
+                ]
+            )
+            with patch("tools.orchestration_runtime.subprocess.run") as run_mock:
+                with self.assertRaisesRegex(ValueError, "allowed_output_paths manifest violation"):
+                    guarded_apply_patch(
+                        repo_root,
+                        orchestration_id="rg1",
+                        actor_role="step",
+                        agent_run_id="build_child_rg1",
+                        changed_paths=[f"{_FIX_PIPE_REF}/build/subdir/new_artifact.json"],
+                        patch_text=patch_text,
+                        capability_token=token,
+                    )
+            self.assertEqual(run_mock.call_count, 0)
 
     def test_guarded_apply_patch_rejects_patch_outside_declared_paths(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

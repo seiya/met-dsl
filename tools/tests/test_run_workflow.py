@@ -14,6 +14,33 @@ from tools import run_workflow
 
 
 class RunWorkflowTests(unittest.TestCase):
+    def test_collect_failure_analysis_includes_unauthorized_write_violation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            orch_root = repo_root / "workspace" / "orchestrations" / "orch_vio"
+            violations = orch_root / "violations"
+            violations.mkdir(parents=True, exist_ok=True)
+            (orch_root / "orchestration_meta.json").write_text(
+                json.dumps({"orchestration_id": "orch_vio", "status": "fail"}, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            (violations / "run_001.unauthorized_write_violation.json").write_text(
+                json.dumps(
+                    {
+                        "agent_run_id": "run_001",
+                        "unauthorized_paths": ["workspace/pipelines/x/test3.tmp"],
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            analysis = run_workflow._collect_failure_analysis(repo_root, "orch_vio")
+            self.assertEqual(len(analysis.get("unauthorized_write_violations", [])), 1)
+            decisions = analysis.get("recommended_retry_decisions", [])
+            self.assertTrue(isinstance(decisions, list) and decisions)
+            self.assertEqual(decisions[0].get("repair_strategy"), "restart")
+            self.assertIn("unauthorized_write_violation", str(decisions[0].get("repair_reason")))
+
     def test_spec_ref_matches_directory_and_file_path(self) -> None:
         self.assertTrue(run_workflow._spec_ref_matches("spec/problem", "spec/problem/test.md"))
         self.assertTrue(run_workflow._spec_ref_matches("spec/problem/test.md", "spec/problem"))
