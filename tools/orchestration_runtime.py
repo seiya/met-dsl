@@ -1755,6 +1755,7 @@ def _write_allowed_output_manifest(
     orchestration_id: str,
     agent_run_id: str,
     allowed_output_paths: Sequence[str],
+    agent_role: str | None = None,
 ) -> str:
     normalized = [
         _normalize_rel_posix(p)
@@ -1767,6 +1768,8 @@ def _write_allowed_output_manifest(
         "allowed_output_paths": sorted(set(normalized)),
         "generated_at": _utc_now_iso(),
     }
+    if isinstance(agent_role, str) and agent_role.strip():
+        payload["agent_role"] = agent_role.strip()
     out_path = _allowed_output_manifest_path(repo_root, orchestration_id, agent_run_id)
     _write_json(out_path, payload)
     return f"workspace/orchestrations/{orchestration_id}/output_manifests/{agent_run_id.strip()}.json"
@@ -5376,6 +5379,15 @@ def init_orchestration(
         allowed_read_roots=["docs/", "spec/", "skills/", "workspace/"],
         denied_read_roots=["tools/"],
     )
+    _write_allowed_output_manifest(
+        repo_root,
+        orchestration_id=orchestration_id,
+        agent_run_id=orchestration_agent_run_id,
+        allowed_output_paths=[
+            f"workspace/orchestrations/{orchestration_id}/failure_analysis.json",
+        ],
+        agent_role="orchestration",
+    )
 
     graph_path = root / "agent_graph.json"
     if not graph_path.exists():
@@ -5982,6 +5994,55 @@ def record_agent_run(
     return payload
 
 
+def deactivate_child_agent(
+    repo_root: Path,
+    orchestration_id: str,
+    *,
+    child_run_id: str,
+) -> dict[str, Any]:
+    active_path = _active_child_agent_run_id_path(repo_root, orchestration_id)
+    if not active_path.exists():
+        return {
+            "deactivated_child_run_id": child_run_id,
+            "orchestration_id": orchestration_id,
+            "deactivated_at": _utc_now_iso(),
+            "already_inactive": True,
+        }
+    active_value = active_path.read_text(encoding="utf-8").strip()
+    if active_value != child_run_id:
+        raise ValueError(
+            "active child run mismatch: "
+            f"expected={child_run_id!r}, actual={active_value!r}"
+        )
+    active_path.unlink()
+    return {
+        "deactivated_child_run_id": child_run_id,
+        "orchestration_id": orchestration_id,
+        "deactivated_at": _utc_now_iso(),
+        "already_inactive": False,
+    }
+
+
+def record_reply_text(
+    repo_root: Path,
+    orchestration_id: str,
+    *,
+    agent_run_id: str,
+    reply_text: str,
+) -> dict[str, Any]:
+    if not isinstance(reply_text, str) or not reply_text.strip():
+        raise ValueError("record-reply requires non-empty reply_text")
+    _, reply_ref = _launch_dialog_refs(orchestration_id, agent_run_id)
+    reply_path = repo_root / reply_ref
+    _write_text(reply_path, reply_text)
+    return {
+        "orchestration_id": orchestration_id,
+        "agent_run_id": agent_run_id,
+        "reply_ref": reply_ref,
+        "recorded_at": _utc_now_iso(),
+    }
+
+
 def write_step_result(
     repo_root: Path,
     orchestration_id: str,
@@ -6508,6 +6569,18 @@ def main(argv: list[str] | None = None) -> int:
     step_parser.add_argument("--agent-run-id", required=True)
     step_parser.add_argument("--result-json", required=True, type=_json_arg, help=_STEP_RESULT_HELP)
 
+    deactivate_child_parser = subparsers.add_parser("deactivate-child")
+    deactivate_child_parser.add_argument("--repo-root", required=True)
+    deactivate_child_parser.add_argument("--orchestration-id", required=True)
+    deactivate_child_parser.add_argument("--child-run-id", required=True)
+
+    record_reply_parser = subparsers.add_parser("record-reply")
+    record_reply_parser.add_argument("--repo-root", required=True)
+    record_reply_parser.add_argument("--orchestration-id", required=True)
+    record_reply_parser.add_argument("--agent-run-id", required=True)
+    record_reply_parser.add_argument("--reply-text")
+    record_reply_parser.add_argument("--reply-from-stdin", action="store_true")
+
     status_parser = subparsers.add_parser("set-status")
     status_parser.add_argument("--repo-root", required=True)
     status_parser.add_argument("--orchestration-id", required=True)
@@ -6714,6 +6787,39 @@ def main(argv: list[str] | None = None) -> int:
                 payload=args.result_json,
             )
         except (ValueError, RuntimeError) as exc:
+            print(str(exc), file=sys.stderr)
+            return 1
+    elif args.command == "deactivate-child":
+        try:
+            result = deactivate_child_agent(
+                repo_root=repo_root,
+                orchestration_id=args.orchestration_id,
+                child_run_id=args.child_run_id,
+            )
+        except ValueError as exc:
+            print(str(exc), file=sys.stderr)
+            return 1
+    elif args.command == "record-reply":
+        if args.reply_from_stdin:
+            reply_text = sys.stdin.read()
+            if not isinstance(reply_text, str):
+                reply_text = ""
+        else:
+            reply_text = args.reply_text
+        if not isinstance(reply_text, str):
+            print("record-reply requires --reply-text or --reply-from-stdin", file=sys.stderr)
+            return 1
+        if not reply_text.strip():
+            print("record-reply requires non-empty reply_text", file=sys.stderr)
+            return 1
+        try:
+            result = record_reply_text(
+                repo_root=repo_root,
+                orchestration_id=args.orchestration_id,
+                agent_run_id=args.agent_run_id,
+                reply_text=reply_text,
+            )
+        except ValueError as exc:
             print(str(exc), file=sys.stderr)
             return 1
     elif args.command == "read-checkpoint":

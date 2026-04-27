@@ -82,7 +82,11 @@ description: 対応 execution platform で `workflow` 全体を開始し、`orch
 10. `Generate` 以降の子 `agent` 起動前に、対象 `node` の直下依存 `node` ごとの `plan_ref` と `pipeline_ref` と `aggregate_verdict` を照合し、`direct dependency execution readiness` 不成立なら子 `agent` を起動せず `blocked` または `fail` を記録する。
 11. phase 本体へ進む前に、`preflight` 済み、launch prompt 準備済み、child `agent` 起動済みの 3 条件を確認する。未充足なら編集、`MCP` 実行、phase artifact 生成を開始してはならない。
 12. 生成した起動要求本文で子 `agent` を起動する。起動成功直後の実 `spawn_agent` 応答だけを `record-launch` で保存し、`launch_prompt_ref` と `launch_reply_ref` も同時に記録する。実起動前の仮記録、起動失敗後の補完記録、任意 `response_payload` の後投入を禁止する。
-13. 子 `agent` 完了後は `python3 tools/orchestration_runtime.py record-agent-run --repo-root <repo_root> --orchestration-id <orchestration_id> --agent-run-json '<json>'` を実行し、`agent_runs.jsonl` へ 1 行追記する。`record-agent-run` により `agent.result.json` と `agent.summary.txt` も同時に保存しなければならない。`record-agent-run` は、申告した `output_refs` と `apply_patch_writes` internal gate 記録と output manifest 記録に加えて baseline との差分で実変更 path を検査するため、capability token の `write_root` または gate 許可 path または manifest 許可 path に含まれない `unauthorized write` が存在する場合は当該 `agent_run` を reject する。reject 発生後は `orchestration agent` が `orchestration_meta.status=fail_closed` を記録して停止しなければならない。
+13. 子 `agent` 完了後は、次の順序で記録処理を実行する。
+    1. `deactivate-child` を実行して active context を orchestration agent へ切り戻す。
+    2. `record-reply` で `launches/<agent_run_id>.reply.txt` を Agent tool の最終応答テキストで上書き保存する。
+    3. `python3 tools/orchestration_runtime.py record-agent-run --repo-root <repo_root> --orchestration-id <orchestration_id> --agent-run-json '<json>'` を実行して `agent_runs.jsonl` へ 1 行追記する。
+    `record-agent-run` により `agent.result.json` と `agent.summary.txt` も同時に保存しなければならない。`record-agent-run` は、申告した `output_refs` と `apply_patch_writes` internal gate 記録と output manifest 記録に加えて baseline との差分で実変更 path を検査するため、capability token の `write_root` または gate 許可 path または manifest 許可 path に含まれない `unauthorized write` が存在する場合は当該 `agent_run` を reject する。reject 発生後は `orchestration agent` が `orchestration_meta.status=fail_closed` を記録して停止しなければならない。
 14. `substep` を持つ phase では、返却結果を評価して `issue_severity` と `repair_strategy` を決定する。再投入が必要な場合は `repair_target_agent_run_id` と `repair_reason` を起動要求へ付与して再起動し、`record-launch` を追加する。
 15. `repair_strategy=reuse` の再投入では、対象 `substep` の契約を変更せず差分修正だけを要求する。`repair_strategy=restart` の再投入では、対象 `substep` の契約入力から再生成させる。
 16. 契約に反する近道を取りたくなった場合は、子 `agent` 起動必須であることを `commentary` で明示し、launch 手順へ戻る。ローカル実装を継続してはならない。

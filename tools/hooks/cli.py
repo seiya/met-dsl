@@ -612,13 +612,11 @@ def main(argv: list[str] | None = None) -> int:
                                 decoded.file_path,
                             )
                         elif orch_agent_run_id and tool_name in {"Write", "Edit"}:
-                            decision = HookDecision(
-                                action=HookDecisionAction.BLOCK,
-                                reason=(
-                                    "orchestration agent must not use Write/Edit tools directly. "
-                                    "Use Bash + guarded-apply-patch for orchestration artifacts."
-                                ),
-                                continue_processing=False,
+                            decision = validate_write_access(
+                                repo_root,
+                                orchestration_id,
+                                orch_agent_run_id,
+                                decoded.file_path,
                             )
                         else:
                             hint = _hint_for_file_tool(tool_name)
