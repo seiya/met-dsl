@@ -16,9 +16,12 @@ from unittest.mock import patch
 from mcp_servers.build_runtime_server import tool_compile_project
 
 from tools.orchestration_runtime import (
+    CLI_MANAGED_EXTENSIONS,
     TERMINAL_STATUSES,
+    _allowed_file_tool_paths_for_launch,
     _allowed_output_paths_for_launch,
     _effective_pass_substep_run_ids,
+    _is_direct_write_path,
     _validate_paths_against_allowed_output_manifest,
     _required_launch_prompt_constraint_lines,
     _pre_phase_complete_judge_checks,
@@ -141,9 +144,11 @@ repair_reason: none
 - `capability_token` は `workspace/orchestrations/<orchestration_id>/capabilities/<agent_run_id>.json` を canonical source とし、起動直後に同 file を読み `capability_token` を抽出して以後の `run-gate` / `guarded-apply-patch` へ渡すこと。
 - `capability_token` が未取得または不一致の場合は処理を開始せず fail で停止すること。
 - `orchestration-read` は `python3 tools/orchestration_runtime.py run-gate --gate orchestration_read --agent-run-id <agent_run_id> --capability-token <capability_token> --args-json '{{"read_path":"..."}}'` を唯一の経路として実行し、`orchestration-read` 直呼びを禁止する。
-- `apply_patch` は `python3 tools/orchestration_runtime.py guarded-apply-patch --repo-root <repo_root> --orchestration-id <orchestration_id> --actor-role step --agent-run-id <agent_run_id> --paths-json '["..."]' --patch-text '<patch_text>' --capability-token <capability_token>` を唯一の経路として実行し、拒否時は編集を停止すること。
-- 書き込みは `guarded-apply-patch` 経由に限定し、`run-gate --gate apply_patch_writes` と `apply-patch-gate` と shell redirection・直接 `write_text`・任意コマンドによる file write を禁止する。
-- `guarded-apply-patch` は `output_manifests/<agent_run_id>.json` を参照して manifest 外 path を reject する。manifest 外 path へ書いてはならない。
+- 書き込み経路は出力 path の extension で分岐する。`output_manifests/<agent_run_id>.json` を canonical source として参照し、`allowed_output_paths` と `allowed_file_tool_paths` の両 list を起動直後に確認すること。
+- `.json` と `.txt` の出力は `python3 tools/orchestration_runtime.py guarded-apply-patch --repo-root <repo_root> --orchestration-id <orchestration_id> --actor-role step --agent-run-id <agent_run_id> --paths-json '["..."]' --patch-text '<patch_text>' --capability-token <capability_token>` を唯一の経路として実行し、拒否時は編集を停止すること。
+- `.yaml` / `.yml` / `.md` および source code 等の上記以外の出力は、`output_manifests/<agent_run_id>.json` の `allowed_file_tool_paths` に列挙された path に限り、`Edit` / `Write` tool で直接書き込むこと。
+- `run-gate --gate apply_patch_writes` と `apply-patch-gate` の公開経路としての使用、shell redirection・`tee`・`sed -i`・任意コマンドによる file write、`allowed_output_paths` 外への書き込みは引き続き禁止する。
+- `guarded-apply-patch` と `Edit` / `Write` のいずれも `output_manifests/<agent_run_id>.json` を参照して manifest 外 path を reject する。manifest 外 path へ書いてはならない。
 - `skill_name` と `skill_ref` が未指定の場合は fail で停止すること。
 - 入力不足時は推測補完せず fail で停止すること。
 - `workflow_mode=dev` の場合、verify 系判定で `issue_severity=major|critical` を検出した時点で fail 停止すること。
@@ -184,9 +189,11 @@ repair_reason: none
 - `capability_token` は `workspace/orchestrations/<orchestration_id>/capabilities/<agent_run_id>.json` を canonical source とし、起動直後に同 file を読み `capability_token` を抽出して以後の `run-gate` / `guarded-apply-patch` へ渡すこと。
 - `capability_token` が未取得または不一致の場合は処理を開始せず fail で停止すること。
 - `orchestration-read` は `python3 tools/orchestration_runtime.py run-gate --gate orchestration_read --agent-run-id <agent_run_id> --capability-token <capability_token> --args-json '{{"read_path":"..."}}'` を唯一の経路として実行し、`orchestration-read` 直呼びを禁止する。
-- `apply_patch` は `python3 tools/orchestration_runtime.py guarded-apply-patch --repo-root <repo_root> --orchestration-id <orchestration_id> --actor-role substep --agent-run-id <agent_run_id> --paths-json '["..."]' --patch-text '<patch_text>' --capability-token <capability_token>` を唯一の経路として実行し、拒否時は編集を停止すること。
-- 書き込みは `guarded-apply-patch` 経由に限定し、`run-gate --gate apply_patch_writes` と `apply-patch-gate` と shell redirection・直接 `write_text`・任意コマンドによる file write を禁止する。
-- `guarded-apply-patch` は `output_manifests/<agent_run_id>.json` を参照して manifest 外 path を reject する。manifest 外 path へ書いてはならない。
+- 書き込み経路は出力 path の extension で分岐する。`output_manifests/<agent_run_id>.json` を canonical source として参照し、`allowed_output_paths` と `allowed_file_tool_paths` の両 list を起動直後に確認すること。
+- `.json` と `.txt` の出力は `python3 tools/orchestration_runtime.py guarded-apply-patch --repo-root <repo_root> --orchestration-id <orchestration_id> --actor-role substep --agent-run-id <agent_run_id> --paths-json '["..."]' --patch-text '<patch_text>' --capability-token <capability_token>` を唯一の経路として実行し、拒否時は編集を停止すること。
+- `.yaml` / `.yml` / `.md` および source code 等の上記以外の出力は、`output_manifests/<agent_run_id>.json` の `allowed_file_tool_paths` に列挙された path に限り、`Edit` / `Write` tool で直接書き込むこと。
+- `run-gate --gate apply_patch_writes` と `apply-patch-gate` の公開経路としての使用、shell redirection・`tee`・`sed -i`・任意コマンドによる file write、`allowed_output_paths` 外への書き込みは引き続き禁止する。
+- `guarded-apply-patch` と `Edit` / `Write` のいずれも `output_manifests/<agent_run_id>.json` を参照して manifest 外 path を reject する。manifest 外 path へ書いてはならない。
 - `skill_name` と `skill_ref` が未指定の場合は fail で停止すること。
 - 入力不足時は推測補完せず fail で停止すること。
 - `workflow_mode=dev` の場合、verify 系判定で `issue_severity=major|critical` を検出した時点で fail 停止すること。
@@ -1887,6 +1894,13 @@ shell_tool                       stable             true
         constraint_lines = _required_launch_prompt_constraint_lines(prepared)
         self.assertTrue(constraint_lines)
         self.assertFalse(any("read_manifests/" in line for line in constraint_lines))
+        self.assertTrue(any("`.json` と `.txt` の出力は" in line for line in constraint_lines))
+        self.assertTrue(
+            any(
+                "`.yaml` / `.yml` / `.md` および source code 等の上記以外の出力は" in line
+                for line in constraint_lines
+            )
+        )
 
     def test_rejects_pass_step_result_when_required_outputs_are_missing_from_substeps(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -8437,6 +8451,303 @@ class TestPhase3RunGate(unittest.TestCase):
                 },
             )
             self.assertFalse(active_path.exists())
+
+
+class DirectWritePathExtensionPolicyTests(unittest.TestCase):
+    """書き込み path の extension 別 policy helper の挙動確認。"""
+
+    def test_cli_managed_extensions_are_json_and_txt(self) -> None:
+        self.assertEqual(CLI_MANAGED_EXTENSIONS, frozenset({".json", ".txt"}))
+
+    def test_is_direct_write_path_classifies_extensions(self) -> None:
+        cli_paths = [
+            "workspace/plans/p/plan.json",
+            "workspace/orchestrations/orch_001/launches/x.reply.txt",
+            "workspace/orchestrations/orch_001/agents/x/dialogs/agent.summary.TXT",
+            "workspace/plans/p/derived_contract.JSON",
+        ]
+        direct_paths = [
+            "workspace/plans/p/case.resolved.yaml",
+            "workspace/plans/p/algorithm.summary.md",
+            "workspace/pipelines/p/generate/g/src/main.f90",
+            "workspace/pipelines/p/generate/g/src/lib.cpp",
+            "workspace/pipelines/p/generate/g/include/header.hpp",
+        ]
+        for path in cli_paths:
+            self.assertFalse(_is_direct_write_path(path), msg=path)
+        for path in direct_paths:
+            self.assertTrue(_is_direct_write_path(path), msg=path)
+
+    def test_is_direct_write_path_rejects_empty(self) -> None:
+        self.assertFalse(_is_direct_write_path(""))
+
+    def test_allowed_file_tool_paths_auto_derive_excludes_cli_extensions(self) -> None:
+        allowed_output_paths = [
+            "workspace/plans/p/case.resolved.yaml",
+            "workspace/plans/p/algorithm.resolved.yaml",
+            "workspace/plans/p/algorithm.summary.md",
+            "workspace/plans/p/derived_contract.json",
+            "workspace/plans/p/plan_meta.json",
+            "workspace/pipelines/p/generate/g/src/main.f90",
+        ]
+        derived = _allowed_file_tool_paths_for_launch(
+            request_payload={},
+            allowed_output_paths=allowed_output_paths,
+        )
+        self.assertEqual(
+            derived,
+            sorted(
+                [
+                    "workspace/plans/p/case.resolved.yaml",
+                    "workspace/plans/p/algorithm.resolved.yaml",
+                    "workspace/plans/p/algorithm.summary.md",
+                    "workspace/pipelines/p/generate/g/src/main.f90",
+                ]
+            ),
+        )
+
+    def test_allowed_file_tool_paths_auto_derive_returns_empty_when_all_cli(self) -> None:
+        derived = _allowed_file_tool_paths_for_launch(
+            request_payload={},
+            allowed_output_paths=[
+                "workspace/plans/p/derived_contract.json",
+                "workspace/plans/p/plan_meta.json",
+            ],
+        )
+        self.assertEqual(derived, [])
+
+    def test_allowed_file_tool_paths_explicit_subset_validation(self) -> None:
+        allowed_output_paths = [
+            "workspace/plans/p/case.resolved.yaml",
+            "workspace/plans/p/derived_contract.json",
+        ]
+        explicit = _allowed_file_tool_paths_for_launch(
+            request_payload={
+                "allowed_file_tool_paths": [
+                    "workspace/plans/p/case.resolved.yaml",
+                ]
+            },
+            allowed_output_paths=allowed_output_paths,
+        )
+        self.assertEqual(explicit, ["workspace/plans/p/case.resolved.yaml"])
+
+    def test_allowed_file_tool_paths_explicit_rejects_cli_managed_extensions(self) -> None:
+        with self.assertRaisesRegex(ValueError, "must not include CLI-managed extensions"):
+            _allowed_file_tool_paths_for_launch(
+                request_payload={
+                    "allowed_file_tool_paths": [
+                        "workspace/plans/p/derived_contract.json",
+                    ]
+                },
+                allowed_output_paths=[
+                    "workspace/plans/p/derived_contract.json",
+                    "workspace/plans/p/case.resolved.yaml",
+                ],
+            )
+
+    def test_allowed_file_tool_paths_explicit_rejects_path_outside_outputs(self) -> None:
+        with self.assertRaisesRegex(ValueError, "must be included in allowed_output_paths"):
+            _allowed_file_tool_paths_for_launch(
+                request_payload={
+                    "allowed_file_tool_paths": [
+                        "workspace/plans/p/extra.yaml",
+                    ]
+                },
+                allowed_output_paths=[
+                    "workspace/plans/p/case.resolved.yaml",
+                ],
+            )
+
+    def test_allowed_file_tool_paths_explicit_empty_returns_empty(self) -> None:
+        derived = _allowed_file_tool_paths_for_launch(
+            request_payload={"allowed_file_tool_paths": []},
+            allowed_output_paths=[
+                "workspace/plans/p/case.resolved.yaml",
+            ],
+        )
+        self.assertEqual(derived, [])
+
+
+class TerminalUnauthorizedWriteDirectWriteTests(unittest.TestCase):
+    """`_validate_actual_write_paths` が direct write extension の path を許容する確認。"""
+
+    def _setup_step_run_state(
+        self,
+        repo_root: Path,
+        *,
+        orchestration_id: str,
+        agent_run_id: str,
+        write_roots: list[str],
+        allowed_output_paths: list[str],
+        allowed_file_tool_paths: list[str],
+    ) -> None:
+        from tools.orchestration_runtime import (
+            _capabilities_dir,
+            _write_allowed_output_manifest,
+            _write_run_write_baseline,
+        )
+
+        init_orchestration(repo_root=repo_root, orchestration_id=orchestration_id)
+        cap_path = _capabilities_dir(repo_root, orchestration_id) / f"{agent_run_id}.json"
+        cap_path.parent.mkdir(parents=True, exist_ok=True)
+        cap_path.write_text(
+            json.dumps(
+                {
+                    "orchestration_id": orchestration_id,
+                    "agent_run_id": agent_run_id,
+                    "write_roots": write_roots,
+                }
+            ),
+            encoding="utf-8",
+        )
+        _write_allowed_output_manifest(
+            repo_root,
+            orchestration_id=orchestration_id,
+            agent_run_id=agent_run_id,
+            allowed_output_paths=allowed_output_paths,
+            allowed_file_tool_paths=allowed_file_tool_paths,
+        )
+        _write_run_write_baseline(repo_root, orchestration_id, agent_run_id=agent_run_id)
+
+    def test_step_terminal_accepts_direct_write_yaml_without_gate(self) -> None:
+        from tools.orchestration_runtime import _validate_actual_write_paths
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            orch = "orch_term_dw_001"
+            run_id = "step_run_term_dw_001"
+            yaml_rel = "workspace/plans/p/case.resolved.yaml"
+            self._setup_step_run_state(
+                repo_root,
+                orchestration_id=orch,
+                agent_run_id=run_id,
+                write_roots=["workspace/plans"],
+                allowed_output_paths=[yaml_rel],
+                allowed_file_tool_paths=[yaml_rel],
+            )
+            yaml_path = repo_root / yaml_rel
+            yaml_path.parent.mkdir(parents=True, exist_ok=True)
+            yaml_path.write_text("case: ok\n", encoding="utf-8")
+
+            _validate_actual_write_paths(
+                repo_root,
+                orch,
+                {
+                    "agent_run_id": run_id,
+                    "agent_role": "step",
+                    "status": "pass",
+                    "output_refs": [yaml_rel],
+                },
+            )
+
+    def test_step_terminal_rejects_direct_write_yaml_when_not_in_manifest(self) -> None:
+        from tools.orchestration_runtime import _validate_actual_write_paths
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            orch = "orch_term_dw_002"
+            run_id = "step_run_term_dw_002"
+            yaml_rel = "workspace/plans/p/case.resolved.yaml"
+            self._setup_step_run_state(
+                repo_root,
+                orchestration_id=orch,
+                agent_run_id=run_id,
+                write_roots=["workspace/plans"],
+                allowed_output_paths=[yaml_rel],
+                allowed_file_tool_paths=[],
+            )
+            yaml_path = repo_root / yaml_rel
+            yaml_path.parent.mkdir(parents=True, exist_ok=True)
+            yaml_path.write_text("case: ok\n", encoding="utf-8")
+
+            with self.assertRaisesRegex(ValueError, "unauthorized write paths"):
+                _validate_actual_write_paths(
+                    repo_root,
+                    orch,
+                    {
+                        "agent_run_id": run_id,
+                        "agent_role": "step",
+                        "status": "pass",
+                        "output_refs": [yaml_rel],
+                    },
+                )
+
+
+class ApplyPatchGateCoverageExtensionTests(unittest.TestCase):
+    """`_validate_apply_patch_gate_coverage` の extension 別 gate 要件確認。"""
+
+    def _make_payload(
+        self,
+        *,
+        agent_role: str,
+        agent_run_id: str,
+        output_refs: list[str],
+    ) -> dict[str, object]:
+        return {
+            "agent_role": agent_role,
+            "agent_run_id": agent_run_id,
+            "output_refs": output_refs,
+        }
+
+    def test_step_pass_without_gate_for_direct_write_only_outputs(self) -> None:
+        from tools.orchestration_runtime import _validate_apply_patch_gate_coverage
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            init_orchestration(repo_root=repo_root, orchestration_id="orch_ext_001")
+            payload = self._make_payload(
+                agent_role="step",
+                agent_run_id="step_run_ext_001",
+                output_refs=[
+                    "workspace/plans/p/case.resolved.yaml",
+                    "workspace/plans/p/algorithm.summary.md",
+                    "workspace/pipelines/p/generate/g/src/main.f90",
+                ],
+            )
+            _validate_apply_patch_gate_coverage(repo_root, "orch_ext_001", payload)
+
+    def test_step_pass_requires_gate_for_json_output(self) -> None:
+        from tools.orchestration_runtime import _validate_apply_patch_gate_coverage
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            init_orchestration(repo_root=repo_root, orchestration_id="orch_ext_002")
+            payload = self._make_payload(
+                agent_role="step",
+                agent_run_id="step_run_ext_002",
+                output_refs=[
+                    "workspace/plans/p/case.resolved.yaml",
+                    "workspace/plans/p/derived_contract.json",
+                ],
+            )
+            with self.assertRaisesRegex(
+                ValueError, "apply_patch_writes gate evidence"
+            ):
+                _validate_apply_patch_gate_coverage(repo_root, "orch_ext_002", payload)
+
+    def test_step_pass_with_gate_covers_only_cli_extension_refs(self) -> None:
+        from tools.orchestration_runtime import _validate_apply_patch_gate_coverage
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            init_orchestration(repo_root=repo_root, orchestration_id="orch_ext_003")
+            _write_apply_patch_gate_evidence(
+                repo_root,
+                orchestration_id="orch_ext_003",
+                agent_run_id="step_run_ext_003",
+                actor_role="step",
+                changed_paths=["workspace/plans/p/derived_contract.json"],
+            )
+            payload = self._make_payload(
+                agent_role="step",
+                agent_run_id="step_run_ext_003",
+                output_refs=[
+                    "workspace/plans/p/case.resolved.yaml",
+                    "workspace/plans/p/algorithm.summary.md",
+                    "workspace/plans/p/derived_contract.json",
+                ],
+            )
+            _validate_apply_patch_gate_coverage(repo_root, "orch_ext_003", payload)
 
 
 if __name__ == "__main__":

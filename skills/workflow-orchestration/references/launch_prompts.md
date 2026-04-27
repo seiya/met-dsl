@@ -31,9 +31,11 @@ repair_reason: <repair_reason>
 - `orchestration-read` は `python3 tools/orchestration_runtime.py run-gate --gate orchestration_read --agent-run-id <agent_run_id> --capability-token <capability_token> --args-json '{"read_path":"..."}'` を唯一の経路として実行し、`orchestration-read` 直呼びを禁止する。
 - `orchestration-read` は `read_manifests/<agent_run_id>.json` を canonical source とし、manifest 外 path を読んではならない。
 - child 実行は `bwrap` sandbox 内でのみ実行すること。非 sandbox 実行を禁止する。
-- `apply_patch` は `python3 tools/orchestration_runtime.py guarded-apply-patch --repo-root <repo_root> --orchestration-id <orchestration_id> --actor-role step --agent-run-id <agent_run_id> --paths-json '["..."]' --patch-text '<patch_text>' --capability-token <capability_token>` を唯一の経路として実行し、拒否時は編集を停止すること。
-- 書き込みは `guarded-apply-patch` 経由に限定し、`run-gate --gate apply_patch_writes` と `apply-patch-gate` と shell redirection・直接 `write_text`・任意コマンドによる file write を禁止する。
-- `guarded-apply-patch` は `output_manifests/<agent_run_id>.json` を参照して manifest 外 path を reject する。manifest 外 path へ書いてはならない。
+- 書き込み経路は出力 path の extension で分岐する。`output_manifests/<agent_run_id>.json` を canonical source として参照し、`allowed_output_paths` と `allowed_file_tool_paths` の両 list を起動直後に確認すること。
+- `.json` と `.txt` の出力は `python3 tools/orchestration_runtime.py guarded-apply-patch --repo-root <repo_root> --orchestration-id <orchestration_id> --actor-role step --agent-run-id <agent_run_id> --paths-json '["..."]' --patch-text '<patch_text>' --capability-token <capability_token>` を唯一の経路として実行し、拒否時は編集を停止すること。
+- `.yaml` / `.yml` / `.md` および source code 等の上記以外の出力は、`output_manifests/<agent_run_id>.json` の `allowed_file_tool_paths` に列挙された path に限り、`Edit` / `Write` tool で直接書き込むこと。
+- `run-gate --gate apply_patch_writes` と `apply-patch-gate` の公開経路としての使用、shell redirection・`tee`・`sed -i`・任意コマンドによる file write、`allowed_output_paths` 外への書き込みは引き続き禁止する。
+- `guarded-apply-patch` と `Edit` / `Write` のいずれも `output_manifests/<agent_run_id>.json` を参照して manifest 外 path を reject する。manifest 外 path へ書いてはならない。
 - `skill_name` と `skill_ref` が未指定の場合は fail で停止すること。
 - 入力不足時は推測補完せず fail で停止すること。
 - `workflow_mode=dev` の場合、verify 系判定で `issue_severity=major|critical` を検出した時点で fail 停止すること。
@@ -78,9 +80,11 @@ repair_reason: <repair_reason>
 - `orchestration-read` は `python3 tools/orchestration_runtime.py run-gate --gate orchestration_read --agent-run-id <agent_run_id> --capability-token <capability_token> --args-json '{"read_path":"..."}'` を唯一の経路として実行し、`orchestration-read` 直呼びを禁止する。
 - `orchestration-read` は `read_manifests/<agent_run_id>.json` を canonical source とし、manifest 外 path を読んではならない。
 - child 実行は `bwrap` sandbox 内でのみ実行すること。非 sandbox 実行を禁止する。
-- `apply_patch` は `python3 tools/orchestration_runtime.py guarded-apply-patch --repo-root <repo_root> --orchestration-id <orchestration_id> --actor-role substep --agent-run-id <agent_run_id> --paths-json '["..."]' --patch-text '<patch_text>' --capability-token <capability_token>` を唯一の経路として実行し、拒否時は編集を停止すること。
-- 書き込みは `guarded-apply-patch` 経由に限定し、`run-gate --gate apply_patch_writes` と `apply-patch-gate` と shell redirection・直接 `write_text`・任意コマンドによる file write を禁止する。
-- `guarded-apply-patch` は `output_manifests/<agent_run_id>.json` を参照して manifest 外 path を reject する。manifest 外 path へ書いてはならない。
+- 書き込み経路は出力 path の extension で分岐する。`output_manifests/<agent_run_id>.json` を canonical source として参照し、`allowed_output_paths` と `allowed_file_tool_paths` の両 list を起動直後に確認すること。
+- `.json` と `.txt` の出力は `python3 tools/orchestration_runtime.py guarded-apply-patch --repo-root <repo_root> --orchestration-id <orchestration_id> --actor-role substep --agent-run-id <agent_run_id> --paths-json '["..."]' --patch-text '<patch_text>' --capability-token <capability_token>` を唯一の経路として実行し、拒否時は編集を停止すること。
+- `.yaml` / `.yml` / `.md` および source code 等の上記以外の出力は、`output_manifests/<agent_run_id>.json` の `allowed_file_tool_paths` に列挙された path に限り、`Edit` / `Write` tool で直接書き込むこと。
+- `run-gate --gate apply_patch_writes` と `apply-patch-gate` の公開経路としての使用、shell redirection・`tee`・`sed -i`・任意コマンドによる file write、`allowed_output_paths` 外への書き込みは引き続き禁止する。
+- `guarded-apply-patch` と `Edit` / `Write` のいずれも `output_manifests/<agent_run_id>.json` を参照して manifest 外 path を reject する。manifest 外 path へ書いてはならない。
 - `skill_name` と `skill_ref` が未指定の場合は fail で停止すること。
 - 入力不足時は推測補完せず fail で停止すること。
 - `workflow_mode=dev` の場合、verify 系判定で `issue_severity=major|critical` を検出した時点で fail 停止すること。

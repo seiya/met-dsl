@@ -20,9 +20,11 @@ READ_HINT = (
 )
 
 WRITE_HINT = (
-    "Hint: Write only via 'guarded-apply-patch' (tools/orchestration_runtime.py) "
-    "within output_manifests/<agent_run_id>.json allowed_output_paths. "
-    "Direct Write/Edit is limited to allowed_file_tool_paths."
+    "Hint: Write paths route by extension. .json/.txt outputs go through "
+    "'guarded-apply-patch' (tools/orchestration_runtime.py) within "
+    "output_manifests/<agent_run_id>.json.allowed_output_paths. Other "
+    "extensions (.yaml/.yml/.md/source code) are written via Edit/Write "
+    "directly and must be listed under allowed_file_tool_paths."
 )
 
 MANIFEST_HINT = (

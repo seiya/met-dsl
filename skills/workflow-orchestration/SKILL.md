@@ -36,9 +36,9 @@ description: 対応 execution platform で `workflow` 全体を開始し、`orch
 - 子 `agent` 起動要求本文には、要求定義と判定規則の canonical source が `docs/` と `spec/` と当該試行 artifact であること、`tools/` 配下の実装、検証 `script`、test code、validator code を読んで rule を抽出してはならないことを明示しなければならない。
 - `plan_ref` と `pipeline_ref` と `dependency_ref` は、起動要求生成時点で canonical path を確定しなければならない。`<agent-determined-...>` などの placeholder を禁止する。
 - child `agent` に許可する phase artifact の変更は、capability token が許可した `write_root` 配下に限定しなければならない。`plan_ref` / `pipeline_ref` 配下の変更は `guarded-apply-patch` または対応 gate を通過した canonical path に限定し、許可 root 外の変更を禁止する。
-- phase artifact を変更する場合、`step agent` / `substep agent` は `guarded-apply-patch` を使用しなければならない。`apply_patch_writes` は内部 gate であり、`run-gate --gate apply_patch_writes` と `apply-patch-gate` を公開経路として使用してはならない。通常 `apply_patch` の直接実行、shell redirection、`tee`、`sed -i`、`perl -0pi`、`python` / `sh` / `bash` による file write を禁止する。
+- phase artifact を変更する場合、`step agent` / `substep agent` は出力 path の extension で書き込み経路を分岐しなければならない。`.json` と `.txt` の出力は `guarded-apply-patch` を canonical invocation とし、それ以外の extension（`.yaml` / `.yml` / `.md` / source code 等）は `output_manifests/<agent_run_id>.json` の `allowed_file_tool_paths` に列挙された path に限り `Edit` / `Write` tool で直接書き込む。`apply_patch_writes` は内部 gate であり、`run-gate --gate apply_patch_writes` と `apply-patch-gate` を公開経路として使用してはならない。通常 `apply_patch` の直接実行、shell redirection、`tee`、`sed -i`、`perl -0pi`、`python` / `sh` / `bash` による file write を禁止する。
 - `guarded-apply-patch` の疎通確認は dry-run または no-op patch で実施しなければならない。dummy file を新規作成して疎通確認してはならない。
-- `record-launch` は `output_manifests/<agent_run_id>.json` と `read_manifests/<agent_run_id>.json` を生成しなければならない。`guarded-apply-patch` と `record-agent-run` は output manifest を参照し、`orchestration-read` は read manifest を参照して manifest 外 path を reject しなければならない。
+- `record-launch` は `output_manifests/<agent_run_id>.json` と `read_manifests/<agent_run_id>.json` を生成しなければならない。output manifest には `allowed_output_paths`（全許可 path）と `allowed_file_tool_paths`（`Edit` / `Write` で直接書き込み可能な path）の両方を保持し、`allowed_file_tool_paths` は既定で `allowed_output_paths` から `.json` / `.txt` を除いた集合を自動収録する。`guarded-apply-patch` と `record-agent-run` は output manifest を参照し、`orchestration-read` は read manifest を参照して manifest 外 path を reject しなければならない。
 - shell による file write は、対象 path が phase artifact かどうかを問わず禁止対象とし、事前 gate または `record-agent-run` が検出した場合は当該 gate または `record-agent-run` が当該 `agent_run` を reject しなければならない。reject 後は `orchestration agent` が `orchestration_meta.status=fail_closed` を記録して停止しなければならない。
 - `step agent` / `substep agent` の起動要求本文には、input contract、expected output、保存先、失敗時停止条件、`spawn_agent` 義務を明示しなければならない。
 - `step agent` / `substep agent` の起動要求本文には、`skill_name` と `skill_ref` と `skill_must_read_refs` を必須記録し、子 `agent` が起動直後に対象 `SKILL` を読める状態にしなければならない。
@@ -125,5 +125,5 @@ description: 対応 execution platform で `workflow` 全体を開始し、`orch
 - スキップした `step` の `output_refs` が後続 `step` の `plan_ref` / `pipeline_ref` と整合している。
 - `verify-checkpoint-integrity` で `valid=false` が返却されたとき、該当 `step` を再実行している。
 - 子 `agent` 必須 phase で、child `agent` 起動前の phase artifact 直接編集、`MCP` 実行、検証目的の仮実装が存在しない。
-- child `agent` の phase artifact 変更が `guarded-apply-patch` または対応 gate を通過した canonical path に限定され、shell file write を含む `unauthorized write` が `record-agent-run` または事前 gate で reject されている。
+- child `agent` の phase artifact 変更が、`.json` / `.txt` については `guarded-apply-patch` を、それ以外の extension については `output_manifests/<agent_run_id>.json.allowed_file_tool_paths` 内 path への `Edit` / `Write` 直接書き込みのみを使用しており、shell file write や manifest 外 path への書き込みを含む `unauthorized write` が `record-agent-run` または事前 gate で reject されている。
 - `agent.summary.txt` が、単一行の定型 `pass` / `fail` のみではなく、最終状態と主要 `output_refs` または失敗原因を含んでいる。

@@ -1282,5 +1282,179 @@ class ClaudeHookCliTests(unittest.TestCase):
             self.assertIn("Ensure record-launch generated the manifest", body.get("reason", ""))
 
 
+class WriteToolExtensionPolicyTests(unittest.TestCase):
+    """`Edit` / `Write` 直接書き込みの extension 別 policy 検証。"""
+
+    def _setup_orchestration_for_write(
+        self,
+        repo_root: Path,
+        *,
+        orch: str,
+        run_id: str,
+        allowed_output_paths: list[str],
+        allowed_file_tool_paths: list[str],
+    ) -> None:
+        orch_root = repo_root / "workspace" / "orchestrations" / orch
+        (orch_root / "output_manifests").mkdir(parents=True, exist_ok=True)
+        (orch_root / "read_manifests").mkdir(parents=True, exist_ok=True)
+        (orch_root / "active_child_agent_run_id.txt").write_text(run_id, encoding="utf-8")
+        (orch_root / "output_manifests" / f"{run_id}.json").write_text(
+            json.dumps(
+                {
+                    "orchestration_id": orch,
+                    "agent_run_id": run_id,
+                    "allowed_output_paths": allowed_output_paths,
+                    "allowed_file_tool_paths": allowed_file_tool_paths,
+                    "write_roots": ["workspace/plans"],
+                }
+            ),
+            encoding="utf-8",
+        )
+
+    def _invoke_write_hook(self, *, orch: str, repo_root: Path, file_path: str) -> tuple[int, dict]:
+        payload = {
+            "orchestration_id": orch,
+            "repo_root": str(repo_root),
+            "tool_name": "Write",
+            "tool_input": {"file_path": file_path},
+        }
+        out = io.StringIO()
+        with patch.dict(os.environ, {"METDSL_WORKFLOW_MODE": "1"}, clear=False):
+            with redirect_stdout(out):
+                code = cli.main(
+                    [
+                        "--backend",
+                        "claude",
+                        "--event",
+                        "PreToolUse",
+                        "--input-json",
+                        json.dumps(payload),
+                    ]
+                )
+        body_text = out.getvalue().strip()
+        body: dict = json.loads(body_text) if body_text else {}
+        return code, body
+
+    def test_write_tool_blocks_json_path_even_when_listed_in_allowed_outputs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            orch = "orch_ext_hooks_001"
+            run_id = "step_run_ext_hooks_001"
+            json_path = "workspace/plans/p/derived_contract.json"
+            self._setup_orchestration_for_write(
+                repo_root,
+                orch=orch,
+                run_id=run_id,
+                allowed_output_paths=[json_path],
+                allowed_file_tool_paths=[],
+            )
+            code, body = self._invoke_write_hook(
+                orch=orch, repo_root=repo_root, file_path=json_path
+            )
+            self.assertEqual(code, 2)
+            self.assertEqual(body.get("decision"), "block")
+            self.assertIn("guarded-apply-patch", body.get("reason", ""))
+
+    def test_write_tool_allows_yaml_when_listed_in_allowed_file_tool_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            orch = "orch_ext_hooks_002"
+            run_id = "step_run_ext_hooks_002"
+            yaml_path = "workspace/plans/p/case.resolved.yaml"
+            self._setup_orchestration_for_write(
+                repo_root,
+                orch=orch,
+                run_id=run_id,
+                allowed_output_paths=[yaml_path],
+                allowed_file_tool_paths=[yaml_path],
+            )
+            code, body = self._invoke_write_hook(
+                orch=orch, repo_root=repo_root, file_path=yaml_path
+            )
+            self.assertEqual(code, 0)
+            if body:
+                self.assertEqual(body.get("decision"), "allow")
+
+    def test_write_tool_allows_markdown_when_listed_in_allowed_file_tool_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            orch = "orch_ext_hooks_003"
+            run_id = "step_run_ext_hooks_003"
+            md_path = "workspace/plans/p/algorithm.summary.md"
+            self._setup_orchestration_for_write(
+                repo_root,
+                orch=orch,
+                run_id=run_id,
+                allowed_output_paths=[md_path],
+                allowed_file_tool_paths=[md_path],
+            )
+            code, body = self._invoke_write_hook(
+                orch=orch, repo_root=repo_root, file_path=md_path
+            )
+            self.assertEqual(code, 0)
+            if body:
+                self.assertEqual(body.get("decision"), "allow")
+
+    def test_write_tool_allows_source_code_when_listed_in_allowed_file_tool_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            orch = "orch_ext_hooks_004"
+            run_id = "step_run_ext_hooks_004"
+            src_path = "workspace/plans/p/src/main.f90"
+            self._setup_orchestration_for_write(
+                repo_root,
+                orch=orch,
+                run_id=run_id,
+                allowed_output_paths=[src_path],
+                allowed_file_tool_paths=[src_path],
+            )
+            code, body = self._invoke_write_hook(
+                orch=orch, repo_root=repo_root, file_path=src_path
+            )
+            self.assertEqual(code, 0)
+            if body:
+                self.assertEqual(body.get("decision"), "allow")
+
+    def test_write_tool_blocks_yaml_when_not_listed_in_allowed_file_tool_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            orch = "orch_ext_hooks_005"
+            run_id = "step_run_ext_hooks_005"
+            yaml_path = "workspace/plans/p/case.resolved.yaml"
+            self._setup_orchestration_for_write(
+                repo_root,
+                orch=orch,
+                run_id=run_id,
+                allowed_output_paths=[yaml_path],
+                allowed_file_tool_paths=[],
+            )
+            code, body = self._invoke_write_hook(
+                orch=orch, repo_root=repo_root, file_path=yaml_path
+            )
+            self.assertEqual(code, 2)
+            self.assertEqual(body.get("decision"), "block")
+
+    def test_write_tool_blocks_cli_managed_internal_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            orch = "orch_ext_hooks_006"
+            run_id = "step_run_ext_hooks_006"
+            cli_managed_path = (
+                f"workspace/orchestrations/{orch}/launches/{run_id}.reply.txt"
+            )
+            self._setup_orchestration_for_write(
+                repo_root,
+                orch=orch,
+                run_id=run_id,
+                allowed_output_paths=[cli_managed_path],
+                allowed_file_tool_paths=[cli_managed_path],
+            )
+            code, body = self._invoke_write_hook(
+                orch=orch, repo_root=repo_root, file_path=cli_managed_path
+            )
+            self.assertEqual(code, 2)
+            self.assertEqual(body.get("decision"), "block")
+
+
 if __name__ == "__main__":
     unittest.main()

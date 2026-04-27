@@ -1994,21 +1994,48 @@ def _allowed_output_paths_for_launch(
     return deduped
 
 
+# Extension classification for write-path policy:
+# `.json` / `.txt` outputs must go through `guarded-apply-patch` CLI for
+# audit/integrity, while other artifact extensions (yaml, md, source code,
+# etc.) are written via the LLM `Edit` / `Write` tools directly.
+CLI_MANAGED_EXTENSIONS: frozenset[str] = frozenset({".json", ".txt"})
+
+
+def _is_direct_write_path(rel_posix: str) -> bool:
+    """Return True when the path may be written via direct Edit/Write tools.
+
+    Paths whose extension belongs to ``CLI_MANAGED_EXTENSIONS`` (e.g. `.json`,
+    `.txt`) are required to go through `guarded-apply-patch` and are therefore
+    excluded from direct write.
+    """
+    token = _normalize_rel_posix(rel_posix)
+    if not token:
+        return False
+    last = token.rsplit("/", 1)[-1]
+    if "." not in last:
+        return True
+    ext = "." + last.rsplit(".", 1)[-1].lower()
+    return ext not in CLI_MANAGED_EXTENSIONS
+
+
 def _allowed_file_tool_paths_for_launch(
     *,
     request_payload: dict[str, Any],
     allowed_output_paths: Sequence[str],
 ) -> list[str]:
     raw = request_payload.get("allowed_file_tool_paths")
-    if raw is None:
-        return []
-    if not isinstance(raw, list):
-        raise ValueError("allowed_file_tool_paths must be a list when provided")
     allowed_set = {
         _normalize_rel_posix(str(item))
         for item in allowed_output_paths
         if isinstance(item, str) and item.strip()
     }
+    if raw is None:
+        # Auto-derive: every output path whose extension is not CLI-managed
+        # is permitted to be written via direct Edit/Write tools.
+        derived = {path for path in allowed_set if path and _is_direct_write_path(path)}
+        return sorted(derived)
+    if not isinstance(raw, list):
+        raise ValueError("allowed_file_tool_paths must be a list when provided")
     normalized: list[str] = []
     for idx, item in enumerate(raw):
         if not isinstance(item, str) or not item.strip():
@@ -2017,6 +2044,11 @@ def _allowed_file_tool_paths_for_launch(
         if item_token.endswith("/"):
             raise ValueError(f"allowed_file_tool_paths[{idx}] must be file path: {item!r}")
         path = _normalize_rel_posix(item_token)
+        if not _is_direct_write_path(path):
+            raise ValueError(
+                f"allowed_file_tool_paths[{idx}] must not include CLI-managed extensions "
+                f"{sorted(CLI_MANAGED_EXTENSIONS)!r}: {path!r}"
+            )
         if path not in allowed_set:
             raise ValueError(
                 f"allowed_file_tool_paths[{idx}] must be included in allowed_output_paths: {path!r}"
@@ -2837,23 +2869,24 @@ def _write_unauthorized_write_violation(
     output_refs: list[str],
     gate_changed_paths: list[str],
     write_roots: list[str],
+    manifest_file_tool_paths: list[str] | None = None,
 ) -> Path:
     out = _violations_dir(repo_root, orchestration_id) / f"{agent_run_id}.unauthorized_write_violation.json"
-    _write_json(
-        out,
-        {
-            "kind": "unauthorized_write_violation",
-            "orchestration_id": orchestration_id,
-            "agent_run_id": agent_run_id,
-            "actor_role": actor_role,
-            "detected_at": _utc_now_iso(),
-            "actual_changed_paths": actual_changed_paths,
-            "unauthorized_paths": unauthorized_paths,
-            "output_refs": output_refs,
-            "gate_changed_paths": gate_changed_paths,
-            "write_roots": write_roots,
-        },
-    )
+    record: dict[str, Any] = {
+        "kind": "unauthorized_write_violation",
+        "orchestration_id": orchestration_id,
+        "agent_run_id": agent_run_id,
+        "actor_role": actor_role,
+        "detected_at": _utc_now_iso(),
+        "actual_changed_paths": actual_changed_paths,
+        "unauthorized_paths": unauthorized_paths,
+        "output_refs": output_refs,
+        "gate_changed_paths": gate_changed_paths,
+        "write_roots": write_roots,
+    }
+    if manifest_file_tool_paths is not None:
+        record["manifest_file_tool_paths"] = manifest_file_tool_paths
+    _write_json(out, record)
     return out
 
 
@@ -2910,11 +2943,30 @@ def _validate_actual_write_paths(
         write_roots = [str(item) for item in roots_obj] if isinstance(roots_obj, list) else []
 
     unauthorized: list[str] = []
-    declared_paths = (
-        sorted(set(output_refs) | set(gate_changed_paths))
-        if actor_role == "orchestration"
-        else sorted(set(gate_changed_paths))
-    )
+    manifest_file_tool_paths: set[str] = set()
+    if actor_role == "orchestration":
+        declared_paths = sorted(set(output_refs) | set(gate_changed_paths))
+    else:
+        # step/substep: include manifest-permitted direct write paths so that
+        # `.yaml` / `.md` / source code outputs written via Edit/Write are not
+        # flagged as unauthorized writes.
+        try:
+            manifest_doc = _load_allowed_output_manifest(
+                repo_root,
+                orchestration_id=orchestration_id,
+                agent_run_id=run_id,
+            )
+        except ValueError:
+            manifest_doc = None
+        if isinstance(manifest_doc, dict):
+            ftp_obj = manifest_doc.get("allowed_file_tool_paths")
+            if isinstance(ftp_obj, list):
+                manifest_file_tool_paths = {
+                    _normalize_rel_posix(str(item))
+                    for item in ftp_obj
+                    if isinstance(item, str) and item.strip()
+                }
+        declared_paths = sorted(set(gate_changed_paths) | manifest_file_tool_paths)
     for path in actual_changed_paths:
         if write_roots and not _path_under_any_write_root(path, write_roots):
             unauthorized.append(path)
@@ -2937,6 +2989,7 @@ def _validate_actual_write_paths(
             output_refs=output_refs,
             gate_changed_paths=gate_changed_paths,
             write_roots=write_roots,
+            manifest_file_tool_paths=sorted(manifest_file_tool_paths) if manifest_file_tool_paths else None,
         )
         raise ValueError(
             "terminal run has unauthorized write paths: "
@@ -3697,6 +3750,8 @@ def _required_launch_prompt_constraint_lines(request_payload: dict[str, Any]) ->
         "`output_manifests/",
         "/capabilities/",
         "`capability_token` が未取得または不一致の場合は処理を開始せず fail",
+        "`.json` と `.txt` の出力は",
+        "`.yaml` / `.yml` / `.md` および source code 等の上記以外の出力は",
     )
     return [
         line
@@ -4388,6 +4443,14 @@ def _validate_apply_patch_gate_coverage(
     if not output_refs:
         return
 
+    # Direct-write extensions (e.g. .yaml / .md / source code) are written via
+    # `Edit`/`Write` tools and are exempt from `apply_patch_writes` gate
+    # coverage. Only `.json` / `.txt` outputs (CLI-managed extensions) require
+    # gate evidence.
+    cli_required_refs = [ref for ref in output_refs if not _is_direct_write_path(ref)]
+    if not cli_required_refs:
+        return
+
     gate_path = _gates_dir(repo_root, orchestration_id) / run_id / "apply_patch_writes.json"
     if not gate_path.exists():
         raise ValueError(
@@ -4416,7 +4479,7 @@ def _validate_apply_patch_gate_coverage(
         raise ValueError(f"apply_patch_writes gate changed_paths must be non-empty: {gate_path}")
 
     uncovered: list[str] = []
-    for output_ref in output_refs:
+    for output_ref in cli_required_refs:
         rel = _normalize_rel_posix(output_ref)
         if not any(_repo_path_under_prefix(rel, cp) for cp in changed_paths):
             uncovered.append(output_ref)

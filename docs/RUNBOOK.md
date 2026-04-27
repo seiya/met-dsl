@@ -75,7 +75,7 @@
 - 各 `step` / `substep` の実処理を `script` で代行してはならない。必ず独立 `agent_run_id` を持つ `LLM agent` で実行する。
 - `step agent` と `substep agent` は `agent_run_id` ごとに固有 `context_id` を持ち、`context_isolated=true` を必須記録とする。
 - `step` / `substep` の起動要求と起動応答は `workspace/orchestrations/<orchestration_id>/launches/` 配下へ保存し、`agent_runs.jsonl` の `launch_request_ref` と `launch_response_ref` から追跡可能にする。
-- `record-launch` は `workspace/orchestrations/<orchestration_id>/output_manifests/<agent_run_id>.json` を生成し、`allowed_output_paths` を確定する。`guarded-apply-patch` と `record-agent-run` は当該 manifest 外 path を reject しなければならない。
+- `record-launch` は `workspace/orchestrations/<orchestration_id>/output_manifests/<agent_run_id>.json` を生成し、`allowed_output_paths`（全許可 path）と `allowed_file_tool_paths`（`Edit` / `Write` で直接書き込み可能な path）を確定する。`allowed_file_tool_paths` は既定で `allowed_output_paths` から `.json` / `.txt` を除いた集合を自動収録する。`guarded-apply-patch` と `record-agent-run` は当該 manifest 外 path、および `Edit` / `Write` による `allowed_file_tool_paths` 外 path への書き込みを reject しなければならない。
 - `record-launch` は `workspace/orchestrations/<orchestration_id>/read_manifests/<agent_run_id>.json` を生成し、`allowed_read_roots` と `denied_read_roots` を確定する。`orchestration_read` は当該 manifest 外 path を reject しなければならない。
 - 各 `step` / `substep` の完了時には `workspace/orchestrations/<orchestration_id>/agents/<agent_run_id>/dialogs/agent.result.json` と `agent.summary.txt` を保存し、`agent_runs.jsonl` の `agent_result_ref` と `agent_summary_ref` から追跡可能にする。
 - `agent.summary.txt` は失敗時の原因要約、再投入要否判断材料、主要 `output_refs` を含む調査用ログとして扱い、空ファイルまたは定型句のみを禁止する。
