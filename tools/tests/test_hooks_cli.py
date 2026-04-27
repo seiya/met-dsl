@@ -1138,6 +1138,41 @@ class ClaudeHookCliTests(unittest.TestCase):
             self.assertIn("guarded-apply-patch", body.get("reason", ""))
             self.assertNotIn("orchestration_read", body.get("reason", ""))
 
+    def test_codex_raw_apply_patch_blocks_in_workflow_mode(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            orch = "orch_apply_patch_guard_001"
+            orch_root = repo_root / "workspace" / "orchestrations" / orch
+            orch_root.mkdir(parents=True, exist_ok=True)
+            payload = {
+                "orchestration_id": orch,
+                "repo_root": str(repo_root),
+                "tool_name": "apply_patch",
+                "tool_input": {"patch": "*** Begin Patch\n*** End Patch\n"},
+            }
+            out = io.StringIO()
+            with patch.dict(
+                os.environ,
+                {"METDSL_WORKFLOW_MODE": "1", "METDSL_REQUIRE_CODEX_HOOKS_FEATURE": "0"},
+                clear=False,
+            ):
+                with redirect_stdout(out):
+                    code = cli.main(
+                        [
+                            "--backend",
+                            "codex",
+                            "--event",
+                            "PreToolUse",
+                            "--input-json",
+                            json.dumps(payload),
+                        ]
+                    )
+            self.assertEqual(code, 2)
+            body = json.loads(out.getvalue().strip())
+            self.assertEqual(body.get("decision"), "block")
+            self.assertIn("raw apply_patch tool is forbidden", body.get("reason", ""))
+            self.assertIn("guarded-apply-patch", body.get("reason", ""))
+
     def test_claude_file_tool_blocks_when_active_agent_run_id_file_missing(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)

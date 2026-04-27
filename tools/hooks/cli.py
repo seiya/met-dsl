@@ -541,6 +541,30 @@ def main(argv: list[str] | None = None) -> int:
         else:
             decoded = adapter.decode_event(event_name.value, payload)
             tool_name = (decoded.tool_name or "").strip()
+            if (
+                event_name == HookEventName.PRE_COMMAND_EXECUTE
+                and os.environ.get("METDSL_WORKFLOW_MODE", "0").strip() == "1"
+                and tool_name == "apply_patch"
+            ):
+                decision = HookDecision(
+                    action=HookDecisionAction.BLOCK,
+                    reason=(
+                        "raw apply_patch tool is forbidden in workflow mode. "
+                        "Use guarded-apply-patch instead: "
+                        "python3 tools/orchestration_runtime.py guarded-apply-patch ..."
+                    ),
+                    continue_processing=False,
+                    audit_detail={"policy": "forbid_raw_apply_patch_in_workflow_mode"},
+                )
+                _append_hook_audit(
+                    backend=args.backend,
+                    event_name=event_name,
+                    payload=payload,
+                    decision=decision,
+                    orchestration_id_override=orchestration_id,
+                )
+                exit_code, stdout_text = adapter.encode_decision(decision)
+                return _emit_hook_response(exit_code, stdout_text, event_name=event_name)
             is_file_tool_pre = (
                 event_name == HookEventName.PRE_COMMAND_EXECUTE
                 and tool_name in {"Write", "Edit", "Read"}
