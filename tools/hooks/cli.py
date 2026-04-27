@@ -70,6 +70,112 @@ def _decision_error(message: str) -> HookDecision:
     )
 
 
+def _inner_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    inner = payload.get("payload")
+    return inner if isinstance(inner, dict) else {}
+
+
+def _payload_value(payload: dict[str, Any], key: str) -> Any:
+    value = payload.get(key)
+    if value is not None:
+        return value
+    return _inner_payload(payload).get(key)
+
+
+def _tool_input(payload: dict[str, Any]) -> dict[str, Any]:
+    value = _payload_value(payload, "tool_input")
+    return value if isinstance(value, dict) else {}
+
+
+def _redact_sensitive_text(text: str) -> str:
+    redacted = re.sub(r"(--capability-token(?:=|\s+))\S+", r"\1<redacted>", text)
+    redacted = re.sub(
+        r'("capability_token"\s*:\s*")([^"]+)(")',
+        r'\1<redacted>\3',
+        redacted,
+    )
+    return redacted
+
+
+def _trim_audit_text(text: str, *, limit: int = 500) -> str:
+    safe = _redact_sensitive_text(text)
+    if len(safe) <= limit:
+        return safe
+    return safe[:limit] + f"...<truncated {len(safe) - limit} chars>"
+
+
+def _extract_apply_patch_paths(patch_text: str) -> list[str]:
+    paths: list[str] = []
+    for line in patch_text.splitlines():
+        for prefix in (
+            "*** Add File: ",
+            "*** Update File: ",
+            "*** Delete File: ",
+            "*** Move to: ",
+        ):
+            if line.startswith(prefix):
+                token = line[len(prefix):].strip()
+                if token:
+                    paths.append(token)
+                break
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for path in paths:
+        if path in seen:
+            continue
+        deduped.append(path)
+        seen.add(path)
+    return deduped
+
+
+def _sanitize_audit_detail(value: Any) -> Any:
+    if isinstance(value, dict):
+        sanitized: dict[str, Any] = {}
+        for key, item in value.items():
+            key_s = str(key)
+            if key_s.lower() in {"capability_token", "token", "secret"}:
+                sanitized[key_s] = "<redacted>"
+            else:
+                sanitized[key_s] = _sanitize_audit_detail(item)
+        return sanitized
+    if isinstance(value, list):
+        return [_sanitize_audit_detail(item) for item in value]
+    if isinstance(value, str):
+        return _trim_audit_text(value)
+    return value
+
+
+def _audit_payload_summary(payload: dict[str, Any], tool_name: str | None) -> dict[str, Any]:
+    summary: dict[str, Any] = {}
+    session_id = _payload_value(payload, "session_id")
+    if isinstance(session_id, str) and session_id.strip():
+        summary["session_id"] = session_id.strip()
+    agent_session_id = _payload_value(payload, "agent_session_id")
+    if isinstance(agent_session_id, str) and agent_session_id.strip():
+        summary["agent_session_id"] = agent_session_id.strip()
+
+    tool_input = _tool_input(payload)
+    file_path = tool_input.get("file_path")
+    if isinstance(file_path, str) and file_path.strip():
+        summary["file_path"] = file_path.strip()
+
+    command = _payload_value(payload, "command")
+    if not isinstance(command, str) or not command.strip():
+        candidate = tool_input.get("command")
+        command = candidate if isinstance(candidate, str) and candidate.strip() else None
+    if isinstance(command, str) and command.strip():
+        summary["command"] = _trim_audit_text(command.strip())
+
+    if (tool_name or "").strip() == "apply_patch":
+        patch_value = tool_input.get("patch")
+        if not isinstance(patch_value, str):
+            patch_value = tool_input.get("patch_text")
+        if isinstance(patch_value, str):
+            summary["apply_patch_paths"] = _extract_apply_patch_paths(patch_value)
+            summary["patch_line_count"] = len(patch_value.splitlines())
+    return summary
+
+
 def _append_hook_audit(
     *,
     backend: str,
@@ -88,8 +194,8 @@ def _append_hook_audit(
     if not isinstance(orchestration_id, str) or not orchestration_id.strip():
         return
     normalized_orch = orchestration_id.strip()
-    inner_payload = payload.get("payload")
-    inner_tool_name = inner_payload.get("tool_name") if isinstance(inner_payload, dict) else None
+    inner_payload = _inner_payload(payload)
+    inner_tool_name = inner_payload.get("tool_name")
     tool_name_raw = payload.get("tool_name")
     tool_name = tool_name_raw if isinstance(tool_name_raw, str) and tool_name_raw.strip() else inner_tool_name
     workflow_mode = os.environ.get("METDSL_WORKFLOW_MODE", "").strip().lower()
@@ -148,8 +254,13 @@ def _append_hook_audit(
         "action": decision.action.value,
         "reason": decision.reason,
         "continue_processing": decision.continue_processing,
-        "tool_name": payload.get("tool_name"),
+        "tool_name": tool_name,
     }
+    payload_summary = _audit_payload_summary(payload, tool_name if isinstance(tool_name, str) else None)
+    if payload_summary:
+        entry["payload_summary"] = payload_summary
+    if decision.audit_detail is not None:
+        entry["audit_detail"] = _sanitize_audit_detail(decision.audit_detail)
     with path.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(entry, ensure_ascii=False) + "\n")
 

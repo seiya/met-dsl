@@ -1172,6 +1172,129 @@ class ClaudeHookCliTests(unittest.TestCase):
             self.assertEqual(body.get("decision"), "block")
             self.assertIn("raw apply_patch tool is forbidden", body.get("reason", ""))
             self.assertIn("guarded-apply-patch", body.get("reason", ""))
+            log_path = (
+                repo_root
+                / "workspace"
+                / "orchestrations"
+                / orch
+                / "hooks"
+                / "native_hook_events.jsonl"
+            )
+            entry = json.loads(log_path.read_text(encoding="utf-8").splitlines()[-1])
+            self.assertEqual(entry.get("tool_name"), "apply_patch")
+            self.assertEqual(
+                entry.get("payload_summary", {}).get("apply_patch_paths"),
+                [],
+            )
+            self.assertEqual(entry.get("payload_summary", {}).get("patch_line_count"), 2)
+            self.assertEqual(
+                entry.get("audit_detail", {}).get("policy"),
+                "forbid_raw_apply_patch_in_workflow_mode",
+            )
+
+    def test_codex_raw_apply_patch_audit_logs_target_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            orch = "orch_apply_patch_audit_001"
+            orch_root = repo_root / "workspace" / "orchestrations" / orch
+            orch_root.mkdir(parents=True, exist_ok=True)
+            patch_text = "\n".join(
+                [
+                    "*** Begin Patch",
+                    "*** Add File: workspace/plans/p/plan_meta.json",
+                    "+{}",
+                    "*** Update File: workspace/plans/p/case.resolved.yaml",
+                    "@@",
+                    "+case: ok",
+                    "*** End Patch",
+                    "",
+                ]
+            )
+            payload = {
+                "orchestration_id": orch,
+                "repo_root": str(repo_root),
+                "tool_name": "apply_patch",
+                "tool_input": {"patch": patch_text},
+            }
+            out = io.StringIO()
+            with patch.dict(
+                os.environ,
+                {"METDSL_WORKFLOW_MODE": "1", "METDSL_REQUIRE_CODEX_HOOKS_FEATURE": "0"},
+                clear=False,
+            ):
+                with redirect_stdout(out):
+                    code = cli.main(
+                        [
+                            "--backend",
+                            "codex",
+                            "--event",
+                            "PreToolUse",
+                            "--input-json",
+                            json.dumps(payload),
+                        ]
+                    )
+            self.assertEqual(code, 2)
+            log_path = (
+                repo_root
+                / "workspace"
+                / "orchestrations"
+                / orch
+                / "hooks"
+                / "native_hook_events.jsonl"
+            )
+            entry = json.loads(log_path.read_text(encoding="utf-8").splitlines()[-1])
+            self.assertEqual(
+                entry.get("payload_summary", {}).get("apply_patch_paths"),
+                [
+                    "workspace/plans/p/plan_meta.json",
+                    "workspace/plans/p/case.resolved.yaml",
+                ],
+            )
+            self.assertNotIn("patch", entry.get("payload_summary", {}))
+
+    def test_bash_audit_redacts_capability_token(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            orch = "orch_audit_redact_001"
+            payload = {
+                "orchestration_id": orch,
+                "repo_root": str(repo_root),
+                "tool_name": "Bash",
+                "tool_input": {
+                    "command": (
+                        "python3 tools/orchestration_runtime.py guarded-apply-patch "
+                        "--capability-token secret-token-123"
+                    )
+                },
+            }
+            with patch.dict(
+                os.environ,
+                {"METDSL_WORKFLOW_MODE": "1", "METDSL_REQUIRE_CODEX_HOOKS_FEATURE": "0"},
+                clear=False,
+            ):
+                code = cli.main(
+                    [
+                        "--backend",
+                        "codex",
+                        "--event",
+                        "PreToolUse",
+                        "--input-json",
+                        json.dumps(payload),
+                    ]
+                )
+            self.assertEqual(code, 0)
+            log_path = (
+                repo_root
+                / "workspace"
+                / "orchestrations"
+                / orch
+                / "hooks"
+                / "native_hook_events.jsonl"
+            )
+            entry = json.loads(log_path.read_text(encoding="utf-8").splitlines()[-1])
+            command_summary = entry.get("payload_summary", {}).get("command", "")
+            self.assertIn("--capability-token <redacted>", command_summary)
+            self.assertNotIn("secret-token-123", command_summary)
 
     def test_claude_file_tool_blocks_when_active_agent_run_id_file_missing(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
