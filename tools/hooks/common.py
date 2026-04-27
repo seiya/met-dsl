@@ -21,7 +21,8 @@ READ_HINT = (
 
 WRITE_HINT = (
     "Hint: Write only via 'guarded-apply-patch' (tools/orchestration_runtime.py) "
-    "and only within output_manifests/<agent_run_id>.json write_roots."
+    "within output_manifests/<agent_run_id>.json allowed_output_paths. "
+    "Direct Write/Edit is limited to allowed_file_tool_paths."
 )
 
 MANIFEST_HINT = (
@@ -265,6 +266,14 @@ def _resolve_manifest_root(repo_root: Path, root_token: str) -> Path:
     return (repo_root / candidate).resolve()
 
 
+def _normalize_rel_posix(path_token: str) -> str:
+    """Normalize repo-relative path into stable POSIX token."""
+    token = path_token.strip().replace("\\", "/").lstrip("/")
+    while "//" in token:
+        token = token.replace("//", "/")
+    return token.rstrip("/")
+
+
 def _is_path_under_root(target: Path, root: Path) -> bool:
     target_s = str(target)
     root_s = str(root)
@@ -343,6 +352,7 @@ def validate_write_access(
     orchestration_id: str,
     agent_run_id: str,
     file_path: str,
+    tool_name: str | None = None,
 ) -> HookDecision:
     """output manifest の allowed_output_paths に対して write/edit 対象を検証する。"""
     manifest_path = (
@@ -382,17 +392,51 @@ def validate_write_access(
             ),
             continue_processing=False,
         )
+    abs_target = _resolve_target_path(repo_root, file_path)
+    try:
+        rel_target = abs_target.relative_to(repo_root).as_posix()
+    except ValueError:
+        rel_target = str(abs_target).replace("\\", "/")
+    rel_target_norm = _normalize_rel_posix(rel_target)
+
+    allowed_file_tool_paths_obj = manifest.get("allowed_file_tool_paths")
+    if not isinstance(allowed_file_tool_paths_obj, list):
+        return HookDecision(
+            action=HookDecisionAction.BLOCK,
+            reason=(
+                f"output manifest missing allowed_file_tool_paths list for agent_run_id={agent_run_id!r}. "
+                f"{MANIFEST_HINT}"
+            ),
+            continue_processing=False,
+        )
+    allowed_file_tool_paths: set[str] = set()
+    for item in allowed_file_tool_paths_obj:
+        if not isinstance(item, str):
+            return HookDecision(
+                action=HookDecisionAction.BLOCK,
+                reason=(
+                    "output manifest allowed_file_tool_paths must contain only strings "
+                    f"for agent_run_id={agent_run_id!r}. {MANIFEST_HINT}"
+                ),
+                continue_processing=False,
+            )
+        token = _normalize_rel_posix(item)
+        if token:
+            allowed_file_tool_paths.add(token)
+
     allowed_paths_obj = manifest.get("allowed_output_paths")
-    if isinstance(allowed_paths_obj, list):
-        allowed_paths = [str(item).strip() for item in allowed_paths_obj if isinstance(item, str) and item.strip()]
-        abs_target = _resolve_target_path(repo_root, file_path)
-        try:
-            rel_target = abs_target.relative_to(repo_root).as_posix()
-        except ValueError:
-            rel_target = str(abs_target).replace("\\", "/")
-        rel_target_norm = rel_target.strip("/").replace("\\", "/")
-        if rel_target_norm in [p.strip("/").replace("\\", "/") for p in allowed_paths]:
-            return HookDecision(action=HookDecisionAction.ALLOW)
+    if not isinstance(allowed_paths_obj, list):
+        return HookDecision(
+            action=HookDecisionAction.BLOCK,
+            reason=(
+                f"output manifest missing allowed_output_paths list for agent_run_id={agent_run_id!r}. "
+                f"{MANIFEST_HINT}"
+            ),
+            continue_processing=False,
+        )
+    allowed_paths = [str(item).strip() for item in allowed_paths_obj if isinstance(item, str) and item.strip()]
+    normalized_allowed_paths = {_normalize_rel_posix(p) for p in allowed_paths}
+    if rel_target_norm not in normalized_allowed_paths:
         return HookDecision(
             action=HookDecisionAction.BLOCK,
             reason=(
@@ -407,38 +451,24 @@ def validate_write_access(
                 "allowed_output_paths": allowed_paths,
             },
         )
-
-    # Backward compatibility for legacy manifests.
-    write_roots_obj = manifest.get("write_roots")
-    if not isinstance(write_roots_obj, list):
+    if tool_name in {"Edit", "Write"} and rel_target_norm not in allowed_file_tool_paths:
         return HookDecision(
             action=HookDecisionAction.BLOCK,
             reason=(
-                f"output manifest missing allowed_output_paths/write_roots list for agent_run_id={agent_run_id!r}. "
-                f"{MANIFEST_HINT}"
+                "direct write via Edit/Write tool is forbidden for this target path. "
+                "Use guarded-apply-patch instead or include the path in "
+                "output_manifest allowed_file_tool_paths: "
+                "python3 tools/orchestration_runtime.py guarded-apply-patch ..."
             ),
             continue_processing=False,
+            audit_detail={
+                "policy": "enforce_guarded_apply_patch",
+                "tool_name": tool_name,
+                "file_path": file_path,
+                "agent_run_id": agent_run_id,
+            },
         )
-    write_roots = [str(item) for item in write_roots_obj]
-    abs_target = _resolve_target_path(repo_root, file_path)
-    for root in write_roots:
-        abs_root = _resolve_manifest_root(repo_root, root)
-        if _is_path_under_root(abs_target, abs_root):
-            return HookDecision(action=HookDecisionAction.ALLOW)
-    return HookDecision(
-        action=HookDecisionAction.BLOCK,
-        reason=(
-            f"unauthorized write: {file_path!r} is not in output_manifest write_roots "
-            f"(agent_run_id={agent_run_id!r}). {WRITE_HINT}"
-        ),
-        continue_processing=False,
-        audit_detail={
-            "policy": "output_manifest_write_guard",
-            "file_path": file_path,
-            "agent_run_id": agent_run_id,
-            "write_roots": write_roots,
-        },
-    )
+    return HookDecision(action=HookDecisionAction.ALLOW)
 
 
 def validate_read_access(

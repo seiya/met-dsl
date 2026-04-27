@@ -1755,6 +1755,7 @@ def _write_allowed_output_manifest(
     orchestration_id: str,
     agent_run_id: str,
     allowed_output_paths: Sequence[str],
+    allowed_file_tool_paths: Sequence[str] | None = None,
     agent_role: str | None = None,
 ) -> str:
     normalized = [
@@ -1762,10 +1763,16 @@ def _write_allowed_output_manifest(
         for p in allowed_output_paths
         if isinstance(p, str) and p.strip()
     ]
+    file_tool_normalized = [
+        _normalize_rel_posix(p)
+        for p in (allowed_file_tool_paths or [])
+        if isinstance(p, str) and p.strip()
+    ]
     payload = {
         "orchestration_id": orchestration_id,
         "agent_run_id": agent_run_id.strip(),
         "allowed_output_paths": sorted(set(normalized)),
+        "allowed_file_tool_paths": sorted(set(file_tool_normalized)),
         "generated_at": _utc_now_iso(),
     }
     if isinstance(agent_role, str) and agent_role.strip():
@@ -1985,6 +1992,37 @@ def _allowed_output_paths_for_launch(
     if not deduped:
         raise ValueError("allowed_output_paths must be non-empty for step/substep agents")
     return deduped
+
+
+def _allowed_file_tool_paths_for_launch(
+    *,
+    request_payload: dict[str, Any],
+    allowed_output_paths: Sequence[str],
+) -> list[str]:
+    raw = request_payload.get("allowed_file_tool_paths")
+    if raw is None:
+        return []
+    if not isinstance(raw, list):
+        raise ValueError("allowed_file_tool_paths must be a list when provided")
+    allowed_set = {
+        _normalize_rel_posix(str(item))
+        for item in allowed_output_paths
+        if isinstance(item, str) and item.strip()
+    }
+    normalized: list[str] = []
+    for idx, item in enumerate(raw):
+        if not isinstance(item, str) or not item.strip():
+            raise ValueError(f"allowed_file_tool_paths[{idx}] must be non-empty string")
+        item_token = item.strip().replace("\\", "/")
+        if item_token.endswith("/"):
+            raise ValueError(f"allowed_file_tool_paths[{idx}] must be file path: {item!r}")
+        path = _normalize_rel_posix(item_token)
+        if path not in allowed_set:
+            raise ValueError(
+                f"allowed_file_tool_paths[{idx}] must be included in allowed_output_paths: {path!r}"
+            )
+        normalized.append(path)
+    return sorted(set(normalized))
 
 
 def _validate_child_write_contract_preflight(
@@ -5386,6 +5424,9 @@ def init_orchestration(
         allowed_output_paths=[
             f"workspace/orchestrations/{orchestration_id}/failure_analysis.json",
         ],
+        allowed_file_tool_paths=[
+            f"workspace/orchestrations/{orchestration_id}/failure_analysis.json",
+        ],
         agent_role="orchestration",
     )
 
@@ -5720,6 +5761,10 @@ def record_launch(
             request_payload=request_payload,
             write_roots=write_roots,
         )
+        allowed_file_tool_paths = _allowed_file_tool_paths_for_launch(
+            request_payload=request_payload,
+            allowed_output_paths=allowed_output_paths,
+        )
         _validate_child_write_contract_preflight(
             request_payload=request_payload,
             capability_doc=cap_doc,
@@ -5730,6 +5775,7 @@ def record_launch(
             orchestration_id=orchestration_id,
             agent_run_id=child_agent_run_id,
             allowed_output_paths=allowed_output_paths,
+            allowed_file_tool_paths=allowed_file_tool_paths,
         )
         out_refs["allowed_output_manifest_ref"] = manifest_ref
         try:
@@ -6434,6 +6480,7 @@ def main(argv: list[str] | None = None) -> int:
         "skill_name, skill_ref. "
         "For step/substep launch, one of allowed_output_paths|required_outputs|output_refs must be provided "
         "as file-path list; runtime validates each path against phase contract outputs and capability write_roots. "
+        "allowed_file_tool_paths is optional and, when provided, must be a file-path list included in allowed_output_paths. "
         "plan_id/pipeline_id format: <slug>_<YYYYMMDD>_<seq3> where slug uses hyphens only "
         "(e.g. 'flux-rsn-p0_20260425_001'; underscores in slug are invalid)."
     )

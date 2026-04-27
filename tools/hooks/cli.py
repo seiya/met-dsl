@@ -589,7 +589,7 @@ def main(argv: list[str] | None = None) -> int:
                                     decision = cli_guard
                                     break
                                 candidate = validate_write_access(
-                                    repo_root, orchestration_id, active_id, target
+                                    repo_root, orchestration_id, active_id, target, tool_name=tool_name
                                 )
                                 if candidate.action == HookDecisionAction.BLOCK:
                                     decision = candidate
@@ -617,6 +617,7 @@ def main(argv: list[str] | None = None) -> int:
                                 orchestration_id,
                                 orch_agent_run_id,
                                 decoded.file_path,
+                                tool_name=tool_name,
                             )
                         else:
                             hint = _hint_for_file_tool(tool_name)
@@ -654,6 +655,7 @@ def main(argv: list[str] | None = None) -> int:
                                 orchestration_id,
                                 active_agent_run_id,
                                 decoded.file_path,
+                                tool_name=tool_name,
                             )
                 else:
                     mapped_agent_run_id = _resolve_codex_agent_run_id_from_session(
@@ -683,6 +685,7 @@ def main(argv: list[str] | None = None) -> int:
                             orchestration_id,
                             mapped_agent_run_id,
                             decoded.file_path,
+                            tool_name=tool_name,
                         )
         _append_hook_audit(
             backend=args.backend,
