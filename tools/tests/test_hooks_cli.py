@@ -1014,6 +1014,55 @@ class ClaudeHookCliTests(unittest.TestCase):
             self.assertIn("unauthorized write", body.get("reason", ""))
             self.assertIn("guarded-apply-patch", body.get("reason", ""))
 
+    def test_claude_read_allows_self_output_and_read_manifest_without_allowed_root(self) -> None:
+        """output/read manifest は allowed_read_roots に含まれなくても Read 可能。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            orch = "orch_manifest_read_001"
+            run_id = "child_run_manifest_001"
+            orch_root = repo_root / "workspace" / "orchestrations" / orch
+            (orch_root / "output_manifests").mkdir(parents=True, exist_ok=True)
+            (orch_root / "read_manifests").mkdir(parents=True, exist_ok=True)
+            (orch_root / "active_child_agent_run_id.txt").write_text(run_id, encoding="utf-8")
+            (orch_root / "output_manifests" / f"{run_id}.json").write_text(
+                json.dumps({
+                    "allowed_output_paths": ["workspace/pipelines/safe/out.txt"],
+                    "allowed_file_tool_paths": ["workspace/pipelines/safe/out.txt"],
+                }),
+                encoding="utf-8",
+            )
+            (orch_root / "read_manifests" / f"{run_id}.json").write_text(
+                json.dumps({"allowed_read_roots": ["docs/"]}),
+                encoding="utf-8",
+            )
+            out_manifest_rel = f"workspace/orchestrations/{orch}/output_manifests/{run_id}.json"
+            read_manifest_rel = f"workspace/orchestrations/{orch}/read_manifests/{run_id}.json"
+            for target in (out_manifest_rel, read_manifest_rel):
+                payload = {
+                    "orchestration_id": orch,
+                    "repo_root": str(repo_root),
+                    "tool_name": "Read",
+                    "tool_input": {"file_path": target},
+                }
+                out = io.StringIO()
+                with patch.dict(os.environ, {"METDSL_WORKFLOW_MODE": "1"}, clear=False):
+                    with redirect_stdout(out):
+                        code = cli.main(
+                            [
+                                "--backend",
+                                "claude",
+                                "--event",
+                                "PreToolUse",
+                                "--input-json",
+                                json.dumps(payload),
+                            ]
+                        )
+                self.assertEqual(code, 0, msg=f"expected allow for {target!r}")
+                raw = out.getvalue().strip()
+                if raw:
+                    body = json.loads(raw)
+                    self.assertEqual(body.get("decision"), "allow", msg=target)
+
     def test_codex_file_tool_resolves_session_to_agent_run_and_allows_manifest_path(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)

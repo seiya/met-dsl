@@ -28,8 +28,10 @@ def _lookup_payload_field(payload: dict[str, Any], key: str) -> Any:
 
 
 READ_HINT = (
-    "Hint: Read only via 'run-gate --gate orchestration_read' and only within "
-    "read_manifests/<agent_run_id>.json allowed_read_roots. "
+    "Hint: workspace/orchestrations/<orchestration_id>/output_manifests/<agent_run_id>.json "
+    "and read_manifests/<agent_run_id>.json may be read directly. For other paths use "
+    "'run-gate --gate orchestration_read' within read_manifests/<agent_run_id>.json "
+    "allowed_read_roots. "
     "Interpret requirements only from docs/, spec/, and skill_must_read_refs artifacts; "
     "do not derive rules from tools/, validator scripts, or tests."
 )
@@ -297,6 +299,28 @@ def _is_path_under_root(target: Path, root: Path) -> bool:
     return target_s == root_s or target_s.startswith(root_s.rstrip("/") + "/")
 
 
+def _is_self_agent_manifest_read_path(
+    repo_root: Path,
+    orchestration_id: str,
+    agent_run_id: str,
+    file_path: str,
+) -> bool:
+    """当該 child の output / read manifest JSON への Read は run-gate 外でも許可する。"""
+    orch = orchestration_id.strip()
+    rid = agent_run_id.strip()
+    if not orch or not rid:
+        return False
+    abs_target = _resolve_target_path(repo_root, file_path)
+    try:
+        rel = abs_target.relative_to(repo_root.resolve()).as_posix()
+    except ValueError:
+        return False
+    rel_norm = _normalize_rel_posix(rel)
+    out_rel = _normalize_rel_posix(f"workspace/orchestrations/{orch}/output_manifests/{rid}.json")
+    read_rel = _normalize_rel_posix(f"workspace/orchestrations/{orch}/read_manifests/{rid}.json")
+    return rel_norm == out_rel or rel_norm == read_rel
+
+
 @dataclass(frozen=True)
 class _CliManagedPath:
     pattern: re.Pattern[str]
@@ -495,6 +519,8 @@ def validate_read_access(
     file_path: str,
 ) -> HookDecision:
     """read manifest の allowed_read_roots に対して read 対象を検証する。"""
+    if _is_self_agent_manifest_read_path(repo_root, orchestration_id, agent_run_id, file_path):
+        return HookDecision(action=HookDecisionAction.ALLOW)
     manifest_path = (
         repo_root
         / "workspace"
