@@ -512,7 +512,8 @@ def _resolve_codex_agent_run_id_from_session(
     runs_path = repo_root / "workspace" / "orchestrations" / orchestration_id / "agent_runs.jsonl"
     if not runs_path.is_file():
         return None
-    resolved: str | None = None
+    session_match_ids: set[str] = set()
+    context_match_ids: set[str] = set()
     with runs_path.open("r", encoding="utf-8") as handle:
         for raw in handle:
             line = raw.strip()
@@ -527,16 +528,24 @@ def _resolve_codex_agent_run_id_from_session(
             backend = str(item.get("agent_backend", "")).strip().lower()
             if backend != "codex":
                 continue
-            entry_session = str(item.get("agent_session_id", "")).strip()
-            if entry_session not in tokens:
-                continue
             run_id = item.get("agent_run_id")
             if not isinstance(run_id, str) or not run_id.strip():
                 continue
-            if resolved is not None and resolved != run_id.strip():
-                return None
-            resolved = run_id.strip()
-    return resolved
+            normalized_run_id = run_id.strip()
+            entry_session = str(item.get("agent_session_id", "")).strip()
+            if entry_session in tokens:
+                session_match_ids.add(normalized_run_id)
+                continue
+            entry_context = str(item.get("context_id", "")).strip()
+            if entry_context in tokens:
+                context_match_ids.add(normalized_run_id)
+    if len(session_match_ids) == 1:
+        return next(iter(session_match_ids))
+    if len(session_match_ids) > 1:
+        return None
+    if len(context_match_ids) == 1:
+        return next(iter(context_match_ids))
+    return None
 
 
 def _hint_for_file_tool(tool_name: str) -> str:

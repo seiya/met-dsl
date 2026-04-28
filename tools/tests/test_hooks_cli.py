@@ -1271,6 +1271,144 @@ class ClaudeHookCliTests(unittest.TestCase):
             )
             self.assertEqual(entry.get("payload_summary", {}).get("patch_line_count"), 4)
 
+    def test_codex_raw_apply_patch_allows_when_session_id_matches_context_id(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            orch = "orch_apply_patch_guard_001_context_fallback"
+            run_id = "step_run_apply_patch_context_001"
+            context_id = "ctx_apply_patch_001"
+            target_path = "workspace/pipelines/safe/case.resolved.yaml"
+            orch_root = repo_root / "workspace" / "orchestrations" / orch
+            (orch_root / "output_manifests").mkdir(parents=True, exist_ok=True)
+            (orch_root / "agent_runs.jsonl").write_text(
+                json.dumps(
+                    {
+                        "agent_run_id": run_id,
+                        "agent_backend": "codex",
+                        "agent_session_id": "sess_unrelated_001",
+                        "context_id": context_id,
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            (orch_root / "output_manifests" / f"{run_id}.json").write_text(
+                json.dumps(
+                    {
+                        "orchestration_id": orch,
+                        "agent_run_id": run_id,
+                        "allowed_output_paths": [target_path],
+                        "allowed_file_tool_paths": [target_path],
+                        "write_roots": ["workspace/pipelines/safe"],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            payload = {
+                "orchestration_id": orch,
+                "repo_root": str(repo_root),
+                "tool_name": "apply_patch",
+                "session_id": context_id,
+                "tool_input": {
+                    "patch": (
+                        "*** Begin Patch\n"
+                        f"*** Add File: {target_path}\n"
+                        "+case: resolved\n"
+                        "*** End Patch\n"
+                    )
+                },
+            }
+            out = io.StringIO()
+            with patch.dict(
+                os.environ,
+                {"METDSL_WORKFLOW_MODE": "1", "METDSL_REQUIRE_CODEX_HOOKS_FEATURE": "0"},
+                clear=False,
+            ):
+                with redirect_stdout(out):
+                    code = cli.main(
+                        [
+                            "--backend",
+                            "codex",
+                            "--event",
+                            "PreToolUse",
+                            "--input-json",
+                            json.dumps(payload),
+                        ]
+                    )
+            self.assertEqual(code, 0)
+            body_text = out.getvalue().strip()
+            if body_text:
+                body = json.loads(body_text)
+                self.assertEqual(body.get("decision"), "allow")
+
+    def test_codex_raw_apply_patch_blocks_when_context_id_mapping_is_ambiguous(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            orch = "orch_apply_patch_guard_ambiguous_context"
+            context_id = "ctx_apply_patch_ambiguous_001"
+            target_path = "workspace/pipelines/safe/case.resolved.yaml"
+            orch_root = repo_root / "workspace" / "orchestrations" / orch
+            (orch_root / "output_manifests").mkdir(parents=True, exist_ok=True)
+            (orch_root / "agent_runs.jsonl").write_text(
+                "\n".join(
+                    [
+                        json.dumps(
+                            {
+                                "agent_run_id": "step_run_apply_patch_context_ambiguous_001",
+                                "agent_backend": "codex",
+                                "agent_session_id": "sess_unrelated_ambiguous_001",
+                                "context_id": context_id,
+                            }
+                        ),
+                        json.dumps(
+                            {
+                                "agent_run_id": "step_run_apply_patch_context_ambiguous_002",
+                                "agent_backend": "codex",
+                                "agent_session_id": "sess_unrelated_ambiguous_002",
+                                "context_id": context_id,
+                            }
+                        ),
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            payload = {
+                "orchestration_id": orch,
+                "repo_root": str(repo_root),
+                "tool_name": "apply_patch",
+                "session_id": context_id,
+                "tool_input": {
+                    "patch": (
+                        "*** Begin Patch\n"
+                        f"*** Add File: {target_path}\n"
+                        "+case: ambiguous\n"
+                        "*** End Patch\n"
+                    )
+                },
+            }
+            out = io.StringIO()
+            with patch.dict(
+                os.environ,
+                {"METDSL_WORKFLOW_MODE": "1", "METDSL_REQUIRE_CODEX_HOOKS_FEATURE": "0"},
+                clear=False,
+            ):
+                with redirect_stdout(out):
+                    code = cli.main(
+                        [
+                            "--backend",
+                            "codex",
+                            "--event",
+                            "PreToolUse",
+                            "--input-json",
+                            json.dumps(payload),
+                        ]
+                    )
+            self.assertEqual(code, 2)
+            body = json.loads(out.getvalue().strip())
+            self.assertEqual(body.get("decision"), "block")
+            self.assertIn("session-to-run mapping not found", body.get("reason", ""))
+
     def test_codex_raw_apply_patch_audit_logs_target_paths(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
