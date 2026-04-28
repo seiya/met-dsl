@@ -1770,13 +1770,21 @@ def _write_apply_patch_gate_evidence(
     result_payload: dict[str, Any],
 ) -> str:
     gate = "apply_patch_writes"
+    latest_changed_paths = _normalize_rel_path_list([str(p) for p in changed_paths if str(p).strip()])
+    cumulative_changed_paths = _update_cumulative_gate_changed_paths_for_run(
+        repo_root,
+        orchestration_id,
+        agent_run_id=agent_run_id,
+        changed_paths=latest_changed_paths,
+    )
     gate_doc: dict[str, Any] = {
         "orchestration_id": orchestration_id,
         "agent_run_id": agent_run_id,
         "gate": gate,
         "args_json": {
             "actor_role": actor_role,
-            "changed_paths": [_normalize_rel_posix(p) for p in changed_paths if str(p).strip()],
+            "changed_paths": cumulative_changed_paths,
+            "latest_changed_paths": latest_changed_paths,
         },
         "status": "pass",
         "exit_code": 0,
@@ -2697,12 +2705,99 @@ def _actual_changed_paths_since_baseline(
     return sorted(changed)
 
 
+def _normalize_rel_path_list(paths: Sequence[str]) -> list[str]:
+    return sorted(
+        {
+            _normalize_rel_posix(str(path))
+            for path in paths
+            if isinstance(path, str) and path.strip()
+        }
+    )
+
+
+def _gate_changed_paths_store_path(
+    repo_root: Path,
+    orchestration_id: str,
+    *,
+    agent_run_id: str,
+) -> Path:
+    return (
+        _orchestration_root(repo_root, orchestration_id)
+        / "agents"
+        / agent_run_id.strip()
+        / "gate_changed_paths.json"
+    )
+
+
+def _load_cumulative_gate_changed_paths_for_run(
+    repo_root: Path,
+    orchestration_id: str,
+    *,
+    agent_run_id: str,
+) -> list[str]:
+    path = _gate_changed_paths_store_path(
+        repo_root,
+        orchestration_id,
+        agent_run_id=agent_run_id,
+    )
+    if not path.exists():
+        return []
+    try:
+        payload = _read_json(path)
+    except (OSError, json.JSONDecodeError):
+        return []
+    if not isinstance(payload, dict):
+        return []
+    paths_obj = payload.get("gate_changed_paths")
+    if not isinstance(paths_obj, list):
+        return []
+    return _normalize_rel_path_list([str(item) for item in paths_obj if isinstance(item, str)])
+
+
+def _update_cumulative_gate_changed_paths_for_run(
+    repo_root: Path,
+    orchestration_id: str,
+    *,
+    agent_run_id: str,
+    changed_paths: Sequence[str],
+) -> list[str]:
+    current = _load_cumulative_gate_changed_paths_for_run(
+        repo_root,
+        orchestration_id,
+        agent_run_id=agent_run_id,
+    )
+    incoming = _normalize_rel_path_list(changed_paths)
+    merged = sorted(set(current) | set(incoming))
+    path = _gate_changed_paths_store_path(
+        repo_root,
+        orchestration_id,
+        agent_run_id=agent_run_id,
+    )
+    _write_json(
+        path,
+        {
+            "orchestration_id": orchestration_id,
+            "agent_run_id": agent_run_id.strip(),
+            "gate_changed_paths": merged,
+            "updated_at": _utc_now_iso(),
+        },
+    )
+    return merged
+
+
 def _gate_changed_paths_for_run(
     repo_root: Path,
     orchestration_id: str,
     *,
     agent_run_id: str,
 ) -> list[str]:
+    cumulative = _load_cumulative_gate_changed_paths_for_run(
+        repo_root,
+        orchestration_id,
+        agent_run_id=agent_run_id,
+    )
+    if cumulative:
+        return cumulative
     gate_path = _gates_dir(repo_root, orchestration_id) / agent_run_id.strip() / "apply_patch_writes.json"
     if not gate_path.exists():
         return []
@@ -2717,11 +2812,7 @@ def _gate_changed_paths_for_run(
     changed_paths = args_json.get("changed_paths")
     if not isinstance(changed_paths, list):
         return []
-    return [
-        _normalize_rel_posix(item)
-        for item in changed_paths
-        if isinstance(item, str) and item.strip()
-    ]
+    return _normalize_rel_path_list([str(item) for item in changed_paths if isinstance(item, str)])
 
 
 def _declared_output_refs(payload: dict[str, Any]) -> list[str]:
@@ -2909,6 +3000,7 @@ def _write_unauthorized_write_violation(
     unauthorized_paths: list[str],
     output_refs: list[str],
     gate_changed_paths: list[str],
+    missing_from_gate_changed_paths: list[str],
     write_roots: list[str],
     manifest_file_tool_paths: list[str] | None = None,
 ) -> Path:
@@ -2923,6 +3015,7 @@ def _write_unauthorized_write_violation(
         "unauthorized_paths": unauthorized_paths,
         "output_refs": output_refs,
         "gate_changed_paths": gate_changed_paths,
+        "missing_from_gate_changed_paths": missing_from_gate_changed_paths,
         "write_roots": write_roots,
     }
     if manifest_file_tool_paths is not None:
@@ -2984,6 +3077,13 @@ def _validate_actual_write_paths(
         write_roots = [str(item) for item in roots_obj] if isinstance(roots_obj, list) else []
 
     unauthorized: list[str] = []
+    missing_from_gate_changed_paths = sorted(
+        {
+            path
+            for path in actual_changed_paths
+            if not any(_repo_path_under_prefix(path, gate_path) for gate_path in gate_changed_paths)
+        }
+    )
     manifest_file_tool_paths: set[str] = set()
     if actor_role == "orchestration":
         declared_paths = sorted(set(output_refs) | set(gate_changed_paths))
@@ -3029,6 +3129,7 @@ def _validate_actual_write_paths(
             unauthorized_paths=unauthorized,
             output_refs=output_refs,
             gate_changed_paths=gate_changed_paths,
+            missing_from_gate_changed_paths=missing_from_gate_changed_paths,
             write_roots=write_roots,
             manifest_file_tool_paths=sorted(manifest_file_tool_paths) if manifest_file_tool_paths else None,
         )
@@ -4515,7 +4616,11 @@ def _validate_apply_patch_gate_coverage(
     changed_paths_obj = args_json.get("changed_paths")
     if not isinstance(changed_paths_obj, list) or not all(isinstance(x, str) for x in changed_paths_obj):
         raise ValueError(f"apply_patch_writes gate changed_paths must be string array: {gate_path}")
-    changed_paths = [_normalize_rel_posix(x) for x in changed_paths_obj if x.strip()]
+    changed_paths = _gate_changed_paths_for_run(
+        repo_root,
+        orchestration_id,
+        agent_run_id=run_id,
+    )
     if not changed_paths:
         raise ValueError(f"apply_patch_writes gate changed_paths must be non-empty: {gate_path}")
 
@@ -6445,14 +6550,6 @@ def guarded_apply_patch(
         agent_run_id=agent_run_id,
         capability_token=capability_token,
     )
-    gate_ref = _write_apply_patch_gate_evidence(
-        repo_root,
-        orchestration_id=orchestration_id,
-        agent_run_id=agent_run_id,
-        actor_role=actor_role,
-        changed_paths=normalized_paths,
-        result_payload=gate_result,
-    )
     proc = subprocess.run(
         ["git", "apply", "--recount", "--whitespace=nowarn", "-"],
         cwd=str(repo_root),
@@ -6464,6 +6561,14 @@ def guarded_apply_patch(
     if proc.returncode != 0:
         msg = (proc.stderr or proc.stdout or "").strip()
         raise RuntimeError(f"guarded-apply-patch: git apply failed: {msg}")
+    gate_ref = _write_apply_patch_gate_evidence(
+        repo_root,
+        orchestration_id=orchestration_id,
+        agent_run_id=agent_run_id,
+        actor_role=actor_role,
+        changed_paths=normalized_paths,
+        result_payload=gate_result,
+    )
 
     return {
         "applied": True,

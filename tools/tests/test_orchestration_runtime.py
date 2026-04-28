@@ -8775,6 +8775,156 @@ class TerminalUnauthorizedWriteDirectWriteTests(unittest.TestCase):
                     },
                 )
 
+    def test_step_terminal_uses_cumulative_gate_changed_paths_across_multiple_apply_patch_calls(self) -> None:
+        from tools.orchestration_runtime import (
+            _validate_actual_write_paths,
+            _write_apply_patch_gate_evidence,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            orch = "orch_term_dw_003"
+            run_id = "step_run_term_dw_003"
+            a_rel = "workspace/pipelines/p/build/build_001/A.json"
+            b_rel = "workspace/pipelines/p/build/build_001/B.json"
+            self._setup_step_run_state(
+                repo_root,
+                orchestration_id=orch,
+                agent_run_id=run_id,
+                write_roots=["workspace/pipelines/p/build"],
+                allowed_output_paths=[a_rel, b_rel],
+                allowed_file_tool_paths=[],
+            )
+            a_path = repo_root / a_rel
+            b_path = repo_root / b_rel
+            a_path.parent.mkdir(parents=True, exist_ok=True)
+            a_path.write_text('{"a": 1}\n', encoding="utf-8")
+            b_path.write_text('{"b": 1}\n', encoding="utf-8")
+            _write_apply_patch_gate_evidence(
+                repo_root,
+                orchestration_id=orch,
+                agent_run_id=run_id,
+                actor_role="step",
+                changed_paths=[a_rel, b_rel],
+                result_payload={"allowed": True, "checked_paths": [a_rel, b_rel]},
+            )
+            _write_apply_patch_gate_evidence(
+                repo_root,
+                orchestration_id=orch,
+                agent_run_id=run_id,
+                actor_role="step",
+                changed_paths=[a_rel],
+                result_payload={"allowed": True, "checked_paths": [a_rel]},
+            )
+
+            _validate_actual_write_paths(
+                repo_root,
+                orch,
+                {
+                    "agent_run_id": run_id,
+                    "agent_role": "step",
+                    "status": "pass",
+                    "output_refs": [a_rel, b_rel],
+                },
+            )
+
+    def test_step_terminal_violation_includes_missing_from_gate_changed_paths(self) -> None:
+        from tools.orchestration_runtime import _validate_actual_write_paths
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            orch = "orch_term_dw_004"
+            run_id = "step_run_term_dw_004"
+            allowed_rel = "workspace/pipelines/p/build/build_001/A.json"
+            unauthorized_rel = "workspace/pipelines/p/build/build_001/C.json"
+            self._setup_step_run_state(
+                repo_root,
+                orchestration_id=orch,
+                agent_run_id=run_id,
+                write_roots=["workspace/pipelines/p/build"],
+                allowed_output_paths=[allowed_rel],
+                allowed_file_tool_paths=[],
+            )
+            allowed_path = repo_root / allowed_rel
+            unauthorized_path = repo_root / unauthorized_rel
+            allowed_path.parent.mkdir(parents=True, exist_ok=True)
+            allowed_path.write_text('{"a": 1}\n', encoding="utf-8")
+            unauthorized_path.write_text('{"c": 1}\n', encoding="utf-8")
+
+            with self.assertRaisesRegex(ValueError, "unauthorized write paths"):
+                _validate_actual_write_paths(
+                    repo_root,
+                    orch,
+                    {
+                        "agent_run_id": run_id,
+                        "agent_role": "step",
+                        "status": "pass",
+                        "output_refs": [allowed_rel],
+                    },
+                )
+            violation_path = (
+                repo_root
+                / "workspace"
+                / "orchestrations"
+                / orch
+                / "violations"
+                / f"{run_id}.unauthorized_write_violation.json"
+            )
+            violation = json.loads(violation_path.read_text(encoding="utf-8"))
+            self.assertEqual(
+                violation.get("missing_from_gate_changed_paths"),
+                [allowed_rel, unauthorized_rel],
+            )
+
+    def test_step_terminal_falls_back_to_gate_file_when_cumulative_store_is_invalid_json(self) -> None:
+        from tools.orchestration_runtime import (
+            _gate_changed_paths_store_path,
+            _validate_actual_write_paths,
+            _write_apply_patch_gate_evidence,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            orch = "orch_term_dw_005"
+            run_id = "step_run_term_dw_005"
+            out_rel = "workspace/pipelines/p/build/build_001/A.json"
+            self._setup_step_run_state(
+                repo_root,
+                orchestration_id=orch,
+                agent_run_id=run_id,
+                write_roots=["workspace/pipelines/p/build"],
+                allowed_output_paths=[out_rel],
+                allowed_file_tool_paths=[],
+            )
+            out_path = repo_root / out_rel
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            out_path.write_text('{"a": 1}\n', encoding="utf-8")
+            _write_apply_patch_gate_evidence(
+                repo_root,
+                orchestration_id=orch,
+                agent_run_id=run_id,
+                actor_role="step",
+                changed_paths=[out_rel],
+                result_payload={"allowed": True, "checked_paths": [out_rel]},
+            )
+            # Corrupt cumulative store to ensure loader falls back to gate file.
+            _gate_changed_paths_store_path(
+                repo_root,
+                orch,
+                agent_run_id=run_id,
+            ).write_text("{invalid-json\n", encoding="utf-8")
+
+            _validate_actual_write_paths(
+                repo_root,
+                orch,
+                {
+                    "agent_run_id": run_id,
+                    "agent_role": "step",
+                    "status": "pass",
+                    "output_refs": [out_rel],
+                },
+            )
+
 
 class ApplyPatchGateCoverageExtensionTests(unittest.TestCase):
     """`_validate_apply_patch_gate_coverage` の extension 別 gate 要件確認。"""
