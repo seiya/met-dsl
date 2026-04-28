@@ -492,11 +492,11 @@ def validate_write_access(
                 "allowed_output_paths": allowed_paths,
             },
         )
-    if tool_name in {"Edit", "Write"} and rel_target_norm not in allowed_file_tool_paths:
+    if tool_name in {"Edit", "Write", "apply_patch"} and rel_target_norm not in allowed_file_tool_paths:
         return HookDecision(
             action=HookDecisionAction.BLOCK,
             reason=(
-                "direct write via Edit/Write tool is forbidden for this target path. "
+                "direct write via Edit/Write/apply_patch tool is forbidden for this target path. "
                 "Use guarded-apply-patch instead or include the path in "
                 "output_manifest allowed_file_tool_paths: "
                 "python3 tools/orchestration_runtime.py guarded-apply-patch ..."

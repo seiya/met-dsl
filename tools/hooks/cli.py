@@ -543,6 +543,80 @@ def _hint_for_file_tool(tool_name: str) -> str:
     return READ_HINT if tool_name == "Read" else WRITE_HINT
 
 
+def _resolve_agent_run_id_for_file_tool(
+    *,
+    backend: str,
+    repo_root: Path,
+    orchestration_id: str,
+    session_id: str | None,
+    agent_session_id: str | None,
+    tool_name: str,
+) -> tuple[str | None, HookDecision | None]:
+    if backend == "claude":
+        active_path = _active_child_agent_run_id_path(repo_root, orchestration_id)
+        if active_path.exists():
+            active_agent_run_id = active_path.read_text(encoding="utf-8").strip()
+            if not active_agent_run_id:
+                hint = _hint_for_file_tool(tool_name)
+                return None, HookDecision(
+                    action=HookDecisionAction.BLOCK,
+                    reason=(
+                        "active child agent_run_id is empty for Claude backend. "
+                        f"{hint}"
+                    ),
+                    continue_processing=False,
+                )
+            return active_agent_run_id, None
+        orch_agent_run_id = _get_orchestration_agent_run_id(repo_root, orchestration_id)
+        if not orch_agent_run_id:
+            hint = _hint_for_file_tool(tool_name)
+            return None, HookDecision(
+                action=HookDecisionAction.BLOCK,
+                reason=(
+                    "no orchestration_agent_run_id found in orchestration_meta.json. "
+                    f"{hint}"
+                ),
+                continue_processing=False,
+            )
+        return orch_agent_run_id, None
+    mapped_agent_run_id = _resolve_codex_agent_run_id_from_session(
+        repo_root=repo_root,
+        orchestration_id=orchestration_id,
+        session_id=session_id,
+        agent_session_id=agent_session_id,
+    )
+    if not mapped_agent_run_id:
+        hint = _hint_for_file_tool(tool_name)
+        return None, HookDecision(
+            action=HookDecisionAction.BLOCK,
+            reason=f"session-to-run mapping not found. {hint}",
+            continue_processing=False,
+        )
+    return mapped_agent_run_id, None
+
+
+def _validate_write_targets(
+    *,
+    repo_root: Path,
+    orchestration_id: str,
+    agent_run_id: str,
+    targets: list[str],
+    tool_name: str,
+) -> HookDecision:
+    for target in targets:
+        cli_guard = check_cli_managed_path(repo_root, target)
+        candidate = cli_guard if cli_guard is not None else validate_write_access(
+            repo_root,
+            orchestration_id,
+            agent_run_id,
+            target,
+            tool_name=tool_name,
+        )
+        if candidate.action == HookDecisionAction.BLOCK:
+            return candidate
+    return HookDecision(action=HookDecisionAction.ALLOW)
+
+
 def _emit_hook_response(
     exit_code: int,
     stdout_text: str,
@@ -657,16 +731,34 @@ def main(argv: list[str] | None = None) -> int:
                 and os.environ.get("METDSL_WORKFLOW_MODE", "0").strip() == "1"
                 and tool_name == "apply_patch"
             ):
-                decision = HookDecision(
-                    action=HookDecisionAction.BLOCK,
-                    reason=(
-                        "raw apply_patch tool is forbidden in workflow mode. "
-                        "Use guarded-apply-patch instead: "
-                        "python3 tools/orchestration_runtime.py guarded-apply-patch ..."
-                    ),
-                    continue_processing=False,
-                    audit_detail={"policy": "forbid_raw_apply_patch_in_workflow_mode"},
+                patch_text = ""
+                decoded_tool_input = _tool_input(decoded.payload)
+                patch_value = decoded_tool_input.get("patch")
+                if not isinstance(patch_value, str):
+                    patch_value = decoded_tool_input.get("patch_text")
+                if isinstance(patch_value, str):
+                    patch_text = patch_value
+                apply_patch_paths = _extract_apply_patch_paths(patch_text)
+                resolved_run_id, resolution_error = _resolve_agent_run_id_for_file_tool(
+                    backend=args.backend,
+                    repo_root=repo_root,
+                    orchestration_id=orchestration_id,
+                    session_id=decoded.session_id,
+                    agent_session_id=decoded.agent_session_id,
+                    tool_name=tool_name,
                 )
+                if resolution_error is not None:
+                    decision = resolution_error
+                elif resolved_run_id is None:
+                    decision = HookDecision(action=HookDecisionAction.ALLOW)
+                else:
+                    decision = _validate_write_targets(
+                        repo_root=repo_root,
+                        orchestration_id=orchestration_id,
+                        agent_run_id=resolved_run_id,
+                        targets=apply_patch_paths,
+                        tool_name=tool_name,
+                    )
                 _append_hook_audit(
                     backend=args.backend,
                     event_name=event_name,
@@ -710,92 +802,32 @@ def main(argv: list[str] | None = None) -> int:
                     decision = HookDecision(action=HookDecisionAction.ALLOW)
                 elif not decoded.file_path:
                     decision = HookDecision(action=HookDecisionAction.ALLOW)
-                elif args.backend == "claude":
-                    active_path = _active_child_agent_run_id_path(repo_root, orchestration_id)
-                    if not active_path.exists():
-                        orch_agent_run_id = _get_orchestration_agent_run_id(repo_root, orchestration_id)
-                        if orch_agent_run_id and tool_name == "Read":
-                            decision = validate_read_access(
-                                repo_root,
-                                orchestration_id,
-                                orch_agent_run_id,
-                                decoded.file_path,
-                            )
-                        elif orch_agent_run_id and tool_name in {"Write", "Edit"}:
-                            cli_guard = check_cli_managed_path(repo_root, decoded.file_path)
-                            decision = cli_guard if cli_guard is not None else validate_write_access(
-                                repo_root,
-                                orchestration_id,
-                                orch_agent_run_id,
-                                decoded.file_path,
-                                tool_name=tool_name,
-                            )
-                        else:
-                            hint = _hint_for_file_tool(tool_name)
-                            decision = HookDecision(
-                                action=HookDecisionAction.BLOCK,
-                                reason=(
-                                    "no orchestration_agent_run_id found in orchestration_meta.json. "
-                                    f"{hint}"
-                                ),
-                                continue_processing=False,
-                            )
-                    else:
-                        active_agent_run_id = active_path.read_text(encoding="utf-8").strip()
-                        if not active_agent_run_id:
-                            hint = _hint_for_file_tool(tool_name)
-                            decision = HookDecision(
-                                action=HookDecisionAction.BLOCK,
-                                reason=(
-                                    "active child agent_run_id is empty for Claude backend. "
-                                    f"{hint}"
-                                ),
-                                continue_processing=False,
-                            )
-                        elif tool_name == "Read":
-                            decision = validate_read_access(
-                                repo_root,
-                                orchestration_id,
-                                active_agent_run_id,
-                                decoded.file_path,
-                            )
-                        else:
-                            cli_guard = check_cli_managed_path(repo_root, decoded.file_path)
-                            decision = cli_guard if cli_guard is not None else validate_write_access(
-                                repo_root,
-                                orchestration_id,
-                                active_agent_run_id,
-                                decoded.file_path,
-                                tool_name=tool_name,
-                            )
                 else:
-                    mapped_agent_run_id = _resolve_codex_agent_run_id_from_session(
+                    resolved_run_id, resolution_error = _resolve_agent_run_id_for_file_tool(
+                        backend=args.backend,
                         repo_root=repo_root,
                         orchestration_id=orchestration_id,
                         session_id=decoded.session_id,
                         agent_session_id=decoded.agent_session_id,
+                        tool_name=tool_name,
                     )
-                    if not mapped_agent_run_id:
-                        hint = _hint_for_file_tool(tool_name)
-                        decision = HookDecision(
-                            action=HookDecisionAction.BLOCK,
-                            reason=f"session-to-run mapping not found. {hint}",
-                            continue_processing=False,
-                        )
+                    if resolution_error is not None:
+                        decision = resolution_error
+                    elif resolved_run_id is None:
+                        decision = HookDecision(action=HookDecisionAction.ALLOW)
                     elif tool_name == "Read":
                         decision = validate_read_access(
                             repo_root,
                             orchestration_id,
-                            mapped_agent_run_id,
+                            resolved_run_id,
                             decoded.file_path,
                         )
                     else:
-                        cli_guard = check_cli_managed_path(repo_root, decoded.file_path)
-                        decision = cli_guard if cli_guard is not None else validate_write_access(
-                            repo_root,
-                            orchestration_id,
-                            mapped_agent_run_id,
-                            decoded.file_path,
+                        decision = _validate_write_targets(
+                            repo_root=repo_root,
+                            orchestration_id=orchestration_id,
+                            agent_run_id=resolved_run_id,
+                            targets=[decoded.file_path],
                             tool_name=tool_name,
                         )
         _append_hook_audit(

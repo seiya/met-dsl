@@ -1187,17 +1187,51 @@ class ClaudeHookCliTests(unittest.TestCase):
             self.assertIn("guarded-apply-patch", body.get("reason", ""))
             self.assertNotIn("orchestration_read", body.get("reason", ""))
 
-    def test_codex_raw_apply_patch_blocks_in_workflow_mode(self) -> None:
+    def test_codex_raw_apply_patch_allows_when_target_is_in_allowed_file_tool_paths(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
             orch = "orch_apply_patch_guard_001"
+            run_id = "step_run_apply_patch_001"
+            session_id = "sess_apply_patch_001"
+            target_path = "workspace/pipelines/safe/notes.md"
             orch_root = repo_root / "workspace" / "orchestrations" / orch
-            orch_root.mkdir(parents=True, exist_ok=True)
+            (orch_root / "output_manifests").mkdir(parents=True, exist_ok=True)
+            (orch_root / "agent_runs.jsonl").write_text(
+                json.dumps(
+                    {
+                        "agent_run_id": run_id,
+                        "agent_backend": "codex",
+                        "agent_session_id": session_id,
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            (orch_root / "output_manifests" / f"{run_id}.json").write_text(
+                json.dumps(
+                    {
+                        "orchestration_id": orch,
+                        "agent_run_id": run_id,
+                        "allowed_output_paths": [target_path],
+                        "allowed_file_tool_paths": [target_path],
+                        "write_roots": ["workspace/pipelines/safe"],
+                    }
+                ),
+                encoding="utf-8",
+            )
             payload = {
                 "orchestration_id": orch,
                 "repo_root": str(repo_root),
                 "tool_name": "apply_patch",
-                "tool_input": {"patch": "*** Begin Patch\n*** End Patch\n"},
+                "session_id": session_id,
+                "tool_input": {
+                    "patch": (
+                        "*** Begin Patch\n"
+                        f"*** Add File: {target_path}\n"
+                        "+notes\n"
+                        "*** End Patch\n"
+                    )
+                },
             }
             out = io.StringIO()
             with patch.dict(
@@ -1216,11 +1250,11 @@ class ClaudeHookCliTests(unittest.TestCase):
                             json.dumps(payload),
                         ]
                     )
-            self.assertEqual(code, 2)
-            body = json.loads(out.getvalue().strip())
-            self.assertEqual(body.get("decision"), "block")
-            self.assertIn("raw apply_patch tool is forbidden", body.get("reason", ""))
-            self.assertIn("guarded-apply-patch", body.get("reason", ""))
+            self.assertEqual(code, 0)
+            body_text = out.getvalue().strip()
+            if body_text:
+                body = json.loads(body_text)
+                self.assertEqual(body.get("decision"), "allow")
             log_path = (
                 repo_root
                 / "workspace"
@@ -1233,13 +1267,9 @@ class ClaudeHookCliTests(unittest.TestCase):
             self.assertEqual(entry.get("tool_name"), "apply_patch")
             self.assertEqual(
                 entry.get("payload_summary", {}).get("apply_patch_paths"),
-                [],
+                [target_path],
             )
-            self.assertEqual(entry.get("payload_summary", {}).get("patch_line_count"), 2)
-            self.assertEqual(
-                entry.get("audit_detail", {}).get("policy"),
-                "forbid_raw_apply_patch_in_workflow_mode",
-            )
+            self.assertEqual(entry.get("payload_summary", {}).get("patch_line_count"), 4)
 
     def test_codex_raw_apply_patch_audit_logs_target_paths(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1393,6 +1423,166 @@ class ClaudeHookCliTests(unittest.TestCase):
             if body_text:
                 body = json.loads(body_text)
                 self.assertEqual(body.get("decision"), "allow")
+
+    def test_claude_file_tool_allows_orchestration_agent_edit_failure_analysis_json(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            orch = "orch_file_guard_failure_analysis_001"
+            run_id = "orch_agent_failure_analysis_001"
+            target_path = f"workspace/orchestrations/{orch}/failure_analysis.json"
+            orch_root = repo_root / "workspace" / "orchestrations" / orch
+            (orch_root / "output_manifests").mkdir(parents=True, exist_ok=True)
+            (orch_root / "orchestration_meta.json").write_text(
+                json.dumps({"orchestration_agent_run_id": run_id}, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            (orch_root / "output_manifests" / f"{run_id}.json").write_text(
+                json.dumps(
+                    {
+                        "orchestration_id": orch,
+                        "agent_run_id": run_id,
+                        "allowed_output_paths": [target_path],
+                        "allowed_file_tool_paths": [target_path],
+                        "write_roots": [f"workspace/orchestrations/{orch}"],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            payload = {
+                "orchestration_id": orch,
+                "repo_root": str(repo_root),
+                "tool_name": "Edit",
+                "tool_input": {"file_path": target_path},
+            }
+            out = io.StringIO()
+            with patch.dict(os.environ, {"METDSL_WORKFLOW_MODE": "1"}, clear=False):
+                with redirect_stdout(out):
+                    code = cli.main(
+                        [
+                            "--backend",
+                            "claude",
+                            "--event",
+                            "PreToolUse",
+                            "--input-json",
+                            json.dumps(payload),
+                        ]
+                    )
+            self.assertEqual(code, 0)
+            body_text = out.getvalue().strip()
+            if body_text:
+                body = json.loads(body_text)
+                self.assertEqual(body.get("decision"), "allow")
+
+    def test_claude_raw_apply_patch_allows_when_failure_analysis_json_is_in_allowlist(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            orch = "orch_file_guard_failure_analysis_002"
+            run_id = "orch_agent_failure_analysis_002"
+            target_path = f"workspace/orchestrations/{orch}/failure_analysis.json"
+            orch_root = repo_root / "workspace" / "orchestrations" / orch
+            (orch_root / "output_manifests").mkdir(parents=True, exist_ok=True)
+            (orch_root / "orchestration_meta.json").write_text(
+                json.dumps({"orchestration_agent_run_id": run_id}, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            (orch_root / "output_manifests" / f"{run_id}.json").write_text(
+                json.dumps(
+                    {
+                        "orchestration_id": orch,
+                        "agent_run_id": run_id,
+                        "allowed_output_paths": [target_path],
+                        "allowed_file_tool_paths": [target_path],
+                        "write_roots": [f"workspace/orchestrations/{orch}"],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            payload = {
+                "orchestration_id": orch,
+                "repo_root": str(repo_root),
+                "tool_name": "apply_patch",
+                "tool_input": {
+                    "patch": (
+                        "*** Begin Patch\n"
+                        f"*** Add File: {target_path}\n"
+                        "+{}\n"
+                        "*** End Patch\n"
+                    )
+                },
+            }
+            out = io.StringIO()
+            with patch.dict(os.environ, {"METDSL_WORKFLOW_MODE": "1"}, clear=False):
+                with redirect_stdout(out):
+                    code = cli.main(
+                        [
+                            "--backend",
+                            "claude",
+                            "--event",
+                            "PreToolUse",
+                            "--input-json",
+                            json.dumps(payload),
+                        ]
+                    )
+            self.assertEqual(code, 0)
+            body_text = out.getvalue().strip()
+            if body_text:
+                body = json.loads(body_text)
+                self.assertEqual(body.get("decision"), "allow")
+
+    def test_claude_raw_apply_patch_blocks_when_target_not_in_allowed_file_tool_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            orch = "orch_file_guard_failure_analysis_003"
+            run_id = "orch_agent_failure_analysis_003"
+            target_path = f"workspace/orchestrations/{orch}/failure_analysis.json"
+            orch_root = repo_root / "workspace" / "orchestrations" / orch
+            (orch_root / "output_manifests").mkdir(parents=True, exist_ok=True)
+            (orch_root / "orchestration_meta.json").write_text(
+                json.dumps({"orchestration_agent_run_id": run_id}, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            (orch_root / "output_manifests" / f"{run_id}.json").write_text(
+                json.dumps(
+                    {
+                        "orchestration_id": orch,
+                        "agent_run_id": run_id,
+                        "allowed_output_paths": [target_path],
+                        "allowed_file_tool_paths": [],
+                        "write_roots": [f"workspace/orchestrations/{orch}"],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            payload = {
+                "orchestration_id": orch,
+                "repo_root": str(repo_root),
+                "tool_name": "apply_patch",
+                "tool_input": {
+                    "patch": (
+                        "*** Begin Patch\n"
+                        f"*** Add File: {target_path}\n"
+                        "+{}\n"
+                        "*** End Patch\n"
+                    )
+                },
+            }
+            out = io.StringIO()
+            with patch.dict(os.environ, {"METDSL_WORKFLOW_MODE": "1"}, clear=False):
+                with redirect_stdout(out):
+                    code = cli.main(
+                        [
+                            "--backend",
+                            "claude",
+                            "--event",
+                            "PreToolUse",
+                            "--input-json",
+                            json.dumps(payload),
+                        ]
+                    )
+            self.assertEqual(code, 2)
+            body = json.loads(out.getvalue().strip())
+            self.assertEqual(body.get("decision"), "block")
+            self.assertIn("allowed_file_tool_paths", body.get("reason", ""))
 
     def test_claude_file_tool_blocks_when_active_agent_run_id_file_empty(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

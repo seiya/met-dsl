@@ -5738,6 +5738,14 @@ class OrchestrationMetaAndJudgeHookTests(unittest.TestCase):
                 repo / "workspace" / "orchestrations" / orch / "read_manifests" / f"{first_run_id}.json"
             )
             self.assertTrue(read_manifest_path.is_file())
+            output_manifest_path = (
+                repo / "workspace" / "orchestrations" / orch / "output_manifests" / f"{first_run_id}.json"
+            )
+            self.assertTrue(output_manifest_path.is_file())
+            output_manifest = json.loads(output_manifest_path.read_text(encoding="utf-8"))
+            expected_failure_analysis = f"workspace/orchestrations/{orch}/failure_analysis.json"
+            self.assertIn(expected_failure_analysis, output_manifest.get("allowed_output_paths", []))
+            self.assertIn(expected_failure_analysis, output_manifest.get("allowed_file_tool_paths", []))
 
     def test_init_orchestration_does_not_duplicate_orchestration_running_entry_on_reinit(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
