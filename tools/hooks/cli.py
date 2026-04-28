@@ -722,14 +722,13 @@ def main(argv: list[str] | None = None) -> int:
                                 decoded.file_path,
                             )
                         elif orch_agent_run_id and tool_name in {"Write", "Edit"}:
-                            decision = HookDecision(
-                                action=HookDecisionAction.BLOCK,
-                                reason=(
-                                    "orchestration agent must not use Write/Edit tools directly. "
-                                    "Use guarded-apply-patch instead: "
-                                    "python3 tools/orchestration_runtime.py guarded-apply-patch ..."
-                                ),
-                                continue_processing=False,
+                            cli_guard = check_cli_managed_path(repo_root, decoded.file_path)
+                            decision = cli_guard if cli_guard is not None else validate_write_access(
+                                repo_root,
+                                orchestration_id,
+                                orch_agent_run_id,
+                                decoded.file_path,
+                                tool_name=tool_name,
                             )
                         else:
                             hint = _hint_for_file_tool(tool_name)
