@@ -43,6 +43,10 @@
 - `Tune verify`: `skills/workflow-tune-verify/SKILL.md`
 - `Promote`: `skills/workflow-promote/SKILL.md`
 
+## 補助 Skill
+- `Workflow audit (Codex)`: `skills/workflow-audit-codex/SKILL.md`
+- `Workflow audit (Claude Code)`: `skills/workflow-audit-claude/SKILL.md`
+
 ## 運用ルール
 1. 1 回の作業で複数 phase を扱う場合、phase ごとに対応 `SKILL` を切り替える。
 2. `verify` で失敗した場合、同一 phase の `generate` に戻し、再生成後に再検証する。
