@@ -78,5 +78,5 @@
 - `orchestration agent` と `step agent` / `substep agent` の階層実行契約は `docs/ORCHESTRATION.md` を canonical source とする。
 - phase と `SKILL` の対応、規則の記載先判定、phase 切替規則は `docs/AGENT_SKILLS.md` を canonical source とする。
 - workflow 固有の禁止事項、過去 artifact 参照禁止、独立 `agent` 実行証跡要件は、`AGENTS.md` へ再掲せず対応 canonical source を参照する。
-- workflow 起動は `python3 tools/run_workflow.py <spec_ref> <until_phase> [--llm <codex|cursor|claude>]` を canonical entrypoint とする。
-- workflow 実行時は、`tools/run_workflow.py` が設定する `METDSL_WORKFLOW_MODE=1` と `METDSL_ORCHESTRATION_ID=<orchestration_id>` を canonical source とする。
+- workflow 起動は、ユーザーが `python3 tools/run_workflow.py <spec_ref> <until_phase> [--llm <codex|cursor|claude>]` を実行する方式を canonical entrypoint とする。
+- workflow 実行時は、ユーザーが起動した `tools/run_workflow.py` が設定する `METDSL_WORKFLOW_MODE=1` と `METDSL_ORCHESTRATION_ID=<orchestration_id>` を canonical source とする。
