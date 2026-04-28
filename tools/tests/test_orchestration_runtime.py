@@ -7904,6 +7904,7 @@ class TestPhase3RunGate(unittest.TestCase):
             self.assertEqual(gate_doc.get("gate"), "check_artifact_syntax")
             self.assertEqual(gate_doc.get("status"), "pass")
             self.assertEqual(gate_doc.get("violations"), [])
+            self.assertNotIn("arg_validation_error", gate_doc)
 
             buf = io.StringIO()
             rc = None
@@ -7928,6 +7929,80 @@ class TestPhase3RunGate(unittest.TestCase):
             self.assertEqual(rc, 0)
             cli_out = json.loads(buf.getvalue())
             self.assertEqual(set(cli_out.keys()), {"violations", "gate_result_ref"})
+
+    def test_run_gate_check_artifact_syntax_rejects_legacy_path_key(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            token = self._setup_run_gate_fixture(repo_root)
+            out = run_gate(
+                repo_root,
+                orchestration_id="rg1",
+                gate_name="check_artifact_syntax",
+                agent_run_id="build_child_rg1",
+                args_json={"path": "workspace/probe.json", "expect_top": "object"},
+                capability_token=token,
+            )
+            self.assertEqual(len(out.get("violations", [])), 1)
+            self.assertIn("args-json validation failed", out["violations"][0])
+            self.assertIn("single 'path' is unsupported", out["violations"][0])
+            gate_doc = json.loads(
+                (
+                    repo_root
+                    / "workspace/orchestrations/rg1/gates/build_child_rg1/check_artifact_syntax.json"
+                ).read_text(encoding="utf-8")
+            )
+            self.assertEqual(gate_doc.get("status"), "fail")
+            self.assertEqual(gate_doc.get("exit_code"), 2)
+            self.assertIn("single 'path' is unsupported", gate_doc.get("arg_validation_error", ""))
+            self.assertEqual(gate_doc.get("violations"), out.get("violations"))
+
+    def test_run_gate_check_artifact_syntax_rejects_empty_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            token = self._setup_run_gate_fixture(repo_root)
+            out = run_gate(
+                repo_root,
+                orchestration_id="rg1",
+                gate_name="check_artifact_syntax",
+                agent_run_id="build_child_rg1",
+                args_json={"paths": [], "expect_top": "object"},
+                capability_token=token,
+            )
+            self.assertEqual(len(out.get("violations", [])), 1)
+            self.assertIn("paths must be a non-empty list", out["violations"][0])
+            gate_doc = json.loads(
+                (
+                    repo_root
+                    / "workspace/orchestrations/rg1/gates/build_child_rg1/check_artifact_syntax.json"
+                ).read_text(encoding="utf-8")
+            )
+            self.assertEqual(gate_doc.get("status"), "fail")
+            self.assertEqual(gate_doc.get("exit_code"), 2)
+            self.assertIn("paths must be a non-empty list", gate_doc.get("arg_validation_error", ""))
+
+    def test_run_gate_check_artifact_syntax_rejects_non_string_path_member(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            token = self._setup_run_gate_fixture(repo_root)
+            out = run_gate(
+                repo_root,
+                orchestration_id="rg1",
+                gate_name="check_artifact_syntax",
+                agent_run_id="build_child_rg1",
+                args_json={"paths": ["workspace/probe.json", 1], "expect_top": "object"},
+                capability_token=token,
+            )
+            self.assertEqual(len(out.get("violations", [])), 1)
+            self.assertIn("paths[1] must be non-empty string", out["violations"][0])
+            gate_doc = json.loads(
+                (
+                    repo_root
+                    / "workspace/orchestrations/rg1/gates/build_child_rg1/check_artifact_syntax.json"
+                ).read_text(encoding="utf-8")
+            )
+            self.assertEqual(gate_doc.get("status"), "fail")
+            self.assertEqual(gate_doc.get("exit_code"), 2)
+            self.assertIn("paths[1] must be non-empty string", gate_doc.get("arg_validation_error", ""))
 
     def test_run_gate_orchestration_read_uses_inline_gate(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -1478,6 +1478,36 @@ def _gate_script_command(
     return cmd
 
 
+_CHECK_ARTIFACT_SYNTAX_EXPECT_TOP_ALLOWED = frozenset({"object", "array"})
+
+
+def _validate_check_artifact_syntax_args(args_json: dict[str, Any]) -> None:
+    paths_value = args_json.get("paths")
+    if "path" in args_json:
+        raise ValueError(
+            "check_artifact_syntax args-json requires 'paths' (list[str]); "
+            "single 'path' is unsupported"
+        )
+    if not isinstance(paths_value, list):
+        raise ValueError("check_artifact_syntax args-json requires key 'paths' as list[str]")
+    if not paths_value:
+        raise ValueError("check_artifact_syntax args-json paths must be a non-empty list")
+    for idx, item in enumerate(paths_value):
+        if not isinstance(item, str) or not item.strip():
+            raise ValueError(
+                f"check_artifact_syntax args-json paths[{idx}] must be non-empty string"
+            )
+
+    expect_top = args_json.get("expect_top")
+    if expect_top is None:
+        return
+    if not isinstance(expect_top, str) or expect_top.strip() not in _CHECK_ARTIFACT_SYNTAX_EXPECT_TOP_ALLOWED:
+        raise ValueError(
+            "check_artifact_syntax args-json expect_top must be one of "
+            f"{sorted(_CHECK_ARTIFACT_SYNTAX_EXPECT_TOP_ALLOWED)!r}"
+        )
+
+
 def _extract_gate_violations(stdout: str, stderr: str, returncode: int) -> list[str]:
     lines: list[str] = []
     for source in (stdout, stderr):
@@ -1665,8 +1695,20 @@ def run_gate(
             agent_run_id,
             args_json,
         )
+
+    arg_validation_error: str | None = None
+    if gate == "check_artifact_syntax":
+        try:
+            _validate_check_artifact_syntax_args(args_json)
+        except ValueError as exc:
+            arg_validation_error = str(exc)
+
     inline_result: dict[str, Any] | None = None
-    if gate == "orchestration_read":
+    if arg_validation_error is not None:
+        violations = [f"args-json validation failed: {arg_validation_error}"]
+        status = "fail"
+        exit_code = 2
+    elif gate == "orchestration_read":
         inline_result = _inline_gate_result(
             repo_root,
             orchestration_id=orchestration_id,
@@ -1704,6 +1746,8 @@ def run_gate(
     }
     if inline_result is not None:
         gate_doc["result"] = inline_result
+    if arg_validation_error is not None:
+        gate_doc["arg_validation_error"] = arg_validation_error
     out_path = _gates_dir(repo_root, orchestration_id) / agent_run_id.strip() / f"{gate}.json"
     _write_json(out_path, gate_doc)
     gate_ref = (
