@@ -599,6 +599,8 @@ def main(argv: list[str] | None = None) -> int:
         spec_ref,
         "--status",
         args.status,
+        "--agent-backend",
+        args.llm,
     ]
     if isinstance(dependency_ref, str) and dependency_ref.strip():
         init_args.extend(["--dependency-ref", dependency_ref])

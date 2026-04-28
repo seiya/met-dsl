@@ -5582,6 +5582,7 @@ def init_orchestration(
     spec_ref: str | None = None,
     dependency_ref: str | None = None,
     status: str = "running",
+    agent_backend: str = "codex",
 ) -> dict[str, Any]:
     root = _orchestration_root(repo_root, orchestration_id)
     root.mkdir(parents=True, exist_ok=True)
@@ -5617,6 +5618,11 @@ def init_orchestration(
                 orchestration_agent_run_id = existing_run_id.strip()
     if not orchestration_agent_run_id:
         orchestration_agent_run_id = str(uuid.uuid4())
+    backend_token = str(agent_backend).strip().lower()
+    if backend_token not in SUPPORTED_BACKENDS:
+        raise ValueError(
+            f"agent_backend must be one of {sorted(SUPPORTED_BACKENDS)}; got {agent_backend!r}"
+        )
     meta["orchestration_agent_run_id"] = orchestration_agent_run_id
     _write_json(meta_path, meta)
     _write_read_access_manifest(
@@ -5672,7 +5678,7 @@ def init_orchestration(
                     {
                         "agent_run_id": orchestration_agent_run_id,
                         "agent_role": "orchestration",
-                        "agent_backend": "claude",
+                        "agent_backend": backend_token,
                         "status": "running",
                         "started_at": _utc_now_iso(),
                     },
@@ -6653,6 +6659,7 @@ def main(argv: list[str] | None = None) -> int:
     init_parser.add_argument("--spec-ref")
     init_parser.add_argument("--dependency-ref")
     init_parser.add_argument("--status", default="running")
+    init_parser.add_argument("--agent-backend", default="codex", choices=sorted(SUPPORTED_BACKENDS))
     init_parser.add_argument(
         "--resume-from-checkpoint",
         action="store_true",
@@ -6942,6 +6949,7 @@ def main(argv: list[str] | None = None) -> int:
                 spec_ref=args.spec_ref,
                 dependency_ref=args.dependency_ref,
                 status=args.status,
+                agent_backend=args.agent_backend,
             )
     elif args.command == "preflight":
         agent_command = args.agent_command
