@@ -6,6 +6,8 @@ from __future__ import annotations
 import subprocess
 from typing import Callable
 
+DEFAULT_FEATURE_PROBE_TIMEOUT_SECONDS = 10.0
+
 
 def parse_feature_list(raw: str) -> dict[str, bool]:
     features: dict[str, bool] = {}
@@ -26,7 +28,7 @@ def codex_hooks_feature_enabled(
     *,
     command: str = "codex",
     runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
-    timeout_seconds: float = 2.0,
+    timeout_seconds: float = DEFAULT_FEATURE_PROBE_TIMEOUT_SECONDS,
 ) -> tuple[bool, str]:
     try:
         proc = runner(

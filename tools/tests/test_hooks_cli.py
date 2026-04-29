@@ -14,6 +14,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from tools.hooks import cli
+from tools.hooks.codex_feature import DEFAULT_FEATURE_PROBE_TIMEOUT_SECONDS
 
 
 class HookCliTests(unittest.TestCase):
@@ -34,6 +35,10 @@ class HookCliTests(unittest.TestCase):
         body = json.loads(json_lines[-1])
         assert isinstance(body, dict)
         assert body.get("decision") == "allow"
+
+    @staticmethod
+    def _timeout_detail() -> str:
+        return f"codex features list timed out after {DEFAULT_FEATURE_PROBE_TIMEOUT_SECONDS:.1f}s"
 
     def test_subprocess_command_works_with_module_entrypoint(self) -> None:
         repo_root = Path(__file__).resolve().parents[2]
@@ -570,7 +575,7 @@ class HookCliTests(unittest.TestCase):
             with patch.dict(os.environ, {"METDSL_HOOK_FEATURE_RETRY_TTL_SECONDS": "0"}):
                 with patch("tools.hooks.cli.codex_hooks_feature_enabled") as feature_mock:
                     feature_mock.side_effect = [
-                        (False, "codex features list timed out after 2.0s"),
+                        (False, self._timeout_detail()),
                         (True, "codex_hooks=true"),
                     ]
                     out1 = io.StringIO()
@@ -612,7 +617,7 @@ class HookCliTests(unittest.TestCase):
             }
             with patch.dict(os.environ, {"METDSL_HOOK_FEATURE_RETRY_TTL_SECONDS": "abc"}):
                 with patch("tools.hooks.cli.codex_hooks_feature_enabled") as feature_mock:
-                    feature_mock.return_value = (False, "codex features list timed out after 2.0s")
+                    feature_mock.return_value = (False, self._timeout_detail())
                     out = io.StringIO()
                     with redirect_stdout(out):
                         code = cli.main(
