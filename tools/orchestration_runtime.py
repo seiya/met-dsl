@@ -2587,6 +2587,9 @@ def _should_ignore_runtime_snapshot_path(
     token = _normalize_rel_posix(rel_posix)
     if not token or token.startswith(".git/"):
         return True
+    # Ignore Claude local/runtime settings mutated by system-level hooks.
+    if token.startswith(".claude/"):
+        return True
     orch_root = _normalize_rel_posix(f"workspace/orchestrations/{orchestration_id}")
     runtime_prefixes = (
         f"{orch_root}/access_logs/",
