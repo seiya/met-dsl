@@ -4141,6 +4141,52 @@ shell_tool                       stable             true
                     },
                 )
 
+    def test_write_step_result_rejects_generate_meta_attempt_count_type(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._setup_preflight_and_orch_agent(repo_root)
+            orch_root = repo_root / "workspace" / "orchestrations" / "orch_001"
+            runs_path = orch_root / "agent_runs.jsonl"
+            meta_ref = "workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/generate/gen_20260413_001/generate_meta.json"
+            meta_path = repo_root / meta_ref
+            meta_path.parent.mkdir(parents=True, exist_ok=True)
+            meta_payload = self._valid_generate_meta()
+            meta_payload["attempt_count"] = "1"
+            meta_payload["verification_status"] = "fail"
+            del meta_payload["lint_command_ref"]
+            meta_path.write_text(json.dumps(meta_payload), encoding="utf-8")
+            with runs_path.open("a", encoding="utf-8") as fh:
+                fh.write(
+                    json.dumps(
+                        {
+                            "agent_run_id": "substep_run_gen_verify_001",
+                            "agent_role": "substep",
+                            "node_key": "problem/shallow_water2d@0.3.0",
+                            "step": "generate",
+                            "substep": "verify",
+                            "status": "pass",
+                            "agent_backend": "claude",
+                            "output_refs": [meta_ref],
+                        }
+                    )
+                    + "\n"
+                )
+            with self.assertRaisesRegex(ValueError, "attempt_count must be integer"):
+                write_step_result(
+                    repo_root=repo_root,
+                    orchestration_id="orch_001",
+                    node_key="problem/shallow_water2d@0.3.0",
+                    step="generate",
+                    agent_run_id="orch_run_001",
+                    payload={
+                        "status": "pass",
+                        "validation_stage": "post_generate",
+                        "required_outputs": [meta_ref],
+                        "failed_substeps": [],
+                        "substep_agent_run_ids": ["substep_run_gen_verify_001"],
+                    },
+                )
+
     def test_write_step_result_requires_generate_meta_lint_command_ref(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
@@ -4184,6 +4230,50 @@ shell_tool                       stable             true
                         "substep_agent_run_ids": ["substep_run_gen_verify_001"],
                     },
                 )
+
+    def test_write_step_result_allows_generate_meta_without_lint_when_fail(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._setup_preflight_and_orch_agent(repo_root)
+            orch_root = repo_root / "workspace" / "orchestrations" / "orch_001"
+            runs_path = orch_root / "agent_runs.jsonl"
+            meta_ref = "workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/generate/gen_20260413_001/generate_meta.json"
+            meta_path = repo_root / meta_ref
+            meta_path.parent.mkdir(parents=True, exist_ok=True)
+            meta_payload = self._valid_generate_meta()
+            meta_payload["verification_status"] = "fail"
+            del meta_payload["lint_command_ref"]
+            meta_path.write_text(json.dumps(meta_payload), encoding="utf-8")
+            with runs_path.open("a", encoding="utf-8") as fh:
+                fh.write(
+                    json.dumps(
+                        {
+                            "agent_run_id": "substep_run_gen_verify_001",
+                            "agent_role": "substep",
+                            "node_key": "problem/shallow_water2d@0.3.0",
+                            "step": "generate",
+                            "substep": "verify",
+                            "status": "pass",
+                            "agent_backend": "claude",
+                            "output_refs": [meta_ref],
+                        }
+                    )
+                    + "\n"
+                )
+            write_step_result(
+                repo_root=repo_root,
+                orchestration_id="orch_001",
+                node_key="problem/shallow_water2d@0.3.0",
+                step="generate",
+                agent_run_id="orch_run_001",
+                payload={
+                    "status": "pass",
+                    "validation_stage": "post_generate",
+                    "required_outputs": [meta_ref],
+                    "failed_substeps": [],
+                    "substep_agent_run_ids": ["substep_run_gen_verify_001"],
+                },
+            )
 
     def test_write_step_result_requires_final_meta_in_required_outputs(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -4256,6 +4346,49 @@ shell_tool                       stable             true
             with runs_path.open("a", encoding="utf-8") as fh:
                 fh.write(json.dumps(substep_record) + "\n")
             with self.assertRaisesRegex(ValueError, "missing required keys"):
+                write_step_result(
+                    repo_root=repo_root,
+                    orchestration_id="orch_001",
+                    node_key="problem/shallow_water2d@0.3.0",
+                    step="plan",
+                    agent_run_id="orch_run_001",
+                    payload={
+                        "status": "pass",
+                        "required_outputs": [meta_ref],
+                        "failed_substeps": [],
+                        "substep_agent_run_ids": ["substep_run_plan_generate_001"],
+                    },
+                )
+
+    def test_write_step_result_rejects_plan_meta_last_fail_reason_type(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._setup_preflight_and_orch_agent(repo_root)
+            orch_root = repo_root / "workspace" / "orchestrations" / "orch_001"
+            runs_path = orch_root / "agent_runs.jsonl"
+            meta_ref = "workspace/plans/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/plan_meta.json"
+            meta_path = repo_root / meta_ref
+            meta_path.parent.mkdir(parents=True, exist_ok=True)
+            meta_payload = self._valid_plan_meta()
+            meta_payload["last_fail_reason"] = 1
+            meta_path.write_text(json.dumps(meta_payload), encoding="utf-8")
+            with runs_path.open("a", encoding="utf-8") as fh:
+                fh.write(
+                    json.dumps(
+                        {
+                            "agent_run_id": "substep_run_plan_generate_001",
+                            "agent_role": "substep",
+                            "node_key": "problem/shallow_water2d@0.3.0",
+                            "step": "plan",
+                            "substep": "generate",
+                            "status": "pass",
+                            "agent_backend": "claude",
+                            "output_refs": [meta_ref],
+                        }
+                    )
+                    + "\n"
+                )
+            with self.assertRaisesRegex(ValueError, "last_fail_reason must be string or null"):
                 write_step_result(
                     repo_root=repo_root,
                     orchestration_id="orch_001",

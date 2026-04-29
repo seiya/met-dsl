@@ -13,6 +13,23 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+try:
+    from tools.meta_contracts import (
+        STAGE_META_FILENAME_BY_STEP,
+        required_meta_keys_for_step,
+    )
+except ModuleNotFoundError:  # pragma: no cover - import bootstrap for direct CLI execution
+    _THIS_FILE = Path(__file__).resolve()
+    _REPO_ROOT = _THIS_FILE.parent.parent
+    import sys
+
+    if str(_REPO_ROOT) not in sys.path:
+        sys.path.insert(0, str(_REPO_ROOT))
+    from tools.meta_contracts import (
+        STAGE_META_FILENAME_BY_STEP,
+        required_meta_keys_for_step,
+    )
+
 PLACEHOLDER_TEXT_PATTERNS = (
     '"sample":"state_recorded"',
     '"dummy"',
@@ -93,16 +110,6 @@ PAREN_SHAPE_EXPR_PATTERN = re.compile(r"^\(\s*([^\)]+?)\s*\)$")
 REQUIRED_WORKFLOW_STEPS = ("plan", "generate", "build", "execute", "judge")
 SUBSTEP_WORKFLOW_STEPS = frozenset({"plan", "generate", "tune"})
 AGENT_TERMINAL_STATUSES = {"pass", "fail", "blocked", "timeout", "cancel"}
-
-# RUNBOOK + GLOSSARY: LLM stage meta for generate.
-# lint_command_ref is required only when verification_status=pass; see _validate_generate_lint_command_logs.
-_GENERATE_META_REQUIRED_KEYS = (
-    "attempt_count",
-    "verification_status",
-    "last_fail_reason",
-    "debug_mode",
-    "context_isolated",
-)
 
 # Generate-stage static lint (MCP run_linter); see docs/workflow/WORKFLOW_CORE.md and docs/workflow/phases/phase_02_generate.md
 _LINT_PRESET_FOR_LANGUAGE: dict[str, str] = {
@@ -1086,10 +1093,10 @@ def _validate_generate_meta_json_files(
         if not isinstance(data, dict):
             violations.append(f"{meta_path}: must be json object")
             continue
-        for key in _GENERATE_META_REQUIRED_KEYS:
+        for key in required_meta_keys_for_step("generate"):
             if key not in data:
                 violations.append(f"{meta_path}: missing required key {key!r}")
-        for key in _GENERATE_META_REQUIRED_KEYS:
+        for key in required_meta_keys_for_step("generate"):
             if key not in data:
                 continue
             val = data.get(key)
@@ -1103,8 +1110,49 @@ def _validate_generate_meta_json_files(
                 violations.append(f"{meta_path}:debug_mode must be boolean")
             elif key == "context_isolated" and not isinstance(val, bool):
                 violations.append(f"{meta_path}:context_isolated must be boolean")
-        if "lint_command_ref" in data:
+        status_token = str(data.get("verification_status", "")).strip().lower()
+        if status_token == "pass":
             _validate_generate_meta_lint_shape(meta_path, data, violations)
+
+
+def _validate_plan_meta_json(plan_dir: Path, violations: list[str]) -> None:
+    meta_path = plan_dir / STAGE_META_FILENAME_BY_STEP["plan"]
+    if not meta_path.exists():
+        violations.append(f"{meta_path}: missing")
+        return
+    try:
+        data = _read_json(meta_path)
+    except json.JSONDecodeError:
+        violations.append(f"{meta_path}: invalid json")
+        return
+    if not isinstance(data, dict):
+        violations.append(f"{meta_path}: must be json object")
+        return
+    required_keys = required_meta_keys_for_step("plan")
+    for key in required_keys:
+        if key not in data:
+            violations.append(f"{meta_path}: missing required key {key!r}")
+    if "attempt_count" in data and not isinstance(data.get("attempt_count"), int):
+        violations.append(f"{meta_path}:attempt_count must be integer")
+    if "verification_status" in data and (
+        not isinstance(data.get("verification_status"), str)
+        or not str(data.get("verification_status")).strip()
+    ):
+        violations.append(f"{meta_path}:verification_status must be non-empty string")
+    if "last_fail_reason" in data and data.get("last_fail_reason") is not None and not isinstance(
+        data.get("last_fail_reason"), str
+    ):
+        violations.append(f"{meta_path}:last_fail_reason must be string or null")
+    if "debug_mode" in data and not isinstance(data.get("debug_mode"), bool):
+        violations.append(f"{meta_path}:debug_mode must be boolean")
+    if "context_isolated" in data and not isinstance(data.get("context_isolated"), bool):
+        violations.append(f"{meta_path}:context_isolated must be boolean")
+    if data.get("context_isolated") is False:
+        reason = data.get("constraint_reason")
+        if not isinstance(reason, str) or not reason.strip():
+            violations.append(
+                f"{meta_path}: requires non-empty constraint_reason when context_isolated=false"
+            )
 
 
 def _iter_command_ref_entries(node: Any) -> list[dict[str, Any]]:
@@ -2062,6 +2110,19 @@ def _validate_generate_meta_lint_shape(
     if not isinstance(run_entries, list):
         violations.append(f"{meta_path}: lint_command_ref.run_linter must be array")
         return
+    if not run_entries:
+        violations.append(f"{meta_path}: lint_command_ref.run_linter must be non-empty")
+        return
+    for idx, item in enumerate(run_entries):
+        if not isinstance(item, dict):
+            violations.append(f"{meta_path}: lint_command_ref.run_linter[{idx}] must be object")
+            continue
+        for key in ("command_id", "command_log_ref", "preset"):
+            value = item.get(key)
+            if not isinstance(value, str) or not value.strip():
+                violations.append(
+                    f"{meta_path}: lint_command_ref.run_linter[{idx}].{key} must be non-empty string"
+                )
 
 
 def _validate_generate_lint_command_logs(
@@ -4627,6 +4688,7 @@ def validate_plan_stage(
 
     for optional in ("case.resolved.yaml", "impl.resolved.yaml", "dependency.resolved.yaml"):
         _try_load_optional_plan_yaml(plan_dir, optional, violations)
+    _validate_plan_meta_json(plan_dir, violations)
 
     return violations
 

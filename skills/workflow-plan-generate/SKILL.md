@@ -46,9 +46,10 @@ Plan ステージの生成責務を固定し、入力 spec から決定的な re
 3. workflow artifact の保存先ルートは `workspace/` のみを許可し、workflow ルート判定は `workspace/` のみを対象とする。
 4. workflow 実行開始前に `workspace/` が存在しない場合、リポジトリルート直下へ `workspace/` を作成する。
 5. 開始前と完了前に `python3 tools/validate_workspace_root.py` を実行してよい。`run-gate --gate validate_workspace_root` が利用可能な実行環境では `run-gate` を優先し、`fail` 時は `Plan fail` とする。
-6. `plan_meta.json` に `attempt_count` と `verification_status` と `last_fail_reason` と `debug_mode` を記録する。
-7. `debug_mode=false` では失敗試行 artifact を保存しない。
-8. 完了前に `python3 tools/check_artifact_syntax.py --expect-top object` を対象 resolved artifact へ実行してよい。`run-gate` 経由の同等検査が利用可能な実行環境では `run-gate` を優先し、`fail` 時は `Plan fail` とする。
+6. `plan_meta.json` に `attempt_count` と `verification_status` と `last_fail_reason` と `debug_mode` と `context_isolated` を記録する。
+7. `context_isolated=false` の場合、`plan_meta.json.constraint_reason` を必須記録する。
+8. `debug_mode=false` では失敗試行 artifact を保存しない。
+9. 完了前に `python3 tools/check_artifact_syntax.py --expect-top object` を対象 resolved artifact へ実行してよい。`run-gate` 経由の同等検査が利用可能な実行環境では `run-gate` を優先し、`fail` 時は `Plan fail` とする。
 
 ## 判定基準
 - 同一入力で再生成したとき、`case.resolved.yaml` と `algorithm.resolved.yaml` と `impl.resolved.yaml` と `dependency.resolved.yaml` が一致する。

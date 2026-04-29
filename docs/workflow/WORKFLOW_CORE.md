@@ -81,6 +81,10 @@ terms は `GLOSSARY.md` を参照する。
 ### `LLM` 利用 phase
 - `LLM` を利用する全 phase に `SPEC.md` の「`LLM` の扱い（全体原則）」を適用する。
 - `LLM` 利用 phase は各 phase の `<stage>_meta.json`（コード生成は `generate_meta.json`）を必須出力とする。
+- `<stage>_meta.json` の共通必須 key は `attempt_count`、`verification_status`、`last_fail_reason`、`debug_mode`、`context_isolated` とする。
+- `context_isolated=false` の場合、`constraint_reason` を必須とする。
+- `plan_meta.json` は上記共通 key のみを必須とする。
+- `generate_meta.json` は上記共通 key を必須とし、`verification_status=pass` の場合のみ `lint_command_ref.run_linter[]`（`command_id`、`command_log_ref`、`preset`）を必須とする。
 - `debug_mode=false` では失敗試行 artifact を保存しない。`debug_mode=true` で保存した場合は保存件数と保存先をメタデータへ記録する。
 - workflow 起動時の execution mode は `tools/run_workflow.py` の `--mode` で指定し、既定値は `dev` とする。`prod` は現行互換の最小ログ運用とし、`dev` は失敗時の原因調査に必要な証跡保存を優先する。
 - `dev` mode の `verify substep` は、`issue_severity=minor` のみを軽微問題として継続可能とし、`major` / `critical` は `fail` としなければならない。

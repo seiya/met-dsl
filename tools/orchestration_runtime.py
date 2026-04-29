@@ -26,6 +26,10 @@ try:
         _utc_now_iso,
         validate_pipeline_semantics_stage,
     )
+    from tools.meta_contracts import (
+        STAGE_META_FILENAME_BY_STEP,
+        missing_required_meta_keys,
+    )
 except ModuleNotFoundError:  # pragma: no cover - import bootstrap for direct CLI execution
     _THIS_FILE = Path(__file__).resolve()
     _REPO_ROOT = _THIS_FILE.parent.parent
@@ -35,6 +39,10 @@ except ModuleNotFoundError:  # pragma: no cover - import bootstrap for direct CL
         _normalize_rel_posix,
         _utc_now_iso,
         validate_pipeline_semantics_stage,
+    )
+    from tools.meta_contracts import (
+        STAGE_META_FILENAME_BY_STEP,
+        missing_required_meta_keys,
     )
 
 TERMINAL_STATUSES = {"pass", "fail", "blocked", "timeout", "cancel"}
@@ -4745,27 +4753,7 @@ def _validate_orchestration_completion_for_pass(
                 )
 
 
-_STEP_META_REQUIRED_KEYS: dict[str, tuple[str, ...]] = {
-    "generate": (
-        "attempt_count",
-        "verification_status",
-        "last_fail_reason",
-        "debug_mode",
-        "context_isolated",
-        "lint_command_ref",
-    ),
-    "plan": (
-        "attempt_count",
-        "verification_status",
-        "last_fail_reason",
-        "debug_mode",
-        "context_isolated",
-    ),
-}
-_STEP_META_FILENAME: dict[str, str] = {
-    "generate": "generate_meta.json",
-    "plan": "plan_meta.json",
-}
+_STEP_META_FILENAME = STAGE_META_FILENAME_BY_STEP
 
 STEP_REQUIRED_VALIDATION_STAGES: dict[str, frozenset[str]] = {
     "generate": frozenset({"post_generate", "post_build", "full"}),
@@ -4787,8 +4775,13 @@ def _validate_lint_command_ref(meta_data: dict[str, Any], *, meta_filename: str,
     lint_command_ref = meta_data.get("lint_command_ref")
     if meta_filename != "generate_meta.json":
         return
+    status = str(meta_data.get("verification_status", "")).strip().lower()
+    if status != "pass":
+        return
     if not isinstance(lint_command_ref, dict):
-        raise ValueError(f"{meta_filename} lint_command_ref must be object: {meta_ref}")
+        raise ValueError(
+            f"{meta_filename} missing lint_command_ref when verification_status=pass: {meta_ref}"
+        )
     run_linter = lint_command_ref.get("run_linter")
     if not isinstance(run_linter, list) or not run_linter:
         raise ValueError(f"{meta_filename} lint_command_ref.run_linter must be non-empty list: {meta_ref}")
@@ -4807,17 +4800,26 @@ def _validate_lint_command_ref(meta_data: dict[str, Any], *, meta_filename: str,
 
 def _validate_step_meta_payload(meta_data: dict[str, Any], *, step_token: str, meta_ref: str) -> None:
     meta_filename = _STEP_META_FILENAME[step_token]
-    required_meta_keys = _STEP_META_REQUIRED_KEYS[step_token]
-    missing_keys = [k for k in required_meta_keys if k not in meta_data]
+    missing_keys = missing_required_meta_keys(meta_data, step_token=step_token)
     if missing_keys:
         raise ValueError(
-            f"{meta_filename} missing required keys: {missing_keys} (ref={meta_ref})"
+            f"{meta_filename} missing required keys: {missing_keys} "
+            f"(phase={step_token} substep=verify ref={meta_ref})"
         )
-    if not isinstance(meta_data.get("context_isolated"), bool):
+    context_isolated = meta_data.get("context_isolated")
+    if not isinstance(context_isolated, bool):
         raise ValueError(f"{meta_filename} context_isolated must be boolean: {meta_ref}")
     if not isinstance(meta_data.get("debug_mode"), bool):
         raise ValueError(f"{meta_filename} debug_mode must be boolean: {meta_ref}")
-    if meta_data.get("context_isolated") is False:
+    if not isinstance(meta_data.get("attempt_count"), int):
+        raise ValueError(f"{meta_filename} attempt_count must be integer: {meta_ref}")
+    verification_status = meta_data.get("verification_status")
+    if not isinstance(verification_status, str) or not verification_status.strip():
+        raise ValueError(f"{meta_filename} verification_status must be non-empty string: {meta_ref}")
+    last_fail_reason = meta_data.get("last_fail_reason")
+    if last_fail_reason is not None and not isinstance(last_fail_reason, str):
+        raise ValueError(f"{meta_filename} last_fail_reason must be string or null: {meta_ref}")
+    if context_isolated is False:
         constraint_reason = meta_data.get("constraint_reason")
         if not isinstance(constraint_reason, str) or not constraint_reason.strip():
             raise ValueError(
@@ -5147,7 +5149,7 @@ def _validate_step_result_payload(
                 substep_outputs.add(output_ref.strip())
 
     # meta ファイル検証（plan/generate の pass 時のみ）
-    if step_token in _STEP_META_REQUIRED_KEYS:
+    if step_token in _STEP_META_FILENAME:
         meta_filename = _STEP_META_FILENAME[step_token]
         meta_refs = [ref for ref in declared_outputs if ref.endswith(meta_filename)]
         if not meta_refs:

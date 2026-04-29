@@ -17,6 +17,8 @@
 - `algorithm.resolved.yaml` は `algorithm_id` と `execution_mode` と `steps[]` と `ordering` と `control_condition` と `iteration_contract` と `update_semantics` と `temporaries` と `derived_field_rules` と `invariants` と `splitting_policy` を必須保持しなければならない。
 - `Plan` 完了前に `python3 tools/check_artifact_syntax.py --expect-top object` を用いて `case.resolved.yaml` と `algorithm.resolved.yaml` と `impl.resolved.yaml` と `dependency.resolved.yaml` と `derived_contract.json` と `plan_meta.json` の構文妥当性を検査し、`fail` 時は `Plan fail` としなければならない。
 - `Plan verify` 完了前に `python3 tools/validate_pipeline_semantics.py --stage plan --plan-ref workspace/plans/<node_key_safe>/<plan_id>/` を実行し、`exit code 0` を必須としなければならない。`fail` 時は `plan_meta.json` の `verification_status=pass` を付与してはならない。
+- `plan_meta.json` の必須 key は `attempt_count`、`verification_status`、`last_fail_reason`、`debug_mode`、`context_isolated` とする。
+- `context_isolated=false` の場合、`plan_meta.json.constraint_reason` を必須とする。
 - `plan_id` は `<slug>_<date>_<seq3>` 形式を必須とし、`slug` は `spec_id` 由来の短い可読 token、`date` は `YYYYMMDD`、`seq3` は同日内 3 桁連番とする。
 - `ordering` は `step_id` の列、または `before` / `after` を持つ dependency object の列として表現しなければならない。
 - `control_condition` は文字列、文字列配列、または object のいずれかで表現しなければならない。

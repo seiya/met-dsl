@@ -146,6 +146,16 @@ def _create_minimal_execution_tree(
         workspace / "plans" / "problem__shallow_water2d__0.3.0" / "shallow-water2d_20260415_001" / "dependency.resolved.yaml",
         dependency_resolved,
     )
+    _write_json(
+        workspace / "plans" / "problem__shallow_water2d__0.3.0" / "shallow-water2d_20260415_001" / "plan_meta.json",
+        {
+            "attempt_count": 1,
+            "verification_status": "pass",
+            "last_fail_reason": None,
+            "debug_mode": False,
+            "context_isolated": True,
+        },
+    )
     if algorithm_contract is None:
         algorithm_contract = {
             "algorithm_id": "shallow_water2d_test_algorithm",
@@ -3140,6 +3150,60 @@ end program shallow_water2d_runner
                 any("plan_ref must be under" in v for v in violations), violations
             )
 
+    def test_validate_plan_stage_rejects_missing_context_isolated(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            _create_minimal_execution_tree(
+                repo_root,
+                dep_spec_id="dynamics_shallow_water_flux_2d_rusanov_p0",
+                model_text="module m\nimplicit none\nend module m\n",
+                runner_text="program r\nimplicit none\nend program r\n",
+                run_command=["x", "y"],
+            )
+            meta_path = (
+                repo_root
+                / "workspace/plans/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/plan_meta.json"
+            )
+            data = json.loads(meta_path.read_text(encoding="utf-8"))
+            data.pop("context_isolated", None)
+            meta_path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+            violations = validate_plan_stage(
+                repo_root,
+                "workspace",
+                "workspace/plans/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001",
+            )
+            self.assertTrue(
+                any("plan_meta.json: missing required key 'context_isolated'" in v for v in violations),
+                violations,
+            )
+
+    def test_validate_plan_stage_requires_constraint_reason_when_not_isolated(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            _create_minimal_execution_tree(
+                repo_root,
+                dep_spec_id="dynamics_shallow_water_flux_2d_rusanov_p0",
+                model_text="module m\nimplicit none\nend module m\n",
+                runner_text="program r\nimplicit none\nend program r\n",
+                run_command=["x", "y"],
+            )
+            meta_path = (
+                repo_root
+                / "workspace/plans/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/plan_meta.json"
+            )
+            data = json.loads(meta_path.read_text(encoding="utf-8"))
+            data["context_isolated"] = False
+            meta_path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+            violations = validate_plan_stage(
+                repo_root,
+                "workspace",
+                "workspace/plans/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001",
+            )
+            self.assertTrue(
+                any("requires non-empty constraint_reason when context_isolated=false" in v for v in violations),
+                violations,
+            )
+
     def test_validate_post_generate_stage_passes(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
@@ -3300,6 +3364,71 @@ shallow_water2d_runner.o: shallow_water2d_runner.f90 shallow_water2d_model.mod
                     "last_fail_reason": "lint failed",
                     "debug_mode": False,
                     "context_isolated": True,
+                },
+            )
+            violations: list[str] = []
+            _validate_generate_meta_json_files(pipeline_dir, violations)
+            self.assertEqual(violations, [])
+
+    def test_validate_generate_meta_rejects_pass_without_lint_command_ref(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            pipeline_dir = Path(tmp) / "pipeline"
+            gen_dir = pipeline_dir / "generate" / "gen_pass_001"
+            gen_dir.mkdir(parents=True)
+            _write_json(
+                gen_dir / "generate_meta.json",
+                {
+                    "attempt_count": 1,
+                    "verification_status": "pass",
+                    "last_fail_reason": None,
+                    "debug_mode": False,
+                    "context_isolated": True,
+                },
+            )
+            violations: list[str] = []
+            _validate_generate_meta_json_files(pipeline_dir, violations)
+            self.assertTrue(
+                any("missing lint_command_ref" in v for v in violations),
+                violations,
+            )
+
+    def test_validate_generate_meta_rejects_empty_run_linter_when_pass(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            pipeline_dir = Path(tmp) / "pipeline"
+            gen_dir = pipeline_dir / "generate" / "gen_pass_002"
+            gen_dir.mkdir(parents=True)
+            _write_json(
+                gen_dir / "generate_meta.json",
+                {
+                    "attempt_count": 1,
+                    "verification_status": "pass",
+                    "last_fail_reason": None,
+                    "debug_mode": False,
+                    "context_isolated": True,
+                    "lint_command_ref": {"run_linter": []},
+                },
+            )
+            violations: list[str] = []
+            _validate_generate_meta_json_files(pipeline_dir, violations)
+            self.assertTrue(
+                any("lint_command_ref.run_linter must be non-empty" in v for v in violations),
+                violations,
+            )
+
+    def test_validate_generate_meta_ignores_lint_shape_when_not_pass(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            pipeline_dir = Path(tmp) / "pipeline"
+            gen_dir = pipeline_dir / "generate" / "gen_fail_002"
+            gen_dir.mkdir(parents=True)
+            _write_json(
+                gen_dir / "generate_meta.json",
+                {
+                    "attempt_count": 1,
+                    "verification_status": "fail",
+                    "last_fail_reason": "compile failed",
+                    "debug_mode": False,
+                    "context_isolated": True,
+                    "lint_command_ref": "invalid-shape",
                 },
             )
             violations: list[str] = []

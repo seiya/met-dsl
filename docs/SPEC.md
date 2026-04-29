@@ -40,6 +40,7 @@
 - ステージ内 `verify` は構造・契約・トレーサビリティ整合の確認を目的とし、物理妥当性の最終保証を代替しない。
 - `LLM` 利用ステージは `<stage>_meta.json`（コード生成は `generate_meta.json`）を必須出力とする。
 - メタデータの必須項目は `attempt_count`、`verification_status`、`last_fail_reason`、`context_isolated`、`debug_mode` とする。`context_isolated=false` の場合は `constraint_reason` を必須とする。
+- `generate_meta.json` の `lint_command_ref` は `verification_status=pass` の場合に必須とし、`verification_status!=pass` では任意とする。
 - `debug_mode` の既定値は `false` とする。`debug_mode=true` の場合のみ失敗試行 artifact の保存を許可し、`retained_failed_attempts` と保存先を記録する。
 
 ## アーキテクチャ方針
