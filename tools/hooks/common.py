@@ -176,6 +176,161 @@ def _extract_command(payload: dict[str, Any]) -> str | None:
     return None
 
 
+def _extract_read_targets(cmd_name: str, cmd_tokens: list[str]) -> list[str]:
+    args = cmd_tokens[1:]
+    cmd = cmd_name.lower()
+    if not args:
+        return []
+
+    if cmd in {"cat", "head", "tail", "less", "more", "bat", "pygmentize"}:
+        return [tok for tok in args if not tok.startswith("-")]
+
+    if cmd == "sed":
+        positional: list[str] = []
+        read_targets: list[str] = []
+        has_explicit_script_source = False
+        explicit_script_after_positional = False
+        idx = 0
+        while idx < len(args):
+            token = args[idx]
+            if token == "--":
+                positional.extend(args[idx + 1 :])
+                break
+            if token.startswith("--") and "=" in token:
+                key, value = token.split("=", 1)
+                if key == "--file" and value:
+                    if positional:
+                        explicit_script_after_positional = True
+                    read_targets.append(value)
+                    has_explicit_script_source = True
+                    idx += 1
+                    continue
+                if key == "--expression":
+                    if positional:
+                        explicit_script_after_positional = True
+                    has_explicit_script_source = True
+                    idx += 1
+                    continue
+            if token in {"-e", "-f"}:
+                if positional:
+                    explicit_script_after_positional = True
+                has_explicit_script_source = True
+                if token == "-f" and idx + 1 < len(args):
+                    read_targets.append(args[idx + 1])
+                idx += 2
+                continue
+            if token.startswith("-e") and token != "-e":
+                if positional:
+                    explicit_script_after_positional = True
+                has_explicit_script_source = True
+                idx += 1
+                continue
+            if token.startswith("-f") and token != "-f":
+                if positional:
+                    explicit_script_after_positional = True
+                has_explicit_script_source = True
+                read_targets.append(token[2:])
+                idx += 1
+                continue
+            if token.startswith("-"):
+                idx += 1
+                continue
+            positional.append(token)
+            idx += 1
+        if has_explicit_script_source:
+            if explicit_script_after_positional and positional:
+                return read_targets + positional[1:]
+            return read_targets + positional
+        if len(positional) <= 1:
+            return read_targets
+        return read_targets + positional[1:]
+
+    if cmd in {"rg", "grep"}:
+        positional: list[str] = []
+        idx = 0
+        has_explicit_pattern = False
+        read_targets: list[str] = []
+        while idx < len(args):
+            token = args[idx]
+            if token == "--":
+                positional.extend(args[idx + 1 :])
+                break
+            if token.startswith("--") and "=" in token:
+                key, value = token.split("=", 1)
+                if key in {"--file", "--regexp"}:
+                    has_explicit_pattern = True
+                    if key == "--file" and value:
+                        read_targets.append(value)
+                    idx += 1
+                    continue
+            if token in {"-e", "-f", "--regexp", "--file"}:
+                has_explicit_pattern = True
+                if token in {"-f", "--file"} and idx + 1 < len(args):
+                    read_targets.append(args[idx + 1])
+                idx += 2
+                continue
+            if token.startswith("-e") and token != "-e":
+                has_explicit_pattern = True
+                idx += 1
+                continue
+            if token.startswith("-f") and token != "-f":
+                has_explicit_pattern = True
+                read_targets.append(token[2:])
+                idx += 1
+                continue
+            if token.startswith("-"):
+                idx += 1
+                continue
+            positional.append(token)
+            idx += 1
+        if not positional:
+            return read_targets
+        if has_explicit_pattern:
+            return read_targets + positional
+        return read_targets + positional[1:]
+
+    if cmd == "awk":
+        positional: list[str] = []
+        idx = 0
+        read_targets: list[str] = []
+        has_program_file = False
+        while idx < len(args):
+            token = args[idx]
+            if token == "--":
+                positional.extend(args[idx + 1 :])
+                break
+            if token.startswith("--file="):
+                value = token.split("=", 1)[1]
+                if value:
+                    read_targets.append(value)
+                    has_program_file = True
+                idx += 1
+                continue
+            if token in {"-f", "--file"}:
+                if idx + 1 < len(args):
+                    read_targets.append(args[idx + 1])
+                has_program_file = True
+                idx += 2
+                continue
+            if token.startswith("-f") and token != "-f":
+                read_targets.append(token[2:])
+                has_program_file = True
+                idx += 1
+                continue
+            if token.startswith("-"):
+                idx += 1
+                continue
+            positional.append(token)
+            idx += 1
+        if not positional:
+            return read_targets
+        if has_program_file:
+            return read_targets + positional
+        return read_targets + positional[1:]
+
+    return []
+
+
 def evaluate_common_policy(hook_input: HookInput) -> HookDecision:
     """Apply backend-agnostic policy checks."""
     if hook_input.event_name not in {
@@ -224,7 +379,9 @@ def evaluate_common_policy(hook_input: HookInput) -> HookDecision:
             )
     workflow_mode_val = os.environ.get("METDSL_WORKFLOW_MODE", "0").strip()
     if workflow_mode_val == "1":
-        bash_read_cmds = frozenset({"cat", "head", "tail", "less", "more", "bat", "pygmentize"})
+        bash_read_cmds = frozenset(
+            {"cat", "head", "tail", "less", "more", "bat", "pygmentize", "sed", "rg", "grep", "awk"}
+        )
         try:
             cmd_tokens = shlex.split(command)
         except ValueError:
@@ -239,7 +396,7 @@ def evaluate_common_policy(hook_input: HookInput) -> HookDecision:
                 else Path.cwd()
             )
             repo_tools_root = (repo_root / "tools").resolve()
-            read_targets = [tok for tok in cmd_tokens[1:] if not tok.startswith("-")]
+            read_targets = _extract_read_targets(first_cmd, cmd_tokens)
             if any(
                 _is_path_under_root(_resolve_target_path(repo_root, target), repo_tools_root)
                 for target in read_targets

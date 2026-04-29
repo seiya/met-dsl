@@ -16,12 +16,20 @@ from tools.hooks.common import (
     HookDecisionAction,
     HookEventName,
     HookInput,
+    _extract_read_targets,
     evaluate_common_policy,
     validate_pipeline_semantics_stage,
 )
 
 
 class HookCommonTests(unittest.TestCase):
+    def test_extract_read_targets_sed_mixed_implicit_and_explicit_script_excludes_implicit_script(self) -> None:
+        targets = _extract_read_targets(
+            "sed",
+            ["sed", "s/a/b/", "-e", "s/c/d/", "docs/WORKFLOW.md"],
+        )
+        self.assertEqual(targets, ["docs/WORKFLOW.md"])
+
     def test_validate_pipeline_semantics_stage_accepts_allowed_stage(self) -> None:
         out = validate_pipeline_semantics_stage(
             step_key="execute",
@@ -101,6 +109,198 @@ class HookCommonTests(unittest.TestCase):
                         command="cat /usr/local/tools/config.yaml",
                     )
                 )
+        self.assertEqual(decision.action, HookDecisionAction.ALLOW)
+
+    def test_evaluate_common_policy_blocks_direct_tools_read_via_sed_in_workflow_mode(self) -> None:
+        with patch.dict(os.environ, {"METDSL_WORKFLOW_MODE": "1"}, clear=False):
+            decision = evaluate_common_policy(
+                HookInput(
+                    event_name=HookEventName.PRE_COMMAND_EXECUTE,
+                    backend="claude",
+                    payload={"command": "sed -n '1,40p' tools/orchestration_runtime.py"},
+                    command="sed -n '1,40p' tools/orchestration_runtime.py",
+                )
+            )
+        self.assertEqual(decision.action, HookDecisionAction.BLOCK)
+        self.assertEqual((decision.audit_detail or {}).get("policy"), "forbid_tools_direct_read")
+
+    def test_evaluate_common_policy_blocks_direct_tools_read_via_rg_in_workflow_mode(self) -> None:
+        with patch.dict(os.environ, {"METDSL_WORKFLOW_MODE": "1"}, clear=False):
+            decision = evaluate_common_policy(
+                HookInput(
+                    event_name=HookEventName.PRE_COMMAND_EXECUTE,
+                    backend="claude",
+                    payload={"command": 'rg -n "pattern" tools/run_workflow.py'},
+                    command='rg -n "pattern" tools/run_workflow.py',
+                )
+            )
+        self.assertEqual(decision.action, HookDecisionAction.BLOCK)
+        self.assertEqual((decision.audit_detail or {}).get("policy"), "forbid_tools_direct_read")
+
+    def test_evaluate_common_policy_blocks_direct_tools_read_via_grep_in_workflow_mode(self) -> None:
+        with patch.dict(os.environ, {"METDSL_WORKFLOW_MODE": "1"}, clear=False):
+            decision = evaluate_common_policy(
+                HookInput(
+                    event_name=HookEventName.PRE_COMMAND_EXECUTE,
+                    backend="claude",
+                    payload={"command": 'grep -n "x" tools/hooks/cli.py'},
+                    command='grep -n "x" tools/hooks/cli.py',
+                )
+            )
+        self.assertEqual(decision.action, HookDecisionAction.BLOCK)
+        self.assertEqual((decision.audit_detail or {}).get("policy"), "forbid_tools_direct_read")
+
+    def test_evaluate_common_policy_blocks_direct_tools_read_via_awk_in_workflow_mode(self) -> None:
+        with patch.dict(os.environ, {"METDSL_WORKFLOW_MODE": "1"}, clear=False):
+            decision = evaluate_common_policy(
+                HookInput(
+                    event_name=HookEventName.PRE_COMMAND_EXECUTE,
+                    backend="claude",
+                    payload={"command": "awk '{print $1}' tools/file.txt"},
+                    command="awk '{print $1}' tools/file.txt",
+                )
+            )
+        self.assertEqual(decision.action, HookDecisionAction.BLOCK)
+        self.assertEqual((decision.audit_detail or {}).get("policy"), "forbid_tools_direct_read")
+
+    def test_evaluate_common_policy_allows_sed_non_tools_path_in_workflow_mode(self) -> None:
+        with patch.dict(os.environ, {"METDSL_WORKFLOW_MODE": "1"}, clear=False):
+            decision = evaluate_common_policy(
+                HookInput(
+                    event_name=HookEventName.PRE_COMMAND_EXECUTE,
+                    backend="claude",
+                    payload={"command": "sed -n '1,40p' docs/WORKFLOW.md"},
+                    command="sed -n '1,40p' docs/WORKFLOW.md",
+                )
+            )
+        self.assertEqual(decision.action, HookDecisionAction.ALLOW)
+
+    def test_evaluate_common_policy_allows_rg_pattern_only_tools_token_in_workflow_mode(self) -> None:
+        with patch.dict(os.environ, {"METDSL_WORKFLOW_MODE": "1"}, clear=False):
+            decision = evaluate_common_policy(
+                HookInput(
+                    event_name=HookEventName.PRE_COMMAND_EXECUTE,
+                    backend="claude",
+                    payload={"command": 'rg -n "tools/" docs/AGENT_SKILLS.md'},
+                    command='rg -n "tools/" docs/AGENT_SKILLS.md',
+                )
+            )
+        self.assertEqual(decision.action, HookDecisionAction.ALLOW)
+
+    def test_evaluate_common_policy_blocks_direct_tools_read_via_sed_f_script_in_workflow_mode(self) -> None:
+        with patch.dict(os.environ, {"METDSL_WORKFLOW_MODE": "1"}, clear=False):
+            decision = evaluate_common_policy(
+                HookInput(
+                    event_name=HookEventName.PRE_COMMAND_EXECUTE,
+                    backend="claude",
+                    payload={"command": "sed -f tools/script.sed docs/WORKFLOW.md"},
+                    command="sed -f tools/script.sed docs/WORKFLOW.md",
+                )
+            )
+        self.assertEqual(decision.action, HookDecisionAction.BLOCK)
+        self.assertEqual((decision.audit_detail or {}).get("policy"), "forbid_tools_direct_read")
+
+    def test_evaluate_common_policy_blocks_direct_tools_read_via_rg_file_in_workflow_mode(self) -> None:
+        with patch.dict(os.environ, {"METDSL_WORKFLOW_MODE": "1"}, clear=False):
+            decision = evaluate_common_policy(
+                HookInput(
+                    event_name=HookEventName.PRE_COMMAND_EXECUTE,
+                    backend="claude",
+                    payload={"command": 'rg --file tools/patterns.txt "x" docs/WORKFLOW.md'},
+                    command='rg --file tools/patterns.txt "x" docs/WORKFLOW.md',
+                )
+            )
+        self.assertEqual(decision.action, HookDecisionAction.BLOCK)
+        self.assertEqual((decision.audit_detail or {}).get("policy"), "forbid_tools_direct_read")
+
+    def test_evaluate_common_policy_blocks_direct_tools_read_via_grep_f_in_workflow_mode(self) -> None:
+        with patch.dict(os.environ, {"METDSL_WORKFLOW_MODE": "1"}, clear=False):
+            decision = evaluate_common_policy(
+                HookInput(
+                    event_name=HookEventName.PRE_COMMAND_EXECUTE,
+                    backend="claude",
+                    payload={"command": "grep -f tools/patterns.txt docs/WORKFLOW.md"},
+                    command="grep -f tools/patterns.txt docs/WORKFLOW.md",
+                )
+            )
+        self.assertEqual(decision.action, HookDecisionAction.BLOCK)
+        self.assertEqual((decision.audit_detail or {}).get("policy"), "forbid_tools_direct_read")
+
+    def test_evaluate_common_policy_blocks_direct_tools_read_via_awk_f_in_workflow_mode(self) -> None:
+        with patch.dict(os.environ, {"METDSL_WORKFLOW_MODE": "1"}, clear=False):
+            decision = evaluate_common_policy(
+                HookInput(
+                    event_name=HookEventName.PRE_COMMAND_EXECUTE,
+                    backend="claude",
+                    payload={"command": "awk -f tools/program.awk docs/WORKFLOW.md"},
+                    command="awk -f tools/program.awk docs/WORKFLOW.md",
+                )
+            )
+        self.assertEqual(decision.action, HookDecisionAction.BLOCK)
+        self.assertEqual((decision.audit_detail or {}).get("policy"), "forbid_tools_direct_read")
+
+    def test_evaluate_common_policy_blocks_direct_tools_read_via_sed_e_and_tools_input_in_workflow_mode(self) -> None:
+        with patch.dict(os.environ, {"METDSL_WORKFLOW_MODE": "1"}, clear=False):
+            decision = evaluate_common_policy(
+                HookInput(
+                    event_name=HookEventName.PRE_COMMAND_EXECUTE,
+                    backend="claude",
+                    payload={"command": "sed -e 's/a/b/' tools/input.txt"},
+                    command="sed -e 's/a/b/' tools/input.txt",
+                )
+            )
+        self.assertEqual(decision.action, HookDecisionAction.BLOCK)
+        self.assertEqual((decision.audit_detail or {}).get("policy"), "forbid_tools_direct_read")
+
+    def test_evaluate_common_policy_blocks_direct_tools_read_via_awk_f_and_tools_input_in_workflow_mode(self) -> None:
+        with patch.dict(os.environ, {"METDSL_WORKFLOW_MODE": "1"}, clear=False):
+            decision = evaluate_common_policy(
+                HookInput(
+                    event_name=HookEventName.PRE_COMMAND_EXECUTE,
+                    backend="claude",
+                    payload={"command": "awk -f docs/program.awk tools/input.txt"},
+                    command="awk -f docs/program.awk tools/input.txt",
+                )
+            )
+        self.assertEqual(decision.action, HookDecisionAction.BLOCK)
+        self.assertEqual((decision.audit_detail or {}).get("policy"), "forbid_tools_direct_read")
+
+    def test_evaluate_common_policy_blocks_direct_tools_read_via_sed_combined_f_in_workflow_mode(self) -> None:
+        with patch.dict(os.environ, {"METDSL_WORKFLOW_MODE": "1"}, clear=False):
+            decision = evaluate_common_policy(
+                HookInput(
+                    event_name=HookEventName.PRE_COMMAND_EXECUTE,
+                    backend="claude",
+                    payload={"command": "sed -ftools/script.sed docs/WORKFLOW.md"},
+                    command="sed -ftools/script.sed docs/WORKFLOW.md",
+                )
+            )
+        self.assertEqual(decision.action, HookDecisionAction.BLOCK)
+        self.assertEqual((decision.audit_detail or {}).get("policy"), "forbid_tools_direct_read")
+
+    def test_evaluate_common_policy_blocks_direct_tools_read_via_rg_combined_f_in_workflow_mode(self) -> None:
+        with patch.dict(os.environ, {"METDSL_WORKFLOW_MODE": "1"}, clear=False):
+            decision = evaluate_common_policy(
+                HookInput(
+                    event_name=HookEventName.PRE_COMMAND_EXECUTE,
+                    backend="claude",
+                    payload={"command": 'rg -ftools/patterns.txt "x" docs/WORKFLOW.md'},
+                    command='rg -ftools/patterns.txt "x" docs/WORKFLOW.md',
+                )
+            )
+        self.assertEqual(decision.action, HookDecisionAction.BLOCK)
+        self.assertEqual((decision.audit_detail or {}).get("policy"), "forbid_tools_direct_read")
+
+    def test_evaluate_common_policy_allows_sed_mixed_implicit_and_explicit_script_without_tools_input(self) -> None:
+        with patch.dict(os.environ, {"METDSL_WORKFLOW_MODE": "1"}, clear=False):
+            decision = evaluate_common_policy(
+                HookInput(
+                    event_name=HookEventName.PRE_COMMAND_EXECUTE,
+                    backend="claude",
+                    payload={"command": "sed 's/a/b/' -e 's/c/d/' docs/WORKFLOW.md"},
+                    command="sed 's/a/b/' -e 's/c/d/' docs/WORKFLOW.md",
+                )
+            )
         self.assertEqual(decision.action, HookDecisionAction.ALLOW)
 
     def test_evaluate_common_policy_blocks_python_inline_open_write(self) -> None:
