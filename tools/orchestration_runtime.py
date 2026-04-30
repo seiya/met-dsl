@@ -3114,6 +3114,11 @@ def _validate_actual_write_paths(
         write_roots = [str(item) for item in roots_obj] if isinstance(roots_obj, list) else []
 
     unauthorized: list[str] = []
+    parent_tmp_root: str | None = None
+    if actor_role in {"step", "substep"}:
+        parent_obj = payload.get("parent_agent_run_id")
+        if isinstance(parent_obj, str) and parent_obj.strip():
+            parent_tmp_root = _normalize_rel_posix(f"workspace/tmp/{parent_obj.strip()}")
     missing_from_gate_changed_paths = sorted(
         {
             path
@@ -3146,6 +3151,8 @@ def _validate_actual_write_paths(
                 }
         declared_paths = sorted(set(gate_changed_paths) | manifest_file_tool_paths)
     for path in actual_changed_paths:
+        if parent_tmp_root and _repo_path_under_prefix(path, parent_tmp_root):
+            continue
         if write_roots and not _path_under_any_write_root(path, write_roots):
             unauthorized.append(path)
             continue
