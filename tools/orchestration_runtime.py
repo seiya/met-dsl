@@ -3116,9 +3116,32 @@ def _validate_actual_write_paths(
     unauthorized: list[str] = []
     parent_tmp_root: str | None = None
     if actor_role in {"step", "substep"}:
-        parent_obj = payload.get("parent_agent_run_id")
-        if isinstance(parent_obj, str) and parent_obj.strip():
-            parent_tmp_root = _normalize_rel_posix(f"workspace/tmp/{parent_obj.strip()}")
+        # Prefer the launch request file as the authoritative source for
+        # parent_agent_run_id; fall back to payload for backward compatibility.
+        _parent_run_id: str | None = None
+        _launch_req = (
+            repo_root
+            / "workspace"
+            / "orchestrations"
+            / orchestration_id
+            / "launches"
+            / f"{run_id}.request.json"
+        )
+        if _launch_req.exists():
+            try:
+                _req_doc = _read_json(_launch_req)
+                if isinstance(_req_doc, dict):
+                    _raw = _req_doc.get("parent_agent_run_id")
+                    if isinstance(_raw, str) and _raw.strip():
+                        _parent_run_id = _raw.strip()
+            except Exception:
+                pass
+        if _parent_run_id is None:
+            _raw_payload = payload.get("parent_agent_run_id")
+            if isinstance(_raw_payload, str) and _raw_payload.strip():
+                _parent_run_id = _raw_payload.strip()
+        if _parent_run_id:
+            parent_tmp_root = _normalize_rel_posix(f"workspace/tmp/{_parent_run_id}")
     missing_from_gate_changed_paths = sorted(
         {
             path
