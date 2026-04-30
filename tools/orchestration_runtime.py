@@ -4470,6 +4470,16 @@ def _validate_launch_request_payload(request_payload: dict[str, Any]) -> None:
             )
     if isinstance(dependency_ref, str) and _is_placeholder_ref(dependency_ref):
         raise ValueError("launch request dependency_ref must not contain placeholder tokens")
+    step_val = str(request_payload.get("step", "")).strip().lower()
+    if step_val == "plan" and isinstance(dependency_ref, str) and dependency_ref.strip():
+        dep_norm = _normalize_rel_posix(dependency_ref.strip())
+        if not (dep_norm.startswith("spec/") and dep_norm.endswith("/deps.yaml")):
+            raise ValueError(
+                "record-launch: Plan step dependency_ref must be spec/.../deps.yaml, "
+                f"got {dependency_ref!r}. "
+                "Both generate and verify substeps must receive the spec path, "
+                "not workspace/plans/."
+            )
 
     # repair_strategy / issue_severity の値検証
     repair_strategy = str(request_payload.get("repair_strategy", "none")).strip()

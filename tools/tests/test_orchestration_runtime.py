@@ -71,6 +71,11 @@ from tools.orchestration_runtime import (
 _FIX_PLAN_REF = "workspace/plans/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001"
 _FIX_PIPE_REF = "workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001"
 _FIX_DEP_REF = f"{_FIX_PLAN_REF}/dependency.resolved.yaml"
+_FIX_PLAN_STEP_DEP_REF = "spec/problem/shallow_water2d/deps.yaml"
+
+
+def _dep_ref_for_step(step: str) -> str:
+    return _FIX_PLAN_STEP_DEP_REF if step.strip().lower() == "plan" else _FIX_DEP_REF
 
 
 def _fixture_generate_downstream_ready(repo_root: Path, *, generation_id: str = "gen_fixture_001") -> None:
@@ -110,7 +115,7 @@ def _fixture_skill_must_read_refs_substep(step: str, substep: str, *, generation
         "skill_ref": f"skills/{skill_name}/SKILL.md",
         "plan_ref": _FIX_PLAN_REF,
         "pipeline_ref": _FIX_PIPE_REF,
-        "dependency_ref": _FIX_DEP_REF,
+        "dependency_ref": _dep_ref_for_step(step),
     }
     if generation_id:
         payload["generation_id"] = generation_id
@@ -149,7 +154,7 @@ def _substep_launch_prompt(node_key: str, step: str, substep: str, agent_run_id:
         "workflow_mode": "dev",
         "plan_ref": _FIX_PLAN_REF,
         "pipeline_ref": _FIX_PIPE_REF,
-        "dependency_ref": _FIX_DEP_REF,
+        "dependency_ref": _dep_ref_for_step(step),
         "skill_name": f"workflow-{step}-{substep}",
         "skill_ref": f"skills/workflow-{step}-{substep}/SKILL.md",
         "skill_must_read_refs": _fixture_skill_must_read_refs_substep(step, substep),
@@ -702,7 +707,7 @@ shell_tool                       stable             true
                 repo_root=repo_root,
                 orchestration_id="orch_001",
                 spec_ref="spec/problem/shallow_water2d/controlled_spec.md",
-                dependency_ref="workspace/plans/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/dependency.resolved.yaml",
+                dependency_ref="spec/problem/shallow_water2d/deps.yaml",
             )
             write_preflight(
                 repo_root=repo_root,
@@ -734,7 +739,7 @@ shell_tool                       stable             true
                     "parent_agent_run_id": "orch_run_001",
                     "plan_ref": "workspace/plans/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001",
                     "pipeline_ref": "workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001",
-                    "dependency_ref": "workspace/plans/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/dependency.resolved.yaml",
+                    "dependency_ref": "spec/problem/shallow_water2d/deps.yaml",
                     "skill_name": "workflow-plan-generate",
                     "skill_ref": "skills/workflow-plan-generate/SKILL.md",
                     "skill_must_read_refs": "",
@@ -1097,7 +1102,7 @@ shell_tool                       stable             true
                     "parent_agent_run_id": "orch_run_001",
                     "plan_ref": "workspace/plans/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001",
                     "pipeline_ref": "workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001",
-                    "dependency_ref": "workspace/plans/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/dependency.resolved.yaml",
+                    "dependency_ref": "spec/problem/shallow_water2d/deps.yaml",
                     "skill_name": "workflow-plan-generate",
                     "skill_ref": "skills/workflow-plan-generate/SKILL.md",
                     "skill_must_read_refs": "",

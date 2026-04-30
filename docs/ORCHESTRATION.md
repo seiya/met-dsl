@@ -113,7 +113,7 @@
 - `Generate verify` の起動要求では、`skill_must_read_refs` に `plan_ref` 配下の `case.resolved.yaml` と `algorithm.resolved.yaml` と `impl.resolved.yaml` と `dependency.resolved.yaml` と `derived_contract.json` に加えて、`pipeline_ref` を基準とする相対パスとして `lineage.json` と `generate/<generation_id>/generate_meta.json` を必須記録しなければならない。不足時は起動前に `fail_closed` とする。
 - `plan_ref` は `workspace/plans/<node_key_safe>/<plan_id>` のみとし、追加のパスセグメント（ファイルパスを含む）を付けてはならない。`<plan_id>` は `<node_key_safe>_` で始まるディレクトリ名とする。
 - `pipeline_ref` は `workspace/pipelines/<node_key_safe>/<pipeline_id>` のみとし、追加のパスセグメント（`generate/` や `generate_meta.json` を含む）を付けてはならない。`<pipeline_id>` は `<node_key_safe>_` で始まるディレクトリ名とする。この制約は `pipeline_ref` フィールド値にのみ適用し、`skill_must_read_refs` には `pipeline_ref` 配下 artifact の相対パス記録を許可する。
-- `dependency_ref` は phase ごとに canonical path を固定しなければならない。`Plan` は `spec/.../deps.yaml`、`Generate` 以降は `workspace/...` の phase root（`plan_ref` または `pipeline_ref`）を記録し、`spec` 直参照を禁止する。
+- `dependency_ref` は phase ごとに canonical path を固定しなければならない。`Plan` は `spec/.../deps.yaml`、`Generate` 以降は `workspace/...` の phase root（`plan_ref` または `pipeline_ref`）を記録し、`spec` 直参照を禁止する。この規則は `Plan` phase の `generate` と `verify` の両 `substep` に適用し、`verify` は `generate` と同一の `dependency_ref` を受け取らなければならない。`validate_workspace_root` gate はこの規則を検証する。
 - `Generate verify` の起動要求では、`generation_id` を必須記録しなければならない。`record-launch` は上記の `plan_ref` / `pipeline_ref` 形と `generation_id` と `skill_must_read_refs` 充足を検査する。
 - `step agent` / `substep agent` が `pass` で終了するとき、`output_refs` の各パスは、対応する起動要求に記録された `plan_ref` または `pipeline_ref` ディレクトリ配下に含まれなければならない。`record_agent_run` がこれを検査する。
 
