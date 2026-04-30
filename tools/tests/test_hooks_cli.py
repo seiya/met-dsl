@@ -1204,6 +1204,191 @@ class ClaudeHookCliTests(unittest.TestCase):
                 )
             self.assertEqual(code, 0)
 
+    def test_codex_file_tool_allows_with_session_run_index_before_agent_runs_recorded(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            orch = "orch_file_guard_index_001"
+            run_id = "step_run_build_index_001"
+            session_id = "sess_step_build_index_001"
+            target = "workspace/pipelines/safe/out.txt"
+            orch_root = repo_root / "workspace" / "orchestrations" / orch
+            (orch_root / "output_manifests").mkdir(parents=True, exist_ok=True)
+            (orch_root / "session_run_index.json").write_text(
+                json.dumps(
+                    {
+                        "entries": [
+                            {
+                                "agent_run_id": run_id,
+                                "agent_session_id": session_id,
+                                "session_id": session_id,
+                                "context_id": "ctx_step_build_index_001",
+                                "agent_role": "step",
+                                "status": "running",
+                            }
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (orch_root / "output_manifests" / f"{run_id}.json").write_text(
+                json.dumps(
+                    {
+                        "orchestration_id": orch,
+                        "agent_run_id": run_id,
+                        "allowed_output_paths": [target],
+                        "allowed_file_tool_paths": [target],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            payload = {
+                "orchestration_id": orch,
+                "repo_root": str(repo_root),
+                "tool_name": "Write",
+                "session_id": session_id,
+                "tool_input": {"file_path": target},
+            }
+            with patch.dict(
+                os.environ,
+                {"METDSL_WORKFLOW_MODE": "1", "METDSL_REQUIRE_CODEX_HOOKS_FEATURE": "0"},
+                clear=False,
+            ):
+                code = cli.main(
+                    [
+                        "--backend",
+                        "codex",
+                        "--event",
+                        "PreToolUse",
+                        "--input-json",
+                        json.dumps(payload),
+                    ]
+                )
+            self.assertEqual(code, 0)
+
+    def test_codex_file_tool_blocks_when_session_run_index_is_ambiguous(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            orch = "orch_file_guard_index_ambiguous_001"
+            session_id = "sess_step_build_index_ambiguous_001"
+            orch_root = repo_root / "workspace" / "orchestrations" / orch
+            orch_root.mkdir(parents=True, exist_ok=True)
+            (orch_root / "session_run_index.json").write_text(
+                json.dumps(
+                    {
+                        "entries": [
+                            {
+                                "agent_run_id": "step_run_ambiguous_001",
+                                "agent_session_id": session_id,
+                                "session_id": session_id,
+                                "agent_role": "step",
+                                "status": "running",
+                            },
+                            {
+                                "agent_run_id": "step_run_ambiguous_002",
+                                "agent_session_id": session_id,
+                                "session_id": session_id,
+                                "agent_role": "step",
+                                "status": "running",
+                            },
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            payload = {
+                "orchestration_id": orch,
+                "repo_root": str(repo_root),
+                "tool_name": "Write",
+                "session_id": session_id,
+                "tool_input": {"file_path": "workspace/pipelines/safe/out.txt"},
+            }
+            out = io.StringIO()
+            with patch.dict(
+                os.environ,
+                {"METDSL_WORKFLOW_MODE": "1", "METDSL_REQUIRE_CODEX_HOOKS_FEATURE": "0"},
+                clear=False,
+            ):
+                with redirect_stdout(out):
+                    code = cli.main(
+                        [
+                            "--backend",
+                            "codex",
+                            "--event",
+                            "PreToolUse",
+                            "--input-json",
+                            json.dumps(payload),
+                        ]
+                    )
+            self.assertEqual(code, 2)
+            body = json.loads(out.getvalue().strip())
+            self.assertEqual(body.get("decision"), "block")
+            self.assertIn("session-to-run mapping not found", body.get("reason", ""))
+            self.assertIn("ambiguous candidates=2", body.get("reason", ""))
+
+    def test_codex_file_tool_does_not_match_none_literal_from_missing_context_id(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            orch = "orch_file_guard_index_none_literal_001"
+            run_id = "step_run_none_literal_001"
+            target = "workspace/pipelines/safe/out.txt"
+            orch_root = repo_root / "workspace" / "orchestrations" / orch
+            (orch_root / "output_manifests").mkdir(parents=True, exist_ok=True)
+            (orch_root / "session_run_index.json").write_text(
+                json.dumps(
+                    {
+                        "entries": [
+                            {
+                                "agent_run_id": run_id,
+                                "agent_session_id": "sess_real_001",
+                                "context_id": None,
+                                "agent_role": "step",
+                                "status": "running",
+                            }
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (orch_root / "output_manifests" / f"{run_id}.json").write_text(
+                json.dumps(
+                    {
+                        "orchestration_id": orch,
+                        "agent_run_id": run_id,
+                        "allowed_output_paths": [target],
+                        "allowed_file_tool_paths": [target],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            payload = {
+                "orchestration_id": orch,
+                "repo_root": str(repo_root),
+                "tool_name": "Write",
+                "session_id": "None",
+                "tool_input": {"file_path": target},
+            }
+            out = io.StringIO()
+            with patch.dict(
+                os.environ,
+                {"METDSL_WORKFLOW_MODE": "1", "METDSL_REQUIRE_CODEX_HOOKS_FEATURE": "0"},
+                clear=False,
+            ):
+                with redirect_stdout(out):
+                    code = cli.main(
+                        [
+                            "--backend",
+                            "codex",
+                            "--event",
+                            "PreToolUse",
+                            "--input-json",
+                            json.dumps(payload),
+                        ]
+                    )
+            self.assertEqual(code, 2)
+            body = json.loads(out.getvalue().strip())
+            self.assertEqual(body.get("decision"), "block")
+            self.assertIn("session-to-run mapping not found", body.get("reason", ""))
+
     def test_codex_file_tool_blocks_when_session_mapping_not_found(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)

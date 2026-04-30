@@ -166,6 +166,7 @@
 - `workspace/orchestrations/<orchestration_id>/preflight.json` が存在し、`can_launch_step_agents=true` と `can_launch_substep_agents=true` と `sandbox_enforced=true` を満たしている。
 - `backend=codex` の `preflight.json` が `checks.codex_hooks_enabled.pass=true` と `checks.codex_home_writable.pass=true` を記録している。
 - `agent_runs.jsonl` の `step` / `substep` ロールが `agent_session_id` と `launch_request_ref` と `launch_response_ref` と `agent_result_ref` と `agent_summary_ref` を保持し、参照先ファイルが存在している。
+- `workspace/orchestrations/<orchestration_id>/session_run_index.json` が存在し、対象 `agent_run_id` の `agent_session_id` と `context_id` と `status` が `record-launch` / `record-agent-run` の状態遷移と整合している。
 - `spec_kind` を問わない workflow 実行で各 `node_key` の個別 `plan_id` と個別 `pipeline_id` が発行されている。
 - 実行証跡から、`script` 一括実行ではなく `orchestration -> step` または `orchestration -> substep` の独立 `agent` 実行であることを確認できる。
 - 明示的な指定がない試行で、既存 workflow 出力の参照または閲覧が実施されていない。

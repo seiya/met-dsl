@@ -50,6 +50,8 @@
 - `step` / `substep` ロールの `agent_runs.jsonl` は `parent_agent_run_id` と `agent_backend` と `agent_model` と `context_id` と `context_isolated` と `agent_session_id` と `launch_request_ref` と `launch_response_ref` と `launch_prompt_ref` と `launch_reply_ref` と `agent_result_ref` と `agent_summary_ref` を必須記録とする。
 - `substep agent` の `parent_agent_run_id` は、当該 `substep` を起動した `orchestration agent_run_id` を指すことを許可する。
 - `spawn_agent` の応答で得た子 `agent` 識別子は `agent_session_id` として記録しなければならない。
+- `record-launch` は child 起動直後に `workspace/orchestrations/<orchestration_id>/session_run_index.json` を更新し、`agent_run_id` と `agent_session_id` と `context_id` と `agent_role` と `status` を記録しなければならない。`session_run_index.json` は native hook の `session_id` / `agent_session_id` 逆引きの一次索引として扱う。
+- native hook における `session_id` 逆引きは `session_run_index.json` を第一優先、`agent_runs.jsonl` を fallback とし、複数候補がある場合は `block` としなければならない。
 - `launches/<agent_run_id>.response.json` と `agents/<agent_run_id>/dialogs/child.response.json` の canonical source は、子 `agent` 起動直後に得た `spawn_agent` 実応答としなければならない。後生成、要約再構成、固定文言による代替を禁止する。
 - `step` / `substep` ロールの `agent_runs.jsonl.agent_session_id` は、対応する `launch response` に含まれる子 `agent` 識別子と一致しなければならない。手書き `session_id`、連番仮値、親 `agent` 推定値を禁止する。
 - `launch_request_ref` と `launch_response_ref` は `workspace/orchestrations/<orchestration_id>/launches/` 配下を参照し、参照先実体が存在しなければならない。

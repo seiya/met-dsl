@@ -101,6 +101,72 @@ def _active_child_agent_run_id_path(repo_root: Path, orchestration_id: str) -> P
     return _orchestration_root(repo_root, orchestration_id) / "active_child_agent_run_id.txt"
 
 
+def _session_run_index_path(repo_root: Path, orchestration_id: str) -> Path:
+    return _orchestration_root(repo_root, orchestration_id) / "session_run_index.json"
+
+
+def _read_session_run_index(repo_root: Path, orchestration_id: str) -> dict[str, Any]:
+    path = _session_run_index_path(repo_root, orchestration_id)
+    if not path.is_file():
+        return {"entries": []}
+    try:
+        payload = _read_json(path)
+    except (OSError, json.JSONDecodeError):
+        return {"entries": []}
+    if not isinstance(payload, dict):
+        return {"entries": []}
+    entries = payload.get("entries")
+    if not isinstance(entries, list):
+        payload["entries"] = []
+    return payload
+
+
+def _append_session_run_index_entry(
+    repo_root: Path,
+    orchestration_id: str,
+    *,
+    agent_run_id: str,
+    agent_session_id: str,
+    context_id: str | None,
+    agent_role: str,
+    status: str,
+) -> None:
+    doc = _read_session_run_index(repo_root, orchestration_id)
+    entries_obj = doc.get("entries")
+    entries = entries_obj if isinstance(entries_obj, list) else []
+    normalized_run_id = agent_run_id.strip()
+    normalized_session_id = agent_session_id.strip()
+    normalized_context_id = context_id.strip() if isinstance(context_id, str) and context_id.strip() else None
+    normalized_role = agent_role.strip().lower()
+    normalized_status = status.strip().lower()
+    for item in entries:
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("agent_run_id", "")).strip() != normalized_run_id:
+            continue
+        item["agent_session_id"] = normalized_session_id
+        item["session_id"] = normalized_session_id
+        item["context_id"] = normalized_context_id
+        item["agent_role"] = normalized_role
+        item["status"] = normalized_status
+        item["updated_at"] = _utc_now_iso()
+        _write_json(_session_run_index_path(repo_root, orchestration_id), doc)
+        return
+    entries.append(
+        {
+            "agent_run_id": normalized_run_id,
+            "agent_session_id": normalized_session_id,
+            "session_id": normalized_session_id,
+            "context_id": normalized_context_id,
+            "agent_role": normalized_role,
+            "status": normalized_status,
+            "recorded_at": _utc_now_iso(),
+        }
+    )
+    doc["entries"] = entries
+    _write_json(_session_run_index_path(repo_root, orchestration_id), doc)
+
+
 # --- Phase 1: access policy / phase state artifact layout (Item 10) ---
 
 DEFAULT_ALLOWED_GATE_SERVICES: tuple[str, ...] = (
@@ -5760,6 +5826,15 @@ def init_orchestration(
                 )
                 + "\n"
             )
+    _append_session_run_index_entry(
+        repo_root,
+        orchestration_id,
+        agent_run_id=orchestration_agent_run_id,
+        agent_session_id=orchestration_agent_run_id,
+        context_id=orchestration_agent_run_id,
+        agent_role="orchestration",
+        status="running",
+    )
 
     pre_orchestration_start(repo_root, orchestration_id, event="init")
     _write_run_write_baseline(repo_root, orchestration_id)
@@ -5943,8 +6018,27 @@ def record_launch(
     response_payload = dict(response_payload)
     response_agent_session_id = _validate_response_agent_session_id(response_payload)
     response_payload.setdefault("agent_session_id", response_agent_session_id)
+    launch_role_obj = request_payload.get("agent_role")
+    if isinstance(launch_role_obj, str) and launch_role_obj.strip():
+        launch_role = launch_role_obj.strip().lower()
+    else:
+        try:
+            launch_role = _required_child_agent_kind(str(request_payload.get("step", "") or ""))
+        except ValueError:
+            launch_role = "unknown"
+    context_obj = request_payload.get("context_id")
+    launch_context_id = context_obj.strip() if isinstance(context_obj, str) and context_obj.strip() else None
 
     _validate_launch_request_payload(request_payload)
+    _append_session_run_index_entry(
+        repo_root,
+        orchestration_id,
+        agent_run_id=child_agent_run_id,
+        agent_session_id=response_agent_session_id,
+        context_id=launch_context_id,
+        agent_role=launch_role,
+        status="running",
+    )
 
     prompt_text = _extract_launch_prompt_text(request_payload)
     reply_text = _extract_launch_reply_text(response_payload)
@@ -6311,6 +6405,22 @@ def record_agent_run(
 
     with runs_path.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
+
+    status_token = str(payload.get("status", "")).strip().lower()
+    if status_token in TERMINAL_STATUSES:
+        session_obj = payload.get("agent_session_id")
+        session_value = session_obj.strip() if isinstance(session_obj, str) and session_obj.strip() else agent_run_id
+        context_obj = payload.get("context_id")
+        context_value = context_obj.strip() if isinstance(context_obj, str) and context_obj.strip() else None
+        _append_session_run_index_entry(
+            repo_root,
+            orchestration_id,
+            agent_run_id=agent_run_id,
+            agent_session_id=session_value,
+            context_id=context_value,
+            agent_role=role_token,
+            status=status_token,
+        )
 
     if role_token in {"step", "substep"}:
         status_raw = payload.get("status")

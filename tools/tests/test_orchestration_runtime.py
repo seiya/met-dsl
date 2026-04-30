@@ -5975,6 +5975,109 @@ class OrchestrationMetaAndJudgeHookTests(unittest.TestCase):
                     matching_running.append(item)
             self.assertEqual(len(matching_running), 1)
 
+    def test_init_orchestration_writes_session_run_index_for_orchestration_agent(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            orch = "orch_session_index_init_001"
+            meta = init_orchestration(repo_root=repo, orchestration_id=orch)
+            run_id = str(meta.get("orchestration_agent_run_id", "")).strip()
+            self.assertTrue(run_id)
+            index_path = repo / "workspace" / "orchestrations" / orch / "session_run_index.json"
+            self.assertTrue(index_path.is_file())
+            index_doc = json.loads(index_path.read_text(encoding="utf-8"))
+            entries = index_doc.get("entries")
+            self.assertIsInstance(entries, list)
+            matched = [
+                item
+                for item in entries
+                if isinstance(item, dict) and str(item.get("agent_run_id", "")).strip() == run_id
+            ]
+            self.assertEqual(len(matched), 1)
+            self.assertEqual(matched[0].get("agent_session_id"), run_id)
+            self.assertEqual(matched[0].get("agent_role"), "orchestration")
+            self.assertEqual(matched[0].get("status"), "running")
+
+    def test_record_launch_and_terminal_record_agent_run_update_session_run_index(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            orch = "orch_session_index_launch_001"
+            parent = "orch_parent_001"
+            child = "step_run_session_index_001"
+            session = "sess_step_session_index_001"
+            init_orchestration(repo_root=repo, orchestration_id=orch)
+            write_preflight(
+                repo_root=repo,
+                orchestration_id=orch,
+                payload=_launchable_preflight_dict(checked_at="2026-04-15T10:00:00Z"),
+            )
+            record_launch(
+                repo_root=repo,
+                orchestration_id=orch,
+                parent_agent_run_id=parent,
+                child_agent_run_id=child,
+                request_payload={
+                    "agent_run_id": child,
+                    "parent_agent_run_id": parent,
+                    "agent_role": "step",
+                    "node_key": "problem/shallow_water2d@0.3.0",
+                    "step": "build",
+                    "context_id": "ctx_step_session_index_001",
+                    "plan_ref": "workspace/plans/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001",
+                    "pipeline_ref": "workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001",
+                    "dependency_ref": "workspace/plans/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/dependency.resolved.yaml",
+                    "skill_name": "workflow-build",
+                    "skill_ref": "skills/workflow-build/SKILL.md",
+                    "skill_must_read_refs": "",
+                    "allowed_output_paths": [
+                        "workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/build/build_001/build_meta.json"
+                    ],
+                },
+                response_payload={
+                    "agent_run_id": child,
+                    **_spawn_response_payload(session),
+                },
+            )
+            index_path = repo / "workspace" / "orchestrations" / orch / "session_run_index.json"
+            index_doc = json.loads(index_path.read_text(encoding="utf-8"))
+            entries = index_doc.get("entries", [])
+            launch_entry = next(
+                item
+                for item in entries
+                if isinstance(item, dict) and str(item.get("agent_run_id", "")).strip() == child
+            )
+            self.assertEqual(launch_entry.get("agent_session_id"), session)
+            self.assertEqual(launch_entry.get("status"), "running")
+
+            record_agent_run(
+                repo_root=repo,
+                orchestration_id=orch,
+                payload={
+                    "agent_run_id": child,
+                    "agent_role": "step",
+                    "agent_backend": "codex",
+                    "agent_model": "gpt-5.3-codex",
+                    "agent_session_id": session,
+                    "context_id": "ctx_step_session_index_001",
+                    "status": "blocked",
+                    "node_key": "problem/shallow_water2d@0.3.0",
+                    "step": "build",
+                    "launch_request_ref": f"workspace/orchestrations/{orch}/launches/{child}.request.json",
+                    "launch_response_ref": f"workspace/orchestrations/{orch}/launches/{child}.response.json",
+                    "launch_prompt_ref": f"workspace/orchestrations/{orch}/launches/{child}.prompt.txt",
+                    "launch_reply_ref": f"workspace/orchestrations/{orch}/launches/{child}.reply.txt",
+                    "result_summary": "step completed",
+                    "output_refs": [],
+                },
+            )
+            updated = json.loads(index_path.read_text(encoding="utf-8"))
+            updated_entries = updated.get("entries", [])
+            terminal_entry = next(
+                item
+                for item in updated_entries
+                if isinstance(item, dict) and str(item.get("agent_run_id", "")).strip() == child
+            )
+            self.assertEqual(terminal_entry.get("status"), "blocked")
+
     def test_pre_orchestration_start_logs_persisted_parallel_nodes_explicit(self) -> None:
         """setdefault で保持した値と hook 返却・ログ用 detail が一致すること。"""
         with tempfile.TemporaryDirectory() as tmp:
@@ -7306,6 +7409,23 @@ class TestPhase2PlanGuardsIntegration(unittest.TestCase):
                                 **_spawn_response_payload(f"sess_child_missing_{missing_key}"),
                             },
                         )
+            index_path = (
+                repo_root
+                / "workspace"
+                / "orchestrations"
+                / "wf5"
+                / "session_run_index.json"
+            )
+            if index_path.exists():
+                index_doc = json.loads(index_path.read_text(encoding="utf-8"))
+                entries = index_doc.get("entries", [])
+                self.assertFalse(
+                    any(
+                        isinstance(item, dict)
+                        and str(item.get("agent_run_id", "")).startswith("child_missing_")
+                        for item in entries
+                    )
+                )
 
     def test_workflow_launch_check_fail_closed_without_readiness_snapshot(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

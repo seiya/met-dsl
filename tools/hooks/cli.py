@@ -501,17 +501,46 @@ def _resolve_codex_agent_run_id_from_session(
     orchestration_id: str,
     session_id: str | None,
     agent_session_id: str | None,
-) -> str | None:
+) -> tuple[str | None, int]:
     tokens = {
         value.strip()
         for value in (session_id, agent_session_id)
         if isinstance(value, str) and value.strip()
     }
     if not tokens:
-        return None
-    runs_path = repo_root / "workspace" / "orchestrations" / orchestration_id / "agent_runs.jsonl"
+        return None, 0
+    orch_root = repo_root / "workspace" / "orchestrations" / orchestration_id
+    index_path = orch_root / "session_run_index.json"
+    if index_path.is_file():
+        try:
+            index_doc = json.loads(index_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            index_doc = None
+        if isinstance(index_doc, dict):
+            entries_obj = index_doc.get("entries")
+            if isinstance(entries_obj, list):
+                matched_from_index: set[str] = set()
+                for item in entries_obj:
+                    if not isinstance(item, dict):
+                        continue
+                    run_id_obj = item.get("agent_run_id")
+                    if not isinstance(run_id_obj, str) or not run_id_obj.strip():
+                        continue
+                    candidate_tokens: set[str] = set()
+                    for key in ("agent_session_id", "context_id", "session_id"):
+                        value_obj = item.get(key)
+                        if isinstance(value_obj, str) and value_obj.strip():
+                            candidate_tokens.add(value_obj.strip())
+                    if tokens.isdisjoint(candidate_tokens):
+                        continue
+                    matched_from_index.add(run_id_obj.strip())
+                if len(matched_from_index) == 1:
+                    return next(iter(matched_from_index)), 1
+                if len(matched_from_index) > 1:
+                    return None, len(matched_from_index)
+    runs_path = orch_root / "agent_runs.jsonl"
     if not runs_path.is_file():
-        return None
+        return None, 0
     session_match_ids: set[str] = set()
     context_match_ids: set[str] = set()
     with runs_path.open("r", encoding="utf-8") as handle:
@@ -540,12 +569,14 @@ def _resolve_codex_agent_run_id_from_session(
             if entry_context in tokens:
                 context_match_ids.add(normalized_run_id)
     if len(session_match_ids) == 1:
-        return next(iter(session_match_ids))
+        return next(iter(session_match_ids)), 1
     if len(session_match_ids) > 1:
-        return None
+        return None, len(session_match_ids)
     if len(context_match_ids) == 1:
-        return next(iter(context_match_ids))
-    return None
+        return next(iter(context_match_ids)), 1
+    if len(context_match_ids) > 1:
+        return None, len(context_match_ids)
+    return None, 0
 
 
 def _hint_for_file_tool(tool_name: str) -> str:
@@ -588,7 +619,7 @@ def _resolve_agent_run_id_for_file_tool(
                 continue_processing=False,
             )
         return orch_agent_run_id, None
-    mapped_agent_run_id = _resolve_codex_agent_run_id_from_session(
+    mapped_agent_run_id, match_count = _resolve_codex_agent_run_id_from_session(
         repo_root=repo_root,
         orchestration_id=orchestration_id,
         session_id=session_id,
@@ -596,9 +627,14 @@ def _resolve_agent_run_id_for_file_tool(
     )
     if not mapped_agent_run_id:
         hint = _hint_for_file_tool(tool_name)
+        suffix = (
+            f" (ambiguous candidates={match_count})"
+            if isinstance(match_count, int) and match_count > 1
+            else ""
+        )
         return None, HookDecision(
             action=HookDecisionAction.BLOCK,
-            reason=f"session-to-run mapping not found. {hint}",
+            reason=f"session-to-run mapping not found{suffix}. {hint}",
             continue_processing=False,
         )
     return mapped_agent_run_id, None
