@@ -281,6 +281,11 @@ class RunWorkflowTests(unittest.TestCase):
             def fake_runtime_command(root: Path, env: dict[str, str], args: list[str]) -> run_workflow.RuntimeResult:
                 if args[0] == "preflight":
                     raise RuntimeError("runtime command failed (preflight): boom")
+                if args[0] == "init":
+                    return run_workflow.RuntimeResult(
+                        payload={"status": "ok", "orchestration_agent_run_id": "orch_agent_run_preflight_fail"},
+                        raw_stdout="{}",
+                    )
                 return run_workflow.RuntimeResult(payload={"status": "ok"}, raw_stdout="{}")
 
             original_runtime = run_workflow._runtime_command
@@ -309,6 +314,48 @@ class RunWorkflowTests(unittest.TestCase):
             self.assertEqual(payload["orchestration_id"], "orch_preflight_fail")
             self.assertIn("preflight", payload["detail"])
 
+    def test_main_returns_structured_error_when_init_result_lacks_orchestration_agent_run_id(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            (repo_root / "tools").mkdir(parents=True, exist_ok=True)
+            (repo_root / "workspace").mkdir(parents=True, exist_ok=True)
+            (repo_root / "spec" / "problem").mkdir(parents=True, exist_ok=True)
+            (repo_root / "spec" / "problem" / "test.md").write_text("spec\n", encoding="utf-8")
+            dep_ref = "workspace/plans/sample/sample_20260424_001/dependency.resolved.yaml"
+            (repo_root / dep_ref).parent.mkdir(parents=True, exist_ok=True)
+            (repo_root / dep_ref).write_text("nodes: []\n", encoding="utf-8")
+
+            def fake_runtime_command(root: Path, env: dict[str, str], args: list[str]) -> run_workflow.RuntimeResult:
+                if args[0] == "init":
+                    return run_workflow.RuntimeResult(payload={"status": "ok"}, raw_stdout="{}")
+                return run_workflow.RuntimeResult(payload={"status": "ok"}, raw_stdout="{}")
+
+            original_runtime = run_workflow._runtime_command
+            try:
+                run_workflow._runtime_command = fake_runtime_command  # type: ignore[assignment]
+                stdout = io.StringIO()
+                with redirect_stdout(stdout):
+                    code = run_workflow.main(
+                        [
+                            "spec/problem/test.md",
+                            "build",
+                            "--repo-root",
+                            str(repo_root),
+                            "--orchestration-id",
+                            "orch_init_missing_run_id",
+                            "--no-invoke-llm",
+                        ]
+                    )
+            finally:
+                run_workflow._runtime_command = original_runtime  # type: ignore[assignment]
+
+            self.assertEqual(code, 2)
+            payload = json.loads(stdout.getvalue().strip())
+            self.assertEqual(payload["status"], "fail")
+            self.assertEqual(payload["reason"], "runtime_command_failed")
+            self.assertEqual(payload["orchestration_id"], "orch_init_missing_run_id")
+            self.assertIn("missing orchestration_agent_run_id", payload["detail"])
+
     def test_main_dev_mode_writes_failure_analysis_on_llm_failure(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
@@ -328,6 +375,11 @@ class RunWorkflowTests(unittest.TestCase):
                             "can_launch_step_agents": True,
                             "can_launch_substep_agents": True,
                         },
+                        raw_stdout="{}",
+                    )
+                if args[0] == "init":
+                    return run_workflow.RuntimeResult(
+                        payload={"status": "ok", "orchestration_agent_run_id": "orch_agent_run_dev_fail"},
                         raw_stdout="{}",
                     )
                 return run_workflow.RuntimeResult(payload={"status": "ok"}, raw_stdout="{}")
@@ -408,6 +460,11 @@ class RunWorkflowTests(unittest.TestCase):
                         },
                         raw_stdout="{}",
                     )
+                if args[0] == "init":
+                    return run_workflow.RuntimeResult(
+                        payload={"status": "ok", "orchestration_agent_run_id": "orch_agent_run_auto_dep"},
+                        raw_stdout="{}",
+                    )
                 return run_workflow.RuntimeResult(payload={"status": "ok"}, raw_stdout="{}")
 
             original_runtime = run_workflow._runtime_command
@@ -452,6 +509,11 @@ class RunWorkflowTests(unittest.TestCase):
                             "can_launch_step_agents": True,
                             "can_launch_substep_agents": True,
                         },
+                        raw_stdout="{}",
+                    )
+                if args[0] == "init":
+                    return run_workflow.RuntimeResult(
+                        payload={"status": "ok", "orchestration_agent_run_id": "orch_agent_run_no_dep"},
                         raw_stdout="{}",
                     )
                 return run_workflow.RuntimeResult(payload={"status": "ok"}, raw_stdout="{}")

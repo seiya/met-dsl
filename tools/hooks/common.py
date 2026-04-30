@@ -597,6 +597,13 @@ def validate_write_access(
         rel_target = str(abs_target).replace("\\", "/")
     rel_target_norm = _normalize_rel_posix(rel_target)
 
+    tmp_root = manifest.get("allowed_tmp_root", "")
+    if isinstance(tmp_root, str) and tmp_root.strip():
+        tmp_norm = _normalize_rel_posix(tmp_root.strip())
+        tmp_prefix = tmp_norm + "/"
+        if rel_target_norm == tmp_norm or rel_target_norm.startswith(tmp_prefix):
+            return HookDecision(action=HookDecisionAction.ALLOW)
+
     allowed_file_tool_paths_obj = manifest.get("allowed_file_tool_paths")
     if not isinstance(allowed_file_tool_paths_obj, list):
         return HookDecision(

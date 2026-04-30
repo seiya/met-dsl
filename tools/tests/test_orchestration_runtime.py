@@ -1065,6 +1065,71 @@ shell_tool                       stable             true
             self.assertIn("agent_run_id: substep_run_plan_generate_001", summary_text)
             self.assertIn("output_refs:", summary_text)
 
+    def test_record_launch_strips_child_agent_run_id_for_tmp_and_manifest_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            init_orchestration(repo_root=repo_root, orchestration_id="orch_001")
+            write_preflight(
+                repo_root=repo_root,
+                orchestration_id="orch_001",
+                payload={
+                    "status": "pass",
+                    "sandbox_runtime": "bwrap",
+                    "sandbox_enforced": True,
+                    "can_launch_step_agents": True,
+                    "can_launch_substep_agents": True,
+                    "feature_states": {"multi_agent": True, "codex_hooks": True},
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}],
+                },
+            )
+            record_launch(
+                repo_root=repo_root,
+                orchestration_id="orch_001",
+                parent_agent_run_id="orch_run_001",
+                child_agent_run_id="  substep_run_strip_001  ",
+                request_payload={
+                    "agent_run_id": "substep_run_strip_001",
+                    "agent_role": "substep",
+                    "node_key": "problem/shallow_water2d@0.3.0",
+                    "step": "plan",
+                    "substep": "generate",
+                    "orchestration_id": "orch_001",
+                    "parent_agent_run_id": "orch_run_001",
+                    "plan_ref": "workspace/plans/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001",
+                    "pipeline_ref": "workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001",
+                    "dependency_ref": "workspace/plans/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/dependency.resolved.yaml",
+                    "skill_name": "workflow-plan-generate",
+                    "skill_ref": "skills/workflow-plan-generate/SKILL.md",
+                    "skill_must_read_refs": "",
+                    "allowed_output_paths": [
+                        "workspace/plans/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/case.resolved.yaml",
+                    ],
+                    "launch_prompt_full": _substep_launch_prompt(
+                        "problem/shallow_water2d@0.3.0",
+                        "plan",
+                        "generate",
+                        "substep_run_strip_001",
+                    ),
+                },
+                response_payload={
+                    "agent_run_id": "substep_run_strip_001",
+                    **_spawn_response_payload("sess_substep_strip"),
+                },
+            )
+            ok_manifest = (
+                repo_root
+                / "workspace/orchestrations/orch_001/output_manifests/substep_run_strip_001.json"
+            )
+            spaced_manifest = (
+                repo_root
+                / "workspace/orchestrations/orch_001/output_manifests/  substep_run_strip_001  .json"
+            )
+            self.assertTrue(ok_manifest.exists())
+            self.assertFalse(spaced_manifest.exists())
+            manifest = json.loads(ok_manifest.read_text(encoding="utf-8"))
+            self.assertEqual(manifest.get("allowed_tmp_root"), "workspace/tmp/substep_run_strip_001")
+            self.assertTrue((repo_root / "workspace/tmp/substep_run_strip_001").is_dir())
+
     def test_record_launch_prefers_prompt_over_launch_prompt_summary(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
@@ -6647,6 +6712,14 @@ class TestPhase1RuleSourceAudit(unittest.TestCase):
             self.assertEqual(policy.get("denied_read_roots"), ["tools/"])
             self.assertIn("docs/", policy.get("allowed_read_roots", []))
             self.assertIn("spec/", policy.get("allowed_read_roots", []))
+            self.assertIn(
+                "workspace/tmp/substep_p1_001/",
+                policy.get("allowed_read_roots", []),
+            )
+            self.assertNotIn(
+                "workspace/tmp/",
+                policy.get("allowed_read_roots", []),
+            )
             self.assertIn(
                 _FIX_PLAN_REF.rstrip("/") + "/",
                 policy.get("allowed_read_roots", []),

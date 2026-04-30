@@ -7,6 +7,7 @@ import argparse
 import json
 import os
 import re
+import shutil
 import shlex
 import subprocess
 import sys
@@ -582,6 +583,13 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 2
 
+    tmp_parent = repo_root / "workspace" / "tmp"
+    tmp_parent.mkdir(parents=True, exist_ok=True)
+    # TMPDIR must match output_manifest.allowed_tmp_root for the active agent (orchestration uses
+    # workspace/tmp/<orchestration_agent_run_id>). Set only after init returns that id; cleanup only
+    # that directory so concurrent workflows' workspace/tmp/<other_agent_run_id>/ are untouched.
+    orchestration_tmp_for_cleanup: Path | None = None
+
     env = dict(os.environ)
     env["METDSL_WORKFLOW_MODE"] = "1"
     env["METDSL_ORCHESTRATION_ID"] = orchestration_id
@@ -589,197 +597,216 @@ def main(argv: list[str] | None = None) -> int:
     env["METDSL_MISSING_ORCHESTRATION_ID_POLICY"] = "strict"
     env["PYTHONPATH"] = str(repo_root) + (f":{env['PYTHONPATH']}" if env.get("PYTHONPATH") else "")
 
-    init_args = [
-        "init",
-        "--repo-root",
-        str(repo_root),
-        "--orchestration-id",
-        orchestration_id,
-        "--spec-ref",
-        spec_ref,
-        "--status",
-        args.status,
-        "--agent-backend",
-        args.llm,
-    ]
-    if isinstance(dependency_ref, str) and dependency_ref.strip():
-        init_args.extend(["--dependency-ref", dependency_ref])
     try:
-        init_result = _runtime_command(repo_root, env, init_args).payload
-        orchestration_agent_run_id = str(init_result.get("orchestration_agent_run_id", "")).strip()
-        preflight_result = _runtime_command(
-            repo_root,
-            env,
-            [
-                "preflight",
-                "--repo-root",
-                str(repo_root),
-                "--orchestration-id",
-                orchestration_id,
-                "--backend",
-                args.llm,
-                "--agent-command",
-                llm_command,
-            ],
-        ).payload
-    except RuntimeError as exc:
-        print(
-            json.dumps(
-                {
-                    "status": "fail",
-                    "reason": "runtime_command_failed",
-                    "detail": str(exc),
-                    "orchestration_id": orchestration_id,
-                },
-                ensure_ascii=False,
-            )
-        )
-        return 2
-    passed, detail = _ensure_preflight_pass(preflight_result)
-    if not passed:
-        _runtime_command(
-            repo_root,
-            env,
-            [
-                "set-status",
-                "--repo-root",
-                str(repo_root),
-                "--orchestration-id",
-                orchestration_id,
-                "--status",
-                "fail",
-                "--reason-code",
-                "preflight_failed",
-                "--reason-detail",
-                detail,
-                "--blocking-policy-scope",
-                "preflight",
-            ],
-        )
-        print(
-            json.dumps(
-                {
-                    "status": "fail",
-                    "reason": "preflight_failed",
-                    "detail": detail,
-                    "orchestration_id": orchestration_id,
-                },
-                ensure_ascii=False,
-            )
-        )
-        return 2
-
-    prompt_text = _build_orchestration_prompt(
-        orchestration_id=orchestration_id,
-        orchestration_agent_run_id=orchestration_agent_run_id,
-        spec_ref=spec_ref,
-        dependency_ref=dependency_ref,
-        until_phase=until_phase,
-        workflow_mode=workflow_mode,
-    )
-    prompt_path = (
-        repo_root
-        / "workspace"
-        / "orchestrations"
-        / orchestration_id
-        / "launches"
-        / "orchestration.start.prompt.txt"
-    )
-    prompt_path.parent.mkdir(parents=True, exist_ok=True)
-    prompt_path.write_text(prompt_text, encoding="utf-8")
-
-    launched = False
-    workflow_status = "running"
-    if args.invoke_llm:
-        launch_command, launch_input = _launch_command_and_input(
-            llm=args.llm,
-            llm_command=llm_command,
-            prompt_text=prompt_text,
-        )
-        proc = subprocess.run(
-            launch_command,
-            cwd=repo_root,
-            env=env,
-            text=True,
-            input=launch_input,
-            check=False,
-        )
-        launched = proc.returncode == 0
-        meta_after_launch = _read_json_if_exists(
-            repo_root / "workspace" / "orchestrations" / orchestration_id / "orchestration_meta.json"
-        )
-        if isinstance(meta_after_launch, dict):
-            workflow_status = str(meta_after_launch.get("status") or "running")
-        if workflow_mode == "dev":
-            severe_verify_issue = _detect_non_minor_verify_issue(repo_root, orchestration_id)
-            if severe_verify_issue is not None:
-                try:
-                    _runtime_command(
-                        repo_root,
-                        env,
-                        [
-                            "set-status",
-                            "--repo-root",
-                            str(repo_root),
-                            "--orchestration-id",
-                            orchestration_id,
-                            "--status",
-                            "fail",
-                            "--reason-code",
-                            "verify_issue_severity_violation",
-                            "--reason-detail",
-                            (
-                                "verify substep severity must be minor in dev mode: "
-                                f"{severe_verify_issue['issue_severity']} ({severe_verify_issue['step_result_ref']})"
-                            ),
-                            "--blocking-policy-scope",
-                            "verify",
-                        ],
-                    )
-                    workflow_status = "fail"
-                except RuntimeError:
-                    workflow_status = "fail"
-        if proc.returncode != 0 or workflow_status.lower() in {"fail", "fail_closed", "blocked", "timeout", "cancel"}:
-            if workflow_mode == "dev":
-                analysis = _collect_failure_analysis(repo_root, orchestration_id)
-                analysis_ref = _write_failure_analysis(repo_root, orchestration_id, analysis)
-                print(
-                    json.dumps(
-                        {
-                            "status": "fail",
-                            "reason": "workflow_failed",
-                            "detail": analysis.get("reason_detail") or "workflow execution failed",
-                            "orchestration_id": orchestration_id,
-                            "workflow_mode": workflow_mode,
-                            "workflow_status": workflow_status,
-                            "analysis_ref": analysis_ref,
-                        },
-                        ensure_ascii=False,
-                    )
+        init_args = [
+            "init",
+            "--repo-root",
+            str(repo_root),
+            "--orchestration-id",
+            orchestration_id,
+            "--spec-ref",
+            spec_ref,
+            "--status",
+            args.status,
+            "--agent-backend",
+            args.llm,
+        ]
+        if isinstance(dependency_ref, str) and dependency_ref.strip():
+            init_args.extend(["--dependency-ref", dependency_ref])
+        try:
+            init_result = _runtime_command(repo_root, env, init_args).payload
+            orchestration_agent_run_id = str(init_result.get("orchestration_agent_run_id", "")).strip()
+            if not orchestration_agent_run_id:
+                raise RuntimeError(
+                    "runtime command failed (init): missing orchestration_agent_run_id in init result"
                 )
-                return 2
-            return proc.returncode if proc.returncode != 0 else 2
+            orch_tmp = tmp_parent / orchestration_agent_run_id
+            orch_tmp.mkdir(parents=True, exist_ok=True)
+            env["TMPDIR"] = str(orch_tmp)
+            orchestration_tmp_for_cleanup = orch_tmp
 
-    print(
-        json.dumps(
-            {
-                "status": "ok",
-                "orchestration_id": orchestration_id,
-                "llm": args.llm,
-                "llm_command": llm_command,
-                "target_spec_ref": args.spec_ref,
-                "until_phase": until_phase,
-                "workflow_mode": workflow_mode,
-                "metdsl_workflow_mode": env["METDSL_WORKFLOW_MODE"],
-                "metdsl_workflow_exec_mode": env["METDSL_WORKFLOW_EXEC_MODE"],
-                "workflow_status": workflow_status,
-                "prompt_ref": str(prompt_path.relative_to(repo_root)),
-                "llm_invoked": launched,
-            },
-            ensure_ascii=False,
+            preflight_result = _runtime_command(
+                repo_root,
+                env,
+                [
+                    "preflight",
+                    "--repo-root",
+                    str(repo_root),
+                    "--orchestration-id",
+                    orchestration_id,
+                    "--backend",
+                    args.llm,
+                    "--agent-command",
+                    llm_command,
+                ],
+            ).payload
+        except RuntimeError as exc:
+            print(
+                json.dumps(
+                    {
+                        "status": "fail",
+                        "reason": "runtime_command_failed",
+                        "detail": str(exc),
+                        "orchestration_id": orchestration_id,
+                    },
+                    ensure_ascii=False,
+                )
+            )
+            return 2
+        passed, detail = _ensure_preflight_pass(preflight_result)
+        if not passed:
+            _runtime_command(
+                repo_root,
+                env,
+                [
+                    "set-status",
+                    "--repo-root",
+                    str(repo_root),
+                    "--orchestration-id",
+                    orchestration_id,
+                    "--status",
+                    "fail",
+                    "--reason-code",
+                    "preflight_failed",
+                    "--reason-detail",
+                    detail,
+                    "--blocking-policy-scope",
+                    "preflight",
+                ],
+            )
+            print(
+                json.dumps(
+                    {
+                        "status": "fail",
+                        "reason": "preflight_failed",
+                        "detail": detail,
+                        "orchestration_id": orchestration_id,
+                    },
+                    ensure_ascii=False,
+                )
+            )
+            return 2
+
+        prompt_text = _build_orchestration_prompt(
+            orchestration_id=orchestration_id,
+            orchestration_agent_run_id=orchestration_agent_run_id,
+            spec_ref=spec_ref,
+            dependency_ref=dependency_ref,
+            until_phase=until_phase,
+            workflow_mode=workflow_mode,
         )
-    )
-    return 0
+        prompt_path = (
+            repo_root
+            / "workspace"
+            / "orchestrations"
+            / orchestration_id
+            / "launches"
+            / "orchestration.start.prompt.txt"
+        )
+        prompt_path.parent.mkdir(parents=True, exist_ok=True)
+        prompt_path.write_text(prompt_text, encoding="utf-8")
+
+        launched = False
+        workflow_status = "running"
+        if args.invoke_llm:
+            launch_command, launch_input = _launch_command_and_input(
+                llm=args.llm,
+                llm_command=llm_command,
+                prompt_text=prompt_text,
+            )
+            proc = subprocess.run(
+                launch_command,
+                cwd=repo_root,
+                env=env,
+                text=True,
+                input=launch_input,
+                check=False,
+            )
+            launched = proc.returncode == 0
+            meta_after_launch = _read_json_if_exists(
+                repo_root / "workspace" / "orchestrations" / orchestration_id / "orchestration_meta.json"
+            )
+            if isinstance(meta_after_launch, dict):
+                workflow_status = str(meta_after_launch.get("status") or "running")
+            if workflow_mode == "dev":
+                severe_verify_issue = _detect_non_minor_verify_issue(repo_root, orchestration_id)
+                if severe_verify_issue is not None:
+                    try:
+                        _runtime_command(
+                            repo_root,
+                            env,
+                            [
+                                "set-status",
+                                "--repo-root",
+                                str(repo_root),
+                                "--orchestration-id",
+                                orchestration_id,
+                                "--status",
+                                "fail",
+                                "--reason-code",
+                                "verify_issue_severity_violation",
+                                "--reason-detail",
+                                (
+                                    "verify substep severity must be minor in dev mode: "
+                                    f"{severe_verify_issue['issue_severity']} ({severe_verify_issue['step_result_ref']})"
+                                ),
+                                "--blocking-policy-scope",
+                                "verify",
+                            ],
+                        )
+                        workflow_status = "fail"
+                    except RuntimeError:
+                        workflow_status = "fail"
+            if proc.returncode != 0 or workflow_status.lower() in {
+                "fail",
+                "fail_closed",
+                "blocked",
+                "timeout",
+                "cancel",
+            }:
+                if workflow_mode == "dev":
+                    analysis = _collect_failure_analysis(repo_root, orchestration_id)
+                    analysis_ref = _write_failure_analysis(repo_root, orchestration_id, analysis)
+                    print(
+                        json.dumps(
+                            {
+                                "status": "fail",
+                                "reason": "workflow_failed",
+                                "detail": analysis.get("reason_detail") or "workflow execution failed",
+                                "orchestration_id": orchestration_id,
+                                "workflow_mode": workflow_mode,
+                                "workflow_status": workflow_status,
+                                "analysis_ref": analysis_ref,
+                            },
+                            ensure_ascii=False,
+                        )
+                    )
+                    return 2
+                return proc.returncode if proc.returncode != 0 else 2
+
+        print(
+            json.dumps(
+                {
+                    "status": "ok",
+                    "orchestration_id": orchestration_id,
+                    "llm": args.llm,
+                    "llm_command": llm_command,
+                    "target_spec_ref": args.spec_ref,
+                    "until_phase": until_phase,
+                    "workflow_mode": workflow_mode,
+                    "metdsl_workflow_mode": env["METDSL_WORKFLOW_MODE"],
+                    "metdsl_workflow_exec_mode": env["METDSL_WORKFLOW_EXEC_MODE"],
+                    "workflow_status": workflow_status,
+                    "prompt_ref": str(prompt_path.relative_to(repo_root)),
+                    "llm_invoked": launched,
+                },
+                ensure_ascii=False,
+            )
+        )
+        return 0
+    finally:
+        if orchestration_tmp_for_cleanup is not None and orchestration_tmp_for_cleanup.exists():
+            shutil.rmtree(orchestration_tmp_for_cleanup, ignore_errors=True)
 
 
 if __name__ == "__main__":

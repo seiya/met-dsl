@@ -1821,6 +1821,7 @@ def _write_allowed_output_manifest(
     allowed_output_paths: Sequence[str],
     allowed_file_tool_paths: Sequence[str] | None = None,
     agent_role: str | None = None,
+    allowed_tmp_root: str | None = None,
 ) -> str:
     normalized = [
         _normalize_rel_posix(p)
@@ -1839,6 +1840,8 @@ def _write_allowed_output_manifest(
         "allowed_file_tool_paths": sorted(set(file_tool_normalized)),
         "generated_at": _utc_now_iso(),
     }
+    if isinstance(allowed_tmp_root, str) and allowed_tmp_root.strip():
+        payload["allowed_tmp_root"] = _normalize_rel_posix(allowed_tmp_root.strip())
     if isinstance(agent_role, str) and agent_role.strip():
         payload["agent_role"] = agent_role.strip()
     out_path = _allowed_output_manifest_path(repo_root, orchestration_id, agent_run_id)
@@ -1879,6 +1882,12 @@ def _validate_paths_against_allowed_output_manifest(
     allowed = {_normalize_rel_posix(str(p)) for p in allowed_obj if isinstance(p, str) and str(p).strip()}
     if not allowed:
         raise ValueError("allowed_output_paths manifest must include non-empty allowed_output_paths")
+    tmp_root_raw = manifest.get("allowed_tmp_root", "")
+    tmp_norm = ""
+    tmp_prefix = ""
+    if isinstance(tmp_root_raw, str) and tmp_root_raw.strip():
+        tmp_norm = _normalize_rel_posix(tmp_root_raw.strip())
+        tmp_prefix = tmp_norm + "/"
     denied: list[str] = []
     invalid_paths: list[str] = []
     for raw in paths:
@@ -1887,6 +1896,8 @@ def _validate_paths_against_allowed_output_manifest(
             invalid_paths.append(str(raw))
             continue
         if rel in allowed:
+            continue
+        if tmp_prefix and (rel == tmp_norm or rel.startswith(tmp_prefix)):
             continue
         denied.append(rel)
     if denied or invalid_paths:
@@ -2189,6 +2200,7 @@ def build_access_policy_payload(
     allowed_read_roots = [
         "docs/",
         "spec/",
+        _with_trailing_slash(_normalize_rel_posix(f"workspace/tmp/{agent_run_id.strip()}")),
         _with_trailing_slash(_normalize_rel_posix(plan_ref)),
         _with_trailing_slash(_normalize_rel_posix(pipeline_ref)),
     ]
@@ -2348,6 +2360,10 @@ def build_bwrap_profile(
     sandbox_root = _orchestration_root(repo_root, orchestration_id) / "sandboxes" / agent_run_id
     tmp_root = sandbox_root / "tmp"
     tmp_root.mkdir(parents=True, exist_ok=True)
+    workspace_tmp_host = (repo_root / "workspace" / "tmp" / agent_run_id).resolve()
+    workspace_tmp_host.mkdir(parents=True, exist_ok=True)
+    child_env = _safe_host_env_for_child()
+    child_env["TMPDIR"] = str(workspace_tmp_host)
     return {
         "orchestration_id": orchestration_id,
         "agent_run_id": agent_run_id,
@@ -2358,8 +2374,9 @@ def build_bwrap_profile(
         "write_roots": write_roots,
         "runtime_ro_bind_paths": _runtime_ro_bind_paths(),
         "tmp_dir": str(tmp_root),
+        "workspace_tmp_rw_abs": str(workspace_tmp_host),
         "workdir": str(repo_root),
-        "env": _safe_host_env_for_child(),
+        "env": child_env,
         "generated_at": _utc_now_iso(),
     }
 
@@ -2407,6 +2424,15 @@ def render_bwrap_command(
             continue
         abs_token = str(abs_path)
         cmd.extend(["--bind", abs_token, abs_token])
+    ws_rw = str(profile.get("workspace_tmp_rw_abs") or "").strip()
+    if not ws_rw:
+        raise ValueError("profile must include workspace_tmp_rw_abs")
+    ws_path = Path(ws_rw)
+    if not ws_path.is_dir():
+        raise ValueError(f"workspace_tmp_rw_abs must be existing directory: {ws_rw}")
+    ws_abs = str(ws_path.resolve())
+    cmd.extend(["--bind", ws_abs, ws_abs])
+    cmd.extend(["--setenv", "TMPDIR", ws_abs])
     cmd.extend(["--bind", tmp_dir, tmp_dir])
     cmd.append("--")
     cmd.extend([str(part) for part in command_argv])
@@ -5591,6 +5617,7 @@ def init_orchestration(
 ) -> dict[str, Any]:
     root = _orchestration_root(repo_root, orchestration_id)
     root.mkdir(parents=True, exist_ok=True)
+    (repo_root / "workspace" / "tmp").mkdir(parents=True, exist_ok=True)
     (root / "launches").mkdir(parents=True, exist_ok=True)
     (root / "agents").mkdir(parents=True, exist_ok=True)
     (root / "steps").mkdir(parents=True, exist_ok=True)
@@ -5648,7 +5675,9 @@ def init_orchestration(
             f"workspace/orchestrations/{orchestration_id}/failure_analysis.json",
         ],
         agent_role="orchestration",
+        allowed_tmp_root=f"workspace/tmp/{orchestration_agent_run_id}",
     )
+    (repo_root / "workspace" / "tmp" / orchestration_agent_run_id).mkdir(parents=True, exist_ok=True)
 
     graph_path = root / "agent_graph.json"
     if not graph_path.exists():
@@ -5776,6 +5805,9 @@ def record_launch(
     response_payload: dict[str, Any],
     relation_type: str = "launch",
 ) -> dict[str, Any]:
+    if not isinstance(child_agent_run_id, str) or not child_agent_run_id.strip():
+        raise ValueError("record-launch requires non-empty child_agent_run_id")
+    child_agent_run_id = child_agent_run_id.strip()
     preflight_payload: dict[str, Any] | None = None
     try:
         preflight_payload = _require_preflight_launchable(
@@ -5990,12 +6022,14 @@ def record_launch(
             capability_doc=cap_doc,
             allowed_output_paths=allowed_output_paths,
         )
+        (repo_root / "workspace" / "tmp" / child_agent_run_id).mkdir(parents=True, exist_ok=True)
         manifest_ref = _write_allowed_output_manifest(
             repo_root,
             orchestration_id=orchestration_id,
             agent_run_id=child_agent_run_id,
             allowed_output_paths=allowed_output_paths,
             allowed_file_tool_paths=allowed_file_tool_paths,
+            allowed_tmp_root=f"workspace/tmp/{child_agent_run_id}",
         )
         out_refs["allowed_output_manifest_ref"] = manifest_ref
         try:
@@ -6256,6 +6290,10 @@ def record_agent_run(
                 )
             if backend_token == "claude":
                 _active_child_agent_run_id_path(repo_root, orchestration_id).unlink(missing_ok=True)
+
+    agent_tmp = repo_root / "workspace" / "tmp" / agent_run_id
+    if agent_tmp.exists():
+        shutil.rmtree(agent_tmp, ignore_errors=True)
 
     return payload
 
