@@ -41,19 +41,51 @@ class RunWorkflowTests(unittest.TestCase):
             self.assertEqual(decisions[0].get("repair_strategy"), "restart")
             self.assertIn("unauthorized_write_violation", str(decisions[0].get("repair_reason")))
 
-    def test_spec_ref_matches_directory_and_file_path(self) -> None:
-        self.assertTrue(run_workflow._spec_ref_matches("spec/problem", "spec/problem/test.md"))
-        self.assertTrue(run_workflow._spec_ref_matches("spec/problem/test.md", "spec/problem"))
-        self.assertTrue(
-            run_workflow._spec_ref_matches(
-                "spec/problem/controlled_spec.md",
-                "spec/problem/test.md",
-            )
-        )
+    def test_discover_dependency_ref_from_file_spec_ref(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            spec_dir = repo_root / "spec" / "problem"
+            spec_dir.mkdir(parents=True, exist_ok=True)
+            (spec_dir / "test.md").write_text("spec\n", encoding="utf-8")
+            (spec_dir / "deps.yaml").write_text("nodes: []\n", encoding="utf-8")
 
-    def test_spec_ref_matches_distinguishes_other_directories(self) -> None:
-        self.assertFalse(run_workflow._spec_ref_matches("spec/problem", "spec/another/test.md"))
-        self.assertFalse(run_workflow._spec_ref_matches("spec/problem/test.md", "spec/another"))
+            dep_ref = run_workflow._discover_dependency_ref(repo_root, "spec/problem/test.md")
+            self.assertEqual(dep_ref, "spec/problem/deps.yaml")
+
+    def test_discover_dependency_ref_from_directory_spec_ref(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            spec_dir = repo_root / "spec" / "problem"
+            spec_dir.mkdir(parents=True, exist_ok=True)
+            (spec_dir / "deps.yaml").write_text("nodes: []\n", encoding="utf-8")
+
+            dep_ref = run_workflow._discover_dependency_ref(repo_root, "spec/problem")
+            self.assertEqual(dep_ref, "spec/problem/deps.yaml")
+
+    def test_discover_dependency_ref_from_spec_root_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            spec_dir = repo_root / "spec"
+            spec_dir.mkdir(parents=True, exist_ok=True)
+            (spec_dir / "task.md").write_text("spec\n", encoding="utf-8")
+            (spec_dir / "deps.yaml").write_text("nodes: []\n", encoding="utf-8")
+
+            dep_ref = run_workflow._discover_dependency_ref(repo_root, "spec/task.md")
+            self.assertEqual(dep_ref, "spec/deps.yaml")
+
+    def test_discover_dependency_ref_rejects_missing_deps_yaml(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            spec_dir = repo_root / "spec" / "problem"
+            spec_dir.mkdir(parents=True, exist_ok=True)
+            (spec_dir / "test.md").write_text("spec\n", encoding="utf-8")
+
+            with self.assertRaises(ValueError):
+                run_workflow._discover_dependency_ref(repo_root, "spec/problem/test.md")
+
+    def test_validate_dependency_ref_rejects_non_spec_deps_path(self) -> None:
+        with self.assertRaises(ValueError):
+            run_workflow._validate_dependency_ref("workspace/plans/x/dependency.resolved.yaml")
 
     def test_normalize_phase_accepts_known_values(self) -> None:
         self.assertEqual(run_workflow._normalize_phase("plan"), "Plan")
@@ -95,7 +127,7 @@ class RunWorkflowTests(unittest.TestCase):
             orchestration_id="orch_test",
             orchestration_agent_run_id="run_orch_001",
             spec_ref="spec/problem/sample.md",
-            dependency_ref="workspace/plans/sample/sample_20260424_001/dependency.resolved.yaml",
+            dependency_ref="spec/problem/deps.yaml",
             until_phase="Judge",
             workflow_mode="dev",
         )
@@ -104,7 +136,8 @@ class RunWorkflowTests(unittest.TestCase):
         self.assertIn("spec/problem/sample.md", text)
         self.assertIn("Judge", text)
         self.assertIn("workflow_mode: `dev`", text)
-        self.assertIn("dependency.resolved.yaml", text)
+        self.assertIn("dependency_ref: `spec/problem/deps.yaml`", text)
+        self.assertNotIn("(not specified)", text)
         self.assertIn("METDSL_WORKFLOW_MODE=1", text)
         self.assertIn("不足している場合は即停止", text)
         self.assertIn("issue_severity", text)
@@ -150,8 +183,7 @@ class RunWorkflowTests(unittest.TestCase):
             (repo_root / "workspace").mkdir(parents=True, exist_ok=True)
             (repo_root / "spec" / "problem").mkdir(parents=True, exist_ok=True)
             (repo_root / "spec" / "problem" / "test.md").write_text("spec\n", encoding="utf-8")
-            dep_ref = "workspace/plans/sample/sample_20260424_001/dependency.resolved.yaml"
-            (repo_root / dep_ref).parent.mkdir(parents=True, exist_ok=True)
+            dep_ref = "spec/problem/deps.yaml"
             (repo_root / dep_ref).write_text("nodes: []\n", encoding="utf-8")
 
             observed_calls: list[list[str]] = []
@@ -209,9 +241,6 @@ class RunWorkflowTests(unittest.TestCase):
     def test_main_fails_when_spec_ref_does_not_exist(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
-            dep_ref = "workspace/plans/sample/sample_20260424_001/dependency.resolved.yaml"
-            (repo_root / dep_ref).parent.mkdir(parents=True, exist_ok=True)
-            (repo_root / dep_ref).write_text("nodes: []\n", encoding="utf-8")
             code = run_workflow.main(
                 [
                     "spec/problem/missing.md",
@@ -232,8 +261,7 @@ class RunWorkflowTests(unittest.TestCase):
             (repo_root / "workspace").mkdir(parents=True, exist_ok=True)
             (repo_root / "spec" / "problem").mkdir(parents=True, exist_ok=True)
             (repo_root / "spec" / "problem" / "test.md").write_text("spec\n", encoding="utf-8")
-            dep_ref = "workspace/plans/sample/sample_20260424_001/dependency.resolved.yaml"
-            (repo_root / dep_ref).parent.mkdir(parents=True, exist_ok=True)
+            dep_ref = "spec/problem/deps.yaml"
             (repo_root / dep_ref).write_text("nodes: []\n", encoding="utf-8")
 
             def fake_runtime_command(root: Path, env: dict[str, str], args: list[str]) -> run_workflow.RuntimeResult:
@@ -274,8 +302,7 @@ class RunWorkflowTests(unittest.TestCase):
             (repo_root / "workspace").mkdir(parents=True, exist_ok=True)
             (repo_root / "spec" / "problem").mkdir(parents=True, exist_ok=True)
             (repo_root / "spec" / "problem" / "test.md").write_text("spec\n", encoding="utf-8")
-            dep_ref = "workspace/plans/sample/sample_20260424_001/dependency.resolved.yaml"
-            (repo_root / dep_ref).parent.mkdir(parents=True, exist_ok=True)
+            dep_ref = "spec/problem/deps.yaml"
             (repo_root / dep_ref).write_text("nodes: []\n", encoding="utf-8")
 
             def fake_runtime_command(root: Path, env: dict[str, str], args: list[str]) -> run_workflow.RuntimeResult:
@@ -321,8 +348,7 @@ class RunWorkflowTests(unittest.TestCase):
             (repo_root / "workspace").mkdir(parents=True, exist_ok=True)
             (repo_root / "spec" / "problem").mkdir(parents=True, exist_ok=True)
             (repo_root / "spec" / "problem" / "test.md").write_text("spec\n", encoding="utf-8")
-            dep_ref = "workspace/plans/sample/sample_20260424_001/dependency.resolved.yaml"
-            (repo_root / dep_ref).parent.mkdir(parents=True, exist_ok=True)
+            dep_ref = "spec/problem/deps.yaml"
             (repo_root / dep_ref).write_text("nodes: []\n", encoding="utf-8")
 
             def fake_runtime_command(root: Path, env: dict[str, str], args: list[str]) -> run_workflow.RuntimeResult:
@@ -363,8 +389,7 @@ class RunWorkflowTests(unittest.TestCase):
             (repo_root / "workspace").mkdir(parents=True, exist_ok=True)
             (repo_root / "spec" / "problem").mkdir(parents=True, exist_ok=True)
             (repo_root / "spec" / "problem" / "test.md").write_text("spec\n", encoding="utf-8")
-            dep_ref = "workspace/plans/sample/sample_20260424_001/dependency.resolved.yaml"
-            (repo_root / dep_ref).parent.mkdir(parents=True, exist_ok=True)
+            dep_ref = "spec/problem/deps.yaml"
             (repo_root / dep_ref).write_text("nodes: []\n", encoding="utf-8")
 
             def fake_runtime_command(root: Path, env: dict[str, str], args: list[str]) -> run_workflow.RuntimeResult:
@@ -418,34 +443,15 @@ class RunWorkflowTests(unittest.TestCase):
             self.assertIsInstance(analysis_ref, str)
             self.assertTrue((repo_root / str(analysis_ref)).exists())
 
-    def test_main_auto_resolves_dependency_ref_from_orchestration_meta(self) -> None:
+    def test_main_resolves_dependency_ref_from_spec_deps_yaml(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
             (repo_root / "tools").mkdir(parents=True, exist_ok=True)
             (repo_root / "workspace").mkdir(parents=True, exist_ok=True)
             (repo_root / "spec" / "problem").mkdir(parents=True, exist_ok=True)
             (repo_root / "spec" / "problem" / "test.md").write_text("spec\n", encoding="utf-8")
-            dep_ref = "workspace/plans/sample/sample_20260424_001/dependency.resolved.yaml"
-            (repo_root / dep_ref).parent.mkdir(parents=True, exist_ok=True)
+            dep_ref = "spec/problem/deps.yaml"
             (repo_root / dep_ref).write_text("nodes: []\n", encoding="utf-8")
-
-            prev_meta = repo_root / "workspace" / "orchestrations" / "orch_prev" / "orchestration_meta.json"
-            prev_meta.parent.mkdir(parents=True, exist_ok=True)
-            prev_meta.write_text(
-                json.dumps(
-                    {
-                        "orchestration_id": "orch_prev",
-                        "spec_ref": "spec/problem/test.md",
-                        "dependency_ref": dep_ref,
-                        "started_at": "2026-04-24T07:00:00Z",
-                        "finished_at": "2026-04-24T07:10:00Z",
-                    },
-                    ensure_ascii=False,
-                    indent=2,
-                )
-                + "\n",
-                encoding="utf-8",
-            )
 
             observed_calls: list[list[str]] = []
 
@@ -490,7 +496,7 @@ class RunWorkflowTests(unittest.TestCase):
             dep_idx = init_call.index("--dependency-ref") + 1
             self.assertEqual(init_call[dep_idx], dep_ref)
 
-    def test_main_allows_startup_without_dependency_ref(self) -> None:
+    def test_main_fails_when_dependency_ref_cannot_be_resolved(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
             (repo_root / "tools").mkdir(parents=True, exist_ok=True)
@@ -535,9 +541,8 @@ class RunWorkflowTests(unittest.TestCase):
             finally:
                 run_workflow._runtime_command = original_runtime  # type: ignore[assignment]
 
-            self.assertEqual(code, 0)
-            init_call = next(call for call in observed_calls if call[0] == "init")
-            self.assertNotIn("--dependency-ref", init_call)
+            self.assertEqual(code, 2)
+            self.assertFalse(observed_calls)
 
 
 if __name__ == "__main__":

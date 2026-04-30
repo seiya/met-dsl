@@ -6,7 +6,6 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import re
 import shutil
 import shlex
 import subprocess
@@ -15,7 +14,7 @@ import textwrap
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 from typing import Any
 
 SUPPORTED_LLMS = ("codex", "cursor", "claude")
@@ -109,16 +108,11 @@ def _build_orchestration_prompt(
     orchestration_id: str,
     orchestration_agent_run_id: str,
     spec_ref: str,
-    dependency_ref: str | None,
+    dependency_ref: str,
     until_phase: str,
     workflow_mode: str,
 ) -> str:
     phase_list = ", ".join(PHASE_ORDER[: PHASE_ORDER.index(until_phase) + 1])
-    dependency_line = (
-        f"- dependency_ref: `{dependency_ref}`"
-        if isinstance(dependency_ref, str) and dependency_ref.strip()
-        else "- dependency_ref: `(not specified)`"
-    )
     base = textwrap.dedent(
         f"""
         Workflow を起動する。
@@ -128,7 +122,7 @@ def _build_orchestration_prompt(
         - orchestration_agent_run_id: `{orchestration_agent_run_id}`
         - workflow_mode: `{workflow_mode}`
         - target_spec_ref: `{spec_ref}`
-        {dependency_line}
+        - dependency_ref: `{dependency_ref}`
         - target_phases: `{phase_list}`（終了 phase: `{until_phase}`）
 
         ## execution constraints
@@ -155,27 +149,6 @@ def _build_orchestration_prompt(
     return base
 
 
-def _normalize_spec_ref_token(token: str) -> str:
-    value = token.strip().replace("\\", "/").strip("/")
-    if value.endswith("/controlled_spec.md"):
-        return value[: -len("/controlled_spec.md")]
-    return value
-
-
-def _expand_spec_ref_tokens(token: str) -> set[str]:
-    normalized = _normalize_spec_ref_token(token)
-    if not normalized:
-        return set()
-    candidates = {normalized}
-    posix_path = PurePosixPath(normalized)
-    # Treat directory-style refs and file-style refs under it as equivalent.
-    if posix_path.suffix:
-        parent = posix_path.parent.as_posix()
-        if parent not in {"", "."}:
-            candidates.add(parent.strip("/"))
-    return candidates
-
-
 def _canonicalize_spec_ref(repo_root: Path, spec_ref: str) -> str:
     resolved = _resolve_existing_ref_path(repo_root, spec_ref, field_name="spec_ref")
     try:
@@ -185,110 +158,25 @@ def _canonicalize_spec_ref(repo_root: Path, spec_ref: str) -> str:
         return str(resolved)
 
 
-def _spec_ref_matches(lhs: str, rhs: str) -> bool:
-    lhs_candidates = _expand_spec_ref_tokens(lhs)
-    rhs_candidates = _expand_spec_ref_tokens(rhs)
-    return bool(lhs_candidates and rhs_candidates and (lhs_candidates & rhs_candidates))
+def _validate_dependency_ref(dependency_ref: str) -> str:
+    normalized = dependency_ref.strip().replace("\\", "/").strip("/")
+    if not normalized:
+        raise ValueError("dependency_ref must be non-empty")
+    if not (normalized.startswith("spec/") and normalized.endswith("/deps.yaml")):
+        raise ValueError("dependency_ref must match spec/.../deps.yaml")
+    return normalized
 
 
-def _parse_iso_like_ts(value: Any) -> str:
-    if not isinstance(value, str):
-        return ""
-    token = value.strip()
-    return token if token else ""
-
-
-def _pick_latest_by_meta(records: list[dict[str, str]]) -> str | None:
-    if not records:
-        return None
-
-    def _sort_key(item: dict[str, str]) -> tuple[str, str, str, str]:
-        return (
-            item.get("finished_at", ""),
-            item.get("resumed_at", ""),
-            item.get("started_at", ""),
-            item.get("orchestration_id", ""),
-        )
-
-    selected = max(records, key=_sort_key)
-    return selected.get("dependency_ref")
-
-
-def _extract_spec_identity_from_controlled_spec(spec_path: Path) -> tuple[str, str, str] | None:
+def _discover_dependency_ref(repo_root: Path, spec_ref: str) -> str:
+    spec_path = _resolve_existing_ref_path(repo_root, spec_ref, field_name="spec_ref")
+    dep_path = (spec_path / "deps.yaml") if spec_path.is_dir() else (spec_path.parent / "deps.yaml")
+    if not dep_path.exists():
+        raise ValueError(f"dependency_ref must exist: {dep_path}")
     try:
-        text = spec_path.read_text(encoding="utf-8")
-    except OSError:
-        return None
-    kind_match = re.search(r"-\s*`spec_kind`:\s*`([^`]+)`", text)
-    id_match = re.search(r"-\s*`spec_id`:\s*`([^`]+)`", text)
-    version_match = re.search(r"-\s*`spec_version`:\s*`([^`]+)`", text)
-    if not kind_match or not id_match or not version_match:
-        return None
-    spec_kind = kind_match.group(1).strip()
-    spec_id = id_match.group(1).strip()
-    spec_version = version_match.group(1).strip()
-    if not spec_kind or not spec_id or not spec_version:
-        return None
-    return spec_kind, spec_id, spec_version
-
-
-def _discover_dependency_ref(repo_root: Path, spec_ref: str) -> str | None:
-    spec_canonical = _canonicalize_spec_ref(repo_root, spec_ref)
-
-    orch_root = repo_root / "workspace" / "orchestrations"
-    candidates: list[dict[str, str]] = []
-    if orch_root.is_dir():
-        for meta_path in orch_root.glob("*/orchestration_meta.json"):
-            payload = _read_json_if_exists(meta_path)
-            if not isinstance(payload, dict):
-                continue
-            meta_spec_ref = payload.get("spec_ref")
-            dep_ref = payload.get("dependency_ref")
-            if not isinstance(meta_spec_ref, str) or not meta_spec_ref.strip():
-                continue
-            if not isinstance(dep_ref, str) or not dep_ref.strip():
-                continue
-            dep_ref_token = dep_ref.strip()
-            dep_path = repo_root / dep_ref_token
-            if not dep_path.exists():
-                continue
-            if not _spec_ref_matches(spec_canonical, meta_spec_ref):
-                continue
-            candidates.append(
-                {
-                    "orchestration_id": str(payload.get("orchestration_id", meta_path.parent.name)),
-                    "dependency_ref": dep_ref_token,
-                    "started_at": _parse_iso_like_ts(payload.get("started_at")),
-                    "resumed_at": _parse_iso_like_ts(payload.get("resumed_at")),
-                    "finished_at": _parse_iso_like_ts(payload.get("finished_at")),
-                }
-            )
-    selected = _pick_latest_by_meta(candidates)
-    if selected:
-        return selected
-
-    # Single-candidate fallback for bootstrap usability.
-    global_dep_candidates = sorted((repo_root / "workspace" / "plans").glob("*/*/dependency.resolved.yaml"))
-    if len(global_dep_candidates) == 1:
-        return str(global_dep_candidates[0].relative_to(repo_root)).replace("\\", "/")
-
-    spec_path = (repo_root / spec_canonical).resolve()
-    controlled_spec_path = spec_path
-    if controlled_spec_path.is_dir():
-        controlled_spec_path = controlled_spec_path / "controlled_spec.md"
-    identity = _extract_spec_identity_from_controlled_spec(controlled_spec_path)
-    if identity is None:
-        return None
-    spec_kind, spec_id, spec_version = identity
-    node_safe = f"{spec_kind}__{spec_id}__{spec_version}"
-    plan_root = repo_root / "workspace" / "plans" / node_safe
-    if not plan_root.is_dir():
-        return None
-    dep_paths = sorted(plan_root.glob("*/dependency.resolved.yaml"))
-    if not dep_paths:
-        return None
-    latest = dep_paths[-1]
-    return str(latest.relative_to(repo_root)).replace("\\", "/")
+        dep_ref = dep_path.relative_to(repo_root).as_posix()
+    except ValueError as exc:
+        raise ValueError(f"dependency_ref must be under repo root: {dep_path}") from exc
+    return _validate_dependency_ref(dep_ref)
 
 
 def _read_json_if_exists(path: Path) -> dict[str, Any] | None:
@@ -568,8 +456,6 @@ def main(argv: list[str] | None = None) -> int:
         llm_command = args.llm_command or DEFAULT_LLM_COMMANDS[args.llm]
         spec_ref = _canonicalize_spec_ref(repo_root, args.spec_ref)
         dependency_ref = _discover_dependency_ref(repo_root, spec_ref)
-        if isinstance(dependency_ref, str) and dependency_ref.strip():
-            _resolve_existing_ref_path(repo_root, dependency_ref, field_name="dependency_ref")
     except ValueError as exc:
         print(
             json.dumps(
@@ -611,8 +497,7 @@ def main(argv: list[str] | None = None) -> int:
             "--agent-backend",
             args.llm,
         ]
-        if isinstance(dependency_ref, str) and dependency_ref.strip():
-            init_args.extend(["--dependency-ref", dependency_ref])
+        init_args.extend(["--dependency-ref", dependency_ref])
         try:
             init_result = _runtime_command(repo_root, env, init_args).payload
             orchestration_agent_run_id = str(init_result.get("orchestration_agent_run_id", "")).strip()
