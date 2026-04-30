@@ -626,6 +626,120 @@ def _validate_write_targets(
     return HookDecision(action=HookDecisionAction.ALLOW)
 
 
+def _evaluate_pre_command_file_access_policy(
+    *,
+    decoded: Any,
+    repo_root: Path,
+    orchestration_id: str,
+    backend: str,
+) -> HookDecision | None:
+    tool_name = (decoded.tool_name or "").strip()
+    if decoded.event_name != HookEventName.PRE_COMMAND_EXECUTE:
+        return None
+    workflow_mode = os.environ.get("METDSL_WORKFLOW_MODE", "0").strip()
+
+    # step 1: apply_patch write guard
+    if tool_name == "apply_patch":
+        if workflow_mode != "1":
+            return None
+        patch_text = ""
+        decoded_tool_input = _tool_input(decoded.payload)
+        patch_value = decoded_tool_input.get("patch")
+        if not isinstance(patch_value, str):
+            patch_value = decoded_tool_input.get("patch_text")
+        if isinstance(patch_value, str):
+            patch_text = patch_value
+        apply_patch_paths = _extract_apply_patch_paths(patch_text)
+        resolved_run_id, resolution_error = _resolve_agent_run_id_for_file_tool(
+            backend=backend,
+            repo_root=repo_root,
+            orchestration_id=orchestration_id,
+            session_id=decoded.session_id,
+            agent_session_id=decoded.agent_session_id,
+            tool_name=tool_name,
+        )
+        if resolution_error is not None:
+            return resolution_error
+        if resolved_run_id is None:
+            return HookDecision(action=HookDecisionAction.ALLOW)
+        return _validate_write_targets(
+            repo_root=repo_root,
+            orchestration_id=orchestration_id,
+            agent_run_id=resolved_run_id,
+            targets=apply_patch_paths,
+            tool_name=tool_name,
+        )
+
+    # step 2: Write / Edit / Read file tool guard
+    if tool_name in {"Write", "Edit", "Read"}:
+        if workflow_mode != "1" or not decoded.file_path:
+            return HookDecision(action=HookDecisionAction.ALLOW)
+        resolved_run_id, resolution_error = _resolve_agent_run_id_for_file_tool(
+            backend=backend,
+            repo_root=repo_root,
+            orchestration_id=orchestration_id,
+            session_id=decoded.session_id,
+            agent_session_id=decoded.agent_session_id,
+            tool_name=tool_name,
+        )
+        if resolution_error is not None:
+            return resolution_error
+        if resolved_run_id is None:
+            return HookDecision(action=HookDecisionAction.ALLOW)
+        if tool_name == "Read":
+            return validate_read_access(
+                repo_root,
+                orchestration_id,
+                resolved_run_id,
+                decoded.file_path,
+            )
+        return _validate_write_targets(
+            repo_root=repo_root,
+            orchestration_id=orchestration_id,
+            agent_run_id=resolved_run_id,
+            targets=[decoded.file_path],
+            tool_name=tool_name,
+        )
+
+    # step 3: Bash read/write guard
+    if tool_name == "Bash":
+        common_decision = evaluate_common_policy(decoded)
+        if common_decision.action == HookDecisionAction.BLOCK:
+            return common_decision
+        if workflow_mode != "1":
+            return common_decision
+        write_targets = _detect_bash_write_targets(decoded.command)
+        if not write_targets:
+            return common_decision
+        resolved_run_id, resolution_error = _resolve_agent_run_id_for_file_tool(
+            backend=backend,
+            repo_root=repo_root,
+            orchestration_id=orchestration_id,
+            session_id=decoded.session_id,
+            agent_session_id=decoded.agent_session_id,
+            tool_name=tool_name,
+        )
+        if resolution_error is not None:
+            return resolution_error
+        if resolved_run_id is None:
+            return HookDecision(
+                action=HookDecisionAction.BLOCK,
+                reason=f"session-to-run mapping not found. {WRITE_HINT}",
+                continue_processing=False,
+            )
+        write_decision = _validate_write_targets(
+            repo_root=repo_root,
+            orchestration_id=orchestration_id,
+            agent_run_id=resolved_run_id,
+            targets=write_targets,
+            tool_name=tool_name,
+        )
+        if write_decision.action == HookDecisionAction.BLOCK:
+            return write_decision
+        return common_decision
+    return None
+
+
 def _emit_hook_response(
     exit_code: int,
     stdout_text: str,
@@ -734,111 +848,14 @@ def main(argv: list[str] | None = None) -> int:
             )
         else:
             decoded = adapter.decode_event(event_name.value, payload)
-            tool_name = (decoded.tool_name or "").strip()
-            if (
-                event_name == HookEventName.PRE_COMMAND_EXECUTE
-                and os.environ.get("METDSL_WORKFLOW_MODE", "0").strip() == "1"
-                and tool_name == "apply_patch"
-            ):
-                patch_text = ""
-                decoded_tool_input = _tool_input(decoded.payload)
-                patch_value = decoded_tool_input.get("patch")
-                if not isinstance(patch_value, str):
-                    patch_value = decoded_tool_input.get("patch_text")
-                if isinstance(patch_value, str):
-                    patch_text = patch_value
-                apply_patch_paths = _extract_apply_patch_paths(patch_text)
-                resolved_run_id, resolution_error = _resolve_agent_run_id_for_file_tool(
-                    backend=args.backend,
-                    repo_root=repo_root,
-                    orchestration_id=orchestration_id,
-                    session_id=decoded.session_id,
-                    agent_session_id=decoded.agent_session_id,
-                    tool_name=tool_name,
-                )
-                if resolution_error is not None:
-                    decision = resolution_error
-                elif resolved_run_id is None:
-                    decision = HookDecision(action=HookDecisionAction.ALLOW)
-                else:
-                    decision = _validate_write_targets(
-                        repo_root=repo_root,
-                        orchestration_id=orchestration_id,
-                        agent_run_id=resolved_run_id,
-                        targets=apply_patch_paths,
-                        tool_name=tool_name,
-                    )
-                _append_hook_audit(
-                    backend=args.backend,
-                    event_name=event_name,
-                    payload=payload,
-                    decision=decision,
-                    orchestration_id_override=orchestration_id,
-                )
-                exit_code, stdout_text = adapter.encode_decision(decision)
-                return _emit_hook_response(exit_code, stdout_text, event_name=event_name)
-            is_file_tool_pre = (
-                event_name == HookEventName.PRE_COMMAND_EXECUTE
-                and tool_name in {"Write", "Edit", "Read"}
+            decision = _evaluate_pre_command_file_access_policy(
+                decoded=decoded,
+                repo_root=repo_root,
+                orchestration_id=orchestration_id,
+                backend=args.backend,
             )
-            if not is_file_tool_pre:
+            if decision is None:
                 decision = evaluate_common_policy(decoded)
-                if (
-                    decision.action == HookDecisionAction.ALLOW
-                    and event_name == HookEventName.PRE_COMMAND_EXECUTE
-                    and tool_name == "Bash"
-                    and os.environ.get("METDSL_WORKFLOW_MODE", "0").strip() == "1"
-                    and args.backend == "claude"
-                ):
-                    active_path = _active_child_agent_run_id_path(repo_root, orchestration_id)
-                    if active_path.exists():
-                        active_id = active_path.read_text(encoding="utf-8").strip()
-                        if active_id:
-                            for target in _detect_bash_write_targets(decoded.command):
-                                cli_guard = check_cli_managed_path(repo_root, target)
-                                if cli_guard is not None:
-                                    decision = cli_guard
-                                    break
-                                candidate = validate_write_access(
-                                    repo_root, orchestration_id, active_id, target, tool_name=tool_name
-                                )
-                                if candidate.action == HookDecisionAction.BLOCK:
-                                    decision = candidate
-                                    break
-            else:
-                workflow_mode = os.environ.get("METDSL_WORKFLOW_MODE", "0").strip()
-                if workflow_mode != "1":
-                    decision = HookDecision(action=HookDecisionAction.ALLOW)
-                elif not decoded.file_path:
-                    decision = HookDecision(action=HookDecisionAction.ALLOW)
-                else:
-                    resolved_run_id, resolution_error = _resolve_agent_run_id_for_file_tool(
-                        backend=args.backend,
-                        repo_root=repo_root,
-                        orchestration_id=orchestration_id,
-                        session_id=decoded.session_id,
-                        agent_session_id=decoded.agent_session_id,
-                        tool_name=tool_name,
-                    )
-                    if resolution_error is not None:
-                        decision = resolution_error
-                    elif resolved_run_id is None:
-                        decision = HookDecision(action=HookDecisionAction.ALLOW)
-                    elif tool_name == "Read":
-                        decision = validate_read_access(
-                            repo_root,
-                            orchestration_id,
-                            resolved_run_id,
-                            decoded.file_path,
-                        )
-                    else:
-                        decision = _validate_write_targets(
-                            repo_root=repo_root,
-                            orchestration_id=orchestration_id,
-                            agent_run_id=resolved_run_id,
-                            targets=[decoded.file_path],
-                            tool_name=tool_name,
-                        )
         _append_hook_audit(
             backend=args.backend,
             event_name=event_name,

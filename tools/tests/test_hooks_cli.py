@@ -274,6 +274,45 @@ class HookCliTests(unittest.TestCase):
                 body = json.loads(out.getvalue().strip())
                 self.assertEqual(body.get("decision"), "block")
 
+    def test_apply_patch_outside_workflow_still_applies_common_policy(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            payload = {
+                "orchestration_id": "orch_apply_patch_common_policy_001",
+                "repo_root": str(repo_root),
+                "tool_name": "apply_patch",
+                "command": "git reset --hard HEAD~1",
+                "tool_input": {
+                    "patch": (
+                        "*** Begin Patch\n"
+                        "*** Add File: workspace/pipelines/safe/out.txt\n"
+                        "+x\n"
+                        "*** End Patch\n"
+                    )
+                },
+            }
+            out = io.StringIO()
+            with patch.dict(
+                os.environ,
+                {"METDSL_WORKFLOW_MODE": "0", "METDSL_REQUIRE_CODEX_HOOKS_FEATURE": "0"},
+                clear=False,
+            ):
+                with redirect_stdout(out):
+                    code = cli.main(
+                        [
+                            "--backend",
+                            "codex",
+                            "--event",
+                            "PreToolUse",
+                            "--input-json",
+                            json.dumps(payload),
+                        ]
+                    )
+            self.assertEqual(code, 2)
+            body = json.loads(out.getvalue().strip())
+            self.assertEqual(body.get("decision"), "block")
+            self.assertIn("git reset --hard", body.get("reason", ""))
+
     def test_allows_non_dangerous_command(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
@@ -718,6 +757,52 @@ class ClaudeHookCliTests(unittest.TestCase):
     def test_detect_bash_write_targets_detects_sed_inplace_when_i_comes_after_script(self) -> None:
         targets = cli._detect_bash_write_targets("sed -e 's/a/b/' -i file.txt")
         self.assertIn("file.txt", targets)
+
+    def test_bash_write_guard_blocks_for_codex_and_claude_when_agent_run_id_unresolved(self) -> None:
+        for backend in ("codex", "claude"):
+            with self.subTest(backend=backend):
+                with tempfile.TemporaryDirectory() as tmp:
+                    repo_root = Path(tmp)
+                    orch = f"orch_bash_guard_unresolved_{backend}"
+                    orch_root = repo_root / "workspace" / "orchestrations" / orch
+                    orch_root.mkdir(parents=True, exist_ok=True)
+                    payload = {
+                        "orchestration_id": orch,
+                        "repo_root": str(repo_root),
+                        "tool_name": "Bash",
+                        "session_id": "sess_missing_001",
+                        "tool_input": {"command": "echo hello > workspace/pipelines/safe/out.txt"},
+                    }
+                    out = io.StringIO()
+                    env = {"METDSL_WORKFLOW_MODE": "1"}
+                    if backend == "codex":
+                        env["METDSL_REQUIRE_CODEX_HOOKS_FEATURE"] = "0"
+                    with patch.dict(os.environ, env, clear=False):
+                        with redirect_stdout(out):
+                            code = cli.main(
+                                [
+                                    "--backend",
+                                    backend,
+                                    "--event",
+                                    "PreToolUse",
+                                    "--input-json",
+                                    json.dumps(payload),
+                                ]
+                            )
+                    self.assertEqual(code, 2)
+                    body = json.loads(out.getvalue().strip())
+                    self.assertEqual(body.get("decision"), "block")
+                    if backend == "codex":
+                        self.assertIn("session-to-run mapping not found", body.get("reason", ""))
+                    else:
+                        reason = body.get("reason", "")
+                        self.assertTrue(
+                            (
+                                "active child agent_run_id is empty" in reason
+                                or "no orchestration_agent_run_id found" in reason
+                            ),
+                            msg=reason,
+                        )
 
     def test_claude_backend_does_not_require_codex_hooks_feature(self) -> None:
         """Claude backend must not invoke the Codex feature probe at all."""
@@ -1473,6 +1558,50 @@ class ClaudeHookCliTests(unittest.TestCase):
                 ],
             )
             self.assertNotIn("patch", entry.get("payload_summary", {}))
+
+    def test_codex_raw_apply_patch_blocks_when_session_mapping_not_found(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            orch = "orch_apply_patch_guard_allow_unresolved"
+            orch_root = repo_root / "workspace" / "orchestrations" / orch
+            orch_root.mkdir(parents=True, exist_ok=True)
+            target_path = "workspace/pipelines/safe/case.resolved.yaml"
+            payload = {
+                "orchestration_id": orch,
+                "repo_root": str(repo_root),
+                "tool_name": "apply_patch",
+                "session_id": "sess_apply_patch_unresolved_001",
+                "tool_input": {
+                    "patch": (
+                        "*** Begin Patch\n"
+                        f"*** Add File: {target_path}\n"
+                        "+case: unresolved-allow\n"
+                        "*** End Patch\n"
+                    )
+                },
+            }
+            out = io.StringIO()
+            with patch.dict(
+                os.environ,
+                {"METDSL_WORKFLOW_MODE": "1", "METDSL_REQUIRE_CODEX_HOOKS_FEATURE": "0"},
+                clear=False,
+            ):
+                with redirect_stdout(out):
+                    code = cli.main(
+                        [
+                            "--backend",
+                            "codex",
+                            "--event",
+                            "PreToolUse",
+                            "--input-json",
+                            json.dumps(payload),
+                        ]
+                    )
+            self.assertEqual(code, 2)
+            body = json.loads(out.getvalue().strip())
+            self.assertEqual(body.get("decision"), "block")
+            self.assertIn("session-to-run mapping not found", body.get("reason", ""))
+            self.assertIn("guarded-apply-patch", body.get("reason", ""))
 
     def test_bash_audit_redacts_capability_token(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
