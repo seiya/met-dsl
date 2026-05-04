@@ -417,12 +417,191 @@ def _get_orchestration_agent_run_id(repo_root: Path, orchestration_id: str) -> s
 
 
 # shell redirection: cmd > path, cmd >> path
-_BASH_REDIRECT_RE = re.compile(r"(?:>>?)\s+([^\s;&|<>]+)")
+_BASH_REDIRECT_RE = re.compile(r"(?:>>?)\s+([^\s;&|<>)]+)")
 # tee: tee [-opts] path
 _BASH_TEE_RE = re.compile(r"\btee\b(?:\s+-\w+)*\s+([^\n;&|<>]+)")
 _REDIRECT_SKIP = frozenset({
     "/dev/null", "/dev/stderr", "/dev/stdout", "/dev/stdin", "1", "2",
 })
+# Patterns for stripping quoted string content before redirect detection.
+# Prevents false positives when CLI arguments like --reply-text "... > 0 ..." are scanned.
+_DOUBLE_QUOTED_RE = re.compile(r'"(?:[^"\\]|\\.)*"', re.DOTALL)
+_SINGLE_QUOTED_RE = re.compile(r"'[^']*'", re.DOTALL)
+
+
+def _strip_quoted_strings(cmd: str) -> str:
+    """Replace the content inside shell quotes with spaces to prevent redirect false-positives."""
+    cmd = _DOUBLE_QUOTED_RE.sub(lambda m: '"' + " " * (len(m.group()) - 2) + '"', cmd)
+    cmd = _SINGLE_QUOTED_RE.sub(lambda m: "'" + " " * (len(m.group()) - 2) + "'", cmd)
+    return cmd
+
+
+def _skip_single_quoted(s: str, i: int) -> int:
+    """Advance past a single-quoted string starting after the opening quote."""
+    n = len(s)
+    while i < n and s[i] != "'":
+        i += 1
+    return i + 1 if i < n else i
+
+
+def _skip_double_quoted(s: str, i: int) -> int:
+    """Advance past a double-quoted string starting after the opening quote.
+    Does NOT recurse into $() / backticks — callers handle those separately.
+    """
+    n = len(s)
+    while i < n and s[i] != '"':
+        if s[i] == "\\" and i + 1 < n:
+            i += 2
+        else:
+            i += 1
+    return i + 1 if i < n else i
+
+
+def _scan_backtick(s: str, start: int) -> tuple[str, int]:
+    """Return (body, index_after_closing_backtick) for a `...` substitution."""
+    i = start
+    n = len(s)
+    while i < n and s[i] != "`":
+        if s[i] == "\\" and i + 1 < n:
+            i += 2
+        else:
+            i += 1
+    return s[start:i], (i + 1 if i < n else i)
+
+
+def _scan_arithmetic_expansion(s: str, start: int) -> tuple[list[str], int]:
+    """Advance past $((...)) starting after the two opening '((' chars.
+
+    $((…)) is arithmetic expansion — bare '>' inside is comparison, not redirect.
+    However nested $(...) and backtick substitutions inside arithmetic DO execute,
+    so their bodies are collected and returned for recursive write-target scanning.
+
+    Returns (nested_bodies, index_after_closing_'))')
+    """
+    depth = 2  # two open parens from '$((' to close
+    i = start
+    n = len(s)
+    bodies: list[str] = []
+    while i < n and depth > 0:
+        c = s[i]
+        if c == "\\" and i + 1 < n:
+            i += 2
+        elif c == "'":
+            i = _skip_single_quoted(s, i + 1)
+        elif s[i : i + 3] == "$((":
+            # nested arithmetic — recurse to capture its inner bodies
+            nested, i = _scan_arithmetic_expansion(s, i + 3)
+            bodies.extend(nested)
+        elif s[i : i + 2] == "$(":
+            # nested command substitution inside arithmetic — executes
+            body, i = _scan_subshell(s, i + 2)
+            bodies.append(body)
+        elif c == "`":
+            body, i = _scan_backtick(s, i + 1)
+            bodies.append(body)
+        elif c == "(":
+            depth += 1
+            i += 1
+        elif c == ")":
+            depth -= 1
+            i += 1
+        else:
+            i += 1
+    return bodies, i
+
+
+def _scan_subshell(s: str, start: int) -> tuple[str, int]:
+    """Return (body, index_after_closing_paren) for a $(...) starting after '('.
+
+    Tracks depth while respecting single/double-quoted strings and escape sequences,
+    so characters like '(' inside single quotes do not affect nesting depth.
+    """
+    depth = 1
+    i = start
+    n = len(s)
+    while i < n and depth > 0:
+        c = s[i]
+        if c == "\\" and i + 1 < n:
+            i += 2
+        elif c == "'":
+            i = _skip_single_quoted(s, i + 1)
+        elif c == '"':
+            i = _skip_double_quoted(s, i + 1)
+        elif c == "`":
+            _, i = _scan_backtick(s, i + 1)
+        elif s[i : i + 2] == "$(":
+            depth += 1
+            i += 2
+        elif c == "(":
+            depth += 1
+            i += 1
+        elif c == ")":
+            depth -= 1
+            if depth == 0:
+                return s[start:i], i + 1
+            i += 1
+        else:
+            i += 1
+    return s[start:i], i
+
+
+def _extract_command_substitution_bodies(command: str) -> list[str]:
+    """Return bodies of every $(...) and `...` substitution, respecting shell quoting.
+
+    Double-quoted strings do NOT suppress $() or backtick substitutions in bash,
+    so these must be scanned for write targets even after the outer quotes are stripped.
+    Parentheses inside single/double quotes are ignored for depth counting.
+    """
+    bodies: list[str] = []
+    i = 0
+    n = len(command)
+    while i < n:
+        c = command[i]
+        if c == "\\" and i + 1 < n:
+            i += 2
+        elif c == "'":
+            i = _skip_single_quoted(command, i + 1)
+        elif c == '"':
+            # Inside double-quotes $() and backticks still expand — scan for them.
+            i += 1
+            while i < n and command[i] != '"':
+                if command[i] == "\\" and i + 1 < n:
+                    i += 2
+                elif command[i : i + 3] == "$((":
+                    nested, i = _scan_arithmetic_expansion(command, i + 3)
+                    for b in nested:
+                        bodies.append(b)
+                        bodies.extend(_extract_command_substitution_bodies(b))
+                elif command[i : i + 2] == "$(":
+                    body, i = _scan_subshell(command, i + 2)
+                    bodies.append(body)
+                    bodies.extend(_extract_command_substitution_bodies(body))
+                elif command[i] == "`":
+                    body, i = _scan_backtick(command, i + 1)
+                    bodies.append(body)
+                    bodies.extend(_extract_command_substitution_bodies(body))
+                else:
+                    i += 1
+            if i < n:
+                i += 1  # skip closing "
+        elif c == "`":
+            body, i = _scan_backtick(command, i + 1)
+            bodies.append(body)
+            bodies.extend(_extract_command_substitution_bodies(body))
+        elif command[i : i + 3] == "$((":
+            nested, i = _scan_arithmetic_expansion(command, i + 3)
+            for b in nested:
+                bodies.append(b)
+                bodies.extend(_extract_command_substitution_bodies(b))
+        elif command[i : i + 2] == "$(":
+            body, i = _scan_subshell(command, i + 2)
+            bodies.append(body)
+            bodies.extend(_extract_command_substitution_bodies(body))
+        else:
+            i += 1
+    return bodies
+
+
 _SHELL_CONTROL_TOKENS = frozenset({"|", "||", "&&", ";"})
 
 
@@ -475,12 +654,26 @@ def _detect_bash_write_targets(command: str | None) -> list[str]:
     if not command:
         return []
     targets: list[str] = []
-    for m in _BASH_REDIRECT_RE.finditer(command):
+    # Recurse into $(...) and `...` bodies first.  Double-quoted strings do NOT
+    # suppress command substitutions in bash, so a redirect inside "$(cmd > path)"
+    # is real even though the outer quotes would otherwise be stripped below.
+    for body in _extract_command_substitution_bodies(command):
+        targets.extend(_detect_bash_write_targets(body))
+    # Strip quoted string content before redirect/tee scanning to avoid false-positives
+    # caused by `>` or `tee` appearing as literal text inside CLI argument values
+    # (e.g. --reply-text "exit code > 0").
+    # _detect_sed_inplace_targets uses shlex.split internally and is not affected.
+    scanned = _strip_quoted_strings(command)
+    for m in _BASH_REDIRECT_RE.finditer(scanned):
         path = m.group(1)
         if path not in _REDIRECT_SKIP and not path.startswith("&"):
             targets.append(path)
-    for m in _BASH_TEE_RE.finditer(command):
-        blob = m.group(1)
+    for m in _BASH_TEE_RE.finditer(scanned):
+        # Match on scanned to skip `tee` inside quoted strings, but recover the
+        # original blob (same span) so quoted paths like tee "out.log" are preserved.
+        # _strip_quoted_strings is length-preserving, so span indices stay aligned.
+        start, end = m.span(1)
+        blob = command[start:end]
         try:
             tee_args = shlex.split(blob)
         except ValueError:

@@ -159,11 +159,15 @@ EOF
 
 #### 5-a. phase launch の複数回試行
 
-`workflow_hooks.jsonl` で同じ `node_key + step` の `pre_phase_launch` が 2 回以上現れる場合、起動失敗によるやり直しが発生している。
+`workflow_hooks.jsonl` で同じ `node_key + step` の `pre_phase_launch` が現れる回数を確認する。
+
+**注意:** `pre_phase_launch` は `workflow-launch-check` コマンドと `record-launch` コマンドの両方から書き込まれる。
+plan step のように substep が複数ある場合は「1 回の workflow-launch-check + substep 数分の record-launch」が正常パターンであり、起動失敗ではない。
+agents ディレクトリ (`workspace/orchestrations/<orch_id>/agents/`) に存在する agent_run_id 数と比較して、`pre_phase_launch` 回数が「1 + 実起動 agent 数」を超える場合のみ retry と判定する。
 
 ```bash
 python3 - <<'EOF'
-import json
+import json, pathlib
 from collections import Counter
 
 orch_id = "<orchestration_id>"
@@ -180,9 +184,20 @@ for e in entries:
         key = f"{e.get('node_key')}::{e.get('step')}"
         counter[key] += 1
 
+# 実起動 agent 数 (record-launch が成功して capabilities が存在するもの)
+caps = list(pathlib.Path(f"workspace/orchestrations/{orch_id}/capabilities").glob("*.json"))
+launched_per_step: Counter = Counter()
+for p in caps:
+    obj = json.loads(p.read_text())
+    key = f"{obj.get('node_key')}::{obj.get('step')}"
+    launched_per_step[key] += 1
+
 for key, cnt in counter.items():
-    if cnt > 1:
-        print(f"RETRY x{cnt}: {key}")
+    expected = 1 + launched_per_step.get(key, 0)  # 1 for workflow-launch-check
+    if cnt > expected:
+        print(f"RETRY x{cnt - expected} (pre_phase_launch={cnt}, expected={expected}): {key}")
+    else:
+        print(f"OK (pre_phase_launch={cnt}, expected={expected}): {key}")
 EOF
 ```
 

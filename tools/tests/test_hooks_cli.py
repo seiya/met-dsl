@@ -758,6 +758,106 @@ class ClaudeHookCliTests(unittest.TestCase):
         targets = cli._detect_bash_write_targets("sed -e 's/a/b/' -i file.txt")
         self.assertIn("file.txt", targets)
 
+    def test_detect_bash_write_targets_ignores_redirect_inside_double_quoted_arg(self) -> None:
+        # --reply-text "... > 0 ..." must NOT be treated as a redirect to "0"
+        cmd = 'python3 tools/orchestration_runtime.py record-reply --reply-text "verification_status=fail. exit code > 0"'
+        targets = cli._detect_bash_write_targets(cmd)
+        self.assertEqual(targets, [])
+
+    def test_detect_bash_write_targets_ignores_redirect_inside_single_quoted_arg(self) -> None:
+        cmd = "python3 tools/orchestration_runtime.py record-reply --reply-text 'status > 0, see log'"
+        targets = cli._detect_bash_write_targets(cmd)
+        self.assertEqual(targets, [])
+
+    def test_detect_bash_write_targets_still_detects_real_redirect_outside_quotes(self) -> None:
+        cmd = 'python3 foo.py --arg "inner > ignored" > workspace/out.txt'
+        targets = cli._detect_bash_write_targets(cmd)
+        self.assertIn("workspace/out.txt", targets)
+        self.assertNotIn("ignored", targets)
+
+    def test_detect_bash_write_targets_ignores_tee_inside_quoted_arg(self) -> None:
+        cmd = 'python3 foo.py --reply-text "pipe | tee tmpfile"'
+        targets = cli._detect_bash_write_targets(cmd)
+        self.assertEqual(targets, [])
+
+    def test_detect_bash_write_targets_tee_with_quoted_path_detects_target(self) -> None:
+        # tee outside quotes but its path argument is quoted: must detect the real path, not whitespace
+        cmd = 'python3 foo.py 2>&1 | tee "output.log"'
+        targets = cli._detect_bash_write_targets(cmd)
+        self.assertIn("output.log", targets)
+        self.assertFalse(any(not t.strip() for t in targets))
+
+    def test_detect_bash_write_targets_redirect_inside_command_substitution_in_quoted_arg(self) -> None:
+        # "$(echo hi > workspace/forbidden.txt)" — $() executes even inside double quotes
+        cmd = 'python3 foo.py --arg "$(echo hi > workspace/forbidden.txt)"'
+        targets = cli._detect_bash_write_targets(cmd)
+        self.assertIn("workspace/forbidden.txt", targets)
+
+    def test_detect_bash_write_targets_backtick_substitution_inside_quoted_arg(self) -> None:
+        cmd = 'python3 foo.py --arg "`echo hi > workspace/out.txt`"'
+        targets = cli._detect_bash_write_targets(cmd)
+        self.assertIn("workspace/out.txt", targets)
+
+    def test_detect_bash_write_targets_nested_command_substitution(self) -> None:
+        # Nested $(): both inner and outer redirects should be caught
+        cmd = 'python3 foo.py "$(echo $(ls > /tmp/a) > /tmp/b)"'
+        targets = cli._detect_bash_write_targets(cmd)
+        self.assertIn("/tmp/a", targets)
+        self.assertIn("/tmp/b", targets)
+
+    def test_detect_bash_write_targets_single_quoted_paren_inside_subshell(self) -> None:
+        # '(' inside $() must not inflate depth and cause the body to be dropped
+        cmd = """python3 foo.py --arg "$(printf '('; echo hi > /tmp/pwn)" """
+        targets = cli._detect_bash_write_targets(cmd)
+        self.assertIn("/tmp/pwn", targets)
+
+    def test_detect_bash_write_targets_escaped_paren_inside_subshell(self) -> None:
+        cmd = r'python3 foo.py --arg "$(printf \(; echo hi > /tmp/pwn)"'
+        targets = cli._detect_bash_write_targets(cmd)
+        self.assertIn("/tmp/pwn", targets)
+
+    def test_detect_bash_write_targets_literal_redirect_in_quoted_string_not_detected(self) -> None:
+        # Plain quoted text with > is not a redirect and must not be flagged
+        cmd = 'python3 foo.py --reply-text "exit code > 0"'
+        targets = cli._detect_bash_write_targets(cmd)
+        self.assertEqual(targets, [])
+
+    def test_detect_bash_write_targets_arithmetic_expansion_not_flagged(self) -> None:
+        # $((1 > 0)) is arithmetic — '>' is comparison, not a redirect
+        cmd = 'python3 foo.py --reply-text "$((1 > 0))"'
+        targets = cli._detect_bash_write_targets(cmd)
+        self.assertEqual(targets, [])
+
+    def test_detect_bash_write_targets_arithmetic_with_nested_parens_not_flagged(self) -> None:
+        cmd = 'python3 foo.py --val "$(( (a + b) > 0 ))"'
+        targets = cli._detect_bash_write_targets(cmd)
+        self.assertEqual(targets, [])
+
+    def test_detect_bash_write_targets_arithmetic_plus_real_redirect(self) -> None:
+        # Arithmetic inside quotes must not mask a real redirect outside quotes
+        cmd = 'python3 foo.py --val "$((1 > 0))" > workspace/out.txt'
+        targets = cli._detect_bash_write_targets(cmd)
+        self.assertIn("workspace/out.txt", targets)
+        self.assertNotIn("0", targets)
+
+    def test_detect_bash_write_targets_nested_subst_in_arithmetic(self) -> None:
+        # $(( $(echo 1 > /tmp/pwn; echo 1) + 1 )) — nested $() inside $(()) executes
+        cmd = '--arg "$(( $(echo 1 > /tmp/pwn; echo 1) + 1 ))"'
+        targets = cli._detect_bash_write_targets(cmd)
+        self.assertIn("/tmp/pwn", targets)
+
+    def test_detect_bash_write_targets_backtick_in_arithmetic(self) -> None:
+        # $(( `echo 1 > /tmp/bt; echo 1` + 1 )) — backtick inside $(()) executes
+        cmd = "$(( `echo 1 > /tmp/bt; echo 1` + 1 ))"
+        targets = cli._detect_bash_write_targets(cmd)
+        self.assertIn("/tmp/bt", targets)
+
+    def test_detect_bash_write_targets_arithmetic_comparison_still_ignored(self) -> None:
+        # Plain arithmetic inside quotes — $((a > b)) is comparison, not redirect
+        cmd = 'python3 foo.py --val "$((a > b))"'
+        targets = cli._detect_bash_write_targets(cmd)
+        self.assertEqual(targets, [])
+
     def test_bash_write_guard_blocks_for_codex_and_claude_when_agent_run_id_unresolved(self) -> None:
         for backend in ("codex", "claude"):
             with self.subTest(backend=backend):

@@ -30,16 +30,17 @@
 ## 運用ルール
 1. `tools/run_workflow.py` を実行して `workspace/orchestrations/<orchestration_id>/` の初期化と `preflight.json` 生成を行う。
 2. `tools/run_workflow.py` 以外の経路で workflow を開始してはならない。
-3. `preflight` 判定が `pass` でない場合は `set-status --status fail` を実行して停止する。
-4. 最初の `commentary` で、対象 phase、使用する `SKILL`、起動する `agent` 種別、`MCP` 使用箇所を宣言する。
-5. 固定表で phase 種別を確認し、`Plan` / `Generate` / `Tune` では `substep agent`、`Build` / `Execute` / `Judge` / `Promote` では `step agent` を起動対象として確定する。
-6. `Plan` の子 `agent` 起動前に、直下依存 `node` の `plan_ref` と `plan_meta.json.verification_status` を確認する。
-7. `Generate` 以降の子 `agent` 起動前に、直下依存 `node` の `plan_ref` と `pipeline_ref` と `aggregate_verdict` を確認する。
-8. `preflight` 済み、launch prompt 準備済み、child `agent` 起動済みを満たすまで phase artifact 編集と `MCP` 実行を開始しない。
-9. 子 `agent` 起動時は `record-launch` を実行する。
-10. 子 `agent` 完了後は `record-agent-run` を追記する。
-11. phase 完了後は `write-step-result` を記録する。
-12. 契約に反する近道へ逸脱しそうな場合は、子 `agent` 起動必須であることを明示して launch 手順へ戻る。
+3. `METDSL_WORKFLOW_MODE=1` で起動した orchestration agent は `~/.claude/projects/` 配下の `memory/` ディレクトリ（`MEMORY.md` 等）を読んではならない。workflow 実行は決定論的に進めるため、conversation 外部の persistent state を参照しない。
+4. `preflight` 判定が `pass` でない場合は `set-status --status fail` を実行して停止する。
+5. 最初の `commentary` で、対象 phase、使用する `SKILL`、起動する `agent` 種別、`MCP` 使用箇所を宣言する。
+6. 固定表で phase 種別を確認し、`Plan` / `Generate` / `Tune` では `substep agent`、`Build` / `Execute` / `Judge` / `Promote` では `step agent` を起動対象として確定する。
+7. `Plan` の子 `agent` 起動前に、直下依存 `node` の `plan_ref` と `plan_meta.json.verification_status` を確認する。
+8. `Generate` 以降の子 `agent` 起動前に、直下依存 `node` の `plan_ref` と `pipeline_ref` と `aggregate_verdict` を確認する。
+9. `preflight` 済み、launch prompt 準備済み、child `agent` 起動済みを満たすまで phase artifact 編集と `MCP` 実行を開始しない。
+10. 子 `agent` 起動時は `record-launch` を実行する。
+11. 子 `agent` 完了後は `record-agent-run` を追記する。
+12. phase 完了後は `write-step-result` を記録する。
+13. 契約に反する近道へ逸脱しそうな場合は、子 `agent` 起動必須であることを明示して launch 手順へ戻る。
 
 ## 判定基準
 - `preflight.json` が存在し、`pass` 条件を満たしている。
