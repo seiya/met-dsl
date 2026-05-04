@@ -37,6 +37,7 @@ repair_reason: <repair_reason>
 - `.yaml` / `.yml` / `.md` および source code 等の上記以外の出力は、`output_manifests/<agent_run_id>.json` の `allowed_file_tool_paths` に列挙された path に限り、`Edit` / `Write` tool で直接書き込むこと。
 - `run-gate --gate apply_patch_writes` と `apply-patch-gate` の公開経路としての使用、shell redirection・`tee`・`sed -i`・任意コマンドによる file write、`allowed_output_paths` 外への書き込みは引き続き禁止する。
 - `guarded-apply-patch` と `Edit` / `Write` のいずれも `output_manifests/<agent_run_id>.json` を参照して manifest 外 path を reject する。manifest 外 path へ書いてはならない。
+- 一時ファイルが必要な場合は `/tmp` を直接指定せず、`$TMPDIR` 環境変数を展開した path を使用すること（例: `"${TMPDIR}/work.json"` または `$(mktemp)`）。`$TMPDIR` は `workspace/tmp/<agent_run_id>/` に設定されており、hook ポリシーの許可範囲内に含まれる。`/tmp/` ハードコードは `output_manifest_write_guard` でブロックされる。
 - `skill_name` と `skill_ref` が未指定の場合は fail で停止すること。
 - 入力不足時は推測補完せず fail で停止すること。
 - `workflow_mode=dev` の場合、verify 系判定で `issue_severity=major|critical` を検出した時点で fail 停止すること。
@@ -88,6 +89,7 @@ repair_reason: <repair_reason>
 - `.yaml` / `.yml` / `.md` および source code 等の上記以外の出力は、`output_manifests/<agent_run_id>.json` の `allowed_file_tool_paths` に列挙された path に限り、`Edit` / `Write` tool で直接書き込むこと。
 - `run-gate --gate apply_patch_writes` と `apply-patch-gate` の公開経路としての使用、shell redirection・`tee`・`sed -i`・任意コマンドによる file write、`allowed_output_paths` 外への書き込みは引き続き禁止する。
 - `guarded-apply-patch` と `Edit` / `Write` のいずれも `output_manifests/<agent_run_id>.json` を参照して manifest 外 path を reject する。manifest 外 path へ書いてはならない。
+- 一時ファイルが必要な場合は `/tmp` を直接指定せず、`$TMPDIR` 環境変数を展開した path を使用すること（例: `"${TMPDIR}/work.json"` または `$(mktemp)`）。`$TMPDIR` は `workspace/tmp/<agent_run_id>/` に設定されており、hook ポリシーの許可範囲内に含まれる。`/tmp/` ハードコードは `output_manifest_write_guard` でブロックされる。
 - `skill_name` と `skill_ref` が未指定の場合は fail で停止すること。
 - 入力不足時は推測補完せず fail で停止すること。
 - `workflow_mode=dev` の場合、verify 系判定で `issue_severity=major|critical` を検出した時点で fail 停止すること。
