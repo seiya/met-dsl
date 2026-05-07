@@ -3216,6 +3216,7 @@ def _validate_actual_write_paths(
         }
     )
     manifest_file_tool_paths: set[str] = set()
+    manifest_allowed_tmp_root: str | None = None
     if actor_role == "orchestration":
         declared_paths = sorted(set(output_refs) | set(gate_changed_paths))
     else:
@@ -3238,9 +3239,21 @@ def _validate_actual_write_paths(
                     for item in ftp_obj
                     if isinstance(item, str) and item.strip()
                 }
+            _tmp_raw = manifest_doc.get("allowed_tmp_root", "")
+            if isinstance(_tmp_raw, str) and _tmp_raw.strip():
+                _tmp_norm = _normalize_rel_posix(_tmp_raw.strip())
+                _expected_tmp = _normalize_rel_posix(f"workspace/tmp/{run_id}")
+                if _tmp_norm != _expected_tmp:
+                    raise ValueError(
+                        f"allowed_tmp_root manifest value {_tmp_norm!r} does not match "
+                        f"expected per-run root {_expected_tmp!r}"
+                    )
+                manifest_allowed_tmp_root = _tmp_norm
         declared_paths = sorted(set(gate_changed_paths) | manifest_file_tool_paths)
     for path in actual_changed_paths:
         if parent_tmp_root and _repo_path_under_prefix(path, parent_tmp_root):
+            continue
+        if manifest_allowed_tmp_root and _repo_path_under_prefix(path, manifest_allowed_tmp_root):
             continue
         if write_roots and not _path_under_any_write_root(path, write_roots):
             unauthorized.append(path)

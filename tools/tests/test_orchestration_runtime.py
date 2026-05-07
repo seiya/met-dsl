@@ -2644,6 +2644,200 @@ shell_tool                       stable             true
             )
             self.assertEqual(payload["output_refs"], [out_ref])
 
+    def test_record_agent_run_accepts_substep_terminal_when_tmp_file_is_under_allowed_tmp_root(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            init_orchestration(repo_root=repo_root, orchestration_id="orch_001")
+            write_preflight(
+                repo_root=repo_root,
+                orchestration_id="orch_001",
+                payload={
+                    "status": "pass",
+                    "sandbox_runtime": "bwrap",
+                    "sandbox_enforced": True,
+                    "can_launch_step_agents": True,
+                    "can_launch_substep_agents": True,
+                    "feature_states": {"multi_agent": True, "codex_hooks": True},
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
+                },
+            )
+            record_agent_run(
+                repo_root=repo_root,
+                orchestration_id="orch_001",
+                payload={
+                    "agent_run_id": "orch_run_001",
+                    "agent_role": "orchestration",
+                    "status": "running",
+                    "agent_backend": "claude",
+                },
+            )
+            record_launch(
+                repo_root=repo_root,
+                orchestration_id="orch_001",
+                parent_agent_run_id="orch_run_001",
+                child_agent_run_id="substep_run_gen_001",
+                request_payload={
+                    "node_key": "problem/shallow_water2d@0.3.0",
+                    "step": "plan",
+                    "substep": "generate",
+                    "agent_role": "substep",
+                    "orchestration_id": "orch_001",
+                    "agent_run_id": "substep_run_gen_001",
+                    "parent_agent_run_id": "orch_run_001",
+                    "plan_ref": _FIX_PLAN_REF,
+                    "pipeline_ref": _FIX_PIPE_REF,
+                    "dependency_ref": _FIX_PLAN_STEP_DEP_REF,
+                    "skill_name": "workflow-plan-generate",
+                    "skill_ref": "skills/workflow-plan-generate/SKILL.md",
+                    "skill_must_read_refs": _fixture_skill_must_read_refs_substep("plan", "generate"),
+                    "allowed_output_paths": [f"{_FIX_PLAN_REF}/plan_meta.json"],
+                    "launch_prompt_full": _substep_launch_prompt(
+                        "problem/shallow_water2d@0.3.0",
+                        "plan",
+                        "generate",
+                        "substep_run_gen_001",
+                    ),
+                },
+                response_payload=_spawn_response_payload("sess_substep_gen_001"),
+            )
+            out_ref = f"{_FIX_PLAN_REF}/plan_meta.json"
+            out_path = repo_root / out_ref
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            out_path.write_text('{"status":"ok"}\n', encoding="utf-8")
+            _write_apply_patch_gate_evidence(
+                repo_root,
+                orchestration_id="orch_001",
+                agent_run_id="substep_run_gen_001",
+                actor_role="substep",
+                changed_paths=[out_ref],
+            )
+            tmp_file_path = repo_root / "workspace" / "tmp" / "substep_run_gen_001" / "guarded_patch_plan_meta.txt"
+            tmp_file_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp_file_path.write_text("patch metadata\n", encoding="utf-8")
+            payload = record_agent_run(
+                repo_root=repo_root,
+                orchestration_id="orch_001",
+                payload={
+                    "agent_run_id": "substep_run_gen_001",
+                    "agent_role": "substep",
+                    "parent_agent_run_id": "orch_run_001",
+                    "step": "plan",
+                    "substep": "generate",
+                    "node_key": "problem/shallow_water2d@0.3.0",
+                    "status": "pass",
+                    "agent_backend": "claude",
+                    "agent_model": "claude-sonnet-4-6",
+                    "context_id": "ctx_substep_gen_001",
+                    "agent_session_id": "sess_substep_gen_001",
+                    "output_refs": [out_ref],
+                },
+            )
+            self.assertEqual(payload["output_refs"], [out_ref])
+
+    def test_record_agent_run_rejects_substep_terminal_when_allowed_tmp_root_is_overbroad(self) -> None:
+        from tools.orchestration_runtime import _write_allowed_output_manifest
+
+        for overbroad in ("workspace/tmp", "workspace", ".", "workspace/tmp/other_run_id"):
+            with self.subTest(overbroad=overbroad):
+                with tempfile.TemporaryDirectory() as tmp:
+                    repo_root = Path(tmp)
+                    init_orchestration(repo_root=repo_root, orchestration_id="orch_001")
+                    write_preflight(
+                        repo_root=repo_root,
+                        orchestration_id="orch_001",
+                        payload={
+                            "status": "pass",
+                            "sandbox_runtime": "bwrap",
+                            "sandbox_enforced": True,
+                            "can_launch_step_agents": True,
+                            "can_launch_substep_agents": True,
+                            "feature_states": {"multi_agent": True, "codex_hooks": True},
+                            "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
+                        },
+                    )
+                    record_agent_run(
+                        repo_root=repo_root,
+                        orchestration_id="orch_001",
+                        payload={
+                            "agent_run_id": "orch_run_001",
+                            "agent_role": "orchestration",
+                            "status": "running",
+                            "agent_backend": "claude",
+                        },
+                    )
+                    record_launch(
+                        repo_root=repo_root,
+                        orchestration_id="orch_001",
+                        parent_agent_run_id="orch_run_001",
+                        child_agent_run_id="substep_run_gen_001",
+                        request_payload={
+                            "node_key": "problem/shallow_water2d@0.3.0",
+                            "step": "plan",
+                            "substep": "generate",
+                            "agent_role": "substep",
+                            "orchestration_id": "orch_001",
+                            "agent_run_id": "substep_run_gen_001",
+                            "parent_agent_run_id": "orch_run_001",
+                            "plan_ref": _FIX_PLAN_REF,
+                            "pipeline_ref": _FIX_PIPE_REF,
+                            "dependency_ref": _FIX_PLAN_STEP_DEP_REF,
+                            "skill_name": "workflow-plan-generate",
+                            "skill_ref": "skills/workflow-plan-generate/SKILL.md",
+                            "skill_must_read_refs": _fixture_skill_must_read_refs_substep("plan", "generate"),
+                            "allowed_output_paths": [f"{_FIX_PLAN_REF}/plan_meta.json"],
+                            "launch_prompt_full": _substep_launch_prompt(
+                                "problem/shallow_water2d@0.3.0",
+                                "plan",
+                                "generate",
+                                "substep_run_gen_001",
+                            ),
+                        },
+                        response_payload=_spawn_response_payload("sess_substep_gen_001"),
+                    )
+                    out_ref = f"{_FIX_PLAN_REF}/plan_meta.json"
+                    out_path = repo_root / out_ref
+                    out_path.parent.mkdir(parents=True, exist_ok=True)
+                    out_path.write_text('{"status":"ok"}\n', encoding="utf-8")
+                    _write_apply_patch_gate_evidence(
+                        repo_root,
+                        orchestration_id="orch_001",
+                        agent_run_id="substep_run_gen_001",
+                        actor_role="substep",
+                        changed_paths=[out_ref],
+                    )
+                    # Overwrite the manifest with an over-broad allowed_tmp_root
+                    _write_allowed_output_manifest(
+                        repo_root,
+                        orchestration_id="orch_001",
+                        agent_run_id="substep_run_gen_001",
+                        allowed_output_paths=[out_ref],
+                        allowed_tmp_root=overbroad,
+                    )
+                    # Write a file that would only be skipped if the over-broad tmp root
+                    # were accepted (path is outside the correct per-run tmp root)
+                    bad_path = repo_root / "workspace" / "tmp" / "other_run_id" / "sneaky.txt"
+                    bad_path.parent.mkdir(parents=True, exist_ok=True)
+                    bad_path.write_text("unauthorized\n", encoding="utf-8")
+                    with self.assertRaises(ValueError):
+                        record_agent_run(
+                            repo_root=repo_root,
+                            orchestration_id="orch_001",
+                            payload={
+                                "agent_run_id": "substep_run_gen_001",
+                                "agent_role": "substep",
+                                "parent_agent_run_id": "orch_run_001",
+                                "step": "plan",
+                                "substep": "generate",
+                                "node_key": "problem/shallow_water2d@0.3.0",
+                                "status": "pass",
+                                "agent_backend": "claude",
+                                "agent_model": "claude-sonnet-4-6",
+                                "context_id": "ctx_substep_gen_001",
+                                "agent_session_id": "sess_substep_gen_001",
+                                "output_refs": [out_ref],
+                            },
+                        )
+
     def test_record_agent_run_accepts_step_terminal_when_gate_changed_paths_uses_directory_prefix(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
