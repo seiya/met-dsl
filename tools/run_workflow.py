@@ -10,6 +10,7 @@ import shutil
 import shlex
 import subprocess
 import sys
+import tempfile
 import textwrap
 import uuid
 from dataclasses import dataclass
@@ -135,15 +136,18 @@ def _build_orchestration_prompt(
         - 子 agent の要求定義と判定規則の canonical source は `docs/`、`spec/`、当該試行 artifact に限定する。
         - child agent 起動前に `workflow-launch-check` を実行し、失敗時は停止する。
         - 進行は開始 phase から `{until_phase}` までとし、それ以降の phase には進まない。
+        - 一時ファイルが必要な場合は `/tmp` を直接指定せず、`$TMPDIR` 環境変数を展開した path を使用すること（例: `"${{TMPDIR}}/work.json"` または `$(mktemp)`）。`$TMPDIR` は `workspace/tmp/<orchestration_agent_run_id>/` に設定されており、hook ポリシーの許可範囲内に含まれる。`/tmp/` ハードコードは `output_manifest_write_guard` でブロックされる。
+        - Claude Code 起動直後の `~/.claude/projects/.../memory/MEMORY.md` 自動 Read は `read_manifest_read_guard` でブロックされるが、これは想定動作であり workflow の継続に影響しない。再試行や `MEMORY.md` 配下への参照を試みてはならない。
         """
     ).strip() + "\n"
 
     if workflow_mode == "dev":
         base += textwrap.dedent(
-            """
+            f"""
             - verify substep で `issue_severity` が `minor` 以外の場合は fail として停止する。
             - fail 時は一次証跡（`agent_runs.jsonl`、`step_result.json`、`agent.summary.txt`、`launches/*.reply.txt`）を優先して原因を調査し、根拠とともに報告する。
             - 途中経過の調査に必要な情報は、可能な限り `workspace/orchestrations/<orchestration_id>/` 配下へ保存する。
+            - `failure_analysis.json` を書き込む場合は `"orchestration_agent_run_id": "{orchestration_agent_run_id}"` フィールドを必ず含める。このフィールドは runtime が current-run 同定に使用するため、省略すると timestamp fallback に降格され、ID 再利用時に誤判定が生じる。
             """
         )
     return base
@@ -339,6 +343,8 @@ def _collect_failure_analysis(repo_root: Path, orchestration_id: str) -> dict[st
         "status": "fail",
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "orchestration_id": orchestration_id,
+        "orchestration_agent_run_id": meta.get("orchestration_agent_run_id"),
+        "orchestration_started_at": meta.get("started_at"),
         "orchestration_status": meta.get("status"),
         "reason_code": meta.get("reason_code"),
         "reason_detail": meta.get("reason_detail"),
@@ -352,12 +358,200 @@ def _collect_failure_analysis(repo_root: Path, orchestration_id: str) -> dict[st
     }
 
 
-def _write_failure_analysis(repo_root: Path, orchestration_id: str, payload: dict[str, Any]) -> str:
+_FAILURE_STATUS_VALUES: frozenset[str] = frozenset(
+    {"fail", "fail_closed", "blocked", "timeout", "cancel"}
+)
+
+
+def _is_valid_failure_analysis(
+    obj: Any,
+    orchestration_id: str,
+    *,
+    orchestration_agent_run_id: str | None,
+) -> bool:
+    """Return True only when obj is a substantive failure analysis for this orchestration run.
+
+    Validity requires:
+    1. obj is a non-empty dict
+    2. orchestration_id matches exactly
+    3. status is a recognised failure value
+    4. at least one failure-evidence field is non-None / non-empty
+    5. Run-identity: orchestration_agent_run_id must be known (non-None) and must match
+       the value embedded in obj.  Any other condition — current ID unknown, canonical
+       missing the field, or field mismatch — is treated as unverifiable/invalid.
+       Timestamp comparison is NOT used: it cannot distinguish same-run from concurrent
+       or reused-ID runs and is therefore not a reliable identity proof.
+    """
+    if not isinstance(obj, dict) or not obj:
+        return False
+    if obj.get("orchestration_id") != orchestration_id:
+        return False
+    status = obj.get("status")
+    if not isinstance(status, str) or status.strip().lower() not in _FAILURE_STATUS_VALUES:
+        return False
+    evidence_fields = (
+        "reason_code",
+        "reason_detail",
+        "failed_agent_run",
+        "failed_step_results",
+        "recommended_retry_decisions",
+        "launch_reply_tail",
+        "agent_summary_tail",
+    )
+    has_evidence = any(
+        obj.get(f) not in (None, "", []) for f in evidence_fields
+    )
+    if not has_evidence:
+        return False
+
+    # Run-identity: exact orchestration_agent_run_id match is the only accepted proof.
+    current_run_id = (
+        orchestration_agent_run_id.strip()
+        if isinstance(orchestration_agent_run_id, str) and orchestration_agent_run_id.strip()
+        else None
+    )
+    if current_run_id is None:
+        # Current run ID unavailable (meta missing/corrupt) — cannot verify ownership.
+        return False
+    obj_run_id = obj.get("orchestration_agent_run_id")
+    return isinstance(obj_run_id, str) and obj_run_id.strip() == current_run_id
+
+
+def _write_failure_analysis(
+    repo_root: Path,
+    orchestration_id: str,
+    payload: dict[str, Any],
+    *,
+    tmp_dir: Path | None = None,
+) -> tuple[str, str | None, str | None]:
+    """Write failure analysis and return (analysis_ref, runtime_ref_or_None, stale_canonical_ref_or_None).
+
+    analysis_ref always points to current-run-valid failure data so callers always
+    receive an accurate primary reference regardless of what existed on disk.
+    runtime_ref and stale_canonical_ref are supplementary references.
+
+    Ownership contract (startup_contract.md):
+    - When failure_analysis.json does not exist: write payload there as safety-net.
+      → analysis_ref = failure_analysis.json, runtime_ref = None, stale_canonical_ref = None
+    - When failure_analysis.json exists and is valid for this run: preserve canonical,
+      write sidecar with existing_file_status="valid".
+      → analysis_ref = failure_analysis.json, runtime_ref = failure_analysis.runtime.json,
+        stale_canonical_ref = None
+    - When failure_analysis.json exists but is invalid/stale: preserve canonical (agent
+      owns it), write current payload to sidecar with existing_file_status="invalid".
+      analysis_ref is redirected to the sidecar so callers always get current-run data.
+      → analysis_ref = failure_analysis.runtime.json, runtime_ref = None,
+        stale_canonical_ref = failure_analysis.json
+    """
     rel = Path("workspace") / "orchestrations" / orchestration_id / "failure_analysis.json"
     path = repo_root / rel
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    return str(rel)
+    effective_tmp = tmp_dir or path.parent
+    canonical_written = _atomic_write_json_exclusive(path, payload, tmp_dir=effective_tmp)
+    if canonical_written:
+        return str(rel), None, None
+    # File already existed (or appeared concurrently) — agent owns canonical; write sidecar only.
+    existing = _read_json_if_exists(path)
+    orchestration_agent_run_id = payload.get("orchestration_agent_run_id") if isinstance(payload.get("orchestration_agent_run_id"), str) else None
+    existing_is_valid = _is_valid_failure_analysis(
+        existing,
+        orchestration_id,
+        orchestration_agent_run_id=orchestration_agent_run_id,
+    )
+    existing_file_status = "valid" if existing_is_valid else "invalid"
+    # Use a UUID-suffixed sidecar name so concurrent runs with the same orchestration_id
+    # do not overwrite each other's runtime analysis.
+    runtime_slug = uuid.uuid4().hex[:12]
+    runtime_rel = (
+        Path("workspace") / "orchestrations" / orchestration_id
+        / f"failure_analysis.runtime.{runtime_slug}.json"
+    )
+    _atomic_write_json(
+        repo_root / runtime_rel,
+        {**payload, "existing_file_status": existing_file_status},
+        tmp_dir=effective_tmp,
+    )
+    if existing_is_valid:
+        # Canonical is current-run data → keep it as primary reference.
+        return str(rel), str(runtime_rel), None
+    # Canonical is stale — redirect analysis_ref to sidecar so callers get current-run data.
+    return str(runtime_rel), None, str(rel)
+
+
+def _atomic_write_json_exclusive(path: Path, payload: dict[str, Any], *, tmp_dir: Path) -> bool:
+    """Write payload to path only if path does not already exist; return True on success.
+
+    Uses write-to-temp + O_CREAT|O_EXCL link/rename to eliminate the TOCTOU window
+    between an existence check and the write.  If path already exists (FileExistsError),
+    returns False without touching the existing file.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        same_device = os.stat(tmp_dir).st_dev == os.stat(path.parent).st_dev
+    except OSError:
+        same_device = False
+    write_dir = tmp_dir if same_device else path.parent
+    text = json.dumps(payload, ensure_ascii=False, indent=2) + "\n"
+    fd, tmp_path_str = tempfile.mkstemp(dir=write_dir, suffix=".json.tmp")
+    tmp = Path(tmp_path_str)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+        # O_CREAT|O_EXCL semantics: link fails atomically if destination exists.
+        try:
+            os.link(tmp, path)
+            return True
+        except FileExistsError:
+            return False
+        except OSError:
+            # Fallback for filesystems that don't support hard links (e.g. some overlayfs).
+            # Write to a second temp file, then install it via O_CREAT|O_EXCL rename-equivalent:
+            # open the destination exclusively, copy bytes, then close.  If the write fails
+            # mid-stream, remove the partial destination to avoid poisoning later runs.
+            try:
+                excl_fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o666)
+            except FileExistsError:
+                return False
+            dest_created = True
+            try:
+                with os.fdopen(excl_fd, "w", encoding="utf-8") as ef:
+                    ef.write(text)
+                dest_created = False  # write succeeded; don't remove on exit
+                return True
+            finally:
+                if dest_created:
+                    # Write failed — remove the partial canonical so it doesn't corrupt future runs.
+                    path.unlink(missing_ok=True)
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+def _atomic_write_json(path: Path, payload: dict[str, Any], *, tmp_dir: Path) -> None:
+    """Write payload as JSON to path atomically via a unique temp file.
+
+    Temp file is placed in tmp_dir when it is on the same device as path.parent
+    (guarantees atomic rename).  Falls back to path.parent otherwise to avoid
+    EXDEV on cross-device rename (e.g. split/bind mounts).
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    # Proactively avoid EXDEV: rename is atomic only within the same filesystem.
+    try:
+        same_device = os.stat(tmp_dir).st_dev == os.stat(path.parent).st_dev
+    except OSError:
+        same_device = False
+    write_dir = tmp_dir if same_device else path.parent
+    text = json.dumps(payload, ensure_ascii=False, indent=2) + "\n"
+    fd, tmp_path_str = tempfile.mkstemp(dir=write_dir, suffix=".json.tmp")
+    tmp = Path(tmp_path_str)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+        tmp.replace(path)
+    except Exception:
+        tmp.unlink(missing_ok=True)
+        raise
 
 
 def _detect_non_minor_verify_issue(repo_root: Path, orchestration_id: str) -> dict[str, Any] | None:
@@ -651,21 +845,71 @@ def main(argv: list[str] | None = None) -> int:
             }:
                 if workflow_mode == "dev":
                     analysis = _collect_failure_analysis(repo_root, orchestration_id)
-                    analysis_ref = _write_failure_analysis(repo_root, orchestration_id, analysis)
-                    print(
-                        json.dumps(
-                            {
-                                "status": "fail",
-                                "reason": "workflow_failed",
-                                "detail": analysis.get("reason_detail") or "workflow execution failed",
-                                "orchestration_id": orchestration_id,
-                                "workflow_mode": workflow_mode,
-                                "workflow_status": workflow_status,
-                                "analysis_ref": analysis_ref,
-                            },
-                            ensure_ascii=False,
+                    fail_output: dict[str, Any] = {
+                        "status": "fail",
+                        "reason": "workflow_failed",
+                        "detail": analysis.get("reason_detail") or "workflow execution failed",
+                        "orchestration_id": orchestration_id,
+                        "workflow_mode": workflow_mode,
+                        "workflow_status": workflow_status,
+                    }
+                    try:
+                        analysis_ref, runtime_analysis_ref, stale_canonical_ref = _write_failure_analysis(
+                            repo_root,
+                            orchestration_id,
+                            analysis,
+                            tmp_dir=orchestration_tmp_for_cleanup,
                         )
-                    )
+                        fail_output["analysis_ref"] = analysis_ref
+                        if runtime_analysis_ref is not None:
+                            fail_output["runtime_analysis_ref"] = runtime_analysis_ref
+                        if stale_canonical_ref is not None:
+                            fail_output["stale_canonical_ref"] = stale_canonical_ref
+                    except Exception as primary_exc:  # noqa: BLE001
+                        # Primary write failed — attempt an emergency exclusive-create write so
+                        # at least some artifact survives without clobbering agent-owned canonical.
+                        orch_dir = (
+                            repo_root / "workspace" / "orchestrations" / orchestration_id
+                        )
+                        emergency_payload = {**analysis, "emergency_write": True}
+                        canonical_path = orch_dir / "failure_analysis.json"
+                        try:
+                            orch_dir.mkdir(parents=True, exist_ok=True)
+                            # Try exclusive-create on canonical first (succeeds only when absent).
+                            wrote_canonical = _atomic_write_json_exclusive(
+                                canonical_path,
+                                emergency_payload,
+                                tmp_dir=orch_dir,
+                            )
+                            if wrote_canonical:
+                                fallback_ref = str(canonical_path.relative_to(repo_root))
+                            else:
+                                # Canonical already exists (agent owns it) — write to unique sidecar.
+                                # Retry with a fresh UUID on collision (bounded to avoid infinite loop).
+                                _MAX_SIDECAR_ATTEMPTS = 5
+                                fallback_ref = None
+                                for _ in range(_MAX_SIDECAR_ATTEMPTS):
+                                    slug = uuid.uuid4().hex[:12]
+                                    sidecar = orch_dir / f"failure_analysis.fallback.{slug}.json"
+                                    if _atomic_write_json_exclusive(
+                                        sidecar, emergency_payload, tmp_dir=orch_dir
+                                    ):
+                                        fallback_ref = str(sidecar.relative_to(repo_root))
+                                        break
+                                if fallback_ref is None:
+                                    raise OSError(
+                                        "emergency sidecar write failed after "
+                                        f"{_MAX_SIDECAR_ATTEMPTS} attempts"
+                                    )
+                            fail_output["analysis_ref"] = fallback_ref
+                            fail_output["analysis_ref_error"] = str(primary_exc)
+                            fail_output["analysis_ref_write_mode"] = "emergency_fallback"
+                        except Exception as fallback_exc:  # noqa: BLE001
+                            # Both writes failed — no artifact on disk.
+                            fail_output["reason"] = "failure_analysis_persist_failed"
+                            fail_output["analysis_ref_error"] = str(primary_exc)
+                            fail_output["analysis_ref_fallback_error"] = str(fallback_exc)
+                    print(json.dumps(fail_output, ensure_ascii=False))
                     return 2
                 return proc.returncode if proc.returncode != 0 else 2
 

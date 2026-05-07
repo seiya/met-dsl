@@ -42,7 +42,7 @@ Plan ステージの生成責務を固定し、入力 spec から決定的な re
 - `Plan generate substep` 完了前に `python3 tools/check_artifact_syntax.py --expect-top object` を実行し、`case.resolved.yaml` と `algorithm.resolved.yaml` と `impl.resolved.yaml` と `dependency.resolved.yaml` が標準 parser で復元可能な mapping / object であることを確認しなければならない。
 
 ## 運用ルール
-0. `.json` artifact（`plan_meta.json` 等）の書き込みは `guarded-apply-patch` を唯一の経路とする。Bash 変数代入・heredoc リダイレクト・`python3 -c` によるインライン書き込みは `output_manifest_write_guard` / `forbid_python_inline_write` でブロックされる。`.yaml` / `.md` artifact は `output_manifests/<agent_run_id>.json` の `allowed_file_tool_paths` に列挙された path に限り `Edit` / `Write` tool で直接書き込む。書き込み前に `allowed_output_paths` を確認し、`workspace/` で始まるプロジェクトルート相対パスのみを使用すること。
+0. `.json` artifact（`plan_meta.json` 等）の書き込みは `guarded-apply-patch` を唯一の経路とする。Bash 変数代入・heredoc リダイレクト・`python3 -c` によるインライン書き込みは `output_manifest_write_guard` / `forbid_python_inline_write` でブロックされる。`.yaml` / `.md` artifact は `output_manifests/<agent_run_id>.json` の `allowed_file_tool_paths` に列挙された path に限り `Edit` / `Write` tool で直接書き込む。書き込み前に `allowed_output_paths` を確認し、`workspace/` で始まるプロジェクトルート相対パスのみを使用すること。`plan_meta.json` を含むすべての出力 path は必ず `workspace/plans/<node_key_safe>/<plan_id>/...` 形式で指定すること。`plans/` 等の `workspace/` 接頭辞を欠くパスは `output_manifest_write_guard` でブロックされ `unauthorized_write_violation` として記録される。
 1. `plan_id` を `<slug>_<date>_<seq3>` 形式で発行する。`slug` は `spec_id` 由来の短い可読 token、`date` は `YYYYMMDD`、`seq3` は同日内 3 桁連番とする。
 2. 出力先は `workspace/plans/<node_key_safe>/<plan_id>/` に固定する。
 3. workflow artifact の保存先ルートは `workspace/` のみを許可し、workflow ルート判定は `workspace/` のみを対象とする。

@@ -11,7 +11,7 @@
 - workflow 起動は `python3 tools/run_workflow.py <spec_ref> <until_phase> [--llm <codex|cursor|claude>]` を canonical entrypoint としなければならない。
 - workflow mode は `python3 tools/run_workflow.py ... --mode <dev|prod>` で指定し、未指定時は `dev` を適用しなければならない。
 - `dev` mode では verify 判定の緩和を禁止し、`issue_severity=major|critical` 検出時は fail 停止を必須とする。
-- `dev` mode で fail した場合は `workspace/orchestrations/<orchestration_id>/failure_analysis.json` を保存し、失敗要因と根拠参照を必須記録とする。
+- `dev` mode で fail した場合は `workspace/orchestrations/<orchestration_id>/failure_analysis.json` を保存し、失敗要因と根拠参照を必須記録とする。この file は orchestration agent が `Edit`/`Write` tool で直接書き込む（`failure_analysis.json` は `allowed_file_tool_paths` に登録済み）。`tools/run_workflow.py` は orchestration agent が書かなかった場合のみ同 path へ safety-net として書き込む（既存ファイルは上書きしない）。orchestration agent が既に書いていた場合は runtime 収集データを `failure_analysis.runtime.<uuid12>.json`（例: `failure_analysis.runtime.3a7f9c2e14b0.json`）へ別書きする。uuid12 は実行ごとに一意な 12 文字 hex で、並行実行時の上書き衝突を防ぐ。`tools/run_workflow.py` が返す `analysis_ref` は常に current-run データを指す（canonical が有効なら `failure_analysis.json`、stale/invalid なら sidecar）。一時ファイルを経由する場合は必ず `$TMPDIR`（`workspace/tmp/<orchestration_agent_run_id>/`）を使用し、`/tmp/` ハードコードは禁止する。
 - 起動前確認の canonical implementation は `tools/run_workflow.py` と `tools/orchestration_runtime.py` の組み合わせとし、`preflight` の backend 指定は `tools/run_workflow.py --llm` を通じて行わなければならない。
 - 子 `agent` へ渡す要求定義と判定規則の canonical source は `docs/` と `spec/` と当該試行 artifact に限定し、`tools/` 配下の実装、検証 `script`、test code、validator code を rule source として参照してはならない。
 - validator invocation は `run-gate` を原則とし、直接実行を許可する場合は read-only 検査かつ gate 非依存検査に限定する。許可対象は `validate_workspace_root.py` と `check_artifact_syntax.py` のみとし、それ以外の validator 直実行を禁止する。
@@ -30,7 +30,7 @@
 ## 運用ルール
 1. `tools/run_workflow.py` を実行して `workspace/orchestrations/<orchestration_id>/` の初期化と `preflight.json` 生成を行う。
 2. `tools/run_workflow.py` 以外の経路で workflow を開始してはならない。
-3. `METDSL_WORKFLOW_MODE=1` で起動した orchestration agent は `~/.claude/projects/` 配下の `memory/` ディレクトリ（`MEMORY.md` 等）を読んではならない。workflow 実行は決定論的に進めるため、conversation 外部の persistent state を参照しない。
+3. `METDSL_WORKFLOW_MODE=1` で起動した orchestration agent は `~/.claude/projects/` 配下の `memory/` ディレクトリ（`MEMORY.md` 等）を読んではならない。workflow 実行は決定論的に進めるため、conversation 外部の persistent state を参照しない。Claude Code の auto memory 機能が起動直後に `MEMORY.md` を自動 Read しようとした場合、`read_manifest_read_guard` でブロックされるが **これは想定動作**であり workflow の継続に影響しない。エラーとして扱わず、再試行や `memory/` 配下への参照を試みてはならない。
 4. `preflight` 判定が `pass` でない場合は `set-status --status fail` を実行して停止する。
 5. 最初の `commentary` で、対象 phase、使用する `SKILL`、起動する `agent` 種別、`MCP` 使用箇所を宣言する。
 6. 固定表で phase 種別を確認し、`Plan` / `Generate` / `Tune` では `substep agent`、`Build` / `Execute` / `Judge` / `Promote` では `step agent` を起動対象として確定する。
