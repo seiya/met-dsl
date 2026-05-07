@@ -6960,7 +6960,13 @@ def main(argv: list[str] | None = None) -> int:
     guarded_patch_parser.add_argument("--actor-role", required=True)
     guarded_patch_parser.add_argument("--agent-run-id", required=True)
     guarded_patch_parser.add_argument("--paths-json", required=True, type=_json_string_list_arg)
-    guarded_patch_parser.add_argument("--patch-text", required=True)
+    guarded_patch_parser.add_argument("--patch-text", default=None)
+    guarded_patch_parser.add_argument(
+        "--patch-file",
+        default=None,
+        help="Path to a file containing the unified diff. Mutually exclusive with --patch-text. "
+             "Use this to avoid OS ARG_MAX limits for large patches.",
+    )
     guarded_patch_parser.add_argument("--capability-token", required=True)
 
     gate_parser = subparsers.add_parser(
@@ -7196,13 +7202,105 @@ def main(argv: list[str] | None = None) -> int:
             return 1
     elif args.command == "guarded-apply-patch":
         try:
+            if args.patch_text is not None and args.patch_file is not None:
+                print("error: --patch-text and --patch-file are mutually exclusive", file=sys.stderr)
+                return 1
+            if args.patch_text is None and args.patch_file is None:
+                print("error: one of --patch-text or --patch-file is required", file=sys.stderr)
+                return 1
+            if args.patch_file is not None:
+                import stat as _stat_mod
+                _PATCH_FILE_MAX_BYTES = int(
+                    os.environ.get("METDSL_PATCH_FILE_MAX_BYTES", 10 * 1024 * 1024)
+                )
+                _pf_fd = -1
+                # Validate agent_run_id is a bare UUID before any path construction.
+                # A traversal segment (e.g. "../..") in agent_run_id would expand the
+                # allowed tmp root above the intended per-agent directory.
+                _UUID_RE = re.compile(
+                    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+                    re.IGNORECASE,
+                )
+                if not _UUID_RE.match(args.agent_run_id):
+                    print(
+                        f"error: --agent-run-id '{args.agent_run_id}' is not a valid UUID",
+                        file=sys.stderr,
+                    )
+                    return 1
+                try:
+                    _allowed_tmp = (
+                        Path(repo_root) / "workspace" / "tmp" / args.agent_run_id
+                    ).resolve()
+                    # Pre-open confinement check using strict resolve (follows symlinks).
+                    # This is the fallback path when /proc/self/fd is unavailable.
+                    # O_NOFOLLOW (below) ensures the final path component cannot be a
+                    # symlink, so the only remaining TOCTOU window is on directory
+                    # components — which are within the agent-owned tmp root.
+                    _pf_pre_resolved = Path(args.patch_file).resolve(strict=True)
+                    if os.path.commonpath([_pf_pre_resolved, _allowed_tmp]) != str(_allowed_tmp):
+                        print(
+                            f"error: --patch-file '{args.patch_file}' is outside the agent's "
+                            f"allowed tmp root '{_allowed_tmp}'. "
+                            f"Use $TMPDIR to construct the path.",
+                            file=sys.stderr,
+                        )
+                        return 1
+                    # O_NOFOLLOW refuses to open if the final path component is a symlink,
+                    # preventing leaf-level symlink swap between the pre-open check and open.
+                    _o_nofollow = getattr(os, "O_NOFOLLOW", 0)
+                    _pf_fd = os.open(args.patch_file, os.O_RDONLY | _o_nofollow)
+                    # On Linux, re-verify confinement via /proc/self/fd/<fd> — this check
+                    # operates on the already-open fd and is fully race-free. If /proc is
+                    # unavailable (non-Linux, restricted container) the OSError is caught
+                    # and we rely on the pre-open resolve check + O_NOFOLLOW above.
+                    try:
+                        _fd_real = Path(os.readlink(f"/proc/self/fd/{_pf_fd}")).resolve()
+                        if os.path.commonpath([_fd_real, _allowed_tmp]) != str(_allowed_tmp):
+                            print(
+                                f"error: --patch-file '{args.patch_file}' is outside the agent's "
+                                f"allowed tmp root '{_allowed_tmp}'. "
+                                f"Use $TMPDIR to construct the path.",
+                                file=sys.stderr,
+                            )
+                            return 1
+                    except OSError:
+                        pass  # /proc unavailable; pre-open check + O_NOFOLLOW suffice
+                    # fstat operates on the open fd — not subject to path races.
+                    _pf_stat = os.fstat(_pf_fd)
+                    if not _stat_mod.S_ISREG(_pf_stat.st_mode):
+                        print(
+                            f"error: --patch-file '{args.patch_file}' is not a regular file "
+                            f"(mode {_pf_stat.st_mode:#o})",
+                            file=sys.stderr,
+                        )
+                        return 1
+                    if _pf_stat.st_size > _PATCH_FILE_MAX_BYTES:
+                        print(
+                            f"error: --patch-file '{args.patch_file}' size {_pf_stat.st_size} bytes "
+                            f"exceeds limit {_PATCH_FILE_MAX_BYTES} bytes",
+                            file=sys.stderr,
+                        )
+                        return 1
+                    # fdopen takes ownership of _pf_fd; mark sentinel before hand-off.
+                    _pf_fobj = os.fdopen(_pf_fd, "r", encoding="utf-8")
+                    _pf_fd = -1
+                    with _pf_fobj:
+                        _patch_text = _pf_fobj.read()
+                except (OSError, UnicodeDecodeError) as exc:
+                    print(f"error: cannot read --patch-file '{args.patch_file}': {exc}", file=sys.stderr)
+                    return 1
+                finally:
+                    if _pf_fd >= 0:
+                        os.close(_pf_fd)
+            else:
+                _patch_text = args.patch_text
             result = guarded_apply_patch(
                 repo_root,
                 orchestration_id=args.orchestration_id,
                 actor_role=args.actor_role,
                 agent_run_id=args.agent_run_id,
                 changed_paths=args.paths_json,
-                patch_text=args.patch_text,
+                patch_text=_patch_text,
                 capability_token=args.capability_token,
             )
         except (RuntimeError, ValueError) as exc:

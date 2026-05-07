@@ -27,7 +27,7 @@
 - `invariants` は非空文字列配列としなければならない。
 - `splitting_policy` は `kind` を持つ object としなければならない。
 - `execution_mode` は `sequence` / `conditional` / `iterative` / `columnwise` のみを許可する。
-- `steps[]` の各要素は `step_id` と `step_kind` と `operation_ref` と `inputs` と `outputs` を必須保持しなければならない。
+- `steps[]` の各要素は `step_id` と `step_kind` と `operation_ref` と `inputs` と `outputs` を必須保持しなければならない。`inputs` と `outputs` は非空文字列の list（例: `["U_L", "U_R"]`）とし、object 形式（`[{name: ..., source: ...}]`）は禁止する。正しい形式の参考例は `docs/examples/algorithm.resolved.example.yaml` を参照。
 - `step_kind` は `boundary_apply` / `reconstruct` / `flux_compute` / `source_term` / `time_integrate` / `column_process` / `pointwise_process` / `iterative_solve` / `filter` / `reduction` / `diagnostic` のみを許可する。
 - `algorithm.resolved.yaml` は `problem` の統合順序と `profile` が選択した `component` 群の拘束を分離表現しなければならない。
 - `algorithm.resolved.yaml` は力学、`microphysics`、`radiation`、`land_surface`、`turbulence` を含む気象計算一般で使用できる表現力を持たなければならない。

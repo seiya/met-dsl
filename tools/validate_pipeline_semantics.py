@@ -2586,6 +2586,36 @@ def _validate_derived_contract_file(
         inputs = io_contract.get("inputs")
         if not isinstance(inputs, list):
             violations.append(f"{contract_path}:io_contract.inputs must be list")
+        else:
+            for idx, item in enumerate(inputs):
+                if not isinstance(item, dict):
+                    violations.append(
+                        f"{contract_path}:io_contract.inputs[{idx}] must be object"
+                    )
+                    continue
+                name = item.get("name")
+                if not isinstance(name, str) or not name.strip():
+                    violations.append(
+                        f"{contract_path}:io_contract.inputs[{idx}].name must be non-empty string"
+                    )
+                evidence_ref = item.get("evidence_ref")
+                if not isinstance(evidence_ref, str) or not evidence_ref.strip():
+                    violations.append(
+                        f"{contract_path}:io_contract.inputs[{idx}].evidence_ref must be non-empty string"
+                    )
+                shape_expr = item.get("shape_expr")
+                if shape_expr is not None and (
+                    not isinstance(shape_expr, str) or not shape_expr.strip()
+                ):
+                    violations.append(
+                        f"{contract_path}:io_contract.inputs[{idx}].shape_expr must be non-empty string when present"
+                    )
+                elif isinstance(shape_expr, str):
+                    ok_shape, _, shape_err = _parse_shape_expr(shape_expr)
+                    if not ok_shape:
+                        violations.append(
+                            f"{contract_path}:io_contract.inputs[{idx}].shape_expr invalid ({shape_err})"
+                        )
 
         outputs = io_contract.get("outputs")
         if not isinstance(outputs, list) or not outputs:
@@ -2861,12 +2891,46 @@ def _validate_derived_contract_schema(
     _validate_derived_contract_file(repo_root, contract_path, violations)
 
 
+def _extract_spec_var_names(derived_path: Path) -> set[str] | None:
+    """Return io_contract variable names from derived_contract.json for provenance checks.
+
+    Returns None when the source is unreliable (parse error or non-dict items found),
+    which signals the caller to skip provenance checking rather than hard-fail with an
+    incomplete symbol set.
+    """
+    try:
+        data = _read_json(derived_path)
+    except (json.JSONDecodeError, OSError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    ic = data.get("io_contract")
+    if not isinstance(ic, dict):
+        return None
+    names: set[str] = set()
+    for key in ("inputs", "outputs"):
+        items = ic.get(key)
+        if not isinstance(items, list):
+            return None
+        for item in items:
+            if not isinstance(item, dict):
+                # Non-dict item means the schema is malformed; skip provenance to avoid
+                # false failures (the derived_contract validator will flag this separately).
+                return None
+            name = item.get("name")
+            if not isinstance(name, str) or not name.strip():
+                return None
+            names.add(name.strip())
+    return names
+
+
 def _validate_algorithm_contract_file(
     repo_root: Path,
     contract_path: Path,
     violations: list[str],
     *,
     multidim_node_key: str | None,
+    direct_spec_vars: set[str] | None = None,
 ) -> None:
     try:
         contract = _read_yaml(contract_path)
@@ -2917,11 +2981,13 @@ def _validate_algorithm_contract_file(
 
             for field_name in ("inputs", "outputs"):
                 raw_value = item.get(field_name)
-                if not isinstance(raw_value, list) or not all(
-                    isinstance(token, str) and token.strip() for token in raw_value
+                if (
+                    not isinstance(raw_value, list)
+                    or not raw_value
+                    or not all(isinstance(token, str) and token.strip() for token in raw_value)
                 ):
                     violations.append(
-                        f"{contract_path}:steps[{idx}].{field_name} must be string list"
+                        f"{contract_path}:steps[{idx}].{field_name} must be non-empty string list"
                     )
 
     ordering = contract.get("ordering")
@@ -2998,6 +3064,45 @@ def _validate_algorithm_contract_file(
     derived_field_rules = contract.get("derived_field_rules")
     if not isinstance(derived_field_rules, list):
         violations.append(f"{contract_path}:derived_field_rules must be list")
+
+    # Provenance check: every token in steps[*].inputs/outputs must be traceable to
+    # direct spec I/O (from derived_contract.json), temporaries, or derived_field_rules.
+    # Only performed when direct_spec_vars is provided (plan-stage with derived_contract.json).
+    if direct_spec_vars is not None and isinstance(steps, list):
+        tmp_names: set[str] = set()
+        if isinstance(temporaries, list):
+            for item in temporaries:
+                if isinstance(item, str) and item.strip():
+                    tmp_names.add(item.strip())
+                elif isinstance(item, dict):
+                    n = item.get("name")
+                    if isinstance(n, str) and n.strip():
+                        tmp_names.add(n.strip())
+        dfr_names: set[str] = set()
+        if isinstance(derived_field_rules, list):
+            for item in derived_field_rules:
+                if isinstance(item, dict):
+                    n = item.get("name")
+                    if isinstance(n, str) and n.strip():
+                        dfr_names.add(n.strip())
+        allowed_tokens = direct_spec_vars | tmp_names | dfr_names
+        for step_idx, item in enumerate(steps):
+            if not isinstance(item, dict):
+                continue
+            for field_name in ("inputs", "outputs"):
+                raw_value = item.get(field_name)
+                if not isinstance(raw_value, list):
+                    continue
+                for tok_idx, token in enumerate(raw_value):
+                    if not isinstance(token, str):
+                        continue
+                    stripped = token.strip()
+                    if stripped and stripped not in allowed_tokens:
+                        violations.append(
+                            f"{contract_path}:steps[{step_idx}].{field_name}[{tok_idx}]"
+                            f" token '{stripped}' is not traceable to direct spec I/O,"
+                            f" temporaries, or derived_field_rules (undefined binding)"
+                        )
 
     invariants = contract.get("invariants")
     if not isinstance(invariants, list):
@@ -4669,10 +4774,12 @@ def validate_plan_stage(
         return [str(exc)]
 
     derived_path = plan_dir / "derived_contract.json"
+    direct_spec_vars: set[str] | None = None
     if not derived_path.exists():
         violations.append(f"{derived_path}: missing")
     else:
         _validate_derived_contract_file(repo_root, derived_path, violations)
+        direct_spec_vars = _extract_spec_var_names(derived_path)
 
     algo_path = plan_dir / "algorithm.resolved.yaml"
     if not algo_path.exists():
@@ -4684,6 +4791,7 @@ def validate_plan_stage(
             algo_path,
             violations,
             multidim_node_key=nk,
+            direct_spec_vars=direct_spec_vars,
         )
 
     for optional in ("case.resolved.yaml", "impl.resolved.yaml", "dependency.resolved.yaml"):

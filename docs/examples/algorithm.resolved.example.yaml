@@ -1,0 +1,70 @@
+# algorithm.resolved.yaml — 正しい形式のサンプル
+#
+# このファイルは workflow-plan-generate / workflow-plan-verify スキルの参考形式として提供する。
+# validate_pipeline_semantics ゲートが要求する構造を最小 2-step で示す。
+#
+# 重要: steps[].inputs と steps[].outputs は「非空文字列の list」でなければならない。
+#   OK: ["U_L", "U_R", "g"]
+#   NG: [{name: U_L, source: U_L[0]}, ...]   ← object list は禁止
+#
+# バインディング規約: steps[*].inputs/outputs に現れる各 token は
+#   - controlled_spec.md の直接入出力変数（例: U_L, U_R, g）、または
+#   - temporaries に列挙された中間変数（例: guard_pass）、または
+#   - derived_field_rules に定義された派生量
+# のいずれかに追跡可能でなければならない。
+# コンポーネント分解由来の名前（例: h_L ← U_L[0]）は temporaries に宣言してはじめて有効になる。
+# このサンプルでは分解を行わず controlled_spec.md の入力変数名（U_L 等）をそのまま使う。
+#
+# algorithm_id に "2d"/"3d" を含めない: problem 型 node の 2D/3D 必須契約
+#   （state_variables / required_update_paths / diagnostics_from_state=true）は
+#   このサンプルでは示さない。2D problem の契約例は別途 docs/examples/ に追加予定。
+
+algorithm_id: example_flux_compute
+execution_mode: sequence
+
+steps:
+  - step_id: step_01_boundary_guard
+    step_kind: boundary_apply
+    operation_ref: input_guard
+    # U_L / U_R / U_B / U_T は controlled_spec.md の直接入力変数
+    inputs: ["U_L", "U_R", "U_B", "U_T"]
+    outputs: ["guard_pass"]
+
+  - step_id: step_02_flux_compute
+    step_kind: flux_compute
+    operation_ref: rusanov_flux_2d
+    # U_L / U_R は controlled_spec.md の直接入力; g は重力加速度パラメータ（同上）
+    inputs: ["U_L", "U_R", "g"]
+    outputs: ["F_h", "F_u", "F_v"]
+
+ordering:
+  - step_01_boundary_guard
+  - step_02_flux_compute
+
+control_condition: ""
+
+iteration_contract: {}
+
+# target_variables: このコンポーネントが書き出す最終変数（flux F_h/F_u/F_v）
+update_semantics:
+  target_variables: ["F_h", "F_u", "F_v"]
+  update_order: sequential
+
+# temporaries: step 間でのみ生存する中間変数（spec 外・target 外）
+temporaries:
+  - name: guard_pass
+    shape_expr: "scalar"
+
+derived_field_rules: []
+
+invariants:
+  - "F_h, F_u, F_v are defined wherever guard_pass is true"
+
+splitting_policy:
+  kind: none
+
+# state_variables / required_update_paths / diagnostics_from_state=true は
+# problem 型 node で spec_id に "2d"/"3d" を含む場合の必須フィールド。
+# component 型の flux compute コンポーネントはこれらを省略する。
+diagnostics_from_state: false
+fallback_policy: fail_closed

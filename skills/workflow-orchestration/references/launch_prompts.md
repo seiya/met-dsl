@@ -112,4 +112,87 @@ repair_reason: <repair_reason>
 - `repair_strategy=restart` の場合は、過去出力を流用せず契約入力から再生成すること。
 - 完了時は artifact 参照と status を `orchestration agent` へ返すこと。
 - 完了返答には `launch_reply` として、実施内容と判定結果を平文で含めること。
+
+#### `.json` artifact 書き込み — `guarded-apply-patch` 使用手順
+
+`.json` / `.txt` の出力は必ず以下の手順で行うこと。ファイルへの書き込みを伴う手段（heredoc リダイレクト・`tee`・`python3 -c` によるファイル書き込み・`echo > file` 等）はすべて禁止される。patch text を変数へ組み立てることは許可される。
+
+**手順（正解パターン — create-or-overwrite with retry）:**
+
+`guarded-apply-patch` は内部で `git apply` を使用するため、patch 形式はファイルの存在有無によって異なる。`os.path.exists()` とパッチ適用の間には race window があるため、パッチ失敗時に逆の形式で 1 回リトライする。同一出力パスへの並行書き込みは orchestration の設計上発生しないが、retry/repair で前回の空ファイルが残存する場合に備えて吸収する。
+
+```bash
+# --patch-file を使用することで:
+#   (a) patch text をファイル経由で渡し argv の ARG_MAX 制限を真に回避する
+#   (b) 存在確認と apply の race を retry で吸収する
+# patch ファイルの書き込み先は $TMPDIR（= workspace/tmp/<agent_run_id>/）で
+# output_manifest_write_guard の許可範囲に含まれる。
+python3 - <<'APPLY'
+import os, json, subprocess, pathlib
+
+target = "workspace/plans/<node_key_safe>/<plan_id>/derived_contract.json"
+orchestration_id = os.environ["METDSL_ORCHESTRATION_ID"]
+agent_run_id = "<agent_run_id>"
+capability_token = "<capability_token>"
+patch_file = pathlib.Path(os.environ["TMPDIR"]) / "guarded_patch_input.txt"
+
+new_data = {"spec_id": "<spec_id>", "key": "value"}
+new_content = json.dumps(new_data, indent=2, ensure_ascii=False) + "\n"
+new_lines = new_content.splitlines(keepends=True)
+
+def build_patch(file_exists):
+    """file_exists=True → update/replace 形式, False → /dev/null create 形式"""
+    if file_exists:
+        with open(target) as f:
+            old_lines = f.readlines()
+        if old_lines:
+            hdr = f"--- a/{target}\n+++ b/{target}\n@@ -1,{len(old_lines)} +1,{len(new_lines)} @@\n"
+            bdy = "".join("-" + l for l in old_lines) + "".join("+" + l for l in new_lines)
+        else:
+            # 0 バイト既存ファイル: コンテンツなし → 全行追加 update ハンク
+            hdr = f"--- a/{target}\n+++ b/{target}\n@@ -0,0 +1,{len(new_lines)} @@\n"
+            bdy = "".join("+" + l for l in new_lines)
+    else:
+        # ファイル不在: /dev/null create hunk
+        hdr = f"--- /dev/null\n+++ b/{target}\n@@ -0,0 +1,{len(new_lines)} @@\n"
+        bdy = "".join("+" + l for l in new_lines)
+    return hdr + bdy
+
+def apply(patch_text):
+    patch_file.write_text(patch_text)
+    subprocess.run([
+        "python3", "tools/orchestration_runtime.py", "guarded-apply-patch",
+        "--repo-root", ".",
+        "--orchestration-id", orchestration_id,
+        "--actor-role", "substep",
+        "--agent-run-id", agent_run_id,
+        "--paths-json", json.dumps([target]),
+        "--patch-file", str(patch_file),
+        "--capability-token", capability_token,
+    ], check=True)
+
+# 存在確認→apply。失敗した場合は逆の形式で 1 回リトライして race を吸収する。
+first_exists = os.path.exists(target)
+try:
+    apply(build_patch(first_exists))
+except subprocess.CalledProcessError:
+    apply(build_patch(not first_exists))
+APPLY
 ```
+
+**禁止パターン（NG — hook がブロックする）:**
+
+```bash
+# NG: workspace/ prefix なしのパス
+echo "$CONTENT" > plans/derived_contract.json
+
+# NG: python3 -c によるインラインファイル書き込み
+python3 -c "import json; open('workspace/plans/.../derived_contract.json','w').write(json.dumps({}))"
+
+# NG: heredoc リダイレクト
+cat <<EOF > workspace/plans/.../derived_contract.json
+{"key": "value"}
+EOF
+```
+
+**重要:** `--paths-json` と `--patch-text` の `+++ b/` パスはいずれも `workspace/` で始まるプロジェクトルート相対パスとすること。`plans/...`（`workspace/` 接頭辞なし）や絶対パスは `output_manifest_write_guard` でブロックされる。

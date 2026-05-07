@@ -23,7 +23,8 @@ Plan ステージの生成責務を固定し、入力 spec から決定的な re
 - `algorithm.resolved.yaml` を必須出力とし、`problem` の統合順序、依存 `operation` 呼び出し順序、条件分岐、反復条件、列処理、派生量定義、更新対象を保持する。
 - `algorithm.resolved.yaml` は `algorithm_id` と `execution_mode` と `steps[]` と `ordering` と `control_condition` と `iteration_contract` と `update_semantics` と `temporaries` と `derived_field_rules` と `invariants` と `splitting_policy` を必須保持する。
 - `execution_mode` は `sequence` / `conditional` / `iterative` / `columnwise` のみを許可する。
-- `steps[]` の各要素は `step_id` と `step_kind` と `operation_ref` と `inputs` と `outputs` を必須保持する。
+- `steps[]` の各要素は `step_id` と `step_kind` と `operation_ref` と `inputs` と `outputs` を必須保持する。`inputs` と `outputs` は **非空文字列の list**（例: `["U_L", "U_R", "h_B", "h_T"]`）とし、object 形式（`[{name: ..., source: ...}]`）は禁止する。参考形式: `docs/examples/algorithm.resolved.example.yaml`。
+- `steps[].inputs` / `steps[].outputs` に現れる string token は、`controlled_spec.md` の直接入出力変数・`temporaries` の中間変数・`derived_field_rules` の派生量のいずれかに**追跡可能**でなければならない。スライス・エイリアス・コンポーネント分解による派生名（例: `h_L` ← `U_L[0]`）は `temporaries` または `derived_field_rules` に宣言して provenance を明示すること。直接名・派生名のいずれにも対応付けできないトークンは `algorithm.resolved.yaml` 単独でデータフローを追跡できないため `Plan fail` とする。
 - `step_kind` は `boundary_apply` / `reconstruct` / `flux_compute` / `source_term` / `time_integrate` / `column_process` / `pointwise_process` / `iterative_solve` / `filter` / `reduction` / `diagnostic` のみを許可する。
 - `algorithm.resolved.yaml` は `Generate` の canonical source 入力であり、`Generate` が `controlled_spec.md` を直接読まなくても実装可能な情報を保持しなければならない。
 - `algorithm.summary.md` を自動生成し、閲覧専用 artifact として保存する。
@@ -41,6 +42,7 @@ Plan ステージの生成責務を固定し、入力 spec から決定的な re
 - `Plan generate substep` 完了前に `python3 tools/check_artifact_syntax.py --expect-top object` を実行し、`case.resolved.yaml` と `algorithm.resolved.yaml` と `impl.resolved.yaml` と `dependency.resolved.yaml` が標準 parser で復元可能な mapping / object であることを確認しなければならない。
 
 ## 運用ルール
+0. `.json` artifact（`plan_meta.json` 等）の書き込みは `guarded-apply-patch` を唯一の経路とする。Bash 変数代入・heredoc リダイレクト・`python3 -c` によるインライン書き込みは `output_manifest_write_guard` / `forbid_python_inline_write` でブロックされる。`.yaml` / `.md` artifact は `output_manifests/<agent_run_id>.json` の `allowed_file_tool_paths` に列挙された path に限り `Edit` / `Write` tool で直接書き込む。書き込み前に `allowed_output_paths` を確認し、`workspace/` で始まるプロジェクトルート相対パスのみを使用すること。
 1. `plan_id` を `<slug>_<date>_<seq3>` 形式で発行する。`slug` は `spec_id` 由来の短い可読 token、`date` は `YYYYMMDD`、`seq3` は同日内 3 桁連番とする。
 2. 出力先は `workspace/plans/<node_key_safe>/<plan_id>/` に固定する。
 3. workflow artifact の保存先ルートは `workspace/` のみを許可し、workflow ルート判定は `workspace/` のみを対象とする。
