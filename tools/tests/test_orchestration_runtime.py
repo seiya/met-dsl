@@ -1171,7 +1171,7 @@ shell_tool                       stable             true
                     "parent_agent_run_id": "orch_run_001",
                     "plan_ref": "workspace/plans/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001",
                     "pipeline_ref": "workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001",
-                    "dependency_ref": "workspace/plans/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/dependency.resolved.yaml",
+                    "dependency_ref": _FIX_PLAN_STEP_DEP_REF,
                     "skill_name": "workflow-plan-generate",
                     "skill_ref": "skills/workflow-plan-generate/SKILL.md",
                     "skill_must_read_refs": "",
@@ -1188,7 +1188,7 @@ shell_tool                       stable             true
                 / "launches"
                 / "substep_run_plan_generate_001.prompt.txt"
             )
-            self.assertEqual(prompt_path.read_text(encoding="utf-8"), f"{full_prompt}\n")
+            self.assertEqual(prompt_path.read_text(encoding="utf-8"), full_prompt)
 
     def test_record_launch_prefers_launch_prompt_full_over_prompt(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1220,7 +1220,7 @@ shell_tool                       stable             true
                     "parent_agent_run_id": "orch_run_001",
                     "plan_ref": "workspace/plans/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001",
                     "pipeline_ref": "workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001",
-                    "dependency_ref": "workspace/plans/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/dependency.resolved.yaml",
+                    "dependency_ref": _FIX_PLAN_STEP_DEP_REF,
                     "skill_name": "workflow-plan-generate",
                     "skill_ref": "skills/workflow-plan-generate/SKILL.md",
                     "skill_must_read_refs": "",
@@ -1290,7 +1290,7 @@ shell_tool                       stable             true
                     "parent_agent_run_id": "orch_run_001",
                     "plan_ref": "workspace/plans/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001",
                     "pipeline_ref": "workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001",
-                    "dependency_ref": "workspace/plans/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/dependency.resolved.yaml",
+                    "dependency_ref": _FIX_PLAN_STEP_DEP_REF,
                     "skill_name": "workflow-plan-generate",
                     "skill_ref": "skills/workflow-plan-generate/SKILL.md",
                     "skill_must_read_refs": "",
@@ -1321,8 +1321,7 @@ shell_tool                       stable             true
                     "plan",
                     "generate",
                     "substep_run_plan_generate_001",
-                )
-                + "\n",
+                ),
             )
 
     def test_rejects_non_template_launch_prompt_for_step_or_substep(self) -> None:
@@ -1682,7 +1681,7 @@ shell_tool                       stable             true
                     "parent_agent_run_id": "orch_run_001",
                     "plan_ref": "workspace/plans/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001",
                     "pipeline_ref": "workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001",
-                    "dependency_ref": "workspace/plans/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/dependency.resolved.yaml",
+                    "dependency_ref": _FIX_PLAN_STEP_DEP_REF,
                 },
                 response_payload=_spawn_response_payload("sess_substep_run_plan_verify_001"),
             )
@@ -1725,7 +1724,7 @@ shell_tool                       stable             true
                 "parent_agent_run_id": "orch_run_001",
                 "plan_ref": "workspace/plans/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001",
                 "pipeline_ref": "workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001",
-                "dependency_ref": "workspace/plans/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/dependency.resolved.yaml",
+                "dependency_ref": _FIX_PLAN_STEP_DEP_REF,
                 "skill_name": "workflow-plan-verify",
                 "skill_ref": "skills/workflow-plan-verify/SKILL.md",
                 "issue_severity": "none",
@@ -1923,7 +1922,11 @@ shell_tool                       stable             true
         )
         constraint_lines = _required_launch_prompt_constraint_lines(prepared)
         self.assertTrue(constraint_lines)
-        self.assertFalse(any("read_manifests/" in line for line in constraint_lines))
+        # The read-manifest canonical-source line ("直接読み取ってよい") is a permission
+        # guidance line, not a constraint — it must be excluded.
+        self.assertFalse(any("読み取ってよい" in line for line in constraint_lines))
+        # The cross-agent artifact prohibition is a security constraint — it must be included.
+        self.assertTrue(any("他 agent の内部 artifact" in line for line in constraint_lines))
         self.assertTrue(any("`.json` と `.txt` の出力は" in line for line in constraint_lines))
         self.assertTrue(
             any(
@@ -1974,7 +1977,7 @@ shell_tool                       stable             true
                     "parent_agent_run_id": "orch_run_001",
                     "plan_ref": "workspace/plans/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001",
                     "pipeline_ref": "workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001",
-                    "dependency_ref": "workspace/plans/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/dependency.resolved.yaml",
+                    "dependency_ref": _FIX_PLAN_STEP_DEP_REF,
                     "skill_name": "workflow-plan-generate",
                     "skill_ref": "skills/workflow-plan-generate/SKILL.md",
                     "skill_must_read_refs": "",
@@ -3833,7 +3836,7 @@ shell_tool                       stable             true
                         "parent_agent_run_id": "orch_run_001",
                         "plan_ref": "workspace/plans/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001",
                         "pipeline_ref": "workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001",
-                        "dependency_ref": "workspace/plans/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/dependency.resolved.yaml",
+                        "dependency_ref": _FIX_PLAN_STEP_DEP_REF,
                         "skill_name": "workflow-plan-generate",
                         "skill_ref": "skills/workflow-plan-generate/SKILL.md",
                         "skill_must_read_refs": "",
@@ -6715,7 +6718,7 @@ class PreflightLiveProbeTtlTests(unittest.TestCase):
                             "parent_agent_run_id": "orch_run_001",
                             "plan_ref": "workspace/plans/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001",
                             "pipeline_ref": "workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001",
-                            "dependency_ref": "workspace/plans/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/dependency.resolved.yaml",
+                            "dependency_ref": _FIX_PLAN_STEP_DEP_REF,
                             "skill_name": "workflow-plan-generate",
                             "skill_ref": "skills/workflow-plan-generate/SKILL.md",
                             "skill_must_read_refs": "",
@@ -6805,7 +6808,7 @@ class PreflightLiveProbeTtlTests(unittest.TestCase):
                             "parent_agent_run_id": "orch_run_001",
                             "plan_ref": "workspace/plans/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001",
                             "pipeline_ref": "workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001",
-                            "dependency_ref": "workspace/plans/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/dependency.resolved.yaml",
+                            "dependency_ref": _FIX_PLAN_STEP_DEP_REF,
                             "skill_name": "workflow-plan-generate",
                             "skill_ref": "skills/workflow-plan-generate/SKILL.md",
                             "skill_must_read_refs": "",
@@ -6988,7 +6991,7 @@ class TestPhase1RuleSourceAudit(unittest.TestCase):
                     "parent_agent_run_id": "orch_run_001",
                     "plan_ref": _FIX_PLAN_REF,
                     "pipeline_ref": _FIX_PIPE_REF,
-                    "dependency_ref": _FIX_DEP_REF,
+                    "dependency_ref": _FIX_PLAN_STEP_DEP_REF,
                     "skill_name": "workflow-plan-generate",
                     "skill_ref": "skills/workflow-plan-generate/SKILL.md",
                     "skill_must_read_refs": "",
@@ -7105,7 +7108,7 @@ class TestPhase1RuleSourceAudit(unittest.TestCase):
                     "parent_agent_run_id": "orch_run_001",
                     "plan_ref": _FIX_PLAN_REF,
                     "pipeline_ref": _FIX_PIPE_REF,
-                    "dependency_ref": _FIX_DEP_REF,
+                    "dependency_ref": _FIX_PLAN_STEP_DEP_REF,
                     "skill_name": "workflow-plan-generate",
                     "skill_ref": "skills/workflow-plan-generate/SKILL.md",
                     "skill_must_read_refs": "",
@@ -7186,7 +7189,7 @@ class TestPhase1RuleSourceAudit(unittest.TestCase):
                     "parent_agent_run_id": "orch_run_001",
                     "plan_ref": _FIX_PLAN_REF,
                     "pipeline_ref": _FIX_PIPE_REF,
-                    "dependency_ref": _FIX_DEP_REF,
+                    "dependency_ref": _FIX_PLAN_STEP_DEP_REF,
                     "skill_name": "workflow-plan-generate",
                     "skill_ref": "skills/workflow-plan-generate/SKILL.md",
                     "skill_must_read_refs": "",
@@ -7256,7 +7259,7 @@ class TestPhase1RuleSourceAudit(unittest.TestCase):
                     "parent_agent_run_id": "orch_run_001",
                     "plan_ref": _FIX_PLAN_REF,
                     "pipeline_ref": _FIX_PIPE_REF,
-                    "dependency_ref": _FIX_DEP_REF,
+                    "dependency_ref": _FIX_PLAN_STEP_DEP_REF,
                     "skill_name": "workflow-plan-generate",
                     "skill_ref": "skills/workflow-plan-generate/SKILL.md",
                     "skill_must_read_refs": "",
@@ -7317,7 +7320,7 @@ class TestPhase1RuleSourceAudit(unittest.TestCase):
                     "parent_agent_run_id": "orch_run_001",
                     "plan_ref": _FIX_PLAN_REF,
                     "pipeline_ref": _FIX_PIPE_REF,
-                    "dependency_ref": _FIX_DEP_REF,
+                    "dependency_ref": _FIX_PLAN_STEP_DEP_REF,
                     "skill_name": "workflow-plan-generate",
                     "skill_ref": "skills/workflow-plan-generate/SKILL.md",
                     "skill_must_read_refs": "",
@@ -7404,7 +7407,7 @@ class TestPhase1RuleSourceAudit(unittest.TestCase):
                     "parent_agent_run_id": "orch_run_001",
                     "plan_ref": _FIX_PLAN_REF,
                     "pipeline_ref": _FIX_PIPE_REF,
-                    "dependency_ref": _FIX_DEP_REF,
+                    "dependency_ref": _FIX_PLAN_STEP_DEP_REF,
                     "skill_name": "workflow-plan-generate",
                     "skill_ref": "skills/workflow-plan-generate/SKILL.md",
                     "skill_must_read_refs": "",
@@ -7949,7 +7952,7 @@ class TestPhase2PlanGuardsIntegration(unittest.TestCase):
                 "parent_agent_run_id": "orch_g6",
                 "plan_ref": _FIX_PLAN_REF,
                 "pipeline_ref": _FIX_PIPE_REF,
-                "dependency_ref": _FIX_DEP_REF,
+                "dependency_ref": _FIX_PLAN_STEP_DEP_REF,
                 "skill_name": "workflow-plan-generate",
                 "skill_ref": "skills/workflow-plan-generate/SKILL.md",
                 "skill_must_read_refs": _fixture_skill_must_read_refs_substep("plan", "generate"),
@@ -7971,7 +7974,7 @@ class TestPhase2PlanGuardsIntegration(unittest.TestCase):
                         "parent_agent_run_id": "orch_g6",
                         "plan_ref": _FIX_PLAN_REF,
                         "pipeline_ref": _FIX_PIPE_REF,
-                        "dependency_ref": _FIX_DEP_REF,
+                        "dependency_ref": _FIX_PLAN_STEP_DEP_REF,
                         "skill_name": "workflow-plan-generate",
                         "skill_ref": "skills/workflow-plan-generate/SKILL.md",
                         "skill_must_read_refs": _fixture_skill_must_read_refs_substep("plan", "generate"),

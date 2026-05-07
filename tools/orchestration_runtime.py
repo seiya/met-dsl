@@ -2711,6 +2711,7 @@ def _should_ignore_runtime_snapshot_path(
         f"{orch_root}/phase_state_log.jsonl",
         f"{orch_root}/preflight.json",
         f"{orch_root}/orchestration_run_write_baseline.json",
+        f"{orch_root}/session_run_index.json",
     }
     return token in runtime_files
 
@@ -4045,6 +4046,7 @@ def _required_launch_prompt_constraint_lines(request_payload: dict[str, Any]) ->
         line
         for line in render_launch_prompt_text(request_payload).splitlines()
         if any(fragment in line for fragment in required_fragments)
+        and "読み取ってよい" not in line
     ]
 
 

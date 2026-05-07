@@ -199,6 +199,7 @@ def _create_minimal_execution_tree(
                     {
                         "name": "case_resolved",
                         "source": "case.resolved.yaml",
+                        "evidence_ref": "case.resolved.yaml",
                     }
                 ],
                 "outputs": [
@@ -1126,6 +1127,108 @@ end program shallow_water2d_runner
             violations = validate(repo_root=repo_root, workspace_root="workspace")
             self.assertTrue(
                 any("state_contract must be object for multidimensional problem node" in v for v in violations)
+            )
+
+    def test_non_state_snapshots_artifact_schema_variable_does_not_authorize_step_token(self) -> None:
+        # Regression: schema.variables on a non-state_snapshots artifact must not be
+        # harvested into direct_spec_vars; doing so would let arbitrary names bypass the
+        # undefined-binding provenance check.
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            _create_minimal_execution_tree(
+                repo_root,
+                dep_spec_id="dynamics_shallow_water_flux_2d_rusanov_p0",
+                model_text="module m\nimplicit none\nend module m\n",
+                runner_text="program r\nimplicit none\nend program r\n",
+                run_command=["x", "y"],
+                algorithm_contract={
+                    "algorithm_id": "shallow_water2d_test_algorithm",
+                    "execution_mode": "sequence",
+                    "steps": [
+                        {
+                            "step_id": "compute_flux",
+                            "step_kind": "flux_compute",
+                            "operation_ref": "dynamics_shallow_water_flux_2d_rusanov_p0__compute_flux",
+                            "inputs": ["bogus_var"],
+                            "outputs": ["h", "hu", "hv"],
+                        }
+                    ],
+                    "ordering": [],
+                    "control_condition": [],
+                    "iteration_contract": {"kind": "none"},
+                    "update_semantics": {"mode": "in_place"},
+                    "temporaries": [],
+                    "derived_field_rules": [],
+                    "invariants": [],
+                    "splitting_policy": {"kind": "none"},
+                    "state_contract": {
+                        "state_variables": [
+                            {"name": "h", "shape_expr": "[2,2]"},
+                            {"name": "hu", "shape_expr": "[2,2]"},
+                            {"name": "hv", "shape_expr": "[2,2]"},
+                        ],
+                        "required_update_paths": ["h", "hu", "hv"],
+                        "diagnostics_from_state": True,
+                        "fallback_policy": "fail_closed",
+                    },
+                },
+                derived_contract={
+                    "io_contract": {
+                        "inputs": [
+                            {
+                                "name": "case_resolved",
+                                "source": "case.resolved.yaml",
+                                "evidence_ref": "case.resolved.yaml",
+                            }
+                        ],
+                        "outputs": [
+                            {
+                                "name": "metric",
+                                "shape_expr": "scalar",
+                                "evidence_ref": "raw/metrics_basis.json",
+                                "raw_variables": ["h", "hu", "hv", "time"],
+                            }
+                        ],
+                    },
+                    "semantic_dependency": {"required_sources": []},
+                    "raw_requirements": {
+                        "required_evidence": [
+                            # bogus_var is only declared under a non-state_snapshots
+                            # artifact schema — it must NOT be harvested into
+                            # direct_spec_vars and must NOT authorize step tokens.
+                            {
+                                "artifact": "metrics_basis.json",
+                                "required": True,
+                                "schema": {
+                                    "variables": [{"name": "bogus_var"}],
+                                },
+                            },
+                            {
+                                "artifact": "state_snapshots",
+                                "required": True,
+                                "min_samples": 1,
+                                "schema": {
+                                    "variables": [
+                                        {"name": "h", "shape_expr": "[2,2]"},
+                                        {"name": "hu", "shape_expr": "[2,2]"},
+                                        {"name": "hv", "shape_expr": "[2,2]"},
+                                    ],
+                                    "time_variable": "time",
+                                    "time_shape_expr": "scalar",
+                                },
+                            },
+                        ]
+                    },
+                },
+            )
+            violations = validate_plan_stage(
+                repo_root,
+                "workspace",
+                "workspace/plans/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001",
+            )
+            self.assertTrue(
+                any("bogus_var" in v and "undefined binding" in v for v in violations),
+                f"expected undefined-binding violation for bogus_var; got: {violations}",
             )
 
     def test_detects_makefile_missing_fortran_module_dependency(self) -> None:

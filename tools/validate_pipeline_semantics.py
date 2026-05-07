@@ -2892,11 +2892,15 @@ def _validate_derived_contract_schema(
 
 
 def _extract_spec_var_names(derived_path: Path) -> set[str] | None:
-    """Return io_contract variable names from derived_contract.json for provenance checks.
+    """Return spec-traceable variable names from derived_contract.json for provenance checks.
 
-    Returns None when the source is unreliable (parse error or non-dict items found),
-    which signals the caller to skip provenance checking rather than hard-fail with an
-    incomplete symbol set.
+    Collects names from io_contract.inputs/outputs AND raw_requirements evidence schema
+    variables — the union of these two sets constitutes the full set of variables that
+    can be legitimately traced back to the external spec or evidence artifacts.
+
+    Returns None when the source is unreliable (parse error or non-dict items found in
+    io_contract), which signals the caller to skip provenance checking rather than
+    hard-fail with an incomplete symbol set.
     """
     try:
         data = _read_json(derived_path)
@@ -2921,6 +2925,33 @@ def _extract_spec_var_names(derived_path: Path) -> set[str] | None:
             if not isinstance(name, str) or not name.strip():
                 return None
             names.add(name.strip())
+    # Also collect variables declared in the state_snapshots evidence schema. These are
+    # spec-internal state variables (e.g. h, hu, hv) that are externally evidenced even
+    # though they don't appear in the component's public io_contract interface. Only
+    # state_snapshots entries are considered because derived-contract validation enforces
+    # schema.variables structure exclusively for that artifact type; schemas on other
+    # artifact entries are unchecked and could inject arbitrary names.
+    rr = data.get("raw_requirements")
+    if isinstance(rr, dict):
+        evidence_list = rr.get("required_evidence")
+        if isinstance(evidence_list, list):
+            for ev in evidence_list:
+                if not isinstance(ev, dict):
+                    continue
+                if ev.get("artifact") != "state_snapshots":
+                    continue
+                schema = ev.get("schema")
+                if not isinstance(schema, dict):
+                    continue
+                variables = schema.get("variables")
+                if not isinstance(variables, list):
+                    continue
+                for var in variables:
+                    if not isinstance(var, dict):
+                        continue
+                    n = var.get("name")
+                    if isinstance(n, str) and n.strip():
+                        names.add(n.strip())
     return names
 
 
