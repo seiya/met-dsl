@@ -41,7 +41,7 @@ class RunWorkflowTests(unittest.TestCase):
             self.assertEqual(decisions[0].get("repair_strategy"), "restart")
             self.assertIn("unauthorized_write_violation", str(decisions[0].get("repair_reason")))
 
-    def test_discover_dependency_ref_from_file_spec_ref(self) -> None:
+    def test_discover_source_dependency_ref_from_file_spec_ref(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
             spec_dir = repo_root / "spec" / "problem"
@@ -49,20 +49,20 @@ class RunWorkflowTests(unittest.TestCase):
             (spec_dir / "test.md").write_text("spec\n", encoding="utf-8")
             (spec_dir / "deps.yaml").write_text("nodes: []\n", encoding="utf-8")
 
-            dep_ref = run_workflow._discover_dependency_ref(repo_root, "spec/problem/test.md")
+            dep_ref = run_workflow._discover_source_dependency_ref(repo_root, "spec/problem/test.md")
             self.assertEqual(dep_ref, "spec/problem/deps.yaml")
 
-    def test_discover_dependency_ref_from_directory_spec_ref(self) -> None:
+    def test_discover_source_dependency_ref_from_directory_spec_ref(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
             spec_dir = repo_root / "spec" / "problem"
             spec_dir.mkdir(parents=True, exist_ok=True)
             (spec_dir / "deps.yaml").write_text("nodes: []\n", encoding="utf-8")
 
-            dep_ref = run_workflow._discover_dependency_ref(repo_root, "spec/problem")
+            dep_ref = run_workflow._discover_source_dependency_ref(repo_root, "spec/problem")
             self.assertEqual(dep_ref, "spec/problem/deps.yaml")
 
-    def test_discover_dependency_ref_from_spec_root_file(self) -> None:
+    def test_discover_source_dependency_ref_from_spec_root_file(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
             spec_dir = repo_root / "spec"
@@ -70,10 +70,10 @@ class RunWorkflowTests(unittest.TestCase):
             (spec_dir / "task.md").write_text("spec\n", encoding="utf-8")
             (spec_dir / "deps.yaml").write_text("nodes: []\n", encoding="utf-8")
 
-            dep_ref = run_workflow._discover_dependency_ref(repo_root, "spec/task.md")
+            dep_ref = run_workflow._discover_source_dependency_ref(repo_root, "spec/task.md")
             self.assertEqual(dep_ref, "spec/deps.yaml")
 
-    def test_discover_dependency_ref_rejects_missing_deps_yaml(self) -> None:
+    def test_discover_source_dependency_ref_rejects_missing_deps_yaml(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
             spec_dir = repo_root / "spec" / "problem"
@@ -81,11 +81,11 @@ class RunWorkflowTests(unittest.TestCase):
             (spec_dir / "test.md").write_text("spec\n", encoding="utf-8")
 
             with self.assertRaises(ValueError):
-                run_workflow._discover_dependency_ref(repo_root, "spec/problem/test.md")
+                run_workflow._discover_source_dependency_ref(repo_root, "spec/problem/test.md")
 
-    def test_validate_dependency_ref_rejects_non_spec_deps_path(self) -> None:
+    def test_validate_source_dependency_ref_rejects_non_spec_deps_path(self) -> None:
         with self.assertRaises(ValueError):
-            run_workflow._validate_dependency_ref("workspace/plans/x/dependency.resolved.yaml")
+            run_workflow._validate_source_dependency_ref("workspace/plans/x/dependency.resolved.yaml")
 
     def test_normalize_phase_accepts_known_values(self) -> None:
         self.assertEqual(run_workflow._normalize_phase("plan"), "Plan")
@@ -127,7 +127,7 @@ class RunWorkflowTests(unittest.TestCase):
             orchestration_id="orch_test",
             orchestration_agent_run_id="run_orch_001",
             spec_ref="spec/problem/sample.md",
-            dependency_ref="spec/problem/deps.yaml",
+            source_dependency_ref="spec/problem/deps.yaml",
             until_phase="Judge",
             workflow_mode="dev",
         )
@@ -492,8 +492,8 @@ class RunWorkflowTests(unittest.TestCase):
 
             self.assertEqual(code, 0)
             init_call = next(call for call in observed_calls if call[0] == "init")
-            self.assertIn("--dependency-ref", init_call)
-            dep_idx = init_call.index("--dependency-ref") + 1
+            self.assertIn("--source-dependency-ref", init_call)
+            dep_idx = init_call.index("--source-dependency-ref") + 1
             self.assertEqual(init_call[dep_idx], dep_ref)
 
     def test_main_fails_when_dependency_ref_cannot_be_resolved(self) -> None:

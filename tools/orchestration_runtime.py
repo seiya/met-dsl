@@ -24,6 +24,9 @@ try:
     from tools.hooks.common import (
         _normalize_rel_posix,
         _utc_now_iso,
+        _ALLOWED_BYPRODUCT_EXTENSIONS,
+        _ALLOWED_EXTENSIONLESS_BYPRODUCT_NAMES,
+        _COMPILER_BYPRODUCT_EXTENSIONS,
         validate_pipeline_semantics_stage,
     )
     from tools.meta_contracts import (
@@ -38,6 +41,9 @@ except ModuleNotFoundError:  # pragma: no cover - import bootstrap for direct CL
     from tools.hooks.common import (
         _normalize_rel_posix,
         _utc_now_iso,
+        _ALLOWED_BYPRODUCT_EXTENSIONS,
+        _ALLOWED_EXTENSIONLESS_BYPRODUCT_NAMES,
+        _COMPILER_BYPRODUCT_EXTENSIONS,
         validate_pipeline_semantics_stage,
     )
     from tools.meta_contracts import (
@@ -58,6 +64,9 @@ _NODE_KEY_SAFE_PATTERN = re.compile(
     r"^[a-z][a-z0-9_]*__[a-z0-9][a-z0-9_]*__[0-9][0-9A-Za-z._-]*$"
 )
 _SLUG_DATE_SEQ3_PATTERN = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*_[0-9]{8}_[0-9]{3}$")
+# Safe agent_run_id characters: alphanumerics, hyphens, underscores.
+# Rejects path separators (/, \), dots (..), null bytes, and other traversal vectors.
+_AGENT_RUN_ID_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_-]*$")
 DEFAULT_BACKEND_COMMANDS = {
     "codex": "codex",
     "cursor": "agent",
@@ -515,7 +524,14 @@ def _write_roots_for_launch(
     if st == "plan":
         return [plan_norm]
     if st == "generate":
-        return [_with_trailing_slash(_normalize_rel_posix(f"{pipeline_ref.rstrip('/')}/generate"))]
+        # pipeline_ref contains the unique pipeline_id (reserved by reserve-phase-root),
+        # so lineage.json is exclusive to this run — no concurrent agent shares this path.
+        # bwrap binds lineage.json's parent directory (not the file) so the agent can create
+        # it; the file must not be pre-created before the agent writes it.
+        return [
+            _with_trailing_slash(_normalize_rel_posix(f"{pipeline_ref.rstrip('/')}/generate")),
+            _normalize_rel_posix(f"{pipeline_ref.rstrip('/')}/lineage.json"),
+        ]
     if st == "build":
         return [_with_trailing_slash(_normalize_rel_posix(f"{pipeline_ref.rstrip('/')}/build"))]
     if st == "execute":
@@ -1234,17 +1250,49 @@ def pre_orchestration_start(
     return {"status": "pass", "hook": "pre_orchestration_start", **detail}
 
 
+def _load_write_roots_from_cap(roots_obj: Any) -> list[str]:
+    """Normalize write_roots from capability JSON at load time.
+
+    Trailing-slash entries are directory roots. All other entries are file pins (exact match),
+    including extensionless files like Makefile or LICENSE.
+    """
+    result: list[str] = []
+    for item in (roots_obj if isinstance(roots_obj, list) else []):
+        if not isinstance(item, str) or not item.strip():
+            continue
+        raw = item.strip()
+        if raw.endswith("/"):
+            result.append(_normalize_rel_posix(raw) + "/")
+        else:
+            result.append(_normalize_rel_posix(raw))  # file pin: exact match
+    return result
+
+
+# _ALLOWED_BYPRODUCT_EXTENSIONS and _ALLOWED_EXTENSIONLESS_BYPRODUCT_NAMES are imported
+# from tools.hooks.common — the single source of truth for pre-write and terminal policy.
+
+
 def _path_under_any_write_root(rel_posix: str, write_roots: list[str]) -> bool:
+    """Check whether rel_posix is authorized by any write_roots entry.
+
+    write_roots must be pre-normalized by _load_write_roots_from_cap so that
+    directory entries have trailing '/' and file pins are exact paths (with or without extension).
+    """
     p = _normalize_rel_posix(rel_posix)
     for root in write_roots:
         if not isinstance(root, str) or not root.strip():
             continue
-        base = _with_trailing_slash(_normalize_rel_posix(root))
-        if not base:
+        normalized_root = _normalize_rel_posix(root)
+        if not normalized_root:
             continue
-        base_no = base.rstrip("/")
-        if _repo_path_under_prefix(p, base_no):
-            return True
+        if root.strip().endswith("/"):
+            # Directory entry: prefix match
+            if _repo_path_under_prefix(p, normalized_root):
+                return True
+        else:
+            # File pin: exact match only
+            if p == normalized_root:
+                return True
     return False
 
 
@@ -1310,7 +1358,7 @@ def gate_apply_patch_writes(
             )
             raise RuntimeError("apply_patch gate: invalid capability_token")
         roots_obj = cap.get("write_roots")
-        roots = [str(x) for x in roots_obj] if isinstance(roots_obj, list) else []
+        roots = _load_write_roots_from_cap(roots_obj)
         node_key = str(cap.get("node_key", "")).strip()
         step = str(cap.get("step", "")).strip().lower()
         if node_key and step:
@@ -1889,11 +1937,15 @@ def _write_allowed_output_manifest(
     agent_role: str | None = None,
     allowed_tmp_root: str | None = None,
 ) -> str:
-    normalized = [
-        _normalize_rel_posix(p)
-        for p in allowed_output_paths
-        if isinstance(p, str) and p.strip()
-    ]
+    normalized = []
+    for p in allowed_output_paths:
+        if not isinstance(p, str) or not p.strip():
+            continue
+        raw = p.strip()
+        if raw.endswith("/"):
+            normalized.append(_normalize_rel_posix(raw) + "/")
+        else:
+            normalized.append(_normalize_rel_posix(raw))
     file_tool_normalized = [
         _normalize_rel_posix(p)
         for p in (allowed_file_tool_paths or [])
@@ -1945,8 +1997,17 @@ def _validate_paths_against_allowed_output_manifest(
     allowed_obj = manifest.get("allowed_output_paths")
     if not isinstance(allowed_obj, list) or not all(isinstance(x, str) for x in allowed_obj):
         raise ValueError("allowed_output_paths manifest must include string array allowed_output_paths")
-    allowed = {_normalize_rel_posix(str(p)) for p in allowed_obj if isinstance(p, str) and str(p).strip()}
-    if not allowed:
+    allowed_files: set[str] = set()
+    allowed_dirs: list[str] = []
+    for p in allowed_obj:
+        if not isinstance(p, str) or not p.strip():
+            continue
+        raw_p = p.strip()
+        if raw_p.endswith("/"):
+            allowed_dirs.append(_normalize_rel_posix(raw_p))
+        else:
+            allowed_files.add(_normalize_rel_posix(raw_p))
+    if not allowed_files and not allowed_dirs:
         raise ValueError("allowed_output_paths manifest must include non-empty allowed_output_paths")
     tmp_root_raw = manifest.get("allowed_tmp_root", "")
     tmp_norm = ""
@@ -1961,7 +2022,16 @@ def _validate_paths_against_allowed_output_manifest(
         if not rel:
             invalid_paths.append(str(raw))
             continue
-        if rel in allowed:
+        if rel in allowed_files:
+            continue
+        if allowed_dirs and any(_repo_path_under_prefix(rel, d) for d in allowed_dirs):
+            # Apply same extension policy as terminal validation — fail before mutation.
+            ext = os.path.splitext(rel)[1].lower()
+            if ext in _ALLOWED_BYPRODUCT_EXTENSIONS:
+                continue
+            if ext == "" and os.path.basename(rel).lower() in _ALLOWED_EXTENSIONLESS_BYPRODUCT_NAMES:
+                continue
+            denied.append(rel)
             continue
         if tmp_prefix and (rel == tmp_norm or rel.startswith(tmp_prefix)):
             continue
@@ -1998,11 +2068,11 @@ def _allowed_output_paths_for_launch(
             raise ValueError(f"allowed_output_paths[{idx}] must be non-empty string")
         token_raw = item.strip().replace("\\", "/")
         if token_raw.endswith("/"):
-            raise ValueError(
-                f"allowed_output_paths[{idx}] must be file path (directory is forbidden): {item!r}"
-            )
-        token = _normalize_rel_posix(token_raw)
-        if not token:
+            # Directory allowlist entry: stored with trailing slash preserved
+            token = _normalize_rel_posix(token_raw.rstrip("/")) + "/"
+        else:
+            token = _normalize_rel_posix(token_raw)
+        if not token or token == "/":
             raise ValueError(f"allowed_output_paths[{idx}] must be valid relative path")
         allowed.append(token)
     normalized_roots = [
@@ -2030,6 +2100,17 @@ def _allowed_output_paths_for_launch(
     tune_prefix = f"{pipeline_ref}/tune/" if pipeline_ref else ""
 
     def _matches_phase_contract(path: str) -> bool:
+        # Directory allowlist entries (trailing slash): validate the directory itself is permitted.
+        if path.endswith("/"):
+            dir_path = path.rstrip("/")
+            if step_token == "generate":
+                if generate_prefix and dir_path.startswith(generate_prefix):
+                    # Allow only <gen_id>/src and its subdirectories; the generate root itself is forbidden
+                    tail = dir_path[len(generate_prefix):]
+                    parts = [seg for seg in tail.split("/") if seg]
+                    if len(parts) >= 2 and parts[1] == "src":
+                        return True
+            return False
         if step_token == "plan":
             return path in plan_required
         if step_token == "generate":
@@ -2165,10 +2246,12 @@ def _allowed_file_tool_paths_for_launch(
     allowed_output_paths: Sequence[str],
 ) -> list[str]:
     raw = request_payload.get("allowed_file_tool_paths")
+    # Exclude directory entries (trailing "/") from allowed_set: _normalize_rel_posix strips the
+    # slash, which would make directory paths appear extension-free and pass _is_direct_write_path.
     allowed_set = {
         _normalize_rel_posix(str(item))
         for item in allowed_output_paths
-        if isinstance(item, str) and item.strip()
+        if isinstance(item, str) and item.strip() and not item.strip().endswith("/")
     }
     if raw is None:
         # Auto-derive: every output path whose extension is not CLI-managed
@@ -2219,9 +2302,13 @@ def _validate_child_write_contract_preflight(
         raise ValueError("child_write_contract_preflight: allowed_output_paths must be non-empty")
     for idx, path in enumerate(allowed):
         if path.endswith("/"):
-            raise ValueError(
-                f"child_write_contract_preflight: allowed_output_paths[{idx}] must be file path, got {path!r}"
-            )
+            # Directory allowlist entry — check it is under a write root (using the dir path itself).
+            if roots and not any(_repo_path_under_prefix(path, root) for root in roots):
+                raise ValueError(
+                    "child_write_contract_preflight: allowed_output_paths directory entry must be under "
+                    f"capability write_roots: {path!r}"
+                )
+            continue
         if roots and not any(_repo_path_under_prefix(path, root) for root in roots):
             raise ValueError(
                 "child_write_contract_preflight: allowed_output_path must be under capability write_roots: "
@@ -2413,16 +2500,59 @@ def build_bwrap_profile(
             if isinstance(p, str) and _normalize_rel_posix(str(p))
         }
     )
-    write_roots = sorted(
-        {
-            _normalize_rel_posix(str(p))
-            for p in writes_obj
-            if isinstance(p, str) and _normalize_rel_posix(str(p))
-        }
-    )
-    for rel in write_roots:
-        abs_write_root = (repo_root / rel).resolve()
-        abs_write_root.mkdir(parents=True, exist_ok=True)
+    write_roots = _load_write_roots_from_cap(writes_obj)
+    resolved_repo_root = repo_root.resolve()
+    created_file_pin_stubs: list[dict[str, Any]] = []
+    for root_entry in write_roots:
+        if root_entry.endswith("/"):
+            candidate = (repo_root / root_entry.rstrip("/")).resolve()
+            try:
+                candidate.relative_to(resolved_repo_root)
+            except ValueError:
+                raise ValueError(
+                    f"write_roots entry {root_entry!r} resolves outside repo_root "
+                    f"({candidate} is not under {resolved_repo_root})"
+                )
+            candidate.mkdir(parents=True, exist_ok=True)
+        else:
+            # File pin: pre-create so bwrap can --bind it at file granularity.
+            # File-level bind ensures bwrap cannot write to sibling files/directories —
+            # the sandbox boundary is exactly the declared pin, nothing broader.
+            # The stub is created empty here; _cleanup_empty_file_pin_stubs removes it
+            # if the agent terminates without writing to it.
+            pin_path = (repo_root / root_entry).resolve()
+            try:
+                pin_path.relative_to(resolved_repo_root)
+            except ValueError:
+                raise ValueError(
+                    f"write_roots entry {root_entry!r} resolves outside repo_root "
+                    f"({pin_path} is not under {resolved_repo_root})"
+                )
+            pin_path.parent.mkdir(parents=True, exist_ok=True)
+            # Check the original (unresolved) path for symlinks — resolve() follows
+            # symlinks so is_symlink() on the resolved path is always False.
+            orig_pin_path = repo_root / _normalize_rel_posix(root_entry)
+            if orig_pin_path.is_symlink():
+                raise ValueError(
+                    f"write_roots file pin {root_entry!r} is a symlink ({orig_pin_path}); "
+                    f"only regular files are permitted as file pins"
+                )
+            if pin_path.exists():
+                # Reject if the resolved path is a directory — binding it via bwrap
+                # would expose the entire subtree as writable.
+                if pin_path.is_dir():
+                    raise ValueError(
+                        f"write_roots file pin {root_entry!r} resolves to a directory ({pin_path}); "
+                        f"add a trailing '/' to declare a directory write root instead"
+                    )
+            else:
+                pin_path.touch()
+                # Record path + mtime_ns so cleanup can distinguish an untouched stub
+                # from a legitimately empty file written by a subprocess after touch().
+                created_file_pin_stubs.append({
+                    "path": _normalize_rel_posix(root_entry),
+                    "mtime_ns": pin_path.stat().st_mtime_ns,
+                })
     sandbox_root = _orchestration_root(repo_root, orchestration_id) / "sandboxes" / agent_run_id
     tmp_root = sandbox_root / "tmp"
     tmp_root.mkdir(parents=True, exist_ok=True)
@@ -2444,6 +2574,7 @@ def build_bwrap_profile(
         "workdir": str(repo_root),
         "env": child_env,
         "generated_at": _utc_now_iso(),
+        "created_file_pin_stubs": created_file_pin_stubs,
     }
 
 
@@ -2487,7 +2618,29 @@ def render_bwrap_command(
             continue
         abs_path = (Path(repo_root) / _normalize_rel_posix(rel)).resolve()
         if not abs_path.exists():
+            # File pins must be pre-created by build_bwrap_profile before render.
+            if not rel.strip().endswith("/"):
+                raise ValueError(
+                    f"write_roots file pin {rel!r} does not exist; "
+                    f"build_bwrap_profile must pre-create it before render_bwrap_command is called"
+                )
             continue
+        # File pins must be plain regular files — not directories or symlinks.
+        # Binding a directory would make the entire subtree writable, not just one file.
+        # Check the original (unresolved) path for symlinks: resolve() follows symlinks
+        # so is_symlink() on abs_path (resolved) is always False.
+        if not rel.strip().endswith("/"):
+            orig_path = Path(repo_root) / _normalize_rel_posix(rel)
+            if orig_path.is_symlink():
+                raise ValueError(
+                    f"write_roots file pin {rel!r} is a symlink ({orig_path}); "
+                    f"only regular files are permitted as file pins"
+                )
+            if not abs_path.is_file():
+                raise ValueError(
+                    f"write_roots file pin {rel!r} resolves to a non-file ({abs_path}); "
+                    f"add a trailing '/' to declare a directory write root instead"
+                )
         abs_token = str(abs_path)
         cmd.extend(["--bind", abs_token, abs_token])
     ws_rw = str(profile.get("workspace_tmp_rw_abs") or "").strip()
@@ -3094,6 +3247,86 @@ def _child_managed_paths_excludable_from_orchestration_diff(
     return excludable
 
 
+def _cleanup_empty_file_pin_stubs(
+    repo_root: Path,
+    orchestration_id: str,
+    *,
+    agent_run_id: str,
+) -> None:
+    """Remove empty file-pin stubs created by this run's build_bwrap_profile.
+
+    Only paths recorded in the sandbox profile's `created_file_pin_stubs` are
+    candidates — pre-existing files are never touched. A stub is removed iff:
+    - It is listed in created_file_pin_stubs (was created as empty stub by this run)
+    - It currently exists and is zero bytes
+    - It was not written by the agent via guarded-apply-patch (not in gate_changed_paths)
+    """
+    profile_path = _sandbox_profiles_dir(repo_root, orchestration_id) / f"{agent_run_id}.json"
+    if not profile_path.exists():
+        return
+    try:
+        profile_doc = _read_json(profile_path)
+    except (OSError, json.JSONDecodeError):
+        return
+    if not isinstance(profile_doc, dict):
+        return
+    stubs_obj = profile_doc.get("created_file_pin_stubs")
+    if not isinstance(stubs_obj, list):
+        return
+    # Build path → recorded_mtime_ns mapping for stubs created by this run.
+    # Each entry is {"path": str, "mtime_ns": int} recorded immediately after touch().
+    candidate_stubs: dict[str, int] = {}
+    for entry in stubs_obj:
+        if isinstance(entry, dict):
+            p = entry.get("path")
+            m = entry.get("mtime_ns")
+            if isinstance(p, str) and p.strip() and isinstance(m, int):
+                candidate_stubs[_normalize_rel_posix(p)] = m
+    if not candidate_stubs:
+        return
+    gate_changed = {
+        _normalize_rel_posix(p)
+        for p in _load_cumulative_gate_changed_paths_for_run(
+            repo_root, orchestration_id, agent_run_id=agent_run_id
+        )
+        if p
+    }
+    for norm, recorded_mtime_ns in candidate_stubs.items():
+        if norm in gate_changed:
+            continue
+        stub_path = repo_root / norm
+        if not stub_path.exists():
+            continue
+        st = stub_path.stat()
+        # Only delete if the file is still zero bytes AND its mtime is unchanged since
+        # our touch() — a subprocess that writes (even zero bytes) updates the mtime.
+        if st.st_size == 0 and st.st_mtime_ns == recorded_mtime_ns:
+            try:
+                stub_path.unlink()
+            except OSError:
+                pass
+
+
+def _write_directory_authorized_paths(
+    repo_root: Path,
+    orchestration_id: str,
+    *,
+    agent_run_id: str,
+    directory_authorized_paths: list[str],
+    manifest_allowed_output_dirs: list[str],
+) -> None:
+    out = _violations_dir(repo_root, orchestration_id).parent / "audit" / f"{agent_run_id}.directory_authorized_paths.json"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    _write_json(out, {
+        "kind": "directory_authorized_paths",
+        "orchestration_id": orchestration_id,
+        "agent_run_id": agent_run_id,
+        "recorded_at": _utc_now_iso(),
+        "manifest_allowed_output_dirs": manifest_allowed_output_dirs,
+        "directory_authorized_paths": directory_authorized_paths,
+    })
+
+
 def _write_unauthorized_write_violation(
     repo_root: Path,
     orchestration_id: str,
@@ -3107,6 +3340,7 @@ def _write_unauthorized_write_violation(
     missing_from_gate_changed_paths: list[str],
     write_roots: list[str],
     manifest_file_tool_paths: list[str] | None = None,
+    directory_authorized_paths: list[str] | None = None,
 ) -> Path:
     out = _violations_dir(repo_root, orchestration_id) / f"{agent_run_id}.unauthorized_write_violation.json"
     record: dict[str, Any] = {
@@ -3124,6 +3358,8 @@ def _write_unauthorized_write_violation(
     }
     if manifest_file_tool_paths is not None:
         record["manifest_file_tool_paths"] = manifest_file_tool_paths
+    if directory_authorized_paths is not None:
+        record["directory_authorized_paths"] = directory_authorized_paths
     _write_json(out, record)
     return out
 
@@ -3178,7 +3414,7 @@ def _validate_actual_write_paths(
         if not isinstance(cap_doc, dict):
             raise ValueError(f"capability must be object for terminal write validation: {cap_path}")
         roots_obj = cap_doc.get("write_roots")
-        write_roots = [str(item) for item in roots_obj] if isinstance(roots_obj, list) else []
+        write_roots = _load_write_roots_from_cap(roots_obj)
 
     unauthorized: list[str] = []
     parent_tmp_root: str | None = None
@@ -3218,8 +3454,10 @@ def _validate_actual_write_paths(
     )
     manifest_file_tool_paths: set[str] = set()
     manifest_allowed_tmp_root: str | None = None
+    manifest_allowed_output_dirs: list[str] = []
     if actor_role == "orchestration":
         declared_paths = sorted(set(output_refs) | set(gate_changed_paths))
+        exact_declared_paths = declared_paths  # orchestration: no directory entries
     else:
         # step/substep: include manifest-permitted direct write paths so that
         # `.yaml` / `.md` / source code outputs written via Edit/Write are not
@@ -3240,6 +3478,11 @@ def _validate_actual_write_paths(
                     for item in ftp_obj
                     if isinstance(item, str) and item.strip()
                 }
+            aop_obj = manifest_doc.get("allowed_output_paths")
+            if isinstance(aop_obj, list):
+                for item in aop_obj:
+                    if isinstance(item, str) and item.strip().endswith("/"):
+                        manifest_allowed_output_dirs.append(_normalize_rel_posix(item.strip()))
             _tmp_raw = manifest_doc.get("allowed_tmp_root", "")
             if isinstance(_tmp_raw, str) and _tmp_raw.strip():
                 _tmp_norm = _normalize_rel_posix(_tmp_raw.strip())
@@ -3250,7 +3493,13 @@ def _validate_actual_write_paths(
                         f"expected per-run root {_expected_tmp!r}"
                     )
                 manifest_allowed_tmp_root = _tmp_norm
-        declared_paths = sorted(set(gate_changed_paths) | manifest_file_tool_paths)
+        exact_declared_paths = sorted(set(gate_changed_paths) | manifest_file_tool_paths)
+        declared_paths = sorted(set(exact_declared_paths) | set(manifest_allowed_output_dirs))
+    # Use a frozenset for O(1) exact-match lookup. exact_declared_paths contains
+    # concrete file paths (gate_changed_paths + manifest_file_tool_paths); prefix
+    # matching would allow a directory token that leaked in to bypass extension policy.
+    _exact_declared_set: frozenset[str] = frozenset(exact_declared_paths)
+    directory_authorized: list[str] = []
     for path in actual_changed_paths:
         if parent_tmp_root and _repo_path_under_prefix(path, parent_tmp_root):
             continue
@@ -3259,13 +3508,27 @@ def _validate_actual_write_paths(
         if write_roots and not _path_under_any_write_root(path, write_roots):
             unauthorized.append(path)
             continue
-        if declared_paths and any(_repo_path_under_prefix(path, decl) for decl in declared_paths):
+        if _exact_declared_set and path in _exact_declared_set:
+            continue
+        if manifest_allowed_output_dirs and any(_repo_path_under_prefix(path, d) for d in manifest_allowed_output_dirs):
+            # All writes under a directory allowlist must have gate provenance (guarded-apply-patch).
+            # Compiler byproducts (.mod, .o, .a) are also unauthorized without provenance —
+            # agents must clean them up before record-agent-run to prevent unaudited binary injection.
+            unauthorized.append(path)
             continue
         if not declared_paths:
             unauthorized.append(path)
             continue
         unauthorized.append(path)
 
+    if directory_authorized:
+        _write_directory_authorized_paths(
+            repo_root,
+            orchestration_id,
+            agent_run_id=run_id,
+            directory_authorized_paths=directory_authorized,
+            manifest_allowed_output_dirs=manifest_allowed_output_dirs,
+        )
     if unauthorized:
         violation_path = _write_unauthorized_write_violation(
             repo_root,
@@ -3279,13 +3542,19 @@ def _validate_actual_write_paths(
             missing_from_gate_changed_paths=missing_from_gate_changed_paths,
             write_roots=write_roots,
             manifest_file_tool_paths=sorted(manifest_file_tool_paths) if manifest_file_tool_paths else None,
+            directory_authorized_paths=directory_authorized if directory_authorized else None,
         )
+        if actor_role in {"step", "substep"}:
+            # Cleanup runs AFTER violation is recorded so evidence is preserved for auditors.
+            _cleanup_empty_file_pin_stubs(repo_root, orchestration_id, agent_run_id=run_id)
         raise ValueError(
             "terminal run has unauthorized write paths: "
             + ", ".join(unauthorized)
             + f" (violation: {violation_path})"
         )
     if actor_role in {"step", "substep"}:
+        # Success path: clean up any stubs the agent never wrote to.
+        _cleanup_empty_file_pin_stubs(repo_root, orchestration_id, agent_run_id=run_id)
         _write_managed_write_snapshot(
             repo_root,
             orchestration_id,
@@ -5732,7 +6001,7 @@ def init_orchestration(
     orchestration_id: str,
     *,
     spec_ref: str | None = None,
-    dependency_ref: str | None = None,
+    source_dependency_ref: str | None = None,
     status: str = "running",
     agent_backend: str = "codex",
 ) -> dict[str, Any]:
@@ -5752,8 +6021,8 @@ def init_orchestration(
     }
     if spec_ref:
         meta["spec_ref"] = spec_ref
-    if dependency_ref:
-        meta["dependency_ref"] = dependency_ref
+    if source_dependency_ref:
+        meta["source_dependency_ref"] = source_dependency_ref
     meta_path = root / "orchestration_meta.json"
     orchestration_agent_run_id: str | None = None
     existing: dict[str, Any] | None = None
@@ -5935,9 +6204,22 @@ def record_launch(
     response_payload: dict[str, Any],
     relation_type: str = "launch",
 ) -> dict[str, Any]:
+    if not isinstance(parent_agent_run_id, str) or not parent_agent_run_id.strip():
+        raise ValueError("record-launch requires non-empty parent_agent_run_id")
+    parent_agent_run_id = parent_agent_run_id.strip()
+    if not _AGENT_RUN_ID_RE.match(parent_agent_run_id):
+        raise ValueError(
+            f"record-launch: parent_agent_run_id contains invalid characters "
+            f"(got {parent_agent_run_id!r}); only alphanumerics, hyphens, and underscores are allowed"
+        )
     if not isinstance(child_agent_run_id, str) or not child_agent_run_id.strip():
         raise ValueError("record-launch requires non-empty child_agent_run_id")
     child_agent_run_id = child_agent_run_id.strip()
+    if not _AGENT_RUN_ID_RE.match(child_agent_run_id):
+        raise ValueError(
+            f"record-launch: child_agent_run_id contains invalid characters "
+            f"(got {child_agent_run_id!r}); only alphanumerics, hyphens, and underscores are allowed"
+        )
     preflight_payload: dict[str, Any] | None = None
     try:
         preflight_payload = _require_preflight_launchable(
@@ -6995,7 +7277,7 @@ def main(argv: list[str] | None = None) -> int:
     init_parser.add_argument("--repo-root", required=True)
     init_parser.add_argument("--orchestration-id", required=True)
     init_parser.add_argument("--spec-ref")
-    init_parser.add_argument("--dependency-ref")
+    init_parser.add_argument("--source-dependency-ref")
     init_parser.add_argument("--status", default="running")
     init_parser.add_argument("--agent-backend", default="codex", choices=sorted(SUPPORTED_BACKENDS))
     init_parser.add_argument(
@@ -7291,7 +7573,7 @@ def main(argv: list[str] | None = None) -> int:
                 repo_root=repo_root,
                 orchestration_id=args.orchestration_id,
                 spec_ref=args.spec_ref,
-                dependency_ref=args.dependency_ref,
+                source_dependency_ref=args.source_dependency_ref,
                 status=args.status,
                 agent_backend=args.agent_backend,
             )

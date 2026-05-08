@@ -410,5 +410,265 @@ class HookCommonTests(unittest.TestCase):
         self.assertNotIn("continue_processing", body)
 
 
+class ValidateWriteAccessDirectoryAllowlistTests(unittest.TestCase):
+    """validate_write_access: extension policy must be enforced for directory allowlist entries."""
+
+    def _write_manifest(
+        self,
+        repo_root: Path,
+        *,
+        orchestration_id: str,
+        agent_run_id: str,
+        allowed_output_paths: list[str],
+    ) -> None:
+        from pathlib import Path
+        manifest_dir = (
+            repo_root
+            / "workspace"
+            / "orchestrations"
+            / orchestration_id
+            / "output_manifests"
+        )
+        manifest_dir.mkdir(parents=True, exist_ok=True)
+        (manifest_dir / f"{agent_run_id}.json").write_text(
+            json.dumps({
+                "allowed_output_paths": allowed_output_paths,
+                "allowed_file_tool_paths": [],
+            }),
+            encoding="utf-8",
+        )
+
+    def _call(
+        self,
+        repo_root: "Path",
+        orchestration_id: str,
+        agent_run_id: str,
+        file_path: str,
+    ) -> "HookDecision":
+        from tools.hooks.common import validate_write_access
+        from pathlib import Path
+        return validate_write_access(repo_root, orchestration_id, agent_run_id, file_path)
+
+    def test_allows_known_extension_under_directory_entry(self) -> None:
+        import tempfile
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._write_manifest(
+                repo_root, orchestration_id="orch1", agent_run_id="run1",
+                allowed_output_paths=["workspace/pipelines/a/generate/g1/src/"],
+            )
+            decision = self._call(
+                repo_root, "orch1", "run1",
+                "workspace/pipelines/a/generate/g1/src/flux.f90",
+            )
+            self.assertEqual(decision.action, HookDecisionAction.ALLOW)
+
+    def test_blocks_makefile_under_directory_entry(self) -> None:
+        """Makefile is a build-control file — requires explicit file pin."""
+        import tempfile
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._write_manifest(
+                repo_root, orchestration_id="orch2", agent_run_id="run2",
+                allowed_output_paths=["workspace/pipelines/a/generate/g1/src/"],
+            )
+            decision = self._call(
+                repo_root, "orch2", "run2",
+                "workspace/pipelines/a/generate/g1/src/Makefile",
+            )
+            self.assertEqual(decision.action, HookDecisionAction.BLOCK)
+
+    def test_blocks_script_under_directory_entry(self) -> None:
+        import tempfile
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._write_manifest(
+                repo_root, orchestration_id="orch3", agent_run_id="run3",
+                allowed_output_paths=["workspace/pipelines/a/generate/g1/src/"],
+            )
+            decision = self._call(
+                repo_root, "orch3", "run3",
+                "workspace/pipelines/a/generate/g1/src/exploit.sh",
+            )
+            self.assertEqual(decision.action, HookDecisionAction.BLOCK)
+
+    def test_blocks_unknown_extensionless_under_directory_entry(self) -> None:
+        import tempfile
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._write_manifest(
+                repo_root, orchestration_id="orch4", agent_run_id="run4",
+                allowed_output_paths=["workspace/pipelines/a/generate/g1/src/"],
+            )
+            decision = self._call(
+                repo_root, "orch4", "run4",
+                "workspace/pipelines/a/generate/g1/src/myexe",
+            )
+            self.assertEqual(decision.action, HookDecisionAction.BLOCK)
+
+    def test_blocks_shared_lib_under_directory_entry(self) -> None:
+        import tempfile
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._write_manifest(
+                repo_root, orchestration_id="orch5", agent_run_id="run5",
+                allowed_output_paths=["workspace/pipelines/a/generate/g1/src/"],
+            )
+            decision = self._call(
+                repo_root, "orch5", "run5",
+                "workspace/pipelines/a/generate/g1/src/lib.so",
+            )
+            self.assertEqual(decision.action, HookDecisionAction.BLOCK)
+
+    def test_blocks_cmake_under_directory_entry(self) -> None:
+        """Build control file (.cmake) requires explicit file pin — can inject arbitrary commands."""
+        import tempfile
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._write_manifest(
+                repo_root, orchestration_id="orch_cmake", agent_run_id="run_cmake",
+                allowed_output_paths=["workspace/pipelines/a/generate/g1/src/"],
+            )
+            decision = self._call(
+                repo_root, "orch_cmake", "run_cmake",
+                "workspace/pipelines/a/generate/g1/src/CMakeLists.txt",
+            )
+            self.assertEqual(decision.action, HookDecisionAction.BLOCK)
+
+    def test_blocks_mk_under_directory_entry(self) -> None:
+        """Build control file (.mk) requires explicit file pin."""
+        import tempfile
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._write_manifest(
+                repo_root, orchestration_id="orch_mk", agent_run_id="run_mk",
+                allowed_output_paths=["workspace/pipelines/a/generate/g1/src/"],
+            )
+            decision = self._call(
+                repo_root, "orch_mk", "run_mk",
+                "workspace/pipelines/a/generate/g1/src/rules.mk",
+            )
+            self.assertEqual(decision.action, HookDecisionAction.BLOCK)
+
+    def test_blocks_toml_under_directory_entry(self) -> None:
+        """Build control file (.toml) requires explicit file pin."""
+        import tempfile
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._write_manifest(
+                repo_root, orchestration_id="orch_toml", agent_run_id="run_toml",
+                allowed_output_paths=["workspace/pipelines/a/generate/g1/src/"],
+            )
+            decision = self._call(
+                repo_root, "orch_toml", "run_toml",
+                "workspace/pipelines/a/generate/g1/src/build.toml",
+            )
+            self.assertEqual(decision.action, HookDecisionAction.BLOCK)
+
+    def test_blocks_nml_under_directory_entry(self) -> None:
+        """Namelist file (.nml) requires explicit file pin — data injection risk."""
+        import tempfile
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._write_manifest(
+                repo_root, orchestration_id="orch_nml", agent_run_id="run_nml",
+                allowed_output_paths=["workspace/pipelines/a/generate/g1/src/"],
+            )
+            decision = self._call(
+                repo_root, "orch_nml", "run_nml",
+                "workspace/pipelines/a/generate/g1/src/params.nml",
+            )
+            self.assertEqual(decision.action, HookDecisionAction.BLOCK)
+
+    def test_blocks_json_under_directory_entry(self) -> None:
+        """Structured data (.json) requires explicit file pin, not directory allowlist."""
+        import tempfile
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._write_manifest(
+                repo_root, orchestration_id="orch6", agent_run_id="run6",
+                allowed_output_paths=["workspace/pipelines/a/generate/g1/src/"],
+            )
+            decision = self._call(
+                repo_root, "orch6", "run6",
+                "workspace/pipelines/a/generate/g1/src/results.json",
+            )
+            self.assertEqual(decision.action, HookDecisionAction.BLOCK)
+
+    def test_blocks_yaml_under_directory_entry(self) -> None:
+        """Structured data (.yaml) requires explicit file pin, not directory allowlist."""
+        import tempfile
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._write_manifest(
+                repo_root, orchestration_id="orch7", agent_run_id="run7",
+                allowed_output_paths=["workspace/pipelines/a/generate/g1/src/"],
+            )
+            decision = self._call(
+                repo_root, "orch7", "run7",
+                "workspace/pipelines/a/generate/g1/src/config.yaml",
+            )
+            self.assertEqual(decision.action, HookDecisionAction.BLOCK)
+
+    def test_blocks_object_file_under_directory_entry(self) -> None:
+        """Compiler byproducts (.o) are created by subprocess, never via Edit/Write — must be blocked."""
+        import tempfile
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._write_manifest(
+                repo_root, orchestration_id="orch8", agent_run_id="run8",
+                allowed_output_paths=["workspace/pipelines/a/generate/g1/src/"],
+            )
+            decision = self._call(
+                repo_root, "orch8", "run8",
+                "workspace/pipelines/a/generate/g1/src/flux.o",
+            )
+            self.assertEqual(decision.action, HookDecisionAction.BLOCK)
+
+    def test_blocks_module_file_under_directory_entry(self) -> None:
+        """Compiler byproducts (.mod) are created by subprocess, never via Edit/Write — must be blocked."""
+        import tempfile
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._write_manifest(
+                repo_root, orchestration_id="orch9", agent_run_id="run9",
+                allowed_output_paths=["workspace/pipelines/a/generate/g1/src/"],
+            )
+            decision = self._call(
+                repo_root, "orch9", "run9",
+                "workspace/pipelines/a/generate/g1/src/flux.mod",
+            )
+            self.assertEqual(decision.action, HookDecisionAction.BLOCK)
+
+    def test_blocks_archive_file_under_directory_entry(self) -> None:
+        """Compiler byproducts (.a) are created by subprocess, never via Edit/Write — must be blocked."""
+        import tempfile
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._write_manifest(
+                repo_root, orchestration_id="orch10", agent_run_id="run10",
+                allowed_output_paths=["workspace/pipelines/a/generate/g1/src/"],
+            )
+            decision = self._call(
+                repo_root, "orch10", "run10",
+                "workspace/pipelines/a/generate/g1/src/libflux.a",
+            )
+            self.assertEqual(decision.action, HookDecisionAction.BLOCK)
+
+
 if __name__ == "__main__":
     unittest.main()

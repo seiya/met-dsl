@@ -708,7 +708,7 @@ shell_tool                       stable             true
                 repo_root=repo_root,
                 orchestration_id="orch_001",
                 spec_ref="spec/problem/shallow_water2d/controlled_spec.md",
-                dependency_ref="spec/problem/shallow_water2d/deps.yaml",
+                source_dependency_ref="spec/problem/shallow_water2d/deps.yaml",
             )
             write_preflight(
                 repo_root=repo_root,
@@ -1427,6 +1427,71 @@ shell_tool                       stable             true
                 "workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/generate/gen_001/generate_meta.json",
                 request_payload["skill_must_read_refs"],
             )
+
+    def test_record_launch_succeeds_with_generate_directory_allowed_output_path(self) -> None:
+        """record_launch for step=generate with a directory allowed_output_path must not raise."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            init_orchestration(repo_root=repo_root, orchestration_id="orch_001")
+            write_preflight(
+                repo_root=repo_root,
+                orchestration_id="orch_001",
+                payload={
+                    "status": "pass",
+                    "sandbox_runtime": "bwrap",
+                    "sandbox_enforced": True,
+                    "can_launch_step_agents": True,
+                    "can_launch_substep_agents": True,
+                    "feature_states": {"multi_agent": True, "codex_hooks": True},
+                    "checks": [
+                        {"name": "multi_agent_enabled", "pass": True},
+                        {"name": "codex_hooks_enabled", "pass": True},
+                        {"name": "codex_home_writable", "pass": True},
+                        {"name": "sandbox_bwrap_available", "pass": True},
+                        {"name": "sandbox_bwrap_userns", "pass": True},
+                    ],
+                },
+            )
+            gen_id = "gen_20260508_001"
+            src_dir = f"{_FIX_PIPE_REF}/generate/{gen_id}/src/"
+            launch_refs = record_launch(
+                repo_root=repo_root,
+                orchestration_id="orch_001",
+                parent_agent_run_id="orch_run_001",
+                child_agent_run_id="step_run_gen_dir_001",
+                request_payload={
+                    "node_key": "problem/shallow_water2d@0.3.0",
+                    "step": "generate",
+                    "agent_role": "step",
+                    "agent_run_id": "step_run_gen_dir_001",
+                    "orchestration_id": "orch_001",
+                    "parent_agent_run_id": "orch_run_001",
+                    "plan_ref": _FIX_PLAN_REF,
+                    "pipeline_ref": _FIX_PIPE_REF,
+                    "dependency_ref": f"{_FIX_PLAN_REF}/dependency.resolved.yaml",
+                    "generation_id": gen_id,
+                    "allowed_output_paths": [src_dir],
+                    "skill_name": "workflow-generate",
+                    "skill_ref": "skills/workflow-generate/SKILL.md",
+                    "skill_must_read_refs": _fixture_skill_must_read_refs_step("generate"),
+                    "launch_prompt_full": _step_launch_prompt(
+                        "problem/shallow_water2d@0.3.0",
+                        "generate",
+                        "step_run_gen_dir_001",
+                    ),
+                },
+                response_payload={
+                    "agent_run_id": "step_run_gen_dir_001",
+                    **_spawn_response_payload("sess_step_gen_dir_001"),
+                },
+            )
+            manifest_path = (
+                repo_root
+                / "workspace/orchestrations/orch_001/output_manifests/step_run_gen_dir_001.json"
+            )
+            self.assertTrue(manifest_path.exists(), "output manifest must be written")
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            self.assertIn(src_dir, manifest["allowed_output_paths"])
 
     def test_rejects_launch_with_placeholder_plan_or_pipeline_refs(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -5121,6 +5186,40 @@ shell_tool                       stable             true
                     response_payload=_spawn_response_payload("sess_step_repair_001"),
                 )
 
+    def test_record_launch_rejects_traversal_in_child_agent_run_id(self) -> None:
+        """child_agent_run_id containing path separators must be rejected before path construction."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._minimal_preflight_setup(repo_root)
+            for bad_id in ["../secret", "../../etc/passwd", "foo/bar", "foo\\bar", "foo.bar"]:
+                with self.subTest(bad_id=bad_id):
+                    with self.assertRaisesRegex(ValueError, "child_agent_run_id contains invalid characters"):
+                        record_launch(
+                            repo_root=repo_root,
+                            orchestration_id="orch_001",
+                            parent_agent_run_id="orch_run_001",
+                            child_agent_run_id=bad_id,
+                            request_payload=self._minimal_request_payload(),
+                            response_payload=_spawn_response_payload("sess_001"),
+                        )
+
+    def test_record_launch_rejects_traversal_in_parent_agent_run_id(self) -> None:
+        """parent_agent_run_id containing path separators must be rejected."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._minimal_preflight_setup(repo_root)
+            for bad_id in ["../orch", "orch/evil", "orch\\evil"]:
+                with self.subTest(bad_id=bad_id):
+                    with self.assertRaisesRegex(ValueError, "parent_agent_run_id contains invalid characters"):
+                        record_launch(
+                            repo_root=repo_root,
+                            orchestration_id="orch_001",
+                            parent_agent_run_id=bad_id,
+                            child_agent_run_id="step_run_001",
+                            request_payload=self._minimal_request_payload(),
+                            response_payload=_spawn_response_payload("sess_001"),
+                        )
+
     def test_record_launch_accepts_none_strategy_without_repair_fields(self) -> None:
         """repair_strategy=none では repair_target と repair_reason が "none" でも成功する。"""
         with tempfile.TemporaryDirectory() as tmp:
@@ -5724,7 +5823,7 @@ class CheckpointResumeRuntimeTests(unittest.TestCase):
                 repo_root=repo,
                 orchestration_id="o1",
                 spec_ref="spec/a.md",
-                dependency_ref="dep.yaml",
+                source_dependency_ref="dep.yaml",
             )
             enable_checkpoint_resume(repo, "o1")
             meta = json.loads(
@@ -8379,6 +8478,182 @@ class TestPhase3RunGate(unittest.TestCase):
                 write_roots=[f"{_FIX_PIPE_REF}/execute/"],
             )
 
+    def test_allowed_output_paths_for_launch_allows_generate_src_directory(self) -> None:
+        gen_id = "gen_20260508_001"
+        req = {
+            "agent_role": "step",
+            "node_key": "problem/shallow_water2d@0.3.0",
+            "step": "generate",
+            "plan_ref": _FIX_PLAN_REF,
+            "pipeline_ref": _FIX_PIPE_REF,
+            "allowed_output_paths": [f"{_FIX_PIPE_REF}/generate/{gen_id}/src/"],
+        }
+        out = _allowed_output_paths_for_launch(
+            request_payload=req,
+            write_roots=[f"{_FIX_PIPE_REF}/generate/"],
+        )
+        self.assertEqual(out, [f"{_FIX_PIPE_REF}/generate/{gen_id}/src/"])
+
+    def test_allowed_output_paths_for_launch_rejects_generate_srcmal_directory(self) -> None:
+        gen_id = "gen_20260508_001"
+        req = {
+            "agent_role": "step",
+            "node_key": "problem/shallow_water2d@0.3.0",
+            "step": "generate",
+            "plan_ref": _FIX_PLAN_REF,
+            "pipeline_ref": _FIX_PIPE_REF,
+            "allowed_output_paths": [f"{_FIX_PIPE_REF}/generate/{gen_id}/srcmal/"],
+        }
+        with self.assertRaisesRegex(ValueError, "outside phase contract outputs"):
+            _allowed_output_paths_for_launch(
+                request_payload=req,
+                write_roots=[f"{_FIX_PIPE_REF}/generate/"],
+            )
+
+    def test_allowed_output_paths_for_launch_rejects_generateevil_prefix_bypass(self) -> None:
+        """A directory whose name starts with 'generate' but is a sibling (e.g. generateevil/) must be rejected."""
+        gen_id = "gen_20260508_001"
+        req = {
+            "agent_role": "step",
+            "node_key": "problem/shallow_water2d@0.3.0",
+            "step": "generate",
+            "plan_ref": _FIX_PLAN_REF,
+            "pipeline_ref": _FIX_PIPE_REF,
+            "allowed_output_paths": [f"{_FIX_PIPE_REF}/generateevil/{gen_id}/src/"],
+        }
+        with self.assertRaisesRegex(ValueError, "outside phase contract outputs"):
+            _allowed_output_paths_for_launch(
+                request_payload=req,
+                write_roots=[f"{_FIX_PIPE_REF}/generateevil/"],
+            )
+
+    def test_allowed_output_paths_for_launch_rejects_generate_root_directory(self) -> None:
+        req = {
+            "agent_role": "step",
+            "node_key": "problem/shallow_water2d@0.3.0",
+            "step": "generate",
+            "plan_ref": _FIX_PLAN_REF,
+            "pipeline_ref": _FIX_PIPE_REF,
+            "allowed_output_paths": [f"{_FIX_PIPE_REF}/generate/"],
+        }
+        with self.assertRaisesRegex(ValueError, "outside phase contract outputs"):
+            _allowed_output_paths_for_launch(
+                request_payload=req,
+                write_roots=[f"{_FIX_PIPE_REF}/generate/"],
+            )
+
+    def test_write_manifest_preserves_directory_entry_trailing_slash(self) -> None:
+        """_write_allowed_output_manifest must persist directory entries with trailing slash intact."""
+        from tools.orchestration_runtime import (
+            _load_allowed_output_manifest,
+            _write_allowed_output_manifest,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            src_dir = f"{_FIX_PIPE_REF}/generate/gen_20260508_001/src/"
+            _write_allowed_output_manifest(
+                repo_root,
+                orchestration_id="rg_persist",
+                agent_run_id="gen_persist",
+                allowed_output_paths=[src_dir],
+            )
+            manifest = _load_allowed_output_manifest(
+                repo_root,
+                orchestration_id="rg_persist",
+                agent_run_id="gen_persist",
+            )
+            self.assertIn(src_dir.rstrip("/") + "/", manifest["allowed_output_paths"])
+
+    def test_write_manifest_then_validate_allows_file_under_directory_entry(self) -> None:
+        """Full path: write manifest with directory entry, then validate a file written under it."""
+        from tools.orchestration_runtime import (
+            _validate_paths_against_allowed_output_manifest,
+            _write_allowed_output_manifest,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            src_dir = f"{_FIX_PIPE_REF}/generate/gen_20260508_001/src/"
+            _write_allowed_output_manifest(
+                repo_root,
+                orchestration_id="rg_e2e",
+                agent_run_id="gen_e2e",
+                allowed_output_paths=[src_dir],
+            )
+            _validate_paths_against_allowed_output_manifest(
+                repo_root,
+                orchestration_id="rg_e2e",
+                agent_run_id="gen_e2e",
+                paths=[
+                    f"{_FIX_PIPE_REF}/generate/gen_20260508_001/src/main.f90",
+                    f"{_FIX_PIPE_REF}/generate/gen_20260508_001/src/mod/util.f90",
+                ],
+            )
+
+    def test_validate_paths_against_allowed_output_manifest_allows_file_under_directory_entry(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            src_dir = f"{_FIX_PIPE_REF}/generate/gen_20260508_001/src/"
+            manifest_path = (
+                repo_root
+                / "workspace/orchestrations/rg_dir_ok/output_manifests/gen_child_dir.json"
+            )
+            manifest_path.parent.mkdir(parents=True, exist_ok=True)
+            manifest_path.write_text(
+                json.dumps(
+                    {
+                        "orchestration_id": "rg_dir_ok",
+                        "agent_run_id": "gen_child_dir",
+                        "allowed_output_paths": [src_dir],
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            # Files under the allowed directory must pass without raising
+            _validate_paths_against_allowed_output_manifest(
+                repo_root,
+                orchestration_id="rg_dir_ok",
+                agent_run_id="gen_child_dir",
+                paths=[
+                    f"{_FIX_PIPE_REF}/generate/gen_20260508_001/src/main.f90",
+                    f"{_FIX_PIPE_REF}/generate/gen_20260508_001/src/module/util.f90",
+                ],
+            )
+
+    def test_validate_paths_against_allowed_output_manifest_rejects_file_outside_directory_entry(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            src_dir = f"{_FIX_PIPE_REF}/generate/gen_20260508_001/src/"
+            manifest_path = (
+                repo_root
+                / "workspace/orchestrations/rg_dir_rej/output_manifests/gen_child_rej.json"
+            )
+            manifest_path.parent.mkdir(parents=True, exist_ok=True)
+            manifest_path.write_text(
+                json.dumps(
+                    {
+                        "orchestration_id": "rg_dir_rej",
+                        "agent_run_id": "gen_child_rej",
+                        "allowed_output_paths": [src_dir],
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(ValueError, "allowed_output_paths manifest violation"):
+                _validate_paths_against_allowed_output_manifest(
+                    repo_root,
+                    orchestration_id="rg_dir_rej",
+                    agent_run_id="gen_child_rej",
+                    paths=[f"{_FIX_PIPE_REF}/generate/gen_20260508_001/other/main.f90"],
+                )
+
     def test_validate_paths_against_allowed_output_manifest_rejects_empty_normalized_path(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
@@ -9635,6 +9910,25 @@ class DirectWritePathExtensionPolicyTests(unittest.TestCase):
         )
         self.assertEqual(derived, [])
 
+    def test_allowed_file_tool_paths_auto_derive_excludes_directory_entries(self) -> None:
+        """Directory entries (trailing /) must not appear in auto-derived allowed_file_tool_paths.
+
+        Regression: _normalize_rel_posix strips '/', making 'src/' become 'src' which
+        passes _is_direct_write_path (no extension → True). This leaked directory tokens
+        into the manifest, enabling a prefix-match bypass of extension policy at terminal.
+        """
+        src_dir = "workspace/pipelines/p/generate/gen_001/src/"
+        derived = _allowed_file_tool_paths_for_launch(
+            request_payload={},
+            allowed_output_paths=[
+                src_dir,
+                "workspace/pipelines/p/lineage.json",  # CLI-managed: also excluded
+            ],
+        )
+        self.assertNotIn("workspace/pipelines/p/generate/gen_001/src", derived)
+        self.assertNotIn("workspace/pipelines/p/lineage.json", derived)
+        self.assertEqual(derived, [])
+
 
 class TerminalUnauthorizedWriteDirectWriteTests(unittest.TestCase):
     """`_validate_actual_write_paths` が direct write extension の path を許容する確認。"""
@@ -9689,7 +9983,7 @@ class TerminalUnauthorizedWriteDirectWriteTests(unittest.TestCase):
                 repo_root,
                 orchestration_id=orch,
                 agent_run_id=run_id,
-                write_roots=["workspace/plans"],
+                write_roots=["workspace/plans/"],
                 allowed_output_paths=[yaml_rel],
                 allowed_file_tool_paths=[yaml_rel],
             )
@@ -9720,7 +10014,7 @@ class TerminalUnauthorizedWriteDirectWriteTests(unittest.TestCase):
                 repo_root,
                 orchestration_id=orch,
                 agent_run_id=run_id,
-                write_roots=["workspace/plans"],
+                write_roots=["workspace/plans/"],
                 allowed_output_paths=[yaml_rel],
                 allowed_file_tool_paths=[],
             )
@@ -9756,7 +10050,7 @@ class TerminalUnauthorizedWriteDirectWriteTests(unittest.TestCase):
                 repo_root,
                 orchestration_id=orch,
                 agent_run_id=run_id,
-                write_roots=["workspace/pipelines/p/build"],
+                write_roots=["workspace/pipelines/p/build/"],
                 allowed_output_paths=[a_rel, b_rel],
                 allowed_file_tool_paths=[],
             )
@@ -9806,7 +10100,7 @@ class TerminalUnauthorizedWriteDirectWriteTests(unittest.TestCase):
                 repo_root,
                 orchestration_id=orch,
                 agent_run_id=run_id,
-                write_roots=["workspace/pipelines/p/build"],
+                write_roots=["workspace/pipelines/p/build/"],
                 allowed_output_paths=[allowed_rel],
                 allowed_file_tool_paths=[],
             )
@@ -9857,7 +10151,7 @@ class TerminalUnauthorizedWriteDirectWriteTests(unittest.TestCase):
                 repo_root,
                 orchestration_id=orch,
                 agent_run_id=run_id,
-                write_roots=["workspace/pipelines/p/build"],
+                write_roots=["workspace/pipelines/p/build/"],
                 allowed_output_paths=[out_rel],
                 allowed_file_tool_paths=[],
             )
@@ -9889,6 +10183,300 @@ class TerminalUnauthorizedWriteDirectWriteTests(unittest.TestCase):
                     "output_refs": [out_rel],
                 },
             )
+
+    def test_step_terminal_rejects_mod_file_without_gate_provenance(self) -> None:
+        """Compiler byproducts (.mod) under directory allowlist are unauthorized without gate provenance.
+
+        Agents must clean up build artefacts before record-agent-run to prevent unaudited binary injection.
+        """
+        from tools.orchestration_runtime import _validate_actual_write_paths
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            orch = "orch_term_dw_007"
+            run_id = "step_run_term_dw_007"
+            src_dir = f"{_FIX_PIPE_REF}/generate/gen_20260508_001/src/"
+            self._setup_step_run_state(
+                repo_root,
+                orchestration_id=orch,
+                agent_run_id=run_id,
+                write_roots=[f"{_FIX_PIPE_REF}/generate/"],
+                allowed_output_paths=[src_dir],
+                allowed_file_tool_paths=[],
+            )
+            byproduct = repo_root / _FIX_PIPE_REF / "generate" / "gen_20260508_001" / "src" / "flux.mod"
+            byproduct.parent.mkdir(parents=True, exist_ok=True)
+            byproduct.write_text("MODULE flux\nEND MODULE\n", encoding="utf-8")
+
+            with self.assertRaisesRegex(ValueError, "unauthorized write paths"):
+                _validate_actual_write_paths(
+                    repo_root,
+                    orch,
+                    {
+                        "agent_run_id": run_id,
+                        "agent_role": "step",
+                        "status": "pass",
+                        "output_refs": [],
+                    },
+                )
+
+    def _setup_src_dir_state(
+        self,
+        repo_root: Path,
+        *,
+        orch: str,
+        run_id: str,
+        src_files: dict[str, str],
+    ) -> None:
+        src_dir = f"{_FIX_PIPE_REF}/generate/gen_20260508_001/src/"
+        self._setup_step_run_state(
+            repo_root,
+            orchestration_id=orch,
+            agent_run_id=run_id,
+            write_roots=[f"{_FIX_PIPE_REF}/generate/"],
+            allowed_output_paths=[src_dir],
+            allowed_file_tool_paths=[],
+        )
+        base = repo_root / _FIX_PIPE_REF / "generate" / "gen_20260508_001" / "src"
+        base.mkdir(parents=True, exist_ok=True)
+        for name, content in src_files.items():
+            (base / name).write_text(content, encoding="utf-8")
+
+    def _run_validate(self, repo_root: Path, orch: str, run_id: str) -> None:
+        from tools.orchestration_runtime import _validate_actual_write_paths
+        _validate_actual_write_paths(
+            repo_root,
+            orch,
+            {"agent_run_id": run_id, "agent_role": "step", "status": "pass", "output_refs": []},
+        )
+
+    def test_step_terminal_rejects_script_under_directory_entry(self) -> None:
+        """Shell scripts under directory allowlist are unauthorized (not in allowlist)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._setup_src_dir_state(repo_root, orch="orch_dw_bl_001", run_id="run_dw_bl_001",
+                                      src_files={"exploit.sh": "#!/bin/sh\nrm -rf /\n"})
+            with self.assertRaisesRegex(ValueError, "unauthorized write paths"):
+                self._run_validate(repo_root, "orch_dw_bl_001", "run_dw_bl_001")
+
+    def test_step_terminal_rejects_shared_lib_under_directory_entry(self) -> None:
+        """.so shared libraries are not a generate-phase source byproduct."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._setup_src_dir_state(repo_root, orch="orch_dw_bl_002", run_id="run_dw_bl_002",
+                                      src_files={"libevil.so": "\x7fELF"})
+            with self.assertRaisesRegex(ValueError, "unauthorized write paths"):
+                self._run_validate(repo_root, "orch_dw_bl_002", "run_dw_bl_002")
+
+    def test_step_terminal_rejects_unknown_extension_under_directory_entry(self) -> None:
+        """Files with unknown/unlisted extensions are fail-closed."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._setup_src_dir_state(repo_root, orch="orch_dw_bl_003", run_id="run_dw_bl_003",
+                                      src_files={"payload.whl": "PK\x03\x04"})
+            with self.assertRaisesRegex(ValueError, "unauthorized write paths"):
+                self._run_validate(repo_root, "orch_dw_bl_003", "run_dw_bl_003")
+
+    def test_step_terminal_rejects_source_file_without_gate_provenance(self) -> None:
+        """A source file (.f90) written outside guarded-apply-patch must fail terminal validation."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            # Write the source file directly (not via guarded-apply-patch → not in gate_changed_paths)
+            self._setup_src_dir_state(repo_root, orch="orch_dw_gate_001", run_id="run_dw_gate_001",
+                                      src_files={"flux.f90": "MODULE flux\nEND MODULE\n"})
+            with self.assertRaisesRegex(ValueError, "unauthorized write paths"):
+                self._run_validate(repo_root, "orch_dw_gate_001", "run_dw_gate_001")
+
+    def test_step_terminal_rejects_compiler_byproduct_without_gate_provenance(self) -> None:
+        """Compiler byproducts (.mod, .o, .a) are unauthorized without gate provenance.
+
+        Agents must clean up compiler artefacts before record-agent-run to prevent
+        unaudited binary injection into the pipeline.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._setup_src_dir_state(repo_root, orch="orch_dw_gate_002", run_id="run_dw_gate_002",
+                                      src_files={"flux.mod": "MODULE flux\nEND MODULE\n",
+                                                 "flux.o": "\x7fELF"})
+            with self.assertRaisesRegex(ValueError, "unauthorized write paths"):
+                self._run_validate(repo_root, "orch_dw_gate_002", "run_dw_gate_002")
+
+    def test_step_terminal_rejects_makefile_under_directory_entry(self) -> None:
+        """Makefile is a build-control file and requires explicit file pin — not in extensionless allowlist."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._setup_src_dir_state(repo_root, orch="orch_dw_bl_004", run_id="run_dw_bl_004",
+                                      src_files={"Makefile": "all:\n\tgfortran main.f90\n"})
+            with self.assertRaisesRegex(ValueError, "unauthorized write paths"):
+                self._run_validate(repo_root, "orch_dw_bl_004", "run_dw_bl_004")
+
+    def test_step_terminal_rejects_unknown_extensionless_file_under_directory_entry(self) -> None:
+        """An extensionless file not in _ALLOWED_EXTENSIONLESS_BYPRODUCT_NAMES is rejected."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._setup_src_dir_state(repo_root, orch="orch_dw_bl_005", run_id="run_dw_bl_005",
+                                      src_files={"myexe": "#!/bin/bash\necho hi\n"})
+            with self.assertRaisesRegex(ValueError, "unauthorized write paths"):
+                self._run_validate(repo_root, "orch_dw_bl_005", "run_dw_bl_005")
+
+    def test_step_terminal_rejects_cmake_under_directory_entry(self) -> None:
+        """Build control file (.cmake) requires explicit file pin — can inject commands."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._setup_src_dir_state(repo_root, orch="orch_dw_bl_006", run_id="run_dw_bl_006",
+                                      src_files={"CMakeLists.txt": "cmake_minimum_required(VERSION 3.0)\n"})
+            with self.assertRaisesRegex(ValueError, "unauthorized write paths"):
+                self._run_validate(repo_root, "orch_dw_bl_006", "run_dw_bl_006")
+
+    def test_step_terminal_rejects_nml_under_directory_entry(self) -> None:
+        """Namelist file (.nml) requires explicit file pin."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._setup_src_dir_state(repo_root, orch="orch_dw_bl_007", run_id="run_dw_bl_007",
+                                      src_files={"params.nml": "&input\n  dt=0.1\n/\n"})
+            with self.assertRaisesRegex(ValueError, "unauthorized write paths"):
+                self._run_validate(repo_root, "orch_dw_bl_007", "run_dw_bl_007")
+
+    def test_step_terminal_rejects_toml_under_directory_entry(self) -> None:
+        """Build config file (.toml) requires explicit file pin."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._setup_src_dir_state(repo_root, orch="orch_dw_bl_008", run_id="run_dw_bl_008",
+                                      src_files={"build.toml": "[build]\nmode = 'release'\n"})
+            with self.assertRaisesRegex(ValueError, "unauthorized write paths"):
+                self._run_validate(repo_root, "orch_dw_bl_008", "run_dw_bl_008")
+
+    def test_step_terminal_rejects_json_even_if_directory_path_leaked_into_manifest_file_tool_paths(self) -> None:
+        """Regression: old auto-derive bug put directory tokens (no trailing /) into
+        allowed_file_tool_paths manifest, then prefix-match in exact_declared_paths bypassed
+        extension policy — any file under src/ would pass. Verify terminal rejects it."""
+        from tools.orchestration_runtime import _validate_actual_write_paths
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            orch = "orch_dw_reg_001"
+            run_id = "run_dw_reg_001"
+            src_dir_entry = f"{_FIX_PIPE_REF}/generate/gen_20260508_001/src/"
+            # Simulate the buggy manifest: directory path WITHOUT trailing slash in allowed_file_tool_paths
+            self._setup_step_run_state(
+                repo_root,
+                orchestration_id=orch,
+                agent_run_id=run_id,
+                write_roots=[f"{_FIX_PIPE_REF}/generate/"],
+                allowed_output_paths=[src_dir_entry],
+                # Inject the buggy token directly — no trailing slash, looks like a path prefix
+                allowed_file_tool_paths=[f"{_FIX_PIPE_REF}/generate/gen_20260508_001/src"],
+            )
+            forbidden = repo_root / _FIX_PIPE_REF / "generate" / "gen_20260508_001" / "src" / "config.json"
+            forbidden.parent.mkdir(parents=True, exist_ok=True)
+            forbidden.write_text('{"key": "value"}\n', encoding="utf-8")
+
+            with self.assertRaisesRegex(ValueError, "unauthorized write paths"):
+                _validate_actual_write_paths(
+                    repo_root, orch,
+                    {"agent_run_id": run_id, "agent_role": "step", "status": "pass", "output_refs": []},
+                )
+
+    def test_step_terminal_rejects_sh_even_if_directory_path_leaked_into_manifest_file_tool_paths(self) -> None:
+        """Regression: same bypass as above but for shell scripts."""
+        from tools.orchestration_runtime import _validate_actual_write_paths
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            orch = "orch_dw_reg_002"
+            run_id = "run_dw_reg_002"
+            src_dir_entry = f"{_FIX_PIPE_REF}/generate/gen_20260508_001/src/"
+            self._setup_step_run_state(
+                repo_root,
+                orchestration_id=orch,
+                agent_run_id=run_id,
+                write_roots=[f"{_FIX_PIPE_REF}/generate/"],
+                allowed_output_paths=[src_dir_entry],
+                allowed_file_tool_paths=[f"{_FIX_PIPE_REF}/generate/gen_20260508_001/src"],
+            )
+            forbidden = repo_root / _FIX_PIPE_REF / "generate" / "gen_20260508_001" / "src" / "exploit.sh"
+            forbidden.parent.mkdir(parents=True, exist_ok=True)
+            forbidden.write_text("#!/bin/sh\nrm -rf /\n", encoding="utf-8")
+
+            with self.assertRaisesRegex(ValueError, "unauthorized write paths"):
+                _validate_actual_write_paths(
+                    repo_root, orch,
+                    {"agent_run_id": run_id, "agent_role": "step", "status": "pass", "output_refs": []},
+                )
+
+    def test_step_terminal_accepts_write_with_directory_write_root(self) -> None:
+        """Directory write_roots must have a trailing slash."""
+        from tools.orchestration_runtime import _validate_actual_write_paths
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            orch = "orch_term_dw_006"
+            run_id = "step_run_term_dw_006"
+            yaml_rel = "workspace/plans/p/case.resolved.yaml"
+            self._setup_step_run_state(
+                repo_root,
+                orchestration_id=orch,
+                agent_run_id=run_id,
+                write_roots=["workspace/plans/"],
+                allowed_output_paths=[yaml_rel],
+                allowed_file_tool_paths=[yaml_rel],
+            )
+            yaml_path = repo_root / yaml_rel
+            yaml_path.parent.mkdir(parents=True, exist_ok=True)
+            yaml_path.write_text("case: ok\n", encoding="utf-8")
+
+            _validate_actual_write_paths(
+                repo_root,
+                orch,
+                {
+                    "agent_run_id": run_id,
+                    "agent_role": "step",
+                    "status": "pass",
+                    "output_refs": [yaml_rel],
+                },
+            )
+
+
+class LoadWriteRootsFromCapTests(unittest.TestCase):
+    """Tests for _load_write_roots_from_cap normalization and rejection rules."""
+
+    def setUp(self) -> None:
+        from tools.orchestration_runtime import _load_write_roots_from_cap
+        self._load = _load_write_roots_from_cap
+
+    def test_trailing_slash_entry_normalized_as_directory(self) -> None:
+        result = self._load(["workspace/plans/"])
+        self.assertEqual(result, ["workspace/plans/"])
+
+    def test_extension_bearing_entry_kept_as_file_pin(self) -> None:
+        result = self._load(["workspace/pipelines/a__b__1.0/lineage.json"])
+        self.assertEqual(result, ["workspace/pipelines/a__b__1.0/lineage.json"])
+
+    def test_extensionless_no_slash_entry_accepted_as_file_pin(self) -> None:
+        """Extensionless entries like Makefile or LICENSE must be accepted as file pins."""
+        result = self._load(["workspace/pipelines/a__b__1.0/pipe_001/src/Makefile"])
+        self.assertEqual(result, ["workspace/pipelines/a__b__1.0/pipe_001/src/Makefile"])
+
+    def test_multiple_extensionless_file_pins_accepted(self) -> None:
+        """Multiple extensionless file pins are all kept in declaration order."""
+        result = self._load([
+            "workspace/pipelines/a__b__1.0/pipe_001/src/Makefile",
+            "workspace/pipelines/a__b__1.0/pipe_001/src/LICENSE",
+            "workspace/pipelines/a__b__1.0/pipe_001/generate/",
+        ])
+        self.assertEqual(result, [
+            "workspace/pipelines/a__b__1.0/pipe_001/src/Makefile",
+            "workspace/pipelines/a__b__1.0/pipe_001/src/LICENSE",
+            "workspace/pipelines/a__b__1.0/pipe_001/generate/",
+        ])
+
+    def test_empty_and_whitespace_entries_skipped(self) -> None:
+        result = self._load(["", "  ", None, 42, "workspace/plans/"])  # type: ignore[list-item]
+        self.assertEqual(result, ["workspace/plans/"])
+
+    def test_non_list_input_returns_empty(self) -> None:
+        self.assertEqual(self._load(None), [])
+        self.assertEqual(self._load("workspace/plans/"), [])
 
 
 class ApplyPatchGateCoverageExtensionTests(unittest.TestCase):
@@ -9966,6 +10554,735 @@ class ApplyPatchGateCoverageExtensionTests(unittest.TestCase):
                 ],
             )
             _validate_apply_patch_gate_coverage(repo_root, "orch_ext_003", payload)
+
+
+class BwrapProfileFilePinTests(unittest.TestCase):
+    """build_bwrap_profile + render_bwrap_command: file-pin write_roots must get a bind mount."""
+
+    def _write_cap_and_manifest(
+        self,
+        repo_root: Path,
+        *,
+        orchestration_id: str,
+        agent_run_id: str,
+        write_roots: list[str],
+    ) -> None:
+        from tools.orchestration_runtime import (
+            _capabilities_dir,
+            _read_manifests_dir,
+            _ensure_orchestration_audit_dirs,
+        )
+        _ensure_orchestration_audit_dirs(repo_root, orchestration_id)
+        cap_dir = _capabilities_dir(repo_root, orchestration_id)
+        cap_dir.mkdir(parents=True, exist_ok=True)
+        cap_path = cap_dir / f"{agent_run_id}.json"
+        cap_path.write_text(
+            json.dumps({"agent_run_id": agent_run_id, "write_roots": write_roots}),
+            encoding="utf-8",
+        )
+        rm_dir = _read_manifests_dir(repo_root, orchestration_id)
+        rm_dir.mkdir(parents=True, exist_ok=True)
+        rm_path = rm_dir / f"{agent_run_id}.json"
+        rm_path.write_text(
+            json.dumps({"agent_run_id": agent_run_id, "allowed_read_roots": ["workspace/"]}),
+            encoding="utf-8",
+        )
+
+    def test_file_pin_write_root_pre_creates_target_file(self) -> None:
+        """build_bwrap_profile must touch a file-pin target so render_bwrap_command can bind it."""
+        from tools.orchestration_runtime import build_bwrap_profile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            orch = "orch_bwrap_fp_001"
+            run_id = "run_bwrap_fp_001"
+            pin = "workspace/pipelines/a__b__1.0/lineage.json"
+            self._write_cap_and_manifest(
+                repo_root, orchestration_id=orch, agent_run_id=run_id,
+                write_roots=[pin],
+            )
+
+            profile = build_bwrap_profile(
+                repo_root=repo_root,
+                orchestration_id=orch,
+                agent_run_id=run_id,
+                backend_command="python3 agent.py",
+            )
+
+            pin_path = repo_root / pin
+            self.assertTrue(pin_path.exists(), "file-pin target must be pre-created for bwrap file-level bind")
+            self.assertIn(pin, profile["write_roots"])
+
+    def test_file_pin_write_root_appears_in_render_bwrap_bind(self) -> None:
+        """render_bwrap_command must emit --bind for the file-pin itself, not its parent directory."""
+        from tools.orchestration_runtime import build_bwrap_profile, render_bwrap_command
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            orch = "orch_bwrap_fp_002"
+            run_id = "run_bwrap_fp_002"
+            pin = "workspace/pipelines/a__b__1.0/lineage.json"
+            self._write_cap_and_manifest(
+                repo_root, orchestration_id=orch, agent_run_id=run_id,
+                write_roots=[pin],
+            )
+            profile = build_bwrap_profile(
+                repo_root=repo_root,
+                orchestration_id=orch,
+                agent_run_id=run_id,
+                backend_command="python3 agent.py",
+            )
+            cmd = render_bwrap_command(profile=profile, command_argv=["python3", "agent.py"])
+            pin_abs = str((repo_root / pin).resolve())
+            parent_abs = str((repo_root / pin).resolve().parent)
+            bind_targets = [cmd[i + 1] for i, tok in enumerate(cmd) if tok == "--bind"]
+            self.assertIn(pin_abs, bind_targets, "file-pin target must appear in bwrap --bind list")
+            self.assertNotIn(parent_abs, bind_targets, "parent directory must NOT be bound — that would grant access to sibling files")
+
+    def test_dotted_directory_write_root_not_misclassified_as_file_pin(self) -> None:
+        """A directory write_root with a dotted name (e.g. v1.0/) must not be treated as a file pin."""
+        from tools.orchestration_runtime import build_bwrap_profile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            orch = "orch_bwrap_fp_003"
+            run_id = "run_bwrap_fp_003"
+            dotted_dir = "workspace/plans/v1.0/"
+            self._write_cap_and_manifest(
+                repo_root, orchestration_id=orch, agent_run_id=run_id,
+                write_roots=[dotted_dir],
+            )
+            build_bwrap_profile(
+                repo_root=repo_root,
+                orchestration_id=orch,
+                agent_run_id=run_id,
+                backend_command="python3 agent.py",
+            )
+            # Must create the directory itself, not just its parent
+            dir_path = repo_root / "workspace" / "plans" / "v1.0"
+            self.assertTrue(dir_path.is_dir(), "dotted directory write_root must be created as directory")
+
+    def _save_profile(self, repo_root: Path, orchestration_id: str, agent_run_id: str, profile: dict) -> None:
+        """Helper: save bwrap profile to disk so _cleanup_empty_file_pin_stubs can find it."""
+        import json as _json
+        from tools.orchestration_runtime import _sandbox_profiles_dir
+        profiles_dir = _sandbox_profiles_dir(repo_root, orchestration_id)
+        profiles_dir.mkdir(parents=True, exist_ok=True)
+        (profiles_dir / f"{agent_run_id}.json").write_text(
+            _json.dumps(profile), encoding="utf-8"
+        )
+
+    def test_file_pin_stub_cleaned_up_when_agent_never_writes(self) -> None:
+        """_cleanup_empty_file_pin_stubs must delete empty stubs if the agent never wrote to the pin."""
+        from tools.orchestration_runtime import build_bwrap_profile, _cleanup_empty_file_pin_stubs
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            orch = "orch_bwrap_fp_005"
+            run_id = "run_bwrap_fp_005"
+            pin = "workspace/pipelines/a__b__1.0/pipe_001/lineage.json"
+            self._write_cap_and_manifest(
+                repo_root, orchestration_id=orch, agent_run_id=run_id,
+                write_roots=[pin],
+            )
+            # Profile build pre-creates the stub; profile is saved so cleanup can read it.
+            profile = build_bwrap_profile(
+                repo_root=repo_root,
+                orchestration_id=orch,
+                agent_run_id=run_id,
+                backend_command="python3 agent.py",
+            )
+            self._save_profile(repo_root, orch, run_id, profile)
+            pin_path = repo_root / pin
+            self.assertTrue(pin_path.exists(), "stub must exist after build_bwrap_profile")
+            self.assertEqual(pin_path.stat().st_size, 0, "stub must be empty")
+
+            # Simulate terminal cleanup: agent terminated without writing to the pin.
+            _cleanup_empty_file_pin_stubs(repo_root, orch, agent_run_id=run_id)
+            self.assertFalse(
+                pin_path.exists(),
+                "empty stub must be removed by _cleanup_empty_file_pin_stubs when agent never wrote",
+            )
+
+    def test_file_pin_stub_preserved_when_agent_wrote_content(self) -> None:
+        """_cleanup_empty_file_pin_stubs must not delete a pin file that the agent wrote content to."""
+        from tools.orchestration_runtime import (
+            build_bwrap_profile, _cleanup_empty_file_pin_stubs,
+            _gate_changed_paths_store_path, _ensure_orchestration_audit_dirs,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            orch = "orch_bwrap_fp_006"
+            run_id = "run_bwrap_fp_006"
+            pin = "workspace/pipelines/a__b__1.0/pipe_001/lineage.json"
+            self._write_cap_and_manifest(
+                repo_root, orchestration_id=orch, agent_run_id=run_id,
+                write_roots=[pin],
+            )
+            profile = build_bwrap_profile(
+                repo_root=repo_root,
+                orchestration_id=orch,
+                agent_run_id=run_id,
+                backend_command="python3 agent.py",
+            )
+            self._save_profile(repo_root, orch, run_id, profile)
+            pin_path = repo_root / pin
+            # Simulate agent writing content to the pin.
+            pin_path.write_text('{"node_key":"a"}', encoding="utf-8")
+            # Simulate gate_changed_paths recording the write.
+            _ensure_orchestration_audit_dirs(repo_root, orch)
+            gcp_path = _gate_changed_paths_store_path(repo_root, orch, agent_run_id=run_id)
+            gcp_path.parent.mkdir(parents=True, exist_ok=True)
+            import json as _json
+            gcp_path.write_text(
+                _json.dumps({"gate_changed_paths": [pin]}), encoding="utf-8"
+            )
+            _cleanup_empty_file_pin_stubs(repo_root, orch, agent_run_id=run_id)
+            self.assertTrue(
+                pin_path.exists(),
+                "non-empty pin file must NOT be removed by cleanup",
+            )
+
+    def test_pre_existing_empty_file_pin_not_deleted_by_cleanup(self) -> None:
+        """A zero-byte file that existed BEFORE build_bwrap_profile must survive _cleanup_empty_file_pin_stubs."""
+        from tools.orchestration_runtime import build_bwrap_profile, _cleanup_empty_file_pin_stubs
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            orch = "orch_bwrap_fp_008"
+            run_id = "run_bwrap_fp_008"
+            pin = "workspace/pipelines/a__b__1.0/pipe_001/lineage.json"
+            # Pre-create the file BEFORE build_bwrap_profile (simulates pre-existing file).
+            pin_path = repo_root / pin
+            pin_path.parent.mkdir(parents=True, exist_ok=True)
+            pin_path.write_bytes(b"")  # zero bytes, pre-existing
+            self._write_cap_and_manifest(
+                repo_root, orchestration_id=orch, agent_run_id=run_id,
+                write_roots=[pin],
+            )
+            # build_bwrap_profile must NOT add it to created_file_pin_stubs (file already existed).
+            profile = build_bwrap_profile(
+                repo_root=repo_root,
+                orchestration_id=orch,
+                agent_run_id=run_id,
+                backend_command="python3 agent.py",
+            )
+            stub_paths = [
+                entry["path"]
+                for entry in profile.get("created_file_pin_stubs", [])
+                if isinstance(entry, dict)
+            ]
+            self.assertNotIn(
+                "workspace/pipelines/a__b__1.0/pipe_001/lineage.json",
+                stub_paths,
+                "pre-existing file must NOT be recorded as a stub",
+            )
+            # Cleanup must leave the pre-existing file untouched.
+            _cleanup_empty_file_pin_stubs(repo_root, orch, agent_run_id=run_id)
+            self.assertTrue(
+                pin_path.exists(),
+                "pre-existing empty file must NOT be deleted by cleanup",
+            )
+
+    def test_file_pin_stub_preserved_when_subprocess_writes_zero_bytes(self) -> None:
+        """A subprocess that writes zero bytes to a pinned file updates the mtime.
+        _cleanup_empty_file_pin_stubs must NOT delete a stub whose mtime has changed,
+        even if the file is still zero bytes — the subprocess output is legitimate."""
+        from tools.orchestration_runtime import build_bwrap_profile, _cleanup_empty_file_pin_stubs
+        import time
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            orch = "orch_bwrap_fp_009"
+            run_id = "run_bwrap_fp_009"
+            pin = "workspace/pipelines/a__b__1.0/pipe_001/lineage.json"
+            self._write_cap_and_manifest(
+                repo_root, orchestration_id=orch, agent_run_id=run_id,
+                write_roots=[pin],
+            )
+            profile = build_bwrap_profile(
+                repo_root=repo_root,
+                orchestration_id=orch,
+                agent_run_id=run_id,
+                backend_command="python3 agent.py",
+            )
+            self._save_profile(repo_root, orch, run_id, profile)
+            pin_path = repo_root / pin
+            self.assertTrue(pin_path.exists())
+            self.assertEqual(pin_path.stat().st_size, 0)
+
+            # Simulate a subprocess writing zero bytes — this updates mtime even though
+            # file size stays at zero.
+            time.sleep(0.01)  # ensure mtime advances
+            pin_path.write_bytes(b"")  # zero-byte write updates mtime
+
+            # Cleanup must preserve the file because mtime changed since our touch().
+            _cleanup_empty_file_pin_stubs(repo_root, orch, agent_run_id=run_id)
+            self.assertTrue(
+                pin_path.exists(),
+                "zero-byte file written by subprocess (mtime changed) must NOT be deleted",
+            )
+
+    def test_generate_step_bwrap_does_not_bind_pipeline_root_as_writable(self) -> None:
+        """bwrap profile for generate step must NOT make pipeline_ref/ writable — sibling dirs stay read-only."""
+        from tools.orchestration_runtime import build_bwrap_profile, render_bwrap_command
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            orch = "orch_bwrap_fp_007"
+            run_id = "run_bwrap_fp_007"
+            pipeline_root = "workspace/pipelines/a__b__1.0/pipe_001"
+            # generate step write_roots: generate/ dir + lineage.json file pin
+            write_roots = [
+                f"{pipeline_root}/generate/",
+                f"{pipeline_root}/lineage.json",
+            ]
+            self._write_cap_and_manifest(
+                repo_root, orchestration_id=orch, agent_run_id=run_id,
+                write_roots=write_roots,
+            )
+            profile = build_bwrap_profile(
+                repo_root=repo_root,
+                orchestration_id=orch,
+                agent_run_id=run_id,
+                backend_command="python3 agent.py",
+            )
+            cmd = render_bwrap_command(profile=profile, command_argv=["python3", "agent.py"])
+            pipeline_abs = str((repo_root / pipeline_root).resolve())
+            bind_targets = [cmd[i + 1] for i, tok in enumerate(cmd) if tok == "--bind"]
+            self.assertNotIn(
+                pipeline_abs, bind_targets,
+                "pipeline_ref/ directory must NOT appear in bwrap --bind — that would make build/execute writable",
+            )
+
+    def test_extensionless_no_slash_entry_treated_as_file_pin(self) -> None:
+        """An extensionless no-slash write_root entry (e.g. Makefile) is treated as a file pin.
+
+        The trailing-slash convention is sufficient to distinguish directories from file pins;
+        no extension is required for file pins.
+        """
+        from tools.orchestration_runtime import build_bwrap_profile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            orch = "orch_bwrap_fp_004"
+            run_id = "run_bwrap_fp_004"
+            makefile_pin = "workspace/pipelines/a__b__1.0/pipe_001/src/Makefile"
+            self._write_cap_and_manifest(
+                repo_root, orchestration_id=orch, agent_run_id=run_id,
+                write_roots=[makefile_pin],
+            )
+            # Must succeed — extensionless file pin is valid
+            profile = build_bwrap_profile(
+                repo_root=repo_root,
+                orchestration_id=orch,
+                agent_run_id=run_id,
+                backend_command="python3 agent.py",
+            )
+            # The file pin must be pre-created as a stub
+            pin_path = repo_root / makefile_pin
+            self.assertTrue(pin_path.exists(), "extensionless file pin must be pre-created as stub")
+            self.assertTrue(pin_path.is_file(), "extensionless file pin stub must be a regular file")
+
+    def test_symlinked_directory_write_root_raises_before_mkdir(self) -> None:
+        """A write_root that resolves outside repo_root via symlink must be rejected before mkdir."""
+        import os
+        from tools.orchestration_runtime import build_bwrap_profile
+
+        with tempfile.TemporaryDirectory() as tmp, tempfile.TemporaryDirectory() as outside:
+            repo_root = Path(tmp)
+            orch = "orch_bwrap_sl_001"
+            run_id = "run_bwrap_sl_001"
+            # Create a symlink inside the repo that points outside
+            link_parent = repo_root / "workspace" / "plans"
+            link_parent.mkdir(parents=True, exist_ok=True)
+            link_path = link_parent / "escape"
+            os.symlink(outside, str(link_path))
+            self._write_cap_and_manifest(
+                repo_root, orchestration_id=orch, agent_run_id=run_id,
+                write_roots=["workspace/plans/escape/"],
+            )
+            with self.assertRaises(ValueError) as ctx:
+                build_bwrap_profile(
+                    repo_root=repo_root,
+                    orchestration_id=orch,
+                    agent_run_id=run_id,
+                    backend_command="python3 agent.py",
+                )
+            self.assertIn("resolves outside repo_root", str(ctx.exception))
+
+    def test_symlinked_file_pin_write_root_raises_before_touch(self) -> None:
+        """A file-pin write_root that resolves outside repo_root via symlink must be rejected."""
+        import os
+        from tools.orchestration_runtime import build_bwrap_profile
+
+        with tempfile.TemporaryDirectory() as tmp, tempfile.TemporaryDirectory() as outside:
+            repo_root = Path(tmp)
+            orch = "orch_bwrap_sl_002"
+            run_id = "run_bwrap_sl_002"
+            link_parent = repo_root / "workspace" / "pipelines" / "a"
+            link_parent.mkdir(parents=True, exist_ok=True)
+            # Symlink the parent directory so pin resolution escapes
+            link_path = link_parent / "escape"
+            os.symlink(outside, str(link_path))
+            self._write_cap_and_manifest(
+                repo_root, orchestration_id=orch, agent_run_id=run_id,
+                write_roots=["workspace/pipelines/a/escape/lineage.json"],
+            )
+            with self.assertRaises(ValueError) as ctx:
+                build_bwrap_profile(
+                    repo_root=repo_root,
+                    orchestration_id=orch,
+                    agent_run_id=run_id,
+                    backend_command="python3 agent.py",
+                )
+            self.assertIn("resolves outside repo_root", str(ctx.exception))
+
+    def test_file_pin_write_root_raises_if_path_is_existing_directory(self) -> None:
+        """build_bwrap_profile must reject a file pin if the path already exists as a directory."""
+        from tools.orchestration_runtime import build_bwrap_profile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            orch = "orch_bwrap_type_001"
+            run_id = "run_bwrap_type_001"
+            pin = "workspace/pipelines/a__b__1.0/lineage.json"
+            # Pre-create the pin path as a directory (not a file).
+            (repo_root / pin).mkdir(parents=True, exist_ok=True)
+            self._write_cap_and_manifest(
+                repo_root, orchestration_id=orch, agent_run_id=run_id,
+                write_roots=[pin],
+            )
+            with self.assertRaises(ValueError) as ctx:
+                build_bwrap_profile(
+                    repo_root=repo_root,
+                    orchestration_id=orch,
+                    agent_run_id=run_id,
+                    backend_command="python3 agent.py",
+                )
+            self.assertIn("resolves to a directory", str(ctx.exception))
+
+    def test_file_pin_write_root_raises_if_path_is_symlink_inside_repo(self) -> None:
+        """build_bwrap_profile must reject a file pin that is a symlink even within the repo."""
+        import os
+        from tools.orchestration_runtime import build_bwrap_profile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            orch = "orch_bwrap_type_002"
+            run_id = "run_bwrap_type_002"
+            pin = "workspace/pipelines/a__b__1.0/lineage.json"
+            pin_path = repo_root / pin
+            pin_path.parent.mkdir(parents=True, exist_ok=True)
+            # Create a real file and a symlink pointing to it.
+            real_file = pin_path.parent / "lineage_real.json"
+            real_file.write_text("{}", encoding="utf-8")
+            os.symlink(str(real_file), str(pin_path))
+            self._write_cap_and_manifest(
+                repo_root, orchestration_id=orch, agent_run_id=run_id,
+                write_roots=[pin],
+            )
+            with self.assertRaises(ValueError) as ctx:
+                build_bwrap_profile(
+                    repo_root=repo_root,
+                    orchestration_id=orch,
+                    agent_run_id=run_id,
+                    backend_command="python3 agent.py",
+                )
+            self.assertIn("symlink", str(ctx.exception))
+
+    def test_render_bwrap_raises_if_file_pin_is_directory_at_render_time(self) -> None:
+        """render_bwrap_command must raise if a file pin became a directory between build and render."""
+        from tools.orchestration_runtime import render_bwrap_command
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            pin_rel = "workspace/pipelines/a__b__1.0/lineage.json"
+            pin_abs = repo_root / pin_rel
+            # Place a directory at the pin path (simulating a race or misconfiguration).
+            pin_abs.mkdir(parents=True, exist_ok=True)
+            ws_tmp = repo_root / "workspace" / "tmp" / "run_rt_001"
+            ws_tmp.mkdir(parents=True, exist_ok=True)
+            profile = {
+                "repo_root": str(repo_root),
+                "tmp_dir": str(ws_tmp),
+                "workspace_tmp_rw_abs": str(ws_tmp),
+                "write_roots": [pin_rel],
+                "read_roots": [],
+                "runtime_ro_bind_paths": [],
+            }
+            with self.assertRaises(ValueError) as ctx:
+                render_bwrap_command(profile=profile, command_argv=["python3", "agent.py"])
+            self.assertIn("non-file", str(ctx.exception))
+
+    def test_render_bwrap_raises_if_file_pin_is_symlink_at_render_time(self) -> None:
+        """render_bwrap_command must raise if a file pin is a symlink at render time."""
+        import os
+        from tools.orchestration_runtime import render_bwrap_command
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            pin_rel = "workspace/pipelines/a__b__1.0/lineage.json"
+            pin_abs = repo_root / pin_rel
+            pin_abs.parent.mkdir(parents=True, exist_ok=True)
+            real = pin_abs.parent / "real.json"
+            real.write_text("{}", encoding="utf-8")
+            os.symlink(str(real), str(pin_abs))
+            ws_tmp = repo_root / "workspace" / "tmp" / "run_rt_002"
+            ws_tmp.mkdir(parents=True, exist_ok=True)
+            profile = {
+                "repo_root": str(repo_root),
+                "tmp_dir": str(ws_tmp),
+                "workspace_tmp_rw_abs": str(ws_tmp),
+                "write_roots": [pin_rel],
+                "read_roots": [],
+                "runtime_ro_bind_paths": [],
+            }
+            with self.assertRaises(ValueError) as ctx:
+                render_bwrap_command(profile=profile, command_argv=["python3", "agent.py"])
+            self.assertIn("symlink", str(ctx.exception))
+
+
+class PreWriteManifestExtensionPolicyTests(unittest.TestCase):
+    """_validate_paths_against_allowed_output_manifest must enforce extension policy pre-mutation."""
+
+    def _write_manifest(
+        self,
+        repo_root: Path,
+        *,
+        orchestration_id: str,
+        agent_run_id: str,
+        allowed_output_paths: list[str],
+    ) -> None:
+        from tools.orchestration_runtime import (
+            _output_manifests_dir,
+            _ensure_orchestration_audit_dirs,
+        )
+        _ensure_orchestration_audit_dirs(repo_root, orchestration_id)
+        m_dir = _output_manifests_dir(repo_root, orchestration_id)
+        m_dir.mkdir(parents=True, exist_ok=True)
+        (m_dir / f"{agent_run_id}.json").write_text(
+            json.dumps({"allowed_output_paths": allowed_output_paths, "allowed_tmp_root": ""}),
+            encoding="utf-8",
+        )
+
+    def test_pre_write_allows_known_extension_under_directory_entry(self) -> None:
+        from tools.orchestration_runtime import _validate_paths_against_allowed_output_manifest
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            orch = "orch_pw_ext_001"
+            run_id = "run_pw_ext_001"
+            self._write_manifest(
+                repo_root, orchestration_id=orch, agent_run_id=run_id,
+                allowed_output_paths=["workspace/pipelines/a/generate/g_001/src/"],
+            )
+            # Must not raise
+            _validate_paths_against_allowed_output_manifest(
+                repo_root,
+                orchestration_id=orch,
+                agent_run_id=run_id,
+                paths=["workspace/pipelines/a/generate/g_001/src/flux.f90"],
+            )
+
+    def test_pre_write_rejects_makefile_under_directory_entry(self) -> None:
+        """Makefile requires explicit file pin — not in extensionless allowlist."""
+        from tools.orchestration_runtime import _validate_paths_against_allowed_output_manifest
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            orch = "orch_pw_ext_002"
+            run_id = "run_pw_ext_002"
+            self._write_manifest(
+                repo_root, orchestration_id=orch, agent_run_id=run_id,
+                allowed_output_paths=["workspace/pipelines/a/generate/g_001/src/"],
+            )
+            with self.assertRaisesRegex(ValueError, "allowed_output_paths manifest violation"):
+                _validate_paths_against_allowed_output_manifest(
+                    repo_root,
+                    orchestration_id=orch,
+                    agent_run_id=run_id,
+                    paths=["workspace/pipelines/a/generate/g_001/src/Makefile"],
+                )
+
+    def test_pre_write_rejects_script_under_directory_entry(self) -> None:
+        from tools.orchestration_runtime import _validate_paths_against_allowed_output_manifest
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            orch = "orch_pw_ext_003"
+            run_id = "run_pw_ext_003"
+            self._write_manifest(
+                repo_root, orchestration_id=orch, agent_run_id=run_id,
+                allowed_output_paths=["workspace/pipelines/a/generate/g_001/src/"],
+            )
+            with self.assertRaisesRegex(ValueError, "allowed_output_paths manifest violation"):
+                _validate_paths_against_allowed_output_manifest(
+                    repo_root,
+                    orchestration_id=orch,
+                    agent_run_id=run_id,
+                    paths=["workspace/pipelines/a/generate/g_001/src/exploit.sh"],
+                )
+
+    def test_pre_write_rejects_unknown_extensionless_under_directory_entry(self) -> None:
+        from tools.orchestration_runtime import _validate_paths_against_allowed_output_manifest
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            orch = "orch_pw_ext_004"
+            run_id = "run_pw_ext_004"
+            self._write_manifest(
+                repo_root, orchestration_id=orch, agent_run_id=run_id,
+                allowed_output_paths=["workspace/pipelines/a/generate/g_001/src/"],
+            )
+            with self.assertRaisesRegex(ValueError, "allowed_output_paths manifest violation"):
+                _validate_paths_against_allowed_output_manifest(
+                    repo_root,
+                    orchestration_id=orch,
+                    agent_run_id=run_id,
+                    paths=["workspace/pipelines/a/generate/g_001/src/myexe"],
+                )
+
+    def test_pre_write_rejects_json_under_directory_entry(self) -> None:
+        """Structured data (.json) under a directory entry requires an explicit file pin."""
+        from tools.orchestration_runtime import _validate_paths_against_allowed_output_manifest
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            orch = "orch_pw_ext_005"
+            run_id = "run_pw_ext_005"
+            self._write_manifest(
+                repo_root, orchestration_id=orch, agent_run_id=run_id,
+                allowed_output_paths=["workspace/pipelines/a/generate/g_001/src/"],
+            )
+            with self.assertRaisesRegex(ValueError, "allowed_output_paths manifest violation"):
+                _validate_paths_against_allowed_output_manifest(
+                    repo_root,
+                    orchestration_id=orch,
+                    agent_run_id=run_id,
+                    paths=["workspace/pipelines/a/generate/g_001/src/results.json"],
+                )
+
+    def test_pre_write_rejects_yaml_under_directory_entry(self) -> None:
+        """Structured data (.yaml) under a directory entry requires an explicit file pin."""
+        from tools.orchestration_runtime import _validate_paths_against_allowed_output_manifest
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            orch = "orch_pw_ext_006"
+            run_id = "run_pw_ext_006"
+            self._write_manifest(
+                repo_root, orchestration_id=orch, agent_run_id=run_id,
+                allowed_output_paths=["workspace/pipelines/a/generate/g_001/src/"],
+            )
+            with self.assertRaisesRegex(ValueError, "allowed_output_paths manifest violation"):
+                _validate_paths_against_allowed_output_manifest(
+                    repo_root,
+                    orchestration_id=orch,
+                    agent_run_id=run_id,
+                    paths=["workspace/pipelines/a/generate/g_001/src/config.yaml"],
+                )
+
+    def test_pre_write_rejects_cmake_under_directory_entry(self) -> None:
+        """Build control file (.cmake) under a directory entry requires an explicit file pin."""
+        from tools.orchestration_runtime import _validate_paths_against_allowed_output_manifest
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            orch = "orch_pw_ext_007"
+            run_id = "run_pw_ext_007"
+            self._write_manifest(
+                repo_root, orchestration_id=orch, agent_run_id=run_id,
+                allowed_output_paths=["workspace/pipelines/a/generate/g_001/src/"],
+            )
+            with self.assertRaisesRegex(ValueError, "allowed_output_paths manifest violation"):
+                _validate_paths_against_allowed_output_manifest(
+                    repo_root,
+                    orchestration_id=orch,
+                    agent_run_id=run_id,
+                    paths=["workspace/pipelines/a/generate/g_001/src/CMakeLists.txt"],
+                )
+
+    def test_pre_write_rejects_nml_under_directory_entry(self) -> None:
+        """Namelist file (.nml) under a directory entry requires an explicit file pin."""
+        from tools.orchestration_runtime import _validate_paths_against_allowed_output_manifest
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            orch = "orch_pw_ext_008"
+            run_id = "run_pw_ext_008"
+            self._write_manifest(
+                repo_root, orchestration_id=orch, agent_run_id=run_id,
+                allowed_output_paths=["workspace/pipelines/a/generate/g_001/src/"],
+            )
+            with self.assertRaisesRegex(ValueError, "allowed_output_paths manifest violation"):
+                _validate_paths_against_allowed_output_manifest(
+                    repo_root,
+                    orchestration_id=orch,
+                    agent_run_id=run_id,
+                    paths=["workspace/pipelines/a/generate/g_001/src/params.nml"],
+                )
+
+    def test_pre_write_rejects_object_file_under_directory_entry(self) -> None:
+        """Compiler byproduct (.o) is subprocess output — Edit/Write must be rejected pre-mutation."""
+        from tools.orchestration_runtime import _validate_paths_against_allowed_output_manifest
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            orch = "orch_pw_ext_009"
+            run_id = "run_pw_ext_009"
+            self._write_manifest(
+                repo_root, orchestration_id=orch, agent_run_id=run_id,
+                allowed_output_paths=["workspace/pipelines/a/generate/g_001/src/"],
+            )
+            with self.assertRaisesRegex(ValueError, "allowed_output_paths manifest violation"):
+                _validate_paths_against_allowed_output_manifest(
+                    repo_root,
+                    orchestration_id=orch,
+                    agent_run_id=run_id,
+                    paths=["workspace/pipelines/a/generate/g_001/src/flux.o"],
+                )
+
+    def test_pre_write_rejects_module_file_under_directory_entry(self) -> None:
+        """Compiler byproduct (.mod) is subprocess output — Edit/Write must be rejected pre-mutation."""
+        from tools.orchestration_runtime import _validate_paths_against_allowed_output_manifest
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            orch = "orch_pw_ext_010"
+            run_id = "run_pw_ext_010"
+            self._write_manifest(
+                repo_root, orchestration_id=orch, agent_run_id=run_id,
+                allowed_output_paths=["workspace/pipelines/a/generate/g_001/src/"],
+            )
+            with self.assertRaisesRegex(ValueError, "allowed_output_paths manifest violation"):
+                _validate_paths_against_allowed_output_manifest(
+                    repo_root,
+                    orchestration_id=orch,
+                    agent_run_id=run_id,
+                    paths=["workspace/pipelines/a/generate/g_001/src/flux.mod"],
+                )
+
+    def test_pre_write_rejects_archive_file_under_directory_entry(self) -> None:
+        """Compiler byproduct (.a) is subprocess output — Edit/Write must be rejected pre-mutation."""
+        from tools.orchestration_runtime import _validate_paths_against_allowed_output_manifest
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            orch = "orch_pw_ext_011"
+            run_id = "run_pw_ext_011"
+            self._write_manifest(
+                repo_root, orchestration_id=orch, agent_run_id=run_id,
+                allowed_output_paths=["workspace/pipelines/a/generate/g_001/src/"],
+            )
+            with self.assertRaisesRegex(ValueError, "allowed_output_paths manifest violation"):
+                _validate_paths_against_allowed_output_manifest(
+                    repo_root,
+                    orchestration_id=orch,
+                    agent_run_id=run_id,
+                    paths=["workspace/pipelines/a/generate/g_001/src/libflux.a"],
+                )
 
 
 if __name__ == "__main__":

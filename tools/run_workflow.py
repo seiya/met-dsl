@@ -109,7 +109,7 @@ def _build_orchestration_prompt(
     orchestration_id: str,
     orchestration_agent_run_id: str,
     spec_ref: str,
-    dependency_ref: str,
+    source_dependency_ref: str,
     until_phase: str,
     workflow_mode: str,
 ) -> str:
@@ -123,7 +123,7 @@ def _build_orchestration_prompt(
         - orchestration_agent_run_id: `{orchestration_agent_run_id}`
         - workflow_mode: `{workflow_mode}`
         - target_spec_ref: `{spec_ref}`
-        - dependency_ref: `{dependency_ref}`
+        - dependency_ref: `{source_dependency_ref}`
         - target_phases: `{phase_list}`（終了 phase: `{until_phase}`）
 
         ## execution constraints
@@ -162,25 +162,25 @@ def _canonicalize_spec_ref(repo_root: Path, spec_ref: str) -> str:
         return str(resolved)
 
 
-def _validate_dependency_ref(dependency_ref: str) -> str:
-    normalized = dependency_ref.strip().replace("\\", "/").strip("/")
+def _validate_source_dependency_ref(source_dependency_ref: str) -> str:
+    normalized = source_dependency_ref.strip().replace("\\", "/").strip("/")
     if not normalized:
-        raise ValueError("dependency_ref must be non-empty")
+        raise ValueError("source_dependency_ref must be non-empty")
     if not (normalized.startswith("spec/") and normalized.endswith("/deps.yaml")):
-        raise ValueError("dependency_ref must match spec/.../deps.yaml")
+        raise ValueError("source_dependency_ref must match spec/.../deps.yaml")
     return normalized
 
 
-def _discover_dependency_ref(repo_root: Path, spec_ref: str) -> str:
+def _discover_source_dependency_ref(repo_root: Path, spec_ref: str) -> str:
     spec_path = _resolve_existing_ref_path(repo_root, spec_ref, field_name="spec_ref")
     dep_path = (spec_path / "deps.yaml") if spec_path.is_dir() else (spec_path.parent / "deps.yaml")
     if not dep_path.exists():
-        raise ValueError(f"dependency_ref must exist: {dep_path}")
+        raise ValueError(f"source_dependency_ref must exist: {dep_path}")
     try:
         dep_ref = dep_path.relative_to(repo_root).as_posix()
     except ValueError as exc:
-        raise ValueError(f"dependency_ref must be under repo root: {dep_path}") from exc
-    return _validate_dependency_ref(dep_ref)
+        raise ValueError(f"source_dependency_ref must be under repo root: {dep_path}") from exc
+    return _validate_source_dependency_ref(dep_ref)
 
 
 def _read_json_if_exists(path: Path) -> dict[str, Any] | None:
@@ -649,7 +649,7 @@ def main(argv: list[str] | None = None) -> int:
         orchestration_id = args.orchestration_id or _new_orchestration_id()
         llm_command = args.llm_command or DEFAULT_LLM_COMMANDS[args.llm]
         spec_ref = _canonicalize_spec_ref(repo_root, args.spec_ref)
-        dependency_ref = _discover_dependency_ref(repo_root, spec_ref)
+        source_dependency_ref = _discover_source_dependency_ref(repo_root, spec_ref)
     except ValueError as exc:
         print(
             json.dumps(
@@ -691,7 +691,7 @@ def main(argv: list[str] | None = None) -> int:
             "--agent-backend",
             args.llm,
         ]
-        init_args.extend(["--dependency-ref", dependency_ref])
+        init_args.extend(["--source-dependency-ref", source_dependency_ref])
         try:
             init_result = _runtime_command(repo_root, env, init_args).payload
             orchestration_agent_run_id = str(init_result.get("orchestration_agent_run_id", "")).strip()
@@ -770,7 +770,7 @@ def main(argv: list[str] | None = None) -> int:
             orchestration_id=orchestration_id,
             orchestration_agent_run_id=orchestration_agent_run_id,
             spec_ref=spec_ref,
-            dependency_ref=dependency_ref,
+            source_dependency_ref=source_dependency_ref,
             until_phase=until_phase,
             workflow_mode=workflow_mode,
         )

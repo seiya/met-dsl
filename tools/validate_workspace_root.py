@@ -29,12 +29,14 @@ ALLOWED_WORKSPACE_TOP_LEVEL_DIRS = {
     "plans",
     "pipelines",
     "index",
+    "tmp",
     ".pycache",
 }
 NODE_KEY_SAFE_PATTERN = re.compile(
     r"^[a-z][a-z0-9_]*__[a-z0-9][a-z0-9_]*__[0-9][0-9A-Za-z._-]*$"
 )
 SLUG_DATE_SEQ3_PATTERN = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*_[0-9]{8}_[0-9]{3}$")
+AGENT_RUN_ID_PATTERN = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_-]*$")
 
 
 def _normalize_workspace_root_token(workspace_root: str) -> str:
@@ -250,6 +252,19 @@ def _scan_workspace_layout(workspace_root: Path) -> list[str]:
         violations.append(
             f"{child}: non-canonical workspace directory name; allowed top-level directories are {sorted(ALLOWED_WORKSPACE_TOP_LEVEL_DIRS)}"
         )
+
+    tmp_root = workspace_root / "tmp"
+    if tmp_root.exists() and tmp_root.is_dir():
+        for child in sorted(tmp_root.iterdir()):
+            if not child.is_dir():
+                violations.append(
+                    f"{child}: non-directory entry directly under workspace/tmp/ is not allowed"
+                )
+                continue
+            if not AGENT_RUN_ID_PATTERN.match(child.name):
+                violations.append(
+                    f"{child}: invalid workspace/tmp/ subdirectory name; expected alphanumeric agent_run_id (no dots, slashes, or spaces)"
+                )
 
     for stage_root_name in ("plans", "pipelines"):
         stage_root = workspace_root / stage_root_name

@@ -189,10 +189,20 @@ echo "$CONTENT" > plans/derived_contract.json
 # NG: python3 -c によるインラインファイル書き込み
 python3 -c "import json; open('workspace/plans/.../derived_contract.json','w').write(json.dumps({}))"
 
-# NG: heredoc リダイレクト
+# NG: heredoc リダイレクト（直接ファイル指定）
 cat <<EOF > workspace/plans/.../derived_contract.json
 {"key": "value"}
 EOF
+
+# NG: $TMPDIR 配下であっても、.json/.txt 出力 path への heredoc redirect は禁止
+# hook は file_path を解釈できず '\"' をパスと誤検知してブロックする
+TMPFILE=$(mktemp "${TMPDIR}/work.json.XXXXXX")
+cat > "${TMPFILE}" << 'EOF'
+{"key": "value"}
+EOF
+# → patch text を変数に組み立てて guarded-apply-patch --patch-file に渡すこと（line 124-180 参照）
 ```
+
+**重要:** `.json` / `.txt` の出力は上記の `guarded-apply-patch` 手順（line 124-180）**以外の手段をすべて禁止する**。patch text を変数に組み立てること自体は許可されるが、最終書き込みは必ず `guarded-apply-patch --patch-file` 経由で行うこと。
 
 **重要:** `--paths-json` と `--patch-text` の `+++ b/` パスはいずれも `workspace/` で始まるプロジェクトルート相対パスとすること。`plans/...`（`workspace/` 接頭辞なし）や絶対パスは `output_manifest_write_guard` でブロックされる。

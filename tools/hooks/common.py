@@ -450,6 +450,42 @@ def _normalize_rel_posix(path_token: str) -> str:
     return token.rstrip("/")
 
 
+# Extensionless filenames permitted under a directory allowlist entry.
+# Build-control names (makefile, gnumakefile) are intentionally excluded — they must be
+# declared as explicit file pins to prevent undeclared command-execution injection.
+_ALLOWED_EXTENSIONLESS_BYPRODUCT_NAMES: frozenset[str] = frozenset({
+    "readme", "license", "changelog", "authors", "install", "notice", "copying",
+})
+
+# True compiler byproducts — created directly by the compiler, never via guarded-apply-patch.
+# Terminal validation may accept these under a directory allowlist without gate provenance.
+# (All other extension-allowlisted files are written through guarded-apply-patch and must
+# therefore appear in gate_changed_paths to pass terminal validation.)
+_COMPILER_BYPRODUCT_EXTENSIONS: frozenset[str] = frozenset({".mod", ".o", ".a"})
+
+# Allowlist of extensions permitted under a directory allowlist entry via file tools
+# (Edit/Write/guarded-apply-patch). Restricted to source code only.
+#
+# Excluded (must use explicit file pins):
+#   - Build control files (.mk, .cmake, .toml, .cfg, .ini, .nml) — can alter downstream
+#     build behaviour or inject arbitrary commands via CMakeLists.txt / Makefile fragments.
+#   - Structured data/documents (.json, .yaml, .xml, .csv, .md, .txt, etc.) — undeclared
+#     data injection is unauditable and can poison downstream steps.
+#   - Compiler byproducts (.mod, .o, .a) — created directly by the compiler as subprocess
+#     output, never via Edit/Write. File-tool writes of these extensions are blocked here;
+#     terminal validation also rejects them unless they have gate provenance — agents must
+#     clean up build artefacts before record-agent-run.
+#
+# Extensionless files are gated by _ALLOWED_EXTENSIONLESS_BYPRODUCT_NAMES.
+# Everything else is rejected (fail-closed).
+_ALLOWED_BYPRODUCT_EXTENSIONS: frozenset[str] = frozenset({
+    # Fortran source — primary intended output of the generate step
+    ".f90", ".f", ".f95", ".f03", ".f08", ".fpp",
+    # C/C++ source — primary intended output of the generate step
+    ".c", ".h", ".cpp", ".hpp", ".cc", ".hh", ".cxx", ".inc",
+})
+
+
 def _is_path_under_root(target: Path, root: Path) -> bool:
     target_s = str(target)
     root_s = str(root)
@@ -640,8 +676,28 @@ def validate_write_access(
             continue_processing=False,
         )
     allowed_paths = [str(item).strip() for item in allowed_paths_obj if isinstance(item, str) and item.strip()]
-    normalized_allowed_paths = {_normalize_rel_posix(p) for p in allowed_paths}
-    if rel_target_norm not in normalized_allowed_paths:
+    # Directory allowlist entries end with '/'; file entries are exact-match only.
+    normalized_allowed_files: set[str] = set()
+    normalized_allowed_dirs: list[str] = []
+    for p in allowed_paths:
+        norm = _normalize_rel_posix(p)
+        if p.endswith("/"):
+            normalized_allowed_dirs.append(norm)
+        else:
+            normalized_allowed_files.add(norm)
+    path_is_allowed = rel_target_norm in normalized_allowed_files
+    if not path_is_allowed and normalized_allowed_dirs:
+        under_dir = any(
+            rel_target_norm == d or rel_target_norm.startswith(d + "/")
+            for d in normalized_allowed_dirs
+        )
+        if under_dir:
+            ext = os.path.splitext(rel_target_norm)[1].lower()
+            if ext in _ALLOWED_BYPRODUCT_EXTENSIONS:
+                path_is_allowed = True
+            elif ext == "" and os.path.basename(rel_target_norm).lower() in _ALLOWED_EXTENSIONLESS_BYPRODUCT_NAMES:
+                path_is_allowed = True
+    if not path_is_allowed:
         return HookDecision(
             action=HookDecisionAction.BLOCK,
             reason=(

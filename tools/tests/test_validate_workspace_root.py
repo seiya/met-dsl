@@ -264,6 +264,42 @@ class ValidateWorkspaceRootTests(unittest.TestCase):
                 any("invalid plans id directory name" in v or "invalid pipelines id directory name" in v for v in violations)
             )
 
+    def test_allows_valid_uuid_subdirectory_under_tmp(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            uuid_dir = repo_root / "workspace" / "tmp" / "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+            uuid_dir.mkdir(parents=True, exist_ok=True)
+            violations, _ = validate(repo_root=repo_root, workspace_root="workspace")
+            self.assertFalse(any("workspace/tmp" in v for v in violations))
+
+    def test_allows_non_uuid_but_runtime_safe_agent_run_id_under_tmp(self) -> None:
+        """IDs like step_run_001 are accepted by runtime (_AGENT_RUN_ID_RE) and must also
+        pass workspace validation — both patterns must be consistent."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            for safe_id in ["step_run_001", "orch-run-abc", "substep123"]:
+                dir_path = repo_root / "workspace" / "tmp" / safe_id
+                dir_path.mkdir(parents=True, exist_ok=True)
+            violations, _ = validate(repo_root=repo_root, workspace_root="workspace")
+            self.assertFalse(any("invalid workspace/tmp/ subdirectory name" in v for v in violations))
+
+    def test_rejects_dotted_subdirectory_under_tmp(self) -> None:
+        """Names starting with '.' or containing '.' are not valid agent_run_ids."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            bad_dir = repo_root / "workspace" / "tmp" / "has.dot"
+            bad_dir.mkdir(parents=True, exist_ok=True)
+            violations, _ = validate(repo_root=repo_root, workspace_root="workspace")
+            self.assertTrue(any("invalid workspace/tmp/ subdirectory name" in v for v in violations))
+
+    def test_rejects_file_directly_under_tmp(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            (repo_root / "workspace" / "tmp").mkdir(parents=True, exist_ok=True)
+            (repo_root / "workspace" / "tmp" / "stray.txt").write_text("x", encoding="utf-8")
+            violations, _ = validate(repo_root=repo_root, workspace_root="workspace")
+            self.assertTrue(any("non-directory entry directly under workspace/tmp/" in v for v in violations))
+
 
 if __name__ == "__main__":
     unittest.main()
