@@ -6703,7 +6703,42 @@ def _json_string_list_arg(raw: str) -> list[str]:
     return [x for x in value if x.strip()]
 
 
-def _extract_patch_target_paths(patch_text: str) -> list[str]:
+def _select_patch_strip(
+    repo_root: Path,
+    patch_text: str,
+    normalized_paths: list[str],
+) -> tuple[int, list[str]]:
+    """Determine the correct -p<strip> level using changed_paths as the disambiguation oracle.
+
+    Runs 'git apply --numstat' with strip=1 (standard git format) then strip=0 (bare paths),
+    selecting the first level whose numstat targets are all covered by normalized_paths.
+
+    Heuristic pattern-matching on 'diff --git a/<X> b/<X>' headers is fundamentally ambiguous:
+    those headers are identical whether the patch is git-prefix format (target=<X>, strip=1)
+    or a bare rename between real directories 'a/' and 'b/' (target='b/<X>', strip=0).
+    Using changed_paths as the oracle resolves this without false assumptions.
+
+    Returns (strip, numstat_targets). Raises RuntimeError if neither strip level produces
+    targets covered by changed_paths (includes mixed-prefix and out-of-scope patches).
+    """
+    for strip in (1, 0):
+        try:
+            numstat = _numstat_targets(repo_root, patch_text, strip)
+        except RuntimeError:
+            continue
+        if numstat and all(
+            any(_repo_path_under_prefix(p, cp) for cp in normalized_paths) for p in numstat
+        ):
+            return strip, numstat
+    raise RuntimeError(
+        "guarded-apply-patch: cannot determine patch strip level — "
+        "neither -p1 nor -p0 produces targets covered by declared changed_paths "
+        "(patch may have mixed prefixes or targets outside changed_paths). "
+        f"changed_paths={normalized_paths}"
+    )
+
+
+def _extract_patch_target_paths(patch_text: str, strip: int = 1) -> list[str]:
     targets: list[str] = []
     for raw in patch_text.splitlines():
         line = raw.strip()
@@ -6712,9 +6747,76 @@ def _extract_patch_target_paths(patch_text: str) -> list[str]:
         token = line[4:].strip()
         if token == "/dev/null":
             continue
-        if token.startswith("b/"):
+        if strip == 1 and token.startswith("b/"):
             token = token[2:]
+        if ".." in token.split("/"):
+            raise RuntimeError(
+                f"guarded-apply-patch: patch path traversal detected: {token!r}"
+            )
         norm = _normalize_rel_posix(token)
+        if norm:
+            targets.append(norm)
+    return sorted(set(targets))
+
+
+def _extract_rename_sources(patch_text: str) -> list[str]:
+    """Return the source paths of all 'rename from' directives in the patch.
+
+    Rename operations delete the source file, which is a destructive side-effect that
+    must be authorized independently from the destination path.  'rename from' lines
+    use raw repo-relative paths (no a/b/ prefix) regardless of the strip level, so no
+    strip logic is needed here.  Copy sources are intentionally excluded: 'copy from'
+    leaves the source intact and only creates a new destination file.
+    """
+    sources: list[str] = []
+    for raw in patch_text.splitlines():
+        line = raw.strip()
+        if not line.startswith("rename from "):
+            continue
+        token = line[len("rename from "):].strip()
+        if not token:
+            continue
+        norm = _normalize_rel_posix(token)
+        if norm:
+            sources.append(norm)
+    return sorted(set(sources))
+
+
+def _numstat_targets(repo_root: Path, patch_text: str, strip: int) -> list[str]:
+    """Dry-run git apply --numstat -z to enumerate the paths git will actually touch.
+
+    Uses -z so that git outputs NUL-terminated raw byte paths instead of quoting/escaping
+    filenames that contain tabs, newlines, double-quotes, or backslashes.  With -z, each
+    record is '<added>\\t<deleted>\\t<dest-path>\\0'.  For renames git outputs the
+    destination path only (the file that will exist after apply), which is what we need.
+    """
+    proc = subprocess.run(
+        ["git", "apply", "--numstat", "-z", "--check", f"-p{strip}", "-"],
+        cwd=str(repo_root),
+        input=patch_text.encode(),
+        capture_output=True,
+        check=False,
+    )
+    if proc.returncode != 0:
+        raw_err = proc.stderr or proc.stdout or b""
+        if isinstance(raw_err, str):
+            raw_err = raw_err.encode()
+        msg = raw_err.decode(errors="replace").strip()
+        raise RuntimeError(f"guarded-apply-patch: pre-apply numstat failed: {msg}")
+    raw_out = proc.stdout if isinstance(proc.stdout, bytes) else (proc.stdout or "").encode()
+    targets: list[str] = []
+    for record in raw_out.split(b"\0"):
+        if not record:
+            continue
+        parts = record.split(b"\t", 2)
+        if len(parts) < 3:
+            continue
+        path_bytes = parts[2]
+        try:
+            path_str = path_bytes.decode()
+        except UnicodeDecodeError:
+            path_str = path_bytes.decode(errors="replace")
+        norm = _normalize_rel_posix(path_str)
         if norm:
             targets.append(norm)
     return sorted(set(targets))
@@ -6736,16 +6838,44 @@ def guarded_apply_patch(
     if not normalized_paths:
         raise ValueError("changed_paths must be non-empty")
 
-    patch_targets = _extract_patch_target_paths(patch_text)
-    if not patch_targets:
-        raise ValueError("patch_text must include at least one '+++ <path>' target")
+    strip, numstat_targets = _select_patch_strip(repo_root, patch_text, normalized_paths)
+    # numstat_targets is the authoritative write set: already verified to be covered by
+    # changed_paths inside _select_patch_strip.  It correctly handles mode-only patches
+    # and pure renames that have no '+++ ' lines and would produce an empty patch_targets.
+    patch_targets = _extract_patch_target_paths(patch_text, strip=strip)
+    # Security check: if the +++ header parser claims a path that git's numstat does NOT
+    # include, the patch text may be trying to deceive the gate.  We only reject for
+    # parser-exclusive paths; numstat-exclusive paths (mode-only, renames) are fine.
+    numstat_set = set(numstat_targets)
+    parser_exclusive = [p for p in patch_targets if p not in numstat_set]
+    if parser_exclusive:
+        raise RuntimeError(
+            "guarded-apply-patch: +++ headers declare paths absent from git-apply numstat "
+            f"(strip={strip}); suspicious_paths={parser_exclusive} numstat={numstat_targets}"
+        )
+    # Defense-in-depth: re-verify all git-resolved targets are within declared changed_paths.
     not_covered = [
-        p for p in patch_targets if not any(_repo_path_under_prefix(p, cp) for cp in normalized_paths)
+        p for p in numstat_targets
+        if not any(_repo_path_under_prefix(p, cp) for cp in normalized_paths)
     ]
     if not_covered:
         raise RuntimeError(
             "guarded-apply-patch: patch targets are not covered by changed_paths: "
             + ", ".join(not_covered)
+        )
+    # Rename-source check: 'rename from' deletes the source file, which is a destructive
+    # side-effect that must also be authorized.  numstat only reports the destination, so
+    # we parse 'rename from' lines directly and require each source to be in changed_paths.
+    rename_sources = _extract_rename_sources(patch_text)
+    uncovered_sources = [
+        p for p in rename_sources
+        if not any(_repo_path_under_prefix(p, cp) for cp in normalized_paths)
+    ]
+    if uncovered_sources:
+        raise RuntimeError(
+            "guarded-apply-patch: rename source paths are not covered by changed_paths "
+            "(rename deletes the source file, which must be explicitly authorized): "
+            + ", ".join(uncovered_sources)
         )
     actor_role_token = actor_role.strip().lower()
     if actor_role_token in {"step", "substep"}:
@@ -6765,7 +6895,7 @@ def guarded_apply_patch(
         capability_token=capability_token,
     )
     proc = subprocess.run(
-        ["git", "apply", "--recount", "--whitespace=nowarn", "-"],
+        ["git", "apply", "--recount", "--whitespace=nowarn", f"-p{strip}", "-"],
         cwd=str(repo_root),
         text=True,
         input=patch_text,
@@ -6787,7 +6917,7 @@ def guarded_apply_patch(
     return {
         "applied": True,
         "changed_paths": normalized_paths,
-        "patch_targets": patch_targets,
+        "patch_targets": numstat_targets,
         "gate_result_ref": gate_ref,
     }
 

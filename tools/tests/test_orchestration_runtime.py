@@ -6,6 +6,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import subprocess
 import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
@@ -8578,24 +8579,29 @@ class TestPhase3RunGate(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
             token = self._setup_run_gate_fixture(repo_root)
+            target_path = f"{_FIX_PIPE_REF}/build/build_001/build_meta.json"
             patch_text = "\n".join(
                 [
-                    "diff --git a/workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/build/build_001/build_meta.json b/workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/build/build_001/build_meta.json",
-                    "--- a/workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/build/build_001/build_meta.json",
-                    "+++ b/workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/build/build_001/build_meta.json",
+                    f"diff --git a/{target_path} b/{target_path}",
+                    f"--- a/{target_path}",
+                    f"+++ b/{target_path}",
                     "@@ -0,0 +1 @@",
                     "+{\"ok\": true}",
                     "",
                 ]
             )
+            numstat_output = f"1\t0\t{target_path}\0".encode()
             with patch("tools.orchestration_runtime.subprocess.run") as run_mock:
-                run_mock.return_value = _FakeCompletedProcess(returncode=0, stdout="", stderr="")
+                run_mock.side_effect = [
+                    _FakeCompletedProcess(returncode=0, stdout=numstat_output, stderr=b""),
+                    _FakeCompletedProcess(returncode=0, stdout="", stderr=""),
+                ]
                 out = guarded_apply_patch(
                     repo_root,
                     orchestration_id="rg1",
                     actor_role="step",
                     agent_run_id="build_child_rg1",
-                    changed_paths=[f"{_FIX_PIPE_REF}/build/build_001/build_meta.json"],
+                    changed_paths=[target_path],
                     patch_text=patch_text,
                     capability_token=token,
                 )
@@ -8604,30 +8610,36 @@ class TestPhase3RunGate(unittest.TestCase):
                 out.get("gate_result_ref"),
                 "workspace/orchestrations/rg1/gates/build_child_rg1/apply_patch_writes.json",
             )
-            self.assertEqual(run_mock.call_count, 1)
+            self.assertEqual(run_mock.call_count, 2)
 
     def test_guarded_apply_patch_rejects_file_under_directory_when_not_listed(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
             token = self._setup_run_gate_fixture(repo_root)
+            target = f"{_FIX_PIPE_REF}/build/subdir/new_artifact.json"
             patch_text = "\n".join(
                 [
-                    "diff --git a/workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/build/subdir/new_artifact.json b/workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/build/subdir/new_artifact.json",
-                    "--- a/workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/build/subdir/new_artifact.json",
-                    "+++ b/workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/build/subdir/new_artifact.json",
+                    f"diff --git a/{target} b/{target}",
+                    f"--- a/{target}",
+                    f"+++ b/{target}",
                     "@@ -0,0 +1 @@",
                     "+{\"ok\": true}",
                     "",
                 ]
             )
-            with patch("tools.orchestration_runtime.subprocess.run") as run_mock:
+            with (
+                patch(
+                    "tools.orchestration_runtime._numstat_targets", return_value=[target]
+                ),
+                patch("tools.orchestration_runtime.subprocess.run") as run_mock,
+            ):
                 with self.assertRaisesRegex(ValueError, "allowed_output_paths manifest violation"):
                     guarded_apply_patch(
                         repo_root,
                         orchestration_id="rg1",
                         actor_role="step",
                         agent_run_id="build_child_rg1",
-                        changed_paths=[f"{_FIX_PIPE_REF}/build/subdir/new_artifact.json"],
+                        changed_paths=[target],
                         patch_text=patch_text,
                         capability_token=token,
                     )
@@ -8637,19 +8649,27 @@ class TestPhase3RunGate(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
             token = self._setup_run_gate_fixture(repo_root)
+            outside_target = "workspace/orchestrations/rg1/orchestration_meta.json"
             patch_text = "\n".join(
                 [
-                    "diff --git a/workspace/orchestrations/rg1/orchestration_meta.json b/workspace/orchestrations/rg1/orchestration_meta.json",
-                    "--- a/workspace/orchestrations/rg1/orchestration_meta.json",
-                    "+++ b/workspace/orchestrations/rg1/orchestration_meta.json",
+                    f"diff --git a/{outside_target} b/{outside_target}",
+                    f"--- a/{outside_target}",
+                    f"+++ b/{outside_target}",
                     "@@ -1 +1 @@",
                     "-{}",
                     "+{\"status\": \"running\"}",
                     "",
                 ]
             )
-            with patch("tools.orchestration_runtime.subprocess.run") as run_mock:
-                with self.assertRaisesRegex(RuntimeError, "not covered by changed_paths"):
+            # _numstat_targets returns the outside target for both strip levels;
+            # _select_patch_strip cannot find coverage in changed_paths → raises.
+            with (
+                patch(
+                    "tools.orchestration_runtime._numstat_targets", return_value=[outside_target]
+                ),
+                patch("tools.orchestration_runtime.subprocess.run") as run_mock,
+            ):
+                with self.assertRaisesRegex(RuntimeError, "cannot determine patch strip level"):
                     guarded_apply_patch(
                         repo_root,
                         orchestration_id="rg1",
@@ -8665,17 +8685,23 @@ class TestPhase3RunGate(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
             token = self._setup_run_gate_fixture(repo_root)
+            target = "workspace/plans/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/case.resolved.yaml"
             patch_text = "\n".join(
                 [
-                    "diff --git a/workspace/plans/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/case.resolved.yaml b/workspace/plans/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/case.resolved.yaml",
-                    "--- a/workspace/plans/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/case.resolved.yaml",
-                    "+++ b/workspace/plans/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/case.resolved.yaml",
+                    f"diff --git a/{target} b/{target}",
+                    f"--- a/{target}",
+                    f"+++ b/{target}",
                     "@@ -0,0 +1 @@",
                     "+cases: []",
                     "",
                 ]
             )
-            with patch("tools.orchestration_runtime.subprocess.run") as run_mock:
+            with (
+                patch(
+                    "tools.orchestration_runtime._numstat_targets", return_value=[target]
+                ),
+                patch("tools.orchestration_runtime.subprocess.run") as run_mock,
+            ):
                 with self.assertRaisesRegex(ValueError, "allowed_output_paths manifest violation"):
                     guarded_apply_patch(
                         repo_root,
@@ -8691,16 +8717,18 @@ class TestPhase3RunGate(unittest.TestCase):
     def test_guarded_apply_patch_validates_manifest_with_declared_changed_paths(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
+            target_path = f"{_FIX_PIPE_REF}/build/new_artifact.json"
             patch_text = "\n".join(
                 [
-                    "diff --git a/workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/build/new_artifact.json b/workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/build/new_artifact.json",
-                    "--- a/workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/build/new_artifact.json",
-                    "+++ b/workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/build/new_artifact.json",
+                    f"diff --git a/{target_path} b/{target_path}",
+                    f"--- a/{target_path}",
+                    f"+++ b/{target_path}",
                     "@@ -0,0 +1 @@",
                     "+{\"ok\": true}",
                     "",
                 ]
             )
+            numstat_output = f"1\t0\t{target_path}\0".encode()
             with (
                 patch(
                     "tools.orchestration_runtime._validate_paths_against_allowed_output_manifest"
@@ -8711,7 +8739,10 @@ class TestPhase3RunGate(unittest.TestCase):
             ):
                 gate_mock.return_value = {"allowed": True, "checked_paths": [f"{_FIX_PIPE_REF}/build/"]}
                 evidence_mock.return_value = "workspace/orchestrations/rg1/gates/build_child_rg1/apply_patch_writes.json"
-                run_mock.return_value = _FakeCompletedProcess(returncode=0, stdout="", stderr="")
+                run_mock.side_effect = [
+                    _FakeCompletedProcess(returncode=0, stdout=numstat_output, stderr=b""),
+                    _FakeCompletedProcess(returncode=0, stdout="", stderr=""),
+                ]
                 guarded_apply_patch(
                     repo_root,
                     orchestration_id="rg1",
@@ -8727,15 +8758,421 @@ class TestPhase3RunGate(unittest.TestCase):
                 [f"{_FIX_PIPE_REF}/build"],
             )
 
+    def test_guarded_apply_patch_no_prefix_patch_writes_declared_path(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            subprocess.run(["git", "init", "--quiet"], cwd=str(repo_root), check=True)
+            subprocess.run(
+                ["git", "config", "user.email", "test@test.com"], cwd=str(repo_root), check=True
+            )
+            subprocess.run(
+                ["git", "config", "user.name", "Test"], cwd=str(repo_root), check=True
+            )
+            target = "workspace/foo/bar.json"
+            (repo_root / "workspace" / "foo").mkdir(parents=True)
+            patch_text = "\n".join(
+                [
+                    f"diff --git {target} {target}",
+                    "new file mode 100644",
+                    "--- /dev/null",
+                    f"+++ {target}",
+                    "@@ -0,0 +1 @@",
+                    '+{"created": true}',
+                    "",
+                ]
+            )
+            with (
+                patch("tools.orchestration_runtime.gate_apply_patch_writes") as gate_mock,
+                patch(
+                    "tools.orchestration_runtime._write_apply_patch_gate_evidence"
+                ) as evidence_mock,
+            ):
+                gate_mock.return_value = {"allowed": True}
+                evidence_mock.return_value = (
+                    "workspace/orchestrations/rg1/gates/ag1/apply_patch_writes.json"
+                )
+                out = guarded_apply_patch(
+                    repo_root,
+                    orchestration_id="rg1",
+                    actor_role="orchestration",
+                    agent_run_id="ag1",
+                    changed_paths=[target],
+                    patch_text=patch_text,
+                    capability_token="tok",
+                )
+            self.assertTrue(out.get("applied"))
+            self.assertTrue((repo_root / target).exists(), "file must be at workspace/foo/bar.json")
+            self.assertFalse(
+                (repo_root / "foo" / "bar.json").exists(),
+                "git apply must not strip 'workspace/' prefix",
+            )
+
+    def test_guarded_apply_patch_bare_path_starting_with_a_slash(self) -> None:
+        # Regression: a bare-path patch targeting a file under a directory named 'a/'
+        # must not be confused with the git a/b prefix format.
+        # 'diff --git a/results.json a/results.json' has the same prefix on both sides,
+        # so _detect_patch_prefix_strip must infer strip=0 (bare), not strip=1.
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            subprocess.run(["git", "init", "--quiet"], cwd=str(repo_root), check=True)
+            subprocess.run(
+                ["git", "config", "user.email", "test@test.com"], cwd=str(repo_root), check=True
+            )
+            subprocess.run(
+                ["git", "config", "user.name", "Test"], cwd=str(repo_root), check=True
+            )
+            target = "a/results.json"
+            (repo_root / "a").mkdir(parents=True)
+            patch_text = "\n".join(
+                [
+                    f"diff --git {target} {target}",
+                    "new file mode 100644",
+                    "--- /dev/null",
+                    f"+++ {target}",
+                    "@@ -0,0 +1 @@",
+                    '+{"ok": true}',
+                    "",
+                ]
+            )
+            with (
+                patch("tools.orchestration_runtime.gate_apply_patch_writes") as gate_mock,
+                patch(
+                    "tools.orchestration_runtime._write_apply_patch_gate_evidence"
+                ) as evidence_mock,
+            ):
+                gate_mock.return_value = {"allowed": True}
+                evidence_mock.return_value = (
+                    "workspace/orchestrations/rg1/gates/ag1/apply_patch_writes.json"
+                )
+                out = guarded_apply_patch(
+                    repo_root,
+                    orchestration_id="rg1",
+                    actor_role="orchestration",
+                    agent_run_id="ag1",
+                    changed_paths=[target],
+                    patch_text=patch_text,
+                    capability_token="tok",
+                )
+            self.assertTrue(out.get("applied"))
+            self.assertTrue((repo_root / target).exists(), "file must be at a/results.json")
+            self.assertFalse(
+                (repo_root / "results.json").exists(),
+                "git apply must not strip 'a/' as if it were a git prefix",
+            )
+
+    def test_guarded_apply_patch_special_char_filename_no_false_mismatch(self) -> None:
+        # Regression: git apply --numstat (without -z) quotes filenames containing
+        # double-quotes, backslashes, tabs, etc., e.g.
+        #   '1\t0\t"dir/file \"quoted\".json"'
+        # The old parser returned the quoted string verbatim, causing a mismatch
+        # against _extract_patch_target_paths which returned the raw path.
+        # With -z, git outputs raw NUL-terminated bytes — no quoting needed.
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            subprocess.run(["git", "init", "--quiet"], cwd=str(repo_root), check=True)
+            subprocess.run(
+                ["git", "config", "user.email", "test@test.com"], cwd=str(repo_root), check=True
+            )
+            subprocess.run(
+                ["git", "config", "user.name", "Test"], cwd=str(repo_root), check=True
+            )
+            # Filename with double-quote triggers git's C-escaping in non-z numstat output
+            target = 'workspace/results/file "quoted".json'
+            (repo_root / "workspace" / "results").mkdir(parents=True)
+            (repo_root / target).write_text("old\n", encoding="utf-8")
+            patch_text = "\n".join(
+                [
+                    f'diff --git a/{target} b/{target}',
+                    f'--- a/{target}',
+                    f'+++ b/{target}',
+                    "@@ -1 +1 @@",
+                    "-old",
+                    "+new",
+                    "",
+                ]
+            )
+            with (
+                patch("tools.orchestration_runtime.gate_apply_patch_writes") as gate_mock,
+                patch(
+                    "tools.orchestration_runtime._write_apply_patch_gate_evidence"
+                ) as evidence_mock,
+            ):
+                gate_mock.return_value = {"allowed": True}
+                evidence_mock.return_value = (
+                    "workspace/orchestrations/rg1/gates/ag1/apply_patch_writes.json"
+                )
+                out = guarded_apply_patch(
+                    repo_root,
+                    orchestration_id="rg1",
+                    actor_role="orchestration",
+                    agent_run_id="ag1",
+                    changed_paths=[target],
+                    patch_text=patch_text,
+                    capability_token="tok",
+                )
+            self.assertTrue(out.get("applied"))
+            self.assertEqual((repo_root / target).read_text(encoding="utf-8"), "new\n")
+
+    def test_guarded_apply_patch_mode_only_patch_applies(self) -> None:
+        # Regression: mode-only patches have no '+++ ' lines, so _extract_patch_target_paths
+        # returns []. Old code raised ValueError("must include at least one '+++ <path>'").
+        # New code uses numstat_targets as the authoritative path set, allowing mode-only patches.
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            subprocess.run(["git", "init", "--quiet"], cwd=str(repo_root), check=True)
+            subprocess.run(
+                ["git", "config", "user.email", "test@test.com"], cwd=str(repo_root), check=True
+            )
+            subprocess.run(
+                ["git", "config", "user.name", "Test"], cwd=str(repo_root), check=True
+            )
+            target = "workspace/foo/script.sh"
+            (repo_root / "workspace" / "foo").mkdir(parents=True)
+            (repo_root / target).write_text("#!/bin/sh\necho hi\n", encoding="utf-8")
+            subprocess.run(["git", "add", "-f", target], cwd=str(repo_root), check=True)
+            subprocess.run(["git", "commit", "-qm", "init"], cwd=str(repo_root), check=True)
+            patch_text = "\n".join(
+                [
+                    f"diff --git a/{target} b/{target}",
+                    "old mode 100644",
+                    "new mode 100755",
+                    "",
+                ]
+            )
+            with (
+                patch("tools.orchestration_runtime.gate_apply_patch_writes") as gate_mock,
+                patch(
+                    "tools.orchestration_runtime._write_apply_patch_gate_evidence"
+                ) as evidence_mock,
+            ):
+                gate_mock.return_value = {"allowed": True}
+                evidence_mock.return_value = (
+                    "workspace/orchestrations/rg1/gates/ag1/apply_patch_writes.json"
+                )
+                out = guarded_apply_patch(
+                    repo_root,
+                    orchestration_id="rg1",
+                    actor_role="orchestration",
+                    agent_run_id="ag1",
+                    changed_paths=[target],
+                    patch_text=patch_text,
+                    capability_token="tok",
+                )
+            self.assertTrue(out.get("applied"))
+            self.assertEqual(out.get("patch_targets"), [target])
+
+    def test_guarded_apply_patch_rename_only_patch_applies(self) -> None:
+        # Regression: pure rename patches have no '+++ ' content lines either.
+        # Old code raised ValueError; new code uses numstat to resolve the destination.
+        # Both the rename source (deleted) and destination (created) must be in changed_paths.
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            subprocess.run(["git", "init", "--quiet"], cwd=str(repo_root), check=True)
+            subprocess.run(
+                ["git", "config", "user.email", "test@test.com"], cwd=str(repo_root), check=True
+            )
+            subprocess.run(
+                ["git", "config", "user.name", "Test"], cwd=str(repo_root), check=True
+            )
+            old = "workspace/foo/old_name.json"
+            new = "workspace/foo/new_name.json"
+            (repo_root / "workspace" / "foo").mkdir(parents=True)
+            (repo_root / old).write_text('{"v": 1}\n', encoding="utf-8")
+            subprocess.run(["git", "add", "-f", old], cwd=str(repo_root), check=True)
+            subprocess.run(["git", "commit", "-qm", "init"], cwd=str(repo_root), check=True)
+            patch_text = "\n".join(
+                [
+                    f"diff --git a/{old} b/{new}",
+                    "similarity index 100%",
+                    f"rename from {old}",
+                    f"rename to {new}",
+                    "",
+                ]
+            )
+            with (
+                patch("tools.orchestration_runtime.gate_apply_patch_writes") as gate_mock,
+                patch(
+                    "tools.orchestration_runtime._write_apply_patch_gate_evidence"
+                ) as evidence_mock,
+            ):
+                gate_mock.return_value = {"allowed": True}
+                evidence_mock.return_value = (
+                    "workspace/orchestrations/rg1/gates/ag1/apply_patch_writes.json"
+                )
+                out = guarded_apply_patch(
+                    repo_root,
+                    orchestration_id="rg1",
+                    actor_role="orchestration",
+                    agent_run_id="ag1",
+                    # Both source (deleted) and destination (created) must be declared.
+                    changed_paths=[old, new],
+                    patch_text=patch_text,
+                    capability_token="tok",
+                )
+            self.assertTrue(out.get("applied"))
+            self.assertEqual(out.get("patch_targets"), [new])
+            self.assertTrue((repo_root / new).exists())
+            self.assertFalse((repo_root / old).exists())
+
+    def test_guarded_apply_patch_rename_from_out_of_scope_rejected(self) -> None:
+        # Security: rename from an out-of-scope path must be rejected even when the
+        # destination is within changed_paths.  A rename deletes the source file,
+        # which is a destructive side-effect that requires explicit authorization.
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            subprocess.run(["git", "init", "--quiet"], cwd=str(repo_root), check=True)
+            subprocess.run(
+                ["git", "config", "user.email", "test@test.com"], cwd=str(repo_root), check=True
+            )
+            subprocess.run(
+                ["git", "config", "user.name", "Test"], cwd=str(repo_root), check=True
+            )
+            src = "sensitive/outside.json"
+            dst = "workspace/allowed/new.json"
+            (repo_root / "sensitive").mkdir(parents=True)
+            (repo_root / "workspace" / "allowed").mkdir(parents=True)
+            (repo_root / src).write_text('{"secret": true}\n', encoding="utf-8")
+            subprocess.run(["git", "add", "-f", src], cwd=str(repo_root), check=True)
+            subprocess.run(["git", "commit", "-qm", "init"], cwd=str(repo_root), check=True)
+            patch_text = "\n".join(
+                [
+                    f"diff --git a/{src} b/{dst}",
+                    "similarity index 100%",
+                    f"rename from {src}",
+                    f"rename to {dst}",
+                    "",
+                ]
+            )
+            with (
+                patch("tools.orchestration_runtime.gate_apply_patch_writes") as gate_mock,
+                patch("tools.orchestration_runtime._write_apply_patch_gate_evidence"),
+            ):
+                gate_mock.return_value = {"allowed": True}
+                with self.assertRaisesRegex(
+                    RuntimeError, "rename source paths are not covered by changed_paths"
+                ):
+                    guarded_apply_patch(
+                        repo_root,
+                        orchestration_id="rg1",
+                        actor_role="orchestration",
+                        agent_run_id="ag1",
+                        changed_paths=[dst],  # only destination — source is out of scope
+                        patch_text=patch_text,
+                        capability_token="tok",
+                    )
+            # Ensure the source file was NOT deleted
+            self.assertTrue(
+                (repo_root / src).exists(),
+                "out-of-scope source must not be deleted",
+            )
+
+    def test_guarded_apply_patch_mixed_prefix_rejected(self) -> None:
+        # A patch mixing git-prefix hunks (a/x.json b/x.json) and bare-path hunks
+        # (workspace/y.json) cannot be consistently applied with a single -p<strip>.
+        # strip=1 produces ["x.json", "y.json"] (strips 'workspace/' from bare hunk).
+        # strip=0 produces ["b/x.json", "workspace/y.json"] (keeps b/ from git hunk).
+        # Neither result is fully covered by changed_paths → _select_patch_strip raises.
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            patch_text = "\n".join(
+                [
+                    "diff --git a/x.json b/x.json",
+                    "--- a/x.json",
+                    "+++ b/x.json",
+                    "@@ -0,0 +1 @@",
+                    '+{"x": 1}',
+                    "diff --git workspace/y.json workspace/y.json",
+                    "--- /dev/null",
+                    "+++ workspace/y.json",
+                    "@@ -0,0 +1 @@",
+                    '+{"y": 1}',
+                    "",
+                ]
+            )
+            # Mock _numstat_targets to return the inconsistent results for each strip level
+            # without actually running git (the repo_root is not a git repo).
+            def fake_numstat(repo_root: object, patch_text: object, strip: int) -> list[str]:
+                return ["x.json", "y.json"] if strip == 1 else ["b/x.json", "workspace/y.json"]
+
+            with (
+                patch("tools.orchestration_runtime._numstat_targets", side_effect=fake_numstat),
+                patch("tools.orchestration_runtime.subprocess.run") as run_mock,
+            ):
+                with self.assertRaisesRegex(
+                    RuntimeError, "cannot determine patch strip level"
+                ):
+                    guarded_apply_patch(
+                        repo_root,
+                        orchestration_id="rg1",
+                        actor_role="orchestration",
+                        agent_run_id="ag1",
+                        changed_paths=["x.json", "workspace/y.json"],
+                        patch_text=patch_text,
+                        capability_token="tok",
+                    )
+            self.assertEqual(run_mock.call_count, 0, "git apply must not be called")
+
+    def test_guarded_apply_patch_numstat_mismatch_raises(self) -> None:
+        # Verify that when _numstat_targets returns a path that is covered by changed_paths
+        # but differs from _extract_patch_target_paths, the cross-validation catches it.
+        # changed_paths uses a directory prefix so the DIFFERENT filename is still "covered"
+        # by _select_patch_strip, letting the cross-validation check run.
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            target = "workspace/foo/bar.json"
+            patch_text = "\n".join(
+                [
+                    f"diff --git a/{target} b/{target}",
+                    f"--- a/{target}",
+                    f"+++ b/{target}",
+                    "@@ -0,0 +1 @@",
+                    '+{"ok": true}',
+                    "",
+                ]
+            )
+            apply_spy = _FakeCompletedProcess(returncode=0, stdout="", stderr="")
+            with (
+                patch(
+                    "tools.orchestration_runtime._numstat_targets",
+                    return_value=["workspace/foo/DIFFERENT.json"],
+                ),
+                patch("tools.orchestration_runtime.subprocess.run", return_value=apply_spy) as run_mock,
+            ):
+                with self.assertRaisesRegex(RuntimeError, "headers declare paths absent from git-apply numstat"):
+                    guarded_apply_patch(
+                        repo_root,
+                        orchestration_id="rg1",
+                        actor_role="orchestration",
+                        agent_run_id="ag1",
+                        # Use a directory prefix so DIFFERENT.json is covered by _select_patch_strip,
+                        # allowing the cross-validation (patch_targets != numstat_targets) to run.
+                        changed_paths=["workspace/foo/"],
+                        patch_text=patch_text,
+                        capability_token="tok",
+                    )
+            self.assertEqual(run_mock.call_count, 0, "git apply must not be called after mismatch")
+
     def test_main_guarded_apply_patch_returns_nonzero_on_gate_rejection(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
+            # git init is required so _numstat_targets can run git apply --numstat --check
+            subprocess.run(["git", "init", "--quiet"], cwd=str(repo_root), check=True)
+            subprocess.run(
+                ["git", "config", "user.email", "test@test.com"], cwd=str(repo_root), check=True
+            )
+            subprocess.run(
+                ["git", "config", "user.name", "Test"], cwd=str(repo_root), check=True
+            )
             token = self._setup_run_gate_fixture(repo_root)
+            outside_target = "workspace/orchestrations/rg1/orchestration_meta.json"
+            # Pre-create the file so git apply --check can evaluate the modification patch
+            (repo_root / "workspace" / "orchestrations" / "rg1").mkdir(parents=True, exist_ok=True)
+            (repo_root / outside_target).write_text("{}\n", encoding="utf-8")
             patch_text = "\n".join(
                 [
-                    "diff --git a/workspace/orchestrations/rg1/orchestration_meta.json b/workspace/orchestrations/rg1/orchestration_meta.json",
-                    "--- a/workspace/orchestrations/rg1/orchestration_meta.json",
-                    "+++ b/workspace/orchestrations/rg1/orchestration_meta.json",
+                    f"diff --git a/{outside_target} b/{outside_target}",
+                    f"--- a/{outside_target}",
+                    f"+++ b/{outside_target}",
                     "@@ -1 +1 @@",
                     "-{}",
                     "+{\"status\": \"running\"}",
@@ -8764,7 +9201,7 @@ class TestPhase3RunGate(unittest.TestCase):
                     ]
                 )
             self.assertEqual(rc, 1)
-            self.assertIn("not covered by changed_paths", err.getvalue())
+            self.assertIn("cannot determine patch strip level", err.getvalue())
 
     def test_run_gate_rejects_gate_not_allowed_by_policy(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
