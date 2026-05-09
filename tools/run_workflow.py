@@ -101,6 +101,11 @@ def _launch_command_and_input(*, llm: str, llm_command: str, prompt_text: str) -
     # Use non-interactive subcommand to run from this bootstrap script.
     if llm == "codex":
         return [*command, "exec", prompt_text], None
+    # Claude Code defaults to launching the interactive TUI; `-p` (--print) runs
+    # the prompt non-interactively and exits, which is required when invoked from
+    # this bootstrap script.
+    if llm == "claude":
+        return [*command, "-p", prompt_text], None
     return command, prompt_text
 
 

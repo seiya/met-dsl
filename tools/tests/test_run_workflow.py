@@ -167,14 +167,14 @@ class RunWorkflowTests(unittest.TestCase):
         self.assertEqual(command, ["codex", "exec", "run workflow"])
         self.assertIsNone(stdin_text)
 
-    def test_launch_command_for_claude_uses_stdin_prompt(self) -> None:
+    def test_launch_command_for_claude_uses_print_flag(self) -> None:
         command, stdin_text = run_workflow._launch_command_and_input(
             llm="claude",
             llm_command="claude",
             prompt_text="run workflow",
         )
-        self.assertEqual(command, ["claude"])
-        self.assertEqual(stdin_text, "run workflow")
+        self.assertEqual(command, ["claude", "-p", "run workflow"])
+        self.assertIsNone(stdin_text)
 
     def test_main_writes_prompt_file(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
