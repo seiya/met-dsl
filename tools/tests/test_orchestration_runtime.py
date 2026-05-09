@@ -3516,6 +3516,72 @@ shell_tool                       stable             true
                 write_roots=["releases/", "spec/registry/spec_catalog.yaml", "workspace/"],
             )
 
+    def test_build_capability_document_rejects_traversal_node_key(self) -> None:
+        """Regression: node_key flows into write_roots / release path prefixes,
+        so malformed values containing path-traversal sequences (`../`),
+        embedded slashes, null bytes, or other non-canonical structure must be
+        rejected at capability-build time. Without strict validation a node_key
+        like `../etc/passwd@1.0.0` produces a write_root of
+        `releases/../etc/passwd/`, escaping the intended release subtree."""
+        from tools.orchestration_runtime import build_capability_document
+
+        base_payload: dict[str, object] = {
+            "agent_role": "step",
+            "step": "promote",
+            "plan_ref": _FIX_PLAN_REF,
+            "pipeline_ref": _FIX_PIPE_REF,
+        }
+        malicious = [
+            "../etc/passwd@1.0.0",
+            "problem/../../../etc/passwd@1.0.0",
+            "problem/foo\x00bar@1.0.0",
+            "problem/foo@bar/1.0.0",
+            "   ../etc   /passwd@1.0.0",
+            "problem/.@1.0.0",
+            "problem/legit@../../1.0.0",
+            "problem/foo..bar@1.0.0",
+            "problem/foo/bar@1.0.0",
+            "problem/Foo@1.0.0",
+            "problem/.foo@1.0.0",
+            "problem/foo.@1.0.0",
+            "/abs/path@1.0.0",
+            "..\\..\\windows@1.0.0",
+        ]
+        for nk in malicious:
+            with self.assertRaises(ValueError, msg=f"should reject node_key={nk!r}"):
+                build_capability_document(
+                    agent_run_id="r1",
+                    orchestration_id="o1",
+                    request_payload={**base_payload, "node_key": nk},
+                )
+
+    def test_build_capability_document_accepts_canonical_node_keys(self) -> None:
+        """Sanity guard for the strict node_key validator: canonical forms used
+        across the codebase (single-segment spec_id, dotted spec_id, components
+        with hyphens/underscores) must continue to be accepted."""
+        from tools.orchestration_runtime import build_capability_document
+
+        base_payload: dict[str, object] = {
+            "agent_role": "step",
+            "step": "promote",
+            "plan_ref": _FIX_PLAN_REF,
+            "pipeline_ref": _FIX_PIPE_REF,
+        }
+        for nk in (
+            "problem/shallow_water2d@0.3.0",
+            "component/dynamics_shallow_water_flux_2d_rusanov_p0@0.1.0",
+            "problem/dom.fam.spec_x@1.0",
+        ):
+            cap = build_capability_document(
+                agent_run_id="r1",
+                orchestration_id="o1",
+                request_payload={**base_payload, "node_key": nk},
+            )
+            self.assertEqual(cap["node_key"], nk)
+            self.assertTrue(cap["write_roots"], f"write_roots empty for {nk!r}")
+            for root in cap["write_roots"]:
+                self.assertNotIn("..", root.split("/"))
+
     def test_allowed_output_paths_for_launch_promote_rejects_cross_spec_release(self) -> None:
         """Regression: a promote agent for spec_x must NOT be allowed to write
         into another spec's release tree, even though the path lives under
@@ -6674,7 +6740,9 @@ class OrchestrationMetaAndJudgeHookTests(unittest.TestCase):
             self.assertEqual(matched[0].get("status"), "running")
 
     def test_record_launch_and_terminal_record_agent_run_update_session_run_index(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(
+            os.environ, {"METDSL_ORCHESTRATION_ENFORCE_LIVE_PREFLIGHT": "0"}
+        ):
             repo = Path(tmp)
             orch = "orch_session_index_launch_001"
             parent = "orch_parent_001"

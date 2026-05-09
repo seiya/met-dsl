@@ -63,7 +63,62 @@ VALID_ISSUE_SEVERITIES = frozenset({"none", "minor", "major", "critical"})
 _NODE_KEY_SAFE_PATTERN = re.compile(
     r"^[a-z][a-z0-9_]*__[a-z0-9][a-z0-9_]*__[0-9][0-9A-Za-z._-]*$"
 )
+# Strict per-component validators for node_key in the canonical
+# `<spec_kind>/<spec_id>@<spec_version>` form. Used to reject malicious or
+# malformed values before they flow into capability write_roots / path prefixes
+# (a node_key like `../etc/passwd@1.0.0` would otherwise produce a write_root
+# of `releases/../etc/passwd/`, escaping the intended release subtree).
+_NODE_KEY_KIND_RE = re.compile(r"^[a-z][a-z0-9_]*$")
+_NODE_KEY_ID_SEGMENT_RE = re.compile(r"^[a-z0-9][a-z0-9_]*$")
+_NODE_KEY_VERSION_RE = re.compile(r"^[0-9][0-9A-Za-z._-]*$")
 _SLUG_DATE_SEQ3_PATTERN = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*_[0-9]{8}_[0-9]{3}$")
+
+
+def _parse_node_key_strict(node_key: Any) -> tuple[str, str, str]:
+    """Validate `node_key` and return `(spec_kind, spec_id_dotted, spec_version)`.
+
+    Enforces the canonical form `<spec_kind>/<spec_id>@<spec_version>` so that
+    components downstream (write_roots, release path prefixes, node_key_safe
+    derivation) cannot be tricked into path traversal via segments like `..`,
+    embedded slashes, null bytes, or whitespace.
+
+    Raises `ValueError` on any deviation from the canonical form.
+    """
+    if not isinstance(node_key, str):
+        raise ValueError("node_key must be a string")
+    token = node_key.strip()
+    if not token:
+        raise ValueError("node_key must be non-empty")
+    if "\x00" in token:
+        raise ValueError(f"node_key contains null byte: {node_key!r}")
+    if "/" not in token or "@" not in token:
+        raise ValueError(
+            f"node_key must match '<spec_kind>/<spec_id>@<spec_version>': {node_key!r}"
+        )
+    spec_kind, tail = token.split("/", 1)
+    spec_id_dotted, spec_version = tail.rsplit("@", 1)
+    spec_kind = spec_kind.strip()
+    spec_id_dotted = spec_id_dotted.strip()
+    spec_version = spec_version.strip()
+    if not spec_kind or not spec_id_dotted or not spec_version:
+        raise ValueError(
+            f"node_key must match '<spec_kind>/<spec_id>@<spec_version>': {node_key!r}"
+        )
+    if not _NODE_KEY_KIND_RE.match(spec_kind):
+        raise ValueError(f"node_key spec_kind is invalid: {node_key!r}")
+    if "/" in spec_id_dotted or "\\" in spec_id_dotted:
+        raise ValueError(f"node_key spec_id must not contain path separators: {node_key!r}")
+    id_segments = spec_id_dotted.split(".")
+    if any(not seg for seg in id_segments):
+        # rejects '..', leading '.', trailing '.'
+        raise ValueError(f"node_key spec_id has empty dot-segment: {node_key!r}")
+    for seg in id_segments:
+        if not _NODE_KEY_ID_SEGMENT_RE.match(seg):
+            raise ValueError(f"node_key spec_id segment is invalid: {node_key!r}")
+    if not _NODE_KEY_VERSION_RE.match(spec_version):
+        raise ValueError(f"node_key spec_version is invalid: {node_key!r}")
+    return spec_kind, spec_id_dotted, spec_version
+
 # Safe agent_run_id characters: alphanumerics, hyphens, underscores.
 # Rejects path separators (/, \), dots (..), null bytes, and other traversal vectors.
 _AGENT_RUN_ID_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_-]*$")
@@ -560,13 +615,12 @@ def _write_roots_for_launch(
             # rather than fall back to the wide tree.
             return []
         try:
-            _spec_kind, _tail = node_key.split("/", 1)
-            _spec_id_dotted, _ = _tail.rsplit("@", 1)
+            _spec_kind, _spec_id_dotted, _ = _parse_node_key_strict(node_key)
         except ValueError:
-            return []
-        _spec_kind = _spec_kind.strip()
-        _spec_id_dotted = _spec_id_dotted.strip()
-        if not _spec_kind or not _spec_id_dotted:
+            # Strict validator rejects path-traversal / malformed node_keys.
+            # Returning [] here triggers the capability-level
+            # `capability_invalid_empty_write_roots` failure for the promote
+            # step, which is the correct fail-closed behavior for this branch.
             return []
         _spec_id_slashed = _spec_id_dotted.replace(".", "/")
         return [
@@ -603,6 +657,10 @@ def build_capability_document(
     if not isinstance(node_raw, str) or not node_raw.strip():
         raise ValueError("capability requires node_key")
     node_key = node_raw.strip()
+    # Reject malformed/traversal-laden node_keys before they flow into
+    # write_roots and release path prefixes (e.g. `../etc/passwd@1.0.0`
+    # would otherwise yield `releases/../etc/passwd/`).
+    _parse_node_key_strict(node_key)
     plan_ref = str(request_payload.get("plan_ref") or "").strip()
     pipeline_ref = str(request_payload.get("pipeline_ref") or "").strip()
     if not plan_ref or not pipeline_ref:
@@ -2270,13 +2328,8 @@ def _allowed_output_paths_for_launch(
             if not node_key:
                 return False
             try:
-                _spec_kind, _tail = node_key.split("/", 1)
-                _spec_id_dotted, _ = _tail.rsplit("@", 1)
+                _spec_kind, _spec_id_dotted, _ = _parse_node_key_strict(node_key)
             except ValueError:
-                return False
-            _spec_kind = _spec_kind.strip()
-            _spec_id_dotted = _spec_id_dotted.strip()
-            if not _spec_kind or not _spec_id_dotted:
                 return False
             _spec_id_slashed = _spec_id_dotted.replace(".", "/")
             required_prefix = f"releases/{_spec_kind}/{_spec_id_slashed}/"
@@ -4547,16 +4600,7 @@ def _split_skill_refs(value: Any) -> list[str]:
 
 
 def _node_key_to_safe(node_key: str) -> str:
-    token = node_key.strip()
-    if "/" not in token or "@" not in token:
-        raise ValueError(f"invalid node_key: {node_key}")
-    spec_kind, tail = token.split("/", 1)
-    spec_id, spec_version = tail.rsplit("@", 1)
-    spec_kind = spec_kind.strip()
-    spec_id = spec_id.strip()
-    spec_version = spec_version.strip()
-    if not spec_kind or not spec_id or not spec_version:
-        raise ValueError(f"invalid node_key: {node_key}")
+    spec_kind, spec_id, spec_version = _parse_node_key_strict(node_key)
     return f"{spec_kind}__{spec_id}__{spec_version}"
 
 
