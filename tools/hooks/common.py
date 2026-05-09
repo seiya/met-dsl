@@ -10,8 +10,18 @@ import json
 import os
 import re
 import shlex
+import time
 from pathlib import Path
 from typing import Any, Protocol
+
+# fcntl is POSIX-only.  On Windows we fall through to fail-closed when the
+# auto-read seen-set needs an exclusive lock — there is no portable
+# equivalent, and Claude Code on Windows has no direct call sites for the
+# orchestration auto-read path today.  Guarded so the import does not raise.
+try:
+    import fcntl as _fcntl  # type: ignore[import-not-found]
+except ImportError:  # pragma: no cover — exercised only on non-POSIX
+    _fcntl = None  # type: ignore[assignment]
 
 def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
@@ -33,7 +43,8 @@ READ_HINT = (
     "'run-gate --gate orchestration_read' within read_manifests/<agent_run_id>.json "
     "allowed_read_roots. "
     "Interpret requirements only from docs/, spec/, and skill_must_read_refs artifacts; "
-    "do not derive rules from tools/, validator scripts, or tests."
+    "do not derive rules from tools/, validator scripts, or tests. "
+    "See docs/RUNBOOK.md#hook-recovery for the full recovery cheatsheet."
 )
 
 WRITE_HINT = (
@@ -41,8 +52,28 @@ WRITE_HINT = (
     "'guarded-apply-patch' (tools/orchestration_runtime.py) within "
     "output_manifests/<agent_run_id>.json.allowed_output_paths. Other "
     "extensions (.yaml/.yml/.md/source code) are written via Edit/Write "
-    "directly and must be listed under allowed_file_tool_paths."
+    "directly and must be listed under allowed_file_tool_paths. "
+    "Ensure $TMPDIR is exported from output_manifests.allowed_tmp_root before writing temp files. "
+    "See docs/RUNBOOK.md#hook-recovery for the full recovery cheatsheet."
 )
+
+# Repo-relative paths that orchestration agent auto-reads at startup (Claude Code behavior).
+# These reads are expected and harmless; silently allow them rather than block.
+# Authorization is by exact repo-relative path match (NOT suffix match) to prevent
+# absolute-path bypasses like /etc/README.md.
+_AUTO_READ_TOLERATED_REPO_RELPATHS: frozenset[str] = frozenset({
+    "MEMORY.md",
+    "README.md",
+    "TODO.md",
+    "CLAUDE.md",
+    ".claude/settings.json",
+})
+
+# Project-memory file lives outside the repo root under the user's Claude Code state directory.
+# We allow it ONLY when the resolved path is inside ~/.claude/projects/ AND ends with
+# the canonical "/memory/MEMORY.md" relative tail.
+_AUTO_READ_PROJECT_MEMORY_PARENT_TAIL: str = ".claude/projects"
+_AUTO_READ_PROJECT_MEMORY_FILE_TAIL: str = "memory/MEMORY.md"
 
 MANIFEST_HINT = (
     "Hint: Ensure record-launch generated the manifest for this agent_run_id and that the manifest "
@@ -410,18 +441,248 @@ def evaluate_common_policy(hook_input: HookInput) -> HookDecision:
                     continue_processing=False,
                     audit_detail={"policy": "forbid_tools_direct_read", "command": command},
                 )
-        if "python" in lowered and "-c" in lowered:
-            if re.search(r"""open\s*\([^)]*,\s*['"][wax]""", command):
+        if "python" in lowered:
+            # Fail-closed: ALL inline Python execution (`-c` snippets and
+            # `- <<EOF` heredocs) is blocked in workflow mode.  Regex-based
+            # write detection is fundamentally unreliable — alias bypasses
+            # like `from pathlib import Path as P; P('x').write_text(...)`
+            # or `Path('x').open('w').write(...)` would slip through any
+            # finite pattern set, and the same goes for `/dev/shm` string
+            # literals embedded in inline source.  Agents that need to run
+            # Python should use a real script file (`python3 script.py`),
+            # which goes through normal write/read manifest validation.
+            #
+            # Tokenization: shlex puts `-c` and `<<` into separate tokens.
+            _py_inline_blocked = False
+            _py_inline_reason = ""
+            tokens_for_python: list[str] = cmd_tokens
+            # Detect `python[3]` invocations specifically (`python` substring
+            # in `lowered` is broad — narrow to a token whose basename starts
+            # with python).
+            has_python_invocation = any(
+                tok.split("/")[-1].lower().startswith("python")
+                for tok in tokens_for_python
+            )
+            if has_python_invocation:
+                # `-c` form
+                if "-c" in tokens_for_python:
+                    _py_inline_blocked = True
+                    _py_inline_reason = "python -c inline execution is forbidden in workflow mode"
+                # heredoc form: `python3 - <<EOF` (still detected via regex
+                # because heredoc syntax is not a single token).
+                elif re.search(r"""python3?\s+-\s*<<""", command):
+                    _py_inline_blocked = True
+                    _py_inline_reason = (
+                        "python - <<EOF heredoc inline execution is forbidden in workflow mode"
+                    )
+            if _py_inline_blocked:
                 return HookDecision(
                     action=HookDecisionAction.BLOCK,
                     reason=(
-                        "blocked: python -c with file write (open(..., 'w'/'a'/'x')) detected. "
-                        "Use guarded-apply-patch for file writes in workflow mode."
+                        f"blocked: {_py_inline_reason}. "
+                        "Inline Python is fail-closed because regex-based "
+                        "filtering cannot reliably catch alias/string-literal "
+                        "bypasses. Use a real script file (python3 script.py) "
+                        "for execution, or tools/audit_orchestration.py for "
+                        "log inspection. "
+                        "Use guarded-apply-patch for .json/.txt outputs, "
+                        "or Edit/Write tool for .yaml/.yml/.md/source code. "
+                        "See docs/RUNBOOK.md#hook-recovery."
                     ),
                     continue_processing=False,
-                    audit_detail={"policy": "forbid_python_inline_write", "command": command},
+                    audit_detail={
+                        "policy": "forbid_python_inline_write",
+                        "command": command,
+                        "fix_hint": {
+                            "next_command": (
+                                "python3 tools/orchestration_runtime.py guarded-apply-patch "
+                                "--repo-root . --orchestration-id <oid> --actor-role <role> "
+                                "--agent-run-id <id> --paths-json '[\"<path>\"]' "
+                                "--patch-file ${TMPDIR}/x.patch --capability-token <token>"
+                            ),
+                            "docs_ref": "docs/RUNBOOK.md#hook-recovery",
+                        },
+                    },
                 )
+        # Block any Bash command that touches /dev/shm in workflow mode.
+        # We scan EVERY token of the entire command — not just positional args
+        # of the first command — to defeat bypasses via shell control tokens
+        # (`cd . && cp ... /dev/shm/x`), wrapper commands (`env cp ...`,
+        # `bash -c '...'`), option-arg forms (`install -t /dev/shm`), and
+        # long-form options (`cp --target-directory=/dev/shm ...`). The policy
+        # is intentionally strict: workflow mode never legitimately needs
+        # /dev/shm, since a per-agent $TMPDIR (workspace/tmp/<agent_run_id>/)
+        # is provided.
+        offending = _find_dev_shm_token(command, cmd_tokens)
+        if offending is not None:
+            return HookDecision(
+                action=HookDecisionAction.BLOCK,
+                reason=(
+                    f"blocked: command touches {offending!r} which is forbidden. "
+                    "/dev/shm reads/writes are not permitted; use $TMPDIR "
+                    "(workspace/tmp/<agent_run_id>/) for temporary files. "
+                    "See docs/RUNBOOK.md#hook-recovery."
+                ),
+                continue_processing=False,
+                audit_detail={
+                    "policy": "output_manifest_write_guard",
+                    "command": command,
+                    "destination": offending,
+                    "fix_hint": {
+                        "next_command": "export TMPDIR from output_manifests/<id>.json allowed_tmp_root",
+                        "docs_ref": "docs/RUNBOOK.md#hook-recovery",
+                    },
+                },
+            )
     return HookDecision(action=HookDecisionAction.ALLOW)
+
+
+_DEV_SHM_PATH_ACCESS_CMDS: frozenset[str] = frozenset({
+    # Commands that take filesystem path arguments and would directly access
+    # `/dev/shm` if one is passed.  Search/text commands (grep, rg, awk, sed,
+    # echo) are intentionally excluded — `grep '/dev/shm' file.log` is a
+    # legitimate diagnostic that does not touch /dev/shm.
+    "cp", "mv", "rsync", "install", "dd", "tee", "cat", "ln",
+    "ls", "stat", "rm", "mkdir", "rmdir", "touch", "truncate",
+    # Archive/search/traversal commands that read or write paths.
+    "tar", "zip", "unzip", "gzip", "gunzip", "bzip2", "xz", "7z",
+    "find", "fd", "du", "df",
+    # Interpreters that can be coaxed into accessing arbitrary paths via
+    # script arguments — bare `/dev/shm` here means "the interpreter is
+    # invoked with /dev/shm as a script/cwd/argv element".  Inline -c
+    # snippets (python3 -c "open('/dev/shm/...')") are caught by the
+    # fail-closed inline-execution policy below, not here.
+    "python", "python3", "perl", "ruby", "node", "lua", "php",
+})
+
+_DEV_SHM_WRAPPER_CMDS: frozenset[str] = frozenset({
+    "env", "sudo", "nice", "ionice", "stdbuf", "time", "exec",
+})
+
+_DEV_SHM_SHELL_CONTROL: frozenset[str] = frozenset({"&&", "||", ";", "|"})
+
+
+def _find_dev_shm_token(command: str, cmd_tokens: list[str]) -> str | None:
+    """Scan a Bash command for any token that touches /dev/shm.
+
+    Strategy:
+    - Tokens with an explicit path suffix (`/dev/shm/foo`) are unambiguously
+      filesystem references and ALWAYS flagged.
+    - Bare tokens (`/dev/shm`) and option-arg destinations are only flagged
+      when the surrounding command is a path-access command (cp/mv/rsync/etc.)
+      — otherwise `grep '/dev/shm' file` and `echo /dev/shm` would over-block.
+    - Quoted shell snippets (`bash -c "..."`) are re-tokenized recursively.
+    """
+    def _check_token_with_suffix(tok: str) -> str | None:
+        """Match `/dev/shm/<...>` (explicit path), `option=/dev/shm[/...]`,
+        or shell-redirection-prefixed forms like `>/dev/shm/x`,
+        `</dev/shm/x`, `>>/dev/shm/x`, `1>/dev/shm/x`, `&>/dev/shm/x`.
+
+        `shlex.split()` keeps the redirection operator glued to the path
+        when there is no whitespace (`echo hi >/dev/shm/x` →
+        `['echo', 'hi', '>/dev/shm/x']`); without this branch the redirect
+        bypasses the path-suffix check.
+        """
+        if tok.startswith("/dev/shm/"):
+            return tok
+        eq_idx = tok.find("=")
+        if eq_idx >= 0:
+            after = tok[eq_idx + 1 :]
+            if after == "/dev/shm" or after.startswith("/dev/shm/"):
+                return tok
+        # Shell redirection-prefixed forms.  The redirection operator is one
+        # of: `>`, `>>`, `<`, `<<`, `<<<`, `&>`, `&>>`, optionally preceded
+        # by a single fd digit (`1>`, `2>>`, `3<`, ...).
+        # Strip the operator+optional-digit and re-check.
+        for prefix_len in range(1, 5):
+            if len(tok) <= prefix_len:
+                continue
+            head = tok[:prefix_len]
+            tail = tok[prefix_len:]
+            # Pattern: optional fd digit, then redirection operator
+            if not head:
+                continue
+            i = 0
+            if i < len(head) and head[i].isdigit():
+                i += 1
+            op = head[i:]
+            if op in (">", ">>", "<", "<<", "<<<", "&>", "&>>"):
+                if tail == "/dev/shm" or tail.startswith("/dev/shm/"):
+                    return tok
+        return None
+
+    def _is_bare_dev_shm(tok: str) -> bool:
+        return tok == "/dev/shm"
+
+    def _split_segments(tokens: list[str]) -> list[list[str]]:
+        segments: list[list[str]] = []
+        current: list[str] = []
+        for t in tokens:
+            if t in _DEV_SHM_SHELL_CONTROL:
+                if current:
+                    segments.append(current)
+                current = []
+            else:
+                current.append(t)
+        if current:
+            segments.append(current)
+        return segments
+
+    def _segment_cmd_args(segment: list[str]) -> tuple[str, list[str]]:
+        """Strip leading wrappers (env, sudo, ...) and env-VAR=value pairs.
+
+        Returns (basename(cmd_lower), remaining_args).
+        """
+        i = 0
+        # Skip wrapper commands and their VAR=value arguments
+        while i < len(segment) and segment[i].lower() in _DEV_SHM_WRAPPER_CMDS:
+            i += 1
+            while (
+                i < len(segment)
+                and "=" in segment[i]
+                and not segment[i].startswith("-")
+                and "/" not in segment[i].split("=", 1)[0]
+            ):
+                i += 1
+        if i >= len(segment):
+            return ("", [])
+        cmd = segment[i].split("/")[-1].lower()
+        return (cmd, segment[i + 1 :])
+
+    # Pass 1: explicit path-suffix or option=value forms — always flag.
+    for tok in cmd_tokens:
+        hit = _check_token_with_suffix(tok)
+        if hit is not None:
+            return hit
+
+    # Pass 2: bare `/dev/shm` in path-access command segments.
+    for seg in _split_segments(cmd_tokens):
+        cmd, args = _segment_cmd_args(seg)
+        if cmd in _DEV_SHM_PATH_ACCESS_CMDS:
+            for tok in args:
+                if _is_bare_dev_shm(tok):
+                    return tok
+
+    # Pass 3: re-tokenize quoted shell snippets (e.g. `bash -c "..."`).
+    for tok in cmd_tokens:
+        if " " not in tok and "\t" not in tok and "\n" not in tok:
+            continue
+        try:
+            inner = shlex.split(tok)
+        except ValueError:
+            continue
+        for itok in inner:
+            hit = _check_token_with_suffix(itok)
+            if hit is not None:
+                return hit
+        for inner_seg in _split_segments(inner):
+            cmd, args = _segment_cmd_args(inner_seg)
+            if cmd in _DEV_SHM_PATH_ACCESS_CMDS:
+                for itok in args:
+                    if _is_bare_dev_shm(itok):
+                        return itok
+
+    return None
 
 
 def _resolve_target_path(repo_root: Path, path_token: str) -> Path:
@@ -698,6 +959,7 @@ def validate_write_access(
             elif ext == "" and os.path.basename(rel_target_norm).lower() in _ALLOWED_EXTENSIONLESS_BYPRODUCT_NAMES:
                 path_is_allowed = True
     if not path_is_allowed:
+        _tmpdir_hint = f"export TMPDIR from output_manifests/{agent_run_id}.json allowed_tmp_root first"
         return HookDecision(
             action=HookDecisionAction.BLOCK,
             reason=(
@@ -710,6 +972,16 @@ def validate_write_access(
                 "file_path": file_path,
                 "agent_run_id": agent_run_id,
                 "allowed_output_paths": allowed_paths,
+                "allowed_tmp_root": manifest.get("allowed_tmp_root", ""),
+                "fix_hint": {
+                    "next_command": (
+                        f"export TMPDIR=$(python3 -c \"import json; "
+                        f"print(json.load(open('workspace/orchestrations/{orchestration_id}"
+                        f"/output_manifests/{agent_run_id}.json'))['allowed_tmp_root'])\")"
+                    ),
+                    "docs_ref": "docs/RUNBOOK.md#hook-recovery",
+                    "note": _tmpdir_hint,
+                },
             },
         )
     if tool_name in {"Edit", "Write", "apply_patch"} and rel_target_norm not in allowed_file_tool_paths:
@@ -727,9 +999,319 @@ def validate_write_access(
                 "tool_name": tool_name,
                 "file_path": file_path,
                 "agent_run_id": agent_run_id,
+                "allowed_file_tool_paths": list(allowed_file_tool_paths),
+                "fix_hint": {
+                    "next_command": (
+                        f"python3 tools/orchestration_runtime.py guarded-apply-patch "
+                        f"--repo-root . --orchestration-id {orchestration_id} "
+                        f"--actor-role <role> --agent-run-id {agent_run_id} "
+                        f"--paths-json '[\"<path>\"]' --patch-file ${{TMPDIR}}/x.patch "
+                        f"--capability-token <token>"
+                    ),
+                    "docs_ref": "docs/RUNBOOK.md#hook-recovery",
+                },
             },
         )
     return HookDecision(action=HookDecisionAction.ALLOW)
+
+
+def _is_auto_read_tolerated(
+    repo_root: Path,
+    agent_role: str | None,
+    file_path: str,
+) -> bool:
+    """orchestration agent の Claude Code auto-read 対象であれば True を返す。
+
+    Authorization rules (must satisfy ALL):
+    - agent_role == "orchestration"
+    - lexical path is either:
+        (a) exactly repo_root/<rel> for some rel in the explicit allowlist, OR
+        (b) exactly <home>/.claude/projects/<this-repo-slug>/memory/MEMORY.md
+    - the requested path itself is NOT a symlink (lstat-based check) to prevent
+      tolerance from being redirected to arbitrary host files via symlink swap.
+    Path comparison is done lexically (no .resolve()) so that an attacker
+    cannot bypass via filesystem symlinks pointing at the tolerated path.
+    """
+    if agent_role != "orchestration":
+        return False
+    try:
+        abs_target = _absolute_lexical(repo_root, file_path)
+        repo_root_abs = _absolute_lexical(repo_root, str(repo_root))
+    except (OSError, ValueError):
+        return False
+
+    if not _path_has_no_symlink_redirect(abs_target):
+        return False
+
+    # (a) repo-contained exact lexical match
+    try:
+        rel = abs_target.relative_to(repo_root_abs)
+    except ValueError:
+        rel = None
+    if rel is not None:
+        rel_posix = rel.as_posix()
+        return rel_posix in _AUTO_READ_TOLERATED_REPO_RELPATHS
+
+    # (b) project-memory file outside the repo: must lexically equal
+    # <home>/.claude/projects/<repo-slug>/memory/MEMORY.md, where <repo-slug>
+    # is derived from the current repo_root. This binds tolerance to the
+    # current project's slot only — preventing cross-project memory
+    # exfiltration.
+    try:
+        home_abs = Path.home()
+    except (OSError, RuntimeError):
+        return False
+    expected_slug = _claude_project_slug(repo_root_abs)
+    expected_path = (
+        home_abs
+        / _AUTO_READ_PROJECT_MEMORY_PARENT_TAIL
+        / expected_slug
+        / "memory"
+        / "MEMORY.md"
+    )
+    return abs_target == expected_path
+
+
+def _absolute_lexical(repo_root: Path, path_token: str) -> Path:
+    """Return absolute, lexically-normalized path WITHOUT following symlinks."""
+    raw = path_token.strip()
+    candidate = Path(raw)
+    if not candidate.is_absolute():
+        candidate = repo_root / candidate
+    # os.path.normpath collapses '.', '..' lexically without following symlinks.
+    return Path(os.path.normpath(str(candidate)))
+
+
+def _path_has_no_symlink_redirect(target: Path) -> bool:
+    """True iff no segment of `target` is itself a symlink.
+
+    Walks each path component (root → leaf) and lstat's it. A non-existent
+    component is fine (no symlink possible). Any S_ISLNK component returns
+    False — refusing tolerance whenever the path could be redirected.
+    """
+    import stat as _stat
+    parts = list(target.parts)
+    accumulator = Path(parts[0]) if parts else Path("/")
+    # On absolute POSIX paths, parts[0] is "/", subsequent parts are segments.
+    for part in parts[1:]:
+        accumulator = accumulator / part
+        try:
+            st = os.lstat(str(accumulator))
+        except FileNotFoundError:
+            # A non-existent intermediate (or leaf) cannot be a symlink target.
+            continue
+        except OSError:
+            return False
+        if _stat.S_ISLNK(st.st_mode):
+            return False
+    return True
+
+
+def _claude_project_slug(repo_root: Path) -> str:
+    """Derive Claude Code's project-directory slug from a repo root.
+
+    Claude Code stores per-project state under ~/.claude/projects/<slug>/, where
+    <slug> is the absolute repo path with each '/' replaced by '-'. For example,
+    /home/seiya/work/met-dsl → -home-seiya-work-met-dsl.
+    """
+    abs_str = str(repo_root)
+    return abs_str.replace("/", "-")
+
+
+def _auto_reads_seen_path(repo_root: Path, orchestration_id: str, agent_run_id: str) -> Path:
+    return (
+        repo_root
+        / "workspace"
+        / "orchestrations"
+        / orchestration_id
+        / "audit"
+        / f"{agent_run_id}.auto_reads_seen.json"
+    )
+
+
+def _canonical_auto_read_key(repo_root: Path, file_path: str) -> str:
+    """Return a canonical key for the auto-read seen-set.
+
+    Different spellings of the same file (`MEMORY.md`, `./MEMORY.md`, the
+    absolute repo path) MUST produce the same key, otherwise the first-read
+    invariant can be defeated by re-spelling. We normalize via the same
+    `_absolute_lexical` helper used by `_is_auto_read_tolerated` and key by
+    the absolute lexical path string.
+    """
+    try:
+        abs_target = _absolute_lexical(repo_root, file_path)
+    except (OSError, ValueError):
+        # Fall back to a stripped form rather than the raw string so trivial
+        # whitespace differences don't multiply keys.
+        return file_path.strip()
+    return str(abs_target)
+
+
+_AUTO_READ_STARTUP_WINDOW_SECONDS: int = 120
+
+
+def _orchestration_started_at(repo_root: Path, orchestration_id: str) -> datetime | None:
+    """Return orchestration_meta.json's `started_at` as a tz-aware datetime."""
+    meta_path = (
+        repo_root
+        / "workspace"
+        / "orchestrations"
+        / orchestration_id
+        / "orchestration_meta.json"
+    )
+    if not meta_path.is_file():
+        return None
+    try:
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(meta, dict):
+        return None
+    raw = meta.get("started_at")
+    if not isinstance(raw, str) or not raw.strip():
+        return None
+    s = raw.strip()
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    try:
+        dt = datetime.fromisoformat(s)
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+def _record_and_check_first_auto_read(
+    repo_root: Path,
+    orchestration_id: str,
+    agent_run_id: str,
+    file_path: str,
+) -> bool:
+    """Track per-agent first-read of allowlisted auto-read paths.
+
+    Returns True iff this read should be classified as a benign Claude Code
+    startup auto-read.  TWO conditions must hold:
+    (a) This is the FIRST time `agent_run_id` has read `file_path` (within
+        an allowlisted path).  Path identity is determined by
+        `_canonical_auto_read_key`, so different spellings collapse to a
+        single seen-set entry.
+    (b) The read happened within a startup window after orchestration
+        `started_at`.  Outside the window, even a first-read is treated as
+        prompt-induced (substantive) — the platform's auto-reads should
+        complete in the first few seconds, so a much later "first read"
+        of MEMORY.md is far more likely to be agent behavior than a
+        delayed startup probe.
+    """
+    # (b) Time-window check — fail-closed: if `started_at` is missing,
+    # malformed, or outside the startup window, classify the read as
+    # substantive.  Without a verifiable startup signal we cannot prove
+    # the read is benign platform behavior, so we must err on the side of
+    # surfacing it as a real policy hit.
+    started_at = _orchestration_started_at(repo_root, orchestration_id)
+    if started_at is None:
+        return False
+    elapsed = (datetime.now(timezone.utc) - started_at).total_seconds()
+    if elapsed < 0 or elapsed > _AUTO_READ_STARTUP_WINDOW_SECONDS:
+        return False
+
+    # (a) First-read check.  We perform a serialized read-modify-write on
+    # the seen-set file via fcntl.flock so that concurrent hook invocations
+    # (multiple Read tool calls in flight) cannot both classify the same
+    # file as "first read" by racing on an empty set.  If we cannot persist
+    # the updated set (read-only audit dir, ENOSPC, etc.) we fail-CLOSED:
+    # without a durable record of "seen," we cannot honor the first-read
+    # invariant on the next call, so we refuse benign classification now
+    # rather than risk hiding a real policy hit on subsequent reads.
+    if _fcntl is None:
+        # Non-POSIX (Windows): no portable file lock available — fail-closed.
+        return False
+    state_path = _auto_reads_seen_path(repo_root, orchestration_id, agent_run_id)
+    canonical_key = _canonical_auto_read_key(repo_root, file_path)
+    try:
+        state_path.parent.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return False  # cannot establish persistent state → fail-closed
+    try:
+        # O_RDWR | O_CREAT — open existing or create empty; flock then
+        # truncate-and-write the updated set under exclusive lock.
+        fd = os.open(str(state_path), os.O_RDWR | os.O_CREAT, 0o644)
+    except OSError:
+        return False  # fail-closed: cannot acquire state file
+    try:
+        # Acquire the exclusive lock with a bounded retry — a stuck holder
+        # (zombie sibling, NFS lock-server hiccup, debugger-paused process)
+        # would otherwise hang every subsequent Read hook on this
+        # orchestration indefinitely. Retry a small number of times with a
+        # short backoff, then fail-closed.
+        _LOCK_RETRY_LIMIT = 5
+        _LOCK_RETRY_BACKOFF_S = 0.1
+        _lock_acquired = False
+        for _ in range(_LOCK_RETRY_LIMIT):
+            try:
+                _fcntl.flock(fd, _fcntl.LOCK_EX | _fcntl.LOCK_NB)
+                _lock_acquired = True
+                break
+            except BlockingIOError:
+                time.sleep(_LOCK_RETRY_BACKOFF_S)
+            except OSError:
+                return False  # locking unavailable → fail-closed
+        if not _lock_acquired:
+            return False  # persistent contention → fail-closed
+        # Read current contents under lock.  Cap at 64 KiB — far above
+        # legitimate need (the seen-set holds ≤ a handful of allowlisted
+        # paths) and small enough that an oversized file is a clear
+        # corruption/attack signal.  Read in a loop until EOF or cap so
+        # that no payload below the cap is silently truncated.
+        _MAX_SEEN_BYTES = 64 * 1024
+        seen: set[str] = set()
+        try:
+            os.lseek(fd, 0, os.SEEK_SET)
+            try:
+                file_size = os.fstat(fd).st_size
+            except OSError:
+                file_size = 0
+            if file_size > _MAX_SEEN_BYTES:
+                # Suspicious / corrupted seen-set — fail-closed; never reset
+                # the file silently (would discard legitimate prior entries
+                # in the recoverable case, and would aid an attacker in the
+                # corruption case).
+                return False
+            buf = b""
+            while len(buf) < _MAX_SEEN_BYTES:
+                chunk = os.read(fd, _MAX_SEEN_BYTES - len(buf))
+                if not chunk:
+                    break
+                buf += chunk
+            raw = buf.decode("utf-8")
+            if raw.strip():
+                data = json.loads(raw)
+                if isinstance(data, list):
+                    seen = {str(x) for x in data if isinstance(x, str)}
+        except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+            seen = set()
+        if canonical_key in seen:
+            return False
+        seen.add(canonical_key)
+        # Truncate and write updated set
+        try:
+            os.lseek(fd, 0, os.SEEK_SET)
+            os.ftruncate(fd, 0)
+            payload = json.dumps(sorted(seen), ensure_ascii=False).encode("utf-8")
+            os.write(fd, payload)
+            os.fsync(fd)
+        except OSError:
+            return False  # write/fsync failure → fail-closed
+        return True
+    finally:
+        try:
+            _fcntl.flock(fd, _fcntl.LOCK_UN)
+        except OSError:
+            pass
+        try:
+            os.close(fd)
+        except OSError:
+            pass
 
 
 def validate_read_access(
@@ -737,8 +1319,42 @@ def validate_read_access(
     orchestration_id: str,
     agent_run_id: str,
     file_path: str,
+    agent_role: str | None = None,
 ) -> HookDecision:
     """read manifest の allowed_read_roots に対して read 対象を検証する。"""
+    if _is_auto_read_tolerated(repo_root, agent_role, file_path):
+        # Keep the read-trust boundary intact: persistent state files
+        # (MEMORY.md, README.md, ~/.claude/projects/.../memory/MEMORY.md) must
+        # NOT enter the orchestration agent's context, even though Claude Code
+        # auto-issues these reads at session start.
+        #
+        # Only the FIRST read of each allowlisted path by this agent is
+        # classified as benign platform noise (`auto_read_expected_block`).
+        # Subsequent reads of the same path indicate a prompt-induced
+        # post-startup access and fall through to the normal substantive
+        # policy, where they show up in audit as real read_manifest_read_guard
+        # violations rather than benign noise.
+        if _record_and_check_first_auto_read(
+            repo_root, orchestration_id, agent_run_id, file_path
+        ):
+            return HookDecision(
+                action=HookDecisionAction.BLOCK,
+                reason=(
+                    f"blocked (expected auto-read): {file_path!r} is a Claude Code "
+                    "auto-read path that must not enter orchestration context. "
+                    "This block is harmless platform behavior; ignore in retry logic."
+                ),
+                continue_processing=False,
+                audit_detail={
+                    "policy": "auto_read_expected_block",
+                    "file_path": file_path,
+                    "agent_role": agent_role,
+                    "agent_run_id": agent_run_id,
+                    "orchestration_id": orchestration_id,
+                },
+            )
+        # Fall through to the substantive read-manifest path below — repeated
+        # reads of the same allowlisted file are not classified as benign.
     if _is_self_agent_manifest_read_path(repo_root, orchestration_id, agent_run_id, file_path):
         return HookDecision(action=HookDecisionAction.ALLOW)
     manifest_path = (
@@ -806,5 +1422,13 @@ def validate_read_access(
             "file_path": file_path,
             "agent_run_id": agent_run_id,
             "allowed_read_roots": allowed_roots,
+            "fix_hint": {
+                "next_command": (
+                    f"python3 tools/orchestration_runtime.py run-gate "
+                    f"--gate orchestration_read --agent-run-id {agent_run_id} "
+                    f"--capability-token <token> --args-json '{{\"read_path\":\"{file_path}\"}}'"
+                ),
+                "docs_ref": "docs/RUNBOOK.md#hook-recovery",
+            },
         },
     )

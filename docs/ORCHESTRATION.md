@@ -202,4 +202,76 @@
 - 失敗試行で推測補完や人工 artifact generation を行わず、当該 `step` を停止している。
 - 子 `agent` 必須 phase で、親 `agent` による検証目的の仮実装、依存 code の一時内包、`MCP` 実行代行が存在しない。
 - 各 `step_result.json` の `executor_agent_run_id` が `orchestration` または `step` ロールの実行記録と対応し、`script` 実行ログのみで phase 完了を主張していない。
+
+## Patch 適用契約
+
+`guarded-apply-patch` サブコマンドの仕様（canonical source: この節。`tools/orchestration_runtime.py` の実装を直接参照してはならない）。
+
+### CLI インタフェース
+
+```
+python3 tools/orchestration_runtime.py guarded-apply-patch \
+  --repo-root <repo_root> \
+  --orchestration-id <orchestration_id> \
+  --actor-role <step|substep> \
+  --agent-run-id <agent_run_id> \
+  --paths-json '<JSON array of changed paths>' \
+  --patch-file <path_to_patch_file> \
+  --capability-token <capability_token>
+```
+
+`--patch-text` による直接埋め込みも可能だが、ARG_MAX 制限を避けるため `--patch-file` 経由を推奨する。`--patch-file` の保存先は `$TMPDIR` 配下のみ許可。
+
+### strip 自動判定
+
+`--strip` という CLI 引数は存在しない。`--paths-json` で渡した `changed_paths` を oracle として `-p1` → `-p0` の順で `git apply --check` を内部試行し、すべての `changed_paths` を被覆できる最初の strip を自動選択する。エラー `cannot determine patch strip level` が出た場合は `--paths-json` の path とパッチヘッダの prefix の不一致を疑うこと（詳細は `skills/workflow-orchestration/references/launch_prompts.md` の「`guarded-apply-patch` の strip について」参照）。
+
+### 出力契約
+
+- 成功時は exit code 0、失敗時は 0 以外。
+- `violations[]` と失敗理由は **stderr** に JSON 形式で出力される。
+- gate 結果は `workspace/orchestrations/<orch_id>/gates/<agent_run_id>/apply_patch_writes.json` に書き込まれるが、このファイルを直接 Read してはならない（`rule_source_violation`）。失敗内容は `2>"${TMPDIR}/last_gate_stderr.txt"` で stderr をキャプチャして参照すること。
+
+### 許可対象 extension
+
+`.json` / `.txt` の出力のみ。`.yaml`・`.yml`・`.md`・source code は `Edit`/`Write` tool（`allowed_file_tool_paths` 経由）を使うこと。
+
+## Capability / Manifest 契約
+
+`record-launch` が発行する 3 つの manifest の必須フィールドと不変条件（canonical source: この節）。
+
+### `capabilities/<agent_run_id>.json` 必須フィールド
+
+| フィールド | 型 | 説明 |
+|---|---|---|
+| `agent_run_id` | string | 子 agent の UUID |
+| `capability_token` | string | 32 byte hex token |
+| `orchestration_id` | string | orchestration ID |
+| `agent_role` | `"orchestration"\|"step"\|"substep"` | agent ロール |
+| `node_key` | string | `<spec_kind>/<spec_id>@<spec_version>` |
+| `step` | string | `"plan"\|"generate"\|...` |
+| `write_roots` | array of strings | capability が許可する write root リスト |
+| `mcp_permissions` | object | MCP 権限スコープ |
+| `expires_at` | ISO8601 | capability 有効期限 |
+
+**不変条件:** `agent_role` が `"step"` または `"substep"` の capability は `write_roots` が空配列であってはならない。`write_roots == []` の capability が発行されようとした場合は `record-launch` が `RuntimeError` で停止する（`reason_code: capability_invalid_empty_write_roots`）。
+
+### `output_manifests/<agent_run_id>.json` 必須フィールド
+
+| フィールド | 型 | 説明 |
+|---|---|---|
+| `allowed_output_paths` | array of strings | `.json`/`.txt` 出力の許可 path 集合 |
+| `allowed_file_tool_paths` | array of strings | `Edit`/`Write` 直接書き込みの許可 path 集合 |
+| `allowed_tmp_root` | string | 一時ファイル許可ルート（`workspace/tmp/<agent_run_id>`） |
+
+**使用方法:** agent は起動直後に `allowed_tmp_root` を読み `export TMPDIR=<allowed_tmp_root>` を実行すること。
+
+### `read_manifests/<agent_run_id>.json` 必須フィールド
+
+| フィールド | 型 | 説明 |
+|---|---|---|
+| `allowed_read_roots` | array of strings | read が許可されるルートパスのリスト |
+| `denied_read_roots` | array of strings | 明示的に拒否されるルートパスのリスト |
+
+`output_manifests/<agent_run_id>.json` と `read_manifests/<agent_run_id>.json` は `Read` tool で直接読み取ってよい（`run-gate` 不要）。他のファイルの read は `run-gate --gate orchestration_read` を経由すること。
 - `agent.summary.txt` が、単一行の定型 `pass` / `fail` のみではなく、最終状態と主要 `output_refs` または失敗要因を保持している。

@@ -100,6 +100,37 @@ EOF
 - `audit_detail.policy` — 適用されたポリシー名
 - `payload_summary` — 操作対象パスまたはコマンド（先頭 200 文字）
 
+### Step 3.5 — policy 別ブロック数を集計する
+
+Step 3 で取得した `blocks` をポリシー別にカウントし、5 件以上を **繰り返しエラーパターン** として強調する。
+
+```bash
+python3 - <<'EOF'
+import json
+from collections import Counter
+
+orch_id = "<orchestration_id>"
+path = f"workspace/orchestrations/{orch_id}/hooks/native_hook_events.jsonl"
+policy_counter: Counter = Counter()
+with open(path) as f:
+    for line in f:
+        line = line.strip()
+        if not line:
+            continue
+        obj = json.loads(line)
+        if obj.get("action") == "block":
+            policy = (obj.get("audit_detail") or {}).get("policy", "unknown")
+            policy_counter[policy] += 1
+
+print("=== Policy block counts ===")
+for policy, cnt in policy_counter.most_common():
+    flag = " *** REPEATED ERROR PATTERN ***" if cnt >= 5 else ""
+    print(f"  {policy}: {cnt}{flag}")
+EOF
+```
+
+繰り返しエラーパターン（5 件以上）が検出された場合は、修復チートシート（`docs/RUNBOOK.md#hook-recovery`）の対応行を参照して根本原因を特定する。
+
 ### Step 4 — 情報収集行動を抽出する
 
 session の `.jsonl` から `--help` 呼び出し、ファイル探索コマンド、ランタイム実装の grep/sed を抽出する。
@@ -154,6 +185,59 @@ EOF
 - `--help` 参照 — CLI 仕様が不明だった箇所（引数フォーマット、サブコマンド名等）
 - `tools/` 直接 grep/sed/read — ランタイム実装からルールを導こうとした箇所（hook ポリシー上禁止）
 - ファイル存在確認 (`ls`, `find`) — phase artifact 生成前の状態把握
+
+### Step 4.5 — `audit_detail.fix_hint` の活用状況を集計する
+
+`native_hook_events.jsonl` 内のブロックに `fix_hint.next_command` が含まれているか、あるいは空だったかを分類する。
+「ヒントが提供されていたのに agent が無視して同じ操作を繰り返した」ケースを重点的に特定する。
+
+```bash
+python3 - <<'EOF'
+import json
+from collections import Counter, defaultdict
+
+orch_id = "<orchestration_id>"
+path = f"workspace/orchestrations/{orch_id}/hooks/native_hook_events.jsonl"
+hint_present: Counter = Counter()   # policy → count of blocks WITH fix_hint
+hint_absent: Counter = Counter()    # policy → count of blocks WITHOUT fix_hint
+hint_ignored: defaultdict = defaultdict(list)  # policy → list of repeated commands
+
+prev_commands: list[str] = []
+with open(path) as f:
+    for line in f:
+        line = line.strip()
+        if not line:
+            continue
+        obj = json.loads(line)
+        if obj.get("action") != "block":
+            continue
+        policy = (obj.get("audit_detail") or {}).get("policy", "unknown")
+        fix_hint = (obj.get("audit_detail") or {}).get("fix_hint")
+        cmd = (obj.get("payload_summary") or {}).get("command", "") or obj.get("payload_summary", "")
+        if fix_hint and fix_hint.get("next_command"):
+            hint_present[policy] += 1
+        else:
+            hint_absent[policy] += 1
+        if cmd and cmd in prev_commands:
+            hint_ignored[policy].append(cmd[:200])
+        prev_commands.append(cmd)
+
+print("=== fix_hint present (structured recovery hint available) ===")
+for p, c in hint_present.most_common():
+    print(f"  {p}: {c}")
+print("=== fix_hint absent (no structured hint — potential docs gap) ===")
+for p, c in hint_absent.most_common():
+    print(f"  {p}: {c}")
+if hint_ignored:
+    print("=== Hint possibly ignored (same command blocked multiple times) ===")
+    for p, cmds in hint_ignored.items():
+        print(f"  {p}: {len(cmds)} repeat(s)")
+        for c in cmds[:3]:
+            print(f"    {c}")
+EOF
+```
+
+「hint_absent」が多いポリシーがあれば `docs/RUNBOOK.md#hook-recovery` の対応行を追記する（Stream B-3 の対象）。
 
 ### Step 5 — チェック失敗とやり直しを抽出する
 
@@ -271,6 +355,53 @@ with open(f'workspace/orchestrations/{orch_id}/phase_state_log.jsonl') as f:
 "
 ```
 
+### Step 5.5 — fail_closed 直前の hook イベント 5 件を時系列で表示する
+
+`fail_closed` が発生した場合、直前の hook イベントを遡って何がトリガになったかを確認する。
+
+```bash
+python3 - <<'EOF'
+import json
+
+orch_id = "<orchestration_id>"
+hook_log = f"workspace/orchestrations/{orch_id}/hooks/native_hook_events.jsonl"
+phase_log = f"workspace/orchestrations/{orch_id}/phase_state_log.jsonl"
+
+# fail_closed timestamp を phase_state_log から取得
+fail_ts = None
+with open(phase_log) as f:
+    for line in f:
+        obj = json.loads(line.strip())
+        if obj.get("to") == "fail_closed" or obj.get("event") == "set_status" and obj.get("new_state") == "fail_closed":
+            fail_ts = obj.get("ts") or obj.get("timestamp")
+
+if fail_ts is None:
+    print("No fail_closed event found in phase_state_log.")
+else:
+    print(f"fail_closed at: {fail_ts}")
+    # Collect all hook events before fail_ts, take last 5
+    events_before = []
+    with open(hook_log) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            obj = json.loads(line)
+            ts = obj.get("ts") or obj.get("timestamp", "")
+            if ts <= fail_ts:
+                events_before.append(obj)
+    last_5 = events_before[-5:]
+    print(f"\n=== Last {len(last_5)} hook events before fail_closed ===")
+    for e in last_5:
+        ts = e.get("ts") or e.get("timestamp", "?")
+        action = e.get("action", "?")
+        tool = e.get("tool_name") or (e.get("payload_summary") or {}).get("tool_name", "?")
+        policy = (e.get("audit_detail") or {}).get("policy", "")
+        summary = str(e.get("payload_summary", ""))[:120]
+        print(f"  [{ts}] {action} | {tool} | {policy} | {summary}")
+EOF
+```
+
 ### Step 6 — 結果を報告する
 
 以下の形式で 3 カテゴリにまとめて報告する。
@@ -294,6 +425,20 @@ with open(f'workspace/orchestrations/{orch_id}/phase_state_log.jsonl') as f:
 #### 3. チェック失敗によるやり直し
 
 phase launch 複数回試行・gate 失敗ループ・sandbox 違反・status 設定ミスを時系列で列挙し、各やり直しの **原因** と **最終結果** を記す。
+
+#### 4. 修復ヒントの要約（新設）
+
+Step 3.5 / 4.5 / 5.5 から、**agent が次に取るべき正規アクション**をポリシー別にまとめる。
+
+| ポリシー | ブロック数 | fix_hint あり/なし | 推奨アクション |
+|---|---|---|---|
+| read_manifest_read_guard | … | … | `guarded-apply-patch` / `run-gate` 経由で取得 |
+| output_manifest_write_guard | … | … | `$TMPDIR` を `allowed_tmp_root` から export する |
+| forbid_python_inline_write | … | … | `guarded-apply-patch` または Edit/Write tool を使う |
+| forbid_tools_direct_read | … | … | `docs/` / `spec/` のみを参照する |
+| enforce_guarded_apply_patch | … | … | `guarded-apply-patch` を使い `allowed_file_tool_paths` に追加する |
+
+繰り返しエラーパターン（5 件以上）は太字で強調し、対応する `docs/RUNBOOK.md#hook-recovery` の行番号を添える。
 
 ---
 

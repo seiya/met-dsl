@@ -511,6 +511,7 @@ def _write_roots_for_launch(
     orchestration_id: str,
     plan_ref: str,
     pipeline_ref: str,
+    node_key: str = "",
 ) -> list[str]:
     r = role.strip().lower()
     st = step.strip().lower()
@@ -541,6 +542,39 @@ def _write_roots_for_launch(
         return [_with_trailing_slash(_normalize_rel_posix(f"{pipeline_ref.rstrip('/')}/execute"))]
     if st == "tune":
         return [_with_trailing_slash(_normalize_rel_posix(f"{pipeline_ref.rstrip('/')}/tune"))]
+    if st == "promote":
+        # Promote writes to two canonical locations outside the pipeline workspace:
+        #   - releases/<spec_kind>/<domain>/<family>/<spec_id>/...
+        #     — official release artifacts for THIS spec only
+        #   - spec/registry/spec_catalog.yaml
+        #     — official_releases registration (shared catalog file)
+        #
+        # The release subtree is scoped to the current node's spec at the
+        # capability level (write_roots), not just at validation time. This
+        # prevents a promote agent for spec_x from writing into spec_y's
+        # release tree even via direct file writes — a sandbox escape that
+        # post-hoc validation cannot recover from once shared checked-in
+        # artifacts are mutated.
+        if not node_key:
+            # Without node_key we cannot derive a per-spec subtree; refuse
+            # rather than fall back to the wide tree.
+            return []
+        try:
+            _spec_kind, _tail = node_key.split("/", 1)
+            _spec_id_dotted, _ = _tail.rsplit("@", 1)
+        except ValueError:
+            return []
+        _spec_kind = _spec_kind.strip()
+        _spec_id_dotted = _spec_id_dotted.strip()
+        if not _spec_kind or not _spec_id_dotted:
+            return []
+        _spec_id_slashed = _spec_id_dotted.replace(".", "/")
+        return [
+            _with_trailing_slash(_normalize_rel_posix(
+                f"releases/{_spec_kind}/{_spec_id_slashed}"
+            )),
+            _normalize_rel_posix("spec/registry/spec_catalog.yaml"),
+        ]
     return []
 
 
@@ -593,12 +627,22 @@ def build_capability_document(
             orchestration_id=orchestration_id,
             plan_ref=plan_ref,
             pipeline_ref=pipeline_ref,
+            node_key=node_key,
         ),
         "mcp_permissions": _mcp_permissions_for_launch(role, step),
         "expires_at": _default_capability_expires_at_iso(),
     }
     if substep_val is not None:
         body["substep"] = substep_val
+    # step/substep agents must have at least one write root; an empty list means
+    # the request_payload was missing or incomplete and would later cause a
+    # fail_closed violation. Fail early here instead.
+    if role in {"step", "substep"} and not body.get("write_roots"):
+        raise ValueError(
+            f"capability_invalid_empty_write_roots: agent_role={role!r} requires at least "
+            "one write_root. Check that plan_ref and pipeline_ref in request_payload are "
+            "non-empty and the step value is valid."
+        )
     return body
 
 
@@ -2067,6 +2111,22 @@ def _allowed_output_paths_for_launch(
         if not isinstance(item, str) or not item.strip():
             raise ValueError(f"allowed_output_paths[{idx}] must be non-empty string")
         token_raw = item.strip().replace("\\", "/")
+        # Reject path-traversal segments BEFORE prefix/contract checks.
+        # `_normalize_rel_posix` does not collapse `..`, so a path like
+        # `releases/<spec>/.../r1/../../somewhere_else` would pass the
+        # startswith() prefix and identifier checks. Refuse any `.` or
+        # `..` segment anywhere in the candidate.
+        for _seg in token_raw.split("/"):
+            if _seg in ("", ".") and not (_seg == "" and token_raw.endswith("/")):
+                # Tolerate a trailing slash (directory entry) but not bare "/"
+                # repeats elsewhere.
+                if _seg == "":
+                    # Skip — duplicate slashes get normalized; treat as harmless.
+                    continue
+            if _seg in (".", ".."):
+                raise ValueError(
+                    f"allowed_output_paths[{idx}] must not contain '.'/'..' segments: {item!r}"
+                )
         if token_raw.endswith("/"):
             # Directory allowlist entry: stored with trailing slash preserved
             token = _normalize_rel_posix(token_raw.rstrip("/")) + "/"
@@ -2193,6 +2253,51 @@ def _allowed_output_paths_for_launch(
                 base in allowed_files
                 or base.endswith("_meta.json")
             )
+        if step_token == "promote":
+            # Promote contract per docs/workflow/phases/phase_07_promote.md:
+            #   releases/<spec_kind>/<domain>/<family>/<spec_id>/
+            #     <target_architecture>/<toolchain_language>/<release_id>/<artifact_path...>
+            #   spec/registry/spec_catalog.yaml (exact file)
+            #
+            # The release tree is constrained to THIS node's spec to prevent
+            # cross-spec writes, AND requires the full architecture/language/
+            # release_id structure under the spec prefix. A bare prefix-match
+            # would let a promote launch declare ad-hoc files like
+            # `releases/.../spec_x/README.md` which fall outside the canonical
+            # release artifact layout.
+            if path == "spec/registry/spec_catalog.yaml":
+                return True
+            if not node_key:
+                return False
+            try:
+                _spec_kind, _tail = node_key.split("/", 1)
+                _spec_id_dotted, _ = _tail.rsplit("@", 1)
+            except ValueError:
+                return False
+            _spec_kind = _spec_kind.strip()
+            _spec_id_dotted = _spec_id_dotted.strip()
+            if not _spec_kind or not _spec_id_dotted:
+                return False
+            _spec_id_slashed = _spec_id_dotted.replace(".", "/")
+            required_prefix = f"releases/{_spec_kind}/{_spec_id_slashed}/"
+            if not path.startswith(required_prefix):
+                return False
+            tail = path[len(required_prefix):]
+            tail_segments = [seg for seg in tail.split("/") if seg]
+            # Tail must be <arch>/<lang>/<release_id>/<artifact_path...>
+            # — at least 4 non-empty segments, with the first three being
+            # well-formed single-segment identifiers (no path-traversal or
+            # control characters).
+            if len(tail_segments) < 4:
+                return False
+            for ident in tail_segments[:3]:
+                # Identifier rule: alphanumeric, underscore, hyphen, dot. No
+                # leading/trailing dot or slash. Empty already rejected above.
+                if ident.startswith(".") or ident.endswith("."):
+                    return False
+                if not all(c.isalnum() or c in "_-." for c in ident):
+                    return False
+            return True
         return False
 
     for idx, path in enumerate(allowed):
@@ -4028,12 +4133,27 @@ def _launch_prompt_template_name(request_payload: dict[str, Any]) -> str:
 
 
 def _template_placeholder_values(request_payload: dict[str, Any]) -> dict[str, str]:
+    orchestration_id = str(request_payload.get("orchestration_id", ""))
+    agent_run_id = str(request_payload.get("agent_run_id", ""))
+    allowed_tmp_root = f"workspace/tmp/{agent_run_id}" if agent_run_id else ""
+    capability_doc_path = (
+        f"workspace/orchestrations/{orchestration_id}/capabilities/{agent_run_id}.json"
+        if orchestration_id and agent_run_id else ""
+    )
+    output_manifest_path = (
+        f"workspace/orchestrations/{orchestration_id}/output_manifests/{agent_run_id}.json"
+        if orchestration_id and agent_run_id else ""
+    )
+    read_manifest_path = (
+        f"workspace/orchestrations/{orchestration_id}/read_manifests/{agent_run_id}.json"
+        if orchestration_id and agent_run_id else ""
+    )
     return {
         "node_key": str(request_payload.get("node_key", "")),
         "step": str(request_payload.get("step", "")),
         "substep": str(request_payload.get("substep", "")),
-        "orchestration_id": str(request_payload.get("orchestration_id", "")),
-        "agent_run_id": str(request_payload.get("agent_run_id", "")),
+        "orchestration_id": orchestration_id,
+        "agent_run_id": agent_run_id,
         "parent_agent_run_id": str(request_payload.get("parent_agent_run_id", "")),
         "workflow_mode": str(request_payload.get("workflow_mode", "")),
         "plan_ref": str(request_payload.get("plan_ref", "")),
@@ -4046,6 +4166,11 @@ def _template_placeholder_values(request_payload: dict[str, Any]) -> dict[str, s
         "repair_strategy": str(request_payload.get("repair_strategy", "")),
         "repair_target_agent_run_id": str(request_payload.get("repair_target_agent_run_id", "")),
         "repair_reason": str(request_payload.get("repair_reason", "")),
+        # Paths injected so agents can read them directly from the launch prompt.
+        "allowed_tmp_root": allowed_tmp_root,
+        "capability_doc_path": capability_doc_path,
+        "output_manifest_path": output_manifest_path,
+        "read_manifest_path": read_manifest_path,
     }
 
 
@@ -6688,7 +6813,24 @@ def record_agent_run(
         payload.setdefault("sandbox_enforced", True)
         payload.setdefault("sandbox_profile_ref", str(sandbox_ref).strip())
 
-    _validate_terminal_run_payload(repo_root, orchestration_id, payload)
+    try:
+        _validate_terminal_run_payload(repo_root, orchestration_id, payload)
+    except ValueError:
+        # Unauthorized write or sandbox violation detected during terminal
+        # validation.  Persist a fail entry to a SEPARATE log so audit tools can
+        # see that this agent_run_id reached record-agent-run with an invalid
+        # payload — without polluting agent_runs.jsonl (which the
+        # duplicate-detection check would otherwise refuse to accept on retry).
+        # The retry path (typically with the same agent_run_id after fixing the
+        # payload) therefore remains operational.
+        invalid_path = root / "agent_runs_invalid.jsonl"
+        fail_entry: dict[str, Any] = dict(payload)
+        fail_entry["status"] = "fail"
+        fail_entry["finished_at"] = _utc_now_iso()
+        fail_entry["fail_reason"] = "terminal_payload_validation_error"
+        with invalid_path.open("a", encoding="utf-8") as _h:
+            _h.write(json.dumps(fail_entry, ensure_ascii=False) + "\n")
+        raise
 
     dialogs_root = root / "agents" / agent_run_id / "dialogs"
     dialogs_root.mkdir(parents=True, exist_ok=True)
@@ -7628,12 +7770,56 @@ def main(argv: list[str] | None = None) -> int:
             print(str(exc), file=sys.stderr)
             return 1
     elif args.command == "guarded-apply-patch":
+        def _emit_apply_patch_error(
+            exc_type: str,
+            message: str,
+            *,
+            reason_code: str | None = None,
+        ) -> None:
+            envelope: dict[str, Any] = {
+                "error": "guarded_apply_patch_failed",
+                "exception_type": exc_type,
+                "message": message,
+                "violations": [{"reason": message, "exception_type": exc_type}],
+            }
+            if reason_code is not None:
+                envelope["reason_code"] = reason_code
+            print(json.dumps(envelope, ensure_ascii=False), file=sys.stderr)
+
         try:
             if args.patch_text is not None and args.patch_file is not None:
-                print("error: --patch-text and --patch-file are mutually exclusive", file=sys.stderr)
+                _emit_apply_patch_error(
+                    "ArgumentError",
+                    "--patch-text and --patch-file are mutually exclusive",
+                    reason_code="mutually_exclusive_patch_source",
+                )
                 return 1
             if args.patch_text is None and args.patch_file is None:
-                print("error: one of --patch-text or --patch-file is required", file=sys.stderr)
+                _emit_apply_patch_error(
+                    "ArgumentError",
+                    "one of --patch-text or --patch-file is required",
+                    reason_code="missing_patch_source",
+                )
+                return 1
+            # Reject path-traversal in agent_run_id BEFORE branching on
+            # --patch-text vs --patch-file.  agent_run_id is used as a path
+            # component in manifest/capability/audit lookups via simple path
+            # joins inside guarded_apply_patch(); a traversal segment
+            # (e.g. "../..") would target the wrong tree.  We require an
+            # identifier shape (alphanumeric, underscore, hyphen) — strict
+            # enough to block traversal/null-byte attacks without rejecting
+            # legacy fixture names that production code accepts elsewhere.
+            _AGENT_RUN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]*$")
+            if not _AGENT_RUN_ID_RE.match(args.agent_run_id or ""):
+                _emit_apply_patch_error(
+                    "ArgumentError",
+                    (
+                        f"--agent-run-id '{args.agent_run_id}' contains "
+                        "path-traversal characters or is empty; required "
+                        "shape: [A-Za-z0-9][A-Za-z0-9_-]*"
+                    ),
+                    reason_code="invalid_agent_run_id",
+                )
                 return 1
             if args.patch_file is not None:
                 import stat as _stat_mod
@@ -7641,17 +7827,19 @@ def main(argv: list[str] | None = None) -> int:
                     os.environ.get("METDSL_PATCH_FILE_MAX_BYTES", 10 * 1024 * 1024)
                 )
                 _pf_fd = -1
-                # Validate agent_run_id is a bare UUID before any path construction.
-                # A traversal segment (e.g. "../..") in agent_run_id would expand the
-                # allowed tmp root above the intended per-agent directory.
+                # When using --patch-file the path is constructed as
+                # workspace/tmp/<agent_run_id>/, so additionally enforce a
+                # strict UUID shape to match the production record-launch
+                # convention (UUID is what record-launch generates).
                 _UUID_RE = re.compile(
                     r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
                     re.IGNORECASE,
                 )
                 if not _UUID_RE.match(args.agent_run_id):
-                    print(
-                        f"error: --agent-run-id '{args.agent_run_id}' is not a valid UUID",
-                        file=sys.stderr,
+                    _emit_apply_patch_error(
+                        "ArgumentError",
+                        f"--agent-run-id '{args.agent_run_id}' is not a valid UUID",
+                        reason_code="invalid_agent_run_id",
                     )
                     return 1
                 try:
@@ -7665,11 +7853,14 @@ def main(argv: list[str] | None = None) -> int:
                     # components — which are within the agent-owned tmp root.
                     _pf_pre_resolved = Path(args.patch_file).resolve(strict=True)
                     if os.path.commonpath([_pf_pre_resolved, _allowed_tmp]) != str(_allowed_tmp):
-                        print(
-                            f"error: --patch-file '{args.patch_file}' is outside the agent's "
-                            f"allowed tmp root '{_allowed_tmp}'. "
-                            f"Use $TMPDIR to construct the path.",
-                            file=sys.stderr,
+                        _emit_apply_patch_error(
+                            "PatchFileOutsideTmpRoot",
+                            (
+                                f"--patch-file '{args.patch_file}' is outside the agent's "
+                                f"allowed tmp root '{_allowed_tmp}'. "
+                                f"Use $TMPDIR to construct the path."
+                            ),
+                            reason_code="patch_file_outside_tmp_root",
                         )
                         return 1
                     # O_NOFOLLOW refuses to open if the final path component is a symlink,
@@ -7683,11 +7874,14 @@ def main(argv: list[str] | None = None) -> int:
                     try:
                         _fd_real = Path(os.readlink(f"/proc/self/fd/{_pf_fd}")).resolve()
                         if os.path.commonpath([_fd_real, _allowed_tmp]) != str(_allowed_tmp):
-                            print(
-                                f"error: --patch-file '{args.patch_file}' is outside the agent's "
-                                f"allowed tmp root '{_allowed_tmp}'. "
-                                f"Use $TMPDIR to construct the path.",
-                                file=sys.stderr,
+                            _emit_apply_patch_error(
+                                "PatchFileOutsideTmpRoot",
+                                (
+                                    f"--patch-file '{args.patch_file}' is outside the agent's "
+                                    f"allowed tmp root '{_allowed_tmp}'. "
+                                    f"Use $TMPDIR to construct the path."
+                                ),
+                                reason_code="patch_file_outside_tmp_root",
                             )
                             return 1
                     except OSError:
@@ -7695,17 +7889,23 @@ def main(argv: list[str] | None = None) -> int:
                     # fstat operates on the open fd — not subject to path races.
                     _pf_stat = os.fstat(_pf_fd)
                     if not _stat_mod.S_ISREG(_pf_stat.st_mode):
-                        print(
-                            f"error: --patch-file '{args.patch_file}' is not a regular file "
-                            f"(mode {_pf_stat.st_mode:#o})",
-                            file=sys.stderr,
+                        _emit_apply_patch_error(
+                            "PatchFileNotRegular",
+                            (
+                                f"--patch-file '{args.patch_file}' is not a regular file "
+                                f"(mode {_pf_stat.st_mode:#o})"
+                            ),
+                            reason_code="patch_file_not_regular",
                         )
                         return 1
                     if _pf_stat.st_size > _PATCH_FILE_MAX_BYTES:
-                        print(
-                            f"error: --patch-file '{args.patch_file}' size {_pf_stat.st_size} bytes "
-                            f"exceeds limit {_PATCH_FILE_MAX_BYTES} bytes",
-                            file=sys.stderr,
+                        _emit_apply_patch_error(
+                            "PatchFileTooLarge",
+                            (
+                                f"--patch-file '{args.patch_file}' size {_pf_stat.st_size} bytes "
+                                f"exceeds limit {_PATCH_FILE_MAX_BYTES} bytes"
+                            ),
+                            reason_code="patch_file_too_large",
                         )
                         return 1
                     # fdopen takes ownership of _pf_fd; mark sentinel before hand-off.
@@ -7714,7 +7914,11 @@ def main(argv: list[str] | None = None) -> int:
                     with _pf_fobj:
                         _patch_text = _pf_fobj.read()
                 except (OSError, UnicodeDecodeError) as exc:
-                    print(f"error: cannot read --patch-file '{args.patch_file}': {exc}", file=sys.stderr)
+                    _emit_apply_patch_error(
+                        type(exc).__name__,
+                        f"cannot read --patch-file '{args.patch_file}': {exc}",
+                        reason_code="patch_file_read_error",
+                    )
                     return 1
                 finally:
                     if _pf_fd >= 0:
@@ -7731,7 +7935,46 @@ def main(argv: list[str] | None = None) -> int:
                 capability_token=args.capability_token,
             )
         except (RuntimeError, ValueError) as exc:
-            print(str(exc), file=sys.stderr)
+            # Emit a stable JSON envelope on stderr so agents following the
+            # docs/ORCHESTRATION.md "出力契約" contract can parse failure
+            # detail without reading the gate file directly. We attempt to
+            # extract violations[] from a JSON-shaped exception message; if the
+            # message is plain text, we fall back to a single-violation entry.
+            err_payload: dict[str, Any] = {
+                "error": "guarded_apply_patch_failed",
+                "exception_type": type(exc).__name__,
+                "message": str(exc),
+                "violations": [],
+            }
+            _msg = str(exc).strip()
+            if _msg.startswith("{") and _msg.endswith("}"):
+                try:
+                    _parsed = json.loads(_msg)
+                    if isinstance(_parsed, dict):
+                        v = _parsed.get("violations")
+                        if isinstance(v, list):
+                            err_payload["violations"] = v
+                        for k in ("reason", "reason_code", "detail"):
+                            if k in _parsed:
+                                err_payload[k] = _parsed[k]
+                except json.JSONDecodeError:
+                    pass
+            if not err_payload["violations"]:
+                err_payload["violations"] = [{
+                    "reason": _msg,
+                    "exception_type": type(exc).__name__,
+                }]
+            print(json.dumps(err_payload, ensure_ascii=False), file=sys.stderr)
+            return 1
+        except Exception as exc:
+            # Catch-all so unexpected exceptions (e.g. KeyError from a payload
+            # quirk) still produce a parseable JSON envelope rather than a
+            # bare traceback that breaks the documented recovery contract.
+            _emit_apply_patch_error(
+                type(exc).__name__,
+                f"unexpected error: {exc}",
+                reason_code="unexpected_error",
+            )
             return 1
     elif args.command == "run-gate":
         try:

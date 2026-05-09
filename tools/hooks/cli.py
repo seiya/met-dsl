@@ -772,6 +772,46 @@ def _resolve_codex_agent_run_id_from_session(
     return None, 0
 
 
+def _get_agent_role_from_capability(
+    repo_root: Path, orchestration_id: str, agent_run_id: str
+) -> str | None:
+    """Return the agent_role for `agent_run_id`.
+
+    Resolution order:
+    1. `capabilities/<agent_run_id>.json` (step/substep agents, written at
+       record-launch time).
+    2. `orchestration_meta.json` — if `agent_run_id` matches
+       `orchestration_agent_run_id`, the role is "orchestration". The
+       orchestration agent has no capability file because it is initialized
+       directly by `init_orchestration` rather than launched as a child.
+    Returns None if neither source identifies the agent.
+    """
+    cap_path = (
+        repo_root
+        / "workspace"
+        / "orchestrations"
+        / orchestration_id
+        / "capabilities"
+        / f"{agent_run_id}.json"
+    )
+    if cap_path.is_file():
+        try:
+            doc = json.loads(cap_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            doc = None
+        if isinstance(doc, dict):
+            role = doc.get("agent_role")
+            if isinstance(role, str) and role.strip():
+                return role.strip().lower()
+
+    # Fallback: orchestration agent has no capability file. Match the run id
+    # against orchestration_meta.json.
+    orch_run_id = _get_orchestration_agent_run_id(repo_root, orchestration_id)
+    if orch_run_id and orch_run_id.strip() == agent_run_id.strip():
+        return "orchestration"
+    return None
+
+
 def _hint_for_file_tool(tool_name: str) -> str:
     return READ_HINT if tool_name == "Read" else WRITE_HINT
 
@@ -916,11 +956,13 @@ def _evaluate_pre_command_file_access_policy(
         if resolved_run_id is None:
             return HookDecision(action=HookDecisionAction.ALLOW)
         if tool_name == "Read":
+            agent_role = _get_agent_role_from_capability(repo_root, orchestration_id, resolved_run_id)
             return validate_read_access(
                 repo_root,
                 orchestration_id,
                 resolved_run_id,
                 decoded.file_path,
+                agent_role=agent_role,
             )
         return _validate_write_targets(
             repo_root=repo_root,

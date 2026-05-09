@@ -3438,6 +3438,385 @@ shell_tool                       stable             true
             [f"{_FIX_PIPE_REF}/tune/"],
         )
 
+    def test_write_roots_for_launch_promote_scoped_to_node_spec_subtree(self) -> None:
+        """Regression: promote write_roots MUST be scoped to the current node's
+        spec subtree. A wide `releases/` write_root would let a promote agent
+        for spec_x mutate any release artifact under the entire releases/
+        tree via the bwrap sandbox bind, before terminal-time validation can
+        reject the path. Scope must come from node_key."""
+        self.assertEqual(
+            _write_roots_for_launch(
+                role="step",
+                step="promote",
+                orchestration_id="orch_001",
+                plan_ref=_FIX_PLAN_REF,
+                pipeline_ref=_FIX_PIPE_REF,
+                node_key="problem/dom.fam.spec_x@1.0",
+            ),
+            ["releases/problem/dom/fam/spec_x/", "spec/registry/spec_catalog.yaml"],
+        )
+
+    def test_write_roots_for_launch_promote_without_node_key_returns_empty(self) -> None:
+        """Without node_key we cannot derive a per-spec subtree. We refuse
+        rather than fall back to the wide releases/ tree. The fail-fast
+        invariant in build_capability_document then raises."""
+        self.assertEqual(
+            _write_roots_for_launch(
+                role="step",
+                step="promote",
+                orchestration_id="orch_001",
+                plan_ref=_FIX_PLAN_REF,
+                pipeline_ref=_FIX_PIPE_REF,
+            ),
+            [],
+        )
+
+    def test_allowed_output_paths_for_launch_promote_accepts_release_artifact_and_catalog(self) -> None:
+        """Regression: promote step must pass phase contract validation for
+        canonical write paths (release tree + spec_catalog.yaml). Without this
+        branch, _matches_phase_contract falls through to False and breaks
+        record-launch for promote."""
+        from tools.orchestration_runtime import _allowed_output_paths_for_launch
+        out = _allowed_output_paths_for_launch(
+            request_payload={
+                "agent_role": "step",
+                "step": "promote",
+                "plan_ref": _FIX_PLAN_REF,
+                "pipeline_ref": _FIX_PIPE_REF,
+                "node_key": "problem/dom.fam.spec_x@1.0",
+                "allowed_output_paths": [
+                    "releases/problem/dom/fam/spec_x/aarch64/fortran/r_001/artifact.tar.gz",
+                    "spec/registry/spec_catalog.yaml",
+                ],
+            },
+            write_roots=["releases/", "spec/registry/spec_catalog.yaml"],
+        )
+        self.assertEqual(
+            out,
+            [
+                "releases/problem/dom/fam/spec_x/aarch64/fortran/r_001/artifact.tar.gz",
+                "spec/registry/spec_catalog.yaml",
+            ],
+        )
+
+    def test_allowed_output_paths_for_launch_promote_rejects_unrelated_path(self) -> None:
+        """Promote contract must still reject paths outside releases/ and the
+        canonical catalog file."""
+        from tools.orchestration_runtime import _allowed_output_paths_for_launch
+        with self.assertRaisesRegex(ValueError, "outside phase contract"):
+            _allowed_output_paths_for_launch(
+                request_payload={
+                    "agent_role": "step",
+                    "step": "promote",
+                    "plan_ref": _FIX_PLAN_REF,
+                    "pipeline_ref": _FIX_PIPE_REF,
+                    "node_key": "problem/dom.fam.spec_x@1.0",
+                    "allowed_output_paths": ["workspace/random.json"],
+                },
+                write_roots=["releases/", "spec/registry/spec_catalog.yaml", "workspace/"],
+            )
+
+    def test_allowed_output_paths_for_launch_promote_rejects_cross_spec_release(self) -> None:
+        """Regression: a promote agent for spec_x must NOT be allowed to write
+        into another spec's release tree, even though the path lives under
+        releases/. The release prefix must be locked to this node's spec."""
+        from tools.orchestration_runtime import _allowed_output_paths_for_launch
+        with self.assertRaisesRegex(ValueError, "outside phase contract"):
+            _allowed_output_paths_for_launch(
+                request_payload={
+                    "agent_role": "step",
+                    "step": "promote",
+                    "plan_ref": _FIX_PLAN_REF,
+                    "pipeline_ref": _FIX_PIPE_REF,
+                    "node_key": "problem/dom.fam.spec_x@1.0",
+                    # Different spec_id → outside this node's release subtree
+                    "allowed_output_paths": [
+                        "releases/problem/other_dom/other_fam/other_spec/aarch64/fortran/r_001/x.tar.gz",
+                    ],
+                },
+                write_roots=["releases/", "spec/registry/spec_catalog.yaml"],
+            )
+
+    def test_guarded_apply_patch_cli_emits_json_on_argument_error(self) -> None:
+        """Regression: argument validation failures must also emit a JSON
+        envelope on stderr, not plain text. Agents following the documented
+        recovery contract parse stderr — early-failure paths breaking that
+        contract are a real footgun."""
+        import subprocess
+        proc = subprocess.run(
+            [
+                "python3",
+                "tools/orchestration_runtime.py",
+                "guarded-apply-patch",
+                "--repo-root", ".",
+                "--orchestration-id", "orch",
+                "--actor-role", "step",
+                "--agent-run-id", "00000000-0000-0000-0000-000000000000",
+                "--paths-json", '["x"]',
+                "--patch-text", "a",
+                "--patch-file", "/tmp/anywhere",
+                "--capability-token", "b",
+            ],
+            cwd=str(Path(__file__).resolve().parents[2]),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertNotEqual(proc.returncode, 0)
+        try:
+            payload = json.loads(proc.stderr.strip())
+        except json.JSONDecodeError:
+            self.fail(f"argument-error stderr is not JSON: {proc.stderr!r}")
+        self.assertEqual(payload["error"], "guarded_apply_patch_failed")
+        self.assertEqual(payload["exception_type"], "ArgumentError")
+        self.assertEqual(payload["reason_code"], "mutually_exclusive_patch_source")
+
+    def test_guarded_apply_patch_cli_emits_json_on_invalid_uuid(self) -> None:
+        """Regression: invalid agent_run_id (UUID) failure must emit JSON envelope."""
+        import subprocess
+        with tempfile.TemporaryDirectory() as tmp:
+            patch_file = Path(tmp) / "x.patch"
+            patch_file.write_text("a", encoding="utf-8")
+            proc = subprocess.run(
+                [
+                    "python3",
+                    "tools/orchestration_runtime.py",
+                    "guarded-apply-patch",
+                    "--repo-root", ".",
+                    "--orchestration-id", "orch",
+                    "--actor-role", "step",
+                    "--agent-run-id", "not-a-uuid",
+                    "--paths-json", '["x"]',
+                    "--patch-file", str(patch_file),
+                    "--capability-token", "b",
+                ],
+                cwd=str(Path(__file__).resolve().parents[2]),
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        self.assertNotEqual(proc.returncode, 0)
+        payload = json.loads(proc.stderr.strip())
+        self.assertEqual(payload["reason_code"], "invalid_agent_run_id")
+
+    def test_guarded_apply_patch_cli_rejects_traversal_agent_run_id_on_patch_text(self) -> None:
+        """Regression: agent_run_id traversal validation must apply to BOTH
+        --patch-text and --patch-file paths. Previously the check was nested
+        under `if args.patch_file is not None`, leaving --patch-text
+        bypassable with traversal segments in --agent-run-id."""
+        import subprocess
+        proc = subprocess.run(
+            [
+                "python3",
+                "tools/orchestration_runtime.py",
+                "guarded-apply-patch",
+                "--repo-root", ".",
+                "--orchestration-id", "orch",
+                "--actor-role", "step",
+                "--agent-run-id", "../../../etc",
+                "--paths-json", '["x"]',
+                "--patch-text", "a",
+                "--capability-token", "b",
+            ],
+            cwd=str(Path(__file__).resolve().parents[2]),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertNotEqual(proc.returncode, 0)
+        payload = json.loads(proc.stderr.strip())
+        self.assertEqual(payload["reason_code"], "invalid_agent_run_id")
+        self.assertIn("path-traversal", payload["message"])
+
+    def test_guarded_apply_patch_cli_accepts_legacy_identifier_agent_run_id_on_patch_text(self) -> None:
+        """Legacy test fixtures use non-UUID identifiers like `build_child_rg1`.
+        These are valid identifiers (no traversal) and must still pass the
+        --patch-text path's argument validation; UUID strictness only applies
+        to --patch-file (where agent_run_id becomes a tmp-root path)."""
+        import subprocess
+        proc = subprocess.run(
+            [
+                "python3",
+                "tools/orchestration_runtime.py",
+                "guarded-apply-patch",
+                "--repo-root", ".",
+                "--orchestration-id", "rg1",
+                "--actor-role", "step",
+                "--agent-run-id", "build_child_rg1",
+                "--paths-json", '["x"]',
+                "--patch-text", "a",
+                "--capability-token", "b",
+            ],
+            cwd=str(Path(__file__).resolve().parents[2]),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertNotEqual(proc.returncode, 0)
+        payload = json.loads(proc.stderr.strip())
+        # MUST NOT be rejected at agent_run_id validation; should fail later
+        self.assertNotEqual(payload.get("reason_code"), "invalid_agent_run_id")
+
+    def test_guarded_apply_patch_cli_emits_json_on_failure(self) -> None:
+        """Regression: docs/ORCHESTRATION.md guarantees stderr carries a JSON
+        envelope with violations[] on guarded-apply-patch failure. Without this,
+        agents following the documented recovery path cannot parse failure
+        detail."""
+        import subprocess
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            (repo_root / "tools").mkdir()
+            # Force a failure by passing a bogus capability + invalid patch
+            proc = subprocess.run(
+                [
+                    "python3",
+                    "tools/orchestration_runtime.py",
+                    "guarded-apply-patch",
+                    "--repo-root", ".",
+                    "--orchestration-id", "orch_does_not_exist",
+                    "--actor-role", "step",
+                    "--agent-run-id", "00000000-0000-0000-0000-000000000000",
+                    "--paths-json", '["x"]',
+                    "--patch-text", "bogus",
+                    "--capability-token", "nope",
+                ],
+                cwd=str(Path(__file__).resolve().parents[2]),
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        self.assertNotEqual(proc.returncode, 0)
+        # stderr must be parseable JSON with the documented envelope
+        try:
+            payload = json.loads(proc.stderr.strip())
+        except json.JSONDecodeError:
+            self.fail(f"stderr is not JSON: {proc.stderr!r}")
+        self.assertEqual(payload.get("error"), "guarded_apply_patch_failed")
+        self.assertIn("exception_type", payload)
+        self.assertIn("violations", payload)
+        self.assertIsInstance(payload["violations"], list)
+        self.assertGreaterEqual(len(payload["violations"]), 1)
+
+    def test_allowed_output_paths_for_launch_promote_rejects_shallow_path_under_spec(self) -> None:
+        """Regression: a path directly under the spec subtree (e.g. README.md
+        without arch/lang/release_id) must be rejected. The previous startswith-only
+        check let arbitrary files anywhere under releases/<spec>/ pass."""
+        from tools.orchestration_runtime import _allowed_output_paths_for_launch
+        with self.assertRaisesRegex(ValueError, "outside phase contract"):
+            _allowed_output_paths_for_launch(
+                request_payload={
+                    "agent_role": "step",
+                    "step": "promote",
+                    "plan_ref": _FIX_PLAN_REF,
+                    "pipeline_ref": _FIX_PIPE_REF,
+                    "node_key": "problem/dom.fam.spec_x@1.0",
+                    "allowed_output_paths": [
+                        "releases/problem/dom/fam/spec_x/README.md",
+                    ],
+                },
+                write_roots=["releases/", "spec/registry/spec_catalog.yaml"],
+            )
+
+    def test_allowed_output_paths_for_launch_promote_rejects_traversal_in_release_path(self) -> None:
+        """Regression: path-traversal segments (../, .hidden, etc.) under the
+        spec subtree must be rejected."""
+        from tools.orchestration_runtime import _allowed_output_paths_for_launch
+        # `.hidden` survives the contract check until the identifier rule rejects it.
+        with self.assertRaisesRegex(ValueError, "outside phase contract"):
+            _allowed_output_paths_for_launch(
+                request_payload={
+                    "agent_role": "step",
+                    "step": "promote",
+                    "plan_ref": _FIX_PLAN_REF,
+                    "pipeline_ref": _FIX_PIPE_REF,
+                    "node_key": "problem/dom.fam.spec_x@1.0",
+                    "allowed_output_paths": [
+                        "releases/problem/dom/fam/spec_x/.hidden/lang/r/x.tar.gz",
+                    ],
+                },
+                write_roots=["releases/", "spec/registry/spec_catalog.yaml"],
+            )
+
+    def test_allowed_output_paths_for_launch_rejects_dotdot_segments(self) -> None:
+        """Regression: `..` segments must be rejected BEFORE prefix/contract
+        checks. Otherwise a path like
+        `releases/<spec>/aarch64/fortran/r1/../../somewhere_else` would pass
+        the startswith() check and the identifier check on the first three
+        tail segments, even though it resolves outside the canonical layout."""
+        from tools.orchestration_runtime import _allowed_output_paths_for_launch
+        with self.assertRaisesRegex(ValueError, "must not contain '\\.'/'\\.\\.' segments"):
+            _allowed_output_paths_for_launch(
+                request_payload={
+                    "agent_role": "step",
+                    "step": "promote",
+                    "plan_ref": _FIX_PLAN_REF,
+                    "pipeline_ref": _FIX_PIPE_REF,
+                    "node_key": "problem/dom.fam.spec_x@1.0",
+                    "allowed_output_paths": [
+                        "releases/problem/dom/fam/spec_x/aarch64/fortran/r1/../../spec/registry/spec_catalog.yaml",
+                    ],
+                },
+                write_roots=["releases/problem/dom/fam/spec_x/", "spec/registry/spec_catalog.yaml"],
+            )
+
+    def test_allowed_output_paths_for_launch_rejects_single_dot_segments(self) -> None:
+        from tools.orchestration_runtime import _allowed_output_paths_for_launch
+        with self.assertRaisesRegex(ValueError, "must not contain '\\.'/'\\.\\.' segments"):
+            _allowed_output_paths_for_launch(
+                request_payload={
+                    "agent_role": "step",
+                    "step": "promote",
+                    "plan_ref": _FIX_PLAN_REF,
+                    "pipeline_ref": _FIX_PIPE_REF,
+                    "node_key": "problem/dom.fam.spec_x@1.0",
+                    "allowed_output_paths": [
+                        "releases/problem/dom/fam/spec_x/./aarch64/fortran/r1/x.tar.gz",
+                    ],
+                },
+                write_roots=["releases/problem/dom/fam/spec_x/", "spec/registry/spec_catalog.yaml"],
+            )
+
+    def test_allowed_output_paths_for_launch_promote_accepts_deep_artifact_path(self) -> None:
+        """Positive case: arbitrary depth under <release_id>/ is allowed for
+        complex artifact layouts."""
+        from tools.orchestration_runtime import _allowed_output_paths_for_launch
+        out = _allowed_output_paths_for_launch(
+            request_payload={
+                "agent_role": "step",
+                "step": "promote",
+                "plan_ref": _FIX_PLAN_REF,
+                "pipeline_ref": _FIX_PIPE_REF,
+                "node_key": "problem/dom.fam.spec_x@1.0",
+                "allowed_output_paths": [
+                    "releases/problem/dom/fam/spec_x/aarch64/fortran/r1/sub/dir/x.tar.gz",
+                ],
+            },
+            write_roots=["releases/", "spec/registry/spec_catalog.yaml"],
+        )
+        self.assertEqual(
+            out,
+            ["releases/problem/dom/fam/spec_x/aarch64/fortran/r1/sub/dir/x.tar.gz"],
+        )
+
+    def test_allowed_output_paths_for_launch_promote_rejects_cross_kind_release(self) -> None:
+        """Regression: a promote agent for spec_kind=problem must NOT write to
+        a different spec_kind subtree."""
+        from tools.orchestration_runtime import _allowed_output_paths_for_launch
+        with self.assertRaisesRegex(ValueError, "outside phase contract"):
+            _allowed_output_paths_for_launch(
+                request_payload={
+                    "agent_role": "step",
+                    "step": "promote",
+                    "plan_ref": _FIX_PLAN_REF,
+                    "pipeline_ref": _FIX_PIPE_REF,
+                    "node_key": "problem/dom.fam.spec_x@1.0",
+                    "allowed_output_paths": [
+                        "releases/algorithm/dom/fam/spec_x/aarch64/fortran/r_001/x.tar.gz",
+                    ],
+                },
+                write_roots=["releases/", "spec/registry/spec_catalog.yaml"],
+            )
+
     def test_record_agent_run_rejects_tune_substep_terminal_write_outside_tune_root(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)

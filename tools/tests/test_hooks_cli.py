@@ -2310,6 +2310,59 @@ class ClaudeHookCliTests(unittest.TestCase):
             self.assertIn("Ensure record-launch generated the manifest", body.get("reason", ""))
 
 
+class GetAgentRoleFromCapabilityTests(unittest.TestCase):
+    """`_get_agent_role_from_capability` resolution including orchestration fallback."""
+
+    def test_returns_role_from_capability_file(self) -> None:
+        from tools.hooks.cli import _get_agent_role_from_capability
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            cap_dir = repo / "workspace" / "orchestrations" / "orch_x" / "capabilities"
+            cap_dir.mkdir(parents=True)
+            (cap_dir / "run_step.json").write_text(
+                json.dumps({"agent_role": "step"}), encoding="utf-8"
+            )
+            self.assertEqual(
+                _get_agent_role_from_capability(repo, "orch_x", "run_step"),
+                "step",
+            )
+
+    def test_falls_back_to_orchestration_meta_for_orchestration_agent(self) -> None:
+        """Regression: orchestration agent has no capability file. Role must
+        be resolved from orchestration_meta.json so auto-read tolerance and
+        the auto_read_expected_block classification work via the CLI path."""
+        from tools.hooks.cli import _get_agent_role_from_capability
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            orch_root = repo / "workspace" / "orchestrations" / "orch_x"
+            orch_root.mkdir(parents=True)
+            (orch_root / "orchestration_meta.json").write_text(
+                json.dumps({
+                    "orchestration_agent_run_id": "run_orch_001",
+                    "orchestration_id": "orch_x",
+                }),
+                encoding="utf-8",
+            )
+            self.assertEqual(
+                _get_agent_role_from_capability(repo, "orch_x", "run_orch_001"),
+                "orchestration",
+            )
+
+    def test_returns_none_for_unknown_agent(self) -> None:
+        from tools.hooks.cli import _get_agent_role_from_capability
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            orch_root = repo / "workspace" / "orchestrations" / "orch_x"
+            orch_root.mkdir(parents=True)
+            (orch_root / "orchestration_meta.json").write_text(
+                json.dumps({"orchestration_agent_run_id": "run_orch_001"}),
+                encoding="utf-8",
+            )
+            self.assertIsNone(
+                _get_agent_role_from_capability(repo, "orch_x", "run_unknown")
+            )
+
+
 class WriteToolExtensionPolicyTests(unittest.TestCase):
     """`Edit` / `Write` 直接書き込みの extension 別 policy 検証。"""
 

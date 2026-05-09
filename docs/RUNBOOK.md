@@ -201,3 +201,18 @@
 - 異なる `node_key` の `generate/src` が不正に完全一致していない。
 - `copy_based_artifact_reuse` が未検出である。
 - `write_scope_violation.json` が未生成である。
+
+## hook ブロック時の修復チートシート {#hook-recovery}
+
+workflow 実行中に hook がブロックした場合、`reason` と `audit_detail.policy` から原因を特定し、以下の表に従って次のアクションを取ること。
+
+| policy | ブロックされた操作の例 | 取るべき次の 1 アクション |
+|---|---|---|
+| `read_manifest_read_guard` | 許可 root 外のファイルを `Read` した | `read_manifests/<agent_run_id>.json` の `allowed_read_roots` を確認し、必要なら `run-gate --gate orchestration_read` 経由で読む。`MEMORY.md`・`README.md`・`.claude/settings.json` は orchestration agent では想定ブロック（無視してよい） |
+| `output_manifest_write_guard` | `/tmp`・`/dev/shm`・manifest 外 path への書き込み | `$TMPDIR` を `export TMPDIR=$(python3 -c "import json; print(json.load(open('workspace/orchestrations/<oid>/output_manifests/<id>.json'))['allowed_tmp_root'])")` で確定してから `${TMPDIR}/` 配下を使う |
+| `enforce_guarded_apply_patch` | `Edit`/`Write`/`apply_patch` で `.json`/`.txt` を書こうとした | `python3 tools/orchestration_runtime.py guarded-apply-patch --repo-root . --orchestration-id <oid> --actor-role <role> --agent-run-id <id> --paths-json '["<path>"]' --patch-file "${TMPDIR}/x.patch" --capability-token <token>` に切り替える |
+| `forbid_python_inline_write` | `python3 -c "open(...,'w')"` や `python3 - <<EOF` でファイル書き込みをしようとした | `.json`/`.txt` は `guarded-apply-patch`、その他は `Edit`/`Write` tool を使う |
+| `forbid_tools_direct_read` | `grep`・`cat`・`sed` で `tools/` 配下を読もうとした | `tools/` の実装は参照禁止。仕様は `docs/`・`spec/`・`skill_must_read_refs` を参照する。`guarded-apply-patch` の動作は `docs/ORCHESTRATION.md#patch-適用契約` と `launch_prompts.md` 末尾を参照 |
+| `rule_source_violation` | 他 agent の capability・gate 結果・他 phase の SKILL.md を読んだ | gate 失敗内容は `2>"${TMPDIR}/last_gate_stderr.txt"` で stderr をキャプチャして取得する。他 phase の SKILL.md は読まず、自 phase の `skill_ref` のみ参照する |
+| `forbid_git_reset_hard` | `git reset --hard` を実行しようとした | `git restore <file>` または `git checkout <file>` で個別ファイルを戻す |
+| `capability_invalid_empty_write_roots` | `write_roots=[]` の capability で書き込もうとした | `record-launch` の `--request-json` に `allowed_output_paths` が正しく設定されているか確認する |
