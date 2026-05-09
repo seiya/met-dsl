@@ -84,10 +84,12 @@ description: 対応 execution platform で `workflow` 全体を開始し、`orch
 10. `Generate` 以降の子 `agent` 起動前に、対象 `node` の直下依存 `node` ごとの `plan_ref` と `pipeline_ref` と `aggregate_verdict` を照合し、`direct dependency execution readiness` 不成立なら子 `agent` を起動せず `blocked` または `fail` を記録する。
 11. phase 本体へ進む前に、`preflight` 済み、launch prompt 準備済み、child `agent` 起動済みの 3 条件を確認する。未充足なら編集、`MCP` 実行、phase artifact 生成を開始してはならない。
 12. 生成した起動要求本文で子 `agent` を起動する。起動成功直後の実 `spawn_agent` 応答だけを `record-launch` で保存し、`launch_prompt_ref` と `launch_reply_ref` も同時に記録する。実起動前の仮記録、起動失敗後の補完記録、任意 `response_payload` の後投入を禁止する。
-13. 子 `agent` 完了後は、次の順序で記録処理を実行する。
-    1. `deactivate-child` を実行して active context を orchestration agent へ切り戻す。
-    2. `record-reply` で `launches/<agent_run_id>.reply.txt` を Agent tool の最終応答テキストで上書き保存する。
-    3. `python3 tools/orchestration_runtime.py record-agent-run --repo-root <repo_root> --orchestration-id <orchestration_id> --agent-run-json '<json>'` を実行して `agent_runs.jsonl` へ 1 行追記する。
+13. 子 `agent` 完了後は、次の順序で記録処理を実行する。順序を逆転させてはならない。`record-child-return` → `deactivate-child` の handshake は Adv-14/16/20 ガードに必須で、欠落すると runtime が `ValueError` で停止する。
+    1. `RETURN_TOKEN=$(cat workspace/orchestrations/<orchestration_id>/launches/<agent_run_id>.parent_return_token)` で `record-launch` が発行した parent-bound token を取得する。
+    2. `python3 tools/orchestration_runtime.py record-child-return --repo-root <repo_root> --orchestration-id <orchestration_id> --agent-run-id <agent_run_id> --return-token "$RETURN_TOKEN"` を実行し、Agent tool の return を観測した証跡 `child_returns/<agent_run_id>.txt` を記録する (Adv-30: 任意 caller による forge を防ぐ token 検証付き)。
+    3. `deactivate-child` を実行して active context を orchestration agent へ切り戻す（ack 不在 or token 不一致では拒否される）。
+    4. `record-reply` で `launches/<agent_run_id>.reply.txt` を Agent tool の最終応答テキストで上書き保存する。
+    5. `python3 tools/orchestration_runtime.py record-agent-run --repo-root <repo_root> --orchestration-id <orchestration_id> --agent-run-json '<json>'` を実行して `agent_runs.jsonl` へ 1 行追記する。
     `record-agent-run` により `agent.result.json` と `agent.summary.txt` も同時に保存しなければならない。`record-agent-run` は、申告した `output_refs` と `apply_patch_writes` internal gate 記録と output manifest 記録に加えて baseline との差分で実変更 path を検査するため、capability token の `write_root` または gate 許可 path または manifest 許可 path に含まれない `unauthorized write` が存在する場合は当該 `agent_run` を reject する。reject 発生後は `orchestration agent` が `orchestration_meta.status=fail_closed` を記録して停止しなければならない。
 14. `substep` を持つ phase では、返却結果を評価して `issue_severity` と `repair_strategy` を決定する。再投入が必要な場合は `repair_target_agent_run_id` と `repair_reason` を起動要求へ付与して再起動し、`record-launch` を追加する。
 15. `repair_strategy=reuse` の再投入では、対象 `substep` の契約を変更せず差分修正だけを要求する。`repair_strategy=restart` の再投入では、対象 `substep` の契約入力から再生成させる。
@@ -98,6 +100,12 @@ description: 対応 execution platform で `workflow` 全体を開始し、`orch
 20. `preflight.json` を手動編集または後編集して `status` と `can_launch_*` を変更してはならない。検査条件の変化は `preflight` 再実行でのみ反映する。
 21. `record-launch` 実行時に live preflight gate が `fail` の場合、当該起動を停止し、`set-status --status fail` のみを許可する。
 22. `Generate` / `Build` / `Execute` / `Judge` の各子 `agent` 完了記録において、`step_result.json` の `validation_stage` フィールドに `validate_pipeline_semantics.py` で実行した `--stage` 値を記録しなければならない。`status=pass` の `step_result` では、当該 `step` に対応する許容 `validation_stage` 値（`generate`: `post_generate`/`post_build`/`full`、`build`: `post_build`/`full`、`execute`: `post_execute`/`pre_judge`/`full`、`judge`: `pre_judge`/`full`）が記録されていない場合、`write-step-result` は失敗する。`Plan` および `Tune` の `step_result` には `validation_stage` を要求しない。
+23. 子 `Agent` tool が API stream idle timeout 等で途中切断された場合は、`record-agent-run` を `status=timeout` で手書きせず、次の順序で finalize する。各 step が欠落すると Adv-14/16/20 ガードにより `ValueError` で停止する。
+    1. `record-child-return --agent-run-id <arid>`: Agent tool の return（タイムアウト終了応答を含む）を観測した証跡を記録。
+    2. `deactivate-child --child-run-id <arid>`: active marker を解除（ack を消費）。
+    3. `record-timeout --agent-run-id <arid> --reason "<text>"`: 終端 entry を記録、部分書き込み整合チェックと `workspace/tmp/<arid>/` 削除を実行。
+
+    Agent tool が wedge して return を一切観測できない例外ケース（プロセス kill 等）に限り、`record-timeout --force-reason "<operator override 内容>"` で marker check を bypass できる。`forced=True` と `forced_reason` が audit 記録に残る。通常フローを優先し、`--force-reason` は最後の escape hatch として使う。詳細は `docs/RUNBOOK.md#substep-timeout-recovery` を参照。
 
 ## 参照
 - 起動最小契約: `references/startup_contract.md`

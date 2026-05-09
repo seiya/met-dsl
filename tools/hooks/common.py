@@ -81,6 +81,33 @@ MANIFEST_HINT = (
 )
 
 
+def format_block_reason_with_hint(decision: "HookDecision") -> str:
+    """Append audit_detail.fix_hint (next_command + docs_ref) to a BLOCK reason.
+
+    Adapters log audit_detail for forensics, but agents only see the `reason`
+    string in the rejection message. Surface the structured fix_hint inline so
+    the agent can act on it without consulting the audit log.
+    """
+    base = decision.reason or "blocked by policy"
+    audit = decision.audit_detail or {}
+    fix_hint = audit.get("fix_hint") if isinstance(audit, dict) else None
+    if not isinstance(fix_hint, dict):
+        return base
+    next_command = fix_hint.get("next_command")
+    docs_ref = fix_hint.get("docs_ref")
+    note = fix_hint.get("note")
+    appended: list[str] = []
+    if isinstance(next_command, str) and next_command.strip():
+        appended.append(f"Fix: {next_command.strip()}")
+    if isinstance(docs_ref, str) and docs_ref.strip():
+        appended.append(f"Docs: {docs_ref.strip()}")
+    if isinstance(note, str) and note.strip():
+        appended.append(f"Note: {note.strip()}")
+    if not appended:
+        return base
+    return base + "\n\n" + "\n".join(appended)
+
+
 class HookEventName(str, Enum):
     SESSION_START = "session_start"
     USER_PROMPT_SUBMIT = "user_prompt_submit"
@@ -997,21 +1024,54 @@ def validate_write_access(
                 "allowed_output_paths": allowed_paths,
                 "allowed_tmp_root": manifest.get("allowed_tmp_root", ""),
                 "fix_hint": {
+                    # NOTE: must NOT suggest `python3 -c "import json; ..."` —
+                    # that form is itself blocked by forbid_python_inline_write
+                    # and would put the agent in a recovery loop. `jq -er` with
+                    # `// empty` causes fail-fast (exit 1) on missing key/file.
                     "next_command": (
-                        f"export TMPDIR=$(python3 -c \"import json; "
-                        f"print(json.load(open('workspace/orchestrations/{orchestration_id}"
-                        f"/output_manifests/{agent_run_id}.json'))['allowed_tmp_root'])\")"
+                        f"export TMPDIR=$(jq -er '.allowed_tmp_root // empty' "
+                        f"\"workspace/orchestrations/{orchestration_id}"
+                        f"/output_manifests/{agent_run_id}.json\")"
                     ),
                     "docs_ref": "docs/RUNBOOK.md#hook-recovery",
                     "note": _tmpdir_hint,
                 },
             },
         )
-    if tool_name in {"Edit", "Write", "apply_patch"} and rel_target_norm not in allowed_file_tool_paths:
+    if tool_name in {"Edit", "Write", "apply_patch", "Bash"} and rel_target_norm not in allowed_file_tool_paths:
+        # Bash redirects (`cat > path`, `tee path`, `>>`) leave no gate
+        # provenance, so they must satisfy the same constraint as Edit/Write:
+        # either be in allowed_file_tool_paths, or go through guarded-apply-patch.
+        # This matches the post-hoc record-agent-run integrity check at
+        # tools/orchestration_runtime.py:_validate_actual_write_paths, which
+        # rejects writes lacking gate provenance unless they appear in
+        # manifest_file_tool_paths.
+        # L2: include a Bash-specific recovery note on top of the concrete
+        # guarded-apply-patch template so operators redirecting via heredoc
+        # see both options ("write to $TMPDIR first" vs "go through
+        # guarded-apply-patch") rather than only the patch path.
+        bash_note = (
+            "Bash redirects must target $TMPDIR (allowed_tmp_root). For "
+            "canonical paths, stage the content under $TMPDIR/x.patch and "
+            "apply via guarded-apply-patch — see fix_hint.next_command."
+            if tool_name == "Bash" else None
+        )
+        fix_hint: dict[str, Any] = {
+            "next_command": (
+                f"python3 tools/orchestration_runtime.py guarded-apply-patch "
+                f"--repo-root . --orchestration-id {orchestration_id} "
+                f"--actor-role <role> --agent-run-id {agent_run_id} "
+                f"--paths-json '[\"{file_path}\"]' --patch-file ${{TMPDIR}}/x.patch "
+                f"--capability-token <token>"
+            ),
+            "docs_ref": "docs/RUNBOOK.md#hook-recovery",
+        }
+        if bash_note:
+            fix_hint["note"] = bash_note
         return HookDecision(
             action=HookDecisionAction.BLOCK,
             reason=(
-                "direct write via Edit/Write/apply_patch tool is forbidden for this target path. "
+                f"direct write via {tool_name} is forbidden for this target path. "
                 "Use guarded-apply-patch instead or include the path in "
                 "output_manifest allowed_file_tool_paths: "
                 "python3 tools/orchestration_runtime.py guarded-apply-patch ..."
@@ -1023,16 +1083,7 @@ def validate_write_access(
                 "file_path": file_path,
                 "agent_run_id": agent_run_id,
                 "allowed_file_tool_paths": list(allowed_file_tool_paths),
-                "fix_hint": {
-                    "next_command": (
-                        f"python3 tools/orchestration_runtime.py guarded-apply-patch "
-                        f"--repo-root . --orchestration-id {orchestration_id} "
-                        f"--actor-role <role> --agent-run-id {agent_run_id} "
-                        f"--paths-json '[\"<path>\"]' --patch-file ${{TMPDIR}}/x.patch "
-                        f"--capability-token <token>"
-                    ),
-                    "docs_ref": "docs/RUNBOOK.md#hook-recovery",
-                },
+                "fix_hint": fix_hint,
             },
         )
     return HookDecision(action=HookDecisionAction.ALLOW)

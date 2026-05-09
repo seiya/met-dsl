@@ -57,6 +57,7 @@ from tools.orchestration_runtime import (
     read_checkpoint,
     record_agent_run,
     record_launch,
+    record_timeout,
     reserve_phase_root,
     render_launch_prompt_text,
     run_gate,
@@ -8404,6 +8405,12 @@ class TestPhase2PlanGuardsIntegration(unittest.TestCase):
             )
 
     def test_tool_compile_project_enforces_gate_when_orchestration_id_set(self) -> None:
+        """L-FOURTH-1: exercise the REAL `validate_mcp_build_tool_invocation`
+        path (no stubbed runtime). When an orchestration is initialized but
+        `record-launch` was never called for the agent_run_id, the production
+        gate raises a RuntimeError mentioning "record-launch" — the test
+        assertion is satisfied by the real production message rather than a
+        self-fulfilling stub."""
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
             init_orchestration(repo_root=repo_root, orchestration_id="g3")
@@ -8420,25 +8427,22 @@ class TestPhase2PlanGuardsIntegration(unittest.TestCase):
                     "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
                 },
             )
-            class _FakeRuntime:
-                @staticmethod
-                def validate_mcp_build_tool_invocation(*args: Any, **kwargs: Any) -> None:
-                    raise RuntimeError("record-launch is required before MCP build tool invocation")
-
-            with patch("mcp_servers.build_runtime_server._load_orchestration_runtime") as load_mock:
-                load_mock.return_value = _FakeRuntime()
-                with self.assertRaises(RuntimeError) as ctx:
-                    tool_compile_project(
-                        {
-                            "project_dir": str(repo_root),
-                            "language": "python",
-                            "build_system": "poetry",
-                            "orchestration_id": "g3",
-                            "agent_run_id": "nolaunch",
-                            "capability_token": "x",
-                            "repo_root": str(repo_root),
-                        }
-                    )
+            # No record-launch for agent_run_id="nolaunch" → real
+            # validate_mcp_build_tool_invocation raises:
+            # "MCP phase gate: record-launch did not complete (missing
+            #  launches/*.response.json) for agent_run_id='nolaunch'"
+            with self.assertRaises(RuntimeError) as ctx:
+                tool_compile_project(
+                    {
+                        "project_dir": str(repo_root),
+                        "language": "python",
+                        "build_system": "poetry",
+                        "orchestration_id": "g3",
+                        "agent_run_id": "nolaunch",
+                        "capability_token": "x",
+                        "repo_root": str(repo_root),
+                    }
+                )
             self.assertIn("record-launch", str(ctx.exception).lower())
 
     def test_apply_patch_gate_orchestration_rejects_plan_paths(self) -> None:
@@ -8651,6 +8655,83 @@ class TestPhase2PlanGuardsIntegration(unittest.TestCase):
             self.assertEqual(meta.get("status"), "fail_closed")
             self.assertEqual(meta.get("reason_code"), "child_agent_forbidden_by_session_policy")
             self.assertEqual(meta.get("blocking_policy_scope"), "session_policy.allow_substep_agent_launch")
+
+    def test_set_status_terminal_writes_cleanup_committed_marker_after_cleanup(self) -> None:
+        """Adv-35 invariant: set-status terminal must commit (a) terminal
+        meta status, (b) tmp cleanup, and (c) cleanup_committed marker.
+        The committed marker is what the validator uses to decide that
+        exemption can be revoked — without it, the validator keeps the
+        orchestration's tmp scratch exempt as cleanup-pending."""
+        from tools.orchestration_runtime import _cleanup_committed_marker_path
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            init_orchestration(repo_root=repo_root, orchestration_id="orch_committed")
+            meta_path = (
+                repo_root / "workspace" / "orchestrations" / "orch_committed"
+                / "orchestration_meta.json"
+            )
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            orch_arid = meta["orchestration_agent_run_id"]
+            tmp_dir = repo_root / "workspace" / "tmp" / orch_arid
+            (tmp_dir / "leaked.py").write_text("print('x')\n", encoding="utf-8")
+
+            update_orchestration_status(
+                repo_root=repo_root,
+                orchestration_id="orch_committed",
+                status="fail",
+                reason_detail="adv-35 invariant test",
+            )
+
+            # 1) terminal meta is published.
+            meta_after = json.loads(meta_path.read_text(encoding="utf-8"))
+            self.assertEqual(meta_after.get("status"), "fail")
+            # 2) tmp dir is cleaned.
+            self.assertFalse(tmp_dir.exists(), "set-status terminal must clean orch tmp")
+            # 3) cleanup_committed marker is written.
+            committed = _cleanup_committed_marker_path(repo_root, "orch_committed", orch_arid)
+            self.assertTrue(committed.is_file(),
+                            "cleanup_committed marker must be written after cleanup")
+
+    def test_set_status_terminal_cleans_orchestration_tmp_root(self) -> None:
+        """Adv-13: when set-status flips to a terminal value (fail/fail_closed
+        /timeout/etc.), the orchestration's own workspace/tmp/<orch_arid>/
+        scratch must be cleaned. Otherwise validate_workspace_root flags any
+        leftover *.py — Adv-9 only exempts that dir while status='running'."""
+        for terminal_status, reason_code in (
+            ("fail", None),
+            ("fail_closed", "child_agent_forbidden_by_session_policy"),
+            ("timeout", None),
+            ("cancel", None),
+        ):
+            with self.subTest(status=terminal_status):
+                with tempfile.TemporaryDirectory() as tmp:
+                    repo_root = Path(tmp)
+                    orch_id = f"orch_set_status_cleanup_{terminal_status}"
+                    init_orchestration(repo_root=repo_root, orchestration_id=orch_id)
+                    meta_path = (
+                        repo_root / "workspace" / "orchestrations" / orch_id
+                        / "orchestration_meta.json"
+                    )
+                    meta = json.loads(meta_path.read_text(encoding="utf-8"))
+                    orch_arid = meta["orchestration_agent_run_id"]
+                    tmp_dir = repo_root / "workspace" / "tmp" / orch_arid
+                    self.assertTrue(tmp_dir.is_dir(),
+                                    "init_orchestration must have created the orch tmp dir")
+                    leaked = tmp_dir / "leaked_helper.py"
+                    leaked.write_text("print('helper')\n", encoding="utf-8")
+
+                    update_orchestration_status(
+                        repo_root=repo_root,
+                        orchestration_id=orch_id,
+                        status=terminal_status,
+                        reason_code=reason_code,
+                        reason_detail="adv-13 test",
+                    )
+                    self.assertFalse(
+                        tmp_dir.exists(),
+                        f"set-status {terminal_status!r} must clean the orchestration tmp dir; "
+                        f"leftover scripts would be flagged by validate_workspace_root.",
+                    )
 
 
 class TestPhase3RunGate(unittest.TestCase):
@@ -11119,6 +11200,192 @@ class BwrapProfileFilePinTests(unittest.TestCase):
             _json.dumps(profile), encoding="utf-8"
         )
 
+    def _seed_launch_request(self, repo_root: Path, orchestration_id: str, arid: str) -> None:
+        """Helper: create launches/<arid>.request.json so that
+        _cleanup_agent_tmp_root's Adv-5 ownership guard accepts the call."""
+        launches_dir = repo_root / "workspace" / "orchestrations" / orchestration_id / "launches"
+        launches_dir.mkdir(parents=True, exist_ok=True)
+        (launches_dir / f"{arid}.request.json").write_text(
+            json.dumps({"agent_run_id": arid}), encoding="utf-8"
+        )
+
+    def test_cleanup_agent_tmp_root_removes_per_agent_tmp_dir(self) -> None:
+        """Fix 4: _cleanup_agent_tmp_root must rmtree workspace/tmp/<arid>/
+        when the calling orchestration owns the launch record."""
+        from tools.orchestration_runtime import _cleanup_agent_tmp_root
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            arid = "abc123-tmp-cleanup-1"
+            self._seed_launch_request(repo_root, "orch_x", arid)
+            tmp_dir = repo_root / "workspace" / "tmp" / arid
+            (tmp_dir / "sub").mkdir(parents=True, exist_ok=True)
+            (tmp_dir / "run_record_launch.py").write_text("print('x')\n", encoding="utf-8")
+            (tmp_dir / "sub" / "patch.txt").write_text("data\n", encoding="utf-8")
+            self.assertTrue(tmp_dir.exists())
+
+            _cleanup_agent_tmp_root(repo_root, "orch_x", agent_run_id=arid)
+            self.assertFalse(tmp_dir.exists(), "agent tmp dir must be removed")
+
+    def test_cleanup_agent_tmp_root_refuses_when_not_owner(self) -> None:
+        """Adv-5: refuse to delete when the calling orchestration has no launch
+        record for arid. Two orchestrations could collide on the same arid (the
+        tmp namespace is flat); the non-owner must not be able to wipe the
+        owner's live scratch."""
+        from tools.orchestration_runtime import _cleanup_agent_tmp_root
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            arid = "shared-arid-cross-orch"
+            # Owner = orch_owner; intruder = orch_intruder
+            self._seed_launch_request(repo_root, "orch_owner", arid)
+            tmp_dir = repo_root / "workspace" / "tmp" / arid
+            tmp_dir.mkdir(parents=True, exist_ok=True)
+            sentinel = tmp_dir / "live_data.txt"
+            sentinel.write_text("owner data\n", encoding="utf-8")
+
+            # Intruder orchestration — no launch record for this arid.
+            _cleanup_agent_tmp_root(repo_root, "orch_intruder", agent_run_id=arid)
+            self.assertTrue(
+                sentinel.exists(),
+                "non-owner orchestration must not wipe the owner's tmp scratch",
+            )
+            self.assertTrue(tmp_dir.exists())
+
+    def test_cleanup_agent_tmp_root_no_op_when_dir_missing(self) -> None:
+        """Idempotent: missing directory is not an error."""
+        from tools.orchestration_runtime import _cleanup_agent_tmp_root
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._seed_launch_request(repo_root, "orch_x", "never-existed")
+            _cleanup_agent_tmp_root(repo_root, "orch_x", agent_run_id="never-existed")
+
+    def test_cleanup_agent_tmp_root_rejects_path_traversal(self) -> None:
+        """Defensive: reject agent_run_id values containing path separators or '..'."""
+        from tools.orchestration_runtime import _cleanup_agent_tmp_root
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            sentinel = repo_root / "workspace" / "tmp" / "abc"
+            sentinel.mkdir(parents=True, exist_ok=True)
+            (sentinel / "keep.txt").write_text("keep\n", encoding="utf-8")
+            self._seed_launch_request(repo_root, "orch_x", "abc")
+            # Each of these must be a no-op (no exception, no deletion).
+            for bad in ("../abc", "abc/sub", "..", ".", ""):
+                _cleanup_agent_tmp_root(repo_root, "orch_x", agent_run_id=bad)
+            self.assertTrue((sentinel / "keep.txt").exists(),
+                            "valid sibling tmp dir must not be touched by traversal attempts")
+
+    def test_cleanup_agent_tmp_root_refuses_on_cross_orch_arid_collision(self) -> None:
+        """Adv-11: when two orchestrations both have launch records for the
+        same arid, the flat workspace/tmp/<arid>/ namespace cannot
+        disambiguate ownership. Cleanup must refuse to delete to avoid wiping
+        the colliding orchestration's live scratch.
+        """
+        from tools.orchestration_runtime import _cleanup_agent_tmp_root
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            shared_arid = "collision-arid-001"
+            self._seed_launch_request(repo_root, "orch_alpha", shared_arid)
+            self._seed_launch_request(repo_root, "orch_beta", shared_arid)
+            tmp_dir = repo_root / "workspace" / "tmp" / shared_arid
+            tmp_dir.mkdir(parents=True, exist_ok=True)
+            sentinel = tmp_dir / "shared.txt"
+            sentinel.write_text("shared\n", encoding="utf-8")
+
+            _cleanup_agent_tmp_root(repo_root, "orch_alpha", agent_run_id=shared_arid)
+            self.assertTrue(
+                sentinel.exists(),
+                "Cross-orch collision must prevent deletion (orch_alpha tries to clean shared dir)",
+            )
+            _cleanup_agent_tmp_root(repo_root, "orch_beta", agent_run_id=shared_arid)
+            self.assertTrue(
+                sentinel.exists(),
+                "Cross-orch collision must prevent deletion (orch_beta also tries to clean shared dir)",
+            )
+
+    def test_cleanup_agent_tmp_root_refuses_on_orch_meta_vs_launch_collision(self) -> None:
+        """Adv-11 + Adv-9: collision can also be between one orch's
+        orchestration_agent_run_id and another orch's substep launch arid."""
+        from tools.orchestration_runtime import _cleanup_agent_tmp_root
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            shared_arid = "orch-vs-substep-collision"
+            # Orch X: claims shared_arid as its orchestration_agent_run_id.
+            orch_x = repo_root / "workspace" / "orchestrations" / "orch_X"
+            orch_x.mkdir(parents=True, exist_ok=True)
+            (orch_x / "orchestration_meta.json").write_text(
+                json.dumps({
+                    "orchestration_id": "orch_X",
+                    "orchestration_agent_run_id": shared_arid,
+                }),
+                encoding="utf-8",
+            )
+            # Orch Y: launched shared_arid as a child agent.
+            self._seed_launch_request(repo_root, "orch_Y", shared_arid)
+            tmp_dir = repo_root / "workspace" / "tmp" / shared_arid
+            tmp_dir.mkdir(parents=True, exist_ok=True)
+            sentinel = tmp_dir / "shared.txt"
+            sentinel.write_text("shared\n", encoding="utf-8")
+
+            _cleanup_agent_tmp_root(repo_root, "orch_Y", agent_run_id=shared_arid)
+            self.assertTrue(
+                sentinel.exists(),
+                "Collision between orchestration_agent_run_id and substep launch must prevent deletion",
+            )
+
+    def test_cleanup_agent_tmp_root_accepts_orchestration_meta_proof(self) -> None:
+        """Adv-7: orchestration agents are not 'launched' via record-launch and
+        so have no .request.json. Their identity is pinned in
+        orchestration_meta.json#orchestration_agent_run_id; that field is
+        accepted as ownership proof for cleanup."""
+        from tools.orchestration_runtime import _cleanup_agent_tmp_root
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            orch_arid = "orch-agent-run-id-001"
+            orch_dir = repo_root / "workspace" / "orchestrations" / "orch_meta"
+            orch_dir.mkdir(parents=True, exist_ok=True)
+            (orch_dir / "orchestration_meta.json").write_text(
+                json.dumps({"orchestration_agent_run_id": orch_arid}), encoding="utf-8",
+            )
+            tmp_dir = repo_root / "workspace" / "tmp" / orch_arid
+            tmp_dir.mkdir(parents=True, exist_ok=True)
+            (tmp_dir / "scratch.txt").write_text("ok\n", encoding="utf-8")
+
+            _cleanup_agent_tmp_root(repo_root, "orch_meta", agent_run_id=orch_arid)
+            self.assertFalse(
+                tmp_dir.exists(),
+                "orchestration role tmp dir must be cleaned when meta proves ownership",
+            )
+
+    def test_cleanup_agent_tmp_root_does_not_follow_symlink(self) -> None:
+        """Symlinks at workspace/tmp/<arid>/ must not be followed (refuse to delete)."""
+        import os
+        from tools.orchestration_runtime import _cleanup_agent_tmp_root
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            external = repo_root / "external_real_dir"
+            external.mkdir()
+            (external / "important.txt").write_text("do not delete\n", encoding="utf-8")
+            workspace_tmp = repo_root / "workspace" / "tmp"
+            workspace_tmp.mkdir(parents=True, exist_ok=True)
+            link_path = workspace_tmp / "link-arid"
+            try:
+                os.symlink(external, link_path)
+            except OSError:
+                self.skipTest("symlink not supported on this filesystem")
+            self._seed_launch_request(repo_root, "orch_x", "link-arid")
+            _cleanup_agent_tmp_root(repo_root, "orch_x", agent_run_id="link-arid")
+            self.assertTrue(
+                (external / "important.txt").exists(),
+                "symlink target must not be touched",
+            )
+
     def test_file_pin_stub_cleaned_up_when_agent_never_writes(self) -> None:
         """_cleanup_empty_file_pin_stubs must delete empty stubs if the agent never wrote to the pin."""
         from tools.orchestration_runtime import build_bwrap_profile, _cleanup_empty_file_pin_stubs
@@ -11730,6 +11997,1346 @@ class PreWriteManifestExtensionPolicyTests(unittest.TestCase):
                     agent_run_id=run_id,
                     paths=["workspace/pipelines/a/generate/g_001/src/libflux.a"],
                 )
+
+
+class RecordTimeoutTests(unittest.TestCase):
+    """Fix 5: record-timeout is the canonical recovery for child Agent stream timeouts."""
+
+    def _setup_substep_launch(self, repo_root: Path) -> str:
+        """Initialise an orchestration with a substep launched and return the substep agent_run_id."""
+        init_orchestration(
+            repo_root=repo_root,
+            orchestration_id="orch_to_001",
+            spec_ref="spec/problem/shallow_water2d/controlled_spec.md",
+            source_dependency_ref="spec/problem/shallow_water2d/deps.yaml",
+        )
+        write_preflight(
+            repo_root=repo_root,
+            orchestration_id="orch_to_001",
+            payload={
+                "status": "pass",
+                "backend": "claude",
+                "sandbox_runtime": "bwrap",
+                "sandbox_enforced": True,
+                "can_launch_step_agents": True,
+                "can_launch_substep_agents": True,
+                "feature_states": {"multi_agent": True, "codex_hooks": True},
+                "checks": [
+                    {"name": "multi_agent_enabled", "pass": True},
+                    {"name": "codex_hooks_enabled", "pass": True},
+                    {"name": "codex_home_writable", "pass": True},
+                    {"name": "sandbox_bwrap_available", "pass": True},
+                    {"name": "sandbox_bwrap_userns", "pass": True},
+                ],
+            },
+        )
+        substep_arid = "substep_run_to_001"
+        record_launch(
+            repo_root=repo_root,
+            orchestration_id="orch_to_001",
+            parent_agent_run_id="orch_run_to_001",
+            child_agent_run_id=substep_arid,
+            request_payload={
+                "agent_run_id": substep_arid,
+                "agent_role": "substep",
+                "node_key": "problem/shallow_water2d@0.3.0",
+                "step": "generate",
+                "substep": "generate",
+                "orchestration_id": "orch_to_001",
+                "parent_agent_run_id": "orch_run_to_001",
+                "plan_ref": _FIX_PLAN_REF,
+                "pipeline_ref": _FIX_PIPE_REF,
+                "dependency_ref": _FIX_PLAN_REF,
+                "skill_name": "workflow-generate-generate",
+                "skill_ref": "skills/workflow-generate-generate/SKILL.md",
+                "skill_must_read_refs": _fixture_skill_must_read_refs_substep(
+                    "generate", "generate"
+                ),
+                "allowed_output_paths": [
+                    f"{_FIX_PIPE_REF}/generate/gen_001/generate_meta.json",
+                ],
+                "launch_prompt_full": render_launch_prompt_text({
+                    "node_key": "problem/shallow_water2d@0.3.0",
+                    "step": "generate",
+                    "substep": "generate",
+                    "agent_run_id": substep_arid,
+                    "orchestration_id": "orch_to_001",
+                    "parent_agent_run_id": "orch_run_to_001",
+                    "workflow_mode": "dev",
+                    "plan_ref": _FIX_PLAN_REF,
+                    "pipeline_ref": _FIX_PIPE_REF,
+                    "dependency_ref": _FIX_PLAN_REF,
+                    "skill_name": "workflow-generate-generate",
+                    "skill_ref": "skills/workflow-generate-generate/SKILL.md",
+                    "skill_must_read_refs": _fixture_skill_must_read_refs_substep(
+                        "generate", "generate"
+                    ),
+                    "issue_severity": "none",
+                    "repair_strategy": "none",
+                    "repair_target_agent_run_id": "none",
+                    "repair_reason": "none",
+                }),
+            },
+            response_payload={
+                "agent_run_id": substep_arid,
+                "backend": "claude",
+                "started_at": "2026-05-09T08:00:00Z",
+                **_spawn_response_payload(substep_arid),
+            },
+        )
+        return substep_arid
+
+    def _deactivate(self, repo_root: Path, arid: str) -> None:
+        """Helper: record child return ack (Adv-20/Adv-30) and clear the
+        active marker so Adv-14 guard accepts the subsequent record-timeout
+        call. Reads the per-arid parent_return_token issued by record-launch."""
+        from tools.orchestration_runtime import (
+            record_child_return, deactivate_child_agent,
+            _parent_return_token_path,
+        )
+        token = _parent_return_token_path(
+            repo_root, "orch_to_001", arid
+        ).read_text(encoding="utf-8").strip()
+        record_child_return(
+            repo_root=repo_root,
+            orchestration_id="orch_to_001",
+            agent_run_id=arid,
+            return_token=token,
+        )
+        deactivate_child_agent(
+            repo_root=repo_root,
+            orchestration_id="orch_to_001",
+            child_run_id=arid,
+        )
+
+    def test_record_timeout_appends_terminal_entry_and_cleans_tmp(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            arid = self._setup_substep_launch(repo_root)
+            tmp_dir = repo_root / "workspace" / "tmp" / arid
+            tmp_dir.mkdir(parents=True, exist_ok=True)
+            (tmp_dir / "scratch.py").write_text("print('x')\n", encoding="utf-8")
+            (tmp_dir / "request.json").write_text("{}\n", encoding="utf-8")
+            self.assertTrue(tmp_dir.exists())
+
+            self._deactivate(repo_root, arid)
+            result = record_timeout(
+                repo_root=repo_root,
+                orchestration_id="orch_to_001",
+                agent_run_id=arid,
+                reason="API stream idle timeout after 600s",
+            )
+            self.assertEqual(result.get("status"), "timeout")
+            self.assertEqual(result.get("agent_run_id"), arid)
+            self.assertEqual(result.get("timeout_reason"), "API stream idle timeout after 600s")
+
+            runs_path = repo_root / "workspace" / "orchestrations" / "orch_to_001" / "agent_runs.jsonl"
+            entries = [json.loads(line) for line in runs_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+            timeout_entry = next((e for e in entries if e.get("agent_run_id") == arid), None)
+            self.assertIsNotNone(timeout_entry)
+            self.assertEqual(timeout_entry["status"], "timeout")
+            self.assertIn("finished_at", timeout_entry)
+            self.assertEqual(timeout_entry["agent_role"], "substep")
+            self.assertEqual(timeout_entry["timeout_reason"], "API stream idle timeout after 600s")
+            self.assertFalse(tmp_dir.exists(),
+                             "workspace/tmp/<arid>/ must be cleaned by record-timeout")  # noqa: E501
+
+    def test_record_timeout_rejects_missing_launch_request(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            init_orchestration(repo_root=repo_root, orchestration_id="orch_to_002")
+            with self.assertRaisesRegex(ValueError, "cannot find launch request"):
+                record_timeout(
+                    repo_root=repo_root,
+                    orchestration_id="orch_to_002",
+                    agent_run_id="never-launched",
+                    reason="x",
+                )
+
+    def test_record_timeout_requires_non_empty_reason(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            with self.assertRaisesRegex(ValueError, "non-empty --reason"):
+                record_timeout(
+                    repo_root=repo_root,
+                    orchestration_id="orch_to_003",
+                    agent_run_id="any",
+                    reason="   ",
+                )
+
+    def test_record_timeout_preserves_launched_context_id_and_parent(self) -> None:
+        """Adv-3: context_id (per-run isolation context, distinct from
+        agent_session_id under Codex's repair_strategy=reuse) and
+        parent_agent_run_id must be carried over from the launch artifacts /
+        session_run_index, not synthesised from agent_session_id."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            arid = self._setup_substep_launch(repo_root)
+
+            # Simulate a backend where context_id was explicitly recorded at
+            # launch time as a separate identifier from agent_session_id
+            # (e.g. Codex distinguishes session and per-run isolated context).
+            # agent_session_id stays bound to the launch response (record-agent-run
+            # rejects mismatch) but context_id can diverge.
+            from tools.orchestration_runtime import (
+                _read_session_run_index,
+                _session_run_index_path,
+            )
+            doc = _read_session_run_index(repo_root, "orch_to_001")
+            for entry in doc.get("entries", []):
+                if entry.get("agent_run_id") == arid:
+                    entry["context_id"] = "explicit-isolated-context-id-XYZ"
+            (_session_run_index_path(repo_root, "orch_to_001")).write_text(
+                json.dumps(doc), encoding="utf-8"
+            )
+
+            self._deactivate(repo_root, arid)
+            result = record_timeout(
+                repo_root=repo_root,
+                orchestration_id="orch_to_001",
+                agent_run_id=arid,
+                reason="stream idle timeout",
+            )
+            self.assertEqual(result.get("context_id"), "explicit-isolated-context-id-XYZ",
+                             "context_id from session_run_index must be preserved, NOT replaced by agent_session_id")
+            self.assertEqual(result.get("parent_agent_run_id"), "orch_run_to_001",
+                             "parent_agent_run_id from launch request must be preserved")
+
+            # Verify the persisted entry on disk also has the right identity.
+            runs_path = repo_root / "workspace" / "orchestrations" / "orch_to_001" / "agent_runs.jsonl"
+            entries = [
+                json.loads(line)
+                for line in runs_path.read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+            timeout_entry = next((e for e in entries if e.get("agent_run_id") == arid), None)
+            self.assertIsNotNone(timeout_entry)
+            self.assertEqual(timeout_entry["context_id"], "explicit-isolated-context-id-XYZ")
+            self.assertEqual(timeout_entry["parent_agent_run_id"], "orch_run_to_001")
+
+    def test_record_agent_run_terminal_routes_through_ownership_guard(self) -> None:
+        """Adv-7 end-to-end: the cleanup at end of record_agent_run must go
+        through _cleanup_agent_tmp_root (with symlink refusal etc.), NOT a raw
+        unconditional shutil.rmtree.
+
+        Verified by setting up a symlinked tmp dir at workspace/tmp/<arid>/
+        pointing OUTSIDE the repo. The helper refuses to follow symlinks. If
+        the legacy raw rmtree were still in place (or were called instead of
+        the helper), the symlink target's contents would be deleted.
+        """
+        import os
+        with tempfile.TemporaryDirectory() as repo_tmp, tempfile.TemporaryDirectory() as ext_tmp:
+            repo_root = Path(repo_tmp)
+            arid = self._setup_substep_launch(repo_root)
+            workspace_tmp = repo_root / "workspace" / "tmp"
+            workspace_tmp.mkdir(parents=True, exist_ok=True)
+            # external dir lives OUTSIDE repo_root so that record-timeout's
+            # workspace-diff check does not flag it as an unauthorized write.
+            external = Path(ext_tmp) / "external_real_dir"
+            external.mkdir()
+            sentinel = external / "must_not_delete.txt"
+            sentinel.write_text("preserve\n", encoding="utf-8")
+            link_path = workspace_tmp / arid
+            # record_launch pre-creates workspace/tmp/<arid>/ as a real dir
+            # (see build_bwrap_profile). Replace it with a symlink so cleanup
+            # is exercised against a symlink target.
+            if link_path.is_dir() and not link_path.is_symlink():
+                import shutil as _sh
+                _sh.rmtree(link_path)
+            try:
+                os.symlink(external, link_path)
+            except OSError:
+                self.skipTest("symlink not supported on this filesystem")
+
+            self._deactivate(repo_root, arid)
+            record_timeout(
+                repo_root=repo_root,
+                orchestration_id="orch_to_001",
+                agent_run_id=arid,
+                reason="stream idle timeout",
+            )
+
+            self.assertTrue(
+                sentinel.exists(),
+                "symlink target contents must NOT be deleted — proves cleanup "
+                "routed through _cleanup_agent_tmp_root (which refuses symlinks) "
+                "rather than the legacy raw shutil.rmtree.",
+            )
+
+    def test_runs_jsonl_exclusive_lock_helper_is_cross_process_exclusive(self) -> None:
+        """NEW-L1: Verify that the production wrapper
+        `_runs_jsonl_exclusive_lock` (not `fcntl.flock` directly) honors
+        cross-process exclusion. This catches regressions where a refactor
+        opens the wrong lock path or releases early."""
+        import multiprocessing as _mp
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            orch_id = "orch_xprocess_helper"
+            (repo_root / "workspace" / "orchestrations" / orch_id).mkdir(parents=True, exist_ok=True)
+            barrier = _mp.Barrier(2)
+            results = _mp.Queue()
+
+            def _worker(rr: str, oid: str, b, q):
+                import sys as _sys
+                _sys.path.insert(0, "/home/seiya/work/met-dsl")
+                from tools.orchestration_runtime import _runs_jsonl_exclusive_lock
+                import time as _time
+                from pathlib import Path as _P
+                b.wait(timeout=10)
+                # Try to acquire the helper non-blocking by racing both at
+                # the same instant. The runtime helper uses LOCK_EX
+                # (blocking), so we time-box one worker holding the lock
+                # and assert the other observes ordered serialization.
+                acquired_at = _time.monotonic()
+                with _runs_jsonl_exclusive_lock(_P(rr), oid):
+                    enter = _time.monotonic()
+                    _time.sleep(0.3)
+                    exit_t = _time.monotonic()
+                q.put((enter - acquired_at, exit_t - enter))
+
+            ctx = _mp.get_context("fork")
+            p1 = ctx.Process(target=_worker, args=(str(repo_root), orch_id, barrier, results))
+            p2 = ctx.Process(target=_worker, args=(str(repo_root), orch_id, barrier, results))
+            p1.start(); p2.start()
+            p1.join(timeout=15); p2.join(timeout=15)
+            self.assertFalse(p1.is_alive() or p2.is_alive(), "workers must complete")
+            outcomes = []
+            while not results.empty():
+                outcomes.append(results.get_nowait())
+            outcomes.sort()
+            # First acquirer enters near 0; second waits ~0.3s for first.
+            # Both hold for ~0.3s. If the helper failed to serialize, both
+            # would enter near 0.
+            self.assertEqual(len(outcomes), 2)
+            wait_a, hold_a = outcomes[0]
+            wait_b, hold_b = outcomes[1]
+            self.assertLess(wait_a, 0.15,
+                            f"first acquirer should enter quickly (got {wait_a}s)")
+            self.assertGreater(wait_b, 0.15,
+                               f"second acquirer must wait for first to release "
+                               f"(got {wait_b}s — helper likely not serializing)")
+
+    def test_runs_jsonl_lock_is_cross_process_exclusive(self) -> None:
+        """L5: the fcntl LOCK_EX on agent_runs.jsonl.lock is honored across
+        OS processes (not just same-process semantics). Two child processes
+        that both attempt to acquire LOCK_EX | LOCK_NB on the same lock
+        file must observe contention — exactly one acquires at a time.
+        Validates that the Adv-24 serialization story holds for real
+        concurrent finalizers, not just intra-process locking."""
+        import multiprocessing as _mp
+        from tools.orchestration_runtime import _runs_jsonl_lock_path
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            orch_id = "orch_xprocess"
+            (repo_root / "workspace" / "orchestrations" / orch_id).mkdir(parents=True, exist_ok=True)
+            lock_path = _runs_jsonl_lock_path(repo_root, orch_id)
+            lock_path.parent.mkdir(parents=True, exist_ok=True)
+            lock_path.touch()
+
+            barrier = _mp.Barrier(2)
+            results = _mp.Queue()
+
+            def _worker(lp: str, b, q):
+                import os as _os
+                import fcntl as _fcntl
+                fd = _os.open(lp, _os.O_WRONLY)
+                try:
+                    b.wait(timeout=10)
+                    try:
+                        _fcntl.flock(fd, _fcntl.LOCK_EX | _fcntl.LOCK_NB)
+                        # Hold briefly then release.
+                        import time as _time
+                        _time.sleep(0.2)
+                        try:
+                            _fcntl.flock(fd, _fcntl.LOCK_UN)
+                        except OSError:
+                            pass
+                        q.put("acquired")
+                    except OSError:
+                        q.put("contended")
+                finally:
+                    _os.close(fd)
+
+            ctx = _mp.get_context("fork")
+            p1 = ctx.Process(target=_worker, args=(str(lock_path), barrier, results))
+            p2 = ctx.Process(target=_worker, args=(str(lock_path), barrier, results))
+            p1.start(); p2.start()
+            p1.join(timeout=15); p2.join(timeout=15)
+            self.assertFalse(p1.is_alive() or p2.is_alive(), "workers must complete")
+            outcomes = []
+            while not results.empty():
+                outcomes.append(results.get_nowait())
+            outcomes.sort()
+            # Exactly one acquires; one observes contention. Serialization holds.
+            self.assertEqual(outcomes, ["acquired", "contended"],
+                             f"cross-process LOCK_EX must serialize: got {outcomes}")
+
+    def test_read_existing_run_ids_tolerates_partial_tail_when_writer_active(self) -> None:
+        """Adv-21+Adv-40: while a writer holds the runs lock, a truncated
+        trailing line is treated as in-flight append and tolerated.
+        Exercised directly on `_read_existing_run_ids` (not record_timeout)
+        because record_agent_run's own LOCK_EX would deadlock against a
+        same-process holder."""
+        import os as _os
+        import fcntl as _fcntl
+        from tools.orchestration_runtime import _read_existing_run_ids
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            orch_dir = repo_root / "workspace" / "orchestrations" / "lockheld"
+            orch_dir.mkdir(parents=True, exist_ok=True)
+            runs_path = orch_dir / "agent_runs.jsonl"
+            lock_path = orch_dir / "agent_runs.jsonl.lock"
+            runs_path.write_text(
+                json.dumps({"agent_run_id": "ok", "status": "pass"}) + "\n"
+                + '{"agent_run_id": "in-flight", "status": "passi',
+                encoding="utf-8",
+            )
+
+            fd = _os.open(str(lock_path), _os.O_WRONLY | _os.O_CREAT, 0o600)
+            try:
+                _fcntl.flock(fd, _fcntl.LOCK_EX)
+                # Lock held → reader must tolerate the partial trailing line.
+                ids = _read_existing_run_ids(runs_path)
+                self.assertEqual(ids, {"ok"})
+            finally:
+                try:
+                    _fcntl.flock(fd, _fcntl.LOCK_UN)
+                finally:
+                    _os.close(fd)
+
+    def test_read_existing_run_ids_self_locked_raises_on_durable_corruption(self) -> None:
+        """NEW-H1: when the caller already holds the runs lock, the
+        writer-active probe would self-contend and falsely report 'in
+        flight'. The caller_holds_lock=True flag forces every malformed
+        line to surface as durable corruption — even though the lock IS
+        held (by the caller themselves)."""
+        from tools.orchestration_runtime import _read_existing_run_ids
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            runs = repo_root / "workspace" / "orchestrations" / "x" / "agent_runs.jsonl"
+            runs.parent.mkdir(parents=True, exist_ok=True)
+            lock_path = runs.parent / "agent_runs.jsonl.lock"
+            lock_path.touch()
+            runs.write_text(
+                json.dumps({"agent_run_id": "a", "status": "pass"}) + "\n"
+                + '{"agent_run_id": "broken-tail',
+                encoding="utf-8",
+            )
+
+            # Without the flag (and with lock file present), the writer-active
+            # probe in another process scenario would see no contention if
+            # we don't hold the lock — but the spec requires `caller_holds_lock`
+            # to force-raise. Here we simulate the locked re-check from
+            # inside the lock holder, which must surface durable corruption.
+            with self.assertRaisesRegex(RuntimeError, "no active writer detected"):
+                _read_existing_run_ids(runs, caller_holds_lock=True)
+
+    def test_read_existing_run_ids_raises_on_durable_corruption_when_no_writer(self) -> None:
+        """Adv-40: a malformed trailing line WITHOUT an active writer is
+        durable corruption — must surface as RuntimeError so the caller
+        can quarantine the ledger rather than silently appending a
+        duplicate terminal entry on top of corrupted state."""
+        from tools.orchestration_runtime import _read_existing_run_ids
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            runs = repo_root / "workspace" / "orchestrations" / "x" / "agent_runs.jsonl"
+            runs.parent.mkdir(parents=True, exist_ok=True)
+            runs.write_text(
+                json.dumps({"agent_run_id": "a", "status": "pass"}) + "\n"
+                + '{"agent_run_id": "broken-tail',  # truncated
+                encoding="utf-8",
+            )
+            # No lock file → no writer → tail is durable corruption.
+            with self.assertRaisesRegex(RuntimeError, "no active writer detected"):
+                _read_existing_run_ids(runs)
+
+    def test_write_json_is_atomic_no_partial_observation(self) -> None:
+        """Adv-27: _write_json must use temp-file + rename so concurrent
+        readers cannot observe an empty / truncated state. Verified by
+        snapshotting the file's content and existence at every write step
+        via a patched os.replace that takes a pre-rename snapshot."""
+        from tools.orchestration_runtime import _write_json
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "subdir" / "meta.json"
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(json.dumps({"version": 1}), encoding="utf-8")
+
+            observed_during_replace: list[str] = []
+
+            real_replace = os.replace
+
+            def _spying_replace(src, dst):
+                # At this moment src is the temp file with full new content;
+                # dst (the canonical path) still holds the OLD content.
+                # A reader landing here must NOT see empty/partial state.
+                try:
+                    observed_during_replace.append(Path(dst).read_text(encoding="utf-8"))
+                except OSError:
+                    observed_during_replace.append("__OSERROR__")
+                return real_replace(src, dst)
+
+            from unittest.mock import patch as _mp
+            with _mp("tools.orchestration_runtime.os.replace", side_effect=_spying_replace):
+                _write_json(target, {"version": 2, "deep": {"k": "v" * 1000}})
+
+            self.assertEqual(len(observed_during_replace), 1)
+            mid_write_view = observed_during_replace[0]
+            self.assertEqual(
+                mid_write_view, json.dumps({"version": 1}),
+                "concurrent reader must observe the OLD complete content, never empty/partial",
+            )
+            # Final state is the new content.
+            final = json.loads(target.read_text(encoding="utf-8"))
+            self.assertEqual(final["version"], 2)
+
+    def test_record_agent_run_running_status_does_not_wipe_orch_tmp(self) -> None:
+        """Adv-25: record_agent_run for status='running' (init_orchestration's
+        seed entry pattern) must NOT wipe workspace/tmp/<orch_arid>/.
+        Cleanup is only legitimate for terminal-status entries."""
+        from tools.orchestration_runtime import (
+            init_orchestration, record_agent_run,
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            init_orchestration(repo_root=repo_root, orchestration_id="orch_running_seed")
+            meta_path = (
+                repo_root / "workspace" / "orchestrations" / "orch_running_seed"
+                / "orchestration_meta.json"
+            )
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            orch_arid = meta["orchestration_agent_run_id"]
+            tmp_dir = repo_root / "workspace" / "tmp" / orch_arid
+            self.assertTrue(tmp_dir.is_dir(), "init_orchestration must create the orch tmp dir")
+            # Drop a sanctioned helper into the orch tmp; subsequent
+            # record_agent_run(status='running') must not delete it.
+            sentinel = tmp_dir / "subsequent_helper.py"
+            sentinel.write_text("print('helper')\n", encoding="utf-8")
+
+            # init_orchestration already writes one running entry; record a
+            # second non-terminal entry to exercise the cleanup-gate path.
+            # (Use a fresh arid to avoid the duplicate guard.)
+            record_agent_run(
+                repo_root=repo_root,
+                orchestration_id="orch_running_seed",
+                payload={
+                    "agent_run_id": "second-running-arid",
+                    "agent_role": "orchestration",
+                    "agent_backend": "claude",
+                    "status": "running",
+                    "started_at": "2026-05-09T10:00:00Z",
+                    "result_summary": "ongoing",
+                },
+            )
+            self.assertTrue(
+                sentinel.exists(),
+                "non-terminal record_agent_run must NOT clean orch tmp scratch",
+            )
+            self.assertTrue(tmp_dir.is_dir())
+
+    def _make_launch_request(self, repo_root: Path, orch_id: str, arid: str) -> None:
+        d = repo_root / "workspace" / "orchestrations" / orch_id / "launches"
+        d.mkdir(parents=True, exist_ok=True)
+        (d / f"{arid}.request.json").write_text(
+            json.dumps({"agent_run_id": arid}), encoding="utf-8"
+        )
+
+    def test_cleanup_committed_marker_not_written_when_cleanup_refused(self) -> None:
+        """Adv-36: ownership/collision refusal must NOT yield a committed
+        marker. The Adv-35 invariant requires committed = "actual cleanup
+        succeeded (or already absent)" — a refused cleanup leaving leftover
+        scratch must keep validator exemption alive."""
+        from tools.orchestration_runtime import (
+            _cleanup_agent_tmp_root, _cleanup_committed_marker_path,
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            arid = "intruder-arid"
+            # Owner orch has the launch record; intruder does NOT.
+            self._make_launch_request(repo_root, "orch_owner", arid)
+            tmp_dir = repo_root / "workspace" / "tmp" / arid
+            tmp_dir.mkdir(parents=True, exist_ok=True)
+            (tmp_dir / "owner_data.txt").write_text("preserve\n", encoding="utf-8")
+
+            # Caller is intruder — cleanup must REFUSE and return False.
+            result = _cleanup_agent_tmp_root(
+                repo_root, "orch_intruder", agent_run_id=arid,
+            )
+            self.assertFalse(result, "intruder cleanup must return False")
+            self.assertTrue(tmp_dir.exists(), "owner data must survive")
+            self.assertFalse(
+                _cleanup_committed_marker_path(repo_root, "orch_intruder", arid).is_file(),
+                "no committed marker should exist for refused cleanup",
+            )
+
+    def test_cleanup_returns_true_when_tmp_already_absent(self) -> None:
+        """Adv-36 corollary: if the tmp dir was already absent (e.g. cleaned
+        by a prior run), the function returns True so the committed marker
+        can be written — there is nothing to clean."""
+        from tools.orchestration_runtime import _cleanup_agent_tmp_root
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            arid = "already-clean-arid"
+            self._make_launch_request(repo_root, "orch_x", arid)
+            # Note: no workspace/tmp/<arid>/ created.
+            result = _cleanup_agent_tmp_root(
+                repo_root, "orch_x", agent_run_id=arid,
+            )
+            self.assertTrue(result, "absent tmp must return True (cleanup trivially complete)")
+
+    def test_record_agent_run_success_path_does_not_pre_clean_tmp(self) -> None:
+        """NEW-M2: cleanup must NOT happen during _validate_terminal_run_payload's
+        success path. A crash between the early cleanup and the durable
+        runs.jsonl append would leave the run with neither scratch nor
+        terminal entry — defeating Adv-35 two-phase commit."""
+        from unittest.mock import patch as _mp
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            arid = self._setup_substep_launch(repo_root)
+            self._deactivate(repo_root, arid)
+            tmp_dir = repo_root / "workspace" / "tmp" / arid
+            tmp_dir.mkdir(parents=True, exist_ok=True)
+            (tmp_dir / "scratch.py").write_text("print('s')\n", encoding="utf-8")
+
+            tmp_present_at_lock_release: list[bool] = []
+
+            from tools import orchestration_runtime as _rt
+            real_validate = _rt._validate_terminal_run_payload
+
+            def _spying_validate(repo_root, orch_id, payload, *, caller_holds_lock=False):
+                # Run the real validator (success path) and snapshot tmp
+                # presence immediately after — before the runs.jsonl append.
+                real_validate(
+                    repo_root, orch_id, payload, caller_holds_lock=caller_holds_lock
+                )
+                tmp_present_at_lock_release.append(tmp_dir.exists())
+
+            with _mp.object(_rt, "_validate_terminal_run_payload", _spying_validate):
+                record_timeout(
+                    repo_root=repo_root,
+                    orchestration_id="orch_to_001",
+                    agent_run_id=arid,
+                    reason="NEW-M2 deferred-cleanup test",
+                )
+            self.assertTrue(tmp_present_at_lock_release,
+                            "spy must have observed validation completion")
+            self.assertTrue(
+                tmp_present_at_lock_release[-1],
+                "tmp dir must STILL EXIST after _validate_terminal_run_payload — "
+                "cleanup is deferred to post-append per NEW-M2",
+            )
+            # Final state: cleanup ran AFTER the locked append → tmp gone.
+            self.assertFalse(tmp_dir.exists())
+
+    def test_record_agent_run_partial_failure_preserves_tmp_for_recovery(self) -> None:
+        """Adv-35 partial-failure invariant: if the terminal append succeeds
+        but cleanup fails (or process dies between append and cleanup), the
+        validator MUST keep workspace/tmp/<arid>/ exempt until the
+        cleanup_committed marker is eventually written. Otherwise scratch
+        needed for forensics / retry would be silently flagged."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            arid = self._setup_substep_launch(repo_root)
+            self._deactivate(repo_root, arid)
+            tmp_dir = repo_root / "workspace" / "tmp" / arid
+            tmp_dir.mkdir(parents=True, exist_ok=True)
+            recovery_helper = tmp_dir / "recovery.py"
+            recovery_helper.write_text("print('preserve me')\n", encoding="utf-8")
+
+            # Manually simulate the exact partial-failure window: terminal
+            # entry written, cleanup NOT performed, no committed marker.
+            runs_path = (
+                repo_root / "workspace" / "orchestrations" / "orch_to_001"
+                / "agent_runs.jsonl"
+            )
+            with runs_path.open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps({
+                    "agent_run_id": arid,
+                    "agent_role": "substep",
+                    "agent_backend": "claude",
+                    "status": "timeout",
+                    "started_at": "2026-05-09T08:00:00Z",
+                    "finished_at": "2026-05-09T09:00:00Z",
+                }) + "\n")
+            # Crucially: no cleanup, no commit marker, tmp dir intact.
+            self.assertTrue(recovery_helper.exists())
+
+            # validate_workspace_root must NOT flag the recovery helper.
+            from tools.validate_workspace_root import validate as _validate
+            violations, _ = _validate(repo_root=repo_root, workspace_root="workspace")
+            self.assertFalse(
+                any(str(recovery_helper) in v for v in violations),
+                f"Adv-35: cleanup_committed missing → exemption stays alive: {violations}",
+            )
+
+    def test_record_agent_run_terminal_writes_cleanup_committed_marker(self) -> None:
+        """Adv-35 invariant: a successful terminal record_agent_run must
+        produce all three durable artifacts:
+          (1) terminal entry in agent_runs.jsonl,
+          (2) workspace/tmp/<arid>/ cleaned,
+          (3) cleanup_committed/<arid>.json marker written.
+        The validator's exemption-revoke decision depends on (1)+(3); the
+        marker's absence keeps exemption alive as cleanup-pending."""
+        from tools.orchestration_runtime import _cleanup_committed_marker_path
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            arid = self._setup_substep_launch(repo_root)
+            self._deactivate(repo_root, arid)
+            tmp_dir = repo_root / "workspace" / "tmp" / arid
+            tmp_dir.mkdir(parents=True, exist_ok=True)
+            (tmp_dir / "scratch.py").write_text("print('s')\n", encoding="utf-8")
+
+            record_timeout(
+                repo_root=repo_root,
+                orchestration_id="orch_to_001",
+                agent_run_id=arid,
+                reason="two-phase invariant test",
+            )
+
+            runs_path = (
+                repo_root / "workspace" / "orchestrations" / "orch_to_001"
+                / "agent_runs.jsonl"
+            )
+            entries = [
+                json.loads(line) for line in runs_path.read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+            arid_entries = [e for e in entries if e.get("agent_run_id") == arid]
+            self.assertEqual(len(arid_entries), 1, "exactly one terminal entry expected")
+            self.assertEqual(arid_entries[0]["status"], "timeout")
+            self.assertFalse(tmp_dir.exists(), "tmp dir must be cleaned")
+            committed = _cleanup_committed_marker_path(repo_root, "orch_to_001", arid)
+            self.assertTrue(
+                committed.is_file(),
+                "cleanup_committed marker must be written after cleanup",
+            )
+
+    def test_session_id_helper_failure_records_specific_fail_reason(self) -> None:
+        """L-NEW-2: M-FOURTH-1 introduced a pre-set sandbox_fail_reason
+        before _validate_response_agent_session_id so the helper's
+        ValueError records as 'launch_response_session_id_invalid' rather
+        than the generic 'terminal_payload_validation_error'. This regression
+        test pins that behavior."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            arid = self._setup_substep_launch(repo_root)
+            # Corrupt the launch response so _validate_response_agent_session_id
+            # raises (placeholder token).
+            resp_path = (
+                repo_root / "workspace" / "orchestrations" / "orch_to_001"
+                / "launches" / f"{arid}.response.json"
+            )
+            resp = json.loads(resp_path.read_text(encoding="utf-8"))
+            resp["agent_session_id"] = "<placeholder>"
+            resp_path.write_text(json.dumps(resp), encoding="utf-8")
+
+            with self.assertRaises(ValueError):
+                record_agent_run(
+                    repo_root=repo_root,
+                    orchestration_id="orch_to_001",
+                    payload={
+                        "agent_run_id": arid,
+                        "agent_role": "substep",
+                        "agent_backend": "claude",
+                        "status": "pass",
+                        "started_at": "2026-05-09T08:00:00Z",
+                        "finished_at": "2026-05-09T09:00:00Z",
+                        "agent_session_id": arid,
+                        "context_id": arid,
+                        "context_isolated": True,
+                        "node_key": "problem/shallow_water2d@0.3.0",
+                        "step": "generate",
+                        "substep": "generate",
+                        "result_summary": "should fail session_id check",
+                        "output_refs": [
+                            "workspace/pipelines/problem__shallow_water2d__0.3.0/"
+                            "shallow-water2d_20260415_001/generate/gen_001/"
+                            "generate_meta.json"
+                        ],
+                    },
+                )
+            invalid_path = (
+                repo_root / "workspace" / "orchestrations" / "orch_to_001"
+                / "agent_runs_invalid.jsonl"
+            )
+            entries = [
+                json.loads(line) for line in invalid_path.read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+            arid_entries = [e for e in entries if e.get("agent_run_id") == arid]
+            self.assertEqual(len(arid_entries), 1)
+            self.assertEqual(
+                arid_entries[0].get("fail_reason"), "launch_response_session_id_invalid",
+                f"specific session_id reason expected, got {arid_entries[0]}",
+            )
+
+    def test_sandbox_violation_records_specific_fail_reason(self) -> None:
+        """L-NEW-1: when record_agent_run raises due to a sandbox violation
+        (sandbox_runtime != bwrap, etc.), the agent_runs_invalid.jsonl entry
+        must record the specific reason rather than a generic
+        'terminal_payload_validation_error'."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            arid = self._setup_substep_launch(repo_root)
+            # Fixture sets sandbox_runtime=bwrap; corrupt it to trigger the
+            # sandbox_runtime_not_bwrap branch.
+            resp_path = (
+                repo_root / "workspace" / "orchestrations" / "orch_to_001"
+                / "launches" / f"{arid}.response.json"
+            )
+            resp = json.loads(resp_path.read_text(encoding="utf-8"))
+            resp["sandbox_runtime"] = "wrong-runtime"
+            resp_path.write_text(json.dumps(resp), encoding="utf-8")
+
+            with self.assertRaises(ValueError):
+                record_agent_run(
+                    repo_root=repo_root,
+                    orchestration_id="orch_to_001",
+                    payload={
+                        "agent_run_id": arid,
+                        "agent_role": "substep",
+                        "agent_backend": "claude",
+                        "status": "pass",
+                        "started_at": "2026-05-09T08:00:00Z",
+                        "finished_at": "2026-05-09T09:00:00Z",
+                        "agent_session_id": arid,
+                        "context_id": arid,
+                        "context_isolated": True,
+                        "node_key": "problem/shallow_water2d@0.3.0",
+                        "step": "generate",
+                        "substep": "generate",
+                        "result_summary": "should fail sandbox check",
+                        "output_refs": [
+                            "workspace/pipelines/problem__shallow_water2d__0.3.0/"
+                            "shallow-water2d_20260415_001/generate/gen_001/"
+                            "generate_meta.json"
+                        ],
+                    },
+                )
+            invalid_path = (
+                repo_root / "workspace" / "orchestrations" / "orch_to_001"
+                / "agent_runs_invalid.jsonl"
+            )
+            self.assertTrue(invalid_path.is_file())
+            entries = [
+                json.loads(line) for line in invalid_path.read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+            arid_entries = [e for e in entries if e.get("agent_run_id") == arid]
+            self.assertEqual(len(arid_entries), 1)
+            self.assertEqual(
+                arid_entries[0].get("fail_reason"), "sandbox_runtime_not_bwrap",
+                f"specific sandbox reason expected, got {arid_entries[0]}",
+            )
+            self.assertIn("fail_message", arid_entries[0])
+
+    def test_record_agent_run_locked_recheck_catches_concurrent_duplicate(self) -> None:
+        """Adv-24: under fcntl serialization, even if the unlocked early
+        duplicate check misses an in-flight write, the locked re-check
+        immediately before the append must catch it and raise — preventing
+        two terminal entries for the same arid."""
+        from tools.orchestration_runtime import (
+            _runs_jsonl_exclusive_lock, record_agent_run,
+            _read_existing_run_ids,
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            arid = self._setup_substep_launch(repo_root)
+            self._deactivate(repo_root, arid)
+
+            # Pre-seed agent_runs.jsonl with a terminal entry written DIRECTLY
+            # (bypassing record_agent_run's early check) to simulate the case
+            # where another process appended between the unlocked early read
+            # and the locked re-check. The locked re-check must observe it.
+            runs_path = (
+                repo_root / "workspace" / "orchestrations" / "orch_to_001"
+                / "agent_runs.jsonl"
+            )
+
+            # Hijack the early check to return an empty set (simulating the
+            # race where the early read landed before the in-flight write).
+            from unittest.mock import patch as _mp
+            real_read = _read_existing_run_ids
+            call_count = {"n": 0}
+
+            def _patched(path, *, caller_holds_lock: bool = False):
+                call_count["n"] += 1
+                if call_count["n"] == 1:
+                    return set()  # early check sees nothing
+                # Locked re-check: insert the racing entry mid-flight
+                with runs_path.open("a", encoding="utf-8") as fh:
+                    fh.write(json.dumps({"agent_run_id": arid, "status": "pass"}) + "\n")
+                return real_read(path, caller_holds_lock=caller_holds_lock)
+
+            with _mp("tools.orchestration_runtime._read_existing_run_ids", side_effect=_patched):
+                with self.assertRaisesRegex(ValueError, "race detected on locked re-check"):
+                    record_agent_run(
+                        repo_root=repo_root,
+                        orchestration_id="orch_to_001",
+                        payload={
+                            "agent_run_id": arid,
+                            "agent_role": "substep",
+                            "agent_backend": "claude",
+                            "status": "timeout",
+                            "started_at": "2026-05-09T08:00:00Z",
+                            "finished_at": "2026-05-09T09:00:00Z",
+                            "agent_session_id": arid,
+                            "context_id": arid,
+                            "context_isolated": True,
+                            "node_key": "problem/shallow_water2d@0.3.0",
+                            "step": "generate",
+                            "substep": "generate",
+                            "result_summary": "timeout: race",
+                        },
+                    )
+            # Verify only the racing-winner entry exists; race-loser did not append.
+            entries = [
+                json.loads(line) for line in runs_path.read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+            arid_entries = [e for e in entries if e.get("agent_run_id") == arid]
+            self.assertEqual(len(arid_entries), 1,
+                             f"locked re-check must prevent duplicate append; got {arid_entries}")
+            self.assertEqual(arid_entries[0]["status"], "pass",
+                             "the racing-winner's entry is preserved; the timeout race-loser is rejected")
+
+    def test_record_existing_run_ids_raises_on_durable_corruption(self) -> None:
+        """Adv-21: a malformed NON-TRAILING line is durable corruption and
+        must raise a controlled RuntimeError (not silently skipped)."""
+        from tools.orchestration_runtime import _read_existing_run_ids
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            runs = repo_root / "workspace" / "orchestrations" / "x" / "agent_runs.jsonl"
+            runs.parent.mkdir(parents=True, exist_ok=True)
+            runs.write_text(
+                json.dumps({"agent_run_id": "a", "status": "pass"}) + "\n"
+                + 'this line is broken\n'
+                + json.dumps({"agent_run_id": "b", "status": "pass"}) + "\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(RuntimeError, "malformed non-trailing JSON"):
+                _read_existing_run_ids(runs)
+
+    def test_record_timeout_refuses_when_arid_already_in_agent_runs_jsonl(self) -> None:
+        """Adv-14: a duplicate timeout call (e.g. retry / delayed callback)
+        must not fabricate a second terminal record nor wipe scratch — refuse
+        if any entry for arid already exists in agent_runs.jsonl."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            arid = self._setup_substep_launch(repo_root)
+            # Pre-seed the runs ledger with an arbitrary entry for the same arid
+            # (the actual content doesn't matter — duplicate detection is on id).
+            runs_path = (
+                repo_root / "workspace" / "orchestrations" / "orch_to_001"
+                / "agent_runs.jsonl"
+            )
+            with runs_path.open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps({"agent_run_id": arid, "status": "running"}) + "\n")
+
+            with self.assertRaisesRegex(ValueError, "already has a durable entry"):
+                record_timeout(
+                    repo_root=repo_root,
+                    orchestration_id="orch_to_001",
+                    agent_run_id=arid,
+                    reason="duplicate timer",
+                )
+
+    def test_record_timeout_refuses_when_session_run_index_status_not_running(self) -> None:
+        """Adv-14: refuse if session_run_index already shows the run as
+        terminal — another finalization path won the race."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            arid = self._setup_substep_launch(repo_root)
+            from tools.orchestration_runtime import (
+                _read_session_run_index, _session_run_index_path,
+            )
+            doc = _read_session_run_index(repo_root, "orch_to_001")
+            for entry in doc.get("entries", []):
+                if entry.get("agent_run_id") == arid:
+                    entry["status"] = "pass"  # simulate prior terminal record
+            (_session_run_index_path(repo_root, "orch_to_001")).write_text(
+                json.dumps(doc), encoding="utf-8"
+            )
+
+            with self.assertRaisesRegex(ValueError, "session_run_index.*not 'running'"):
+                record_timeout(
+                    repo_root=repo_root,
+                    orchestration_id="orch_to_001",
+                    agent_run_id=arid,
+                    reason="late callback",
+                )
+
+    def test_record_timeout_refuses_when_active_child_marker_still_set(self) -> None:
+        """Adv-14 + Adv-16: refuse if backend-neutral per-arid marker
+        active_children/<arid>.txt still exists. The orchestration must call
+        deactivate-child first (signaling that the Agent tool actually
+        returned) before record-timeout can run, regardless of backend."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            arid = self._setup_substep_launch(repo_root)
+            from tools.orchestration_runtime import (
+                _active_child_agent_run_id_path,
+                _active_child_marker_path,
+            )
+            # The fixture (claude backend) produces both markers.
+            self.assertTrue(_active_child_agent_run_id_path(repo_root, "orch_to_001").is_file())
+            self.assertTrue(_active_child_marker_path(repo_root, "orch_to_001", arid).is_file())
+
+            with self.assertRaisesRegex(ValueError, "active-child marker .* still exists"):
+                record_timeout(
+                    repo_root=repo_root,
+                    orchestration_id="orch_to_001",
+                    agent_run_id=arid,
+                    reason="early fire",
+                )
+
+    def test_record_timeout_refuses_for_codex_backend_when_marker_present(self) -> None:
+        """Adv-16: backend-neutral guard. Codex/Cursor never had the legacy
+        single-file Claude marker, so the per-arid marker is the only
+        liveness handshake protecting them from delayed/duplicated timeouts.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            arid = self._setup_substep_launch(repo_root)
+            # Force the launch response into a non-Claude backend so the
+            # legacy single-file Claude marker is bypassed and only the new
+            # per-arid marker remains as protection.
+            resp_path = (
+                repo_root / "workspace" / "orchestrations" / "orch_to_001"
+                / "launches" / f"{arid}.response.json"
+            )
+            resp = json.loads(resp_path.read_text(encoding="utf-8"))
+            resp["backend"] = "codex"
+            resp_path.write_text(json.dumps(resp), encoding="utf-8")
+            from tools.orchestration_runtime import (
+                _active_child_agent_run_id_path,
+                _active_child_marker_path,
+            )
+            # Remove Claude legacy marker so the per-arid marker is the sole
+            # remaining defense (mirrors how a real Codex run would look —
+            # record_launch never writes it for non-Claude backends).
+            _active_child_agent_run_id_path(repo_root, "orch_to_001").unlink(missing_ok=True)
+            self.assertTrue(_active_child_marker_path(repo_root, "orch_to_001", arid).is_file(),
+                            "per-arid marker must exist for the protection to be testable")
+
+            with self.assertRaisesRegex(ValueError, "active-child marker .* still exists"):
+                record_timeout(
+                    repo_root=repo_root,
+                    orchestration_id="orch_to_001",
+                    agent_run_id=arid,
+                    reason="codex delayed callback",
+                )
+
+    def test_deactivate_child_validates_before_unlinking_per_arid_marker(self) -> None:
+        """Adv-18: a stray deactivate-child for a non-active arid must NOT
+        clear the per-arid marker. Otherwise it could unlock record-timeout
+        for a still-running child by removing its liveness guard."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            real_arid = self._setup_substep_launch(repo_root)
+            # Mismatched deactivate (Claude single-marker mismatch) must
+            # raise BEFORE clearing per-arid marker.
+            from tools.orchestration_runtime import (
+                deactivate_child_agent, _active_child_marker_path,
+            )
+            real_marker = _active_child_marker_path(repo_root, "orch_to_001", real_arid)
+            self.assertTrue(real_marker.is_file())
+            with self.assertRaisesRegex(ValueError, "active child run mismatch"):
+                deactivate_child_agent(
+                    repo_root=repo_root,
+                    orchestration_id="orch_to_001",
+                    child_run_id="other-arid-typo",
+                )
+            # The legitimate live arid's marker survives the failed call.
+            self.assertTrue(
+                real_marker.is_file(),
+                "stray deactivate-child must NOT remove the live child's marker",
+            )
+            # And record-timeout for the live arid is still blocked.
+            with self.assertRaisesRegex(ValueError, "active-child marker .* still exists"):
+                record_timeout(
+                    repo_root=repo_root,
+                    orchestration_id="orch_to_001",
+                    agent_run_id=real_arid,
+                    reason="should be blocked",
+                )
+
+    def test_deactivate_child_idempotent_when_no_markers(self) -> None:
+        """Adv-18: a second deactivate-child after both markers gone returns
+        already_inactive=True without raising."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            arid = self._setup_substep_launch(repo_root)
+            from tools.orchestration_runtime import (
+                deactivate_child_agent, record_child_return,
+                _parent_return_token_path,
+            )
+            token = _parent_return_token_path(
+                repo_root, "orch_to_001", arid
+            ).read_text(encoding="utf-8").strip()
+            record_child_return(
+                repo_root=repo_root, orchestration_id="orch_to_001",
+                agent_run_id=arid, return_token=token,
+            )
+            r1 = deactivate_child_agent(
+                repo_root=repo_root, orchestration_id="orch_to_001", child_run_id=arid,
+            )
+            self.assertFalse(r1.get("already_inactive"))
+            r2 = deactivate_child_agent(
+                repo_root=repo_root, orchestration_id="orch_to_001", child_run_id=arid,
+            )
+            self.assertTrue(r2.get("already_inactive"))
+
+    def test_deactivate_child_refuses_without_record_child_return(self) -> None:
+        """Adv-20: deactivate-child must require an explicit record-child-return
+        ack first. Without it, a misrouted deactivate-child cannot remove the
+        per-arid active marker that protects record-timeout."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            arid = self._setup_substep_launch(repo_root)
+            from tools.orchestration_runtime import (
+                deactivate_child_agent, _active_child_marker_path,
+            )
+            with self.assertRaisesRegex(ValueError, "child_returns/.* is missing"):
+                deactivate_child_agent(
+                    repo_root=repo_root,
+                    orchestration_id="orch_to_001",
+                    child_run_id=arid,
+                )
+            # Marker survives the failed call.
+            self.assertTrue(_active_child_marker_path(repo_root, "orch_to_001", arid).is_file())
+
+    def test_record_child_return_refuses_for_unlaunched_arid(self) -> None:
+        """Adv-20: record-child-return must prove the arid was actually
+        launched (active_children marker exists). Otherwise a misrouted call
+        could pre-issue an ack for an arbitrary arid and unlock a future
+        deactivate-child for it."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._setup_substep_launch(repo_root)
+            from tools.orchestration_runtime import record_child_return
+            with self.assertRaisesRegex(ValueError, "no active_children/.* marker"):
+                record_child_return(
+                    repo_root=repo_root,
+                    orchestration_id="orch_to_001",
+                    agent_run_id="never-launched-arid",
+                    return_token="any-token",
+                )
+
+    def test_record_child_return_refuses_with_wrong_token(self) -> None:
+        """Adv-30: a caller that does not know the per-arid parent return
+        token (stored at launches/<arid>.parent_return_token) must NOT be
+        able to forge an ack."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            arid = self._setup_substep_launch(repo_root)
+            from tools.orchestration_runtime import record_child_return
+            with self.assertRaisesRegex(ValueError, "return_token does not match"):
+                record_child_return(
+                    repo_root=repo_root,
+                    orchestration_id="orch_to_001",
+                    agent_run_id=arid,
+                    return_token="forged-token-attacker-guessed",
+                )
+
+    def test_deactivate_child_rejects_tampered_ack_file(self) -> None:
+        """Adv-30: even if the ack file exists, deactivate-child must verify
+        the embedded token matches the parent_return_token. A tampered ack
+        (without the secret token) cannot pass."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            arid = self._setup_substep_launch(repo_root)
+            from tools.orchestration_runtime import (
+                _child_return_marker_path, deactivate_child_agent,
+            )
+            # Manually fabricate an ack file with NO valid token.
+            ack = _child_return_marker_path(repo_root, "orch_to_001", arid)
+            ack.parent.mkdir(parents=True, exist_ok=True)
+            ack.write_text(
+                json.dumps({"agent_run_id": arid, "return_token": "fake"}),
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(ValueError, "valid parent return token"):
+                deactivate_child_agent(
+                    repo_root=repo_root,
+                    orchestration_id="orch_to_001",
+                    child_run_id=arid,
+                )
+
+    def test_deactivate_child_refuses_when_parent_return_token_missing(self) -> None:
+        """Adv-30 token-missing invariant: if the ack file exists but
+        launches/<arid>.parent_return_token is absent, deactivate-child must
+        refuse to clear liveness markers. record_child_return requires both
+        files together, so the token's absence indicates corruption or
+        tampering — silently bypassing token verification would let an
+        attacker forge an ack by deleting the token first."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            arid = self._setup_substep_launch(repo_root)
+            from tools.orchestration_runtime import (
+                _child_return_marker_path, _parent_return_token_path,
+                deactivate_child_agent, record_child_return,
+            )
+            # Legitimate record_child_return path first (uses real token).
+            token_path = _parent_return_token_path(
+                repo_root, "orch_to_001", arid
+            )
+            real_token = token_path.read_text(encoding="utf-8").strip()
+            record_child_return(
+                repo_root=repo_root,
+                orchestration_id="orch_to_001",
+                agent_run_id=arid,
+                return_token=real_token,
+            )
+            ack = _child_return_marker_path(repo_root, "orch_to_001", arid)
+            self.assertTrue(ack.is_file())
+            # Now simulate corruption: delete the parent_return_token sidecar
+            # while the ack still contains a (formerly valid) token.
+            token_path.unlink()
+            self.assertFalse(token_path.is_file())
+            with self.assertRaisesRegex(
+                ValueError, "parent_return_token is missing"
+            ):
+                deactivate_child_agent(
+                    repo_root=repo_root,
+                    orchestration_id="orch_to_001",
+                    child_run_id=arid,
+                )
+            # Markers must remain so an operator can investigate / re-issue.
+            self.assertTrue(ack.is_file())
+
+    def test_forced_record_timeout_preserves_markers_when_record_agent_run_fails(self) -> None:
+        """Adv-37: in the forced bypass path, markers must NOT be cleared
+        until record_agent_run successfully commits the terminal entry.
+        Otherwise a record_agent_run failure leaves the run without markers
+        AND without terminal record — wedged forever, no retry possible."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            arid = self._setup_substep_launch(repo_root)
+            from tools.orchestration_runtime import (
+                _active_child_marker_path, _active_child_agent_run_id_path,
+            )
+            self.assertTrue(_active_child_marker_path(repo_root, "orch_to_001", arid).is_file())
+            self.assertTrue(_active_child_agent_run_id_path(repo_root, "orch_to_001").is_file())
+
+            # Inject a duplicate entry into agent_runs.jsonl so record_agent_run's
+            # locked re-check raises ValueError mid-flow.
+            runs_path = (
+                repo_root / "workspace" / "orchestrations" / "orch_to_001"
+                / "agent_runs.jsonl"
+            )
+            with runs_path.open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps({"agent_run_id": arid, "status": "running"}) + "\n")
+
+            with self.assertRaises(ValueError):
+                record_timeout(
+                    repo_root=repo_root,
+                    orchestration_id="orch_to_001",
+                    agent_run_id=arid,
+                    reason="forced timeout that will fail mid-commit",
+                    force_reason="operator override",
+                )
+            # Markers MUST survive the failed call so retry/recovery is possible.
+            self.assertTrue(
+                _active_child_marker_path(repo_root, "orch_to_001", arid).is_file(),
+                "active_children marker must NOT be unlinked before terminal commit",
+            )
+            self.assertTrue(
+                _active_child_agent_run_id_path(repo_root, "orch_to_001").is_file(),
+                "legacy Claude marker must NOT be unlinked before terminal commit",
+            )
+
+    def test_record_timeout_force_reason_bypasses_marker_for_wedged_child(self) -> None:
+        """Adv-26: when a child wedges before parent observes any return,
+        record-child-return is unreachable and the normal flow deadlocks. The
+        --force-reason escape clears the markers and finalizes the run, with
+        forced=True + forced_reason recorded in the payload for audit."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            arid = self._setup_substep_launch(repo_root)
+            # Intentionally do NOT call _deactivate — simulate a wedged child
+            # where deactivate-child is unreachable.
+            from tools.orchestration_runtime import (
+                _active_child_marker_path, _active_child_agent_run_id_path,
+            )
+            self.assertTrue(_active_child_marker_path(repo_root, "orch_to_001", arid).is_file())
+
+            # Without --force-reason: blocked.
+            with self.assertRaisesRegex(ValueError, "active-child marker"):
+                record_timeout(
+                    repo_root=repo_root,
+                    orchestration_id="orch_to_001",
+                    agent_run_id=arid,
+                    reason="wedged child",
+                )
+
+            # With --force-reason: succeeds.
+            result = record_timeout(
+                repo_root=repo_root,
+                orchestration_id="orch_to_001",
+                agent_run_id=arid,
+                reason="API stream wedged after 30 minutes",
+                force_reason="operator override: child PID killed externally",
+            )
+            self.assertEqual(result.get("status"), "timeout")
+            self.assertTrue(result.get("forced"))
+            self.assertIn("operator override", result.get("forced_reason", ""))
+            self.assertIn("FORCED", result.get("timeout_reason", ""))
+            # Markers cleared by the forced bypass.
+            self.assertFalse(_active_child_marker_path(repo_root, "orch_to_001", arid).is_file())
+            self.assertFalse(_active_child_agent_run_id_path(repo_root, "orch_to_001").is_file())
+
+    def test_record_timeout_succeeds_after_deactivate_child(self) -> None:
+        """Adv-14 happy path: record-child-return + deactivate-child clears
+        the marker; then record-timeout proceeds and finalizes the run."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            arid = self._setup_substep_launch(repo_root)
+            from tools.orchestration_runtime import (
+                deactivate_child_agent, record_child_return,
+                _parent_return_token_path,
+            )
+            token = _parent_return_token_path(
+                repo_root, "orch_to_001", arid
+            ).read_text(encoding="utf-8").strip()
+            record_child_return(
+                repo_root=repo_root,
+                orchestration_id="orch_to_001",
+                agent_run_id=arid,
+                return_token=token,
+            )
+            deactivate_child_agent(
+                repo_root=repo_root,
+                orchestration_id="orch_to_001",
+                child_run_id=arid,
+            )
+            result = record_timeout(
+                repo_root=repo_root,
+                orchestration_id="orch_to_001",
+                agent_run_id=arid,
+                reason="legitimate timeout after deactivate",
+            )
+            self.assertEqual(result.get("status"), "timeout")
+
+    def test_record_timeout_cli_dispatch(self) -> None:
+        """The `record-timeout` subcommand is wired into main()."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            arid = self._setup_substep_launch(repo_root)
+            self._deactivate(repo_root, arid)
+            argv = [
+                "record-timeout",
+                "--repo-root", str(repo_root),
+                "--orchestration-id", "orch_to_001",
+                "--agent-run-id", arid,
+                "--reason", "stream idle timeout",
+            ]
+            stdout = io.StringIO()
+            with redirect_stdout(stdout):
+                rc = main(argv)
+            self.assertEqual(rc, 0)
+            payload = json.loads(stdout.getvalue())
+            self.assertEqual(payload.get("status"), "timeout")
+            self.assertEqual(payload.get("agent_run_id"), arid)
 
 
 if __name__ == "__main__":

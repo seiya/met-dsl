@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import hashlib
 import json
 import os
@@ -18,7 +19,16 @@ import uuid
 from functools import lru_cache
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Callable, Sequence
+from typing import Any, Callable, Iterator, Sequence
+
+# fcntl is POSIX-only. Used by Adv-24 to serialize agent_runs.jsonl
+# duplicate-check + append against concurrent finalizers. On non-POSIX
+# platforms the lock degrades to a no-op (single-process workflows are the
+# only supported configuration there).
+try:
+    import fcntl as _fcntl  # type: ignore[import-not-found]
+except ImportError:  # pragma: no cover — non-POSIX
+    _fcntl = None  # type: ignore[assignment]
 
 try:
     from tools.hooks.common import (
@@ -145,15 +155,55 @@ def _read_json(path: Path) -> Any:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
-def _write_json(path: Path, payload: Any) -> None:
+def _atomic_write_text(path: Path, body: str) -> None:
+    """Adv-27: write `body` to `path` atomically via temp-file + os.replace.
+
+    Plain `path.write_text()` truncates and rewrites in place, so a concurrent
+    reader (e.g. `validate_workspace_root` polling `orchestration_meta.json`)
+    can transiently observe an empty or truncated file mid-write and treat the
+    orchestration as not-active — falsely flagging sanctioned tmp scripts.
+    Writing to a sibling temp file then renaming guarantees readers see
+    either the previous full content or the new full content, never partial.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    # Use NamedTemporaryFile in the same directory so os.replace is atomic
+    # (cross-device renames are not). delete=False because we hand the file
+    # off to os.replace explicitly.
+    fd, tmp_name = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent)
+    )
+    tmp_path = Path(tmp_name)
+    # L-NEW-3: cleanup MUST run on BaseException too (KeyboardInterrupt /
+    # SystemExit), otherwise SIGINT during a long write campaign accumulates
+    # `.tmp` litter under workspace/orchestrations/. try/finally with a
+    # `replaced` flag distinguishes successful rename (no cleanup) from any
+    # failure path including signal-driven exits.
+    replaced = False
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(body)
+            fh.flush()
+            try:
+                os.fsync(fh.fileno())
+            except OSError:
+                pass
+        os.replace(str(tmp_path), str(path))
+        replaced = True
+    finally:
+        if not replaced:
+            try:
+                tmp_path.unlink()
+            except OSError:
+                pass
+
+
+def _write_json(path: Path, payload: Any) -> None:
+    _atomic_write_text(path, json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
 
 
 def _write_text(path: Path, text: str) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
     body = text if text.endswith("\n") else f"{text}\n"
-    path.write_text(body, encoding="utf-8")
+    _atomic_write_text(path, body)
 
 
 def _orchestration_root(repo_root: Path, orchestration_id: str) -> Path:
@@ -163,6 +213,232 @@ def _orchestration_root(repo_root: Path, orchestration_id: str) -> Path:
 def _active_child_agent_run_id_path(repo_root: Path, orchestration_id: str) -> Path:
     """Claude backend 専用の active child `agent_run_id` 管理ファイル。"""
     return _orchestration_root(repo_root, orchestration_id) / "active_child_agent_run_id.txt"
+
+
+def _active_children_dir(repo_root: Path, orchestration_id: str) -> Path:
+    """Backend-neutral per-arid active-child marker directory (Adv-16).
+
+    Each launched child writes `active_children/<agent_run_id>.txt` here.
+    deactivate_child / record_agent_run terminal / record_timeout's success
+    path remove the marker. record_timeout REFUSES to proceed while the
+    marker exists — this provides Codex/Cursor with the same liveness
+    handshake protection that Claude got from active_child_agent_run_id.txt.
+    """
+    return _orchestration_root(repo_root, orchestration_id) / "active_children"
+
+
+def _active_child_marker_path(repo_root: Path, orchestration_id: str, agent_run_id: str) -> Path:
+    return _active_children_dir(repo_root, orchestration_id) / f"{agent_run_id}.txt"
+
+
+def _runs_jsonl_lock_path(repo_root: Path, orchestration_id: str) -> Path:
+    """Sidecar lock file used by Adv-24 to serialize concurrent finalizers.
+
+    fcntl.flock is acquired on this file for the duration of
+    record_agent_run's read-existing-IDs → append region, eliminating the
+    race where two finalizers would both miss each other's in-flight write
+    (one tolerated as a truncated trailing line by Adv-21) and commit
+    contradictory terminal entries for the same arid.
+    """
+    return _orchestration_root(repo_root, orchestration_id) / "agent_runs.jsonl.lock"
+
+
+_FCNTL_FALLBACK_WARNED = False
+
+
+@contextlib.contextmanager
+def _runs_jsonl_exclusive_lock(repo_root: Path, orchestration_id: str) -> Iterator[None]:
+    if _fcntl is None:  # pragma: no cover — non-POSIX
+        # L-NEW-4: on non-POSIX platforms (Windows, etc.) fcntl is unavailable,
+        # so the lock degrades to a no-op. Two concurrent finalizers would
+        # then race silently. Single-process workflows are unaffected, but
+        # any multi-process driver would defeat Adv-24 serialization without
+        # warning. Emit a one-shot stderr message so the operator sees the
+        # downgrade rather than discovering it via corrupt state.
+        global _FCNTL_FALLBACK_WARNED
+        if not _FCNTL_FALLBACK_WARNED:
+            _FCNTL_FALLBACK_WARNED = True
+            import sys as _sys
+            print(
+                "orchestration_runtime: WARNING — fcntl is unavailable on this "
+                "platform; agent_runs.jsonl serialization is a no-op. "
+                "Concurrent record_agent_run / record_timeout invocations may "
+                "race. Restrict orchestration to a single process or run on "
+                "a POSIX system to enable Adv-24 lock serialization.",
+                file=_sys.stderr,
+            )
+        yield
+        return
+    lock_path = _runs_jsonl_lock_path(repo_root, orchestration_id)
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(str(lock_path), os.O_WRONLY | os.O_CREAT, 0o600)
+    try:
+        _fcntl.flock(fd, _fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            try:
+                _fcntl.flock(fd, _fcntl.LOCK_UN)
+            except OSError:
+                pass
+    finally:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+
+
+def _cleanup_committed_dir(repo_root: Path, orchestration_id: str) -> Path:
+    """Adv-35: per-arid cleanup-committed marker directory.
+
+    Two-phase finalization invariant: validate_workspace_root may revoke a
+    tmp dir's exemption ONLY if both
+      (a) a terminal entry for the arid exists in agent_runs.jsonl, AND
+      (b) cleanup_committed/<arid>.json exists.
+    The committed marker is written *after* the destructive
+    `_cleanup_agent_tmp_root` call has succeeded, so a partial failure
+    (terminal entry written but cleanup failed mid-way) keeps the run in a
+    "cleanup pending" state — recovery scratch under workspace/tmp/<arid>/
+    stays exempt for diagnostics rather than getting silently flagged.
+    """
+    return _orchestration_root(repo_root, orchestration_id) / "cleanup_committed"
+
+
+def _cleanup_committed_marker_path(
+    repo_root: Path, orchestration_id: str, agent_run_id: str
+) -> Path:
+    return _cleanup_committed_dir(repo_root, orchestration_id) / f"{agent_run_id}.json"
+
+
+def _write_cleanup_committed_marker(
+    repo_root: Path, orchestration_id: str, agent_run_id: str
+) -> None:
+    d = _cleanup_committed_dir(repo_root, orchestration_id)
+    d.mkdir(parents=True, exist_ok=True)
+    _atomic_write_text(
+        _cleanup_committed_marker_path(repo_root, orchestration_id, agent_run_id),
+        json.dumps({
+            "agent_run_id": agent_run_id,
+            "committed_at": _utc_now_iso(),
+        }, ensure_ascii=False) + "\n",
+    )
+
+
+def _parent_return_token_path(
+    repo_root: Path, orchestration_id: str, agent_run_id: str
+) -> Path:
+    """Adv-30: per-arid parent-bound return token stored alongside launch
+    artifacts. Generated at record-launch time and required at
+    record-child-return time as proof that the caller is the same parent
+    that initiated the launch (defense against accidental misrouted ack
+    calls from buggy automation that doesn't know the per-arid token)."""
+    return _orchestration_root(repo_root, orchestration_id) / "launches" / f"{agent_run_id}.parent_return_token"
+
+
+def _read_parent_return_token(
+    repo_root: Path, orchestration_id: str, agent_run_id: str
+) -> str | None:
+    p = _parent_return_token_path(repo_root, orchestration_id, agent_run_id)
+    if not p.is_file():
+        return None
+    try:
+        token = p.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    return token if token else None
+
+
+def _child_returns_dir(repo_root: Path, orchestration_id: str) -> Path:
+    """Per-arid child-return acknowledgment directory (Adv-20).
+
+    The orchestration agent calls `record-child-return --agent-run-id <arid>`
+    AFTER it has observed the Agent tool actually returning. The resulting
+    `child_returns/<arid>.txt` file is a separate proof, distinct from the
+    launch-time `active_children/<arid>.txt` marker, that the orch agent has
+    witnessed the Agent tool return for THIS specific arid. deactivate-child
+    refuses to clear the active_children marker without this ack — without
+    it a misrouted deactivate-child call would erase the only liveness guard
+    for a still-running Codex/Cursor child.
+    """
+    return _orchestration_root(repo_root, orchestration_id) / "child_returns"
+
+
+def _child_return_marker_path(repo_root: Path, orchestration_id: str, agent_run_id: str) -> Path:
+    return _child_returns_dir(repo_root, orchestration_id) / f"{agent_run_id}.txt"
+
+
+def record_child_return(
+    repo_root: Path,
+    orchestration_id: str,
+    *,
+    agent_run_id: str,
+    return_token: str,
+    reply_excerpt: str | None = None,
+) -> dict[str, Any]:
+    """Adv-20/Adv-30: record that the orchestration agent has observed the
+    Agent tool returning for this child run.
+
+    The `return_token` MUST match the per-arid token written by record-launch
+    to launches/<arid>.parent_return_token. This binds the ack to "the
+    process that holds parent-readable launch state" — accidental misrouted
+    calls from buggy automation that doesn't know the token will be rejected.
+
+    The token is also embedded in the resulting ack file so deactivate-child
+    can re-verify at unlink time.
+    """
+    if not isinstance(agent_run_id, str) or not agent_run_id.strip():
+        raise ValueError("record-child-return requires non-empty --agent-run-id")
+    arid = agent_run_id.strip()
+    # Path-traversal guard: arid must be a flat token, not a path component.
+    if "/" in arid or ".." in arid or arid in {".", ""}:
+        raise ValueError(f"record-child-return: invalid agent_run_id {arid!r}")
+    if not isinstance(return_token, str) or not return_token.strip():
+        raise ValueError(
+            "record-child-return requires --return-token <token>. The token "
+            "is generated by record-launch and stored in "
+            f"workspace/orchestrations/{orchestration_id}/launches/{arid}.parent_return_token."
+        )
+    return_token = return_token.strip()
+    # Require that the launch actually happened (active_children marker for
+    # this arid must exist). Prevents recording an ack for a never-launched
+    # arid, which would later let an unrelated deactivate-child slip through.
+    if not _active_child_marker_path(repo_root, orchestration_id, arid).is_file():
+        raise ValueError(
+            f"record-child-return: no active_children/{arid}.txt marker — "
+            f"either the run was never launched, was already deactivated, or "
+            f"already terminated. record-child-return must run BEFORE "
+            f"deactivate-child."
+        )
+    expected_token = _read_parent_return_token(repo_root, orchestration_id, arid)
+    if expected_token is None:
+        raise ValueError(
+            f"record-child-return: missing parent return token at "
+            f"launches/{arid}.parent_return_token. The launch may pre-date "
+            f"the Adv-30 token mechanism — re-launch via record-launch."
+        )
+    # secrets.compare_digest avoids timing leaks even though this is local I/O.
+    if not secrets.compare_digest(return_token, expected_token):
+        raise ValueError(
+            f"record-child-return: return_token does not match the parent "
+            f"token recorded at record-launch time for {arid!r}. The token "
+            f"is per-arid; verify --return-token is the value from "
+            f"launches/{arid}.parent_return_token, not a value from another arid."
+        )
+    returns_dir = _child_returns_dir(repo_root, orchestration_id)
+    returns_dir.mkdir(parents=True, exist_ok=True)
+    marker = _child_return_marker_path(repo_root, orchestration_id, arid)
+    payload = {
+        "agent_run_id": arid,
+        "recorded_at": _utc_now_iso(),
+        "return_token": return_token,
+    }
+    if isinstance(reply_excerpt, str) and reply_excerpt.strip():
+        payload["reply_excerpt"] = reply_excerpt.strip()[:200]
+    # M1: atomic write so a concurrent deactivate_child_agent reader never
+    # observes a partial JSON body (which would falsely trip the Adv-30
+    # "tampered with" raise path).
+    _atomic_write_text(marker, json.dumps(payload, ensure_ascii=False) + "\n")
+    return payload
 
 
 def _session_run_index_path(repo_root: Path, orchestration_id: str) -> Path:
@@ -2997,6 +3273,14 @@ def _should_ignore_runtime_snapshot_path(
     runtime_prefixes = (
         f"{orch_root}/access_logs/",
         f"{orch_root}/access_policies/",
+        # Adv-16: per-arid active-child markers managed by record_launch /
+        # deactivate_child / record_agent_run terminal — orchestration runtime
+        # writes only, never authored by child agents.
+        f"{orch_root}/active_children/",
+        # Adv-20: per-arid child-return ack markers.
+        f"{orch_root}/child_returns/",
+        # Adv-35: per-arid cleanup-committed markers (two-phase finalization).
+        f"{orch_root}/cleanup_committed/",
         f"{orch_root}/agents/",
         f"{orch_root}/capabilities/",
         f"{orch_root}/gates/",
@@ -3015,6 +3299,8 @@ def _should_ignore_runtime_snapshot_path(
     runtime_files = {
         f"{orch_root}/agent_graph.json",
         f"{orch_root}/agent_runs.jsonl",
+        # Adv-24: fcntl lock sidecar; orchestration runtime exclusively manages it.
+        f"{orch_root}/agent_runs.jsonl.lock",
         f"{orch_root}/orchestration_meta.json",
         f"{orch_root}/orchestration_checkpoint.json",
         f"{orch_root}/active_child_agent_run_id.txt",
@@ -3255,31 +3541,6 @@ def _is_runtime_audit_artifact_path(orchestration_id: str, rel_path: str) -> boo
     return any(_repo_path_under_prefix(rel, prefix.rstrip("/")) for prefix in prefixes)
 
 
-def _declared_child_managed_paths(
-    repo_root: Path,
-    orchestration_id: str,
-    *,
-    current_agent_run_id: str,
-) -> list[str]:
-    declared: set[str] = set()
-    records = _load_run_records(_orchestration_root(repo_root, orchestration_id))
-    for run_id, record in records.items():
-        if run_id == current_agent_run_id.strip():
-            continue
-        role = str(record.get("agent_role") or "").strip().lower()
-        if role not in {"step", "substep"}:
-            continue
-        declared.update(_declared_output_refs(record))
-        declared.update(
-            _gate_changed_paths_for_run(
-                repo_root,
-                orchestration_id,
-                agent_run_id=run_id,
-            )
-        )
-    return sorted(declared)
-
-
 def _managed_write_snapshot_path(
     repo_root: Path,
     orchestration_id: str,
@@ -3347,6 +3608,7 @@ def _child_managed_paths_excludable_from_orchestration_diff(
     orchestration_id: str,
     *,
     current_agent_run_id: str,
+    caller_holds_lock: bool = False,
 ) -> set[str]:
     baseline = _load_run_write_baseline(repo_root, orchestration_id)
     baseline_files_obj = baseline.get("files")
@@ -3360,7 +3622,13 @@ def _child_managed_paths_excludable_from_orchestration_diff(
         else {}
     )
     excludable: set[str] = set()
-    records = _load_run_records(_orchestration_root(repo_root, orchestration_id))
+    # H-FOURTH-1: forward caller_holds_lock so the orchestration-role
+    # finalize path (called from inside the runs-jsonl lock) doesn't mask
+    # durable corruption via self-lock contention.
+    records = _load_run_records(
+        _orchestration_root(repo_root, orchestration_id),
+        caller_holds_lock=caller_holds_lock,
+    )
     for run_id, record in records.items():
         if run_id == current_agent_run_id.strip():
             continue
@@ -3465,6 +3733,143 @@ def _cleanup_empty_file_pin_stubs(
                 pass
 
 
+def _cleanup_agent_tmp_root(
+    repo_root: Path,
+    orchestration_id: str,
+    *,
+    agent_run_id: str,
+) -> bool:
+    """Remove `workspace/tmp/<agent_run_id>/` recursively at terminal status.
+
+    The per-agent tmp directory accumulates heredoc-staged patches, helper
+    `*.py` scripts, request/reply payloads, etc. Without cleanup the next
+    invocation of `validate_workspace_root` flags every leftover `*.py` as
+    "python script under workspace/ is forbidden", failing downstream phases.
+
+    Returns:
+      True  — cleanup succeeded OR the tmp dir was already absent. The caller
+              may now write the cleanup_committed marker (Adv-36).
+      False — cleanup was REFUSED (ownership / collision / symlink) or the
+              destructive `rmtree` raised. The committed marker MUST NOT be
+              written; the run remains in cleanup-pending state so the
+              validator keeps tmp scratch exempt for diagnostics.
+
+    Safety:
+    - Only deletes the exact path `workspace/tmp/<agent_run_id>/` derived from
+      the agent_run_id argument. The orchestration runtime only ever calls this
+      for terminal-status agents, so there is no in-flight risk.
+    - Validates that the target lives under repo_root/workspace/tmp/ before
+      unlinking — refuses to traverse symlinks pointing elsewhere.
+    - **Adv-5 ownership guard**: only deletes if the calling orchestration owns
+      the launch record for `<agent_run_id>` (i.e.,
+      `workspace/orchestrations/<orchestration_id>/launches/<arid>.request.json`
+      exists). The tmp namespace is shared (`workspace/tmp/<arid>/` with no
+      orchestration prefix), so two orchestrations that happen to reuse the
+      same `arid` would share the directory — terminating one must not delete
+      the other's live scratch. Without this guard, a single record-agent-run
+      could wipe a concurrent orchestration's in-flight workspace.
+    - rmtree errors are not raised (cleanup must not fail the calling
+      record-agent-run / record-timeout flow), but they are surfaced via
+      the False return so callers can suppress the cleanup_committed marker.
+    """
+    if not isinstance(agent_run_id, str) or not agent_run_id.strip():
+        return False
+    arid = agent_run_id.strip()
+    # Defensive: reject path-traversal-style values.
+    if "/" in arid or ".." in arid or arid in {".", ""}:
+        return False
+    if not isinstance(orchestration_id, str) or not orchestration_id.strip():
+        return False
+    # Adv-5/Adv-7: refuse to delete unless this orchestration owns the arid.
+    # Two ownership proofs are accepted (covering both child agents and the
+    # orchestration agent itself):
+    #   (a) Step/substep agents: launches/<arid>.request.json exists.
+    #   (b) Orchestration agent: orchestration_meta.json#orchestration_agent_run_id
+    #       equals arid (orchestration agents are not "launched" via record-launch
+    #       and have no request file, but their identity is pinned in the meta).
+    # Without either proof we refuse to delete — a concurrent orchestration
+    # that happens to reuse the same arid (the workspace/tmp/ namespace is flat)
+    # may be using the directory as live scratch.
+    orch_root_dir = repo_root / "workspace" / "orchestrations" / orchestration_id.strip()
+    is_owner_via_launch = (orch_root_dir / "launches" / f"{arid}.request.json").is_file()
+    is_owner_via_orchestration = False
+    if not is_owner_via_launch:
+        meta_path = orch_root_dir / "orchestration_meta.json"
+        if meta_path.is_file():
+            try:
+                meta_doc = json.loads(meta_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                meta_doc = None
+            if isinstance(meta_doc, dict):
+                expected = meta_doc.get("orchestration_agent_run_id")
+                if isinstance(expected, str) and expected.strip() == arid:
+                    is_owner_via_orchestration = True
+    if not (is_owner_via_launch or is_owner_via_orchestration):
+        return False
+    # Adv-11: cross-orchestration collision check. The flat workspace/tmp/<arid>/
+    # namespace cannot disambiguate which orchestration owns the directory's
+    # contents when two orchestrations have launched the same arid. If ANY
+    # other orchestration also claims this arid (via a launch record OR as its
+    # own orchestration_agent_run_id), refuse to delete — wiping the shared
+    # directory would destroy the colliding orchestration's live scratch.
+    # This matches the validator's collision-aware exemption (Adv-10):
+    # workspace/tmp/<arid>/ is treated as ambiguous and surfaced; cleanup is
+    # likewise refused.
+    #
+    # **M4 caveat (TOCTOU)**: this scan is unsynchronized. Between the scan
+    # and the rmtree below, a concurrent record-launch in another
+    # orchestration could create launches/<arid>.request.json for the same
+    # arid. With UUID4 arids (the documented norm — see RUNBOOK.md UUID
+    # generation) collision is astronomically rare; the workflow contract
+    # treats fresh UUID arids as a precondition. If callers ever assign
+    # non-UUID arids, this race becomes reachable and would need an
+    # additional cross-orchestration lock. Document deviations explicitly.
+    orchestrations_root = repo_root / "workspace" / "orchestrations"
+    other_owners = 0
+    if orchestrations_root.is_dir():
+        for other_dir in orchestrations_root.iterdir():
+            if not other_dir.is_dir() or other_dir.name == orchestration_id.strip():
+                continue
+            if (other_dir / "launches" / f"{arid}.request.json").is_file():
+                other_owners += 1
+                continue
+            other_meta_path = other_dir / "orchestration_meta.json"
+            if other_meta_path.is_file():
+                try:
+                    other_meta = json.loads(other_meta_path.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError):
+                    continue
+                if isinstance(other_meta, dict):
+                    other_arid = other_meta.get("orchestration_agent_run_id")
+                    if isinstance(other_arid, str) and other_arid.strip() == arid:
+                        other_owners += 1
+    if other_owners > 0:
+        return False
+    workspace_tmp = repo_root / "workspace" / "tmp"
+    target = workspace_tmp / arid
+    if not target.exists():
+        # Already absent — counts as "tmp is gone" for the committed marker.
+        return True
+    # Reject symlink redirection — never follow a symlink at <agent_run_id>.
+    try:
+        if target.is_symlink():
+            return False
+        # Confirm the resolved path stays under workspace/tmp/.
+        resolved_target = target.resolve()
+        resolved_parent = workspace_tmp.resolve()
+        if resolved_target.parent != resolved_parent:
+            return False
+    except OSError:
+        return False
+    import shutil
+    try:
+        shutil.rmtree(target)
+    except OSError:
+        return False
+    # Successful rmtree (or post-rmtree absence). Confirm directory is gone.
+    return not target.exists()
+
+
 def _write_directory_authorized_paths(
     repo_root: Path,
     orchestration_id: str,
@@ -3526,6 +3931,8 @@ def _validate_actual_write_paths(
     repo_root: Path,
     orchestration_id: str,
     payload: dict[str, Any],
+    *,
+    caller_holds_lock: bool = False,
 ) -> None:
     role_obj = payload.get("agent_role")
     agent_run_id_obj = payload.get("agent_run_id")
@@ -3557,6 +3964,7 @@ def _validate_actual_write_paths(
             repo_root,
             orchestration_id,
             current_agent_run_id=run_id,
+            caller_holds_lock=caller_holds_lock,
         )
         actual_changed_paths = [
             path
@@ -3705,6 +4113,7 @@ def _validate_actual_write_paths(
         if actor_role in {"step", "substep"}:
             # Cleanup runs AFTER violation is recorded so evidence is preserved for auditors.
             _cleanup_empty_file_pin_stubs(repo_root, orchestration_id, agent_run_id=run_id)
+            _cleanup_agent_tmp_root(repo_root, orchestration_id, agent_run_id=run_id)
         raise ValueError(
             "terminal run has unauthorized write paths: "
             + ", ".join(unauthorized)
@@ -3712,14 +4121,28 @@ def _validate_actual_write_paths(
         )
     if actor_role in {"step", "substep"}:
         # Success path: clean up any stubs the agent never wrote to.
-        _cleanup_empty_file_pin_stubs(repo_root, orchestration_id, agent_run_id=run_id)
-        _write_managed_write_snapshot(
-            repo_root,
-            orchestration_id,
-            agent_run_id=run_id,
-            declared_paths=declared_paths,
-            actual_changed_paths=actual_changed_paths,
-        )
+        # NEW-M2: tmp cleanup is DEFERRED to the post-lock end-of-function
+        # phase in record_agent_run (Adv-35 two-phase commit). Doing it
+        # here, before the durable terminal append at runs.jsonl, would
+        # delete recovery scratch ahead of the durable state transition —
+        # if a crash lands between this point and the append, the run is
+        # left without a terminal entry AND without diagnostic scratch.
+        # NEW-L3: wrap each cleanup helper call so an unexpected OSError
+        # in one does not skip the snapshot write that follows.
+        try:
+            _cleanup_empty_file_pin_stubs(repo_root, orchestration_id, agent_run_id=run_id)
+        except OSError:
+            pass
+        try:
+            _write_managed_write_snapshot(
+                repo_root,
+                orchestration_id,
+                agent_run_id=run_id,
+                declared_paths=declared_paths,
+                actual_changed_paths=actual_changed_paths,
+            )
+        except OSError:
+            pass
 
 
 def _load_checkpoint(
@@ -5095,18 +5518,60 @@ def _validate_launch_request_payload(request_payload: dict[str, Any]) -> None:
         )
 
 
-def _load_run_records(orchestration_root: Path) -> dict[str, dict[str, Any]]:
+def _load_run_records(
+    orchestration_root: Path,
+    *,
+    caller_holds_lock: bool = False,
+) -> dict[str, dict[str, Any]]:
+    """Load `agent_runs.jsonl` into a dict keyed by agent_run_id.
+
+    M-NEW-1: shares the same parse-resilience contract as
+    `_read_existing_run_ids` — Adv-21 trailing-line tolerance combined with
+    Adv-40 in-flight detection. A truncated last line whose corruption is
+    plausibly a concurrent appender's mid-write is silently skipped; any
+    other malformed line raises `RuntimeError("...durable corruption...")`.
+    Without this, callers like `_validate_orchestration_completion_for_pass`
+    would crash on `JSONDecodeError` whenever `record_agent_run` is appending
+    concurrently.
+
+    H-FOURTH-1: caller_holds_lock mirrors `_read_existing_run_ids`. When the
+    caller already holds the runs-jsonl fcntl lock (typically via
+    `_runs_jsonl_exclusive_lock` inside `record_agent_run`), the
+    writer-active probe would self-contend and falsely report in-flight,
+    silently masking durable trailing-line corruption. Pass True to force
+    every malformed line to surface.
+    """
     runs_path = orchestration_root / "agent_runs.jsonl"
     records: dict[str, dict[str, Any]] = {}
     if not runs_path.exists():
         return records
-    for raw in runs_path.read_text(encoding="utf-8").splitlines():
-        line = raw.strip()
-        if not line:
-            continue
-        item = json.loads(line)
+    non_empty_lines = [s for s in (raw.strip() for raw in runs_path.read_text(encoding="utf-8").splitlines()) if s]
+    n_lines = len(non_empty_lines)
+    for idx, line in enumerate(non_empty_lines):
+        is_last = idx == n_lines - 1
+        in_flight = (
+            is_last
+            and not caller_holds_lock
+            and _agent_runs_writer_active(runs_path)
+        )
+        try:
+            item = json.loads(line)
+        except json.JSONDecodeError as exc:
+            if in_flight:
+                continue
+            raise RuntimeError(
+                f"agent_runs.jsonl has malformed JSON at line {idx + 1}: {exc} "
+                f"(no active writer detected — durable corruption; quarantine "
+                f"the ledger and roll forward explicitly)"
+                if is_last else
+                f"agent_runs.jsonl has malformed non-trailing JSON at line {idx + 1}: {exc}"
+            ) from exc
         if not isinstance(item, dict):
-            continue
+            if in_flight:
+                continue
+            raise RuntimeError(
+                f"agent_runs.jsonl line {idx + 1} is not a JSON object: {item!r}"
+            )
         run_id = item.get("agent_run_id")
         if isinstance(run_id, str) and run_id.strip():
             records[run_id.strip()] = item
@@ -5117,6 +5582,8 @@ def _validate_terminal_run_payload(
     repo_root: Path,
     orchestration_id: str,
     payload: dict[str, Any],
+    *,
+    caller_holds_lock: bool = False,
 ) -> None:
     role = payload.get("agent_role")
     status = payload.get("status")
@@ -5125,7 +5592,12 @@ def _validate_terminal_run_payload(
     role_token = role.strip().lower()
     if role_token not in {"orchestration", "step", "substep"}:
         return
-    _validate_actual_write_paths(repo_root, orchestration_id, payload)
+    # H-FOURTH-1: forward caller_holds_lock so the orchestration-role
+    # _load_run_records call within _validate_actual_write_paths surfaces
+    # durable corruption rather than masking it via self-lock contention.
+    _validate_actual_write_paths(
+        repo_root, orchestration_id, payload, caller_holds_lock=caller_holds_lock
+    )
     if not isinstance(status, str) or status.strip().lower() != "pass":
         return
 
@@ -6245,40 +6717,47 @@ def init_orchestration(
     runs_path = root / "agent_runs.jsonl"
     if not runs_path.exists():
         runs_path.write_text("", encoding="utf-8")
-    has_orchestration_running_entry = False
-    with runs_path.open("r", encoding="utf-8") as fh:
-        for raw in fh:
-            line = raw.strip()
-            if not line:
-                continue
-            try:
-                item = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if not isinstance(item, dict):
-                continue
-            if (
-                str(item.get("agent_run_id", "")).strip() == orchestration_agent_run_id
-                and str(item.get("agent_role", "")).strip() == "orchestration"
-                and str(item.get("status", "")).strip() == "running"
-            ):
-                has_orchestration_running_entry = True
-                break
-    if not has_orchestration_running_entry:
-        with runs_path.open("a", encoding="utf-8") as fh:
-            fh.write(
-                json.dumps(
-                    {
-                        "agent_run_id": orchestration_agent_run_id,
-                        "agent_role": "orchestration",
-                        "agent_backend": backend_token,
-                        "status": "running",
-                        "started_at": _utc_now_iso(),
-                    },
-                    ensure_ascii=False,
+    # H-NEW-1: serialize the read+append against any concurrent
+    # record_agent_run finalizer. Without this lock, init_orchestration's
+    # plain `open("a")` could interleave bytes with a finalizer's locked
+    # append, defeating Adv-24 serialization. The lock protects both the
+    # idempotency scan (read existing entries) and the running-entry
+    # append.
+    with _runs_jsonl_exclusive_lock(repo_root, orchestration_id):
+        has_orchestration_running_entry = False
+        with runs_path.open("r", encoding="utf-8") as fh:
+            for raw in fh:
+                line = raw.strip()
+                if not line:
+                    continue
+                try:
+                    item = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(item, dict):
+                    continue
+                if (
+                    str(item.get("agent_run_id", "")).strip() == orchestration_agent_run_id
+                    and str(item.get("agent_role", "")).strip() == "orchestration"
+                    and str(item.get("status", "")).strip() == "running"
+                ):
+                    has_orchestration_running_entry = True
+                    break
+        if not has_orchestration_running_entry:
+            with runs_path.open("a", encoding="utf-8") as fh:
+                fh.write(
+                    json.dumps(
+                        {
+                            "agent_run_id": orchestration_agent_run_id,
+                            "agent_role": "orchestration",
+                            "agent_backend": backend_token,
+                            "status": "running",
+                            "started_at": _utc_now_iso(),
+                        },
+                        ensure_ascii=False,
+                    )
+                    + "\n"
                 )
-                + "\n"
-            )
     _append_session_run_index_entry(
         repo_root,
         orchestration_id,
@@ -6706,24 +7185,143 @@ def record_launch(
         orchestration_id,
         agent_run_id=child_agent_run_id,
     )
+    # NEW-M1: write parent_return_token FIRST so it is durably present
+    # before the active_children marker (Adv-16) appears. record_child_return
+    # checks the marker before the token: if a crash interrupts launch
+    # writing, this ordering guarantees we never observe "marker exists but
+    # token missing" — the recoverable invariant is "token may exist
+    # without marker (launch incomplete)" rather than "marker exists
+    # without token (permanent record_child_return failure)".
+    # Adv-30: per-arid parent-bound token; record-child-return requires it
+    # to construct a valid ack. Stored in launches/<arid>.parent_return_token
+    # (parent-only via read manifests). Atomic write (M1/Adv-27) so
+    # concurrent readers never observe partial content.
+    parent_return_token = secrets.token_hex(32)
+    _atomic_write_text(
+        _parent_return_token_path(repo_root, orchestration_id, child_agent_run_id),
+        parent_return_token,
+    )
+
+    # L-NEW-2: route active-child marker writes through _atomic_write_text
+    # for consistency with Adv-27. The marker file is queried only for
+    # existence (not contents) by record_child_return, but a concurrent
+    # reader observing a partial write would still log a confusing
+    # half-empty file; atomic writes eliminate that observability gap.
     if backend_token == "claude":
-        _active_child_agent_run_id_path(repo_root, orchestration_id).write_text(
+        _atomic_write_text(
+            _active_child_agent_run_id_path(repo_root, orchestration_id),
             child_agent_run_id,
-            encoding="utf-8",
         )
+    # Adv-16: backend-neutral per-arid active-child marker. Codex/Cursor lack
+    # the single-active-child constraint that the Claude marker enforces, but
+    # they still need a "the Agent tool actually returned" handshake before
+    # record-timeout may finalize a run. Marker is created here for ALL
+    # backends (LAST per NEW-M1 ordering above) and removed by
+    # deactivate-child / record-agent-run terminal.
+    marker_dir = _active_children_dir(repo_root, orchestration_id)
+    marker_dir.mkdir(parents=True, exist_ok=True)
+    _atomic_write_text(
+        _active_child_marker_path(repo_root, orchestration_id, child_agent_run_id),
+        child_agent_run_id,
+    )
 
     return out_refs
 
 
-def _read_existing_run_ids(path: Path) -> set[str]:
+def _agent_runs_writer_active(runs_path: Path) -> bool:
+    """Adv-40: probe whether a writer currently holds the agent_runs.jsonl
+    fcntl lock. True = lock contended (writer is appending), False = lock
+    free (no active writer). Used to distinguish an in-flight concurrent
+    append (which legitimately leaves the trailing line truncated) from
+    durable crash corruption that masquerades as the same shape.
+
+    On non-POSIX platforms (no fcntl) we conservatively return True so that
+    legacy single-process workflows keep tolerating partial reads.
+    """
+    if _fcntl is None:  # pragma: no cover — non-POSIX
+        return True
+    lock_path = runs_path.parent / (runs_path.name + ".lock")
+    if not lock_path.exists():
+        # No lock file means no record_agent_run has ever held the lock here.
+        # A truncated tail is therefore not an in-flight append.
+        return False
+    try:
+        fd = os.open(str(lock_path), os.O_RDWR)
+    except OSError:
+        # Permission / race; cannot determine — fall back to "active" so we
+        # do not raise on a possibly-recoverable in-flight append.
+        return True
+    try:
+        try:
+            _fcntl.flock(fd, _fcntl.LOCK_EX | _fcntl.LOCK_NB)
+        except OSError:
+            # Contention — writer is active.
+            return True
+        # We acquired the lock → no writer was holding it. Release.
+        try:
+            _fcntl.flock(fd, _fcntl.LOCK_UN)
+        except OSError:
+            pass
+        return False
+    finally:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+
+
+def _read_existing_run_ids(path: Path, *, caller_holds_lock: bool = False) -> set[str]:
+    """Return the set of agent_run_ids recorded in agent_runs.jsonl.
+
+    Adv-21: writers append without holding a Python-level lock per write
+    line, so a reader that lands mid-write can observe a truncated trailing
+    line. Tolerate exactly one JSONDecodeError on the LAST non-empty line
+    when it is plausibly an in-flight append.
+    Adv-40: distinguish in-flight from durable corruption by probing the
+    record_agent_run fcntl lock. If no writer is currently holding the
+    lock, a malformed trailing line is durable corruption and must surface
+    as a controlled RuntimeError rather than be silently swallowed (which
+    could let a duplicate terminal entry slip past `record_agent_run`'s
+    duplicate-id check).
+    NEW-H1: when the caller already holds the fcntl lock (the locked
+    re-check inside record_agent_run), the writer-active probe would
+    self-contend and falsely return True — masking durable corruption.
+    `caller_holds_lock=True` skips the heuristic and treats every
+    malformed line as durable corruption, which is the correct behavior
+    when no other writer can be active by definition.
+    """
     if not path.exists():
         return set()
     run_ids: set[str] = set()
-    for raw in path.read_text(encoding="utf-8").splitlines():
-        line = raw.strip()
-        if not line:
-            continue
-        item = json.loads(line)
+    non_empty_lines = [s for s in (raw.strip() for raw in path.read_text(encoding="utf-8").splitlines()) if s]
+    n_lines = len(non_empty_lines)
+    for idx, line in enumerate(non_empty_lines):
+        is_last = idx == n_lines - 1
+        # NEW-H1: when the caller holds the fcntl lock, no other writer can
+        # be active — a malformed line is unconditionally durable corruption.
+        in_flight = (
+            is_last
+            and not caller_holds_lock
+            and _agent_runs_writer_active(path)
+        )
+        try:
+            item = json.loads(line)
+        except json.JSONDecodeError as exc:
+            if in_flight:
+                continue
+            raise RuntimeError(
+                f"agent_runs.jsonl has malformed JSON at line {idx + 1}: {exc} "
+                f"(no active writer detected — durable corruption; quarantine "
+                f"the ledger and roll forward explicitly)"
+                if is_last else
+                f"agent_runs.jsonl has malformed non-trailing JSON at line {idx + 1}: {exc}"
+            ) from exc
+        if not isinstance(item, dict):
+            if in_flight:
+                continue
+            raise RuntimeError(
+                f"agent_runs.jsonl line {idx + 1} is not a JSON object: {item!r}"
+            )
         run_id = item.get("agent_run_id")
         if isinstance(run_id, str) and run_id.strip():
             run_ids.add(run_id.strip())
@@ -6740,6 +7338,266 @@ def _validate_skipped_by_checkpoint_payload(payload: dict[str, Any]) -> None:
         raise ValueError("skipped_by_checkpoint requires status=skipped")
     if payload["step"].strip().lower() != payload["skipped_step"].strip().lower():
         raise ValueError("skipped_step must match step for skipped_by_checkpoint")
+
+
+def record_timeout(
+    repo_root: Path,
+    orchestration_id: str,
+    *,
+    agent_run_id: str,
+    reason: str,
+    force_reason: str | None = None,
+) -> dict[str, Any]:
+    """Canonical recovery for substep/step API stream idle timeout.
+
+    Normal path: orchestration agent observes Agent tool returning, calls
+    record-child-return → deactivate-child → record-timeout. The Adv-14/16/20
+    guards refuse to finalize while liveness markers are still present.
+
+    Adv-26 escape hatch: pass `force_reason` (or --force-reason on CLI) to
+    bypass the active-children/legacy-marker guards for genuinely wedged
+    children where deactivate-child is unreachable (Agent tool process killed
+    before the parent observed any return). The bypass clears both markers
+    on the operator's responsibility; force_reason is appended to the audit
+    trail (timeout_reason) and recorded as `forced=True` in the run payload.
+
+    Without --force-reason, a wedged child is a permanent dead end because
+    record-child-return → deactivate-child → record-timeout cannot make
+    progress. With it, operators retain a controlled finalization path.
+    """
+    if not isinstance(agent_run_id, str) or not agent_run_id.strip():
+        raise ValueError("record-timeout requires non-empty --agent-run-id")
+    arid = agent_run_id.strip()
+    if not isinstance(reason, str) or not reason.strip():
+        raise ValueError("record-timeout requires non-empty --reason")
+    reason_text = reason.strip()
+    forced = isinstance(force_reason, str) and force_reason.strip() != ""
+    forced_reason_text = force_reason.strip() if forced else None
+
+    orch_root = _orchestration_root(repo_root, orchestration_id)
+    req_path = orch_root / "launches" / f"{arid}.request.json"
+    resp_path = orch_root / "launches" / f"{arid}.response.json"
+    if not req_path.exists():
+        raise ValueError(
+            f"record-timeout cannot find launch request: {req_path}. "
+            "Ensure record-launch was executed before the Agent tool call."
+        )
+    if not resp_path.exists():
+        raise ValueError(
+            f"record-timeout cannot find launch response: {resp_path}."
+        )
+    try:
+        req_doc = _read_json(req_path)
+        resp_doc = _read_json(resp_path)
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"record-timeout failed to read launch artifacts: {exc}") from exc
+    if not isinstance(req_doc, dict) or not isinstance(resp_doc, dict):
+        raise ValueError("record-timeout: launch request/response must be JSON objects")
+
+    role_token = ""
+    role_obj = req_doc.get("agent_role")
+    if isinstance(role_obj, str) and role_obj.strip():
+        role_token = role_obj.strip().lower()
+    if role_token not in {"step", "substep"}:
+        raise ValueError(
+            f"record-timeout only supports step/substep agents; agent_role={role_token!r}. "
+            "Use set-status for orchestration timeouts."
+        )
+
+    backend_obj = resp_doc.get("backend")
+    backend_token = backend_obj.strip().lower() if isinstance(backend_obj, str) and backend_obj.strip() else ""
+    if backend_token not in SUPPORTED_BACKENDS:
+        raise ValueError(
+            f"record-timeout: launch response backend={backend_token!r} not in {sorted(SUPPORTED_BACKENDS)}"
+        )
+
+    # Adv-14: liveness/ownership guards before fabricating a terminal record
+    # and wiping workspace/tmp/<arid>/. record-timeout cannot directly verify
+    # that the child process is dead, but it MUST refuse obvious mis-fires
+    # (duplicate timer, delayed callback, mis-routed retry) that would
+    # finalize a still-active run and destroy its scratch.
+    runs_path = orch_root / "agent_runs.jsonl"
+    # H3: this early read is unlocked. record_agent_run runs another check
+    # under fcntl.LOCK_EX (Adv-24) so a race between this read and a
+    # concurrent in-progress record_agent_run for the same arid is caught
+    # there. Distinguish the two cases in the error message:
+    #   - "already finalized": the entry was durably present when we read.
+    #   - "raced concurrent finalizer": the locked re-check at
+    #     record_agent_run will surface this with its own message; this
+    #     unlocked path errs on the side of failing fast with the safer
+    #     wording that matches the most common cause.
+    if runs_path.is_file() and not _agent_runs_writer_active(runs_path):
+        # No writer holds the lock at this instant → the existing entry, if
+        # any, is durable rather than mid-write. Safe to claim "already
+        # finalized" without ambiguity.
+        existing_run_ids = _read_existing_run_ids(runs_path)
+        if arid in existing_run_ids:
+            raise ValueError(
+                f"record-timeout: agent_run_id={arid!r} already has a durable "
+                f"entry in agent_runs.jsonl (the run was already finalized). "
+                f"Refusing to add a duplicate terminal record — investigate "
+                f"why the timeout path was re-entered."
+            )
+    elif runs_path.is_file():
+        # Writer active: defer to record_agent_run's locked re-check, which
+        # will raise "race detected on locked re-check" with precise wording
+        # if and only if the racing writer commits an entry for this arid.
+        pass
+    # session_run_index status check — the index is updated to the terminal
+    # status on successful record-agent-run, so any non-running status here
+    # signals that another finalization path already won the race.
+    index_doc = _read_session_run_index(repo_root, orchestration_id)
+    for _entry in index_doc.get("entries", []) or []:
+        if isinstance(_entry, dict) and _entry.get("agent_run_id") == arid:
+            _sess_status = _entry.get("status")
+            if isinstance(_sess_status, str) and _sess_status.strip().lower() != "running":
+                raise ValueError(
+                    f"record-timeout: session_run_index for {arid!r} shows "
+                    f"status={_sess_status!r}, not 'running'. Refusing — the "
+                    f"run has already terminated or was never launched."
+                )
+            break
+    # Adv-16: backend-neutral active-child marker check. record-launch creates
+    # `active_children/<arid>.txt` for ALL backends; deactivate-child (the
+    # documented signal that the Agent tool returned) removes it. While the
+    # marker exists, the orchestration agent has not yet acknowledged that the
+    # child finished — firing record-timeout in that state would race the
+    # still-pending Agent tool return on Codex/Cursor as well as Claude.
+    # Adv-26: forced=True skips this guard for genuinely-wedged children
+    # (operator override; force_reason is recorded in the audit trail).
+    # Adv-37: forced bypass NO LONGER unlinks markers up-front. If
+    # record_agent_run() below fails (validation, locked re-check, etc.)
+    # the run must remain protected by its existing markers so a retry is
+    # possible. Marker removal happens AFTER record_agent_run succeeds.
+    marker_path = _active_child_marker_path(repo_root, orchestration_id, arid)
+    forced_marker_to_remove: list[Path] = []
+    if marker_path.is_file():
+        if not forced:
+            raise ValueError(
+                f"record-timeout: active-child marker {marker_path.name} still exists "
+                f"under workspace/orchestrations/{orchestration_id}/active_children/. "
+                f"Run `deactivate-child --child-run-id {arid}` first to confirm the "
+                f"Agent tool actually returned, then retry record-timeout. "
+                f"For genuinely-wedged children where deactivate-child is "
+                f"unreachable, use --force-reason '<text>' to bypass."
+            )
+        # Forced bypass: queue the marker for removal AFTER record_agent_run
+        # commits the durable terminal entry.
+        forced_marker_to_remove.append(marker_path)
+    # Defensive: also check the legacy Claude single-file marker for backward
+    # compat (record-launch keeps writing it for sequential-child enforcement).
+    if backend_token == "claude":
+        active_path = _active_child_agent_run_id_path(repo_root, orchestration_id)
+        if active_path.is_file():
+            try:
+                active_arid = active_path.read_text(encoding="utf-8").strip()
+            except OSError:
+                active_arid = ""
+            if active_arid == arid:
+                if not forced:
+                    raise ValueError(
+                        f"record-timeout: active_child_agent_run_id.txt still points "
+                        f"to {arid!r}. Run `deactivate-child --child-run-id {arid}` "
+                        f"first to confirm the Agent tool actually returned, then "
+                        f"retry record-timeout. For genuinely-wedged children, "
+                        f"use --force-reason '<text>' to bypass."
+                    )
+                forced_marker_to_remove.append(active_path)
+    if forced:
+        # Adv-37: defer this too. The ack is part of the liveness story;
+        # removing it before terminal commit would also lose retry safety.
+        forced_marker_to_remove.append(
+            _child_return_marker_path(repo_root, orchestration_id, arid)
+        )
+
+    started_at = resp_doc.get("started_at")
+    if not isinstance(started_at, str) or not started_at.strip():
+        started_at = _utc_now_iso()
+
+    # Resolve identity fields from authoritative sources rather than synthesising them.
+    # Order of precedence (Adv-3):
+    #   1. session_run_index.json — written by record-launch with the actual launched
+    #      identity (agent_session_id may differ from agent_run_id for Codex backend
+    #      and may be reused across runs under repair_strategy=reuse).
+    #   2. launches/<arid>.response.json (record-launch persists the response payload).
+    #   3. launches/<arid>.request.json for fields the response does not carry
+    #      (parent_agent_run_id, context_id when explicitly set in request).
+    #   4. arid itself, as last-resort default for Claude Code where
+    #      agent_session_id == context_id == agent_run_id by contract.
+    # index_doc was loaded above for the Adv-14 liveness guards.
+    index_entry: dict[str, Any] = {}
+    for entry in index_doc.get("entries", []) or []:
+        if isinstance(entry, dict) and entry.get("agent_run_id") == arid:
+            index_entry = entry
+            break
+
+    def _first_str(*candidates: Any) -> str | None:
+        for c in candidates:
+            if isinstance(c, str) and c.strip():
+                return c.strip()
+        return None
+
+    session_value = _first_str(
+        index_entry.get("agent_session_id"),
+        resp_doc.get("agent_session_id"),
+        arid,
+    ) or arid
+    context_value = _first_str(
+        index_entry.get("context_id"),
+        req_doc.get("context_id"),
+        resp_doc.get("context_id"),
+        # Claude Code contract: context_id == agent_run_id.
+        arid if backend_token == "claude" else None,
+        session_value,
+    ) or session_value
+    parent_value = _first_str(req_doc.get("parent_agent_run_id"))
+
+    composed_reason = reason_text
+    if forced:
+        composed_reason = f"{reason_text} | FORCED: {forced_reason_text}"
+    payload: dict[str, Any] = {
+        "agent_run_id": arid,
+        "agent_role": role_token,
+        "agent_backend": backend_token,
+        "status": "timeout",
+        "started_at": started_at,
+        "finished_at": _utc_now_iso(),
+        "agent_session_id": session_value,
+        "context_id": context_value,
+        "context_isolated": True,
+        "timeout_reason": composed_reason,
+        # _extract_agent_summary_text scans for keys ending in "summary"/"reason";
+        # surface the timeout reason as result_summary so agent.summary.txt
+        # validation passes without requiring callers to duplicate the field.
+        "result_summary": f"timeout: {composed_reason}",
+    }
+    if forced:
+        payload["forced"] = True
+        payload["forced_reason"] = forced_reason_text
+    if parent_value is not None:
+        payload["parent_agent_run_id"] = parent_value
+    for field in ("node_key", "step", "substep", "agent_model"):
+        val = req_doc.get(field)
+        if isinstance(val, str) and val.strip():
+            payload[field] = val.strip()
+
+    result = record_agent_run(
+        repo_root=repo_root,
+        orchestration_id=orchestration_id,
+        payload=payload,
+    )
+    # Adv-37: only after the durable terminal record committed do we touch
+    # forced-bypass markers. record_agent_run terminal already unlinks
+    # active_child / per-arid / parent_return_token markers, so the only
+    # remaining cleanup here is the child_return ack (if any) — which
+    # deactivate_child would normally have removed but the forced path
+    # bypassed.
+    for stale_marker in forced_marker_to_remove:
+        try:
+            stale_marker.unlink(missing_ok=True)
+        except OSError:
+            pass
+    return result
 
 
 def record_agent_run(
@@ -6802,92 +7660,149 @@ def record_agent_run(
     if isinstance(status, str) and status.strip().lower() in TERMINAL_STATUSES:
         payload.setdefault("finished_at", _utc_now_iso())
 
-    if role_token in {"step", "substep"}:
-        launch_response_path = repo_root / payload["launch_response_ref"]
-        launch_response_payload = _read_json(launch_response_path)
-        if not isinstance(launch_response_payload, dict):
-            raise ValueError("launch response must be json object")
-        response_agent_session_id = _validate_response_agent_session_id(launch_response_payload)
-        payload_agent_session_id = payload.get("agent_session_id")
-        if not isinstance(payload_agent_session_id, str) or not payload_agent_session_id.strip():
-            raise ValueError("agent_session_id must be non-empty string")
-        if payload_agent_session_id.strip() != response_agent_session_id:
-            raise ValueError(
-                "agent_session_id must match child agent identifier in launch response"
-            )
-        sandbox_ref = launch_response_payload.get("sandbox_profile_ref")
-        if launch_response_payload.get("sandbox_runtime") != "bwrap":
-            _write_sandbox_enforcement_violation(
-                repo_root,
-                orchestration_id,
-                agent_run_id=agent_run_id,
-                reason="sandbox_runtime_not_bwrap",
-                detail={"launch_response_ref": payload["launch_response_ref"]},
-            )
-            raise ValueError("launch response must record sandbox_runtime=bwrap")
-        if launch_response_payload.get("sandbox_enforced") is not True:
-            _write_sandbox_enforcement_violation(
-                repo_root,
-                orchestration_id,
-                agent_run_id=agent_run_id,
-                reason="sandbox_not_enforced",
-                detail={"launch_response_ref": payload["launch_response_ref"]},
-            )
-            raise ValueError("launch response must record sandbox_enforced=true")
-        if not isinstance(sandbox_ref, str) or not sandbox_ref.strip():
-            _write_sandbox_enforcement_violation(
-                repo_root,
-                orchestration_id,
-                agent_run_id=agent_run_id,
-                reason="sandbox_profile_missing",
-                detail={"launch_response_ref": payload["launch_response_ref"]},
-            )
-            raise ValueError("launch response must include sandbox_profile_ref")
-        sandbox_path = repo_root / str(sandbox_ref).strip()
-        if not sandbox_path.exists():
-            _write_sandbox_enforcement_violation(
-                repo_root,
-                orchestration_id,
-                agent_run_id=agent_run_id,
-                reason="sandbox_profile_not_found",
-                detail={"sandbox_profile_ref": sandbox_ref},
-            )
-            raise ValueError(f"sandbox_profile_ref target not found: {sandbox_ref}")
-        payload.setdefault("sandbox_runtime", "bwrap")
-        payload.setdefault("sandbox_enforced", True)
-        payload.setdefault("sandbox_profile_ref", str(sandbox_ref).strip())
-
-    try:
-        _validate_terminal_run_payload(repo_root, orchestration_id, payload)
-    except ValueError:
-        # Unauthorized write or sandbox violation detected during terminal
-        # validation.  Persist a fail entry to a SEPARATE log so audit tools can
-        # see that this agent_run_id reached record-agent-run with an invalid
-        # payload — without polluting agent_runs.jsonl (which the
-        # duplicate-detection check would otherwise refuse to accept on retry).
-        # The retry path (typically with the same agent_run_id after fixing the
-        # payload) therefore remains operational.
-        invalid_path = root / "agent_runs_invalid.jsonl"
-        fail_entry: dict[str, Any] = dict(payload)
-        fail_entry["status"] = "fail"
-        fail_entry["finished_at"] = _utc_now_iso()
-        fail_entry["fail_reason"] = "terminal_payload_validation_error"
-        with invalid_path.open("a", encoding="utf-8") as _h:
-            _h.write(json.dumps(fail_entry, ensure_ascii=False) + "\n")
-        raise
+    # NEW-H2: sandbox checks moved into the locked region below so two
+    # concurrent finalizers cannot race on `_write_sandbox_enforcement_violation`
+    # writes, and so failures are recorded in agent_runs_invalid.jsonl
+    # alongside other terminal-validation failures rather than only as
+    # violation sidecars.
 
     dialogs_root = root / "agents" / agent_run_id / "dialogs"
     dialogs_root.mkdir(parents=True, exist_ok=True)
     result_ref, summary_ref = _agent_result_refs(orchestration_id, agent_run_id)
     payload.setdefault("agent_result_ref", result_ref)
     payload.setdefault("agent_summary_ref", summary_ref)
-    summary_text = _extract_agent_summary_text(payload)
-    _validate_agent_summary_text(payload, summary_text)
-    _write_json(dialogs_root / "agent.result.json", payload)
-    _write_text(dialogs_root / "agent.summary.txt", summary_text)
 
-    with runs_path.open("a", encoding="utf-8") as handle:
-        handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
+    # Adv-24/H2: serialize the duplicate-recheck + terminal validation +
+    # dialog/append commit phase against any concurrent finalizer for the
+    # same orchestration. _validate_terminal_run_payload runs inside the
+    # lock (H2 fix) because its violation path calls
+    # _cleanup_empty_file_pin_stubs / _cleanup_agent_tmp_root — destructive
+    # operations that two unsynchronized finalizers must not race.
+    with _runs_jsonl_exclusive_lock(repo_root, orchestration_id):
+        # NEW-H1: caller holds the lock, so writer-active probe would
+        # self-contend. Pass the flag so durable corruption is surfaced
+        # rather than masked.
+        existing_locked = _read_existing_run_ids(runs_path, caller_holds_lock=True)
+        if agent_run_id in existing_locked:
+            raise ValueError(
+                f"duplicate agent_run_id: {agent_run_id} "
+                f"(race detected on locked re-check)"
+            )
+        # L-NEW-1: capture sandbox-violation reason so the invalid-log entry
+        # records the specific failure (e.g. sandbox_runtime_not_bwrap)
+        # rather than the generic "terminal_payload_validation_error".
+        sandbox_fail_reason: str | None = None
+        try:
+            # NEW-H2: sandbox checks run under the lock and route violations
+            # through the same invalid-entry log as _validate_terminal_run_payload.
+            if role_token in {"step", "substep"}:
+                launch_response_path = repo_root / payload["launch_response_ref"]
+                launch_response_payload = _read_json(launch_response_path)
+                if not isinstance(launch_response_payload, dict):
+                    sandbox_fail_reason = "launch_response_not_object"
+                    raise ValueError("launch response must be json object")
+                # M-FOURTH-1: pre-set the reason so a ValueError raised by
+                # the helper carries the specific identity-failure tag into
+                # agent_runs_invalid.jsonl rather than the generic
+                # "terminal_payload_validation_error" bucket.
+                sandbox_fail_reason = "launch_response_session_id_invalid"
+                response_agent_session_id = _validate_response_agent_session_id(launch_response_payload)
+                # Helper accepted the response → reset to None so the next
+                # check's failure (if any) records its own specific reason.
+                sandbox_fail_reason = None
+                payload_agent_session_id = payload.get("agent_session_id")
+                if not isinstance(payload_agent_session_id, str) or not payload_agent_session_id.strip():
+                    sandbox_fail_reason = "agent_session_id_empty"
+                    raise ValueError("agent_session_id must be non-empty string")
+                if payload_agent_session_id.strip() != response_agent_session_id:
+                    sandbox_fail_reason = "agent_session_id_mismatch"
+                    raise ValueError(
+                        "agent_session_id must match child agent identifier in launch response"
+                    )
+                sandbox_ref = launch_response_payload.get("sandbox_profile_ref")
+                if launch_response_payload.get("sandbox_runtime") != "bwrap":
+                    _write_sandbox_enforcement_violation(
+                        repo_root,
+                        orchestration_id,
+                        agent_run_id=agent_run_id,
+                        reason="sandbox_runtime_not_bwrap",
+                        detail={"launch_response_ref": payload["launch_response_ref"]},
+                    )
+                    sandbox_fail_reason = "sandbox_runtime_not_bwrap"
+                    raise ValueError("launch response must record sandbox_runtime=bwrap")
+                if launch_response_payload.get("sandbox_enforced") is not True:
+                    _write_sandbox_enforcement_violation(
+                        repo_root,
+                        orchestration_id,
+                        agent_run_id=agent_run_id,
+                        reason="sandbox_not_enforced",
+                        detail={"launch_response_ref": payload["launch_response_ref"]},
+                    )
+                    sandbox_fail_reason = "sandbox_not_enforced"
+                    raise ValueError("launch response must record sandbox_enforced=true")
+                if not isinstance(sandbox_ref, str) or not sandbox_ref.strip():
+                    _write_sandbox_enforcement_violation(
+                        repo_root,
+                        orchestration_id,
+                        agent_run_id=agent_run_id,
+                        reason="sandbox_profile_missing",
+                        detail={"launch_response_ref": payload["launch_response_ref"]},
+                    )
+                    sandbox_fail_reason = "sandbox_profile_missing"
+                    raise ValueError("launch response must include sandbox_profile_ref")
+                sandbox_path = repo_root / str(sandbox_ref).strip()
+                if not sandbox_path.exists():
+                    _write_sandbox_enforcement_violation(
+                        repo_root,
+                        orchestration_id,
+                        agent_run_id=agent_run_id,
+                        reason="sandbox_profile_not_found",
+                        detail={"sandbox_profile_ref": sandbox_ref},
+                    )
+                    sandbox_fail_reason = "sandbox_profile_not_found"
+                    raise ValueError(f"sandbox_profile_ref target not found: {sandbox_ref}")
+                payload.setdefault("sandbox_runtime", "bwrap")
+                payload.setdefault("sandbox_enforced", True)
+                payload.setdefault("sandbox_profile_ref", str(sandbox_ref).strip())
+            _validate_terminal_run_payload(
+                repo_root, orchestration_id, payload, caller_holds_lock=True,
+            )
+        except ValueError as exc:
+            # Unauthorized write or sandbox violation detected during terminal
+            # validation.  Persist a fail entry to a SEPARATE log so audit
+            # tools can see that this agent_run_id reached record-agent-run
+            # with an invalid payload — without polluting agent_runs.jsonl
+            # (which the duplicate-detection check would otherwise refuse on
+            # retry). The retry path (typically with the same agent_run_id
+            # after fixing the payload) therefore remains operational.
+            invalid_path = root / "agent_runs_invalid.jsonl"
+            fail_entry: dict[str, Any] = dict(payload)
+            fail_entry["status"] = "fail"
+            fail_entry["finished_at"] = _utc_now_iso()
+            # L-NEW-1: prefer the specific sandbox/identity reason; fall
+            # back to the generic terminal-validation tag for everything
+            # else (output manifest violations, etc., raised by
+            # _validate_terminal_run_payload itself).
+            fail_entry["fail_reason"] = sandbox_fail_reason or "terminal_payload_validation_error"
+            fail_entry["fail_message"] = str(exc)
+            with invalid_path.open("a", encoding="utf-8") as _h:
+                _h.write(json.dumps(fail_entry, ensure_ascii=False) + "\n")
+            raise
+        # Summary text needs the (possibly-mutated) payload.
+        summary_text = _extract_agent_summary_text(payload)
+        _validate_agent_summary_text(payload, summary_text)
+        _write_json(dialogs_root / "agent.result.json", payload)
+        _write_text(dialogs_root / "agent.summary.txt", summary_text)
+        # Adv-35: append the durable terminal record FIRST. The destructive
+        # tmp cleanup runs after this append (outside the lock) and only
+        # then is the cleanup_committed marker written. Validator treats an
+        # arid as truly terminated only when BOTH the terminal entry AND
+        # the committed marker exist — so a partial failure (cleanup fails
+        # silently, or process dies between append and commit) preserves
+        # the recovery scratch under workspace/tmp/<arid>/ for diagnostics
+        # rather than losing it ahead of a durable state transition.
+        with runs_path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
 
     status_token = str(payload.get("status", "")).strip().lower()
     if status_token in TERMINAL_STATUSES:
@@ -6923,10 +7838,32 @@ def record_agent_run(
                 )
             if backend_token == "claude":
                 _active_child_agent_run_id_path(repo_root, orchestration_id).unlink(missing_ok=True)
+            # Adv-16: also clear backend-neutral per-arid marker.
+            _active_child_marker_path(
+                repo_root, orchestration_id, agent_run_id
+            ).unlink(missing_ok=True)
+            # Adv-30: clear the parent return token sidecar; the run is done
+            # and the token must not be reusable.
+            _parent_return_token_path(
+                repo_root, orchestration_id, agent_run_id
+            ).unlink(missing_ok=True)
 
-    agent_tmp = repo_root / "workspace" / "tmp" / agent_run_id
-    if agent_tmp.exists():
-        shutil.rmtree(agent_tmp, ignore_errors=True)
+    # Adv-35/36: terminal record is now durable in agent_runs.jsonl. Run the
+    # destructive tmp cleanup, then write the cleanup_committed marker ONLY
+    # IF the cleanup actually completed (rmtree succeeded or tmp was already
+    # absent). Adv-36: a refusal (ownership / collision / symlink) or a
+    # silent rmtree OSError must NOT publish the committed marker —
+    # otherwise validator would revoke exemption while leftover scratch
+    # remains, exactly the "broken two-phase invariant" Codex flagged.
+    final_status = str(payload.get("status", "")).strip().lower()
+    if final_status in TERMINAL_STATUSES or final_status == "fail_closed":
+        cleanup_done = _cleanup_agent_tmp_root(
+            repo_root, orchestration_id, agent_run_id=agent_run_id
+        )
+        if cleanup_done:
+            _write_cleanup_committed_marker(
+                repo_root, orchestration_id, agent_run_id=agent_run_id
+            )
 
     return payload
 
@@ -6937,21 +7874,103 @@ def deactivate_child_agent(
     *,
     child_run_id: str,
 ) -> dict[str, Any]:
+    """Clear active-child markers for a SUBSTEP / STEP child run.
+
+    **M3 design note**: This function is intentionally asymmetric vs the
+    orchestration agent's own arid. The orch agent has no `record-launch`
+    handshake (no per-arid `launches/<arid>.request.json`), so it has no
+    `record-child-return` ack to validate against and is finalized via
+    `update_orchestration_status` directly. The Adv-30 parent-bound token
+    and Adv-20 ack file therefore protect ONLY child runs (where the
+    "Agent tool returned" signal is the actual security boundary). The
+    orch's own scratch is cleaned at terminal `set-status` time and is
+    guarded by the `is_owner_via_orchestration` proof in
+    `_cleanup_agent_tmp_root` (orchestration_meta.json identity).
+    """
+    # Adv-18: validate-first, unlink-second. The previous implementation
+    # unlinked the per-arid backend-neutral marker (Adv-16) BEFORE checking
+    # the legacy Claude marker, which meant a stray/misrouted deactivate-child
+    # call could clear a still-running child's record-timeout liveness guard
+    # and enable a downstream record-timeout to wipe live tmp scratch.
+    # Both marker checks now run before any state mutation.
     active_path = _active_child_agent_run_id_path(repo_root, orchestration_id)
-    if not active_path.exists():
+    legacy_marker_present = active_path.is_file()
+    if legacy_marker_present:
+        active_value = active_path.read_text(encoding="utf-8").strip()
+        if active_value != child_run_id:
+            raise ValueError(
+                "active child run mismatch: "
+                f"expected={child_run_id!r}, actual={active_value!r}"
+            )
+    per_arid_marker = _active_child_marker_path(
+        repo_root, orchestration_id, child_run_id
+    )
+    per_arid_present = per_arid_marker.is_file()
+    if not legacy_marker_present and not per_arid_present:
+        # Idempotent: already deactivated (or never launched).
         return {
             "deactivated_child_run_id": child_run_id,
             "orchestration_id": orchestration_id,
             "deactivated_at": _utc_now_iso(),
             "already_inactive": True,
         }
-    active_value = active_path.read_text(encoding="utf-8").strip()
-    if active_value != child_run_id:
+    # Adv-20: require explicit "Agent tool returned" ack. The orchestration
+    # agent must call record-child-return before deactivate-child. Without
+    # this gate, a misrouted deactivate-child for a still-running Codex/Cursor
+    # child clears its only liveness guard (active_children marker) and lets
+    # record-timeout finalize and wipe its scratch.
+    return_ack = _child_return_marker_path(repo_root, orchestration_id, child_run_id)
+    if not return_ack.is_file():
         raise ValueError(
-            "active child run mismatch: "
-            f"expected={child_run_id!r}, actual={active_value!r}"
+            f"deactivate-child: child_returns/{child_run_id}.txt is missing — "
+            f"call `record-child-return --agent-run-id {child_run_id}` AFTER "
+            f"observing the Agent tool actually return, BEFORE deactivate-child."
         )
-    active_path.unlink()
+    # Adv-30: re-verify the parent-bound token at unlink time. Even if the
+    # ack file was created legitimately, an attacker who later edits the file
+    # cannot set a token they don't know.
+    expected_parent_token = _read_parent_return_token(
+        repo_root, orchestration_id, child_run_id
+    )
+    # Token-missing bug fix: `record_child_return` requires the
+    # parent_return_token to exist before writing the ack file. If we now
+    # see the ack present but the token absent, the invariant has been
+    # violated (manual tampering, partial cleanup race, or a code-path
+    # bug). Silently skipping verification would let any caller forge an
+    # ack by deleting the token file first — defeating the Adv-30 binding.
+    # Refuse to clear liveness markers and surface the inconsistency.
+    if expected_parent_token is None:
+        raise ValueError(
+            f"deactivate-child: child_returns/{child_run_id}.txt exists but "
+            f"launches/{child_run_id}.parent_return_token is missing. "
+            f"record-child-return requires both files together, so the "
+            f"absence of the parent token indicates corruption or external "
+            f"tampering of the launch artifacts. Refusing to clear liveness "
+            f"markers — investigate (re-launch may be required)."
+        )
+    try:
+        ack_doc = json.loads(return_ack.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        ack_doc = None
+    ack_token = (
+        ack_doc.get("return_token") if isinstance(ack_doc, dict) else None
+    )
+    if not isinstance(ack_token, str) or not secrets.compare_digest(
+        ack_token, expected_parent_token
+    ):
+        raise ValueError(
+            f"deactivate-child: child_returns/{child_run_id}.txt does not "
+            f"contain a valid parent return token. The ack appears to have "
+            f"been tampered with or constructed without the per-arid token "
+            f"from launches/{child_run_id}.parent_return_token."
+        )
+    # Validation passed and at least one marker exists — atomic unlink phase.
+    per_arid_marker.unlink(missing_ok=True)
+    active_path.unlink(missing_ok=True)
+    # Consume the ack: it must be re-issued for any future relaunch of the
+    # same arid (defensive — no current code path reuses arids, but this
+    # keeps the invariant that ack proves a one-time return event).
+    return_ack.unlink(missing_ok=True)
     return {
         "deactivated_child_run_id": child_run_id,
         "orchestration_id": orchestration_id,
@@ -7110,7 +8129,26 @@ def update_orchestration_status(
         meta["finished_at"] = _utc_now_iso()
     if status == "fail_closed":
         meta["finished_at"] = _utc_now_iso()
+    # Adv-35: write the durable terminal status FIRST, then cleanup tmp,
+    # then write the cleanup_committed marker. Validator's exemption-revoke
+    # decision requires BOTH the terminal meta status AND the committed
+    # marker (Adv-35 two-phase commit), so a partial failure between meta
+    # write and cleanup keeps orch tmp scratch exempt for diagnostics
+    # rather than orphaning recovery artifacts.
     _write_json(meta_path, meta)
+    if status in TERMINAL_STATUSES or status == "fail_closed":
+        orch_arid_obj = meta.get("orchestration_agent_run_id")
+        if isinstance(orch_arid_obj, str) and orch_arid_obj.strip():
+            cleanup_done = _cleanup_agent_tmp_root(
+                repo_root,
+                orchestration_id,
+                agent_run_id=orch_arid_obj.strip(),
+            )
+            # Adv-36: only publish committed marker on confirmed cleanup.
+            if cleanup_done:
+                _write_cleanup_committed_marker(
+                    repo_root, orchestration_id, agent_run_id=orch_arid_obj.strip(),
+                )
     _append_phase_state_log(
         repo_root,
         orchestration_id,
@@ -7656,6 +8694,67 @@ def main(argv: list[str] | None = None) -> int:
     record_reply_parser.add_argument("--reply-text")
     record_reply_parser.add_argument("--reply-from-stdin", action="store_true")
 
+    record_child_return_parser = subparsers.add_parser(
+        "record-child-return",
+        description=(
+            "Adv-20: record that the orchestration agent has observed the "
+            "Agent tool returning for this child. Required precondition for "
+            "deactivate-child (and hence for record-timeout). Writes "
+            "workspace/orchestrations/<orch>/child_returns/<arid>.txt as the "
+            "ack signal; deactivate-child consumes the file when it succeeds."
+        ),
+    )
+    record_child_return_parser.add_argument("--repo-root", required=True)
+    record_child_return_parser.add_argument("--orchestration-id", required=True)
+    record_child_return_parser.add_argument("--agent-run-id", required=True)
+    record_child_return_parser.add_argument(
+        "--return-token", required=True,
+        help=(
+            "Adv-30: per-arid parent-bound token from "
+            "workspace/orchestrations/<orch>/launches/<arid>.parent_return_token "
+            "(generated at record-launch). Pass via "
+            "`$(cat <that file>)`. record-child-return verifies the token "
+            "before issuing the ack and embeds it in the ack file so "
+            "deactivate-child can re-verify."
+        ),
+    )
+    record_child_return_parser.add_argument(
+        "--reply-excerpt", default=None,
+        help="Optional short metadata (e.g. first line of the Agent reply); "
+             "stored alongside the ack timestamp for audit. Truncated to 200 chars.",
+    )
+
+    record_timeout_parser = subparsers.add_parser(
+        "record-timeout",
+        description=(
+            "Canonical recovery for substep/step API stream idle timeout. "
+            "Reads launches/<agent_run_id>.request.json and .response.json to "
+            "build a record-agent-run payload with status='timeout' and "
+            "delegates to record-agent-run (which validates partial writes and "
+            "cleans up workspace/tmp/<agent_run_id>/)."
+        ),
+    )
+    record_timeout_parser.add_argument("--repo-root", required=True)
+    record_timeout_parser.add_argument("--orchestration-id", required=True)
+    record_timeout_parser.add_argument("--agent-run-id", required=True)
+    record_timeout_parser.add_argument(
+        "--reason",
+        required=True,
+        help="Human-readable timeout reason (e.g., 'API stream idle timeout after 600s').",
+    )
+    record_timeout_parser.add_argument(
+        "--force-reason", default=None,
+        help=(
+            "Adv-26 escape hatch: bypass the active-children/legacy marker guards "
+            "for genuinely-wedged children where deactivate-child is unreachable "
+            "(e.g. Agent tool process killed before parent observed return). "
+            "Required text becomes part of timeout_reason and the run payload "
+            "carries forced=True + forced_reason for audit. Use sparingly — the "
+            "normal record-child-return → deactivate-child → record-timeout flow "
+            "is preferred whenever possible."
+        ),
+    )
+
     status_parser = subparsers.add_parser("set-status")
     status_parser.add_argument("--repo-root", required=True)
     status_parser.add_argument("--orchestration-id", required=True)
@@ -8089,6 +9188,30 @@ def main(argv: list[str] | None = None) -> int:
                 reply_text=reply_text,
             )
         except ValueError as exc:
+            print(str(exc), file=sys.stderr)
+            return 1
+    elif args.command == "record-timeout":
+        try:
+            result = record_timeout(
+                repo_root=repo_root,
+                orchestration_id=args.orchestration_id,
+                agent_run_id=args.agent_run_id,
+                reason=args.reason,
+                force_reason=args.force_reason,
+            )
+        except (ValueError, RuntimeError) as exc:
+            print(str(exc), file=sys.stderr)
+            return 1
+    elif args.command == "record-child-return":
+        try:
+            result = record_child_return(
+                repo_root=repo_root,
+                orchestration_id=args.orchestration_id,
+                agent_run_id=args.agent_run_id,
+                return_token=args.return_token,
+                reply_excerpt=args.reply_excerpt,
+            )
+        except (ValueError, RuntimeError) as exc:
             print(str(exc), file=sys.stderr)
             return 1
     elif args.command == "read-checkpoint":

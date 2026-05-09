@@ -222,9 +222,64 @@ workflow 実行中に hook がブロックした場合、`reason` と `audit_det
 |---|---|---|
 | `read_manifest_read_guard` | 許可 root 外のファイルを `Read` した | `read_manifests/<agent_run_id>.json` の `allowed_read_roots` を確認し、必要なら `run-gate --gate orchestration_read` 経由で読む。`MEMORY.md`・`README.md`・`.claude/settings.json` は orchestration agent では想定ブロック（無視してよい）。**自身の `launches/<agent_run_id>.prompt.txt` は Agent tool 入力で既に渡されているため再読不要** |
 | `output_manifest_write_guard` | `/tmp`・`/dev/shm`・manifest 外 path への書き込み | `set -e` の下で `export TMPDIR=$(jq -er '.allowed_tmp_root // empty' workspace/orchestrations/<oid>/output_manifests/<id>.json)` を実行して `$TMPDIR` を確定してから `${TMPDIR}/` 配下を使う。`-e` + `// empty` により file 不在 / field 欠損時は exit 1 で fail-fast（`python3 -c "import json; ..."` は `forbid_python_inline_write` でブロックされる） |
-| `enforce_guarded_apply_patch` | `Edit`/`Write`/`apply_patch` で `.json`/`.txt` を書こうとした | `python3 tools/orchestration_runtime.py guarded-apply-patch --repo-root . --orchestration-id <oid> --actor-role <role> --agent-run-id <id> --paths-json '["<path>"]' --patch-file "${TMPDIR}/x.patch" --capability-token <token>` に切り替える |
+| `enforce_guarded_apply_patch` | `Edit`/`Write`/`apply_patch` で `.json`/`.txt` を書こうとした、または **Bash heredoc**（`cat > <canonical_path> <<EOF`）で `allowed_file_tool_paths` 外の path に書こうとした | `python3 tools/orchestration_runtime.py guarded-apply-patch --repo-root . --orchestration-id <oid> --actor-role <role> --agent-run-id <id> --paths-json '["<path>"]' --patch-file "${TMPDIR}/x.patch" --capability-token <token>` に切り替える。Bash heredoc は `${TMPDIR}/` 配下にのみ書き、canonical path への書き込みは `guarded-apply-patch` で行う |
 | `forbid_python_inline_write` | `python3 -c` / `python3 - <<EOF` を実行した（`audit_detail.intent_detected` で意図別に分類される） | **書き込み意図** (`open(...,'w')` / `Path.write_text` 等): `.json`/`.txt` は `guarded-apply-patch`、その他は `Edit`/`Write` tool を使う。**UUID 生成意図** (`import uuid; print(uuid.uuid4())`): `cat /proc/sys/kernel/random/uuid` を使う。**JSON 読み取り意図** (`json.load(...)` / `json.loads(...)`): `Read` tool で直接読む。Python 処理が必要なら `${TMPDIR}/x.py` に script を書いて `python3 ${TMPDIR}/x.py` で実行する |
 | `forbid_tools_direct_read` | `grep`・`cat`・`sed` で `tools/` 配下を読もうとした | `tools/` の実装は参照禁止。仕様は `docs/`・`spec/`・`skill_must_read_refs` を参照する。`guarded-apply-patch` の動作は `docs/ORCHESTRATION.md#patch-適用契約` と `launch_prompts.md` 末尾を参照 |
 | `rule_source_violation` | 他 agent の capability・gate 結果・他 phase の SKILL.md を読んだ | gate 失敗内容は `2>"${TMPDIR}/last_gate_stderr.txt"` で stderr をキャプチャして取得する。他 phase の SKILL.md は読まず、自 phase の `skill_ref` のみ参照する |
 | `forbid_git_reset_hard` | `git reset --hard` を実行しようとした | `git restore <file>` または `git checkout <file>` で個別ファイルを戻す |
 | `capability_invalid_empty_write_roots` | `write_roots=[]` の capability で書き込もうとした | `record-launch` の `--request-json` に `allowed_output_paths` が正しく設定されているか確認する |
+
+## Substep timeout 復旧 {#substep-timeout-recovery}
+
+子 Agent tool が API stream idle timeout で途中切断された場合、orchestration agent は `record-timeout` を呼んで終端 entry を確定させる。**ad-hoc な `run_record_timeout_*.py` script を `workspace/tmp/` に書いてはならない**（`validate_workspace_root` gate が `*.py` を fail する原因になる）。
+
+**前提**: `record-timeout` を呼ぶ前に必ず以下の順で実行すること。Adv-14/Adv-20/Adv-30 ガードにより、いずれかが欠けると ValueError で停止する（誤発火による live agent の scratch 削除防止）。
+
+1. `record-child-return --agent-run-id <arid> --return-token <token>`: orchestration agent が Agent tool の return を実際に観測した証跡 (`child_returns/<arid>.txt`) を記録。`<token>` は `record-launch` 時に自動生成され `launches/<arid>.parent_return_token` に保存されている (Adv-30: 任意 caller による forge を防ぐ parent-bound nonce)。
+2. `deactivate-child --child-run-id <arid>`: ack を確認 + token 一致を再検証したうえで active marker を解除
+3. `record-timeout --agent-run-id <arid> --reason ...`: 終端 entry を記録
+
+```bash
+RETURN_TOKEN=$(cat workspace/orchestrations/<orchestration_id>/launches/<child_agent_run_id>.parent_return_token)
+
+python3 tools/orchestration_runtime.py record-child-return \
+  --repo-root . \
+  --orchestration-id <orchestration_id> \
+  --agent-run-id <child_agent_run_id> \
+  --return-token "$RETURN_TOKEN"
+
+python3 tools/orchestration_runtime.py deactivate-child \
+  --repo-root . \
+  --orchestration-id <orchestration_id> \
+  --child-run-id <child_agent_run_id>
+
+python3 tools/orchestration_runtime.py record-timeout \
+  --repo-root . \
+  --orchestration-id <orchestration_id> \
+  --agent-run-id <child_agent_run_id> \
+  --reason "API stream idle timeout after 600s"
+```
+
+`record-timeout` は内部で以下を行う:
+
+1. `launches/<agent_run_id>.request.json` と `.response.json` から `agent_role` / `node_key` / `step` / `substep` / `agent_backend` / `agent_session_id` / `started_at` を導出する。
+2. `record-agent-run` を `status="timeout"` で呼び出す。これにより `agent_runs.jsonl` に終端 entry が追記され、`_validate_actual_write_paths` が部分書き込み（途中まで生成された artifact）の整合チェックを実行する。
+3. 部分書き込みに `unauthorized` paths があれば `violations/<arid>.unauthorized_write_violation.json` を残す。
+4. `workspace/tmp/<agent_run_id>/` を再帰削除する（`_cleanup_agent_tmp_root`）。
+
+呼び出し後、orchestration agent は `set-status --status fail_closed --reason-code <code> --reason-detail <detail>` を続けて呼び、orchestration 自体を終端させる。`fail_closed` reason は timeout 単独なら `child_agent_timeout`、部分書き込みも検出された場合は `noncanonical_phase_write_attempt` を使う。
+
+### Wedged child の escape hatch（Adv-26）
+
+Agent tool プロセスが return を一切観測できない異常状態（外部 kill 等）で `record-child-return` が書けない場合に限り、`record-timeout --force-reason "<operator override 内容>"` で marker check を bypass できる。
+
+```bash
+python3 tools/orchestration_runtime.py record-timeout \
+  --repo-root . \
+  --orchestration-id <orchestration_id> \
+  --agent-run-id <child_agent_run_id> \
+  --reason "Agent process killed by SIGKILL after 30 minutes" \
+  --force-reason "operator override: PID 12345 confirmed terminated externally"
+```
+
+bypass 時は `forced=True` と `forced_reason` が `agent_runs.jsonl` の entry および `agent.summary.txt` に記録される。通常の `record-child-return → deactivate-child → record-timeout` フローを優先し、`--force-reason` は最終手段として使用すること。

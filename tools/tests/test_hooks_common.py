@@ -410,6 +410,66 @@ class HookCommonTests(unittest.TestCase):
         self.assertEqual(body.get("decision"), "block")
         self.assertNotIn("continue_processing", body)
 
+    def test_claude_adapter_encode_decision_block_surfaces_fix_hint(self) -> None:
+        adapter = ClaudeHookAdapter()
+        decision = HookDecision(
+            action=HookDecisionAction.BLOCK,
+            reason="unauthorized write: foo",
+            audit_detail={
+                "policy": "output_manifest_write_guard",
+                "fix_hint": {
+                    "next_command": "export TMPDIR=$(jq ...)",
+                    "docs_ref": "docs/RUNBOOK.md#hook-recovery",
+                    "note": "set TMPDIR first",
+                },
+            },
+        )
+        code, stdout_text = adapter.encode_decision(decision)
+        self.assertEqual(code, 2)
+        body = json.loads(stdout_text)
+        reason = body.get("reason", "")
+        self.assertIn("unauthorized write: foo", reason)
+        self.assertIn("Fix: export TMPDIR=$(jq ...)", reason)
+        self.assertIn("Docs: docs/RUNBOOK.md#hook-recovery", reason)
+        self.assertIn("Note: set TMPDIR first", reason)
+
+    def test_codex_adapter_encode_decision_block_surfaces_fix_hint(self) -> None:
+        adapter = CodexHookAdapter()
+        decision = HookDecision(
+            action=HookDecisionAction.BLOCK,
+            reason="forbidden inline write",
+            audit_detail={
+                "policy": "forbid_python_inline_write",
+                "fix_hint": {
+                    "next_command": "cat /proc/sys/kernel/random/uuid",
+                    "docs_ref": "docs/RUNBOOK.md#hook-recovery",
+                },
+            },
+        )
+        code, stdout_text = adapter.encode_decision(decision)
+        self.assertEqual(code, 2)
+        body = json.loads(stdout_text)
+        reason = body.get("reason", "")
+        self.assertIn("forbidden inline write", reason)
+        self.assertIn("Fix: cat /proc/sys/kernel/random/uuid", reason)
+        self.assertIn("Docs: docs/RUNBOOK.md#hook-recovery", reason)
+
+    def test_format_block_reason_with_hint_no_audit_detail_returns_base(self) -> None:
+        from tools.hooks.common import format_block_reason_with_hint
+
+        decision = HookDecision(action=HookDecisionAction.BLOCK, reason="denied")
+        self.assertEqual(format_block_reason_with_hint(decision), "denied")
+
+    def test_format_block_reason_with_hint_no_fix_hint_returns_base(self) -> None:
+        from tools.hooks.common import format_block_reason_with_hint
+
+        decision = HookDecision(
+            action=HookDecisionAction.BLOCK,
+            reason="denied",
+            audit_detail={"policy": "x"},
+        )
+        self.assertEqual(format_block_reason_with_hint(decision), "denied")
+
 
 class ValidateWriteAccessDirectoryAllowlistTests(unittest.TestCase):
     """validate_write_access: extension policy must be enforced for directory allowlist entries."""
@@ -1602,6 +1662,131 @@ class FixHintInAuditDetailTests(unittest.TestCase):
         self.assertIn("next_command", fix_hint)
         self.assertIn("docs_ref", fix_hint)
         self.assertIn("docs/RUNBOOK.md#hook-recovery", fix_hint["docs_ref"])
+
+    def test_bash_redirect_to_exact_pinned_path_requires_gate_provenance(self) -> None:
+        """Fix 2: Bash heredoc/redirect to an exact-pinned allowed_output_paths
+        target must be blocked unless the path is in allowed_file_tool_paths.
+        Matches the post-hoc check in record-agent-run that requires gate
+        provenance for paths absent from manifest_file_tool_paths."""
+        from tools.hooks.common import validate_write_access
+        import tempfile
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._write_manifest(
+                repo_root,
+                orchestration_id="orchB",
+                agent_run_id="runB",
+                allowed_output_paths=["workspace/pipelines/x/lineage.json"],
+            )
+            decision = validate_write_access(
+                repo_root,
+                "orchB",
+                "runB",
+                "workspace/pipelines/x/lineage.json",
+                tool_name="Bash",
+            )
+        self.assertEqual(decision.action, HookDecisionAction.BLOCK)
+        audit = decision.audit_detail or {}
+        self.assertEqual(audit.get("policy"), "enforce_guarded_apply_patch")
+        self.assertEqual(audit.get("tool_name"), "Bash")
+
+    def test_bash_redirect_to_allowed_file_tool_path_is_allowed(self) -> None:
+        """Bash redirect to a path explicitly in allowed_file_tool_paths is
+        allowed (matches Edit/Write semantics and post-hoc acceptance)."""
+        from tools.hooks.common import validate_write_access
+        import tempfile
+        import json as _json
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            mdir = repo_root / "workspace" / "orchestrations" / "orchBA" / "output_manifests"
+            mdir.mkdir(parents=True, exist_ok=True)
+            (mdir / "runBA.json").write_text(_json.dumps({
+                "agent_run_id": "runBA",
+                "allowed_output_paths": ["workspace/pipelines/x/src/foo.f90"],
+                "allowed_file_tool_paths": ["workspace/pipelines/x/src/foo.f90"],
+                "allowed_tmp_root": "workspace/tmp/runBA",
+            }), encoding="utf-8")
+            decision = validate_write_access(
+                repo_root,
+                "orchBA",
+                "runBA",
+                "workspace/pipelines/x/src/foo.f90",
+                tool_name="Bash",
+            )
+        self.assertEqual(decision.action, HookDecisionAction.ALLOW)
+
+    def test_output_manifest_write_guard_fix_hint_is_hook_safe(self) -> None:
+        """Adversarial review Adv-1: the surfaced fix_hint.next_command must
+        itself pass forbid_python_inline_write so the agent does not get
+        looped into a second BLOCK on recovery. Use jq, not `python3 -c`.
+        """
+        from tools.hooks.common import validate_write_access, evaluate_common_policy
+        import tempfile
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._write_manifest(
+                repo_root,
+                orchestration_id="orchHS",
+                agent_run_id="runHS",
+                allowed_output_paths=["workspace/outputs/"],
+            )
+            decision = validate_write_access(
+                repo_root,
+                "orchHS",
+                "runHS",
+                "workspace/bad/out.json",
+                tool_name="Write",
+            )
+        self.assertEqual(decision.action, HookDecisionAction.BLOCK)
+        next_cmd = ((decision.audit_detail or {}).get("fix_hint") or {}).get("next_command", "")
+        self.assertTrue(next_cmd, "fix_hint.next_command must be present")
+        # The recovery command itself must not be blocked by forbid_python_inline_write.
+        self.assertNotIn("python3 -c", next_cmd,
+                         "next_command must avoid `python3 -c` (blocked by forbid_python_inline_write)")
+        self.assertNotIn("python3 -", next_cmd,
+                         "next_command must avoid `python3 - <<EOF` (blocked by forbid_python_inline_write)")
+        self.assertIn("jq", next_cmd, "next_command should use jq for manifest reads")
+        # Sanity: the recovery command should pass evaluate_common_policy in workflow mode.
+        with patch.dict(os.environ, {"METDSL_WORKFLOW_MODE": "1"}, clear=False):
+            recovery_decision = evaluate_common_policy(
+                HookInput(
+                    event_name=HookEventName.PRE_COMMAND_EXECUTE,
+                    backend="claude",
+                    payload={"command": next_cmd},
+                    command=next_cmd,
+                )
+            )
+        self.assertNotEqual(
+            recovery_decision.action, HookDecisionAction.BLOCK,
+            f"recovery command itself was blocked by hook policy: {recovery_decision.reason}"
+        )
+
+    def test_bash_redirect_to_tmpdir_is_allowed(self) -> None:
+        """Bash redirect into allowed_tmp_root remains permitted (TMPDIR is the
+        sanctioned scratch area for heredocs and patch staging)."""
+        from tools.hooks.common import validate_write_access
+        import tempfile
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._write_manifest(
+                repo_root,
+                orchestration_id="orchT",
+                agent_run_id="runT",
+                allowed_output_paths=["workspace/pipelines/x/lineage.json"],
+                allowed_tmp_root="workspace/tmp/runT",
+            )
+            decision = validate_write_access(
+                repo_root,
+                "orchT",
+                "runT",
+                "workspace/tmp/runT/scratch.patch",
+                tool_name="Bash",
+            )
+        self.assertEqual(decision.action, HookDecisionAction.ALLOW)
 
 
 class DevShmWriteBlockTests(unittest.TestCase):

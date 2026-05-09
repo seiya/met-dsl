@@ -21,6 +21,11 @@ repair_strategy: <repair_strategy>
 repair_target_agent_run_id: <repair_target_agent_run_id>
 repair_reason: <repair_reason>
 
+**Step 0（最初の Bash で必ず実行）** — 1 行コマンド:
+    export TMPDIR=$(jq -er '.allowed_tmp_root' "workspace/orchestrations/<orchestration_id>/output_manifests/<agent_run_id>.json")
+
+以降の `cat > ...`、`mkdir -p ...`、heredoc は **すべて** `$TMPDIR/` 配下で行う。canonical path（`workspace/pipelines/...`、`workspace/plans/...`、`lineage.json` 等）への直接書き込みは、`Edit`/`Write` tool で `allowed_file_tool_paths` に登録済みのものに限る。それ以外は `guarded-apply-patch` を必須とし、Bash heredoc で書くと `enforce_guarded_apply_patch` でブロックされる。
+
 必須要件:
 - あなたは phase artifacts を直接生成する担当である。
 - この step は標準 substep を持たない phase である。自身で step 契約を完了させること。
@@ -79,6 +84,11 @@ issue_severity: <issue_severity>
 repair_strategy: <repair_strategy>
 repair_target_agent_run_id: <repair_target_agent_run_id>
 repair_reason: <repair_reason>
+
+**Step 0（最初の Bash で必ず実行）** — 1 行コマンド:
+    export TMPDIR=$(jq -er '.allowed_tmp_root' "workspace/orchestrations/<orchestration_id>/output_manifests/<agent_run_id>.json")
+
+以降の `cat > ...`、`mkdir -p ...`、heredoc は **すべて** `$TMPDIR/` 配下で行う。canonical path（`workspace/pipelines/...`、`workspace/plans/...`、`lineage.json` 等）への直接書き込みは、`Edit`/`Write` tool で `allowed_file_tool_paths` に登録済みのものに限る。それ以外は `guarded-apply-patch` を必須とし、Bash heredoc で書くと `enforce_guarded_apply_patch` でブロックされる。
 
 必須要件:
 - 契約された入力だけを読むこと。

@@ -13,6 +13,7 @@ from tools.hooks.common import (
     HookEventName,
     HookInput,
     _lookup_payload_field,
+    format_block_reason_with_hint,
     normalize_hook_event_name,
 )
 
@@ -70,7 +71,7 @@ class CodexHookAdapter(HookBackendAdapter):
         if decision.action == HookDecisionAction.BLOCK:
             body = {
                 "decision": "block",
-                "reason": decision.reason or "blocked by policy",
+                "reason": format_block_reason_with_hint(decision),
                 "continue_processing": bool(decision.continue_processing),
             }
             return 2, json.dumps(body, ensure_ascii=False)
