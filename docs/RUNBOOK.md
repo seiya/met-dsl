@@ -6,6 +6,18 @@
 - `spec` の `Controlled Spec`（物理定義）と `tests`（検証プロファイル）から実行と判定を行い、物理妥当性と性能を評価する。
 - 失敗の原因を**Spec / Plan / Generate / Execute / Judge / Tune / Promote**のどこにあるか切り分ける。
 
+## 0-1. 必須 CLI tools
+
+workflow 実行および本 RUNBOOK の修復手順は以下の CLI を前提とする。いずれも sandbox の `/usr/bin` 系から呼び出せる前提で記載されている。
+
+| ツール | 用途 | 代表箇所 |
+|---|---|---|
+| `python3` | workflow runtime（`tools/orchestration_runtime.py` 等） | 全 phase |
+| `jq` | output_manifest 等 JSON からの shell 変数抽出（`python3 -c "import json; ..."` は `forbid_python_inline_write` でブロックされるため代替不可） | hook-recovery / `$TMPDIR` 確定 |
+| `git` | `write_scope_baseline` / `git apply`（`guarded-apply-patch` 内部で使用）/ status 検査 | 全 phase |
+
+不在の場合は `tools/run_workflow.py` 起動時点で fail-fast する（`{status: fail, reason: missing_required_cli_tools, ...}` の構造化エラーで exit 2）。bwrap profile が `/usr` を ro-bind することにより sandbox 内でも上記 tool が利用可能。
+
 ## 1. 入力と artifact（最小）
 - 入力: `CONTROLLED_SPEC`（物理・アルゴリズム定義）
 - 入力: `tests`（自然言語中心のケース展開・実行条件・判定閾値）
@@ -208,10 +220,10 @@ workflow 実行中に hook がブロックした場合、`reason` と `audit_det
 
 | policy | ブロックされた操作の例 | 取るべき次の 1 アクション |
 |---|---|---|
-| `read_manifest_read_guard` | 許可 root 外のファイルを `Read` した | `read_manifests/<agent_run_id>.json` の `allowed_read_roots` を確認し、必要なら `run-gate --gate orchestration_read` 経由で読む。`MEMORY.md`・`README.md`・`.claude/settings.json` は orchestration agent では想定ブロック（無視してよい） |
-| `output_manifest_write_guard` | `/tmp`・`/dev/shm`・manifest 外 path への書き込み | `$TMPDIR` を `export TMPDIR=$(python3 -c "import json; print(json.load(open('workspace/orchestrations/<oid>/output_manifests/<id>.json'))['allowed_tmp_root'])")` で確定してから `${TMPDIR}/` 配下を使う |
+| `read_manifest_read_guard` | 許可 root 外のファイルを `Read` した | `read_manifests/<agent_run_id>.json` の `allowed_read_roots` を確認し、必要なら `run-gate --gate orchestration_read` 経由で読む。`MEMORY.md`・`README.md`・`.claude/settings.json` は orchestration agent では想定ブロック（無視してよい）。**自身の `launches/<agent_run_id>.prompt.txt` は Agent tool 入力で既に渡されているため再読不要** |
+| `output_manifest_write_guard` | `/tmp`・`/dev/shm`・manifest 外 path への書き込み | `set -e` の下で `export TMPDIR=$(jq -er '.allowed_tmp_root // empty' workspace/orchestrations/<oid>/output_manifests/<id>.json)` を実行して `$TMPDIR` を確定してから `${TMPDIR}/` 配下を使う。`-e` + `// empty` により file 不在 / field 欠損時は exit 1 で fail-fast（`python3 -c "import json; ..."` は `forbid_python_inline_write` でブロックされる） |
 | `enforce_guarded_apply_patch` | `Edit`/`Write`/`apply_patch` で `.json`/`.txt` を書こうとした | `python3 tools/orchestration_runtime.py guarded-apply-patch --repo-root . --orchestration-id <oid> --actor-role <role> --agent-run-id <id> --paths-json '["<path>"]' --patch-file "${TMPDIR}/x.patch" --capability-token <token>` に切り替える |
-| `forbid_python_inline_write` | `python3 -c "open(...,'w')"` や `python3 - <<EOF` でファイル書き込みをしようとした | `.json`/`.txt` は `guarded-apply-patch`、その他は `Edit`/`Write` tool を使う |
+| `forbid_python_inline_write` | `python3 -c` / `python3 - <<EOF` を実行した（`audit_detail.intent_detected` で意図別に分類される） | **書き込み意図** (`open(...,'w')` / `Path.write_text` 等): `.json`/`.txt` は `guarded-apply-patch`、その他は `Edit`/`Write` tool を使う。**UUID 生成意図** (`import uuid; print(uuid.uuid4())`): `cat /proc/sys/kernel/random/uuid` を使う。**JSON 読み取り意図** (`json.load(...)` / `json.loads(...)`): `Read` tool で直接読む。Python 処理が必要なら `${TMPDIR}/x.py` に script を書いて `python3 ${TMPDIR}/x.py` で実行する |
 | `forbid_tools_direct_read` | `grep`・`cat`・`sed` で `tools/` 配下を読もうとした | `tools/` の実装は参照禁止。仕様は `docs/`・`spec/`・`skill_must_read_refs` を参照する。`guarded-apply-patch` の動作は `docs/ORCHESTRATION.md#patch-適用契約` と `launch_prompts.md` 末尾を参照 |
 | `rule_source_violation` | 他 agent の capability・gate 結果・他 phase の SKILL.md を読んだ | gate 失敗内容は `2>"${TMPDIR}/last_gate_stderr.txt"` で stderr をキャプチャして取得する。他 phase の SKILL.md は読まず、自 phase の `skill_ref` のみ参照する |
 | `forbid_git_reset_hard` | `git reset --hard` を実行しようとした | `git restore <file>` または `git checkout <file>` で個別ファイルを戻す |

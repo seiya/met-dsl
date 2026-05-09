@@ -852,6 +852,75 @@ class ForbidPythonInlineWriteNewPatternsTests(unittest.TestCase):
         policy = (decision.audit_detail or {}).get("policy", "")
         self.assertNotEqual(policy, "forbid_python_inline_write")
 
+    def test_uuid_intent_emits_proc_random_hint(self) -> None:
+        decision = self._call("python3 -c 'import uuid; print(uuid.uuid4())'")
+        self.assertEqual(decision.action, HookDecisionAction.BLOCK)
+        detail = decision.audit_detail or {}
+        self.assertEqual(detail.get("policy"), "forbid_python_inline_write")
+        self.assertEqual(detail.get("intent_detected"), "uuid")
+        self.assertEqual(
+            (detail.get("fix_hint") or {}).get("next_command"),
+            "cat /proc/sys/kernel/random/uuid",
+        )
+
+    def test_uuid1_and_uuid5_also_classified_as_uuid_intent(self) -> None:
+        """Pin coverage of uuid.uuid1/uuid3/uuid5 — agents that reach for
+        non-uuid4 variants must get the same `cat /proc/sys/kernel/random/uuid`
+        hint, not the default write hint."""
+        for fn in ("uuid1", "uuid3", "uuid5"):
+            decision = self._call(f"python3 -c 'import uuid; print(uuid.{fn}())'")
+            detail = decision.audit_detail or {}
+            self.assertEqual(decision.action, HookDecisionAction.BLOCK)
+            self.assertEqual(
+                detail.get("intent_detected"), "uuid",
+                msg=f"uuid.{fn} should classify as uuid intent",
+            )
+            self.assertEqual(
+                (detail.get("fix_hint") or {}).get("next_command"),
+                "cat /proc/sys/kernel/random/uuid",
+            )
+
+    def test_json_read_intent_emits_read_tool_hint(self) -> None:
+        decision = self._call(
+            "python3 -c \"import json; print(json.load(open('x.json')))\""
+        )
+        self.assertEqual(decision.action, HookDecisionAction.BLOCK)
+        detail = decision.audit_detail or {}
+        self.assertEqual(detail.get("policy"), "forbid_python_inline_write")
+        self.assertEqual(detail.get("intent_detected"), "json_read")
+        self.assertIn(
+            "Read tool",
+            (detail.get("fix_hint") or {}).get("next_command", ""),
+        )
+
+    def test_default_write_intent_emits_guarded_apply_patch_hint(self) -> None:
+        decision = self._call("python3 -c \"open('x.json','w').write('{}')\"")
+        self.assertEqual(decision.action, HookDecisionAction.BLOCK)
+        detail = decision.audit_detail or {}
+        self.assertEqual(detail.get("policy"), "forbid_python_inline_write")
+        self.assertEqual(detail.get("intent_detected"), "write")
+        self.assertIn(
+            "guarded-apply-patch",
+            (detail.get("fix_hint") or {}).get("next_command", ""),
+        )
+
+    def test_heredoc_uuid_intent_emits_proc_random_hint(self) -> None:
+        """Boundary: intent classification must work for the heredoc form, not
+        only `python -c`. The block path differs (heredoc detected by regex,
+        not by `-c` token) but the intent-detection scan over `command`
+        applies uniformly."""
+        decision = self._call(
+            "python3 - <<'EOF'\nimport uuid; print(uuid.uuid4())\nEOF"
+        )
+        self.assertEqual(decision.action, HookDecisionAction.BLOCK)
+        detail = decision.audit_detail or {}
+        self.assertEqual(detail.get("policy"), "forbid_python_inline_write")
+        self.assertEqual(detail.get("intent_detected"), "uuid")
+        self.assertEqual(
+            (detail.get("fix_hint") or {}).get("next_command"),
+            "cat /proc/sys/kernel/random/uuid",
+        )
+
 
 class AutoReadToleratedTests(unittest.TestCase):
     """B-2: orchestration agent auto-read of MEMORY.md/README.md/etc. returns allow."""

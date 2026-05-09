@@ -219,6 +219,72 @@ python3 tools/orchestration_runtime.py record-launch \
 | `node_key` | step/substep では必須 | |
 | `output_refs` | pass 終端時に必須 | |
 
+## `reserve-phase-root` コマンドテンプレート（Claude Code backend）
+
+コマンドを構築するとき以下をそのままコピーして値を埋める。`--help` を実行して引数を調べてはならない。
+
+```bash
+python3 tools/orchestration_runtime.py reserve-phase-root \
+  --repo-root . \
+  --orchestration-id <orchestration_id> \
+  --node-key <node_key> \
+  --step <plan|generate> \
+  --reserved-id <reserved_id> \
+  --reserved-by-agent-run-id <agent_run_id>
+```
+
+- `--step plan` で plan_id を、`--step generate` で pipeline_id を予約する。Plan phase は両方を 1 回ずつ実行し、`--reserved-id` には**同じ ID**（例: `flux-rsn-p0_20260509_001`）を指定する。他 phase は `--step generate` の 1 回のみ。
+- `--reserved-id` は `<slug>_<YYYYMMDD>_<seq3>` 形式（slug はハイフン区切り小文字英数。アンダースコアを slug 内に含めてはならない）。
+- `--reserved-by-agent-run-id` は当該 ID を実際に使う子 agent の UUID。
+
+## `record-agent-run` コマンドテンプレート（Claude Code backend）
+
+コマンドを構築するとき以下をそのままコピーして値を埋める。`--help` を実行して引数を調べてはならない。
+
+```bash
+python3 tools/orchestration_runtime.py record-agent-run \
+  --repo-root . \
+  --orchestration-id <orchestration_id> \
+  --agent-run-json '{
+    "agent_run_id": "<agent_run_id>",
+    "agent_role": "<orchestration|step|substep>",
+    "agent_backend": "claude",
+    "status": "<running|pass|fail|fail_closed|blocked|timeout|cancel>",
+    "started_at": "<ISO8601>",
+    "finished_at": "<ISO8601>",
+    "agent_session_id": "<agent_run_id>",
+    "context_id": "<agent_run_id>",
+    "context_isolated": true,
+    "node_key": "<node_key>",
+    "step": "<step>",
+    "substep": "<substep_or_omit_for_step_agent>",
+    "output_refs": ["<path>", ...]
+  }'
+```
+
+- 終端 status (`pass` / `fail` / `fail_closed` / `blocked` / `timeout` / `cancel`) では `finished_at` を必須とする。
+- `pass` 終端では `output_refs` を必須とする。
+- step/substep role では `agent_session_id` / `context_id` / `context_isolated` / `node_key` を必須とする。Claude Code では `agent_session_id` と `context_id` は `agent_run_id` と同値で記録する。
+- orchestration role の `running` 初期 entry は `init_orchestration()` が自動挿入するため orchestration agent からは呼び出さない。終端 entry のみ orchestration agent が `set-status` 実行後に追記する。
+
+## `set-status` コマンドテンプレート（Claude Code backend）
+
+コマンドを構築するとき以下をそのままコピーして値を埋める。`--help` を実行して引数を調べてはならない。
+
+```bash
+python3 tools/orchestration_runtime.py set-status \
+  --repo-root . \
+  --orchestration-id <orchestration_id> \
+  --status <running|pass|fail|fail_closed> \
+  --reason-code <reason_code_or_omit> \
+  --reason-detail <reason_detail_or_omit> \
+  --blocking-policy-scope <scope_or_omit>
+```
+
+- `--reason-code` / `--reason-detail` / `--blocking-policy-scope` は `fail` / `fail_closed` 時に必要。`pass` では省略可。
+- 省略する optional flag は **flag ごと外す**（空文字や `omit` 文字列を値として渡してはならない）。例: `pass` 時は `--reason-code` の行ごと削除する。
+- orchestration agent は本コマンドを実行した後に `record-agent-run` で orchestration role の終端 entry を追記する。
+
 ## execution platform 別の補足
 
 execution platform ごとの子 `agent` 起動ツールと `preflight` 引数の対応は `CLAUDE.md` の「execution platform 別の子 `agent` 起動ツール」を参照する。

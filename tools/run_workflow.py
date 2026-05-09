@@ -37,6 +37,16 @@ PHASE_ALIASES = {
 }
 PHASE_ORDER = ["Plan", "Generate", "Build", "Execute", "Judge", "Tune", "Promote"]
 
+# CLI tools the workflow runtime and its hook-recovery procedures depend on.
+# Documented in docs/RUNBOOK.md#0-1. Missing any one fails the run before init,
+# so agents never hit a partial-failure state where (e.g.) jq is unavailable
+# but TMPDIR extraction is already prescribed.
+REQUIRED_CLI_TOOLS = ("python3", "jq", "git")
+
+
+def _check_required_cli_tools() -> list[str]:
+    return [tool for tool in REQUIRED_CLI_TOOLS if shutil.which(tool) is None]
+
 
 @dataclass(frozen=True)
 class RuntimeResult:
@@ -647,6 +657,22 @@ def _resolve_existing_ref_path(repo_root: Path, ref: str, *, field_name: str) ->
 
 def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
+    missing_tools = _check_required_cli_tools()
+    if missing_tools:
+        print(
+            json.dumps(
+                {
+                    "status": "fail",
+                    "reason": "missing_required_cli_tools",
+                    "detail": f"missing tools: {','.join(missing_tools)}",
+                    "missing": missing_tools,
+                    "required": list(REQUIRED_CLI_TOOLS),
+                    "docs_ref": "docs/RUNBOOK.md#0-1",
+                },
+                ensure_ascii=False,
+            )
+        )
+        return 2
     try:
         workflow_mode = _normalize_workflow_mode(args.mode)
         until_phase = _normalize_phase(args.until_phase)

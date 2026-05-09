@@ -544,6 +544,94 @@ class RunWorkflowTests(unittest.TestCase):
             self.assertEqual(code, 2)
             self.assertFalse(observed_calls)
 
+    def test_main_fails_fast_when_required_cli_tool_missing(self) -> None:
+        """If jq (or any REQUIRED_CLI_TOOLS entry) is not on PATH, main() must
+        return 2 with status=fail/reason=missing_required_cli_tools BEFORE
+        running any orchestration_runtime command. This protects against
+        partial-failure states where downstream procedures (e.g. TMPDIR
+        extraction via jq) would otherwise be prescribed despite the tool
+        being absent."""
+        original_which = run_workflow.shutil.which
+
+        def fake_which(name: str) -> str | None:
+            if name == "jq":
+                return None
+            return original_which(name)
+
+        observed_calls: list[list[str]] = []
+
+        def fake_runtime(repo_root, env, args):  # type: ignore[no-untyped-def]
+            observed_calls.append(list(args))
+            raise AssertionError("orchestration_runtime must not be invoked")
+
+        original_runtime = run_workflow._runtime_command
+        run_workflow.shutil.which = fake_which  # type: ignore[assignment]
+        run_workflow._runtime_command = fake_runtime  # type: ignore[assignment]
+        try:
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                code = run_workflow.main([
+                    "spec/problem/dummy.md",
+                    "Plan",
+                    "--llm",
+                    "claude",
+                ])
+        finally:
+            run_workflow.shutil.which = original_which  # type: ignore[assignment]
+            run_workflow._runtime_command = original_runtime  # type: ignore[assignment]
+
+        self.assertEqual(code, 2)
+        self.assertFalse(observed_calls)
+        payload = json.loads(buf.getvalue().strip())
+        self.assertEqual(payload.get("status"), "fail")
+        self.assertEqual(payload.get("reason"), "missing_required_cli_tools")
+        self.assertEqual(payload.get("missing"), ["jq"])
+        self.assertIn("python3", payload.get("required", []))
+        self.assertEqual(payload.get("detail"), "missing tools: jq")
+
+    def test_check_required_cli_tools_returns_empty_when_all_present(self) -> None:
+        """Sanity check: in the test environment all required tools are
+        present, so the helper returns []. If this fails, the test environment
+        is missing a tool needed for workflow runs."""
+        self.assertEqual(run_workflow._check_required_cli_tools(), [])
+
+    def test_main_reports_multiple_missing_tools_in_detail(self) -> None:
+        """When multiple required tools are missing, `detail` must enumerate
+        all of them as a comma-separated list (no spaces). This pins the
+        format so future separator changes don't silently drift away from the
+        documented shape in docs/RUNBOOK.md#0-1."""
+        original_which = run_workflow.shutil.which
+
+        def fake_which(name: str) -> str | None:
+            if name in {"jq", "git"}:
+                return None
+            return original_which(name)
+
+        original_runtime = run_workflow._runtime_command
+
+        def fake_runtime(repo_root, env, args):  # type: ignore[no-untyped-def]
+            raise AssertionError("orchestration_runtime must not be invoked")
+
+        run_workflow.shutil.which = fake_which  # type: ignore[assignment]
+        run_workflow._runtime_command = fake_runtime  # type: ignore[assignment]
+        try:
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                code = run_workflow.main([
+                    "spec/problem/dummy.md",
+                    "Plan",
+                    "--llm",
+                    "claude",
+                ])
+        finally:
+            run_workflow.shutil.which = original_which  # type: ignore[assignment]
+            run_workflow._runtime_command = original_runtime  # type: ignore[assignment]
+
+        self.assertEqual(code, 2)
+        payload = json.loads(buf.getvalue().strip())
+        self.assertEqual(payload.get("missing"), ["jq", "git"])
+        self.assertEqual(payload.get("detail"), "missing tools: jq,git")
+
 
 if __name__ == "__main__":
     unittest.main()

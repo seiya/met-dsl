@@ -476,6 +476,33 @@ def evaluate_common_policy(hook_input: HookInput) -> HookDecision:
                         "python - <<EOF heredoc inline execution is forbidden in workflow mode"
                     )
             if _py_inline_blocked:
+                # Intent classification — uuid / json_read / write (default).
+                # The block is unconditional, but the recovery hint differs by
+                # intent: agents commonly reach for `python -c` to (a) generate
+                # a UUID, (b) inspect a JSON file, or (c) write a file. Pointing
+                # them at the canonical alternative for the actual intent
+                # eliminates the retry loop.
+                intent = "write"
+                hint_next = (
+                    "python3 tools/orchestration_runtime.py guarded-apply-patch "
+                    "--repo-root . --orchestration-id <oid> --actor-role <role> "
+                    "--agent-run-id <id> --paths-json '[\"<path>\"]' "
+                    "--patch-file ${TMPDIR}/x.patch --capability-token <token>"
+                )
+                if re.search(r"uuid\.uuid[1345]\s*\(", command):
+                    # Cover uuid1/uuid3/uuid4/uuid5 — agents typically reach
+                    # for uuid4, but uuid1 (host+time) and uuid5 (namespace
+                    # SHA-1) also appear. Pattern requires `uuid.<fn>(` so
+                    # bare `uuid` strings (e.g. paths/log lines) don't match.
+                    intent = "uuid"
+                    hint_next = "cat /proc/sys/kernel/random/uuid"
+                elif re.search(r"json\s*\.\s*loads?\s*\(", command):
+                    intent = "json_read"
+                    hint_next = (
+                        "Use the Read tool for the JSON file directly; if Python is "
+                        "required, write a script to ${TMPDIR}/x.py and run "
+                        "`python3 ${TMPDIR}/x.py`."
+                    )
                 return HookDecision(
                     action=HookDecisionAction.BLOCK,
                     reason=(
@@ -493,13 +520,9 @@ def evaluate_common_policy(hook_input: HookInput) -> HookDecision:
                     audit_detail={
                         "policy": "forbid_python_inline_write",
                         "command": command,
+                        "intent_detected": intent,
                         "fix_hint": {
-                            "next_command": (
-                                "python3 tools/orchestration_runtime.py guarded-apply-patch "
-                                "--repo-root . --orchestration-id <oid> --actor-role <role> "
-                                "--agent-run-id <id> --paths-json '[\"<path>\"]' "
-                                "--patch-file ${TMPDIR}/x.patch --capability-token <token>"
-                            ),
+                            "next_command": hint_next,
                             "docs_ref": "docs/RUNBOOK.md#hook-recovery",
                         },
                     },
