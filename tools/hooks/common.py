@@ -522,7 +522,7 @@ def evaluate_common_policy(hook_input: HookInput) -> HookDecision:
                     # SHA-1) also appear. Pattern requires `uuid.<fn>(` so
                     # bare `uuid` strings (e.g. paths/log lines) don't match.
                     intent = "uuid"
-                    hint_next = "cat /proc/sys/kernel/random/uuid"
+                    hint_next = "python3 tools/new_agent_run_id.py"
                 elif re.search(r"json\s*\.\s*loads?\s*\(", command):
                     intent = "json_read"
                     hint_next = (

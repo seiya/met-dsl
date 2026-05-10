@@ -46,7 +46,7 @@ repair_reason: <repair_reason>
 - `gates/<agent_run_id>/` 配下の内部 gate ファイル（`apply_patch_writes.json` 等）は、自身の `agent_run_id` に対応するものであっても直接読んではならない。gate 実行結果の取得は **`run-gate` / `guarded-apply-patch` の stderr** を canonical 経路とし、`2>"${TMPDIR}/last_gate_stderr.txt"` で保存して参照すること（例: `python3 tools/orchestration_runtime.py run-gate --gate ... 2>"${TMPDIR}/last_gate_stderr.txt"`）。失敗時の `violations[]` は stderr に JSON 形式で出力される。要約は `agent.summary.txt` / `step_result.json` を参照すること。他 agent の内部 artifact（`capabilities/`・`output_manifests/`・`read_manifests/`・`access_logs/`・`agents/<other_agent_run_id>/`・`dialogs/` 配下で自身の `agent_run_id` に対応しないファイル）も同様に直接読んではならない。cross-agent read は `rule_source_violation` を発火し phase を fail させる。
 - `python3 -c "..."` や `python3 - <<'EOF'` でファイルへの書き込み（`open(path, 'w'/'a'/'x')`・`Path.write_text`・`shutil.copy*` 等）を行ってはならない。`forbid_python_inline_write` でブロックされる。`.json`/`.txt` は `guarded-apply-patch`、その他は `Edit`/`Write` tool を使うこと。
 - JSON ファイルの内容確認は `Read` tool を使うこと。`python3 -c "import json; ..."` は `forbid_python_inline_write` でブロックされる。Python 処理がどうしても必要な場合のみ `${TMPDIR}/x.py` に script を書き `python3 ${TMPDIR}/x.py` で実行する。
-- UUID 生成は `cat /proc/sys/kernel/random/uuid` を使うこと。`python3 -c 'import uuid; print(uuid.uuid4())'` は `-S` 等の flag を含めて全て `forbid_python_inline_write` でブロックされる。
+- UUID 生成は `python3 tools/new_agent_run_id.py` を使うこと。`python3 -c 'import uuid; print(uuid.uuid4())'` は `-S` 等の flag を含めて全て `forbid_python_inline_write` でブロックされる。`cat /proc/sys/kernel/random/uuid` は session sandbox の approval 要求で都度停止するため使用しない。
 - 自身の launch prompt 本文は Agent tool 起動時の入力で渡されている。`launches/<agent_run_id>.prompt.txt` を `Read` で再読する必要はなく、`read_manifest_read_guard` でブロックされる。
 - `tools/`・`tests/`・validator script・hook 実装への `Read`/`grep`/`sed`/`cat` は `forbid_tools_direct_read` でブロックされる。要件と判定規則は `docs/`・`spec/`・`skill_must_read_refs` のみから解釈すること。`guarded-apply-patch` の内部動作（strip 判定等）は `docs/ORCHESTRATION.md` の「Patch 適用契約」と本ファイル末尾「`guarded-apply-patch` の strip について」を canonical 参照先とする。
 - 自身が生成した artifact を参照する際は `output_manifests/<agent_run_id>.json` の `allowed_output_paths` に列挙されたプロジェクトルートからの相対パス（例: `workspace/plans/...`）を使うこと。`/home/<user>/...` 等の絶対パスや `workspace/` 接頭辞を持たないパスを使ってはならない。
@@ -111,7 +111,7 @@ repair_reason: <repair_reason>
 - `gates/<agent_run_id>/` 配下の内部 gate ファイル（`apply_patch_writes.json` 等）は、自身の `agent_run_id` に対応するものであっても直接読んではならない。gate 実行結果の取得は **`run-gate` / `guarded-apply-patch` の stderr** を canonical 経路とし、`2>"${TMPDIR}/last_gate_stderr.txt"` で保存して参照すること（例: `python3 tools/orchestration_runtime.py run-gate --gate ... 2>"${TMPDIR}/last_gate_stderr.txt"`）。失敗時の `violations[]` は stderr に JSON 形式で出力される。要約は `agent.summary.txt` / `step_result.json` を参照すること。他 agent の内部 artifact（`capabilities/`・`output_manifests/`・`read_manifests/`・`access_logs/`・`agents/<other_agent_run_id>/`・`dialogs/` 配下で自身の `agent_run_id` に対応しないファイル）も同様に直接読んではならない。cross-agent read は `rule_source_violation` を発火し phase を fail させる。
 - `python3 -c "..."` や `python3 - <<'EOF'` でファイルへの書き込み（`open(path, 'w'/'a'/'x')`・`Path.write_text`・`shutil.copy*` 等）を行ってはならない。`forbid_python_inline_write` でブロックされる。`.json`/`.txt` は `guarded-apply-patch`、その他は `Edit`/`Write` tool を使うこと。
 - JSON ファイルの内容確認は `Read` tool を使うこと。`python3 -c "import json; ..."` は `forbid_python_inline_write` でブロックされる。Python 処理がどうしても必要な場合のみ `${TMPDIR}/x.py` に script を書き `python3 ${TMPDIR}/x.py` で実行する。
-- UUID 生成は `cat /proc/sys/kernel/random/uuid` を使うこと。`python3 -c 'import uuid; print(uuid.uuid4())'` は `-S` 等の flag を含めて全て `forbid_python_inline_write` でブロックされる。
+- UUID 生成は `python3 tools/new_agent_run_id.py` を使うこと。`python3 -c 'import uuid; print(uuid.uuid4())'` は `-S` 等の flag を含めて全て `forbid_python_inline_write` でブロックされる。`cat /proc/sys/kernel/random/uuid` は session sandbox の approval 要求で都度停止するため使用しない。
 - 自身の launch prompt 本文は Agent tool 起動時の入力で渡されている。`launches/<agent_run_id>.prompt.txt` を `Read` で再読する必要はなく、`read_manifest_read_guard` でブロックされる。
 - `tools/`・`tests/`・validator script・hook 実装への `Read`/`grep`/`sed`/`cat` は `forbid_tools_direct_read` でブロックされる。要件と判定規則は `docs/`・`spec/`・`skill_must_read_refs` のみから解釈すること。`guarded-apply-patch` の内部動作（strip 判定等）は `docs/ORCHESTRATION.md` の「Patch 適用契約」と本ファイル末尾「`guarded-apply-patch` の strip について」を canonical 参照先とする。
 - 自身が生成した artifact を参照する際は `output_manifests/<agent_run_id>.json` の `allowed_output_paths` に列挙されたプロジェクトルートからの相対パス（例: `workspace/plans/...`）を使うこと。`/home/<user>/...` 等の絶対パスや `workspace/` 接頭辞を持たないパスを使ってはならない。
@@ -246,7 +246,7 @@ python3 -c "import json; open('workspace/plans/.../derived_contract.json','w').w
 # NG: python3 -c による JSON 読み取り (intent_detected=json_read) — Read tool または jq を使う
 python3 -c "import json; print(json.load(open('workspace/orchestrations/<oid>/output_manifests/<id>.json'))['allowed_tmp_root'])"
 
-# NG: python3 -c による UUID 生成 (intent_detected=uuid) — cat /proc/sys/kernel/random/uuid を使う
+# NG: python3 -c による UUID 生成 (intent_detected=uuid) — python3 tools/new_agent_run_id.py を使う
 python3 -c "import uuid; print(uuid.uuid4())"
 
 # NG: heredoc リダイレクト（直接ファイル指定）

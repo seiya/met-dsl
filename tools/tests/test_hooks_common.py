@@ -441,7 +441,7 @@ class HookCommonTests(unittest.TestCase):
             audit_detail={
                 "policy": "forbid_python_inline_write",
                 "fix_hint": {
-                    "next_command": "cat /proc/sys/kernel/random/uuid",
+                    "next_command": "python3 tools/new_agent_run_id.py",
                     "docs_ref": "docs/RUNBOOK.md#hook-recovery",
                 },
             },
@@ -451,7 +451,7 @@ class HookCommonTests(unittest.TestCase):
         body = json.loads(stdout_text)
         reason = body.get("reason", "")
         self.assertIn("forbidden inline write", reason)
-        self.assertIn("Fix: cat /proc/sys/kernel/random/uuid", reason)
+        self.assertIn("Fix: python3 tools/new_agent_run_id.py", reason)
         self.assertIn("Docs: docs/RUNBOOK.md#hook-recovery", reason)
 
     def test_format_block_reason_with_hint_no_audit_detail_returns_base(self) -> None:
@@ -912,7 +912,7 @@ class ForbidPythonInlineWriteNewPatternsTests(unittest.TestCase):
         policy = (decision.audit_detail or {}).get("policy", "")
         self.assertNotEqual(policy, "forbid_python_inline_write")
 
-    def test_uuid_intent_emits_proc_random_hint(self) -> None:
+    def test_uuid_intent_emits_new_agent_run_id_hint(self) -> None:
         decision = self._call("python3 -c 'import uuid; print(uuid.uuid4())'")
         self.assertEqual(decision.action, HookDecisionAction.BLOCK)
         detail = decision.audit_detail or {}
@@ -920,13 +920,13 @@ class ForbidPythonInlineWriteNewPatternsTests(unittest.TestCase):
         self.assertEqual(detail.get("intent_detected"), "uuid")
         self.assertEqual(
             (detail.get("fix_hint") or {}).get("next_command"),
-            "cat /proc/sys/kernel/random/uuid",
+            "python3 tools/new_agent_run_id.py",
         )
 
     def test_uuid1_and_uuid5_also_classified_as_uuid_intent(self) -> None:
         """Pin coverage of uuid.uuid1/uuid3/uuid5 — agents that reach for
-        non-uuid4 variants must get the same `cat /proc/sys/kernel/random/uuid`
-        hint, not the default write hint."""
+        non-uuid4 variants must get the same new_agent_run_id.py hint, not the
+        default write hint."""
         for fn in ("uuid1", "uuid3", "uuid5"):
             decision = self._call(f"python3 -c 'import uuid; print(uuid.{fn}())'")
             detail = decision.audit_detail or {}
@@ -937,7 +937,7 @@ class ForbidPythonInlineWriteNewPatternsTests(unittest.TestCase):
             )
             self.assertEqual(
                 (detail.get("fix_hint") or {}).get("next_command"),
-                "cat /proc/sys/kernel/random/uuid",
+                "python3 tools/new_agent_run_id.py",
             )
 
     def test_json_read_intent_emits_read_tool_hint(self) -> None:
@@ -978,7 +978,7 @@ class ForbidPythonInlineWriteNewPatternsTests(unittest.TestCase):
         self.assertEqual(detail.get("intent_detected"), "uuid")
         self.assertEqual(
             (detail.get("fix_hint") or {}).get("next_command"),
-            "cat /proc/sys/kernel/random/uuid",
+            "python3 tools/new_agent_run_id.py",
         )
 
 

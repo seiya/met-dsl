@@ -7311,6 +7311,36 @@ shell_tool                       stable             true
         out = _re.sub(r"\n\s+", " ", stdout.getvalue())
         self.assertIn("Plan => spec/.../deps.yaml; Generate+ => workspace phase root", out)
 
+    def test_new_agent_run_id_script_emits_parsable_uuid(self) -> None:
+        """`tools/new_agent_run_id.py` prints a parsable UUID4 to stdout and exits 0.
+
+        Canonical UUID source for Claude Code orchestration agents — replaces
+        `cat /proc/sys/kernel/random/uuid` (blocked by session sandbox) and
+        `python3 -c 'import uuid; ...'` (blocked by forbid_python_inline_write).
+
+        Exercised via subprocess (not in-process) on purpose: the script must
+        remain runnable even when `tools.orchestration_runtime` or its import
+        graph (`tools.hooks.common`, `tools.meta_contracts`) is broken, since
+        UUID minting is the bootstrap step for every child launch. An
+        in-process import would mask that isolation property.
+        """
+        import sys as _sys
+        import uuid as _uuid
+        repo_root = Path(__file__).resolve().parents[2]
+        script = repo_root / "tools" / "new_agent_run_id.py"
+        self.assertTrue(script.is_file(), msg=f"missing canonical UUID script: {script}")
+        proc = subprocess.run(
+            [_sys.executable, str(script)],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        self.assertEqual(proc.returncode, 0, msg=proc.stderr)
+        token = proc.stdout.strip()
+        parsed = _uuid.UUID(token)
+        self.assertEqual(str(parsed), token)
+
     def test_render_launch_prompt_includes_capability_token_source_line(self) -> None:
         """launch prompt が capability_token の取得元と fail-fast 条件を含むこと。"""
         payload = {
