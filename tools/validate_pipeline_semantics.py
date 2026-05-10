@@ -1155,6 +1155,25 @@ def _validate_plan_meta_json(plan_dir: Path, violations: list[str]) -> None:
             )
 
 
+_MCP_AUDIT_LOG_BASENAME: str = "mcp_command_log.jsonl"
+
+
+def _canonical_mcp_log_refs_for_lint(meta_path: Path, repo_root: Path) -> set[str]:
+    """Canonical command_log_ref placements for `generate_meta.json` lint validation.
+
+    Only one canonical placement: sibling under `<gen_dir>/src/`. A child agent
+    that writes a forged mcp_command_log.jsonl elsewhere and points the
+    `lint_command_ref.run_linter[].command_log_ref` at it should be rejected.
+    """
+    parent = meta_path.parent
+    canonical = parent / "src" / _MCP_AUDIT_LOG_BASENAME
+    try:
+        rel = canonical.resolve().relative_to(repo_root.resolve()).as_posix()
+    except ValueError:
+        return set()
+    return {rel}
+
+
 def _iter_command_ref_entries(node: Any) -> list[dict[str, Any]]:
     refs: list[dict[str, Any]] = []
     if isinstance(node, dict):
@@ -1209,6 +1228,57 @@ def _validate_trial_meta(repo_root: Path, execution: NodeExecution, violations: 
         violations.append(f"{trial_meta_path}:source_command_ref missing")
         return
 
+    # `source_generation_id` is a hard requirement for execute trial_meta —
+    # without it, validators cannot bind quality_check evidence to a specific
+    # generation, and a writer could otherwise omit the field to silently
+    # bypass `tool_name` / mandatory `run_program` checks. Legacy artifacts
+    # under active validation must be re-recorded; post-migration writers
+    # always emit the field.
+    _src_gen_raw = data.get("source_generation_id")
+    if not isinstance(_src_gen_raw, str) or not _src_gen_raw.strip():
+        violations.append(
+            f"{trial_meta_path}:source_generation_id is required (single "
+            "trusted source for cross-phase quality_check provenance and "
+            "the gate for strict source_command_ref validation)."
+        )
+    # `source_build_id` binds run_program evidence to the specific build whose
+    # binary this execute used. Without it, a trial_meta could attribute its
+    # results to one build while having actually executed a sibling build's
+    # binary (mixed-build attribution).
+    _src_build_raw = data.get("source_build_id")
+    _trial_source_build_id: str | None = None
+    if not isinstance(_src_build_raw, str) or not _src_build_raw.strip():
+        violations.append(
+            f"{trial_meta_path}:source_build_id is required (binds "
+            "run_program evidence to the specific build whose binary the "
+            "execute run consumed)."
+        )
+    else:
+        _trial_source_build_id = _src_build_raw.strip()
+        # Verify the referenced build directory exists with a bin/ subdirectory.
+        _build_bin = (
+            execution.pipeline_dir
+            / "build"
+            / _trial_source_build_id
+            / "bin"
+        )
+        if not _build_bin.is_dir():
+            violations.append(
+                f"{trial_meta_path}:source_build_id={_trial_source_build_id!r} "
+                f"does not resolve to an existing build bin directory "
+                f"({_build_bin!s})."
+            )
+            _trial_source_build_id = None
+    declared_tool_names_in_entries: list[str] = []
+
+    # source_command_ref entries record run_program/run_threads/etc. command
+    # invocations; their log files use project-defined filenames (e.g.
+    # `run_commands.jsonl`) and do NOT use the canonical MCP audit log basename.
+    # The validator only checks command_id presence (no tool_name/ok inspection),
+    # so the forge surface here is limited to "a record exists with this id" —
+    # not meaningful evidence of successful MCP tool execution. Canonical
+    # placement is enforced separately for lint_command_ref where the validator
+    # inspects tool_name/ok and the forge becomes high-impact.
     for entry in _iter_command_ref_entries(source_command_ref):
         command_id = entry.get("command_id")
         log_ref = entry.get("command_log_ref") or entry.get("command_log_path")
@@ -1227,7 +1297,7 @@ def _validate_trial_meta(repo_root: Path, execution: NodeExecution, violations: 
         if not log_path.exists():
             violations.append(f"{trial_meta_path}:command log missing ({log_ref})")
             continue
-        found = False
+        found_record: dict[str, Any] | None = None
         for line in log_path.read_text(encoding="utf-8").splitlines():
             line = line.strip()
             if not line:
@@ -1237,12 +1307,68 @@ def _validate_trial_meta(repo_root: Path, execution: NodeExecution, violations: 
             except json.JSONDecodeError:
                 continue
             if obj.get("command_id") == command_id:
-                found = True
+                if isinstance(obj, dict):
+                    found_record = obj
                 break
-        if not found:
+        if found_record is None:
             violations.append(
                 f"{trial_meta_path}:command_id {command_id} not found in {log_ref}"
             )
+            continue
+        # Defense against forged source_command_ref evidence: every entry must
+        # declare its role via `tool_name` and the matched log record must
+        # report the same tool. Execute trial_meta only documents tools
+        # actually invoked by the execute role (run_program / run_quality_checks).
+        # `compile_project` is a build-phase tool whose evidence belongs in
+        # build_meta.json, not execute trial_meta — accepting it here would
+        # let a child claim build provenance through execute records without
+        # any role-specific lineage validation.
+        recognized_tool_names = {"run_program", "run_quality_checks"}
+        declared_tool_name_raw = entry.get("tool_name")
+        if (
+            not isinstance(declared_tool_name_raw, str)
+            or declared_tool_name_raw.strip() not in recognized_tool_names
+        ):
+            violations.append(
+                f"{trial_meta_path}:source_command_ref entry with command_id "
+                f"{command_id} must declare tool_name field in "
+                f"{sorted(recognized_tool_names)!r} (got "
+                f"{declared_tool_name_raw!r}). Each entry must commit to a "
+                f"specific MCP tool role so downstream role-specific checks "
+                f"cannot be silently skipped."
+            )
+            continue
+        declared_tool_name = declared_tool_name_raw.strip()
+        declared_tool_names_in_entries.append(declared_tool_name)
+        record_tool_name = found_record.get("tool_name")
+        if not isinstance(record_tool_name, str) or record_tool_name not in recognized_tool_names:
+            violations.append(
+                f"{trial_meta_path}:source_command_ref command_id {command_id} log "
+                f"record must declare tool_name in {sorted(recognized_tool_names)!r} "
+                f"(got {record_tool_name!r}). Records without a recognized MCP "
+                f"tool_name cannot serve as tool-execution evidence."
+            )
+            continue
+        if record_tool_name != declared_tool_name:
+            violations.append(
+                f"{trial_meta_path}:source_command_ref entry tool_name="
+                f"{declared_tool_name!r} (command_id={command_id}) does not "
+                f"match log record tool_name={record_tool_name!r}. The "
+                f"declared role must match the resolved MCP record."
+            )
+
+    # Execute trial_meta MUST contain at least one run_program entry — this is
+    # the actual execution evidence the trial is supposed to record. Without
+    # this check, a forged trial_meta with only `compile_project` /
+    # `run_quality_checks` entries (which validate via different code paths)
+    # could pass `post_execute` while never proving the program actually ran.
+    if "run_program" not in declared_tool_names_in_entries:
+        violations.append(
+            f"{trial_meta_path}:source_command_ref must include at least one "
+            f"entry with tool_name='run_program' (declared roles: "
+            f"{sorted(set(declared_tool_names_in_entries))!r}). Execute trial "
+            f"metadata requires actual program-run evidence."
+        )
 
 
 def _validate_raw_evidence(
@@ -2256,6 +2382,18 @@ def _validate_generate_lint_command_logs(
             violations.append(
                 f"{meta_path}: lint_command_ref.run_linter[{idx}].preset must not be "
                 "'mixed'; record separate fortitude and cppcheck entries"
+            )
+            continue
+
+        canonical_refs_lint = _canonical_mcp_log_refs_for_lint(meta_path, repo_root)
+        log_ref_norm = log_ref.strip().rstrip("/")
+        if canonical_refs_lint and log_ref_norm not in canonical_refs_lint:
+            violations.append(
+                f"{meta_path}: lint_command_ref.run_linter[{idx}].command_log_ref "
+                f"must be the canonical MCP audit log placement "
+                f"(expected one of {sorted(canonical_refs_lint)!r}, got {log_ref_norm!r}). "
+                "Non-canonical placements are rejected to prevent forged tool-execution "
+                "evidence."
             )
             continue
 
@@ -3587,6 +3725,42 @@ def _validate_runner_outputs(execution: NodeExecution, violations: list[str]) ->
     _validate_runner_source_files(execution, runner_files, violations)
 
 
+def _canonical_log_ref_for_run_program(
+    trial_meta_path: Path, repo_root: Path
+) -> str | None:
+    """Canonical command_log_ref placement for run_program records.
+
+    Sibling of trial_meta inside the execute node directory.
+    """
+    canonical = trial_meta_path.parent / _MCP_AUDIT_LOG_BASENAME
+    try:
+        return canonical.resolve().relative_to(repo_root.resolve()).as_posix()
+    except ValueError:
+        return None
+
+
+def _canonical_log_ref_for_run_quality_checks(
+    pipeline_dir: Path, repo_root: Path, source_generation_id: str
+) -> str | None:
+    """Canonical command_log_ref placement for the trial's specific generation.
+
+    skills/workflow-execute/SKILL.md L20 mandates run_quality_checks against
+    `project_dir=generate/<gen_id>/src/`. The canonical placement is bound
+    strictly to the trial_meta's declared `source_generation_id` — sibling
+    or older generations under the same pipeline are NOT acceptable. This
+    prevents a child from pointing trial_meta at a stale/unrelated
+    generation's audit log to forge quality-check evidence.
+    """
+    gen_id = source_generation_id.strip()
+    if not gen_id:
+        return None
+    canonical = pipeline_dir / "generate" / gen_id / "src" / _MCP_AUDIT_LOG_BASENAME
+    try:
+        return canonical.resolve().relative_to(repo_root.resolve()).as_posix()
+    except ValueError:
+        return None
+
+
 def _validate_run_program_inputs(
     repo_root: Path, execution: NodeExecution, violations: list[str]
 ) -> None:
@@ -3598,6 +3772,24 @@ def _validate_run_program_inputs(
     source_command_ref = data.get("source_command_ref")
     if source_command_ref is None:
         return
+
+    canonical_run_program_ref = _canonical_log_ref_for_run_program(
+        trial_meta_path, repo_root
+    )
+    # Bind run_program executable to trial_meta's source_build_id. The matched
+    # record's `cwd` field (project_dir) or absolute argv[0] must resolve
+    # under `<pipeline>/build/<source_build_id>/bin/`. Otherwise an execute
+    # could attribute results to one build while running a sibling build's
+    # binary (mixed-build attribution forge).
+    _trial_source_build_id = data.get("source_build_id")
+    _build_bin_abs: Path | None = None
+    if isinstance(_trial_source_build_id, str) and _trial_source_build_id.strip():
+        _build_bin_abs = (
+            execution.pipeline_dir
+            / "build"
+            / _trial_source_build_id.strip()
+            / "bin"
+        ).resolve()
 
     for entry in _iter_command_ref_entries(source_command_ref):
         command_id = entry.get("command_id")
@@ -3615,6 +3807,36 @@ def _validate_run_program_inputs(
         if matched.get("tool_name") != "run_program":
             continue
 
+        # Reject failed MCP runs as evidence: a run_program record with
+        # ok!=true means the program execution itself did not succeed, and
+        # cannot serve as proof that the workload ran. Mirrors the
+        # `run_linter` validator policy.
+        if matched.get("ok") is not True:
+            violations.append(
+                f"{trial_meta_path}:run_program command_id={command_id} "
+                f"ok must be true (got {matched.get('ok')!r}). Failed MCP "
+                f"runs cannot serve as tool-execution evidence."
+            )
+            continue
+
+        # Canonical-placement enforcement: a run_program record must be at
+        # the canonical sibling-of-trial_meta location. Records claimed at
+        # non-canonical paths (e.g. `raw/forged.jsonl` written by the agent
+        # under raw/) are rejected to prevent forged tool-execution evidence.
+        log_ref_norm = log_ref.strip().rstrip("/")
+        if (
+            canonical_run_program_ref is not None
+            and log_ref_norm != canonical_run_program_ref
+        ):
+            violations.append(
+                f"{trial_meta_path}:run_program command_id={command_id} "
+                f"command_log_ref must be the canonical MCP audit log placement "
+                f"({canonical_run_program_ref!r}, got {log_ref_norm!r}). "
+                "Non-canonical placements are rejected to prevent forged "
+                "tool-execution evidence."
+            )
+            continue
+
         command = matched.get("command")
         if not isinstance(command, list):
             continue
@@ -3627,6 +3849,45 @@ def _validate_run_program_inputs(
             violations.append(
                 f"{trial_meta_path}:run_program command_id={command_id} must include case.resolved.yaml"
             )
+
+        # Bind to source_build_id: the executed binary must live under the
+        # declared build's bin/ directory. Resolve via the matched record's
+        # `cwd` (project_dir) or argv[0] absolute path. Relative argv[0]
+        # (e.g. `./simulate`) is resolved against `cwd`.
+        if _build_bin_abs is not None and command:
+            executable = command[0]
+            cwd_val = matched.get("cwd")
+            cwd_path: Path | None = None
+            if isinstance(cwd_val, str) and cwd_val.strip():
+                cwd_path = Path(cwd_val.strip())
+            executable_resolved: Path | None = None
+            if isinstance(executable, str) and executable.strip():
+                exe_path = Path(executable.strip())
+                if exe_path.is_absolute():
+                    try:
+                        executable_resolved = exe_path.resolve()
+                    except (OSError, RuntimeError):
+                        executable_resolved = None
+                elif cwd_path is not None:
+                    try:
+                        executable_resolved = (cwd_path / exe_path).resolve()
+                    except (OSError, RuntimeError):
+                        executable_resolved = None
+            ok_under_build_bin = False
+            if executable_resolved is not None:
+                try:
+                    executable_resolved.relative_to(_build_bin_abs)
+                    ok_under_build_bin = True
+                except ValueError:
+                    ok_under_build_bin = False
+            if not ok_under_build_bin:
+                violations.append(
+                    f"{trial_meta_path}:run_program command_id={command_id} "
+                    f"executable {executable!r} (cwd={cwd_val!r}) must "
+                    f"resolve under source_build_id={_trial_source_build_id!r}"
+                    f"'s bin directory ({_build_bin_abs!s}). Mixed-build "
+                    f"attribution is not permitted."
+                )
 
 
 def _validate_quality_check_commands(
@@ -3654,6 +3915,55 @@ def _validate_quality_check_commands(
             build_system = raw_build_system.strip().lower()
 
     generate_src_dirs = _generate_src_dirs(execution.pipeline_dir)
+    # The cross-phase canonical placement is bound strictly to the trial's
+    # `source_generation_id` (single source of truth). Sibling/older
+    # generations under the same pipeline are not acceptable evidence for
+    # this execute run.
+    source_generation_id_raw = data.get("source_generation_id")
+    source_generation_id: str | None = None
+    if isinstance(source_generation_id_raw, str) and source_generation_id_raw.strip():
+        source_generation_id = source_generation_id_raw.strip()
+    canonical_qc_ref: str | None = None
+    if source_generation_id is not None:
+        canonical_qc_ref = _canonical_log_ref_for_run_quality_checks(
+            execution.pipeline_dir, repo_root, source_generation_id
+        )
+        # Verify the declared generation actually exists (generate_meta.json
+        # present) and is in pass state. A forged source_generation_id could
+        # otherwise authorize an arbitrary path, and pointing at a failed or
+        # superseded generation would credit stale evidence to this run.
+        if source_generation_id is not None and canonical_qc_ref is not None:
+            gen_meta = (
+                execution.pipeline_dir
+                / "generate"
+                / source_generation_id
+                / "generate_meta.json"
+            )
+            if not gen_meta.is_file():
+                violations.append(
+                    f"{trial_meta_path}:source_generation_id={source_generation_id!r} "
+                    f"references a generation that does not exist on disk "
+                    f"({gen_meta!s} missing)."
+                )
+                canonical_qc_ref = None
+            else:
+                try:
+                    gen_meta_doc = _read_json(gen_meta)
+                except (OSError, json.JSONDecodeError):
+                    gen_meta_doc = None
+                gen_status: str | None = None
+                if isinstance(gen_meta_doc, dict):
+                    raw_status = gen_meta_doc.get("verification_status")
+                    if isinstance(raw_status, str):
+                        gen_status = raw_status.strip().lower()
+                if gen_status != "pass":
+                    violations.append(
+                        f"{trial_meta_path}:source_generation_id={source_generation_id!r} "
+                        f"references a generation with verification_status="
+                        f"{gen_status!r} (expected 'pass'). Stale or failed "
+                        f"generations cannot serve as quality_check provenance."
+                    )
+                    canonical_qc_ref = None
 
     for entry in _iter_command_ref_entries(source_command_ref):
         command_id = entry.get("command_id")
@@ -3669,6 +3979,44 @@ def _validate_quality_check_commands(
         if matched is None:
             continue
         if matched.get("tool_name") != "run_quality_checks":
+            continue
+
+        # Reject failed MCP runs as evidence: ok!=true means the
+        # quality_check itself failed, so the record cannot prove a
+        # successful quality check.
+        if matched.get("ok") is not True:
+            violations.append(
+                f"{trial_meta_path}:run_quality_checks command_id={command_id} "
+                f"ok must be true (got {matched.get('ok')!r}). Failed MCP "
+                f"runs cannot serve as tool-execution evidence."
+            )
+            continue
+
+        # source_generation_id is required when a run_quality_checks record
+        # is referenced — without it we cannot pin the canonical cross-phase
+        # placement and would risk accepting evidence from a sibling/older
+        # generation.
+        if source_generation_id is None:
+            violations.append(
+                f"{trial_meta_path}:source_generation_id must be declared "
+                f"when source_command_ref includes a run_quality_checks "
+                f"record (command_id={command_id})."
+            )
+            continue
+        if canonical_qc_ref is None:
+            # generation_id present but generate_meta.json missing — already
+            # reported above. Skip per-entry violation to avoid duplication.
+            continue
+        log_ref_norm = log_ref.strip().rstrip("/")
+        if log_ref_norm != canonical_qc_ref:
+            violations.append(
+                f"{trial_meta_path}:run_quality_checks command_id={command_id} "
+                f"command_log_ref must be the canonical MCP audit log placement "
+                f"for source_generation_id={source_generation_id!r} "
+                f"(expected {canonical_qc_ref!r}, got {log_ref_norm!r}). "
+                "Non-canonical or cross-generation placements are rejected to "
+                "prevent forged or stale tool-execution evidence."
+            )
             continue
 
         command = matched.get("command")

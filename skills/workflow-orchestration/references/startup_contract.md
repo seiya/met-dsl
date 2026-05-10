@@ -51,6 +51,8 @@ export TMPDIR=$(jq -er '.allowed_tmp_root' \
    - `TODO.md`（プロジェクトルート）
    - `CLAUDE.md`（プロジェクトルート）
    - `.claude/settings.json`
+   - `.cursor/mcp.json`（Claude Code の MCP discovery が起動直後に自動 Read する）
+   - `mcp_servers/README.md`（同上）
    - プロジェクトルート直下の `MEMORY.md`
 
    **substep agent はこれらのファイルを読もうとしてはならない**（substep にとっては通常エラー）。

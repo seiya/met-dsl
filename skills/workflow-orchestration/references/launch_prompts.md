@@ -124,6 +124,44 @@ repair_reason: <repair_reason>
 - `Plan` の `plan_meta.json` 更新時は `attempt_count` と `verification_status` と `last_fail_reason` と `debug_mode` と `context_isolated` を必須記録し、`context_isolated=false` の場合は `constraint_reason` を必須記録すること。
 - `Generate` / `Build` / `Execute` / `Judge` の substep は、直下依存 `node` の `direct dependency execution readiness` を満たさない限り開始してはならない。
 - 直下依存 `node` が未完了でも、依存先 code を対象 `node` の `src/` へ内包して代替してはならない。
+- **MCP 副次出力の `mcp_command_log.jsonl` を必ず `allowed_output_paths` に含めること**。canonical placement は phase ごとに以下:
+  - Generate substep: `<pipeline_ref>/generate/<generation_id>/src/mcp_command_log.jsonl` (run_linter)
+  - Build step (in-phase, CMake/Meson out-of-source): `<pipeline_ref>/build/<build_id>/mcp_command_log.jsonl` (compile_project, project_dir=<build_id>/)
+  - Build step (cross-phase, Make in-source for Fortran/C-family): `<pipeline_ref>/generate/<generation_id>/src/mcp_command_log.jsonl` (compile_project, project_dir=<gen>/src/)。launch request の `generation_id` で bind され、`record-launch` が `generate_meta.json` の `verification_status=pass` を検証する
+  - Execute step (in-phase): `<pipeline_ref>/execute/<execution_id>/<node_safe>/mcp_command_log.jsonl` (run_program 等)
+  - Execute step (cross-phase quality_check): `<pipeline_ref>/generate/<generation_id>/src/mcp_command_log.jsonl` (`skills/workflow-execute/SKILL.md` L20 — `toolchain.build_system=make` + Fortran/C-family では `run_quality_checks` を `project_dir=generate/<generation_id>/src/` で実行するため、log は generate ツリーに副次出力される)。Execute step の launch request に `generation_id` を含めると runtime が cross-phase canonical placement を auto-inject し、phase contract と write_roots check を bypass する。`generation_id` は `<pipeline_ref>/generate/<generation_id>/generate_meta.json` の存在で検証され、未知の generation_id (実際の generate 実行に対応しない値) を渡すと `record-launch` が `ValueError` で reject する (任意 caller による cross-phase write authorization injection 防止)。
+
+  さらに、`validate_pipeline_semantics.py` は MCP tool 実行証跡として trust する全 `command_log_ref` を canonical placement のみに制限する:
+  - `lint_command_ref.run_linter[].command_log_ref`: `<gen_dir>/src/mcp_command_log.jsonl`
+  - `source_command_ref.<run_program-key>.command_log_ref`: `<execute node_dir>/mcp_command_log.jsonl` (sibling of trial_meta)
+  - `source_command_ref.run_quality_checks.command_log_ref`: `<pipeline_ref>/generate/<source_generation_id>/src/mcp_command_log.jsonl` — `trial_meta.source_generation_id` で **単一の gen_id にのみ bind** される。同 pipeline の sibling/older generation の canonical placement は受理しない。
+
+  非 canonical path への placement (例: `<execute>/raw/forged.jsonl`) は post_generate / post_execute gate が reject する (forge MCP execution evidence の防止)。
+
+  さらに `_validate_trial_meta` は `source_command_ref` の各 entry が指す log record に **recognized MCP `tool_name`** (`run_program` / `run_quality_checks`) が含まれることを必須とする。`compile_project` は build phase の道具で execute trial_meta では受理しない。`tool_name` 欠落 / 未知の値の forge record は reject される (tool-specific validator が silent skip する経路を遮断)。
+
+  Execute step の cross-phase canonical 配置は launch request の `generation_id` フィールドにのみ bind される。`allowed_output_paths` に `<pipeline_ref>/generate/<other_gen>/src/...` (request の `generation_id` と異なる generation) を含めると phase contract が reject する。Trial_meta 側でも `source_generation_id` を必須記録とし、execute と generate の bind を確定させる。
+
+  **単一 namespace 強制:** generate / build / execute step の `allowed_output_paths` は単一の `<gen_id>` / `<build_id>` / `<exec_id>` のみを target としなければならない。同 pipeline 配下に複数 id を混在 listing すると `record-launch` が `ValueError` で reject する (sibling/older run の audit log への write authority 付与を防止)。Generate / Execute step では追加で request の `generation_id` / `execution_id` と listed paths の id が一致することを要求する (mismatch は `does not match request ...id` で reject)。
+
+  **Quality_check stale-generation 対策:** `trial_meta.source_generation_id` が指す `generate_meta.json` は `verification_status=pass` でなければならない。失敗 / 古い generation を quality_check evidence として参照すると post_execute validator が reject する。さらに **`record-launch` も** `verification_status` を check し、failed generation 配下の MCP audit log に対する write authority 付与を launch 時点で reject する (failed gen tree の provenance contamination 防止)。
+
+  **Build lineage bind (specific build):** Execute step の launch request は `source_build_id` を必須記録とし、`<pipeline>/build/<source_build_id>/build_meta.json` の `source_generation_id` と request の `generation_id` が一致しなければならない。`source_build_id` 欠落、build_meta.json 不在、`source_generation_id` 未記録、または値の mismatch は record_launch が reject する。これにより mixed-build forge (build A の binary を実行しながら build B の quality_check evidence を流用) を防止。Build step は `build_meta.json` に `source_generation_id` を必須記録 (`skills/workflow-build/SKILL.md` 参照)。
+
+  **Cross-phase auto-inject の Make-only ゲート:** `<pipeline>/generate/<generation_id>/src/mcp_command_log.jsonl` への cross-phase write authority は `toolchain.build_system=make` (Fortran/C-family in-source build) のときのみ auto-inject される。CMake/Meson/Ninja 等の out-of-source toolchain では cross-phase は注入されず、build/execute の log は in-phase canonical (`<build_id>/mcp_command_log.jsonl` または `<exec_id>/<node_safe>/mcp_command_log.jsonl`) のみ許可される。`record-launch` は `impl.resolved.yaml` の `toolchain.build_system` を読んで自動判定する。
+
+  **`ok=true` requirement for execute evidence:** post_execute validator は `run_program` / `run_quality_checks` record の `ok=true` を必須要求する。`ok=false` または `ok` 欠落の record は失敗実行とみなし、tool-execution evidence として認めない (lint validator と同じポリシー)。
+
+  **Role binding for source_command_ref:** Execute trial_meta の `source_command_ref` 各 entry は `tool_name` フィールド (= `run_program` または `run_quality_checks`) を宣言し、log record の `tool_name` と一致しなければならない。`compile_project` は build phase 専用で execute trial_meta では受理しない。trial_meta は最低 1 つ `tool_name='run_program'` entry を含むことが必須 (実プログラム実行証跡)。role mismatch (例: run_program slot に compile_project record) は forge とみなし reject される。
+
+  **Run_program log canonical placement (MCP gate enforcement):** `validate_mcp_build_tool_invocation` (MCP server pre-call gate) は `tool_name=run_program` かつ `step=execute` の呼び出しで log placement を canonical (`<pipeline_ref>/execute/<execution_id>/<node_safe>/mcp_command_log.jsonl`) のみに強制する。`project_dir` を execute node_dir に設定するか、`command_log_path` 引数で canonical absolute/relative path を明示すること。非 canonical 配置は MCP 呼び出し時点で `RuntimeError` で reject され、後の post_execute validator まで遅延しない。
+
+  **MCP audit log trust model (defense-in-depth, not cryptographic proof):** `mcp_owned_audit_logs` フィールド経由で manifest に登録された canonical log path は terminalization 時に「authorized MCP-owned write」として承認される。これは MCP server から path への write が以下 3 防御層で他経路をすべて遮断していることに依拠する: (a) hook 層が `Edit`/`Write` を `allowed_file_tool_paths` 除外で reject、(b) `guarded-apply-patch` が `mcp_owned_audit_logs` 内の path への mutation を `RuntimeError` で reject、(c) Bash heredoc/redirect も同 hook で reject。これにより canonical path への write は MCP server 経由のみが事実上可能。**ただし、これは out-of-band な MCP-side 署名や invocation cross-reference を持たないため**、もし将来 hook 層に新たな write 経路 (MCP 以外) が漏れた場合は、forge を再び許す可能性がある。完全な防御には MCP server が独自の audit ledger を残し、validator が path とその ledger を cross-reference する設計拡張が必要 (現時点では future work として認識)。
+
+  `tools/orchestration_runtime.py` の `_allowed_output_paths_for_launch()` が generate/build/execute いずれの phase でも defensive auto-inject を行うが、`record-launch` の `--request-json` で明示列挙すれば auto-inject に依存せず確定する。漏れた場合は `record-agent-run` で `unauthorized_write_violation` が発生し orchestration が `fail_closed` で停止する。本 log は integrity-protected で以下 3 経路がすべて拒否される (`validate_pipeline_semantics.py` が log の内容を信頼するため、生成は MCP server 経由のみに限定する):
+  - `Edit` / `Write` tool 直接書き込み (`allowed_file_tool_paths` から自動除外)
+  - `guarded-apply-patch` 経由のパッチ適用 (`changed_paths` / `numstat_targets` / rename 元/先 のいずれかに該当する場合 `RuntimeError`)
+  - 上記を回避する任意の Bash redirect (既存の `enforce_guarded_apply_patch` と `output_manifest_write_guard` で既にブロック済み)
 - `repair_strategy=reuse` の場合は、`repair_target_agent_run_id` の出力との差分修正に限定すること。
 - `repair_strategy=restart` の場合は、過去出力を流用せず契約入力から再生成すること。
 - 完了時は artifact 参照と status を `orchestration agent` へ返すこと。

@@ -27,6 +27,11 @@ Execute ステージの実行責務を固定し、判定可能なランタイム
 - `raw` は一次証跡のみを保存し、`diagnostics.json` の複写を `metrics_basis` として保存してはならない。
 - `stdout.log` と `stderr.log` と `trial_meta.json` を必須保存する。
 - `trial_meta.json` に `runner_command` と `process_trace_ref` と `raw_artifact_refs` を必須記録する。
+- `trial_meta.json` には `source_generation_id` を必須記録する。値は本 Execute が `quality_check` で参照する `<pipeline>/generate/<generation_id>/` の id とし、当該 `generate_meta.json` の `verification_status=pass` でなければならない (failed / stale generation を quality_check evidence として参照することを禁止する)。
+- Execute の launch request は `source_build_id` を必須記録とし、本 Execute が binary を取得する `<pipeline>/build/<source_build_id>/` の id を指定する。`record-launch` は `<source_build_id>/build_meta.json` の `source_generation_id` と request の `generation_id` が一致することを cross-reference 検証し、mismatch は reject する (mixed-build forge 防止)。
+- `trial_meta.json` の `source_command_ref` 各 entry は `tool_name` フィールドを必須宣言とし、`run_program` または `run_quality_checks` のいずれかを指定する (`compile_project` は build phase の道具で、build_meta.json に記録されるため execute trial_meta では受理しない)。entry の `tool_name` は対応する MCP `command_log` record の `tool_name` と一致しなければならない。少なくとも 1 つの entry は `tool_name='run_program'` でなければならない (実プログラム実行証跡)。
+- `run_program` の MCP `command_log` 出力は `<execute node_dir>/mcp_command_log.jsonl` (= `<pipeline>/execute/<execution_id>/<node_key>/mcp_command_log.jsonl`) を canonical placement とし、`source_command_ref.<run_program-key>.command_log_ref` は当該 path のみ許可する。`run_program` 呼び出し時は `command_log_path` 引数または `project_dir` 設定で本 path に log が落ちるよう構成する。
+- `run_quality_checks` の MCP `command_log` 出力は cross-phase canonical placement (`<pipeline>/generate/<source_generation_id>/src/mcp_command_log.jsonl`) のみ許可する。非 canonical placement (例: `raw/` 配下の任意 `.jsonl`) は `post_execute` validator で reject される。
 - `target.class=cpu` の品質比較は `threads_per_rank=1` と `threads_per_rank>1` の execution result を比較対象として保存する。
 - `quality check` の比較 canonical source は `diagnostics.json` と `verdict.json` とし、`stdout` 差分のみで合否を確定してはならない。
 - workflow artifact の保存先ルートは `workspace/` のみを許可し、workflow ルート判定は `workspace/` のみを対象とする。

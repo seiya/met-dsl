@@ -18,7 +18,11 @@ Build ステージの実行責務を固定し、再現可能なビルド artifac
 - `gcc` / `clang` / `gfortran` の単発ビルドを禁止する。
 - `toolchain.build_system=make` の場合、入力 `src/Makefile` は言語依存のコンパイル順序依存をターゲット前提条件として明示し、`make -j` で成否が変化しないことを必須とする。
 - 依存を持つ `node` は、依存 `operation` の解決先が `dependency.resolved.yaml` と一致することを `Build` 時に検証しなければならない。不一致時は `Build fail` とする。
-- `build_meta.json` に `build_system` と `compiler` と `build_log_ref` と `status` を記録する。
+- `build_meta.json` に `build_system` と `compiler` と `build_log_ref` と `status` と `source_generation_id` を記録する。`source_generation_id` は本ビルドが入力として使用した `<pipeline>/generate/<source_generation_id>/` の id を必須記録とする (Execute step が cross-phase MCP audit log の lineage 検証に使用する)。
+- `compile_project` の MCP `command_log` 出力は以下 2 つの canonical placement のみ許可する:
+  - In-source build (Make for Fortran/C/cpp/mixed): `<pipeline>/generate/<generation_id>/src/mcp_command_log.jsonl` (cross-phase, project_dir=`<gen>/src/`)。launch request に `generation_id` を必ず含めて record_launch に通すこと (failed/stale gen は record_launch が verification_status check で reject する)。
+  - Out-of-source build (CMake/Meson/Ninja): `<pipeline>/build/<build_id>/mcp_command_log.jsonl` (in-phase、project_dir=`<build_id>/`)。
+  非 canonical placement に log が落ちる構成 (例: `<build_id>/bin/mcp_command_log.jsonl`) は terminal validation で `unauthorized_write_violation` になる。
 - 出力 `bin/` は `Execute` が参照可能な相対配置にする。
 - workflow artifact の保存先ルートは `workspace/` のみを許可し、workflow ルート判定は `workspace/` のみを対象とする。
 

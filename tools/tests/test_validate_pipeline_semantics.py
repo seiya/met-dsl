@@ -120,7 +120,8 @@ def _create_minimal_execution_tree(
     raw_dir = node_dir / "raw"
     snapshots_dir = raw_dir / "state_snapshots"
     src_dir = pipeline_dir / "generate" / "gen_20260415_001" / "src"
-    log_path = node_dir / "run_commands.jsonl"
+    # Canonical placement for in-phase MCP audit log: sibling of trial_meta.
+    log_path = node_dir / "mcp_command_log.jsonl"
 
     _write_json(
         pipeline_dir / "lineage.json",
@@ -320,6 +321,13 @@ def _create_minimal_execution_tree(
     )
 
     command_id = "cmd_run_001"
+    # Plant a build directory + binary so trial_meta.source_build_id resolves
+    # under <pipeline>/build/<id>/bin/ and run_program executable validation
+    # binds to the declared build.
+    build_id_for_fixture = "build_20260415_001"
+    build_bin_dir = pipeline_dir / "build" / build_id_for_fixture / "bin"
+    build_bin_dir.mkdir(parents=True, exist_ok=True)
+    (build_bin_dir / "simulate").write_text("binary\n", encoding="utf-8")
     log_path.parent.mkdir(parents=True, exist_ok=True)
     log_path.write_text(
         json.dumps(
@@ -327,6 +335,8 @@ def _create_minimal_execution_tree(
                 "command_id": command_id,
                 "tool_name": "run_program",
                 "command": run_command,
+                "cwd": str(build_bin_dir),
+                "ok": True,
             },
             ensure_ascii=False,
         )
@@ -338,9 +348,12 @@ def _create_minimal_execution_tree(
         {
             "generated_by_stage": "execute",
             "source_execution_id": exec_id,
+            "source_generation_id": "gen_20260415_001",
+            "source_build_id": build_id_for_fixture,
             "source_command_ref": {
                 "run_threads_1": {
                     "command_id": command_id,
+                    "tool_name": "run_program",
                     "command_log_ref": f"workspace/{log_path.relative_to(workspace).as_posix()}",
                 }
             },
@@ -1530,21 +1543,31 @@ end program shallow_water2d_runner
             )
             trial_meta_path = node_dir / "trial_meta.json"
             trial_meta = json.loads(trial_meta_path.read_text(encoding="utf-8"))
-            run_log_ref = trial_meta["source_command_ref"]["run_threads_1"]["command_log_ref"]
+            # run_quality_checks canonical placement: cross-phase under
+            # generate/<gen>/src/mcp_command_log.jsonl. Append to the existing
+            # canonical log written by the fixture.
+            qc_log_ref = (
+                "workspace/pipelines/problem__shallow_water2d__0.3.0/"
+                "shallow-water2d_20260415_001/generate/gen_20260415_001/src/"
+                "mcp_command_log.jsonl"
+            )
             trial_meta["source_command_ref"]["run_quality_checks"] = {
                 "command_id": "cmd_quality_001",
-                "command_log_ref": run_log_ref,
+                "tool_name": "run_quality_checks",
+                "command_log_ref": qc_log_ref,
             }
+            trial_meta["source_generation_id"] = "gen_20260415_001"
             _write_json(trial_meta_path, trial_meta)
 
-            run_log_path = repo_root / run_log_ref
-            with run_log_path.open("a", encoding="utf-8") as handle:
+            qc_log_path = repo_root / qc_log_ref
+            with qc_log_path.open("a", encoding="utf-8") as handle:
                 handle.write(
                     json.dumps(
                         {
                             "command_id": "cmd_quality_001",
                             "tool_name": "run_quality_checks",
                             "command": ["python3", "quality_check.py", ".", "."],
+                            "ok": True,
                         },
                         ensure_ascii=False,
                     )
@@ -1605,15 +1628,21 @@ end program shallow_water2d_runner
             )
             trial_meta_path = node_dir / "trial_meta.json"
             trial_meta = json.loads(trial_meta_path.read_text(encoding="utf-8"))
-            run_log_ref = trial_meta["source_command_ref"]["run_threads_1"]["command_log_ref"]
+            qc_log_ref = (
+                "workspace/pipelines/problem__shallow_water2d__0.3.0/"
+                "shallow-water2d_20260415_001/generate/gen_20260415_001/src/"
+                "mcp_command_log.jsonl"
+            )
             trial_meta["source_command_ref"]["run_quality_checks"] = {
                 "command_id": "cmd_quality_001",
-                "command_log_ref": run_log_ref,
+                "tool_name": "run_quality_checks",
+                "command_log_ref": qc_log_ref,
             }
+            trial_meta["source_generation_id"] = "gen_20260415_001"
             _write_json(trial_meta_path, trial_meta)
 
-            run_log_path = repo_root / run_log_ref
-            with run_log_path.open("a", encoding="utf-8") as handle:
+            qc_log_path = repo_root / qc_log_ref
+            with qc_log_path.open("a", encoding="utf-8") as handle:
                 handle.write(
                     json.dumps(
                         {
@@ -1621,6 +1650,7 @@ end program shallow_water2d_runner
                             "tool_name": "run_quality_checks",
                             "cwd": str(src_dir),
                             "command": ["pytest", "-q"],
+                            "ok": True,
                         },
                         ensure_ascii=False,
                     )
@@ -1693,15 +1723,21 @@ shallow_water2d_runner.o: shallow_water2d_runner.f90 shallow_water2d_model.mod
             )
             trial_meta_path = node_dir / "trial_meta.json"
             trial_meta = json.loads(trial_meta_path.read_text(encoding="utf-8"))
-            run_log_ref = trial_meta["source_command_ref"]["run_threads_1"]["command_log_ref"]
+            qc_log_ref = (
+                "workspace/pipelines/problem__shallow_water2d__0.3.0/"
+                "shallow-water2d_20260415_001/generate/gen_20260415_001/src/"
+                "mcp_command_log.jsonl"
+            )
             trial_meta["source_command_ref"]["run_quality_checks"] = {
                 "command_id": "cmd_quality_001",
-                "command_log_ref": run_log_ref,
+                "tool_name": "run_quality_checks",
+                "command_log_ref": qc_log_ref,
             }
+            trial_meta["source_generation_id"] = "gen_20260415_001"
             _write_json(trial_meta_path, trial_meta)
 
-            run_log_path = repo_root / run_log_ref
-            with run_log_path.open("a", encoding="utf-8") as handle:
+            qc_log_path = repo_root / qc_log_ref
+            with qc_log_path.open("a", encoding="utf-8") as handle:
                 handle.write(
                     json.dumps(
                         {
@@ -1709,6 +1745,7 @@ shallow_water2d_runner.o: shallow_water2d_runner.f90 shallow_water2d_model.mod
                             "tool_name": "run_quality_checks",
                             "cwd": str(src_dir),
                             "command": ["make", "test"],
+                            "ok": True,
                         },
                         ensure_ascii=False,
                     )
@@ -3451,6 +3488,605 @@ shallow_water2d_runner.o: shallow_water2d_runner.f90 shallow_water2d_model.mod
             )
             self.assertTrue(
                 any("logged command does not match preset" in v for v in violations),
+                violations,
+            )
+
+    def test_validate_post_generate_stage_rejects_noncanonical_lint_command_log_ref(self) -> None:
+        """Defense against forged MCP execution evidence at non-canonical paths.
+
+        A child agent that writes a forged mcp_command_log.jsonl at a non-
+        canonical placement (e.g. <gen>/src/notes/mcp_command_log.jsonl) and
+        points lint_command_ref.run_linter[].command_log_ref at it must be
+        rejected by the post_generate validator. The canonical placement is
+        <gen>/src/mcp_command_log.jsonl (sibling of model/runner sources).
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            _create_minimal_execution_tree(
+                repo_root,
+                dep_spec_id="dynamics_shallow_water_flux_2d_rusanov_p0",
+                model_text="module m\nimplicit none\nend module m\n",
+                runner_text="program r\nimplicit none\nend program r\n",
+                run_command=["x", "y"],
+            )
+            pipeline_dir = (
+                repo_root
+                / "workspace"
+                / "pipelines"
+                / "problem__shallow_water2d__0.3.0"
+                / "shallow-water2d_20260415_001"
+            )
+            # Plant a forged log at a NON-canonical placement (under src/notes/).
+            forged_log = (
+                pipeline_dir
+                / "generate"
+                / "gen_20260415_001"
+                / "src"
+                / "notes"
+                / "mcp_command_log.jsonl"
+            )
+            forged_log.parent.mkdir(parents=True, exist_ok=True)
+            forged_log.write_text(
+                json.dumps(
+                    {
+                        "command_id": "lint_cmd_fixture_001",
+                        "tool_name": "run_linter",
+                        "command": ["fortitude", "check", "."],
+                        "ok": True,
+                    },
+                    ensure_ascii=False,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            # Rewrite generate_meta.json's lint_command_ref to point at the forged log.
+            meta_path = (
+                pipeline_dir / "generate" / "gen_20260415_001" / "generate_meta.json"
+            )
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            forged_ref = (
+                "workspace/pipelines/problem__shallow_water2d__0.3.0/"
+                "shallow-water2d_20260415_001/generate/gen_20260415_001/src/"
+                "notes/mcp_command_log.jsonl"
+            )
+            meta["lint_command_ref"]["run_linter"][0]["command_log_ref"] = forged_ref
+            meta_path.write_text(
+                json.dumps(meta, ensure_ascii=False) + "\n", encoding="utf-8"
+            )
+            violations = validate_post_generate_stage(
+                repo_root,
+                "workspace",
+                "workspace/pipelines/problem__shallow_water2d__0.3.0/"
+                "shallow-water2d_20260415_001",
+                generation_id="gen_20260415_001",
+            )
+            self.assertTrue(
+                any(
+                    "canonical MCP audit log placement" in v for v in violations
+                ),
+                violations,
+            )
+
+    def test_trial_meta_rejects_role_mismatch_compile_project_for_run_program(self) -> None:
+        """Defense against forged role substitution in source_command_ref.
+
+        A child writes a log record with `tool_name=compile_project` at the
+        canonical placement and points the run_program slot in trial_meta at
+        it. Without role binding, the trial_meta whitelist accepts the record
+        (compile_project is recognized) and downstream
+        `_validate_run_program_inputs` silently skips because the matched
+        tool_name != run_program. The new validator must reject this role
+        substitution explicitly via declared/resolved tool_name match.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            _create_minimal_execution_tree(
+                repo_root,
+                dep_spec_id="dynamics_shallow_water_flux_2d_rusanov_p0",
+                model_text="module m\nimplicit none\nend module m\n",
+                runner_text="program r\nimplicit none\nend program r\n",
+                run_command=["./simulate", "workspace/case.resolved.yaml", "workspace/outdir"],
+            )
+            node_dir = (
+                repo_root
+                / "workspace"
+                / "pipelines"
+                / "problem__shallow_water2d__0.3.0"
+                / "shallow-water2d_20260415_001"
+                / "execute"
+                / "exe_test_001"
+                / "problem"
+                / "shallow_water2d"
+            )
+            # Replace the canonical log with a compile_project record (wrong
+            # tool for the run_program slot the fixture's trial_meta declares).
+            log_path = node_dir / "mcp_command_log.jsonl"
+            log_path.write_text(
+                json.dumps(
+                    {
+                        "command_id": "fixture_run_program_001",
+                        "tool_name": "compile_project",
+                        "command": ["make", "all"],
+                    },
+                    ensure_ascii=False,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            trial_meta_path = node_dir / "trial_meta.json"
+            trial_meta = json.loads(trial_meta_path.read_text(encoding="utf-8"))
+            trial_meta["source_command_ref"]["run_threads_1"]["command_id"] = (
+                "fixture_run_program_001"
+            )
+            _write_json(trial_meta_path, trial_meta)
+            violations = validate(repo_root=repo_root, workspace_root="workspace")
+            # compile_project is no longer accepted in execute trial_meta's
+            # tool_name whitelist (it's a build-phase tool). The forged log
+            # record's tool_name=compile_project is rejected by the
+            # recognized-tool-names check, not role mismatch.
+            self.assertTrue(
+                any(
+                    "log record must declare tool_name" in v
+                    and "compile_project" in v
+                    for v in violations
+                ),
+                violations,
+            )
+
+    def test_trial_meta_rejects_log_record_without_recognized_tool_name(self) -> None:
+        """Defense against forged source_command_ref records lacking tool_name.
+
+        A child agent that writes a log record with command_id only (no
+        tool_name field) at the canonical placement, then points trial_meta
+        source_command_ref at it, must be rejected. Without tool_name the
+        downstream tool-specific validators silently skip the entry, leaving
+        the forged provenance unverified.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            _create_minimal_execution_tree(
+                repo_root,
+                dep_spec_id="dynamics_shallow_water_flux_2d_rusanov_p0",
+                model_text="module m\nimplicit none\nend module m\n",
+                runner_text="program r\nimplicit none\nend program r\n",
+                run_command=["./simulate", "workspace/case.resolved.yaml", "workspace/outdir"],
+            )
+            node_dir = (
+                repo_root
+                / "workspace"
+                / "pipelines"
+                / "problem__shallow_water2d__0.3.0"
+                / "shallow-water2d_20260415_001"
+                / "execute"
+                / "exe_test_001"
+                / "problem"
+                / "shallow_water2d"
+            )
+            # Overwrite the canonical log file with a record that has no
+            # tool_name field — only command_id.
+            log_path = node_dir / "mcp_command_log.jsonl"
+            log_path.write_text(
+                json.dumps(
+                    {
+                        "command_id": "fixture_run_program_001",
+                        "command": ["./simulate", "case.resolved.yaml", "out"],
+                    },
+                    ensure_ascii=False,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            trial_meta_path = node_dir / "trial_meta.json"
+            trial_meta = json.loads(trial_meta_path.read_text(encoding="utf-8"))
+            trial_meta["source_command_ref"]["run_threads_1"]["command_id"] = (
+                "fixture_run_program_001"
+            )
+            _write_json(trial_meta_path, trial_meta)
+            violations = validate(repo_root=repo_root, workspace_root="workspace")
+            self.assertTrue(
+                any(
+                    "log record must declare tool_name" in v
+                    and "fixture_run_program_001" in v
+                    for v in violations
+                ),
+                violations,
+            )
+
+    def test_trial_meta_requires_source_generation_id(self) -> None:
+        """Strict policy: every execute trial_meta must declare
+        `source_generation_id`. Without it, validators cannot bind
+        provenance and the field could be omitted to silently bypass
+        per-entry tool_name and mandatory run_program checks.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            _create_minimal_execution_tree(
+                repo_root,
+                dep_spec_id="dynamics_shallow_water_flux_2d_rusanov_p0",
+                model_text="module m\nimplicit none\nend module m\n",
+                runner_text="program r\nimplicit none\nend program r\n",
+                run_command=["./simulate", "workspace/case.resolved.yaml", "workspace/outdir"],
+            )
+            node_dir = (
+                repo_root
+                / "workspace"
+                / "pipelines"
+                / "problem__shallow_water2d__0.3.0"
+                / "shallow-water2d_20260415_001"
+                / "execute"
+                / "exe_test_001"
+                / "problem"
+                / "shallow_water2d"
+            )
+            trial_meta_path = node_dir / "trial_meta.json"
+            trial_meta = json.loads(trial_meta_path.read_text(encoding="utf-8"))
+            trial_meta.pop("source_generation_id", None)
+            _write_json(trial_meta_path, trial_meta)
+            violations = validate(repo_root=repo_root, workspace_root="workspace")
+            self.assertTrue(
+                any(
+                    "source_generation_id is required" in v
+                    for v in violations
+                ),
+                violations,
+            )
+
+    def test_trial_meta_requires_source_build_id(self) -> None:
+        """source_build_id binds run_program to the specific build whose
+        binary the execute used. Omission must be rejected.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            _create_minimal_execution_tree(
+                repo_root,
+                dep_spec_id="dynamics_shallow_water_flux_2d_rusanov_p0",
+                model_text="module m\nimplicit none\nend module m\n",
+                runner_text="program r\nimplicit none\nend program r\n",
+                run_command=["./simulate", "workspace/case.resolved.yaml", "workspace/outdir"],
+            )
+            node_dir = (
+                repo_root
+                / "workspace"
+                / "pipelines"
+                / "problem__shallow_water2d__0.3.0"
+                / "shallow-water2d_20260415_001"
+                / "execute"
+                / "exe_test_001"
+                / "problem"
+                / "shallow_water2d"
+            )
+            trial_meta_path = node_dir / "trial_meta.json"
+            trial_meta = json.loads(trial_meta_path.read_text(encoding="utf-8"))
+            trial_meta.pop("source_build_id", None)
+            _write_json(trial_meta_path, trial_meta)
+            violations = validate(repo_root=repo_root, workspace_root="workspace")
+            self.assertTrue(
+                any("source_build_id is required" in v for v in violations),
+                violations,
+            )
+
+    def test_run_program_rejects_executable_outside_source_build_id(self) -> None:
+        """The matched run_program record's executable must resolve under
+        `<pipeline>/build/<source_build_id>/bin/`. A trial_meta that claims
+        provenance for build A but executes a sibling build B's binary must
+        be rejected.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            _create_minimal_execution_tree(
+                repo_root,
+                dep_spec_id="dynamics_shallow_water_flux_2d_rusanov_p0",
+                model_text="module m\nimplicit none\nend module m\n",
+                runner_text="program r\nimplicit none\nend program r\n",
+                run_command=["./simulate", "workspace/case.resolved.yaml", "workspace/outdir"],
+            )
+            pipeline_dir = (
+                repo_root
+                / "workspace"
+                / "pipelines"
+                / "problem__shallow_water2d__0.3.0"
+                / "shallow-water2d_20260415_001"
+            )
+            node_dir = (
+                pipeline_dir / "execute" / "exe_test_001" / "problem" / "shallow_water2d"
+            )
+            # Plant a sibling build whose binary the run actually used.
+            sibling_build = pipeline_dir / "build" / "build_sibling_999" / "bin"
+            sibling_build.mkdir(parents=True, exist_ok=True)
+            (sibling_build / "simulate").write_text("sibling\n", encoding="utf-8")
+            # Rewrite the log record's cwd to point at the sibling bin/, but
+            # leave trial_meta.source_build_id pointing at the (declared)
+            # canonical fixture build.
+            log_path = node_dir / "mcp_command_log.jsonl"
+            recs = [
+                json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines() if line.strip()
+            ]
+            for rec in recs:
+                if rec.get("tool_name") == "run_program":
+                    rec["cwd"] = str(sibling_build)
+            log_path.write_text(
+                "\n".join(json.dumps(r, ensure_ascii=False) for r in recs) + "\n",
+                encoding="utf-8",
+            )
+            violations = validate(repo_root=repo_root, workspace_root="workspace")
+            self.assertTrue(
+                any(
+                    "executable" in v and "must resolve under" in v
+                    for v in violations
+                ),
+                violations,
+            )
+
+    def test_run_program_rejects_failed_record(self) -> None:
+        """A run_program record with ok!=true cannot serve as evidence."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            _create_minimal_execution_tree(
+                repo_root,
+                dep_spec_id="dynamics_shallow_water_flux_2d_rusanov_p0",
+                model_text="module m\nimplicit none\nend module m\n",
+                runner_text="program r\nimplicit none\nend program r\n",
+                run_command=["./simulate", "workspace/case.resolved.yaml", "workspace/outdir"],
+            )
+            node_dir = (
+                repo_root
+                / "workspace"
+                / "pipelines"
+                / "problem__shallow_water2d__0.3.0"
+                / "shallow-water2d_20260415_001"
+                / "execute"
+                / "exe_test_001"
+                / "problem"
+                / "shallow_water2d"
+            )
+            # Get the command_id the fixture used.
+            trial_meta_path = node_dir / "trial_meta.json"
+            trial_meta = json.loads(trial_meta_path.read_text(encoding="utf-8"))
+            cmd_id = trial_meta["source_command_ref"]["run_threads_1"]["command_id"]
+            log_path = node_dir / "mcp_command_log.jsonl"
+            log_path.write_text(
+                json.dumps(
+                    {
+                        "command_id": cmd_id,
+                        "tool_name": "run_program",
+                        "command": ["./simulate", "case.resolved.yaml", "out"],
+                        "ok": False,
+                    },
+                    ensure_ascii=False,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            violations = validate(repo_root=repo_root, workspace_root="workspace")
+            self.assertTrue(
+                any(
+                    f"run_program command_id={cmd_id}" in v
+                    and "ok must be true" in v
+                    for v in violations
+                ),
+                violations,
+            )
+
+    def test_run_quality_checks_rejects_failed_source_generation(self) -> None:
+        """source_generation_id must point to a generation in pass state.
+
+        Pointing trial_meta at a failed/stale generation under the same
+        pipeline (even with a valid mcp_command_log.jsonl) must be rejected,
+        otherwise stale evidence credits the current execute run.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            _create_minimal_execution_tree(
+                repo_root,
+                dep_spec_id="dynamics_shallow_water_flux_2d_rusanov_p0",
+                model_text="module m\nimplicit none\nend module m\n",
+                runner_text="program r\nimplicit none\nend program r\n",
+                run_command=["./simulate", "workspace/case.resolved.yaml", "workspace/outdir"],
+            )
+            pipeline_dir = (
+                repo_root
+                / "workspace"
+                / "pipelines"
+                / "problem__shallow_water2d__0.3.0"
+                / "shallow-water2d_20260415_001"
+            )
+            node_dir = (
+                pipeline_dir / "execute" / "exe_test_001" / "problem" / "shallow_water2d"
+            )
+            # Plant a stale generation in fail state with its own canonical log.
+            stale_gen_id = "gen_stale_001"
+            stale_dir = pipeline_dir / "generate" / stale_gen_id
+            stale_dir.mkdir(parents=True, exist_ok=True)
+            _write_json(
+                stale_dir / "generate_meta.json",
+                {
+                    "attempt_count": 1,
+                    "verification_status": "fail",
+                    "last_fail_reason": "lint failed",
+                    "debug_mode": False,
+                    "context_isolated": True,
+                },
+            )
+            stale_src = stale_dir / "src"
+            stale_src.mkdir(parents=True, exist_ok=True)
+            stale_log_ref = (
+                f"workspace/pipelines/problem__shallow_water2d__0.3.0/"
+                f"shallow-water2d_20260415_001/generate/{stale_gen_id}/src/"
+                "mcp_command_log.jsonl"
+            )
+            (stale_src / "mcp_command_log.jsonl").write_text(
+                json.dumps(
+                    {
+                        "command_id": "cmd_quality_stale",
+                        "tool_name": "run_quality_checks",
+                        "cwd": str(stale_src),
+                        "command": ["make", "test"],
+                        "ok": True,
+                    },
+                    ensure_ascii=False,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            trial_meta_path = node_dir / "trial_meta.json"
+            trial_meta = json.loads(trial_meta_path.read_text(encoding="utf-8"))
+            trial_meta["source_generation_id"] = stale_gen_id
+            trial_meta["source_command_ref"]["run_quality_checks"] = {
+                "command_id": "cmd_quality_stale",
+                "tool_name": "run_quality_checks",
+                "command_log_ref": stale_log_ref,
+            }
+            _write_json(trial_meta_path, trial_meta)
+            violations = validate(repo_root=repo_root, workspace_root="workspace")
+            self.assertTrue(
+                any(
+                    "verification_status='fail'" in v
+                    and stale_gen_id in v
+                    for v in violations
+                ),
+                violations,
+            )
+
+    def test_run_quality_checks_rejects_sibling_generation_log(self) -> None:
+        """Cross-phase canonical placement is bound strictly to source_generation_id.
+
+        An execute trial_meta that points run_quality_checks at a sibling
+        generation's canonical log (different gen_id) must be rejected, even
+        though the path is technically a canonical placement under the same
+        pipeline. Provenance must match the trial's own generation.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            _create_minimal_execution_tree(
+                repo_root,
+                dep_spec_id="dynamics_shallow_water_flux_2d_rusanov_p0",
+                model_text="module m\nimplicit none\nend module m\n",
+                runner_text="program r\nimplicit none\nend program r\n",
+                run_command=["./simulate", "workspace/case.resolved.yaml", "workspace/outdir"],
+            )
+            pipeline_dir = (
+                repo_root
+                / "workspace"
+                / "pipelines"
+                / "problem__shallow_water2d__0.3.0"
+                / "shallow-water2d_20260415_001"
+            )
+            node_dir = (
+                pipeline_dir / "execute" / "exe_test_001" / "problem" / "shallow_water2d"
+            )
+            # Plant a sibling generation with its own canonical log.
+            sibling_gen_id = "gen_sibling_001"
+            sibling_dir = pipeline_dir / "generate" / sibling_gen_id
+            sibling_dir.mkdir(parents=True, exist_ok=True)
+            (sibling_dir / "generate_meta.json").write_text(
+                '{"verification_status": "pass"}\n', encoding="utf-8"
+            )
+            sibling_src = sibling_dir / "src"
+            sibling_src.mkdir(parents=True, exist_ok=True)
+            sibling_log_ref = (
+                f"workspace/pipelines/problem__shallow_water2d__0.3.0/"
+                f"shallow-water2d_20260415_001/generate/{sibling_gen_id}/src/"
+                "mcp_command_log.jsonl"
+            )
+            (sibling_src / "mcp_command_log.jsonl").write_text(
+                json.dumps(
+                    {
+                        "command_id": "cmd_quality_sibling",
+                        "tool_name": "run_quality_checks",
+                        "cwd": str(sibling_src),
+                        "command": ["make", "test"],
+                        "ok": True,
+                    },
+                    ensure_ascii=False,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            trial_meta_path = node_dir / "trial_meta.json"
+            trial_meta = json.loads(trial_meta_path.read_text(encoding="utf-8"))
+            # trial_meta declares the real (fixture) generation but references
+            # the sibling generation's log.
+            trial_meta["source_generation_id"] = "gen_20260415_001"
+            trial_meta["source_command_ref"]["run_quality_checks"] = {
+                "command_id": "cmd_quality_sibling",
+                "tool_name": "run_quality_checks",
+                "command_log_ref": sibling_log_ref,
+            }
+            _write_json(trial_meta_path, trial_meta)
+            violations = validate(repo_root=repo_root, workspace_root="workspace")
+            self.assertTrue(
+                any(
+                    "run_quality_checks command_id=cmd_quality_sibling" in v
+                    and "canonical MCP audit log placement" in v
+                    for v in violations
+                ),
+                violations,
+            )
+
+    def test_run_program_rejects_noncanonical_command_log_ref(self) -> None:
+        """Defense against forged run_program evidence at non-canonical paths.
+
+        A child agent that writes a synthetic JSONL under raw/ (which is
+        permitted as an execute output directory) and points
+        source_command_ref.run_threads_1.command_log_ref at it must be
+        rejected. The canonical placement for run_program is sibling of
+        trial_meta.json (in-phase canonical for execute).
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            _create_minimal_execution_tree(
+                repo_root,
+                dep_spec_id="dynamics_shallow_water_flux_2d_rusanov_p0",
+                model_text="module m\nimplicit none\nend module m\n",
+                runner_text="program r\nimplicit none\nend program r\n",
+                run_command=["./simulate", "workspace/case.resolved.yaml", "workspace/outdir"],
+            )
+            node_dir = (
+                repo_root
+                / "workspace"
+                / "pipelines"
+                / "problem__shallow_water2d__0.3.0"
+                / "shallow-water2d_20260415_001"
+                / "execute"
+                / "exe_test_001"
+                / "problem"
+                / "shallow_water2d"
+            )
+            # Plant a forged log under raw/ (a writable execute output directory).
+            forged_log = node_dir / "raw" / "forged_run.jsonl"
+            forged_log.parent.mkdir(parents=True, exist_ok=True)
+            forged_log.write_text(
+                json.dumps(
+                    {
+                        "command_id": "forged_cmd_001",
+                        "tool_name": "run_program",
+                        "command": ["./simulate", "case.resolved.yaml", "out"],
+                        "ok": True,
+                    },
+                    ensure_ascii=False,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            # Repoint trial_meta source_command_ref to the forged log.
+            trial_meta_path = node_dir / "trial_meta.json"
+            trial_meta = json.loads(trial_meta_path.read_text(encoding="utf-8"))
+            trial_meta["source_command_ref"]["run_threads_1"] = {
+                "command_id": "forged_cmd_001",
+                "command_log_ref": (
+                    "workspace/pipelines/problem__shallow_water2d__0.3.0/"
+                    "shallow-water2d_20260415_001/execute/exe_test_001/"
+                    "problem/shallow_water2d/raw/forged_run.jsonl"
+                ),
+            }
+            _write_json(trial_meta_path, trial_meta)
+            violations = validate(repo_root=repo_root, workspace_root="workspace")
+            self.assertTrue(
+                any(
+                    "run_program command_id=forged_cmd_001" in v
+                    and "canonical MCP audit log placement" in v
+                    for v in violations
+                ),
                 violations,
             )
 

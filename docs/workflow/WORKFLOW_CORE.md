@@ -54,7 +54,7 @@ terms は `GLOSSARY.md` を参照する。
 13. workflow 実行中は対象 `DAG` の `workspace/plans` と `workspace/pipelines` 配下 artifact を削除してはならない。
 14. `quality check` は `diagnostics.json` と `verdict.json` の比較を canonical source とし、`stdout` 差分のみで合否を確定してはならない。
 15. `lineage.json` と `trial_meta.json` の artifact 参照パスは `workspace/` 起点で記録しなければならない。
-16. `trial_meta.json` は `generated_by_stage`、`source_execution_id`、`source_command_ref`、`source_artifact_hash` を必須記録とする。
+16. `trial_meta.json` は `generated_by_stage`、`source_execution_id`、`source_generation_id`、`source_build_id`、`source_command_ref`、`source_artifact_hash` を必須記録とする。`source_command_ref` の各 entry は `tool_name` (`run_program` または `run_quality_checks` のいずれか) を宣言し、対応する MCP `command_log` record の `tool_name` と一致しなければならない (`compile_project` は build_meta.json 側に記録され、execute trial_meta では受理しない)。Execute trial_meta は最低 1 つ `tool_name='run_program'` の entry を持たなければならない。`source_generation_id` の指す `generate_meta.json` は `verification_status=pass` でなければならない。`source_build_id` の指す `<pipeline>/build/<source_build_id>/bin/` は実在し、`run_program` log record の executable はその bin/ 配下に解決しなければならない (mixed-build attribution forge 防止)。
 17. 異なる `pipeline_id` 間で `id` 系メタデータのみを変更して artifact 本文を流用してはならない。検出時は `copy_based_artifact_reuse` として `invalid` とする。
 18. 本規範違反は workflow 仕様違反とし、当該 `pipeline` を `invalid` とする。
 19. `Promote` 以外の phase は、`workspace/` 配下以外へ書き込みを行ってはならない。`Promote` は `releases/` 配下と `spec/registry/spec_catalog.yaml` への書き込みのみを許可する。

@@ -58,6 +58,7 @@ Generate ステージの生成責務を固定し、`Build` 可能な実装 artif
 6. workflow 実行開始前に `workspace/` が存在しない場合、リポジトリルート直下へ `workspace/` を作成する。
 7. 開始前と完了前に `python3 tools/validate_workspace_root.py` を実行し、`fail` 時は `Generate fail` とする。
 8. ソース生成後、`MCP` の `run_linter` で `static lint` を成功させ、`generate_meta.json` の `lint_command_ref` を埋めてから `Generate verify` へ渡す。
+9. `MCP` `run_linter` は `cwd=<src>/` で実行され、副次的に `<src>/mcp_command_log.jsonl` を書き出す。orchestration agent は当該 path を `allowed_output_paths` に含めて `record-launch` を呼ぶこと。`tools/orchestration_runtime.py` の `_allowed_output_paths_for_launch()` が defensive auto-inject も実施するが、明示列挙が canonical。本 log は integrity-protected log として `allowed_file_tool_paths` から自動除外され、child agent は `Edit` / `Write` で直接書き込めない。`validate_pipeline_semantics.py` が `tool_name=run_linter` / `ok=true` などの記録を信頼するため、log の生成は MCP `run_linter` 経由のみに限定される。
 
 ## 判定基準
 - `model` と `runner` の責務分離が保持される。

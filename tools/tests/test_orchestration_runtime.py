@@ -175,6 +175,20 @@ def _spawn_response_payload(session_id: str) -> dict[str, object]:
     }
 
 
+def _plant_impl_resolved_yaml_make(repo_root: Path, plan_ref: str = _FIX_PLAN_REF) -> None:
+    """Plant impl.resolved.yaml with toolchain.build_system: make.
+
+    Required for tests that exercise cross-phase canonical placement: record_launch
+    reads this file to gate cross-phase auto-inject on Make toolchain.
+    """
+    p = repo_root / plan_ref / "impl.resolved.yaml"
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(
+        "toolchain:\n  language: fortran\n  build_system: make\n",
+        encoding="utf-8",
+    )
+
+
 def _write_apply_patch_gate_evidence(
     repo_root: Path,
     *,
@@ -1494,6 +1508,610 @@ shell_tool                       stable             true
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
             self.assertIn(src_dir, manifest["allowed_output_paths"])
 
+    def _record_generate_launch_with_outputs(
+        self,
+        *,
+        repo_root: Path,
+        orchestration_id: str,
+        child_agent_run_id: str,
+        gen_id: str,
+        allowed_output_paths: list[str],
+    ) -> Path:
+        init_orchestration(repo_root=repo_root, orchestration_id=orchestration_id)
+        write_preflight(
+            repo_root=repo_root,
+            orchestration_id=orchestration_id,
+            payload={
+                "status": "pass",
+                "sandbox_runtime": "bwrap",
+                "sandbox_enforced": True,
+                "can_launch_step_agents": True,
+                "can_launch_substep_agents": True,
+                "feature_states": {"multi_agent": True, "codex_hooks": True},
+                "checks": [
+                    {"name": "multi_agent_enabled", "pass": True},
+                    {"name": "codex_hooks_enabled", "pass": True},
+                    {"name": "codex_home_writable", "pass": True},
+                    {"name": "sandbox_bwrap_available", "pass": True},
+                    {"name": "sandbox_bwrap_userns", "pass": True},
+                ],
+            },
+        )
+        record_launch(
+            repo_root=repo_root,
+            orchestration_id=orchestration_id,
+            parent_agent_run_id="orch_run_001",
+            child_agent_run_id=child_agent_run_id,
+            request_payload={
+                "node_key": "problem/shallow_water2d@0.3.0",
+                "step": "generate",
+                "agent_role": "step",
+                "agent_run_id": child_agent_run_id,
+                "orchestration_id": orchestration_id,
+                "parent_agent_run_id": "orch_run_001",
+                "plan_ref": _FIX_PLAN_REF,
+                "pipeline_ref": _FIX_PIPE_REF,
+                "dependency_ref": f"{_FIX_PLAN_REF}/dependency.resolved.yaml",
+                "generation_id": gen_id,
+                "allowed_output_paths": allowed_output_paths,
+                "skill_name": "workflow-generate",
+                "skill_ref": "skills/workflow-generate/SKILL.md",
+                "skill_must_read_refs": _fixture_skill_must_read_refs_step("generate"),
+                "launch_prompt_full": _step_launch_prompt(
+                    "problem/shallow_water2d@0.3.0",
+                    "generate",
+                    child_agent_run_id,
+                ),
+            },
+            response_payload={
+                "agent_run_id": child_agent_run_id,
+                **_spawn_response_payload(f"sess_{child_agent_run_id}"),
+            },
+        )
+        return (
+            repo_root
+            / f"workspace/orchestrations/{orchestration_id}/output_manifests/{child_agent_run_id}.json"
+        )
+
+    def test_allowed_output_paths_auto_injects_mcp_command_log(self) -> None:
+        """Generate step launches must auto-inject <gen>/src/mcp_command_log.jsonl."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            gen_id = "gen_20260510_001"
+            src_dir = f"{_FIX_PIPE_REF}/generate/{gen_id}/src/"
+            manifest_path = self._record_generate_launch_with_outputs(
+                repo_root=repo_root,
+                orchestration_id="orch_001",
+                child_agent_run_id="run_auto_inject_dir",
+                gen_id=gen_id,
+                allowed_output_paths=[src_dir],
+            )
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            log_path = f"{src_dir}mcp_command_log.jsonl"
+            self.assertIn(log_path, manifest["allowed_output_paths"])
+
+    def test_auto_inject_idempotent_when_already_listed(self) -> None:
+        """Pre-listing the log path must not duplicate it after auto-inject."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            gen_id = "gen_20260510_002"
+            src_dir = f"{_FIX_PIPE_REF}/generate/{gen_id}/src/"
+            log_path = f"{src_dir}mcp_command_log.jsonl"
+            manifest_path = self._record_generate_launch_with_outputs(
+                repo_root=repo_root,
+                orchestration_id="orch_001",
+                child_agent_run_id="run_auto_inject_idempotent",
+                gen_id=gen_id,
+                allowed_output_paths=[src_dir, log_path],
+            )
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            occurrences = [p for p in manifest["allowed_output_paths"] if p == log_path]
+            self.assertEqual(len(occurrences), 1)
+
+    def test_auto_inject_extracts_gen_id_from_file_entry(self) -> None:
+        """File-only entries under <gen>/src/ must still trigger log path injection."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            gen_id = "gen_20260510_003"
+            src_file = f"{_FIX_PIPE_REF}/generate/{gen_id}/src/main.f90"
+            manifest_path = self._record_generate_launch_with_outputs(
+                repo_root=repo_root,
+                orchestration_id="orch_001",
+                child_agent_run_id="run_auto_inject_file_entry",
+                gen_id=gen_id,
+                allowed_output_paths=[src_file],
+            )
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            expected = f"{_FIX_PIPE_REF}/generate/{gen_id}/src/mcp_command_log.jsonl"
+            self.assertIn(expected, manifest["allowed_output_paths"])
+
+    def test_auto_inject_skipped_when_no_src_entry(self) -> None:
+        """Without any src/ entry the log path must NOT be injected."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            gen_id = "gen_20260510_004"
+            generate_meta = (
+                f"{_FIX_PIPE_REF}/generate/{gen_id}/generate_meta.json"
+            )
+            manifest_path = self._record_generate_launch_with_outputs(
+                repo_root=repo_root,
+                orchestration_id="orch_001",
+                child_agent_run_id="run_auto_inject_no_src",
+                gen_id=gen_id,
+                allowed_output_paths=[
+                    f"{_FIX_PIPE_REF}/lineage.json",
+                    generate_meta,
+                ],
+            )
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            for p in manifest["allowed_output_paths"]:
+                self.assertFalse(
+                    p.endswith("mcp_command_log.jsonl"),
+                    f"unexpected auto-inject without src/ entry: {p}",
+                )
+
+    def test_generate_launch_rejects_listed_paths_for_multiple_generations(self) -> None:
+        """A generate launch must target exactly one generation_id.
+
+        Listing paths under two distinct <gen_id>/src/ prefixes would let the
+        launch silently auto-inject MCP-owned audit logs for both, granting
+        write authority across sibling generations and breaking provenance
+        isolation.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            gen1 = "gen_20260510_005"
+            gen2 = "gen_20260510_006"
+            src1 = f"{_FIX_PIPE_REF}/generate/{gen1}/src/"
+            src2 = f"{_FIX_PIPE_REF}/generate/{gen2}/src/"
+            with self.assertRaisesRegex(
+                ValueError, "must target a single generation_id"
+            ):
+                self._record_generate_launch_with_outputs(
+                    repo_root=repo_root,
+                    orchestration_id="orch_001",
+                    child_agent_run_id="run_auto_inject_multi",
+                    gen_id=gen1,
+                    allowed_output_paths=[src1, src2],
+                )
+
+    def test_generate_launch_rejects_listed_path_for_other_generation(self) -> None:
+        """If request.generation_id is set, listed paths must use that gen_id only."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            real_gen = "gen_20260510_007"
+            other_gen = "gen_20260510_008"
+            src_other = f"{_FIX_PIPE_REF}/generate/{other_gen}/src/"
+            with self.assertRaisesRegex(
+                ValueError,
+                "must target a single generation_id|does not match request generation_id",
+            ):
+                self._record_generate_launch_with_outputs(
+                    repo_root=repo_root,
+                    orchestration_id="orch_001",
+                    child_agent_run_id="run_gen_mismatch",
+                    gen_id=real_gen,
+                    allowed_output_paths=[src_other],
+                )
+
+    def test_execute_launch_rejects_listed_path_for_other_execution_id(self) -> None:
+        """If request.execution_id is set, listed paths must use that exec_id only."""
+        from tools.orchestration_runtime import _allowed_output_paths_for_launch
+
+        node_safe = "problem__shallow_water2d__0.3.0"
+        req = {
+            "agent_role": "step",
+            "node_key": "problem/shallow_water2d@0.3.0",
+            "step": "execute",
+            "plan_ref": _FIX_PLAN_REF,
+            "pipeline_ref": _FIX_PIPE_REF,
+            "execution_id": "exec_real_001",
+            "allowed_output_paths": [
+                # Caller declares execution_id=exec_real_001 but lists a path
+                # under a different execution_id.
+                f"{_FIX_PIPE_REF}/execute/exec_other_002/{node_safe}/diagnostics.json",
+            ],
+        }
+        with self.assertRaisesRegex(
+            ValueError,
+            "must target a single execution_id|does not match request execution_id",
+        ):
+            _allowed_output_paths_for_launch(
+                request_payload=req,
+                write_roots=[f"{_FIX_PIPE_REF}/execute/"],
+            )
+
+    def test_build_launch_accepts_cross_phase_log_for_make_build(self) -> None:
+        """In-source Make builds (Fortran/C family) run compile_project with
+        project_dir=<gen>/src/, so the MCP audit log lands in the generate
+        tree. The build launch must auto-inject the cross-phase canonical
+        placement when generation_id is provided.
+        """
+        from tools.orchestration_runtime import (
+            _allowed_output_paths_for_launch,
+            _canonical_mcp_audit_log_paths_for_request,
+        )
+
+        gen_id = "gen_make_build_001"
+        build_id = "build_make_001"
+        cross_log = (
+            f"{_FIX_PIPE_REF}/generate/{gen_id}/src/mcp_command_log.jsonl"
+        )
+        in_phase_log = (
+            f"{_FIX_PIPE_REF}/build/{build_id}/mcp_command_log.jsonl"
+        )
+        req = {
+            "agent_role": "step",
+            "node_key": "problem/shallow_water2d@0.3.0",
+            "step": "build",
+            "plan_ref": _FIX_PLAN_REF,
+            "pipeline_ref": _FIX_PIPE_REF,
+            "generation_id": gen_id,
+            # `_resolved_build_system` is normally injected by record_launch
+            # from impl.resolved.yaml; for direct helper tests we set it.
+            "_resolved_build_system": "make",
+            "allowed_output_paths": [
+                f"{_FIX_PIPE_REF}/build/{build_id}/build_meta.json",
+                f"{_FIX_PIPE_REF}/build/{build_id}/bin/main",
+            ],
+        }
+        out = _allowed_output_paths_for_launch(
+            request_payload=req,
+            write_roots=[
+                f"{_FIX_PIPE_REF}/build/",
+                f"{_FIX_PIPE_REF}/generate/",
+            ],
+        )
+        # Both placements (in-phase and cross-phase) auto-injected.
+        self.assertIn(in_phase_log, out)
+        self.assertIn(cross_log, out)
+        canonical = set(_canonical_mcp_audit_log_paths_for_request(req, out))
+        self.assertIn(in_phase_log, canonical)
+        self.assertIn(cross_log, canonical)
+
+    def test_build_launch_skips_cross_phase_log_for_non_make_toolchain(self) -> None:
+        """Cross-phase canonical placement is Make-only.
+
+        For CMake/Meson/Ninja or any out-of-source build, the cross-phase
+        generate-tree audit log must NOT be auto-injected even when
+        generation_id is provided. Otherwise non-Make builds would gain
+        write authority into the generate tree contrary to spec.
+        """
+        from tools.orchestration_runtime import _allowed_output_paths_for_launch
+
+        gen_id = "gen_cmake_001"
+        build_id = "build_cmake_001"
+        cross_log = (
+            f"{_FIX_PIPE_REF}/generate/{gen_id}/src/mcp_command_log.jsonl"
+        )
+        in_phase_log = (
+            f"{_FIX_PIPE_REF}/build/{build_id}/mcp_command_log.jsonl"
+        )
+        req = {
+            "agent_role": "step",
+            "node_key": "problem/shallow_water2d@0.3.0",
+            "step": "build",
+            "plan_ref": _FIX_PLAN_REF,
+            "pipeline_ref": _FIX_PIPE_REF,
+            "generation_id": gen_id,
+            # Non-Make toolchain → cross-phase not authorized.
+            "_resolved_build_system": "cmake",
+            "allowed_output_paths": [
+                f"{_FIX_PIPE_REF}/build/{build_id}/build_meta.json",
+                f"{_FIX_PIPE_REF}/build/{build_id}/bin/main",
+            ],
+        }
+        out = _allowed_output_paths_for_launch(
+            request_payload=req,
+            write_roots=[
+                f"{_FIX_PIPE_REF}/build/",
+            ],
+        )
+        # In-phase log is auto-injected; cross-phase is NOT.
+        self.assertIn(in_phase_log, out)
+        self.assertNotIn(cross_log, out)
+
+    def test_build_launch_rejects_cross_phase_log_for_failed_generation(self) -> None:
+        """Build cross-phase log authorization mirrors execute: failed/stale
+        generation must be rejected at record_launch (verification_status=fail)
+        before write authority is granted.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            init_orchestration(repo_root=repo_root, orchestration_id="orch_001")
+            _plant_impl_resolved_yaml_make(repo_root)
+            write_preflight(
+                repo_root=repo_root,
+                orchestration_id="orch_001",
+                payload={
+                    "status": "pass",
+                    "sandbox_runtime": "bwrap",
+                    "sandbox_enforced": True,
+                    "can_launch_step_agents": True,
+                    "can_launch_substep_agents": True,
+                    "feature_states": {"multi_agent": True, "codex_hooks": True},
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
+                },
+            )
+            record_agent_run(
+                repo_root=repo_root,
+                orchestration_id="orch_001",
+                payload={
+                    "agent_run_id": "orch_run_001",
+                    "agent_role": "orchestration",
+                    "status": "running",
+                    "agent_backend": "claude",
+                },
+            )
+            failed_gen = "gen_failed_for_build"
+            build_id = "build_against_failed_001"
+            # Pre_phase_launch requires AT LEAST ONE pass-state generation
+            # under the pipeline. Plant one so the gate doesn't fire before
+            # our cross-phase verification reaches the failed gen the launch
+            # actually targets.
+            ok_gen_dir = repo_root / f"{_FIX_PIPE_REF}/generate/gen_ok_001"
+            ok_gen_dir.mkdir(parents=True, exist_ok=True)
+            (ok_gen_dir / "generate_meta.json").write_text(
+                '{"verification_status": "pass"}\n', encoding="utf-8"
+            )
+            gen_dir = repo_root / f"{_FIX_PIPE_REF}/generate/{failed_gen}"
+            gen_dir.mkdir(parents=True, exist_ok=True)
+            (gen_dir / "generate_meta.json").write_text(
+                '{"verification_status": "fail"}\n', encoding="utf-8"
+            )
+            with self.assertRaisesRegex(
+                ValueError, "verification_status='fail'"
+            ):
+                record_launch(
+                    repo_root=repo_root,
+                    orchestration_id="orch_001",
+                    parent_agent_run_id="orch_run_001",
+                    child_agent_run_id="step_run_build_failed_gen",
+                    request_payload={
+                        "node_key": "problem/shallow_water2d@0.3.0",
+                        "step": "build",
+                        "agent_role": "step",
+                        "orchestration_id": "orch_001",
+                        "agent_run_id": "step_run_build_failed_gen",
+                        "parent_agent_run_id": "orch_run_001",
+                        "plan_ref": _FIX_PLAN_REF,
+                        "pipeline_ref": _FIX_PIPE_REF,
+                        "dependency_ref": _FIX_DEP_REF,
+                        "generation_id": failed_gen,
+                        "skill_name": "workflow-build",
+                        "skill_ref": "skills/workflow-build/SKILL.md",
+                        "skill_must_read_refs": _fixture_skill_must_read_refs_step("build"),
+                        "allowed_output_paths": [
+                            f"{_FIX_PIPE_REF}/build/{build_id}/build_meta.json",
+                        ],
+                        "launch_prompt_full": _step_launch_prompt(
+                            "problem/shallow_water2d@0.3.0",
+                            "build",
+                            "step_run_build_failed_gen",
+                        ),
+                    },
+                    response_payload=_spawn_response_payload("sess_step_build_failed_gen"),
+                )
+
+    def test_build_launch_rejects_listed_paths_for_multiple_build_ids(self) -> None:
+        """A build launch must target exactly one build_id."""
+        from tools.orchestration_runtime import _allowed_output_paths_for_launch
+
+        req = {
+            "agent_role": "step",
+            "node_key": "problem/shallow_water2d@0.3.0",
+            "step": "build",
+            "plan_ref": _FIX_PLAN_REF,
+            "pipeline_ref": _FIX_PIPE_REF,
+            "allowed_output_paths": [
+                f"{_FIX_PIPE_REF}/build/build_a/build_meta.json",
+                f"{_FIX_PIPE_REF}/build/build_b/build_meta.json",
+            ],
+        }
+        with self.assertRaisesRegex(ValueError, "must target a single build_id"):
+            _allowed_output_paths_for_launch(
+                request_payload=req,
+                write_roots=[f"{_FIX_PIPE_REF}/build/"],
+            )
+
+    def test_auto_inject_log_excluded_from_allowed_file_tool_paths(self) -> None:
+        """Auto-injected MCP audit log must not become directly Edit/Write-eligible.
+
+        validate_pipeline_semantics.py reads mcp_command_log.jsonl as the source
+        of truth that MCP run_linter actually executed. Direct file-tool writes
+        would let a child forge ok=true entries and bypass static-lint
+        verification.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            gen_id = "gen_20260510_007"
+            src_dir = f"{_FIX_PIPE_REF}/generate/{gen_id}/src/"
+            manifest_path = self._record_generate_launch_with_outputs(
+                repo_root=repo_root,
+                orchestration_id="orch_001",
+                child_agent_run_id="run_log_not_filetool",
+                gen_id=gen_id,
+                allowed_output_paths=[src_dir],
+            )
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            log_path = f"{src_dir}mcp_command_log.jsonl"
+            self.assertIn(log_path, manifest["allowed_output_paths"])
+            self.assertNotIn(log_path, manifest["allowed_file_tool_paths"])
+            for p in manifest["allowed_file_tool_paths"]:
+                self.assertFalse(
+                    p.endswith("mcp_command_log.jsonl"),
+                    f"integrity-protected log leaked into allowed_file_tool_paths: {p}",
+                )
+
+    def test_explicit_file_tool_listing_of_mcp_log_rejected(self) -> None:
+        """Caller cannot bypass the protection by explicitly listing the canonical log path."""
+        from tools.orchestration_runtime import _allowed_file_tool_paths_for_launch
+
+        log_path = (
+            f"{_FIX_PIPE_REF}/generate/gen_20260510_008/src/mcp_command_log.jsonl"
+        )
+        req = {
+            "agent_role": "step",
+            "step": "generate",
+            "node_key": "problem/shallow_water2d@0.3.0",
+            "pipeline_ref": _FIX_PIPE_REF,
+            "allowed_file_tool_paths": [log_path],
+        }
+        with self.assertRaisesRegex(ValueError, "canonical MCP audit log"):
+            _allowed_file_tool_paths_for_launch(
+                request_payload=req,
+                allowed_output_paths=[log_path],
+            )
+
+    def test_noncanonical_mcp_log_basename_remains_writable(self) -> None:
+        """Files with the basename mcp_command_log.jsonl at NON-canonical paths
+        (e.g. nested under src/subdir/) must be treated as ordinary outputs:
+        Edit/Write-eligible and not protected as MCP-owned. The canonical
+        placement under <gen>/src/ is still classified MCP-owned, but a
+        sibling path one directory deeper is not.
+        """
+        from tools.orchestration_runtime import (
+            _allowed_file_tool_paths_for_launch,
+            _canonical_mcp_audit_log_paths_for_request,
+        )
+
+        gen_id = "gen_20260510_009"
+        canonical_path = (
+            f"{_FIX_PIPE_REF}/generate/{gen_id}/src/mcp_command_log.jsonl"
+        )
+        noncanonical_path = (
+            f"{_FIX_PIPE_REF}/generate/{gen_id}/src/notes/mcp_command_log.jsonl"
+        )
+        req = {
+            "agent_role": "step",
+            "step": "generate",
+            "node_key": "problem/shallow_water2d@0.3.0",
+            "pipeline_ref": _FIX_PIPE_REF,
+        }
+        canonical_set = set(
+            _canonical_mcp_audit_log_paths_for_request(req, [noncanonical_path])
+        )
+        # The noncanonical path is NOT in the canonical set even though its
+        # basename matches; only the canonical placement is.
+        self.assertNotIn(noncanonical_path, canonical_set)
+        self.assertIn(canonical_path, canonical_set)
+        # Auto-derived file_tool_paths must include the noncanonical path
+        # because .jsonl is not CLI-managed and the path is not MCP-owned.
+        out = _allowed_file_tool_paths_for_launch(
+            request_payload=req,
+            allowed_output_paths=[noncanonical_path],
+        )
+        self.assertIn(noncanonical_path, out)
+        # The canonical placement, if also listed, is excluded from file_tool.
+        out2 = _allowed_file_tool_paths_for_launch(
+            request_payload=req,
+            allowed_output_paths=[noncanonical_path, canonical_path],
+        )
+        self.assertIn(noncanonical_path, out2)
+        self.assertNotIn(canonical_path, out2)
+
+    def test_build_phase_auto_injects_and_accepts_mcp_command_log(self) -> None:
+        """Build step must auto-inject <build_id>/mcp_command_log.jsonl (compile_project log)."""
+        from tools.orchestration_runtime import _allowed_output_paths_for_launch
+
+        build_id = "build_20260510_001"
+        req = {
+            "agent_role": "step",
+            "node_key": "problem/shallow_water2d@0.3.0",
+            "step": "build",
+            "plan_ref": _FIX_PLAN_REF,
+            "pipeline_ref": _FIX_PIPE_REF,
+            "allowed_output_paths": [
+                f"{_FIX_PIPE_REF}/build/{build_id}/bin/main",
+                f"{_FIX_PIPE_REF}/build/{build_id}/build_meta.json",
+            ],
+        }
+        out = _allowed_output_paths_for_launch(
+            request_payload=req,
+            write_roots=[f"{_FIX_PIPE_REF}/build/"],
+        )
+        expected_log = f"{_FIX_PIPE_REF}/build/{build_id}/mcp_command_log.jsonl"
+        self.assertIn(expected_log, out)
+
+    def test_build_phase_rejects_log_in_unrecognized_subdir(self) -> None:
+        """Build phase only accepts the log directly under <build_id>/, not under arbitrary subdirs."""
+        from tools.orchestration_runtime import _allowed_output_paths_for_launch
+
+        build_id = "build_20260510_002"
+        req = {
+            "agent_role": "step",
+            "node_key": "problem/shallow_water2d@0.3.0",
+            "step": "build",
+            "plan_ref": _FIX_PLAN_REF,
+            "pipeline_ref": _FIX_PIPE_REF,
+            "allowed_output_paths": [
+                # Log path under an unrecognized subdir (not /bin/, not directly under build_id).
+                f"{_FIX_PIPE_REF}/build/{build_id}/logs/mcp_command_log.jsonl",
+            ],
+        }
+        with self.assertRaisesRegex(ValueError, "outside phase contract"):
+            _allowed_output_paths_for_launch(
+                request_payload=req,
+                write_roots=[f"{_FIX_PIPE_REF}/build/"],
+            )
+
+    def test_execute_phase_auto_injects_and_accepts_mcp_command_log(self) -> None:
+        """Execute step must auto-inject <exec_id>/<node_safe>/mcp_command_log.jsonl."""
+        from tools.orchestration_runtime import _allowed_output_paths_for_launch
+
+        exec_id = "exec_20260510_001"
+        node_safe = "problem__shallow_water2d__0.3.0"
+        req = {
+            "agent_role": "step",
+            "node_key": "problem/shallow_water2d@0.3.0",
+            "step": "execute",
+            "plan_ref": _FIX_PLAN_REF,
+            "pipeline_ref": _FIX_PIPE_REF,
+            "allowed_output_paths": [
+                f"{_FIX_PIPE_REF}/execute/{exec_id}/{node_safe}/diagnostics.json",
+                f"{_FIX_PIPE_REF}/execute/{exec_id}/{node_safe}/perf.json",
+            ],
+        }
+        out = _allowed_output_paths_for_launch(
+            request_payload=req,
+            write_roots=[f"{_FIX_PIPE_REF}/execute/"],
+        )
+        expected_log = (
+            f"{_FIX_PIPE_REF}/execute/{exec_id}/{node_safe}/mcp_command_log.jsonl"
+        )
+        self.assertIn(expected_log, out)
+
+    def test_build_log_excluded_from_allowed_file_tool_paths(self) -> None:
+        """Auto-injected build log must remain integrity-protected (not Edit/Write-eligible)."""
+        from tools.orchestration_runtime import (
+            _allowed_file_tool_paths_for_launch,
+            _allowed_output_paths_for_launch,
+        )
+
+        build_id = "build_20260510_003"
+        req = {
+            "agent_role": "step",
+            "node_key": "problem/shallow_water2d@0.3.0",
+            "step": "build",
+            "plan_ref": _FIX_PLAN_REF,
+            "pipeline_ref": _FIX_PIPE_REF,
+            "allowed_output_paths": [
+                f"{_FIX_PIPE_REF}/build/{build_id}/bin/main",
+                f"{_FIX_PIPE_REF}/build/{build_id}/build_meta.json",
+            ],
+        }
+        allowed = _allowed_output_paths_for_launch(
+            request_payload=req,
+            write_roots=[f"{_FIX_PIPE_REF}/build/"],
+        )
+        file_tool = _allowed_file_tool_paths_for_launch(
+            request_payload=req,
+            allowed_output_paths=allowed,
+        )
+        log_path = f"{_FIX_PIPE_REF}/build/{build_id}/mcp_command_log.jsonl"
+        self.assertIn(log_path, allowed)
+        self.assertNotIn(log_path, file_tool)
+
     def test_rejects_launch_with_placeholder_plan_or_pipeline_refs(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
@@ -2713,6 +3331,978 @@ shell_tool                       stable             true
                 },
             )
             self.assertEqual(payload["output_refs"], [out_ref])
+
+    def test_noncanonical_mcp_log_in_allowed_output_paths_is_not_mcp_trusted(self) -> None:
+        """A manifest entry with the basename mcp_command_log.jsonl at a
+        non-canonical path (e.g. <gen>/src/notes/mcp_command_log.jsonl) must
+        NOT be persisted as an MCP-owned audit log. Only canonical placements
+        under <gen>/src/ directly (alongside model/runner sources) qualify.
+        Defense against an over-broad manifest silently auto-trusting an
+        arbitrary file.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            init_orchestration(repo_root=repo_root, orchestration_id="orch_001")
+            write_preflight(
+                repo_root=repo_root,
+                orchestration_id="orch_001",
+                payload={
+                    "status": "pass",
+                    "sandbox_runtime": "bwrap",
+                    "sandbox_enforced": True,
+                    "can_launch_step_agents": True,
+                    "can_launch_substep_agents": True,
+                    "feature_states": {"multi_agent": True, "codex_hooks": True},
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
+                },
+            )
+            gen_id = "gen_20260510_010"
+            canonical_log = (
+                f"{_FIX_PIPE_REF}/generate/{gen_id}/src/mcp_command_log.jsonl"
+            )
+            noncanonical = (
+                f"{_FIX_PIPE_REF}/generate/{gen_id}/src/notes/mcp_command_log.jsonl"
+            )
+            record_launch(
+                repo_root=repo_root,
+                orchestration_id="orch_001",
+                parent_agent_run_id="orch_run_001",
+                child_agent_run_id="step_run_noncanon",
+                request_payload={
+                    "node_key": "problem/shallow_water2d@0.3.0",
+                    "step": "generate",
+                    "agent_role": "step",
+                    "orchestration_id": "orch_001",
+                    "agent_run_id": "step_run_noncanon",
+                    "parent_agent_run_id": "orch_run_001",
+                    "plan_ref": _FIX_PLAN_REF,
+                    "pipeline_ref": _FIX_PIPE_REF,
+                    "dependency_ref": f"{_FIX_PLAN_REF}/dependency.resolved.yaml",
+                    "generation_id": gen_id,
+                    # Caller declares both a canonical and a noncanonical
+                    # mcp_command_log.jsonl. Phase contract for /src/ is
+                    # loose enough to accept the noncanonical entry.
+                    "allowed_output_paths": [
+                        f"{_FIX_PIPE_REF}/generate/{gen_id}/src/main.f90",
+                        noncanonical,
+                    ],
+                    "skill_name": "workflow-generate",
+                    "skill_ref": "skills/workflow-generate/SKILL.md",
+                    "skill_must_read_refs": _fixture_skill_must_read_refs_step("generate"),
+                    "launch_prompt_full": _step_launch_prompt(
+                        "problem/shallow_water2d@0.3.0",
+                        "generate",
+                        "step_run_noncanon",
+                    ),
+                },
+                response_payload=_spawn_response_payload("sess_step_run_noncanon"),
+            )
+            manifest = json.loads(
+                (
+                    repo_root
+                    / "workspace/orchestrations/orch_001/output_manifests/step_run_noncanon.json"
+                ).read_text(encoding="utf-8")
+            )
+            # The canonical placement is auto-injected and recorded as
+            # MCP-owned; the noncanonical path is treated as a normal output.
+            self.assertIn(canonical_log, manifest["mcp_owned_audit_logs"])
+            self.assertNotIn(noncanonical, manifest["mcp_owned_audit_logs"])
+            # The noncanonical path is auto-derived as Edit/Write-eligible
+            # (regular .jsonl, not MCP-owned).
+            self.assertIn(noncanonical, manifest["allowed_file_tool_paths"])
+            # The canonical placement is excluded from file_tool paths.
+            self.assertNotIn(canonical_log, manifest["allowed_file_tool_paths"])
+
+    def test_record_agent_run_accepts_mcp_command_log_without_gate_provenance(self) -> None:
+        """Terminal validation must accept MCP-written mcp_command_log.jsonl.
+
+        MCP server writes the log directly (no guarded-apply-patch, no
+        Edit/Write tool invocation). It is auto-injected into
+        allowed_output_paths but excluded from allowed_file_tool_paths for
+        integrity. _validate_actual_write_paths() must recognize integrity-
+        protected MCP audit log entries in the manifest as authorized
+        MCP-owned outputs, otherwise a successful build/execute would be
+        fail-closed for the very file the MCP tool just produced.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            init_orchestration(repo_root=repo_root, orchestration_id="orch_001")
+            write_preflight(
+                repo_root=repo_root,
+                orchestration_id="orch_001",
+                payload={
+                    "status": "pass",
+                    "sandbox_runtime": "bwrap",
+                    "sandbox_enforced": True,
+                    "can_launch_step_agents": True,
+                    "can_launch_substep_agents": True,
+                    "feature_states": {"multi_agent": True, "codex_hooks": True},
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
+                },
+            )
+            record_agent_run(
+                repo_root=repo_root,
+                orchestration_id="orch_001",
+                payload={
+                    "agent_run_id": "orch_run_001",
+                    "agent_role": "orchestration",
+                    "status": "running",
+                    "agent_backend": "claude",
+                },
+            )
+            build_id = "build_20260510_001"
+            bin_ref = f"{_FIX_PIPE_REF}/build/{build_id}/bin/simulate"
+            log_ref = f"{_FIX_PIPE_REF}/build/{build_id}/mcp_command_log.jsonl"
+            record_launch(
+                repo_root=repo_root,
+                orchestration_id="orch_001",
+                parent_agent_run_id="orch_run_001",
+                child_agent_run_id="step_run_build_mcp_log",
+                request_payload={
+                    "node_key": "problem/shallow_water2d@0.3.0",
+                    "step": "build",
+                    "agent_role": "step",
+                    "orchestration_id": "orch_001",
+                    "agent_run_id": "step_run_build_mcp_log",
+                    "parent_agent_run_id": "orch_run_001",
+                    "plan_ref": _FIX_PLAN_REF,
+                    "pipeline_ref": _FIX_PIPE_REF,
+                    "dependency_ref": _FIX_DEP_REF,
+                    "skill_name": "workflow-build",
+                    "skill_ref": "skills/workflow-build/SKILL.md",
+                    "skill_must_read_refs": _fixture_skill_must_read_refs_step("build"),
+                    "allowed_output_paths": [bin_ref],
+                    "launch_prompt_full": _step_launch_prompt(
+                        "problem/shallow_water2d@0.3.0",
+                        "build",
+                        "step_run_build_mcp_log",
+                    ),
+                },
+                response_payload=_spawn_response_payload("sess_step_build_mcp_log"),
+            )
+            # Confirm auto-inject placed log in allowed_output_paths but not in file_tool list.
+            manifest = json.loads(
+                (
+                    repo_root
+                    / "workspace/orchestrations/orch_001/output_manifests/step_run_build_mcp_log.json"
+                ).read_text(encoding="utf-8")
+            )
+            self.assertIn(log_ref, manifest["allowed_output_paths"])
+            self.assertNotIn(log_ref, manifest["allowed_file_tool_paths"])
+
+            # Simulate build artefacts on disk:
+            #   - the binary, written via guarded-apply-patch (gate provenance)
+            #   - the MCP audit log, written by MCP server directly (no gate)
+            bin_path = repo_root / bin_ref
+            bin_path.parent.mkdir(parents=True, exist_ok=True)
+            bin_path.write_text("binary\n", encoding="utf-8")
+            log_path = repo_root / log_ref
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            log_path.write_text(
+                '{"command_id":"abc","tool_name":"compile_project","ok":true}\n',
+                encoding="utf-8",
+            )
+            _write_apply_patch_gate_evidence(
+                repo_root,
+                orchestration_id="orch_001",
+                agent_run_id="step_run_build_mcp_log",
+                actor_role="step",
+                changed_paths=[bin_ref],
+            )
+            payload = record_agent_run(
+                repo_root=repo_root,
+                orchestration_id="orch_001",
+                payload={
+                    "agent_run_id": "step_run_build_mcp_log",
+                    "agent_role": "step",
+                    "parent_agent_run_id": "orch_run_001",
+                    "step": "build",
+                    "node_key": "problem/shallow_water2d@0.3.0",
+                    "status": "pass",
+                    "agent_backend": "codex",
+                    "agent_model": "gpt-5-codex",
+                    "context_id": "ctx_step_build_mcp_log",
+                    "agent_session_id": "sess_step_build_mcp_log",
+                    "output_refs": [bin_ref, log_ref],
+                },
+            )
+            self.assertEqual(payload["status"], "pass")
+            self.assertIn(log_ref, payload["output_refs"])
+            # No unauthorized_write_violation file should have been written.
+            violation_path = (
+                repo_root
+                / "workspace/orchestrations/orch_001/violations"
+                / "step_run_build_mcp_log.unauthorized_write_violation.json"
+            )
+            self.assertFalse(violation_path.exists())
+
+    def test_execute_run_quality_checks_cross_phase_mcp_log_authorized(self) -> None:
+        """Execute's run_quality_checks runs with project_dir=generate/<gen>/src/
+        per skills/workflow-execute/SKILL.md L20. The MCP server's default
+        command_log_path resolves to project_dir/mcp_command_log.jsonl, so the
+        audit log lands under the generate tree even though the agent role is
+        execute. The cross-phase canonical placement must be:
+          - auto-injected when execute requests include `generation_id`
+          - phase-contract accepted
+          - terminal-validated as authorized despite execute's write_roots
+            being scoped to <pipeline_ref>/execute/.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            init_orchestration(repo_root=repo_root, orchestration_id="orch_001")
+            _plant_impl_resolved_yaml_make(repo_root)
+            write_preflight(
+                repo_root=repo_root,
+                orchestration_id="orch_001",
+                payload={
+                    "status": "pass",
+                    "sandbox_runtime": "bwrap",
+                    "sandbox_enforced": True,
+                    "can_launch_step_agents": True,
+                    "can_launch_substep_agents": True,
+                    "feature_states": {"multi_agent": True, "codex_hooks": True},
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
+                },
+            )
+            record_agent_run(
+                repo_root=repo_root,
+                orchestration_id="orch_001",
+                payload={
+                    "agent_run_id": "orch_run_001",
+                    "agent_role": "orchestration",
+                    "status": "running",
+                    "agent_backend": "claude",
+                },
+            )
+            gen_id = "gen_20260510_011"
+            exec_id = "exec_20260510_001"
+            node_safe = "problem__shallow_water2d__0.3.0"
+            # Cross-phase log auto-inject requires the referenced generation
+            # to have actually run (generate_meta.json must exist). In a real
+            # workflow generate completes before execute launches.
+            gen_meta_dir = repo_root / f"{_FIX_PIPE_REF}/generate/{gen_id}"
+            gen_meta_dir.mkdir(parents=True, exist_ok=True)
+            (gen_meta_dir / "generate_meta.json").write_text(
+                '{"verification_status": "pass"}\n', encoding="utf-8"
+            )
+            # Pipeline build phase must also exist for execute pre-launch
+            # readiness check (downstream_phase_launch_gate). The build_meta
+            # must record source_generation_id for the cross-phase lineage
+            # bind to authorize the request's generation_id.
+            build_id_for_lineage = "build_20260510_001"
+            build_dir = (
+                repo_root / f"{_FIX_PIPE_REF}/build/{build_id_for_lineage}"
+            )
+            (build_dir / "bin").mkdir(parents=True, exist_ok=True)
+            (build_dir / "bin/main").write_text("binary\n", encoding="utf-8")
+            (build_dir / "build_meta.json").write_text(
+                json.dumps({
+                    "build_system": "make",
+                    "compiler": "gfortran",
+                    "build_log_ref": "...",
+                    "status": "pass",
+                    "source_generation_id": gen_id,
+                }) + "\n",
+                encoding="utf-8",
+            )
+            cross_phase_log = (
+                f"{_FIX_PIPE_REF}/generate/{gen_id}/src/mcp_command_log.jsonl"
+            )
+            in_phase_log = (
+                f"{_FIX_PIPE_REF}/execute/{exec_id}/{node_safe}/mcp_command_log.jsonl"
+            )
+            diagnostics_ref = (
+                f"{_FIX_PIPE_REF}/execute/{exec_id}/{node_safe}/diagnostics.json"
+            )
+            record_launch(
+                repo_root=repo_root,
+                orchestration_id="orch_001",
+                parent_agent_run_id="orch_run_001",
+                child_agent_run_id="step_run_exec_qc",
+                request_payload={
+                    "node_key": "problem/shallow_water2d@0.3.0",
+                    "step": "execute",
+                    "agent_role": "step",
+                    "orchestration_id": "orch_001",
+                    "agent_run_id": "step_run_exec_qc",
+                    "parent_agent_run_id": "orch_run_001",
+                    "plan_ref": _FIX_PLAN_REF,
+                    "pipeline_ref": _FIX_PIPE_REF,
+                    "dependency_ref": _FIX_DEP_REF,
+                    "execution_id": exec_id,
+                    # generation_id triggers cross-phase log auto-inject for execute.
+                    "generation_id": gen_id,
+                    "source_build_id": build_id_for_lineage,
+                    "skill_name": "workflow-execute",
+                    "skill_ref": "skills/workflow-execute/SKILL.md",
+                    "skill_must_read_refs": _fixture_skill_must_read_refs_step("execute"),
+                    "allowed_output_paths": [diagnostics_ref],
+                    "launch_prompt_full": _step_launch_prompt(
+                        "problem/shallow_water2d@0.3.0",
+                        "execute",
+                        "step_run_exec_qc",
+                    ),
+                },
+                response_payload=_spawn_response_payload("sess_step_exec_qc"),
+            )
+            manifest = json.loads(
+                (
+                    repo_root
+                    / "workspace/orchestrations/orch_001/output_manifests/step_run_exec_qc.json"
+                ).read_text(encoding="utf-8")
+            )
+            # Both the in-phase and cross-phase canonical placements are auto-injected.
+            self.assertIn(in_phase_log, manifest["allowed_output_paths"])
+            self.assertIn(cross_phase_log, manifest["allowed_output_paths"])
+            # Both are in mcp_owned_audit_logs and excluded from file_tool list.
+            self.assertIn(in_phase_log, manifest["mcp_owned_audit_logs"])
+            self.assertIn(cross_phase_log, manifest["mcp_owned_audit_logs"])
+            self.assertNotIn(in_phase_log, manifest["allowed_file_tool_paths"])
+            self.assertNotIn(cross_phase_log, manifest["allowed_file_tool_paths"])
+
+            # Simulate the artefacts on disk:
+            #   - diagnostics.json written via guarded-apply-patch (gate provenance)
+            #   - cross-phase mcp_command_log.jsonl written by MCP run_quality_checks
+            #     (no gate provenance; cross-phase placement under generate/)
+            diag_path = repo_root / diagnostics_ref
+            diag_path.parent.mkdir(parents=True, exist_ok=True)
+            diag_path.write_text("{}\n", encoding="utf-8")
+            log_path = repo_root / cross_phase_log
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            log_path.write_text(
+                '{"command_id":"qc1","tool_name":"run_quality_checks","ok":true}\n',
+                encoding="utf-8",
+            )
+            _write_apply_patch_gate_evidence(
+                repo_root,
+                orchestration_id="orch_001",
+                agent_run_id="step_run_exec_qc",
+                actor_role="step",
+                changed_paths=[diagnostics_ref],
+            )
+            payload = record_agent_run(
+                repo_root=repo_root,
+                orchestration_id="orch_001",
+                payload={
+                    "agent_run_id": "step_run_exec_qc",
+                    "agent_role": "step",
+                    "parent_agent_run_id": "orch_run_001",
+                    "step": "execute",
+                    "node_key": "problem/shallow_water2d@0.3.0",
+                    "status": "pass",
+                    "agent_backend": "codex",
+                    "agent_model": "gpt-5-codex",
+                    "context_id": "ctx_step_run_exec_qc",
+                    "agent_session_id": "sess_step_exec_qc",
+                    "output_refs": [diagnostics_ref, cross_phase_log],
+                },
+            )
+            self.assertEqual(payload["status"], "pass")
+            violation_path = (
+                repo_root
+                / "workspace/orchestrations/orch_001/violations"
+                / "step_run_exec_qc.unauthorized_write_violation.json"
+            )
+            self.assertFalse(violation_path.exists())
+
+    def test_execute_launch_rejects_listed_path_for_unrelated_generation(self) -> None:
+        """Defense against authorization-by-listing of an unrelated generation.
+
+        If an execute launch lists `<pipeline_ref>/generate/<other>/src/...`
+        in allowed_output_paths (a generation different from the request's
+        `generation_id`), the launch must be rejected. Otherwise an older or
+        sibling generation's audit log could gain MCP-owned write authority.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            init_orchestration(repo_root=repo_root, orchestration_id="orch_001")
+            write_preflight(
+                repo_root=repo_root,
+                orchestration_id="orch_001",
+                payload={
+                    "status": "pass",
+                    "sandbox_runtime": "bwrap",
+                    "sandbox_enforced": True,
+                    "can_launch_step_agents": True,
+                    "can_launch_substep_agents": True,
+                    "feature_states": {"multi_agent": True, "codex_hooks": True},
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
+                },
+            )
+            record_agent_run(
+                repo_root=repo_root,
+                orchestration_id="orch_001",
+                payload={
+                    "agent_run_id": "orch_run_001",
+                    "agent_role": "orchestration",
+                    "status": "running",
+                    "agent_backend": "claude",
+                },
+            )
+            real_gen = "gen_real_001"
+            other_gen = "gen_other_002"
+            exec_id = "exec_unrelated_001"
+            node_safe = "problem__shallow_water2d__0.3.0"
+            # Both generations exist on disk (e.g., older sibling under same pipeline).
+            for gid in (real_gen, other_gen):
+                gdir = repo_root / f"{_FIX_PIPE_REF}/generate/{gid}"
+                gdir.mkdir(parents=True, exist_ok=True)
+                (gdir / "generate_meta.json").write_text(
+                    '{"verification_status": "pass"}\n', encoding="utf-8"
+                )
+            (repo_root / f"{_FIX_PIPE_REF}/build/build_x/bin").mkdir(
+                parents=True, exist_ok=True
+            )
+            (repo_root / f"{_FIX_PIPE_REF}/build/build_x/bin/main").write_text(
+                "binary\n", encoding="utf-8"
+            )
+            diagnostics_ref = (
+                f"{_FIX_PIPE_REF}/execute/{exec_id}/{node_safe}/diagnostics.json"
+            )
+            other_log_ref = (
+                f"{_FIX_PIPE_REF}/generate/{other_gen}/src/mcp_command_log.jsonl"
+            )
+            # Launch with generation_id=real_gen but ALSO list a path under
+            # the unrelated other_gen tree. The phase contract for execute
+            # should reject the unrelated generate path because it does not
+            # match the request's generation_id.
+            with self.assertRaisesRegex(
+                ValueError, "outside phase contract|under capability write_roots"
+            ):
+                record_launch(
+                    repo_root=repo_root,
+                    orchestration_id="orch_001",
+                    parent_agent_run_id="orch_run_001",
+                    child_agent_run_id="step_run_exec_unrelated",
+                    request_payload={
+                        "node_key": "problem/shallow_water2d@0.3.0",
+                        "step": "execute",
+                        "agent_role": "step",
+                        "orchestration_id": "orch_001",
+                        "agent_run_id": "step_run_exec_unrelated",
+                        "parent_agent_run_id": "orch_run_001",
+                        "plan_ref": _FIX_PLAN_REF,
+                        "pipeline_ref": _FIX_PIPE_REF,
+                        "dependency_ref": _FIX_DEP_REF,
+                        "execution_id": exec_id,
+                        "generation_id": real_gen,
+                        "skill_name": "workflow-execute",
+                        "skill_ref": "skills/workflow-execute/SKILL.md",
+                        "skill_must_read_refs": _fixture_skill_must_read_refs_step("execute"),
+                        "allowed_output_paths": [diagnostics_ref, other_log_ref],
+                        "launch_prompt_full": _step_launch_prompt(
+                            "problem/shallow_water2d@0.3.0",
+                            "execute",
+                            "step_run_exec_unrelated",
+                        ),
+                    },
+                    response_payload=_spawn_response_payload("sess_step_exec_unrelated"),
+                )
+
+    def test_execute_launch_accepts_when_legacy_build_coexists_with_recorded_build(self) -> None:
+        """Legacy build directories without source_generation_id must NOT
+        block valid execute launches as long as at least one current build
+        records the lineage and matches the request's generation_id.
+
+        Defense against operational dead-end: pipelines accumulate historical
+        build dirs over retries, and over-broad strict bind would render the
+        pipeline unusable for future executes once any single build_meta is
+        missing the field.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            init_orchestration(repo_root=repo_root, orchestration_id="orch_001")
+            _plant_impl_resolved_yaml_make(repo_root)
+            write_preflight(
+                repo_root=repo_root,
+                orchestration_id="orch_001",
+                payload={
+                    "status": "pass",
+                    "sandbox_runtime": "bwrap",
+                    "sandbox_enforced": True,
+                    "can_launch_step_agents": True,
+                    "can_launch_substep_agents": True,
+                    "feature_states": {"multi_agent": True, "codex_hooks": True},
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
+                },
+            )
+            record_agent_run(
+                repo_root=repo_root,
+                orchestration_id="orch_001",
+                payload={
+                    "agent_run_id": "orch_run_001",
+                    "agent_role": "orchestration",
+                    "status": "running",
+                    "agent_backend": "claude",
+                },
+            )
+            real_gen = "gen_real_001"
+            exec_id = "exec_test_001"
+            node_safe = "problem__shallow_water2d__0.3.0"
+            gd = repo_root / f"{_FIX_PIPE_REF}/generate/{real_gen}"
+            gd.mkdir(parents=True, exist_ok=True)
+            (gd / "generate_meta.json").write_text(
+                '{"verification_status": "pass"}\n', encoding="utf-8"
+            )
+            # Legacy build dir WITHOUT source_generation_id (older retry).
+            legacy_dir = repo_root / f"{_FIX_PIPE_REF}/build/build_legacy_999"
+            (legacy_dir / "bin").mkdir(parents=True, exist_ok=True)
+            (legacy_dir / "bin/main").write_text("legacy_binary\n", encoding="utf-8")
+            (legacy_dir / "build_meta.json").write_text(
+                json.dumps({
+                    "build_system": "make",
+                    "compiler": "gfortran",
+                    "build_log_ref": "...",
+                    "status": "pass",
+                }) + "\n",
+                encoding="utf-8",
+            )
+            # Current build with source_generation_id matching the request.
+            current_dir = repo_root / f"{_FIX_PIPE_REF}/build/build_current_001"
+            (current_dir / "bin").mkdir(parents=True, exist_ok=True)
+            (current_dir / "bin/main").write_text("current_binary\n", encoding="utf-8")
+            (current_dir / "build_meta.json").write_text(
+                json.dumps({
+                    "build_system": "make",
+                    "compiler": "gfortran",
+                    "build_log_ref": "...",
+                    "status": "pass",
+                    "source_generation_id": real_gen,
+                }) + "\n",
+                encoding="utf-8",
+            )
+            diagnostics_ref = (
+                f"{_FIX_PIPE_REF}/execute/{exec_id}/{node_safe}/diagnostics.json"
+            )
+            # Execute launch with generation_id=real_gen must succeed even
+            # though legacy_build is missing source_generation_id.
+            record_launch(
+                repo_root=repo_root,
+                orchestration_id="orch_001",
+                parent_agent_run_id="orch_run_001",
+                child_agent_run_id="step_run_exec_legacy_coexist",
+                request_payload={
+                    "node_key": "problem/shallow_water2d@0.3.0",
+                    "step": "execute",
+                    "agent_role": "step",
+                    "orchestration_id": "orch_001",
+                    "agent_run_id": "step_run_exec_legacy_coexist",
+                    "parent_agent_run_id": "orch_run_001",
+                    "plan_ref": _FIX_PLAN_REF,
+                    "pipeline_ref": _FIX_PIPE_REF,
+                    "dependency_ref": _FIX_DEP_REF,
+                    "execution_id": exec_id,
+                    "generation_id": real_gen,
+                    "source_build_id": "build_current_001",
+                    "skill_name": "workflow-execute",
+                    "skill_ref": "skills/workflow-execute/SKILL.md",
+                    "skill_must_read_refs": _fixture_skill_must_read_refs_step("execute"),
+                    "allowed_output_paths": [diagnostics_ref],
+                    "launch_prompt_full": _step_launch_prompt(
+                        "problem/shallow_water2d@0.3.0",
+                        "execute",
+                        "step_run_exec_legacy_coexist",
+                    ),
+                },
+                response_payload=_spawn_response_payload("sess_step_exec_legacy_coexist"),
+            )
+            manifest = json.loads(
+                (
+                    repo_root
+                    / "workspace/orchestrations/orch_001/output_manifests/step_run_exec_legacy_coexist.json"
+                ).read_text(encoding="utf-8")
+            )
+            cross_log = (
+                f"{_FIX_PIPE_REF}/generate/{real_gen}/src/mcp_command_log.jsonl"
+            )
+            self.assertIn(cross_log, manifest["mcp_owned_audit_logs"])
+
+    def test_execute_launch_requires_source_build_id_for_in_phase_log_only(self) -> None:
+        """source_build_id is required for ALL execute launches, not only
+        cross-phase quality_check authorization. An execute that uses only
+        in-phase logging must still be bound to a specific build to prevent
+        attributing evidence to an arbitrary build that happens to record a
+        matching source_generation_id.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            init_orchestration(repo_root=repo_root, orchestration_id="orch_001")
+            write_preflight(
+                repo_root=repo_root,
+                orchestration_id="orch_001",
+                payload={
+                    "status": "pass",
+                    "sandbox_runtime": "bwrap",
+                    "sandbox_enforced": True,
+                    "can_launch_step_agents": True,
+                    "can_launch_substep_agents": True,
+                    "feature_states": {"multi_agent": True, "codex_hooks": True},
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
+                },
+            )
+            record_agent_run(
+                repo_root=repo_root,
+                orchestration_id="orch_001",
+                payload={
+                    "agent_run_id": "orch_run_001",
+                    "agent_role": "orchestration",
+                    "status": "running",
+                    "agent_backend": "claude",
+                },
+            )
+            real_gen = "gen_real_001"
+            exec_id = "exec_in_phase_001"
+            node_safe = "problem__shallow_water2d__0.3.0"
+            gd = repo_root / f"{_FIX_PIPE_REF}/generate/{real_gen}"
+            gd.mkdir(parents=True, exist_ok=True)
+            (gd / "generate_meta.json").write_text(
+                '{"verification_status": "pass"}\n', encoding="utf-8"
+            )
+            bd = repo_root / f"{_FIX_PIPE_REF}/build/build_x"
+            (bd / "bin").mkdir(parents=True, exist_ok=True)
+            (bd / "bin/main").write_text("binary\n", encoding="utf-8")
+            (bd / "build_meta.json").write_text(
+                json.dumps({
+                    "build_system": "make",
+                    "compiler": "gfortran",
+                    "build_log_ref": "...",
+                    "status": "pass",
+                    "source_generation_id": real_gen,
+                }) + "\n",
+                encoding="utf-8",
+            )
+            diagnostics_ref = (
+                f"{_FIX_PIPE_REF}/execute/{exec_id}/{node_safe}/diagnostics.json"
+            )
+            # Launch WITHOUT source_build_id → reject regardless of cross-phase status.
+            with self.assertRaisesRegex(
+                ValueError,
+                "execute launch requires `source_build_id`",
+            ):
+                record_launch(
+                    repo_root=repo_root,
+                    orchestration_id="orch_001",
+                    parent_agent_run_id="orch_run_001",
+                    child_agent_run_id="step_run_exec_no_build_id",
+                    request_payload={
+                        "node_key": "problem/shallow_water2d@0.3.0",
+                        "step": "execute",
+                        "agent_role": "step",
+                        "orchestration_id": "orch_001",
+                        "agent_run_id": "step_run_exec_no_build_id",
+                        "parent_agent_run_id": "orch_run_001",
+                        "plan_ref": _FIX_PLAN_REF,
+                        "pipeline_ref": _FIX_PIPE_REF,
+                        "dependency_ref": _FIX_DEP_REF,
+                        "execution_id": exec_id,
+                        "generation_id": real_gen,
+                        # No source_build_id, no cross-phase log declared.
+                        "skill_name": "workflow-execute",
+                        "skill_ref": "skills/workflow-execute/SKILL.md",
+                        "skill_must_read_refs": _fixture_skill_must_read_refs_step("execute"),
+                        "allowed_output_paths": [diagnostics_ref],
+                        "launch_prompt_full": _step_launch_prompt(
+                            "problem/shallow_water2d@0.3.0",
+                            "execute",
+                            "step_run_exec_no_build_id",
+                        ),
+                    },
+                    response_payload=_spawn_response_payload("sess_step_exec_no_build_id"),
+                )
+
+    def test_execute_launch_rejects_unrelated_generation_when_build_meta_records_lineage(self) -> None:
+        """Cross-phase generation_id must match an actual build's
+        source_generation_id. If build_meta.json under the pipeline records
+        source_generation_id and the request's generation_id does not match
+        any of them, the cross-phase write authorization is rejected.
+
+        Defense against attributing quality_check evidence to a passing
+        sibling generation that was not used by any build.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            init_orchestration(repo_root=repo_root, orchestration_id="orch_001")
+            _plant_impl_resolved_yaml_make(repo_root)
+            write_preflight(
+                repo_root=repo_root,
+                orchestration_id="orch_001",
+                payload={
+                    "status": "pass",
+                    "sandbox_runtime": "bwrap",
+                    "sandbox_enforced": True,
+                    "can_launch_step_agents": True,
+                    "can_launch_substep_agents": True,
+                    "feature_states": {"multi_agent": True, "codex_hooks": True},
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
+                },
+            )
+            record_agent_run(
+                repo_root=repo_root,
+                orchestration_id="orch_001",
+                payload={
+                    "agent_run_id": "orch_run_001",
+                    "agent_role": "orchestration",
+                    "status": "running",
+                    "agent_backend": "claude",
+                },
+            )
+            real_gen = "gen_real_001"
+            unrelated_gen = "gen_unrelated_999"
+            build_id = "build_real_001"
+            exec_id = "exec_test_001"
+            node_safe = "problem__shallow_water2d__0.3.0"
+            # Two pass-state generations + one build_meta that records ONLY
+            # real_gen as its source_generation_id.
+            for gid in (real_gen, unrelated_gen):
+                gd = repo_root / f"{_FIX_PIPE_REF}/generate/{gid}"
+                gd.mkdir(parents=True, exist_ok=True)
+                (gd / "generate_meta.json").write_text(
+                    '{"verification_status": "pass"}\n', encoding="utf-8"
+                )
+            bd = repo_root / f"{_FIX_PIPE_REF}/build/{build_id}"
+            (bd / "bin").mkdir(parents=True, exist_ok=True)
+            (bd / "bin/main").write_text("binary\n", encoding="utf-8")
+            (bd / "build_meta.json").write_text(
+                json.dumps({
+                    "build_system": "make",
+                    "compiler": "gfortran",
+                    "build_log_ref": "...",
+                    "status": "pass",
+                    "source_generation_id": real_gen,
+                }) + "\n",
+                encoding="utf-8",
+            )
+            diagnostics_ref = (
+                f"{_FIX_PIPE_REF}/execute/{exec_id}/{node_safe}/diagnostics.json"
+            )
+            with self.assertRaisesRegex(
+                ValueError,
+                "does not match build .* source_generation_id",
+            ):
+                record_launch(
+                    repo_root=repo_root,
+                    orchestration_id="orch_001",
+                    parent_agent_run_id="orch_run_001",
+                    child_agent_run_id="step_run_exec_unrelated_gen",
+                    request_payload={
+                        "node_key": "problem/shallow_water2d@0.3.0",
+                        "step": "execute",
+                        "agent_role": "step",
+                        "orchestration_id": "orch_001",
+                        "agent_run_id": "step_run_exec_unrelated_gen",
+                        "parent_agent_run_id": "orch_run_001",
+                        "plan_ref": _FIX_PLAN_REF,
+                        "pipeline_ref": _FIX_PIPE_REF,
+                        "dependency_ref": _FIX_DEP_REF,
+                        "execution_id": exec_id,
+                        # Request points at the real build but claims
+                        # unrelated_gen — should fail because build_real_001's
+                        # source_generation_id is real_gen, not unrelated_gen.
+                        "generation_id": unrelated_gen,
+                        "source_build_id": build_id,
+                        "skill_name": "workflow-execute",
+                        "skill_ref": "skills/workflow-execute/SKILL.md",
+                        "skill_must_read_refs": _fixture_skill_must_read_refs_step("execute"),
+                        "allowed_output_paths": [diagnostics_ref],
+                        "launch_prompt_full": _step_launch_prompt(
+                            "problem/shallow_water2d@0.3.0",
+                            "execute",
+                            "step_run_exec_unrelated_gen",
+                        ),
+                    },
+                    response_payload=_spawn_response_payload("sess_step_exec_unrelated_gen"),
+                )
+
+    def test_execute_launch_rejects_cross_phase_log_for_failed_generation(self) -> None:
+        """Defense against authorizing writes into a failed generation's tree.
+
+        Even when generate_meta.json exists for the referenced generation_id,
+        record_launch must reject the cross-phase MCP audit log authorization
+        if verification_status is not 'pass'. Otherwise an Execute run could
+        mutate provenance files inside a failed/stale generation before the
+        run is later rejected by post_execute, contaminating cross-phase
+        artifacts irreversibly.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            init_orchestration(repo_root=repo_root, orchestration_id="orch_001")
+            _plant_impl_resolved_yaml_make(repo_root)
+            write_preflight(
+                repo_root=repo_root,
+                orchestration_id="orch_001",
+                payload={
+                    "status": "pass",
+                    "sandbox_runtime": "bwrap",
+                    "sandbox_enforced": True,
+                    "can_launch_step_agents": True,
+                    "can_launch_substep_agents": True,
+                    "feature_states": {"multi_agent": True, "codex_hooks": True},
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
+                },
+            )
+            record_agent_run(
+                repo_root=repo_root,
+                orchestration_id="orch_001",
+                payload={
+                    "agent_run_id": "orch_run_001",
+                    "agent_role": "orchestration",
+                    "status": "running",
+                    "agent_backend": "claude",
+                },
+            )
+            failed_gen = "gen_failed_001"
+            exec_id = "exec_against_failed_001"
+            node_safe = "problem__shallow_water2d__0.3.0"
+            # Plant a failed generation (verification_status=fail).
+            gen_dir = repo_root / f"{_FIX_PIPE_REF}/generate/{failed_gen}"
+            gen_dir.mkdir(parents=True, exist_ok=True)
+            (gen_dir / "generate_meta.json").write_text(
+                '{"verification_status": "fail"}\n', encoding="utf-8"
+            )
+            # build_x's build_meta.json records source_generation_id=failed_gen
+            # so the mandatory lineage bind passes and the cross-phase
+            # verification_status check is reached.
+            build_x_dir = repo_root / f"{_FIX_PIPE_REF}/build/build_x"
+            (build_x_dir / "bin").mkdir(parents=True, exist_ok=True)
+            (build_x_dir / "bin/main").write_text("binary\n", encoding="utf-8")
+            (build_x_dir / "build_meta.json").write_text(
+                json.dumps({
+                    "build_system": "make",
+                    "compiler": "gfortran",
+                    "build_log_ref": "...",
+                    "status": "pass",
+                    "source_generation_id": failed_gen,
+                }) + "\n",
+                encoding="utf-8",
+            )
+            diagnostics_ref = (
+                f"{_FIX_PIPE_REF}/execute/{exec_id}/{node_safe}/diagnostics.json"
+            )
+            with self.assertRaisesRegex(
+                ValueError, "verification_status='fail'"
+            ):
+                record_launch(
+                    repo_root=repo_root,
+                    orchestration_id="orch_001",
+                    parent_agent_run_id="orch_run_001",
+                    child_agent_run_id="step_run_exec_failed_gen",
+                    request_payload={
+                        "node_key": "problem/shallow_water2d@0.3.0",
+                        "step": "execute",
+                        "agent_role": "step",
+                        "orchestration_id": "orch_001",
+                        "agent_run_id": "step_run_exec_failed_gen",
+                        "parent_agent_run_id": "orch_run_001",
+                        "plan_ref": _FIX_PLAN_REF,
+                        "pipeline_ref": _FIX_PIPE_REF,
+                        "dependency_ref": _FIX_DEP_REF,
+                        "execution_id": exec_id,
+                        "generation_id": failed_gen,
+                        "source_build_id": "build_x",
+                        "skill_name": "workflow-execute",
+                        "skill_ref": "skills/workflow-execute/SKILL.md",
+                        "skill_must_read_refs": _fixture_skill_must_read_refs_step("execute"),
+                        "allowed_output_paths": [diagnostics_ref],
+                        "launch_prompt_full": _step_launch_prompt(
+                            "problem/shallow_water2d@0.3.0",
+                            "execute",
+                            "step_run_exec_failed_gen",
+                        ),
+                    },
+                    response_payload=_spawn_response_payload("sess_step_exec_failed_gen"),
+                )
+
+    def test_execute_launch_rejects_cross_phase_log_for_unknown_generation_id(self) -> None:
+        """Defense against authorization-by-injection of cross-phase log paths.
+
+        If the launch request's `generation_id` does not correspond to an
+        actual generate run on disk (`generate_meta.json` missing),
+        record_launch must refuse rather than silently auto-inject a writable
+        cross-phase log path that targets an unrelated generation's audit log.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            init_orchestration(repo_root=repo_root, orchestration_id="orch_001")
+            _plant_impl_resolved_yaml_make(repo_root)
+            write_preflight(
+                repo_root=repo_root,
+                orchestration_id="orch_001",
+                payload={
+                    "status": "pass",
+                    "sandbox_runtime": "bwrap",
+                    "sandbox_enforced": True,
+                    "can_launch_step_agents": True,
+                    "can_launch_substep_agents": True,
+                    "feature_states": {"multi_agent": True, "codex_hooks": True},
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
+                },
+            )
+            record_agent_run(
+                repo_root=repo_root,
+                orchestration_id="orch_001",
+                payload={
+                    "agent_run_id": "orch_run_001",
+                    "agent_role": "orchestration",
+                    "status": "running",
+                    "agent_backend": "claude",
+                },
+            )
+            forged_gen_id = "gen_20260510_xxx_unknown"
+            exec_id = "exec_20260510_002"
+            node_safe = "problem__shallow_water2d__0.3.0"
+            # Plant a build_meta that records the forged gen so the
+            # mandatory source_build_id lineage check passes; the cross-phase
+            # generate_meta absence then triggers the unknown-generation
+            # rejection in the cross-phase loop.
+            build_dir = repo_root / f"{_FIX_PIPE_REF}/build/build_for_forged"
+            (build_dir / "bin").mkdir(parents=True, exist_ok=True)
+            (build_dir / "bin/main").write_text("binary\n", encoding="utf-8")
+            (build_dir / "build_meta.json").write_text(
+                json.dumps({
+                    "build_system": "make",
+                    "compiler": "gfortran",
+                    "build_log_ref": "...",
+                    "status": "pass",
+                    "source_generation_id": forged_gen_id,
+                }) + "\n",
+                encoding="utf-8",
+            )
+            diagnostics_ref = (
+                f"{_FIX_PIPE_REF}/execute/{exec_id}/{node_safe}/diagnostics.json"
+            )
+            with self.assertRaisesRegex(
+                ValueError, "unknown cross-phase generation_id"
+            ):
+                record_launch(
+                    repo_root=repo_root,
+                    orchestration_id="orch_001",
+                    parent_agent_run_id="orch_run_001",
+                    child_agent_run_id="step_run_exec_forged",
+                    request_payload={
+                        "node_key": "problem/shallow_water2d@0.3.0",
+                        "step": "execute",
+                        "agent_role": "step",
+                        "orchestration_id": "orch_001",
+                        "agent_run_id": "step_run_exec_forged",
+                        "parent_agent_run_id": "orch_run_001",
+                        "plan_ref": _FIX_PLAN_REF,
+                        "pipeline_ref": _FIX_PIPE_REF,
+                        "dependency_ref": _FIX_DEP_REF,
+                        "execution_id": exec_id,
+                        "generation_id": forged_gen_id,
+                        "source_build_id": "build_for_forged",
+                        "skill_name": "workflow-execute",
+                        "skill_ref": "skills/workflow-execute/SKILL.md",
+                        "skill_must_read_refs": _fixture_skill_must_read_refs_step("execute"),
+                        "allowed_output_paths": [diagnostics_ref],
+                        "launch_prompt_full": _step_launch_prompt(
+                            "problem/shallow_water2d@0.3.0",
+                            "execute",
+                            "step_run_exec_forged",
+                        ),
+                    },
+                    response_payload=_spawn_response_payload("sess_step_exec_forged"),
+                )
 
     def test_record_agent_run_accepts_substep_terminal_when_tmp_file_is_under_allowed_tmp_root(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -9020,7 +10610,15 @@ class TestPhase3RunGate(unittest.TestCase):
             request_payload=req,
             write_roots=[f"{_FIX_PIPE_REF}/generate/"],
         )
-        self.assertEqual(out, [f"{_FIX_PIPE_REF}/generate/{gen_id}/src/"])
+        # Generate-step launches receive a defensive auto-inject for the
+        # MCP run_linter side-effect log under <gen_id>/src/.
+        self.assertEqual(
+            out,
+            [
+                f"{_FIX_PIPE_REF}/generate/{gen_id}/src/",
+                f"{_FIX_PIPE_REF}/generate/{gen_id}/src/mcp_command_log.jsonl",
+            ],
+        )
 
     def test_allowed_output_paths_for_launch_rejects_generate_srcmal_directory(self) -> None:
         gen_id = "gen_20260508_001"
@@ -9414,6 +11012,50 @@ class TestPhase3RunGate(unittest.TestCase):
                 "workspace/orchestrations/rg1/gates/build_child_rg1/apply_patch_writes.json",
             )
             self.assertEqual(run_mock.call_count, 2)
+
+    def test_guarded_apply_patch_rejects_mcp_command_log_mutation(self) -> None:
+        """Step/substep agents must not patch integrity-protected MCP audit logs.
+
+        The log path is auto-injected into allowed_output_paths so MCP-side
+        writes pass record-agent-run, but a forged guarded-apply-patch must
+        be rejected before manifest validation — otherwise a child could
+        fabricate `tool_name=run_linter, ok=true` records and bypass
+        validate_pipeline_semantics.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            token = self._setup_run_gate_fixture(repo_root)
+            log_path = f"{_FIX_PIPE_REF}/build/build_001/mcp_command_log.jsonl"
+            patch_text = "\n".join(
+                [
+                    f"diff --git a/{log_path} b/{log_path}",
+                    f"--- a/{log_path}",
+                    f"+++ b/{log_path}",
+                    "@@ -0,0 +1 @@",
+                    '+{"command_id": "forged", "tool_name": "run_linter", "ok": true}',
+                    "",
+                ]
+            )
+            with (
+                patch(
+                    "tools.orchestration_runtime._numstat_targets", return_value=[log_path]
+                ),
+                patch("tools.orchestration_runtime.subprocess.run") as run_mock,
+            ):
+                with self.assertRaisesRegex(
+                    RuntimeError, "MCP-owned audit logs"
+                ):
+                    guarded_apply_patch(
+                        repo_root,
+                        orchestration_id="rg1",
+                        actor_role="step",
+                        agent_run_id="build_child_rg1",
+                        changed_paths=[log_path],
+                        patch_text=patch_text,
+                        capability_token=token,
+                    )
+            # git apply must not be invoked.
+            self.assertEqual(run_mock.call_count, 0)
 
     def test_guarded_apply_patch_rejects_file_under_directory_when_not_listed(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

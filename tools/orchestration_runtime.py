@@ -1859,6 +1859,96 @@ def validate_mcp_build_tool_invocation(
             raise RuntimeError(
                 "MCP phase gate: Execute run_program command must reference case.resolved.yaml"
             )
+        # Canonical command_log_path enforcement: align with validator-side
+        # post_execute check so non-canonical placements fail at MCP-call time
+        # rather than after expensive execution. Required canonical:
+        #   <pipeline_ref>/execute/<execution_id>/<node_safe>/mcp_command_log.jsonl
+        # The MCP server's `_resolve_command_log_path` resolves a relative
+        # `command_log_path` against `project_dir`; we normalize both to a
+        # repo-relative canonical comparison.
+        try:
+            req_doc_for_log = _read_json(
+                _orchestration_root(repo_root, orchestration_id)
+                / "launches"
+                / f"{agent_run_id.strip()}.request.json"
+            )
+        except (OSError, json.JSONDecodeError):
+            req_doc_for_log = None
+        pipeline_ref_for_log: str | None = None
+        execution_id_for_log: str | None = None
+        if isinstance(req_doc_for_log, dict):
+            pr_raw = req_doc_for_log.get("pipeline_ref")
+            if isinstance(pr_raw, str) and pr_raw.strip():
+                pipeline_ref_for_log = _normalize_rel_posix(pr_raw.strip())
+            ex_raw = req_doc_for_log.get("execution_id")
+            if isinstance(ex_raw, str) and ex_raw.strip():
+                execution_id_for_log = ex_raw.strip()
+        if pipeline_ref_for_log and execution_id_for_log:
+            expected_log_rel = (
+                f"{pipeline_ref_for_log}/execute/{execution_id_for_log}/"
+                f"{node_safe}/mcp_command_log.jsonl"
+            )
+            project_dir_raw = args_obj.get("project_dir")
+            command_log_path_raw = args_obj.get("command_log_path")
+            actual_log_rel: str | None = None
+            try:
+                if (
+                    isinstance(command_log_path_raw, str)
+                    and command_log_path_raw.strip()
+                ):
+                    clp_path = Path(command_log_path_raw.strip())
+                    if clp_path.is_absolute():
+                        try:
+                            actual_log_rel = (
+                                clp_path.resolve()
+                                .relative_to(repo_root.resolve())
+                                .as_posix()
+                            )
+                        except ValueError:
+                            actual_log_rel = None
+                    else:
+                        if (
+                            isinstance(project_dir_raw, str)
+                            and project_dir_raw.strip()
+                        ):
+                            base = Path(project_dir_raw.strip())
+                            if not base.is_absolute():
+                                base = repo_root / base
+                            try:
+                                actual_log_rel = (
+                                    (base / clp_path)
+                                    .resolve()
+                                    .relative_to(repo_root.resolve())
+                                    .as_posix()
+                                )
+                            except ValueError:
+                                actual_log_rel = None
+                elif (
+                    isinstance(project_dir_raw, str)
+                    and project_dir_raw.strip()
+                ):
+                    base = Path(project_dir_raw.strip())
+                    if not base.is_absolute():
+                        base = repo_root / base
+                    try:
+                        actual_log_rel = (
+                            (base / "mcp_command_log.jsonl")
+                            .resolve()
+                            .relative_to(repo_root.resolve())
+                            .as_posix()
+                        )
+                    except ValueError:
+                        actual_log_rel = None
+            except OSError:
+                actual_log_rel = None
+            if actual_log_rel != expected_log_rel:
+                raise RuntimeError(
+                    "MCP phase gate: Execute run_program log placement must be "
+                    f"canonical {expected_log_rel!r} (resolved={actual_log_rel!r}). "
+                    "Set project_dir to the execute node directory or pass "
+                    "command_log_path explicitly so post_execute can verify "
+                    "tool-execution evidence at canonical placement."
+                )
     if tool_name in {"compile_project", "run_quality_checks"}:
         plan_ref = _launch_plan_ref_for_agent(repo_root, orchestration_id, agent_run_id)
         if plan_ref:
@@ -2314,6 +2404,7 @@ def _write_allowed_output_manifest(
     allowed_file_tool_paths: Sequence[str] | None = None,
     agent_role: str | None = None,
     allowed_tmp_root: str | None = None,
+    mcp_owned_audit_logs: Sequence[str] | None = None,
 ) -> str:
     normalized = []
     for p in allowed_output_paths:
@@ -2329,11 +2420,17 @@ def _write_allowed_output_manifest(
         for p in (allowed_file_tool_paths or [])
         if isinstance(p, str) and p.strip()
     ]
+    mcp_logs_normalized = [
+        _normalize_rel_posix(p)
+        for p in (mcp_owned_audit_logs or [])
+        if isinstance(p, str) and p.strip()
+    ]
     payload = {
         "orchestration_id": orchestration_id,
         "agent_run_id": agent_run_id.strip(),
         "allowed_output_paths": sorted(set(normalized)),
         "allowed_file_tool_paths": sorted(set(file_tool_normalized)),
+        "mcp_owned_audit_logs": sorted(set(mcp_logs_normalized)),
         "generated_at": _utc_now_iso(),
     }
     if isinstance(allowed_tmp_root, str) and allowed_tmp_root.strip():
@@ -2492,6 +2589,8 @@ def _allowed_output_paths_for_launch(
     build_prefix = f"{pipeline_ref}/build/" if pipeline_ref else ""
     execute_prefix = f"{pipeline_ref}/execute/" if pipeline_ref else ""
     tune_prefix = f"{pipeline_ref}/tune/" if pipeline_ref else ""
+    # generation_id closure for cross-phase placement check below.
+    generation_id = str(request_payload.get("generation_id") or "").strip()
 
     def _matches_phase_contract(path: str) -> bool:
         # Directory allowlist entries (trailing slash): validate the directory itself is permitted.
@@ -2517,12 +2616,53 @@ def _allowed_output_paths_for_launch(
                     return True
             return False
         if step_token == "build":
+            # Cross-phase exception: in-source Make builds for Fortran/C
+            # family run compile_project with project_dir=<gen>/src/, so the
+            # MCP audit log lands under the generate tree. Strict bind to
+            # request.generation_id (record_launch verifies pass-state).
+            if generate_prefix and path.startswith(generate_prefix):
+                if not generation_id:
+                    return False
+                expected_cross_phase_build = (
+                    f"{generate_prefix}{generation_id}/src/{_MCP_AUDIT_LOG_BASENAME}"
+                )
+                return path == expected_cross_phase_build
             if build_prefix and path.startswith(build_prefix):
-                return "/bin/" in path or path.endswith("/build_meta.json")
+                if "/bin/" in path or path.endswith("/build_meta.json"):
+                    return True
+                # MCP `compile_project` writes a side-effect command log to
+                # `<project_dir>/mcp_command_log.jsonl`. Per
+                # `docs/workflow/phases/phase_03_build.md`, the in-phase
+                # canonical placement (out-of-source CMake/Meson builds) is
+                # directly under `<build_id>/`.
+                tail = path[len(build_prefix):]
+                tail_parts = [part for part in tail.split("/") if part]
+                if (
+                    len(tail_parts) == 2
+                    and tail_parts[1] == "mcp_command_log.jsonl"
+                ):
+                    return True
             return False
         if step_token == "execute":
             if not execute_prefix or not node_safe:
                 return False
+            # Cross-phase exception: skills/workflow-execute/SKILL.md mandates
+            # `run_quality_checks` against `project_dir=generate/<gen_id>/src/`
+            # for `toolchain.build_system=make` + Fortran/C-family pipelines.
+            # The MCP server's default command_log_path resolves to
+            # `<project_dir>/mcp_command_log.jsonl`, so the audit log lands in
+            # the generate tree. This is the only legitimate write the
+            # execute role makes outside execute/. Strictly bind the allowed
+            # cross-phase placement to the launch request's `generation_id`
+            # field — any other generation_id (e.g. an older sibling
+            # generation under the same pipeline) is not authorized.
+            if generate_prefix and path.startswith(generate_prefix):
+                if not generation_id:
+                    return False
+                expected_cross_phase = (
+                    f"{generate_prefix}{generation_id}/src/{_MCP_AUDIT_LOG_BASENAME}"
+                )
+                return path == expected_cross_phase
             if not path.startswith(execute_prefix):
                 return False
             tail = path[len(execute_prefix):]
@@ -2544,6 +2684,9 @@ def _allowed_output_paths_for_launch(
                 "stderr.log",
                 "metrics_basis.json",
                 "execution_trace.json",
+                # MCP `run_program` / `run_quality_checks` side-effect log
+                # (phase_04_execute.md L10).
+                "mcp_command_log.jsonl",
             }
             return rel_under_node in allowed_files or rel_under_node.startswith("raw/")
         if step_token == "judge":
@@ -2629,7 +2772,114 @@ def _allowed_output_paths_for_launch(
             return True
         return False
 
+    # Defensive auto-inject: MCP build/execute tooling writes a side-effect
+    # command log to `<project_dir>/mcp_command_log.jsonl` (run_linter for
+    # generate per skills/workflow-generate-generate, compile_project per
+    # docs/workflow/phases/phase_03_build.md L12, run_program /
+    # run_quality_checks per phase_04_execute.md L10). If the canonical log
+    # path is not pre-listed in allowed_output_paths, record-agent-run rejects
+    # it as `unauthorized_write_violation` and fail_closes the orchestration.
+    # Single-namespace enforcement for generate/build/execute steps:
+    # require listed paths under `<pipeline_ref>/<phase>/` to use exactly one
+    # `<gen_id>` / `<build_id>` / `<exec_id>`. Otherwise the step could
+    # authorize MCP-owned audit logs and outputs across sibling runs in the
+    # same pipeline, breaking provenance isolation.
+    if step_token == "generate" and generate_prefix:
+        gen_ids: set[str] = set()
+        for p in allowed:
+            if not p.startswith(generate_prefix):
+                continue
+            tail = p[len(generate_prefix):]
+            parts = [s for s in tail.split("/") if s]
+            if parts:
+                gen_ids.add(parts[0])
+        if len(gen_ids) > 1:
+            raise ValueError(
+                f"allowed_output_paths must target a single generation_id; "
+                f"got multiple under {generate_prefix!r}: {sorted(gen_ids)!r}"
+            )
+        if generation_id and gen_ids and generation_id not in gen_ids:
+            raise ValueError(
+                f"allowed_output_paths generation_id={sorted(gen_ids)!r} does "
+                f"not match request generation_id={generation_id!r}"
+            )
+    elif step_token == "build" and build_prefix:
+        build_ids: set[str] = set()
+        for p in allowed:
+            if not p.startswith(build_prefix):
+                continue
+            tail = p[len(build_prefix):]
+            parts = [s for s in tail.split("/") if s]
+            if parts:
+                build_ids.add(parts[0])
+        if len(build_ids) > 1:
+            raise ValueError(
+                f"allowed_output_paths must target a single build_id; "
+                f"got multiple under {build_prefix!r}: {sorted(build_ids)!r}"
+            )
+    elif step_token == "execute" and execute_prefix:
+        exec_ids: set[str] = set()
+        for p in allowed:
+            if not p.startswith(execute_prefix):
+                continue
+            tail = p[len(execute_prefix):]
+            parts = [s for s in tail.split("/") if s]
+            if parts:
+                exec_ids.add(parts[0])
+        if len(exec_ids) > 1:
+            raise ValueError(
+                f"allowed_output_paths must target a single execution_id; "
+                f"got multiple under {execute_prefix!r}: {sorted(exec_ids)!r}"
+            )
+        request_execution_id = str(
+            request_payload.get("execution_id") or ""
+        ).strip()
+        if request_execution_id and exec_ids and request_execution_id not in exec_ids:
+            raise ValueError(
+                f"allowed_output_paths execution_id={sorted(exec_ids)!r} does "
+                f"not match request execution_id={request_execution_id!r}"
+            )
+    # Inject only the canonical placements derived from listed paths — see
+    # `_canonical_mcp_audit_log_paths` for the strict per-phase shapes.
+    # `_resolved_build_system` is an internal request_payload field
+    # populated by record_launch (resolved from impl.resolved.yaml) so the
+    # helper can gate cross-phase canonical placement on `build_system=make`.
+    # Tests calling this helper directly may set the field explicitly when
+    # cross-phase semantics are exercised; absence simply disables
+    # cross-phase auto-inject (in-phase canonical still applies).
+    _bs_raw = request_payload.get("_resolved_build_system")
+    _bs_norm = (
+        _bs_raw.strip().lower()
+        if isinstance(_bs_raw, str) and _bs_raw.strip()
+        else ""
+    )
+    canonical_logs = _canonical_mcp_audit_log_paths(
+        step_token=step_token,
+        pipeline_ref=pipeline_ref,
+        node_safe=node_safe,
+        generation_id=generation_id,
+        listed_paths=list(allowed),
+        build_system=_bs_norm,
+    )
+    canonical_logs_set: set[str] = set(canonical_logs)
+    for log_path in canonical_logs:
+        if log_path not in allowed:
+            allowed.append(log_path)
+
     for idx, path in enumerate(allowed):
+        if path in canonical_logs_set:
+            # Canonical MCP-owned audit logs are pre-validated against
+            # canonical phase placements (including legitimate cross-phase
+            # placements like Execute's run_quality_checks log under
+            # generate/<gen>/src/). Skip the capability write_roots check
+            # because the cross-phase placement legitimately falls outside
+            # the step's write_roots, and rely on phase contract +
+            # multi-layer integrity protection instead.
+            if not _matches_phase_contract(path):
+                raise ValueError(
+                    f"allowed_output_paths[{idx}] is outside phase contract outputs for step={step_token!r}: {path!r}"
+                )
+            continue
         if normalized_roots and not any(_repo_path_under_prefix(path, root) for root in normalized_roots):
             raise ValueError(
                 f"allowed_output_paths[{idx}] must be under capability write_roots: {path!r}"
@@ -2656,13 +2906,162 @@ def _allowed_output_paths_for_launch(
 # etc.) are written via the LLM `Edit` / `Write` tools directly.
 CLI_MANAGED_EXTENSIONS: frozenset[str] = frozenset({".json", ".txt"})
 
+# Integrity-protected audit logs written exclusively by MCP tools as evidence
+# of tool execution. `validate_pipeline_semantics.py` reads these files and
+# trusts their JSONL records (e.g. `tool_name`, `ok`, `command`) as the source
+# of truth that an MCP tool actually ran. Direct `Edit` / `Write` access by
+# child agents would let them forge successful runs, so canonical placements
+# (computed by `_canonical_mcp_audit_log_paths()`) are excluded from
+# `allowed_file_tool_paths` and rejected from `guarded-apply-patch`.
+#
+# Protection is scoped to canonical placements only — a non-canonical file
+# that happens to share this basename (e.g. an unrelated source asset under a
+# nested subdirectory) is treated as a normal file. This avoids both
+# (a) over-trusting any manifest entry whose basename happens to match
+# (b) over-blocking legitimate project files with this name.
+_MCP_AUDIT_LOG_BASENAME: str = "mcp_command_log.jsonl"
+
+
+def _canonical_mcp_audit_log_paths(
+    *,
+    step_token: str,
+    pipeline_ref: str,
+    node_safe: str,
+    listed_paths: Sequence[str],
+    generation_id: str = "",
+    build_system: str = "",
+) -> list[str]:
+    """Derive canonical MCP audit log paths from the listed allowed_output_paths.
+
+    Canonical placements (per docs/workflow/phases/phase_*.md and
+    skills/workflow-execute/SKILL.md):
+      - generate: `<pipeline_ref>/generate/<gen_id>/src/mcp_command_log.jsonl`
+      - build:    `<pipeline_ref>/build/<build_id>/mcp_command_log.jsonl`
+      - execute (in-phase): `<pipeline_ref>/execute/<exec_id>/<node_safe>/mcp_command_log.jsonl`
+      - execute (cross-phase quality_check): `<pipeline_ref>/generate/<gen_id>/src/mcp_command_log.jsonl`
+        — `run_quality_checks` runs with `project_dir=generate/<gen_id>/src/`
+        for `toolchain.build_system=make` + Fortran/C-family pipelines per
+        `skills/workflow-execute/SKILL.md`, so the MCP server's default
+        `command_log_path` (resolved as `project_dir/mcp_command_log.jsonl`)
+        lands in the generate tree even though the agent role is `execute`.
+
+    Only paths matching these structures are returned. A path like
+    `<gen_id>/src/notes/mcp_command_log.jsonl` is **not** canonical and is
+    treated as a normal file (writable subject to the usual file-tool /
+    apply-patch rules).
+    """
+    if not pipeline_ref:
+        return []
+    canonical: set[str] = set()
+    if step_token == "generate":
+        prefix = f"{pipeline_ref}/generate/"
+        for tok in listed_paths:
+            if not isinstance(tok, str) or not tok.startswith(prefix):
+                continue
+            tail = tok[len(prefix):]
+            parts = [p for p in tail.split("/") if p]
+            # Canonical: <gen_id>/src/...
+            if len(parts) >= 2 and parts[1] == "src":
+                canonical.add(f"{prefix}{parts[0]}/src/{_MCP_AUDIT_LOG_BASENAME}")
+    elif step_token == "build":
+        prefix = f"{pipeline_ref}/build/"
+        for tok in listed_paths:
+            if not isinstance(tok, str) or not tok.startswith(prefix):
+                continue
+            tail = tok[len(prefix):]
+            parts = [p for p in tail.split("/") if p]
+            # Canonical (in-phase, e.g. CMake/Meson out-of-source builds with
+            # project_dir=<build_id>/): <build_id>/mcp_command_log.jsonl
+            # alongside build_meta.json.
+            if parts:
+                canonical.add(f"{prefix}{parts[0]}/{_MCP_AUDIT_LOG_BASENAME}")
+        # Cross-phase placement is reserved for in-source Make builds
+        # (Fortran/C-family per skills/workflow-build): compile_project runs
+        # with `project_dir=<pipeline>/generate/<gen_id>/src/` (where the
+        # Makefile lives), so the MCP server's default command_log_path
+        # resolves under the generate tree. Gate on `build_system=make` —
+        # CMake/Meson/Ninja and other out-of-source toolchains do not
+        # legitimately write into the generate tree, and unconditional
+        # cross-phase authorization would let those phases mutate generate
+        # provenance.
+        if generation_id and build_system == "make":
+            gen_prefix = f"{pipeline_ref}/generate/"
+            canonical.add(
+                f"{gen_prefix}{generation_id}/src/{_MCP_AUDIT_LOG_BASENAME}"
+            )
+    elif step_token == "execute" and node_safe:
+        prefix = f"{pipeline_ref}/execute/"
+        for tok in listed_paths:
+            if not isinstance(tok, str) or not tok.startswith(prefix):
+                continue
+            tail = tok[len(prefix):]
+            parts = [p for p in tail.split("/") if p]
+            # Canonical (in-phase): <exec_id>/<node_safe>/mcp_command_log.jsonl
+            if len(parts) >= 2 and parts[1] == node_safe:
+                canonical.add(
+                    f"{prefix}{parts[0]}/{node_safe}/{_MCP_AUDIT_LOG_BASENAME}"
+                )
+        # Cross-phase quality_check log placement: derive ONLY from the
+        # explicit `generation_id` field AND only when the toolchain is
+        # `build_system=make` (the documented Make-only exception per
+        # skills/workflow-execute/SKILL.md). For non-Make execute runs
+        # (run_program against a CMake/Meson out-of-source binary), the log
+        # belongs in-phase and cross-phase authorization must not be
+        # granted — otherwise a child could steer MCP logging into the
+        # generate tree and contaminate verified provenance files.
+        if generation_id and build_system == "make":
+            gen_prefix = f"{pipeline_ref}/generate/"
+            canonical.add(
+                f"{gen_prefix}{generation_id}/src/{_MCP_AUDIT_LOG_BASENAME}"
+            )
+    return sorted(canonical)
+
+
+def _canonical_mcp_audit_log_paths_for_request(
+    request_payload: dict[str, Any],
+    allowed_output_paths: Sequence[str],
+    *,
+    repo_root: Path | None = None,
+) -> list[str]:
+    step_token = str(request_payload.get("step") or "").strip().lower()
+    pipeline_ref = _normalize_rel_posix(str(request_payload.get("pipeline_ref") or ""))
+    node_key = str(request_payload.get("node_key") or "").strip()
+    node_safe = _node_key_to_safe(node_key) if node_key else ""
+    generation_id = str(request_payload.get("generation_id") or "").strip()
+    # Resolve toolchain.build_system, preferring (1) explicit
+    # `_resolved_build_system` in request_payload (set by record_launch from
+    # impl.resolved.yaml), then (2) reading impl.resolved.yaml directly
+    # when repo_root is provided. Without either, build_system="" which
+    # disables cross-phase canonical placement (Make-only exception).
+    build_system = ""
+    bs_pre = request_payload.get("_resolved_build_system")
+    if isinstance(bs_pre, str) and bs_pre.strip():
+        build_system = bs_pre.strip().lower()
+    elif repo_root is not None:
+        plan_ref = str(request_payload.get("plan_ref") or "").strip()
+        if plan_ref:
+            bs = _impl_resolved_build_system(repo_root, plan_ref)
+            if isinstance(bs, str) and bs.strip():
+                build_system = bs.strip().lower()
+    return _canonical_mcp_audit_log_paths(
+        step_token=step_token,
+        pipeline_ref=pipeline_ref,
+        node_safe=node_safe,
+        generation_id=generation_id,
+        listed_paths=list(allowed_output_paths),
+        build_system=build_system,
+    )
+
 
 def _is_direct_write_path(rel_posix: str) -> bool:
     """Return True when the path may be written via direct Edit/Write tools.
 
     Paths whose extension belongs to ``CLI_MANAGED_EXTENSIONS`` (e.g. `.json`,
     `.txt`) are required to go through `guarded-apply-patch` and are therefore
-    excluded from direct write.
+    excluded from direct write. Integrity protection of canonical MCP audit
+    logs is enforced separately by the caller (see
+    `_canonical_mcp_audit_log_paths`); this helper is purely
+    extension-classification.
     """
     token = _normalize_rel_posix(rel_posix)
     if not token:
@@ -2687,10 +3086,24 @@ def _allowed_file_tool_paths_for_launch(
         for item in allowed_output_paths
         if isinstance(item, str) and item.strip() and not item.strip().endswith("/")
     }
+    # Canonical MCP audit log paths are MCP-owned and integrity-protected:
+    # exclude them from direct file-tool writes regardless of their extension.
+    # Non-canonical files that happen to share the basename are treated as
+    # ordinary outputs and remain Edit/Write-eligible.
+    canonical_log_set = set(
+        _canonical_mcp_audit_log_paths_for_request(request_payload, list(allowed_output_paths))
+    )
     if raw is None:
-        # Auto-derive: every output path whose extension is not CLI-managed
-        # is permitted to be written via direct Edit/Write tools.
-        derived = {path for path in allowed_set if path and _is_direct_write_path(path)}
+        # Auto-derive: every output path whose extension is not CLI-managed and
+        # is not a canonical MCP audit log is permitted to be written via
+        # direct Edit/Write tools.
+        derived = {
+            path
+            for path in allowed_set
+            if path
+            and path not in canonical_log_set
+            and _is_direct_write_path(path)
+        }
         return sorted(derived)
     if not isinstance(raw, list):
         raise ValueError("allowed_file_tool_paths must be a list when provided")
@@ -2702,6 +3115,11 @@ def _allowed_file_tool_paths_for_launch(
         if item_token.endswith("/"):
             raise ValueError(f"allowed_file_tool_paths[{idx}] must be file path: {item!r}")
         path = _normalize_rel_posix(item_token)
+        if path in canonical_log_set:
+            raise ValueError(
+                f"allowed_file_tool_paths[{idx}] must not include canonical MCP audit "
+                f"log path: {path!r} (written exclusively by MCP tooling)"
+            )
         if not _is_direct_write_path(path):
             raise ValueError(
                 f"allowed_file_tool_paths[{idx}] must not include CLI-managed extensions "
@@ -2734,6 +3152,9 @@ def _validate_child_write_contract_preflight(
     allowed = [_normalize_rel_posix(str(item)) for item in allowed_output_paths if isinstance(item, str) and item.strip()]
     if not allowed:
         raise ValueError("child_write_contract_preflight: allowed_output_paths must be non-empty")
+    canonical_logs_set = set(
+        _canonical_mcp_audit_log_paths_for_request(request_payload, allowed_output_paths)
+    )
     for idx, path in enumerate(allowed):
         if path.endswith("/"):
             # Directory allowlist entry — check it is under a write root (using the dir path itself).
@@ -2742,6 +3163,13 @@ def _validate_child_write_contract_preflight(
                     "child_write_contract_preflight: allowed_output_paths directory entry must be under "
                     f"capability write_roots: {path!r}"
                 )
+            continue
+        if path in canonical_logs_set:
+            # Canonical MCP-owned audit logs may legitimately fall outside
+            # capability write_roots (e.g. Execute's run_quality_checks log
+            # under generate/<gen>/src/). Phase contract pre-validates the
+            # placement; multi-layer integrity protection prevents agent
+            # mutation, so the cross-phase write is safe.
             continue
         if roots and not any(_repo_path_under_prefix(path, root) for root in roots):
             raise ValueError(
@@ -4021,6 +4449,7 @@ def _validate_actual_write_paths(
     manifest_file_tool_paths: set[str] = set()
     manifest_allowed_tmp_root: str | None = None
     manifest_allowed_output_dirs: list[str] = []
+    manifest_integrity_protected_logs: set[str] = set()
     if actor_role == "orchestration":
         declared_paths = sorted(set(output_refs) | set(gate_changed_paths))
         exact_declared_paths = declared_paths  # orchestration: no directory entries
@@ -4047,8 +4476,28 @@ def _validate_actual_write_paths(
             aop_obj = manifest_doc.get("allowed_output_paths")
             if isinstance(aop_obj, list):
                 for item in aop_obj:
-                    if isinstance(item, str) and item.strip().endswith("/"):
-                        manifest_allowed_output_dirs.append(_normalize_rel_posix(item.strip()))
+                    if not isinstance(item, str) or not item.strip():
+                        continue
+                    raw_aop = item.strip()
+                    if raw_aop.endswith("/"):
+                        manifest_allowed_output_dirs.append(_normalize_rel_posix(raw_aop))
+            # Canonical MCP audit logs (e.g. mcp_command_log.jsonl at the
+            # phase-specific canonical placement) are written by MCP server
+            # tooling without going through guarded-apply-patch and are
+            # excluded from allowed_file_tool_paths so children cannot
+            # Edit/Write them. Authorize them as MCP-owned outputs at
+            # terminalization so a successful MCP tool run does not get
+            # fail-closed for the very file it is trusted to produce.
+            # Trust only the manifest's persisted `mcp_owned_audit_logs`
+            # field — basename matches outside canonical placement are not
+            # auto-trusted (defense against over-broad manifest entries).
+            mcp_logs_obj = manifest_doc.get("mcp_owned_audit_logs")
+            if isinstance(mcp_logs_obj, list):
+                for item in mcp_logs_obj:
+                    if isinstance(item, str) and item.strip():
+                        manifest_integrity_protected_logs.add(
+                            _normalize_rel_posix(item.strip())
+                        )
             _tmp_raw = manifest_doc.get("allowed_tmp_root", "")
             if isinstance(_tmp_raw, str) and _tmp_raw.strip():
                 _tmp_norm = _normalize_rel_posix(_tmp_raw.strip())
@@ -4059,7 +4508,11 @@ def _validate_actual_write_paths(
                         f"expected per-run root {_expected_tmp!r}"
                     )
                 manifest_allowed_tmp_root = _tmp_norm
-        exact_declared_paths = sorted(set(gate_changed_paths) | manifest_file_tool_paths)
+        exact_declared_paths = sorted(
+            set(gate_changed_paths)
+            | manifest_file_tool_paths
+            | manifest_integrity_protected_logs
+        )
         declared_paths = sorted(set(exact_declared_paths) | set(manifest_allowed_output_dirs))
     # Use a frozenset for O(1) exact-match lookup. exact_declared_paths contains
     # concrete file paths (gate_changed_paths + manifest_file_tool_paths); prefix
@@ -4070,6 +4523,16 @@ def _validate_actual_write_paths(
         if parent_tmp_root and _repo_path_under_prefix(path, parent_tmp_root):
             continue
         if manifest_allowed_tmp_root and _repo_path_under_prefix(path, manifest_allowed_tmp_root):
+            continue
+        if path in manifest_integrity_protected_logs:
+            # Canonical MCP-owned audit logs are pre-validated against
+            # canonical phase placements at launch time and protected by
+            # multiple defense layers (file_tool exclusion, guarded-apply-
+            # patch rejection, hook-level write block). Authorize the actual
+            # write regardless of capability `write_roots` so legitimate
+            # cross-phase placements (e.g. Execute's run_quality_checks log
+            # under generate/<gen>/src/) are not fail-closed for the very
+            # file the MCP tool produced.
             continue
         if write_roots and not _path_under_any_write_root(path, write_roots):
             unauthorized.append(path)
@@ -5653,11 +6116,36 @@ def _validate_apply_patch_gate_coverage(
     if not output_refs:
         return
 
+    # Canonical MCP audit logs are written by MCP server tooling without gate
+    # provenance and are exempt from this coverage check. Only canonical
+    # placements recorded in the manifest's `mcp_owned_audit_logs` field
+    # qualify; basename matches at non-canonical paths still require coverage.
+    mcp_owned_logs: set[str] = set()
+    try:
+        manifest_doc_for_coverage = _load_allowed_output_manifest(
+            repo_root,
+            orchestration_id=orchestration_id,
+            agent_run_id=run_id,
+        )
+    except ValueError:
+        manifest_doc_for_coverage = None
+    if isinstance(manifest_doc_for_coverage, dict):
+        mcp_logs_obj = manifest_doc_for_coverage.get("mcp_owned_audit_logs")
+        if isinstance(mcp_logs_obj, list):
+            for item in mcp_logs_obj:
+                if isinstance(item, str) and item.strip():
+                    mcp_owned_logs.add(_normalize_rel_posix(item.strip()))
     # Direct-write extensions (e.g. .yaml / .md / source code) are written via
     # `Edit`/`Write` tools and are exempt from `apply_patch_writes` gate
     # coverage. Only `.json` / `.txt` outputs (CLI-managed extensions) require
-    # gate evidence.
-    cli_required_refs = [ref for ref in output_refs if not _is_direct_write_path(ref)]
+    # gate evidence. Canonical MCP audit logs are likewise exempt because the
+    # only legitimate writer is the MCP server itself.
+    cli_required_refs = [
+        ref
+        for ref in output_refs
+        if not _is_direct_write_path(ref)
+        and _normalize_rel_posix(ref) not in mcp_owned_logs
+    ]
     if not cli_required_refs:
         return
 
@@ -7088,6 +7576,15 @@ def record_launch(
         out_refs["capability_token"] = cap_doc.get("capability_token", "")
         write_roots_obj = cap_doc.get("write_roots")
         write_roots = [str(item) for item in write_roots_obj] if isinstance(write_roots_obj, list) else []
+        # Resolve toolchain.build_system from impl.resolved.yaml so the
+        # canonical-placement helper can gate cross-phase auto-inject on
+        # `build_system=make` (the documented Make-only exception).
+        _plan_ref_for_bs = str(request_payload.get("plan_ref") or "").strip()
+        if _plan_ref_for_bs:
+            _bs_resolved = _impl_resolved_build_system(repo_root, _plan_ref_for_bs)
+            if isinstance(_bs_resolved, str) and _bs_resolved.strip():
+                request_payload = dict(request_payload)
+                request_payload["_resolved_build_system"] = _bs_resolved.strip().lower()
         allowed_output_paths = _allowed_output_paths_for_launch(
             request_payload=request_payload,
             write_roots=write_roots,
@@ -7102,6 +7599,151 @@ def record_launch(
             allowed_output_paths=allowed_output_paths,
         )
         (repo_root / "workspace" / "tmp" / child_agent_run_id).mkdir(parents=True, exist_ok=True)
+        # Execute step lineage bind (mandatory for ALL execute launches, not
+        # only when cross-phase quality_check log is authorized): every
+        # execute run must declare `source_build_id` in the launch request,
+        # and the referenced build's `build_meta.json` must record
+        # `source_generation_id` matching the request's `generation_id`.
+        # Without this binding, an execute could run binaries from build A
+        # while attributing evidence (e.g. trial_meta) to a different
+        # sibling build's generation — a mixed-build forge that purely
+        # in-phase logging would not catch elsewhere.
+        _step_token_for_bind = str(request_payload.get("step") or "").strip().lower()
+        _pipe_ref_for_bind = _normalize_rel_posix(
+            str(request_payload.get("pipeline_ref") or "")
+        )
+        if _step_token_for_bind == "execute" and _pipe_ref_for_bind:
+            _gen_id_for_bind = str(
+                request_payload.get("generation_id") or ""
+            ).strip()
+            _source_build_id = str(
+                request_payload.get("source_build_id") or ""
+            ).strip()
+            if not _gen_id_for_bind:
+                raise ValueError(
+                    "execute launch requires `generation_id` in the launch "
+                    "request to bind provenance to a specific generation."
+                )
+            if not _source_build_id:
+                raise ValueError(
+                    "execute launch requires `source_build_id` in the launch "
+                    "request to bind provenance to a specific build. "
+                    "Without this binding, evidence could be forged across "
+                    "sibling builds even when in-phase logging is used."
+                )
+            _bm_path = (
+                repo_root / _pipe_ref_for_bind / "build" / _source_build_id / "build_meta.json"
+            )
+            if not _bm_path.is_file():
+                raise ValueError(
+                    f"execute launch source_build_id={_source_build_id!r} "
+                    f"does not resolve to an existing build_meta.json at "
+                    f"{_bm_path!s}. The referenced build must exist on disk "
+                    "before execute can attribute provenance to it."
+                )
+            try:
+                _bm_doc = _read_json(_bm_path)
+            except (OSError, json.JSONDecodeError):
+                _bm_doc = None
+            if not isinstance(_bm_doc, dict):
+                raise ValueError(
+                    f"execute launch source_build_id={_source_build_id!r}: "
+                    "build_meta.json could not be parsed as a JSON object."
+                )
+            _bm_src_gen = _bm_doc.get("source_generation_id")
+            if (
+                not isinstance(_bm_src_gen, str)
+                or not _bm_src_gen.strip()
+            ):
+                raise ValueError(
+                    f"execute launch source_build_id={_source_build_id!r}: "
+                    "build_meta.json must record `source_generation_id` to "
+                    "bind execute provenance. Migrate the build's metadata "
+                    "before launching execute against it."
+                )
+            if _bm_src_gen.strip() != _gen_id_for_bind:
+                raise ValueError(
+                    f"execute launch generation_id={_gen_id_for_bind!r} "
+                    f"does not match build {_source_build_id!r}'s "
+                    f"source_generation_id={_bm_src_gen.strip()!r}. Execute "
+                    "must run against the binary produced by the generation "
+                    "it claims provenance for."
+                )
+        canonical_audit_logs = _canonical_mcp_audit_log_paths_for_request(
+            request_payload, allowed_output_paths, repo_root=repo_root
+        )
+        # Validate cross-phase canonical placements:
+        #   - Execute → generate/<gen>/ for run_quality_checks
+        #   - Build → generate/<gen>/ for in-source compile_project
+        #     (Make for Fortran/C-family runs project_dir=<gen>/src/)
+        # The `generation_id` from the request payload is otherwise free-form
+        # and could authorize writes to an unrelated generation's audit log
+        # under the same pipeline. Require the referenced generate run to
+        # actually exist on disk (generate_meta.json must be present) and to
+        # have reached pass state before granting cross-phase write authority.
+        _step_token_xpv = str(request_payload.get("step") or "").strip().lower()
+        _pipe_ref_xpv = _normalize_rel_posix(
+            str(request_payload.get("pipeline_ref") or "")
+        )
+        if _step_token_xpv in {"execute", "build"} and _pipe_ref_xpv:
+            _gen_prefix_xpv = f"{_pipe_ref_xpv}/generate/"
+            for _log_path in canonical_audit_logs:
+                if not _log_path.startswith(_gen_prefix_xpv):
+                    continue
+                _tail_xpv = _log_path[len(_gen_prefix_xpv):]
+                _parts_xpv = [p for p in _tail_xpv.split("/") if p]
+                if not _parts_xpv:
+                    continue
+                _gen_id_xpv = _parts_xpv[0]
+                _gen_meta = (
+                    repo_root
+                    / _gen_prefix_xpv
+                    / _gen_id_xpv
+                    / "generate_meta.json"
+                )
+                if not _gen_meta.exists():
+                    raise ValueError(
+                        f"{_step_token_xpv} launch references unknown "
+                        f"cross-phase generation_id={_gen_id_xpv!r}: "
+                        f"generate_meta.json not found at {_gen_meta!s}. "
+                        "Cross-phase MCP audit log authorization requires the "
+                        "referenced generation to have actually run."
+                    )
+                # Verify the generation reached pass state BEFORE granting
+                # write authority into its tree. Authorizing writes against a
+                # failed/stale generation would let an Execute run mutate or
+                # append to provenance files that later validators trust,
+                # contaminating cross-phase artifacts irreversibly.
+                try:
+                    _gen_meta_doc = _read_json(_gen_meta)
+                except (OSError, json.JSONDecodeError):
+                    _gen_meta_doc = None
+                _gen_status_raw = (
+                    _gen_meta_doc.get("verification_status")
+                    if isinstance(_gen_meta_doc, dict)
+                    else None
+                )
+                _gen_status = (
+                    _gen_status_raw.strip().lower()
+                    if isinstance(_gen_status_raw, str)
+                    else None
+                )
+                if _gen_status != "pass":
+                    raise ValueError(
+                        f"{_step_token_xpv} launch references cross-phase "
+                        f"generation_id={_gen_id_xpv!r} with "
+                        f"verification_status={_gen_status!r} (expected "
+                        "'pass'). Cannot grant MCP-owned write authority to "
+                        "a failed/stale generation tree; this would "
+                        "contaminate provenance files trusted by later "
+                        "validators."
+                    )
+                # NOTE: execute step source_build_id / generation_id lineage
+                # bind is enforced unconditionally above (see "Execute step
+                # lineage bind" block before canonical_audit_logs). The
+                # cross-phase loop here only handles existence + pass-state
+                # of the generation referenced from the cross-phase audit
+                # log path (build step's Make-only path).
         manifest_ref = _write_allowed_output_manifest(
             repo_root,
             orchestration_id=orchestration_id,
@@ -7109,6 +7751,7 @@ def record_launch(
             allowed_output_paths=allowed_output_paths,
             allowed_file_tool_paths=allowed_file_tool_paths,
             allowed_tmp_root=f"workspace/tmp/{child_agent_run_id}",
+            mcp_owned_audit_logs=canonical_audit_logs,
         )
         out_refs["allowed_output_manifest_ref"] = manifest_ref
         try:
@@ -8383,7 +9026,50 @@ def guarded_apply_patch(
             "(rename deletes the source file, which must be explicitly authorized): "
             + ", ".join(uncovered_sources)
         )
+    # Canonical MCP audit logs are written exclusively by MCP server tooling
+    # and trusted by validate_pipeline_semantics.py as proof of tool execution.
+    # Although the path is auto-injected into allowed_output_paths so MCP-side
+    # writes pass record-agent-run's terminal validation, child agents must
+    # not be able to mutate the log via this CLI. Reject if any path the patch
+    # would touch (declared, git-resolved, or rename source) targets a path
+    # listed in the manifest's `mcp_owned_audit_logs` field. Non-canonical
+    # paths that happen to share the basename remain mutable through normal
+    # apply-patch rules.
+    mcp_owned_logs_for_patch: set[str] = set()
     actor_role_token = actor_role.strip().lower()
+    if actor_role_token in {"step", "substep"}:
+        try:
+            manifest_doc_for_patch = _load_allowed_output_manifest(
+                repo_root,
+                orchestration_id=orchestration_id,
+                agent_run_id=agent_run_id,
+            )
+        except ValueError:
+            manifest_doc_for_patch = None
+        if isinstance(manifest_doc_for_patch, dict):
+            mcp_logs_obj = manifest_doc_for_patch.get("mcp_owned_audit_logs")
+            if isinstance(mcp_logs_obj, list):
+                for item in mcp_logs_obj:
+                    if isinstance(item, str) and item.strip():
+                        mcp_owned_logs_for_patch.add(
+                            _normalize_rel_posix(item.strip())
+                        )
+    if mcp_owned_logs_for_patch:
+        all_touched_paths = (
+            set(normalized_paths)
+            | set(numstat_targets)
+            | set(patch_targets)
+            | set(rename_sources)
+        )
+        forbidden_logs = sorted(
+            p for p in all_touched_paths if p in mcp_owned_logs_for_patch
+        )
+        if forbidden_logs:
+            raise RuntimeError(
+                "guarded-apply-patch: cannot mutate MCP-owned audit logs "
+                "(written exclusively by MCP tooling): "
+                + ", ".join(forbidden_logs)
+            )
     if actor_role_token in {"step", "substep"}:
         _validate_paths_against_allowed_output_manifest(
             repo_root,
@@ -8542,7 +9228,17 @@ def main(argv: list[str] | None = None) -> int:
         "as file-path list; runtime validates each path against phase contract outputs and capability write_roots. "
         "allowed_file_tool_paths is optional and, when provided, must be a file-path list included in allowed_output_paths. "
         "plan_id/pipeline_id format: <slug>_<YYYYMMDD>_<seq3> where slug uses hyphens only "
-        "(e.g. 'flux-rsn-p0_20260425_001'; underscores in slug are invalid)."
+        "(e.g. 'flux-rsn-p0_20260425_001'; underscores in slug are invalid). "
+        "Execute step extra-required fields: execution_id (single exec_id pinned for this launch), "
+        "generation_id (the gen_id whose <gen>/src/ run_quality_checks uses; record_launch verifies "
+        "verification_status=pass), and source_build_id (the build_id whose binary execute uses; "
+        "record_launch reads <pipeline>/build/<source_build_id>/build_meta.json and verifies "
+        "source_generation_id == request.generation_id to prevent mixed-build forge). "
+        "Cross-phase MCP audit log auto-inject (`<gen>/src/mcp_command_log.jsonl`) only fires when "
+        "impl.resolved.yaml records `toolchain.build_system: make` (Fortran/C-family in-source builds). "
+        "Generate substep extra-required: generation_id matches the listed paths' single <gen_id>. "
+        "Build step listed paths must use a single <build_id>; cross-phase Make builds also accept "
+        "generation_id-derived `<gen>/src/mcp_command_log.jsonl` placement."
     )
     _RECORD_LAUNCH_RESPONSE_HELP = (
         "JSON object with child agent response. For Claude Code backend use: "
