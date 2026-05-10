@@ -2,6 +2,14 @@
 
 この文書は、`workflow` 全体を統括する `orchestration agent` と、phase unit / substep unit の独立エージェント実行規約を定義する。
 
+## 関連文書
+
+- CLI 全 subcommand reference: [`docs/CLI_REFERENCE.md`](CLI_REFERENCE.md)
+- workspace artifact 配置の tree 図と読み書きルール: [`docs/WORKSPACE_LAYOUT.md`](WORKSPACE_LAYOUT.md)
+- workflow 起動契約: [`skills/workflow-orchestration/SKILL.md`](../skills/workflow-orchestration/SKILL.md) と [`skills/workflow-orchestration/references/startup_contract.md`](../skills/workflow-orchestration/references/startup_contract.md)
+- launch 要求テンプレート: [`skills/workflow-orchestration/references/launch_prompts.md`](../skills/workflow-orchestration/references/launch_prompts.md)
+- hook 復旧 cheat sheet: [`docs/RUNBOOK.md#hook-recovery`](RUNBOOK.md#hook-recovery)
+
 ## 目的
 - `workflow` 実行を階層化し、phase responsibilities と監査責務を分離する。
 - 各 `step` / 各 `substep` を独立エージェントとして実行し、実行経路を追跡可能にする。

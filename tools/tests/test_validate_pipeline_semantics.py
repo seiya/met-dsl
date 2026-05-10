@@ -9,7 +9,10 @@ import tempfile
 import unittest
 from pathlib import Path
 
+import yaml
+
 from tools.validate_pipeline_semantics import (
+    _BUNDLED_SHAPE_EXPR_SCHEMA_PATH,
     _validate_generate_lint_command_logs,
     _validate_generate_meta_json_files,
     validate,
@@ -17,6 +20,23 @@ from tools.validate_pipeline_semantics import (
     validate_post_build_stage,
     validate_post_generate_stage,
 )
+
+
+def _seed_shape_expr_schema_into(repo_root: Path) -> None:
+    """Copy the validator-bundled shape_expr.schema.json into a test's tmp
+    repo so the public validate_*() entrypoints (which fail-closed when a
+    repo_root is in scope without a target schema) work under realistic
+    fixtures. Tests that intentionally exercise the missing-schema path
+    must NOT call this helper.
+
+    Idempotent — safe to invoke after `repo_root` is created and before
+    any validate_*() call. Uses bytes copy so canonical-source equivalence
+    is preserved (no JSON re-serialization drift)."""
+    target = repo_root / "spec" / "schema" / "plan" / "shape_expr.schema.json"
+    if target.is_file():
+        return
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(_BUNDLED_SHAPE_EXPR_SCHEMA_PATH.read_bytes())
 
 
 def _write_json(path: Path, data: object) -> None:
@@ -719,6 +739,7 @@ class ValidatePipelineSemanticsTests(unittest.TestCase):
     def test_rejects_noncanonical_workspace_root_argument(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
+            _seed_shape_expr_schema_into(repo_root)
             violations = validate(repo_root=repo_root, workspace_root="workspace/runs/sample")
             self.assertTrue(
                 any("workspace_root must be exactly 'workspace'" in v for v in violations)
@@ -727,6 +748,7 @@ class ValidatePipelineSemanticsTests(unittest.TestCase):
     def test_ignores_empty_execution_node_directories(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
+            _seed_shape_expr_schema_into(repo_root)
             model_text = """module shallow_water2d_model
 use dynamics_shallow_water_flux_2d_rusanov_p0_model
 implicit none
@@ -769,6 +791,7 @@ end program shallow_water2d_runner
     def test_detects_dependency_dummy_and_runner_output_and_missing_case_input(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
+            _seed_shape_expr_schema_into(repo_root)
             model_text = """module shallow_water2d_model
 implicit none
 contains
@@ -804,6 +827,7 @@ end program shallow_water2d_runner
     def test_passes_with_dependency_use_and_case_input(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
+            _seed_shape_expr_schema_into(repo_root)
             model_text = """module shallow_water2d_model
 use dynamics_shallow_water_flux_2d_rusanov_p0_model
 implicit none
@@ -830,9 +854,487 @@ end program shallow_water2d_runner
             violations = validate(repo_root=repo_root, workspace_root="workspace")
             self.assertEqual([], violations)
 
+    def test_state_variables_shorthand_in_snapshot_schema_is_rejected(self) -> None:
+        """Regression: the `state_variables: [name, ...]` shorthand (variable
+        names only, no per-variable `shape_expr`) is no longer a valid form
+        for snapshot schemas. The previous wildcard-sentinel handling let
+        corrupted/wrong-rank state_snapshot payloads survive into pre_judge
+        because every shape comparison short-circuited to True. The contract
+        is now: `variables: [{name, shape_expr}, ...]` everywhere.
+
+        This test asserts:
+          (a) snapshot_schema.json with `state_variables` shorthand fails
+              validation with a specific 'shorthand is not supported' message;
+          (b) derived_contract.json with the same shorthand also fails with
+              the parallel violation on `raw_requirements.required_evidence`;
+          (c) the shape-validation path is no longer disabled — `_shape_matches_expr`
+              has no sentinel bypass."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            _seed_shape_expr_schema_into(repo_root)
+            model_text = """module shallow_water2d_model
+use dynamics_shallow_water_flux_2d_rusanov_p0_model
+implicit none
+contains
+subroutine solve(flag)
+  logical, intent(out) :: flag
+  call dynamics_shallow_water_flux_2d_rusanov_p0__compute_flux(flag)
+end subroutine solve
+end module shallow_water2d_model
+"""
+            runner_text = """program shallow_water2d_runner
+implicit none
+write(*,*) 'diagnostics only'
+end program shallow_water2d_runner
+"""
+            _create_minimal_execution_tree(
+                repo_root,
+                dep_spec_id="dynamics_shallow_water_flux_2d_rusanov_p0",
+                model_text=model_text,
+                runner_text=runner_text,
+                run_command=["./simulate", "workspace/case.resolved.yaml", "workspace/outdir"],
+            )
+
+            workspace = repo_root / "workspace"
+            node_safe = "problem__shallow_water2d__0.3.0"
+            pipeline_id = "shallow-water2d_20260415_001"
+            snapshots_dir = (
+                workspace / "pipelines" / node_safe / pipeline_id
+                / "execute" / "exe_test_001" / "problem" / "shallow_water2d"
+                / "raw" / "state_snapshots"
+            )
+            (snapshots_dir / "snapshot_schema.json").write_text(
+                json.dumps({
+                    "state_variables": ["h", "hu", "hv"],
+                    "time_variable": "time",
+                    "time_shape_expr": "scalar",
+                }),
+                encoding="utf-8",
+            )
+            derived_path = (
+                workspace / "plans" / node_safe / "shallow-water2d_20260415_001"
+                / "derived_contract.json"
+            )
+            derived = json.loads(derived_path.read_text(encoding="utf-8"))
+            for entry in derived["raw_requirements"]["required_evidence"]:
+                if entry.get("artifact") == "state_snapshots":
+                    entry["schema"] = {
+                        "state_variables": ["h", "hu", "hv"],
+                        "time_variable": "time",
+                        "time_shape_expr": "scalar",
+                    }
+            derived_path.write_text(json.dumps(derived), encoding="utf-8")
+
+            violations = validate(repo_root=repo_root, workspace_root="workspace")
+            # (a) snapshot_schema rejected
+            self.assertTrue(
+                any(
+                    "snapshot_schema.json" in v
+                    and "'state_variables' shorthand is not supported" in v
+                    for v in violations
+                ),
+                f"Expected snapshot_schema shorthand rejection; got: {violations}",
+            )
+            # (b) derived_contract rejected
+            self.assertTrue(
+                any(
+                    "derived_contract.json" in v
+                    and "must not use 'state_variables' shorthand" in v
+                    for v in violations
+                ),
+                f"Expected derived_contract shorthand rejection; got: {violations}",
+            )
+
+    def test_shape_expr_schema_cache_invalidates_on_file_mtime_change(self) -> None:
+        """Regression: long-lived processes must observe schema-content
+        changes at the same path within a single process (rebases, branch
+        switches, schema repairs). Previously the cache was keyed by path
+        only, so a mutated schema kept reading the old (potentially broken
+        or stricter) ruleset until process restart — reintroducing the
+        version-skew hazard the schema-driven design was supposed to
+        prevent."""
+        import os
+        import time
+        from tools.validate_pipeline_semantics import (
+            _active_repo_root_for_schema,
+            _load_shape_expr_patterns_cached,
+            _parse_shape_expr,
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            sd = repo_root / "spec" / "schema" / "plan"
+            sd.mkdir(parents=True)
+            schema_path = sd / "shape_expr.schema.json"
+            # Initial schema: integer-only list form (rejects identifiers).
+            schema_path.write_text(
+                json.dumps({
+                    "oneOf": [
+                        {"x-shape-form": "scalar", "pattern": r"^[Ss][Cc][Aa][Ll][Aa][Rr]$"},
+                        {"x-shape-form": "list", "pattern": r"^\[[0-9]+\]$"},
+                    ]
+                }),
+                encoding="utf-8",
+            )
+            _load_shape_expr_patterns_cached.cache_clear()
+            token = _active_repo_root_for_schema.set(repo_root)
+            try:
+                ok_int_initial, _, _ = _parse_shape_expr("[3]")
+                ok_id_initial, _, _ = _parse_shape_expr("[nx]")
+                self.assertTrue(ok_int_initial, "[3] must pass under integer-only schema")
+                self.assertFalse(ok_id_initial, "[nx] must fail under integer-only schema")
+                # Mutate schema to identifier-only list form. Bump mtime to
+                # ensure invalidation is observed regardless of filesystem
+                # mtime resolution.
+                schema_path.write_text(
+                    json.dumps({
+                        "oneOf": [
+                            {"x-shape-form": "scalar", "pattern": r"^[Ss][Cc][Aa][Ll][Aa][Rr]$"},
+                            {"x-shape-form": "list", "pattern": r"^\[[A-Za-z_][A-Za-z0-9_]*\]$"},
+                        ]
+                    }),
+                    encoding="utf-8",
+                )
+                future = time.time() + 1.0
+                os.utime(schema_path, (future, future))
+                # WITHOUT manually clearing the cache, the loader must observe
+                # the new content via mtime invalidation.
+                ok_int_after, _, _ = _parse_shape_expr("[3]")
+                ok_id_after, _, _ = _parse_shape_expr("[nx]")
+                self.assertFalse(
+                    ok_int_after,
+                    "[3] must now fail; cache must invalidate on mtime change",
+                )
+                self.assertTrue(
+                    ok_id_after,
+                    "[nx] must now pass; cache must invalidate on mtime change",
+                )
+            finally:
+                _active_repo_root_for_schema.reset(token)
+                _load_shape_expr_patterns_cached.cache_clear()
+
+    def test_shape_expr_schema_loader_accepts_identifier_only_repo_local_grammar(self) -> None:
+        """Regression: a repo-local schema that legitimately allows ONLY
+        symbolic dim tokens (no integer literals) must NOT be rejected as
+        'malformed'. Previously the loader's classifier only tried integer
+        probes (`[1]`, `(1)`) and treated any branch failing those probes
+        as malformed — making startup hard-fail for schemas that exclude
+        integer literals.
+
+        Two paths are now supported:
+          (a) explicit `x-shape-form` metadata → trusted regardless of probe
+              behavior;
+          (b) richer probe set (`[a]`, `[Nx]`, etc.) → probe-classifies
+              identifier-only schemas correctly without explicit metadata."""
+        from tools.validate_pipeline_semantics import (
+            _active_repo_root_for_schema,
+            _load_shape_expr_patterns_cached,
+            _parse_shape_expr,
+        )
+        # (a) Probe-based: identifier-only list-form schema, no metadata.
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            sd = repo_root / "spec" / "schema" / "plan"
+            sd.mkdir(parents=True)
+            schema = {
+                "oneOf": [
+                    {"pattern": r"^[Ss][Cc][Aa][Ll][Aa][Rr]$"},
+                    {
+                        "pattern": r"^\[[A-Za-z_][A-Za-z0-9_]*(?:,[A-Za-z_][A-Za-z0-9_]*)*\]$",
+                    },
+                ]
+            }
+            (sd / "shape_expr.schema.json").write_text(json.dumps(schema), encoding="utf-8")
+            _load_shape_expr_patterns_cached.cache_clear()
+            token = _active_repo_root_for_schema.set(repo_root)
+            try:
+                ok, dims, _ = _parse_shape_expr("[nx]")
+                self.assertTrue(ok, "id-only schema must accept [nx] via probe matrix")
+                self.assertEqual(dims, ["nx"])
+                ok_int, _, _ = _parse_shape_expr("[3]")
+                self.assertFalse(ok_int, "id-only schema must reject [3] (regex disallows)")
+            finally:
+                _active_repo_root_for_schema.reset(token)
+                _load_shape_expr_patterns_cached.cache_clear()
+        # (b) Explicit x-shape-form: regex matches NEITHER probe (requires
+        # 2+ char identifier) but author asserts it is list-form.
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            sd = repo_root / "spec" / "schema" / "plan"
+            sd.mkdir(parents=True)
+            schema = {
+                "oneOf": [
+                    {"x-shape-form": "scalar", "pattern": r"^[Ss][Cc][Aa][Ll][Aa][Rr]$"},
+                    {
+                        "x-shape-form": "list",
+                        "pattern": r"^\[[A-Za-z_][A-Za-z0-9_]+(?:,[A-Za-z_][A-Za-z0-9_]+)*\]$",
+                    },
+                ]
+            }
+            (sd / "shape_expr.schema.json").write_text(json.dumps(schema), encoding="utf-8")
+            _load_shape_expr_patterns_cached.cache_clear()
+            token = _active_repo_root_for_schema.set(repo_root)
+            try:
+                ok_two, _, _ = _parse_shape_expr("[nx]")
+                self.assertTrue(ok_two, "explicit x-shape-form list accepts 2+ char id [nx]")
+                ok_one, _, _ = _parse_shape_expr("[a]")
+                self.assertFalse(ok_one, "exotic 2+-char regex correctly rejects single-char [a]")
+            finally:
+                _active_repo_root_for_schema.reset(token)
+                _load_shape_expr_patterns_cached.cache_clear()
+        # (c) Negative regression: unclassifiable branch (no metadata, no
+        # probe match) still raises RuntimeError with a hint to use
+        # `x-shape-form` for disambiguation.
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            sd = repo_root / "spec" / "schema" / "plan"
+            sd.mkdir(parents=True)
+            broken = {
+                "oneOf": [
+                    {"pattern": r"^[Ss][Cc][Aa][Ll][Aa][Rr]$"},
+                    {"pattern": r"^XXXXXX$"},  # matches nothing canonical
+                ]
+            }
+            (sd / "shape_expr.schema.json").write_text(json.dumps(broken), encoding="utf-8")
+            _load_shape_expr_patterns_cached.cache_clear()
+            token = _active_repo_root_for_schema.set(repo_root)
+            try:
+                with self.assertRaises(RuntimeError) as ctx:
+                    _parse_shape_expr("[3]")
+                self.assertIn("x-shape-form", str(ctx.exception))
+            finally:
+                _active_repo_root_for_schema.reset(token)
+                _load_shape_expr_patterns_cached.cache_clear()
+
+    def test_shape_expr_schema_loader_rejects_structural_malformations(self) -> None:
+        """Regression: structurally invalid (but JSON-decodable) schemas must
+        produce `RuntimeError`, not `AttributeError` from `.get()` on the
+        wrong type. The CLI / run_workflow guards only recover from
+        `RuntimeError`; an opaque traceback would defeat the structured
+        FAIL output that orchestration gates parse for recovery."""
+        from tools.validate_pipeline_semantics import (
+            _active_repo_root_for_schema,
+            _load_shape_expr_patterns_cached,
+            _parse_shape_expr,
+        )
+        cases = [
+            ("null", "null", "top-level must be a JSON object"),
+            ("list", "[]", "top-level must be a JSON object"),
+            ("missing oneOf", json.dumps({"title": "no oneOf"}), "must declare a top-level 'oneOf' array"),
+            ("oneOf as string", json.dumps({"oneOf": "oops"}), "'oneOf' must be a JSON array"),
+            ("oneOf with non-dict", json.dumps({"oneOf": [42]}), "must be a JSON object"),
+            ("branch missing pattern", json.dumps({"oneOf": [{"title": "x"}]}), "pattern must be a non-empty string"),
+            ("branch pattern empty", json.dumps({"oneOf": [{"pattern": ""}]}), "pattern must be a non-empty string"),
+        ]
+        for label, content, expected_msg_fragment in cases:
+            with tempfile.TemporaryDirectory() as tmp:
+                repo = Path(tmp)
+                sd = repo / "spec" / "schema" / "plan"
+                sd.mkdir(parents=True)
+                (sd / "shape_expr.schema.json").write_text(content, encoding="utf-8")
+                _load_shape_expr_patterns_cached.cache_clear()
+                token = _active_repo_root_for_schema.set(repo)
+                try:
+                    with self.assertRaises(RuntimeError) as ctx:
+                        _parse_shape_expr("[3]")
+                    self.assertIn(
+                        expected_msg_fragment, str(ctx.exception),
+                        f"case {label!r}: expected {expected_msg_fragment!r} in error message; got: {ctx.exception}",
+                    )
+                except AssertionError:
+                    raise
+                except Exception as exc:  # pragma: no cover
+                    self.fail(
+                        f"case {label!r}: expected RuntimeError, got {type(exc).__name__}: {exc}"
+                    )
+                finally:
+                    _active_repo_root_for_schema.reset(token)
+                    _load_shape_expr_patterns_cached.cache_clear()
+
+    def test_parser_grammar_is_schema_driven_no_hardcoded_dim_token_limit(self) -> None:
+        """Regression: dim-token grammar must be owned by the active schema's
+        list-form regex, NOT shadowed by a hardcoded post-check. Previously
+        the parser re-validated each dim token against `_SHAPE_EXPR_DIM_TOKEN`
+        (`[0-9]+|[A-Za-z_][A-Za-z0-9_]*`), so a repo-local schema that
+        legitimately accepts e.g. arithmetic-like dim tokens (`n+1`) would be
+        rejected by the parser AFTER the regex matched — a drift hazard.
+
+        With the schema fully driving grammar:
+          - bundled schema (strict grammar) still rejects function-call etc.
+            via its own regex.
+          - a repo-local schema that allows arithmetic dim tokens accepts
+            them and `_shape_matches_expr` treats them as bindable
+            identifiers (case-sensitive)."""
+        from tools.validate_pipeline_semantics import (
+            _active_repo_root_for_schema,
+            _load_shape_expr_patterns_cached,
+            _parse_shape_expr,
+            _shape_matches_expr,
+        )
+        # Bundled schema continues to reject function-call notation by its
+        # own regex (no hidden post-check needed).
+        _load_shape_expr_patterns_cached.cache_clear()
+        for expr in ("[vector(3)]", "[matrix(3,3)]", "[3, vector(2)]", "vector(3)", "tensor"):
+            ok, _, _ = _parse_shape_expr(expr)
+            self.assertFalse(ok, f"bundled schema must reject {expr!r} via its own regex")
+        # Repo-local schema with extended dim-token grammar must work.
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            sd = repo / "spec" / "schema" / "plan"
+            sd.mkdir(parents=True)
+            schema = {
+                "oneOf": [
+                    {"pattern": r"^[Ss][Cc][Aa][Ll][Aa][Rr]$"},
+                    # Allow tokens that include `+` and `-` (arithmetic-like)
+                    # in addition to alnum.
+                    {"pattern": r"^\[[A-Za-z0-9+\-]+(?:,[A-Za-z0-9+\-]+)*\]$"},
+                ]
+            }
+            (sd / "shape_expr.schema.json").write_text(json.dumps(schema), encoding="utf-8")
+            _load_shape_expr_patterns_cached.cache_clear()
+            token = _active_repo_root_for_schema.set(repo)
+            try:
+                ok, dims, _ = _parse_shape_expr("[n+1]")
+                self.assertTrue(ok, "repo-local extended schema must accept [n+1]")
+                self.assertEqual(dims, ["n+1"])
+                ok, dims, _ = _parse_shape_expr("[3,n+1,m-2]")
+                self.assertTrue(ok)
+                self.assertEqual(dims, ["3", "n+1", "m-2"])
+                # Symbolic identifier semantics still apply for non-digit tokens.
+                self.assertTrue(_shape_matches_expr("[n+1,n+1]", [4, 4]))
+                self.assertFalse(_shape_matches_expr("[n+1,n+1]", [4, 5]))
+            finally:
+                _active_repo_root_for_schema.reset(token)
+                _load_shape_expr_patterns_cached.cache_clear()
+
+    def test_shape_expr_schema_loader_classifies_branches_structurally(self) -> None:
+        """Regression: branch classification must use the regex behavior, not
+        the human-readable `title`. A schema with valid regexes but renamed
+        or localized titles must still load successfully. A schema whose
+        regexes do not accept any canonical probe must be rejected with a
+        clear error so operators do not ship broken patterns."""
+        from tools.validate_pipeline_semantics import (
+            _active_repo_root_for_schema,
+            _load_shape_expr_patterns_cached,
+            _parse_shape_expr,
+        )
+        # Case A: localized titles, structurally valid regexes → must load.
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            sd = repo_root / "spec" / "schema" / "plan"
+            sd.mkdir(parents=True)
+            schema = {
+                "oneOf": [
+                    {"title": "0次元 (zero-dim)", "pattern": r"^[Ss][Cc][Aa][Ll][Aa][Rr]$"},
+                    {"title": "リスト形 (list form)", "pattern": r"^\[[0-9]+(?:,[0-9]+)*\]$"},
+                ]
+            }
+            (sd / "shape_expr.schema.json").write_text(
+                json.dumps(schema, ensure_ascii=False), encoding="utf-8"
+            )
+            _load_shape_expr_patterns_cached.cache_clear()
+            token = _active_repo_root_for_schema.set(repo_root)
+            try:
+                ok_scalar, _, err_scalar = _parse_shape_expr("scalar")
+                self.assertTrue(ok_scalar, f"localized scalar branch should match: {err_scalar}")
+                ok_list, _, err_list = _parse_shape_expr("[3]")
+                self.assertTrue(ok_list, f"localized list branch should match: {err_list}")
+            finally:
+                _active_repo_root_for_schema.reset(token)
+                _load_shape_expr_patterns_cached.cache_clear()
+        # Case B: branch with a regex that matches NEITHER probe is a
+        # malformed schema. Must raise a clear RuntimeError naming the
+        # offending pattern so operators can repair it.
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            sd = repo_root / "spec" / "schema" / "plan"
+            sd.mkdir(parents=True)
+            broken = {
+                "oneOf": [
+                    {"title": "scalar", "pattern": r"^scalar$"},
+                    {"title": "garbage", "pattern": r"^XXXXXX$"},  # matches nothing canonical
+                ]
+            }
+            (sd / "shape_expr.schema.json").write_text(json.dumps(broken), encoding="utf-8")
+            _load_shape_expr_patterns_cached.cache_clear()
+            token = _active_repo_root_for_schema.set(repo_root)
+            try:
+                with self.assertRaises(RuntimeError) as ctx:
+                    _parse_shape_expr("[3]")
+                msg = str(ctx.exception)
+                self.assertIn("matches no probe", msg)
+                self.assertIn("XXXXXX", msg)
+                self.assertIn("x-shape-form", msg)
+            finally:
+                _active_repo_root_for_schema.reset(token)
+                _load_shape_expr_patterns_cached.cache_clear()
+
+    def test_shape_expr_identifiers_are_case_sensitive(self) -> None:
+        """Regression: identifier-style dim tokens are case-SENSITIVE so
+        `Nx` and `nx` are distinct. Previously canonicalization lowercased
+        every dim, silently merging `[Nx, nx]` into `[nx,nx]` and then
+        enforcing equal extents — over-constraining shape contracts. Only
+        the literal scalar form is normalized to lowercase `"scalar"`
+        because the schema explicitly defines that form case-insensitively."""
+        from tools.validate_pipeline_semantics import (
+            _canonical_shape_expr,
+            _shape_matches_expr,
+        )
+        # Distinct case-different identifiers stay independent.
+        self.assertTrue(_shape_matches_expr("[Nx, nx]", [2, 3]))
+        self.assertTrue(_shape_matches_expr("[Nx, nx]", [3, 3]))
+        # Repeated identifier (same case) still binds.
+        self.assertFalse(_shape_matches_expr("[Nx, Nx]", [2, 3]))
+        self.assertTrue(_shape_matches_expr("[Nx, Nx]", [5, 5]))
+        # Canonicalization preserves identifier case (only whitespace is
+        # collapsed; only the scalar literal is normalized).
+        self.assertEqual(_canonical_shape_expr("[Nx, nx]"), "[Nx,nx]")
+        self.assertEqual(_canonical_shape_expr("[NX, nX, Ny]"), "[NX,nX,Ny]")
+        # Scalar literal is still case-insensitive (schema regex matches all).
+        self.assertEqual(_canonical_shape_expr("Scalar"), "scalar")
+        self.assertEqual(_canonical_shape_expr("SCALAR"), "scalar")
+
+    def test_shape_matches_expr_binds_repeated_symbolic_dimensions(self) -> None:
+        """Regression: a symbolic `shape_expr` like `[n,n]` is a CONTRACT that
+        the two extents are equal at runtime. The matcher must enforce that
+        repeated identifiers bind to the same observed value; previously every
+        symbolic token was unconstrained, so `[n,n]` accepted `[2,3]` and the
+        canonical contract was effectively a wildcard.
+
+        Distinct identifiers (e.g. `[nx,ny]`) are independently bound — they
+        may but need not coincide. Identifier matching is case-insensitive
+        because `_canonical_shape_expr` lowercases dim tokens."""
+        from tools.validate_pipeline_semantics import _shape_matches_expr
+        # Repeated identifier: must agree.
+        self.assertTrue(_shape_matches_expr("[n,n]", [4, 4]))
+        self.assertFalse(_shape_matches_expr("[n,n]", [2, 3]))
+        self.assertFalse(_shape_matches_expr("[nx,nx]", [2, 3]))
+        self.assertTrue(_shape_matches_expr("[nx,nx]", [5, 5]))
+        # Distinct identifiers: independent bindings — any rectangular shape OK.
+        self.assertTrue(_shape_matches_expr("[nx,ny]", [2, 3]))
+        self.assertTrue(_shape_matches_expr("[nx,ny]", [3, 3]))
+        # Mixed literal + repeated symbolic.
+        self.assertTrue(_shape_matches_expr("[3,n,n]", [3, 5, 5]))
+        self.assertFalse(_shape_matches_expr("[3,n,n]", [3, 5, 7]))
+        # Literal mismatch never recovers from earlier bindings.
+        self.assertFalse(_shape_matches_expr("[3,n,n]", [4, 5, 5]))
+
+    def test_shape_matches_expr_has_no_sentinel_bypass(self) -> None:
+        """Regression: `_shape_matches_expr` must NOT short-circuit to True on
+        any internal sentinel value. A wrong-rank payload against the canonical
+        `variables: [{name, shape_expr}, ...]` form must fail."""
+        from tools.validate_pipeline_semantics import _shape_matches_expr
+        # Concrete shape_expr behaves correctly.
+        self.assertTrue(_shape_matches_expr("[2,2]", [2, 2]))
+        self.assertFalse(_shape_matches_expr("[2,2]", [2, 3]))  # wrong dim
+        self.assertFalse(_shape_matches_expr("[2,2]", [2]))     # wrong rank
+        # No sentinel string should be treated as wildcard.
+        self.assertFalse(_shape_matches_expr("__any_shape_sentinel__", [10]))
+        self.assertFalse(_shape_matches_expr("[*]", [10]))
+
     def test_ignores_aux_model_file_for_dependency_usage_validation(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
+            _seed_shape_expr_schema_into(repo_root)
             model_text = """module shallow_water2d_model
 use dynamics_shallow_water_flux_2d_rusanov_p0_model
 implicit none
@@ -872,6 +1374,7 @@ end module aux_model
     def test_detects_dependency_dag_incomplete_for_target_pipeline_scope(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
+            _seed_shape_expr_schema_into(repo_root)
             model_text = """module shallow_water2d_model
 use dynamics_shallow_water_flux_2d_rusanov_p0_model
 implicit none
@@ -929,6 +1432,7 @@ end program shallow_water2d_runner
     def test_detects_problem_constant_model_and_runner_diagnostics(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
+            _seed_shape_expr_schema_into(repo_root)
             model_text = """module shallow_water2d_model
 use dynamics_shallow_water_flux_2d_rusanov_p0_model
 implicit none
@@ -977,6 +1481,7 @@ end program shallow_water2d_runner
     def test_detects_invalid_perf_json(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
+            _seed_shape_expr_schema_into(repo_root)
             model_text = """module shallow_water2d_model
 use dynamics_shallow_water_flux_2d_rusanov_p0_model
 implicit none
@@ -1015,6 +1520,7 @@ end program shallow_water2d_runner
     def test_detects_unsafe_fortran_f0_perf_serialization(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
+            _seed_shape_expr_schema_into(repo_root)
             model_text = """module shallow_water2d_model
 use dynamics_shallow_water_flux_2d_rusanov_p0_model
 implicit none
@@ -1052,6 +1558,7 @@ end program shallow_water2d_runner
     def test_detects_metric_only_scalar_kernel_for_2d_problem(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
+            _seed_shape_expr_schema_into(repo_root)
             model_text = """module shallow_water2d_model
 use dynamics_shallow_water_flux_2d_rusanov_p0_model
 implicit none
@@ -1093,6 +1600,7 @@ end program shallow_water2d_runner
     def test_requires_algorithm_state_contract_for_2d_problem(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
+            _seed_shape_expr_schema_into(repo_root)
             model_text = """module shallow_water2d_model
 use dynamics_shallow_water_flux_2d_rusanov_p0_model
 implicit none
@@ -1148,6 +1656,7 @@ end program shallow_water2d_runner
         # undefined-binding provenance check.
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
+            _seed_shape_expr_schema_into(repo_root)
             _create_minimal_execution_tree(
                 repo_root,
                 dep_spec_id="dynamics_shallow_water_flux_2d_rusanov_p0",
@@ -1247,6 +1756,7 @@ end program shallow_water2d_runner
     def test_detects_makefile_missing_fortran_module_dependency(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
+            _seed_shape_expr_schema_into(repo_root)
             dep_spec_id = "dynamics_shallow_water_flux_2d_rusanov_p0"
             model_text = """module shallow_water2d_model
 use dynamics_shallow_water_flux_2d_rusanov_p0_model
@@ -1310,6 +1820,7 @@ shallow_water2d_runner.o: shallow_water2d_runner.f90 shallow_water2d_model.mod
     def test_detects_missing_llm_semantic_review(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
+            _seed_shape_expr_schema_into(repo_root)
             model_text = """module shallow_water2d_model
 use dynamics_shallow_water_flux_2d_rusanov_p0_model
 implicit none
@@ -1353,6 +1864,7 @@ end program shallow_water2d_runner
     def test_detects_dependency_call_outputs_not_used_in_out_dataflow(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
+            _seed_shape_expr_schema_into(repo_root)
             model_text = """module shallow_water2d_model
 use dynamics_shallow_water_flux_2d_rusanov_p0_model
 implicit none
@@ -1392,6 +1904,7 @@ end program shallow_water2d_runner
     def test_state_snapshots_can_be_optional_by_contract(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
+            _seed_shape_expr_schema_into(repo_root)
             model_text = """module shallow_water2d_model
 use dynamics_shallow_water_flux_2d_rusanov_p0_model
 implicit none
@@ -1463,6 +1976,7 @@ end program shallow_water2d_runner
     def test_detects_invalid_io_contract_outputs(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
+            _seed_shape_expr_schema_into(repo_root)
             model_text = """module shallow_water2d_model
 use dynamics_shallow_water_flux_2d_rusanov_p0_model
 implicit none
@@ -1507,6 +2021,7 @@ end program shallow_water2d_runner
     def test_detects_forbidden_custom_quality_check_command(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
+            _seed_shape_expr_schema_into(repo_root)
             model_text = """module shallow_water2d_model
 use dynamics_shallow_water_flux_2d_rusanov_p0_model
 implicit none
@@ -1582,6 +2097,7 @@ end program shallow_water2d_runner
     def test_rejects_pytest_quality_check_for_fortran_make_pipeline(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
+            _seed_shape_expr_schema_into(repo_root)
             model_text = """module shallow_water2d_model
 use dynamics_shallow_water_flux_2d_rusanov_p0_model
 implicit none
@@ -1665,6 +2181,7 @@ end program shallow_water2d_runner
     def test_rejects_make_quality_check_without_declared_test_target(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
+            _seed_shape_expr_schema_into(repo_root)
             model_text = """module shallow_water2d_model
 use dynamics_shallow_water_flux_2d_rusanov_p0_model
 implicit none
@@ -1760,6 +2277,7 @@ shallow_water2d_runner.o: shallow_water2d_runner.f90 shallow_water2d_model.mod
     def test_rejects_source_command_log_outside_workspace(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
+            _seed_shape_expr_schema_into(repo_root)
             model_text = """module shallow_water2d_model
 use dynamics_shallow_water_flux_2d_rusanov_p0_model
 implicit none
@@ -1820,6 +2338,7 @@ end program shallow_water2d_runner
     def test_validates_tests_md_and_per_test_counts(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
+            _seed_shape_expr_schema_into(repo_root)
             model_text = """module shallow_water2d_model
 use dynamics_shallow_water_flux_2d_rusanov_p0_model
 implicit none
@@ -1921,6 +2440,7 @@ end program shallow_water2d_runner
     def test_requires_raw_variables_when_snapshot_required_and_evidence_is_non_snapshot(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
+            _seed_shape_expr_schema_into(repo_root)
             model_text = """module shallow_water2d_model
 use dynamics_shallow_water_flux_2d_rusanov_p0_model
 implicit none
@@ -2048,6 +2568,7 @@ end program shallow_water2d_runner
     def test_detects_missing_test_evidence_requirements(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
+            _seed_shape_expr_schema_into(repo_root)
             model_text = """module shallow_water2d_model
 use dynamics_shallow_water_flux_2d_rusanov_p0_model
 implicit none
@@ -2123,6 +2644,7 @@ end program shallow_water2d_runner
     def test_detects_metrics_basis_without_per_test_evidence_index(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
+            _seed_shape_expr_schema_into(repo_root)
             tests_path = (
                 repo_root
                 / "spec"
@@ -2216,6 +2738,7 @@ end program shallow_water2d_runner
     def test_detects_metrics_basis_missing_required_variable_in_per_test_entry(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
+            _seed_shape_expr_schema_into(repo_root)
             tests_path = (
                 repo_root
                 / "spec"
@@ -2310,6 +2833,7 @@ end program shallow_water2d_runner
     def test_detects_snapshot_shape_mismatch_against_derived_contract(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
+            _seed_shape_expr_schema_into(repo_root)
             model_text = """module shallow_water2d_model
 use dynamics_shallow_water_flux_2d_rusanov_p0_model
 implicit none
@@ -2364,6 +2888,7 @@ end program shallow_water2d_runner
     def test_detects_missing_orchestration_when_required(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
+            _seed_shape_expr_schema_into(repo_root)
             model_text = """module shallow_water2d_model
 use dynamics_shallow_water_flux_2d_rusanov_p0_model
 implicit none
@@ -2399,6 +2924,7 @@ end program shallow_water2d_runner
     def test_passes_with_orchestration_when_required(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
+            _seed_shape_expr_schema_into(repo_root)
             model_text = """module shallow_water2d_model
 use dynamics_shallow_water_flux_2d_rusanov_p0_model
 implicit none
@@ -2433,6 +2959,7 @@ end program shallow_water2d_runner
     def test_detects_non_isolated_step_context_when_required(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
+            _seed_shape_expr_schema_into(repo_root)
             model_text = """module shallow_water2d_model
 use dynamics_shallow_water_flux_2d_rusanov_p0_model
 implicit none
@@ -2487,6 +3014,7 @@ end program shallow_water2d_runner
     def test_detects_missing_agent_summary_ref_when_required(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
+            _seed_shape_expr_schema_into(repo_root)
             model_text = """module shallow_water2d_model
 use dynamics_shallow_water_flux_2d_rusanov_p0_model
 implicit none
@@ -2541,6 +3069,7 @@ end program shallow_water2d_runner
     def test_detects_missing_launch_prompt_ref_when_required(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
+            _seed_shape_expr_schema_into(repo_root)
             model_text = """module shallow_water2d_model
 use dynamics_shallow_water_flux_2d_rusanov_p0_model
 implicit none
@@ -2595,6 +3124,7 @@ end program shallow_water2d_runner
     def test_detects_missing_child_agent_identifier_in_launch_response(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
+            _seed_shape_expr_schema_into(repo_root)
             model_text = """module shallow_water2d_model
 use dynamics_shallow_water_flux_2d_rusanov_p0_model
 implicit none
@@ -2655,6 +3185,7 @@ end program shallow_water2d_runner
     def test_detects_mismatched_agent_session_id_against_launch_response(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
+            _seed_shape_expr_schema_into(repo_root)
             model_text = """module shallow_water2d_model
 use dynamics_shallow_water_flux_2d_rusanov_p0_model
 implicit none
@@ -2712,6 +3243,7 @@ end program shallow_water2d_runner
     def test_detects_uninformative_agent_summary_when_required(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
+            _seed_shape_expr_schema_into(repo_root)
             model_text = """module shallow_water2d_model
 use dynamics_shallow_water_flux_2d_rusanov_p0_model
 implicit none
@@ -2760,6 +3292,7 @@ end program shallow_water2d_runner
     def test_detects_fabricated_orchestration_pattern_with_generic_launch_reply_and_sequential_ids(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
+            _seed_shape_expr_schema_into(repo_root)
             model_text = """module shallow_water2d_model
 use dynamics_shallow_water_flux_2d_rusanov_p0_model
 implicit none
@@ -2829,6 +3362,7 @@ end program shallow_water2d_runner
     def test_accepts_algorithm_contract_yaml_artifact(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
+            _seed_shape_expr_schema_into(repo_root)
             model_text = """module shallow_water2d_model
 use dynamics_shallow_water_flux_2d_rusanov_p0_model
 implicit none
@@ -2900,6 +3434,7 @@ splitting_policy:
     def test_detects_invalid_raw_artifact_vocabulary_in_derived_contract(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
+            _seed_shape_expr_schema_into(repo_root)
             model_text = """module shallow_water2d_model
 use dynamics_shallow_water_flux_2d_rusanov_p0_model
 implicit none
@@ -2946,6 +3481,7 @@ end program shallow_water2d_runner
     def test_detects_snapshot_output_shape_mismatch_inside_derived_contract(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
+            _seed_shape_expr_schema_into(repo_root)
             model_text = """module shallow_water2d_model
 use dynamics_shallow_water_flux_2d_rusanov_p0_model
 implicit none
@@ -3006,6 +3542,7 @@ end program shallow_water2d_runner
     def test_detects_unknown_required_raw_variables_from_tests_mapping(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
+            _seed_shape_expr_schema_into(repo_root)
             tests_path = (
                 repo_root
                 / "spec"
@@ -3082,6 +3619,7 @@ end program shallow_water2d_runner
     def test_detects_missing_plan_step_result_when_orchestration_required(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
+            _seed_shape_expr_schema_into(repo_root)
             model_text = """module shallow_water2d_model
 use dynamics_shallow_water_flux_2d_rusanov_p0_model
 implicit none
@@ -3127,6 +3665,7 @@ end program shallow_water2d_runner
     def test_detects_missing_pipeline_lineage_json(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
+            _seed_shape_expr_schema_into(repo_root)
             model_text = """module shallow_water2d_model
 use dynamics_shallow_water_flux_2d_rusanov_p0_model
 implicit none
@@ -3163,6 +3702,7 @@ end program shallow_water2d_runner
     def test_detects_missing_graph_child_run_when_orchestration_required(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
+            _seed_shape_expr_schema_into(repo_root)
             model_text = """module shallow_water2d_model
 use dynamics_shallow_water_flux_2d_rusanov_p0_model
 implicit none
@@ -3217,6 +3757,7 @@ end program shallow_water2d_runner
     def test_detects_non_template_launch_prompt_when_orchestration_required(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
+            _seed_shape_expr_schema_into(repo_root)
             model_text = """module shallow_water2d_model
 use dynamics_shallow_water_flux_2d_rusanov_p0_model
 implicit none
@@ -3264,6 +3805,7 @@ end program shallow_water2d_runner
     def test_validate_plan_stage_passes_for_resolved_plan_directory(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
+            _seed_shape_expr_schema_into(repo_root)
             _create_minimal_execution_tree(
                 repo_root,
                 dep_spec_id="dynamics_shallow_water_flux_2d_rusanov_p0",
@@ -3281,6 +3823,7 @@ end program shallow_water2d_runner
     def test_validate_plan_stage_rejects_non_plans_path(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
+            _seed_shape_expr_schema_into(repo_root)
             violations = validate_plan_stage(
                 repo_root,
                 "workspace",
@@ -3293,6 +3836,7 @@ end program shallow_water2d_runner
     def test_validate_plan_stage_rejects_missing_context_isolated(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
+            _seed_shape_expr_schema_into(repo_root)
             _create_minimal_execution_tree(
                 repo_root,
                 dep_spec_id="dynamics_shallow_water_flux_2d_rusanov_p0",
@@ -3320,6 +3864,7 @@ end program shallow_water2d_runner
     def test_validate_plan_stage_requires_constraint_reason_when_not_isolated(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
+            _seed_shape_expr_schema_into(repo_root)
             _create_minimal_execution_tree(
                 repo_root,
                 dep_spec_id="dynamics_shallow_water_flux_2d_rusanov_p0",
@@ -3347,6 +3892,7 @@ end program shallow_water2d_runner
     def test_validate_post_generate_stage_passes(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
+            _seed_shape_expr_schema_into(repo_root)
             dep_model_text = """module dynamics_shallow_water_flux_2d_rusanov_p0_model
 implicit none
 contains
@@ -3409,6 +3955,7 @@ shallow_water2d_runner.o: shallow_water2d_runner.f90 shallow_water2d_model.mod
     def test_validate_post_generate_stage_rejects_failed_run_linter_log(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
+            _seed_shape_expr_schema_into(repo_root)
             _create_minimal_execution_tree(
                 repo_root,
                 dep_spec_id="dynamics_shallow_water_flux_2d_rusanov_p0",
@@ -3451,6 +3998,7 @@ shallow_water2d_runner.o: shallow_water2d_runner.f90 shallow_water2d_model.mod
     def test_validate_post_generate_stage_rejects_lint_command_mismatch(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
+            _seed_shape_expr_schema_into(repo_root)
             _create_minimal_execution_tree(
                 repo_root,
                 dep_spec_id="dynamics_shallow_water_flux_2d_rusanov_p0",
@@ -3502,6 +4050,7 @@ shallow_water2d_runner.o: shallow_water2d_runner.f90 shallow_water2d_model.mod
         """
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
+            _seed_shape_expr_schema_into(repo_root)
             _create_minimal_execution_tree(
                 repo_root,
                 dep_spec_id="dynamics_shallow_water_flux_2d_rusanov_p0",
@@ -3580,6 +4129,7 @@ shallow_water2d_runner.o: shallow_water2d_runner.f90 shallow_water2d_model.mod
         """
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
+            _seed_shape_expr_schema_into(repo_root)
             _create_minimal_execution_tree(
                 repo_root,
                 dep_spec_id="dynamics_shallow_water_flux_2d_rusanov_p0",
@@ -3644,6 +4194,7 @@ shallow_water2d_runner.o: shallow_water2d_runner.f90 shallow_water2d_model.mod
         """
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
+            _seed_shape_expr_schema_into(repo_root)
             _create_minimal_execution_tree(
                 repo_root,
                 dep_spec_id="dynamics_shallow_water_flux_2d_rusanov_p0",
@@ -3700,6 +4251,7 @@ shallow_water2d_runner.o: shallow_water2d_runner.f90 shallow_water2d_model.mod
         """
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
+            _seed_shape_expr_schema_into(repo_root)
             _create_minimal_execution_tree(
                 repo_root,
                 dep_spec_id="dynamics_shallow_water_flux_2d_rusanov_p0",
@@ -3737,6 +4289,7 @@ shallow_water2d_runner.o: shallow_water2d_runner.f90 shallow_water2d_model.mod
         """
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
+            _seed_shape_expr_schema_into(repo_root)
             _create_minimal_execution_tree(
                 repo_root,
                 dep_spec_id="dynamics_shallow_water_flux_2d_rusanov_p0",
@@ -3773,6 +4326,7 @@ shallow_water2d_runner.o: shallow_water2d_runner.f90 shallow_water2d_model.mod
         """
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
+            _seed_shape_expr_schema_into(repo_root)
             _create_minimal_execution_tree(
                 repo_root,
                 dep_spec_id="dynamics_shallow_water_flux_2d_rusanov_p0",
@@ -3821,6 +4375,7 @@ shallow_water2d_runner.o: shallow_water2d_runner.f90 shallow_water2d_model.mod
         """A run_program record with ok!=true cannot serve as evidence."""
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
+            _seed_shape_expr_schema_into(repo_root)
             _create_minimal_execution_tree(
                 repo_root,
                 dep_spec_id="dynamics_shallow_water_flux_2d_rusanov_p0",
@@ -3876,6 +4431,7 @@ shallow_water2d_runner.o: shallow_water2d_runner.f90 shallow_water2d_model.mod
         """
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
+            _seed_shape_expr_schema_into(repo_root)
             _create_minimal_execution_tree(
                 repo_root,
                 dep_spec_id="dynamics_shallow_water_flux_2d_rusanov_p0",
@@ -3957,6 +4513,7 @@ shallow_water2d_runner.o: shallow_water2d_runner.f90 shallow_water2d_model.mod
         """
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
+            _seed_shape_expr_schema_into(repo_root)
             _create_minimal_execution_tree(
                 repo_root,
                 dep_spec_id="dynamics_shallow_water_flux_2d_rusanov_p0",
@@ -4034,6 +4591,7 @@ shallow_water2d_runner.o: shallow_water2d_runner.f90 shallow_water2d_model.mod
         """
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
+            _seed_shape_expr_schema_into(repo_root)
             _create_minimal_execution_tree(
                 repo_root,
                 dep_spec_id="dynamics_shallow_water_flux_2d_rusanov_p0",
@@ -4241,6 +4799,7 @@ shallow_water2d_runner.o: shallow_water2d_runner.f90 shallow_water2d_model.mod
     def test_validate_post_build_stage_passes(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
+            _seed_shape_expr_schema_into(repo_root)
             dep_model_text = """module dynamics_shallow_water_flux_2d_rusanov_p0_model
 implicit none
 contains
@@ -4304,6 +4863,7 @@ shallow_water2d_runner.o: shallow_water2d_runner.f90 shallow_water2d_model.mod
         """metrics_basis 引数が raw/metrics_basis.json に反映されること（trivial 検証テストの前提）。"""
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
+            _seed_shape_expr_schema_into(repo_root)
             model_text = """module shallow_water2d_model
 use dynamics_shallow_water_flux_2d_rusanov_p0_model
 implicit none
@@ -4349,6 +4909,7 @@ end program shallow_water2d_runner
         """metrics_basis.json の全数値が 0.0 のとき violation が発生すること。"""
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
+            _seed_shape_expr_schema_into(repo_root)
             model_text = """module shallow_water2d_model
 use dynamics_shallow_water_flux_2d_rusanov_p0_model
 implicit none
@@ -4382,6 +4943,7 @@ end program shallow_water2d_runner
         """metrics_basis.json の全フィールドが null のとき violation が発生すること。"""
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
+            _seed_shape_expr_schema_into(repo_root)
             model_text = """module shallow_water2d_model
 use dynamics_shallow_water_flux_2d_rusanov_p0_model
 implicit none
@@ -4415,6 +4977,7 @@ end program shallow_water2d_runner
         """metrics_basis.json の一部に非ゼロ実数値があれば通過すること。"""
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
+            _seed_shape_expr_schema_into(repo_root)
             model_text = """module shallow_water2d_model
 use dynamics_shallow_water_flux_2d_rusanov_p0_model
 implicit none
@@ -4448,6 +5011,7 @@ end program shallow_water2d_runner
         """metrics_basis.json に数値フィールドが一切なければ trivial チェックをスキップする。"""
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
+            _seed_shape_expr_schema_into(repo_root)
             model_text = """module shallow_water2d_model
 use dynamics_shallow_water_flux_2d_rusanov_p0_model
 implicit none
@@ -4476,6 +5040,431 @@ end program shallow_water2d_runner
                 any("trivial placeholder" in v for v in violations),
                 f"Expected no trivial placeholder violation, got: {violations}",
             )
+
+    def test_shape_expr_schema_load_is_lazy_and_errors_are_structured(self) -> None:
+        """Regression: a missing or malformed shape_expr schema must NOT crash
+        at import time (which would block `--help` and unrelated CLI flows).
+        First parse-time access surfaces a `RuntimeError` whose message names
+        the offending path so operators can repair it."""
+        from tools.validate_pipeline_semantics import (
+            _BUNDLED_SHAPE_EXPR_SCHEMA_PATH,
+            _active_repo_root_for_schema,
+            _load_shape_expr_patterns_cached,
+            _parse_shape_expr,
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            broken_root = Path(tmp)
+            schema_dir = broken_root / "spec" / "schema" / "plan"
+            schema_dir.mkdir(parents=True)
+            (schema_dir / "shape_expr.schema.json").write_text(
+                "{ this is not json", encoding="utf-8"
+            )
+            _load_shape_expr_patterns_cached.cache_clear()
+            token = _active_repo_root_for_schema.set(broken_root)
+            try:
+                with self.assertRaises(RuntimeError) as ctx:
+                    _parse_shape_expr("[3]")
+                msg = str(ctx.exception)
+                self.assertIn("shape_expr schema", msg)
+                self.assertIn("malformed JSON", msg)
+                self.assertIn(str(broken_root / "spec" / "schema" / "plan" / "shape_expr.schema.json"), msg)
+            finally:
+                _active_repo_root_for_schema.reset(token)
+                _load_shape_expr_patterns_cached.cache_clear()
+        # Bundled schema continues to work after the cache reset.
+        ok, _, _ = _parse_shape_expr("[3]")
+        self.assertTrue(ok)
+        # Sanity: the bundled path resolution is still valid.
+        self.assertTrue(_BUNDLED_SHAPE_EXPR_SCHEMA_PATH.is_file())
+
+    def test_shape_expr_schema_resolves_from_active_repo_root(self) -> None:
+        """Regression: the active repo_root's spec/schema/plan/shape_expr.schema.json
+        is the canonical source — its rules apply, and missing the schema while
+        a repo_root is in scope must FAIL CLOSED rather than silently falling
+        back to the validator-bundled copy. Bundled fallback is reserved for
+        ad-hoc / library-style invocation with no target repo in scope."""
+        from tools.validate_pipeline_semantics import (
+            _active_repo_root_for_schema,
+            _load_shape_expr_patterns_cached,
+            _parse_shape_expr,
+        )
+        with tempfile.TemporaryDirectory() as tmp_strict, tempfile.TemporaryDirectory() as tmp_no_schema:
+            strict_root = Path(tmp_strict)
+            no_schema_root = Path(tmp_no_schema)
+            schema_dir = strict_root / "spec" / "schema" / "plan"
+            schema_dir.mkdir(parents=True)
+            strict_schema = {
+                "$schema": "http://json-schema.org/draft-07/schema#",
+                "oneOf": [
+                    {"title": "scalar literal", "pattern": r"^[Ss][Cc][Aa][Ll][Aa][Rr]$"},
+                    {
+                        "title": "bracket list form (integer-only)",
+                        "pattern": r"^\[\s*[0-9]+(?:\s*,\s*[0-9]+)*\s*\]$",
+                    },
+                ],
+            }
+            (schema_dir / "shape_expr.schema.json").write_text(
+                json.dumps(strict_schema), encoding="utf-8"
+            )
+
+            _load_shape_expr_patterns_cached.cache_clear()
+            token = _active_repo_root_for_schema.set(strict_root)
+            try:
+                # Identifier dim now rejected (target schema is integer-only).
+                ok_id, _, _ = _parse_shape_expr("[nx]")
+                self.assertFalse(ok_id, "identifier dim should be rejected by strict target schema")
+                # Integer dim still passes.
+                ok_int, _, _ = _parse_shape_expr("[3]")
+                self.assertTrue(ok_int, "integer dim should pass strict target schema")
+                # Paren tuple form not declared in strict target schema → rejected.
+                ok_paren, _, _ = _parse_shape_expr("(d1, d2)")
+                self.assertFalse(ok_paren, "paren form absent from strict schema should be rejected")
+            finally:
+                _active_repo_root_for_schema.reset(token)
+                _load_shape_expr_patterns_cached.cache_clear()
+
+            # Target with no schema while in scope must FAIL CLOSED — no silent
+            # bundled fallback once a repo_root is pinned, otherwise version
+            # skew between target and validator-bundle goes undetected.
+            token2 = _active_repo_root_for_schema.set(no_schema_root)
+            try:
+                with self.assertRaises(RuntimeError) as ctx:
+                    _parse_shape_expr("[3]")
+                msg = str(ctx.exception)
+                self.assertIn("shape_expr schema not found", msg)
+                self.assertIn(
+                    str(no_schema_root / "spec" / "schema" / "plan" / "shape_expr.schema.json"),
+                    msg,
+                )
+            finally:
+                _active_repo_root_for_schema.reset(token2)
+                _load_shape_expr_patterns_cached.cache_clear()
+
+            # When NO repo_root is in scope (library / ad-hoc / unit-test
+            # invocation), bundled fallback IS used. This keeps test and
+            # importer paths working without forcing every caller to provide
+            # a target repo.
+            ok_bundled, _, _ = _parse_shape_expr("[nx]")
+            self.assertTrue(ok_bundled, "bundled schema applies when no repo_root is in scope")
+            _load_shape_expr_patterns_cached.cache_clear()
+
+    def test_validate_plan_stage_fails_closed_when_target_repo_lacks_schema(self) -> None:
+        """Regression: public validate_*() entrypoints must bind the active
+        repo_root context themselves so a target repo without
+        spec/schema/plan/shape_expr.schema.json fails closed. Previously the
+        context was set only by CLI main(), so library callers silently fell
+        back to the validator-bundled schema, defeating the fail-closed
+        protection against version skew between target and validator-bundle."""
+        from tools.validate_pipeline_semantics import (
+            _active_repo_root_for_schema,
+            _load_shape_expr_patterns_cached,
+            validate_plan_stage,
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            # Deliberately do NOT seed the schema (this test exercises the
+            # missing-schema path). Build minimal plan artifacts so the
+            # validator reaches shape_expr parsing.
+            plan_dir = repo_root / "workspace" / "plans" / "x" / "p1"
+            plan_dir.mkdir(parents=True)
+            algo = {
+                "algorithm_id": "alg",
+                "execution_mode": "sequence",
+                "steps": [],
+                "ordering": [],
+                "control_condition": "",
+                "iteration_contract": {},
+                "update_semantics": {},
+                "temporaries": [{"name": "t", "shape_expr": "[3]"}],
+                "derived_field_rules": [],
+                "invariants": ["x"],
+                "splitting_policy": {"kind": "none"},
+            }
+            (plan_dir / "algorithm.resolved.yaml").write_text(
+                yaml.safe_dump(algo), encoding="utf-8"
+            )
+            _load_shape_expr_patterns_cached.cache_clear()
+            # Pre-condition: no leaked context from prior tests.
+            self.assertIsNone(_active_repo_root_for_schema.get())
+            # Direct library-style call must fail closed.
+            with self.assertRaises(RuntimeError) as ctx:
+                validate_plan_stage(repo_root, "workspace", "workspace/plans/x/p1")
+            msg = str(ctx.exception)
+            self.assertIn("shape_expr schema not found", msg)
+            self.assertIn(
+                str(repo_root / "spec" / "schema" / "plan" / "shape_expr.schema.json"),
+                msg,
+            )
+            # Post-condition: validate_plan_stage MUST reset the context so
+            # subsequent in-process calls don't see the failed repo's root.
+            self.assertIsNone(
+                _active_repo_root_for_schema.get(),
+                "validate_plan_stage must reset the active context after returning/raising",
+            )
+            _load_shape_expr_patterns_cached.cache_clear()
+
+    def test_consecutive_main_calls_do_not_leak_repo_root_context(self) -> None:
+        """Regression: main() must scope `_active_repo_root_for_schema` to its
+        own invocation. A long-lived process or batch tooling that invokes
+        main() against repo A then repo B must NOT carry repo A's context
+        into repo B's resolution. The leak is process-local and order-
+        dependent, which makes it expensive to diagnose without a guard test."""
+        import io
+        from contextlib import redirect_stdout
+        from tools.validate_pipeline_semantics import (
+            _active_repo_root_for_schema,
+            _load_shape_expr_patterns_cached,
+            main,
+        )
+
+        def _build_repo(tmp: str) -> Path:
+            repo = Path(tmp)
+            sd = repo / "spec" / "schema" / "plan"
+            sd.mkdir(parents=True)
+            (sd / "shape_expr.schema.json").write_bytes(
+                _BUNDLED_SHAPE_EXPR_SCHEMA_PATH.read_bytes()
+            )
+            plan_dir = repo / "workspace" / "plans" / "x" / "p1"
+            plan_dir.mkdir(parents=True)
+            (plan_dir / "algorithm.resolved.yaml").write_text(
+                yaml.safe_dump(
+                    {
+                        "algorithm_id": "a",
+                        "execution_mode": "sequence",
+                        "steps": [],
+                        "ordering": [],
+                        "control_condition": "",
+                        "iteration_contract": {},
+                        "update_semantics": {},
+                        "temporaries": [{"name": "t", "shape_expr": "[3]"}],
+                        "derived_field_rules": [],
+                        "invariants": ["x"],
+                        "splitting_policy": {"kind": "none"},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            return repo
+
+        _load_shape_expr_patterns_cached.cache_clear()
+        # Pre-condition baseline.
+        baseline = _active_repo_root_for_schema.get()
+        with tempfile.TemporaryDirectory() as tmp_a, tempfile.TemporaryDirectory() as tmp_b:
+            repo_a = _build_repo(tmp_a)
+            repo_b = _build_repo(tmp_b)
+            for repo in (repo_a, repo_b):
+                buf = io.StringIO()
+                with redirect_stdout(buf):
+                    main(
+                        [
+                            "--repo-root", str(repo),
+                            "--stage", "plan",
+                            "--plan-ref", "workspace/plans/x/p1",
+                        ]
+                    )
+                # After each main() call the context must be reset.
+                self.assertEqual(
+                    _active_repo_root_for_schema.get(),
+                    baseline,
+                    f"main() against {repo} leaked context "
+                    f"(active={_active_repo_root_for_schema.get()!r}, expected={baseline!r})",
+                )
+
+    def test_cli_emits_structured_fail_on_broken_schema(self) -> None:
+        """Regression: a broken canonical schema (missing or malformed) must
+        surface as `pipeline semantic validation: FAIL\\n- schema_load_failed: ...`
+        on stdout rather than an uncaught traceback. Orchestration gates parse
+        the structured output; an opaque crash blocks recovery and observability."""
+        import io
+        from contextlib import redirect_stdout
+        from tools.validate_pipeline_semantics import (
+            _active_repo_root_for_schema,
+            _load_shape_expr_patterns_cached,
+            main,
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            broken_root = Path(tmp)
+            schema_dir = broken_root / "spec" / "schema" / "plan"
+            schema_dir.mkdir(parents=True)
+            (schema_dir / "shape_expr.schema.json").write_text(
+                "{ broken json", encoding="utf-8"
+            )
+            # Need a minimal plan_ref so plan-stage actually exercises shape_expr.
+            plan_ref = broken_root / "workspace" / "plans" / "x" / "p1"
+            plan_ref.mkdir(parents=True)
+            algo = {
+                "algorithm_id": "alg",
+                "execution_mode": "sequence",
+                "steps": [],
+                "ordering": [],
+                "control_condition": "",
+                "iteration_contract": {},
+                "update_semantics": {},
+                "temporaries": [{"name": "t", "shape_expr": "[3]"}],
+                "derived_field_rules": [],
+                "invariants": ["x"],
+                "splitting_policy": {"kind": "none"},
+            }
+            (plan_ref / "algorithm.resolved.yaml").write_text(
+                yaml.safe_dump(algo), encoding="utf-8"
+            )
+            _load_shape_expr_patterns_cached.cache_clear()
+            # Reset any leaked context from earlier tests.
+            try:
+                prev = _active_repo_root_for_schema.get()
+            except LookupError:
+                prev = None
+            _active_repo_root_for_schema.set(None)
+            buf = io.StringIO()
+            try:
+                with redirect_stdout(buf):
+                    rc = main([
+                        "--repo-root", str(broken_root),
+                        "--stage", "plan",
+                        "--plan-ref", "workspace/plans/x/p1",
+                    ])
+            finally:
+                _active_repo_root_for_schema.set(prev)
+                _load_shape_expr_patterns_cached.cache_clear()
+            output = buf.getvalue()
+        self.assertEqual(rc, 1, f"expected exit code 1, got {rc}; output: {output!r}")
+        self.assertIn("pipeline semantic validation: FAIL", output)
+        self.assertIn("schema_load_failed", output)
+        self.assertIn("shape_expr.schema.json", output)
+
+    def test_shape_expr_rejects_wrapped_function_call_notation(self) -> None:
+        """Regression: function-call notation must be rejected even when wrapped
+        inside the bracket/paren forms (e.g. `[vector(3)]`, `[3, vector(2)]`,
+        `(d1, matrix(2,2))`). The previous schema regex was permissive on
+        dimension tokens; the parser now restricts each dim token to integer
+        literal or identifier-style symbol.
+
+        Single-element paren tuples like `(tensor)` and `(d1)` REMAIN valid
+        because their structure is a legitimate 1-D shape — `tensor` here is
+        treated as an identifier-named dimension, not a function-call."""
+        from tools.validate_pipeline_semantics import _parse_shape_expr
+        forbidden = [
+            "[vector(3)]",
+            "[matrix(3,3)]",
+            "[3, vector(2)]",
+            "(d1, matrix(2,2))",
+            "[1+2]",
+            "[3.0]",
+            "[-3]",
+        ]
+        for expr in forbidden:
+            ok, _, err = _parse_shape_expr(expr)
+            self.assertFalse(ok, f"{expr!r} should be rejected, got ok=True")
+            self.assertTrue(err, f"{expr!r} rejection must carry a non-empty error message")
+
+        accepted = [
+            "scalar",
+            "[3]",
+            "[nx, ny]",
+            "(nx)",
+            "(d1, d2)",
+            "(tensor)",  # 1-D paren tuple with identifier-named dim — structurally valid
+        ]
+        for expr in accepted:
+            ok, _, _ = _parse_shape_expr(expr)
+            self.assertTrue(ok, f"{expr!r} should be accepted")
+
+    def test_object_form_temporaries_must_include_shape_expr(self) -> None:
+        """Regression: phase_01_plan.md L26 mandates that object-form temporaries
+        entries carry both `name` and `shape_expr` (canonical source:
+        spec/schema/plan/shape_expr.schema.json). Missing shape_expr must fail
+        Plan validation rather than silently leak into Generate."""
+        from tools.validate_pipeline_semantics import _validate_algorithm_contract_file
+        contract = {
+            "algorithm_id": "alg_test",
+            "execution_mode": "sequence",
+            "steps": [
+                {
+                    "step_id": "s1",
+                    "step_kind": "flux_compute",
+                    "operation_ref": "op_dummy",
+                    "inputs": ["U_L", "U_R"],
+                    "outputs": ["F_h"],
+                }
+            ],
+            "ordering": ["s1"],
+            "control_condition": "",
+            "iteration_contract": {},
+            "update_semantics": {"target_variables": ["F_h"], "update_order": "sequential"},
+            "temporaries": [
+                {"name": "guard_pass"},  # missing shape_expr — must violate
+            ],
+            "derived_field_rules": [],
+            "invariants": ["dummy"],
+            "splitting_policy": {"kind": "none"},
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            _seed_shape_expr_schema_into(repo_root)
+            contract_path = repo_root / "algorithm.resolved.yaml"
+            contract_path.write_text(yaml.safe_dump(contract), encoding="utf-8")
+            violations: list[str] = []
+            _validate_algorithm_contract_file(
+                repo_root,
+                contract_path,
+                violations,
+                multidim_node_key=None,
+                direct_spec_vars=None,
+            )
+        offending = [
+            v for v in violations
+            if "temporaries[0].shape_expr" in v and "required" in v
+        ]
+        self.assertTrue(
+            offending,
+            f"Expected required-shape_expr violation, got: {violations}",
+        )
+
+    def test_object_form_temporaries_with_shape_expr_passes(self) -> None:
+        """Negative regression of the previous test: a complete object-form
+        entry with valid shape_expr must NOT produce a temporaries violation."""
+        from tools.validate_pipeline_semantics import _validate_algorithm_contract_file
+        contract = {
+            "algorithm_id": "alg_test",
+            "execution_mode": "sequence",
+            "steps": [
+                {
+                    "step_id": "s1",
+                    "step_kind": "flux_compute",
+                    "operation_ref": "op_dummy",
+                    "inputs": ["U_L", "U_R"],
+                    "outputs": ["F_h"],
+                }
+            ],
+            "ordering": ["s1"],
+            "control_condition": "",
+            "iteration_contract": {},
+            "update_semantics": {"target_variables": ["F_h"], "update_order": "sequential"},
+            "temporaries": [
+                {"name": "guard_pass", "shape_expr": "scalar"},
+                {"name": "flux_vec", "shape_expr": "[3]"},
+            ],
+            "derived_field_rules": [],
+            "invariants": ["dummy"],
+            "splitting_policy": {"kind": "none"},
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            _seed_shape_expr_schema_into(repo_root)
+            contract_path = repo_root / "algorithm.resolved.yaml"
+            contract_path.write_text(yaml.safe_dump(contract), encoding="utf-8")
+            violations: list[str] = []
+            _validate_algorithm_contract_file(
+                repo_root,
+                contract_path,
+                violations,
+                multidim_node_key=None,
+                direct_spec_vars=None,
+            )
+        self.assertFalse(
+            any("temporaries[" in v for v in violations),
+            f"Unexpected temporaries violation: {[v for v in violations if 'temporaries[' in v]}",
+        )
 
 
 if __name__ == "__main__":

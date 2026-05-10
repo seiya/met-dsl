@@ -18,6 +18,26 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+# Direct-CLI import bootstrap. When this script is executed as
+# `python3 tools/run_workflow.py ...` (the canonical entrypoint per
+# CLAUDE.md), `sys.path[0]` is `tools/`, not the repo root, so absolute
+# package imports like `from tools.validate_pipeline_semantics import ...`
+# fail with `ModuleNotFoundError` before any structured error handling
+# can run. Mirror the pattern used by `tools/validate_pipeline_semantics.py`
+# and `tools/orchestration_runtime.py`: detect the missing import and
+# prepend the repo root to `sys.path`. The probe import is intentionally
+# small (a stdlib-style module name we know lives next to this script)
+# so the side effect is just sys.path adjustment.
+try:
+    from tools import validate_pipeline_semantics as _probe  # noqa: F401
+except ModuleNotFoundError:  # pragma: no cover - direct CLI execution
+    _THIS_FILE = Path(__file__).resolve()
+    _REPO_ROOT = _THIS_FILE.parent.parent
+    if str(_REPO_ROOT) not in sys.path:
+        sys.path.insert(0, str(_REPO_ROOT))
+    # Re-probe so the in-function imports later in main() succeed.
+    from tools import validate_pipeline_semantics as _probe  # noqa: F401
+
 SUPPORTED_LLMS = ("codex", "cursor", "claude")
 SUPPORTED_WORKFLOW_MODES = ("dev", "prod")
 DEFAULT_LLM_COMMANDS = {
@@ -132,6 +152,22 @@ def _build_orchestration_prompt(
     base = textwrap.dedent(
         f"""
         Workflow を起動する。
+
+        ## Step 0 — TMPDIR bootstrap (FIRST Bash before anything else)
+
+        最初の `Bash` 呼び出しで以下を必ず実行する。skip すると後続の heredoc / `cat > ...` が
+        `output_manifest_write_guard` でブロックされる (`startup_contract.md` Step 0 参照)。
+
+        ```bash
+        export METDSL_ORCHESTRATION_ID="{orchestration_id}"
+        export ORCHESTRATION_AGENT_RUN_ID="{orchestration_agent_run_id}"
+        export TMPDIR=$(jq -er '.allowed_tmp_root' \\
+          "workspace/orchestrations/$METDSL_ORCHESTRATION_ID/output_manifests/$ORCHESTRATION_AGENT_RUN_ID.json")
+        ```
+
+        `tools/run_workflow.py` は呼び出し時に `METDSL_ORCHESTRATION_ID` / `ORCHESTRATION_AGENT_RUN_ID` /
+        `TMPDIR` を子プロセスに引き継いでいるが、明示 export を入れておくと session 切り替え時にも
+        参照可能になる。
 
         ## startup context
         - orchestration_id: `{orchestration_id}`
@@ -694,6 +730,47 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 2
 
+    # Startup assertion: validate_pipeline_semantics now fail-closes when the
+    # active repo_root's `spec/schema/plan/shape_expr.schema.json` is missing,
+    # malformed, contains an invalid regex, or fails the structural classifier.
+    # We must surface ALL of those failure modes here BEFORE any orchestration
+    # state mutation (init/preflight/launches/...), otherwise the run would
+    # create `workspace/tmp/<arid>/` and orchestration_meta.json only to
+    # collapse later with `schema_load_failed` mid-phase, leaving partially
+    # initialized state to clean up.
+    #
+    # Reuse the validator's actual schema loader so the check exercises the
+    # same code path as the gate it is guarding — `is_file()` alone would
+    # miss malformed JSON, invalid regex, and structural-classifier failures.
+    required_schema = repo_root / "spec" / "schema" / "plan" / "shape_expr.schema.json"
+    try:
+        from tools.validate_pipeline_semantics import (
+            _get_shape_expr_patterns,
+            _load_shape_expr_patterns_cached,
+        )
+        _load_shape_expr_patterns_cached.cache_clear()
+        _get_shape_expr_patterns(repo_root=repo_root)
+    except (RuntimeError, ModuleNotFoundError) as exc:
+        try:
+            missing_path_rel = str(required_schema.relative_to(repo_root))
+        except ValueError:
+            missing_path_rel = str(required_schema)
+        print(
+            json.dumps(
+                {
+                    "status": "fail",
+                    "reason": "missing_canonical_schema",
+                    "detail": (
+                        f"canonical schema invalid or missing: {missing_path_rel}. "
+                        f"{exc}"
+                    ),
+                    "missing_path": missing_path_rel,
+                },
+                ensure_ascii=False,
+            )
+        )
+        return 2
+
     tmp_parent = repo_root / "workspace" / "tmp"
     tmp_parent.mkdir(parents=True, exist_ok=True)
     # TMPDIR must match output_manifest.allowed_tmp_root for the active agent (orchestration uses
@@ -733,6 +810,7 @@ def main(argv: list[str] | None = None) -> int:
             orch_tmp = tmp_parent / orchestration_agent_run_id
             orch_tmp.mkdir(parents=True, exist_ok=True)
             env["TMPDIR"] = str(orch_tmp)
+            env["ORCHESTRATION_AGENT_RUN_ID"] = orchestration_agent_run_id
             orchestration_tmp_for_cleanup = orch_tmp
 
             preflight_result = _runtime_command(

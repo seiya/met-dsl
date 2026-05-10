@@ -22,6 +22,7 @@ Plan ステージの生成責務を固定し、入力 spec から決定的な re
 - `case.resolved.yaml` は実行時入力の決定値のみを保持し、検証 output contract を保持してはならない。
 - `algorithm.resolved.yaml` を必須出力とし、`problem` の統合順序、依存 `operation` 呼び出し順序、条件分岐、反復条件、列処理、派生量定義、更新対象を保持する。
 - `algorithm.resolved.yaml` は `algorithm_id` と `execution_mode` と `steps[]` と `ordering` と `control_condition` と `iteration_contract` と `update_semantics` と `temporaries` と `derived_field_rules` と `invariants` と `splitting_policy` を必須保持する。
+- `temporaries[].shape_expr` および `state_variables[].shape_expr` の表現規則は `spec/schema/plan/shape_expr.schema.json` を canonical source とする。許容形式は `scalar` (case-insensitive) / `[d1, d2, ...]` / `(d1, d2, ...)` の 3 形式に限り、`vector(N)` / `matrix(M,N)` / `tensor` 等の関数呼び出し記法は `Plan fail` とする。
 - `execution_mode` は `sequence` / `conditional` / `iterative` / `columnwise` のみを許可する。
 - `steps[]` の各要素は `step_id` と `step_kind` と `operation_ref` と `inputs` と `outputs` を必須保持する。`inputs` と `outputs` は **非空文字列の list**（例: `["U_L", "U_R", "h_B", "h_T"]`）とし、object 形式（`[{name: ..., source: ...}]`）は禁止する。参考形式: `docs/examples/algorithm.resolved.example.yaml`。
 - `steps[].inputs` / `steps[].outputs` に現れる string token は、`controlled_spec.md` の直接入出力変数・`temporaries` の中間変数・`derived_field_rules` の派生量のいずれかに**追跡可能**でなければならない。スライス・エイリアス・コンポーネント分解による派生名（例: `h_L` ← `U_L[0]`）は `temporaries` または `derived_field_rules` に宣言して provenance を明示すること。直接名・派生名のいずれにも対応付けできないトークンは `algorithm.resolved.yaml` 単独でデータフローを追跡できないため `Plan fail` とする。
@@ -34,7 +35,7 @@ Plan ステージの生成責務を固定し、入力 spec から決定的な re
 - `dependency.resolved.yaml` は `node_key` と `direct_deps` と `transitive_deps` と `topo_level` を必須記録する。
 - `derived_contract.json` は `Plan verify substep` が導出して保存する検証契約とし、`Plan generate substep` は生成してはならない。
 - `problem` かつ `spec_id` が `2d` または `3d` を含む `node` では、`algorithm.resolved.yaml` に状態更新対象と更新順序を必須保持しなければならない。
-- `algorithm.resolved.yaml` の多次元 `problem` 向け契約は `state_variables[].name` と `state_variables[].shape_expr` と `required_update_paths` と `diagnostics_from_state=true` と `fallback_policy=fail_closed` を必須保持する。
+- `algorithm.resolved.yaml` の多次元 `problem` 向け契約は `state_variables[].name` と `state_variables[].shape_expr` と `required_update_paths` と `diagnostics_from_state=true` と `fallback_policy=fail_closed` を必須保持する。`state_variables[].shape_expr` も `spec/schema/plan/shape_expr.schema.json` の 3 形式に限る。
 - 上位 `node` の `Plan` は、直下依存 `node` の `plan_ref` と `plan_meta.json.verification_status` を確認し、`direct dependency plan readiness` を満たさない場合は開始してはならない。
 - 上記の生成契約を導出できない場合は `Plan fail` とし、不完全な契約で `Generate` へ進めてはならない。
 - 未登録依存、未実装依存、互換性違反依存は解決エラーにし、該当 `node` を `blocked` にする。

@@ -892,12 +892,32 @@ def check_cli_managed_path(repo_root: Path, file_path: str) -> "HookDecision | N
     return None
 
 
+def _detect_tmpdir_step0_skipped(bash_command: str | None) -> bool:
+    """Heuristic: did the agent skip Step 0 (TMPDIR export from allowed_tmp_root)?
+
+    Triggers when the offending Bash command contains either:
+      - "${TMPDIR:-..." or "$TMPDIR:-..." parameter-default expansion (proves the
+        agent knew TMPDIR might be unset and wrote a fallback inline)
+      - hardcoded "/tmp/" or "/dev/shm/" path inside a redirect/heredoc target
+    Both indicate Step 0 (`export TMPDIR=$(jq -er '.allowed_tmp_root' ...)`) was not
+    executed before the offending write.
+    """
+    if not bash_command:
+        return False
+    if "${TMPDIR:-" in bash_command or "$TMPDIR:-" in bash_command:
+        return True
+    if "/tmp/" in bash_command or "/dev/shm/" in bash_command:
+        return True
+    return False
+
+
 def validate_write_access(
     repo_root: Path,
     orchestration_id: str,
     agent_run_id: str,
     file_path: str,
     tool_name: str | None = None,
+    bash_command: str | None = None,
 ) -> HookDecision:
     """output manifest の allowed_output_paths に対して write/edit 対象を検証する。"""
     manifest_path = (
@@ -1010,6 +1030,35 @@ def validate_write_access(
                 path_is_allowed = True
     if not path_is_allowed:
         _tmpdir_hint = f"export TMPDIR from output_manifests/{agent_run_id}.json allowed_tmp_root first"
+        step0_skipped = _detect_tmpdir_step0_skipped(bash_command)
+        fix_hint_block: dict[str, Any] = {
+            # NOTE: must NOT suggest `python3 -c "import json; ..."` —
+            # that form is itself blocked by forbid_python_inline_write
+            # and would put the agent in a recovery loop. `jq -er` with
+            # `// empty` causes fail-fast (exit 1) on missing key/file.
+            "next_command": (
+                f"export TMPDIR=$(jq -er '.allowed_tmp_root // empty' "
+                f"\"workspace/orchestrations/{orchestration_id}"
+                f"/output_manifests/{agent_run_id}.json\")"
+            ),
+            "docs_ref": "docs/RUNBOOK.md#hook-recovery",
+            "note": _tmpdir_hint,
+        }
+        if step0_skipped:
+            # Strong signal: agent wrote `${TMPDIR:-fallback}` or hardcoded /tmp/
+            # → Step 0 (TMPDIR export from allowed_tmp_root) was clearly not run.
+            # Prepend a Step 0 reminder so the fix_hint reads as a recovery cheat-sheet
+            # specific to this failure mode rather than a generic write hint.
+            fix_hint_block["step0_skipped"] = True
+            fix_hint_block["note"] = (
+                "Step 0 (TMPDIR setup from allowed_tmp_root) was not executed before this "
+                "write. Run the next_command BELOW first, then re-issue the original write "
+                "under \"$TMPDIR/...\" (no ${TMPDIR:-fallback} syntax, no hardcoded /tmp/). "
+                "See skills/workflow-orchestration/references/startup_contract.md Step 0."
+            )
+            fix_hint_block["canonical_doc"] = (
+                "skills/workflow-orchestration/references/startup_contract.md#step-0--tmpdir-セットアップ必須先頭ステップ"
+            )
         return HookDecision(
             action=HookDecisionAction.BLOCK,
             reason=(
@@ -1023,19 +1072,7 @@ def validate_write_access(
                 "agent_run_id": agent_run_id,
                 "allowed_output_paths": allowed_paths,
                 "allowed_tmp_root": manifest.get("allowed_tmp_root", ""),
-                "fix_hint": {
-                    # NOTE: must NOT suggest `python3 -c "import json; ..."` —
-                    # that form is itself blocked by forbid_python_inline_write
-                    # and would put the agent in a recovery loop. `jq -er` with
-                    # `// empty` causes fail-fast (exit 1) on missing key/file.
-                    "next_command": (
-                        f"export TMPDIR=$(jq -er '.allowed_tmp_root // empty' "
-                        f"\"workspace/orchestrations/{orchestration_id}"
-                        f"/output_manifests/{agent_run_id}.json\")"
-                    ),
-                    "docs_ref": "docs/RUNBOOK.md#hook-recovery",
-                    "note": _tmpdir_hint,
-                },
+                "fix_hint": fix_hint_block,
             },
         )
     if tool_name in {"Edit", "Write", "apply_patch", "Bash"} and rel_target_norm not in allowed_file_tool_paths:

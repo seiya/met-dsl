@@ -23,7 +23,7 @@
 - `ordering` は `step_id` の列、または `before` / `after` を持つ dependency object の列として表現しなければならない。
 - `control_condition` は文字列、文字列配列、または object のいずれかで表現しなければならない。
 - `iteration_contract` は object とし、`execution_mode=iterative` の場合は空 object を禁止する。
-- `temporaries` は文字列配列、または `name` と任意の `shape_expr` を持つ object 配列として表現しなければならない。
+- `temporaries` は文字列配列、または `name` と `shape_expr` を持つ object 配列として表現しなければならない。`shape_expr` の許容形式は `spec/schema/plan/shape_expr.schema.json` を canonical source とし、`scalar` (case-insensitive) / `[d1, d2, ...]` / `(d1, d2, ...)` の 3 形式に限る。`vector(N)` / `matrix(M,N)` / `tensor` 等の関数呼び出し記法は禁止し、`Plan fail` とする。
 - `invariants` は非空文字列配列としなければならない。
 - `splitting_policy` は `kind` を持つ object としなければならない。
 - `execution_mode` は `sequence` / `conditional` / `iterative` / `columnwise` のみを許可する。
@@ -52,7 +52,7 @@
 - `verify substep` は `algorithm.resolved.yaml` の演算構成と `derived_contract.json` の検証契約を混在させてはならない。
 - `derived_contract.json` は `io_contract.inputs` と `io_contract.outputs` を必須保持し、`io_contract.outputs` は `name` と `evidence_ref` と `shape_expr` で判定対象出力の一次証跡参照を定義しなければならない。
 - `io_contract.outputs[].evidence_ref` が `raw/state_snapshots` を参照する場合、`raw_variables` を非空配列で必須記録し、各要素は `raw_requirements.required_evidence[].schema.variables[].name` または `time_variable` を参照しなければならない。
-- `io_contract.outputs[].evidence_ref` が `raw/state_snapshots` を参照し、`raw_variables` が単一の `state variable` または `time_variable` を指す場合、`io_contract.outputs[].shape_expr` は参照先 schema の `shape_expr` と一致しなければならない。
+- `io_contract.outputs[].evidence_ref` が `raw/state_snapshots` を参照し、`raw_variables` が単一の `state variable` または `time_variable` を指す場合、`io_contract.outputs[].shape_expr` は参照先 schema の `shape_expr` と一致しなければならない。`io_contract.inputs[].shape_expr` および `io_contract.outputs[].shape_expr` の許容形式は `temporaries[].shape_expr` と同じく `spec/schema/plan/shape_expr.schema.json` を canonical source とする。
 - `io_contract.outputs` で `evidence_ref` が `raw/state_snapshots` 以外を参照し、かつ `raw_requirements.required_evidence` で `artifact=state_snapshots` を必須宣言する場合、当該 `output` は `raw_variables`（非空配列）で再計算に必要な `raw/state_snapshots` 変数名を明示しなければならない。
 - `derived_contract.json` は `raw_requirements.required_evidence` を必須保持し、`artifact` と `required` と `min_samples` と `schema`（必要時）で `raw` 一次証跡の必須構成を定義しなければならない。
 - `derived_contract.json` は `test_evidence_requirements` を保持し、`tests.md` の各 `test_id` ごとに `required_raw_variables` を明示しなければならない。

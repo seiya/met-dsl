@@ -1663,6 +1663,67 @@ class FixHintInAuditDetailTests(unittest.TestCase):
         self.assertIn("docs_ref", fix_hint)
         self.assertIn("docs/RUNBOOK.md#hook-recovery", fix_hint["docs_ref"])
 
+    def test_fix_hint_step0_skipped_emphasized_when_tmpdir_fallback_in_bash(self) -> None:
+        """Regression: when the offending Bash command contains `${TMPDIR:-fallback}`
+        or hardcodes /tmp/, the fix_hint should mark step0_skipped=True and surface
+        the canonical_doc anchor for startup_contract.md Step 0. Validates the
+        bash_command-aware path in validate_write_access."""
+        from tools.hooks.common import validate_write_access
+        import tempfile
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._write_manifest(
+                repo_root,
+                orchestration_id="orchSTP",
+                agent_run_id="runSTP",
+                allowed_output_paths=["workspace/outputs/"],
+            )
+            decision = validate_write_access(
+                repo_root,
+                "orchSTP",
+                "runSTP",
+                '"',  # actual file_path the parser would extract from a stripped redirect
+                tool_name="Bash",
+                bash_command='cat > "${TMPDIR:-workspace/tmp/runSTP}/x.py" <<EOF\npass\nEOF',
+            )
+        self.assertEqual(decision.action, HookDecisionAction.BLOCK)
+        audit = decision.audit_detail or {}
+        self.assertEqual(audit.get("policy"), "output_manifest_write_guard")
+        fix_hint = audit.get("fix_hint") or {}
+        self.assertTrue(fix_hint.get("step0_skipped"))
+        self.assertIn("startup_contract.md", fix_hint.get("canonical_doc", ""))
+        self.assertIn("Step 0", fix_hint.get("note", ""))
+
+    def test_fix_hint_step0_skipped_absent_when_tmpdir_already_set(self) -> None:
+        """Negative regression: when no TMPDIR-fallback / hardcoded /tmp/ pattern
+        is present, the fix_hint must NOT mark step0_skipped (otherwise the hint
+        would mis-attribute writes that fail for unrelated reasons)."""
+        from tools.hooks.common import validate_write_access
+        import tempfile
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._write_manifest(
+                repo_root,
+                orchestration_id="orchSTP2",
+                agent_run_id="runSTP2",
+                allowed_output_paths=["workspace/outputs/"],
+            )
+            decision = validate_write_access(
+                repo_root,
+                "orchSTP2",
+                "runSTP2",
+                "workspace/bad/out.json",
+                tool_name="Bash",
+                bash_command='cat > "${TMPDIR}/x.py" <<EOF\npass\nEOF',
+            )
+        self.assertEqual(decision.action, HookDecisionAction.BLOCK)
+        audit = decision.audit_detail or {}
+        fix_hint = audit.get("fix_hint") or {}
+        self.assertFalse(fix_hint.get("step0_skipped"))
+        self.assertNotIn("canonical_doc", fix_hint)
+
     def test_bash_redirect_to_exact_pinned_path_requires_gate_provenance(self) -> None:
         """Fix 2: Bash heredoc/redirect to an exact-pinned allowed_output_paths
         target must be blocked unless the path is in allowed_file_tool_paths.

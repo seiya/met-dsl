@@ -51,9 +51,28 @@ update_semantics:
   update_order: sequential
 
 # temporaries: step 間でのみ生存する中間変数（spec 外・target 外）
+#
+# shape_expr の表現規則は spec/schema/plan/shape_expr.schema.json を canonical source とする。
+# 許容形式は次の 3 つに限る:
+#   - "scalar" (case-insensitive)              … 0 次元
+#   - "[d1, d2, ...]"  (bracket list form)     … 例: "[3]", "[nx, ny]"
+#   - "(d1, d2, ...)"  (paren tuple form)      … 例: "(d1, d2)", "(nx, ny, nz)"
+# 関数呼び出し記法 (vector(N) / matrix(M,N) / tensor 等) は validator が reject し Plan fail となる。
 temporaries:
   - name: guard_pass
     shape_expr: "scalar"
+  # 以下はマルチ次元 shape_expr の許容形式の参考例（このサンプルでは未使用）。
+  # - name: flux_vec_example
+  #   shape_expr: "[3]"            # OK: bracket list form
+  # - name: state_grid_example
+  #   shape_expr: "[nx, ny]"       # OK: 2 次元 grid
+  # - name: tensor_example
+  #   shape_expr: "(d1, d2, d3)"   # OK: paren tuple form
+  #
+  # 禁止例 (validate_pipeline_semantics でブロックされる):
+  #   shape_expr: "vector(3)"      # NG: 関数呼び出し記法 → "[3]" を使う
+  #   shape_expr: "matrix(3,3)"    # NG: 同上 → "[3, 3]" を使う
+  #   shape_expr: "tensor"         # NG: 列挙外 token
 
 derived_field_rules: []
 

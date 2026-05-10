@@ -1,0 +1,54 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "spec/schema/plan/shape_expr.schema.json",
+  "title": "shape_expr representation rule",
+  "description": "Canonical representation rule for shape_expr fields appearing in algorithm.resolved.yaml (temporaries[].shape_expr, state_variables[].shape_expr) and derived_contract.json (io_contract.inputs[].shape_expr, io_contract.outputs[].shape_expr). The validator tools/validate_pipeline_semantics.py loads this schema at module init and rejects any value that does not match one of the oneOf branches. Function-call style notations such as vector(N), matrix(M,N), tensor are explicitly forbidden; use [N] or (M,N) instead.",
+  "type": "string",
+  "oneOf": [
+    {
+      "title": "scalar literal",
+      "x-shape-form": "scalar",
+      "description": "The literal token 'scalar' (case-insensitive). Use for 0-dimensional / single-value temporaries.",
+      "pattern": "^[Ss][Cc][Aa][Ll][Aa][Rr]$"
+    },
+    {
+      "title": "bracket list form",
+      "x-shape-form": "list",
+      "description": "Comma-separated dimensions enclosed in square brackets. Each dimension token must be either an integer literal (\\d+) or an identifier-style symbol ([A-Za-z_][A-Za-z0-9_]*). Function-call notation, parens, and other punctuation inside dimension tokens are forbidden. Example: [3], [nx, ny], [Nz, Nx, Ny].",
+      "pattern": "^\\[\\s*(?:[0-9]+|[A-Za-z_][A-Za-z0-9_]*)(?:\\s*,\\s*(?:[0-9]+|[A-Za-z_][A-Za-z0-9_]*))*\\s*\\]$"
+    },
+    {
+      "title": "paren tuple form",
+      "x-shape-form": "tuple",
+      "description": "Comma-separated dimensions enclosed in parentheses. Each dimension token must be either an integer literal (\\d+) or an identifier-style symbol ([A-Za-z_][A-Za-z0-9_]*). Function-call notation, parens, and other punctuation inside dimension tokens are forbidden. Example: (d1,d2), (nx, ny, nz).",
+      "pattern": "^\\(\\s*(?:[0-9]+|[A-Za-z_][A-Za-z0-9_]*)(?:\\s*,\\s*(?:[0-9]+|[A-Za-z_][A-Za-z0-9_]*))*\\s*\\)$"
+    }
+  ],
+  "examples": [
+    "scalar",
+    "[3]",
+    "[nx, ny]",
+    "[Nz, Nx, Ny]",
+    "(d1, d2)",
+    "(nx, ny, nz)"
+  ],
+  "x-forbidden-examples": [
+    "vector(3)",
+    "matrix(3,3)",
+    "tensor",
+    "Vector",
+    "[3, ]",
+    "[]",
+    "()",
+    "[vector(3)]",
+    "[matrix(3,3)]",
+    "[3, vector(2)]",
+    "(d1, matrix(2,2))",
+    "[1+2]",
+    "[3.0]",
+    "[-3]"
+  ],
+  "x-forbidden-examples-note": "Single-element paren tuples such as (tensor) or (d1) are NOT forbidden; they are valid 1-D paren-tuple shapes whose single dimension token is an identifier. Forbidden cases above all involve function-call notation (vector(N), matrix(M,N)), float/arithmetic literals, or empty/malformed tokens.",
+  "x-canonical-validator": "tools/validate_pipeline_semantics.py:_parse_shape_expr",
+  "x-canonical-doc": "docs/workflow/phases/phase_01_plan.md"
+}

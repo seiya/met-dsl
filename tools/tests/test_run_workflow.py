@@ -5,18 +5,36 @@ from __future__ import annotations
 
 import io
 import json
+import os
+import subprocess
+import sys
 import tempfile
 import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
 
 from tools import run_workflow
+from tools.validate_pipeline_semantics import _BUNDLED_SHAPE_EXPR_SCHEMA_PATH
+
+
+def _seed_shape_expr_schema_into(repo_root: Path) -> None:
+    """Copy the validator-bundled shape_expr.schema.json into a tmp repo so
+    `run_workflow.main()`'s startup assertion (canonical schema must exist
+    at <repo_root>/spec/schema/plan/shape_expr.schema.json) passes for tests
+    that exercise normal main() flows. Tests that intentionally exercise the
+    missing-schema path must NOT call this helper."""
+    target = repo_root / "spec" / "schema" / "plan" / "shape_expr.schema.json"
+    if target.is_file():
+        return
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(_BUNDLED_SHAPE_EXPR_SCHEMA_PATH.read_bytes())
 
 
 class RunWorkflowTests(unittest.TestCase):
     def test_collect_failure_analysis_includes_unauthorized_write_violation(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
+            _seed_shape_expr_schema_into(repo_root)
             orch_root = repo_root / "workspace" / "orchestrations" / "orch_vio"
             violations = orch_root / "violations"
             violations.mkdir(parents=True, exist_ok=True)
@@ -44,6 +62,7 @@ class RunWorkflowTests(unittest.TestCase):
     def test_discover_source_dependency_ref_from_file_spec_ref(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
+            _seed_shape_expr_schema_into(repo_root)
             spec_dir = repo_root / "spec" / "problem"
             spec_dir.mkdir(parents=True, exist_ok=True)
             (spec_dir / "test.md").write_text("spec\n", encoding="utf-8")
@@ -55,6 +74,7 @@ class RunWorkflowTests(unittest.TestCase):
     def test_discover_source_dependency_ref_from_directory_spec_ref(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
+            _seed_shape_expr_schema_into(repo_root)
             spec_dir = repo_root / "spec" / "problem"
             spec_dir.mkdir(parents=True, exist_ok=True)
             (spec_dir / "deps.yaml").write_text("nodes: []\n", encoding="utf-8")
@@ -65,6 +85,7 @@ class RunWorkflowTests(unittest.TestCase):
     def test_discover_source_dependency_ref_from_spec_root_file(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
+            _seed_shape_expr_schema_into(repo_root)
             spec_dir = repo_root / "spec"
             spec_dir.mkdir(parents=True, exist_ok=True)
             (spec_dir / "task.md").write_text("spec\n", encoding="utf-8")
@@ -76,6 +97,7 @@ class RunWorkflowTests(unittest.TestCase):
     def test_discover_source_dependency_ref_rejects_missing_deps_yaml(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
+            _seed_shape_expr_schema_into(repo_root)
             spec_dir = repo_root / "spec" / "problem"
             spec_dir.mkdir(parents=True, exist_ok=True)
             (spec_dir / "test.md").write_text("spec\n", encoding="utf-8")
@@ -179,6 +201,7 @@ class RunWorkflowTests(unittest.TestCase):
     def test_main_writes_prompt_file(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
+            _seed_shape_expr_schema_into(repo_root)
             (repo_root / "tools").mkdir(parents=True, exist_ok=True)
             (repo_root / "workspace").mkdir(parents=True, exist_ok=True)
             (repo_root / "spec" / "problem").mkdir(parents=True, exist_ok=True)
@@ -238,9 +261,150 @@ class RunWorkflowTests(unittest.TestCase):
             prompt_text = prompt_path.read_text(encoding="utf-8")
             self.assertIn("orchestration_agent_run_id: `orch_agent_run_001`", prompt_text)
 
+    def test_direct_script_invocation_does_not_crash_on_module_import(self) -> None:
+        """Regression: `python3 tools/run_workflow.py ...` is the canonical
+        entrypoint per CLAUDE.md. Under direct-script invocation `sys.path[0]`
+        is `tools/`, NOT the repo root, so `from tools.X import Y` raises
+        `ModuleNotFoundError` unless the script bootstraps `sys.path` first.
+        Previously the new schema-load guard imported `tools.validate_pipeline_semantics`
+        without that bootstrap, crashing direct-CLI invocation with a raw
+        traceback instead of the intended structured failure. This test
+        spawns the actual subprocess to exercise the real direct-script
+        codepath that `run_workflow.main()` from in-process import would
+        otherwise mask."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            # Build a minimal valid spec so we reach the schema guard.
+            (repo_root / "spec" / "problem").mkdir(parents=True, exist_ok=True)
+            (repo_root / "spec" / "problem" / "test.md").write_text("spec\n", encoding="utf-8")
+            (repo_root / "spec" / "problem" / "deps.yaml").write_text("nodes: []\n", encoding="utf-8")
+            # Deliberately omit the canonical schema so the guard fires.
+            run_workflow_path = (
+                Path(__file__).resolve().parent.parent / "run_workflow.py"
+            )
+            # Strip PYTHONPATH so the subprocess only has its own bootstrap.
+            env = {k: v for k, v in os.environ.items() if k != "PYTHONPATH"}
+            proc = subprocess.run(
+                [
+                    sys.executable,
+                    str(run_workflow_path),
+                    "spec/problem/test.md",
+                    "build",
+                    "--repo-root", str(repo_root),
+                    "--orchestration-id", "orch_direct_cli",
+                    "--no-invoke-llm",
+                ],
+                cwd=str(repo_root),
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+        # Must NOT crash with a Python traceback (ModuleNotFoundError or otherwise).
+        self.assertNotIn(
+            "Traceback",
+            proc.stderr,
+            f"direct-CLI invocation must not produce a traceback; stderr:\n{proc.stderr}",
+        )
+        self.assertEqual(
+            proc.returncode, 2,
+            f"expected exit 2 (structured fail); stdout:\n{proc.stdout}\nstderr:\n{proc.stderr}",
+        )
+        # Must emit structured JSON identifying the schema gap.
+        last_line = proc.stdout.strip().splitlines()[-1]
+        payload = json.loads(last_line)
+        self.assertEqual(payload["status"], "fail")
+        self.assertEqual(payload["reason"], "missing_canonical_schema")
+        self.assertIn("shape_expr.schema.json", payload["missing_path"])
+
+    def test_main_fails_fast_when_canonical_schema_missing(self) -> None:
+        """Regression: tools/run_workflow.py must abort BEFORE init/preflight
+        if `<repo_root>/spec/schema/plan/shape_expr.schema.json` is missing,
+        because validate_pipeline_semantics is now fail-closed under repo
+        scope and would otherwise collapse every downstream phase gate with
+        `schema_load_failed` after orchestration state has already been
+        mutated. Emits structured `missing_canonical_schema` JSON on stdout."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            # Deliberately do NOT seed the schema (this test exercises absence).
+            (repo_root / "spec" / "problem").mkdir(parents=True, exist_ok=True)
+            (repo_root / "spec" / "problem" / "test.md").write_text("spec\n", encoding="utf-8")
+            (repo_root / "spec" / "problem" / "deps.yaml").write_text("nodes: []\n", encoding="utf-8")
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                code = run_workflow.main(
+                    [
+                        "spec/problem/test.md",
+                        "build",
+                        "--repo-root", str(repo_root),
+                        "--orchestration-id", "orch_no_schema",
+                        "--no-invoke-llm",
+                    ]
+                )
+            output = buf.getvalue()
+        self.assertEqual(code, 2)
+        # Verify structured JSON output with the right reason code.
+        payload = json.loads(output.strip().splitlines()[-1])
+        self.assertEqual(payload["status"], "fail")
+        self.assertEqual(payload["reason"], "missing_canonical_schema")
+        self.assertIn("spec/schema/plan/shape_expr.schema.json", payload["missing_path"])
+        # Critical: orchestration state must NOT have been created — the
+        # check must run before init().
+        self.assertFalse(
+            (repo_root / "workspace" / "orchestrations").exists(),
+            "init/preflight must not run before the schema-existence check",
+        )
+
+    def test_main_fails_fast_when_canonical_schema_is_malformed(self) -> None:
+        """Regression: the startup guard must surface NOT only missing-file
+        but also malformed JSON, invalid regex, and structural-classifier
+        failures BEFORE any orchestration state mutation. Previously the
+        guard only did `is_file()`, so a corrupted schema slipped through and
+        crashed mid-phase after `workspace/tmp/<arid>/` was already created."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            schema_dir = repo_root / "spec" / "schema" / "plan"
+            schema_dir.mkdir(parents=True)
+            # Schema EXISTS as a file but has malformed JSON.
+            (schema_dir / "shape_expr.schema.json").write_text(
+                "{ this is not json", encoding="utf-8"
+            )
+            (repo_root / "spec" / "problem").mkdir(parents=True, exist_ok=True)
+            (repo_root / "spec" / "problem" / "test.md").write_text("spec\n", encoding="utf-8")
+            (repo_root / "spec" / "problem" / "deps.yaml").write_text("nodes: []\n", encoding="utf-8")
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                code = run_workflow.main(
+                    [
+                        "spec/problem/test.md",
+                        "build",
+                        "--repo-root", str(repo_root),
+                        "--orchestration-id", "orch_corrupt_schema",
+                        "--no-invoke-llm",
+                    ]
+                )
+            output = buf.getvalue()
+        self.assertEqual(code, 2)
+        payload = json.loads(output.strip().splitlines()[-1])
+        self.assertEqual(payload["status"], "fail")
+        self.assertEqual(payload["reason"], "missing_canonical_schema")
+        # Detail must surface the underlying parse error so operators can fix
+        # the schema rather than just learning "something is wrong".
+        self.assertIn("malformed JSON", payload["detail"])
+        # Critical: NO orchestration state was touched.
+        self.assertFalse(
+            (repo_root / "workspace" / "orchestrations").exists(),
+            "init/preflight must not run before the schema-load check",
+        )
+        self.assertFalse(
+            (repo_root / "workspace" / "tmp").exists(),
+            "workspace/tmp must not be created before the schema-load check",
+        )
+
     def test_main_fails_when_spec_ref_does_not_exist(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
+            _seed_shape_expr_schema_into(repo_root)
             code = run_workflow.main(
                 [
                     "spec/problem/missing.md",
@@ -257,6 +421,7 @@ class RunWorkflowTests(unittest.TestCase):
     def test_main_returns_structured_error_when_init_runtime_fails(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
+            _seed_shape_expr_schema_into(repo_root)
             (repo_root / "tools").mkdir(parents=True, exist_ok=True)
             (repo_root / "workspace").mkdir(parents=True, exist_ok=True)
             (repo_root / "spec" / "problem").mkdir(parents=True, exist_ok=True)
@@ -298,6 +463,7 @@ class RunWorkflowTests(unittest.TestCase):
     def test_main_returns_structured_error_when_preflight_runtime_fails(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
+            _seed_shape_expr_schema_into(repo_root)
             (repo_root / "tools").mkdir(parents=True, exist_ok=True)
             (repo_root / "workspace").mkdir(parents=True, exist_ok=True)
             (repo_root / "spec" / "problem").mkdir(parents=True, exist_ok=True)
@@ -344,6 +510,7 @@ class RunWorkflowTests(unittest.TestCase):
     def test_main_returns_structured_error_when_init_result_lacks_orchestration_agent_run_id(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
+            _seed_shape_expr_schema_into(repo_root)
             (repo_root / "tools").mkdir(parents=True, exist_ok=True)
             (repo_root / "workspace").mkdir(parents=True, exist_ok=True)
             (repo_root / "spec" / "problem").mkdir(parents=True, exist_ok=True)
@@ -385,6 +552,7 @@ class RunWorkflowTests(unittest.TestCase):
     def test_main_dev_mode_writes_failure_analysis_on_llm_failure(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
+            _seed_shape_expr_schema_into(repo_root)
             (repo_root / "tools").mkdir(parents=True, exist_ok=True)
             (repo_root / "workspace").mkdir(parents=True, exist_ok=True)
             (repo_root / "spec" / "problem").mkdir(parents=True, exist_ok=True)
@@ -446,6 +614,7 @@ class RunWorkflowTests(unittest.TestCase):
     def test_main_resolves_dependency_ref_from_spec_deps_yaml(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
+            _seed_shape_expr_schema_into(repo_root)
             (repo_root / "tools").mkdir(parents=True, exist_ok=True)
             (repo_root / "workspace").mkdir(parents=True, exist_ok=True)
             (repo_root / "spec" / "problem").mkdir(parents=True, exist_ok=True)
@@ -499,6 +668,7 @@ class RunWorkflowTests(unittest.TestCase):
     def test_main_fails_when_dependency_ref_cannot_be_resolved(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
+            _seed_shape_expr_schema_into(repo_root)
             (repo_root / "tools").mkdir(parents=True, exist_ok=True)
             (repo_root / "workspace").mkdir(parents=True, exist_ok=True)
             (repo_root / "spec" / "problem").mkdir(parents=True, exist_ok=True)

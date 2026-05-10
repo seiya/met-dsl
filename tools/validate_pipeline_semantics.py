@@ -9,9 +9,12 @@ import json
 import re
 
 import yaml
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 try:
     from tools.meta_contracts import (
@@ -105,8 +108,253 @@ FORBIDDEN_QUALITY_CHECK_EXECUTABLES = {"python", "python3", "pypy", "bash", "sh"
 MAKE_QUALITY_CHECK_REQUIRED_LANGUAGES = {"fortran", "c", "cpp", "mixed"}
 TEST_ID_HEADING_PATTERN = re.compile(r"^###\s+\d+-\d+\.\s+`([^`]+)`\s*$")
 TEST_OUTCOME_VALUES = {"pass", "fail", "xfail", "skipped", "blocked"}
-BRACKET_SHAPE_EXPR_PATTERN = re.compile(r"^\[\s*([^\]]+?)\s*\]$")
-PAREN_SHAPE_EXPR_PATTERN = re.compile(r"^\(\s*([^\)]+?)\s*\)$")
+# Bundled schema lives next to this validator; used as the canonical fallback
+# when no target repo_root is in scope (tests, ad-hoc invocation) and as the
+# default canonical reference for the validator's pinned rules.
+_BUNDLED_SHAPE_EXPR_SCHEMA_PATH = (
+    Path(__file__).resolve().parent.parent
+    / "spec" / "schema" / "plan" / "shape_expr.schema.json"
+)
+# Active repo_root for schema resolution. Set by main() via --repo-root and by
+# stage-level entry points (validate, validate_plan_stage, ...). When set, the
+# target repo's spec/schema/... is preferred over the validator bundle, so a
+# repo with diverged shape_expr rules is validated against ITS rules rather
+# than the validator-installation's bundled copy.
+_active_repo_root_for_schema: ContextVar["Path | None"] = ContextVar(
+    "_active_repo_root_for_schema", default=None
+)
+# Strip outer brackets/parens to expose the comma-separated body. The
+# inner grammar (what each dim token may look like) is owned entirely by
+# the active schema's list-form regex — this split is just a syntactic
+# extractor for downstream binding/equality logic.
+_SHAPE_EXPR_DIM_SPLIT = re.compile(r"^[\[\(]\s*(.+?)\s*[\]\)]$")
+
+
+
+@contextmanager
+def _pinned_repo_root_for_schema(repo_root: "Path | None") -> Iterator[None]:
+    """Scope `_active_repo_root_for_schema` to `repo_root` for the duration of
+    the with-block, then reset to the previous value via the captured token.
+
+    Use this at every public validator entrypoint that accepts a `repo_root`
+    so schema resolution is bound to the caller's intent rather than ambient
+    process-global state. Without scoped reset, consecutive in-process calls
+    against different repo roots would leak the first repo's context into
+    subsequent validations.
+    """
+    token = _active_repo_root_for_schema.set(repo_root)
+    try:
+        yield
+    finally:
+        _active_repo_root_for_schema.reset(token)
+
+
+def _resolve_shape_expr_schema_path(repo_root: "Path | None" = None) -> Path:
+    """Resolve the canonical shape_expr.schema.json for the active validation.
+
+    Resolution rules (fail-closed when scope is in effect):
+      - If `repo_root` is provided OR `_active_repo_root_for_schema` is set,
+        the validation has a target repo in scope. Require the target's
+        `<repo_root>/spec/schema/plan/shape_expr.schema.json`. If it is
+        missing, raise `RuntimeError` instead of silently falling back to
+        the validator bundle — the caller (CLI main) converts this into a
+        structured `pipeline semantic validation: FAIL` violation. Falling
+        back here would let partial deploys, bad rebases, or repo-specific
+        rule changes validate against the wrong rule set.
+      - If neither is set (library / ad-hoc / unit-test invocation with no
+        target repo), the validator-bundled schema is used. This covers
+        `_parse_shape_expr` calls that originate from tests or other tools
+        importing the validator without a target repo.
+
+    Explicit `repo_root` takes priority over the active context when both
+    are set (caller intent wins).
+    """
+    chosen: Path | None = None
+    if repo_root is not None:
+        chosen = repo_root
+    else:
+        active = _active_repo_root_for_schema.get()
+        if active is not None:
+            chosen = active
+    if chosen is not None:
+        candidate = chosen / "spec" / "schema" / "plan" / "shape_expr.schema.json"
+        if not candidate.is_file():
+            raise RuntimeError(
+                f"shape_expr schema not found at {candidate}. "
+                "Canonical source: spec/schema/plan/shape_expr.schema.json. "
+                "When a repo_root is in scope (--repo-root or active context), "
+                "the target repo must ship this schema; the validator bundle is "
+                "not used as a silent fallback."
+            )
+        return candidate
+    return _BUNDLED_SHAPE_EXPR_SCHEMA_PATH
+
+
+@lru_cache(maxsize=8)
+def _load_shape_expr_patterns_by_mtime(
+    schema_path_str: str,
+    mtime_ns: int,  # noqa: ARG001 — used only as a cache-busting key
+) -> tuple[tuple[re.Pattern[str], ...], tuple[re.Pattern[str], ...]]:
+    """Internal mtime-keyed cache. The mtime arg invalidates the entry when
+    the schema file content changes at the same path (rebases, branch
+    switches, schema repairs) within a long-lived process. Without this,
+    the loader would memoize a stale or previously-broken parse.
+    """
+    schema_path = Path(schema_path_str)
+    try:
+        schema_text = schema_path.read_text(encoding="utf-8")
+    except FileNotFoundError as exc:
+        raise RuntimeError(
+            f"shape_expr schema not found at {schema_path}. "
+            "Canonical source: spec/schema/plan/shape_expr.schema.json"
+        ) from exc
+    except OSError as exc:
+        raise RuntimeError(
+            f"shape_expr schema {schema_path} is unreadable: {exc}. "
+            "Canonical source: spec/schema/plan/shape_expr.schema.json"
+        ) from exc
+    try:
+        schema = json.loads(schema_text)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(
+            f"shape_expr schema {schema_path} is malformed JSON: {exc}. "
+            "Canonical source: spec/schema/plan/shape_expr.schema.json"
+        ) from exc
+    # Structural validation: every malformed-but-valid-JSON case must produce
+    # a RuntimeError so callers (CLI main + run_workflow startup guard) emit
+    # structured failure output instead of an opaque AttributeError traceback.
+    if not isinstance(schema, dict):
+        raise RuntimeError(
+            f"shape_expr schema {schema_path} top-level must be a JSON object "
+            f"(got {type(schema).__name__})"
+        )
+    if "oneOf" not in schema:
+        raise RuntimeError(
+            f"shape_expr schema {schema_path} must declare a top-level 'oneOf' array"
+        )
+    branches = schema["oneOf"]
+    if not isinstance(branches, list):
+        raise RuntimeError(
+            f"shape_expr schema {schema_path} 'oneOf' must be a JSON array "
+            f"(got {type(branches).__name__})"
+        )
+    # Classify each branch by what shape category it expresses. Two paths:
+    #
+    #   1. Explicit metadata via `x-shape-form` (recommended): one of
+    #      "scalar" | "list" | "tuple". This is grammar-agnostic — the
+    #      schema author asserts the structural category and the loader
+    #      trusts that assertion. Treats list and tuple as equivalent
+    #      "list-form" categories internally (the parser strips outer
+    #      delimiters and operates on the comma-separated body identically).
+    #
+    #   2. Probe-based fallback (when `x-shape-form` is absent): try a rich
+    #      probe set so id-only schemas (`[nx]` / `(ny)`), digit-only
+    #      schemas (`[1]`/`(1)`), and mixed schemas all classify correctly.
+    #      A branch matches a probe set iff its regex `fullmatch`es ANY
+    #      probe in the set; the broader probe set avoids hard-failing
+    #      otherwise-valid repo-local grammars that exclude integer
+    #      literals or identifier literals.
+    _SCALAR_PROBES = ("scalar", "Scalar", "SCALAR")
+    _LIST_PROBES = (
+        "[1]", "[a]", "[A]", "[Nx]", "[1,2]", "[a,b]", "[Nx,Ny]",
+        "(1)", "(a)", "(A)", "(Nx)", "(1,2)", "(a,b)", "(Nx,Ny)",
+    )
+    _ALLOWED_SHAPE_FORM_VALUES = {"scalar", "list", "tuple"}
+    scalar_pats: list[re.Pattern[str]] = []
+    list_form_pats: list[re.Pattern[str]] = []
+    for branch_idx, branch in enumerate(branches):
+        if not isinstance(branch, dict):
+            raise RuntimeError(
+                f"shape_expr schema {schema_path} 'oneOf'[{branch_idx}] must be a JSON object "
+                f"(got {type(branch).__name__})"
+            )
+        pat = branch.get("pattern")
+        if not isinstance(pat, str) or not pat:
+            raise RuntimeError(
+                f"shape_expr schema {schema_path} 'oneOf'[{branch_idx}].pattern must be a non-empty string"
+            )
+        try:
+            compiled = re.compile(pat)
+        except re.error as exc:
+            raise RuntimeError(
+                f"shape_expr schema {schema_path} contains invalid regex {pat!r}: {exc}"
+            ) from exc
+        explicit_form_raw = branch.get("x-shape-form")
+        if explicit_form_raw is not None:
+            if not isinstance(explicit_form_raw, str):
+                raise RuntimeError(
+                    f"shape_expr schema {schema_path} 'oneOf'[{branch_idx}].x-shape-form "
+                    f"must be a string (got {type(explicit_form_raw).__name__})"
+                )
+            explicit_form = explicit_form_raw.strip().lower()
+            if explicit_form not in _ALLOWED_SHAPE_FORM_VALUES:
+                raise RuntimeError(
+                    f"shape_expr schema {schema_path} 'oneOf'[{branch_idx}].x-shape-form "
+                    f"must be one of {sorted(_ALLOWED_SHAPE_FORM_VALUES)} (got {explicit_form_raw!r})"
+                )
+            if explicit_form == "scalar":
+                scalar_pats.append(compiled)
+            else:
+                list_form_pats.append(compiled)
+            continue
+        # Fallback: probe-based classification
+        if any(compiled.fullmatch(probe) for probe in _SCALAR_PROBES):
+            scalar_pats.append(compiled)
+        elif any(compiled.fullmatch(probe) for probe in _LIST_PROBES):
+            list_form_pats.append(compiled)
+        else:
+            raise RuntimeError(
+                f"shape_expr schema {schema_path} oneOf branch with pattern {pat!r} "
+                "matches no probe in the canonical set (scalar literal, or "
+                "bracket/paren shape with integer or identifier dim tokens); "
+                "set 'x-shape-form' to 'scalar' | 'list' | 'tuple' to disambiguate explicitly"
+            )
+    if not scalar_pats or not list_form_pats:
+        raise RuntimeError(
+            f"shape_expr schema {schema_path} must declare at least one scalar branch "
+            "and at least one list/tuple-form branch"
+        )
+    return tuple(scalar_pats), tuple(list_form_pats)
+
+
+def _load_shape_expr_patterns_cached(
+    schema_path_str: str,
+) -> tuple[tuple[re.Pattern[str], ...], tuple[re.Pattern[str], ...]]:
+    """Public schema loader. Stats the file to derive mtime then delegates
+    to the mtime-keyed cache so file-content changes at the same path are
+    observed within a single process (rebases, repairs, branch switches).
+
+    Stat errors are mapped to `RuntimeError` for caller compatibility — the
+    CLI / run_workflow guards only catch `RuntimeError`.
+    """
+    schema_path = Path(schema_path_str)
+    try:
+        mtime_ns = schema_path.stat().st_mtime_ns
+    except FileNotFoundError as exc:
+        raise RuntimeError(
+            f"shape_expr schema not found at {schema_path}. "
+            "Canonical source: spec/schema/plan/shape_expr.schema.json"
+        ) from exc
+    except OSError as exc:
+        raise RuntimeError(
+            f"shape_expr schema {schema_path} is unreadable: {exc}. "
+            "Canonical source: spec/schema/plan/shape_expr.schema.json"
+        ) from exc
+    return _load_shape_expr_patterns_by_mtime(schema_path_str, mtime_ns)
+
+
+# Expose `cache_clear` so existing test code (and operators that need to
+# force a reload, e.g. after editing the bundled schema) keeps working.
+_load_shape_expr_patterns_cached.cache_clear = (  # type: ignore[attr-defined]
+    _load_shape_expr_patterns_by_mtime.cache_clear
+)
+
+
+def _get_shape_expr_patterns(
+    repo_root: "Path | None" = None,
+) -> tuple[tuple[re.Pattern[str], ...], tuple[re.Pattern[str], ...]]:
+    schema_path = _resolve_shape_expr_schema_path(repo_root)
+    return _load_shape_expr_patterns_cached(str(schema_path))
 REQUIRED_WORKFLOW_STEPS = ("plan", "generate", "build", "execute", "judge")
 SUBSTEP_WORKFLOW_STEPS = frozenset({"plan", "generate", "tune"})
 AGENT_TERMINAL_STATUSES = {"pass", "fail", "blocked", "timeout", "cancel"}
@@ -1451,14 +1699,18 @@ def _validate_raw_evidence(
                                     state_variables.append(name)
                                     state_variable_shapes[name] = _canonical_shape_expr(raw_shape_expr)
 
-                        raw_state_vars = schema_data.get("state_variables")
+                        # Reject the legacy `state_variables: [name, ...]`
+                        # shorthand: it left snapshot shape unconstrained,
+                        # which let corrupted/wrong-rank payloads pass through
+                        # to pre_judge undetected. The canonical form is
+                        # `variables: [{name, shape_expr}, ...]` with explicit
+                        # per-variable shape_expr.
+                        if "state_variables" in schema_data:
+                            violations.append(
+                                f"{schema_path}: 'state_variables' shorthand is not supported; "
+                                "use 'variables: [{name, shape_expr}, ...]' with explicit per-variable shape_expr"
+                            )
                         raw_time_var = schema_data.get("time_variable")
-                        if isinstance(raw_state_vars, list):
-                            for item in raw_state_vars:
-                                if isinstance(item, str) and item.strip():
-                                    token = item.strip()
-                                    state_variables.append(token)
-                                    state_variable_shapes.setdefault(token, "[*]")
                         if isinstance(raw_time_var, str) and raw_time_var.strip():
                             time_variable = raw_time_var.strip()
                         raw_time_shape = schema_data.get("time_shape_expr")
@@ -1471,7 +1723,8 @@ def _validate_raw_evidence(
 
                     if not state_variables:
                         violations.append(
-                            f"{schema_path}: variables/state_variables must be non-empty"
+                            f"{schema_path}: variables must be a non-empty list of "
+                            "{name, shape_expr} objects"
                         )
                     if not time_variable:
                         violations.append(
@@ -2451,20 +2704,46 @@ def _find_command_log_record(
 
 
 def _parse_shape_expr(expr: str) -> tuple[bool, list[str], str]:
+    """Validate shape_expr against spec/schema/plan/shape_expr.schema.json.
+
+    Allowed forms (canonical source: spec/schema/plan/shape_expr.schema.json):
+      - "scalar" (case-insensitive)
+      - "[d1, d2, ...]" with non-empty dim tokens
+      - "(d1, d2, ...)" with non-empty dim tokens
+
+    Function-call notation such as "vector(3)" / "matrix(M,N)" / "tensor" is rejected.
+    """
     token = expr.strip()
     if not token:
         return False, [], "shape_expr must be non-empty"
-    if token.lower() == "scalar":
-        return True, [], ""
-
-    match = BRACKET_SHAPE_EXPR_PATTERN.fullmatch(token)
-    if match is None:
-        match = PAREN_SHAPE_EXPR_PATTERN.fullmatch(token)
-    if match is None:
-        return False, [], "shape_expr must be scalar or [dim1,dim2,...] or (dim1,dim2,...)"
-
+    scalar_patterns, list_form_patterns = _get_shape_expr_patterns()
+    for pat in scalar_patterns:
+        if pat.fullmatch(token):
+            return True, [], ""
+    matched = False
+    for pat in list_form_patterns:
+        if pat.fullmatch(token):
+            matched = True
+            break
+    if not matched:
+        return (
+            False,
+            [],
+            "shape_expr must be scalar or [dim1,dim2,...] or (dim1,dim2,...). "
+            "See spec/schema/plan/shape_expr.schema.json for canonical forms; "
+            "function-call notations such as vector(N), matrix(M,N), tensor are forbidden.",
+        )
+    body_match = _SHAPE_EXPR_DIM_SPLIT.fullmatch(token)
+    if body_match is None:  # pragma: no cover - schema pattern guarantees match
+        return False, [], "shape_expr internal parse error"
     dims: list[str] = []
-    for raw_dim in match.group(1).split(","):
+    # Per-token grammar is owned by the schema's regex (the list-form
+    # branch already encodes which dim-token forms are accepted). The
+    # parser only extracts components and rejects empty splits as a
+    # safety net — it does NOT re-validate token shape, because doing so
+    # would shadow the schema and create a drift hazard if a repo-local
+    # schema legitimately evolves the accepted dim-token grammar.
+    for raw_dim in body_match.group(1).split(","):
         dim = raw_dim.strip()
         if not dim:
             return False, [], "shape_expr has empty dimension token"
@@ -2473,12 +2752,21 @@ def _parse_shape_expr(expr: str) -> tuple[bool, list[str], str]:
 
 
 def _canonical_shape_expr(expr: str) -> str:
+    """Normalize a shape_expr string for cross-artifact equality comparison.
+
+    Identifier-style dim tokens are case-SENSITIVE: `Nx` and `nx` are
+    distinct identifiers (matches Python identifier semantics, which the
+    schema's regex allows). Only the literal scalar form is normalized to
+    lowercase `"scalar"`, since the schema explicitly defines that form
+    case-insensitively (`^[Ss][Cc][Aa][Ll][Aa][Rr]$`). Whitespace inside
+    list/paren forms is collapsed.
+    """
     ok, dims, _ = _parse_shape_expr(expr)
     if not ok:
-        return expr.strip().lower()
+        return expr.strip()
     if not dims:
         return "scalar"
-    return "[" + ",".join(dim.lower() for dim in dims) + "]"
+    return "[" + ",".join(dim for dim in dims) + "]"
 
 
 def _infer_json_shape(value: Any) -> list[int] | None:
@@ -2499,6 +2787,19 @@ def _infer_json_shape(value: Any) -> list[int] | None:
 
 
 def _shape_matches_expr(shape_expr: str, actual_shape: list[int]) -> bool:
+    """Match a parsed shape_expr against an observed shape list.
+
+    Token semantics:
+      - integer literal (e.g. "3"): must equal `actual_dim` exactly.
+      - identifier-style symbol (e.g. "nx"): binds to `actual_dim` on first
+        occurrence; subsequent occurrences of the SAME identifier in the same
+        shape_expr must observe the same value (so `[n,n]` requires a square
+        shape, `[nx,ny]` accepts any rectangular shape, `[nx,nx]` requires
+        equal extents).
+      - The legacy "*" wildcard token is no longer producible by `_parse_shape_expr`
+        because the active schema's list-form regex rejects it, so this matcher
+        does not special-case it.
+    """
     ok, dims, _ = _parse_shape_expr(shape_expr)
     if not ok:
         return False
@@ -2506,15 +2807,25 @@ def _shape_matches_expr(shape_expr: str, actual_shape: list[int]) -> bool:
         return actual_shape == []
     if len(dims) != len(actual_shape):
         return False
+    bindings: dict[str, int] = {}
     for expected_dim, actual_dim in zip(dims, actual_shape):
-        token = expected_dim.strip().lower()
-        if token == "*":
-            continue
+        # Case-SENSITIVE token: `Nx` and `nx` are treated as distinct
+        # identifiers (matches Python identifier semantics that the schema
+        # regex accepts). Lowercasing here would silently merge these into
+        # a single binding and over-constrain shape contracts.
+        token = expected_dim.strip()
         if token.isdigit():
             if int(token) != actual_dim:
                 return False
             continue
+        # Symbolic identifier — bind on first occurrence, enforce equality on
+        # subsequent occurrences. Negative actual extents are never valid.
         if actual_dim < 0:
+            return False
+        prev = bindings.get(token)
+        if prev is None:
+            bindings[token] = actual_dim
+        elif prev != actual_dim:
             return False
     return True
 
@@ -2568,12 +2879,10 @@ def _state_snapshot_requirement_details(
                     ):
                         required_variables[raw_name.strip()] = _canonical_shape_expr(raw_shape_expr)
 
-            raw_state_vars = schema.get("state_variables")
-            if isinstance(raw_state_vars, list):
-                for token in raw_state_vars:
-                    if isinstance(token, str) and token.strip():
-                        required_variables.setdefault(token.strip(), "[*]")
-
+            # Legacy `state_variables` shorthand is no longer recognized.
+            # `_validate_derived_contract_schema` separately rejects schemas
+            # that omit `variables`, so missing required-evidence shapes fail
+            # closed there with a clear violation.
             raw_time_var = schema.get("time_variable")
             if isinstance(raw_time_var, str) and raw_time_var.strip():
                 required_time_variable = raw_time_var.strip()
@@ -2894,18 +3203,14 @@ def _validate_derived_contract_file(
                         continue
                     snapshot_variables[raw_name.strip()] = _canonical_shape_expr(raw_shape_expr)
 
-        raw_state_vars = schema.get("state_variables")
-        if raw_state_vars is not None:
-            if not isinstance(raw_state_vars, list) or not all(
-                isinstance(token, str) and token.strip() for token in raw_state_vars
-            ):
-                violations.append(
-                    f"{contract_path}:raw_requirements.required_evidence[{idx}].schema.state_variables must be non-empty string list when present"
-                )
-            else:
-                for token in raw_state_vars:
-                    if isinstance(token, str) and token.strip():
-                        snapshot_variables.setdefault(token.strip(), "[*]")
+        if "state_variables" in schema:
+            # Legacy shorthand: rejected uniformly. `schema.variables` (the
+            # canonical form with explicit per-variable shape_expr) is the
+            # only accepted source of state-snapshot shape contracts.
+            violations.append(
+                f"{contract_path}:raw_requirements.required_evidence[{idx}].schema "
+                "must not use 'state_variables' shorthand; use 'variables: [{name, shape_expr}, ...]' instead"
+            )
         raw_time_var = schema.get("time_variable")
         if raw_time_var is not None and (
             not isinstance(raw_time_var, str) or not raw_time_var.strip()
@@ -3224,11 +3529,19 @@ def _validate_algorithm_contract_file(
             name = item.get("name")
             if not isinstance(name, str) or not name.strip():
                 violations.append(f"{contract_path}:temporaries[{idx}].name must be non-empty string")
-            shape_expr = item.get("shape_expr")
-            if shape_expr is not None and (
-                not isinstance(shape_expr, str) or not shape_expr.strip() or not _parse_shape_expr(shape_expr)[0]
-            ):
-                violations.append(f"{contract_path}:temporaries[{idx}].shape_expr invalid")
+            if "shape_expr" not in item:
+                violations.append(
+                    f"{contract_path}:temporaries[{idx}].shape_expr is required for object-form entries "
+                    "(canonical source: spec/schema/plan/shape_expr.schema.json)"
+                )
+            else:
+                shape_expr = item.get("shape_expr")
+                if (
+                    not isinstance(shape_expr, str)
+                    or not shape_expr.strip()
+                    or not _parse_shape_expr(shape_expr)[0]
+                ):
+                    violations.append(f"{contract_path}:temporaries[{idx}].shape_expr invalid")
 
     derived_field_rules = contract.get("derived_field_rules")
     if not isinstance(derived_field_rules, list):
@@ -5143,6 +5456,15 @@ def validate_plan_stage(
     workspace_root: str,
     plan_ref: str,
 ) -> list[str]:
+    with _pinned_repo_root_for_schema(repo_root):
+        return _validate_plan_stage_impl(repo_root, workspace_root, plan_ref)
+
+
+def _validate_plan_stage_impl(
+    repo_root: Path,
+    workspace_root: str,
+    plan_ref: str,
+) -> list[str]:
     violations: list[str] = []
     normalized_workspace_root = _normalize_workspace_root_token(workspace_root)
     if normalized_workspace_root != "workspace":
@@ -5233,6 +5555,18 @@ def validate_post_generate_stage(
     pipeline_ref: str,
     generation_id: str | None,
 ) -> list[str]:
+    with _pinned_repo_root_for_schema(repo_root):
+        return _validate_post_generate_stage_impl(
+            repo_root, workspace_root, pipeline_ref, generation_id
+        )
+
+
+def _validate_post_generate_stage_impl(
+    repo_root: Path,
+    workspace_root: str,
+    pipeline_ref: str,
+    generation_id: str | None,
+) -> list[str]:
     violations: list[str] = []
     normalized_workspace_root = _normalize_workspace_root_token(workspace_root)
     if normalized_workspace_root != "workspace":
@@ -5299,6 +5633,18 @@ def validate_post_build_stage(
     pipeline_ref: str,
     generation_id: str | None,
 ) -> list[str]:
+    with _pinned_repo_root_for_schema(repo_root):
+        return _validate_post_build_stage_impl(
+            repo_root, workspace_root, pipeline_ref, generation_id
+        )
+
+
+def _validate_post_build_stage_impl(
+    repo_root: Path,
+    workspace_root: str,
+    pipeline_ref: str,
+    generation_id: str | None,
+) -> list[str]:
     violations: list[str] = []
     normalized_workspace_root = _normalize_workspace_root_token(workspace_root)
     if normalized_workspace_root != "workspace":
@@ -5331,6 +5677,23 @@ def validate(
     pipeline_roots: list[Path] | None = None,
     require_llm_review: bool = True,
     require_orchestration: bool = False,
+) -> list[str]:
+    with _pinned_repo_root_for_schema(repo_root):
+        return _validate_impl(
+            repo_root,
+            workspace_root,
+            pipeline_roots,
+            require_llm_review,
+            require_orchestration,
+        )
+
+
+def _validate_impl(
+    repo_root: Path,
+    workspace_root: str,
+    pipeline_roots: list[Path] | None,
+    require_llm_review: bool,
+    require_orchestration: bool,
 ) -> list[str]:
     violations: list[str] = []
     normalized_workspace_root = _normalize_workspace_root_token(workspace_root)
@@ -5516,7 +5879,7 @@ def validate(
     return violations
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--repo-root", default=".")
     parser.add_argument("--workspace-root", default="workspace")
@@ -5580,7 +5943,7 @@ def main() -> int:
             "Without this flag, --allow-missing-* options are rejected."
         ),
     )
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     if (args.allow_missing_llm_review or args.allow_missing_orchestration) and not args.legacy_mode:
         print(
@@ -5601,75 +5964,94 @@ def main() -> int:
 
     repo_root = Path(args.repo_root).resolve()
 
-    if args.stage == "plan":
-        if not args.plan_ref or not str(args.plan_ref).strip():
-            print(
-                "pipeline semantic validation: FAIL\n"
-                "- --stage plan requires non-empty --plan-ref"
-            )
-            return 1
-        violations = validate_plan_stage(
-            repo_root, args.workspace_root, str(args.plan_ref).strip()
-        )
-    elif args.stage in ("post_generate", "post_build"):
-        roots = args.pipeline_root or []
-        if len(roots) != 1:
-            print(
-                "pipeline semantic validation: FAIL\n"
-                f"- --stage {args.stage} requires exactly one --pipeline-root "
-                f"(got {len(roots)})"
-            )
-            return 1
-        pipeline_ref = roots[0].strip()
-        if args.stage == "post_generate":
-            violations = validate_post_generate_stage(
-                repo_root,
-                args.workspace_root,
-                pipeline_ref,
-                args.generation_id,
-            )
-        else:
-            violations = validate_post_build_stage(
-                repo_root,
-                args.workspace_root,
-                pipeline_ref,
-                args.generation_id,
-            )
-    else:
-        try:
-            pipeline_roots = _resolve_pipeline_roots(
-                repo_root=repo_root,
-                workspace_root=args.workspace_root,
-                raw_values=args.pipeline_root,
-            )
-        except ValueError as exc:
-            print(f"pipeline semantic validation: FAIL\n- {exc}")
-            return 1
+    # Pin the active repo_root for the duration of this main() call only,
+    # then reset via the captured token. Without scoped reset, a long-lived
+    # process (or repeated in-process main() calls in tests / batch tooling)
+    # would leak the first repo's context into later validations against a
+    # different repo_root, producing order-dependent schema-resolution bugs.
+    with _pinned_repo_root_for_schema(repo_root):
+        return _main_dispatch(args, repo_root)
 
-        if args.stage == "post_execute":
-            violations = validate(
-                repo_root=repo_root,
-                workspace_root=args.workspace_root,
-                pipeline_roots=pipeline_roots,
-                require_llm_review=False,
-                require_orchestration=False,
+
+def _main_dispatch(args: argparse.Namespace, repo_root: Path) -> int:
+    # Wrap stage validators so a broken canonical schema (missing repo-local
+    # shape_expr.schema.json, malformed JSON, invalid regex, etc.) produces a
+    # structured "pipeline semantic validation: FAIL" line with the offending
+    # path instead of an opaque traceback. Orchestration gates rely on the
+    # structured output to extract violations and surface a repairable failure.
+    try:
+        if args.stage == "plan":
+            if not args.plan_ref or not str(args.plan_ref).strip():
+                print(
+                    "pipeline semantic validation: FAIL\n"
+                    "- --stage plan requires non-empty --plan-ref"
+                )
+                return 1
+            violations = validate_plan_stage(
+                repo_root, args.workspace_root, str(args.plan_ref).strip()
             )
-        elif args.stage == "pre_judge":
-            violations = validate(
-                repo_root=repo_root,
-                workspace_root=args.workspace_root,
-                pipeline_roots=pipeline_roots,
-                require_llm_review=True,
-                require_orchestration=True,
-            )
+        elif args.stage in ("post_generate", "post_build"):
+            roots = args.pipeline_root or []
+            if len(roots) != 1:
+                print(
+                    "pipeline semantic validation: FAIL\n"
+                    f"- --stage {args.stage} requires exactly one --pipeline-root "
+                    f"(got {len(roots)})"
+                )
+                return 1
+            pipeline_ref = roots[0].strip()
+            if args.stage == "post_generate":
+                violations = validate_post_generate_stage(
+                    repo_root,
+                    args.workspace_root,
+                    pipeline_ref,
+                    args.generation_id,
+                )
+            else:
+                violations = validate_post_build_stage(
+                    repo_root,
+                    args.workspace_root,
+                    pipeline_ref,
+                    args.generation_id,
+                )
         else:
-            violations = validate(
-                repo_root=repo_root,
-                workspace_root=args.workspace_root,
-                pipeline_roots=pipeline_roots,
-                require_llm_review=not args.allow_missing_llm_review,
-                require_orchestration=not args.allow_missing_orchestration,
-            )
+            try:
+                pipeline_roots = _resolve_pipeline_roots(
+                    repo_root=repo_root,
+                    workspace_root=args.workspace_root,
+                    raw_values=args.pipeline_root,
+                )
+            except ValueError as exc:
+                print(f"pipeline semantic validation: FAIL\n- {exc}")
+                return 1
+
+            if args.stage == "post_execute":
+                violations = validate(
+                    repo_root=repo_root,
+                    workspace_root=args.workspace_root,
+                    pipeline_roots=pipeline_roots,
+                    require_llm_review=False,
+                    require_orchestration=False,
+                )
+            elif args.stage == "pre_judge":
+                violations = validate(
+                    repo_root=repo_root,
+                    workspace_root=args.workspace_root,
+                    pipeline_roots=pipeline_roots,
+                    require_llm_review=True,
+                    require_orchestration=True,
+                )
+            else:
+                violations = validate(
+                    repo_root=repo_root,
+                    workspace_root=args.workspace_root,
+                    pipeline_roots=pipeline_roots,
+                    require_llm_review=not args.allow_missing_llm_review,
+                    require_orchestration=not args.allow_missing_orchestration,
+                )
+    except RuntimeError as exc:
+        print(f"pipeline semantic validation: FAIL\n- schema_load_failed: {exc}")
+        return 1
 
     if violations:
         print("pipeline semantic validation: FAIL")

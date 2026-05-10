@@ -79,6 +79,7 @@ description: 対応 execution platform で `workflow` 全体を開始し、`orch
 - `verify-checkpoint-integrity` で `stale` が検出された `step` をスキップしてはならない。
 
 ## 運用ルール
+0. **Step 0 (TMPDIR セットアップ)**: orchestration agent は最初の `Bash` 実行**前に** `export TMPDIR=$(jq -er '.allowed_tmp_root' "workspace/orchestrations/$METDSL_ORCHESTRATION_ID/output_manifests/$ORCHESTRATION_AGENT_RUN_ID.json")` を実行する (`METDSL_ORCHESTRATION_ID` と `ORCHESTRATION_AGENT_RUN_ID` は `tools/run_workflow.py` が export 済み)。これを skip すると以降の `cat > $TMPDIR/...` 等の heredoc が `output_manifest_write_guard` でブロックされる。詳細手順は `references/startup_contract.md` の Step 0 を canonical source とする。子 `agent` も同等の Step 0 を起動直後に実施する義務がある (`references/launch_prompts.md` 参照)。
 1. `python3 tools/run_workflow.py <spec_ref> <until_phase> --llm <backend>` を実行し、`workspace/orchestrations/<orchestration_id>/` の初期化、`preflight.json` 生成、起動 prompt 生成を一括で行う。
 2. `tools/run_workflow.py` 以外の経路で workflow を開始してはならない。例外運用で `tools/orchestration_runtime.py` を直接実行する場合は、理由と差分を記録し、通常運用へ復帰しなければならない。
 3. `preflight.json` の `probed_at` フィールドは、`record-launch` 実行時に TTL キャッシュの判定に使用され、TTL 期限切れ後の live probe 成功時に `tools/orchestration_runtime.py` によって自動更新される。この自動更新は `status` / `can_launch_*` 等の判定結果フィールドを変更しないため、手動編集禁止ルールの適用外とする。
@@ -117,6 +118,8 @@ description: 対応 execution platform で `workflow` 全体を開始し、`orch
 ## 参照
 - 起動最小契約: `references/startup_contract.md`
 - launch 要求テンプレート: `references/launch_prompts.md`
+- CLI 全 subcommand reference: `docs/CLI_REFERENCE.md` (本 file 経由で `--help` を呼ばずに引数を確定する canonical source)
+- workspace artifact 配置の tree 図と読み書きルール: `docs/WORKSPACE_LAYOUT.md`
 
 ## 判定基準
 - `orchestration agent` が phase artifactsを直接生成していない。

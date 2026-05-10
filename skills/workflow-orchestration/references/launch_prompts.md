@@ -27,6 +27,7 @@ repair_reason: <repair_reason>
 以降の `cat > ...`、`mkdir -p ...`、heredoc は **すべて** `$TMPDIR/` 配下で行う。canonical path（`workspace/pipelines/...`、`workspace/plans/...`、`lineage.json` 等）への直接書き込みは、`Edit`/`Write` tool で `allowed_file_tool_paths` に登録済みのものに限る。それ以外は `guarded-apply-patch` を必須とし、Bash heredoc で書くと `enforce_guarded_apply_patch` でブロックされる。
 
 必須要件:
+- **自身の launch prompt 本文 (`launches/<agent_run_id>.prompt.txt`) を `Read` で読んではならない。** prompt は `Agent` tool の入力として既に渡されているため再読不要であり、当該 path は `read_manifest_read_guard` で fail-closed にブロックされる。`launches/<agent_run_id>.prompt.txt` は audit / replay 用途で `Agent` tool に渡された原文を 1 対 1 保存する canonical artifact である。
 - あなたは phase artifacts を直接生成する担当である。
 - この step は標準 substep を持たない phase である。自身で step 契約を完了させること。
 - 起動直後に `skill_ref` を読み、`skill_must_read_refs` と矛盾しない契約で実行すること。
@@ -91,6 +92,7 @@ repair_reason: <repair_reason>
 以降の `cat > ...`、`mkdir -p ...`、heredoc は **すべて** `$TMPDIR/` 配下で行う。canonical path（`workspace/pipelines/...`、`workspace/plans/...`、`lineage.json` 等）への直接書き込みは、`Edit`/`Write` tool で `allowed_file_tool_paths` に登録済みのものに限る。それ以外は `guarded-apply-patch` を必須とし、Bash heredoc で書くと `enforce_guarded_apply_patch` でブロックされる。
 
 必須要件:
+- **自身の launch prompt 本文 (`launches/<agent_run_id>.prompt.txt`) を `Read` で読んではならない。** prompt は `Agent` tool の入力として既に渡されているため再読不要であり、当該 path は `read_manifest_read_guard` で fail-closed にブロックされる。`launches/<agent_run_id>.prompt.txt` は audit / replay 用途で `Agent` tool に渡された原文を 1 対 1 保存する canonical artifact である。
 - 契約された入力だけを読むこと。
 - 契約された artifacts だけを書くこと。
 - expected output と保存先を守ること。

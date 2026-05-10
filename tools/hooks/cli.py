@@ -880,6 +880,7 @@ def _validate_write_targets(
     agent_run_id: str,
     targets: list[str],
     tool_name: str,
+    bash_command: str | None = None,
 ) -> HookDecision:
     for target in targets:
         cli_guard = check_cli_managed_path(repo_root, target)
@@ -889,6 +890,7 @@ def _validate_write_targets(
             agent_run_id,
             target,
             tool_name=tool_name,
+            bash_command=bash_command,
         )
         if candidate.action == HookDecisionAction.BLOCK:
             return candidate
@@ -1004,6 +1006,7 @@ def _evaluate_pre_command_file_access_policy(
             agent_run_id=resolved_run_id,
             targets=write_targets,
             tool_name=tool_name,
+            bash_command=decoded.command,
         )
         if write_decision.action == HookDecisionAction.BLOCK:
             return write_decision
