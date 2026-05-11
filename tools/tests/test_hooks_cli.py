@@ -1652,7 +1652,7 @@ class ClaudeHookCliTests(unittest.TestCase):
             orch = "orch_apply_patch_guard_001_context_fallback"
             run_id = "step_run_apply_patch_context_001"
             context_id = "ctx_apply_patch_001"
-            target_path = "workspace/pipelines/safe/case.resolved.yaml"
+            target_path = "workspace/pipelines/safe/spec.ir.yaml"
             orch_root = repo_root / "workspace" / "orchestrations" / orch
             (orch_root / "output_manifests").mkdir(parents=True, exist_ok=True)
             (orch_root / "agent_runs.jsonl").write_text(
@@ -1721,7 +1721,7 @@ class ClaudeHookCliTests(unittest.TestCase):
             repo_root = Path(tmp)
             orch = "orch_apply_patch_guard_ambiguous_context"
             context_id = "ctx_apply_patch_ambiguous_001"
-            target_path = "workspace/pipelines/safe/case.resolved.yaml"
+            target_path = "workspace/pipelines/safe/spec.ir.yaml"
             orch_root = repo_root / "workspace" / "orchestrations" / orch
             (orch_root / "output_manifests").mkdir(parents=True, exist_ok=True)
             (orch_root / "agent_runs.jsonl").write_text(
@@ -1793,9 +1793,9 @@ class ClaudeHookCliTests(unittest.TestCase):
             patch_text = "\n".join(
                 [
                     "*** Begin Patch",
-                    "*** Add File: workspace/plans/p/plan_meta.json",
+                    "*** Add File: workspace/ir/p/ir_meta.json",
                     "+{}",
-                    "*** Update File: workspace/plans/p/case.resolved.yaml",
+                    "*** Update File: workspace/ir/p/spec.ir.yaml",
                     "@@",
                     "+case: ok",
                     "*** End Patch",
@@ -1838,8 +1838,8 @@ class ClaudeHookCliTests(unittest.TestCase):
             self.assertEqual(
                 entry.get("payload_summary", {}).get("apply_patch_paths"),
                 [
-                    "workspace/plans/p/plan_meta.json",
-                    "workspace/plans/p/case.resolved.yaml",
+                    "workspace/ir/p/ir_meta.json",
+                    "workspace/ir/p/spec.ir.yaml",
                 ],
             )
             self.assertNotIn("patch", entry.get("payload_summary", {}))
@@ -1850,7 +1850,7 @@ class ClaudeHookCliTests(unittest.TestCase):
             orch = "orch_apply_patch_guard_allow_unresolved"
             orch_root = repo_root / "workspace" / "orchestrations" / orch
             orch_root.mkdir(parents=True, exist_ok=True)
-            target_path = "workspace/pipelines/safe/case.resolved.yaml"
+            target_path = "workspace/pipelines/safe/spec.ir.yaml"
             payload = {
                 "orchestration_id": orch,
                 "repo_root": str(repo_root),
@@ -2386,7 +2386,7 @@ class WriteToolExtensionPolicyTests(unittest.TestCase):
                     "agent_run_id": run_id,
                     "allowed_output_paths": allowed_output_paths,
                     "allowed_file_tool_paths": allowed_file_tool_paths,
-                    "write_roots": ["workspace/plans"],
+                    "write_roots": ["workspace/ir"],
                 }
             ),
             encoding="utf-8",
@@ -2421,7 +2421,7 @@ class WriteToolExtensionPolicyTests(unittest.TestCase):
             repo_root = Path(tmp)
             orch = "orch_ext_hooks_001"
             run_id = "step_run_ext_hooks_001"
-            json_path = "workspace/plans/p/derived_contract.json"
+            json_path = "workspace/ir/p/spec.ir.yaml"
             self._setup_orchestration_for_write(
                 repo_root,
                 orch=orch,
@@ -2441,7 +2441,7 @@ class WriteToolExtensionPolicyTests(unittest.TestCase):
             repo_root = Path(tmp)
             orch = "orch_ext_hooks_002"
             run_id = "step_run_ext_hooks_002"
-            yaml_path = "workspace/plans/p/case.resolved.yaml"
+            yaml_path = "workspace/ir/p/spec.ir.yaml"
             self._setup_orchestration_for_write(
                 repo_root,
                 orch=orch,
@@ -2461,7 +2461,7 @@ class WriteToolExtensionPolicyTests(unittest.TestCase):
             repo_root = Path(tmp)
             orch = "orch_ext_hooks_003"
             run_id = "step_run_ext_hooks_003"
-            md_path = "workspace/plans/p/algorithm.summary.md"
+            md_path = "workspace/ir/p/algorithm.summary.md"
             self._setup_orchestration_for_write(
                 repo_root,
                 orch=orch,
@@ -2481,7 +2481,7 @@ class WriteToolExtensionPolicyTests(unittest.TestCase):
             repo_root = Path(tmp)
             orch = "orch_ext_hooks_004"
             run_id = "step_run_ext_hooks_004"
-            src_path = "workspace/plans/p/src/main.f90"
+            src_path = "workspace/ir/p/src/main.f90"
             self._setup_orchestration_for_write(
                 repo_root,
                 orch=orch,
@@ -2501,7 +2501,7 @@ class WriteToolExtensionPolicyTests(unittest.TestCase):
             repo_root = Path(tmp)
             orch = "orch_ext_hooks_005"
             run_id = "step_run_ext_hooks_005"
-            yaml_path = "workspace/plans/p/case.resolved.yaml"
+            yaml_path = "workspace/ir/p/spec.ir.yaml"
             self._setup_orchestration_for_write(
                 repo_root,
                 orch=orch,

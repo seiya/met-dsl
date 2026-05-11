@@ -10,7 +10,7 @@ orchestration_id: <orchestration_id>
 agent_run_id: <agent_run_id>
 parent_agent_run_id: <parent_agent_run_id>
 workflow_mode: <workflow_mode>
-plan_ref: <plan_ref>
+ir_ref: <ir_ref>
 pipeline_ref: <pipeline_ref>
 dependency_ref: <dependency_ref>
 skill_name: <skill_name>
@@ -24,7 +24,7 @@ repair_reason: <repair_reason>
 **Step 0（最初の Bash で必ず実行）** — 1 行コマンド:
     export TMPDIR=$(jq -er '.allowed_tmp_root' "workspace/orchestrations/<orchestration_id>/output_manifests/<agent_run_id>.json")
 
-以降の `cat > ...`、`mkdir -p ...`、heredoc は **すべて** `$TMPDIR/` 配下で行う。canonical path（`workspace/pipelines/...`、`workspace/plans/...`、`lineage.json` 等）への直接書き込みは、`Edit`/`Write` tool で `allowed_file_tool_paths` に登録済みのものに限る。それ以外は `guarded-apply-patch` を必須とし、Bash heredoc で書くと `enforce_guarded_apply_patch` でブロックされる。
+以降の `cat > ...`、`mkdir -p ...`、heredoc は **すべて** `$TMPDIR/` 配下で行う。canonical path（`workspace/pipelines/...`、`workspace/ir/...`、`lineage.json` 等）への直接書き込みは、`Edit`/`Write` tool で `allowed_file_tool_paths` に登録済みのものに限る。それ以外は `guarded-apply-patch` を必須とし、Bash heredoc で書くと `enforce_guarded_apply_patch` でブロックされる。
 
 必須要件:
 - **自身の launch prompt 本文 (`launches/<agent_run_id>.prompt.txt`) を `Read` で読んではならない。** prompt は `Agent` tool の入力として既に渡されているため再読不要であり、当該 path は `read_manifest_read_guard` で fail-closed にブロックされる。`launches/<agent_run_id>.prompt.txt` は audit / replay 用途で `Agent` tool に渡された原文を 1 対 1 保存する canonical artifact である。
@@ -50,15 +50,15 @@ repair_reason: <repair_reason>
 - UUID 生成は `python3 tools/new_agent_run_id.py` を使うこと。`python3 -c 'import uuid; print(uuid.uuid4())'` は `-S` 等の flag を含めて全て `forbid_python_inline_write` でブロックされる。`cat /proc/sys/kernel/random/uuid` は session sandbox の approval 要求で都度停止するため使用しない。
 - 自身の launch prompt 本文は Agent tool 起動時の入力で渡されている。`launches/<agent_run_id>.prompt.txt` を `Read` で再読する必要はなく、`read_manifest_read_guard` でブロックされる。
 - `tools/`・`tests/`・validator script・hook 実装への `Read`/`grep`/`sed`/`cat` は `forbid_tools_direct_read` でブロックされる。要件と判定規則は `docs/`・`spec/`・`skill_must_read_refs` のみから解釈すること。`guarded-apply-patch` の内部動作（strip 判定等）は `docs/ORCHESTRATION.md` の「Patch 適用契約」と本ファイル末尾「`guarded-apply-patch` の strip について」を canonical 参照先とする。
-- 自身が生成した artifact を参照する際は `output_manifests/<agent_run_id>.json` の `allowed_output_paths` に列挙されたプロジェクトルートからの相対パス（例: `workspace/plans/...`）を使うこと。`/home/<user>/...` 等の絶対パスや `workspace/` 接頭辞を持たないパスを使ってはならない。
+- 自身が生成した artifact を参照する際は `output_manifests/<agent_run_id>.json` の `allowed_output_paths` に列挙されたプロジェクトルートからの相対パス（例: `workspace/ir/...`）を使うこと。`/home/<user>/...` 等の絶対パスや `workspace/` 接頭辞を持たないパスを使ってはならない。
 - `orchestration_id`・`agent_run_id`・`node_key`・`step`・`write_roots` 等の orchestration メタデータは `capabilities/<agent_run_id>.json` を canonical source とする。`orchestration_meta.json` は `read_manifest_read_guard` でブロックされる。
 - `skill_name` と `skill_ref` が未指定の場合は fail で停止すること。launch prompt で指定された `skill_ref` の 1 ファイルのみを読み、**自 phase 以外の SKILL.md を追加 Read してはならない**（phase ↔ skill 対応は本ファイル末尾参照）。
 - 入力不足時は推測補完せず fail で停止すること。
 - `workflow_mode=dev` の場合、verify 系判定で `issue_severity=major|critical` を検出した時点で fail 停止すること。
 - `workflow_mode=dev` で fail した場合、`failure_analysis.json` 生成に必要な根拠（失敗理由、関連 output_refs、主要ログ要約）を返答へ含めること。
-- `Plan` の場合、直下依存 `node` の `direct dependency plan readiness` を満たさない限り開始してはならない。
-- `Plan` の `plan_meta.json` 更新時は `attempt_count` と `verification_status` と `last_fail_reason` と `debug_mode` と `context_isolated` を必須記録し、`context_isolated=false` の場合は `constraint_reason` を必須記録すること。
-- `Generate` / `Build` / `Execute` / `Judge` の場合、直下依存 `node` の `direct dependency execution readiness` を満たさない限り開始してはならない。
+- `Compile` の場合、直下依存 `node` の `direct dependency compile readiness` を満たさない限り開始してはならない。
+- `Compile` の `ir_meta.json` 更新時は `attempt_count` と `verification_status` と `last_fail_reason` と `debug_mode` と `context_isolated` を必須記録し、`context_isolated=false` の場合は `constraint_reason` を必須記録すること。
+- `Generate` / `Build` / `Validate` の場合、直下依存 `node` の `direct dependency execution readiness` を満たさない限り開始してはならない。
 - 直下依存 `node` が未完了でも、依存先 code を自身の `src/` へ内包して代替してはならない。
 - 完了後は required_outputs と failed_substeps と substep_agent_run_ids を親へ返すこと。
 - 完了返答には `launch_reply` として、実施内容と判定結果を平文で含めること。
@@ -75,7 +75,7 @@ orchestration_id: <orchestration_id>
 agent_run_id: <agent_run_id>
 parent_agent_run_id: <parent_agent_run_id>
 workflow_mode: <workflow_mode>
-plan_ref: <plan_ref>
+ir_ref: <ir_ref>
 pipeline_ref: <pipeline_ref>
 dependency_ref: <dependency_ref>
 skill_name: <skill_name>
@@ -89,7 +89,7 @@ repair_reason: <repair_reason>
 **Step 0（最初の Bash で必ず実行）** — 1 行コマンド:
     export TMPDIR=$(jq -er '.allowed_tmp_root' "workspace/orchestrations/<orchestration_id>/output_manifests/<agent_run_id>.json")
 
-以降の `cat > ...`、`mkdir -p ...`、heredoc は **すべて** `$TMPDIR/` 配下で行う。canonical path（`workspace/pipelines/...`、`workspace/plans/...`、`lineage.json` 等）への直接書き込みは、`Edit`/`Write` tool で `allowed_file_tool_paths` に登録済みのものに限る。それ以外は `guarded-apply-patch` を必須とし、Bash heredoc で書くと `enforce_guarded_apply_patch` でブロックされる。
+以降の `cat > ...`、`mkdir -p ...`、heredoc は **すべて** `$TMPDIR/` 配下で行う。canonical path（`workspace/pipelines/...`、`workspace/ir/...`、`lineage.json` 等）への直接書き込みは、`Edit`/`Write` tool で `allowed_file_tool_paths` に登録済みのものに限る。それ以外は `guarded-apply-patch` を必須とし、Bash heredoc で書くと `enforce_guarded_apply_patch` でブロックされる。
 
 必須要件:
 - **自身の launch prompt 本文 (`launches/<agent_run_id>.prompt.txt`) を `Read` で読んではならない。** prompt は `Agent` tool の入力として既に渡されているため再読不要であり、当該 path は `read_manifest_read_guard` で fail-closed にブロックされる。`launches/<agent_run_id>.prompt.txt` は audit / replay 用途で `Agent` tool に渡された原文を 1 対 1 保存する canonical artifact である。
@@ -116,47 +116,47 @@ repair_reason: <repair_reason>
 - UUID 生成は `python3 tools/new_agent_run_id.py` を使うこと。`python3 -c 'import uuid; print(uuid.uuid4())'` は `-S` 等の flag を含めて全て `forbid_python_inline_write` でブロックされる。`cat /proc/sys/kernel/random/uuid` は session sandbox の approval 要求で都度停止するため使用しない。
 - 自身の launch prompt 本文は Agent tool 起動時の入力で渡されている。`launches/<agent_run_id>.prompt.txt` を `Read` で再読する必要はなく、`read_manifest_read_guard` でブロックされる。
 - `tools/`・`tests/`・validator script・hook 実装への `Read`/`grep`/`sed`/`cat` は `forbid_tools_direct_read` でブロックされる。要件と判定規則は `docs/`・`spec/`・`skill_must_read_refs` のみから解釈すること。`guarded-apply-patch` の内部動作（strip 判定等）は `docs/ORCHESTRATION.md` の「Patch 適用契約」と本ファイル末尾「`guarded-apply-patch` の strip について」を canonical 参照先とする。
-- 自身が生成した artifact を参照する際は `output_manifests/<agent_run_id>.json` の `allowed_output_paths` に列挙されたプロジェクトルートからの相対パス（例: `workspace/plans/...`）を使うこと。`/home/<user>/...` 等の絶対パスや `workspace/` 接頭辞を持たないパスを使ってはならない。
+- 自身が生成した artifact を参照する際は `output_manifests/<agent_run_id>.json` の `allowed_output_paths` に列挙されたプロジェクトルートからの相対パス（例: `workspace/ir/...`）を使うこと。`/home/<user>/...` 等の絶対パスや `workspace/` 接頭辞を持たないパスを使ってはならない。
 - `orchestration_id`・`agent_run_id`・`node_key`・`step`・`write_roots` 等の orchestration メタデータは `capabilities/<agent_run_id>.json` を canonical source とする。`orchestration_meta.json` は `read_manifest_read_guard` でブロックされる。
 - `skill_name` と `skill_ref` が未指定の場合は fail で停止すること。launch prompt で指定された `skill_ref` の 1 ファイルのみを読み、**自 phase 以外の SKILL.md を追加 Read してはならない**（phase ↔ skill 対応は本ファイル末尾参照）。
 - 入力不足時は推測補完せず fail で停止すること。
 - `workflow_mode=dev` の場合、verify 系判定で `issue_severity=major|critical` を検出した時点で fail 停止すること。
 - `workflow_mode=dev` で fail した場合、`failure_analysis.json` 生成に必要な根拠（失敗理由、関連 output_refs、主要ログ要約）を返答へ含めること。
-- `Plan` の substep は、直下依存 `node` の `direct dependency plan readiness` を満たさない限り開始してはならない。
-- `Plan` の `plan_meta.json` 更新時は `attempt_count` と `verification_status` と `last_fail_reason` と `debug_mode` と `context_isolated` を必須記録し、`context_isolated=false` の場合は `constraint_reason` を必須記録すること。
-- `Generate` / `Build` / `Execute` / `Judge` の substep は、直下依存 `node` の `direct dependency execution readiness` を満たさない限り開始してはならない。
+- `Compile` の substep は、直下依存 `node` の `direct dependency compile readiness` を満たさない限り開始してはならない。
+- `Compile` の `ir_meta.json` 更新時は `attempt_count` と `verification_status` と `last_fail_reason` と `debug_mode` と `context_isolated` を必須記録し、`context_isolated=false` の場合は `constraint_reason` を必須記録すること。
+- `Generate` / `Build` / `Validate` の substep は、直下依存 `node` の `direct dependency execution readiness` を満たさない限り開始してはならない。
 - 直下依存 `node` が未完了でも、依存先 code を対象 `node` の `src/` へ内包して代替してはならない。
 - **MCP 副次出力の `mcp_command_log.jsonl` を必ず `allowed_output_paths` に含めること**。canonical placement は phase ごとに以下:
-  - Generate substep: `<pipeline_ref>/generate/<generation_id>/src/mcp_command_log.jsonl` (run_linter)
-  - Build step (in-phase, CMake/Meson out-of-source): `<pipeline_ref>/build/<build_id>/mcp_command_log.jsonl` (compile_project, project_dir=<build_id>/)
-  - Build step (cross-phase, Make in-source for Fortran/C-family): `<pipeline_ref>/generate/<generation_id>/src/mcp_command_log.jsonl` (compile_project, project_dir=<gen>/src/)。launch request の `generation_id` で bind され、`record-launch` が `generate_meta.json` の `verification_status=pass` を検証する
-  - Execute step (in-phase): `<pipeline_ref>/execute/<execution_id>/<node_safe>/mcp_command_log.jsonl` (run_program 等)
-  - Execute step (cross-phase quality_check): `<pipeline_ref>/generate/<generation_id>/src/mcp_command_log.jsonl` (`skills/workflow-execute/SKILL.md` L20 — `toolchain.build_system=make` + Fortran/C-family では `run_quality_checks` を `project_dir=generate/<generation_id>/src/` で実行するため、log は generate ツリーに副次出力される)。Execute step の launch request に `generation_id` を含めると runtime が cross-phase canonical placement を auto-inject し、phase contract と write_roots check を bypass する。`generation_id` は `<pipeline_ref>/generate/<generation_id>/generate_meta.json` の存在で検証され、未知の generation_id (実際の generate 実行に対応しない値) を渡すと `record-launch` が `ValueError` で reject する (任意 caller による cross-phase write authorization injection 防止)。
+  - Generate substep: `<pipeline_ref>/source/<source_id>/src/mcp_command_log.jsonl` (run_linter)
+  - Build step (in-phase, CMake/Meson out-of-source): `<pipeline_ref>/binary/<binary_id>/mcp_command_log.jsonl` (compile_project, project_dir=<binary_id>/)
+  - Build step (cross-phase, Make in-source for Fortran/C-family): `<pipeline_ref>/source/<source_id>/src/mcp_command_log.jsonl` (compile_project, project_dir=<gen>/src/)。launch request の `source_id` で bind され、`record-launch` が `source_meta.json` の `verification_status=pass` を検証する
+  - Validate.execute substep (in-phase): `<pipeline_ref>/runs/<run_id>/<node_safe>/mcp_command_log.jsonl` (run_program 等)
+  - Validate.execute substep (cross-phase quality_check): `<pipeline_ref>/source/<source_id>/src/mcp_command_log.jsonl` (`skills/workflow-validate-execute/SKILL.md` L20 — `toolchain.build_system=make` + Fortran/C-family では `run_quality_checks` を `project_dir=source/<source_id>/src/` で実行するため、log は generate ツリーに副次出力される)。Validate.execute substep の launch request に `source_id` を含めると runtime が cross-phase canonical placement を auto-inject し、phase contract と write_roots check を bypass する。`source_id` は `<pipeline_ref>/source/<source_id>/source_meta.json` の存在で検証され、未知の source_id (実際の generate 実行に対応しない値) を渡すと `record-launch` が `ValueError` で reject する (任意 caller による cross-phase write authorization injection 防止)。
 
   さらに、`validate_pipeline_semantics.py` は MCP tool 実行証跡として trust する全 `command_log_ref` を canonical placement のみに制限する:
   - `lint_command_ref.run_linter[].command_log_ref`: `<gen_dir>/src/mcp_command_log.jsonl`
   - `source_command_ref.<run_program-key>.command_log_ref`: `<execute node_dir>/mcp_command_log.jsonl` (sibling of trial_meta)
-  - `source_command_ref.run_quality_checks.command_log_ref`: `<pipeline_ref>/generate/<source_generation_id>/src/mcp_command_log.jsonl` — `trial_meta.source_generation_id` で **単一の gen_id にのみ bind** される。同 pipeline の sibling/older generation の canonical placement は受理しない。
+  - `source_command_ref.run_quality_checks.command_log_ref`: `<pipeline_ref>/generate/<source_source_id>/src/mcp_command_log.jsonl` — `trial_meta.source_source_id` で **単一の gen_id にのみ bind** される。同 pipeline の sibling/older generation の canonical placement は受理しない。
 
   非 canonical path への placement (例: `<execute>/raw/forged.jsonl`) は post_generate / post_execute gate が reject する (forge MCP execution evidence の防止)。
 
   さらに `_validate_trial_meta` は `source_command_ref` の各 entry が指す log record に **recognized MCP `tool_name`** (`run_program` / `run_quality_checks`) が含まれることを必須とする。`compile_project` は build phase の道具で execute trial_meta では受理しない。`tool_name` 欠落 / 未知の値の forge record は reject される (tool-specific validator が silent skip する経路を遮断)。
 
-  Execute step の cross-phase canonical 配置は launch request の `generation_id` フィールドにのみ bind される。`allowed_output_paths` に `<pipeline_ref>/generate/<other_gen>/src/...` (request の `generation_id` と異なる generation) を含めると phase contract が reject する。Trial_meta 側でも `source_generation_id` を必須記録とし、execute と generate の bind を確定させる。
+  Validate.execute substep の cross-phase canonical 配置は launch request の `source_id` フィールドにのみ bind される。`allowed_output_paths` に `<pipeline_ref>/generate/<other_gen>/src/...` (request の `source_id` と異なる generation) を含めると phase contract が reject する。Trial_meta 側でも `source_source_id` を必須記録とし、execute と generate の bind を確定させる。
 
-  **単一 namespace 強制:** generate / build / execute step の `allowed_output_paths` は単一の `<gen_id>` / `<build_id>` / `<exec_id>` のみを target としなければならない。同 pipeline 配下に複数 id を混在 listing すると `record-launch` が `ValueError` で reject する (sibling/older run の audit log への write authority 付与を防止)。Generate / Execute step では追加で request の `generation_id` / `execution_id` と listed paths の id が一致することを要求する (mismatch は `does not match request ...id` で reject)。
+  **単一 namespace 強制:** generate / build / validate step (Validate.execute substep) の `allowed_output_paths` は単一の `<source_id>` / `<binary_id>` / `<run_id>` のみを target としなければならない。同 pipeline 配下に複数 id を混在 listing すると `record-launch` が `ValueError` で reject する (sibling/older run の audit log への write authority 付与を防止)。Generate / Validate.execute では追加で request の `source_id` / `run_id` と listed paths の id が一致することを要求する (mismatch は `does not match request ...id` で reject)。
 
-  **Quality_check stale-generation 対策:** `trial_meta.source_generation_id` が指す `generate_meta.json` は `verification_status=pass` でなければならない。失敗 / 古い generation を quality_check evidence として参照すると post_execute validator が reject する。さらに **`record-launch` も** `verification_status` を check し、failed generation 配下の MCP audit log に対する write authority 付与を launch 時点で reject する (failed gen tree の provenance contamination 防止)。
+  **Quality_check stale-generation 対策:** `trial_meta.source_source_id` が指す `source_meta.json` は `verification_status=pass` でなければならない。失敗 / 古い generation を quality_check evidence として参照すると post_execute validator が reject する。さらに **`record-launch` も** `verification_status` を check し、failed generation 配下の MCP audit log に対する write authority 付与を launch 時点で reject する (failed gen tree の provenance contamination 防止)。
 
-  **Build lineage bind (specific build):** Execute step の launch request は `source_build_id` を必須記録とし、`<pipeline>/build/<source_build_id>/build_meta.json` の `source_generation_id` と request の `generation_id` が一致しなければならない。`source_build_id` 欠落、build_meta.json 不在、`source_generation_id` 未記録、または値の mismatch は record_launch が reject する。これにより mixed-build forge (build A の binary を実行しながら build B の quality_check evidence を流用) を防止。Build step は `build_meta.json` に `source_generation_id` を必須記録 (`skills/workflow-build/SKILL.md` 参照)。
+  **Build lineage bind (specific build):** Validate.execute substep の launch request は `source_binary_id` を必須記録とし、`<pipeline>/binary/<source_binary_id>/binary_meta.json` の `source_source_id` と request の `source_id` が一致しなければならない。`source_binary_id` 欠落、binary_meta.json 不在、`source_source_id` 未記録、または値の mismatch は record_launch が reject する。これにより mixed-build forge (build A の binary を実行しながら build B の quality_check evidence を流用) を防止。Build step は `binary_meta.json` に `source_source_id` を必須記録 (`skills/workflow-build/SKILL.md` 参照)。
 
-  **Cross-phase auto-inject の Make-only ゲート:** `<pipeline>/generate/<generation_id>/src/mcp_command_log.jsonl` への cross-phase write authority は `toolchain.build_system=make` (Fortran/C-family in-source build) のときのみ auto-inject される。CMake/Meson/Ninja 等の out-of-source toolchain では cross-phase は注入されず、build/execute の log は in-phase canonical (`<build_id>/mcp_command_log.jsonl` または `<exec_id>/<node_safe>/mcp_command_log.jsonl`) のみ許可される。`record-launch` は `impl.resolved.yaml` の `toolchain.build_system` を読んで自動判定する。
+  **Cross-phase auto-inject の Make-only ゲート:** `<pipeline>/source/<source_id>/src/mcp_command_log.jsonl` への cross-phase write authority は `toolchain.build_system=make` (Fortran/C-family in-source build) のときのみ auto-inject される。CMake/Meson/Ninja 等の out-of-source toolchain では cross-phase は注入されず、build/execute の log は in-phase canonical (`<binary_id>/mcp_command_log.jsonl` または `<exec_id>/<node_safe>/mcp_command_log.jsonl`) のみ許可される。`record-launch` は `spec.ir.yaml.impl_defaults` の `toolchain.build_system` を読んで自動判定する。
 
   **`ok=true` requirement for execute evidence:** post_execute validator は `run_program` / `run_quality_checks` record の `ok=true` を必須要求する。`ok=false` または `ok` 欠落の record は失敗実行とみなし、tool-execution evidence として認めない (lint validator と同じポリシー)。
 
-  **Role binding for source_command_ref:** Execute trial_meta の `source_command_ref` 各 entry は `tool_name` フィールド (= `run_program` または `run_quality_checks`) を宣言し、log record の `tool_name` と一致しなければならない。`compile_project` は build phase 専用で execute trial_meta では受理しない。trial_meta は最低 1 つ `tool_name='run_program'` entry を含むことが必須 (実プログラム実行証跡)。role mismatch (例: run_program slot に compile_project record) は forge とみなし reject される。
+  **Role binding for source_command_ref:** Validate.execute trial_meta の `source_command_ref` 各 entry は `tool_name` フィールド (= `run_program` または `run_quality_checks`) を宣言し、log record の `tool_name` と一致しなければならない。`compile_project` は build phase 専用で validate trial_meta では受理しない。trial_meta は最低 1 つ `tool_name='run_program'` entry を含むことが必須 (実プログラム実行証跡)。role mismatch (例: run_program slot に compile_project record) は forge とみなし reject される。
 
-  **Run_program log canonical placement (MCP gate enforcement):** `validate_mcp_build_tool_invocation` (MCP server pre-call gate) は `tool_name=run_program` かつ `step=execute` の呼び出しで log placement を canonical (`<pipeline_ref>/execute/<execution_id>/<node_safe>/mcp_command_log.jsonl`) のみに強制する。`project_dir` を execute node_dir に設定するか、`command_log_path` 引数で canonical absolute/relative path を明示すること。非 canonical 配置は MCP 呼び出し時点で `RuntimeError` で reject され、後の post_execute validator まで遅延しない。
+  **Run_program log canonical placement (MCP gate enforcement):** `validate_mcp_build_tool_invocation` (MCP server pre-call gate) は `tool_name=run_program` かつ `step=execute` の呼び出しで log placement を canonical (`<pipeline_ref>/runs/<run_id>/<node_safe>/mcp_command_log.jsonl`) のみに強制する。`project_dir` を execute node_dir に設定するか、`command_log_path` 引数で canonical absolute/relative path を明示すること。非 canonical 配置は MCP 呼び出し時点で `RuntimeError` で reject され、後の post_execute validator まで遅延しない。
 
   **MCP audit log trust model (defense-in-depth, not cryptographic proof):** `mcp_owned_audit_logs` フィールド経由で manifest に登録された canonical log path は terminalization 時に「authorized MCP-owned write」として承認される。これは MCP server から path への write が以下 3 防御層で他経路をすべて遮断していることに依拠する: (a) hook 層が `Edit`/`Write` を `allowed_file_tool_paths` 除外で reject、(b) `guarded-apply-patch` が `mcp_owned_audit_logs` 内の path への mutation を `RuntimeError` で reject、(c) Bash heredoc/redirect も同 hook で reject。これにより canonical path への write は MCP server 経由のみが事実上可能。**ただし、これは out-of-band な MCP-side 署名や invocation cross-reference を持たないため**、もし将来 hook 層に新たな write 経路 (MCP 以外) が漏れた場合は、forge を再び許す可能性がある。完全な防御には MCP server が独自の audit ledger を残し、validator が path とその ledger を cross-reference する設計拡張が必要 (現時点では future work として認識)。
 
@@ -186,7 +186,7 @@ repair_reason: <repair_reason>
 python3 - <<'APPLY'
 import os, json, subprocess, pathlib
 
-target = "workspace/plans/<node_key_safe>/<plan_id>/derived_contract.json"
+target = "workspace/ir/<node_key_safe>/<ir_id>/spec.ir.yaml"
 orchestration_id = os.environ["METDSL_ORCHESTRATION_ID"]
 agent_run_id = "<agent_run_id>"
 capability_token = "<capability_token>"
@@ -240,10 +240,10 @@ APPLY
 
 ```bash
 # NG: workspace/ prefix なしのパス
-echo "$CONTENT" > plans/derived_contract.json
+echo "$CONTENT" > ir/spec.ir.yaml
 
 # NG: python3 -c によるインラインファイル書き込み (intent_detected=write)
-python3 -c "import json; open('workspace/plans/.../derived_contract.json','w').write(json.dumps({}))"
+python3 -c "import json; open('workspace/ir/.../spec.ir.yaml','w').write(json.dumps({}))"
 
 # NG: python3 -c による JSON 読み取り (intent_detected=json_read) — Read tool または jq を使う
 python3 -c "import json; print(json.load(open('workspace/orchestrations/<oid>/output_manifests/<id>.json'))['allowed_tmp_root'])"
@@ -252,7 +252,7 @@ python3 -c "import json; print(json.load(open('workspace/orchestrations/<oid>/ou
 python3 -c "import uuid; print(uuid.uuid4())"
 
 # NG: heredoc リダイレクト（直接ファイル指定）
-cat <<EOF > workspace/plans/.../derived_contract.json
+cat <<EOF > workspace/ir/.../spec.ir.yaml
 {"key": "value"}
 EOF
 
@@ -291,18 +291,18 @@ EOF
 
 | step | substep | skill_name | skill_ref |
 |---|---|---|---|
-| plan | generate | workflow-plan-generate | skills/workflow-plan-generate/SKILL.md |
-| plan | verify | workflow-plan-verify | skills/workflow-plan-verify/SKILL.md |
+| plan | generate | workflow-compile-generate | skills/workflow-compile-generate/SKILL.md |
+| plan | verify | workflow-compile-verify | skills/workflow-compile-verify/SKILL.md |
 | generate | generate | workflow-generate-generate | skills/workflow-generate-generate/SKILL.md |
 | generate | verify | workflow-generate-verify | skills/workflow-generate-verify/SKILL.md |
 | tune | generate | workflow-tune-generate | skills/workflow-tune-generate/SKILL.md |
 | tune | verify | workflow-tune-verify | skills/workflow-tune-verify/SKILL.md |
 | build | — | workflow-build | skills/workflow-build/SKILL.md |
-| execute | — | workflow-execute | skills/workflow-execute/SKILL.md |
-| judge | — | workflow-judge | skills/workflow-judge/SKILL.md |
+| execute | — | workflow-validate-execute | skills/workflow-validate-execute/SKILL.md |
+| judge | — | workflow-validate-judge | skills/workflow-validate-judge/SKILL.md |
 | promote | — | workflow-promote | skills/workflow-promote/SKILL.md |
 
-**ネガティブ制約:** 自 phase 以外の SKILL.md を Read してはならない（例: generate substep が `skills/workflow-plan-verify/SKILL.md` を読む行為は `rule_source_violation` を発火する）。launch prompt の `skill_ref` で渡された 1 ファイルだけを読むこと。
+**ネガティブ制約:** 自 phase 以外の SKILL.md を Read してはならない（例: generate substep が `skills/workflow-compile-verify/SKILL.md` を読む行為は `rule_source_violation` を発火する）。launch prompt の `skill_ref` で渡された 1 ファイルだけを読むこと。
 
 ---
 

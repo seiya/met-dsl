@@ -1,0 +1,5 @@
+interface:
+  display_name: "Workflow Validate Execute"
+  short_description: "Help with Workflow Validate Execute tasks"
+  backend: "claude"
+  spawn_agent_tool: "Agent"

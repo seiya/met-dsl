@@ -180,15 +180,10 @@ def normalize_hook_event_name(event_name: str) -> HookEventName:
 def validate_pipeline_semantics_stage(*, step_key: str, args_json: dict[str, Any]) -> str:
     """Validate `validate_pipeline_semantics` stage input for a step capability."""
     allowed_by_step: dict[str, frozenset[str]] = {
-        "plan": frozenset({"plan", "full"}),
+        "compile": frozenset({"compile", "full"}),
         "generate": frozenset({"post_generate", "post_build", "full"}),
-        "tune": frozenset({"post_generate", "post_build", "full"}),
         "build": frozenset({"post_build", "full"}),
-        "execute": frozenset({"post_execute", "full"}),
-        "judge": frozenset({"pre_judge", "full"}),
-        "promote": frozenset(
-            {"plan", "post_generate", "post_build", "post_execute", "pre_judge", "full"}
-        ),
+        "validate": frozenset({"post_execute", "pre_judge", "full"}),
     }
     stage = args_json.get("stage") or args_json.get("--stage")
     if not isinstance(stage, str) or not stage.strip():

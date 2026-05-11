@@ -70,24 +70,46 @@ from tools.orchestration_runtime import (
     write_step_result,
 )
 
-_FIX_PLAN_REF = "workspace/plans/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001"
+_FIX_IR_REF = "workspace/ir/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001"
 _FIX_PIPE_REF = "workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001"
-_FIX_DEP_REF = f"{_FIX_PLAN_REF}/dependency.resolved.yaml"
-_FIX_PLAN_STEP_DEP_REF = "spec/problem/shallow_water2d/deps.yaml"
+_FIX_DEP_REF = f"{_FIX_IR_REF}/spec.ir.yaml"
+_FIX_COMPILE_STEP_DEP_REF = "spec/problem/shallow_water2d/deps.yaml"
 
 
 def _dep_ref_for_step(step: str) -> str:
-    return _FIX_PLAN_STEP_DEP_REF if step.strip().lower() == "plan" else _FIX_DEP_REF
+    return _FIX_COMPILE_STEP_DEP_REF if step.strip().lower() == "compile" else _FIX_DEP_REF
 
 
-def _fixture_generate_downstream_ready(repo_root: Path, *, generation_id: str = "gen_fixture_001") -> None:
-    """`build` の `pre_phase_launch` downstream gate 用に verification pass の generate ツリーを置く。"""
-    gen_dir = repo_root / _FIX_PIPE_REF / "generate" / generation_id
+def _fixture_generate_downstream_ready(repo_root: Path, *, source_id: str = "src_fixture_001") -> None:
+    """`build` の `pre_phase_launch` downstream gate 用に verification pass の source ツリーを置く。"""
+    gen_dir = repo_root / _FIX_PIPE_REF / "source" / source_id
     gen_dir.mkdir(parents=True, exist_ok=True)
-    (gen_dir / "generate_meta.json").write_text(
+    (gen_dir / "source_meta.json").write_text(
         json.dumps({"verification_status": "pass"}),
         encoding="utf-8",
     )
+
+
+
+
+def _mark_dependencies_ready(repo_root: Path, orchestration_id: str = "orch_001") -> None:
+    """Inject `dependency_readiness` so `_dependency_ready` accepts the launch."""
+    meta_path = (
+        repo_root / "workspace" / "orchestrations" / orchestration_id / "orchestration_meta.json"
+    )
+    if not meta_path.is_file():
+        return
+    meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    meta["dependency_readiness"] = {
+        "direct_dependency_compile_readiness": True,
+        "direct_dependency_execution_readiness": True,
+        "detail": {
+            "ir_ref_verified": True,
+            "pipeline_ref_verified": True,
+            "aggregate_verdict_verified": True,
+        },
+    }
+    meta_path.write_text(json.dumps(meta, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
 
 def _fixture_skill_must_read_refs_step(step: str) -> str:
@@ -99,7 +121,7 @@ def _fixture_skill_must_read_refs_step(step: str) -> str:
                 "step": step,
                 "skill_name": skill_name,
                 "skill_ref": f"skills/{skill_name}/SKILL.md",
-                "plan_ref": _FIX_PLAN_REF,
+                "ir_ref": _FIX_IR_REF,
                 "pipeline_ref": _FIX_PIPE_REF,
                 "dependency_ref": _FIX_DEP_REF,
             }
@@ -107,7 +129,7 @@ def _fixture_skill_must_read_refs_step(step: str) -> str:
     )
 
 
-def _fixture_skill_must_read_refs_substep(step: str, substep: str, *, generation_id: str | None = None) -> str:
+def _fixture_skill_must_read_refs_substep(step: str, substep: str, *, source_id: str | None = None) -> str:
     skill_name = f"workflow-{step}-{substep}"
     payload: dict[str, str | None] = {
         "node_key": "problem/shallow_water2d@0.3.0",
@@ -115,12 +137,12 @@ def _fixture_skill_must_read_refs_substep(step: str, substep: str, *, generation
         "substep": substep,
         "skill_name": skill_name,
         "skill_ref": f"skills/{skill_name}/SKILL.md",
-        "plan_ref": _FIX_PLAN_REF,
+        "ir_ref": _FIX_IR_REF,
         "pipeline_ref": _FIX_PIPE_REF,
         "dependency_ref": _dep_ref_for_step(step),
     }
-    if generation_id:
-        payload["generation_id"] = generation_id
+    if source_id:
+        payload["source_id"] = source_id
     return ",".join(build_skill_must_read_refs(payload))
 
 
@@ -132,7 +154,7 @@ def _step_launch_prompt(node_key: str, step: str, agent_run_id: str) -> str:
         "orchestration_id": "orch_001",
         "parent_agent_run_id": "orch_run_001",
         "workflow_mode": "dev",
-        "plan_ref": _FIX_PLAN_REF,
+        "ir_ref": _FIX_IR_REF,
         "pipeline_ref": _FIX_PIPE_REF,
         "dependency_ref": _FIX_DEP_REF,
         "skill_name": f"workflow-{step}",
@@ -154,7 +176,7 @@ def _substep_launch_prompt(node_key: str, step: str, substep: str, agent_run_id:
         "orchestration_id": "orch_001",
         "parent_agent_run_id": "orch_run_001",
         "workflow_mode": "dev",
-        "plan_ref": _FIX_PLAN_REF,
+        "ir_ref": _FIX_IR_REF,
         "pipeline_ref": _FIX_PIPE_REF,
         "dependency_ref": _dep_ref_for_step(step),
         "skill_name": f"workflow-{step}-{substep}",
@@ -175,13 +197,13 @@ def _spawn_response_payload(session_id: str) -> dict[str, object]:
     }
 
 
-def _plant_impl_resolved_yaml_make(repo_root: Path, plan_ref: str = _FIX_PLAN_REF) -> None:
-    """Plant impl.resolved.yaml with toolchain.build_system: make.
+def _plant_spec_ir_yaml_make(repo_root: Path, ir_ref: str = _FIX_IR_REF) -> None:
+    """Plant spec.ir.yaml with toolchain.build_system: make.
 
     Required for tests that exercise cross-phase canonical placement: record_launch
     reads this file to gate cross-phase auto-inject on Make toolchain.
     """
-    p = repo_root / plan_ref / "impl.resolved.yaml"
+    p = repo_root / ir_ref / "spec.ir.yaml"
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(
         "toolchain:\n  language: fortran\n  build_system: make\n",
@@ -287,8 +309,8 @@ class CodexOrchestrationRuntimeTests(unittest.TestCase):
                 ],
             }
             run_records = {
-                "sub_old": {"agent_role": "substep", "node_key": "problem/shallow_water2d@0.3.0", "step": "plan", "status": "fail"},
-                "sub_new": {"agent_role": "substep", "node_key": "problem/shallow_water2d@0.3.0", "step": "plan", "status": "pass"},
+                "sub_old": {"agent_role": "substep", "node_key": "problem/shallow_water2d@0.3.0", "step": "compile", "status": "fail"},
+                "sub_new": {"agent_role": "substep", "node_key": "problem/shallow_water2d@0.3.0", "step": "compile", "status": "pass"},
             }
             with self.assertRaisesRegex(ValueError, "must use repair_strategy='restart'"):
                 _effective_pass_substep_run_ids(
@@ -297,7 +319,7 @@ class CodexOrchestrationRuntimeTests(unittest.TestCase):
                     orchestration_id=orchestration_id,
                     run_records=run_records,
                     node_key="problem/shallow_water2d@0.3.0",
-                    step_token="plan",
+                    step_token="compile",
                 )
 
     def test_parse_feature_list_extracts_boolean_flags(self) -> None:
@@ -668,25 +690,25 @@ shell_tool                       stable             true
         payload = prepare_launch_request_payload(
             {
                 "node_key": "problem/shallow_water2d@0.3.0",
-                "step": "plan",
+                "step": "compile",
                 "substep": "verify",
                 "orchestration_id": "orch_001",
                 "agent_run_id": "substep_run_plan_verify_001",
                 "parent_agent_run_id": "orch_run_001",
-                "plan_ref": "workspace/plans/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001",
+                "ir_ref": "workspace/ir/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001",
                 "pipeline_ref": "workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001",
-                "dependency_ref": "workspace/plans/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/dependency.resolved.yaml",
+                "dependency_ref": "workspace/ir/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/spec.ir.yaml",
             }
         )
-        self.assertEqual(payload["skill_name"], "workflow-plan-verify")
-        self.assertEqual(payload["skill_ref"], "skills/workflow-plan-verify/SKILL.md")
+        self.assertEqual(payload["skill_name"], "workflow-compile-verify")
+        self.assertEqual(payload["skill_ref"], "skills/workflow-compile-verify/SKILL.md")
         self.assertEqual(payload["issue_severity"], "none")
         self.assertIn("docs/workflow/WORKFLOW_CORE.md", payload["skill_must_read_refs"])
-        self.assertIn("docs/workflow/phases/phase_01_plan.md", payload["skill_must_read_refs"])
+        self.assertIn("docs/workflow/phases/phase_01_compile.md", payload["skill_must_read_refs"])
         self.assertIn("docs/ORCHESTRATION.md", payload["skill_must_read_refs"])
-        self.assertIn("skills/workflow-plan-verify/SKILL.md", payload["skill_must_read_refs"])
-        self.assertNotIn(
-            "workspace/plans/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/derived_contract.json",
+        self.assertIn("skills/workflow-compile-verify/SKILL.md", payload["skill_must_read_refs"])
+        self.assertIn(
+            "workspace/ir/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/spec.ir.yaml",
             payload["skill_must_read_refs"],
         )
         self.assertIn("必須要件:", payload["launch_prompt_full"])
@@ -699,9 +721,9 @@ shell_tool                       stable             true
                 "orchestration_id": "orch_001",
                 "agent_run_id": "step_run_build_001",
                 "parent_agent_run_id": "orch_run_001",
-                "plan_ref": "workspace/plans/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001",
+                "ir_ref": "workspace/ir/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001",
                 "pipeline_ref": "workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001",
-                "dependency_ref": "workspace/plans/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/dependency.resolved.yaml",
+                "dependency_ref": "workspace/ir/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/spec.ir.yaml",
                 "skill_name": "workflow-build",
                 "skill_ref": "skills/workflow-build/SKILL.md",
                 "skill_must_read_refs": _fixture_skill_must_read_refs_step("build"),
@@ -725,6 +747,7 @@ shell_tool                       stable             true
                 spec_ref="spec/problem/shallow_water2d/controlled_spec.md",
                 source_dependency_ref="spec/problem/shallow_water2d/deps.yaml",
             )
+            _mark_dependencies_ready(repo_root)
             write_preflight(
                 repo_root=repo_root,
                 orchestration_id="orch_001",
@@ -749,23 +772,23 @@ shell_tool                       stable             true
                     "agent_run_id": "substep_run_plan_generate_001",
                     "agent_role": "substep",
                     "node_key": "problem/shallow_water2d@0.3.0",
-                    "step": "plan",
+                    "step": "compile",
                     "substep": "generate",
                     "orchestration_id": "orch_001",
                     "parent_agent_run_id": "orch_run_001",
-                    "plan_ref": "workspace/plans/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001",
+                    "ir_ref": "workspace/ir/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001",
                     "pipeline_ref": "workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001",
                     "dependency_ref": "spec/problem/shallow_water2d/deps.yaml",
-                    "skill_name": "workflow-plan-generate",
-                    "skill_ref": "skills/workflow-plan-generate/SKILL.md",
+                    "skill_name": "workflow-compile-generate",
+                    "skill_ref": "skills/workflow-compile-generate/SKILL.md",
                     "skill_must_read_refs": "",
                     "allowed_output_paths": [
-                        "workspace/plans/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/case.resolved.yaml",
-                        "workspace/plans/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/plan_meta.json",
+                        "workspace/ir/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/spec.ir.yaml",
+                        "workspace/ir/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/ir_meta.json",
                     ],
                     "launch_prompt_full": _substep_launch_prompt(
                         "problem/shallow_water2d@0.3.0",
-                        "plan",
+                        "compile",
                         "generate",
                         "substep_run_plan_generate_001",
                     ),
@@ -787,14 +810,14 @@ shell_tool                       stable             true
                     "step": "build",
                     "orchestration_id": "orch_001",
                     "parent_agent_run_id": "orch_run_001",
-                    "plan_ref": "workspace/plans/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001",
+                    "ir_ref": "workspace/ir/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001",
                     "pipeline_ref": "workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001",
-                    "dependency_ref": "workspace/plans/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/dependency.resolved.yaml",
+                    "dependency_ref": "workspace/ir/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/spec.ir.yaml",
                     "skill_name": "workflow-build",
                     "skill_ref": "skills/workflow-build/SKILL.md",
                     "skill_must_read_refs": "",
                     "allowed_output_paths": [
-                        "workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/build/build_001/bin/simulate",
+                        "workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/binary/bin_001/bin/simulate",
                     ],
                     "launch_prompt_full": _step_launch_prompt(
                         "problem/shallow_water2d@0.3.0",
@@ -825,8 +848,8 @@ shell_tool                       stable             true
                 agent_run_id="substep_run_plan_generate_001",
                 actor_role="substep",
                 changed_paths=[
-                    "workspace/plans/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/case.resolved.yaml",
-                    "workspace/plans/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/plan_meta.json",
+                    "workspace/ir/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/spec.ir.yaml",
+                    "workspace/ir/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/ir_meta.json",
                 ],
             )
             record_agent_run(
@@ -837,7 +860,7 @@ shell_tool                       stable             true
                     "parent_agent_run_id": "orch_run_001",
                     "agent_role": "substep",
                     "node_key": "problem/shallow_water2d@0.3.0",
-                    "step": "plan",
+                    "step": "compile",
                     "substep": "generate",
                     "status": "pass",
                     "agent_backend": "codex",
@@ -851,8 +874,8 @@ shell_tool                       stable             true
                     "started_at": "2026-03-11T00:00:10Z",
                     "finished_at": "2026-03-11T00:00:50Z",
                     "output_refs": [
-                        "workspace/plans/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/case.resolved.yaml",
-                        "workspace/plans/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/plan_meta.json",
+                        "workspace/ir/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/spec.ir.yaml",
+                        "workspace/ir/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/ir_meta.json",
                     ],
                 },
             )
@@ -862,7 +885,7 @@ shell_tool                       stable             true
                 agent_run_id="step_run_build_001",
                 actor_role="step",
                 changed_paths=[
-                    "workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/build/build_001/bin/simulate"
+                    "workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/binary/bin_001/bin/simulate"
                 ],
             )
             record_agent_run(
@@ -882,35 +905,36 @@ shell_tool                       stable             true
                     "started_at": "2026-03-11T00:00:20Z",
                     "finished_at": "2026-03-11T00:01:10Z",
                     "output_refs": [
-                        "workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/build/build_001/bin/simulate"
+                        "workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/binary/bin_001/bin/simulate"
                     ],
                 },
             )
 
-            plan_meta_path = (
+            ir_meta_path = (
                 repo_root
-                / "workspace/plans/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/plan_meta.json"
+                / "workspace/ir/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/ir_meta.json"
             )
-            plan_meta_path.parent.mkdir(parents=True, exist_ok=True)
-            plan_meta_path.write_text(
-                json.dumps(self._valid_plan_meta()),
+            ir_meta_path.parent.mkdir(parents=True, exist_ok=True)
+            ir_meta_path.write_text(
+                json.dumps(self._valid_ir_meta()),
                 encoding="utf-8",
             )
             write_step_result(
                 repo_root=repo_root,
                 orchestration_id="orch_001",
                 node_key="problem/shallow_water2d@0.3.0",
-                step="plan",
+                step="compile",
                 agent_run_id="orch_run_001",
                 payload={
                     "status": "pass",
                     "required_outputs": [
-                        "workspace/plans/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/case.resolved.yaml",
-                        "workspace/plans/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/plan_meta.json",
+                        "workspace/ir/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/spec.ir.yaml",
+                        "workspace/ir/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/ir_meta.json",
                     ],
                     "failed_substeps": [],
                     "substep_agent_run_ids": ["substep_run_plan_generate_001"],
                     "executor_agent_run_id": "orch_run_001",
+                    "validation_stage": "compile",
                 },
             )
             write_step_result(
@@ -923,7 +947,7 @@ shell_tool                       stable             true
                     "status": "pass",
                     "validation_stage": "post_build",
                     "required_outputs": [
-                        "workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/build/build_001/bin/simulate"
+                        "workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/binary/bin_001/bin/simulate"
                     ],
                     "failed_substeps": [],
                     "substep_agent_run_ids": [],
@@ -1002,7 +1026,7 @@ shell_tool                       stable             true
                     orch_root
                     / "steps"
                     / "problem__shallow_water2d__0.3.0"
-                    / "plan"
+                    / "compile"
                     / "orch_run_001"
                     / "step_result.json"
                 ).exists()
@@ -1090,6 +1114,7 @@ shell_tool                       stable             true
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
             init_orchestration(repo_root=repo_root, orchestration_id="orch_001")
+            _mark_dependencies_ready(repo_root)
             write_preflight(
                 repo_root=repo_root,
                 orchestration_id="orch_001",
@@ -1112,22 +1137,22 @@ shell_tool                       stable             true
                     "agent_run_id": "substep_run_strip_001",
                     "agent_role": "substep",
                     "node_key": "problem/shallow_water2d@0.3.0",
-                    "step": "plan",
+                    "step": "compile",
                     "substep": "generate",
                     "orchestration_id": "orch_001",
                     "parent_agent_run_id": "orch_run_001",
-                    "plan_ref": "workspace/plans/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001",
+                    "ir_ref": "workspace/ir/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001",
                     "pipeline_ref": "workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001",
                     "dependency_ref": "spec/problem/shallow_water2d/deps.yaml",
-                    "skill_name": "workflow-plan-generate",
-                    "skill_ref": "skills/workflow-plan-generate/SKILL.md",
+                    "skill_name": "workflow-compile-generate",
+                    "skill_ref": "skills/workflow-compile-generate/SKILL.md",
                     "skill_must_read_refs": "",
                     "allowed_output_paths": [
-                        "workspace/plans/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/case.resolved.yaml",
+                        "workspace/ir/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/spec.ir.yaml",
                     ],
                     "launch_prompt_full": _substep_launch_prompt(
                         "problem/shallow_water2d@0.3.0",
-                        "plan",
+                        "compile",
                         "generate",
                         "substep_run_strip_001",
                     ),
@@ -1155,6 +1180,7 @@ shell_tool                       stable             true
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
             init_orchestration(repo_root=repo_root, orchestration_id="orch_001")
+            _mark_dependencies_ready(repo_root)
             write_preflight(
                 repo_root=repo_root,
                 orchestration_id="orch_001",
@@ -1170,7 +1196,7 @@ shell_tool                       stable             true
             )
             full_prompt = _substep_launch_prompt(
                 "problem/shallow_water2d@0.3.0",
-                "plan",
+                "compile",
                 "generate",
                 "substep_run_plan_generate_001",
             )
@@ -1181,15 +1207,15 @@ shell_tool                       stable             true
                 child_agent_run_id="substep_run_plan_generate_001",
                 request_payload={
                     "node_key": "problem/shallow_water2d@0.3.0",
-                    "step": "plan",
+                    "step": "compile",
                     "substep": "generate",
                     "orchestration_id": "orch_001",
                     "parent_agent_run_id": "orch_run_001",
-                    "plan_ref": "workspace/plans/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001",
+                    "ir_ref": "workspace/ir/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001",
                     "pipeline_ref": "workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001",
-                    "dependency_ref": _FIX_PLAN_STEP_DEP_REF,
-                    "skill_name": "workflow-plan-generate",
-                    "skill_ref": "skills/workflow-plan-generate/SKILL.md",
+                    "dependency_ref": _FIX_COMPILE_STEP_DEP_REF,
+                    "skill_name": "workflow-compile-generate",
+                    "skill_ref": "skills/workflow-compile-generate/SKILL.md",
                     "skill_must_read_refs": "",
                     "launch_prompt": "short summary",
                     "prompt": full_prompt,
@@ -1210,6 +1236,7 @@ shell_tool                       stable             true
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
             init_orchestration(repo_root=repo_root, orchestration_id="orch_001")
+            _mark_dependencies_ready(repo_root)
             write_preflight(
                 repo_root=repo_root,
                 orchestration_id="orch_001",
@@ -1230,26 +1257,26 @@ shell_tool                       stable             true
                 child_agent_run_id="substep_run_plan_generate_001",
                 request_payload={
                     "node_key": "problem/shallow_water2d@0.3.0",
-                    "step": "plan",
+                    "step": "compile",
                     "substep": "generate",
                     "orchestration_id": "orch_001",
                     "parent_agent_run_id": "orch_run_001",
-                    "plan_ref": "workspace/plans/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001",
+                    "ir_ref": "workspace/ir/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001",
                     "pipeline_ref": "workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001",
-                    "dependency_ref": _FIX_PLAN_STEP_DEP_REF,
-                    "skill_name": "workflow-plan-generate",
-                    "skill_ref": "skills/workflow-plan-generate/SKILL.md",
+                    "dependency_ref": _FIX_COMPILE_STEP_DEP_REF,
+                    "skill_name": "workflow-compile-generate",
+                    "skill_ref": "skills/workflow-compile-generate/SKILL.md",
                     "skill_must_read_refs": "",
                     "launch_prompt": "summary",
                     "prompt": _substep_launch_prompt(
                         "problem/shallow_water2d@0.3.0",
-                        "plan",
+                        "compile",
                         "generate",
                         "substep_run_plan_generate_001",
                     ),
                     "launch_prompt_full": _substep_launch_prompt(
                         "problem/shallow_water2d@0.3.0",
-                        "plan",
+                        "compile",
                         "generate",
                         "substep_run_plan_generate_001",
                     )
@@ -1269,7 +1296,7 @@ shell_tool                       stable             true
                 prompt_path.read_text(encoding="utf-8"),
                 _substep_launch_prompt(
                     "problem/shallow_water2d@0.3.0",
-                    "plan",
+                    "compile",
                     "generate",
                     "substep_run_plan_generate_001",
                 )
@@ -1280,6 +1307,7 @@ shell_tool                       stable             true
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
             init_orchestration(repo_root=repo_root, orchestration_id="orch_001")
+            _mark_dependencies_ready(repo_root)
             write_preflight(
                 repo_root=repo_root,
                 orchestration_id="orch_001",
@@ -1300,21 +1328,21 @@ shell_tool                       stable             true
                 child_agent_run_id="substep_run_plan_generate_001",
                 request_payload={
                     "node_key": "problem/shallow_water2d@0.3.0",
-                    "step": "plan",
+                    "step": "compile",
                     "substep": "generate",
                     "orchestration_id": "orch_001",
                     "parent_agent_run_id": "orch_run_001",
-                    "plan_ref": "workspace/plans/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001",
+                    "ir_ref": "workspace/ir/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001",
                     "pipeline_ref": "workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001",
-                    "dependency_ref": _FIX_PLAN_STEP_DEP_REF,
-                    "skill_name": "workflow-plan-generate",
-                    "skill_ref": "skills/workflow-plan-generate/SKILL.md",
+                    "dependency_ref": _FIX_COMPILE_STEP_DEP_REF,
+                    "skill_name": "workflow-compile-generate",
+                    "skill_ref": "skills/workflow-compile-generate/SKILL.md",
                     "skill_must_read_refs": "",
                     "launch_prompt": "summary only",
                     "spawn_request": {
                         "task": _substep_launch_prompt(
                             "problem/shallow_water2d@0.3.0",
-                            "plan",
+                            "compile",
                             "generate",
                             "substep_run_plan_generate_001",
                         ),
@@ -1334,7 +1362,7 @@ shell_tool                       stable             true
                 prompt_path.read_text(encoding="utf-8"),
                 _substep_launch_prompt(
                     "problem/shallow_water2d@0.3.0",
-                    "plan",
+                    "compile",
                     "generate",
                     "substep_run_plan_generate_001",
                 ),
@@ -1344,6 +1372,7 @@ shell_tool                       stable             true
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
             init_orchestration(repo_root=repo_root, orchestration_id="orch_001")
+            _mark_dependencies_ready(repo_root)
             write_preflight(
                 repo_root=repo_root,
                 orchestration_id="orch_001",
@@ -1369,9 +1398,9 @@ shell_tool                       stable             true
                         "orchestration_id": "orch_001",
                         "agent_run_id": "step_run_build_001",
                         "parent_agent_run_id": "orch_run_001",
-                        "plan_ref": "workspace/plans/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001",
+                        "ir_ref": "workspace/ir/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001",
                         "pipeline_ref": "workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001",
-                        "dependency_ref": "workspace/plans/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/dependency.resolved.yaml",
+                        "dependency_ref": "workspace/ir/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/spec.ir.yaml",
                         "skill_name": "workflow-build",
                         "skill_ref": "skills/workflow-build/SKILL.md",
                         "skill_must_read_refs": "",
@@ -1388,6 +1417,7 @@ shell_tool                       stable             true
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
             init_orchestration(repo_root=repo_root, orchestration_id="orch_001")
+            _mark_dependencies_ready(repo_root)
             write_preflight(
                 repo_root=repo_root,
                 orchestration_id="orch_001",
@@ -1413,13 +1443,13 @@ shell_tool                       stable             true
                     "orchestration_id": "orch_001",
                     "agent_run_id": "substep_run_generate_verify_001",
                     "parent_agent_run_id": "orch_run_001",
-                    "plan_ref": "workspace/plans/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001",
+                    "ir_ref": "workspace/ir/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001",
                     "pipeline_ref": "workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001",
-                    "dependency_ref": "workspace/plans/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/dependency.resolved.yaml",
-                    "generation_id": "gen_001",
+                    "dependency_ref": "workspace/ir/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/spec.ir.yaml",
+                    "source_id": "gen_001",
                     "skill_name": "workflow-generate-verify",
                     "skill_ref": "skills/workflow-generate-verify/SKILL.md",
-                    "skill_must_read_refs": "workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/generate/gen_001/generate_meta.json",
+                    "skill_must_read_refs": "workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/source/src_001/source_meta.json",
                 },
                 response_payload=_spawn_response_payload("sess_substep_run_generate_verify_001"),
             )
@@ -1427,11 +1457,11 @@ shell_tool                       stable             true
                 (repo_root / launch_refs["launch_request_ref"]).read_text(encoding="utf-8")
             )
             self.assertIn(
-                "workspace/plans/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/case.resolved.yaml",
+                "workspace/ir/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/spec.ir.yaml",
                 request_payload["skill_must_read_refs"],
             )
             self.assertIn(
-                "workspace/plans/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/derived_contract.json",
+                "workspace/ir/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/spec.ir.yaml",
                 request_payload["skill_must_read_refs"],
             )
             self.assertIn(
@@ -1439,7 +1469,7 @@ shell_tool                       stable             true
                 request_payload["skill_must_read_refs"],
             )
             self.assertIn(
-                "workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/generate/gen_001/generate_meta.json",
+                "workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/source/src_001/source_meta.json",
                 request_payload["skill_must_read_refs"],
             )
 
@@ -1448,6 +1478,7 @@ shell_tool                       stable             true
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
             init_orchestration(repo_root=repo_root, orchestration_id="orch_001")
+            _mark_dependencies_ready(repo_root)
             write_preflight(
                 repo_root=repo_root,
                 orchestration_id="orch_001",
@@ -1467,8 +1498,8 @@ shell_tool                       stable             true
                     ],
                 },
             )
-            gen_id = "gen_20260508_001"
-            src_dir = f"{_FIX_PIPE_REF}/generate/{gen_id}/src/"
+            src_id = "src_20260508_001"
+            src_dir = f"{_FIX_PIPE_REF}/source/{src_id}/src/"
             launch_refs = record_launch(
                 repo_root=repo_root,
                 orchestration_id="orch_001",
@@ -1481,10 +1512,10 @@ shell_tool                       stable             true
                     "agent_run_id": "step_run_gen_dir_001",
                     "orchestration_id": "orch_001",
                     "parent_agent_run_id": "orch_run_001",
-                    "plan_ref": _FIX_PLAN_REF,
+                    "ir_ref": _FIX_IR_REF,
                     "pipeline_ref": _FIX_PIPE_REF,
-                    "dependency_ref": f"{_FIX_PLAN_REF}/dependency.resolved.yaml",
-                    "generation_id": gen_id,
+                    "dependency_ref": f"{_FIX_IR_REF}/spec.ir.yaml",
+                    "source_id": src_id,
                     "allowed_output_paths": [src_dir],
                     "skill_name": "workflow-generate",
                     "skill_ref": "skills/workflow-generate/SKILL.md",
@@ -1514,10 +1545,11 @@ shell_tool                       stable             true
         repo_root: Path,
         orchestration_id: str,
         child_agent_run_id: str,
-        gen_id: str,
+        src_id: str,
         allowed_output_paths: list[str],
     ) -> Path:
         init_orchestration(repo_root=repo_root, orchestration_id=orchestration_id)
+        _mark_dependencies_ready(repo_root)
         write_preflight(
             repo_root=repo_root,
             orchestration_id=orchestration_id,
@@ -1549,10 +1581,10 @@ shell_tool                       stable             true
                 "agent_run_id": child_agent_run_id,
                 "orchestration_id": orchestration_id,
                 "parent_agent_run_id": "orch_run_001",
-                "plan_ref": _FIX_PLAN_REF,
+                "ir_ref": _FIX_IR_REF,
                 "pipeline_ref": _FIX_PIPE_REF,
-                "dependency_ref": f"{_FIX_PLAN_REF}/dependency.resolved.yaml",
-                "generation_id": gen_id,
+                "dependency_ref": f"{_FIX_IR_REF}/spec.ir.yaml",
+                "source_id": src_id,
                 "allowed_output_paths": allowed_output_paths,
                 "skill_name": "workflow-generate",
                 "skill_ref": "skills/workflow-generate/SKILL.md",
@@ -1577,13 +1609,13 @@ shell_tool                       stable             true
         """Generate step launches must auto-inject <gen>/src/mcp_command_log.jsonl."""
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
-            gen_id = "gen_20260510_001"
-            src_dir = f"{_FIX_PIPE_REF}/generate/{gen_id}/src/"
+            src_id = "src_20260510_001"
+            src_dir = f"{_FIX_PIPE_REF}/source/{src_id}/src/"
             manifest_path = self._record_generate_launch_with_outputs(
                 repo_root=repo_root,
                 orchestration_id="orch_001",
                 child_agent_run_id="run_auto_inject_dir",
-                gen_id=gen_id,
+                src_id=src_id,
                 allowed_output_paths=[src_dir],
             )
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -1594,14 +1626,14 @@ shell_tool                       stable             true
         """Pre-listing the log path must not duplicate it after auto-inject."""
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
-            gen_id = "gen_20260510_002"
-            src_dir = f"{_FIX_PIPE_REF}/generate/{gen_id}/src/"
+            src_id = "src_20260510_002"
+            src_dir = f"{_FIX_PIPE_REF}/source/{src_id}/src/"
             log_path = f"{src_dir}mcp_command_log.jsonl"
             manifest_path = self._record_generate_launch_with_outputs(
                 repo_root=repo_root,
                 orchestration_id="orch_001",
                 child_agent_run_id="run_auto_inject_idempotent",
-                gen_id=gen_id,
+                src_id=src_id,
                 allowed_output_paths=[src_dir, log_path],
             )
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -1612,35 +1644,35 @@ shell_tool                       stable             true
         """File-only entries under <gen>/src/ must still trigger log path injection."""
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
-            gen_id = "gen_20260510_003"
-            src_file = f"{_FIX_PIPE_REF}/generate/{gen_id}/src/main.f90"
+            src_id = "src_20260510_003"
+            src_file = f"{_FIX_PIPE_REF}/source/{src_id}/src/main.f90"
             manifest_path = self._record_generate_launch_with_outputs(
                 repo_root=repo_root,
                 orchestration_id="orch_001",
                 child_agent_run_id="run_auto_inject_file_entry",
-                gen_id=gen_id,
+                src_id=src_id,
                 allowed_output_paths=[src_file],
             )
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-            expected = f"{_FIX_PIPE_REF}/generate/{gen_id}/src/mcp_command_log.jsonl"
+            expected = f"{_FIX_PIPE_REF}/source/{src_id}/src/mcp_command_log.jsonl"
             self.assertIn(expected, manifest["allowed_output_paths"])
 
     def test_auto_inject_skipped_when_no_src_entry(self) -> None:
         """Without any src/ entry the log path must NOT be injected."""
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
-            gen_id = "gen_20260510_004"
-            generate_meta = (
-                f"{_FIX_PIPE_REF}/generate/{gen_id}/generate_meta.json"
+            src_id = "src_20260510_004"
+            source_meta = (
+                f"{_FIX_PIPE_REF}/source/{src_id}/source_meta.json"
             )
             manifest_path = self._record_generate_launch_with_outputs(
                 repo_root=repo_root,
                 orchestration_id="orch_001",
                 child_agent_run_id="run_auto_inject_no_src",
-                gen_id=gen_id,
+                src_id=src_id,
                 allowed_output_paths=[
                     f"{_FIX_PIPE_REF}/lineage.json",
-                    generate_meta,
+                    source_meta,
                 ],
             )
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -1651,115 +1683,115 @@ shell_tool                       stable             true
                 )
 
     def test_generate_launch_rejects_listed_paths_for_multiple_generations(self) -> None:
-        """A generate launch must target exactly one generation_id.
+        """A generate launch must target exactly one source_id.
 
-        Listing paths under two distinct <gen_id>/src/ prefixes would let the
+        Listing paths under two distinct <src_id>/src/ prefixes would let the
         launch silently auto-inject MCP-owned audit logs for both, granting
         write authority across sibling generations and breaking provenance
         isolation.
         """
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
-            gen1 = "gen_20260510_005"
-            gen2 = "gen_20260510_006"
-            src1 = f"{_FIX_PIPE_REF}/generate/{gen1}/src/"
-            src2 = f"{_FIX_PIPE_REF}/generate/{gen2}/src/"
+            src1 = "src_20260510_005"
+            src2 = "src_20260510_006"
+            src1 = f"{_FIX_PIPE_REF}/source/{src1}/src/"
+            src2 = f"{_FIX_PIPE_REF}/source/{src2}/src/"
             with self.assertRaisesRegex(
-                ValueError, "must target a single generation_id"
+                ValueError, "must target a single source_id"
             ):
                 self._record_generate_launch_with_outputs(
                     repo_root=repo_root,
                     orchestration_id="orch_001",
                     child_agent_run_id="run_auto_inject_multi",
-                    gen_id=gen1,
+                    src_id=src1,
                     allowed_output_paths=[src1, src2],
                 )
 
     def test_generate_launch_rejects_listed_path_for_other_generation(self) -> None:
-        """If request.generation_id is set, listed paths must use that gen_id only."""
+        """If request.source_id is set, listed paths must use that src_id only."""
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
-            real_gen = "gen_20260510_007"
-            other_gen = "gen_20260510_008"
-            src_other = f"{_FIX_PIPE_REF}/generate/{other_gen}/src/"
+            real_gen = "src_20260510_007"
+            other_src = "src_20260510_008"
+            src_other = f"{_FIX_PIPE_REF}/source/{other_src}/src/"
             with self.assertRaisesRegex(
                 ValueError,
-                "must target a single generation_id|does not match request generation_id",
+                "must target a single source_id|does not match request source_id",
             ):
                 self._record_generate_launch_with_outputs(
                     repo_root=repo_root,
                     orchestration_id="orch_001",
                     child_agent_run_id="run_gen_mismatch",
-                    gen_id=real_gen,
+                    src_id=real_gen,
                     allowed_output_paths=[src_other],
                 )
 
-    def test_execute_launch_rejects_listed_path_for_other_execution_id(self) -> None:
-        """If request.execution_id is set, listed paths must use that exec_id only."""
+    def test_validate_launch_rejects_listed_path_for_other_run_id(self) -> None:
+        """If request.run_id is set, listed paths must use that run_id only."""
         from tools.orchestration_runtime import _allowed_output_paths_for_launch
 
         node_safe = "problem__shallow_water2d__0.3.0"
         req = {
             "agent_role": "step",
             "node_key": "problem/shallow_water2d@0.3.0",
-            "step": "execute",
-            "plan_ref": _FIX_PLAN_REF,
+            "step": "validate", "substep": "execute",
+            "ir_ref": _FIX_IR_REF,
             "pipeline_ref": _FIX_PIPE_REF,
-            "execution_id": "exec_real_001",
+            "run_id": "exec_real_001",
             "allowed_output_paths": [
-                # Caller declares execution_id=exec_real_001 but lists a path
-                # under a different execution_id.
-                f"{_FIX_PIPE_REF}/execute/exec_other_002/{node_safe}/diagnostics.json",
+                # Caller declares run_id=exec_real_001 but lists a path
+                # under a different run_id.
+                f"{_FIX_PIPE_REF}/runs/run_other_002/{node_safe}/diagnostics.json",
             ],
         }
         with self.assertRaisesRegex(
             ValueError,
-            "must target a single execution_id|does not match request execution_id",
+            "must target a single run_id|does not match request run_id",
         ):
             _allowed_output_paths_for_launch(
                 request_payload=req,
-                write_roots=[f"{_FIX_PIPE_REF}/execute/"],
+                write_roots=[f"{_FIX_PIPE_REF}/runs/"],
             )
 
     def test_build_launch_accepts_cross_phase_log_for_make_build(self) -> None:
         """In-source Make builds (Fortran/C family) run compile_project with
         project_dir=<gen>/src/, so the MCP audit log lands in the generate
         tree. The build launch must auto-inject the cross-phase canonical
-        placement when generation_id is provided.
+        placement when source_id is provided.
         """
         from tools.orchestration_runtime import (
             _allowed_output_paths_for_launch,
             _canonical_mcp_audit_log_paths_for_request,
         )
 
-        gen_id = "gen_make_build_001"
-        build_id = "build_make_001"
+        src_id = "src_make_build_001"
+        binary_id = "build_make_001"
         cross_log = (
-            f"{_FIX_PIPE_REF}/generate/{gen_id}/src/mcp_command_log.jsonl"
+            f"{_FIX_PIPE_REF}/source/{src_id}/src/mcp_command_log.jsonl"
         )
         in_phase_log = (
-            f"{_FIX_PIPE_REF}/build/{build_id}/mcp_command_log.jsonl"
+            f"{_FIX_PIPE_REF}/binary/{binary_id}/mcp_command_log.jsonl"
         )
         req = {
             "agent_role": "step",
             "node_key": "problem/shallow_water2d@0.3.0",
             "step": "build",
-            "plan_ref": _FIX_PLAN_REF,
+            "ir_ref": _FIX_IR_REF,
             "pipeline_ref": _FIX_PIPE_REF,
-            "generation_id": gen_id,
+            "source_id": src_id,
             # `_resolved_build_system` is normally injected by record_launch
-            # from impl.resolved.yaml; for direct helper tests we set it.
+            # from spec.ir.yaml; for direct helper tests we set it.
             "_resolved_build_system": "make",
             "allowed_output_paths": [
-                f"{_FIX_PIPE_REF}/build/{build_id}/build_meta.json",
-                f"{_FIX_PIPE_REF}/build/{build_id}/bin/main",
+                f"{_FIX_PIPE_REF}/binary/{binary_id}/binary_meta.json",
+                f"{_FIX_PIPE_REF}/binary/{binary_id}/bin/main",
             ],
         }
         out = _allowed_output_paths_for_launch(
             request_payload=req,
             write_roots=[
-                f"{_FIX_PIPE_REF}/build/",
-                f"{_FIX_PIPE_REF}/generate/",
+                f"{_FIX_PIPE_REF}/binary/",
+                f"{_FIX_PIPE_REF}/source/",
             ],
         )
         # Both placements (in-phase and cross-phase) auto-injected.
@@ -1774,37 +1806,37 @@ shell_tool                       stable             true
 
         For CMake/Meson/Ninja or any out-of-source build, the cross-phase
         generate-tree audit log must NOT be auto-injected even when
-        generation_id is provided. Otherwise non-Make builds would gain
+        source_id is provided. Otherwise non-Make builds would gain
         write authority into the generate tree contrary to spec.
         """
         from tools.orchestration_runtime import _allowed_output_paths_for_launch
 
-        gen_id = "gen_cmake_001"
-        build_id = "build_cmake_001"
+        src_id = "src_cmake_001"
+        binary_id = "build_cmake_001"
         cross_log = (
-            f"{_FIX_PIPE_REF}/generate/{gen_id}/src/mcp_command_log.jsonl"
+            f"{_FIX_PIPE_REF}/source/{src_id}/src/mcp_command_log.jsonl"
         )
         in_phase_log = (
-            f"{_FIX_PIPE_REF}/build/{build_id}/mcp_command_log.jsonl"
+            f"{_FIX_PIPE_REF}/binary/{binary_id}/mcp_command_log.jsonl"
         )
         req = {
             "agent_role": "step",
             "node_key": "problem/shallow_water2d@0.3.0",
             "step": "build",
-            "plan_ref": _FIX_PLAN_REF,
+            "ir_ref": _FIX_IR_REF,
             "pipeline_ref": _FIX_PIPE_REF,
-            "generation_id": gen_id,
+            "source_id": src_id,
             # Non-Make toolchain → cross-phase not authorized.
             "_resolved_build_system": "cmake",
             "allowed_output_paths": [
-                f"{_FIX_PIPE_REF}/build/{build_id}/build_meta.json",
-                f"{_FIX_PIPE_REF}/build/{build_id}/bin/main",
+                f"{_FIX_PIPE_REF}/binary/{binary_id}/binary_meta.json",
+                f"{_FIX_PIPE_REF}/binary/{binary_id}/bin/main",
             ],
         }
         out = _allowed_output_paths_for_launch(
             request_payload=req,
             write_roots=[
-                f"{_FIX_PIPE_REF}/build/",
+                f"{_FIX_PIPE_REF}/binary/",
             ],
         )
         # In-phase log is auto-injected; cross-phase is NOT.
@@ -1819,7 +1851,8 @@ shell_tool                       stable             true
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
             init_orchestration(repo_root=repo_root, orchestration_id="orch_001")
-            _plant_impl_resolved_yaml_make(repo_root)
+            _mark_dependencies_ready(repo_root)
+            _plant_spec_ir_yaml_make(repo_root)
             write_preflight(
                 repo_root=repo_root,
                 orchestration_id="orch_001",
@@ -1844,19 +1877,19 @@ shell_tool                       stable             true
                 },
             )
             failed_gen = "gen_failed_for_build"
-            build_id = "build_against_failed_001"
+            binary_id = "build_against_failed_001"
             # Pre_phase_launch requires AT LEAST ONE pass-state generation
             # under the pipeline. Plant one so the gate doesn't fire before
             # our cross-phase verification reaches the failed gen the launch
             # actually targets.
-            ok_gen_dir = repo_root / f"{_FIX_PIPE_REF}/generate/gen_ok_001"
+            ok_gen_dir = repo_root / f"{_FIX_PIPE_REF}/source/src_ok_001"
             ok_gen_dir.mkdir(parents=True, exist_ok=True)
-            (ok_gen_dir / "generate_meta.json").write_text(
+            (ok_gen_dir / "source_meta.json").write_text(
                 '{"verification_status": "pass"}\n', encoding="utf-8"
             )
-            gen_dir = repo_root / f"{_FIX_PIPE_REF}/generate/{failed_gen}"
+            gen_dir = repo_root / f"{_FIX_PIPE_REF}/source/{failed_gen}"
             gen_dir.mkdir(parents=True, exist_ok=True)
-            (gen_dir / "generate_meta.json").write_text(
+            (gen_dir / "source_meta.json").write_text(
                 '{"verification_status": "fail"}\n', encoding="utf-8"
             )
             with self.assertRaisesRegex(
@@ -1874,15 +1907,15 @@ shell_tool                       stable             true
                         "orchestration_id": "orch_001",
                         "agent_run_id": "step_run_build_failed_gen",
                         "parent_agent_run_id": "orch_run_001",
-                        "plan_ref": _FIX_PLAN_REF,
+                        "ir_ref": _FIX_IR_REF,
                         "pipeline_ref": _FIX_PIPE_REF,
                         "dependency_ref": _FIX_DEP_REF,
-                        "generation_id": failed_gen,
+                        "source_id": failed_gen,
                         "skill_name": "workflow-build",
                         "skill_ref": "skills/workflow-build/SKILL.md",
                         "skill_must_read_refs": _fixture_skill_must_read_refs_step("build"),
                         "allowed_output_paths": [
-                            f"{_FIX_PIPE_REF}/build/{build_id}/build_meta.json",
+                            f"{_FIX_PIPE_REF}/binary/{binary_id}/binary_meta.json",
                         ],
                         "launch_prompt_full": _step_launch_prompt(
                             "problem/shallow_water2d@0.3.0",
@@ -1894,24 +1927,24 @@ shell_tool                       stable             true
                 )
 
     def test_build_launch_rejects_listed_paths_for_multiple_build_ids(self) -> None:
-        """A build launch must target exactly one build_id."""
+        """A build launch must target exactly one binary_id."""
         from tools.orchestration_runtime import _allowed_output_paths_for_launch
 
         req = {
             "agent_role": "step",
             "node_key": "problem/shallow_water2d@0.3.0",
             "step": "build",
-            "plan_ref": _FIX_PLAN_REF,
+            "ir_ref": _FIX_IR_REF,
             "pipeline_ref": _FIX_PIPE_REF,
             "allowed_output_paths": [
-                f"{_FIX_PIPE_REF}/build/build_a/build_meta.json",
-                f"{_FIX_PIPE_REF}/build/build_b/build_meta.json",
+                f"{_FIX_PIPE_REF}/binary/bin_a/binary_meta.json",
+                f"{_FIX_PIPE_REF}/binary/bin_b/binary_meta.json",
             ],
         }
-        with self.assertRaisesRegex(ValueError, "must target a single build_id"):
+        with self.assertRaisesRegex(ValueError, "must target a single binary_id"):
             _allowed_output_paths_for_launch(
                 request_payload=req,
-                write_roots=[f"{_FIX_PIPE_REF}/build/"],
+                write_roots=[f"{_FIX_PIPE_REF}/binary/"],
             )
 
     def test_auto_inject_log_excluded_from_allowed_file_tool_paths(self) -> None:
@@ -1924,13 +1957,13 @@ shell_tool                       stable             true
         """
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
-            gen_id = "gen_20260510_007"
-            src_dir = f"{_FIX_PIPE_REF}/generate/{gen_id}/src/"
+            src_id = "src_20260510_007"
+            src_dir = f"{_FIX_PIPE_REF}/source/{src_id}/src/"
             manifest_path = self._record_generate_launch_with_outputs(
                 repo_root=repo_root,
                 orchestration_id="orch_001",
                 child_agent_run_id="run_log_not_filetool",
-                gen_id=gen_id,
+                src_id=src_id,
                 allowed_output_paths=[src_dir],
             )
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -1948,7 +1981,7 @@ shell_tool                       stable             true
         from tools.orchestration_runtime import _allowed_file_tool_paths_for_launch
 
         log_path = (
-            f"{_FIX_PIPE_REF}/generate/gen_20260510_008/src/mcp_command_log.jsonl"
+            f"{_FIX_PIPE_REF}/source/src_20260510_008/src/mcp_command_log.jsonl"
         )
         req = {
             "agent_role": "step",
@@ -1975,12 +2008,12 @@ shell_tool                       stable             true
             _canonical_mcp_audit_log_paths_for_request,
         )
 
-        gen_id = "gen_20260510_009"
+        src_id = "src_20260510_009"
         canonical_path = (
-            f"{_FIX_PIPE_REF}/generate/{gen_id}/src/mcp_command_log.jsonl"
+            f"{_FIX_PIPE_REF}/source/{src_id}/src/mcp_command_log.jsonl"
         )
         noncanonical_path = (
-            f"{_FIX_PIPE_REF}/generate/{gen_id}/src/notes/mcp_command_log.jsonl"
+            f"{_FIX_PIPE_REF}/source/{src_id}/src/notes/mcp_command_log.jsonl"
         )
         req = {
             "agent_role": "step",
@@ -2011,73 +2044,73 @@ shell_tool                       stable             true
         self.assertNotIn(canonical_path, out2)
 
     def test_build_phase_auto_injects_and_accepts_mcp_command_log(self) -> None:
-        """Build step must auto-inject <build_id>/mcp_command_log.jsonl (compile_project log)."""
+        """Build step must auto-inject <binary_id>/mcp_command_log.jsonl (compile_project log)."""
         from tools.orchestration_runtime import _allowed_output_paths_for_launch
 
-        build_id = "build_20260510_001"
+        binary_id = "bin_20260510_001"
         req = {
             "agent_role": "step",
             "node_key": "problem/shallow_water2d@0.3.0",
             "step": "build",
-            "plan_ref": _FIX_PLAN_REF,
+            "ir_ref": _FIX_IR_REF,
             "pipeline_ref": _FIX_PIPE_REF,
             "allowed_output_paths": [
-                f"{_FIX_PIPE_REF}/build/{build_id}/bin/main",
-                f"{_FIX_PIPE_REF}/build/{build_id}/build_meta.json",
+                f"{_FIX_PIPE_REF}/binary/{binary_id}/bin/main",
+                f"{_FIX_PIPE_REF}/binary/{binary_id}/binary_meta.json",
             ],
         }
         out = _allowed_output_paths_for_launch(
             request_payload=req,
-            write_roots=[f"{_FIX_PIPE_REF}/build/"],
+            write_roots=[f"{_FIX_PIPE_REF}/binary/"],
         )
-        expected_log = f"{_FIX_PIPE_REF}/build/{build_id}/mcp_command_log.jsonl"
+        expected_log = f"{_FIX_PIPE_REF}/binary/{binary_id}/mcp_command_log.jsonl"
         self.assertIn(expected_log, out)
 
     def test_build_phase_rejects_log_in_unrecognized_subdir(self) -> None:
-        """Build phase only accepts the log directly under <build_id>/, not under arbitrary subdirs."""
+        """Build phase only accepts the log directly under <binary_id>/, not under arbitrary subdirs."""
         from tools.orchestration_runtime import _allowed_output_paths_for_launch
 
-        build_id = "build_20260510_002"
+        binary_id = "bin_20260510_002"
         req = {
             "agent_role": "step",
             "node_key": "problem/shallow_water2d@0.3.0",
             "step": "build",
-            "plan_ref": _FIX_PLAN_REF,
+            "ir_ref": _FIX_IR_REF,
             "pipeline_ref": _FIX_PIPE_REF,
             "allowed_output_paths": [
-                # Log path under an unrecognized subdir (not /bin/, not directly under build_id).
-                f"{_FIX_PIPE_REF}/build/{build_id}/logs/mcp_command_log.jsonl",
+                # Log path under an unrecognized subdir (not /bin/, not directly under binary_id).
+                f"{_FIX_PIPE_REF}/binary/{binary_id}/logs/mcp_command_log.jsonl",
             ],
         }
         with self.assertRaisesRegex(ValueError, "outside phase contract"):
             _allowed_output_paths_for_launch(
                 request_payload=req,
-                write_roots=[f"{_FIX_PIPE_REF}/build/"],
+                write_roots=[f"{_FIX_PIPE_REF}/binary/"],
             )
 
     def test_execute_phase_auto_injects_and_accepts_mcp_command_log(self) -> None:
-        """Execute step must auto-inject <exec_id>/<node_safe>/mcp_command_log.jsonl."""
+        """Execute step must auto-inject <run_id>/<node_safe>/mcp_command_log.jsonl."""
         from tools.orchestration_runtime import _allowed_output_paths_for_launch
 
-        exec_id = "exec_20260510_001"
+        run_id = "run_20260510_001"
         node_safe = "problem__shallow_water2d__0.3.0"
         req = {
             "agent_role": "step",
             "node_key": "problem/shallow_water2d@0.3.0",
-            "step": "execute",
-            "plan_ref": _FIX_PLAN_REF,
+            "step": "validate", "substep": "execute",
+            "ir_ref": _FIX_IR_REF,
             "pipeline_ref": _FIX_PIPE_REF,
             "allowed_output_paths": [
-                f"{_FIX_PIPE_REF}/execute/{exec_id}/{node_safe}/diagnostics.json",
-                f"{_FIX_PIPE_REF}/execute/{exec_id}/{node_safe}/perf.json",
+                f"{_FIX_PIPE_REF}/runs/{run_id}/{node_safe}/diagnostics.json",
+                f"{_FIX_PIPE_REF}/runs/{run_id}/{node_safe}/perf.json",
             ],
         }
         out = _allowed_output_paths_for_launch(
             request_payload=req,
-            write_roots=[f"{_FIX_PIPE_REF}/execute/"],
+            write_roots=[f"{_FIX_PIPE_REF}/runs/"],
         )
         expected_log = (
-            f"{_FIX_PIPE_REF}/execute/{exec_id}/{node_safe}/mcp_command_log.jsonl"
+            f"{_FIX_PIPE_REF}/runs/{run_id}/{node_safe}/mcp_command_log.jsonl"
         )
         self.assertIn(expected_log, out)
 
@@ -2088,27 +2121,27 @@ shell_tool                       stable             true
             _allowed_output_paths_for_launch,
         )
 
-        build_id = "build_20260510_003"
+        binary_id = "bin_20260510_003"
         req = {
             "agent_role": "step",
             "node_key": "problem/shallow_water2d@0.3.0",
             "step": "build",
-            "plan_ref": _FIX_PLAN_REF,
+            "ir_ref": _FIX_IR_REF,
             "pipeline_ref": _FIX_PIPE_REF,
             "allowed_output_paths": [
-                f"{_FIX_PIPE_REF}/build/{build_id}/bin/main",
-                f"{_FIX_PIPE_REF}/build/{build_id}/build_meta.json",
+                f"{_FIX_PIPE_REF}/binary/{binary_id}/bin/main",
+                f"{_FIX_PIPE_REF}/binary/{binary_id}/binary_meta.json",
             ],
         }
         allowed = _allowed_output_paths_for_launch(
             request_payload=req,
-            write_roots=[f"{_FIX_PIPE_REF}/build/"],
+            write_roots=[f"{_FIX_PIPE_REF}/binary/"],
         )
         file_tool = _allowed_file_tool_paths_for_launch(
             request_payload=req,
             allowed_output_paths=allowed,
         )
-        log_path = f"{_FIX_PIPE_REF}/build/{build_id}/mcp_command_log.jsonl"
+        log_path = f"{_FIX_PIPE_REF}/binary/{binary_id}/mcp_command_log.jsonl"
         self.assertIn(log_path, allowed)
         self.assertNotIn(log_path, file_tool)
 
@@ -2116,6 +2149,7 @@ shell_tool                       stable             true
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
             init_orchestration(repo_root=repo_root, orchestration_id="orch_001")
+            _mark_dependencies_ready(repo_root)
             write_preflight(
                 repo_root=repo_root,
                 orchestration_id="orch_001",
@@ -2129,7 +2163,7 @@ shell_tool                       stable             true
                     "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
                 },
             )
-            with self.assertRaisesRegex(ValueError, "plan_ref must not contain placeholder"):
+            with self.assertRaisesRegex(ValueError, "ir_ref must not contain placeholder"):
                 record_launch(
                     repo_root=repo_root,
                     orchestration_id="orch_001",
@@ -2137,20 +2171,20 @@ shell_tool                       stable             true
                     child_agent_run_id="substep_run_plan_generate_001",
                     request_payload={
                         "node_key": "problem/shallow_water2d@0.3.0",
-                        "step": "plan",
+                        "step": "compile",
                         "substep": "generate",
                         "orchestration_id": "orch_001",
                         "agent_run_id": "substep_run_plan_generate_001",
                         "parent_agent_run_id": "orch_run_001",
-                        "plan_ref": "workspace/plans/problem__shallow_water2d__0.3.0/<agent-determined-plan-id>",
+                        "ir_ref": "workspace/ir/problem__shallow_water2d__0.3.0/<agent-determined-plan-id>",
                         "pipeline_ref": "workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001",
-                        "dependency_ref": "workspace/plans/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/dependency.resolved.yaml",
-                        "skill_name": "workflow-plan-generate",
-                        "skill_ref": "skills/workflow-plan-generate/SKILL.md",
+                        "dependency_ref": "workspace/ir/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/spec.ir.yaml",
+                        "skill_name": "workflow-compile-generate",
+                        "skill_ref": "skills/workflow-compile-generate/SKILL.md",
                         "skill_must_read_refs": "",
                         "launch_prompt_full": _substep_launch_prompt(
                             "problem/shallow_water2d@0.3.0",
-                            "plan",
+                            "compile",
                             "generate",
                             "substep_run_plan_generate_001",
                         ),
@@ -2162,6 +2196,7 @@ shell_tool                       stable             true
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
             init_orchestration(repo_root=repo_root, orchestration_id="orch_001")
+            _mark_dependencies_ready(repo_root)
             write_preflight(
                 repo_root=repo_root,
                 orchestration_id="orch_001",
@@ -2183,19 +2218,19 @@ shell_tool                       stable             true
                     child_agent_run_id="substep_run_plan_generate_001",
                     request_payload={
                         "node_key": "problem/shallow_water2d@0.3.0",
-                        "step": "plan",
+                        "step": "compile",
                         "substep": "generate",
                         "orchestration_id": "orch_001",
                         "agent_run_id": "substep_run_plan_generate_001",
                         "parent_agent_run_id": "orch_run_001",
-                        "plan_ref": "workspace/plans/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001",
+                        "ir_ref": "workspace/ir/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001",
                         "pipeline_ref": "workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001",
-                        "skill_name": "workflow-plan-generate",
-                        "skill_ref": "skills/workflow-plan-generate/SKILL.md",
+                        "skill_name": "workflow-compile-generate",
+                        "skill_ref": "skills/workflow-compile-generate/SKILL.md",
                         "skill_must_read_refs": "",
                         "launch_prompt_full": _substep_launch_prompt(
                             "problem/shallow_water2d@0.3.0",
-                            "plan",
+                            "compile",
                             "generate",
                             "substep_run_plan_generate_001",
                         ),
@@ -2207,6 +2242,7 @@ shell_tool                       stable             true
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
             init_orchestration(repo_root=repo_root, orchestration_id="orch_001")
+            _mark_dependencies_ready(repo_root)
             write_preflight(
                 repo_root=repo_root,
                 orchestration_id="orch_001",
@@ -2228,20 +2264,20 @@ shell_tool                       stable             true
                     child_agent_run_id="substep_run_plan_generate_001",
                     request_payload={
                         "node_key": "problem/shallow_water2d@0.3.0",
-                        "step": "plan",
+                        "step": "compile",
                         "substep": "generate",
                         "orchestration_id": "orch_001",
                         "agent_run_id": "substep_run_plan_generate_001",
                         "parent_agent_run_id": "orch_run_001",
-                        "plan_ref": "workspace/plans/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001",
+                        "ir_ref": "workspace/ir/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001",
                         "pipeline_ref": "workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001",
-                        "dependency_ref": "workspace/plans/problem__shallow_water2d__0.3.0/<agent-determined-dependency-ref>",
-                        "skill_name": "workflow-plan-generate",
-                        "skill_ref": "skills/workflow-plan-generate/SKILL.md",
+                        "dependency_ref": "workspace/ir/problem__shallow_water2d__0.3.0/<agent-determined-dependency-ref>",
+                        "skill_name": "workflow-compile-generate",
+                        "skill_ref": "skills/workflow-compile-generate/SKILL.md",
                         "skill_must_read_refs": "",
                         "launch_prompt_full": _substep_launch_prompt(
                             "problem/shallow_water2d@0.3.0",
-                            "plan",
+                            "compile",
                             "generate",
                             "substep_run_plan_generate_001",
                         ),
@@ -2253,6 +2289,7 @@ shell_tool                       stable             true
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
             init_orchestration(repo_root=repo_root, orchestration_id="orch_001")
+            _mark_dependencies_ready(repo_root)
             write_preflight(
                 repo_root=repo_root,
                 orchestration_id="orch_001",
@@ -2268,7 +2305,7 @@ shell_tool                       stable             true
             )
             bad_pipeline = (
                 "workspace/pipelines/problem__shallow_water2d__0.3.0/"
-                "shallow-water2d_20260415_001/generate/gen_001/generate_meta.json"
+                "shallow-water2d_20260415_001/source/src_001/source_meta.json"
             )
             with self.assertRaisesRegex(ValueError, "pipeline_ref must be exactly"):
                 record_launch(
@@ -2283,9 +2320,9 @@ shell_tool                       stable             true
                         "orchestration_id": "orch_001",
                         "agent_run_id": "substep_bad_pipeline_001",
                         "parent_agent_run_id": "orch_run_001",
-                        "plan_ref": "workspace/plans/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001",
+                        "ir_ref": "workspace/ir/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001",
                         "pipeline_ref": bad_pipeline,
-                        "dependency_ref": "workspace/plans/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/dependency.resolved.yaml",
+                        "dependency_ref": "workspace/ir/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/spec.ir.yaml",
                         "skill_name": "workflow-generate-generate",
                         "skill_ref": "skills/workflow-generate-generate/SKILL.md",
                         "skill_must_read_refs": "",
@@ -2294,10 +2331,11 @@ shell_tool                       stable             true
                     response_payload=_spawn_response_payload("sess_bad_pipeline_001"),
                 )
 
-    def test_rejects_generate_verify_without_generation_id(self) -> None:
+    def test_rejects_generate_verify_without_source_id(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
             init_orchestration(repo_root=repo_root, orchestration_id="orch_001")
+            _mark_dependencies_ready(repo_root)
             write_preflight(
                 repo_root=repo_root,
                 orchestration_id="orch_001",
@@ -2311,7 +2349,7 @@ shell_tool                       stable             true
                     "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
                 },
             )
-            with self.assertRaisesRegex(ValueError, "generation_id"):
+            with self.assertRaisesRegex(ValueError, "source_id"):
                 record_launch(
                     repo_root=repo_root,
                     orchestration_id="orch_001",
@@ -2324,9 +2362,9 @@ shell_tool                       stable             true
                         "orchestration_id": "orch_001",
                         "agent_run_id": "substep_gen_verify_no_gid",
                         "parent_agent_run_id": "orch_run_001",
-                        "plan_ref": "workspace/plans/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001",
+                        "ir_ref": "workspace/ir/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001",
                         "pipeline_ref": "workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001",
-                        "dependency_ref": "workspace/plans/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/dependency.resolved.yaml",
+                        "dependency_ref": "workspace/ir/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/spec.ir.yaml",
                         "skill_name": "workflow-generate-verify",
                         "skill_ref": "skills/workflow-generate-verify/SKILL.md",
                         "skill_must_read_refs": "",
@@ -2339,6 +2377,7 @@ shell_tool                       stable             true
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
             init_orchestration(repo_root=repo_root, orchestration_id="orch_001")
+            _mark_dependencies_ready(repo_root)
             write_preflight(
                 repo_root=repo_root,
                 orchestration_id="orch_001",
@@ -2359,34 +2398,35 @@ shell_tool                       stable             true
                 child_agent_run_id="substep_run_plan_verify_001",
                 request_payload={
                     "node_key": "problem/shallow_water2d@0.3.0",
-                    "step": "plan",
+                    "step": "compile",
                     "substep": "verify",
                     "orchestration_id": "orch_001",
                     "agent_run_id": "substep_run_plan_verify_001",
                     "parent_agent_run_id": "orch_run_001",
-                    "plan_ref": "workspace/plans/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001",
+                    "ir_ref": "workspace/ir/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001",
                     "pipeline_ref": "workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001",
-                    "dependency_ref": _FIX_PLAN_STEP_DEP_REF,
+                    "dependency_ref": _FIX_COMPILE_STEP_DEP_REF,
                 },
                 response_payload=_spawn_response_payload("sess_substep_run_plan_verify_001"),
             )
             request_path = repo_root / launch_refs["launch_request_ref"]
             prompt_path = repo_root / launch_refs["launch_prompt_ref"]
             request_payload = json.loads(request_path.read_text(encoding="utf-8"))
-            self.assertEqual(request_payload["skill_name"], "workflow-plan-verify")
-            self.assertEqual(request_payload["skill_ref"], "skills/workflow-plan-verify/SKILL.md")
-            self.assertNotIn(
-                "workspace/plans/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/derived_contract.json",
+            self.assertEqual(request_payload["skill_name"], "workflow-compile-verify")
+            self.assertEqual(request_payload["skill_ref"], "skills/workflow-compile-verify/SKILL.md")
+            self.assertIn(
+                "workspace/ir/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/spec.ir.yaml",
                 request_payload["skill_must_read_refs"],
             )
             prompt_text = prompt_path.read_text(encoding="utf-8")
             self.assertIn("必須要件:", prompt_text)
-            self.assertIn("skill_name: workflow-plan-verify", prompt_text)
+            self.assertIn("skill_name: workflow-compile-verify", prompt_text)
 
     def test_rejects_launch_prompt_when_field_values_do_not_match_request_payload(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
             init_orchestration(repo_root=repo_root, orchestration_id="orch_001")
+            _mark_dependencies_ready(repo_root)
             write_preflight(
                 repo_root=repo_root,
                 orchestration_id="orch_001",
@@ -2402,16 +2442,16 @@ shell_tool                       stable             true
             )
             base = {
                 "node_key": "problem/shallow_water2d@0.3.0",
-                "step": "plan",
+                "step": "compile",
                 "substep": "verify",
                 "orchestration_id": "orch_001",
                 "agent_run_id": "substep_run_plan_verify_001",
                 "parent_agent_run_id": "orch_run_001",
-                "plan_ref": "workspace/plans/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001",
+                "ir_ref": "workspace/ir/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001",
                 "pipeline_ref": "workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001",
-                "dependency_ref": _FIX_PLAN_STEP_DEP_REF,
-                "skill_name": "workflow-plan-verify",
-                "skill_ref": "skills/workflow-plan-verify/SKILL.md",
+                "dependency_ref": _FIX_COMPILE_STEP_DEP_REF,
+                "skill_name": "workflow-compile-verify",
+                "skill_ref": "skills/workflow-compile-verify/SKILL.md",
                 "issue_severity": "none",
                 "repair_strategy": "none",
                 "repair_target_agent_run_id": "none",
@@ -2419,8 +2459,8 @@ shell_tool                       stable             true
             }
             prepared = prepare_launch_request_payload(dict(base))
             prompt = build_launch_prompt_text(prepared).replace(
-                "skill_name: workflow-plan-verify",
-                "skill_name: workflow-plan-generate",
+                "skill_name: workflow-compile-verify",
+                "skill_name: workflow-compile-generate",
             ) + "\n\n必須要件:\n- 契約された substep を完了すること。\n"
             with self.assertRaisesRegex(
                 ValueError, "must preserve workflow-orchestration template field values"
@@ -2438,6 +2478,7 @@ shell_tool                       stable             true
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
             init_orchestration(repo_root=repo_root, orchestration_id="orch_001")
+            _mark_dependencies_ready(repo_root)
             write_preflight(
                 repo_root=repo_root,
                 orchestration_id="orch_001",
@@ -2458,7 +2499,7 @@ shell_tool                       stable             true
                     "orchestration_id": "orch_001",
                     "agent_run_id": "step_run_build_001",
                     "parent_agent_run_id": "orch_run_001",
-                    "plan_ref": _FIX_PLAN_REF,
+                    "ir_ref": _FIX_IR_REF,
                     "pipeline_ref": _FIX_PIPE_REF,
                     "dependency_ref": _FIX_DEP_REF,
                     "skill_name": "workflow-build",
@@ -2489,6 +2530,7 @@ shell_tool                       stable             true
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
             init_orchestration(repo_root=repo_root, orchestration_id="orch_001")
+            _mark_dependencies_ready(repo_root)
             write_preflight(
                 repo_root=repo_root,
                 orchestration_id="orch_001",
@@ -2509,7 +2551,7 @@ shell_tool                       stable             true
                     "orchestration_id": "orch_001",
                     "agent_run_id": "step_run_build_001",
                     "parent_agent_run_id": "orch_run_001",
-                    "plan_ref": _FIX_PLAN_REF,
+                    "ir_ref": _FIX_IR_REF,
                     "pipeline_ref": _FIX_PIPE_REF,
                     "dependency_ref": _FIX_DEP_REF,
                     "skill_name": "workflow-build",
@@ -2540,6 +2582,7 @@ shell_tool                       stable             true
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
             init_orchestration(repo_root=repo_root, orchestration_id="orch_001")
+            _mark_dependencies_ready(repo_root)
             write_preflight(
                 repo_root=repo_root,
                 orchestration_id="orch_001",
@@ -2560,7 +2603,7 @@ shell_tool                       stable             true
                     "orchestration_id": "orch_001",
                     "agent_run_id": "step_run_build_001",
                     "parent_agent_run_id": "orch_run_001",
-                    "plan_ref": _FIX_PLAN_REF,
+                    "ir_ref": _FIX_IR_REF,
                     "pipeline_ref": _FIX_PIPE_REF,
                     "dependency_ref": _FIX_DEP_REF,
                     "skill_name": "workflow-build",
@@ -2594,7 +2637,7 @@ shell_tool                       stable             true
                 "orchestration_id": "orch_001",
                 "agent_run_id": "step_run_build_001",
                 "parent_agent_run_id": "orch_run_001",
-                "plan_ref": _FIX_PLAN_REF,
+                "ir_ref": _FIX_IR_REF,
                 "pipeline_ref": _FIX_PIPE_REF,
                 "dependency_ref": _FIX_DEP_REF,
                 "skill_name": "workflow-build",
@@ -2624,6 +2667,7 @@ shell_tool                       stable             true
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
             init_orchestration(repo_root=repo_root, orchestration_id="orch_001")
+            _mark_dependencies_ready(repo_root)
             write_preflight(
                 repo_root=repo_root,
                 orchestration_id="orch_001",
@@ -2654,24 +2698,24 @@ shell_tool                       stable             true
                 child_agent_run_id="substep_run_plan_generate_001",
                 request_payload={
                     "node_key": "problem/shallow_water2d@0.3.0",
-                    "step": "plan",
+                    "step": "compile",
                     "substep": "generate",
                     "agent_role": "substep",
                     "orchestration_id": "orch_001",
                     "agent_run_id": "substep_run_plan_generate_001",
                     "parent_agent_run_id": "orch_run_001",
-                    "plan_ref": "workspace/plans/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001",
+                    "ir_ref": "workspace/ir/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001",
                     "pipeline_ref": "workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001",
-                    "dependency_ref": _FIX_PLAN_STEP_DEP_REF,
-                    "skill_name": "workflow-plan-generate",
-                    "skill_ref": "skills/workflow-plan-generate/SKILL.md",
+                    "dependency_ref": _FIX_COMPILE_STEP_DEP_REF,
+                    "skill_name": "workflow-compile-generate",
+                    "skill_ref": "skills/workflow-compile-generate/SKILL.md",
                     "skill_must_read_refs": "",
                     "allowed_output_paths": [
-                        "workspace/plans/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/impl.resolved.yaml",
+                        "workspace/ir/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/spec.ir.yaml",
                     ],
                     "launch_prompt_full": _substep_launch_prompt(
                         "problem/shallow_water2d@0.3.0",
-                        "plan",
+                        "compile",
                         "generate",
                         "substep_run_plan_generate_001",
                     ),
@@ -2680,7 +2724,7 @@ shell_tool                       stable             true
             )
             impl_path = (
                 repo_root
-                / "workspace/plans/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/impl.resolved.yaml"
+                / "workspace/ir/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/spec.ir.yaml"
             )
             impl_path.parent.mkdir(parents=True, exist_ok=True)
             impl_path.write_text("{}\n", encoding="utf-8")
@@ -2690,7 +2734,7 @@ shell_tool                       stable             true
                 agent_run_id="substep_run_plan_generate_001",
                 actor_role="substep",
                 changed_paths=[
-                    "workspace/plans/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/impl.resolved.yaml",
+                    "workspace/ir/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/spec.ir.yaml",
                 ],
             )
             record_agent_run(
@@ -2701,7 +2745,7 @@ shell_tool                       stable             true
                     "parent_agent_run_id": "orch_run_001",
                     "agent_role": "substep",
                     "node_key": "problem/shallow_water2d@0.3.0",
-                    "step": "plan",
+                    "step": "compile",
                     "substep": "generate",
                     "status": "pass",
                     "agent_backend": "codex",
@@ -2709,17 +2753,17 @@ shell_tool                       stable             true
                     "context_id": "ctx_substep_plan_generate_001",
                     "agent_session_id": "sess_substep_plan_generate_001",
                     "output_refs": [
-                        "workspace/plans/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/impl.resolved.yaml",
+                        "workspace/ir/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/spec.ir.yaml",
                     ],
                 },
             )
-            plan_meta_path2 = (
+            ir_meta_path2 = (
                 repo_root
-                / "workspace/plans/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/plan_meta.json"
+                / "workspace/ir/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/ir_meta.json"
             )
-            plan_meta_path2.parent.mkdir(parents=True, exist_ok=True)
-            plan_meta_path2.write_text(
-                json.dumps(self._valid_plan_meta()),
+            ir_meta_path2.parent.mkdir(parents=True, exist_ok=True)
+            ir_meta_path2.write_text(
+                json.dumps(self._valid_ir_meta()),
                 encoding="utf-8",
             )
             with self.assertRaisesRegex(ValueError, "effective substep output_refs"):
@@ -2727,15 +2771,16 @@ shell_tool                       stable             true
                     repo_root=repo_root,
                     orchestration_id="orch_001",
                     node_key="problem/shallow_water2d@0.3.0",
-                    step="plan",
+                    step="compile",
                     agent_run_id="orch_run_001",
                     payload={
                         "status": "pass",
                         "required_outputs": [
-                            "workspace/plans/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/plan_meta.json"
+                            "workspace/ir/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/ir_meta.json"
                         ],
                         "failed_substeps": [],
                         "substep_agent_run_ids": ["substep_run_plan_generate_001"],
+                        "validation_stage": "compile",
                     },
                 )
 
@@ -2743,6 +2788,7 @@ shell_tool                       stable             true
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
             init_orchestration(repo_root=repo_root, orchestration_id="orch_001")
+            _mark_dependencies_ready(repo_root)
             write_preflight(
                 repo_root=repo_root,
                 orchestration_id="orch_001",
@@ -2781,6 +2827,7 @@ shell_tool                       stable             true
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
             init_orchestration(repo_root=repo_root, orchestration_id="orch_001")
+            _mark_dependencies_ready(repo_root)
             write_preflight(
                 repo_root=repo_root,
                 orchestration_id="orch_001",
@@ -2806,7 +2853,7 @@ shell_tool                       stable             true
                         "status": "pass",
                         "agent_backend": "claude",
                         "output_refs": [
-                            "workspace/plans/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/plan_meta.json"
+                            "workspace/ir/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/ir_meta.json"
                         ],
                     },
                 )
@@ -2815,6 +2862,7 @@ shell_tool                       stable             true
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
             init_orchestration(repo_root=repo_root, orchestration_id="orch_001")
+            _mark_dependencies_ready(repo_root)
             write_preflight(
                 repo_root=repo_root,
                 orchestration_id="orch_001",
@@ -2856,6 +2904,7 @@ shell_tool                       stable             true
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
             init_orchestration(repo_root=repo_root, orchestration_id="orch_001")
+            _mark_dependencies_ready(repo_root)
             write_preflight(
                 repo_root=repo_root,
                 orchestration_id="orch_001",
@@ -2889,6 +2938,7 @@ shell_tool                       stable             true
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
             init_orchestration(repo_root=repo_root, orchestration_id="orch_001")
+            _mark_dependencies_ready(repo_root)
             write_preflight(
                 repo_root=repo_root,
                 orchestration_id="orch_001",
@@ -2934,6 +2984,7 @@ shell_tool                       stable             true
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
             init_orchestration(repo_root=repo_root, orchestration_id="orch_001")
+            _mark_dependencies_ready(repo_root)
             write_preflight(
                 repo_root=repo_root,
                 orchestration_id="orch_001",
@@ -2977,6 +3028,7 @@ shell_tool                       stable             true
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
             init_orchestration(repo_root=repo_root, orchestration_id="orch_001")
+            _mark_dependencies_ready(repo_root)
             write_preflight(
                 repo_root=repo_root,
                 orchestration_id="orch_001",
@@ -2991,8 +3043,8 @@ shell_tool                       stable             true
                 },
             )
             bad_ref = (
-                "workspace/plans/problem__shallow_water2d__0.3.0/"
-                "shallow-water2d_20260415_001/plan_meta.json"
+                "workspace/ir/problem__shallow_water2d__0.3.0/"
+                "shallow-water2d_20260415_001/ir_meta.json"
             )
             bad_path = repo_root / bad_ref
             bad_path.parent.mkdir(parents=True, exist_ok=True)
@@ -3014,6 +3066,7 @@ shell_tool                       stable             true
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
             init_orchestration(repo_root=repo_root, orchestration_id="orch_001")
+            _mark_dependencies_ready(repo_root)
             write_preflight(
                 repo_root=repo_root,
                 orchestration_id="orch_001",
@@ -3049,13 +3102,13 @@ shell_tool                       stable             true
                     "orchestration_id": "orch_001",
                     "agent_run_id": "step_run_build_001",
                     "parent_agent_run_id": "orch_run_001",
-                    "plan_ref": _FIX_PLAN_REF,
+                    "ir_ref": _FIX_IR_REF,
                     "pipeline_ref": _FIX_PIPE_REF,
                     "dependency_ref": _FIX_DEP_REF,
                     "skill_name": "workflow-build",
                     "skill_ref": "skills/workflow-build/SKILL.md",
                     "skill_must_read_refs": _fixture_skill_must_read_refs_step("build"),
-                    "allowed_output_paths": [f"{_FIX_PIPE_REF}/build/build_001/build_meta.json"],
+                    "allowed_output_paths": [f"{_FIX_PIPE_REF}/binary/bin_001/binary_meta.json"],
                     "launch_prompt_full": _step_launch_prompt(
                         "problem/shallow_water2d@0.3.0",
                         "build",
@@ -3064,7 +3117,7 @@ shell_tool                       stable             true
                 },
                 response_payload=_spawn_response_payload("sess_step_build_001"),
             )
-            out_ref = f"{_FIX_PIPE_REF}/build/build_001/build_meta.json"
+            out_ref = f"{_FIX_PIPE_REF}/binary/bin_001/binary_meta.json"
             out_path = repo_root / out_ref
             out_path.parent.mkdir(parents=True, exist_ok=True)
             out_path.write_text('{"status":"ok"}\n', encoding="utf-8")
@@ -3091,6 +3144,7 @@ shell_tool                       stable             true
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
             init_orchestration(repo_root=repo_root, orchestration_id="orch_001")
+            _mark_dependencies_ready(repo_root)
             write_preflight(
                 repo_root=repo_root,
                 orchestration_id="orch_001",
@@ -3126,13 +3180,13 @@ shell_tool                       stable             true
                     "orchestration_id": "orch_001",
                     "agent_run_id": "step_run_build_001",
                     "parent_agent_run_id": "orch_run_001",
-                    "plan_ref": _FIX_PLAN_REF,
+                    "ir_ref": _FIX_IR_REF,
                     "pipeline_ref": _FIX_PIPE_REF,
                     "dependency_ref": _FIX_DEP_REF,
                     "skill_name": "workflow-build",
                     "skill_ref": "skills/workflow-build/SKILL.md",
                     "skill_must_read_refs": _fixture_skill_must_read_refs_step("build"),
-                    "allowed_output_paths": [f"{_FIX_PIPE_REF}/build/build_001/build_meta.json"],
+                    "allowed_output_paths": [f"{_FIX_PIPE_REF}/binary/bin_001/binary_meta.json"],
                     "launch_prompt_full": _step_launch_prompt(
                         "problem/shallow_water2d@0.3.0",
                         "build",
@@ -3141,7 +3195,7 @@ shell_tool                       stable             true
                 },
                 response_payload=_spawn_response_payload("sess_step_build_001"),
             )
-            out_ref = f"{_FIX_PIPE_REF}/build/build_001/build_meta.json"
+            out_ref = f"{_FIX_PIPE_REF}/binary/bin_001/binary_meta.json"
             out_path = repo_root / out_ref
             out_path.parent.mkdir(parents=True, exist_ok=True)
             out_path.write_text('{"status":"ok"}\n', encoding="utf-8")
@@ -3168,6 +3222,7 @@ shell_tool                       stable             true
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
             init_orchestration(repo_root=repo_root, orchestration_id="orch_001")
+            _mark_dependencies_ready(repo_root)
             write_preflight(
                 repo_root=repo_root,
                 orchestration_id="orch_001",
@@ -3203,13 +3258,13 @@ shell_tool                       stable             true
                     "orchestration_id": "orch_001",
                     "agent_run_id": "step_run_build_001",
                     "parent_agent_run_id": "orch_run_001",
-                    "plan_ref": _FIX_PLAN_REF,
+                    "ir_ref": _FIX_IR_REF,
                     "pipeline_ref": _FIX_PIPE_REF,
                     "dependency_ref": _FIX_DEP_REF,
                     "skill_name": "workflow-build",
                     "skill_ref": "skills/workflow-build/SKILL.md",
                     "skill_must_read_refs": _fixture_skill_must_read_refs_step("build"),
-                    "allowed_output_paths": [f"{_FIX_PIPE_REF}/build/build_001/build_meta.json"],
+                    "allowed_output_paths": [f"{_FIX_PIPE_REF}/binary/bin_001/binary_meta.json"],
                     "launch_prompt_full": _step_launch_prompt(
                         "problem/shallow_water2d@0.3.0",
                         "build",
@@ -3218,7 +3273,7 @@ shell_tool                       stable             true
                 },
                 response_payload=_spawn_response_payload("sess_step_build_001"),
             )
-            out_ref = f"{_FIX_PIPE_REF}/build/build_001/build_meta.json"
+            out_ref = f"{_FIX_PIPE_REF}/binary/bin_001/binary_meta.json"
             out_path = repo_root / out_ref
             out_path.parent.mkdir(parents=True, exist_ok=True)
             out_path.write_text('{"status":"ok"}\n', encoding="utf-8")
@@ -3227,7 +3282,7 @@ shell_tool                       stable             true
                 orchestration_id="orch_001",
                 agent_run_id="step_run_build_001",
                 actor_role="step",
-                changed_paths=[f"{_FIX_PIPE_REF}/build/build_001/bin/other"],
+                changed_paths=[f"{_FIX_PIPE_REF}/binary/bin_001/bin/other"],
             )
             with self.assertRaisesRegex(ValueError, "terminal run has unauthorized write paths"):
                 record_agent_run(
@@ -3252,6 +3307,7 @@ shell_tool                       stable             true
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
             init_orchestration(repo_root=repo_root, orchestration_id="orch_001")
+            _mark_dependencies_ready(repo_root)
             write_preflight(
                 repo_root=repo_root,
                 orchestration_id="orch_001",
@@ -3287,13 +3343,13 @@ shell_tool                       stable             true
                     "orchestration_id": "orch_001",
                     "agent_run_id": "step_run_build_001",
                     "parent_agent_run_id": "orch_run_001",
-                    "plan_ref": _FIX_PLAN_REF,
+                    "ir_ref": _FIX_IR_REF,
                     "pipeline_ref": _FIX_PIPE_REF,
                     "dependency_ref": _FIX_DEP_REF,
                     "skill_name": "workflow-build",
                     "skill_ref": "skills/workflow-build/SKILL.md",
                     "skill_must_read_refs": _fixture_skill_must_read_refs_step("build"),
-                    "allowed_output_paths": [f"{_FIX_PIPE_REF}/build/build_001/bin/simulate"],
+                    "allowed_output_paths": [f"{_FIX_PIPE_REF}/binary/bin_001/bin/simulate"],
                     "launch_prompt_full": _step_launch_prompt(
                         "problem/shallow_water2d@0.3.0",
                         "build",
@@ -3302,7 +3358,7 @@ shell_tool                       stable             true
                 },
                 response_payload=_spawn_response_payload("sess_step_build_001"),
             )
-            out_ref = f"{_FIX_PIPE_REF}/build/build_001/bin/simulate"
+            out_ref = f"{_FIX_PIPE_REF}/binary/bin_001/bin/simulate"
             out_path = repo_root / out_ref
             out_path.parent.mkdir(parents=True, exist_ok=True)
             out_path.write_text("binary\n", encoding="utf-8")
@@ -3343,6 +3399,7 @@ shell_tool                       stable             true
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
             init_orchestration(repo_root=repo_root, orchestration_id="orch_001")
+            _mark_dependencies_ready(repo_root)
             write_preflight(
                 repo_root=repo_root,
                 orchestration_id="orch_001",
@@ -3356,12 +3413,12 @@ shell_tool                       stable             true
                     "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
                 },
             )
-            gen_id = "gen_20260510_010"
+            src_id = "src_20260510_010"
             canonical_log = (
-                f"{_FIX_PIPE_REF}/generate/{gen_id}/src/mcp_command_log.jsonl"
+                f"{_FIX_PIPE_REF}/source/{src_id}/src/mcp_command_log.jsonl"
             )
             noncanonical = (
-                f"{_FIX_PIPE_REF}/generate/{gen_id}/src/notes/mcp_command_log.jsonl"
+                f"{_FIX_PIPE_REF}/source/{src_id}/src/notes/mcp_command_log.jsonl"
             )
             record_launch(
                 repo_root=repo_root,
@@ -3375,15 +3432,15 @@ shell_tool                       stable             true
                     "orchestration_id": "orch_001",
                     "agent_run_id": "step_run_noncanon",
                     "parent_agent_run_id": "orch_run_001",
-                    "plan_ref": _FIX_PLAN_REF,
+                    "ir_ref": _FIX_IR_REF,
                     "pipeline_ref": _FIX_PIPE_REF,
-                    "dependency_ref": f"{_FIX_PLAN_REF}/dependency.resolved.yaml",
-                    "generation_id": gen_id,
+                    "dependency_ref": f"{_FIX_IR_REF}/spec.ir.yaml",
+                    "source_id": src_id,
                     # Caller declares both a canonical and a noncanonical
                     # mcp_command_log.jsonl. Phase contract for /src/ is
                     # loose enough to accept the noncanonical entry.
                     "allowed_output_paths": [
-                        f"{_FIX_PIPE_REF}/generate/{gen_id}/src/main.f90",
+                        f"{_FIX_PIPE_REF}/source/{src_id}/src/main.f90",
                         noncanonical,
                     ],
                     "skill_name": "workflow-generate",
@@ -3427,6 +3484,7 @@ shell_tool                       stable             true
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
             init_orchestration(repo_root=repo_root, orchestration_id="orch_001")
+            _mark_dependencies_ready(repo_root)
             write_preflight(
                 repo_root=repo_root,
                 orchestration_id="orch_001",
@@ -3450,9 +3508,9 @@ shell_tool                       stable             true
                     "agent_backend": "claude",
                 },
             )
-            build_id = "build_20260510_001"
-            bin_ref = f"{_FIX_PIPE_REF}/build/{build_id}/bin/simulate"
-            log_ref = f"{_FIX_PIPE_REF}/build/{build_id}/mcp_command_log.jsonl"
+            binary_id = "bin_20260510_001"
+            bin_ref = f"{_FIX_PIPE_REF}/binary/{binary_id}/bin/simulate"
+            log_ref = f"{_FIX_PIPE_REF}/binary/{binary_id}/mcp_command_log.jsonl"
             record_launch(
                 repo_root=repo_root,
                 orchestration_id="orch_001",
@@ -3465,7 +3523,7 @@ shell_tool                       stable             true
                     "orchestration_id": "orch_001",
                     "agent_run_id": "step_run_build_mcp_log",
                     "parent_agent_run_id": "orch_run_001",
-                    "plan_ref": _FIX_PLAN_REF,
+                    "ir_ref": _FIX_IR_REF,
                     "pipeline_ref": _FIX_PIPE_REF,
                     "dependency_ref": _FIX_DEP_REF,
                     "skill_name": "workflow-build",
@@ -3542,15 +3600,16 @@ shell_tool                       stable             true
         command_log_path resolves to project_dir/mcp_command_log.jsonl, so the
         audit log lands under the generate tree even though the agent role is
         execute. The cross-phase canonical placement must be:
-          - auto-injected when execute requests include `generation_id`
+          - auto-injected when execute requests include `source_id`
           - phase-contract accepted
           - terminal-validated as authorized despite execute's write_roots
-            being scoped to <pipeline_ref>/execute/.
+            being scoped to <pipeline_ref>/runs/.
         """
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
             init_orchestration(repo_root=repo_root, orchestration_id="orch_001")
-            _plant_impl_resolved_yaml_make(repo_root)
+            _mark_dependencies_ready(repo_root)
+            _plant_spec_ir_yaml_make(repo_root)
             write_preflight(
                 repo_root=repo_root,
                 orchestration_id="orch_001",
@@ -3574,45 +3633,45 @@ shell_tool                       stable             true
                     "agent_backend": "claude",
                 },
             )
-            gen_id = "gen_20260510_011"
-            exec_id = "exec_20260510_001"
+            src_id = "src_20260510_011"
+            run_id = "run_20260510_001"
             node_safe = "problem__shallow_water2d__0.3.0"
             # Cross-phase log auto-inject requires the referenced generation
-            # to have actually run (generate_meta.json must exist). In a real
+            # to have actually run (source_meta.json must exist). In a real
             # workflow generate completes before execute launches.
-            gen_meta_dir = repo_root / f"{_FIX_PIPE_REF}/generate/{gen_id}"
+            gen_meta_dir = repo_root / f"{_FIX_PIPE_REF}/source/{src_id}"
             gen_meta_dir.mkdir(parents=True, exist_ok=True)
-            (gen_meta_dir / "generate_meta.json").write_text(
+            (gen_meta_dir / "source_meta.json").write_text(
                 '{"verification_status": "pass"}\n', encoding="utf-8"
             )
             # Pipeline build phase must also exist for execute pre-launch
             # readiness check (downstream_phase_launch_gate). The build_meta
-            # must record source_generation_id for the cross-phase lineage
-            # bind to authorize the request's generation_id.
-            build_id_for_lineage = "build_20260510_001"
+            # must record source_source_id for the cross-phase lineage
+            # bind to authorize the request's source_id.
+            binary_id_for_lineage = "bin_20260510_001"
             build_dir = (
-                repo_root / f"{_FIX_PIPE_REF}/build/{build_id_for_lineage}"
+                repo_root / f"{_FIX_PIPE_REF}/binary/{binary_id_for_lineage}"
             )
             (build_dir / "bin").mkdir(parents=True, exist_ok=True)
             (build_dir / "bin/main").write_text("binary\n", encoding="utf-8")
-            (build_dir / "build_meta.json").write_text(
+            (build_dir / "binary_meta.json").write_text(
                 json.dumps({
                     "build_system": "make",
                     "compiler": "gfortran",
                     "build_log_ref": "...",
                     "status": "pass",
-                    "source_generation_id": gen_id,
+                    "source_source_id": src_id,
                 }) + "\n",
                 encoding="utf-8",
             )
             cross_phase_log = (
-                f"{_FIX_PIPE_REF}/generate/{gen_id}/src/mcp_command_log.jsonl"
+                f"{_FIX_PIPE_REF}/source/{src_id}/src/mcp_command_log.jsonl"
             )
             in_phase_log = (
-                f"{_FIX_PIPE_REF}/execute/{exec_id}/{node_safe}/mcp_command_log.jsonl"
+                f"{_FIX_PIPE_REF}/runs/{run_id}/{node_safe}/mcp_command_log.jsonl"
             )
             diagnostics_ref = (
-                f"{_FIX_PIPE_REF}/execute/{exec_id}/{node_safe}/diagnostics.json"
+                f"{_FIX_PIPE_REF}/runs/{run_id}/{node_safe}/diagnostics.json"
             )
             record_launch(
                 repo_root=repo_root,
@@ -3621,27 +3680,23 @@ shell_tool                       stable             true
                 child_agent_run_id="step_run_exec_qc",
                 request_payload={
                     "node_key": "problem/shallow_water2d@0.3.0",
-                    "step": "execute",
-                    "agent_role": "step",
+                    "step": "validate", "substep": "execute",
+                    "agent_role": "substep",
                     "orchestration_id": "orch_001",
                     "agent_run_id": "step_run_exec_qc",
                     "parent_agent_run_id": "orch_run_001",
-                    "plan_ref": _FIX_PLAN_REF,
+                    "ir_ref": _FIX_IR_REF,
                     "pipeline_ref": _FIX_PIPE_REF,
                     "dependency_ref": _FIX_DEP_REF,
-                    "execution_id": exec_id,
-                    # generation_id triggers cross-phase log auto-inject for execute.
-                    "generation_id": gen_id,
-                    "source_build_id": build_id_for_lineage,
-                    "skill_name": "workflow-execute",
-                    "skill_ref": "skills/workflow-execute/SKILL.md",
-                    "skill_must_read_refs": _fixture_skill_must_read_refs_step("execute"),
+                    "run_id": run_id,
+                    # source_id triggers cross-phase log auto-inject for execute.
+                    "source_id": src_id,
+                    "source_binary_id": binary_id_for_lineage,
+                    "skill_name": "workflow-validate-execute",
+                    "skill_ref": "skills/workflow-validate-execute/SKILL.md",
+                    "skill_must_read_refs": _fixture_skill_must_read_refs_substep("validate", "execute"),
                     "allowed_output_paths": [diagnostics_ref],
-                    "launch_prompt_full": _step_launch_prompt(
-                        "problem/shallow_water2d@0.3.0",
-                        "execute",
-                        "step_run_exec_qc",
-                    ),
+                    "launch_prompt_full": _substep_launch_prompt("problem/shallow_water2d@0.3.0", "validate", "execute", "step_run_exec_qc"),
                 },
                 response_payload=_spawn_response_payload("sess_step_exec_qc"),
             )
@@ -3677,7 +3732,7 @@ shell_tool                       stable             true
                 repo_root,
                 orchestration_id="orch_001",
                 agent_run_id="step_run_exec_qc",
-                actor_role="step",
+                actor_role="substep",
                 changed_paths=[diagnostics_ref],
             )
             payload = record_agent_run(
@@ -3685,9 +3740,9 @@ shell_tool                       stable             true
                 orchestration_id="orch_001",
                 payload={
                     "agent_run_id": "step_run_exec_qc",
-                    "agent_role": "step",
+                    "agent_role": "substep",
                     "parent_agent_run_id": "orch_run_001",
-                    "step": "execute",
+                    "step": "validate", "substep": "execute",
                     "node_key": "problem/shallow_water2d@0.3.0",
                     "status": "pass",
                     "agent_backend": "codex",
@@ -3708,14 +3763,15 @@ shell_tool                       stable             true
     def test_execute_launch_rejects_listed_path_for_unrelated_generation(self) -> None:
         """Defense against authorization-by-listing of an unrelated generation.
 
-        If an execute launch lists `<pipeline_ref>/generate/<other>/src/...`
+        If an execute launch lists `<pipeline_ref>/source/<other>/src/...`
         in allowed_output_paths (a generation different from the request's
-        `generation_id`), the launch must be rejected. Otherwise an older or
+        `source_id`), the launch must be rejected. Otherwise an older or
         sibling generation's audit log could gain MCP-owned write authority.
         """
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
             init_orchestration(repo_root=repo_root, orchestration_id="orch_001")
+            _mark_dependencies_ready(repo_root)
             write_preflight(
                 repo_root=repo_root,
                 orchestration_id="orch_001",
@@ -3740,32 +3796,32 @@ shell_tool                       stable             true
                 },
             )
             real_gen = "gen_real_001"
-            other_gen = "gen_other_002"
-            exec_id = "exec_unrelated_001"
+            other_src = "src_other_002"
+            run_id = "run_unrelated_001"
             node_safe = "problem__shallow_water2d__0.3.0"
             # Both generations exist on disk (e.g., older sibling under same pipeline).
-            for gid in (real_gen, other_gen):
-                gdir = repo_root / f"{_FIX_PIPE_REF}/generate/{gid}"
+            for gid in (real_gen, other_src):
+                gdir = repo_root / f"{_FIX_PIPE_REF}/source/{gid}"
                 gdir.mkdir(parents=True, exist_ok=True)
-                (gdir / "generate_meta.json").write_text(
+                (gdir / "source_meta.json").write_text(
                     '{"verification_status": "pass"}\n', encoding="utf-8"
                 )
-            (repo_root / f"{_FIX_PIPE_REF}/build/build_x/bin").mkdir(
+            (repo_root / f"{_FIX_PIPE_REF}/binary/bin_x/bin").mkdir(
                 parents=True, exist_ok=True
             )
-            (repo_root / f"{_FIX_PIPE_REF}/build/build_x/bin/main").write_text(
+            (repo_root / f"{_FIX_PIPE_REF}/binary/bin_x/bin/main").write_text(
                 "binary\n", encoding="utf-8"
             )
             diagnostics_ref = (
-                f"{_FIX_PIPE_REF}/execute/{exec_id}/{node_safe}/diagnostics.json"
+                f"{_FIX_PIPE_REF}/runs/{run_id}/{node_safe}/diagnostics.json"
             )
             other_log_ref = (
-                f"{_FIX_PIPE_REF}/generate/{other_gen}/src/mcp_command_log.jsonl"
+                f"{_FIX_PIPE_REF}/source/{other_src}/src/mcp_command_log.jsonl"
             )
-            # Launch with generation_id=real_gen but ALSO list a path under
-            # the unrelated other_gen tree. The phase contract for execute
+            # Launch with source_id=real_gen but ALSO list a path under
+            # the unrelated other_src tree. The phase contract for execute
             # should reject the unrelated generate path because it does not
-            # match the request's generation_id.
+            # match the request's source_id.
             with self.assertRaisesRegex(
                 ValueError, "outside phase contract|under capability write_roots"
             ):
@@ -3776,33 +3832,29 @@ shell_tool                       stable             true
                     child_agent_run_id="step_run_exec_unrelated",
                     request_payload={
                         "node_key": "problem/shallow_water2d@0.3.0",
-                        "step": "execute",
-                        "agent_role": "step",
+                        "step": "validate", "substep": "execute",
+                        "agent_role": "substep",
                         "orchestration_id": "orch_001",
                         "agent_run_id": "step_run_exec_unrelated",
                         "parent_agent_run_id": "orch_run_001",
-                        "plan_ref": _FIX_PLAN_REF,
+                        "ir_ref": _FIX_IR_REF,
                         "pipeline_ref": _FIX_PIPE_REF,
                         "dependency_ref": _FIX_DEP_REF,
-                        "execution_id": exec_id,
-                        "generation_id": real_gen,
-                        "skill_name": "workflow-execute",
-                        "skill_ref": "skills/workflow-execute/SKILL.md",
-                        "skill_must_read_refs": _fixture_skill_must_read_refs_step("execute"),
+                        "run_id": run_id,
+                        "source_id": real_gen,
+                        "skill_name": "workflow-validate-execute",
+                        "skill_ref": "skills/workflow-validate-execute/SKILL.md",
+                        "skill_must_read_refs": _fixture_skill_must_read_refs_substep("validate", "execute"),
                         "allowed_output_paths": [diagnostics_ref, other_log_ref],
-                        "launch_prompt_full": _step_launch_prompt(
-                            "problem/shallow_water2d@0.3.0",
-                            "execute",
-                            "step_run_exec_unrelated",
-                        ),
+                        "launch_prompt_full": _substep_launch_prompt("problem/shallow_water2d@0.3.0", "validate", "execute", "step_run_exec_unrelated"),
                     },
                     response_payload=_spawn_response_payload("sess_step_exec_unrelated"),
                 )
 
     def test_execute_launch_accepts_when_legacy_build_coexists_with_recorded_build(self) -> None:
-        """Legacy build directories without source_generation_id must NOT
+        """Legacy build directories without source_source_id must NOT
         block valid execute launches as long as at least one current build
-        records the lineage and matches the request's generation_id.
+        records the lineage and matches the request's source_id.
 
         Defense against operational dead-end: pipelines accumulate historical
         build dirs over retries, and over-broad strict bind would render the
@@ -3812,7 +3864,8 @@ shell_tool                       stable             true
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
             init_orchestration(repo_root=repo_root, orchestration_id="orch_001")
-            _plant_impl_resolved_yaml_make(repo_root)
+            _mark_dependencies_ready(repo_root)
+            _plant_spec_ir_yaml_make(repo_root)
             write_preflight(
                 repo_root=repo_root,
                 orchestration_id="orch_001",
@@ -3837,18 +3890,18 @@ shell_tool                       stable             true
                 },
             )
             real_gen = "gen_real_001"
-            exec_id = "exec_test_001"
+            run_id = "run_test_001"
             node_safe = "problem__shallow_water2d__0.3.0"
-            gd = repo_root / f"{_FIX_PIPE_REF}/generate/{real_gen}"
+            gd = repo_root / f"{_FIX_PIPE_REF}/source/{real_gen}"
             gd.mkdir(parents=True, exist_ok=True)
-            (gd / "generate_meta.json").write_text(
+            (gd / "source_meta.json").write_text(
                 '{"verification_status": "pass"}\n', encoding="utf-8"
             )
-            # Legacy build dir WITHOUT source_generation_id (older retry).
-            legacy_dir = repo_root / f"{_FIX_PIPE_REF}/build/build_legacy_999"
+            # Legacy build dir WITHOUT source_source_id (older retry).
+            legacy_dir = repo_root / f"{_FIX_PIPE_REF}/binary/bin_legacy_999"
             (legacy_dir / "bin").mkdir(parents=True, exist_ok=True)
             (legacy_dir / "bin/main").write_text("legacy_binary\n", encoding="utf-8")
-            (legacy_dir / "build_meta.json").write_text(
+            (legacy_dir / "binary_meta.json").write_text(
                 json.dumps({
                     "build_system": "make",
                     "compiler": "gfortran",
@@ -3857,25 +3910,25 @@ shell_tool                       stable             true
                 }) + "\n",
                 encoding="utf-8",
             )
-            # Current build with source_generation_id matching the request.
-            current_dir = repo_root / f"{_FIX_PIPE_REF}/build/build_current_001"
+            # Current build with source_source_id matching the request.
+            current_dir = repo_root / f"{_FIX_PIPE_REF}/binary/bin_current_001"
             (current_dir / "bin").mkdir(parents=True, exist_ok=True)
             (current_dir / "bin/main").write_text("current_binary\n", encoding="utf-8")
-            (current_dir / "build_meta.json").write_text(
+            (current_dir / "binary_meta.json").write_text(
                 json.dumps({
                     "build_system": "make",
                     "compiler": "gfortran",
                     "build_log_ref": "...",
                     "status": "pass",
-                    "source_generation_id": real_gen,
+                    "source_source_id": real_gen,
                 }) + "\n",
                 encoding="utf-8",
             )
             diagnostics_ref = (
-                f"{_FIX_PIPE_REF}/execute/{exec_id}/{node_safe}/diagnostics.json"
+                f"{_FIX_PIPE_REF}/runs/{run_id}/{node_safe}/diagnostics.json"
             )
-            # Execute launch with generation_id=real_gen must succeed even
-            # though legacy_build is missing source_generation_id.
+            # Execute launch with source_id=real_gen must succeed even
+            # though legacy_build is missing source_source_id.
             record_launch(
                 repo_root=repo_root,
                 orchestration_id="orch_001",
@@ -3883,26 +3936,22 @@ shell_tool                       stable             true
                 child_agent_run_id="step_run_exec_legacy_coexist",
                 request_payload={
                     "node_key": "problem/shallow_water2d@0.3.0",
-                    "step": "execute",
-                    "agent_role": "step",
+                    "step": "validate", "substep": "execute",
+                    "agent_role": "substep",
                     "orchestration_id": "orch_001",
                     "agent_run_id": "step_run_exec_legacy_coexist",
                     "parent_agent_run_id": "orch_run_001",
-                    "plan_ref": _FIX_PLAN_REF,
+                    "ir_ref": _FIX_IR_REF,
                     "pipeline_ref": _FIX_PIPE_REF,
                     "dependency_ref": _FIX_DEP_REF,
-                    "execution_id": exec_id,
-                    "generation_id": real_gen,
-                    "source_build_id": "build_current_001",
-                    "skill_name": "workflow-execute",
-                    "skill_ref": "skills/workflow-execute/SKILL.md",
-                    "skill_must_read_refs": _fixture_skill_must_read_refs_step("execute"),
+                    "run_id": run_id,
+                    "source_id": real_gen,
+                    "source_binary_id": "bin_current_001",
+                    "skill_name": "workflow-validate-execute",
+                    "skill_ref": "skills/workflow-validate-execute/SKILL.md",
+                    "skill_must_read_refs": _fixture_skill_must_read_refs_substep("validate", "execute"),
                     "allowed_output_paths": [diagnostics_ref],
-                    "launch_prompt_full": _step_launch_prompt(
-                        "problem/shallow_water2d@0.3.0",
-                        "execute",
-                        "step_run_exec_legacy_coexist",
-                    ),
+                    "launch_prompt_full": _substep_launch_prompt("problem/shallow_water2d@0.3.0", "validate", "execute", "step_run_exec_legacy_coexist"),
                 },
                 response_payload=_spawn_response_payload("sess_step_exec_legacy_coexist"),
             )
@@ -3913,7 +3962,7 @@ shell_tool                       stable             true
                 ).read_text(encoding="utf-8")
             )
             cross_log = (
-                f"{_FIX_PIPE_REF}/generate/{real_gen}/src/mcp_command_log.jsonl"
+                f"{_FIX_PIPE_REF}/source/{real_gen}/src/mcp_command_log.jsonl"
             )
             self.assertIn(cross_log, manifest["mcp_owned_audit_logs"])
 
@@ -3922,11 +3971,12 @@ shell_tool                       stable             true
         cross-phase quality_check authorization. An execute that uses only
         in-phase logging must still be bound to a specific build to prevent
         attributing evidence to an arbitrary build that happens to record a
-        matching source_generation_id.
+        matching source_source_id.
         """
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
             init_orchestration(repo_root=repo_root, orchestration_id="orch_001")
+            _mark_dependencies_ready(repo_root)
             write_preflight(
                 repo_root=repo_root,
                 orchestration_id="orch_001",
@@ -3951,33 +4001,33 @@ shell_tool                       stable             true
                 },
             )
             real_gen = "gen_real_001"
-            exec_id = "exec_in_phase_001"
+            run_id = "run_in_phase_001"
             node_safe = "problem__shallow_water2d__0.3.0"
-            gd = repo_root / f"{_FIX_PIPE_REF}/generate/{real_gen}"
+            gd = repo_root / f"{_FIX_PIPE_REF}/source/{real_gen}"
             gd.mkdir(parents=True, exist_ok=True)
-            (gd / "generate_meta.json").write_text(
+            (gd / "source_meta.json").write_text(
                 '{"verification_status": "pass"}\n', encoding="utf-8"
             )
-            bd = repo_root / f"{_FIX_PIPE_REF}/build/build_x"
+            bd = repo_root / f"{_FIX_PIPE_REF}/binary/bin_x"
             (bd / "bin").mkdir(parents=True, exist_ok=True)
             (bd / "bin/main").write_text("binary\n", encoding="utf-8")
-            (bd / "build_meta.json").write_text(
+            (bd / "binary_meta.json").write_text(
                 json.dumps({
                     "build_system": "make",
                     "compiler": "gfortran",
                     "build_log_ref": "...",
                     "status": "pass",
-                    "source_generation_id": real_gen,
+                    "source_source_id": real_gen,
                 }) + "\n",
                 encoding="utf-8",
             )
             diagnostics_ref = (
-                f"{_FIX_PIPE_REF}/execute/{exec_id}/{node_safe}/diagnostics.json"
+                f"{_FIX_PIPE_REF}/runs/{run_id}/{node_safe}/diagnostics.json"
             )
-            # Launch WITHOUT source_build_id → reject regardless of cross-phase status.
+            # Launch WITHOUT source_binary_id → reject regardless of cross-phase status.
             with self.assertRaisesRegex(
                 ValueError,
-                "execute launch requires `source_build_id`",
+                "validate.execute launch requires `source_binary_id`",
             ):
                 record_launch(
                     repo_root=repo_root,
@@ -3986,34 +4036,30 @@ shell_tool                       stable             true
                     child_agent_run_id="step_run_exec_no_build_id",
                     request_payload={
                         "node_key": "problem/shallow_water2d@0.3.0",
-                        "step": "execute",
-                        "agent_role": "step",
+                        "step": "validate", "substep": "execute",
+                        "agent_role": "substep",
                         "orchestration_id": "orch_001",
                         "agent_run_id": "step_run_exec_no_build_id",
                         "parent_agent_run_id": "orch_run_001",
-                        "plan_ref": _FIX_PLAN_REF,
+                        "ir_ref": _FIX_IR_REF,
                         "pipeline_ref": _FIX_PIPE_REF,
                         "dependency_ref": _FIX_DEP_REF,
-                        "execution_id": exec_id,
-                        "generation_id": real_gen,
+                        "run_id": run_id,
+                        "source_id": real_gen,
                         # No source_build_id, no cross-phase log declared.
-                        "skill_name": "workflow-execute",
-                        "skill_ref": "skills/workflow-execute/SKILL.md",
-                        "skill_must_read_refs": _fixture_skill_must_read_refs_step("execute"),
+                        "skill_name": "workflow-validate-execute",
+                        "skill_ref": "skills/workflow-validate-execute/SKILL.md",
+                        "skill_must_read_refs": _fixture_skill_must_read_refs_substep("validate", "execute"),
                         "allowed_output_paths": [diagnostics_ref],
-                        "launch_prompt_full": _step_launch_prompt(
-                            "problem/shallow_water2d@0.3.0",
-                            "execute",
-                            "step_run_exec_no_build_id",
-                        ),
+                        "launch_prompt_full": _substep_launch_prompt("problem/shallow_water2d@0.3.0", "validate", "execute", "step_run_exec_no_build_id"),
                     },
                     response_payload=_spawn_response_payload("sess_step_exec_no_build_id"),
                 )
 
     def test_execute_launch_rejects_unrelated_generation_when_build_meta_records_lineage(self) -> None:
-        """Cross-phase generation_id must match an actual build's
-        source_generation_id. If build_meta.json under the pipeline records
-        source_generation_id and the request's generation_id does not match
+        """Cross-phase source_id must match an actual build's
+        source_source_id. If binary_meta.json under the pipeline records
+        source_source_id and the request's source_id does not match
         any of them, the cross-phase write authorization is rejected.
 
         Defense against attributing quality_check evidence to a passing
@@ -4022,7 +4068,8 @@ shell_tool                       stable             true
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
             init_orchestration(repo_root=repo_root, orchestration_id="orch_001")
-            _plant_impl_resolved_yaml_make(repo_root)
+            _mark_dependencies_ready(repo_root)
+            _plant_spec_ir_yaml_make(repo_root)
             write_preflight(
                 repo_root=repo_root,
                 orchestration_id="orch_001",
@@ -4048,36 +4095,36 @@ shell_tool                       stable             true
             )
             real_gen = "gen_real_001"
             unrelated_gen = "gen_unrelated_999"
-            build_id = "build_real_001"
-            exec_id = "exec_test_001"
+            binary_id = "build_real_001"
+            run_id = "run_test_001"
             node_safe = "problem__shallow_water2d__0.3.0"
             # Two pass-state generations + one build_meta that records ONLY
-            # real_gen as its source_generation_id.
+            # real_gen as its source_source_id.
             for gid in (real_gen, unrelated_gen):
-                gd = repo_root / f"{_FIX_PIPE_REF}/generate/{gid}"
+                gd = repo_root / f"{_FIX_PIPE_REF}/source/{gid}"
                 gd.mkdir(parents=True, exist_ok=True)
-                (gd / "generate_meta.json").write_text(
+                (gd / "source_meta.json").write_text(
                     '{"verification_status": "pass"}\n', encoding="utf-8"
                 )
-            bd = repo_root / f"{_FIX_PIPE_REF}/build/{build_id}"
+            bd = repo_root / f"{_FIX_PIPE_REF}/binary/{binary_id}"
             (bd / "bin").mkdir(parents=True, exist_ok=True)
             (bd / "bin/main").write_text("binary\n", encoding="utf-8")
-            (bd / "build_meta.json").write_text(
+            (bd / "binary_meta.json").write_text(
                 json.dumps({
                     "build_system": "make",
                     "compiler": "gfortran",
                     "build_log_ref": "...",
                     "status": "pass",
-                    "source_generation_id": real_gen,
+                    "source_source_id": real_gen,
                 }) + "\n",
                 encoding="utf-8",
             )
             diagnostics_ref = (
-                f"{_FIX_PIPE_REF}/execute/{exec_id}/{node_safe}/diagnostics.json"
+                f"{_FIX_PIPE_REF}/runs/{run_id}/{node_safe}/diagnostics.json"
             )
             with self.assertRaisesRegex(
                 ValueError,
-                "does not match build .* source_generation_id",
+                "does not match build .* source_source_id",
             ):
                 record_launch(
                     repo_root=repo_root,
@@ -4086,29 +4133,25 @@ shell_tool                       stable             true
                     child_agent_run_id="step_run_exec_unrelated_gen",
                     request_payload={
                         "node_key": "problem/shallow_water2d@0.3.0",
-                        "step": "execute",
-                        "agent_role": "step",
+                        "step": "validate", "substep": "execute",
+                        "agent_role": "substep",
                         "orchestration_id": "orch_001",
                         "agent_run_id": "step_run_exec_unrelated_gen",
                         "parent_agent_run_id": "orch_run_001",
-                        "plan_ref": _FIX_PLAN_REF,
+                        "ir_ref": _FIX_IR_REF,
                         "pipeline_ref": _FIX_PIPE_REF,
                         "dependency_ref": _FIX_DEP_REF,
-                        "execution_id": exec_id,
+                        "run_id": run_id,
                         # Request points at the real build but claims
                         # unrelated_gen — should fail because build_real_001's
-                        # source_generation_id is real_gen, not unrelated_gen.
-                        "generation_id": unrelated_gen,
-                        "source_build_id": build_id,
-                        "skill_name": "workflow-execute",
-                        "skill_ref": "skills/workflow-execute/SKILL.md",
-                        "skill_must_read_refs": _fixture_skill_must_read_refs_step("execute"),
+                        # source_source_id is real_gen, not unrelated_gen.
+                        "source_id": unrelated_gen,
+                        "source_binary_id": binary_id,
+                        "skill_name": "workflow-validate-execute",
+                        "skill_ref": "skills/workflow-validate-execute/SKILL.md",
+                        "skill_must_read_refs": _fixture_skill_must_read_refs_substep("validate", "execute"),
                         "allowed_output_paths": [diagnostics_ref],
-                        "launch_prompt_full": _step_launch_prompt(
-                            "problem/shallow_water2d@0.3.0",
-                            "execute",
-                            "step_run_exec_unrelated_gen",
-                        ),
+                        "launch_prompt_full": _substep_launch_prompt("problem/shallow_water2d@0.3.0", "validate", "execute", "step_run_exec_unrelated_gen"),
                     },
                     response_payload=_spawn_response_payload("sess_step_exec_unrelated_gen"),
                 )
@@ -4116,7 +4159,7 @@ shell_tool                       stable             true
     def test_execute_launch_rejects_cross_phase_log_for_failed_generation(self) -> None:
         """Defense against authorizing writes into a failed generation's tree.
 
-        Even when generate_meta.json exists for the referenced generation_id,
+        Even when source_meta.json exists for the referenced source_id,
         record_launch must reject the cross-phase MCP audit log authorization
         if verification_status is not 'pass'. Otherwise an Execute run could
         mutate provenance files inside a failed/stale generation before the
@@ -4126,7 +4169,8 @@ shell_tool                       stable             true
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
             init_orchestration(repo_root=repo_root, orchestration_id="orch_001")
-            _plant_impl_resolved_yaml_make(repo_root)
+            _mark_dependencies_ready(repo_root)
+            _plant_spec_ir_yaml_make(repo_root)
             write_preflight(
                 repo_root=repo_root,
                 orchestration_id="orch_001",
@@ -4151,32 +4195,32 @@ shell_tool                       stable             true
                 },
             )
             failed_gen = "gen_failed_001"
-            exec_id = "exec_against_failed_001"
+            run_id = "run_against_failed_001"
             node_safe = "problem__shallow_water2d__0.3.0"
             # Plant a failed generation (verification_status=fail).
-            gen_dir = repo_root / f"{_FIX_PIPE_REF}/generate/{failed_gen}"
+            gen_dir = repo_root / f"{_FIX_PIPE_REF}/source/{failed_gen}"
             gen_dir.mkdir(parents=True, exist_ok=True)
-            (gen_dir / "generate_meta.json").write_text(
+            (gen_dir / "source_meta.json").write_text(
                 '{"verification_status": "fail"}\n', encoding="utf-8"
             )
-            # build_x's build_meta.json records source_generation_id=failed_gen
+            # build_x's binary_meta.json records source_source_id=failed_gen
             # so the mandatory lineage bind passes and the cross-phase
             # verification_status check is reached.
-            build_x_dir = repo_root / f"{_FIX_PIPE_REF}/build/build_x"
+            build_x_dir = repo_root / f"{_FIX_PIPE_REF}/binary/bin_x"
             (build_x_dir / "bin").mkdir(parents=True, exist_ok=True)
             (build_x_dir / "bin/main").write_text("binary\n", encoding="utf-8")
-            (build_x_dir / "build_meta.json").write_text(
+            (build_x_dir / "binary_meta.json").write_text(
                 json.dumps({
                     "build_system": "make",
                     "compiler": "gfortran",
                     "build_log_ref": "...",
                     "status": "pass",
-                    "source_generation_id": failed_gen,
+                    "source_source_id": failed_gen,
                 }) + "\n",
                 encoding="utf-8",
             )
             diagnostics_ref = (
-                f"{_FIX_PIPE_REF}/execute/{exec_id}/{node_safe}/diagnostics.json"
+                f"{_FIX_PIPE_REF}/runs/{run_id}/{node_safe}/diagnostics.json"
             )
             with self.assertRaisesRegex(
                 ValueError, "verification_status='fail'"
@@ -4188,42 +4232,39 @@ shell_tool                       stable             true
                     child_agent_run_id="step_run_exec_failed_gen",
                     request_payload={
                         "node_key": "problem/shallow_water2d@0.3.0",
-                        "step": "execute",
-                        "agent_role": "step",
+                        "step": "validate", "substep": "execute",
+                        "agent_role": "substep",
                         "orchestration_id": "orch_001",
                         "agent_run_id": "step_run_exec_failed_gen",
                         "parent_agent_run_id": "orch_run_001",
-                        "plan_ref": _FIX_PLAN_REF,
+                        "ir_ref": _FIX_IR_REF,
                         "pipeline_ref": _FIX_PIPE_REF,
                         "dependency_ref": _FIX_DEP_REF,
-                        "execution_id": exec_id,
-                        "generation_id": failed_gen,
-                        "source_build_id": "build_x",
-                        "skill_name": "workflow-execute",
-                        "skill_ref": "skills/workflow-execute/SKILL.md",
-                        "skill_must_read_refs": _fixture_skill_must_read_refs_step("execute"),
+                        "run_id": run_id,
+                        "source_id": failed_gen,
+                        "source_binary_id": "bin_x",
+                        "skill_name": "workflow-validate-execute",
+                        "skill_ref": "skills/workflow-validate-execute/SKILL.md",
+                        "skill_must_read_refs": _fixture_skill_must_read_refs_substep("validate", "execute"),
                         "allowed_output_paths": [diagnostics_ref],
-                        "launch_prompt_full": _step_launch_prompt(
-                            "problem/shallow_water2d@0.3.0",
-                            "execute",
-                            "step_run_exec_failed_gen",
-                        ),
+                        "launch_prompt_full": _substep_launch_prompt("problem/shallow_water2d@0.3.0", "validate", "execute", "step_run_exec_failed_gen"),
                     },
                     response_payload=_spawn_response_payload("sess_step_exec_failed_gen"),
                 )
 
-    def test_execute_launch_rejects_cross_phase_log_for_unknown_generation_id(self) -> None:
+    def test_validate_launch_rejects_cross_phase_log_for_unknown_source_id(self) -> None:
         """Defense against authorization-by-injection of cross-phase log paths.
 
-        If the launch request's `generation_id` does not correspond to an
-        actual generate run on disk (`generate_meta.json` missing),
+        If the launch request's `source_id` does not correspond to an
+        actual generate run on disk (`source_meta.json` missing),
         record_launch must refuse rather than silently auto-inject a writable
         cross-phase log path that targets an unrelated generation's audit log.
         """
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
             init_orchestration(repo_root=repo_root, orchestration_id="orch_001")
-            _plant_impl_resolved_yaml_make(repo_root)
+            _mark_dependencies_ready(repo_root)
+            _plant_spec_ir_yaml_make(repo_root)
             write_preflight(
                 repo_root=repo_root,
                 orchestration_id="orch_001",
@@ -4247,31 +4288,31 @@ shell_tool                       stable             true
                     "agent_backend": "claude",
                 },
             )
-            forged_gen_id = "gen_20260510_xxx_unknown"
-            exec_id = "exec_20260510_002"
+            forged_src_id = "src_20260510_xxx_unknown"
+            run_id = "run_20260510_002"
             node_safe = "problem__shallow_water2d__0.3.0"
             # Plant a build_meta that records the forged gen so the
             # mandatory source_build_id lineage check passes; the cross-phase
-            # generate_meta absence then triggers the unknown-generation
+            # source_meta absence then triggers the unknown-source
             # rejection in the cross-phase loop.
-            build_dir = repo_root / f"{_FIX_PIPE_REF}/build/build_for_forged"
+            build_dir = repo_root / f"{_FIX_PIPE_REF}/binary/bin_for_forged"
             (build_dir / "bin").mkdir(parents=True, exist_ok=True)
             (build_dir / "bin/main").write_text("binary\n", encoding="utf-8")
-            (build_dir / "build_meta.json").write_text(
+            (build_dir / "binary_meta.json").write_text(
                 json.dumps({
                     "build_system": "make",
                     "compiler": "gfortran",
                     "build_log_ref": "...",
                     "status": "pass",
-                    "source_generation_id": forged_gen_id,
+                    "source_source_id": forged_src_id,
                 }) + "\n",
                 encoding="utf-8",
             )
             diagnostics_ref = (
-                f"{_FIX_PIPE_REF}/execute/{exec_id}/{node_safe}/diagnostics.json"
+                f"{_FIX_PIPE_REF}/runs/{run_id}/{node_safe}/diagnostics.json"
             )
             with self.assertRaisesRegex(
-                ValueError, "unknown cross-phase generation_id"
+                ValueError, "unknown cross-phase source_id"
             ):
                 record_launch(
                     repo_root=repo_root,
@@ -4280,26 +4321,22 @@ shell_tool                       stable             true
                     child_agent_run_id="step_run_exec_forged",
                     request_payload={
                         "node_key": "problem/shallow_water2d@0.3.0",
-                        "step": "execute",
-                        "agent_role": "step",
+                        "step": "validate", "substep": "execute",
+                        "agent_role": "substep",
                         "orchestration_id": "orch_001",
                         "agent_run_id": "step_run_exec_forged",
                         "parent_agent_run_id": "orch_run_001",
-                        "plan_ref": _FIX_PLAN_REF,
+                        "ir_ref": _FIX_IR_REF,
                         "pipeline_ref": _FIX_PIPE_REF,
                         "dependency_ref": _FIX_DEP_REF,
-                        "execution_id": exec_id,
-                        "generation_id": forged_gen_id,
-                        "source_build_id": "build_for_forged",
-                        "skill_name": "workflow-execute",
-                        "skill_ref": "skills/workflow-execute/SKILL.md",
-                        "skill_must_read_refs": _fixture_skill_must_read_refs_step("execute"),
+                        "run_id": run_id,
+                        "source_id": forged_src_id,
+                        "source_binary_id": "bin_for_forged",
+                        "skill_name": "workflow-validate-execute",
+                        "skill_ref": "skills/workflow-validate-execute/SKILL.md",
+                        "skill_must_read_refs": _fixture_skill_must_read_refs_substep("validate", "execute"),
                         "allowed_output_paths": [diagnostics_ref],
-                        "launch_prompt_full": _step_launch_prompt(
-                            "problem/shallow_water2d@0.3.0",
-                            "execute",
-                            "step_run_exec_forged",
-                        ),
+                        "launch_prompt_full": _substep_launch_prompt("problem/shallow_water2d@0.3.0", "validate", "execute", "step_run_exec_forged"),
                     },
                     response_payload=_spawn_response_payload("sess_step_exec_forged"),
                 )
@@ -4308,6 +4345,7 @@ shell_tool                       stable             true
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
             init_orchestration(repo_root=repo_root, orchestration_id="orch_001")
+            _mark_dependencies_ready(repo_root)
             write_preflight(
                 repo_root=repo_root,
                 orchestration_id="orch_001",
@@ -4338,29 +4376,29 @@ shell_tool                       stable             true
                 child_agent_run_id="substep_run_gen_001",
                 request_payload={
                     "node_key": "problem/shallow_water2d@0.3.0",
-                    "step": "plan",
+                    "step": "compile",
                     "substep": "generate",
                     "agent_role": "substep",
                     "orchestration_id": "orch_001",
                     "agent_run_id": "substep_run_gen_001",
                     "parent_agent_run_id": "orch_run_001",
-                    "plan_ref": _FIX_PLAN_REF,
+                    "ir_ref": _FIX_IR_REF,
                     "pipeline_ref": _FIX_PIPE_REF,
-                    "dependency_ref": _FIX_PLAN_STEP_DEP_REF,
-                    "skill_name": "workflow-plan-generate",
-                    "skill_ref": "skills/workflow-plan-generate/SKILL.md",
-                    "skill_must_read_refs": _fixture_skill_must_read_refs_substep("plan", "generate"),
-                    "allowed_output_paths": [f"{_FIX_PLAN_REF}/plan_meta.json"],
+                    "dependency_ref": _FIX_COMPILE_STEP_DEP_REF,
+                    "skill_name": "workflow-compile-generate",
+                    "skill_ref": "skills/workflow-compile-generate/SKILL.md",
+                    "skill_must_read_refs": _fixture_skill_must_read_refs_substep("compile", "generate"),
+                    "allowed_output_paths": [f"{_FIX_IR_REF}/ir_meta.json"],
                     "launch_prompt_full": _substep_launch_prompt(
                         "problem/shallow_water2d@0.3.0",
-                        "plan",
+                        "compile",
                         "generate",
                         "substep_run_gen_001",
                     ),
                 },
                 response_payload=_spawn_response_payload("sess_substep_gen_001"),
             )
-            out_ref = f"{_FIX_PLAN_REF}/plan_meta.json"
+            out_ref = f"{_FIX_IR_REF}/ir_meta.json"
             out_path = repo_root / out_ref
             out_path.parent.mkdir(parents=True, exist_ok=True)
             out_path.write_text('{"status":"ok"}\n', encoding="utf-8")
@@ -4371,7 +4409,7 @@ shell_tool                       stable             true
                 actor_role="substep",
                 changed_paths=[out_ref],
             )
-            tmp_file_path = repo_root / "workspace" / "tmp" / "substep_run_gen_001" / "guarded_patch_plan_meta.txt"
+            tmp_file_path = repo_root / "workspace" / "tmp" / "substep_run_gen_001" / "guarded_patch_ir_meta.txt"
             tmp_file_path.parent.mkdir(parents=True, exist_ok=True)
             tmp_file_path.write_text("patch metadata\n", encoding="utf-8")
             payload = record_agent_run(
@@ -4381,7 +4419,7 @@ shell_tool                       stable             true
                     "agent_run_id": "substep_run_gen_001",
                     "agent_role": "substep",
                     "parent_agent_run_id": "orch_run_001",
-                    "step": "plan",
+                    "step": "compile",
                     "substep": "generate",
                     "node_key": "problem/shallow_water2d@0.3.0",
                     "status": "pass",
@@ -4402,6 +4440,7 @@ shell_tool                       stable             true
                 with tempfile.TemporaryDirectory() as tmp:
                     repo_root = Path(tmp)
                     init_orchestration(repo_root=repo_root, orchestration_id="orch_001")
+                    _mark_dependencies_ready(repo_root)
                     write_preflight(
                         repo_root=repo_root,
                         orchestration_id="orch_001",
@@ -4432,29 +4471,29 @@ shell_tool                       stable             true
                         child_agent_run_id="substep_run_gen_001",
                         request_payload={
                             "node_key": "problem/shallow_water2d@0.3.0",
-                            "step": "plan",
+                            "step": "compile",
                             "substep": "generate",
                             "agent_role": "substep",
                             "orchestration_id": "orch_001",
                             "agent_run_id": "substep_run_gen_001",
                             "parent_agent_run_id": "orch_run_001",
-                            "plan_ref": _FIX_PLAN_REF,
+                            "ir_ref": _FIX_IR_REF,
                             "pipeline_ref": _FIX_PIPE_REF,
-                            "dependency_ref": _FIX_PLAN_STEP_DEP_REF,
-                            "skill_name": "workflow-plan-generate",
-                            "skill_ref": "skills/workflow-plan-generate/SKILL.md",
-                            "skill_must_read_refs": _fixture_skill_must_read_refs_substep("plan", "generate"),
-                            "allowed_output_paths": [f"{_FIX_PLAN_REF}/plan_meta.json"],
+                            "dependency_ref": _FIX_COMPILE_STEP_DEP_REF,
+                            "skill_name": "workflow-compile-generate",
+                            "skill_ref": "skills/workflow-compile-generate/SKILL.md",
+                            "skill_must_read_refs": _fixture_skill_must_read_refs_substep("compile", "generate"),
+                            "allowed_output_paths": [f"{_FIX_IR_REF}/ir_meta.json"],
                             "launch_prompt_full": _substep_launch_prompt(
                                 "problem/shallow_water2d@0.3.0",
-                                "plan",
+                                "compile",
                                 "generate",
                                 "substep_run_gen_001",
                             ),
                         },
                         response_payload=_spawn_response_payload("sess_substep_gen_001"),
                     )
-                    out_ref = f"{_FIX_PLAN_REF}/plan_meta.json"
+                    out_ref = f"{_FIX_IR_REF}/ir_meta.json"
                     out_path = repo_root / out_ref
                     out_path.parent.mkdir(parents=True, exist_ok=True)
                     out_path.write_text('{"status":"ok"}\n', encoding="utf-8")
@@ -4486,7 +4525,7 @@ shell_tool                       stable             true
                                 "agent_run_id": "substep_run_gen_001",
                                 "agent_role": "substep",
                                 "parent_agent_run_id": "orch_run_001",
-                                "step": "plan",
+                                "step": "compile",
                                 "substep": "generate",
                                 "node_key": "problem/shallow_water2d@0.3.0",
                                 "status": "pass",
@@ -4502,6 +4541,7 @@ shell_tool                       stable             true
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
             init_orchestration(repo_root=repo_root, orchestration_id="orch_001")
+            _mark_dependencies_ready(repo_root)
             write_preflight(
                 repo_root=repo_root,
                 orchestration_id="orch_001",
@@ -4537,13 +4577,13 @@ shell_tool                       stable             true
                     "orchestration_id": "orch_001",
                     "agent_run_id": "step_run_build_001",
                     "parent_agent_run_id": "orch_run_001",
-                    "plan_ref": _FIX_PLAN_REF,
+                    "ir_ref": _FIX_IR_REF,
                     "pipeline_ref": _FIX_PIPE_REF,
                     "dependency_ref": _FIX_DEP_REF,
                     "skill_name": "workflow-build",
                     "skill_ref": "skills/workflow-build/SKILL.md",
                     "skill_must_read_refs": _fixture_skill_must_read_refs_step("build"),
-                    "allowed_output_paths": [f"{_FIX_PIPE_REF}/build/build_001/bin/simulate"],
+                    "allowed_output_paths": [f"{_FIX_PIPE_REF}/binary/bin_001/bin/simulate"],
                     "launch_prompt_full": _step_launch_prompt(
                         "problem/shallow_water2d@0.3.0",
                         "build",
@@ -4552,7 +4592,7 @@ shell_tool                       stable             true
                 },
                 response_payload=_spawn_response_payload("sess_step_build_001"),
             )
-            out_ref = f"{_FIX_PIPE_REF}/build/build_001/bin/simulate"
+            out_ref = f"{_FIX_PIPE_REF}/binary/bin_001/bin/simulate"
             out_path = repo_root / out_ref
             out_path.parent.mkdir(parents=True, exist_ok=True)
             out_path.write_text("binary\n", encoding="utf-8")
@@ -4561,7 +4601,7 @@ shell_tool                       stable             true
                 orchestration_id="orch_001",
                 agent_run_id="step_run_build_001",
                 actor_role="step",
-                changed_paths=[f"{_FIX_PIPE_REF}/build/build_001/bin/"],
+                changed_paths=[f"{_FIX_PIPE_REF}/binary/bin_001/bin/"],
             )
             payload = record_agent_run(
                 repo_root=repo_root,
@@ -4587,12 +4627,13 @@ shell_tool                       stable             true
     ) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
-            out_ref = f"{_FIX_PIPE_REF}/build/build_001/bin/simulate"
+            out_ref = f"{_FIX_PIPE_REF}/binary/bin_001/bin/simulate"
             out_path = repo_root / out_ref
             out_path.parent.mkdir(parents=True, exist_ok=True)
             out_path.write_text("binary-baseline\n", encoding="utf-8")
             _fixture_generate_downstream_ready(repo_root)
             init_orchestration(repo_root=repo_root, orchestration_id="orch_001")
+            _mark_dependencies_ready(repo_root)
             write_preflight(
                 repo_root=repo_root,
                 orchestration_id="orch_001",
@@ -4628,13 +4669,13 @@ shell_tool                       stable             true
                     "orchestration_id": "orch_001",
                     "agent_run_id": "step_run_build_001",
                     "parent_agent_run_id": "orch_run_001",
-                    "plan_ref": _FIX_PLAN_REF,
+                    "ir_ref": _FIX_IR_REF,
                     "pipeline_ref": _FIX_PIPE_REF,
                     "dependency_ref": _FIX_DEP_REF,
                     "skill_name": "workflow-build",
                     "skill_ref": "skills/workflow-build/SKILL.md",
                     "skill_must_read_refs": _fixture_skill_must_read_refs_step("build"),
-                    "allowed_output_paths": [f"{_FIX_PIPE_REF}/build/build_001/bin/simulate"],
+                    "allowed_output_paths": [f"{_FIX_PIPE_REF}/binary/bin_001/bin/simulate"],
                     "launch_prompt_full": _step_launch_prompt(
                         "problem/shallow_water2d@0.3.0",
                         "build",
@@ -4687,6 +4728,7 @@ shell_tool                       stable             true
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
             init_orchestration(repo_root=repo_root, orchestration_id="orch_001")
+            _mark_dependencies_ready(repo_root)
             write_preflight(
                 repo_root=repo_root,
                 orchestration_id="orch_001",
@@ -4722,13 +4764,13 @@ shell_tool                       stable             true
                     "orchestration_id": "orch_001",
                     "agent_run_id": "step_run_build_001",
                     "parent_agent_run_id": "orch_run_001",
-                    "plan_ref": _FIX_PLAN_REF,
+                    "ir_ref": _FIX_IR_REF,
                     "pipeline_ref": _FIX_PIPE_REF,
                     "dependency_ref": _FIX_DEP_REF,
                     "skill_name": "workflow-build",
                     "skill_ref": "skills/workflow-build/SKILL.md",
                     "skill_must_read_refs": _fixture_skill_must_read_refs_step("build"),
-                    "allowed_output_paths": [f"{_FIX_PIPE_REF}/build/build_001/bin/simulate"],
+                    "allowed_output_paths": [f"{_FIX_PIPE_REF}/binary/bin_001/bin/simulate"],
                     "launch_prompt_full": _step_launch_prompt(
                         "problem/shallow_water2d@0.3.0",
                         "build",
@@ -4737,7 +4779,7 @@ shell_tool                       stable             true
                 },
                 response_payload=_spawn_response_payload("sess_step_build_001"),
             )
-            out_ref = f"{_FIX_PIPE_REF}/build/build_001/bin/simulate"
+            out_ref = f"{_FIX_PIPE_REF}/binary/bin_001/bin/simulate"
             out_path = repo_root / out_ref
             out_path.parent.mkdir(parents=True, exist_ok=True)
             out_path.write_text("binary\n", encoding="utf-8")
@@ -4782,6 +4824,7 @@ shell_tool                       stable             true
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
             init_orchestration(repo_root=repo_root, orchestration_id="orch_001")
+            _mark_dependencies_ready(repo_root)
             write_preflight(
                 repo_root=repo_root,
                 orchestration_id="orch_001",
@@ -4817,13 +4860,13 @@ shell_tool                       stable             true
                     "orchestration_id": "orch_001",
                     "agent_run_id": "step_run_build_001",
                     "parent_agent_run_id": "orch_run_001",
-                    "plan_ref": _FIX_PLAN_REF,
+                    "ir_ref": _FIX_IR_REF,
                     "pipeline_ref": _FIX_PIPE_REF,
                     "dependency_ref": _FIX_DEP_REF,
                     "skill_name": "workflow-build",
                     "skill_ref": "skills/workflow-build/SKILL.md",
                     "skill_must_read_refs": _fixture_skill_must_read_refs_step("build"),
-                    "allowed_output_paths": [f"{_FIX_PIPE_REF}/build/build_001/bin/simulate"],
+                    "allowed_output_paths": [f"{_FIX_PIPE_REF}/binary/bin_001/bin/simulate"],
                     "launch_prompt_full": _step_launch_prompt(
                         "problem/shallow_water2d@0.3.0",
                         "build",
@@ -4832,7 +4875,7 @@ shell_tool                       stable             true
                 },
                 response_payload=_spawn_response_payload("sess_step_build_001"),
             )
-            out_ref = f"{_FIX_PIPE_REF}/build/build_001/bin/simulate"
+            out_ref = f"{_FIX_PIPE_REF}/binary/bin_001/bin/simulate"
             out_path = repo_root / out_ref
             out_path.parent.mkdir(parents=True, exist_ok=True)
             out_path.write_text("binary-v1\n", encoding="utf-8")
@@ -4879,12 +4922,13 @@ shell_tool                       stable             true
     ) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
-            out_ref = f"{_FIX_PIPE_REF}/build/build_001/bin/simulate"
+            out_ref = f"{_FIX_PIPE_REF}/binary/bin_001/bin/simulate"
             out_path = repo_root / out_ref
             out_path.parent.mkdir(parents=True, exist_ok=True)
             out_path.write_text("binary-baseline\n", encoding="utf-8")
             _fixture_generate_downstream_ready(repo_root)
             init_orchestration(repo_root=repo_root, orchestration_id="orch_001")
+            _mark_dependencies_ready(repo_root)
             write_preflight(
                 repo_root=repo_root,
                 orchestration_id="orch_001",
@@ -4920,13 +4964,13 @@ shell_tool                       stable             true
                     "orchestration_id": "orch_001",
                     "agent_run_id": "step_run_build_001",
                     "parent_agent_run_id": "orch_run_001",
-                    "plan_ref": _FIX_PLAN_REF,
+                    "ir_ref": _FIX_IR_REF,
                     "pipeline_ref": _FIX_PIPE_REF,
                     "dependency_ref": _FIX_DEP_REF,
                     "skill_name": "workflow-build",
                     "skill_ref": "skills/workflow-build/SKILL.md",
                     "skill_must_read_refs": _fixture_skill_must_read_refs_step("build"),
-                    "allowed_output_paths": [f"{_FIX_PIPE_REF}/build/build_001/bin/simulate"],
+                    "allowed_output_paths": [f"{_FIX_PIPE_REF}/binary/bin_001/bin/simulate"],
                     "launch_prompt_full": _step_launch_prompt(
                         "problem/shallow_water2d@0.3.0",
                         "build",
@@ -4977,6 +5021,7 @@ shell_tool                       stable             true
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
             init_orchestration(repo_root=repo_root, orchestration_id="orch_001")
+            _mark_dependencies_ready(repo_root)
             write_preflight(
                 repo_root=repo_root,
                 orchestration_id="orch_001",
@@ -5002,9 +5047,9 @@ shell_tool                       stable             true
                         "orchestration_id": "orch_001",
                         "agent_run_id": "step_run_build_001",
                         "parent_agent_run_id": "orch_run_001",
-                        "plan_ref": "workspace/plans/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001",
+                        "ir_ref": "workspace/ir/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001",
                         "pipeline_ref": "workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001",
-                        "dependency_ref": "workspace/plans/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/dependency.resolved.yaml",
+                        "dependency_ref": "workspace/ir/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/spec.ir.yaml",
                         "skill_name": "workflow-build",
                         "skill_ref": "skills/workflow-build/SKILL.md",
                         "skill_must_read_refs": "",
@@ -5023,7 +5068,7 @@ shell_tool                       stable             true
                 role="substep",
                 step="tune",
                 orchestration_id="orch_001",
-                plan_ref=_FIX_PLAN_REF,
+                ir_ref=_FIX_IR_REF,
                 pipeline_ref=_FIX_PIPE_REF,
             ),
             [f"{_FIX_PIPE_REF}/tune/"],
@@ -5040,7 +5085,7 @@ shell_tool                       stable             true
                 role="step",
                 step="promote",
                 orchestration_id="orch_001",
-                plan_ref=_FIX_PLAN_REF,
+                ir_ref=_FIX_IR_REF,
                 pipeline_ref=_FIX_PIPE_REF,
                 node_key="problem/dom.fam.spec_x@1.0",
             ),
@@ -5056,7 +5101,7 @@ shell_tool                       stable             true
                 role="step",
                 step="promote",
                 orchestration_id="orch_001",
-                plan_ref=_FIX_PLAN_REF,
+                ir_ref=_FIX_IR_REF,
                 pipeline_ref=_FIX_PIPE_REF,
             ),
             [],
@@ -5072,7 +5117,7 @@ shell_tool                       stable             true
             request_payload={
                 "agent_role": "step",
                 "step": "promote",
-                "plan_ref": _FIX_PLAN_REF,
+                "ir_ref": _FIX_IR_REF,
                 "pipeline_ref": _FIX_PIPE_REF,
                 "node_key": "problem/dom.fam.spec_x@1.0",
                 "allowed_output_paths": [
@@ -5099,7 +5144,7 @@ shell_tool                       stable             true
                 request_payload={
                     "agent_role": "step",
                     "step": "promote",
-                    "plan_ref": _FIX_PLAN_REF,
+                    "ir_ref": _FIX_IR_REF,
                     "pipeline_ref": _FIX_PIPE_REF,
                     "node_key": "problem/dom.fam.spec_x@1.0",
                     "allowed_output_paths": ["workspace/random.json"],
@@ -5118,8 +5163,8 @@ shell_tool                       stable             true
 
         base_payload: dict[str, object] = {
             "agent_role": "step",
-            "step": "promote",
-            "plan_ref": _FIX_PLAN_REF,
+            "step": "build",
+            "ir_ref": _FIX_IR_REF,
             "pipeline_ref": _FIX_PIPE_REF,
         }
         malicious = [
@@ -5154,8 +5199,8 @@ shell_tool                       stable             true
 
         base_payload: dict[str, object] = {
             "agent_role": "step",
-            "step": "promote",
-            "plan_ref": _FIX_PLAN_REF,
+            "step": "build",
+            "ir_ref": _FIX_IR_REF,
             "pipeline_ref": _FIX_PIPE_REF,
         }
         for nk in (
@@ -5183,7 +5228,7 @@ shell_tool                       stable             true
                 request_payload={
                     "agent_role": "step",
                     "step": "promote",
-                    "plan_ref": _FIX_PLAN_REF,
+                    "ir_ref": _FIX_IR_REF,
                     "pipeline_ref": _FIX_PIPE_REF,
                     "node_key": "problem/dom.fam.spec_x@1.0",
                     # Different spec_id → outside this node's release subtree
@@ -5364,7 +5409,7 @@ shell_tool                       stable             true
                 request_payload={
                     "agent_role": "step",
                     "step": "promote",
-                    "plan_ref": _FIX_PLAN_REF,
+                    "ir_ref": _FIX_IR_REF,
                     "pipeline_ref": _FIX_PIPE_REF,
                     "node_key": "problem/dom.fam.spec_x@1.0",
                     "allowed_output_paths": [
@@ -5384,7 +5429,7 @@ shell_tool                       stable             true
                 request_payload={
                     "agent_role": "step",
                     "step": "promote",
-                    "plan_ref": _FIX_PLAN_REF,
+                    "ir_ref": _FIX_IR_REF,
                     "pipeline_ref": _FIX_PIPE_REF,
                     "node_key": "problem/dom.fam.spec_x@1.0",
                     "allowed_output_paths": [
@@ -5405,8 +5450,8 @@ shell_tool                       stable             true
             _allowed_output_paths_for_launch(
                 request_payload={
                     "agent_role": "step",
-                    "step": "promote",
-                    "plan_ref": _FIX_PLAN_REF,
+                    "step": "build",
+                    "ir_ref": _FIX_IR_REF,
                     "pipeline_ref": _FIX_PIPE_REF,
                     "node_key": "problem/dom.fam.spec_x@1.0",
                     "allowed_output_paths": [
@@ -5422,8 +5467,8 @@ shell_tool                       stable             true
             _allowed_output_paths_for_launch(
                 request_payload={
                     "agent_role": "step",
-                    "step": "promote",
-                    "plan_ref": _FIX_PLAN_REF,
+                    "step": "build",
+                    "ir_ref": _FIX_IR_REF,
                     "pipeline_ref": _FIX_PIPE_REF,
                     "node_key": "problem/dom.fam.spec_x@1.0",
                     "allowed_output_paths": [
@@ -5441,7 +5486,7 @@ shell_tool                       stable             true
             request_payload={
                 "agent_role": "step",
                 "step": "promote",
-                "plan_ref": _FIX_PLAN_REF,
+                "ir_ref": _FIX_IR_REF,
                 "pipeline_ref": _FIX_PIPE_REF,
                 "node_key": "problem/dom.fam.spec_x@1.0",
                 "allowed_output_paths": [
@@ -5464,7 +5509,7 @@ shell_tool                       stable             true
                 request_payload={
                     "agent_role": "step",
                     "step": "promote",
-                    "plan_ref": _FIX_PLAN_REF,
+                    "ir_ref": _FIX_IR_REF,
                     "pipeline_ref": _FIX_PIPE_REF,
                     "node_key": "problem/dom.fam.spec_x@1.0",
                     "allowed_output_paths": [
@@ -5478,6 +5523,7 @@ shell_tool                       stable             true
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
             init_orchestration(repo_root=repo_root, orchestration_id="orch_001")
+            _mark_dependencies_ready(repo_root)
             write_preflight(
                 repo_root=repo_root,
                 orchestration_id="orch_001",
@@ -5538,7 +5584,7 @@ shell_tool                       stable             true
                         "orchestration_id": "orch_001",
                         "agent_run_id": "substep_run_tune_001",
                         "parent_agent_run_id": "orch_run_001",
-                        "plan_ref": _FIX_PLAN_REF,
+                        "ir_ref": _FIX_IR_REF,
                         "pipeline_ref": _FIX_PIPE_REF,
                         "dependency_ref": _FIX_DEP_REF,
                     },
@@ -5611,7 +5657,7 @@ shell_tool                       stable             true
                 "orch_001",
                 agent_run_id="substep_run_tune_001",
             )
-            bad_ref = f"{_FIX_PIPE_REF}/generate/leaked.txt"
+            bad_ref = f"{_FIX_PIPE_REF}/source/leaked.txt"
             bad_path = repo_root / bad_ref
             bad_path.parent.mkdir(parents=True, exist_ok=True)
             bad_path.write_text("leak\n", encoding="utf-8")
@@ -5646,6 +5692,7 @@ shell_tool                       stable             true
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
             init_orchestration(repo_root=repo_root, orchestration_id="orch_001")
+            _mark_dependencies_ready(repo_root)
             write_preflight(
                 repo_root=repo_root,
                 orchestration_id="orch_001",
@@ -5671,13 +5718,13 @@ shell_tool                       stable             true
                     "orchestration_id": "orch_001",
                     "agent_run_id": "step_run_build_001",
                     "parent_agent_run_id": "orch_run_001",
-                    "plan_ref": "workspace/plans/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001",
+                    "ir_ref": "workspace/ir/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001",
                     "pipeline_ref": "workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001",
-                    "dependency_ref": "workspace/plans/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/dependency.resolved.yaml",
+                    "dependency_ref": "workspace/ir/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/spec.ir.yaml",
                     "skill_name": "workflow-build",
                     "skill_ref": "skills/workflow-build/SKILL.md",
                     "skill_must_read_refs": "",
-                    "allowed_output_paths": ["workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/build/build_001/bin/simulate"],
+                    "allowed_output_paths": ["workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/binary/bin_001/bin/simulate"],
                     "launch_prompt_full": _step_launch_prompt(
                         "problem/shallow_water2d@0.3.0",
                         "build",
@@ -5702,7 +5749,7 @@ shell_tool                       stable             true
                         "context_id": "ctx_step_build_001",
                         "agent_session_id": "sess_step_build_999",
                         "output_refs": [
-                            "workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/build/build_001/bin/simulate"
+                            "workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/binary/bin_001/bin/simulate"
                         ],
                     },
                 )
@@ -5711,6 +5758,7 @@ shell_tool                       stable             true
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
             init_orchestration(repo_root=repo_root, orchestration_id="orch_001")
+            _mark_dependencies_ready(repo_root)
             write_preflight(
                 repo_root=repo_root,
                 orchestration_id="orch_001",
@@ -5743,6 +5791,7 @@ shell_tool                       stable             true
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
             init_orchestration(repo_root=repo_root, orchestration_id="orch_001")
+            _mark_dependencies_ready(repo_root)
             write_preflight(
                 repo_root=repo_root,
                 orchestration_id="orch_001",
@@ -5762,7 +5811,7 @@ shell_tool                       stable             true
                     orchestration_id="orch_001",
                     parent_agent_run_id="orch_run_001",
                     child_agent_run_id="step_run_plan_001",
-                    request_payload={"step": "plan"},
+                    request_payload={"step": "compile"},
                     response_payload=_spawn_response_payload("sess_step_plan_001"),
                 )
             meta = json.loads(
@@ -5777,6 +5826,7 @@ shell_tool                       stable             true
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
             init_orchestration(repo_root=repo_root, orchestration_id="orch_001")
+            _mark_dependencies_ready(repo_root)
             write_preflight(
                 repo_root=repo_root,
                 orchestration_id="orch_001",
@@ -5801,7 +5851,7 @@ shell_tool                       stable             true
                         "agent_model": "gpt-5-codex",
                         "context_id": "ctx_step_plan_001",
                         "agent_session_id": "sess_step_plan_001",
-                        "output_refs": ["workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/build/build_001/bin/simulate"],
+                        "output_refs": ["workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/binary/bin_001/bin/simulate"],
                     },
                 )
 
@@ -5809,6 +5859,7 @@ shell_tool                       stable             true
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
             init_orchestration(repo_root=repo_root, orchestration_id="orch_001")
+            _mark_dependencies_ready(repo_root)
             with self.assertRaisesRegex(ValueError, "feature_states.multi_agent=false"):
                 write_preflight(
                     repo_root=repo_root,
@@ -5830,6 +5881,7 @@ shell_tool                       stable             true
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
             init_orchestration(repo_root=repo_root, orchestration_id="orch_001")
+            _mark_dependencies_ready(repo_root)
             with self.assertRaisesRegex(ValueError, "feature_states.codex_hooks=true"):
                 write_preflight(
                     repo_root=repo_root,
@@ -5854,6 +5906,7 @@ shell_tool                       stable             true
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
             init_orchestration(repo_root=repo_root, orchestration_id="orch_001")
+            _mark_dependencies_ready(repo_root)
             with self.assertRaisesRegex(ValueError, "checks.codex_hooks_enabled.pass=true"):
                 write_preflight(
                     repo_root=repo_root,
@@ -5876,6 +5929,7 @@ shell_tool                       stable             true
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
             init_orchestration(repo_root=repo_root, orchestration_id="orch_001")
+            _mark_dependencies_ready(repo_root)
             with self.assertRaisesRegex(ValueError, "checks.codex_home_writable.pass=true"):
                 write_preflight(
                     repo_root=repo_root,
@@ -5899,6 +5953,7 @@ shell_tool                       stable             true
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
             init_orchestration(repo_root=repo_root, orchestration_id="orch_001")
+            _mark_dependencies_ready(repo_root)
             write_preflight(
                 repo_root=repo_root,
                 orchestration_id="orch_001",
@@ -5931,16 +5986,16 @@ shell_tool                       stable             true
                     child_agent_run_id="substep_run_plan_generate_001",
                     request_payload={
                         "node_key": "problem/shallow_water2d@0.3.0",
-                        "step": "plan",
+                        "step": "compile",
                         "substep": "generate",
                         "orchestration_id": "orch_001",
                         "agent_run_id": "substep_run_plan_generate_001",
                         "parent_agent_run_id": "orch_run_001",
-                        "plan_ref": "workspace/plans/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001",
+                        "ir_ref": "workspace/ir/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001",
                         "pipeline_ref": "workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001",
-                        "dependency_ref": _FIX_PLAN_STEP_DEP_REF,
-                        "skill_name": "workflow-plan-generate",
-                        "skill_ref": "skills/workflow-plan-generate/SKILL.md",
+                        "dependency_ref": _FIX_COMPILE_STEP_DEP_REF,
+                        "skill_name": "workflow-compile-generate",
+                        "skill_ref": "skills/workflow-compile-generate/SKILL.md",
                         "skill_must_read_refs": "",
                         "issue_severity": "none",
                         "repair_strategy": "none",
@@ -5948,7 +6003,7 @@ shell_tool                       stable             true
                         "repair_reason": "none",
                         "launch_prompt_full": _substep_launch_prompt(
                             "problem/shallow_water2d@0.3.0",
-                            "plan",
+                            "compile",
                             "generate",
                             "substep_run_plan_generate_001",
                         ),
@@ -5961,6 +6016,7 @@ shell_tool                       stable             true
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
             init_orchestration(repo_root=repo_root, orchestration_id="orch_001")
+            _mark_dependencies_ready(repo_root)
             write_preflight(
                 repo_root=repo_root,
                 orchestration_id="orch_001",
@@ -6002,14 +6058,14 @@ shell_tool                       stable             true
                         "orchestration_id": "orch_001",
                         "agent_run_id": "step_run_build_001",
                         "parent_agent_run_id": "orch_run_001",
-                        "plan_ref": "workspace/plans/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001",
+                        "ir_ref": "workspace/ir/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001",
                         "pipeline_ref": "workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001",
-                        "dependency_ref": "workspace/plans/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/dependency.resolved.yaml",
+                        "dependency_ref": "workspace/ir/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/spec.ir.yaml",
                         "skill_name": "workflow-build",
                         "skill_ref": "skills/workflow-build/SKILL.md",
                         "skill_must_read_refs": "",
                         "allowed_output_paths": [
-                            "workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/build/build_001/bin/simulate",
+                            "workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/binary/bin_001/bin/simulate",
                         ],
                         "launch_prompt_full": _step_launch_prompt(
                             "problem/shallow_water2d@0.3.0",
@@ -6025,7 +6081,7 @@ shell_tool                       stable             true
                     agent_run_id="step_run_build_001",
                     actor_role="step",
                     changed_paths=[
-                        "workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/build/build_001/bin/simulate"
+                        "workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/binary/bin_001/bin/simulate"
                     ],
                 )
                 record_agent_run(
@@ -6042,7 +6098,7 @@ shell_tool                       stable             true
                         "agent_model": "gpt-5-codex",
                         "context_id": "ctx_step_build_001",
                         "agent_session_id": "sess_step_build_001",
-                        "output_refs": ["workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/build/build_001/bin/simulate"],
+                        "output_refs": ["workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/binary/bin_001/bin/simulate"],
                     },
                 )
                 write_step_result(
@@ -6055,7 +6111,7 @@ shell_tool                       stable             true
                         "status": "pass",
                         "validation_stage": "post_build",
                         "required_outputs": [
-                            "workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/build/build_001/bin/simulate"
+                            "workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/binary/bin_001/bin/simulate"
                         ],
                         "failed_substeps": [],
                         "substep_agent_run_ids": [],
@@ -6071,6 +6127,7 @@ shell_tool                       stable             true
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
             init_orchestration(repo_root=repo_root, orchestration_id="orch_001")
+            _mark_dependencies_ready(repo_root)
             write_preflight(
                 repo_root=repo_root,
                 orchestration_id="orch_001",
@@ -6106,13 +6163,13 @@ shell_tool                       stable             true
                     "orchestration_id": "orch_001",
                     "agent_run_id": "step_run_build_001",
                     "parent_agent_run_id": "orch_run_001",
-                    "plan_ref": "workspace/plans/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001",
+                    "ir_ref": "workspace/ir/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001",
                     "pipeline_ref": "workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001",
-                    "dependency_ref": "workspace/plans/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/dependency.resolved.yaml",
+                    "dependency_ref": "workspace/ir/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/spec.ir.yaml",
                     "skill_name": "workflow-build",
                     "skill_ref": "skills/workflow-build/SKILL.md",
                     "skill_must_read_refs": "",
-                    "allowed_output_paths": ["workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/build/build_001/bin/simulate"],
+                    "allowed_output_paths": ["workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/binary/bin_001/bin/simulate"],
                     "launch_prompt_full": _step_launch_prompt(
                         "problem/shallow_water2d@0.3.0",
                         "build",
@@ -6133,6 +6190,7 @@ shell_tool                       stable             true
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
             init_orchestration(repo_root=repo_root, orchestration_id="orch_001")
+            _mark_dependencies_ready(repo_root)
             with self.assertRaisesRegex(ValueError, "agent_backend must be non-empty string"):
                 record_agent_run(
                     repo_root=repo_root,
@@ -6149,6 +6207,7 @@ shell_tool                       stable             true
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
             init_orchestration(repo_root=repo_root, orchestration_id="orch_001")
+            _mark_dependencies_ready(repo_root)
             with self.assertRaisesRegex(ValueError, "agent_backend must be one of"):
                 record_agent_run(
                     repo_root=repo_root,
@@ -6168,6 +6227,7 @@ shell_tool                       stable             true
                 with tempfile.TemporaryDirectory() as tmp:
                     repo_root = Path(tmp)
                     init_orchestration(repo_root=repo_root, orchestration_id="orch_001")
+                    _mark_dependencies_ready(repo_root)
                     payload = record_agent_run(
                         repo_root=repo_root,
                         orchestration_id="orch_001",
@@ -6183,6 +6243,7 @@ shell_tool                       stable             true
     def _setup_preflight_and_orch_agent(self, repo_root: Path) -> None:
         """共通セットアップ: init_orchestration + write_preflight + orchestration record_agent_run。"""
         init_orchestration(repo_root=repo_root, orchestration_id="orch_001")
+        _mark_dependencies_ready(repo_root)
         write_preflight(
             repo_root=repo_root,
             orchestration_id="orch_001",
@@ -6209,11 +6270,10 @@ shell_tool                       stable             true
         phase_state_path = repo_root / "workspace/orchestrations/orch_001/phase_state.json"
         phase_state = json.loads(phase_state_path.read_text(encoding="utf-8"))
         phase_state["node_states"]["problem__shallow_water2d__0.3.0"] = {
-            "plan": "child_finished",
+            "compile": "child_finished",
             "generate": "child_finished",
             "build": "child_finished",
-            "execute": "child_finished",
-            "judge": "child_finished",
+            "validate": "child_finished",
         }
         phase_state_path.write_text(
             json.dumps(phase_state, ensure_ascii=False, indent=2) + "\n",
@@ -6221,7 +6281,7 @@ shell_tool                       stable             true
         )
 
     @staticmethod
-    def _valid_plan_meta(*, context_isolated: bool = True) -> dict[str, object]:
+    def _valid_ir_meta(*, context_isolated: bool = True) -> dict[str, object]:
         payload: dict[str, object] = {
             "attempt_count": 1,
             "verification_status": "pass",
@@ -6234,7 +6294,7 @@ shell_tool                       stable             true
         return payload
 
     @staticmethod
-    def _valid_generate_meta(*, context_isolated: bool = True) -> dict[str, object]:
+    def _valid_source_meta(*, context_isolated: bool = True) -> dict[str, object]:
         payload: dict[str, object] = {
             "attempt_count": 1,
             "verification_status": "pass",
@@ -6270,7 +6330,7 @@ shell_tool                       stable             true
                     payload={
                         "status": "pass",
                         "required_outputs": [
-                            "workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/build/build_001/bin/simulate"
+                            "workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/binary/bin_001/bin/simulate"
                         ],
                         "failed_substeps": [],
                         "substep_agent_run_ids": [],
@@ -6281,6 +6341,7 @@ shell_tool                       stable             true
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
             init_orchestration(repo_root=repo_root, orchestration_id="orch_001")
+            _mark_dependencies_ready(repo_root)
             write_preflight(
                 repo_root=repo_root,
                 orchestration_id="orch_001",
@@ -6326,15 +6387,15 @@ shell_tool                       stable             true
                     "status": "pass",
                     "validation_stage": "post_build",
                     "required_outputs": [
-                        "workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/build/build_001/bin/simulate"
+                        "workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/binary/bin_001/bin/simulate"
                     ],
                     "failed_substeps": [],
                     "substep_agent_run_ids": [],
                 },
             )
 
-    def test_write_step_result_requires_validation_stage_for_execute_pass(self) -> None:
-        """validation_stage のない pass execute step_result が ValueError を上げること。"""
+    def test_write_step_result_requires_validation_stage_for_validate_pass(self) -> None:
+        """validation_stage のない pass validate step_result が ValueError を上げること。"""
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
             self._setup_preflight_and_orch_agent(repo_root)
@@ -6343,20 +6404,21 @@ shell_tool                       stable             true
                     repo_root=repo_root,
                     orchestration_id="orch_001",
                     node_key="problem/shallow_water2d@0.3.0",
-                    step="execute",
-                    agent_run_id="step_run_execute_001",
+                    step="validate",
+                    agent_run_id="step_run_validate_001",
                     payload={
                         "status": "pass",
                         "required_outputs": [
-                            "workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/execute/run_001/results.json"
+                            "workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/runs/run_001/results.json"
                         ],
                         "failed_substeps": [],
                         "substep_agent_run_ids": [],
+                        "launch_request_ref": "workspace/orchestrations/orch_001/launches/step_run_validate_001.request.json",
                     },
                 )
 
-    def test_write_step_result_does_not_require_validation_stage_for_plan_pass(self) -> None:
-        """plan step の pass step_result には validation_stage を要求しないこと（後方互換）。"""
+    def test_write_step_result_requires_validation_stage_for_compile_pass(self) -> None:
+        """compile step の pass step_result には validation_stage='compile' を必須とすること。"""
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
             self._setup_preflight_and_orch_agent(repo_root)
@@ -6364,43 +6426,44 @@ shell_tool                       stable             true
             orch_root = repo_root / "workspace" / "orchestrations" / "orch_001"
             runs_path = orch_root / "agent_runs.jsonl"
             substep_record = {
-                "agent_run_id": "substep_run_plan_generate_001",
+                "agent_run_id": "substep_run_compile_generate_001",
                 "parent_agent_run_id": "orch_run_001",
                 "agent_role": "substep",
                 "node_key": "problem/shallow_water2d@0.3.0",
-                "step": "plan",
+                "step": "compile",
                 "substep": "generate",
                 "status": "pass",
                 "agent_backend": "claude",
                 "output_refs": [
-                    "workspace/plans/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/case.resolved.yaml",
-                    "workspace/plans/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/plan_meta.json",
+                    "workspace/ir/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/spec.ir.yaml",
+                    "workspace/ir/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/ir_meta.json",
                 ],
             }
             with runs_path.open("a", encoding="utf-8") as fh:
                 fh.write(json.dumps(substep_record) + "\n")
-            # plan_meta.json をディスクに作成する
-            plan_meta_path = repo_root / "workspace" / "plans" / "problem__shallow_water2d__0.3.0" / "shallow-water2d_20260415_001" / "plan_meta.json"
-            plan_meta_path.parent.mkdir(parents=True, exist_ok=True)
-            plan_meta_path.write_text(
-                json.dumps(self._valid_plan_meta()),
+            # ir_meta.json をディスクに作成する
+            ir_meta_path = repo_root / "workspace" / "ir" / "problem__shallow_water2d__0.3.0" / "shallow-water2d_20260415_001" / "ir_meta.json"
+            ir_meta_path.parent.mkdir(parents=True, exist_ok=True)
+            ir_meta_path.write_text(
+                json.dumps(self._valid_ir_meta()),
                 encoding="utf-8",
             )
-            # plan step には validation_stage がなくても成功することを確認
+            # compile step は pass で validation_stage='compile' を必須とする
             write_step_result(
                 repo_root=repo_root,
                 orchestration_id="orch_001",
                 node_key="problem/shallow_water2d@0.3.0",
-                step="plan",
+                step="compile",
                 agent_run_id="orch_run_001",
                 payload={
                     "status": "pass",
                     "required_outputs": [
-                        "workspace/plans/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/case.resolved.yaml",
-                        "workspace/plans/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/plan_meta.json",
+                        "workspace/ir/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/spec.ir.yaml",
+                        "workspace/ir/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/ir_meta.json",
                     ],
                     "failed_substeps": [],
-                    "substep_agent_run_ids": ["substep_run_plan_generate_001"],
+                    "substep_agent_run_ids": ["substep_run_compile_generate_001"],
+                    "validation_stage": "compile",
                 },
             )
 
@@ -6417,6 +6480,7 @@ shell_tool                       stable             true
                 with tempfile.TemporaryDirectory() as tmp:
                     repo_root = Path(tmp)
                     init_orchestration(repo_root=repo_root, orchestration_id="orch_001")
+                    _mark_dependencies_ready(repo_root)
                     payload = record_agent_run(
                         repo_root=repo_root,
                         orchestration_id="orch_001",
@@ -6430,14 +6494,14 @@ shell_tool                       stable             true
                     self.assertEqual(payload["agent_backend"], expected)
 
 
-    def test_write_step_result_requires_generate_meta_in_substep_outputs(self) -> None:
-        """generate pass step_result で generate_meta.json が substep output_refs にない場合 ValueError。"""
+    def test_write_step_result_requires_source_meta_in_substep_outputs(self) -> None:
+        """generate pass step_result で source_meta.json が substep output_refs にない場合 ValueError。"""
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
             self._setup_preflight_and_orch_agent(repo_root)
             orch_root = repo_root / "workspace" / "orchestrations" / "orch_001"
             runs_path = orch_root / "agent_runs.jsonl"
-            # substep record: generate_meta.json を含まない
+            # substep record: source_meta.json を含まない
             substep_record = {
                 "agent_run_id": "substep_run_gen_verify_001",
                 "agent_role": "substep",
@@ -6447,12 +6511,12 @@ shell_tool                       stable             true
                 "status": "pass",
                 "agent_backend": "claude",
                 "output_refs": [
-                    "workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/generate/gen_20260413_001/src/model.f90"
+                    "workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/source/src_20260413_001/src/model.f90"
                 ],
             }
             with runs_path.open("a", encoding="utf-8") as fh:
                 fh.write(json.dumps(substep_record) + "\n")
-            with self.assertRaisesRegex(ValueError, "generate_meta.json"):
+            with self.assertRaisesRegex(ValueError, "source_meta.json"):
                 write_step_result(
                     repo_root=repo_root,
                     orchestration_id="orch_001",
@@ -6463,22 +6527,22 @@ shell_tool                       stable             true
                         "status": "pass",
                         "validation_stage": "post_generate",
                         "required_outputs": [
-                            "workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/generate/gen_20260413_001/src/model.f90"
+                            "workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/source/src_20260413_001/src/model.f90"
                         ],
                         "failed_substeps": [],
                         "substep_agent_run_ids": ["substep_run_gen_verify_001"],
                     },
                 )
 
-    def test_write_step_result_validates_generate_meta_required_keys(self) -> None:
-        """generate_meta.json に必須キーが欠けている場合 ValueError。"""
+    def test_write_step_result_validates_source_meta_required_keys(self) -> None:
+        """source_meta.json に必須キーが欠けている場合 ValueError。"""
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
             self._setup_preflight_and_orch_agent(repo_root)
             orch_root = repo_root / "workspace" / "orchestrations" / "orch_001"
             runs_path = orch_root / "agent_runs.jsonl"
-            meta_ref = "workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/generate/gen_20260413_001/generate_meta.json"
-            # 不完全な generate_meta.json を作成（attempt_count のみ）
+            meta_ref = "workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/source/src_20260413_001/source_meta.json"
+            # 不完全な source_meta.json を作成（attempt_count のみ）
             meta_path = repo_root / meta_ref
             meta_path.parent.mkdir(parents=True, exist_ok=True)
             meta_path.write_text(json.dumps({"attempt_count": 1}), encoding="utf-8")
@@ -6510,16 +6574,16 @@ shell_tool                       stable             true
                     },
                 )
 
-    def test_write_step_result_rejects_generate_meta_attempt_count_type(self) -> None:
+    def test_write_step_result_rejects_source_meta_attempt_count_type(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
             self._setup_preflight_and_orch_agent(repo_root)
             orch_root = repo_root / "workspace" / "orchestrations" / "orch_001"
             runs_path = orch_root / "agent_runs.jsonl"
-            meta_ref = "workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/generate/gen_20260413_001/generate_meta.json"
+            meta_ref = "workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/source/src_20260413_001/source_meta.json"
             meta_path = repo_root / meta_ref
             meta_path.parent.mkdir(parents=True, exist_ok=True)
-            meta_payload = self._valid_generate_meta()
+            meta_payload = self._valid_source_meta()
             meta_payload["attempt_count"] = "1"
             meta_payload["verification_status"] = "fail"
             del meta_payload["lint_command_ref"]
@@ -6556,16 +6620,16 @@ shell_tool                       stable             true
                     },
                 )
 
-    def test_write_step_result_requires_generate_meta_lint_command_ref(self) -> None:
+    def test_write_step_result_requires_source_meta_lint_command_ref(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
             self._setup_preflight_and_orch_agent(repo_root)
             orch_root = repo_root / "workspace" / "orchestrations" / "orch_001"
             runs_path = orch_root / "agent_runs.jsonl"
-            meta_ref = "workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/generate/gen_20260413_001/generate_meta.json"
+            meta_ref = "workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/source/src_20260413_001/source_meta.json"
             meta_path = repo_root / meta_ref
             meta_path.parent.mkdir(parents=True, exist_ok=True)
-            meta_payload = self._valid_generate_meta()
+            meta_payload = self._valid_source_meta()
             del meta_payload["lint_command_ref"]
             meta_path.write_text(json.dumps(meta_payload), encoding="utf-8")
             with runs_path.open("a", encoding="utf-8") as fh:
@@ -6600,16 +6664,16 @@ shell_tool                       stable             true
                     },
                 )
 
-    def test_write_step_result_allows_generate_meta_without_lint_when_fail(self) -> None:
+    def test_write_step_result_allows_source_meta_without_lint_when_fail(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
             self._setup_preflight_and_orch_agent(repo_root)
             orch_root = repo_root / "workspace" / "orchestrations" / "orch_001"
             runs_path = orch_root / "agent_runs.jsonl"
-            meta_ref = "workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/generate/gen_20260413_001/generate_meta.json"
+            meta_ref = "workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/source/src_20260413_001/source_meta.json"
             meta_path = repo_root / meta_ref
             meta_path.parent.mkdir(parents=True, exist_ok=True)
-            meta_payload = self._valid_generate_meta()
+            meta_payload = self._valid_source_meta()
             meta_payload["verification_status"] = "fail"
             del meta_payload["lint_command_ref"]
             meta_path.write_text(json.dumps(meta_payload), encoding="utf-8")
@@ -6650,11 +6714,11 @@ shell_tool                       stable             true
             self._setup_preflight_and_orch_agent(repo_root)
             orch_root = repo_root / "workspace" / "orchestrations" / "orch_001"
             runs_path = orch_root / "agent_runs.jsonl"
-            meta_ref = "workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/generate/gen_20260413_001/generate_meta.json"
-            src_ref = "workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/generate/gen_20260413_001/src/model.f90"
+            meta_ref = "workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/source/src_20260413_001/source_meta.json"
+            src_ref = "workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/source/src_20260413_001/src/model.f90"
             meta_path = repo_root / meta_ref
             meta_path.parent.mkdir(parents=True, exist_ok=True)
-            meta_path.write_text(json.dumps(self._valid_generate_meta()), encoding="utf-8")
+            meta_path.write_text(json.dumps(self._valid_source_meta()), encoding="utf-8")
             src_path = repo_root / src_ref
             src_path.parent.mkdir(parents=True, exist_ok=True)
             src_path.write_text("program model\nend program model\n", encoding="utf-8")
@@ -6674,7 +6738,7 @@ shell_tool                       stable             true
                     )
                     + "\n"
                 )
-            with self.assertRaisesRegex(ValueError, "required_outputs to include final generate_meta.json"):
+            with self.assertRaisesRegex(ValueError, "required_outputs to include final source_meta.json"):
                 write_step_result(
                     repo_root=repo_root,
                     orchestration_id="orch_001",
@@ -6690,15 +6754,15 @@ shell_tool                       stable             true
                     },
                 )
 
-    def test_write_step_result_validates_plan_meta_required_keys(self) -> None:
-        """plan_meta.json に必須キーが欠けている場合 ValueError。"""
+    def test_write_step_result_validates_ir_meta_required_keys(self) -> None:
+        """ir_meta.json に必須キーが欠けている場合 ValueError。"""
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
             self._setup_preflight_and_orch_agent(repo_root)
             orch_root = repo_root / "workspace" / "orchestrations" / "orch_001"
             runs_path = orch_root / "agent_runs.jsonl"
-            meta_ref = "workspace/plans/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/plan_meta.json"
-            # 不完全な plan_meta.json（verification_status が欠けている）
+            meta_ref = "workspace/ir/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/ir_meta.json"
+            # 不完全な ir_meta.json（verification_status が欠けている）
             meta_path = repo_root / meta_ref
             meta_path.parent.mkdir(parents=True, exist_ok=True)
             meta_path.write_text(json.dumps({"attempt_count": 1, "context_isolated": True}), encoding="utf-8")
@@ -6706,7 +6770,7 @@ shell_tool                       stable             true
                 "agent_run_id": "substep_run_plan_generate_001",
                 "agent_role": "substep",
                 "node_key": "problem/shallow_water2d@0.3.0",
-                "step": "plan",
+                "step": "compile",
                 "substep": "generate",
                 "status": "pass",
                 "agent_backend": "claude",
@@ -6719,26 +6783,27 @@ shell_tool                       stable             true
                     repo_root=repo_root,
                     orchestration_id="orch_001",
                     node_key="problem/shallow_water2d@0.3.0",
-                    step="plan",
+                    step="compile",
                     agent_run_id="orch_run_001",
                     payload={
                         "status": "pass",
                         "required_outputs": [meta_ref],
                         "failed_substeps": [],
                         "substep_agent_run_ids": ["substep_run_plan_generate_001"],
+                        "validation_stage": "compile",
                     },
                 )
 
-    def test_write_step_result_rejects_plan_meta_last_fail_reason_type(self) -> None:
+    def test_write_step_result_rejects_ir_meta_last_fail_reason_type(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
             self._setup_preflight_and_orch_agent(repo_root)
             orch_root = repo_root / "workspace" / "orchestrations" / "orch_001"
             runs_path = orch_root / "agent_runs.jsonl"
-            meta_ref = "workspace/plans/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/plan_meta.json"
+            meta_ref = "workspace/ir/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/ir_meta.json"
             meta_path = repo_root / meta_ref
             meta_path.parent.mkdir(parents=True, exist_ok=True)
-            meta_payload = self._valid_plan_meta()
+            meta_payload = self._valid_ir_meta()
             meta_payload["last_fail_reason"] = 1
             meta_path.write_text(json.dumps(meta_payload), encoding="utf-8")
             with runs_path.open("a", encoding="utf-8") as fh:
@@ -6748,7 +6813,7 @@ shell_tool                       stable             true
                             "agent_run_id": "substep_run_plan_generate_001",
                             "agent_role": "substep",
                             "node_key": "problem/shallow_water2d@0.3.0",
-                            "step": "plan",
+                            "step": "compile",
                             "substep": "generate",
                             "status": "pass",
                             "agent_backend": "claude",
@@ -6762,13 +6827,14 @@ shell_tool                       stable             true
                     repo_root=repo_root,
                     orchestration_id="orch_001",
                     node_key="problem/shallow_water2d@0.3.0",
-                    step="plan",
+                    step="compile",
                     agent_run_id="orch_run_001",
                     payload={
                         "status": "pass",
                         "required_outputs": [meta_ref],
                         "failed_substeps": [],
                         "substep_agent_run_ids": ["substep_run_plan_generate_001"],
+                        "validation_stage": "compile",
                     },
                 )
 
@@ -6778,10 +6844,10 @@ shell_tool                       stable             true
             self._setup_preflight_and_orch_agent(repo_root)
             orch_root = repo_root / "workspace" / "orchestrations" / "orch_001"
             runs_path = orch_root / "agent_runs.jsonl"
-            meta_ref = "workspace/plans/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/plan_meta.json"
+            meta_ref = "workspace/ir/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/ir_meta.json"
             meta_path = repo_root / meta_ref
             meta_path.parent.mkdir(parents=True, exist_ok=True)
-            meta_payload = self._valid_plan_meta(context_isolated=False)
+            meta_payload = self._valid_ir_meta(context_isolated=False)
             del meta_payload["constraint_reason"]
             meta_path.write_text(json.dumps(meta_payload), encoding="utf-8")
             with runs_path.open("a", encoding="utf-8") as fh:
@@ -6791,7 +6857,7 @@ shell_tool                       stable             true
                             "agent_run_id": "substep_run_plan_generate_001",
                             "agent_role": "substep",
                             "node_key": "problem/shallow_water2d@0.3.0",
-                            "step": "plan",
+                            "step": "compile",
                             "substep": "generate",
                             "status": "pass",
                             "agent_backend": "claude",
@@ -6805,29 +6871,30 @@ shell_tool                       stable             true
                     repo_root=repo_root,
                     orchestration_id="orch_001",
                     node_key="problem/shallow_water2d@0.3.0",
-                    step="plan",
+                    step="compile",
                     agent_run_id="orch_run_001",
                     payload={
                         "status": "pass",
                         "required_outputs": [meta_ref],
                         "failed_substeps": [],
                         "substep_agent_run_ids": ["substep_run_plan_generate_001"],
+                        "validation_stage": "compile",
                     },
                 )
 
-    def test_write_step_result_accepts_valid_generate_meta(self) -> None:
-        """必須キーがすべて揃った generate_meta.json を含む pass generate step_result が成功する。"""
+    def test_write_step_result_accepts_valid_source_meta(self) -> None:
+        """必須キーがすべて揃った source_meta.json を含む pass generate step_result が成功する。"""
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
             self._setup_preflight_and_orch_agent(repo_root)
             orch_root = repo_root / "workspace" / "orchestrations" / "orch_001"
             runs_path = orch_root / "agent_runs.jsonl"
-            meta_ref = "workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/generate/gen_20260413_001/generate_meta.json"
-            # 完全な generate_meta.json を作成
+            meta_ref = "workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/source/src_20260413_001/source_meta.json"
+            # 完全な source_meta.json を作成
             meta_path = repo_root / meta_ref
             meta_path.parent.mkdir(parents=True, exist_ok=True)
             meta_path.write_text(
-                json.dumps(self._valid_generate_meta()),
+                json.dumps(self._valid_source_meta()),
                 encoding="utf-8",
             )
             substep_record = {
@@ -6865,14 +6932,14 @@ shell_tool                       stable             true
             self._setup_preflight_and_orch_agent(repo_root)
             orch_root = repo_root / "workspace" / "orchestrations" / "orch_001"
             runs_path = orch_root / "agent_runs.jsonl"
-            old_meta_ref = "workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/generate/gen_20260413_001/generate_meta.json"
-            new_meta_ref = "workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/generate/gen_20260413_002/generate_meta.json"
+            old_meta_ref = "workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/source/src_20260413_001/source_meta.json"
+            new_meta_ref = "workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/source/src_20260413_002/source_meta.json"
             old_meta_path = repo_root / old_meta_ref
             old_meta_path.parent.mkdir(parents=True, exist_ok=True)
-            old_meta_path.write_text(json.dumps(self._valid_generate_meta()), encoding="utf-8")
+            old_meta_path.write_text(json.dumps(self._valid_source_meta()), encoding="utf-8")
             new_meta_path = repo_root / new_meta_ref
             new_meta_path.parent.mkdir(parents=True, exist_ok=True)
-            new_meta_path.write_text(json.dumps(self._valid_generate_meta()), encoding="utf-8")
+            new_meta_path.write_text(json.dumps(self._valid_source_meta()), encoding="utf-8")
             with runs_path.open("a", encoding="utf-8") as fh:
                 fh.write(
                     json.dumps(
@@ -6938,10 +7005,10 @@ shell_tool                       stable             true
             self._setup_preflight_and_orch_agent(repo_root)
             orch_root = repo_root / "workspace" / "orchestrations" / "orch_001"
             runs_path = orch_root / "agent_runs.jsonl"
-            meta_ref = "workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/generate/gen_20260413_001/generate_meta.json"
+            meta_ref = "workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/source/src_20260413_001/source_meta.json"
             meta_path = repo_root / meta_ref
             meta_path.parent.mkdir(parents=True, exist_ok=True)
-            meta_path.write_text(json.dumps(self._valid_generate_meta()), encoding="utf-8")
+            meta_path.write_text(json.dumps(self._valid_source_meta()), encoding="utf-8")
             with runs_path.open("a", encoding="utf-8") as fh:
                 fh.write(
                     json.dumps(
@@ -6980,14 +7047,14 @@ shell_tool                       stable             true
             self._setup_preflight_and_orch_agent(repo_root)
             orch_root = repo_root / "workspace" / "orchestrations" / "orch_001"
             runs_path = orch_root / "agent_runs.jsonl"
-            old_meta_ref = "workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/generate/gen_20260413_001/generate_meta.json"
-            new_meta_ref = "workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/generate/gen_20260413_002/generate_meta.json"
+            old_meta_ref = "workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/source/src_20260413_001/source_meta.json"
+            new_meta_ref = "workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/source/src_20260413_002/source_meta.json"
             old_meta_path = repo_root / old_meta_ref
             old_meta_path.parent.mkdir(parents=True, exist_ok=True)
-            old_meta_path.write_text(json.dumps(self._valid_generate_meta()), encoding="utf-8")
+            old_meta_path.write_text(json.dumps(self._valid_source_meta()), encoding="utf-8")
             new_meta_path = repo_root / new_meta_ref
             new_meta_path.parent.mkdir(parents=True, exist_ok=True)
-            new_meta_path.write_text(json.dumps(self._valid_generate_meta()), encoding="utf-8")
+            new_meta_path.write_text(json.dumps(self._valid_source_meta()), encoding="utf-8")
             with runs_path.open("a", encoding="utf-8") as fh:
                 fh.write(
                     json.dumps(
@@ -7053,14 +7120,14 @@ shell_tool                       stable             true
             self._setup_preflight_and_orch_agent(repo_root)
             orch_root = repo_root / "workspace" / "orchestrations" / "orch_001"
             runs_path = orch_root / "agent_runs.jsonl"
-            old_meta_ref = "workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/generate/gen_20260413_001/generate_meta.json"
-            new_meta_ref = "workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/generate/gen_20260413_002/generate_meta.json"
+            old_meta_ref = "workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/source/src_20260413_001/source_meta.json"
+            new_meta_ref = "workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/source/src_20260413_002/source_meta.json"
             old_meta_path = repo_root / old_meta_ref
             old_meta_path.parent.mkdir(parents=True, exist_ok=True)
-            old_meta_path.write_text(json.dumps(self._valid_generate_meta()), encoding="utf-8")
+            old_meta_path.write_text(json.dumps(self._valid_source_meta()), encoding="utf-8")
             new_meta_path = repo_root / new_meta_ref
             new_meta_path.parent.mkdir(parents=True, exist_ok=True)
-            new_meta_path.write_text(json.dumps(self._valid_generate_meta()), encoding="utf-8")
+            new_meta_path.write_text(json.dumps(self._valid_source_meta()), encoding="utf-8")
             with runs_path.open("a", encoding="utf-8") as fh:
                 fh.write(
                     json.dumps(
@@ -7124,6 +7191,7 @@ shell_tool                       stable             true
     def _minimal_preflight_setup(self, repo_root: Path) -> None:
         """orchestration / preflight / orchestration agent run を最小構成でセットアップする。"""
         init_orchestration(repo_root=repo_root, orchestration_id="orch_001")
+        _mark_dependencies_ready(repo_root)
         write_preflight(
             repo_root=repo_root,
             orchestration_id="orch_001",
@@ -7156,7 +7224,7 @@ shell_tool                       stable             true
             "parent_agent_run_id": "orch_run_001",
             "node_key": "problem/shallow_water2d@0.3.0",
             "step": "build",
-            "plan_ref": _FIX_PLAN_REF,
+            "ir_ref": _FIX_IR_REF,
             "pipeline_ref": _FIX_PIPE_REF,
             "dependency_ref": _FIX_DEP_REF,
             "skill_name": "workflow-build",
@@ -7350,7 +7418,7 @@ shell_tool                       stable             true
             "agent_run_id": "step_run_build_001",
             "parent_agent_run_id": "orch_run_001",
             "workflow_mode": "dev",
-            "plan_ref": _FIX_PLAN_REF,
+            "ir_ref": _FIX_IR_REF,
             "pipeline_ref": _FIX_PIPE_REF,
             "dependency_ref": _FIX_DEP_REF,
             "skill_name": "workflow-build",
@@ -7370,10 +7438,11 @@ class CheckpointResumeRuntimeTests(unittest.TestCase):
     """Item 8: orchestration checkpoint / resume のユニットテスト。"""
 
     _NK = "component/solver@0.1.0"
-    _OUT = "workspace/plans/component__solver__0.1.0/solver_20260415_001/out.txt"
+    _OUT = "workspace/ir/component__solver__0.1.0/solver_20260415_001/out.txt"
 
     def _setup_preflight_and_orch_agent(self, repo_root: Path) -> None:
         init_orchestration(repo_root=repo_root, orchestration_id="orch_001")
+        _mark_dependencies_ready(repo_root)
         write_preflight(
             repo_root=repo_root,
             orchestration_id="orch_001",
@@ -7400,14 +7469,13 @@ class CheckpointResumeRuntimeTests(unittest.TestCase):
         phase_state_path = repo_root / "workspace/orchestrations/orch_001/phase_state.json"
         phase_state = json.loads(phase_state_path.read_text(encoding="utf-8"))
         phase_state["node_states"]["problem__shallow_water2d__0.3.0"] = {
-            "plan": "child_finished",
+            "compile": "child_finished",
             "generate": "child_finished",
             "build": "child_finished",
-            "execute": "child_finished",
-            "judge": "child_finished",
+            "validate": "child_finished",
         }
         phase_state["node_states"]["component__solver__0.1.0"] = {
-            "plan": "child_finished",
+            "compile": "child_finished",
             "generate": "child_finished",
             "build": "child_finished",
             "execute": "child_finished",
@@ -7451,6 +7519,7 @@ class CheckpointResumeRuntimeTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp)
             init_orchestration(repo_root=repo, orchestration_id="o1")
+            _mark_dependencies_ready(repo, "o1")
             out = repo / self._OUT
             out.parent.mkdir(parents=True, exist_ok=True)
             out.write_text("data", encoding="utf-8")
@@ -7458,16 +7527,16 @@ class CheckpointResumeRuntimeTests(unittest.TestCase):
                 repo,
                 "o1",
                 node_key=self._NK,
-                step="plan",
+                step="compile",
                 agent_run_id="run-1",
                 result={
                     "status": "pass",
                     "required_outputs": [self._OUT],
-                    "plan_ref": "workspace/plans/component__solver__0.1.0/solver_20260415_001",
+                    "ir_ref": "workspace/ir/component__solver__0.1.0/solver_20260415_001",
                     "pipeline_ref": "",
                 },
             )
-            self.assertEqual(entry.get("step"), "plan")
+            self.assertEqual(entry.get("step"), "compile")
             cp = repo / "workspace/orchestrations/o1/orchestration_checkpoint.json"
             self.assertTrue(cp.exists())
             data = json.loads(cp.read_text(encoding="utf-8"))
@@ -7477,34 +7546,35 @@ class CheckpointResumeRuntimeTests(unittest.TestCase):
     def test_update_checkpoint_fills_refs_from_launch_request_when_result_refs_are_none(
         self,
     ) -> None:
-        """plan_ref / pipeline_ref が JSON で明示的に null のとき、launch_request から補完する。"""
+        """ir_ref / pipeline_ref が JSON で明示的に null のとき、launch_request から補完する。"""
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp)
             init_orchestration(repo_root=repo, orchestration_id="o1")
+            _mark_dependencies_ready(repo, "o1")
             out = repo / self._OUT
             out.parent.mkdir(parents=True, exist_ok=True)
             out.write_text("data", encoding="utf-8")
             lr_rel = "workspace/orchestrations/o1/step_launch.request.json"
             lr_path = repo / lr_rel
             lr_path.parent.mkdir(parents=True, exist_ok=True)
-            exp_plan = "workspace/plans/component__solver__0.1.0/solver_20260415_001"
+            exp_plan = "workspace/ir/component__solver__0.1.0/solver_20260415_001"
             exp_pipe = (
                 "workspace/pipelines/component__solver__0.1.0/solver_20260415_001"
             )
             lr_path.write_text(
-                json.dumps({"plan_ref": exp_plan, "pipeline_ref": exp_pipe}),
+                json.dumps({"ir_ref": exp_plan, "pipeline_ref": exp_pipe}),
                 encoding="utf-8",
             )
             update_checkpoint(
                 repo,
                 "o1",
                 node_key=self._NK,
-                step="plan",
+                step="compile",
                 agent_run_id="run-1",
                 result={
                     "status": "pass",
                     "required_outputs": [self._OUT],
-                    "plan_ref": None,
+                    "ir_ref": None,
                     "pipeline_ref": None,
                     "launch_request_ref": lr_rel,
                 },
@@ -7515,18 +7585,19 @@ class CheckpointResumeRuntimeTests(unittest.TestCase):
                 ).read_text(encoding="utf-8")
             )
             step0 = data["completed_steps"][0]
-            self.assertEqual(step0["plan_ref"], exp_plan)
+            self.assertEqual(step0["ir_ref"], exp_plan)
             self.assertEqual(step0["pipeline_ref"], exp_pipe)
 
     def test_update_checkpoint_skips_on_fail(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp)
             init_orchestration(repo_root=repo, orchestration_id="o1")
+            _mark_dependencies_ready(repo, "o1")
             r = update_checkpoint(
                 repo,
                 "o1",
                 node_key=self._NK,
-                step="plan",
+                step="compile",
                 agent_run_id="run-1",
                 result={"status": "fail"},
             )
@@ -7539,21 +7610,22 @@ class CheckpointResumeRuntimeTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp)
             init_orchestration(repo_root=repo, orchestration_id="o1")
+            _mark_dependencies_ready(repo, "o1")
             out = repo / self._OUT
             out.parent.mkdir(parents=True, exist_ok=True)
             out.write_text("a", encoding="utf-8")
             base = {
                 "status": "pass",
                 "required_outputs": [self._OUT],
-                "plan_ref": "workspace/plans/component__solver__0.1.0/solver_20260415_001",
+                "ir_ref": "workspace/ir/component__solver__0.1.0/solver_20260415_001",
                 "pipeline_ref": "",
             }
             update_checkpoint(
-                repo, "o1", node_key=self._NK, step="plan", agent_run_id="r1", result=base
+                repo, "o1", node_key=self._NK, step="compile", agent_run_id="r1", result=base
             )
             out.write_text("b", encoding="utf-8")
             update_checkpoint(
-                repo, "o1", node_key=self._NK, step="plan", agent_run_id="r2", result=base
+                repo, "o1", node_key=self._NK, step="compile", agent_run_id="r2", result=base
             )
             data = json.loads(
                 (repo / "workspace/orchestrations/o1/orchestration_checkpoint.json").read_text(
@@ -7567,6 +7639,7 @@ class CheckpointResumeRuntimeTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp)
             init_orchestration(repo_root=repo, orchestration_id="o1")
+            _mark_dependencies_ready(repo, "o1")
             out = repo / self._OUT
             out.parent.mkdir(parents=True, exist_ok=True)
             out.write_text("fixed", encoding="utf-8")
@@ -7574,12 +7647,12 @@ class CheckpointResumeRuntimeTests(unittest.TestCase):
                 repo,
                 "o1",
                 node_key=self._NK,
-                step="plan",
+                step="compile",
                 agent_run_id="r1",
                 result={
                     "status": "pass",
                     "required_outputs": [self._OUT],
-                    "plan_ref": "p",
+                    "ir_ref": "p",
                     "pipeline_ref": "",
                 },
             )
@@ -7589,17 +7662,18 @@ class CheckpointResumeRuntimeTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp)
             init_orchestration(repo_root=repo, orchestration_id="o1")
-            missing_ref = "workspace/plans/component__solver__0.1.0/solver_20260415_001/missing.txt"
+            _mark_dependencies_ready(repo, "o1")
+            missing_ref = "workspace/ir/component__solver__0.1.0/solver_20260415_001/missing.txt"
             entry = update_checkpoint(
                 repo,
                 "o1",
                 node_key=self._NK,
-                step="plan",
+                step="compile",
                 agent_run_id="r1",
                 result={
                     "status": "pass",
                     "required_outputs": [missing_ref],
-                    "plan_ref": "p",
+                    "ir_ref": "p",
                     "pipeline_ref": "",
                 },
             )
@@ -7609,6 +7683,7 @@ class CheckpointResumeRuntimeTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp)
             init_orchestration(repo_root=repo, orchestration_id="o1")
+            _mark_dependencies_ready(repo, "o1")
             out = repo / self._OUT
             out.parent.mkdir(parents=True, exist_ok=True)
             out.write_text("ok", encoding="utf-8")
@@ -7616,12 +7691,12 @@ class CheckpointResumeRuntimeTests(unittest.TestCase):
                 repo,
                 "o1",
                 node_key=self._NK,
-                step="plan",
+                step="compile",
                 agent_run_id="r1",
                 result={
                     "status": "pass",
                     "required_outputs": [self._OUT],
-                    "plan_ref": "p",
+                    "ir_ref": "p",
                     "pipeline_ref": "",
                 },
             )
@@ -7633,6 +7708,7 @@ class CheckpointResumeRuntimeTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp)
             init_orchestration(repo_root=repo, orchestration_id="o1")
+            _mark_dependencies_ready(repo, "o1")
             out = repo / self._OUT
             out.parent.mkdir(parents=True, exist_ok=True)
             out.write_text("v1", encoding="utf-8")
@@ -7640,12 +7716,12 @@ class CheckpointResumeRuntimeTests(unittest.TestCase):
                 repo,
                 "o1",
                 node_key=self._NK,
-                step="plan",
+                step="compile",
                 agent_run_id="r1",
                 result={
                     "status": "pass",
                     "required_outputs": [self._OUT],
-                    "plan_ref": "p",
+                    "ir_ref": "p",
                     "pipeline_ref": "",
                 },
             )
@@ -7658,6 +7734,7 @@ class CheckpointResumeRuntimeTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp)
             init_orchestration(repo_root=repo, orchestration_id="o1")
+            _mark_dependencies_ready(repo, "o1")
             path = repo / "workspace/orchestrations/o1/orchestration_checkpoint.json"
             path.write_text(
                 json.dumps({
@@ -7668,11 +7745,11 @@ class CheckpointResumeRuntimeTests(unittest.TestCase):
                         {
                             "node_key": self._NK,
                             "node_key_safe": "component__solver__0.1.0",
-                            "step": "plan",
+                            "step": "compile",
                             "agent_run_id": "r1",
                             "status": "pass",
                             "completed_at": "2026-04-15T00:00:00Z",
-                            "plan_ref": "p",
+                            "ir_ref": "p",
                             "pipeline_ref": "",
                             "output_refs": ["x"],
                             "artifact_hashes": {"x": "sha256:missing"},
@@ -7689,6 +7766,7 @@ class CheckpointResumeRuntimeTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp)
             init_orchestration(repo_root=repo, orchestration_id="o1")
+            _mark_dependencies_ready(repo, "o1")
             vr = verify_checkpoint_integrity(repo, "o1")
             self.assertFalse(vr["valid"])
             self.assertIn("error", vr)
@@ -7697,6 +7775,7 @@ class CheckpointResumeRuntimeTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp)
             init_orchestration(repo_root=repo, orchestration_id="o1")
+            _mark_dependencies_ready(repo, "o1")
             meta = json.loads(
                 (repo / "workspace/orchestrations/o1/orchestration_meta.json").read_text(
                     encoding="utf-8"
@@ -7708,7 +7787,7 @@ class CheckpointResumeRuntimeTests(unittest.TestCase):
             )
             self.assertIsNone(
                 check_step_completed(
-                    repo, "o1", node_key=self._NK, step="plan", verify_integrity=True
+                    repo, "o1", node_key=self._NK, step="compile", verify_integrity=True
                 )
             )
 
@@ -7716,6 +7795,7 @@ class CheckpointResumeRuntimeTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp)
             init_orchestration(repo_root=repo, orchestration_id="o1")
+            _mark_dependencies_ready(repo, "o1")
             out = repo / self._OUT
             out.parent.mkdir(parents=True, exist_ok=True)
             out.write_text("x", encoding="utf-8")
@@ -7723,18 +7803,18 @@ class CheckpointResumeRuntimeTests(unittest.TestCase):
                 repo,
                 "o1",
                 node_key=self._NK,
-                step="plan",
+                step="compile",
                 agent_run_id="r1",
                 result={
                     "status": "pass",
                     "required_outputs": [self._OUT],
-                    "plan_ref": "p",
+                    "ir_ref": "p",
                     "pipeline_ref": "",
                 },
             )
             self.assertIsNone(
                 check_step_completed(
-                    repo, "o1", node_key=self._NK, step="plan", verify_integrity=True
+                    repo, "o1", node_key=self._NK, step="compile", verify_integrity=True
                 )
             )
 
@@ -7742,6 +7822,7 @@ class CheckpointResumeRuntimeTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp)
             init_orchestration(repo_root=repo, orchestration_id="o1")
+            _mark_dependencies_ready(repo, "o1")
             enable_checkpoint_resume(repo, "o1")
             out = repo / self._OUT
             out.parent.mkdir(parents=True, exist_ok=True)
@@ -7750,17 +7831,17 @@ class CheckpointResumeRuntimeTests(unittest.TestCase):
                 repo,
                 "o1",
                 node_key=self._NK,
-                step="plan",
+                step="compile",
                 agent_run_id="r1",
                 result={
                     "status": "pass",
                     "required_outputs": [self._OUT],
-                    "plan_ref": "p",
+                    "ir_ref": "p",
                     "pipeline_ref": "",
                 },
             )
             info = check_step_completed(
-                repo, "o1", node_key=self._NK, step="plan", verify_integrity=True
+                repo, "o1", node_key=self._NK, step="compile", verify_integrity=True
             )
             self.assertIsNotNone(info)
             assert info is not None
@@ -7773,20 +7854,21 @@ class CheckpointResumeRuntimeTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp)
             init_orchestration(repo_root=repo, orchestration_id="o1")
+            _mark_dependencies_ready(repo, "o1")
             enable_checkpoint_resume(repo, "o1")
             missing_output = (
-                "workspace/plans/component__solver__0.1.0/solver_20260415_001/absent.txt"
+                "workspace/ir/component__solver__0.1.0/solver_20260415_001/absent.txt"
             )
             update_checkpoint(
                 repo,
                 "o1",
                 node_key=self._NK,
-                step="plan",
+                step="compile",
                 agent_run_id="r1",
                 result={
                     "status": "pass",
                     "required_outputs": [missing_output],
-                    "plan_ref": "p",
+                    "ir_ref": "p",
                     "pipeline_ref": "",
                 },
             )
@@ -7795,7 +7877,7 @@ class CheckpointResumeRuntimeTests(unittest.TestCase):
                 "sha256:missing",
             )
             info = check_step_completed(
-                repo, "o1", node_key=self._NK, step="plan", verify_integrity=True
+                repo, "o1", node_key=self._NK, step="compile", verify_integrity=True
             )
             self.assertIsNotNone(info)
             assert info is not None
@@ -7806,6 +7888,7 @@ class CheckpointResumeRuntimeTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp)
             init_orchestration(repo_root=repo, orchestration_id="o1")
+            _mark_dependencies_ready(repo, "o1")
             enable_checkpoint_resume(repo, "o1")
             out = repo / self._OUT
             out.parent.mkdir(parents=True, exist_ok=True)
@@ -7814,19 +7897,19 @@ class CheckpointResumeRuntimeTests(unittest.TestCase):
                 repo,
                 "o1",
                 node_key=self._NK,
-                step="plan",
+                step="compile",
                 agent_run_id="r1",
                 result={
                     "status": "pass",
                     "required_outputs": [self._OUT],
-                    "plan_ref": "p",
+                    "ir_ref": "p",
                     "pipeline_ref": "",
                 },
             )
             out.write_text("y", encoding="utf-8")
             self.assertIsNone(
                 check_step_completed(
-                    repo, "o1", node_key=self._NK, step="plan", verify_integrity=True
+                    repo, "o1", node_key=self._NK, step="compile", verify_integrity=True
                 )
             )
 
@@ -7834,6 +7917,7 @@ class CheckpointResumeRuntimeTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp)
             init_orchestration(repo_root=repo, orchestration_id="o1")
+            _mark_dependencies_ready(repo, "o1")
             enable_checkpoint_resume(repo, "o1")
             self.assertIsNone(
                 check_step_completed(
@@ -7845,6 +7929,7 @@ class CheckpointResumeRuntimeTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp)
             init_orchestration(repo_root=repo, orchestration_id="o1")
+            _mark_dependencies_ready(repo, "o1")
             enable_checkpoint_resume(repo, "o1")
             out = repo / self._OUT
             out.parent.mkdir(parents=True, exist_ok=True)
@@ -7853,18 +7938,18 @@ class CheckpointResumeRuntimeTests(unittest.TestCase):
                 repo,
                 "o1",
                 node_key=self._NK,
-                step="plan",
+                step="compile",
                 agent_run_id="r1",
                 result={
                     "status": "pass",
                     "required_outputs": [self._OUT],
-                    "plan_ref": "p",
+                    "ir_ref": "p",
                     "pipeline_ref": "",
                 },
             )
             out.write_text("y", encoding="utf-8")
             info = check_step_completed(
-                repo, "o1", node_key=self._NK, step="plan", verify_integrity=False
+                repo, "o1", node_key=self._NK, step="compile", verify_integrity=False
             )
             self.assertIsNotNone(info)
 
@@ -7872,6 +7957,7 @@ class CheckpointResumeRuntimeTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp)
             init_orchestration(repo_root=repo, orchestration_id="o1")
+            _mark_dependencies_ready(repo, "o1")
             meta = enable_checkpoint_resume(repo, "o1")
             self.assertTrue(meta.get("resume_enabled"))
             self.assertIn("resumed_at", meta)
@@ -7906,7 +7992,7 @@ class CheckpointResumeRuntimeTests(unittest.TestCase):
             self._setup_preflight_and_orch_agent(repo_root)
             out_ref = (
                 "workspace/pipelines/problem__shallow_water2d__0.3.0/"
-                "shallow-water2d_20260415_001/build/build_001/bin/simulate"
+                "shallow-water2d_20260415_001/binary/bin_001/bin/simulate"
             )
             out_path = repo_root / out_ref
             out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -7939,7 +8025,7 @@ class CheckpointResumeRuntimeTests(unittest.TestCase):
             self._setup_preflight_and_orch_agent(repo_root)
             out_ref = (
                 "workspace/pipelines/problem__shallow_water2d__0.3.0/"
-                "shallow-water2d_20260415_001/build/build_001/bin/simulate"
+                "shallow-water2d_20260415_001/binary/bin_001/bin/simulate"
             )
             out_path = repo_root / out_ref
             out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -7970,7 +8056,7 @@ class CheckpointResumeRuntimeTests(unittest.TestCase):
             self._setup_preflight_and_orch_agent(repo_root)
             out_ref = (
                 "workspace/pipelines/problem__shallow_water2d__0.3.0/"
-                "shallow-water2d_20260415_001/build/build_001/bin/simulate"
+                "shallow-water2d_20260415_001/binary/bin_001/bin/simulate"
             )
             out_path = repo_root / out_ref
             out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -8006,6 +8092,7 @@ class CheckpointResumeRuntimeTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp)
             init_orchestration(repo_root=repo, orchestration_id="o1")
+            _mark_dependencies_ready(repo, "o1")
             buf = io.StringIO()
             with redirect_stdout(buf):
                 rc = main(
@@ -8066,6 +8153,7 @@ class CheckpointResumeRuntimeTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp)
             init_orchestration(repo_root=repo, orchestration_id="o1")
+            _mark_dependencies_ready(repo, "o1")
             enable_checkpoint_resume(repo, "o1")
             out = repo / self._OUT
             out.parent.mkdir(parents=True, exist_ok=True)
@@ -8074,12 +8162,12 @@ class CheckpointResumeRuntimeTests(unittest.TestCase):
                 repo,
                 "o1",
                 node_key=self._NK,
-                step="plan",
+                step="compile",
                 agent_run_id="r1",
                 result={
                     "status": "pass",
                     "required_outputs": [self._OUT],
-                    "plan_ref": "p",
+                    "ir_ref": "p",
                     "pipeline_ref": "",
                 },
             )
@@ -8095,7 +8183,7 @@ class CheckpointResumeRuntimeTests(unittest.TestCase):
                         "--node-key",
                         self._NK,
                         "--step",
-                        "plan",
+                        "compile",
                     ]
                 )
             self.assertEqual(rc, 0)
@@ -8106,6 +8194,7 @@ class CheckpointResumeRuntimeTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp)
             init_orchestration(repo_root=repo, orchestration_id="o1")
+            _mark_dependencies_ready(repo, "o1")
             buf = io.StringIO()
             with redirect_stdout(buf):
                 rc = main(
@@ -8125,13 +8214,14 @@ class CheckpointResumeRuntimeTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp)
             init_orchestration(repo_root=repo, orchestration_id="o2")
+            _mark_dependencies_ready(repo, "o2")
             ck_path = repo / "workspace/orchestrations/o2/orchestration_checkpoint.json"
             ck_path.write_text(
                 json.dumps(
                     {
                         "orchestration_id": "o2",
                         "schema_version": "1",
-                        "completed_steps": [{"node_key": "problem/shallow_water2d@0.3.0", "step": "plan"}],
+                        "completed_steps": [{"node_key": "problem/shallow_water2d@0.3.0", "step": "compile"}],
                     }
                 ),
                 encoding="utf-8",
@@ -8143,6 +8233,7 @@ class CheckpointResumeRuntimeTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp)
             init_orchestration(repo_root=repo, orchestration_id="o3")
+            _mark_dependencies_ready(repo, "o3")
             enable_checkpoint_resume(repo_root=repo, orchestration_id="o3")
             ck_path = repo / "workspace/orchestrations/o3/orchestration_checkpoint.json"
             ck_path.write_text(
@@ -8150,7 +8241,7 @@ class CheckpointResumeRuntimeTests(unittest.TestCase):
                     {
                         "orchestration_id": "o3",
                         "schema_version": "1",
-                        "completed_steps": [{"node_key": "problem/shallow_water2d@0.3.0", "step": "plan"}],
+                        "completed_steps": [{"node_key": "problem/shallow_water2d@0.3.0", "step": "compile"}],
                     }
                 ),
                 encoding="utf-8",
@@ -8163,6 +8254,7 @@ class CheckpointResumeRuntimeTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp)
             init_orchestration(repo_root=repo, orchestration_id="o1")
+            _mark_dependencies_ready(repo, "o1")
             buf = io.StringIO()
             with redirect_stdout(buf):
                 rc = main(
@@ -8182,6 +8274,7 @@ class CheckpointResumeRuntimeTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp)
             init_orchestration(repo_root=repo, orchestration_id="o1")
+            _mark_dependencies_ready(repo, "o1")
             record_agent_run(
                 repo_root=repo,
                 orchestration_id="o1",
@@ -8191,8 +8284,8 @@ class CheckpointResumeRuntimeTests(unittest.TestCase):
                     "status": "skipped",
                     "agent_backend": "codex",
                     "node_key": self._NK,
-                    "step": "plan",
-                    "skipped_step": "plan",
+                    "step": "compile",
+                    "skipped_step": "compile",
                     "reason": "checkpoint_integrity_ok",
                     "checkpoint_agent_run_id": "orig-run-1",
                     "result_summary": "skipped by checkpoint",
@@ -8387,14 +8480,14 @@ class OrchestrationMetaAndJudgeHookTests(unittest.TestCase):
                     "node_key": "problem/shallow_water2d@0.3.0",
                     "step": "build",
                     "context_id": "ctx_step_session_index_001",
-                    "plan_ref": "workspace/plans/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001",
+                    "ir_ref": "workspace/ir/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001",
                     "pipeline_ref": "workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001",
-                    "dependency_ref": "workspace/plans/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/dependency.resolved.yaml",
+                    "dependency_ref": "workspace/ir/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/spec.ir.yaml",
                     "skill_name": "workflow-build",
                     "skill_ref": "skills/workflow-build/SKILL.md",
                     "skill_must_read_refs": "",
                     "allowed_output_paths": [
-                        "workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/build/build_001/build_meta.json"
+                        "workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/binary/bin_001/binary_meta.json"
                     ],
                 },
                 response_payload={
@@ -8469,7 +8562,7 @@ class OrchestrationMetaAndJudgeHookTests(unittest.TestCase):
             node_key = "problem/shallow_water2d@0.3.0"
             nk_safe = "problem__shallow_water2d__0.3.0"
             pipe_rel = "workspace/pipelines/judge_test_pipe"
-            base = repo / pipe_rel / "execute" / "ex_j1" / nk_safe
+            base = repo / pipe_rel / "runs" / "run_j1" / nk_safe
             base.mkdir(parents=True)
             (base / "semantic_review.json").write_text(
                 json.dumps({"decision": "pass"}),
@@ -8478,7 +8571,7 @@ class OrchestrationMetaAndJudgeHookTests(unittest.TestCase):
             lr_rel = "workspace/launches/judge_lr.json"
             (repo / lr_rel).parent.mkdir(parents=True, exist_ok=True)
             (repo / lr_rel).write_text(
-                json.dumps({"pipeline_ref": pipe_rel, "execution_id": "ex_j1"}),
+                json.dumps({"pipeline_ref": pipe_rel, "run_id": "run_j1"}),
                 encoding="utf-8",
             )
             payload = {"launch_request_ref": lr_rel}
@@ -8502,12 +8595,12 @@ class OrchestrationMetaAndJudgeHookTests(unittest.TestCase):
             node_key = "problem/shallow_water2d@0.3.0"
             nk_safe = "problem__shallow_water2d__0.3.0"
             pipe_rel = "workspace/pipelines/judge_timeout_pipe"
-            base = repo / pipe_rel / "execute" / "ex_to1" / nk_safe
+            base = repo / pipe_rel / "runs" / "run_to1" / nk_safe
             base.mkdir(parents=True)
             lr_rel = "workspace/launches/judge_lr_timeout.json"
             (repo / lr_rel).parent.mkdir(parents=True, exist_ok=True)
             (repo / lr_rel).write_text(
-                json.dumps({"pipeline_ref": pipe_rel, "execution_id": "ex_to1"}),
+                json.dumps({"pipeline_ref": pipe_rel, "run_id": "run_to1"}),
                 encoding="utf-8",
             )
             payload = {"launch_request_ref": lr_rel}
@@ -8582,6 +8675,7 @@ class PreflightLiveProbeTtlTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp)
             init_orchestration(repo_root=repo, orchestration_id="o1")
+            _mark_dependencies_ready(repo, "o1")
             checked = "2026-04-15T10:00:00Z"
             out = write_preflight(
                 repo_root=repo,
@@ -8598,6 +8692,7 @@ class PreflightLiveProbeTtlTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp)
             init_orchestration(repo_root=repo, orchestration_id="o1")
+            _mark_dependencies_ready(repo, "o1")
             checked = "2026-04-15T10:00:00Z"
             explicit = "2026-04-15T09:00:00Z"
             out = write_preflight(
@@ -8611,6 +8706,7 @@ class PreflightLiveProbeTtlTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp)
             init_orchestration(repo_root=repo, orchestration_id="o1")
+            _mark_dependencies_ready(repo, "o1")
             out = write_preflight(
                 repo_root=repo,
                 orchestration_id="o1",
@@ -8624,6 +8720,7 @@ class PreflightLiveProbeTtlTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp)
             init_orchestration(repo_root=repo, orchestration_id="o1")
+            _mark_dependencies_ready(repo, "o1")
             write_preflight(
                 repo_root=repo,
                 orchestration_id="o1",
@@ -8644,12 +8741,14 @@ class PreflightLiveProbeTtlTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp)
             init_orchestration(repo_root=repo, orchestration_id="o1")
+            _mark_dependencies_ready(repo, "o1")
             _update_preflight_probed_at(repo, "o1", "2026-04-16T12:00:00Z")
 
     def test_update_preflight_probed_at_noop_on_corrupted_json(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp)
             init_orchestration(repo_root=repo, orchestration_id="o1")
+            _mark_dependencies_ready(repo, "o1")
             path = repo / "workspace/orchestrations/o1/preflight.json"
             path.write_text("{not-json", encoding="utf-8")
             _update_preflight_probed_at(repo, "o1", "2026-04-16T12:00:00Z")
@@ -8659,6 +8758,7 @@ class PreflightLiveProbeTtlTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp)
             init_orchestration(repo_root=repo, orchestration_id="o1")
+            _mark_dependencies_ready(repo, "o1")
             write_preflight(
                 repo_root=repo,
                 orchestration_id="o1",
@@ -8682,6 +8782,7 @@ class PreflightLiveProbeTtlTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp)
             init_orchestration(repo_root=repo, orchestration_id="o1")
+            _mark_dependencies_ready(repo, "o1")
             write_preflight(
                 repo_root=repo,
                 orchestration_id="o1",
@@ -8706,6 +8807,7 @@ class PreflightLiveProbeTtlTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp)
             init_orchestration(repo_root=repo, orchestration_id="o1")
+            _mark_dependencies_ready(repo, "o1")
             path = repo / "workspace/orchestrations/o1/preflight.json"
             body = _launchable_preflight_dict(checked_at="2026-04-15T10:00:00Z")
             path.write_text(json.dumps(body, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
@@ -8726,6 +8828,7 @@ class PreflightLiveProbeTtlTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp)
             init_orchestration(repo_root=repo, orchestration_id="o1")
+            _mark_dependencies_ready(repo, "o1")
             write_preflight(
                 repo_root=repo,
                 orchestration_id="o1",
@@ -8746,6 +8849,7 @@ class PreflightLiveProbeTtlTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp)
             init_orchestration(repo_root=repo, orchestration_id="o1")
+            _mark_dependencies_ready(repo, "o1")
             write_preflight(
                 repo_root=repo,
                 orchestration_id="o1",
@@ -8764,6 +8868,7 @@ class PreflightLiveProbeTtlTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp)
             init_orchestration(repo_root=repo, orchestration_id="o1")
+            _mark_dependencies_ready(repo, "o1")
             write_preflight(
                 repo_root=repo,
                 orchestration_id="o1",
@@ -8790,6 +8895,7 @@ class PreflightLiveProbeTtlTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp)
             init_orchestration(repo_root=repo, orchestration_id="o1")
+            _mark_dependencies_ready(repo, "o1")
             write_preflight(
                 repo_root=repo,
                 orchestration_id="o1",
@@ -8821,6 +8927,7 @@ class PreflightLiveProbeTtlTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp)
             init_orchestration(repo_root=repo, orchestration_id="o1")
+            _mark_dependencies_ready(repo, "o1")
             write_preflight(
                 repo_root=repo,
                 orchestration_id="o1",
@@ -8844,13 +8951,14 @@ class PreflightLiveProbeTtlTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp)
             init_orchestration(repo_root=repo, orchestration_id="orch_001")
+            _mark_dependencies_ready(repo, "orch_001")
             meta_path = repo / "workspace/orchestrations/orch_001/orchestration_meta.json"
             meta = json.loads(meta_path.read_text(encoding="utf-8"))
             meta["dependency_readiness"] = {
-                "direct_dependency_plan_readiness": True,
+                "direct_dependency_compile_readiness": True,
                 "direct_dependency_execution_readiness": True,
                 "detail": {
-                    "plan_ref_verified": True,
+                    "ir_ref_verified": True,
                     "pipeline_ref_verified": True,
                     "aggregate_verdict_verified": True,
                 },
@@ -8879,16 +8987,16 @@ class PreflightLiveProbeTtlTests(unittest.TestCase):
                         child_agent_run_id="substep_run_plan_generate_001",
                         request_payload={
                             "node_key": "problem/shallow_water2d@0.3.0",
-                            "step": "plan",
+                            "step": "compile",
                             "substep": "generate",
                             "orchestration_id": "orch_001",
                             "agent_run_id": "substep_run_plan_generate_001",
                             "parent_agent_run_id": "orch_run_001",
-                            "plan_ref": "workspace/plans/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001",
+                            "ir_ref": "workspace/ir/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001",
                             "pipeline_ref": "workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001",
-                            "dependency_ref": _FIX_PLAN_STEP_DEP_REF,
-                            "skill_name": "workflow-plan-generate",
-                            "skill_ref": "skills/workflow-plan-generate/SKILL.md",
+                            "dependency_ref": _FIX_COMPILE_STEP_DEP_REF,
+                            "skill_name": "workflow-compile-generate",
+                            "skill_ref": "skills/workflow-compile-generate/SKILL.md",
                             "skill_must_read_refs": "",
                             "issue_severity": "none",
                             "repair_strategy": "none",
@@ -8896,7 +9004,7 @@ class PreflightLiveProbeTtlTests(unittest.TestCase):
                             "repair_reason": "none",
                             "launch_prompt_full": _substep_launch_prompt(
                                 "problem/shallow_water2d@0.3.0",
-                                "plan",
+                                "compile",
                                 "generate",
                                 "substep_run_plan_generate_001",
                             ),
@@ -8915,9 +9023,9 @@ class PreflightLiveProbeTtlTests(unittest.TestCase):
                             "orchestration_id": "orch_001",
                             "agent_run_id": "step_run_build_001",
                             "parent_agent_run_id": "orch_run_001",
-                            "plan_ref": "workspace/plans/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001",
+                            "ir_ref": "workspace/ir/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001",
                             "pipeline_ref": "workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001",
-                            "dependency_ref": "workspace/plans/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/dependency.resolved.yaml",
+                            "dependency_ref": "workspace/ir/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/spec.ir.yaml",
                             "skill_name": "workflow-build",
                             "skill_ref": "skills/workflow-build/SKILL.md",
                             "skill_must_read_refs": "",
@@ -8935,13 +9043,14 @@ class PreflightLiveProbeTtlTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp)
             init_orchestration(repo_root=repo, orchestration_id="orch_001")
+            _mark_dependencies_ready(repo, "orch_001")
             meta_path = repo / "workspace/orchestrations/orch_001/orchestration_meta.json"
             meta = json.loads(meta_path.read_text(encoding="utf-8"))
             meta["dependency_readiness"] = {
-                "direct_dependency_plan_readiness": True,
+                "direct_dependency_compile_readiness": True,
                 "direct_dependency_execution_readiness": True,
                 "detail": {
-                    "plan_ref_verified": True,
+                    "ir_ref_verified": True,
                     "pipeline_ref_verified": True,
                     "aggregate_verdict_verified": True,
                 },
@@ -8969,16 +9078,16 @@ class PreflightLiveProbeTtlTests(unittest.TestCase):
                         child_agent_run_id="substep_run_plan_generate_001",
                         request_payload={
                             "node_key": "problem/shallow_water2d@0.3.0",
-                            "step": "plan",
+                            "step": "compile",
                             "substep": "generate",
                             "orchestration_id": "orch_001",
                             "agent_run_id": "substep_run_plan_generate_001",
                             "parent_agent_run_id": "orch_run_001",
-                            "plan_ref": "workspace/plans/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001",
+                            "ir_ref": "workspace/ir/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001",
                             "pipeline_ref": "workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001",
-                            "dependency_ref": _FIX_PLAN_STEP_DEP_REF,
-                            "skill_name": "workflow-plan-generate",
-                            "skill_ref": "skills/workflow-plan-generate/SKILL.md",
+                            "dependency_ref": _FIX_COMPILE_STEP_DEP_REF,
+                            "skill_name": "workflow-compile-generate",
+                            "skill_ref": "skills/workflow-compile-generate/SKILL.md",
                             "skill_must_read_refs": "",
                             "issue_severity": "none",
                             "repair_strategy": "none",
@@ -8986,7 +9095,7 @@ class PreflightLiveProbeTtlTests(unittest.TestCase):
                             "repair_reason": "none",
                             "launch_prompt_full": _substep_launch_prompt(
                                 "problem/shallow_water2d@0.3.0",
-                                "plan",
+                                "compile",
                                 "generate",
                                 "substep_run_plan_generate_001",
                             ),
@@ -9008,9 +9117,9 @@ class PreflightLiveProbeTtlTests(unittest.TestCase):
                             "orchestration_id": "orch_001",
                             "agent_run_id": "step_run_build_001",
                             "parent_agent_run_id": "orch_run_001",
-                            "plan_ref": "workspace/plans/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001",
+                            "ir_ref": "workspace/ir/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001",
                             "pipeline_ref": "workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001",
-                            "dependency_ref": "workspace/plans/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/dependency.resolved.yaml",
+                            "dependency_ref": "workspace/ir/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/spec.ir.yaml",
                             "skill_name": "workflow-build",
                             "skill_ref": "skills/workflow-build/SKILL.md",
                             "skill_must_read_refs": "",
@@ -9028,6 +9137,7 @@ class PreflightLiveProbeTtlTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp)
             init_orchestration(repo_root=repo, orchestration_id="o1")
+            _mark_dependencies_ready(repo, "o1")
             write_preflight(
                 repo_root=repo,
                 orchestration_id="o1",
@@ -9052,6 +9162,7 @@ class PreflightLiveProbeTtlTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp)
             init_orchestration(repo_root=repo, orchestration_id="o1")
+            _mark_dependencies_ready(repo, "o1")
             with patch.dict(os.environ, {"METDSL_ORCHESTRATION_ENFORCE_LIVE_PREFLIGHT": "auto"}):
                 st = get_preflight_ttl_status(repo, "o1")
             self.assertFalse(st["preflight_exists"])
@@ -9061,6 +9172,7 @@ class PreflightLiveProbeTtlTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp)
             init_orchestration(repo_root=repo, orchestration_id="o1")
+            _mark_dependencies_ready(repo, "o1")
             write_preflight(
                 repo_root=repo,
                 orchestration_id="o1",
@@ -9076,6 +9188,7 @@ class PreflightLiveProbeTtlTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp)
             init_orchestration(repo_root=repo, orchestration_id="o1")
+            _mark_dependencies_ready(repo, "o1")
             write_preflight(
                 repo_root=repo,
                 orchestration_id="o1",
@@ -9114,6 +9227,7 @@ class TestPhase1RuleSourceAudit(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
             init_orchestration(repo_root=repo_root, orchestration_id="orch_001")
+            _mark_dependencies_ready(repo_root)
             orch = repo_root / "workspace/orchestrations/orch_001"
             self.assertTrue((orch / "access_policies").is_dir())
             self.assertTrue((orch / "access_logs").is_dir())
@@ -9153,20 +9267,20 @@ class TestPhase1RuleSourceAudit(unittest.TestCase):
                     "agent_run_id": "substep_p1_001",
                     "agent_role": "substep",
                     "node_key": "problem/shallow_water2d@0.3.0",
-                    "step": "plan",
+                    "step": "compile",
                     "substep": "generate",
                     "orchestration_id": "orch_001",
                     "parent_agent_run_id": "orch_run_001",
-                    "plan_ref": _FIX_PLAN_REF,
+                    "ir_ref": _FIX_IR_REF,
                     "pipeline_ref": _FIX_PIPE_REF,
-                    "dependency_ref": _FIX_PLAN_STEP_DEP_REF,
-                    "skill_name": "workflow-plan-generate",
-                    "skill_ref": "skills/workflow-plan-generate/SKILL.md",
+                    "dependency_ref": _FIX_COMPILE_STEP_DEP_REF,
+                    "skill_name": "workflow-compile-generate",
+                    "skill_ref": "skills/workflow-compile-generate/SKILL.md",
                     "skill_must_read_refs": "",
-                    "allowed_output_paths": [f"{_FIX_PLAN_REF}/case.resolved.yaml"],
+                    "allowed_output_paths": [f"{_FIX_IR_REF}/spec.ir.yaml"],
                     "launch_prompt_full": _substep_launch_prompt(
                         "problem/shallow_water2d@0.3.0",
-                        "plan",
+                        "compile",
                         "generate",
                         "substep_p1_001",
                     ),
@@ -9180,7 +9294,7 @@ class TestPhase1RuleSourceAudit(unittest.TestCase):
             self.assertTrue(pol_path.exists())
             policy = json.loads(pol_path.read_text(encoding="utf-8"))
             self.assertEqual(policy.get("agent_run_id"), "substep_p1_001")
-            self.assertEqual(policy.get("step"), "plan")
+            self.assertEqual(policy.get("step"), "compile")
             self.assertEqual(policy.get("substep"), "generate")
             self.assertEqual(policy.get("denied_read_roots"), ["tools/"])
             self.assertIn("docs/", policy.get("allowed_read_roots", []))
@@ -9194,7 +9308,7 @@ class TestPhase1RuleSourceAudit(unittest.TestCase):
                 policy.get("allowed_read_roots", []),
             )
             self.assertIn(
-                _FIX_PLAN_REF.rstrip("/") + "/",
+                _FIX_IR_REF.rstrip("/") + "/",
                 policy.get("allowed_read_roots", []),
             )
             self.assertIn(
@@ -9202,7 +9316,7 @@ class TestPhase1RuleSourceAudit(unittest.TestCase):
                 policy.get("allowed_read_roots", []),
             )
             self.assertIn(
-                "skills/workflow-plan-generate/SKILL.md/",
+                "skills/workflow-compile-generate/SKILL.md/",
                 policy.get("allowed_read_roots", []),
             )
             self.assertEqual(
@@ -9218,16 +9332,16 @@ class TestPhase1RuleSourceAudit(unittest.TestCase):
             self.assertTrue(cap_path.exists())
             cap = json.loads(cap_path.read_text(encoding="utf-8"))
             self.assertEqual(cap.get("agent_run_id"), "substep_p1_001")
-            self.assertEqual(cap.get("step"), "plan")
+            self.assertEqual(cap.get("step"), "compile")
             self.assertTrue(isinstance(cap.get("capability_token"), str) and cap["capability_token"])
-            self.assertIn(_FIX_PLAN_REF.rstrip("/") + "/", cap.get("write_roots", []))
+            self.assertIn(_FIX_IR_REF.rstrip("/") + "/", cap.get("write_roots", []))
             manifest_path = orch / "output_manifests" / "substep_p1_001.json"
             self.assertTrue(manifest_path.exists())
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
             self.assertEqual(manifest.get("agent_run_id"), "substep_p1_001")
             self.assertEqual(
                 manifest.get("allowed_output_paths"),
-                [f"{_FIX_PLAN_REF}/case.resolved.yaml"],
+                [f"{_FIX_IR_REF}/spec.ir.yaml"],
             )
             read_manifest_path = orch / "read_manifests" / "substep_p1_001.json"
             self.assertTrue(read_manifest_path.exists())
@@ -9238,7 +9352,7 @@ class TestPhase1RuleSourceAudit(unittest.TestCase):
             ps_launch = json.loads((orch / "phase_state.json").read_text(encoding="utf-8"))
             node_safe = "problem__shallow_water2d__0.3.0"
             self.assertEqual(
-                ps_launch.get("node_states", {}).get(node_safe, {}).get("plan"),
+                ps_launch.get("node_states", {}).get(node_safe, {}).get("compile"),
                 "child_running",
             )
 
@@ -9248,6 +9362,7 @@ class TestPhase1RuleSourceAudit(unittest.TestCase):
             (repo_root / "tools").mkdir(parents=True, exist_ok=True)
             (repo_root / "tools" / "p1_dummy.txt").write_text("dummy-tools-read\n", encoding="utf-8")
             init_orchestration(repo_root=repo_root, orchestration_id="orch_001")
+            _mark_dependencies_ready(repo_root)
             write_preflight(
                 repo_root=repo_root,
                 orchestration_id="orch_001",
@@ -9270,23 +9385,23 @@ class TestPhase1RuleSourceAudit(unittest.TestCase):
                     "agent_run_id": "child_p1r",
                     "agent_role": "substep",
                     "node_key": "problem/shallow_water2d@0.3.0",
-                    "step": "plan",
+                    "step": "compile",
                     "substep": "generate",
                     "orchestration_id": "orch_001",
                     "parent_agent_run_id": "orch_run_001",
-                    "plan_ref": _FIX_PLAN_REF,
+                    "ir_ref": _FIX_IR_REF,
                     "pipeline_ref": _FIX_PIPE_REF,
-                    "dependency_ref": _FIX_PLAN_STEP_DEP_REF,
-                    "skill_name": "workflow-plan-generate",
-                    "skill_ref": "skills/workflow-plan-generate/SKILL.md",
+                    "dependency_ref": _FIX_COMPILE_STEP_DEP_REF,
+                    "skill_name": "workflow-compile-generate",
+                    "skill_ref": "skills/workflow-compile-generate/SKILL.md",
                     "skill_must_read_refs": "",
                     "allowed_output_paths": [
-                        f"{_FIX_PLAN_REF}/case.resolved.yaml",
-                        f"{_FIX_PLAN_REF}/plan_meta.json",
+                        f"{_FIX_IR_REF}/spec.ir.yaml",
+                        f"{_FIX_IR_REF}/ir_meta.json",
                     ],
                     "launch_prompt_full": _substep_launch_prompt(
                         "problem/shallow_water2d@0.3.0",
-                        "plan",
+                        "compile",
                         "generate",
                         "child_p1r",
                     ),
@@ -9329,6 +9444,7 @@ class TestPhase1RuleSourceAudit(unittest.TestCase):
             (repo_root / "plans").mkdir(parents=True, exist_ok=True)
             (repo_root / "plans" / "outside.txt").write_text("ng\n", encoding="utf-8")
             init_orchestration(repo_root=repo_root, orchestration_id="orch_001")
+            _mark_dependencies_ready(repo_root)
             write_preflight(
                 repo_root=repo_root,
                 orchestration_id="orch_001",
@@ -9351,23 +9467,23 @@ class TestPhase1RuleSourceAudit(unittest.TestCase):
                     "agent_run_id": "child_p1r",
                     "agent_role": "substep",
                     "node_key": "problem/shallow_water2d@0.3.0",
-                    "step": "plan",
+                    "step": "compile",
                     "substep": "generate",
                     "orchestration_id": "orch_001",
                     "parent_agent_run_id": "orch_run_001",
-                    "plan_ref": _FIX_PLAN_REF,
+                    "ir_ref": _FIX_IR_REF,
                     "pipeline_ref": _FIX_PIPE_REF,
-                    "dependency_ref": _FIX_PLAN_STEP_DEP_REF,
-                    "skill_name": "workflow-plan-generate",
-                    "skill_ref": "skills/workflow-plan-generate/SKILL.md",
+                    "dependency_ref": _FIX_COMPILE_STEP_DEP_REF,
+                    "skill_name": "workflow-compile-generate",
+                    "skill_ref": "skills/workflow-compile-generate/SKILL.md",
                     "skill_must_read_refs": "",
                     "allowed_output_paths": [
-                        f"{_FIX_PLAN_REF}/case.resolved.yaml",
-                        f"{_FIX_PLAN_REF}/plan_meta.json",
+                        f"{_FIX_IR_REF}/spec.ir.yaml",
+                        f"{_FIX_IR_REF}/ir_meta.json",
                     ],
                     "launch_prompt_full": _substep_launch_prompt(
                         "problem/shallow_water2d@0.3.0",
-                        "plan",
+                        "compile",
                         "generate",
                         "child_p1r",
                     ),
@@ -9394,11 +9510,12 @@ class TestPhase1RuleSourceAudit(unittest.TestCase):
     def test_phase2_orchestration_read_allows_skill_ref_path(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
-            (repo_root / "skills" / "workflow-plan-generate").mkdir(parents=True, exist_ok=True)
-            (repo_root / "skills" / "workflow-plan-generate" / "SKILL.md").write_text(
-                "# workflow-plan-generate\n", encoding="utf-8"
+            (repo_root / "skills" / "workflow-compile-generate").mkdir(parents=True, exist_ok=True)
+            (repo_root / "skills" / "workflow-compile-generate" / "SKILL.md").write_text(
+                "# workflow-compile-generate\n", encoding="utf-8"
             )
             init_orchestration(repo_root=repo_root, orchestration_id="orch_001")
+            _mark_dependencies_ready(repo_root)
             write_preflight(
                 repo_root=repo_root,
                 orchestration_id="orch_001",
@@ -9421,23 +9538,23 @@ class TestPhase1RuleSourceAudit(unittest.TestCase):
                     "agent_run_id": "child_p1r",
                     "agent_role": "substep",
                     "node_key": "problem/shallow_water2d@0.3.0",
-                    "step": "plan",
+                    "step": "compile",
                     "substep": "generate",
                     "orchestration_id": "orch_001",
                     "parent_agent_run_id": "orch_run_001",
-                    "plan_ref": _FIX_PLAN_REF,
+                    "ir_ref": _FIX_IR_REF,
                     "pipeline_ref": _FIX_PIPE_REF,
-                    "dependency_ref": _FIX_PLAN_STEP_DEP_REF,
-                    "skill_name": "workflow-plan-generate",
-                    "skill_ref": "skills/workflow-plan-generate/SKILL.md",
+                    "dependency_ref": _FIX_COMPILE_STEP_DEP_REF,
+                    "skill_name": "workflow-compile-generate",
+                    "skill_ref": "skills/workflow-compile-generate/SKILL.md",
                     "skill_must_read_refs": "",
                     "allowed_output_paths": [
-                        f"{_FIX_PLAN_REF}/case.resolved.yaml",
-                        f"{_FIX_PLAN_REF}/plan_meta.json",
+                        f"{_FIX_IR_REF}/spec.ir.yaml",
+                        f"{_FIX_IR_REF}/ir_meta.json",
                     ],
                     "launch_prompt_full": _substep_launch_prompt(
                         "problem/shallow_water2d@0.3.0",
-                        "plan",
+                        "compile",
                         "generate",
                         "child_p1r",
                     ),
@@ -9448,11 +9565,11 @@ class TestPhase1RuleSourceAudit(unittest.TestCase):
                 repo_root=repo_root,
                 orchestration_id="orch_001",
                 agent_run_id="child_p1r",
-                read_path="skills/workflow-plan-generate/SKILL.md",
+                read_path="skills/workflow-compile-generate/SKILL.md",
             )
             self.assertTrue(out.get("file_exists"))
-            self.assertEqual(out.get("read_path"), "skills/workflow-plan-generate/SKILL.md")
-            self.assertIn("workflow-plan-generate", str(out.get("content")))
+            self.assertEqual(out.get("read_path"), "skills/workflow-compile-generate/SKILL.md")
+            self.assertIn("workflow-compile-generate", str(out.get("content")))
 
     def test_phase2_orchestration_read_rejects_when_read_manifest_is_missing(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -9460,6 +9577,7 @@ class TestPhase1RuleSourceAudit(unittest.TestCase):
             (repo_root / "docs").mkdir(parents=True, exist_ok=True)
             (repo_root / "docs" / "probe.txt").write_text("ok\n", encoding="utf-8")
             init_orchestration(repo_root=repo_root, orchestration_id="orch_001")
+            _mark_dependencies_ready(repo_root)
             write_preflight(
                 repo_root=repo_root,
                 orchestration_id="orch_001",
@@ -9482,23 +9600,23 @@ class TestPhase1RuleSourceAudit(unittest.TestCase):
                     "agent_run_id": "child_p1r",
                     "agent_role": "substep",
                     "node_key": "problem/shallow_water2d@0.3.0",
-                    "step": "plan",
+                    "step": "compile",
                     "substep": "generate",
                     "orchestration_id": "orch_001",
                     "parent_agent_run_id": "orch_run_001",
-                    "plan_ref": _FIX_PLAN_REF,
+                    "ir_ref": _FIX_IR_REF,
                     "pipeline_ref": _FIX_PIPE_REF,
-                    "dependency_ref": _FIX_PLAN_STEP_DEP_REF,
-                    "skill_name": "workflow-plan-generate",
-                    "skill_ref": "skills/workflow-plan-generate/SKILL.md",
+                    "dependency_ref": _FIX_COMPILE_STEP_DEP_REF,
+                    "skill_name": "workflow-compile-generate",
+                    "skill_ref": "skills/workflow-compile-generate/SKILL.md",
                     "skill_must_read_refs": "",
                     "allowed_output_paths": [
-                        f"{_FIX_PLAN_REF}/case.resolved.yaml",
-                        f"{_FIX_PLAN_REF}/plan_meta.json",
+                        f"{_FIX_IR_REF}/spec.ir.yaml",
+                        f"{_FIX_IR_REF}/ir_meta.json",
                     ],
                     "launch_prompt_full": _substep_launch_prompt(
                         "problem/shallow_water2d@0.3.0",
-                        "plan",
+                        "compile",
                         "generate",
                         "child_p1r",
                     ),
@@ -9522,6 +9640,7 @@ class TestPhase1RuleSourceAudit(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
             init_orchestration(repo_root=repo_root, orchestration_id="orch_p1m")
+            _mark_dependencies_ready(repo_root, "orch_p1m")
             write_preflight(
                 repo_root=repo_root,
                 orchestration_id="orch_p1m",
@@ -9547,6 +9666,7 @@ class TestPhase1RuleSourceAudit(unittest.TestCase):
             (repo_root / "docs").mkdir(parents=True, exist_ok=True)
             (repo_root / "docs" / "p1_doc.txt").write_text("ok\n", encoding="utf-8")
             init_orchestration(repo_root=repo_root, orchestration_id="orch_001")
+            _mark_dependencies_ready(repo_root)
             write_preflight(
                 repo_root=repo_root,
                 orchestration_id="orch_001",
@@ -9569,23 +9689,23 @@ class TestPhase1RuleSourceAudit(unittest.TestCase):
                     "agent_run_id": "c_cli",
                     "agent_role": "substep",
                     "node_key": "problem/shallow_water2d@0.3.0",
-                    "step": "plan",
+                    "step": "compile",
                     "substep": "generate",
                     "orchestration_id": "orch_001",
                     "parent_agent_run_id": "orch_run_001",
-                    "plan_ref": _FIX_PLAN_REF,
+                    "ir_ref": _FIX_IR_REF,
                     "pipeline_ref": _FIX_PIPE_REF,
-                    "dependency_ref": _FIX_PLAN_STEP_DEP_REF,
-                    "skill_name": "workflow-plan-generate",
-                    "skill_ref": "skills/workflow-plan-generate/SKILL.md",
+                    "dependency_ref": _FIX_COMPILE_STEP_DEP_REF,
+                    "skill_name": "workflow-compile-generate",
+                    "skill_ref": "skills/workflow-compile-generate/SKILL.md",
                     "skill_must_read_refs": "",
                     "allowed_output_paths": [
-                        f"{_FIX_PLAN_REF}/case.resolved.yaml",
-                        f"{_FIX_PLAN_REF}/plan_meta.json",
+                        f"{_FIX_IR_REF}/spec.ir.yaml",
+                        f"{_FIX_IR_REF}/ir_meta.json",
                     ],
                     "launch_prompt_full": _substep_launch_prompt(
                         "problem/shallow_water2d@0.3.0",
-                        "plan",
+                        "compile",
                         "generate",
                         "c_cli",
                     ),
@@ -9622,13 +9742,14 @@ class TestPhase1RuleSourceAudit(unittest.TestCase):
 
 class TestPhase2PlanGuardsIntegration(unittest.TestCase):
     def test_required_child_agent_kind_plan_and_build(self) -> None:
-        self.assertEqual(_required_child_agent_kind("plan"), "substep")
+        self.assertEqual(_required_child_agent_kind("compile"), "substep")
         self.assertEqual(_required_child_agent_kind("build"), "step")
 
     def test_workflow_launch_check_fail_closed_by_session_policy(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
             init_orchestration(repo_root=repo_root, orchestration_id="wf1")
+            _mark_dependencies_ready(repo_root, "wf1")
             dep_path = repo_root / _FIX_DEP_REF
             dep_path.parent.mkdir(parents=True, exist_ok=True)
             dep_path.write_text("ok\n", encoding="utf-8")
@@ -9655,7 +9776,7 @@ class TestPhase2PlanGuardsIntegration(unittest.TestCase):
                 repo_root,
                 orchestration_id="wf1",
                 node_key="problem/shallow_water2d@0.3.0",
-                step="plan",
+                step="compile",
                 backend="codex",
                 require_child_agent="substep",
             )
@@ -9667,6 +9788,7 @@ class TestPhase2PlanGuardsIntegration(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
             init_orchestration(repo_root=repo_root, orchestration_id="wf2")
+            _mark_dependencies_ready(repo_root, "wf2")
             dep_path = repo_root / _FIX_DEP_REF
             dep_path.parent.mkdir(parents=True, exist_ok=True)
             dep_path.write_text("ok\n", encoding="utf-8")
@@ -9674,10 +9796,10 @@ class TestPhase2PlanGuardsIntegration(unittest.TestCase):
             meta = json.loads(meta_path.read_text(encoding="utf-8"))
             meta["dependency_ref"] = _FIX_DEP_REF
             meta["dependency_readiness"] = {
-                "direct_dependency_plan_readiness": True,
+                "direct_dependency_compile_readiness": True,
                 "direct_dependency_execution_readiness": True,
                 "detail": {
-                    "plan_ref_verified": True,
+                    "ir_ref_verified": True,
                     "pipeline_ref_verified": True,
                     "aggregate_verdict_verified": True,
                 },
@@ -9708,7 +9830,7 @@ class TestPhase2PlanGuardsIntegration(unittest.TestCase):
                 repo_root,
                 orchestration_id="wf2",
                 node_key="problem/shallow_water2d@0.3.0",
-                step="plan",
+                step="compile",
                 backend="codex",
                 require_child_agent="substep",
             )
@@ -9720,6 +9842,7 @@ class TestPhase2PlanGuardsIntegration(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
             init_orchestration(repo_root=repo_root, orchestration_id="wf5")
+            _mark_dependencies_ready(repo_root, "wf5")
             write_preflight(
                 repo_root=repo_root,
                 orchestration_id="wf5",
@@ -9743,12 +9866,12 @@ class TestPhase2PlanGuardsIntegration(unittest.TestCase):
                 "agent_role": "substep",
                 "orchestration_id": "wf5",
                 "parent_agent_run_id": "orch_wf5",
-                "plan_ref": _FIX_PLAN_REF,
+                "ir_ref": _FIX_IR_REF,
                 "pipeline_ref": _FIX_PIPE_REF,
                 "dependency_ref": _FIX_DEP_REF,
-                "skill_name": "workflow-plan-generate",
-                "skill_ref": "skills/workflow-plan-generate/SKILL.md",
-                "skill_must_read_refs": _fixture_skill_must_read_refs_substep("plan", "generate"),
+                "skill_name": "workflow-compile-generate",
+                "skill_ref": "skills/workflow-compile-generate/SKILL.md",
+                "skill_must_read_refs": _fixture_skill_must_read_refs_substep("compile", "generate"),
                 "issue_severity": "none",
                 "repair_strategy": "none",
                 "repair_target_agent_run_id": "none",
@@ -9756,7 +9879,7 @@ class TestPhase2PlanGuardsIntegration(unittest.TestCase):
             }
             for missing_key in ("step", "node_key"):
                 req = dict(base)
-                req["step"] = "plan"
+                req["step"] = "compile"
                 req["substep"] = "generate"
                 req["node_key"] = "problem/shallow_water2d@0.3.0"
                 del req[missing_key]
@@ -9797,6 +9920,8 @@ class TestPhase2PlanGuardsIntegration(unittest.TestCase):
             repo_root = Path(tmp)
             init_orchestration(repo_root=repo_root, orchestration_id="wf3")
 
+            # Intentionally do NOT call _mark_dependencies_ready — this test
+            # verifies fail_closed when no readiness snapshot is present.
             def runner(args, **kwargs):  # type: ignore[no-untyped-def]
                 if args[1:] == ["--version"]:
                     return _FakeCompletedProcess(0, stdout="codex-cli 0.114.0\n")
@@ -9832,7 +9957,7 @@ class TestPhase2PlanGuardsIntegration(unittest.TestCase):
                 repo_root,
                 orchestration_id="wf3",
                 node_key="problem/shallow_water2d@0.3.0",
-                step="plan",
+                step="compile",
                 backend="codex",
                 require_child_agent="substep",
             )
@@ -9845,6 +9970,7 @@ class TestPhase2PlanGuardsIntegration(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
             init_orchestration(repo_root=repo_root, orchestration_id="wf4")
+            _mark_dependencies_ready(repo_root, "wf4")
             write_preflight(
                 repo_root=repo_root,
                 orchestration_id="wf4",
@@ -9864,16 +9990,16 @@ class TestPhase2PlanGuardsIntegration(unittest.TestCase):
                 "agent_run_id": "plan_sub_fail_closed",
                 "agent_role": "substep",
                 "node_key": "problem/shallow_water2d@0.3.0",
-                "step": "plan",
+                "step": "compile",
                 "substep": "generate",
                 "orchestration_id": "wf4",
                 "parent_agent_run_id": "orch_wf4",
-                "plan_ref": _FIX_PLAN_REF,
+                "ir_ref": _FIX_IR_REF,
                 "pipeline_ref": _FIX_PIPE_REF,
                 "dependency_ref": _FIX_DEP_REF,
-                "skill_name": "workflow-plan-generate",
-                "skill_ref": "skills/workflow-plan-generate/SKILL.md",
-                "skill_must_read_refs": _fixture_skill_must_read_refs_substep("plan", "generate"),
+                "skill_name": "workflow-compile-generate",
+                "skill_ref": "skills/workflow-compile-generate/SKILL.md",
+                "skill_must_read_refs": _fixture_skill_must_read_refs_substep("compile", "generate"),
                 "issue_severity": "none",
                 "repair_strategy": "none",
                 "repair_target_agent_run_id": "none",
@@ -9882,17 +10008,17 @@ class TestPhase2PlanGuardsIntegration(unittest.TestCase):
                     {
                         "agent_run_id": "plan_sub_fail_closed",
                         "node_key": "problem/shallow_water2d@0.3.0",
-                        "step": "plan",
+                        "step": "compile",
                         "substep": "generate",
                         "orchestration_id": "wf4",
                         "parent_agent_run_id": "orch_wf4",
-                        "plan_ref": _FIX_PLAN_REF,
+                        "ir_ref": _FIX_IR_REF,
                         "pipeline_ref": _FIX_PIPE_REF,
                         "dependency_ref": _FIX_DEP_REF,
-                        "skill_name": "workflow-plan-generate",
-                        "skill_ref": "skills/workflow-plan-generate/SKILL.md",
+                        "skill_name": "workflow-compile-generate",
+                        "skill_ref": "skills/workflow-compile-generate/SKILL.md",
                         "skill_must_read_refs": _fixture_skill_must_read_refs_substep(
-                            "plan", "generate"
+                            "compile", "generate"
                         ),
                         "issue_severity": "none",
                         "repair_strategy": "none",
@@ -9925,6 +10051,7 @@ class TestPhase2PlanGuardsIntegration(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
             init_orchestration(repo_root=repo_root, orchestration_id="g1")
+            _mark_dependencies_ready(repo_root, "g1")
             write_preflight(
                 repo_root=repo_root,
                 orchestration_id="g1",
@@ -9952,6 +10079,7 @@ class TestPhase2PlanGuardsIntegration(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
             init_orchestration(repo_root=repo_root, orchestration_id="g2")
+            _mark_dependencies_ready(repo_root, "g2")
             write_preflight(
                 repo_root=repo_root,
                 orchestration_id="g2",
@@ -9972,7 +10100,7 @@ class TestPhase2PlanGuardsIntegration(unittest.TestCase):
                 "step": "build",
                 "orchestration_id": "g2",
                 "parent_agent_run_id": "orch_g2",
-                "plan_ref": _FIX_PLAN_REF,
+                "ir_ref": _FIX_IR_REF,
                 "pipeline_ref": _FIX_PIPE_REF,
                 "dependency_ref": _FIX_DEP_REF,
                 "skill_name": "workflow-build",
@@ -9982,7 +10110,7 @@ class TestPhase2PlanGuardsIntegration(unittest.TestCase):
                 "repair_strategy": "none",
                 "repair_target_agent_run_id": "none",
                 "repair_reason": "none",
-                "allowed_output_paths": [f"{_FIX_PIPE_REF}/build/build_001/bin/simulate"],
+                "allowed_output_paths": [f"{_FIX_PIPE_REF}/binary/bin_001/bin/simulate"],
                 "launch_prompt_full": render_launch_prompt_text(
                     {
                         "agent_run_id": "build_child_1",
@@ -9990,7 +10118,7 @@ class TestPhase2PlanGuardsIntegration(unittest.TestCase):
                         "step": "build",
                         "orchestration_id": "g2",
                         "parent_agent_run_id": "orch_g2",
-                        "plan_ref": _FIX_PLAN_REF,
+                        "ir_ref": _FIX_IR_REF,
                         "pipeline_ref": _FIX_PIPE_REF,
                         "dependency_ref": _FIX_DEP_REF,
                         "skill_name": "workflow-build",
@@ -10034,6 +10162,7 @@ class TestPhase2PlanGuardsIntegration(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
             init_orchestration(repo_root=repo_root, orchestration_id="g3")
+            _mark_dependencies_ready(repo_root, "g3")
             write_preflight(
                 repo_root=repo_root,
                 orchestration_id="g3",
@@ -10069,7 +10198,8 @@ class TestPhase2PlanGuardsIntegration(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
             init_orchestration(repo_root=repo_root, orchestration_id="g4")
-            bad = f"{_FIX_PLAN_REF}/case.resolved.yaml"
+            _mark_dependencies_ready(repo_root, "g4")
+            bad = f"{_FIX_IR_REF}/spec.ir.yaml"
             with self.assertRaises(RuntimeError):
                 gate_apply_patch_writes(
                     repo_root,
@@ -10086,6 +10216,7 @@ class TestPhase2PlanGuardsIntegration(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
             init_orchestration(repo_root=repo_root, orchestration_id="g5")
+            _mark_dependencies_ready(repo_root, "g5")
             out = gate_apply_patch_writes(
                 repo_root,
                 orchestration_id="g5",
@@ -10100,6 +10231,7 @@ class TestPhase2PlanGuardsIntegration(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
             init_orchestration(repo_root=repo_root, orchestration_id="g6")
+            _mark_dependencies_ready(repo_root, "g6")
             write_preflight(
                 repo_root=repo_root,
                 orchestration_id="g6",
@@ -10117,38 +10249,38 @@ class TestPhase2PlanGuardsIntegration(unittest.TestCase):
                 "agent_run_id": "plan_sub_1",
                 "agent_role": "substep",
                 "node_key": "problem/shallow_water2d@0.3.0",
-                "step": "plan",
+                "step": "compile",
                 "substep": "generate",
                 "orchestration_id": "g6",
                 "parent_agent_run_id": "orch_g6",
-                "plan_ref": _FIX_PLAN_REF,
+                "ir_ref": _FIX_IR_REF,
                 "pipeline_ref": _FIX_PIPE_REF,
-                "dependency_ref": _FIX_PLAN_STEP_DEP_REF,
-                "skill_name": "workflow-plan-generate",
-                "skill_ref": "skills/workflow-plan-generate/SKILL.md",
-                "skill_must_read_refs": _fixture_skill_must_read_refs_substep("plan", "generate"),
+                "dependency_ref": _FIX_COMPILE_STEP_DEP_REF,
+                "skill_name": "workflow-compile-generate",
+                "skill_ref": "skills/workflow-compile-generate/SKILL.md",
+                "skill_must_read_refs": _fixture_skill_must_read_refs_substep("compile", "generate"),
                 "issue_severity": "none",
                 "repair_strategy": "none",
                 "repair_target_agent_run_id": "none",
                 "repair_reason": "none",
                 "allowed_output_paths": [
-                    f"{_FIX_PLAN_REF}/case.resolved.yaml",
-                    f"{_FIX_PLAN_REF}/plan_meta.json",
+                    f"{_FIX_IR_REF}/spec.ir.yaml",
+                    f"{_FIX_IR_REF}/ir_meta.json",
                 ],
                 "launch_prompt_full": render_launch_prompt_text(
                     {
                         "agent_run_id": "plan_sub_1",
                         "node_key": "problem/shallow_water2d@0.3.0",
-                        "step": "plan",
+                        "step": "compile",
                         "substep": "generate",
                         "orchestration_id": "g6",
                         "parent_agent_run_id": "orch_g6",
-                        "plan_ref": _FIX_PLAN_REF,
+                        "ir_ref": _FIX_IR_REF,
                         "pipeline_ref": _FIX_PIPE_REF,
-                        "dependency_ref": _FIX_PLAN_STEP_DEP_REF,
-                        "skill_name": "workflow-plan-generate",
-                        "skill_ref": "skills/workflow-plan-generate/SKILL.md",
-                        "skill_must_read_refs": _fixture_skill_must_read_refs_substep("plan", "generate"),
+                        "dependency_ref": _FIX_COMPILE_STEP_DEP_REF,
+                        "skill_name": "workflow-compile-generate",
+                        "skill_ref": "skills/workflow-compile-generate/SKILL.md",
+                        "skill_must_read_refs": _fixture_skill_must_read_refs_substep("compile", "generate"),
                         "issue_severity": "none",
                         "repair_strategy": "none",
                         "repair_target_agent_run_id": "none",
@@ -10169,7 +10301,7 @@ class TestPhase2PlanGuardsIntegration(unittest.TestCase):
                     encoding="utf-8"
                 )
             )
-            bad = f"{_FIX_PIPE_REF}/generate/out.txt"
+            bad = f"{_FIX_PIPE_REF}/source/out.txt"
             with self.assertRaises(RuntimeError):
                 gate_apply_patch_writes(
                     repo_root,
@@ -10184,12 +10316,13 @@ class TestPhase2PlanGuardsIntegration(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
             init_orchestration(repo_root=repo_root, orchestration_id="g7")
+            _mark_dependencies_ready(repo_root, "g7")
             phase_state_path = repo_root / "workspace/orchestrations/g7/phase_state.json"
             phase_state = json.loads(phase_state_path.read_text(encoding="utf-8"))
             node_safe = "problem__shallow_water2d__0.3.0"
             phase_state["current_state"] = "preflight_passed"
             phase_state["node_states"][node_safe] = {
-                "plan": "launch_recorded",
+                "compile": "launch_recorded",
                 "generate": "not_started",
                 "build": "not_started",
                 "execute": "not_started",
@@ -10206,8 +10339,8 @@ class TestPhase2PlanGuardsIntegration(unittest.TestCase):
                         "orchestration_id": "g7",
                         "agent_role": "substep",
                         "node_key": "problem/shallow_water2d@0.3.0",
-                        "step": "plan",
-                        "write_roots": [_FIX_PLAN_REF + "/"],
+                        "step": "compile",
+                        "write_roots": [_FIX_IR_REF + "/"],
                         "mcp_permissions": [],
                         "expires_at": "2099-01-01T00:00:00Z",
                     },
@@ -10222,7 +10355,7 @@ class TestPhase2PlanGuardsIntegration(unittest.TestCase):
                     repo_root,
                     orchestration_id="g7",
                     actor_role="substep",
-                    changed_paths=[f"{_FIX_PLAN_REF}/case.resolved.yaml"],
+                    changed_paths=[f"{_FIX_IR_REF}/spec.ir.yaml"],
                     agent_run_id="prelaunch_sub",
                     capability_token="tok_prelaunch",
                 )
@@ -10236,18 +10369,19 @@ class TestPhase2PlanGuardsIntegration(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
             init_orchestration(repo_root=repo_root, orchestration_id="g8")
+            _mark_dependencies_ready(repo_root, "g8")
             reserved = reserve_phase_root(
                 repo_root,
                 orchestration_id="g8",
                 node_key="problem/shallow_water2d@0.3.0",
-                step="plan",
+                step="compile",
                 reserved_id="sw_flux_rusanov_p0_20260415_001",
                 reserved_by_agent_run_id="orch_run_001",
             )
             self.assertEqual(reserved.get("status"), "reserved")
             reservation_path = (
                 repo_root
-                / "workspace/orchestrations/g8/reservations/problem__shallow_water2d__0.3.0/plan.json"
+                / "workspace/orchestrations/g8/reservations/problem__shallow_water2d__0.3.0/compile.json"
             )
             self.assertTrue(reservation_path.exists())
             with self.assertRaises(RuntimeError):
@@ -10255,7 +10389,7 @@ class TestPhase2PlanGuardsIntegration(unittest.TestCase):
                     repo_root,
                     orchestration_id="g8",
                     actor_role="orchestration",
-                    changed_paths=[f"{_FIX_PLAN_REF}/case.resolved.yaml"],
+                    changed_paths=[f"{_FIX_IR_REF}/spec.ir.yaml"],
                     agent_run_id="orch_run_001",
                     capability_token=None,
                 )
@@ -10264,6 +10398,7 @@ class TestPhase2PlanGuardsIntegration(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
             init_orchestration(repo_root=repo_root, orchestration_id="g9")
+            _mark_dependencies_ready(repo_root, "g9")
             meta = update_orchestration_status(
                 repo_root=repo_root,
                 orchestration_id="g9",
@@ -10286,6 +10421,7 @@ class TestPhase2PlanGuardsIntegration(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
             init_orchestration(repo_root=repo_root, orchestration_id="orch_committed")
+            _mark_dependencies_ready(repo_root, "orch_committed")
             meta_path = (
                 repo_root / "workspace" / "orchestrations" / "orch_committed"
                 / "orchestration_meta.json"
@@ -10328,6 +10464,7 @@ class TestPhase2PlanGuardsIntegration(unittest.TestCase):
                     repo_root = Path(tmp)
                     orch_id = f"orch_set_status_cleanup_{terminal_status}"
                     init_orchestration(repo_root=repo_root, orchestration_id=orch_id)
+                    _mark_dependencies_ready(repo_root)
                     meta_path = (
                         repo_root / "workspace" / "orchestrations" / orch_id
                         / "orchestration_meta.json"
@@ -10359,6 +10496,7 @@ class TestPhase3RunGate(unittest.TestCase):
         (repo_root / "workspace").mkdir(parents=True, exist_ok=True)
         (repo_root / "workspace" / "probe.json").write_text('{"ok": true}\n', encoding="utf-8")
         init_orchestration(repo_root=repo_root, orchestration_id="rg1")
+        _mark_dependencies_ready(repo_root, "rg1")
         write_preflight(
             repo_root=repo_root,
             orchestration_id="rg1",
@@ -10379,7 +10517,7 @@ class TestPhase3RunGate(unittest.TestCase):
             "step": "build",
             "orchestration_id": "rg1",
             "parent_agent_run_id": "orch_rg1",
-            "plan_ref": _FIX_PLAN_REF,
+            "ir_ref": _FIX_IR_REF,
             "pipeline_ref": _FIX_PIPE_REF,
             "dependency_ref": _FIX_DEP_REF,
             "skill_name": "workflow-build",
@@ -10389,7 +10527,7 @@ class TestPhase3RunGate(unittest.TestCase):
             "repair_strategy": "none",
             "repair_target_agent_run_id": "none",
             "repair_reason": "none",
-            "allowed_output_paths": [f"{_FIX_PIPE_REF}/build/build_001/build_meta.json"],
+            "allowed_output_paths": [f"{_FIX_PIPE_REF}/binary/bin_001/binary_meta.json"],
             "launch_prompt_full": render_launch_prompt_text(
                 {
                     "agent_run_id": "build_child_rg1",
@@ -10397,7 +10535,7 @@ class TestPhase3RunGate(unittest.TestCase):
                     "step": "build",
                     "orchestration_id": "rg1",
                     "parent_agent_run_id": "orch_rg1",
-                    "plan_ref": _FIX_PLAN_REF,
+                    "ir_ref": _FIX_IR_REF,
                     "pipeline_ref": _FIX_PIPE_REF,
                     "dependency_ref": _FIX_DEP_REF,
                     "skill_name": "workflow-build",
@@ -10433,6 +10571,7 @@ class TestPhase3RunGate(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
             init_orchestration(repo_root=repo_root, orchestration_id="rg_bad")
+            _mark_dependencies_ready(repo_root, "rg_bad")
             write_preflight(
                 repo_root=repo_root,
                 orchestration_id="rg_bad",
@@ -10453,7 +10592,7 @@ class TestPhase3RunGate(unittest.TestCase):
                 "step": "build",
                 "orchestration_id": "rg_bad",
                 "parent_agent_run_id": "orch_bad",
-                "plan_ref": _FIX_PLAN_REF,
+                "ir_ref": _FIX_IR_REF,
                 "pipeline_ref": _FIX_PIPE_REF,
                 "dependency_ref": _FIX_DEP_REF,
                 "skill_name": "workflow-build",
@@ -10463,7 +10602,7 @@ class TestPhase3RunGate(unittest.TestCase):
                 "repair_strategy": "none",
                 "repair_target_agent_run_id": "none",
                 "repair_reason": "none",
-                "allowed_output_paths": [f"{_FIX_PIPE_REF}/build/test3.tmp"],
+                "allowed_output_paths": [f"{_FIX_PIPE_REF}/binary/test3.tmp"],
                 "launch_prompt_full": render_launch_prompt_text(
                     {
                         "agent_run_id": "build_bad_001",
@@ -10471,7 +10610,7 @@ class TestPhase3RunGate(unittest.TestCase):
                         "step": "build",
                         "orchestration_id": "rg_bad",
                         "parent_agent_run_id": "orch_bad",
-                        "plan_ref": _FIX_PLAN_REF,
+                        "ir_ref": _FIX_IR_REF,
                         "pipeline_ref": _FIX_PIPE_REF,
                         "dependency_ref": _FIX_DEP_REF,
                         "skill_name": "workflow-build",
@@ -10498,6 +10637,7 @@ class TestPhase3RunGate(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
             init_orchestration(repo_root=repo_root, orchestration_id="rg_exec_bad")
+            _mark_dependencies_ready(repo_root, "rg_exec_bad")
             write_preflight(
                 repo_root=repo_root,
                 orchestration_id="rg_exec_bad",
@@ -10515,33 +10655,33 @@ class TestPhase3RunGate(unittest.TestCase):
                 "agent_run_id": "execute_bad_001",
                 "agent_role": "step",
                 "node_key": "problem/shallow_water2d@0.3.0",
-                "step": "execute",
+                "step": "validate", "substep": "execute",
                 "orchestration_id": "rg_exec_bad",
                 "parent_agent_run_id": "orch_exec_bad",
-                "plan_ref": _FIX_PLAN_REF,
+                "ir_ref": _FIX_IR_REF,
                 "pipeline_ref": _FIX_PIPE_REF,
                 "dependency_ref": _FIX_DEP_REF,
-                "skill_name": "workflow-execute",
-                "skill_ref": "skills/workflow-execute/SKILL.md",
-                "skill_must_read_refs": _fixture_skill_must_read_refs_step("execute"),
+                "skill_name": "workflow-validate-execute",
+                "skill_ref": "skills/workflow-validate-execute/SKILL.md",
+                "skill_must_read_refs": _fixture_skill_must_read_refs_substep("validate", "execute"),
                 "issue_severity": "none",
                 "repair_strategy": "none",
                 "repair_target_agent_run_id": "none",
                 "repair_reason": "none",
-                "allowed_output_paths": [f"{_FIX_PIPE_REF}/execute/exec_001/diagnostics.json"],
+                "allowed_output_paths": [f"{_FIX_PIPE_REF}/runs/run_001/diagnostics.json"],
                 "launch_prompt_full": render_launch_prompt_text(
                     {
                         "agent_run_id": "execute_bad_001",
                         "node_key": "problem/shallow_water2d@0.3.0",
-                        "step": "execute",
+                        "step": "validate", "substep": "execute",
                         "orchestration_id": "rg_exec_bad",
                         "parent_agent_run_id": "orch_exec_bad",
-                        "plan_ref": _FIX_PLAN_REF,
+                        "ir_ref": _FIX_IR_REF,
                         "pipeline_ref": _FIX_PIPE_REF,
                         "dependency_ref": _FIX_DEP_REF,
-                        "skill_name": "workflow-execute",
-                        "skill_ref": "skills/workflow-execute/SKILL.md",
-                        "skill_must_read_refs": _fixture_skill_must_read_refs_step("execute"),
+                        "skill_name": "workflow-validate-execute",
+                        "skill_ref": "skills/workflow-validate-execute/SKILL.md",
+                        "skill_must_read_refs": _fixture_skill_must_read_refs_substep("validate", "execute"),
                         "issue_severity": "none",
                         "repair_strategy": "none",
                         "repair_target_agent_run_id": "none",
@@ -10564,24 +10704,24 @@ class TestPhase3RunGate(unittest.TestCase):
             "agent_role": "substep",
             "node_key": "problem/shallow_water2d@0.3.0",
             "step": "tune",
-            "plan_ref": _FIX_PLAN_REF,
+            "ir_ref": _FIX_IR_REF,
             "pipeline_ref": _FIX_PIPE_REF,
-            "allowed_output_paths": [f"{_FIX_PIPE_REF}/tune/trial_001/impl.resolved.yaml"],
+            "allowed_output_paths": [f"{_FIX_PIPE_REF}/tune/trial_001/spec.ir.yaml"],
         }
         out = _allowed_output_paths_for_launch(
             request_payload=req,
             write_roots=[f"{_FIX_PIPE_REF}/tune/"],
         )
-        self.assertEqual(out, [f"{_FIX_PIPE_REF}/tune/trial_001/impl.resolved.yaml"])
+        self.assertEqual(out, [f"{_FIX_PIPE_REF}/tune/trial_001/spec.ir.yaml"])
 
     def test_allowed_output_paths_for_launch_rejects_nested_tune_subdirectory(self) -> None:
         req = {
             "agent_role": "substep",
             "node_key": "problem/shallow_water2d@0.3.0",
             "step": "tune",
-            "plan_ref": _FIX_PLAN_REF,
+            "ir_ref": _FIX_IR_REF,
             "pipeline_ref": _FIX_PIPE_REF,
-            "allowed_output_paths": [f"{_FIX_PIPE_REF}/tune/trial_001/subdir/impl.resolved.yaml"],
+            "allowed_output_paths": [f"{_FIX_PIPE_REF}/tune/trial_001/subdir/spec.ir.yaml"],
         }
         with self.assertRaisesRegex(ValueError, "outside phase contract outputs"):
             _allowed_output_paths_for_launch(
@@ -10593,28 +10733,28 @@ class TestPhase3RunGate(unittest.TestCase):
         req = {
             "agent_role": "step",
             "node_key": "problem/shallow_water2d@0.3.0",
-            "step": "judge",
-            "plan_ref": _FIX_PLAN_REF,
+            "step": "validate", "substep": "judge",
+            "ir_ref": _FIX_IR_REF,
             "pipeline_ref": _FIX_PIPE_REF,
             "allowed_output_paths": [
-                f"{_FIX_PIPE_REF}/execute/ex_001/problem__shallow_water2d__0.3.0/summary.json"
+                f"{_FIX_PIPE_REF}/runs/ex_001/problem__shallow_water2d__0.3.0/summary.json"
             ],
         }
         out = _allowed_output_paths_for_launch(
             request_payload=req,
-            write_roots=[f"{_FIX_PIPE_REF}/execute/"],
+            write_roots=[f"{_FIX_PIPE_REF}/runs/"],
         )
         self.assertEqual(
             out,
-            [f"{_FIX_PIPE_REF}/execute/ex_001/problem__shallow_water2d__0.3.0/summary.json"],
+            [f"{_FIX_PIPE_REF}/runs/ex_001/problem__shallow_water2d__0.3.0/summary.json"],
         )
 
     def test_allowed_output_paths_for_launch_rejects_judge_path_under_legacy_judge_root(self) -> None:
         req = {
             "agent_role": "step",
             "node_key": "problem/shallow_water2d@0.3.0",
-            "step": "judge",
-            "plan_ref": _FIX_PLAN_REF,
+            "step": "validate", "substep": "judge",
+            "ir_ref": _FIX_IR_REF,
             "pipeline_ref": _FIX_PIPE_REF,
             "allowed_output_paths": [
                 f"{_FIX_PIPE_REF}/judge/jdg_001/problem__shallow_water2d__0.3.0/summary.json"
@@ -10623,59 +10763,59 @@ class TestPhase3RunGate(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "must be under capability write_roots"):
             _allowed_output_paths_for_launch(
                 request_payload=req,
-                write_roots=[f"{_FIX_PIPE_REF}/execute/"],
+                write_roots=[f"{_FIX_PIPE_REF}/runs/"],
             )
 
     def test_allowed_output_paths_for_launch_allows_generate_src_directory(self) -> None:
-        gen_id = "gen_20260508_001"
+        src_id = "src_20260508_001"
         req = {
             "agent_role": "step",
             "node_key": "problem/shallow_water2d@0.3.0",
             "step": "generate",
-            "plan_ref": _FIX_PLAN_REF,
+            "ir_ref": _FIX_IR_REF,
             "pipeline_ref": _FIX_PIPE_REF,
-            "allowed_output_paths": [f"{_FIX_PIPE_REF}/generate/{gen_id}/src/"],
+            "allowed_output_paths": [f"{_FIX_PIPE_REF}/source/{src_id}/src/"],
         }
         out = _allowed_output_paths_for_launch(
             request_payload=req,
-            write_roots=[f"{_FIX_PIPE_REF}/generate/"],
+            write_roots=[f"{_FIX_PIPE_REF}/source/"],
         )
         # Generate-step launches receive a defensive auto-inject for the
-        # MCP run_linter side-effect log under <gen_id>/src/.
+        # MCP run_linter side-effect log under <src_id>/src/.
         self.assertEqual(
             out,
             [
-                f"{_FIX_PIPE_REF}/generate/{gen_id}/src/",
-                f"{_FIX_PIPE_REF}/generate/{gen_id}/src/mcp_command_log.jsonl",
+                f"{_FIX_PIPE_REF}/source/{src_id}/src/",
+                f"{_FIX_PIPE_REF}/source/{src_id}/src/mcp_command_log.jsonl",
             ],
         )
 
     def test_allowed_output_paths_for_launch_rejects_generate_srcmal_directory(self) -> None:
-        gen_id = "gen_20260508_001"
+        src_id = "src_20260508_001"
         req = {
             "agent_role": "step",
             "node_key": "problem/shallow_water2d@0.3.0",
             "step": "generate",
-            "plan_ref": _FIX_PLAN_REF,
+            "ir_ref": _FIX_IR_REF,
             "pipeline_ref": _FIX_PIPE_REF,
-            "allowed_output_paths": [f"{_FIX_PIPE_REF}/generate/{gen_id}/srcmal/"],
+            "allowed_output_paths": [f"{_FIX_PIPE_REF}/source/{src_id}/srcmal/"],
         }
         with self.assertRaisesRegex(ValueError, "outside phase contract outputs"):
             _allowed_output_paths_for_launch(
                 request_payload=req,
-                write_roots=[f"{_FIX_PIPE_REF}/generate/"],
+                write_roots=[f"{_FIX_PIPE_REF}/source/"],
             )
 
     def test_allowed_output_paths_for_launch_rejects_generateevil_prefix_bypass(self) -> None:
         """A directory whose name starts with 'generate' but is a sibling (e.g. generateevil/) must be rejected."""
-        gen_id = "gen_20260508_001"
+        src_id = "src_20260508_001"
         req = {
             "agent_role": "step",
             "node_key": "problem/shallow_water2d@0.3.0",
             "step": "generate",
-            "plan_ref": _FIX_PLAN_REF,
+            "ir_ref": _FIX_IR_REF,
             "pipeline_ref": _FIX_PIPE_REF,
-            "allowed_output_paths": [f"{_FIX_PIPE_REF}/generateevil/{gen_id}/src/"],
+            "allowed_output_paths": [f"{_FIX_PIPE_REF}/generateevil/{src_id}/src/"],
         }
         with self.assertRaisesRegex(ValueError, "outside phase contract outputs"):
             _allowed_output_paths_for_launch(
@@ -10688,14 +10828,14 @@ class TestPhase3RunGate(unittest.TestCase):
             "agent_role": "step",
             "node_key": "problem/shallow_water2d@0.3.0",
             "step": "generate",
-            "plan_ref": _FIX_PLAN_REF,
+            "ir_ref": _FIX_IR_REF,
             "pipeline_ref": _FIX_PIPE_REF,
-            "allowed_output_paths": [f"{_FIX_PIPE_REF}/generate/"],
+            "allowed_output_paths": [f"{_FIX_PIPE_REF}/source/"],
         }
         with self.assertRaisesRegex(ValueError, "outside phase contract outputs"):
             _allowed_output_paths_for_launch(
                 request_payload=req,
-                write_roots=[f"{_FIX_PIPE_REF}/generate/"],
+                write_roots=[f"{_FIX_PIPE_REF}/source/"],
             )
 
     def test_write_manifest_preserves_directory_entry_trailing_slash(self) -> None:
@@ -10707,7 +10847,7 @@ class TestPhase3RunGate(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
-            src_dir = f"{_FIX_PIPE_REF}/generate/gen_20260508_001/src/"
+            src_dir = f"{_FIX_PIPE_REF}/source/src_20260508_001/src/"
             _write_allowed_output_manifest(
                 repo_root,
                 orchestration_id="rg_persist",
@@ -10730,7 +10870,7 @@ class TestPhase3RunGate(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
-            src_dir = f"{_FIX_PIPE_REF}/generate/gen_20260508_001/src/"
+            src_dir = f"{_FIX_PIPE_REF}/source/src_20260508_001/src/"
             _write_allowed_output_manifest(
                 repo_root,
                 orchestration_id="rg_e2e",
@@ -10742,15 +10882,15 @@ class TestPhase3RunGate(unittest.TestCase):
                 orchestration_id="rg_e2e",
                 agent_run_id="gen_e2e",
                 paths=[
-                    f"{_FIX_PIPE_REF}/generate/gen_20260508_001/src/main.f90",
-                    f"{_FIX_PIPE_REF}/generate/gen_20260508_001/src/mod/util.f90",
+                    f"{_FIX_PIPE_REF}/source/src_20260508_001/src/main.f90",
+                    f"{_FIX_PIPE_REF}/source/src_20260508_001/src/mod/util.f90",
                 ],
             )
 
     def test_validate_paths_against_allowed_output_manifest_allows_file_under_directory_entry(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
-            src_dir = f"{_FIX_PIPE_REF}/generate/gen_20260508_001/src/"
+            src_dir = f"{_FIX_PIPE_REF}/source/src_20260508_001/src/"
             manifest_path = (
                 repo_root
                 / "workspace/orchestrations/rg_dir_ok/output_manifests/gen_child_dir.json"
@@ -10775,15 +10915,15 @@ class TestPhase3RunGate(unittest.TestCase):
                 orchestration_id="rg_dir_ok",
                 agent_run_id="gen_child_dir",
                 paths=[
-                    f"{_FIX_PIPE_REF}/generate/gen_20260508_001/src/main.f90",
-                    f"{_FIX_PIPE_REF}/generate/gen_20260508_001/src/module/util.f90",
+                    f"{_FIX_PIPE_REF}/source/src_20260508_001/src/main.f90",
+                    f"{_FIX_PIPE_REF}/source/src_20260508_001/src/module/util.f90",
                 ],
             )
 
     def test_validate_paths_against_allowed_output_manifest_rejects_file_outside_directory_entry(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
-            src_dir = f"{_FIX_PIPE_REF}/generate/gen_20260508_001/src/"
+            src_dir = f"{_FIX_PIPE_REF}/source/src_20260508_001/src/"
             manifest_path = (
                 repo_root
                 / "workspace/orchestrations/rg_dir_rej/output_manifests/gen_child_rej.json"
@@ -10807,7 +10947,7 @@ class TestPhase3RunGate(unittest.TestCase):
                     repo_root,
                     orchestration_id="rg_dir_rej",
                     agent_run_id="gen_child_rej",
-                    paths=[f"{_FIX_PIPE_REF}/generate/gen_20260508_001/other/main.f90"],
+                    paths=[f"{_FIX_PIPE_REF}/source/src_20260508_001/other/main.f90"],
                 )
 
     def test_validate_paths_against_allowed_output_manifest_rejects_empty_normalized_path(self) -> None:
@@ -10823,7 +10963,7 @@ class TestPhase3RunGate(unittest.TestCase):
                     {
                         "orchestration_id": "rg_invalid",
                         "agent_run_id": "build_child_rg1",
-                        "allowed_output_paths": [f"{_FIX_PIPE_REF}/build/build_001/build_meta.json"],
+                        "allowed_output_paths": [f"{_FIX_PIPE_REF}/binary/bin_001/binary_meta.json"],
                     },
                     ensure_ascii=False,
                     indent=2,
@@ -11001,7 +11141,7 @@ class TestPhase3RunGate(unittest.TestCase):
                     agent_run_id="build_child_rg1",
                     args_json={
                         "actor_role": "step",
-                        "changed_paths": [f"{_FIX_PIPE_REF}/build/new_artifact.json"],
+                        "changed_paths": [f"{_FIX_PIPE_REF}/binary/new_artifact.json"],
                     },
                     capability_token=token,
                 )
@@ -11010,7 +11150,7 @@ class TestPhase3RunGate(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
             token = self._setup_run_gate_fixture(repo_root)
-            target_path = f"{_FIX_PIPE_REF}/build/build_001/build_meta.json"
+            target_path = f"{_FIX_PIPE_REF}/binary/bin_001/binary_meta.json"
             patch_text = "\n".join(
                 [
                     f"diff --git a/{target_path} b/{target_path}",
@@ -11055,7 +11195,7 @@ class TestPhase3RunGate(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
             token = self._setup_run_gate_fixture(repo_root)
-            log_path = f"{_FIX_PIPE_REF}/build/build_001/mcp_command_log.jsonl"
+            log_path = f"{_FIX_PIPE_REF}/binary/bin_001/mcp_command_log.jsonl"
             patch_text = "\n".join(
                 [
                     f"diff --git a/{log_path} b/{log_path}",
@@ -11091,7 +11231,7 @@ class TestPhase3RunGate(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
             token = self._setup_run_gate_fixture(repo_root)
-            target = f"{_FIX_PIPE_REF}/build/subdir/new_artifact.json"
+            target = f"{_FIX_PIPE_REF}/binary/subdir/new_artifact.json"
             patch_text = "\n".join(
                 [
                     f"diff --git a/{target} b/{target}",
@@ -11150,7 +11290,7 @@ class TestPhase3RunGate(unittest.TestCase):
                         orchestration_id="rg1",
                         actor_role="step",
                         agent_run_id="build_child_rg1",
-                        changed_paths=[f"{_FIX_PIPE_REF}/build/"],
+                        changed_paths=[f"{_FIX_PIPE_REF}/binary/"],
                         patch_text=patch_text,
                         capability_token=token,
                     )
@@ -11160,7 +11300,7 @@ class TestPhase3RunGate(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
             token = self._setup_run_gate_fixture(repo_root)
-            target = "workspace/plans/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/case.resolved.yaml"
+            target = "workspace/ir/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/spec.ir.yaml"
             patch_text = "\n".join(
                 [
                     f"diff --git a/{target} b/{target}",
@@ -11183,7 +11323,7 @@ class TestPhase3RunGate(unittest.TestCase):
                         orchestration_id="rg1",
                         actor_role="step",
                         agent_run_id="build_child_rg1",
-                        changed_paths=["workspace/plans/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/"],
+                        changed_paths=["workspace/ir/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/"],
                         patch_text=patch_text,
                         capability_token=token,
                     )
@@ -11192,7 +11332,7 @@ class TestPhase3RunGate(unittest.TestCase):
     def test_guarded_apply_patch_validates_manifest_with_declared_changed_paths(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
-            target_path = f"{_FIX_PIPE_REF}/build/new_artifact.json"
+            target_path = f"{_FIX_PIPE_REF}/binary/new_artifact.json"
             patch_text = "\n".join(
                 [
                     f"diff --git a/{target_path} b/{target_path}",
@@ -11212,7 +11352,7 @@ class TestPhase3RunGate(unittest.TestCase):
                 patch("tools.orchestration_runtime._write_apply_patch_gate_evidence") as evidence_mock,
                 patch("tools.orchestration_runtime.subprocess.run") as run_mock,
             ):
-                gate_mock.return_value = {"allowed": True, "checked_paths": [f"{_FIX_PIPE_REF}/build/"]}
+                gate_mock.return_value = {"allowed": True, "checked_paths": [f"{_FIX_PIPE_REF}/binary/"]}
                 evidence_mock.return_value = "workspace/orchestrations/rg1/gates/build_child_rg1/apply_patch_writes.json"
                 run_mock.side_effect = [
                     _FakeCompletedProcess(returncode=0, stdout=numstat_output, stderr=b""),
@@ -11223,20 +11363,21 @@ class TestPhase3RunGate(unittest.TestCase):
                     orchestration_id="rg1",
                     actor_role="step",
                     agent_run_id="build_child_rg1",
-                    changed_paths=[f"{_FIX_PIPE_REF}/build/"],
+                    changed_paths=[f"{_FIX_PIPE_REF}/binary/"],
                     patch_text=patch_text,
                     capability_token="token",
                 )
             self.assertEqual(manifest_mock.call_count, 1)
             self.assertEqual(
                 manifest_mock.call_args.kwargs.get("paths"),
-                [f"{_FIX_PIPE_REF}/build"],
+                [f"{_FIX_PIPE_REF}/binary"],
             )
 
     def test_guarded_apply_patch_no_prefix_patch_writes_declared_path(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
             subprocess.run(["git", "init", "--quiet"], cwd=str(repo_root), check=True)
+            subprocess.run(["git", "config", "commit.gpgsign", "false"], cwd=str(repo_root), check=True)
             subprocess.run(
                 ["git", "config", "user.email", "test@test.com"], cwd=str(repo_root), check=True
             )
@@ -11290,6 +11431,7 @@ class TestPhase3RunGate(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
             subprocess.run(["git", "init", "--quiet"], cwd=str(repo_root), check=True)
+            subprocess.run(["git", "config", "commit.gpgsign", "false"], cwd=str(repo_root), check=True)
             subprocess.run(
                 ["git", "config", "user.email", "test@test.com"], cwd=str(repo_root), check=True
             )
@@ -11345,6 +11487,7 @@ class TestPhase3RunGate(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
             subprocess.run(["git", "init", "--quiet"], cwd=str(repo_root), check=True)
+            subprocess.run(["git", "config", "commit.gpgsign", "false"], cwd=str(repo_root), check=True)
             subprocess.run(
                 ["git", "config", "user.email", "test@test.com"], cwd=str(repo_root), check=True
             )
@@ -11395,6 +11538,7 @@ class TestPhase3RunGate(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
             subprocess.run(["git", "init", "--quiet"], cwd=str(repo_root), check=True)
+            subprocess.run(["git", "config", "commit.gpgsign", "false"], cwd=str(repo_root), check=True)
             subprocess.run(
                 ["git", "config", "user.email", "test@test.com"], cwd=str(repo_root), check=True
             )
@@ -11443,6 +11587,7 @@ class TestPhase3RunGate(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
             subprocess.run(["git", "init", "--quiet"], cwd=str(repo_root), check=True)
+            subprocess.run(["git", "config", "commit.gpgsign", "false"], cwd=str(repo_root), check=True)
             subprocess.run(
                 ["git", "config", "user.email", "test@test.com"], cwd=str(repo_root), check=True
             )
@@ -11496,6 +11641,7 @@ class TestPhase3RunGate(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
             subprocess.run(["git", "init", "--quiet"], cwd=str(repo_root), check=True)
+            subprocess.run(["git", "config", "commit.gpgsign", "false"], cwd=str(repo_root), check=True)
             subprocess.run(
                 ["git", "config", "user.email", "test@test.com"], cwd=str(repo_root), check=True
             )
@@ -11632,6 +11778,7 @@ class TestPhase3RunGate(unittest.TestCase):
             repo_root = Path(tmp)
             # git init is required so _numstat_targets can run git apply --numstat --check
             subprocess.run(["git", "init", "--quiet"], cwd=str(repo_root), check=True)
+            subprocess.run(["git", "config", "commit.gpgsign", "false"], cwd=str(repo_root), check=True)
             subprocess.run(
                 ["git", "config", "user.email", "test@test.com"], cwd=str(repo_root), check=True
             )
@@ -11668,7 +11815,7 @@ class TestPhase3RunGate(unittest.TestCase):
                         "--agent-run-id",
                         "build_child_rg1",
                         "--paths-json",
-                        json.dumps([f"{_FIX_PIPE_REF}/build/new_artifact.json"]),
+                        json.dumps([f"{_FIX_PIPE_REF}/binary/new_artifact.json"]),
                         "--patch-text",
                         patch_text,
                         "--capability-token",
@@ -11720,14 +11867,15 @@ class TestPhase3RunGate(unittest.TestCase):
                     orchestration_id="rg1",
                     gate_name="validate_pipeline_semantics",
                     agent_run_id="build_child_rg1",
-                    args_json={"stage": "plan", "pipeline-root": _FIX_PIPE_REF},
+                    args_json={"stage": "compile", "pipeline-root": _FIX_PIPE_REF},
                     capability_token=token,
                 )
 
-    def test_pre_phase_launch_blocks_build_when_generate_meta_not_pass(self) -> None:
+    def test_pre_phase_launch_blocks_build_when_source_meta_not_pass(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
             init_orchestration(repo_root=repo_root, orchestration_id="pl1")
+            _mark_dependencies_ready(repo_root, "pl1")
             write_preflight(
                 repo_root=repo_root,
                 orchestration_id="pl1",
@@ -11744,7 +11892,7 @@ class TestPhase3RunGate(unittest.TestCase):
             )
             pipe = repo_root / _FIX_PIPE_REF
             (pipe / "generate" / "g1").mkdir(parents=True, exist_ok=True)
-            (pipe / "generate" / "g1" / "generate_meta.json").write_text(
+            (pipe / "generate" / "g1" / "source_meta.json").write_text(
                 json.dumps({"verification_status": "fail"}),
                 encoding="utf-8",
             )
@@ -11759,7 +11907,7 @@ class TestPhase3RunGate(unittest.TestCase):
                     "node_key": "problem/shallow_water2d@0.3.0",
                     "step": "build",
                     "pipeline_ref": _FIX_PIPE_REF,
-                    "plan_ref": _FIX_PLAN_REF,
+                    "ir_ref": _FIX_IR_REF,
                     "dependency_ref": _FIX_DEP_REF,
                 },
             )
@@ -11804,6 +11952,7 @@ class TestPhase3RunGate(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
             init_orchestration(repo_root=repo_root, orchestration_id="orch_001")
+            _mark_dependencies_ready(repo_root)
             write_preflight(
                 repo_root=repo_root,
                 orchestration_id="orch_001",
@@ -11835,13 +11984,13 @@ class TestPhase3RunGate(unittest.TestCase):
                     "step": "build",
                     "orchestration_id": "orch_001",
                     "parent_agent_run_id": "orch_run_001",
-                    "plan_ref": _FIX_PLAN_REF,
+                    "ir_ref": _FIX_IR_REF,
                     "pipeline_ref": _FIX_PIPE_REF,
                     "dependency_ref": _FIX_DEP_REF,
                     "skill_name": "workflow-build",
                     "skill_ref": "skills/workflow-build/SKILL.md",
                     "skill_must_read_refs": "",
-                    "allowed_output_paths": [f"{_FIX_PIPE_REF}/build/build_001/bin/simulate"],
+                    "allowed_output_paths": [f"{_FIX_PIPE_REF}/binary/bin_001/bin/simulate"],
                     "launch_prompt_full": _step_launch_prompt(
                         "problem/shallow_water2d@0.3.0",
                         "build",
@@ -11870,22 +12019,18 @@ class TestPhase3RunGate(unittest.TestCase):
                     child_agent_run_id="step_run_execute_001",
                     request_payload={
                         "agent_run_id": "step_run_execute_001",
-                        "agent_role": "step",
+                        "agent_role": "substep",
                         "node_key": "problem/shallow_water2d@0.3.0",
-                        "step": "execute",
+                        "step": "validate", "substep": "execute",
                         "orchestration_id": "orch_001",
                         "parent_agent_run_id": "orch_run_001",
-                        "plan_ref": _FIX_PLAN_REF,
+                        "ir_ref": _FIX_IR_REF,
                         "pipeline_ref": _FIX_PIPE_REF,
                         "dependency_ref": _FIX_DEP_REF,
-                        "skill_name": "workflow-execute",
-                        "skill_ref": "skills/workflow-execute/SKILL.md",
+                        "skill_name": "workflow-validate-execute",
+                        "skill_ref": "skills/workflow-validate-execute/SKILL.md",
                         "skill_must_read_refs": "",
-                        "launch_prompt_full": _step_launch_prompt(
-                            "problem/shallow_water2d@0.3.0",
-                            "execute",
-                            "step_run_execute_001",
-                        ),
+                        "launch_prompt_full": _substep_launch_prompt("problem/shallow_water2d@0.3.0", "validate", "execute", "step_run_execute_001"),
                     },
                     response_payload={
                         "agent_run_id": "step_run_execute_001",
@@ -11907,6 +12052,7 @@ class TestPhase3RunGate(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
             init_orchestration(repo_root=repo_root, orchestration_id="orch_001")
+            _mark_dependencies_ready(repo_root)
             write_preflight(
                 repo_root=repo_root,
                 orchestration_id="orch_001",
@@ -11938,13 +12084,13 @@ class TestPhase3RunGate(unittest.TestCase):
                     "step": "build",
                     "orchestration_id": "orch_001",
                     "parent_agent_run_id": "orch_run_001",
-                    "plan_ref": _FIX_PLAN_REF,
+                    "ir_ref": _FIX_IR_REF,
                     "pipeline_ref": _FIX_PIPE_REF,
                     "dependency_ref": _FIX_DEP_REF,
                     "skill_name": "workflow-build",
                     "skill_ref": "skills/workflow-build/SKILL.md",
                     "skill_must_read_refs": "",
-                    "allowed_output_paths": [f"{_FIX_PIPE_REF}/build/build_001/bin/simulate"],
+                    "allowed_output_paths": [f"{_FIX_PIPE_REF}/binary/bin_001/bin/simulate"],
                     "launch_prompt_full": _step_launch_prompt(
                         "problem/shallow_water2d@0.3.0",
                         "build",
@@ -11964,7 +12110,7 @@ class TestPhase3RunGate(unittest.TestCase):
                 / "active_child_agent_run_id.txt"
             )
             self.assertTrue(active_path.exists())
-            out_ref = f"{_FIX_PIPE_REF}/build/build_001/bin/simulate"
+            out_ref = f"{_FIX_PIPE_REF}/binary/bin_001/bin/simulate"
             _write_apply_patch_gate_evidence(
                 repo_root,
                 orchestration_id="orch_001",
@@ -12004,17 +12150,17 @@ class DirectWritePathExtensionPolicyTests(unittest.TestCase):
 
     def test_is_direct_write_path_classifies_extensions(self) -> None:
         cli_paths = [
-            "workspace/plans/p/plan.json",
+            "workspace/ir/p/ir_meta.json",
             "workspace/orchestrations/orch_001/launches/x.reply.txt",
             "workspace/orchestrations/orch_001/agents/x/dialogs/agent.summary.TXT",
-            "workspace/plans/p/derived_contract.JSON",
+            "workspace/ir/p/ir_meta.JSON",
         ]
         direct_paths = [
-            "workspace/plans/p/case.resolved.yaml",
-            "workspace/plans/p/algorithm.summary.md",
-            "workspace/pipelines/p/generate/g/src/main.f90",
-            "workspace/pipelines/p/generate/g/src/lib.cpp",
-            "workspace/pipelines/p/generate/g/include/header.hpp",
+            "workspace/ir/p/spec.ir.yaml",
+            "workspace/ir/p/algorithm.summary.md",
+            "workspace/pipelines/p/source/g/src/main.f90",
+            "workspace/pipelines/p/source/g/src/lib.cpp",
+            "workspace/pipelines/p/source/g/include/header.hpp",
         ]
         for path in cli_paths:
             self.assertFalse(_is_direct_write_path(path), msg=path)
@@ -12026,12 +12172,12 @@ class DirectWritePathExtensionPolicyTests(unittest.TestCase):
 
     def test_allowed_file_tool_paths_auto_derive_excludes_cli_extensions(self) -> None:
         allowed_output_paths = [
-            "workspace/plans/p/case.resolved.yaml",
-            "workspace/plans/p/algorithm.resolved.yaml",
-            "workspace/plans/p/algorithm.summary.md",
-            "workspace/plans/p/derived_contract.json",
-            "workspace/plans/p/plan_meta.json",
-            "workspace/pipelines/p/generate/g/src/main.f90",
+            "workspace/ir/p/spec.ir.yaml",
+            "workspace/ir/p/io_contract.yaml",
+            "workspace/ir/p/algorithm.summary.md",
+            "workspace/ir/p/case_summary.yaml",
+            "workspace/ir/p/ir_meta.json",
+            "workspace/pipelines/p/source/g/src/main.f90",
         ]
         derived = _allowed_file_tool_paths_for_launch(
             request_payload={},
@@ -12041,10 +12187,11 @@ class DirectWritePathExtensionPolicyTests(unittest.TestCase):
             derived,
             sorted(
                 [
-                    "workspace/plans/p/case.resolved.yaml",
-                    "workspace/plans/p/algorithm.resolved.yaml",
-                    "workspace/plans/p/algorithm.summary.md",
-                    "workspace/pipelines/p/generate/g/src/main.f90",
+                    "workspace/ir/p/spec.ir.yaml",
+                    "workspace/ir/p/io_contract.yaml",
+                    "workspace/ir/p/algorithm.summary.md",
+                    "workspace/ir/p/case_summary.yaml",
+                    "workspace/pipelines/p/source/g/src/main.f90",
                 ]
             ),
         )
@@ -12053,38 +12200,38 @@ class DirectWritePathExtensionPolicyTests(unittest.TestCase):
         derived = _allowed_file_tool_paths_for_launch(
             request_payload={},
             allowed_output_paths=[
-                "workspace/plans/p/derived_contract.json",
-                "workspace/plans/p/plan_meta.json",
+                "workspace/ir/p/plan_meta.json",
+                "workspace/ir/p/ir_meta.json",
             ],
         )
         self.assertEqual(derived, [])
 
     def test_allowed_file_tool_paths_explicit_subset_validation(self) -> None:
         allowed_output_paths = [
-            "workspace/plans/p/case.resolved.yaml",
-            "workspace/plans/p/derived_contract.json",
+            "workspace/ir/p/spec.ir.yaml",
+            "workspace/ir/p/spec.ir.yaml",
         ]
         explicit = _allowed_file_tool_paths_for_launch(
             request_payload={
                 "allowed_file_tool_paths": [
-                    "workspace/plans/p/case.resolved.yaml",
+                    "workspace/ir/p/spec.ir.yaml",
                 ]
             },
             allowed_output_paths=allowed_output_paths,
         )
-        self.assertEqual(explicit, ["workspace/plans/p/case.resolved.yaml"])
+        self.assertEqual(explicit, ["workspace/ir/p/spec.ir.yaml"])
 
     def test_allowed_file_tool_paths_explicit_rejects_cli_managed_extensions(self) -> None:
         with self.assertRaisesRegex(ValueError, "must not include CLI-managed extensions"):
             _allowed_file_tool_paths_for_launch(
                 request_payload={
                     "allowed_file_tool_paths": [
-                        "workspace/plans/p/derived_contract.json",
+                        "workspace/ir/p/ir_meta.json",
                     ]
                 },
                 allowed_output_paths=[
-                    "workspace/plans/p/derived_contract.json",
-                    "workspace/plans/p/case.resolved.yaml",
+                    "workspace/ir/p/spec.ir.yaml",
+                    "workspace/ir/p/ir_meta.json",
                 ],
             )
 
@@ -12093,11 +12240,11 @@ class DirectWritePathExtensionPolicyTests(unittest.TestCase):
             _allowed_file_tool_paths_for_launch(
                 request_payload={
                     "allowed_file_tool_paths": [
-                        "workspace/plans/p/extra.yaml",
+                        "workspace/ir/p/extra.yaml",
                     ]
                 },
                 allowed_output_paths=[
-                    "workspace/plans/p/case.resolved.yaml",
+                    "workspace/ir/p/spec.ir.yaml",
                 ],
             )
 
@@ -12105,7 +12252,7 @@ class DirectWritePathExtensionPolicyTests(unittest.TestCase):
         derived = _allowed_file_tool_paths_for_launch(
             request_payload={"allowed_file_tool_paths": []},
             allowed_output_paths=[
-                "workspace/plans/p/case.resolved.yaml",
+                "workspace/ir/p/spec.ir.yaml",
             ],
         )
         self.assertEqual(derived, [])
@@ -12117,7 +12264,7 @@ class DirectWritePathExtensionPolicyTests(unittest.TestCase):
         passes _is_direct_write_path (no extension → True). This leaked directory tokens
         into the manifest, enabling a prefix-match bypass of extension policy at terminal.
         """
-        src_dir = "workspace/pipelines/p/generate/gen_001/src/"
+        src_dir = "workspace/pipelines/p/source/src_001/src/"
         derived = _allowed_file_tool_paths_for_launch(
             request_payload={},
             allowed_output_paths=[
@@ -12125,7 +12272,7 @@ class DirectWritePathExtensionPolicyTests(unittest.TestCase):
                 "workspace/pipelines/p/lineage.json",  # CLI-managed: also excluded
             ],
         )
-        self.assertNotIn("workspace/pipelines/p/generate/gen_001/src", derived)
+        self.assertNotIn("workspace/pipelines/p/source/src_001/src", derived)
         self.assertNotIn("workspace/pipelines/p/lineage.json", derived)
         self.assertEqual(derived, [])
 
@@ -12150,6 +12297,7 @@ class TerminalUnauthorizedWriteDirectWriteTests(unittest.TestCase):
         )
 
         init_orchestration(repo_root=repo_root, orchestration_id=orchestration_id)
+        _mark_dependencies_ready(repo_root)
         cap_path = _capabilities_dir(repo_root, orchestration_id) / f"{agent_run_id}.json"
         cap_path.parent.mkdir(parents=True, exist_ok=True)
         cap_path.write_text(
@@ -12178,12 +12326,12 @@ class TerminalUnauthorizedWriteDirectWriteTests(unittest.TestCase):
             repo_root = Path(tmp)
             orch = "orch_term_dw_001"
             run_id = "step_run_term_dw_001"
-            yaml_rel = "workspace/plans/p/case.resolved.yaml"
+            yaml_rel = "workspace/ir/p/spec.ir.yaml"
             self._setup_step_run_state(
                 repo_root,
                 orchestration_id=orch,
                 agent_run_id=run_id,
-                write_roots=["workspace/plans/"],
+                write_roots=["workspace/ir/"],
                 allowed_output_paths=[yaml_rel],
                 allowed_file_tool_paths=[yaml_rel],
             )
@@ -12209,12 +12357,12 @@ class TerminalUnauthorizedWriteDirectWriteTests(unittest.TestCase):
             repo_root = Path(tmp)
             orch = "orch_term_dw_002"
             run_id = "step_run_term_dw_002"
-            yaml_rel = "workspace/plans/p/case.resolved.yaml"
+            yaml_rel = "workspace/ir/p/spec.ir.yaml"
             self._setup_step_run_state(
                 repo_root,
                 orchestration_id=orch,
                 agent_run_id=run_id,
-                write_roots=["workspace/plans/"],
+                write_roots=["workspace/ir/"],
                 allowed_output_paths=[yaml_rel],
                 allowed_file_tool_paths=[],
             )
@@ -12244,13 +12392,13 @@ class TerminalUnauthorizedWriteDirectWriteTests(unittest.TestCase):
             repo_root = Path(tmp)
             orch = "orch_term_dw_003"
             run_id = "step_run_term_dw_003"
-            a_rel = "workspace/pipelines/p/build/build_001/A.json"
-            b_rel = "workspace/pipelines/p/build/build_001/B.json"
+            a_rel = "workspace/pipelines/p/binary/bin_001/A.json"
+            b_rel = "workspace/pipelines/p/binary/bin_001/B.json"
             self._setup_step_run_state(
                 repo_root,
                 orchestration_id=orch,
                 agent_run_id=run_id,
-                write_roots=["workspace/pipelines/p/build/"],
+                write_roots=["workspace/pipelines/p/binary/"],
                 allowed_output_paths=[a_rel, b_rel],
                 allowed_file_tool_paths=[],
             )
@@ -12294,13 +12442,13 @@ class TerminalUnauthorizedWriteDirectWriteTests(unittest.TestCase):
             repo_root = Path(tmp)
             orch = "orch_term_dw_004"
             run_id = "step_run_term_dw_004"
-            allowed_rel = "workspace/pipelines/p/build/build_001/A.json"
-            unauthorized_rel = "workspace/pipelines/p/build/build_001/C.json"
+            allowed_rel = "workspace/pipelines/p/binary/bin_001/A.json"
+            unauthorized_rel = "workspace/pipelines/p/binary/bin_001/C.json"
             self._setup_step_run_state(
                 repo_root,
                 orchestration_id=orch,
                 agent_run_id=run_id,
-                write_roots=["workspace/pipelines/p/build/"],
+                write_roots=["workspace/pipelines/p/binary/"],
                 allowed_output_paths=[allowed_rel],
                 allowed_file_tool_paths=[],
             )
@@ -12346,12 +12494,12 @@ class TerminalUnauthorizedWriteDirectWriteTests(unittest.TestCase):
             repo_root = Path(tmp)
             orch = "orch_term_dw_005"
             run_id = "step_run_term_dw_005"
-            out_rel = "workspace/pipelines/p/build/build_001/A.json"
+            out_rel = "workspace/pipelines/p/binary/bin_001/A.json"
             self._setup_step_run_state(
                 repo_root,
                 orchestration_id=orch,
                 agent_run_id=run_id,
-                write_roots=["workspace/pipelines/p/build/"],
+                write_roots=["workspace/pipelines/p/binary/"],
                 allowed_output_paths=[out_rel],
                 allowed_file_tool_paths=[],
             )
@@ -12395,16 +12543,16 @@ class TerminalUnauthorizedWriteDirectWriteTests(unittest.TestCase):
             repo_root = Path(tmp)
             orch = "orch_term_dw_007"
             run_id = "step_run_term_dw_007"
-            src_dir = f"{_FIX_PIPE_REF}/generate/gen_20260508_001/src/"
+            src_dir = f"{_FIX_PIPE_REF}/source/src_20260508_001/src/"
             self._setup_step_run_state(
                 repo_root,
                 orchestration_id=orch,
                 agent_run_id=run_id,
-                write_roots=[f"{_FIX_PIPE_REF}/generate/"],
+                write_roots=[f"{_FIX_PIPE_REF}/source/"],
                 allowed_output_paths=[src_dir],
                 allowed_file_tool_paths=[],
             )
-            byproduct = repo_root / _FIX_PIPE_REF / "generate" / "gen_20260508_001" / "src" / "flux.mod"
+            byproduct = repo_root / _FIX_PIPE_REF / "generate" / "src_20260508_001" / "src" / "flux.mod"
             byproduct.parent.mkdir(parents=True, exist_ok=True)
             byproduct.write_text("MODULE flux\nEND MODULE\n", encoding="utf-8")
 
@@ -12428,16 +12576,16 @@ class TerminalUnauthorizedWriteDirectWriteTests(unittest.TestCase):
         run_id: str,
         src_files: dict[str, str],
     ) -> None:
-        src_dir = f"{_FIX_PIPE_REF}/generate/gen_20260508_001/src/"
+        src_dir = f"{_FIX_PIPE_REF}/source/src_20260508_001/src/"
         self._setup_step_run_state(
             repo_root,
             orchestration_id=orch,
             agent_run_id=run_id,
-            write_roots=[f"{_FIX_PIPE_REF}/generate/"],
+            write_roots=[f"{_FIX_PIPE_REF}/source/"],
             allowed_output_paths=[src_dir],
             allowed_file_tool_paths=[],
         )
-        base = repo_root / _FIX_PIPE_REF / "generate" / "gen_20260508_001" / "src"
+        base = repo_root / _FIX_PIPE_REF / "generate" / "src_20260508_001" / "src"
         base.mkdir(parents=True, exist_ok=True)
         for name, content in src_files.items():
             (base / name).write_text(content, encoding="utf-8")
@@ -12556,18 +12704,18 @@ class TerminalUnauthorizedWriteDirectWriteTests(unittest.TestCase):
             repo_root = Path(tmp)
             orch = "orch_dw_reg_001"
             run_id = "run_dw_reg_001"
-            src_dir_entry = f"{_FIX_PIPE_REF}/generate/gen_20260508_001/src/"
+            src_dir_entry = f"{_FIX_PIPE_REF}/source/src_20260508_001/src/"
             # Simulate the buggy manifest: directory path WITHOUT trailing slash in allowed_file_tool_paths
             self._setup_step_run_state(
                 repo_root,
                 orchestration_id=orch,
                 agent_run_id=run_id,
-                write_roots=[f"{_FIX_PIPE_REF}/generate/"],
+                write_roots=[f"{_FIX_PIPE_REF}/source/"],
                 allowed_output_paths=[src_dir_entry],
                 # Inject the buggy token directly — no trailing slash, looks like a path prefix
-                allowed_file_tool_paths=[f"{_FIX_PIPE_REF}/generate/gen_20260508_001/src"],
+                allowed_file_tool_paths=[f"{_FIX_PIPE_REF}/source/src_20260508_001/src"],
             )
-            forbidden = repo_root / _FIX_PIPE_REF / "generate" / "gen_20260508_001" / "src" / "config.json"
+            forbidden = repo_root / _FIX_PIPE_REF / "generate" / "src_20260508_001" / "src" / "config.json"
             forbidden.parent.mkdir(parents=True, exist_ok=True)
             forbidden.write_text('{"key": "value"}\n', encoding="utf-8")
 
@@ -12585,16 +12733,16 @@ class TerminalUnauthorizedWriteDirectWriteTests(unittest.TestCase):
             repo_root = Path(tmp)
             orch = "orch_dw_reg_002"
             run_id = "run_dw_reg_002"
-            src_dir_entry = f"{_FIX_PIPE_REF}/generate/gen_20260508_001/src/"
+            src_dir_entry = f"{_FIX_PIPE_REF}/source/src_20260508_001/src/"
             self._setup_step_run_state(
                 repo_root,
                 orchestration_id=orch,
                 agent_run_id=run_id,
-                write_roots=[f"{_FIX_PIPE_REF}/generate/"],
+                write_roots=[f"{_FIX_PIPE_REF}/source/"],
                 allowed_output_paths=[src_dir_entry],
-                allowed_file_tool_paths=[f"{_FIX_PIPE_REF}/generate/gen_20260508_001/src"],
+                allowed_file_tool_paths=[f"{_FIX_PIPE_REF}/source/src_20260508_001/src"],
             )
-            forbidden = repo_root / _FIX_PIPE_REF / "generate" / "gen_20260508_001" / "src" / "exploit.sh"
+            forbidden = repo_root / _FIX_PIPE_REF / "generate" / "src_20260508_001" / "src" / "exploit.sh"
             forbidden.parent.mkdir(parents=True, exist_ok=True)
             forbidden.write_text("#!/bin/sh\nrm -rf /\n", encoding="utf-8")
 
@@ -12612,12 +12760,12 @@ class TerminalUnauthorizedWriteDirectWriteTests(unittest.TestCase):
             repo_root = Path(tmp)
             orch = "orch_term_dw_006"
             run_id = "step_run_term_dw_006"
-            yaml_rel = "workspace/plans/p/case.resolved.yaml"
+            yaml_rel = "workspace/ir/p/spec.ir.yaml"
             self._setup_step_run_state(
                 repo_root,
                 orchestration_id=orch,
                 agent_run_id=run_id,
-                write_roots=["workspace/plans/"],
+                write_roots=["workspace/ir/"],
                 allowed_output_paths=[yaml_rel],
                 allowed_file_tool_paths=[yaml_rel],
             )
@@ -12645,8 +12793,8 @@ class LoadWriteRootsFromCapTests(unittest.TestCase):
         self._load = _load_write_roots_from_cap
 
     def test_trailing_slash_entry_normalized_as_directory(self) -> None:
-        result = self._load(["workspace/plans/"])
-        self.assertEqual(result, ["workspace/plans/"])
+        result = self._load(["workspace/ir/"])
+        self.assertEqual(result, ["workspace/ir/"])
 
     def test_extension_bearing_entry_kept_as_file_pin(self) -> None:
         result = self._load(["workspace/pipelines/a__b__1.0/lineage.json"])
@@ -12662,21 +12810,21 @@ class LoadWriteRootsFromCapTests(unittest.TestCase):
         result = self._load([
             "workspace/pipelines/a__b__1.0/pipe_001/src/Makefile",
             "workspace/pipelines/a__b__1.0/pipe_001/src/LICENSE",
-            "workspace/pipelines/a__b__1.0/pipe_001/generate/",
+            "workspace/pipelines/a__b__1.0/pipe_001/source/",
         ])
         self.assertEqual(result, [
             "workspace/pipelines/a__b__1.0/pipe_001/src/Makefile",
             "workspace/pipelines/a__b__1.0/pipe_001/src/LICENSE",
-            "workspace/pipelines/a__b__1.0/pipe_001/generate/",
+            "workspace/pipelines/a__b__1.0/pipe_001/source/",
         ])
 
     def test_empty_and_whitespace_entries_skipped(self) -> None:
-        result = self._load(["", "  ", None, 42, "workspace/plans/"])  # type: ignore[list-item]
-        self.assertEqual(result, ["workspace/plans/"])
+        result = self._load(["", "  ", None, 42, "workspace/ir/"])  # type: ignore[list-item]
+        self.assertEqual(result, ["workspace/ir/"])
 
     def test_non_list_input_returns_empty(self) -> None:
         self.assertEqual(self._load(None), [])
-        self.assertEqual(self._load("workspace/plans/"), [])
+        self.assertEqual(self._load("workspace/ir/"), [])
 
 
 class ApplyPatchGateCoverageExtensionTests(unittest.TestCase):
@@ -12701,13 +12849,14 @@ class ApplyPatchGateCoverageExtensionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
             init_orchestration(repo_root=repo_root, orchestration_id="orch_ext_001")
+            _mark_dependencies_ready(repo_root, "orch_ext_001")
             payload = self._make_payload(
                 agent_role="step",
                 agent_run_id="step_run_ext_001",
                 output_refs=[
-                    "workspace/plans/p/case.resolved.yaml",
-                    "workspace/plans/p/algorithm.summary.md",
-                    "workspace/pipelines/p/generate/g/src/main.f90",
+                    "workspace/ir/p/spec.ir.yaml",
+                    "workspace/ir/p/algorithm.summary.md",
+                    "workspace/pipelines/p/source/g/src/main.f90",
                 ],
             )
             _validate_apply_patch_gate_coverage(repo_root, "orch_ext_001", payload)
@@ -12718,12 +12867,13 @@ class ApplyPatchGateCoverageExtensionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
             init_orchestration(repo_root=repo_root, orchestration_id="orch_ext_002")
+            _mark_dependencies_ready(repo_root, "orch_ext_002")
             payload = self._make_payload(
                 agent_role="step",
                 agent_run_id="step_run_ext_002",
                 output_refs=[
-                    "workspace/plans/p/case.resolved.yaml",
-                    "workspace/plans/p/derived_contract.json",
+                    "workspace/ir/p/spec.ir.yaml",
+                    "workspace/ir/p/ir_meta.json",
                 ],
             )
             with self.assertRaisesRegex(
@@ -12737,20 +12887,21 @@ class ApplyPatchGateCoverageExtensionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
             init_orchestration(repo_root=repo_root, orchestration_id="orch_ext_003")
+            _mark_dependencies_ready(repo_root, "orch_ext_003")
             _write_apply_patch_gate_evidence(
                 repo_root,
                 orchestration_id="orch_ext_003",
                 agent_run_id="step_run_ext_003",
                 actor_role="step",
-                changed_paths=["workspace/plans/p/derived_contract.json"],
+                changed_paths=["workspace/ir/p/spec.ir.yaml"],
             )
             payload = self._make_payload(
                 agent_role="step",
                 agent_run_id="step_run_ext_003",
                 output_refs=[
-                    "workspace/plans/p/case.resolved.yaml",
-                    "workspace/plans/p/algorithm.summary.md",
-                    "workspace/plans/p/derived_contract.json",
+                    "workspace/ir/p/spec.ir.yaml",
+                    "workspace/ir/p/algorithm.summary.md",
+                    "workspace/ir/p/spec.ir.yaml",
                 ],
             )
             _validate_apply_patch_gate_coverage(repo_root, "orch_ext_003", payload)
@@ -12847,7 +12998,7 @@ class BwrapProfileFilePinTests(unittest.TestCase):
             repo_root = Path(tmp)
             orch = "orch_bwrap_fp_003"
             run_id = "run_bwrap_fp_003"
-            dotted_dir = "workspace/plans/v1.0/"
+            dotted_dir = "workspace/ir/v1.0/"
             self._write_cap_and_manifest(
                 repo_root, orchestration_id=orch, agent_run_id=run_id,
                 write_roots=[dotted_dir],
@@ -12859,7 +13010,7 @@ class BwrapProfileFilePinTests(unittest.TestCase):
                 backend_command="python3 agent.py",
             )
             # Must create the directory itself, not just its parent
-            dir_path = repo_root / "workspace" / "plans" / "v1.0"
+            dir_path = repo_root / "workspace" / "ir" / "v1.0"
             self.assertTrue(dir_path.is_dir(), "dotted directory write_root must be created as directory")
 
     def _save_profile(self, repo_root: Path, orchestration_id: str, agent_run_id: str, profile: dict) -> None:
@@ -13221,7 +13372,7 @@ class BwrapProfileFilePinTests(unittest.TestCase):
             pipeline_root = "workspace/pipelines/a__b__1.0/pipe_001"
             # generate step write_roots: generate/ dir + lineage.json file pin
             write_roots = [
-                f"{pipeline_root}/generate/",
+                f"{pipeline_root}/source/",
                 f"{pipeline_root}/lineage.json",
             ]
             self._write_cap_and_manifest(
@@ -13281,13 +13432,13 @@ class BwrapProfileFilePinTests(unittest.TestCase):
             orch = "orch_bwrap_sl_001"
             run_id = "run_bwrap_sl_001"
             # Create a symlink inside the repo that points outside
-            link_parent = repo_root / "workspace" / "plans"
+            link_parent = repo_root / "workspace" / "ir"
             link_parent.mkdir(parents=True, exist_ok=True)
             link_path = link_parent / "escape"
             os.symlink(outside, str(link_path))
             self._write_cap_and_manifest(
                 repo_root, orchestration_id=orch, agent_run_id=run_id,
-                write_roots=["workspace/plans/escape/"],
+                write_roots=["workspace/ir/escape/"],
             )
             with self.assertRaises(ValueError) as ctx:
                 build_bwrap_profile(
@@ -13462,14 +13613,14 @@ class PreWriteManifestExtensionPolicyTests(unittest.TestCase):
             run_id = "run_pw_ext_001"
             self._write_manifest(
                 repo_root, orchestration_id=orch, agent_run_id=run_id,
-                allowed_output_paths=["workspace/pipelines/a/generate/g_001/src/"],
+                allowed_output_paths=["workspace/pipelines/a/source/g_001/src/"],
             )
             # Must not raise
             _validate_paths_against_allowed_output_manifest(
                 repo_root,
                 orchestration_id=orch,
                 agent_run_id=run_id,
-                paths=["workspace/pipelines/a/generate/g_001/src/flux.f90"],
+                paths=["workspace/pipelines/a/source/g_001/src/flux.f90"],
             )
 
     def test_pre_write_rejects_makefile_under_directory_entry(self) -> None:
@@ -13482,14 +13633,14 @@ class PreWriteManifestExtensionPolicyTests(unittest.TestCase):
             run_id = "run_pw_ext_002"
             self._write_manifest(
                 repo_root, orchestration_id=orch, agent_run_id=run_id,
-                allowed_output_paths=["workspace/pipelines/a/generate/g_001/src/"],
+                allowed_output_paths=["workspace/pipelines/a/source/g_001/src/"],
             )
             with self.assertRaisesRegex(ValueError, "allowed_output_paths manifest violation"):
                 _validate_paths_against_allowed_output_manifest(
                     repo_root,
                     orchestration_id=orch,
                     agent_run_id=run_id,
-                    paths=["workspace/pipelines/a/generate/g_001/src/Makefile"],
+                    paths=["workspace/pipelines/a/source/g_001/src/Makefile"],
                 )
 
     def test_pre_write_rejects_script_under_directory_entry(self) -> None:
@@ -13501,14 +13652,14 @@ class PreWriteManifestExtensionPolicyTests(unittest.TestCase):
             run_id = "run_pw_ext_003"
             self._write_manifest(
                 repo_root, orchestration_id=orch, agent_run_id=run_id,
-                allowed_output_paths=["workspace/pipelines/a/generate/g_001/src/"],
+                allowed_output_paths=["workspace/pipelines/a/source/g_001/src/"],
             )
             with self.assertRaisesRegex(ValueError, "allowed_output_paths manifest violation"):
                 _validate_paths_against_allowed_output_manifest(
                     repo_root,
                     orchestration_id=orch,
                     agent_run_id=run_id,
-                    paths=["workspace/pipelines/a/generate/g_001/src/exploit.sh"],
+                    paths=["workspace/pipelines/a/source/g_001/src/exploit.sh"],
                 )
 
     def test_pre_write_rejects_unknown_extensionless_under_directory_entry(self) -> None:
@@ -13520,14 +13671,14 @@ class PreWriteManifestExtensionPolicyTests(unittest.TestCase):
             run_id = "run_pw_ext_004"
             self._write_manifest(
                 repo_root, orchestration_id=orch, agent_run_id=run_id,
-                allowed_output_paths=["workspace/pipelines/a/generate/g_001/src/"],
+                allowed_output_paths=["workspace/pipelines/a/source/g_001/src/"],
             )
             with self.assertRaisesRegex(ValueError, "allowed_output_paths manifest violation"):
                 _validate_paths_against_allowed_output_manifest(
                     repo_root,
                     orchestration_id=orch,
                     agent_run_id=run_id,
-                    paths=["workspace/pipelines/a/generate/g_001/src/myexe"],
+                    paths=["workspace/pipelines/a/source/g_001/src/myexe"],
                 )
 
     def test_pre_write_rejects_json_under_directory_entry(self) -> None:
@@ -13540,14 +13691,14 @@ class PreWriteManifestExtensionPolicyTests(unittest.TestCase):
             run_id = "run_pw_ext_005"
             self._write_manifest(
                 repo_root, orchestration_id=orch, agent_run_id=run_id,
-                allowed_output_paths=["workspace/pipelines/a/generate/g_001/src/"],
+                allowed_output_paths=["workspace/pipelines/a/source/g_001/src/"],
             )
             with self.assertRaisesRegex(ValueError, "allowed_output_paths manifest violation"):
                 _validate_paths_against_allowed_output_manifest(
                     repo_root,
                     orchestration_id=orch,
                     agent_run_id=run_id,
-                    paths=["workspace/pipelines/a/generate/g_001/src/results.json"],
+                    paths=["workspace/pipelines/a/source/g_001/src/results.json"],
                 )
 
     def test_pre_write_rejects_yaml_under_directory_entry(self) -> None:
@@ -13560,14 +13711,14 @@ class PreWriteManifestExtensionPolicyTests(unittest.TestCase):
             run_id = "run_pw_ext_006"
             self._write_manifest(
                 repo_root, orchestration_id=orch, agent_run_id=run_id,
-                allowed_output_paths=["workspace/pipelines/a/generate/g_001/src/"],
+                allowed_output_paths=["workspace/pipelines/a/source/g_001/src/"],
             )
             with self.assertRaisesRegex(ValueError, "allowed_output_paths manifest violation"):
                 _validate_paths_against_allowed_output_manifest(
                     repo_root,
                     orchestration_id=orch,
                     agent_run_id=run_id,
-                    paths=["workspace/pipelines/a/generate/g_001/src/config.yaml"],
+                    paths=["workspace/pipelines/a/source/g_001/src/config.yaml"],
                 )
 
     def test_pre_write_rejects_cmake_under_directory_entry(self) -> None:
@@ -13580,14 +13731,14 @@ class PreWriteManifestExtensionPolicyTests(unittest.TestCase):
             run_id = "run_pw_ext_007"
             self._write_manifest(
                 repo_root, orchestration_id=orch, agent_run_id=run_id,
-                allowed_output_paths=["workspace/pipelines/a/generate/g_001/src/"],
+                allowed_output_paths=["workspace/pipelines/a/source/g_001/src/"],
             )
             with self.assertRaisesRegex(ValueError, "allowed_output_paths manifest violation"):
                 _validate_paths_against_allowed_output_manifest(
                     repo_root,
                     orchestration_id=orch,
                     agent_run_id=run_id,
-                    paths=["workspace/pipelines/a/generate/g_001/src/CMakeLists.txt"],
+                    paths=["workspace/pipelines/a/source/g_001/src/CMakeLists.txt"],
                 )
 
     def test_pre_write_rejects_nml_under_directory_entry(self) -> None:
@@ -13600,14 +13751,14 @@ class PreWriteManifestExtensionPolicyTests(unittest.TestCase):
             run_id = "run_pw_ext_008"
             self._write_manifest(
                 repo_root, orchestration_id=orch, agent_run_id=run_id,
-                allowed_output_paths=["workspace/pipelines/a/generate/g_001/src/"],
+                allowed_output_paths=["workspace/pipelines/a/source/g_001/src/"],
             )
             with self.assertRaisesRegex(ValueError, "allowed_output_paths manifest violation"):
                 _validate_paths_against_allowed_output_manifest(
                     repo_root,
                     orchestration_id=orch,
                     agent_run_id=run_id,
-                    paths=["workspace/pipelines/a/generate/g_001/src/params.nml"],
+                    paths=["workspace/pipelines/a/source/g_001/src/params.nml"],
                 )
 
     def test_pre_write_rejects_object_file_under_directory_entry(self) -> None:
@@ -13620,14 +13771,14 @@ class PreWriteManifestExtensionPolicyTests(unittest.TestCase):
             run_id = "run_pw_ext_009"
             self._write_manifest(
                 repo_root, orchestration_id=orch, agent_run_id=run_id,
-                allowed_output_paths=["workspace/pipelines/a/generate/g_001/src/"],
+                allowed_output_paths=["workspace/pipelines/a/source/g_001/src/"],
             )
             with self.assertRaisesRegex(ValueError, "allowed_output_paths manifest violation"):
                 _validate_paths_against_allowed_output_manifest(
                     repo_root,
                     orchestration_id=orch,
                     agent_run_id=run_id,
-                    paths=["workspace/pipelines/a/generate/g_001/src/flux.o"],
+                    paths=["workspace/pipelines/a/source/g_001/src/flux.o"],
                 )
 
     def test_pre_write_rejects_module_file_under_directory_entry(self) -> None:
@@ -13640,14 +13791,14 @@ class PreWriteManifestExtensionPolicyTests(unittest.TestCase):
             run_id = "run_pw_ext_010"
             self._write_manifest(
                 repo_root, orchestration_id=orch, agent_run_id=run_id,
-                allowed_output_paths=["workspace/pipelines/a/generate/g_001/src/"],
+                allowed_output_paths=["workspace/pipelines/a/source/g_001/src/"],
             )
             with self.assertRaisesRegex(ValueError, "allowed_output_paths manifest violation"):
                 _validate_paths_against_allowed_output_manifest(
                     repo_root,
                     orchestration_id=orch,
                     agent_run_id=run_id,
-                    paths=["workspace/pipelines/a/generate/g_001/src/flux.mod"],
+                    paths=["workspace/pipelines/a/source/g_001/src/flux.mod"],
                 )
 
     def test_pre_write_rejects_archive_file_under_directory_entry(self) -> None:
@@ -13660,14 +13811,14 @@ class PreWriteManifestExtensionPolicyTests(unittest.TestCase):
             run_id = "run_pw_ext_011"
             self._write_manifest(
                 repo_root, orchestration_id=orch, agent_run_id=run_id,
-                allowed_output_paths=["workspace/pipelines/a/generate/g_001/src/"],
+                allowed_output_paths=["workspace/pipelines/a/source/g_001/src/"],
             )
             with self.assertRaisesRegex(ValueError, "allowed_output_paths manifest violation"):
                 _validate_paths_against_allowed_output_manifest(
                     repo_root,
                     orchestration_id=orch,
                     agent_run_id=run_id,
-                    paths=["workspace/pipelines/a/generate/g_001/src/libflux.a"],
+                    paths=["workspace/pipelines/a/source/g_001/src/libflux.a"],
                 )
 
 
@@ -13682,6 +13833,7 @@ class RecordTimeoutTests(unittest.TestCase):
             spec_ref="spec/problem/shallow_water2d/controlled_spec.md",
             source_dependency_ref="spec/problem/shallow_water2d/deps.yaml",
         )
+        _mark_dependencies_ready(repo_root, "orch_to_001")
         write_preflight(
             repo_root=repo_root,
             orchestration_id="orch_to_001",
@@ -13716,16 +13868,16 @@ class RecordTimeoutTests(unittest.TestCase):
                 "substep": "generate",
                 "orchestration_id": "orch_to_001",
                 "parent_agent_run_id": "orch_run_to_001",
-                "plan_ref": _FIX_PLAN_REF,
+                "ir_ref": _FIX_IR_REF,
                 "pipeline_ref": _FIX_PIPE_REF,
-                "dependency_ref": _FIX_PLAN_REF,
+                "dependency_ref": _FIX_IR_REF,
                 "skill_name": "workflow-generate-generate",
                 "skill_ref": "skills/workflow-generate-generate/SKILL.md",
                 "skill_must_read_refs": _fixture_skill_must_read_refs_substep(
                     "generate", "generate"
                 ),
                 "allowed_output_paths": [
-                    f"{_FIX_PIPE_REF}/generate/gen_001/generate_meta.json",
+                    f"{_FIX_PIPE_REF}/source/src_001/source_meta.json",
                 ],
                 "launch_prompt_full": render_launch_prompt_text({
                     "node_key": "problem/shallow_water2d@0.3.0",
@@ -13735,9 +13887,9 @@ class RecordTimeoutTests(unittest.TestCase):
                     "orchestration_id": "orch_to_001",
                     "parent_agent_run_id": "orch_run_to_001",
                     "workflow_mode": "dev",
-                    "plan_ref": _FIX_PLAN_REF,
+                    "ir_ref": _FIX_IR_REF,
                     "pipeline_ref": _FIX_PIPE_REF,
-                    "dependency_ref": _FIX_PLAN_REF,
+                    "dependency_ref": _FIX_IR_REF,
                     "skill_name": "workflow-generate-generate",
                     "skill_ref": "skills/workflow-generate-generate/SKILL.md",
                     "skill_must_read_refs": _fixture_skill_must_read_refs_substep(
@@ -13817,6 +13969,7 @@ class RecordTimeoutTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
             init_orchestration(repo_root=repo_root, orchestration_id="orch_to_002")
+            _mark_dependencies_ready(repo_root, "orch_to_002")
             with self.assertRaisesRegex(ValueError, "cannot find launch request"):
                 record_timeout(
                     repo_root=repo_root,
@@ -14171,6 +14324,7 @@ class RecordTimeoutTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
             init_orchestration(repo_root=repo_root, orchestration_id="orch_running_seed")
+            _mark_dependencies_ready(repo_root, "orch_running_seed")
             meta_path = (
                 repo_root / "workspace" / "orchestrations" / "orch_running_seed"
                 / "orchestration_meta.json"
@@ -14320,14 +14474,21 @@ class RecordTimeoutTests(unittest.TestCase):
                 repo_root / "workspace" / "orchestrations" / "orch_to_001"
                 / "agent_runs.jsonl"
             )
+            # Use a recent timestamp so the Adv-39 cleanup_pending TTL hasn't
+            # aged the arid into "truly terminated" yet — we want to assert the
+            # in-window behaviour (recovery helper preserved) explicitly.
+            from datetime import datetime as _dt, timezone as _tz, timedelta as _td
+            _now = _dt.now(_tz.utc)
+            _started = (_now - _td(minutes=10)).isoformat().replace("+00:00", "Z")
+            _finished = (_now - _td(minutes=1)).isoformat().replace("+00:00", "Z")
             with runs_path.open("a", encoding="utf-8") as fh:
                 fh.write(json.dumps({
                     "agent_run_id": arid,
                     "agent_role": "substep",
                     "agent_backend": "claude",
                     "status": "timeout",
-                    "started_at": "2026-05-09T08:00:00Z",
-                    "finished_at": "2026-05-09T09:00:00Z",
+                    "started_at": _started,
+                    "finished_at": _finished,
                 }) + "\n")
             # Crucially: no cleanup, no commit marker, tmp dir intact.
             self.assertTrue(recovery_helper.exists())
@@ -14421,8 +14582,8 @@ class RecordTimeoutTests(unittest.TestCase):
                         "result_summary": "should fail session_id check",
                         "output_refs": [
                             "workspace/pipelines/problem__shallow_water2d__0.3.0/"
-                            "shallow-water2d_20260415_001/generate/gen_001/"
-                            "generate_meta.json"
+                            "shallow-water2d_20260415_001/source/src_001/"
+                            "source_meta.json"
                         ],
                     },
                 )
@@ -14479,8 +14640,8 @@ class RecordTimeoutTests(unittest.TestCase):
                         "result_summary": "should fail sandbox check",
                         "output_refs": [
                             "workspace/pipelines/problem__shallow_water2d__0.3.0/"
-                            "shallow-water2d_20260415_001/generate/gen_001/"
-                            "generate_meta.json"
+                            "shallow-water2d_20260415_001/source/src_001/"
+                            "source_meta.json"
                         ],
                     },
                 )

@@ -1,5 +1,0 @@
-interface:
-  display_name: "Workflow Judge"
-  short_description: "Help with Workflow Judge tasks"
-  backend: "claude"
-  spawn_agent_tool: "Agent"

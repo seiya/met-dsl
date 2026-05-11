@@ -32,7 +32,7 @@ class HookCommonTests(unittest.TestCase):
 
     def test_validate_pipeline_semantics_stage_accepts_allowed_stage(self) -> None:
         out = validate_pipeline_semantics_stage(
-            step_key="execute",
+            step_key="validate",
             args_json={"stage": "post_execute"},
         )
         self.assertEqual(out, "post_execute")
@@ -40,14 +40,14 @@ class HookCommonTests(unittest.TestCase):
     def test_validate_pipeline_semantics_stage_rejects_forbidden_stage(self) -> None:
         with self.assertRaisesRegex(ValueError, "not permitted"):
             validate_pipeline_semantics_stage(
-                step_key="judge",
+                step_key="validate",
                 args_json={"stage": "post_build"},
             )
 
     def test_validate_pipeline_semantics_stage_rejects_pre_judge_allow_missing(self) -> None:
         with self.assertRaisesRegex(ValueError, "pre_judge forbids"):
             validate_pipeline_semantics_stage(
-                step_key="judge",
+                step_key="validate",
                 args_json={"stage": "pre_judge", "allow_missing_orchestration": True},
             )
 
@@ -1395,16 +1395,21 @@ class AutoReadToleratedTests(unittest.TestCase):
                 json.dumps({"allowed_read_roots": ["workspace/orchestrations/orch_ro/"], "denied_read_roots": []}),
                 encoding="utf-8",
             )
+            # Replace audit/ with a regular file. The persistence path tries
+            # `state_path.parent.mkdir(..., exist_ok=True)` first, which fails
+            # with FileExistsError/NotADirectoryError when the path exists as a
+            # file rather than a directory. This simulation reliably exercises
+            # the fail-closed branch regardless of the test runner's uid (root
+            # can bypass chmod-based read-only directories on POSIX).
             audit_dir = orch_root / "audit"
-            audit_dir.mkdir()
-            os.chmod(audit_dir, 0o500)
+            audit_dir.write_text("placeholder file blocking mkdir\n", encoding="utf-8")
             try:
                 decision = validate_read_access(
                     repo_root, "orch_ro", "run_orch", "MEMORY.md",
                     agent_role="orchestration",
                 )
             finally:
-                os.chmod(audit_dir, 0o700)
+                audit_dir.unlink(missing_ok=True)
             self.assertNotEqual(
                 (decision.audit_detail or {}).get("policy"),
                 "auto_read_expected_block",

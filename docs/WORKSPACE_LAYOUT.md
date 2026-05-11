@@ -108,34 +108,41 @@ workspace/
 │       # allowed_tmp_root は "workspace/tmp/<agent_run_id>" であり、
 │       # workspace/orchestrations/<orch>/tmp/... へ書くと output_manifest_write_guard で reject される。
 │
-├── plans/
+├── ir/
 │   └── <node_key_safe>/                           例: component__dynamics_shallow_water_flux_2d_rusanov_p0__0.1.0
-│       └── <plan_id>/                             例: flux-rsn-p0_20260510_001
-│           ├── case.resolved.yaml                 (plan/generate substep 出力)
-│           ├── algorithm.resolved.yaml            (同上)
-│           ├── impl.resolved.yaml                 (同上)
-│           ├── dependency.resolved.yaml           (同上)
-│           ├── algorithm.summary.md               (同上、閲覧専用)
-│           ├── derived_contract.json              (plan/verify substep 出力)
-│           └── plan_meta.json                     (plan/generate; verification_status は plan/verify)
+│       └── <ir_id>/                               例: flux-rsn-p0_20260510_001
+│           ├── spec.ir.yaml                       (Compile/generate substep 出力)
+│           │                                       # case / algorithm / impl_defaults / io_contract / dependency
+│           │                                       # の 5 セクションを統合保持する単一構造 IR
+│           └── ir_meta.json                       (Compile/generate; verification_status は Compile/verify)
 │
 └── pipelines/
     └── <node_key_safe>/
         └── <pipeline_id>/
-            ├── generate/
-            │   └── <generation_id>/
+            ├── source/
+            │   └── <source_id>/
             │       ├── src/                       (生成 source code、`mcp_command_log.jsonl` を含む)
-            │       └── generate_meta.json
-            ├── build/
-            │   └── <build_id>/
-            │       ├── (out-of-source build artifacts)
-            │       ├── build_meta.json            (source_generation_id を pin)
+            │       └── source_meta.json
+            ├── binary/
+            │   └── <binary_id>/
+            │       ├── bin/
+            │       ├── binary_meta.json           (source_source_id を pin)
             │       └── mcp_command_log.jsonl      (compile_project の MCP audit)
-            ├── execute/
-            │   └── <execution_id>/
-            │       └── ...                        (execute step output)
-            ├── judge/
-            │   └── ...
+            ├── runs/
+            │   └── <run_id>/                      (Validate phase output: execute + judge)
+            │       └── <node_key>/
+            │           ├── diagnostics.json
+            │           ├── perf.json
+            │           ├── quality_check.json
+            │           ├── raw/
+            │           ├── stdout.log
+            │           ├── stderr.log
+            │           ├── semantic_review.json
+            │           ├── verdict.json
+            │           ├── aggregate_verdict.json
+            │           ├── summary.json
+            │           ├── trial_meta.json
+            │           └── validate_meta.json
             └── lineage.json                       (phase 間の id 系譜)
 ```
 
@@ -169,11 +176,12 @@ workspace/
 
 | path | 生成 phase | 書き手 | 読み手 | 備考 |
 |---|---|---|---|---|
-| `workspace/plans/.../<plan_id>/algorithm.resolved.yaml` | plan/generate | substep agent (Edit/Write) | 後続 phase 全部 | `temporaries[].shape_expr` の表現規則は `spec/schema/plan/shape_expr.schema.json` |
-| `workspace/plans/.../<plan_id>/derived_contract.json` | plan/verify | substep agent (guarded-apply-patch) | generate 以降 | |
-| `workspace/plans/.../<plan_id>/plan_meta.json` | plan/generate / verify | substep agent (guarded-apply-patch) | runtime / validator | `verification_status` は verify が pass の時のみ付与 |
-| `workspace/pipelines/.../<pipeline_id>/generate/<gen>/src/` | generate | step/substep agent | 後続 phase | |
-| `workspace/pipelines/.../<pipeline_id>/build/<build_id>/build_meta.json` | build | step agent (guarded-apply-patch) | execute / validator | `source_generation_id` を pin |
+| `workspace/ir/.../<ir_id>/spec.ir.yaml` | Compile/generate | substep agent (Edit/Write) | Generate 以降全部 | 単一構造 IR。`temporaries[].shape_expr` 等の表現規則は `spec/schema/plan/shape_expr.schema.json` |
+| `workspace/ir/.../<ir_id>/ir_meta.json` | Compile/generate / verify | substep agent (guarded-apply-patch) | runtime / validator | `verification_status` は verify が pass の時のみ付与 |
+| `workspace/pipelines/.../<pipeline_id>/source/<source_id>/src/` | Generate | substep agent | 後続 phase | |
+| `workspace/pipelines/.../<pipeline_id>/source/<source_id>/source_meta.json` | Generate | substep agent (guarded-apply-patch) | Build / validator | |
+| `workspace/pipelines/.../<pipeline_id>/binary/<binary_id>/binary_meta.json` | Build | step agent (guarded-apply-patch) | Validate / validator | `source_source_id` を pin |
+| `workspace/pipelines/.../<pipeline_id>/runs/<run_id>/<node_key>/verdict.json` | Validate/judge | substep agent (guarded-apply-patch) | runtime / validator / 上位 node | |
 | `workspace/pipelines/.../<pipeline_id>/lineage.json` | 各 phase が追加 | (write-step-result 経由) | runtime / validator | phase id 系譜 |
 
 ## node_key_safe の生成規則

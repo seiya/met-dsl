@@ -14,9 +14,9 @@ import yaml
 from tools.validate_pipeline_semantics import (
     _BUNDLED_SHAPE_EXPR_SCHEMA_PATH,
     _validate_generate_lint_command_logs,
-    _validate_generate_meta_json_files,
+    _validate_source_meta_json_files,
     validate,
-    validate_plan_stage,
+    validate_compile_stage,
     validate_post_build_stage,
     validate_post_generate_stage,
 )
@@ -32,7 +32,7 @@ def _seed_shape_expr_schema_into(repo_root: Path) -> None:
     Idempotent — safe to invoke after `repo_root` is created and before
     any validate_*() call. Uses bytes copy so canonical-source equivalence
     is preserved (no JSON re-serialization drift)."""
-    target = repo_root / "spec" / "schema" / "plan" / "shape_expr.schema.json"
+    target = repo_root / "spec" / "schema" / "ir" / "shape_expr.schema.json"
     if target.is_file():
         return
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -45,11 +45,10 @@ def _write_json(path: Path, data: object) -> None:
 
 
 _STEP_PHASE_PATH = {
-    "plan": "docs/workflow/phases/phase_01_plan.md",
+    "compile": "docs/workflow/phases/phase_01_compile.md",
     "generate": "docs/workflow/phases/phase_02_generate.md",
     "build": "docs/workflow/phases/phase_03_build.md",
-    "execute": "docs/workflow/phases/phase_04_execute.md",
-    "judge": "docs/workflow/phases/phase_05_judge.md",
+    "validate": "docs/workflow/phases/phase_04_validate.md",
 }
 
 
@@ -65,9 +64,9 @@ def _step_prompt_fixture(orchestration_id: str, node_key: str, step: str, run_id
 orchestration_id: {orchestration_id}
 agent_run_id: {run_id}
 parent_agent_run_id: orch_run_001
-plan_ref: workspace/plans/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001
+ir_ref: workspace/ir/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001
 pipeline_ref: workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001
-dependency_ref: workspace/plans/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/dependency.resolved.yaml
+dependency_ref: workspace/ir/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/spec.ir.yaml
 skill_name: workflow-{step}
 skill_ref: skills/workflow-{step}/SKILL.md
 skill_must_read_refs: {refs}
@@ -95,9 +94,9 @@ def _substep_prompt_fixture(
 orchestration_id: {orchestration_id}
 agent_run_id: {run_id}
 parent_agent_run_id: orch_run_001
-plan_ref: workspace/plans/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001
+ir_ref: workspace/ir/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001
 pipeline_ref: workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001
-dependency_ref: workspace/plans/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/dependency.resolved.yaml
+dependency_ref: workspace/ir/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/spec.ir.yaml
 skill_name: workflow-{step}-{substep}
 skill_ref: skills/workflow-{step}-{substep}/SKILL.md
 skill_must_read_refs: {refs}
@@ -125,7 +124,7 @@ def _create_minimal_execution_tree(
     extra_sources: dict[str, str] | None = None,
     makefile_text: str | None = None,
     algorithm_contract: dict[str, object] | None = None,
-    derived_contract: dict[str, object] | None = None,
+    io_contract: dict[str, object] | None = None,
     dependency_resolved: dict[str, object] | None = None,
     impl_resolved: dict[str, object] | None = None,
     metrics_basis: object | None = None,
@@ -133,13 +132,13 @@ def _create_minimal_execution_tree(
     workspace = repo_root / "workspace"
     node_safe = "problem__shallow_water2d__0.3.0"
     pipeline_id = "shallow-water2d_20260415_001"
-    exec_id = "exe_test_001"
+    run_id = "run_test_001"
 
     pipeline_dir = workspace / "pipelines" / node_safe / pipeline_id
-    node_dir = pipeline_dir / "execute" / exec_id / "problem" / "shallow_water2d"
+    node_dir = pipeline_dir / "runs" / run_id / "problem" / "shallow_water2d"
     raw_dir = node_dir / "raw"
     snapshots_dir = raw_dir / "state_snapshots"
-    src_dir = pipeline_dir / "generate" / "gen_20260415_001" / "src"
+    src_dir = pipeline_dir / "source" / "src_20260415_001" / "src"
     # Canonical placement for in-phase MCP audit log: sibling of trial_meta.
     log_path = node_dir / "mcp_command_log.jsonl"
 
@@ -148,13 +147,13 @@ def _create_minimal_execution_tree(
         {
             "node_key": "problem/shallow_water2d@0.3.0",
             "pipeline_id": pipeline_id,
-            "plan_ref": "workspace/plans/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001",
-            "dependency_ref": "workspace/plans/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/dependency.resolved.yaml",
+            "ir_ref": "workspace/ir/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001",
+            "dependency_ref": "workspace/ir/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/spec.ir.yaml",
         },
     )
     lint_command_id = "lint_cmd_fixture_001"
     rel_lint_log = (
-        f"workspace/pipelines/{node_safe}/{pipeline_id}/generate/gen_20260415_001/src/mcp_command_log.jsonl"
+        f"workspace/pipelines/{node_safe}/{pipeline_id}/source/src_20260415_001/src/mcp_command_log.jsonl"
     )
     if dependency_resolved is None:
         dependency_resolved = {
@@ -164,11 +163,7 @@ def _create_minimal_execution_tree(
             "topo_level": 1,
         }
     _write_json(
-        workspace / "plans" / "problem__shallow_water2d__0.3.0" / "shallow-water2d_20260415_001" / "dependency.resolved.yaml",
-        dependency_resolved,
-    )
-    _write_json(
-        workspace / "plans" / "problem__shallow_water2d__0.3.0" / "shallow-water2d_20260415_001" / "plan_meta.json",
+        workspace / "ir" / "problem__shallow_water2d__0.3.0" / "shallow-water2d_20260415_001" / "ir_meta.json",
         {
             "attempt_count": 1,
             "verification_status": "pass",
@@ -209,29 +204,27 @@ def _create_minimal_execution_tree(
                 "fallback_policy": "fail_closed",
             },
         }
-    _write_json(
-        workspace / "plans" / "problem__shallow_water2d__0.3.0" / "shallow-water2d_20260415_001" / "algorithm.resolved.yaml",
-        algorithm_contract,
-    )
-    if derived_contract is None:
-        derived_contract = {
-            "io_contract": {
-                "inputs": [
-                    {
-                        "name": "case_resolved",
-                        "source": "case.resolved.yaml",
-                        "evidence_ref": "case.resolved.yaml",
-                    }
-                ],
-                "outputs": [
-                    {
-                        "name": "metric",
-                        "shape_expr": "scalar",
-                        "evidence_ref": "raw/metrics_basis.json",
-                        "raw_variables": ["h", "hu", "hv", "time"],
-                    }
-                ],
-            },
+    if io_contract is None:
+        # New IR: spec.ir.yaml.io_contract holds inputs / outputs /
+        # semantic_dependency / raw_requirements / test_evidence_requirements
+        # as siblings (the legacy `io_contract` wrapper that derived_contract.json
+        # used is dropped).
+        io_contract = {
+            "inputs": [
+                {
+                    "name": "case_resolved",
+                    "source": "spec.ir.yaml",
+                    "evidence_ref": "spec.ir.yaml",
+                }
+            ],
+            "outputs": [
+                {
+                    "name": "metric",
+                    "shape_expr": "scalar",
+                    "evidence_ref": "raw/metrics_basis.json",
+                    "raw_variables": ["h", "hu", "hv", "time"],
+                }
+            ],
             "semantic_dependency": {"required_sources": []},
             "raw_requirements": {
                 "required_evidence": [
@@ -254,10 +247,6 @@ def _create_minimal_execution_tree(
                 ]
             },
         }
-    _write_json(
-        workspace / "plans" / "problem__shallow_water2d__0.3.0" / "shallow-water2d_20260415_001" / "derived_contract.json",
-        derived_contract,
-    )
     if impl_resolved is None:
         impl_resolved = {
             "target": {
@@ -280,9 +269,19 @@ def _create_minimal_execution_tree(
             },
             "backend_overrides": [],
         }
+
+    # Merge all 5 sections into a single spec.ir.yaml. The new IR design puts
+    # algorithm / io_contract / impl_defaults / dependency under their own
+    # top-level keys; case is optional here.
+    spec_ir_doc: dict[str, object] = {
+        "algorithm": algorithm_contract,
+        "io_contract": io_contract,
+        "impl_defaults": impl_resolved,
+        "dependency": dependency_resolved,
+    }
     _write_json(
-        workspace / "plans" / "problem__shallow_water2d__0.3.0" / "shallow-water2d_20260415_001" / "impl.resolved.yaml",
-        impl_resolved,
+        workspace / "ir" / "problem__shallow_water2d__0.3.0" / "shallow-water2d_20260415_001" / "spec.ir.yaml",
+        spec_ir_doc,
     )
 
     _write_json(node_dir / "diagnostics.json", {"metric": 1.0})
@@ -344,8 +343,8 @@ def _create_minimal_execution_tree(
     # Plant a build directory + binary so trial_meta.source_build_id resolves
     # under <pipeline>/build/<id>/bin/ and run_program executable validation
     # binds to the declared build.
-    build_id_for_fixture = "build_20260415_001"
-    build_bin_dir = pipeline_dir / "build" / build_id_for_fixture / "bin"
+    build_id_for_fixture = "bin_20260415_001"
+    build_bin_dir = pipeline_dir / "binary" / build_id_for_fixture / "bin"
     build_bin_dir.mkdir(parents=True, exist_ok=True)
     (build_bin_dir / "simulate").write_text("binary\n", encoding="utf-8")
     log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -366,10 +365,10 @@ def _create_minimal_execution_tree(
     _write_json(
         node_dir / "trial_meta.json",
         {
-            "generated_by_stage": "execute",
-            "source_execution_id": exec_id,
-            "source_generation_id": "gen_20260415_001",
-            "source_build_id": build_id_for_fixture,
+            "generated_by_stage": "validate",
+            "source_run_id": run_id,
+            "source_source_id": "src_20260415_001",
+            "source_binary_id": build_id_for_fixture,
             "source_command_ref": {
                 "run_threads_1": {
                     "command_id": command_id,
@@ -422,7 +421,7 @@ shallow_water2d_runner.o: shallow_water2d_runner.f90 shallow_water2d_model.mod
         encoding="utf-8",
     )
     _write_json(
-        pipeline_dir / "generate" / "gen_20260415_001" / "generate_meta.json",
+        pipeline_dir / "source" / "src_20260415_001" / "source_meta.json",
         {
             "attempt_count": 1,
             "verification_status": "pass",
@@ -494,14 +493,15 @@ def _create_minimal_orchestration_tree(
         },
     )
     step_ids = {
-        step: f"step_run_{step}_001" for step in ("build", "execute", "judge")
+        step: f"step_run_{step}_001" for step in ("build",)
     }
     substep_ids = {
-        "plan": ["substep_run_plan_generate_001", "substep_run_plan_verify_001"],
+        "compile": ["substep_run_compile_generate_001", "substep_run_compile_verify_001"],
         "generate": ["substep_run_generate_generate_001", "substep_run_generate_verify_001"],
+        "validate": ["substep_run_validate_execute_001", "substep_run_validate_judge_001"],
     }
     graph_data = {"edges": []}
-    for step in ("build", "execute", "judge"):
+    for step in ("build",):
         graph_data["edges"].append(
             {
                 "parent_agent_run_id": "orch_run_001",
@@ -531,7 +531,7 @@ def _create_minimal_orchestration_tree(
             "finished_at": "2026-03-01T00:10:00Z",
         }
     ]
-    for step in ("build", "execute", "judge"):
+    for step in ("build",):
         step_request_ref = f"workspace/orchestrations/{orchestration_id}/launches/{step_ids[step]}.request.json"
         step_response_ref = f"workspace/orchestrations/{orchestration_id}/launches/{step_ids[step]}.response.json"
         step_prompt_ref = f"workspace/orchestrations/{orchestration_id}/launches/{step_ids[step]}.prompt.txt"
@@ -691,7 +691,7 @@ def _create_minimal_orchestration_tree(
                 },
             )
             (substep_agent_dir / "agent.summary.txt").write_text(
-                f"agent_run_id: {substep_id}\nstatus: pass\noutput_refs:\n- workspace/plans/{node_safe}/plan_{step}_{idx}\n",
+                f"agent_run_id: {substep_id}\nstatus: pass\noutput_refs:\n- workspace/ir/{node_safe}/plan_{step}_{idx}\n",
                 encoding="utf-8",
             )
             run_items.append(substep_payload)
@@ -700,7 +700,7 @@ def _create_minimal_orchestration_tree(
         encoding="utf-8",
     )
 
-    for step in ("plan", "generate"):
+    for step in ("compile", "generate", "validate"):
         _write_json(
             orchestration_root
             / "steps"
@@ -717,7 +717,7 @@ def _create_minimal_orchestration_tree(
             },
         )
 
-    for step in ("build", "execute", "judge"):
+    for step in ("build",):
         _write_json(
             orchestration_root
             / "steps"
@@ -769,7 +769,7 @@ end program shallow_water2d_runner
                 dep_spec_id="dynamics_shallow_water_flux_2d_rusanov_p0",
                 model_text=model_text,
                 runner_text=runner_text,
-                run_command=["./simulate", "workspace/case.resolved.yaml", "workspace/outdir"],
+                run_command=["./simulate", "workspace/spec.ir.yaml", "workspace/outdir"],
             )
 
             empty_node_dir = (
@@ -778,7 +778,7 @@ end program shallow_water2d_runner
                 / "pipelines"
                 / "problem__shallow_water2d__0.3.0"
                 / "problem__shallow_water2d__0.3.0_empty_pipeline"
-                / "execute"
+                / "runs"
                 / "exe_empty_001"
                 / "problem"
                 / "shallow_water2d"
@@ -822,7 +822,7 @@ end program shallow_water2d_runner
             self.assertTrue(any("missing dependency module use" in v for v in violations))
             self.assertTrue(any("missing dependency operation call" in v for v in violations))
             self.assertTrue(any("forbidden runner output write detected" in v for v in violations))
-            self.assertTrue(any("must include case.resolved.yaml" in v for v in violations))
+            self.assertTrue(any("must include spec.ir.yaml" in v for v in violations))
 
     def test_passes_with_dependency_use_and_case_input(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -848,7 +848,7 @@ end program shallow_water2d_runner
                 dep_spec_id="dynamics_shallow_water_flux_2d_rusanov_p0",
                 model_text=model_text,
                 runner_text=runner_text,
-                run_command=["./simulate", "workspace/case.resolved.yaml", "workspace/outdir"],
+                run_command=["./simulate", "workspace/spec.ir.yaml", "workspace/outdir"],
             )
 
             violations = validate(repo_root=repo_root, workspace_root="workspace")
@@ -865,7 +865,7 @@ end program shallow_water2d_runner
         This test asserts:
           (a) snapshot_schema.json with `state_variables` shorthand fails
               validation with a specific 'shorthand is not supported' message;
-          (b) derived_contract.json with the same shorthand also fails with
+          (b) spec.ir.yaml with the same shorthand also fails with
               the parallel violation on `raw_requirements.required_evidence`;
           (c) the shape-validation path is no longer disabled — `_shape_matches_expr`
               has no sentinel bypass."""
@@ -892,7 +892,7 @@ end program shallow_water2d_runner
                 dep_spec_id="dynamics_shallow_water_flux_2d_rusanov_p0",
                 model_text=model_text,
                 runner_text=runner_text,
-                run_command=["./simulate", "workspace/case.resolved.yaml", "workspace/outdir"],
+                run_command=["./simulate", "workspace/spec.ir.yaml", "workspace/outdir"],
             )
 
             workspace = repo_root / "workspace"
@@ -900,7 +900,7 @@ end program shallow_water2d_runner
             pipeline_id = "shallow-water2d_20260415_001"
             snapshots_dir = (
                 workspace / "pipelines" / node_safe / pipeline_id
-                / "execute" / "exe_test_001" / "problem" / "shallow_water2d"
+                / "runs" / "run_test_001" / "problem" / "shallow_water2d"
                 / "raw" / "state_snapshots"
             )
             (snapshots_dir / "snapshot_schema.json").write_text(
@@ -912,11 +912,12 @@ end program shallow_water2d_runner
                 encoding="utf-8",
             )
             derived_path = (
-                workspace / "plans" / node_safe / "shallow-water2d_20260415_001"
-                / "derived_contract.json"
+                workspace / "ir" / node_safe / "shallow-water2d_20260415_001"
+                / "spec.ir.yaml"
             )
             derived = json.loads(derived_path.read_text(encoding="utf-8"))
-            for entry in derived["raw_requirements"]["required_evidence"]:
+            io = derived.get("io_contract", derived)
+            for entry in io["raw_requirements"]["required_evidence"]:
                 if entry.get("artifact") == "state_snapshots":
                     entry["schema"] = {
                         "state_variables": ["h", "hu", "hv"],
@@ -935,14 +936,14 @@ end program shallow_water2d_runner
                 ),
                 f"Expected snapshot_schema shorthand rejection; got: {violations}",
             )
-            # (b) derived_contract rejected
+            # (b) io_contract rejected
             self.assertTrue(
                 any(
-                    "derived_contract.json" in v
+                    "spec.ir.yaml" in v
                     and "must not use 'state_variables' shorthand" in v
                     for v in violations
                 ),
-                f"Expected derived_contract shorthand rejection; got: {violations}",
+                f"Expected io_contract shorthand rejection; got: {violations}",
             )
 
     def test_shape_expr_schema_cache_invalidates_on_file_mtime_change(self) -> None:
@@ -962,7 +963,7 @@ end program shallow_water2d_runner
         )
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
-            sd = repo_root / "spec" / "schema" / "plan"
+            sd = repo_root / "spec" / "schema" / "ir"
             sd.mkdir(parents=True)
             schema_path = sd / "shape_expr.schema.json"
             # Initial schema: integer-only list form (rejects identifiers).
@@ -1033,7 +1034,7 @@ end program shallow_water2d_runner
         # (a) Probe-based: identifier-only list-form schema, no metadata.
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
-            sd = repo_root / "spec" / "schema" / "plan"
+            sd = repo_root / "spec" / "schema" / "ir"
             sd.mkdir(parents=True)
             schema = {
                 "oneOf": [
@@ -1059,7 +1060,7 @@ end program shallow_water2d_runner
         # 2+ char identifier) but author asserts it is list-form.
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
-            sd = repo_root / "spec" / "schema" / "plan"
+            sd = repo_root / "spec" / "schema" / "ir"
             sd.mkdir(parents=True)
             schema = {
                 "oneOf": [
@@ -1086,7 +1087,7 @@ end program shallow_water2d_runner
         # `x-shape-form` for disambiguation.
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
-            sd = repo_root / "spec" / "schema" / "plan"
+            sd = repo_root / "spec" / "schema" / "ir"
             sd.mkdir(parents=True)
             broken = {
                 "oneOf": [
@@ -1128,7 +1129,7 @@ end program shallow_water2d_runner
         for label, content, expected_msg_fragment in cases:
             with tempfile.TemporaryDirectory() as tmp:
                 repo = Path(tmp)
-                sd = repo / "spec" / "schema" / "plan"
+                sd = repo / "spec" / "schema" / "ir"
                 sd.mkdir(parents=True)
                 (sd / "shape_expr.schema.json").write_text(content, encoding="utf-8")
                 _load_shape_expr_patterns_cached.cache_clear()
@@ -1179,7 +1180,7 @@ end program shallow_water2d_runner
         # Repo-local schema with extended dim-token grammar must work.
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp)
-            sd = repo / "spec" / "schema" / "plan"
+            sd = repo / "spec" / "schema" / "ir"
             sd.mkdir(parents=True)
             schema = {
                 "oneOf": [
@@ -1220,7 +1221,7 @@ end program shallow_water2d_runner
         # Case A: localized titles, structurally valid regexes → must load.
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
-            sd = repo_root / "spec" / "schema" / "plan"
+            sd = repo_root / "spec" / "schema" / "ir"
             sd.mkdir(parents=True)
             schema = {
                 "oneOf": [
@@ -1246,7 +1247,7 @@ end program shallow_water2d_runner
         # offending pattern so operators can repair it.
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
-            sd = repo_root / "spec" / "schema" / "plan"
+            sd = repo_root / "spec" / "schema" / "ir"
             sd.mkdir(parents=True)
             broken = {
                 "oneOf": [
@@ -1364,7 +1365,7 @@ end module aux_model
                 dep_spec_id="dynamics_shallow_water_flux_2d_rusanov_p0",
                 model_text=model_text,
                 runner_text=runner_text,
-                run_command=["./simulate", "workspace/case.resolved.yaml", "workspace/outdir"],
+                run_command=["./simulate", "workspace/spec.ir.yaml", "workspace/outdir"],
                 extra_sources={"aux_model.f90": aux_model_text},
             )
 
@@ -1395,7 +1396,7 @@ end program shallow_water2d_runner
                 dep_spec_id="dynamics_shallow_water_flux_2d_rusanov_p0",
                 model_text=model_text,
                 runner_text=runner_text,
-                run_command=["./simulate", "workspace/case.resolved.yaml", "workspace/outdir"],
+                run_command=["./simulate", "workspace/spec.ir.yaml", "workspace/outdir"],
                 dependency_resolved={
                     "node_key": "problem/shallow_water2d@0.3.0",
                     "direct_deps": ["component/dynamics_shallow_water_flux_2d_rusanov_p0@0.1.0"],
@@ -1467,7 +1468,7 @@ end program shallow_water2d_runner
                 dep_spec_id="dynamics_shallow_water_flux_2d_rusanov_p0",
                 model_text=model_text,
                 runner_text=runner_text,
-                run_command=["./simulate", "workspace/case.resolved.yaml", "workspace/outdir"],
+                run_command=["./simulate", "workspace/spec.ir.yaml", "workspace/outdir"],
             )
 
             violations = validate(repo_root=repo_root, workspace_root="workspace")
@@ -1504,11 +1505,11 @@ end program shallow_water2d_runner
                 dep_spec_id="dynamics_shallow_water_flux_2d_rusanov_p0",
                 model_text=model_text,
                 runner_text=runner_text,
-                run_command=["./simulate", "workspace/case.resolved.yaml", "workspace/outdir"],
+                run_command=["./simulate", "workspace/spec.ir.yaml", "workspace/outdir"],
             )
             perf_path = (
                 repo_root
-                / "workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/execute/exe_test_001/problem/shallow_water2d/perf.json"
+                / "workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/runs/run_test_001/problem/shallow_water2d/perf.json"
             )
             perf_path.write_text('{"walltime_sec":.000002}\n', encoding="utf-8")
 
@@ -1547,7 +1548,7 @@ end program shallow_water2d_runner
                 dep_spec_id="dynamics_shallow_water_flux_2d_rusanov_p0",
                 model_text=model_text,
                 runner_text=runner_text,
-                run_command=["./simulate", "workspace/case.resolved.yaml", "workspace/outdir"],
+                run_command=["./simulate", "workspace/spec.ir.yaml", "workspace/outdir"],
             )
 
             violations = validate(repo_root=repo_root, workspace_root="workspace")
@@ -1589,7 +1590,7 @@ end program shallow_water2d_runner
                 dep_spec_id="dynamics_shallow_water_flux_2d_rusanov_p0",
                 model_text=model_text,
                 runner_text=runner_text,
-                run_command=["./simulate", "workspace/case.resolved.yaml", "workspace/outdir"],
+                run_command=["./simulate", "workspace/spec.ir.yaml", "workspace/outdir"],
             )
 
             violations = validate(repo_root=repo_root, workspace_root="workspace")
@@ -1621,7 +1622,7 @@ end program shallow_water2d_runner
                 dep_spec_id="dynamics_shallow_water_flux_2d_rusanov_p0",
                 model_text=model_text,
                 runner_text=runner_text,
-                run_command=["./simulate", "workspace/case.resolved.yaml", "workspace/outdir"],
+                run_command=["./simulate", "workspace/spec.ir.yaml", "workspace/outdir"],
                 algorithm_contract={
                     "algorithm_id": "broken_algorithm",
                     "execution_mode": "sequence",
@@ -1694,13 +1695,12 @@ end program shallow_water2d_runner
                         "fallback_policy": "fail_closed",
                     },
                 },
-                derived_contract={
-                    "io_contract": {
-                        "inputs": [
+                io_contract={
+                    "inputs": [
                             {
                                 "name": "case_resolved",
-                                "source": "case.resolved.yaml",
-                                "evidence_ref": "case.resolved.yaml",
+                                "source": "spec.ir.yaml",
+                                "evidence_ref": "spec.ir.yaml",
                             }
                         ],
                         "outputs": [
@@ -1711,7 +1711,6 @@ end program shallow_water2d_runner
                                 "raw_variables": ["h", "hu", "hv", "time"],
                             }
                         ],
-                    },
                     "semantic_dependency": {"required_sources": []},
                     "raw_requirements": {
                         "required_evidence": [
@@ -1743,10 +1742,10 @@ end program shallow_water2d_runner
                     },
                 },
             )
-            violations = validate_plan_stage(
+            violations = validate_compile_stage(
                 repo_root,
                 "workspace",
-                "workspace/plans/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001",
+                "workspace/ir/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001",
             )
             self.assertTrue(
                 any("bogus_var" in v and "undefined binding" in v for v in violations),
@@ -1805,7 +1804,7 @@ shallow_water2d_runner.o: shallow_water2d_runner.f90 shallow_water2d_model.mod
                 dep_spec_id=dep_spec_id,
                 model_text=model_text,
                 runner_text=runner_text,
-                run_command=["./simulate", "workspace/case.resolved.yaml", "workspace/outdir"],
+                run_command=["./simulate", "workspace/spec.ir.yaml", "workspace/outdir"],
                 extra_sources={
                     "dynamics_shallow_water_flux_2d_rusanov_p0_model.f90": dep_model_text
                 },
@@ -1841,7 +1840,7 @@ end program shallow_water2d_runner
                 dep_spec_id="dynamics_shallow_water_flux_2d_rusanov_p0",
                 model_text=model_text,
                 runner_text=runner_text,
-                run_command=["./simulate", "workspace/case.resolved.yaml", "workspace/outdir"],
+                run_command=["./simulate", "workspace/spec.ir.yaml", "workspace/outdir"],
             )
 
             review_path = (
@@ -1850,8 +1849,8 @@ end program shallow_water2d_runner
                 / "pipelines"
                 / "problem__shallow_water2d__0.3.0"
                 / "shallow-water2d_20260415_001"
-                / "execute"
-                / "exe_test_001"
+                / "runs"
+                / "run_test_001"
                 / "problem"
                 / "shallow_water2d"
                 / "semantic_review.json"
@@ -1893,7 +1892,7 @@ end program shallow_water2d_runner
                 dep_spec_id="dynamics_shallow_water_flux_2d_rusanov_p0",
                 model_text=model_text,
                 runner_text=runner_text,
-                run_command=["./simulate", "workspace/case.resolved.yaml", "workspace/outdir"],
+                run_command=["./simulate", "workspace/spec.ir.yaml", "workspace/outdir"],
             )
 
             violations = validate(repo_root=repo_root, workspace_root="workspace")
@@ -1925,10 +1924,9 @@ end program shallow_water2d_runner
                 dep_spec_id="dynamics_shallow_water_flux_2d_rusanov_p0",
                 model_text=model_text,
                 runner_text=runner_text,
-                run_command=["./simulate", "workspace/case.resolved.yaml", "workspace/outdir"],
-                derived_contract={
-                    "io_contract": {
-                        "inputs": [{"name": "case_resolved", "source": "case.resolved.yaml"}],
+                run_command=["./simulate", "workspace/spec.ir.yaml", "workspace/outdir"],
+                io_contract={
+                    "inputs": [{"name": "case_resolved", "source": "spec.ir.yaml"}],
                         "outputs": [
                             {
                                 "name": "metric",
@@ -1936,7 +1934,6 @@ end program shallow_water2d_runner
                                 "evidence_ref": "raw/metrics_basis.json",
                             }
                         ],
-                    },
                     "semantic_dependency": {"required_sources": []},
                     "raw_requirements": {
                         "required_evidence": [
@@ -1954,8 +1951,8 @@ end program shallow_water2d_runner
                 / "pipelines"
                 / "problem__shallow_water2d__0.3.0"
                 / "shallow-water2d_20260415_001"
-                / "execute"
-                / "exe_test_001"
+                / "runs"
+                / "run_test_001"
                 / "problem"
                 / "shallow_water2d"
             )
@@ -1997,12 +1994,10 @@ end program shallow_water2d_runner
                 dep_spec_id="dynamics_shallow_water_flux_2d_rusanov_p0",
                 model_text=model_text,
                 runner_text=runner_text,
-                run_command=["./simulate", "workspace/case.resolved.yaml", "workspace/outdir"],
-                derived_contract={
-                    "io_contract": {
-                        "inputs": [{"name": "case_resolved", "source": "case.resolved.yaml"}],
+                run_command=["./simulate", "workspace/spec.ir.yaml", "workspace/outdir"],
+                io_contract={
+                    "inputs": [{"name": "case_resolved", "source": "spec.ir.yaml"}],
                         "outputs": [],
-                    },
                     "semantic_dependency": {"required_sources": []},
                     "raw_requirements": {
                         "required_evidence": [
@@ -2042,7 +2037,7 @@ end program shallow_water2d_runner
                 dep_spec_id="dynamics_shallow_water_flux_2d_rusanov_p0",
                 model_text=model_text,
                 runner_text=runner_text,
-                run_command=["./simulate", "workspace/case.resolved.yaml", "workspace/outdir"],
+                run_command=["./simulate", "workspace/spec.ir.yaml", "workspace/outdir"],
             )
 
             node_dir = (
@@ -2051,8 +2046,8 @@ end program shallow_water2d_runner
                 / "pipelines"
                 / "problem__shallow_water2d__0.3.0"
                 / "shallow-water2d_20260415_001"
-                / "execute"
-                / "exe_test_001"
+                / "runs"
+                / "run_test_001"
                 / "problem"
                 / "shallow_water2d"
             )
@@ -2063,7 +2058,7 @@ end program shallow_water2d_runner
             # canonical log written by the fixture.
             qc_log_ref = (
                 "workspace/pipelines/problem__shallow_water2d__0.3.0/"
-                "shallow-water2d_20260415_001/generate/gen_20260415_001/src/"
+                "shallow-water2d_20260415_001/source/src_20260415_001/src/"
                 "mcp_command_log.jsonl"
             )
             trial_meta["source_command_ref"]["run_quality_checks"] = {
@@ -2071,7 +2066,7 @@ end program shallow_water2d_runner
                 "tool_name": "run_quality_checks",
                 "command_log_ref": qc_log_ref,
             }
-            trial_meta["source_generation_id"] = "gen_20260415_001"
+            trial_meta["source_source_id"] = "src_20260415_001"
             _write_json(trial_meta_path, trial_meta)
 
             qc_log_path = repo_root / qc_log_ref
@@ -2118,7 +2113,7 @@ end program shallow_water2d_runner
                 dep_spec_id="dynamics_shallow_water_flux_2d_rusanov_p0",
                 model_text=model_text,
                 runner_text=runner_text,
-                run_command=["./simulate", "workspace/case.resolved.yaml", "workspace/outdir"],
+                run_command=["./simulate", "workspace/spec.ir.yaml", "workspace/outdir"],
             )
 
             node_dir = (
@@ -2127,8 +2122,8 @@ end program shallow_water2d_runner
                 / "pipelines"
                 / "problem__shallow_water2d__0.3.0"
                 / "shallow-water2d_20260415_001"
-                / "execute"
-                / "exe_test_001"
+                / "runs"
+                / "run_test_001"
                 / "problem"
                 / "shallow_water2d"
             )
@@ -2138,15 +2133,15 @@ end program shallow_water2d_runner
                 / "pipelines"
                 / "problem__shallow_water2d__0.3.0"
                 / "shallow-water2d_20260415_001"
-                / "generate"
-                / "gen_20260415_001"
+                / "source"
+                / "src_20260415_001"
                 / "src"
             )
             trial_meta_path = node_dir / "trial_meta.json"
             trial_meta = json.loads(trial_meta_path.read_text(encoding="utf-8"))
             qc_log_ref = (
                 "workspace/pipelines/problem__shallow_water2d__0.3.0/"
-                "shallow-water2d_20260415_001/generate/gen_20260415_001/src/"
+                "shallow-water2d_20260415_001/source/src_20260415_001/src/"
                 "mcp_command_log.jsonl"
             )
             trial_meta["source_command_ref"]["run_quality_checks"] = {
@@ -2154,7 +2149,7 @@ end program shallow_water2d_runner
                 "tool_name": "run_quality_checks",
                 "command_log_ref": qc_log_ref,
             }
-            trial_meta["source_generation_id"] = "gen_20260415_001"
+            trial_meta["source_source_id"] = "src_20260415_001"
             _write_json(trial_meta_path, trial_meta)
 
             qc_log_path = repo_root / qc_log_ref
@@ -2202,7 +2197,7 @@ end program shallow_water2d_runner
                 dep_spec_id="dynamics_shallow_water_flux_2d_rusanov_p0",
                 model_text=model_text,
                 runner_text=runner_text,
-                run_command=["./simulate", "workspace/case.resolved.yaml", "workspace/outdir"],
+                run_command=["./simulate", "workspace/spec.ir.yaml", "workspace/outdir"],
                 makefile_text="""FC ?= gfortran
 OBJS = shallow_water2d_model.o shallow_water2d_runner.o
 
@@ -2223,8 +2218,8 @@ shallow_water2d_runner.o: shallow_water2d_runner.f90 shallow_water2d_model.mod
                 / "pipelines"
                 / "problem__shallow_water2d__0.3.0"
                 / "shallow-water2d_20260415_001"
-                / "execute"
-                / "exe_test_001"
+                / "runs"
+                / "run_test_001"
                 / "problem"
                 / "shallow_water2d"
             )
@@ -2234,15 +2229,15 @@ shallow_water2d_runner.o: shallow_water2d_runner.f90 shallow_water2d_model.mod
                 / "pipelines"
                 / "problem__shallow_water2d__0.3.0"
                 / "shallow-water2d_20260415_001"
-                / "generate"
-                / "gen_20260415_001"
+                / "source"
+                / "src_20260415_001"
                 / "src"
             )
             trial_meta_path = node_dir / "trial_meta.json"
             trial_meta = json.loads(trial_meta_path.read_text(encoding="utf-8"))
             qc_log_ref = (
                 "workspace/pipelines/problem__shallow_water2d__0.3.0/"
-                "shallow-water2d_20260415_001/generate/gen_20260415_001/src/"
+                "shallow-water2d_20260415_001/source/src_20260415_001/src/"
                 "mcp_command_log.jsonl"
             )
             trial_meta["source_command_ref"]["run_quality_checks"] = {
@@ -2250,7 +2245,7 @@ shallow_water2d_runner.o: shallow_water2d_runner.f90 shallow_water2d_model.mod
                 "tool_name": "run_quality_checks",
                 "command_log_ref": qc_log_ref,
             }
-            trial_meta["source_generation_id"] = "gen_20260415_001"
+            trial_meta["source_source_id"] = "src_20260415_001"
             _write_json(trial_meta_path, trial_meta)
 
             qc_log_path = repo_root / qc_log_ref
@@ -2298,7 +2293,7 @@ end program shallow_water2d_runner
                 dep_spec_id="dynamics_shallow_water_flux_2d_rusanov_p0",
                 model_text=model_text,
                 runner_text=runner_text,
-                run_command=["./simulate", "workspace/case.resolved.yaml", "workspace/outdir"],
+                run_command=["./simulate", "workspace/spec.ir.yaml", "workspace/outdir"],
             )
 
             node_dir = (
@@ -2307,8 +2302,8 @@ end program shallow_water2d_runner
                 / "pipelines"
                 / "problem__shallow_water2d__0.3.0"
                 / "shallow-water2d_20260415_001"
-                / "execute"
-                / "exe_test_001"
+                / "runs"
+                / "run_test_001"
                 / "problem"
                 / "shallow_water2d"
             )
@@ -2320,7 +2315,7 @@ end program shallow_water2d_runner
                     {
                         "command_id": "cmd_run_001",
                         "tool_name": "run_program",
-                        "command": ["./simulate", "workspace/case.resolved.yaml", "workspace/outdir"],
+                        "command": ["./simulate", "workspace/spec.ir.yaml", "workspace/outdir"],
                     },
                     ensure_ascii=False,
                 )
@@ -2368,13 +2363,12 @@ end program shallow_water2d_runner
                 dep_spec_id="dynamics_shallow_water_flux_2d_rusanov_p0",
                 model_text=model_text,
                 runner_text=runner_text,
-                run_command=["./simulate", "workspace/case.resolved.yaml", "workspace/outdir"],
-                derived_contract={
+                run_command=["./simulate", "workspace/spec.ir.yaml", "workspace/outdir"],
+                io_contract={
                     "source": {
                         "tests": "spec/problem/mock_domain/mock_family/mock_spec/tests.md"
                     },
-                    "io_contract": {
-                        "inputs": [{"name": "case_resolved", "source": "case.resolved.yaml"}],
+                    "inputs": [{"name": "case_resolved", "source": "spec.ir.yaml"}],
                         "outputs": [
                             {
                                 "name": "metric",
@@ -2382,7 +2376,6 @@ end program shallow_water2d_runner
                                 "evidence_ref": "raw/metrics_basis.json",
                             }
                         ],
-                    },
                     "semantic_dependency": {"required_sources": []},
                     "raw_requirements": {
                         "required_evidence": [
@@ -2399,8 +2392,8 @@ end program shallow_water2d_runner
                 / "pipelines"
                 / "problem__shallow_water2d__0.3.0"
                 / "shallow-water2d_20260415_001"
-                / "execute"
-                / "exe_test_001"
+                / "runs"
+                / "run_test_001"
                 / "problem"
                 / "shallow_water2d"
             )
@@ -2477,17 +2470,15 @@ end program shallow_water2d_runner
                 dep_spec_id="dynamics_shallow_water_flux_2d_rusanov_p0",
                 model_text=model_text,
                 runner_text=runner_text,
-                run_command=["./simulate", "workspace/case.resolved.yaml", "workspace/outdir"],
-                derived_contract={
+                run_command=["./simulate", "workspace/spec.ir.yaml", "workspace/outdir"],
+                io_contract={
                     "source": {
                         "tests": "spec/problem/dynamics/shallow_water/shallow_water2d/tests.md"
                     },
-                    "io_contract": {
-                        "inputs": [{"name": "case_resolved", "source": "case.resolved.yaml"}],
+                    "inputs": [{"name": "case_resolved", "source": "spec.ir.yaml"}],
                         "outputs": [
                             {"name": "metric_mass", "shape_expr": "scalar", "evidence_ref": "raw/metrics_basis.json"},
                         ],
-                    },
                     "semantic_dependency": {"required_sources": []},
                     "raw_requirements": {
                         "required_evidence": [
@@ -2524,8 +2515,8 @@ end program shallow_water2d_runner
                 / "pipelines"
                 / "problem__shallow_water2d__0.3.0"
                 / "shallow-water2d_20260415_001"
-                / "execute"
-                / "exe_test_001"
+                / "runs"
+                / "run_test_001"
                 / "problem"
                 / "shallow_water2d"
             )
@@ -2599,11 +2590,10 @@ end program shallow_water2d_runner
                 dep_spec_id="dynamics_shallow_water_flux_2d_rusanov_p0",
                 model_text=model_text,
                 runner_text=runner_text,
-                run_command=["./simulate", "workspace/case.resolved.yaml", "workspace/outdir"],
-                derived_contract={
+                run_command=["./simulate", "workspace/spec.ir.yaml", "workspace/outdir"],
+                io_contract={
                     "source": {"tests": "spec/problem/mock_domain/mock_family/mock_spec/tests.md"},
-                    "io_contract": {
-                        "inputs": [{"name": "case_resolved", "source": "case.resolved.yaml"}],
+                    "inputs": [{"name": "case_resolved", "source": "spec.ir.yaml"}],
                         "outputs": [
                             {
                                 "name": "metric",
@@ -2612,7 +2602,6 @@ end program shallow_water2d_runner
                                 "raw_variables": ["h", "hu", "hv", "time"],
                             }
                         ],
-                    },
                     "semantic_dependency": {"required_sources": []},
                     "raw_requirements": {
                         "required_evidence": [
@@ -2681,11 +2670,10 @@ end program shallow_water2d_runner
                 dep_spec_id="dynamics_shallow_water_flux_2d_rusanov_p0",
                 model_text=model_text,
                 runner_text=runner_text,
-                run_command=["./simulate", "workspace/case.resolved.yaml", "workspace/outdir"],
-                derived_contract={
+                run_command=["./simulate", "workspace/spec.ir.yaml", "workspace/outdir"],
+                io_contract={
                     "source": {"tests": "spec/problem/mock_domain/mock_family/mock_spec/tests.md"},
-                    "io_contract": {
-                        "inputs": [{"name": "case_resolved", "source": "case.resolved.yaml"}],
+                    "inputs": [{"name": "case_resolved", "source": "spec.ir.yaml"}],
                         "outputs": [
                             {
                                 "name": "metric",
@@ -2694,7 +2682,6 @@ end program shallow_water2d_runner
                                 "raw_variables": ["h", "time"],
                             }
                         ],
-                    },
                     "semantic_dependency": {"required_sources": []},
                     "raw_requirements": {
                         "required_evidence": [
@@ -2774,11 +2761,10 @@ end program shallow_water2d_runner
                 dep_spec_id="dynamics_shallow_water_flux_2d_rusanov_p0",
                 model_text=model_text,
                 runner_text=runner_text,
-                run_command=["./simulate", "workspace/case.resolved.yaml", "workspace/outdir"],
-                derived_contract={
+                run_command=["./simulate", "workspace/spec.ir.yaml", "workspace/outdir"],
+                io_contract={
                     "source": {"tests": "spec/problem/mock_domain/mock_family/mock_spec/tests.md"},
-                    "io_contract": {
-                        "inputs": [{"name": "case_resolved", "source": "case.resolved.yaml"}],
+                    "inputs": [{"name": "case_resolved", "source": "spec.ir.yaml"}],
                         "outputs": [
                             {
                                 "name": "metric",
@@ -2787,7 +2773,6 @@ end program shallow_water2d_runner
                                 "raw_variables": ["h", "time"],
                             }
                         ],
-                    },
                     "semantic_dependency": {"required_sources": []},
                     "raw_requirements": {
                         "required_evidence": [
@@ -2830,7 +2815,7 @@ end program shallow_water2d_runner
                 any("metrics_basis.json: test_id test_a missing required_raw_variables (['time'])" in v for v in violations)
             )
 
-    def test_detects_snapshot_shape_mismatch_against_derived_contract(self) -> None:
+    def test_detects_snapshot_shape_mismatch_against_io_contract(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
             _seed_shape_expr_schema_into(repo_root)
@@ -2854,7 +2839,7 @@ end program shallow_water2d_runner
                 dep_spec_id="dynamics_shallow_water_flux_2d_rusanov_p0",
                 model_text=model_text,
                 runner_text=runner_text,
-                run_command=["./simulate", "workspace/case.resolved.yaml", "workspace/outdir"],
+                run_command=["./simulate", "workspace/spec.ir.yaml", "workspace/outdir"],
             )
 
             snapshots_dir = (
@@ -2863,8 +2848,8 @@ end program shallow_water2d_runner
                 / "pipelines"
                 / "problem__shallow_water2d__0.3.0"
                 / "shallow-water2d_20260415_001"
-                / "execute"
-                / "exe_test_001"
+                / "runs"
+                / "run_test_001"
                 / "problem"
                 / "shallow_water2d"
                 / "raw"
@@ -2909,7 +2894,7 @@ end program shallow_water2d_runner
                 dep_spec_id="dynamics_shallow_water_flux_2d_rusanov_p0",
                 model_text=model_text,
                 runner_text=runner_text,
-                run_command=["./simulate", "workspace/case.resolved.yaml", "workspace/outdir"],
+                run_command=["./simulate", "workspace/spec.ir.yaml", "workspace/outdir"],
             )
 
             violations = validate(
@@ -2945,7 +2930,7 @@ end program shallow_water2d_runner
                 dep_spec_id="dynamics_shallow_water_flux_2d_rusanov_p0",
                 model_text=model_text,
                 runner_text=runner_text,
-                run_command=["./simulate", "workspace/case.resolved.yaml", "workspace/outdir"],
+                run_command=["./simulate", "workspace/spec.ir.yaml", "workspace/outdir"],
             )
             _create_minimal_orchestration_tree(repo_root)
 
@@ -2980,7 +2965,7 @@ end program shallow_water2d_runner
                 dep_spec_id="dynamics_shallow_water_flux_2d_rusanov_p0",
                 model_text=model_text,
                 runner_text=runner_text,
-                run_command=["./simulate", "workspace/case.resolved.yaml", "workspace/outdir"],
+                run_command=["./simulate", "workspace/spec.ir.yaml", "workspace/outdir"],
             )
             _create_minimal_orchestration_tree(repo_root)
 
@@ -3035,7 +3020,7 @@ end program shallow_water2d_runner
                 dep_spec_id="dynamics_shallow_water_flux_2d_rusanov_p0",
                 model_text=model_text,
                 runner_text=runner_text,
-                run_command=["./simulate", "workspace/case.resolved.yaml", "workspace/outdir"],
+                run_command=["./simulate", "workspace/spec.ir.yaml", "workspace/outdir"],
             )
             _create_minimal_orchestration_tree(repo_root)
 
@@ -3090,7 +3075,7 @@ end program shallow_water2d_runner
                 dep_spec_id="dynamics_shallow_water_flux_2d_rusanov_p0",
                 model_text=model_text,
                 runner_text=runner_text,
-                run_command=["./simulate", "workspace/case.resolved.yaml", "workspace/outdir"],
+                run_command=["./simulate", "workspace/spec.ir.yaml", "workspace/outdir"],
             )
             _create_minimal_orchestration_tree(repo_root)
 
@@ -3145,7 +3130,7 @@ end program shallow_water2d_runner
                 dep_spec_id="dynamics_shallow_water_flux_2d_rusanov_p0",
                 model_text=model_text,
                 runner_text=runner_text,
-                run_command=["./simulate", "workspace/case.resolved.yaml", "workspace/outdir"],
+                run_command=["./simulate", "workspace/spec.ir.yaml", "workspace/outdir"],
             )
             _create_minimal_orchestration_tree(repo_root)
 
@@ -3206,7 +3191,7 @@ end program shallow_water2d_runner
                 dep_spec_id="dynamics_shallow_water_flux_2d_rusanov_p0",
                 model_text=model_text,
                 runner_text=runner_text,
-                run_command=["./simulate", "workspace/case.resolved.yaml", "workspace/outdir"],
+                run_command=["./simulate", "workspace/spec.ir.yaml", "workspace/outdir"],
             )
             _create_minimal_orchestration_tree(repo_root)
 
@@ -3264,7 +3249,7 @@ end program shallow_water2d_runner
                 dep_spec_id="dynamics_shallow_water_flux_2d_rusanov_p0",
                 model_text=model_text,
                 runner_text=runner_text,
-                run_command=["./simulate", "workspace/case.resolved.yaml", "workspace/outdir"],
+                run_command=["./simulate", "workspace/spec.ir.yaml", "workspace/outdir"],
             )
             _create_minimal_orchestration_tree(repo_root)
 
@@ -3313,7 +3298,7 @@ end program shallow_water2d_runner
                 dep_spec_id="dynamics_shallow_water_flux_2d_rusanov_p0",
                 model_text=model_text,
                 runner_text=runner_text,
-                run_command=["./simulate", "workspace/case.resolved.yaml", "workspace/outdir"],
+                run_command=["./simulate", "workspace/spec.ir.yaml", "workspace/outdir"],
             )
             _create_minimal_orchestration_tree(repo_root)
 
@@ -3383,55 +3368,61 @@ end program shallow_water2d_runner
                 dep_spec_id="dynamics_shallow_water_flux_2d_rusanov_p0",
                 model_text=model_text,
                 runner_text=runner_text,
-                run_command=["./simulate", "workspace/case.resolved.yaml", "workspace/outdir"],
+                run_command=["./simulate", "workspace/spec.ir.yaml", "workspace/outdir"],
             )
             algorithm_path = (
                 repo_root
                 / "workspace"
-                / "plans"
+                / "ir"
                 / "problem__shallow_water2d__0.3.0"
                 / "shallow-water2d_20260415_001"
-                / "algorithm.resolved.yaml"
+                / "spec.ir.yaml"
             )
-            algorithm_path.write_text(
-                """algorithm_id: shallow_water2d_test_algorithm
-execution_mode: sequence
-ordering:
-  - compute_flux
-control_condition: always
-iteration_contract:
-  kind: none
-steps:
-  - step_id: compute_flux
-    step_kind: flux_compute
-    operation_ref: dynamics_shallow_water_flux_2d_rusanov_p0__compute_flux
-    inputs: [h, hu, hv]
-    outputs: [h, hu, hv]
-update_semantics:
-  state_variables:
-    - name: h
-      shape_expr: "[2,2]"
-    - name: hu
-      shape_expr: "[2,2]"
-    - name: hv
-      shape_expr: "[2,2]"
-  required_update_paths: [h, hu, hv]
-  diagnostics_from_state: true
-  fallback_policy: fail_closed
-temporaries: []
-derived_field_rules: []
-invariants: []
-splitting_policy:
-  kind: none
-""",
-                encoding="utf-8",
-            )
+            # Rewrite spec.ir.yaml as YAML (was JSON in test helper). The new
+            # IR-centric design requires the algorithm content nested under an
+            # `algorithm:` key inside spec.ir.yaml; preserve the other sections
+            # the helper wrote so the downstream validators have IR / impl_defaults
+            # / io_contract / dependency available.
+            import yaml  # noqa: F401  (validator uses pyyaml internally too)
+            existing = json.loads(algorithm_path.read_text(encoding="utf-8"))
+            algorithm_block = {
+                "algorithm_id": "shallow_water2d_test_algorithm",
+                "execution_mode": "sequence",
+                "ordering": ["compute_flux"],
+                "control_condition": "always",
+                "iteration_contract": {"kind": "none"},
+                "steps": [
+                    {
+                        "step_id": "compute_flux",
+                        "step_kind": "flux_compute",
+                        "operation_ref": "dynamics_shallow_water_flux_2d_rusanov_p0__compute_flux",
+                        "inputs": ["h", "hu", "hv"],
+                        "outputs": ["h", "hu", "hv"],
+                    }
+                ],
+                "update_semantics": {
+                    "state_variables": [
+                        {"name": "h", "shape_expr": "[2,2]"},
+                        {"name": "hu", "shape_expr": "[2,2]"},
+                        {"name": "hv", "shape_expr": "[2,2]"},
+                    ],
+                    "required_update_paths": ["h", "hu", "hv"],
+                    "diagnostics_from_state": True,
+                    "fallback_policy": "fail_closed",
+                },
+                "temporaries": [],
+                "derived_field_rules": [],
+                "invariants": [],
+                "splitting_policy": {"kind": "none"},
+            }
+            existing["algorithm"] = algorithm_block
+            algorithm_path.write_text(yaml.safe_dump(existing, sort_keys=False), encoding="utf-8")
 
             violations = validate(repo_root=repo_root, workspace_root="workspace")
             self.assertFalse(any("invalid yaml" in v for v in violations))
-            self.assertFalse(any("algorithm.resolved.yaml" in v for v in violations))
+            self.assertFalse(any("spec.ir.yaml" in v for v in violations))
 
-    def test_detects_invalid_raw_artifact_vocabulary_in_derived_contract(self) -> None:
+    def test_detects_invalid_raw_artifact_vocabulary_in_io_contract(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
             _seed_shape_expr_schema_into(repo_root)
@@ -3455,10 +3446,9 @@ end program shallow_water2d_runner
                 dep_spec_id="dynamics_shallow_water_flux_2d_rusanov_p0",
                 model_text=model_text,
                 runner_text=runner_text,
-                run_command=["./simulate", "workspace/case.resolved.yaml", "workspace/outdir"],
-                derived_contract={
-                    "io_contract": {
-                        "inputs": [{"name": "case_resolved", "source": "case.resolved.yaml"}],
+                run_command=["./simulate", "workspace/spec.ir.yaml", "workspace/outdir"],
+                io_contract={
+                    "inputs": [{"name": "case_resolved", "source": "spec.ir.yaml"}],
                         "outputs": [
                             {
                                 "name": "metric",
@@ -3466,7 +3456,6 @@ end program shallow_water2d_runner
                                 "evidence_ref": "raw/ghost_cells",
                             }
                         ],
-                    },
                     "semantic_dependency": {"required_sources": []},
                     "raw_requirements": {
                         "required_evidence": [
@@ -3478,7 +3467,7 @@ end program shallow_water2d_runner
             violations = validate(repo_root=repo_root, workspace_root="workspace")
             self.assertTrue(any("must be one of" in v and "ghost_cells" in v for v in violations))
 
-    def test_detects_snapshot_output_shape_mismatch_inside_derived_contract(self) -> None:
+    def test_detects_snapshot_output_shape_mismatch_inside_io_contract(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
             _seed_shape_expr_schema_into(repo_root)
@@ -3502,10 +3491,9 @@ end program shallow_water2d_runner
                 dep_spec_id="dynamics_shallow_water_flux_2d_rusanov_p0",
                 model_text=model_text,
                 runner_text=runner_text,
-                run_command=["./simulate", "workspace/case.resolved.yaml", "workspace/outdir"],
-                derived_contract={
-                    "io_contract": {
-                        "inputs": [{"name": "case_resolved", "source": "case.resolved.yaml"}],
+                run_command=["./simulate", "workspace/spec.ir.yaml", "workspace/outdir"],
+                io_contract={
+                    "inputs": [{"name": "case_resolved", "source": "spec.ir.yaml"}],
                         "outputs": [
                             {
                                 "name": "U_np1",
@@ -3514,7 +3502,6 @@ end program shallow_water2d_runner
                                 "raw_variables": ["h"],
                             }
                         ],
-                    },
                     "semantic_dependency": {"required_sources": ["h"]},
                     "raw_requirements": {
                         "required_evidence": [
@@ -3572,11 +3559,10 @@ end program shallow_water2d_runner
                 dep_spec_id="dynamics_shallow_water_flux_2d_rusanov_p0",
                 model_text=model_text,
                 runner_text=runner_text,
-                run_command=["./simulate", "workspace/case.resolved.yaml", "workspace/outdir"],
-                derived_contract={
+                run_command=["./simulate", "workspace/spec.ir.yaml", "workspace/outdir"],
+                io_contract={
                     "source": {"tests": "spec/problem/shallow_water2d/tests.md"},
-                    "io_contract": {
-                        "inputs": [{"name": "case_resolved", "source": "case.resolved.yaml"}],
+                    "inputs": [{"name": "case_resolved", "source": "spec.ir.yaml"}],
                         "outputs": [
                             {
                                 "name": "metric",
@@ -3585,7 +3571,6 @@ end program shallow_water2d_runner
                                 "raw_variables": ["h"],
                             }
                         ],
-                    },
                     "semantic_dependency": {"required_sources": ["h"]},
                     "raw_requirements": {
                         "required_evidence": [
@@ -3640,7 +3625,7 @@ end program shallow_water2d_runner
                 dep_spec_id="dynamics_shallow_water_flux_2d_rusanov_p0",
                 model_text=model_text,
                 runner_text=runner_text,
-                run_command=["./simulate", "workspace/case.resolved.yaml", "workspace/outdir"],
+                run_command=["./simulate", "workspace/spec.ir.yaml", "workspace/outdir"],
             )
             _create_minimal_orchestration_tree(repo_root)
             step_result = (
@@ -3650,7 +3635,7 @@ end program shallow_water2d_runner
                 / "orch_test_001"
                 / "steps"
                 / "problem__shallow_water2d__0.3.0"
-                / "plan"
+                / "compile"
                 / "orch_run_001"
                 / "step_result.json"
             )
@@ -3660,7 +3645,7 @@ end program shallow_water2d_runner
                 workspace_root="workspace",
                 require_orchestration=True,
             )
-            self.assertTrue(any("missing step_result.json" in v and "problem__shallow_water2d__0.3.0/plan" in v for v in violations))
+            self.assertTrue(any("missing step_result.json" in v and "problem__shallow_water2d__0.3.0/compile" in v for v in violations))
 
     def test_detects_missing_pipeline_lineage_json(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -3686,7 +3671,7 @@ end program shallow_water2d_runner
                 dep_spec_id="dynamics_shallow_water_flux_2d_rusanov_p0",
                 model_text=model_text,
                 runner_text=runner_text,
-                run_command=["./simulate", "workspace/case.resolved.yaml", "workspace/outdir"],
+                run_command=["./simulate", "workspace/spec.ir.yaml", "workspace/outdir"],
             )
             (
                 repo_root
@@ -3723,7 +3708,7 @@ end program shallow_water2d_runner
                 dep_spec_id="dynamics_shallow_water_flux_2d_rusanov_p0",
                 model_text=model_text,
                 runner_text=runner_text,
-                run_command=["./simulate", "workspace/case.resolved.yaml", "workspace/outdir"],
+                run_command=["./simulate", "workspace/spec.ir.yaml", "workspace/outdir"],
             )
             _create_minimal_orchestration_tree(repo_root)
             runs_path = (
@@ -3739,7 +3724,7 @@ end program shallow_water2d_runner
                 if line.strip()
             ]
             items = [
-                item for item in items if item.get("agent_run_id") != "step_run_execute_001"
+                item for item in items if item.get("agent_run_id") != "substep_run_validate_execute_001"
             ]
             runs_path.write_text(
                 "\n".join(json.dumps(item, ensure_ascii=False) for item in items) + "\n",
@@ -3778,7 +3763,7 @@ end program shallow_water2d_runner
                 dep_spec_id="dynamics_shallow_water_flux_2d_rusanov_p0",
                 model_text=model_text,
                 runner_text=runner_text,
-                run_command=["./simulate", "workspace/case.resolved.yaml", "workspace/outdir"],
+                run_command=["./simulate", "workspace/spec.ir.yaml", "workspace/outdir"],
             )
             _create_minimal_orchestration_tree(repo_root)
             prompt_path = (
@@ -3802,7 +3787,7 @@ end program shallow_water2d_runner
                 any("launch_prompt_ref missing workflow-orchestration template markers" in v for v in violations)
             )
 
-    def test_validate_plan_stage_passes_for_resolved_plan_directory(self) -> None:
+    def test_validate_compile_stage_passes_for_resolved_plan_directory(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
             _seed_shape_expr_schema_into(repo_root)
@@ -3813,27 +3798,27 @@ end program shallow_water2d_runner
                 runner_text="program r\nimplicit none\nend program r\n",
                 run_command=["x", "y"],
             )
-            violations = validate_plan_stage(
+            violations = validate_compile_stage(
                 repo_root,
                 "workspace",
-                "workspace/plans/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001",
+                "workspace/ir/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001",
             )
             self.assertEqual(violations, [])
 
-    def test_validate_plan_stage_rejects_non_plans_path(self) -> None:
+    def test_validate_compile_stage_rejects_non_plans_path(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
             _seed_shape_expr_schema_into(repo_root)
-            violations = validate_plan_stage(
+            violations = validate_compile_stage(
                 repo_root,
                 "workspace",
                 "workspace/pipelines/foo/bar",
             )
             self.assertTrue(
-                any("plan_ref must be under" in v for v in violations), violations
+                any("ir_ref must be under" in v for v in violations), violations
             )
 
-    def test_validate_plan_stage_rejects_missing_context_isolated(self) -> None:
+    def test_validate_compile_stage_rejects_missing_context_isolated(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
             _seed_shape_expr_schema_into(repo_root)
@@ -3846,22 +3831,22 @@ end program shallow_water2d_runner
             )
             meta_path = (
                 repo_root
-                / "workspace/plans/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/plan_meta.json"
+                / "workspace/ir/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/ir_meta.json"
             )
             data = json.loads(meta_path.read_text(encoding="utf-8"))
             data.pop("context_isolated", None)
             meta_path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-            violations = validate_plan_stage(
+            violations = validate_compile_stage(
                 repo_root,
                 "workspace",
-                "workspace/plans/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001",
+                "workspace/ir/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001",
             )
             self.assertTrue(
-                any("plan_meta.json: missing required key 'context_isolated'" in v for v in violations),
+                any("ir_meta.json: missing required key 'context_isolated'" in v for v in violations),
                 violations,
             )
 
-    def test_validate_plan_stage_requires_constraint_reason_when_not_isolated(self) -> None:
+    def test_validate_compile_stage_requires_constraint_reason_when_not_isolated(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
             _seed_shape_expr_schema_into(repo_root)
@@ -3874,15 +3859,15 @@ end program shallow_water2d_runner
             )
             meta_path = (
                 repo_root
-                / "workspace/plans/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/plan_meta.json"
+                / "workspace/ir/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/ir_meta.json"
             )
             data = json.loads(meta_path.read_text(encoding="utf-8"))
             data["context_isolated"] = False
             meta_path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-            violations = validate_plan_stage(
+            violations = validate_compile_stage(
                 repo_root,
                 "workspace",
-                "workspace/plans/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001",
+                "workspace/ir/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001",
             )
             self.assertTrue(
                 any("requires non-empty constraint_reason when context_isolated=false" in v for v in violations),
@@ -3948,7 +3933,7 @@ shallow_water2d_runner.o: shallow_water2d_runner.f90 shallow_water2d_model.mod
                 "workspace",
                 "workspace/pipelines/problem__shallow_water2d__0.3.0/"
                 "shallow-water2d_20260415_001",
-                generation_id="gen_20260415_001",
+                source_id="src_20260415_001",
             )
             self.assertEqual(violations, [])
 
@@ -3970,7 +3955,7 @@ shallow_water2d_runner.o: shallow_water2d_runner.f90 shallow_water2d_model.mod
                 / "problem__shallow_water2d__0.3.0"
                 / "shallow-water2d_20260415_001"
             )
-            log_path = pipeline_dir / "generate" / "gen_20260415_001" / "src" / "mcp_command_log.jsonl"
+            log_path = pipeline_dir / "source" / "src_20260415_001" / "src" / "mcp_command_log.jsonl"
             log_path.write_text(
                 json.dumps(
                     {
@@ -3989,7 +3974,7 @@ shallow_water2d_runner.o: shallow_water2d_runner.f90 shallow_water2d_model.mod
                 "workspace",
                 "workspace/pipelines/problem__shallow_water2d__0.3.0/"
                 "shallow-water2d_20260415_001",
-                generation_id="gen_20260415_001",
+                source_id="src_20260415_001",
             )
             self.assertTrue(
                 any("run_linter did not succeed" in v for v in violations), violations
@@ -4013,7 +3998,7 @@ shallow_water2d_runner.o: shallow_water2d_runner.f90 shallow_water2d_model.mod
                 / "problem__shallow_water2d__0.3.0"
                 / "shallow-water2d_20260415_001"
             )
-            log_path = pipeline_dir / "generate" / "gen_20260415_001" / "src" / "mcp_command_log.jsonl"
+            log_path = pipeline_dir / "source" / "src_20260415_001" / "src" / "mcp_command_log.jsonl"
             log_path.write_text(
                 json.dumps(
                     {
@@ -4032,7 +4017,7 @@ shallow_water2d_runner.o: shallow_water2d_runner.f90 shallow_water2d_model.mod
                 "workspace",
                 "workspace/pipelines/problem__shallow_water2d__0.3.0/"
                 "shallow-water2d_20260415_001",
-                generation_id="gen_20260415_001",
+                source_id="src_20260415_001",
             )
             self.assertTrue(
                 any("logged command does not match preset" in v for v in violations),
@@ -4068,8 +4053,8 @@ shallow_water2d_runner.o: shallow_water2d_runner.f90 shallow_water2d_model.mod
             # Plant a forged log at a NON-canonical placement (under src/notes/).
             forged_log = (
                 pipeline_dir
-                / "generate"
-                / "gen_20260415_001"
+                / "source"
+                / "src_20260415_001"
                 / "src"
                 / "notes"
                 / "mcp_command_log.jsonl"
@@ -4088,14 +4073,14 @@ shallow_water2d_runner.o: shallow_water2d_runner.f90 shallow_water2d_model.mod
                 + "\n",
                 encoding="utf-8",
             )
-            # Rewrite generate_meta.json's lint_command_ref to point at the forged log.
+            # Rewrite source_meta.json's lint_command_ref to point at the forged log.
             meta_path = (
-                pipeline_dir / "generate" / "gen_20260415_001" / "generate_meta.json"
+                pipeline_dir / "source" / "src_20260415_001" / "source_meta.json"
             )
             meta = json.loads(meta_path.read_text(encoding="utf-8"))
             forged_ref = (
                 "workspace/pipelines/problem__shallow_water2d__0.3.0/"
-                "shallow-water2d_20260415_001/generate/gen_20260415_001/src/"
+                "shallow-water2d_20260415_001/source/src_20260415_001/src/"
                 "notes/mcp_command_log.jsonl"
             )
             meta["lint_command_ref"]["run_linter"][0]["command_log_ref"] = forged_ref
@@ -4107,7 +4092,7 @@ shallow_water2d_runner.o: shallow_water2d_runner.f90 shallow_water2d_model.mod
                 "workspace",
                 "workspace/pipelines/problem__shallow_water2d__0.3.0/"
                 "shallow-water2d_20260415_001",
-                generation_id="gen_20260415_001",
+                source_id="src_20260415_001",
             )
             self.assertTrue(
                 any(
@@ -4135,7 +4120,7 @@ shallow_water2d_runner.o: shallow_water2d_runner.f90 shallow_water2d_model.mod
                 dep_spec_id="dynamics_shallow_water_flux_2d_rusanov_p0",
                 model_text="module m\nimplicit none\nend module m\n",
                 runner_text="program r\nimplicit none\nend program r\n",
-                run_command=["./simulate", "workspace/case.resolved.yaml", "workspace/outdir"],
+                run_command=["./simulate", "workspace/spec.ir.yaml", "workspace/outdir"],
             )
             node_dir = (
                 repo_root
@@ -4143,8 +4128,8 @@ shallow_water2d_runner.o: shallow_water2d_runner.f90 shallow_water2d_model.mod
                 / "pipelines"
                 / "problem__shallow_water2d__0.3.0"
                 / "shallow-water2d_20260415_001"
-                / "execute"
-                / "exe_test_001"
+                / "runs"
+                / "run_test_001"
                 / "problem"
                 / "shallow_water2d"
             )
@@ -4200,7 +4185,7 @@ shallow_water2d_runner.o: shallow_water2d_runner.f90 shallow_water2d_model.mod
                 dep_spec_id="dynamics_shallow_water_flux_2d_rusanov_p0",
                 model_text="module m\nimplicit none\nend module m\n",
                 runner_text="program r\nimplicit none\nend program r\n",
-                run_command=["./simulate", "workspace/case.resolved.yaml", "workspace/outdir"],
+                run_command=["./simulate", "workspace/spec.ir.yaml", "workspace/outdir"],
             )
             node_dir = (
                 repo_root
@@ -4208,8 +4193,8 @@ shallow_water2d_runner.o: shallow_water2d_runner.f90 shallow_water2d_model.mod
                 / "pipelines"
                 / "problem__shallow_water2d__0.3.0"
                 / "shallow-water2d_20260415_001"
-                / "execute"
-                / "exe_test_001"
+                / "runs"
+                / "run_test_001"
                 / "problem"
                 / "shallow_water2d"
             )
@@ -4220,7 +4205,7 @@ shallow_water2d_runner.o: shallow_water2d_runner.f90 shallow_water2d_model.mod
                 json.dumps(
                     {
                         "command_id": "fixture_run_program_001",
-                        "command": ["./simulate", "case.resolved.yaml", "out"],
+                        "command": ["./simulate", "spec.ir.yaml", "out"],
                     },
                     ensure_ascii=False,
                 )
@@ -4243,9 +4228,9 @@ shallow_water2d_runner.o: shallow_water2d_runner.f90 shallow_water2d_model.mod
                 violations,
             )
 
-    def test_trial_meta_requires_source_generation_id(self) -> None:
+    def test_trial_meta_requires_source_source_id(self) -> None:
         """Strict policy: every execute trial_meta must declare
-        `source_generation_id`. Without it, validators cannot bind
+        `source_source_id`. Without it, validators cannot bind
         provenance and the field could be omitted to silently bypass
         per-entry tool_name and mandatory run_program checks.
         """
@@ -4257,7 +4242,7 @@ shallow_water2d_runner.o: shallow_water2d_runner.f90 shallow_water2d_model.mod
                 dep_spec_id="dynamics_shallow_water_flux_2d_rusanov_p0",
                 model_text="module m\nimplicit none\nend module m\n",
                 runner_text="program r\nimplicit none\nend program r\n",
-                run_command=["./simulate", "workspace/case.resolved.yaml", "workspace/outdir"],
+                run_command=["./simulate", "workspace/spec.ir.yaml", "workspace/outdir"],
             )
             node_dir = (
                 repo_root
@@ -4265,19 +4250,19 @@ shallow_water2d_runner.o: shallow_water2d_runner.f90 shallow_water2d_model.mod
                 / "pipelines"
                 / "problem__shallow_water2d__0.3.0"
                 / "shallow-water2d_20260415_001"
-                / "execute"
-                / "exe_test_001"
+                / "runs"
+                / "run_test_001"
                 / "problem"
                 / "shallow_water2d"
             )
             trial_meta_path = node_dir / "trial_meta.json"
             trial_meta = json.loads(trial_meta_path.read_text(encoding="utf-8"))
-            trial_meta.pop("source_generation_id", None)
+            trial_meta.pop("source_source_id", None)
             _write_json(trial_meta_path, trial_meta)
             violations = validate(repo_root=repo_root, workspace_root="workspace")
             self.assertTrue(
                 any(
-                    "source_generation_id is required" in v
+                    "source_source_id is required" in v
                     for v in violations
                 ),
                 violations,
@@ -4295,7 +4280,7 @@ shallow_water2d_runner.o: shallow_water2d_runner.f90 shallow_water2d_model.mod
                 dep_spec_id="dynamics_shallow_water_flux_2d_rusanov_p0",
                 model_text="module m\nimplicit none\nend module m\n",
                 runner_text="program r\nimplicit none\nend program r\n",
-                run_command=["./simulate", "workspace/case.resolved.yaml", "workspace/outdir"],
+                run_command=["./simulate", "workspace/spec.ir.yaml", "workspace/outdir"],
             )
             node_dir = (
                 repo_root
@@ -4303,14 +4288,14 @@ shallow_water2d_runner.o: shallow_water2d_runner.f90 shallow_water2d_model.mod
                 / "pipelines"
                 / "problem__shallow_water2d__0.3.0"
                 / "shallow-water2d_20260415_001"
-                / "execute"
-                / "exe_test_001"
+                / "runs"
+                / "run_test_001"
                 / "problem"
                 / "shallow_water2d"
             )
             trial_meta_path = node_dir / "trial_meta.json"
             trial_meta = json.loads(trial_meta_path.read_text(encoding="utf-8"))
-            trial_meta.pop("source_build_id", None)
+            trial_meta.pop("source_binary_id", None)
             _write_json(trial_meta_path, trial_meta)
             violations = validate(repo_root=repo_root, workspace_root="workspace")
             self.assertTrue(
@@ -4332,7 +4317,7 @@ shallow_water2d_runner.o: shallow_water2d_runner.f90 shallow_water2d_model.mod
                 dep_spec_id="dynamics_shallow_water_flux_2d_rusanov_p0",
                 model_text="module m\nimplicit none\nend module m\n",
                 runner_text="program r\nimplicit none\nend program r\n",
-                run_command=["./simulate", "workspace/case.resolved.yaml", "workspace/outdir"],
+                run_command=["./simulate", "workspace/spec.ir.yaml", "workspace/outdir"],
             )
             pipeline_dir = (
                 repo_root
@@ -4342,10 +4327,10 @@ shallow_water2d_runner.o: shallow_water2d_runner.f90 shallow_water2d_model.mod
                 / "shallow-water2d_20260415_001"
             )
             node_dir = (
-                pipeline_dir / "execute" / "exe_test_001" / "problem" / "shallow_water2d"
+                pipeline_dir / "runs" / "run_test_001" / "problem" / "shallow_water2d"
             )
             # Plant a sibling build whose binary the run actually used.
-            sibling_build = pipeline_dir / "build" / "build_sibling_999" / "bin"
+            sibling_build = pipeline_dir / "binary" / "build_sibling_999" / "bin"
             sibling_build.mkdir(parents=True, exist_ok=True)
             (sibling_build / "simulate").write_text("sibling\n", encoding="utf-8")
             # Rewrite the log record's cwd to point at the sibling bin/, but
@@ -4381,7 +4366,7 @@ shallow_water2d_runner.o: shallow_water2d_runner.f90 shallow_water2d_model.mod
                 dep_spec_id="dynamics_shallow_water_flux_2d_rusanov_p0",
                 model_text="module m\nimplicit none\nend module m\n",
                 runner_text="program r\nimplicit none\nend program r\n",
-                run_command=["./simulate", "workspace/case.resolved.yaml", "workspace/outdir"],
+                run_command=["./simulate", "workspace/spec.ir.yaml", "workspace/outdir"],
             )
             node_dir = (
                 repo_root
@@ -4389,8 +4374,8 @@ shallow_water2d_runner.o: shallow_water2d_runner.f90 shallow_water2d_model.mod
                 / "pipelines"
                 / "problem__shallow_water2d__0.3.0"
                 / "shallow-water2d_20260415_001"
-                / "execute"
-                / "exe_test_001"
+                / "runs"
+                / "run_test_001"
                 / "problem"
                 / "shallow_water2d"
             )
@@ -4404,7 +4389,7 @@ shallow_water2d_runner.o: shallow_water2d_runner.f90 shallow_water2d_model.mod
                     {
                         "command_id": cmd_id,
                         "tool_name": "run_program",
-                        "command": ["./simulate", "case.resolved.yaml", "out"],
+                        "command": ["./simulate", "spec.ir.yaml", "out"],
                         "ok": False,
                     },
                     ensure_ascii=False,
@@ -4423,7 +4408,7 @@ shallow_water2d_runner.o: shallow_water2d_runner.f90 shallow_water2d_model.mod
             )
 
     def test_run_quality_checks_rejects_failed_source_generation(self) -> None:
-        """source_generation_id must point to a generation in pass state.
+        """source_source_id must point to a generation in pass state.
 
         Pointing trial_meta at a failed/stale generation under the same
         pipeline (even with a valid mcp_command_log.jsonl) must be rejected,
@@ -4437,7 +4422,7 @@ shallow_water2d_runner.o: shallow_water2d_runner.f90 shallow_water2d_model.mod
                 dep_spec_id="dynamics_shallow_water_flux_2d_rusanov_p0",
                 model_text="module m\nimplicit none\nend module m\n",
                 runner_text="program r\nimplicit none\nend program r\n",
-                run_command=["./simulate", "workspace/case.resolved.yaml", "workspace/outdir"],
+                run_command=["./simulate", "workspace/spec.ir.yaml", "workspace/outdir"],
             )
             pipeline_dir = (
                 repo_root
@@ -4447,14 +4432,14 @@ shallow_water2d_runner.o: shallow_water2d_runner.f90 shallow_water2d_model.mod
                 / "shallow-water2d_20260415_001"
             )
             node_dir = (
-                pipeline_dir / "execute" / "exe_test_001" / "problem" / "shallow_water2d"
+                pipeline_dir / "runs" / "run_test_001" / "problem" / "shallow_water2d"
             )
             # Plant a stale generation in fail state with its own canonical log.
             stale_gen_id = "gen_stale_001"
-            stale_dir = pipeline_dir / "generate" / stale_gen_id
+            stale_dir = pipeline_dir / "source" / stale_gen_id
             stale_dir.mkdir(parents=True, exist_ok=True)
             _write_json(
-                stale_dir / "generate_meta.json",
+                stale_dir / "source_meta.json",
                 {
                     "attempt_count": 1,
                     "verification_status": "fail",
@@ -4467,7 +4452,7 @@ shallow_water2d_runner.o: shallow_water2d_runner.f90 shallow_water2d_model.mod
             stale_src.mkdir(parents=True, exist_ok=True)
             stale_log_ref = (
                 f"workspace/pipelines/problem__shallow_water2d__0.3.0/"
-                f"shallow-water2d_20260415_001/generate/{stale_gen_id}/src/"
+                f"shallow-water2d_20260415_001/source/{stale_gen_id}/src/"
                 "mcp_command_log.jsonl"
             )
             (stale_src / "mcp_command_log.jsonl").write_text(
@@ -4486,7 +4471,7 @@ shallow_water2d_runner.o: shallow_water2d_runner.f90 shallow_water2d_model.mod
             )
             trial_meta_path = node_dir / "trial_meta.json"
             trial_meta = json.loads(trial_meta_path.read_text(encoding="utf-8"))
-            trial_meta["source_generation_id"] = stale_gen_id
+            trial_meta["source_source_id"] = stale_gen_id
             trial_meta["source_command_ref"]["run_quality_checks"] = {
                 "command_id": "cmd_quality_stale",
                 "tool_name": "run_quality_checks",
@@ -4504,7 +4489,7 @@ shallow_water2d_runner.o: shallow_water2d_runner.f90 shallow_water2d_model.mod
             )
 
     def test_run_quality_checks_rejects_sibling_generation_log(self) -> None:
-        """Cross-phase canonical placement is bound strictly to source_generation_id.
+        """Cross-phase canonical placement is bound strictly to source_source_id.
 
         An execute trial_meta that points run_quality_checks at a sibling
         generation's canonical log (different gen_id) must be rejected, even
@@ -4519,7 +4504,7 @@ shallow_water2d_runner.o: shallow_water2d_runner.f90 shallow_water2d_model.mod
                 dep_spec_id="dynamics_shallow_water_flux_2d_rusanov_p0",
                 model_text="module m\nimplicit none\nend module m\n",
                 runner_text="program r\nimplicit none\nend program r\n",
-                run_command=["./simulate", "workspace/case.resolved.yaml", "workspace/outdir"],
+                run_command=["./simulate", "workspace/spec.ir.yaml", "workspace/outdir"],
             )
             pipeline_dir = (
                 repo_root
@@ -4529,20 +4514,20 @@ shallow_water2d_runner.o: shallow_water2d_runner.f90 shallow_water2d_model.mod
                 / "shallow-water2d_20260415_001"
             )
             node_dir = (
-                pipeline_dir / "execute" / "exe_test_001" / "problem" / "shallow_water2d"
+                pipeline_dir / "runs" / "run_test_001" / "problem" / "shallow_water2d"
             )
             # Plant a sibling generation with its own canonical log.
             sibling_gen_id = "gen_sibling_001"
-            sibling_dir = pipeline_dir / "generate" / sibling_gen_id
+            sibling_dir = pipeline_dir / "source" / sibling_gen_id
             sibling_dir.mkdir(parents=True, exist_ok=True)
-            (sibling_dir / "generate_meta.json").write_text(
+            (sibling_dir / "source_meta.json").write_text(
                 '{"verification_status": "pass"}\n', encoding="utf-8"
             )
             sibling_src = sibling_dir / "src"
             sibling_src.mkdir(parents=True, exist_ok=True)
             sibling_log_ref = (
                 f"workspace/pipelines/problem__shallow_water2d__0.3.0/"
-                f"shallow-water2d_20260415_001/generate/{sibling_gen_id}/src/"
+                f"shallow-water2d_20260415_001/source/{sibling_gen_id}/src/"
                 "mcp_command_log.jsonl"
             )
             (sibling_src / "mcp_command_log.jsonl").write_text(
@@ -4563,7 +4548,7 @@ shallow_water2d_runner.o: shallow_water2d_runner.f90 shallow_water2d_model.mod
             trial_meta = json.loads(trial_meta_path.read_text(encoding="utf-8"))
             # trial_meta declares the real (fixture) generation but references
             # the sibling generation's log.
-            trial_meta["source_generation_id"] = "gen_20260415_001"
+            trial_meta["source_source_id"] = "src_20260415_001"
             trial_meta["source_command_ref"]["run_quality_checks"] = {
                 "command_id": "cmd_quality_sibling",
                 "tool_name": "run_quality_checks",
@@ -4597,7 +4582,7 @@ shallow_water2d_runner.o: shallow_water2d_runner.f90 shallow_water2d_model.mod
                 dep_spec_id="dynamics_shallow_water_flux_2d_rusanov_p0",
                 model_text="module m\nimplicit none\nend module m\n",
                 runner_text="program r\nimplicit none\nend program r\n",
-                run_command=["./simulate", "workspace/case.resolved.yaml", "workspace/outdir"],
+                run_command=["./simulate", "workspace/spec.ir.yaml", "workspace/outdir"],
             )
             node_dir = (
                 repo_root
@@ -4605,8 +4590,8 @@ shallow_water2d_runner.o: shallow_water2d_runner.f90 shallow_water2d_model.mod
                 / "pipelines"
                 / "problem__shallow_water2d__0.3.0"
                 / "shallow-water2d_20260415_001"
-                / "execute"
-                / "exe_test_001"
+                / "runs"
+                / "run_test_001"
                 / "problem"
                 / "shallow_water2d"
             )
@@ -4618,7 +4603,7 @@ shallow_water2d_runner.o: shallow_water2d_runner.f90 shallow_water2d_model.mod
                     {
                         "command_id": "forged_cmd_001",
                         "tool_name": "run_program",
-                        "command": ["./simulate", "case.resolved.yaml", "out"],
+                        "command": ["./simulate", "spec.ir.yaml", "out"],
                         "ok": True,
                     },
                     ensure_ascii=False,
@@ -4633,7 +4618,7 @@ shallow_water2d_runner.o: shallow_water2d_runner.f90 shallow_water2d_model.mod
                 "command_id": "forged_cmd_001",
                 "command_log_ref": (
                     "workspace/pipelines/problem__shallow_water2d__0.3.0/"
-                    "shallow-water2d_20260415_001/execute/exe_test_001/"
+                    "shallow-water2d_20260415_001/runs/run_test_001/"
                     "problem/shallow_water2d/raw/forged_run.jsonl"
                 ),
             }
@@ -4648,13 +4633,13 @@ shallow_water2d_runner.o: shallow_water2d_runner.f90 shallow_water2d_model.mod
                 violations,
             )
 
-    def test_validate_generate_meta_accepts_fail_without_lint_command_ref(self) -> None:
+    def test_validate_source_meta_accepts_fail_without_lint_command_ref(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             pipeline_dir = Path(tmp) / "pipeline"
-            gen_dir = pipeline_dir / "generate" / "gen_fail_001"
+            gen_dir = pipeline_dir / "source" / "gen_fail_001"
             gen_dir.mkdir(parents=True)
             _write_json(
-                gen_dir / "generate_meta.json",
+                gen_dir / "source_meta.json",
                 {
                     "attempt_count": 1,
                     "verification_status": "fail",
@@ -4664,16 +4649,16 @@ shallow_water2d_runner.o: shallow_water2d_runner.f90 shallow_water2d_model.mod
                 },
             )
             violations: list[str] = []
-            _validate_generate_meta_json_files(pipeline_dir, violations)
+            _validate_source_meta_json_files(pipeline_dir, violations)
             self.assertEqual(violations, [])
 
-    def test_validate_generate_meta_rejects_pass_without_lint_command_ref(self) -> None:
+    def test_validate_source_meta_rejects_pass_without_lint_command_ref(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             pipeline_dir = Path(tmp) / "pipeline"
-            gen_dir = pipeline_dir / "generate" / "gen_pass_001"
+            gen_dir = pipeline_dir / "source" / "gen_pass_001"
             gen_dir.mkdir(parents=True)
             _write_json(
-                gen_dir / "generate_meta.json",
+                gen_dir / "source_meta.json",
                 {
                     "attempt_count": 1,
                     "verification_status": "pass",
@@ -4683,19 +4668,19 @@ shallow_water2d_runner.o: shallow_water2d_runner.f90 shallow_water2d_model.mod
                 },
             )
             violations: list[str] = []
-            _validate_generate_meta_json_files(pipeline_dir, violations)
+            _validate_source_meta_json_files(pipeline_dir, violations)
             self.assertTrue(
                 any("missing lint_command_ref" in v for v in violations),
                 violations,
             )
 
-    def test_validate_generate_meta_rejects_empty_run_linter_when_pass(self) -> None:
+    def test_validate_source_meta_rejects_empty_run_linter_when_pass(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             pipeline_dir = Path(tmp) / "pipeline"
-            gen_dir = pipeline_dir / "generate" / "gen_pass_002"
+            gen_dir = pipeline_dir / "source" / "gen_pass_002"
             gen_dir.mkdir(parents=True)
             _write_json(
-                gen_dir / "generate_meta.json",
+                gen_dir / "source_meta.json",
                 {
                     "attempt_count": 1,
                     "verification_status": "pass",
@@ -4706,19 +4691,19 @@ shallow_water2d_runner.o: shallow_water2d_runner.f90 shallow_water2d_model.mod
                 },
             )
             violations: list[str] = []
-            _validate_generate_meta_json_files(pipeline_dir, violations)
+            _validate_source_meta_json_files(pipeline_dir, violations)
             self.assertTrue(
                 any("lint_command_ref.run_linter must be non-empty" in v for v in violations),
                 violations,
             )
 
-    def test_validate_generate_meta_ignores_lint_shape_when_not_pass(self) -> None:
+    def test_validate_source_meta_ignores_lint_shape_when_not_pass(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             pipeline_dir = Path(tmp) / "pipeline"
-            gen_dir = pipeline_dir / "generate" / "gen_fail_002"
+            gen_dir = pipeline_dir / "source" / "gen_fail_002"
             gen_dir.mkdir(parents=True)
             _write_json(
-                gen_dir / "generate_meta.json",
+                gen_dir / "source_meta.json",
                 {
                     "attempt_count": 1,
                     "verification_status": "fail",
@@ -4729,12 +4714,12 @@ shallow_water2d_runner.o: shallow_water2d_runner.f90 shallow_water2d_model.mod
                 },
             )
             violations: list[str] = []
-            _validate_generate_meta_json_files(pipeline_dir, violations)
+            _validate_source_meta_json_files(pipeline_dir, violations)
             self.assertEqual(violations, [])
 
     def test_validate_generate_lint_rejects_pass_without_lint_command_ref(self) -> None:
         violations: list[str] = []
-        meta_path = Path("/tmp/generate_meta.json")
+        meta_path = Path("/tmp/source_meta.json")
         _validate_generate_lint_command_logs(
             Path("/repo"),
             meta_path,
@@ -4749,7 +4734,7 @@ shallow_water2d_runner.o: shallow_water2d_runner.f90 shallow_water2d_model.mod
 
     def test_validate_generate_lint_rejects_non_dict_lint_command_ref_when_pass(self) -> None:
         violations: list[str] = []
-        meta_path = Path("/tmp/generate_meta.json")
+        meta_path = Path("/tmp/source_meta.json")
         _validate_generate_lint_command_logs(
             Path("/repo"),
             meta_path,
@@ -4767,7 +4752,7 @@ shallow_water2d_runner.o: shallow_water2d_runner.f90 shallow_water2d_model.mod
 
     def test_validate_generate_lint_mixed_requires_exactly_two_entries(self) -> None:
         violations: list[str] = []
-        meta_path = Path("/tmp/generate_meta.json")
+        meta_path = Path("/tmp/source_meta.json")
         data = {
             "verification_status": "pass",
             "lint_command_ref": {
@@ -4855,7 +4840,7 @@ shallow_water2d_runner.o: shallow_water2d_runner.f90 shallow_water2d_model.mod
                 "workspace",
                 "workspace/pipelines/problem__shallow_water2d__0.3.0/"
                 "shallow-water2d_20260415_001",
-                generation_id="gen_20260415_001",
+                source_id="src_20260415_001",
             )
             self.assertEqual(violations, [])
 
@@ -4885,7 +4870,7 @@ end program shallow_water2d_runner
                 dep_spec_id="dynamics_shallow_water_flux_2d_rusanov_p0",
                 model_text=model_text,
                 runner_text=runner_text,
-                run_command=["./simulate", "workspace/case.resolved.yaml", "workspace/outdir"],
+                run_command=["./simulate", "workspace/spec.ir.yaml", "workspace/outdir"],
                 metrics_basis=payload,
             )
             metrics_path = (
@@ -4894,8 +4879,8 @@ end program shallow_water2d_runner
                 / "pipelines"
                 / "problem__shallow_water2d__0.3.0"
                 / "shallow-water2d_20260415_001"
-                / "execute"
-                / "exe_test_001"
+                / "runs"
+                / "run_test_001"
                 / "problem"
                 / "shallow_water2d"
                 / "raw"
@@ -4930,7 +4915,7 @@ end program shallow_water2d_runner
                 dep_spec_id="dynamics_shallow_water_flux_2d_rusanov_p0",
                 model_text=model_text,
                 runner_text=runner_text,
-                run_command=["./simulate", "workspace/case.resolved.yaml", "workspace/outdir"],
+                run_command=["./simulate", "workspace/spec.ir.yaml", "workspace/outdir"],
                 metrics_basis={"value_a": 0.0, "value_b": 0.0},
             )
             violations = validate(repo_root, workspace_root="workspace")
@@ -4964,7 +4949,7 @@ end program shallow_water2d_runner
                 dep_spec_id="dynamics_shallow_water_flux_2d_rusanov_p0",
                 model_text=model_text,
                 runner_text=runner_text,
-                run_command=["./simulate", "workspace/case.resolved.yaml", "workspace/outdir"],
+                run_command=["./simulate", "workspace/spec.ir.yaml", "workspace/outdir"],
                 metrics_basis={"value_a": None, "value_b": None},
             )
             violations = validate(repo_root, workspace_root="workspace")
@@ -4998,7 +4983,7 @@ end program shallow_water2d_runner
                 dep_spec_id="dynamics_shallow_water_flux_2d_rusanov_p0",
                 model_text=model_text,
                 runner_text=runner_text,
-                run_command=["./simulate", "workspace/case.resolved.yaml", "workspace/outdir"],
+                run_command=["./simulate", "workspace/spec.ir.yaml", "workspace/outdir"],
                 metrics_basis={"value_a": 0.0, "value_b": 1.5},
             )
             violations = validate(repo_root, workspace_root="workspace")
@@ -5032,7 +5017,7 @@ end program shallow_water2d_runner
                 dep_spec_id="dynamics_shallow_water_flux_2d_rusanov_p0",
                 model_text=model_text,
                 runner_text=runner_text,
-                run_command=["./simulate", "workspace/case.resolved.yaml", "workspace/outdir"],
+                run_command=["./simulate", "workspace/spec.ir.yaml", "workspace/outdir"],
                 metrics_basis={"label": "test", "tags": ["a", "b"]},
             )
             violations = validate(repo_root, workspace_root="workspace")
@@ -5054,7 +5039,7 @@ end program shallow_water2d_runner
         )
         with tempfile.TemporaryDirectory() as tmp:
             broken_root = Path(tmp)
-            schema_dir = broken_root / "spec" / "schema" / "plan"
+            schema_dir = broken_root / "spec" / "schema" / "ir"
             schema_dir.mkdir(parents=True)
             (schema_dir / "shape_expr.schema.json").write_text(
                 "{ this is not json", encoding="utf-8"
@@ -5067,7 +5052,7 @@ end program shallow_water2d_runner
                 msg = str(ctx.exception)
                 self.assertIn("shape_expr schema", msg)
                 self.assertIn("malformed JSON", msg)
-                self.assertIn(str(broken_root / "spec" / "schema" / "plan" / "shape_expr.schema.json"), msg)
+                self.assertIn(str(broken_root / "spec" / "schema" / "ir" / "shape_expr.schema.json"), msg)
             finally:
                 _active_repo_root_for_schema.reset(token)
                 _load_shape_expr_patterns_cached.cache_clear()
@@ -5078,7 +5063,7 @@ end program shallow_water2d_runner
         self.assertTrue(_BUNDLED_SHAPE_EXPR_SCHEMA_PATH.is_file())
 
     def test_shape_expr_schema_resolves_from_active_repo_root(self) -> None:
-        """Regression: the active repo_root's spec/schema/plan/shape_expr.schema.json
+        """Regression: the active repo_root's spec/schema/ir/shape_expr.schema.json
         is the canonical source — its rules apply, and missing the schema while
         a repo_root is in scope must FAIL CLOSED rather than silently falling
         back to the validator-bundled copy. Bundled fallback is reserved for
@@ -5091,7 +5076,7 @@ end program shallow_water2d_runner
         with tempfile.TemporaryDirectory() as tmp_strict, tempfile.TemporaryDirectory() as tmp_no_schema:
             strict_root = Path(tmp_strict)
             no_schema_root = Path(tmp_no_schema)
-            schema_dir = strict_root / "spec" / "schema" / "plan"
+            schema_dir = strict_root / "spec" / "schema" / "ir"
             schema_dir.mkdir(parents=True)
             strict_schema = {
                 "$schema": "http://json-schema.org/draft-07/schema#",
@@ -5133,7 +5118,7 @@ end program shallow_water2d_runner
                 msg = str(ctx.exception)
                 self.assertIn("shape_expr schema not found", msg)
                 self.assertIn(
-                    str(no_schema_root / "spec" / "schema" / "plan" / "shape_expr.schema.json"),
+                    str(no_schema_root / "spec" / "schema" / "ir" / "shape_expr.schema.json"),
                     msg,
                 )
             finally:
@@ -5148,24 +5133,24 @@ end program shallow_water2d_runner
             self.assertTrue(ok_bundled, "bundled schema applies when no repo_root is in scope")
             _load_shape_expr_patterns_cached.cache_clear()
 
-    def test_validate_plan_stage_fails_closed_when_target_repo_lacks_schema(self) -> None:
+    def test_validate_compile_stage_fails_closed_when_target_repo_lacks_schema(self) -> None:
         """Regression: public validate_*() entrypoints must bind the active
         repo_root context themselves so a target repo without
-        spec/schema/plan/shape_expr.schema.json fails closed. Previously the
+        spec/schema/ir/shape_expr.schema.json fails closed. Previously the
         context was set only by CLI main(), so library callers silently fell
         back to the validator-bundled schema, defeating the fail-closed
         protection against version skew between target and validator-bundle."""
         from tools.validate_pipeline_semantics import (
             _active_repo_root_for_schema,
             _load_shape_expr_patterns_cached,
-            validate_plan_stage,
+            validate_compile_stage,
         )
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
             # Deliberately do NOT seed the schema (this test exercises the
             # missing-schema path). Build minimal plan artifacts so the
             # validator reaches shape_expr parsing.
-            plan_dir = repo_root / "workspace" / "plans" / "x" / "p1"
+            plan_dir = repo_root / "workspace" / "ir" / "x" / "p1"
             plan_dir.mkdir(parents=True)
             algo = {
                 "algorithm_id": "alg",
@@ -5180,7 +5165,7 @@ end program shallow_water2d_runner
                 "invariants": ["x"],
                 "splitting_policy": {"kind": "none"},
             }
-            (plan_dir / "algorithm.resolved.yaml").write_text(
+            (plan_dir / "spec.ir.yaml").write_text(
                 yaml.safe_dump(algo), encoding="utf-8"
             )
             _load_shape_expr_patterns_cached.cache_clear()
@@ -5188,18 +5173,18 @@ end program shallow_water2d_runner
             self.assertIsNone(_active_repo_root_for_schema.get())
             # Direct library-style call must fail closed.
             with self.assertRaises(RuntimeError) as ctx:
-                validate_plan_stage(repo_root, "workspace", "workspace/plans/x/p1")
+                validate_compile_stage(repo_root, "workspace", "workspace/ir/x/p1")
             msg = str(ctx.exception)
             self.assertIn("shape_expr schema not found", msg)
             self.assertIn(
-                str(repo_root / "spec" / "schema" / "plan" / "shape_expr.schema.json"),
+                str(repo_root / "spec" / "schema" / "ir" / "shape_expr.schema.json"),
                 msg,
             )
-            # Post-condition: validate_plan_stage MUST reset the context so
+            # Post-condition: validate_compile_stage MUST reset the context so
             # subsequent in-process calls don't see the failed repo's root.
             self.assertIsNone(
                 _active_repo_root_for_schema.get(),
-                "validate_plan_stage must reset the active context after returning/raising",
+                "validate_compile_stage must reset the active context after returning/raising",
             )
             _load_shape_expr_patterns_cached.cache_clear()
 
@@ -5219,14 +5204,14 @@ end program shallow_water2d_runner
 
         def _build_repo(tmp: str) -> Path:
             repo = Path(tmp)
-            sd = repo / "spec" / "schema" / "plan"
+            sd = repo / "spec" / "schema" / "ir"
             sd.mkdir(parents=True)
             (sd / "shape_expr.schema.json").write_bytes(
                 _BUNDLED_SHAPE_EXPR_SCHEMA_PATH.read_bytes()
             )
-            plan_dir = repo / "workspace" / "plans" / "x" / "p1"
+            plan_dir = repo / "workspace" / "ir" / "x" / "p1"
             plan_dir.mkdir(parents=True)
-            (plan_dir / "algorithm.resolved.yaml").write_text(
+            (plan_dir / "spec.ir.yaml").write_text(
                 yaml.safe_dump(
                     {
                         "algorithm_id": "a",
@@ -5258,8 +5243,8 @@ end program shallow_water2d_runner
                     main(
                         [
                             "--repo-root", str(repo),
-                            "--stage", "plan",
-                            "--plan-ref", "workspace/plans/x/p1",
+                            "--stage", "compile",
+                            "--ir-ref", "workspace/ir/x/p1",
                         ]
                     )
                 # After each main() call the context must be reset.
@@ -5284,14 +5269,14 @@ end program shallow_water2d_runner
         )
         with tempfile.TemporaryDirectory() as tmp:
             broken_root = Path(tmp)
-            schema_dir = broken_root / "spec" / "schema" / "plan"
+            schema_dir = broken_root / "spec" / "schema" / "ir"
             schema_dir.mkdir(parents=True)
             (schema_dir / "shape_expr.schema.json").write_text(
                 "{ broken json", encoding="utf-8"
             )
-            # Need a minimal plan_ref so plan-stage actually exercises shape_expr.
-            plan_ref = broken_root / "workspace" / "plans" / "x" / "p1"
-            plan_ref.mkdir(parents=True)
+            # Need a minimal ir_ref so plan-stage actually exercises shape_expr.
+            ir_ref = broken_root / "workspace" / "ir" / "x" / "p1"
+            ir_ref.mkdir(parents=True)
             algo = {
                 "algorithm_id": "alg",
                 "execution_mode": "sequence",
@@ -5305,7 +5290,7 @@ end program shallow_water2d_runner
                 "invariants": ["x"],
                 "splitting_policy": {"kind": "none"},
             }
-            (plan_ref / "algorithm.resolved.yaml").write_text(
+            (ir_ref / "spec.ir.yaml").write_text(
                 yaml.safe_dump(algo), encoding="utf-8"
             )
             _load_shape_expr_patterns_cached.cache_clear()
@@ -5320,8 +5305,8 @@ end program shallow_water2d_runner
                 with redirect_stdout(buf):
                     rc = main([
                         "--repo-root", str(broken_root),
-                        "--stage", "plan",
-                        "--plan-ref", "workspace/plans/x/p1",
+                        "--stage", "compile",
+                        "--ir-ref", "workspace/ir/x/p1",
                     ])
             finally:
                 _active_repo_root_for_schema.set(prev)
@@ -5372,7 +5357,7 @@ end program shallow_water2d_runner
     def test_object_form_temporaries_must_include_shape_expr(self) -> None:
         """Regression: phase_01_plan.md L26 mandates that object-form temporaries
         entries carry both `name` and `shape_expr` (canonical source:
-        spec/schema/plan/shape_expr.schema.json). Missing shape_expr must fail
+        spec/schema/ir/shape_expr.schema.json). Missing shape_expr must fail
         Plan validation rather than silently leak into Generate."""
         from tools.validate_pipeline_semantics import _validate_algorithm_contract_file
         contract = {
@@ -5401,7 +5386,7 @@ end program shallow_water2d_runner
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
             _seed_shape_expr_schema_into(repo_root)
-            contract_path = repo_root / "algorithm.resolved.yaml"
+            contract_path = repo_root / "spec.ir.yaml"
             contract_path.write_text(yaml.safe_dump(contract), encoding="utf-8")
             violations: list[str] = []
             _validate_algorithm_contract_file(
@@ -5451,7 +5436,7 @@ end program shallow_water2d_runner
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
             _seed_shape_expr_schema_into(repo_root)
-            contract_path = repo_root / "algorithm.resolved.yaml"
+            contract_path = repo_root / "spec.ir.yaml"
             contract_path.write_text(yaml.safe_dump(contract), encoding="utf-8")
             violations: list[str] = []
             _validate_algorithm_contract_file(

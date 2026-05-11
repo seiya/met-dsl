@@ -20,10 +20,10 @@ from tools.validate_pipeline_semantics import _BUNDLED_SHAPE_EXPR_SCHEMA_PATH
 def _seed_shape_expr_schema_into(repo_root: Path) -> None:
     """Copy the validator-bundled shape_expr.schema.json into a tmp repo so
     `run_workflow.main()`'s startup assertion (canonical schema must exist
-    at <repo_root>/spec/schema/plan/shape_expr.schema.json) passes for tests
+    at <repo_root>/spec/schema/ir/shape_expr.schema.json) passes for tests
     that exercise normal main() flows. Tests that intentionally exercise the
     missing-schema path must NOT call this helper."""
-    target = repo_root / "spec" / "schema" / "plan" / "shape_expr.schema.json"
+    target = repo_root / "spec" / "schema" / "ir" / "shape_expr.schema.json"
     if target.is_file():
         return
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -107,11 +107,11 @@ class RunWorkflowTests(unittest.TestCase):
 
     def test_validate_source_dependency_ref_rejects_non_spec_deps_path(self) -> None:
         with self.assertRaises(ValueError):
-            run_workflow._validate_source_dependency_ref("workspace/plans/x/dependency.resolved.yaml")
+            run_workflow._validate_source_dependency_ref("workspace/ir/x/spec.ir.yaml")
 
     def test_normalize_phase_accepts_known_values(self) -> None:
-        self.assertEqual(run_workflow._normalize_phase("plan"), "Plan")
-        self.assertEqual(run_workflow._normalize_phase("PROMOTE"), "Promote")
+        self.assertEqual(run_workflow._normalize_phase("compile"), "Compile")
+        self.assertEqual(run_workflow._normalize_phase("VALIDATE"), "Validate")
 
     def test_normalize_phase_rejects_unknown_value(self) -> None:
         with self.assertRaises(ValueError):
@@ -150,13 +150,13 @@ class RunWorkflowTests(unittest.TestCase):
             orchestration_agent_run_id="run_orch_001",
             spec_ref="spec/problem/sample.md",
             source_dependency_ref="spec/problem/deps.yaml",
-            until_phase="Judge",
+            until_phase="Validate",
             workflow_mode="dev",
         )
         self.assertIn("orch_test", text)
         self.assertIn("run_orch_001", text)
         self.assertIn("spec/problem/sample.md", text)
-        self.assertIn("Judge", text)
+        self.assertIn("Validate", text)
         self.assertIn("workflow_mode: `dev`", text)
         self.assertIn("dependency_ref: `spec/problem/deps.yaml`", text)
         self.assertNotIn("(not specified)", text)
@@ -319,7 +319,7 @@ class RunWorkflowTests(unittest.TestCase):
 
     def test_main_fails_fast_when_canonical_schema_missing(self) -> None:
         """Regression: tools/run_workflow.py must abort BEFORE init/preflight
-        if `<repo_root>/spec/schema/plan/shape_expr.schema.json` is missing,
+        if `<repo_root>/spec/schema/ir/shape_expr.schema.json` is missing,
         because validate_pipeline_semantics is now fail-closed under repo
         scope and would otherwise collapse every downstream phase gate with
         `schema_load_failed` after orchestration state has already been
@@ -347,7 +347,7 @@ class RunWorkflowTests(unittest.TestCase):
         payload = json.loads(output.strip().splitlines()[-1])
         self.assertEqual(payload["status"], "fail")
         self.assertEqual(payload["reason"], "missing_canonical_schema")
-        self.assertIn("spec/schema/plan/shape_expr.schema.json", payload["missing_path"])
+        self.assertIn("spec/schema/ir/shape_expr.schema.json", payload["missing_path"])
         # Critical: orchestration state must NOT have been created — the
         # check must run before init().
         self.assertFalse(
@@ -363,7 +363,7 @@ class RunWorkflowTests(unittest.TestCase):
         crashed mid-phase after `workspace/tmp/<arid>/` was already created."""
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
-            schema_dir = repo_root / "spec" / "schema" / "plan"
+            schema_dir = repo_root / "spec" / "schema" / "ir"
             schema_dir.mkdir(parents=True)
             # Schema EXISTS as a file but has malformed JSON.
             (schema_dir / "shape_expr.schema.json").write_text(
@@ -742,7 +742,7 @@ class RunWorkflowTests(unittest.TestCase):
             with redirect_stdout(buf):
                 code = run_workflow.main([
                     "spec/problem/dummy.md",
-                    "Plan",
+                    "Compile",
                     "--llm",
                     "claude",
                 ])
@@ -789,7 +789,7 @@ class RunWorkflowTests(unittest.TestCase):
             with redirect_stdout(buf):
                 code = run_workflow.main([
                     "spec/problem/dummy.md",
-                    "Plan",
+                    "Compile",
                     "--llm",
                     "claude",
                 ])

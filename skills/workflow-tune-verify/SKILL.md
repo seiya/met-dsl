@@ -1,15 +1,15 @@
 ---
 name: workflow-tune-verify
-description: Tune ステージの verify を実行し、候補 `impl.resolved.yaml` の物理合格、品質条件、性能目的関数を評価して採用可否を判定するときに使用する。`best impl` の固定と回帰移行判定に適用する。
+description: Tune ステージの verify を実行し、候補 `spec.ir.yaml.impl_defaults` variant の物理合格、品質条件、性能目的関数を評価して採用可否を判定するときに使用する。`best impl` の固定と回帰移行判定に適用する。
 ---
 
 # Workflow Tune Verify
 
 ## 目的
-Tune ステージ候補の検証責務を固定し、採用候補を客観指標で選別する。
+Tune ステージ候補の検証責務を固定し、採用候補を客観指標で選別する。本フローは core workflow から分離された **任意フロー** の一部である。
 
 ## 適用範囲
-- 候補 `impl.resolved.yaml` の trial 結果評価
+- 候補 `spec.ir.yaml.impl_defaults` variant の trial 結果評価
 - `best impl` の確定と再チューニング判定
 
 ## 要件
@@ -23,7 +23,7 @@ Tune ステージ候補の検証責務を固定し、採用候補を客観指標
 
 ## 運用ルール
 1. `verdict` と `aggregate_verdict` が `pass` の候補のみ採用候補に残す。
-2. 採用候補の中から目的関数最大の `impl.resolved.yaml` を `best impl` に固定する。
+2. 採用候補の中から目的関数最大の variant `spec.ir.yaml.impl_defaults` を `best impl` に固定する。
 3. 新アーキテクチャまたは新コンパイラ条件では再チューニング判定を実行する。
 4. 判定根拠を `tuning` 系メタデータに保存し、回帰監視へ引き渡す。
 5. `dev` mode で `fail` した場合は、`failure_analysis.json` 作成に必要な根拠（失敗理由、対象 trial、判定エビデンス）を記録する。

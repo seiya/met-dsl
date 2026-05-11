@@ -7,7 +7,7 @@
 ### 対象
 - 入力: 自然言語中心の `Controlled Spec`（物理・アルゴリズム定義）と `tests`（verification input・判定プロファイル）
 - 出力: 実行コード（`model` + `runner`）と判定 artifact（`diagnostics.json` / `perf.json` / `verdict.json` / `aggregate_verdict.json` / `summary.json`）
-- 運用: `Spec -> Plan -> Generate -> Build -> Execute -> Judge -> Tune -> Promote` の反復運用
+- 運用: core workflow `Spec -> Compile -> Generate -> Build -> Validate` の反復運用。任意フローとして `Tune`（実装裁量の variant 探索）と `Promote`（正式版昇格）を別経路で扱う。
 - ハードウェア: `CPU` / `GPU` を含む（`Phase 0` は `CPU` 参照、以降 `GPU` へ拡張）
 - `Controlled Spec` と `tests` の canonical source 形式は `Markdown` とし、自然言語で一意に定義できる項目は文章で記述する。
 
@@ -22,9 +22,9 @@
 
 ## 不正防止原則（全体仕様）
 1. `tests` 合格または workflow 進行を目的とした `dummy` 出力の生成を禁止する。
-2. phase inputが不足する場合は当該 phase を `fail` で停止し、推測補完やプレースホルダ補完を禁止する。
+2. phase input が不足する場合は当該 phase を `fail` で停止し、推測補完やプレースホルダ補完を禁止する。
 3. phase 失敗時に下流 phase の開始条件を満たす目的で artifact を人工生成してはならない。
-4. 明示的な指定がない場合、過去 workflow 出力（過去 `plan_id` / `pipeline_id` / `generation_id` / `build_id` / `execution_id`）の内容参照を禁止する。
+4. 明示的な指定がない場合、過去 workflow 出力（過去 `ir_id` / `pipeline_id` / `source_id` / `binary_id` / `run_id`）の内容参照を禁止する。
 5. 本原則への違反は仕様違反とし、当該 workflow 実行を無効とする。
 
 ## 運用原則（Spec-First）
@@ -38,18 +38,24 @@
 - `LLM` 利用ステージは `generate -> verify -> regenerate` を反復し、検証合格後のみ artifact を確定する。
 - `verifier` は `generator` と独立したコンテキスト（別セッションまたは別エージェント）での実行を必須とする。
 - ステージ内 `verify` は構造・契約・トレーサビリティ整合の確認を目的とし、物理妥当性の最終保証を代替しない。
-- `LLM` 利用ステージは `<stage>_meta.json`（コード生成は `generate_meta.json`）を必須出力とする。
+- `LLM` 利用ステージは `<stage>_meta.json`（`Compile` は `ir_meta.json`、`Generate` は `source_meta.json`、`Validate` は `validate_meta.json`）を必須出力とする。
 - メタデータの必須項目は `attempt_count`、`verification_status`、`last_fail_reason`、`context_isolated`、`debug_mode` とする。`context_isolated=false` の場合は `constraint_reason` を必須とする。
-- `generate_meta.json` の `lint_command_ref` は `verification_status=pass` の場合に必須とし、`verification_status!=pass` では任意とする。
+- `source_meta.json` の `lint_command_ref` は `verification_status=pass` の場合に必須とし、`verification_status!=pass` では任意とする。
 - `debug_mode` の既定値は `false` とする。`debug_mode=true` の場合のみ失敗試行 artifact の保存を許可し、`retained_failed_attempts` と保存先を記録する。
 
 ## アーキテクチャ方針
-- 物理アルゴリズム（A）は物理結果に影響する選択とし、`case.resolved.yaml` で決定する。
-- 実行アルゴリズム（B）は性能・計算過程に影響する選択とし、`impl.resolved.yaml` で表現する。
-- `case.resolved.yaml` は実行時 input contract の決定値のみを保持し、output contract を保持しない。
-- 判定対象出力の `name` と `shape_expr` と `evidence_ref` は `derived_contract.json` の `io_contract.outputs` で管理する。
-- `raw` 一次証跡の必須有無は `derived_contract.json` の `raw_requirements.required_evidence` で管理し、固定の計算様式や固定の証跡構成を一律必須にしてはならない。
-- A と B の分離により、物理再現性と性能探索を両立する。
+- core workflow は **単一の構造 IR (`spec.ir.yaml`)** を `Compile` phase で生成し、`Generate` 以降の段は IR を canonical source として扱う。`controlled_spec.md` を `Generate` 以降が直接読むことを禁止する。
+- `spec.ir.yaml` は次の 5 セクションを統合保持する:
+  - `case`: 実行時入力の決定値（`sweep` 展開済み）。
+  - `algorithm`: 物理アルゴリズム（A）の構造表現。`execution_mode` / `steps[]` / `ordering` / `control_condition` / `iteration_contract` / `update_semantics` / `temporaries` / `derived_field_rules` / `invariants` / `splitting_policy` を必須語彙とする。
+  - `impl_defaults`: 実装裁量のデフォルト値。`target.backend`、`target.architecture`、`toolchain.language`、`toolchain.build_system` を含む。
+  - `io_contract`: 検証契約。`inputs` / `outputs` / `semantic_dependency.required_sources` / `raw_requirements.required_evidence` / `test_evidence_requirements` を保持する。
+  - `dependency`: 依存解決結果（`direct_deps` / `transitive_deps` / `topo_level`）。
+- 物理アルゴリズム（A）は `algorithm` セクションで決定し、case 依存は `case` セクションが保持する。
+- 実装裁量（B）の **デフォルト値は `impl_defaults` に格納するが、core workflow ではこれは固定値とする**。実装裁量の variant 探索は任意フロー `Tune` の責務であり、`Tune` は `spec.ir.yaml` を不変前提として `tuning.spec` を別途読み、code variant を生成する。
+- 判定対象出力の `name` と `shape_expr` と `evidence_ref` は `spec.ir.yaml` の `io_contract.outputs` で管理する。
+- `raw` 一次証跡の必須有無は `spec.ir.yaml` の `io_contract.raw_requirements.required_evidence` で管理し、固定の計算様式や固定の証跡構成を一律必須にしてはならない。
+- 物理アルゴリズム（A）と実装裁量（B）を単一 IR の異なるセクションで分離管理することで、物理再現性と Tune 探索を両立する。
 
 ## 大規模 spec 運用設計
 ### 目的
@@ -134,10 +140,9 @@ releases/
 - `problem spec` の再利用境界を変更した場合は `releases/registry/component_catalog.yaml` を同時更新する。
 - `component` の実装状態が `spec_defined_not_implemented` の間は、依存先 `problem spec` を `status=draft` とする。
 - `workspace/` は試行 artifact の作業領域とし、正式版 artifact の canonical source に使用してはならない。
-- 昇格時は `spec_catalog.yaml` の対象 `spec_id` に `official_releases` を追加し、`release_id`、`target_architecture`、`toolchain_language`、`target_backend`、`source_pipeline_id`、`source_generation_id`、`source_build_id`、`source_execution_id`、`artifact_root`、`promoted_at`、`status` を記録する。
+- 昇格時は `spec_catalog.yaml` の対象 `spec_id` に `official_releases` を追加し、`release_id`、`target_architecture`、`toolchain_language`、`target_backend`、`source_pipeline_id`、`source_source_id`、`source_binary_id`、`source_run_id`、`artifact_root`、`promoted_at`、`status` を記録する。Promote は任意フローで core workflow から分離されている。
 - `official_releases` の `status=active` は各 `spec_id` の `target_architecture + toolchain_language` ごとに 1 件のみ許可する。
-- 互換移行期間では旧配置 `spec/<domain>/<family>/<spec_id>/...` を `problem spec` とみなし、`spec_kind=problem` で registry 登録する。
-- 互換移行期間中も新規 `spec` は `spec/<spec_kind>/<domain>/<family>/<spec_id>/...` を必須とする。
+- `spec` の配置は `spec/<spec_kind>/<domain>/<family>/<spec_id>/...` を canonical とする。
 
 ### 判定基準
 - `CI` は `spec_kind` / `spec_id` / `component_id` / `operation_id` の形式検証を `pass` しなければならない。
@@ -148,15 +153,14 @@ releases/
 - `CI` は `official_releases` の `artifact_root` が `releases/` 配下を指さない場合に `fail` としなければならない。
 
 ## 成功条件（最小）
-- `Controlled Spec` から各 `spec` の計算課題を実装する `model` と `runner` の変換が再現可能である。
+- `Controlled Spec` から `spec.ir.yaml` への構造化、さらに各 `spec` の計算課題を実装する `model` と `runner` への変換が再現可能である。
 - `problem` / `component` / `profile` の責務境界が維持され、依存宣言が registry と整合している。
-- 物理妥当性判定と性能評価に必要な artifact 契約が workflow で再現可能である。
-- `impl`（B）の探索で物理合格を維持しつつ性能改善を評価できる。
+- 物理妥当性判定と性能評価に必要な artifact 契約が core workflow で再現可能である。
+- 任意フロー `Tune` で `impl_defaults`（B）の探索を行い、物理合格を維持しつつ性能改善を評価できる。
 
 ## 参照
 - `CONTROLLED_SPEC.md`
 - `TESTS.md`
 - `WORKFLOW.md`（入口） / `workflow/WORKFLOW_CORE.md` / `workflow/phases/`
-- `IMPL_PLAN_SPEC.md`
 - `PHYSICAL_VALIDATION.md`
 - `GLOSSARY.md`

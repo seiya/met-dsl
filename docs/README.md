@@ -8,12 +8,12 @@
 3. `TESTS.md`（`tests` の書式と必須要件）
 4. `PHYSICAL_VALIDATION.md`（物理妥当性判定の要件）
 5. `GLOSSARY.md`（`Artifacts` / `terms`）
-6. `WORKFLOW.md`（workflow 仕様への入口。本文は `workflow/WORKFLOW_CORE.md` と `workflow/phases/` に分割）
+6. `WORKFLOW.md`（5-phase `Spec → Compile → Generate → Build → Validate` の入口。本文は `workflow/WORKFLOW_CORE.md` と `workflow/phases/` に分割）
 7. `ORCHESTRATION.md`（`orchestration agent -> substep agent` と `orchestration agent -> step agent` の実行規約）
 8. `RUNBOOK.md`（試行を回すための最小運用手順）
-9. `IMPL_PLAN_SPEC.md`（`impl.resolved.yaml` 仕様）
+9. `IMPL_PLAN_SPEC.md`（`spec.ir.yaml.impl_defaults` セクションの既定値規則）
 10. `PERFORMANCE_DIAGNOSTICS.md`（`perf.json` 仕様）
-11. `TUNING_WORKFLOW.md`（性能探索の運用指針）
+11. `TUNING_WORKFLOW.md`（任意フロー: 性能探索の運用指針）
 
 ## Role-based Structure
 ### Core（方向性・契約）
@@ -23,7 +23,7 @@
 - `PHYSICAL_VALIDATION.md`
 - `GLOSSARY.md`
 
-### Loop（試行を回す）
+### Loop（試行を回す, core workflow）
 - `WORKFLOW.md` / `workflow/WORKFLOW_CORE.md` / `workflow/phases/`
 - `ORCHESTRATION.md`
 - `RUNBOOK.md`
@@ -31,7 +31,9 @@
 ### Execution / Performance（実装と性能）
 - `IMPL_PLAN_SPEC.md`
 - `PERFORMANCE_DIAGNOSTICS.md`
-- `TUNING_WORKFLOW.md`
+
+### Optional flows（任意フロー, core workflow 外）
+- `TUNING_WORKFLOW.md`（Tune: 実装裁量 variant 探索 / Promote: 正式版昇格）
 
 ## 運用ルール
 - 迷ったら `SPEC.md` の「不変原則」に立ち戻る。

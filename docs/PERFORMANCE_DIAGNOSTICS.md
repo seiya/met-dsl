@@ -27,7 +27,7 @@
 - `memory_bytes_read/write`: 推定でもよい
 - `device`: GPU 名、SM 数等
 - `compiler`: コンパイラ/バージョン、主要フラグ
-- `impl_hash`: impl.resolved.yaml の hash
+- `impl_hash`: `spec.ir.yaml.impl_defaults` の hash
 - `git_sha`: 実行したコードのコミット
 
 ## 4. 測定上の注意

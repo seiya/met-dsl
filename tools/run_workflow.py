@@ -47,15 +47,12 @@ DEFAULT_LLM_COMMANDS = {
 }
 
 PHASE_ALIASES = {
-    "plan": "Plan",
+    "compile": "Compile",
     "generate": "Generate",
     "build": "Build",
-    "execute": "Execute",
-    "judge": "Judge",
-    "tune": "Tune",
-    "promote": "Promote",
+    "validate": "Validate",
 }
-PHASE_ORDER = ["Plan", "Generate", "Build", "Execute", "Judge", "Tune", "Promote"]
+PHASE_ORDER = ["Compile", "Generate", "Build", "Validate"]
 
 # CLI tools the workflow runtime and its hook-recovery procedures depend on.
 # Documented in docs/RUNBOOK.md#0-1. Missing any one fails the run before init,
@@ -607,7 +604,7 @@ def _atomic_write_json(path: Path, payload: dict[str, Any], *, tmp_dir: Path) ->
 
 def _detect_non_minor_verify_issue(repo_root: Path, orchestration_id: str) -> dict[str, Any] | None:
     orch_root = repo_root / "workspace" / "orchestrations" / orchestration_id
-    verify_steps = {"plan", "generate", "tune"}
+    verify_steps = {"compile", "generate", "validate"}
     for step_result_path in sorted(orch_root.glob("steps/*/*/*/step_result.json")):
         payload = _read_json_if_exists(step_result_path)
         if not payload:
@@ -654,7 +651,7 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
         description="Bootstrap workflow startup (init + preflight + prompt).",
     )
     parser.add_argument("spec_ref", help="Target spec path/reference.")
-    parser.add_argument("until_phase", help="Final phase to execute (plan/generate/build/execute/judge/tune/promote).")
+    parser.add_argument("until_phase", help="Final phase to execute (compile/generate/build/validate).")
     parser.add_argument(
         "--mode",
         default="dev",
@@ -731,7 +728,7 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     # Startup assertion: validate_pipeline_semantics now fail-closes when the
-    # active repo_root's `spec/schema/plan/shape_expr.schema.json` is missing,
+    # active repo_root's `spec/schema/ir/shape_expr.schema.json` is missing,
     # malformed, contains an invalid regex, or fails the structural classifier.
     # We must surface ALL of those failure modes here BEFORE any orchestration
     # state mutation (init/preflight/launches/...), otherwise the run would
@@ -742,7 +739,7 @@ def main(argv: list[str] | None = None) -> int:
     # Reuse the validator's actual schema loader so the check exercises the
     # same code path as the gate it is guarding — `is_file()` alone would
     # miss malformed JSON, invalid regex, and structural-classifier failures.
-    required_schema = repo_root / "spec" / "schema" / "plan" / "shape_expr.schema.json"
+    required_schema = repo_root / "spec" / "schema" / "ir" / "shape_expr.schema.json"
     try:
         from tools.validate_pipeline_semantics import (
             _get_shape_expr_patterns,

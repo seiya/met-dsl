@@ -6,8 +6,8 @@ from __future__ import annotations
 from typing import Any
 
 STAGE_META_FILENAME_BY_STEP: dict[str, str] = {
-    "plan": "plan_meta.json",
-    "generate": "generate_meta.json",
+    "compile": "ir_meta.json",
+    "generate": "source_meta.json",
 }
 
 STAGE_META_COMMON_REQUIRED_KEYS: tuple[str, ...] = (
@@ -19,7 +19,7 @@ STAGE_META_COMMON_REQUIRED_KEYS: tuple[str, ...] = (
 )
 
 STAGE_META_EXTRA_REQUIRED_KEYS: dict[str, tuple[str, ...]] = {
-    "plan": (),
+    "compile": (),
     "generate": (),
 }
 

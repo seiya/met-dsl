@@ -113,10 +113,10 @@ TEST_OUTCOME_VALUES = {"pass", "fail", "xfail", "skipped", "blocked"}
 # default canonical reference for the validator's pinned rules.
 _BUNDLED_SHAPE_EXPR_SCHEMA_PATH = (
     Path(__file__).resolve().parent.parent
-    / "spec" / "schema" / "plan" / "shape_expr.schema.json"
+    / "spec" / "schema" / "ir" / "shape_expr.schema.json"
 )
 # Active repo_root for schema resolution. Set by main() via --repo-root and by
-# stage-level entry points (validate, validate_plan_stage, ...). When set, the
+# stage-level entry points (validate, validate_compile_stage, ...). When set, the
 # target repo's spec/schema/... is preferred over the validator bundle, so a
 # repo with diverged shape_expr rules is validated against ITS rules rather
 # than the validator-installation's bundled copy.
@@ -155,7 +155,7 @@ def _resolve_shape_expr_schema_path(repo_root: "Path | None" = None) -> Path:
     Resolution rules (fail-closed when scope is in effect):
       - If `repo_root` is provided OR `_active_repo_root_for_schema` is set,
         the validation has a target repo in scope. Require the target's
-        `<repo_root>/spec/schema/plan/shape_expr.schema.json`. If it is
+        `<repo_root>/spec/schema/ir/shape_expr.schema.json`. If it is
         missing, raise `RuntimeError` instead of silently falling back to
         the validator bundle — the caller (CLI main) converts this into a
         structured `pipeline semantic validation: FAIL` violation. Falling
@@ -177,11 +177,11 @@ def _resolve_shape_expr_schema_path(repo_root: "Path | None" = None) -> Path:
         if active is not None:
             chosen = active
     if chosen is not None:
-        candidate = chosen / "spec" / "schema" / "plan" / "shape_expr.schema.json"
+        candidate = chosen / "spec" / "schema" / "ir" / "shape_expr.schema.json"
         if not candidate.is_file():
             raise RuntimeError(
                 f"shape_expr schema not found at {candidate}. "
-                "Canonical source: spec/schema/plan/shape_expr.schema.json. "
+                "Canonical source: spec/schema/ir/shape_expr.schema.json. "
                 "When a repo_root is in scope (--repo-root or active context), "
                 "the target repo must ship this schema; the validator bundle is "
                 "not used as a silent fallback."
@@ -206,19 +206,19 @@ def _load_shape_expr_patterns_by_mtime(
     except FileNotFoundError as exc:
         raise RuntimeError(
             f"shape_expr schema not found at {schema_path}. "
-            "Canonical source: spec/schema/plan/shape_expr.schema.json"
+            "Canonical source: spec/schema/ir/shape_expr.schema.json"
         ) from exc
     except OSError as exc:
         raise RuntimeError(
             f"shape_expr schema {schema_path} is unreadable: {exc}. "
-            "Canonical source: spec/schema/plan/shape_expr.schema.json"
+            "Canonical source: spec/schema/ir/shape_expr.schema.json"
         ) from exc
     try:
         schema = json.loads(schema_text)
     except json.JSONDecodeError as exc:
         raise RuntimeError(
             f"shape_expr schema {schema_path} is malformed JSON: {exc}. "
-            "Canonical source: spec/schema/plan/shape_expr.schema.json"
+            "Canonical source: spec/schema/ir/shape_expr.schema.json"
         ) from exc
     # Structural validation: every malformed-but-valid-JSON case must produce
     # a RuntimeError so callers (CLI main + run_workflow startup guard) emit
@@ -333,12 +333,12 @@ def _load_shape_expr_patterns_cached(
     except FileNotFoundError as exc:
         raise RuntimeError(
             f"shape_expr schema not found at {schema_path}. "
-            "Canonical source: spec/schema/plan/shape_expr.schema.json"
+            "Canonical source: spec/schema/ir/shape_expr.schema.json"
         ) from exc
     except OSError as exc:
         raise RuntimeError(
             f"shape_expr schema {schema_path} is unreadable: {exc}. "
-            "Canonical source: spec/schema/plan/shape_expr.schema.json"
+            "Canonical source: spec/schema/ir/shape_expr.schema.json"
         ) from exc
     return _load_shape_expr_patterns_by_mtime(schema_path_str, mtime_ns)
 
@@ -355,8 +355,8 @@ def _get_shape_expr_patterns(
 ) -> tuple[tuple[re.Pattern[str], ...], tuple[re.Pattern[str], ...]]:
     schema_path = _resolve_shape_expr_schema_path(repo_root)
     return _load_shape_expr_patterns_cached(str(schema_path))
-REQUIRED_WORKFLOW_STEPS = ("plan", "generate", "build", "execute", "judge")
-SUBSTEP_WORKFLOW_STEPS = frozenset({"plan", "generate", "tune"})
+REQUIRED_WORKFLOW_STEPS = ("compile", "generate", "build", "validate")
+SUBSTEP_WORKFLOW_STEPS = frozenset({"compile", "generate", "validate"})
 AGENT_TERMINAL_STATUSES = {"pass", "fail", "blocked", "timeout", "cancel"}
 
 # Generate-stage static lint (MCP run_linter); see docs/workflow/WORKFLOW_CORE.md and docs/workflow/phases/phase_02_generate.md
@@ -376,9 +376,9 @@ _NODE_KEY_SAFE_PATTERN_LINEAGE = re.compile(
 )
 _SLUG_DATE_SEQ3_PATTERN = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*_(\d{8})_(\d{3})$")
 _STAGE_DATE_SEQ3_PATTERNS: dict[str, re.Pattern[str]] = {
-    "gen": re.compile(r"^gen_(\d{8})_(\d{3})$"),
-    "build": re.compile(r"^build_(\d{8})_(\d{3})$"),
-    "exec": re.compile(r"^exec_(\d{8})_(\d{3})$"),
+    "src": re.compile(r"^src_(\d{8})_(\d{3})$"),
+    "bin": re.compile(r"^bin_(\d{8})_(\d{3})$"),
+    "run": re.compile(r"^run_(\d{8})_(\d{3})$"),
 }
 
 
@@ -438,7 +438,7 @@ def _required_launch_prompt_markers_for_role(
         "orchestration_id:",
         "agent_run_id:",
         "parent_agent_run_id:",
-        "plan_ref:",
+        "ir_ref:",
         "pipeline_ref:",
         "dependency_ref:",
         "skill_name:",
@@ -1156,7 +1156,7 @@ class NodeExecution:
 class NodeLineage:
     node_key: str
     pipeline_dir: Path
-    plan_ref: str | None
+    ir_ref: str | None
     dependency_ref: str | None
 
 
@@ -1194,10 +1194,10 @@ def _node_executions(
     for pipeline_dir in targets:
         if not pipeline_dir.is_dir():
             continue
-        execute_root = pipeline_dir / "execute"
-        if not execute_root.exists():
+        runs_root = pipeline_dir / "runs"
+        if not runs_root.exists():
             continue
-        for exec_dir in sorted(execute_root.iterdir()):
+        for exec_dir in sorted(runs_root.iterdir()):
             if not exec_dir.is_dir():
                 continue
             for kind_dir in sorted(exec_dir.iterdir()):
@@ -1262,13 +1262,13 @@ def _lineage_records(
         node_key = lineage.get("node_key")
         if not isinstance(node_key, str) or not node_key.strip():
             continue
-        plan_ref = lineage.get("plan_ref")
+        ir_ref = lineage.get("ir_ref")
         dep_ref = lineage.get("dependency_ref")
         records.append(
             NodeLineage(
                 node_key=node_key.strip(),
                 pipeline_dir=pipeline_dir,
-                plan_ref=plan_ref if isinstance(plan_ref, str) else None,
+                ir_ref=ir_ref if isinstance(ir_ref, str) else None,
                 dependency_ref=dep_ref if isinstance(dep_ref, str) else None,
             )
         )
@@ -1320,17 +1320,17 @@ def _validate_pipeline_lineage_presence(
                 )
 
 
-def _validate_generate_meta_json_files(
+def _validate_source_meta_json_files(
     pipeline_dir: Path,
     violations: list[str],
 ) -> None:
-    generate_root = pipeline_dir / "generate"
+    generate_root = pipeline_dir / "source"
     if not generate_root.exists() or not generate_root.is_dir():
         return
     for gen_dir in sorted(generate_root.iterdir()):
         if not gen_dir.is_dir():
             continue
-        meta_path = gen_dir / "generate_meta.json"
+        meta_path = gen_dir / "source_meta.json"
         if not meta_path.exists():
             continue
         try:
@@ -1360,11 +1360,11 @@ def _validate_generate_meta_json_files(
                 violations.append(f"{meta_path}:context_isolated must be boolean")
         status_token = str(data.get("verification_status", "")).strip().lower()
         if status_token == "pass":
-            _validate_generate_meta_lint_shape(meta_path, data, violations)
+            _validate_source_meta_lint_shape(meta_path, data, violations)
 
 
-def _validate_plan_meta_json(plan_dir: Path, violations: list[str]) -> None:
-    meta_path = plan_dir / STAGE_META_FILENAME_BY_STEP["plan"]
+def _validate_ir_meta_json(ir_dir: Path, violations: list[str]) -> None:
+    meta_path = ir_dir / STAGE_META_FILENAME_BY_STEP["compile"]
     if not meta_path.exists():
         violations.append(f"{meta_path}: missing")
         return
@@ -1376,7 +1376,7 @@ def _validate_plan_meta_json(plan_dir: Path, violations: list[str]) -> None:
     if not isinstance(data, dict):
         violations.append(f"{meta_path}: must be json object")
         return
-    required_keys = required_meta_keys_for_step("plan")
+    required_keys = required_meta_keys_for_step("compile")
     for key in required_keys:
         if key not in data:
             violations.append(f"{meta_path}: missing required key {key!r}")
@@ -1407,7 +1407,7 @@ _MCP_AUDIT_LOG_BASENAME: str = "mcp_command_log.jsonl"
 
 
 def _canonical_mcp_log_refs_for_lint(meta_path: Path, repo_root: Path) -> set[str]:
-    """Canonical command_log_ref placements for `generate_meta.json` lint validation.
+    """Canonical command_log_ref placements for `source_meta.json` lint validation.
 
     Only one canonical placement: sibling under `<gen_dir>/src/`. A child agent
     that writes a forged mcp_command_log.jsonl elsewhere and points the
@@ -1476,16 +1476,16 @@ def _validate_trial_meta(repo_root: Path, execution: NodeExecution, violations: 
         violations.append(f"{trial_meta_path}:source_command_ref missing")
         return
 
-    # `source_generation_id` is a hard requirement for execute trial_meta —
+    # `source_source_id` is a hard requirement for execute trial_meta —
     # without it, validators cannot bind quality_check evidence to a specific
     # generation, and a writer could otherwise omit the field to silently
     # bypass `tool_name` / mandatory `run_program` checks. Legacy artifacts
     # under active validation must be re-recorded; post-migration writers
     # always emit the field.
-    _src_gen_raw = data.get("source_generation_id")
+    _src_gen_raw = data.get("source_source_id")
     if not isinstance(_src_gen_raw, str) or not _src_gen_raw.strip():
         violations.append(
-            f"{trial_meta_path}:source_generation_id is required (single "
+            f"{trial_meta_path}:source_source_id is required (single "
             "trusted source for cross-phase quality_check provenance and "
             "the gate for strict source_command_ref validation)."
         )
@@ -1493,7 +1493,7 @@ def _validate_trial_meta(repo_root: Path, execution: NodeExecution, violations: 
     # binary this execute used. Without it, a trial_meta could attribute its
     # results to one build while having actually executed a sibling build's
     # binary (mixed-build attribution).
-    _src_build_raw = data.get("source_build_id")
+    _src_build_raw = data.get("source_binary_id")
     _trial_source_build_id: str | None = None
     if not isinstance(_src_build_raw, str) or not _src_build_raw.strip():
         violations.append(
@@ -1503,10 +1503,10 @@ def _validate_trial_meta(repo_root: Path, execution: NodeExecution, violations: 
         )
     else:
         _trial_source_build_id = _src_build_raw.strip()
-        # Verify the referenced build directory exists with a bin/ subdirectory.
+        # Verify the referenced binary directory exists with a bin/ subdirectory.
         _build_bin = (
             execution.pipeline_dir
-            / "build"
+            / "binary"
             / _trial_source_build_id
             / "bin"
         )
@@ -1568,7 +1568,7 @@ def _validate_trial_meta(repo_root: Path, execution: NodeExecution, violations: 
         # report the same tool. Execute trial_meta only documents tools
         # actually invoked by the execute role (run_program / run_quality_checks).
         # `compile_project` is a build-phase tool whose evidence belongs in
-        # build_meta.json, not execute trial_meta — accepting it here would
+        # binary_meta.json, not execute trial_meta — accepting it here would
         # let a child claim build provenance through execute records without
         # any role-specific lineage validation.
         recognized_tool_names = {"run_program", "run_quality_checks"}
@@ -1791,7 +1791,7 @@ def _validate_raw_evidence(
                         missing_required = set(expected_state_variables.keys()) - set(state_variables)
                         if missing_required:
                             violations.append(
-                                f"{schema_path}: missing required state_variables from derived_contract ({sorted(missing_required)})"
+                                f"{schema_path}: missing required state_variables from io_contract ({sorted(missing_required)})"
                             )
                         for name, expected_shape in expected_state_variables.items():
                             declared_shape = state_variable_shapes.get(name)
@@ -1799,16 +1799,16 @@ def _validate_raw_evidence(
                                 continue
                             if _canonical_shape_expr(expected_shape) != _canonical_shape_expr(declared_shape):
                                 violations.append(
-                                    f"{schema_path}: variable {name} shape_expr must match derived_contract ({expected_shape})"
+                                    f"{schema_path}: variable {name} shape_expr must match io_contract ({expected_shape})"
                                 )
 
                     if expected_time_variable and expected_time_variable != time_variable:
                         violations.append(
-                            f"{schema_path}: time_variable must match derived_contract ({expected_time_variable})"
+                            f"{schema_path}: time_variable must match io_contract ({expected_time_variable})"
                         )
                     if expected_time_variable and _canonical_shape_expr(expected_time_shape_expr) != _canonical_shape_expr(time_shape_expr):
                         violations.append(
-                            f"{schema_path}: time_shape_expr must match derived_contract ({expected_time_shape_expr})"
+                            f"{schema_path}: time_shape_expr must match io_contract ({expected_time_shape_expr})"
                         )
 
                 if len(snapshot_data_files) < required_snapshot_min_samples:
@@ -1921,7 +1921,7 @@ def _validate_execution_json_outputs(execution: NodeExecution, violations: list[
 def _validate_generate_outputs(
     repo_root: Path, execution: NodeExecution, violations: list[str]
 ) -> None:
-    generate_root = execution.pipeline_dir / "generate"
+    generate_root = execution.pipeline_dir / "source"
     if not generate_root.exists():
         violations.append(f"{generate_root}: missing")
         return
@@ -2002,13 +2002,13 @@ def _validate_generate_outputs(
 def _validate_generate_outputs_for_generation(
     repo_root: Path,
     execution: NodeExecution,
-    generation_id: str,
+    source_id: str,
     violations: list[str],
 ) -> None:
-    gen_dir = execution.pipeline_dir / "generate" / generation_id
+    gen_dir = execution.pipeline_dir / "source" / source_id
     if not gen_dir.is_dir():
         violations.append(
-            f"{gen_dir}: missing generate directory for generation_id={generation_id!r}"
+            f"{gen_dir}: missing generate directory for source_id={source_id!r}"
         )
         return
     src_dir = gen_dir / "src"
@@ -2106,45 +2106,94 @@ def _dependency_resolved_for_execution(repo_root: Path, execution: NodeExecution
     dep_path = repo_root / dependency_ref
     if not dep_path.exists():
         return None
+    # spec.ir.yaml is YAML; legacy dependency.resolved.yaml was also YAML.
+    # Older fixtures sometimes wrote JSON, so fall back to the JSON loader.
     try:
-        dep_data = _read_json(dep_path)
-    except json.JSONDecodeError:
+        dep_data = _read_yaml(dep_path)
+    except (json.JSONDecodeError, yaml.YAMLError):
+        try:
+            dep_data = _read_json(dep_path)
+        except json.JSONDecodeError:
+            return None
+    if not isinstance(dep_data, dict):
         return None
-    return dep_data if isinstance(dep_data, dict) else None
+    # New IR nests the dependency block under spec.ir.yaml.dependency. Unwrap
+    # it so callers continue to see the legacy flat keys.
+    if isinstance(dep_data.get("dependency"), dict):
+        nested = dep_data["dependency"]
+        if "direct_deps" in nested or "transitive_deps" in nested or "node_key" in nested:
+            return nested
+    return dep_data
 
 
-def _plan_dir_for_execution(repo_root: Path, execution: NodeExecution) -> Path | None:
+def _ir_dir_for_execution(repo_root: Path, execution: NodeExecution) -> Path | None:
     lineage_path = execution.pipeline_dir / "lineage.json"
     if not lineage_path.exists():
         return None
 
     lineage = _read_json(lineage_path)
-    plan_ref = lineage.get("plan_ref")
-    if not isinstance(plan_ref, str) or not plan_ref.startswith("workspace/"):
+    ir_ref = lineage.get("ir_ref")
+    if not isinstance(ir_ref, str) or not ir_ref.startswith("workspace/"):
         return None
 
-    plan_dir = repo_root / plan_ref
-    if not plan_dir.exists() or not plan_dir.is_dir():
+    ir_dir = repo_root / ir_ref
+    if not ir_dir.exists() or not ir_dir.is_dir():
         return None
-    return plan_dir
+    return ir_dir
 
 
-def _derived_contract_for_execution(
+def _io_contract_for_execution(
     repo_root: Path, execution: NodeExecution
 ) -> dict[str, Any] | None:
-    plan_dir = _plan_dir_for_execution(repo_root, execution)
-    if plan_dir is None:
+    ir_dir = _ir_dir_for_execution(repo_root, execution)
+    if ir_dir is None:
         return None
 
-    contract_path = plan_dir / "derived_contract.json"
+    contract_path = ir_dir / "spec.ir.yaml"
     if not contract_path.exists():
         return None
 
     try:
-        data = _read_json(contract_path)
-    except json.JSONDecodeError:
+        data = _read_yaml(contract_path)
+    except (json.JSONDecodeError, yaml.YAMLError):
+        try:
+            data = _read_json(contract_path)
+        except json.JSONDecodeError:
+            return None
+    if not isinstance(data, dict):
         return None
-    return data if isinstance(data, dict) else None
+    # Unwrap the io_contract section if the doc uses the new IR nesting:
+    # spec.ir.yaml.io_contract holds inputs / outputs / raw_requirements /
+    # test_evidence_requirements / semantic_dependency as siblings.  Tests and
+    # callers that expect derived_contract.json's flat layout will see those
+    # siblings at the top level after this transform.
+    if (
+        isinstance(data.get("io_contract"), dict)
+        and (
+            "inputs" in data["io_contract"]
+            or "outputs" in data["io_contract"]
+            or "raw_requirements" in data["io_contract"]
+            or "test_evidence_requirements" in data["io_contract"]
+        )
+        and "raw_requirements" not in data
+    ):
+        section = data["io_contract"]
+        flattened: dict[str, Any] = {
+            "io_contract": {
+                "inputs": section.get("inputs"),
+                "outputs": section.get("outputs"),
+            },
+        }
+        for key in (
+            "raw_requirements",
+            "semantic_dependency",
+            "test_evidence_requirements",
+            "source",
+        ):
+            if key in section:
+                flattened[key] = section[key]
+        return flattened
+    return data
 
 
 def _read_yaml(path: Path) -> Any:
@@ -2154,11 +2203,11 @@ def _read_yaml(path: Path) -> Any:
 def _algorithm_contract_for_execution(
     repo_root: Path, execution: NodeExecution
 ) -> dict[str, Any] | None:
-    plan_dir = _plan_dir_for_execution(repo_root, execution)
-    if plan_dir is None:
+    ir_dir = _ir_dir_for_execution(repo_root, execution)
+    if ir_dir is None:
         return None
 
-    contract_path = plan_dir / "algorithm.resolved.yaml"
+    contract_path = ir_dir / "spec.ir.yaml"
     if not contract_path.exists():
         return None
 
@@ -2169,20 +2218,20 @@ def _algorithm_contract_for_execution(
 def _algorithm_contract_path_for_execution(
     repo_root: Path, execution: NodeExecution
 ) -> Path | None:
-    plan_dir = _plan_dir_for_execution(repo_root, execution)
-    if plan_dir is None:
+    ir_dir = _ir_dir_for_execution(repo_root, execution)
+    if ir_dir is None:
         return None
-    return plan_dir / "algorithm.resolved.yaml"
+    return ir_dir / "spec.ir.yaml"
 
 
 def _impl_contract_for_execution(
     repo_root: Path, execution: NodeExecution
 ) -> dict[str, Any] | None:
-    plan_dir = _plan_dir_for_execution(repo_root, execution)
-    if plan_dir is None:
+    ir_dir = _ir_dir_for_execution(repo_root, execution)
+    if ir_dir is None:
         return None
 
-    contract_path = plan_dir / "impl.resolved.yaml"
+    contract_path = ir_dir / "spec.ir.yaml"
     if not contract_path.exists():
         return None
 
@@ -2190,7 +2239,14 @@ def _impl_contract_for_execution(
         data = _read_yaml(contract_path)
     except yaml.YAMLError:
         return None
-    return data if isinstance(data, dict) else None
+    if not isinstance(data, dict):
+        return None
+    # spec.ir.yaml nests impl-defaults under `impl_defaults:` (was a flat
+    # impl.resolved.yaml in the legacy layout).
+    impl_section = data.get("impl_defaults")
+    if isinstance(impl_section, dict):
+        return impl_section
+    return data
 
 
 def _resolve_logged_path(repo_root: Path, raw_path: str) -> Path:
@@ -2220,7 +2276,7 @@ def _quality_check_preset_from_command(command: list[str]) -> str | None:
 
 
 def _generate_src_dirs(pipeline_dir: Path) -> list[Path]:
-    generate_root = pipeline_dir / "generate"
+    generate_root = pipeline_dir / "source"
     if not generate_root.exists():
         return []
     return sorted(
@@ -2295,13 +2351,13 @@ def _algorithm_state_contract(contract: dict[str, Any]) -> dict[str, Any] | None
     return None
 
 
-def _derived_contract_path_for_execution(
+def _io_contract_path_for_execution(
     repo_root: Path, execution: NodeExecution
 ) -> Path | None:
-    plan_dir = _plan_dir_for_execution(repo_root, execution)
-    if plan_dir is None:
+    ir_dir = _ir_dir_for_execution(repo_root, execution)
+    if ir_dir is None:
         return None
-    return plan_dir / "derived_contract.json"
+    return ir_dir / "spec.ir.yaml"
 
 
 def _tests_path_from_contract(repo_root: Path, contract: dict[str, Any]) -> Path | None:
@@ -2319,7 +2375,7 @@ def _tests_path_from_contract(repo_root: Path, contract: dict[str, Any]) -> Path
 
 
 def _tests_path_for_execution(repo_root: Path, execution: NodeExecution) -> Path | None:
-    contract = _derived_contract_for_execution(repo_root, execution)
+    contract = _io_contract_for_execution(repo_root, execution)
     if not isinstance(contract, dict):
         return None
     return _tests_path_from_contract(repo_root, contract)
@@ -2439,8 +2495,8 @@ def _metrics_basis_variable_keys(entry: dict[str, Any]) -> set[str]:
     }
 
 
-def _impl_language_from_plan_dir(repo_root: Path, plan_dir: Path) -> str | None:
-    impl_path = plan_dir / "impl.resolved.yaml"
+def _impl_language_from_plan_dir(repo_root: Path, ir_dir: Path) -> str | None:
+    impl_path = ir_dir / "spec.ir.yaml"
     if not impl_path.exists():
         return None
     try:
@@ -2449,7 +2505,14 @@ def _impl_language_from_plan_dir(repo_root: Path, plan_dir: Path) -> str | None:
         return None
     if not isinstance(data, dict):
         return None
-    toolchain = data.get("toolchain")
+    # New IR nests toolchain under impl_defaults.  Fall back to a flat
+    # `toolchain:` key when the doc still uses the legacy layout (eg. tests
+    # that hand-construct only the impl section).
+    impl_defaults = data.get("impl_defaults")
+    if isinstance(impl_defaults, dict):
+        toolchain = impl_defaults.get("toolchain")
+    else:
+        toolchain = data.get("toolchain")
     if not isinstance(toolchain, dict):
         return None
     raw = toolchain.get("language")
@@ -2472,7 +2535,7 @@ def _infer_run_linter_preset_from_command(command: list[Any]) -> str | None:
     return None
 
 
-def _validate_generate_meta_lint_shape(
+def _validate_source_meta_lint_shape(
     meta_path: Path, data: dict[str, Any], violations: list[str]
 ) -> None:
     ref = data.get("lint_command_ref")
@@ -2518,7 +2581,7 @@ def _validate_generate_lint_command_logs(
 
     if not impl_language:
         violations.append(
-            f"{meta_path}: cannot validate static lint without impl.resolved.yaml toolchain.language"
+            f"{meta_path}: cannot validate static lint without spec.ir.yaml toolchain.language"
         )
         return
 
@@ -2704,9 +2767,9 @@ def _find_command_log_record(
 
 
 def _parse_shape_expr(expr: str) -> tuple[bool, list[str], str]:
-    """Validate shape_expr against spec/schema/plan/shape_expr.schema.json.
+    """Validate shape_expr against spec/schema/ir/shape_expr.schema.json.
 
-    Allowed forms (canonical source: spec/schema/plan/shape_expr.schema.json):
+    Allowed forms (canonical source: spec/schema/ir/shape_expr.schema.json):
       - "scalar" (case-insensitive)
       - "[d1, d2, ...]" with non-empty dim tokens
       - "(d1, d2, ...)" with non-empty dim tokens
@@ -2730,7 +2793,7 @@ def _parse_shape_expr(expr: str) -> tuple[bool, list[str], str]:
             False,
             [],
             "shape_expr must be scalar or [dim1,dim2,...] or (dim1,dim2,...). "
-            "See spec/schema/plan/shape_expr.schema.json for canonical forms; "
+            "See spec/schema/ir/shape_expr.schema.json for canonical forms; "
             "function-call notations such as vector(N), matrix(M,N), tensor are forbidden.",
         )
     body_match = _SHAPE_EXPR_DIM_SPLIT.fullmatch(token)
@@ -2880,7 +2943,7 @@ def _state_snapshot_requirement_details(
                         required_variables[raw_name.strip()] = _canonical_shape_expr(raw_shape_expr)
 
             # Legacy `state_variables` shorthand is no longer recognized.
-            # `_validate_derived_contract_schema` separately rejects schemas
+            # `_validate_io_contract_schema` separately rejects schemas
             # that omit `variables`, so missing required-evidence shapes fail
             # closed there with a clear violation.
             raw_time_var = schema.get("time_variable")
@@ -2903,7 +2966,7 @@ def _normalize_raw_evidence_artifact(token: str) -> str | None:
 def _raw_requirements_for_execution(
     repo_root: Path, execution: NodeExecution
 ) -> dict[str, Any] | None:
-    contract = _derived_contract_for_execution(repo_root, execution)
+    contract = _io_contract_for_execution(repo_root, execution)
     if not isinstance(contract, dict):
         return None
 
@@ -2975,7 +3038,7 @@ def _state_snapshot_required(repo_root: Path, execution: NodeExecution) -> bool:
 
 
 def _semantic_required_sources(repo_root: Path, execution: NodeExecution) -> set[str]:
-    contract = _derived_contract_for_execution(repo_root, execution)
+    contract = _io_contract_for_execution(repo_root, execution)
     if not isinstance(contract, dict):
         return set()
 
@@ -3012,18 +3075,52 @@ def _semantic_required_sources(repo_root: Path, execution: NodeExecution) -> set
     return required
 
 
-def _validate_derived_contract_file(
+def _validate_io_contract_file(
     repo_root: Path, contract_path: Path, violations: list[str]
 ) -> None:
     try:
-        contract = _read_json(contract_path)
-    except json.JSONDecodeError:
-        violations.append(f"{contract_path}: invalid json")
-        return
+        contract = _read_yaml(contract_path)
+    except (json.JSONDecodeError, yaml.YAMLError):
+        try:
+            contract = _read_json(contract_path)
+        except json.JSONDecodeError:
+            violations.append(f"{contract_path}: invalid json")
+            return
 
     if not isinstance(contract, dict):
         violations.append(f"{contract_path}: must be json object")
         return
+
+    # New IR: spec.ir.yaml has the io_contract section nested under
+    # `io_contract:` and contains inputs / outputs / raw_requirements /
+    # test_evidence_requirements / semantic_dependency as siblings.  The
+    # original validator was written against derived_contract.json's flat
+    # structure where `io_contract`, `raw_requirements`, etc. were all
+    # top-level keys.  When we see the new nested form, lift the io_contract
+    # section to act as the contract dict, but keep `io_contract.inputs`
+    # path semantics by wrapping inputs/outputs in a synthetic `io_contract`
+    # key.
+    if (
+        isinstance(contract.get("io_contract"), dict)
+        and ("inputs" in contract["io_contract"] or "outputs" in contract["io_contract"])
+        and "raw_requirements" not in contract  # not legacy flat form
+    ):
+        io_section = contract["io_contract"]
+        new_contract: dict[str, Any] = {
+            "io_contract": {
+                "inputs": io_section.get("inputs"),
+                "outputs": io_section.get("outputs"),
+            },
+        }
+        for key in (
+            "raw_requirements",
+            "semantic_dependency",
+            "test_evidence_requirements",
+            "source",
+        ):
+            if key in io_section:
+                new_contract[key] = io_section[key]
+        contract = new_contract
 
     output_items: list[tuple[int, dict[str, Any]]] = []
     io_contract = contract.get("io_contract")
@@ -3306,7 +3403,7 @@ def _validate_derived_contract_file(
 
     if "numerical_kernel_contract" in contract:
         violations.append(
-            f"{contract_path}:numerical_kernel_contract must not appear in derived_contract.json; move generation contract to algorithm.resolved.yaml"
+            f"{contract_path}:numerical_kernel_contract must not appear in spec.ir.yaml; move generation contract to spec.ir.yaml"
         )
 
     _validate_test_evidence_requirements(
@@ -3319,23 +3416,23 @@ def _validate_derived_contract_file(
     )
 
 
-def _validate_derived_contract_schema(
+def _validate_io_contract_schema(
     repo_root: Path, execution: NodeExecution, violations: list[str]
 ) -> None:
-    contract_path = _derived_contract_path_for_execution(repo_root, execution)
+    contract_path = _io_contract_path_for_execution(repo_root, execution)
     if contract_path is None:
         violations.append(
-            f"{execution.pipeline_dir / 'lineage.json'}: plan_ref missing; cannot resolve derived_contract.json"
+            f"{execution.pipeline_dir / 'lineage.json'}: ir_ref missing; cannot resolve spec.ir.yaml"
         )
         return
     if not contract_path.exists():
         violations.append(f"{contract_path}: missing")
         return
-    _validate_derived_contract_file(repo_root, contract_path, violations)
+    _validate_io_contract_file(repo_root, contract_path, violations)
 
 
 def _extract_spec_var_names(derived_path: Path) -> set[str] | None:
-    """Return spec-traceable variable names from derived_contract.json for provenance checks.
+    """Return spec-traceable variable names from spec.ir.yaml for provenance checks.
 
     Collects names from io_contract.inputs/outputs AND raw_requirements evidence schema
     variables — the union of these two sets constitutes the full set of variables that
@@ -3346,12 +3443,26 @@ def _extract_spec_var_names(derived_path: Path) -> set[str] | None:
     hard-fail with an incomplete symbol set.
     """
     try:
-        data = _read_json(derived_path)
-    except (json.JSONDecodeError, OSError):
-        return None
+        data = _read_yaml(derived_path)
+    except (json.JSONDecodeError, yaml.YAMLError, OSError):
+        try:
+            data = _read_json(derived_path)
+        except (json.JSONDecodeError, OSError):
+            return None
     if not isinstance(data, dict):
         return None
+    # Unwrap the new IR layout where io_contract.{inputs,outputs} live inside
+    # the spec.ir.yaml `io_contract:` section.  When already in legacy flat
+    # form we'll see `inputs`/`outputs` at the root of `io_contract`.
     ic = data.get("io_contract")
+    if isinstance(ic, dict) and isinstance(ic.get("io_contract"), dict):
+        # Already double-nested: drill in once more
+        ic = ic["io_contract"]
+    elif isinstance(ic, dict) and "inputs" not in ic and "outputs" not in ic:
+        # io_contract section but inputs/outputs not visible at this level —
+        # try the section itself (the new IR sometimes stores inputs/outputs
+        # as siblings of raw_requirements at the same level)
+        pass
     if not isinstance(ic, dict):
         return None
     names: set[str] = set()
@@ -3362,7 +3473,7 @@ def _extract_spec_var_names(derived_path: Path) -> set[str] | None:
         for item in items:
             if not isinstance(item, dict):
                 # Non-dict item means the schema is malformed; skip provenance to avoid
-                # false failures (the derived_contract validator will flag this separately).
+                # false failures (the io_contract validator will flag this separately).
                 return None
             name = item.get("name")
             if not isinstance(name, str) or not name.strip():
@@ -3374,7 +3485,13 @@ def _extract_spec_var_names(derived_path: Path) -> set[str] | None:
     # state_snapshots entries are considered because derived-contract validation enforces
     # schema.variables structure exclusively for that artifact type; schemas on other
     # artifact entries are unchecked and could inject arbitrary names.
+    # raw_requirements may live at the root (legacy derived_contract.json) or
+    # nested under spec.ir.yaml.io_contract.raw_requirements (new IR).
     rr = data.get("raw_requirements")
+    if not isinstance(rr, dict):
+        io_section = data.get("io_contract")
+        if isinstance(io_section, dict):
+            rr = io_section.get("raw_requirements")
     if isinstance(rr, dict):
         evidence_list = rr.get("required_evidence")
         if isinstance(evidence_list, list):
@@ -3415,6 +3532,12 @@ def _validate_algorithm_contract_file(
     if not isinstance(contract, dict):
         violations.append(f"{contract_path}: must be mapping")
         return
+
+    # Unified IR: spec.ir.yaml has `algorithm:` key at the top.  Read the
+    # algorithm section if present; otherwise fall back to a flat document
+    # (still legal for tests that write the algorithm block at the root).
+    if isinstance(contract.get("algorithm"), dict):
+        contract = contract["algorithm"]
 
     algorithm_id = contract.get("algorithm_id")
     if not isinstance(algorithm_id, str) or not algorithm_id.strip():
@@ -3532,7 +3655,7 @@ def _validate_algorithm_contract_file(
             if "shape_expr" not in item:
                 violations.append(
                     f"{contract_path}:temporaries[{idx}].shape_expr is required for object-form entries "
-                    "(canonical source: spec/schema/plan/shape_expr.schema.json)"
+                    "(canonical source: spec/schema/ir/shape_expr.schema.json)"
                 )
             else:
                 shape_expr = item.get("shape_expr")
@@ -3548,8 +3671,8 @@ def _validate_algorithm_contract_file(
         violations.append(f"{contract_path}:derived_field_rules must be list")
 
     # Provenance check: every token in steps[*].inputs/outputs must be traceable to
-    # direct spec I/O (from derived_contract.json), temporaries, or derived_field_rules.
-    # Only performed when direct_spec_vars is provided (plan-stage with derived_contract.json).
+    # direct spec I/O (from spec.ir.yaml), temporaries, or derived_field_rules.
+    # Only performed when direct_spec_vars is provided (plan-stage with spec.ir.yaml).
     if direct_spec_vars is not None and isinstance(steps, list):
         tmp_names: set[str] = set()
         if isinstance(temporaries, list):
@@ -3672,7 +3795,7 @@ def _validate_algorithm_contract_schema(
     contract_path = _algorithm_contract_path_for_execution(repo_root, execution)
     if contract_path is None:
         violations.append(
-            f"{execution.pipeline_dir / 'lineage.json'}: plan_ref missing; cannot resolve algorithm.resolved.yaml"
+            f"{execution.pipeline_dir / 'lineage.json'}: ir_ref missing; cannot resolve spec.ir.yaml"
         )
         return
     if not contract_path.exists():
@@ -3767,7 +3890,7 @@ def _validate_metrics_basis_per_test(
     metrics_basis: dict[str, Any],
     violations: list[str],
 ) -> None:
-    contract = _derived_contract_for_execution(repo_root, execution)
+    contract = _io_contract_for_execution(repo_root, execution)
     if not isinstance(contract, dict):
         return
 
@@ -3982,7 +4105,7 @@ def _validate_dependency_operation_usage(
     if not dep_spec_ids:
         return
 
-    generate_root = execution.pipeline_dir / "generate"
+    generate_root = execution.pipeline_dir / "source"
     if not generate_root.exists():
         return
 
@@ -4031,7 +4154,7 @@ def _validate_runner_source_files(
 
 
 def _validate_runner_outputs(execution: NodeExecution, violations: list[str]) -> None:
-    generate_root = execution.pipeline_dir / "generate"
+    generate_root = execution.pipeline_dir / "source"
     runner_files = sorted(generate_root.glob("*/src/*_runner.f90"))
     if not runner_files:
         return
@@ -4053,21 +4176,21 @@ def _canonical_log_ref_for_run_program(
 
 
 def _canonical_log_ref_for_run_quality_checks(
-    pipeline_dir: Path, repo_root: Path, source_generation_id: str
+    pipeline_dir: Path, repo_root: Path, source_source_id: str
 ) -> str | None:
-    """Canonical command_log_ref placement for the trial's specific generation.
+    """Canonical command_log_ref placement for the trial's specific source.
 
-    skills/workflow-execute/SKILL.md L20 mandates run_quality_checks against
-    `project_dir=generate/<gen_id>/src/`. The canonical placement is bound
-    strictly to the trial_meta's declared `source_generation_id` — sibling
-    or older generations under the same pipeline are NOT acceptable. This
-    prevents a child from pointing trial_meta at a stale/unrelated
-    generation's audit log to forge quality-check evidence.
+    skills/workflow-validate-execute/SKILL.md mandates run_quality_checks
+    against `project_dir=source/<source_id>/src/`. The canonical placement
+    is bound strictly to the trial_meta's declared `source_source_id` —
+    sibling or older sources under the same pipeline are NOT acceptable.
+    This prevents a child from pointing trial_meta at a stale/unrelated
+    source's audit log to forge quality-check evidence.
     """
-    gen_id = source_generation_id.strip()
+    gen_id = source_source_id.strip()
     if not gen_id:
         return None
-    canonical = pipeline_dir / "generate" / gen_id / "src" / _MCP_AUDIT_LOG_BASENAME
+    canonical = pipeline_dir / "source" / gen_id / "src" / _MCP_AUDIT_LOG_BASENAME
     try:
         return canonical.resolve().relative_to(repo_root.resolve()).as_posix()
     except ValueError:
@@ -4094,12 +4217,12 @@ def _validate_run_program_inputs(
     # under `<pipeline>/build/<source_build_id>/bin/`. Otherwise an execute
     # could attribute results to one build while running a sibling build's
     # binary (mixed-build attribution forge).
-    _trial_source_build_id = data.get("source_build_id")
+    _trial_source_build_id = data.get("source_binary_id")
     _build_bin_abs: Path | None = None
     if isinstance(_trial_source_build_id, str) and _trial_source_build_id.strip():
         _build_bin_abs = (
             execution.pipeline_dir
-            / "build"
+            / "binary"
             / _trial_source_build_id.strip()
             / "bin"
         ).resolve()
@@ -4155,12 +4278,12 @@ def _validate_run_program_inputs(
             continue
 
         has_case_resolved = any(
-            isinstance(arg, str) and arg.endswith("case.resolved.yaml")
+            isinstance(arg, str) and arg.endswith("spec.ir.yaml")
             for arg in command
         )
         if not has_case_resolved:
             violations.append(
-                f"{trial_meta_path}:run_program command_id={command_id} must include case.resolved.yaml"
+                f"{trial_meta_path}:run_program command_id={command_id} must include spec.ir.yaml"
             )
 
         # Bind to source_build_id: the executed binary must live under the
@@ -4229,32 +4352,32 @@ def _validate_quality_check_commands(
 
     generate_src_dirs = _generate_src_dirs(execution.pipeline_dir)
     # The cross-phase canonical placement is bound strictly to the trial's
-    # `source_generation_id` (single source of truth). Sibling/older
+    # `source_source_id` (single source of truth). Sibling/older
     # generations under the same pipeline are not acceptable evidence for
     # this execute run.
-    source_generation_id_raw = data.get("source_generation_id")
-    source_generation_id: str | None = None
-    if isinstance(source_generation_id_raw, str) and source_generation_id_raw.strip():
-        source_generation_id = source_generation_id_raw.strip()
+    source_source_id_raw = data.get("source_source_id")
+    source_source_id: str | None = None
+    if isinstance(source_source_id_raw, str) and source_source_id_raw.strip():
+        source_source_id = source_source_id_raw.strip()
     canonical_qc_ref: str | None = None
-    if source_generation_id is not None:
+    if source_source_id is not None:
         canonical_qc_ref = _canonical_log_ref_for_run_quality_checks(
-            execution.pipeline_dir, repo_root, source_generation_id
+            execution.pipeline_dir, repo_root, source_source_id
         )
-        # Verify the declared generation actually exists (generate_meta.json
-        # present) and is in pass state. A forged source_generation_id could
+        # Verify the declared generation actually exists (source_meta.json
+        # present) and is in pass state. A forged source_source_id could
         # otherwise authorize an arbitrary path, and pointing at a failed or
         # superseded generation would credit stale evidence to this run.
-        if source_generation_id is not None and canonical_qc_ref is not None:
+        if source_source_id is not None and canonical_qc_ref is not None:
             gen_meta = (
                 execution.pipeline_dir
-                / "generate"
-                / source_generation_id
-                / "generate_meta.json"
+                / "source"
+                / source_source_id
+                / "source_meta.json"
             )
             if not gen_meta.is_file():
                 violations.append(
-                    f"{trial_meta_path}:source_generation_id={source_generation_id!r} "
+                    f"{trial_meta_path}:source_source_id={source_source_id!r} "
                     f"references a generation that does not exist on disk "
                     f"({gen_meta!s} missing)."
                 )
@@ -4271,7 +4394,7 @@ def _validate_quality_check_commands(
                         gen_status = raw_status.strip().lower()
                 if gen_status != "pass":
                     violations.append(
-                        f"{trial_meta_path}:source_generation_id={source_generation_id!r} "
+                        f"{trial_meta_path}:source_source_id={source_source_id!r} "
                         f"references a generation with verification_status="
                         f"{gen_status!r} (expected 'pass'). Stale or failed "
                         f"generations cannot serve as quality_check provenance."
@@ -4305,19 +4428,19 @@ def _validate_quality_check_commands(
             )
             continue
 
-        # source_generation_id is required when a run_quality_checks record
+        # source_source_id is required when a run_quality_checks record
         # is referenced — without it we cannot pin the canonical cross-phase
         # placement and would risk accepting evidence from a sibling/older
         # generation.
-        if source_generation_id is None:
+        if source_source_id is None:
             violations.append(
-                f"{trial_meta_path}:source_generation_id must be declared "
+                f"{trial_meta_path}:source_source_id must be declared "
                 f"when source_command_ref includes a run_quality_checks "
                 f"record (command_id={command_id})."
             )
             continue
         if canonical_qc_ref is None:
-            # generation_id present but generate_meta.json missing — already
+            # source_id present but source_meta.json missing — already
             # reported above. Skip per-entry violation to avoid duplication.
             continue
         log_ref_norm = log_ref.strip().rstrip("/")
@@ -4325,7 +4448,7 @@ def _validate_quality_check_commands(
             violations.append(
                 f"{trial_meta_path}:run_quality_checks command_id={command_id} "
                 f"command_log_ref must be the canonical MCP audit log placement "
-                f"for source_generation_id={source_generation_id!r} "
+                f"for source_source_id={source_source_id!r} "
                 f"(expected {canonical_qc_ref!r}, got {log_ref_norm!r}). "
                 "Non-canonical or cross-generation placements are rejected to "
                 "prevent forged or stale tool-execution evidence."
@@ -4392,7 +4515,7 @@ def _validate_quality_check_commands(
             if cwd_path is None:
                 violations.append(
                     f"{trial_meta_path}:run_quality_checks command_id={command_id} "
-                    "must record cwd under generate/<generation_id>/src"
+                    "must record cwd under source/<source_id>/src"
                 )
                 continue
 
@@ -4401,7 +4524,7 @@ def _validate_quality_check_commands(
             ):
                 violations.append(
                     f"{trial_meta_path}:run_quality_checks command_id={command_id} "
-                    "must run inside generate/<generation_id>/src for make-based quality check"
+                    "must run inside source/<source_id>/src for make-based quality check"
                 )
                 continue
 
@@ -4672,7 +4795,7 @@ def _validate_llm_semantic_review(
 
 
 def _source_fingerprint(execution: NodeExecution) -> SourceFingerprint | None:
-    generate_root = execution.pipeline_dir / "generate"
+    generate_root = execution.pipeline_dir / "source"
     gen_dirs = sorted(d for d in generate_root.iterdir() if d.is_dir()) if generate_root.exists() else []
     if not gen_dirs:
         return None
@@ -5372,9 +5495,9 @@ def _validate_orchestration_hierarchy(
         )
 
 
-def _resolve_plan_dir(repo_root: Path, workspace_root: str, raw_plan_ref: str) -> Path:
+def _resolve_ir_dir(repo_root: Path, workspace_root: str, raw_ir_ref: str) -> Path:
     workspace_path = (repo_root / workspace_root).resolve()
-    candidate = Path(raw_plan_ref)
+    candidate = Path(raw_ir_ref)
     if not candidate.is_absolute():
         candidate = (repo_root / candidate).resolve()
     else:
@@ -5383,14 +5506,14 @@ def _resolve_plan_dir(repo_root: Path, workspace_root: str, raw_plan_ref: str) -
         candidate.relative_to(workspace_path.resolve())
     except ValueError as exc:
         raise ValueError(
-            f"plan_ref must be under {workspace_path}: {candidate}"
+            f"ir_ref must be under {workspace_path}: {candidate}"
         ) from exc
-    plans_root = workspace_path / "plans"
+    ir_root = workspace_path / "ir"
     try:
-        candidate.relative_to(plans_root.resolve())
+        candidate.relative_to(ir_root.resolve())
     except ValueError as exc:
         raise ValueError(
-            f"plan_ref must be under {plans_root}: {candidate}"
+            f"ir_ref must be under {ir_root}: {candidate}"
         ) from exc
     return candidate
 
@@ -5420,8 +5543,8 @@ def _resolve_pipeline_dir_for_stage(
     return candidate
 
 
-def _plan_dependency_node_key(plan_dir: Path) -> str | None:
-    dep_path = plan_dir / "dependency.resolved.yaml"
+def _plan_dependency_node_key(ir_dir: Path) -> str | None:
+    dep_path = ir_dir / "spec.ir.yaml"
     if not dep_path.exists():
         return None
     try:
@@ -5435,8 +5558,8 @@ def _plan_dependency_node_key(plan_dir: Path) -> str | None:
     return None
 
 
-def _try_load_optional_plan_yaml(plan_dir: Path, name: str, violations: list[str]) -> None:
-    path = plan_dir / name
+def _try_load_optional_plan_yaml(ir_dir: Path, name: str, violations: list[str]) -> None:
+    path = ir_dir / name
     if not path.exists():
         return
     try:
@@ -5451,42 +5574,42 @@ def _try_load_optional_plan_yaml(plan_dir: Path, name: str, violations: list[str
         violations.append(f"{path}: must be mapping at top level")
 
 
-def validate_plan_stage(
+def validate_compile_stage(
     repo_root: Path,
     workspace_root: str,
-    plan_ref: str,
+    ir_ref: str,
 ) -> list[str]:
     with _pinned_repo_root_for_schema(repo_root):
-        return _validate_plan_stage_impl(repo_root, workspace_root, plan_ref)
+        return _validate_compile_stage_impl(repo_root, workspace_root, ir_ref)
 
 
-def _validate_plan_stage_impl(
+def _validate_compile_stage_impl(
     repo_root: Path,
     workspace_root: str,
-    plan_ref: str,
+    ir_ref: str,
 ) -> list[str]:
     violations: list[str] = []
     normalized_workspace_root = _normalize_workspace_root_token(workspace_root)
     if normalized_workspace_root != "workspace":
         return [f"workspace_root must be exactly 'workspace' (given: {workspace_root})"]
     try:
-        plan_dir = _resolve_plan_dir(repo_root, workspace_root, plan_ref)
+        ir_dir = _resolve_ir_dir(repo_root, workspace_root, ir_ref)
     except ValueError as exc:
         return [str(exc)]
 
-    derived_path = plan_dir / "derived_contract.json"
+    derived_path = ir_dir / "spec.ir.yaml"
     direct_spec_vars: set[str] | None = None
     if not derived_path.exists():
         violations.append(f"{derived_path}: missing")
     else:
-        _validate_derived_contract_file(repo_root, derived_path, violations)
+        _validate_io_contract_file(repo_root, derived_path, violations)
         direct_spec_vars = _extract_spec_var_names(derived_path)
 
-    algo_path = plan_dir / "algorithm.resolved.yaml"
+    algo_path = ir_dir / "spec.ir.yaml"
     if not algo_path.exists():
         violations.append(f"{algo_path}: missing")
     else:
-        nk = _plan_dependency_node_key(plan_dir)
+        nk = _plan_dependency_node_key(ir_dir)
         _validate_algorithm_contract_file(
             repo_root,
             algo_path,
@@ -5495,14 +5618,14 @@ def _validate_plan_stage_impl(
             direct_spec_vars=direct_spec_vars,
         )
 
-    for optional in ("case.resolved.yaml", "impl.resolved.yaml", "dependency.resolved.yaml"):
-        _try_load_optional_plan_yaml(plan_dir, optional, violations)
-    _validate_plan_meta_json(plan_dir, violations)
+    for optional in ("spec.ir.yaml", "spec.ir.yaml", "spec.ir.yaml"):
+        _try_load_optional_plan_yaml(ir_dir, optional, violations)
+    _validate_ir_meta_json(ir_dir, violations)
 
     return violations
 
 
-def _lineage_node_key_and_plan_ref(
+def _lineage_node_key_and_ir_ref(
     pipeline_dir: Path,
 ) -> tuple[str | None, str | None]:
     lineage_path = pipeline_dir / "lineage.json"
@@ -5515,10 +5638,10 @@ def _lineage_node_key_and_plan_ref(
     if not isinstance(data, dict):
         return None, None
     nk = data.get("node_key")
-    pr = data.get("plan_ref")
+    pr = data.get("ir_ref")
     node_key = nk.strip() if isinstance(nk, str) else None
-    plan_ref = pr.strip() if isinstance(pr, str) else None
-    return node_key, plan_ref
+    ir_ref = pr.strip() if isinstance(pr, str) else None
+    return node_key, ir_ref
 
 
 def _stub_execution(pipeline_dir: Path, node_key: str) -> NodeExecution:
@@ -5531,14 +5654,14 @@ def _stub_execution(pipeline_dir: Path, node_key: str) -> NodeExecution:
     )
 
 
-def _latest_generation_id(pipeline_dir: Path) -> str | None:
-    gen_root = pipeline_dir / "generate"
+def _latest_source_id(pipeline_dir: Path) -> str | None:
+    gen_root = pipeline_dir / "source"
     if not gen_root.is_dir():
         return None
     latest_name: str | None = None
     latest_key: tuple[int, int] | None = None
     for gen_dir in sorted(d for d in gen_root.iterdir() if d.is_dir()):
-        parsed = _parse_stage_attempt_id(gen_dir.name, "gen")
+        parsed = _parse_stage_attempt_id(gen_dir.name, "src")
         if parsed is None:
             continue
         if latest_key is None or parsed > latest_key:
@@ -5553,11 +5676,11 @@ def validate_post_generate_stage(
     repo_root: Path,
     workspace_root: str,
     pipeline_ref: str,
-    generation_id: str | None,
+    source_id: str | None,
 ) -> list[str]:
     with _pinned_repo_root_for_schema(repo_root):
         return _validate_post_generate_stage_impl(
-            repo_root, workspace_root, pipeline_ref, generation_id
+            repo_root, workspace_root, pipeline_ref, source_id
         )
 
 
@@ -5565,7 +5688,7 @@ def _validate_post_generate_stage_impl(
     repo_root: Path,
     workspace_root: str,
     pipeline_ref: str,
-    generation_id: str | None,
+    source_id: str | None,
 ) -> list[str]:
     violations: list[str] = []
     normalized_workspace_root = _normalize_workspace_root_token(workspace_root)
@@ -5578,36 +5701,36 @@ def _validate_post_generate_stage_impl(
     except ValueError as exc:
         return [str(exc)]
 
-    node_key, plan_ref = _lineage_node_key_and_plan_ref(pipeline_dir)
+    node_key, ir_ref = _lineage_node_key_and_ir_ref(pipeline_dir)
     if not node_key:
         violations.append(f"{pipeline_dir / 'lineage.json'}: missing node_key")
         return violations
 
-    gen_id = generation_id or _latest_generation_id(pipeline_dir)
+    gen_id = source_id or _latest_source_id(pipeline_dir)
     if not gen_id:
         violations.append(f"{pipeline_dir / 'generate'}: no generation directory found")
         return violations
-    if _parse_stage_attempt_id(gen_id, "gen") is None:
+    if _parse_stage_attempt_id(gen_id, "src") is None:
         violations.append(
-            f"{pipeline_dir / 'generate' / gen_id}: invalid generation_id; expected gen_<YYYYMMDD>_<seq3>"
+            f"{pipeline_dir / 'source' / gen_id}: invalid source_id; expected src_<YYYYMMDD>_<seq3>"
         )
         return violations
 
-    if plan_ref:
-        plan_dir = (repo_root / plan_ref).resolve()
-        derived_path = plan_dir / "derived_contract.json"
+    if ir_ref:
+        ir_dir = (repo_root / ir_ref).resolve()
+        derived_path = ir_dir / "spec.ir.yaml"
         if derived_path.exists():
-            _validate_derived_contract_file(repo_root, derived_path, violations)
+            _validate_io_contract_file(repo_root, derived_path, violations)
         else:
-            violations.append(f"{derived_path}: missing (plan_ref {plan_ref})")
+            violations.append(f"{derived_path}: missing (ir_ref {ir_ref})")
 
     execution = _stub_execution(pipeline_dir, node_key)
     _validate_generate_outputs_for_generation(
         repo_root, execution, gen_id, violations
     )
 
-    gen_dir = pipeline_dir / "generate" / gen_id
-    meta_path = gen_dir / "generate_meta.json"
+    gen_dir = pipeline_dir / "source" / gen_id
+    meta_path = gen_dir / "source_meta.json"
     if meta_path.exists():
         try:
             meta_data = _read_json(meta_path)
@@ -5616,9 +5739,9 @@ def _validate_post_generate_stage_impl(
         else:
             if isinstance(meta_data, dict):
                 impl_lang: str | None = None
-                if plan_ref:
+                if ir_ref:
                     impl_lang = _impl_language_from_plan_dir(
-                        repo_root, (repo_root / plan_ref).resolve()
+                        repo_root, (repo_root / ir_ref).resolve()
                     )
                 _validate_generate_lint_command_logs(
                     repo_root, meta_path, meta_data, impl_lang, violations
@@ -5631,11 +5754,11 @@ def validate_post_build_stage(
     repo_root: Path,
     workspace_root: str,
     pipeline_ref: str,
-    generation_id: str | None,
+    source_id: str | None,
 ) -> list[str]:
     with _pinned_repo_root_for_schema(repo_root):
         return _validate_post_build_stage_impl(
-            repo_root, workspace_root, pipeline_ref, generation_id
+            repo_root, workspace_root, pipeline_ref, source_id
         )
 
 
@@ -5643,7 +5766,7 @@ def _validate_post_build_stage_impl(
     repo_root: Path,
     workspace_root: str,
     pipeline_ref: str,
-    generation_id: str | None,
+    source_id: str | None,
 ) -> list[str]:
     violations: list[str] = []
     normalized_workspace_root = _normalize_workspace_root_token(workspace_root)
@@ -5656,17 +5779,17 @@ def _validate_post_build_stage_impl(
     except ValueError as exc:
         return [str(exc)]
 
-    gen_id = generation_id or _latest_generation_id(pipeline_dir)
+    gen_id = source_id or _latest_source_id(pipeline_dir)
     if not gen_id:
         violations.append(f"{pipeline_dir / 'generate'}: no generation directory found")
         return violations
-    if _parse_stage_attempt_id(gen_id, "gen") is None:
+    if _parse_stage_attempt_id(gen_id, "src") is None:
         violations.append(
-            f"{pipeline_dir / 'generate' / gen_id}: invalid generation_id; expected gen_<YYYYMMDD>_<seq3>"
+            f"{pipeline_dir / 'source' / gen_id}: invalid source_id; expected src_<YYYYMMDD>_<seq3>"
         )
         return violations
 
-    src_dir = pipeline_dir / "generate" / gen_id / "src"
+    src_dir = pipeline_dir / "source" / gen_id / "src"
     _validate_fortran_makefile_src_dir(src_dir, violations)
     return violations
 
@@ -5719,7 +5842,7 @@ def _validate_impl(
         if pd in seen_pipeline_dirs:
             continue
         seen_pipeline_dirs.add(pd)
-        _validate_generate_meta_json_files(pd, violations)
+        _validate_source_meta_json_files(pd, violations)
 
     if require_orchestration:
         _validate_orchestration_hierarchy(
@@ -5735,7 +5858,7 @@ def _validate_impl(
 
     for execution in executions:
         _validate_algorithm_contract_schema(repo_root, execution, violations)
-        _validate_derived_contract_schema(repo_root, execution, violations)
+        _validate_io_contract_schema(repo_root, execution, violations)
         _validate_trial_meta(repo_root, execution, violations)
         _validate_execution_json_outputs(execution, violations)
         _validate_raw_evidence(repo_root, execution, violations)
@@ -5774,11 +5897,19 @@ def _validate_impl(
         if not dep_path.exists():
             continue
         try:
-            dep_data = _read_json(dep_path)
-        except json.JSONDecodeError:
-            continue
+            dep_data = _read_yaml(dep_path)
+        except (json.JSONDecodeError, yaml.YAMLError):
+            try:
+                dep_data = _read_json(dep_path)
+            except json.JSONDecodeError:
+                continue
         if not isinstance(dep_data, dict):
             continue
+        # Unwrap spec.ir.yaml.dependency for the new IR
+        if isinstance(dep_data.get("dependency"), dict):
+            nested = dep_data["dependency"]
+            if "direct_deps" in nested or "all_nodes" in nested or "node_key" in nested:
+                dep_data = nested
         all_nodes = dep_data.get("all_nodes")
         if not isinstance(all_nodes, list) or not all_nodes:
             continue
@@ -5821,8 +5952,8 @@ def _validate_impl(
         if token is not None:
             scope_lineage_nodes_by_token.setdefault(token, set()).add(node_token)
         plan_ok = False
-        if isinstance(lineage.plan_ref, str) and lineage.plan_ref.startswith("workspace/"):
-            plan_path = repo_root / lineage.plan_ref
+        if isinstance(lineage.ir_ref, str) and lineage.ir_ref.startswith("workspace/"):
+            plan_path = repo_root / lineage.ir_ref
             plan_ok = plan_path.exists() and plan_path.is_dir()
         if plan_ok:
             scope_plan_nodes.add(node_token)
@@ -5887,7 +6018,7 @@ def main(argv: list[str] | None = None) -> int:
         "--stage",
         choices=(
             "full",
-            "plan",
+            "compile",
             "post_generate",
             "post_build",
             "post_execute",
@@ -5896,22 +6027,22 @@ def main(argv: list[str] | None = None) -> int:
         default="full",
         help=(
             "full: default end-to-end validation (requires execution artifacts). "
-            "plan: validate plan directory only (derived_contract + algorithm + optional YAML). "
-            "post_generate / post_build: validate one pipeline generate tree (requires --pipeline-root). "
+            "compile: validate IR directory only (spec.ir.yaml structure invariants). "
+            "post_generate / post_build: validate one pipeline source tree (requires --pipeline-root). "
             "post_execute: full validation with LLM review and orchestration optional. "
             "pre_judge: full validation with LLM review and orchestration required."
         ),
     )
     parser.add_argument(
-        "--plan-ref",
+        "--ir-ref",
         default=None,
-        help="Workspace-relative plan directory (required for --stage plan).",
+        help="Workspace-relative IR directory (required for --stage compile).",
     )
     parser.add_argument(
-        "--generation-id",
+        "--source-id",
         default=None,
         help=(
-            "generate/<generation_id> under the pipeline (optional for post_generate/post_build; "
+            "source/<source_id> under the pipeline (optional for post_generate/post_build; "
             "defaults to latest lexicographic directory name)."
         ),
     )
@@ -5980,15 +6111,15 @@ def _main_dispatch(args: argparse.Namespace, repo_root: Path) -> int:
     # path instead of an opaque traceback. Orchestration gates rely on the
     # structured output to extract violations and surface a repairable failure.
     try:
-        if args.stage == "plan":
-            if not args.plan_ref or not str(args.plan_ref).strip():
+        if args.stage == "compile":
+            if not args.ir_ref or not str(args.ir_ref).strip():
                 print(
                     "pipeline semantic validation: FAIL\n"
-                    "- --stage plan requires non-empty --plan-ref"
+                    "- --stage compile requires non-empty --ir-ref"
                 )
                 return 1
-            violations = validate_plan_stage(
-                repo_root, args.workspace_root, str(args.plan_ref).strip()
+            violations = validate_compile_stage(
+                repo_root, args.workspace_root, str(args.ir_ref).strip()
             )
         elif args.stage in ("post_generate", "post_build"):
             roots = args.pipeline_root or []
@@ -6005,14 +6136,14 @@ def _main_dispatch(args: argparse.Namespace, repo_root: Path) -> int:
                     repo_root,
                     args.workspace_root,
                     pipeline_ref,
-                    args.generation_id,
+                    args.source_id,
                 )
             else:
                 violations = validate_post_build_stage(
                     repo_root,
                     args.workspace_root,
                     pipeline_ref,
-                    args.generation_id,
+                    args.source_id,
                 )
         else:
             try:

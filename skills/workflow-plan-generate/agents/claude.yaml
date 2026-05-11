@@ -1,5 +1,0 @@
-interface:
-  display_name: "Workflow Plan Generate"
-  short_description: "Help with Workflow Plan Generate tasks"
-  backend: "claude"
-  spawn_agent_tool: "Agent"

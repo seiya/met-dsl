@@ -25,13 +25,13 @@ class CheckArtifactSyntaxTest(unittest.TestCase):
 
     def test_accepts_yaml_mapping(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            path = Path(tmp) / "case.resolved.yaml"
+            path = Path(tmp) / "spec.ir.yaml"
             path.write_text("case_id: sample\nsweep: []\n", encoding="utf-8")
             check_file(path, fmt="yaml", expected_top="object")
 
     def test_rejects_wrong_top_level(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            path = Path(tmp) / "case.resolved.yaml"
+            path = Path(tmp) / "spec.ir.yaml"
             path.write_text("- sample\n", encoding="utf-8")
             with self.assertRaises(ValueError):
                 check_file(path, fmt="yaml", expected_top="object")

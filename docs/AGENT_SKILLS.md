@@ -7,8 +7,9 @@
 
 ## 適用範囲
 - `workflow` 全体を統括する `orchestration agent`
-- ワークフロー phase `Plan` / `Generate` / `Build` / `Execute` / `Judge` / `Tune` / `Promote`
+- core workflow phase `Compile` / `Generate` / `Build` / `Validate`
 - 各 phase で参照する `skills/<skill_name>/SKILL.md`
+- 任意フロー `Tune` / `Promote` の SKILL は core workflow と分離して扱う。
 
 ## 要件
 - エージェントは、作業対象 phase を特定してから対応 `SKILL.md` を読み込む。
@@ -16,8 +17,8 @@
 - workflow 共通の不変規範（過去 artifact 参照禁止、`dummy` 禁止、検証契約導出、`workspace/` ルート制約、`quality check` 判定軸）は `docs/workflow/WORKFLOW_CORE.md` を canonical source とする。各 `phase` の詳細契約は `docs/workflow/phases/` 配下のファイルを canonical source とする。仕様への入口は `docs/WORKFLOW.md` とする。
 - エージェント階層の実行契約（`orchestration -> step` と `orchestration -> substep`）は `ORCHESTRATION.md` を canonical source とする。
 - 全体方針と `spec` 管理要件（`spec_kind` / registry / 正式版配置 / 命名規則）は `SPEC.md` を canonical source とする。
-- `Build` / `Execute` / `quality check` は `MCP` サーバー経由で実行し、`AGENTS.md` の `MCP 実行ルール` と対応 `SKILL.md` の契約を同時適用する。
-- 各 phase は、対応 `SKILL.md` に定義された必須出力（例: `plan_meta.json`、`build_meta.json`、`verdict.json`）を欠落させてはならない。
+- `Build` / `Validate.execute` / `quality check` は `MCP` サーバー経由で実行し、`AGENTS.md` の `MCP 実行ルール` と対応 `SKILL.md` の契約を同時適用する。
+- 各 phase は、対応 `SKILL.md` に定義された必須出力（例: `ir_meta.json`、`source_meta.json`、`binary_meta.json`、`verdict.json`、`validate_meta.json`）を欠落させてはならない。
 - `SKILL.md` へは実行手順と当該 `SKILL` 固有の手続きを記述し、`phase` の I/O 契約・artifact 形式・数値的正規要件を `docs/workflow/WORKFLOW_CORE.md` または `docs/workflow/phases/phase_*.md` と矛盾する形で重複定義してはならない。
 - hook 実装は backend 非依存の `common validation` と backend 固有の adapter を分離し、`common validation` は `tools/hooks/common.py`、backend adapter は `tools/hooks/adapters/` を canonical source とする。
 - `codex` backend では `.codex/hooks.json` を hook 呼び出し定義の canonical source とし、`preflight` 判定で `feature_states.codex_hooks=true` を必須とする。
@@ -30,15 +31,17 @@
 5. エージェント固有の実行便宜（例: プロンプト順序、ログ整理手順）は `SKILL.md` に限定し、`docs/workflow/WORKFLOW_CORE.md` および `docs/workflow/phases/` へ混在させない。
 6. 判定に迷う場合は、規則違反時の影響が監査可能性・再現性・判定整合の破壊に及ぶかを判定軸とする。破壊する場合は `docs/workflow/` 配下の契約文書、破壊しない場合は `SKILL.md` を選択する。
 
-## phase と Skill 対応表
+## phase と Skill 対応表（core workflow）
 - `Workflow orchestration`: `skills/workflow-orchestration/SKILL.md`
-- `Plan generate`: `skills/workflow-plan-generate/SKILL.md`
-- `Plan verify`: `skills/workflow-plan-verify/SKILL.md`
+- `Compile generate`: `skills/workflow-compile-generate/SKILL.md`
+- `Compile verify`: `skills/workflow-compile-verify/SKILL.md`
 - `Generate generate`: `skills/workflow-generate-generate/SKILL.md`
 - `Generate verify`: `skills/workflow-generate-verify/SKILL.md`
 - `Build`: `skills/workflow-build/SKILL.md`
-- `Execute`: `skills/workflow-execute/SKILL.md`
-- `Judge`: `skills/workflow-judge/SKILL.md`
+- `Validate execute`: `skills/workflow-validate-execute/SKILL.md`
+- `Validate judge`: `skills/workflow-validate-judge/SKILL.md`
+
+## phase と Skill 対応表（任意フロー）
 - `Tune generate`: `skills/workflow-tune-generate/SKILL.md`
 - `Tune verify`: `skills/workflow-tune-verify/SKILL.md`
 - `Promote`: `skills/workflow-promote/SKILL.md`

@@ -1,0 +1,5 @@
+interface:
+  display_name: "Workflow Compile Generate"
+  short_description: "Help with Workflow Compile Generate tasks"
+  backend: "claude"
+  spawn_agent_tool: "Agent"

@@ -1,7 +1,12 @@
-# algorithm.resolved.yaml — 正しい形式のサンプル
+# spec.ir.yaml の algorithm セクション — 正しい形式のサンプル
 #
-# このファイルは workflow-plan-generate / workflow-plan-verify スキルの参考形式として提供する。
-# validate_pipeline_semantics ゲートが要求する構造を最小 2-step で示す。
+# このファイルは Compile phase が出力する spec.ir.yaml の `algorithm:` セクション部分を
+# 最小 2-step で示す参考形式である。`workflow-compile-generate` / `workflow-compile-verify`
+# スキル（および validate_pipeline_semantics --stage compile ゲート）が要求する構造を示す。
+#
+# 本ファイルは algorithm セクションのみを抜粋した形で記載しており、
+# 実際の spec.ir.yaml ではこのブロックを `algorithm:` キーの値として配置し、
+# `case` / `impl_defaults` / `io_contract` / `dependency` の各セクションと併置する。
 #
 # 重要: steps[].inputs と steps[].outputs は「非空文字列の list」でなければならない。
 #   OK: ["U_L", "U_R", "g"]
@@ -57,7 +62,7 @@ update_semantics:
 #   - "scalar" (case-insensitive)              … 0 次元
 #   - "[d1, d2, ...]"  (bracket list form)     … 例: "[3]", "[nx, ny]"
 #   - "(d1, d2, ...)"  (paren tuple form)      … 例: "(d1, d2)", "(nx, ny, nz)"
-# 関数呼び出し記法 (vector(N) / matrix(M,N) / tensor 等) は validator が reject し Plan fail となる。
+# 関数呼び出し記法 (vector(N) / matrix(M,N) / tensor 等) は validator が reject し Compile fail となる。
 temporaries:
   - name: guard_pass
     shape_expr: "scalar"

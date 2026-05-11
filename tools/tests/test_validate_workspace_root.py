@@ -27,7 +27,7 @@ class ValidateWorkspaceRootTests(unittest.TestCase):
                 / "pipelines"
                 / "node"
                 / "pipe"
-                / "execute"
+                / "runs"
                 / "exec_001"
                 / "problem"
                 / "shallow_water2d@0.3.0"
@@ -966,7 +966,7 @@ class ValidateWorkspaceRootTests(unittest.TestCase):
             )
 
     def test_symlink_outside_tmp_pointing_into_tmp_does_not_get_exempted(self) -> None:
-        """Adv-32: a symlink at workspace/plans/.../helper.py whose target
+        """Adv-32: a symlink at workspace/ir/.../helper.py whose target
         resolves into workspace/tmp/<live-arid>/ must NOT be exempted. The
         validation must judge by where the file appears in the workspace
         tree (lexical path), not where it dereferences."""
@@ -986,7 +986,7 @@ class ValidateWorkspaceRootTests(unittest.TestCase):
             tmp_target = repo_root / "workspace" / "tmp" / arid / "helper.py"
             tmp_target.parent.mkdir(parents=True, exist_ok=True)
             tmp_target.write_text("print('inside tmp')\n", encoding="utf-8")
-            # Symlink at workspace/plans/.../sneaky.py → tmp_target.
+            # Symlink at workspace/ir/.../sneaky.py → tmp_target.
             sneaky_dir = repo_root / "workspace" / "plans" / "node" / "src"
             sneaky_dir.mkdir(parents=True, exist_ok=True)
             sneaky = sneaky_dir / "sneaky.py"
@@ -1392,7 +1392,7 @@ class ValidateWorkspaceRootTests(unittest.TestCase):
             request.write_text(
                 json.dumps(
                     {
-                        "step": "plan",
+                        "step": "compile",
                         "dependency_ref": "spec/component/example/deps.yaml",
                     }
                 ),
@@ -1430,8 +1430,8 @@ class ValidateWorkspaceRootTests(unittest.TestCase):
             request.write_text(
                 json.dumps(
                     {
-                        "step": "plan",
-                        "dependency_ref": "workspace/plans/example/dependency.resolved.yaml",
+                        "step": "compile",
+                        "dependency_ref": "workspace/ir/example/spec.ir.yaml",
                     }
                 ),
                 encoding="utf-8",
@@ -1439,7 +1439,7 @@ class ValidateWorkspaceRootTests(unittest.TestCase):
 
             violations, _ = validate(repo_root=repo_root, workspace_root="workspace")
             self.assertTrue(
-                any("Plan dependency_ref must be spec/.../deps.yaml" in v for v in violations)
+                any("Compile dependency_ref must be spec/.../deps.yaml" in v for v in violations)
             )
 
     def test_detects_invalid_node_key_safe_directory_name(self) -> None:

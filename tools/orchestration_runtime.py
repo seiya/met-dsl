@@ -141,13 +141,10 @@ DEFAULT_BACKEND_COMMANDS = {
 # Child agent `skill_must_read_refs`: split workflow spec (see docs/workflow/).
 WORKFLOW_CORE_REF = "docs/workflow/WORKFLOW_CORE.md"
 WORKFLOW_PHASE_DOC_BY_STEP: dict[str, str] = {
-    "plan": "docs/workflow/phases/phase_01_plan.md",
+    "compile": "docs/workflow/phases/phase_01_compile.md",
     "generate": "docs/workflow/phases/phase_02_generate.md",
     "build": "docs/workflow/phases/phase_03_build.md",
-    "execute": "docs/workflow/phases/phase_04_execute.md",
-    "judge": "docs/workflow/phases/phase_05_judge.md",
-    "tune": "docs/workflow/phases/phase_06_tune.md",
-    "promote": "docs/workflow/phases/phase_07_promote.md",
+    "validate": "docs/workflow/phases/phase_04_validate.md",
 }
 
 
@@ -517,13 +514,10 @@ DEFAULT_ALLOWED_GATE_SERVICES: tuple[str, ...] = (
 )
 
 STEP_REQUIRED_CHILD_AGENT: dict[str, str] = {
-    "plan": "substep",
+    "compile": "substep",
     "generate": "substep",
-    "tune": "substep",
     "build": "step",
-    "execute": "step",
-    "judge": "step",
-    "promote": "step",
+    "validate": "substep",
 }
 
 FAIL_CLOSED_REASON_CODES = {
@@ -542,14 +536,13 @@ FAIL_CLOSED_REASON_CODES = {
 
 PARALLEL_NODES_ENV_VAR = "METDSL_ALLOW_PARALLEL_NODES"
 
-PHASE_ARTIFACT_GUARDED_PREFIXES: tuple[str, ...] = ("workspace/plans/", "workspace/pipelines/")
+PHASE_ARTIFACT_GUARDED_PREFIXES: tuple[str, ...] = ("workspace/ir/", "workspace/pipelines/")
 
 STEP_KEYS_FOR_NODE_STATE: tuple[str, ...] = (
-    "plan",
+    "compile",
     "generate",
     "build",
-    "execute",
-    "judge",
+    "validate",
 )
 
 
@@ -830,7 +823,7 @@ def _mcp_permissions_for_launch(role: str, step: str) -> list[str]:
         return ["run_linter"]
     if st == "build":
         return ["compile_project"]
-    if st == "execute":
+    if st == "validate":
         return ["run_program", "run_quality_checks"]
     return []
 
@@ -840,37 +833,41 @@ def _write_roots_for_launch(
     role: str,
     step: str,
     orchestration_id: str,
-    plan_ref: str,
+    ir_ref: str,
     pipeline_ref: str,
     node_key: str = "",
 ) -> list[str]:
     r = role.strip().lower()
     st = step.strip().lower()
     orch_root = _with_trailing_slash(_normalize_rel_posix(f"workspace/orchestrations/{orchestration_id}"))
-    plan_norm = _with_trailing_slash(_normalize_rel_posix(plan_ref))
+    ir_norm = _with_trailing_slash(_normalize_rel_posix(ir_ref))
     pipe_norm = _with_trailing_slash(_normalize_rel_posix(pipeline_ref))
     if r == "orchestration":
         return [orch_root]
     if r not in {"step", "substep"}:
         return []
-    if st == "plan":
-        return [plan_norm]
+    if st == "compile":
+        return [ir_norm]
     if st == "generate":
         # pipeline_ref contains the unique pipeline_id (reserved by reserve-phase-root),
         # so lineage.json is exclusive to this run — no concurrent agent shares this path.
         # bwrap binds lineage.json's parent directory (not the file) so the agent can create
         # it; the file must not be pre-created before the agent writes it.
         return [
-            _with_trailing_slash(_normalize_rel_posix(f"{pipeline_ref.rstrip('/')}/generate")),
+            _with_trailing_slash(_normalize_rel_posix(f"{pipeline_ref.rstrip('/')}/source")),
             _normalize_rel_posix(f"{pipeline_ref.rstrip('/')}/lineage.json"),
         ]
     if st == "build":
-        return [_with_trailing_slash(_normalize_rel_posix(f"{pipeline_ref.rstrip('/')}/build"))]
-    if st == "execute":
-        return [_with_trailing_slash(_normalize_rel_posix(f"{pipeline_ref.rstrip('/')}/execute"))]
-    if st == "judge":
-        # Judge artifacts are written under execute/<execution_id>/<node_key_safe>/.
-        return [_with_trailing_slash(_normalize_rel_posix(f"{pipeline_ref.rstrip('/')}/execute"))]
+        return [_with_trailing_slash(_normalize_rel_posix(f"{pipeline_ref.rstrip('/')}/binary"))]
+    if st == "validate":
+        # Validate substeps (execute / judge) write under runs/<run_id>/<node_key_safe>/.
+        return [_with_trailing_slash(_normalize_rel_posix(f"{pipeline_ref.rstrip('/')}/runs"))]
+    # NOTE: `tune` / `promote` are out-of-scope for the core 5-phase workflow
+    # (Spec -> Compile -> Generate -> Build -> Validate). They are retained
+    # here as optional flows invoked via a separate entrypoint (see CLAUDE.md
+    # "任意フロー Tune / Promote"). The core workflow does not produce these
+    # step tokens, so the branches below are reachable only from the optional
+    # entrypoints; their tests assert the contract those entrypoints rely on.
     if st == "tune":
         return [_with_trailing_slash(_normalize_rel_posix(f"{pipeline_ref.rstrip('/')}/tune"))]
     if st == "promote":
@@ -937,10 +934,10 @@ def build_capability_document(
     # write_roots and release path prefixes (e.g. `../etc/passwd@1.0.0`
     # would otherwise yield `releases/../etc/passwd/`).
     _parse_node_key_strict(node_key)
-    plan_ref = str(request_payload.get("plan_ref") or "").strip()
+    ir_ref = str(request_payload.get("ir_ref") or "").strip()
     pipeline_ref = str(request_payload.get("pipeline_ref") or "").strip()
-    if not plan_ref or not pipeline_ref:
-        raise ValueError("capability requires plan_ref and pipeline_ref")
+    if not ir_ref or not pipeline_ref:
+        raise ValueError("capability requires ir_ref and pipeline_ref")
 
     substep_val: str | None = None
     ss = request_payload.get("substep")
@@ -959,7 +956,7 @@ def build_capability_document(
             role=role,
             step=step,
             orchestration_id=orchestration_id,
-            plan_ref=plan_ref,
+            ir_ref=ir_ref,
             pipeline_ref=pipeline_ref,
             node_key=node_key,
         ),
@@ -974,7 +971,7 @@ def build_capability_document(
     if role in {"step", "substep"} and not body.get("write_roots"):
         raise ValueError(
             f"capability_invalid_empty_write_roots: agent_role={role!r} requires at least "
-            "one write_root. Check that plan_ref and pipeline_ref in request_payload are "
+            "one write_root. Check that ir_ref and pipeline_ref in request_payload are "
             "non-empty and the step value is valid."
         )
     return body
@@ -1308,11 +1305,11 @@ def _dependency_ready(
     readiness = meta.get("dependency_readiness")
     if not isinstance(readiness, dict):
         return False, "dependency_readiness_missing"
-    if step_token == "plan":
-        token = readiness.get("direct_dependency_plan_readiness")
+    if step_token == "compile":
+        token = readiness.get("direct_dependency_compile_readiness")
         if token is not True:
-            return False, "direct_dependency_plan_readiness_not_pass"
-    elif step_token in {"generate", "build", "execute", "judge", "tune", "promote"}:
+            return False, "direct_dependency_compile_readiness_not_pass"
+    elif step_token in {"generate", "build", "validate"}:
         token = readiness.get("direct_dependency_execution_readiness")
         if token is not True:
             return False, "direct_dependency_execution_readiness_not_pass"
@@ -1322,10 +1319,10 @@ def _dependency_ready(
     if not isinstance(detail, dict):
         return False, "dependency_readiness_detail_missing"
     required_detail_keys: tuple[str, ...]
-    if step_token == "plan":
-        required_detail_keys = ("plan_ref_verified",)
+    if step_token == "compile":
+        required_detail_keys = ("ir_ref_verified",)
     else:
-        required_detail_keys = ("plan_ref_verified", "pipeline_ref_verified", "aggregate_verdict_verified")
+        required_detail_keys = ("ir_ref_verified", "pipeline_ref_verified", "aggregate_verdict_verified")
     for required_key in required_detail_keys:
         if detail.get(required_key) is not True:
             return False, f"dependency_readiness_detail_not_pass:{required_key}"
@@ -1425,29 +1422,29 @@ def _resolve_judge_execution_dir(
     node_key: str,
     launch_request: dict[str, Any],
 ) -> tuple[Path | None, str | None]:
-    """`Judge` 入力となる `execute/<execution_id>/<node_key_safe>/` を返す。失敗時は (None, reason)。"""
+    """`Validate.judge` 入力となる `runs/<run_id>/<node_key_safe>/` を返す。失敗時は (None, reason)。"""
     rel = _normalize_rel_posix(pipeline_ref)
     pr_abs = repo_root / rel
     if not pr_abs.is_dir():
         return None, "pipeline_missing"
     nk_safe = _node_key_to_safe(node_key)
-    ex_id = launch_request.get("execution_id")
-    if isinstance(ex_id, str) and ex_id.strip():
-        cand = pr_abs / "execute" / ex_id.strip() / nk_safe
+    run_id = launch_request.get("run_id")
+    if isinstance(run_id, str) and run_id.strip():
+        cand = pr_abs / "runs" / run_id.strip() / nk_safe
         if cand.is_dir():
             return cand, None
-        return None, "judge_execution_path_missing"
-    exec_root = pr_abs / "execute"
+        return None, "judge_run_path_missing"
+    runs_root = pr_abs / "runs"
     candidates: list[Path] = []
-    if exec_root.is_dir():
-        for eid_dir in sorted(exec_root.iterdir()):
-            if not eid_dir.is_dir():
+    if runs_root.is_dir():
+        for rid_dir in sorted(runs_root.iterdir()):
+            if not rid_dir.is_dir():
                 continue
-            cand = eid_dir / nk_safe
+            cand = rid_dir / nk_safe
             if cand.is_dir():
                 candidates.append(cand)
     if len(candidates) != 1:
-        return None, "judge_execution_id_unresolved_or_ambiguous"
+        return None, "judge_run_id_unresolved_or_ambiguous"
     return candidates[0], None
 
 
@@ -1465,14 +1462,15 @@ def _downstream_phase_launch_gate(
     if not pr_abs.is_dir():
         return True, None
     st = step.strip().lower()
+    substep = str(launch_request.get("substep") or "").strip().lower()
     if st == "build":
-        gen_root = pr_abs / "generate"
+        gen_root = pr_abs / "source"
         if not gen_root.is_dir():
-            return False, "downstream:generate_dir_missing"
+            return False, "downstream:source_dir_missing"
         for gen_dir in sorted(gen_root.iterdir()):
             if not gen_dir.is_dir():
                 continue
-            meta = gen_dir / "generate_meta.json"
+            meta = gen_dir / "source_meta.json"
             if not meta.is_file():
                 continue
             try:
@@ -1481,19 +1479,19 @@ def _downstream_phase_launch_gate(
                 continue
             if isinstance(data, dict) and str(data.get("verification_status", "")).strip().lower() == "pass":
                 return True, None
-        return False, "downstream:generate_meta_verification_status_not_pass"
-    if st == "execute":
-        build_root = pr_abs / "build"
+        return False, "downstream:source_meta_verification_status_not_pass"
+    if st == "validate" and substep == "execute":
+        build_root = pr_abs / "binary"
         if not build_root.is_dir():
-            return False, "downstream:build_dir_missing"
+            return False, "downstream:binary_dir_missing"
         for bdir in sorted(build_root.iterdir()):
             if not bdir.is_dir():
                 continue
             bin_dir = bdir / "bin"
             if bin_dir.is_dir() and any(bin_dir.iterdir()):
                 return True, None
-        return False, "downstream:build_bin_dir_missing"
-    if st == "judge":
+        return False, "downstream:binary_bin_dir_missing"
+    if st == "validate" and substep == "judge":
         base, err = _resolve_judge_execution_dir(
             repo_root,
             pipeline_ref=pipeline_ref,
@@ -1850,19 +1848,19 @@ def validate_mcp_build_tool_invocation(
         )
 
     args_obj = mcp_args if isinstance(mcp_args, dict) else {}
-    if tool_name == "run_program" and step_key == "execute":
+    if tool_name == "run_program" and step_key == "validate":
         cmd = args_obj.get("command")
         if not isinstance(cmd, list) or not cmd:
             raise RuntimeError("MCP phase gate: run_program requires non-empty command array")
         joined = " ".join(str(x) for x in cmd)
-        if "case.resolved.yaml" not in joined:
+        if "spec.ir.yaml" not in joined:
             raise RuntimeError(
-                "MCP phase gate: Execute run_program command must reference case.resolved.yaml"
+                "MCP phase gate: Validate.execute run_program command must reference spec.ir.yaml (case section)"
             )
         # Canonical command_log_path enforcement: align with validator-side
         # post_execute check so non-canonical placements fail at MCP-call time
         # rather than after expensive execution. Required canonical:
-        #   <pipeline_ref>/execute/<execution_id>/<node_safe>/mcp_command_log.jsonl
+        #   <pipeline_ref>/runs/<run_id>/<node_safe>/mcp_command_log.jsonl
         # The MCP server's `_resolve_command_log_path` resolves a relative
         # `command_log_path` against `project_dir`; we normalize both to a
         # repo-relative canonical comparison.
@@ -1875,17 +1873,17 @@ def validate_mcp_build_tool_invocation(
         except (OSError, json.JSONDecodeError):
             req_doc_for_log = None
         pipeline_ref_for_log: str | None = None
-        execution_id_for_log: str | None = None
+        run_id_for_log: str | None = None
         if isinstance(req_doc_for_log, dict):
             pr_raw = req_doc_for_log.get("pipeline_ref")
             if isinstance(pr_raw, str) and pr_raw.strip():
                 pipeline_ref_for_log = _normalize_rel_posix(pr_raw.strip())
-            ex_raw = req_doc_for_log.get("execution_id")
+            ex_raw = req_doc_for_log.get("run_id")
             if isinstance(ex_raw, str) and ex_raw.strip():
-                execution_id_for_log = ex_raw.strip()
-        if pipeline_ref_for_log and execution_id_for_log:
+                run_id_for_log = ex_raw.strip()
+        if pipeline_ref_for_log and run_id_for_log:
             expected_log_rel = (
-                f"{pipeline_ref_for_log}/execute/{execution_id_for_log}/"
+                f"{pipeline_ref_for_log}/runs/{run_id_for_log}/"
                 f"{node_safe}/mcp_command_log.jsonl"
             )
             project_dir_raw = args_obj.get("project_dir")
@@ -1950,9 +1948,9 @@ def validate_mcp_build_tool_invocation(
                     "tool-execution evidence at canonical placement."
                 )
     if tool_name in {"compile_project", "run_quality_checks"}:
-        plan_ref = _launch_plan_ref_for_agent(repo_root, orchestration_id, agent_run_id)
-        if plan_ref:
-            bs = _impl_resolved_build_system(repo_root, plan_ref)
+        ir_ref = _launch_ir_ref_for_agent(repo_root, orchestration_id, agent_run_id)
+        if ir_ref:
+            bs = _impl_resolved_build_system(repo_root, ir_ref)
             if bs == "make":
                 if tool_name == "compile_project":
                     req_bs = str(args_obj.get("build_system", "")).strip().lower()
@@ -1978,7 +1976,7 @@ def validate_mcp_build_tool_invocation(
     )
 
 
-def _launch_plan_ref_for_agent(
+def _launch_ir_ref_for_agent(
     repo_root: Path, orchestration_id: str, agent_run_id: str
 ) -> str | None:
     req_path = _orchestration_root(repo_root, orchestration_id) / "launches" / f"{agent_run_id.strip()}.request.json"
@@ -1990,12 +1988,12 @@ def _launch_plan_ref_for_agent(
         return None
     if not isinstance(doc, dict):
         return None
-    pr = doc.get("plan_ref")
+    pr = doc.get("ir_ref")
     return pr.strip() if isinstance(pr, str) and pr.strip() else None
 
 
-def _impl_resolved_build_system(repo_root: Path, plan_ref: str) -> str | None:
-    path = repo_root / _normalize_rel_posix(plan_ref) / "impl.resolved.yaml"
+def _impl_resolved_build_system(repo_root: Path, ir_ref: str) -> str | None:
+    path = repo_root / _normalize_rel_posix(ir_ref) / "spec.ir.yaml"
     if not path.is_file():
         return None
     text = path.read_text(encoding="utf-8", errors="ignore")
@@ -2572,25 +2570,22 @@ def _allowed_output_paths_for_launch(
         if isinstance(root, str) and str(root).strip()
     ]
     step_token = str(request_payload.get("step") or "").strip().lower()
-    plan_ref = _normalize_rel_posix(str(request_payload.get("plan_ref") or ""))
+    substep_token = str(request_payload.get("substep") or "").strip().lower()
+    ir_ref = _normalize_rel_posix(str(request_payload.get("ir_ref") or ""))
     pipeline_ref = _normalize_rel_posix(str(request_payload.get("pipeline_ref") or ""))
     node_key = str(request_payload.get("node_key") or "").strip()
     node_safe = _node_key_to_safe(node_key) if node_key else ""
-    plan_required = {
-        f"{plan_ref}/case.resolved.yaml",
-        f"{plan_ref}/algorithm.resolved.yaml",
-        f"{plan_ref}/impl.resolved.yaml",
-        f"{plan_ref}/dependency.resolved.yaml",
-        f"{plan_ref}/derived_contract.json",
-        f"{plan_ref}/algorithm.summary.md",
-        f"{plan_ref}/plan_meta.json",
-    } if plan_ref else set()
-    generate_prefix = f"{pipeline_ref}/generate/" if pipeline_ref else ""
-    build_prefix = f"{pipeline_ref}/build/" if pipeline_ref else ""
-    execute_prefix = f"{pipeline_ref}/execute/" if pipeline_ref else ""
+    compile_required = {
+        f"{ir_ref}/spec.ir.yaml",
+        f"{ir_ref}/algorithm.summary.md",
+        f"{ir_ref}/ir_meta.json",
+    } if ir_ref else set()
+    generate_prefix = f"{pipeline_ref}/source/" if pipeline_ref else ""
+    build_prefix = f"{pipeline_ref}/binary/" if pipeline_ref else ""
+    validate_prefix = f"{pipeline_ref}/runs/" if pipeline_ref else ""
     tune_prefix = f"{pipeline_ref}/tune/" if pipeline_ref else ""
-    # generation_id closure for cross-phase placement check below.
-    generation_id = str(request_payload.get("generation_id") or "").strip()
+    # source_id closure for cross-phase placement check below.
+    source_id = str(request_payload.get("source_id") or "").strip()
 
     def _matches_phase_contract(path: str) -> bool:
         # Directory allowlist entries (trailing slash): validate the directory itself is permitted.
@@ -2604,37 +2599,37 @@ def _allowed_output_paths_for_launch(
                     if len(parts) >= 2 and parts[1] == "src":
                         return True
             return False
-        if step_token == "plan":
-            return path in plan_required
+        if step_token == "compile":
+            return path in compile_required
         if step_token == "generate":
             if pipeline_ref and path == f"{pipeline_ref}/lineage.json":
                 return True
             if generate_prefix and path.startswith(generate_prefix):
                 if "/src/" in path:
                     return True
-                if path.endswith("/generate_meta.json"):
+                if path.endswith("/source_meta.json"):
                     return True
             return False
         if step_token == "build":
             # Cross-phase exception: in-source Make builds for Fortran/C
             # family run compile_project with project_dir=<gen>/src/, so the
             # MCP audit log lands under the generate tree. Strict bind to
-            # request.generation_id (record_launch verifies pass-state).
+            # request.source_id (record_launch verifies pass-state).
             if generate_prefix and path.startswith(generate_prefix):
-                if not generation_id:
+                if not source_id:
                     return False
                 expected_cross_phase_build = (
-                    f"{generate_prefix}{generation_id}/src/{_MCP_AUDIT_LOG_BASENAME}"
+                    f"{generate_prefix}{source_id}/src/{_MCP_AUDIT_LOG_BASENAME}"
                 )
                 return path == expected_cross_phase_build
             if build_prefix and path.startswith(build_prefix):
-                if "/bin/" in path or path.endswith("/build_meta.json"):
+                if "/bin/" in path or path.endswith("/binary_meta.json"):
                     return True
                 # MCP `compile_project` writes a side-effect command log to
                 # `<project_dir>/mcp_command_log.jsonl`. Per
                 # `docs/workflow/phases/phase_03_build.md`, the in-phase
                 # canonical placement (out-of-source CMake/Meson builds) is
-                # directly under `<build_id>/`.
+                # directly under `<binary_id>/`.
                 tail = path[len(build_prefix):]
                 tail_parts = [part for part in tail.split("/") if part]
                 if (
@@ -2643,31 +2638,32 @@ def _allowed_output_paths_for_launch(
                 ):
                     return True
             return False
-        if step_token == "execute":
-            if not execute_prefix or not node_safe:
+        if step_token == "validate" and substep_token == "execute":
+            if not validate_prefix or not node_safe:
                 return False
-            # Cross-phase exception: skills/workflow-execute/SKILL.md mandates
-            # `run_quality_checks` against `project_dir=generate/<gen_id>/src/`
-            # for `toolchain.build_system=make` + Fortran/C-family pipelines.
-            # The MCP server's default command_log_path resolves to
+            # Cross-phase exception: skills/workflow-validate-execute/SKILL.md
+            # mandates `run_quality_checks` against
+            # `project_dir=source/<source_id>/src/` for
+            # `toolchain.build_system=make` + Fortran/C-family pipelines. The
+            # MCP server's default command_log_path resolves to
             # `<project_dir>/mcp_command_log.jsonl`, so the audit log lands in
-            # the generate tree. This is the only legitimate write the
-            # execute role makes outside execute/. Strictly bind the allowed
-            # cross-phase placement to the launch request's `generation_id`
-            # field — any other generation_id (e.g. an older sibling
-            # generation under the same pipeline) is not authorized.
+            # the source tree. This is the only legitimate write the
+            # Validate.execute substep makes outside runs/. Strictly bind the
+            # allowed cross-phase placement to the launch request's
+            # `source_id` field — any other source_id (e.g. an older sibling
+            # source under the same pipeline) is not authorized.
             if generate_prefix and path.startswith(generate_prefix):
-                if not generation_id:
+                if not source_id:
                     return False
                 expected_cross_phase = (
-                    f"{generate_prefix}{generation_id}/src/{_MCP_AUDIT_LOG_BASENAME}"
+                    f"{generate_prefix}{source_id}/src/{_MCP_AUDIT_LOG_BASENAME}"
                 )
                 return path == expected_cross_phase
-            if not path.startswith(execute_prefix):
+            if not path.startswith(validate_prefix):
                 return False
-            tail = path[len(execute_prefix):]
+            tail = path[len(validate_prefix):]
             tail_parts = [part for part in tail.split("/") if part]
-            # execute contract must be under execute/<execution_id>/<node_safe>/...
+            # Validate.execute contract must be under runs/<run_id>/<node_safe>/...
             if len(tail_parts) < 3 or tail_parts[1] != node_safe:
                 return False
             rel_under_node = "/".join(tail_parts[2:])
@@ -2675,28 +2671,24 @@ def _allowed_output_paths_for_launch(
                 "diagnostics.json",
                 "perf.json",
                 "quality_check.json",
-                "verdict.json",
-                "aggregate_verdict.json",
-                "summary.json",
-                "semantic_review.json",
                 "trial_meta.json",
                 "stdout.log",
                 "stderr.log",
                 "metrics_basis.json",
                 "execution_trace.json",
                 # MCP `run_program` / `run_quality_checks` side-effect log
-                # (phase_04_execute.md L10).
+                # (phase_04_validate.md).
                 "mcp_command_log.jsonl",
             }
             return rel_under_node in allowed_files or rel_under_node.startswith("raw/")
-        if step_token == "judge":
-            if not execute_prefix or not node_safe:
+        if step_token == "validate" and substep_token == "judge":
+            if not validate_prefix or not node_safe:
                 return False
-            if not path.startswith(execute_prefix):
+            if not path.startswith(validate_prefix):
                 return False
-            tail = path[len(execute_prefix):]
+            tail = path[len(validate_prefix):]
             tail_parts = [part for part in tail.split("/") if part]
-            # judge contract must be under execute/<execution_id>/<node_safe>/...
+            # Validate.judge contract must be under runs/<run_id>/<node_safe>/...
             if len(tail_parts) < 3 or tail_parts[1] != node_safe:
                 return False
             rel_under_node = "/".join(tail_parts[2:])
@@ -2705,9 +2697,12 @@ def _allowed_output_paths_for_launch(
                 "verdict.json",
                 "aggregate_verdict.json",
                 "summary.json",
-                "trial_meta.json",
+                "validate_meta.json",
             }
             return rel_under_node in allowed_files
+        # NOTE: `tune` / `promote` step branches below are out-of-scope for
+        # core 5-phase workflow (see _write_roots_for_launch for context).
+        # They remain to satisfy the optional-flow capability contract.
         if step_token == "tune":
             if not tune_prefix or not path.startswith(tune_prefix):
                 return False
@@ -2717,7 +2712,7 @@ def _allowed_output_paths_for_launch(
             if len(rel_parts) != 2:
                 return False
             allowed_files = {
-                "impl.resolved.yaml",
+                "spec.ir.yaml",
                 "diagnostics.json",
                 "perf.json",
                 "verdict.json",
@@ -2772,16 +2767,17 @@ def _allowed_output_paths_for_launch(
             return True
         return False
 
-    # Defensive auto-inject: MCP build/execute tooling writes a side-effect
+    # Defensive auto-inject: MCP build/validate tooling writes a side-effect
     # command log to `<project_dir>/mcp_command_log.jsonl` (run_linter for
     # generate per skills/workflow-generate-generate, compile_project per
-    # docs/workflow/phases/phase_03_build.md L12, run_program /
-    # run_quality_checks per phase_04_execute.md L10). If the canonical log
-    # path is not pre-listed in allowed_output_paths, record-agent-run rejects
-    # it as `unauthorized_write_violation` and fail_closes the orchestration.
-    # Single-namespace enforcement for generate/build/execute steps:
+    # docs/workflow/phases/phase_03_build.md, run_program /
+    # run_quality_checks per docs/workflow/phases/phase_04_validate.md). If
+    # the canonical log path is not pre-listed in allowed_output_paths,
+    # record-agent-run rejects it as `unauthorized_write_violation` and
+    # fail_closes the orchestration.
+    # Single-namespace enforcement for generate/build/validate steps:
     # require listed paths under `<pipeline_ref>/<phase>/` to use exactly one
-    # `<gen_id>` / `<build_id>` / `<exec_id>`. Otherwise the step could
+    # `<source_id>` / `<binary_id>` / `<run_id>`. Otherwise the step could
     # authorize MCP-owned audit logs and outputs across sibling runs in the
     # same pipeline, breaking provenance isolation.
     if step_token == "generate" and generate_prefix:
@@ -2795,13 +2791,13 @@ def _allowed_output_paths_for_launch(
                 gen_ids.add(parts[0])
         if len(gen_ids) > 1:
             raise ValueError(
-                f"allowed_output_paths must target a single generation_id; "
+                f"allowed_output_paths must target a single source_id; "
                 f"got multiple under {generate_prefix!r}: {sorted(gen_ids)!r}"
             )
-        if generation_id and gen_ids and generation_id not in gen_ids:
+        if source_id and gen_ids and source_id not in gen_ids:
             raise ValueError(
-                f"allowed_output_paths generation_id={sorted(gen_ids)!r} does "
-                f"not match request generation_id={generation_id!r}"
+                f"allowed_output_paths source_id={sorted(gen_ids)!r} does "
+                f"not match request source_id={source_id!r}"
             )
     elif step_token == "build" and build_prefix:
         build_ids: set[str] = set()
@@ -2814,35 +2810,35 @@ def _allowed_output_paths_for_launch(
                 build_ids.add(parts[0])
         if len(build_ids) > 1:
             raise ValueError(
-                f"allowed_output_paths must target a single build_id; "
+                f"allowed_output_paths must target a single binary_id; "
                 f"got multiple under {build_prefix!r}: {sorted(build_ids)!r}"
             )
-    elif step_token == "execute" and execute_prefix:
-        exec_ids: set[str] = set()
+    elif step_token == "validate" and validate_prefix:
+        run_ids: set[str] = set()
         for p in allowed:
-            if not p.startswith(execute_prefix):
+            if not p.startswith(validate_prefix):
                 continue
-            tail = p[len(execute_prefix):]
+            tail = p[len(validate_prefix):]
             parts = [s for s in tail.split("/") if s]
             if parts:
-                exec_ids.add(parts[0])
-        if len(exec_ids) > 1:
+                run_ids.add(parts[0])
+        if len(run_ids) > 1:
             raise ValueError(
-                f"allowed_output_paths must target a single execution_id; "
-                f"got multiple under {execute_prefix!r}: {sorted(exec_ids)!r}"
+                f"allowed_output_paths must target a single run_id; "
+                f"got multiple under {validate_prefix!r}: {sorted(run_ids)!r}"
             )
-        request_execution_id = str(
-            request_payload.get("execution_id") or ""
+        request_run_id = str(
+            request_payload.get("run_id") or ""
         ).strip()
-        if request_execution_id and exec_ids and request_execution_id not in exec_ids:
+        if request_run_id and run_ids and request_run_id not in run_ids:
             raise ValueError(
-                f"allowed_output_paths execution_id={sorted(exec_ids)!r} does "
-                f"not match request execution_id={request_execution_id!r}"
+                f"allowed_output_paths run_id={sorted(run_ids)!r} does "
+                f"not match request run_id={request_run_id!r}"
             )
     # Inject only the canonical placements derived from listed paths — see
     # `_canonical_mcp_audit_log_paths` for the strict per-phase shapes.
     # `_resolved_build_system` is an internal request_payload field
-    # populated by record_launch (resolved from impl.resolved.yaml) so the
+    # populated by record_launch (resolved from spec.ir.yaml.impl_defaults) so the
     # helper can gate cross-phase canonical placement on `build_system=make`.
     # Tests calling this helper directly may set the field explicitly when
     # cross-phase semantics are exercised; absence simply disables
@@ -2857,9 +2853,10 @@ def _allowed_output_paths_for_launch(
         step_token=step_token,
         pipeline_ref=pipeline_ref,
         node_safe=node_safe,
-        generation_id=generation_id,
+        source_id=source_id,
         listed_paths=list(allowed),
         build_system=_bs_norm,
+        substep_token=substep_token,
     )
     canonical_logs_set: set[str] = set(canonical_logs)
     for log_path in canonical_logs:
@@ -2928,25 +2925,27 @@ def _canonical_mcp_audit_log_paths(
     pipeline_ref: str,
     node_safe: str,
     listed_paths: Sequence[str],
-    generation_id: str = "",
+    source_id: str = "",
     build_system: str = "",
+    substep_token: str = "",
 ) -> list[str]:
     """Derive canonical MCP audit log paths from the listed allowed_output_paths.
 
     Canonical placements (per docs/workflow/phases/phase_*.md and
-    skills/workflow-execute/SKILL.md):
-      - generate: `<pipeline_ref>/generate/<gen_id>/src/mcp_command_log.jsonl`
-      - build:    `<pipeline_ref>/build/<build_id>/mcp_command_log.jsonl`
-      - execute (in-phase): `<pipeline_ref>/execute/<exec_id>/<node_safe>/mcp_command_log.jsonl`
-      - execute (cross-phase quality_check): `<pipeline_ref>/generate/<gen_id>/src/mcp_command_log.jsonl`
-        — `run_quality_checks` runs with `project_dir=generate/<gen_id>/src/`
+    skills/workflow-validate-execute/SKILL.md):
+      - generate: `<pipeline_ref>/source/<source_id>/src/mcp_command_log.jsonl`
+      - build:    `<pipeline_ref>/binary/<binary_id>/mcp_command_log.jsonl`
+      - validate.execute (in-phase): `<pipeline_ref>/runs/<run_id>/<node_safe>/mcp_command_log.jsonl`
+      - validate.execute (cross-phase quality_check): `<pipeline_ref>/source/<source_id>/src/mcp_command_log.jsonl`
+        — `run_quality_checks` runs with `project_dir=source/<source_id>/src/`
         for `toolchain.build_system=make` + Fortran/C-family pipelines per
-        `skills/workflow-execute/SKILL.md`, so the MCP server's default
-        `command_log_path` (resolved as `project_dir/mcp_command_log.jsonl`)
-        lands in the generate tree even though the agent role is `execute`.
+        `skills/workflow-validate-execute/SKILL.md`, so the MCP server's
+        default `command_log_path` (resolved as
+        `project_dir/mcp_command_log.jsonl`) lands in the source tree even
+        though the substep is `validate.execute`.
 
     Only paths matching these structures are returned. A path like
-    `<gen_id>/src/notes/mcp_command_log.jsonl` is **not** canonical and is
+    `<source_id>/src/notes/mcp_command_log.jsonl` is **not** canonical and is
     treated as a normal file (writable subject to the usual file-tool /
     apply-patch rules).
     """
@@ -2954,65 +2953,70 @@ def _canonical_mcp_audit_log_paths(
         return []
     canonical: set[str] = set()
     if step_token == "generate":
-        prefix = f"{pipeline_ref}/generate/"
+        prefix = f"{pipeline_ref}/source/"
         for tok in listed_paths:
             if not isinstance(tok, str) or not tok.startswith(prefix):
                 continue
             tail = tok[len(prefix):]
             parts = [p for p in tail.split("/") if p]
-            # Canonical: <gen_id>/src/...
+            # Canonical: <source_id>/src/...
             if len(parts) >= 2 and parts[1] == "src":
                 canonical.add(f"{prefix}{parts[0]}/src/{_MCP_AUDIT_LOG_BASENAME}")
     elif step_token == "build":
-        prefix = f"{pipeline_ref}/build/"
+        prefix = f"{pipeline_ref}/binary/"
         for tok in listed_paths:
             if not isinstance(tok, str) or not tok.startswith(prefix):
                 continue
             tail = tok[len(prefix):]
             parts = [p for p in tail.split("/") if p]
             # Canonical (in-phase, e.g. CMake/Meson out-of-source builds with
-            # project_dir=<build_id>/): <build_id>/mcp_command_log.jsonl
-            # alongside build_meta.json.
+            # project_dir=<binary_id>/): <binary_id>/mcp_command_log.jsonl
+            # alongside binary_meta.json.
             if parts:
                 canonical.add(f"{prefix}{parts[0]}/{_MCP_AUDIT_LOG_BASENAME}")
         # Cross-phase placement is reserved for in-source Make builds
         # (Fortran/C-family per skills/workflow-build): compile_project runs
-        # with `project_dir=<pipeline>/generate/<gen_id>/src/` (where the
+        # with `project_dir=<pipeline>/source/<source_id>/src/` (where the
         # Makefile lives), so the MCP server's default command_log_path
-        # resolves under the generate tree. Gate on `build_system=make` —
+        # resolves under the source tree. Gate on `build_system=make` —
         # CMake/Meson/Ninja and other out-of-source toolchains do not
-        # legitimately write into the generate tree, and unconditional
-        # cross-phase authorization would let those phases mutate generate
+        # legitimately write into the source tree, and unconditional
+        # cross-phase authorization would let those phases mutate source
         # provenance.
-        if generation_id and build_system == "make":
-            gen_prefix = f"{pipeline_ref}/generate/"
+        if source_id and build_system == "make":
+            gen_prefix = f"{pipeline_ref}/source/"
             canonical.add(
-                f"{gen_prefix}{generation_id}/src/{_MCP_AUDIT_LOG_BASENAME}"
+                f"{gen_prefix}{source_id}/src/{_MCP_AUDIT_LOG_BASENAME}"
             )
-    elif step_token == "execute" and node_safe:
-        prefix = f"{pipeline_ref}/execute/"
+    elif step_token == "validate" and substep_token == "execute" and node_safe:
+        # Only the Validate.execute substep emits MCP command logs (run_program
+        # / run_quality_checks). Validate.judge runs without MCP, so no
+        # auto-injection — adding mcp_command_log.jsonl would later fail
+        # phase contract validation since judge does not list it as an allowed
+        # output filename.
+        prefix = f"{pipeline_ref}/runs/"
         for tok in listed_paths:
             if not isinstance(tok, str) or not tok.startswith(prefix):
                 continue
             tail = tok[len(prefix):]
             parts = [p for p in tail.split("/") if p]
-            # Canonical (in-phase): <exec_id>/<node_safe>/mcp_command_log.jsonl
+            # Canonical (in-phase): <run_id>/<node_safe>/mcp_command_log.jsonl
             if len(parts) >= 2 and parts[1] == node_safe:
                 canonical.add(
                     f"{prefix}{parts[0]}/{node_safe}/{_MCP_AUDIT_LOG_BASENAME}"
                 )
         # Cross-phase quality_check log placement: derive ONLY from the
-        # explicit `generation_id` field AND only when the toolchain is
+        # explicit `source_id` field AND only when the toolchain is
         # `build_system=make` (the documented Make-only exception per
-        # skills/workflow-execute/SKILL.md). For non-Make execute runs
+        # skills/workflow-validate-execute/SKILL.md). For non-Make runs
         # (run_program against a CMake/Meson out-of-source binary), the log
         # belongs in-phase and cross-phase authorization must not be
         # granted — otherwise a child could steer MCP logging into the
-        # generate tree and contaminate verified provenance files.
-        if generation_id and build_system == "make":
-            gen_prefix = f"{pipeline_ref}/generate/"
+        # source tree and contaminate verified provenance files.
+        if source_id and build_system == "make":
+            gen_prefix = f"{pipeline_ref}/source/"
             canonical.add(
-                f"{gen_prefix}{generation_id}/src/{_MCP_AUDIT_LOG_BASENAME}"
+                f"{gen_prefix}{source_id}/src/{_MCP_AUDIT_LOG_BASENAME}"
             )
     return sorted(canonical)
 
@@ -3027,10 +3031,10 @@ def _canonical_mcp_audit_log_paths_for_request(
     pipeline_ref = _normalize_rel_posix(str(request_payload.get("pipeline_ref") or ""))
     node_key = str(request_payload.get("node_key") or "").strip()
     node_safe = _node_key_to_safe(node_key) if node_key else ""
-    generation_id = str(request_payload.get("generation_id") or "").strip()
+    source_id = str(request_payload.get("source_id") or "").strip()
     # Resolve toolchain.build_system, preferring (1) explicit
     # `_resolved_build_system` in request_payload (set by record_launch from
-    # impl.resolved.yaml), then (2) reading impl.resolved.yaml directly
+    # spec.ir.yaml.impl_defaults), then (2) reading spec.ir.yaml.impl_defaults directly
     # when repo_root is provided. Without either, build_system="" which
     # disables cross-phase canonical placement (Make-only exception).
     build_system = ""
@@ -3038,18 +3042,20 @@ def _canonical_mcp_audit_log_paths_for_request(
     if isinstance(bs_pre, str) and bs_pre.strip():
         build_system = bs_pre.strip().lower()
     elif repo_root is not None:
-        plan_ref = str(request_payload.get("plan_ref") or "").strip()
-        if plan_ref:
-            bs = _impl_resolved_build_system(repo_root, plan_ref)
+        ir_ref = str(request_payload.get("ir_ref") or "").strip()
+        if ir_ref:
+            bs = _impl_resolved_build_system(repo_root, ir_ref)
             if isinstance(bs, str) and bs.strip():
                 build_system = bs.strip().lower()
+    substep_token = str(request_payload.get("substep") or "").strip().lower()
     return _canonical_mcp_audit_log_paths(
         step_token=step_token,
         pipeline_ref=pipeline_ref,
         node_safe=node_safe,
-        generation_id=generation_id,
+        source_id=source_id,
         listed_paths=list(allowed_output_paths),
         build_system=build_system,
+        substep_token=substep_token,
     )
 
 
@@ -3205,10 +3211,10 @@ def build_access_policy_payload(
         raise ValueError("access policy requires node_key")
     if not isinstance(step, str) or not step.strip():
         raise ValueError("access policy requires step")
-    plan_ref = request_payload.get("plan_ref")
+    ir_ref = request_payload.get("ir_ref")
     pipeline_ref = request_payload.get("pipeline_ref")
-    if not isinstance(plan_ref, str) or not plan_ref.strip():
-        raise ValueError("access policy requires plan_ref")
+    if not isinstance(ir_ref, str) or not ir_ref.strip():
+        raise ValueError("access policy requires ir_ref")
     if not isinstance(pipeline_ref, str) or not pipeline_ref.strip():
         raise ValueError("access policy requires pipeline_ref")
 
@@ -3216,7 +3222,7 @@ def build_access_policy_payload(
         "docs/",
         "spec/",
         _with_trailing_slash(_normalize_rel_posix(f"workspace/tmp/{agent_run_id.strip()}")),
-        _with_trailing_slash(_normalize_rel_posix(plan_ref)),
+        _with_trailing_slash(_normalize_rel_posix(ir_ref)),
         _with_trailing_slash(_normalize_rel_posix(pipeline_ref)),
     ]
     skill_must_read_refs = _split_skill_refs(request_payload.get("skill_must_read_refs"))
@@ -5095,7 +5101,7 @@ def _template_placeholder_values(request_payload: dict[str, Any]) -> dict[str, s
         "agent_run_id": agent_run_id,
         "parent_agent_run_id": str(request_payload.get("parent_agent_run_id", "")),
         "workflow_mode": str(request_payload.get("workflow_mode", "")),
-        "plan_ref": str(request_payload.get("plan_ref", "")),
+        "ir_ref": str(request_payload.get("ir_ref", "")),
         "pipeline_ref": str(request_payload.get("pipeline_ref", "")),
         "dependency_ref": str(request_payload.get("dependency_ref", "")),
         "skill_name": str(request_payload.get("skill_name", "")),
@@ -5139,37 +5145,33 @@ def _skill_name_for_request(request_payload: dict[str, Any]) -> str | None:
 def _required_verify_skill_refs(request_payload: dict[str, Any]) -> list[str]:
     step = request_payload.get("step")
     substep = request_payload.get("substep")
-    plan_ref = request_payload.get("plan_ref")
+    ir_ref = request_payload.get("ir_ref")
     if (
         not isinstance(step, str)
-        or step.strip().lower() not in {"plan", "generate"}
+        or step.strip().lower() not in {"compile", "generate"}
         or not isinstance(substep, str)
         or substep.strip().lower() != "verify"
-        or not isinstance(plan_ref, str)
-        or not plan_ref.strip()
+        or not isinstance(ir_ref, str)
+        or not ir_ref.strip()
     ):
         return []
-    plan_root = plan_ref.strip().rstrip("/")
+    ir_root = ir_ref.strip().rstrip("/")
     refs = [
-        f"{plan_root}/case.resolved.yaml",
-        f"{plan_root}/algorithm.resolved.yaml",
-        f"{plan_root}/impl.resolved.yaml",
-        f"{plan_root}/dependency.resolved.yaml",
+        f"{ir_root}/spec.ir.yaml",
     ]
     if step.strip().lower() == "generate":
-        refs.append(f"{plan_root}/derived_contract.json")
         pipeline_ref = request_payload.get("pipeline_ref")
-        generation_id = request_payload.get("generation_id")
+        source_id = request_payload.get("source_id")
         if not isinstance(pipeline_ref, str) or not pipeline_ref.strip():
             raise ValueError("generate verify launch request must include non-empty pipeline_ref")
-        if not isinstance(generation_id, str) or not generation_id.strip():
-            raise ValueError("generate verify launch request must include non-empty generation_id")
+        if not isinstance(source_id, str) or not source_id.strip():
+            raise ValueError("generate verify launch request must include non-empty source_id")
         pr = pipeline_ref.strip().rstrip("/")
-        gid = generation_id.strip()
+        sid = source_id.strip()
         refs.extend(
             [
                 f"{pr}/lineage.json",
-                f"{pr}/generate/{gid}/generate_meta.json",
+                f"{pr}/source/{sid}/source_meta.json",
             ]
         )
     return refs
@@ -5325,7 +5327,7 @@ def _required_launch_prompt_markers(request_payload: dict[str, Any]) -> list[str
         "orchestration_id:",
         "agent_run_id:",
         "parent_agent_run_id:",
-        "plan_ref:",
+        "ir_ref:",
         "pipeline_ref:",
         "dependency_ref:",
         "skill_name:",
@@ -5519,10 +5521,10 @@ def update_checkpoint(
         if isinstance(raw, list):
             output_refs = [r.strip() for r in raw if isinstance(r, str) and r.strip()]
 
-    plan_ref = str(result.get("plan_ref") or "")
+    ir_ref = str(result.get("ir_ref") or "")
     pipeline_ref = str(result.get("pipeline_ref") or "")
 
-    if not plan_ref or not pipeline_ref:
+    if not ir_ref or not pipeline_ref:
         lr_ref = result.get("launch_request_ref")
         if isinstance(lr_ref, str) and lr_ref.strip():
             lr_path = repo_root / lr_ref.strip()
@@ -5530,7 +5532,7 @@ def update_checkpoint(
                 try:
                     lr_data = _read_json(lr_path)
                     if isinstance(lr_data, dict):
-                        plan_ref = plan_ref or str(lr_data.get("plan_ref") or "")
+                        ir_ref = ir_ref or str(lr_data.get("ir_ref") or "")
                         pipeline_ref = pipeline_ref or str(
                             lr_data.get("pipeline_ref") or ""
                         )
@@ -5546,7 +5548,7 @@ def update_checkpoint(
         "agent_run_id": agent_run_id.strip(),
         "status": "pass",
         "completed_at": _utc_now_iso(),
-        "plan_ref": plan_ref.strip(),
+        "ir_ref": ir_ref.strip(),
         "pipeline_ref": pipeline_ref.strip(),
         "output_refs": output_refs,
         "artifact_hashes": artifact_hashes,
@@ -5739,7 +5741,7 @@ def check_step_completed(
         "node_key": entry.get("node_key"),
         "step": entry.get("step"),
         "agent_run_id": entry.get("agent_run_id"),
-        "plan_ref": entry.get("plan_ref"),
+        "ir_ref": entry.get("ir_ref"),
         "pipeline_ref": entry.get("pipeline_ref"),
         "output_refs": entry.get("output_refs", []),
         "completed_at": entry.get("completed_at"),
@@ -5815,7 +5817,7 @@ def _validate_pass_output_refs_against_launch(
     repo_root: Path,
     payload: dict[str, Any],
 ) -> None:
-    """Require each output_ref to lie under plan_ref or pipeline_ref from the saved launch request.
+    """Require each output_ref to lie under ir_ref or pipeline_ref from the saved launch request.
 
     Only applies to ``step`` / ``substep`` runs that have a launch request on disk.
     ``orchestration`` and other roles do not set ``launch_request_ref``; skip validation.
@@ -5841,14 +5843,14 @@ def _validate_pass_output_refs_against_launch(
     if not isinstance(launch_payload, dict):
         raise ValueError(f"launch request must be object: {launch_request_ref}")
 
-    plan_ref = launch_payload.get("plan_ref")
+    ir_ref = launch_payload.get("ir_ref")
     pipeline_ref = launch_payload.get("pipeline_ref")
-    if not isinstance(plan_ref, str) or not plan_ref.strip():
-        raise ValueError("launch request plan_ref missing for output_refs validation")
+    if not isinstance(ir_ref, str) or not ir_ref.strip():
+        raise ValueError("launch request ir_ref missing for output_refs validation")
     if not isinstance(pipeline_ref, str) or not pipeline_ref.strip():
         raise ValueError("launch request pipeline_ref missing for output_refs validation")
 
-    plan_root = plan_ref.strip().rstrip("/")
+    ir_root = ir_ref.strip().rstrip("/")
     pipe_root = pipeline_ref.strip().rstrip("/")
 
     for idx, ref in enumerate(output_refs):
@@ -5857,11 +5859,11 @@ def _validate_pass_output_refs_against_launch(
         r = ref.strip()
         if not r.startswith("workspace/"):
             raise ValueError(f"output_refs[{idx}] must start with workspace/: {r!r}")
-        if _workspace_path_is_under_ref(r, plan_root) or _workspace_path_is_under_ref(r, pipe_root):
+        if _workspace_path_is_under_ref(r, ir_root) or _workspace_path_is_under_ref(r, pipe_root):
             continue
         raise ValueError(
-            f"output_refs[{idx}] must be under plan_ref or pipeline_ref root "
-            f"({plan_root!r} or {pipe_root!r}); got {r!r}"
+            f"output_refs[{idx}] must be under ir_ref or pipeline_ref root "
+            f"({ir_root!r} or {pipe_root!r}); got {r!r}"
         )
 
 
@@ -5878,23 +5880,23 @@ def _validate_launch_request_payload(request_payload: dict[str, Any]) -> None:
     else:
         node_safe = None
 
-    for key in ("plan_ref", "pipeline_ref", "dependency_ref"):
+    for key in ("ir_ref", "pipeline_ref", "dependency_ref"):
         value = request_payload.get(key)
         if not isinstance(value, str) or not value.strip():
             raise ValueError(f"launch request must include non-empty {key}")
         if _is_placeholder_ref(value):
             raise ValueError(f"launch request {key} must not contain placeholder tokens")
 
-    plan_ref = request_payload.get("plan_ref")
+    ir_ref = request_payload.get("ir_ref")
     pipeline_ref = request_payload.get("pipeline_ref")
     dependency_ref = request_payload.get("dependency_ref")
     if node_safe is not None:
-        if isinstance(plan_ref, str) and plan_ref.strip():
+        if isinstance(ir_ref, str) and ir_ref.strip():
             _validate_canonical_workspace_root_ref(
-                ref=plan_ref,
+                ref=ir_ref,
                 node_safe=node_safe,
-                kind="plans",
-                label="plan_ref",
+                kind="ir",
+                label="ir_ref",
             )
         if isinstance(pipeline_ref, str) and pipeline_ref.strip():
             _validate_canonical_workspace_root_ref(
@@ -5906,14 +5908,14 @@ def _validate_launch_request_payload(request_payload: dict[str, Any]) -> None:
     if isinstance(dependency_ref, str) and _is_placeholder_ref(dependency_ref):
         raise ValueError("launch request dependency_ref must not contain placeholder tokens")
     step_val = str(request_payload.get("step", "")).strip().lower()
-    if step_val == "plan" and isinstance(dependency_ref, str) and dependency_ref.strip():
+    if step_val == "compile" and isinstance(dependency_ref, str) and dependency_ref.strip():
         dep_norm = _normalize_rel_posix(dependency_ref.strip())
         if not (dep_norm.startswith("spec/") and dep_norm.endswith("/deps.yaml")):
             raise ValueError(
-                "record-launch: Plan step dependency_ref must be spec/.../deps.yaml, "
+                "record-launch: Compile step dependency_ref must be spec/.../deps.yaml, "
                 f"got {dependency_ref!r}. "
                 "Both generate and verify substeps must receive the spec path, "
-                "not workspace/plans/."
+                "not workspace/ir/."
             )
 
     # repair_strategy / issue_severity の値検証
@@ -5948,14 +5950,14 @@ def _validate_launch_request_payload(request_payload: dict[str, Any]) -> None:
 
     is_verify_substep = (
         isinstance(step, str)
-        and step.strip().lower() in {"plan", "generate"}
+        and step.strip().lower() in {"compile", "generate"}
         and isinstance(substep, str)
         and substep.strip().lower() == "verify"
     )
     if is_verify_substep and isinstance(step, str) and step.strip().lower() == "generate":
-        gen_id = request_payload.get("generation_id")
+        gen_id = request_payload.get("source_id")
         if not isinstance(gen_id, str) or not gen_id.strip():
-            raise ValueError("generate verify launch request must include non-empty generation_id")
+            raise ValueError("generate verify launch request must include non-empty source_id")
 
     if not is_verify_substep:
         return
@@ -6304,10 +6306,10 @@ def _validate_orchestration_completion_for_pass(
 _STEP_META_FILENAME = STAGE_META_FILENAME_BY_STEP
 
 STEP_REQUIRED_VALIDATION_STAGES: dict[str, frozenset[str]] = {
+    "compile": frozenset({"compile", "full"}),
     "generate": frozenset({"post_generate", "post_build", "full"}),
     "build": frozenset({"post_build", "full"}),
-    "execute": frozenset({"post_execute", "pre_judge", "full"}),
-    "judge": frozenset({"pre_judge", "full"}),
+    "validate": frozenset({"post_execute", "pre_judge", "full"}),
 }
 
 _RETRY_DECISION_REQUIRED_KEYS: tuple[str, ...] = (
@@ -6321,7 +6323,7 @@ _RETRY_DECISION_REQUIRED_KEYS: tuple[str, ...] = (
 
 def _validate_lint_command_ref(meta_data: dict[str, Any], *, meta_filename: str, meta_ref: str) -> None:
     lint_command_ref = meta_data.get("lint_command_ref")
-    if meta_filename != "generate_meta.json":
+    if meta_filename != "source_meta.json":
         return
     status = str(meta_data.get("verification_status", "")).strip().lower()
     if status != "pass":
@@ -6658,7 +6660,7 @@ def _validate_step_result_payload(
             detail={"step": step_token, "status": status_token, "validation_stage": validation_stage},
         )
 
-    if step_token == "judge" and status_token in TERMINAL_STATUSES:
+    if step_token == "validate" and status_token in TERMINAL_STATUSES:
         _pre_phase_complete_judge_checks(
             repo_root,
             node_key=node_key,
@@ -6666,8 +6668,8 @@ def _validate_step_result_payload(
             payload=payload,
         )
 
-    # 以下は既存の substep 検証（plan/generate/tune のみ）
-    if step_token not in {"plan", "generate", "tune"}:
+    # 以下は既存の substep 検証（compile/generate/validate のみ）
+    if step_token not in {"compile", "generate", "validate"}:
         return
     if status_token != "pass":
         return
@@ -7294,7 +7296,7 @@ def write_preflight(repo_root: Path, orchestration_id: str, payload: dict[str, A
                 "direct_dependency_plan_readiness": True,
                 "direct_dependency_execution_readiness": True,
                 "detail": {
-                    "plan_ref_verified": True,
+                    "ir_ref_verified": True,
                     "pipeline_ref_verified": True,
                     "aggregate_verdict_verified": True,
                 },
@@ -7576,12 +7578,12 @@ def record_launch(
         out_refs["capability_token"] = cap_doc.get("capability_token", "")
         write_roots_obj = cap_doc.get("write_roots")
         write_roots = [str(item) for item in write_roots_obj] if isinstance(write_roots_obj, list) else []
-        # Resolve toolchain.build_system from impl.resolved.yaml so the
+        # Resolve toolchain.build_system from spec.ir.yaml.impl_defaults so the
         # canonical-placement helper can gate cross-phase auto-inject on
         # `build_system=make` (the documented Make-only exception).
-        _plan_ref_for_bs = str(request_payload.get("plan_ref") or "").strip()
-        if _plan_ref_for_bs:
-            _bs_resolved = _impl_resolved_build_system(repo_root, _plan_ref_for_bs)
+        _ir_ref_for_bs = str(request_payload.get("ir_ref") or "").strip()
+        if _ir_ref_for_bs:
+            _bs_resolved = _impl_resolved_build_system(repo_root, _ir_ref_for_bs)
             if isinstance(_bs_resolved, str) and _bs_resolved.strip():
                 request_payload = dict(request_payload)
                 request_payload["_resolved_build_system"] = _bs_resolved.strip().lower()
@@ -7602,8 +7604,8 @@ def record_launch(
         # Execute step lineage bind (mandatory for ALL execute launches, not
         # only when cross-phase quality_check log is authorized): every
         # execute run must declare `source_build_id` in the launch request,
-        # and the referenced build's `build_meta.json` must record
-        # `source_generation_id` matching the request's `generation_id`.
+        # and the referenced build's `binary_meta.json` must record
+        # `source_source_id` matching the request's `source_id`.
         # Without this binding, an execute could run binaries from build A
         # while attributing evidence (e.g. trial_meta) to a different
         # sibling build's generation — a mixed-build forge that purely
@@ -7612,34 +7614,39 @@ def record_launch(
         _pipe_ref_for_bind = _normalize_rel_posix(
             str(request_payload.get("pipeline_ref") or "")
         )
-        if _step_token_for_bind == "execute" and _pipe_ref_for_bind:
+        _substep_token_for_bind = str(request_payload.get("substep") or "").strip().lower()
+        if (
+            _step_token_for_bind == "validate"
+            and _substep_token_for_bind == "execute"
+            and _pipe_ref_for_bind
+        ):
             _gen_id_for_bind = str(
-                request_payload.get("generation_id") or ""
+                request_payload.get("source_id") or ""
             ).strip()
-            _source_build_id = str(
-                request_payload.get("source_build_id") or ""
+            _source_binary_id = str(
+                request_payload.get("source_binary_id") or ""
             ).strip()
             if not _gen_id_for_bind:
                 raise ValueError(
-                    "execute launch requires `generation_id` in the launch "
-                    "request to bind provenance to a specific generation."
+                    "validate.execute launch requires `source_id` in the launch "
+                    "request to bind provenance to a specific source."
                 )
-            if not _source_build_id:
+            if not _source_binary_id:
                 raise ValueError(
-                    "execute launch requires `source_build_id` in the launch "
+                    "validate.execute launch requires `source_binary_id` in the launch "
                     "request to bind provenance to a specific build. "
                     "Without this binding, evidence could be forged across "
                     "sibling builds even when in-phase logging is used."
                 )
             _bm_path = (
-                repo_root / _pipe_ref_for_bind / "build" / _source_build_id / "build_meta.json"
+                repo_root / _pipe_ref_for_bind / "binary" / _source_binary_id / "binary_meta.json"
             )
             if not _bm_path.is_file():
                 raise ValueError(
-                    f"execute launch source_build_id={_source_build_id!r} "
-                    f"does not resolve to an existing build_meta.json at "
+                    f"validate.execute launch source_binary_id={_source_binary_id!r} "
+                    f"does not resolve to an existing binary_meta.json at "
                     f"{_bm_path!s}. The referenced build must exist on disk "
-                    "before execute can attribute provenance to it."
+                    "before validate.execute can attribute provenance to it."
                 )
             try:
                 _bm_doc = _read_json(_bm_path)
@@ -7647,26 +7654,26 @@ def record_launch(
                 _bm_doc = None
             if not isinstance(_bm_doc, dict):
                 raise ValueError(
-                    f"execute launch source_build_id={_source_build_id!r}: "
-                    "build_meta.json could not be parsed as a JSON object."
+                    f"validate.execute launch source_binary_id={_source_binary_id!r}: "
+                    "binary_meta.json could not be parsed as a JSON object."
                 )
-            _bm_src_gen = _bm_doc.get("source_generation_id")
+            _bm_src_gen = _bm_doc.get("source_source_id")
             if (
                 not isinstance(_bm_src_gen, str)
                 or not _bm_src_gen.strip()
             ):
                 raise ValueError(
-                    f"execute launch source_build_id={_source_build_id!r}: "
-                    "build_meta.json must record `source_generation_id` to "
-                    "bind execute provenance. Migrate the build's metadata "
-                    "before launching execute against it."
+                    f"validate.execute launch source_binary_id={_source_binary_id!r}: "
+                    "binary_meta.json must record `source_source_id` to "
+                    "bind validate.execute provenance. Migrate the build's metadata "
+                    "before launching validate.execute against it."
                 )
             if _bm_src_gen.strip() != _gen_id_for_bind:
                 raise ValueError(
-                    f"execute launch generation_id={_gen_id_for_bind!r} "
-                    f"does not match build {_source_build_id!r}'s "
-                    f"source_generation_id={_bm_src_gen.strip()!r}. Execute "
-                    "must run against the binary produced by the generation "
+                    f"validate.execute launch source_id={_gen_id_for_bind!r} "
+                    f"does not match build {_source_binary_id!r}'s "
+                    f"source_source_id={_bm_src_gen.strip()!r}. Validate.execute "
+                    "must run against the binary produced by the source "
                     "it claims provenance for."
                 )
         canonical_audit_logs = _canonical_mcp_audit_log_paths_for_request(
@@ -7676,17 +7683,21 @@ def record_launch(
         #   - Execute → generate/<gen>/ for run_quality_checks
         #   - Build → generate/<gen>/ for in-source compile_project
         #     (Make for Fortran/C-family runs project_dir=<gen>/src/)
-        # The `generation_id` from the request payload is otherwise free-form
+        # The `source_id` from the request payload is otherwise free-form
         # and could authorize writes to an unrelated generation's audit log
         # under the same pipeline. Require the referenced generate run to
-        # actually exist on disk (generate_meta.json must be present) and to
+        # actually exist on disk (source_meta.json must be present) and to
         # have reached pass state before granting cross-phase write authority.
         _step_token_xpv = str(request_payload.get("step") or "").strip().lower()
         _pipe_ref_xpv = _normalize_rel_posix(
             str(request_payload.get("pipeline_ref") or "")
         )
-        if _step_token_xpv in {"execute", "build"} and _pipe_ref_xpv:
-            _gen_prefix_xpv = f"{_pipe_ref_xpv}/generate/"
+        _substep_xpv = str(request_payload.get("substep") or "").strip().lower()
+        _xpv_is_validate_execute = (
+            _step_token_xpv == "validate" and _substep_xpv == "execute"
+        )
+        if (_xpv_is_validate_execute or _step_token_xpv == "build") and _pipe_ref_xpv:
+            _gen_prefix_xpv = f"{_pipe_ref_xpv}/source/"
             for _log_path in canonical_audit_logs:
                 if not _log_path.startswith(_gen_prefix_xpv):
                     continue
@@ -7699,13 +7710,13 @@ def record_launch(
                     repo_root
                     / _gen_prefix_xpv
                     / _gen_id_xpv
-                    / "generate_meta.json"
+                    / "source_meta.json"
                 )
                 if not _gen_meta.exists():
                     raise ValueError(
                         f"{_step_token_xpv} launch references unknown "
-                        f"cross-phase generation_id={_gen_id_xpv!r}: "
-                        f"generate_meta.json not found at {_gen_meta!s}. "
+                        f"cross-phase source_id={_gen_id_xpv!r}: "
+                        f"source_meta.json not found at {_gen_meta!s}. "
                         "Cross-phase MCP audit log authorization requires the "
                         "referenced generation to have actually run."
                     )
@@ -7731,14 +7742,14 @@ def record_launch(
                 if _gen_status != "pass":
                     raise ValueError(
                         f"{_step_token_xpv} launch references cross-phase "
-                        f"generation_id={_gen_id_xpv!r} with "
+                        f"source_id={_gen_id_xpv!r} with "
                         f"verification_status={_gen_status!r} (expected "
                         "'pass'). Cannot grant MCP-owned write authority to "
                         "a failed/stale generation tree; this would "
                         "contaminate provenance files trusted by later "
                         "validators."
                     )
-                # NOTE: execute step source_build_id / generation_id lineage
+                # NOTE: execute step source_build_id / source_id lineage
                 # bind is enforced unconditionally above (see "Execute step
                 # lineage bind" block before canonical_audit_logs). The
                 # cross-phase loop here only handles existence + pass-state
@@ -8829,7 +8840,7 @@ def reserve_phase_root(
     payload = {
         "node_key": node_key.strip(),
         "step": step_key,
-        "reserved_plan_id": reserved_id.strip(),
+        "reserved_ir_id": reserved_id.strip(),
         "reserved_by_agent_run_id": reserved_by_agent_run_id.strip(),
         "status": "reserved",
         "reserved_at": _utc_now_iso(),
@@ -9165,7 +9176,7 @@ def _validate_write_step_result_fields(payload: dict[str, Any], step: str) -> No
         type_name = type(substep_ids).__name__ if substep_ids is not None else "missing"
         raise ValueError(
             f"{label}: required field 'substep_agent_run_ids' must be a list (got {type_name}). "
-            "Use an empty list [] for step-only phases (build/execute/judge/promote)."
+            "Use an empty list [] for step-only phases (build)."
         )
     step_token = step.strip().lower()
     if step_token in STEP_REQUIRED_VALIDATION_STAGES and status_token in TERMINAL_STATUSES:
@@ -9219,7 +9230,7 @@ def main(argv: list[str] | None = None) -> int:
         "agent_role ('step'|'substep'), node_key (<spec_kind>/<spec_id>@<spec_version>), "
         "step, substep (for substep agents), orchestration_id, agent_run_id, "
         "parent_agent_run_id, workflow_mode ('dev'|'prod'), "
-        "plan_ref (workspace/plans/<node_key_safe>/<plan_id>), "
+        "ir_ref (workspace/ir/<node_key_safe>/<ir_id>), "
         "pipeline_ref (workspace/pipelines/<node_key_safe>/<pipeline_id> -- required for ALL "
         "phases including Plan; reserve via reserve-phase-root --step generate if not yet created), "
         "dependency_ref (phase rule: Plan => spec/.../deps.yaml; Generate+ => workspace phase root), "
@@ -9227,18 +9238,18 @@ def main(argv: list[str] | None = None) -> int:
         "For step/substep launch, one of allowed_output_paths|required_outputs|output_refs must be provided "
         "as file-path list; runtime validates each path against phase contract outputs and capability write_roots. "
         "allowed_file_tool_paths is optional and, when provided, must be a file-path list included in allowed_output_paths. "
-        "plan_id/pipeline_id format: <slug>_<YYYYMMDD>_<seq3> where slug uses hyphens only "
+        "ir_id/pipeline_id format: <slug>_<YYYYMMDD>_<seq3> where slug uses hyphens only "
         "(e.g. 'flux-rsn-p0_20260425_001'; underscores in slug are invalid). "
-        "Execute step extra-required fields: execution_id (single exec_id pinned for this launch), "
-        "generation_id (the gen_id whose <gen>/src/ run_quality_checks uses; record_launch verifies "
-        "verification_status=pass), and source_build_id (the build_id whose binary execute uses; "
-        "record_launch reads <pipeline>/build/<source_build_id>/build_meta.json and verifies "
-        "source_generation_id == request.generation_id to prevent mixed-build forge). "
+        "Execute step extra-required fields: run_id (single exec_id pinned for this launch), "
+        "source_id (the gen_id whose <gen>/src/ run_quality_checks uses; record_launch verifies "
+        "verification_status=pass), and source_build_id (the binary_id whose binary execute uses; "
+        "record_launch reads <pipeline>/build/<source_build_id>/binary_meta.json and verifies "
+        "source_source_id == request.source_id to prevent mixed-build forge). "
         "Cross-phase MCP audit log auto-inject (`<gen>/src/mcp_command_log.jsonl`) only fires when "
-        "impl.resolved.yaml records `toolchain.build_system: make` (Fortran/C-family in-source builds). "
-        "Generate substep extra-required: generation_id matches the listed paths' single <gen_id>. "
-        "Build step listed paths must use a single <build_id>; cross-phase Make builds also accept "
-        "generation_id-derived `<gen>/src/mcp_command_log.jsonl` placement."
+        "spec.ir.yaml.impl_defaults records `toolchain.build_system: make` (Fortran/C-family in-source builds). "
+        "Generate substep extra-required: source_id matches the listed paths' single <gen_id>. "
+        "Build step listed paths must use a single <binary_id>; cross-phase Make builds also accept "
+        "source_id-derived `<gen>/src/mcp_command_log.jsonl` placement."
     )
     _RECORD_LAUNCH_RESPONSE_HELP = (
         "JSON object with child agent response. For Claude Code backend use: "
@@ -9254,9 +9265,9 @@ def main(argv: list[str] | None = None) -> int:
         "validate_workspace_root => {'paths': ['workspace']} (optional, defaults to repo workspace); "
         "check_artifact_syntax => {'expect_top': 'object', 'paths': ['workspace/.../file.yaml', ...]}; "
         "validate_pipeline_semantics => {'stage': 'plan|post_generate|post_build|post_execute|pre_judge|full', "
-        "'plan_ref': 'workspace/plans/...'(plan stage), "
+        "'ir_ref': 'workspace/ir/...'(plan stage), "
         "'pipeline_root': 'workspace/pipelines/...' or ['workspace/pipelines/...', ...], "
-        "'generation_id': '<id>' (optional)}. "
+        "'source_id': '<id>' (optional)}. "
         "Keys are converted to CLI flags (e.g. pipeline_root -> --pipeline-root)."
     )
     _STEP_RESULT_HELP = (
@@ -9265,11 +9276,11 @@ def main(argv: list[str] | None = None) -> int:
         "failed_substeps (list[str], optional), retry_decisions (list[object], optional). "
         "retry_decisions items require: issue_severity, repair_strategy, repair_target_agent_run_id, "
         "new_agent_run_id, repair_reason. "
-        "When step in {generate,build,execute,judge} and status is terminal "
+        "When step in {compile,generate,build,validate} and status is terminal "
         "(pass/fail/blocked/timeout/cancel), validation_stage is required: "
-        "generate=>post_generate|full, build=>post_build|full, execute=>post_execute|pre_judge|full, "
-        "judge=>pre_judge|full. "
-        "For plan/generate/tune pass, required_outputs must be covered by effective substep output_refs."
+        "compile=>compile|full, generate=>post_generate|post_build|full, "
+        "build=>post_build|full, validate=>post_execute|pre_judge|full. "
+        "For compile/generate pass, required_outputs must be covered by effective substep output_refs."
     )
 
     launch_parser = subparsers.add_parser(
@@ -9492,10 +9503,10 @@ def main(argv: list[str] | None = None) -> int:
     reserve_root_parser = subparsers.add_parser(
         "reserve-phase-root",
         description=(
-            "Reserve a plan_id or pipeline_id before the child agent creates the directory. "
-            "Writes a reservation marker only; does NOT create workspace/plans/ or "
+            "Reserve an ir_id or pipeline_id before the child agent creates the directory. "
+            "Writes a reservation marker only; does NOT create workspace/ir/ or "
             "workspace/pipelines/ directories. "
-            "Use --step plan to reserve a plan_id; --step generate to reserve a pipeline_id. "
+            "Use --step compile to reserve an ir_id; --step generate to reserve a pipeline_id. "
             "Both reservations are typically needed before launching Plan phase substeps, "
             "because record-launch requires a valid pipeline_ref even for Plan."
         ),
@@ -9507,11 +9518,11 @@ def main(argv: list[str] | None = None) -> int:
         help=_NODE_KEY_HELP,
     )
     reserve_root_parser.add_argument("--step", required=True,
-                                     help="'plan' to reserve a plan_id; 'generate' to reserve a pipeline_id.")
+                                     help="'compile' to reserve an ir_id; 'generate' to reserve a pipeline_id.")
     reserve_root_parser.add_argument(
         "--reserved-id", required=True,
         help=(
-            "The plan_id or pipeline_id to reserve. "
+            "The ir_id or pipeline_id to reserve. "
             "Format: <slug>_<YYYYMMDD>_<seq3> where slug is hyphen-separated lowercase alphanumeric "
             "(regex: ^[a-z0-9]+(?:-[a-z0-9]+)*_[0-9]{8}_[0-9]{3}$). "
             "Example: 'flux-rsn-p0_20260425_001'. "

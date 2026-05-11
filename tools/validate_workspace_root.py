@@ -312,11 +312,11 @@ def _validate_dependency_ref(json_path: Path, dotted_path: str, value: str, step
         return [f"{json_path}:{dotted_path}: absolute path is not allowed ({value})"]
 
     normalized = _normalize_relpath(value)
-    if step == "plan":
+    if step == "compile":
         if normalized.startswith("spec/") and normalized.endswith("/deps.yaml"):
             return []
         return [
-            f"{json_path}:{dotted_path}: Plan dependency_ref must be spec/.../deps.yaml ({value})"
+            f"{json_path}:{dotted_path}: Compile dependency_ref must be spec/.../deps.yaml ({value})"
         ]
 
     if normalized.startswith("workspace/"):
@@ -834,7 +834,7 @@ def _scan_workspace_for_forbidden_scripts(workspace_root: Path) -> list[str]:
     live_arids = _live_agent_tmp_run_ids(workspace_root) if tmp_root_present else set()
     # Adv-32: use the LEXICAL path under workspace/ for the exemption decision,
     # not Path.resolve(). resolve() follows symlinks, so a symlink such as
-    # workspace/plans/foo/helper.py -> ../../tmp/<live-arid>/helper.py would
+    # workspace/ir/foo/helper.py -> ../../tmp/<live-arid>/helper.py would
     # resolve INTO workspace/tmp/ and inherit the exemption. The actual
     # workspace entry being validated lives outside tmp/, so we must judge by
     # where the file appears in the workspace tree, not where it dereferences.

@@ -1,0 +1,5 @@
+interface:
+  display_name: "Workflow Validate Judge"
+  short_description: "Help with Workflow Validate Judge tasks"
+  backend: "claude"
+  spawn_agent_tool: "Agent"
