@@ -84,7 +84,9 @@ description: 対応 execution platform で `workflow` 全体を開始し、`orch
 - `verify-checkpoint-integrity` で `stale` が検出された `step` をスキップしてはならない。
 
 ## 運用ルール
-0. **Step 0 (TMPDIR セットアップ)**: orchestration agent は最初の `Bash` 実行**前に** `export TMPDIR=$(jq -er '.allowed_tmp_root' "workspace/orchestrations/$METDSL_ORCHESTRATION_ID/output_manifests/$ORCHESTRATION_AGENT_RUN_ID.json")` を実行する (`METDSL_ORCHESTRATION_ID` と `ORCHESTRATION_AGENT_RUN_ID` は `tools/run_workflow.py` が export 済み)。これを skip すると以降の `cat > $TMPDIR/...` 等の heredoc が `output_manifest_write_guard` でブロックされる。詳細手順は `references/startup_contract.md` の Step 0 を canonical source とする。子 `agent` も同等の Step 0 を起動直後に実施する義務がある (`references/launch_prompts.md` 参照)。
+
+**tmp area 利用契約 (前提)**: orchestration agent / 子 `agent` の `allowed_tmp_root` は `workspace/tmp/<agent_run_id>/` 固定 (`record-launch` 時に `output_manifests/<agent_run_id>.json` へ記録される)。一時ファイル書き込みは当該 literal path 配下を直接指定する。`output_manifest_write_guard` は write 対象 path が `allowed_tmp_root` 配下かを判定するだけで `$TMPDIR` env を参照しない。`export TMPDIR=...`、`jq -er ...`、`printenv`、`bash -c` 等の bootstrap Bash を呼んではならない (Claude Code session sandbox の approval 要求で workflow が停止する根本原因になる)。env 変数 (`METDSL_ORCHESTRATION_ID` / `ORCHESTRATION_AGENT_RUN_ID` / `TMPDIR`) は `tools/run_workflow.py` が subprocess に inherit させており確認 Bash も不要。子 `agent` の launch prompt にも `allowed_tmp_root` を literal で埋め込む (`references/launch_prompts.md` 参照)。
+
 1. `python3 tools/run_workflow.py <spec_ref> <until_phase> --llm <backend>` を実行し、`workspace/orchestrations/<orchestration_id>/` の初期化、`preflight.json` 生成、起動 prompt 生成を一括で行う。
 2. `tools/run_workflow.py` 以外の経路で workflow を開始してはならない。例外運用で `tools/orchestration_runtime.py` を直接実行する場合は、理由と差分を記録し、通常運用へ復帰しなければならない。
 3. `preflight.json` の `probed_at` フィールドは、`record-launch` 実行時に TTL キャッシュの判定に使用され、TTL 期限切れ後の live probe 成功時に `tools/orchestration_runtime.py` によって自動更新される。この自動更新は `status` / `can_launch_*` 等の判定結果フィールドを変更しないため、手動編集禁止ルールの適用外とする。
@@ -98,11 +100,10 @@ description: 対応 execution platform で `workflow` 全体を開始し、`orch
 11. phase 本体へ進む前に、`preflight` 済み、launch prompt 準備済み、child `agent` 起動済みの 3 条件を確認する。未充足なら編集、`MCP` 実行、phase artifact 生成を開始してはならない。
 12. 生成した起動要求本文で子 `agent` を起動する。起動成功直後の実 `spawn_agent` 応答だけを `record-launch` で保存し、`launch_prompt_ref` と `launch_reply_ref` も同時に記録する。実起動前の仮記録、起動失敗後の補完記録、任意 `response_payload` の後投入を禁止する。
 13. 子 `agent` 完了後は、次の順序で記録処理を実行する。順序を逆転させてはならない。`record-child-return` → `deactivate-child` の handshake は Adv-14/16/20 ガードに必須で、欠落すると runtime が `ValueError` で停止する。
-    1. `RETURN_TOKEN=$(cat workspace/orchestrations/<orchestration_id>/launches/<agent_run_id>.parent_return_token)` で `record-launch` が発行した parent-bound token を取得する。
-    2. `python3 tools/orchestration_runtime.py record-child-return --repo-root <repo_root> --orchestration-id <orchestration_id> --agent-run-id <agent_run_id> --return-token "$RETURN_TOKEN"` を実行し、Agent tool の return を観測した証跡 `child_returns/<agent_run_id>.txt` を記録する (Adv-30: 任意 caller による forge を防ぐ token 検証付き)。
-    3. `deactivate-child` を実行して active context を orchestration agent へ切り戻す（ack 不在 or token 不一致では拒否される）。
-    4. `record-reply` で `launches/<agent_run_id>.reply.txt` を Agent tool の最終応答テキストで上書き保存する。
-    5. `python3 tools/orchestration_runtime.py record-agent-run --repo-root <repo_root> --orchestration-id <orchestration_id> --agent-run-json '<json>'` を実行して `agent_runs.jsonl` へ 1 行追記する。
+    1. `python3 tools/orchestration_runtime.py record-child-return --repo-root <repo_root> --orchestration-id <orchestration_id> --agent-run-id <agent_run_id> --return-token "$(cat workspace/orchestrations/<orchestration_id>/launches/<agent_run_id>.parent_return_token)"` を実行し、Agent tool の return を観測した証跡 `child_returns/<agent_run_id>.txt` を記録する (Adv-30: 任意 caller による forge を防ぐ parent-bound token; `record-launch` が自動生成。コマンド substitution `$(cat ...)` をインラインで使い、`VAR=$(cat ...)` の 2-step 形式は使わない — 先頭 `VAR=` が `Bash(python3 ...)` allowlist 一致を壊し session approval を要求する)。
+    2. `deactivate-child` を実行して active context を orchestration agent へ切り戻す（ack 不在 or token 不一致では拒否される）。
+    3. `record-reply` で `launches/<agent_run_id>.reply.txt` を Agent tool の最終応答テキストで上書き保存する。
+    4. `python3 tools/orchestration_runtime.py record-agent-run --repo-root <repo_root> --orchestration-id <orchestration_id> --agent-run-json '<json>'` を実行して `agent_runs.jsonl` へ 1 行追記する。
     `record-agent-run` により `agent.result.json` と `agent.summary.txt` も同時に保存しなければならない。`record-agent-run` は、申告した `output_refs` と `apply_patch_writes` internal gate 記録と output manifest 記録に加えて baseline との差分で実変更 path を検査するため、capability token の `write_root` または gate 許可 path または manifest 許可 path に含まれない `unauthorized write` が存在する場合は当該 `agent_run` を reject する。reject 発生後は `orchestration agent` が `orchestration_meta.status=fail_closed` を記録して停止しなければならない。
 14. `substep` を持つ phase では、返却結果を評価して `issue_severity` と `repair_strategy` を決定する。再投入が必要な場合は `repair_target_agent_run_id` と `repair_reason` を起動要求へ付与して再起動し、`record-launch` を追加する。
 15. `repair_strategy=reuse` の再投入では、対象 `substep` の契約を変更せず差分修正だけを要求する。`repair_strategy=restart` の再投入では、対象 `substep` の契約入力から再生成させる。

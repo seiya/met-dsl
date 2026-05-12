@@ -433,7 +433,7 @@ Step 3.5 / 4.5 / 5.5 から、**agent が次に取るべき正規アクション
 | ポリシー | ブロック数 | fix_hint あり/なし | 推奨アクション |
 |---|---|---|---|
 | read_manifest_read_guard | … | … | `guarded-apply-patch` / `run-gate` 経由で取得 |
-| output_manifest_write_guard | … | … | `$TMPDIR` を `allowed_tmp_root` から export する |
+| output_manifest_write_guard | … | … | `allowed_tmp_root` の literal path (`workspace/tmp/<agent_run_id>/...`) を直接指定する。`export TMPDIR=...` / `jq -er ...` の bootstrap Bash は禁止 (Claude Code session sandbox approval で workflow が停止する) |
 | forbid_python_inline_write | … | … | `guarded-apply-patch` または Edit/Write tool を使う |
 | forbid_tools_direct_read | … | … | `docs/` / `spec/` のみを参照する |
 | enforce_guarded_apply_patch | … | … | `guarded-apply-patch` を使い `allowed_file_tool_paths` に追加する |

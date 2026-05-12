@@ -54,10 +54,11 @@ PHASE_ALIASES = {
 }
 PHASE_ORDER = ["Compile", "Generate", "Build", "Validate"]
 
-# CLI tools the workflow runtime and its hook-recovery procedures depend on.
-# Documented in docs/RUNBOOK.md#0-1. Missing any one fails the run before init,
-# so agents never hit a partial-failure state where (e.g.) jq is unavailable
-# but TMPDIR extraction is already prescribed.
+# CLI tools the workflow runtime depends on (used internally by orchestration_runtime
+# subcommands such as run-gate / guarded-apply-patch, and by git-based status probes
+# in tools/run_workflow.py itself). Missing any one fails the run before init, so
+# agents never hit a partial-failure state where (e.g.) jq is unavailable to runtime
+# but already in the agent's environment.
 REQUIRED_CLI_TOOLS = ("python3", "jq", "git")
 
 
@@ -146,25 +147,26 @@ def _build_orchestration_prompt(
     workflow_mode: str,
 ) -> str:
     phase_list = ", ".join(PHASE_ORDER[: PHASE_ORDER.index(until_phase) + 1])
+    allowed_tmp_root = f"workspace/tmp/{orchestration_agent_run_id}"
     base = textwrap.dedent(
         f"""
         Workflow を起動する。
 
-        ## Step 0 — TMPDIR bootstrap (FIRST Bash before anything else)
+        ## tmp area (literal path で参照する)
 
-        最初の `Bash` 呼び出しで以下を必ず実行する。skip すると後続の heredoc / `cat > ...` が
-        `output_manifest_write_guard` でブロックされる (`startup_contract.md` Step 0 参照)。
+        本 orchestration agent の `allowed_tmp_root` は以下の literal path:
 
-        ```bash
-        export METDSL_ORCHESTRATION_ID="{orchestration_id}"
-        export ORCHESTRATION_AGENT_RUN_ID="{orchestration_agent_run_id}"
-        export TMPDIR=$(jq -er '.allowed_tmp_root' \\
-          "workspace/orchestrations/$METDSL_ORCHESTRATION_ID/output_manifests/$ORCHESTRATION_AGENT_RUN_ID.json")
+        ```
+        {allowed_tmp_root}
         ```
 
-        `tools/run_workflow.py` は呼び出し時に `METDSL_ORCHESTRATION_ID` / `ORCHESTRATION_AGENT_RUN_ID` /
-        `TMPDIR` を子プロセスに引き継いでいるが、明示 export を入れておくと session 切り替え時にも
-        参照可能になる。
+        一時ファイルが必要な場合は `{allowed_tmp_root}/...` を **literal** で指定する。
+        `output_manifest_write_guard` は manifest の `allowed_tmp_root` 配下かどうかだけを判定し
+        `$TMPDIR` env を見ないため、env 変数経由の参照は不要。
+        Bash で `export TMPDIR=...`、`jq -er ...`、`printenv`、`bash -c` を呼んではならない
+        (session sandbox の approval 要求で workflow が停止する原因になる)。
+        env (`METDSL_ORCHESTRATION_ID` / `ORCHESTRATION_AGENT_RUN_ID` / `TMPDIR`) は
+        `tools/run_workflow.py` が subprocess に既に inherit させているため確認 Bash も不要。
 
         ## startup context
         - orchestration_id: `{orchestration_id}`
@@ -184,7 +186,7 @@ def _build_orchestration_prompt(
         - 子 agent の要求定義と判定規則の canonical source は `docs/`、`spec/`、当該試行 artifact に限定する。
         - child agent 起動前に `workflow-launch-check` を実行し、失敗時は停止する。
         - 進行は開始 phase から `{until_phase}` までとし、それ以降の phase には進まない。
-        - 一時ファイルが必要な場合は `/tmp` を直接指定せず、`$TMPDIR` 環境変数を展開した path を使用すること（例: `"${{TMPDIR}}/work.json"` または `$(mktemp)`）。`$TMPDIR` は `workspace/tmp/<orchestration_agent_run_id>/` に設定されており、hook ポリシーの許可範囲内に含まれる。`/tmp/` ハードコードは `output_manifest_write_guard` でブロックされる。
+        - 一時ファイルが必要な場合は `/tmp` や `/dev/shm` を指定せず、上記 `tmp area` セクションの literal path (`{allowed_tmp_root}/...`) を直接使用すること。`/tmp/` ハードコードは `output_manifest_write_guard` でブロックされる。
         - Claude Code 起動直後の `~/.claude/projects/.../memory/MEMORY.md` 自動 Read は `read_manifest_read_guard` でブロックされるが、これは想定動作であり workflow の継続に影響しない。再試行や `MEMORY.md` 配下への参照を試みてはならない。
         """
     ).strip() + "\n"

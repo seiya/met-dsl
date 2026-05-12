@@ -192,11 +192,11 @@ workflow 実行中に hook がブロックした場合、`reason` と `audit_det
 | policy | ブロックされた操作の例 | 取るべき次の 1 アクション |
 |---|---|---|
 | `read_manifest_read_guard` | 許可 root 外のファイルを `Read` した | `read_manifests/<agent_run_id>.json` の `allowed_read_roots` を確認し、必要なら `run-gate --gate orchestration_read` 経由で読む |
-| `output_manifest_write_guard` | `/tmp`・`/dev/shm`・manifest 外 path への書き込み | `set -e` の下で `export TMPDIR=$(jq -er '.allowed_tmp_root // empty' workspace/orchestrations/<oid>/output_manifests/<id>.json)` を実行して `$TMPDIR` を確定してから `${TMPDIR}/` 配下を使う |
-| `enforce_guarded_apply_patch` | `Edit`/`Write`/`apply_patch` で `.json`/`.txt` を書こうとした | `python3 tools/orchestration_runtime.py guarded-apply-patch --repo-root . --orchestration-id <oid> --actor-role <role> --agent-run-id <id> --paths-json '["<path>"]' --patch-file "${TMPDIR}/x.patch" --capability-token <token>` に切り替える。`spec.ir.yaml` などの `.yaml` は `Edit`/`Write` を直接使う（guarded-apply-patch は `.json`/`.txt` 専用） |
+| `output_manifest_write_guard` | `/tmp`・`/dev/shm`・manifest 外 path への書き込み | `output_manifests/<agent_run_id>.json` の `allowed_tmp_root` (= `workspace/tmp/<agent_run_id>/`) 配下を **literal path** で直接指定する (例: `cat > workspace/tmp/<agent_run_id>/x.patch <<EOF`)。`export TMPDIR=...` / `jq -er ...` / `printenv` の bootstrap Bash は Claude Code session sandbox の approval 要求で workflow が停止するため使用禁止 (`skills/workflow-orchestration/references/startup_contract.md` の tmp area 利用契約 参照)。hook は write 対象 path のみを判定し `$TMPDIR` env を参照しない |
+| `enforce_guarded_apply_patch` | `Edit`/`Write`/`apply_patch` で `.json`/`.txt` を書こうとした | `python3 tools/orchestration_runtime.py guarded-apply-patch --repo-root . --orchestration-id <oid> --actor-role <role> --agent-run-id <id> --paths-json '["<path>"]' --patch-file workspace/tmp/<agent_run_id>/x.patch --capability-token <token>` に切り替える（`<agent_run_id>` は literal 置換）。`spec.ir.yaml` などの `.yaml` は `Edit`/`Write` を直接使う（guarded-apply-patch は `.json`/`.txt` 専用） |
 | `forbid_python_inline_write` | `python3 -c` / `python3 - <<EOF` を実行した | **書き込み意図**: `.json`/`.txt` は `guarded-apply-patch`、その他は `Edit`/`Write` tool を使う。**UUID 生成意図**: `python3 tools/new_agent_run_id.py` を使う。**JSON 読み取り意図**: `Read` tool で直接読む |
 | `forbid_tools_direct_read` | `grep`・`cat`・`sed` で `tools/` 配下を読もうとした | `tools/` の実装は参照禁止。仕様は `docs/`・`spec/`・`skill_must_read_refs` を参照する |
-| `rule_source_violation` | 他 agent の capability・gate 結果・他 phase の SKILL.md を読んだ | gate 失敗内容は `2>"${TMPDIR}/last_gate_stderr.txt"` で stderr をキャプチャして取得する |
+| `rule_source_violation` | 他 agent の capability・gate 結果・他 phase の SKILL.md を読んだ | gate 失敗内容は `2>workspace/tmp/<agent_run_id>/last_gate_stderr.txt` で stderr をキャプチャして取得する（`<agent_run_id>` は literal 置換） |
 | `forbid_git_reset_hard` | `git reset --hard` を実行しようとした | `git restore <file>` または `git checkout <file>` で個別ファイルを戻す |
 | `capability_invalid_empty_write_roots` | `write_roots=[]` の capability で書き込もうとした | `record-launch` の `--request-json` に `allowed_output_paths` が正しく設定されているか確認する |
 
@@ -229,13 +229,14 @@ workflow 実行中に hook がブロックした場合、`reason` と `audit_det
 3. `record-timeout --agent-run-id <arid> --reason ...`: 終端 entry を記録。
 
 ```bash
-RETURN_TOKEN=$(cat workspace/orchestrations/<orchestration_id>/launches/<child_agent_run_id>.parent_return_token)
-
+# return-token は $(cat ...) をインライン引数として渡す。VAR=$(cat ...) の 2-step
+# shell var 形式は先頭 `VAR=` が `Bash(python3 ...)` allowlist 一致を壊し session
+# approval を要求するため使用しない。
 python3 tools/orchestration_runtime.py record-child-return \
   --repo-root . \
   --orchestration-id <orchestration_id> \
   --agent-run-id <child_agent_run_id> \
-  --return-token "$RETURN_TOKEN"
+  --return-token "$(cat workspace/orchestrations/<orchestration_id>/launches/<child_agent_run_id>.parent_return_token)"
 
 python3 tools/orchestration_runtime.py deactivate-child \
   --repo-root . \

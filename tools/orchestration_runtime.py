@@ -11685,7 +11685,8 @@ def main(argv: list[str] | None = None) -> int:
                             (
                                 f"--patch-file '{args.patch_file}' is outside the agent's "
                                 f"allowed tmp root '{_allowed_tmp}'. "
-                                f"Use $TMPDIR to construct the path."
+                                f"Use the literal allowed_tmp_root path (e.g. "
+                                f"'{_allowed_tmp}/<name>.patch'); do not 'export TMPDIR=...'."
                             ),
                             reason_code="patch_file_outside_tmp_root",
                         )

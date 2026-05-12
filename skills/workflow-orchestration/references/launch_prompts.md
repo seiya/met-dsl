@@ -25,10 +25,7 @@ repair_strategy: <repair_strategy>
 repair_target_agent_run_id: <repair_target_agent_run_id>
 repair_reason: <repair_reason>
 
-**Step 0（最初の Bash で必ず実行）** — 1 行コマンド:
-    export TMPDIR=$(jq -er '.allowed_tmp_root' "workspace/orchestrations/<orchestration_id>/output_manifests/<agent_run_id>.json")
-
-以降の `cat > ...`、`mkdir -p ...`、heredoc は **すべて** `$TMPDIR/` 配下で行う。canonical path（`workspace/pipelines/...`、`workspace/ir/...`、`lineage.json` 等）への直接書き込みは、`Edit`/`Write` tool で `allowed_file_tool_paths` に登録済みのものに限る。それ以外は `guarded-apply-patch` を必須とし、Bash heredoc で書くと `enforce_guarded_apply_patch` でブロックされる。
+**tmp area (literal path で参照)**: `allowed_tmp_root` は `workspace/tmp/<agent_run_id>/` 固定 (`output_manifests/<agent_run_id>.json` の同名フィールドに記録済み)。一時ファイルは当該 literal path 配下を `cat > workspace/tmp/<agent_run_id>/...` のように直接指定する。`output_manifest_write_guard` は path のみ判定し `$TMPDIR` env を参照しない。`export TMPDIR=...`、`jq -er ...`、`printenv`、`bash -c '...'` の bootstrap Bash を呼んではならない (Claude Code session sandbox の approval 要求で workflow が停止する根本原因)。canonical path（`workspace/pipelines/...`、`workspace/ir/...`、`lineage.json` 等）への直接書き込みは、`Edit`/`Write` tool で `allowed_file_tool_paths` に登録済みのものに限る。それ以外は `guarded-apply-patch` を必須とし、Bash heredoc で canonical path に書くと `enforce_guarded_apply_patch` でブロックされる。
 
 必須要件:
 - **自身の launch prompt 本文 (`launches/<agent_run_id>.prompt.txt`) を `Read` で読んではならない。** prompt は `Agent` tool の入力として既に渡されているため再読不要であり、当該 path は `read_manifest_read_guard` で fail-closed にブロックされる。`launches/<agent_run_id>.prompt.txt` は audit / replay 用途で `Agent` tool に渡された原文を 1 対 1 保存する canonical artifact である。
@@ -47,10 +44,10 @@ repair_reason: <repair_reason>
 - `.yaml` / `.yml` / `.md` および source code 等の上記以外の出力は、`output_manifests/<agent_run_id>.json` の `allowed_file_tool_paths` に列挙された path に限り、`Edit` / `Write` tool で直接書き込むこと。
 - `run-gate --gate apply_patch_writes` と `apply-patch-gate` の公開経路としての使用、shell redirection・`tee`・`sed -i`・任意コマンドによる file write、`allowed_output_paths` 外への書き込みは引き続き禁止する。
 - `guarded-apply-patch` と `Edit` / `Write` のいずれも `output_manifests/<agent_run_id>.json` を参照して manifest 外 path を reject する。manifest 外 path へ書いてはならない。
-- 一時ファイルが必要な場合は `/tmp`・`/dev/shm` を直接指定せず、`$TMPDIR` 環境変数を展開した path のみを使用すること（例: `"${TMPDIR}/work.json"` または `$(mktemp -p "${TMPDIR}")`）。**起動直後の最初の Bash ステップ**で `output_manifests/<agent_run_id>.json` の `allowed_tmp_root` を読み `export TMPDIR=<allowed_tmp_root>` を実行すること（詳細手順は本ファイル末尾「`$TMPDIR` の設定主体と起動手順」参照）。`$TMPDIR` 未設定のまま `/tmp/`・`/dev/shm/` をハードコードすると `output_manifest_write_guard` でブロックされる。
-- `gates/<agent_run_id>/` 配下の内部 gate ファイル（`apply_patch_writes.json` 等）は、自身の `agent_run_id` に対応するものであっても直接読んではならない。gate 実行結果の取得は **`run-gate` / `guarded-apply-patch` の stderr** を canonical 経路とし、`2>"${TMPDIR}/last_gate_stderr.txt"` で保存して参照すること（例: `python3 tools/orchestration_runtime.py run-gate --gate ... 2>"${TMPDIR}/last_gate_stderr.txt"`）。失敗時の `violations[]` は stderr に JSON 形式で出力される。要約は `agent.summary.txt` / `step_result.json` を参照すること。他 agent の内部 artifact（`capabilities/`・`output_manifests/`・`read_manifests/`・`access_logs/`・`agents/<other_agent_run_id>/`・`dialogs/` 配下で自身の `agent_run_id` に対応しないファイル）も同様に直接読んではならない。cross-agent read は `rule_source_violation` を発火し phase を fail させる。
+- 一時ファイルが必要な場合は `/tmp`・`/dev/shm` を直接指定せず、`allowed_tmp_root` の literal path (`workspace/tmp/<agent_run_id>/...`) を直接指定すること。拡張子により書込手段を切り替える: **(a)** `.py` / `.yaml` / `.sh` 等 (非 `.json` / `.txt`) は Bash heredoc 可 (例: `cat > workspace/tmp/<agent_run_id>/work.py <<'EOF'`)、**(b)** `.json` / `.txt` は `Write` tool を使う (Bash heredoc redirect は本ファイルの NG 例 (下記) 参照: hook の file_path parser が一部の quoted 形式で `'\"'` をパスと誤検知して block する場合がある)。`output_manifest_write_guard` は write 対象 path が `allowed_tmp_root` 配下かのみ判定し `$TMPDIR` env を参照しない（`tools/hooks/common.py:_validate_write_access`）。`export TMPDIR=...`、`jq -er ...`、`printenv`、`bash -c '...'` の bootstrap Bash は使用禁止（session sandbox approval 要求で workflow が停止する）。`/tmp/`・`/dev/shm/` のハードコードは引き続き `output_manifest_write_guard` でブロックされる。
+- `gates/<agent_run_id>/` 配下の内部 gate ファイル（`apply_patch_writes.json` 等）は、自身の `agent_run_id` に対応するものであっても直接読んではならない。gate 実行結果の取得は **`run-gate` / `guarded-apply-patch` の stderr** を canonical 経路とし、`2>workspace/tmp/<agent_run_id>/last_gate_stderr.txt` で保存して参照すること（例: `python3 tools/orchestration_runtime.py run-gate --gate ... 2>workspace/tmp/<agent_run_id>/last_gate_stderr.txt`）。`<agent_run_id>` 部分は自身の値を literal 置換すること（`${TMPDIR}` env 参照は contract 上禁止ではないが env 依存を減らすため literal を canonical とする）。失敗時の `violations[]` は stderr に JSON 形式で出力される。要約は `agent.summary.txt` / `step_result.json` を参照すること。他 agent の内部 artifact（`capabilities/`・`output_manifests/`・`read_manifests/`・`access_logs/`・`agents/<other_agent_run_id>/`・`dialogs/` 配下で自身の `agent_run_id` に対応しないファイル）も同様に直接読んではならない。cross-agent read は `rule_source_violation` を発火し phase を fail させる。
 - `python3 -c "..."` や `python3 - <<'EOF'` でファイルへの書き込み（`open(path, 'w'/'a'/'x')`・`Path.write_text`・`shutil.copy*` 等）を行ってはならない。`forbid_python_inline_write` でブロックされる。`.json`/`.txt` は `guarded-apply-patch`、その他は `Edit`/`Write` tool を使うこと。
-- JSON ファイルの内容確認は `Read` tool を使うこと。`python3 -c "import json; ..."` は `forbid_python_inline_write` でブロックされる。Python 処理がどうしても必要な場合のみ `${TMPDIR}/x.py` に script を書き `python3 ${TMPDIR}/x.py` で実行する。
+- JSON ファイルの内容確認は `Read` tool を使うこと。`python3 -c "import json; ..."` は `forbid_python_inline_write` でブロックされる。Python 処理がどうしても必要な場合のみ `workspace/tmp/<agent_run_id>/x.py` に script を書き `python3 workspace/tmp/<agent_run_id>/x.py` で実行する（`<agent_run_id>` は literal 置換）。
 - UUID 生成は `python3 tools/new_agent_run_id.py` を使うこと。`python3 -c 'import uuid; print(uuid.uuid4())'` は `-S` 等の flag を含めて全て `forbid_python_inline_write` でブロックされる。`cat /proc/sys/kernel/random/uuid` は session sandbox の approval 要求で都度停止するため使用しない。
 - 自身の launch prompt 本文は Agent tool 起動時の入力で渡されている。`launches/<agent_run_id>.prompt.txt` を `Read` で再読する必要はなく、`read_manifest_read_guard` でブロックされる。
 - `tools/`・`tests/`・validator script・hook 実装への `Read`/`grep`/`sed`/`cat` は `forbid_tools_direct_read` でブロックされる。要件と判定規則は `docs/`・`spec/`・`skill_must_read_refs` のみから解釈すること。`guarded-apply-patch` の内部動作（strip 判定等）は `docs/ORCHESTRATION.md` の「Patch 適用契約」と本ファイル末尾「`guarded-apply-patch` の strip について」を canonical 参照先とする。
@@ -90,10 +87,7 @@ repair_strategy: <repair_strategy>
 repair_target_agent_run_id: <repair_target_agent_run_id>
 repair_reason: <repair_reason>
 
-**Step 0（最初の Bash で必ず実行）** — 1 行コマンド:
-    export TMPDIR=$(jq -er '.allowed_tmp_root' "workspace/orchestrations/<orchestration_id>/output_manifests/<agent_run_id>.json")
-
-以降の `cat > ...`、`mkdir -p ...`、heredoc は **すべて** `$TMPDIR/` 配下で行う。canonical path（`workspace/pipelines/...`、`workspace/ir/...`、`lineage.json` 等）への直接書き込みは、`Edit`/`Write` tool で `allowed_file_tool_paths` に登録済みのものに限る。それ以外は `guarded-apply-patch` を必須とし、Bash heredoc で書くと `enforce_guarded_apply_patch` でブロックされる。
+**tmp area (literal path で参照)**: `allowed_tmp_root` は `workspace/tmp/<agent_run_id>/` 固定 (`output_manifests/<agent_run_id>.json` の同名フィールドに記録済み)。一時ファイルは当該 literal path 配下を `cat > workspace/tmp/<agent_run_id>/...` のように直接指定する。`output_manifest_write_guard` は path のみ判定し `$TMPDIR` env を参照しない。`export TMPDIR=...`、`jq -er ...`、`printenv`、`bash -c '...'` の bootstrap Bash を呼んではならない (Claude Code session sandbox の approval 要求で workflow が停止する根本原因)。canonical path（`workspace/pipelines/...`、`workspace/ir/...`、`lineage.json` 等）への直接書き込みは、`Edit`/`Write` tool で `allowed_file_tool_paths` に登録済みのものに限る。それ以外は `guarded-apply-patch` を必須とし、Bash heredoc で canonical path に書くと `enforce_guarded_apply_patch` でブロックされる。
 
 必須要件:
 - **自身の launch prompt 本文 (`launches/<agent_run_id>.prompt.txt`) を `Read` で読んではならない。** prompt は `Agent` tool の入力として既に渡されているため再読不要であり、当該 path は `read_manifest_read_guard` で fail-closed にブロックされる。`launches/<agent_run_id>.prompt.txt` は audit / replay 用途で `Agent` tool に渡された原文を 1 対 1 保存する canonical artifact である。
@@ -113,10 +107,10 @@ repair_reason: <repair_reason>
 - `.yaml` / `.yml` / `.md` および source code 等の上記以外の出力は、`output_manifests/<agent_run_id>.json` の `allowed_file_tool_paths` に列挙された path に限り、`Edit` / `Write` tool で直接書き込むこと。
 - `run-gate --gate apply_patch_writes` と `apply-patch-gate` の公開経路としての使用、shell redirection・`tee`・`sed -i`・任意コマンドによる file write、`allowed_output_paths` 外への書き込みは引き続き禁止する。
 - `guarded-apply-patch` と `Edit` / `Write` のいずれも `output_manifests/<agent_run_id>.json` を参照して manifest 外 path を reject する。manifest 外 path へ書いてはならない。
-- 一時ファイルが必要な場合は `/tmp`・`/dev/shm` を直接指定せず、`$TMPDIR` 環境変数を展開した path のみを使用すること（例: `"${TMPDIR}/work.json"` または `$(mktemp -p "${TMPDIR}")`）。**起動直後の最初の Bash ステップ**で `output_manifests/<agent_run_id>.json` の `allowed_tmp_root` を読み `export TMPDIR=<allowed_tmp_root>` を実行すること（詳細手順は本ファイル末尾「`$TMPDIR` の設定主体と起動手順」参照）。`$TMPDIR` 未設定のまま `/tmp/`・`/dev/shm/` をハードコードすると `output_manifest_write_guard` でブロックされる。
-- `gates/<agent_run_id>/` 配下の内部 gate ファイル（`apply_patch_writes.json` 等）は、自身の `agent_run_id` に対応するものであっても直接読んではならない。gate 実行結果の取得は **`run-gate` / `guarded-apply-patch` の stderr** を canonical 経路とし、`2>"${TMPDIR}/last_gate_stderr.txt"` で保存して参照すること（例: `python3 tools/orchestration_runtime.py run-gate --gate ... 2>"${TMPDIR}/last_gate_stderr.txt"`）。失敗時の `violations[]` は stderr に JSON 形式で出力される。要約は `agent.summary.txt` / `step_result.json` を参照すること。他 agent の内部 artifact（`capabilities/`・`output_manifests/`・`read_manifests/`・`access_logs/`・`agents/<other_agent_run_id>/`・`dialogs/` 配下で自身の `agent_run_id` に対応しないファイル）も同様に直接読んではならない。cross-agent read は `rule_source_violation` を発火し phase を fail させる。
+- 一時ファイルが必要な場合は `/tmp`・`/dev/shm` を直接指定せず、`allowed_tmp_root` の literal path (`workspace/tmp/<agent_run_id>/...`) を直接指定すること。拡張子により書込手段を切り替える: **(a)** `.py` / `.yaml` / `.sh` 等 (非 `.json` / `.txt`) は Bash heredoc 可 (例: `cat > workspace/tmp/<agent_run_id>/work.py <<'EOF'`)、**(b)** `.json` / `.txt` は `Write` tool を使う (Bash heredoc redirect は本ファイルの NG 例 (下記) 参照: hook の file_path parser が一部の quoted 形式で `'\"'` をパスと誤検知して block する場合がある)。`output_manifest_write_guard` は write 対象 path が `allowed_tmp_root` 配下かのみ判定し `$TMPDIR` env を参照しない（`tools/hooks/common.py:_validate_write_access`）。`export TMPDIR=...`、`jq -er ...`、`printenv`、`bash -c '...'` の bootstrap Bash は使用禁止（session sandbox approval 要求で workflow が停止する）。`/tmp/`・`/dev/shm/` のハードコードは引き続き `output_manifest_write_guard` でブロックされる。
+- `gates/<agent_run_id>/` 配下の内部 gate ファイル（`apply_patch_writes.json` 等）は、自身の `agent_run_id` に対応するものであっても直接読んではならない。gate 実行結果の取得は **`run-gate` / `guarded-apply-patch` の stderr** を canonical 経路とし、`2>workspace/tmp/<agent_run_id>/last_gate_stderr.txt` で保存して参照すること（例: `python3 tools/orchestration_runtime.py run-gate --gate ... 2>workspace/tmp/<agent_run_id>/last_gate_stderr.txt`）。`<agent_run_id>` 部分は自身の値を literal 置換すること（`${TMPDIR}` env 参照は contract 上禁止ではないが env 依存を減らすため literal を canonical とする）。失敗時の `violations[]` は stderr に JSON 形式で出力される。要約は `agent.summary.txt` / `step_result.json` を参照すること。他 agent の内部 artifact（`capabilities/`・`output_manifests/`・`read_manifests/`・`access_logs/`・`agents/<other_agent_run_id>/`・`dialogs/` 配下で自身の `agent_run_id` に対応しないファイル）も同様に直接読んではならない。cross-agent read は `rule_source_violation` を発火し phase を fail させる。
 - `python3 -c "..."` や `python3 - <<'EOF'` でファイルへの書き込み（`open(path, 'w'/'a'/'x')`・`Path.write_text`・`shutil.copy*` 等）を行ってはならない。`forbid_python_inline_write` でブロックされる。`.json`/`.txt` は `guarded-apply-patch`、その他は `Edit`/`Write` tool を使うこと。
-- JSON ファイルの内容確認は `Read` tool を使うこと。`python3 -c "import json; ..."` は `forbid_python_inline_write` でブロックされる。Python 処理がどうしても必要な場合のみ `${TMPDIR}/x.py` に script を書き `python3 ${TMPDIR}/x.py` で実行する。
+- JSON ファイルの内容確認は `Read` tool を使うこと。`python3 -c "import json; ..."` は `forbid_python_inline_write` でブロックされる。Python 処理がどうしても必要な場合のみ `workspace/tmp/<agent_run_id>/x.py` に script を書き `python3 workspace/tmp/<agent_run_id>/x.py` で実行する（`<agent_run_id>` は literal 置換）。
 - UUID 生成は `python3 tools/new_agent_run_id.py` を使うこと。`python3 -c 'import uuid; print(uuid.uuid4())'` は `-S` 等の flag を含めて全て `forbid_python_inline_write` でブロックされる。`cat /proc/sys/kernel/random/uuid` は session sandbox の approval 要求で都度停止するため使用しない。
 - 自身の launch prompt 本文は Agent tool 起動時の入力で渡されている。`launches/<agent_run_id>.prompt.txt` を `Read` で再読する必要はなく、`read_manifest_read_guard` でブロックされる。
 - `tools/`・`tests/`・validator script・hook 実装への `Read`/`grep`/`sed`/`cat` は `forbid_tools_direct_read` でブロックされる。要件と判定規則は `docs/`・`spec/`・`skill_must_read_refs` のみから解釈すること。`guarded-apply-patch` の内部動作（strip 判定等）は `docs/ORCHESTRATION.md` の「Patch 適用契約」と本ファイル末尾「`guarded-apply-patch` の strip について」を canonical 参照先とする。
@@ -181,64 +175,58 @@ repair_reason: <repair_reason>
 
 `guarded-apply-patch` は内部で `git apply` を使用するため、patch 形式はファイルの存在有無によって異なる。`os.path.exists()` とパッチ適用の間には race window があるため、パッチ失敗時に逆の形式で 1 回リトライする。同一出力パスへの並行書き込みは orchestration の設計上発生しないが、retry/repair で前回の空ファイルが残存する場合に備えて吸収する。
 
-```bash
-# --patch-file を使用することで:
-#   (a) patch text をファイル経由で渡し argv の ARG_MAX 制限を真に回避する
-#   (b) 存在確認と apply の race を retry で吸収する
-# patch ファイルの書き込み先は $TMPDIR（= workspace/tmp/<agent_run_id>/）で
-# output_manifest_write_guard の許可範囲に含まれる。
-python3 - <<'APPLY'
-import os, json, subprocess, pathlib
+**手順 (Bash + Write tool ベース、`python3 -c` / `python3 - <<EOF` は `forbid_python_inline_write` で block されるため不可):**
 
-target = "workspace/ir/<node_key_safe>/<ir_id>/spec.ir.yaml"
-orchestration_id = os.environ["METDSL_ORCHESTRATION_ID"]
-agent_run_id = "<agent_run_id>"
-capability_token = "<capability_token>"
-patch_file = pathlib.Path(os.environ["TMPDIR"]) / "guarded_patch_input.txt"
+1. **target file の状態確認**: `Read` tool で `workspace/ir/<node_key_safe>/<ir_id>/spec.ir.yaml` を読む (存在しない場合 `Read` がエラーを返すので、その場合は `/dev/null` create 形式の patch を組む)。既存ならその行数 (`len(old_lines)`) を controll する。
+2. **patch text を組み立てる**: 既存・新規・空ファイル の 3 形式があり、いずれも単純な文字列連結で構築できる。テンプレート (`<old_lines>` / `<new_lines>` は agent が literal 値で置換):
 
-new_data = {"spec_id": "<spec_id>", "key": "value"}
-new_content = json.dumps(new_data, indent=2, ensure_ascii=False) + "\n"
-new_lines = new_content.splitlines(keepends=True)
+   ```text
+   # update / replace 形式 (既存ファイル, len(old_lines)=N>0, len(new_lines)=M)
+   --- a/<target>
+   +++ b/<target>
+   @@ -1,N +1,M @@
+   -<old line 1>
+   -<old line 2>
+   ...
+   +<new line 1>
+   +<new line 2>
+   ...
 
-def build_patch(file_exists):
-    """file_exists=True → update/replace 形式, False → /dev/null create 形式"""
-    if file_exists:
-        with open(target) as f:
-            old_lines = f.readlines()
-        if old_lines:
-            hdr = f"--- a/{target}\n+++ b/{target}\n@@ -1,{len(old_lines)} +1,{len(new_lines)} @@\n"
-            bdy = "".join("-" + l for l in old_lines) + "".join("+" + l for l in new_lines)
-        else:
-            # 0 バイト既存ファイル: コンテンツなし → 全行追加 update ハンク
-            hdr = f"--- a/{target}\n+++ b/{target}\n@@ -0,0 +1,{len(new_lines)} @@\n"
-            bdy = "".join("+" + l for l in new_lines)
-    else:
-        # ファイル不在: /dev/null create hunk
-        hdr = f"--- /dev/null\n+++ b/{target}\n@@ -0,0 +1,{len(new_lines)} @@\n"
-        bdy = "".join("+" + l for l in new_lines)
-    return hdr + bdy
+   # 0 バイト既存ファイル (len(old_lines)=0)
+   --- a/<target>
+   +++ b/<target>
+   @@ -0,0 +1,M @@
+   +<new line 1>
+   ...
 
-def apply(patch_text):
-    patch_file.write_text(patch_text)
-    subprocess.run([
-        "python3", "tools/orchestration_runtime.py", "guarded-apply-patch",
-        "--repo-root", ".",
-        "--orchestration-id", orchestration_id,
-        "--actor-role", "substep",
-        "--agent-run-id", agent_run_id,
-        "--paths-json", json.dumps([target]),
-        "--patch-file", str(patch_file),
-        "--capability-token", capability_token,
-    ], check=True)
+   # ファイル不在: /dev/null create hunk
+   --- /dev/null
+   +++ b/<target>
+   @@ -0,0 +1,M @@
+   +<new line 1>
+   ...
+   ```
 
-# 存在確認→apply。失敗した場合は逆の形式で 1 回リトライして race を吸収する。
-first_exists = os.path.exists(target)
-try:
-    apply(build_patch(first_exists))
-except subprocess.CalledProcessError:
-    apply(build_patch(not first_exists))
-APPLY
-```
+3. **patch text を `workspace/tmp/<agent_run_id>/guarded_patch_input.txt` へ書き込む**: `Write` tool を使う (literal path は `allowed_tmp_root` 配下のため `output_manifest_write_guard` を通過する。`.json` / `.txt` への Bash heredoc redirect は本ファイルの NG 例 (下記参照) で禁止しているため、`Write` tool が canonical 経路)。
+4. **guarded-apply-patch を実行**:
+
+   ```bash
+   python3 tools/orchestration_runtime.py guarded-apply-patch \
+     --repo-root . \
+     --orchestration-id <orchestration_id> \
+     --actor-role <substep|step> \
+     --agent-run-id <agent_run_id> \
+     --paths-json '["workspace/ir/<node_key_safe>/<ir_id>/spec.ir.yaml"]' \
+     --patch-file workspace/tmp/<agent_run_id>/guarded_patch_input.txt \
+     --capability-token <capability_token>
+   ```
+
+5. **race window retry**: コマンドが失敗した場合、`os.path.exists()` と `git apply` の間の race を吸収するため、逆の patch 形式 (update ↔ create) を `Write` tool で再構築して再度 `guarded-apply-patch` を実行する。失敗判定は Bash の終了コード (`echo $?` または出力に含まれる error 文字列) で行う。retry は最大 1 回まで。同一出力パスへの並行書き込みは orchestration の設計上発生しないが、retry/repair で前回の空ファイルが残存する場合に備えて吸収する。
+
+**禁止される代替パターン:**
+- `python3 -c "..."` / `python3 - <<'EOF'` で patch を build して subprocess.run する形式 → `forbid_python_inline_write` で **無条件 block** (workflow mode の `tools/hooks/common.py:_validate_workflow_bash_policy` 内 regex `python3?\s+-\s*<<`)。
+- `VAR=$(...)` の shell var 割り当て + command substitution → `Bash(python3 ...)` allowlist 一致を壊し session approval 要求。
+- `tee` / `cat <<EOF >file` 等で patch を書き出す → `output_manifest_write_guard` または `enforce_guarded_apply_patch` で block。
 
 **禁止パターン（NG — hook がブロックする）:**
 
@@ -260,16 +248,18 @@ cat <<EOF > workspace/ir/.../spec.ir.yaml
 {"key": "value"}
 EOF
 
-# NG: $TMPDIR 配下であっても、.json/.txt 出力 path への heredoc redirect は禁止
-# hook は file_path を解釈できず '\"' をパスと誤検知してブロックする
-TMPFILE=$(mktemp "${TMPDIR}/work.json.XXXXXX")
-cat > "${TMPFILE}" << 'EOF'
+# NG: workspace/tmp/<agent_run_id>/ 配下であっても、.json/.txt 出力 path への
+# heredoc redirect は禁止 (hook は file_path を解釈できず '\"' をパスと誤検知してブロックする)。
+# 加えて TMPFILE=$(mktemp ...) のような shell var 割り当ては allowlist 一致を壊し
+# session approval を要求するため使用しない。
+cat > workspace/tmp/<agent_run_id>/work.json << 'EOF'
 {"key": "value"}
 EOF
-# → patch text を変数に組み立てて guarded-apply-patch --patch-file に渡すこと（line 124-180 参照）
+# → patch text を Write tool で workspace/tmp/<arid>/guarded_patch_input.txt に書き込んでから
+# guarded-apply-patch --patch-file に渡すこと (本ファイル「`.json` artifact 書き込み — `guarded-apply-patch` 使用手順」節 参照)
 ```
 
-**重要:** `.json` / `.txt` の出力は上記の `guarded-apply-patch` 手順（line 124-180）**以外の手段をすべて禁止する**。patch text を変数に組み立てること自体は許可されるが、最終書き込みは必ず `guarded-apply-patch --patch-file` 経由で行うこと。
+**重要:** `.json` / `.txt` の出力は本ファイル「`.json` artifact 書き込み — `guarded-apply-patch` 使用手順」節の `guarded-apply-patch` 手順**以外の手段をすべて禁止する**。patch text を `Write` tool で `workspace/tmp/<agent_run_id>/guarded_patch_input.txt` に書き込んだのち、`guarded-apply-patch --patch-file` 経由で適用すること。
 
 **重要:** `--paths-json` と `--patch-text` の `+++ b/` パスはいずれも `workspace/` で始まるプロジェクトルート相対パスとすること。`plans/...`（`workspace/` 接頭辞なし）や絶対パスは `output_manifest_write_guard` でブロックされる。
 
@@ -310,22 +300,32 @@ EOF
 
 ---
 
-#### `$TMPDIR` の設定主体と起動手順
+#### `allowed_tmp_root` の利用契約
 
-`record-launch` は `workspace/tmp/<agent_run_id>/` を作成するが、`$TMPDIR` 環境変数の `export` は **agent が自身で行う**責務である。
+`record-launch` は `workspace/tmp/<agent_run_id>/` を作成して `output_manifests/<agent_run_id>.json` の `allowed_tmp_root` フィールドに記録する。**agent はこの literal path を直接使う**ことで `output_manifest_write_guard` を通過する (write 対象 path のみを判定し `$TMPDIR` env は参照しない、`tools/hooks/common.py:_validate_write_access`)。
 
-**起動直後の最初の Bash ステップで必ず実行すること:**
+**禁止される bootstrap Bash:**
+
+- `export TMPDIR=$(jq -er ...)`、`export TMPDIR=...` — Claude Code session sandbox の approval 要求で workflow が停止する根本原因。
+- `jq -er ...` / `printenv` / `bash -c '...'` — 同上。
+- `python3 -c "import json; ..."` — `forbid_python_inline_write` (intent_detected=`json_read`) でブロックされる。
+
+**正しい一時ファイル書き込み:**
+
+- **`.json` / `.txt` ファイル**: `Write` tool で `workspace/tmp/<agent_run_id>/<name>.{json,txt}` を直接書き込む。Bash heredoc redirect は `cat > "path" <<EOF` の quoted 形式で hook の file_path parser が `'\"'` をパスと誤検知する既知のリスクがあるため避ける。
+- **`.py` / `.yaml` / `.sh` 等**: Bash heredoc で OK。
 
 ```bash
-# output_manifest から allowed_tmp_root を読み取り TMPDIR を確定する
-set -e
-_TMPROOT=$(jq -er '.allowed_tmp_root // empty' "workspace/orchestrations/<orchestration_id>/output_manifests/<agent_run_id>.json")
-export TMPDIR="${_TMPROOT}"
+# gate stderr 退避 (非 .json/.txt path への redirect は安全)
+python3 tools/orchestration_runtime.py run-gate --gate ... 2>workspace/tmp/<agent_run_id>/last_gate_stderr.txt
+
+# 一時 python script
+cat > workspace/tmp/<agent_run_id>/build_patch.py <<'EOF'
+# script body ...
+EOF
+python3 workspace/tmp/<agent_run_id>/build_patch.py
 ```
 
-- `python3 -c "import json; ..."` は `forbid_python_inline_write` (intent_detected=`json_read`) でブロックされるため使用しない。`jq` は workflow 環境の必須ツールとして利用可能（`docs/RUNBOOK.md` の required tools 参照）。
-- `-e` flag と `// empty` filter により、file 不在 / `allowed_tmp_root` field 欠損 / null 値の場合に `jq` が exit 1 を返し、`set -e` 下で fail-fast する。`TMPDIR=null` のような壊れた状態で後続を続行しないこと。
+`.json` / `.txt` patch file の書込は `Write` tool 経由を canonical とする (本ファイル「`.json` artifact 書き込み — `guarded-apply-patch` 使用手順」節 参照)。
 
-- `<orchestration_id>` と `<agent_run_id>` は launch prompt の対応フィールドで置換すること。
-- 以降のすべての一時ファイルは `${TMPDIR}/` 配下に置くこと。
-- `/tmp/`・`/dev/shm/`・`$(mktemp)` 無引数（`$TMPDIR` 未設定時は `/tmp` へフォールバック）は禁止。`$(mktemp -p "${TMPDIR}")` は OK。
+`<agent_run_id>` は launch prompt の対応フィールドで literal 置換すること。`$TMPDIR` env は `tools/run_workflow.py` が subprocess に inherit させているため `${TMPDIR}/...` 形式の参照も結果的に動作するが、env 依存を最小化するため literal path を canonical とする。`/tmp/`・`/dev/shm/`・`$(mktemp)` 無引数は引き続き `output_manifest_write_guard` でブロックされる。

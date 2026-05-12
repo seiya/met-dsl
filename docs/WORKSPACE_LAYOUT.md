@@ -102,7 +102,7 @@ workspace/
 │           └── <id>.json                          (sandbox / write 違反のスナップショット)
 │
 ├── tmp/
-│   └── <agent_run_id>/                            各 agent の allowed_tmp_root (Step 0 で TMPDIR=これ)
+│   └── <agent_run_id>/                            各 agent の allowed_tmp_root (literal path で直接参照)
 │       └── ...                                    (heredoc / mktemp / 中間 script の置き場)
 │       # 注意: orchestration_id 配下ではなく workspace/ 直下に置く。manifest が宣言する
 │       # allowed_tmp_root は "workspace/tmp/<agent_run_id>" であり、
@@ -170,7 +170,7 @@ workspace/
 | `child_returns/<arid>.txt` | `record-child-return` | runtime | runtime (`deactivate-child` が消費) | Adv-30 token 検証付き |
 | `agents/<arid>/dialogs/agent.result.json` | `record-agent-run` (pass 時) | runtime | runtime / validator / 親 orchestration agent | 子 agent の構造化結果 |
 | `agents/<arid>/dialogs/agent.summary.txt` | 同上 | runtime | 同上 | 単一行禁止、根拠を含むこと |
-| `gates/<arid>/<gate>.json` | gate 実行時 | runtime | **本人 Read 禁止** (内部 artifact)。stderr 経由で取得 | `2>"${TMPDIR}/last_gate_stderr.txt"` |
+| `gates/<arid>/<gate>.json` | gate 実行時 | runtime | **本人 Read 禁止** (内部 artifact)。stderr 経由で取得 | `2>workspace/tmp/<agent_run_id>/last_gate_stderr.txt` |
 
 ### phase artifact
 
@@ -194,4 +194,4 @@ workspace/
 
 各 agent の `allowed_tmp_root` は **`workspace/tmp/<agent_run_id>/`** (workspace 直下、orchestration_id 配下では無い)。runtime canonical source は `tools/orchestration_runtime.py` の `init_orchestration` (orchestration agent 用) と `record_launch` (子 agent 用) で、いずれも `workspace/tmp/<agent_run_id>` を `output_manifests/<agent_run_id>.json#allowed_tmp_root` に書き込む。
 
-Step 0 で `export TMPDIR=$(jq -er '.allowed_tmp_root' "workspace/orchestrations/<orch>/output_manifests/<agent_run_id>.json")` を実行する (`startup_contract.md` 参照)。manifest が宣言する path 以外 (`/tmp/`、`/dev/shm/`、`workspace/orchestrations/<orch>/tmp/...` 等) を tmp として使うと `output_manifest_write_guard` でブロックされる。
+agent は当該 literal path (`workspace/tmp/<agent_run_id>/...`) を直接指定する。`output_manifest_write_guard` は write 対象 path のみを判定し `$TMPDIR` env を参照しないため、`export TMPDIR=...` / `jq -er ...` 等の bootstrap Bash は不要 (`skills/workflow-orchestration/references/startup_contract.md` 参照)。これらの Bash は Claude Code session sandbox の approval 要求で workflow が停止する原因になるため使用禁止。manifest が宣言する path 以外 (`/tmp/`、`/dev/shm/`、`workspace/orchestrations/<orch>/tmp/...` 等) を tmp として使うと `output_manifest_write_guard` でブロックされる。

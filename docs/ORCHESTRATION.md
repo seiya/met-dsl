@@ -202,7 +202,7 @@
 44. `resume_enabled=false` の orchestration では `orchestration_checkpoint.json` を信頼して `step` をスキップしてはならない。
 45. `write-step-result` の `status` が terminal (`pass` / `fail` / `blocked` / `timeout` / `cancel`) の場合、`Compile` / `Generate` / `Build` / `Validate` の `step_result.json` に `validation_stage` を必須記録する。許容値は `Compile: compile|full`、`Generate: post_generate|full`、`Build: post_build|full`、`Validate: post_execute|pre_judge|full`（runtime canonical: `tools/orchestration_runtime.py` の `STEP_REQUIRED_VALIDATION_STAGES`）。step ごとの許容値以外、または欠落時は runtime が `ValueError` で reject する。
 46. `codex_feature_check.json` の `status_kind=probe_error` の結果は永続固定してはならない。`METDSL_HOOK_FEATURE_RETRY_TTL_SECONDS`（既定 30 秒）経過後に再プローブを許可する。
-47. `workspace/tmp/<agent_run_id>/` は各 agent の一時作業領域として使用できる。`record-agent-run` は当該 `agent_run` 記録後に `workspace/tmp/<agent_run_id>/` を自動削除する。`tools/run_workflow.py` は `init` 成功後に環境変数 `TMPDIR` を `workspace/tmp/<orchestration_agent_run_id>/` に設定する。
+47. `workspace/tmp/<agent_run_id>/` は各 agent の一時作業領域として使用できる。agent は当該 literal path を直接指定する（`output_manifest_write_guard` は write 対象 path のみを判定し `$TMPDIR` env を参照しない）。`record-agent-run` は当該 `agent_run` 記録後に `workspace/tmp/<agent_run_id>/` を自動削除する。`tools/run_workflow.py` は `init` 成功後に環境変数 `TMPDIR` を `workspace/tmp/<orchestration_agent_run_id>/` に設定するが、これは subprocess inherit 用の保険であり agent 側での `export TMPDIR=...` は不要かつ禁止（Claude Code session sandbox の approval 要求で workflow が停止する）。
 
 ## 判定基準
 - workflow ごとに `orchestration_id` が発行され、`orchestration_meta.json` が存在する。
@@ -238,7 +238,7 @@ python3 tools/orchestration_runtime.py guarded-apply-patch \
   --capability-token <capability_token>
 ```
 
-`--patch-text` による直接埋め込みも可能だが、ARG_MAX 制限を避けるため `--patch-file` 経由を推奨する。`--patch-file` の保存先は `$TMPDIR` 配下のみ許可。
+`--patch-text` による直接埋め込みも可能だが、ARG_MAX 制限を避けるため `--patch-file` 経由を推奨する。`--patch-file` の保存先は `allowed_tmp_root` (= `workspace/tmp/<agent_run_id>/`) 配下の literal path のみ許可（`$TMPDIR` env への参照は動作するが env 依存を最小化するため literal を canonical とする）。
 
 ### strip 自動判定
 
@@ -282,7 +282,7 @@ python3 tools/orchestration_runtime.py guarded-apply-patch \
 | `allowed_file_tool_paths` | array of strings | `Edit`/`Write` 直接書き込みの許可 path 集合 |
 | `allowed_tmp_root` | string | 一時ファイル許可ルート（`workspace/tmp/<agent_run_id>`） |
 
-**使用方法:** agent は起動直後に `allowed_tmp_root` を読み `export TMPDIR=<allowed_tmp_root>` を実行する。
+**使用方法:** agent は `allowed_tmp_root` の literal path (`workspace/tmp/<agent_run_id>/...`) を直接指定して書き込む。`output_manifest_write_guard` は write 対象 path のみを判定し `$TMPDIR` env を参照しないため、`export TMPDIR=...` / `jq -er ...` 等の bootstrap Bash は不要かつ禁止 (Claude Code session sandbox の approval 要求で workflow が停止する。詳細は `skills/workflow-orchestration/references/startup_contract.md` の tmp area 利用契約 参照)。
 
 ### `read_manifests/<agent_run_id>.json` 必須フィールド
 

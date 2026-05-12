@@ -53,8 +53,11 @@ WRITE_HINT = (
     "output_manifests/<agent_run_id>.json.allowed_output_paths. Other "
     "extensions (.yaml/.yml/.md/source code) are written via Edit/Write "
     "directly and must be listed under allowed_file_tool_paths. "
-    "Ensure $TMPDIR is exported from output_manifests.allowed_tmp_root before writing temp files. "
-    "See docs/RUNBOOK.md#hook-recovery for the full recovery cheatsheet."
+    "For temp files, write directly under the literal allowed_tmp_root path "
+    "(workspace/tmp/<agent_run_id>/...); do NOT use `export TMPDIR=...`, "
+    "`jq -er ...`, or any bootstrap Bash (Claude Code session sandbox approval "
+    "would stall the workflow). See skills/workflow-orchestration/references/startup_contract.md "
+    "for the tmp-area contract."
 )
 
 # Repo-relative paths that orchestration agent auto-reads at startup (Claude Code behavior).
@@ -82,11 +85,14 @@ MANIFEST_HINT = (
 
 
 def format_block_reason_with_hint(decision: "HookDecision") -> str:
-    """Append audit_detail.fix_hint (next_command + docs_ref) to a BLOCK reason.
+    """Append audit_detail.fix_hint to a BLOCK reason.
 
     Adapters log audit_detail for forensics, but agents only see the `reason`
     string in the rejection message. Surface the structured fix_hint inline so
     the agent can act on it without consulting the audit log.
+
+    Supported fix_hint fields: next_command (a runnable command), write_under
+    (a literal path prefix), docs_ref (doc anchor), note (free text).
     """
     base = decision.reason or "blocked by policy"
     audit = decision.audit_detail or {}
@@ -94,11 +100,14 @@ def format_block_reason_with_hint(decision: "HookDecision") -> str:
     if not isinstance(fix_hint, dict):
         return base
     next_command = fix_hint.get("next_command")
+    write_under = fix_hint.get("write_under")
     docs_ref = fix_hint.get("docs_ref")
     note = fix_hint.get("note")
     appended: list[str] = []
     if isinstance(next_command, str) and next_command.strip():
         appended.append(f"Fix: {next_command.strip()}")
+    if isinstance(write_under, str) and write_under.strip():
+        appended.append(f"Write under: {write_under.strip()}")
     if isinstance(docs_ref, str) and docs_ref.strip():
         appended.append(f"Docs: {docs_ref.strip()}")
     if isinstance(note, str) and note.strip():
@@ -510,7 +519,7 @@ def evaluate_common_policy(hook_input: HookInput) -> HookDecision:
                     "python3 tools/orchestration_runtime.py guarded-apply-patch "
                     "--repo-root . --orchestration-id <oid> --actor-role <role> "
                     "--agent-run-id <id> --paths-json '[\"<path>\"]' "
-                    "--patch-file ${TMPDIR}/x.patch --capability-token <token>"
+                    "--patch-file workspace/tmp/<agent_run_id>/x.patch --capability-token <token>"
                 )
                 if re.search(r"uuid\.uuid[1345]\s*\(", command):
                     # Cover uuid1/uuid3/uuid4/uuid5 — agents typically reach
@@ -523,8 +532,9 @@ def evaluate_common_policy(hook_input: HookInput) -> HookDecision:
                     intent = "json_read"
                     hint_next = (
                         "Use the Read tool for the JSON file directly; if Python is "
-                        "required, write a script to ${TMPDIR}/x.py and run "
-                        "`python3 ${TMPDIR}/x.py`."
+                        "required, write a script to workspace/tmp/<agent_run_id>/x.py "
+                        "and run `python3 workspace/tmp/<agent_run_id>/x.py` "
+                        "(literal path, no $TMPDIR env reference needed)."
                     )
                 return HookDecision(
                     action=HookDecisionAction.BLOCK,
@@ -565,9 +575,9 @@ def evaluate_common_policy(hook_input: HookInput) -> HookDecision:
                 action=HookDecisionAction.BLOCK,
                 reason=(
                     f"blocked: command touches {offending!r} which is forbidden. "
-                    "/dev/shm reads/writes are not permitted; use $TMPDIR "
-                    "(workspace/tmp/<agent_run_id>/) for temporary files. "
-                    "See docs/RUNBOOK.md#hook-recovery."
+                    "/dev/shm reads/writes are not permitted; write under the literal "
+                    "allowed_tmp_root path (workspace/tmp/<agent_run_id>/) for temporary files. "
+                    "See skills/workflow-orchestration/references/startup_contract.md."
                 ),
                 continue_processing=False,
                 audit_detail={
@@ -575,8 +585,8 @@ def evaluate_common_policy(hook_input: HookInput) -> HookDecision:
                     "command": command,
                     "destination": offending,
                     "fix_hint": {
-                        "next_command": "export TMPDIR from output_manifests/<id>.json allowed_tmp_root",
-                        "docs_ref": "docs/RUNBOOK.md#hook-recovery",
+                        "write_under": "workspace/tmp/<agent_run_id>/...",
+                        "docs_ref": "skills/workflow-orchestration/references/startup_contract.md",
                     },
                 },
             )
@@ -888,15 +898,15 @@ def check_cli_managed_path(repo_root: Path, file_path: str) -> "HookDecision | N
     return None
 
 
-def _detect_tmpdir_step0_skipped(bash_command: str | None) -> bool:
-    """Heuristic: did the agent skip Step 0 (TMPDIR export from allowed_tmp_root)?
+def _detect_tmpdir_fallback_or_hardcode(bash_command: str | None) -> bool:
+    """Heuristic: did the agent use TMPDIR fallback syntax or hardcoded /tmp paths?
 
     Triggers when the offending Bash command contains either:
-      - "${TMPDIR:-..." or "$TMPDIR:-..." parameter-default expansion (proves the
-        agent knew TMPDIR might be unset and wrote a fallback inline)
+      - "${TMPDIR:-..." or "$TMPDIR:-..." parameter-default expansion (the agent
+        wrote a fallback inline instead of using the literal allowed_tmp_root path)
       - hardcoded "/tmp/" or "/dev/shm/" path inside a redirect/heredoc target
-    Both indicate Step 0 (`export TMPDIR=$(jq -er '.allowed_tmp_root' ...)`) was not
-    executed before the offending write.
+    Both indicate the agent should switch to the literal `workspace/tmp/<agent_run_id>/`
+    path declared in the manifest's `allowed_tmp_root`.
     """
     if not bash_command:
         return False
@@ -1025,35 +1035,31 @@ def validate_write_access(
             elif ext == "" and os.path.basename(rel_target_norm).lower() in _ALLOWED_EXTENSIONLESS_BYPRODUCT_NAMES:
                 path_is_allowed = True
     if not path_is_allowed:
-        _tmpdir_hint = f"export TMPDIR from output_manifests/{agent_run_id}.json allowed_tmp_root first"
-        step0_skipped = _detect_tmpdir_step0_skipped(bash_command)
+        allowed_tmp_root_value = manifest.get("allowed_tmp_root", "")
+        tmp_root_str = (
+            allowed_tmp_root_value.strip()
+            if isinstance(allowed_tmp_root_value, str) and allowed_tmp_root_value.strip()
+            else f"workspace/tmp/{agent_run_id}"
+        )
+        used_fallback_or_hardcode = _detect_tmpdir_fallback_or_hardcode(bash_command)
         fix_hint_block: dict[str, Any] = {
-            # NOTE: must NOT suggest `python3 -c "import json; ..."` —
-            # that form is itself blocked by forbid_python_inline_write
-            # and would put the agent in a recovery loop. `jq -er` with
-            # `// empty` causes fail-fast (exit 1) on missing key/file.
-            "next_command": (
-                f"export TMPDIR=$(jq -er '.allowed_tmp_root // empty' "
-                f"\"workspace/orchestrations/{orchestration_id}"
-                f"/output_manifests/{agent_run_id}.json\")"
+            # Recommend the literal allowed_tmp_root path. Do NOT recommend `export TMPDIR=...`
+            # or `jq -er ...` — those Bash patterns trigger Claude Code session sandbox approval
+            # prompts that can stall the workflow indefinitely. The hook only checks whether the
+            # write target sits under allowed_tmp_root and ignores $TMPDIR env, so a literal
+            # path works without any shell variable setup.
+            "write_under": f"{tmp_root_str}/...",
+            "docs_ref": "skills/workflow-orchestration/references/startup_contract.md",
+            "note": (
+                "Write under the literal allowed_tmp_root path "
+                f"({tmp_root_str}/...). Do not use `export TMPDIR=...`, `jq -er ...`, "
+                "`${TMPDIR:-fallback}` syntax, or hardcoded /tmp//dev/shm paths."
             ),
-            "docs_ref": "docs/RUNBOOK.md#hook-recovery",
-            "note": _tmpdir_hint,
         }
-        if step0_skipped:
-            # Strong signal: agent wrote `${TMPDIR:-fallback}` or hardcoded /tmp/
-            # → Step 0 (TMPDIR export from allowed_tmp_root) was clearly not run.
-            # Prepend a Step 0 reminder so the fix_hint reads as a recovery cheat-sheet
-            # specific to this failure mode rather than a generic write hint.
-            fix_hint_block["step0_skipped"] = True
-            fix_hint_block["note"] = (
-                "Step 0 (TMPDIR setup from allowed_tmp_root) was not executed before this "
-                "write. Run the next_command BELOW first, then re-issue the original write "
-                "under \"$TMPDIR/...\" (no ${TMPDIR:-fallback} syntax, no hardcoded /tmp/). "
-                "See skills/workflow-orchestration/references/startup_contract.md Step 0."
-            )
+        if used_fallback_or_hardcode:
+            fix_hint_block["tmpdir_fallback_or_hardcode"] = True
             fix_hint_block["canonical_doc"] = (
-                "skills/workflow-orchestration/references/startup_contract.md#step-0--tmpdir-セットアップ必須先頭ステップ"
+                "skills/workflow-orchestration/references/startup_contract.md#tmp-area-の使い方必須前提"
             )
         return HookDecision(
             action=HookDecisionAction.BLOCK,
@@ -1081,12 +1087,14 @@ def validate_write_access(
         # manifest_file_tool_paths.
         # L2: include a Bash-specific recovery note on top of the concrete
         # guarded-apply-patch template so operators redirecting via heredoc
-        # see both options ("write to $TMPDIR first" vs "go through
+        # see both options ("stage under allowed_tmp_root first" vs "go through
         # guarded-apply-patch") rather than only the patch path.
         bash_note = (
-            "Bash redirects must target $TMPDIR (allowed_tmp_root). For "
-            "canonical paths, stage the content under $TMPDIR/x.patch and "
-            "apply via guarded-apply-patch — see fix_hint.next_command."
+            f"Bash redirects must target the literal allowed_tmp_root "
+            f"(workspace/tmp/{agent_run_id}/...). For canonical paths, stage the "
+            f"content under workspace/tmp/{agent_run_id}/x.patch and apply via "
+            f"guarded-apply-patch — see fix_hint.next_command. Do NOT use "
+            f"`export TMPDIR=...` or $TMPDIR env (session approval would stall)."
             if tool_name == "Bash" else None
         )
         fix_hint: dict[str, Any] = {
@@ -1094,10 +1102,11 @@ def validate_write_access(
                 f"python3 tools/orchestration_runtime.py guarded-apply-patch "
                 f"--repo-root . --orchestration-id {orchestration_id} "
                 f"--actor-role <role> --agent-run-id {agent_run_id} "
-                f"--paths-json '[\"{file_path}\"]' --patch-file ${{TMPDIR}}/x.patch "
+                f"--paths-json '[\"{file_path}\"]' "
+                f"--patch-file workspace/tmp/{agent_run_id}/x.patch "
                 f"--capability-token <token>"
             ),
-            "docs_ref": "docs/RUNBOOK.md#hook-recovery",
+            "docs_ref": "skills/workflow-orchestration/references/startup_contract.md",
         }
         if bash_note:
             fix_hint["note"] = bash_note

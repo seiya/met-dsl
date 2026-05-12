@@ -458,9 +458,9 @@ class HookCommonTests(unittest.TestCase):
             audit_detail={
                 "policy": "output_manifest_write_guard",
                 "fix_hint": {
-                    "next_command": "export TMPDIR=$(jq ...)",
+                    "next_command": "python3 tools/orchestration_runtime.py ...",
                     "docs_ref": "docs/RUNBOOK.md#hook-recovery",
-                    "note": "set TMPDIR first",
+                    "note": "use the canonical CLI",
                 },
             },
         )
@@ -469,9 +469,37 @@ class HookCommonTests(unittest.TestCase):
         body = json.loads(stdout_text)
         reason = body.get("reason", "")
         self.assertIn("unauthorized write: foo", reason)
-        self.assertIn("Fix: export TMPDIR=$(jq ...)", reason)
+        self.assertIn("Fix: python3 tools/orchestration_runtime.py ...", reason)
         self.assertIn("Docs: docs/RUNBOOK.md#hook-recovery", reason)
-        self.assertIn("Note: set TMPDIR first", reason)
+        self.assertIn("Note: use the canonical CLI", reason)
+
+    def test_claude_adapter_encode_decision_block_surfaces_write_under_hint(self) -> None:
+        """Regression: the new `write_under` fix_hint field (introduced when Step 0
+        was eliminated) must render as a `Write under: ...` line in the surfaced
+        block reason. Without this, agents see no recovery hint for path-based
+        guidance and can fall back to approval-blocking bootstrap Bash forms.
+        """
+        adapter = ClaudeHookAdapter()
+        decision = HookDecision(
+            action=HookDecisionAction.BLOCK,
+            reason="unauthorized write: foo",
+            audit_detail={
+                "policy": "output_manifest_write_guard",
+                "fix_hint": {
+                    "write_under": "workspace/tmp/run123/...",
+                    "docs_ref": "skills/workflow-orchestration/references/startup_contract.md",
+                    "note": "use literal allowed_tmp_root path",
+                },
+            },
+        )
+        code, stdout_text = adapter.encode_decision(decision)
+        self.assertEqual(code, 2)
+        body = json.loads(stdout_text)
+        reason = body.get("reason", "")
+        self.assertIn("unauthorized write: foo", reason)
+        self.assertIn("Write under: workspace/tmp/run123/...", reason)
+        self.assertIn("Docs: skills/workflow-orchestration/references/startup_contract.md", reason)
+        self.assertIn("Note: use literal allowed_tmp_root path", reason)
 
     def test_codex_adapter_encode_decision_block_surfaces_fix_hint(self) -> None:
         adapter = CodexHookAdapter()
@@ -1704,15 +1732,20 @@ class FixHintInAuditDetailTests(unittest.TestCase):
         audit = decision.audit_detail or {}
         self.assertIn("fix_hint", audit)
         fix_hint = audit["fix_hint"]
-        self.assertIn("next_command", fix_hint)
+        # Literal-path write hint replaces the legacy `next_command: export TMPDIR=...` form
+        # so the recovery instruction never recommends a Bash command that would itself
+        # trigger Claude Code session sandbox approval.
+        self.assertIn("write_under", fix_hint)
+        self.assertIn("workspace/tmp/", fix_hint["write_under"])
         self.assertIn("docs_ref", fix_hint)
-        self.assertIn("docs/RUNBOOK.md#hook-recovery", fix_hint["docs_ref"])
+        self.assertIn("startup_contract.md", fix_hint["docs_ref"])
 
-    def test_fix_hint_step0_skipped_emphasized_when_tmpdir_fallback_in_bash(self) -> None:
+    def test_fix_hint_flags_tmpdir_fallback_or_hardcode_in_bash(self) -> None:
         """Regression: when the offending Bash command contains `${TMPDIR:-fallback}`
-        or hardcodes /tmp/, the fix_hint should mark step0_skipped=True and surface
-        the canonical_doc anchor for startup_contract.md Step 0. Validates the
-        bash_command-aware path in validate_write_access."""
+        or hardcodes /tmp/, the fix_hint should mark tmpdir_fallback_or_hardcode=True
+        and surface the canonical_doc anchor for startup_contract.md tmp-area section.
+        The recovery hint must instruct the agent to use the literal allowed_tmp_root
+        path, never `export TMPDIR=...` (which would itself need session approval)."""
         from tools.hooks.common import validate_write_access
         import tempfile
         from pathlib import Path
@@ -1736,14 +1769,18 @@ class FixHintInAuditDetailTests(unittest.TestCase):
         audit = decision.audit_detail or {}
         self.assertEqual(audit.get("policy"), "output_manifest_write_guard")
         fix_hint = audit.get("fix_hint") or {}
-        self.assertTrue(fix_hint.get("step0_skipped"))
+        self.assertTrue(fix_hint.get("tmpdir_fallback_or_hardcode"))
         self.assertIn("startup_contract.md", fix_hint.get("canonical_doc", ""))
-        self.assertIn("Step 0", fix_hint.get("note", ""))
+        self.assertIn("workspace/tmp/", fix_hint.get("write_under", ""))
+        # Recovery hint must not recommend an approval-blocking Bash form.
+        note = fix_hint.get("note", "")
+        self.assertNotIn("export TMPDIR=", note.replace("`export TMPDIR=...`", ""))
+        self.assertNotIn("jq -er", note.replace("`jq -er ...`", ""))
 
-    def test_fix_hint_step0_skipped_absent_when_tmpdir_already_set(self) -> None:
+    def test_fix_hint_absent_when_no_tmpdir_fallback_or_hardcode(self) -> None:
         """Negative regression: when no TMPDIR-fallback / hardcoded /tmp/ pattern
-        is present, the fix_hint must NOT mark step0_skipped (otherwise the hint
-        would mis-attribute writes that fail for unrelated reasons)."""
+        is present, the fix_hint must NOT mark tmpdir_fallback_or_hardcode (otherwise
+        the hint would mis-attribute writes that fail for unrelated reasons)."""
         from tools.hooks.common import validate_write_access
         import tempfile
         from pathlib import Path
@@ -1766,7 +1803,7 @@ class FixHintInAuditDetailTests(unittest.TestCase):
         self.assertEqual(decision.action, HookDecisionAction.BLOCK)
         audit = decision.audit_detail or {}
         fix_hint = audit.get("fix_hint") or {}
-        self.assertFalse(fix_hint.get("step0_skipped"))
+        self.assertFalse(fix_hint.get("tmpdir_fallback_or_hardcode"))
         self.assertNotIn("canonical_doc", fix_hint)
 
     def test_bash_redirect_to_exact_pinned_path_requires_gate_provenance(self) -> None:
@@ -1823,12 +1860,15 @@ class FixHintInAuditDetailTests(unittest.TestCase):
             )
         self.assertEqual(decision.action, HookDecisionAction.ALLOW)
 
-    def test_output_manifest_write_guard_fix_hint_is_hook_safe(self) -> None:
-        """Adversarial review Adv-1: the surfaced fix_hint.next_command must
-        itself pass forbid_python_inline_write so the agent does not get
-        looped into a second BLOCK on recovery. Use jq, not `python3 -c`.
+    def test_output_manifest_write_guard_fix_hint_is_literal_path(self) -> None:
+        """The recovery hint surfaced for an unauthorized write must be a literal
+        allowed_tmp_root path, not a shell command. Step 0 was eliminated precisely
+        because `export TMPDIR=$(jq -er ...)` triggers Claude Code session sandbox
+        approval prompts that stall the workflow indefinitely. The hook only checks
+        whether the write target sits under allowed_tmp_root and ignores $TMPDIR env,
+        so a literal path works without any shell variable setup.
         """
-        from tools.hooks.common import validate_write_access, evaluate_common_policy
+        from tools.hooks.common import validate_write_access
         import tempfile
         from pathlib import Path
         with tempfile.TemporaryDirectory() as tmp:
@@ -1838,6 +1878,7 @@ class FixHintInAuditDetailTests(unittest.TestCase):
                 orchestration_id="orchHS",
                 agent_run_id="runHS",
                 allowed_output_paths=["workspace/outputs/"],
+                allowed_tmp_root="workspace/tmp/runHS",
             )
             decision = validate_write_access(
                 repo_root,
@@ -1847,28 +1888,17 @@ class FixHintInAuditDetailTests(unittest.TestCase):
                 tool_name="Write",
             )
         self.assertEqual(decision.action, HookDecisionAction.BLOCK)
-        next_cmd = ((decision.audit_detail or {}).get("fix_hint") or {}).get("next_command", "")
-        self.assertTrue(next_cmd, "fix_hint.next_command must be present")
-        # The recovery command itself must not be blocked by forbid_python_inline_write.
-        self.assertNotIn("python3 -c", next_cmd,
-                         "next_command must avoid `python3 -c` (blocked by forbid_python_inline_write)")
-        self.assertNotIn("python3 -", next_cmd,
-                         "next_command must avoid `python3 - <<EOF` (blocked by forbid_python_inline_write)")
-        self.assertIn("jq", next_cmd, "next_command should use jq for manifest reads")
-        # Sanity: the recovery command should pass evaluate_common_policy in workflow mode.
-        with patch.dict(os.environ, {"METDSL_WORKFLOW_MODE": "1"}, clear=False):
-            recovery_decision = evaluate_common_policy(
-                HookInput(
-                    event_name=HookEventName.PRE_COMMAND_EXECUTE,
-                    backend="claude",
-                    payload={"command": next_cmd},
-                    command=next_cmd,
-                )
-            )
-        self.assertNotEqual(
-            recovery_decision.action, HookDecisionAction.BLOCK,
-            f"recovery command itself was blocked by hook policy: {recovery_decision.reason}"
-        )
+        fix_hint = (decision.audit_detail or {}).get("fix_hint") or {}
+        write_under = fix_hint.get("write_under", "")
+        self.assertTrue(write_under, "fix_hint.write_under must be present")
+        self.assertIn("workspace/tmp/runHS", write_under)
+        # The recovery hint must not be a runnable shell command — it must be a path.
+        self.assertNotIn("export TMPDIR=", write_under)
+        self.assertNotIn("jq -er", write_under)
+        self.assertNotIn("python3 -", write_under)
+        # next_command is intentionally absent: any Bash form recommended here would
+        # itself need to clear session-sandbox approval, defeating the purpose.
+        self.assertNotIn("next_command", fix_hint)
 
     def test_bash_redirect_to_tmpdir_is_allowed(self) -> None:
         """Bash redirect into allowed_tmp_root remains permitted (TMPDIR is the
@@ -1913,6 +1943,26 @@ class DevShmWriteBlockTests(unittest.TestCase):
         decision = self._call("cp workspace/outputs/result.json /dev/shm/result.json")
         self.assertEqual(decision.action, HookDecisionAction.BLOCK)
         self.assertEqual((decision.audit_detail or {}).get("policy"), "output_manifest_write_guard")
+
+    def test_dev_shm_block_fix_hint_uses_literal_path(self) -> None:
+        """Regression: the /dev/shm fix_hint must recommend a literal allowed_tmp_root
+        path (write_under) and NOT a shell command. Step 0 was eliminated precisely
+        because `export TMPDIR=...` triggers Claude Code session sandbox approval.
+        The /dev/shm branch in evaluate_common_policy does not know the actual
+        agent_run_id, so the placeholder string is acceptable here.
+        """
+        decision = self._call("cp workspace/outputs/result.json /dev/shm/result.json")
+        self.assertEqual(decision.action, HookDecisionAction.BLOCK)
+        fix_hint = (decision.audit_detail or {}).get("fix_hint") or {}
+        write_under = fix_hint.get("write_under", "")
+        self.assertTrue(write_under, "fix_hint.write_under must be present")
+        self.assertIn("workspace/tmp/", write_under)
+        self.assertNotIn("export TMPDIR=", write_under)
+        self.assertNotIn("jq -er", write_under)
+        # Recovery hint must not be a runnable shell command.
+        self.assertNotIn("next_command", fix_hint)
+        docs_ref = fix_hint.get("docs_ref", "")
+        self.assertIn("startup_contract.md", docs_ref)
 
     def test_blocks_mv_to_dev_shm(self) -> None:
         decision = self._call("mv /tmp/result.json /dev/shm/result.json")
