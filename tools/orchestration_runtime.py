@@ -30,6 +30,34 @@ try:
 except ImportError:  # pragma: no cover — non-POSIX
     _fcntl = None  # type: ignore[assignment]
 
+# Codex round 25 F1 → round 27 F1: PyYAML is required by the dependency-
+# readiness paths (`_read_deps_yaml`, `_load_spec_catalog_from_bytes`) but
+# NOT by recovery commands (`set-status`, `record-timeout`,
+# `workflow-launch-check` for leaf nodes, etc.). Module-level import would
+# brick every CLI command when the package is missing — that expanded the
+# blast radius from a localized feature failure to a full control-plane
+# outage. Use a lazy resolver instead so:
+#   - paths that parse YAML get an actionable RuntimeError when the package
+#     is missing (distinct from missing repo data, with install hint),
+#   - all other commands (status updates, audit reads, cleanup) remain
+#     usable without PyYAML installed.
+
+
+def _require_yaml() -> Any:
+    """Lazy PyYAML resolver. Raises a distinct RuntimeError when PyYAML is
+    not installed so the diagnostic is "install PyYAML" rather than
+    "deps.yaml missing/unparseable" (Codex round 25 F1 + round 27 F1)."""
+    try:
+        import yaml as _yaml_mod
+    except ImportError as exc:  # pragma: no cover — install gap
+        raise RuntimeError(
+            "tools.orchestration_runtime: PyYAML is required for parsing "
+            "deps.yaml / spec_catalog.yaml. Install with `pip install PyYAML`. "
+            "Recovery commands (set-status, record-timeout, etc.) that do "
+            "not parse YAML remain usable without it."
+        ) from exc
+    return _yaml_mod
+
 try:
     from tools.hooks.common import (
         _normalize_rel_posix,
@@ -62,6 +90,1282 @@ except ModuleNotFoundError:  # pragma: no cover - import bootstrap for direct CL
     )
 
 TERMINAL_STATUSES = {"pass", "fail", "blocked", "timeout", "cancel"}
+# `set-status` の冪等化対象。一度この集合に入った status は、許可された昇格 (fail -> fail_closed) を除き
+# 同一値・他 terminal への遷移ともに reject する。failure narrative の追記は failure_analysis.json で行う。
+# 同一値再呼び出しは cleanup_committed marker が無い場合に限り cleanup retry を許可する (F2)。
+IDEMPOTENT_TERMINAL_STATUSES = TERMINAL_STATUSES | {"fail_closed"}
+
+
+_DEPENDENCY_READINESS_STAGES: tuple[str, ...] = (
+    "ir_ref",
+    "pipeline_ref",
+    "aggregate_verdict",
+)
+
+
+def _read_deps_yaml(repo_root: Path, spec_ref: Any) -> dict[str, Any] | None:
+    if not isinstance(spec_ref, str) or not spec_ref.strip():
+        return None
+    deps_path = (repo_root / spec_ref.strip() / "deps.yaml").resolve()
+    try:
+        deps_path.relative_to(repo_root.resolve())
+    except ValueError:
+        return None
+    if not deps_path.is_file():
+        return None
+    # Codex round 27 F1: resolve PyYAML BEFORE the try-block so its
+    # install-required `RuntimeError` propagates to the caller. Catching it
+    # here would silently turn "package missing" into "deps.yaml unparseable"
+    # and let dependency_readiness fall through to its "no deps" branch.
+    yaml_mod = _require_yaml()
+    try:
+        return yaml_mod.safe_load(deps_path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+
+def _deps_yaml_bytes_are_canonical_empty(deps_bytes: bytes) -> bool:
+    """Codex round 34 F1: a CONSERVATIVE byte-level recognizer for the
+    canonical empty-deps form of `deps.yaml`. Returns True only when the
+    file content unambiguously declares both `components: []` and
+    `profiles: []` under a single `dependencies:` key — any deviation
+    (extra keys, populated lists, exotic YAML syntax) returns False so
+    the caller falls back to full YAML parsing.
+
+    This lets `_compute_initial_dependency_readiness` recognize a true
+    leaf without invoking PyYAML, so a brand-new no-deps orchestration
+    remains launchable during a controller packaging issue. The recognizer
+    is intentionally strict: false negatives are safe (caller parses with
+    PyYAML if available, else fails closed); false positives would be a
+    fail-open (orchestration treated as leaf when it actually has deps).
+    """
+    text = deps_bytes.decode("utf-8", errors="ignore")
+    significant: list[str] = []
+    for raw_line in text.splitlines():
+        # Strip trailing whitespace and inline comments.
+        line = raw_line.split("#", 1)[0].rstrip()
+        if line.strip() == "":
+            continue
+        significant.append(line)
+    # Only accept the two key orderings, with optional trailing newline.
+    canonical_forms = [
+        ["dependencies:", "  components: []", "  profiles: []"],
+        ["dependencies:", "  profiles: []", "  components: []"],
+    ]
+    return significant in canonical_forms
+
+
+class SpecCatalogCorruption(Exception):
+    """Codex round 33 F2: distinct failure mode for `spec_catalog.yaml`
+    parse / top-level schema corruption. Distinguishes a repository-wide
+    catalog outage from an ordinary "no matching dep" verification result
+    so observability tooling and the CLI exit can fail loud instead of
+    silently flipping every readiness flag to False."""
+
+
+@lru_cache(maxsize=16)
+def _load_spec_catalog_from_bytes(
+    content_bytes: bytes,
+) -> dict[tuple[str, str], tuple[str, ...]]:
+    """Parse `spec_catalog.yaml` bytes into `(spec_kind, spec_id) → versions`.
+
+    Codex round 26 F1: cache keyed on FILE CONTENT bytes (not mtime).
+    Restore/copy workflows that preserve mtime while changing content
+    previously left the cache returning the OLD parsed dict even though
+    `_dependency_set_fingerprint` always reads current bytes — letting
+    readiness be persisted from stale catalog with a fingerprint derived
+    from the new bytes. Keying on content makes cache hits semantic:
+    same bytes → same parsed dict, no drift possible.
+    """
+    # Codex round 35 F2: zero-byte catalog is corruption, not "no specs
+    # yet". The previous lenient early-return collapsed a truncated or
+    # partially restored `spec_catalog.yaml` into an ordinary readiness=
+    # false dep miss instead of surfacing the repo-wide outage. The
+    # missing-file case was already promoted to `SpecCatalogCorruption`
+    # by `_load_spec_catalog` (round 34 F2); empty file content reaches
+    # this layer only when the file exists but holds zero bytes, which
+    # is just as broken.
+    if not content_bytes:
+        raise SpecCatalogCorruption(
+            "spec_catalog.yaml is empty (zero-byte file). Dependency "
+            "resolution requires the canonical registry; this is a "
+            "repository-wide outage, not a normal dependency miss."
+        )
+    # Codex round 27 F1: resolve PyYAML BEFORE the try-block so a missing
+    # package raises `RuntimeError` to the caller instead of being swallowed
+    # as "catalog unparseable → empty dict" (which would make every
+    # `_matching_dep_versions` call return [] and fail readiness silently).
+    yaml_mod = _require_yaml()
+    # Codex round 33 F2: catalog parse/schema problems propagate as a
+    # distinct `SpecCatalogCorruption` exception rather than being
+    # downgraded to `{}` (which made downstream resolution treat
+    # repository-wide catalog corruption as "no matching dep" — a normal
+    # negative verification — and let `mark_dependency_readiness` complete
+    # with all readiness flags false, hiding an outage as an ordinary
+    # dependency miss). Distinct failure mode matches the treatment of
+    # malformed deps.yaml (`deps_yaml_malformed_schema`).
+    try:
+        doc = yaml_mod.safe_load(content_bytes.decode("utf-8"))
+    except Exception as exc:
+        raise SpecCatalogCorruption(
+            f"spec_catalog.yaml could not be parsed as YAML: {exc}"
+        ) from exc
+    if not isinstance(doc, dict):
+        raise SpecCatalogCorruption(
+            f"spec_catalog.yaml top-level must be a mapping; got {type(doc).__name__}"
+        )
+    specs = doc.get("specs")
+    if not isinstance(specs, list):
+        raise SpecCatalogCorruption(
+            "spec_catalog.yaml is missing the canonical `specs:` list "
+            f"(found {type(specs).__name__})"
+        )
+    grouped: dict[tuple[str, str], list[str]] = {}
+    for entry in specs:
+        if not isinstance(entry, dict):
+            continue
+        kind = entry.get("spec_kind")
+        sid = entry.get("spec_id")
+        ver = entry.get("spec_version")
+        if not (isinstance(kind, str) and isinstance(sid, str) and isinstance(ver, str)):
+            continue
+        kind_token = kind.strip()
+        sid_token = sid.strip()
+        ver_token = ver.strip()
+        # Codex round 15 F2: reject catalog entries with path-unsafe tokens.
+        if not (
+            _is_safe_path_token(kind_token)
+            and _is_safe_path_token(sid_token)
+            and _is_safe_path_token(ver_token)
+        ):
+            continue
+        grouped.setdefault((kind_token, sid_token), []).append(ver_token)
+    out: dict[tuple[str, str], tuple[str, ...]] = {}
+    for key, versions in grouped.items():
+        deduped = sorted(set(versions), key=_parse_semver, reverse=True)
+        out[key] = tuple(deduped)
+    return out
+
+
+def _load_spec_catalog(repo_root_str: str) -> dict[tuple[str, str], tuple[str, ...]]:
+    """Read catalog bytes each call and dispatch to a content-keyed cache.
+
+    Codex round 26 F1: previously keyed on `(repo_root, mtime_ns)`, which
+    could be bypassed by edits that preserve mtime (restore-from-cache,
+    `cp -p`, etc.). Hashing on content (via the bytes themselves as the
+    `lru_cache` key) guarantees a cache hit only when the file contents
+    are byte-identical, so dependency resolution and `_dependency_set_fingerprint`
+    cannot diverge.
+    """
+    # Codex round 34 F2: missing / unreadable catalog is now a HARD failure
+    # (`SpecCatalogCorruption`). Previously it returned `{}` which downstream
+    # dep resolution treated as "no matching versions" — making a repo-wide
+    # registry outage look like an ordinary readiness=false dependency miss
+    # and sending operators to the wrong layer for recovery. All three
+    # production call sites (`_certify_and_collect_dep_artifacts`,
+    # `_verify_dependency_readiness`, `_relevant_catalog_subset_bytes`) only
+    # invoke this function AFTER deps.yaml entries are confirmed non-empty,
+    # so leaf orchestrations (which need no catalog) are unaffected.
+    catalog_path = Path(repo_root_str) / "spec" / "registry" / "spec_catalog.yaml"
+    if not catalog_path.is_file():
+        raise SpecCatalogCorruption(
+            f"spec_catalog.yaml is missing at {catalog_path}. Dependency "
+            "resolution requires the canonical registry; this is a "
+            "repository-wide outage, not a normal dependency miss."
+        )
+    try:
+        content = catalog_path.read_bytes()
+    except OSError as exc:
+        raise SpecCatalogCorruption(
+            f"spec_catalog.yaml at {catalog_path} is unreadable: {exc}"
+        ) from exc
+    return _load_spec_catalog_from_bytes(content)
+
+
+# Preserve the existing `_load_spec_catalog.cache_clear()` call surface used by
+# tests; delegate to the content-keyed inner cache.
+_load_spec_catalog.cache_clear = _load_spec_catalog_from_bytes.cache_clear  # type: ignore[attr-defined]
+
+
+_SEMVER_RE = re.compile(
+    r"^(?P<core>\d+(?:\.\d+)*)"
+    r"(?:-(?P<pre>[0-9A-Za-z.-]+))?"
+    r"(?:\+(?P<build>[0-9A-Za-z.-]+))?$"
+)
+
+
+def _parse_semver(
+    v: str,
+) -> tuple[tuple[int, ...], int, tuple[tuple[int, Any], ...]]:
+    """Parse a semver-style version string into a 3-tuple sort key.
+
+    Returns `(numeric_core, no_prerelease_flag, prerelease_key)`:
+    - `numeric_core`: dot-separated leading digits as ints (e.g. `1.0.0` → `(1, 0, 0)`).
+    - `no_prerelease_flag`: `1` when no `-prerelease` suffix is present, `0` otherwise.
+      Per SemVer §11, a version without prerelease has HIGHER precedence than the
+      same numeric core with prerelease (`1.0.0 > 1.0.0-rc1`). Tuple comparison
+      gives that ordering because `1 > 0`.
+    - `prerelease_key`: tuple of per-token sort keys for the prerelease segment
+      (numeric tokens sort before alpha; `(0, int)` < `(1, str)`).
+
+    Build metadata (`+xxx`) is parsed but **excluded from ordering** (SemVer §10).
+
+    Codex round 13 F2: the previous parser only accepted `[\\d.]` and coerced
+    every non-numeric component to `0`, breaking `1.0.0-rc1` and friends.
+    """
+    s = v.strip()
+    m = _SEMVER_RE.match(s)
+    if not m:
+        # Malformed: sort below any well-formed value.
+        return ((0,), 0, ())
+    core_str = m.group("core")
+    nums = tuple(int(tok) for tok in core_str.split("."))
+    pre = m.group("pre")
+    if pre is None:
+        return (nums, 1, ())
+    pre_key: list[tuple[int, Any]] = []
+    for tok in pre.split("."):
+        if tok.isdigit():
+            pre_key.append((0, int(tok)))
+        else:
+            pre_key.append((1, tok))
+    return (nums, 0, tuple(pre_key))
+
+
+# Accept any version syntax `_parse_semver` can handle: numeric core plus
+# optional `-prerelease` / `+build` suffix.
+_CONSTRAINT_OP_RE = re.compile(
+    r"^\s*(>=|<=|==|!=|>|<)?"
+    r"\s*(\d+(?:\.\d+)*(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?)\s*$"
+)
+
+
+def _matches_version_constraint(version: str, constraint: str | None) -> bool:
+    """Evaluate `version` against an AND-joined constraint expression.
+
+    Supported operators: `>=`, `>`, `<=`, `<`, `==`, `!=`. Bare versions (no
+    operator) are treated as `==`. Whitespace-separated terms are AND-combined.
+    Empty / None constraint → always true.
+
+    Operator semantics (Codex round 14 F2):
+    - Ordering operators (`>`, `>=`, `<`, `<=`) use SemVer-numeric precedence:
+      build metadata (`+xxx`) is ignored (SemVer §10), prerelease ranks below
+      its release (SemVer §11).
+    - Equality operators (`==`, `!=`) compare **normalized full strings**,
+      including any `+build` suffix. This prevents `==1.0.0+cpu` from
+      silently matching `1.0.0+gpu` — workspace artifact roots are keyed by
+      the full version string, so equality must distinguish build variants.
+    """
+    if not constraint or not constraint.strip():
+        return True
+    v_norm = version.strip()
+    v_key = _parse_semver(v_norm)
+    for term in constraint.split():
+        m = _CONSTRAINT_OP_RE.match(term)
+        if not m:
+            return False
+        op = m.group(1) or "=="
+        rhs = m.group(2).strip()
+        if op == "==":
+            if v_norm != rhs:
+                return False
+            continue
+        if op == "!=":
+            if v_norm == rhs:
+                return False
+            continue
+        rv = _parse_semver(rhs)
+        if op == ">=" and not (v_key >= rv):
+            return False
+        if op == ">" and not (v_key > rv):
+            return False
+        if op == "<=" and not (v_key <= rv):
+            return False
+        if op == "<" and not (v_key < rv):
+            return False
+    return True
+
+
+def _constraint_is_exact_string_match_only(constraint: str | None) -> bool:
+    """True iff every term in `constraint` is an exact `==<full-version>` clause.
+
+    Used to gate range-constraint resolution across build-metadata variants:
+    if a constraint contains any inequality (`>=`, `<`, etc.) it must not
+    silently match different build variants of the same numeric release.
+    """
+    if not constraint or not constraint.strip():
+        return False
+    for term in constraint.split():
+        m = _CONSTRAINT_OP_RE.match(term)
+        if not m:
+            return False
+        op = m.group(1)
+        if op != "==":
+            return False
+    return True
+
+
+def _matching_dep_versions(
+    catalog: dict[tuple[str, str], tuple[str, ...]],
+    kind: str,
+    spec_id: str,
+    constraint: str | None,
+) -> tuple[str, ...]:
+    """Return every catalog version of `(kind, spec_id)` satisfying `constraint`,
+    in descending semver order. Empty tuple → unresolvable dep (fail-closed).
+
+    Codex round 13 F1: returning ALL matching versions (not just the max) lets
+    `_verify_dependency_readiness` evaluate per-stage artifact presence across
+    ANY of them. A newer catalog entry without artifacts no longer blocks
+    parents whose older matching version is fully verified.
+
+    Codex round 16 F2: when a range/inequality constraint matches catalog
+    versions that share the same ordering key (i.e., differ only by build
+    metadata, e.g. `1.0.0+cpu` vs `1.0.0+gpu`), the resolution is ambiguous
+    — distinct workspace artifact roots cannot be silently selected. Return
+    an empty tuple in that case so the caller fails closed. Exact-string
+    constraints (`==1.0.0+cpu`) are unaffected: the operator already pins a
+    specific full version.
+    """
+    versions = catalog.get((kind, spec_id))
+    if not versions:
+        return ()
+    matched = tuple(v for v in versions if _matches_version_constraint(v, constraint))
+    if len(matched) > 1 and not _constraint_is_exact_string_match_only(constraint):
+        ordering_keys = {_parse_semver(v) for v in matched}
+        if len(ordering_keys) < len(matched):
+            # Two or more matched versions share the same numeric+prerelease
+            # ordering key, differing only by build metadata. Range resolution
+            # is ambiguous; fail closed (caller treats as unresolvable dep).
+            return ()
+    return matched
+
+
+def _resolve_dep_version(
+    catalog: dict[tuple[str, str], tuple[str, ...]],
+    kind: str,
+    spec_id: str,
+    constraint: str | None,
+) -> str | None:
+    """Return the highest matching version, or None if no version matches.
+    Kept for callers that need a single representative version (e.g. for
+    fingerprint pinning); readiness verification uses `_matching_dep_versions`."""
+    matched = _matching_dep_versions(catalog, kind, spec_id, constraint)
+    return matched[0] if matched else None
+
+
+_DEPS_YAML_ALLOWED_KEYS: frozenset[str] = frozenset({"components", "profiles"})
+
+# Codex round 15 F2: identifiers from deps.yaml / spec_catalog.yaml are
+# interpolated into workspace/<kind>/<safe>/ paths. ANY of `spec_kind`,
+# `spec_id`, `spec_version` containing path separators or traversal sequences
+# would let the verifier walk out of the dependency subtree and treat
+# unrelated files as readiness evidence. Reject anything outside this strict
+# safe-token grammar before path construction or fingerprint inclusion.
+_SAFE_ID_TOKEN_RE = re.compile(r"^[A-Za-z0-9._+-]+$")
+
+
+def _is_safe_path_token(s: Any) -> bool:
+    """Strict whitelist for spec identifiers used in workspace paths.
+
+    Rejects empty / non-str values, `..` traversal substrings, and any
+    character outside `[A-Za-z0-9._+-]`. Path separators (`/`, `\\`), null
+    bytes, and shell metacharacters are all rejected. Used to gate
+    `spec_kind` / `spec_id` / `spec_version` values from deps.yaml and
+    spec_catalog.yaml before they are interpolated into filesystem paths.
+    """
+    if not isinstance(s, str) or not s:
+        return False
+    if ".." in s:
+        return False
+    return bool(_SAFE_ID_TOKEN_RE.match(s))
+
+
+def _parse_dep_entries(
+    deps_doc: dict[str, Any]
+) -> tuple[list[tuple[str, str, str | None]], bool]:
+    """Parse direct dependencies from a deps.yaml document.
+
+    Returns `(entries, well_formed)`:
+    - `entries`: list of `(spec_kind, spec_id, version_constraint)` triples.
+      Constraint is None when the entry omits it (bare-string or dict without
+      `version_constraint`).
+    - `well_formed`: False when ANY structural problem is detected. Caller
+      MUST treat well_formed=False as fail-closed.
+
+    Strict schema enforced (Codex round 12 F1): the `dependencies` block must
+    be a dict containing EXACTLY the canonical keys `{"components", "profiles"}`
+    and nothing else. Unknown keys (e.g. typoed `component:`) or missing
+    canonical keys mark the document as malformed — previously these silently
+    yielded an empty entry list which `_verify_dependency_readiness` collapsed
+    to vacuous-true readiness.
+    """
+    entries: list[tuple[str, str, str | None]] = []
+    deps = deps_doc.get("dependencies")
+    if not isinstance(deps, dict):
+        return entries, False
+    keys = set(deps.keys())
+    if keys - _DEPS_YAML_ALLOWED_KEYS:
+        return entries, False
+    if keys != _DEPS_YAML_ALLOWED_KEYS:
+        return entries, False
+    well_formed = True
+    for kind_key, id_field in (("components", "component_id"), ("profiles", "profile_id")):
+        items = deps.get(kind_key)
+        if not isinstance(items, list):
+            well_formed = False
+            continue
+        kind = kind_key.rstrip("s")  # "components" -> "component"
+        for item in items:
+            if not isinstance(item, dict):
+                # Codex round 22 F1: only canonical dict form is accepted.
+                # Bare string items were silently normalized by taking the
+                # final `/`-segment — that lets entries like
+                # `"profile/foo"`, `"x/y/z"`, or `"../dep_a"` be rewritten
+                # to different IDs and pass the gate against the wrong dep.
+                # Require explicit `{component_id|profile_id, version_constraint}`.
+                well_formed = False
+                continue
+            sid = item.get(id_field)
+            constraint = item.get("version_constraint")
+            if not (isinstance(sid, str) and sid.strip()):
+                well_formed = False
+                continue
+            sid_token = sid.strip()
+            # Codex round 15 F2: reject path-traversal in spec_id before
+            # any workspace path is composed downstream.
+            if not _is_safe_path_token(sid_token):
+                well_formed = False
+                continue
+            if constraint is not None and not isinstance(constraint, str):
+                well_formed = False
+                continue
+            c = constraint.strip() if isinstance(constraint, str) and constraint.strip() else None
+            entries.append((kind, sid_token, c))
+    return entries, well_formed
+
+
+# Codex round 31 F2: the freshness reader MUST share the same canonical
+# grammar as the writer (`_SLUG_DATE_SEQ3_PATTERN` defined further down).
+# The previous reader regex (`^.+_(\d{8})_(\d{3})$`) accepted ANY prefix —
+# uppercase letters, underscores between slug parts, slashes in the path
+# tail, etc. — so a planted `FAKE__20991231_999/binary_meta.json` outranked
+# legitimate artifacts despite never having been issued by any writer.
+# Anchoring both ends to the strict slug grammar closes that trust gap.
+# This pattern is identical to `_SLUG_DATE_SEQ3_PATTERN` plus capture
+# groups for date and seq; kept in lock-step by construction (see the
+# `assert` at module load below).
+_FRESHNESS_CANONICAL_ID_RE = re.compile(
+    r"^[a-z0-9]+(?:-[a-z0-9]+)*_([0-9]{8})_([0-9]{3})$"
+)
+
+
+def _freshness_key_from_id(name: str) -> tuple[str, int] | None:
+    """Parse a canonical runtime-issued id (`<slug>_<YYYYMMDD>_<seq3>`) and
+    return an ordering key `(date_str, seq_int)`. None when the name does
+    not match the strict canonical grammar.
+
+    Codex round 35 F1: the ordering key no longer includes the slug. The
+    earlier `(date, seq, name)` tuple meant that two artifacts with the
+    same `<YYYYMMDD>_<seq3>` but different slugs were silently ranked by
+    slug, picking the lex-larger one. Because `reserve_phase_root` does
+    NOT enforce global `(date, seq)` uniqueness across orchestrations, a
+    concurrent or retried run could mint a colliding id whose slug
+    happens to sort later and become the chosen artifact for downstream
+    dependency_readiness — driving the gate with the wrong evidence.
+    Round 35 makes such a collision an explicit ambiguity (the selector
+    returns None and a `freshness_id_collision` reason); callers fail
+    closed with no silent slug-tiebreaker.
+
+    Codex round 31 F2: the matcher uses the same grammar as the writer
+    (`_SLUG_DATE_SEQ3_PATTERN`).
+    """
+    m = _FRESHNESS_CANONICAL_ID_RE.match(name)
+    if m is None:
+        return None
+    return (m.group(1), int(m.group(2)))
+
+
+def _select_max_by_id_extracted(
+    candidates: list[Path], id_extractor: Callable[[Path], str | None]
+) -> Path | None:
+    """Filter `candidates` to those whose extracted id matches the canonical
+    grammar, then return the candidate whose id has the greatest
+    `(date, seq)` ordering. None if no canonical candidate exists OR if
+    two or more candidates share the maximum `(date, seq)` — the latter
+    is a "collision ambiguity" that must fail closed because the
+    runtime cannot pick the "right" artifact when distinct IDs claim the
+    same canonical position (Codex round 35 F1).
+    """
+    scored: list[tuple[tuple[str, int], Path]] = []
+    for p in candidates:
+        id_name = id_extractor(p)
+        if id_name is None:
+            continue
+        key = _freshness_key_from_id(id_name)
+        if key is None:
+            continue
+        scored.append((key, p))
+    if not scored:
+        return None
+    max_key = max(kv[0] for kv in scored)
+    tied = [p for k, p in scored if k == max_key]
+    if len(tied) > 1:
+        # Ambiguous: ≥2 distinct canonical IDs claim the same (date, seq).
+        # Emit a stderr diagnostic so operators see WHICH paths collided
+        # and return None so callers fail closed. Logging via stderr (not
+        # phase_state_log) keeps this helper free of orchestration_id
+        # context; the upstream `_compute_dep_readiness_and_fingerprint`
+        # path surfaces the gate-level fail_reason.
+        try:
+            collisions = ", ".join(sorted(str(t) for t in tied))
+            print(
+                f"freshness_id_collision at (date={max_key[0]}, seq={max_key[1]}): "
+                f"{collisions}",
+                file=sys.stderr,
+            )
+        except Exception:
+            pass
+        return None
+    return tied[0]
+
+
+def _latest_meta_under(root: Path, glob_pattern: str) -> Path | None:
+    """Return the latest meta file under `root` matching `glob_pattern`,
+    selected by parsed canonical id `(date, seq)` from the enclosing
+    directory name. Both `*/ir_meta.json` (ir_id parent) and
+    `binary/*/binary_meta.json` (binary_id parent) put the runtime-issued
+    id directly above the file. Non-canonical enclosing names are filtered
+    out (defense against stray `zzz/` directories).
+    """
+    candidates = [p for p in root.glob(glob_pattern) if p.is_file()]
+    return _select_max_by_id_extracted(candidates, lambda p: p.parent.name)
+
+
+def _latest_aggregate_verdict_under(
+    pipe_root: Path, *, bound_to_binary_id: str | None = None
+) -> Path | None:
+    """Return the latest aggregate_verdict.json under `pipe_root` ordered
+    by parsed canonical `run_id`. Non-canonical run_ids are filtered out.
+
+    Codex round 24: when `bound_to_binary_id` is provided, restrict
+    candidates to verdicts whose sibling `trial_meta.json` records
+    `source_binary_id == bound_to_binary_id`. This binds the chosen verdict
+    to the specific binary `pipeline_ref` certified, preventing a passing
+    verdict for an OLDER binary from satisfying execution readiness while
+    a NEWER (un-validated) binary is selected for pipeline_ref. Verdicts
+    missing the sibling trial_meta.json (or its `source_binary_id` field)
+    are treated as unbound and excluded.
+    """
+    def _run_id_of(p: Path) -> str | None:
+        try:
+            parts = p.relative_to(pipe_root).parts
+        except ValueError:
+            return None
+        if len(parts) >= 4 and parts[0] == "runs":
+            return parts[1]
+        return None
+    candidates: list[Path] = []
+    for p in pipe_root.rglob("aggregate_verdict.json"):
+        if not p.is_file():
+            continue
+        if bound_to_binary_id is not None:
+            trial_meta = p.parent / "trial_meta.json"
+            if not trial_meta.is_file():
+                continue
+            try:
+                trial_doc = json.loads(trial_meta.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            if not isinstance(trial_doc, dict):
+                continue
+            src_bin = trial_doc.get("source_binary_id")
+            if not (isinstance(src_bin, str) and src_bin.strip() == bound_to_binary_id):
+                continue
+        candidates.append(p)
+    return _select_max_by_id_extracted(candidates, _run_id_of)
+
+
+def _latest_pipeline_dir(safe_root: Path) -> Path | None:
+    """Return the latest pipeline_id directory under
+    `workspace/pipelines/<safe>/`, ordered by parsed `(date, seq)` from
+    the canonical id suffix. Non-canonical pipeline directory names are
+    filtered out (Codex round 23 F2).
+
+    Codex round 11 F2 (still in effect): both pipeline_ref and
+    aggregate_verdict are bound to the SAME selected pipeline dir to
+    eliminate cross-run mixing.
+    """
+    if not safe_root.is_dir():
+        return None
+    candidates = [p for p in safe_root.iterdir() if p.is_dir()]
+    return _select_max_by_id_extracted(candidates, lambda d: d.name)
+
+
+def _verify_dep_stage(
+    repo_root: Path, kind: str, spec_id: str, version: str, stage: str
+) -> bool:
+    """Check whether the **current** dep artifact for `(kind, id, version)`
+    evidences `stage` completion.
+
+    "Current" = most recent by mtime under the versioned workspace directory.
+    Historical artifacts from earlier passing runs do NOT satisfy the gate
+    (Codex round 5 fix): a stale pass cannot unblock a new launch.
+
+    stage ∈ {"ir_ref", "pipeline_ref", "aggregate_verdict"}:
+
+    - ir_ref: latest `workspace/ir/<safe>/*/ir_meta.json` has verification_status=pass.
+    - pipeline_ref: latest `workspace/pipelines/<safe>/*/binary/*/binary_meta.json`
+      has verification_status=pass.
+    - aggregate_verdict: latest `workspace/pipelines/<safe>/**/aggregate_verdict.json`
+      has its top-level `aggregate_verdict` field set to `pass` or `xfail`
+      (per docs/GLOSSARY.md).
+    """
+    # Defensive: every caller validates upstream, but recheck before
+    # composing a filesystem path (Codex round 15 F2 defense-in-depth).
+    if not (
+        _is_safe_path_token(kind)
+        and _is_safe_path_token(spec_id)
+        and _is_safe_path_token(version)
+    ):
+        return False
+    safe = f"{kind}__{spec_id}__{version}"
+    if stage == "ir_ref":
+        root = repo_root / "workspace" / "ir" / safe
+        if not root.is_dir():
+            return False
+        latest = _latest_meta_under(root, "*/ir_meta.json")
+        if latest is None:
+            return False
+        try:
+            doc = json.loads(latest.read_text(encoding="utf-8"))
+        except Exception:
+            return False
+        return (
+            isinstance(doc, dict)
+            and str(doc.get("verification_status", "")).strip().lower() == "pass"
+        )
+    if stage in {"pipeline_ref", "aggregate_verdict"}:
+        # Codex round 11 F2: both pipeline_ref and aggregate_verdict are
+        # evaluated against the SAME selected pipeline run (latest pipeline_id
+        # under workspace/pipelines/<safe>/). Selecting them independently
+        # would let a newer incomplete run's passing binary be combined with
+        # an older run's passing verdict — execution readiness would erroneously
+        # pass even though no single run was end-to-end pass.
+        safe_root = repo_root / "workspace" / "pipelines" / safe
+        pipe_dir = _latest_pipeline_dir(safe_root)
+        if pipe_dir is None:
+            return False
+        if stage == "pipeline_ref":
+            latest = _latest_meta_under(pipe_dir, "binary/*/binary_meta.json")
+            if latest is None:
+                return False
+            try:
+                doc = json.loads(latest.read_text(encoding="utf-8"))
+            except Exception:
+                return False
+            return (
+                isinstance(doc, dict)
+                and str(doc.get("verification_status", "")).strip().lower() == "pass"
+            )
+        # stage == "aggregate_verdict"
+        # Codex round 24: bind the verdict to the SAME binary that
+        # pipeline_ref would select; reject verdicts produced for a
+        # different (older) binary even when newer binaries lack verdicts.
+        latest_binary = _latest_meta_under(pipe_dir, "binary/*/binary_meta.json")
+        if latest_binary is None:
+            return False
+        chosen_binary_id = latest_binary.parent.name
+        latest = _latest_aggregate_verdict_under(
+            pipe_dir, bound_to_binary_id=chosen_binary_id,
+        )
+        if latest is None:
+            return False
+        try:
+            doc = json.loads(latest.read_text(encoding="utf-8"))
+        except Exception:
+            return False
+        if not isinstance(doc, dict):
+            return False
+        verdict = str(doc.get("aggregate_verdict", "")).strip().lower()
+        # docs/GLOSSARY.md: "最新 aggregate_verdict が `pass` または `xfail` である状態"
+        return verdict in {"pass", "xfail"}
+    raise ValueError(f"unknown readiness stage: {stage!r}")
+
+
+def _stage_status_from_bytes(stage: str, raw: bytes) -> bool:
+    """Decide whether `raw` (one artifact file's bytes) satisfies `stage`."""
+    try:
+        doc = json.loads(raw.decode("utf-8"))
+    except Exception:
+        return False
+    if stage in {"ir_ref", "pipeline_ref"}:
+        return (
+            isinstance(doc, dict)
+            and str(doc.get("verification_status", "")).strip().lower() == "pass"
+        )
+    if stage == "aggregate_verdict":
+        if not isinstance(doc, dict):
+            return False
+        verdict = str(doc.get("aggregate_verdict", "")).strip().lower()
+        return verdict in {"pass", "xfail"}
+    raise ValueError(f"unknown readiness stage: {stage!r}")
+
+
+def _read_candidate_artifact_bytes(
+    repo_root: Path, kind: str, spec_id: str, version: str
+) -> dict[str, bytes]:
+    """Read each candidate stage's latest artifact bytes ONCE for one
+    `(kind, spec_id, version)` triple. Returns a dict whose presence of a
+    `stage` key indicates the file existed and was successfully read.
+    """
+    out: dict[str, bytes] = {}
+    if not (
+        _is_safe_path_token(kind)
+        and _is_safe_path_token(spec_id)
+        and _is_safe_path_token(version)
+    ):
+        return out
+    safe = f"{kind}__{spec_id}__{version}"
+    ir_root = repo_root / "workspace" / "ir" / safe
+    if ir_root.is_dir():
+        latest = _latest_meta_under(ir_root, "*/ir_meta.json")
+        if latest is not None:
+            try:
+                out["ir_ref"] = latest.read_bytes()
+            except OSError:
+                pass
+    safe_root = repo_root / "workspace" / "pipelines" / safe
+    pipe_dir = _latest_pipeline_dir(safe_root)
+    if pipe_dir is not None:
+        latest_binary = _latest_meta_under(pipe_dir, "binary/*/binary_meta.json")
+        chosen_binary_id: str | None = None
+        if latest_binary is not None:
+            chosen_binary_id = latest_binary.parent.name
+            try:
+                out["pipeline_ref"] = latest_binary.read_bytes()
+            except OSError:
+                pass
+        # Codex round 24: only consider verdicts bound to the chosen binary
+        # (via trial_meta.source_binary_id). A passing verdict for an older
+        # binary cannot satisfy aggregate_verdict_verified while a newer
+        # un-validated binary is selected for pipeline_ref.
+        if chosen_binary_id is not None:
+            latest_verdict = _latest_aggregate_verdict_under(
+                pipe_dir, bound_to_binary_id=chosen_binary_id,
+            )
+            if latest_verdict is not None:
+                try:
+                    out["aggregate_verdict"] = latest_verdict.read_bytes()
+                except OSError:
+                    pass
+    return out
+
+
+def _level_from_stage_bytes(stage_bytes: dict[str, bytes]) -> int:
+    """Cumulative readiness level achieved by one `(kind, sid, version)`:
+
+      0 = no ir / ir fail
+      1 = ir pass
+      2 = ir + pipeline pass
+      3 = ir + pipeline + verdict pass
+
+    Used by `_certify_and_collect_dep_artifacts` to choose ONE certified
+    version per dep (highest matched version achieving the maximum level).
+    """
+    if not _stage_status_from_bytes("ir_ref", stage_bytes.get("ir_ref", b"")):
+        return 0
+    if not _stage_status_from_bytes("pipeline_ref", stage_bytes.get("pipeline_ref", b"")):
+        return 1
+    if not _stage_status_from_bytes("aggregate_verdict", stage_bytes.get("aggregate_verdict", b"")):
+        return 2
+    return 3
+
+
+def _certify_and_collect_dep_artifacts(
+    repo_root: Path, spec_ref: Any
+) -> dict[str, Any]:
+    """Single-pass: read every candidate dep artifact ONCE, select the
+    certified version per dep, and return both the certification decision
+    and the bytes to feed into the fingerprint (Codex round 17 F1+F2).
+
+    Returns a dict with:
+      - `deps_doc_valid` (bool): True iff deps.yaml parsed as a dict.
+      - `entries_well_formed` (bool): True iff the deps.yaml schema is strict.
+      - `has_entries` (bool): True iff deps.yaml lists any direct deps.
+      - `certified_entries`: list of `(kind, spec_id, certified_version, level)`
+        in deps.yaml order. `certified_version` is the HIGHEST matching
+        catalog version that achieved the MAX level (any of {0,1,2,3}).
+        When no version was matched / no artifacts existed, level is 0 and
+        `certified_version` is None.
+      - `artifact_bytes_in_order`: list of `(stage, kind, sid, version, bytes)`
+        for ONLY the certified version of each dep — the canonical input to
+        the fingerprint hash. Walking only certified deps' artifacts means
+        unrelated historical-version artifact churn does NOT invalidate
+        readiness at the launch-time fingerprint check.
+    """
+    snap: dict[str, Any] = {
+        "deps_doc_valid": False,
+        "entries_well_formed": False,
+        "has_entries": False,
+        "certified_entries": [],
+        "artifact_bytes_in_order": [],
+    }
+    deps_doc = _read_deps_yaml(repo_root, spec_ref)
+    if not isinstance(deps_doc, dict):
+        return snap
+    snap["deps_doc_valid"] = True
+    entries, well_formed = _parse_dep_entries(deps_doc)
+    snap["entries_well_formed"] = well_formed
+    if not well_formed:
+        return snap
+    if not entries:
+        snap["has_entries"] = False
+        return snap
+    snap["has_entries"] = True
+    catalog = _load_spec_catalog(str(repo_root.resolve()))
+    for kind, spec_id, constraint in entries:
+        matched = _matching_dep_versions(catalog, kind, spec_id, constraint)
+        if not matched:
+            snap["certified_entries"].append((kind, spec_id, None, 0))
+            continue
+        best_v: str | None = None
+        best_level = -1
+        best_bytes: dict[str, bytes] = {}
+        # matched is descending; iterate so ties prefer the higher version.
+        for v in matched:
+            stage_bytes = _read_candidate_artifact_bytes(repo_root, kind, spec_id, v)
+            level = _level_from_stage_bytes(stage_bytes)
+            if level > best_level:
+                best_level = level
+                best_v = v
+                best_bytes = stage_bytes
+        if best_v is None:
+            snap["certified_entries"].append((kind, spec_id, None, 0))
+            continue
+        snap["certified_entries"].append((kind, spec_id, best_v, best_level))
+        for stage in _DEPENDENCY_READINESS_STAGES:
+            if stage in best_bytes:
+                snap["artifact_bytes_in_order"].append(
+                    (stage, kind, spec_id, best_v, best_bytes[stage])
+                )
+    return snap
+
+
+def _walk_dep_artifacts(
+    repo_root: Path, spec_ref: Any
+) -> Iterator[tuple[str, str, str, str, bytes]]:
+    """Yield artifact bytes for ONLY the certified version per dep.
+
+    Backed by `_certify_and_collect_dep_artifacts` so the fingerprint
+    hash narrows to artifacts that actually contributed to readiness
+    (Codex round 17 F2). Order is canonical: deps.yaml entry order,
+    one version per entry, stages in (ir_ref, pipeline_ref, aggregate_verdict).
+    """
+    snap = _certify_and_collect_dep_artifacts(repo_root, spec_ref)
+    for chunk in snap["artifact_bytes_in_order"]:
+        yield chunk
+
+
+def _dep_fingerprint_header_bytes(repo_root: Path, spec_ref: Any) -> bytes:
+    """Header bytes prefixed to the dep-set fingerprint hash.
+
+    Codex round 19 F1: the catalog contribution is NOT the entire
+    `spec_catalog.yaml` bytes — that would let unrelated catalog churn
+    (publishing a spec your orchestration does not depend on, editing
+    metadata elsewhere) invalidate every in-flight orchestration. Instead,
+    hash a deterministic representation of ONLY the catalog versions for
+    `(spec_kind, spec_id)` pairs that appear in this orchestration's
+    `deps.yaml`. Edits outside that subset cannot change resolution and
+    therefore cannot legitimately invalidate readiness.
+    """
+    spec_token = spec_ref.strip() if isinstance(spec_ref, str) and spec_ref.strip() else ""
+    deps_bytes: bytes = b""
+    if spec_token:
+        deps_path = (repo_root / spec_token / "deps.yaml").resolve()
+        try:
+            deps_path.relative_to(repo_root.resolve())
+            if deps_path.is_file():
+                deps_bytes = deps_path.read_bytes()
+        except (ValueError, OSError):
+            deps_bytes = b""
+    catalog_subset_bytes = _relevant_catalog_subset_bytes(repo_root, spec_ref)
+    return spec_token.encode("utf-8") + b"\x00" + deps_bytes + b"\x00" + catalog_subset_bytes
+
+
+def _no_deps_leaf_fingerprint(repo_root: Path, spec_ref: Any) -> str:
+    """Byte-only fingerprint that matches the full dep-set fingerprint
+    iff the orchestration is a leaf with no direct dependencies.
+
+    Codex round 30 F1: the round-29 PyYAML-missing leaf fallback trusted
+    `certified_deps == []` from persisted meta without proving it still
+    described the *current* deps.yaml — a stale meta or direct edit could
+    fail-open the gate. This helper recomputes the fingerprint header
+    bytes WITHOUT parsing YAML (catalog subset is empty by definition
+    when there are no deps) and SHA-256s them. For a true leaf, this
+    equals the original `_dependency_set_fingerprint` value because:
+      - `_relevant_catalog_subset_bytes` returns `b""` when deps.yaml has
+        no entries, so catalog_subset is empty.
+      - `artifact_bytes_in_order` is empty for a leaf, so the artifact
+        block is empty.
+    The hash therefore reduces to `SHA256(spec_token \\x00 deps_bytes \\x00 b"")`.
+    If the persisted fingerprint matches this byte-only recomputation,
+    deps.yaml hasn't been mutated since mark concluded "no deps" — so
+    trusting `certified_deps == []` is safe even without PyYAML.
+
+    Edits to deps.yaml (adding/changing deps) or to spec_ref change the
+    bytes → fingerprint mismatch → reject. Forging persisted meta cannot
+    succeed without also reconstructing matching deps.yaml bytes.
+    """
+    spec_token = spec_ref.strip() if isinstance(spec_ref, str) and spec_ref.strip() else ""
+    deps_bytes: bytes = b""
+    if spec_token:
+        deps_path = (repo_root / spec_token / "deps.yaml").resolve()
+        try:
+            deps_path.relative_to(repo_root.resolve())
+            if deps_path.is_file():
+                deps_bytes = deps_path.read_bytes()
+        except (ValueError, OSError):
+            deps_bytes = b""
+    h = hashlib.sha256()
+    h.update(spec_token.encode("utf-8"))
+    h.update(b"\x00")
+    h.update(deps_bytes)
+    h.update(b"\x00")
+    # catalog subset = empty for a no-deps leaf (round 19 F1 semantics).
+    return h.hexdigest()
+
+
+def _relevant_catalog_subset_bytes(repo_root: Path, spec_ref: Any) -> bytes:
+    """Deterministic serialization of the catalog subset relevant to
+    `spec_ref`'s deps: for each `(spec_kind, spec_id)` appearing in
+    deps.yaml, the sorted set of catalog versions for that pair. Returns
+    empty bytes when deps.yaml is missing, malformed, or has no entries.
+
+    Catalog edits to OTHER specs do not contribute to the hash, so they
+    cannot invalidate this orchestration's readiness.
+    """
+    deps_doc = _read_deps_yaml(repo_root, spec_ref)
+    if not isinstance(deps_doc, dict):
+        return b""
+    entries, well_formed = _parse_dep_entries(deps_doc)
+    if not well_formed or not entries:
+        return b""
+    catalog = _load_spec_catalog(str(repo_root.resolve()))
+    seen: set[tuple[str, str]] = set()
+    items: list[tuple[str, str, list[str]]] = []
+    for kind, spec_id, _constraint in entries:
+        key = (kind, spec_id)
+        if key in seen:
+            continue
+        seen.add(key)
+        versions = list(catalog.get(key, ()))
+        # Catalog tuples are already sorted descending; re-sort lexicographically
+        # so the serialized representation is stable across runs.
+        items.append((kind, spec_id, sorted(versions)))
+    items.sort()
+    return json.dumps(items, sort_keys=True, separators=(",", ":")).encode("utf-8")
+
+
+def _compute_dep_readiness_and_fingerprint(
+    repo_root: Path, spec_ref: Any
+) -> tuple[dict[str, bool] | None, str, list[dict[str, str]], str | None]:
+    """Single-pass: derive readiness booleans, fingerprint, the certified
+    `(spec_kind, spec_id, spec_version)` per dep, and any verification-error
+    reason from the SAME artifact byte snapshots (Codex round 16 F1 + round
+    17 F1/F2 + round 21 F2).
+
+    Per-dep certified version is the HIGHEST matching catalog version that
+    achieved the max readiness level (ir → ir+pipeline → ir+pipeline+verdict).
+    The fingerprint hashes ONLY the certified version's artifacts plus the
+    header (spec_ref + deps.yaml + spec_catalog.yaml subset).
+
+    Returns `(verified_dict, fingerprint_hex, certified_deps, fail_reason)`:
+      - `verified_dict`: None when verification cannot run. Else a dict of
+        stage booleans.
+      - `fingerprint_hex`: stable hash of header + certified artifacts.
+      - `certified_deps`: list of {"spec_kind", "spec_id", "spec_version"} in
+        deps.yaml order.
+      - `fail_reason`: None on success; otherwise one of
+        `"deps_yaml_missing_or_unparseable"` (deps.yaml file absent or YAML
+        parse failed) or `"deps_yaml_malformed_schema"` (deps.yaml parsed
+        but the dependency-block schema is invalid — unknown keys, missing
+        canonical lists, list items in wrong shape, etc.). Callers that
+        write persisted state (`mark_dependency_readiness`) treat both as
+        hard verification failures and fail closed with the specific reason
+        so the audit trail records WHICH defect occurred.
+    """
+    # Codex round 33 F2: catalog corruption is a distinct hard failure,
+    # not a normal "no matching dep" verification result. Convert the
+    # exception into a specific fail_reason so observability tooling, the
+    # CLI exit, and persisted state all record WHICH defect occurred.
+    try:
+        snap = _certify_and_collect_dep_artifacts(repo_root, spec_ref)
+        header = _dep_fingerprint_header_bytes(repo_root, spec_ref)
+    except SpecCatalogCorruption:
+        # Without a valid catalog there is no fingerprint we can stably
+        # compute. Return `verified=None` with the distinct
+        # `spec_catalog_corrupt` fail_reason so the same fail-closed
+        # persistence + raise path used for other hard verification
+        # failures (`deps_yaml_*`) handles this case loudly.
+        return (None, "", [], "spec_catalog_corrupt")
+    h = hashlib.sha256()
+    h.update(header)
+    for stage, kind, sid, version, raw in snap["artifact_bytes_in_order"]:
+        # Codex round 19 F2: prefix each artifact's bytes with its identity
+        # (kind/spec_id/version/stage). Without this, a higher matching
+        # version whose ir_meta.json bytes happen to equal the older
+        # certified version's bytes would recompute as the new certified
+        # version yet produce an identical fingerprint — gate would trust
+        # the persisted certified_deps even though they now point to a
+        # different version.
+        h.update(b"\x00")
+        h.update(f"{kind}__{sid}__{version}__{stage}".encode("utf-8"))
+        h.update(b"\x00")
+        h.update(raw)
+    fingerprint = h.hexdigest()
+    if not snap["deps_doc_valid"]:
+        return None, fingerprint, [], "deps_yaml_missing_or_unparseable"
+    if not snap["entries_well_formed"]:
+        # Codex round 21 F2: malformed deps.yaml schema is a HARD verification
+        # failure, not a normal negative result. Distinct reason so observability
+        # tooling (and the CLI exit) can differentiate spec defects from
+        # ordinary "no artifacts" cases.
+        return None, fingerprint, [], "deps_yaml_malformed_schema"
+    if not snap["has_entries"]:
+        return (
+            {f"{s}_verified": True for s in _DEPENDENCY_READINESS_STAGES},
+            fingerprint,
+            [],
+            None,
+        )
+    results: dict[str, bool] = {f"{s}_verified": True for s in _DEPENDENCY_READINESS_STAGES}
+    certified_deps: list[dict[str, str]] = []
+    for kind, spec_id, cert_v, level in snap["certified_entries"]:
+        if cert_v is None:
+            for s in _DEPENDENCY_READINESS_STAGES:
+                results[f"{s}_verified"] = False
+            certified_deps.append({"spec_kind": kind, "spec_id": spec_id, "spec_version": ""})
+            continue
+        if level < 1:
+            results["ir_ref_verified"] = False
+        if level < 2:
+            results["pipeline_ref_verified"] = False
+        if level < 3:
+            results["aggregate_verdict_verified"] = False
+        certified_deps.append({"spec_kind": kind, "spec_id": spec_id, "spec_version": cert_v})
+    return results, fingerprint, certified_deps, None
+
+
+def _verify_dependency_readiness(
+    repo_root: Path, spec_ref: Any
+) -> dict[str, bool] | None:
+    """Verify each direct-dep's artifacts and aggregate per-stage detail flags.
+
+    Returns:
+      - None if deps.yaml is missing/unparseable (caller decides fail-closed).
+      - dict {ir_ref_verified, pipeline_ref_verified, aggregate_verdict_verified}
+        otherwise. A stage is True iff EVERY listed direct dep passes its
+        per-stage artifact check. Empty deps → vacuous true for every stage.
+    """
+    deps_doc = _read_deps_yaml(repo_root, spec_ref)
+    if not isinstance(deps_doc, dict):
+        return None
+    entries, well_formed = _parse_dep_entries(deps_doc)
+    if not well_formed:
+        # Codex round 7 F1: malformed deps.yaml must NOT degrade to vacuous-true.
+        return {f"{stage}_verified": False for stage in _DEPENDENCY_READINESS_STAGES}
+    if not entries:
+        return {f"{stage}_verified": True for stage in _DEPENDENCY_READINESS_STAGES}
+    catalog = _load_spec_catalog(str(repo_root.resolve()))
+    results: dict[str, bool] = {f"{s}_verified": True for s in _DEPENDENCY_READINESS_STAGES}
+    for kind, spec_id, constraint in entries:
+        # Codex round 13 F1 + round 14 F1 (same-version coherence):
+        # readiness for each stage requires SOME single catalog version V to
+        # satisfy a cumulative chain. Specifically, the per-dep contribution is:
+        #
+        #   ir_ref          ← ∃ V where ir_ref passes for V
+        #   pipeline_ref    ← ∃ V where ir_ref AND pipeline_ref pass for the SAME V
+        #   aggregate_verdict ← ∃ V where ir_ref AND pipeline_ref AND aggregate_verdict pass for the SAME V
+        #
+        # This blocks the cross-version mix where ir_ref is satisfied by one
+        # version and pipeline_ref by another — execution_readiness would
+        # otherwise certify a chain that never existed as a coherent dep run.
+        # Constraint membership remains required: only catalog versions that
+        # match the dependency's version_constraint contribute.
+        matched_versions = _matching_dep_versions(catalog, kind, spec_id, constraint)
+        if not matched_versions:
+            for s in _DEPENDENCY_READINESS_STAGES:
+                results[f"{s}_verified"] = False
+            continue
+        any_ir = False
+        any_ir_pipe = False
+        any_ir_pipe_verdict = False
+        for v in matched_versions:
+            if not _verify_dep_stage(repo_root, kind, spec_id, v, "ir_ref"):
+                continue
+            any_ir = True
+            if not _verify_dep_stage(repo_root, kind, spec_id, v, "pipeline_ref"):
+                continue
+            any_ir_pipe = True
+            if _verify_dep_stage(repo_root, kind, spec_id, v, "aggregate_verdict"):
+                any_ir_pipe_verdict = True
+                break  # full chain found; further versions can't downgrade.
+        if not any_ir:
+            results["ir_ref_verified"] = False
+        if not any_ir_pipe:
+            results["pipeline_ref_verified"] = False
+        if not any_ir_pipe_verdict:
+            results["aggregate_verdict_verified"] = False
+    return results
+
+
+def _dependency_set_fingerprint(repo_root: Path, spec_ref: Any) -> str:
+    """Fingerprint identifying the dependency set the readiness flags apply to.
+
+    Combines normalized `spec_ref`, the bytes of `<spec_ref>/deps.yaml`, and
+    the bytes of `spec/registry/spec_catalog.yaml`. When ANY of those inputs
+    differ from the value stored on `dependency_readiness`, the persisted
+    flags refer to a stale dependency set and MUST be reset.
+
+    Codex round 6 F1: includes spec_ref + deps.yaml so `spec_ref` repointing
+    or deps.yaml edits invalidate stale `true` flags.
+
+    Codex round 7 F2: also includes spec_catalog.yaml so catalog drift
+    (new matching version added, previous version removed, constraint
+    ambiguity introduced) invalidates persisted readiness. Without this,
+    `_resolve_dep_version` outcomes can drift while readiness booleans
+    silently stay true.
+    """
+    # Codex round 16 F1: route through the shared `_walk_dep_artifacts`
+    # walker so the fingerprint observed at gate time uses the same canonical
+    # ordering and read pattern as `_compute_dep_readiness_and_fingerprint`
+    # at mark time. The same on-disk state ALWAYS produces the same hash.
+    h = hashlib.sha256()
+    h.update(_dep_fingerprint_header_bytes(repo_root, spec_ref))
+    for stage, kind, sid, version, raw in _walk_dep_artifacts(repo_root, spec_ref):
+        # Round 19 F2: identity prefix; see _compute_dep_readiness_and_fingerprint.
+        h.update(b"\x00")
+        h.update(f"{kind}__{sid}__{version}__{stage}".encode("utf-8"))
+        h.update(b"\x00")
+        h.update(raw)
+    return h.hexdigest()
+
+
+def _compute_initial_dependency_readiness(
+    repo_root: Path, spec_ref: Any
+) -> dict[str, Any]:
+    """Compute the canonical `dependency_readiness` payload for a fresh orchestration.
+
+    Replaces the previous all-true default which fail-opens `workflow-launch-check`
+    when no real readiness builder is wired up. Semantics:
+
+    - If `spec_ref` is missing or the target `deps.yaml` cannot be parsed, return
+      a fail-closed payload (all flags false) so the gate refuses to launch until
+      a real verifier writes verified state.
+    - If `deps.yaml` lists no `components` and no `profiles`, dependency readiness
+      is vacuously satisfied — return all flags true (matches the audit's empty-
+      dependency case where launches should proceed).
+    - Otherwise, return fail-closed. A future readiness builder must explicitly
+      flip these flags after verifying each direct dependency's `ir_meta.json` /
+      `pipeline_meta.json` / `aggregate_verdict`. The fail-closed default ensures
+      that gate behaviour does not silently trust unverified state.
+    """
+    # Codex round 34 F1: detect a canonical empty-deps leaf via a strict
+    # BYTE-LEVEL recognizer BEFORE touching PyYAML. Round 33 made every
+    # init call `_dependency_set_fingerprint` up front, so a controller
+    # PyYAML outage caused `write_preflight` to drop into its degraded
+    # branch and persist an all-false readiness record for FRESH leaf
+    # orchestrations — a brand-new no-deps workflow could not launch.
+    # The byte-level recognizer is intentionally conservative: false
+    # negatives just defer to PyYAML parsing (or fail-closed under
+    # outage); false positives would be fail-open, so the grammar is
+    # restricted to the canonical pattern.
+    spec_token = spec_ref.strip() if isinstance(spec_ref, str) and spec_ref.strip() else ""
+    deps_bytes_for_leaf: bytes | None = None
+    if spec_token:
+        deps_path = (repo_root / spec_token / "deps.yaml").resolve()
+        try:
+            deps_path.relative_to(repo_root.resolve())
+            if deps_path.is_file():
+                deps_bytes_for_leaf = deps_path.read_bytes()
+        except (ValueError, OSError):
+            deps_bytes_for_leaf = None
+    if deps_bytes_for_leaf is not None and _deps_yaml_bytes_are_canonical_empty(
+        deps_bytes_for_leaf
+    ):
+        # Byte-confirmed leaf: full fingerprint == byte-only fingerprint
+        # (catalog subset is empty by construction; no artifact bytes).
+        return {
+            "direct_dependency_compile_readiness": True,
+            "direct_dependency_execution_readiness": True,
+            "detail": {
+                "ir_ref_verified": True,
+                "pipeline_ref_verified": True,
+                "aggregate_verdict_verified": True,
+            },
+            "dep_set_fingerprint": _no_deps_leaf_fingerprint(repo_root, spec_ref),
+            "certified_deps": [],
+        }
+    # Codex round 33 F1: PyYAML errors past this point propagate so
+    # `write_preflight` can decide between "preserve existing verified
+    # record" and "write fail-closed". Non-leaf specs cannot be verified
+    # without YAML, so a PyYAML outage MUST fail-closed for those.
+    fingerprint = _dependency_set_fingerprint(repo_root, spec_ref)
+    trivial: dict[str, Any] = {
+        "direct_dependency_compile_readiness": True,
+        "direct_dependency_execution_readiness": True,
+        "detail": {
+            "ir_ref_verified": True,
+            "pipeline_ref_verified": True,
+            "aggregate_verdict_verified": True,
+        },
+        "dep_set_fingerprint": fingerprint,
+        # Codex round 31 F1: persist `certified_deps: []` in the initial
+        # trivial-leaf payload so the round-30 PyYAML-missing leaf shortcut
+        # is satisfied without requiring a subsequent
+        # `mark-dependency-readiness` run. Previously this field was only
+        # written by `mark_dependency_readiness`, so a fresh
+        # `init → preflight → workflow-launch-check` for a no-deps spec
+        # failed closed under PyYAML outage even though it is a legitimate
+        # vacuous-leaf. The empty list IS the byte-level proof of no deps,
+        # cryptographically bound to the dep_set_fingerprint that hashes
+        # the deps.yaml bytes.
+        "certified_deps": [],
+    }
+    fail_closed: dict[str, Any] = {
+        "direct_dependency_compile_readiness": False,
+        "direct_dependency_execution_readiness": False,
+        "detail": {
+            "ir_ref_verified": False,
+            "pipeline_ref_verified": False,
+            "aggregate_verdict_verified": False,
+        },
+        "dep_set_fingerprint": fingerprint,
+        # Fail-closed payloads explicitly omit `certified_deps`: there is
+        # no proof of any verification state to record. The PyYAML-missing
+        # leaf shortcut requires `certified_deps == []`, so its absence
+        # alone reliably fails the gate (consistent with the rest of the
+        # fail-closed semantics).
+    }
+    # Codex round 33 F1: PyYAML errors propagate; write_preflight handles
+    # the "preserve existing or write degraded fail-closed" decision based
+    # on whether prior verified state exists. Letting `_read_deps_yaml` /
+    # `_require_yaml` raise here is the correct behavior so the caller can
+    # distinguish "could not evaluate" from "evaluated to fail-closed".
+    deps_doc = _read_deps_yaml(repo_root, spec_ref)
+    if not isinstance(deps_doc, dict):
+        return fail_closed
+    # Codex round 12 F1: route trivial-leaf detection through the strict
+    # schema validator instead of a loose `len() == 0` check. Unknown
+    # dependency keys (e.g. typoed `component:`) or missing canonical keys
+    # now fail-closed rather than silently producing vacuous-true readiness.
+    entries, well_formed = _parse_dep_entries(deps_doc)
+    if not well_formed:
+        return fail_closed
+    if not entries:
+        return trivial
+    return fail_closed
 # Judge の pre_phase_complete 検証で semantic_review を要求しない終了理由（未完了扱い）。
 JUDGE_SEMANTIC_REVIEW_SKIPPED_STATUSES = frozenset({"timeout", "cancel"})
 SUPPORTED_BACKENDS = {"codex", "cursor", "claude"}
@@ -82,6 +1386,28 @@ _NODE_KEY_KIND_RE = re.compile(r"^[a-z][a-z0-9_]*$")
 _NODE_KEY_ID_SEGMENT_RE = re.compile(r"^[a-z0-9][a-z0-9_]*$")
 _NODE_KEY_VERSION_RE = re.compile(r"^[0-9][0-9A-Za-z._-]*$")
 _SLUG_DATE_SEQ3_PATTERN = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*_[0-9]{8}_[0-9]{3}$")
+
+# Codex round 31 F2 → round 36: keep reader (`_FRESHNESS_CANONICAL_ID_RE`)
+# and writer (`_SLUG_DATE_SEQ3_PATTERN`) grammars in lock-step. The capture
+# groups in the reader (`([0-9]{8})` / `([0-9]{3})`) are the only intentional
+# difference; their pattern bodies must be identical so a future edit to one
+# without the other surfaces at module load instead of silently re-opening
+# the trust gap fixed in round 31. Round 36 promotes this from `assert` (which
+# `python -O` elides) to an unconditional RuntimeError so the load-bearing
+# invariant survives optimized interpreter modes. Round 36 also tightens the
+# reader's digit classes to `[0-9]` (same as the writer) for genuine
+# equivalence — `\d` would match Unicode digits.
+if _SLUG_DATE_SEQ3_PATTERN.pattern != (
+    _FRESHNESS_CANONICAL_ID_RE.pattern
+    .replace(r"([0-9]{8})", r"[0-9]{8}")
+    .replace(r"([0-9]{3})", r"[0-9]{3}")
+):
+    raise RuntimeError(
+        "freshness reader and writer regexes have diverged — round 31 F2 "
+        "invariant violated. Reader: "
+        f"{_FRESHNESS_CANONICAL_ID_RE.pattern!r}; writer: "
+        f"{_SLUG_DATE_SEQ3_PATTERN.pattern!r}."
+    )
 
 
 def _parse_node_key_strict(node_key: Any) -> tuple[str, str, str]:
@@ -240,33 +1566,40 @@ def _runs_jsonl_lock_path(repo_root: Path, orchestration_id: str) -> Path:
     return _orchestration_root(repo_root, orchestration_id) / "agent_runs.jsonl.lock"
 
 
+def _orchestration_meta_lock_path(repo_root: Path, orchestration_id: str) -> Path:
+    """Sidecar lock for orchestration_meta.json terminal-status serialization.
+
+    Protects the read-check-write-cleanup-marker critical section in
+    `update_orchestration_status` against concurrent terminalizers that would
+    otherwise both pass the same-terminal guard and produce nondeterministic
+    final `reason_code` / `reason_detail` (last writer wins).
+    """
+    return _orchestration_root(repo_root, orchestration_id) / "orchestration_meta.json.lock"
+
+
 _FCNTL_FALLBACK_WARNED = False
 
 
+def _fcntl_warn_once(scope: str) -> None:
+    global _FCNTL_FALLBACK_WARNED
+    if _FCNTL_FALLBACK_WARNED:
+        return
+    _FCNTL_FALLBACK_WARNED = True
+    import sys as _sys
+    print(
+        "orchestration_runtime: WARNING — fcntl is unavailable on this "
+        f"platform; {scope} serialization is a no-op. Concurrent invocations "
+        "may race. Restrict orchestration to a single process or run on a "
+        "POSIX system to enable lock serialization.",
+        file=_sys.stderr,
+    )
+
+
 @contextlib.contextmanager
-def _runs_jsonl_exclusive_lock(repo_root: Path, orchestration_id: str) -> Iterator[None]:
+def _fcntl_exclusive_lock(lock_path: Path) -> Iterator[None]:
     if _fcntl is None:  # pragma: no cover — non-POSIX
-        # L-NEW-4: on non-POSIX platforms (Windows, etc.) fcntl is unavailable,
-        # so the lock degrades to a no-op. Two concurrent finalizers would
-        # then race silently. Single-process workflows are unaffected, but
-        # any multi-process driver would defeat Adv-24 serialization without
-        # warning. Emit a one-shot stderr message so the operator sees the
-        # downgrade rather than discovering it via corrupt state.
-        global _FCNTL_FALLBACK_WARNED
-        if not _FCNTL_FALLBACK_WARNED:
-            _FCNTL_FALLBACK_WARNED = True
-            import sys as _sys
-            print(
-                "orchestration_runtime: WARNING — fcntl is unavailable on this "
-                "platform; agent_runs.jsonl serialization is a no-op. "
-                "Concurrent record_agent_run / record_timeout invocations may "
-                "race. Restrict orchestration to a single process or run on "
-                "a POSIX system to enable Adv-24 lock serialization.",
-                file=_sys.stderr,
-            )
         yield
         return
-    lock_path = _runs_jsonl_lock_path(repo_root, orchestration_id)
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     fd = os.open(str(lock_path), os.O_WRONLY | os.O_CREAT, 0o600)
     try:
@@ -283,6 +1616,35 @@ def _runs_jsonl_exclusive_lock(repo_root: Path, orchestration_id: str) -> Iterat
             os.close(fd)
         except OSError:
             pass
+
+
+@contextlib.contextmanager
+def _runs_jsonl_exclusive_lock(repo_root: Path, orchestration_id: str) -> Iterator[None]:
+    if _fcntl is None:  # pragma: no cover — non-POSIX
+        # L-NEW-4: on non-POSIX platforms (Windows, etc.) fcntl is unavailable,
+        # so the lock degrades to a no-op. Two concurrent finalizers would
+        # then race silently. Single-process workflows are unaffected, but
+        # any multi-process driver would defeat Adv-24 serialization without
+        # warning. Emit a one-shot stderr message so the operator sees the
+        # downgrade rather than discovering it via corrupt state.
+        _fcntl_warn_once("agent_runs.jsonl")
+        yield
+        return
+    with _fcntl_exclusive_lock(_runs_jsonl_lock_path(repo_root, orchestration_id)):
+        yield
+
+
+@contextlib.contextmanager
+def _orchestration_meta_exclusive_lock(
+    repo_root: Path, orchestration_id: str
+) -> Iterator[None]:
+    """Serialize the terminal-status critical section in update_orchestration_status."""
+    if _fcntl is None:  # pragma: no cover — non-POSIX
+        _fcntl_warn_once("orchestration_meta.json")
+        yield
+        return
+    with _fcntl_exclusive_lock(_orchestration_meta_lock_path(repo_root, orchestration_id)):
+        yield
 
 
 def _cleanup_committed_dir(repo_root: Path, orchestration_id: str) -> Path:
@@ -603,6 +1965,42 @@ def _phase_state_path(repo_root: Path, orchestration_id: str) -> Path:
 
 def _phase_state_log_path(repo_root: Path, orchestration_id: str) -> Path:
     return _orchestration_root(repo_root, orchestration_id) / "phase_state_log.jsonl"
+
+
+def _phase_state_log_has_set_status(
+    repo_root: Path, orchestration_id: str, status: str
+) -> bool:
+    """Return True iff `phase_state_log.jsonl` already contains a canonical
+    `set_status` event whose `to` matches `status`.
+
+    Used by `update_orchestration_status` same-terminal replay to detect when
+    the original forward-transition call committed meta+cleanup but its
+    audit append failed (e.g., write-permission glitch). Replay then backfills
+    the canonical event from the persisted meta instead of returning a silent
+    no-op that loses the transition record forever.
+    """
+    path = _phase_state_log_path(repo_root, orchestration_id)
+    if not path.is_file():
+        return False
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return False
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+        except Exception:
+            continue
+        if (
+            isinstance(obj, dict)
+            and obj.get("event") == "set_status"
+            and obj.get("to") == status
+        ):
+            return True
+    return False
 
 
 def _ensure_orchestration_audit_dirs(repo_root: Path, orchestration_id: str) -> None:
@@ -1298,35 +2696,116 @@ def _dependency_ready(
     meta_path = _orchestration_root(repo_root, orchestration_id) / "orchestration_meta.json"
     if not meta_path.exists():
         return False, "orchestration_meta_missing"
-    meta = _read_json(meta_path)
-    if not isinstance(meta, dict):
-        return False, "orchestration_meta_invalid"
     step_token = step.strip().lower()
-    readiness = meta.get("dependency_readiness")
-    if not isinstance(readiness, dict):
-        return False, "dependency_readiness_missing"
-    if step_token == "compile":
-        token = readiness.get("direct_dependency_compile_readiness")
-        if token is not True:
-            return False, "direct_dependency_compile_readiness_not_pass"
-    elif step_token in {"generate", "build", "validate"}:
-        token = readiness.get("direct_dependency_execution_readiness")
-        if token is not True:
-            return False, "direct_dependency_execution_readiness_not_pass"
-    else:
+    if step_token not in {"compile", "generate", "build", "validate"}:
         return False, f"unsupported_step_for_dependency_readiness:{step_token}"
-    detail = readiness.get("detail")
-    if not isinstance(detail, dict):
-        return False, "dependency_readiness_detail_missing"
-    required_detail_keys: tuple[str, ...]
-    if step_token == "compile":
-        required_detail_keys = ("ir_ref_verified",)
-    else:
-        required_detail_keys = ("ir_ref_verified", "pipeline_ref_verified", "aggregate_verdict_verified")
-    for required_key in required_detail_keys:
-        if detail.get(required_key) is not True:
-            return False, f"dependency_readiness_detail_not_pass:{required_key}"
-    return True, None
+    # Codex round 27 F2: serialize the read + recompute + fingerprint
+    # comparison against meta writers under the same exclusive lock that
+    # `mark_dependency_readiness` / `write_preflight` / `update_orchestration_status`
+    # use. Without the lock the read can see a half-written
+    # `dep_set_fingerprint` while `_compute_dep_readiness_and_fingerprint`
+    # reads catalog/deps bytes that the writer is in the middle of certifying,
+    # producing a false-negative `dep_set_fingerprint_stale` that
+    # fail-closes a perfectly valid orchestration. Holding the lock for the
+    # whole comparison turns the check into a snapshot read.
+    with _orchestration_meta_exclusive_lock(repo_root, orchestration_id):
+        meta = _read_json(meta_path)
+        if not isinstance(meta, dict):
+            return False, "orchestration_meta_invalid"
+        readiness = meta.get("dependency_readiness")
+        if not isinstance(readiness, dict):
+            return False, "dependency_readiness_missing"
+        # Codex round 18 F1: do NOT trust persisted booleans alone. A direct
+        # edit of orchestration_meta.json that flips dependency_readiness flags
+        # while leaving artifacts (and therefore dep_set_fingerprint) unchanged
+        # would otherwise pass the gate. Recompute readiness from live workspace
+        # state at launch time and use the recomputed booleans as authoritative;
+        # the persisted booleans are advisory / audit-only. The stored fingerprint
+        # comparison still runs first as a cheap stale detector — catches catalog
+        # or deps.yaml mutation between mark and gate.
+        spec_ref = meta.get("spec_ref")
+        # Codex round 28 F1: `_compute_dep_readiness_and_fingerprint` reaches
+        # `_read_deps_yaml` / `_load_spec_catalog_from_bytes`, which raise
+        # `RuntimeError` when PyYAML is not installed (round 27 F1). Letting
+        # that escape `_dependency_ready` turns a missing package into an
+        # un-handled launch-gate exception (the upstream CLI prints a
+        # traceback instead of `dependency_not_ready`). Convert the install
+        # failure into a deterministic fail-closed gate result with a
+        # specific reason so operators can distinguish "PyYAML missing" from
+        # other verification failures.
+        try:
+            recomputed, current_fp, _certified, fail_reason = (
+                _compute_dep_readiness_and_fingerprint(repo_root, spec_ref)
+            )
+        except RuntimeError as exc:
+            if "PyYAML" in str(exc):
+                # Codex round 29 F1 → round 30 F1: PyYAML unavailable. A
+                # no-deps leaf orchestration (persisted `certified_deps == []`
+                # + all detail flags True) needs no YAML parse to verify,
+                # BUT the persisted claim must still be bound to the CURRENT
+                # deps.yaml bytes. Round 29's plain trust-persisted shortcut
+                # let stale meta or a direct edit (empty certified_deps +
+                # flipped detail flags) fail-open the gate exactly during a
+                # degraded control plane. Round 30 binds the shortcut to a
+                # byte-only fingerprint over `spec_ref` + raw `deps.yaml`
+                # bytes (catalog subset is empty by definition when there
+                # are no deps), so:
+                #   - deps.yaml edits → fingerprint mismatch → reject
+                #   - forged certified_deps without matching deps.yaml bytes
+                #     → fingerprint mismatch → reject
+                # The shortcut now requires (a) persisted no-deps claim,
+                # (b) all detail flags True, AND (c) live byte fingerprint
+                # equals persisted fingerprint.
+                persisted_certified = readiness.get("certified_deps")
+                persisted_detail = readiness.get("detail")
+                persisted_fp = readiness.get("dep_set_fingerprint")
+                if (
+                    isinstance(persisted_certified, list)
+                    and len(persisted_certified) == 0
+                    and isinstance(persisted_detail, dict)
+                    and persisted_detail.get("ir_ref_verified") is True
+                    and persisted_detail.get("pipeline_ref_verified") is True
+                    and persisted_detail.get("aggregate_verdict_verified") is True
+                    and isinstance(persisted_fp, str)
+                    and persisted_fp == _no_deps_leaf_fingerprint(repo_root, spec_ref)
+                ):
+                    return True, None
+                return False, "pyyaml_unavailable"
+            raise
+        stored_fp = readiness.get("dep_set_fingerprint")
+        if stored_fp != current_fp:
+            return False, "dep_set_fingerprint_stale"
+        if recomputed is None:
+            # Codex round 20 F1: production launch checks MUST fail closed when
+            # live recomputation cannot run — there is no way to re-verify
+            # artifacts, so trusting persisted booleans means trusting whatever
+            # `orchestration_meta.json` happens to say. The persisted-boolean
+            # fallback is preserved ONLY for test scaffolding via an explicit
+            # opt-in env var so unit-test fixtures (`_mark_dependencies_ready`)
+            # that intentionally skip building a real deps.yaml continue to work.
+            # Production environments do not set this variable; missing/unparseable
+            # OR malformed-schema deps.yaml at gate time → reject with the
+            # specific fail_reason (Codex round 25 F2: don't collapse distinct
+            # verification failures into one generic reason).
+            if os.environ.get("METDSL_DEP_READINESS_ALLOW_PERSISTED_FALLBACK") != "1":
+                return False, fail_reason or "deps_yaml_missing_or_unparseable"
+            if step_token == "compile":
+                if readiness.get("direct_dependency_compile_readiness") is not True:
+                    return False, "direct_dependency_compile_readiness_not_pass"
+                return True, None
+            if readiness.get("direct_dependency_execution_readiness") is not True:
+                return False, "direct_dependency_execution_readiness_not_pass"
+            return True, None
+        if step_token == "compile":
+            if not recomputed.get("ir_ref_verified"):
+                return False, "direct_dependency_compile_readiness_not_pass"
+            return True, None
+        # generate / build / validate
+        required = ("ir_ref_verified", "pipeline_ref_verified", "aggregate_verdict_verified")
+        for required_key in required:
+            if not recomputed.get(required_key):
+                return False, f"dependency_readiness_detail_not_pass:{required_key}"
+        return True, None
 
 
 def workflow_launch_check(
@@ -2623,6 +4102,19 @@ def _allowed_output_paths_for_launch(
                 )
                 return path == expected_cross_phase_build
             if build_prefix and path.startswith(build_prefix):
+                # Codex round 29 F2: enforce canonical `<slug>_YYYYMMDD_NNN`
+                # on `binary_id` (the first segment after build_prefix).
+                # The round-23 freshness selector filters by this same
+                # suffix when dependency_readiness inspects another
+                # orchestration's `binary/<binary_id>/binary_meta.json` —
+                # so a non-canonical binary_id would silently be ignored
+                # by downstream dep checks. Reject the write at the
+                # earliest boundary instead of letting it land and be
+                # silently dropped later.
+                tail = path[len(build_prefix):]
+                tail_parts = [part for part in tail.split("/") if part]
+                if not tail_parts or not _SLUG_DATE_SEQ3_PATTERN.match(tail_parts[0]):
+                    return False
                 if "/bin/" in path or path.endswith("/binary_meta.json"):
                     return True
                 # MCP `compile_project` writes a side-effect command log to
@@ -2630,8 +4122,6 @@ def _allowed_output_paths_for_launch(
                 # `docs/workflow/phases/phase_03_build.md`, the in-phase
                 # canonical placement (out-of-source CMake/Meson builds) is
                 # directly under `<binary_id>/`.
-                tail = path[len(build_prefix):]
-                tail_parts = [part for part in tail.split("/") if part]
                 if (
                     len(tail_parts) == 2
                     and tail_parts[1] == "mcp_command_log.jsonl"
@@ -2664,7 +4154,15 @@ def _allowed_output_paths_for_launch(
             tail = path[len(validate_prefix):]
             tail_parts = [part for part in tail.split("/") if part]
             # Validate.execute contract must be under runs/<run_id>/<node_safe>/...
-            if len(tail_parts) < 3 or tail_parts[1] != node_safe:
+            # Codex round 29 F2: enforce canonical `<slug>_YYYYMMDD_NNN`
+            # on `run_id` so the round-23 freshness filter for
+            # `runs/<run_id>/.../aggregate_verdict.json` never has to
+            # silently drop legitimate verdicts of downstream consumers.
+            if (
+                len(tail_parts) < 3
+                or tail_parts[1] != node_safe
+                or not _SLUG_DATE_SEQ3_PATTERN.match(tail_parts[0])
+            ):
                 return False
             rel_under_node = "/".join(tail_parts[2:])
             allowed_files = {
@@ -2689,7 +4187,14 @@ def _allowed_output_paths_for_launch(
             tail = path[len(validate_prefix):]
             tail_parts = [part for part in tail.split("/") if part]
             # Validate.judge contract must be under runs/<run_id>/<node_safe>/...
-            if len(tail_parts) < 3 or tail_parts[1] != node_safe:
+            # Codex round 29 F2: same canonical-id enforcement as the
+            # execute substep — judge writes the aggregate_verdict that
+            # downstream dependency_readiness consumes.
+            if (
+                len(tail_parts) < 3
+                or tail_parts[1] != node_safe
+                or not _SLUG_DATE_SEQ3_PATTERN.match(tail_parts[0])
+            ):
                 return False
             rel_under_node = "/".join(tail_parts[2:])
             allowed_files = {
@@ -3735,6 +5240,9 @@ def _should_ignore_runtime_snapshot_path(
         f"{orch_root}/agent_runs.jsonl",
         # Adv-24: fcntl lock sidecar; orchestration runtime exclusively manages it.
         f"{orch_root}/agent_runs.jsonl.lock",
+        # Codex round 11 F1: fcntl lock sidecar for orchestration_meta.json
+        # serialization; same runtime-managed exemption as the runs lock.
+        f"{orch_root}/orchestration_meta.json.lock",
         f"{orch_root}/orchestration_meta.json",
         f"{orch_root}/orchestration_checkpoint.json",
         f"{orch_root}/active_child_agent_run_id.txt",
@@ -4250,58 +5758,62 @@ def _cleanup_agent_tmp_root(
     # workspace/tmp/<arid>/ is treated as ambiguous and surfaced; cleanup is
     # likewise refused.
     #
-    # **M4 caveat (TOCTOU)**: this scan is unsynchronized. Between the scan
-    # and the rmtree below, a concurrent record-launch in another
-    # orchestration could create launches/<arid>.request.json for the same
-    # arid. With UUID4 arids (the documented norm — see RUNBOOK.md UUID
-    # generation) collision is astronomically rare; the workflow contract
-    # treats fresh UUID arids as a precondition. If callers ever assign
-    # non-UUID arids, this race becomes reachable and would need an
-    # additional cross-orchestration lock. Document deviations explicitly.
-    orchestrations_root = repo_root / "workspace" / "orchestrations"
-    other_owners = 0
-    if orchestrations_root.is_dir():
-        for other_dir in orchestrations_root.iterdir():
-            if not other_dir.is_dir() or other_dir.name == orchestration_id.strip():
-                continue
-            if (other_dir / "launches" / f"{arid}.request.json").is_file():
-                other_owners += 1
-                continue
-            other_meta_path = other_dir / "orchestration_meta.json"
-            if other_meta_path.is_file():
-                try:
-                    other_meta = json.loads(other_meta_path.read_text(encoding="utf-8"))
-                except (OSError, json.JSONDecodeError):
-                    continue
-                if isinstance(other_meta, dict):
-                    other_arid = other_meta.get("orchestration_agent_run_id")
-                    if isinstance(other_arid, str) and other_arid.strip() == arid:
-                        other_owners += 1
-    if other_owners > 0:
-        return False
+    # Codex round 20 F2: serialize the cross-orchestration scan + rmtree under
+    # an fcntl lock on `workspace/tmp/<arid>.lock`. Two concurrent cleanup
+    # attempts (or a cleanup race against a same-orchestration replay) cannot
+    # observe stale ownership state. The lock further narrows — but does not
+    # fully eliminate — the legacy M4 race where a record-launch in another
+    # orchestration creates `launches/<arid>.request.json` between the scan
+    # and the rmtree. With UUID4 arids (the documented norm) collision is
+    # astronomically rare; namespacing `workspace/tmp/` by orchestration_id
+    # is the long-term elimination (see RUNBOOK.md `tmp-namespace-redesign`).
     workspace_tmp = repo_root / "workspace" / "tmp"
-    target = workspace_tmp / arid
-    if not target.exists():
-        # Already absent — counts as "tmp is gone" for the committed marker.
-        return True
-    # Reject symlink redirection — never follow a symlink at <agent_run_id>.
-    try:
-        if target.is_symlink():
+    workspace_tmp.mkdir(parents=True, exist_ok=True)
+    lock_path = workspace_tmp / f"{arid}.lock"
+    with _fcntl_exclusive_lock(lock_path):
+        orchestrations_root = repo_root / "workspace" / "orchestrations"
+        other_owners = 0
+        if orchestrations_root.is_dir():
+            for other_dir in orchestrations_root.iterdir():
+                if not other_dir.is_dir() or other_dir.name == orchestration_id.strip():
+                    continue
+                if (other_dir / "launches" / f"{arid}.request.json").is_file():
+                    other_owners += 1
+                    continue
+                other_meta_path = other_dir / "orchestration_meta.json"
+                if other_meta_path.is_file():
+                    try:
+                        other_meta = json.loads(other_meta_path.read_text(encoding="utf-8"))
+                    except (OSError, json.JSONDecodeError):
+                        continue
+                    if isinstance(other_meta, dict):
+                        other_arid = other_meta.get("orchestration_agent_run_id")
+                        if isinstance(other_arid, str) and other_arid.strip() == arid:
+                            other_owners += 1
+        if other_owners > 0:
             return False
-        # Confirm the resolved path stays under workspace/tmp/.
-        resolved_target = target.resolve()
-        resolved_parent = workspace_tmp.resolve()
-        if resolved_target.parent != resolved_parent:
+        target = workspace_tmp / arid
+        if not target.exists():
+            # Already absent — counts as "tmp is gone" for the committed marker.
+            return True
+        # Reject symlink redirection — never follow a symlink at <agent_run_id>.
+        try:
+            if target.is_symlink():
+                return False
+            # Confirm the resolved path stays under workspace/tmp/.
+            resolved_target = target.resolve()
+            resolved_parent = workspace_tmp.resolve()
+            if resolved_target.parent != resolved_parent:
+                return False
+        except OSError:
             return False
-    except OSError:
-        return False
-    import shutil
-    try:
-        shutil.rmtree(target)
-    except OSError:
-        return False
-    # Successful rmtree (or post-rmtree absence). Confirm directory is gone.
-    return not target.exists()
+        import shutil
+        try:
+            shutil.rmtree(target)
+        except OSError:
+            return False
+        # Successful rmtree (or post-rmtree absence). Confirm directory is gone.
+        return not target.exists()
 
 
 def _write_directory_authorized_paths(
@@ -4526,6 +6038,15 @@ def _validate_actual_write_paths(
     _exact_declared_set: frozenset[str] = frozenset(exact_declared_paths)
     directory_authorized: list[str] = []
     for path in actual_changed_paths:
+        # Codex round 20 F2: cross-orchestration cleanup lock sidecar at
+        # `workspace/tmp/<arid>.lock` is created/touched by `_cleanup_agent_tmp_root`
+        # via fcntl during terminal status finalization. Runtime-managed; exempt.
+        if (
+            path.startswith("workspace/tmp/")
+            and path.endswith(".lock")
+            and "/" not in path[len("workspace/tmp/"):]
+        ):
+            continue
         if parent_tmp_root and _repo_path_under_prefix(path, parent_tmp_root):
             continue
         if manifest_allowed_tmp_root and _repo_path_under_prefix(path, manifest_allowed_tmp_root):
@@ -6307,7 +7828,14 @@ _STEP_META_FILENAME = STAGE_META_FILENAME_BY_STEP
 
 STEP_REQUIRED_VALIDATION_STAGES: dict[str, frozenset[str]] = {
     "compile": frozenset({"compile", "full"}),
-    "generate": frozenset({"post_generate", "post_build", "full"}),
+    # Generate accepts only `post_generate` (the validator stage that
+    # checks generation outputs) and `full`. `post_build` is Build's
+    # responsibility — its semantics are "validation after the build
+    # artifact exists" and applying it to a Generate terminal status
+    # would conflate phase boundaries. No production code or test
+    # exercises `generate + post_build`; the previous permissive set was
+    # a tolerance with no legitimate use case.
+    "generate": frozenset({"post_generate", "full"}),
     "build": frozenset({"post_build", "full"}),
     "validate": frozenset({"post_execute", "pre_judge", "full"}),
 }
@@ -7290,18 +8818,144 @@ def write_preflight(repo_root: Path, orchestration_id: str, payload: dict[str, A
     _write_json(root / "preflight.json", stored)
     meta_path = root / "orchestration_meta.json"
     if meta_path.exists():
-        meta = _read_json(meta_path)
-        if isinstance(meta, dict) and not isinstance(meta.get("dependency_readiness"), dict):
-            meta["dependency_readiness"] = {
-                "direct_dependency_plan_readiness": True,
-                "direct_dependency_execution_readiness": True,
-                "detail": {
-                    "ir_ref_verified": True,
-                    "pipeline_ref_verified": True,
-                    "aggregate_verdict_verified": True,
-                },
-            }
-            _write_json(meta_path, meta)
+        # Codex round 11 F1: the orchestration_meta.json read-check-write region
+        # here mutates the same file mark_dependency_readiness() guards under
+        # _orchestration_meta_exclusive_lock. Without acquiring the same lock,
+        # a concurrent mark-dependency-readiness call can have its verified
+        # `true` flags overwritten by this preflight pass with a stale snapshot.
+        with _orchestration_meta_exclusive_lock(repo_root, orchestration_id):
+            meta = _read_json(meta_path)
+            if isinstance(meta, dict):
+                # Codex round 6 F1 fix: tie dependency_readiness to a fingerprint of
+                # (spec_ref + deps.yaml bytes). When that fingerprint changes —
+                # e.g. spec_ref repointed from a leaf to a non-leaf, or deps.yaml
+                # edited — any previously persisted "true" flags refer to a stale
+                # dependency set and MUST be invalidated. Branches:
+                #
+                #   - existing missing            → initialize from computed.
+                #   - fingerprint mismatch        → reset to computed (the new
+                #                                    canonical initial state, which
+                #                                    is fail-closed for non-leaf
+                #                                    and trivial-true for leaf).
+                #   - fingerprint match + leaf    → idempotent refresh from computed.
+                #   - fingerprint match + non-leaf→ preserve CLI-verified flags.
+                existing = meta.get("dependency_readiness")
+                # Codex round 33 F1: when PyYAML is unavailable we cannot
+                # recompute the full fingerprint that a previously-verified
+                # non-leaf record was built with. Synthesizing a byte-only
+                # fallback (round 32) caused a guaranteed fingerprint
+                # MISMATCH and overwrote verified state with fail-closed —
+                # a transient packaging issue on the controller erased
+                # every non-leaf orchestration's verified state. Skip the
+                # invalidation block entirely on PyYAML outage:
+                #   - existing verified record → preserved (degraded mode)
+                #   - no existing record → write minimal fail-closed inline
+                #     so the gate refuses launches until PyYAML is restored.
+                try:
+                    computed = _compute_initial_dependency_readiness(
+                        repo_root, meta.get("spec_ref")
+                    )
+                except SpecCatalogCorruption:
+                    # Codex round 34 F2: catalog corruption / missing.
+                    # Same treatment as PyYAML outage: preserve existing
+                    # verified state, or write fail-closed if no prior
+                    # record. mark-dependency-readiness will surface the
+                    # specific reason loudly when next invoked.
+                    if isinstance(existing, dict):
+                        _append_phase_state_log(
+                            repo_root, orchestration_id,
+                            {
+                                "ts": _utc_now_iso(),
+                                "event": "dependency_readiness_preserved_spec_catalog_unavailable",
+                                "reason": "spec_catalog_corrupt_at_preflight",
+                            },
+                        )
+                        computed = None  # type: ignore[assignment]
+                    else:
+                        meta["dependency_readiness"] = {
+                            "direct_dependency_compile_readiness": False,
+                            "direct_dependency_execution_readiness": False,
+                            "detail": {
+                                "ir_ref_verified": False,
+                                "pipeline_ref_verified": False,
+                                "aggregate_verdict_verified": False,
+                            },
+                        }
+                        _write_json(meta_path, meta)
+                        _append_phase_state_log(
+                            repo_root, orchestration_id,
+                            {
+                                "ts": _utc_now_iso(),
+                                "event": "dependency_readiness_degraded_init",
+                                "reason": "spec_catalog_corrupt_at_preflight",
+                            },
+                        )
+                        computed = None  # type: ignore[assignment]
+                except RuntimeError as exc:
+                    if "PyYAML" not in str(exc):
+                        raise
+                    if isinstance(existing, dict):
+                        # Preserve existing readiness; record degraded mode
+                        # in the phase state log so operators can correlate.
+                        _append_phase_state_log(
+                            repo_root, orchestration_id,
+                            {
+                                "ts": _utc_now_iso(),
+                                "event": "dependency_readiness_preserved_pyyaml_unavailable",
+                                "reason": "pyyaml_unavailable_at_preflight",
+                            },
+                        )
+                        computed = None  # type: ignore[assignment]
+                    else:
+                        # No prior record — write a minimal fail-closed
+                        # payload (no fingerprint we can compute, no
+                        # certified_deps) so the gate refuses launch.
+                        meta["dependency_readiness"] = {
+                            "direct_dependency_compile_readiness": False,
+                            "direct_dependency_execution_readiness": False,
+                            "detail": {
+                                "ir_ref_verified": False,
+                                "pipeline_ref_verified": False,
+                                "aggregate_verdict_verified": False,
+                            },
+                        }
+                        _write_json(meta_path, meta)
+                        _append_phase_state_log(
+                            repo_root, orchestration_id,
+                            {
+                                "ts": _utc_now_iso(),
+                                "event": "dependency_readiness_degraded_init",
+                                "reason": "pyyaml_unavailable_at_preflight",
+                            },
+                        )
+                        computed = None  # type: ignore[assignment]
+                if computed is None:
+                    # PyYAML-degraded mode handled above; skip the rest of
+                    # the invalidation/refresh logic.
+                    pass
+                else:
+                    is_leaf = computed.get("direct_dependency_compile_readiness") is True
+                    current_fp = computed.get("dep_set_fingerprint")
+                    existing_fp = existing.get("dep_set_fingerprint") if isinstance(existing, dict) else None
+                    if not isinstance(existing, dict):
+                        meta["dependency_readiness"] = computed
+                        _write_json(meta_path, meta)
+                    elif existing_fp != current_fp:
+                        meta["dependency_readiness"] = computed
+                        _write_json(meta_path, meta)
+                        _append_phase_state_log(
+                            repo_root, orchestration_id,
+                            {
+                                "ts": _utc_now_iso(),
+                                "event": "dependency_readiness_invalidated",
+                                "reason": "dep_set_fingerprint_mismatch",
+                                "previous_fingerprint": existing_fp,
+                                "new_fingerprint": current_fp,
+                            },
+                        )
+                    elif is_leaf and existing != computed:
+                        meta["dependency_readiness"] = computed
+                        _write_json(meta_path, meta)
     if _preflight_allows_agent_launch(stored):
         _transition_phase_state(
             repo_root,
@@ -8749,74 +10403,361 @@ def update_orchestration_status(
     reason_detail: str | None = None,
     blocking_policy_scope: str | None = None,
 ) -> dict[str, Any]:
-    if status == "pass":
-        _require_preflight_launchable(
-            repo_root,
-            orchestration_id,
-            enforce_live_probe=False,
-        )
-        _validate_orchestration_completion_for_pass(repo_root, orchestration_id)
     meta_path = _orchestration_root(repo_root, orchestration_id) / "orchestration_meta.json"
     if not meta_path.exists():
         raise FileNotFoundError(meta_path)
-    meta = _read_json(meta_path)
-    if not isinstance(meta, dict):
-        raise ValueError(f"invalid orchestration_meta.json: {meta_path}")
-    if status == "fail_closed":
-        if not isinstance(reason_code, str) or not reason_code.strip():
-            raise ValueError("set-status fail_closed requires non-empty reason_code")
-        if reason_code.strip() not in FAIL_CLOSED_REASON_CODES:
-            raise ValueError(
-                "set-status fail_closed reason_code must be one of "
-                f"{sorted(FAIL_CLOSED_REASON_CODES)}"
-            )
-    meta["status"] = status
-    if isinstance(reason_code, str) and reason_code.strip():
-        meta["reason_code"] = reason_code.strip()
-    if isinstance(reason_detail, str) and reason_detail.strip():
-        meta["reason_detail"] = reason_detail.strip()
-    if isinstance(blocking_policy_scope, str) and blocking_policy_scope.strip():
-        meta["blocking_policy_scope"] = blocking_policy_scope.strip()
-    if status == "fail_closed":
-        meta["detected_at"] = _utc_now_iso()
-    if status in TERMINAL_STATUSES:
-        meta["finished_at"] = _utc_now_iso()
-    if status == "fail_closed":
-        meta["finished_at"] = _utc_now_iso()
-    # Adv-35: write the durable terminal status FIRST, then cleanup tmp,
-    # then write the cleanup_committed marker. Validator's exemption-revoke
-    # decision requires BOTH the terminal meta status AND the committed
-    # marker (Adv-35 two-phase commit), so a partial failure between meta
-    # write and cleanup keeps orch tmp scratch exempt for diagnostics
-    # rather than orphaning recovery artifacts.
-    _write_json(meta_path, meta)
-    if status in TERMINAL_STATUSES or status == "fail_closed":
+    # F3: serialize the full read-check-write-cleanup-marker section. Without this
+    # lock, two concurrent terminalizers can both observe a non-terminal status,
+    # both pass the same-terminal guard below, and race the meta write — the
+    # final reason_code/reason_detail becomes nondeterministic.
+    with _orchestration_meta_exclusive_lock(repo_root, orchestration_id):
+        meta = _read_json(meta_path)
+        if not isinstance(meta, dict):
+            raise ValueError(f"invalid orchestration_meta.json: {meta_path}")
+        current_status_pre = meta.get("status")
+        is_same_terminal_replay = (
+            isinstance(current_status_pre, str)
+            and current_status_pre in IDEMPOTENT_TERMINAL_STATUSES
+            and status == current_status_pre
+        )
+        # Codex round 15 F1: status-specific preconditions (pass needs
+        # preflight launchability + completion validation; fail_closed needs
+        # reason_code) MUST run only for FORWARD transitions. A same-terminal
+        # replay reflects a defensive retry after the first call already
+        # committed — re-running pass validation can fail on expired preflight
+        # or drifted workspace even though the orchestration is already done.
+        if not is_same_terminal_replay:
+            if status == "pass":
+                _require_preflight_launchable(
+                    repo_root,
+                    orchestration_id,
+                    enforce_live_probe=False,
+                )
+                _validate_orchestration_completion_for_pass(repo_root, orchestration_id)
+            if status == "fail_closed":
+                if not isinstance(reason_code, str) or not reason_code.strip():
+                    raise ValueError("set-status fail_closed requires non-empty reason_code")
+                if reason_code.strip() not in FAIL_CLOSED_REASON_CODES:
+                    raise ValueError(
+                        "set-status fail_closed reason_code must be one of "
+                        f"{sorted(FAIL_CLOSED_REASON_CODES)}"
+                    )
+        current_status = meta.get("status")
         orch_arid_obj = meta.get("orchestration_agent_run_id")
-        if isinstance(orch_arid_obj, str) and orch_arid_obj.strip():
-            cleanup_done = _cleanup_agent_tmp_root(
+        orch_arid = (
+            orch_arid_obj.strip()
+            if isinstance(orch_arid_obj, str) and orch_arid_obj.strip()
+            else None
+        )
+        if isinstance(current_status, str) and current_status in IDEMPOTENT_TERMINAL_STATUSES:
+            if status == current_status:
+                # F2: same-terminal re-invocation is the only built-in recovery
+                # path for a half-committed terminalization. Two-phase commit:
+                # (a) terminal meta written, (b) tmp cleaned, (c) committed
+                # marker. If (b) or (c) failed previously, the cleanup_committed
+                # marker is missing — accept the call as a cleanup-retry that
+                # touches ONLY the cleanup/marker phase. Narrative fields stay
+                # frozen at their first-write values; failure_analysis.json is
+                # the canonical place for additional context.
+                marker_present = False
+                if orch_arid is not None:
+                    marker_present = _cleanup_committed_marker_path(
+                        repo_root, orchestration_id, orch_arid
+                    ).is_file()
+                if marker_present:
+                    # F1 (Codex round 4): fully-committed same-terminal replay is a
+                    # safe no-op. Defensive retries after ambiguous network/IO
+                    # failures (the caller may have lost the response even though
+                    # the first call succeeded) must not error — the system is
+                    # already in the requested state. Narrative updates still
+                    # belong in failure_analysis.json (orchestration agent's
+                    # allowed_file_tool_path), but reissuing set-status with the
+                    # same status returns the existing meta unchanged.
+                    #
+                    # Codex round 18 F2: if the canonical `set_status` audit
+                    # event for this terminal status is missing (e.g., the
+                    # original forward-transition call committed meta + marker
+                    # but its log append failed), backfill it from the persisted
+                    # meta state before recording the no-op replay. Otherwise
+                    # the canonical transition record stays lost forever.
+                    if not _phase_state_log_has_set_status(
+                        repo_root, orchestration_id, status,
+                    ):
+                        _append_phase_state_log(
+                            repo_root,
+                            orchestration_id,
+                            {
+                                "ts": _utc_now_iso(),
+                                "event": "set_status",
+                                "to": status,
+                                "reason_code": meta.get("reason_code"),
+                                "reason_detail": meta.get("reason_detail"),
+                                "blocking_policy_scope": meta.get("blocking_policy_scope"),
+                                "detected_at": meta.get("detected_at"),
+                                "backfilled": True,
+                                "backfill_reason": "missing_canonical_set_status_event",
+                            },
+                        )
+                    _append_phase_state_log(
+                        repo_root,
+                        orchestration_id,
+                        {
+                            "ts": _utc_now_iso(),
+                            "event": "set_status_noop_replay",
+                            "to": status,
+                        },
+                    )
+                    return meta
+                # Cleanup retry path: re-run only the destructive cleanup and
+                # marker write. Do NOT mutate meta narrative fields.
+                # Codex round 18 F2: also backfill the canonical set_status
+                # event if it's missing (original call may have failed before
+                # logging).
+                if orch_arid is not None:
+                    cleanup_done = _cleanup_agent_tmp_root(
+                        repo_root,
+                        orchestration_id,
+                        agent_run_id=orch_arid,
+                    )
+                    if cleanup_done:
+                        _write_cleanup_committed_marker(
+                            repo_root, orchestration_id, agent_run_id=orch_arid,
+                        )
+                if not _phase_state_log_has_set_status(
+                    repo_root, orchestration_id, status,
+                ):
+                    _append_phase_state_log(
+                        repo_root,
+                        orchestration_id,
+                        {
+                            "ts": _utc_now_iso(),
+                            "event": "set_status",
+                            "to": status,
+                            "reason_code": meta.get("reason_code"),
+                            "reason_detail": meta.get("reason_detail"),
+                            "blocking_policy_scope": meta.get("blocking_policy_scope"),
+                            "detected_at": meta.get("detected_at"),
+                            "backfilled": True,
+                            "backfill_reason": "missing_canonical_set_status_event",
+                        },
+                    )
+                _append_phase_state_log(
+                    repo_root,
+                    orchestration_id,
+                    {
+                        "ts": _utc_now_iso(),
+                        "event": "set_status_cleanup_retry",
+                        "to": status,
+                    },
+                )
+                return meta
+            if not (current_status == "fail" and status == "fail_closed"):
+                raise ValueError(
+                    "terminal-to-terminal status transition rejected: "
+                    f"'{current_status}' -> '{status}'. Only 'fail' -> 'fail_closed' is permitted."
+                )
+        meta["status"] = status
+        if isinstance(reason_code, str) and reason_code.strip():
+            meta["reason_code"] = reason_code.strip()
+        if isinstance(reason_detail, str) and reason_detail.strip():
+            meta["reason_detail"] = reason_detail.strip()
+        if isinstance(blocking_policy_scope, str) and blocking_policy_scope.strip():
+            meta["blocking_policy_scope"] = blocking_policy_scope.strip()
+        if status == "fail_closed":
+            meta["detected_at"] = _utc_now_iso()
+        if status in TERMINAL_STATUSES:
+            meta["finished_at"] = _utc_now_iso()
+        if status == "fail_closed":
+            meta["finished_at"] = _utc_now_iso()
+        # Adv-35: write the durable terminal status FIRST, then cleanup tmp,
+        # then write the cleanup_committed marker. Validator's exemption-revoke
+        # decision requires BOTH the terminal meta status AND the committed
+        # marker (Adv-35 two-phase commit), so a partial failure between meta
+        # write and cleanup keeps orch tmp scratch exempt for diagnostics
+        # rather than orphaning recovery artifacts.
+        _write_json(meta_path, meta)
+        if status in TERMINAL_STATUSES or status == "fail_closed":
+            if orch_arid is not None:
+                cleanup_done = _cleanup_agent_tmp_root(
+                    repo_root,
+                    orchestration_id,
+                    agent_run_id=orch_arid,
+                )
+                # Adv-36: only publish committed marker on confirmed cleanup.
+                if cleanup_done:
+                    _write_cleanup_committed_marker(
+                        repo_root, orchestration_id, agent_run_id=orch_arid,
+                    )
+        # Codex round 21 F1: build the audit event from the COMMITTED meta
+        # rather than raw call arguments. Raw args bypass the .strip()
+        # normalization and the "preserve existing if unchanged" logic above,
+        # so the log could record a different reason_code/reason_detail than
+        # the persisted state. Reading back from `meta` ensures the audit
+        # trail matches the canonical orchestration_meta.json and that the
+        # forward write has the same shape as the replay backfill (which
+        # also sources from meta).
+        _append_phase_state_log(
+            repo_root,
+            orchestration_id,
+            {
+                "ts": _utc_now_iso(),
+                "event": "set_status",
+                "to": meta.get("status"),
+                "reason_code": meta.get("reason_code"),
+                "reason_detail": meta.get("reason_detail"),
+                "blocking_policy_scope": meta.get("blocking_policy_scope"),
+                "detected_at": meta.get("detected_at"),
+            },
+        )
+        return meta
+
+
+def mark_dependency_readiness(
+    repo_root: Path,
+    orchestration_id: str,
+) -> dict[str, Any]:
+    """Re-verify `orchestration_meta.dependency_readiness` from real workspace
+    artifacts and overwrite ALL detail flags with the freshly computed values.
+
+    Codex round 6 F2 fix: every call performs a full re-verification of all
+    three stages. Selective updates would let stale `true` flags survive
+    dependency regressions (an older `ir_ref_verified=true` could persist
+    even after a newer ir_meta.json went `verification_status=fail`). By
+    overwriting all flags from current artifact state, the persisted booleans
+    that `_dependency_ready` consumes always reflect the live workspace.
+
+    The runtime resolves every direct dependency in `<spec_ref>/deps.yaml`
+    (via `spec/registry/spec_catalog.yaml` + version_constraint matching),
+    then inspects the LATEST (mtime) workspace artifact per stage:
+
+      - ir_ref: latest `workspace/ir/<dep_safe>/*/ir_meta.json` has verification_status=pass
+      - pipeline_ref: latest `workspace/pipelines/<dep_safe>/*/binary/*/binary_meta.json` has verification_status=pass
+      - aggregate_verdict: latest `workspace/pipelines/<dep_safe>/**/aggregate_verdict.json` has top-level value ∈ {pass, xfail}
+
+    A stage flag is True only when EVERY direct dep passes its per-stage check
+    (empty deps → trivially true). Top-level flags derived:
+      compile_readiness   = ir_ref_verified
+      execution_readiness = ir_ref_verified AND pipeline_ref_verified AND aggregate_verdict_verified
+
+    Also refreshes `dep_set_fingerprint` so subsequent `write_preflight` calls
+    can detect deps.yaml / spec_ref churn.
+
+    The CLI is NOT a caller assertion — it triggers runtime artifact
+    verification. A caller cannot mark deps "verified" unless the workspace
+    actually contains passing artifacts.
+    """
+    meta_path = _orchestration_root(repo_root, orchestration_id) / "orchestration_meta.json"
+    if not meta_path.exists():
+        raise FileNotFoundError(meta_path)
+    with _orchestration_meta_exclusive_lock(repo_root, orchestration_id):
+        meta = _read_json(meta_path)
+        if not isinstance(meta, dict):
+            raise ValueError(f"invalid orchestration_meta.json: {meta_path}")
+        spec_ref = meta.get("spec_ref")
+        # Codex round 16 F1: single-pass read so persisted booleans and
+        # fingerprint derive from the SAME artifact byte snapshots. Otherwise
+        # a producer mutation between a separate verify() and fingerprint()
+        # call would persist inconsistent state.
+        # Codex round 17 F1+F2: also persist certified_deps (one canonical
+        # version per dep) so downstream consumers see the same version that
+        # satisfied readiness, and the fingerprint narrows to those versions
+        # only (historical-version churn does not invalidate).
+        verified, fingerprint_hex, certified_deps, fail_reason = _compute_dep_readiness_and_fingerprint(
+            repo_root, spec_ref
+        )
+        if verified is None:
+            # Codex round 8 F2 + round 21 F2: persist fail-closed BEFORE
+            # raising and record the SPECIFIC fail_reason so observability
+            # tooling can differentiate `deps_yaml_missing_or_unparseable`
+            # (file absent / YAML parse failed) from
+            # `deps_yaml_malformed_schema` (file parses but schema invalid).
+            fail_closed_payload: dict[str, Any] = {
+                "direct_dependency_compile_readiness": False,
+                "direct_dependency_execution_readiness": False,
+                "detail": {
+                    "ir_ref_verified": False,
+                    "pipeline_ref_verified": False,
+                    "aggregate_verdict_verified": False,
+                },
+                "dep_set_fingerprint": fingerprint_hex,
+            }
+            meta["dependency_readiness"] = fail_closed_payload
+            _write_json(meta_path, meta)
+            _append_phase_state_log(
                 repo_root,
                 orchestration_id,
-                agent_run_id=orch_arid_obj.strip(),
+                {
+                    "ts": _utc_now_iso(),
+                    "event": "mark_dependency_readiness_failed",
+                    "reason": fail_reason or "deps_yaml_missing_or_unparseable",
+                    "spec_ref": spec_ref,
+                },
             )
-            # Adv-36: only publish committed marker on confirmed cleanup.
-            if cleanup_done:
-                _write_cleanup_committed_marker(
-                    repo_root, orchestration_id, agent_run_id=orch_arid_obj.strip(),
+            if fail_reason == "deps_yaml_malformed_schema":
+                raise ValueError(
+                    "mark-dependency-readiness: deps.yaml schema is malformed "
+                    f"for spec_ref={spec_ref!r}. Persisted dependency_readiness "
+                    "reset to fail-closed. Inspect dependencies.components / "
+                    "dependencies.profiles for unknown keys, missing canonical "
+                    "lists, or malformed list items, then re-run "
+                    "mark-dependency-readiness."
                 )
-    _append_phase_state_log(
-        repo_root,
-        orchestration_id,
-        {
-            "ts": _utc_now_iso(),
-            "event": "set_status",
-            "to": status,
-            "reason_code": reason_code,
-            "reason_detail": reason_detail,
-            "blocking_policy_scope": blocking_policy_scope,
-            "detected_at": _utc_now_iso() if status == "fail_closed" else None,
-        },
-    )
-    return meta
+            if fail_reason == "spec_catalog_corrupt":
+                # Codex round 33 F2: surface catalog corruption distinctly
+                # so wrappers can route this to a repo-wide outage alert
+                # rather than treating it like an ordinary dep miss.
+                raise ValueError(
+                    "mark-dependency-readiness: spec_catalog.yaml is "
+                    "corrupt or missing the canonical schema. Persisted "
+                    f"dependency_readiness for spec_ref={spec_ref!r} reset "
+                    "to fail-closed. This is a repository-wide outage, "
+                    "not a normal dependency miss — fix the catalog file "
+                    "(top-level `specs:` list) and re-run."
+                )
+            raise ValueError(
+                "mark-dependency-readiness: cannot verify readiness — "
+                f"deps.yaml missing or unparseable for spec_ref={spec_ref!r}. "
+                "Persisted dependency_readiness reset to fail-closed. "
+                "Populate spec_ref in orchestration_meta and ensure deps.yaml exists, "
+                "then re-run mark-dependency-readiness."
+            )
+        detail = {
+            "ir_ref_verified": bool(verified.get("ir_ref_verified", False)),
+            "pipeline_ref_verified": bool(verified.get("pipeline_ref_verified", False)),
+            "aggregate_verdict_verified": bool(verified.get("aggregate_verdict_verified", False)),
+        }
+        compile_ok = detail["ir_ref_verified"]
+        execution_ok = (
+            detail["ir_ref_verified"]
+            and detail["pipeline_ref_verified"]
+            and detail["aggregate_verdict_verified"]
+        )
+        new_readiness: dict[str, Any] = {
+            "direct_dependency_compile_readiness": compile_ok,
+            "direct_dependency_execution_readiness": execution_ok,
+            "detail": detail,
+            "dep_set_fingerprint": fingerprint_hex,
+            # Codex round 17 F1: persist the per-dep certified version so
+            # downstream lineage / launch-request templating uses the SAME
+            # version that satisfied readiness, not a separately-resolved
+            # "highest matching version".
+            "certified_deps": certified_deps,
+        }
+        meta["dependency_readiness"] = new_readiness
+        _write_json(meta_path, meta)
+        _append_phase_state_log(
+            repo_root,
+            orchestration_id,
+            {
+                "ts": _utc_now_iso(),
+                "event": "mark_dependency_readiness",
+                "verified": verified,
+                "detail": detail,
+                "direct_dependency_compile_readiness": compile_ok,
+                "direct_dependency_execution_readiness": execution_ok,
+            },
+        )
+        return new_readiness
 
 
 def reserve_phase_root(
@@ -8830,6 +10771,23 @@ def reserve_phase_root(
 ) -> dict[str, Any]:
     step_key = step.strip().lower()
     _required_child_agent_kind(step_key)
+    # Codex round 32 F2: validate `reserved_id` against `_SLUG_DATE_SEQ3_PATTERN`
+    # at the canonical reservation entrypoint. Round-31 tightened the
+    # freshness reader to this same grammar but left the writer side
+    # unenforced — a workflow could reserve a non-canonical id, write
+    # valid artifacts under it, and then have downstream
+    # `dependency_readiness` silently ignore them. Enforcing the same
+    # grammar here means the trust boundary is symmetric: only IDs that
+    # readers will honor can be issued in the first place.
+    reserved_id_clean = reserved_id.strip()
+    if not _SLUG_DATE_SEQ3_PATTERN.match(reserved_id_clean):
+        raise ValueError(
+            f"reserve-phase-root: reserved_id={reserved_id_clean!r} must match "
+            f"<slug>_<YYYYMMDD>_<seq3> (lowercase hyphen-separated slug + "
+            "8-digit date + 3-digit sequence). The freshness selector "
+            "rejects non-canonical IDs, so an artifact written under this "
+            "id would be invisible to downstream dependency_readiness."
+        )
     node_safe = _node_key_to_safe(node_key.strip())
     out = (
         _orchestration_root(repo_root, orchestration_id)
@@ -8840,7 +10798,7 @@ def reserve_phase_root(
     payload = {
         "node_key": node_key.strip(),
         "step": step_key,
-        "reserved_ir_id": reserved_id.strip(),
+        "reserved_ir_id": reserved_id_clean,
         "reserved_by_agent_run_id": reserved_by_agent_run_id.strip(),
         "status": "reserved",
         "reserved_at": _utc_now_iso(),
@@ -9278,7 +11236,7 @@ def main(argv: list[str] | None = None) -> int:
         "new_agent_run_id, repair_reason. "
         "When step in {compile,generate,build,validate} and status is terminal "
         "(pass/fail/blocked/timeout/cancel), validation_stage is required: "
-        "compile=>compile|full, generate=>post_generate|post_build|full, "
+        "compile=>compile|full, generate=>post_generate|full, "
         "build=>post_build|full, validate=>post_execute|pre_judge|full. "
         "For compile/generate pass, required_outputs must be covered by effective substep output_refs."
     )
@@ -9469,6 +11427,25 @@ def main(argv: list[str] | None = None) -> int:
     status_parser.add_argument("--reason-code")
     status_parser.add_argument("--reason-detail")
     status_parser.add_argument("--blocking-policy-scope")
+
+    mark_dep_parser = subparsers.add_parser(
+        "mark-dependency-readiness",
+        description=(
+            "Re-verify orchestration_meta.dependency_readiness from real "
+            "workspace artifacts and OVERWRITE all detail flags with the "
+            "computed result. The runtime resolves every direct dep in "
+            "<spec_ref>/deps.yaml (via spec/registry/spec_catalog.yaml + "
+            "version_constraint matching) and inspects the latest (mtime) "
+            "ir_meta.json / binary_meta.json / aggregate_verdict.json. A "
+            "flag is True only when every dep passes its per-stage check. "
+            "Top-level compile/execution readiness are derived from detail "
+            "flags. The CLI takes no per-stage args: every call performs a "
+            "full re-verification (selective updates would let stale `true` "
+            "flags survive dependency regressions)."
+        ),
+    )
+    mark_dep_parser.add_argument("--repo-root", required=True)
+    mark_dep_parser.add_argument("--orchestration-id", required=True)
 
     launch_check_parser = subparsers.add_parser(
         "workflow-launch-check",
@@ -9958,6 +11935,32 @@ def main(argv: list[str] | None = None) -> int:
             reason_detail=args.reason_detail,
             blocking_policy_scope=args.blocking_policy_scope,
         )
+    elif args.command == "mark-dependency-readiness":
+        # Codex round 26 F2: convert expected verification failures
+        # (malformed/missing deps.yaml, missing orchestration_meta.json) into
+        # a clean stderr message + exit code 1 rather than letting a
+        # traceback escape the CLI surface — orchestration wrappers treat
+        # tracebacks as infrastructure crashes, not dependency rejections.
+        try:
+            result = mark_dependency_readiness(
+                repo_root=repo_root,
+                orchestration_id=args.orchestration_id,
+            )
+        except (ValueError, FileNotFoundError) as exc:
+            print(f"mark-dependency-readiness: {exc}", file=sys.stderr)
+            return 1
+        except RuntimeError as exc:
+            # Codex round 28 F2: PyYAML not installed → `_require_yaml()`
+            # raises `RuntimeError` from `_read_deps_yaml` /
+            # `_load_spec_catalog_from_bytes`. Surface as a clean stderr
+            # message under the same CLI contract as other expected
+            # verification failures rather than letting wrappers see a
+            # Python traceback (which would be classified as an
+            # infrastructure crash, not a dependency rejection).
+            if "PyYAML" not in str(exc):
+                raise
+            print(f"mark-dependency-readiness: {exc}", file=sys.stderr)
+            return 1
     elif args.command == "workflow-launch-check":
         result = pre_phase_launch(
             repo_root,

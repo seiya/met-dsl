@@ -63,7 +63,7 @@
 13. workflow 実行中は対象 `DAG` の `workspace/ir` と `workspace/pipelines` 配下 artifact を削除してはならない。
 14. `quality check` は `diagnostics.json` と `verdict.json` の比較を canonical source とし、`stdout` 差分のみで合否を確定してはならない。
 15. `lineage.json` と `trial_meta.json` の artifact 参照パスは `workspace/` 起点で記録しなければならない。
-16. `trial_meta.json` は `generated_by_stage`、`source_run_id`、`source_source_id`、`source_binary_id`、`source_command_ref`、`source_artifact_hash` を必須記録とする。`source_command_ref` の各 entry は `tool_name` (`run_program` または `run_quality_checks`) を宣言し、対応する MCP `command_log` record の `tool_name` と一致しなければならない。`Validate` の execute 部の trial_meta は最低 1 つ `tool_name='run_program'` の entry を持たなければならない。`source_source_id` の指す `source_meta.json` は `verification_status=pass` でなければならない。`source_binary_id` の指す `<pipeline>/binary/<source_binary_id>/bin/` は実在し、`run_program` log record の executable はその bin/ 配下に解決しなければならない。
+16. `trial_meta.json` は `generated_by_stage`、`source_source_id`、`source_binary_id`、`source_command_ref`、`source_artifact_hash` を必須記録とする (`run_id` は trial_meta が配置される `runs/<run_id>/` directory path 自体が canonical encoding であり、別途 `source_run_id` フィールドを記録しない — self-referential / circular なため)。`source_command_ref` の各 entry は `tool_name` (`run_program` または `run_quality_checks`) を宣言し、対応する MCP `command_log` record の `tool_name` と一致しなければならない。`Validate` の execute 部の trial_meta は最低 1 つ `tool_name='run_program'` の entry を持たなければならない。`source_source_id` の指す `source_meta.json` は `verification_status=pass` でなければならない。`source_binary_id` の指す `<pipeline>/binary/<source_binary_id>/bin/` は実在し、`run_program` log record の executable はその bin/ 配下に解決しなければならない。
 17. 異なる `pipeline_id` 間で `id` 系メタデータのみを変更して artifact 本文を流用してはならない。検出時は `copy_based_artifact_reuse` として `invalid` とする。
 18. 本規範違反は workflow 仕様違反とし、当該 `pipeline` を `invalid` とする。
 19. core workflow の全 phase は `workspace/` 配下以外へ書き込みを行ってはならない。任意フロー（`Promote`）の例外は別 plan で定義する。
@@ -218,7 +218,7 @@ workspace/
 #### 再実行規則
 - 同一 `ir_id` で `Generate` を複数回実行してよい。各試行は別 `source_id` とする。
 - 同一 `source_id` で `Build` を複数回実行してよい。各試行は別 `binary_id` とする。
-- 同一 `binary_id` で `Validate` を複数回実行してよい。各試行は別 `run_id` とする。
+- 同一 `binary_id` で `Validate` を複数回実行してよい。各試行は別 `run_id` とする。これは full Validate retry (`execute` 再実行 + `judge` 再評価) と judge 単独再評価 (`execute` 出力を流用して `judge` のみ再実行) の両方に適用する: いずれの場合も新規 `run_id` を発行し、既存 `runs/<run_id>/` ディレクトリに上書きしてはならない。同一 `run_id` 配下で `judge` を 2 回以上実行すると `verdict.json` / `aggregate_verdict.json` / `summary.json` / `semantic_review.json` (judge の canonical 出力) が上書きされて以前の判定根拠が失われるため、同一 `run_id` の再利用を禁止する。judge 単独再評価で `execute` の `raw/` / `diagnostics.json` / `perf.json` / `quality_check.json` / `trial_meta.json` をそのまま流用する場合、orchestration agent はそれらを新 `run_id` 配下にコピーし、`trial_meta.json` の `source_source_id` / `source_binary_id` は元 `run_id` と一致しなければならない (binary を生成した source と build の provenance を維持するため)。さらに、判定根拠の存続条件として、`trial_meta.json.source_source_id` の指す `<pipeline_ref>/source/<source_source_id>/` ディレクトリと `trial_meta.json.source_binary_id` の指す `<pipeline_ref>/binary/<source_binary_id>/` ディレクトリは、当該 `trial_meta.json` を保持する全ての `run_id` (元 + 再評価で複製された全ての run) が存在する限り削除してはならない (judge が `source_meta.json` 検査と `source/<source_id>/src/` の意味検査に依存するため、provenance チェーンが宙ぶらりんになると再評価不能になる)。
 - `Build` 開始条件は対象 `source_id` の `source_meta.json` で `verification_status=pass` であることとする。
 - `debug_mode=false` の `Generate` は `attempts/` を生成してはならない。
 - `Validate` 入力は常に同一 `run_id` 配下 artifact とし、他 `run_id` との混在を禁止する。

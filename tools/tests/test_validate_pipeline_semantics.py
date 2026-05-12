@@ -366,7 +366,6 @@ def _create_minimal_execution_tree(
         node_dir / "trial_meta.json",
         {
             "generated_by_stage": "validate",
-            "source_run_id": run_id,
             "source_source_id": "src_20260415_001",
             "source_binary_id": build_id_for_fixture,
             "source_command_ref": {

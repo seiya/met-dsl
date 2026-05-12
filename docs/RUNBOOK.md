@@ -60,7 +60,7 @@ workflow 実行および本 RUNBOOK の修復手順は以下の CLI を前提と
 - `Validate.judge` 開始前と完了前に、`run-gate` で `validate_pipeline_semantics` を `--stage pre_judge` 相当引数で実行し、`fail` 時は当該 `pipeline` を `invalid` とする。
 - `validate_pipeline_semantics --stage pre_judge` は `--allow-missing-orchestration` と `--allow-missing-llm-review` と併用してはならない。
 - `Validate.judge` 開始前の `pre_judge` 相当引数は、対象 `spec.ir.yaml.dependency.all_nodes` に対応する全 `pipeline_root` を `--pipeline-root` へ繰り返し指定して実行する。
-- `trial_meta.json` は `generated_by_stage` と `source_run_id` と `source_command_ref` と `source_artifact_hash` を必須記録とし、欠落または不整合時は `fail` とする。
+- `trial_meta.json` は `generated_by_stage` と `source_source_id` と `source_binary_id` と `source_command_ref` と `source_artifact_hash` を必須記録とし、欠落または不整合時は `fail` とする (`run_id` は trial_meta が配置される `runs/<run_id>/` directory path 自体が encode しているため、別途 `source_run_id` フィールドは記録しない)。
 - 本節の検証に違反した試行は当該 phase で停止し、下流 phase 開始条件を満たす目的の人工 artifact generation を禁止する。
 
 ### 1-2-1. `validate_pipeline_semantics.py` の補足静的規則（Generate 周辺）
@@ -171,7 +171,7 @@ workflow 実行および本 RUNBOOK の修復手順は以下の CLI を前提と
 - 依存 `operation` と同等機能を依存元 `node` へ再実装していない。
 - 上位 `node` の `source/<source_id>/src/` に依存 `node` 実装本体が複製・再配置・再定義されていない。
 - `spec.ir.yaml.impl_defaults.toolchain.language=fortran` の依存 `component` を持つ `node` で `use <spec_id>_model` と `call <spec_id>__*` が実装されている。
-- `trial_meta.json` の `generated_by_stage` / `source_run_id` / `source_command_ref` / `source_artifact_hash` が欠落していない。
+- `trial_meta.json` の `generated_by_stage` / `source_source_id` / `source_binary_id` / `source_command_ref` / `source_artifact_hash` が欠落していない (`run_id` は `runs/<run_id>/` directory path 自体が encode するため別フィールドにしない)。
 - `trial_meta.json` の `source_command_ref` が参照する `run_program` 実行コマンドに `spec.ir.yaml.case` が含まれている。
 - `blocked` で終了した `node` に `aggregate_verdict.json` / `summary.json` / `trial_meta.json` が存在し、`blocked_reason` が記録されている。
 - `runner` が `python` / `bash` / `sh` / `node` など外部インタプリタを起動していない。

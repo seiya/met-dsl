@@ -5,7 +5,9 @@
 
 ## I/O 契約
 - execution input: `binary/<binary_id>/bin/`、`spec.ir.yaml`、`tests.md`
-- verification input: `spec.ir.yaml`、`source/<source_id>/`、同一 `run_id` 配下の `raw/` / `diagnostics.json` / `perf.json` / `quality_check.json`
+- verification input: `spec.ir.yaml`、`source/<source_id>/`、同一 `run_id` 配下の `raw/` / `diagnostics.json` / `perf.json` / `quality_check.json` / `trial_meta.json`。`<source_id>` の解決経路は substep ごとに異なる:
+  - `Validate.execute`: launch request に必須記録される `source_id` (runtime enforce 済み; `binary_meta.json.source_source_id` との一致も verify される)。
+  - `Validate.judge`: launch request は `run_id` のみ必須なので、同一 `run_id` 配下の `trial_meta.json.source_source_id` を読んで `<source_id>` を解決する (trial_meta は execute が書き込み、runtime が binary_meta との一致を verify 済み)。retry で複数の `source_id` が `pipeline_id` 配下に共存する場合でも、この経路で execute が実際に使用した正確な source が一意に pin される。
 - 出力: `workspace/pipelines/<node_key_safe>/<pipeline_id>/runs/<run_id>/<node_key>/` 配下の以下:
   - `diagnostics.json`、`perf.json`、`quality_check.json`、`raw/`、`stdout.log`、`stderr.log`（execute substep）
   - `semantic_review.json`、`verdict.json`、`aggregate_verdict.json`、`summary.json`、`trial_meta.json`、`validate_meta.json`（judge substep）

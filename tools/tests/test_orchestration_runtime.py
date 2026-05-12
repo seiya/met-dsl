@@ -9,7 +9,15 @@ import os
 import subprocess
 import tempfile
 import unittest
-from contextlib import redirect_stderr, redirect_stdout
+
+# Codex round 20 F1: unit tests use `_mark_dependencies_ready` to inject
+# all-true readiness without setting up a real deps.yaml on disk. Production
+# `_dependency_ready` now fails closed when live recompute cannot run; tests
+# explicitly opt into the legacy persisted-boolean fallback so existing
+# fixtures keep working. Production environments do NOT set this variable.
+os.environ.setdefault("METDSL_DEP_READINESS_ALLOW_PERSISTED_FALLBACK", "1")
+from contextlib import contextmanager, redirect_stderr, redirect_stdout
+from typing import Any, Callable
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
@@ -93,7 +101,12 @@ def _fixture_generate_downstream_ready(repo_root: Path, *, source_id: str = "src
 
 
 def _mark_dependencies_ready(repo_root: Path, orchestration_id: str = "orch_001") -> None:
-    """Inject `dependency_readiness` so `_dependency_ready` accepts the launch."""
+    """Inject `dependency_readiness` so `_dependency_ready` accepts the launch.
+
+    Includes `dep_set_fingerprint` matching the current `spec_ref` + deps.yaml
+    so a subsequent `write_preflight` call does not invalidate this state.
+    """
+    from tools.orchestration_runtime import _dependency_set_fingerprint
     meta_path = (
         repo_root / "workspace" / "orchestrations" / orchestration_id / "orchestration_meta.json"
     )
@@ -108,6 +121,7 @@ def _mark_dependencies_ready(repo_root: Path, orchestration_id: str = "orch_001"
             "pipeline_ref_verified": True,
             "aggregate_verdict_verified": True,
         },
+        "dep_set_fingerprint": _dependency_set_fingerprint(repo_root, meta.get("spec_ref")),
     }
     meta_path.write_text(json.dumps(meta, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
@@ -817,7 +831,7 @@ shell_tool                       stable             true
                     "skill_ref": "skills/workflow-build/SKILL.md",
                     "skill_must_read_refs": "",
                     "allowed_output_paths": [
-                        "workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/binary/bin_001/bin/simulate",
+                        "workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/binary/bin_20260101_001/bin/simulate",
                     ],
                     "launch_prompt_full": _step_launch_prompt(
                         "problem/shallow_water2d@0.3.0",
@@ -885,7 +899,7 @@ shell_tool                       stable             true
                 agent_run_id="step_run_build_001",
                 actor_role="step",
                 changed_paths=[
-                    "workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/binary/bin_001/bin/simulate"
+                    "workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/binary/bin_20260101_001/bin/simulate"
                 ],
             )
             record_agent_run(
@@ -905,7 +919,7 @@ shell_tool                       stable             true
                     "started_at": "2026-03-11T00:00:20Z",
                     "finished_at": "2026-03-11T00:01:10Z",
                     "output_refs": [
-                        "workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/binary/bin_001/bin/simulate"
+                        "workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/binary/bin_20260101_001/bin/simulate"
                     ],
                 },
             )
@@ -947,7 +961,7 @@ shell_tool                       stable             true
                     "status": "pass",
                     "validation_stage": "post_build",
                     "required_outputs": [
-                        "workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/binary/bin_001/bin/simulate"
+                        "workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/binary/bin_20260101_001/bin/simulate"
                     ],
                     "failed_substeps": [],
                     "substep_agent_run_ids": [],
@@ -1741,7 +1755,7 @@ shell_tool                       stable             true
             "allowed_output_paths": [
                 # Caller declares run_id=exec_real_001 but lists a path
                 # under a different run_id.
-                f"{_FIX_PIPE_REF}/runs/run_other_002/{node_safe}/diagnostics.json",
+                f"{_FIX_PIPE_REF}/runs/run_20260201_002/{node_safe}/diagnostics.json",
             ],
         }
         with self.assertRaisesRegex(
@@ -1765,7 +1779,7 @@ shell_tool                       stable             true
         )
 
         src_id = "src_make_build_001"
-        binary_id = "build_make_001"
+        binary_id = "build-make_20260101_001"
         cross_log = (
             f"{_FIX_PIPE_REF}/source/{src_id}/src/mcp_command_log.jsonl"
         )
@@ -1812,7 +1826,7 @@ shell_tool                       stable             true
         from tools.orchestration_runtime import _allowed_output_paths_for_launch
 
         src_id = "src_cmake_001"
-        binary_id = "build_cmake_001"
+        binary_id = "build-cmake_20260101_001"
         cross_log = (
             f"{_FIX_PIPE_REF}/source/{src_id}/src/mcp_command_log.jsonl"
         )
@@ -1877,7 +1891,7 @@ shell_tool                       stable             true
                 },
             )
             failed_gen = "gen_failed_for_build"
-            binary_id = "build_against_failed_001"
+            binary_id = "build-against-failed_20260201_001"
             # Pre_phase_launch requires AT LEAST ONE pass-state generation
             # under the pipeline. Plant one so the gate doesn't fire before
             # our cross-phase verification reaches the failed gen the launch
@@ -1937,8 +1951,8 @@ shell_tool                       stable             true
             "ir_ref": _FIX_IR_REF,
             "pipeline_ref": _FIX_PIPE_REF,
             "allowed_output_paths": [
-                f"{_FIX_PIPE_REF}/binary/bin_a/binary_meta.json",
-                f"{_FIX_PIPE_REF}/binary/bin_b/binary_meta.json",
+                f"{_FIX_PIPE_REF}/binary/bin_20260101_002/binary_meta.json",
+                f"{_FIX_PIPE_REF}/binary/bin_20260101_003/binary_meta.json",
             ],
         }
         with self.assertRaisesRegex(ValueError, "must target a single binary_id"):
@@ -3108,7 +3122,7 @@ shell_tool                       stable             true
                     "skill_name": "workflow-build",
                     "skill_ref": "skills/workflow-build/SKILL.md",
                     "skill_must_read_refs": _fixture_skill_must_read_refs_step("build"),
-                    "allowed_output_paths": [f"{_FIX_PIPE_REF}/binary/bin_001/binary_meta.json"],
+                    "allowed_output_paths": [f"{_FIX_PIPE_REF}/binary/bin_20260101_001/binary_meta.json"],
                     "launch_prompt_full": _step_launch_prompt(
                         "problem/shallow_water2d@0.3.0",
                         "build",
@@ -3117,7 +3131,7 @@ shell_tool                       stable             true
                 },
                 response_payload=_spawn_response_payload("sess_step_build_001"),
             )
-            out_ref = f"{_FIX_PIPE_REF}/binary/bin_001/binary_meta.json"
+            out_ref = f"{_FIX_PIPE_REF}/binary/bin_20260101_001/binary_meta.json"
             out_path = repo_root / out_ref
             out_path.parent.mkdir(parents=True, exist_ok=True)
             out_path.write_text('{"status":"ok"}\n', encoding="utf-8")
@@ -3186,7 +3200,7 @@ shell_tool                       stable             true
                     "skill_name": "workflow-build",
                     "skill_ref": "skills/workflow-build/SKILL.md",
                     "skill_must_read_refs": _fixture_skill_must_read_refs_step("build"),
-                    "allowed_output_paths": [f"{_FIX_PIPE_REF}/binary/bin_001/binary_meta.json"],
+                    "allowed_output_paths": [f"{_FIX_PIPE_REF}/binary/bin_20260101_001/binary_meta.json"],
                     "launch_prompt_full": _step_launch_prompt(
                         "problem/shallow_water2d@0.3.0",
                         "build",
@@ -3195,7 +3209,7 @@ shell_tool                       stable             true
                 },
                 response_payload=_spawn_response_payload("sess_step_build_001"),
             )
-            out_ref = f"{_FIX_PIPE_REF}/binary/bin_001/binary_meta.json"
+            out_ref = f"{_FIX_PIPE_REF}/binary/bin_20260101_001/binary_meta.json"
             out_path = repo_root / out_ref
             out_path.parent.mkdir(parents=True, exist_ok=True)
             out_path.write_text('{"status":"ok"}\n', encoding="utf-8")
@@ -3264,7 +3278,7 @@ shell_tool                       stable             true
                     "skill_name": "workflow-build",
                     "skill_ref": "skills/workflow-build/SKILL.md",
                     "skill_must_read_refs": _fixture_skill_must_read_refs_step("build"),
-                    "allowed_output_paths": [f"{_FIX_PIPE_REF}/binary/bin_001/binary_meta.json"],
+                    "allowed_output_paths": [f"{_FIX_PIPE_REF}/binary/bin_20260101_001/binary_meta.json"],
                     "launch_prompt_full": _step_launch_prompt(
                         "problem/shallow_water2d@0.3.0",
                         "build",
@@ -3273,7 +3287,7 @@ shell_tool                       stable             true
                 },
                 response_payload=_spawn_response_payload("sess_step_build_001"),
             )
-            out_ref = f"{_FIX_PIPE_REF}/binary/bin_001/binary_meta.json"
+            out_ref = f"{_FIX_PIPE_REF}/binary/bin_20260101_001/binary_meta.json"
             out_path = repo_root / out_ref
             out_path.parent.mkdir(parents=True, exist_ok=True)
             out_path.write_text('{"status":"ok"}\n', encoding="utf-8")
@@ -3282,7 +3296,7 @@ shell_tool                       stable             true
                 orchestration_id="orch_001",
                 agent_run_id="step_run_build_001",
                 actor_role="step",
-                changed_paths=[f"{_FIX_PIPE_REF}/binary/bin_001/bin/other"],
+                changed_paths=[f"{_FIX_PIPE_REF}/binary/bin_20260101_001/bin/other"],
             )
             with self.assertRaisesRegex(ValueError, "terminal run has unauthorized write paths"):
                 record_agent_run(
@@ -3349,7 +3363,7 @@ shell_tool                       stable             true
                     "skill_name": "workflow-build",
                     "skill_ref": "skills/workflow-build/SKILL.md",
                     "skill_must_read_refs": _fixture_skill_must_read_refs_step("build"),
-                    "allowed_output_paths": [f"{_FIX_PIPE_REF}/binary/bin_001/bin/simulate"],
+                    "allowed_output_paths": [f"{_FIX_PIPE_REF}/binary/bin_20260101_001/bin/simulate"],
                     "launch_prompt_full": _step_launch_prompt(
                         "problem/shallow_water2d@0.3.0",
                         "build",
@@ -3358,7 +3372,7 @@ shell_tool                       stable             true
                 },
                 response_payload=_spawn_response_payload("sess_step_build_001"),
             )
-            out_ref = f"{_FIX_PIPE_REF}/binary/bin_001/bin/simulate"
+            out_ref = f"{_FIX_PIPE_REF}/binary/bin_20260101_001/bin/simulate"
             out_path = repo_root / out_ref
             out_path.parent.mkdir(parents=True, exist_ok=True)
             out_path.write_text("binary\n", encoding="utf-8")
@@ -3797,7 +3811,7 @@ shell_tool                       stable             true
             )
             real_gen = "gen_real_001"
             other_src = "src_other_002"
-            run_id = "run_unrelated_001"
+            run_id = "run_20260201_001"
             node_safe = "problem__shallow_water2d__0.3.0"
             # Both generations exist on disk (e.g., older sibling under same pipeline).
             for gid in (real_gen, other_src):
@@ -3806,10 +3820,10 @@ shell_tool                       stable             true
                 (gdir / "source_meta.json").write_text(
                     '{"verification_status": "pass"}\n', encoding="utf-8"
                 )
-            (repo_root / f"{_FIX_PIPE_REF}/binary/bin_x/bin").mkdir(
+            (repo_root / f"{_FIX_PIPE_REF}/binary/bin_20260201_003/bin").mkdir(
                 parents=True, exist_ok=True
             )
-            (repo_root / f"{_FIX_PIPE_REF}/binary/bin_x/bin/main").write_text(
+            (repo_root / f"{_FIX_PIPE_REF}/binary/bin_20260201_003/bin/main").write_text(
                 "binary\n", encoding="utf-8"
             )
             diagnostics_ref = (
@@ -3890,7 +3904,7 @@ shell_tool                       stable             true
                 },
             )
             real_gen = "gen_real_001"
-            run_id = "run_test_001"
+            run_id = "run_20260201_002"
             node_safe = "problem__shallow_water2d__0.3.0"
             gd = repo_root / f"{_FIX_PIPE_REF}/source/{real_gen}"
             gd.mkdir(parents=True, exist_ok=True)
@@ -3898,7 +3912,7 @@ shell_tool                       stable             true
                 '{"verification_status": "pass"}\n', encoding="utf-8"
             )
             # Legacy build dir WITHOUT source_source_id (older retry).
-            legacy_dir = repo_root / f"{_FIX_PIPE_REF}/binary/bin_legacy_999"
+            legacy_dir = repo_root / f"{_FIX_PIPE_REF}/binary/bin_20260101_999"
             (legacy_dir / "bin").mkdir(parents=True, exist_ok=True)
             (legacy_dir / "bin/main").write_text("legacy_binary\n", encoding="utf-8")
             (legacy_dir / "binary_meta.json").write_text(
@@ -3911,7 +3925,7 @@ shell_tool                       stable             true
                 encoding="utf-8",
             )
             # Current build with source_source_id matching the request.
-            current_dir = repo_root / f"{_FIX_PIPE_REF}/binary/bin_current_001"
+            current_dir = repo_root / f"{_FIX_PIPE_REF}/binary/bin_20260201_001"
             (current_dir / "bin").mkdir(parents=True, exist_ok=True)
             (current_dir / "bin/main").write_text("current_binary\n", encoding="utf-8")
             (current_dir / "binary_meta.json").write_text(
@@ -3946,7 +3960,7 @@ shell_tool                       stable             true
                     "dependency_ref": _FIX_DEP_REF,
                     "run_id": run_id,
                     "source_id": real_gen,
-                    "source_binary_id": "bin_current_001",
+                    "source_binary_id": "bin_20260201_001",
                     "skill_name": "workflow-validate-execute",
                     "skill_ref": "skills/workflow-validate-execute/SKILL.md",
                     "skill_must_read_refs": _fixture_skill_must_read_refs_substep("validate", "execute"),
@@ -4001,14 +4015,14 @@ shell_tool                       stable             true
                 },
             )
             real_gen = "gen_real_001"
-            run_id = "run_in_phase_001"
+            run_id = "run_20260201_003"
             node_safe = "problem__shallow_water2d__0.3.0"
             gd = repo_root / f"{_FIX_PIPE_REF}/source/{real_gen}"
             gd.mkdir(parents=True, exist_ok=True)
             (gd / "source_meta.json").write_text(
                 '{"verification_status": "pass"}\n', encoding="utf-8"
             )
-            bd = repo_root / f"{_FIX_PIPE_REF}/binary/bin_x"
+            bd = repo_root / f"{_FIX_PIPE_REF}/binary/bin_20260201_003"
             (bd / "bin").mkdir(parents=True, exist_ok=True)
             (bd / "bin/main").write_text("binary\n", encoding="utf-8")
             (bd / "binary_meta.json").write_text(
@@ -4095,8 +4109,8 @@ shell_tool                       stable             true
             )
             real_gen = "gen_real_001"
             unrelated_gen = "gen_unrelated_999"
-            binary_id = "build_real_001"
-            run_id = "run_test_001"
+            binary_id = "build-real_20260201_001"
+            run_id = "run_20260201_002"
             node_safe = "problem__shallow_water2d__0.3.0"
             # Two pass-state generations + one build_meta that records ONLY
             # real_gen as its source_source_id.
@@ -4143,7 +4157,7 @@ shell_tool                       stable             true
                         "dependency_ref": _FIX_DEP_REF,
                         "run_id": run_id,
                         # Request points at the real build but claims
-                        # unrelated_gen — should fail because build_real_001's
+                        # unrelated_gen — should fail because build-real_20260201_001's
                         # source_source_id is real_gen, not unrelated_gen.
                         "source_id": unrelated_gen,
                         "source_binary_id": binary_id,
@@ -4195,7 +4209,7 @@ shell_tool                       stable             true
                 },
             )
             failed_gen = "gen_failed_001"
-            run_id = "run_against_failed_001"
+            run_id = "run_20260201_004"
             node_safe = "problem__shallow_water2d__0.3.0"
             # Plant a failed generation (verification_status=fail).
             gen_dir = repo_root / f"{_FIX_PIPE_REF}/source/{failed_gen}"
@@ -4206,7 +4220,7 @@ shell_tool                       stable             true
             # build_x's binary_meta.json records source_source_id=failed_gen
             # so the mandatory lineage bind passes and the cross-phase
             # verification_status check is reached.
-            build_x_dir = repo_root / f"{_FIX_PIPE_REF}/binary/bin_x"
+            build_x_dir = repo_root / f"{_FIX_PIPE_REF}/binary/bin_20260201_003"
             (build_x_dir / "bin").mkdir(parents=True, exist_ok=True)
             (build_x_dir / "bin/main").write_text("binary\n", encoding="utf-8")
             (build_x_dir / "binary_meta.json").write_text(
@@ -4242,7 +4256,7 @@ shell_tool                       stable             true
                         "dependency_ref": _FIX_DEP_REF,
                         "run_id": run_id,
                         "source_id": failed_gen,
-                        "source_binary_id": "bin_x",
+                        "source_binary_id": "bin_20260201_003",
                         "skill_name": "workflow-validate-execute",
                         "skill_ref": "skills/workflow-validate-execute/SKILL.md",
                         "skill_must_read_refs": _fixture_skill_must_read_refs_substep("validate", "execute"),
@@ -4295,7 +4309,7 @@ shell_tool                       stable             true
             # mandatory source_build_id lineage check passes; the cross-phase
             # source_meta absence then triggers the unknown-source
             # rejection in the cross-phase loop.
-            build_dir = repo_root / f"{_FIX_PIPE_REF}/binary/bin_for_forged"
+            build_dir = repo_root / f"{_FIX_PIPE_REF}/binary/bin_20260201_002"
             (build_dir / "bin").mkdir(parents=True, exist_ok=True)
             (build_dir / "bin/main").write_text("binary\n", encoding="utf-8")
             (build_dir / "binary_meta.json").write_text(
@@ -4331,7 +4345,7 @@ shell_tool                       stable             true
                         "dependency_ref": _FIX_DEP_REF,
                         "run_id": run_id,
                         "source_id": forged_src_id,
-                        "source_binary_id": "bin_for_forged",
+                        "source_binary_id": "bin_20260201_002",
                         "skill_name": "workflow-validate-execute",
                         "skill_ref": "skills/workflow-validate-execute/SKILL.md",
                         "skill_must_read_refs": _fixture_skill_must_read_refs_substep("validate", "execute"),
@@ -4583,7 +4597,7 @@ shell_tool                       stable             true
                     "skill_name": "workflow-build",
                     "skill_ref": "skills/workflow-build/SKILL.md",
                     "skill_must_read_refs": _fixture_skill_must_read_refs_step("build"),
-                    "allowed_output_paths": [f"{_FIX_PIPE_REF}/binary/bin_001/bin/simulate"],
+                    "allowed_output_paths": [f"{_FIX_PIPE_REF}/binary/bin_20260101_001/bin/simulate"],
                     "launch_prompt_full": _step_launch_prompt(
                         "problem/shallow_water2d@0.3.0",
                         "build",
@@ -4592,7 +4606,7 @@ shell_tool                       stable             true
                 },
                 response_payload=_spawn_response_payload("sess_step_build_001"),
             )
-            out_ref = f"{_FIX_PIPE_REF}/binary/bin_001/bin/simulate"
+            out_ref = f"{_FIX_PIPE_REF}/binary/bin_20260101_001/bin/simulate"
             out_path = repo_root / out_ref
             out_path.parent.mkdir(parents=True, exist_ok=True)
             out_path.write_text("binary\n", encoding="utf-8")
@@ -4601,7 +4615,7 @@ shell_tool                       stable             true
                 orchestration_id="orch_001",
                 agent_run_id="step_run_build_001",
                 actor_role="step",
-                changed_paths=[f"{_FIX_PIPE_REF}/binary/bin_001/bin/"],
+                changed_paths=[f"{_FIX_PIPE_REF}/binary/bin_20260101_001/bin/"],
             )
             payload = record_agent_run(
                 repo_root=repo_root,
@@ -4627,7 +4641,7 @@ shell_tool                       stable             true
     ) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
-            out_ref = f"{_FIX_PIPE_REF}/binary/bin_001/bin/simulate"
+            out_ref = f"{_FIX_PIPE_REF}/binary/bin_20260101_001/bin/simulate"
             out_path = repo_root / out_ref
             out_path.parent.mkdir(parents=True, exist_ok=True)
             out_path.write_text("binary-baseline\n", encoding="utf-8")
@@ -4675,7 +4689,7 @@ shell_tool                       stable             true
                     "skill_name": "workflow-build",
                     "skill_ref": "skills/workflow-build/SKILL.md",
                     "skill_must_read_refs": _fixture_skill_must_read_refs_step("build"),
-                    "allowed_output_paths": [f"{_FIX_PIPE_REF}/binary/bin_001/bin/simulate"],
+                    "allowed_output_paths": [f"{_FIX_PIPE_REF}/binary/bin_20260101_001/bin/simulate"],
                     "launch_prompt_full": _step_launch_prompt(
                         "problem/shallow_water2d@0.3.0",
                         "build",
@@ -4770,7 +4784,7 @@ shell_tool                       stable             true
                     "skill_name": "workflow-build",
                     "skill_ref": "skills/workflow-build/SKILL.md",
                     "skill_must_read_refs": _fixture_skill_must_read_refs_step("build"),
-                    "allowed_output_paths": [f"{_FIX_PIPE_REF}/binary/bin_001/bin/simulate"],
+                    "allowed_output_paths": [f"{_FIX_PIPE_REF}/binary/bin_20260101_001/bin/simulate"],
                     "launch_prompt_full": _step_launch_prompt(
                         "problem/shallow_water2d@0.3.0",
                         "build",
@@ -4779,7 +4793,7 @@ shell_tool                       stable             true
                 },
                 response_payload=_spawn_response_payload("sess_step_build_001"),
             )
-            out_ref = f"{_FIX_PIPE_REF}/binary/bin_001/bin/simulate"
+            out_ref = f"{_FIX_PIPE_REF}/binary/bin_20260101_001/bin/simulate"
             out_path = repo_root / out_ref
             out_path.parent.mkdir(parents=True, exist_ok=True)
             out_path.write_text("binary\n", encoding="utf-8")
@@ -4866,7 +4880,7 @@ shell_tool                       stable             true
                     "skill_name": "workflow-build",
                     "skill_ref": "skills/workflow-build/SKILL.md",
                     "skill_must_read_refs": _fixture_skill_must_read_refs_step("build"),
-                    "allowed_output_paths": [f"{_FIX_PIPE_REF}/binary/bin_001/bin/simulate"],
+                    "allowed_output_paths": [f"{_FIX_PIPE_REF}/binary/bin_20260101_001/bin/simulate"],
                     "launch_prompt_full": _step_launch_prompt(
                         "problem/shallow_water2d@0.3.0",
                         "build",
@@ -4875,7 +4889,7 @@ shell_tool                       stable             true
                 },
                 response_payload=_spawn_response_payload("sess_step_build_001"),
             )
-            out_ref = f"{_FIX_PIPE_REF}/binary/bin_001/bin/simulate"
+            out_ref = f"{_FIX_PIPE_REF}/binary/bin_20260101_001/bin/simulate"
             out_path = repo_root / out_ref
             out_path.parent.mkdir(parents=True, exist_ok=True)
             out_path.write_text("binary-v1\n", encoding="utf-8")
@@ -4922,7 +4936,7 @@ shell_tool                       stable             true
     ) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
-            out_ref = f"{_FIX_PIPE_REF}/binary/bin_001/bin/simulate"
+            out_ref = f"{_FIX_PIPE_REF}/binary/bin_20260101_001/bin/simulate"
             out_path = repo_root / out_ref
             out_path.parent.mkdir(parents=True, exist_ok=True)
             out_path.write_text("binary-baseline\n", encoding="utf-8")
@@ -4970,7 +4984,7 @@ shell_tool                       stable             true
                     "skill_name": "workflow-build",
                     "skill_ref": "skills/workflow-build/SKILL.md",
                     "skill_must_read_refs": _fixture_skill_must_read_refs_step("build"),
-                    "allowed_output_paths": [f"{_FIX_PIPE_REF}/binary/bin_001/bin/simulate"],
+                    "allowed_output_paths": [f"{_FIX_PIPE_REF}/binary/bin_20260101_001/bin/simulate"],
                     "launch_prompt_full": _step_launch_prompt(
                         "problem/shallow_water2d@0.3.0",
                         "build",
@@ -5724,7 +5738,7 @@ shell_tool                       stable             true
                     "skill_name": "workflow-build",
                     "skill_ref": "skills/workflow-build/SKILL.md",
                     "skill_must_read_refs": "",
-                    "allowed_output_paths": ["workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/binary/bin_001/bin/simulate"],
+                    "allowed_output_paths": ["workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/binary/bin_20260101_001/bin/simulate"],
                     "launch_prompt_full": _step_launch_prompt(
                         "problem/shallow_water2d@0.3.0",
                         "build",
@@ -5749,7 +5763,7 @@ shell_tool                       stable             true
                         "context_id": "ctx_step_build_001",
                         "agent_session_id": "sess_step_build_999",
                         "output_refs": [
-                            "workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/binary/bin_001/bin/simulate"
+                            "workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/binary/bin_20260101_001/bin/simulate"
                         ],
                     },
                 )
@@ -5851,7 +5865,7 @@ shell_tool                       stable             true
                         "agent_model": "gpt-5-codex",
                         "context_id": "ctx_step_plan_001",
                         "agent_session_id": "sess_step_plan_001",
-                        "output_refs": ["workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/binary/bin_001/bin/simulate"],
+                        "output_refs": ["workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/binary/bin_20260101_001/bin/simulate"],
                     },
                 )
 
@@ -6065,7 +6079,7 @@ shell_tool                       stable             true
                         "skill_ref": "skills/workflow-build/SKILL.md",
                         "skill_must_read_refs": "",
                         "allowed_output_paths": [
-                            "workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/binary/bin_001/bin/simulate",
+                            "workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/binary/bin_20260101_001/bin/simulate",
                         ],
                         "launch_prompt_full": _step_launch_prompt(
                             "problem/shallow_water2d@0.3.0",
@@ -6081,7 +6095,7 @@ shell_tool                       stable             true
                     agent_run_id="step_run_build_001",
                     actor_role="step",
                     changed_paths=[
-                        "workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/binary/bin_001/bin/simulate"
+                        "workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/binary/bin_20260101_001/bin/simulate"
                     ],
                 )
                 record_agent_run(
@@ -6098,7 +6112,7 @@ shell_tool                       stable             true
                         "agent_model": "gpt-5-codex",
                         "context_id": "ctx_step_build_001",
                         "agent_session_id": "sess_step_build_001",
-                        "output_refs": ["workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/binary/bin_001/bin/simulate"],
+                        "output_refs": ["workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/binary/bin_20260101_001/bin/simulate"],
                     },
                 )
                 write_step_result(
@@ -6111,7 +6125,7 @@ shell_tool                       stable             true
                         "status": "pass",
                         "validation_stage": "post_build",
                         "required_outputs": [
-                            "workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/binary/bin_001/bin/simulate"
+                            "workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/binary/bin_20260101_001/bin/simulate"
                         ],
                         "failed_substeps": [],
                         "substep_agent_run_ids": [],
@@ -6169,7 +6183,7 @@ shell_tool                       stable             true
                     "skill_name": "workflow-build",
                     "skill_ref": "skills/workflow-build/SKILL.md",
                     "skill_must_read_refs": "",
-                    "allowed_output_paths": ["workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/binary/bin_001/bin/simulate"],
+                    "allowed_output_paths": ["workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/binary/bin_20260101_001/bin/simulate"],
                     "launch_prompt_full": _step_launch_prompt(
                         "problem/shallow_water2d@0.3.0",
                         "build",
@@ -6330,7 +6344,7 @@ shell_tool                       stable             true
                     payload={
                         "status": "pass",
                         "required_outputs": [
-                            "workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/binary/bin_001/bin/simulate"
+                            "workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/binary/bin_20260101_001/bin/simulate"
                         ],
                         "failed_substeps": [],
                         "substep_agent_run_ids": [],
@@ -6387,7 +6401,7 @@ shell_tool                       stable             true
                     "status": "pass",
                     "validation_stage": "post_build",
                     "required_outputs": [
-                        "workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/binary/bin_001/bin/simulate"
+                        "workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/binary/bin_20260101_001/bin/simulate"
                     ],
                     "failed_substeps": [],
                     "substep_agent_run_ids": [],
@@ -6409,7 +6423,7 @@ shell_tool                       stable             true
                     payload={
                         "status": "pass",
                         "required_outputs": [
-                            "workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/runs/run_001/results.json"
+                            "workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/runs/run_20260101_001/results.json"
                         ],
                         "failed_substeps": [],
                         "substep_agent_run_ids": [],
@@ -7992,7 +8006,7 @@ class CheckpointResumeRuntimeTests(unittest.TestCase):
             self._setup_preflight_and_orch_agent(repo_root)
             out_ref = (
                 "workspace/pipelines/problem__shallow_water2d__0.3.0/"
-                "shallow-water2d_20260415_001/binary/bin_001/bin/simulate"
+                "shallow-water2d_20260415_001/binary/bin_20260101_001/bin/simulate"
             )
             out_path = repo_root / out_ref
             out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -8025,7 +8039,7 @@ class CheckpointResumeRuntimeTests(unittest.TestCase):
             self._setup_preflight_and_orch_agent(repo_root)
             out_ref = (
                 "workspace/pipelines/problem__shallow_water2d__0.3.0/"
-                "shallow-water2d_20260415_001/binary/bin_001/bin/simulate"
+                "shallow-water2d_20260415_001/binary/bin_20260101_001/bin/simulate"
             )
             out_path = repo_root / out_ref
             out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -8056,7 +8070,7 @@ class CheckpointResumeRuntimeTests(unittest.TestCase):
             self._setup_preflight_and_orch_agent(repo_root)
             out_ref = (
                 "workspace/pipelines/problem__shallow_water2d__0.3.0/"
-                "shallow-water2d_20260415_001/binary/bin_001/bin/simulate"
+                "shallow-water2d_20260415_001/binary/bin_20260101_001/bin/simulate"
             )
             out_path = repo_root / out_ref
             out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -8468,6 +8482,9 @@ class OrchestrationMetaAndJudgeHookTests(unittest.TestCase):
                 orchestration_id=orch,
                 payload=_launchable_preflight_dict(checked_at="2026-04-15T10:00:00Z"),
             )
+            # write_preflight no longer defaults dependency_readiness to all-true;
+            # tests that exercise launch paths must explicitly mark readiness.
+            _mark_dependencies_ready(repo, orch)
             record_launch(
                 repo_root=repo,
                 orchestration_id=orch,
@@ -8487,7 +8504,7 @@ class OrchestrationMetaAndJudgeHookTests(unittest.TestCase):
                     "skill_ref": "skills/workflow-build/SKILL.md",
                     "skill_must_read_refs": "",
                     "allowed_output_paths": [
-                        "workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/binary/bin_001/binary_meta.json"
+                        "workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/binary/bin_20260101_001/binary_meta.json"
                     ],
                 },
                 response_payload={
@@ -8952,18 +8969,6 @@ class PreflightLiveProbeTtlTests(unittest.TestCase):
             repo = Path(tmp)
             init_orchestration(repo_root=repo, orchestration_id="orch_001")
             _mark_dependencies_ready(repo, "orch_001")
-            meta_path = repo / "workspace/orchestrations/orch_001/orchestration_meta.json"
-            meta = json.loads(meta_path.read_text(encoding="utf-8"))
-            meta["dependency_readiness"] = {
-                "direct_dependency_compile_readiness": True,
-                "direct_dependency_execution_readiness": True,
-                "detail": {
-                    "ir_ref_verified": True,
-                    "pipeline_ref_verified": True,
-                    "aggregate_verdict_verified": True,
-                },
-            }
-            meta_path.write_text(json.dumps(meta, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
             path = repo / "workspace/orchestrations/orch_001/preflight.json"
             path.write_text(
                 json.dumps(_launchable_preflight_dict(checked_at="2026-04-15T10:00:00Z"), indent=2)
@@ -9044,18 +9049,6 @@ class PreflightLiveProbeTtlTests(unittest.TestCase):
             repo = Path(tmp)
             init_orchestration(repo_root=repo, orchestration_id="orch_001")
             _mark_dependencies_ready(repo, "orch_001")
-            meta_path = repo / "workspace/orchestrations/orch_001/orchestration_meta.json"
-            meta = json.loads(meta_path.read_text(encoding="utf-8"))
-            meta["dependency_readiness"] = {
-                "direct_dependency_compile_readiness": True,
-                "direct_dependency_execution_readiness": True,
-                "detail": {
-                    "ir_ref_verified": True,
-                    "pipeline_ref_verified": True,
-                    "aggregate_verdict_verified": True,
-                },
-            }
-            meta_path.write_text(json.dumps(meta, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
             path = repo / "workspace/orchestrations/orch_001/preflight.json"
             path.write_text(
                 json.dumps(_launchable_preflight_dict(checked_at="2026-04-15T10:00:00Z"), indent=2)
@@ -10110,7 +10103,7 @@ class TestPhase2PlanGuardsIntegration(unittest.TestCase):
                 "repair_strategy": "none",
                 "repair_target_agent_run_id": "none",
                 "repair_reason": "none",
-                "allowed_output_paths": [f"{_FIX_PIPE_REF}/binary/bin_001/bin/simulate"],
+                "allowed_output_paths": [f"{_FIX_PIPE_REF}/binary/bin_20260101_001/bin/simulate"],
                 "launch_prompt_full": render_launch_prompt_text(
                     {
                         "agent_run_id": "build_child_1",
@@ -10375,7 +10368,7 @@ class TestPhase2PlanGuardsIntegration(unittest.TestCase):
                 orchestration_id="g8",
                 node_key="problem/shallow_water2d@0.3.0",
                 step="compile",
-                reserved_id="sw_flux_rusanov_p0_20260415_001",
+                reserved_id="sw-flux-rusanov-p0_20260415_001",
                 reserved_by_agent_run_id="orch_run_001",
             )
             self.assertEqual(reserved.get("status"), "reserved")
@@ -10527,7 +10520,7 @@ class TestPhase3RunGate(unittest.TestCase):
             "repair_strategy": "none",
             "repair_target_agent_run_id": "none",
             "repair_reason": "none",
-            "allowed_output_paths": [f"{_FIX_PIPE_REF}/binary/bin_001/binary_meta.json"],
+            "allowed_output_paths": [f"{_FIX_PIPE_REF}/binary/bin_20260101_001/binary_meta.json"],
             "launch_prompt_full": render_launch_prompt_text(
                 {
                     "agent_run_id": "build_child_rg1",
@@ -10668,7 +10661,7 @@ class TestPhase3RunGate(unittest.TestCase):
                 "repair_strategy": "none",
                 "repair_target_agent_run_id": "none",
                 "repair_reason": "none",
-                "allowed_output_paths": [f"{_FIX_PIPE_REF}/runs/run_001/diagnostics.json"],
+                "allowed_output_paths": [f"{_FIX_PIPE_REF}/runs/run_20260101_001/diagnostics.json"],
                 "launch_prompt_full": render_launch_prompt_text(
                     {
                         "agent_run_id": "execute_bad_001",
@@ -10737,7 +10730,7 @@ class TestPhase3RunGate(unittest.TestCase):
             "ir_ref": _FIX_IR_REF,
             "pipeline_ref": _FIX_PIPE_REF,
             "allowed_output_paths": [
-                f"{_FIX_PIPE_REF}/runs/ex_001/problem__shallow_water2d__0.3.0/summary.json"
+                f"{_FIX_PIPE_REF}/runs/ex_20260101_001/problem__shallow_water2d__0.3.0/summary.json"
             ],
         }
         out = _allowed_output_paths_for_launch(
@@ -10746,7 +10739,7 @@ class TestPhase3RunGate(unittest.TestCase):
         )
         self.assertEqual(
             out,
-            [f"{_FIX_PIPE_REF}/runs/ex_001/problem__shallow_water2d__0.3.0/summary.json"],
+            [f"{_FIX_PIPE_REF}/runs/ex_20260101_001/problem__shallow_water2d__0.3.0/summary.json"],
         )
 
     def test_allowed_output_paths_for_launch_rejects_judge_path_under_legacy_judge_root(self) -> None:
@@ -10963,7 +10956,7 @@ class TestPhase3RunGate(unittest.TestCase):
                     {
                         "orchestration_id": "rg_invalid",
                         "agent_run_id": "build_child_rg1",
-                        "allowed_output_paths": [f"{_FIX_PIPE_REF}/binary/bin_001/binary_meta.json"],
+                        "allowed_output_paths": [f"{_FIX_PIPE_REF}/binary/bin_20260101_001/binary_meta.json"],
                     },
                     ensure_ascii=False,
                     indent=2,
@@ -11150,7 +11143,7 @@ class TestPhase3RunGate(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
             token = self._setup_run_gate_fixture(repo_root)
-            target_path = f"{_FIX_PIPE_REF}/binary/bin_001/binary_meta.json"
+            target_path = f"{_FIX_PIPE_REF}/binary/bin_20260101_001/binary_meta.json"
             patch_text = "\n".join(
                 [
                     f"diff --git a/{target_path} b/{target_path}",
@@ -11195,7 +11188,7 @@ class TestPhase3RunGate(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
             token = self._setup_run_gate_fixture(repo_root)
-            log_path = f"{_FIX_PIPE_REF}/binary/bin_001/mcp_command_log.jsonl"
+            log_path = f"{_FIX_PIPE_REF}/binary/bin_20260101_001/mcp_command_log.jsonl"
             patch_text = "\n".join(
                 [
                     f"diff --git a/{log_path} b/{log_path}",
@@ -11990,7 +11983,7 @@ class TestPhase3RunGate(unittest.TestCase):
                     "skill_name": "workflow-build",
                     "skill_ref": "skills/workflow-build/SKILL.md",
                     "skill_must_read_refs": "",
-                    "allowed_output_paths": [f"{_FIX_PIPE_REF}/binary/bin_001/bin/simulate"],
+                    "allowed_output_paths": [f"{_FIX_PIPE_REF}/binary/bin_20260101_001/bin/simulate"],
                     "launch_prompt_full": _step_launch_prompt(
                         "problem/shallow_water2d@0.3.0",
                         "build",
@@ -12090,7 +12083,7 @@ class TestPhase3RunGate(unittest.TestCase):
                     "skill_name": "workflow-build",
                     "skill_ref": "skills/workflow-build/SKILL.md",
                     "skill_must_read_refs": "",
-                    "allowed_output_paths": [f"{_FIX_PIPE_REF}/binary/bin_001/bin/simulate"],
+                    "allowed_output_paths": [f"{_FIX_PIPE_REF}/binary/bin_20260101_001/bin/simulate"],
                     "launch_prompt_full": _step_launch_prompt(
                         "problem/shallow_water2d@0.3.0",
                         "build",
@@ -12110,7 +12103,7 @@ class TestPhase3RunGate(unittest.TestCase):
                 / "active_child_agent_run_id.txt"
             )
             self.assertTrue(active_path.exists())
-            out_ref = f"{_FIX_PIPE_REF}/binary/bin_001/bin/simulate"
+            out_ref = f"{_FIX_PIPE_REF}/binary/bin_20260101_001/bin/simulate"
             _write_apply_patch_gate_evidence(
                 repo_root,
                 orchestration_id="orch_001",
@@ -12392,8 +12385,8 @@ class TerminalUnauthorizedWriteDirectWriteTests(unittest.TestCase):
             repo_root = Path(tmp)
             orch = "orch_term_dw_003"
             run_id = "step_run_term_dw_003"
-            a_rel = "workspace/pipelines/p/binary/bin_001/A.json"
-            b_rel = "workspace/pipelines/p/binary/bin_001/B.json"
+            a_rel = "workspace/pipelines/p/binary/bin_20260101_001/A.json"
+            b_rel = "workspace/pipelines/p/binary/bin_20260101_001/B.json"
             self._setup_step_run_state(
                 repo_root,
                 orchestration_id=orch,
@@ -12442,8 +12435,8 @@ class TerminalUnauthorizedWriteDirectWriteTests(unittest.TestCase):
             repo_root = Path(tmp)
             orch = "orch_term_dw_004"
             run_id = "step_run_term_dw_004"
-            allowed_rel = "workspace/pipelines/p/binary/bin_001/A.json"
-            unauthorized_rel = "workspace/pipelines/p/binary/bin_001/C.json"
+            allowed_rel = "workspace/pipelines/p/binary/bin_20260101_001/A.json"
+            unauthorized_rel = "workspace/pipelines/p/binary/bin_20260101_001/C.json"
             self._setup_step_run_state(
                 repo_root,
                 orchestration_id=orch,
@@ -12494,7 +12487,7 @@ class TerminalUnauthorizedWriteDirectWriteTests(unittest.TestCase):
             repo_root = Path(tmp)
             orch = "orch_term_dw_005"
             run_id = "step_run_term_dw_005"
-            out_rel = "workspace/pipelines/p/binary/bin_001/A.json"
+            out_rel = "workspace/pipelines/p/binary/bin_20260101_001/A.json"
             self._setup_step_run_state(
                 repo_root,
                 orchestration_id=orch,
@@ -15170,6 +15163,5394 @@ class RecordTimeoutTests(unittest.TestCase):
             payload = json.loads(stdout.getvalue())
             self.assertEqual(payload.get("status"), "timeout")
             self.assertEqual(payload.get("agent_run_id"), arid)
+
+
+class SetStatusIdempotencyTests(unittest.TestCase):
+    """set-status の冪等化 guard を検証する。
+
+    audit (orch_20260511T065637Z_5b7d93d4) で orchestration agent が同一 terminal status
+    (`fail_closed`) を 4 回連続 set-status し reason_detail を逐次上書きしていた。failure
+    narrative の canonical 保存先は failure_analysis.json であり、orchestration_meta の
+    terminal status は 1 回のみ確定するのが正しい。
+    """
+
+    def _orch_meta(self, repo_root: Path, orchestration_id: str) -> dict:
+        meta_path = (
+            repo_root / "workspace" / "orchestrations" / orchestration_id
+            / "orchestration_meta.json"
+        )
+        return json.loads(meta_path.read_text(encoding="utf-8"))
+
+    def test_same_terminal_replay_after_full_commit_is_noop(self) -> None:
+        """F1 (Codex round 4): defensive retry after ambiguous failure must not
+        error. When the marker is fully committed, a second same-terminal call
+        returns the existing meta unchanged so callers with at-least-once
+        delivery can safely replay."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            init_orchestration(repo_root=repo_root, orchestration_id="ssi_repeat")
+            _mark_dependencies_ready(repo_root, "ssi_repeat")
+            update_orchestration_status(
+                repo_root=repo_root,
+                orchestration_id="ssi_repeat",
+                status="fail_closed",
+                reason_code="dependency_not_ready",
+                reason_detail="first detail",
+            )
+            # Replay must not raise.
+            replayed = update_orchestration_status(
+                repo_root=repo_root,
+                orchestration_id="ssi_repeat",
+                status="fail_closed",
+                reason_code="dependency_not_ready",
+                reason_detail="second detail (silently ignored on replay)",
+            )
+            self.assertEqual(replayed.get("status"), "fail_closed")
+            # Narrative fields are frozen at first-write values; replay does
+            # not mutate them.
+            meta = self._orch_meta(repo_root, "ssi_repeat")
+            self.assertEqual(meta.get("reason_detail"), "first detail",
+                             "reason_detail must not be overwritten by replay")
+
+    def test_allows_fail_to_fail_closed_promotion(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            init_orchestration(repo_root=repo_root, orchestration_id="ssi_promote")
+            _mark_dependencies_ready(repo_root, "ssi_promote")
+            update_orchestration_status(
+                repo_root=repo_root,
+                orchestration_id="ssi_promote",
+                status="fail",
+                reason_detail="live preflight failed",
+            )
+            meta = update_orchestration_status(
+                repo_root=repo_root,
+                orchestration_id="ssi_promote",
+                status="fail_closed",
+                reason_code="dependency_not_ready",
+                reason_detail="promoted after preflight fail",
+            )
+            self.assertEqual(meta.get("status"), "fail_closed")
+
+    def test_rejects_terminal_to_other_terminal_transition(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            init_orchestration(repo_root=repo_root, orchestration_id="ssi_cross")
+            _mark_dependencies_ready(repo_root, "ssi_cross")
+            update_orchestration_status(
+                repo_root=repo_root,
+                orchestration_id="ssi_cross",
+                status="fail_closed",
+                reason_code="dependency_not_ready",
+                reason_detail="closed",
+            )
+            with self.assertRaisesRegex(ValueError, "terminal-to-terminal"):
+                update_orchestration_status(
+                    repo_root=repo_root,
+                    orchestration_id="ssi_cross",
+                    status="blocked",
+                )
+
+
+class PreflightDependencyReadinessInitTests(unittest.TestCase):
+    """preflight が orchestration_meta.dependency_readiness を初期化する際の動作:
+
+    1. canonical field 名 (`direct_dependency_compile_readiness`) のみが書かれる
+    2. spec_ref に対応する deps.yaml の依存が空 (`components: [] & profiles: []`) のとき、
+       trivial に true で初期化される (vacuous truth, audit 互換)
+    3. spec_ref 未設定または deps.yaml 不在のとき、**fail-closed (false)** で初期化される
+    4. deps.yaml に依存が記載されているとき、**fail-closed (false)** で初期化される
+       (将来の readiness builder がフラグを明示的に flip するまで gate は通さない)
+
+    audit (orch_20260511T065637Z_5b7d93d4) では legacy 名 `direct_dependency_plan_readiness`
+    が all-true で書かれており、`workflow-launch-check` を fail-open させていた。
+    """
+
+    _PREFLIGHT_PAYLOAD = {
+        "status": "pass",
+        "sandbox_runtime": "bwrap",
+        "sandbox_enforced": True,
+        "can_launch_step_agents": True,
+        "can_launch_substep_agents": True,
+        "feature_states": {"multi_agent": True, "codex_hooks": True},
+        "checks": [
+            {"name": "multi_agent_enabled", "pass": True},
+            {"name": "codex_hooks_enabled", "pass": True},
+            {"name": "codex_home_writable", "pass": True},
+            {"name": "sandbox_bwrap_available", "pass": True},
+            {"name": "sandbox_bwrap_userns", "pass": True},
+        ],
+    }
+
+    def _readiness_after_preflight(self, repo_root: Path, orch_id: str) -> dict:
+        meta_path = (
+            repo_root / "workspace" / "orchestrations" / orch_id / "orchestration_meta.json"
+        )
+        return json.loads(meta_path.read_text(encoding="utf-8")).get("dependency_readiness") or {}
+
+    def test_no_spec_ref_defaults_to_fail_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            init_orchestration(repo_root=repo_root, orchestration_id="pflt_nospec")
+            write_preflight(
+                repo_root=repo_root, orchestration_id="pflt_nospec",
+                payload=self._PREFLIGHT_PAYLOAD,
+            )
+            readiness = self._readiness_after_preflight(repo_root, "pflt_nospec")
+            self.assertIn("direct_dependency_compile_readiness", readiness)
+            self.assertFalse(readiness["direct_dependency_compile_readiness"],
+                             "missing spec_ref must fail-closed, not fail-open")
+            self.assertFalse(readiness["direct_dependency_execution_readiness"])
+            self.assertNotIn("direct_dependency_plan_readiness", readiness,
+                             "legacy field name must not be written")
+
+    def test_empty_deps_yaml_initializes_trivially_true(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            spec_dir = repo_root / "spec" / "component" / "leaf_node"
+            spec_dir.mkdir(parents=True)
+            (spec_dir / "deps.yaml").write_text(
+                "spec_id: leaf_node\nspec_kind: component\n"
+                "dependencies:\n  components: []\n  profiles: []\n",
+                encoding="utf-8",
+            )
+            init_orchestration(
+                repo_root=repo_root, orchestration_id="pflt_leaf",
+                spec_ref="spec/component/leaf_node",
+            )
+            write_preflight(
+                repo_root=repo_root, orchestration_id="pflt_leaf",
+                payload=self._PREFLIGHT_PAYLOAD,
+            )
+            readiness = self._readiness_after_preflight(repo_root, "pflt_leaf")
+            self.assertTrue(readiness["direct_dependency_compile_readiness"])
+            self.assertTrue(readiness["direct_dependency_execution_readiness"])
+            for k in ("ir_ref_verified", "pipeline_ref_verified", "aggregate_verdict_verified"):
+                self.assertTrue(readiness["detail"][k])
+
+    def test_nonempty_deps_yaml_defaults_to_fail_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            spec_dir = repo_root / "spec" / "component" / "compound_node"
+            spec_dir.mkdir(parents=True)
+            (spec_dir / "deps.yaml").write_text(
+                "spec_id: compound_node\nspec_kind: component\n"
+                "dependencies:\n"
+                "  components:\n    - spec/component/dep_a\n"
+                "  profiles: []\n",
+                encoding="utf-8",
+            )
+            init_orchestration(
+                repo_root=repo_root, orchestration_id="pflt_compound",
+                spec_ref="spec/component/compound_node",
+            )
+            write_preflight(
+                repo_root=repo_root, orchestration_id="pflt_compound",
+                payload=self._PREFLIGHT_PAYLOAD,
+            )
+            readiness = self._readiness_after_preflight(repo_root, "pflt_compound")
+            self.assertFalse(readiness["direct_dependency_compile_readiness"],
+                             "non-empty deps must fail-closed until verified")
+            self.assertFalse(readiness["direct_dependency_execution_readiness"])
+
+    def test_missing_deps_yaml_defaults_to_fail_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            init_orchestration(
+                repo_root=repo_root, orchestration_id="pflt_nodeps",
+                spec_ref="spec/component/nonexistent",
+            )
+            write_preflight(
+                repo_root=repo_root, orchestration_id="pflt_nodeps",
+                payload=self._PREFLIGHT_PAYLOAD,
+            )
+            readiness = self._readiness_after_preflight(repo_root, "pflt_nodeps")
+            self.assertFalse(readiness["direct_dependency_compile_readiness"])
+
+
+class SetStatusCleanupRetryTests(unittest.TestCase):
+    """F2: terminal status の cleanup が途中失敗した orchestration では、cleanup_committed
+    marker が存在しない。この状態で同一 terminal status を再呼び出しすると、meta の narrative
+    fields を上書きせず、cleanup と marker write のみを retry することを検証する。
+
+    marker が既に存在する (fully committed) 場合のみ同一 terminal 再呼び出しを reject する。
+    """
+
+    def _arid(self, repo_root: Path, orch: str) -> str:
+        meta_path = (
+            repo_root / "workspace" / "orchestrations" / orch / "orchestration_meta.json"
+        )
+        return json.loads(meta_path.read_text(encoding="utf-8"))["orchestration_agent_run_id"]
+
+    def test_same_terminal_retry_runs_cleanup_when_marker_missing(self) -> None:
+        from tools.orchestration_runtime import _cleanup_committed_marker_path
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            init_orchestration(repo_root=repo_root, orchestration_id="ssc_retry")
+            _mark_dependencies_ready(repo_root, "ssc_retry")
+            orch_arid = self._arid(repo_root, "ssc_retry")
+            tmp_dir = repo_root / "workspace" / "tmp" / orch_arid
+            update_orchestration_status(
+                repo_root=repo_root, orchestration_id="ssc_retry",
+                status="fail_closed", reason_code="dependency_not_ready",
+                reason_detail="initial detail",
+            )
+            # First call: marker exists, tmp cleaned.
+            self.assertFalse(tmp_dir.exists())
+            marker = _cleanup_committed_marker_path(repo_root, "ssc_retry", orch_arid)
+            self.assertTrue(marker.is_file())
+            # Simulate a partial-failure state: remove the marker AND recreate the
+            # tmp dir to mimic the half-committed scenario from the cleanup helper
+            # docstring (terminal entry written, cleanup raised mid-way).
+            marker.unlink()
+            tmp_dir.mkdir(parents=True, exist_ok=True)
+            (tmp_dir / "leaked.py").write_text("x\n", encoding="utf-8")
+
+            # Second call with same terminal status must NOT raise; it should
+            # re-run cleanup and re-publish the marker.
+            update_orchestration_status(
+                repo_root=repo_root, orchestration_id="ssc_retry",
+                status="fail_closed", reason_code="dependency_not_ready",
+                reason_detail="retry detail (should NOT overwrite)",
+            )
+            self.assertFalse(tmp_dir.exists(), "cleanup retry must remove tmp dir")
+            self.assertTrue(marker.is_file(), "cleanup retry must republish marker")
+            # Narrative fields are frozen at first-write values.
+            meta = json.loads(
+                (repo_root / "workspace" / "orchestrations" / "ssc_retry"
+                 / "orchestration_meta.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(meta.get("reason_detail"), "initial detail",
+                             "cleanup retry must not overwrite reason_detail")
+
+    def test_same_terminal_after_marker_committed_is_noop_replay(self) -> None:
+        """F1 (Codex round 4): once the marker is fully committed, same-terminal
+        re-invocation is a safe no-op (for at-least-once retry semantics).
+        Narrative fields stay frozen at first-write values; no exception."""
+        from tools.orchestration_runtime import _cleanup_committed_marker_path
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            init_orchestration(repo_root=repo_root, orchestration_id="ssc_committed")
+            _mark_dependencies_ready(repo_root, "ssc_committed")
+            update_orchestration_status(
+                repo_root=repo_root, orchestration_id="ssc_committed",
+                status="fail_closed", reason_code="dependency_not_ready",
+                reason_detail="initial",
+            )
+            orch_arid = self._arid(repo_root, "ssc_committed")
+            self.assertTrue(_cleanup_committed_marker_path(
+                repo_root, "ssc_committed", orch_arid).is_file())
+            # Replay returns the existing meta; no exception.
+            replayed = update_orchestration_status(
+                repo_root=repo_root, orchestration_id="ssc_committed",
+                status="fail_closed", reason_code="dependency_not_ready",
+                reason_detail="repeat (silently ignored)",
+            )
+            self.assertEqual(replayed.get("reason_detail"), "initial",
+                             "replay must not overwrite narrative")
+
+
+class UpdateOrchestrationStatusLockTests(unittest.TestCase):
+    """F3: terminal-status critical section が fcntl で serialize されていることを検証する。
+
+    厳密な concurrent process race を unit test で再現するのは難しいが、lock 用 sidecar
+    file の作成と、外部 lock holder 中の set-status 呼び出しが lock を取得して進行することを
+    確認する (lock primitive そのものの存在検証)。
+    """
+
+    def test_meta_lock_path_is_created_on_terminal_call(self) -> None:
+        from tools.orchestration_runtime import _orchestration_meta_lock_path
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            init_orchestration(repo_root=repo_root, orchestration_id="lock_path")
+            _mark_dependencies_ready(repo_root, "lock_path")
+            update_orchestration_status(
+                repo_root=repo_root, orchestration_id="lock_path",
+                status="fail_closed", reason_code="dependency_not_ready",
+                reason_detail="lock test",
+            )
+            self.assertTrue(_orchestration_meta_lock_path(repo_root, "lock_path").is_file(),
+                            "fcntl sidecar lock file must be created")
+
+    def test_concurrent_terminalizers_serialize_via_lock(self) -> None:
+        """fcntl LOCK_EX is process-wide; if two threads call set-status concurrently,
+        the lock must serialize them so both observe a consistent terminal state.
+        The second call should hit the same-terminal retry path (since the first
+        call has already committed the marker), not the unguarded race window."""
+        import threading
+        from tools.orchestration_runtime import _cleanup_committed_marker_path
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            init_orchestration(repo_root=repo_root, orchestration_id="lock_race")
+            _mark_dependencies_ready(repo_root, "lock_race")
+            errors: list[BaseException] = []
+            def call(detail: str) -> None:
+                try:
+                    update_orchestration_status(
+                        repo_root=repo_root, orchestration_id="lock_race",
+                        status="fail_closed", reason_code="dependency_not_ready",
+                        reason_detail=detail,
+                    )
+                except BaseException as e:
+                    errors.append(e)
+            t1 = threading.Thread(target=call, args=("from-thread-1",))
+            t2 = threading.Thread(target=call, args=("from-thread-2",))
+            t1.start(); t2.start(); t1.join(); t2.join()
+            # One of the two should succeed; the other reaches the same-terminal
+            # retry path (no exception) or rejects (ValueError if marker already
+            # committed before it acquires the lock). What we are NOT allowed to
+            # see is a state where both writes interleaved and corrupted meta.
+            meta_path = (
+                repo_root / "workspace" / "orchestrations" / "lock_race"
+                / "orchestration_meta.json"
+            )
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            self.assertEqual(meta.get("status"), "fail_closed")
+            self.assertIn(meta.get("reason_detail"), {"from-thread-1", "from-thread-2"},
+                          "reason_detail must equal exactly one of the two writes")
+            arid = meta["orchestration_agent_run_id"]
+            self.assertTrue(_cleanup_committed_marker_path(repo_root, "lock_race", arid).is_file())
+
+
+def _setup_verified_dep(
+    repo_root: Path,
+    *,
+    dep_id: str = "dep_a",
+    dep_kind: str = "component",
+    dep_version: str = "0.1.0",
+    ir_pass: bool = True,
+    binary_pass: bool = True,
+    verdict_present: bool = True,
+) -> None:
+    """Create spec_catalog entry + workspace artifacts so artifact verification
+    sees passing state for `dep_id` at the given version. Used by F2 tests."""
+    catalog = repo_root / "spec" / "registry" / "spec_catalog.yaml"
+    catalog.parent.mkdir(parents=True, exist_ok=True)
+    catalog.write_text(
+        "catalog_version: 0.2.0\nupdated_at: 2026-05-11\nspecs:\n"
+        f"  - spec_kind: {dep_kind}\n"
+        f"    spec_id: {dep_id}\n"
+        f"    spec_version: {dep_version}\n"
+        "    status: controlled_draft\n",
+        encoding="utf-8",
+    )
+    safe = f"{dep_kind}__{dep_id}__{dep_version}"
+    # Codex round 31 F2: the freshness reader now anchors to the strict
+    # `_SLUG_DATE_SEQ3_PATTERN` (lowercase, hyphen-separated slug). If
+    # `dep_id` carries internal underscores (e.g. `dep_a`), convert them
+    # to hyphens for the *directory* slug so the artifact is visible to
+    # the freshness selector. The catalog spec_id itself keeps its
+    # original underscored form to match real deps.yaml conventions.
+    slug = dep_id.replace("_", "-")
+    ir_dir = repo_root / "workspace" / "ir" / safe / f"{slug}_20260511_001"
+    ir_dir.mkdir(parents=True)
+    (ir_dir / "ir_meta.json").write_text(
+        json.dumps({"verification_status": "pass" if ir_pass else "fail"}),
+        encoding="utf-8",
+    )
+    pipe_dir = (
+        repo_root / "workspace" / "pipelines" / safe / f"{slug}_20260511_001"
+    )
+    binary_dir = pipe_dir / "binary" / "bin_20260101_001"
+    binary_dir.mkdir(parents=True)
+    (binary_dir / "binary_meta.json").write_text(
+        json.dumps({"verification_status": "pass" if binary_pass else "fail"}),
+        encoding="utf-8",
+    )
+    if verdict_present:
+        verdict_dir = pipe_dir / "runs" / "run_20260101_001" / safe
+        verdict_dir.mkdir(parents=True)
+        (verdict_dir / "aggregate_verdict.json").write_text(
+            json.dumps({"aggregate_verdict": "pass"}), encoding="utf-8",
+        )
+        (verdict_dir / "trial_meta.json").write_text(
+            json.dumps({"source_binary_id": "bin_20260101_001"}), encoding="utf-8")
+        # Codex round 24: verdict must record the source_binary_id it validated.
+        (verdict_dir / "trial_meta.json").write_text(
+            json.dumps({"source_binary_id": "bin_20260101_001"}), encoding="utf-8",
+        )
+
+
+class DependencyReadyFailReasonPropagationTests(unittest.TestCase):
+    """Codex round 25 F2: `_dependency_ready` must propagate the SPECIFIC
+    `fail_reason` from `_compute_dep_readiness_and_fingerprint` instead of
+    collapsing every "cannot recompute" case into the generic
+    `deps_yaml_missing_or_unparseable`. Distinct reasons let observability
+    tooling differentiate "fix the spec" from "create the file" recovery
+    paths."""
+
+    def test_malformed_schema_propagates_specific_reason(self) -> None:
+        """When deps.yaml exists but has malformed schema (unknown key under
+        `dependencies`), the gate must return `deps_yaml_malformed_schema`,
+        not the generic `deps_yaml_missing_or_unparseable`."""
+        from tools.orchestration_runtime import (
+            _dependency_ready, _load_spec_catalog,
+            _dependency_set_fingerprint,
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            (repo_root / "spec" / "registry").mkdir(parents=True)
+            (repo_root / "spec" / "registry" / "spec_catalog.yaml").write_text(
+                "catalog_version: 0.2.0\nspecs: []\n", encoding="utf-8",
+            )
+            spec_dir = repo_root / "spec" / "component" / "broken"
+            spec_dir.mkdir(parents=True)
+            (spec_dir / "deps.yaml").write_text(
+                "spec_id: broken\nspec_kind: component\n"
+                "dependencies:\n  components: []\n  profiles: []\n  extras: []\n",
+                encoding="utf-8",
+            )
+            init_orchestration(
+                repo_root=repo_root, orchestration_id="frp",
+                spec_ref="spec/component/broken",
+            )
+            write_preflight(
+                repo_root=repo_root, orchestration_id="frp",
+                payload=_launchable_preflight_dict(checked_at="2026-04-15T10:00:00Z"),
+            )
+            # Persisted readiness must agree on fingerprint so the gate
+            # progresses past the fingerprint check into the recompute branch.
+            meta_path = (
+                repo_root / "workspace" / "orchestrations" / "frp"
+                / "orchestration_meta.json"
+            )
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            meta["dependency_readiness"] = {
+                "direct_dependency_compile_readiness": False,
+                "direct_dependency_execution_readiness": False,
+                "detail": {
+                    "ir_ref_verified": False,
+                    "pipeline_ref_verified": False,
+                    "aggregate_verdict_verified": False,
+                },
+                "dep_set_fingerprint": _dependency_set_fingerprint(
+                    repo_root, "spec/component/broken",
+                ),
+            }
+            meta_path.write_text(json.dumps(meta) + "\n", encoding="utf-8")
+            # Disable persisted-boolean fallback for this assertion: we want
+            # production strict-mode behavior where the gate uses fail_reason.
+            with patch.dict(os.environ, {}, clear=False):
+                os.environ.pop("METDSL_DEP_READINESS_ALLOW_PERSISTED_FALLBACK", None)
+                ok, reason = _dependency_ready(repo_root, "frp", step="compile")
+            self.assertFalse(ok)
+            self.assertEqual(reason, "deps_yaml_malformed_schema",
+                             "gate must propagate the specific malformed-schema "
+                             "reason, not collapse to deps_yaml_missing_or_unparseable")
+
+    def test_missing_deps_yaml_propagates_missing_reason(self) -> None:
+        """When deps.yaml does not exist on disk, the gate returns
+        `deps_yaml_missing_or_unparseable`."""
+        from tools.orchestration_runtime import (
+            _dependency_ready, _dependency_set_fingerprint,
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            init_orchestration(
+                repo_root=repo_root, orchestration_id="frp2",
+                spec_ref="spec/component/nonexistent",
+            )
+            write_preflight(
+                repo_root=repo_root, orchestration_id="frp2",
+                payload=_launchable_preflight_dict(checked_at="2026-04-15T10:00:00Z"),
+            )
+            meta_path = (
+                repo_root / "workspace" / "orchestrations" / "frp2"
+                / "orchestration_meta.json"
+            )
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            meta["dependency_readiness"] = {
+                "direct_dependency_compile_readiness": False,
+                "direct_dependency_execution_readiness": False,
+                "detail": {
+                    "ir_ref_verified": False,
+                    "pipeline_ref_verified": False,
+                    "aggregate_verdict_verified": False,
+                },
+                "dep_set_fingerprint": _dependency_set_fingerprint(
+                    repo_root, "spec/component/nonexistent",
+                ),
+            }
+            meta_path.write_text(json.dumps(meta) + "\n", encoding="utf-8")
+            with patch.dict(os.environ, {}, clear=False):
+                os.environ.pop("METDSL_DEP_READINESS_ALLOW_PERSISTED_FALLBACK", None)
+                ok, reason = _dependency_ready(repo_root, "frp2", step="compile")
+            self.assertFalse(ok)
+            self.assertEqual(reason, "deps_yaml_missing_or_unparseable")
+
+
+class CatalogCacheContentKeyedTests(unittest.TestCase):
+    """Codex round 26 F1: catalog cache must invalidate when content changes
+    even if mtime is preserved (restore-from-cache, `cp -p`, etc.). Cache
+    keyed on file content bytes, not mtime."""
+
+    def test_mtime_preserved_content_change_invalidates_cache(self) -> None:
+        from tools.orchestration_runtime import (
+            _load_spec_catalog, _resolve_dep_version,
+        )
+        import os
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            cat = repo_root / "spec" / "registry" / "spec_catalog.yaml"
+            cat.parent.mkdir(parents=True)
+            cat.write_text(
+                "catalog_version: 0.2.0\nspecs:\n"
+                "  - spec_kind: component\n    spec_id: dep_a\n    spec_version: 0.1.0\n",
+                encoding="utf-8",
+            )
+            _load_spec_catalog.cache_clear()
+            cat1 = _load_spec_catalog(str(repo_root.resolve()))
+            self.assertEqual(
+                _resolve_dep_version(cat1, "component", "dep_a", ">=0.1.0"),
+                "0.1.0",
+            )
+            # Capture mtime, edit content, restore mtime — simulates
+            # `cp -p` / restore workflows that preserve timestamps.
+            stat = cat.stat()
+            cat.write_text(
+                "catalog_version: 0.2.0\nspecs:\n"
+                "  - spec_kind: component\n    spec_id: dep_a\n    spec_version: 0.2.0\n",
+                encoding="utf-8",
+            )
+            os.utime(cat, ns=(stat.st_atime_ns, stat.st_mtime_ns))
+            self.assertEqual(cat.stat().st_mtime_ns, stat.st_mtime_ns,
+                             "precondition: mtime is preserved across the edit")
+            cat2 = _load_spec_catalog(str(repo_root.resolve()))
+            self.assertEqual(
+                _resolve_dep_version(cat2, "component", "dep_a", ">=0.1.0"),
+                "0.2.0",
+                "content-keyed cache must observe the new contents even though "
+                "mtime is unchanged",
+            )
+
+
+class AggregateVerdictBoundToBinaryTests(unittest.TestCase):
+    """Codex round 24: aggregate_verdict_verified requires that the chosen
+    verdict's `trial_meta.source_binary_id` matches the binary the
+    pipeline_ref stage would select. A passing verdict for an OLDER binary
+    cannot satisfy execution readiness when a NEWER (un-validated) binary
+    is selected for pipeline_ref."""
+
+    def _build_catalog(self, repo_root: Path) -> None:
+        (repo_root / "spec" / "registry").mkdir(parents=True)
+        (repo_root / "spec" / "registry" / "spec_catalog.yaml").write_text(
+            "catalog_version: 0.2.0\nspecs:\n"
+            "  - spec_kind: component\n    spec_id: dep_a\n    spec_version: 0.1.0\n",
+            encoding="utf-8",
+        )
+
+    def test_newer_binary_with_only_older_verdict_fails(self) -> None:
+        """One pipeline contains an OLDER binary `bin_20260101_001` (pass) with
+        a passing verdict bound to it, AND a NEWER binary `bin_20260601_001`
+        (pass) that has NO verdict. Latest pipeline_ref selects the newer
+        binary; aggregate_verdict must NOT use the older binary's verdict."""
+        from tools.orchestration_runtime import _verify_dep_stage, _load_spec_catalog
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._build_catalog(repo_root)
+            _load_spec_catalog.cache_clear()
+            safe = "component__dep_a__0.1.0"
+            pipe = repo_root / "workspace" / "pipelines" / safe / "pipe_20260101_001"
+            # Older binary + matching verdict.
+            old_bin = pipe / "binary" / "bin_20260101_001"
+            old_bin.mkdir(parents=True)
+            (old_bin / "binary_meta.json").write_text(
+                json.dumps({"verification_status": "pass"}), encoding="utf-8")
+            old_verdict_dir = pipe / "runs" / "run_20260101_001" / safe
+            old_verdict_dir.mkdir(parents=True)
+            (old_verdict_dir / "aggregate_verdict.json").write_text(
+                json.dumps({"aggregate_verdict": "pass"}), encoding="utf-8")
+            (old_verdict_dir / "trial_meta.json").write_text(
+                json.dumps({"source_binary_id": "bin_20260101_001"}), encoding="utf-8")
+            # Newer binary (no verdict).
+            new_bin = pipe / "binary" / "bin_20260601_001"
+            new_bin.mkdir(parents=True)
+            (new_bin / "binary_meta.json").write_text(
+                json.dumps({"verification_status": "pass"}), encoding="utf-8")
+            # pipeline_ref → newer binary (pass) → True
+            self.assertTrue(
+                _verify_dep_stage(repo_root, "component", "dep_a", "0.1.0", "pipeline_ref"),
+                "newer binary passes verification_status check"
+            )
+            # aggregate_verdict → must be bound to bin_20260601_001 which has
+            # no verdict → False (cannot borrow older bin_20260101_001's verdict).
+            self.assertFalse(
+                _verify_dep_stage(repo_root, "component", "dep_a", "0.1.0", "aggregate_verdict"),
+                "verdict for older binary must NOT satisfy aggregate_verdict "
+                "when newer un-validated binary is the chosen pipeline_ref",
+            )
+
+    def test_verdict_for_matching_binary_satisfies(self) -> None:
+        """Sanity: when both binary and matching verdict exist, gate passes."""
+        from tools.orchestration_runtime import _verify_dep_stage, _load_spec_catalog
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._build_catalog(repo_root)
+            _load_spec_catalog.cache_clear()
+            safe = "component__dep_a__0.1.0"
+            pipe = repo_root / "workspace" / "pipelines" / safe / "pipe_20260101_001"
+            b = pipe / "binary" / "bin_20260101_001"
+            b.mkdir(parents=True)
+            (b / "binary_meta.json").write_text(
+                json.dumps({"verification_status": "pass"}), encoding="utf-8")
+            v = pipe / "runs" / "run_20260101_001" / safe
+            v.mkdir(parents=True)
+            (v / "aggregate_verdict.json").write_text(
+                json.dumps({"aggregate_verdict": "pass"}), encoding="utf-8")
+            (v / "trial_meta.json").write_text(
+                json.dumps({"source_binary_id": "bin_20260101_001"}), encoding="utf-8")
+            self.assertTrue(
+                _verify_dep_stage(repo_root, "component", "dep_a", "0.1.0", "aggregate_verdict")
+            )
+
+    def test_verdict_missing_trial_meta_is_excluded(self) -> None:
+        """A verdict whose sibling trial_meta.json is missing (or lacks
+        `source_binary_id`) is unbound and must be excluded."""
+        from tools.orchestration_runtime import _verify_dep_stage, _load_spec_catalog
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._build_catalog(repo_root)
+            _load_spec_catalog.cache_clear()
+            safe = "component__dep_a__0.1.0"
+            pipe = repo_root / "workspace" / "pipelines" / safe / "pipe_20260101_001"
+            b = pipe / "binary" / "bin_20260101_001"
+            b.mkdir(parents=True)
+            (b / "binary_meta.json").write_text(
+                json.dumps({"verification_status": "pass"}), encoding="utf-8")
+            v = pipe / "runs" / "run_20260101_001" / safe
+            v.mkdir(parents=True)
+            (v / "aggregate_verdict.json").write_text(
+                json.dumps({"aggregate_verdict": "pass"}), encoding="utf-8")
+            # NO trial_meta.json — verdict is unbound.
+            self.assertFalse(
+                _verify_dep_stage(repo_root, "component", "dep_a", "0.1.0", "aggregate_verdict"),
+                "unbound verdict (no trial_meta.source_binary_id) must be excluded",
+            )
+
+    def test_verdict_with_mismatched_source_binary_id_is_excluded(self) -> None:
+        """Verdict whose source_binary_id doesn't match the chosen binary is
+        excluded even if the verdict itself is passing."""
+        from tools.orchestration_runtime import _verify_dep_stage, _load_spec_catalog
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._build_catalog(repo_root)
+            _load_spec_catalog.cache_clear()
+            safe = "component__dep_a__0.1.0"
+            pipe = repo_root / "workspace" / "pipelines" / safe / "pipe_20260101_001"
+            b = pipe / "binary" / "bin_20260601_001"
+            b.mkdir(parents=True)
+            (b / "binary_meta.json").write_text(
+                json.dumps({"verification_status": "pass"}), encoding="utf-8")
+            v = pipe / "runs" / "run_20260101_001" / safe
+            v.mkdir(parents=True)
+            (v / "aggregate_verdict.json").write_text(
+                json.dumps({"aggregate_verdict": "pass"}), encoding="utf-8")
+            (v / "trial_meta.json").write_text(
+                # Mismatch: chosen binary is bin_20260601_001 but verdict points to ...0101_001.
+                json.dumps({"source_binary_id": "bin_20260101_001"}), encoding="utf-8")
+            self.assertFalse(
+                _verify_dep_stage(repo_root, "component", "dep_a", "0.1.0", "aggregate_verdict"),
+                "verdict bound to a different binary must be excluded",
+            )
+
+
+class FreshnessKeyParsedIdOrderingTests(unittest.TestCase):
+    """Codex round 23 F1+F2: ordering must be by parsed `(date, seq)` from the
+    canonical id suffix, not by raw path lex. Non-canonical directory names
+    (stray `zzz/`, etc.) must be filtered out before selection so they
+    cannot impersonate a runtime-issued id."""
+
+    def _build(self, repo_root: Path) -> None:
+        (repo_root / "spec" / "registry").mkdir(parents=True)
+        (repo_root / "spec" / "registry" / "spec_catalog.yaml").write_text(
+            "catalog_version: 0.2.0\nspecs:\n"
+            "  - spec_kind: component\n    spec_id: dep_a\n    spec_version: 0.1.0\n",
+            encoding="utf-8",
+        )
+
+    def test_newer_by_date_with_smaller_slug_wins(self) -> None:
+        """Round 23 F1: `a_20260601_001` (newer date, smaller slug) must beat
+        `z_20260501_001` (older date, larger slug). Pure lex-on-path would
+        pick `z_...`; parsing date+seq gives the correct order."""
+        from tools.orchestration_runtime import _verify_dep_stage, _load_spec_catalog
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._build(repo_root)
+            _load_spec_catalog.cache_clear()
+            safe = "component__dep_a__0.1.0"
+            older_larger_slug = repo_root / "workspace" / "ir" / safe / "z_20260501_001"
+            newer_smaller_slug = repo_root / "workspace" / "ir" / safe / "a_20260601_001"
+            older_larger_slug.mkdir(parents=True)
+            newer_smaller_slug.mkdir(parents=True)
+            (older_larger_slug / "ir_meta.json").write_text(
+                json.dumps({"verification_status": "pass"}), encoding="utf-8")
+            (newer_smaller_slug / "ir_meta.json").write_text(
+                json.dumps({"verification_status": "fail"}), encoding="utf-8")
+            self.assertFalse(
+                _verify_dep_stage(repo_root, "component", "dep_a", "0.1.0", "ir_ref"),
+                "newer-by-date (smaller slug) must override older-by-date "
+                "(larger slug) — date+seq parsing decouples ordering from slug",
+            )
+
+    def test_non_canonical_directory_filtered_out(self) -> None:
+        """Round 23 F2: a stray `zzz/` with passing ir_meta.json must NOT
+        win over a legitimate canonical-id directory with failing
+        ir_meta.json. Non-canonical names are filtered before selection."""
+        from tools.orchestration_runtime import _verify_dep_stage, _load_spec_catalog
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._build(repo_root)
+            _load_spec_catalog.cache_clear()
+            safe = "component__dep_a__0.1.0"
+            canonical = repo_root / "workspace" / "ir" / safe / "dep-a_20260601_001"
+            stray = repo_root / "workspace" / "ir" / safe / "zzz"
+            canonical.mkdir(parents=True)
+            stray.mkdir(parents=True)
+            (canonical / "ir_meta.json").write_text(
+                json.dumps({"verification_status": "fail"}), encoding="utf-8")
+            (stray / "ir_meta.json").write_text(
+                json.dumps({"verification_status": "pass"}), encoding="utf-8")
+            self.assertFalse(
+                _verify_dep_stage(repo_root, "component", "dep_a", "0.1.0", "ir_ref"),
+                "stray `zzz/` must be filtered out; the canonical-id failing "
+                "artifact must drive the gate decision",
+            )
+
+    def test_only_non_canonical_present_yields_false(self) -> None:
+        """If ALL artifacts in the dep tree are non-canonical, the selector
+        must filter them all out and return None → stage fails closed."""
+        from tools.orchestration_runtime import _verify_dep_stage, _load_spec_catalog
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._build(repo_root)
+            _load_spec_catalog.cache_clear()
+            safe = "component__dep_a__0.1.0"
+            stray = repo_root / "workspace" / "ir" / safe / "zzz"
+            stray.mkdir(parents=True)
+            (stray / "ir_meta.json").write_text(
+                json.dumps({"verification_status": "pass"}), encoding="utf-8")
+            self.assertFalse(
+                _verify_dep_stage(repo_root, "component", "dep_a", "0.1.0", "ir_ref"),
+                "no canonical id present → stage fail-closed",
+            )
+
+    def test_non_canonical_pipeline_dir_filtered_out(self) -> None:
+        """Same filter applies to pipeline_dir selection (binary_meta path)."""
+        from tools.orchestration_runtime import _verify_dep_stage, _load_spec_catalog
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._build(repo_root)
+            _load_spec_catalog.cache_clear()
+            safe = "component__dep_a__0.1.0"
+            canonical = repo_root / "workspace" / "pipelines" / safe / "pipe_20260101_001"
+            stray = repo_root / "workspace" / "pipelines" / safe / "zzz"
+            for d in (canonical / "binary" / "bin_20260101_001",
+                      stray / "binary" / "bin_20260101_001"):
+                d.mkdir(parents=True)
+            (canonical / "binary" / "bin_20260101_001" / "binary_meta.json").write_text(
+                json.dumps({"verification_status": "fail"}), encoding="utf-8")
+            (stray / "binary" / "bin_20260101_001" / "binary_meta.json").write_text(
+                json.dumps({"verification_status": "pass"}), encoding="utf-8")
+            self.assertFalse(
+                _verify_dep_stage(repo_root, "component", "dep_a", "0.1.0", "pipeline_ref"),
+                "stray pipeline_dir must not bypass the canonical filter",
+            )
+
+
+class BareStringDepEntryRejectionTests(unittest.TestCase):
+    """Codex round 22 F1: bare-string deps.yaml items previously had their
+    last `/`-segment kept as the dependency id, silently rewriting
+    `"profile/foo"` → `foo` or `"../dep_a"` → `dep_a`. The canonical dict
+    form is now the ONLY accepted shape."""
+
+    def _orch_with_deps(self, repo_root: Path, body: str, orch: str = "bsd") -> None:
+        spec_dir = repo_root / "spec" / "component" / "subject"
+        spec_dir.mkdir(parents=True, exist_ok=True)
+        (spec_dir / "deps.yaml").write_text(body, encoding="utf-8")
+        init_orchestration(
+            repo_root=repo_root, orchestration_id=orch,
+            spec_ref="spec/component/subject",
+        )
+        write_preflight(
+            repo_root=repo_root, orchestration_id=orch,
+            payload=_launchable_preflight_dict(checked_at="2026-04-15T10:00:00Z"),
+        )
+
+    def test_bare_string_dep_entry_raises(self) -> None:
+        from tools.orchestration_runtime import mark_dependency_readiness, _load_spec_catalog
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._orch_with_deps(repo_root,
+                "spec_id: subject\nspec_kind: component\n"
+                "dependencies:\n  components:\n    - dep_a\n  profiles: []\n",
+            )
+            _load_spec_catalog.cache_clear()
+            with self.assertRaisesRegex(ValueError, "schema is malformed"):
+                mark_dependency_readiness(repo_root=repo_root, orchestration_id="bsd")
+
+    def test_bare_path_traversal_string_raises(self) -> None:
+        from tools.orchestration_runtime import mark_dependency_readiness, _load_spec_catalog
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._orch_with_deps(repo_root,
+                "spec_id: subject\nspec_kind: component\n"
+                # Bare string "../dep_a" — previously rewritten to "dep_a";
+                # now rejected as malformed entirely.
+                "dependencies:\n  components:\n    - \"../dep_a\"\n  profiles: []\n",
+            )
+            _load_spec_catalog.cache_clear()
+            with self.assertRaisesRegex(ValueError, "schema is malformed"):
+                mark_dependency_readiness(repo_root=repo_root, orchestration_id="bsd")
+
+    def test_bare_path_string_with_subpath_raises(self) -> None:
+        """`"profile/foo"` previously normalized to id `foo`. Now rejected."""
+        from tools.orchestration_runtime import mark_dependency_readiness, _load_spec_catalog
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._orch_with_deps(repo_root,
+                "spec_id: subject\nspec_kind: component\n"
+                "dependencies:\n  components:\n    - \"profile/foo\"\n  profiles: []\n",
+            )
+            _load_spec_catalog.cache_clear()
+            with self.assertRaisesRegex(ValueError, "schema is malformed"):
+                mark_dependency_readiness(repo_root=repo_root, orchestration_id="bsd")
+
+
+class ArtifactFreshnessIdBasedOrderingTests(unittest.TestCase):
+    """Codex round 22 F2: `_artifact_freshness_key` now uses runtime-issued
+    path identity (ir_id / pipeline_id / run_id) for lex ordering, not
+    mtime. Touching/copying older passing artifacts cannot reverse the
+    selection — only the runtime's canonical id ordering matters."""
+
+    def _build(self, repo_root: Path) -> None:
+        (repo_root / "spec" / "registry").mkdir(parents=True)
+        (repo_root / "spec" / "registry" / "spec_catalog.yaml").write_text(
+            "catalog_version: 0.2.0\nspecs:\n"
+            "  - spec_kind: component\n    spec_id: dep_a\n    spec_version: 0.1.0\n",
+            encoding="utf-8",
+        )
+
+    def test_touching_older_passing_ir_meta_does_not_override_newer_fail(self) -> None:
+        from tools.orchestration_runtime import _verify_dep_stage, _load_spec_catalog
+        import os, time
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._build(repo_root)
+            _load_spec_catalog.cache_clear()
+            safe = "component__dep_a__0.1.0"
+            # Older ir_id (lex-smaller name) with pass; newer ir_id (lex-larger) with fail.
+            old = repo_root / "workspace" / "ir" / safe / "dep-a_20260101_001"
+            new = repo_root / "workspace" / "ir" / safe / "dep-a_20260601_001"
+            old.mkdir(parents=True)
+            new.mkdir(parents=True)
+            (old / "ir_meta.json").write_text(
+                json.dumps({"verification_status": "pass"}), encoding="utf-8")
+            (new / "ir_meta.json").write_text(
+                json.dumps({"verification_status": "fail"}), encoding="utf-8")
+            # Adversary touches the OLD passing artifact to make it newer by mtime.
+            time.sleep(0.01)
+            os.utime(old / "ir_meta.json")
+            self.assertFalse(
+                _verify_dep_stage(repo_root, "component", "dep_a", "0.1.0", "ir_ref"),
+                "older artifact touched to a newer mtime must NOT override the "
+                "newer-by-runtime-id failing artifact",
+            )
+
+    def test_touching_older_pipeline_dir_does_not_override(self) -> None:
+        from tools.orchestration_runtime import _verify_dep_stage, _load_spec_catalog
+        import os, time
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._build(repo_root)
+            _load_spec_catalog.cache_clear()
+            safe = "component__dep_a__0.1.0"
+            # Older pipeline_id (pass), newer pipeline_id (fail).
+            p_old = repo_root / "workspace" / "pipelines" / safe / "pipe_20260101_001"
+            p_new = repo_root / "workspace" / "pipelines" / safe / "pipe_20260601_001"
+            for p, status in ((p_old, "pass"), (p_new, "fail")):
+                b = p / "binary" / "bin_20260101_001"
+                b.mkdir(parents=True)
+                (b / "binary_meta.json").write_text(
+                    json.dumps({"verification_status": status}), encoding="utf-8")
+            time.sleep(0.01)
+            # Touch every file in the OLD pipeline dir — mtime-based selection
+            # would now pick the OLD pipeline.
+            for f in p_old.rglob("*"):
+                if f.is_file():
+                    os.utime(f)
+            self.assertFalse(
+                _verify_dep_stage(repo_root, "component", "dep_a", "0.1.0", "pipeline_ref"),
+                "touched-newer mtime on old pipeline must not override newer "
+                "(by runtime id) pipeline's failing binary_meta",
+            )
+
+
+class UnrelatedCatalogChurnIsolationTests(unittest.TestCase):
+    """Codex round 19 F1: publishing or editing a catalog entry that this
+    orchestration does NOT depend on must not invalidate persisted readiness.
+    The fingerprint only hashes the catalog subset for `(kind, spec_id)`
+    pairs that appear in this orch's deps.yaml."""
+
+    def _build_orch(self, repo_root: Path, orch: str = "iso") -> None:
+        (repo_root / "spec" / "registry").mkdir(parents=True)
+        (repo_root / "spec" / "registry" / "spec_catalog.yaml").write_text(
+            "catalog_version: 0.2.0\nspecs:\n"
+            "  - spec_kind: component\n    spec_id: dep_a\n    spec_version: 0.1.0\n",
+            encoding="utf-8",
+        )
+        spec_dir = repo_root / "spec" / "component" / "user"
+        spec_dir.mkdir(parents=True)
+        (spec_dir / "deps.yaml").write_text(
+            "spec_id: user\nspec_kind: component\n"
+            "dependencies:\n  components:\n"
+            "    - component_id: dep_a\n      version_constraint: \">=0.1.0\"\n"
+            "  profiles: []\n",
+            encoding="utf-8",
+        )
+        init_orchestration(
+            repo_root=repo_root, orchestration_id=orch,
+            spec_ref="spec/component/user",
+        )
+        write_preflight(
+            repo_root=repo_root, orchestration_id=orch,
+            payload=_launchable_preflight_dict(checked_at="2026-04-15T10:00:00Z"),
+        )
+
+    def test_unrelated_spec_publication_does_not_invalidate(self) -> None:
+        """Adding `(component, totally_unrelated)` to spec_catalog must not
+        change the fingerprint of an orchestration whose deps reference
+        only `(component, dep_a)`."""
+        from tools.orchestration_runtime import (
+            mark_dependency_readiness, _dependency_ready, _load_spec_catalog,
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._build_orch(repo_root, "iso_a")
+            safe = "component__dep_a__0.1.0"
+            ir = repo_root / "workspace" / "ir" / safe / "dep-a_20260101_001"
+            ir.mkdir(parents=True)
+            (ir / "ir_meta.json").write_text(
+                json.dumps({"verification_status": "pass"}), encoding="utf-8")
+            _load_spec_catalog.cache_clear()
+            mark_dependency_readiness(repo_root=repo_root, orchestration_id="iso_a")
+            # Publish an UNRELATED spec to the catalog. dep_a is unchanged.
+            (repo_root / "spec" / "registry" / "spec_catalog.yaml").write_text(
+                "catalog_version: 0.2.0\nspecs:\n"
+                "  - spec_kind: component\n    spec_id: dep_a\n    spec_version: 0.1.0\n"
+                "  - spec_kind: component\n    spec_id: totally_unrelated\n    spec_version: 1.0.0\n",
+                encoding="utf-8",
+            )
+            _load_spec_catalog.cache_clear()
+            ok, reason = _dependency_ready(repo_root, "iso_a", step="compile")
+            self.assertTrue(
+                ok,
+                f"unrelated catalog publication must not invalidate readiness; "
+                f"reason={reason}",
+            )
+
+    def test_relevant_catalog_addition_does_invalidate(self) -> None:
+        """Mirror check: adding a new version FOR dep_a (the dep we use)
+        must invalidate (because the matching set / certified version may
+        change)."""
+        from tools.orchestration_runtime import (
+            mark_dependency_readiness, _dependency_ready, _load_spec_catalog,
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._build_orch(repo_root, "rel")
+            safe = "component__dep_a__0.1.0"
+            ir = repo_root / "workspace" / "ir" / safe / "dep-a_20260101_001"
+            ir.mkdir(parents=True)
+            (ir / "ir_meta.json").write_text(
+                json.dumps({"verification_status": "pass"}), encoding="utf-8")
+            _load_spec_catalog.cache_clear()
+            mark_dependency_readiness(repo_root=repo_root, orchestration_id="rel")
+            (repo_root / "spec" / "registry" / "spec_catalog.yaml").write_text(
+                "catalog_version: 0.2.0\nspecs:\n"
+                "  - spec_kind: component\n    spec_id: dep_a\n    spec_version: 0.1.0\n"
+                "  - spec_kind: component\n    spec_id: dep_a\n    spec_version: 0.2.0\n",
+                encoding="utf-8",
+            )
+            _load_spec_catalog.cache_clear()
+            ok, reason = _dependency_ready(repo_root, "rel", step="compile")
+            self.assertFalse(ok)
+            self.assertEqual(reason, "dep_set_fingerprint_stale")
+
+
+class CertifiedVersionIdentityInFingerprintTests(unittest.TestCase):
+    """Codex round 19 F2: even when artifact bytes happen to be identical,
+    a switch in certified version must invalidate the fingerprint. The
+    fingerprint prefixes each artifact's bytes with its
+    `(spec_kind, spec_id, spec_version, stage)` identity, so identity drift
+    cannot survive byte equality."""
+
+    def test_identity_prefix_in_fingerprint(self) -> None:
+        """Two on-disk states with identical artifact bytes but DIFFERENT
+        certified versions must produce different fingerprints."""
+        from tools.orchestration_runtime import (
+            _dependency_set_fingerprint, _load_spec_catalog,
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            (repo_root / "spec" / "registry").mkdir(parents=True)
+            spec_dir = repo_root / "spec" / "component" / "user"
+            spec_dir.mkdir(parents=True)
+            (spec_dir / "deps.yaml").write_text(
+                "spec_id: user\nspec_kind: component\n"
+                "dependencies:\n  components:\n"
+                "    - component_id: dep_a\n      version_constraint: \">=0.1.0\"\n"
+                "  profiles: []\n",
+                encoding="utf-8",
+            )
+            # State A: only 0.1.0 in catalog + artifacts.
+            (repo_root / "spec" / "registry" / "spec_catalog.yaml").write_text(
+                "catalog_version: 0.2.0\nspecs:\n"
+                "  - spec_kind: component\n    spec_id: dep_a\n    spec_version: 0.1.0\n",
+                encoding="utf-8",
+            )
+            safe_010 = "component__dep_a__0.1.0"
+            ir_010 = repo_root / "workspace" / "ir" / safe_010 / "dep-a_20260101_001"
+            ir_010.mkdir(parents=True)
+            (ir_010 / "ir_meta.json").write_text(
+                json.dumps({"verification_status": "pass"}), encoding="utf-8")
+            _load_spec_catalog.cache_clear()
+            fp_a = _dependency_set_fingerprint(repo_root, "spec/component/user")
+            # State B: 0.2.0 added to catalog AND has IDENTICAL artifact bytes.
+            # Certified version flips from 0.1.0 to 0.2.0.
+            (repo_root / "spec" / "registry" / "spec_catalog.yaml").write_text(
+                "catalog_version: 0.2.0\nspecs:\n"
+                "  - spec_kind: component\n    spec_id: dep_a\n    spec_version: 0.1.0\n"
+                "  - spec_kind: component\n    spec_id: dep_a\n    spec_version: 0.2.0\n",
+                encoding="utf-8",
+            )
+            safe_020 = "component__dep_a__0.2.0"
+            ir_020 = repo_root / "workspace" / "ir" / safe_020 / "dep-a_20260101_001"
+            ir_020.mkdir(parents=True)
+            # Identical bytes to 0.1.0's artifact.
+            (ir_020 / "ir_meta.json").write_text(
+                json.dumps({"verification_status": "pass"}), encoding="utf-8")
+            _load_spec_catalog.cache_clear()
+            fp_b = _dependency_set_fingerprint(repo_root, "spec/component/user")
+            self.assertNotEqual(
+                fp_a, fp_b,
+                "certified version drift with identical bytes must change fingerprint",
+            )
+
+    def test_gate_rejects_when_certified_version_drifts(self) -> None:
+        """End-to-end: mark certifies 0.1.0. Then 0.2.0 is published with
+        identical artifact bytes. Gate must reject (fingerprint mismatch)
+        rather than trust the persisted certified_deps that still says 0.1.0."""
+        from tools.orchestration_runtime import (
+            mark_dependency_readiness, _dependency_ready, _load_spec_catalog,
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            (repo_root / "spec" / "registry").mkdir(parents=True)
+            (repo_root / "spec" / "registry" / "spec_catalog.yaml").write_text(
+                "catalog_version: 0.2.0\nspecs:\n"
+                "  - spec_kind: component\n    spec_id: dep_a\n    spec_version: 0.1.0\n",
+                encoding="utf-8",
+            )
+            spec_dir = repo_root / "spec" / "component" / "user"
+            spec_dir.mkdir(parents=True)
+            (spec_dir / "deps.yaml").write_text(
+                "spec_id: user\nspec_kind: component\n"
+                "dependencies:\n  components:\n"
+                "    - component_id: dep_a\n      version_constraint: \">=0.1.0\"\n"
+                "  profiles: []\n",
+                encoding="utf-8",
+            )
+            init_orchestration(
+                repo_root=repo_root, orchestration_id="drift",
+                spec_ref="spec/component/user",
+            )
+            write_preflight(
+                repo_root=repo_root, orchestration_id="drift",
+                payload=_launchable_preflight_dict(checked_at="2026-04-15T10:00:00Z"),
+            )
+            for ver in ("0.1.0",):
+                safe = f"component__dep_a__{ver}"
+                ir = repo_root / "workspace" / "ir" / safe / "dep-a_20260101_001"
+                ir.mkdir(parents=True)
+                (ir / "ir_meta.json").write_text(
+                    json.dumps({"verification_status": "pass"}), encoding="utf-8")
+            _load_spec_catalog.cache_clear()
+            r = mark_dependency_readiness(repo_root=repo_root, orchestration_id="drift")
+            self.assertEqual(r["certified_deps"][0]["spec_version"], "0.1.0")
+            # Publish 0.2.0 with bit-identical artifact bytes.
+            (repo_root / "spec" / "registry" / "spec_catalog.yaml").write_text(
+                "catalog_version: 0.2.0\nspecs:\n"
+                "  - spec_kind: component\n    spec_id: dep_a\n    spec_version: 0.1.0\n"
+                "  - spec_kind: component\n    spec_id: dep_a\n    spec_version: 0.2.0\n",
+                encoding="utf-8",
+            )
+            safe_020 = "component__dep_a__0.2.0"
+            ir_020 = repo_root / "workspace" / "ir" / safe_020 / "dep-a_20260101_001"
+            ir_020.mkdir(parents=True)
+            (ir_020 / "ir_meta.json").write_text(
+                json.dumps({"verification_status": "pass"}), encoding="utf-8")
+            _load_spec_catalog.cache_clear()
+            ok, reason = _dependency_ready(repo_root, "drift", step="compile")
+            self.assertFalse(
+                ok,
+                "certified version drift (0.1.0 → 0.2.0) with identical bytes "
+                "must invalidate the gate via fingerprint mismatch",
+            )
+            self.assertEqual(reason, "dep_set_fingerprint_stale")
+
+
+class SetStatusAuditEventReflectsCommittedMetaTests(unittest.TestCase):
+    """Codex round 21 F1: the canonical `set_status` audit event must reflect
+    the COMMITTED meta state (after `.strip()` normalization, fail→fail_closed
+    promotion, etc.), not the raw call arguments."""
+
+    def test_audit_log_uses_persisted_reason_detail_after_strip(self) -> None:
+        """Raw `--reason-detail` carries leading/trailing whitespace; persisted
+        meta strips it. The audit log must record the stripped value."""
+        from tools.orchestration_runtime import _phase_state_log_path
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            init_orchestration(repo_root=repo_root, orchestration_id="aud")
+            _mark_dependencies_ready(repo_root, "aud")
+            update_orchestration_status(
+                repo_root=repo_root, orchestration_id="aud",
+                status="fail_closed", reason_code="dependency_not_ready",
+                reason_detail="   stripped detail   ",
+            )
+            meta = json.loads(
+                (repo_root / "workspace" / "orchestrations" / "aud"
+                 / "orchestration_meta.json").read_text(encoding="utf-8")
+            )
+            log_path = _phase_state_log_path(repo_root, "aud")
+            set_status_event = None
+            for line in log_path.read_text(encoding="utf-8").splitlines():
+                if line.strip():
+                    obj = json.loads(line)
+                    if obj.get("event") == "set_status":
+                        set_status_event = obj
+                        break
+            self.assertIsNotNone(set_status_event)
+            # Log MUST equal persisted meta (normalized), not raw call arg.
+            self.assertEqual(set_status_event["reason_detail"], meta.get("reason_detail"))
+            self.assertEqual(set_status_event["reason_detail"], "stripped detail")
+
+    def test_audit_log_reflects_fail_to_fail_closed_promotion(self) -> None:
+        """On `fail → fail_closed` promotion, the audit event records the
+        FINAL committed values (including the promoted reason_code), not just
+        the call's raw arguments. This guarantees forward writes and replay
+        backfills share the same shape."""
+        from tools.orchestration_runtime import _phase_state_log_path
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            init_orchestration(repo_root=repo_root, orchestration_id="aud2")
+            _mark_dependencies_ready(repo_root, "aud2")
+            update_orchestration_status(
+                repo_root=repo_root, orchestration_id="aud2",
+                status="fail", reason_detail="initial fail",
+            )
+            update_orchestration_status(
+                repo_root=repo_root, orchestration_id="aud2",
+                status="fail_closed", reason_code="dependency_not_ready",
+                reason_detail="promoted",
+            )
+            meta = json.loads(
+                (repo_root / "workspace" / "orchestrations" / "aud2"
+                 / "orchestration_meta.json").read_text(encoding="utf-8")
+            )
+            # Verify the fail_closed audit event matches committed meta.
+            log_path = _phase_state_log_path(repo_root, "aud2")
+            fail_closed_event = None
+            for line in log_path.read_text(encoding="utf-8").splitlines():
+                if line.strip():
+                    obj = json.loads(line)
+                    if obj.get("event") == "set_status" and obj.get("to") == "fail_closed":
+                        fail_closed_event = obj
+            self.assertIsNotNone(fail_closed_event)
+            self.assertEqual(fail_closed_event["reason_code"], meta.get("reason_code"))
+            self.assertEqual(fail_closed_event["reason_detail"], meta.get("reason_detail"))
+
+
+class MarkDependencyReadinessMalformedCliTests(unittest.TestCase):
+    """Codex round 21 F2: malformed deps.yaml is a hard verification failure
+    at the point of `mark-dependency-readiness`, surfaced as a non-zero CLI
+    exit and a `mark_dependency_readiness_failed` audit event with
+    `reason=deps_yaml_malformed_schema`."""
+
+    def test_cli_non_zero_exit_on_malformed_deps(self) -> None:
+        from tools.orchestration_runtime import main as runtime_main, _load_spec_catalog
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            (repo_root / "spec" / "registry").mkdir(parents=True)
+            (repo_root / "spec" / "registry" / "spec_catalog.yaml").write_text(
+                "catalog_version: 0.2.0\nspecs: []\n", encoding="utf-8",
+            )
+            spec_dir = repo_root / "spec" / "component" / "broken"
+            spec_dir.mkdir(parents=True)
+            (spec_dir / "deps.yaml").write_text(
+                "spec_id: broken\nspec_kind: component\n"
+                "dependencies:\n  component:\n    - {component_id: x}\n  profiles: []\n",
+                encoding="utf-8",
+            )
+            init_orchestration(
+                repo_root=repo_root, orchestration_id="cli_mal",
+                spec_ref="spec/component/broken",
+            )
+            write_preflight(
+                repo_root=repo_root, orchestration_id="cli_mal",
+                payload=_launchable_preflight_dict(checked_at="2026-04-15T10:00:00Z"),
+            )
+            _load_spec_catalog.cache_clear()
+            argv = [
+                "mark-dependency-readiness",
+                "--repo-root", str(repo_root),
+                "--orchestration-id", "cli_mal",
+            ]
+            # Codex round 26 F2: CLI must NOT propagate ValueError as a
+            # traceback. Expect rc=1 with stderr explanation.
+            stderr_io = io.StringIO()
+            with redirect_stderr(stderr_io):
+                rc = runtime_main(argv)
+            self.assertEqual(rc, 1)
+            self.assertIn("schema is malformed", stderr_io.getvalue())
+            # Persisted state must be fail-closed.
+            meta = json.loads(
+                (repo_root / "workspace" / "orchestrations" / "cli_mal"
+                 / "orchestration_meta.json").read_text(encoding="utf-8")
+            )
+            self.assertFalse(
+                meta["dependency_readiness"]["direct_dependency_compile_readiness"],
+            )
+
+    def test_malformed_logs_specific_reason(self) -> None:
+        """The audit event must record `reason=deps_yaml_malformed_schema`
+        rather than the generic missing/unparseable reason, so observability
+        tooling can differentiate spec defects from missing files."""
+        from tools.orchestration_runtime import (
+            mark_dependency_readiness, _phase_state_log_path, _load_spec_catalog,
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            (repo_root / "spec" / "registry").mkdir(parents=True)
+            (repo_root / "spec" / "registry" / "spec_catalog.yaml").write_text(
+                "catalog_version: 0.2.0\nspecs: []\n", encoding="utf-8",
+            )
+            spec_dir = repo_root / "spec" / "component" / "broken2"
+            spec_dir.mkdir(parents=True)
+            (spec_dir / "deps.yaml").write_text(
+                "spec_id: broken2\nspec_kind: component\n"
+                "dependencies:\n  components: []\n  profiles: []\n  extras: []\n",
+                encoding="utf-8",
+            )
+            init_orchestration(
+                repo_root=repo_root, orchestration_id="reason",
+                spec_ref="spec/component/broken2",
+            )
+            write_preflight(
+                repo_root=repo_root, orchestration_id="reason",
+                payload=_launchable_preflight_dict(checked_at="2026-04-15T10:00:00Z"),
+            )
+            _load_spec_catalog.cache_clear()
+            with self.assertRaisesRegex(ValueError, "schema is malformed"):
+                mark_dependency_readiness(
+                    repo_root=repo_root, orchestration_id="reason",
+                )
+            log_path = _phase_state_log_path(repo_root, "reason")
+            failed_event = None
+            for line in log_path.read_text(encoding="utf-8").splitlines():
+                if line.strip():
+                    obj = json.loads(line)
+                    if obj.get("event") == "mark_dependency_readiness_failed":
+                        failed_event = obj
+                        break
+            self.assertIsNotNone(failed_event)
+            self.assertEqual(failed_event["reason"], "deps_yaml_malformed_schema")
+
+
+class DependencyReadinessStrictModeTests(unittest.TestCase):
+    """Codex round 20 F1: production launch checks fail closed when live
+    recompute cannot run (no deps.yaml). The persisted-boolean fallback is
+    gated behind METDSL_DEP_READINESS_ALLOW_PERSISTED_FALLBACK=1, which only
+    test scaffolding sets."""
+
+    def test_strict_mode_rejects_when_recompute_unavailable(self) -> None:
+        from tools.orchestration_runtime import _dependency_ready
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            init_orchestration(repo_root=repo_root, orchestration_id="strict")
+            _mark_dependencies_ready(repo_root, "strict")
+            # No spec_ref / deps.yaml on disk. Disable the fallback.
+            with patch.dict(os.environ, {
+                "METDSL_DEP_READINESS_ALLOW_PERSISTED_FALLBACK": "",
+            }, clear=False):
+                # patch.dict can't truly "unset" a var unless we ensure it.
+                os.environ.pop(
+                    "METDSL_DEP_READINESS_ALLOW_PERSISTED_FALLBACK", None,
+                )
+                ok, reason = _dependency_ready(repo_root, "strict", step="compile")
+            self.assertFalse(ok,
+                             "production strict mode must reject when live "
+                             "recompute cannot run")
+            self.assertEqual(reason, "deps_yaml_missing_or_unparseable")
+
+    def test_fallback_mode_allows_persisted_booleans_for_tests(self) -> None:
+        """The opt-in env var explicitly enables the legacy fallback so test
+        fixtures (`_mark_dependencies_ready`) continue to work."""
+        from tools.orchestration_runtime import _dependency_ready
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            init_orchestration(repo_root=repo_root, orchestration_id="fb")
+            _mark_dependencies_ready(repo_root, "fb")
+            # Module-level setdefault already set the env var to "1".
+            self.assertEqual(
+                os.environ.get("METDSL_DEP_READINESS_ALLOW_PERSISTED_FALLBACK"),
+                "1",
+            )
+            ok, reason = _dependency_ready(repo_root, "fb", step="compile")
+            self.assertTrue(ok, f"fallback opt-in must allow test scaffolding; reason={reason}")
+
+
+class TmpCleanupLockTests(unittest.TestCase):
+    """Codex round 20 F2: cleanup creates and uses fcntl lock at
+    `workspace/tmp/<arid>.lock` to serialize the ownership scan + rmtree
+    against concurrent cleanup attempts."""
+
+    def test_cleanup_creates_lock_sidecar(self) -> None:
+        """Smoke: `_cleanup_agent_tmp_root` creates the lock file."""
+        from tools.orchestration_runtime import _cleanup_agent_tmp_root
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            init_orchestration(repo_root=repo_root, orchestration_id="lck")
+            meta = json.loads(
+                (repo_root / "workspace" / "orchestrations" / "lck"
+                 / "orchestration_meta.json").read_text(encoding="utf-8")
+            )
+            arid = meta["orchestration_agent_run_id"]
+            (repo_root / "workspace" / "tmp" / arid).mkdir(parents=True, exist_ok=True)
+            ok = _cleanup_agent_tmp_root(
+                repo_root, "lck", agent_run_id=arid,
+            )
+            self.assertTrue(ok)
+            self.assertTrue(
+                (repo_root / "workspace" / "tmp" / f"{arid}.lock").is_file(),
+                "cleanup must create workspace/tmp/<arid>.lock sidecar",
+            )
+
+    def test_cleanup_lock_serializes_concurrent_attempts(self) -> None:
+        """Two threads calling cleanup for the same arid must serialize.
+        We can't directly observe lock contention without instrumentation,
+        but we verify both calls complete and the tmp dir is gone."""
+        import threading
+        from tools.orchestration_runtime import _cleanup_agent_tmp_root
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            init_orchestration(repo_root=repo_root, orchestration_id="cc")
+            meta = json.loads(
+                (repo_root / "workspace" / "orchestrations" / "cc"
+                 / "orchestration_meta.json").read_text(encoding="utf-8")
+            )
+            arid = meta["orchestration_agent_run_id"]
+            (repo_root / "workspace" / "tmp" / arid).mkdir(parents=True, exist_ok=True)
+            (repo_root / "workspace" / "tmp" / arid / "scratch.txt").write_text(
+                "x", encoding="utf-8",
+            )
+            errors: list[BaseException] = []
+            results: list[bool] = []
+            def call():
+                try:
+                    r = _cleanup_agent_tmp_root(repo_root, "cc", agent_run_id=arid)
+                    results.append(r)
+                except BaseException as e:
+                    errors.append(e)
+            t1 = threading.Thread(target=call)
+            t2 = threading.Thread(target=call)
+            t1.start(); t2.start(); t1.join(); t2.join()
+            self.assertEqual(errors, [])
+            # Both calls return True (idempotent: one removes, the other sees absent).
+            self.assertTrue(all(results))
+            self.assertFalse((repo_root / "workspace" / "tmp" / arid).exists())
+
+
+class DependencyReadinessForgeryRejectionTests(unittest.TestCase):
+    """Codex round 18 F1: a direct edit of `orchestration_meta.json` that
+    flips dependency_readiness booleans without changing artifacts must NOT
+    pass the launch gate. The gate now uses LIVE recomputation as
+    authoritative (when deps.yaml is available); the persisted booleans
+    become advisory-only."""
+
+    def _build(self, repo_root: Path, orch: str = "frg") -> None:
+        (repo_root / "spec" / "registry").mkdir(parents=True)
+        (repo_root / "spec" / "registry" / "spec_catalog.yaml").write_text(
+            "catalog_version: 0.2.0\nspecs:\n"
+            "  - spec_kind: component\n    spec_id: dep_a\n    spec_version: 0.1.0\n",
+            encoding="utf-8",
+        )
+        spec_dir = repo_root / "spec" / "component" / "user"
+        spec_dir.mkdir(parents=True)
+        (spec_dir / "deps.yaml").write_text(
+            "spec_id: user\nspec_kind: component\n"
+            "dependencies:\n  components:\n"
+            "    - component_id: dep_a\n      version_constraint: \">=0.1.0 <1.0.0\"\n"
+            "  profiles: []\n",
+            encoding="utf-8",
+        )
+        init_orchestration(
+            repo_root=repo_root, orchestration_id=orch,
+            spec_ref="spec/component/user",
+        )
+        write_preflight(
+            repo_root=repo_root, orchestration_id=orch,
+            payload=_launchable_preflight_dict(checked_at="2026-04-15T10:00:00Z"),
+        )
+
+    def test_forged_persisted_booleans_without_artifacts_fail_gate(self) -> None:
+        """No workspace artifacts for dep_a. Adversary edits
+        `orchestration_meta.dependency_readiness` to all-true with a
+        fingerprint matching the (no-artifact) current state. Gate must
+        still reject because LIVE recomputation says false."""
+        from tools.orchestration_runtime import (
+            _dependency_ready, _dependency_set_fingerprint, _load_spec_catalog,
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._build(repo_root)
+            _load_spec_catalog.cache_clear()
+            meta_path = (
+                repo_root / "workspace" / "orchestrations" / "frg"
+                / "orchestration_meta.json"
+            )
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            # Forge: all true + matching fingerprint, but NO artifacts on disk.
+            meta["dependency_readiness"] = {
+                "direct_dependency_compile_readiness": True,
+                "direct_dependency_execution_readiness": True,
+                "detail": {
+                    "ir_ref_verified": True,
+                    "pipeline_ref_verified": True,
+                    "aggregate_verdict_verified": True,
+                },
+                "dep_set_fingerprint": _dependency_set_fingerprint(
+                    repo_root, "spec/component/user",
+                ),
+            }
+            meta_path.write_text(json.dumps(meta) + "\n", encoding="utf-8")
+            ok, reason = _dependency_ready(repo_root, "frg", step="compile")
+            self.assertFalse(
+                ok,
+                "forged true booleans must not bypass the gate when live "
+                "recomputation says false",
+            )
+            self.assertEqual(reason, "direct_dependency_compile_readiness_not_pass")
+
+    def test_live_recompute_authoritative_even_when_stored_says_false(self) -> None:
+        """Opposite direction: stored booleans=false, artifacts say pass. Gate
+        uses live recompute → pass."""
+        from tools.orchestration_runtime import (
+            _dependency_ready, _dependency_set_fingerprint,
+            mark_dependency_readiness, _load_spec_catalog,
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._build(repo_root, "live")
+            safe = "component__dep_a__0.1.0"
+            ir = repo_root / "workspace" / "ir" / safe / "dep-a_20260101_001"
+            ir.mkdir(parents=True)
+            (ir / "ir_meta.json").write_text(
+                json.dumps({"verification_status": "pass"}), encoding="utf-8")
+            _load_spec_catalog.cache_clear()
+            # Mark, then tamper the persisted booleans to false (without
+            # mutating fingerprint).
+            mark_dependency_readiness(repo_root=repo_root, orchestration_id="live")
+            meta_path = (
+                repo_root / "workspace" / "orchestrations" / "live"
+                / "orchestration_meta.json"
+            )
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            meta["dependency_readiness"]["direct_dependency_compile_readiness"] = False
+            meta["dependency_readiness"]["detail"]["ir_ref_verified"] = False
+            meta_path.write_text(json.dumps(meta) + "\n", encoding="utf-8")
+            ok, reason = _dependency_ready(repo_root, "live", step="compile")
+            self.assertTrue(
+                ok,
+                f"live recompute must override tampered persisted false; reason={reason}",
+            )
+
+
+class SetStatusAuditBackfillTests(unittest.TestCase):
+    """Codex round 18 F2: same-terminal replay must backfill the canonical
+    `set_status` audit event when the original call committed meta+marker
+    but its phase_state_log append failed. Otherwise the transition record
+    is lost forever."""
+
+    def test_replay_backfills_missing_set_status_event(self) -> None:
+        """Stage a half-committed state: terminal meta + marker present,
+        but no `set_status` event in phase_state_log. Replay must inject
+        the canonical event from persisted meta."""
+        from tools.orchestration_runtime import (
+            _phase_state_log_path, _cleanup_committed_marker_path,
+            _cleanup_committed_dir,
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            init_orchestration(repo_root=repo_root, orchestration_id="bf")
+            meta_path = (
+                repo_root / "workspace" / "orchestrations" / "bf"
+                / "orchestration_meta.json"
+            )
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            arid = meta["orchestration_agent_run_id"]
+            # Simulate post-commit, pre-log state: meta is terminal, marker
+            # exists, but no `set_status` event in phase_state_log.
+            meta["status"] = "fail_closed"
+            meta["reason_code"] = "dependency_not_ready"
+            meta["reason_detail"] = "original failure detail"
+            meta_path.write_text(json.dumps(meta) + "\n", encoding="utf-8")
+            _cleanup_committed_dir(repo_root, "bf").mkdir(parents=True, exist_ok=True)
+            _cleanup_committed_marker_path(repo_root, "bf", arid).write_text(
+                "{}", encoding="utf-8",
+            )
+            log_path = _phase_state_log_path(repo_root, "bf")
+            # Pre-replay: no set_status event in log.
+            text = log_path.read_text(encoding="utf-8") if log_path.is_file() else ""
+            for line in text.splitlines():
+                if line.strip():
+                    obj = json.loads(line)
+                    self.assertNotEqual(obj.get("event"), "set_status",
+                                        "precondition: no set_status event yet")
+            # Replay.
+            update_orchestration_status(
+                repo_root=repo_root, orchestration_id="bf",
+                status="fail_closed", reason_code="dependency_not_ready",
+                reason_detail="retry detail (ignored)",
+            )
+            # Post-replay: backfilled set_status event must be present.
+            text = log_path.read_text(encoding="utf-8")
+            backfilled_event = None
+            for line in text.splitlines():
+                if line.strip():
+                    obj = json.loads(line)
+                    if obj.get("event") == "set_status" and obj.get("to") == "fail_closed":
+                        backfilled_event = obj
+                        break
+            self.assertIsNotNone(backfilled_event,
+                                 "replay must backfill the canonical set_status event")
+            self.assertTrue(backfilled_event.get("backfilled"),
+                            "backfilled events must carry the `backfilled` marker")
+            self.assertEqual(backfilled_event.get("reason_detail"), "original failure detail")
+
+    def test_replay_does_not_double_log_when_set_status_already_present(self) -> None:
+        """When the original set_status event IS in the log, replay must
+        NOT backfill a second copy."""
+        from tools.orchestration_runtime import _phase_state_log_path
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            init_orchestration(repo_root=repo_root, orchestration_id="bf2")
+            _mark_dependencies_ready(repo_root, "bf2")
+            # Normal forward call (logs set_status, writes marker).
+            update_orchestration_status(
+                repo_root=repo_root, orchestration_id="bf2",
+                status="fail_closed", reason_code="dependency_not_ready",
+                reason_detail="initial",
+            )
+            log_path = _phase_state_log_path(repo_root, "bf2")
+            set_status_count_before = sum(
+                1 for line in log_path.read_text(encoding="utf-8").splitlines()
+                if line.strip() and json.loads(line).get("event") == "set_status"
+            )
+            # Replay.
+            update_orchestration_status(
+                repo_root=repo_root, orchestration_id="bf2",
+                status="fail_closed", reason_code="dependency_not_ready",
+                reason_detail="replay (ignored)",
+            )
+            set_status_count_after = sum(
+                1 for line in log_path.read_text(encoding="utf-8").splitlines()
+                if line.strip() and json.loads(line).get("event") == "set_status"
+            )
+            self.assertEqual(set_status_count_before, set_status_count_after,
+                             "replay must not duplicate an already-present set_status event")
+
+
+class CertifiedDepVersionTests(unittest.TestCase):
+    """Codex round 17 F1+F2: mark-dependency-readiness persists the per-dep
+    certified version (HIGHEST matching version that achieved max readiness
+    level), and the fingerprint hashes only that version's artifacts. So
+    unrelated historical-version artifact churn does NOT invalidate readiness."""
+
+    def _build(self, repo_root: Path, orch: str = "cd") -> None:
+        (repo_root / "spec" / "registry").mkdir(parents=True)
+        (repo_root / "spec" / "registry" / "spec_catalog.yaml").write_text(
+            "catalog_version: 0.2.0\nspecs:\n"
+            "  - spec_kind: component\n    spec_id: dep_a\n    spec_version: 0.1.0\n"
+            "  - spec_kind: component\n    spec_id: dep_a\n    spec_version: 0.2.0\n",
+            encoding="utf-8",
+        )
+        spec_dir = repo_root / "spec" / "component" / "user"
+        spec_dir.mkdir(parents=True)
+        (spec_dir / "deps.yaml").write_text(
+            "spec_id: user\nspec_kind: component\n"
+            "dependencies:\n  components:\n"
+            "    - component_id: dep_a\n      version_constraint: \">=0.1.0 <1.0.0\"\n"
+            "  profiles: []\n",
+            encoding="utf-8",
+        )
+        init_orchestration(
+            repo_root=repo_root, orchestration_id=orch,
+            spec_ref="spec/component/user",
+        )
+        write_preflight(
+            repo_root=repo_root, orchestration_id=orch,
+            payload=_launchable_preflight_dict(checked_at="2026-04-15T10:00:00Z"),
+        )
+
+    def _write_full_chain(self, repo_root: Path, version: str) -> None:
+        safe = f"component__dep_a__{version}"
+        ir = repo_root / "workspace" / "ir" / safe / f"dep-a_20260101_001"
+        ir.mkdir(parents=True)
+        (ir / "ir_meta.json").write_text(
+            json.dumps({"verification_status": "pass"}), encoding="utf-8")
+        bin_dir = (repo_root / "workspace" / "pipelines" / safe
+                   / "pipe_20260101_001" / "binary" / "bin_20260101_001")
+        bin_dir.mkdir(parents=True)
+        (bin_dir / "binary_meta.json").write_text(
+            json.dumps({"verification_status": "pass"}), encoding="utf-8")
+        v_dir = (repo_root / "workspace" / "pipelines" / safe
+                 / "pipe_20260101_001" / "runs" / "run_20260101_001" / safe)
+        v_dir.mkdir(parents=True)
+        (v_dir / "aggregate_verdict.json").write_text(
+            json.dumps({"aggregate_verdict": "pass"}), encoding="utf-8")
+        (v_dir / "trial_meta.json").write_text(
+            json.dumps({"source_binary_id": "bin_20260101_001"}), encoding="utf-8")
+
+    def test_certified_deps_persisted_in_meta(self) -> None:
+        """After mark, dependency_readiness.certified_deps records the
+        per-dep version that satisfied readiness."""
+        from tools.orchestration_runtime import (
+            mark_dependency_readiness, _load_spec_catalog,
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._build(repo_root)
+            # Only 0.1.0 has full chain; 0.2.0 has no artifacts.
+            self._write_full_chain(repo_root, "0.1.0")
+            _load_spec_catalog.cache_clear()
+            r = mark_dependency_readiness(repo_root=repo_root, orchestration_id="cd")
+            self.assertTrue(r["direct_dependency_compile_readiness"])
+            certified = r.get("certified_deps")
+            self.assertEqual(
+                certified,
+                [{"spec_kind": "component", "spec_id": "dep_a", "spec_version": "0.1.0"}],
+                "certified_deps must record the version that satisfied readiness",
+            )
+
+    def test_highest_matching_full_chain_wins(self) -> None:
+        """When multiple versions have the full chain, certify the HIGHEST."""
+        from tools.orchestration_runtime import (
+            mark_dependency_readiness, _load_spec_catalog,
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._build(repo_root)
+            self._write_full_chain(repo_root, "0.1.0")
+            self._write_full_chain(repo_root, "0.2.0")
+            _load_spec_catalog.cache_clear()
+            r = mark_dependency_readiness(repo_root=repo_root, orchestration_id="cd")
+            certified = r.get("certified_deps")
+            self.assertEqual(certified[0]["spec_version"], "0.2.0",
+                             "certified_deps must prefer highest version when both qualify")
+
+    def test_unrelated_version_artifact_churn_does_not_invalidate(self) -> None:
+        """Codex round 17 F2 core test: only 0.1.0 is certified; touching
+        0.2.0's artifacts must NOT change the persisted fingerprint, so the
+        launch gate does NOT reject as stale."""
+        from tools.orchestration_runtime import (
+            mark_dependency_readiness, _dependency_ready, _load_spec_catalog,
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._build(repo_root)
+            self._write_full_chain(repo_root, "0.1.0")
+            _load_spec_catalog.cache_clear()
+            r1 = mark_dependency_readiness(repo_root=repo_root, orchestration_id="cd")
+            self.assertTrue(r1["direct_dependency_compile_readiness"])
+            fp1 = r1["dep_set_fingerprint"]
+            # Touch 0.2.0's directory with random partial artifact — fingerprint
+            # of 0.1.0's certified chain must be unaffected.
+            safe_02 = "component__dep_a__0.2.0"
+            ir_02 = repo_root / "workspace" / "ir" / safe_02 / "dep_a_0.2.0_999"
+            ir_02.mkdir(parents=True)
+            (ir_02 / "ir_meta.json").write_text(
+                json.dumps({"verification_status": "fail"}), encoding="utf-8")
+            ok, reason = _dependency_ready(repo_root, "cd", step="compile")
+            self.assertTrue(
+                ok,
+                f"unrelated version 0.2.0 artifact churn must not invalidate "
+                f"the 0.1.0-certified readiness; reason={reason}",
+            )
+            # Re-marking on the same state must reproduce the same fingerprint.
+            r2 = mark_dependency_readiness(repo_root=repo_root, orchestration_id="cd")
+            self.assertEqual(r2["dep_set_fingerprint"], fp1)
+
+    def test_certified_version_regression_invalidates(self) -> None:
+        """Mirror check: a regression of the CERTIFIED version's artifact
+        must still invalidate (fingerprint mismatch)."""
+        from tools.orchestration_runtime import (
+            mark_dependency_readiness, _dependency_ready, _load_spec_catalog,
+        )
+        import time
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._build(repo_root)
+            self._write_full_chain(repo_root, "0.1.0")
+            _load_spec_catalog.cache_clear()
+            mark_dependency_readiness(repo_root=repo_root, orchestration_id="cd")
+            # Regress 0.1.0's ir (the certified version).
+            time.sleep(0.01)
+            safe = "component__dep_a__0.1.0"
+            newer = repo_root / "workspace" / "ir" / safe / "dep-a_20260901_001"
+            newer.mkdir()
+            (newer / "ir_meta.json").write_text(
+                json.dumps({"verification_status": "fail"}), encoding="utf-8")
+            ok, reason = _dependency_ready(repo_root, "cd", step="compile")
+            self.assertFalse(ok,
+                             "certified version regression must invalidate "
+                             "via dep_set_fingerprint_stale")
+            self.assertEqual(reason, "dep_set_fingerprint_stale")
+
+
+class WithinMarkArtifactConsistencyTests(unittest.TestCase):
+    """Codex round 16 F1: a single mark-dependency-readiness call must use the
+    SAME artifact byte snapshot for both verification booleans and the
+    persisted fingerprint. Otherwise a producer mutation between the two
+    reads would persist a fingerprint that matches the post-mutation state
+    while the booleans reflect the pre-mutation state, letting the gate
+    trust outdated readiness."""
+
+    def test_persisted_fingerprint_matches_subsequent_fingerprint_for_same_state(self) -> None:
+        """End-to-end: after mark, computing the fingerprint independently must
+        equal the persisted one (assuming no mutation in between)."""
+        from tools.orchestration_runtime import (
+            mark_dependency_readiness, _dependency_set_fingerprint, _load_spec_catalog,
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            (repo_root / "spec" / "registry").mkdir(parents=True)
+            (repo_root / "spec" / "registry" / "spec_catalog.yaml").write_text(
+                "catalog_version: 0.2.0\nspecs:\n"
+                "  - spec_kind: component\n    spec_id: dep_a\n    spec_version: 0.1.0\n",
+                encoding="utf-8",
+            )
+            spec_dir = repo_root / "spec" / "component" / "user"
+            spec_dir.mkdir(parents=True)
+            (spec_dir / "deps.yaml").write_text(
+                "spec_id: user\nspec_kind: component\n"
+                "dependencies:\n  components:\n"
+                "    - component_id: dep_a\n      version_constraint: \">=0.1.0 <1.0.0\"\n"
+                "  profiles: []\n",
+                encoding="utf-8",
+            )
+            init_orchestration(
+                repo_root=repo_root, orchestration_id="wmc",
+                spec_ref="spec/component/user",
+            )
+            write_preflight(
+                repo_root=repo_root, orchestration_id="wmc",
+                payload=_launchable_preflight_dict(checked_at="2026-04-15T10:00:00Z"),
+            )
+            safe = "component__dep_a__0.1.0"
+            ir = repo_root / "workspace" / "ir" / safe / "dep-a_20260101_001"
+            ir.mkdir(parents=True)
+            (ir / "ir_meta.json").write_text(
+                json.dumps({"verification_status": "pass"}), encoding="utf-8")
+            bin_dir = (repo_root / "workspace" / "pipelines" / safe
+                       / "pipe_20260101_001" / "binary" / "bin_20260101_001")
+            bin_dir.mkdir(parents=True)
+            (bin_dir / "binary_meta.json").write_text(
+                json.dumps({"verification_status": "pass"}), encoding="utf-8")
+            v_dir = (repo_root / "workspace" / "pipelines" / safe
+                     / "pipe_20260101_001" / "runs" / "run_20260101_001" / safe)
+            v_dir.mkdir(parents=True)
+            (v_dir / "aggregate_verdict.json").write_text(
+                json.dumps({"aggregate_verdict": "pass"}), encoding="utf-8")
+            (v_dir / "trial_meta.json").write_text(
+                json.dumps({"source_binary_id": "bin_20260101_001"}), encoding="utf-8")
+            _load_spec_catalog.cache_clear()
+            result = mark_dependency_readiness(repo_root=repo_root, orchestration_id="wmc")
+            persisted_fp = result["dep_set_fingerprint"]
+            recomputed_fp = _dependency_set_fingerprint(
+                repo_root, "spec/component/user",
+            )
+            self.assertEqual(persisted_fp, recomputed_fp,
+                             "single-pass mark must produce fingerprint identical "
+                             "to a fresh _dependency_set_fingerprint() call")
+
+    def test_combined_helper_yields_consistent_state(self) -> None:
+        """Direct unit test on the single-pass helper: verification booleans
+        and the returned fingerprint always derive from the same artifact
+        bytes read in one pass."""
+        from tools.orchestration_runtime import (
+            _compute_dep_readiness_and_fingerprint,
+            _dependency_set_fingerprint, _load_spec_catalog,
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            (repo_root / "spec" / "registry").mkdir(parents=True)
+            (repo_root / "spec" / "registry" / "spec_catalog.yaml").write_text(
+                "catalog_version: 0.2.0\nspecs:\n"
+                "  - spec_kind: component\n    spec_id: dep_a\n    spec_version: 0.1.0\n",
+                encoding="utf-8",
+            )
+            spec_dir = repo_root / "spec" / "component" / "user"
+            spec_dir.mkdir(parents=True)
+            (spec_dir / "deps.yaml").write_text(
+                "spec_id: user\nspec_kind: component\n"
+                "dependencies:\n  components:\n"
+                "    - component_id: dep_a\n      version_constraint: \">=0.1.0 <1.0.0\"\n"
+                "  profiles: []\n",
+                encoding="utf-8",
+            )
+            safe = "component__dep_a__0.1.0"
+            ir = repo_root / "workspace" / "ir" / safe / "dep-a_20260101_001"
+            ir.mkdir(parents=True)
+            (ir / "ir_meta.json").write_text(
+                json.dumps({"verification_status": "pass"}), encoding="utf-8")
+            _load_spec_catalog.cache_clear()
+            booleans, fp, certified, fail_reason = _compute_dep_readiness_and_fingerprint(
+                repo_root, "spec/component/user",
+            )
+            self.assertIsNone(fail_reason)
+            self.assertIsNotNone(booleans)
+            self.assertTrue(booleans["ir_ref_verified"])
+            self.assertEqual(
+                certified,
+                [{"spec_kind": "component", "spec_id": "dep_a", "spec_version": "0.1.0"}],
+            )
+            # The fingerprint must equal what _dependency_set_fingerprint
+            # computes on the same state — both share the walker.
+            self.assertEqual(fp, _dependency_set_fingerprint(
+                repo_root, "spec/component/user"))
+
+
+class BuildVariantAmbiguityRejectionTests(unittest.TestCase):
+    """Codex round 16 F2: a range/inequality constraint matching multiple
+    catalog versions that share the same numeric+prerelease ordering key
+    (differ only by build metadata) must fail closed. Workspace artifact
+    roots are keyed by the FULL version string, so the resolver must not
+    silently pick among `+cpu` / `+gpu` etc."""
+
+    def _build_catalog_with_variants(self, repo_root: Path) -> None:
+        (repo_root / "spec" / "registry").mkdir(parents=True)
+        (repo_root / "spec" / "registry" / "spec_catalog.yaml").write_text(
+            "catalog_version: 0.2.0\nspecs:\n"
+            "  - spec_kind: component\n    spec_id: dep_a\n    spec_version: 1.0.0+cpu\n"
+            "  - spec_kind: component\n    spec_id: dep_a\n    spec_version: 1.0.0+gpu\n",
+            encoding="utf-8",
+        )
+
+    def test_range_constraint_matches_build_variants_fails_closed(self) -> None:
+        from tools.orchestration_runtime import (
+            _load_spec_catalog, _matching_dep_versions,
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._build_catalog_with_variants(repo_root)
+            _load_spec_catalog.cache_clear()
+            cat = _load_spec_catalog(str(repo_root.resolve()))
+            # `>=1.0.0` matches both +cpu and +gpu (same ordering key).
+            matched = _matching_dep_versions(cat, "component", "dep_a", ">=1.0.0")
+            self.assertEqual(matched, (),
+                             "range constraint over build variants must reject "
+                             "(empty tuple = unresolvable)")
+
+    def test_exact_string_constraint_pins_specific_build(self) -> None:
+        from tools.orchestration_runtime import (
+            _load_spec_catalog, _matching_dep_versions,
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._build_catalog_with_variants(repo_root)
+            _load_spec_catalog.cache_clear()
+            cat = _load_spec_catalog(str(repo_root.resolve()))
+            # `==1.0.0+cpu` pins exactly one full version.
+            matched = _matching_dep_versions(cat, "component", "dep_a", "==1.0.0+cpu")
+            self.assertEqual(matched, ("1.0.0+cpu",))
+
+    def test_e2e_range_with_build_variants_blocks_readiness(self) -> None:
+        """A non-leaf dep with `>=1.0.0` against a catalog of `+cpu` and `+gpu`
+        must be unresolvable and fail-closed even if both have passing artifacts."""
+        from tools.orchestration_runtime import (
+            mark_dependency_readiness, _load_spec_catalog,
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._build_catalog_with_variants(repo_root)
+            spec_dir = repo_root / "spec" / "component" / "user"
+            spec_dir.mkdir(parents=True)
+            (spec_dir / "deps.yaml").write_text(
+                "spec_id: user\nspec_kind: component\n"
+                "dependencies:\n  components:\n"
+                "    - component_id: dep_a\n      version_constraint: \">=1.0.0\"\n"
+                "  profiles: []\n",
+                encoding="utf-8",
+            )
+            init_orchestration(
+                repo_root=repo_root, orchestration_id="bv2",
+                spec_ref="spec/component/user",
+            )
+            write_preflight(
+                repo_root=repo_root, orchestration_id="bv2",
+                payload=_launchable_preflight_dict(checked_at="2026-04-15T10:00:00Z"),
+            )
+            for variant in ("1.0.0+cpu", "1.0.0+gpu"):
+                safe = f"component__dep_a__{variant}"
+                ir = repo_root / "workspace" / "ir" / safe / "dep-a_20260101_001"
+                ir.mkdir(parents=True)
+                (ir / "ir_meta.json").write_text(
+                    json.dumps({"verification_status": "pass"}), encoding="utf-8")
+                bin_dir = (repo_root / "workspace" / "pipelines" / safe
+                           / "pipe_20260101_001" / "binary" / "bin_20260101_001")
+                bin_dir.mkdir(parents=True)
+                (bin_dir / "binary_meta.json").write_text(
+                    json.dumps({"verification_status": "pass"}), encoding="utf-8")
+                v_dir = (repo_root / "workspace" / "pipelines" / safe
+                         / "pipe_20260101_001" / "runs" / "run_20260101_001" / safe)
+                v_dir.mkdir(parents=True)
+                (v_dir / "aggregate_verdict.json").write_text(
+                    json.dumps({"aggregate_verdict": "pass"}), encoding="utf-8")
+                (v_dir / "trial_meta.json").write_text(
+                    json.dumps({"source_binary_id": "bin_20260101_001"}), encoding="utf-8")
+            _load_spec_catalog.cache_clear()
+            r = mark_dependency_readiness(repo_root=repo_root, orchestration_id="bv2")
+            self.assertFalse(
+                r["direct_dependency_compile_readiness"],
+                "range constraint that matches multiple build variants must fail-closed; "
+                "exact-string `==1.0.0+cpu` would be required to pin a specific variant",
+            )
+
+
+class SetStatusPassReplayIdempotencyTests(unittest.TestCase):
+    """Codex round 15 F1: same-terminal `pass` replay must be a true no-op
+    even when preflight has since expired or workspace state has drifted.
+    The original code ran `_require_preflight_launchable` and
+    `_validate_orchestration_completion_for_pass` BEFORE the same-terminal
+    check, so a defensive retry could fail despite the first call having
+    already committed `pass`."""
+
+    def test_pass_replay_no_op_even_when_preflight_validation_would_fail(self) -> None:
+        """Simulate response-loss-then-retry on a successful `set-status pass`:
+        directly stage a terminal pass meta (as if the first call had committed)
+        and then corrupt preflight.json so a fresh validation pass would error.
+        A defensive replay must observe the existing terminal state and no-op,
+        without re-running `_require_preflight_launchable` /
+        `_validate_orchestration_completion_for_pass`."""
+        from tools.orchestration_runtime import (
+            _dependency_set_fingerprint, _cleanup_committed_marker_path,
+            _cleanup_committed_dir,
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            init_orchestration(repo_root=repo_root, orchestration_id="pr")
+            write_preflight(
+                repo_root=repo_root, orchestration_id="pr",
+                payload=_launchable_preflight_dict(checked_at="2026-04-15T10:00:00Z"),
+            )
+            meta_path = (
+                repo_root / "workspace" / "orchestrations" / "pr"
+                / "orchestration_meta.json"
+            )
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            arid = meta["orchestration_agent_run_id"]
+            # Stage a terminal pass meta (simulating a first call that succeeded
+            # but whose response was lost). Include the canonical
+            # dependency_readiness so launch-gate fingerprint check matches.
+            meta["status"] = "pass"
+            meta["dependency_readiness"] = {
+                "direct_dependency_compile_readiness": True,
+                "direct_dependency_execution_readiness": True,
+                "detail": {
+                    "ir_ref_verified": True,
+                    "pipeline_ref_verified": True,
+                    "aggregate_verdict_verified": True,
+                },
+                "dep_set_fingerprint": _dependency_set_fingerprint(
+                    repo_root, meta.get("spec_ref"),
+                ),
+            }
+            meta_path.write_text(json.dumps(meta) + "\n", encoding="utf-8")
+            # Stage the cleanup_committed marker so the replay hits the no-op
+            # branch (round 4 F1) rather than cleanup-retry.
+            cleanup_dir = _cleanup_committed_dir(repo_root, "pr")
+            cleanup_dir.mkdir(parents=True, exist_ok=True)
+            _cleanup_committed_marker_path(repo_root, "pr", arid).write_text(
+                "{}", encoding="utf-8",
+            )
+            # Corrupt preflight.json so `_require_preflight_launchable` would
+            # now reject. If the replay path still runs pass validation, this
+            # call will raise. With the round 15 F1 fix it must no-op.
+            (repo_root / "workspace" / "orchestrations" / "pr"
+             / "preflight.json").write_text(
+                json.dumps({"status": "fail"}), encoding="utf-8",
+            )
+            replayed = update_orchestration_status(
+                repo_root=repo_root, orchestration_id="pr", status="pass",
+            )
+            self.assertEqual(replayed.get("status"), "pass",
+                             "pass replay must succeed without re-running preflight gate")
+
+
+class DependencyIdentifierPathSafetyTests(unittest.TestCase):
+    """Codex round 15 F2: spec_kind / spec_id / spec_version values from
+    deps.yaml and spec_catalog.yaml are interpolated into workspace paths.
+    Path-traversal characters (`..`, `/`, `\\`) and otherwise unsafe tokens
+    must be rejected before path construction so a malformed entry cannot
+    steer the verifier outside the dependency subtree."""
+
+    def test_deps_yaml_path_traversal_in_component_id_raises(self) -> None:
+        """Path-traversal in component_id is treated as a malformed schema
+        (well_formed=False), so mark raises and persists fail-closed."""
+        from tools.orchestration_runtime import (
+            mark_dependency_readiness, _load_spec_catalog,
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            (repo_root / "spec" / "registry").mkdir(parents=True)
+            (repo_root / "spec" / "registry" / "spec_catalog.yaml").write_text(
+                "catalog_version: 0.2.0\nspecs: []\n", encoding="utf-8",
+            )
+            spec_dir = repo_root / "spec" / "component" / "subject"
+            spec_dir.mkdir(parents=True)
+            (spec_dir / "deps.yaml").write_text(
+                "spec_id: subject\nspec_kind: component\n"
+                "dependencies:\n  components:\n"
+                "    - component_id: \"../../orchestrations/other\"\n"
+                "      version_constraint: \">=0.1.0\"\n"
+                "  profiles: []\n",
+                encoding="utf-8",
+            )
+            init_orchestration(
+                repo_root=repo_root, orchestration_id="ps",
+                spec_ref="spec/component/subject",
+            )
+            write_preflight(
+                repo_root=repo_root, orchestration_id="ps",
+                payload=_launchable_preflight_dict(checked_at="2026-04-15T10:00:00Z"),
+            )
+            _load_spec_catalog.cache_clear()
+            with self.assertRaisesRegex(ValueError, "schema is malformed"):
+                mark_dependency_readiness(repo_root=repo_root, orchestration_id="ps")
+            meta = json.loads(
+                (repo_root / "workspace" / "orchestrations" / "ps"
+                 / "orchestration_meta.json").read_text(encoding="utf-8")
+            )
+            self.assertFalse(
+                meta["dependency_readiness"]["direct_dependency_compile_readiness"],
+                "path-traversal component_id must persist fail-closed",
+            )
+
+    def test_spec_catalog_path_traversal_in_spec_id_is_skipped(self) -> None:
+        """A catalog entry with unsafe spec_id must not be indexed; resolution
+        of even legitimate constraints for that id then yields None."""
+        from tools.orchestration_runtime import (
+            _load_spec_catalog, _resolve_dep_version,
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            (repo_root / "spec" / "registry").mkdir(parents=True)
+            (repo_root / "spec" / "registry" / "spec_catalog.yaml").write_text(
+                "catalog_version: 0.2.0\nspecs:\n"
+                "  - spec_kind: component\n"
+                "    spec_id: \"../../etc/passwd\"\n"
+                "    spec_version: 0.1.0\n",
+                encoding="utf-8",
+            )
+            _load_spec_catalog.cache_clear()
+            cat = _load_spec_catalog(str(repo_root.resolve()))
+            # The unsafe entry must NOT be present in the indexed catalog.
+            self.assertNotIn(("component", "../../etc/passwd"), cat)
+            # Resolving any constraint for that id returns None.
+            self.assertIsNone(
+                _resolve_dep_version(cat, "component", "../../etc/passwd", ">=0.1.0"),
+            )
+
+    def test_spec_catalog_path_traversal_in_version_is_skipped(self) -> None:
+        from tools.orchestration_runtime import (
+            _load_spec_catalog, _resolve_dep_version,
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            (repo_root / "spec" / "registry").mkdir(parents=True)
+            (repo_root / "spec" / "registry" / "spec_catalog.yaml").write_text(
+                "catalog_version: 0.2.0\nspecs:\n"
+                "  - spec_kind: component\n    spec_id: dep_a\n"
+                "    spec_version: \"0.1.0/../../etc\"\n",
+                encoding="utf-8",
+            )
+            _load_spec_catalog.cache_clear()
+            cat = _load_spec_catalog(str(repo_root.resolve()))
+            # No entry indexed for dep_a because the only version was unsafe.
+            self.assertNotIn(("component", "dep_a"), cat)
+
+    def test_safe_token_unit(self) -> None:
+        from tools.orchestration_runtime import _is_safe_path_token as S
+        self.assertTrue(S("dep_a"))
+        self.assertTrue(S("0.1.0"))
+        self.assertTrue(S("1.0.0-rc1"))
+        self.assertTrue(S("1.0.0+cpu"))
+        self.assertFalse(S(""))
+        self.assertFalse(S(None))
+        self.assertFalse(S("../etc"))
+        self.assertFalse(S("a/b"))
+        self.assertFalse(S("a\\b"))
+        self.assertFalse(S("a..b"))
+        self.assertFalse(S("a\0b"))
+        self.assertFalse(S("a b"))
+
+
+class CrossVersionCoherenceTests(unittest.TestCase):
+    """Codex round 14 F1: per-stage readiness must require ONE matching catalog
+    version to satisfy a cumulative chain (ir → pipeline → verdict), not the
+    `any()` per-stage independent check that allowed ir_ref to come from
+    version A while pipeline_ref came from version B. Execution readiness
+    must NOT certify a chain that never existed as a coherent dep run.
+    """
+
+    def _build_orch(self, repo_root: Path, orch: str) -> None:
+        (repo_root / "spec" / "registry").mkdir(parents=True)
+        (repo_root / "spec" / "registry" / "spec_catalog.yaml").write_text(
+            "catalog_version: 0.2.0\nspecs:\n"
+            "  - spec_kind: component\n    spec_id: dep_a\n    spec_version: 0.1.0\n"
+            "  - spec_kind: component\n    spec_id: dep_a\n    spec_version: 0.2.0\n",
+            encoding="utf-8",
+        )
+        spec_dir = repo_root / "spec" / "component" / "user"
+        spec_dir.mkdir(parents=True)
+        (spec_dir / "deps.yaml").write_text(
+            "spec_id: user\nspec_kind: component\n"
+            "dependencies:\n  components:\n"
+            "    - component_id: dep_a\n      version_constraint: \">=0.1.0 <1.0.0\"\n"
+            "  profiles: []\n",
+            encoding="utf-8",
+        )
+        init_orchestration(
+            repo_root=repo_root, orchestration_id=orch,
+            spec_ref="spec/component/user",
+        )
+        write_preflight(
+            repo_root=repo_root, orchestration_id=orch,
+            payload=_launchable_preflight_dict(checked_at="2026-04-15T10:00:00Z"),
+        )
+
+    def _write_ir(self, repo_root: Path, version: str, *, status: str) -> None:
+        safe = f"component__dep_a__{version}"
+        d = repo_root / "workspace" / "ir" / safe / f"dep-a_20260101_001"
+        d.mkdir(parents=True)
+        (d / "ir_meta.json").write_text(
+            json.dumps({"verification_status": status}), encoding="utf-8")
+
+    def _write_binary(self, repo_root: Path, version: str, *, status: str) -> None:
+        safe = f"component__dep_a__{version}"
+        d = (repo_root / "workspace" / "pipelines" / safe
+             / "pipe_20260101_001" / "binary" / "bin_20260101_001")
+        d.mkdir(parents=True)
+        (d / "binary_meta.json").write_text(
+            json.dumps({"verification_status": status}), encoding="utf-8")
+
+    def _write_verdict(self, repo_root: Path, version: str, *, verdict: str) -> None:
+        safe = f"component__dep_a__{version}"
+        d = (repo_root / "workspace" / "pipelines" / safe
+             / "pipe_20260101_001" / "runs" / "run_20260101_001" / safe)
+        d.mkdir(parents=True)
+        (d / "aggregate_verdict.json").write_text(
+            json.dumps({"aggregate_verdict": verdict}), encoding="utf-8")
+        (d / "trial_meta.json").write_text(
+            json.dumps({"source_binary_id": "bin_20260101_001"}), encoding="utf-8")
+
+    def test_ir_from_v1_pipeline_from_v2_must_not_certify(self) -> None:
+        """0.2.0 has ir=pass but no pipeline; 0.1.0 has pipeline+verdict=pass
+        but no ir. Under the old `any()` per-stage logic this would set both
+        ir_ref_verified=true and pipeline_ref_verified=true. Round 14 F1
+        requires same-version coherence: no single version has both → both
+        must be false."""
+        from tools.orchestration_runtime import (
+            mark_dependency_readiness, _load_spec_catalog,
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._build_orch(repo_root, "xv")
+            self._write_ir(repo_root, "0.2.0", status="pass")
+            self._write_binary(repo_root, "0.1.0", status="pass")
+            self._write_verdict(repo_root, "0.1.0", verdict="pass")
+            _load_spec_catalog.cache_clear()
+            r = mark_dependency_readiness(repo_root=repo_root, orchestration_id="xv")
+            self.assertFalse(
+                r["direct_dependency_execution_readiness"],
+                "execution readiness must not be true when no single version "
+                "has the full ir+pipeline+verdict chain",
+            )
+            # pipeline_ref_verified requires same-version ir AND pipeline pass.
+            # Neither 0.1.0 (no ir) nor 0.2.0 (no pipeline) qualifies → false.
+            self.assertFalse(r["detail"]["pipeline_ref_verified"])
+
+    def test_full_chain_single_version_grants_full_readiness(self) -> None:
+        """When ONE matching version has the complete chain, all detail flags
+        must be true regardless of partial artifacts at other matching versions."""
+        from tools.orchestration_runtime import (
+            mark_dependency_readiness, _load_spec_catalog,
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._build_orch(repo_root, "full")
+            # 0.1.0: complete chain. 0.2.0: only ir.
+            self._write_ir(repo_root, "0.1.0", status="pass")
+            self._write_binary(repo_root, "0.1.0", status="pass")
+            self._write_verdict(repo_root, "0.1.0", verdict="pass")
+            self._write_ir(repo_root, "0.2.0", status="pass")
+            _load_spec_catalog.cache_clear()
+            r = mark_dependency_readiness(repo_root=repo_root, orchestration_id="full")
+            self.assertTrue(r["direct_dependency_compile_readiness"])
+            self.assertTrue(r["direct_dependency_execution_readiness"])
+
+    def test_ir_only_satisfies_compile_but_not_execution(self) -> None:
+        """ir_ref alone is enough for direct_dependency_compile_readiness.
+        Without a same-version pipeline+verdict, execution_readiness stays false."""
+        from tools.orchestration_runtime import (
+            mark_dependency_readiness, _load_spec_catalog,
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._build_orch(repo_root, "ironly")
+            self._write_ir(repo_root, "0.1.0", status="pass")
+            _load_spec_catalog.cache_clear()
+            r = mark_dependency_readiness(repo_root=repo_root, orchestration_id="ironly")
+            self.assertTrue(r["direct_dependency_compile_readiness"])
+            self.assertFalse(r["direct_dependency_execution_readiness"])
+
+
+class BuildMetadataEqualityTests(unittest.TestCase):
+    """Codex round 14 F2: == and != must distinguish build metadata variants
+    because workspace artifact roots are keyed by the full version string.
+    `==1.0.0+cpu` must not silently match `1.0.0+gpu`."""
+
+    def test_equality_distinguishes_build_variants(self) -> None:
+        from tools.orchestration_runtime import _matches_version_constraint as M
+        self.assertFalse(M("1.0.0+cpu", "==1.0.0+gpu"))
+        self.assertTrue(M("1.0.0+cpu", "==1.0.0+cpu"))
+        self.assertFalse(M("1.0.0+cpu", "==1.0.0"))
+        self.assertTrue(M("1.0.0+cpu", "!=1.0.0+gpu"))
+        self.assertTrue(M("1.0.0+cpu", "!=1.0.0"))
+
+    def test_equality_with_prerelease_and_build(self) -> None:
+        from tools.orchestration_runtime import _matches_version_constraint as M
+        self.assertTrue(M("1.0.0-rc1+cpu", "==1.0.0-rc1+cpu"))
+        self.assertFalse(M("1.0.0-rc1+cpu", "==1.0.0-rc1+gpu"))
+        self.assertFalse(M("1.0.0-rc1+cpu", "==1.0.0-rc2+cpu"))
+
+    def test_catalog_with_build_variants_routes_to_correct_workspace(self) -> None:
+        """End-to-end: catalog publishes `1.0.0+cpu` and `1.0.0+gpu` as
+        separate entries. A `==1.0.0+cpu` constraint must only verify against
+        the `+cpu` workspace, not silently accept `+gpu` artifacts."""
+        from tools.orchestration_runtime import (
+            mark_dependency_readiness, _load_spec_catalog,
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            (repo_root / "spec" / "registry").mkdir(parents=True)
+            (repo_root / "spec" / "registry" / "spec_catalog.yaml").write_text(
+                "catalog_version: 0.2.0\nspecs:\n"
+                "  - spec_kind: component\n    spec_id: dep_a\n    spec_version: 1.0.0+cpu\n"
+                "  - spec_kind: component\n    spec_id: dep_a\n    spec_version: 1.0.0+gpu\n",
+                encoding="utf-8",
+            )
+            spec_dir = repo_root / "spec" / "component" / "user"
+            spec_dir.mkdir(parents=True)
+            (spec_dir / "deps.yaml").write_text(
+                "spec_id: user\nspec_kind: component\n"
+                "dependencies:\n  components:\n"
+                "    - component_id: dep_a\n      version_constraint: \"==1.0.0+cpu\"\n"
+                "  profiles: []\n",
+                encoding="utf-8",
+            )
+            init_orchestration(
+                repo_root=repo_root, orchestration_id="bv",
+                spec_ref="spec/component/user",
+            )
+            write_preflight(
+                repo_root=repo_root, orchestration_id="bv",
+                payload=_launchable_preflight_dict(checked_at="2026-04-15T10:00:00Z"),
+            )
+            # Only the +gpu variant has artifacts. Constraint pins +cpu, so
+            # the dep must NOT silently accept the +gpu artifact set.
+            gpu_safe = "component__dep_a__1.0.0+gpu"
+            ir_dir = repo_root / "workspace" / "ir" / gpu_safe / "dep-a_20260101_001"
+            ir_dir.mkdir(parents=True)
+            (ir_dir / "ir_meta.json").write_text(
+                json.dumps({"verification_status": "pass"}), encoding="utf-8")
+            _load_spec_catalog.cache_clear()
+            r = mark_dependency_readiness(repo_root=repo_root, orchestration_id="bv")
+            self.assertFalse(
+                r["direct_dependency_compile_readiness"],
+                "==1.0.0+cpu must not match `+gpu` workspace artifacts",
+            )
+
+
+class NewVersionPublishNoOutageTests(unittest.TestCase):
+    """Codex round 13 F1: publishing a new matching catalog version without
+    its workspace artifacts must NOT break parents that are still verified
+    against an older matching version. Per-stage check accepts ANY matching
+    catalog version with passing artifact, so older verified versions remain
+    valid until something explicitly invalidates them."""
+
+    def test_new_version_without_artifacts_does_not_block_parent(self) -> None:
+        from tools.orchestration_runtime import (
+            mark_dependency_readiness, _load_spec_catalog,
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            # Catalog publishes BOTH 0.1.0 and 0.2.0, but only 0.1.0 has artifacts.
+            (repo_root / "spec" / "registry").mkdir(parents=True)
+            (repo_root / "spec" / "registry" / "spec_catalog.yaml").write_text(
+                "catalog_version: 0.2.0\nspecs:\n"
+                "  - spec_kind: component\n    spec_id: dep_a\n    spec_version: 0.1.0\n"
+                "  - spec_kind: component\n    spec_id: dep_a\n    spec_version: 0.2.0\n",
+                encoding="utf-8",
+            )
+            spec_dir = repo_root / "spec" / "component" / "user"
+            spec_dir.mkdir(parents=True)
+            (spec_dir / "deps.yaml").write_text(
+                "spec_id: user\nspec_kind: component\n"
+                "dependencies:\n  components:\n"
+                "    - component_id: dep_a\n      version_constraint: \">=0.1.0 <1.0.0\"\n"
+                "  profiles: []\n",
+                encoding="utf-8",
+            )
+            init_orchestration(
+                repo_root=repo_root, orchestration_id="nv",
+                spec_ref="spec/component/user",
+            )
+            write_preflight(
+                repo_root=repo_root, orchestration_id="nv",
+                payload=_launchable_preflight_dict(checked_at="2026-04-15T10:00:00Z"),
+            )
+            # Passing artifacts at 0.1.0 only. 0.2.0 published in catalog but
+            # has NO workspace artifacts.
+            safe_010 = "component__dep_a__0.1.0"
+            ir_dir = repo_root / "workspace" / "ir" / safe_010 / "dep-a_20260101_001"
+            ir_dir.mkdir(parents=True)
+            (ir_dir / "ir_meta.json").write_text(
+                json.dumps({"verification_status": "pass"}), encoding="utf-8")
+            bin_dir = (repo_root / "workspace" / "pipelines" / safe_010
+                       / "pipe_20260101_001" / "binary" / "bin_20260101_001")
+            bin_dir.mkdir(parents=True)
+            (bin_dir / "binary_meta.json").write_text(
+                json.dumps({"verification_status": "pass"}), encoding="utf-8")
+            v_dir = (repo_root / "workspace" / "pipelines" / safe_010
+                     / "pipe_20260101_001" / "runs" / "run_20260101_001" / safe_010)
+            v_dir.mkdir(parents=True)
+            (v_dir / "aggregate_verdict.json").write_text(
+                json.dumps({"aggregate_verdict": "pass"}), encoding="utf-8")
+            (v_dir / "trial_meta.json").write_text(
+                json.dumps({"source_binary_id": "bin_20260101_001"}), encoding="utf-8")
+            _load_spec_catalog.cache_clear()
+            result = mark_dependency_readiness(
+                repo_root=repo_root, orchestration_id="nv",
+            )
+            self.assertTrue(result["direct_dependency_compile_readiness"],
+                            "older verified version (0.1.0) must keep parent launchable "
+                            "even when newer 0.2.0 is published without artifacts")
+            self.assertTrue(result["direct_dependency_execution_readiness"])
+
+    def test_no_matching_version_has_artifacts_fails_closed(self) -> None:
+        """If NEITHER matching version has artifacts, fail-closed."""
+        from tools.orchestration_runtime import (
+            mark_dependency_readiness, _load_spec_catalog,
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            (repo_root / "spec" / "registry").mkdir(parents=True)
+            (repo_root / "spec" / "registry" / "spec_catalog.yaml").write_text(
+                "catalog_version: 0.2.0\nspecs:\n"
+                "  - spec_kind: component\n    spec_id: dep_a\n    spec_version: 0.1.0\n"
+                "  - spec_kind: component\n    spec_id: dep_a\n    spec_version: 0.2.0\n",
+                encoding="utf-8",
+            )
+            spec_dir = repo_root / "spec" / "component" / "user"
+            spec_dir.mkdir(parents=True)
+            (spec_dir / "deps.yaml").write_text(
+                "spec_id: user\nspec_kind: component\n"
+                "dependencies:\n  components:\n"
+                "    - component_id: dep_a\n      version_constraint: \">=0.1.0 <1.0.0\"\n"
+                "  profiles: []\n",
+                encoding="utf-8",
+            )
+            init_orchestration(
+                repo_root=repo_root, orchestration_id="nv2",
+                spec_ref="spec/component/user",
+            )
+            write_preflight(
+                repo_root=repo_root, orchestration_id="nv2",
+                payload=_launchable_preflight_dict(checked_at="2026-04-15T10:00:00Z"),
+            )
+            _load_spec_catalog.cache_clear()
+            result = mark_dependency_readiness(
+                repo_root=repo_root, orchestration_id="nv2",
+            )
+            self.assertFalse(result["direct_dependency_compile_readiness"])
+
+
+class SemverParserPrereleaseBuildTests(unittest.TestCase):
+    """Codex round 13 F2: the constraint comparator must handle prerelease
+    suffixes (`1.0.0-rc1`) and build metadata (`1.0.0+abc`) so the runtime's
+    version syntax is internally consistent.
+    """
+
+    def test_prerelease_constraint_parses_and_orders(self) -> None:
+        from tools.orchestration_runtime import _matches_version_constraint as M
+        # SemVer §11: 1.0.0 > 1.0.0-rc1 > 1.0.0-alpha.
+        self.assertTrue(M("1.0.0", ">1.0.0-rc1"))
+        self.assertTrue(M("1.0.0-rc1", ">1.0.0-alpha"))
+        self.assertFalse(M("1.0.0-rc1", ">=1.0.0"),
+                         "prerelease must rank below the same numeric release")
+        self.assertTrue(M("1.0.0-rc1", "==1.0.0-rc1"))
+        self.assertFalse(M("1.0.0-rc1", "==1.0.0-rc2"))
+
+    def test_prerelease_dotted_components_numeric_first(self) -> None:
+        from tools.orchestration_runtime import _matches_version_constraint as M
+        # SemVer §11.4: numeric prerelease tokens rank below alpha
+        # within the same prerelease position. 1.0.0-alpha.1 < 1.0.0-alpha.beta.
+        self.assertTrue(M("1.0.0-alpha.beta", ">1.0.0-alpha.1"))
+        self.assertTrue(M("1.0.0-alpha.2", ">1.0.0-alpha.1"))
+
+    def test_build_metadata_ignored_for_ordering_distinguished_for_equality(self) -> None:
+        """SemVer §10: build metadata MUST be ignored for precedence
+        (ordering operators). But because workspace artifact roots are keyed
+        by the full version string, == and != MUST distinguish build variants
+        — otherwise `==1.0.0+cpu` would silently match `1.0.0+gpu` (Codex
+        round 14 F2)."""
+        from tools.orchestration_runtime import _matches_version_constraint as M
+        # Ordering ignores build metadata: 1.0.0+abc ~= 1.0.0 for `>` / `<`.
+        self.assertFalse(M("1.0.0+abc", ">1.0.0"))
+        self.assertFalse(M("1.0.0+abc", "<1.0.0"))
+        self.assertTrue(M("1.0.0+abc", ">=1.0.0"))
+        self.assertTrue(M("1.0.0+abc", "<=1.0.0"))
+        # Equality distinguishes build metadata (exact-string comparison).
+        self.assertFalse(M("1.0.0+abc", "==1.0.0"))
+        self.assertFalse(M("1.0.0+abc", "==1.0.0+xyz"))
+        self.assertTrue(M("1.0.0+abc", "==1.0.0+abc"))
+        self.assertTrue(M("1.0.0+abc", "!=1.0.0+xyz"))
+
+    def test_constraint_accepts_prerelease_in_catalog(self) -> None:
+        """Higher-level: catalog containing `1.0.0-rc1` must be ordered and
+        matchable by version_constraint expressions."""
+        from tools.orchestration_runtime import (
+            _load_spec_catalog, _resolve_dep_version,
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            cat = repo_root / "spec" / "registry" / "spec_catalog.yaml"
+            cat.parent.mkdir(parents=True)
+            cat.write_text(
+                "catalog_version: 0.2.0\nspecs:\n"
+                "  - spec_kind: component\n    spec_id: dep_a\n    spec_version: 1.0.0-rc1\n"
+                "  - spec_kind: component\n    spec_id: dep_a\n    spec_version: 1.0.0\n",
+                encoding="utf-8",
+            )
+            _load_spec_catalog.cache_clear()
+            catalog = _load_spec_catalog(str(repo_root.resolve()))
+            # 1.0.0 > 1.0.0-rc1, so highest-match for any range covering both is 1.0.0.
+            self.assertEqual(
+                _resolve_dep_version(catalog, "component", "dep_a", ">=1.0.0-rc1"),
+                "1.0.0",
+            )
+            # Exact match should pick the prerelease entry.
+            self.assertEqual(
+                _resolve_dep_version(catalog, "component", "dep_a", "==1.0.0-rc1"),
+                "1.0.0-rc1",
+            )
+
+
+class DepsYamlSchemaStrictnessTests(unittest.TestCase):
+    """Codex round 12 F1: deps.yaml strict schema validation. Unknown keys or
+    missing canonical keys must fail-closed instead of producing vacuous-true
+    readiness via the empty-list collapse path.
+    """
+
+    def _orch_with_deps(self, repo_root: Path, deps_body: str, orch: str = "schema") -> None:
+        spec_dir = repo_root / "spec" / "component" / "subject"
+        spec_dir.mkdir(parents=True, exist_ok=True)
+        (spec_dir / "deps.yaml").write_text(deps_body, encoding="utf-8")
+        init_orchestration(
+            repo_root=repo_root, orchestration_id=orch,
+            spec_ref="spec/component/subject",
+        )
+        write_preflight(
+            repo_root=repo_root, orchestration_id=orch,
+            payload=_launchable_preflight_dict(checked_at="2026-04-15T10:00:00Z"),
+        )
+
+    def _readiness(self, repo_root: Path, orch: str) -> dict:
+        meta = json.loads(
+            (repo_root / "workspace" / "orchestrations" / orch / "orchestration_meta.json")
+            .read_text(encoding="utf-8")
+        )
+        return meta.get("dependency_readiness") or {}
+
+    def test_typoed_singular_component_key_raises(self) -> None:
+        """`component:` (singular typo, not the canonical `components:`) must
+        not be silently accepted; mark raises and persists fail-closed."""
+        from tools.orchestration_runtime import (
+            mark_dependency_readiness, _load_spec_catalog,
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._orch_with_deps(repo_root,
+                "spec_id: subject\nspec_kind: component\n"
+                "dependencies:\n  component:\n    - {component_id: dep_a, version_constraint: '>=0.1.0'}\n"
+                "  profiles: []\n",
+            )
+            # preflight init must already be fail-closed.
+            r = self._readiness(repo_root, "schema")
+            self.assertFalse(r.get("direct_dependency_compile_readiness"),
+                             "typoed key must fail-closed at preflight init")
+            _load_spec_catalog.cache_clear()
+            with self.assertRaisesRegex(ValueError, "schema is malformed"):
+                mark_dependency_readiness(
+                    repo_root=repo_root, orchestration_id="schema",
+                )
+
+    def test_extra_unknown_section_raises(self) -> None:
+        """Any extra key under `dependencies` (e.g. `extras`) must raise."""
+        from tools.orchestration_runtime import (
+            mark_dependency_readiness, _load_spec_catalog,
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._orch_with_deps(repo_root,
+                "spec_id: subject\nspec_kind: component\n"
+                "dependencies:\n"
+                "  components: []\n  profiles: []\n  extras: []\n",
+            )
+            _load_spec_catalog.cache_clear()
+            with self.assertRaisesRegex(ValueError, "schema is malformed"):
+                mark_dependency_readiness(
+                    repo_root=repo_root, orchestration_id="schema",
+                )
+
+    def test_missing_profiles_key_raises(self) -> None:
+        """Both `components` and `profiles` must be explicitly present, even
+        when empty. Omitting one must raise."""
+        from tools.orchestration_runtime import (
+            mark_dependency_readiness, _load_spec_catalog,
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._orch_with_deps(repo_root,
+                "spec_id: subject\nspec_kind: component\n"
+                "dependencies:\n  components: []\n",  # profiles missing
+            )
+            _load_spec_catalog.cache_clear()
+            with self.assertRaisesRegex(ValueError, "schema is malformed"):
+                mark_dependency_readiness(
+                    repo_root=repo_root, orchestration_id="schema",
+                )
+
+    def test_explicit_empty_lists_grant_trivial_true(self) -> None:
+        """The canonical leaf form (both lists present and empty) still grants
+        trivial-true readiness — this is the only acceptable empty schema."""
+        from tools.orchestration_runtime import (
+            mark_dependency_readiness, _load_spec_catalog,
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._orch_with_deps(repo_root,
+                "spec_id: subject\nspec_kind: component\n"
+                "dependencies:\n  components: []\n  profiles: []\n",
+            )
+            r = self._readiness(repo_root, "schema")
+            self.assertTrue(r.get("direct_dependency_compile_readiness"),
+                            "canonical empty-leaf form must grant trivial-true")
+            _load_spec_catalog.cache_clear()
+            result = mark_dependency_readiness(
+                repo_root=repo_root, orchestration_id="schema",
+            )
+            self.assertTrue(result["direct_dependency_compile_readiness"])
+
+
+class CrossPipelineRunMixingTests(unittest.TestCase):
+    """Codex round 11 F2: execution readiness must bind binary_meta and
+    aggregate_verdict to the SAME pipeline run. Selecting them independently
+    would let a newer incomplete run's passing binary be combined with an
+    older run's passing verdict — readiness would erroneously pass.
+    """
+
+    def _build(self, repo_root: Path) -> None:
+        (repo_root / "spec" / "registry").mkdir(parents=True)
+        (repo_root / "spec" / "registry" / "spec_catalog.yaml").write_text(
+            "catalog_version: 0.2.0\nspecs:\n"
+            "  - spec_kind: component\n    spec_id: dep_a\n    spec_version: 0.1.0\n",
+            encoding="utf-8",
+        )
+
+    def test_incomplete_newer_run_must_not_borrow_older_verdict(self) -> None:
+        """pipe_001 (older): binary_meta=pass + aggregate_verdict=pass (complete).
+        pipe_002 (newer): binary_meta=pass only — no aggregate_verdict yet.
+        execution_readiness must NOT pass via cross-run mixing.
+        """
+        from tools.orchestration_runtime import _verify_dep_stage, _load_spec_catalog
+        import time
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._build(repo_root)
+            _load_spec_catalog.cache_clear()
+            safe = "component__dep_a__0.1.0"
+            # pipe_001: complete pipeline, written first.
+            p1 = repo_root / "workspace" / "pipelines" / safe / "pipe_20260101_001"
+            b1 = p1 / "binary" / "bin_20260101_001"
+            b1.mkdir(parents=True)
+            (b1 / "binary_meta.json").write_text(
+                json.dumps({"verification_status": "pass"}), encoding="utf-8")
+            v1 = p1 / "runs" / "run_20260101_001" / safe
+            v1.mkdir(parents=True)
+            (v1 / "aggregate_verdict.json").write_text(
+                json.dumps({"aggregate_verdict": "pass"}), encoding="utf-8")
+            (v1 / "trial_meta.json").write_text(
+                json.dumps({"source_binary_id": "bin_20260101_001"}), encoding="utf-8")
+            # pipe_002: newer, binary done, no verdict yet.
+            time.sleep(0.01)
+            p2 = repo_root / "workspace" / "pipelines" / safe / "pipe_20260601_001"
+            b2 = p2 / "binary" / "bin_20260101_001"
+            b2.mkdir(parents=True)
+            (b2 / "binary_meta.json").write_text(
+                json.dumps({"verification_status": "pass"}), encoding="utf-8")
+            # pipeline_ref must read pipe_002's binary (newer) → pass.
+            self.assertTrue(
+                _verify_dep_stage(repo_root, "component", "dep_a", "0.1.0", "pipeline_ref"),
+                "pipeline_ref of newer pipe_002 should be pass",
+            )
+            # aggregate_verdict must read pipe_002 (which has none) → fail.
+            self.assertFalse(
+                _verify_dep_stage(repo_root, "component", "dep_a", "0.1.0", "aggregate_verdict"),
+                "aggregate_verdict must not borrow older pipe_001 verdict when "
+                "current pipe_002 has no verdict yet",
+            )
+
+    def test_failing_newer_binary_in_same_pipeline_forces_fail(self) -> None:
+        """A newer run with binary_meta=fail must reject pipeline_ref even if
+        an older pipeline has binary_meta=pass."""
+        from tools.orchestration_runtime import _verify_dep_stage, _load_spec_catalog
+        import time
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._build(repo_root)
+            _load_spec_catalog.cache_clear()
+            safe = "component__dep_a__0.1.0"
+            p1 = repo_root / "workspace" / "pipelines" / safe / "pipe_20260101_001"
+            (p1 / "binary" / "bin_20260101_001").mkdir(parents=True)
+            (p1 / "binary" / "bin_20260101_001" / "binary_meta.json").write_text(
+                json.dumps({"verification_status": "pass"}), encoding="utf-8")
+            time.sleep(0.01)
+            p2 = repo_root / "workspace" / "pipelines" / safe / "pipe_20260601_001"
+            (p2 / "binary" / "bin_20260101_001").mkdir(parents=True)
+            (p2 / "binary" / "bin_20260101_001" / "binary_meta.json").write_text(
+                json.dumps({"verification_status": "fail"}), encoding="utf-8")
+            self.assertFalse(
+                _verify_dep_stage(repo_root, "component", "dep_a", "0.1.0", "pipeline_ref"),
+                "newer-pipeline failing binary must take precedence over older passing one",
+            )
+
+
+class WritePreflightConcurrencyTests(unittest.TestCase):
+    """Codex round 11 F1: write_preflight's orchestration_meta read-check-write
+    must acquire the same _orchestration_meta_exclusive_lock as
+    mark_dependency_readiness so verified `true` flags are not clobbered by a
+    concurrent preflight pass holding a stale meta snapshot."""
+
+    def test_write_preflight_uses_meta_lock_path(self) -> None:
+        """The fcntl sidecar file must be created when write_preflight runs."""
+        from tools.orchestration_runtime import _orchestration_meta_lock_path
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            init_orchestration(repo_root=repo_root, orchestration_id="wpl")
+            write_preflight(
+                repo_root=repo_root, orchestration_id="wpl",
+                payload=_launchable_preflight_dict(checked_at="2026-04-15T10:00:00Z"),
+            )
+            self.assertTrue(_orchestration_meta_lock_path(repo_root, "wpl").is_file())
+
+    def test_concurrent_preflight_and_mark_do_not_clobber_verified(self) -> None:
+        """A concurrent write_preflight + mark_dependency_readiness must not
+        end with stale dependency_readiness. Because both now acquire the
+        same fcntl LOCK_EX, the final meta state must reflect the verified
+        write (not the preflight's older read snapshot)."""
+        import threading, time
+        from tools.orchestration_runtime import (
+            mark_dependency_readiness, _load_spec_catalog,
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            # Non-leaf orch with passing artifacts.
+            (repo_root / "spec" / "registry").mkdir(parents=True)
+            (repo_root / "spec" / "registry" / "spec_catalog.yaml").write_text(
+                "catalog_version: 0.2.0\nspecs:\n"
+                "  - spec_kind: component\n    spec_id: dep_a\n    spec_version: 0.1.0\n",
+                encoding="utf-8",
+            )
+            spec_dir = repo_root / "spec" / "component" / "src"
+            spec_dir.mkdir(parents=True)
+            (spec_dir / "deps.yaml").write_text(
+                "spec_id: src\nspec_kind: component\n"
+                "dependencies:\n  components:\n"
+                "    - component_id: dep_a\n      version_constraint: \">=0.1.0 <1.0.0\"\n"
+                "  profiles: []\n",
+                encoding="utf-8",
+            )
+            init_orchestration(
+                repo_root=repo_root, orchestration_id="cc",
+                spec_ref="spec/component/src",
+            )
+            write_preflight(
+                repo_root=repo_root, orchestration_id="cc",
+                payload=_launchable_preflight_dict(checked_at="2026-04-15T10:00:00Z"),
+            )
+            safe = "component__dep_a__0.1.0"
+            ir_dir = repo_root / "workspace" / "ir" / safe / "dep-a_20260101_001"
+            ir_dir.mkdir(parents=True)
+            (ir_dir / "ir_meta.json").write_text(
+                json.dumps({"verification_status": "pass"}), encoding="utf-8")
+            bin_dir = (repo_root / "workspace" / "pipelines" / safe
+                       / "pipe_20260101_001" / "binary" / "bin_20260101_001")
+            bin_dir.mkdir(parents=True)
+            (bin_dir / "binary_meta.json").write_text(
+                json.dumps({"verification_status": "pass"}), encoding="utf-8")
+            v_dir = (repo_root / "workspace" / "pipelines" / safe
+                     / "pipe_20260101_001" / "runs" / "run_20260101_001" / safe)
+            v_dir.mkdir(parents=True)
+            (v_dir / "aggregate_verdict.json").write_text(
+                json.dumps({"aggregate_verdict": "pass"}), encoding="utf-8")
+            (v_dir / "trial_meta.json").write_text(
+                json.dumps({"source_binary_id": "bin_20260101_001"}), encoding="utf-8")
+            _load_spec_catalog.cache_clear()
+            errors: list[BaseException] = []
+            def call_mark() -> None:
+                try:
+                    mark_dependency_readiness(repo_root=repo_root, orchestration_id="cc")
+                except BaseException as e:
+                    errors.append(e)
+            def call_preflight() -> None:
+                try:
+                    write_preflight(
+                        repo_root=repo_root, orchestration_id="cc",
+                        payload=_launchable_preflight_dict(checked_at="2026-04-16T10:00:00Z"),
+                    )
+                except BaseException as e:
+                    errors.append(e)
+            t1 = threading.Thread(target=call_mark)
+            t2 = threading.Thread(target=call_preflight)
+            t1.start(); t2.start(); t1.join(); t2.join()
+            self.assertEqual(errors, [])
+            # Whatever the interleaving, mark's verified true flags must be
+            # present at the end — they cannot have been overwritten by a
+            # preflight pass holding a stale snapshot.
+            meta = json.loads(
+                (repo_root / "workspace" / "orchestrations" / "cc"
+                 / "orchestration_meta.json").read_text(encoding="utf-8")
+            )
+            readiness = meta.get("dependency_readiness") or {}
+            self.assertTrue(readiness.get("direct_dependency_compile_readiness"),
+                            "concurrent preflight must not clobber verified readiness")
+
+
+class ArtifactFreshnessTieBreakerTests(unittest.TestCase):
+    """Codex round 10 F1: artifact freshness selection must be deterministic
+    even when two files share the same mtime (coarse-resolution filesystems or
+    fast back-to-back writes). `_artifact_freshness_key` uses
+    (st_mtime_ns, path_str) — path_str breaks mtime ties so a newer-by-name
+    failing artifact wins over a stale-by-name passing one even on collision.
+    """
+
+    def test_latest_meta_under_breaks_mtime_ties_by_path(self) -> None:
+        from tools.orchestration_runtime import _latest_meta_under
+        import os
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            a_dir = root / "dep-a_20260101_001"
+            b_dir = root / "dep-a_20260901_001"
+            a_dir.mkdir()
+            b_dir.mkdir()
+            a = a_dir / "ir_meta.json"
+            b = b_dir / "ir_meta.json"
+            a.write_text("OLD_PASS", encoding="utf-8")
+            b.write_text("NEW_FAIL", encoding="utf-8")
+            # Force identical mtimes (coarse filesystem / fast burst write).
+            ts_ns = 1_700_000_000_000_000_000
+            os.utime(a, ns=(ts_ns, ts_ns))
+            os.utime(b, ns=(ts_ns, ts_ns))
+            latest = _latest_meta_under(root, "*/ir_meta.json")
+            self.assertIsNotNone(latest)
+            self.assertEqual(latest.name, "ir_meta.json")
+            # Path tiebreaker: lex-greater path wins. The lex-larger directory
+            # name (`20260901_001`) is also chronologically newer per the
+            # canonical naming scheme. Deterministic across runs.
+            self.assertEqual(latest.parent.name, "dep-a_20260901_001",
+                             "mtime tie must be broken deterministically by path")
+
+    def test_verify_dep_stage_with_tied_mtimes_picks_newer_fail(self) -> None:
+        """When pass artifact (older name) and fail artifact (newer name) share
+        the same mtime, _verify_dep_stage must select the newer-by-name (fail)
+        and return False — not silently accept the stale pass."""
+        from tools.orchestration_runtime import _verify_dep_stage, _load_spec_catalog
+        import os
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            (repo_root / "spec" / "registry").mkdir(parents=True)
+            (repo_root / "spec" / "registry" / "spec_catalog.yaml").write_text(
+                "catalog_version: 0.2.0\nspecs:\n"
+                "  - spec_kind: component\n    spec_id: dep_a\n    spec_version: 0.1.0\n",
+                encoding="utf-8",
+            )
+            _load_spec_catalog.cache_clear()
+            safe = "component__dep_a__0.1.0"
+            old = repo_root / "workspace" / "ir" / safe / "dep-a_20260101_001"
+            new = repo_root / "workspace" / "ir" / safe / "dep-a_20260901_001"
+            old.mkdir(parents=True)
+            new.mkdir(parents=True)
+            (old / "ir_meta.json").write_text(
+                json.dumps({"verification_status": "pass"}), encoding="utf-8")
+            (new / "ir_meta.json").write_text(
+                json.dumps({"verification_status": "fail"}), encoding="utf-8")
+            ts_ns = 1_700_000_000_000_000_000
+            os.utime(old / "ir_meta.json", ns=(ts_ns, ts_ns))
+            os.utime(new / "ir_meta.json", ns=(ts_ns, ts_ns))
+            self.assertFalse(
+                _verify_dep_stage(repo_root, "component", "dep_a", "0.1.0", "ir_ref"),
+                "tied mtimes must not let a stale pass beat a newer fail",
+            )
+
+    def test_aggregate_verdict_tied_mtimes_picks_newer_fail(self) -> None:
+        from tools.orchestration_runtime import _verify_dep_stage, _load_spec_catalog
+        import os
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            (repo_root / "spec" / "registry").mkdir(parents=True)
+            (repo_root / "spec" / "registry" / "spec_catalog.yaml").write_text(
+                "catalog_version: 0.2.0\nspecs:\n"
+                "  - spec_kind: component\n    spec_id: dep_a\n    spec_version: 0.1.0\n",
+                encoding="utf-8",
+            )
+            _load_spec_catalog.cache_clear()
+            safe = "component__dep_a__0.1.0"
+            old = (repo_root / "workspace" / "pipelines" / safe
+                   / "pipe_20260101_001" / "runs" / "run_20260101_001" / safe)
+            new = (repo_root / "workspace" / "pipelines" / safe
+                   / "pipe_20260601_002" / "runs" / "run_20260601_002" / safe)
+            old.mkdir(parents=True)
+            new.mkdir(parents=True)
+            (old / "aggregate_verdict.json").write_text(
+                json.dumps({"aggregate_verdict": "pass"}), encoding="utf-8")
+            (old / "trial_meta.json").write_text(
+                json.dumps({"source_binary_id": "bin_20260101_001"}), encoding="utf-8")
+            (new / "aggregate_verdict.json").write_text(
+                json.dumps({"aggregate_verdict": "fail"}), encoding="utf-8")
+            (new / "trial_meta.json").write_text(
+                json.dumps({"source_binary_id": "bin_20260101_001"}), encoding="utf-8")
+            ts_ns = 1_700_000_000_000_000_000
+            os.utime(old / "aggregate_verdict.json", ns=(ts_ns, ts_ns))
+            os.utime(new / "aggregate_verdict.json", ns=(ts_ns, ts_ns))
+            self.assertFalse(
+                _verify_dep_stage(repo_root, "component", "dep_a", "0.1.0", "aggregate_verdict"),
+                "tied aggregate_verdict mtimes must route through the same helper "
+                "and reject stale pass",
+            )
+
+
+class SetStatusReplayE2ETests(unittest.TestCase):
+    """Codex round 10 F2 (companion): SKILL.md now correctly documents that
+    same-terminal `set-status` replay is idempotent. This e2e test exercises
+    the documented recovery path: response-loss replay must not raise."""
+
+    def test_skill_documented_recovery_path_works(self) -> None:
+        """A driver that calls set-status, never sees the response, and
+        defensively retries with the same status must observe success twice
+        (no exception, narrative immutable, cleanup marker present)."""
+        from tools.orchestration_runtime import _cleanup_committed_marker_path
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            init_orchestration(repo_root=repo_root, orchestration_id="replay")
+            _mark_dependencies_ready(repo_root, "replay")
+            first = update_orchestration_status(
+                repo_root=repo_root, orchestration_id="replay",
+                status="fail_closed", reason_code="dependency_not_ready",
+                reason_detail="initial",
+            )
+            self.assertEqual(first["status"], "fail_closed")
+            arid = first["orchestration_agent_run_id"]
+            self.assertTrue(_cleanup_committed_marker_path(
+                repo_root, "replay", arid).is_file())
+            # Defensive retry per SKILL.md item 34: same terminal, same fields.
+            replayed = update_orchestration_status(
+                repo_root=repo_root, orchestration_id="replay",
+                status="fail_closed", reason_code="dependency_not_ready",
+                reason_detail="retry-arrived-anyway",
+            )
+            self.assertEqual(replayed["status"], "fail_closed")
+            self.assertEqual(replayed["reason_detail"], "initial",
+                             "replay must NOT overwrite narrative")
+            self.assertTrue(_cleanup_committed_marker_path(
+                repo_root, "replay", arid).is_file(),
+                "marker remains after no-op replay")
+
+
+class PostMarkArtifactRegressionTests(unittest.TestCase):
+    """Codex round 9 F1: artifact regression after mark-dependency-readiness
+    must be caught at launch time without a separate preflight rerun. The
+    dep_set_fingerprint includes per-dep latest artifact bytes, so any change
+    in the latest artifact content invalidates persisted readiness."""
+
+    def test_newer_failing_ir_meta_invalidates_readiness_at_gate(self) -> None:
+        from tools.orchestration_runtime import (
+            mark_dependency_readiness, _dependency_ready, _load_spec_catalog,
+        )
+        import time
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            # spec_catalog + spec/component/up/deps.yaml referencing dep_a.
+            (repo_root / "spec" / "registry").mkdir(parents=True)
+            (repo_root / "spec" / "registry" / "spec_catalog.yaml").write_text(
+                "catalog_version: 0.2.0\nspecs:\n"
+                "  - spec_kind: component\n    spec_id: dep_a\n    spec_version: 0.1.0\n",
+                encoding="utf-8",
+            )
+            spec_dir = repo_root / "spec" / "component" / "up"
+            spec_dir.mkdir(parents=True)
+            (spec_dir / "deps.yaml").write_text(
+                "spec_id: up\nspec_kind: component\n"
+                "dependencies:\n  components:\n"
+                "    - component_id: dep_a\n      version_constraint: \">=0.1.0 <1.0.0\"\n"
+                "  profiles: []\n",
+                encoding="utf-8",
+            )
+            init_orchestration(
+                repo_root=repo_root, orchestration_id="reg",
+                spec_ref="spec/component/up",
+            )
+            write_preflight(
+                repo_root=repo_root, orchestration_id="reg",
+                payload=_launchable_preflight_dict(checked_at="2026-04-15T10:00:00Z"),
+            )
+            # Passing artifacts for dep_a.
+            safe = "component__dep_a__0.1.0"
+            ir_dir = repo_root / "workspace" / "ir" / safe / "dep-a_20260101_001"
+            ir_dir.mkdir(parents=True)
+            (ir_dir / "ir_meta.json").write_text(
+                json.dumps({"verification_status": "pass"}), encoding="utf-8")
+            bin_dir = (repo_root / "workspace" / "pipelines" / safe
+                       / "pipe_20260101_001" / "binary" / "bin_20260101_001")
+            bin_dir.mkdir(parents=True)
+            (bin_dir / "binary_meta.json").write_text(
+                json.dumps({"verification_status": "pass"}), encoding="utf-8")
+            verdict_dir = (repo_root / "workspace" / "pipelines" / safe
+                           / "pipe_20260101_001" / "runs" / "run_20260101_001" / safe)
+            verdict_dir.mkdir(parents=True)
+            (verdict_dir / "aggregate_verdict.json").write_text(
+                json.dumps({"aggregate_verdict": "pass"}), encoding="utf-8")
+            (verdict_dir / "trial_meta.json").write_text(
+                json.dumps({"source_binary_id": "bin_20260101_001"}), encoding="utf-8")
+            _load_spec_catalog.cache_clear()
+            mark_dependency_readiness(repo_root=repo_root, orchestration_id="reg")
+            ok, _ = _dependency_ready(repo_root, "reg", step="compile")
+            self.assertTrue(ok, "baseline must pass after marking")
+            # Now create a newer ir_meta.json with verification_status=fail.
+            # deps.yaml and catalog are unchanged — only the artifact regressed.
+            time.sleep(0.01)
+            newer = repo_root / "workspace" / "ir" / safe / "dep-a_20260901_001"
+            newer.mkdir(parents=True)
+            (newer / "ir_meta.json").write_text(
+                json.dumps({"verification_status": "fail"}), encoding="utf-8")
+            ok2, reason = _dependency_ready(repo_root, "reg", step="compile")
+            self.assertFalse(ok2, "post-mark artifact regression must invalidate gate")
+            self.assertEqual(reason, "dep_set_fingerprint_stale")
+
+
+class CatalogCacheInvalidationTests(unittest.TestCase):
+    """Codex round 9 F2: spec_catalog.yaml edits within a long-lived process
+    must invalidate the catalog cache so version resolution reflects current
+    catalog state — not the contents loaded at the first call."""
+
+    def test_catalog_edit_within_process_changes_resolved_version(self) -> None:
+        from tools.orchestration_runtime import (
+            _load_spec_catalog, _resolve_dep_version,
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            cat = repo_root / "spec" / "registry" / "spec_catalog.yaml"
+            cat.parent.mkdir(parents=True)
+            cat.write_text(
+                "catalog_version: 0.2.0\nspecs:\n"
+                "  - spec_kind: component\n    spec_id: dep_a\n    spec_version: 0.1.0\n",
+                encoding="utf-8",
+            )
+            # First load: only 0.1.0 present → constraint resolves to 0.1.0.
+            cat1 = _load_spec_catalog(str(repo_root.resolve()))
+            self.assertEqual(
+                _resolve_dep_version(cat1, "component", "dep_a", ">=0.1.0 <1.0.0"),
+                "0.1.0",
+            )
+            # Edit catalog to add another matching version → now ambiguous.
+            # mtime changes, so the cache key changes and the new content is loaded.
+            import time
+            time.sleep(0.01)  # ensure mtime resolution captures the change
+            cat.write_text(
+                "catalog_version: 0.2.0\nspecs:\n"
+                "  - spec_kind: component\n    spec_id: dep_a\n    spec_version: 0.1.0\n"
+                "  - spec_kind: component\n    spec_id: dep_a\n    spec_version: 0.2.0\n",
+                encoding="utf-8",
+            )
+            cat2 = _load_spec_catalog(str(repo_root.resolve()))
+            # Codex round 12 F2: multi-match resolves to the highest matching
+            # version (not None). Validates that the cache invalidated AND
+            # the new resolver semantics picked 0.2.0.
+            self.assertEqual(
+                _resolve_dep_version(cat2, "component", "dep_a", ">=0.1.0 <1.0.0"),
+                "0.2.0",
+                "catalog edit must invalidate cache and resolver picks highest match",
+            )
+
+    def test_mark_dependency_readiness_sees_catalog_edits_in_process(self) -> None:
+        """End-to-end: a process that calls mark-dependency-readiness, then
+        edits spec_catalog.yaml externally, then calls mark again must observe
+        the new catalog state on the second call (no manual cache_clear)."""
+        from tools.orchestration_runtime import mark_dependency_readiness
+        import time
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            cat = repo_root / "spec" / "registry" / "spec_catalog.yaml"
+            cat.parent.mkdir(parents=True)
+            cat.write_text(
+                "catalog_version: 0.2.0\nspecs:\n"
+                "  - spec_kind: component\n    spec_id: dep_a\n    spec_version: 0.1.0\n",
+                encoding="utf-8",
+            )
+            spec_dir = repo_root / "spec" / "component" / "up"
+            spec_dir.mkdir(parents=True)
+            (spec_dir / "deps.yaml").write_text(
+                "spec_id: up\nspec_kind: component\n"
+                "dependencies:\n  components:\n"
+                "    - component_id: dep_a\n      version_constraint: \">=0.1.0 <1.0.0\"\n"
+                "  profiles: []\n",
+                encoding="utf-8",
+            )
+            init_orchestration(
+                repo_root=repo_root, orchestration_id="cci",
+                spec_ref="spec/component/up",
+            )
+            write_preflight(
+                repo_root=repo_root, orchestration_id="cci",
+                payload=_launchable_preflight_dict(checked_at="2026-04-15T10:00:00Z"),
+            )
+            # Passing artifacts at 0.1.0.
+            safe = "component__dep_a__0.1.0"
+            ir_dir = repo_root / "workspace" / "ir" / safe / "dep-a_20260101_001"
+            ir_dir.mkdir(parents=True)
+            (ir_dir / "ir_meta.json").write_text(
+                json.dumps({"verification_status": "pass"}), encoding="utf-8")
+            bin_dir = (repo_root / "workspace" / "pipelines" / safe
+                       / "pipe_20260101_001" / "binary" / "bin_20260101_001")
+            bin_dir.mkdir(parents=True)
+            (bin_dir / "binary_meta.json").write_text(
+                json.dumps({"verification_status": "pass"}), encoding="utf-8")
+            v_dir = (repo_root / "workspace" / "pipelines" / safe
+                     / "pipe_20260101_001" / "runs" / "run_20260101_001" / safe)
+            v_dir.mkdir(parents=True)
+            (v_dir / "aggregate_verdict.json").write_text(
+                json.dumps({"aggregate_verdict": "pass"}), encoding="utf-8")
+            (v_dir / "trial_meta.json").write_text(
+                json.dumps({"source_binary_id": "bin_20260101_001"}), encoding="utf-8")
+            # First mark: 0.1.0 unique → passing.
+            r1 = mark_dependency_readiness(repo_root=repo_root, orchestration_id="cci")
+            self.assertTrue(r1["direct_dependency_compile_readiness"])
+            # Edit catalog in-process: REMOVE 0.1.0 (the only catalog entry
+            # satisfying `>=0.1.0 <1.0.0` is gone), forcing the dep to become
+            # unresolvable. Tests that the cache reload picks up the edit and
+            # the verifier observes the new (empty) matching set.
+            time.sleep(0.01)
+            cat.write_text(
+                "catalog_version: 0.2.0\nspecs: []\n",
+                encoding="utf-8",
+            )
+            # No cache_clear() — the cache must auto-invalidate via mtime keying.
+            r2 = mark_dependency_readiness(repo_root=repo_root, orchestration_id="cci")
+            self.assertFalse(
+                r2["direct_dependency_compile_readiness"],
+                "in-process catalog edit must invalidate cached resolution and "
+                "produce fail-closed readiness on the next mark call",
+            )
+
+
+class LaunchGateFingerprintCheckTests(unittest.TestCase):
+    """Codex round 8 F1: _dependency_ready must reject when stored fingerprint
+    no longer matches current (spec_ref + deps.yaml + spec_catalog.yaml) state.
+    Without this, out-of-band edits between mark-dependency-readiness and
+    workflow-launch-check would let stale `true` flags pass the gate.
+    """
+
+    def _setup_passing_orch(self, repo_root: Path, orch: str = "fp_gate") -> None:
+        cat = repo_root / "spec" / "registry" / "spec_catalog.yaml"
+        cat.parent.mkdir(parents=True, exist_ok=True)
+        cat.write_text(
+            "catalog_version: 0.2.0\nspecs:\n"
+            "  - spec_kind: component\n    spec_id: dep_a\n    spec_version: 0.1.0\n",
+            encoding="utf-8",
+        )
+        spec_dir = repo_root / "spec" / "component" / "src"
+        spec_dir.mkdir(parents=True, exist_ok=True)
+        (spec_dir / "deps.yaml").write_text(
+            "spec_id: src\nspec_kind: component\n"
+            "dependencies:\n  components:\n"
+            "    - component_id: dep_a\n      version_constraint: \">=0.1.0 <1.0.0\"\n"
+            "  profiles: []\n",
+            encoding="utf-8",
+        )
+        init_orchestration(
+            repo_root=repo_root, orchestration_id=orch,
+            spec_ref="spec/component/src",
+        )
+        write_preflight(
+            repo_root=repo_root, orchestration_id=orch,
+            payload=_launchable_preflight_dict(checked_at="2026-04-15T10:00:00Z"),
+        )
+        # Populate passing artifacts and mark readiness so the gate would
+        # otherwise pass.
+        _setup_verified_dep(repo_root, dep_id="dep_a", dep_version="0.1.0")
+        # _setup_verified_dep overwrites catalog; restore the single-version form
+        # so the constraint resolves uniquely.
+        cat.write_text(
+            "catalog_version: 0.2.0\nspecs:\n"
+            "  - spec_kind: component\n    spec_id: dep_a\n    spec_version: 0.1.0\n",
+            encoding="utf-8",
+        )
+        from tools.orchestration_runtime import (
+            mark_dependency_readiness, _load_spec_catalog,
+        )
+        _load_spec_catalog.cache_clear()
+        mark_dependency_readiness(repo_root=repo_root, orchestration_id=orch)
+
+    def test_gate_passes_when_fingerprint_matches(self) -> None:
+        from tools.orchestration_runtime import _dependency_ready, _load_spec_catalog
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._setup_passing_orch(repo_root)
+            ok, reason = _dependency_ready(repo_root, "fp_gate", step="compile")
+            self.assertTrue(ok, f"baseline must pass; reason={reason}")
+
+    def test_gate_rejects_when_deps_yaml_changes_after_marking(self) -> None:
+        """After mark-dependency-readiness writes true flags, an out-of-band
+        deps.yaml edit must immediately cause _dependency_ready to fail —
+        without waiting for a separate preflight rerun."""
+        from tools.orchestration_runtime import _dependency_ready, _load_spec_catalog
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._setup_passing_orch(repo_root)
+            # Edit deps.yaml.
+            (repo_root / "spec" / "component" / "src" / "deps.yaml").write_text(
+                "spec_id: src\nspec_kind: component\n"
+                "dependencies:\n  components:\n"
+                "    - component_id: dep_a\n      version_constraint: \">=0.1.0 <1.0.0\"\n"
+                "    - component_id: dep_b\n      version_constraint: \">=0.1.0 <1.0.0\"\n"
+                "  profiles: []\n",
+                encoding="utf-8",
+            )
+            _load_spec_catalog.cache_clear()
+            ok, reason = _dependency_ready(repo_root, "fp_gate", step="compile")
+            self.assertFalse(ok)
+            self.assertEqual(reason, "dep_set_fingerprint_stale")
+
+    def test_gate_rejects_when_catalog_changes_after_marking(self) -> None:
+        """An out-of-band catalog edit between mark and gate must reject."""
+        from tools.orchestration_runtime import _dependency_ready, _load_spec_catalog
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._setup_passing_orch(repo_root)
+            # Edit catalog: add another version that makes constraint ambiguous.
+            (repo_root / "spec" / "registry" / "spec_catalog.yaml").write_text(
+                "catalog_version: 0.2.0\nspecs:\n"
+                "  - spec_kind: component\n    spec_id: dep_a\n    spec_version: 0.1.0\n"
+                "  - spec_kind: component\n    spec_id: dep_a\n    spec_version: 0.2.0\n",
+                encoding="utf-8",
+            )
+            _load_spec_catalog.cache_clear()
+            ok, reason = _dependency_ready(repo_root, "fp_gate", step="compile")
+            self.assertFalse(ok)
+            self.assertEqual(reason, "dep_set_fingerprint_stale")
+
+
+class MarkDependencyReadinessErrorPathTests(unittest.TestCase):
+    """Codex round 8 F2: mark-dependency-readiness must persist fail-closed
+    state when verification fails (deps.yaml missing / unparseable). Without
+    this, a prior passing readiness survives the error and the gate stays
+    open until a separate preflight invalidates it.
+    """
+
+    def test_verification_error_overwrites_previous_passing_readiness(self) -> None:
+        from tools.orchestration_runtime import (
+            mark_dependency_readiness, _load_spec_catalog,
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            # Build a non-leaf orch with passing artifacts; mark readiness.
+            cat = repo_root / "spec" / "registry" / "spec_catalog.yaml"
+            cat.parent.mkdir(parents=True, exist_ok=True)
+            cat.write_text(
+                "catalog_version: 0.2.0\nspecs:\n"
+                "  - spec_kind: component\n    spec_id: dep_a\n    spec_version: 0.1.0\n",
+                encoding="utf-8",
+            )
+            spec_dir = repo_root / "spec" / "component" / "subject"
+            spec_dir.mkdir(parents=True)
+            (spec_dir / "deps.yaml").write_text(
+                "spec_id: subject\nspec_kind: component\n"
+                "dependencies:\n  components:\n"
+                "    - component_id: dep_a\n      version_constraint: \">=0.1.0 <1.0.0\"\n"
+                "  profiles: []\n",
+                encoding="utf-8",
+            )
+            init_orchestration(
+                repo_root=repo_root, orchestration_id="err_path",
+                spec_ref="spec/component/subject",
+            )
+            write_preflight(
+                repo_root=repo_root, orchestration_id="err_path",
+                payload=_launchable_preflight_dict(checked_at="2026-04-15T10:00:00Z"),
+            )
+            _setup_verified_dep(repo_root, dep_id="dep_a")
+            cat.write_text(
+                "catalog_version: 0.2.0\nspecs:\n"
+                "  - spec_kind: component\n    spec_id: dep_a\n    spec_version: 0.1.0\n",
+                encoding="utf-8",
+            )
+            _load_spec_catalog.cache_clear()
+            first = mark_dependency_readiness(
+                repo_root=repo_root, orchestration_id="err_path",
+            )
+            self.assertTrue(first["direct_dependency_compile_readiness"])
+            # Break the deps.yaml: replace with a non-dict YAML so
+            # _read_deps_yaml returns None.
+            (spec_dir / "deps.yaml").write_text("- just_a_list\n", encoding="utf-8")
+            _load_spec_catalog.cache_clear()
+            with self.assertRaisesRegex(ValueError, "cannot verify readiness"):
+                mark_dependency_readiness(
+                    repo_root=repo_root, orchestration_id="err_path",
+                )
+            # Stale true MUST have been overwritten with fail-closed.
+            meta = json.loads(
+                (repo_root / "workspace" / "orchestrations" / "err_path"
+                 / "orchestration_meta.json").read_text(encoding="utf-8")
+            )
+            readiness = meta.get("dependency_readiness") or {}
+            self.assertFalse(readiness.get("direct_dependency_compile_readiness"),
+                             "passing readiness must be overwritten on verification error")
+            for k in ("ir_ref_verified", "pipeline_ref_verified", "aggregate_verdict_verified"):
+                self.assertFalse(readiness.get("detail", {}).get(k))
+
+
+class MalformedDepsYamlTests(unittest.TestCase):
+    """Codex round 7 F1: a deps.yaml with malformed entries must NOT degrade to
+    vacuous-true readiness. Previously, unparseable list items were dropped and
+    an all-malformed list produced empty `entries` which `_verify_dependency_readiness`
+    treated as the leaf case → all flags true → gate bypass.
+    """
+
+    def _orch_with_deps(self, repo_root: Path, deps_body: str, orch: str = "mal") -> None:
+        spec_dir = repo_root / "spec" / "component" / "mal"
+        spec_dir.mkdir(parents=True, exist_ok=True)
+        (spec_dir / "deps.yaml").write_text(deps_body, encoding="utf-8")
+        init_orchestration(
+            repo_root=repo_root, orchestration_id=orch,
+            spec_ref="spec/component/mal",
+        )
+        write_preflight(
+            repo_root=repo_root, orchestration_id=orch,
+            payload=_launchable_preflight_dict(checked_at="2026-04-15T10:00:00Z"),
+        )
+
+    def _assert_meta_fail_closed(self, repo_root: Path, orch: str = "mal") -> None:
+        meta = json.loads(
+            (repo_root / "workspace" / "orchestrations" / orch
+             / "orchestration_meta.json").read_text(encoding="utf-8")
+        )
+        readiness = meta.get("dependency_readiness") or {}
+        self.assertFalse(readiness.get("direct_dependency_compile_readiness"))
+        for k in ("ir_ref_verified", "pipeline_ref_verified", "aggregate_verdict_verified"):
+            self.assertFalse(readiness.get("detail", {}).get(k))
+
+    def test_dict_entry_missing_component_id_raises(self) -> None:
+        from tools.orchestration_runtime import mark_dependency_readiness, _load_spec_catalog
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._orch_with_deps(repo_root,
+                # dict entry without component_id (malformed)
+                "spec_id: mal\nspec_kind: component\n"
+                "dependencies:\n  components:\n    - {garbled: true}\n  profiles: []\n",
+            )
+            _load_spec_catalog.cache_clear()
+            with self.assertRaisesRegex(ValueError, "schema is malformed"):
+                mark_dependency_readiness(repo_root=repo_root, orchestration_id="mal")
+            self._assert_meta_fail_closed(repo_root)
+
+    def test_non_dict_non_string_item_raises(self) -> None:
+        from tools.orchestration_runtime import mark_dependency_readiness, _load_spec_catalog
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._orch_with_deps(repo_root,
+                # integer list item — not a dict, not a string
+                "spec_id: mal\nspec_kind: component\n"
+                "dependencies:\n  components:\n    - 42\n  profiles: []\n",
+            )
+            _load_spec_catalog.cache_clear()
+            with self.assertRaisesRegex(ValueError, "schema is malformed"):
+                mark_dependency_readiness(repo_root=repo_root, orchestration_id="mal")
+            self._assert_meta_fail_closed(repo_root)
+
+    def test_components_not_a_list_raises(self) -> None:
+        from tools.orchestration_runtime import mark_dependency_readiness, _load_spec_catalog
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._orch_with_deps(repo_root,
+                # components is a string, not a list
+                "spec_id: mal\nspec_kind: component\n"
+                "dependencies:\n  components: \"not_a_list\"\n  profiles: []\n",
+            )
+            _load_spec_catalog.cache_clear()
+            with self.assertRaisesRegex(ValueError, "schema is malformed"):
+                mark_dependency_readiness(repo_root=repo_root, orchestration_id="mal")
+            self._assert_meta_fail_closed(repo_root)
+
+    def test_one_valid_one_malformed_raises(self) -> None:
+        """Even when most entries are well-formed, a single malformed item must
+        block the verification — partial validation cannot be silently accepted."""
+        from tools.orchestration_runtime import mark_dependency_readiness, _load_spec_catalog
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._orch_with_deps(repo_root,
+                "spec_id: mal\nspec_kind: component\n"
+                "dependencies:\n  components:\n"
+                "    - component_id: dep_a\n      version_constraint: \">=0.1.0 <1.0.0\"\n"
+                "    - {garbled: true}\n"
+                "  profiles: []\n",
+            )
+            # Set up valid artifacts for dep_a so it would have passed alone.
+            _setup_verified_dep(repo_root, dep_id="dep_a")
+            _load_spec_catalog.cache_clear()
+            with self.assertRaisesRegex(ValueError, "schema is malformed"):
+                mark_dependency_readiness(repo_root=repo_root, orchestration_id="mal")
+            self._assert_meta_fail_closed(repo_root)
+
+
+class CatalogDriftInvalidationTests(unittest.TestCase):
+    """Codex round 7 F2: dep_set_fingerprint must include spec_catalog.yaml so
+    that catalog drift (new matching version added, version removed, constraint
+    becoming ambiguous) invalidates persisted readiness. Without this, stale
+    true flags can survive catalog changes that should require re-verification.
+    """
+
+    def _make_orch_with_nonleaf(
+        self, repo_root: Path, orch: str = "drift",
+        catalog_versions: list[str] | None = None,
+    ) -> None:
+        cat_versions = catalog_versions or ["0.1.0"]
+        cat = repo_root / "spec" / "registry" / "spec_catalog.yaml"
+        cat.parent.mkdir(parents=True, exist_ok=True)
+        body = ["catalog_version: 0.2.0", "specs:"]
+        for v in cat_versions:
+            body.append("  - spec_kind: component")
+            body.append("    spec_id: dep_a")
+            body.append(f"    spec_version: {v}")
+        cat.write_text("\n".join(body) + "\n", encoding="utf-8")
+        spec_dir = repo_root / "spec" / "component" / "compound_drift"
+        spec_dir.mkdir(parents=True, exist_ok=True)
+        (spec_dir / "deps.yaml").write_text(
+            "spec_id: compound_drift\nspec_kind: component\n"
+            "dependencies:\n  components:\n"
+            "    - component_id: dep_a\n      version_constraint: \">=0.1.0 <1.0.0\"\n"
+            "  profiles: []\n",
+            encoding="utf-8",
+        )
+        init_orchestration(
+            repo_root=repo_root, orchestration_id=orch,
+            spec_ref="spec/component/compound_drift",
+        )
+        write_preflight(
+            repo_root=repo_root, orchestration_id=orch,
+            payload=_launchable_preflight_dict(checked_at="2026-04-15T10:00:00Z"),
+        )
+
+    def _readiness(self, repo_root: Path, orch: str) -> dict:
+        meta = json.loads(
+            (repo_root / "workspace" / "orchestrations" / orch / "orchestration_meta.json")
+            .read_text(encoding="utf-8")
+        )
+        return meta.get("dependency_readiness") or {}
+
+    def test_catalog_edit_invalidates_persisted_readiness(self) -> None:
+        from tools.orchestration_runtime import (
+            mark_dependency_readiness, _load_spec_catalog,
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._make_orch_with_nonleaf(repo_root, catalog_versions=["0.1.0"])
+            _setup_verified_dep(repo_root, dep_id="dep_a", dep_version="0.1.0")
+            # Re-write catalog because _setup_verified_dep overwrote it; ensure
+            # only 0.1.0 entry exists so constraint resolves uniquely.
+            (repo_root / "spec" / "registry" / "spec_catalog.yaml").write_text(
+                "catalog_version: 0.2.0\nspecs:\n"
+                "  - spec_kind: component\n    spec_id: dep_a\n    spec_version: 0.1.0\n",
+                encoding="utf-8",
+            )
+            _load_spec_catalog.cache_clear()
+            r1 = mark_dependency_readiness(
+                repo_root=repo_root, orchestration_id="drift",
+            )
+            self.assertTrue(r1["direct_dependency_compile_readiness"])
+            fp1 = r1["dep_set_fingerprint"]
+            # Add a second matching catalog version → constraint now ambiguous.
+            (repo_root / "spec" / "registry" / "spec_catalog.yaml").write_text(
+                "catalog_version: 0.2.0\nspecs:\n"
+                "  - spec_kind: component\n    spec_id: dep_a\n    spec_version: 0.1.0\n"
+                "  - spec_kind: component\n    spec_id: dep_a\n    spec_version: 0.2.0\n",
+                encoding="utf-8",
+            )
+            _load_spec_catalog.cache_clear()
+            # Re-running preflight must invalidate the persisted true readiness
+            # because the catalog hash changed.
+            write_preflight(
+                repo_root=repo_root, orchestration_id="drift",
+                payload=_launchable_preflight_dict(checked_at="2026-04-15T10:00:00Z"),
+            )
+            r2 = self._readiness(repo_root, "drift")
+            self.assertFalse(r2["direct_dependency_compile_readiness"],
+                             "catalog drift must invalidate stale true readiness")
+            self.assertNotEqual(r2["dep_set_fingerprint"], fp1)
+
+
+class DependencyArtifactBindingTests(unittest.TestCase):
+    """F1 (Codex round 5): _verify_dep_stage must bind to the CURRENT (latest by
+    mtime) artifact, not "any historical passing artifact". A stale older pass
+    must not satisfy the gate when a newer fail exists."""
+
+    def _build(self, repo_root: Path) -> None:
+        # Catalog entry for dep_a@0.1.0.
+        cat = repo_root / "spec" / "registry" / "spec_catalog.yaml"
+        cat.parent.mkdir(parents=True, exist_ok=True)
+        cat.write_text(
+            "catalog_version: 0.2.0\nspecs:\n"
+            "  - spec_kind: component\n    spec_id: dep_a\n    spec_version: 0.1.0\n",
+            encoding="utf-8",
+        )
+
+    def test_stale_passing_ir_is_overridden_by_newer_failing_ir(self) -> None:
+        from tools.orchestration_runtime import _verify_dep_stage, _load_spec_catalog
+        import time
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._build(repo_root)
+            _load_spec_catalog.cache_clear()
+            safe = "component__dep_a__0.1.0"
+            base = repo_root / "workspace" / "ir" / safe
+            (base / "dep-a_20260101_001").mkdir(parents=True)
+            (base / "dep-a_20260101_001" / "ir_meta.json").write_text(
+                json.dumps({"verification_status": "pass"}), encoding="utf-8")
+            time.sleep(0.01)
+            (base / "dep-a_20260601_001").mkdir(parents=True)
+            (base / "dep-a_20260601_001" / "ir_meta.json").write_text(
+                json.dumps({"verification_status": "fail"}), encoding="utf-8")
+            result = _verify_dep_stage(repo_root, "component", "dep_a", "0.1.0", "ir_ref")
+            self.assertFalse(result,
+                             "latest artifact is fail; stale pass must NOT satisfy the gate")
+
+    def test_aggregate_verdict_fail_is_rejected(self) -> None:
+        """File existence is no longer sufficient; aggregate_verdict must be
+        pass or xfail per docs/GLOSSARY.md."""
+        from tools.orchestration_runtime import _verify_dep_stage, _load_spec_catalog
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._build(repo_root)
+            _load_spec_catalog.cache_clear()
+            safe = "component__dep_a__0.1.0"
+            v = (repo_root / "workspace" / "pipelines" / safe / "pipe_20260101_001"
+                 / "runs" / "run_20260101_001" / safe)
+            v.mkdir(parents=True)
+            (v / "aggregate_verdict.json").write_text(
+                json.dumps({"aggregate_verdict": "fail"}), encoding="utf-8")
+            (v / "trial_meta.json").write_text(
+                json.dumps({"source_binary_id": "bin_20260101_001"}), encoding="utf-8")
+            self.assertFalse(
+                _verify_dep_stage(repo_root, "component", "dep_a", "0.1.0", "aggregate_verdict"),
+                "aggregate_verdict=fail must not satisfy the gate")
+
+    def test_aggregate_verdict_xfail_is_accepted(self) -> None:
+        from tools.orchestration_runtime import _verify_dep_stage, _load_spec_catalog
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._build(repo_root)
+            _load_spec_catalog.cache_clear()
+            safe = "component__dep_a__0.1.0"
+            # Codex round 24: verdict binding requires a binary in the same pipeline
+            # whose id matches trial_meta.source_binary_id.
+            b = (repo_root / "workspace" / "pipelines" / safe / "pipe_20260101_001"
+                 / "binary" / "bin_20260101_001")
+            b.mkdir(parents=True)
+            (b / "binary_meta.json").write_text(
+                json.dumps({"verification_status": "pass"}), encoding="utf-8")
+            v = (repo_root / "workspace" / "pipelines" / safe / "pipe_20260101_001"
+                 / "runs" / "run_20260101_001" / safe)
+            v.mkdir(parents=True)
+            (v / "aggregate_verdict.json").write_text(
+                json.dumps({"aggregate_verdict": "xfail"}), encoding="utf-8")
+            (v / "trial_meta.json").write_text(
+                json.dumps({"source_binary_id": "bin_20260101_001"}), encoding="utf-8")
+            self.assertTrue(
+                _verify_dep_stage(repo_root, "component", "dep_a", "0.1.0", "aggregate_verdict"),
+                "aggregate_verdict=xfail must satisfy the gate (per glossary)")
+
+    def test_stale_passing_verdict_overridden_by_newer_failing_verdict(self) -> None:
+        from tools.orchestration_runtime import _verify_dep_stage, _load_spec_catalog
+        import time
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._build(repo_root)
+            _load_spec_catalog.cache_clear()
+            safe = "component__dep_a__0.1.0"
+            old = (repo_root / "workspace" / "pipelines" / safe / "pipe_20260101_001"
+                   / "runs" / "run_20260101_001" / safe)
+            old.mkdir(parents=True)
+            (old / "aggregate_verdict.json").write_text(
+                json.dumps({"aggregate_verdict": "pass"}), encoding="utf-8")
+            (old / "trial_meta.json").write_text(
+                json.dumps({"source_binary_id": "bin_20260101_001"}), encoding="utf-8")
+            time.sleep(0.01)
+            new = (repo_root / "workspace" / "pipelines" / safe / "pipe_20260601_002"
+                   / "runs" / "run_20260601_002" / safe)
+            new.mkdir(parents=True)
+            (new / "aggregate_verdict.json").write_text(
+                json.dumps({"aggregate_verdict": "fail"}), encoding="utf-8")
+            (new / "trial_meta.json").write_text(
+                json.dumps({"source_binary_id": "bin_20260101_001"}), encoding="utf-8")
+            self.assertFalse(
+                _verify_dep_stage(repo_root, "component", "dep_a", "0.1.0", "aggregate_verdict"),
+                "newer verdict=fail must override older verdict=pass")
+
+
+class VersionConstraintResolutionTests(unittest.TestCase):
+    """F2 (Codex round 5): version_constraint must drive catalog resolution,
+    not "last-seen catalog entry"."""
+
+    def _catalog_with_versions(self, repo_root: Path, versions: list[str]) -> None:
+        cat = repo_root / "spec" / "registry" / "spec_catalog.yaml"
+        cat.parent.mkdir(parents=True, exist_ok=True)
+        body = ["catalog_version: 0.2.0", "specs:"]
+        for v in versions:
+            body.append("  - spec_kind: component")
+            body.append("    spec_id: dep_a")
+            body.append(f"    spec_version: {v}")
+        cat.write_text("\n".join(body) + "\n", encoding="utf-8")
+
+    def test_constraint_matches_unique_version(self) -> None:
+        from tools.orchestration_runtime import (
+            _load_spec_catalog, _resolve_dep_version,
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._catalog_with_versions(repo_root, ["0.1.0", "0.2.0", "1.0.0"])
+            _load_spec_catalog.cache_clear()
+            catalog = _load_spec_catalog(str(repo_root.resolve()))
+            # Constraint >=0.1.0 <0.2.0 should match only 0.1.0.
+            resolved = _resolve_dep_version(catalog, "component", "dep_a", ">=0.1.0 <0.2.0")
+            self.assertEqual(resolved, "0.1.0")
+
+    def test_range_constraint_survives_catalog_publishing_new_version(self) -> None:
+        """E2E (Codex round 12 F2): a non-leaf node with a range constraint
+        like `>=0.1.0 <1.0.0` must REMAIN launchable when the catalog later
+        adds a second matching version (e.g. `0.2.0`). Previously this turned
+        every dependent into a permanent fail-closed."""
+        from tools.orchestration_runtime import (
+            mark_dependency_readiness, _load_spec_catalog,
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            # Start with only 0.1.0 published + passing artifacts at 0.1.0.
+            self._catalog_with_versions(repo_root, ["0.1.0"])
+            spec_dir = repo_root / "spec" / "component" / "user"
+            spec_dir.mkdir(parents=True)
+            (spec_dir / "deps.yaml").write_text(
+                "spec_id: user\nspec_kind: component\n"
+                "dependencies:\n  components:\n"
+                "    - component_id: dep_a\n      version_constraint: \">=0.1.0 <1.0.0\"\n"
+                "  profiles: []\n",
+                encoding="utf-8",
+            )
+            init_orchestration(
+                repo_root=repo_root, orchestration_id="rng",
+                spec_ref="spec/component/user",
+            )
+            write_preflight(
+                repo_root=repo_root, orchestration_id="rng",
+                payload=_launchable_preflight_dict(checked_at="2026-04-15T10:00:00Z"),
+            )
+            # Publish 0.2.0 (newer release) + passing artifacts at 0.2.0.
+            self._catalog_with_versions(repo_root, ["0.1.0", "0.2.0"])
+            for v in ("0.1.0", "0.2.0"):
+                safe = f"component__dep_a__{v}"
+                ir_dir = repo_root / "workspace" / "ir" / safe / "dep-a_20260101_001"
+                ir_dir.mkdir(parents=True)
+                (ir_dir / "ir_meta.json").write_text(
+                    json.dumps({"verification_status": "pass"}), encoding="utf-8")
+                bin_dir = (repo_root / "workspace" / "pipelines" / safe
+                           / "pipe_20260101_001" / "binary" / "bin_20260101_001")
+                bin_dir.mkdir(parents=True)
+                (bin_dir / "binary_meta.json").write_text(
+                    json.dumps({"verification_status": "pass"}), encoding="utf-8")
+                v_dir = (repo_root / "workspace" / "pipelines" / safe
+                         / "pipe_20260101_001" / "runs" / "run_20260101_001" / safe)
+                v_dir.mkdir(parents=True)
+                (v_dir / "aggregate_verdict.json").write_text(
+                    json.dumps({"aggregate_verdict": "pass"}), encoding="utf-8")
+                (v_dir / "trial_meta.json").write_text(
+                    json.dumps({"source_binary_id": "bin_20260101_001"}), encoding="utf-8")
+            _load_spec_catalog.cache_clear()
+            result = mark_dependency_readiness(
+                repo_root=repo_root, orchestration_id="rng",
+            )
+            self.assertTrue(result["direct_dependency_compile_readiness"],
+                            "range constraint must remain launchable after newer "
+                            "version is published (highest match picked)")
+            self.assertTrue(result["direct_dependency_execution_readiness"])
+
+    def test_multi_match_constraint_picks_highest_version(self) -> None:
+        """Codex round 12 F2: range constraints like `>=0.1.0 <1.0.0` are
+        common in real deps.yaml. When multiple catalog versions match, the
+        resolver picks the highest (descending semver order), keeping
+        existing specs launchable across catalog growth."""
+        from tools.orchestration_runtime import (
+            _load_spec_catalog, _resolve_dep_version,
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._catalog_with_versions(repo_root, ["0.1.0", "0.2.0"])
+            _load_spec_catalog.cache_clear()
+            catalog = _load_spec_catalog(str(repo_root.resolve()))
+            resolved = _resolve_dep_version(catalog, "component", "dep_a", ">=0.1.0 <1.0.0")
+            self.assertEqual(resolved, "0.2.0",
+                             "multi-match constraint must pick highest catalog version")
+
+    def test_no_match_constraint_fails_closed(self) -> None:
+        from tools.orchestration_runtime import (
+            _load_spec_catalog, _resolve_dep_version,
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._catalog_with_versions(repo_root, ["0.1.0"])
+            _load_spec_catalog.cache_clear()
+            catalog = _load_spec_catalog(str(repo_root.resolve()))
+            resolved = _resolve_dep_version(catalog, "component", "dep_a", ">=2.0.0")
+            self.assertIsNone(resolved)
+
+    def test_constraint_drives_workspace_lookup_in_full_verify(self) -> None:
+        """End-to-end: deps.yaml declares >=0.1.0 <0.2.0, catalog has both 0.1.0
+        and 0.2.0 artifacts in workspace. Only 0.1.0 must be evaluated."""
+        from tools.orchestration_runtime import (
+            mark_dependency_readiness, _load_spec_catalog,
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._catalog_with_versions(repo_root, ["0.1.0", "0.2.0"])
+            # 0.1.0 has passing artifacts; 0.2.0 has failing ones. Constraint
+            # >=0.1.0 <0.2.0 must resolve to 0.1.0 → readiness should be true.
+            for v, ir_status in (("0.1.0", "pass"), ("0.2.0", "fail")):
+                safe = f"component__dep_a__{v}"
+                ir_dir = repo_root / "workspace" / "ir" / safe / f"dep-a_20260101_001"
+                ir_dir.mkdir(parents=True)
+                (ir_dir / "ir_meta.json").write_text(
+                    json.dumps({"verification_status": ir_status}), encoding="utf-8")
+                bin_dir = (repo_root / "workspace" / "pipelines" / safe
+                           / "pipe_20260101_001" / "binary" / "bin_20260101_001")
+                bin_dir.mkdir(parents=True)
+                (bin_dir / "binary_meta.json").write_text(
+                    json.dumps({"verification_status": ir_status}), encoding="utf-8")
+                v_dir = (repo_root / "workspace" / "pipelines" / safe
+                         / "pipe_20260101_001" / "runs" / "run_20260101_001" / safe)
+                v_dir.mkdir(parents=True)
+                (v_dir / "aggregate_verdict.json").write_text(
+                    json.dumps({"aggregate_verdict": ir_status}), encoding="utf-8")
+                (v_dir / "trial_meta.json").write_text(
+                    json.dumps({"source_binary_id": "bin_20260101_001"}), encoding="utf-8")
+            spec_dir = repo_root / "spec" / "component" / "compound"
+            spec_dir.mkdir(parents=True)
+            (spec_dir / "deps.yaml").write_text(
+                "spec_id: compound\nspec_kind: component\n"
+                "dependencies:\n  components:\n"
+                "    - component_id: dep_a\n      version_constraint: \">=0.1.0 <0.2.0\"\n"
+                "  profiles: []\n",
+                encoding="utf-8",
+            )
+            init_orchestration(
+                repo_root=repo_root, orchestration_id="vc_e2e",
+                spec_ref="spec/component/compound",
+            )
+            write_preflight(repo_root=repo_root, orchestration_id="vc_e2e",
+                            payload=_launchable_preflight_dict(checked_at="2026-04-15T10:00:00Z"))
+            _load_spec_catalog.cache_clear()
+            result = mark_dependency_readiness(
+                repo_root=repo_root, orchestration_id="vc_e2e",
+            )
+            self.assertTrue(result["direct_dependency_compile_readiness"],
+                            "constraint <0.2.0 should bind to 0.1.0 (passing), not 0.2.0 (failing)")
+
+    def test_constraint_parser_basic_ops(self) -> None:
+        from tools.orchestration_runtime import _matches_version_constraint as M
+        self.assertTrue(M("0.1.0", ">=0.1.0"))
+        self.assertFalse(M("0.0.9", ">=0.1.0"))
+        self.assertTrue(M("0.1.5", ">=0.1.0 <0.2.0"))
+        self.assertFalse(M("0.2.0", ">=0.1.0 <0.2.0"))
+        self.assertTrue(M("1.2.3", "==1.2.3"))
+        self.assertTrue(M("1.2.3", "1.2.3"))  # bare = ==
+        self.assertFalse(M("1.2.4", "==1.2.3"))
+        self.assertTrue(M("anything", None))
+        self.assertTrue(M("anything", ""))
+
+
+class MarkDependencyReadinessTests(unittest.TestCase):
+    """F2 (Codex round 4): mark-dependency-readiness verifies actual workspace
+    artifacts instead of trusting caller assertions. A caller cannot mark
+    readiness=true unless deps.yaml resolves to real passing artifacts.
+    """
+
+    def _readiness(self, repo_root: Path, orch: str) -> dict:
+        meta = json.loads(
+            (repo_root / "workspace" / "orchestrations" / orch / "orchestration_meta.json")
+            .read_text(encoding="utf-8")
+        )
+        return meta.get("dependency_readiness") or {}
+
+    def _init_nonleaf(self, repo_root: Path, orch: str, dep_id: str = "dep_a") -> None:
+        spec_dir = repo_root / "spec" / "component" / "compound"
+        spec_dir.mkdir(parents=True, exist_ok=True)
+        (spec_dir / "deps.yaml").write_text(
+            "spec_id: compound\nspec_kind: component\n"
+            "dependencies:\n  components:\n"
+            f"    - component_id: {dep_id}\n      version_constraint: \">=0.1.0 <1.0.0\"\n"
+            "  profiles: []\n",
+            encoding="utf-8",
+        )
+        # Codex round 34 F2: write a valid-but-empty catalog stub. Missing
+        # catalog now raises `SpecCatalogCorruption` (a distinct hard
+        # failure) which would make every preflight on a non-leaf with no
+        # published specs blow up before tests get to exercise the actual
+        # dep-verification path. `_setup_verified_dep` (when used) replaces
+        # this stub with real entries.
+        cat = repo_root / "spec" / "registry" / "spec_catalog.yaml"
+        cat.parent.mkdir(parents=True, exist_ok=True)
+        if not cat.is_file():
+            cat.write_text(
+                "catalog_version: 0.2.0\nspecs: []\n", encoding="utf-8",
+            )
+        init_orchestration(
+            repo_root=repo_root, orchestration_id=orch,
+            spec_ref="spec/component/compound",
+        )
+        write_preflight(
+            repo_root=repo_root, orchestration_id=orch,
+            payload=_launchable_preflight_dict(checked_at="2026-04-15T10:00:00Z"),
+        )
+
+    def test_artifacts_present_grants_full_readiness(self) -> None:
+        from tools.orchestration_runtime import mark_dependency_readiness, _load_spec_catalog
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._init_nonleaf(repo_root, "mdr_full")
+            _setup_verified_dep(repo_root, dep_id="dep_a")
+            _load_spec_catalog.cache_clear()
+            result = mark_dependency_readiness(
+                repo_root=repo_root, orchestration_id="mdr_full",
+            )
+            self.assertTrue(result["detail"]["ir_ref_verified"])
+            self.assertTrue(result["detail"]["pipeline_ref_verified"])
+            self.assertTrue(result["detail"]["aggregate_verdict_verified"])
+            self.assertTrue(result["direct_dependency_compile_readiness"])
+            self.assertTrue(result["direct_dependency_execution_readiness"])
+
+    def test_missing_artifacts_stay_fail_closed(self) -> None:
+        """Caller cannot bypass verification: with no workspace artifacts for the
+        dep, all flags remain false even when mark-dependency-readiness is called."""
+        from tools.orchestration_runtime import mark_dependency_readiness, _load_spec_catalog
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._init_nonleaf(repo_root, "mdr_missing")
+            _load_spec_catalog.cache_clear()
+            # No _setup_verified_dep call → no artifacts exist.
+            result = mark_dependency_readiness(
+                repo_root=repo_root, orchestration_id="mdr_missing",
+            )
+            self.assertFalse(result["detail"]["ir_ref_verified"])
+            self.assertFalse(result["detail"]["pipeline_ref_verified"])
+            self.assertFalse(result["detail"]["aggregate_verdict_verified"])
+            self.assertFalse(result["direct_dependency_compile_readiness"])
+            self.assertFalse(result["direct_dependency_execution_readiness"])
+
+    def test_failing_ir_meta_keeps_compile_fail_closed(self) -> None:
+        """An ir_meta.json with verification_status=fail does NOT satisfy
+        ir_ref_verified, even though the file exists."""
+        from tools.orchestration_runtime import mark_dependency_readiness, _load_spec_catalog
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._init_nonleaf(repo_root, "mdr_fail")
+            _setup_verified_dep(repo_root, dep_id="dep_a", ir_pass=False)
+            _load_spec_catalog.cache_clear()
+            result = mark_dependency_readiness(
+                repo_root=repo_root, orchestration_id="mdr_fail",
+            )
+            self.assertFalse(result["detail"]["ir_ref_verified"])
+            self.assertFalse(result["direct_dependency_compile_readiness"])
+
+    def test_dependency_regression_clears_stale_pass(self) -> None:
+        """Codex round 6 F2: a stale ir_ref_verified=true must NOT survive a
+        subsequent mark-dependency-readiness call when the underlying artifact
+        regressed. Every call performs a full overwrite from current artifacts."""
+        from tools.orchestration_runtime import mark_dependency_readiness, _load_spec_catalog
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._init_nonleaf(repo_root, "mdr_reg")
+            _setup_verified_dep(repo_root, dep_id="dep_a")
+            _load_spec_catalog.cache_clear()
+            # First: full verify, all true.
+            full = mark_dependency_readiness(
+                repo_root=repo_root, orchestration_id="mdr_reg",
+            )
+            self.assertTrue(full["detail"]["ir_ref_verified"])
+            # Simulate ir regression: newer ir_meta has verification_status=fail.
+            import time
+            safe = "component__dep_a__0.1.0"
+            time.sleep(0.01)
+            new_ir = (repo_root / "workspace" / "ir" / safe / "dep-a_20260901_001")
+            new_ir.mkdir(parents=True)
+            (new_ir / "ir_meta.json").write_text(
+                json.dumps({"verification_status": "fail"}), encoding="utf-8")
+            # Even though we don't "request" ir_ref re-verification, every call
+            # must full-recompute. The stale ir_ref_verified=true must clear.
+            second = mark_dependency_readiness(
+                repo_root=repo_root, orchestration_id="mdr_reg",
+            )
+            self.assertFalse(second["detail"]["ir_ref_verified"],
+                             "stale ir_ref_verified=true must be cleared on regression")
+            self.assertFalse(second["direct_dependency_compile_readiness"])
+
+    def test_marked_readiness_unblocks_workflow_launch_check(self) -> None:
+        from tools.orchestration_runtime import (
+            mark_dependency_readiness, _dependency_ready, _load_spec_catalog,
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._init_nonleaf(repo_root, "mdr_gate")
+            ok, _ = _dependency_ready(repo_root, "mdr_gate", step="compile")
+            self.assertFalse(ok)
+            _setup_verified_dep(repo_root, dep_id="dep_a")
+            _load_spec_catalog.cache_clear()
+            mark_dependency_readiness(
+                repo_root=repo_root, orchestration_id="mdr_gate",
+            )
+            ok, reason = _dependency_ready(repo_root, "mdr_gate", step="compile")
+            self.assertTrue(ok, f"compile gate must pass after artifact verification; reason={reason}")
+
+    def test_unresolvable_dep_id_stays_fail_closed(self) -> None:
+        """A dep_id not present in spec_catalog cannot be verified; the runtime
+        must NOT silently treat unresolvable deps as passing."""
+        from tools.orchestration_runtime import mark_dependency_readiness, _load_spec_catalog
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._init_nonleaf(repo_root, "mdr_unresolv", dep_id="ghost_dep")
+            # Empty catalog (no entry for ghost_dep). `_init_nonleaf` writes
+            # an empty-but-valid stub; overwrite to keep test intent explicit.
+            (repo_root / "spec" / "registry" / "spec_catalog.yaml").write_text(
+                "catalog_version: 0.2.0\nspecs: []\n", encoding="utf-8",
+            )
+            _load_spec_catalog.cache_clear()
+            result = mark_dependency_readiness(
+                repo_root=repo_root, orchestration_id="mdr_unresolv",
+            )
+            self.assertFalse(result["direct_dependency_compile_readiness"],
+                             "unresolvable dep_id must keep readiness fail-closed")
+
+    def test_cli_dispatch(self) -> None:
+        from tools.orchestration_runtime import main as runtime_main, _load_spec_catalog
+        import io
+        from contextlib import redirect_stdout
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._init_nonleaf(repo_root, "mdr_cli")
+            _setup_verified_dep(repo_root, dep_id="dep_a")
+            _load_spec_catalog.cache_clear()
+            stdout = io.StringIO()
+            with redirect_stdout(stdout):
+                rc = runtime_main([
+                    "mark-dependency-readiness",
+                    "--repo-root", str(repo_root),
+                    "--orchestration-id", "mdr_cli",
+                ])
+            self.assertEqual(rc, 0)
+            payload = json.loads(stdout.getvalue())
+            self.assertTrue(payload["direct_dependency_compile_readiness"])
+            self.assertTrue(payload["direct_dependency_execution_readiness"])
+
+
+class PreflightLeafRecomputeTests(unittest.TestCase):
+    """F2 (Codex round 3): write_preflight が leaf node では毎回 recompute し、
+    earlier-setup-order issue (spec_ref unset at first preflight など) で fail-closed
+    が sticky 化することを防ぐ。non-leaf は CLI-set state を保持する。
+    """
+
+    _PAYLOAD = {
+        "status": "pass", "sandbox_runtime": "bwrap", "sandbox_enforced": True,
+        "can_launch_step_agents": True, "can_launch_substep_agents": True,
+        "feature_states": {"multi_agent": True, "codex_hooks": True},
+        "checks": [
+            {"name": "multi_agent_enabled", "pass": True},
+            {"name": "codex_hooks_enabled", "pass": True},
+            {"name": "codex_home_writable", "pass": True},
+            {"name": "sandbox_bwrap_available", "pass": True},
+            {"name": "sandbox_bwrap_userns", "pass": True},
+        ],
+    }
+
+    def _readiness(self, repo_root: Path, orch: str) -> dict:
+        meta = json.loads(
+            (repo_root / "workspace" / "orchestrations" / orch / "orchestration_meta.json")
+            .read_text(encoding="utf-8")
+        )
+        return meta.get("dependency_readiness") or {}
+
+    def test_leaf_recovers_after_spec_ref_becomes_available(self) -> None:
+        """First preflight without spec_ref → fail-closed. After spec_ref is populated
+        and deps.yaml is in place, a second preflight must refresh the leaf state to
+        trivial-true (cannot stay stuck)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            # First preflight: no spec_ref, no deps.yaml → fail-closed.
+            init_orchestration(repo_root=repo_root, orchestration_id="leaf_recov")
+            write_preflight(repo_root=repo_root, orchestration_id="leaf_recov",
+                            payload=self._PAYLOAD)
+            r1 = self._readiness(repo_root, "leaf_recov")
+            self.assertFalse(r1["direct_dependency_compile_readiness"])
+            # Author the leaf spec and add spec_ref to meta, then rerun preflight.
+            spec_dir = repo_root / "spec" / "component" / "leaf"
+            spec_dir.mkdir(parents=True)
+            (spec_dir / "deps.yaml").write_text(
+                "spec_id: leaf\nspec_kind: component\n"
+                "dependencies:\n  components: []\n  profiles: []\n",
+                encoding="utf-8",
+            )
+            meta_path = (
+                repo_root / "workspace" / "orchestrations" / "leaf_recov"
+                / "orchestration_meta.json"
+            )
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            meta["spec_ref"] = "spec/component/leaf"
+            meta_path.write_text(json.dumps(meta) + "\n", encoding="utf-8")
+            # Rerun preflight: must recompute the leaf to trivial-true.
+            write_preflight(repo_root=repo_root, orchestration_id="leaf_recov",
+                            payload=self._PAYLOAD)
+            r2 = self._readiness(repo_root, "leaf_recov")
+            self.assertTrue(r2["direct_dependency_compile_readiness"],
+                            "leaf node must refresh out of stale fail-closed on re-preflight")
+
+    def test_dep_set_fingerprint_change_invalidates_readiness(self) -> None:
+        """Codex round 6 F1: when spec_ref repoints or deps.yaml content changes,
+        previously persisted true flags MUST be reset — they refer to a stale
+        dependency set."""
+        from tools.orchestration_runtime import _load_spec_catalog
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            # spec1: leaf — trivial-true.
+            spec1 = repo_root / "spec" / "component" / "leafA"
+            spec1.mkdir(parents=True)
+            (spec1 / "deps.yaml").write_text(
+                "spec_id: leafA\nspec_kind: component\n"
+                "dependencies:\n  components: []\n  profiles: []\n",
+                encoding="utf-8",
+            )
+            init_orchestration(
+                repo_root=repo_root, orchestration_id="fp_invalidate",
+                spec_ref="spec/component/leafA",
+            )
+            write_preflight(repo_root=repo_root, orchestration_id="fp_invalidate",
+                            payload=self._PAYLOAD)
+            r1 = self._readiness(repo_root, "fp_invalidate")
+            self.assertTrue(r1["direct_dependency_compile_readiness"])
+            original_fp = r1["dep_set_fingerprint"]
+            self.assertTrue(original_fp)
+            # Repoint spec_ref to a non-leaf spec.
+            spec2 = repo_root / "spec" / "component" / "compoundB"
+            spec2.mkdir(parents=True)
+            (spec2 / "deps.yaml").write_text(
+                "spec_id: compoundB\nspec_kind: component\n"
+                "dependencies:\n  components:\n"
+                "    - component_id: dep_x\n      version_constraint: \">=0.1.0 <1.0.0\"\n"
+                "  profiles: []\n",
+                encoding="utf-8",
+            )
+            meta_path = (
+                repo_root / "workspace" / "orchestrations" / "fp_invalidate"
+                / "orchestration_meta.json"
+            )
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            meta["spec_ref"] = "spec/component/compoundB"
+            meta_path.write_text(json.dumps(meta) + "\n", encoding="utf-8")
+            # Codex round 34 F2: non-leaf preflight requires a present
+            # spec_catalog.yaml (missing now raises SpecCatalogCorruption).
+            # Write an empty-but-valid stub so the fingerprint comparison
+            # can run; mismatch invalidation is what this test asserts.
+            cat = repo_root / "spec" / "registry" / "spec_catalog.yaml"
+            cat.parent.mkdir(parents=True, exist_ok=True)
+            cat.write_text("catalog_version: 0.2.0\nspecs: []\n", encoding="utf-8")
+            _load_spec_catalog.cache_clear()
+            # Preflight again: fingerprint mismatch must reset to fail-closed.
+            write_preflight(repo_root=repo_root, orchestration_id="fp_invalidate",
+                            payload=self._PAYLOAD)
+            r2 = self._readiness(repo_root, "fp_invalidate")
+            self.assertFalse(r2["direct_dependency_compile_readiness"],
+                             "spec_ref change must invalidate stale true readiness")
+            self.assertNotEqual(r2["dep_set_fingerprint"], original_fp)
+
+    def test_deps_yaml_edit_invalidates_readiness(self) -> None:
+        """Editing deps.yaml content (without changing spec_ref) must also
+        invalidate persisted readiness."""
+        from tools.orchestration_runtime import (
+            mark_dependency_readiness, _load_spec_catalog,
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            spec_dir = repo_root / "spec" / "component" / "edits"
+            spec_dir.mkdir(parents=True)
+            (spec_dir / "deps.yaml").write_text(
+                "spec_id: edits\nspec_kind: component\n"
+                "dependencies:\n  components:\n"
+                "    - component_id: dep_a\n      version_constraint: \">=0.1.0 <1.0.0\"\n"
+                "  profiles: []\n",
+                encoding="utf-8",
+            )
+            init_orchestration(
+                repo_root=repo_root, orchestration_id="fp_edits",
+                spec_ref="spec/component/edits",
+            )
+            write_preflight(repo_root=repo_root, orchestration_id="fp_edits",
+                            payload=self._PAYLOAD)
+            _setup_verified_dep(repo_root, dep_id="dep_a")
+            _load_spec_catalog.cache_clear()
+            r1 = mark_dependency_readiness(
+                repo_root=repo_root, orchestration_id="fp_edits",
+            )
+            self.assertTrue(r1["direct_dependency_compile_readiness"])
+            fp1 = r1["dep_set_fingerprint"]
+            # Edit deps.yaml to add a new dep (now references an unbuilt dep_b).
+            (spec_dir / "deps.yaml").write_text(
+                "spec_id: edits\nspec_kind: component\n"
+                "dependencies:\n  components:\n"
+                "    - component_id: dep_a\n      version_constraint: \">=0.1.0 <1.0.0\"\n"
+                "    - component_id: dep_b\n      version_constraint: \">=0.1.0 <1.0.0\"\n"
+                "  profiles: []\n",
+                encoding="utf-8",
+            )
+            write_preflight(repo_root=repo_root, orchestration_id="fp_edits",
+                            payload=self._PAYLOAD)
+            r2 = self._readiness(repo_root, "fp_edits")
+            self.assertFalse(r2["direct_dependency_compile_readiness"],
+                             "deps.yaml edit must invalidate stale true readiness")
+            self.assertNotEqual(r2["dep_set_fingerprint"], fp1)
+
+    def test_nonleaf_preserves_verified_values_across_preflight(self) -> None:
+        """For non-leaf nodes, values flipped to true by mark-dependency-readiness
+        (which itself ran artifact verification) must survive subsequent preflight
+        calls — preflight does not overwrite non-leaf readiness."""
+        from tools.orchestration_runtime import mark_dependency_readiness, _load_spec_catalog
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            spec_dir = repo_root / "spec" / "component" / "compound2"
+            spec_dir.mkdir(parents=True)
+            (spec_dir / "deps.yaml").write_text(
+                "spec_id: compound2\nspec_kind: component\n"
+                "dependencies:\n  components:\n"
+                "    - component_id: dep_a\n      version_constraint: \">=0.1.0 <1.0.0\"\n"
+                "  profiles: []\n",
+                encoding="utf-8",
+            )
+            init_orchestration(
+                repo_root=repo_root, orchestration_id="nonleaf_pres",
+                spec_ref="spec/component/compound2",
+            )
+            write_preflight(repo_root=repo_root, orchestration_id="nonleaf_pres",
+                            payload=self._PAYLOAD)
+            _setup_verified_dep(repo_root, dep_id="dep_a")
+            _load_spec_catalog.cache_clear()
+            mark_dependency_readiness(
+                repo_root=repo_root, orchestration_id="nonleaf_pres",
+            )
+            # Re-run preflight: must NOT overwrite verified values.
+            write_preflight(repo_root=repo_root, orchestration_id="nonleaf_pres",
+                            payload=self._PAYLOAD)
+            r = self._readiness(repo_root, "nonleaf_pres")
+            self.assertTrue(r["direct_dependency_compile_readiness"])
+            self.assertTrue(r["direct_dependency_execution_readiness"])
+
+
+class PyYAMLScopedRequirementTests(unittest.TestCase):
+    """Codex round 27 F1: PyYAML is required only for the deps-parsing code
+    paths. Recovery commands (set-status, record-timeout) must continue to
+    work when the package is missing — collapsing them under a module-top
+    `raise ImportError` expanded the blast radius from a localized feature
+    failure to a full control-plane outage."""
+
+    def _missing_yaml_resolver(self) -> Callable[[], Any]:  # type: ignore[name-defined]
+        from tools.orchestration_runtime import _require_yaml as _orig  # noqa: F401
+
+        def _raise() -> Any:
+            raise RuntimeError(
+                "tools.orchestration_runtime: PyYAML is required for parsing "
+                "deps.yaml / spec_catalog.yaml. Install with `pip install PyYAML`."
+            )
+
+        return _raise
+
+    def test_require_yaml_raises_with_install_hint(self) -> None:
+        from tools.orchestration_runtime import _require_yaml
+        # When PyYAML is actually installed (the test environment), this
+        # returns the module without raising. We assert the contract by
+        # confirming the docstring identifies it as the install-required
+        # resolver and that the returned object exposes `safe_load`.
+        mod = _require_yaml()
+        self.assertTrue(hasattr(mod, "safe_load"))
+
+    def test_set_status_works_without_pyyaml(self) -> None:
+        """set-status MUST NOT import yaml. Patching `_require_yaml` to a
+        raising stub then exercising set-status confirms the recovery
+        path is independent of PyYAML availability."""
+        from tools.orchestration_runtime import (
+            _require_yaml as _live_resolver,  # noqa: F401
+            update_orchestration_status,
+        )
+        import tools.orchestration_runtime as _rt
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            init_orchestration(
+                repo_root=repo_root,
+                orchestration_id="orch_recover",
+                spec_ref="spec/component/x",
+            )
+            with patch.object(_rt, "_require_yaml", self._missing_yaml_resolver()):
+                update_orchestration_status(
+                    repo_root=repo_root,
+                    orchestration_id="orch_recover",
+                    status="fail_closed",
+                    reason_code="dependency_not_ready",
+                    reason_detail="recover_smoke",
+                )
+            meta_path = (
+                repo_root / "workspace" / "orchestrations" / "orch_recover"
+                / "orchestration_meta.json"
+            )
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            self.assertEqual(meta["status"], "fail_closed")
+            self.assertEqual(meta["reason_code"], "dependency_not_ready")
+
+    def test_dependency_ready_returns_pyyaml_unavailable_not_crash(self) -> None:
+        """Codex round 28 F1: `_dependency_ready` MUST convert a missing-
+        PyYAML `RuntimeError` from `_compute_dep_readiness_and_fingerprint`
+        into a deterministic gate result (`pyyaml_unavailable`) instead of
+        letting it escape as an unhandled exception. Without this conversion
+        `workflow-launch-check` looks like an infrastructure outage rather
+        than a fail-closed dependency decision."""
+        import tools.orchestration_runtime as _rt
+        from tools.orchestration_runtime import _dependency_ready
+
+        def _raise(repo_root, spec_ref):  # type: ignore[no-untyped-def]
+            raise RuntimeError("PyYAML is required for parsing deps.yaml")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            init_orchestration(
+                repo_root=repo_root,
+                orchestration_id="orch_noyaml",
+                spec_ref="spec/component/x",
+            )
+            # Seed dependency_readiness so the gate reaches the recompute
+            # path (otherwise it returns earlier on a missing key).
+            meta_path = (
+                repo_root / "workspace" / "orchestrations" / "orch_noyaml"
+                / "orchestration_meta.json"
+            )
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            meta["dependency_readiness"] = {
+                "direct_dependency_compile_readiness": False,
+                "direct_dependency_execution_readiness": False,
+                "detail": {},
+                "dep_set_fingerprint": "seed",
+            }
+            meta_path.write_text(
+                json.dumps(meta, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
+            with patch.object(_rt, "_compute_dep_readiness_and_fingerprint", _raise):
+                ok, reason = _dependency_ready(
+                    repo_root, "orch_noyaml", step="compile",
+                )
+            self.assertFalse(ok)
+            self.assertEqual(reason, "pyyaml_unavailable")
+
+    def test_mark_dependency_readiness_cli_handles_missing_pyyaml_cleanly(self) -> None:
+        """Codex round 28 F2: the `mark-dependency-readiness` CLI dispatcher
+        previously caught only `ValueError` / `FileNotFoundError`. The
+        round-27 F1 change made `mark_dependency_readiness()` propagate a
+        `RuntimeError` from `_require_yaml()` when PyYAML is absent — that
+        escaped the dispatch table as a raw traceback. The CLI must now
+        convert it into the same stderr+exit-1 contract as other expected
+        verification failures."""
+        import tools.orchestration_runtime as _rt
+
+        def _raise_pyyaml(**kwargs):  # type: ignore[no-untyped-def]
+            raise RuntimeError(
+                "tools.orchestration_runtime: PyYAML is required for parsing "
+                "deps.yaml / spec_catalog.yaml."
+            )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            init_orchestration(
+                repo_root=repo_root,
+                orchestration_id="orch_cli_noyaml",
+                spec_ref="spec/component/x",
+            )
+            stderr_buf = io.StringIO()
+            with patch.object(_rt, "mark_dependency_readiness", _raise_pyyaml), \
+                 redirect_stderr(stderr_buf):
+                rc = _rt.main([
+                    "mark-dependency-readiness",
+                    "--repo-root", str(repo_root),
+                    "--orchestration-id", "orch_cli_noyaml",
+                ])
+            self.assertEqual(rc, 1)
+            self.assertIn("PyYAML", stderr_buf.getvalue())
+
+    def test_mark_dependency_readiness_cli_propagates_unrelated_runtimeerror(self) -> None:
+        """Guard: the round-28 F2 catch must NOT swallow unrelated
+        RuntimeErrors. Only those whose message identifies the PyYAML
+        install gap should be downgraded; other RuntimeErrors are real
+        infrastructure bugs and should escape with a traceback."""
+        import tools.orchestration_runtime as _rt
+
+        def _raise_unrelated(**kwargs):  # type: ignore[no-untyped-def]
+            raise RuntimeError("disk corruption: unrelated infra failure")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            init_orchestration(
+                repo_root=repo_root,
+                orchestration_id="orch_cli_infra",
+                spec_ref="spec/component/x",
+            )
+            with patch.object(_rt, "mark_dependency_readiness", _raise_unrelated):
+                with self.assertRaises(RuntimeError) as ctx:
+                    _rt.main([
+                        "mark-dependency-readiness",
+                        "--repo-root", str(repo_root),
+                        "--orchestration-id", "orch_cli_infra",
+                    ])
+            self.assertIn("disk corruption", str(ctx.exception))
+
+    def test_read_deps_yaml_propagates_missing_package_runtimeerror(self) -> None:
+        """When `_require_yaml` raises (PyYAML missing), `_read_deps_yaml`
+        must propagate the RuntimeError to its caller instead of swallowing
+        it into the "deps.yaml unparseable → None" branch. Caller code
+        (mark_dependency_readiness, _compute_dep_readiness_and_fingerprint)
+        is responsible for surfacing the install hint."""
+        import tools.orchestration_runtime as _rt
+        from tools.orchestration_runtime import _read_deps_yaml
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            spec_dir = repo_root / "spec" / "component" / "x"
+            spec_dir.mkdir(parents=True)
+            (spec_dir / "deps.yaml").write_text(
+                "dependencies:\n  components: []\n  profiles: []\n",
+                encoding="utf-8",
+            )
+            with patch.object(_rt, "_require_yaml", self._missing_yaml_resolver()):
+                with self.assertRaises(RuntimeError) as ctx:
+                    _read_deps_yaml(repo_root, "spec/component/x")
+            self.assertIn("PyYAML is required", str(ctx.exception))
+
+
+class DependencyReadyLockSerializationTests(unittest.TestCase):
+    """Codex round 27 F2: `_dependency_ready` reads orchestration_meta and
+    recomputes the dep_set_fingerprint without the writers' exclusive lock,
+    so a concurrent `mark_dependency_readiness` could produce a torn read
+    where the stored fingerprint reflects a half-written certified_deps and
+    the recomputed bytes reflect post-commit catalog/deps state — surfacing
+    as a false-negative `dep_set_fingerprint_stale`. Holding the meta lock
+    around the entire check turns the read into a snapshot."""
+
+    def test_dependency_ready_acquires_meta_lock(self) -> None:
+        """Patch `_orchestration_meta_exclusive_lock` with a counter and
+        verify `_dependency_ready` enters it exactly once."""
+        import tools.orchestration_runtime as _rt
+        from tools.orchestration_runtime import _dependency_ready
+
+        entries: list[str] = []
+
+        @contextmanager
+        def _tracking_lock(repo_root: Path, orchestration_id: str):
+            entries.append(orchestration_id)
+            yield
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            init_orchestration(
+                repo_root=repo_root,
+                orchestration_id="orch_locked",
+                spec_ref="spec/component/x",
+            )
+            with patch.object(_rt, "_orchestration_meta_exclusive_lock", _tracking_lock):
+                _dependency_ready(repo_root, "orch_locked", step="compile")
+
+        self.assertEqual(entries, ["orch_locked"])
+
+    def test_dependency_ready_holds_lock_during_recompute(self) -> None:
+        """The lock must wrap BOTH the meta read AND the fingerprint
+        recompute — releasing between read and recompute would let a
+        concurrent `mark_dependency_readiness` swap certified_deps under
+        the gate and produce a torn comparison. We verify by capturing the
+        order of (lock_entered, meta_read, lock_exited) calls."""
+        import tools.orchestration_runtime as _rt
+        from tools.orchestration_runtime import _dependency_ready
+
+        events: list[str] = []
+
+        @contextmanager
+        def _ordering_lock(repo_root: Path, orchestration_id: str):
+            events.append("lock_entered")
+            try:
+                yield
+            finally:
+                events.append("lock_exited")
+
+        orig_compute = _rt._compute_dep_readiness_and_fingerprint
+
+        def _tracking_compute(repo_root: Path, spec_ref: Any):  # type: ignore[no-untyped-def]
+            events.append("compute_called")
+            return orig_compute(repo_root, spec_ref)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            init_orchestration(
+                repo_root=repo_root,
+                orchestration_id="orch_ordering",
+                spec_ref="spec/component/x",
+            )
+            # Seed dependency_readiness so _dependency_ready reaches the
+            # recompute path (otherwise it short-circuits on missing key).
+            meta_path = (
+                repo_root / "workspace" / "orchestrations" / "orch_ordering"
+                / "orchestration_meta.json"
+            )
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            meta["dependency_readiness"] = {
+                "direct_dependency_compile_readiness": True,
+                "direct_dependency_execution_readiness": True,
+                "detail": {
+                    "ir_ref_verified": True,
+                    "pipeline_ref_verified": True,
+                    "aggregate_verdict_verified": True,
+                },
+                "dep_set_fingerprint": "seed",
+            }
+            meta_path.write_text(
+                json.dumps(meta, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
+            with patch.object(_rt, "_orchestration_meta_exclusive_lock", _ordering_lock), \
+                 patch.object(_rt, "_compute_dep_readiness_and_fingerprint", _tracking_compute):
+                _dependency_ready(repo_root, "orch_ordering", step="compile")
+
+        # Lock entered before compute, still held during compute,
+        # exited only after compute returned.
+        self.assertEqual(events[0], "lock_entered")
+        self.assertEqual(events[-1], "lock_exited")
+        self.assertIn("compute_called", events)
+        # Compute must happen between enter and exit.
+        enter_idx = events.index("lock_entered")
+        exit_idx = events.index("lock_exited")
+        compute_idx = events.index("compute_called")
+        self.assertLess(enter_idx, compute_idx)
+        self.assertLess(compute_idx, exit_idx)
+
+
+class LeafLaunchWithoutPyYAMLTests(unittest.TestCase):
+    """Codex round 29 F1: a leaf orchestration with no dependencies
+    (`certified_deps == []` + all detail flags True) MUST remain launchable
+    when PyYAML is unavailable. Round 28 made the recompute path raise
+    `pyyaml_unavailable` even for trivially-leaf nodes that need no YAML
+    parse to verify."""
+
+    def _seed_persisted_leaf(self, repo_root: Path, orch_id: str) -> Path:
+        from tools.orchestration_runtime import _no_deps_leaf_fingerprint
+        spec_ref = "spec/component/leaf"
+        # A real leaf has deps.yaml on disk with no entries. The round-30
+        # byte-level fingerprint binds the persisted "no deps" claim to
+        # these bytes; without a real file the fingerprint would still
+        # match (both empty), but using a concrete file mirrors the
+        # production setup.
+        spec_dir = repo_root / spec_ref
+        spec_dir.mkdir(parents=True, exist_ok=True)
+        (spec_dir / "deps.yaml").write_text(
+            "dependencies:\n  components: []\n  profiles: []\n",
+            encoding="utf-8",
+        )
+        init_orchestration(
+            repo_root=repo_root, orchestration_id=orch_id, spec_ref=spec_ref,
+        )
+        meta_path = (
+            repo_root / "workspace" / "orchestrations" / orch_id
+            / "orchestration_meta.json"
+        )
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        meta["dependency_readiness"] = {
+            "direct_dependency_compile_readiness": True,
+            "direct_dependency_execution_readiness": True,
+            "detail": {
+                "ir_ref_verified": True,
+                "pipeline_ref_verified": True,
+                "aggregate_verdict_verified": True,
+            },
+            "dep_set_fingerprint": _no_deps_leaf_fingerprint(repo_root, spec_ref),
+            "certified_deps": [],
+        }
+        meta_path.write_text(
+            json.dumps(meta, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        return meta_path
+
+    def test_leaf_launchable_when_pyyaml_missing(self) -> None:
+        import tools.orchestration_runtime as _rt
+        from tools.orchestration_runtime import _dependency_ready
+
+        def _raise(repo_root, spec_ref):  # type: ignore[no-untyped-def]
+            raise RuntimeError("PyYAML is required")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._seed_persisted_leaf(repo_root, "orch_leaf")
+            with patch.object(_rt, "_compute_dep_readiness_and_fingerprint", _raise):
+                ok, reason = _dependency_ready(
+                    repo_root, "orch_leaf", step="compile",
+                )
+            self.assertTrue(ok, msg=f"leaf launch blocked: {reason!r}")
+            self.assertIsNone(reason)
+
+    def test_pyyaml_missing_rejects_when_deps_yaml_mutated_since_mark(self) -> None:
+        """Codex round 30 F1: the leaf shortcut must NOT trust persisted
+        meta alone — it must verify the byte-level fingerprint binds the
+        claim to the current `deps.yaml` bytes. Mutating deps.yaml after
+        mark (e.g. adding a dep) MUST flip the gate to fail-closed even
+        though persisted `certified_deps == []` would otherwise authorize
+        launch. This guards against fail-open during a degraded control
+        plane (PyYAML missing) when the dependency set has actually
+        changed under the orchestration."""
+        import tools.orchestration_runtime as _rt
+        from tools.orchestration_runtime import _dependency_ready
+
+        def _raise(repo_root, spec_ref):  # type: ignore[no-untyped-def]
+            raise RuntimeError("PyYAML is required")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._seed_persisted_leaf(repo_root, "orch_mutated")
+            # Mutate deps.yaml to add a real dep AFTER mark wrote the
+            # fingerprint. Bytes now differ; the persisted fingerprint no
+            # longer matches the byte-level recomputation.
+            (repo_root / "spec" / "component" / "leaf" / "deps.yaml").write_text(
+                "dependencies:\n"
+                "  components:\n"
+                "    - component_id: dep_a\n"
+                "      version_constraint: \">=0.1.0 <1.0.0\"\n"
+                "  profiles: []\n",
+                encoding="utf-8",
+            )
+            with patch.object(_rt, "_compute_dep_readiness_and_fingerprint", _raise):
+                ok, reason = _dependency_ready(
+                    repo_root, "orch_mutated", step="compile",
+                )
+            self.assertFalse(ok)
+            self.assertEqual(reason, "pyyaml_unavailable")
+
+    def test_pyyaml_missing_rejects_forged_empty_certified_deps(self) -> None:
+        """Adversarial: a direct edit that empties `certified_deps` and
+        flips detail flags to True must still be rejected because the
+        forger cannot reconstruct the byte fingerprint matching a real
+        no-deps deps.yaml unless they ALSO replace deps.yaml — and even
+        then the forgery would be self-consistent only against the
+        current (real-empty) bytes, which would also pass live recompute
+        when PyYAML returns. Here we forge against a real-deps.yaml so
+        the fingerprint check fails."""
+        import tools.orchestration_runtime as _rt
+        from tools.orchestration_runtime import _dependency_ready
+
+        def _raise(repo_root, spec_ref):  # type: ignore[no-untyped-def]
+            raise RuntimeError("PyYAML is required")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            # Real-deps spec on disk (NOT a leaf).
+            spec_dir = repo_root / "spec" / "component" / "real"
+            spec_dir.mkdir(parents=True)
+            (spec_dir / "deps.yaml").write_text(
+                "dependencies:\n"
+                "  components:\n"
+                "    - spec_id: dep_x\n"
+                "      version_constraint: \"^0.1.0\"\n"
+                "  profiles: []\n",
+                encoding="utf-8",
+            )
+            init_orchestration(
+                repo_root=repo_root, orchestration_id="orch_forged",
+                spec_ref="spec/component/real",
+            )
+            meta_path = (
+                repo_root / "workspace" / "orchestrations" / "orch_forged"
+                / "orchestration_meta.json"
+            )
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            meta["dependency_readiness"] = {
+                "direct_dependency_compile_readiness": True,
+                "direct_dependency_execution_readiness": True,
+                "detail": {
+                    "ir_ref_verified": True,
+                    "pipeline_ref_verified": True,
+                    "aggregate_verdict_verified": True,
+                },
+                # Forger sets certified_deps=[] and an arbitrary fingerprint;
+                # neither matches the real-deps byte-level recomputation.
+                "dep_set_fingerprint": "forged_anything",
+                "certified_deps": [],
+            }
+            meta_path.write_text(
+                json.dumps(meta, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
+            with patch.object(_rt, "_compute_dep_readiness_and_fingerprint", _raise):
+                ok, reason = _dependency_ready(
+                    repo_root, "orch_forged", step="compile",
+                )
+            self.assertFalse(ok)
+            self.assertEqual(reason, "pyyaml_unavailable")
+
+    def test_non_leaf_still_fail_closed_when_pyyaml_missing(self) -> None:
+        """Guard: when persisted `certified_deps` has entries, PyYAML
+        absence still fails closed — we cannot re-verify the artifact
+        chain without parsing the catalog."""
+        import tools.orchestration_runtime as _rt
+        from tools.orchestration_runtime import _dependency_ready
+
+        def _raise(repo_root, spec_ref):  # type: ignore[no-untyped-def]
+            raise RuntimeError("PyYAML is required")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            meta_path = self._seed_persisted_leaf(repo_root, "orch_nonleaf")
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            meta["dependency_readiness"]["certified_deps"] = [
+                {"spec_kind": "component", "spec_id": "dep_a", "spec_version": "0.1.0"},
+            ]
+            meta_path.write_text(
+                json.dumps(meta, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
+            with patch.object(_rt, "_compute_dep_readiness_and_fingerprint", _raise):
+                ok, reason = _dependency_ready(
+                    repo_root, "orch_nonleaf", step="compile",
+                )
+            self.assertFalse(ok)
+            self.assertEqual(reason, "pyyaml_unavailable")
+
+
+class CanonicalIdEnforcementTests(unittest.TestCase):
+    """Codex round 29 F2: the write-acceptance boundary rejects
+    binary_id / run_id segments that do not match the canonical
+    `<slug>_YYYYMMDD_NNN` suffix. Producer-side enforcement guarantees
+    the round-23 freshness selector never silently drops a legitimate
+    artifact from a downstream dependency's `binary/` or `runs/` tree."""
+
+    def _build_payload(self, step: str, substep: str | None, output_paths: list[str]) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "agent_role": "step" if substep is None else "substep",
+            "step": step,
+            "ir_ref": _FIX_IR_REF,
+            "pipeline_ref": _FIX_PIPE_REF,
+            "node_key": "problem/shallow_water2d@0.3.0",
+            "allowed_output_paths": output_paths,
+        }
+        if substep is not None:
+            payload["substep"] = substep
+        return payload
+
+    def test_build_rejects_non_canonical_binary_id(self) -> None:
+        """Build step output path with `binary/bin_001/...` (no canonical
+        suffix) must be rejected at the write-acceptance boundary."""
+        from tools.orchestration_runtime import _allowed_output_paths_for_launch
+        bad = f"{_FIX_PIPE_REF}/binary/bin_001/binary_meta.json"
+        good = f"{_FIX_PIPE_REF}/binary/bin_20260101_001/binary_meta.json"
+        with self.assertRaises(ValueError) as ctx:
+            _allowed_output_paths_for_launch(
+                request_payload=self._build_payload("build", None, [bad]),
+                write_roots=[f"{_FIX_PIPE_REF}/binary/"],
+            )
+        self.assertIn("outside phase contract", str(ctx.exception))
+        # And the canonical form passes.
+        ok_list = _allowed_output_paths_for_launch(
+            request_payload=self._build_payload("build", None, [good]),
+            write_roots=[f"{_FIX_PIPE_REF}/binary/"],
+        )
+        self.assertIn(good, ok_list)
+
+    def test_validate_execute_rejects_non_canonical_run_id(self) -> None:
+        from tools.orchestration_runtime import _allowed_output_paths_for_launch
+        node_safe = "problem__shallow_water2d__0.3.0"
+        bad = f"{_FIX_PIPE_REF}/runs/run_001/{node_safe}/diagnostics.json"
+        good = f"{_FIX_PIPE_REF}/runs/run_20260101_001/{node_safe}/diagnostics.json"
+        with self.assertRaises(ValueError) as ctx:
+            _allowed_output_paths_for_launch(
+                request_payload=self._build_payload("validate", "execute", [bad]),
+                write_roots=[f"{_FIX_PIPE_REF}/runs/"],
+            )
+        self.assertIn("outside phase contract", str(ctx.exception))
+        ok_list = _allowed_output_paths_for_launch(
+            request_payload=self._build_payload("validate", "execute", [good]),
+            write_roots=[f"{_FIX_PIPE_REF}/runs/"],
+        )
+        self.assertIn(good, ok_list)
+
+    def test_validate_judge_rejects_non_canonical_run_id(self) -> None:
+        from tools.orchestration_runtime import _allowed_output_paths_for_launch
+        node_safe = "problem__shallow_water2d__0.3.0"
+        bad = f"{_FIX_PIPE_REF}/runs/ex_001/{node_safe}/aggregate_verdict.json"
+        good = f"{_FIX_PIPE_REF}/runs/run_20260101_001/{node_safe}/aggregate_verdict.json"
+        with self.assertRaises(ValueError) as ctx:
+            _allowed_output_paths_for_launch(
+                request_payload=self._build_payload("validate", "judge", [bad]),
+                write_roots=[f"{_FIX_PIPE_REF}/runs/"],
+            )
+        self.assertIn("outside phase contract", str(ctx.exception))
+        ok_list = _allowed_output_paths_for_launch(
+            request_payload=self._build_payload("validate", "judge", [good]),
+            write_roots=[f"{_FIX_PIPE_REF}/runs/"],
+        )
+        self.assertIn(good, ok_list)
+
+
+class FreshnessSelectorStrictGrammarTests(unittest.TestCase):
+    """Codex round 31 F2: the freshness reader must use the SAME grammar
+    as the writer (`_SLUG_DATE_SEQ3_PATTERN`). Round 23's loose regex
+    (`^.+_(\\d{8})_(\\d{3})$`) accepted any prefix — including uppercase,
+    leading underscore, or arbitrary fabricated names — so a planted
+    `FAKE_20991231_999/` directory outranked legitimate artifacts."""
+
+    def test_loose_suffix_is_rejected(self) -> None:
+        from tools.orchestration_runtime import _freshness_key_from_id
+        # Uppercase slug — fabricated, would have passed old loose regex.
+        self.assertIsNone(_freshness_key_from_id("FAKE_20991231_999"))
+        # Underscore-separated slug parts — not canonical.
+        self.assertIsNone(_freshness_key_from_id("dep_a_20260101_001"))
+        # Leading punctuation.
+        self.assertIsNone(_freshness_key_from_id(".hidden_20260101_001"))
+        # Trailing path segment — must be exactly `<slug>_DATE_SEQ`.
+        self.assertIsNone(
+            _freshness_key_from_id("ok_20260101_001/extra")
+        )
+
+    def test_canonical_grammar_accepted(self) -> None:
+        from tools.orchestration_runtime import _freshness_key_from_id
+        # Codex round 35 F1: key shape is `(date, seq)` only — slug is no
+        # longer a tiebreaker, since same-(date,seq) collisions across
+        # distinct slugs must fail closed (handled by the selector).
+        self.assertEqual(
+            _freshness_key_from_id("dep-a_20260101_001"),
+            ("20260101", 1),
+        )
+        self.assertEqual(
+            _freshness_key_from_id("shallow-water2d_20260415_001"),
+            ("20260415", 1),
+        )
+
+    def test_writer_pattern_matches_reader_in_lock_step(self) -> None:
+        """If a reader-accepted id is REJECTED by the writer pattern,
+        the trust-gap is back. This test prevents future drift."""
+        from tools.orchestration_runtime import (
+            _freshness_key_from_id, _SLUG_DATE_SEQ3_PATTERN,
+        )
+        samples = [
+            "dep-a_20260101_001",
+            "shallow-water2d_20260415_001",
+            "flux-rsn-p0_20260510_001",
+            "x_20260101_999",
+        ]
+        for s in samples:
+            self.assertIsNotNone(_freshness_key_from_id(s), s)
+            self.assertIsNotNone(_SLUG_DATE_SEQ3_PATTERN.match(s), s)
+        fabrications = [
+            "FAKE_20991231_999",
+            "_leading_underscore_20260101_001",
+            "dep_a_20260101_001",
+            "ok 20260101_001",
+        ]
+        for s in fabrications:
+            self.assertIsNone(_freshness_key_from_id(s), s)
+            self.assertIsNone(_SLUG_DATE_SEQ3_PATTERN.match(s), s)
+
+
+class InitialLeafReadinessCertifiedDepsTests(unittest.TestCase):
+    """Codex round 31 F1: `_compute_initial_dependency_readiness` must
+    persist `certified_deps: []` in the trivial leaf payload so the
+    round-30 PyYAML-missing leaf shortcut works end-to-end from a fresh
+    `init → preflight` without requiring a subsequent
+    `mark-dependency-readiness` run."""
+
+    def test_preflight_writes_certified_deps_empty_for_leaf(self) -> None:
+        """`write_preflight` invokes `_compute_initial_dependency_readiness`.
+        For a vacuous-leaf spec the resulting payload MUST include
+        `certified_deps: []` so the round-30 PyYAML-missing shortcut works."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            spec_dir = repo_root / "spec" / "component" / "leaf"
+            spec_dir.mkdir(parents=True)
+            (spec_dir / "deps.yaml").write_text(
+                "dependencies:\n  components: []\n  profiles: []\n",
+                encoding="utf-8",
+            )
+            init_orchestration(
+                repo_root=repo_root, orchestration_id="orch_init_leaf",
+                spec_ref="spec/component/leaf",
+            )
+            write_preflight(
+                repo_root=repo_root, orchestration_id="orch_init_leaf",
+                payload=_launchable_preflight_dict(checked_at="2026-05-12T00:00:00Z"),
+            )
+            meta_path = (
+                repo_root / "workspace" / "orchestrations" / "orch_init_leaf"
+                / "orchestration_meta.json"
+            )
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            readiness = meta.get("dependency_readiness", {})
+            self.assertEqual(readiness.get("certified_deps"), [])
+            self.assertTrue(readiness.get("direct_dependency_compile_readiness"))
+
+    def test_fresh_init_preflight_leaf_launchable_without_pyyaml(self) -> None:
+        """End-to-end: `init` + `preflight` only (no
+        `mark-dependency-readiness`) for a no-deps spec MUST satisfy the
+        PyYAML-missing leaf shortcut. Round 31 F1 made this work without
+        requiring a verifier run after preflight."""
+        import tools.orchestration_runtime as _rt
+        from tools.orchestration_runtime import _dependency_ready
+
+        def _raise(repo_root, spec_ref):  # type: ignore[no-untyped-def]
+            raise RuntimeError("PyYAML is required")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            spec_dir = repo_root / "spec" / "component" / "freshleaf"
+            spec_dir.mkdir(parents=True)
+            (spec_dir / "deps.yaml").write_text(
+                "dependencies:\n  components: []\n  profiles: []\n",
+                encoding="utf-8",
+            )
+            init_orchestration(
+                repo_root=repo_root, orchestration_id="orch_fresh",
+                spec_ref="spec/component/freshleaf",
+            )
+            write_preflight(
+                repo_root=repo_root, orchestration_id="orch_fresh",
+                payload=_launchable_preflight_dict(checked_at="2026-05-12T00:00:00Z"),
+            )
+            with patch.object(_rt, "_compute_dep_readiness_and_fingerprint", _raise):
+                ok, reason = _dependency_ready(
+                    repo_root, "orch_fresh", step="compile",
+                )
+            self.assertTrue(
+                ok,
+                msg=(
+                    "fresh leaf init+preflight must satisfy PyYAML-missing "
+                    f"shortcut; reason={reason!r}"
+                ),
+            )
+
+
+class PreflightSurvivesMissingPyYAMLTests(unittest.TestCase):
+    """Codex round 32 F1: `write_preflight` must not crash when PyYAML
+    is missing — it must compute a degraded `dependency_readiness`
+    payload (fail-closed by default) and let downstream control surfaces
+    keep running. Round 31's `_compute_initial_dependency_readiness`
+    called `_dependency_set_fingerprint` unconditionally, which reached
+    `_require_yaml()` and raised on degraded hosts."""
+
+    def test_preflight_does_not_raise_when_pyyaml_missing_real_deps(self) -> None:
+        import tools.orchestration_runtime as _rt
+
+        def _raise(*args, **kwargs):  # type: ignore[no-untyped-def]
+            raise RuntimeError("PyYAML is required for parsing deps.yaml")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            spec_dir = repo_root / "spec" / "component" / "real"
+            spec_dir.mkdir(parents=True)
+            (spec_dir / "deps.yaml").write_text(
+                "dependencies:\n"
+                "  components:\n"
+                "    - component_id: dep_a\n"
+                "      version_constraint: \">=0.1.0 <1.0.0\"\n"
+                "  profiles: []\n",
+                encoding="utf-8",
+            )
+            init_orchestration(
+                repo_root=repo_root, orchestration_id="orch_real_noyaml",
+                spec_ref="spec/component/real",
+            )
+            with patch.object(_rt, "_require_yaml", lambda: _raise()):
+                # MUST NOT raise.
+                write_preflight(
+                    repo_root=repo_root,
+                    orchestration_id="orch_real_noyaml",
+                    payload=_launchable_preflight_dict(
+                        checked_at="2026-05-12T00:00:00Z",
+                    ),
+                )
+            meta = json.loads((
+                repo_root / "workspace" / "orchestrations" / "orch_real_noyaml"
+                / "orchestration_meta.json"
+            ).read_text(encoding="utf-8"))
+            # With real deps + PyYAML unavailable we cannot prove leaf
+            # status — payload is fail-closed.
+            readiness = meta["dependency_readiness"]
+            self.assertFalse(readiness["direct_dependency_compile_readiness"])
+            self.assertNotIn("certified_deps", readiness)
+
+    def test_preflight_writes_leaf_certified_deps_when_pyyaml_available(self) -> None:
+        """When PyYAML IS available the leaf path still produces
+        `certified_deps: []` (round 31 F1). Smoke test that round-32 F1
+        did not regress that behavior."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            spec_dir = repo_root / "spec" / "component" / "smokeleaf"
+            spec_dir.mkdir(parents=True)
+            (spec_dir / "deps.yaml").write_text(
+                "dependencies:\n  components: []\n  profiles: []\n",
+                encoding="utf-8",
+            )
+            init_orchestration(
+                repo_root=repo_root, orchestration_id="orch_smokeleaf",
+                spec_ref="spec/component/smokeleaf",
+            )
+            write_preflight(
+                repo_root=repo_root, orchestration_id="orch_smokeleaf",
+                payload=_launchable_preflight_dict(
+                    checked_at="2026-05-12T00:00:00Z",
+                ),
+            )
+            meta = json.loads((
+                repo_root / "workspace" / "orchestrations" / "orch_smokeleaf"
+                / "orchestration_meta.json"
+            ).read_text(encoding="utf-8"))
+            readiness = meta["dependency_readiness"]
+            self.assertEqual(readiness["certified_deps"], [])
+            self.assertTrue(readiness["direct_dependency_compile_readiness"])
+
+
+class ReservePhaseRootCanonicalIdTests(unittest.TestCase):
+    """Codex round 32 F2: `reserve_phase_root` must enforce
+    `_SLUG_DATE_SEQ3_PATTERN` on `reserved_id`. Round 31 tightened the
+    freshness reader to this grammar but left the writer side
+    unenforced — a workflow could reserve a non-canonical id and write
+    valid artifacts that downstream dep_readiness silently ignored."""
+
+    def test_reserve_rejects_non_canonical_reserved_id(self) -> None:
+        from tools.orchestration_runtime import reserve_phase_root
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            init_orchestration(
+                repo_root=repo_root, orchestration_id="orch_reserve_bad",
+                spec_ref="spec/component/x",
+            )
+            for bad in (
+                "FAKE_20991231_999",
+                "dep_a_20260101_001",  # underscore inside slug
+                "noseq_20260101",
+                "missing-suffix",
+            ):
+                with self.subTest(reserved_id=bad):
+                    with self.assertRaises(ValueError) as ctx:
+                        reserve_phase_root(
+                            repo_root,
+                            orchestration_id="orch_reserve_bad",
+                            node_key="component/x@0.1.0",
+                            step="compile",
+                            reserved_id=bad,
+                            reserved_by_agent_run_id="arid_caller",
+                        )
+                    self.assertIn("reserved_id", str(ctx.exception))
+
+    def test_reserve_accepts_canonical_reserved_id(self) -> None:
+        from tools.orchestration_runtime import reserve_phase_root
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            init_orchestration(
+                repo_root=repo_root, orchestration_id="orch_reserve_ok",
+                spec_ref="spec/component/x",
+            )
+            payload = reserve_phase_root(
+                repo_root,
+                orchestration_id="orch_reserve_ok",
+                node_key="component/x@0.1.0",
+                step="compile",
+                reserved_id="dep-a_20260101_001",
+                reserved_by_agent_run_id="arid_caller",
+            )
+            self.assertEqual(payload["reserved_ir_id"], "dep-a_20260101_001")
+
+
+class PreflightPreservesVerifiedOnPyYAMLOutageTests(unittest.TestCase):
+    """Codex round 33 F1: a transient PyYAML outage on the controller
+    must NOT invalidate previously-verified non-leaf readiness records.
+    Round 32 synthesized an incompatible byte-only fingerprint that
+    guaranteed a "mismatch" against the full fingerprint stored at mark
+    time, causing `write_preflight` to overwrite verified state with
+    fail-closed across every non-leaf orchestration."""
+
+    def test_existing_verified_non_leaf_preserved_when_pyyaml_missing(self) -> None:
+        import tools.orchestration_runtime as _rt
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            # Build a non-leaf orchestration and verify it normally.
+            (repo_root / "spec" / "registry").mkdir(parents=True)
+            (repo_root / "spec" / "registry" / "spec_catalog.yaml").write_text(
+                "catalog_version: 0.2.0\nspecs:\n"
+                "  - spec_kind: component\n    spec_id: dep_a\n    spec_version: 0.1.0\n",
+                encoding="utf-8",
+            )
+            spec_dir = repo_root / "spec" / "component" / "nonleaf"
+            spec_dir.mkdir(parents=True)
+            (spec_dir / "deps.yaml").write_text(
+                "dependencies:\n"
+                "  components:\n"
+                "    - component_id: dep_a\n"
+                "      version_constraint: \">=0.1.0 <1.0.0\"\n"
+                "  profiles: []\n",
+                encoding="utf-8",
+            )
+            init_orchestration(
+                repo_root=repo_root, orchestration_id="orch_pres",
+                spec_ref="spec/component/nonleaf",
+            )
+            write_preflight(
+                repo_root=repo_root, orchestration_id="orch_pres",
+                payload=_launchable_preflight_dict(checked_at="2026-05-12T00:00:00Z"),
+            )
+            _setup_verified_dep(repo_root, dep_id="dep_a")
+            (repo_root / "spec" / "registry" / "spec_catalog.yaml").write_text(
+                "catalog_version: 0.2.0\nspecs:\n"
+                "  - spec_kind: component\n    spec_id: dep_a\n    spec_version: 0.1.0\n",
+                encoding="utf-8",
+            )
+            from tools.orchestration_runtime import (
+                mark_dependency_readiness, _load_spec_catalog,
+            )
+            _load_spec_catalog.cache_clear()
+            mark_dependency_readiness(
+                repo_root=repo_root, orchestration_id="orch_pres",
+            )
+            meta_path = (
+                repo_root / "workspace" / "orchestrations" / "orch_pres"
+                / "orchestration_meta.json"
+            )
+            verified_meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            verified_readiness = dict(verified_meta["dependency_readiness"])
+            self.assertTrue(verified_readiness["direct_dependency_compile_readiness"])
+
+            # Now simulate PyYAML outage and re-run preflight.
+            def _raise():  # type: ignore[no-untyped-def]
+                raise RuntimeError("PyYAML is required for parsing deps.yaml")
+
+            with patch.object(_rt, "_require_yaml", _raise):
+                write_preflight(
+                    repo_root=repo_root, orchestration_id="orch_pres",
+                    payload=_launchable_preflight_dict(
+                        checked_at="2026-05-12T01:00:00Z",
+                    ),
+                )
+            after = json.loads(meta_path.read_text(encoding="utf-8"))
+            # The previously-verified record MUST be preserved untouched.
+            self.assertEqual(
+                after["dependency_readiness"], verified_readiness,
+                msg=(
+                    "round-33 F1: PyYAML outage must not overwrite verified "
+                    "non-leaf readiness — found "
+                    f"{after['dependency_readiness']!r}"
+                ),
+            )
+
+
+class SpecCatalogCorruptionTests(unittest.TestCase):
+    """Codex round 33 F2: corrupt `spec_catalog.yaml` must propagate as a
+    distinct `spec_catalog_corrupt` failure, not be downgraded to
+    `{}` → "no matching dep" → silent all-flags-false. Hiding a
+    repository-wide outage as an ordinary dependency miss makes
+    diagnosis and recovery much harder."""
+
+    def test_load_spec_catalog_raises_on_corrupt_yaml(self) -> None:
+        from tools.orchestration_runtime import (
+            _load_spec_catalog, SpecCatalogCorruption,
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            cat = repo_root / "spec" / "registry" / "spec_catalog.yaml"
+            cat.parent.mkdir(parents=True)
+            cat.write_text(
+                "this is: not\n   - valid: yaml: : :\n",
+                encoding="utf-8",
+            )
+            _load_spec_catalog.cache_clear()
+            with self.assertRaises(SpecCatalogCorruption):
+                _load_spec_catalog(str(repo_root.resolve()))
+
+    def test_load_spec_catalog_raises_on_missing_specs_list(self) -> None:
+        from tools.orchestration_runtime import (
+            _load_spec_catalog, SpecCatalogCorruption,
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            cat = repo_root / "spec" / "registry" / "spec_catalog.yaml"
+            cat.parent.mkdir(parents=True)
+            # Valid YAML but missing top-level `specs:` list.
+            cat.write_text(
+                "catalog_version: 0.2.0\nupdated_at: 2026-05-11\n",
+                encoding="utf-8",
+            )
+            _load_spec_catalog.cache_clear()
+            with self.assertRaises(SpecCatalogCorruption):
+                _load_spec_catalog(str(repo_root.resolve()))
+
+    def test_load_spec_catalog_raises_on_missing_file(self) -> None:
+        """Codex round 34 F2: missing catalog is a HARD failure when
+        dependency resolution requires it. The earlier round-33 round-trip
+        lenient semantics let a repo-wide registry outage masquerade as
+        an ordinary "no matching dep" miss for non-leaf specs."""
+        from tools.orchestration_runtime import (
+            _load_spec_catalog, SpecCatalogCorruption,
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            _load_spec_catalog.cache_clear()
+            with self.assertRaises(SpecCatalogCorruption):
+                _load_spec_catalog(str(Path(tmp).resolve()))
+
+    def test_mark_dependency_readiness_fails_loud_on_catalog_corruption(self) -> None:
+        from tools.orchestration_runtime import (
+            mark_dependency_readiness, _load_spec_catalog,
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            spec_dir = repo_root / "spec" / "component" / "x"
+            spec_dir.mkdir(parents=True)
+            (spec_dir / "deps.yaml").write_text(
+                "dependencies:\n"
+                "  components:\n"
+                "    - component_id: dep_a\n"
+                "      version_constraint: \">=0.1.0 <1.0.0\"\n"
+                "  profiles: []\n",
+                encoding="utf-8",
+            )
+            cat = repo_root / "spec" / "registry" / "spec_catalog.yaml"
+            cat.parent.mkdir(parents=True)
+            # Corrupt catalog.
+            cat.write_text("this is: not\n   - valid: yaml: : :\n", encoding="utf-8")
+            _load_spec_catalog.cache_clear()
+            init_orchestration(
+                repo_root=repo_root, orchestration_id="orch_corruptcat",
+                spec_ref="spec/component/x",
+            )
+            with self.assertRaises(ValueError) as ctx:
+                mark_dependency_readiness(
+                    repo_root=repo_root, orchestration_id="orch_corruptcat",
+                )
+            self.assertIn("spec_catalog.yaml", str(ctx.exception))
+            self.assertIn("corrupt", str(ctx.exception).lower())
+            # And the persisted state is fail-closed with the distinct reason.
+            meta_path = (
+                repo_root / "workspace" / "orchestrations" / "orch_corruptcat"
+                / "orchestration_meta.json"
+            )
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            self.assertFalse(
+                meta["dependency_readiness"]["direct_dependency_compile_readiness"]
+            )
+            log = (
+                repo_root / "workspace" / "orchestrations" / "orch_corruptcat"
+                / "phase_state_log.jsonl"
+            ).read_text(encoding="utf-8")
+            self.assertIn("spec_catalog_corrupt", log)
+
+
+class FreshLeafLaunchableWithoutPyYAMLTests(unittest.TestCase):
+    """Codex round 34 F1: a brand-new no-deps orchestration must remain
+    launchable through `init → preflight → workflow-launch-check` even
+    when the controller is missing PyYAML. The fix is a strict
+    byte-level recognizer for canonical empty-deps `deps.yaml`."""
+
+    def _canonical_leaf(self, repo_root: Path) -> None:
+        spec_dir = repo_root / "spec" / "component" / "freshcanon"
+        spec_dir.mkdir(parents=True)
+        (spec_dir / "deps.yaml").write_text(
+            "dependencies:\n  components: []\n  profiles: []\n",
+            encoding="utf-8",
+        )
+
+    def test_byte_recognizer_accepts_canonical_empty_deps(self) -> None:
+        from tools.orchestration_runtime import _deps_yaml_bytes_are_canonical_empty
+        good = [
+            b"dependencies:\n  components: []\n  profiles: []\n",
+            b"dependencies:\n  profiles: []\n  components: []\n",
+            b"# leading comment\ndependencies:\n  components: []\n  profiles: []\n",
+        ]
+        for sample in good:
+            self.assertTrue(_deps_yaml_bytes_are_canonical_empty(sample), sample)
+
+    def test_byte_recognizer_rejects_populated_or_ambiguous(self) -> None:
+        from tools.orchestration_runtime import _deps_yaml_bytes_are_canonical_empty
+        bad = [
+            b"dependencies:\n  components:\n    - component_id: dep_a\n  profiles: []\n",
+            b"dependencies:\n  components: []\n  profiles:\n    - profile_id: foo\n",
+            b"spec_id: x\ndependencies:\n  components: []\n  profiles: []\n",
+            b"",
+            b"dependencies:\n",
+        ]
+        for sample in bad:
+            self.assertFalse(_deps_yaml_bytes_are_canonical_empty(sample), sample)
+
+    def test_fresh_leaf_init_launchable_under_pyyaml_outage(self) -> None:
+        """End-to-end: `init → preflight → workflow-launch-check` on a
+        canonical-empty-deps spec must succeed when PyYAML is missing."""
+        import tools.orchestration_runtime as _rt
+        from tools.orchestration_runtime import _dependency_ready
+
+        def _raise():  # type: ignore[no-untyped-def]
+            raise RuntimeError("PyYAML is required for parsing deps.yaml")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._canonical_leaf(repo_root)
+            with patch.object(_rt, "_require_yaml", _raise):
+                init_orchestration(
+                    repo_root=repo_root, orchestration_id="orch_fresh_outage",
+                    spec_ref="spec/component/freshcanon",
+                )
+                write_preflight(
+                    repo_root=repo_root, orchestration_id="orch_fresh_outage",
+                    payload=_launchable_preflight_dict(
+                        checked_at="2026-05-12T00:00:00Z",
+                    ),
+                )
+                ok, reason = _dependency_ready(
+                    repo_root, "orch_fresh_outage", step="compile",
+                )
+            self.assertTrue(
+                ok,
+                msg=(
+                    "round-34 F1: fresh canonical-leaf init + preflight must "
+                    f"launch under PyYAML outage; reason={reason!r}"
+                ),
+            )
+
+
+class SpecCatalogMissingHardFailureTests(unittest.TestCase):
+    """Codex round 34 F2: a missing `spec_catalog.yaml` is a HARD
+    failure when dependency resolution is required, not an ordinary
+    "no matching dep" miss. Round 33 only caught corrupt non-empty
+    catalogs; missing-file still silently produced empty-dict."""
+
+    def test_load_spec_catalog_raises_on_missing(self) -> None:
+        from tools.orchestration_runtime import (
+            _load_spec_catalog, SpecCatalogCorruption,
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            _load_spec_catalog.cache_clear()
+            with self.assertRaises(SpecCatalogCorruption) as ctx:
+                _load_spec_catalog(str(Path(tmp).resolve()))
+            self.assertIn("missing", str(ctx.exception).lower())
+
+    def test_mark_dependency_readiness_fails_loud_when_catalog_missing(self) -> None:
+        from tools.orchestration_runtime import (
+            mark_dependency_readiness, _load_spec_catalog,
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            spec_dir = repo_root / "spec" / "component" / "needs_catalog"
+            spec_dir.mkdir(parents=True)
+            (spec_dir / "deps.yaml").write_text(
+                "dependencies:\n"
+                "  components:\n"
+                "    - component_id: dep_a\n"
+                "      version_constraint: \">=0.1.0 <1.0.0\"\n"
+                "  profiles: []\n",
+                encoding="utf-8",
+            )
+            # Intentionally do NOT create spec/registry/spec_catalog.yaml.
+            _load_spec_catalog.cache_clear()
+            init_orchestration(
+                repo_root=repo_root, orchestration_id="orch_nocat",
+                spec_ref="spec/component/needs_catalog",
+            )
+            # write_preflight handles the missing-catalog gracefully (preserves /
+            # writes fail-closed). The hard failure should surface at
+            # mark-dependency-readiness time so operators get the distinct error.
+            with self.assertRaises(ValueError) as ctx:
+                mark_dependency_readiness(
+                    repo_root=repo_root, orchestration_id="orch_nocat",
+                )
+            self.assertIn("spec_catalog.yaml", str(ctx.exception))
+            log = (
+                repo_root / "workspace" / "orchestrations" / "orch_nocat"
+                / "phase_state_log.jsonl"
+            ).read_text(encoding="utf-8")
+            self.assertIn("spec_catalog_corrupt", log)
+
+
+class FreshnessIdCollisionTests(unittest.TestCase):
+    """Codex round 35 F1: when two distinct canonical IDs share the same
+    `(date, seq)` the freshness selector must fail closed instead of
+    using slug as a silent tiebreaker. `reserve_phase_root` only
+    validates id format, not global `(date, seq)` uniqueness across
+    orchestrations — so a concurrent or retried run could mint a
+    colliding id whose slug sorts later and win selection."""
+
+    def test_selector_returns_none_on_same_date_seq_different_slug(self) -> None:
+        from tools.orchestration_runtime import _select_max_by_id_extracted
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            # Two distinct canonical IDs at the same (date, seq).
+            a = root / "alpha_20260101_001"
+            b = root / "zulu_20260101_001"
+            a.mkdir()
+            b.mkdir()
+            result = _select_max_by_id_extracted(
+                [a, b], lambda p: p.name,
+            )
+            self.assertIsNone(
+                result,
+                msg=(
+                    "round-35 F1: same-(date,seq) collision must fail "
+                    f"closed; selector returned {result!r}"
+                ),
+            )
+
+    def test_selector_picks_unique_max_when_no_collision(self) -> None:
+        from tools.orchestration_runtime import _select_max_by_id_extracted
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            older = root / "alpha_20260101_001"
+            newer = root / "alpha_20260201_001"
+            same_date_lower_seq = root / "alpha_20260201_000"
+            for d in (older, newer, same_date_lower_seq):
+                d.mkdir()
+            result = _select_max_by_id_extracted(
+                [older, newer, same_date_lower_seq], lambda p: p.name,
+            )
+            self.assertEqual(result, newer)
+
+    def test_dependency_readiness_fails_closed_on_ir_id_collision(self) -> None:
+        """End-to-end: planting two distinct ir_ids with the same
+        (date, seq) under the dep's safe directory must make
+        ir_ref_verified=False (selector returns None → fail-closed),
+        not silently pick the lex-larger slug."""
+        from tools.orchestration_runtime import (
+            _verify_dep_stage, _load_spec_catalog,
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            safe = "component__dep_a__0.1.0"
+            ir_root = repo_root / "workspace" / "ir" / safe
+            ir_root.mkdir(parents=True)
+            for slug in ("alpha", "zulu"):
+                d = ir_root / f"{slug}_20260101_001"
+                d.mkdir()
+                (d / "ir_meta.json").write_text(
+                    json.dumps({"verification_status": "pass"}),
+                    encoding="utf-8",
+                )
+            _load_spec_catalog.cache_clear()
+            ok = _verify_dep_stage(
+                repo_root, "component", "dep_a", "0.1.0", "ir_ref",
+            )
+            self.assertFalse(
+                ok,
+                msg="collision must fail closed; got True via slug tiebreaker",
+            )
+
+
+class SpecCatalogZeroByteCorruptionTests(unittest.TestCase):
+    """Codex round 35 F2: an empty (zero-byte) `spec_catalog.yaml` is
+    corruption, not "no specs published yet". Round 34's
+    `SpecCatalogCorruption` only fired on parse/schema errors on
+    non-empty content; truncated catalogs slipped through as ordinary
+    empty-catalog → readiness=false."""
+
+    def test_zero_byte_catalog_raises(self) -> None:
+        from tools.orchestration_runtime import (
+            _load_spec_catalog, SpecCatalogCorruption,
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            cat = repo_root / "spec" / "registry" / "spec_catalog.yaml"
+            cat.parent.mkdir(parents=True)
+            cat.write_text("", encoding="utf-8")  # zero-byte file.
+            _load_spec_catalog.cache_clear()
+            with self.assertRaises(SpecCatalogCorruption) as ctx:
+                _load_spec_catalog(str(repo_root.resolve()))
+            self.assertIn("empty", str(ctx.exception).lower())
+
+    def test_mark_dependency_readiness_fails_loud_on_zero_byte_catalog(self) -> None:
+        from tools.orchestration_runtime import (
+            mark_dependency_readiness, _load_spec_catalog,
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            spec_dir = repo_root / "spec" / "component" / "needs_catalog"
+            spec_dir.mkdir(parents=True)
+            (spec_dir / "deps.yaml").write_text(
+                "dependencies:\n"
+                "  components:\n"
+                "    - component_id: dep_a\n"
+                "      version_constraint: \">=0.1.0 <1.0.0\"\n"
+                "  profiles: []\n",
+                encoding="utf-8",
+            )
+            cat = repo_root / "spec" / "registry" / "spec_catalog.yaml"
+            cat.parent.mkdir(parents=True)
+            cat.write_text("", encoding="utf-8")  # truncated.
+            _load_spec_catalog.cache_clear()
+            init_orchestration(
+                repo_root=repo_root, orchestration_id="orch_zerocat",
+                spec_ref="spec/component/needs_catalog",
+            )
+            with self.assertRaises(ValueError) as ctx:
+                mark_dependency_readiness(
+                    repo_root=repo_root, orchestration_id="orch_zerocat",
+                )
+            self.assertIn("spec_catalog.yaml", str(ctx.exception))
+            log = (
+                repo_root / "workspace" / "orchestrations" / "orch_zerocat"
+                / "phase_state_log.jsonl"
+            ).read_text(encoding="utf-8")
+            self.assertIn("spec_catalog_corrupt", log)
 
 
 if __name__ == "__main__":

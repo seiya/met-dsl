@@ -134,7 +134,7 @@
 - 子 `agent` への起動要求には `skill_name` と `skill_ref` と `skill_must_read_refs` を必須記録する。
 
 ### `ir_ref` / `pipeline_ref` / `dependency_ref` の規約
-- `ir_ref` は `workspace/ir/<node_key_safe>/<ir_id>` のみとし、追加のパスセグメントを付けてはならない。`<ir_id>` は `<node_key_safe>_` で始まるディレクトリ名とする。
+- `ir_ref` は `workspace/ir/<node_key_safe>/<ir_id>` のみとし、追加のパスセグメントを付けてはならない。`<ir_id>` は canonical な `<slug>_<YYYYMMDD>_<seq3>` 形式とする（正規表現 `^[a-z0-9]+(?:-[a-z0-9]+)*_[0-9]{8}_[0-9]{3}$`、canonical source: `docs/workflow/WORKFLOW_CORE.md` と `tools/orchestration_runtime.py` の `_SLUG_DATE_SEQ3_PATTERN`）。`<node_key_safe>` は `<ir_id>` の親 directory として配置し、`<ir_id>` 自体に prefix として付与してはならない（`node_key_safe` は `__` / `_` を含むため slug 正規表現に違反する）。
 - `pipeline_ref` は `workspace/pipelines/<node_key_safe>/<pipeline_id>` のみとし、追加のパスセグメント（`source/` や `source_meta.json` を含む）を付けてはならない。
 - `dependency_ref` は phase ごとに canonical path を固定する。`Compile` は `spec/.../deps.yaml`、`Generate` 以降は `workspace/...` の phase root（`ir_ref` または `pipeline_ref`）を記録し、`spec` 直参照を禁止する。
 - `Generate verify` の起動要求では、`source_id` を必須記録しなければならない。
@@ -143,7 +143,7 @@
 ### `Compile` 起動要求
 - `Compile.generate` の `skill_must_read_refs` には `controlled_spec.md` と `tests.md` と `deps.yaml` と `spec/registry/spec_catalog.yaml` を含める。
 - `Compile.verify` の `skill_must_read_refs` には `Compile.generate` が生成した `spec.ir.yaml` と `controlled_spec.md` と `tests.md` と `deps.yaml` を含める。
-- `Compile.verify` は `spec.ir.yaml` の構造 invariant 検証（全 case が algorithm.steps に被覆 / 依存解決の閉包整合 / output 契約と algorithm 出力の整合）を必須責務とする。
+- `Compile.verify` は `spec.ir.yaml` の構造 invariant 検証（全 case が algorithm.steps に被覆 / 依存解決の閉包整合 / output 契約と algorithm 出力の整合）を必須責務とする。加えて `impl_defaults.toolchain.language` / `impl_defaults.toolchain.standard` / `impl_defaults.toolchain.build_system` / `impl_defaults.target.architecture` が未定義の場合は `fail` とする (canonical source: `docs/IMPL_PLAN_SPEC.md` "必須項目")。
 
 ### `Generate` 起動要求
 - `Generate.generate` の `skill_must_read_refs` には `spec.ir.yaml` を含める。`controlled_spec.md` を直接読んではならない。
@@ -151,7 +151,7 @@
 
 ### `Validate` 起動要求
 - `Validate.execute` の `skill_must_read_refs` には `spec.ir.yaml` と `pipeline_ref/binary/<binary_id>/binary_meta.json` を含める。
-- `Validate.judge` の `skill_must_read_refs` には `spec.ir.yaml` と `tests.md` と同一 `run_id` 配下の `raw/` / `diagnostics.json` / `perf.json` / `quality_check.json` と `pipeline_ref/source/<source_id>/` を含める。
+- `Validate.judge` の `skill_must_read_refs` には `spec.ir.yaml` と `tests.md` と同一 `run_id` 配下の `raw/` / `diagnostics.json` / `perf.json` / `quality_check.json` / `trial_meta.json` と `pipeline_ref/source/<source_id>/` を含める。judge の launch request は `source_id` / `source_binary_id` を必須にしない (runtime は `run_id` のみ enforce する); 代わりに judge は同一 `run_id` 配下の `trial_meta.json` を読み、`trial_meta.json.source_source_id` を `<source_id>` として解決する (trial_meta は Validate.execute が書き込み、runtime が `binary_meta.json.source_source_id` との一致を verify 済みのため、retry で複数 source が共存する pipeline でも judge が誤った source を読む経路は無い)。
 - `Validate.judge` は `raw/` から独立経路で判定指標を再計算し、`diagnostics.json` と整合確認しなければならない。`LLM` 意味検査を必須実行する。
 
 ## 運用ルール
@@ -199,7 +199,7 @@
 42. `resume_enabled=true` の orchestration において、`orchestration agent` は `check-step-completed` を各 `step` 起動前に実行し、`completed=true` かつ `integrity=ok` の場合のみ当該 `step` のスキップを許可する。
 43. チェックポイントによりスキップした `step` は `agent_runs.jsonl` に `agent_role=skipped_by_checkpoint` として記録する。
 44. `resume_enabled=false` の orchestration では `orchestration_checkpoint.json` を信頼して `step` をスキップしてはならない。
-45. `write-step-result` の `status=pass` では、`Generate` / `Build` / `Validate` の `step_result.json` に `validation_stage` を必須記録する。許容値は `Generate: post_generate|full`、`Build: post_build|full`、`Validate: post_validate|full`。`Compile` は `validation_stage` を必須にしない。
+45. `write-step-result` の `status` が terminal (`pass` / `fail` / `blocked` / `timeout` / `cancel`) の場合、`Compile` / `Generate` / `Build` / `Validate` の `step_result.json` に `validation_stage` を必須記録する。許容値は `Compile: compile|full`、`Generate: post_generate|full`、`Build: post_build|full`、`Validate: post_execute|pre_judge|full`（runtime canonical: `tools/orchestration_runtime.py` の `STEP_REQUIRED_VALIDATION_STAGES`）。step ごとの許容値以外、または欠落時は runtime が `ValueError` で reject する。
 46. `codex_feature_check.json` の `status_kind=probe_error` の結果は永続固定してはならない。`METDSL_HOOK_FEATURE_RETRY_TTL_SECONDS`（既定 30 秒）経過後に再プローブを許可する。
 47. `workspace/tmp/<agent_run_id>/` は各 agent の一時作業領域として使用できる。`record-agent-run` は当該 `agent_run` 記録後に `workspace/tmp/<agent_run_id>/` を自動削除する。`tools/run_workflow.py` は `init` 成功後に環境変数 `TMPDIR` を `workspace/tmp/<orchestration_agent_run_id>/` に設定する。
 
@@ -218,7 +218,7 @@
 - `substep` を持つ `step` では、`agent_runs.jsonl` に記録された当該 `step` の全 `substep` の `agent_run_id` が、いずれかの `step_result.json` の `substep_agent_run_ids` に含まれる。
 - `step_result.json` の `required_outputs` が `docs/workflow/WORKFLOW_CORE.md` および対応する `docs/workflow/phases/phase_*.md` の phase contract と一致する。
 - `step_result.json` が `retry_decisions` を保持する場合、`effective pass substep` 集合を一意に復元できる。
-- `step_result.json` が `status=pass` の `Generate` / `Build` / `Validate` では、`validation_stage` が phase ごとの許容値に一致する。
+- `step_result.json` が terminal status の `Compile` / `Generate` / `Build` / `Validate` では、`validation_stage` が phase ごとの許容値 (項 45) に一致する。
 
 ## Patch 適用契約
 
