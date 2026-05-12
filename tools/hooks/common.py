@@ -64,12 +64,31 @@ WRITE_HINT = (
 # These reads are expected and harmless; silently allow them rather than block.
 # Authorization is by exact repo-relative path match (NOT suffix match) to prevent
 # absolute-path bypasses like /etc/README.md.
+# Scope: orchestration agent only. substep agent has narrower allowed roots and
+# must not Read these files.
 _AUTO_READ_TOLERATED_REPO_RELPATHS: frozenset[str] = frozenset({
     "MEMORY.md",
     "README.md",
     "TODO.md",
     "CLAUDE.md",
+})
+
+# Repo-relative paths and prefixes that the Claude Code harness auto-reads at
+# startup regardless of agent role (e.g. MCP discovery, settings parsing).
+# These reads happen before any agent prompt runs, so the agent cannot avoid
+# them. Allow for ALL agent roles (orchestration + step/substep) when the path
+# matches lexically. Authorization rules mirror the orchestration set:
+# - exact repo-relative match for the RELPATHS set, OR
+# - exact-prefix lexical match for the PREFIXES set, where prefix MUST end with
+#   "/" so it cannot extend across path components (no suffix bypass).
+_HARNESS_AUTO_READ_TOLERATED_REPO_RELPATHS: frozenset[str] = frozenset({
     ".claude/settings.json",
+    ".cursor/mcp.json",
+    "mcp_servers/README.md",
+    "mcp_servers/mcp_servers.example.json",
+})
+_HARNESS_AUTO_READ_TOLERATED_REPO_PREFIXES: frozenset[str] = frozenset({
+    "mcp_servers/tools/",
 })
 
 # Project-memory file lives outside the repo root under the user's Claude Code state directory.
@@ -1136,20 +1155,31 @@ def _is_auto_read_tolerated(
     agent_role: str | None,
     file_path: str,
 ) -> bool:
-    """orchestration agent の Claude Code auto-read 対象であれば True を返す。
+    """Claude Code auto-read 対象であれば True を返す。
 
-    Authorization rules (must satisfy ALL):
-    - agent_role == "orchestration"
-    - lexical path is either:
-        (a) exactly repo_root/<rel> for some rel in the explicit allowlist, OR
-        (b) exactly <home>/.claude/projects/<this-repo-slug>/memory/MEMORY.md
-    - the requested path itself is NOT a symlink (lstat-based check) to prevent
-      tolerance from being redirected to arbitrary host files via symlink swap.
-    Path comparison is done lexically (no .resolve()) so that an attacker
-    cannot bypass via filesystem symlinks pointing at the tolerated path.
+    Two categories of tolerated auto-reads are recognised:
+
+    1. Harness-mandatory auto-reads (all agent roles):
+       Files the Claude Code harness reads at startup regardless of agent
+       role (MCP discovery, settings parsing). Apply to orchestration AND
+       step/substep agents. Path must lexically match
+       `_HARNESS_AUTO_READ_TOLERATED_REPO_RELPATHS` or have a component-aligned
+       prefix from `_HARNESS_AUTO_READ_TOLERATED_REPO_PREFIXES`.
+
+    2. Orchestration-only auto-reads:
+       Project state files (MEMORY/README/TODO/CLAUDE) that orchestration
+       agent reads during MCP discovery. Apply only when agent_role ==
+       "orchestration". Path either lexically matches
+       `_AUTO_READ_TOLERATED_REPO_RELPATHS`, or is the project-memory file
+       under <home>/.claude/projects/<repo-slug>/memory/MEMORY.md.
+
+    Security invariants for both categories:
+    - The requested path itself must NOT traverse any symlink component
+      (lstat-based check) to prevent tolerance from being redirected to
+      arbitrary host files via symlink swap.
+    - Path comparison is done lexically (no .resolve()), so an attacker
+      cannot bypass via filesystem symlinks pointing at a tolerated path.
     """
-    if agent_role != "orchestration":
-        return False
     try:
         abs_target = _absolute_lexical(repo_root, file_path)
         repo_root_abs = _absolute_lexical(repo_root, str(repo_root))
@@ -1159,14 +1189,29 @@ def _is_auto_read_tolerated(
     if not _path_has_no_symlink_redirect(abs_target):
         return False
 
-    # (a) repo-contained exact lexical match
     try:
         rel = abs_target.relative_to(repo_root_abs)
     except ValueError:
         rel = None
-    if rel is not None:
-        rel_posix = rel.as_posix()
-        return rel_posix in _AUTO_READ_TOLERATED_REPO_RELPATHS
+    rel_posix = rel.as_posix() if rel is not None else None
+
+    # Category 1: harness-mandatory auto-read (all roles).
+    if rel_posix is not None:
+        if rel_posix in _HARNESS_AUTO_READ_TOLERATED_REPO_RELPATHS:
+            return True
+        for prefix in _HARNESS_AUTO_READ_TOLERATED_REPO_PREFIXES:
+            # Prefix must end with "/" so match is component-aligned and
+            # cannot extend across path segments (no suffix bypass).
+            if prefix.endswith("/") and rel_posix.startswith(prefix):
+                return True
+
+    # Category 2: orchestration-only auto-read.
+    if agent_role != "orchestration":
+        return False
+
+    # (a) repo-contained exact lexical match
+    if rel_posix is not None and rel_posix in _AUTO_READ_TOLERATED_REPO_RELPATHS:
+        return True
 
     # (b) project-memory file outside the repo: must lexically equal
     # <home>/.claude/projects/<repo-slug>/memory/MEMORY.md, where <repo-slug>

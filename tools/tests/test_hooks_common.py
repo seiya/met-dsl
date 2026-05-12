@@ -1579,10 +1579,162 @@ class AutoReadToleratedTests(unittest.TestCase):
 
     def test_substep_reads_memory_md_not_tolerated(self) -> None:
         # substep should still be blocked by the substantive read_manifest_read_guard,
-        # not auto-read tolerance (which is orchestration-only).
+        # not auto-read tolerance (which is orchestration-only for MEMORY.md).
         decision = self._call_validate_read("MEMORY.md", "substep")
         policy = (decision.audit_detail or {}).get("policy", "")
         self.assertNotEqual(policy, "auto_read_expected_block")
+
+    # ---- Harness-mandatory auto-read (all agent roles) -----------------
+
+    def test_substep_reads_claude_settings_is_harness_tolerated(self) -> None:
+        # .claude/settings.json is Claude Code harness auto-discovery; the
+        # substep harness reads it at startup regardless of agent role and
+        # the agent cannot suppress it. Must be classified benign.
+        decision = self._call_validate_read(".claude/settings.json", "substep")
+        self.assertEqual(
+            (decision.audit_detail or {}).get("policy"), "auto_read_expected_block",
+        )
+
+    def test_substep_reads_mcp_servers_readme_is_harness_tolerated(self) -> None:
+        decision = self._call_validate_read("mcp_servers/README.md", "substep")
+        self.assertEqual(
+            (decision.audit_detail or {}).get("policy"), "auto_read_expected_block",
+        )
+
+    def test_substep_reads_cursor_mcp_json_is_harness_tolerated(self) -> None:
+        decision = self._call_validate_read(".cursor/mcp.json", "substep")
+        self.assertEqual(
+            (decision.audit_detail or {}).get("policy"), "auto_read_expected_block",
+        )
+
+    def test_substep_reads_mcp_servers_tools_run_linter_is_harness_tolerated(self) -> None:
+        decision = self._call_validate_read(
+            "mcp_servers/tools/run_linter.json", "substep",
+        )
+        self.assertEqual(
+            (decision.audit_detail or {}).get("policy"), "auto_read_expected_block",
+        )
+
+    def test_substep_reads_mcp_servers_example_json_is_harness_tolerated(self) -> None:
+        # mcp_servers.example.json is in _HARNESS_AUTO_READ_TOLERATED_REPO_RELPATHS
+        # — verify substep harness Read is benign.
+        decision = self._call_validate_read(
+            "mcp_servers/mcp_servers.example.json", "substep",
+        )
+        self.assertEqual(
+            (decision.audit_detail or {}).get("policy"), "auto_read_expected_block",
+        )
+
+    def test_orchestration_reads_mcp_servers_tools_prefix_is_harness_tolerated(self) -> None:
+        # Regression-lock: harness category 1 is branchless on agent_role.
+        # If a future refactor mistakenly gates the prefix loop on
+        # `agent_role == "orchestration"`, this positive test for the
+        # orchestration role on a prefix path catches the regression.
+        decision = self._call_validate_read(
+            "mcp_servers/tools/run_linter.json", "orchestration",
+        )
+        self.assertEqual(
+            (decision.audit_detail or {}).get("policy"), "auto_read_expected_block",
+        )
+
+    def test_substep_reads_mcp_servers_tools_arbitrary_json_is_harness_tolerated(self) -> None:
+        # Prefix match: any file under mcp_servers/tools/ is harness-discovered.
+        decision = self._call_validate_read(
+            "mcp_servers/tools/other.json", "substep",
+        )
+        self.assertEqual(
+            (decision.audit_detail or {}).get("policy"), "auto_read_expected_block",
+        )
+
+    def test_substep_reads_mcp_servers_runtime_py_not_tolerated(self) -> None:
+        # The Python runtime file is NOT in harness set/prefix — it must
+        # remain blocked by the substantive read_manifest_read_guard so an
+        # agent cannot use the tolerance path to dig into implementation.
+        decision = self._call_validate_read(
+            "mcp_servers/build_runtime_server.py", "substep",
+        )
+        policy = (decision.audit_detail or {}).get("policy", "")
+        self.assertNotEqual(policy, "auto_read_expected_block")
+
+    def test_substep_reads_mcp_servers_other_dir_json_not_tolerated(self) -> None:
+        # Regression: prefix is "mcp_servers/tools/" only. A nested dir
+        # under mcp_servers/ that is not /tools/ must not be tolerated.
+        decision = self._call_validate_read(
+            "mcp_servers/other_dir/file.json", "substep",
+        )
+        policy = (decision.audit_detail or {}).get("policy", "")
+        self.assertNotEqual(policy, "auto_read_expected_block")
+
+    def test_substep_cannot_bypass_via_traversal_in_mcp_tools(self) -> None:
+        # Regression: ../mcp_servers/tools/x.json normalised lexically must
+        # not lead outside the repo prefix.
+        decision = self._call_validate_read(
+            "../mcp_servers/tools/x.json", "substep",
+        )
+        policy = (decision.audit_detail or {}).get("policy", "")
+        self.assertNotEqual(policy, "auto_read_expected_block")
+
+    def test_orchestration_rejects_symlinked_mcp_servers_readme(self) -> None:
+        """Symlink attack: a symlink at mcp_servers/README.md pointing at an
+        arbitrary host file must NOT be tolerated even for orchestration."""
+        from tools.hooks.common import _is_auto_read_tolerated
+        import os
+        import tempfile
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            repo_root = tmp_path / "repo"
+            (repo_root / "mcp_servers").mkdir(parents=True)
+            target = tmp_path / "secret.txt"
+            target.write_text("secret", encoding="utf-8")
+            os.symlink(target, repo_root / "mcp_servers" / "README.md")
+            self.assertFalse(
+                _is_auto_read_tolerated(
+                    repo_root, "orchestration", "mcp_servers/README.md",
+                )
+            )
+
+    def test_substep_rejects_symlinked_mcp_tools_glob(self) -> None:
+        """Symlink attack on a prefix-matched file: a symlink inside
+        mcp_servers/tools/ pointing outside must NOT be tolerated."""
+        from tools.hooks.common import _is_auto_read_tolerated
+        import os
+        import tempfile
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            repo_root = tmp_path / "repo"
+            (repo_root / "mcp_servers" / "tools").mkdir(parents=True)
+            target = tmp_path / "secret.txt"
+            target.write_text("secret", encoding="utf-8")
+            os.symlink(target, repo_root / "mcp_servers" / "tools" / "x.json")
+            self.assertFalse(
+                _is_auto_read_tolerated(
+                    repo_root, "substep", "mcp_servers/tools/x.json",
+                )
+            )
+
+    def test_substep_rejects_when_mcp_tools_directory_is_symlink(self) -> None:
+        """Symlink attack on the prefix directory itself: if `mcp_servers/tools`
+        is a symlink to e.g. /etc, the per-component lstat walk must reject the
+        read regardless of the leaf path being within the prefix set."""
+        from tools.hooks.common import _is_auto_read_tolerated
+        import os
+        import tempfile
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            repo_root = tmp_path / "repo"
+            (repo_root / "mcp_servers").mkdir(parents=True)
+            attacker_dir = tmp_path / "attacker_payload"
+            attacker_dir.mkdir()
+            (attacker_dir / "passwd").write_text("secret", encoding="utf-8")
+            os.symlink(attacker_dir, repo_root / "mcp_servers" / "tools")
+            self.assertFalse(
+                _is_auto_read_tolerated(
+                    repo_root, "substep", "mcp_servers/tools/passwd",
+                )
+            )
 
     def test_orchestration_cannot_bypass_via_absolute_etc_readme(self) -> None:
         # Regression: /etc/README.md must NOT be tolerated even though it ends with /README.md

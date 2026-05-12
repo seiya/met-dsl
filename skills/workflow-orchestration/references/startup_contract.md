@@ -47,19 +47,29 @@ workspace/tmp/<agent_run_id>/
 ## 運用ルール
 1. `tools/run_workflow.py` を実行して `workspace/orchestrations/<orchestration_id>/` の初期化と `preflight.json` 生成を行う。
 2. `tools/run_workflow.py` 以外の経路で workflow を開始してはならない。
-3. `METDSL_WORKFLOW_MODE=1` で起動した orchestration agent は `~/.claude/projects/` 配下の `memory/` ディレクトリ（`MEMORY.md` 等）を読んではならない。workflow 実行は決定論的に進めるため、conversation 外部の persistent state を参照しない。以下の **Claude Code auto-read 系ファイル**が起動直後に自動 Read された場合、`read_manifest_read_guard` でブロックされるが **これは想定動作**であり workflow の継続に影響しない。エラーとして扱わず、再試行やこれらのファイルへの追加参照を試みてはならない。
+3. `METDSL_WORKFLOW_MODE=1` で起動した orchestration agent は `~/.claude/projects/` 配下の `memory/` ディレクトリ（`MEMORY.md` 等）を読んではならない。workflow 実行は決定論的に進めるため、conversation 外部の persistent state を参照しない。以下の **Claude Code auto-read 系ファイル**が起動直後に自動 Read された場合、`audit_detail.policy=auto_read_expected_block` で benign 分類されるが **これは想定動作**であり workflow の継続に影響しない。エラーとして扱わず、再試行やこれらのファイルへの追加参照を試みてはならない。
 
-   **orchestration agent における auto-read 許容ブロック対象（ブロックを無視してよいファイル一覧）:**
-   - `~/.claude/projects/.../memory/MEMORY.md`（または `MEMORY.md` のみ）
-   - `README.md`（プロジェクトルート）
-   - `TODO.md`（プロジェクトルート）
-   - `CLAUDE.md`（プロジェクトルート）
+   許容対象は **(A) harness 強制 auto-read（全 agent role 適用）** と **(B) orchestration agent のみ許容** の 2 ブロックに分かれる。実装は `tools/hooks/common.py` の `_HARNESS_AUTO_READ_TOLERATED_REPO_RELPATHS` / `_HARNESS_AUTO_READ_TOLERATED_REPO_PREFIXES` および `_AUTO_READ_TOLERATED_REPO_RELPATHS` に対応する。
+
+   **(A) harness 強制 auto-read（全 agent role 適用）**
+
+   Claude Code harness が agent role に依らず startup 直後に Read するファイル群。`orchestration agent` / `step agent` / `substep agent` のいずれでも benign 扱いとする。harness の動作であり、agent が能動的にこれらを Read することは禁止する。
    - `.claude/settings.json`
    - `.cursor/mcp.json`（Claude Code の MCP discovery が起動直後に自動 Read する）
    - `mcp_servers/README.md`（同上）
+   - `mcp_servers/mcp_servers.example.json`（同上）
+   - `mcp_servers/tools/` 配下の全ファイル（MCP tool 定義の auto-discovery。実装は prefix-tolerate しており harness が読むのは `*.json` のみ）
+
+   **(B) orchestration agent のみ許容**
+
+   `orchestration agent` の startup 時に Claude Code harness が project state を read する経路。`substep agent` には適用されない（substep の harness は project state を再 read しないため）。
+   - `~/.claude/projects/.../memory/MEMORY.md`
+   - `README.md`（プロジェクトルート）
+   - `TODO.md`（プロジェクトルート）
+   - `CLAUDE.md`（プロジェクトルート）
    - プロジェクトルート直下の `MEMORY.md`
 
-   **substep agent はこれらのファイルを読もうとしてはならない**（substep にとっては通常エラー）。
+   **substep agent はブロック (B) のファイルを Read してはならない**（substep にとっては通常エラーで `read_manifest_read_guard` が発火する）。ブロック (A) は harness 経由でのみ許容され、agent prompt から能動的に Read することは全 role で禁止する。
 4. `preflight` 判定が `pass` でない場合は `set-status --status fail` を実行して停止する。
 5. 最初の `commentary` で、対象 phase、使用する `SKILL`、起動する `agent` 種別、`MCP` 使用箇所を宣言する。
 6. 固定表で phase 種別を確認し、`Compile` / `Generate` / `Validate` では `substep agent`、`Build` では `step agent` を起動対象として確定する。

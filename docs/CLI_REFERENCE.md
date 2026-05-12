@@ -157,7 +157,7 @@ Adv-20: orchestration agent が `Agent` tool の return を観測した証跡 (`
 | `--repo-root` | yes | |
 | `--orchestration-id` | yes | |
 | `--agent-run-id` | yes | 子 agent の UUID |
-| `--return-token` | yes | Adv-30: `workspace/orchestrations/<orch>/launches/<arid>.parent_return_token` の値。`$(cat <path>)` で渡す |
+| `--return-token` | yes | Adv-30: `workspace/orchestrations/<orch>/launches/<arid>.parent_return_token` の値。`$(cat <path>)` で渡す。**`Read` tool 等で当該 file を先に読んではならない**（active_child window 中の Read は child arid の `read_manifest` で評価され `read_manifest_read_guard` で block される） |
 | `--reply-excerpt` | no | 任意短文 (200 chars 截断)。audit 用 |
 
 ---
