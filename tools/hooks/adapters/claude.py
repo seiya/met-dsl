@@ -69,6 +69,29 @@ class ClaudeHookAdapter(HookBackendAdapter):
             }
             return 2, json.dumps(body, ensure_ascii=False)
 
+        if decision.action == HookDecisionAction.ALLOW_AUTO_APPROVE:
+            # hookSpecificOutput.permissionDecision="allow" は harness の
+            # permission prompt を bypass し、operator approval なしで実行を継続する。
+            # 前提: ALLOW_AUTO_APPROVE は cli.py の Write/Edit branch (PreToolUse
+            # event) でのみ発行される。他 event で混入させた場合 hookEventName が
+            # 不整合になるので、新規発行箇所を追加するときは PreToolUse である
+            # ことを保証すること。
+            audit = decision.audit_detail or {}
+            tool_name = audit.get("tool_name") or "tool"
+            file_path = audit.get("file_path") or ""
+            agent_run_id = audit.get("agent_run_id") or ""
+            reason = f"{tool_name} to {file_path} matched output_manifest.allowed_file_tool_paths"
+            if agent_run_id:
+                reason += f" (agent_run_id={agent_run_id})"
+            body = {
+                "hookSpecificOutput": {
+                    "hookEventName": "PreToolUse",
+                    "permissionDecision": "allow",
+                    "permissionDecisionReason": reason,
+                }
+            }
+            return 0, json.dumps(body, ensure_ascii=False)
+
         if decision.action == HookDecisionAction.CONTINUE_WITH_MESSAGE:
             # Claude Code expects plain text (or empty) on the allow path;
             # "continue" is not a recognised JSON decision value.

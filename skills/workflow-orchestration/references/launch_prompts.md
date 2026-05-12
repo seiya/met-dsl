@@ -1,5 +1,9 @@
 # Launch Prompts
 
+> **Audience: orchestration agent のみ。**
+> このファイルは orchestration agent が `Agent` tool（または `spawn_agent`）の `prompt` 引数を生成するためのテンプレ集である。
+> **`step agent` / `substep agent` はこのファイルを `Read` してはならない。** 起動後の child agent には必要なテンプレ内容が既に `Agent` tool の prompt 引数として渡されており、当該 path は `read_manifest_read_guard` で fail-closed にブロックされる（再発防止のため意図的）。
+
 ## `step agent` 起動要求テンプレート
 
 ```text

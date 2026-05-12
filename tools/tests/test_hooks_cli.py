@@ -1977,9 +1977,11 @@ class ClaudeHookCliTests(unittest.TestCase):
                     )
             self.assertEqual(code, 0)
             body_text = out.getvalue().strip()
-            if body_text:
-                body = json.loads(body_text)
-                self.assertEqual(body.get("decision"), "allow")
+            self.assertTrue(body_text, "hook must emit hookSpecificOutput for permission auto-approve")
+            body = json.loads(body_text)
+            hso = body.get("hookSpecificOutput") or {}
+            self.assertEqual(hso.get("permissionDecision"), "allow")
+            self.assertEqual(hso.get("hookEventName"), "PreToolUse")
 
     def test_claude_file_tool_allows_orchestration_agent_edit_failure_analysis_json(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -2026,9 +2028,11 @@ class ClaudeHookCliTests(unittest.TestCase):
                     )
             self.assertEqual(code, 0)
             body_text = out.getvalue().strip()
-            if body_text:
-                body = json.loads(body_text)
-                self.assertEqual(body.get("decision"), "allow")
+            self.assertTrue(body_text, "hook must emit hookSpecificOutput for permission auto-approve")
+            body = json.loads(body_text)
+            hso = body.get("hookSpecificOutput") or {}
+            self.assertEqual(hso.get("permissionDecision"), "allow")
+            self.assertEqual(hso.get("hookEventName"), "PreToolUse")
 
     def test_claude_raw_apply_patch_allows_when_failure_analysis_json_is_in_allowlist(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -2453,8 +2457,8 @@ class WriteToolExtensionPolicyTests(unittest.TestCase):
                 orch=orch, repo_root=repo_root, file_path=yaml_path
             )
             self.assertEqual(code, 0)
-            if body:
-                self.assertEqual(body.get("decision"), "allow")
+            self.assertTrue(body, "hook must emit hookSpecificOutput for permission auto-approve")
+            self.assertEqual((body.get("hookSpecificOutput") or {}).get("permissionDecision"), "allow")
 
     def test_write_tool_allows_markdown_when_listed_in_allowed_file_tool_paths(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -2473,8 +2477,8 @@ class WriteToolExtensionPolicyTests(unittest.TestCase):
                 orch=orch, repo_root=repo_root, file_path=md_path
             )
             self.assertEqual(code, 0)
-            if body:
-                self.assertEqual(body.get("decision"), "allow")
+            self.assertTrue(body, "hook must emit hookSpecificOutput for permission auto-approve")
+            self.assertEqual((body.get("hookSpecificOutput") or {}).get("permissionDecision"), "allow")
 
     def test_write_tool_allows_source_code_when_listed_in_allowed_file_tool_paths(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -2493,8 +2497,8 @@ class WriteToolExtensionPolicyTests(unittest.TestCase):
                 orch=orch, repo_root=repo_root, file_path=src_path
             )
             self.assertEqual(code, 0)
-            if body:
-                self.assertEqual(body.get("decision"), "allow")
+            self.assertTrue(body, "hook must emit hookSpecificOutput for permission auto-approve")
+            self.assertEqual((body.get("hookSpecificOutput") or {}).get("permissionDecision"), "allow")
 
     def test_write_tool_blocks_yaml_when_not_listed_in_allowed_file_tool_paths(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -2535,6 +2539,92 @@ class WriteToolExtensionPolicyTests(unittest.TestCase):
             )
             self.assertEqual(code, 2)
             self.assertEqual(body.get("decision"), "block")
+
+    def test_bash_redirect_to_allowed_path_is_plain_allow_not_auto_approve(self) -> None:
+        """Regression: ALLOW_AUTO_APPROVE は Write/Edit branch 限定。
+        Bash redirect が manifest match で ALLOW になっても hookSpecificOutput を
+        emit してはならない（Bash は harness の permission prompt 対象外であり、
+        auto-approve は不要かつ event scope が PreToolUse 以外でも適用される
+        誤拡張を防ぐ）。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            orch = "orch_bash_scope_001"
+            run_id = "step_run_bash_scope_001"
+            target = "workspace/ir/p/spec.ir.yaml"
+            self._setup_orchestration_for_write(
+                repo_root,
+                orch=orch,
+                run_id=run_id,
+                allowed_output_paths=[target],
+                allowed_file_tool_paths=[target],
+            )
+            payload = {
+                "orchestration_id": orch,
+                "repo_root": str(repo_root),
+                "tool_name": "Bash",
+                "tool_input": {"command": f"cat foo > {target}"},
+            }
+            out = io.StringIO()
+            with patch.dict(os.environ, {"METDSL_WORKFLOW_MODE": "1"}, clear=False):
+                with redirect_stdout(out):
+                    code = cli.main(
+                        [
+                            "--backend",
+                            "claude",
+                            "--event",
+                            "PreToolUse",
+                            "--input-json",
+                            json.dumps(payload),
+                        ]
+                    )
+            self.assertEqual(code, 0)
+            body_text = out.getvalue().strip()
+            # plain ALLOW for Bash → empty stdout, NOT hookSpecificOutput JSON
+            self.assertEqual(body_text, "", f"Bash ALLOW must not emit auto-approve payload; got: {body_text!r}")
+
+    def test_apply_patch_match_is_plain_allow_not_auto_approve(self) -> None:
+        """Regression: apply_patch も Write/Edit と異なる経路を通り、
+        ALLOW_AUTO_APPROVE には昇格してはならない。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            orch = "orch_apply_patch_scope_001"
+            run_id = "step_run_apply_patch_scope_001"
+            target = "workspace/ir/p/ir_meta.json"
+            self._setup_orchestration_for_write(
+                repo_root,
+                orch=orch,
+                run_id=run_id,
+                allowed_output_paths=[target],
+                allowed_file_tool_paths=[target],
+            )
+            patch_text = (
+                "*** Begin Patch\n"
+                f"*** Add File: {target}\n"
+                "+{}\n"
+                "*** End Patch\n"
+            )
+            payload = {
+                "orchestration_id": orch,
+                "repo_root": str(repo_root),
+                "tool_name": "apply_patch",
+                "tool_input": {"patch": patch_text},
+            }
+            out = io.StringIO()
+            with patch.dict(os.environ, {"METDSL_WORKFLOW_MODE": "1"}, clear=False):
+                with redirect_stdout(out):
+                    code = cli.main(
+                        [
+                            "--backend",
+                            "claude",
+                            "--event",
+                            "PreToolUse",
+                            "--input-json",
+                            json.dumps(payload),
+                        ]
+                    )
+            self.assertEqual(code, 0)
+            body_text = out.getvalue().strip()
+            self.assertEqual(body_text, "", f"apply_patch ALLOW must not emit auto-approve payload; got: {body_text!r}")
 
 
 if __name__ == "__main__":

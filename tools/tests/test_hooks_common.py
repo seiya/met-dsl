@@ -400,6 +400,46 @@ class HookCommonTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual(stdout_text, "")
 
+    def test_claude_adapter_encode_decision_allow_auto_approve_emits_hook_specific_output(self) -> None:
+        adapter = ClaudeHookAdapter()
+        decision = HookDecision(
+            action=HookDecisionAction.ALLOW_AUTO_APPROVE,
+            audit_detail={
+                "policy": "output_manifest_write_allow",
+                "tool_name": "Write",
+                "file_path": "workspace/ir/foo/spec.ir.yaml",
+                "agent_run_id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+            },
+        )
+        code, stdout_text = adapter.encode_decision(decision)
+        self.assertEqual(code, 0)
+        body = json.loads(stdout_text)
+        self.assertIn("hookSpecificOutput", body)
+        hso = body["hookSpecificOutput"]
+        self.assertEqual(hso.get("hookEventName"), "PreToolUse")
+        self.assertEqual(hso.get("permissionDecision"), "allow")
+        reason = hso.get("permissionDecisionReason") or ""
+        self.assertIn("Write to workspace/ir/foo/spec.ir.yaml", reason)
+        self.assertIn("agent_run_id=aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee", reason)
+
+    def test_codex_adapter_encode_decision_allow_auto_approve_falls_back_to_empty_allow(self) -> None:
+        adapter = CodexHookAdapter()
+        decision = HookDecision(
+            action=HookDecisionAction.ALLOW_AUTO_APPROVE,
+            audit_detail={
+                "policy": "output_manifest_write_allow",
+                "tool_name": "Write",
+                "file_path": "workspace/ir/foo/spec.ir.yaml",
+                "agent_run_id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+            },
+        )
+        code, stdout_text = adapter.encode_decision(decision)
+        self.assertEqual(code, 0)
+        self.assertEqual(stdout_text, "")
+
+    def test_hook_decision_action_allow_auto_approve_enum_value(self) -> None:
+        self.assertEqual(HookDecisionAction.ALLOW_AUTO_APPROVE.value, "allow_auto_approve")
+
     def test_claude_adapter_encode_decision_block_omits_continue_processing(self) -> None:
         adapter = ClaudeHookAdapter()
         code, stdout_text = adapter.encode_decision(

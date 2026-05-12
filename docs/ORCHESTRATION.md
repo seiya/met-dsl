@@ -88,6 +88,7 @@
 - `record-launch` は child 起動直後に `workspace/orchestrations/<orchestration_id>/session_run_index.json` を更新し、`agent_run_id` と `agent_session_id` と `context_id` と `agent_role` と `status` を記録しなければならない。
 - `agent_graph.json` の `edge` は、`orchestration -> step` または `orchestration -> substep` を canonical source とする。
 - `agent_runs.jsonl` と `agent_graph.json` は、実行中イベントを逐次追記して生成しなければならない。後生成を禁止する。
+- `orchestration agent` 自身の `agent_runs.jsonl` 行は **起動直後に 1 回だけ** `agent_role=orchestration`、`status=running` で append する。終了時に同 `agent_run_id` の行を更新する経路は持たない（`record-agent-run` の二重 invoke は `ValueError: duplicate agent_run_id` で reject される）。orchestration 全体の terminal 状態は `set-status` で `orchestration_meta.json` 側に表現する。詳細は [docs/CLI_REFERENCE.md#record-agent-run](CLI_REFERENCE.md#record-agent-run) と [docs/CLI_REFERENCE.md#set-status](CLI_REFERENCE.md#set-status) を canonical source とする。
 - `record-launch` は、`spawn_agent` 成功直後の request/response 保存専用処理としなければならない。
 - `record-launch` は launch response に `sandbox_runtime=bwrap` と `sandbox_enforced=true` と `sandbox_profile_ref` を記録しなければならない。
 

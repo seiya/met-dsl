@@ -9,6 +9,7 @@ from pathlib import Path
 
 from tools.audit_orchestration import (
     audit,
+    collect_allow_auto_approve_stats,
     collect_fix_hint_stats,
     collect_policy_block_counts,
     collect_fail_closed_timeline,
@@ -342,6 +343,60 @@ class CollectAgentRunSummaryTests(unittest.TestCase):
         self.assertIn("r1", result["missing_finished_at"])
 
 
+class CollectAllowAutoApproveStatsTests(unittest.TestCase):
+    """`action=allow_auto_approve` イベントの可視化用集計。"""
+
+    def _make_allow_auto(self, tool_name: str) -> dict:
+        return {
+            "action": "allow_auto_approve",
+            "tool_name": tool_name,
+            "audit_detail": {"policy": "output_manifest_write_allow", "tool_name": tool_name},
+            "ts": "2026-05-09T00:00:00Z",
+        }
+
+    def test_empty_events_returns_zero_total(self) -> None:
+        result = collect_allow_auto_approve_stats([])
+        self.assertEqual(result, {"total": 0, "by_tool": {}})
+
+    def test_ignores_non_allow_auto_approve_actions(self) -> None:
+        events = [
+            {"action": "allow", "tool_name": "Read"},
+            {"action": "block", "tool_name": "Write"},
+            self._make_allow_auto("Write"),
+        ]
+        result = collect_allow_auto_approve_stats(events)
+        self.assertEqual(result["total"], 1)
+        self.assertEqual(result["by_tool"], {"Write": 1})
+
+    def test_aggregates_by_tool_name_and_sorts_by_count(self) -> None:
+        events = [
+            self._make_allow_auto("Write"),
+            self._make_allow_auto("Write"),
+            self._make_allow_auto("Write"),
+            self._make_allow_auto("Edit"),
+        ]
+        result = collect_allow_auto_approve_stats(events)
+        self.assertEqual(result["total"], 4)
+        self.assertEqual(list(result["by_tool"].keys()), ["Write", "Edit"])
+        self.assertEqual(result["by_tool"]["Write"], 3)
+        self.assertEqual(result["by_tool"]["Edit"], 1)
+
+    def test_falls_back_to_audit_detail_tool_name_when_top_level_missing(self) -> None:
+        events = [
+            {
+                "action": "allow_auto_approve",
+                "audit_detail": {"tool_name": "Write"},
+            }
+        ]
+        result = collect_allow_auto_approve_stats(events)
+        self.assertEqual(result["by_tool"], {"Write": 1})
+
+    def test_unknown_tool_when_no_tool_name_anywhere(self) -> None:
+        events = [{"action": "allow_auto_approve"}]
+        result = collect_allow_auto_approve_stats(events)
+        self.assertEqual(result["by_tool"], {"unknown": 1})
+
+
 class AuditIntegrationTests(unittest.TestCase):
     """audit() end-to-end with a small fixture workspace."""
 
@@ -359,6 +414,24 @@ class AuditIntegrationTests(unittest.TestCase):
             _make_block("read_manifest_read_guard", "cat tools/z.py"),
             _make_block("output_manifest_write_guard", fix_hint={"next_command": "guarded-apply-patch ..."}),
             {"action": "allow", "tool_name": "Read", "ts": "2026-05-09T00:10:00Z"},
+            {
+                "action": "allow_auto_approve",
+                "tool_name": "Write",
+                "audit_detail": {"policy": "output_manifest_write_allow", "tool_name": "Write"},
+                "ts": "2026-05-09T00:06:00Z",
+            },
+            {
+                "action": "allow_auto_approve",
+                "tool_name": "Write",
+                "audit_detail": {"policy": "output_manifest_write_allow", "tool_name": "Write"},
+                "ts": "2026-05-09T00:07:00Z",
+            },
+            {
+                "action": "allow_auto_approve",
+                "tool_name": "Edit",
+                "audit_detail": {"policy": "output_manifest_write_allow", "tool_name": "Edit"},
+                "ts": "2026-05-09T00:08:00Z",
+            },
         ]
         _write_jsonl(hooks_dir / "native_hook_events.jsonl", hook_events)
 
@@ -388,6 +461,9 @@ class AuditIntegrationTests(unittest.TestCase):
         self.assertIsNotNone(result["fail_closed_timeline"]["fail_closed_at"])
         self.assertEqual(result["agent_run_summary"]["status_counts"]["pass"], 1)
         self.assertEqual(result["agent_run_summary"]["status_counts"]["fail"], 1)
+        aa = result["allow_auto_approve_stats"]
+        self.assertEqual(aa["total"], 3)
+        self.assertEqual(aa["by_tool"], {"Write": 2, "Edit": 1})
 
     def test_audit_renders_markdown_without_error(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -398,6 +474,23 @@ class AuditIntegrationTests(unittest.TestCase):
         self.assertIn("REPEATED ERROR PATTERN", md)
         self.assertIn("read_manifest_read_guard", md)
         self.assertIn("fail_closed", md)
+        self.assertIn("Auto-approved Write/Edit", md)
+        self.assertIn("Total: 3", md)
+
+    def test_audit_markdown_omits_auto_approve_section_when_zero(self) -> None:
+        """Section is suppressed when no allow_auto_approve events fired."""
+        with tempfile.TemporaryDirectory() as tmp:
+            orch_id = "orch_no_auto_approve"
+            orch_root = Path(tmp) / "workspace" / "orchestrations" / orch_id
+            (orch_root / "hooks").mkdir(parents=True)
+            _write_jsonl(
+                orch_root / "hooks" / "native_hook_events.jsonl",
+                [_make_block("read_manifest_read_guard")],
+            )
+            result = audit(Path(tmp), orch_id)
+        self.assertEqual(result["allow_auto_approve_stats"]["total"], 0)
+        md = _render_markdown(result)
+        self.assertNotIn("Auto-approved Write/Edit", md)
 
     def test_audit_handles_missing_log_files_gracefully(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

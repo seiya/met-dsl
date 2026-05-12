@@ -96,6 +96,30 @@ def collect_policy_block_counts(
     return dict(counter.most_common())
 
 
+def collect_allow_auto_approve_stats(
+    hook_events: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """`action=allow_auto_approve` の総数と tool_name 別内訳を返す。
+
+    `hookSpecificOutput.permissionDecision="allow"` で harness の permission
+    prompt を bypass した Write/Edit イベントの可視化用。volume が想定外に
+    大きい場合は manifest 検証が緩い、または agent 側で意図しない多重 write
+    が走っているシグナル。
+    """
+    by_tool: Counter = Counter()
+    total = 0
+    for e in hook_events:
+        if e.get("action") != "allow_auto_approve":
+            continue
+        total += 1
+        tool_name = e.get("tool_name") or (e.get("audit_detail") or {}).get("tool_name") or "unknown"
+        by_tool[tool_name] += 1
+    return {
+        "total": total,
+        "by_tool": dict(by_tool.most_common()),
+    }
+
+
 def split_substantive_and_benign(
     blocks: list[dict[str, Any]],
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
@@ -330,6 +354,7 @@ def audit(repo_root: Path, orchestration_id: str) -> dict[str, Any]:
         "policy_block_counts": collect_policy_block_counts(substantive_blocks),
         "benign_policy_block_counts": collect_policy_block_counts(benign_blocks),
         "suspicious_benign_volume": suspicious_benign,
+        "allow_auto_approve_stats": collect_allow_auto_approve_stats(hook_events),
         "fix_hint_stats": collect_fix_hint_stats(substantive_blocks),
         "fail_closed_timeline": timeline,
         "agent_run_summary": collect_agent_run_summary(agent_runs, invalid_runs),
@@ -393,6 +418,30 @@ def _render_markdown(result: dict[str, Any]) -> str:
                 f"| `{entry['agent_run_id']}` | `{entry['policy']}` | "
                 f"{entry['count']} | {entry['expected_max']} |"
             )
+        lines.append("")
+
+    aa = result.get("allow_auto_approve_stats", {})
+    if aa.get("total", 0) > 0:
+        lines.append("## Auto-approved Write/Edit (hookSpecificOutput)")
+        lines.append("")
+        lines.append(
+            "Count of `action=allow_auto_approve` events. These are Write/Edit "
+            "calls where the hook returned `permissionDecision=\"allow\"` because "
+            "the target path matched `output_manifest.allowed_file_tool_paths`, "
+            "bypassing the Claude Code harness permission prompt. High volume on "
+            "a single tool may indicate an agent doing more direct writes than "
+            "expected; check the corresponding agent's output_manifest scope."
+        )
+        lines.append("")
+        lines.append(f"Total: {aa.get('total', 0)}")
+        # collect_allow_auto_approve_stats() は total>0 のとき必ず by_tool を
+        # 1 件以上含む (tool_name 不明時は "unknown" を採用) ため、ここでは
+        # 空チェックを省略できる。
+        lines.append("")
+        lines.append("| Tool | Count |")
+        lines.append("|---|---|")
+        for tool_name, cnt in aa.get("by_tool", {}).items():
+            lines.append(f"| `{tool_name}` | {cnt} |")
         lines.append("")
 
     fhs = result["fix_hint_stats"]

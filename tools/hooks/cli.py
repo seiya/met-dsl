@@ -966,13 +966,29 @@ def _evaluate_pre_command_file_access_policy(
                 decoded.file_path,
                 agent_role=agent_role,
             )
-        return _validate_write_targets(
+        # Write / Edit: manifest 一致時は permissionDecision=allow を返して harness の
+        # permission prompt を bypass する。manifest 不一致は BLOCK のまま伝播する。
+        write_decision = _validate_write_targets(
             repo_root=repo_root,
             orchestration_id=orchestration_id,
             agent_run_id=resolved_run_id,
             targets=[decoded.file_path],
             tool_name=tool_name,
         )
+        if write_decision.action == HookDecisionAction.ALLOW:
+            return HookDecision(
+                action=HookDecisionAction.ALLOW_AUTO_APPROVE,
+                reason=write_decision.reason,
+                additional_context=write_decision.additional_context,
+                continue_processing=write_decision.continue_processing,
+                audit_detail={
+                    "policy": "output_manifest_write_allow",
+                    "tool_name": tool_name,
+                    "file_path": decoded.file_path,
+                    "agent_run_id": resolved_run_id,
+                },
+            )
+        return write_decision
 
     # step 3: Bash read/write guard
     if tool_name == "Bash":

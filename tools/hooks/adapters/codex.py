@@ -84,6 +84,9 @@ class CodexHookAdapter(HookBackendAdapter):
             }
             return 0, json.dumps(body, ensure_ascii=False)
 
+        # ALLOW_AUTO_APPROVE は Claude Code 固有の permissionDecision bypass を
+        # 表現する。Codex は permission prompt を持たず、明示的な auto-approve
+        # 表現も不要なので ALLOW と同じく空 stdout を返す。
         # Codex hook runtime does not require payload on allow-path and some events
         # reject non-empty JSON outputs. Return empty stdout for compatibility.
         return 0, ""

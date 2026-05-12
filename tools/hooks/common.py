@@ -119,6 +119,7 @@ class HookEventName(str, Enum):
 
 class HookDecisionAction(str, Enum):
     ALLOW = "allow"
+    ALLOW_AUTO_APPROVE = "allow_auto_approve"
     BLOCK = "block"
     CONTINUE_WITH_MESSAGE = "continue_with_message"
 

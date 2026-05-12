@@ -200,6 +200,24 @@ workflow 実行中に hook がブロックした場合、`reason` と `audit_det
 | `forbid_git_reset_hard` | `git reset --hard` を実行しようとした | `git restore <file>` または `git checkout <file>` で個別ファイルを戻す |
 | `capability_invalid_empty_write_roots` | `write_roots=[]` の capability で書き込もうとした | `record-launch` の `--request-json` に `allowed_output_paths` が正しく設定されているか確認する |
 
+## duplicate agent_run_id recovery {#duplicate-agent_run_id-recovery}
+
+`record-agent-run` を **同一 `agent_run_id`** で 2 回 invoke すると `ValueError: duplicate agent_run_id: <id>` を raise する。idempotent ではない hard error として設計されており、同じ `agent_run_id` を後から更新／upsert する経路は無い。
+
+**典型的な発生原因**
+
+- 既に `agent_runs.jsonl` へ append 済みの child agent_run について retry を試みた
+- orchestration agent 自身の entry を terminal で再 append しようとした（orchestration の終端は `set-status` 経由が canonical で、`record-agent-run` を 2 回目に呼ぶ経路は存在しない）
+
+**回復手順**
+
+1. `python3 tools/new_agent_run_id.py` で新しい `agent_run_id` を採番する。
+2. `python3 tools/orchestration_runtime.py reserve-phase-root --orchestration-id <oid> --agent-run-id <new_arid> --node-key <node_key> --step <step>` で `ir_id` / `pipeline_id` を新規予約する（旧 `agent_run_id` が予約済みの場合は予約の reuse 可否を operator に確認）。
+3. `record-launch` → `Agent` tool 起動 → `record-child-return` → `deactivate-child` → `record-reply` → `record-agent-run` の正規 sequence を新 `agent_run_id` で再実行する（CLAUDE.md の手順 1–9 を参照）。
+4. orchestration 自体を終端させる場合は `set-status --status fail_closed --reason-code <code> --reason-detail <detail>` を呼ぶ。`agent_runs.jsonl` の orchestration 行を更新しないこと。
+
+詳細な CLI 規約は [docs/CLI_REFERENCE.md#record-agent-run](CLI_REFERENCE.md#record-agent-run) を canonical source とする。
+
 ## Substep timeout 復旧 {#substep-timeout-recovery}
 
 子 Agent tool が API stream idle timeout で途中切断された場合、orchestration agent は `record-timeout` を呼んで終端 entry を確定させる。**ad-hoc な script を `workspace/tmp/` に書いてはならない**。
