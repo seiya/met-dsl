@@ -111,6 +111,14 @@
 - 再投入時は `repair_strategy` を問わず、新規 `agent_run_id` と新規 `context_id` を発行する。
 - `repair_strategy=reuse` の場合、`agent_session_id` は再利用してよい。`repair_strategy=restart` の場合、`agent_session_id` は新規発行しなければならない。
 - 再投入時の `launches/<agent_run_id>.request.json` は、`issue_severity` と `repair_strategy` と `repair_target_agent_run_id` と `repair_reason` を必須記録とする。
+- `repair_strategy=reuse` で `apply_patch_writes` gate 証跡は `repair_target_agent_run_id` から継承する。新規 `guarded-apply-patch` 呼び出しは不要とし、`record-agent-run` は `gates/<repair_target>/apply_patch_writes.json` を canonical な証跡として参照する。継承の事実は `<orch_root>/agents/<agent_run_id>/audit/gate_inheritance.json` に記録され audit 経路を構成する。`repair_strategy=restart` の場合は継承しない（契約再解釈のため新規証跡を必須とする）。
+
+### 再投入時の baseline diff 契約
+- `record-agent-run` reject 後の retry における child baseline diff は、毎回 live workspace を walk して baseline と比較する (`_compute_changed_paths_against_baseline`)。これにより deactivate 後の任意の filesystem 改変も terminal write validation の対象に残る。
+- retry の brick-cascade 防止のため、`<orch_root>/agent_runs_invalid.jsonl` (および lock sidecar) のみを runtime-owned 単体 file として live diff から narrow に除外する。これは前回の `record-agent-run` 失敗が次回 retry の diff を contaminate する原因 file であり、`record-agent-run` 自身が writer であることが確定している。`<orch_root>/audit/`・`<orch_root>/violations/`・`<orch_root>/failure_analysis.json` 等の他 control-plane path は blanket exempt **しない** — child の hook-bypass write が terminal validation に backstop として残る (`tools/orchestration_runtime.py::_should_ignore_runtime_snapshot_path` を canonical source とする)。
+- `<orch_root>/launches/...`・`<orch_root>/violations/...`・`<orch_root>/agents/...` 等の per-arid runtime-managed prefix も diff から除外する (元来 runtime-only directories)。`workspace/tmp/<parent_arid>/` 配下の parent scratch は `_validate_actual_write_paths` の `parent_tmp_root` exclusion で除外する。
+- `deactivate-child` は `<orch_root>/agents/<agent_run_id>/deactivate_snapshot.json` に child-authored path 集合を audit 用に保存する。本 snapshot は人手 audit と将来の debug 用途のみで、`record-agent-run` の validation 経路では参照しない (live diff を必ず通す)。
+
 - 失敗 phase からのフィードバック方向は phase ごとに固定する:
   - `Compile` 失敗 → Compile 内 retry のみ（上流は人手 Spec のため自動 retry なし）。
   - `Generate` 失敗 → Generate 内 retry。`source_meta.json` の verify 失敗が `attribution=ir` と判定された場合は `Compile` まで戻す。

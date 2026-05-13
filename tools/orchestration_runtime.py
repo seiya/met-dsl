@@ -5240,6 +5240,25 @@ def _should_ignore_runtime_snapshot_path(
         f"{orch_root}/agent_runs.jsonl",
         # Adv-24: fcntl lock sidecar; orchestration runtime exclusively manages it.
         f"{orch_root}/agent_runs.jsonl.lock",
+        # Recurrence-prevention plan (Issue 3): the invalid-payload audit log
+        # is written by `record-agent-run` after terminal validation rejects a
+        # payload (see `_validate_terminal_run_payload`). It lives at the
+        # orchestration root and is exempted here because:
+        #   (1) the runtime is the only legitimate writer (record-agent-run
+        #       itself, while serializing terminal-validation failures);
+        #   (2) children cannot reach the path through tool hooks
+        #       (`output_manifest_write_guard` blocks any Edit/Write/Bash
+        #       redirect to paths outside `allowed_file_tool_paths`), so a
+        #       child entry can only land here through a hook bypass —
+        #       outside the threat model this terminal-diff check addresses;
+        #   (3) without the exemption, the very write that records a failed
+        #       attempt contaminates the next retry's baseline diff, which
+        #       was the demonstrated brick-cascade we are fixing.
+        # The exemption is intentionally narrow: only the literal log file
+        # and its fcntl-lock sidecar. Other files under `<orch_root>/` are
+        # not blanket-exempt — see Codex review round 6 P1.
+        f"{orch_root}/agent_runs_invalid.jsonl",
+        f"{orch_root}/agent_runs_invalid.jsonl.lock",
         # Codex round 11 F1: fcntl lock sidecar for orchestration_meta.json
         # serialization; same runtime-managed exemption as the runs lock.
         f"{orch_root}/orchestration_meta.json.lock",
@@ -5319,12 +5338,33 @@ def _load_run_write_baseline(
     return payload
 
 
-def _actual_changed_paths_since_baseline(
+def _deactivate_snapshot_path(
+    repo_root: Path,
+    orchestration_id: str,
+    *,
+    agent_run_id: str,
+) -> Path:
+    """Per-arid deactivate snapshot — child-authored path set captured at
+    `deactivate-child` time. Lives under `agents/<arid>/` (runtime-prefix
+    exempt), so writing it does not contaminate any diff."""
+    return (
+        _orchestration_root(repo_root, orchestration_id)
+        / "agents"
+        / agent_run_id.strip()
+        / "deactivate_snapshot.json"
+    )
+
+
+def _compute_changed_paths_against_baseline(
     repo_root: Path,
     orchestration_id: str,
     *,
     agent_run_id: str | None = None,
 ) -> list[str]:
+    """Raw baseline-diff computation — walks the workspace and compares
+    against the per-arid write baseline. This is the canonical live-diff
+    used by `_actual_changed_paths_since_baseline` for terminal write
+    validation."""
     baseline = _load_run_write_baseline(
         repo_root,
         orchestration_id,
@@ -5346,6 +5386,29 @@ def _actual_changed_paths_since_baseline(
         if before.get(rel) != after.get(rel)
     }
     return sorted(changed)
+
+
+def _actual_changed_paths_since_baseline(
+    repo_root: Path,
+    orchestration_id: str,
+    *,
+    agent_run_id: str | None = None,
+) -> list[str]:
+    # Recurrence-prevention plan (Issue 3) — Codex review P1 follow-up:
+    # always perform the live baseline diff so post-deactivate filesystem
+    # mutations remain visible to terminal write validation. The
+    # demonstrated failure (`agent_runs_invalid.jsonl` and similar runtime
+    # writes contaminating retries) is fully addressed by the
+    # `runtime_files` / `runtime_prefixes` exemptions in
+    # `_should_ignore_runtime_snapshot_path`, plus the existing
+    # `parent_tmp_root` exclusion in `_validate_actual_write_paths`. The
+    # deactivate snapshot remains available as an audit artifact (see
+    # `_deactivate_snapshot_path`) but is no longer consulted for diff
+    # short-circuiting — that would hide real unauthorized writes that
+    # appear between deactivate and the (possibly retried) record-agent-run.
+    return _compute_changed_paths_against_baseline(
+        repo_root, orchestration_id, agent_run_id=agent_run_id
+    )
 
 
 def _normalize_rel_path_list(paths: Sequence[str]) -> list[str]:
@@ -6906,9 +6969,288 @@ def _required_launch_prompt_constraint_lines(request_payload: dict[str, Any]) ->
     ]
 
 
+# Issue 1 of the recurrence-prevention plan: per-(step, substep) allowed
+# `validate_pipeline_semantics --stage <X>` invocations. Canonical source:
+# `skills/workflow-orchestration/references/launch_prompts.md` "substep ↔
+# allowed validator gate 対応表". `record-launch` rejects any launch
+# prompt where an actionable invocation line targets a stage outside the
+# substep's allow-set. Override with env `METDSL_ENFORCE_GATE_ALLOWLIST=0`
+# for emergency rollback.
+#
+# Two canonical invocation forms are detected (Codex review round 2 P2):
+#   (a) Direct CLI:   `python3 tools/validate_pipeline_semantics.py
+#                      --stage <X> ...`
+#   (b) run-gate:     `python3 tools/orchestration_runtime.py run-gate
+#                      --gate validate_pipeline_semantics ...
+#                      --args-json '{"stage": "<X>", ...}'`
+#
+# Negative-constraint prose ("do not run `validate_pipeline_semantics
+# --stage compile`") is not flagged: each line is pre-filtered for
+# actionable markers (`python3` / `tools/...py` / `--gate
+# validate_pipeline_semantics`) before stage extraction.
+# Invocation-presence detectors (do NOT capture stage). Each match marks
+# the START of an actionable `validate_pipeline_semantics` invocation.
+# Stage extraction is then performed in a windowed lookahead so multi-line
+# commands (with `\` continuation or wrapped --args-json) are handled
+# correctly (Codex review round 7 P1).
+#
+# The direct-CLI invocation form requires the `.py` suffix AND a
+# `python3` token on the same line. The run-gate form requires the
+# `--gate validate_pipeline_semantics` argument PLUS a `python3` token on
+# the same line or in the immediately preceding lines (covering Bash
+# backslash-continued invocations). Both checks ensure narrative
+# mentions of `validate_pipeline_semantics.py` in documentation prose are
+# never flagged.
+_DIRECT_INVOCATION_RE = re.compile(r"validate_pipeline_semantics\.py\b")
+_RUN_GATE_INVOCATION_RE = re.compile(r"--gate\s+validate_pipeline_semantics\b")
+_PYTHON3_INVOCATION_TOKEN_RE = re.compile(r"python3\b")
+
+# Stage value extractors. Each produces a single capturing group with the
+# stage token. The patterns use a permissive lookahead body so they
+# tolerate wrapped commands (line continuations / multiline JSON args);
+# the caller bounds the search window before invoking these patterns.
+_DIRECT_STAGE_RE = re.compile(
+    r"validate_pipeline_semantics\.py\b.*?--stage\s+(\w+)",
+    re.DOTALL,
+)
+# Tolerate the shell double-quoted form where JSON quotes are
+# backslash-escaped (e.g. `--args-json "{\"stage\":\"compile\"}"`) in
+# addition to the single-quoted form (`--args-json '{"stage":...}'`).
+# The optional `\\?` before each quote captures the escape character
+# when present. Codex review round 15 P1.
+_RUN_GATE_STAGE_RE = re.compile(
+    r"--gate\s+validate_pipeline_semantics\b.*?"
+    r"\\?[\"']stage\\?[\"']\s*:\s*\\?[\"'](\w+)\\?[\"']",
+    re.DOTALL,
+)
+
+# Default stage assumed when an actionable validate_pipeline_semantics
+# invocation omits `--stage` / `"stage"` — mirrors the argparse default
+# in `tools/validate_pipeline_semantics.py`. Used only when no stage is
+# discoverable in the post-invocation window (Codex review round 4 P1).
+_VALIDATE_PIPELINE_DEFAULT_STAGE = "full"
+
+# Lookahead window (in characters) used when scanning for `--stage` /
+# `"stage"` after an invocation marker. Bounded so a far-away invocation
+# elsewhere in the prompt cannot accidentally satisfy a later one.
+_STAGE_LOOKAHEAD_BYTES = 500
+
+# Lookback window (in characters) used to detect that an invocation
+# (direct `validate_pipeline_semantics.py` reference or `--gate
+# validate_pipeline_semantics` argument) was actually launched by a
+# `python3 ...` command spread over preceding lines via Bash
+# backslash-continuation. Applies to both invocation forms (Codex review
+# round 8 P2).
+_INVOCATION_PYTHON3_LOOKBACK_BYTES = 300
+
+# Negation markers — when any appears on the same line as an invocation
+# marker the line is treated as descriptive prose (e.g. "do not run X")
+# and skipped (Codex review round 7 P2).
+_NEGATION_MARKERS: tuple[str, ...] = (
+    "do not ",
+    "don't ",
+    "do not.",
+    "should not ",
+    "shouldn't ",
+    "must not ",
+    "mustn't ",
+    "してはならない",
+    "してはいけない",
+    "含めてはならない",
+    "含めるな",
+    "禁止",
+    "ng:",
+)
+
+
+def _line_around(text: str, position: int) -> tuple[int, int, str]:
+    """Return `(line_start, line_end, line)` for the line containing
+    character `position` in `text`."""
+    line_start = text.rfind("\n", 0, position) + 1
+    line_end = text.find("\n", position)
+    if line_end == -1:
+        line_end = len(text)
+    return line_start, line_end, text[line_start:line_end]
+
+
+def _has_negation_marker(line: str) -> bool:
+    lower = line.lower()
+    return any(marker in lower for marker in _NEGATION_MARKERS)
+
+
+def _find_stage_near_invocation(
+    text: str,
+    invocation_start: int,
+    stage_re: re.Pattern[str],
+) -> str | None:
+    """Search for a stage value in the window beginning at
+    `invocation_start`. The window terminates at the earliest of:
+    `_STAGE_LOOKAHEAD_BYTES` chars, a paragraph break (`\\n\\n`), or the
+    next invocation marker of either form. Returns the matched stage
+    token or None."""
+    end = min(len(text), invocation_start + _STAGE_LOOKAHEAD_BYTES)
+    paragraph_break = text.find("\n\n", invocation_start)
+    if paragraph_break != -1 and paragraph_break < end:
+        end = paragraph_break
+    for next_re in (_DIRECT_INVOCATION_RE, _RUN_GATE_INVOCATION_RE):
+        m = next_re.search(text, invocation_start + 1)
+        if m and m.start() < end:
+            end = m.start()
+    window = text[invocation_start:end]
+    match = stage_re.search(window)
+    if match is None:
+        return None
+    return match.group(1)
+
+# Allowed `--stage` values per (step, substep). Authoritative sources:
+# `tools/validate_pipeline_semantics.py` argparse choices = {`compile`,
+# `post_generate`, `post_build`, `post_execute`, `pre_judge`, `full`} (see
+# also `docs/CLI_REFERENCE.md`). A substep absent from this map is
+# unconstrained — only substeps where the workflow explicitly forbids
+# `validate_pipeline_semantics` invocation or restricts the stage are
+# listed.
+ALLOWED_VALIDATE_PIPELINE_STAGES: dict[tuple[str, str], frozenset[str]] = {
+    # Strict per-substep mapping. Authoritative source: the "substep ↔
+    # allowed validator gate 対応表" in
+    # `skills/workflow-orchestration/references/launch_prompts.md`. Each
+    # substep is restricted to the single canonical `--stage` it owns;
+    # cross-substep / `full` invocations are rejected at `record-launch`
+    # because they widen the substep's responsibility surface beyond the
+    # recurrence-prevention contract. (SKILL.md line 116 documents the
+    # broader per-step allow-set for `write-step-result`'s
+    # `validation_stage` field — a separate recording-layer contract — but
+    # the launch-prompt layer enforced here is strictly per-substep.)
+    #
+    # Compile.generate / Generate.generate must not invoke
+    # `validate_pipeline_semantics` at all — that responsibility lies with
+    # the corresponding verify substep. This was the exact pattern that
+    # triggered the original `noncanonical_phase_write_attempt` failure.
+    ("compile", "generate"): frozenset(),
+    ("compile", "verify"): frozenset({"compile"}),
+    ("generate", "generate"): frozenset(),
+    ("generate", "verify"): frozenset({"post_generate"}),
+    ("build", ""): frozenset({"post_build"}),
+    ("validate", "execute"): frozenset({"post_execute"}),
+    ("validate", "judge"): frozenset({"pre_judge"}),
+}
+
+
+def _iter_validate_pipeline_invocations(prompt_text: str) -> list[str]:
+    """Yield the stage targeted by each actionable
+    `validate_pipeline_semantics` invocation in `prompt_text`. Both
+    canonical invocation forms (direct CLI and `run-gate --args-json`) are
+    supported. The list ordering is unspecified.
+
+    An invocation is recognized only when:
+      - The direct-CLI marker `validate_pipeline_semantics.py` (or the
+        run-gate marker `--gate validate_pipeline_semantics`) appears on
+        a line that also contains `python3` (or the run-gate marker is
+        preceded by `python3` within `_RUN_GATE_LOOKBACK_BYTES`, covering
+        Bash backslash-continued multi-line commands), AND
+      - The line containing the marker has no negation marker (e.g.
+        "do not run …", "禁止", "してはならない") — such lines are treated
+        as documentation prose (Codex review round 7 P2).
+
+    For each accepted invocation the stage is extracted from a bounded
+    forward window so wrapped `--args-json '{"stage": ...}'` blocks are
+    parsed correctly (Codex review round 7 P1). When no stage can be
+    found the validator's argparse default (`full`) is reported, ensuring
+    omitted-stage invocations are still subjected to the allow-set check
+    (Codex review round 4 P1).
+    """
+    stages: list[str] = []
+
+    def _python3_visible(marker_start: int, line_start: int, line: str) -> bool:
+        """Return True when a `python3` token is on the marker's line OR
+        within `_INVOCATION_PYTHON3_LOOKBACK_BYTES` chars before the
+        marker (covering Bash backslash-continuation). Codex review
+        round 8 P2 — same lookback applies to both invocation forms."""
+        if _PYTHON3_INVOCATION_TOKEN_RE.search(line):
+            return True
+        lookback_start = max(0, line_start - _INVOCATION_PYTHON3_LOOKBACK_BYTES)
+        preceding = prompt_text[lookback_start:marker_start]
+        return _PYTHON3_INVOCATION_TOKEN_RE.search(preceding) is not None
+
+    # Direct-CLI form: invocation marker + python3 (same line or lookback)
+    # + stage extractor.
+    for m in _DIRECT_INVOCATION_RE.finditer(prompt_text):
+        line_start, _, line = _line_around(prompt_text, m.start())
+        if not _python3_visible(m.start(), line_start, line):
+            continue
+        if _has_negation_marker(line):
+            continue
+        stage = _find_stage_near_invocation(prompt_text, m.start(), _DIRECT_STAGE_RE)
+        stages.append(stage if stage else _VALIDATE_PIPELINE_DEFAULT_STAGE)
+
+    # run-gate form: same `python3`-visibility rule (line or lookback).
+    for m in _RUN_GATE_INVOCATION_RE.finditer(prompt_text):
+        line_start, _, line = _line_around(prompt_text, m.start())
+        if not _python3_visible(m.start(), line_start, line):
+            continue
+        if _has_negation_marker(line):
+            continue
+        stage = _find_stage_near_invocation(prompt_text, m.start(), _RUN_GATE_STAGE_RE)
+        stages.append(stage if stage else _VALIDATE_PIPELINE_DEFAULT_STAGE)
+
+    return stages
+
+
+def _lint_launch_prompt_gate_allowlist(
+    prompt_text: str,
+    *,
+    step: str,
+    substep: str | None,
+) -> list[str]:
+    """Return a list of human-readable violation descriptions when the
+    prompt contains an actionable `validate_pipeline_semantics` invocation
+    targeting a stage that is not in this substep's allow-set. Empty list
+    means the prompt is clean. Issue 1 of the recurrence-prevention plan.
+
+    The scan recognizes both canonical invocation forms (direct CLI and
+    `run-gate --args-json`), tolerates multi-line wrapping of long
+    commands (Codex review round 7 P1), and excludes documentation prose
+    that quotes the forbidden form via negation markers (Codex review
+    round 7 P2)."""
+    if os.environ.get("METDSL_ENFORCE_GATE_ALLOWLIST", "1").strip() == "0":
+        return []
+    key = (
+        step.strip().lower() if isinstance(step, str) else "",
+        (substep or "").strip().lower() if isinstance(substep, str) else "",
+    )
+    if key not in ALLOWED_VALIDATE_PIPELINE_STAGES:
+        return []
+    allowed_stages = ALLOWED_VALIDATE_PIPELINE_STAGES[key]
+    violations: list[str] = []
+    for stage in _iter_validate_pipeline_invocations(prompt_text):
+        if stage.lower() not in allowed_stages:
+            violations.append(
+                f"validate_pipeline_semantics stage={stage!r} (allowed for "
+                f"step={key[0]!r} substep={key[1]!r}: "
+                f"{sorted(allowed_stages) or '(none — gate forbidden)'})"
+            )
+    return violations
+
+
 def _validate_launch_prompt_text(request_payload: dict[str, Any], prompt_text: str) -> None:
     required_markers = _required_launch_prompt_markers(request_payload)
     if not required_markers:
+        # Even when no template markers are required (e.g. orchestration
+        # agent self-prompts), still apply the gate-allowlist lint when
+        # step/substep are declared — this is the canonical recurrence-
+        # prevention guard for Issue 1.
+        step_raw = request_payload.get("step")
+        substep_raw = request_payload.get("substep")
+        if isinstance(step_raw, str) and step_raw.strip():
+            violations = _lint_launch_prompt_gate_allowlist(
+                prompt_text, step=step_raw, substep=substep_raw if isinstance(substep_raw, str) else None
+            )
+            if violations:
+                raise ValueError(
+                    f"launch prompt for step={step_raw!r} substep={substep_raw!r} "
+                    f"violates substep ↔ allowed validator gate 対応表: {violations}. "
+                    f"See skills/workflow-orchestration/references/launch_prompts.md "
+                    f"for the canonical allowlist."
+                )
         return
     missing_markers = [marker for marker in required_markers if marker not in prompt_text]
     if missing_markers:
@@ -6930,6 +7272,22 @@ def _validate_launch_prompt_text(request_payload: dict[str, Any], prompt_text: s
             "launch prompt text must preserve workflow-orchestration shell-write constraints: "
             + ", ".join(missing_constraint_lines)
         )
+    # Issue 1 of the recurrence-prevention plan: regex-based forbidden
+    # validator-gate lint. Runs after marker / line / constraint checks so
+    # missing-template errors retain their pre-existing precedence.
+    step_raw = request_payload.get("step")
+    substep_raw = request_payload.get("substep")
+    if isinstance(step_raw, str) and step_raw.strip():
+        hits = _lint_launch_prompt_gate_allowlist(
+            prompt_text, step=step_raw, substep=substep_raw if isinstance(substep_raw, str) else None
+        )
+        if hits:
+            raise ValueError(
+                f"launch prompt for step={step_raw!r} substep={substep_raw!r} "
+                f"contains forbidden gate keyword(s): {hits}. "
+                f"See skills/workflow-orchestration/references/launch_prompts.md "
+                f"`substep ↔ allowed validator gate 対応表` for the canonical allowlist."
+            )
 
 
 def _extract_agent_summary_text(payload: dict[str, Any]) -> str:
@@ -7601,7 +7959,10 @@ def _validate_terminal_run_payload(
             agent_run_id=str(payload.get("agent_run_id") or ""),
             paths=[str(item) for item in output_refs if isinstance(item, str)],
         )
-        _validate_apply_patch_gate_coverage(repo_root, orchestration_id, payload)
+        _validate_apply_patch_gate_coverage(
+            repo_root, orchestration_id, payload,
+            caller_holds_lock=caller_holds_lock,
+        )
         return
 
     if not isinstance(output_refs, list) or not output_refs:
@@ -7609,13 +7970,309 @@ def _validate_terminal_run_payload(
     for idx, item in enumerate(output_refs):
         if not isinstance(item, str) or not item.strip():
             raise ValueError(f"output_refs[{idx}] must be non-empty string")
-    _validate_apply_patch_gate_coverage(repo_root, orchestration_id, payload)
+    _validate_apply_patch_gate_coverage(
+        repo_root, orchestration_id, payload,
+        caller_holds_lock=caller_holds_lock,
+    )
+
+
+def _read_launch_request_payload(
+    repo_root: Path,
+    orchestration_id: str,
+    *,
+    agent_run_id: str,
+) -> dict[str, Any] | None:
+    """Return the parsed `launches/<arid>.request.json` payload, or None
+    when absent / malformed."""
+    request_path = (
+        _orchestration_root(repo_root, orchestration_id)
+        / "launches"
+        / f"{agent_run_id.strip()}.request.json"
+    )
+    if not request_path.exists():
+        return None
+    try:
+        payload = _read_json(request_path)
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    return payload
+
+
+def _read_repair_fields_from_launch_request(
+    repo_root: Path,
+    orchestration_id: str,
+    *,
+    agent_run_id: str,
+) -> tuple[str, str]:
+    """Return (repair_strategy, repair_target_agent_run_id) from the per-arid
+    launch request, or empty strings when either field is absent / malformed.
+    Used by `_maybe_inherit_apply_patch_gate` (Issue 2 of the recurrence-
+    prevention plan)."""
+    payload = _read_launch_request_payload(
+        repo_root, orchestration_id, agent_run_id=agent_run_id
+    )
+    if payload is None:
+        return "", ""
+    strategy = str(payload.get("repair_strategy") or "").strip().lower()
+    target = str(payload.get("repair_target_agent_run_id") or "").strip()
+    return strategy, target
+
+
+def _launch_identity_tuple(payload: dict[str, Any]) -> tuple[str, str, str]:
+    """Return the (node_key, step, substep) tuple from a launch request
+    payload, normalized to lower-case strings. Used for reuse-target
+    identity verification (Issue 2 + Codex review round 3 P1)."""
+    return (
+        str(payload.get("node_key") or "").strip().lower(),
+        str(payload.get("step") or "").strip().lower(),
+        str(payload.get("substep") or "").strip().lower(),
+    )
+
+
+def _record_gate_evidence_inheritance(
+    repo_root: Path,
+    orchestration_id: str,
+    *,
+    agent_run_id: str,
+    inherited_from: str,
+    gate: str,
+) -> None:
+    """Write the audit sidecar that documents a gate-evidence inheritance.
+    Issue 2 of the recurrence-prevention plan.
+
+    Lives under `<orch_root>/agents/<arid>/audit/gate_inheritance.json`
+    (per-arid runtime sidecar). The `<orch_root>/agents/` prefix is already
+    runtime-exempt in `_should_ignore_runtime_snapshot_path` (see also
+    `deactivate_snapshot.json` and `gate_changed_paths.json` siblings),
+    so the path is invisible to child-side baseline diffs without
+    needing a separate `audit/` prefix carve-out (Codex review round 6
+    follow-up — avoids blanket-hiding a directory a child could
+    theoretically touch via hook bypass)."""
+    audit_path = (
+        _orchestration_root(repo_root, orchestration_id)
+        / "agents"
+        / agent_run_id.strip()
+        / "audit"
+        / "gate_inheritance.json"
+    )
+    _write_json(
+        audit_path,
+        {
+            "kind": "gate_evidence_inheritance",
+            "agent_run_id": agent_run_id.strip(),
+            "inherited_from": inherited_from.strip(),
+            "gate": gate,
+            "recorded_at": _utc_now_iso(),
+        },
+    )
+
+
+def _read_gate_inheritance_audit(
+    repo_root: Path,
+    orchestration_id: str,
+    *,
+    agent_run_id: str,
+) -> str | None:
+    """Return the `inherited_from` arid recorded in the per-arid gate-
+    inheritance audit sidecar, or None when the sidecar is absent /
+    malformed. Used by `_maybe_inherit_apply_patch_gate` to follow the
+    inheritance chain across chained reuse retries (Codex review round 8
+    P1)."""
+    audit_path = (
+        _orchestration_root(repo_root, orchestration_id)
+        / "agents"
+        / agent_run_id.strip()
+        / "audit"
+        / "gate_inheritance.json"
+    )
+    if not audit_path.exists():
+        return None
+    try:
+        payload = _read_json(audit_path)
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    if str(payload.get("gate") or "").strip() != "apply_patch_writes":
+        return None
+    inherited_from = str(payload.get("inherited_from") or "").strip()
+    return inherited_from or None
+
+
+def _collect_inherited_apply_patch_gates(
+    repo_root: Path,
+    orchestration_id: str,
+    *,
+    agent_run_id: str,
+    caller_holds_lock: bool = False,
+) -> list[tuple[Path, str]]:
+    """Walk the inheritance chain starting from the current run's
+    `repair_target_agent_run_id` and return EVERY ancestor's
+    `apply_patch_writes.json` (gate_path, arid) tuple discovered along
+    the way. Empty list when no inheritance applies. Issue 2 of the
+    recurrence-prevention plan, refined per Codex review round 9.
+
+    Two contracts differ from earlier iterations:
+
+    1. Aggregation over the chain (Codex round 9 P1 #1) — partial-reuse
+       chains like A→B→C, where B patched a subset and inherited the
+       rest from A, must surface BOTH B's and A's `changed_paths` when
+       C validates. Earlier implementations stopped at the first
+       ancestor that had a gate file, breaking transitive coverage.
+
+    2. Chain traversal mechanism (Codex review rounds 9 P1 #2 + 11 P1):
+       the chain advances first via the per-arid audit sidecar
+       `agents/<cursor>/audit/gate_inheritance.json` (recorded only on a
+       successful coverage check, i.e. `status=pass` ancestors); when
+       the audit is absent, it falls back to
+       `repair_target_agent_run_id` from the cursor's launch request,
+       BUT only because the runs.jsonl attestation below already
+       guarantees the cursor's terminal validation succeeded. The
+       fallback is what preserves transitive coverage across
+       intermediate `status=fail` reuse retries — those runs never have
+       audit sidecars (because `_validate_apply_patch_gate_coverage`
+       only runs for `status=pass`) but their workspace state is still
+       validated by `_validate_actual_write_paths`.
+
+    3. agent_runs.jsonl attestation gates each hop's OWN gate, not the
+       walk itself (Codex review rounds 10 + 14) — `guarded-apply-patch`
+       writes `gates/<arid>/apply_patch_writes.json` BEFORE `record-
+       agent-run` runs, so a run whose terminal validation was rejected
+       (entry only in `agent_runs_invalid.jsonl`) still leaves its gate
+       file behind. Inheriting that gate would launder unvalidated
+       evidence (round 10). However, the rejected cursor's launch
+       request still records a valid `repair_target_agent_run_id`
+       pointer to an earlier ancestor whose evidence WAS validated; the
+       walk can safely traverse past the rejected cursor to that
+       ancestor (round 14). Concretely: a cursor that is not in
+       `agent_runs.jsonl` does NOT contribute its own gate to
+       `results`, but the walk still follows its audit / request-chain
+       pointer to the next hop. The next hop is then subjected to the
+       same attestation re-check.
+
+    Identity is re-verified at every chain step so a forged audit
+    sidecar cannot bridge mismatched `(node_key, step, substep)`
+    identities."""
+    current_payload = _read_launch_request_payload(
+        repo_root, orchestration_id, agent_run_id=agent_run_id
+    )
+    if current_payload is None:
+        return []
+    strategy = str(current_payload.get("repair_strategy") or "").strip().lower()
+    target = str(current_payload.get("repair_target_agent_run_id") or "").strip()
+    if strategy != "reuse" or not target:
+        return []
+
+    current_identity = _launch_identity_tuple(current_payload)
+    if not current_identity[0] or not current_identity[1]:
+        return []
+
+    orch_root = _orchestration_root(repo_root, orchestration_id)
+    run_records = _load_run_records(orch_root, caller_holds_lock=caller_holds_lock)
+
+    # The walk terminates because arids are unique and the `visited` set
+    # grows monotonically. There is no fixed depth cap (Codex review
+    # round 12 P2): valid `repair_strategy=reuse` chains can exceed any
+    # arbitrary limit, especially with partial-patch retries where each
+    # hop only owns a subset of `changed_paths`. Cycle detection alone
+    # is the correct termination criterion.
+    results: list[tuple[Path, str]] = []
+    visited: set[str] = {agent_run_id.strip()}
+    cursor: str | None = target
+    while True:
+        if not cursor or cursor in visited:
+            break
+        visited.add(cursor)
+
+        cursor_payload = _read_launch_request_payload(
+            repo_root, orchestration_id, agent_run_id=cursor
+        )
+        if cursor_payload is None:
+            # Broken chain — refuse all inheritance rather than partial.
+            return []
+        if _launch_identity_tuple(cursor_payload) != current_identity:
+            # Mis-targeted hop — refuse the entire chain.
+            return []
+
+        # Attestation: a cursor not in agent_runs.jsonl was rejected at
+        # terminal validation. Its OWN gate evidence is unvalidated and
+        # must not be inherited (Codex round 10 P1), but the walk can
+        # still traverse past it via its launch request's repair_target
+        # to reach a validated ancestor (Codex round 14 P1). Together
+        # these prevent laundering of the rejected cursor's evidence
+        # while preserving transitive chains across rejected
+        # intermediates.
+        cursor_validated = cursor in run_records
+        if cursor_validated:
+            gate = (
+                _gates_dir(repo_root, orchestration_id)
+                / cursor
+                / "apply_patch_writes.json"
+            )
+            if gate.exists():
+                results.append((gate, cursor))
+
+        # Chain traversal: audit first (success-attested), then request
+        # chain (validated by the runs.jsonl attestation re-checked at
+        # the next iteration). Codex review round 11 P1 — request-chain
+        # fallback is re-enabled now that round 10's runs.jsonl check
+        # blocks rejected ancestors from being walked.
+        next_arid = _read_gate_inheritance_audit(
+            repo_root, orchestration_id, agent_run_id=cursor
+        )
+        if not next_arid:
+            cursor_strategy = (
+                str(cursor_payload.get("repair_strategy") or "").strip().lower()
+            )
+            cursor_target = (
+                str(cursor_payload.get("repair_target_agent_run_id") or "").strip()
+            )
+            if cursor_strategy == "reuse" and cursor_target:
+                next_arid = cursor_target
+        if not next_arid:
+            break
+        cursor = next_arid
+
+    return results
+
+
+def _validate_apply_patch_gate_doc(
+    gate_path: Path,
+    *,
+    actor_role: str,
+) -> None:
+    """Structural validation of an `apply_patch_writes.json` artifact.
+    Raises ValueError with a descriptive message on any mismatch. Issue 2
+    of the recurrence-prevention plan — extracted so both the primary and
+    the inherited gate can be validated symmetrically when partial reuse
+    merges evidence from both runs."""
+    gate_doc = _read_json(gate_path)
+    if not isinstance(gate_doc, dict):
+        raise ValueError(f"apply_patch_writes gate artifact must be object: {gate_path}")
+    if str(gate_doc.get("status", "")).strip().lower() != "pass":
+        raise ValueError(f"apply_patch_writes gate must pass before terminal run record: {gate_path}")
+    args_json = gate_doc.get("args_json")
+    if not isinstance(args_json, dict):
+        raise ValueError(f"apply_patch_writes gate args_json must be object: {gate_path}")
+    gate_actor_role = args_json.get("actor_role")
+    if not isinstance(gate_actor_role, str) or gate_actor_role.strip().lower() != actor_role:
+        raise ValueError(
+            "apply_patch_writes gate actor_role mismatch: "
+            f"expected={actor_role!r} got={gate_actor_role!r} ({gate_path})"
+        )
+    changed_paths_obj = args_json.get("changed_paths")
+    if not isinstance(changed_paths_obj, list) or not all(isinstance(x, str) for x in changed_paths_obj):
+        raise ValueError(f"apply_patch_writes gate changed_paths must be string array: {gate_path}")
 
 
 def _validate_apply_patch_gate_coverage(
     repo_root: Path,
     orchestration_id: str,
     payload: dict[str, Any],
+    *,
+    caller_holds_lock: bool = False,
 ) -> None:
     """`apply_patch` 書き込み経路の gate 実行証跡を終端時に強制する。"""
     role = payload.get("agent_role")
@@ -7672,47 +8329,87 @@ def _validate_apply_patch_gate_coverage(
     if not cli_required_refs:
         return
 
-    gate_path = _gates_dir(repo_root, orchestration_id) / run_id / "apply_patch_writes.json"
-    if not gate_path.exists():
+    # Issue 2 of the recurrence-prevention plan (with Codex review
+    # rounds 8 + 9 follow-ups): `repair_strategy=reuse` retries inherit
+    # gate evidence from successful ancestors so they don't need to
+    # re-invoke `guarded-apply-patch` just to satisfy the coverage
+    # check. Coverage aggregates the union of:
+    #
+    #   - the current run's own gate (when present, e.g. partial
+    #     reuse that patched a subset of outputs), and
+    #   - every audit-attested ancestor's gate, walked transitively via
+    #     `agents/<arid>/audit/gate_inheritance.json`.
+    #
+    # The audit-only walk (Codex round 9 P1 #2) ensures only previously-
+    # validated ancestor evidence can be inherited; rejected ancestors
+    # have no audit and break the chain. Transitive aggregation (Codex
+    # round 9 P1 #1) preserves coverage across partial-reuse chains
+    # (A→B→C where B patched a subset and inherited the rest from A).
+    current_gate_path = _gates_dir(repo_root, orchestration_id) / run_id / "apply_patch_writes.json"
+    inherited_chain = _collect_inherited_apply_patch_gates(
+        repo_root, orchestration_id, agent_run_id=run_id,
+        caller_holds_lock=caller_holds_lock,
+    )
+
+    evidences: list[tuple[Path, str]] = []
+    if current_gate_path.exists():
+        evidences.append((current_gate_path, run_id))
+    evidences.extend(inherited_chain)
+
+    if not evidences:
         raise ValueError(
             f"pass status for {actor_role} requires apply_patch_writes gate evidence: "
-            f"{gate_path}"
+            f"{current_gate_path}"
         )
-    gate_doc = _read_json(gate_path)
-    if not isinstance(gate_doc, dict):
-        raise ValueError(f"apply_patch_writes gate artifact must be object: {gate_path}")
-    if str(gate_doc.get("status", "")).strip().lower() != "pass":
-        raise ValueError(f"apply_patch_writes gate must pass before terminal run record: {gate_path}")
-    args_json = gate_doc.get("args_json")
-    if not isinstance(args_json, dict):
-        raise ValueError(f"apply_patch_writes gate args_json must be object: {gate_path}")
-    gate_actor_role = args_json.get("actor_role")
-    if not isinstance(gate_actor_role, str) or gate_actor_role.strip().lower() != actor_role:
+
+    # Validate each gate doc structurally (status / actor_role /
+    # changed_paths shape) before trusting its evidence.
+    for gate_path, _arid in evidences:
+        _validate_apply_patch_gate_doc(gate_path, actor_role=actor_role)
+
+    effective_changed_paths: set[str] = set()
+    for _gate_path, arid in evidences:
+        effective_changed_paths.update(
+            _gate_changed_paths_for_run(
+                repo_root,
+                orchestration_id,
+                agent_run_id=arid,
+            )
+        )
+    if not effective_changed_paths:
         raise ValueError(
-            "apply_patch_writes gate actor_role mismatch: "
-            f"expected={actor_role!r} got={gate_actor_role!r}"
+            f"apply_patch_writes gate changed_paths must be non-empty: {evidences[0][0]}"
         )
-    changed_paths_obj = args_json.get("changed_paths")
-    if not isinstance(changed_paths_obj, list) or not all(isinstance(x, str) for x in changed_paths_obj):
-        raise ValueError(f"apply_patch_writes gate changed_paths must be string array: {gate_path}")
-    changed_paths = _gate_changed_paths_for_run(
-        repo_root,
-        orchestration_id,
-        agent_run_id=run_id,
-    )
-    if not changed_paths:
-        raise ValueError(f"apply_patch_writes gate changed_paths must be non-empty: {gate_path}")
 
     uncovered: list[str] = []
     for output_ref in cli_required_refs:
         rel = _normalize_rel_posix(output_ref)
-        if not any(_repo_path_under_prefix(rel, cp) for cp in changed_paths):
+        if not any(_repo_path_under_prefix(rel, cp) for cp in effective_changed_paths):
             uncovered.append(output_ref)
     if uncovered:
         raise ValueError(
             "apply_patch_writes gate does not cover terminal output_refs: "
             + ", ".join(uncovered)
         )
+
+    # Audit: record inheritance against the immediate `repair_target`
+    # (per C's launch request), regardless of how many chain hops were
+    # actually traversed to reach a gate file. The next run that retries
+    # against this run can then follow the audit one hop at a time —
+    # `_collect_inherited_apply_patch_gates` walks the chain by reading
+    # each per-arid audit sidecar.
+    if inherited_chain:
+        _, immediate_target = _read_repair_fields_from_launch_request(
+            repo_root, orchestration_id, agent_run_id=run_id
+        )
+        if immediate_target:
+            _record_gate_evidence_inheritance(
+                repo_root,
+                orchestration_id,
+                agent_run_id=run_id,
+                inherited_from=immediate_target,
+                gate="apply_patch_writes",
+            )
 
 
 def _validate_step_or_substep_launch_refs(repo_root: Path, payload: dict[str, Any]) -> None:
@@ -10272,6 +10969,39 @@ def deactivate_child_agent(
             f"been tampered with or constructed without the per-arid token "
             f"from launches/{child_run_id}.parent_return_token."
         )
+    # Recurrence-prevention plan (Issue 3): capture the child-authored path
+    # set NOW, before any subsequent parent / runtime write can contaminate
+    # the live baseline diff. This freezes what the child wrote during its
+    # active window so `record-agent-run` retries (which may run after
+    # post-fail infrastructure writes like `agent_runs_invalid.jsonl`) can
+    # compute the diff against the snapshot rather than re-walking the
+    # workspace. Idempotent: subsequent deactivate calls preserve the first
+    # captured snapshot.
+    snap_path = _deactivate_snapshot_path(
+        repo_root, orchestration_id, agent_run_id=child_run_id
+    )
+    if not snap_path.exists():
+        try:
+            child_authored = _compute_changed_paths_against_baseline(
+                repo_root,
+                orchestration_id,
+                agent_run_id=child_run_id,
+            )
+            _write_json(
+                snap_path,
+                {
+                    "kind": "deactivate_snapshot",
+                    "agent_run_id": child_run_id,
+                    "orchestration_id": orchestration_id,
+                    "child_authored_paths": child_authored,
+                    "captured_at": _utc_now_iso(),
+                },
+            )
+        except (OSError, ValueError):
+            # If baseline is missing (legacy orchestration without per-arid
+            # baseline tracking) or write fails, fall through to the
+            # tree-walk fallback in `_actual_changed_paths_since_baseline`.
+            pass
     # Validation passed and at least one marker exists — atomic unlink phase.
     per_arid_marker.unlink(missing_ok=True)
     active_path.unlink(missing_ok=True)

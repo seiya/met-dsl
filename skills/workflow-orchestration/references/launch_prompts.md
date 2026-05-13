@@ -300,6 +300,34 @@ EOF
 
 ---
 
+#### substep ↔ allowed validator gate 対応表
+
+`orchestration agent` が launch prompt 本文に明示・列挙してよい `validate_pipeline_semantics --stage <X>` invocation を `(step, substep)` ごとに canonical 化する。下表の "allowed_stage" 列で許可された `--stage` 以外を launch prompt に記載してはならない。再発防止プラン (Issue 1) を canonical source とする。
+
+| step | substep | allowed `validate_pipeline_semantics --stage` | 備考 |
+|---|---|---|---|
+| compile | generate | (なし) | gate 呼び出しは `validate_workspace_root` / `check_artifact_syntax --expect-top object` に限定。`io_contract` 関連は `Compile.verify` 責務。 |
+| compile | verify | `compile` | `io_contract` 導出後の verify 完了前に必須。 |
+| generate | generate | (なし) | `--stage post_generate` は `Generate.verify` 責務。 |
+| generate | verify | `post_generate` | |
+| build | — | `post_build` | MCP `compile_project` 呼び出し後に invoke。 |
+| validate | execute | `post_execute` | `run_program` / `run_quality_checks` 結果の判定に invoke。 |
+| validate | judge | `pre_judge` | `aggregate_verdict` 確定前の最終 validation。 |
+
+`--stage full` は end-to-end validation を行う debug 用 stage であり、上記いずれの (step, substep) でも明示的には allow-list に含めない (定常 workflow は per-phase stage を canonical とする)。canonical な `--stage` 値の網羅一覧は `tools/validate_pipeline_semantics.py` の argparse `choices` (`compile` / `post_generate` / `post_build` / `post_execute` / `pre_judge` / `full`) を一次 source とする。
+
+**recording-layer との区別:** `skills/workflow-orchestration/SKILL.md` line 116 は `step_result.json#validation_stage` に**記録してよい**値として step 単位の広めの集合 (`full` を含む) を定義しており、これは write-step-result 時の recording-layer contract である。本表は launch-prompt 時の invocation-layer contract であり、recording-layer よりも厳格な per-substep 制約を課す。両者は別 layer の contract であり、本表で per-substep に絞られた結果として recording される `validation_stage` 値も自動的に SKILL.md line 116 の許容集合に含まれる (例: `compile/verify` で実行可能なのは `compile` のみ → SKILL.md `compile`/`full` 集合の subset)。
+
+**negative constraint:** 上記表に許可されていない `--stage` の `validate_pipeline_semantics` 呼び出しを本 `(step, substep)` の launch prompt に記載してはならない。例: `Compile.generate` 用 prompt に `validate_pipeline_semantics --stage compile` を含めると `Compile.verify` 責務を侵害し `noncanonical_phase_write_attempt` を発火する。MCP tool 名 (`compile_project` 等) の単なる言及 (説明文・negative constraint 等) は本 lint の対象外とする。
+
+`record-launch` は `_validate_launch_prompt_text` 内で `launch_prompt_ref` のテキストに対して per-(step, substep) の allowed-stage 集合を照合する。actionable な invocation 行 (`python3` / `tools/validate_pipeline_semantics.py` / `--gate validate_pipeline_semantics` を含む行) のみを scan し、direct CLI 形式と canonical run-gate JSON 形式 (`--args-json '{"stage": "..."}'`) の両方を抽出して allowed-stage 外なら `ValueError` で reject する (`tools/orchestration_runtime.py::_lint_launch_prompt_gate_allowlist` と `ALLOWED_VALIDATE_PIPELINE_STAGES` が canonical 実装)。緊急 rollback 用に env `METDSL_ENFORCE_GATE_ALLOWLIST=0` で lint を無効化できる (default は有効)。
+
+#### `repair_strategy=reuse` 時の追加契約
+
+`repair_strategy=reuse` での再投入は、`record-agent-run` の `apply_patch_writes` 証跡を `repair_target_agent_run_id` から継承する (`docs/ORCHESTRATION.md` の repair / retry 節を canonical source とする)。launch prompt 本文の `guarded-apply-patch` 関連の constraint 行はそのまま保持してよい — child が実際に同 path を再書き込みする場合は通常通り gate を経由し、何も書かなければ継承証跡で coverage を満たす。継承の信頼性は runtime 側の同一 identity 検証 (`(node_key, step, substep)` 一致) で担保される。
+
+---
+
 #### `allowed_tmp_root` の利用契約
 
 `record-launch` は `workspace/tmp/<agent_run_id>/` を作成して `output_manifests/<agent_run_id>.json` の `allowed_tmp_root` フィールドに記録する。**agent はこの literal path を直接使う**ことで `output_manifest_write_guard` を通過する (write 対象 path のみを判定し `$TMPDIR` env は参照しない、`tools/hooks/common.py:_validate_write_access`)。

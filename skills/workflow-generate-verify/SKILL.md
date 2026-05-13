@@ -13,6 +13,7 @@ Generate ステージ出力の検証責務を固定し、`Build` 失敗を事前
 - `workspace/pipelines/<pipeline_id>/source/<source_id>/source_meta.json` の更新
 
 ## 要件
+- 本 substep が起動できる validator gate は `skills/workflow-orchestration/references/launch_prompts.md` の「substep ↔ allowed validator gate 対応表」を canonical source とする。
 - 判定規則の canonical source は `docs/workflow/WORKFLOW_CORE.md` と `docs/workflow/phases/phase_02_generate.md` と `docs/RUNBOOK.md` と `spec.ir.yaml` (`case` / `algorithm` / `impl_defaults` / `io_contract` / `dependency` の 5 セクション) と検査対象生成物に限定する。`tools/` 配下の実装、検証 `script`、test code、validator code を読んで要求や判定規則を抽出してはならない。
 - `spec.ir.yaml.case` に記載された `test case set` の全 `case_id` と全展開 `case` が、`runner` または `model` の実装経路から到達可能であることを検査する。未実装 `case`、到達不能分岐、固定 `case_id` 限定実装を `fail` とする。
 - `spec.ir.yaml.case` の実行時入力が `runner` と `model` に伝播していることを検査する。少なくとも `case_id`、格子条件、時間条件、初期条件識別子、境界条件識別子、`profile` または `component` 選択結果、`test_profile_id`、`test_profile_version` の受理経路または記録経路を確認できない場合は `fail` とする。

@@ -35,6 +35,7 @@ Compile ステージの生成責務を固定し、入力 spec から決定的な
 - `impl_defaults` の fixed / knob レイヤ境界 (`target.*` / `toolchain.*` / `selected.*` は fixed、`abstract.*` / `backend_overrides.*` は knob) は `docs/workflow/phases/phase_01_compile.md` の「impl_defaults の fixed / knob 境界」節を canonical source とする。`Compile.generate` は全 fixed sub-key を欠落なく決定し、knob レイヤの leaf 値も既定値として確定させる（`null` / `<TBD>` 等の plug-hole 禁止）。
 - `dependency` セクションは `node_key` と `direct_deps` と `transitive_deps` と `topo_level` を必須記録する。
 - `io_contract` セクションは `Compile.verify substep` が導出して `spec.ir.yaml` の対応セクションへ書き込む。`Compile.generate substep` は `io_contract` セクションを生成してはならない（`Compile.verify` の責務）。
+- 本 substep が起動できる validator gate は `skills/workflow-orchestration/references/launch_prompts.md` の「substep ↔ allowed validator gate 対応表」を canonical source とする (responsibility 外 gate の launch prompt 混入は `noncanonical_phase_write_attempt` を発火する)。
 - `problem` かつ `spec_id` が `2d` または `3d` を含む `node` では、`algorithm` セクションに状態更新対象と更新順序を必須保持しなければならない。
 - 多次元 `problem` 向け契約は `algorithm.state_variables[].name` と `algorithm.state_variables[].shape_expr` と `algorithm.required_update_paths` と `algorithm.diagnostics_from_state=true` と `algorithm.fallback_policy=fail_closed` を必須保持する。`state_variables[].shape_expr` も `spec/schema/plan/shape_expr.schema.json` の 3 形式に限る。
 - 上位 `node` の `Compile` は、直下依存 `node` の `ir_ref` と `ir_meta.json.verification_status` を確認し、`direct dependency compile readiness` を満たさない場合は開始してはならない。

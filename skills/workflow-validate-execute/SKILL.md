@@ -13,6 +13,7 @@ Validate phase の execute substep として、判定可能なランタイム ar
 - `runner` 実行と `quality check` 実行
 
 ## 要件
+- 本 phase が起動できる validator gate は `skills/workflow-orchestration/references/launch_prompts.md` の「substep ↔ allowed validator gate 対応表」を canonical source とする。
 - `run` は `MCP` サーバーの `run_program` を使用する。
 - `run_program` の実行コマンドは `spec.ir.yaml.case` を入力引数として必ず含まなければならない。
 - `quality check` は `MCP` サーバーの `run_quality_checks` を使用する。

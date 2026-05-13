@@ -13,6 +13,7 @@ Build ステージの実行責務を固定し、再現可能なビルド artifac
 - `source_meta.json` が `verification_status=pass` の artifact をビルドする作業
 
 ## 要件
+- 本 phase が起動できる validator gate は `skills/workflow-orchestration/references/launch_prompts.md` の「substep ↔ allowed validator gate 対応表」を canonical source とする。
 - `compile` は `MCP` サーバーの `compile_project` を使用する。
 - `fortran` / `c` / `cpp` / `mixed` 系は `make` / `cmake` / `meson` / `ninja` の標準ビルドツールのみを許可する。
 - `gcc` / `clang` / `gfortran` の単発ビルドを禁止する。

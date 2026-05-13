@@ -13,6 +13,7 @@ Generate ステージの生成責務を固定し、`Build` 可能な実装 artif
 - `source_meta.json` を生成する作業
 
 ## 要件
+- 本 substep が起動できる validator gate は `skills/workflow-orchestration/references/launch_prompts.md` の「substep ↔ allowed validator gate 対応表」を canonical source とする。
 - 作業開始直後に `ir_ref` の `spec.ir.yaml` を読み、`io_contract.raw_requirements.required_evidence` の全要素について `artifact` と `required` と `min_samples` と（`artifact=state_snapshots` かつ `required=true` のとき）`schema.variables[].name` と `time_variable` を列挙し、`runner` の `raw/` 出力設計・`raw/metrics_basis.json` の索引設計と突合してから実装に入る。
 - 入力は `spec.ir.yaml` (`case` / `algorithm` / `impl_defaults` / `io_contract` / `dependency` の 5 セクション) とする。
 - `controlled_spec.md` を直接入力にしてはならない。演算構成の要求定義は `spec.ir.yaml.algorithm` から解釈しなければならない。
