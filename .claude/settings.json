@@ -3,6 +3,7 @@
     "allow": [
       "Bash(python3 tools/orchestration_runtime.py *)",
       "Bash(python3 tools/new_agent_run_id.py)",
+      "Bash(python3 tools/run_workflow.py *)",
       "Bash(python3 tools/validate_pipeline_semantics.py *)",
       "Bash(python3 tools/check_artifact_syntax.py *)",
       "Bash(python3 tools/validate_workspace_root.py *)",

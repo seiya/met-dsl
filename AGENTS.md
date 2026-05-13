@@ -55,6 +55,12 @@
 - 要件・制約・input/output・判定条件が具体化されている。
 - terms・artifact 名・role 名・phase 名・classification 名が `docs/GLOSSARY.md` の英語表記と一致している。
 
+## CLI 仕様参照ルール
+- CLI 引数情報の取得経路は、subcommand 頻度と payload 複雑度に応じて使い分ける。詳細表は `CLAUDE.md` の「CLI 仕様の確認規約」節を canonical source とする。
+- `tools/orchestration_runtime.py` の頻出 subcommand (`record-launch` / `record-agent-run` / `record-child-return` / `deactivate-child` / `record-reply` / `set-status` / `write-step-result` / `workflow-launch-check` / `reserve-phase-root` / `mark-dependency-readiness` / `guarded-apply-patch` / `run-gate`) は `docs/CLI_REFERENCE.md` (Tier-A) を canonical source とする。
+- `tools/orchestration_runtime.py` の稀少 subcommand (`init` / `preflight` / `preflight-status` / `record-timeout` / `read-checkpoint` / `verify-checkpoint-integrity` / `check-step-completed` / `orchestration-read`) と、`tools/run_workflow.py` / `tools/validate_pipeline_semantics.py` / `tools/audit_orchestration.py` は `<tool> [<sub>] --help` を canonical source とする。`docs/CLI_REFERENCE_RARE.md` は稀少 subcommand の overview のみ保持する。
+- `tools/` 配下の `.py` 実装を `Read` tool / `grep` / `sed` / `cat` 等で直接読む経路は `forbid_tools_direct_read` および `read_manifest_read_guard` の対象として禁止する。`--help` 経由の argparse 出力読取は block されない。
+
 ## MCP 実行ルール
 - `compile` / `run` / `quality check` は、必ず MCP サーバー経由で実行する。
 - 標準サーバーは `mcp_servers/build_runtime_server.py` とし、`detect_build_system` / `compile_project` / `run_program` / `run_quality_checks` / `run_linter` を使用する。

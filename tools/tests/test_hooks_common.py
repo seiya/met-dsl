@@ -16,6 +16,7 @@ from tools.hooks.common import (
     HookDecisionAction,
     HookEventName,
     HookInput,
+    _detect_cli_help_invocation,
     _extract_read_targets,
     evaluate_common_policy,
     validate_pipeline_semantics_stage,
@@ -537,6 +538,122 @@ class HookCommonTests(unittest.TestCase):
             audit_detail={"policy": "x"},
         )
         self.assertEqual(format_block_reason_with_hint(decision), "denied")
+
+
+class DetectCliHelpInvocationTests(unittest.TestCase):
+    """`_detect_cli_help_invocation`: `python3 tools/<name>.py [<sub>] --help` を audit する。
+
+    CLI 仕様確認方針 (CLAUDE.md「CLI 仕様の確認規約」節) で `--help` 経由の
+    argparse 出力読取を first-class 経路として扱うため、hook は block せず
+    audit_detail のみ付与して使用頻度を記録する。
+    """
+
+    def _shlex(self, command: str) -> list[str]:
+        import shlex
+        return shlex.split(command)
+
+    def test_detects_orchestration_runtime_subcommand_help(self) -> None:
+        cmd = "python3 tools/orchestration_runtime.py record-launch --help"
+        result = _detect_cli_help_invocation(self._shlex(cmd), cmd)
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertEqual(result["policy"], "cli_help_invocation_observed")
+        self.assertEqual(result["tool"], "tools/orchestration_runtime.py")
+        self.assertEqual(result["subcommand"], "record-launch")
+        self.assertEqual(result["command"], cmd)
+
+    def test_detects_root_help_with_null_subcommand(self) -> None:
+        cmd = "python3 tools/orchestration_runtime.py --help"
+        result = _detect_cli_help_invocation(self._shlex(cmd), cmd)
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertEqual(result["tool"], "tools/orchestration_runtime.py")
+        self.assertIsNone(result["subcommand"])
+
+    def test_detects_run_workflow_help(self) -> None:
+        cmd = "python3 tools/run_workflow.py --help"
+        result = _detect_cli_help_invocation(self._shlex(cmd), cmd)
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertEqual(result["tool"], "tools/run_workflow.py")
+        self.assertIsNone(result["subcommand"])
+
+    def test_detects_short_help_flag(self) -> None:
+        cmd = "python3 tools/orchestration_runtime.py -h"
+        result = _detect_cli_help_invocation(self._shlex(cmd), cmd)
+        self.assertIsNotNone(result)
+
+    def test_returns_none_for_normal_invocation(self) -> None:
+        cmd = "python3 tools/orchestration_runtime.py record-launch --repo-root ."
+        self.assertIsNone(_detect_cli_help_invocation(self._shlex(cmd), cmd))
+
+    def test_returns_none_for_uuid_helper(self) -> None:
+        cmd = "python3 tools/new_agent_run_id.py"
+        self.assertIsNone(_detect_cli_help_invocation(self._shlex(cmd), cmd))
+
+    def test_returns_none_for_non_tools_script(self) -> None:
+        cmd = "python3 scripts/other.py --help"
+        self.assertIsNone(_detect_cli_help_invocation(self._shlex(cmd), cmd))
+
+    def test_returns_none_for_non_python_invocation(self) -> None:
+        cmd = "cat tools/orchestration_runtime.py"
+        self.assertIsNone(_detect_cli_help_invocation(self._shlex(cmd), cmd))
+
+    def test_returns_none_for_module_form_invocation(self) -> None:
+        """`python -m tools.orchestration_runtime` 形式は canonical でなく検出対象外。"""
+        cmd = "python3 -m tools.orchestration_runtime record-launch --help"
+        self.assertIsNone(_detect_cli_help_invocation(self._shlex(cmd), cmd))
+
+
+class EvaluateCommonPolicyCliHelpAuditTests(unittest.TestCase):
+    """`evaluate_common_policy` の cli_help audit が ALLOW 経路で audit_detail を残す。"""
+
+    def _make(self, command: str) -> HookInput:
+        return HookInput(
+            event_name=HookEventName.PRE_COMMAND_EXECUTE,
+            backend="claude",
+            payload={"repo_root": "."},
+            tool_name="Bash",
+            command=command,
+        )
+
+    def test_cli_help_invocation_allows_with_audit_detail_in_workflow_mode(self) -> None:
+        with patch.dict(os.environ, {"METDSL_WORKFLOW_MODE": "1"}):
+            decision = evaluate_common_policy(
+                self._make("python3 tools/orchestration_runtime.py record-launch --help")
+            )
+        self.assertEqual(decision.action, HookDecisionAction.ALLOW)
+        self.assertIsNotNone(decision.audit_detail)
+        assert decision.audit_detail is not None
+        self.assertEqual(decision.audit_detail["policy"], "cli_help_invocation_observed")
+        self.assertEqual(decision.audit_detail["subcommand"], "record-launch")
+
+    def test_non_help_invocation_allows_without_audit_detail(self) -> None:
+        with patch.dict(os.environ, {"METDSL_WORKFLOW_MODE": "1"}):
+            decision = evaluate_common_policy(
+                self._make("python3 tools/orchestration_runtime.py record-launch --repo-root .")
+            )
+        self.assertEqual(decision.action, HookDecisionAction.ALLOW)
+        self.assertIsNone(decision.audit_detail)
+
+    def test_implementation_read_still_blocked_in_workflow_mode(self) -> None:
+        """`--help` 経路を許容しても `cat tools/X.py` 等の実装直読は引き続き block。"""
+        with patch.dict(os.environ, {"METDSL_WORKFLOW_MODE": "1"}):
+            decision = evaluate_common_policy(
+                self._make("cat tools/orchestration_runtime.py")
+            )
+        self.assertEqual(decision.action, HookDecisionAction.BLOCK)
+        assert decision.audit_detail is not None
+        self.assertEqual(decision.audit_detail["policy"], "forbid_tools_direct_read")
+
+    def test_cli_help_audit_skipped_outside_workflow_mode(self) -> None:
+        """workflow mode が無効なら hook は audit_detail を付けない。"""
+        with patch.dict(os.environ, {"METDSL_WORKFLOW_MODE": "0"}):
+            decision = evaluate_common_policy(
+                self._make("python3 tools/orchestration_runtime.py record-launch --help")
+            )
+        self.assertEqual(decision.action, HookDecisionAction.ALLOW)
+        self.assertIsNone(decision.audit_detail)
 
 
 class ValidateWriteAccessDirectoryAllowlistTests(unittest.TestCase):

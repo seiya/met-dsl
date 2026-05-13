@@ -460,6 +460,7 @@ def evaluate_common_policy(hook_input: HookInput) -> HookDecision:
                 },
             )
     workflow_mode_val = os.environ.get("METDSL_WORKFLOW_MODE", "0").strip()
+    cli_help_audit: dict[str, Any] | None = None
     if workflow_mode_val == "1":
         bash_read_cmds = frozenset(
             {"cat", "head", "tail", "less", "more", "bat", "pygmentize", "sed", "rg", "grep", "awk"}
@@ -492,6 +493,7 @@ def evaluate_common_policy(hook_input: HookInput) -> HookDecision:
                     continue_processing=False,
                     audit_detail={"policy": "forbid_tools_direct_read", "command": command},
                 )
+        cli_help_audit = _detect_cli_help_invocation(cmd_tokens, command)
         if "python" in lowered:
             # Fail-closed: ALL inline Python execution (`-c` snippets and
             # `- <<EOF` heredocs) is blocked in workflow mode.  Regex-based
@@ -609,7 +611,51 @@ def evaluate_common_policy(hook_input: HookInput) -> HookDecision:
                     },
                 },
             )
+    if cli_help_audit is not None:
+        return HookDecision(action=HookDecisionAction.ALLOW, audit_detail=cli_help_audit)
     return HookDecision(action=HookDecisionAction.ALLOW)
+
+
+def _detect_cli_help_invocation(
+    cmd_tokens: list[str], command: str
+) -> dict[str, Any] | None:
+    """Detect `python[3] tools/<name>.py [<sub>] --help` invocations.
+
+    Returns audit_detail dict for ALLOW logging, or None if not a help call.
+    `--help` against tools/ is permitted (argparse output only, not implementation
+    read). Logging frequency informs Tier-A/Tier-B doc split decisions.
+    """
+    if "--help" not in cmd_tokens and "-h" not in cmd_tokens:
+        return None
+    py_idx = next(
+        (
+            i
+            for i, tok in enumerate(cmd_tokens)
+            if tok.split("/")[-1].lower().startswith("python")
+        ),
+        -1,
+    )
+    if py_idx < 0:
+        return None
+    script_idx = py_idx + 1
+    while script_idx < len(cmd_tokens) and cmd_tokens[script_idx].startswith("-"):
+        script_idx += 1
+    if script_idx >= len(cmd_tokens):
+        return None
+    script = cmd_tokens[script_idx]
+    if not script.startswith("tools/") or not script.endswith(".py"):
+        return None
+    subcommand: str | None = None
+    if script_idx + 1 < len(cmd_tokens):
+        candidate = cmd_tokens[script_idx + 1]
+        if not candidate.startswith("-"):
+            subcommand = candidate
+    return {
+        "policy": "cli_help_invocation_observed",
+        "tool": script,
+        "subcommand": subcommand,
+        "command": command,
+    }
 
 
 _DEV_SHM_PATH_ACCESS_CMDS: frozenset[str] = frozenset({
