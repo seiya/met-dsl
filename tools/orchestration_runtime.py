@@ -6469,7 +6469,9 @@ def _run_live_probe_and_update(
     command = cached_payload.get("probe_command")
     probe_command = command.strip() if isinstance(command, str) and command.strip() else None
 
-    live_probe = probe_execution_platform(backend=backend, agent_command=probe_command)
+    live_probe = probe_execution_platform(
+        backend=backend, agent_command=probe_command, repo_root=repo_root
+    )
     if not _preflight_allows_agent_launch(live_probe):
         raise RuntimeError(
             "live preflight gate failed: execution platform multi_agent must be enabled at launch time"
@@ -9264,11 +9266,205 @@ _BACKEND_PROBERS: dict[
 }
 
 
+_CLAUDE_MCP_BUILD_RUNTIME_SERVER_RELPATH = "mcp_servers/build_runtime_server.py"
+_CLAUDE_MCP_BUILD_RUNTIME_NAME_TOKENS = ("build-runtime", "build_runtime")
+_CLAUDE_USER_SETTINGS_PATH = Path.home() / ".claude.json"
+_CLAUDE_MCP_REMEDIATION = (
+    "build-runtime MCP server is not enabled for this project in the Claude Code "
+    "session (~/.claude.json `projects.<repo>.{mcpServers,enabledMcpjsonServers}`). "
+    "Required tools (run_linter, compile_project, run_program, run_quality_checks, "
+    "detect_build_system) are needed by Generate/Build/Validate phases. "
+    "Remediation: (1) launch `claude` interactively from the repo root and accept "
+    "the workspace trust prompt that enables `build-runtime` from the repo-shipped "
+    "`.mcp.json`, or (2) run `claude mcp add-json --scope project build-runtime ...` "
+    "using the snippet in `mcp_servers/mcp_servers.example.json`. "
+    "Reference: `mcp_servers/README.md`."
+)
+
+
+def _read_claude_project_enabled_mcp_servers(
+    repo_root: Path,
+    *,
+    settings_path: Path | None = None,
+) -> tuple[set[str] | None, str]:
+    """`~/.claude.json` から target repo に対する enabled MCP server 名集合を読み出す。
+
+    返り値は (servers, detail)。servers は次の集合演算で得る:
+        (projects.<abs_repo>.mcpServers のキー)
+        ∪ (projects.<abs_repo>.enabledMcpjsonServers)
+        ∪ (top-level mcpServers のキー; user-scope)
+        − projects.<abs_repo>.disabledMcpjsonServers
+
+    settings 不在 / 該当 project entry 不在 / 形不正の場合は (None, 説明) を返す。
+    None は「未判定」を意味し、gate fail として扱う (Claude Code に未認知の workspace
+    では Agent 側で `mcp__build-runtime__*` tool が露出しない)。
+    """
+    path = settings_path if settings_path is not None else _CLAUDE_USER_SETTINGS_PATH
+    if not path.exists():
+        return None, f"settings_missing ({path})"
+    try:
+        with path.open("r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (json.JSONDecodeError, OSError) as exc:
+        return None, f"settings_read_error ({path}): {type(exc).__name__}: {exc}"
+    if not isinstance(data, dict):
+        return None, f"settings_not_object ({path})"
+
+    abs_repo = str(repo_root.resolve())
+    projects = data.get("projects")
+    proj_entry: dict[str, Any] = {}
+    if isinstance(projects, dict):
+        cand = projects.get(abs_repo)
+        if isinstance(cand, dict):
+            proj_entry = cand
+
+    enabled: set[str] = set()
+    proj_mcp = proj_entry.get("mcpServers")
+    if isinstance(proj_mcp, dict):
+        enabled.update(str(k) for k in proj_mcp.keys() if isinstance(k, str))
+    proj_enabled = proj_entry.get("enabledMcpjsonServers")
+    if isinstance(proj_enabled, list):
+        enabled.update(str(x) for x in proj_enabled if isinstance(x, str))
+    top_mcp = data.get("mcpServers")
+    if isinstance(top_mcp, dict):
+        enabled.update(str(k) for k in top_mcp.keys() if isinstance(k, str))
+    proj_disabled = proj_entry.get("disabledMcpjsonServers")
+    if isinstance(proj_disabled, list):
+        for x in proj_disabled:
+            if isinstance(x, str):
+                enabled.discard(x)
+
+    detail = f"project_entry_found={bool(proj_entry)}; enabled_servers={sorted(enabled)}"
+    return enabled, detail
+
+
+def _probe_claude_mcp_registry(
+    command: str,
+    repo_root: Path | None,
+    runner: Callable[..., subprocess.CompletedProcess[str]],
+    *,
+    settings_path: Path | None = None,
+) -> tuple[list[dict[str, Any]], bool]:
+    """Claude session が target repo で build-runtime MCP tool を露出するかを判定する。
+
+    canonical signal は `~/.claude.json` の trust state (`projects.<abs_repo>.{mcpServers,
+    enabledMcpjsonServers} − disabledMcpjsonServers` ∪ top-level `mcpServers`)。
+    `claude mcp list` は trust dialog を skip して stdio server を spawn するため
+    false-positive (workspace 未信頼でも `✓ Connected` を返す) を起こす — 補助 diagnostic
+    として扱い preflight gate には使わない (Codex review P1)。`mcp list` の timeout は
+    advisory のみで Claude orchestration を block しない (P2)。
+
+    `repo_root` が None の場合 (主に unit test) は advisory-only check のみ返す。
+    """
+    if repo_root is None:
+        return (
+            [
+                {
+                    "name": "claude_mcp_build_runtime_registered",
+                    "pass": None,
+                    "detail": (
+                        "skipped; probe_execution_platform was called without repo_root "
+                        "(advisory only — production calls via cmd_preflight always pass repo_root)"
+                    ),
+                }
+            ],
+            True,
+        )
+
+    enabled_servers, settings_detail = _read_claude_project_enabled_mcp_servers(
+        repo_root, settings_path=settings_path
+    )
+    build_runtime_token_set = {tok for tok in _CLAUDE_MCP_BUILD_RUNTIME_NAME_TOKENS}
+    if enabled_servers is None:
+        session_enabled = False
+    else:
+        session_enabled = bool(enabled_servers & build_runtime_token_set)
+
+    # `claude mcp list` は advisory diagnostic として軽く呼ぶ。timeout は gate しない。
+    try:
+        proc = runner(
+            [command, "mcp", "list"],
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=10,
+            cwd=str(repo_root),
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError) as exc:
+        list_available: bool | None = None  # advisory: timeout / spawn error は inconclusive
+        list_stdout = ""
+        list_stderr = f"{type(exc).__name__}: {exc}"
+        returncode = -1
+    else:
+        list_available = proc.returncode == 0
+        list_stdout = proc.stdout or ""
+        list_stderr = proc.stderr or ""
+        returncode = proc.returncode
+
+    name_listed = False
+    healthy = False
+    matched_line = ""
+    for raw_line in list_stdout.splitlines():
+        head = raw_line.strip().split(":", 1)[0].strip().lower()
+        if not head:
+            continue
+        normalized = head.replace("_", "-")
+        if any(
+            normalized == tok or normalized.startswith(tok + " ")
+            for tok in (t.replace("_", "-") for t in _CLAUDE_MCP_BUILD_RUNTIME_NAME_TOKENS)
+        ):
+            name_listed = True
+            matched_line = raw_line.strip()
+            lower_line = matched_line.lower()
+            if "connected" in lower_line and "disconnected" not in lower_line:
+                healthy = True
+            break
+
+    server_path = repo_root / _CLAUDE_MCP_BUILD_RUNTIME_SERVER_RELPATH
+    server_present = server_path.is_file()
+
+    registered_pass = bool(session_enabled)
+
+    list_detail_parts: list[str] = [f"returncode={returncode}"]
+    if list_stdout.strip():
+        list_detail_parts.append(f"stdout={list_stdout.strip()[:512]}")
+    if list_stderr.strip():
+        list_detail_parts.append(f"stderr={list_stderr.strip()[:512]}")
+    list_detail = "; ".join(list_detail_parts)
+
+    registered_detail_parts: list[str] = [
+        f"session_enabled={session_enabled}",
+        f"settings_signal={settings_detail}",
+        f"mcp_list_advisory: in_list={name_listed}, healthy={healthy}",
+        f"server_file_present={server_present} ({_CLAUDE_MCP_BUILD_RUNTIME_SERVER_RELPATH}; diagnostic only)",
+    ]
+    if matched_line:
+        registered_detail_parts.append(f"matched_line={matched_line[:256]}")
+    if not registered_pass:
+        registered_detail_parts.append(_CLAUDE_MCP_REMEDIATION)
+    registered_detail = " | ".join(registered_detail_parts)
+
+    checks = [
+        {
+            "name": "claude_mcp_list_available",
+            "pass": list_available,
+            "detail": list_detail,
+        },
+        {
+            "name": "claude_mcp_build_runtime_registered",
+            "pass": registered_pass,
+            "detail": registered_detail,
+        },
+    ]
+    return checks, registered_pass
+
+
 def probe_execution_platform(
     *,
     backend: str,
     agent_command: str | None = None,
     runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
+    repo_root: Path | None = None,
 ) -> dict[str, Any]:
     backend_token = backend.strip().lower()
     if backend_token not in SUPPORTED_BACKENDS:
@@ -9295,6 +9491,10 @@ def probe_execution_platform(
 
     if backend_token in ("cursor", "claude"):
         can_launch_agents = _can_launch_from_help_fallback_checks(backend_token, checks)
+        if backend_token == "claude":
+            mcp_checks, mcp_ok = _probe_claude_mcp_registry(command, repo_root, runner)
+            checks.extend(mcp_checks)
+            can_launch_agents = can_launch_agents and mcp_ok
     else:
         can_launch_agents = _all_strict_boolean_probe_checks_pass(checks)
         codex_hooks_enabled = features.get("codex_hooks") is True
@@ -12290,6 +12490,7 @@ def main(argv: list[str] | None = None) -> int:
             payload=probe_execution_platform(
                 backend=args.backend,
                 agent_command=agent_command,
+                repo_root=repo_root,
             ),
         )
     elif args.command == "preflight-status":

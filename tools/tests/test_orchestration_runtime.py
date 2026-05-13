@@ -488,6 +488,271 @@ shell_tool                       stable             true
         self.assertEqual(result["status"], "fail")
         self.assertFalse(result["can_launch_substep_agents"])
 
+    def _claude_runner_with_mcp(
+        self,
+        mcp_stdout: str = "",
+        mcp_returncode: int = 0,
+        *,
+        raise_on_mcp_list: Exception | None = None,
+    ) -> Callable[..., subprocess.CompletedProcess[str]]:
+        def runner(args, **kwargs):  # type: ignore[no-untyped-def]
+            if args[0] == "claude" and args[1:] == ["--version"]:
+                return _FakeCompletedProcess(0, stdout="2.1.0 (Claude Code)\n")
+            if args[0] == "claude" and args[1:] == ["features", "list"]:
+                return _FakeCompletedProcess(1, stderr="unknown command\n")
+            if args[0] == "claude" and args[1:] == ["--help"]:
+                return _FakeCompletedProcess(
+                    0, stdout="Usage: claude [options] [command] [prompt]\n"
+                )
+            if args[0] == "claude" and args[1:] == ["mcp", "list"]:
+                if raise_on_mcp_list is not None:
+                    raise raise_on_mcp_list
+                return _FakeCompletedProcess(mcp_returncode, stdout=mcp_stdout)
+            raise AssertionError(args)
+
+        return runner
+
+    @staticmethod
+    def _write_claude_settings(
+        settings_path: Path,
+        *,
+        repo_root: Path,
+        project_mcp_servers: dict[str, Any] | None = None,
+        enabled_mcpjson_servers: list[str] | None = None,
+        disabled_mcpjson_servers: list[str] | None = None,
+        top_mcp_servers: dict[str, Any] | None = None,
+    ) -> None:
+        proj_key = str(repo_root.resolve())
+        data: dict[str, Any] = {"projects": {proj_key: {}}}
+        proj = data["projects"][proj_key]
+        if project_mcp_servers is not None:
+            proj["mcpServers"] = project_mcp_servers
+        if enabled_mcpjson_servers is not None:
+            proj["enabledMcpjsonServers"] = enabled_mcpjson_servers
+        if disabled_mcpjson_servers is not None:
+            proj["disabledMcpjsonServers"] = disabled_mcpjson_servers
+        if top_mcp_servers is not None:
+            data["mcpServers"] = top_mcp_servers
+        settings_path.write_text(json.dumps(data), encoding="utf-8")
+
+    def test_probe_claude_mcp_registry_passes_when_session_trust_enables_build_runtime(
+        self,
+    ) -> None:
+        """`~/.claude.json` の `enabledMcpjsonServers` に build-runtime があれば pass。"""
+        with tempfile.TemporaryDirectory() as td:
+            repo_root = Path(td)
+            settings = Path(td) / "claude.json"
+            self._write_claude_settings(
+                settings,
+                repo_root=repo_root,
+                enabled_mcpjson_servers=["build-runtime"],
+            )
+            runner = self._claude_runner_with_mcp(
+                "build-runtime: stdio python3 ./mcp_servers/build_runtime_server.py - ✓ Connected\n"
+            )
+            with patch(
+                "tools.orchestration_runtime._CLAUDE_USER_SETTINGS_PATH", new=settings
+            ):
+                result = probe_execution_platform(
+                    backend="claude", runner=runner, repo_root=repo_root
+                )
+
+        self.assertEqual(result["status"], "pass")
+        self.assertTrue(result["can_launch_step_agents"])
+        by_name = {c["name"]: c for c in result["checks"]}
+        self.assertTrue(by_name["claude_mcp_build_runtime_registered"]["pass"])
+        self.assertIn("session_enabled=True", by_name["claude_mcp_build_runtime_registered"]["detail"])
+
+    def test_probe_claude_mcp_registry_passes_when_user_scope_registered(self) -> None:
+        """user-scope `claude mcp add` (top-level mcpServers) でも pass する。"""
+        with tempfile.TemporaryDirectory() as td:
+            repo_root = Path(td)
+            settings = Path(td) / "claude.json"
+            self._write_claude_settings(
+                settings,
+                repo_root=repo_root,
+                top_mcp_servers={"build-runtime": {"command": "python3"}},
+            )
+            runner = self._claude_runner_with_mcp(
+                "build-runtime: stdio /opt/met-dsl/build_runtime_server.py - ✓ Connected\n"
+            )
+            with patch(
+                "tools.orchestration_runtime._CLAUDE_USER_SETTINGS_PATH", new=settings
+            ):
+                result = probe_execution_platform(
+                    backend="claude", runner=runner, repo_root=repo_root
+                )
+
+        self.assertEqual(result["status"], "pass")
+        by_name = {c["name"]: c for c in result["checks"]}
+        self.assertTrue(by_name["claude_mcp_build_runtime_registered"]["pass"])
+
+    def test_probe_claude_mcp_registry_fails_when_session_trust_missing_even_if_mcp_list_connected(
+        self,
+    ) -> None:
+        """`mcp list` で Connected と出ても、`~/.claude.json` で enabled でなければ fail。
+
+        `claude mcp list` は workspace trust を skip して health check を回すため、
+        session が tools を露出する保証にはならない (Codex review P1)。
+        """
+        with tempfile.TemporaryDirectory() as td:
+            repo_root = Path(td)
+            settings = Path(td) / "claude.json"
+            self._write_claude_settings(
+                settings,
+                repo_root=repo_root,
+                enabled_mcpjson_servers=[],  # trust dialog で enable されていない
+            )
+            runner = self._claude_runner_with_mcp(
+                "build-runtime: stdio python3 ./mcp_servers/build_runtime_server.py - ✓ Connected\n"
+            )
+            with patch(
+                "tools.orchestration_runtime._CLAUDE_USER_SETTINGS_PATH", new=settings
+            ):
+                result = probe_execution_platform(
+                    backend="claude", runner=runner, repo_root=repo_root
+                )
+
+        self.assertEqual(result["status"], "fail")
+        self.assertFalse(result["can_launch_step_agents"])
+        by_name = {c["name"]: c for c in result["checks"]}
+        self.assertFalse(by_name["claude_mcp_build_runtime_registered"]["pass"])
+        detail = by_name["claude_mcp_build_runtime_registered"]["detail"]
+        self.assertIn("session_enabled=False", detail)
+        # advisory: mcp_list still indicates Connected
+        self.assertIn("mcp_list_advisory: in_list=True, healthy=True", detail)
+        self.assertIn("is not enabled", detail)
+
+    def test_probe_claude_mcp_registry_fails_when_disabled_overrides_enabled(self) -> None:
+        """`disabledMcpjsonServers` が `enabledMcpjsonServers` を打ち消すこと。"""
+        with tempfile.TemporaryDirectory() as td:
+            repo_root = Path(td)
+            settings = Path(td) / "claude.json"
+            self._write_claude_settings(
+                settings,
+                repo_root=repo_root,
+                enabled_mcpjson_servers=["build-runtime"],
+                disabled_mcpjson_servers=["build-runtime"],
+            )
+            runner = self._claude_runner_with_mcp("")
+            with patch(
+                "tools.orchestration_runtime._CLAUDE_USER_SETTINGS_PATH", new=settings
+            ):
+                result = probe_execution_platform(
+                    backend="claude", runner=runner, repo_root=repo_root
+                )
+
+        self.assertEqual(result["status"], "fail")
+        by_name = {c["name"]: c for c in result["checks"]}
+        self.assertFalse(by_name["claude_mcp_build_runtime_registered"]["pass"])
+
+    def test_probe_claude_mcp_registry_fails_when_settings_missing(self) -> None:
+        """`~/.claude.json` が存在しなければ未判定として fail。"""
+        with tempfile.TemporaryDirectory() as td:
+            repo_root = Path(td)
+            settings = Path(td) / "claude.json"  # not created
+            runner = self._claude_runner_with_mcp("")
+            with patch(
+                "tools.orchestration_runtime._CLAUDE_USER_SETTINGS_PATH", new=settings
+            ):
+                result = probe_execution_platform(
+                    backend="claude", runner=runner, repo_root=repo_root
+                )
+
+        self.assertEqual(result["status"], "fail")
+        by_name = {c["name"]: c for c in result["checks"]}
+        self.assertFalse(by_name["claude_mcp_build_runtime_registered"]["pass"])
+        self.assertIn(
+            "settings_missing",
+            by_name["claude_mcp_build_runtime_registered"]["detail"],
+        )
+
+    def test_probe_claude_mcp_registry_mcp_list_timeout_is_advisory_not_gate(self) -> None:
+        """`claude mcp list` の timeout は advisory のみで gate しない (Codex review P2)。
+
+        trust state が enable していれば、`mcp list` が timeout しても workflow は許可する。
+        """
+        with tempfile.TemporaryDirectory() as td:
+            repo_root = Path(td)
+            settings = Path(td) / "claude.json"
+            self._write_claude_settings(
+                settings,
+                repo_root=repo_root,
+                enabled_mcpjson_servers=["build-runtime"],
+            )
+            runner = self._claude_runner_with_mcp(
+                raise_on_mcp_list=subprocess.TimeoutExpired(cmd="claude mcp list", timeout=10)
+            )
+            with patch(
+                "tools.orchestration_runtime._CLAUDE_USER_SETTINGS_PATH", new=settings
+            ):
+                result = probe_execution_platform(
+                    backend="claude", runner=runner, repo_root=repo_root
+                )
+
+        self.assertEqual(result["status"], "pass")
+        self.assertTrue(result["can_launch_step_agents"])
+        by_name = {c["name"]: c for c in result["checks"]}
+        # registered gate は trust state で pass
+        self.assertTrue(by_name["claude_mcp_build_runtime_registered"]["pass"])
+        # list_available は advisory (None) on timeout — gate しない
+        self.assertIsNone(by_name["claude_mcp_list_available"]["pass"])
+        self.assertIn(
+            "TimeoutExpired", by_name["claude_mcp_list_available"]["detail"]
+        )
+
+    def test_probe_claude_mcp_registry_runs_mcp_list_in_repo_root(self) -> None:
+        """`claude mcp list` は target repo_root を cwd として実行する必要がある。
+
+        Claude は project-scoped `.mcp.json` を cwd 経由で解決するため、cwd 不指定だと
+        `tools/run_workflow.py` を別 cwd から `--repo-root <repo>` 付きで呼んだ場合に
+        false-negative が出る。runner が `cwd=str(repo_root)` で呼ばれることを lock。
+        """
+        captured: dict[str, Any] = {}
+
+        def runner(args, **kwargs):  # type: ignore[no-untyped-def]
+            if args[0] == "claude" and args[1:] == ["--version"]:
+                return _FakeCompletedProcess(0, stdout="2.1.0 (Claude Code)\n")
+            if args[0] == "claude" and args[1:] == ["features", "list"]:
+                return _FakeCompletedProcess(1, stderr="unknown command\n")
+            if args[0] == "claude" and args[1:] == ["--help"]:
+                return _FakeCompletedProcess(0, stdout="Usage: claude ...\n")
+            if args[0] == "claude" and args[1:] == ["mcp", "list"]:
+                captured["cwd"] = kwargs.get("cwd")
+                return _FakeCompletedProcess(0, stdout="")
+            raise AssertionError(args)
+
+        with tempfile.TemporaryDirectory() as td:
+            repo_root = Path(td)
+            settings = Path(td) / "claude.json"
+            self._write_claude_settings(
+                settings,
+                repo_root=repo_root,
+                enabled_mcpjson_servers=["build-runtime"],
+            )
+            with patch(
+                "tools.orchestration_runtime._CLAUDE_USER_SETTINGS_PATH", new=settings
+            ):
+                probe_execution_platform(
+                    backend="claude", runner=runner, repo_root=repo_root
+                )
+
+        self.assertEqual(captured.get("cwd"), str(repo_root))
+
+    def test_probe_claude_mcp_registry_skipped_when_repo_root_none(self) -> None:
+        """既存 Claude probe テスト互換: repo_root 未指定なら advisory-only で AND しない。"""
+        result = probe_execution_platform(
+            backend="claude",
+            runner=self._claude_runner_with_mcp("ignored"),
+        )
+
+        self.assertEqual(result["status"], "pass")
+        self.assertTrue(result["can_launch_step_agents"])
+        by_name = {c["name"]: c for c in result["checks"]}
+        self.assertIn("claude_mcp_build_runtime_registered", by_name)
+        self.assertIsNone(by_name["claude_mcp_build_runtime_registered"]["pass"])
+        self.assertIn("skipped", by_name["claude_mcp_build_runtime_registered"]["detail"])
+
     def test_probe_execution_platform_uses_explicit_agent_command(self) -> None:
         seen = {"command": ""}
 
@@ -8819,6 +9084,34 @@ class PreflightLiveProbeTtlTests(unittest.TestCase):
                     )
                     _require_preflight_launchable(repo, "o1", enforce_live_probe=True)
                     self.assertEqual(probe_mock.call_count, 1)
+
+    def test_require_preflight_launchable_passes_repo_root_to_live_probe(self) -> None:
+        """live probe にも repo_root を渡すこと (Claude MCP gate を live preflight でも有効化)。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            init_orchestration(repo_root=repo, orchestration_id="o1")
+            _mark_dependencies_ready(repo, "o1")
+            write_preflight(
+                repo_root=repo,
+                orchestration_id="o1",
+                payload=_launchable_preflight_dict(
+                    checked_at="2026-04-15T10:00:00Z",
+                    probed_at=_iso_utc_z(datetime.now(timezone.utc) - timedelta(seconds=2000)),
+                ),
+            )
+            env = {
+                "METDSL_ORCHESTRATION_ENFORCE_LIVE_PREFLIGHT": "auto",
+                "METDSL_PREFLIGHT_TTL_SECONDS": "1800",
+            }
+            with patch.dict(os.environ, env):
+                with patch("tools.orchestration_runtime.probe_execution_platform") as probe_mock:
+                    probe_mock.return_value = _launchable_preflight_dict(
+                        checked_at="2026-04-15T11:00:00Z",
+                    )
+                    _require_preflight_launchable(repo, "o1", enforce_live_probe=True)
+                    self.assertEqual(probe_mock.call_count, 1)
+                    _, call_kwargs = probe_mock.call_args
+                    self.assertEqual(call_kwargs.get("repo_root"), repo)
 
     def test_require_preflight_launchable_probes_when_no_probed_at(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

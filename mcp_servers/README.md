@@ -28,7 +28,37 @@
 - execution result は `command_id` と `executed_command` と `command_log_path` を返却し、リポジトリ配下にログがある場合は `command_log_ref` を返却する。
 
 ## MCP 設定例
-以下は一般的な MCP クライアント設定の例である。実際の設定形式はクライアント実装に合わせて調整する。
+
+backend ごとに canonical 設定ファイルが異なる。リポジトリには以下 2 ファイルを同梱する。
+
+### Claude Code: `.mcp.json` (リポジトリ root)
+
+Claude Code は project root 直下の `.mcp.json` を読み、初回起動時の workspace trust dialog で enable する。同梱内容:
+
+```json
+{
+  "mcpServers": {
+    "build-runtime": {
+      "command": "python3",
+      "args": ["./mcp_servers/build_runtime_server.py"]
+    }
+  }
+}
+```
+
+`tools/run_workflow.py --llm claude` の `preflight` (`tools/orchestration_runtime.py` `_probe_claude_mcp_registry`) は `claude mcp list` を実行して `build-runtime` の登録を検証し、未登録なら `status=fail` で停止する。`.mcp.json` を使わず CLI 経由で登録する場合:
+
+```bash
+claude mcp add-json build-runtime '{"command":"python3","args":["./mcp_servers/build_runtime_server.py"]}'
+```
+
+### Cursor: `.cursor/mcp.json`
+
+Cursor は `.cursor/mcp.json` を読む。リポジトリ同梱の `.cursor/mcp.json` で `build-runtime` を絶対パス指定済み (Cursor の解決規約に合わせる)。
+
+### 一般的な MCP クライアント
+
+その他クライアント向け参照例:
 
 ```json
 {

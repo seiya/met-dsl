@@ -33,6 +33,7 @@
 ### preflight
 - `preflight` 実行時は `--backend claude` を指定する。
 - コマンド例: `python3 tools/run_workflow.py <spec_ref> <until_phase> --llm claude`
+- Claude backend の `preflight` は `~/.claude.json` の `projects.<abs_repo>.{mcpServers,enabledMcpjsonServers} − disabledMcpjsonServers` ∪ top-level `mcpServers` に `build-runtime` が含まれることを必須とする (`run_linter` / `compile_project` / `run_program` / `run_quality_checks` / `detect_build_system` を提供)。これは Claude Code session が `mcp__build-runtime__*` tool を Agent へ露出する canonical 条件と一致する。`claude mcp list` は workspace trust dialog を skip して stdio server を spawn するため `✓ Connected` でも session が tool を露出する保証にならず (false-positive 源)、preflight gate には使わず advisory 表示のみに留める。未 enable 時は `preflight.json#checks` の `claude_mcp_build_runtime_registered` が `pass=false` となり `status=fail` で停止する。remediation はリポジトリ同梱の `.mcp.json` を `claude` workspace trust dialog で有効化するか、`claude mcp add-json --scope project build-runtime ...` を `mcp_servers/mcp_servers.example.json` の snippet で実行する。
 
 ### 子 `agent` 起動
 - Claude Code では `spawn_agent` の代わりに `Agent` tool を使用して子 `agent` を起動する。

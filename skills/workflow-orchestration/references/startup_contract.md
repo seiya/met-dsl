@@ -34,6 +34,7 @@ workspace/tmp/<agent_run_id>/
 - validator invocation は `run-gate` を原則とし、直接実行を許可する場合は read-only 検査かつ gate 非依存検査に限定する。許可対象は `validate_workspace_root.py` と `check_artifact_syntax.py` のみとし、それ以外の validator 直実行を禁止する。
 - `init` と `preflight` は各 1 回以上実行しなければならない。
 - `preflight.json` が `status=pass` かつ `can_launch_step_agents=true` かつ `can_launch_substep_agents=true` を満たさない場合、子 `agent` を起動してはならない。
+- Claude backend では `preflight.json#checks` に `claude_mcp_build_runtime_registered: pass=true` が含まれることを判定対象とする。`probe_execution_platform` が AND 評価済みであり、orchestration agent 側で `claude mcp list` を再実行する必要はない。`pass=false` 時は `status=fail` で停止済みのため、当該分岐に達することはない (Generate/Build/Validate 子 agent 起動の前段で必ず検知される)。
 - phase 着手前に、対象 phase が `substep agent` 必須か `step agent` 必須かを固定表で確認しなければならない。`Compile` / `Generate` / `Validate` は `substep agent`、`Build` は `step agent` とする。
 - 最初の `commentary` で、対象 phase、使用する `SKILL`、起動する `agent` 種別、`MCP` 使用箇所を実行宣言しなければならない。
 - `Compile` の子 `agent` を起動する前に、対象 `node` の直下依存 `node` が `direct dependency compile readiness` を満たすことを確認しなければならない。
