@@ -14389,7 +14389,8 @@ class RecordTimeoutTests(unittest.TestCase):
 
             def _worker(rr: str, oid: str, b, q):
                 import sys as _sys
-                _sys.path.insert(0, "/home/seiya/work/met-dsl")
+                from pathlib import Path as _RP
+                _sys.path.insert(0, str(_RP(__file__).resolve().parents[2]))
                 from tools.orchestration_runtime import _runs_jsonl_exclusive_lock
                 import time as _time
                 from pathlib import Path as _P
