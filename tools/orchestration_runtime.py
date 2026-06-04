@@ -9566,12 +9566,45 @@ _MCP_JSON_RELPATH = ".mcp.json"
 _CLAUDE_MCP_REMEDIATION = (
     "build-runtime MCP server is not enabled for this project via the repo-committed "
     "`.claude/settings.json`. Required tools (run_linter, compile_project, run_program, "
-    "run_quality_checks, detect_build_system) are needed by Generate/Build/Validate phases. "
+    "run_quality_checks) are needed by Generate/Build/Validate phases (detect_build_system "
+    "is advisory — provided by the server but not gated). "
     "Remediation: add `\"enabledMcpjsonServers\": [\"build-runtime\"]` (or "
     "`\"enableAllProjectMcpServers\": true`) to the top level of the committed "
     "`.claude/settings.json`, and ensure no `disabledMcpjsonServers` entry for build-runtime "
     "exists in `.claude/settings.json` / `.claude/settings.local.json`. "
     "Reference: `mcp_servers/README.md`."
+)
+# permission rule 文字列の canonical 形。Claude Code の permission rule は MCP tool 名部分の
+# wildcard (`mcp__build-runtime__*`) を解さないため、server 単位 grant が全 tool を覆う正攻法。
+# remediation メッセージ表示用の canonical (hyphen) token。
+_CLAUDE_MCP_SERVER_PERMISSION_TOKEN = "mcp__build-runtime"
+# granted 判定に必須の個別 tool 名。detect_build_system は advisory (granted 判定に
+# 含めない) — Generate/Build/Validate が必須依存する 4 tool のみを gate 対象とする。
+_CLAUDE_MCP_REQUIRED_TOOL_NAMES = (
+    "run_linter",
+    "compile_project",
+    "run_program",
+    "run_quality_checks",
+)
+# remediation メッセージ表示用の canonical (hyphen) token。
+_CLAUDE_MCP_REQUIRED_TOOL_PERMISSION_TOKENS = tuple(
+    f"mcp__build-runtime__{name}" for name in _CLAUDE_MCP_REQUIRED_TOOL_NAMES
+)
+# 判定で accept する permission token は registration で実際に enable された server alias から
+# 導出する (下記 _evaluate_build_runtime_tool_permission)。enable された alias (例 `build-runtime`)
+# と permission の alias (例 `mcp__build_runtime`) が食い違うと Claude は実 server 名で permission
+# を keyed するため child Agent が tool を呼べない — alias 横断の無条件 accept は false-pass の元。
+_CLAUDE_MCP_PERMISSION_REMEDIATION = (
+    "build-runtime MCP tools are registered/connected but not permission-granted to the "
+    "orchestration's spawned child Agent sessions. Add the server-level grant "
+    "`\"mcp__build-runtime\"` to `permissions.allow` in the repo-committed "
+    "`.claude/settings.json` (this grants all build-runtime tools — run_linter, "
+    "compile_project, run_program, run_quality_checks, detect_build_system). Claude Code "
+    "permission rules do NOT support a tool-name wildcard (`mcp__build-runtime__*`), so use "
+    "the server-level token; to grant individually, list "
+    "`mcp__build-runtime__run_linter` / `__compile_project` / `__run_program` / "
+    "`__run_quality_checks`. Ensure no matching `permissions.deny` entry exists in "
+    "`.claude/settings.json` / `.claude/settings.local.json`. Reference: `mcp_servers/README.md`."
 )
 
 
@@ -9673,6 +9706,158 @@ def _read_repo_enabled_mcp_servers(
     return enabled, detail
 
 
+def _read_repo_mcp_tool_permissions(
+    repo_root: Path,
+    *,
+    settings_path: Path | None = None,
+    local_settings_path: Path | None = None,
+) -> tuple[set[str], set[str], str | None, str]:
+    """repo にコミットされた project settings から MCP tool permission の状態を読み出す。
+
+    canonical source は `<repo>/.claude/settings.json` の `permissions` セクション。
+    `.claude/settings.local.json` の `permissions.allow` (個人 opt-in 追加) と
+    `permissions.deny` (個人 opt-out) も合算/減算する。`~/.claude.json` は
+    enablement check と同じ理由 (マシン依存・再現性) で参照しない。
+
+    戻り値 `(allow_set, deny_set, default_mode, detail)`:
+      - allow_set: project + local の `permissions.allow` 文字列集合
+      - deny_set:  project + local の `permissions.deny` 文字列集合
+      - default_mode: `permissions.defaultMode` (project 優先、無ければ local、無ければ None)
+      - detail: 診断用文字列
+    """
+    settings = (
+        settings_path
+        if settings_path is not None
+        else repo_root / _CLAUDE_PROJECT_SETTINGS_RELPATH
+    )
+    local_settings = (
+        local_settings_path
+        if local_settings_path is not None
+        else repo_root / _CLAUDE_PROJECT_LOCAL_SETTINGS_RELPATH
+    )
+
+    def _collect(path: Path) -> tuple[set[str], set[str], str | None]:
+        data, _err = _load_json_object(path)
+        if not isinstance(data, dict):
+            return set(), set(), None
+        perms = data.get("permissions")
+        if not isinstance(perms, dict):
+            return set(), set(), None
+        # 非 list (null / str / int 等) は無視して空集合扱いとする。`for x in value` を
+        # list 確定後にのみ行い、malformed value での TypeError (preflight abort) を防ぐ。
+        allow_raw = perms.get("allow")
+        allow = (
+            {str(x) for x in allow_raw if isinstance(x, str)}
+            if isinstance(allow_raw, list)
+            else set()
+        )
+        deny_raw = perms.get("deny")
+        deny = (
+            {str(x) for x in deny_raw if isinstance(x, str)}
+            if isinstance(deny_raw, list)
+            else set()
+        )
+        mode = perms.get("defaultMode")
+        return allow, deny, (mode if isinstance(mode, str) else None)
+
+    proj_allow, proj_deny, proj_mode = _collect(settings)
+    local_allow, local_deny, local_mode = _collect(local_settings)
+
+    allow_set = proj_allow | local_allow
+    deny_set = proj_deny | local_deny
+    default_mode = proj_mode if proj_mode is not None else local_mode
+
+    detail = (
+        f"settings={settings}; allow={sorted(allow_set)}; "
+        f"deny={sorted(deny_set)}; default_mode={default_mode}"
+    )
+    return allow_set, deny_set, default_mode, detail
+
+
+def _evaluate_build_runtime_tool_permission(
+    repo_root: Path,
+    *,
+    enabled_aliases: set[str] | None = None,
+    settings_path: Path | None = None,
+    local_settings_path: Path | None = None,
+) -> tuple[bool, str]:
+    """build-runtime MCP tool が子 Agent session に permission-granted されているか判定する。
+
+    `enabled_aliases` は registration で実際に enable された build-runtime の server alias
+    集合 (`{"build-runtime"}` / `{"build_runtime"}` 等)。permission token はこの **enable
+    された alias からのみ** 導出する。Claude は実 server 名で permission を keyed するため、
+    enable 名と permission alias が食い違うと child Agent が tool を呼べないにも関わらず
+    preflight が pass してしまう (false-pass)。`enabled_aliases` が空/None の場合は
+    registration AND-gate が別途 fail するため、診断目的で既知 alias 全体を fallback に使う。
+
+    granted 条件 (いずれか):
+      - `permissions.defaultMode == "bypassPermissions"` (全 tool 無条件許可)
+      - server 単位 grant (`mcp__<enabled-alias>`) が allow にあり、server 単位 deny も
+        必須 tool の個別 deny も無い
+      - 必須 4 tool (`run_linter` / `compile_project` / `run_program` /
+        `run_quality_checks`) が各々「enable alias の allow を1つ以上持ち deny されていない」
+        (かつ server 単位 deny が無い)
+    Claude Code の deny rule は allow より優先。tool 固有 deny は server 単位 allow を、
+    server 単位 deny は個別 tool allow を、それぞれ打ち消すため、いずれの deny があっても
+    granted=false とする (false-pass 防止)。`detect_build_system` は advisory (どの phase も
+    invoke しないため gate 対象外)。
+    """
+    allow_set, deny_set, default_mode, perms_detail = _read_repo_mcp_tool_permissions(
+        repo_root,
+        settings_path=settings_path,
+        local_settings_path=local_settings_path,
+    )
+
+    if default_mode == "bypassPermissions":
+        return True, f"granted via defaultMode=bypassPermissions | {perms_detail}"
+
+    # enable された alias のみ accept (canonical 順を保持)。未指定/空は registration が
+    # 別途 fail するため fallback として既知 alias 全体を使う。
+    aliases = tuple(
+        a for a in _CLAUDE_MCP_BUILD_RUNTIME_NAME_TOKENS if a in (enabled_aliases or set())
+    ) or _CLAUDE_MCP_BUILD_RUNTIME_NAME_TOKENS
+
+    server_tokens = {f"mcp__{alias}" for alias in aliases}
+    required_tool_aliases = tuple(
+        tuple(f"mcp__{alias}__{name}" for alias in aliases)
+        for name in _CLAUDE_MCP_REQUIRED_TOOL_NAMES
+    )
+
+    server_allowed = bool(server_tokens & allow_set)
+    server_denied = bool(server_tokens & deny_set)
+
+    def _tool_allowed(alias_tokens: tuple[str, ...]) -> bool:
+        # 当該 tool に allow alias が1つでもあり、その alias が deny されていなければ true
+        return any(tok in allow_set and tok not in deny_set for tok in alias_tokens)
+
+    def _tool_denied(alias_tokens: tuple[str, ...]) -> bool:
+        return any(tok in deny_set for tok in alias_tokens)
+
+    # 必須 tool のいずれかが個別 deny されていれば server 単位 grant を打ち消す
+    required_tool_denied = any(_tool_denied(toks) for toks in required_tool_aliases)
+    server_granted = server_allowed and not server_denied and not required_tool_denied
+
+    # server 単位 deny は server の全 tool を block するため、個別 allow があっても granted 不可。
+    tools_granted = (not server_denied) and all(
+        _tool_allowed(toks) for toks in required_tool_aliases
+    )
+
+    granted = server_granted or tools_granted
+    detail_parts = [
+        f"granted={granted}",
+        f"accepted_aliases={list(aliases)}",
+        f"server_grant={server_granted}",
+        f"server_allowed={server_allowed}",
+        f"server_denied={server_denied}",
+        f"required_tool_denied={required_tool_denied}",
+        f"all_tool_grants={tools_granted}",
+        perms_detail,
+    ]
+    if not granted:
+        detail_parts.append(_CLAUDE_MCP_PERMISSION_REMEDIATION)
+    return granted, " | ".join(detail_parts)
+
+
 def _probe_claude_mcp_registry(
     command: str,
     repo_root: Path | None,
@@ -9706,7 +9891,17 @@ def _probe_claude_mcp_registry(
                         "skipped; probe_execution_platform was called without repo_root "
                         "(advisory only — production calls via cmd_preflight always pass repo_root)"
                     ),
-                }
+                },
+                {
+                    # registered と permission は常に対で評価する契約 (CLAUDE.md / startup_contract.md)。
+                    # repo_root 不在の advisory-only 経路でも permission check を省かず skipped で含める。
+                    "name": "claude_mcp_build_runtime_permission_granted",
+                    "pass": None,
+                    "detail": (
+                        "skipped; probe_execution_platform was called without repo_root "
+                        "(advisory only — production calls via cmd_preflight always pass repo_root)"
+                    ),
+                },
             ],
             True,
         )
@@ -9720,8 +9915,10 @@ def _probe_claude_mcp_registry(
     build_runtime_token_set = {tok for tok in _CLAUDE_MCP_BUILD_RUNTIME_NAME_TOKENS}
     if enabled_servers is None:
         session_enabled = False
+        enabled_build_runtime_aliases: set[str] = set()
     else:
-        session_enabled = bool(enabled_servers & build_runtime_token_set)
+        enabled_build_runtime_aliases = enabled_servers & build_runtime_token_set
+        session_enabled = bool(enabled_build_runtime_aliases)
 
     # `claude mcp list` は advisory diagnostic として軽く呼ぶ。timeout は gate しない。
     try:
@@ -9787,6 +9984,13 @@ def _probe_claude_mcp_registry(
         registered_detail_parts.append(_CLAUDE_MCP_REMEDIATION)
     registered_detail = " | ".join(registered_detail_parts)
 
+    permission_granted, permission_detail = _evaluate_build_runtime_tool_permission(
+        repo_root,
+        enabled_aliases=enabled_build_runtime_aliases,
+        settings_path=settings_path,
+        local_settings_path=local_settings_path,
+    )
+
     checks = [
         {
             "name": "claude_mcp_list_available",
@@ -9798,8 +10002,16 @@ def _probe_claude_mcp_registry(
             "pass": registered_pass,
             "detail": registered_detail,
         },
+        {
+            "name": "claude_mcp_build_runtime_permission_granted",
+            "pass": permission_granted,
+            "detail": permission_detail,
+        },
     ]
-    return checks, registered_pass
+    # registration と permission の AND を gate signal とする。registered=true でも tool が
+    # 子 Agent session に permission-granted されていなければ launch を許可しない。
+    mcp_ok = registered_pass and permission_granted
+    return checks, mcp_ok
 
 
 def probe_execution_platform(

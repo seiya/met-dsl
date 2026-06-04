@@ -522,6 +522,11 @@ shell_tool                       stable             true
         enable_all_project_mcp_servers: bool | None = None,
         mcp_servers: dict[str, Any] | None = None,
         local_disabled_mcpjson_servers: list[str] | None = None,
+        allow_permissions: list[str] | None = None,
+        deny_permissions: list[str] | None = None,
+        default_mode: str | None = None,
+        local_allow_permissions: list[str] | None = None,
+        local_deny_permissions: list[str] | None = None,
     ) -> None:
         """repo にコミットされる project settings を temp repo_root へ書き出す。
 
@@ -539,6 +544,15 @@ shell_tool                       stable             true
                 data["disabledMcpjsonServers"] = disabled_mcpjson_servers
             if enable_all_project_mcp_servers is not None:
                 data["enableAllProjectMcpServers"] = enable_all_project_mcp_servers
+            perms: dict[str, Any] = {}
+            if allow_permissions is not None:
+                perms["allow"] = allow_permissions
+            if deny_permissions is not None:
+                perms["deny"] = deny_permissions
+            if default_mode is not None:
+                perms["defaultMode"] = default_mode
+            if perms:
+                data["permissions"] = perms
             (claude_dir / "settings.json").write_text(
                 json.dumps(data), encoding="utf-8"
             )
@@ -546,11 +560,23 @@ shell_tool                       stable             true
             (repo_root / ".mcp.json").write_text(
                 json.dumps({"mcpServers": mcp_servers}), encoding="utf-8"
             )
-        if local_disabled_mcpjson_servers is not None:
+        if (
+            local_disabled_mcpjson_servers is not None
+            or local_allow_permissions is not None
+            or local_deny_permissions is not None
+        ):
+            local_data: dict[str, Any] = {}
+            if local_disabled_mcpjson_servers is not None:
+                local_data["disabledMcpjsonServers"] = local_disabled_mcpjson_servers
+            local_perms: dict[str, Any] = {}
+            if local_allow_permissions is not None:
+                local_perms["allow"] = local_allow_permissions
+            if local_deny_permissions is not None:
+                local_perms["deny"] = local_deny_permissions
+            if local_perms:
+                local_data["permissions"] = local_perms
             (claude_dir / "settings.local.json").write_text(
-                json.dumps(
-                    {"disabledMcpjsonServers": local_disabled_mcpjson_servers}
-                ),
+                json.dumps(local_data),
                 encoding="utf-8",
             )
 
@@ -561,7 +587,9 @@ shell_tool                       stable             true
         with tempfile.TemporaryDirectory() as td:
             repo_root = Path(td)
             self._write_project_settings(
-                repo_root, enabled_mcpjson_servers=["build-runtime"]
+                repo_root,
+                enabled_mcpjson_servers=["build-runtime"],
+                allow_permissions=["mcp__build-runtime"],
             )
             runner = self._claude_runner_with_mcp(
                 "build-runtime: stdio python3 ./mcp_servers/build_runtime_server.py - ✓ Connected\n"
@@ -575,6 +603,7 @@ shell_tool                       stable             true
         by_name = {c["name"]: c for c in result["checks"]}
         self.assertTrue(by_name["claude_mcp_build_runtime_registered"]["pass"])
         self.assertIn("session_enabled=True", by_name["claude_mcp_build_runtime_registered"]["detail"])
+        self.assertTrue(by_name["claude_mcp_build_runtime_permission_granted"]["pass"])
 
     def test_probe_claude_mcp_registry_passes_when_enable_all_project_mcp_servers(self) -> None:
         """`enableAllProjectMcpServers:true` + `.mcp.json` が build-runtime を定義していれば pass。"""
@@ -584,6 +613,7 @@ shell_tool                       stable             true
                 repo_root,
                 enable_all_project_mcp_servers=True,
                 mcp_servers={"build-runtime": {"command": "python3"}},
+                allow_permissions=["mcp__build-runtime"],
             )
             runner = self._claude_runner_with_mcp(
                 "build-runtime: stdio /opt/met-dsl/build_runtime_server.py - ✓ Connected\n"
@@ -689,7 +719,9 @@ shell_tool                       stable             true
         with tempfile.TemporaryDirectory() as td:
             repo_root = Path(td)
             self._write_project_settings(
-                repo_root, enabled_mcpjson_servers=["build-runtime"]
+                repo_root,
+                enabled_mcpjson_servers=["build-runtime"],
+                allow_permissions=["mcp__build-runtime"],
             )
             runner = self._claude_runner_with_mcp(
                 raise_on_mcp_list=subprocess.TimeoutExpired(cmd="claude mcp list", timeout=10)
@@ -733,7 +765,9 @@ shell_tool                       stable             true
         with tempfile.TemporaryDirectory() as td:
             repo_root = Path(td)
             self._write_project_settings(
-                repo_root, enabled_mcpjson_servers=["build-runtime"]
+                repo_root,
+                enabled_mcpjson_servers=["build-runtime"],
+                allow_permissions=["mcp__build-runtime"],
             )
             probe_execution_platform(
                 backend="claude", runner=runner, repo_root=repo_root
@@ -754,6 +788,340 @@ shell_tool                       stable             true
         self.assertIn("claude_mcp_build_runtime_registered", by_name)
         self.assertIsNone(by_name["claude_mcp_build_runtime_registered"]["pass"])
         self.assertIn("skipped", by_name["claude_mcp_build_runtime_registered"]["detail"])
+        # registered と permission は常に対で評価する契約: None 経路でも両 check を含める
+        self.assertIn("claude_mcp_build_runtime_permission_granted", by_name)
+        self.assertIsNone(by_name["claude_mcp_build_runtime_permission_granted"]["pass"])
+        self.assertIn(
+            "skipped", by_name["claude_mcp_build_runtime_permission_granted"]["detail"]
+        )
+
+    def test_probe_claude_mcp_registry_fails_when_registered_but_permission_not_granted(
+        self,
+    ) -> None:
+        """registered=true でも permissions.allow に build-runtime が無ければ fail (本障害の再現)。"""
+        with tempfile.TemporaryDirectory() as td:
+            repo_root = Path(td)
+            self._write_project_settings(
+                repo_root,
+                enabled_mcpjson_servers=["build-runtime"],
+                allow_permissions=["Bash(python3 tools/run_workflow.py *)"],
+            )
+            runner = self._claude_runner_with_mcp(
+                "build-runtime: stdio python3 ./mcp_servers/build_runtime_server.py - ✓ Connected\n"
+            )
+            result = probe_execution_platform(
+                backend="claude", runner=runner, repo_root=repo_root
+            )
+
+        self.assertEqual(result["status"], "fail")
+        self.assertFalse(result["can_launch_step_agents"])
+        by_name = {c["name"]: c for c in result["checks"]}
+        # registered は pass、permission は fail
+        self.assertTrue(by_name["claude_mcp_build_runtime_registered"]["pass"])
+        self.assertFalse(by_name["claude_mcp_build_runtime_permission_granted"]["pass"])
+        self.assertIn(
+            "not permission-granted",
+            by_name["claude_mcp_build_runtime_permission_granted"]["detail"],
+        )
+
+    def test_probe_claude_mcp_registry_passes_when_individual_tool_permissions_granted(
+        self,
+    ) -> None:
+        """server 単位 grant が無くても必須 4 tool を個別 allow すれば permission pass。"""
+        with tempfile.TemporaryDirectory() as td:
+            repo_root = Path(td)
+            self._write_project_settings(
+                repo_root,
+                enabled_mcpjson_servers=["build-runtime"],
+                allow_permissions=[
+                    "mcp__build-runtime__run_linter",
+                    "mcp__build-runtime__compile_project",
+                    "mcp__build-runtime__run_program",
+                    "mcp__build-runtime__run_quality_checks",
+                ],
+            )
+            runner = self._claude_runner_with_mcp(
+                "build-runtime: stdio python3 ./mcp_servers/build_runtime_server.py - ✓ Connected\n"
+            )
+            result = probe_execution_platform(
+                backend="claude", runner=runner, repo_root=repo_root
+            )
+
+        self.assertEqual(result["status"], "pass")
+        by_name = {c["name"]: c for c in result["checks"]}
+        self.assertTrue(by_name["claude_mcp_build_runtime_permission_granted"]["pass"])
+
+    def test_probe_claude_mcp_registry_fails_when_individual_tool_permissions_incomplete(
+        self,
+    ) -> None:
+        """個別 grant が必須 4 tool に満たない (run_quality_checks 欠落) と permission fail。"""
+        with tempfile.TemporaryDirectory() as td:
+            repo_root = Path(td)
+            self._write_project_settings(
+                repo_root,
+                enabled_mcpjson_servers=["build-runtime"],
+                allow_permissions=[
+                    "mcp__build-runtime__run_linter",
+                    "mcp__build-runtime__compile_project",
+                    "mcp__build-runtime__run_program",
+                ],
+            )
+            runner = self._claude_runner_with_mcp("")
+            result = probe_execution_platform(
+                backend="claude", runner=runner, repo_root=repo_root
+            )
+
+        self.assertEqual(result["status"], "fail")
+        by_name = {c["name"]: c for c in result["checks"]}
+        self.assertFalse(by_name["claude_mcp_build_runtime_permission_granted"]["pass"])
+
+    def test_probe_claude_mcp_registry_fails_when_server_permission_denied(self) -> None:
+        """server 単位 deny は server 単位 allow を打ち消し permission fail。"""
+        with tempfile.TemporaryDirectory() as td:
+            repo_root = Path(td)
+            self._write_project_settings(
+                repo_root,
+                enabled_mcpjson_servers=["build-runtime"],
+                allow_permissions=["mcp__build-runtime"],
+                deny_permissions=["mcp__build-runtime"],
+            )
+            runner = self._claude_runner_with_mcp("")
+            result = probe_execution_platform(
+                backend="claude", runner=runner, repo_root=repo_root
+            )
+
+        self.assertEqual(result["status"], "fail")
+        by_name = {c["name"]: c for c in result["checks"]}
+        self.assertFalse(by_name["claude_mcp_build_runtime_permission_granted"]["pass"])
+
+    def test_probe_claude_mcp_registry_fails_when_server_allowed_but_required_tool_denied(
+        self,
+    ) -> None:
+        """server 単位 allow でも必須 tool の個別 deny があれば fail (Claude は deny を優先)。"""
+        with tempfile.TemporaryDirectory() as td:
+            repo_root = Path(td)
+            self._write_project_settings(
+                repo_root,
+                enabled_mcpjson_servers=["build-runtime"],
+                allow_permissions=["mcp__build-runtime"],
+                deny_permissions=["mcp__build-runtime__run_linter"],
+            )
+            runner = self._claude_runner_with_mcp(
+                "build-runtime: stdio python3 ./mcp_servers/build_runtime_server.py - ✓ Connected\n"
+            )
+            result = probe_execution_platform(
+                backend="claude", runner=runner, repo_root=repo_root
+            )
+
+        self.assertEqual(result["status"], "fail")
+        by_name = {c["name"]: c for c in result["checks"]}
+        self.assertFalse(by_name["claude_mcp_build_runtime_permission_granted"]["pass"])
+        self.assertIn(
+            "required_tool_denied=True",
+            by_name["claude_mcp_build_runtime_permission_granted"]["detail"],
+        )
+
+    def test_probe_claude_mcp_registry_passes_for_underscore_server_alias(self) -> None:
+        """`build_runtime` (underscore) alias を enable + `mcp__build_runtime` allow で pass。"""
+        with tempfile.TemporaryDirectory() as td:
+            repo_root = Path(td)
+            self._write_project_settings(
+                repo_root,
+                enabled_mcpjson_servers=["build_runtime"],
+                allow_permissions=["mcp__build_runtime"],
+            )
+            runner = self._claude_runner_with_mcp(
+                "build_runtime: stdio python3 ./mcp_servers/build_runtime_server.py - ✓ Connected\n"
+            )
+            result = probe_execution_platform(
+                backend="claude", runner=runner, repo_root=repo_root
+            )
+
+        self.assertEqual(result["status"], "pass")
+        by_name = {c["name"]: c for c in result["checks"]}
+        self.assertTrue(by_name["claude_mcp_build_runtime_registered"]["pass"])
+        self.assertTrue(by_name["claude_mcp_build_runtime_permission_granted"]["pass"])
+
+    def test_probe_claude_mcp_registry_passes_for_underscore_individual_tool_aliases(
+        self,
+    ) -> None:
+        """underscore で enable + underscore 個別 tool allow (alias 一致) で permission pass。"""
+        with tempfile.TemporaryDirectory() as td:
+            repo_root = Path(td)
+            self._write_project_settings(
+                repo_root,
+                enabled_mcpjson_servers=["build_runtime"],
+                allow_permissions=[
+                    "mcp__build_runtime__run_linter",
+                    "mcp__build_runtime__compile_project",
+                    "mcp__build_runtime__run_program",
+                    "mcp__build_runtime__run_quality_checks",
+                ],
+            )
+            runner = self._claude_runner_with_mcp("")
+            result = probe_execution_platform(
+                backend="claude", runner=runner, repo_root=repo_root
+            )
+
+        self.assertEqual(result["status"], "pass")
+        by_name = {c["name"]: c for c in result["checks"]}
+        self.assertTrue(by_name["claude_mcp_build_runtime_permission_granted"]["pass"])
+
+    def test_probe_claude_mcp_registry_fails_when_permission_alias_mismatches_enabled(
+        self,
+    ) -> None:
+        """enable は hyphen `build-runtime` だが permission が underscore alias のみ → fail。
+
+        Claude は実 server 名 (`build-runtime`) で permission を keyed するため、`mcp__build_runtime`
+        だけ allow しても child Agent は tool を呼べない。preflight が false-pass しないことを lock。
+        """
+        with tempfile.TemporaryDirectory() as td:
+            repo_root = Path(td)
+            self._write_project_settings(
+                repo_root,
+                enabled_mcpjson_servers=["build-runtime"],
+                allow_permissions=["mcp__build_runtime"],
+            )
+            runner = self._claude_runner_with_mcp(
+                "build-runtime: stdio python3 ./mcp_servers/build_runtime_server.py - ✓ Connected\n"
+            )
+            result = probe_execution_platform(
+                backend="claude", runner=runner, repo_root=repo_root
+            )
+
+        self.assertEqual(result["status"], "fail")
+        by_name = {c["name"]: c for c in result["checks"]}
+        self.assertTrue(by_name["claude_mcp_build_runtime_registered"]["pass"])
+        self.assertFalse(by_name["claude_mcp_build_runtime_permission_granted"]["pass"])
+        self.assertIn(
+            "accepted_aliases=['build-runtime']",
+            by_name["claude_mcp_build_runtime_permission_granted"]["detail"],
+        )
+
+    def test_probe_claude_mcp_registry_server_deny_blocks_individual_allows(self) -> None:
+        """server 単位 deny は個別 tool allow があっても全 tool を block し permission fail。"""
+        with tempfile.TemporaryDirectory() as td:
+            repo_root = Path(td)
+            self._write_project_settings(
+                repo_root,
+                enabled_mcpjson_servers=["build-runtime"],
+                allow_permissions=[
+                    "mcp__build-runtime__run_linter",
+                    "mcp__build-runtime__compile_project",
+                    "mcp__build-runtime__run_program",
+                    "mcp__build-runtime__run_quality_checks",
+                ],
+                deny_permissions=["mcp__build-runtime"],
+            )
+            runner = self._claude_runner_with_mcp("")
+            result = probe_execution_platform(
+                backend="claude", runner=runner, repo_root=repo_root
+            )
+
+        self.assertEqual(result["status"], "fail")
+        by_name = {c["name"]: c for c in result["checks"]}
+        self.assertFalse(by_name["claude_mcp_build_runtime_permission_granted"]["pass"])
+        self.assertIn(
+            "server_denied=True",
+            by_name["claude_mcp_build_runtime_permission_granted"]["detail"],
+        )
+
+    def test_probe_claude_mcp_registry_passes_without_detect_build_system_grant(
+        self,
+    ) -> None:
+        """detect_build_system は advisory: 個別 grant に含めなくても permission pass。"""
+        with tempfile.TemporaryDirectory() as td:
+            repo_root = Path(td)
+            self._write_project_settings(
+                repo_root,
+                enabled_mcpjson_servers=["build-runtime"],
+                # detect_build_system を意図的に省く
+                allow_permissions=[
+                    "mcp__build-runtime__run_linter",
+                    "mcp__build-runtime__compile_project",
+                    "mcp__build-runtime__run_program",
+                    "mcp__build-runtime__run_quality_checks",
+                ],
+            )
+            runner = self._claude_runner_with_mcp("")
+            result = probe_execution_platform(
+                backend="claude", runner=runner, repo_root=repo_root
+            )
+
+        self.assertEqual(result["status"], "pass")
+        by_name = {c["name"]: c for c in result["checks"]}
+        self.assertTrue(by_name["claude_mcp_build_runtime_permission_granted"]["pass"])
+
+    def test_probe_claude_mcp_registry_handles_non_list_permissions_without_crash(
+        self,
+    ) -> None:
+        """`permissions.allow` が非 list (null) でも TypeError で abort せず permission fail。"""
+        with tempfile.TemporaryDirectory() as td:
+            repo_root = Path(td)
+            claude_dir = repo_root / ".claude"
+            claude_dir.mkdir(parents=True, exist_ok=True)
+            (claude_dir / "settings.json").write_text(
+                json.dumps(
+                    {
+                        "enabledMcpjsonServers": ["build-runtime"],
+                        "permissions": {"allow": None, "deny": "not-a-list"},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            runner = self._claude_runner_with_mcp("")
+            # 例外を投げず status=fail に落ちることを確認 (preflight abort しない)
+            result = probe_execution_platform(
+                backend="claude", runner=runner, repo_root=repo_root
+            )
+
+        self.assertEqual(result["status"], "fail")
+        by_name = {c["name"]: c for c in result["checks"]}
+        self.assertFalse(by_name["claude_mcp_build_runtime_permission_granted"]["pass"])
+
+    def test_probe_claude_mcp_registry_passes_when_default_mode_bypass_permissions(
+        self,
+    ) -> None:
+        """`permissions.defaultMode=bypassPermissions` は全 tool 無条件許可で permission pass。"""
+        with tempfile.TemporaryDirectory() as td:
+            repo_root = Path(td)
+            self._write_project_settings(
+                repo_root,
+                enabled_mcpjson_servers=["build-runtime"],
+                default_mode="bypassPermissions",
+            )
+            runner = self._claude_runner_with_mcp(
+                "build-runtime: stdio python3 ./mcp_servers/build_runtime_server.py - ✓ Connected\n"
+            )
+            result = probe_execution_platform(
+                backend="claude", runner=runner, repo_root=repo_root
+            )
+
+        self.assertEqual(result["status"], "pass")
+        by_name = {c["name"]: c for c in result["checks"]}
+        self.assertTrue(by_name["claude_mcp_build_runtime_permission_granted"]["pass"])
+        self.assertIn(
+            "bypassPermissions",
+            by_name["claude_mcp_build_runtime_permission_granted"]["detail"],
+        )
+
+    def test_probe_claude_mcp_registry_permission_granted_via_local_settings(self) -> None:
+        """`.claude/settings.local.json` の permissions.allow も grant として合算される。"""
+        with tempfile.TemporaryDirectory() as td:
+            repo_root = Path(td)
+            self._write_project_settings(
+                repo_root,
+                enabled_mcpjson_servers=["build-runtime"],
+                local_allow_permissions=["mcp__build-runtime"],
+            )
+            runner = self._claude_runner_with_mcp("")
+            result = probe_execution_platform(
+                backend="claude", runner=runner, repo_root=repo_root
+            )
+
+        self.assertEqual(result["status"], "pass")
+        by_name = {c["name"]: c for c in result["checks"]}
+        self.assertTrue(by_name["claude_mcp_build_runtime_permission_granted"]["pass"])
 
     def test_probe_execution_platform_uses_explicit_agent_command(self) -> None:
         seen = {"command": ""}

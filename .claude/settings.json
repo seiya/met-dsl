@@ -2,6 +2,7 @@
   "enabledMcpjsonServers": ["build-runtime"],
   "permissions": {
     "allow": [
+      "mcp__build-runtime",
       "Bash(python3 tools/orchestration_runtime.py *)",
       "Bash(python3 tools/new_agent_run_id.py)",
       "Bash(python3 tools/run_workflow.py *)",
