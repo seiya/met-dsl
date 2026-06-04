@@ -9268,73 +9268,119 @@ _BACKEND_PROBERS: dict[
 
 _CLAUDE_MCP_BUILD_RUNTIME_SERVER_RELPATH = "mcp_servers/build_runtime_server.py"
 _CLAUDE_MCP_BUILD_RUNTIME_NAME_TOKENS = ("build-runtime", "build_runtime")
-_CLAUDE_USER_SETTINGS_PATH = Path.home() / ".claude.json"
+# enablement の canonical source は repo にコミットされる project settings。`~/.claude.json`
+# (per-user / per-machine の trust 履歴) は意図的に参照しない — マシン依存で preflight 結果が
+# 揺れる原因になるため (再現性優先)。
+_CLAUDE_PROJECT_SETTINGS_RELPATH = ".claude/settings.json"
+_CLAUDE_PROJECT_LOCAL_SETTINGS_RELPATH = ".claude/settings.local.json"
+_MCP_JSON_RELPATH = ".mcp.json"
 _CLAUDE_MCP_REMEDIATION = (
-    "build-runtime MCP server is not enabled for this project in the Claude Code "
-    "session (~/.claude.json `projects.<repo>.{mcpServers,enabledMcpjsonServers}`). "
-    "Required tools (run_linter, compile_project, run_program, run_quality_checks, "
-    "detect_build_system) are needed by Generate/Build/Validate phases. "
-    "Remediation: (1) launch `claude` interactively from the repo root and accept "
-    "the workspace trust prompt that enables `build-runtime` from the repo-shipped "
-    "`.mcp.json`, or (2) run `claude mcp add-json --scope project build-runtime ...` "
-    "using the snippet in `mcp_servers/mcp_servers.example.json`. "
+    "build-runtime MCP server is not enabled for this project via the repo-committed "
+    "`.claude/settings.json`. Required tools (run_linter, compile_project, run_program, "
+    "run_quality_checks, detect_build_system) are needed by Generate/Build/Validate phases. "
+    "Remediation: add `\"enabledMcpjsonServers\": [\"build-runtime\"]` (or "
+    "`\"enableAllProjectMcpServers\": true`) to the top level of the committed "
+    "`.claude/settings.json`, and ensure no `disabledMcpjsonServers` entry for build-runtime "
+    "exists in `.claude/settings.json` / `.claude/settings.local.json`. "
     "Reference: `mcp_servers/README.md`."
 )
 
 
-def _read_claude_project_enabled_mcp_servers(
-    repo_root: Path,
-    *,
-    settings_path: Path | None = None,
-) -> tuple[set[str] | None, str]:
-    """`~/.claude.json` から target repo に対する enabled MCP server 名集合を読み出す。
+def _load_json_object(path: Path) -> tuple[dict[str, Any] | None, str | None]:
+    """path から JSON object を読む。返り値 (obj, error)。
 
-    返り値は (servers, detail)。servers は次の集合演算で得る:
-        (projects.<abs_repo>.mcpServers のキー)
-        ∪ (projects.<abs_repo>.enabledMcpjsonServers)
-        ∪ (top-level mcpServers のキー; user-scope)
-        − projects.<abs_repo>.disabledMcpjsonServers
-
-    settings 不在 / 該当 project entry 不在 / 形不正の場合は (None, 説明) を返す。
-    None は「未判定」を意味し、gate fail として扱う (Claude Code に未認知の workspace
-    では Agent 側で `mcp__build-runtime__*` tool が露出しない)。
+    存在しなければ (None, None)（呼び出し側で「無し」を扱える）。読み込み/parse 失敗や
+    非 object は (None, error_string) を返す。
     """
-    path = settings_path if settings_path is not None else _CLAUDE_USER_SETTINGS_PATH
     if not path.exists():
-        return None, f"settings_missing ({path})"
+        return None, None
     try:
         with path.open("r", encoding="utf-8") as fh:
             data = json.load(fh)
     except (json.JSONDecodeError, OSError) as exc:
-        return None, f"settings_read_error ({path}): {type(exc).__name__}: {exc}"
+        return None, f"read_error ({path}): {type(exc).__name__}: {exc}"
     if not isinstance(data, dict):
-        return None, f"settings_not_object ({path})"
+        return None, f"not_object ({path})"
+    return data, None
 
-    abs_repo = str(repo_root.resolve())
-    projects = data.get("projects")
-    proj_entry: dict[str, Any] = {}
-    if isinstance(projects, dict):
-        cand = projects.get(abs_repo)
-        if isinstance(cand, dict):
-            proj_entry = cand
+
+def _read_repo_enabled_mcp_servers(
+    repo_root: Path,
+    *,
+    settings_path: Path | None = None,
+    local_settings_path: Path | None = None,
+    mcp_json_path: Path | None = None,
+) -> tuple[set[str] | None, str]:
+    """repo にコミットされた project settings から enabled MCP server 名集合を読み出す。
+
+    canonical source は `<repo>/.claude/settings.json` (flat key)。`~/.claude.json`
+    (per-user / per-machine の trust 履歴) は意図的に参照しない — マシン依存で結果が揺れる
+    のを避け再現性を担保するため。集合は次の演算で得る:
+        (.claude/settings.json: enabledMcpjsonServers)
+        ∪ (enableAllProjectMcpServers=true のとき .mcp.json の mcpServers キー全部)
+        − (.claude/settings.json: disabledMcpjsonServers)
+        − (.claude/settings.local.json: disabledMcpjsonServers)   # 個人 opt-out 検出
+
+    `.claude/settings.json` 不在 / 不正 JSON / 非 object の場合は (None, 説明) を返す。
+    None は「未判定」を意味し gate fail として扱う (repo が未構成)。
+
+    既知の割り切り: `~/.claude.json` の disabledMcpjsonServers による opt-out は見ないため、
+    その経路で無効化したユーザーは false-pass しうる (再現性優先で許容)。
+    """
+    settings = (
+        settings_path
+        if settings_path is not None
+        else repo_root / _CLAUDE_PROJECT_SETTINGS_RELPATH
+    )
+    local_settings = (
+        local_settings_path
+        if local_settings_path is not None
+        else repo_root / _CLAUDE_PROJECT_LOCAL_SETTINGS_RELPATH
+    )
+    mcp_json = (
+        mcp_json_path if mcp_json_path is not None else repo_root / _MCP_JSON_RELPATH
+    )
+
+    data, err = _load_json_object(settings)
+    if data is None:
+        if err is not None:
+            return None, f"project_settings_{err}"
+        return None, f"project_settings_missing ({settings})"
 
     enabled: set[str] = set()
-    proj_mcp = proj_entry.get("mcpServers")
-    if isinstance(proj_mcp, dict):
-        enabled.update(str(k) for k in proj_mcp.keys() if isinstance(k, str))
-    proj_enabled = proj_entry.get("enabledMcpjsonServers")
-    if isinstance(proj_enabled, list):
-        enabled.update(str(x) for x in proj_enabled if isinstance(x, str))
-    top_mcp = data.get("mcpServers")
-    if isinstance(top_mcp, dict):
-        enabled.update(str(k) for k in top_mcp.keys() if isinstance(k, str))
-    proj_disabled = proj_entry.get("disabledMcpjsonServers")
-    if isinstance(proj_disabled, list):
-        for x in proj_disabled:
+    enabled_list = data.get("enabledMcpjsonServers")
+    if isinstance(enabled_list, list):
+        enabled.update(str(x) for x in enabled_list if isinstance(x, str))
+
+    enable_all = data.get("enableAllProjectMcpServers") is True
+    if enable_all:
+        mcp_data, _mcp_err = _load_json_object(mcp_json)
+        if isinstance(mcp_data, dict):
+            mcp_servers = mcp_data.get("mcpServers")
+            if isinstance(mcp_servers, dict):
+                enabled.update(str(k) for k in mcp_servers.keys() if isinstance(k, str))
+
+    disabled_proj = data.get("disabledMcpjsonServers")
+    if isinstance(disabled_proj, list):
+        for x in disabled_proj:
             if isinstance(x, str):
                 enabled.discard(x)
 
-    detail = f"project_entry_found={bool(proj_entry)}; enabled_servers={sorted(enabled)}"
+    local_disabled: set[str] = set()
+    local_data, _local_err = _load_json_object(local_settings)
+    if isinstance(local_data, dict):
+        local_disabled_list = local_data.get("disabledMcpjsonServers")
+        if isinstance(local_disabled_list, list):
+            local_disabled.update(
+                str(x) for x in local_disabled_list if isinstance(x, str)
+            )
+            enabled.difference_update(local_disabled)
+
+    detail = (
+        f"settings={settings}; enable_all={enable_all}; "
+        f"enabled_servers={sorted(enabled)}; "
+        f"local_disabled={sorted(local_disabled)}"
+    )
     return enabled, detail
 
 
@@ -9344,11 +9390,16 @@ def _probe_claude_mcp_registry(
     runner: Callable[..., subprocess.CompletedProcess[str]],
     *,
     settings_path: Path | None = None,
+    local_settings_path: Path | None = None,
+    mcp_json_path: Path | None = None,
 ) -> tuple[list[dict[str, Any]], bool]:
     """Claude session が target repo で build-runtime MCP tool を露出するかを判定する。
 
-    canonical signal は `~/.claude.json` の trust state (`projects.<abs_repo>.{mcpServers,
-    enabledMcpjsonServers} − disabledMcpjsonServers` ∪ top-level `mcpServers`)。
+    canonical signal は repo にコミットされた `<repo>/.claude/settings.json`
+    (`enabledMcpjsonServers` / `enableAllProjectMcpServers` − `disabledMcpjsonServers`、
+    及び `.claude/settings.local.json` の disable 減算)。`~/.claude.json` (per-user /
+    per-machine の trust 履歴) は参照しない — マシン依存で preflight 結果が揺れる原因に
+    なるため (再現性優先)。
     `claude mcp list` は trust dialog を skip して stdio server を spawn するため
     false-positive (workspace 未信頼でも `✓ Connected` を返す) を起こす — 補助 diagnostic
     として扱い preflight gate には使わない (Codex review P1)。`mcp list` の timeout は
@@ -9371,8 +9422,11 @@ def _probe_claude_mcp_registry(
             True,
         )
 
-    enabled_servers, settings_detail = _read_claude_project_enabled_mcp_servers(
-        repo_root, settings_path=settings_path
+    enabled_servers, settings_detail = _read_repo_enabled_mcp_servers(
+        repo_root,
+        settings_path=settings_path,
+        local_settings_path=local_settings_path,
+        mcp_json_path=mcp_json_path,
     )
     build_runtime_token_set = {tok for tok in _CLAUDE_MCP_BUILD_RUNTIME_NAME_TOKENS}
     if enabled_servers is None:
@@ -9434,7 +9488,7 @@ def _probe_claude_mcp_registry(
 
     registered_detail_parts: list[str] = [
         f"session_enabled={session_enabled}",
-        f"settings_signal={settings_detail}",
+        f"repo_settings_signal={settings_detail}",
         f"mcp_list_advisory: in_list={name_listed}, healthy={healthy}",
         f"server_file_present={server_present} ({_CLAUDE_MCP_BUILD_RUNTIME_SERVER_RELPATH}; diagnostic only)",
     ]
