@@ -7860,8 +7860,22 @@ def check_step_completed(
 def enable_checkpoint_resume(
     repo_root: Path,
     orchestration_id: str,
+    *,
+    spec_ref: str | None = None,
+    source_dependency_ref: str | None = None,
 ) -> dict[str, Any]:
     """orchestration_meta.json に resume_enabled=true を設定する。
+
+    `spec_ref` / `source_dependency_ref` が指定された場合のみ meta を更新する
+    (resume 時に CLI で override された値を meta へ反映し、次回 resume の復元元が
+    stale にならないようにするため)。未指定時は既存 meta を保持する。
+
+    既に terminal status (pass / fail / fail_closed / blocked / timeout / cancel) で
+    終端した orchestration を resume する場合、live status を `running` へ戻す。
+    `update_orchestration_status` は terminal → 他 status の遷移を `fail` → `fail_closed`
+    を除き reject するため、reset しないと resume した agent が完了しても `pass` を記録
+    できず、resume が成立しない。prior terminal の narrative は `resumed_from_*` に退避し、
+    failure_analysis.json / phase_state_log に履歴が残る。
 
     orchestration が存在しない場合は RuntimeError を送出する。
     """
@@ -7879,8 +7893,56 @@ def enable_checkpoint_resume(
         raise RuntimeError(f"orchestration_meta.json is invalid: {meta_path}")
     meta["resume_enabled"] = True
     meta["resumed_at"] = _utc_now_iso()
+    if isinstance(spec_ref, str) and spec_ref.strip():
+        meta["spec_ref"] = spec_ref.strip()
+    if isinstance(source_dependency_ref, str) and source_dependency_ref.strip():
+        meta["source_dependency_ref"] = source_dependency_ref.strip()
+    prior_status = meta.get("status")
+    terminal_reset = (
+        isinstance(prior_status, str) and prior_status in IDEMPOTENT_TERMINAL_STATUSES
+    )
+    if terminal_reset:
+        # Archive the prior terminal narrative, then hand the resumed run a fresh
+        # in-progress lifecycle so its eventual set-status(pass/fail) is a valid
+        # forward transition from `running` rather than a rejected terminal-to-terminal one.
+        meta["resumed_from_status"] = prior_status
+        for live_field, archive_field in (
+            ("reason_code", "resumed_from_reason_code"),
+            ("reason_detail", "resumed_from_reason_detail"),
+            ("blocking_policy_scope", "resumed_from_blocking_policy_scope"),
+        ):
+            if meta.get(live_field) is not None:
+                meta[archive_field] = meta.get(live_field)
+                meta.pop(live_field, None)
+        meta.pop("finished_at", None)
+        meta.pop("detected_at", None)
+        meta["status"] = "running"
+        # Drop the prior terminalization's cleanup_committed marker so the resumed
+        # run's eventual terminalization performs a clean two-phase commit and the
+        # validator does not treat reused orch tmp as already revoked.
+        orch_arid = meta.get("orchestration_agent_run_id")
+        if isinstance(orch_arid, str) and orch_arid.strip():
+            marker = _cleanup_committed_marker_path(
+                repo_root, orchestration_id, orch_arid.strip()
+            )
+            try:
+                marker.unlink()
+            except FileNotFoundError:
+                pass
     _write_json(meta_path, meta)
     merge_phase_state_for_resume(repo_root, orchestration_id)
+    if terminal_reset:
+        _append_phase_state_log(
+            repo_root,
+            orchestration_id,
+            {
+                "ts": _utc_now_iso(),
+                "event": "resume_status_reset",
+                "from": prior_status,
+                "to": "running",
+                "note": "terminal status reset to running for checkpoint resume",
+            },
+        )
     return meta
 
 
@@ -12387,7 +12449,7 @@ def main(argv: list[str] | None = None) -> int:
     init_parser.add_argument(
         "--resume-from-checkpoint",
         action="store_true",
-        help="Enable checkpoint resume on an existing orchestration (sets resume_enabled).",
+        help="Enable checkpoint resume on an existing orchestration (sets resume_enabled; resets a terminal status back to running).",
     )
 
     preflight_parser = subparsers.add_parser("preflight")
@@ -12761,6 +12823,8 @@ def main(argv: list[str] | None = None) -> int:
             result = enable_checkpoint_resume(
                 repo_root=repo_root,
                 orchestration_id=args.orchestration_id,
+                spec_ref=args.spec_ref,
+                source_dependency_ref=args.source_dependency_ref,
             )
         else:
             result = init_orchestration(

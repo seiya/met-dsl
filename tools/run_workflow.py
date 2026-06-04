@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shutil
 import shlex
 import subprocess
@@ -40,6 +41,10 @@ except ModuleNotFoundError:  # pragma: no cover - direct CLI execution
 
 SUPPORTED_LLMS = ("codex", "cursor", "claude")
 SUPPORTED_WORKFLOW_MODES = ("dev", "prod")
+# Applied when --llm / --mode are omitted on a non-resume run. Kept as the
+# historical defaults so plain `run_workflow.py <spec> <phase>` is unchanged.
+DEFAULT_LLM = "codex"
+DEFAULT_WORKFLOW_MODE = "dev"
 DEFAULT_LLM_COMMANDS = {
     "codex": "codex",
     "cursor": "cursor",
@@ -411,6 +416,14 @@ def _collect_failure_analysis(repo_root: Path, orchestration_id: str) -> dict[st
 _FAILURE_STATUS_VALUES: frozenset[str] = frozenset(
     {"fail", "fail_closed", "blocked", "timeout", "cancel"}
 )
+# Statuses that make an orchestration safe to auto-select as "the latest" for
+# implicit (`--resume` without `--orchestration-id`) resume. A non-terminal status
+# (e.g. `running`) is ambiguous — it may be an active concurrent run whose shared
+# workspace/tmp/<arid> resume would clobber, or a crashed run — so implicit resume
+# refuses it and asks for an explicit id.
+_RESUMABLE_TERMINAL_STATUSES: frozenset[str] = frozenset(
+    {"pass", "fail", "fail_closed", "blocked", "timeout", "cancel"}
+)
 
 
 def _is_valid_failure_analysis(
@@ -648,22 +661,131 @@ def _ensure_preflight_pass(preflight: dict[str, Any]) -> tuple[bool, str]:
     return True, "pass"
 
 
+def _find_latest_orchestration(repo_root: Path) -> str | None:
+    """Return the most recent orchestration_id under workspace/orchestrations.
+
+    Ranking uses orchestration_meta.json#started_at (UTC ISO8601, microsecond
+    precision — chronologically sortable as text) rather than the directory name.
+    A lexical max over ids is wrong because: (1) ids may be caller-supplied via
+    --orchestration-id (e.g. `orch_unit`) and would sort after timestamp ids like
+    `orch_202606...`, and (2) ids generated in the same second differ only by a
+    random suffix, so name order is not creation order. Orchestrations whose meta
+    lacks a usable started_at sort oldest; the id is a deterministic tie-breaker.
+
+    Any subdirectory carrying an orchestration_meta.json is an orchestration —
+    the id need not start with `orch_`, since --orchestration-id accepts arbitrary
+    caller-supplied ids and those runs must remain resumable as "the latest".
+    """
+    orch_root = repo_root / "workspace" / "orchestrations"
+    if not orch_root.is_dir():
+        return None
+    candidates: list[tuple[str, str]] = []
+    for path in orch_root.iterdir():
+        if not path.is_dir():
+            continue
+        meta = _read_json_if_exists(path / "orchestration_meta.json")
+        if not isinstance(meta, dict):
+            continue
+        started_at = meta.get("started_at")
+        started_key = started_at.strip() if isinstance(started_at, str) else ""
+        candidates.append((started_key, path.name))
+    if not candidates:
+        return None
+    # max over (started_at, id): newest start wins; equal/empty starts fall back
+    # to a stable lexical id tie-break.
+    return max(candidates, key=lambda item: (item[0], item[1]))[1]
+
+
+def _extract_prompt_params(prompt_text: str) -> dict[str, str]:
+    """Recover startup params embedded by _build_orchestration_prompt().
+
+    Returns whichever of {until_phase, mode, spec_ref} can be parsed from the
+    `orchestration.start.prompt.txt` body. A round-trip unit test pins this
+    extractor to the prompt format so a wording change cannot silently break it.
+    """
+    found: dict[str, str] = {}
+    mode_match = re.search(r"workflow_mode:\s*`([^`]+)`", prompt_text)
+    if mode_match:
+        found["mode"] = mode_match.group(1).strip()
+    phase_match = re.search(r"終了 phase:\s*`([^`]+)`", prompt_text)
+    if phase_match:
+        found["until_phase"] = phase_match.group(1).strip()
+    spec_match = re.search(r"target_spec_ref:\s*`([^`]+)`", prompt_text)
+    if spec_match:
+        found["spec_ref"] = spec_match.group(1).strip()
+    return found
+
+
+def _load_resume_params(repo_root: Path, orchestration_id: str) -> dict[str, str | None]:
+    """Recover launch params for a resume from an orchestration's existing artifacts.
+
+    No dedicated params file is persisted: every value is recovered from artifacts
+    that run_workflow.py already writes on every start.
+    - spec_ref / source_dependency_ref ← orchestration_meta.json
+    - llm                              ← preflight.json#backend
+    - llm_command                      ← preflight.json#probe_command
+    - until_phase / mode               ← launches/orchestration.start.prompt.txt
+    Missing/unparseable values are returned as None for the caller to validate.
+    """
+    orch_root = repo_root / "workspace" / "orchestrations" / orchestration_id
+    meta = _read_json_if_exists(orch_root / "orchestration_meta.json") or {}
+    preflight = _read_json_if_exists(orch_root / "preflight.json") or {}
+    prompt_path = orch_root / "launches" / "orchestration.start.prompt.txt"
+    prompt_text = prompt_path.read_text(encoding="utf-8") if prompt_path.exists() else ""
+    prompt_params = _extract_prompt_params(prompt_text)
+
+    def _clean(value: Any) -> str | None:
+        return value.strip() if isinstance(value, str) and value.strip() else None
+
+    return {
+        "spec_ref": _clean(meta.get("spec_ref")) or prompt_params.get("spec_ref"),
+        "source_dependency_ref": _clean(meta.get("source_dependency_ref")),
+        "llm": _clean(preflight.get("backend")),
+        # probe_command is the agent command run_workflow used for both preflight
+        # and launch on the original run; reuse it so a custom --llm-command (e.g.
+        # a wrapper / non-PATH binary) survives resume.
+        "llm_command": _clean(preflight.get("probe_command")),
+        "until_phase": prompt_params.get("until_phase"),
+        "mode": prompt_params.get("mode"),
+    }
+
+
 def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Bootstrap workflow startup (init + preflight + prompt).",
     )
-    parser.add_argument("spec_ref", help="Target spec path/reference.")
-    parser.add_argument("until_phase", help="Final phase to execute (compile/generate/build/validate).")
+    parser.add_argument(
+        "spec_ref",
+        nargs="?",
+        help="Target spec path/reference. Optional with --resume (recovered from the resumed orchestration).",
+    )
+    parser.add_argument(
+        "until_phase",
+        nargs="?",
+        help=(
+            "Final phase to execute (compile/generate/build/validate). "
+            "Optional with --resume (recovered from the resumed orchestration)."
+        ),
+    )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help=(
+            "Resume the latest orchestration (or --orchestration-id) from its checkpoint. "
+            "spec_ref / until_phase / --llm / --mode are recovered from the resumed "
+            "orchestration when omitted."
+        ),
+    )
     parser.add_argument(
         "--mode",
-        default="dev",
+        default=None,
         choices=SUPPORTED_WORKFLOW_MODES,
         help="Workflow execution mode: dev (default) or prod.",
     )
-    parser.add_argument("--llm", default="codex", choices=SUPPORTED_LLMS)
+    parser.add_argument("--llm", default=None, choices=SUPPORTED_LLMS)
     parser.add_argument("--llm-command", help="Override backend command used by preflight and optional launch.")
     parser.add_argument("--repo-root", default=".")
-    parser.add_argument("--orchestration-id", help="If omitted, generated automatically.")
+    parser.add_argument("--orchestration-id", help="If omitted, generated automatically (or, with --resume, the latest orchestration).")
     parser.add_argument("--status", default="running", help="Initial orchestration status for init.")
     parser.set_defaults(invoke_llm=True)
     parser.add_argument(
@@ -708,14 +830,141 @@ def main(argv: list[str] | None = None) -> int:
             )
         )
         return 2
-    try:
-        workflow_mode = _normalize_workflow_mode(args.mode)
-        until_phase = _normalize_phase(args.until_phase)
-        repo_root = Path(args.repo_root).resolve()
+    repo_root = Path(args.repo_root).resolve()
+
+    # Resolve effective startup inputs. With --resume, omitted spec_ref /
+    # until_phase / --llm / --mode are recovered from the target orchestration's
+    # existing artifacts (orchestration_meta.json + preflight.json + the start
+    # prompt). Without --resume the historical defaults (codex / dev) apply.
+    resume_mode = bool(args.resume)
+    # Recovered resume metadata (populated in the resume branch). The reuse decision
+    # in the try block compares the effective spec/backend against these to tell an
+    # actual change from an explicit no-op restate.
+    resume_recovered_spec_ref: str | None = None
+    resume_recovered_dep_ref: str | None = None
+    resume_recovered_llm: str | None = None
+    resume_recovered_llm_command: str | None = None
+    if resume_mode:
+        explicit_id = bool(args.orchestration_id)
+        orchestration_id = args.orchestration_id or _find_latest_orchestration(repo_root)
+        if not orchestration_id:
+            print(
+                json.dumps(
+                    {
+                        "status": "fail",
+                        "reason": "no_resumable_orchestration",
+                        "detail": "no orchestration found under workspace/orchestrations to resume",
+                    },
+                    ensure_ascii=False,
+                )
+            )
+            return 2
+        if not explicit_id:
+            # Implicit "latest" must be a terminalized run. A non-terminal latest
+            # (e.g. an active concurrent `running` orchestration) would share its
+            # orchestration_agent_run_id, and resume's tmp cleanup could delete the
+            # live run's workspace/tmp/<arid>. Require an explicit id in that case.
+            latest_meta = _read_json_if_exists(
+                repo_root / "workspace" / "orchestrations" / orchestration_id / "orchestration_meta.json"
+            ) or {}
+            latest_status = str(latest_meta.get("status") or "").strip().lower()
+            if latest_status not in _RESUMABLE_TERMINAL_STATUSES:
+                print(
+                    json.dumps(
+                        {
+                            "status": "fail",
+                            "reason": "latest_orchestration_not_resumable",
+                            "detail": (
+                                f"latest orchestration {orchestration_id} has non-terminal status "
+                                f"'{latest_status or 'unknown'}'; pass --orchestration-id to resume a specific run"
+                            ),
+                            "orchestration_id": orchestration_id,
+                        },
+                        ensure_ascii=False,
+                    )
+                )
+                return 2
+        recovered = _load_resume_params(repo_root, orchestration_id)
+        spec_ref_arg = args.spec_ref
+        until_phase_arg = args.until_phase
+        # A lone positional is ambiguous on resume: argparse binds it to spec_ref,
+        # but overriding until_phase (e.g. extending the run further) is the common
+        # case while overriding spec_ref is not. If only spec_ref was given and it
+        # names a known phase, treat it as the until_phase override instead.
+        if spec_ref_arg and not until_phase_arg and spec_ref_arg.strip().lower() in PHASE_ALIASES:
+            until_phase_arg = spec_ref_arg
+            spec_ref_arg = None
+        spec_ref_in = spec_ref_arg or recovered.get("spec_ref")
+        until_phase_in = until_phase_arg or recovered.get("until_phase")
+        llm_in = args.llm or recovered.get("llm")
+        mode_in = args.mode or recovered.get("mode")
+        # Carry the recovered values; the reuse decision happens in the try block
+        # below, keyed on whether the *effective* spec/backend actually changed
+        # (not merely whether the arg was passed) — passing the same value
+        # explicitly must still reuse the recovered dependency/command.
+        resume_recovered_spec_ref = recovered.get("spec_ref")
+        resume_recovered_dep_ref = recovered.get("source_dependency_ref")
+        resume_recovered_llm = recovered.get("llm")
+        resume_recovered_llm_command = recovered.get("llm_command")
+        missing = [
+            name
+            for name, value, ok in (
+                ("spec_ref", spec_ref_in, bool(spec_ref_in)),
+                ("until_phase", until_phase_in, bool(until_phase_in)),
+                ("llm", llm_in, llm_in in SUPPORTED_LLMS),
+                ("mode", mode_in, bool(mode_in)),
+            )
+            if not ok
+        ]
+        if missing:
+            print(
+                json.dumps(
+                    {
+                        "status": "fail",
+                        "reason": "resume_params_unrecoverable",
+                        "detail": (
+                            f"could not recover {', '.join(missing)} for orchestration "
+                            f"{orchestration_id}; pass them explicitly"
+                        ),
+                        "orchestration_id": orchestration_id,
+                    },
+                    ensure_ascii=False,
+                )
+            )
+            return 2
+    else:
         orchestration_id = args.orchestration_id or _new_orchestration_id()
-        llm_command = args.llm_command or DEFAULT_LLM_COMMANDS[args.llm]
-        spec_ref = _canonicalize_spec_ref(repo_root, args.spec_ref)
-        source_dependency_ref = _discover_source_dependency_ref(repo_root, spec_ref)
+        spec_ref_in = args.spec_ref
+        until_phase_in = args.until_phase
+        llm_in = args.llm or DEFAULT_LLM
+        mode_in = args.mode or DEFAULT_WORKFLOW_MODE
+
+    try:
+        workflow_mode = _normalize_workflow_mode(mode_in)
+        if not until_phase_in:
+            raise ValueError("until_phase is required unless --resume is set")
+        until_phase = _normalize_phase(until_phase_in)
+        llm = llm_in
+        # Reuse the recovered agent command unless --llm-command was given or the
+        # backend actually changed; restating the same --llm must keep the command.
+        if args.llm_command:
+            llm_command = args.llm_command
+        elif resume_recovered_llm_command and llm == resume_recovered_llm:
+            llm_command = resume_recovered_llm_command
+        else:
+            llm_command = DEFAULT_LLM_COMMANDS[llm]
+        if not spec_ref_in:
+            raise ValueError("spec_ref is required unless --resume is set")
+        spec_ref = _canonicalize_spec_ref(repo_root, spec_ref_in)
+        # Reuse the recovered dependency ref when the spec is unchanged (compared
+        # canonically, so restating the same spec still counts as unchanged).
+        # Format-validate only — no existence check — so resume stays stable even if
+        # the dependency file moved/was renamed after the original run. A genuine
+        # spec change rediscovers the dependency next to the new spec.
+        if resume_recovered_dep_ref and spec_ref == resume_recovered_spec_ref:
+            source_dependency_ref = _validate_source_dependency_ref(resume_recovered_dep_ref)
+        else:
+            source_dependency_ref = _discover_source_dependency_ref(repo_root, spec_ref)
     except ValueError as exc:
         print(
             json.dumps(
@@ -785,20 +1034,41 @@ def main(argv: list[str] | None = None) -> int:
     env["PYTHONPATH"] = str(repo_root) + (f":{env['PYTHONPATH']}" if env.get("PYTHONPATH") else "")
 
     try:
-        init_args = [
-            "init",
-            "--repo-root",
-            str(repo_root),
-            "--orchestration-id",
-            orchestration_id,
-            "--spec-ref",
-            spec_ref,
-            "--status",
-            args.status,
-            "--agent-backend",
-            args.llm,
-        ]
-        init_args.extend(["--source-dependency-ref", source_dependency_ref])
+        if resume_mode:
+            # Resume an existing orchestration: enable checkpoint resume (sets
+            # resume_enabled=true and preserves orchestration_agent_run_id) instead
+            # of re-initializing. The returned meta carries orchestration_agent_run_id.
+            # Pass the resolved spec/dependency refs so meta stays in sync when they
+            # were overridden on the CLI — otherwise a later implicit resume would
+            # recover the stale meta value and revert the override.
+            init_args = [
+                "init",
+                "--repo-root",
+                str(repo_root),
+                "--orchestration-id",
+                orchestration_id,
+                "--resume-from-checkpoint",
+                "--spec-ref",
+                spec_ref,
+                "--source-dependency-ref",
+                source_dependency_ref,
+            ]
+        else:
+            init_args = [
+                "init",
+                "--repo-root",
+                str(repo_root),
+                "--orchestration-id",
+                orchestration_id,
+                "--spec-ref",
+                spec_ref,
+                "--status",
+                args.status,
+                "--agent-backend",
+                llm,
+                "--source-dependency-ref",
+                source_dependency_ref,
+            ]
         try:
             init_result = _runtime_command(repo_root, env, init_args).payload
             orchestration_agent_run_id = str(init_result.get("orchestration_agent_run_id", "")).strip()
@@ -822,7 +1092,7 @@ def main(argv: list[str] | None = None) -> int:
                     "--orchestration-id",
                     orchestration_id,
                     "--backend",
-                    args.llm,
+                    llm,
                     "--agent-command",
                     llm_command,
                 ],
@@ -897,7 +1167,7 @@ def main(argv: list[str] | None = None) -> int:
         workflow_status = "running"
         if args.invoke_llm:
             launch_command, launch_input = _launch_command_and_input(
-                llm=args.llm,
+                llm=llm,
                 llm_command=llm_command,
                 prompt_text=prompt_text,
             )
@@ -1026,9 +1296,10 @@ def main(argv: list[str] | None = None) -> int:
                 {
                     "status": "ok",
                     "orchestration_id": orchestration_id,
-                    "llm": args.llm,
+                    "resumed": resume_mode,
+                    "llm": llm,
                     "llm_command": llm_command,
-                    "target_spec_ref": args.spec_ref,
+                    "target_spec_ref": spec_ref,
                     "until_phase": until_phase,
                     "workflow_mode": workflow_mode,
                     "metdsl_workflow_mode": env["METDSL_WORKFLOW_MODE"],

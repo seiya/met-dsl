@@ -8,6 +8,7 @@
 - `orchestration agent` の起動手順は [skills/workflow-orchestration/SKILL.md](skills/workflow-orchestration/SKILL.md) を参照する。
 - 起動前の最小確認手順は [skills/workflow-orchestration/references/startup_contract.md](skills/workflow-orchestration/references/startup_contract.md) を参照する。
 - workflow 起動は `python3 tools/run_workflow.py <spec_ref> <until_phase> [--llm <codex|cursor|claude>]` を canonical entrypoint とする。`<until_phase>` は `compile` / `generate` / `build` / `validate` のいずれかを指定する。
+- 途中で fail した workflow の再開は `python3 tools/run_workflow.py --resume [--orchestration-id <id>]` を canonical 経路とする。`--resume` 時は `spec_ref` / `until_phase` / `--llm` / `--mode` を省略でき、対象 orchestration の既存 artifact（`orchestration_meta.json` / `preflight.json` / `launches/orchestration.start.prompt.txt`）から復元される（明示指定が優先、`--orchestration-id` 省略時は時系列最新を対象）。内部で `init --resume-from-checkpoint`（`resume_enabled=true`、terminal status を `running` へ reset）を実行する。詳細は [docs/RUNBOOK.md](docs/RUNBOOK.md) §3-1 を参照する。
 - workflow 実行時の `METDSL_WORKFLOW_MODE=1` と `METDSL_ORCHESTRATION_ID=<orchestration_id>` は `tools/run_workflow.py` が設定する値を canonical source とする。
 - 任意フロー `Tune`（実装裁量 variant 探索）と `Promote`（正式版昇格）は core workflow と分離した entrypoint で起動する（詳細は別 plan で定義）。
 

@@ -166,9 +166,18 @@ class RunWorkflowTests(unittest.TestCase):
 
     def test_parse_args_defaults(self) -> None:
         ns = run_workflow._parse_args(["spec/problem.md", "generate"])
-        self.assertEqual(ns.mode, "dev")
-        self.assertEqual(ns.llm, "codex")
+        # --mode / --llm default to None so main() can tell "omitted" from
+        # "explicitly passed"; the historical codex/dev defaults are applied in main().
+        self.assertIsNone(ns.mode)
+        self.assertIsNone(ns.llm)
+        self.assertFalse(ns.resume)
         self.assertTrue(ns.invoke_llm)
+
+    def test_parse_args_allows_omitted_positionals_for_resume(self) -> None:
+        ns = run_workflow._parse_args(["--resume", "--no-invoke-llm"])
+        self.assertTrue(ns.resume)
+        self.assertIsNone(ns.spec_ref)
+        self.assertIsNone(ns.until_phase)
 
     def test_parse_args_supports_no_invoke_flag(self) -> None:
         ns = run_workflow._parse_args(
@@ -197,6 +206,464 @@ class RunWorkflowTests(unittest.TestCase):
         )
         self.assertEqual(command, ["claude", "-p", "run workflow"])
         self.assertIsNone(stdin_text)
+
+    def test_prompt_params_roundtrip(self) -> None:
+        # The resume extractor must recover until_phase/mode/spec_ref from the
+        # exact text emitted by _build_orchestration_prompt(). This pins the two
+        # functions together so a prompt wording change that breaks resume fails here.
+        for until_phase, mode in (("Build", "dev"), ("Validate", "prod"), ("Compile", "dev")):
+            prompt = run_workflow._build_orchestration_prompt(
+                orchestration_id="orch_x",
+                orchestration_agent_run_id="arid_x",
+                spec_ref="spec/problem/test.md",
+                source_dependency_ref="spec/problem/deps.yaml",
+                until_phase=until_phase,
+                workflow_mode=mode,
+            )
+            extracted = run_workflow._extract_prompt_params(prompt)
+            self.assertEqual(extracted.get("until_phase"), until_phase)
+            self.assertEqual(extracted.get("mode"), mode)
+            self.assertEqual(extracted.get("spec_ref"), "spec/problem/test.md")
+
+    def _seed_resumable_orchestration(
+        self,
+        repo_root: Path,
+        orchestration_id: str,
+        *,
+        spec_ref: str,
+        until_phase: str,
+        mode: str,
+        backend: str,
+        started_at: str = "2026-01-01T00:00:00.000000Z",
+        source_dependency_ref: str = "spec/problem/deps.yaml",
+        probe_command: str | None = None,
+    ) -> None:
+        """Create the on-disk artifacts a resume recovers params from."""
+        orch_root = repo_root / "workspace" / "orchestrations" / orchestration_id
+        (orch_root / "launches").mkdir(parents=True, exist_ok=True)
+        dep_ref = source_dependency_ref
+        (orch_root / "orchestration_meta.json").write_text(
+            json.dumps(
+                {
+                    "orchestration_id": orchestration_id,
+                    "status": "fail",
+                    "started_at": started_at,
+                    "spec_ref": spec_ref,
+                    "source_dependency_ref": dep_ref,
+                    "orchestration_agent_run_id": "orch_agent_prev",
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+        (orch_root / "preflight.json").write_text(
+            json.dumps(
+                {
+                    "status": "pass",
+                    "backend": backend,
+                    "probe_command": probe_command if probe_command is not None else backend,
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+        prompt = run_workflow._build_orchestration_prompt(
+            orchestration_id=orchestration_id,
+            orchestration_agent_run_id="orch_agent_prev",
+            spec_ref=spec_ref,
+            source_dependency_ref=dep_ref,
+            until_phase=until_phase,
+            workflow_mode=mode,
+        )
+        (orch_root / "launches" / "orchestration.start.prompt.txt").write_text(
+            prompt, encoding="utf-8"
+        )
+
+    def _seed_spec_tree(self, repo_root: Path) -> None:
+        _seed_shape_expr_schema_into(repo_root)
+        (repo_root / "tools").mkdir(parents=True, exist_ok=True)
+        (repo_root / "workspace").mkdir(parents=True, exist_ok=True)
+        (repo_root / "spec" / "problem").mkdir(parents=True, exist_ok=True)
+        (repo_root / "spec" / "problem" / "test.md").write_text("spec\n", encoding="utf-8")
+        (repo_root / "spec" / "problem" / "deps.yaml").write_text("nodes: []\n", encoding="utf-8")
+
+    def _run_main_with_fake_runtime(
+        self, argv: list[str]
+    ) -> tuple[int, dict, list[list[str]]]:
+        observed_calls: list[list[str]] = []
+
+        def fake_runtime_command(root, env, args):  # type: ignore[no-untyped-def]
+            observed_calls.append(args)
+            if args[0] == "init":
+                return run_workflow.RuntimeResult(
+                    payload={"status": "ok", "orchestration_agent_run_id": "orch_agent_run_002"},
+                    raw_stdout="{}",
+                )
+            if args[0] == "preflight":
+                return run_workflow.RuntimeResult(
+                    payload={
+                        "status": "pass",
+                        "can_launch_step_agents": True,
+                        "can_launch_substep_agents": True,
+                    },
+                    raw_stdout="{}",
+                )
+            return run_workflow.RuntimeResult(payload={"status": "ok"}, raw_stdout="{}")
+
+        original = run_workflow._runtime_command
+        buf = io.StringIO()
+        try:
+            run_workflow._runtime_command = fake_runtime_command  # type: ignore[assignment]
+            with redirect_stdout(buf):
+                code = run_workflow.main(argv)
+        finally:
+            run_workflow._runtime_command = original  # type: ignore[assignment]
+        out = json.loads(buf.getvalue().strip().splitlines()[-1])
+        return code, out, observed_calls
+
+    def test_resume_recovers_params_and_uses_checkpoint_init(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._seed_spec_tree(repo_root)
+            self._seed_resumable_orchestration(
+                repo_root,
+                "orch_20260101T000000Z_aaaaaaaa",
+                spec_ref="spec/problem/test.md",
+                until_phase="Build",
+                mode="dev",
+                backend="claude",
+            )
+            code, out, calls = self._run_main_with_fake_runtime(
+                ["--resume", "--repo-root", str(repo_root), "--no-invoke-llm"]
+            )
+            self.assertEqual(code, 0, out)
+            self.assertEqual(out["status"], "ok")
+            self.assertTrue(out["resumed"])
+            # Latest (only) orchestration reused, params recovered from artifacts.
+            self.assertEqual(out["orchestration_id"], "orch_20260101T000000Z_aaaaaaaa")
+            self.assertEqual(out["until_phase"], "Build")
+            self.assertEqual(out["llm"], "claude")
+            self.assertEqual(out["workflow_mode"], "dev")
+            # init must use --resume-from-checkpoint (not a fresh init), and pass the
+            # resolved spec/dep refs so meta stays in sync with the resumed run.
+            init_calls = [c for c in calls if c and c[0] == "init"]
+            self.assertEqual(len(init_calls), 1)
+            self.assertIn("--resume-from-checkpoint", init_calls[0])
+            idx = init_calls[0].index("--spec-ref")
+            self.assertEqual(init_calls[0][idx + 1], "spec/problem/test.md")
+
+    def test_resume_picks_latest_by_started_at(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._seed_spec_tree(repo_root)
+            for oid, phase, started in (
+                ("orch_20260101T000000Z_aaaaaaaa", "Compile", "2026-01-01T00:00:00.000000Z"),
+                ("orch_20260301T000000Z_bbbbbbbb", "Validate", "2026-03-01T00:00:00.000000Z"),
+            ):
+                self._seed_resumable_orchestration(
+                    repo_root, oid, spec_ref="spec/problem/test.md",
+                    until_phase=phase, mode="dev", backend="codex", started_at=started,
+                )
+            code, out, _ = self._run_main_with_fake_runtime(
+                ["--resume", "--repo-root", str(repo_root), "--no-invoke-llm"]
+            )
+            self.assertEqual(code, 0, out)
+            self.assertEqual(out["orchestration_id"], "orch_20260301T000000Z_bbbbbbbb")
+            self.assertEqual(out["until_phase"], "Validate")
+
+    def test_resume_latest_uses_started_at_not_id_text(self) -> None:
+        # Regression for the lexical-max bug: the newest started_at must win even
+        # when its id sorts BEFORE another candidate, and even when a custom
+        # (non-timestamp) id that sorts lexically last is present.
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._seed_spec_tree(repo_root)
+            # newest start, but lexically-smallest id
+            self._seed_resumable_orchestration(
+                repo_root, "orch_20260101T000000Z_aaaaaaaa", spec_ref="spec/problem/test.md",
+                until_phase="Validate", mode="dev", backend="claude",
+                started_at="2026-05-01T00:00:00.000000Z",
+            )
+            # older start, lexically-larger timestamp id
+            self._seed_resumable_orchestration(
+                repo_root, "orch_20260301T000000Z_bbbbbbbb", spec_ref="spec/problem/test.md",
+                until_phase="Compile", mode="dev", backend="codex",
+                started_at="2026-02-01T00:00:00.000000Z",
+            )
+            # custom id that sorts lexically last ('u' > '2') but is oldest
+            self._seed_resumable_orchestration(
+                repo_root, "orch_unit_run", spec_ref="spec/problem/test.md",
+                until_phase="Build", mode="dev", backend="cursor",
+                started_at="2026-01-01T00:00:00.000000Z",
+            )
+            code, out, _ = self._run_main_with_fake_runtime(
+                ["--resume", "--repo-root", str(repo_root), "--no-invoke-llm"]
+            )
+            self.assertEqual(code, 0, out)
+            # The 2026-05-01 start wins despite its lexically-smaller id.
+            self.assertEqual(out["orchestration_id"], "orch_20260101T000000Z_aaaaaaaa")
+            self.assertEqual(out["until_phase"], "Validate")
+            self.assertEqual(out["llm"], "claude")
+
+    def test_resume_includes_custom_orchestration_ids(self) -> None:
+        # A run launched with a custom --orchestration-id (no `orch_` prefix) must
+        # still be resumable as "the latest" when it is the newest started.
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._seed_spec_tree(repo_root)
+            self._seed_resumable_orchestration(
+                repo_root, "orch_20260101T000000Z_aaaaaaaa", spec_ref="spec/problem/test.md",
+                until_phase="Compile", mode="dev", backend="codex",
+                started_at="2026-01-01T00:00:00.000000Z",
+            )
+            self._seed_resumable_orchestration(
+                repo_root, "customrun", spec_ref="spec/problem/test.md",
+                until_phase="Validate", mode="dev", backend="claude",
+                started_at="2026-05-01T00:00:00.000000Z",
+            )
+            code, out, _ = self._run_main_with_fake_runtime(
+                ["--resume", "--repo-root", str(repo_root), "--no-invoke-llm"]
+            )
+            self.assertEqual(code, 0, out)
+            self.assertEqual(out["orchestration_id"], "customrun")
+            self.assertEqual(out["until_phase"], "Validate")
+
+    def test_resume_reuses_recovered_dependency_ref(self) -> None:
+        # The dependency ref recorded at init must be reused on resume rather than
+        # rediscovered from the spec path, so resume stays stable even when the
+        # default deps.yaml next to the spec is absent/moved.
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            _seed_shape_expr_schema_into(repo_root)
+            (repo_root / "tools").mkdir(parents=True, exist_ok=True)
+            (repo_root / "workspace").mkdir(parents=True, exist_ok=True)
+            (repo_root / "spec" / "problem").mkdir(parents=True, exist_ok=True)
+            (repo_root / "spec" / "problem" / "test.md").write_text("spec\n", encoding="utf-8")
+            # Intentionally NO spec/problem/deps.yaml: _discover_source_dependency_ref
+            # would raise here, so success proves the recovered ref is used instead.
+            self._seed_resumable_orchestration(
+                repo_root, "orch_20260101T000000Z_aaaaaaaa", spec_ref="spec/problem/test.md",
+                until_phase="Build", mode="dev", backend="claude",
+                source_dependency_ref="spec/problem/sub/deps.yaml",
+            )
+            code, out, _ = self._run_main_with_fake_runtime(
+                ["--resume", "--repo-root", str(repo_root), "--no-invoke-llm"]
+            )
+            self.assertEqual(code, 0, out)
+            prompt = (
+                repo_root / "workspace" / "orchestrations"
+                / "orch_20260101T000000Z_aaaaaaaa" / "launches"
+                / "orchestration.start.prompt.txt"
+            ).read_text(encoding="utf-8")
+            self.assertIn("spec/problem/sub/deps.yaml", prompt)
+
+    def test_resume_preserves_custom_llm_command(self) -> None:
+        # A custom --llm-command from the original run (recorded as preflight
+        # probe_command) must be reused on resume, not replaced by the default binary.
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._seed_spec_tree(repo_root)
+            self._seed_resumable_orchestration(
+                repo_root, "orch_20260101T000000Z_aaaaaaaa", spec_ref="spec/problem/test.md",
+                until_phase="Build", mode="dev", backend="claude",
+                probe_command="/opt/wrappers/claude-wrapper",
+            )
+            code, out, calls = self._run_main_with_fake_runtime(
+                ["--resume", "--repo-root", str(repo_root), "--no-invoke-llm"]
+            )
+            self.assertEqual(code, 0, out)
+            self.assertEqual(out["llm_command"], "/opt/wrappers/claude-wrapper")
+            preflight_calls = [c for c in calls if c and c[0] == "preflight"]
+            self.assertEqual(len(preflight_calls), 1)
+            idx = preflight_calls[0].index("--agent-command")
+            self.assertEqual(preflight_calls[0][idx + 1], "/opt/wrappers/claude-wrapper")
+
+    def test_resume_same_spec_explicit_keeps_recovered_dependency(self) -> None:
+        # Restating the SAME spec_ref explicitly is not a change: the recovered
+        # (possibly non-default) dependency must still be reused, not rediscovered.
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            _seed_shape_expr_schema_into(repo_root)
+            (repo_root / "tools").mkdir(parents=True, exist_ok=True)
+            (repo_root / "workspace").mkdir(parents=True, exist_ok=True)
+            (repo_root / "spec" / "problem").mkdir(parents=True, exist_ok=True)
+            (repo_root / "spec" / "problem" / "test.md").write_text("spec\n", encoding="utf-8")
+            # No spec/problem/deps.yaml: rediscovery would fail, proving reuse.
+            self._seed_resumable_orchestration(
+                repo_root, "orch_20260101T000000Z_aaaaaaaa", spec_ref="spec/problem/test.md",
+                until_phase="Build", mode="dev", backend="claude",
+                source_dependency_ref="spec/problem/sub/deps.yaml",
+            )
+            code, out, _ = self._run_main_with_fake_runtime(
+                ["--resume", "spec/problem/test.md",
+                 "--repo-root", str(repo_root), "--no-invoke-llm"]
+            )
+            self.assertEqual(code, 0, out)
+            prompt = (
+                repo_root / "workspace" / "orchestrations"
+                / "orch_20260101T000000Z_aaaaaaaa" / "launches"
+                / "orchestration.start.prompt.txt"
+            ).read_text(encoding="utf-8")
+            self.assertIn("spec/problem/sub/deps.yaml", prompt)
+
+    def test_resume_same_backend_explicit_keeps_custom_llm_command(self) -> None:
+        # Restating the SAME --llm is not a change: the recovered custom command
+        # must still be reused, not replaced by the default backend binary.
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._seed_spec_tree(repo_root)
+            self._seed_resumable_orchestration(
+                repo_root, "orch_20260101T000000Z_aaaaaaaa", spec_ref="spec/problem/test.md",
+                until_phase="Build", mode="dev", backend="claude",
+                probe_command="/opt/wrappers/claude-wrapper",
+            )
+            code, out, _ = self._run_main_with_fake_runtime(
+                ["--resume", "--llm", "claude",
+                 "--repo-root", str(repo_root), "--no-invoke-llm"]
+            )
+            self.assertEqual(code, 0, out)
+            self.assertEqual(out["llm"], "claude")
+            self.assertEqual(out["llm_command"], "/opt/wrappers/claude-wrapper")
+
+    def test_resume_cli_llm_command_overrides_recovered(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._seed_spec_tree(repo_root)
+            self._seed_resumable_orchestration(
+                repo_root, "orch_20260101T000000Z_aaaaaaaa", spec_ref="spec/problem/test.md",
+                until_phase="Build", mode="dev", backend="claude",
+                probe_command="/opt/wrappers/old",
+            )
+            code, out, _ = self._run_main_with_fake_runtime(
+                ["--resume", "--llm-command", "/opt/wrappers/new",
+                 "--repo-root", str(repo_root), "--no-invoke-llm"]
+            )
+            self.assertEqual(code, 0, out)
+            self.assertEqual(out["llm_command"], "/opt/wrappers/new")
+
+    def test_resume_backend_override_uses_new_backend_default_command(self) -> None:
+        # Switching backend on resume must not reuse the old backend's recovered
+        # command; it falls back to the new backend's default.
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._seed_spec_tree(repo_root)
+            self._seed_resumable_orchestration(
+                repo_root, "orch_20260101T000000Z_aaaaaaaa", spec_ref="spec/problem/test.md",
+                until_phase="Build", mode="dev", backend="claude",
+                probe_command="/opt/wrappers/claude-wrapper",
+            )
+            code, out, _ = self._run_main_with_fake_runtime(
+                ["--resume", "--llm", "codex", "--repo-root", str(repo_root), "--no-invoke-llm"]
+            )
+            self.assertEqual(code, 0, out)
+            self.assertEqual(out["llm"], "codex")
+            self.assertEqual(out["llm_command"], run_workflow.DEFAULT_LLM_COMMANDS["codex"])
+
+    def test_resume_cli_overrides_recovered_until_phase(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._seed_spec_tree(repo_root)
+            self._seed_resumable_orchestration(
+                repo_root, "orch_20260101T000000Z_aaaaaaaa",
+                spec_ref="spec/problem/test.md", until_phase="Compile",
+                mode="dev", backend="claude",
+            )
+            code, out, _ = self._run_main_with_fake_runtime(
+                ["--resume", "build", "--repo-root", str(repo_root), "--no-invoke-llm"]
+            )
+            self.assertEqual(code, 0, out)
+            self.assertEqual(out["until_phase"], "Build")
+
+    def test_resume_refuses_running_latest_without_explicit_id(self) -> None:
+        # Implicit `--resume` must not auto-attach to a non-terminal (running) latest.
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._seed_spec_tree(repo_root)
+            oid = "orch_20260101T000000Z_aaaaaaaa"
+            self._seed_resumable_orchestration(
+                repo_root, oid, spec_ref="spec/problem/test.md",
+                until_phase="Build", mode="dev", backend="claude",
+            )
+            meta_path = (
+                repo_root / "workspace" / "orchestrations" / oid / "orchestration_meta.json"
+            )
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            meta["status"] = "running"
+            meta_path.write_text(json.dumps(meta, ensure_ascii=False), encoding="utf-8")
+
+            code, out, calls = self._run_main_with_fake_runtime(
+                ["--resume", "--repo-root", str(repo_root), "--no-invoke-llm"]
+            )
+            self.assertEqual(code, 2)
+            self.assertEqual(out["reason"], "latest_orchestration_not_resumable")
+            self.assertEqual(calls, [])
+
+            # An explicit --orchestration-id bypasses the guard (deliberate choice).
+            code2, out2, _ = self._run_main_with_fake_runtime(
+                ["--resume", "--orchestration-id", oid,
+                 "--repo-root", str(repo_root), "--no-invoke-llm"]
+            )
+            self.assertEqual(code2, 0, out2)
+            self.assertEqual(out2["orchestration_id"], oid)
+
+    def test_resume_passes_overridden_spec_ref_to_init(self) -> None:
+        # An explicit spec_ref override on resume must be forwarded to
+        # init --resume-from-checkpoint so meta is updated (not left stale).
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._seed_spec_tree(repo_root)
+            (repo_root / "spec" / "other").mkdir(parents=True, exist_ok=True)
+            (repo_root / "spec" / "other" / "alt.md").write_text("spec\n", encoding="utf-8")
+            (repo_root / "spec" / "other" / "deps.yaml").write_text("nodes: []\n", encoding="utf-8")
+            self._seed_resumable_orchestration(
+                repo_root, "orch_20260101T000000Z_aaaaaaaa", spec_ref="spec/problem/test.md",
+                until_phase="Build", mode="dev", backend="claude",
+            )
+            code, out, calls = self._run_main_with_fake_runtime(
+                ["--resume", "spec/other/alt.md",
+                 "--repo-root", str(repo_root), "--no-invoke-llm"]
+            )
+            self.assertEqual(code, 0, out)
+            self.assertEqual(out["target_spec_ref"], "spec/other/alt.md")
+            init_calls = [c for c in calls if c and c[0] == "init"]
+            idx = init_calls[0].index("--spec-ref")
+            self.assertEqual(init_calls[0][idx + 1], "spec/other/alt.md")
+            # Overridden spec rediscovers its own deps, not the recovered one.
+            didx = init_calls[0].index("--source-dependency-ref")
+            self.assertEqual(init_calls[0][didx + 1], "spec/other/deps.yaml")
+
+    def test_resume_fails_when_no_orchestration_exists(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._seed_spec_tree(repo_root)
+            code, out, calls = self._run_main_with_fake_runtime(
+                ["--resume", "--repo-root", str(repo_root), "--no-invoke-llm"]
+            )
+            self.assertEqual(code, 2)
+            self.assertEqual(out["reason"], "no_resumable_orchestration")
+            self.assertEqual(calls, [])
+
+    def test_resume_fails_when_until_phase_unrecoverable(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._seed_spec_tree(repo_root)
+            oid = "orch_20260101T000000Z_aaaaaaaa"
+            self._seed_resumable_orchestration(
+                repo_root, oid, spec_ref="spec/problem/test.md",
+                until_phase="Build", mode="dev", backend="claude",
+            )
+            # Corrupt the prompt so until_phase/mode cannot be extracted.
+            (
+                repo_root / "workspace" / "orchestrations" / oid
+                / "launches" / "orchestration.start.prompt.txt"
+            ).write_text("no parseable params here\n", encoding="utf-8")
+            code, out, calls = self._run_main_with_fake_runtime(
+                ["--resume", "--repo-root", str(repo_root), "--no-invoke-llm"]
+            )
+            self.assertEqual(code, 2)
+            self.assertEqual(out["reason"], "resume_params_unrecoverable")
+            self.assertIn("until_phase", out["detail"])
+            self.assertEqual(calls, [])
 
     def test_main_writes_prompt_file(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

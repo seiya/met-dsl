@@ -8537,6 +8537,88 @@ class CheckpointResumeRuntimeTests(unittest.TestCase):
             self.assertEqual(meta.get("spec_ref"), "spec/a.md")
             self.assertTrue(meta.get("resume_enabled"))
 
+    def test_enable_checkpoint_resume_updates_refs_when_provided(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            init_orchestration(
+                repo_root=repo,
+                orchestration_id="o1",
+                spec_ref="spec/old/a.md",
+                source_dependency_ref="spec/old/deps.yaml",
+            )
+            meta = enable_checkpoint_resume(
+                repo,
+                "o1",
+                spec_ref="spec/new/b.md",
+                source_dependency_ref="spec/new/deps.yaml",
+            )
+            self.assertEqual(meta.get("spec_ref"), "spec/new/b.md")
+            self.assertEqual(meta.get("source_dependency_ref"), "spec/new/deps.yaml")
+            on_disk = json.loads(
+                (repo / "workspace/orchestrations/o1/orchestration_meta.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(on_disk.get("spec_ref"), "spec/new/b.md")
+            self.assertEqual(on_disk.get("source_dependency_ref"), "spec/new/deps.yaml")
+
+    def test_enable_checkpoint_resume_resets_terminal_status_to_running(self) -> None:
+        # A resumed orchestration that already terminalized (fail / fail_closed)
+        # must be reset to `running`, otherwise the resumed agent's final
+        # set-status(pass) is a rejected terminal-to-terminal transition.
+        for prior in ("fail", "fail_closed", "pass"):
+            with self.subTest(prior=prior):
+                with tempfile.TemporaryDirectory() as tmp:
+                    repo = Path(tmp)
+                    init_orchestration(repo_root=repo, orchestration_id="o1")
+                    meta_path = repo / "workspace/orchestrations/o1/orchestration_meta.json"
+                    meta = json.loads(meta_path.read_text(encoding="utf-8"))
+                    meta.update(
+                        {
+                            "status": prior,
+                            "reason_code": "noncanonical_phase_write_attempt",
+                            "reason_detail": "prior failure detail",
+                            "blocking_policy_scope": "write",
+                            "finished_at": "2026-01-01T00:00:00.000000Z",
+                            "detected_at": "2026-01-01T00:00:00.000000Z",
+                        }
+                    )
+                    meta_path.write_text(json.dumps(meta, ensure_ascii=False), encoding="utf-8")
+                    # Simulate the prior terminalization's cleanup marker.
+                    arid = meta["orchestration_agent_run_id"]
+                    marker = (
+                        repo / "workspace/orchestrations/o1/cleanup_committed" / f"{arid}.json"
+                    )
+                    marker.parent.mkdir(parents=True, exist_ok=True)
+                    marker.write_text("{}\n", encoding="utf-8")
+
+                    returned = enable_checkpoint_resume(repo, "o1")
+
+                    on_disk = json.loads(meta_path.read_text(encoding="utf-8"))
+                    for view in (returned, on_disk):
+                        self.assertEqual(view.get("status"), "running")
+                        self.assertTrue(view.get("resume_enabled"))
+                        self.assertEqual(view.get("resumed_from_status"), prior)
+                        # Live terminal narrative cleared, archived under resumed_from_*.
+                        self.assertNotIn("reason_code", view)
+                        self.assertNotIn("finished_at", view)
+                        self.assertNotIn("detected_at", view)
+                        self.assertEqual(
+                            view.get("resumed_from_reason_code"),
+                            "noncanonical_phase_write_attempt",
+                        )
+                    # Stale cleanup marker removed so the next terminalization is clean.
+                    self.assertFalse(marker.exists())
+
+    def test_enable_checkpoint_resume_keeps_nonterminal_status(self) -> None:
+        # An interrupted (still `running`) orchestration must not be touched/archived.
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            init_orchestration(repo_root=repo, orchestration_id="o1", status="running")
+            returned = enable_checkpoint_resume(repo, "o1")
+            self.assertEqual(returned.get("status"), "running")
+            self.assertNotIn("resumed_from_status", returned)
+
     def test_write_step_result_updates_checkpoint_on_pass(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)

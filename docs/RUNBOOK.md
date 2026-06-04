@@ -140,6 +140,27 @@ workflow 実行および本 RUNBOOK の修復手順は以下の CLI を前提と
 - 性能未達（B の探索不足） → 任意フロー `Tune` の `impl_defaults` variant 探索を起動する。
 - 正式版昇格 → 任意フロー `Promote` で `releases/` へ。
 
+## 3-1. 失敗した workflow の再開（`--resume`）
+
+途中で fail した workflow を、完了済み `step`（compile 済み等）を再利用したまま失敗箇所から再開する canonical 経路は `python3 tools/run_workflow.py --resume` とする。
+
+```bash
+# 最新の orchestration を、前回の spec_ref / until_phase / llm のまま再開する
+python3 tools/run_workflow.py --resume
+
+# 特定 orchestration を再開する場合
+python3 tools/run_workflow.py --resume --orchestration-id <orchestration_id>
+
+# until_phase を延長して再開する場合（lone positional が phase 名なら until_phase 上書き）
+python3 tools/run_workflow.py --resume build
+```
+
+- `spec_ref` / `until_phase` / `--llm` / `--mode` は省略すると対象 orchestration の既存 artifact（`orchestration_meta.json` / `preflight.json` / `launches/orchestration.start.prompt.txt`）から復元される。明示指定した値が優先される。
+- `--orchestration-id` を省略した場合は `workspace/orchestrations/` 内で時系列最新（`orchestration_meta.json#started_at` 順）の orchestration を対象とする。ただし最新が非 terminal status（`running` 等）の場合は、実行中の並行 run へ誤接続して共有 `workspace/tmp/<arid>` を破壊する事故を避けるため `latest_orchestration_not_resumable` で停止する（その run を resume するには `--orchestration-id` を明示する）。
+- resume 時に `spec_ref` を明示 override した場合、override 後の `spec_ref` / `source_dependency_ref` は `orchestration_meta.json` へ反映される（次回の implicit resume が stale な旧値へ revert しないようにするため）。
+- 内部動作: `--resume` は `orchestration_runtime.py init --resume-from-checkpoint`（= `resume_enabled=true` 設定、`orchestration_agent_run_id` 保持、`phase_state` merge）を実行してから起動する。対象 orchestration が terminal status（`fail` / `fail_closed` / `pass` 等）で終端済みの場合、live status を `running` へ戻す（terminal → 他 status の遷移は `fail` → `fail_closed` を除き runtime が reject するため、reset しないと resume した agent が完了しても `pass` を記録できない）。reset 時、終端時の `reason_code` / `reason_detail` / `blocking_policy_scope` は `resumed_from_*` に退避し、`finished_at` / `detected_at` を除去する（履歴は `failure_analysis.json` と `phase_state_log.jsonl` に残る）。完了済み `step` の skip 判定は orchestration agent が `check-step-completed` で行う（SKILL.md 運用ルール 19）。`verify-checkpoint-integrity` で `stale` 検出された `step` は skip されず再実行される。
+- `Build` 失敗は決定的処理のため Build を内部 retry せず `Generate` へ戻す（本表 §3）。Build step は checkpoint 上「未完了」のままとなり、resume 時に Generate から再実行される。
+
 ## 4. 運用の最小チェックリスト
 - `Controlled Spec` に未定義項目がない。
 - `spec.ir.yaml` が `case` / `algorithm` / `impl_defaults` / `io_contract` / `dependency` の 5 セクションを保持し、`Compile.verify` の V1〜V5 invariant を満たす。

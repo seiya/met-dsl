@@ -22,6 +22,7 @@ description: 対応 execution platform で `workflow` 全体を開始し、`orch
 - 任意フロー `Tune` / `Promote` は core workflow に含めない。`Tune` は substep を持つ任意フロー、`Promote` は step の任意フローとして別 entrypoint から起動する。
 - execution platform の起動可否確認と証跡書き出しは `tools/orchestration_runtime.py` を canonical source 実装として使用しなければならない。
 - workflow 起動は `python3 tools/run_workflow.py <spec_ref> <until_phase> [--llm <codex|cursor|claude>]` を canonical entrypoint とし、手動 `init` / 手動 `preflight` を通常経路として使用してはならない。`<until_phase>` は `compile` / `generate` / `build` / `validate` のいずれか。
+- 失敗した workflow の再開も `python3 tools/run_workflow.py --resume [--orchestration-id <id>]` を canonical entrypoint とし、手動 `init --resume-from-checkpoint` を通常経路として使用してはならない。`--resume` は対象 orchestration（`--orchestration-id` 省略時は時系列最新）の既存 artifact から `spec_ref` / `until_phase` / `--llm` / `--mode` を復元し、内部で `resume_enabled=true` を設定する。terminal status で終端済みの場合は live status を `running` へ reset する（terminal → 他 status 遷移の reject を回避するため）。完了済み `step` の skip 判定は本 SKILL 運用ルール 19（`check-step-completed`）に従う。詳細は [docs/RUNBOOK.md](../../docs/RUNBOOK.md) §3-1。
 - workflow mode は `tools/run_workflow.py --mode <dev|prod>` を canonical source とし、既定値は `dev` とする。
 - `dev` mode では verify 判定を厳格運用し、`issue_severity=major|critical` を検出した場合は `fail` として停止しなければならない。
 - `dev` mode で fail が発生した場合、`workspace/orchestrations/<orchestration_id>/failure_analysis.json` を必須出力として原因調査結果を保存しなければならない。
