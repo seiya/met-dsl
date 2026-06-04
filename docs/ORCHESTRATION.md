@@ -62,6 +62,8 @@
   - `Validate.execute` / `Validate.judge`: `workspace/pipelines/<node_key_safe>/<pipeline_id>/runs/<run_id>/<node_key>/`
 - `ir_ref` / `pipeline_ref` 配下の変更は、`.json` / `.txt` 出力については `guarded-apply-patch` を通過した canonical path、それ以外の extension については `output_manifests/<agent_run_id>.json` の `allowed_file_tool_paths` に列挙された path への `Edit` / `Write` 直接書き込みに限定する。
 - `record-launch` は child `agent_run_id` ごとに `workspace/orchestrations/<orchestration_id>/output_manifests/<agent_run_id>.json` を生成し、`allowed_output_paths` と `allowed_file_tool_paths` と `allowed_tmp_root`（`workspace/tmp/<agent_run_id>`）を確定しなければならない。
+- **Make build の必須 file pin auto-inject**: `Generate` step かつ `spec.ir.yaml.impl_defaults.toolchain.build_system=make` のとき、`record-launch` は in-source `Makefile` (`<pipeline_ref>/source/<source_id>/src/Makefile`) を `allowed_output_paths` へ自動注入し、`allowed_file_tool_paths` へ流す。bare な `src/` directory entry だけでは source 拡張子 (`.f90`/`.c`) は `guarded-apply-patch` で書けても拡張子なしの `Makefile` は directory-allowlist の source-extension 集合から意図的に除外 (`tools/hooks/common.py`) されるため全経路で書けず、child が mid-run で推測回避 fail-stop する。orchestration agent は通常 `allowed_file_tool_paths` を省略 (auto-derive) すればよい。
+- **launch-time provisioning 検証**: `record-launch` は、Make build Generate launch で必須 `Makefile` pin が確定後の `allowed_file_tool_paths` に欠落している場合 (caller が明示 `allowed_file_tool_paths` を渡して pin を漏らした等)、**child 起動前に `ValueError` で fail-fast** する。artifact を汚染する mid-run fail-stop を、安価で recoverable な launch-time error に変換する。
 - `record-launch` は child `agent_run_id` ごとに `workspace/orchestrations/<orchestration_id>/read_manifests/<agent_run_id>.json` を生成し、`allowed_read_roots` と `denied_read_roots` を確定しなければならない。
 - `record-launch` は child `agent_run_id` ごとに `workspace/orchestrations/<orchestration_id>/sandbox_profiles/<agent_run_id>.json` を生成し、`bwrap` 実行に必要な `read_roots` と `write_roots` と runtime bind 構成を確定しなければならない。child 起動は当該 profile を用いた `bwrap` 実行のみを許可する。
 
@@ -99,6 +101,7 @@
 - validator script の直接実行は例外運用としてのみ許可する。許可対象は `validate_workspace_root.py` と `check_artifact_syntax.py` に限定する。
 - 子 `agent` が `apply_patch` を実行する場合、`python3 tools/orchestration_runtime.py guarded-apply-patch --repo-root <repo_root> --orchestration-id <orchestration_id> --actor-role <step|substep> --agent-run-id <agent_run_id> --paths-json '["..."]' --patch-text '<patch_text>' --capability-token <capability_token>` を canonical invocation とする。`guarded-apply-patch` の使用対象は `.json` / `.txt` 出力に限定する。
 - `record-agent-run` は、child `agent` が申告した `output_refs` と `apply_patch_writes` gate 記録、および `output_manifests/<agent_run_id>.json.allowed_file_tool_paths` に加えて、baseline との差分で実変更 path を検査しなければならない。実変更 path が capability token の `write_root` 配下にない、または gate 許可 path と `allowed_file_tool_paths` のいずれにも含まれない場合、`unauthorized write` として reject する。
+- **runtime placeholder 復元 (recoverability)**: 終端検査の baseline diff の前に、`record-agent-run` は `created_file_pin_stubs` に記録された runtime-owned placeholder (例 `lineage.json`) のうち、gate 経由で書換えられておらず (= `gate_changed_paths` 非被覆) 現在 absent なものを 0-byte で復元する。これにより、collateral に削除された runtime placeholder が `unauthorized write` として判定され、復元手段を持たない orchestration agent が恒久 `fail_closed` に陥る deadlock を防ぐ。`status=fail`/`blocked`/`timeout` の terminal record でも適用し、失敗 run を `agent_runs.jsonl` に記録可能とする (clean restart を可能にする)。`record-agent-run` は runtime 権限で動作するため、orchestration agent 自身には禁止される canonical-path write がここでは許容される。
 - `orchestration agent` は、子 `agent` 起動要求本文を `skills/workflow-orchestration/references/launch_prompts.md` の対応テンプレートから生成しなければならない。テンプレートを使わない自由形式 prompt を禁止する。
 - `ir_ref` と `pipeline_ref` と `dependency_ref` は、子 `agent` 起動前に canonical path を確定しなければならない。placeholder を起動要求へ記録してはならない。
 
@@ -261,6 +264,10 @@ python3 tools/orchestration_runtime.py guarded-apply-patch \
 ### 許可対象 extension
 
 `.json` / `.txt` の出力のみ。`.yaml`・`.yml`・`.md`・source code は `Edit`/`Write` tool（`allowed_file_tool_paths` 経由）を使うこと。`spec.ir.yaml` は `Edit`/`Write` 経由で書き込む。
+
+### runtime 生成 placeholder の保護
+
+`record-launch` は file pin (例 Generate の `lineage.json`) を bwrap が file 粒度で bind できるよう 0-byte placeholder として事前生成し、`sandbox_profiles/<agent_run_id>.json` の `created_file_pin_stubs` に記録する。`guarded-apply-patch` は apply 完了後に、**`changed_paths` に含まれない `created_file_pin_stubs` の placeholder が消えていれば 0-byte で復元する** (defense-in-depth)。`changed_paths` 被覆外の path を `git apply` が削除することは strip 判定後の被覆検査で既に reject されるが、万一の out-of-band 削除でも runtime-owned placeholder を残さないことを保証し、後段 `record-agent-run` の終端検査で「runtime artifact への非 gate 変更 = `unauthorized_write`」として恒久 `fail_closed` 化するのを防ぐ。`changed_paths` で被覆された path (agent が gate 経由で意図的に書換/削除した path) は復元対象外とする。
 
 ## Capability / Manifest 契約
 

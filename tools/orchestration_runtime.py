@@ -4368,6 +4368,18 @@ def _allowed_output_paths_for_launch(
         if log_path not in allowed:
             allowed.append(log_path)
 
+    # Mandatory build-control file pins (e.g. Make's in-source Makefile). A bare
+    # `src/` directory allowlist entry covers source extensions (.f90/.c) via
+    # guarded-apply-patch but NOT the extensionless `Makefile`, which is
+    # intentionally excluded from the directory-allowlist source-extension set
+    # (tools/hooks/common.py) and would therefore be unwritable through every
+    # channel. Inject the explicit file pin so it is authorized as an output and
+    # — via `_allowed_file_tool_paths_for_launch` auto-derive — Edit/Write
+    # eligible. See `_mandatory_file_tool_pins_for_launch`.
+    for mandatory_pin in _mandatory_file_tool_pins_for_launch(request_payload, allowed):
+        if mandatory_pin not in allowed:
+            allowed.append(mandatory_pin)
+
     for idx, path in enumerate(allowed):
         if path in canonical_logs_set:
             # Canonical MCP-owned audit logs are pre-validated against
@@ -4615,7 +4627,13 @@ def _allowed_file_tool_paths_for_launch(
             and path not in canonical_log_set
             and _is_direct_write_path(path)
         }
-        return sorted(derived)
+        result = sorted(derived)
+        _assert_mandatory_file_tool_pins_present(
+            request_payload=request_payload,
+            allowed_output_paths=allowed_output_paths,
+            allowed_file_tool_paths=result,
+        )
+        return result
     if not isinstance(raw, list):
         raise ValueError("allowed_file_tool_paths must be a list when provided")
     normalized: list[str] = []
@@ -4641,7 +4659,104 @@ def _allowed_file_tool_paths_for_launch(
                 f"allowed_file_tool_paths[{idx}] must be included in allowed_output_paths: {path!r}"
             )
         normalized.append(path)
-    return sorted(set(normalized))
+    result = sorted(set(normalized))
+    _assert_mandatory_file_tool_pins_present(
+        request_payload=request_payload,
+        allowed_output_paths=allowed_output_paths,
+        allowed_file_tool_paths=result,
+    )
+    return result
+
+
+def _mandatory_file_tool_pins_for_launch(
+    request_payload: dict[str, Any],
+    allowed_output_paths: Sequence[str],
+) -> list[str]:
+    """Build-control file pins that MUST be Edit/Write-eligible for the launch.
+
+    For Make-based Generate launches the in-source ``Makefile`` is mandatory
+    (make + Fortran/C needs the ``test`` / ``check`` targets) yet is an
+    extensionless build-control name intentionally excluded from the
+    directory-allowlist source-extension set (``tools/hooks/common.py``). A bare
+    ``<pipeline_ref>/source/<source_id>/src/`` directory entry therefore leaves
+    it unwritable through every channel, so it must be pinned explicitly.
+
+    ``build_system`` is resolved from ``_resolved_build_system`` (populated by
+    ``record_launch`` from ``spec.ir.yaml.impl_defaults``). Absence disables the
+    requirement, so direct callers / non-Make toolchains are unaffected.
+    """
+    step_token = str(request_payload.get("step") or "").strip().lower()
+    substep_token = str(request_payload.get("substep") or "").strip().lower()
+    pipeline_ref = _normalize_rel_posix(str(request_payload.get("pipeline_ref") or ""))
+    # Only the source-generating launch needs the Makefile. The Generate.verify
+    # substep inspects src/ and writes source_meta.json — granting it Makefile
+    # (build-control) write authority would let the verifier mutate the very
+    # artifact it is supposed to judge, so it must be excluded.
+    if step_token != "generate" or substep_token == "verify" or not pipeline_ref:
+        return []
+    bs_raw = request_payload.get("_resolved_build_system")
+    bs_norm = bs_raw.strip().lower() if isinstance(bs_raw, str) and bs_raw.strip() else ""
+    if bs_norm != "make":
+        return []
+    generate_prefix = f"{pipeline_ref}/source/"
+    source_id = str(request_payload.get("source_id") or "").strip()
+    if not source_id:
+        # Single-namespace enforcement guarantees at most one source_id under
+        # the generate prefix; derive it from the listed paths when the request
+        # does not carry an explicit `source_id` field.
+        gen_ids: set[str] = set()
+        for item in allowed_output_paths:
+            if not isinstance(item, str):
+                continue
+            tok = _normalize_rel_posix(item)
+            if not tok.startswith(generate_prefix):
+                continue
+            tail = tok[len(generate_prefix):]
+            parts = [s for s in tail.split("/") if s]
+            if parts:
+                gen_ids.add(parts[0])
+        if len(gen_ids) == 1:
+            source_id = next(iter(gen_ids))
+    if not source_id:
+        return []
+    return [f"{generate_prefix}{source_id}/src/Makefile"]
+
+
+def _assert_mandatory_file_tool_pins_present(
+    *,
+    request_payload: dict[str, Any],
+    allowed_output_paths: Sequence[str],
+    allowed_file_tool_paths: Sequence[str],
+) -> None:
+    """Fail the launch (before the child spawns) when a mandatory build-control
+    file pin is absent from the effective ``allowed_file_tool_paths``.
+
+    This converts the otherwise mid-run, artifact-corrupting fail-stop (a child
+    discovering it cannot write the Makefile and aborting) into a cheap,
+    recoverable launch-time ``ValueError``. The common case (auto-derived
+    file-tool paths) is already satisfied by the Fix-1 injection in
+    ``_allowed_output_paths_for_launch``; this guard catches the case where the
+    caller passes an explicit ``allowed_file_tool_paths`` list that omits the
+    pin.
+    """
+    mandatory = _mandatory_file_tool_pins_for_launch(
+        request_payload, allowed_output_paths
+    )
+    if not mandatory:
+        return
+    present = {_normalize_rel_posix(str(p)) for p in allowed_file_tool_paths}
+    missing = [pin for pin in mandatory if _normalize_rel_posix(pin) not in present]
+    if missing:
+        raise ValueError(
+            "allowed_file_tool_paths is missing mandatory build-control file "
+            f"pin(s) {missing!r} required for this launch. Make-based Generate "
+            "needs the in-source Makefile to be Edit/Write-eligible, but a bare "
+            "src/ directory entry is insufficient (the extensionless Makefile is "
+            "excluded from the directory-allowlist source-extension set). "
+            "Remediation: add the Makefile path to allowed_output_paths and "
+            "allowed_file_tool_paths, or omit an explicit allowed_file_tool_paths "
+            "so record-launch auto-derives it."
+        )
 
 
 def _validate_child_write_contract_preflight(
@@ -5678,6 +5793,104 @@ def _child_managed_paths_excludable_from_orchestration_diff(
     return excludable
 
 
+def _runtime_created_pin_stub_paths(
+    repo_root: Path,
+    orchestration_id: str,
+    *,
+    agent_run_id: str,
+) -> dict[str, int | None]:
+    """Return the repo-relative file-pin stubs this run pre-created, mapped to
+    the ``mtime_ns`` recorded at creation (``created_file_pin_stubs``).
+
+    These are runtime-owned canonical placeholders (e.g. the Generate step's
+    ``lineage.json``) created so bwrap can bind them at file granularity. They
+    carry no agent-authored content unless the agent wrote them through the
+    gate, so their collateral deletion is semantically harmless (and is even
+    performed deliberately by ``_cleanup_empty_file_pin_stubs`` for untouched
+    stubs). The recorded ``mtime_ns`` lets a restore reproduce the exact stub
+    state so ``_cleanup_empty_file_pin_stubs`` (which matches on mtime) still
+    treats the restored placeholder as an untouched stub. ``None`` indicates the
+    entry recorded no usable mtime."""
+    profile_path = _sandbox_profiles_dir(repo_root, orchestration_id) / f"{agent_run_id.strip()}.json"
+    if not profile_path.exists():
+        return {}
+    try:
+        profile_doc = _read_json(profile_path)
+    except (OSError, json.JSONDecodeError):
+        return {}
+    if not isinstance(profile_doc, dict):
+        return {}
+    stubs_obj = profile_doc.get("created_file_pin_stubs")
+    if not isinstance(stubs_obj, list):
+        return {}
+    result: dict[str, int | None] = {}
+    for entry in stubs_obj:
+        if isinstance(entry, dict):
+            p = entry.get("path")
+            if isinstance(p, str) and p.strip():
+                m = entry.get("mtime_ns")
+                result[_normalize_rel_posix(p)] = m if isinstance(m, int) else None
+    return result
+
+
+def _restore_deleted_file_pin_stubs(
+    repo_root: Path,
+    orchestration_id: str,
+    *,
+    agent_run_id: str,
+    skip_prefixes: Sequence[str] = (),
+) -> list[str]:
+    """Re-create as a 0-byte file any runtime-created file-pin stub that is
+    currently absent (collaterally deleted outside the gate).
+
+    Restoring the canonical placeholder returns the workspace to its launch
+    baseline so a (possibly failed) run can be recorded instead of dead-locking
+    the orchestration with a permanently unrecordable ``unauthorized_write``
+    over a runtime-owned artifact. ``record-launch`` / ``record-agent-run`` /
+    ``guarded-apply-patch`` all run with runtime authority (outside the child
+    sandbox), so this restore is permitted where the orchestration agent's own
+    canonical-path writes are not.
+
+    Stubs covered by ``skip_prefixes`` (typically the run's
+    ``gate_changed_paths`` — paths the agent legitimately mutated through
+    guarded-apply-patch) are left untouched so a deliberate gate write/removal
+    is never clobbered. Returns the list of restored paths."""
+    stubs = _runtime_created_pin_stub_paths(
+        repo_root, orchestration_id, agent_run_id=agent_run_id
+    )
+    if not stubs:
+        return []
+    resolved_root = repo_root.resolve()
+    skip = [_normalize_rel_posix(str(p)) for p in skip_prefixes if str(p).strip()]
+    restored: list[str] = []
+    for rel in sorted(stubs):
+        if any(_repo_path_under_prefix(rel, prefix) for prefix in skip):
+            continue
+        target = (repo_root / rel).resolve()
+        try:
+            target.relative_to(resolved_root)
+        except ValueError:
+            continue
+        if target.exists():
+            continue
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.touch()
+            # Reproduce the mtime recorded at stub creation so
+            # `_cleanup_empty_file_pin_stubs` (which deletes only zero-byte
+            # stubs whose mtime still matches `created_file_pin_stubs`) still
+            # treats this restored placeholder as an untouched stub. Without
+            # this, touch()'s fresh mtime would make the empty placeholder
+            # un-cleanable and leave it lingering as canonical workspace data.
+            recorded_mtime_ns = stubs.get(rel)
+            if isinstance(recorded_mtime_ns, int):
+                os.utime(target, ns=(recorded_mtime_ns, recorded_mtime_ns))
+        except OSError:
+            continue
+        restored.append(rel)
+    return restored
+
+
 def _cleanup_empty_file_pin_stubs(
     repo_root: Path,
     orchestration_id: str,
@@ -5956,6 +6169,20 @@ def _validate_actual_write_paths(
 
     run_id = agent_run_id_obj.strip()
     baseline_agent_run_id = run_id if actor_role in {"step", "substep"} else None
+    if actor_role in {"step", "substep"}:
+        # Fix 4 (recoverability): re-create any runtime-owned file-pin stub
+        # (e.g. lineage.json) that was collaterally deleted outside the gate so
+        # the baseline diff is clean and a failed run remains recordable instead
+        # of dead-locking the orchestration. Stubs the agent legitimately
+        # mutated through guarded-apply-patch (gate_changed_paths) are skipped.
+        _restore_deleted_file_pin_stubs(
+            repo_root,
+            orchestration_id,
+            agent_run_id=run_id,
+            skip_prefixes=_gate_changed_paths_for_run(
+                repo_root, orchestration_id, agent_run_id=run_id
+            ),
+        )
     actual_changed_paths = _actual_changed_paths_since_baseline(
         repo_root,
         orchestration_id,
@@ -12050,6 +12277,20 @@ def guarded_apply_patch(
     if proc.returncode != 0:
         msg = (proc.stderr or proc.stdout or "").strip()
         raise RuntimeError(f"guarded-apply-patch: git apply failed: {msg}")
+    # Fix 3 (probing-deletion safety): defense-in-depth — re-create any
+    # runtime-owned file-pin stub (e.g. lineage.json) that this apply removed
+    # without it being declared in changed_paths. `not_covered` above already
+    # rejects out-of-scope targets, so a placeholder outside changed_paths must
+    # not have been a legitimate target; restoring the 0-byte canonical
+    # placeholder guarantees guarded-apply-patch never leaves it deleted
+    # out-of-band (which would otherwise surface as an unrecordable
+    # unauthorized_write at terminalization).
+    _restore_deleted_file_pin_stubs(
+        repo_root,
+        orchestration_id,
+        agent_run_id=agent_run_id,
+        skip_prefixes=normalized_paths,
+    )
     gate_ref = _write_apply_patch_gate_evidence(
         repo_root,
         orchestration_id=orchestration_id,

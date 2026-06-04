@@ -2426,6 +2426,154 @@ shell_tool                       stable             true
         self.assertIn(log_path, allowed)
         self.assertNotIn(log_path, file_tool)
 
+    def test_generate_make_launch_auto_injects_makefile_pin(self) -> None:
+        """Fix 1: a Make-based Generate launch with only a bare src/ directory
+        entry must auto-inject the extensionless src/Makefile as an explicit
+        file pin so it is Edit/Write-eligible. A bare directory alone leaves the
+        Makefile unwritable — source extensions (.f90) go via guarded-apply-
+        patch under the directory allowlist, but the extensionless Makefile is
+        intentionally excluded from that allowlist (tools/hooks/common.py)."""
+        from tools.orchestration_runtime import (
+            _allowed_file_tool_paths_for_launch,
+            _allowed_output_paths_for_launch,
+        )
+
+        src_id = "src_20260604_002"
+        src_dir = f"{_FIX_PIPE_REF}/source/{src_id}/src/"
+        makefile = f"{_FIX_PIPE_REF}/source/{src_id}/src/Makefile"
+        req = {
+            "agent_role": "step",
+            "step": "generate",
+            "node_key": "problem/shallow_water2d@0.3.0",
+            "ir_ref": _FIX_IR_REF,
+            "pipeline_ref": _FIX_PIPE_REF,
+            "source_id": src_id,
+            # Normally injected by record_launch from spec.ir.yaml.impl_defaults.
+            "_resolved_build_system": "make",
+            "allowed_output_paths": [src_dir],
+        }
+        allowed = _allowed_output_paths_for_launch(
+            request_payload=req,
+            write_roots=[
+                f"{_FIX_PIPE_REF}/source/",
+                f"{_FIX_PIPE_REF}/lineage.json",
+            ],
+        )
+        self.assertIn(makefile, allowed)
+        # Auto-derived file-tool paths (raw=None) must carry the Makefile so the
+        # child can Edit/Write it.
+        file_tool = _allowed_file_tool_paths_for_launch(
+            request_payload=req,
+            allowed_output_paths=allowed,
+        )
+        self.assertIn(makefile, file_tool)
+
+    def test_generate_non_make_launch_does_not_inject_makefile_pin(self) -> None:
+        """Fix 1 is Make-scoped: CMake/Meson Generate launches must NOT get a
+        Makefile pin auto-injected (out-of-source toolchains do not build with
+        an in-source Makefile)."""
+        from tools.orchestration_runtime import _allowed_output_paths_for_launch
+
+        src_id = "src_20260604_003"
+        src_dir = f"{_FIX_PIPE_REF}/source/{src_id}/src/"
+        req = {
+            "agent_role": "step",
+            "step": "generate",
+            "node_key": "problem/shallow_water2d@0.3.0",
+            "ir_ref": _FIX_IR_REF,
+            "pipeline_ref": _FIX_PIPE_REF,
+            "source_id": src_id,
+            "_resolved_build_system": "cmake",
+            "allowed_output_paths": [src_dir],
+        }
+        allowed = _allowed_output_paths_for_launch(
+            request_payload=req,
+            write_roots=[
+                f"{_FIX_PIPE_REF}/source/",
+                f"{_FIX_PIPE_REF}/lineage.json",
+            ],
+        )
+        self.assertNotIn(
+            f"{_FIX_PIPE_REF}/source/{src_id}/src/Makefile", allowed
+        )
+
+    def test_generate_verify_make_launch_does_not_inject_makefile_pin(self) -> None:
+        """Fix 1 must be scoped to the source-generating launch: the
+        Generate.verify substep (which inspects src/ and writes source_meta.json)
+        must NOT receive Makefile write authority, even for a Make pipeline —
+        otherwise the verifier could mutate the artifact it is judging."""
+        from tools.orchestration_runtime import (
+            _allowed_file_tool_paths_for_launch,
+            _allowed_output_paths_for_launch,
+        )
+
+        src_id = "src_20260604_005"
+        source_meta = f"{_FIX_PIPE_REF}/source/{src_id}/source_meta.json"
+        makefile = f"{_FIX_PIPE_REF}/source/{src_id}/src/Makefile"
+        req = {
+            "agent_role": "substep",
+            "step": "generate",
+            "substep": "verify",
+            "node_key": "problem/shallow_water2d@0.3.0",
+            "ir_ref": _FIX_IR_REF,
+            "pipeline_ref": _FIX_PIPE_REF,
+            "source_id": src_id,
+            "_resolved_build_system": "make",
+            "allowed_output_paths": [source_meta],
+        }
+        allowed = _allowed_output_paths_for_launch(
+            request_payload=req,
+            write_roots=[
+                f"{_FIX_PIPE_REF}/source/",
+                f"{_FIX_PIPE_REF}/lineage.json",
+            ],
+        )
+        self.assertNotIn(makefile, allowed)
+        # And no mandatory-pin validation fires for the verify substep.
+        file_tool = _allowed_file_tool_paths_for_launch(
+            request_payload=req,
+            allowed_output_paths=allowed,
+        )
+        self.assertNotIn(makefile, file_tool)
+
+    def test_generate_make_launch_rejects_explicit_file_tool_omitting_makefile(self) -> None:
+        """Fix 2: when the caller passes an explicit allowed_file_tool_paths that
+        omits the mandatory Makefile pin, the launch must fail fast (before the
+        child spawns) with a clear remediation — converting an artifact-
+        corrupting mid-run fail-stop into a cheap, recoverable launch error."""
+        from tools.orchestration_runtime import (
+            _allowed_file_tool_paths_for_launch,
+            _allowed_output_paths_for_launch,
+        )
+
+        src_id = "src_20260604_004"
+        src_dir = f"{_FIX_PIPE_REF}/source/{src_id}/src/"
+        model = f"{_FIX_PIPE_REF}/source/{src_id}/src/model.f90"
+        req = {
+            "agent_role": "step",
+            "step": "generate",
+            "node_key": "problem/shallow_water2d@0.3.0",
+            "ir_ref": _FIX_IR_REF,
+            "pipeline_ref": _FIX_PIPE_REF,
+            "source_id": src_id,
+            "_resolved_build_system": "make",
+            "allowed_output_paths": [src_dir, model],
+            # Explicit list omits the mandatory Makefile pin.
+            "allowed_file_tool_paths": [model],
+        }
+        allowed = _allowed_output_paths_for_launch(
+            request_payload=req,
+            write_roots=[
+                f"{_FIX_PIPE_REF}/source/",
+                f"{_FIX_PIPE_REF}/lineage.json",
+            ],
+        )
+        with self.assertRaisesRegex(ValueError, "mandatory build-control file"):
+            _allowed_file_tool_paths_for_launch(
+                request_payload=req,
+                allowed_output_paths=allowed,
+            )
+
     def test_rejects_launch_with_placeholder_plan_or_pipeline_refs(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
@@ -3874,6 +4022,128 @@ shell_tool                       stable             true
                 / "step_run_build_mcp_log.unauthorized_write_violation.json"
             )
             self.assertFalse(violation_path.exists())
+
+    def test_record_agent_run_recovers_collaterally_deleted_lineage_placeholder(self) -> None:
+        """Fix 4 (recoverability): a failed Generate run whose runtime-created
+        lineage.json placeholder was collaterally deleted outside the gate must
+        still be recordable. record-agent-run restores the 0-byte placeholder
+        before the baseline diff so the run is appended to agent_runs.jsonl
+        instead of fail-closing on an unrecoverable unauthorized_write over a
+        runtime-owned artifact."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            init_orchestration(repo_root=repo_root, orchestration_id="orch_001")
+            _mark_dependencies_ready(repo_root)
+            write_preflight(
+                repo_root=repo_root,
+                orchestration_id="orch_001",
+                payload={
+                    "status": "pass",
+                    "sandbox_runtime": "bwrap",
+                    "sandbox_enforced": True,
+                    "can_launch_step_agents": True,
+                    "can_launch_substep_agents": True,
+                    "feature_states": {"multi_agent": True, "codex_hooks": True},
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
+                },
+            )
+            record_agent_run(
+                repo_root=repo_root,
+                orchestration_id="orch_001",
+                payload={
+                    "agent_run_id": "orch_run_001",
+                    "agent_role": "orchestration",
+                    "status": "running",
+                    "agent_backend": "claude",
+                },
+            )
+            src_id = "src_20260604_010"
+            src_dir = f"{_FIX_PIPE_REF}/source/{src_id}/src/"
+            lineage_ref = f"{_FIX_PIPE_REF}/lineage.json"
+            record_launch(
+                repo_root=repo_root,
+                orchestration_id="orch_001",
+                parent_agent_run_id="orch_run_001",
+                child_agent_run_id="step_run_gen_recover",
+                request_payload={
+                    "node_key": "problem/shallow_water2d@0.3.0",
+                    "step": "generate",
+                    "agent_role": "step",
+                    "orchestration_id": "orch_001",
+                    "agent_run_id": "step_run_gen_recover",
+                    "parent_agent_run_id": "orch_run_001",
+                    "ir_ref": _FIX_IR_REF,
+                    "pipeline_ref": _FIX_PIPE_REF,
+                    "dependency_ref": f"{_FIX_IR_REF}/spec.ir.yaml",
+                    "source_id": src_id,
+                    "allowed_output_paths": [src_dir],
+                    "skill_name": "workflow-generate",
+                    "skill_ref": "skills/workflow-generate/SKILL.md",
+                    "skill_must_read_refs": _fixture_skill_must_read_refs_step("generate"),
+                    "launch_prompt_full": _step_launch_prompt(
+                        "problem/shallow_water2d@0.3.0",
+                        "generate",
+                        "step_run_gen_recover",
+                    ),
+                },
+                response_payload=_spawn_response_payload("sess_step_run_gen_recover"),
+            )
+            # record_launch pre-creates the lineage.json file-pin placeholder.
+            lineage_path = repo_root / lineage_ref
+            self.assertTrue(
+                lineage_path.exists(),
+                "launch must pre-create the lineage.json placeholder",
+            )
+            # Simulate the collateral deletion of the placeholder outside the gate.
+            lineage_path.unlink()
+            self.assertFalse(lineage_path.exists())
+
+            # The failed run must record without raising; pre-fix this raised a
+            # ValueError (unauthorized_write over lineage.json) and the run was
+            # diverted to agent_runs_invalid.jsonl, dead-locking the orchestration.
+            payload = record_agent_run(
+                repo_root=repo_root,
+                orchestration_id="orch_001",
+                payload={
+                    "agent_run_id": "step_run_gen_recover",
+                    "agent_role": "step",
+                    "parent_agent_run_id": "orch_run_001",
+                    "step": "generate",
+                    "node_key": "problem/shallow_water2d@0.3.0",
+                    "status": "fail",
+                    "agent_backend": "claude",
+                    "agent_session_id": "sess_step_run_gen_recover",
+                    "result_summary": "generate fail-stopped (test fixture)",
+                    "output_refs": [],
+                },
+            )
+            self.assertEqual(payload["status"], "fail")
+            violation_path = (
+                repo_root
+                / "workspace/orchestrations/orch_001/violations"
+                / "step_run_gen_recover.unauthorized_write_violation.json"
+            )
+            self.assertFalse(
+                violation_path.exists(),
+                "collateral deletion of a runtime-owned placeholder must not be "
+                "recorded as an unauthorized write",
+            )
+            # The failed run is durably recorded (valid log), not diverted to the
+            # invalid log.
+            runs_log = (
+                repo_root
+                / "workspace/orchestrations/orch_001/agent_runs.jsonl"
+            )
+            self.assertIn("step_run_gen_recover", runs_log.read_text(encoding="utf-8"))
+            invalid_log = (
+                repo_root
+                / "workspace/orchestrations/orch_001/agent_runs_invalid.jsonl"
+            )
+            if invalid_log.exists():
+                self.assertNotIn(
+                    "step_run_gen_recover",
+                    invalid_log.read_text(encoding="utf-8"),
+                )
 
     def test_execute_run_quality_checks_cross_phase_mcp_log_authorized(self) -> None:
         """Execute's run_quality_checks runs with project_dir=generate/<gen>/src/
@@ -13300,6 +13570,144 @@ class BwrapProfileFilePinTests(unittest.TestCase):
             # Must create the directory itself, not just its parent
             dir_path = repo_root / "workspace" / "ir" / "v1.0"
             self.assertTrue(dir_path.is_dir(), "dotted directory write_root must be created as directory")
+
+    def test_restore_deleted_file_pin_stubs_recreates_absent_stub(self) -> None:
+        """_restore_deleted_file_pin_stubs must re-create (as 0-byte) a
+        runtime-created file-pin stub that was collaterally deleted, while
+        leaving gate-covered stubs and present stubs untouched."""
+        from tools.orchestration_runtime import (
+            build_bwrap_profile,
+            _restore_deleted_file_pin_stubs,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            orch = "orch_restore_001"
+            run_id = "run_restore_001"
+            pin = "workspace/pipelines/a__b__1.0/lineage.json"
+            self._write_cap_and_manifest(
+                repo_root, orchestration_id=orch, agent_run_id=run_id,
+                write_roots=[pin],
+            )
+            profile = build_bwrap_profile(
+                repo_root=repo_root,
+                orchestration_id=orch,
+                agent_run_id=run_id,
+                backend_command="python3 agent.py",
+            )
+            self._save_profile(repo_root, orch, run_id, profile)
+            pin_path = repo_root / pin
+            self.assertTrue(pin_path.exists())
+
+            # Collateral deletion.
+            pin_path.unlink()
+            restored = _restore_deleted_file_pin_stubs(
+                repo_root, orch, agent_run_id=run_id
+            )
+            self.assertEqual(restored, [pin])
+            self.assertTrue(pin_path.exists())
+            self.assertEqual(pin_path.stat().st_size, 0)
+            # Regression: the restored stub must reproduce the recorded mtime so
+            # _cleanup_empty_file_pin_stubs still treats it as an untouched stub
+            # and removes it (otherwise an empty placeholder lingers as
+            # canonical workspace data).
+            from tools.orchestration_runtime import _cleanup_empty_file_pin_stubs
+            _cleanup_empty_file_pin_stubs(repo_root, orch, agent_run_id=run_id)
+            self.assertFalse(
+                pin_path.exists(),
+                "a restored untouched stub must remain eligible for cleanup",
+            )
+
+            # Idempotent: a present stub is not re-touched / re-reported.
+            pin_path.touch()
+            restored_again = _restore_deleted_file_pin_stubs(
+                repo_root, orch, agent_run_id=run_id
+            )
+            self.assertEqual(restored_again, [])
+
+            # A stub covered by skip_prefixes (e.g. a path the agent mutated
+            # through guarded-apply-patch) is left untouched.
+            pin_path.unlink()
+            skipped = _restore_deleted_file_pin_stubs(
+                repo_root, orch, agent_run_id=run_id, skip_prefixes=[pin]
+            )
+            self.assertEqual(skipped, [])
+            self.assertFalse(pin_path.exists())
+
+    def test_guarded_apply_patch_restores_collaterally_deleted_pin_stub(self) -> None:
+        """Fix 3 (probing-deletion safety): guarded_apply_patch must never leave
+        a runtime-owned file-pin stub deleted out-of-band. Applying a patch to
+        an unrelated path must re-create a collaterally-deleted placeholder that
+        is not part of the declared changed_paths."""
+        from tools.orchestration_runtime import (
+            build_bwrap_profile,
+            guarded_apply_patch,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            subprocess.run(["git", "init", "--quiet"], cwd=str(repo_root), check=True)
+            subprocess.run(["git", "config", "commit.gpgsign", "false"], cwd=str(repo_root), check=True)
+            subprocess.run(["git", "config", "user.email", "test@test.com"], cwd=str(repo_root), check=True)
+            subprocess.run(["git", "config", "user.name", "Test"], cwd=str(repo_root), check=True)
+
+            orch = "orch_gap_restore_001"
+            run_id = "run_gap_restore_001"
+            pin = "workspace/pipelines/a__b__1.0/lineage.json"
+            self._write_cap_and_manifest(
+                repo_root, orchestration_id=orch, agent_run_id=run_id,
+                write_roots=[pin],
+            )
+            profile = build_bwrap_profile(
+                repo_root=repo_root,
+                orchestration_id=orch,
+                agent_run_id=run_id,
+                backend_command="python3 agent.py",
+            )
+            self._save_profile(repo_root, orch, run_id, profile)
+            pin_path = repo_root / pin
+            self.assertTrue(pin_path.exists())
+            # Collateral deletion before an (unrelated) gate apply.
+            pin_path.unlink()
+
+            target = "workspace/foo/bar.json"
+            (repo_root / "workspace" / "foo").mkdir(parents=True)
+            patch_text = "\n".join(
+                [
+                    f"diff --git {target} {target}",
+                    "new file mode 100644",
+                    "--- /dev/null",
+                    f"+++ {target}",
+                    "@@ -0,0 +1 @@",
+                    '+{"created": true}',
+                    "",
+                ]
+            )
+            with (
+                patch("tools.orchestration_runtime.gate_apply_patch_writes") as gate_mock,
+                patch("tools.orchestration_runtime._write_apply_patch_gate_evidence") as evidence_mock,
+            ):
+                gate_mock.return_value = {"allowed": True}
+                evidence_mock.return_value = (
+                    f"workspace/orchestrations/{orch}/gates/{run_id}/apply_patch_writes.json"
+                )
+                out = guarded_apply_patch(
+                    repo_root,
+                    orchestration_id=orch,
+                    actor_role="orchestration",
+                    agent_run_id=run_id,
+                    changed_paths=[target],
+                    patch_text=patch_text,
+                    capability_token="tok",
+                )
+            self.assertTrue(out.get("applied"))
+            self.assertTrue((repo_root / target).exists())
+            # The placeholder, absent and outside changed_paths, was restored.
+            self.assertTrue(
+                pin_path.exists(),
+                "guarded_apply_patch must restore the collaterally-deleted pin stub",
+            )
+            self.assertEqual(pin_path.stat().st_size, 0)
 
     def _save_profile(self, repo_root: Path, orchestration_id: str, agent_run_id: str, profile: dict) -> None:
         """Helper: save bwrap profile to disk so _cleanup_empty_file_pin_stubs can find it."""
