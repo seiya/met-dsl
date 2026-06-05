@@ -7,6 +7,7 @@
 - execution input: `source/<source_id>/src/`、`spec.ir.yaml` の `impl_defaults`
 - verification input: `spec.ir.yaml`、`source_meta.json`
 - 出力: `workspace/pipelines/<node_key_safe>/<pipeline_id>/binary/<binary_id>/bin/`、`binary_meta.json`、`compile_project` の `command_id` と `command_log_ref`
+  - `build_system=make` の in-source Make は out-of-source override で実行する: 実行 binary は `BINDIR=<pipeline>/binary/<binary_id>/bin` へ、object/`.mod` は `OBJDIR=workspace/tmp/<agent_run_id>/build`（per-run tmp、auto-clean）へ出力し、`src/` には cross-phase MCP audit log 以外を書かない。`binary_meta.json#binary_artifact_ref` は `binary/<binary_id>/bin/<exe>` を指す。
 
 ## `binary_id` フォーマット
 - 形式: `bin_<YYYYMMDD>_<seq3>`、例: `bin_20260511_001`
@@ -16,6 +17,7 @@
 - `Build` は `compile_project` を使用し、`fortran` / `c` / `cpp` / `mixed` 系では依存関係を扱える標準ビルドツール（既定 `make`）を使用する。
 - `spec.ir.yaml.impl_defaults.toolchain.build_system=make` の `Build` 入力は、`src/Makefile` が言語依存のコンパイル順序依存を前提条件として明示した依存関係完全版でなければならない。
 - `spec.ir.yaml.impl_defaults.toolchain.build_system=make` の `Build` は、`make -j` で成否が変化しない依存記述を必須とする。
+- `spec.ir.yaml.impl_defaults.toolchain.build_system=make` の `Build` は、`compile_project` の `extra_args` に `OBJDIR=<abs>/workspace/tmp/<agent_run_id>/build` と `BINDIR=<abs>/<pipeline>/binary/<binary_id>/bin` を渡し、build artifact を `src/` 外（object は per-run tmp、exe は `binary/<binary_id>/bin/`）へ出さなければならない。実行 binary path は `allowed_output_paths` に file 形式で列挙する。`src/` 配下への `.o`/`.mod`/exe 書き込みは Build capability write_root（`binary/` のみ）外であり `unauthorized_write_violation` → `fail_closed` を招く。
 - `compile_project` の実コマンド記録は `JSONL` 形式で保存し、既定の保存先は `project_dir/mcp_command_log.jsonl` とする。
 - `Build` の試行メタデータ (`binary_meta.json`) は `command_id` と `command_log_ref`（または `command_log_path`）を追跡可能に記録する。
 - `Build` は依存を持つ `node` で、依存 `operation` 解決先が `spec.ir.yaml.dependency` と一致することを必須検証とする。不一致時は `Build fail` とする。
@@ -26,6 +28,7 @@
 ## `binary_meta.json` 必須 key
 - `attempt_count`、`verification_status`、`last_fail_reason`
 - `source_source_id`: 入力ソースを発行した `source_id`
+- `binary_artifact_ref`: 実行 binary の canonical path `binary/<binary_id>/bin/<exe>`（out-of-source `BINDIR` 出力。`src/` 配下を指してはならない）。`Validate.execute` の `run_program` 入力解決に必須。
 - `command_id`、`command_log_ref`（または `command_log_path`）
 - `validation_stage`: `post_build` または `full`
 - `failure_category`、`failure_source_refs[]`、`failure_excerpt`: `verification_status=fail` の場合に必須。Generate retry の deterministic な trigger に使用（詳細は「失敗時挙動」節）。

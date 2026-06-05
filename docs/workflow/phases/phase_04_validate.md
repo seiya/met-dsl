@@ -47,7 +47,7 @@
 - `quality_check.json` は `checks.verdict_available=true` と `checks.diagnostics_match=true` と `checks.verdict_match=true` を同時に満たさなければならない。いずれかが `false` または欠落の場合は `Validate.execute fail` とする。
 - `quality check` 実行は `run_quality_checks` の `preset` 指定のみを許可し、`python3 quality_check.py` など任意コマンド実行を禁止する。
 - `Validate.execute` は `quality check` 成立のために `runs/<run_id>/<node_key>/` 配下へ `test` source、harness、補助 `script`、一時 `Makefile` を生成してはならない。必要 artifact が `Generate` または `Build` 出力に存在しない場合は `Validate.execute fail` とする。
-- `spec.ir.yaml.impl_defaults.toolchain.build_system=make` かつ `toolchain.language=fortran` / `c` / `cpp` / `mixed` 系では、`quality check` は `source/<source_id>/src/` を `project_dir` とする `make_test` または `make_check` で実行する。
+- `spec.ir.yaml.impl_defaults.toolchain.build_system=make` かつ `toolchain.language=fortran` / `c` / `cpp` / `mixed` 系では、`quality check` は `source/<source_id>/src/` を `project_dir` とする `make_test` または `make_check` で実行する。`run_quality_checks` には `env={OBJDIR:<abs tmp build>, BINDIR:<abs binary/<source_binary_id>/bin>, RUNDIR:<abs runs/<run_id>/<node_safe>>}` を渡し、既存 binary を `binary/<source_binary_id>/bin/` から参照する（read-only bind の `binary/` で relink しない）。test の run 出力は `RUNDIR`（run node dir）配下に閉じ、`src/` には cross-phase audit log 以外を書かない。
 - `perf.json` の仕様は `PERFORMANCE_DIAGNOSTICS.md` を参照する。
 - `Validate.execute` 完了前に `python3 tools/validate_pipeline_semantics.py --stage post_execute` を実行し、`exit code 0` を必須とする。`--pipeline-root` は繰り返し指定可能とし、`spec.ir.yaml.dependency.all_nodes` が複数 `node` を保持する試行では `all_nodes` に対応する全 `pipeline_root` を指定する。
 
