@@ -125,7 +125,7 @@ repair_reason: <repair_reason>
 - `Generate` / `Build` / `Validate` の substep は、直下依存 `node` の `direct dependency execution readiness` を満たさない限り開始してはならない。
 - 直下依存 `node` が未完了でも、依存先 code を対象 `node` の `src/` へ内包して代替してはならない。
 - **MCP 副次出力の `mcp_command_log.jsonl` を必ず `allowed_output_paths` に含めること**。canonical placement は phase ごとに以下:
-  - Generate substep: `<pipeline_ref>/source/<source_id>/src/mcp_command_log.jsonl` (run_linter)
+  - Generate substep: `<pipeline_ref>/source/<source_id>/src/mcp_command_log.jsonl` (run_linter)。**この auto-inject と `run_linter` 副次出力は `generate.generate` substep のみ**に対応する。`generate.verify` substep の `allowed_output_paths` は `run_linter` 副次出力 (`mcp_command_log.jsonl`) を authorize しないため、verify launch prompt に `run_linter` 実行を記載してはならない (verify が記載してよい `validate_pipeline_semantics --stage` は下記「substep ↔ allowed validator gate 対応表」のとおり `post_generate` のみ; read-only の `validate_workspace_root.py` は別途許可)。
   - Build step (in-phase, CMake/Meson out-of-source): `<pipeline_ref>/binary/<binary_id>/mcp_command_log.jsonl` (compile_project, project_dir=<binary_id>/)
   - Build step (cross-phase, Make in-source for Fortran/C-family): `<pipeline_ref>/source/<source_id>/src/mcp_command_log.jsonl` (compile_project, project_dir=<gen>/src/)。launch request の `source_id` で bind され、`record-launch` が `source_meta.json` の `verification_status=pass` を検証する
   - Validate.execute substep (in-phase): `<pipeline_ref>/runs/<run_id>/<node_safe>/mcp_command_log.jsonl` (run_program 等)
@@ -321,6 +321,8 @@ EOF
 **recording-layer との区別:** `skills/workflow-orchestration/SKILL.md` line 116 は `step_result.json#validation_stage` に**記録してよい**値として step 単位の広めの集合 (`full` を含む) を定義しており、これは write-step-result 時の recording-layer contract である。本表は launch-prompt 時の invocation-layer contract であり、recording-layer よりも厳格な per-substep 制約を課す。両者は別 layer の contract であり、本表で per-substep に絞られた結果として recording される `validation_stage` 値も自動的に SKILL.md line 116 の許容集合に含まれる (例: `compile/verify` で実行可能なのは `compile` のみ → SKILL.md `compile`/`full` 集合の subset)。
 
 **negative constraint:** 上記表に許可されていない `--stage` の `validate_pipeline_semantics` 呼び出しを本 `(step, substep)` の launch prompt に記載してはならない。例: `Compile.generate` 用 prompt に `validate_pipeline_semantics --stage compile` を含めると `Compile.verify` 責務を侵害し `noncanonical_phase_write_attempt` を発火する。MCP tool 名 (`compile_project` 等) の単なる言及 (説明文・negative constraint 等) は本 lint の対象外とする。
+
+**negative constraint (MCP write tool):** `generate/verify` 用 launch prompt に `run_linter` 等の `build-runtime` MCP write tool の実行を記載してはならない。lint は `generate.generate` 責務であり (`docs/workflow/phases/phase_02_generate.md` 2-1)、verify での実行は verify の `allowed_output_paths` が authorize しない `mcp_command_log.jsonl` への書き込みを誘発し `unauthorized_write_violation` → `fail_closed` を招く。本制約は `build-runtime` MCP write tool のみを対象とし、read-only の `validate_workspace_root.py` および `validate_pipeline_semantics --stage post_generate` (上表) は引き続き許可する。
 
 `record-launch` は `_validate_launch_prompt_text` 内で `launch_prompt_ref` のテキストに対して per-(step, substep) の allowed-stage 集合を照合する。actionable な invocation 行 (`python3` / `tools/validate_pipeline_semantics.py` / `--gate validate_pipeline_semantics` を含む行) のみを scan し、direct CLI 形式と canonical run-gate JSON 形式 (`--args-json '{"stage": "..."}'`) の両方を抽出して allowed-stage 外なら `ValueError` で reject する (`tools/orchestration_runtime.py::_lint_launch_prompt_gate_allowlist` と `ALLOWED_VALIDATE_PIPELINE_STAGES` が canonical 実装)。緊急 rollback 用に env `METDSL_ENFORCE_GATE_ALLOWLIST=0` で lint を無効化できる (default は有効)。
 

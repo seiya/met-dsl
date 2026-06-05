@@ -53,6 +53,8 @@
 ### 2-2. Generate.verify substep
 `Generate.verify` 完了前に `python3 tools/validate_pipeline_semantics.py --stage post_generate --pipeline-root workspace/pipelines/<node_key_safe>/<pipeline_id>/` を実行し、検証対象の `source_id` を固定する場合は `--source-id <source_id>` を付与する。`exit code 0` を必須とする。
 
+`Generate.verify` は `run_linter` を含む `build-runtime` MCP の write 系 tool（`run_linter` / `compile_project` / `run_program` / `run_quality_checks`）を実行してはならない（`static lint` は 2-1 の `Generate.generate` 責務）。verify が起動してよい外部 gate は read-only の `validate_workspace_root.py` と `validate_pipeline_semantics --stage post_generate` に限定し、`lint_command_ref.run_linter` は既存記録の *検査* 対象に限定する。verify の `allowed_output_paths` は `run_linter` の副次出力 (`mcp_command_log.jsonl`) を authorize しないため、verify から `run_linter` を実行するとその書き込みが manifest 外となり `unauthorized_write_violation` → `fail_closed` を招く。
+
 `Generate.verify` 必須検証項目:
 
 #### G1. case 被覆性
