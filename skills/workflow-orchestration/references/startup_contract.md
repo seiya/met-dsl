@@ -119,6 +119,8 @@ node_key_safe → component__dynamics_shallow_water_flux_2d_rusanov_p0__0.1.0
 
 `reserve-phase-root` の `--reserved-id` にはこの形式で渡す。
 
+> **`run_id` は例外:** 上記 `<slug>_<YYYYMMDD>_<seq3>` 形式は `ir_id` / `pipeline_id` 専用。`Validate` の `run_id` は **固定 literal `run_` prefix** を持つ `run_<YYYYMMDD>_<seq3>` 形式（例: `run_20260605_001` ✓）であり、slug 形式を流用してはならない（`run-rsn-p0_20260605_001` ✗）。ハイフン slug 形式は generic slug 正規表現には合致してしまうが、`record-launch` の Validate phase contract が `outside phase contract` で reject し、仮に通過しても `post_execute` の run 発見が silent fail する。
+
 ### `ir_ref` / `pipeline_ref` の形式
 
 ```

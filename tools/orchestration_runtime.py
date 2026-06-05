@@ -1387,6 +1387,21 @@ _NODE_KEY_ID_SEGMENT_RE = re.compile(r"^[a-z0-9][a-z0-9_]*$")
 _NODE_KEY_VERSION_RE = re.compile(r"^[0-9][0-9A-Za-z._-]*$")
 _SLUG_DATE_SEQ3_PATTERN = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*_[0-9]{8}_[0-9]{3}$")
 
+# `run_id` is the one id in the family that is NOT a `<slug>_<date>_<seq3>`
+# value: it carries a fixed literal `run_` prefix (`run_<YYYYMMDD>_<seq3>`,
+# e.g. `run_20260605_001`). A slug-shaped run_id like `run-rsn-p0_20260605_001`
+# (mistakenly generalized from the ir_id/pipeline_id naming rule) MATCHES
+# `_SLUG_DATE_SEQ3_PATTERN` (slug=`run-rsn-p0`) and therefore used to slip
+# through the `_matches_phase_contract` write-acceptance boundary, yet the
+# Validate `post_execute` run discovery in `tools/validate_pipeline_semantics.py`
+# only recognizes the canonical `runs/run_<date>_<seq>/...` layout and reports
+# "no execution artifacts found". The validate run-dir branches in
+# `_matches_phase_contract` enforce THIS stricter shape so the format drift
+# fails fast at launch (record-launch raises "outside phase contract") instead
+# of a silent downstream no-match. IMPORTANT: keep this in lock-step with the
+# canonical run dir grammar that `post_execute` discovery relies on.
+_RUN_ID_RE = re.compile(r"^run_[0-9]{8}_[0-9]{3}$")
+
 # Codex round 31 F2 → round 36: keep reader (`_FRESHNESS_CANONICAL_ID_RE`)
 # and writer (`_SLUG_DATE_SEQ3_PATTERN`) grammars in lock-step. The capture
 # groups in the reader (`([0-9]{8})` / `([0-9]{3})`) are the only intentional
@@ -4154,14 +4169,22 @@ def _allowed_output_paths_for_launch(
             tail = path[len(validate_prefix):]
             tail_parts = [part for part in tail.split("/") if part]
             # Validate.execute contract must be under runs/<run_id>/<node_safe>/...
-            # Codex round 29 F2: enforce canonical `<slug>_YYYYMMDD_NNN`
-            # on `run_id` so the round-23 freshness filter for
-            # `runs/<run_id>/.../aggregate_verdict.json` never has to
-            # silently drop legitimate verdicts of downstream consumers.
+            # Codex round 29 F2: enforce canonical `run_id` so the round-23
+            # freshness filter for `runs/<run_id>/.../aggregate_verdict.json`
+            # never has to silently drop legitimate verdicts of downstream
+            # consumers.
+            # run_id uses the strict `run_<YYYYMMDD>_<seq3>` grammar
+            # (`_RUN_ID_RE`), NOT the generic `<slug>_<date>_<seq3>` grammar:
+            # a slug-shaped value like `run-rsn-p0_20260605_001` matched the
+            # old `_SLUG_DATE_SEQ3_PATTERN` (slug=`run-rsn-p0`) and slipped
+            # through here, yet the Validate `post_execute` run discovery only
+            # recognizes the literal `run_` layout and silently reported
+            # "no execution artifacts found". Rejecting it at this boundary
+            # surfaces the mistake at launch instead.
             if (
                 len(tail_parts) < 3
                 or tail_parts[1] != node_safe
-                or not _SLUG_DATE_SEQ3_PATTERN.match(tail_parts[0])
+                or not _RUN_ID_RE.fullmatch(tail_parts[0])
             ):
                 return False
             rel_under_node = "/".join(tail_parts[2:])
@@ -4189,11 +4212,13 @@ def _allowed_output_paths_for_launch(
             # Validate.judge contract must be under runs/<run_id>/<node_safe>/...
             # Codex round 29 F2: same canonical-id enforcement as the
             # execute substep — judge writes the aggregate_verdict that
-            # downstream dependency_readiness consumes.
+            # downstream dependency_readiness consumes. run_id uses the strict
+            # `run_<YYYYMMDD>_<seq3>` grammar (`_RUN_ID_RE`); see the execute
+            # branch above for why the generic slug grammar is insufficient.
             if (
                 len(tail_parts) < 3
                 or tail_parts[1] != node_safe
-                or not _SLUG_DATE_SEQ3_PATTERN.match(tail_parts[0])
+                or not _RUN_ID_RE.fullmatch(tail_parts[0])
             ):
                 return False
             rel_under_node = "/".join(tail_parts[2:])

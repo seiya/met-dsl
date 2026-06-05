@@ -2763,6 +2763,61 @@ shell_tool                       stable             true
         )
         self.assertIn(expected_log, out)
 
+    def test_record_launch_rejects_slug_shaped_validate_run_id(self) -> None:
+        """Regression for the orch_…_2947d72c failure: a slug-shaped run_id
+        like `run-rsn-p0_20260605_001` matches the generic
+        `_SLUG_DATE_SEQ3_PATTERN` (slug=`run-rsn-p0`) and used to slip past the
+        write-acceptance boundary, but is NOT a canonical run_id (no literal
+        `run_` prefix) so the Validate post_execute discovery silently found no
+        artifacts. The boundary must now reject it at launch."""
+        from tools.orchestration_runtime import _allowed_output_paths_for_launch
+
+        run_id = "run-rsn-p0_20260605_001"
+        node_safe = "problem__shallow_water2d__0.3.0"
+        req = {
+            "agent_role": "step",
+            "node_key": "problem/shallow_water2d@0.3.0",
+            "step": "validate", "substep": "execute",
+            "ir_ref": _FIX_IR_REF,
+            "pipeline_ref": _FIX_PIPE_REF,
+            "run_id": run_id,
+            "allowed_output_paths": [
+                f"{_FIX_PIPE_REF}/runs/{run_id}/{node_safe}/diagnostics.json",
+                f"{_FIX_PIPE_REF}/runs/{run_id}/{node_safe}/perf.json",
+            ],
+        }
+        with self.assertRaisesRegex(ValueError, "outside phase contract"):
+            _allowed_output_paths_for_launch(
+                request_payload=req,
+                write_roots=[f"{_FIX_PIPE_REF}/runs/"],
+            )
+
+    def test_record_launch_accepts_canonical_validate_run_id(self) -> None:
+        """The canonical run_<YYYYMMDD>_<seq3> form must continue to pass."""
+        from tools.orchestration_runtime import _allowed_output_paths_for_launch
+
+        run_id = "run_20260605_001"
+        node_safe = "problem__shallow_water2d__0.3.0"
+        req = {
+            "agent_role": "step",
+            "node_key": "problem/shallow_water2d@0.3.0",
+            "step": "validate", "substep": "execute",
+            "ir_ref": _FIX_IR_REF,
+            "pipeline_ref": _FIX_PIPE_REF,
+            "run_id": run_id,
+            "allowed_output_paths": [
+                f"{_FIX_PIPE_REF}/runs/{run_id}/{node_safe}/diagnostics.json",
+                f"{_FIX_PIPE_REF}/runs/{run_id}/{node_safe}/perf.json",
+            ],
+        }
+        out = _allowed_output_paths_for_launch(
+            request_payload=req,
+            write_roots=[f"{_FIX_PIPE_REF}/runs/"],
+        )
+        self.assertIn(
+            f"{_FIX_PIPE_REF}/runs/{run_id}/{node_safe}/diagnostics.json", out
+        )
+
     def test_build_log_excluded_from_allowed_file_tool_paths(self) -> None:
         """Auto-injected build log must remain integrity-protected (not Edit/Write-eligible)."""
         from tools.orchestration_runtime import (
@@ -11745,7 +11800,7 @@ class TestPhase3RunGate(unittest.TestCase):
             "ir_ref": _FIX_IR_REF,
             "pipeline_ref": _FIX_PIPE_REF,
             "allowed_output_paths": [
-                f"{_FIX_PIPE_REF}/runs/ex_20260101_001/problem__shallow_water2d__0.3.0/summary.json"
+                f"{_FIX_PIPE_REF}/runs/run_20260101_001/problem__shallow_water2d__0.3.0/summary.json"
             ],
         }
         out = _allowed_output_paths_for_launch(
@@ -11754,7 +11809,7 @@ class TestPhase3RunGate(unittest.TestCase):
         )
         self.assertEqual(
             out,
-            [f"{_FIX_PIPE_REF}/runs/ex_20260101_001/problem__shallow_water2d__0.3.0/summary.json"],
+            [f"{_FIX_PIPE_REF}/runs/run_20260101_001/problem__shallow_water2d__0.3.0/summary.json"],
         )
 
     def test_allowed_output_paths_for_launch_rejects_judge_path_under_legacy_judge_root(self) -> None:
@@ -20973,14 +21028,18 @@ class CanonicalIdEnforcementTests(unittest.TestCase):
     def test_validate_execute_rejects_non_canonical_run_id(self) -> None:
         from tools.orchestration_runtime import _allowed_output_paths_for_launch
         node_safe = "problem__shallow_water2d__0.3.0"
-        bad = f"{_FIX_PIPE_REF}/runs/run_001/{node_safe}/diagnostics.json"
         good = f"{_FIX_PIPE_REF}/runs/run_20260101_001/{node_safe}/diagnostics.json"
-        with self.assertRaises(ValueError) as ctx:
-            _allowed_output_paths_for_launch(
-                request_payload=self._build_payload("validate", "execute", [bad]),
-                write_roots=[f"{_FIX_PIPE_REF}/runs/"],
-            )
-        self.assertIn("outside phase contract", str(ctx.exception))
+        # `run_001` lacks the canonical date/seq suffix; `run-rsn-p0_20260605_001`
+        # is slug-shaped (matches `_SLUG_DATE_SEQ3_PATTERN`) yet is NOT a
+        # canonical run_id — run_id requires the literal `run_` prefix.
+        for bad_run_id in ("run_001", "run-rsn-p0_20260605_001"):
+            bad = f"{_FIX_PIPE_REF}/runs/{bad_run_id}/{node_safe}/diagnostics.json"
+            with self.assertRaises(ValueError) as ctx:
+                _allowed_output_paths_for_launch(
+                    request_payload=self._build_payload("validate", "execute", [bad]),
+                    write_roots=[f"{_FIX_PIPE_REF}/runs/"],
+                )
+            self.assertIn("outside phase contract", str(ctx.exception))
         ok_list = _allowed_output_paths_for_launch(
             request_payload=self._build_payload("validate", "execute", [good]),
             write_roots=[f"{_FIX_PIPE_REF}/runs/"],
@@ -20990,14 +21049,17 @@ class CanonicalIdEnforcementTests(unittest.TestCase):
     def test_validate_judge_rejects_non_canonical_run_id(self) -> None:
         from tools.orchestration_runtime import _allowed_output_paths_for_launch
         node_safe = "problem__shallow_water2d__0.3.0"
-        bad = f"{_FIX_PIPE_REF}/runs/ex_001/{node_safe}/aggregate_verdict.json"
         good = f"{_FIX_PIPE_REF}/runs/run_20260101_001/{node_safe}/aggregate_verdict.json"
-        with self.assertRaises(ValueError) as ctx:
-            _allowed_output_paths_for_launch(
-                request_payload=self._build_payload("validate", "judge", [bad]),
-                write_roots=[f"{_FIX_PIPE_REF}/runs/"],
-            )
-        self.assertIn("outside phase contract", str(ctx.exception))
+        # `ex_001` is non-canonical; `run-rsn-p0_20260605_001` is slug-shaped
+        # but still not a canonical run_id (no literal `run_` prefix).
+        for bad_run_id in ("ex_001", "run-rsn-p0_20260605_001"):
+            bad = f"{_FIX_PIPE_REF}/runs/{bad_run_id}/{node_safe}/aggregate_verdict.json"
+            with self.assertRaises(ValueError) as ctx:
+                _allowed_output_paths_for_launch(
+                    request_payload=self._build_payload("validate", "judge", [bad]),
+                    write_roots=[f"{_FIX_PIPE_REF}/runs/"],
+                )
+            self.assertIn("outside phase contract", str(ctx.exception))
         ok_list = _allowed_output_paths_for_launch(
             request_payload=self._build_payload("validate", "judge", [good]),
             write_roots=[f"{_FIX_PIPE_REF}/runs/"],

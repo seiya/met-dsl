@@ -19,6 +19,7 @@
 
 ## `run_id` フォーマット
 - 形式: `run_<YYYYMMDD>_<seq3>`、例: `run_20260511_001`
+- `run_id` は固定 literal `run_` prefix を持つ。`ir_id` / `pipeline_id` の `<slug>_<YYYYMMDD>_<seq3>`（slug はハイフン区切り）形式を流用してはならない。`run-rsn-p0_20260605_001` 等のハイフン slug 形式は generic slug 文法には合致するが canonical `run_id` ではなく、`record-launch` の phase contract が reject し、仮に通過しても `post_execute` の run 発見が literal `run_` layout のみ認識して `no execution artifacts found` で silent fail する。
 
 ## `validate_meta.json` 必須 key
 - 共通: `attempt_count`、`verification_status`、`last_fail_reason`、`debug_mode`、`context_isolated`
@@ -33,6 +34,7 @@
 - `run_program` の実コマンド記録は `JSONL` 形式で保存し、既定の保存先は `project_dir/mcp_command_log.jsonl` とする。
 - `Validate.execute` は `node` 単位で個別実行し、他 `node` の artifact を混在させてはならない。
 - `runner` の出力対象は `diagnostics.json`、`perf.json`、`raw/` 一次証跡、`stdout.log`、`stderr.log` に限定する。
+- `runner`（`run_program` が実行する binary）は canonical run dir へ `diagnostics.json` / `perf.json` を**直書きしてはならない**。canonical `.json` は `guarded-apply-patch` の gate evidence を必須とし、binary 直書きは `unauthorized_write_violation` → `fail_closed` を招く（`mcp_command_log.jsonl` のような MCP-owned audit log とは扱いが異なる）。binary の出力は `allowed_tmp_root`（`workspace/tmp/<exec_agent_run_id>/`）へ落とし、`Validate.execute` agent が tmp の `.json` を読んで canonical `diagnostics.json` / `perf.json` を `guarded-apply-patch`（create-form）で再 author する。`raw/`・`stdout.log`・`stderr.log` は非 `.json` のため `Write` tool で書く。
 - `runner` は `verdict.json`、`aggregate_verdict.json`、`summary.json`、`trial_meta.json` を書き込んではならない（これらは `Validate.judge` の責務）。
 - `diagnostics.json` と `perf.json` は、標準 `JSON` parser で復元可能な UTF-8 `JSON object` として出力しなければならない。
 - `Validate.execute` 完了前に `python3 tools/check_artifact_syntax.py --format json --expect-top object` を用いて `diagnostics.json` と `perf.json` と `quality_check.json` を検査し、`fail` 時は `Validate.execute fail` とする。

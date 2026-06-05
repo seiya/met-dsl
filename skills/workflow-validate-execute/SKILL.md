@@ -21,6 +21,8 @@ Validate phase の execute substep として、判定可能なランタイム ar
 - `spec.ir.yaml.impl_defaults.toolchain.build_system=make` かつ `toolchain.language=fortran` / `c` / `cpp` / `mixed` 系の場合、`quality check` は `source/<source_id>/src/` に対する `run_quality_checks preset=make_test` または `preset=make_check` で実行しなければならない。適合経路が存在しない場合は `Validate.execute fail` とする。
 - 上記 `run_quality_checks` は `env` で out-of-source dir を渡さなければならない: `env={OBJDIR:<abs>/workspace/tmp/<agent_run_id>/build, BINDIR:<abs>/<pipeline>/binary/<source_binary_id>/bin, RUNDIR:<abs>/<pipeline>/runs/<run_id>/<node_safe>}`。`binary/` と `source/` は Validate.execute では read-only bind されるため `make test` は relink してはならず（Makefile の `test -x $(BINDIR)/$(BIN) || $(MAKE) …` guard で既存 binary を参照）、test の run 出力は `$(RUNDIR)`（= 本 substep の write_root たる run node dir）配下に閉じる。`Validate.execute` 中の `src/` 書き込みは cross-phase audit log（`source/<source_id>/src/mcp_command_log.jsonl`）のみ許可され、それ以外（`.o`/`.mod`/exe/`raw/`/`diagnostics.json`/`perf.json` の `src/` 出力）は `unauthorized_write_violation` を招く。
 - `runner` が `model` を呼び出し、`diagnostics.json` と `perf.json` を出力する。
+- `runner`（`run_program` が実行する binary）に canonical run dir (`runs/<run_id>/<node_safe>/`) へ `diagnostics.json` / `perf.json` を**直書きさせてはならない**。これらは canonical `.json` であり `guarded-apply-patch` の gate evidence を必須とするため、binary 直書きは終端 `record-agent-run` で `unauthorized_write_violation` → `fail_closed` を招く（`mcp_command_log.jsonl` のような MCP-owned audit log とは扱いが異なる）。launch は `run_program` の作業/出力先（`project_dir` または case 出力先）を `allowed_tmp_root`（`workspace/tmp/<exec_agent_run_id>/run/`）へ向け、binary は `diagnostics.json` / `perf.json` / `raw/` / log を tmp（auto-authorize）へ落とす。`command_log_path` には canonical `runs/<run_id>/<node_safe>/mcp_command_log.jsonl` を明示する（`project_dir` を tmp にしても MCP log placement gate を満たすため）。
+- execute agent は tmp の `diagnostics.json` / `perf.json` を読み、canonical `runs/<run_id>/<node_safe>/diagnostics.json` / `perf.json`（および `trial_meta.json` / `quality_check.json`）を `guarded-apply-patch`（create-form）で再 author する。`raw/...`・`stdout.log`・`stderr.log` は非 `.json` なので `allowed_file_tool_paths` 内 path への `Write` tool で書く。
 - `runner` が `verdict.json` と `aggregate_verdict.json` と `summary.json` と `trial_meta.json` を直接出力してはならない（これらは `Validate.judge` の責務）。
 - `Validate.execute` 完了条件は `diagnostics.json` と `perf.json` が標準 `JSON` parser で復元可能な UTF-8 `JSON object` であることを含む。不正 `JSON` を検出した場合は `Validate.execute fail` とし、`Validate.judge` を開始してはならない。
 - `Validate.execute` 完了前に `python3 tools/check_artifact_syntax.py --format json --expect-top object` を実行し、`diagnostics.json` と `perf.json` と `quality_check.json` と `trial_meta.json` の構文妥当性を検査しなければならない。
@@ -40,7 +42,7 @@ Validate phase の execute substep として、判定可能なランタイム ar
 - `Validate.execute` 完了前に `python3 tools/validate_pipeline_semantics.py --stage post_execute` を実行し、`fail` 時は `Validate.execute fail` とする。`--pipeline-root` は繰り返し指定可能とし、`spec.ir.yaml.dependency.all_nodes` を保持する試行では `all_nodes` に対応する全 `pipeline_root` を指定しなければならない。
 
 ## 運用ルール
-1. `run_id` を発行し、artifact を `run_id` 単位で分離保存する。
+1. `run_id` を発行し、artifact を `run_id` 単位で分離保存する。`run_id` は固定 literal `run_` prefix を持つ `run_<YYYYMMDD>_<seq3>` 形式（例: `run_20260605_001`）とし、`ir_id` / `pipeline_id` の `<slug>_<YYYYMMDD>_<seq3>` 形式を流用してはならない（`run-rsn-p0_20260605_001` 等のハイフン slug 形式は `record-launch` の phase contract が reject し、通過しても `post_execute` の run 発見が silent fail する）。
 2. 判定入力の混在を避けるため、`run_id` を跨いだ artifact 参照を禁止する。
 3. `node_key` ごとに artifact ディレクトリを分離する。
 4. 実行失敗時は `trial_meta.json` に環境情報と失敗原因を記録する。
