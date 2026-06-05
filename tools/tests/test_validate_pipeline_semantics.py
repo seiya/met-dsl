@@ -52,6 +52,17 @@ _STEP_PHASE_PATH = {
 }
 
 
+def _dependency_ref_for_step(step: str) -> str:
+    """Phase-specific dependency_ref per ORCHESTRATION.md:151.
+
+    Compile records the spec deps.yaml *file*; Generate and later phases record
+    the IR phase-root *directory* (ir_ref).
+    """
+    if step == "compile":
+        return "spec/problem/dynamics/shallow_water/shallow_water2d/deps.yaml"
+    return "workspace/ir/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001"
+
+
 def _step_prompt_fixture(orchestration_id: str, node_key: str, step: str, run_id: str) -> str:
     phase_path = _STEP_PHASE_PATH.get(step, "docs/workflow/phases/phase_01_plan.md")
     refs = (
@@ -66,7 +77,7 @@ agent_run_id: {run_id}
 parent_agent_run_id: orch_run_001
 ir_ref: workspace/ir/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001
 pipeline_ref: workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001
-dependency_ref: workspace/ir/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/spec.ir.yaml
+dependency_ref: {_dependency_ref_for_step(step)}
 skill_name: workflow-{step}
 skill_ref: skills/workflow-{step}/SKILL.md
 skill_must_read_refs: {refs}
@@ -96,7 +107,7 @@ agent_run_id: {run_id}
 parent_agent_run_id: orch_run_001
 ir_ref: workspace/ir/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001
 pipeline_ref: workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001
-dependency_ref: workspace/ir/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/spec.ir.yaml
+dependency_ref: {_dependency_ref_for_step(step)}
 skill_name: workflow-{step}-{substep}
 skill_ref: skills/workflow-{step}-{substep}/SKILL.md
 skill_must_read_refs: {refs}
@@ -148,7 +159,7 @@ def _create_minimal_execution_tree(
             "node_key": "problem/shallow_water2d@0.3.0",
             "pipeline_id": pipeline_id,
             "ir_ref": "workspace/ir/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001",
-            "dependency_ref": "workspace/ir/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/spec.ir.yaml",
+            "dependency_ref": "workspace/ir/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001",
         },
     )
     lint_command_id = "lint_cmd_fixture_001"
@@ -3927,6 +3938,79 @@ shallow_water2d_runner.o: shallow_water2d_runner.f90 shallow_water2d_model.mod
                 },
                 makefile_text=makefile_text,
             )
+            violations = validate_post_generate_stage(
+                repo_root,
+                "workspace",
+                "workspace/pipelines/problem__shallow_water2d__0.3.0/"
+                "shallow-water2d_20260415_001",
+                source_id="src_20260415_001",
+            )
+            self.assertEqual(violations, [])
+
+    def test_validate_post_generate_stage_leaf_node_directory_dependency_ref(self) -> None:
+        """Regression: a leaf node (direct_deps=[]) with dependency_ref pointing at the
+        IR phase-root *directory* (per ORCHESTRATION.md:151) must resolve the dependency
+        block from <ir>/spec.ir.yaml instead of crashing with IsADirectoryError."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            _seed_shape_expr_schema_into(repo_root)
+            dep_model_text = """module dynamics_shallow_water_flux_2d_rusanov_p0_model
+implicit none
+contains
+subroutine dynamics_shallow_water_flux_2d_rusanov_p0__compute_flux(flag)
+  logical, intent(out) :: flag
+  flag = .true.
+end subroutine dynamics_shallow_water_flux_2d_rusanov_p0__compute_flux
+end module dynamics_shallow_water_flux_2d_rusanov_p0_model
+"""
+            model_text = """module shallow_water2d_model
+use dynamics_shallow_water_flux_2d_rusanov_p0_model
+implicit none
+contains
+subroutine solve(flag)
+  logical, intent(out) :: flag
+  call dynamics_shallow_water_flux_2d_rusanov_p0__compute_flux(flag)
+end subroutine solve
+end module shallow_water2d_model
+"""
+            runner_text = """program shallow_water2d_runner
+implicit none
+write(*,*) 'ok'
+end program shallow_water2d_runner
+"""
+            makefile_text = """FC ?= gfortran
+OBJS = dynamics_shallow_water_flux_2d_rusanov_p0_model.o shallow_water2d_model.o shallow_water2d_runner.o
+
+simulate: $(OBJS)
+\t$(FC) -o $@ $(OBJS)
+
+dynamics_shallow_water_flux_2d_rusanov_p0_model.o dynamics_shallow_water_flux_2d_rusanov_p0_model.mod: dynamics_shallow_water_flux_2d_rusanov_p0_model.f90
+\t$(FC) -c $<
+
+shallow_water2d_model.o shallow_water2d_model.mod: shallow_water2d_model.f90 dynamics_shallow_water_flux_2d_rusanov_p0_model.mod
+\t$(FC) -c $<
+
+shallow_water2d_runner.o: shallow_water2d_runner.f90 shallow_water2d_model.mod
+\t$(FC) -c $<
+"""
+            _create_minimal_execution_tree(
+                repo_root,
+                dep_spec_id="dynamics_shallow_water_flux_2d_rusanov_p0",
+                model_text=model_text,
+                runner_text=runner_text,
+                run_command=["x", "y"],
+                extra_sources={
+                    "dynamics_shallow_water_flux_2d_rusanov_p0_model.f90": dep_model_text
+                },
+                makefile_text=makefile_text,
+                dependency_resolved={
+                    "node_key": "problem/shallow_water2d@0.3.0",
+                    "direct_deps": [],
+                    "transitive_deps": [],
+                    "topo_level": 0,
+                },
+            )
+            # dependency_ref written by the fixture is the IR phase-root directory.
             violations = validate_post_generate_stage(
                 repo_root,
                 "workspace",

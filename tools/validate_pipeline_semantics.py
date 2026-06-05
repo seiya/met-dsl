@@ -2093,6 +2093,28 @@ def _validate_generate_outputs_for_generation(
         )
 
 
+def _dependency_doc_path(repo_root: Path, dep_path: Path, ir_ref: str | None) -> Path | None:
+    """Resolve the dependency document from a dependency_ref.
+
+    Compile contract: dependency_ref is a spec/.../deps.yaml *file*.
+    Generate+ contract (ORCHESTRATION.md:151): dependency_ref is the IR/pipeline
+    phase-root *directory*; the dependency block lives in <ir>/spec.ir.yaml.
+    Legacy fixtures also pointed dependency_ref straight at spec.ir.yaml (a file).
+    """
+    if dep_path.is_file():
+        return dep_path
+    if dep_path.is_dir():
+        candidate = dep_path / "spec.ir.yaml"
+        if candidate.is_file():
+            return candidate
+        # pipeline_ref phase-root has no spec.ir.yaml; fall back to the IR dir.
+        if isinstance(ir_ref, str) and ir_ref.startswith("workspace/"):
+            ir_candidate = repo_root / ir_ref / "spec.ir.yaml"
+            if ir_candidate.is_file():
+                return ir_candidate
+    return None
+
+
 def _dependency_resolved_for_execution(repo_root: Path, execution: NodeExecution) -> dict[str, Any] | None:
     lineage_path = execution.pipeline_dir / "lineage.json"
     if not lineage_path.exists():
@@ -2106,14 +2128,18 @@ def _dependency_resolved_for_execution(repo_root: Path, execution: NodeExecution
     dep_path = repo_root / dependency_ref
     if not dep_path.exists():
         return None
+    dep_doc_path = _dependency_doc_path(repo_root, dep_path, lineage.get("ir_ref"))
+    if dep_doc_path is None:
+        return None
     # spec.ir.yaml is YAML; legacy dependency.resolved.yaml was also YAML.
     # Older fixtures sometimes wrote JSON, so fall back to the JSON loader.
+    # OSError guards against a stray directory ever crashing the validator.
     try:
-        dep_data = _read_yaml(dep_path)
-    except (json.JSONDecodeError, yaml.YAMLError):
+        dep_data = _read_yaml(dep_doc_path)
+    except (json.JSONDecodeError, yaml.YAMLError, OSError):
         try:
-            dep_data = _read_json(dep_path)
-        except json.JSONDecodeError:
+            dep_data = _read_json(dep_doc_path)
+        except (json.JSONDecodeError, OSError):
             return None
     if not isinstance(dep_data, dict):
         return None
@@ -5896,12 +5922,15 @@ def _validate_impl(
         dep_path = repo_root / lineage.dependency_ref
         if not dep_path.exists():
             continue
+        dep_doc_path = _dependency_doc_path(repo_root, dep_path, lineage.ir_ref)
+        if dep_doc_path is None:
+            continue
         try:
-            dep_data = _read_yaml(dep_path)
-        except (json.JSONDecodeError, yaml.YAMLError):
+            dep_data = _read_yaml(dep_doc_path)
+        except (json.JSONDecodeError, yaml.YAMLError, OSError):
             try:
-                dep_data = _read_json(dep_path)
-            except json.JSONDecodeError:
+                dep_data = _read_json(dep_doc_path)
+            except (json.JSONDecodeError, OSError):
                 continue
         if not isinstance(dep_data, dict):
             continue
