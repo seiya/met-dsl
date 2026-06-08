@@ -21769,5 +21769,134 @@ class SpecCatalogZeroByteCorruptionTests(unittest.TestCase):
             self.assertIn("spec_catalog_corrupt", log)
 
 
+class FailureAnalysisRuntimeSidecarExemptionTests(unittest.TestCase):
+    """The `failure_analysis.runtime.<uuid12>.json` safety-net sidecar written by
+    run_workflow.py must be exempt from the terminal write baseline diff, so an
+    interrupted child's `record-timeout` is not dead-locked by an
+    unauthorized_write_violation over a file the runtime (not the child) wrote.
+    """
+
+    def test_should_ignore_classifies_runtime_sidecar_not_canonical(self) -> None:
+        from tools.orchestration_runtime import _should_ignore_runtime_snapshot_path
+
+        orch_id = "orch_001"
+        base = f"workspace/orchestrations/{orch_id}"
+        kwargs = {"orchestration_id": orch_id, "agent_run_id": "child_arid"}
+
+        # UUID-suffixed runtime sidecar → exempt.
+        self.assertTrue(
+            _should_ignore_runtime_snapshot_path(
+                f"{base}/failure_analysis.runtime.abc123abc123.json", **kwargs
+            )
+        )
+        # Canonical failure_analysis.json (agent-owned via the gate) → NOT exempt.
+        self.assertFalse(
+            _should_ignore_runtime_snapshot_path(
+                f"{base}/failure_analysis.json", **kwargs
+            )
+        )
+        # A non-conforming slug (wrong length / non-hex) must NOT be blanket-exempt.
+        self.assertFalse(
+            _should_ignore_runtime_snapshot_path(
+                f"{base}/failure_analysis.runtime.NOTHEX12345.json", **kwargs
+            )
+        )
+        self.assertFalse(
+            _should_ignore_runtime_snapshot_path(
+                f"{base}/failure_analysis.runtime.deadbeef.json", **kwargs
+            )
+        )
+
+    def test_runtime_sidecar_not_charged_to_child_terminal_diff(self) -> None:
+        from tools.orchestration_runtime import (
+            _actual_changed_paths_since_baseline,
+            _write_run_write_baseline,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            orch_id = "orch_001"
+            orch_dir = repo_root / "workspace" / "orchestrations" / orch_id
+            orch_dir.mkdir(parents=True)
+
+            # Child launch baseline captured BEFORE the sidecar exists.
+            _write_run_write_baseline(repo_root, orch_id, agent_run_id="child_arid")
+
+            # run_workflow writes the safety-net sidecar after the baseline.
+            sidecar_rel = (
+                f"workspace/orchestrations/{orch_id}"
+                "/failure_analysis.runtime.abc123abc123.json"
+            )
+            (repo_root / sidecar_rel).write_text("{}\n", encoding="utf-8")
+
+            changed = _actual_changed_paths_since_baseline(
+                repo_root, orch_id, agent_run_id="child_arid"
+            )
+            self.assertNotIn(
+                sidecar_rel,
+                changed,
+                "runtime safety-net sidecar must not be charged to the child diff",
+            )
+
+            # Canonical failure_analysis.json remains tracked (not exempt), so a
+            # genuine agent write there is still observable.
+            canonical_rel = (
+                f"workspace/orchestrations/{orch_id}/failure_analysis.json"
+            )
+            (repo_root / canonical_rel).write_text("{}\n", encoding="utf-8")
+            changed_after = _actual_changed_paths_since_baseline(
+                repo_root, orch_id, agent_run_id="child_arid"
+            )
+            self.assertIn(canonical_rel, changed_after)
+            self.assertNotIn(sidecar_rel, changed_after)
+
+    def test_old_baseline_containing_sidecar_not_charged(self) -> None:
+        # Recovery path: a baseline written before the exemption (or one that
+        # captured a sidecar left by a prior failed run) already lists the
+        # `failure_analysis.runtime.<uuid12>.json` path in its `files` map. The
+        # filtered snapshot drops it from `after`, so without symmetric
+        # filtering of `before` it would surface as a spurious deletion and
+        # re-wedge the resumed run.
+        import json
+
+        from tools.orchestration_runtime import (
+            _actual_changed_paths_since_baseline,
+            _compute_sha256,
+            _run_write_baseline_path,
+            _write_run_write_baseline,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            orch_id = "orch_001"
+            orch_dir = repo_root / "workspace" / "orchestrations" / orch_id
+            orch_dir.mkdir(parents=True)
+
+            sidecar_rel = (
+                f"workspace/orchestrations/{orch_id}"
+                "/failure_analysis.runtime.abc123abc123.json"
+            )
+            (repo_root / sidecar_rel).write_text("{}\n", encoding="utf-8")
+
+            _write_run_write_baseline(repo_root, orch_id, agent_run_id="child_arid")
+            # Simulate an old baseline that recorded the sidecar digest.
+            bpath = _run_write_baseline_path(
+                repo_root, orch_id, agent_run_id="child_arid"
+            )
+            doc = json.loads(bpath.read_text(encoding="utf-8"))
+            doc["files"][sidecar_rel] = _compute_sha256(repo_root / sidecar_rel)
+            bpath.write_text(json.dumps(doc), encoding="utf-8")
+
+            changed = _actual_changed_paths_since_baseline(
+                repo_root, orch_id, agent_run_id="child_arid"
+            )
+            self.assertNotIn(
+                sidecar_rel,
+                changed,
+                "a sidecar recorded in an old baseline must not surface as a "
+                "spurious change once the snapshot exempts it",
+            )
+
+
 if __name__ == "__main__":
     unittest.main()

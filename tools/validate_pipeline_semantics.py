@@ -952,7 +952,11 @@ _MAKE_VAR_REF_PATTERN = re.compile(r"\$\(([A-Za-z_][A-Za-z0-9_]*)\)|\$\{([A-Za-z
 
 
 def _expand_make_vars(
-    expr: str, var_map: dict[str, str], depth: int = 8, strip_unknown: bool = False
+    expr: str,
+    var_map: dict[str, str],
+    depth: int = 8,
+    strip_unknown: bool = False,
+    preserve: set[str] | None = None,
 ) -> str:
     """Substitute ``$(NAME)`` / ``${NAME}`` for known names, bounded by depth.
 
@@ -963,7 +967,14 @@ def _expand_make_vars(
     make: a ``:=`` RHS that forward-references a not-yet-defined variable
     expands to empty *now* and must not be resolved by a later definition. The
     depth bound stops self/cyclic references from looping forever.
+
+    ``preserve`` names are never substituted nor stripped: their ``$(NAME)``
+    reference survives verbatim. This is used by the directory-prefix-aware
+    Makefile analysis to keep the ``$(OBJDIR)`` sentinel intact (so a
+    ``$(MODEL_OBJ) := $(OBJDIR)/foo.o`` definition expands to
+    ``$(OBJDIR)/foo.o`` rather than collapsing the out-of-source prefix away).
     """
+    preserve = preserve or set()
 
     for _ in range(depth):
         if "$" not in expr:
@@ -971,6 +982,8 @@ def _expand_make_vars(
 
         def _sub(match: "re.Match[str]") -> str:
             name = match.group(1) or match.group(2)
+            if name in preserve:
+                return match.group(0)
             return var_map[name] if name in var_map else match.group(0)
 
         expanded = _MAKE_VAR_REF_PATTERN.sub(_sub, expr)
@@ -978,7 +991,12 @@ def _expand_make_vars(
             break
         expr = expanded
     if strip_unknown:
-        expr = _MAKE_VAR_REF_PATTERN.sub("", expr)
+
+        def _strip(match: "re.Match[str]") -> str:
+            name = match.group(1) or match.group(2)
+            return match.group(0) if name in preserve else ""
+
+        expr = _MAKE_VAR_REF_PATTERN.sub(_strip, expr)
     return expr
 
 
@@ -1068,6 +1086,113 @@ def _parse_makefile_rules(makefile_text: str) -> dict[str, set[str]]:
     return rules
 
 
+# Out-of-source directory sentinels parameterized in generated Makefiles. They
+# default to "." for in-source `make` but are overridden at Build/Validate time
+# (e.g. `OBJDIR=<per-run tmp>`), so a prerequisite's `$(OBJDIR)/` prefix is NOT
+# cosmetic: it determines which concrete target make resolves under an override.
+_MAKE_DIR_SENTINELS = frozenset({"OBJDIR", "BINDIR", "RUNDIR"})
+_OBJDIR_REF_PATTERN = re.compile(r"\$[({]OBJDIR[)}]")
+
+
+def _token_has_objdir_prefix(token: str) -> bool:
+    """True if a (sentinel-preserved) token references `$(OBJDIR)` / `${OBJDIR}`."""
+    return bool(_OBJDIR_REF_PATTERN.search(token))
+
+
+def _parse_makefile_rules_objdir_aware(
+    makefile_text: str,
+) -> tuple[dict[str, bool], dict[str, set[tuple[str, bool]]]]:
+    """Parse rules while preserving the `$(OBJDIR)` sentinel so the out-of-source
+    directory prefix survives basename normalization.
+
+    Mirrors `_parse_makefile_rules`' incremental variable tracking but (1) never
+    records the directory sentinels (`OBJDIR`/`BINDIR`/`RUNDIR`) as defined
+    variables and (2) preserves their `$(...)` references through `:=`/`+=`
+    immediate expansion. Returns:
+
+    - ``target_has_objdir``: object-rule target basename → whether the producing
+      rule writes it under `$(OBJDIR)/` (OR-ed across rules).
+    - ``prereqs_diraware``: target basename → set of
+      ``(prereq_basename, prereq_has_objdir_prefix)`` for its prerequisites.
+    """
+    var_map: dict[str, str] = {}
+    var_flavor: dict[str, str] = {}
+    target_has_objdir: dict[str, bool] = {}
+    prereqs_diraware: dict[str, set[tuple[str, bool]]] = {}
+
+    for line in _makefile_logical_lines(makefile_text):
+        assign_match = _MAKE_ASSIGNMENT_PATTERN.match(line)
+        if assign_match is not None:
+            name, op, value = (
+                assign_match.group(1),
+                assign_match.group(2),
+                assign_match.group(3).strip(),
+            )
+            # Never record the directory sentinels; their `$(...)` refs must stay
+            # literal so a `$(OBJDIR)/`-prefixed value is structurally detectable.
+            if name in _MAKE_DIR_SENTINELS:
+                continue
+            if op == "?":
+                if name not in var_map:
+                    var_map[name] = value
+                    var_flavor[name] = "recursive"
+            elif op == ":":
+                var_map[name] = _expand_make_vars(
+                    value, var_map, strip_unknown=True, preserve=_MAKE_DIR_SENTINELS
+                )
+                var_flavor[name] = "simple"
+            elif op == "+":
+                if name not in var_map:
+                    var_map[name] = value
+                    var_flavor[name] = "recursive"
+                else:
+                    addition = (
+                        _expand_make_vars(
+                            value,
+                            var_map,
+                            strip_unknown=True,
+                            preserve=_MAKE_DIR_SENTINELS,
+                        )
+                        if var_flavor.get(name) == "simple"
+                        else value
+                    )
+                    existing = var_map[name]
+                    var_map[name] = (
+                        (existing + " " + addition).strip() if existing else addition
+                    )
+            else:
+                var_flavor[name] = "recursive"
+                var_map[name] = value
+            continue
+        if ":" not in line:
+            continue
+
+        target_raw, prereq_raw = line.split(":", 1)
+        target_raw = _expand_make_vars(target_raw, var_map, preserve=_MAKE_DIR_SENTINELS)
+        target_tokens = target_raw.split()
+        if not target_tokens:
+            continue
+
+        prereq_expr = prereq_raw.split(";", 1)[0].replace("|", " ")
+        prereq_expr = _expand_make_vars(prereq_expr, var_map, preserve=_MAKE_DIR_SENTINELS)
+        prereq_pairs: set[tuple[str, bool]] = set()
+        for token in prereq_expr.split():
+            norm = _normalize_make_token(token)
+            if norm is None:
+                continue
+            prereq_pairs.add((norm, _token_has_objdir_prefix(token)))
+
+        for target_token in target_tokens:
+            target = _normalize_make_token(target_token)
+            if target is None:
+                continue
+            target_has_objdir[target] = target_has_objdir.get(
+                target, False
+            ) or _token_has_objdir_prefix(target_token)
+            prereqs_diraware.setdefault(target, set()).update(prereq_pairs)
+    return target_has_objdir, prereqs_diraware
+
+
 def _local_fortran_module_map(src_files: list[Path]) -> dict[str, str]:
     module_map: dict[str, str] = {}
     pattern = re.compile(r"^\s*module\s+(?!procedure\b)([a-z_][a-z0-9_]*)\b", re.MULTILINE)
@@ -1108,26 +1233,39 @@ def _validate_fortran_makefile_src_dir(src_dir: Path, violations: list[str]) -> 
     src_files = sorted(
         p for p in src_dir.iterdir() if p.is_file() and p.suffix.lower() == ".f90"
     )
-    if len(src_files) < 2:
+    if not src_files:
         return
 
     deps_by_stem = _fortran_source_module_deps(src_files)
     required_object_deps = {
         stem: deps for stem, deps in deps_by_stem.items() if deps
     }
-    if not required_object_deps:
-        return
 
     makefile_path = src_dir / "Makefile"
     if not makefile_path.exists():
-        violations.append(
-            f"{makefile_path}: missing for fortran module dependency build"
-        )
+        # The module-dependency build contract requires a Makefile; the
+        # directory-prefix check below has nothing to inspect without one.
+        if required_object_deps:
+            violations.append(
+                f"{makefile_path}: missing for fortran module dependency build"
+            )
         return
 
-    rules = _parse_makefile_rules(
-        makefile_path.read_text(encoding="utf-8", errors="ignore")
+    makefile_text = makefile_path.read_text(encoding="utf-8", errors="ignore")
+    rules = _parse_makefile_rules(makefile_text)
+    # Directory-prefix-aware view: detects a prerequisite whose `$(OBJDIR)/`
+    # prefix structure disagrees with its producing object rule. The basename
+    # `rules` view above normalizes the prefix away, so a bare `foo.o`
+    # prerequisite passes there even though the only rule that produces it
+    # targets `$(OBJDIR)/foo.o` — which breaks `make -j` under an out-of-source
+    # OBJDIR override (no rule makes the bare target). See SKILL.md L42.
+    target_has_objdir, prereqs_diraware = _parse_makefile_rules_objdir_aware(
+        makefile_text
     )
+    # Basename-level: every used-module dependency must be a prerequisite of
+    # the consuming object rule (the `.mod` or the `.o`). Gated by
+    # `required_object_deps` — only meaningful when sources have local `use`
+    # dependencies on each other.
     for stem, deps in sorted(required_object_deps.items()):
         object_target = f"{stem}.o"
         prereqs = rules.get(object_target)
@@ -1144,6 +1282,47 @@ def _validate_fortran_makefile_src_dir(src_dir: Path, violations: list[str]) -> 
                 violations.append(
                     f"{makefile_path}: {object_target} missing prerequisite for used module ({dep_mod} or {dep_obj})"
                 )
+
+    # Out-of-source correctness (directory-prefix consistency) runs
+    # UNCONDITIONALLY — independent of `required_object_deps` and source count.
+    # A bare object prerequisite on a link rule (e.g. `$(BINDIR)/app: main.o`
+    # against `$(OBJDIR)/main.o:`) breaks the out-of-source Build even when no
+    # source has a local `use` dependency, so this pass must not be gated by the
+    # module-dependency early returns above.
+    # Checked across
+    # ALL rules — object rules AND the link/default rule. When an object (or its
+    # paired `.mod`) is produced under `$(OBJDIR)/`, every rule that consumes it
+    # must reference it with the same `$(OBJDIR)/` prefix. A bare basename
+    # prerequisite has no producing rule once OBJDIR is overridden, so
+    # `make -j` aborts with "No rule to make target" — the same prefix mismatch
+    # whether the bare name appears on the runner object rule or the link rule.
+    def _produced_under_objdir(prereq_basename: str) -> bool:
+        # The object itself is produced under $(OBJDIR)/...
+        if target_has_objdir.get(prereq_basename, False):
+            return True
+        # ...or it is a `.mod` whose sibling `.o` is produced under $(OBJDIR)/
+        # (the .mod is typically a by-product of compiling that .o and may have
+        # no explicit rule of its own).
+        if prereq_basename.endswith(".mod"):
+            sibling_obj = f"{prereq_basename[: -len('.mod')]}.o"
+            return target_has_objdir.get(sibling_obj, False)
+        return False
+
+    for consumer_target in sorted(prereqs_diraware):
+        bare = sorted(
+            {
+                prereq_basename
+                for prereq_basename, has_objdir in prereqs_diraware[consumer_target]
+                if not has_objdir and _produced_under_objdir(prereq_basename)
+            }
+        )
+        if bare:
+            violations.append(
+                f"{makefile_path}: {consumer_target} prerequisite "
+                f"({', '.join(bare)}) must carry the same $(OBJDIR)/ prefix as its "
+                f"producing rule target; a bare basename has no rule under an "
+                f"out-of-source OBJDIR override and breaks make -j (no rule to make target)"
+            )
 
 
 def _validate_fortran_makefile_dependencies(generate_root: Path, violations: list[str]) -> None:

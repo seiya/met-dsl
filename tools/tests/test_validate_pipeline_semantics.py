@@ -14,6 +14,7 @@ import yaml
 from tools.validate_pipeline_semantics import (
     _BUNDLED_SHAPE_EXPR_SCHEMA_PATH,
     _parse_makefile_rules,
+    _validate_fortran_makefile_src_dir,
     _validate_generate_lint_command_logs,
     _validate_source_meta_json_files,
     validate,
@@ -5769,6 +5770,200 @@ class ParseMakefileRulesTest(unittest.TestCase):
         prereqs = rules.get("foo_runner.o", set())
         self.assertIn("other.o", prereqs)
         self.assertIn("foo_model.o", prereqs)
+
+
+class FortranMakefileObjdirPrefixTest(unittest.TestCase):
+    """Out-of-source correctness: a used-module prerequisite must carry the same
+    `$(OBJDIR)/` prefix as its producing object rule. A bare basename passes the
+    basename-normalizing `_parse_makefile_rules` view but breaks `make -j` once
+    OBJDIR is overridden — the escaped defect that passed Generate.verify but
+    failed Build for orch_20260608T012651Z_e906113b (src_002).
+    """
+
+    _MODEL = (
+        "module swm_model\n"
+        "implicit none\n"
+        "contains\n"
+        "subroutine solve(flag)\n"
+        "  logical, intent(out) :: flag\n"
+        "  flag = .true.\n"
+        "end subroutine solve\n"
+        "end module swm_model\n"
+    )
+    _RUNNER = (
+        "program swm_runner\n"
+        "use swm_model\n"
+        "implicit none\n"
+        "logical :: flag\n"
+        "call solve(flag)\n"
+        "write(*,*) flag\n"
+        "end program swm_runner\n"
+    )
+
+    def _run(self, makefile_text: str) -> list[str]:
+        with tempfile.TemporaryDirectory() as tmp:
+            src_dir = Path(tmp)
+            (src_dir / "swm_model.f90").write_text(self._MODEL, encoding="utf-8")
+            (src_dir / "swm_runner.f90").write_text(self._RUNNER, encoding="utf-8")
+            (src_dir / "Makefile").write_text(makefile_text, encoding="utf-8")
+            violations: list[str] = []
+            _validate_fortran_makefile_src_dir(src_dir, violations)
+            return violations
+
+    def _run_files(
+        self, sources: dict[str, str], makefile_text: str
+    ) -> list[str]:
+        with tempfile.TemporaryDirectory() as tmp:
+            src_dir = Path(tmp)
+            for name, text in sources.items():
+                (src_dir / name).write_text(text, encoding="utf-8")
+            (src_dir / "Makefile").write_text(makefile_text, encoding="utf-8")
+            violations: list[str] = []
+            _validate_fortran_makefile_src_dir(src_dir, violations)
+            return violations
+
+    _MAIN = "program app\nimplicit none\nwrite(*,*) 1\nend program app\n"
+    _HELPER = "subroutine helper()\nimplicit none\nend subroutine helper\n"
+
+    def test_bare_link_prereq_single_source_no_use_dep_is_flagged(self) -> None:
+        # No local `use` dependency at all, but the link rule consumes a bare
+        # object name while the object rule produces $(OBJDIR)/main.o. The
+        # prefix check must run even though required_object_deps is empty.
+        makefile = (
+            "FC ?= gfortran\n"
+            "OBJDIR ?= .\n"
+            "BINDIR ?= .\n"
+            "BIN := app\n"
+            "$(BINDIR)/$(BIN): main.o | $(BINDIR)\n"
+            "\t$(FC) -o $@ main.o\n"
+            "$(OBJDIR)/main.o: main.f90 | $(OBJDIR)\n"
+            "\t$(FC) -c $< -o $@\n"
+        )
+        violations = self._run_files({"main.f90": self._MAIN}, makefile)
+        self.assertTrue(
+            any("must carry the same $(OBJDIR)/ prefix" in v for v in violations),
+            f"bare link prereq with no use-dep must be flagged; got: {violations}",
+        )
+
+    def test_bare_link_prereq_two_independent_sources_is_flagged(self) -> None:
+        makefile = (
+            "FC ?= gfortran\n"
+            "OBJDIR ?= .\n"
+            "BINDIR ?= .\n"
+            "BIN := app\n"
+            "$(BINDIR)/$(BIN): main.o helper.o | $(BINDIR)\n"
+            "\t$(FC) -o $@ main.o helper.o\n"
+            "$(OBJDIR)/main.o: main.f90 | $(OBJDIR)\n"
+            "\t$(FC) -c $< -o $@\n"
+            "$(OBJDIR)/helper.o: helper.f90 | $(OBJDIR)\n"
+            "\t$(FC) -c $< -o $@\n"
+        )
+        violations = self._run_files(
+            {"main.f90": self._MAIN, "helper.f90": self._HELPER}, makefile
+        )
+        self.assertTrue(
+            any("must carry the same $(OBJDIR)/ prefix" in v for v in violations),
+            f"bare link prereqs (independent sources) must be flagged; got: {violations}",
+        )
+
+    def test_prefixed_link_prereq_single_source_is_accepted(self) -> None:
+        makefile = (
+            "FC ?= gfortran\n"
+            "OBJDIR ?= .\n"
+            "BINDIR ?= .\n"
+            "BIN := app\n"
+            "MAIN_OBJ := $(OBJDIR)/main.o\n"
+            "$(BINDIR)/$(BIN): $(MAIN_OBJ) | $(BINDIR)\n"
+            "\t$(FC) -o $@ $(MAIN_OBJ)\n"
+            "$(MAIN_OBJ): main.f90 | $(OBJDIR)\n"
+            "\t$(FC) -c $< -o $@\n"
+        )
+        violations = self._run_files({"main.f90": self._MAIN}, makefile)
+        self.assertEqual(
+            [], violations, f"prefixed link prereq must be accepted; got: {violations}"
+        )
+
+    def test_bare_prereq_against_objdir_producing_rule_is_flagged(self) -> None:
+        # src_002-like: model object/.mod produced under $(OBJDIR), but the
+        # runner rule lists them as bare basenames -> no rule under override.
+        makefile = (
+            "FC ?= gfortran\n"
+            "OBJDIR ?= .\n"
+            "$(OBJDIR)/swm_model.o: swm_model.f90 | $(OBJDIR)\n"
+            "\t$(FC) -J$(OBJDIR) -c $< -o $@\n"
+            "$(OBJDIR)/swm_runner.o: swm_runner.f90 swm_model.o swm_model.mod | $(OBJDIR)\n"
+            "\t$(FC) -I$(OBJDIR) -c $< -o $@\n"
+        )
+        violations = self._run(makefile)
+        self.assertTrue(
+            any("must carry the same $(OBJDIR)/ prefix" in v for v in violations),
+            f"bare prereq vs $(OBJDIR)/ producing rule must be flagged; got: {violations}",
+        )
+
+    def test_objdir_prefixed_variable_prereq_is_accepted(self) -> None:
+        # src_003-like: $(MODEL_OBJ)/$(MODEL_MOD) defined before the rule and
+        # resolving to $(OBJDIR)/-prefixed paths. Valid out-of-source make.
+        makefile = (
+            "FC ?= gfortran\n"
+            "OBJDIR ?= .\n"
+            "MODEL_OBJ := $(OBJDIR)/swm_model.o\n"
+            "MODEL_MOD := $(OBJDIR)/swm_model.mod\n"
+            "RUNNER_OBJ := $(OBJDIR)/swm_runner.o\n"
+            "$(MODEL_OBJ): swm_model.f90 | $(OBJDIR)\n"
+            "\t$(FC) -J$(OBJDIR) -c $< -o $@\n"
+            "$(MODEL_MOD): $(MODEL_OBJ)\n"
+            "\t@true\n"
+            "$(RUNNER_OBJ): swm_runner.f90 $(MODEL_OBJ) $(MODEL_MOD) | $(OBJDIR)\n"
+            "\t$(FC) -I$(OBJDIR) -c $< -o $@\n"
+        )
+        violations = self._run(makefile)
+        self.assertEqual(
+            [], violations, f"OBJDIR-prefixed variable prereqs must be accepted; got: {violations}"
+        )
+
+    def test_bare_object_prereq_on_link_rule_is_flagged(self) -> None:
+        # The used-module object rule is correctly $(OBJDIR)/-prefixed, but the
+        # link/default rule consumes the objects as bare basenames. Under an
+        # OBJDIR override `make -j` aborts with "No rule to make target". The
+        # prefix check must inspect the link rule, not just object rules of
+        # use-dependent sources.
+        makefile = (
+            "FC ?= gfortran\n"
+            "OBJDIR ?= .\n"
+            "BINDIR ?= .\n"
+            "BIN := app\n"
+            "MODEL_OBJ := $(OBJDIR)/swm_model.o\n"
+            "MODEL_MOD := $(OBJDIR)/swm_model.mod\n"
+            "RUNNER_OBJ := $(OBJDIR)/swm_runner.o\n"
+            "$(BINDIR)/$(BIN): swm_runner.o swm_model.o | $(BINDIR)\n"
+            "\t$(FC) -o $@ swm_runner.o swm_model.o\n"
+            "$(MODEL_OBJ): swm_model.f90 | $(OBJDIR)\n"
+            "\t$(FC) -J$(OBJDIR) -c $< -o $@\n"
+            "$(MODEL_MOD): $(MODEL_OBJ)\n"
+            "\t@true\n"
+            "$(RUNNER_OBJ): swm_runner.f90 $(MODEL_OBJ) $(MODEL_MOD) | $(OBJDIR)\n"
+            "\t$(FC) -I$(OBJDIR) -c $< -o $@\n"
+        )
+        violations = self._run(makefile)
+        self.assertTrue(
+            any("must carry the same $(OBJDIR)/ prefix" in v for v in violations),
+            f"bare object prereq on the link rule must be flagged; got: {violations}",
+        )
+
+    def test_in_source_bare_makefile_is_accepted(self) -> None:
+        # Fully in-source (no $(OBJDIR) in targets): bare prerequisites are
+        # legitimate and must not be flagged by the directory-aware check.
+        makefile = (
+            "FC ?= gfortran\n"
+            "swm_model.o: swm_model.f90\n"
+            "\t$(FC) -c $<\n"
+            "swm_runner.o: swm_runner.f90 swm_model.o swm_model.mod\n"
+            "\t$(FC) -c $<\n"
+        )
+        violations = self._run(makefile)
+        self.assertEqual(
+            [], violations, f"in-source bare Makefile must stay valid; got: {violations}"
+        )
 
 
 if __name__ == "__main__":

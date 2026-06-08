@@ -5375,6 +5375,23 @@ def _should_ignore_runtime_snapshot_path(
     )
     if any(token.startswith(prefix) for prefix in runtime_prefixes):
         return True
+    # `failure_analysis.runtime.<uuid12>.json` safety-net sidecar is written by
+    # `run_workflow.py:_write_failure_analysis` at the orchestration root when a
+    # canonical `failure_analysis.json` already exists. It is emitted by the
+    # outer run_workflow process — never by a child agent, which cannot reach
+    # the path through tool hooks (`output_manifest_write_guard`). The write can
+    # land after an interrupted child's launch baseline is captured but before
+    # `record-timeout` terminalizes it; without this exemption the sidecar shows
+    # up in that child's terminal-diff and is misattributed as an
+    # unauthorized_write_violation, dead-locking terminalization. Same
+    # runtime-owned rationale as `agent_runs_invalid.jsonl` below; intentionally
+    # narrow — only the UUID-suffixed runtime sidecar, NOT the canonical
+    # `failure_analysis.json` (which the orchestration agent owns via the gate).
+    if re.fullmatch(
+        rf"{re.escape(orch_root)}/failure_analysis\.runtime\.[0-9a-f]{{12}}\.json",
+        token,
+    ):
+        return True
     runtime_files = {
         f"{orch_root}/agent_graph.json",
         f"{orch_root}/agent_runs.jsonl",
@@ -5511,9 +5528,22 @@ def _compute_changed_paths_against_baseline(
         agent_run_id=agent_run_id,
     )
     run_id = agent_run_id.strip() if isinstance(agent_run_id, str) and agent_run_id.strip() else "orchestration"
+    # Apply the runtime-snapshot ignore predicate to BOTH sides. `after` is
+    # already filtered (via `_snapshot_repo_files`); filtering `before`
+    # identically keeps the diff symmetric. Without this, a baseline written
+    # before a path became exempt — or one that captured a pre-existing
+    # runtime-owned file (e.g. a `failure_analysis.runtime.<uuid12>.json`
+    # sidecar left by a prior failed run) — would show that path only in
+    # `before`, so it surfaces as a spurious deletion/change and can be rejected
+    # as an unauthorized write, re-wedging resumed runs with older baselines.
     before = {
-        _normalize_rel_posix(str(path)): str(digest)
+        rel: str(digest)
         for path, digest in dict(baseline.get("files", {})).items()
+        if not _should_ignore_runtime_snapshot_path(
+            (rel := _normalize_rel_posix(str(path))),
+            orchestration_id=orchestration_id,
+            agent_run_id=run_id,
+        )
     }
     after = _snapshot_repo_files(
         repo_root,
