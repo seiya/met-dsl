@@ -945,22 +945,114 @@ def _normalize_make_token(token: str) -> str | None:
     return name
 
 
+_MAKE_ASSIGNMENT_PATTERN = re.compile(
+    r"^([A-Za-z_][A-Za-z0-9_]*)\s*([:+?]?)=\s*(.*)$"
+)
+_MAKE_VAR_REF_PATTERN = re.compile(r"\$\(([A-Za-z_][A-Za-z0-9_]*)\)|\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
+
+
+def _expand_make_vars(
+    expr: str, var_map: dict[str, str], depth: int = 8, strip_unknown: bool = False
+) -> str:
+    """Substitute ``$(NAME)`` / ``${NAME}`` for known names, bounded by depth.
+
+    By default unknown variables are left intact so `_normalize_make_token`
+    strips them, preserving behavior for genuinely unresolved references at
+    rule-expansion time. With ``strip_unknown=True`` (used for immediate ``:=``
+    expansion) any still-unresolved reference collapses to empty, matching GNU
+    make: a ``:=`` RHS that forward-references a not-yet-defined variable
+    expands to empty *now* and must not be resolved by a later definition. The
+    depth bound stops self/cyclic references from looping forever.
+    """
+
+    for _ in range(depth):
+        if "$" not in expr:
+            break
+
+        def _sub(match: "re.Match[str]") -> str:
+            name = match.group(1) or match.group(2)
+            return var_map[name] if name in var_map else match.group(0)
+
+        expanded = _MAKE_VAR_REF_PATTERN.sub(_sub, expr)
+        if expanded == expr:
+            break
+        expr = expanded
+    if strip_unknown:
+        expr = _MAKE_VAR_REF_PATTERN.sub("", expr)
+    return expr
+
+
 def _parse_makefile_rules(makefile_text: str) -> dict[str, set[str]]:
     rules: dict[str, set[str]] = {}
-    assignment_pattern = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*\s*[:+?]?=")
+    # Track simple variable definitions (`=` / `:=` / `?=` / `+=`) in file
+    # order. GNU make expands a rule's targets and prerequisites immediately
+    # when it reads the rule, so only definitions that appear *before* a rule
+    # are visible to it; a forward reference expands to empty, which means the
+    # prerequisite is genuinely absent (and `make -j` can race). Building the
+    # map incrementally reproduces that: a not-yet-defined variable stays
+    # unexpanded and `_normalize_make_token` drops it. `var_flavor` records
+    # whether a variable is simply-expanded (`:=`) or recursively-expanded
+    # (`=` / `?=`), which determines how `+=` treats the appended text.
+    var_map: dict[str, str] = {}
+    var_flavor: dict[str, str] = {}
 
     for line in _makefile_logical_lines(makefile_text):
-        if assignment_pattern.match(line):
+        assign_match = _MAKE_ASSIGNMENT_PATTERN.match(line)
+        if assign_match is not None:
+            name, op, value = (
+                assign_match.group(1),
+                assign_match.group(2),
+                assign_match.group(3).strip(),
+            )
+            if op == "?":
+                # Conditional: only sets when undefined; defines a
+                # recursively-expanded variable.
+                if name not in var_map:
+                    var_map[name] = value
+                    var_flavor[name] = "recursive"
+            elif op == ":":
+                # Simply-expanded: RHS is expanded immediately at definition
+                # time, so later redefinitions (or later first-definitions) of
+                # referenced variables do not change this value. Unresolved
+                # forward references collapse to empty, as make does now.
+                var_map[name] = _expand_make_vars(
+                    value, var_map, strip_unknown=True
+                )
+                var_flavor[name] = "simple"
+            elif op == "+":
+                if name not in var_map:
+                    # No prior definition: `+=` acts like `=` (recursive).
+                    var_map[name] = value
+                    var_flavor[name] = "recursive"
+                else:
+                    # Appended text is expanded immediately for a
+                    # simply-expanded variable, but kept raw (lazy) for a
+                    # recursively-expanded one.
+                    addition = (
+                        _expand_make_vars(value, var_map, strip_unknown=True)
+                        if var_flavor.get(name) == "simple"
+                        else value
+                    )
+                    existing = var_map[name]
+                    var_map[name] = (
+                        (existing + " " + addition).strip() if existing else addition
+                    )
+            else:
+                # Recursively-expanded (`=`): store raw, expand lazily at use.
+                var_flavor[name] = "recursive"
+                var_map[name] = value
             continue
         if ":" not in line:
             continue
 
         target_raw, prereq_raw = line.split(":", 1)
+        target_raw = _expand_make_vars(target_raw, var_map)
         target_tokens = target_raw.split()
         if not target_tokens:
             continue
 
         prereq_expr = prereq_raw.split(";", 1)[0].replace("|", " ")
+        prereq_expr = _expand_make_vars(prereq_expr, var_map)
         prereq_tokens = prereq_expr.split()
         prereqs = {
             norm

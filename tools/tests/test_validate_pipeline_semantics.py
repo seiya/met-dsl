@@ -13,6 +13,7 @@ import yaml
 
 from tools.validate_pipeline_semantics import (
     _BUNDLED_SHAPE_EXPR_SCHEMA_PATH,
+    _parse_makefile_rules,
     _validate_generate_lint_command_logs,
     _validate_source_meta_json_files,
     validate,
@@ -1824,6 +1825,149 @@ shallow_water2d_runner.o: shallow_water2d_runner.f90 shallow_water2d_model.mod
             violations = validate(repo_root=repo_root, workspace_root="workspace")
             self.assertTrue(
                 any("missing prerequisite for used module" in v for v in violations)
+            )
+
+    def test_accepts_makefile_variable_resolved_fortran_module_dependency(self) -> None:
+        # Mirrors the real generated Makefile: the runner object rule declares
+        # its used-module prerequisite via a variable ($(MODEL_OBJ)) defined as
+        # $(OBJDIR)/..._model.o. This is valid Make and must not be flagged as a
+        # missing prerequisite (regression guard against the false positive).
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            _seed_shape_expr_schema_into(repo_root)
+            dep_spec_id = "dynamics_shallow_water_flux_2d_rusanov_p0"
+            model_text = """module shallow_water2d_model
+use dynamics_shallow_water_flux_2d_rusanov_p0_model
+implicit none
+contains
+subroutine solve(flag)
+  logical, intent(out) :: flag
+  call dynamics_shallow_water_flux_2d_rusanov_p0__compute_flux(flag)
+end subroutine solve
+end module shallow_water2d_model
+"""
+            runner_text = """program shallow_water2d_runner
+use shallow_water2d_model
+implicit none
+logical :: flag
+call solve(flag)
+write(*,*) flag
+end program shallow_water2d_runner
+"""
+            dep_model_text = """module dynamics_shallow_water_flux_2d_rusanov_p0_model
+implicit none
+contains
+subroutine dynamics_shallow_water_flux_2d_rusanov_p0__compute_flux(flag)
+  logical, intent(out) :: flag
+  flag = .true.
+end subroutine dynamics_shallow_water_flux_2d_rusanov_p0__compute_flux
+end module dynamics_shallow_water_flux_2d_rusanov_p0_model
+"""
+            makefile_text = """FC ?= gfortran
+OBJDIR ?= .
+DEP_OBJ = $(OBJDIR)/dynamics_shallow_water_flux_2d_rusanov_p0_model.o
+MODEL_OBJ = $(OBJDIR)/shallow_water2d_model.o
+RUNNER_OBJ = $(OBJDIR)/shallow_water2d_runner.o
+OBJS = $(DEP_OBJ) $(MODEL_OBJ) $(RUNNER_OBJ)
+
+simulate: $(OBJS)
+\t$(FC) -o $@ $(OBJS)
+
+$(DEP_OBJ): dynamics_shallow_water_flux_2d_rusanov_p0_model.f90 | $(OBJDIR)
+\t$(FC) -J$(OBJDIR) -c $< -o $@
+
+$(MODEL_OBJ): shallow_water2d_model.f90 $(DEP_OBJ) | $(OBJDIR)
+\t$(FC) -J$(OBJDIR) -I$(OBJDIR) -c $< -o $@
+
+$(RUNNER_OBJ): shallow_water2d_runner.f90 $(MODEL_OBJ) | $(OBJDIR)
+\t$(FC) -I$(OBJDIR) -c $< -o $@
+"""
+            _create_minimal_execution_tree(
+                repo_root,
+                dep_spec_id=dep_spec_id,
+                model_text=model_text,
+                runner_text=runner_text,
+                run_command=["./simulate", "workspace/spec.ir.yaml", "workspace/outdir"],
+                extra_sources={
+                    "dynamics_shallow_water_flux_2d_rusanov_p0_model.f90": dep_model_text
+                },
+                makefile_text=makefile_text,
+            )
+
+            violations = validate(repo_root=repo_root, workspace_root="workspace")
+            self.assertFalse(
+                any("missing prerequisite for used module" in v for v in violations),
+                f"variable-resolved prerequisite should be accepted; got: {violations}",
+            )
+
+    def test_detects_makefile_forward_referenced_prereq_variable(self) -> None:
+        # A prerequisite variable referenced *before* its definition expands to
+        # empty in GNU make (rule prerequisites are expanded at read time), so
+        # the dependency is genuinely absent and must still be flagged.
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            _seed_shape_expr_schema_into(repo_root)
+            dep_spec_id = "dynamics_shallow_water_flux_2d_rusanov_p0"
+            model_text = """module shallow_water2d_model
+use dynamics_shallow_water_flux_2d_rusanov_p0_model
+implicit none
+contains
+subroutine solve(flag)
+  logical, intent(out) :: flag
+  call dynamics_shallow_water_flux_2d_rusanov_p0__compute_flux(flag)
+end subroutine solve
+end module shallow_water2d_model
+"""
+            runner_text = """program shallow_water2d_runner
+use shallow_water2d_model
+implicit none
+logical :: flag
+call solve(flag)
+write(*,*) flag
+end program shallow_water2d_runner
+"""
+            dep_model_text = """module dynamics_shallow_water_flux_2d_rusanov_p0_model
+implicit none
+contains
+subroutine dynamics_shallow_water_flux_2d_rusanov_p0__compute_flux(flag)
+  logical, intent(out) :: flag
+  flag = .true.
+end subroutine dynamics_shallow_water_flux_2d_rusanov_p0__compute_flux
+end module dynamics_shallow_water_flux_2d_rusanov_p0_model
+"""
+            # MODEL_OBJ is used in the runner rule's prerequisites but defined
+            # only afterwards -> make sees an empty prerequisite -> violation.
+            makefile_text = """FC ?= gfortran
+OBJDIR ?= .
+DEP_OBJ = $(OBJDIR)/dynamics_shallow_water_flux_2d_rusanov_p0_model.o
+
+$(DEP_OBJ): dynamics_shallow_water_flux_2d_rusanov_p0_model.f90 | $(OBJDIR)
+\t$(FC) -J$(OBJDIR) -c $< -o $@
+
+shallow_water2d_model.o: shallow_water2d_model.f90 $(DEP_OBJ) | $(OBJDIR)
+\t$(FC) -J$(OBJDIR) -I$(OBJDIR) -c $< -o $@
+
+shallow_water2d_runner.o: shallow_water2d_runner.f90 $(MODEL_OBJ) | $(OBJDIR)
+\t$(FC) -I$(OBJDIR) -c $< -o $@
+
+MODEL_OBJ = $(OBJDIR)/shallow_water2d_model.o
+"""
+            _create_minimal_execution_tree(
+                repo_root,
+                dep_spec_id=dep_spec_id,
+                model_text=model_text,
+                runner_text=runner_text,
+                run_command=["./simulate", "workspace/spec.ir.yaml", "workspace/outdir"],
+                extra_sources={
+                    "dynamics_shallow_water_flux_2d_rusanov_p0_model.f90": dep_model_text
+                },
+                makefile_text=makefile_text,
+            )
+
+            violations = validate(repo_root=repo_root, workspace_root="workspace")
+            self.assertTrue(
+                any("missing prerequisite for used module" in v for v in violations),
+                f"forward-referenced prereq variable should be flagged; got: {violations}",
             )
 
     def test_detects_missing_llm_semantic_review(self) -> None:
@@ -5533,6 +5677,98 @@ end program shallow_water2d_runner
             any("temporaries[" in v for v in violations),
             f"Unexpected temporaries violation: {[v for v in violations if 'temporaries[' in v]}",
         )
+
+
+class ParseMakefileRulesTest(unittest.TestCase):
+    def test_recursive_assignment_expands_lazily(self) -> None:
+        rules = _parse_makefile_rules(
+            "OBJDIR ?= .\n"
+            "MODEL_OBJ = $(OBJDIR)/foo_model.o\n"
+            "$(OBJDIR)/foo_runner.o: foo_runner.f90 $(MODEL_OBJ)\n"
+        )
+        self.assertIn("foo_model.o", rules.get("foo_runner.o", set()))
+
+    def test_conditional_assignment_does_not_overwrite_defined_variable(self) -> None:
+        # `?=` is a no-op when the variable is already defined. GNU make keeps
+        # the (wrong) earlier value, so the model.o dependency is genuinely
+        # absent and must NOT be hidden by treating ?= as an overwrite.
+        rules = _parse_makefile_rules(
+            "OBJDIR ?= .\n"
+            "MODEL_OBJ = wrong.o\n"
+            "MODEL_OBJ ?= $(OBJDIR)/foo_model.o\n"
+            "foo_runner.o: foo_runner.f90 $(MODEL_OBJ)\n"
+        )
+        prereqs = rules.get("foo_runner.o", set())
+        self.assertIn("wrong.o", prereqs)
+        self.assertNotIn("foo_model.o", prereqs)
+
+    def test_conditional_assignment_sets_when_undefined(self) -> None:
+        rules = _parse_makefile_rules(
+            "OBJDIR ?= .\n"
+            "MODEL_OBJ ?= $(OBJDIR)/foo_model.o\n"
+            "foo_runner.o: foo_runner.f90 $(MODEL_OBJ)\n"
+        )
+        self.assertIn("foo_model.o", rules.get("foo_runner.o", set()))
+
+    def test_simply_expanded_assignment_snapshots_at_definition(self) -> None:
+        # `:=` expands its RHS immediately, so a later redefinition of the
+        # referenced variable must not change the prerequisite. make resolves
+        # PREQ to wrong.o here, so the foo_model.o dependency is absent.
+        rules = _parse_makefile_rules(
+            "DEP := wrong.o\n"
+            "PREQ := $(DEP)\n"
+            "DEP := foo_model.o\n"
+            "foo_runner.o: foo_runner.f90 $(PREQ)\n"
+        )
+        prereqs = rules.get("foo_runner.o", set())
+        self.assertIn("wrong.o", prereqs)
+        self.assertNotIn("foo_model.o", prereqs)
+
+    def test_forward_reference_variable_is_not_resolved(self) -> None:
+        rules = _parse_makefile_rules(
+            "foo_runner.o: foo_runner.f90 $(MODEL_OBJ)\n"
+            "MODEL_OBJ = foo_model.o\n"
+        )
+        self.assertNotIn("foo_model.o", rules.get("foo_runner.o", set()))
+
+    def test_simply_expanded_assignment_drops_forward_reference(self) -> None:
+        # `:=` expands immediately, so a forward reference in its RHS becomes
+        # empty *now*; a later definition of that variable must not retroactively
+        # resolve it (make has no foo_model.o prerequisite -> still a violation).
+        rules = _parse_makefile_rules(
+            "MODEL_OBJ := $(DEP_OBJ)\n"
+            "DEP_OBJ = foo_model.o\n"
+            "foo_runner.o: foo_runner.f90 $(MODEL_OBJ)\n"
+        )
+        self.assertNotIn("foo_model.o", rules.get("foo_runner.o", set()))
+
+    def test_append_to_simply_expanded_variable_expands_immediately(self) -> None:
+        # `+=` onto a `:=` variable expands the appended text immediately, so a
+        # forward reference becomes empty now and is not resolved by a later
+        # definition (make sees no foo_model.o prerequisite).
+        rules = _parse_makefile_rules(
+            "OBJS := other.o\n"
+            "OBJS += $(MODEL_OBJ)\n"
+            "MODEL_OBJ = foo_model.o\n"
+            "foo_runner.o: foo_runner.f90 $(OBJS)\n"
+        )
+        prereqs = rules.get("foo_runner.o", set())
+        self.assertIn("other.o", prereqs)
+        self.assertNotIn("foo_model.o", prereqs)
+
+    def test_append_to_recursive_variable_expands_lazily(self) -> None:
+        # `+=` onto a `=` variable keeps the appended text raw, so it resolves
+        # at rule-expansion time against the then-current value (make does see
+        # the foo_model.o prerequisite here).
+        rules = _parse_makefile_rules(
+            "OBJS = other.o\n"
+            "OBJS += $(MODEL_OBJ)\n"
+            "MODEL_OBJ = foo_model.o\n"
+            "foo_runner.o: foo_runner.f90 $(OBJS)\n"
+        )
+        prereqs = rules.get("foo_runner.o", set())
+        self.assertIn("other.o", prereqs)
+        self.assertIn("foo_model.o", prereqs)
 
 
 if __name__ == "__main__":
