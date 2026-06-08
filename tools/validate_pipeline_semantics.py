@@ -1400,19 +1400,585 @@ def _validate_problem_runner_nonphysical_casepath_input(
             )
 
 
-def _validate_runner_perf_json_serialization(
+# Edit descriptors may carry a leading repeat count (e.g. ``2l1`` / ``3f0.6``);
+# the negative lookbehind excludes letters so multi-letter descriptors such as
+# ``tl`` (tab-left) are not mistaken for an ``L`` (logical) descriptor.
+_RUNNER_FORMAT_LOGICAL_DESC = re.compile(r"(?<![a-z])l\d*(?![a-z])")
+# ``f0`` is the F descriptor with width 0; it may be preceded by a repeat count
+# (``2f0.6``) or a ``P`` scale factor (``1pf0.6``). The lookbehind excludes every
+# letter *except* ``p`` so a ``P`` scale factor is allowed while ``f0`` embedded
+# in a word (e.g. ``leaf0``) is not matched.
+_RUNNER_FORMAT_F0_DESC = re.compile(r"(?<![a-oq-z])f0(?:\.\d+)?")
+# Statement recognizers (operate on lowercased logical lines). ``write`` must be a
+# statement keyword followed by ``(`` (not a substring of an identifier such as
+# ``write_flag`` / ``rewrite``). A FORMAT statement carries a leading label.
+_RUNNER_WRITE_STMT = re.compile(r"(?<![a-z0-9_])write\s*\(")
+_RUNNER_FORMAT_STMT = re.compile(r"^\s*(\d+)\s+format\s*\(")
+_RUNNER_CHAR_LITERAL = re.compile(r"'(?:[^']|'')*'|\"(?:[^\"]|\"\")*\"")
+_RUNNER_KEYWORD_ITEM = re.compile(r"[a-z][a-z0-9_]*\s*=")
+_RUNNER_FMT_KEYWORD = re.compile(r"fmt\s*=\s*(.*)", re.DOTALL)
+_RUNNER_NAME_TOKEN = re.compile(r"[a-z][a-z0-9_]*\Z")
+# Fortran scoping-unit boundaries. Statement labels, FORMAT statements, and local
+# variables are scoped to their program unit, so resolution must not cross units.
+_FORTRAN_UNIT_END = re.compile(
+    r"^\s*end\s*$|^\s*end\s*(?:program|module|submodule|subroutine|function|blockdata)\b"
+)
+_FORTRAN_UNIT_OPEN = re.compile(
+    r"^\s*(?:(?:pure|elemental|impure|recursive)\s+)*(?:program|subroutine|module|submodule)\b"
+)
+_FORTRAN_FUNCTION_OPEN = re.compile(r"(?<![a-z0-9_])function\s+[a-z][a-z0-9_]*\s*\(")
+
+
+def _strip_fortran_inline_comment(line: str) -> str:
+    """Drop a trailing ``!`` comment, honoring single/double quoted strings."""
+    in_single = False
+    in_double = False
+    i = 0
+    n = len(line)
+    while i < n:
+        ch = line[i]
+        if in_single:
+            if ch == "'":
+                in_single = False
+        elif in_double:
+            if ch == '"':
+                in_double = False
+        elif ch == "'":
+            in_single = True
+        elif ch == '"':
+            in_double = True
+        elif ch == "!":
+            return line[:i]
+        i += 1
+    return line
+
+
+def _split_fortran_statements(line: str) -> list[str]:
+    """Split a logical line on top-level ``;`` statement separators.
+
+    Semicolons inside quotes or parentheses are ignored, so a line such as
+    ``fmt = '(a,l1,a)'; write(u, fmt) x`` becomes two statements.
+    """
+    parts: list[str] = []
+    current: list[str] = []
+    depth = 0
+    in_single = False
+    in_double = False
+    for ch in line:
+        if in_single:
+            current.append(ch)
+            if ch == "'":
+                in_single = False
+        elif in_double:
+            current.append(ch)
+            if ch == '"':
+                in_double = False
+        elif ch == "'":
+            in_single = True
+            current.append(ch)
+        elif ch == '"':
+            in_double = True
+            current.append(ch)
+        elif ch == "(":
+            depth += 1
+            current.append(ch)
+        elif ch == ")":
+            depth -= 1
+            current.append(ch)
+        elif ch == ";" and depth == 0:
+            parts.append("".join(current))
+            current = []
+        else:
+            current.append(ch)
+    parts.append("".join(current))
+    return parts
+
+
+def _iter_fortran_logical_lines(text: str) -> list[tuple[int, str]]:
+    """Merge free-form continuation lines and split ``;``-separated statements.
+
+    Returns ``(start_lineno, statement)`` pairs, where ``start_lineno`` is the
+    physical line on which the statement began. Trailing ``&`` continuations are
+    merged, inline ``!`` comments stripped, an optional leading ``&`` on a
+    continuation line dropped, and a logical line carrying multiple ``;``-joined
+    statements is expanded into one entry per statement (all sharing the line).
+    """
+    logical: list[tuple[int, str]] = []
+    buffer = ""
+    start_lineno: int | None = None
+
+    def flush() -> None:
+        if start_lineno is None:
+            return
+        for statement in _split_fortran_statements(buffer):
+            if statement.strip():
+                logical.append((start_lineno, statement))
+
+    for lineno, raw_line in enumerate(text.splitlines(), 1):
+        code = _strip_fortran_inline_comment(raw_line).rstrip()
+        continued = code.endswith("&")
+        if continued:
+            code = code[:-1]
+        if buffer:
+            stripped = code.lstrip()
+            if stripped.startswith("&"):
+                stripped = stripped[1:]
+            buffer += stripped
+        else:
+            start_lineno = lineno
+            buffer = code
+        if continued:
+            continue
+        flush()
+        buffer = ""
+        start_lineno = None
+    flush()
+    return logical
+
+
+def _extract_balanced_parens(text: str, open_index: int) -> str:
+    """Return the substring inside the parentheses opening at ``open_index``.
+
+    Parentheses appearing inside single/double quoted strings are ignored so a
+    format literal such as ``'(a,l1,a)'`` does not prematurely close the group.
+    """
+    depth = 0
+    in_single = False
+    in_double = False
+    i = open_index
+    n = len(text)
+    while i < n:
+        ch = text[i]
+        if in_single:
+            if ch == "'":
+                in_single = False
+        elif in_double:
+            if ch == '"':
+                in_double = False
+        elif ch == "'":
+            in_single = True
+        elif ch == '"':
+            in_double = True
+        elif ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth == 0:
+                return text[open_index + 1 : i]
+        i += 1
+    return text[open_index + 1 :]
+
+
+def _split_top_level_commas(text: str) -> list[str]:
+    """Split on commas that are outside parentheses and quotes."""
+    parts: list[str] = []
+    current: list[str] = []
+    depth = 0
+    in_single = False
+    in_double = False
+    for ch in text:
+        if in_single:
+            current.append(ch)
+            if ch == "'":
+                in_single = False
+        elif in_double:
+            current.append(ch)
+            if ch == '"':
+                in_double = False
+        elif ch == "'":
+            in_single = True
+            current.append(ch)
+        elif ch == '"':
+            in_double = True
+            current.append(ch)
+        elif ch == "(":
+            depth += 1
+            current.append(ch)
+        elif ch == ")":
+            depth -= 1
+            current.append(ch)
+        elif ch == "," and depth == 0:
+            parts.append("".join(current))
+            current = []
+        else:
+            current.append(ch)
+    parts.append("".join(current))
+    return parts
+
+
+def _fortran_literal_value(token: str) -> str:
+    """Return the character value of a quoted Fortran literal token.
+
+    Strips the outer quotes and collapses the doubled outer quote escape
+    (``''`` -> ``'`` / ``""`` -> ``"``) so embedded string descriptors are left
+    with single delimiters.
+    """
+    quote = token[0]
+    inner = token[1:-1]
+    return inner.replace(quote * 2, quote)
+
+
+def _strip_format_char_literals(fmt_value: str) -> str:
+    """Remove embedded character-string edit descriptors from a format value.
+
+    A Fortran format may embed literal text via ``'...'`` or ``"..."`` (with the
+    delimiter doubled to escape). Such text is *data*, not descriptor codes, so
+    substrings like ``L1`` or ``F0`` inside it must not be scanned. Returns the
+    format with all embedded character literals removed.
+    """
+    out: list[str] = []
+    i = 0
+    n = len(fmt_value)
+    while i < n:
+        ch = fmt_value[i]
+        if ch in "'\"":
+            quote = ch
+            i += 1
+            while i < n:
+                if fmt_value[i] == quote:
+                    if i + 1 < n and fmt_value[i + 1] == quote:
+                        i += 2
+                        continue
+                    i += 1
+                    break
+                i += 1
+        else:
+            out.append(ch)
+            i += 1
+    return "".join(out)
+
+
+def _scan_runner_format_text(
+    runner_file: Path, lineno: int, fmt_value: str, violations: list[str]
+) -> None:
+    # Blanks are insignificant in a Fortran format spec (outside character
+    # literals, already stripped), so remove them before matching ``f 0.6`` etc.
+    descriptor_stream = re.sub(r"\s+", "", _strip_format_char_literals(fmt_value))
+    if _RUNNER_FORMAT_LOGICAL_DESC.search(descriptor_stream):
+        violations.append(
+            f"{runner_file}:{lineno}: runner write uses Fortran L edit descriptor "
+            f"(emits T/F); JSON boolean must be literal true/false"
+        )
+    if _RUNNER_FORMAT_F0_DESC.search(descriptor_stream):
+        violations.append(
+            f"{runner_file}:{lineno}: runner write uses Fortran F0 formatting; "
+            f"JSON numeric serialization must be leading-zero safe"
+        )
+
+
+_RUNNER_UNIT_KEYWORD = re.compile(r"unit\s*=\s*(.*)", re.DOTALL)
+# Unit designators that are never a JSON artifact (stdout / stderr); formatted
+# writes to them are debug/log output and must not be scanned for JSON safety.
+_NON_JSON_WRITE_UNITS = {"*", "output_unit", "error_unit"}
+
+
+def _runner_write_unit(io_control: str) -> str | None:
+    """Return the unit designator of a ``write`` control list (``*`` / name / id)."""
+    items = [item.strip() for item in _split_top_level_commas(io_control)]
+    for item in items:
+        keyword = _RUNNER_UNIT_KEYWORD.match(item)
+        if keyword:
+            return keyword.group(1).strip()
+    if items and not _RUNNER_KEYWORD_ITEM.match(items[0]):
+        return items[0].strip()
+    return None
+
+
+def _runner_write_format_token(io_control: str) -> str | None:
+    """Return the format spec token referenced by a ``write`` control list.
+
+    Handles ``fmt=`` keyword form and the positional form (unit first, format
+    second). Returns the raw token (a quoted literal, an integer label, or a
+    name); ``None`` when there is no format (e.g. list-directed ``write(u, *)``
+    is returned as ``*`` and filtered by the caller).
+    """
+    items = [item.strip() for item in _split_top_level_commas(io_control)]
+    for item in items:
+        keyword = _RUNNER_FMT_KEYWORD.match(item)
+        if keyword:
+            return keyword.group(1).strip()
+    positional = [item for item in items if not _RUNNER_KEYWORD_ITEM.match(item)]
+    if len(positional) >= 2:
+        return positional[1].strip()
+    return None
+
+
+def _depth0_assignment_rhs(line: str, name: str) -> str | None:
+    """Return the RHS of a top-level assignment ``name = rhs`` on ``line``.
+
+    Quote- and paren-aware so an I/O keyword argument (``fmt=`` inside
+    ``write(...)``), an equality test (``==``), and other relational operators
+    (``/=`` / ``>=`` / ``<=``) are not mistaken for a variable assignment, and an
+    array-element target (``a(i) = ...``) does not match a scalar ``name``.
+    Returns ``None`` when the line is not such an assignment.
+    """
+    depth = 0
+    in_single = False
+    in_double = False
+    i = 0
+    n = len(line)
+    while i < n:
+        ch = line[i]
+        if in_single:
+            if ch == "'":
+                in_single = False
+        elif in_double:
+            if ch == '"':
+                in_double = False
+        elif ch == "'":
+            in_single = True
+        elif ch == '"':
+            in_double = True
+        elif ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+        elif ch == "=" and depth == 0:
+            if i + 1 < n and line[i + 1] == "=":
+                i += 2
+                continue
+            if i > 0 and line[i - 1] in "<>/=":
+                i += 1
+                continue
+            j = i - 1
+            while j >= 0 and line[j] == " ":
+                j -= 1
+            end = j
+            while j >= 0 and (line[j].isalnum() or line[j] == "_"):
+                j -= 1
+            lhs = line[j + 1 : end + 1]
+            if lhs == name and not (j >= 0 and line[j] == ")"):
+                # Stop at the next top-level comma so a sibling initializer in a
+                # multi-name declaration (``:: a = '(...)', b = '(...)'``) is not
+                # folded into this name's RHS.
+                return _split_top_level_commas(line[i + 1 :])[0].strip()
+        i += 1
+    return None
+
+
+def _split_top_level_concat(expr: str) -> list[str]:
+    """Split ``expr`` on the Fortran ``//`` concatenation operator at top level.
+
+    ``//`` inside quotes or parentheses is ignored, so only operands joined at the
+    expression's top level are separated.
+    """
+    parts: list[str] = []
+    current: list[str] = []
+    depth = 0
+    in_single = False
+    in_double = False
+    i = 0
+    n = len(expr)
+    while i < n:
+        ch = expr[i]
+        if in_single:
+            current.append(ch)
+            if ch == "'":
+                in_single = False
+        elif in_double:
+            current.append(ch)
+            if ch == '"':
+                in_double = False
+        elif ch == "'":
+            in_single = True
+            current.append(ch)
+        elif ch == '"':
+            in_double = True
+            current.append(ch)
+        elif ch == "(":
+            depth += 1
+            current.append(ch)
+        elif ch == ")":
+            depth -= 1
+            current.append(ch)
+        elif ch == "/" and depth == 0 and i + 1 < n and expr[i + 1] == "/":
+            parts.append("".join(current))
+            current = []
+            i += 2
+            continue
+        else:
+            current.append(ch)
+        i += 1
+    parts.append("".join(current))
+    return parts
+
+
+def _resolve_format_expr(expr: str) -> str | None:
+    """Resolve a format-spec expression to its constant value, or ``None``.
+
+    Handles a single character literal and a constant concatenation of character
+    literals (``'(a,' // 'l1,a)'``). Any non-literal operand (variable / function
+    call) makes the expression unresolvable, returning ``None`` so a partial
+    literal is never scanned. The resolved value must look like a Fortran format
+    spec (parenthesized).
+    """
+    pieces: list[str] = []
+    for operand in _split_top_level_concat(expr):
+        operand = operand.strip()
+        literal = _RUNNER_CHAR_LITERAL.fullmatch(operand)
+        if not literal:
+            return None
+        pieces.append(_fortran_literal_value(operand))
+    value = "".join(pieces)
+    return value if value.lstrip().startswith("(") else None
+
+
+def _assign_fortran_scopes(
+    logical_lines: list[tuple[int, str]],
+) -> tuple[list[int], dict[int, int | None]]:
+    """Return a scope id per logical line plus a ``scope -> parent scope`` map.
+
+    A ``program`` / ``subroutine`` / ``function`` / ``(sub)module`` header opens a
+    new scope nested in the current one; the matching ``end`` (or ``end <kind>``)
+    closes it. Construct ends (``end do`` / ``end if`` / ...) are not unit ends and
+    do not close a scope. The parent map enables host-association lookups for
+    names declared in an enclosing unit.
+    """
+    scopes: list[int] = []
+    parents: dict[int, int | None] = {0: None}
+    stack = [0]
+    next_id = 1
+    for _lineno, line in logical_lines:
+        lowered = line.lower()
+        if _FORTRAN_UNIT_END.match(lowered):
+            scopes.append(stack[-1])
+            if len(stack) > 1:
+                stack.pop()
+            continue
+        opens_unit = bool(_FORTRAN_UNIT_OPEN.match(lowered)) and not re.match(
+            r"^\s*module\s+procedure\b", lowered
+        )
+        if not opens_unit and _FORTRAN_FUNCTION_OPEN.search(lowered):
+            opens_unit = True
+        if opens_unit:
+            next_id += 1
+            parents[next_id] = stack[-1]
+            stack.append(next_id)
+            scopes.append(next_id)
+        else:
+            scopes.append(stack[-1])
+    return scopes, parents
+
+
+def _validate_runner_json_serialization(
     runner_file: Path,
-    lowered: str,
+    text: str,
     violations: list[str],
 ) -> None:
-    perf_block = _extract_first_output_block(lowered, "perf.json")
-    if perf_block is None:
-        return
+    """Flag JSON-incompatible Fortran edit descriptors in runner write statements.
 
-    if re.search(r"write\s*\([^)]*,\s*['\"][^'\"]*f0\.\d+[^'\"]*['\"]", perf_block):
-        violations.append(
-            f"{runner_file}: perf.json block uses Fortran F0 formatting; JSON numeric serialization must be leading-zero safe"
-        )
+    The ``runner`` emits only JSON artifacts (``diagnostics.json`` / ``perf.json``
+    / ``raw/metrics_basis.json`` / ``raw/state_snapshots/*.json``). Two descriptor
+    classes in a ``write`` format spec break standard JSON parsing and must never
+    reach a JSON token:
+
+      * ``L`` / ``L<n>`` logical edit descriptor emits the bare tokens ``T`` / ``F``
+        instead of JSON ``true`` / ``false`` (booleans must be literal strings).
+      * ``F0`` / ``F0.d`` numeric edit descriptor can emit leading-zero-less floats
+        like ``.5`` that violate RFC 8259.
+
+    The source is scanned as *logical* lines (free-form ``&`` continuations are
+    merged, inline comments stripped). Only genuine ``write(...)`` statements are
+    inspected — the keyword must be followed by ``(`` so an identifier such as
+    ``write_flag`` on a ``read`` line is not mistaken for output. For each write
+    the format spec it actually references is resolved and scanned, whether it is
+    an inline literal (``write(u, '(...)')`` / ``write(u, fmt='(...)')``), an
+    integer label bound to a ``FORMAT`` statement (``write(u, 100)`` +
+    ``100 format(...)``), or a named character constant/variable
+    (``write(u, fmt)`` + ``fmt = '(...)'``). Statement labels and local variables
+    are resolved within the write's own Fortran scoping unit, so a label/name
+    reused in another program unit is not confused. For a named format the most
+    recent literal assignment at or before the write (its reaching definition) is
+    scanned; a non-literal reassignment (``fmt=fmt`` / computed) does not clear a
+    prior unsafe literal. ``read`` statements and read-only format definitions are
+    never scanned, since logical/numeric input parsing legitimately uses these
+    descriptors.
+    """
+    logical_lines = _iter_fortran_logical_lines(text)
+    scopes, scope_parents = _assign_fortran_scopes(logical_lines)
+
+    def scope_chain(scope: int) -> list[int]:
+        chain: list[int] = []
+        current: int | None = scope
+        while current is not None:
+            chain.append(current)
+            current = scope_parents.get(current)
+        return chain
+
+    # First pass: collect per-scope label-bound formats and every write statement
+    # with the format token it references; record which names are used so only
+    # their assignments need tracking.
+    # ``order`` is the logical-statement sequence index (monotonic across the
+    # whole file), used for reaching analysis instead of the physical line number
+    # because ``;``-separated statements share one physical line.
+    label_formats: dict[tuple[int, str], str] = {}
+    writes: list[tuple[int, int, int, str]] = []  # (scope, order, lineno, token)
+    used_names: set[str] = set()
+    for order, (scope, (lineno, line)) in enumerate(zip(scopes, logical_lines)):
+        lowered = line.lower()
+        label_match = _RUNNER_FORMAT_STMT.match(lowered)
+        if label_match:
+            label_formats[(scope, label_match.group(1))] = _extract_balanced_parens(
+                lowered, label_match.end() - 1
+            )
+        for write_match in _RUNNER_WRITE_STMT.finditer(lowered):
+            io_control = _extract_balanced_parens(lowered, write_match.end() - 1)
+            unit = _runner_write_unit(io_control)
+            if unit is not None and unit in _NON_JSON_WRITE_UNITS:
+                continue
+            token = _runner_write_format_token(io_control)
+            if not token:
+                continue
+            writes.append((scope, order, lineno, token))
+            if (
+                token[0] not in "'\""
+                and not token.isdigit()
+                and _RUNNER_NAME_TOKEN.match(token)
+            ):
+                used_names.add(token)
+
+    # Collect literal assignments per (scope, name) keyed by statement order. Only
+    # resolvable format literals are recorded; a non-literal assignment is
+    # intentionally not recorded so it neither resolves nor erases a prior literal.
+    name_assignments: dict[tuple[int, str], list[tuple[int, str]]] = {}
+    if used_names:
+        for order, (scope, (lineno, line)) in enumerate(zip(scopes, logical_lines)):
+            lowered = line.lower()
+            for name in used_names:
+                rhs = _depth0_assignment_rhs(lowered, name)
+                if rhs is None:
+                    continue
+                value = _resolve_format_expr(rhs)
+                if value is not None:
+                    name_assignments.setdefault((scope, name), []).append(
+                        (order, value)
+                    )
+
+    # Second pass: scan each write's resolved format spec. Labels are strictly
+    # local to their unit; named formats follow host association (the write's
+    # scope and its enclosing scopes) and use the latest assignment strictly
+    # before the write in statement order.
+    for scope, order, lineno, token in writes:
+        if token[0] in "'\"":
+            value = _resolve_format_expr(token)
+            if value is not None:
+                _scan_runner_format_text(runner_file, lineno, value, violations)
+        elif token.isdigit():
+            content = label_formats.get((scope, token))
+            if content is not None:
+                _scan_runner_format_text(runner_file, lineno, content, violations)
+        elif _RUNNER_NAME_TOKEN.match(token):
+            candidates: list[tuple[int, str]] = []
+            for ancestor in scope_chain(scope):
+                candidates.extend(name_assignments.get((ancestor, token), ()))
+            reaching: str | None = None
+            for assign_order, value in sorted(candidates):
+                if assign_order < order:
+                    reaching = value
+                else:
+                    break
+            if reaching is not None:
+                _scan_runner_format_text(runner_file, lineno, reaching, violations)
 
 
 @dataclass
@@ -4443,9 +5009,9 @@ def _validate_runner_source_files(
             lowered=text,
             violations=violations,
         )
-        _validate_runner_perf_json_serialization(
+        _validate_runner_json_serialization(
             runner_file=runner_file,
-            lowered=text,
+            text=text,
             violations=violations,
         )
 

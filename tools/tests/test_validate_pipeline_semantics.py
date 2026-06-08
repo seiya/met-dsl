@@ -1565,7 +1565,969 @@ end program shallow_water2d_runner
 
             violations = validate(repo_root=repo_root, workspace_root="workspace")
             self.assertTrue(
-                any("perf.json block uses Fortran F0 formatting" in v for v in violations)
+                any("Fortran F0 formatting" in v for v in violations)
+            )
+
+    def test_detects_unsafe_fortran_l1_boolean_serialization(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            _seed_shape_expr_schema_into(repo_root)
+            model_text = """module shallow_water2d_model
+use dynamics_shallow_water_flux_2d_rusanov_p0_model
+implicit none
+contains
+subroutine shallow_water2d__step(guard_pass)
+  logical, intent(out) :: guard_pass
+  guard_pass = .true.
+end subroutine shallow_water2d__step
+end module shallow_water2d_model
+"""
+            runner_text = """program shallow_water2d_runner
+use shallow_water2d_model
+implicit none
+logical :: guard_pass
+integer :: u
+call shallow_water2d__step(guard_pass)
+open(newunit=u, file='diagnostics.json', status='replace', action='write')
+write(u,'(a,l1,a)') '{"guard_pass":', guard_pass, '}'
+close(u)
+end program shallow_water2d_runner
+"""
+            _create_minimal_execution_tree(
+                repo_root,
+                dep_spec_id="dynamics_shallow_water_flux_2d_rusanov_p0",
+                model_text=model_text,
+                runner_text=runner_text,
+                run_command=["./simulate", "workspace/spec.ir.yaml", "workspace/outdir"],
+            )
+
+            violations = validate(repo_root=repo_root, workspace_root="workspace")
+            self.assertTrue(
+                any("Fortran L edit descriptor" in v for v in violations),
+                msg=f"expected L-descriptor violation, got: {violations}",
+            )
+
+    def test_detects_unsafe_serialization_with_keyword_fmt(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            _seed_shape_expr_schema_into(repo_root)
+            model_text = """module shallow_water2d_model
+use dynamics_shallow_water_flux_2d_rusanov_p0_model
+implicit none
+contains
+subroutine shallow_water2d__step(guard_pass, walltime_sec)
+  logical, intent(out) :: guard_pass
+  real(8), intent(out) :: walltime_sec
+  guard_pass = .true.
+  walltime_sec = 2.0d-6
+end subroutine shallow_water2d__step
+end module shallow_water2d_model
+"""
+            # Both writes use valid Fortran keyword `fmt=` syntax (and one uses
+            # `unit=`), which must still be caught.
+            runner_text = """program shallow_water2d_runner
+use shallow_water2d_model
+implicit none
+logical :: guard_pass
+real(8) :: walltime_sec
+integer :: u
+call shallow_water2d__step(guard_pass, walltime_sec)
+open(newunit=u, file='diagnostics.json', status='replace', action='write')
+write(u, fmt='(a,l1,a)') '{"guard_pass":', guard_pass, '}'
+close(u)
+open(newunit=u, file='perf.json', status='replace', action='write')
+write(unit=u, fmt='(a,f0.6,a)') '{"walltime_sec":', walltime_sec, '}'
+close(u)
+end program shallow_water2d_runner
+"""
+            _create_minimal_execution_tree(
+                repo_root,
+                dep_spec_id="dynamics_shallow_water_flux_2d_rusanov_p0",
+                model_text=model_text,
+                runner_text=runner_text,
+                run_command=["./simulate", "workspace/spec.ir.yaml", "workspace/outdir"],
+            )
+
+            violations = validate(repo_root=repo_root, workspace_root="workspace")
+            self.assertTrue(
+                any("Fortran L edit descriptor" in v for v in violations),
+                msg=f"expected L-descriptor violation (keyword fmt=), got: {violations}",
+            )
+            self.assertTrue(
+                any("Fortran F0 formatting" in v for v in violations),
+                msg=f"expected F0 violation (keyword fmt=/unit=), got: {violations}",
+            )
+
+    def test_detects_f0_after_scale_factor(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            _seed_shape_expr_schema_into(repo_root)
+            model_text = """module shallow_water2d_model
+use dynamics_shallow_water_flux_2d_rusanov_p0_model
+implicit none
+contains
+subroutine shallow_water2d__step(walltime_sec)
+  real(8), intent(out) :: walltime_sec
+  walltime_sec = 2.0d-6
+end subroutine shallow_water2d__step
+end module shallow_water2d_model
+"""
+            # 1P scale factor precedes the F0 descriptor; still leading-zero unsafe.
+            runner_text = """program shallow_water2d_runner
+use shallow_water2d_model
+implicit none
+real(8) :: walltime_sec
+integer :: u
+call shallow_water2d__step(walltime_sec)
+open(newunit=u, file='perf.json', status='replace', action='write')
+write(u,'(a,1pf0.6,a)') '{"walltime_sec":', walltime_sec, '}'
+close(u)
+end program shallow_water2d_runner
+"""
+            _create_minimal_execution_tree(
+                repo_root,
+                dep_spec_id="dynamics_shallow_water_flux_2d_rusanov_p0",
+                model_text=model_text,
+                runner_text=runner_text,
+                run_command=["./simulate", "workspace/spec.ir.yaml", "workspace/outdir"],
+            )
+
+            violations = validate(repo_root=repo_root, workspace_root="workspace")
+            self.assertTrue(
+                any("Fortran F0 formatting" in v for v in violations),
+                msg=f"expected F0 violation after 1P scale factor, got: {violations}",
+            )
+
+    def test_detects_unsafe_serialization_across_continuation_lines(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            _seed_shape_expr_schema_into(repo_root)
+            model_text = """module shallow_water2d_model
+use dynamics_shallow_water_flux_2d_rusanov_p0_model
+implicit none
+contains
+subroutine shallow_water2d__step(guard_pass)
+  logical, intent(out) :: guard_pass
+  guard_pass = .true.
+end subroutine shallow_water2d__step
+end module shallow_water2d_model
+"""
+            # The write statement wraps over a free-form `&` continuation; the
+            # format literal lands on a physical line without the word `write`.
+            runner_text = """program shallow_water2d_runner
+use shallow_water2d_model
+implicit none
+logical :: guard_pass
+integer :: u
+call shallow_water2d__step(guard_pass)
+open(newunit=u, file='diagnostics.json', status='replace', action='write')
+write(unit=u, &
+      fmt='(a,l1,a)') '{"guard_pass":', guard_pass, '}'
+close(u)
+end program shallow_water2d_runner
+"""
+            _create_minimal_execution_tree(
+                repo_root,
+                dep_spec_id="dynamics_shallow_water_flux_2d_rusanov_p0",
+                model_text=model_text,
+                runner_text=runner_text,
+                run_command=["./simulate", "workspace/spec.ir.yaml", "workspace/outdir"],
+            )
+
+            violations = validate(repo_root=repo_root, workspace_root="workspace")
+            self.assertTrue(
+                any("Fortran L edit descriptor" in v for v in violations),
+                msg=f"expected L violation across continuation, got: {violations}",
+            )
+
+    def test_read_with_write_named_variable_is_not_flagged(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            _seed_shape_expr_schema_into(repo_root)
+            model_text = """module shallow_water2d_model
+use dynamics_shallow_water_flux_2d_rusanov_p0_model
+implicit none
+contains
+subroutine shallow_water2d__step(walltime_sec)
+  real(8), intent(out) :: walltime_sec
+  walltime_sec = 2.0d-6
+end subroutine shallow_water2d__step
+end module shallow_water2d_model
+"""
+            # `read(...) write_flag` is legitimate logical INPUT parsing; the
+            # variable name contains "write" but must not trip the output gate.
+            # The JSON write itself uses a safe literal format.
+            runner_text = """program shallow_water2d_runner
+use shallow_water2d_model
+implicit none
+real(8) :: walltime_sec
+logical :: write_flag
+integer :: u
+read(u,'(l1)') write_flag
+call shallow_water2d__step(walltime_sec)
+open(newunit=u, file='perf.json', status='replace', action='write')
+write(u,'(a,f12.6,a)') '{"walltime_sec":', walltime_sec, '}'
+close(u)
+end program shallow_water2d_runner
+"""
+            _create_minimal_execution_tree(
+                repo_root,
+                dep_spec_id="dynamics_shallow_water_flux_2d_rusanov_p0",
+                model_text=model_text,
+                runner_text=runner_text,
+                run_command=["./simulate", "workspace/spec.ir.yaml", "workspace/outdir"],
+            )
+
+            violations = validate(repo_root=repo_root, workspace_root="workspace")
+            self.assertFalse(
+                any(
+                    "Fortran L edit descriptor" in v or "Fortran F0 formatting" in v
+                    for v in violations
+                ),
+                msg=f"read-input L descriptor must not be flagged, got: {violations}",
+            )
+
+    def test_detects_unsafe_serialization_via_labeled_format(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            _seed_shape_expr_schema_into(repo_root)
+            model_text = """module shallow_water2d_model
+use dynamics_shallow_water_flux_2d_rusanov_p0_model
+implicit none
+contains
+subroutine shallow_water2d__step(guard_pass)
+  logical, intent(out) :: guard_pass
+  guard_pass = .true.
+end subroutine shallow_water2d__step
+end module shallow_water2d_model
+"""
+            # Format referenced by integer label bound to a FORMAT statement.
+            runner_text = """program shallow_water2d_runner
+use shallow_water2d_model
+implicit none
+logical :: guard_pass
+integer :: u
+call shallow_water2d__step(guard_pass)
+open(newunit=u, file='diagnostics.json', status='replace', action='write')
+write(u, 100) '{"guard_pass":', guard_pass, '}'
+100 format(a,l1,a)
+close(u)
+end program shallow_water2d_runner
+"""
+            _create_minimal_execution_tree(
+                repo_root,
+                dep_spec_id="dynamics_shallow_water_flux_2d_rusanov_p0",
+                model_text=model_text,
+                runner_text=runner_text,
+                run_command=["./simulate", "workspace/spec.ir.yaml", "workspace/outdir"],
+            )
+
+            violations = validate(repo_root=repo_root, workspace_root="workspace")
+            self.assertTrue(
+                any("Fortran L edit descriptor" in v for v in violations),
+                msg=f"expected L violation via labeled FORMAT, got: {violations}",
+            )
+
+    def test_detects_unsafe_serialization_via_named_format(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            _seed_shape_expr_schema_into(repo_root)
+            model_text = """module shallow_water2d_model
+use dynamics_shallow_water_flux_2d_rusanov_p0_model
+implicit none
+contains
+subroutine shallow_water2d__step(guard_pass)
+  logical, intent(out) :: guard_pass
+  guard_pass = .true.
+end subroutine shallow_water2d__step
+end module shallow_water2d_model
+"""
+            # Format referenced by a named character constant.
+            runner_text = """program shallow_water2d_runner
+use shallow_water2d_model
+implicit none
+character(*), parameter :: jfmt = '(a,l1,a)'
+logical :: guard_pass
+integer :: u
+call shallow_water2d__step(guard_pass)
+open(newunit=u, file='diagnostics.json', status='replace', action='write')
+write(u, jfmt) '{"guard_pass":', guard_pass, '}'
+close(u)
+end program shallow_water2d_runner
+"""
+            _create_minimal_execution_tree(
+                repo_root,
+                dep_spec_id="dynamics_shallow_water_flux_2d_rusanov_p0",
+                model_text=model_text,
+                runner_text=runner_text,
+                run_command=["./simulate", "workspace/spec.ir.yaml", "workspace/outdir"],
+            )
+
+            violations = validate(repo_root=repo_root, workspace_root="workspace")
+            self.assertTrue(
+                any("Fortran L edit descriptor" in v for v in violations),
+                msg=f"expected L violation via named FORMAT, got: {violations}",
+            )
+
+    def test_embedded_string_in_format_is_not_flagged(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            _seed_shape_expr_schema_into(repo_root)
+            model_text = """module shallow_water2d_model
+use dynamics_shallow_water_flux_2d_rusanov_p0_model
+implicit none
+contains
+subroutine shallow_water2d__step(walltime_sec)
+  real(8), intent(out) :: walltime_sec
+  walltime_sec = 2.0d-6
+end subroutine shallow_water2d__step
+end module shallow_water2d_model
+"""
+            # The format embeds literal JSON text whose bytes happen to contain
+            # "l1"/"f0"; those are data, not edit descriptors, and the actual
+            # numeric descriptor (f12.6) is leading-zero safe.
+            runner_text = """program shallow_water2d_runner
+use shallow_water2d_model
+implicit none
+real(8) :: walltime_sec
+integer :: u
+call shallow_water2d__step(walltime_sec)
+open(newunit=u, file='perf.json', status='replace', action='write')
+write(u,'("{""walltime_l1_f0"":",f12.6,"}")') walltime_sec
+close(u)
+end program shallow_water2d_runner
+"""
+            _create_minimal_execution_tree(
+                repo_root,
+                dep_spec_id="dynamics_shallow_water_flux_2d_rusanov_p0",
+                model_text=model_text,
+                runner_text=runner_text,
+                run_command=["./simulate", "workspace/spec.ir.yaml", "workspace/outdir"],
+            )
+
+            violations = validate(repo_root=repo_root, workspace_root="workspace")
+            self.assertFalse(
+                any(
+                    "Fortran L edit descriptor" in v or "Fortran F0 formatting" in v
+                    for v in violations
+                ),
+                msg=f"embedded format text must not be flagged, got: {violations}",
+            )
+
+    def test_real_descriptor_alongside_embedded_string_is_flagged(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            _seed_shape_expr_schema_into(repo_root)
+            model_text = """module shallow_water2d_model
+use dynamics_shallow_water_flux_2d_rusanov_p0_model
+implicit none
+contains
+subroutine shallow_water2d__step(guard_pass)
+  logical, intent(out) :: guard_pass
+  guard_pass = .true.
+end subroutine shallow_water2d__step
+end module shallow_water2d_model
+"""
+            # A genuine L descriptor outside the embedded text must still be caught.
+            runner_text = """program shallow_water2d_runner
+use shallow_water2d_model
+implicit none
+logical :: guard_pass
+integer :: u
+call shallow_water2d__step(guard_pass)
+open(newunit=u, file='diagnostics.json', status='replace', action='write')
+write(u,'("{""guard_pass"":",l1,"}")') guard_pass
+close(u)
+end program shallow_water2d_runner
+"""
+            _create_minimal_execution_tree(
+                repo_root,
+                dep_spec_id="dynamics_shallow_water_flux_2d_rusanov_p0",
+                model_text=model_text,
+                runner_text=runner_text,
+                run_command=["./simulate", "workspace/spec.ir.yaml", "workspace/outdir"],
+            )
+
+            violations = validate(repo_root=repo_root, workspace_root="workspace")
+            self.assertTrue(
+                any("Fortran L edit descriptor" in v for v in violations),
+                msg=f"real L descriptor must still be flagged, got: {violations}",
+            )
+
+    def test_reassigned_format_var_uses_reaching_definition(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            _seed_shape_expr_schema_into(repo_root)
+            model_text = """module shallow_water2d_model
+use dynamics_shallow_water_flux_2d_rusanov_p0_model
+implicit none
+contains
+subroutine shallow_water2d__step(walltime_sec)
+  real(8), intent(out) :: walltime_sec
+  walltime_sec = 2.0d-6
+end subroutine shallow_water2d__step
+end module shallow_water2d_model
+"""
+            # `fmt` holds an L descriptor for read-side parsing, then is reassigned
+            # a safe format before the JSON write. The reaching definition at the
+            # write is the safe one, so nothing must be flagged.
+            runner_text = """program shallow_water2d_runner
+use shallow_water2d_model
+implicit none
+real(8) :: walltime_sec
+logical :: flag
+character(len=32) :: fmt
+integer :: u
+fmt = '(l1)'
+read(u, fmt) flag
+call shallow_water2d__step(walltime_sec)
+fmt = '(a,f12.6,a)'
+open(newunit=u, file='perf.json', status='replace', action='write')
+write(u, fmt) '{"walltime_sec":', walltime_sec, '}'
+close(u)
+end program shallow_water2d_runner
+"""
+            _create_minimal_execution_tree(
+                repo_root,
+                dep_spec_id="dynamics_shallow_water_flux_2d_rusanov_p0",
+                model_text=model_text,
+                runner_text=runner_text,
+                run_command=["./simulate", "workspace/spec.ir.yaml", "workspace/outdir"],
+            )
+
+            violations = validate(repo_root=repo_root, workspace_root="workspace")
+            self.assertFalse(
+                any(
+                    "Fortran L edit descriptor" in v or "Fortran F0 formatting" in v
+                    for v in violations
+                ),
+                msg=f"read-side format must not reach the write, got: {violations}",
+            )
+
+    def test_reassigned_format_var_flags_unsafe_reaching_write(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            _seed_shape_expr_schema_into(repo_root)
+            model_text = """module shallow_water2d_model
+use dynamics_shallow_water_flux_2d_rusanov_p0_model
+implicit none
+contains
+subroutine shallow_water2d__step(guard_pass)
+  logical, intent(out) :: guard_pass
+  guard_pass = .true.
+end subroutine shallow_water2d__step
+end module shallow_water2d_model
+"""
+            # The reaching definition at the write IS the unsafe L format.
+            runner_text = """program shallow_water2d_runner
+use shallow_water2d_model
+implicit none
+logical :: guard_pass
+character(len=32) :: fmt
+integer :: u
+call shallow_water2d__step(guard_pass)
+fmt = '(a,a,a)'
+fmt = '(a,l1,a)'
+open(newunit=u, file='diagnostics.json', status='replace', action='write')
+write(u, fmt) '{"guard_pass":', guard_pass, '}'
+close(u)
+end program shallow_water2d_runner
+"""
+            _create_minimal_execution_tree(
+                repo_root,
+                dep_spec_id="dynamics_shallow_water_flux_2d_rusanov_p0",
+                model_text=model_text,
+                runner_text=runner_text,
+                run_command=["./simulate", "workspace/spec.ir.yaml", "workspace/outdir"],
+            )
+
+            violations = validate(repo_root=repo_root, workspace_root="workspace")
+            self.assertTrue(
+                any("Fortran L edit descriptor" in v for v in violations),
+                msg=f"unsafe reaching format must be flagged, got: {violations}",
+            )
+
+    def test_noop_reassignment_does_not_bypass_unsafe_format(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            _seed_shape_expr_schema_into(repo_root)
+            model_text = """module shallow_water2d_model
+use dynamics_shallow_water_flux_2d_rusanov_p0_model
+implicit none
+contains
+subroutine shallow_water2d__step(guard_pass)
+  logical, intent(out) :: guard_pass
+  guard_pass = .true.
+end subroutine shallow_water2d__step
+end module shallow_water2d_model
+"""
+            # An unsafe literal followed by a non-literal (no-op) reassignment must
+            # not hide the still-unsafe descriptor reaching the write.
+            runner_text = """program shallow_water2d_runner
+use shallow_water2d_model
+implicit none
+logical :: guard_pass
+character(len=32) :: fmt
+integer :: u
+call shallow_water2d__step(guard_pass)
+fmt = '(a,l1,a)'
+fmt = fmt
+open(newunit=u, file='diagnostics.json', status='replace', action='write')
+write(u, fmt) '{"guard_pass":', guard_pass, '}'
+close(u)
+end program shallow_water2d_runner
+"""
+            _create_minimal_execution_tree(
+                repo_root,
+                dep_spec_id="dynamics_shallow_water_flux_2d_rusanov_p0",
+                model_text=model_text,
+                runner_text=runner_text,
+                run_command=["./simulate", "workspace/spec.ir.yaml", "workspace/outdir"],
+            )
+
+            violations = validate(repo_root=repo_root, workspace_root="workspace")
+            self.assertTrue(
+                any("Fortran L edit descriptor" in v for v in violations),
+                msg=f"no-op reassignment must not bypass unsafe format, got: {violations}",
+            )
+
+    def test_format_label_scoped_to_program_unit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            _seed_shape_expr_schema_into(repo_root)
+            model_text = """module shallow_water2d_model
+use dynamics_shallow_water_flux_2d_rusanov_p0_model
+implicit none
+contains
+subroutine shallow_water2d__step(walltime_sec)
+  real(8), intent(out) :: walltime_sec
+  walltime_sec = 2.0d-6
+end subroutine shallow_water2d__step
+end module shallow_water2d_model
+"""
+            # The main program's write(u,100) uses a safe FORMAT label 100. A helper
+            # subroutine reuses label 100 with an unsafe descriptor but only for a
+            # read. Labels are per-scope, so the main write must not be flagged.
+            runner_text = """program shallow_water2d_runner
+use shallow_water2d_model
+implicit none
+real(8) :: walltime_sec
+integer :: u
+call shallow_water2d__step(walltime_sec)
+open(newunit=u, file='perf.json', status='replace', action='write')
+write(u, 100) '{"walltime_sec":', walltime_sec, '}'
+100 format(a,f12.6,a)
+close(u)
+call helper(u)
+contains
+subroutine helper(unit)
+  integer, intent(in) :: unit
+  logical :: flag
+  read(unit, 100) flag
+100 format(l1)
+end subroutine helper
+end program shallow_water2d_runner
+"""
+            _create_minimal_execution_tree(
+                repo_root,
+                dep_spec_id="dynamics_shallow_water_flux_2d_rusanov_p0",
+                model_text=model_text,
+                runner_text=runner_text,
+                run_command=["./simulate", "workspace/spec.ir.yaml", "workspace/outdir"],
+            )
+
+            violations = validate(repo_root=repo_root, workspace_root="workspace")
+            self.assertFalse(
+                any(
+                    "Fortran L edit descriptor" in v or "Fortran F0 formatting" in v
+                    for v in violations
+                ),
+                msg=f"per-scope label must not cross units, got: {violations}",
+            )
+
+    def test_detects_host_associated_named_format(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            _seed_shape_expr_schema_into(repo_root)
+            model_text = """module shallow_water2d_model
+use dynamics_shallow_water_flux_2d_rusanov_p0_model
+implicit none
+contains
+subroutine shallow_water2d__step(guard_pass)
+  logical, intent(out) :: guard_pass
+  guard_pass = .true.
+end subroutine shallow_water2d__step
+end module shallow_water2d_model
+"""
+            # `jfmt` is declared in the host program and used by an internal
+            # subroutine via host association; the unsafe descriptor must be found.
+            runner_text = """program shallow_water2d_runner
+use shallow_water2d_model
+implicit none
+character(*), parameter :: jfmt = '(a,l1,a)'
+logical :: guard_pass
+integer :: u
+call shallow_water2d__step(guard_pass)
+open(newunit=u, file='diagnostics.json', status='replace', action='write')
+call emit(u, guard_pass)
+close(u)
+contains
+subroutine emit(unit, gp)
+  integer, intent(in) :: unit
+  logical, intent(in) :: gp
+  write(unit, jfmt) '{"guard_pass":', gp, '}'
+end subroutine emit
+end program shallow_water2d_runner
+"""
+            _create_minimal_execution_tree(
+                repo_root,
+                dep_spec_id="dynamics_shallow_water_flux_2d_rusanov_p0",
+                model_text=model_text,
+                runner_text=runner_text,
+                run_command=["./simulate", "workspace/spec.ir.yaml", "workspace/outdir"],
+            )
+
+            violations = validate(repo_root=repo_root, workspace_root="workspace")
+            self.assertTrue(
+                any("Fortran L edit descriptor" in v for v in violations),
+                msg=f"host-associated format must be resolved, got: {violations}",
+            )
+
+    def test_detects_unsafe_format_in_semicolon_statement(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            _seed_shape_expr_schema_into(repo_root)
+            model_text = """module shallow_water2d_model
+use dynamics_shallow_water_flux_2d_rusanov_p0_model
+implicit none
+contains
+subroutine shallow_water2d__step(guard_pass)
+  logical, intent(out) :: guard_pass
+  guard_pass = .true.
+end subroutine shallow_water2d__step
+end module shallow_water2d_model
+"""
+            # Assignment and write share one physical line via `;`.
+            runner_text = """program shallow_water2d_runner
+use shallow_water2d_model
+implicit none
+logical :: guard_pass
+character(len=32) :: fmt
+integer :: u
+call shallow_water2d__step(guard_pass)
+open(newunit=u, file='diagnostics.json', status='replace', action='write')
+fmt = '(a,l1,a)'; write(u, fmt) '{"guard_pass":', guard_pass, '}'
+close(u)
+end program shallow_water2d_runner
+"""
+            _create_minimal_execution_tree(
+                repo_root,
+                dep_spec_id="dynamics_shallow_water_flux_2d_rusanov_p0",
+                model_text=model_text,
+                runner_text=runner_text,
+                run_command=["./simulate", "workspace/spec.ir.yaml", "workspace/outdir"],
+            )
+
+            violations = validate(repo_root=repo_root, workspace_root="workspace")
+            self.assertTrue(
+                any("Fortran L edit descriptor" in v for v in violations),
+                msg=f"semicolon-joined write must be scanned, got: {violations}",
+            )
+
+    def test_detects_concatenated_named_format(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            _seed_shape_expr_schema_into(repo_root)
+            model_text = """module shallow_water2d_model
+use dynamics_shallow_water_flux_2d_rusanov_p0_model
+implicit none
+contains
+subroutine shallow_water2d__step(guard_pass)
+  logical, intent(out) :: guard_pass
+  guard_pass = .true.
+end subroutine shallow_water2d__step
+end module shallow_water2d_model
+"""
+            # Named format assembled from constant character concatenation.
+            runner_text = """program shallow_water2d_runner
+use shallow_water2d_model
+implicit none
+character(*), parameter :: jfmt = '(a,' // 'l1,a)'
+logical :: guard_pass
+integer :: u
+call shallow_water2d__step(guard_pass)
+open(newunit=u, file='diagnostics.json', status='replace', action='write')
+write(u, jfmt) '{"guard_pass":', guard_pass, '}'
+close(u)
+end program shallow_water2d_runner
+"""
+            _create_minimal_execution_tree(
+                repo_root,
+                dep_spec_id="dynamics_shallow_water_flux_2d_rusanov_p0",
+                model_text=model_text,
+                runner_text=runner_text,
+                run_command=["./simulate", "workspace/spec.ir.yaml", "workspace/outdir"],
+            )
+
+            violations = validate(repo_root=repo_root, workspace_root="workspace")
+            self.assertTrue(
+                any("Fortran L edit descriptor" in v for v in violations),
+                msg=f"concatenated named format must be resolved, got: {violations}",
+            )
+
+    def test_detects_concatenated_inline_format(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            _seed_shape_expr_schema_into(repo_root)
+            model_text = """module shallow_water2d_model
+use dynamics_shallow_water_flux_2d_rusanov_p0_model
+implicit none
+contains
+subroutine shallow_water2d__step(walltime_sec)
+  real(8), intent(out) :: walltime_sec
+  walltime_sec = 2.0d-6
+end subroutine shallow_water2d__step
+end module shallow_water2d_model
+"""
+            # Inline format assembled by concatenation; F0 in the second piece.
+            runner_text = """program shallow_water2d_runner
+use shallow_water2d_model
+implicit none
+real(8) :: walltime_sec
+integer :: u
+call shallow_water2d__step(walltime_sec)
+open(newunit=u, file='perf.json', status='replace', action='write')
+write(u, '(a,' // 'f0.6,a)') '{"walltime_sec":', walltime_sec, '}'
+close(u)
+end program shallow_water2d_runner
+"""
+            _create_minimal_execution_tree(
+                repo_root,
+                dep_spec_id="dynamics_shallow_water_flux_2d_rusanov_p0",
+                model_text=model_text,
+                runner_text=runner_text,
+                run_command=["./simulate", "workspace/spec.ir.yaml", "workspace/outdir"],
+            )
+
+            violations = validate(repo_root=repo_root, workspace_root="workspace")
+            self.assertTrue(
+                any("Fortran F0 formatting" in v for v in violations),
+                msg=f"concatenated inline format must be scanned, got: {violations}",
+            )
+
+    def test_same_line_assignment_after_write_does_not_reach(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            _seed_shape_expr_schema_into(repo_root)
+            model_text = """module shallow_water2d_model
+use dynamics_shallow_water_flux_2d_rusanov_p0_model
+implicit none
+contains
+subroutine shallow_water2d__step(guard_pass)
+  logical, intent(out) :: guard_pass
+  guard_pass = .true.
+end subroutine shallow_water2d__step
+end module shallow_water2d_model
+"""
+            # On one physical line: safe format, the write, then an unsafe
+            # reassignment. The unsafe one is AFTER the write and must not reach it.
+            runner_text = """program shallow_water2d_runner
+use shallow_water2d_model
+implicit none
+logical :: guard_pass
+character(len=32) :: fmt
+integer :: u
+call shallow_water2d__step(guard_pass)
+open(newunit=u, file='diagnostics.json', status='replace', action='write')
+fmt = '(a,a,a)'; write(u, fmt) '{"guard_pass":', guard_pass, '}'; fmt = '(a,l1,a)'
+close(u)
+end program shallow_water2d_runner
+"""
+            _create_minimal_execution_tree(
+                repo_root,
+                dep_spec_id="dynamics_shallow_water_flux_2d_rusanov_p0",
+                model_text=model_text,
+                runner_text=runner_text,
+                run_command=["./simulate", "workspace/spec.ir.yaml", "workspace/outdir"],
+            )
+
+            violations = validate(repo_root=repo_root, workspace_root="workspace")
+            self.assertFalse(
+                any(
+                    "Fortran L edit descriptor" in v or "Fortran F0 formatting" in v
+                    for v in violations
+                ),
+                msg=f"later same-line assignment must not reach the write, got: {violations}",
+            )
+
+    def test_same_line_unsafe_assignment_before_write_is_flagged(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            _seed_shape_expr_schema_into(repo_root)
+            model_text = """module shallow_water2d_model
+use dynamics_shallow_water_flux_2d_rusanov_p0_model
+implicit none
+contains
+subroutine shallow_water2d__step(guard_pass)
+  logical, intent(out) :: guard_pass
+  guard_pass = .true.
+end subroutine shallow_water2d__step
+end module shallow_water2d_model
+"""
+            # Unsafe assignment precedes the write on the same physical line.
+            runner_text = """program shallow_water2d_runner
+use shallow_water2d_model
+implicit none
+logical :: guard_pass
+character(len=32) :: fmt
+integer :: u
+call shallow_water2d__step(guard_pass)
+open(newunit=u, file='diagnostics.json', status='replace', action='write')
+fmt = '(a,a,a)'; fmt = '(a,l1,a)'; write(u, fmt) '{"guard_pass":', guard_pass, '}'
+close(u)
+end program shallow_water2d_runner
+"""
+            _create_minimal_execution_tree(
+                repo_root,
+                dep_spec_id="dynamics_shallow_water_flux_2d_rusanov_p0",
+                model_text=model_text,
+                runner_text=runner_text,
+                run_command=["./simulate", "workspace/spec.ir.yaml", "workspace/outdir"],
+            )
+
+            violations = validate(repo_root=repo_root, workspace_root="workspace")
+            self.assertTrue(
+                any("Fortran L edit descriptor" in v for v in violations),
+                msg=f"earlier same-line unsafe assignment must be flagged, got: {violations}",
+            )
+
+    def test_formatted_stdout_debug_write_is_not_flagged(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            _seed_shape_expr_schema_into(repo_root)
+            model_text = """module shallow_water2d_model
+use dynamics_shallow_water_flux_2d_rusanov_p0_model
+implicit none
+contains
+subroutine shallow_water2d__step(guard_pass, walltime_sec)
+  logical, intent(out) :: guard_pass
+  real(8), intent(out) :: walltime_sec
+  guard_pass = .true.
+  walltime_sec = 2.0d-6
+end subroutine shallow_water2d__step
+end module shallow_water2d_model
+"""
+            # Formatted debug write to stdout (unit *) uses an L descriptor; it is
+            # not a JSON artifact and must not be flagged. JSON write is safe.
+            runner_text = """program shallow_water2d_runner
+use shallow_water2d_model
+implicit none
+logical :: guard_pass
+real(8) :: walltime_sec
+integer :: u
+call shallow_water2d__step(guard_pass, walltime_sec)
+write(*,'(a,l1)') 'debug guard_pass=', guard_pass
+open(newunit=u, file='perf.json', status='replace', action='write')
+write(u,'(a,f12.6,a)') '{"walltime_sec":', walltime_sec, '}'
+close(u)
+end program shallow_water2d_runner
+"""
+            _create_minimal_execution_tree(
+                repo_root,
+                dep_spec_id="dynamics_shallow_water_flux_2d_rusanov_p0",
+                model_text=model_text,
+                runner_text=runner_text,
+                run_command=["./simulate", "workspace/spec.ir.yaml", "workspace/outdir"],
+            )
+
+            violations = validate(repo_root=repo_root, workspace_root="workspace")
+            self.assertFalse(
+                any(
+                    "Fortran L edit descriptor" in v or "Fortran F0 formatting" in v
+                    for v in violations
+                ),
+                msg=f"stdout debug write must not be flagged, got: {violations}",
+            )
+
+    def test_detects_unsafe_format_in_multiname_declaration(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            _seed_shape_expr_schema_into(repo_root)
+            model_text = """module shallow_water2d_model
+use dynamics_shallow_water_flux_2d_rusanov_p0_model
+implicit none
+contains
+subroutine shallow_water2d__step(guard_pass)
+  logical, intent(out) :: guard_pass
+  guard_pass = .true.
+end subroutine shallow_water2d__step
+end module shallow_water2d_model
+"""
+            # Unsafe format declared first in a multi-name parameter declaration.
+            runner_text = """program shallow_water2d_runner
+use shallow_water2d_model
+implicit none
+character(*), parameter :: jfmt = '(a,l1,a)', kfmt = '(a,i0,a)'
+logical :: guard_pass
+integer :: u
+call shallow_water2d__step(guard_pass)
+open(newunit=u, file='diagnostics.json', status='replace', action='write')
+write(u, jfmt) '{"guard_pass":', guard_pass, '}'
+close(u)
+end program shallow_water2d_runner
+"""
+            _create_minimal_execution_tree(
+                repo_root,
+                dep_spec_id="dynamics_shallow_water_flux_2d_rusanov_p0",
+                model_text=model_text,
+                runner_text=runner_text,
+                run_command=["./simulate", "workspace/spec.ir.yaml", "workspace/outdir"],
+            )
+
+            violations = validate(repo_root=repo_root, workspace_root="workspace")
+            self.assertTrue(
+                any("Fortran L edit descriptor" in v for v in violations),
+                msg=f"multi-name declared format must be resolved, got: {violations}",
+            )
+
+    def test_detects_unsafe_format_with_blanks_in_descriptor(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            _seed_shape_expr_schema_into(repo_root)
+            model_text = """module shallow_water2d_model
+use dynamics_shallow_water_flux_2d_rusanov_p0_model
+implicit none
+contains
+subroutine shallow_water2d__step(walltime_sec)
+  real(8), intent(out) :: walltime_sec
+  walltime_sec = 2.0d-6
+end subroutine shallow_water2d__step
+end module shallow_water2d_model
+"""
+            # Blank inside the F0 descriptor is insignificant in Fortran formats.
+            runner_text = """program shallow_water2d_runner
+use shallow_water2d_model
+implicit none
+real(8) :: walltime_sec
+integer :: u
+call shallow_water2d__step(walltime_sec)
+open(newunit=u, file='perf.json', status='replace', action='write')
+write(u,'(a,f 0.6,a)') '{"walltime_sec":', walltime_sec, '}'
+close(u)
+end program shallow_water2d_runner
+"""
+            _create_minimal_execution_tree(
+                repo_root,
+                dep_spec_id="dynamics_shallow_water_flux_2d_rusanov_p0",
+                model_text=model_text,
+                runner_text=runner_text,
+                run_command=["./simulate", "workspace/spec.ir.yaml", "workspace/outdir"],
+            )
+
+            violations = validate(repo_root=repo_root, workspace_root="workspace")
+            self.assertTrue(
+                any("Fortran F0 formatting" in v for v in violations),
+                msg=f"blank-separated F0 descriptor must be scanned, got: {violations}",
             )
 
     def test_detects_metric_only_scalar_kernel_for_2d_problem(self) -> None:

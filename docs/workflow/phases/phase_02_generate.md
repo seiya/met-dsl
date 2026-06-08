@@ -29,6 +29,7 @@
 - 言語に依らず `model`（物理計算）と `runner`（input/output・実行連携）を分離して生成する。
 - `runner` は `model` を `call` / `use` / `import` で呼び出し、物理更新ロジックを重複実装してはならない。
 - `runner` ソースに `verdict.json`、`aggregate_verdict.json`、`summary.json`、`trial_meta.json` の各文字列を **コメント行を含む全文** に substring として含めてはならない。
+- `runner` が JSON 出力（`diagnostics.json` / `perf.json` / `raw/metrics_basis.json` / `raw/state_snapshots/*.json`）へ書く token は標準 JSON parser で復元可能でなければならない。`impl_defaults.toolchain.language=fortran` では数値へ leading-zero を欠落し得る `F0.d` 書式を、論理値へ `T`/`F` を生む `L` 系 edit descriptor（`L1` 等）を JSON token へ直接使用してはならない。boolean は literal `true` / `false` を出力する。canonical な serialization 規則は [docs/PERFORMANCE_DIAGNOSTICS.md](../../PERFORMANCE_DIAGNOSTICS.md) §6 を参照する。post_generate 静的解析がこの違反を検出して fail させる。
 - `spec.ir.yaml.impl_defaults.toolchain.language` が `fortran` / `c` / `cpp` / `mixed` 系の場合、`runner` が `python` / `bash` / `sh` / `node` など外部インタプリタを起動してはならない。
 - `model` は数値状態更新または判定対象演算を実行しなければならない。固定値返却専用、固定 `JSON` 出力専用、`no-op` 専用実装を禁止する。
 - 依存を持つ `node` の `model` は、`spec.ir.yaml.dependency.direct_deps` で解決された依存 `node` の公開 `operation` 呼び出しを必須とする。

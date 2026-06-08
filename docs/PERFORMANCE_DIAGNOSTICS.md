@@ -46,3 +46,4 @@
 - `perf.json` は UTF-8 の単一 `JSON object` として標準 parser で復元可能でなければならない。
 - 数値 token は `RFC 8259` に従い、先頭 0 を欠落させた `.123` と `-.123` を禁止する。
 - `toolchain.language=fortran` の `runner` は、`F0.d` 書式を `JSON` 数値 token へ直接埋め込んではならない。
+- `toolchain.language=fortran` の `runner` は、論理値を `JSON` へ出力する際に `L` 系 edit descriptor（`L1` 等）が生成する `T`/`F` トークンを `JSON` boolean token へ直接埋め込んではならない。`JSON` boolean は literal `true` / `false` のみ許容し、論理値で分岐して文字列を書く。

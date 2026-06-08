@@ -33,7 +33,7 @@ Generate ステージの生成責務を固定し、`Build` 可能な実装 artif
 - 依存先が `profile` で公開 `operation` を持たない構成では、依存元 `problem` が `profile` の選択結果と拘束条件を参照する実装にしなければならない。
 - `runner` は `diagnostics.json` と `perf.json` と `raw/` 一次証跡のみを出力対象とし、`verdict.json` と `aggregate_verdict.json` と `summary.json` と `trial_meta.json` を書き込んではならない。
 - `runner` ソース（`Fortran` では慣例として `*_runner.f90`）に上記 4 ファイル名を **コメントを含むソース全体** の substring として含めてはならない。部分一致検査はコメントを除外しない。
-- `runner` が出力する `diagnostics.json` と `perf.json` は、標準 `JSON` parser で復元可能な UTF-8 `JSON object` でなければならない。`impl_defaults.toolchain.language=fortran` の場合、`F0.d` など leading zero を欠落し得る数値整形を `JSON` 数値 token へ直接使用してはならない。
+- `runner` が出力する `diagnostics.json` と `perf.json` は、標準 `JSON` parser で復元可能な UTF-8 `JSON object` でなければならない。`impl_defaults.toolchain.language=fortran` の場合、`F0.d` など leading zero を欠落し得る数値整形を `JSON` 数値 token へ直接使用してはならない。論理値を `JSON` boolean として出力する場合は literal `true` / `false` を書き、`L` 系 edit descriptor（`L1` 等）が生成する `T`/`F` トークンを `JSON` boolean token へ直接使用してはならない（`raw/metrics_basis.json` と `raw/state_snapshots/*.json` も同様）。
 - `impl_defaults.target.class=cpu` かつ並列化方式未指定のとき、並列化可能ループへ `OpenMP` を既定適用する。
 - 生成 artifact は対象 `node_key` と整合する構成にする。
 - 生成 artifact は `node_key` ごとの差分を保持し、共通ライブラリ明示なしに `src` 全体を複製してはならない。
