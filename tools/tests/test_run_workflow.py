@@ -728,6 +728,122 @@ class RunWorkflowTests(unittest.TestCase):
             prompt_text = prompt_path.read_text(encoding="utf-8")
             self.assertIn("orchestration_agent_run_id: `orch_agent_run_001`", prompt_text)
 
+    def _run_main_with_failing_launch(
+        self,
+        repo_root: Path,
+        *,
+        meta_status_after_launch: str | None,
+        orchestration_id: str = "orch_interrupt",
+    ) -> tuple[int, dict, list[list[str]]]:
+        """Drive main() through the invoke_llm branch with a non-zero subprocess
+        exit (simulating a token/session-limit kill mid-run).
+
+        meta_status_after_launch seeds orchestration_meta.json so the post-launch
+        status read reflects whether the orchestration agent terminalized
+        (e.g. "fail") or was killed non-terminal (None → file absent → "running").
+        """
+        self._seed_spec_tree(repo_root)
+        orch_root = repo_root / "workspace" / "orchestrations" / orchestration_id
+        if meta_status_after_launch is not None:
+            orch_root.mkdir(parents=True, exist_ok=True)
+            (orch_root / "orchestration_meta.json").write_text(
+                json.dumps(
+                    {
+                        "orchestration_id": orchestration_id,
+                        "status": meta_status_after_launch,
+                        "orchestration_agent_run_id": "orch_agent_run_002",
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+
+        observed_calls: list[list[str]] = []
+
+        def fake_runtime_command(root, env, args):  # type: ignore[no-untyped-def]
+            observed_calls.append(args)
+            if args[0] == "init":
+                return run_workflow.RuntimeResult(
+                    payload={"status": "ok", "orchestration_agent_run_id": "orch_agent_run_002"},
+                    raw_stdout="{}",
+                )
+            if args[0] == "preflight":
+                return run_workflow.RuntimeResult(
+                    payload={
+                        "status": "pass",
+                        "can_launch_step_agents": True,
+                        "can_launch_substep_agents": True,
+                    },
+                    raw_stdout="{}",
+                )
+            return run_workflow.RuntimeResult(payload={"status": "ok"}, raw_stdout="{}")
+
+        def fake_subprocess_run(cmd, *a, **kw):  # type: ignore[no-untyped-def]
+            return subprocess.CompletedProcess(args=cmd, returncode=1)
+
+        original_runtime = run_workflow._runtime_command
+        original_run = run_workflow.subprocess.run
+        buf = io.StringIO()
+        try:
+            run_workflow._runtime_command = fake_runtime_command  # type: ignore[assignment]
+            run_workflow.subprocess.run = fake_subprocess_run  # type: ignore[assignment]
+            with redirect_stdout(buf):
+                code = run_workflow.main(
+                    [
+                        "spec/problem/test.md",
+                        "build",
+                        "--repo-root",
+                        str(repo_root),
+                        "--orchestration-id",
+                        orchestration_id,
+                    ]
+                )
+        finally:
+            run_workflow._runtime_command = original_runtime  # type: ignore[assignment]
+            run_workflow.subprocess.run = original_run  # type: ignore[assignment]
+        out = json.loads(buf.getvalue().strip().splitlines()[-1])
+        return code, out, observed_calls
+
+    def test_failing_launch_terminalizes_nonterminal_orchestration(self) -> None:
+        # A token-limit kill leaves the orchestration meta non-terminal ("running").
+        # run_workflow must terminalize it (set-status fail) so an implicit --resume
+        # is not refused by the non-terminal-latest guard.
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            code, out, calls = self._run_main_with_failing_launch(
+                repo_root, meta_status_after_launch=None
+            )
+            self.assertEqual(code, 2, out)
+            self.assertEqual(out["reason"], "workflow_failed")
+            self.assertEqual(out["workflow_status"], "fail")
+            status_calls = [c for c in calls if c and c[0] == "set-status"]
+            self.assertEqual(len(status_calls), 1, calls)
+            call = status_calls[0]
+            self.assertEqual(call[call.index("--status") + 1], "fail")
+            self.assertEqual(
+                call[call.index("--reason-code") + 1], "llm_launch_interrupted"
+            )
+
+    def test_failing_launch_does_not_double_terminalize(self) -> None:
+        # When the orchestration agent already recorded a terminal status before
+        # the non-zero exit, run_workflow must NOT issue a redundant set-status.
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            code, out, calls = self._run_main_with_failing_launch(
+                repo_root, meta_status_after_launch="fail"
+            )
+            self.assertEqual(code, 2, out)
+            self.assertEqual(out["reason"], "workflow_failed")
+            self.assertEqual(out["workflow_status"], "fail")
+            interrupt_calls = [
+                c
+                for c in calls
+                if c
+                and c[0] == "set-status"
+                and "llm_launch_interrupted" in c
+            ]
+            self.assertEqual(interrupt_calls, [], calls)
+
     def test_direct_script_invocation_does_not_crash_on_module_import(self) -> None:
         """Regression: `python3 tools/run_workflow.py ...` is the canonical
         entrypoint per CLAUDE.md. Under direct-script invocation `sys.path[0]`

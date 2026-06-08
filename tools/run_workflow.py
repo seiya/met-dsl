@@ -1221,6 +1221,48 @@ def main(argv: list[str] | None = None) -> int:
                 "timeout",
                 "cancel",
             }:
+                # When the launched LLM process exited without the orchestration
+                # agent recording a terminal status (e.g. a token/session-limit
+                # kill mid-run), the orchestration meta is still non-terminal
+                # ("running"). run_workflow launched the child synchronously and
+                # it has now returned, so the child is provably dead — terminalize
+                # the orchestration ourselves so an implicit `--resume` (which
+                # refuses a non-terminal latest, see _RESUMABLE_TERMINAL_STATUSES)
+                # can recover it. Best-effort: failure reporting continues even if
+                # set-status raises. Runs before failure-analysis collection so the
+                # reason is reflected in meta.reason_code/reason_detail.
+                if workflow_status.lower() not in _RESUMABLE_TERMINAL_STATUSES:
+                    try:
+                        _runtime_command(
+                            repo_root,
+                            env,
+                            [
+                                "set-status",
+                                "--repo-root",
+                                str(repo_root),
+                                "--orchestration-id",
+                                orchestration_id,
+                                "--status",
+                                "fail",
+                                "--reason-code",
+                                "llm_launch_interrupted",
+                                "--reason-detail",
+                                (
+                                    "LLM launch process exited (returncode="
+                                    f"{proc.returncode}) without the orchestration agent "
+                                    "recording a terminal status; orchestration left non-terminal "
+                                    f"'{workflow_status}'"
+                                ),
+                                "--blocking-policy-scope",
+                                "launch",
+                            ],
+                        )
+                        workflow_status = "fail"
+                    except RuntimeError:
+                        # set-status failed — proceed with failure reporting using
+                        # the observed non-terminal status; resume may still need an
+                        # explicit --orchestration-id in this degraded case.
+                        pass
                 if workflow_mode == "dev":
                     analysis = _collect_failure_analysis(repo_root, orchestration_id)
                     fail_output: dict[str, Any] = {
