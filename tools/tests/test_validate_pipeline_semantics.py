@@ -1277,6 +1277,153 @@ end program shallow_water2d_runner
             violations = validate(repo_root=repo_root, workspace_root="workspace")
             self.assertEqual([], violations)
 
+    def test_broken_append_only_sibling_source_does_not_poison_in_scope_run(self) -> None:
+        """post_execute structural SOURCE checks are scoped to the source the
+        in-scope run declares via trial_meta.source_source_id — a historically
+        broken append-only sibling source (left by an earlier Generate attempt,
+        unremovable under the append-only contract) must NOT permanently fail an
+        otherwise-conformant run. Regression for orch_20260608T012651Z_e906113b,
+        where pipeline-wide source scanning let src_002 (Makefile OBJDIR-prefix
+        defect) poison the clean src_20260609_001 / run_20260609_002.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            _seed_shape_expr_schema_into(repo_root)
+            model_text = """module shallow_water2d_model
+use dynamics_shallow_water_flux_2d_rusanov_p0_model
+implicit none
+contains
+subroutine solve(flag)
+  logical, intent(out) :: flag
+  call dynamics_shallow_water_flux_2d_rusanov_p0__compute_flux(flag)
+end subroutine solve
+end module shallow_water2d_model
+"""
+            runner_text = """program shallow_water2d_runner
+implicit none
+write(*,*) 'diagnostics only'
+end program shallow_water2d_runner
+"""
+            _create_minimal_execution_tree(
+                repo_root,
+                dep_spec_id="dynamics_shallow_water_flux_2d_rusanov_p0",
+                model_text=model_text,
+                runner_text=runner_text,
+                run_command=["./simulate", "workspace/spec.ir.yaml", "workspace/outdir"],
+            )
+
+            # Plant a broken append-only sibling source. Its Makefile has the
+            # OBJDIR-prefix defect (a bare object prerequisite on the link rule
+            # whose producing rule targets $(OBJDIR)/main.o) — flagged when
+            # scanned directly, but the in-scope run never references it.
+            pipeline_dir = (
+                repo_root
+                / "workspace"
+                / "pipelines"
+                / "problem__shallow_water2d__0.3.0"
+                / "shallow-water2d_20260415_001"
+            )
+            broken_src = pipeline_dir / "source" / "src_20260415_999" / "src"
+            broken_src.mkdir(parents=True, exist_ok=True)
+            (broken_src / "main.f90").write_text(
+                "program app\nimplicit none\nwrite(*,*) 1\nend program app\n",
+                encoding="utf-8",
+            )
+            broken_makefile = (
+                "FC ?= gfortran\n"
+                "OBJDIR ?= .\n"
+                "BINDIR ?= .\n"
+                "BIN := app\n"
+                "$(BINDIR)/$(BIN): main.o | $(BINDIR)\n"
+                "\t$(FC) -o $@ main.o\n"
+                "$(OBJDIR)/main.o: main.f90 | $(OBJDIR)\n"
+                "\t$(FC) -c $< -o $@\n"
+            )
+            (broken_src / "Makefile").write_text(broken_makefile, encoding="utf-8")
+
+            # Sanity: the planted sibling IS genuinely defective when scanned.
+            sibling_violations: list[str] = []
+            _validate_fortran_makefile_src_dir(broken_src, sibling_violations)
+            self.assertTrue(
+                any(
+                    "must carry the same $(OBJDIR)/ prefix" in v
+                    for v in sibling_violations
+                ),
+                f"planted sibling must be a real defect; got: {sibling_violations}",
+            )
+
+            # The pipeline must still PASS: the broken sibling is out of scope.
+            violations = validate(repo_root=repo_root, workspace_root="workspace")
+            self.assertEqual([], violations)
+
+    def test_path_like_source_source_id_is_rejected(self) -> None:
+        """The scoped source lookup uses trial_meta.source_source_id directly as a
+        path component. A value containing a separator / absolute path / traversal
+        must be rejected (not used to scan an unintended directory), so a forged or
+        malformed trial_meta cannot escape `<pipeline>/source/`.
+        """
+        for bad_id in ("../../escape", "/abs/source", "a/b"):
+            with self.subTest(source_source_id=bad_id):
+                with tempfile.TemporaryDirectory() as tmp:
+                    repo_root = Path(tmp)
+                    _seed_shape_expr_schema_into(repo_root)
+                    model_text = """module shallow_water2d_model
+use dynamics_shallow_water_flux_2d_rusanov_p0_model
+implicit none
+contains
+subroutine solve(flag)
+  logical, intent(out) :: flag
+  call dynamics_shallow_water_flux_2d_rusanov_p0__compute_flux(flag)
+end subroutine solve
+end module shallow_water2d_model
+"""
+                    runner_text = """program shallow_water2d_runner
+implicit none
+write(*,*) 'diagnostics only'
+end program shallow_water2d_runner
+"""
+                    _create_minimal_execution_tree(
+                        repo_root,
+                        dep_spec_id="dynamics_shallow_water_flux_2d_rusanov_p0",
+                        model_text=model_text,
+                        runner_text=runner_text,
+                        run_command=[
+                            "./simulate",
+                            "workspace/spec.ir.yaml",
+                            "workspace/outdir",
+                        ],
+                    )
+                    trial_meta_path = (
+                        repo_root
+                        / "workspace"
+                        / "pipelines"
+                        / "problem__shallow_water2d__0.3.0"
+                        / "shallow-water2d_20260415_001"
+                        / "runs"
+                        / "run_test_001"
+                        / "problem__shallow_water2d__0.3.0"
+                        / "trial_meta.json"
+                    )
+                    trial_meta = json.loads(
+                        trial_meta_path.read_text(encoding="utf-8")
+                    )
+                    trial_meta["source_source_id"] = bad_id
+                    trial_meta_path.write_text(
+                        json.dumps(trial_meta, ensure_ascii=False),
+                        encoding="utf-8",
+                    )
+
+                    violations = validate(
+                        repo_root=repo_root, workspace_root="workspace"
+                    )
+                    self.assertTrue(
+                        any(
+                            "must be a plain source directory name" in v
+                            for v in violations
+                        ),
+                        f"path-like source_source_id must be rejected; got: {violations}",
+                    )
+
     def test_state_variables_shorthand_in_snapshot_schema_is_rejected(self) -> None:
         """Regression: the `state_variables: [name, ...]` shorthand (variable
         names only, no per-variable `shape_expr`) is no longer a valid form

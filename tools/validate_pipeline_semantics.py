@@ -1342,18 +1342,6 @@ def _validate_fortran_makefile_src_dir(src_dir: Path, violations: list[str]) -> 
             )
 
 
-def _validate_fortran_makefile_dependencies(generate_root: Path, violations: list[str]) -> None:
-    if not generate_root.exists():
-        return
-
-    gen_dirs = sorted(d for d in generate_root.iterdir() if d.is_dir())
-    for gen_dir in gen_dirs:
-        src_dir = gen_dir / "src"
-        if not src_dir.exists():
-            continue
-        _validate_fortran_makefile_src_dir(src_dir, violations)
-
-
 def _validate_problem_runner_diagnostics_dependency(
     execution: NodeExecution,
     runner_file: Path,
@@ -2880,21 +2868,69 @@ def _validate_execution_json_outputs(execution: NodeExecution, violations: list[
             violations.append(f"{perf_path}:parallelism.{key} must be >= 0")
 
 
-def _validate_generate_outputs(
-    repo_root: Path, execution: NodeExecution, violations: list[str]
-) -> None:
-    generate_root = execution.pipeline_dir / "source"
-    if not generate_root.exists():
-        violations.append(f"{generate_root}: missing")
-        return
+def _execution_in_scope_src_dir(
+    execution: NodeExecution, violations: list[str]
+) -> Path | None:
+    """Resolve the single ``source/<source_source_id>/src`` directory that this
+    execution's ``trial_meta.json`` declares it was produced from.
 
-    model_files, expected_model_name = _node_model_files(generate_root, execution)
+    Structural SOURCE checks (model/runner content, Makefile module deps) must be
+    scoped to the source the in-scope run actually used — not every ``source/*/src``
+    sibling under the pipeline. Scanning all siblings lets historically-broken
+    append-only sources (left by earlier Generate attempts, unremovable under the
+    append-only contract) permanently fail an otherwise-conformant run; mirroring
+    the existing ``--run-id`` run-scoping fixes this.
+
+    Returns ``None`` when ``source_source_id`` is absent/invalid (already reported
+    by ``_validate_trial_meta`` as a hard requirement, so no double-report and no
+    silent pass) — callers then skip the structural source scan entirely rather
+    than falling back to a pipeline-wide sweep.
+    """
+    trial_meta_path = execution.node_dir / "trial_meta.json"
+    if not trial_meta_path.exists():
+        return None
+    try:
+        data = _read_json(trial_meta_path)
+    except (json.JSONDecodeError, OSError):
+        return None
+    source_source_id = data.get("source_source_id")
+    if not isinstance(source_source_id, str) or not source_source_id.strip():
+        return None
+    source_source_id = source_source_id.strip()
+    # The id is used directly as a path component, so reject anything that is not
+    # a single plain directory name: a separator, absolute path, or `.`/`..`
+    # traversal would otherwise escape `<pipeline>/source/` and run the structural
+    # source checks against an unintended (or out-of-pipeline) directory. Flag it
+    # rather than silently skipping so a forged/malformed trial_meta is caught.
+    id_parts = Path(source_source_id).parts
+    if (
+        "/" in source_source_id
+        or "\\" in source_source_id
+        or len(id_parts) != 1
+        or id_parts[0] in (".", "..")
+    ):
+        violations.append(
+            f"{trial_meta_path}:source_source_id={source_source_id!r} must be a "
+            "plain source directory name (no path separators or traversal)"
+        )
+        return None
+    src_dir = execution.pipeline_dir / "source" / source_source_id / "src"
+    if not src_dir.is_dir():
+        violations.append(f"{src_dir}: declared source_source_id directory missing")
+        return None
+    return src_dir
+
+
+def _validate_generate_outputs(
+    repo_root: Path, execution: NodeExecution, src_dir: Path, violations: list[str]
+) -> None:
+    model_files, expected_model_name = _model_files_in_src_dir(src_dir, execution)
     if not model_files:
         if expected_model_name is None:
-            violations.append(f"{generate_root}: model source not found")
+            violations.append(f"{src_dir}: model source not found")
         else:
             violations.append(
-                f"{generate_root}: node model source not found ({expected_model_name})"
+                f"{src_dir}: node model source not found ({expected_model_name})"
             )
         return
 
@@ -2955,10 +2991,7 @@ def _validate_generate_outputs(
             violations=violations,
         )
 
-    _validate_fortran_makefile_dependencies(
-        generate_root=generate_root,
-        violations=violations,
-    )
+    _validate_fortran_makefile_src_dir(src_dir, violations)
 
 
 def _validate_generate_outputs_for_generation(
@@ -5030,25 +5063,6 @@ def _spec_id_from_node_key(node_key: str) -> str | None:
     return spec_id or None
 
 
-def _node_model_files(
-    generate_root: Path, execution: NodeExecution
-) -> tuple[list[Path], str | None]:
-    spec_id = _spec_id_from_node_key(execution.node_key)
-    if spec_id is None:
-        return sorted(generate_root.glob("*/src/*_model.f90")), None
-
-    expected_name = f"{spec_id}_model.f90"
-    targets: list[Path] = []
-    for gen_dir in sorted(d for d in generate_root.iterdir() if d.is_dir()):
-        src_dir = gen_dir / "src"
-        if not src_dir.exists():
-            continue
-        candidate = src_dir / expected_name
-        if candidate.exists():
-            targets.append(candidate)
-    return targets, expected_name
-
-
 def _model_files_in_src_dir(
     src_dir: Path, execution: NodeExecution
 ) -> tuple[list[Path], str | None]:
@@ -5093,21 +5107,17 @@ def _validate_dependency_operation_on_model_files(
 
 
 def _validate_dependency_operation_usage(
-    repo_root: Path, execution: NodeExecution, violations: list[str]
+    repo_root: Path, execution: NodeExecution, src_dir: Path, violations: list[str]
 ) -> None:
     dep_spec_ids = _component_dep_spec_ids(repo_root, execution)
     if not dep_spec_ids:
         return
 
-    generate_root = execution.pipeline_dir / "source"
-    if not generate_root.exists():
-        return
-
-    model_files, expected_model_name = _node_model_files(generate_root, execution)
+    model_files, expected_model_name = _model_files_in_src_dir(src_dir, execution)
     if not model_files:
         if expected_model_name is not None:
             violations.append(
-                f"{generate_root}: node model source not found ({expected_model_name})"
+                f"{src_dir}: node model source not found ({expected_model_name})"
             )
         return
 
@@ -5147,9 +5157,10 @@ def _validate_runner_source_files(
         )
 
 
-def _validate_runner_outputs(execution: NodeExecution, violations: list[str]) -> None:
-    generate_root = execution.pipeline_dir / "source"
-    runner_files = sorted(generate_root.glob("*/src/*_runner.f90"))
+def _validate_runner_outputs(
+    execution: NodeExecution, src_dir: Path, violations: list[str]
+) -> None:
+    runner_files = sorted(src_dir.glob("*_runner.f90"))
     if not runner_files:
         return
     _validate_runner_source_files(execution, runner_files, violations)
@@ -6878,6 +6889,12 @@ def _validate_impl(
     dep_contexts: list[tuple[NodeExecution, set[str], str | None]] = []
     lineage_contexts: list[tuple[NodeLineage, set[str], str | None]] = []
     lineages = _lineage_records(workspace_path, pipeline_roots)
+    # Structural SOURCE checks are scoped to the source each execution declares
+    # via trial_meta.source_source_id (mirroring --run-id run-scoping). Track the
+    # sources already structurally validated so that, in legacy multi-run mode,
+    # several runs sharing one source do not re-validate it and emit duplicate
+    # violations.
+    validated_structural_src_dirs: set[Path] = set()
 
     for execution in executions:
         _validate_algorithm_contract_schema(repo_root, execution, violations)
@@ -6886,9 +6903,19 @@ def _validate_impl(
         _validate_execution_json_outputs(execution, violations)
         _validate_raw_evidence(repo_root, execution, violations)
         _validate_metrics_basis_not_trivial(execution, violations)
-        _validate_generate_outputs(repo_root, execution, violations)
-        _validate_dependency_operation_usage(repo_root, execution, violations)
-        _validate_runner_outputs(execution, violations)
+        in_scope_src_dir = _execution_in_scope_src_dir(execution, violations)
+        if (
+            in_scope_src_dir is not None
+            and in_scope_src_dir not in validated_structural_src_dirs
+        ):
+            validated_structural_src_dirs.add(in_scope_src_dir)
+            _validate_generate_outputs(
+                repo_root, execution, in_scope_src_dir, violations
+            )
+            _validate_dependency_operation_usage(
+                repo_root, execution, in_scope_src_dir, violations
+            )
+            _validate_runner_outputs(execution, in_scope_src_dir, violations)
         _validate_run_program_inputs(repo_root, execution, violations)
         _validate_quality_check_commands(repo_root, execution, violations)
         _validate_tests_verdict_summary_consistency(repo_root, execution, violations)
