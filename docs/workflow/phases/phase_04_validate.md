@@ -8,7 +8,7 @@
 - verification input: `spec.ir.yaml`、`source/<source_id>/`、同一 `run_id` 配下の `raw/` / `diagnostics.json` / `perf.json` / `quality_check.json` / `trial_meta.json`。`<source_id>` の解決経路は substep ごとに異なる:
   - `Validate.execute`: launch request に必須記録される `source_id` (runtime enforce 済み; `binary_meta.json.source_source_id` との一致も verify される)。
   - `Validate.judge`: launch request は `run_id` のみ必須なので、同一 `run_id` 配下の `trial_meta.json.source_source_id` を読んで `<source_id>` を解決する (trial_meta は execute が書き込み、runtime が binary_meta との一致を verify 済み)。retry で複数の `source_id` が `pipeline_id` 配下に共存する場合でも、この経路で execute が実際に使用した正確な source が一意に pin される。
-- 出力: `workspace/pipelines/<node_key_safe>/<pipeline_id>/runs/<run_id>/<node_key>/` 配下の以下:
+- 出力: `workspace/pipelines/<node_key_safe>/<pipeline_id>/runs/<run_id>/<node_key_safe>/` 配下の以下:
   - `diagnostics.json`、`perf.json`、`quality_check.json`、`raw/`、`stdout.log`、`stderr.log`（execute substep）
   - `semantic_review.json`、`verdict.json`、`aggregate_verdict.json`、`summary.json`、`trial_meta.json`、`validate_meta.json`（judge substep）
   - `run_program` の `command_id` と `command_log_ref`
@@ -38,7 +38,7 @@
 - `runner` は `verdict.json`、`aggregate_verdict.json`、`summary.json`、`trial_meta.json` を書き込んではならない（これらは `Validate.judge` の責務）。
 - `diagnostics.json` と `perf.json` は、標準 `JSON` parser で復元可能な UTF-8 `JSON object` として出力しなければならない。
 - `Validate.execute` 完了前に `python3 tools/check_artifact_syntax.py --format json --expect-top object` を用いて `diagnostics.json` と `perf.json` と `quality_check.json` を検査し、`fail` 時は `Validate.execute fail` とする。
-- `Validate.execute` は `Validate.judge` 再計算に必要な一次証跡を `runs/<run_id>/<node_key>/raw/` に保存しなければならない。
+- `Validate.execute` は `Validate.judge` 再計算に必要な一次証跡を `runs/<run_id>/<node_key_safe>/raw/` に保存しなければならない。
 - 一次証跡の必須構成は `spec.ir.yaml.io_contract.raw_requirements.required_evidence` を canonical source とする。固定の最小構成を全 `spec` に一律適用してはならない。
 - `raw_requirements.required_evidence` が `artifact=state_snapshots` かつ `required=true` を宣言する場合、`raw/state_snapshots/` は `snapshot_schema.json` で `variables[].name` と `variables[].shape_expr` と `time_variable` と `time_shape_expr` を宣言し、`min_samples` 件以上の状態ファイルへ当該項目を保持しなければならない。
 - `raw_requirements.required_evidence` が `artifact=state_snapshots` を必須宣言しない場合、`raw/state_snapshots/` を必須にしてはならない。
@@ -48,7 +48,7 @@
 - `Validate.execute` が失敗した場合、`diagnostics.json` / `perf.json` の人工生成を禁止し、当該 `node` を `fail` とする。
 - `quality_check.json` は `checks.verdict_available=true` と `checks.diagnostics_match=true` と `checks.verdict_match=true` を同時に満たさなければならない。いずれかが `false` または欠落の場合は `Validate.execute fail` とする。
 - `quality check` 実行は `run_quality_checks` の `preset` 指定のみを許可し、`python3 quality_check.py` など任意コマンド実行を禁止する。
-- `Validate.execute` は `quality check` 成立のために `runs/<run_id>/<node_key>/` 配下へ `test` source、harness、補助 `script`、一時 `Makefile` を生成してはならない。必要 artifact が `Generate` または `Build` 出力に存在しない場合は `Validate.execute fail` とする。
+- `Validate.execute` は `quality check` 成立のために `runs/<run_id>/<node_key_safe>/` 配下へ `test` source、harness、補助 `script`、一時 `Makefile` を生成してはならない。必要 artifact が `Generate` または `Build` 出力に存在しない場合は `Validate.execute fail` とする。
 - `spec.ir.yaml.impl_defaults.toolchain.build_system=make` かつ `toolchain.language=fortran` / `c` / `cpp` / `mixed` 系では、`quality check` は `source/<source_id>/src/` を `project_dir` とする `make_test` または `make_check` で実行する。`run_quality_checks` には `env={OBJDIR:<abs tmp build>, BINDIR:<abs binary/<source_binary_id>/bin>, RUNDIR:<abs>/workspace/tmp/<exec_agent_run_id>/qc_run}` を渡し、既存 binary を `binary/<source_binary_id>/bin/` から参照する（read-only bind の `binary/` で relink しない）。`make test` は binary を再実行して `diagnostics.json` / `raw/*` を `RUNDIR` 直下へ吐くため、`RUNDIR` を canonical run node dir に向けると binary 直書きが gate-authored copy を上書きし `unauthorized_write_violation` を招く。`RUNDIR` は tmp（`workspace/tmp/<exec_agent_run_id>/qc_run`、`run_program` の `run/` とは別 subdir）へ向け、binary 出力は canonical run node dir へ一切直書きさせない。全 canonical `.json` は `run_program` と `run_quality_checks` の **両方完了後**に agent が `guarded-apply-patch` で再 author する（最終 step）。`src/` には cross-phase audit log 以外を書かない。
 - `perf.json` の仕様は `PERFORMANCE_DIAGNOSTICS.md` を参照する。
 - `Validate.execute` 完了前に `python3 tools/validate_pipeline_semantics.py --stage post_execute` を実行し、`exit code 0` を必須とする。`--pipeline-root` は繰り返し指定可能とし、`spec.ir.yaml.dependency.all_nodes` が複数 `node` を保持する試行では `all_nodes` に対応する全 `pipeline_root` を指定する。
@@ -62,7 +62,7 @@
 - `Validate.judge` は `raw/metrics_basis.json` が `io_contract.test_evidence_requirements` の全 `test_id` を保持し、各 entry が当該 `test_id` の `required_raw_variables` を欠落なく保持していることを開始条件として検証する。不足時は `Validate.judge fail` とする。
 - `Validate.judge` は再計算不能または不整合時に `fail` としなければならない。
 - `Validate.judge` は固定スクリプト検査に加え、`LLM` による意味検査を必須実行し、`model` / `runner` / `raw` 一次証跡の整合性と捏造疑義を判定する。
-- `LLM` 意味検査の結果は `semantic_review.json` として `runs/<run_id>/<node_key>/` 配下へ保存し、`review_method`、`decision`、`scope.model_ref`、`scope.runner_ref`、`scope.raw_refs`、`findings` を必須記録とする。
+- `LLM` 意味検査の結果は `semantic_review.json` として `runs/<run_id>/<node_key_safe>/` 配下へ保存し、`review_method`、`decision`、`scope.model_ref`、`scope.runner_ref`、`scope.raw_refs`、`findings` を必須記録とする。
 - `semantic_review.json` の `decision` が `fail` または欠落の場合、当該 `node` を `Validate.judge fail` とする。
 - 直下依存 `node` に `fail` または `blocked` がある場合、上位 `node` は `self_verdict` を評価せず `aggregate_verdict=blocked` として終了する。
 - `blocked` 終了時も `aggregate_verdict.json`、`summary.json`、`trial_meta.json` を必須出力とし、`blocked_reason` と `blocking_direct_deps` を記録する。

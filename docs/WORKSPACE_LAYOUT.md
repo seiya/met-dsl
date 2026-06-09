@@ -130,7 +130,7 @@ workspace/
             │       └── mcp_command_log.jsonl      (compile_project の MCP audit)
             ├── runs/
             │   └── <run_id>/                      (Validate phase output: execute + judge)
-            │       └── <node_key>/
+            │       └── <node_key_safe>/
             │           ├── diagnostics.json
             │           ├── perf.json
             │           ├── quality_check.json
@@ -181,7 +181,7 @@ workspace/
 | `workspace/pipelines/.../<pipeline_id>/source/<source_id>/src/` | Generate | substep agent | 後続 phase | |
 | `workspace/pipelines/.../<pipeline_id>/source/<source_id>/source_meta.json` | Generate | substep agent (guarded-apply-patch) | Build / validator | |
 | `workspace/pipelines/.../<pipeline_id>/binary/<binary_id>/binary_meta.json` | Build | step agent (guarded-apply-patch) | Validate / validator | `source_source_id` を pin |
-| `workspace/pipelines/.../<pipeline_id>/runs/<run_id>/<node_key>/verdict.json` | Validate/judge | substep agent (guarded-apply-patch) | runtime / validator / 上位 node | |
+| `workspace/pipelines/.../<pipeline_id>/runs/<run_id>/<node_key_safe>/verdict.json` | Validate/judge | substep agent (guarded-apply-patch) | runtime / validator / 上位 node | |
 | `workspace/pipelines/.../<pipeline_id>/lineage.json` | 各 phase が追加 | (write-step-result 経由) | runtime / validator | phase id 系譜 |
 
 ## node_key_safe の生成規則

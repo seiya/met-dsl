@@ -148,7 +148,7 @@ def _create_minimal_execution_tree(
     run_id = "run_test_001"
 
     pipeline_dir = workspace / "pipelines" / node_safe / pipeline_id
-    node_dir = pipeline_dir / "runs" / run_id / "problem" / "shallow_water2d"
+    node_dir = pipeline_dir / "runs" / run_id / "problem__shallow_water2d__0.3.0"
     raw_dir = node_dir / "raw"
     snapshots_dir = raw_dir / "state_snapshots"
     src_dir = pipeline_dir / "source" / "src_20260415_001" / "src"
@@ -792,13 +792,275 @@ end program shallow_water2d_runner
                 / "problem__shallow_water2d__0.3.0_empty_pipeline"
                 / "runs"
                 / "exe_empty_001"
-                / "problem"
-                / "shallow_water2d"
+                / "problem__shallow_water2d__0.3.0"
             )
             empty_node_dir.mkdir(parents=True, exist_ok=True)
 
             violations = validate(repo_root=repo_root, workspace_root="workspace")
             self.assertEqual([], violations)
+
+    def test_rejects_run_node_dir_not_matching_pipeline_node_safe(self) -> None:
+        """A run node dir whose name != the pipeline's node_key_safe must fail.
+
+        Discovery reconstructs node_key from the inner directory name; downstream
+        node_key matching normalizes away @version, so a forged version segment
+        (e.g. ...__9.9.9 under a ...__0.3.0 pipeline) would otherwise pass. The
+        validator must reject it instead of treating it as the execution node.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            forged_node_dir = (
+                repo_root
+                / "workspace"
+                / "pipelines"
+                / "problem__shallow_water2d__0.3.0"
+                / "shallow-water2d_20260415_001"
+                / "runs"
+                / "run_test_001"
+                / "problem__shallow_water2d__9.9.9"
+            )
+            forged_node_dir.mkdir(parents=True, exist_ok=True)
+            (forged_node_dir / "perf.json").write_text("{}\n", encoding="utf-8")
+
+            violations = validate(repo_root=repo_root, workspace_root="workspace")
+            self.assertTrue(
+                any(
+                    "run node directory name must equal pipeline node_key_safe" in v
+                    and "problem__shallow_water2d__9.9.9" in v
+                    for v in violations
+                ),
+                violations,
+            )
+            self.assertFalse(
+                any("no execution artifacts found" in v for v in violations),
+                violations,
+            )
+
+    def test_rejects_unparseable_run_node_dir_with_artifacts(self) -> None:
+        """An artifact-bearing run dir whose name is not a valid node_key_safe
+        must be reported, not silently dropped, even when a canonical execution
+        exists elsewhere."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            _seed_shape_expr_schema_into(repo_root)
+            _create_minimal_execution_tree(
+                repo_root,
+                dep_spec_id="dynamics_shallow_water_flux_2d_rusanov_p0",
+                model_text="module m\nimplicit none\nend module m\n",
+                runner_text="program r\nimplicit none\nend program r\n",
+                run_command=["./simulate", "workspace/spec.ir.yaml", "workspace/outdir"],
+            )
+            # Plant an artifact-bearing run dir with an unparseable name (no
+            # `<kind>__<id>__<version>` structure) alongside the canonical run.
+            bad_node_dir = (
+                repo_root
+                / "workspace"
+                / "pipelines"
+                / "problem__shallow_water2d__0.3.0"
+                / "shallow-water2d_20260415_001"
+                / "runs"
+                / "run_test_002"
+                / "garbage_dir"
+            )
+            bad_node_dir.mkdir(parents=True, exist_ok=True)
+            (bad_node_dir / "perf.json").write_text("{}\n", encoding="utf-8")
+
+            violations = validate(repo_root=repo_root, workspace_root="workspace")
+            self.assertTrue(
+                any(
+                    "run node directory name must equal pipeline node_key_safe" in v
+                    and "garbage_dir" in v
+                    for v in violations
+                ),
+                violations,
+            )
+
+    def test_rejects_judge_only_noncanonical_run_dir(self) -> None:
+        """A non-canonical run dir holding only Validate.judge outputs (no execute
+        markers) must still be reported, even when a canonical execution exists."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            _seed_shape_expr_schema_into(repo_root)
+            _create_minimal_execution_tree(
+                repo_root,
+                dep_spec_id="dynamics_shallow_water_flux_2d_rusanov_p0",
+                model_text="module m\nimplicit none\nend module m\n",
+                runner_text="program r\nimplicit none\nend program r\n",
+                run_command=["./simulate", "workspace/spec.ir.yaml", "workspace/outdir"],
+            )
+            judge_only_dir = (
+                repo_root
+                / "workspace"
+                / "pipelines"
+                / "problem__shallow_water2d__0.3.0"
+                / "shallow-water2d_20260415_001"
+                / "runs"
+                / "run_test_003"
+                / "problem__shallow_water2d__9.9.9"
+            )
+            judge_only_dir.mkdir(parents=True, exist_ok=True)
+            (judge_only_dir / "verdict.json").write_text("{}\n", encoding="utf-8")
+
+            violations = validate(repo_root=repo_root, workspace_root="workspace")
+            self.assertTrue(
+                any(
+                    "run node directory name must equal pipeline node_key_safe" in v
+                    and "problem__shallow_water2d__9.9.9" in v
+                    for v in violations
+                ),
+                violations,
+            )
+
+    def test_rejects_legacy_nested_run_artifacts(self) -> None:
+        """Legacy nested run artifacts (runs/<run_id>/<kind>/<spec>/perf.json),
+        where markers sit a level below the immediate run child, must be reported
+        alongside a canonical execution — not silently skipped."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            _seed_shape_expr_schema_into(repo_root)
+            _create_minimal_execution_tree(
+                repo_root,
+                dep_spec_id="dynamics_shallow_water_flux_2d_rusanov_p0",
+                model_text="module m\nimplicit none\nend module m\n",
+                runner_text="program r\nimplicit none\nend program r\n",
+                run_command=["./simulate", "workspace/spec.ir.yaml", "workspace/outdir"],
+            )
+            legacy_spec_dir = (
+                repo_root
+                / "workspace"
+                / "pipelines"
+                / "problem__shallow_water2d__0.3.0"
+                / "shallow-water2d_20260415_001"
+                / "runs"
+                / "run_test_004"
+                / "problem"
+                / "shallow_water2d"
+            )
+            legacy_spec_dir.mkdir(parents=True, exist_ok=True)
+            (legacy_spec_dir / "perf.json").write_text("{}\n", encoding="utf-8")
+
+            violations = validate(repo_root=repo_root, workspace_root="workspace")
+            self.assertTrue(
+                any(
+                    "run node directory name must equal pipeline node_key_safe" in v
+                    and "got 'problem'" in v
+                    for v in violations
+                ),
+                violations,
+            )
+
+    def test_rejects_noncanonical_run_dir_with_only_log_output(self) -> None:
+        """A non-canonical run dir holding only a non-marker Validate output
+        (e.g. stdout.log / validate_meta.json, not in the fixed marker set) must
+        still be reported — content detection is general, not basename-keyed."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            _seed_shape_expr_schema_into(repo_root)
+            _create_minimal_execution_tree(
+                repo_root,
+                dep_spec_id="dynamics_shallow_water_flux_2d_rusanov_p0",
+                model_text="module m\nimplicit none\nend module m\n",
+                runner_text="program r\nimplicit none\nend program r\n",
+                run_command=["./simulate", "workspace/spec.ir.yaml", "workspace/outdir"],
+            )
+            log_only_dir = (
+                repo_root
+                / "workspace"
+                / "pipelines"
+                / "problem__shallow_water2d__0.3.0"
+                / "shallow-water2d_20260415_001"
+                / "runs"
+                / "run_test_005"
+                / "problem__shallow_water2d__9.9.9"
+            )
+            log_only_dir.mkdir(parents=True, exist_ok=True)
+            (log_only_dir / "stdout.log").write_text("ran\n", encoding="utf-8")
+
+            violations = validate(repo_root=repo_root, workspace_root="workspace")
+            self.assertTrue(
+                any(
+                    "run node directory name must equal pipeline node_key_safe" in v
+                    and "problem__shallow_water2d__9.9.9" in v
+                    for v in violations
+                ),
+                violations,
+            )
+
+    def test_rejects_malformed_pipeline_node_safe_parent_with_artifacts(self) -> None:
+        """A pipeline whose node_key_safe parent dir is unparseable must be
+        reported when it holds run artifacts, even though _node_executions skips
+        it and a canonical execution exists elsewhere."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            _seed_shape_expr_schema_into(repo_root)
+            _create_minimal_execution_tree(
+                repo_root,
+                dep_spec_id="dynamics_shallow_water_flux_2d_rusanov_p0",
+                model_text="module m\nimplicit none\nend module m\n",
+                runner_text="program r\nimplicit none\nend program r\n",
+                run_command=["./simulate", "workspace/spec.ir.yaml", "workspace/outdir"],
+            )
+            # Malformed pipeline parent ("bad" is not <kind>__<id>__<version>);
+            # the run child matches that malformed parent name.
+            bad_run_dir = (
+                repo_root
+                / "workspace"
+                / "pipelines"
+                / "bad"
+                / "shallow-water2d_20260415_009"
+                / "runs"
+                / "run_test_001"
+                / "bad"
+            )
+            bad_run_dir.mkdir(parents=True, exist_ok=True)
+            (bad_run_dir / "perf.json").write_text("{}\n", encoding="utf-8")
+
+            violations = validate(repo_root=repo_root, workspace_root="workspace")
+            self.assertTrue(
+                any(
+                    "is not a valid '<spec_kind>__<spec_id>__<spec_version>'" in v
+                    and f"{bad_run_dir}" in v
+                    for v in violations
+                ),
+                violations,
+            )
+
+    def test_rejects_lineage_node_key_mismatched_with_pipeline_parent(self) -> None:
+        """lineage.json.node_key must resolve to the pipeline's node_key_safe
+        parent directory. A bumped @version in node_key (while the parent dir and
+        run dir agree) must be rejected, otherwise the tree would validate against
+        another node's IR since downstream node matching strips @version."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            _seed_shape_expr_schema_into(repo_root)
+            _create_minimal_execution_tree(
+                repo_root,
+                dep_spec_id="dynamics_shallow_water_flux_2d_rusanov_p0",
+                model_text="module m\nimplicit none\nend module m\n",
+                runner_text="program r\nimplicit none\nend program r\n",
+                run_command=["./simulate", "workspace/spec.ir.yaml", "workspace/outdir"],
+            )
+            lineage_path = (
+                repo_root
+                / "workspace"
+                / "pipelines"
+                / "problem__shallow_water2d__0.3.0"
+                / "shallow-water2d_20260415_001"
+                / "lineage.json"
+            )
+            lineage = json.loads(lineage_path.read_text(encoding="utf-8"))
+            lineage["node_key"] = "problem/shallow_water2d@9.9.9"
+            _write_json(lineage_path, lineage)
+
+            violations = validate(repo_root=repo_root, workspace_root="workspace")
+            self.assertTrue(
+                any(
+                    "must match pipeline node_key_safe directory" in v
+                    and "problem/shallow_water2d@9.9.9" in v
+                    for v in violations
+                ),
+                violations,
+            )
 
     def test_detects_dependency_dummy_and_runner_output_and_missing_case_input(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -912,7 +1174,7 @@ end program shallow_water2d_runner
             pipeline_id = "shallow-water2d_20260415_001"
             snapshots_dir = (
                 workspace / "pipelines" / node_safe / pipeline_id
-                / "runs" / "run_test_001" / "problem" / "shallow_water2d"
+                / "runs" / "run_test_001" / "problem__shallow_water2d__0.3.0"
                 / "raw" / "state_snapshots"
             )
             (snapshots_dir / "snapshot_schema.json").write_text(
@@ -1521,7 +1783,7 @@ end program shallow_water2d_runner
             )
             perf_path = (
                 repo_root
-                / "workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/runs/run_test_001/problem/shallow_water2d/perf.json"
+                / "workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/runs/run_test_001/problem__shallow_water2d__0.3.0/perf.json"
             )
             perf_path.write_text('{"walltime_sec":.000002}\n', encoding="utf-8")
 
@@ -2968,8 +3230,7 @@ end program shallow_water2d_runner
                 / "shallow-water2d_20260415_001"
                 / "runs"
                 / "run_test_001"
-                / "problem"
-                / "shallow_water2d"
+                / "problem__shallow_water2d__0.3.0"
                 / "semantic_review.json"
             )
             review_path.unlink()
@@ -3070,8 +3331,7 @@ end program shallow_water2d_runner
                 / "shallow-water2d_20260415_001"
                 / "runs"
                 / "run_test_001"
-                / "problem"
-                / "shallow_water2d"
+                / "problem__shallow_water2d__0.3.0"
             )
             trial_meta_path = node_dir / "trial_meta.json"
             trial_meta = json.loads(trial_meta_path.read_text(encoding="utf-8"))
@@ -3165,8 +3425,7 @@ end program shallow_water2d_runner
                 / "shallow-water2d_20260415_001"
                 / "runs"
                 / "run_test_001"
-                / "problem"
-                / "shallow_water2d"
+                / "problem__shallow_water2d__0.3.0"
             )
             trial_meta_path = node_dir / "trial_meta.json"
             trial_meta = json.loads(trial_meta_path.read_text(encoding="utf-8"))
@@ -3241,8 +3500,7 @@ end program shallow_water2d_runner
                 / "shallow-water2d_20260415_001"
                 / "runs"
                 / "run_test_001"
-                / "problem"
-                / "shallow_water2d"
+                / "problem__shallow_water2d__0.3.0"
             )
             src_dir = (
                 repo_root
@@ -3337,8 +3595,7 @@ shallow_water2d_runner.o: shallow_water2d_runner.f90 shallow_water2d_model.mod
                 / "shallow-water2d_20260415_001"
                 / "runs"
                 / "run_test_001"
-                / "problem"
-                / "shallow_water2d"
+                / "problem__shallow_water2d__0.3.0"
             )
             src_dir = (
                 repo_root
@@ -3421,8 +3678,7 @@ end program shallow_water2d_runner
                 / "shallow-water2d_20260415_001"
                 / "runs"
                 / "run_test_001"
-                / "problem"
-                / "shallow_water2d"
+                / "problem__shallow_water2d__0.3.0"
             )
             trial_meta_path = node_dir / "trial_meta.json"
             trial_meta = json.loads(trial_meta_path.read_text(encoding="utf-8"))
@@ -3511,8 +3767,7 @@ end program shallow_water2d_runner
                 / "shallow-water2d_20260415_001"
                 / "runs"
                 / "run_test_001"
-                / "problem"
-                / "shallow_water2d"
+                / "problem__shallow_water2d__0.3.0"
             )
             _write_json(
                 node_dir / "verdict.json",
@@ -3634,8 +3889,7 @@ end program shallow_water2d_runner
                 / "shallow-water2d_20260415_001"
                 / "runs"
                 / "run_test_001"
-                / "problem"
-                / "shallow_water2d"
+                / "problem__shallow_water2d__0.3.0"
             )
             _write_json(
                 node_dir / "verdict.json",
@@ -3967,8 +4221,7 @@ end program shallow_water2d_runner
                 / "shallow-water2d_20260415_001"
                 / "runs"
                 / "run_test_001"
-                / "problem"
-                / "shallow_water2d"
+                / "problem__shallow_water2d__0.3.0"
                 / "raw"
                 / "state_snapshots"
             )
@@ -5320,8 +5573,7 @@ shallow_water2d_runner.o: shallow_water2d_runner.f90 shallow_water2d_model.mod
                 / "shallow-water2d_20260415_001"
                 / "runs"
                 / "run_test_001"
-                / "problem"
-                / "shallow_water2d"
+                / "problem__shallow_water2d__0.3.0"
             )
             # Replace the canonical log with a compile_project record (wrong
             # tool for the run_program slot the fixture's trial_meta declares).
@@ -5385,8 +5637,7 @@ shallow_water2d_runner.o: shallow_water2d_runner.f90 shallow_water2d_model.mod
                 / "shallow-water2d_20260415_001"
                 / "runs"
                 / "run_test_001"
-                / "problem"
-                / "shallow_water2d"
+                / "problem__shallow_water2d__0.3.0"
             )
             # Overwrite the canonical log file with a record that has no
             # tool_name field — only command_id.
@@ -5442,8 +5693,7 @@ shallow_water2d_runner.o: shallow_water2d_runner.f90 shallow_water2d_model.mod
                 / "shallow-water2d_20260415_001"
                 / "runs"
                 / "run_test_001"
-                / "problem"
-                / "shallow_water2d"
+                / "problem__shallow_water2d__0.3.0"
             )
             trial_meta_path = node_dir / "trial_meta.json"
             trial_meta = json.loads(trial_meta_path.read_text(encoding="utf-8"))
@@ -5480,8 +5730,7 @@ shallow_water2d_runner.o: shallow_water2d_runner.f90 shallow_water2d_model.mod
                 / "shallow-water2d_20260415_001"
                 / "runs"
                 / "run_test_001"
-                / "problem"
-                / "shallow_water2d"
+                / "problem__shallow_water2d__0.3.0"
             )
             trial_meta_path = node_dir / "trial_meta.json"
             trial_meta = json.loads(trial_meta_path.read_text(encoding="utf-8"))
@@ -5517,7 +5766,7 @@ shallow_water2d_runner.o: shallow_water2d_runner.f90 shallow_water2d_model.mod
                 / "shallow-water2d_20260415_001"
             )
             node_dir = (
-                pipeline_dir / "runs" / "run_test_001" / "problem" / "shallow_water2d"
+                pipeline_dir / "runs" / "run_test_001" / "problem__shallow_water2d__0.3.0"
             )
             # Plant a sibling build whose binary the run actually used.
             sibling_build = pipeline_dir / "binary" / "build_sibling_999" / "bin"
@@ -5566,8 +5815,7 @@ shallow_water2d_runner.o: shallow_water2d_runner.f90 shallow_water2d_model.mod
                 / "shallow-water2d_20260415_001"
                 / "runs"
                 / "run_test_001"
-                / "problem"
-                / "shallow_water2d"
+                / "problem__shallow_water2d__0.3.0"
             )
             # Get the command_id the fixture used.
             trial_meta_path = node_dir / "trial_meta.json"
@@ -5622,7 +5870,7 @@ shallow_water2d_runner.o: shallow_water2d_runner.f90 shallow_water2d_model.mod
                 / "shallow-water2d_20260415_001"
             )
             node_dir = (
-                pipeline_dir / "runs" / "run_test_001" / "problem" / "shallow_water2d"
+                pipeline_dir / "runs" / "run_test_001" / "problem__shallow_water2d__0.3.0"
             )
             # Plant a stale generation in fail state with its own canonical log.
             stale_gen_id = "gen_stale_001"
@@ -5704,7 +5952,7 @@ shallow_water2d_runner.o: shallow_water2d_runner.f90 shallow_water2d_model.mod
                 / "shallow-water2d_20260415_001"
             )
             node_dir = (
-                pipeline_dir / "runs" / "run_test_001" / "problem" / "shallow_water2d"
+                pipeline_dir / "runs" / "run_test_001" / "problem__shallow_water2d__0.3.0"
             )
             # Plant a sibling generation with its own canonical log.
             sibling_gen_id = "gen_sibling_001"
@@ -5782,8 +6030,7 @@ shallow_water2d_runner.o: shallow_water2d_runner.f90 shallow_water2d_model.mod
                 / "shallow-water2d_20260415_001"
                 / "runs"
                 / "run_test_001"
-                / "problem"
-                / "shallow_water2d"
+                / "problem__shallow_water2d__0.3.0"
             )
             # Plant a forged log under raw/ (a writable execute output directory).
             forged_log = node_dir / "raw" / "forged_run.jsonl"
@@ -5809,7 +6056,7 @@ shallow_water2d_runner.o: shallow_water2d_runner.f90 shallow_water2d_model.mod
                 "command_log_ref": (
                     "workspace/pipelines/problem__shallow_water2d__0.3.0/"
                     "shallow-water2d_20260415_001/runs/run_test_001/"
-                    "problem/shallow_water2d/raw/forged_run.jsonl"
+                    "problem__shallow_water2d__0.3.0/raw/forged_run.jsonl"
                 ),
             }
             _write_json(trial_meta_path, trial_meta)
@@ -6071,8 +6318,7 @@ end program shallow_water2d_runner
                 / "shallow-water2d_20260415_001"
                 / "runs"
                 / "run_test_001"
-                / "problem"
-                / "shallow_water2d"
+                / "problem__shallow_water2d__0.3.0"
                 / "raw"
                 / "metrics_basis.json"
             )

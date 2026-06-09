@@ -32,7 +32,7 @@ workflow 実行および本 RUNBOOK の修復手順は以下の CLI を前提と
 - 各 `pipeline` には `lineage.json` を必須配置する。
 - `source` artifact は `workspace/pipelines/<node_key_safe>/<pipeline_id>/source/<source_id>/` に保存する。
 - `binary` artifact は `workspace/pipelines/<node_key_safe>/<pipeline_id>/binary/<binary_id>/` に保存する。
-- `Validate` artifact は `workspace/pipelines/<node_key_safe>/<pipeline_id>/runs/<run_id>/<node_key>/` に保存する。
+- `Validate` artifact は `workspace/pipelines/<node_key_safe>/<pipeline_id>/runs/<run_id>/<node_key_safe>/` に保存する。
 - 判定時は `run_id` 単位で読み込む。`run_id` を跨ぐファイル混在を禁止する。
 - 判定時は `node_key` 単位で `verdict` / `aggregate_verdict` / `summary` を分離して読み込む。
 - 任意フロー `Promote` の正式版 artifact は `releases/<spec_kind>/<domain>/<family>/<spec_id>/<target_architecture>/<toolchain_language>/<release_id>/` に保存する（core workflow 外）。`workspace` は試行用途に限定する。
@@ -101,7 +101,7 @@ workflow 実行および本 RUNBOOK の修復手順は以下の CLI を前提と
    - `Build` 自身を内部 retry してはならない。
 7. **Validate**: 対象 `node` ごとに `Validate.execute` substep がバイナリを実行し一次証跡を生成、`Validate.judge` substep が判定指標を再計算して `verdict` を確定する。
    - `Validate.execute` は `MCP run_program` で `runner` を実行し、`run_program` 実行コマンドに `spec.ir.yaml.case` を必ず含める。
-   - `Validate.execute` は `runs/<run_id>/<node_key>/raw/` へ判定再計算用の一次証跡を保存する。`raw` 構成の必須条件は `spec.ir.yaml.io_contract.raw_requirements.required_evidence` を canonical source とする。
+   - `Validate.execute` は `runs/<run_id>/<node_key_safe>/raw/` へ判定再計算用の一次証跡を保存する。`raw` 構成の必須条件は `spec.ir.yaml.io_contract.raw_requirements.required_evidence` を canonical source とする。
    - `Validate.judge` は `raw` 一次証跡のみを入力として判定指標を再計算し、`diagnostics` と一致しない場合は `Validate.judge fail` とする。固定スクリプト検査に加えて `LLM` 意味検査を実施し、`semantic_review.json` の `decision=pass` を必須条件にする。
    - 依存込み判定は `aggregate_verdict.json` へ出力する。直下依存 `node` が `fail` または `blocked` の場合、上位 `node` は `blocked` として終了する。
 8. **強制停止**: 入力不足または前段 artifact 不足で当該 phase を進められない場合、当該 phase を `fail` で停止する。推定補完や人工ファイル生成で進めてはならない。
@@ -197,7 +197,7 @@ python3 tools/run_workflow.py --resume build
 - `blocked` で終了した `node` に `aggregate_verdict.json` / `summary.json` / `trial_meta.json` が存在し、`blocked_reason` が記録されている。
 - `runner` が `python` / `bash` / `sh` / `node` など外部インタプリタを起動していない。
 - `runner` が `verdict.json` / `aggregate_verdict.json` / `summary.json` / `trial_meta.json` を書き込んでいない。
-- `runs/<run_id>/<node_key>/raw/` が存在し、`Validate.judge` 再計算に必要なファイルが揃っている。
+- `runs/<run_id>/<node_key_safe>/raw/` が存在し、`Validate.judge` 再計算に必要なファイルが揃っている。
 - `raw/metrics_basis.json` が `diagnostics.json` の複写ではなく、一次証跡から構成されている。
 - `run-gate` による `validate_workspace_root` 実行が `PASS` を返している。
 - `run-gate` による `validate_pipeline_semantics --stage pre_judge` 相当実行が `PASS` を返している。

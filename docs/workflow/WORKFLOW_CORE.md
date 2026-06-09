@@ -162,7 +162,7 @@ workspace/
             binary_meta.json
         runs/
           <run_id>/
-            <node_key>/
+            <node_key_safe>/
               diagnostics.json
               perf.json
               quality_check.json

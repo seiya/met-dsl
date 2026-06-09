@@ -497,6 +497,23 @@ def _node_key_to_safe(node_key: str) -> str | None:
     return f"{spec_kind}__{spec_id}__{spec_version}"
 
 
+def _node_safe_to_node_key(node_safe: str) -> str | None:
+    """`<spec_kind>__<spec_id>__<spec_version>` を `<spec_kind>/<spec_id>@<spec_version>` へ復元する。
+
+    `_node_key_to_safe` の逆変換。`spec_kind` / `spec_version` は `__` を含まないため、
+    先頭 token を `spec_kind`、末尾 token を `spec_version`、中間を `__` で再結合した値を
+    `spec_id` とする（`spec_id` 内の `__` も復元できる）。
+    """
+    parts = node_safe.split("__")
+    if len(parts) < 3:
+        return None
+    spec_kind, spec_version = parts[0], parts[-1]
+    spec_id = "__".join(parts[1:-1])
+    if not spec_kind or not spec_id or not spec_version:
+        return None
+    return f"{spec_kind}/{spec_id}@{spec_version}"
+
+
 def _parse_slug_date_seq3_id(value: str) -> tuple[int, int] | None:
     match = _SLUG_DATE_SEQ3_PATTERN.fullmatch(value.strip())
     if not match:
@@ -2012,24 +2029,52 @@ def _canonical_json(obj: Any) -> str:
     return json.dumps(obj, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
 
+def _has_execution_artifacts(node_dir: Path) -> bool:
+    markers = (
+        node_dir / "diagnostics.json",
+        node_dir / "perf.json",
+        node_dir / "trial_meta.json",
+        node_dir / "quality_check.json",
+        node_dir / "raw" / "metrics_basis.json",
+    )
+    return any(path.exists() for path in markers)
+
+
+def _subtree_has_any_file(root: Path) -> bool:
+    """True if any regular file exists anywhere under ``root``.
+
+    Used by the non-canonical run-directory scan. The only legitimate child under
+    ``runs/<run_id>/`` is the pipeline's ``<node_key_safe>`` dir (skipped by the
+    caller), so any file-bearing non-canonical child is a forbidden Validate
+    output placement — regardless of filename. Detecting content generally
+    (rather than a fixed marker set) covers every documented output: diagnostics
+    / perf / verdict / summary / semantic_review / trial_meta / quality_check /
+    validate_meta, raw evidence (metrics_basis, execution_trace, state_snapshots,
+    snapshot_schema), stdout/stderr logs, and mcp_command_log — plus any future
+    additions. Recursive so legacy nested ``<kind>/<spec>/`` layouts are caught.
+    """
+    for path in root.rglob("*"):
+        if path.is_file():
+            return True
+    return False
+
+
 def _node_executions(
     workspace_root: Path, pipeline_roots: list[Path] | None = None
 ) -> list[NodeExecution]:
     result: list[NodeExecution] = []
     targets = _pipeline_targets(workspace_root, pipeline_roots)
 
-    def has_execution_artifacts(node_dir: Path) -> bool:
-        markers = (
-            node_dir / "diagnostics.json",
-            node_dir / "perf.json",
-            node_dir / "trial_meta.json",
-            node_dir / "quality_check.json",
-            node_dir / "raw" / "metrics_basis.json",
-        )
-        return any(path.exists() for path in markers)
-
     for pipeline_dir in targets:
         if not pipeline_dir.is_dir():
+            continue
+        # The canonical run node directory is the pipeline's own node_key_safe
+        # (= pipeline_dir.parent.name). Derive node_key from it so a non-canonical
+        # run subdir name (mismatched or unparseable) is never discovered as the
+        # execution node; such dirs are reported by _validate_run_node_dir_names.
+        expected_node_safe = pipeline_dir.parent.name
+        node_key = _node_safe_to_node_key(expected_node_safe)
+        if node_key is None:
             continue
         runs_root = pipeline_dir / "runs"
         if not runs_root.exists():
@@ -2037,24 +2082,78 @@ def _node_executions(
         for exec_dir in sorted(runs_root.iterdir()):
             if not exec_dir.is_dir():
                 continue
-            for kind_dir in sorted(exec_dir.iterdir()):
-                if not kind_dir.is_dir():
+            for node_safe_dir in sorted(exec_dir.iterdir()):
+                if not node_safe_dir.is_dir():
                     continue
-                for spec_dir in sorted(kind_dir.iterdir()):
-                    if not spec_dir.is_dir():
-                        continue
-                    if not has_execution_artifacts(spec_dir):
-                        continue
-                    node_key = f"{kind_dir.name}/{spec_dir.name}"
-                    result.append(
-                        NodeExecution(
-                            node_key=node_key,
-                            node_dir=spec_dir,
-                            exec_dir=exec_dir,
-                            pipeline_dir=pipeline_dir,
-                        )
+                if not _has_execution_artifacts(node_safe_dir):
+                    continue
+                if node_safe_dir.name != expected_node_safe:
+                    continue
+                result.append(
+                    NodeExecution(
+                        node_key=node_key,
+                        node_dir=node_safe_dir,
+                        exec_dir=exec_dir,
+                        pipeline_dir=pipeline_dir,
                     )
+                )
     return result
+
+
+def _validate_run_node_dir_names(
+    workspace_root: Path,
+    pipeline_roots: list[Path] | None,
+    violations: list[str],
+) -> None:
+    """Every run-artifact-bearing ``runs/<run_id>/<child>`` directory must be
+    named exactly the pipeline's ``node_key_safe`` (``pipeline_dir.parent.name``),
+    and that parent must itself be a valid ``node_key_safe``.
+
+    Reports mismatched-but-parseable names (e.g. a forged ``@version`` segment),
+    unparseable run-child names, and malformed pipeline parents (where the
+    canonical name itself is invalid, so the child could never be canonical).
+    ``_node_executions`` only discovers the canonical dir, so without this scan a
+    non-canonical artifact directory would be silently ignored and could pass
+    validation whenever a canonical execution also exists. Content detection is
+    general (``_subtree_has_any_file``) so every documented Validate output —
+    including judge-only outputs, logs, mcp_command_log, validate_meta, and raw
+    evidence — and legacy nested (``<kind>/<spec>/``) layouts are all covered.
+    """
+    for pipeline_dir in _pipeline_targets(workspace_root, pipeline_roots):
+        if not pipeline_dir.is_dir():
+            continue
+        expected_node_safe = pipeline_dir.parent.name
+        parent_is_valid = _node_safe_to_node_key(expected_node_safe) is not None
+        runs_root = pipeline_dir / "runs"
+        if not runs_root.exists():
+            continue
+        for exec_dir in sorted(runs_root.iterdir()):
+            if not exec_dir.is_dir():
+                continue
+            for child in sorted(exec_dir.iterdir()):
+                if not child.is_dir():
+                    continue
+                # The canonical run node dir (parent valid + name match) is
+                # validated by the per-execution checks; skip it (and its nested
+                # raw/ artifacts) entirely.
+                if parent_is_valid and child.name == expected_node_safe:
+                    continue
+                # Non-canonical child: any run artifact anywhere beneath it is a
+                # forbidden non-canonical Validate output (including legacy nested
+                # <kind>/<spec>/ layouts).
+                if not _subtree_has_any_file(child):
+                    continue
+                if not parent_is_valid:
+                    violations.append(
+                        f"{child}: pipeline node_key_safe directory "
+                        f"{expected_node_safe!r} is not a valid "
+                        "'<spec_kind>__<spec_id>__<spec_version>'"
+                    )
+                else:
+                    violations.append(
+                        f"{child}: run node directory name must equal pipeline "
+                        f"node_key_safe {expected_node_safe!r} (got {child.name!r})"
+                    )
 
 
 def _pipeline_targets(
@@ -2137,6 +2236,25 @@ def _validate_pipeline_lineage_presence(
         node_key = lineage.get("node_key")
         if not isinstance(node_key, str) or not node_key.strip():
             violations.append(f"{lineage_path}:node_key must be non-empty string")
+        else:
+            # Tie the declared node_key back to the pipeline's node_key_safe parent
+            # directory so a forged/mistyped parent (e.g. a bumped @version) cannot
+            # be validated against another node's IR. Downstream node matching
+            # normalizes away @version, so this directory binding is the only place
+            # the full versioned identity is enforced.
+            expected_safe = _node_key_to_safe(node_key.strip())
+            actual_safe = pipeline_dir.parent.name
+            if expected_safe is None:
+                violations.append(
+                    f"{lineage_path}:node_key {node_key.strip()!r} must match "
+                    "'<spec_kind>/<spec_id>@<spec_version>'"
+                )
+            elif expected_safe != actual_safe:
+                violations.append(
+                    f"{lineage_path}:node_key {node_key.strip()!r} (node_key_safe "
+                    f"{expected_safe!r}) must match pipeline node_key_safe directory "
+                    f"{actual_safe!r}"
+                )
         raw_pid = lineage.get("pipeline_id")
         if not isinstance(raw_pid, str) or not raw_pid.strip():
             violations.append(f"{lineage_path}:pipeline_id must be non-empty string")
@@ -6691,7 +6809,17 @@ def _validate_impl(
         return [f"{workspace_path}: workspace root does not exist"]
 
     executions = _node_executions(workspace_path, pipeline_roots=pipeline_roots)
+    # The run node directory under runs/<run_id>/ must be the pipeline's own
+    # node_key_safe. Report any artifact-bearing run subdir that deviates (a
+    # forged version segment or an unparseable name) — _node_executions only
+    # discovers the canonical dir, so without this scan a non-canonical artifact
+    # directory would be silently ignored and could pass whenever a canonical
+    # execution also exists. Run before the empty-executions check so a lone
+    # non-canonical dir fails explicitly instead of "no execution artifacts found".
+    _validate_run_node_dir_names(workspace_path, pipeline_roots, violations)
     if not executions:
+        if violations:
+            return violations
         return [f"{workspace_path}/pipelines: no execution artifacts found"]
 
     _validate_pipeline_lineage_presence(

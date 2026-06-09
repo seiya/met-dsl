@@ -59,7 +59,7 @@
   - `Compile.generate` / `Compile.verify`: `workspace/ir/<node_key_safe>/<ir_id>/`
   - `Generate.generate` / `Generate.verify`: `workspace/pipelines/<node_key_safe>/<pipeline_id>/source/<source_id>/`
   - `Build`: `workspace/pipelines/<node_key_safe>/<pipeline_id>/binary/<binary_id>/`
-  - `Validate.execute` / `Validate.judge`: `workspace/pipelines/<node_key_safe>/<pipeline_id>/runs/<run_id>/<node_key>/`
+  - `Validate.execute` / `Validate.judge`: `workspace/pipelines/<node_key_safe>/<pipeline_id>/runs/<run_id>/<node_key_safe>/`
 - `ir_ref` / `pipeline_ref` 配下の変更は、`.json` / `.txt` 出力については `guarded-apply-patch` を通過した canonical path、それ以外の extension については `output_manifests/<agent_run_id>.json` の `allowed_file_tool_paths` に列挙された path への `Edit` / `Write` 直接書き込みに限定する。
 - `record-launch` は child `agent_run_id` ごとに `workspace/orchestrations/<orchestration_id>/output_manifests/<agent_run_id>.json` を生成し、`allowed_output_paths` と `allowed_file_tool_paths` と `allowed_tmp_root`（`workspace/tmp/<agent_run_id>`）を確定しなければならない。
 - **Make build の必須 file pin auto-inject**: `Generate` step かつ `spec.ir.yaml.impl_defaults.toolchain.build_system=make` のとき、`record-launch` は in-source `Makefile` (`<pipeline_ref>/source/<source_id>/src/Makefile`) を `allowed_output_paths` へ自動注入し、`allowed_file_tool_paths` へ流す。bare な `src/` directory entry だけでは source 拡張子 (`.f90`/`.c`) は `guarded-apply-patch` で書けても拡張子なしの `Makefile` は directory-allowlist の source-extension 集合から意図的に除外 (`tools/hooks/common.py`) されるため全経路で書けず、child が mid-run で推測回避 fail-stop する。orchestration agent は通常 `allowed_file_tool_paths` を省略 (auto-derive) すればよい。
