@@ -13,7 +13,10 @@ import yaml
 
 from tools.validate_pipeline_semantics import (
     _BUNDLED_SHAPE_EXPR_SCHEMA_PATH,
+    NodeExecution,
+    _node_executions,
     _parse_makefile_rules,
+    _required_raw_evidence,
     _validate_fortran_makefile_src_dir,
     _validate_generate_lint_command_logs,
     _validate_source_meta_json_files,
@@ -798,6 +801,152 @@ end program shallow_water2d_runner
 
             violations = validate(repo_root=repo_root, workspace_root="workspace")
             self.assertEqual([], violations)
+
+    def test_node_executions_run_id_scope_filters_siblings(self) -> None:
+        """--run-id scoping must restrict post_execute discovery to the target
+        run so that append-only sibling runs from prior attempts (which cannot be
+        deleted) do not permanently fail the pipeline."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            workspace = repo_root / "workspace"
+            node_safe = "problem__shallow_water2d__0.3.0"
+            pipeline_dir = (
+                workspace / "pipelines" / node_safe / "shallow-water2d_20260415_001"
+            )
+            for run_id in ("run_test_001", "run_test_002"):
+                node_dir = pipeline_dir / "runs" / run_id / node_safe
+                node_dir.mkdir(parents=True, exist_ok=True)
+                _write_json(node_dir / "perf.json", {"walltime_sec": 0.0})
+
+            # Unscoped (run_ids=None): every sibling run is discovered (legacy).
+            all_runs = _node_executions(workspace, pipeline_roots=[pipeline_dir])
+            self.assertEqual(
+                {"run_test_001", "run_test_002"},
+                {e.exec_dir.name for e in all_runs},
+            )
+
+            # Scoped: only the target run is discovered.
+            scoped = _node_executions(
+                workspace, pipeline_roots=[pipeline_dir], run_ids={"run_test_001"}
+            )
+            self.assertEqual({"run_test_001"}, {e.exec_dir.name for e in scoped})
+
+    def test_required_raw_evidence_execution_trace_is_ir_driven(self) -> None:
+        """RC1: execution_trace.json must be IR-driven, not a fixed default.
+
+        When the IR's raw_requirements does not declare execution_trace, it must
+        NOT be required (so a node whose IR is silent about it passes without a
+        spurious "raw/execution_trace.json: missing"). Declaring it required:true
+        in the IR must still re-mandate it. metrics_basis.json stays as the
+        baseline requirement either way.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            node_safe = "problem__shallow_water2d__0.3.0"
+            ir_ref = (
+                "workspace/ir/problem__shallow_water2d__0.3.0/"
+                "shallow-water2d_20260415_001"
+            )
+            pipeline_dir = (
+                repo_root
+                / "workspace"
+                / "pipelines"
+                / node_safe
+                / "shallow-water2d_20260415_001"
+            )
+            ir_dir = repo_root / ir_ref
+            pipeline_dir.mkdir(parents=True, exist_ok=True)
+            ir_dir.mkdir(parents=True, exist_ok=True)
+            _write_json(pipeline_dir / "lineage.json", {"ir_ref": ir_ref})
+
+            execution = NodeExecution(
+                node_key="problem/shallow_water2d@0.3.0",
+                node_dir=pipeline_dir / "runs" / "run_test_001" / node_safe,
+                exec_dir=pipeline_dir / "runs" / "run_test_001",
+                pipeline_dir=pipeline_dir,
+            )
+
+            spec_ir_path = ir_dir / "spec.ir.yaml"
+
+            # IR silent about execution_trace -> not required; baseline kept.
+            _write_json(
+                spec_ir_path,
+                {
+                    "io_contract": {
+                        "raw_requirements": {
+                            "required_evidence": [
+                                {"artifact": "metrics_basis.json", "required": True},
+                                {
+                                    "artifact": "state_snapshots",
+                                    "required": True,
+                                    "min_samples": 1,
+                                },
+                            ]
+                        }
+                    }
+                },
+            )
+            required = _required_raw_evidence(repo_root, execution)
+            self.assertNotIn("execution_trace.json", required)
+            self.assertIn("metrics_basis.json", required)
+
+            # IR explicitly declares execution_trace required -> re-mandated.
+            _write_json(
+                spec_ir_path,
+                {
+                    "io_contract": {
+                        "raw_requirements": {
+                            "required_evidence": [
+                                {"artifact": "metrics_basis.json", "required": True},
+                                {"artifact": "execution_trace.json", "required": True},
+                            ]
+                        }
+                    }
+                },
+            )
+            required = _required_raw_evidence(repo_root, execution)
+            self.assertIn("execution_trace.json", required)
+
+    def test_post_execute_run_id_scope_requires_every_pipeline_root(self) -> None:
+        """With repeated --pipeline-root, --run-id scoping must fail when any
+        requested root lacks an execution for the requested run, instead of
+        silently validating only the subset of roots that contain it (false
+        PASS for dependency/all_nodes roots)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            workspace = repo_root / "workspace"
+            node_safe = "problem__shallow_water2d__0.3.0"
+            root_with_run = (
+                workspace / "pipelines" / node_safe / "shallow-water2d_20260415_001"
+            )
+            node_dir = root_with_run / "runs" / "run_test_001" / node_safe
+            node_dir.mkdir(parents=True, exist_ok=True)
+            _write_json(node_dir / "perf.json", {"walltime_sec": 0.0})
+
+            # Second requested root holds only a different (sibling) run id.
+            root_without_run = (
+                workspace / "pipelines" / node_safe / "shallow-water2d_20260415_002"
+            )
+            other_node_dir = root_without_run / "runs" / "run_test_999" / node_safe
+            other_node_dir.mkdir(parents=True, exist_ok=True)
+            _write_json(other_node_dir / "perf.json", {"walltime_sec": 0.0})
+
+            violations = validate(
+                repo_root=repo_root,
+                workspace_root="workspace",
+                pipeline_roots=[root_with_run, root_without_run],
+                require_llm_review=False,
+                require_orchestration=False,
+                run_ids={"run_test_001"},
+            )
+            self.assertTrue(
+                any(
+                    "no execution artifacts found for requested --run-id" in v
+                    and "shallow-water2d_20260415_002" in v
+                    for v in violations
+                ),
+                violations,
+            )
 
     def test_rejects_run_node_dir_not_matching_pipeline_node_safe(self) -> None:
         """A run node dir whose name != the pipeline's node_key_safe must fail.

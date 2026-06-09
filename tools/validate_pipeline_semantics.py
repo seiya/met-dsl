@@ -2060,7 +2060,9 @@ def _subtree_has_any_file(root: Path) -> bool:
 
 
 def _node_executions(
-    workspace_root: Path, pipeline_roots: list[Path] | None = None
+    workspace_root: Path,
+    pipeline_roots: list[Path] | None = None,
+    run_ids: set[str] | None = None,
 ) -> list[NodeExecution]:
     result: list[NodeExecution] = []
     targets = _pipeline_targets(workspace_root, pipeline_roots)
@@ -2081,6 +2083,8 @@ def _node_executions(
             continue
         for exec_dir in sorted(runs_root.iterdir()):
             if not exec_dir.is_dir():
+                continue
+            if run_ids is not None and exec_dir.name not in run_ids:
                 continue
             for node_safe_dir in sorted(exec_dir.iterdir()):
                 if not node_safe_dir.is_dir():
@@ -2104,6 +2108,7 @@ def _validate_run_node_dir_names(
     workspace_root: Path,
     pipeline_roots: list[Path] | None,
     violations: list[str],
+    run_ids: set[str] | None = None,
 ) -> None:
     """Every run-artifact-bearing ``runs/<run_id>/<child>`` directory must be
     named exactly the pipeline's ``node_key_safe`` (``pipeline_dir.parent.name``),
@@ -2129,6 +2134,8 @@ def _validate_run_node_dir_names(
             continue
         for exec_dir in sorted(runs_root.iterdir()):
             if not exec_dir.is_dir():
+                continue
+            if run_ids is not None and exec_dir.name not in run_ids:
                 continue
             for child in sorted(exec_dir.iterdir()):
                 if not child.is_dir():
@@ -3960,7 +3967,13 @@ def _raw_requirements_for_execution(
 def _required_raw_evidence(
     repo_root: Path, execution: NodeExecution
 ) -> set[str]:
-    required: set[str] = {"metrics_basis.json", "execution_trace.json"}
+    # execution_trace.json is IR-driven: it is required only when the IR's
+    # raw_requirements.required_evidence explicitly declares it
+    # (artifact=execution_trace, required=true). Per phase_04_validate.md:42 the
+    # IR is the canonical source for raw-evidence and a fixed minimal set must
+    # not be imposed uniformly on every spec, so it is intentionally absent from
+    # this default. metrics_basis.json stays as the baseline raw evidence.
+    required: set[str] = {"metrics_basis.json"}
     raw_requirements = _raw_requirements_for_execution(repo_root, execution)
     if not isinstance(raw_requirements, dict):
         return required
@@ -6781,6 +6794,7 @@ def validate(
     pipeline_roots: list[Path] | None = None,
     require_llm_review: bool = True,
     require_orchestration: bool = False,
+    run_ids: set[str] | None = None,
 ) -> list[str]:
     with _pinned_repo_root_for_schema(repo_root):
         return _validate_impl(
@@ -6789,6 +6803,7 @@ def validate(
             pipeline_roots,
             require_llm_review,
             require_orchestration,
+            run_ids,
         )
 
 
@@ -6798,6 +6813,7 @@ def _validate_impl(
     pipeline_roots: list[Path] | None,
     require_llm_review: bool,
     require_orchestration: bool,
+    run_ids: set[str] | None = None,
 ) -> list[str]:
     violations: list[str] = []
     normalized_workspace_root = _normalize_workspace_root_token(workspace_root)
@@ -6808,7 +6824,9 @@ def _validate_impl(
     if not workspace_path.exists():
         return [f"{workspace_path}: workspace root does not exist"]
 
-    executions = _node_executions(workspace_path, pipeline_roots=pipeline_roots)
+    executions = _node_executions(
+        workspace_path, pipeline_roots=pipeline_roots, run_ids=run_ids
+    )
     # The run node directory under runs/<run_id>/ must be the pipeline's own
     # node_key_safe. Report any artifact-bearing run subdir that deviates (a
     # forged version segment or an unparseable name) — _node_executions only
@@ -6816,7 +6834,21 @@ def _validate_impl(
     # directory would be silently ignored and could pass whenever a canonical
     # execution also exists. Run before the empty-executions check so a lone
     # non-canonical dir fails explicitly instead of "no execution artifacts found".
-    _validate_run_node_dir_names(workspace_path, pipeline_roots, violations)
+    _validate_run_node_dir_names(workspace_path, pipeline_roots, violations, run_ids)
+    # When --run-id scopes validation, every explicitly requested pipeline root
+    # must contribute at least one execution for the requested run. Without this,
+    # run-id filtering silently drops any requested root that lacks the scoped run
+    # (e.g. a dependency/all_nodes root whose current run id was not supplied), and
+    # validation could PASS after checking only a subset of the requested roots —
+    # a missing current run for that root would go unreported.
+    if run_ids is not None and pipeline_roots:
+        covered_roots = {execution.pipeline_dir for execution in executions}
+        for root in pipeline_roots:
+            if root not in covered_roots:
+                violations.append(
+                    f"{root}: no execution artifacts found for requested --run-id "
+                    f"({', '.join(sorted(run_ids))})"
+                )
     if not executions:
         if violations:
             return violations
@@ -7051,6 +7083,17 @@ def main(argv: list[str] | None = None) -> int:
         ),
     )
     parser.add_argument(
+        "--run-id",
+        action="append",
+        help=(
+            "Optional runs/<run_id> to scope validation to. Can be repeated. "
+            "Effective for --stage post_execute/pre_judge; when omitted, every "
+            "run under the pipeline is validated (legacy behavior). Scoping to "
+            "the current run avoids append-only sibling runs from prior "
+            "attempts permanently failing the pipeline."
+        ),
+    )
+    parser.add_argument(
         "--allow-missing-llm-review",
         action="store_true",
         help="Allow missing semantic_review.json for legacy pipelines.",
@@ -7150,6 +7193,7 @@ def _main_dispatch(args: argparse.Namespace, repo_root: Path) -> int:
                 print(f"pipeline semantic validation: FAIL\n- {exc}")
                 return 1
 
+            run_ids = set(args.run_id) if args.run_id else None
             if args.stage == "post_execute":
                 violations = validate(
                     repo_root=repo_root,
@@ -7157,6 +7201,7 @@ def _main_dispatch(args: argparse.Namespace, repo_root: Path) -> int:
                     pipeline_roots=pipeline_roots,
                     require_llm_review=False,
                     require_orchestration=False,
+                    run_ids=run_ids,
                 )
             elif args.stage == "pre_judge":
                 violations = validate(
@@ -7165,6 +7210,7 @@ def _main_dispatch(args: argparse.Namespace, repo_root: Path) -> int:
                     pipeline_roots=pipeline_roots,
                     require_llm_review=True,
                     require_orchestration=True,
+                    run_ids=run_ids,
                 )
             else:
                 violations = validate(

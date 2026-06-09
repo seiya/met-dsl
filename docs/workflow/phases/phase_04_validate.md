@@ -46,12 +46,12 @@
 - `raw/metrics_basis.json` は `io_contract.test_evidence_requirements` の全 `test_id` を対象とする per-test evidence index を保持しなければならない。各 `test_id` の entry は `required_raw_variables` を欠落なく保持する。
 - 同一 `metrics_basis.json` 内で異なる `test_id` の一次証跡を相互上書きしてはならない。
 - `Validate.execute` が失敗した場合、`diagnostics.json` / `perf.json` の人工生成を禁止し、当該 `node` を `fail` とする。
-- `quality_check.json` は `checks.verdict_available=true` と `checks.diagnostics_match=true` と `checks.verdict_match=true` を同時に満たさなければならない。いずれかが `false` または欠落の場合は `Validate.execute fail` とする。
+- `quality_check.json` は `checks.verdict_available=true` と `checks.diagnostics_match=true` と `checks.verdict_match=true` を同時に満たさなければならない。いずれかが `false` または欠落の場合は `Validate.execute fail` とする。加えて **top-level `status` フィールドへ literal `"pass"`** を記録しなければならない（agent-authored metadata）。`status` が `"pass"` 以外または欠落（例: `verdict:"pass"` のみで `status` 不在）の場合、`post_execute` gate が `quality_check.json:status must be pass` で reject する。
 - `quality check` 実行は `run_quality_checks` の `preset` 指定のみを許可し、`python3 quality_check.py` など任意コマンド実行を禁止する。
 - `Validate.execute` は `quality check` 成立のために `runs/<run_id>/<node_key_safe>/` 配下へ `test` source、harness、補助 `script`、一時 `Makefile` を生成してはならない。必要 artifact が `Generate` または `Build` 出力に存在しない場合は `Validate.execute fail` とする。
 - `spec.ir.yaml.impl_defaults.toolchain.build_system=make` かつ `toolchain.language=fortran` / `c` / `cpp` / `mixed` 系では、`quality check` は `source/<source_id>/src/` を `project_dir` とする `make_test` または `make_check` で実行する。`run_quality_checks` には `env={OBJDIR:<abs tmp build>, BINDIR:<abs binary/<source_binary_id>/bin>, RUNDIR:<abs>/workspace/tmp/<exec_agent_run_id>/qc_run}` を渡し、既存 binary を `binary/<source_binary_id>/bin/` から参照する（read-only bind の `binary/` で relink しない）。`make test` は binary を再実行して `diagnostics.json` / `raw/*` を `RUNDIR` 直下へ吐くため、`RUNDIR` を canonical run node dir に向けると binary 直書きが gate-authored copy を上書きし `unauthorized_write_violation` を招く。`RUNDIR` は tmp（`workspace/tmp/<exec_agent_run_id>/qc_run`、`run_program` の `run/` とは別 subdir）へ向け、binary 出力は canonical run node dir へ一切直書きさせない。全 canonical `.json` は `run_program` と `run_quality_checks` の **両方完了後**に agent が `guarded-apply-patch` で再 author する（最終 step）。`src/` には cross-phase audit log 以外を書かない。
 - `perf.json` の仕様は `PERFORMANCE_DIAGNOSTICS.md` を参照する。
-- `Validate.execute` 完了前に `python3 tools/validate_pipeline_semantics.py --stage post_execute` を実行し、`exit code 0` を必須とする。`--pipeline-root` は繰り返し指定可能とし、`spec.ir.yaml.dependency.all_nodes` が複数 `node` を保持する試行では `all_nodes` に対応する全 `pipeline_root` を指定する。
+- `Validate.execute` 完了前に `python3 tools/validate_pipeline_semantics.py --stage post_execute --pipeline-root <pipeline_root> --run-id <run_id>` を実行し、`exit code 0` を必須とする。`--pipeline-root` は繰り返し指定可能とし、`spec.ir.yaml.dependency.all_nodes` が複数 `node` を保持する試行では `all_nodes` に対応する全 `pipeline_root` を指定する。`--run-id` には本試行の `run_id` を指定し、検証を当該 run へ scope する。`pipeline_id` は `append-only`（既存 run を削除不可）のため、`--run-id` を省略すると過去 retry の壊れた sibling run が同 pipeline に残存して恒久的に `post_execute` を fail させる。`--run-id` 指定で corrected run のみを検証対象とする。
 
 ### 4-2. Validate.judge substep
 - 判定 canonical source は `tests.md` と `spec.ir.yaml.io_contract` とする。
@@ -70,7 +70,7 @@
 - `verdict.json` は `per_test` を必須保持とし、`tests.md` の全 `test_id` を重複なく記録する。
 - `summary.json` の `counts` は `verdict.json.per_test` の集計値と一致しなければならない。
 - 判定入力不足時は `Validate.judge fail` とし、推定値や仮定値で `verdict` を成立させてはならない。
-- `Validate.judge` 開始前と完了前に `python3 tools/validate_pipeline_semantics.py --stage pre_judge` を実行し、`fail` 時は当該 `pipeline` を `invalid` とする。
+- `Validate.judge` 開始前と完了前に `python3 tools/validate_pipeline_semantics.py --stage pre_judge --pipeline-root <pipeline_root> --run-id <run_id>` を実行し、`fail` 時は当該 `pipeline` を `invalid` とする。`--run-id` には判定対象 `run_id` を指定し、`append-only` の pipeline に残る過去 retry の壊れた sibling run を検証対象から除外する。
 - `python3 tools/validate_pipeline_semantics.py --stage pre_judge` は `--allow-missing-orchestration` と `--allow-missing-llm-review` を指定してはならない。
 - `python3 tools/validate_pipeline_semantics.py --stage pre_judge` は、`spec.ir.yaml.dependency.all_nodes` で解決された全 `node` の `pipeline_root` を `--pipeline-root` へ繰り返し指定して検証対象に含めなければならない。
 - `python3 tools/validate_pipeline_semantics.py --stage pre_judge` は、`spec.ir.yaml.dependency.all_nodes` に対して `ir` または `pipeline` が未発行の `node` を検出した場合に `fail` とし、当該試行の `Validate.judge` 開始を禁止する。
