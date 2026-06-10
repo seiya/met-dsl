@@ -1387,6 +1387,136 @@ shell_tool                       stable             true
         self.assertIn("完了返答には `launch_reply`", prompt)
         self.assertIn("guarded-apply-patch", prompt)
 
+    def test_record_agent_run_auto_populates_parent_and_model_from_launch_request(self) -> None:
+        """record_agent_run backfills parent_agent_run_id and agent_model onto the
+        agent_runs entry from launches/<arid>.request.json when the record-agent-run
+        payload omits them. This satisfies the pre_judge step/substep requirement
+        without the orchestration agent re-supplying fields the launch already
+        captured (parent unconditionally; agent_model from the required launch field)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            init_orchestration(
+                repo_root=repo_root,
+                orchestration_id="orch_001",
+                spec_ref="spec/problem/shallow_water2d/controlled_spec.md",
+                source_dependency_ref="spec/problem/shallow_water2d/deps.yaml",
+            )
+            _mark_dependencies_ready(repo_root, "orch_001")
+            write_preflight(
+                repo_root=repo_root,
+                orchestration_id="orch_001",
+                payload={
+                    "status": "pass",
+                    "sandbox_runtime": "bwrap",
+                    "sandbox_enforced": True,
+                    "can_launch_step_agents": True,
+                    "can_launch_substep_agents": True,
+                    "feature_states": {"multi_agent": True, "codex_hooks": True},
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}],
+                },
+            )
+            record_agent_run(
+                repo_root=repo_root,
+                orchestration_id="orch_001",
+                payload={
+                    "agent_run_id": "orch_run_001",
+                    "agent_role": "orchestration",
+                    "status": "running",
+                    "agent_backend": "claude",
+                    "started_at": "2026-03-11T00:00:00Z",
+                },
+            )
+            launch_refs = record_launch(
+                repo_root=repo_root,
+                orchestration_id="orch_001",
+                parent_agent_run_id="orch_run_001",
+                child_agent_run_id="substep_run_ap_generate_001",
+                request_payload={
+                    "agent_model": "claude-opus-4-8",
+                    "agent_run_id": "substep_run_ap_generate_001",
+                    "agent_role": "substep",
+                    "node_key": "problem/shallow_water2d@0.3.0",
+                    "step": "compile",
+                    "substep": "generate",
+                    "orchestration_id": "orch_001",
+                    "parent_agent_run_id": "orch_run_001",
+                    "ir_ref": "workspace/ir/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001",
+                    "pipeline_ref": "workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001",
+                    "dependency_ref": "spec/problem/shallow_water2d/deps.yaml",
+                    "skill_name": "workflow-compile-generate",
+                    "skill_ref": "skills/workflow-compile-generate/SKILL.md",
+                    "skill_must_read_refs": "",
+                    "allowed_output_paths": [
+                        "workspace/ir/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/spec.ir.yaml",
+                    ],
+                    "launch_prompt_full": _substep_launch_prompt(
+                        "problem/shallow_water2d@0.3.0",
+                        "compile",
+                        "generate",
+                        "substep_run_ap_generate_001",
+                    ),
+                },
+                response_payload={
+                    "agent_run_id": "substep_run_ap_generate_001",
+                    **_spawn_response_payload("sess_substep_ap_generate_001"),
+                },
+            )
+            _write_apply_patch_gate_evidence(
+                repo_root,
+                orchestration_id="orch_001",
+                agent_run_id="substep_run_ap_generate_001",
+                actor_role="substep",
+                changed_paths=[
+                    "workspace/ir/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/spec.ir.yaml",
+                ],
+            )
+            record_agent_run(
+                repo_root=repo_root,
+                orchestration_id="orch_001",
+                payload={
+                    # parent_agent_run_id and agent_model are intentionally OMITTED.
+                    "agent_run_id": "substep_run_ap_generate_001",
+                    "agent_role": "substep",
+                    "node_key": "problem/shallow_water2d@0.3.0",
+                    "step": "compile",
+                    "substep": "generate",
+                    "status": "pass",
+                    "agent_backend": "codex",
+                    "context_id": "ctx_substep_ap_generate_001",
+                    "agent_session_id": "sess_substep_ap_generate_001",
+                    "started_at": "2026-03-11T00:00:10Z",
+                    "finished_at": "2026-03-11T00:00:50Z",
+                    "output_refs": [
+                        "workspace/ir/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/spec.ir.yaml",
+                    ],
+                    "launch_request_ref": launch_refs["launch_request_ref"],
+                    "launch_response_ref": launch_refs["launch_response_ref"],
+                    "launch_prompt_ref": launch_refs["launch_prompt_ref"],
+                    "launch_reply_ref": launch_refs["launch_reply_ref"],
+                },
+            )
+            runs_path = repo_root / "workspace/orchestrations/orch_001/agent_runs.jsonl"
+            entries = [
+                json.loads(line)
+                for line in runs_path.read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+            sub = next(
+                e for e in entries if e.get("agent_run_id") == "substep_run_ap_generate_001"
+            )
+            self.assertEqual(sub.get("parent_agent_run_id"), "orch_run_001")
+            self.assertEqual(sub.get("agent_model"), "claude-opus-4-8")
+
+    def test_validate_launch_request_payload_requires_agent_model(self) -> None:
+        """A step/substep launch request without agent_model is rejected at
+        record-launch time (fail-fast), since agent_model is not runtime-derivable
+        and must be supplied by the orchestration agent."""
+        from tools.orchestration_runtime import _validate_launch_request_payload
+
+        req = {"node_key": "problem/shallow_water2d@0.3.0", "step": "build"}
+        with self.assertRaisesRegex(ValueError, "agent_model"):
+            _validate_launch_request_payload(req)
+
     def test_writes_orchestration_artifacts_in_canonical_layout(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
@@ -1418,6 +1548,7 @@ shell_tool                       stable             true
                 parent_agent_run_id="orch_run_001",
                 child_agent_run_id="substep_run_plan_generate_001",
                 request_payload={
+                    "agent_model": "claude-opus-4-8",
                     "agent_run_id": "substep_run_plan_generate_001",
                     "agent_role": "substep",
                     "node_key": "problem/shallow_water2d@0.3.0",
@@ -1453,6 +1584,7 @@ shell_tool                       stable             true
                 parent_agent_run_id="orch_run_001",
                 child_agent_run_id="step_run_build_001",
                 request_payload={
+                    "agent_model": "claude-opus-4-8",
                     "agent_run_id": "step_run_build_001",
                     "agent_role": "step",
                     "node_key": "problem/shallow_water2d@0.3.0",
@@ -1783,6 +1915,7 @@ shell_tool                       stable             true
                 parent_agent_run_id="orch_run_001",
                 child_agent_run_id="  substep_run_strip_001  ",
                 request_payload={
+                    "agent_model": "claude-opus-4-8",
                     "agent_run_id": "substep_run_strip_001",
                     "agent_role": "substep",
                     "node_key": "problem/shallow_water2d@0.3.0",
@@ -1855,6 +1988,7 @@ shell_tool                       stable             true
                 parent_agent_run_id="orch_run_001",
                 child_agent_run_id="substep_run_plan_generate_001",
                 request_payload={
+                    "agent_model": "claude-opus-4-8",
                     "node_key": "problem/shallow_water2d@0.3.0",
                     "step": "compile",
                     "substep": "generate",
@@ -1905,6 +2039,7 @@ shell_tool                       stable             true
                 parent_agent_run_id="orch_run_001",
                 child_agent_run_id="substep_run_plan_generate_001",
                 request_payload={
+                    "agent_model": "claude-opus-4-8",
                     "node_key": "problem/shallow_water2d@0.3.0",
                     "step": "compile",
                     "substep": "generate",
@@ -1976,6 +2111,7 @@ shell_tool                       stable             true
                 parent_agent_run_id="orch_run_001",
                 child_agent_run_id="substep_run_plan_generate_001",
                 request_payload={
+                    "agent_model": "claude-opus-4-8",
                     "node_key": "problem/shallow_water2d@0.3.0",
                     "step": "compile",
                     "substep": "generate",
@@ -2042,6 +2178,7 @@ shell_tool                       stable             true
                     parent_agent_run_id="orch_run_001",
                     child_agent_run_id="step_run_build_001",
                     request_payload={
+                        "agent_model": "claude-opus-4-8",
                         "node_key": "problem/shallow_water2d@0.3.0",
                         "step": "build",
                         "orchestration_id": "orch_001",
@@ -2086,6 +2223,7 @@ shell_tool                       stable             true
                 parent_agent_run_id="orch_run_001",
                 child_agent_run_id="substep_run_generate_verify_001",
                 request_payload={
+                    "agent_model": "claude-opus-4-8",
                     "node_key": "problem/shallow_water2d@0.3.0",
                     "step": "Generate",
                     "substep": "verify",
@@ -2155,6 +2293,7 @@ shell_tool                       stable             true
                 parent_agent_run_id="orch_run_001",
                 child_agent_run_id="step_run_gen_dir_001",
                 request_payload={
+                    "agent_model": "claude-opus-4-8",
                     "node_key": "problem/shallow_water2d@0.3.0",
                     "step": "generate",
                     "agent_role": "step",
@@ -2224,6 +2363,7 @@ shell_tool                       stable             true
             parent_agent_run_id="orch_run_001",
             child_agent_run_id=child_agent_run_id,
             request_payload={
+                "agent_model": "claude-opus-4-8",
                 "node_key": "problem/shallow_water2d@0.3.0",
                 "step": "generate",
                 "agent_role": "step",
@@ -2550,6 +2690,7 @@ shell_tool                       stable             true
                     parent_agent_run_id="orch_run_001",
                     child_agent_run_id="step_run_build_failed_gen",
                     request_payload={
+                        "agent_model": "claude-opus-4-8",
                         "node_key": "problem/shallow_water2d@0.3.0",
                         "step": "build",
                         "agent_role": "step",
@@ -3022,6 +3163,7 @@ shell_tool                       stable             true
                     parent_agent_run_id="orch_run_001",
                     child_agent_run_id="substep_run_plan_generate_001",
                     request_payload={
+                        "agent_model": "claude-opus-4-8",
                         "node_key": "problem/shallow_water2d@0.3.0",
                         "step": "compile",
                         "substep": "generate",
@@ -3069,6 +3211,7 @@ shell_tool                       stable             true
                     parent_agent_run_id="orch_run_001",
                     child_agent_run_id="substep_run_plan_generate_001",
                     request_payload={
+                        "agent_model": "claude-opus-4-8",
                         "node_key": "problem/shallow_water2d@0.3.0",
                         "step": "compile",
                         "substep": "generate",
@@ -3115,6 +3258,7 @@ shell_tool                       stable             true
                     parent_agent_run_id="orch_run_001",
                     child_agent_run_id="substep_run_plan_generate_001",
                     request_payload={
+                        "agent_model": "claude-opus-4-8",
                         "node_key": "problem/shallow_water2d@0.3.0",
                         "step": "compile",
                         "substep": "generate",
@@ -3166,6 +3310,7 @@ shell_tool                       stable             true
                     parent_agent_run_id="orch_run_001",
                     child_agent_run_id="substep_bad_pipeline_001",
                     request_payload={
+                        "agent_model": "claude-opus-4-8",
                         "node_key": "problem/shallow_water2d@0.3.0",
                         "step": "generate",
                         "substep": "generate",
@@ -3208,6 +3353,7 @@ shell_tool                       stable             true
                     parent_agent_run_id="orch_run_001",
                     child_agent_run_id="substep_gen_verify_no_gid",
                     request_payload={
+                        "agent_model": "claude-opus-4-8",
                         "node_key": "problem/shallow_water2d@0.3.0",
                         "step": "generate",
                         "substep": "verify",
@@ -3249,6 +3395,7 @@ shell_tool                       stable             true
                 parent_agent_run_id="orch_run_001",
                 child_agent_run_id="substep_run_plan_verify_001",
                 request_payload={
+                    "agent_model": "claude-opus-4-8",
                     "node_key": "problem/shallow_water2d@0.3.0",
                     "step": "compile",
                     "substep": "verify",
@@ -3295,6 +3442,7 @@ shell_tool                       stable             true
             base = {
                 "node_key": "problem/shallow_water2d@0.3.0",
                 "step": "compile",
+                "agent_model": "claude-opus-4-8",
                 "substep": "verify",
                 "orchestration_id": "orch_001",
                 "agent_run_id": "substep_run_plan_verify_001",
@@ -3348,6 +3496,7 @@ shell_tool                       stable             true
                 {
                     "node_key": "problem/shallow_water2d@0.3.0",
                     "step": "build",
+                    "agent_model": "claude-opus-4-8",
                     "orchestration_id": "orch_001",
                     "agent_run_id": "step_run_build_001",
                     "parent_agent_run_id": "orch_run_001",
@@ -3400,6 +3549,7 @@ shell_tool                       stable             true
                 {
                     "node_key": "problem/shallow_water2d@0.3.0",
                     "step": "build",
+                    "agent_model": "claude-opus-4-8",
                     "orchestration_id": "orch_001",
                     "agent_run_id": "step_run_build_001",
                     "parent_agent_run_id": "orch_run_001",
@@ -3452,6 +3602,7 @@ shell_tool                       stable             true
                 {
                     "node_key": "problem/shallow_water2d@0.3.0",
                     "step": "build",
+                    "agent_model": "claude-opus-4-8",
                     "orchestration_id": "orch_001",
                     "agent_run_id": "step_run_build_001",
                     "parent_agent_run_id": "orch_run_001",
@@ -3549,6 +3700,7 @@ shell_tool                       stable             true
                 parent_agent_run_id="orch_run_001",
                 child_agent_run_id="substep_run_plan_generate_001",
                 request_payload={
+                    "agent_model": "claude-opus-4-8",
                     "node_key": "problem/shallow_water2d@0.3.0",
                     "step": "compile",
                     "substep": "generate",
@@ -3948,6 +4100,7 @@ shell_tool                       stable             true
                 parent_agent_run_id="orch_run_001",
                 child_agent_run_id="step_run_build_001",
                 request_payload={
+                    "agent_model": "claude-opus-4-8",
                     "node_key": "problem/shallow_water2d@0.3.0",
                     "step": "build",
                     "agent_role": "step",
@@ -4026,6 +4179,7 @@ shell_tool                       stable             true
                 parent_agent_run_id="orch_run_001",
                 child_agent_run_id="step_run_build_001",
                 request_payload={
+                    "agent_model": "claude-opus-4-8",
                     "node_key": "problem/shallow_water2d@0.3.0",
                     "step": "build",
                     "agent_role": "step",
@@ -4104,6 +4258,7 @@ shell_tool                       stable             true
                 parent_agent_run_id="orch_run_001",
                 child_agent_run_id="step_run_build_001",
                 request_payload={
+                    "agent_model": "claude-opus-4-8",
                     "node_key": "problem/shallow_water2d@0.3.0",
                     "step": "build",
                     "agent_role": "step",
@@ -4189,6 +4344,7 @@ shell_tool                       stable             true
                 parent_agent_run_id="orch_run_001",
                 child_agent_run_id="step_run_build_001",
                 request_payload={
+                    "agent_model": "claude-opus-4-8",
                     "node_key": "problem/shallow_water2d@0.3.0",
                     "step": "build",
                     "agent_role": "step",
@@ -4278,6 +4434,7 @@ shell_tool                       stable             true
                 parent_agent_run_id="orch_run_001",
                 child_agent_run_id="step_run_noncanon",
                 request_payload={
+                    "agent_model": "claude-opus-4-8",
                     "node_key": "problem/shallow_water2d@0.3.0",
                     "step": "generate",
                     "agent_role": "step",
@@ -4369,6 +4526,7 @@ shell_tool                       stable             true
                 parent_agent_run_id="orch_run_001",
                 child_agent_run_id="step_run_build_mcp_log",
                 request_payload={
+                    "agent_model": "claude-opus-4-8",
                     "node_key": "problem/shallow_water2d@0.3.0",
                     "step": "build",
                     "agent_role": "step",
@@ -4489,6 +4647,7 @@ shell_tool                       stable             true
                 parent_agent_run_id="orch_run_001",
                 child_agent_run_id="step_run_gen_recover",
                 request_payload={
+                    "agent_model": "claude-opus-4-8",
                     "node_key": "problem/shallow_water2d@0.3.0",
                     "step": "generate",
                     "agent_role": "step",
@@ -4653,6 +4812,7 @@ shell_tool                       stable             true
                 parent_agent_run_id="orch_run_001",
                 child_agent_run_id="step_run_exec_qc",
                 request_payload={
+                    "agent_model": "claude-opus-4-8",
                     "node_key": "problem/shallow_water2d@0.3.0",
                     "step": "validate", "substep": "execute",
                     "agent_role": "substep",
@@ -4805,6 +4965,7 @@ shell_tool                       stable             true
                     parent_agent_run_id="orch_run_001",
                     child_agent_run_id="step_run_exec_unrelated",
                     request_payload={
+                        "agent_model": "claude-opus-4-8",
                         "node_key": "problem/shallow_water2d@0.3.0",
                         "step": "validate", "substep": "execute",
                         "agent_role": "substep",
@@ -4909,6 +5070,7 @@ shell_tool                       stable             true
                 parent_agent_run_id="orch_run_001",
                 child_agent_run_id="step_run_exec_legacy_coexist",
                 request_payload={
+                    "agent_model": "claude-opus-4-8",
                     "node_key": "problem/shallow_water2d@0.3.0",
                     "step": "validate", "substep": "execute",
                     "agent_role": "substep",
@@ -5009,6 +5171,7 @@ shell_tool                       stable             true
                     parent_agent_run_id="orch_run_001",
                     child_agent_run_id="step_run_exec_no_build_id",
                     request_payload={
+                        "agent_model": "claude-opus-4-8",
                         "node_key": "problem/shallow_water2d@0.3.0",
                         "step": "validate", "substep": "execute",
                         "agent_role": "substep",
@@ -5106,6 +5269,7 @@ shell_tool                       stable             true
                     parent_agent_run_id="orch_run_001",
                     child_agent_run_id="step_run_exec_unrelated_gen",
                     request_payload={
+                        "agent_model": "claude-opus-4-8",
                         "node_key": "problem/shallow_water2d@0.3.0",
                         "step": "validate", "substep": "execute",
                         "agent_role": "substep",
@@ -5205,6 +5369,7 @@ shell_tool                       stable             true
                     parent_agent_run_id="orch_run_001",
                     child_agent_run_id="step_run_exec_failed_gen",
                     request_payload={
+                        "agent_model": "claude-opus-4-8",
                         "node_key": "problem/shallow_water2d@0.3.0",
                         "step": "validate", "substep": "execute",
                         "agent_role": "substep",
@@ -5294,6 +5459,7 @@ shell_tool                       stable             true
                     parent_agent_run_id="orch_run_001",
                     child_agent_run_id="step_run_exec_forged",
                     request_payload={
+                        "agent_model": "claude-opus-4-8",
                         "node_key": "problem/shallow_water2d@0.3.0",
                         "step": "validate", "substep": "execute",
                         "agent_role": "substep",
@@ -5349,6 +5515,7 @@ shell_tool                       stable             true
                 parent_agent_run_id="orch_run_001",
                 child_agent_run_id="substep_run_gen_001",
                 request_payload={
+                    "agent_model": "claude-opus-4-8",
                     "node_key": "problem/shallow_water2d@0.3.0",
                     "step": "compile",
                     "substep": "generate",
@@ -5444,6 +5611,7 @@ shell_tool                       stable             true
                         parent_agent_run_id="orch_run_001",
                         child_agent_run_id="substep_run_gen_001",
                         request_payload={
+                            "agent_model": "claude-opus-4-8",
                             "node_key": "problem/shallow_water2d@0.3.0",
                             "step": "compile",
                             "substep": "generate",
@@ -5545,6 +5713,7 @@ shell_tool                       stable             true
                 parent_agent_run_id="orch_run_001",
                 child_agent_run_id="step_run_build_001",
                 request_payload={
+                    "agent_model": "claude-opus-4-8",
                     "node_key": "problem/shallow_water2d@0.3.0",
                     "step": "build",
                     "agent_role": "step",
@@ -5637,6 +5806,7 @@ shell_tool                       stable             true
                 parent_agent_run_id="orch_run_001",
                 child_agent_run_id="step_run_build_001",
                 request_payload={
+                    "agent_model": "claude-opus-4-8",
                     "node_key": "problem/shallow_water2d@0.3.0",
                     "step": "build",
                     "agent_role": "step",
@@ -5732,6 +5902,7 @@ shell_tool                       stable             true
                 parent_agent_run_id="orch_run_001",
                 child_agent_run_id="step_run_build_001",
                 request_payload={
+                    "agent_model": "claude-opus-4-8",
                     "node_key": "problem/shallow_water2d@0.3.0",
                     "step": "build",
                     "agent_role": "step",
@@ -5828,6 +5999,7 @@ shell_tool                       stable             true
                 parent_agent_run_id="orch_run_001",
                 child_agent_run_id="step_run_build_001",
                 request_payload={
+                    "agent_model": "claude-opus-4-8",
                     "node_key": "problem/shallow_water2d@0.3.0",
                     "step": "build",
                     "agent_role": "step",
@@ -5932,6 +6104,7 @@ shell_tool                       stable             true
                 parent_agent_run_id="orch_run_001",
                 child_agent_run_id="step_run_build_001",
                 request_payload={
+                    "agent_model": "claude-opus-4-8",
                     "node_key": "problem/shallow_water2d@0.3.0",
                     "step": "build",
                     "agent_role": "step",
@@ -6016,6 +6189,7 @@ shell_tool                       stable             true
                     parent_agent_run_id="orch_run_001",
                     child_agent_run_id="step_run_build_001",
                     request_payload={
+                        "agent_model": "claude-opus-4-8",
                         "node_key": "problem/shallow_water2d@0.3.0",
                         "step": "build",
                         "orchestration_id": "orch_001",
@@ -6089,6 +6263,7 @@ shell_tool                       stable             true
         from tools.orchestration_runtime import _allowed_output_paths_for_launch
         out = _allowed_output_paths_for_launch(
             request_payload={
+                "agent_model": "claude-opus-4-8",
                 "agent_role": "step",
                 "step": "promote",
                 "ir_ref": _FIX_IR_REF,
@@ -6116,6 +6291,7 @@ shell_tool                       stable             true
         with self.assertRaisesRegex(ValueError, "outside phase contract"):
             _allowed_output_paths_for_launch(
                 request_payload={
+                    "agent_model": "claude-opus-4-8",
                     "agent_role": "step",
                     "step": "promote",
                     "ir_ref": _FIX_IR_REF,
@@ -6138,6 +6314,7 @@ shell_tool                       stable             true
         base_payload: dict[str, object] = {
             "agent_role": "step",
             "step": "build",
+            "agent_model": "claude-opus-4-8",
             "ir_ref": _FIX_IR_REF,
             "pipeline_ref": _FIX_PIPE_REF,
         }
@@ -6174,6 +6351,7 @@ shell_tool                       stable             true
         base_payload: dict[str, object] = {
             "agent_role": "step",
             "step": "build",
+            "agent_model": "claude-opus-4-8",
             "ir_ref": _FIX_IR_REF,
             "pipeline_ref": _FIX_PIPE_REF,
         }
@@ -6200,6 +6378,7 @@ shell_tool                       stable             true
         with self.assertRaisesRegex(ValueError, "outside phase contract"):
             _allowed_output_paths_for_launch(
                 request_payload={
+                    "agent_model": "claude-opus-4-8",
                     "agent_role": "step",
                     "step": "promote",
                     "ir_ref": _FIX_IR_REF,
@@ -6381,6 +6560,7 @@ shell_tool                       stable             true
         with self.assertRaisesRegex(ValueError, "outside phase contract"):
             _allowed_output_paths_for_launch(
                 request_payload={
+                    "agent_model": "claude-opus-4-8",
                     "agent_role": "step",
                     "step": "promote",
                     "ir_ref": _FIX_IR_REF,
@@ -6401,6 +6581,7 @@ shell_tool                       stable             true
         with self.assertRaisesRegex(ValueError, "outside phase contract"):
             _allowed_output_paths_for_launch(
                 request_payload={
+                    "agent_model": "claude-opus-4-8",
                     "agent_role": "step",
                     "step": "promote",
                     "ir_ref": _FIX_IR_REF,
@@ -6423,6 +6604,7 @@ shell_tool                       stable             true
         with self.assertRaisesRegex(ValueError, "must not contain '\\.'/'\\.\\.' segments"):
             _allowed_output_paths_for_launch(
                 request_payload={
+                    "agent_model": "claude-opus-4-8",
                     "agent_role": "step",
                     "step": "build",
                     "ir_ref": _FIX_IR_REF,
@@ -6440,6 +6622,7 @@ shell_tool                       stable             true
         with self.assertRaisesRegex(ValueError, "must not contain '\\.'/'\\.\\.' segments"):
             _allowed_output_paths_for_launch(
                 request_payload={
+                    "agent_model": "claude-opus-4-8",
                     "agent_role": "step",
                     "step": "build",
                     "ir_ref": _FIX_IR_REF,
@@ -6458,6 +6641,7 @@ shell_tool                       stable             true
         from tools.orchestration_runtime import _allowed_output_paths_for_launch
         out = _allowed_output_paths_for_launch(
             request_payload={
+                "agent_model": "claude-opus-4-8",
                 "agent_role": "step",
                 "step": "promote",
                 "ir_ref": _FIX_IR_REF,
@@ -6481,6 +6665,7 @@ shell_tool                       stable             true
         with self.assertRaisesRegex(ValueError, "outside phase contract"):
             _allowed_output_paths_for_launch(
                 request_payload={
+                    "agent_model": "claude-opus-4-8",
                     "agent_role": "step",
                     "step": "promote",
                     "ir_ref": _FIX_IR_REF,
@@ -6686,6 +6871,7 @@ shell_tool                       stable             true
                 parent_agent_run_id="orch_run_001",
                 child_agent_run_id="step_run_build_001",
                 request_payload={
+                    "agent_model": "claude-opus-4-8",
                     "node_key": "problem/shallow_water2d@0.3.0",
                     "step": "build",
                     "agent_role": "step",
@@ -6959,6 +7145,7 @@ shell_tool                       stable             true
                     parent_agent_run_id="orch_run_001",
                     child_agent_run_id="substep_run_plan_generate_001",
                     request_payload={
+                        "agent_model": "claude-opus-4-8",
                         "node_key": "problem/shallow_water2d@0.3.0",
                         "step": "compile",
                         "substep": "generate",
@@ -7026,6 +7213,7 @@ shell_tool                       stable             true
                     parent_agent_run_id="orch_run_001",
                     child_agent_run_id="step_run_build_001",
                     request_payload={
+                        "agent_model": "claude-opus-4-8",
                         "node_key": "problem/shallow_water2d@0.3.0",
                         "step": "build",
                         "agent_role": "step",
@@ -7131,6 +7319,7 @@ shell_tool                       stable             true
                 parent_agent_run_id="orch_run_001",
                 child_agent_run_id="step_run_build_001",
                 request_payload={
+                    "agent_model": "claude-opus-4-8",
                     "node_key": "problem/shallow_water2d@0.3.0",
                     "step": "build",
                     "agent_role": "step",
@@ -8198,6 +8387,7 @@ shell_tool                       stable             true
             "parent_agent_run_id": "orch_run_001",
             "node_key": "problem/shallow_water2d@0.3.0",
             "step": "build",
+            "agent_model": "claude-opus-4-8",
             "ir_ref": _FIX_IR_REF,
             "pipeline_ref": _FIX_PIPE_REF,
             "dependency_ref": _FIX_DEP_REF,
@@ -9533,6 +9723,7 @@ class OrchestrationMetaAndJudgeHookTests(unittest.TestCase):
                 parent_agent_run_id=parent,
                 child_agent_run_id=child,
                 request_payload={
+                    "agent_model": "claude-opus-4-8",
                     "agent_run_id": child,
                     "parent_agent_run_id": parent,
                     "agent_role": "step",
@@ -10061,6 +10252,7 @@ class PreflightLiveProbeTtlTests(unittest.TestCase):
                         parent_agent_run_id="orch_run_001",
                         child_agent_run_id="substep_run_plan_generate_001",
                         request_payload={
+                            "agent_model": "claude-opus-4-8",
                             "node_key": "problem/shallow_water2d@0.3.0",
                             "step": "compile",
                             "substep": "generate",
@@ -10093,6 +10285,7 @@ class PreflightLiveProbeTtlTests(unittest.TestCase):
                         parent_agent_run_id="orch_run_001",
                         child_agent_run_id="step_run_build_001",
                         request_payload={
+                            "agent_model": "claude-opus-4-8",
                             "node_key": "problem/shallow_water2d@0.3.0",
                             "step": "build",
                             "orchestration_id": "orch_001",
@@ -10140,6 +10333,7 @@ class PreflightLiveProbeTtlTests(unittest.TestCase):
                         parent_agent_run_id="orch_run_001",
                         child_agent_run_id="substep_run_plan_generate_001",
                         request_payload={
+                            "agent_model": "claude-opus-4-8",
                             "node_key": "problem/shallow_water2d@0.3.0",
                             "step": "compile",
                             "substep": "generate",
@@ -10175,6 +10369,7 @@ class PreflightLiveProbeTtlTests(unittest.TestCase):
                         parent_agent_run_id="orch_run_001",
                         child_agent_run_id="step_run_build_001",
                         request_payload={
+                            "agent_model": "claude-opus-4-8",
                             "node_key": "problem/shallow_water2d@0.3.0",
                             "step": "build",
                             "orchestration_id": "orch_001",
@@ -10327,6 +10522,7 @@ class TestPhase1RuleSourceAudit(unittest.TestCase):
                 parent_agent_run_id="orch_run_001",
                 child_agent_run_id="substep_p1_001",
                 request_payload={
+                    "agent_model": "claude-opus-4-8",
                     "agent_run_id": "substep_p1_001",
                     "agent_role": "substep",
                     "node_key": "problem/shallow_water2d@0.3.0",
@@ -10445,6 +10641,7 @@ class TestPhase1RuleSourceAudit(unittest.TestCase):
                 parent_agent_run_id="orch_run_001",
                 child_agent_run_id="child_p1r",
                 request_payload={
+                    "agent_model": "claude-opus-4-8",
                     "agent_run_id": "child_p1r",
                     "agent_role": "substep",
                     "node_key": "problem/shallow_water2d@0.3.0",
@@ -10527,6 +10724,7 @@ class TestPhase1RuleSourceAudit(unittest.TestCase):
                 parent_agent_run_id="orch_run_001",
                 child_agent_run_id="child_p1r",
                 request_payload={
+                    "agent_model": "claude-opus-4-8",
                     "agent_run_id": "child_p1r",
                     "agent_role": "substep",
                     "node_key": "problem/shallow_water2d@0.3.0",
@@ -10598,6 +10796,7 @@ class TestPhase1RuleSourceAudit(unittest.TestCase):
                 parent_agent_run_id="orch_run_001",
                 child_agent_run_id="child_p1r",
                 request_payload={
+                    "agent_model": "claude-opus-4-8",
                     "agent_run_id": "child_p1r",
                     "agent_role": "substep",
                     "node_key": "problem/shallow_water2d@0.3.0",
@@ -10660,6 +10859,7 @@ class TestPhase1RuleSourceAudit(unittest.TestCase):
                 parent_agent_run_id="orch_run_001",
                 child_agent_run_id="child_p1r",
                 request_payload={
+                    "agent_model": "claude-opus-4-8",
                     "agent_run_id": "child_p1r",
                     "agent_role": "substep",
                     "node_key": "problem/shallow_water2d@0.3.0",
@@ -10749,6 +10949,7 @@ class TestPhase1RuleSourceAudit(unittest.TestCase):
                 parent_agent_run_id="orch_run_001",
                 child_agent_run_id="c_cli",
                 request_payload={
+                    "agent_model": "claude-opus-4-8",
                     "agent_run_id": "c_cli",
                     "agent_role": "substep",
                     "node_key": "problem/shallow_water2d@0.3.0",
@@ -11161,6 +11362,7 @@ class TestPhase2PlanGuardsIntegration(unittest.TestCase):
                 "agent_role": "step",
                 "node_key": "problem/shallow_water2d@0.3.0",
                 "step": "build",
+                "agent_model": "claude-opus-4-8",
                 "orchestration_id": "g2",
                 "parent_agent_run_id": "orch_g2",
                 "ir_ref": _FIX_IR_REF,
@@ -11314,6 +11516,7 @@ class TestPhase2PlanGuardsIntegration(unittest.TestCase):
                 "node_key": "problem/shallow_water2d@0.3.0",
                 "step": "compile",
                 "substep": "generate",
+                "agent_model": "claude-opus-4-8",
                 "orchestration_id": "g6",
                 "parent_agent_run_id": "orch_g6",
                 "ir_ref": _FIX_IR_REF,
@@ -11578,6 +11781,7 @@ class TestPhase3RunGate(unittest.TestCase):
             "agent_role": "step",
             "node_key": "problem/shallow_water2d@0.3.0",
             "step": "build",
+            "agent_model": "claude-opus-4-8",
             "orchestration_id": "rg1",
             "parent_agent_run_id": "orch_rg1",
             "ir_ref": _FIX_IR_REF,
@@ -11653,6 +11857,7 @@ class TestPhase3RunGate(unittest.TestCase):
                 "agent_role": "step",
                 "node_key": "problem/shallow_water2d@0.3.0",
                 "step": "build",
+                "agent_model": "claude-opus-4-8",
                 "orchestration_id": "rg_bad",
                 "parent_agent_run_id": "orch_bad",
                 "ir_ref": _FIX_IR_REF,
@@ -11719,6 +11924,7 @@ class TestPhase3RunGate(unittest.TestCase):
                 "agent_role": "step",
                 "node_key": "problem/shallow_water2d@0.3.0",
                 "step": "validate", "substep": "execute",
+                "agent_model": "claude-opus-4-8",
                 "orchestration_id": "rg_exec_bad",
                 "parent_agent_run_id": "orch_exec_bad",
                 "ir_ref": _FIX_IR_REF,
@@ -13041,6 +13247,7 @@ class TestPhase3RunGate(unittest.TestCase):
                 parent_agent_run_id="orch_run_001",
                 child_agent_run_id="step_run_build_001",
                 request_payload={
+                    "agent_model": "claude-opus-4-8",
                     "agent_run_id": "step_run_build_001",
                     "agent_role": "step",
                     "node_key": "problem/shallow_water2d@0.3.0",
@@ -13081,6 +13288,7 @@ class TestPhase3RunGate(unittest.TestCase):
                     parent_agent_run_id="orch_run_001",
                     child_agent_run_id="step_run_execute_001",
                     request_payload={
+                        "agent_model": "claude-opus-4-8",
                         "agent_run_id": "step_run_execute_001",
                         "agent_role": "substep",
                         "node_key": "problem/shallow_water2d@0.3.0",
@@ -13141,6 +13349,7 @@ class TestPhase3RunGate(unittest.TestCase):
                 parent_agent_run_id="orch_run_001",
                 child_agent_run_id="step_run_build_001",
                 request_payload={
+                    "agent_model": "claude-opus-4-8",
                     "agent_run_id": "step_run_build_001",
                     "agent_role": "step",
                     "node_key": "problem/shallow_water2d@0.3.0",
@@ -13276,6 +13485,7 @@ class DirectWritePathExtensionPolicyTests(unittest.TestCase):
         ]
         explicit = _allowed_file_tool_paths_for_launch(
             request_payload={
+                "agent_model": "claude-opus-4-8",
                 "allowed_file_tool_paths": [
                     "workspace/ir/p/spec.ir.yaml",
                 ]
@@ -13288,6 +13498,7 @@ class DirectWritePathExtensionPolicyTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "must not include CLI-managed extensions"):
             _allowed_file_tool_paths_for_launch(
                 request_payload={
+                    "agent_model": "claude-opus-4-8",
                     "allowed_file_tool_paths": [
                         "workspace/ir/p/ir_meta.json",
                     ]
@@ -13302,6 +13513,7 @@ class DirectWritePathExtensionPolicyTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "must be included in allowed_output_paths"):
             _allowed_file_tool_paths_for_launch(
                 request_payload={
+                    "agent_model": "claude-opus-4-8",
                     "allowed_file_tool_paths": [
                         "workspace/ir/p/extra.yaml",
                     ]
@@ -15062,6 +15274,7 @@ class RecordTimeoutTests(unittest.TestCase):
             parent_agent_run_id="orch_run_to_001",
             child_agent_run_id=substep_arid,
             request_payload={
+                "agent_model": "claude-opus-4-8",
                 "agent_run_id": substep_arid,
                 "agent_role": "substep",
                 "node_key": "problem/shallow_water2d@0.3.0",

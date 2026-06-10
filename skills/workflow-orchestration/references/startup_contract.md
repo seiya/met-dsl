@@ -210,6 +210,7 @@ python3 tools/orchestration_runtime.py record-launch \
     "orchestration_id": "<orchestration_id>",
     "agent_run_id": "<agent_run_id>",
     "parent_agent_run_id": "<orchestration_agent_run_id>",
+    "agent_model": "<子 agent の LLM model id, 例 claude-opus-4-8>",
     "workflow_mode": "<dev|prod>",
     "ir_ref": "<ir_ref>",
     "pipeline_ref": "<pipeline_ref>",
@@ -242,6 +243,7 @@ python3 tools/orchestration_runtime.py record-launch \
 | `orchestration_id` | orchestration ID |
 | `agent_run_id` | 子 agent の UUID |
 | `parent_agent_run_id` | 親（orchestration）agent の UUID |
+| `agent_model` | 子 agent を実行する LLM model id（例 `"claude-opus-4-8"`）。runtime からは導出できないため launch 時に必須。`record-agent-run` が `agent_runs.jsonl` の step/substep entry へ自動転記する（`pre_judge` が両 role に必須要求） |
 | `workflow_mode` | `"dev"` または `"prod"` |
 | `ir_ref` | `workspace/ir/<node_key_safe>/<ir_id>` 形式 |
 | `pipeline_ref` | `workspace/pipelines/<node_key_safe>/<pipeline_id>` 形式（Compile phase でも必須）|
@@ -265,6 +267,8 @@ python3 tools/orchestration_runtime.py record-launch \
 | `context_isolated` | step/substep では必須（常に `true`）| |
 | `node_key` | step/substep では必須 | |
 | `output_refs` | pass 終端時に必須 | |
+| `parent_agent_run_id` | 自動転記（payload 不要）| `record-agent-run` が `launches/<arid>.request.json` から補完する。step/substep entry で `pre_judge` が必須要求するが、launch request に既存のため payload へ書く必要はない |
+| `agent_model` | 自動転記（payload 不要）| 同上。record-launch 時に指定した `agent_model` から補完される |
 
 ## `reserve-phase-root` コマンドテンプレート（Claude Code backend）
 

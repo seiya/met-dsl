@@ -8100,6 +8100,14 @@ def _validate_launch_request_payload(request_payload: dict[str, Any]) -> None:
         raise ValueError("launch request must include non-empty node_key")
     if not isinstance(step, str) or not step.strip():
         raise ValueError("launch request must include non-empty step")
+    # agent_model identifies the LLM that produced the child's artifacts; it is
+    # not derivable by the runtime (e.g. Claude Code has no runtime-knowable
+    # model), so the orchestration agent must supply it at launch. record-launch
+    # persists it into the request, and record_agent_run backfills it onto the
+    # agent_runs entry, satisfying the pre_judge step/substep requirement.
+    agent_model = request_payload.get("agent_model")
+    if not isinstance(agent_model, str) or not agent_model.strip():
+        raise ValueError("launch request must include non-empty agent_model")
     if isinstance(node_key, str) and node_key.strip():
         node_safe = _node_key_to_safe(node_key.strip())
     else:
@@ -11470,6 +11478,26 @@ def record_agent_run(
         payload.setdefault("launch_prompt_ref", prompt_ref)
         payload.setdefault("launch_reply_ref", reply_ref)
         _validate_step_or_substep_launch_refs(repo_root, payload)
+
+        # Auto-derive identity fields the orchestration agent need not re-supply.
+        # `parent_agent_run_id` and `agent_model` are recorded into the launch
+        # request by record-launch (parent unconditionally; agent_model required
+        # for step/substep launches), so we backfill them here rather than rely
+        # on the caller's record-agent-run payload — which the canonical field
+        # tables historically omitted, leaving every step/substep entry without
+        # them and failing pre_judge. Mirrors the record_timeout path which
+        # already pulls both from the launch request. Read defensively: if the
+        # request is missing/unreadable, leave the fields absent so the terminal
+        # validator and pre_judge still fail loud rather than silently passing.
+        try:
+            _launch_req = _read_json(repo_root / str(payload["launch_request_ref"]))
+        except (OSError, json.JSONDecodeError, KeyError):
+            _launch_req = None
+        if isinstance(_launch_req, dict):
+            for _field in ("parent_agent_run_id", "agent_model"):
+                _val = _launch_req.get(_field)
+                if isinstance(_val, str) and _val.strip():
+                    payload.setdefault(_field, _val.strip())
 
     status = payload.get("status")
     if isinstance(status, str) and status.strip().lower() in TERMINAL_STATUSES:

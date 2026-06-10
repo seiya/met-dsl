@@ -635,7 +635,10 @@ def _create_minimal_orchestration_tree(
                 {
                     "agent_run_id": substep_id,
                     "role": "substep",
+                    "node_key": node_key,
                     "step": step,
+                    # substep_run_<step>_<substep>_<seq> → recover the substep label.
+                    "substep": substep_id.split("_")[3],
                     "launch_prompt_ref": substep_prompt_ref,
                     "launch_prompt": f"run substep {step} part {idx}",
                 },
@@ -5403,6 +5406,233 @@ end program shallow_water2d_runner
             )
             self.assertTrue(
                 any("child_agent_run_id not found in agent_runs.jsonl" in v for v in violations)
+            )
+
+    _INFLIGHT_NODE_SAFE = "problem__shallow_water2d__0.3.0"
+
+    def _violations_with_removed_child(
+        self,
+        repo_root: Path,
+        *,
+        removed_arid: str | None = None,
+        in_flight_arids: list[str] | None = None,
+        remove_validate_step_result: bool = False,
+        phantom_judge_request_arid: str | None = None,
+        reparent_removed_child_to: str | None = None,
+    ) -> list[str]:
+        """Build the minimal execution + orchestration tree, optionally drop
+        ``removed_arid`` from agent_runs.jsonl (leaving its agent_graph edge
+        dangling) and/or delete the validate step_result.json, then run pre_judge
+        passing ``in_flight_arids`` as --in-flight-agent-run-id declarations.
+
+        ``phantom_judge_request_arid`` writes a validate/judge launch request for
+        an arid that is NOT present in agent_graph.json or agent_runs.jsonl — a
+        stale/mistyped/cross-orchestration id with no dangling edge — to verify it
+        cannot trigger any exemption."""
+        _seed_shape_expr_schema_into(repo_root)
+        model_text = """module shallow_water2d_model
+use dynamics_shallow_water_flux_2d_rusanov_p0_model
+implicit none
+contains
+subroutine solve(flag)
+  logical, intent(out) :: flag
+  call dynamics_shallow_water_flux_2d_rusanov_p0__compute_flux(flag)
+end subroutine solve
+end module shallow_water2d_model
+"""
+        runner_text = """program shallow_water2d_runner
+implicit none
+write(*,*) 'ok'
+end program shallow_water2d_runner
+"""
+        _create_minimal_execution_tree(
+            repo_root,
+            dep_spec_id="dynamics_shallow_water_flux_2d_rusanov_p0",
+            model_text=model_text,
+            runner_text=runner_text,
+            run_command=["./simulate", "workspace/spec.ir.yaml", "workspace/outdir"],
+        )
+        _create_minimal_orchestration_tree(repo_root)
+        orch_root = repo_root / "workspace" / "orchestrations" / "orch_test_001"
+        runs_path = orch_root / "agent_runs.jsonl"
+        items = [
+            json.loads(line)
+            for line in runs_path.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        if removed_arid is not None:
+            items = [item for item in items if item.get("agent_run_id") != removed_arid]
+        runs_path.write_text(
+            "\n".join(json.dumps(item, ensure_ascii=False) for item in items) + "\n",
+            encoding="utf-8",
+        )
+        if reparent_removed_child_to is not None and removed_arid is not None:
+            graph_path = orch_root / "agent_graph.json"
+            graph = json.loads(graph_path.read_text(encoding="utf-8"))
+            for edge in graph.get("edges", []):
+                if edge.get("child_agent_run_id") == removed_arid:
+                    edge["parent_agent_run_id"] = reparent_removed_child_to
+            _write_json(graph_path, graph)
+        if remove_validate_step_result:
+            (
+                orch_root / "steps" / self._INFLIGHT_NODE_SAFE / "validate"
+                / "orch_run_001" / "step_result.json"
+            ).unlink()
+        if phantom_judge_request_arid is not None:
+            _write_json(
+                orch_root / "launches" / f"{phantom_judge_request_arid}.request.json",
+                {
+                    "agent_run_id": phantom_judge_request_arid,
+                    "role": "substep",
+                    "node_key": "problem/shallow_water2d@0.3.0",
+                    "step": "validate",
+                    "substep": "judge",
+                },
+            )
+        return validate(
+            repo_root=repo_root,
+            workspace_root="workspace",
+            require_orchestration=True,
+            in_flight_agent_run_ids=set(in_flight_arids) if in_flight_arids else None,
+        )
+
+    @staticmethod
+    def _has_dangling_edge(violations: list[str], arid: str) -> bool:
+        return any(
+            f"child_agent_run_id not found in agent_runs.jsonl ({arid})" in v
+            for v in violations
+        )
+
+    @staticmethod
+    def _has_missing_validate_step_result(violations: list[str]) -> bool:
+        return any(
+            "missing step_result.json for" in v and "/validate" in v for v in violations
+        )
+
+    def test_inflight_judge_tolerated_with_explicit_flag(self) -> None:
+        """When the live judge declares its own agent_run_id via
+        --in-flight-agent-run-id, its not-yet-recorded edge AND its not-yet-written
+        validate step_result are tolerated."""
+        judge_arid = "substep_run_validate_judge_001"
+        with tempfile.TemporaryDirectory() as tmp:
+            violations = self._violations_with_removed_child(
+                Path(tmp),
+                removed_arid=judge_arid,
+                in_flight_arids=[judge_arid],
+                remove_validate_step_result=True,
+            )
+            self.assertFalse(
+                self._has_dangling_edge(violations, judge_arid),
+                msg=f"declared in-flight judge edge must be tolerated; got: {violations}",
+            )
+            self.assertFalse(
+                self._has_missing_validate_step_result(violations),
+                msg=f"declared in-flight judge validate step_result must be tolerated; got: {violations}",
+            )
+
+    def test_dangling_judge_edge_without_flag_is_not_tolerated(self) -> None:
+        """Fail-closed: a dangling judge edge / missing validate step_result with
+        NO --in-flight-agent-run-id declaration is NOT tolerated (this is the
+        crash / stale-marker / wrong-backend case — no live caller vouches for it)."""
+        judge_arid = "substep_run_validate_judge_001"
+        with tempfile.TemporaryDirectory() as tmp:
+            violations = self._violations_with_removed_child(
+                Path(tmp),
+                removed_arid=judge_arid,
+                in_flight_arids=None,
+                remove_validate_step_result=True,
+            )
+            self.assertTrue(
+                self._has_dangling_edge(violations, judge_arid),
+                msg=f"undeclared dangling judge edge must NOT be tolerated; got: {violations}",
+            )
+            self.assertTrue(
+                self._has_missing_validate_step_result(violations),
+                msg=f"undeclared missing validate step_result must NOT be tolerated; got: {violations}",
+            )
+
+    def test_in_flight_flag_for_non_judge_arid_does_nothing(self) -> None:
+        """The flag exempts only the validate/judge substep: declaring a non-judge
+        arid (e.g. execute) must NOT suppress its orphaned-edge violation."""
+        execute_arid = "substep_run_validate_execute_001"
+        with tempfile.TemporaryDirectory() as tmp:
+            violations = self._violations_with_removed_child(
+                Path(tmp),
+                removed_arid=execute_arid,
+                in_flight_arids=[execute_arid],
+            )
+            self.assertTrue(
+                self._has_dangling_edge(violations, execute_arid),
+                msg=f"in-flight flag must not exempt a non-judge child; got: {violations}",
+            )
+
+    def test_in_flight_flag_does_not_mask_missing_validate_result_once_judge_recorded(
+        self,
+    ) -> None:
+        """The step_result exemption is gated on the judge being genuinely
+        unrecorded. If the judge already has an agent_runs entry, a missing
+        validate step_result is a real gap and must still surface even when its
+        arid is (stale-ly) passed via the flag."""
+        judge_arid = "substep_run_validate_judge_001"
+        with tempfile.TemporaryDirectory() as tmp:
+            violations = self._violations_with_removed_child(
+                Path(tmp),
+                removed_arid=None,  # judge stays recorded in agent_runs
+                in_flight_arids=[judge_arid],
+                remove_validate_step_result=True,
+            )
+            self.assertTrue(
+                self._has_missing_validate_step_result(violations),
+                msg=f"missing validate step_result must surface once judge is recorded; got: {violations}",
+            )
+
+    def test_in_flight_flag_without_dangling_edge_does_not_mask_missing_validate_result(
+        self,
+    ) -> None:
+        """The validate step_result exemption requires graph evidence: a flag that
+        names a validate/judge arid which is NOT an actual dangling edge (stale /
+        mistyped / cross-orchestration — it has a launch request but no edge in
+        agent_graph.json) must NOT suppress the missing validate step_result."""
+        phantom_judge = "substep_run_validate_judge_phantom"
+        with tempfile.TemporaryDirectory() as tmp:
+            violations = self._violations_with_removed_child(
+                Path(tmp),
+                removed_arid=None,  # all real runs recorded; no dangling edge
+                in_flight_arids=[phantom_judge],
+                remove_validate_step_result=True,
+                phantom_judge_request_arid=phantom_judge,
+            )
+            self.assertTrue(
+                self._has_missing_validate_step_result(violations),
+                msg=(
+                    "a declared in-flight judge with no dangling edge must not mask "
+                    f"the missing validate step_result; got: {violations}"
+                ),
+            )
+
+    def test_in_flight_judge_edge_with_substep_parent_still_fails(self) -> None:
+        """The in-flight exemption suppresses ONLY the missing-child record. The
+        parent role is known from agent_runs.jsonl, so a malformed edge whose
+        parent is a substep must still fail closed even when the (in-flight) judge
+        child is exempted."""
+        judge_arid = "substep_run_validate_judge_001"
+        substep_parent = "substep_run_compile_generate_001"  # a recorded substep
+        with tempfile.TemporaryDirectory() as tmp:
+            violations = self._violations_with_removed_child(
+                Path(tmp),
+                removed_arid=judge_arid,
+                in_flight_arids=[judge_arid],
+                reparent_removed_child_to=substep_parent,
+            )
+            # The missing-child record itself is still tolerated...
+            self.assertFalse(
+                self._has_dangling_edge(violations, judge_arid),
+                msg=f"in-flight judge missing-child record should be tolerated; got: {violations}",
+            )
+            # ...but the substep-parent hierarchy violation must surface.
+            self.assertTrue(
+                any("substep must not be parent role" in v for v in violations),
+                msg=f"substep-parent edge must still fail closed; got: {violations}",
             )
 
     def test_detects_non_template_launch_prompt_when_orchestration_required(self) -> None:

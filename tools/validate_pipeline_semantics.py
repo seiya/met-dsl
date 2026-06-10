@@ -5868,7 +5868,9 @@ def _validate_orchestration_hierarchy(
     workspace_path: Path,
     executions: list[NodeExecution],
     violations: list[str],
+    in_flight_agent_run_ids: set[str] | None = None,
 ) -> None:
+    in_flight_agent_run_ids = in_flight_agent_run_ids or set()
     orchestrations_root = workspace_path / "orchestrations"
     if not orchestrations_root.exists() or not orchestrations_root.is_dir():
         violations.append(
@@ -5904,6 +5906,60 @@ def _validate_orchestration_hierarchy(
         run_records: dict[str, dict[str, Any]] = {}
         run_roles: dict[str, str] = {}
         seen_context_ids: dict[str, str] = {}
+
+        # In-flight tolerance for the self-judging exception ONLY.
+        #
+        # record-launch appends a child's agent_graph edge BEFORE the child runs,
+        # while the child's agent_runs.jsonl entry and its step_result.json are
+        # written only AFTER it returns. The Validate.judge substep runs --stage
+        # pre_judge from inside its own (still-executing) run, so its own edge and
+        # the validate step_result are necessarily unrecorded at that moment.
+        #
+        # The ONLY trustworthy proof that a run is genuinely in-flight RIGHT NOW
+        # is the live caller declaring its own agent_run_id: a static artifact
+        # (an active_children marker, the single-active-child pointer) cannot be
+        # distinguished from a stale leftover after a crash/partial cleanup, and
+        # such markers are not written for every backend. We therefore exempt
+        # exactly the agent_run_id(s) the caller passes via
+        # --in-flight-agent-run-id, and only after verifying from the persisted
+        # launch request that each is the validate/judge substep (so the flag can
+        # never be used to suppress unrelated missing-record violations). Nothing
+        # is exempted by marker presence alone — an orphaned edge with no
+        # live-caller declaration still fails, fail-closed.
+        inflight_exempt_arids: set[str] = set()
+        inflight_exempt_node_safe: dict[str, str] = {}
+        # Populated by the agent_graph edge scan below with the subset of
+        # declared in-flight arids that are ACTUALLY observed as a dangling edge
+        # (child present in agent_graph.json but not yet in agent_runs.jsonl).
+        # Only these get the validate step_result exemption — a flag naming an
+        # arid with a plausible launch request but no dangling edge (stale /
+        # mistyped / cross-orchestration) must not suppress anything.
+        observed_inflight_dangling: set[str] = set()
+        for raw_arid in in_flight_agent_run_ids:
+            arid = raw_arid.strip()
+            if not arid:
+                continue
+            req_path = orchestration_dir / "launches" / f"{arid}.request.json"
+            try:
+                req_doc = _read_json(req_path)
+            except (OSError, json.JSONDecodeError):
+                continue
+            if not isinstance(req_doc, dict):
+                continue
+            step_name = req_doc.get("step")
+            substep_name = req_doc.get("substep")
+            node_key = req_doc.get("node_key")
+            if not (
+                isinstance(step_name, str) and step_name.strip().lower() == "validate"
+                and isinstance(substep_name, str) and substep_name.strip().lower() == "judge"
+            ):
+                continue
+            inflight_exempt_arids.add(arid)
+            if isinstance(node_key, str) and node_key.strip():
+                node_safe = _node_key_to_safe(node_key.strip())
+                if node_safe is not None:
+                    inflight_exempt_node_safe[arid] = node_safe
+
         for required in (meta_path, graph_path, runs_path, preflight_path):
             if not required.exists():
                 violations.append(f"{required}: missing")
@@ -6332,6 +6388,24 @@ def _validate_orchestration_hierarchy(
                 )
                 continue
             if child_role is None:
+                if child_id in inflight_exempt_arids:
+                    # The live judge declared this run as its own in-flight
+                    # agent_run_id (--in-flight-agent-run-id) and the launch
+                    # request confirms it is the validate/judge substep; its
+                    # agent_runs entry is appended only after it returns. Record
+                    # the graph evidence so the validate step_result exemption
+                    # below requires this same dangling edge.
+                    #
+                    # We exempt ONLY the missing-child record. The parent role is
+                    # already known from agent_runs.jsonl and must still be valid:
+                    # a substep can never be a parent, regardless of the in-flight
+                    # child, so keep failing closed on that malformed hierarchy.
+                    observed_inflight_dangling.add(child_id)
+                    if parent_role == "substep":
+                        violations.append(
+                            f"{graph_path}:edges[{edge_idx}] substep must not be parent role"
+                        )
+                    continue
                 violations.append(
                     f"{graph_path}:edges[{edge_idx}] child_agent_run_id not found in agent_runs.jsonl ({child_id})"
                 )
@@ -6348,6 +6422,20 @@ def _validate_orchestration_hierarchy(
                 violations.append(
                     f"{graph_path}:edges[{edge_idx}] substep must not be parent role"
                 )
+
+        # The in-flight judge's own validate step_result.json is written only
+        # after it returns. Exempt the validate step from the missing-result
+        # check ONLY for a declared in-flight judge that was actually observed as
+        # a dangling agent_graph edge (graph evidence it is the live, not-yet-
+        # recorded child). Without that evidence — a stale/mistyped arid, or a
+        # judge that already has an agent_runs entry — a missing validate
+        # step_result is a real gap and must surface rather than be masked.
+        for arid, node_safe in inflight_exempt_node_safe.items():
+            if arid not in observed_inflight_dangling:
+                continue
+            key = (node_safe, "validate")
+            if key in step_coverage:
+                step_coverage[key] = True
 
         for run_id, role_l in run_roles.items():
             item = run_records[run_id]
@@ -6806,6 +6894,7 @@ def validate(
     require_llm_review: bool = True,
     require_orchestration: bool = False,
     run_ids: set[str] | None = None,
+    in_flight_agent_run_ids: set[str] | None = None,
 ) -> list[str]:
     with _pinned_repo_root_for_schema(repo_root):
         return _validate_impl(
@@ -6815,6 +6904,7 @@ def validate(
             require_llm_review,
             require_orchestration,
             run_ids,
+            in_flight_agent_run_ids,
         )
 
 
@@ -6825,6 +6915,7 @@ def _validate_impl(
     require_llm_review: bool,
     require_orchestration: bool,
     run_ids: set[str] | None = None,
+    in_flight_agent_run_ids: set[str] | None = None,
 ) -> list[str]:
     violations: list[str] = []
     normalized_workspace_root = _normalize_workspace_root_token(workspace_root)
@@ -6883,6 +6974,7 @@ def _validate_impl(
             workspace_path=workspace_path,
             executions=executions,
             violations=violations,
+            in_flight_agent_run_ids=in_flight_agent_run_ids,
         )
 
     source_hash_map: dict[str, list[SourceFingerprint]] = {}
@@ -7121,6 +7213,21 @@ def main(argv: list[str] | None = None) -> int:
         ),
     )
     parser.add_argument(
+        "--in-flight-agent-run-id",
+        action="append",
+        help=(
+            "agent_run_id of a run that is genuinely executing right now and "
+            "therefore has not yet appended its agent_runs.jsonl entry / "
+            "step_result.json. Can be repeated. Effective only for --stage "
+            "pre_judge: the Validate.judge substep passes its OWN agent_run_id so "
+            "the self-judging exception (its own agent_graph edge + the validate "
+            "step_result, both written only after it returns) is not mis-flagged. "
+            "Each id is exempted only after the persisted launch request confirms "
+            "it is the validate/judge substep; an orphaned edge with no matching "
+            "--in-flight-agent-run-id still fails (fail-closed)."
+        ),
+    )
+    parser.add_argument(
         "--allow-missing-llm-review",
         action="store_true",
         help="Allow missing semantic_review.json for legacy pipelines.",
@@ -7238,6 +7345,11 @@ def _main_dispatch(args: argparse.Namespace, repo_root: Path) -> int:
                     require_llm_review=True,
                     require_orchestration=True,
                     run_ids=run_ids,
+                    in_flight_agent_run_ids=(
+                        set(args.in_flight_agent_run_id)
+                        if args.in_flight_agent_run_id
+                        else None
+                    ),
                 )
             else:
                 violations = validate(
