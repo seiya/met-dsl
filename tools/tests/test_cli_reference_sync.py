@@ -52,6 +52,7 @@ TIER_B_SUBCOMMANDS: frozenset[str] = frozenset({
     "verify-checkpoint-integrity",
     "check-step-completed",
     "orchestration-read",
+    "repair-agent-runs",
 })
 
 REPO_ROOT = Path(__file__).resolve().parents[2]

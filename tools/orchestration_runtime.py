@@ -8001,6 +8001,287 @@ def enable_checkpoint_resume(
     return meta
 
 
+def _load_substep_parent_map(root: Path) -> dict[str, str]:
+    """Map each substep agent_run_id -> its step's executor_agent_run_id.
+
+    Built from every steps/*/*/*/step_result.json. This is the authoritative
+    source for the pre_judge substep-linkage check (which requires a substep's
+    parent_agent_run_id to equal the listing step's executor_agent_run_id), so
+    backfilling parent_agent_run_id from here satisfies that gate exactly.
+    """
+    mapping: dict[str, str] = {}
+    steps_dir = root / "steps"
+    if not steps_dir.is_dir():
+        return mapping
+    for result_path in steps_dir.glob("*/*/*/step_result.json"):
+        try:
+            doc = _read_json(result_path)
+        except (OSError, json.JSONDecodeError):
+            continue
+        if not isinstance(doc, dict):
+            continue
+        executor = doc.get("executor_agent_run_id")
+        subs = doc.get("substep_agent_run_ids")
+        if not isinstance(executor, str) or not executor.strip():
+            continue
+        if not isinstance(subs, list):
+            continue
+        for sid in subs:
+            if isinstance(sid, str) and sid.strip():
+                mapping.setdefault(sid.strip(), executor.strip())
+    return mapping
+
+
+def _load_agent_graph_parent_map(root: Path) -> dict[str, str]:
+    """Map child_agent_run_id -> parent_agent_run_id from agent_graph.json edges."""
+    mapping: dict[str, str] = {}
+    graph_path = root / "agent_graph.json"
+    if not graph_path.is_file():
+        return mapping
+    try:
+        doc = _read_json(graph_path)
+    except (OSError, json.JSONDecodeError):
+        return mapping
+    edges = doc.get("edges") if isinstance(doc, dict) else None
+    if not isinstance(edges, list):
+        return mapping
+    for edge in edges:
+        if not isinstance(edge, dict):
+            continue
+        child = edge.get("child_agent_run_id")
+        parent = edge.get("parent_agent_run_id")
+        if (
+            isinstance(child, str)
+            and child.strip()
+            and isinstance(parent, str)
+            and parent.strip()
+        ):
+            mapping.setdefault(child.strip(), parent.strip())
+    return mapping
+
+
+def repair_legacy_agent_runs(
+    repo_root: Path,
+    orchestration_id: str,
+    *,
+    agent_model: str | None = None,
+) -> dict[str, Any]:
+    """Backfill parent_agent_run_id / agent_model on pre-fix agent_runs.jsonl lines.
+
+    step/substep records written before commit caa10ab (which made agent_model
+    required and added forward backfill) lack `parent_agent_run_id` and
+    `agent_model`. Because agent_runs.jsonl is append-only and duplicate
+    record-agent-run is rejected, those values cannot be supplied forward — yet
+    the pre_judge gate scans every line and the substep-linkage check, so the
+    legacy lines permanently fail the gate and make resume impossible.
+
+    This repair reconstructs the missing values from existing artifacts and fills
+    ONLY missing fields (never overwriting a present non-empty value):
+
+    - parent_agent_run_id: substep -> step_result.json executor_agent_run_id;
+      step -> orchestration_meta.json orchestration_agent_run_id. Both are
+      cross-checked against agent_graph.json child->parent edges; a disagreement
+      marks the line unrepairable rather than guessing.
+    - agent_model: runtime non-derivable by design (orchestration_runtime: the
+      LLM that produced a child's artifacts is not knowable from the runtime), so
+      it is taken from an explicit `agent_model` override or, failing that, from
+      the unique non-empty agent_model already present on sibling entries of the
+      same orchestration. If neither yields a value, the line is left missing and
+      status is `needs_manual`.
+
+    Filled lines gain a `backfilled` provenance object and an audit entry is
+    appended to record_repairs.jsonl. The original lines' missing state is thereby
+    preserved in the audit log. Idempotent: a re-run with nothing missing is a
+    no-op. Serialized under the agent_runs.jsonl exclusive lock.
+    """
+    root = _orchestration_root(repo_root, orchestration_id)
+    runs_path = root / "agent_runs.jsonl"
+    base_result: dict[str, Any] = {
+        "status": "noop",
+        "orchestration_id": orchestration_id,
+        "agent_model": None,
+        "agent_model_source": None,
+        "repaired_lines": [],
+        "remaining_missing": [],
+        "unrepairable": [],
+    }
+    if not runs_path.is_file():
+        base_result["reason"] = "agent_runs.jsonl absent"
+        return base_result
+
+    orchestration_arid: str | None = None
+    meta_path = root / "orchestration_meta.json"
+    try:
+        meta = _read_json(meta_path)
+    except (OSError, json.JSONDecodeError):
+        meta = None
+    if isinstance(meta, dict):
+        v = meta.get("orchestration_agent_run_id")
+        if isinstance(v, str) and v.strip():
+            orchestration_arid = v.strip()
+
+    repaired: list[dict[str, Any]] = []
+    remaining: list[dict[str, Any]] = []
+    unrepairable: list[dict[str, Any]] = []
+    chosen_model: str | None = None
+    model_source: str | None = None
+    changed = False
+
+    with _runs_jsonl_exclusive_lock(repo_root, orchestration_id):
+        raw = runs_path.read_text(encoding="utf-8")
+        ends_nl = raw.endswith("\n")
+        raw_lines = raw.splitlines()
+
+        parsed: list[dict[str, Any] | None] = []
+        models: set[str] = set()
+        for line in raw_lines:
+            s = line.strip()
+            if not s:
+                parsed.append(None)
+                continue
+            try:
+                obj = json.loads(s)
+            except json.JSONDecodeError:
+                parsed.append(None)
+                continue
+            if not isinstance(obj, dict):
+                parsed.append(None)
+                continue
+            parsed.append(obj)
+            m = obj.get("agent_model")
+            if isinstance(m, str) and m.strip():
+                models.add(m.strip())
+
+        if isinstance(agent_model, str) and agent_model.strip():
+            chosen_model = agent_model.strip()
+            model_source = "override"
+        elif len(models) == 1:
+            chosen_model = next(iter(models))
+            model_source = "sibling_uniform"
+
+        substep_parent = _load_substep_parent_map(root)
+        graph_parent = _load_agent_graph_parent_map(root)
+
+        audit_entries: list[dict[str, Any]] = []
+        for idx, obj in enumerate(parsed):
+            if obj is None:
+                continue
+            role = obj.get("agent_role")
+            role_token = (
+                role.strip().lower() if isinstance(role, str) and role.strip() else None
+            )
+            if role_token not in {"step", "substep"}:
+                continue
+            arid_val = obj.get("agent_run_id")
+            arid = arid_val.strip() if isinstance(arid_val, str) and arid_val.strip() else None
+
+            fields_filled: list[str] = []
+            line_missing: list[str] = []
+            parent_src_used: str | None = None
+
+            cur_parent = obj.get("parent_agent_run_id")
+            if not (isinstance(cur_parent, str) and cur_parent.strip()):
+                derived: str | None = None
+                parent_source: str | None = None
+                if role_token == "substep" and arid in substep_parent:
+                    derived = substep_parent[arid]
+                    parent_source = "step_result_executor"
+                elif role_token == "step":
+                    derived = orchestration_arid
+                    parent_source = "orchestration_meta"
+                graph_val = graph_parent.get(arid) if arid else None
+                if derived is None and graph_val:
+                    derived = graph_val
+                    parent_source = "agent_graph"
+                if derived is not None and graph_val is not None and graph_val != derived:
+                    unrepairable.append(
+                        {
+                            "agent_run_id": arid,
+                            "line": idx + 1,
+                            "field": "parent_agent_run_id",
+                            "reason": (
+                                f"agent_graph parent {graph_val} disagrees with "
+                                f"derived {derived}"
+                            ),
+                        }
+                    )
+                    line_missing.append("parent_agent_run_id")
+                elif derived:
+                    obj["parent_agent_run_id"] = derived
+                    fields_filled.append("parent_agent_run_id")
+                    parent_src_used = parent_source
+                else:
+                    unrepairable.append(
+                        {
+                            "agent_run_id": arid,
+                            "line": idx + 1,
+                            "field": "parent_agent_run_id",
+                            "reason": "no authoritative source",
+                        }
+                    )
+                    line_missing.append("parent_agent_run_id")
+
+            cur_model = obj.get("agent_model")
+            if not (isinstance(cur_model, str) and cur_model.strip()):
+                if chosen_model:
+                    obj["agent_model"] = chosen_model
+                    fields_filled.append("agent_model")
+                else:
+                    line_missing.append("agent_model")
+
+            if fields_filled:
+                changed = True
+                prov: dict[str, Any] = {
+                    "at": _utc_now_iso(),
+                    "reason": "pre_caa10ab legacy record backfill (repair-agent-runs)",
+                    "fields": list(fields_filled),
+                }
+                if "parent_agent_run_id" in fields_filled:
+                    prov["parent_source"] = parent_src_used
+                if "agent_model" in fields_filled:
+                    prov["agent_model_source"] = model_source
+                obj["backfilled"] = prov
+                raw_lines[idx] = json.dumps(obj, ensure_ascii=False)
+                repaired.append(
+                    {"agent_run_id": arid, "line": idx + 1, "fields": list(fields_filled)}
+                )
+                audit_entries.append(
+                    {"agent_run_id": arid, "line": idx + 1, **prov}
+                )
+
+            if line_missing:
+                remaining.append(
+                    {"agent_run_id": arid, "line": idx + 1, "missing": line_missing}
+                )
+
+        if changed:
+            body = "\n".join(raw_lines)
+            if ends_nl:
+                body += "\n"
+            _atomic_write_text(runs_path, body)
+            repairs_path = root / "record_repairs.jsonl"
+            with repairs_path.open("a", encoding="utf-8") as fh:
+                for entry in audit_entries:
+                    fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+    if remaining:
+        status = "needs_manual"
+    elif changed:
+        status = "repaired"
+    else:
+        status = "noop"
+
+    return {
+        "status": status,
+        "orchestration_id": orchestration_id,
+        "agent_model": chosen_model,
+        "agent_model_source": model_source,
+        "repaired_lines": repaired,
+        "remaining_missing": remaining,
+        "unrepairable": unrepairable,
+    }
+
+
 def _validate_canonical_workspace_root_ref(
     *,
     ref: str,
@@ -9134,10 +9415,18 @@ def _pre_phase_complete_judge_checks(
     dec_norm = str(dec).strip().lower()
     if dec_norm == "fail" and status_token == "pass":
         raise ValueError("semantic_review.json decision=fail cannot accompany pass step_result")
-    if dec_norm == "pass" and status_token in {"fail", "blocked"}:
-        raise ValueError(
-            "semantic_review.json decision=pass cannot accompany fail or blocked step_result"
-        )
+    if dec_norm == "pass" and status_token == "fail":
+        raise ValueError("semantic_review.json decision=pass cannot accompany fail step_result")
+    # NOTE: `blocked` is intentionally decoupled from `decision`. A `pass`
+    # semantic_review reflects node-physics correctness, whereas `blocked` means
+    # the node could not be CERTIFIED due to a non-physics blocker (e.g. an
+    # orchestration-record integrity gate failure that is unrecoverable in the
+    # current run). Coupling those two axes previously deadlocked terminalization
+    # — write-step-result rejected `fail`/`blocked` while semantic_review=pass yet
+    # `pass` was impossible without a finalized verdict — forcing fail_closed as
+    # the only escape. A node whose physics passed may still honestly terminalize
+    # as `blocked`; the additional `blocked` artifact requirements below remain
+    # enforced so the verdict is not merely asserted.
     if status_token == "blocked":
         for name in ("aggregate_verdict.json", "summary.json", "trial_meta.json"):
             if not (base / name).is_file():
@@ -13110,6 +13399,26 @@ def main(argv: list[str] | None = None) -> int:
         help="Skip artifact hash verification (testing only).",
     )
 
+    repair_runs_parser = subparsers.add_parser(
+        "repair-agent-runs",
+        help=(
+            "Backfill missing parent_agent_run_id/agent_model on pre-fix "
+            "(pre-caa10ab) step/substep agent_runs.jsonl lines so a resumed "
+            "orchestration can pass the pre_judge gate."
+        ),
+    )
+    repair_runs_parser.add_argument("--repo-root", required=True)
+    repair_runs_parser.add_argument("--orchestration-id", required=True)
+    repair_runs_parser.add_argument(
+        "--agent-model",
+        default=None,
+        help=(
+            "Model id to assign to legacy lines missing agent_model. Required "
+            "only when it cannot be auto-derived from a unique non-empty "
+            "agent_model on sibling entries of the same orchestration."
+        ),
+    )
+
     args = parser.parse_args(argv)
     repo_root = Path(getattr(args, "repo_root")).resolve()
 
@@ -13121,6 +13430,18 @@ def main(argv: list[str] | None = None) -> int:
                 spec_ref=args.spec_ref,
                 source_dependency_ref=args.source_dependency_ref,
             )
+            # Bring any pre-caa10ab legacy agent_runs.jsonl lines into pre_judge
+            # compliance before the resumed run reaches the gate. Runs at init
+            # time (before any child launch / outside the active_child window),
+            # so the agent_runs.jsonl write is safe. Non-fatal: a `needs_manual`
+            # result (agent_model not auto-derivable) leaves resume to proceed so
+            # the operator can re-run `repair-agent-runs --agent-model <id>`.
+            repair_summary = repair_legacy_agent_runs(
+                repo_root=repo_root,
+                orchestration_id=args.orchestration_id,
+            )
+            if isinstance(result, dict):
+                result = {**result, "legacy_record_repair": repair_summary}
         else:
             result = init_orchestration(
                 repo_root=repo_root,
@@ -13512,6 +13833,12 @@ def main(argv: list[str] | None = None) -> int:
                 "node_key": args.node_key,
                 "step": args.step.strip().lower(),
             }
+    elif args.command == "repair-agent-runs":
+        result = repair_legacy_agent_runs(
+            repo_root=repo_root,
+            orchestration_id=args.orchestration_id,
+            agent_model=args.agent_model,
+        )
     elif args.command == "set-status":
         result = update_orchestration_status(
             repo_root=repo_root,

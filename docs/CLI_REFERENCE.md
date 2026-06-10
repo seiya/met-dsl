@@ -4,7 +4,7 @@
 
 `tools/orchestration_runtime.py` のうち **頻出 subcommand (Tier-A) の canonical CLI reference**。payload schema が複雑で phase 別の必須切替があり、`--help` 出力だけでは確定できないものを網羅する: `record-launch` / `record-agent-run` / `record-child-return` / `deactivate-child` / `record-reply` / `set-status` / `write-step-result` / `workflow-launch-check` / `reserve-phase-root` / `mark-dependency-readiness` / `guarded-apply-patch` / `run-gate` (計 12)。
 
-稀少 subcommand (Tier-B: `init` / `preflight` / `preflight-status` / `record-timeout` / `read-checkpoint` / `verify-checkpoint-integrity` / `check-step-completed` / `orchestration-read`) は overview のみ [docs/CLI_REFERENCE_RARE.md](CLI_REFERENCE_RARE.md) に置き、詳細は `python3 tools/orchestration_runtime.py <sub> --help` を canonical source とする。
+稀少 subcommand (Tier-B: `init` / `preflight` / `preflight-status` / `record-timeout` / `read-checkpoint` / `verify-checkpoint-integrity` / `check-step-completed` / `orchestration-read` / `repair-agent-runs`) は overview のみ [docs/CLI_REFERENCE_RARE.md](CLI_REFERENCE_RARE.md) に置き、詳細は `python3 tools/orchestration_runtime.py <sub> --help` を canonical source とする。
 
 tool / subcommand 別の情報取得方針 (頻出 vs 稀少、`--help` vs doc) は `CLAUDE.md` の「CLI 仕様の確認規約」節を canonical source とする。
 

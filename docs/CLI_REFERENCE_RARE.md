@@ -29,6 +29,7 @@
 | `verify-checkpoint-integrity` | checkpoint に記録された artifact hash と現状を照合 | resume 開始時の整合性確認。`stale` 検出時はその step を skip してはならない |
 | `check-step-completed` | `resume_enabled=true` で対象 step の完了状態を確認 | canonical な skip 判定経路。`step_result.json` の直接参照で skip 判断してはならない |
 | `orchestration-read` | manifest 外 path の gate-mediated read | 通常は `run-gate --gate orchestration_read --args-json '{"read_path": "..."}'` 経由で呼ぶ |
+| `repair-agent-runs` | pre-`caa10ab` の `agent_runs.jsonl` step/substep 行に欠落した `parent_agent_run_id` / `agent_model` を in-place backfill し `pre_judge` 準拠にする | `--resume` 時に自動実行される。auto 導出が `needs_manual` の場合のみ `--agent-model <id>` を付けて手動実行（詳細は `RUNBOOK.md` §3-1） |
 
 ## 引数取得経路
 

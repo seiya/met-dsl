@@ -127,7 +127,7 @@ description: 対応 execution platform で `workflow` 全体を開始し、`orch
 - launch 要求テンプレート: `references/launch_prompts.md`
 - CLI 仕様 reference (場所別最適化、詳細は `CLAUDE.md` の「CLI 仕様の確認規約」節):
   - 頻出 subcommand (`record-launch` / `record-agent-run` / `record-child-return` / `deactivate-child` / `record-reply` / `set-status` / `write-step-result` / `workflow-launch-check` / `reserve-phase-root` / `mark-dependency-readiness` / `guarded-apply-patch` / `run-gate`): `docs/CLI_REFERENCE.md` (Tier-A) と本 `references/startup_contract.md` のテンプレート併用
-  - 稀少 subcommand (`init` / `preflight` / `preflight-status` / `record-timeout` / `read-checkpoint` / `verify-checkpoint-integrity` / `check-step-completed` / `orchestration-read`): `python3 tools/orchestration_runtime.py <sub> --help`。overview は `docs/CLI_REFERENCE_RARE.md`
+  - 稀少 subcommand (`init` / `preflight` / `preflight-status` / `record-timeout` / `read-checkpoint` / `verify-checkpoint-integrity` / `check-step-completed` / `orchestration-read` / `repair-agent-runs`): `python3 tools/orchestration_runtime.py <sub> --help`。overview は `docs/CLI_REFERENCE_RARE.md`
   - 例外復旧手順: `docs/RUNBOOK.md`
 - workspace artifact 配置の tree 図と読み書きルール: `docs/WORKSPACE_LAYOUT.md`
 

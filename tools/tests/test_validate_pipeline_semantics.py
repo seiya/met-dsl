@@ -5509,6 +5509,67 @@ end program shallow_water2d_runner
             "missing step_result.json for" in v and "/validate" in v for v in violations
         )
 
+    def test_pre_judge_passes_after_repair_backfills_legacy_records(self) -> None:
+        """End-to-end: pre-caa10ab records (missing parent_agent_run_id /
+        agent_model) make the orchestration-hierarchy gate fail; running
+        repair_legacy_agent_runs backfills them from authoritative sources
+        (step_result executor / agent_graph parent + uniform sibling model) so
+        the same validation passes without a fresh orchestration."""
+        from tools.orchestration_runtime import repair_legacy_agent_runs
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            # Build a clean, passing execution + orchestration tree.
+            self._violations_with_removed_child(repo)
+            orch_root = repo / "workspace" / "orchestrations" / "orch_test_001"
+            runs_path = orch_root / "agent_runs.jsonl"
+            items = [
+                json.loads(line)
+                for line in runs_path.read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+            # Degrade a step + two substep records to the pre-fix shape.
+            legacy = {
+                "step_run_build_001",
+                "substep_run_compile_generate_001",
+                "substep_run_compile_verify_001",
+            }
+            for item in items:
+                if item.get("agent_run_id") in legacy:
+                    item.pop("parent_agent_run_id", None)
+                    item.pop("agent_model", None)
+            runs_path.write_text(
+                "\n".join(json.dumps(item, ensure_ascii=False) for item in items) + "\n",
+                encoding="utf-8",
+            )
+
+            before = validate(
+                repo_root=repo,
+                workspace_root="workspace",
+                require_orchestration=True,
+            )
+            self.assertTrue(
+                any("missing parent_agent_run_id" in v for v in before), before
+            )
+            self.assertTrue(any("missing agent_model" in v for v in before), before)
+
+            out = repair_legacy_agent_runs(repo, "orch_test_001")
+            self.assertEqual(out["status"], "repaired", out)
+            self.assertEqual(out["agent_model"], "gpt-5-codex", out)
+
+            after = validate(
+                repo_root=repo,
+                workspace_root="workspace",
+                require_orchestration=True,
+            )
+            self.assertFalse(
+                any("missing parent_agent_run_id" in v for v in after), after
+            )
+            self.assertFalse(any("missing agent_model" in v for v in after), after)
+            self.assertFalse(
+                any("must equal executor_agent_run_id" in v for v in after), after
+            )
+
     def test_inflight_judge_tolerated_with_explicit_flag(self) -> None:
         """When the live judge declares its own agent_run_id via
         --in-flight-agent-run-id, its not-yet-recorded edge AND its not-yet-written

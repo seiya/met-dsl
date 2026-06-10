@@ -66,6 +66,7 @@ from tools.orchestration_runtime import (
     record_agent_run,
     record_launch,
     record_timeout,
+    repair_legacy_agent_runs,
     reserve_phase_root,
     render_launch_prompt_text,
     run_gate,
@@ -9804,7 +9805,7 @@ class OrchestrationMetaAndJudgeHookTests(unittest.TestCase):
             meta2 = json.loads(meta_path.read_text(encoding="utf-8"))
             self.assertEqual(meta2.get("parallel_nodes_explicit"), meta1.get("parallel_nodes_explicit"))
 
-    def test_pre_phase_complete_judge_checks_rejects_pass_decision_with_fail_or_blocked(
+    def test_pre_phase_complete_judge_checks_rejects_pass_decision_with_fail(
         self,
     ) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -9825,17 +9826,86 @@ class OrchestrationMetaAndJudgeHookTests(unittest.TestCase):
                 encoding="utf-8",
             )
             payload = {"launch_request_ref": lr_rel}
-            for bad_status in ("fail", "blocked"):
-                with self.assertRaisesRegex(
-                    ValueError,
-                    "decision=pass cannot accompany fail or blocked",
-                ):
-                    _pre_phase_complete_judge_checks(
-                        repo,
-                        node_key=node_key,
-                        status_token=bad_status,
-                        payload=payload,
-                    )
+            with self.assertRaisesRegex(
+                ValueError,
+                "decision=pass cannot accompany fail step_result",
+            ):
+                _pre_phase_complete_judge_checks(
+                    repo,
+                    node_key=node_key,
+                    status_token="fail",
+                    payload=payload,
+                )
+
+    def test_pre_phase_complete_judge_checks_allows_blocked_with_pass_decision(
+        self,
+    ) -> None:
+        """`blocked` is decoupled from semantic_review.decision: a node whose
+        physics passed (decision=pass) may still terminalize as blocked when a
+        non-physics blocker (e.g. orchestration-record integrity) prevents
+        certification. The additional blocked artifact requirements still apply."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            node_key = "problem/shallow_water2d@0.3.0"
+            nk_safe = "problem__shallow_water2d__0.3.0"
+            pipe_rel = "workspace/pipelines/judge_blocked_pipe"
+            base = repo / pipe_rel / "runs" / "run_b1" / nk_safe
+            base.mkdir(parents=True)
+            (base / "semantic_review.json").write_text(
+                json.dumps({"decision": "pass"}),
+                encoding="utf-8",
+            )
+            # blocked terminalization still requires these three artifacts.
+            for name in ("aggregate_verdict.json", "summary.json", "trial_meta.json"):
+                (base / name).write_text("{}\n", encoding="utf-8")
+            lr_rel = "workspace/launches/judge_lr_blocked.json"
+            (repo / lr_rel).parent.mkdir(parents=True, exist_ok=True)
+            (repo / lr_rel).write_text(
+                json.dumps({"pipeline_ref": pipe_rel, "run_id": "run_b1"}),
+                encoding="utf-8",
+            )
+            payload = {"launch_request_ref": lr_rel}
+            # Must NOT raise — blocked is permitted alongside decision=pass.
+            _pre_phase_complete_judge_checks(
+                repo,
+                node_key=node_key,
+                status_token="blocked",
+                payload=payload,
+            )
+
+    def test_pre_phase_complete_judge_checks_blocked_still_requires_artifacts(
+        self,
+    ) -> None:
+        """Decoupling decision from blocked must not weaken the blocked artifact
+        gate: blocked without aggregate_verdict.json is still rejected."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            node_key = "problem/shallow_water2d@0.3.0"
+            nk_safe = "problem__shallow_water2d__0.3.0"
+            pipe_rel = "workspace/pipelines/judge_blocked_missing_pipe"
+            base = repo / pipe_rel / "runs" / "run_b2" / nk_safe
+            base.mkdir(parents=True)
+            (base / "semantic_review.json").write_text(
+                json.dumps({"decision": "pass"}),
+                encoding="utf-8",
+            )
+            lr_rel = "workspace/launches/judge_lr_blocked_missing.json"
+            (repo / lr_rel).parent.mkdir(parents=True, exist_ok=True)
+            (repo / lr_rel).write_text(
+                json.dumps({"pipeline_ref": pipe_rel, "run_id": "run_b2"}),
+                encoding="utf-8",
+            )
+            payload = {"launch_request_ref": lr_rel}
+            with self.assertRaisesRegex(
+                ValueError,
+                "blocked judge requires aggregate_verdict.json",
+            ):
+                _pre_phase_complete_judge_checks(
+                    repo,
+                    node_key=node_key,
+                    status_token="blocked",
+                    payload=payload,
+                )
 
     def test_pre_phase_complete_judge_checks_skips_semantic_review_on_timeout_or_cancel(
         self,
@@ -22109,6 +22179,180 @@ class FailureAnalysisRuntimeSidecarExemptionTests(unittest.TestCase):
                 "a sidecar recorded in an old baseline must not surface as a "
                 "spurious change once the snapshot exempts it",
             )
+
+
+class RepairLegacyAgentRunsTests(unittest.TestCase):
+    """repair_legacy_agent_runs backfills pre-caa10ab agent_runs.jsonl lines."""
+
+    def _build(
+        self,
+        repo: Path,
+        orch: str,
+        *,
+        runs: list[dict[str, Any]],
+        step_results: list[dict[str, Any]] | None = None,
+        graph_edges: list[dict[str, Any]] | None = None,
+        orchestration_arid: str | None = "orch-arid-1",
+    ) -> Path:
+        root = repo / "workspace" / "orchestrations" / orch
+        (root / "steps").mkdir(parents=True, exist_ok=True)
+        with (root / "agent_runs.jsonl").open("w", encoding="utf-8") as fh:
+            for entry in runs:
+                fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        meta: dict[str, Any] = {"orchestration_id": orch, "status": "running"}
+        if orchestration_arid is not None:
+            meta["orchestration_agent_run_id"] = orchestration_arid
+        (root / "orchestration_meta.json").write_text(
+            json.dumps(meta), encoding="utf-8"
+        )
+        for i, sr in enumerate(step_results or []):
+            d = root / "steps" / f"node__{i}" / "compile" / "exec-1"
+            d.mkdir(parents=True, exist_ok=True)
+            (d / "step_result.json").write_text(json.dumps(sr), encoding="utf-8")
+        if graph_edges is not None:
+            (root / "agent_graph.json").write_text(
+                json.dumps({"edges": graph_edges}), encoding="utf-8"
+            )
+        return root
+
+    def test_backfills_parent_from_step_result_and_model_from_sibling(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            orch = "orch_repair_1"
+            root = self._build(
+                repo,
+                orch,
+                runs=[
+                    {"agent_run_id": "orch-arid-1", "agent_role": "orchestration",
+                     "agent_backend": "claude"},
+                    # legacy substep: missing parent + model
+                    {"agent_run_id": "sub-1", "agent_role": "substep",
+                     "agent_backend": "claude", "step": "compile", "substep": "generate"},
+                    # post-fix sibling with the model present
+                    {"agent_run_id": "sub-judge", "agent_role": "substep",
+                     "agent_backend": "claude", "step": "validate", "substep": "judge",
+                     "parent_agent_run_id": "orch-arid-1", "agent_model": "claude-opus-4-8"},
+                ],
+                step_results=[
+                    {"executor_agent_run_id": "orch-arid-1",
+                     "substep_agent_run_ids": ["sub-1"]},
+                ],
+                graph_edges=[
+                    {"parent_agent_run_id": "orch-arid-1", "child_agent_run_id": "sub-1",
+                     "relation_type": "launch"},
+                ],
+            )
+            out = repair_legacy_agent_runs(repo, orch)
+            self.assertEqual(out["status"], "repaired")
+            self.assertEqual(out["agent_model"], "claude-opus-4-8")
+            self.assertEqual(out["agent_model_source"], "sibling_uniform")
+            self.assertEqual(out["remaining_missing"], [])
+            lines = [
+                json.loads(x)
+                for x in (root / "agent_runs.jsonl").read_text().splitlines()
+                if x.strip()
+            ]
+            sub1 = next(d for d in lines if d["agent_run_id"] == "sub-1")
+            self.assertEqual(sub1["parent_agent_run_id"], "orch-arid-1")
+            self.assertEqual(sub1["agent_model"], "claude-opus-4-8")
+            self.assertEqual(sub1["backfilled"]["parent_source"], "step_result_executor")
+            # audit log written
+            audit = [
+                json.loads(x)
+                for x in (root / "record_repairs.jsonl").read_text().splitlines()
+                if x.strip()
+            ]
+            self.assertEqual(audit[0]["agent_run_id"], "sub-1")
+
+    def test_step_parent_from_meta_and_idempotent(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            orch = "orch_repair_2"
+            root = self._build(
+                repo,
+                orch,
+                runs=[
+                    {"agent_run_id": "step-1", "agent_role": "step",
+                     "agent_backend": "claude", "step": "build",
+                     "agent_model": "gpt-5.3-codex"},
+                ],
+                graph_edges=[
+                    {"parent_agent_run_id": "orch-arid-1", "child_agent_run_id": "step-1",
+                     "relation_type": "launch"},
+                ],
+            )
+            out = repair_legacy_agent_runs(repo, orch)
+            self.assertEqual(out["status"], "repaired")
+            lines = [
+                json.loads(x)
+                for x in (root / "agent_runs.jsonl").read_text().splitlines()
+                if x.strip()
+            ]
+            self.assertEqual(lines[0]["parent_agent_run_id"], "orch-arid-1")
+            # existing agent_model must not be overwritten
+            self.assertEqual(lines[0]["agent_model"], "gpt-5.3-codex")
+            # idempotent re-run
+            out2 = repair_legacy_agent_runs(repo, orch)
+            self.assertEqual(out2["status"], "noop")
+            self.assertEqual(out2["repaired_lines"], [])
+
+    def test_needs_manual_when_model_undeterminable(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            orch = "orch_repair_3"
+            self._build(
+                repo,
+                orch,
+                runs=[
+                    {"agent_run_id": "step-1", "agent_role": "step",
+                     "agent_backend": "claude", "step": "build"},
+                ],
+                graph_edges=[
+                    {"parent_agent_run_id": "orch-arid-1", "child_agent_run_id": "step-1",
+                     "relation_type": "launch"},
+                ],
+            )
+            out = repair_legacy_agent_runs(repo, orch)
+            self.assertEqual(out["status"], "needs_manual")
+            self.assertEqual(out["remaining_missing"][0]["missing"], ["agent_model"])
+            # explicit override resolves it
+            out2 = repair_legacy_agent_runs(repo, orch, agent_model="claude-opus-4-8")
+            self.assertEqual(out2["status"], "repaired")
+            self.assertEqual(out2["agent_model_source"], "override")
+
+    def test_graph_disagreement_marks_unrepairable(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            orch = "orch_repair_4"
+            self._build(
+                repo,
+                orch,
+                runs=[
+                    {"agent_run_id": "sub-1", "agent_role": "substep",
+                     "agent_backend": "claude", "step": "compile", "substep": "generate",
+                     "agent_model": "claude-opus-4-8"},
+                ],
+                step_results=[
+                    {"executor_agent_run_id": "executor-A",
+                     "substep_agent_run_ids": ["sub-1"]},
+                ],
+                graph_edges=[
+                    # graph disagrees with step_result executor
+                    {"parent_agent_run_id": "executor-B", "child_agent_run_id": "sub-1",
+                     "relation_type": "launch"},
+                ],
+            )
+            out = repair_legacy_agent_runs(repo, orch)
+            self.assertEqual(out["status"], "needs_manual")
+            self.assertTrue(
+                any(u["agent_run_id"] == "sub-1" for u in out["unrepairable"])
+            )
+
+    def test_noop_when_agent_runs_absent(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            out = repair_legacy_agent_runs(repo, "orch_missing")
+            self.assertEqual(out["status"], "noop")
 
 
 if __name__ == "__main__":
