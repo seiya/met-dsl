@@ -4,8 +4,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import ast
 from datetime import datetime, timezone
 from enum import Enum
+import fnmatch
+import glob
 import json
 import os
 import re
@@ -96,6 +99,18 @@ _HARNESS_AUTO_READ_TOLERATED_REPO_PREFIXES: frozenset[str] = frozenset({
 # the canonical "/memory/MEMORY.md" relative tail.
 _AUTO_READ_PROJECT_MEMORY_PARENT_TAIL: str = ".claude/projects"
 _AUTO_READ_PROJECT_MEMORY_FILE_TAIL: str = "memory/MEMORY.md"
+
+# Claude Code persisted tool-results are written when a tool-result payload exceeds the
+# inline size limit.  The payload is saved to:
+#   ~/.claude/projects/<repo-slug>/<session-id>/tool-results/<id>.txt
+# Agents encounter the `<persisted-output>` wrapper in their context and attempt to Read
+# the file to access the full content.  Since these files are written by the Claude Code
+# harness (not by the agent), they are never in any agent's read_manifest, causing
+# read_manifest_read_guard to fire as a false-positive audit noise entry.
+# We quiet-handle these reads for ALL agent roles (not just orchestration), bound to the
+# current project's slug to prevent cross-project exfiltration.
+_AUTO_READ_PROJECT_TOOL_RESULTS_PARENT_TAIL: str = ".claude/projects"
+_AUTO_READ_PROJECT_TOOL_RESULTS_DIR_COMPONENT: str = "tool-results"
 
 MANIFEST_HINT = (
     "Hint: Ensure record-launch generated the manifest for this agent_run_id and that the manifest "
@@ -413,6 +428,497 @@ def _extract_read_targets(cmd_name: str, cmd_tokens: list[str]) -> list[str]:
     return []
 
 
+# --- Pipe-tail inline-Python AST allowlist ---------------------------------
+# Modules a read-only stdin-parsing snippet may legitimately import.  Anything
+# capable of file I/O, subprocess, networking, or dynamic import is excluded.
+_PIPE_TAIL_ALLOWED_IMPORT_ROOTS: frozenset[str] = frozenset({
+    # NB: `string` is intentionally NOT allowed — string.Formatter().get_field()
+    # resolves a string-literal attribute path to a LIVE object (e.g.
+    # "0.__class__.__bases__[0].__subclasses__"), an RCE primitive the AST
+    # inspector cannot see because the dunder chain lives inside a string.
+    "json", "sys", "re", "csv", "math", "collections",
+    "itertools", "functools", "decimal", "fractions", "statistics",
+    "textwrap", "datetime", "unicodedata", "hashlib", "base64", "html",
+})
+# Builtins that enable dynamic code execution, attribute reflection, or file
+# access.  A call to any of these in the body forces a block.
+_PIPE_TAIL_DANGEROUS_CALLS: frozenset[str] = frozenset({
+    "eval", "exec", "compile", "__import__", "getattr", "setattr",
+    "delattr", "globals", "locals", "vars", "open", "input",
+    "breakpoint", "memoryview", "exit", "quit", "help",
+})
+# Bare names that, if referenced, signal a sandbox-escape attempt even when the
+# corresponding import was rejected (e.g. relying on an ambient global).
+_PIPE_TAIL_DANGEROUS_NAMES: frozenset[str] = frozenset({
+    "os", "subprocess", "socket", "shutil", "pathlib", "importlib",
+    "ctypes", "builtins", "multiprocessing", "threading", "signal",
+    "pty", "fcntl", "mmap", "resource", "platform", "sysconfig",
+    "code", "codeop", "runpy", "pickle", "marshal", "gc", "inspect",
+    # string.Formatter / operator.attrgetter etc. resolve attribute paths from
+    # string literals, defeating AST attribute inspection — block the names too.
+    "Formatter", "attrgetter", "methodcaller", "itemgetter",
+})
+# Non-dunder attributes that are dangerous on an otherwise-allowed module
+# (notably `sys.modules`, which reaches every imported module including os;
+# and Formatter.get_field, which returns a live object for a string field path).
+_PIPE_TAIL_DANGEROUS_ATTRS: frozenset[str] = frozenset({
+    "modules", "system", "popen", "spawn", "spawnv", "fork", "execv",
+    "execve", "execl", "load_module", "import_module", "find_module",
+    "get_field", "get_value", "vformat", "format_field", "convert_field",
+})
+
+# Leaf-attribute ALLOWLIST for pipe-tail `-c` bodies.  A blocklist is unsound:
+# allowed modules RE-EXPORT other modules (and builtins) as plain non-dunder
+# attributes — e.g. `json.codecs.builtins.open`, `statistics.random._os.environ`,
+# `re.enum` — reaching arbitrary sinks via ordinary ast.Attribute chains with no
+# dunder, no dangerous Name, and no `__` string literal.  So attribute access is
+# DENY-BY-DEFAULT: only these well-known data/parse method+attribute names are
+# permitted.  Module re-export names (codecs/enum/random/operator/builtins/_os…)
+# are absent → the traversal to any dangerous module is severed.
+_PIPE_TAIL_ALLOWED_ATTRS: frozenset[str] = frozenset({
+    # streams (read-only stdin parsing; .write only reachable on stdout/stderr
+    # since `open` is blocked as both Name and attribute)
+    "stdin", "stdout", "stderr", "read", "readline", "readlines", "buffer",
+    "flush", "write", "writelines", "argv", "maxsize", "byteorder",
+    # str / bytes methods
+    "strip", "lstrip", "rstrip", "split", "rsplit", "splitlines", "join",
+    "replace", "lower", "upper", "casefold", "title", "capitalize",
+    "swapcase", "startswith", "endswith", "find", "rfind", "index", "rindex",
+    "count", "encode", "decode", "format", "format_map", "zfill", "ljust",
+    "rjust", "center", "expandtabs", "partition", "rpartition", "translate",
+    "maketrans", "isdigit", "isalpha", "isalnum", "isspace", "isupper",
+    "islower", "isnumeric", "isdecimal", "isidentifier", "removeprefix",
+    "removesuffix", "hex", "bit_length", "to_bytes", "from_bytes",
+    # dict / list / set methods
+    "get", "keys", "values", "items", "setdefault", "update", "pop",
+    "popitem", "append", "extend", "insert", "remove", "add", "discard",
+    "sort", "reverse", "copy", "clear", "fromkeys", "union", "intersection",
+    "difference", "issubset", "issuperset", "most_common", "elements",
+    "subtract", "total",
+    # json
+    "loads", "load", "dumps", "dump", "JSONDecodeError",
+    # re
+    "findall", "match", "search", "fullmatch", "finditer", "sub", "subn",
+    "compile", "escape", "group", "groups", "groupdict", "start", "end",
+    "span", "expand", "purge", "flags", "pattern",
+    "I", "M", "S", "X", "A", "L", "U", "IGNORECASE", "MULTILINE", "DOTALL",
+    "VERBOSE", "ASCII", "LOCALE", "UNICODE",
+    # csv
+    "reader", "writer", "DictReader", "DictWriter", "field_size_limit",
+    "excel", "unix_dialect", "register_dialect", "fieldnames",
+    "QUOTE_MINIMAL", "QUOTE_ALL", "QUOTE_NONNUMERIC", "QUOTE_NONE",
+    # base64 / hashlib
+    "b64decode", "b64encode", "b16decode", "b16encode", "b32decode",
+    "b32encode", "urlsafe_b64decode", "urlsafe_b64encode",
+    "standard_b64decode", "standard_b64encode", "decodebytes", "encodebytes",
+    "md5", "sha1", "sha256", "sha512", "sha224", "sha384", "new",
+    "hexdigest", "digest", "blake2b", "blake2s",
+    # math / statistics / decimal / fractions
+    "pi", "e", "tau", "inf", "nan", "sqrt", "floor", "ceil", "trunc", "log",
+    "log2", "log10", "exp", "fabs", "factorial", "gcd", "lcm", "isclose",
+    "isnan", "isinf", "isfinite", "sin", "cos", "tan", "atan", "atan2",
+    "hypot", "degrees", "radians", "mean", "median", "mode", "stdev",
+    "variance", "fmean", "fsum", "prod", "comb", "perm",
+    "Decimal", "Fraction", "quantize", "numerator", "denominator",
+    "as_integer_ratio", "real", "imag", "conjugate",
+    # datetime
+    "datetime", "date", "time", "timedelta", "timezone", "now", "today",
+    "utcnow", "fromisoformat", "fromtimestamp", "utcfromtimestamp",
+    "strftime", "strptime", "isoformat", "year", "month", "day", "hour",
+    "minute", "second", "microsecond", "weekday", "isoweekday", "timestamp",
+    "astimezone", "combine", "utctimetuple", "days", "seconds",
+    "total_seconds", "utc",
+    # itertools / functools
+    "chain", "islice", "cycle", "product", "permutations", "combinations",
+    "combinations_with_replacement", "groupby", "accumulate", "starmap",
+    "takewhile", "dropwhile", "tee", "zip_longest", "filterfalse", "compress",
+    "from_iterable", "reduce", "partial", "lru_cache", "cmp_to_key", "wraps",
+    # collections
+    "OrderedDict", "defaultdict", "Counter", "deque", "namedtuple",
+    "ChainMap", "appendleft", "popleft", "rotate", "maxlen",
+    # unicodedata / textwrap
+    "normalize", "name", "category", "numeric", "digit", "bidirectional",
+    "wrap", "fill", "dedent", "indent", "shorten",
+})
+
+
+def _command_reads_operator_secret(
+    command: str,
+    cmd_tokens: list[str],
+    repo_root: Path,
+    met_dsl_root: Path,
+) -> bool:
+    """True if a Bash command appears to read anything under ~/.met-dsl/.
+
+    Operator tokens live under ~/.met-dsl/.  This guard is NOT gated on the
+    command name (the prior version only fired for cat/head/etc., letting
+    `od`, `xxd`, `cut`, `read X < ...`, and `x=$(cat ...)` slip through).  Two
+    complementary checks:
+      (1) a raw-command marker regex catching ~ / $HOME / ${HOME} / <abs-home>
+          spellings even when adjacent shell punctuation mangles tokenization;
+      (2) per-token path resolution catching `..` traversal and symlinks
+          (.resolve() normalizes both) regardless of the leading command.
+    """
+    home = str(Path.home())
+    marker_re = re.compile(
+        r"(?:~|\$HOME|\$\{HOME\}|" + re.escape(home) + r")/\.met-dsl(?:/|\b)"
+    )
+    if marker_re.search(command):
+        return True
+    # Also test a quote/backslash-collapsed copy of the whole command: shlex
+    # normally removes embedded quotes (`~/.met-d''sl`) and escapes (`~/\.met-dsl`),
+    # but on a shlex parse failure evaluate_common_policy falls back to
+    # command.split(), which does NOT — so collapse them here too (mirrors
+    # _command_invokes_dismiss_violation).
+    collapsed_cmd = re.sub(r"""['"\\]""", "", command)
+    if collapsed_cmd != command and marker_re.search(collapsed_cmd):
+        return True
+    candidate_tokens = list(cmd_tokens)
+    if collapsed_cmd != command:
+        candidate_tokens += collapsed_cmd.split()
+    for tok in candidate_tokens:
+        # Strip shell punctuation that can wrap a path token (redirects,
+        # substitution parens, quotes) but keep `$` (expandvars), glob
+        # metacharacters `[` `]` `*` `?`, and braces `{` `}` (brace expansion,
+        # all handled explicitly below).
+        t = tok.strip().strip("<>();|&\"'`")
+        if not t:
+            continue
+        # Brace expansion (`~/.met-{dsl,x}/...`, `{k..m}`, nested) happens in the
+        # shell before the path exists; expanduser/glob never see it.  Expand to
+        # the cartesian product and test every variant precisely.
+        for variant in _brace_expand(t):
+            # If braces REMAIN (bounded-out >8 groups, or malformed), fall back
+            # to the fail-closed `{...}`→`*` glob catch-all for this variant.
+            # (Precise variants skip this, so legit `~/.{config,local}` reads are
+            # not over-blocked.)
+            if "{" in variant:
+                _bg = os.path.expanduser(os.path.expandvars(_braces_to_glob(variant)))
+                # Cheap lexical check FIRST (no filesystem touch), then a bounded
+                # real-glob — never an unbounded glob.glob on attacker patterns.
+                if _glob_pattern_targets_root(_bg, met_dsl_root):
+                    return True
+                if _glob_targets_secret_bounded(_bg, met_dsl_root):
+                    return True
+                continue
+            expanded = os.path.expanduser(os.path.expandvars(variant))
+            # Glob metacharacters (`*?[`) are expanded by the shell at runtime;
+            # a literal .resolve() would keep them and miss the match.  e.g.
+            # `cat ~/.met-d*/operator_tokens/x.txt` reads the real token.
+            if any(ch in expanded for ch in "*?["):
+                # Cheap lexical fnmatch FIRST: does the glob pattern target the
+                # .met-dsl directory components?  This catches `~/*/*/*` shapes
+                # (a `*` at the .met-dsl depth fnmatches it) WITHOUT walking the
+                # filesystem — the prior ordering ran glob.glob first and hung
+                # the synchronous hook on `~/*/*/*/x`.
+                if _glob_pattern_targets_root(expanded, met_dsl_root):
+                    return True
+                # Then a BOUNDED real-glob for symlink redirection the lexical
+                # check can't see (≤1 wildcard component → cheap).
+                if _glob_targets_secret_bounded(expanded, met_dsl_root):
+                    return True
+                continue
+            try:
+                    p = (
+                        Path(expanded).resolve()
+                        if os.path.isabs(expanded)
+                        else (repo_root / expanded).resolve()
+                    )
+            except (OSError, ValueError, RuntimeError):
+                continue
+            if _is_path_under_root(p, met_dsl_root):
+                return True
+    return False
+
+
+def _split_top_commas(s: str) -> list[str]:
+    """Split on commas that are NOT inside a nested `{...}` group."""
+    parts: list[str] = []
+    depth = 0
+    cur: list[str] = []
+    for ch in s:
+        if ch == "{":
+            depth += 1
+            cur.append(ch)
+        elif ch == "}":
+            depth -= 1
+            cur.append(ch)
+        elif ch == "," and depth == 0:
+            parts.append("".join(cur))
+            cur = []
+        else:
+            cur.append(ch)
+    parts.append("".join(cur))
+    return parts
+
+
+_BRACE_SEQUENCE_MAX_SPAN = 1024
+
+
+def _expand_sequence(spec: str) -> list[str] | None:
+    """Bash sequence expansion `{a..z}` / `{0..9}` / `{lo..hi..step}` -> list.
+
+    Returns None for anything not a recognized 2- or 3-part sequence, OR for a
+    span larger than _BRACE_SEQUENCE_MAX_SPAN — the caller preserves the braces
+    in that case so the fail-closed `{...}`→`*` glob fallback fires.  Bounding
+    here is essential: a single `{0..100000000}` has only one `{` (so the
+    8-group cap does not apply) and would otherwise materialize 100M strings
+    (multi-GB, ~13s) inside this synchronous hook before the product-loop cap.
+    """
+    m = re.fullmatch(r"([A-Za-z0-9]+)\.\.([A-Za-z0-9]+)(?:\.\.(-?\d+))?", spec)
+    if not m:
+        return None
+    a, b, step_s = m.group(1), m.group(2), m.group(3)
+    step = abs(int(step_s)) if step_s else 1
+    if step == 0:
+        step = 1
+    if a.isdigit() and b.isdigit():
+        lo, hi = int(a), int(b)
+    elif len(a) == 1 and len(b) == 1 and a.isalpha() and b.isalpha():
+        lo, hi = ord(a), ord(b)
+    else:
+        return None
+    if (abs(hi - lo) // step) + 1 > _BRACE_SEQUENCE_MAX_SPAN:
+        return None
+    rng = range(lo, hi + 1, step) if lo <= hi else range(lo, hi - 1, -step)
+    if a.isdigit():
+        return [str(n) for n in rng]
+    return [chr(n) for n in rng]
+
+
+def _brace_expand(s: str) -> list[str]:
+    """Bash brace expansion: comma groups `{x,y}`, sequences `{k..m}`, and
+    nested groups `{a,{b,c}}` — cartesian product, balanced-brace aware.
+
+    Bounded to avoid exponential blowup in this synchronous PreToolUse hook:
+    more than 8 brace groups, or more than 256 results, → stop expanding (the
+    `_braces_to_glob` fail-closed fallback in the caller still blocks anything
+    that lexically targets the secret root).
+    """
+    if s.count("{") > 8:
+        return [s]
+    # Find the first balanced top-level {...} group.
+    depth = 0
+    start = -1
+    for idx, ch in enumerate(s):
+        if ch == "{":
+            if depth == 0:
+                start = idx
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                inner = s[start + 1 : idx]
+                pre, post = s[:start], s[idx + 1 :]
+                parts = _split_top_commas(inner)
+                out: list[str] = []
+                if len(parts) == 1:
+                    seq = _expand_sequence(parts[0])
+                    if seq is None:
+                        # Not a comma list and not a recognized/bounded sequence
+                        # (e.g. an unparsed step form, an oversized range, or a
+                        # literal `{x}` bash would leave alone).  PRESERVE the
+                        # braces — do NOT substitute literally — so the caller's
+                        # `{`-present `_braces_to_glob` fallback still fires.
+                        # (Substituting literally would drop the `{`, skip the
+                        # fallback, and let `~/.met-ds{k..m..1}/x` through.)
+                        for tail in _brace_expand(post):
+                            out.append(pre + "{" + inner + "}" + tail)
+                            if len(out) > 256:
+                                return out
+                        return out
+                    options = seq
+                else:
+                    options = parts
+                for opt in options:
+                    for sub in _brace_expand(opt):
+                        for tail in _brace_expand(post):
+                            out.append(pre + sub + tail)
+                            if len(out) > 256:
+                                return out
+                return out
+    return [s]
+
+
+def _braces_to_glob(s: str) -> str:
+    """Replace every `{...}` run with `*` (innermost-first, repeatedly).
+
+    Fail-closed catch-all for ANY brace form — comma groups, sequence
+    expansion `{k..m}`, and nested braces — without emulating bash exactly.
+    e.g. `~/.met-ds{k..m}/x` -> `~/.met-ds*/x`, `~/.{met-{dsl,x},y}/z` -> `~/.*/z`.
+    The result is then matched as a glob pattern against the secret root.
+    """
+    prev = None
+    while prev != s:
+        prev = s
+        s = re.sub(r"\{[^{}]*\}", "*", s)
+    return s
+
+
+def _glob_pattern_targets_root(pattern: str, root: Path) -> bool:
+    """True if an absolute glob `pattern` could match a path under `root`.
+
+    Component-wise fnmatch: each literal component of `root` must be matched by
+    the corresponding glob component of `pattern` (e.g. `.met-d*` / `.m?t-dsl` /
+    `.[m]et-dsl` all fnmatch the literal `.met-dsl`).  Used to fail-closed on
+    globbed operator-secret reads even when the file does not yet exist.
+    """
+    pat = Path(pattern)
+    if not pat.is_absolute():
+        return False
+    pat_parts = pat.parts
+    root_parts = root.parts
+    if len(pat_parts) < len(root_parts):
+        return False
+    return all(
+        fnmatch.fnmatch(rp, pp) for pp, rp in zip(pat_parts, root_parts)
+    )
+
+
+def _glob_targets_secret_bounded(pattern: str, root: Path) -> bool:
+    """Real `glob.glob` (catches symlink redirection the lexical check misses),
+    BOUNDED to avoid a synchronous-hook DoS.
+
+    A pattern with multiple wildcard path components (`~/*/*/*/x`) makes
+    glob.glob recursively scandir the entire $HOME subtree (multi-second hang).
+    Such patterns already lexically target the secret root (a `*` at the
+    .met-dsl depth fnmatches it) and are caught by `_glob_pattern_targets_root`
+    BEFORE this is called — so here we only run glob when at most ONE component
+    carries a wildcard, keeping the filesystem walk cheap.
+    """
+    if sum(1 for comp in pattern.split(os.sep) if any(c in comp for c in "*?[")) > 1:
+        return False
+    try:
+        for match in glob.glob(pattern):
+            if _is_path_under_root(Path(match).resolve(), root):
+                return True
+    except (OSError, ValueError):
+        pass
+    return False
+
+
+_DISMISS_VIOLATION_TOKEN = "dismiss-violation"
+
+
+def _command_invokes_dismiss_violation(command: str, cmd_tokens: list[str]) -> bool:
+    """True if a Bash command invokes the operator-only `dismiss-violation`.
+
+    A raw `\\bdismiss-violation\\b` regex is evaded by shell reassembly the
+    runtime ultimately sees as one argv token.  This is best-effort hardening
+    against the common forms — quote-splitting (`dismiss-vio""lation`),
+    backslash-splitting (`dismiss-vi\\olation`), `$VAR`/`${VAR}` indirection,
+    and `${VAR//from/to}` pattern substitution (`V=dismiss_violation;
+    ${V//_/-}`).  Fully general shell reassembly (command substitution,
+    arrays, `eval`, IFS tricks) is undecidable here; the AUTHORITATIVE gate is
+    the operator token required by `dismiss_violation` itself.
+    """
+    if any(tok == _DISMISS_VIOLATION_TOKEN for tok in cmd_tokens):
+        return True
+    assigns: dict[str, str] = {}
+    for m in re.finditer(
+        r"(?:^|[;&|]|\s)\s*([A-Za-z_][A-Za-z0-9_]*)=([^\s;&|]+)", command
+    ):
+        assigns[m.group(1)] = m.group(2)
+
+    # Bash pattern substitution `${NAME//from/to}` (all) / `${NAME/from/to}`
+    # (first).  Apply BEFORE the simple `$NAME` pass so the simple regex does
+    # not partially consume `${V` and leave `//_/-}` behind.
+    def _pat_sub(m: "re.Match[str]") -> str:
+        name, flag, frm, to = m.group(1), m.group(2), m.group(3), m.group(4)
+        val = assigns.get(name)
+        if val is None:
+            return m.group(0)
+        return val.replace(frm, to) if flag == "//" else val.replace(frm, to, 1)
+
+    resolved = re.sub(
+        r"\$\{([A-Za-z_]\w*)(//|/)([^/}]*)/([^}]*)\}", _pat_sub, command
+    )
+
+    # Bash case modification `${NAME,,}` (lower-all) / `${NAME^^}` (upper-all) /
+    # `${NAME,}` / `${NAME^}` (first char).  Apply BEFORE the simple `$NAME` pass.
+    def _case_sub(m: "re.Match[str]") -> str:
+        name, op = m.group(1), m.group(2)
+        val = assigns.get(name)
+        if val is None:
+            return m.group(0)
+        if op == ",,":
+            return val.lower()
+        if op == "^^":
+            return val.upper()
+        if op == ",":
+            return val[:1].lower() + val[1:]
+        return val[:1].upper() + val[1:]
+
+    resolved = re.sub(
+        r"\$\{([A-Za-z_]\w*)(,,|\^\^|,|\^)\}", _case_sub, resolved
+    )
+    for name, val in assigns.items():
+        resolved = re.sub(r"\$\{?" + re.escape(name) + r"\}?", val, resolved)
+    # Case-fold the collapsed string so case-mangled spellings still match the
+    # (lowercase) dismiss-violation token.
+    collapsed = re.sub(r"""['"\\]""", "", resolved).lower()
+    return _DISMISS_VIOLATION_TOKEN in collapsed
+
+
+def _pipe_tail_body_is_safe(body: str) -> bool:
+    """Return True only when an inline `-c` body is a read-only stdin parser.
+
+    Allowlist AST validation (replaces the prior substring blocklist, which was
+    trivially defeated by `__import__("os").system(...)`, `exec(input())`,
+    `__builtins__.__dict__["open"]`, etc.).  Fail-closed on any parse error.
+
+    Reflection-via-string-literal is also blocked: any string CONSTANT containing
+    `__` is rejected, because attribute paths embedded in strings (the
+    `string.Formatter().get_field("0.__class__.__bases__...")` /
+    `operator.attrgetter("__globals__")` family) reach a live object without ever
+    producing an ast.Attribute node the walker can see.  Combined with dropping
+    `string` from the import allowlist and blocking the Formatter/attrgetter
+    names+methods, this closes the format-string RCE.
+    """
+    try:
+        tree = ast.parse(body, mode="exec")
+    except (SyntaxError, ValueError):
+        return False
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name.split(".")[0] not in _PIPE_TAIL_ALLOWED_IMPORT_ROOTS:
+                    return False
+        elif isinstance(node, ast.ImportFrom):
+            if (node.module or "").split(".")[0] not in _PIPE_TAIL_ALLOWED_IMPORT_ROOTS:
+                return False
+        elif isinstance(node, ast.Attribute):
+            # Any dunder attribute (e.g. __class__, __globals__, __dict__,
+            # __subclasses__) is an introspection-escape vector.
+            if node.attr.startswith("__") and node.attr.endswith("__"):
+                return False
+            if node.attr in _PIPE_TAIL_DANGEROUS_ATTRS:
+                return False
+            # DENY-BY-DEFAULT: allowed modules re-export builtins/os/operator as
+            # plain attributes (json.codecs.builtins.open, statistics.random._os),
+            # so only an explicit leaf-attribute allowlist is sound.
+            if node.attr not in _PIPE_TAIL_ALLOWED_ATTRS:
+                return False
+        elif isinstance(node, ast.Name):
+            # Reject dangerous builtins/modules whenever referenced as a bare
+            # Name — NOT only as a Call callee.  `e=eval; e(stdin)`,
+            # `w=open; w(p,"w")`, `g=getattr; g(obj, name)` alias the builtin
+            # through a local, so a Call-callee-only check (the prior bug) let
+            # them through.  Every Name node is inspected here.
+            if (
+                node.id in _PIPE_TAIL_DANGEROUS_NAMES
+                or node.id in _PIPE_TAIL_DANGEROUS_CALLS
+            ):
+                return False
+            if node.id.startswith("__") and node.id.endswith("__"):
+                return False
+        elif isinstance(node, ast.Constant):
+            # Reject attribute paths smuggled inside string literals.
+            if isinstance(node.value, str) and "__" in node.value:
+                return False
+    return True
+
+
 def evaluate_common_policy(hook_input: HookInput) -> HookDecision:
     """Apply backend-agnostic policy checks."""
     if hook_input.event_name not in {
@@ -471,13 +977,30 @@ def evaluate_common_policy(hook_input: HookInput) -> HookDecision:
             cmd_tokens = command.split()
         lowered_tokens = [tok.lower() for tok in cmd_tokens]
         first_cmd = lowered_tokens[0].split("/")[-1] if lowered_tokens else ""
-        if first_cmd in bash_read_cmds:
-            repo_root_raw = hook_input.payload.get("repo_root")
-            repo_root = (
-                Path(repo_root_raw).resolve()
-                if isinstance(repo_root_raw, str) and repo_root_raw.strip()
-                else Path.cwd()
+        repo_root_raw = hook_input.payload.get("repo_root")
+        repo_root = (
+            Path(repo_root_raw).resolve()
+            if isinstance(repo_root_raw, str) and repo_root_raw.strip()
+            else Path.cwd()
+        )
+        # ~/.met-dsl/ holds operator-only secrets (dismiss-violation tokens).
+        # NOT gated on the command name: any command that reads under ~/.met-dsl/
+        # (cat, od, xxd, cut, `read X < ...`, `x=$(cat ...)`, ..-traversal, etc.)
+        # is blocked.  The Read tool already excludes it (not in
+        # allowed_read_roots); this closes the Bash path.
+        met_dsl_root = (Path.home() / ".met-dsl").resolve()
+        if _command_reads_operator_secret(command, cmd_tokens, repo_root, met_dsl_root):
+            return HookDecision(
+                action=HookDecisionAction.BLOCK,
+                reason=(
+                    "blocked: direct read from ~/.met-dsl/ via Bash is forbidden in "
+                    "workflow mode. Operator tokens live there and must not enter "
+                    "agent context; dismiss-violation is an operator-only action."
+                ),
+                continue_processing=False,
+                audit_detail={"policy": "forbid_operator_secret_direct_read", "command": command},
             )
+        if first_cmd in bash_read_cmds:
             repo_tools_root = (repo_root / "tools").resolve()
             read_targets = _extract_read_targets(first_cmd, cmd_tokens)
             if any(
@@ -495,15 +1018,24 @@ def evaluate_common_policy(hook_input: HookInput) -> HookDecision:
                 )
         cli_help_audit = _detect_cli_help_invocation(cmd_tokens, command)
         if "python" in lowered:
-            # Fail-closed: ALL inline Python execution (`-c` snippets and
-            # `- <<EOF` heredocs) is blocked in workflow mode.  Regex-based
-            # write detection is fundamentally unreliable — alias bypasses
-            # like `from pathlib import Path as P; P('x').write_text(...)`
-            # or `Path('x').open('w').write(...)` would slip through any
-            # finite pattern set, and the same goes for `/dev/shm` string
-            # literals embedded in inline source.  Agents that need to run
-            # Python should use a real script file (`python3 script.py`),
-            # which goes through normal write/read manifest validation.
+            # Inline Python policy (fail-closed with one narrow exception):
+            #
+            # DEFAULT: ALL standalone `python3 -c` snippets and `python3 - <<EOF`
+            # heredocs are blocked.  Regex-based write detection is fundamentally
+            # unreliable — alias bypasses like `from pathlib import Path as P;
+            # P('x').write_text(...)` or `Path('x').open('w').write(...)` would
+            # slip through any finite pattern set.  Agents that need to run Python
+            # should use a real script file (`python3 script.py`), which goes
+            # through normal write/read manifest validation.
+            #
+            # EXCEPTION: `... | python3 -c '...'` pipe-tail read-only invocations
+            # are allowed when the `-c` body contains no file-write patterns.
+            # Pipe-tail means stdin is consumed from the previous stage (not from
+            # a file argument), which substantially limits the attack surface.
+            # The `-c` body is scanned for write-API patterns; if none are found
+            # the invocation is permitted.  Risk: alias-based write bypasses
+            # remain theoretically possible; this is a conscious trade-off
+            # accepted by the project operator (see plan pure-wibbling-oasis).
             #
             # Tokenization: shlex puts `-c` and `<<` into separate tokens.
             _py_inline_blocked = False
@@ -517,24 +1049,122 @@ def evaluate_common_policy(hook_input: HookInput) -> HookDecision:
                 for tok in tokens_for_python
             )
             if has_python_invocation:
-                # `-c` form
-                if "-c" in tokens_for_python:
-                    _py_inline_blocked = True
-                    _py_inline_reason = "python -c inline execution is forbidden in workflow mode"
                 # heredoc form: `python3 - <<EOF` (still detected via regex
-                # because heredoc syntax is not a single token).
-                elif re.search(r"""python3?\s+-\s*<<""", command):
+                # because heredoc syntax is not a single token) — always blocked.
+                if re.search(r"""python3?\s+-\s*<<""", command):
                     _py_inline_blocked = True
                     _py_inline_reason = (
                         "python - <<EOF heredoc inline execution is forbidden in workflow mode"
                     )
+                # `-c` form — check for the pipe-tail read-only exception first.
+                elif "-c" in tokens_for_python:
+                    # --- Pipe-tail read-only exception ---
+                    # A `... | python3 -c '...'` invocation where python reads
+                    # only from stdin is much lower risk than a standalone `-c`
+                    # call.  Allow it only if ALL of the following hold:
+                    #   (1) there is exactly ONE python3 -c in the entire command
+                    #       (mixed commands like `... | python3 -c '...'; python3
+                    #       -c 'open(...)'` are rejected in full — the first
+                    #       invocation's pipe-tail status must not whitelist a
+                    #       second standalone invocation in the same string), AND
+                    #   (2) that single python3 -c is immediately preceded by a
+                    #       `|` separator in the command string, AND
+                    #   (3) the `-c` body contains no recognized file-write API
+                    #       calls (open-for-write, write_text, shutil.copy, etc.)
+                    # python[0-9.]* — match ANY interpreter version (python,
+                    # python2, python3, python3.11), not just python3.  Otherwise
+                    # a benign `... | python3 -c '<safe>'` coexisting with a
+                    # second `; python2 -c '<evil>'` would count as 1 and wrongly
+                    # qualify for the pipe-tail exception while python2 runs
+                    # unguarded.
+                    _total_python_c_count = len(
+                        re.findall(r"(?:\S*/)?python[0-9.]*\s+-c\b", command)
+                    )
+                    _is_pipe_tail = (
+                        _total_python_c_count == 1
+                        and bool(
+                            re.search(
+                                # (?<!\|)\|(?!\|) — match a SINGLE pipe only.  The
+                                # negative lookbehind/lookahead exclude `||` (logical
+                                # OR), so `cat x || python3 -c '...'` is NOT treated
+                                # as a read-only pipe-tail (it would run python3 even
+                                # when the left side fails — not a stdin consumer).
+                                # [^|;&\n]* — stop at any shell separator so that
+                                # `echo x | cat; python3 -c '...'` (semicoloned
+                                # standalone) does NOT match as pipe-tail.
+                                # (?:\S*/)? — matches optional path prefix so that
+                                # `/usr/bin/python3 -c` is detected the same as
+                                # bare `python3 -c`.
+                                r"(?<!\|)\|(?!\|)[^|;&\n]*(?:\S*/)?python[0-9.]*\s+-c\b",
+                                command,
+                            )
+                        )
+                    )
+                    # Extract the inline code body for write-pattern scanning.
+                    # Use the -c immediately following python3/python in the token
+                    # list, not the first -c overall (which could belong to grep -c
+                    # or another command that precedes the pipe).
+                    # _c_body_reliable tracks whether we successfully extracted the
+                    # actual `-c` body.  If shlex fails to parse (unmatched quote) or
+                    # the body token is absent, the write-pattern scan cannot be
+                    # trusted — we MUST fail-closed (block) rather than silently
+                    # scanning an empty string that matches no write pattern.
+                    _c_body = ""
+                    _c_body_reliable = False
+                    try:
+                        import shlex as _shlex_mod
+                        _toks_s = _shlex_mod.split(command)
+                        _ci = None
+                        for _tok_idx in range(len(_toks_s) - 1):
+                            # Use basename so that path-qualified interpreters
+                            # like /usr/bin/python3 are matched correctly.
+                            _base = _toks_s[_tok_idx].split("/")[-1]
+                            if (
+                                _base in ("python3", "python")
+                                and _toks_s[_tok_idx + 1] == "-c"
+                            ):
+                                _ci = _tok_idx + 1
+                                break
+                        if _ci is not None and _ci + 1 < len(_toks_s):
+                            _c_body = _toks_s[_ci + 1]
+                            _c_body_reliable = True
+                    except Exception:
+                        _c_body = ""
+                        _c_body_reliable = False
+                    # Validate the body with an allowlist AST check (not a
+                    # substring blocklist).  The legitimate pipe-tail use case
+                    # (parsing stdin JSON/text) only imports read-only modules
+                    # and reads from sys.stdin; anything capable of file I/O,
+                    # subprocess, networking, dynamic exec, or attribute-escape
+                    # is rejected.  See _pipe_tail_body_is_safe.
+                    _c_body_safe = _c_body_reliable and _pipe_tail_body_is_safe(_c_body)
+                    if _is_pipe_tail and _c_body_safe:
+                        # Pipe-tail + reliably-extracted + AST-allowlisted body
+                        # → allow.  Fall through (do not set _py_inline_blocked).
+                        pass
+                    else:
+                        _py_inline_blocked = True
+                        if not _is_pipe_tail:
+                            _py_inline_reason = (
+                                "python -c inline execution is forbidden in workflow mode"
+                            )
+                        elif not _c_body_reliable:
+                            _py_inline_reason = (
+                                "python -c pipe-tail body could not be parsed reliably "
+                                "(unmatched quote / malformed) — blocked fail-closed"
+                            )
+                        else:
+                            _py_inline_reason = (
+                                "python -c pipe-tail body is not a read-only stdin parser "
+                                "(disallowed import / call / attribute) — blocked fail-closed"
+                            )
             if _py_inline_blocked:
                 # Intent classification — uuid / json_read / write (default).
-                # The block is unconditional, but the recovery hint differs by
-                # intent: agents commonly reach for `python -c` to (a) generate
-                # a UUID, (b) inspect a JSON file, or (c) write a file. Pointing
-                # them at the canonical alternative for the actual intent
-                # eliminates the retry loop.
+                # The block is unconditional for matched cases, but the recovery
+                # hint differs by intent: agents commonly reach for `python -c`
+                # to (a) generate a UUID, (b) inspect a JSON file, or (c) write
+                # a file.  Pointing them at the canonical alternative eliminates
+                # the retry loop.
                 intent = "write"
                 hint_next = (
                     "python3 tools/orchestration_runtime.py guarded-apply-patch "
@@ -563,7 +1193,8 @@ def evaluate_common_policy(hook_input: HookInput) -> HookDecision:
                         f"blocked: {_py_inline_reason}. "
                         "Inline Python is fail-closed because regex-based "
                         "filtering cannot reliably catch alias/string-literal "
-                        "bypasses. Use a real script file (python3 script.py) "
+                        "bypasses (exception: pipe-tail with no write patterns). "
+                        "Use a real script file (python3 script.py) "
                         "for execution, or tools/audit_orchestration.py for "
                         "log inspection. "
                         "Use guarded-apply-patch for .json/.txt outputs, "
@@ -581,6 +1212,26 @@ def evaluate_common_policy(hook_input: HookInput) -> HookDecision:
                         },
                     },
                 )
+        # Block dismiss-violation in all workflow sessions regardless of how the
+        # runtime is invoked (script path, -m module, or wrapper) and regardless
+        # of shell reassembly (quote/backslash splitting, variable indirection).
+        # An agent cannot bypass this by using METDSL_WORKFLOW_MODE=0 prefix
+        # because the hook reads its OWN os.environ (set by run_workflow.py at
+        # session start), not the subprocess env override.
+        if _command_invokes_dismiss_violation(command, cmd_tokens):
+            return HookDecision(
+                action=HookDecisionAction.BLOCK,
+                reason=(
+                    "blocked: dismiss-violation is an operator-only command and "
+                    "cannot be invoked from within a running workflow session. "
+                    "Run it from the operator terminal outside the workflow."
+                ),
+                continue_processing=False,
+                audit_detail={
+                    "policy": "forbid_dismiss_violation_in_workflow",
+                    "command": command,
+                },
+            )
         # Block any Bash command that touches /dev/shm in workflow mode.
         # We scan EVERY token of the entire command — not just positional args
         # of the first command — to defeat bypasses via shell control tokens
@@ -1196,6 +1847,58 @@ def validate_write_access(
     return HookDecision(action=HookDecisionAction.ALLOW)
 
 
+def _is_persisted_tool_result_read(
+    repo_root: Path,
+    agent_role: str | None,
+    agent_run_id: str,
+    file_path: str,
+    session_id: str | None = None,
+) -> bool:
+    """True iff file_path is a persisted Claude Code tool-result this agent may read.
+
+    Matches: ~/.claude/projects/<repo-slug>/<session_dir>/tool-results/<id>.txt
+    The session_dir component must equal either `agent_run_id` or `session_id`.
+    Two IDs are checked because:
+    - Claude Code backend records agent_run_id as agent_session_id (per CLAUDE.md),
+      so tool-results may be stored under agent_run_id.
+    - The hook payload's session_id is the live Claude Code session identifier
+      actually used to name the directory; pass it to cover cases where the two
+      differ.
+    This prevents reads from a different agent's or previous session's directory.
+    Applies to all agent roles — all can receive <persisted-output> wrappers.
+    """
+    valid_session_dirs: set[str] = {s for s in (agent_run_id, session_id) if s}
+    if not valid_session_dirs:
+        return False
+    try:
+        abs_target = _absolute_lexical(repo_root, file_path)
+        repo_root_abs = _absolute_lexical(repo_root, str(repo_root))
+    except (OSError, ValueError):
+        return False
+    if not _path_has_no_symlink_redirect(abs_target):
+        return False
+    try:
+        home_abs = Path.home()
+        slug = _claude_project_slug(repo_root_abs)
+        project_root = home_abs / _AUTO_READ_PROJECT_TOOL_RESULTS_PARENT_TAIL / slug
+        if (
+            abs_target.name.endswith(".txt")
+            and abs_target.parent.name == _AUTO_READ_PROJECT_TOOL_RESULTS_DIR_COMPONENT
+        ):
+            rel = abs_target.relative_to(project_root)
+            parts = rel.parts
+            # parts = (session_dir, "tool-results", filename)
+            if (
+                len(parts) == 3
+                and parts[1] == _AUTO_READ_PROJECT_TOOL_RESULTS_DIR_COMPONENT
+                and parts[0] in valid_session_dirs
+            ):
+                return True
+    except (OSError, RuntimeError, ValueError):
+        pass
+    return False
+
+
 def _is_auto_read_tolerated(
     repo_root: Path,
     agent_role: str | None,
@@ -1251,7 +1954,12 @@ def _is_auto_read_tolerated(
             if prefix.endswith("/") and rel_posix.startswith(prefix):
                 return True
 
-    # Category 2: orchestration-only auto-read.
+    # Category 2a: persisted tool-results (all agent roles) are handled upstream
+    # in validate_read_access via _is_persisted_tool_result_read, which requires
+    # agent_run_id for session-binding and returns ALLOW before this function
+    # is called. No fallback needed here.
+
+    # Category 2b: orchestration-only auto-read.
     if agent_role != "orchestration":
         return False
 
@@ -1527,8 +2235,21 @@ def validate_read_access(
     agent_run_id: str,
     file_path: str,
     agent_role: str | None = None,
+    session_id: str | None = None,
 ) -> HookDecision:
     """read manifest の allowed_read_roots に対して read 対象を検証する。"""
+    # Category 2a: persisted tool-results for any agent role.
+    # These are harness-internal files (never in read_manifest) that agents must
+    # be able to read when large tool outputs have been persisted as
+    # <persisted-output>.  Return ALLOW directly — do not route through the
+    # block-as-noise path used for startup auto-reads.
+    # session_id (the live Claude Code session identifier from the hook payload)
+    # is checked alongside agent_run_id because Claude Code stores tool-results
+    # under its own session directory, which may differ from agent_run_id.
+    if _is_persisted_tool_result_read(
+        repo_root, agent_role, agent_run_id, file_path, session_id=session_id
+    ):
+        return HookDecision(action=HookDecisionAction.ALLOW)
     if _is_auto_read_tolerated(repo_root, agent_role, file_path):
         # Keep the read-trust boundary intact: persistent state files
         # (MEMORY.md, README.md, ~/.claude/projects/.../memory/MEMORY.md) must

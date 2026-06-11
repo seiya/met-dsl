@@ -55,7 +55,7 @@ Generate ステージの生成責務を固定し、`Build` 可能な実装 artif
 - 対象 `pipeline` ルートに `lineage.json` を必須配置する（`workspace/pipelines/<node_key_safe>/<pipeline_id>/lineage.json`）。フィールド要件は `docs/workflow/WORKFLOW_CORE.md` を canonical source とし、`post_generate` 検査で欠落は `fail` となる。
 
 ## 運用ルール
-1. `source_id` を発行し、出力先を `workspace/pipelines/<pipeline_id>/source/<source_id>/` に固定する。
+1. `source_id` を発行し、出力先を `workspace/pipelines/<pipeline_id>/source/<source_id>/` に固定する。`source_id` の形式は `src_<YYYYMMDD>_<seq3>`（例: `src_20260511_001`）とする。canonical: `docs/workflow/phases/phase_02_generate.md`。形式違反は `record-launch` が `ValueError` で事前 reject する（generate step launch 契約）。
 2. `debug_mode=false` では `attempts/` を作成しない。
 3. `debug_mode=true` の場合のみ失敗試行を `attempts/<attempt_id>/` に保存する。
 4. `verification_status=pass` の artifact のみ `Build` に引き渡す。

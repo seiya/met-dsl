@@ -489,6 +489,25 @@ shell_tool                       stable             true
         self.assertEqual(result["status"], "fail")
         self.assertFalse(result["can_launch_substep_agents"])
 
+    def test_probe_execution_platform_claude_fails_when_help_exit0_but_empty_stdout(self) -> None:
+        """P2-C: `claude --help` exiting 0 with EMPTY stdout must NOT pass as
+        multi_agent — guards against a substitute/broken binary named `claude`
+        that returns success with no help text."""
+        def runner(args, **kwargs):  # type: ignore[no-untyped-def]
+            if args[0] == "claude" and args[1:] == ["--version"]:
+                return _FakeCompletedProcess(0, stdout="2.1.0 (Claude Code)\n")
+            if args[0] == "claude" and args[1:] == ["features", "list"]:
+                return _FakeCompletedProcess(1, stderr="unknown command\n")
+            if args[0] == "claude" and args[1:] == ["--help"]:
+                return _FakeCompletedProcess(0, stdout="   \n")  # exit 0, no real output
+            raise AssertionError(args)
+
+        result = probe_execution_platform(backend="claude", runner=runner)
+        self.assertEqual(result["backend"], "claude")
+        self.assertEqual(result["status"], "fail")
+        self.assertFalse(result["can_launch_substep_agents"])
+        self.assertNotEqual(result["feature_states"].get("multi_agent"), True)
+
     def _claude_runner_with_mcp(
         self,
         mcp_stdout: str = "",
@@ -2234,7 +2253,7 @@ shell_tool                       stable             true
                     "ir_ref": "workspace/ir/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001",
                     "pipeline_ref": "workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001",
                     "dependency_ref": "workspace/ir/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/spec.ir.yaml",
-                    "source_id": "gen_001",
+                    "source_id": "src_20260415_001",
                     "skill_name": "workflow-generate-verify",
                     "skill_ref": "skills/workflow-generate-verify/SKILL.md",
                     "skill_must_read_refs": "workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/source/src_001/source_meta.json",
@@ -2482,10 +2501,13 @@ shell_tool                       stable             true
         """
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
-            src1 = "src_20260510_005"
-            src2 = "src_20260510_006"
-            src1 = f"{_FIX_PIPE_REF}/source/{src1}/src/"
-            src2 = f"{_FIX_PIPE_REF}/source/{src2}/src/"
+            src_bare_1 = "src_20260510_005"
+            src_bare_2 = "src_20260510_006"
+            src1 = f"{_FIX_PIPE_REF}/source/{src_bare_1}/src/"
+            src2 = f"{_FIX_PIPE_REF}/source/{src_bare_2}/src/"
+            # Request source_id is a valid bare id (passes the format check); the
+            # rejection under test is the multi-source_id span across the listed
+            # allowed_output_paths.
             with self.assertRaisesRegex(
                 ValueError, "must target a single source_id"
             ):
@@ -2493,7 +2515,7 @@ shell_tool                       stable             true
                     repo_root=repo_root,
                     orchestration_id="orch_001",
                     child_agent_run_id="run_auto_inject_multi",
-                    src_id=src1,
+                    src_id=src_bare_1,
                     allowed_output_paths=[src1, src2],
                 )
 
@@ -15350,6 +15372,7 @@ class RecordTimeoutTests(unittest.TestCase):
                 "node_key": "problem/shallow_water2d@0.3.0",
                 "step": "generate",
                 "substep": "generate",
+                "source_id": "src_20260509_001",
                 "orchestration_id": "orch_to_001",
                 "parent_agent_run_id": "orch_run_to_001",
                 "ir_ref": _FIX_IR_REF,
@@ -15361,7 +15384,7 @@ class RecordTimeoutTests(unittest.TestCase):
                     "generate", "generate"
                 ),
                 "allowed_output_paths": [
-                    f"{_FIX_PIPE_REF}/source/src_001/source_meta.json",
+                    f"{_FIX_PIPE_REF}/source/src_20260509_001/source_meta.json",
                 ],
                 "launch_prompt_full": render_launch_prompt_text({
                     "node_key": "problem/shallow_water2d@0.3.0",
@@ -22353,6 +22376,227 @@ class RepairLegacyAgentRunsTests(unittest.TestCase):
             repo = Path(tmp)
             out = repair_legacy_agent_runs(repo, "orch_missing")
             self.assertEqual(out["status"], "noop")
+
+
+class DismissViolationTests(unittest.TestCase):
+    """dismiss-violation operator gate + P2-B prior-dismissal evidence preservation."""
+
+    def _seed_violation(self, repo: Path, oid: str, arid: str, paths: list[str]) -> Path:
+        from tools.orchestration_runtime import (
+            _write_unauthorized_write_violation,
+            _violations_dir,
+        )
+        _violations_dir(repo, oid).mkdir(parents=True, exist_ok=True)
+        return _write_unauthorized_write_violation(
+            repo, oid, agent_run_id=arid, actor_role="step",
+            actual_changed_paths=list(paths), unauthorized_paths=list(paths),
+            output_refs=[], gate_changed_paths=[], missing_from_gate_changed_paths=[],
+            write_roots=[],
+        )
+
+    def test_prior_dismissal_preserved_on_overwrite(self) -> None:
+        """P2-B: a re-detection with non-subset paths must not destroy the
+        operator's prior dismissal evidence — it is carried into prior_dismissals."""
+        from tools.orchestration_runtime import _write_unauthorized_write_violation
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            oid, arid = "orch_pd", "run_pd"
+            p = self._seed_violation(repo, oid, arid, ["a.txt"])
+            doc = json.loads(p.read_text(encoding="utf-8"))
+            doc["dismissed_at"] = "2026-06-11T00:00:00Z"
+            doc["dismiss_reason"] = "benign pyc"
+            doc["dismissed_paths"] = ["a.txt"]
+            p.write_text(json.dumps(doc), encoding="utf-8")
+
+            # Re-detection surfaces a NEW path (not a subset of dismissed_paths).
+            _write_unauthorized_write_violation(
+                repo, oid, agent_run_id=arid, actor_role="step",
+                actual_changed_paths=["a.txt", "b.txt"],
+                unauthorized_paths=["a.txt", "b.txt"],
+                output_refs=[], gate_changed_paths=[],
+                missing_from_gate_changed_paths=[], write_roots=[],
+            )
+            final = json.loads(p.read_text(encoding="utf-8"))
+            self.assertIn("prior_dismissals", final)
+            self.assertEqual(len(final["prior_dismissals"]), 1)
+            carried = final["prior_dismissals"][0]
+            self.assertEqual(carried["dismiss_reason"], "benign pyc")
+            self.assertEqual(carried["dismissed_paths"], ["a.txt"])
+            self.assertIn("superseded_at", carried)
+            # The fresh record must not present stale approval as current.
+            self.assertNotIn("dismissed_at", final)
+
+    def test_prior_dismissals_accumulate(self) -> None:
+        """Repeated overwrites accumulate history rather than replacing it."""
+        from tools.orchestration_runtime import _write_unauthorized_write_violation
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            oid, arid = "orch_acc", "run_acc"
+            p = self._seed_violation(repo, oid, arid, ["a.txt"])
+            for i, reason in enumerate(("first", "second")):
+                doc = json.loads(p.read_text(encoding="utf-8"))
+                doc["dismissed_at"] = f"2026-06-1{i}T00:00:00Z"
+                doc["dismiss_reason"] = reason
+                doc["dismissed_paths"] = ["a.txt"]
+                p.write_text(json.dumps(doc), encoding="utf-8")
+                _write_unauthorized_write_violation(
+                    repo, oid, agent_run_id=arid, actor_role="step",
+                    actual_changed_paths=["a.txt", f"new{i}.txt"],
+                    unauthorized_paths=["a.txt", f"new{i}.txt"],
+                    output_refs=[], gate_changed_paths=[],
+                    missing_from_gate_changed_paths=[], write_roots=[],
+                )
+            final = json.loads(p.read_text(encoding="utf-8"))
+            self.assertEqual(len(final["prior_dismissals"]), 2)
+            self.assertEqual(
+                [h["dismiss_reason"] for h in final["prior_dismissals"]],
+                ["first", "second"],
+            )
+
+    def test_prior_dismissals_retained_without_redismiss(self) -> None:
+        """Regression: a SECOND consecutive re-detection (no operator re-dismiss
+        in between, so the prior record carries prior_dismissals but no fresh
+        dismissed_at) must NOT drop the accumulated history."""
+        from tools.orchestration_runtime import _write_unauthorized_write_violation
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            oid, arid = "orch_nrd", "run_nrd"
+            p = self._seed_violation(repo, oid, arid, ["a.txt"])
+            doc = json.loads(p.read_text(encoding="utf-8"))
+            doc["dismissed_at"] = "2026-06-11T00:00:00Z"
+            doc["dismiss_reason"] = "benign"
+            doc["dismissed_paths"] = ["a.txt"]
+            p.write_text(json.dumps(doc), encoding="utf-8")
+
+            def redetect(paths: list[str]) -> None:
+                _write_unauthorized_write_violation(
+                    repo, oid, agent_run_id=arid, actor_role="step",
+                    actual_changed_paths=paths, unauthorized_paths=paths,
+                    output_refs=[], gate_changed_paths=[],
+                    missing_from_gate_changed_paths=[], write_roots=[],
+                )
+
+            redetect(["a.txt", "b.txt"])           # #1 — captures the dismissal
+            after1 = json.loads(p.read_text(encoding="utf-8"))
+            self.assertEqual(len(after1["prior_dismissals"]), 1)
+            self.assertNotIn("dismissed_at", after1)  # no fresh dismissal now
+
+            redetect(["a.txt", "b.txt", "c.txt"])  # #2 — NO re-dismiss before this
+            after2 = json.loads(p.read_text(encoding="utf-8"))
+            # History from #1 must survive even though the prior record had no
+            # dismissed_at to trigger a fresh append.
+            self.assertEqual(len(after2["prior_dismissals"]), 1)
+            self.assertEqual(after2["prior_dismissals"][0]["dismiss_reason"], "benign")
+
+    def test_wrong_operator_token_rejected(self) -> None:
+        from tools.orchestration_runtime import dismiss_violation
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            home = Path(tmp) / "home"
+            oid, arid = "orch_tok", "run_tok"
+            self._seed_violation(repo, oid, arid, ["a.txt"])
+            tok_dir = home / ".met-dsl" / "operator_tokens"
+            tok_dir.mkdir(parents=True, exist_ok=True)
+            (tok_dir / f"{oid}.txt").write_text("real-token", encoding="utf-8")
+            with patch.dict(os.environ, {"HOME": str(home)}):
+                with self.assertRaisesRegex(ValueError, "does not match the stored"):
+                    dismiss_violation(
+                        repo_root=repo, orchestration_id=oid, agent_run_id=arid,
+                        dismiss_reason="x", paths=["a.txt"],
+                        operator_token="WRONG",
+                    )
+
+    def test_empty_token_file_never_validates(self) -> None:
+        """Regression: a 0-byte / whitespace token file (e.g. crash mid-write)
+        must NOT validate — neither `compare_digest('','')` nor a whitespace
+        --operator-token may pass the operator gate."""
+        from tools.orchestration_runtime import dismiss_violation
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            home = Path(tmp) / "home"
+            oid, arid = "orch_empty", "run_empty"
+            self._seed_violation(repo, oid, arid, ["a.txt"])
+            tok_dir = home / ".met-dsl" / "operator_tokens"
+            tok_dir.mkdir(parents=True, exist_ok=True)
+            (tok_dir / f"{oid}.txt").write_text("", encoding="utf-8")  # 0-byte
+            with patch.dict(os.environ, {"HOME": str(home)}):
+                for cand in (" ", "", "anything"):
+                    with self.assertRaisesRegex(ValueError, "empty or corrupt"):
+                        dismiss_violation(
+                            repo_root=repo, orchestration_id=oid, agent_run_id=arid,
+                            dismiss_reason="x", paths=["a.txt"],
+                            operator_token=cand,
+                        )
+
+    def test_init_repairs_zero_byte_token_and_preserves_valid(self) -> None:
+        """init regenerates a 0-byte token (mode 0o600) but leaves a valid one
+        untouched across resume."""
+        import stat as _stat
+        from tools.orchestration_runtime import init_orchestration
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp) / "h"
+            # 0-byte → repaired
+            repo1 = Path(tmp) / "r1"; repo1.mkdir()
+            td = home / ".met-dsl" / "operator_tokens"; td.mkdir(parents=True)
+            broken = td / "orch_a.txt"; broken.write_text("", encoding="utf-8")
+            with patch.dict(os.environ, {"HOME": str(home)}):
+                init_orchestration(repo_root=repo1, orchestration_id="orch_a",
+                    spec_ref="spec/x.md", source_dependency_ref="spec/d.yaml")
+            self.assertTrue(broken.read_text().strip())
+            self.assertEqual(_stat.S_IMODE(broken.stat().st_mode), 0o600)
+            # valid → preserved
+            repo2 = Path(tmp) / "r2"; repo2.mkdir()
+            keep = td / "orch_b.txt"; keep.write_text("KEEP-123", encoding="utf-8")
+            with patch.dict(os.environ, {"HOME": str(home)}):
+                init_orchestration(repo_root=repo2, orchestration_id="orch_b",
+                    spec_ref="spec/x.md", source_dependency_ref="spec/d.yaml")
+            self.assertEqual(keep.read_text(), "KEEP-123")
+
+    def test_correct_token_dismisses_and_pass_gate_accepts_subset(self) -> None:
+        from tools.orchestration_runtime import (
+            dismiss_violation, _is_violation_dismissed,
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            home = Path(tmp) / "home"
+            oid, arid = "orch_ok", "run_ok"
+            self._seed_violation(repo, oid, arid, ["a.txt", "b.txt"])
+            tok_dir = home / ".met-dsl" / "operator_tokens"
+            tok_dir.mkdir(parents=True, exist_ok=True)
+            (tok_dir / f"{oid}.txt").write_text("real-token", encoding="utf-8")
+            with patch.dict(os.environ, {"HOME": str(home)}):
+                res = dismiss_violation(
+                    repo_root=repo, orchestration_id=oid, agent_run_id=arid,
+                    dismiss_reason="benign", paths=["a.txt", "b.txt"],
+                    operator_token="real-token",
+                )
+            self.assertTrue(res["dismissed"])
+            # subset of dismissed_paths → pass-gate accepts
+            self.assertTrue(_is_violation_dismissed(
+                repo, oid, agent_run_id=arid, unauthorized_paths=["a.txt"],
+            ))
+            # path outside dismissed set → pass-gate rejects
+            self.assertFalse(_is_violation_dismissed(
+                repo, oid, agent_run_id=arid, unauthorized_paths=["a.txt", "c.txt"],
+            ))
+
+    def test_path_not_in_unauthorized_cannot_be_dismissed(self) -> None:
+        from tools.orchestration_runtime import dismiss_violation
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            home = Path(tmp) / "home"
+            oid, arid = "orch_unk", "run_unk"
+            self._seed_violation(repo, oid, arid, ["a.txt"])
+            tok_dir = home / ".met-dsl" / "operator_tokens"
+            tok_dir.mkdir(parents=True, exist_ok=True)
+            (tok_dir / f"{oid}.txt").write_text("real-token", encoding="utf-8")
+            with patch.dict(os.environ, {"HOME": str(home)}):
+                with self.assertRaisesRegex(ValueError, "not in the violation's"):
+                    dismiss_violation(
+                        repo_root=repo, orchestration_id=oid, agent_run_id=arid,
+                        dismiss_reason="x", paths=["never-seen.txt"],
+                        operator_token="real-token",
+                    )
 
 
 if __name__ == "__main__":

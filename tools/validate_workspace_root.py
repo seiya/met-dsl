@@ -265,6 +265,7 @@ ALLOWED_WORKSPACE_TOP_LEVEL_DIRS = {
     "orchestrations",
     "plans",
     "pipelines",
+    "ir",       # Compile step output: workspace/ir/<node_key_safe>/<ir_id>/
     "index",
     "tmp",
     ".pycache",

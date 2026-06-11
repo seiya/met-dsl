@@ -2381,5 +2381,389 @@ class DevShmWriteBlockTests(unittest.TestCase):
         self.assertEqual((decision.audit_detail or {}).get("policy"), "output_manifest_write_guard")
 
 
+class PipeTailInlinePythonAstTests(unittest.TestCase):
+    """P0: pipe-tail `... | python3 -c '...'` exception is AST-allowlisted.
+
+    The legitimate read-only stdin-parsing case is allowed; arbitrary code
+    execution / file-write / sandbox-escape bodies are blocked (the prior
+    substring blocklist was trivially defeated)."""
+
+    def _call(self, command: str) -> HookDecision:
+        with patch.dict(os.environ, {"METDSL_WORKFLOW_MODE": "1"}, clear=False):
+            return evaluate_common_policy(
+                HookInput(
+                    event_name=HookEventName.PRE_COMMAND_EXECUTE,
+                    backend="claude",
+                    payload={"command": command},
+                    command=command,
+                )
+            )
+
+    def _is_blocked(self, command: str) -> bool:
+        return self._call(command).action == HookDecisionAction.BLOCK
+
+    def test_allows_legitimate_stdin_json_parse(self) -> None:
+        for cmd in (
+            "cat x | python3 -c 'import sys,json; print(json.loads(sys.stdin.read()))'",
+            "cat x | python3 -c 'import sys,re; print(re.findall(r\"x\", sys.stdin.read()))'",
+            "cat x | python3 -c 'import sys; print(sys.stdin.read().strip())'",
+            "echo {} | python3 -c 'import sys,json; print(json.load(sys.stdin).get(\"k\"))'",
+            "cat x | /usr/bin/python3 -c 'import sys,json; json.loads(sys.stdin.read())'",
+        ):
+            self.assertFalse(self._is_blocked(cmd), msg=f"should ALLOW: {cmd}")
+
+    def test_blocks_rce_via_import_system(self) -> None:
+        self.assertTrue(self._is_blocked(
+            "cat x | python3 -c '__import__(\"os\").system(\"id\")'"))
+
+    def test_blocks_exec_input(self) -> None:
+        self.assertTrue(self._is_blocked("cat x | python3 -c 'exec(input())'"))
+
+    def test_blocks_builtins_dict_open(self) -> None:
+        self.assertTrue(self._is_blocked(
+            "cat x | python3 -c 'f=__builtins__.__dict__[\"open\"]; f(\"/tmp/p\",\"w\")'"))
+
+    def test_blocks_sys_modules_escape(self) -> None:
+        self.assertTrue(self._is_blocked(
+            "cat x | python3 -c 'import sys; sys.modules[\"os\"].system(\"id\")'"))
+
+    def test_blocks_subclasses_traversal(self) -> None:
+        self.assertTrue(self._is_blocked(
+            "cat x | python3 -c '().__class__.__bases__[0].__subclasses__()'"))
+
+    def test_blocks_os_and_socket_imports(self) -> None:
+        self.assertTrue(self._is_blocked("cat x | python3 -c 'import os; os.write(1,b\"x\")'"))
+        self.assertTrue(self._is_blocked("cat x | python3 -c 'import socket'"))
+        self.assertTrue(self._is_blocked(
+            "cat x | python3 -c 'import subprocess; subprocess.run([\"id\"])'"))
+
+    def test_blocks_open_for_write(self) -> None:
+        self.assertTrue(self._is_blocked("cat x | python3 -c 'open(\"/tmp/p\",\"w\")'"))
+
+    def test_blocks_logical_or_not_pipe_tail(self) -> None:
+        """`||` is NOT a pipe-tail; the body must not be granted the exception."""
+        self.assertTrue(self._is_blocked(
+            "cat x || python3 -c 'import sys,json; json.loads(sys.stdin.read())'"))
+
+    def test_blocks_unparseable_body_fail_closed(self) -> None:
+        self.assertTrue(self._is_blocked(
+            "cat x | python3 -c 'import sys; print(sys.stdin.read()"))  # unmatched quote
+
+    def test_standalone_c_still_blocked(self) -> None:
+        self.assertTrue(self._is_blocked(
+            "python3 -c 'import sys,json; json.loads(sys.stdin.read())'"))
+
+    def test_blocks_coexisting_python2_with_benign_pipe_tail(self) -> None:
+        """A benign `python3 -c` pipe-tail must NOT whitelist a coexisting
+        `python2 -c` (different interpreter version) running unguarded."""
+        self.assertTrue(self._is_blocked(
+            'cat x | python3 -c "import sys; print(sys.stdin.read())"'
+            ' ; python2 -c "import os; os.system(0)"'))
+
+    def test_standalone_python2_c_blocked(self) -> None:
+        self.assertTrue(self._is_blocked("python2 -c 'import os; os.system(1)'"))
+
+    def test_blocks_string_formatter_get_field_rce(self) -> None:
+        """RCE: string.Formatter().get_field resolves a string-literal attribute
+        path to a LIVE object — the AST walker never sees the dunder chain."""
+        self.assertTrue(self._is_blocked(
+            "cat /dev/null | python3 -c 'import string; "
+            "f=string.Formatter(); o,_=f.get_field(\"0.__class__.__bases__\",[\"\"],{}); print(o)'"))
+
+    def test_blocks_dunder_in_string_literal(self) -> None:
+        """Attribute paths smuggled inside string literals are rejected."""
+        self.assertTrue(self._is_blocked(
+            "cat x | python3 -c 'import sys; x=\"0.__class__\"; print(x, sys.stdin.read())'"))
+
+    def test_blocks_operator_attrgetter(self) -> None:
+        self.assertTrue(self._is_blocked(
+            "cat x | python3 -c 'from operator import attrgetter; attrgetter(\"__globals__\")(print)'"))
+
+    def test_blocks_bare_string_module_import(self) -> None:
+        """`string` is no longer an allowed import (Formatter is an RCE sink)."""
+        self.assertTrue(self._is_blocked(
+            "cat x | python3 -c 'import string; print(string.ascii_letters)'"))
+
+    def test_blocks_module_reexport_attribute_chains(self) -> None:
+        """RCE: allowed modules re-export builtins/os/operator as plain
+        attributes (json.codecs.builtins.open, statistics.random._os.environ,
+        re.enum.bltns) — deny-by-default attribute allowlist must block these."""
+        for body in (
+            'import json; json.codecs.builtins.open("/tmp/p","w").write("x")',
+            "import statistics; print(statistics.random._os.environ)",
+            "import re; print(re.enum.bltns.eval(\"6*7\"))",
+            "import fractions; print(fractions.operator.add)",
+            "import json; print(json.decoder.re.enum)",
+        ):
+            self.assertTrue(
+                self._is_blocked(f"cat x | python3 -c '{body}'"),
+                msg=f"re-export chain should block: {body}")
+
+    def test_allows_richer_legit_parsers_under_allowlist(self) -> None:
+        """The attribute allowlist must not break common stdin parsing."""
+        for body in (
+            "import sys; print(sys.stdin.read().strip().split())",
+            'import sys,json; print(json.load(sys.stdin).get("k"))',
+            "import sys,csv; [print(r) for r in csv.reader(sys.stdin)]",
+            "import sys,base64; print(base64.b64decode(sys.stdin.read()))",
+            'import sys; d={}; d.setdefault("a",[]).append(sys.stdin.read())',
+        ):
+            self.assertFalse(
+                self._is_blocked(f"cat x | python3 -c '{body}'"),
+                msg=f"legit parser should allow: {body}")
+
+    def test_blocks_builtin_aliasing(self) -> None:
+        """RCE: dangerous builtins aliased through a local Name (not called
+        directly) must be rejected — `e=eval; e(stdin)`, `w=open`, `g=getattr`."""
+        for body in (
+            "import sys; e=eval; e(sys.stdin.read())",
+            'w=open; w("/tmp/p","w")',
+            "g=getattr; print(g(object, \"x\"))",
+            'import functools; functools.reduce(eval, ["1"])',
+            "m=map; list(m(eval, [\"1\"]))",
+        ):
+            self.assertTrue(
+                self._is_blocked(f"cat x | python3 -c '{body}'"),
+                msg=f"alias body should block: {body}")
+
+
+class ForbidOperatorSecretReadTests(unittest.TestCase):
+    """P1: ~/.met-dsl/ reads are blocked regardless of the read command."""
+
+    def _call(self, command: str) -> HookDecision:
+        with patch.dict(os.environ, {"METDSL_WORKFLOW_MODE": "1"}, clear=False):
+            return evaluate_common_policy(
+                HookInput(
+                    event_name=HookEventName.PRE_COMMAND_EXECUTE,
+                    backend="claude",
+                    payload={"command": command, "repo_root": os.getcwd()},
+                    command=command,
+                )
+            )
+
+    def _policy(self, command: str) -> str:
+        return (self._call(command).audit_detail or {}).get("policy", "")
+
+    def test_blocks_cat_head_tail(self) -> None:
+        for c in ("cat", "head", "tail", "less"):
+            self.assertEqual(
+                self._policy(f"{c} ~/.met-dsl/operator_tokens/x.txt"),
+                "forbid_operator_secret_direct_read", msg=c)
+
+    def test_blocks_non_read_commands(self) -> None:
+        """od/xxd/cut/read are not in the read-command set but must still block."""
+        for c in (
+            "od -c ~/.met-dsl/operator_tokens/x.txt",
+            "xxd ~/.met-dsl/operator_tokens/x.txt",
+            "cut -c1- ~/.met-dsl/operator_tokens/x.txt",
+            "read X < ~/.met-dsl/operator_tokens/x.txt",
+        ):
+            self.assertEqual(
+                self._policy(c), "forbid_operator_secret_direct_read", msg=c)
+
+    def test_blocks_command_substitution(self) -> None:
+        self.assertEqual(
+            self._policy("x=$(cat ~/.met-dsl/operator_tokens/x.txt)"),
+            "forbid_operator_secret_direct_read")
+
+    def test_blocks_glob_metacharacters(self) -> None:
+        """Shell globs expand at runtime; the guard must fail-closed on them."""
+        from pathlib import Path
+        home = str(Path.home())
+        for c in (
+            "cat ~/.met-d*/operator_tokens/x.txt",
+            "cat $HOME/.met-d*/operator_tokens/x.txt",
+            f"cat {home}/.met-d*/operator_tokens/x.txt",
+            "od ~/.m?t-dsl/operator_tokens/x.txt",
+            "cat ~/.[m]et-dsl/operator_tokens/x.txt",
+        ):
+            self.assertEqual(
+                self._policy(c), "forbid_operator_secret_direct_read", msg=c)
+
+    def test_blocks_brace_expansion(self) -> None:
+        """Shell brace expansion `{a,b}` in the .met-dsl segment must fail-closed."""
+        for c in (
+            "cat ~/.met-{dsl,x}/operator_tokens/x.txt",
+            "cat ~/.met-ds{l}/operator_tokens/x.txt",
+            "cat ~/.{met-dsl,foo}/operator_tokens/x.txt",
+            "cat $HOME/.met-{dsl,x}/operator_tokens/x.txt",
+        ):
+            self.assertEqual(
+                self._policy(c), "forbid_operator_secret_direct_read", msg=c)
+
+    def test_blocks_brace_sequence_and_nested(self) -> None:
+        """`{k..m}` sequence and nested braces both expand to .met-dsl in bash."""
+        for c in (
+            "cat ~/.met-ds{k..m}/operator_tokens/x.txt",
+            "cat ~/.{met-{dsl,x},y}/operator_tokens/x.txt",
+            "od ~/.met-ds{a..z}/operator_tokens/x.txt",
+        ):
+            self.assertEqual(
+                self._policy(c), "forbid_operator_secret_direct_read", msg=c)
+
+    def test_blocks_brace_step_sequence(self) -> None:
+        """bash 3-part step sequence `{lo..hi..incr}` also expands to .met-dsl."""
+        for c in (
+            "cat ~/.met-ds{k..m..1}/operator_tokens/x.txt",
+            "od -c ~/.met-ds{j..p..2}/x",
+            "cat ~/.met-ds{a..z..1}/x",
+        ):
+            self.assertEqual(
+                self._policy(c), "forbid_operator_secret_direct_read", msg=c)
+
+    def test_multi_wildcard_glob_no_dos(self) -> None:
+        """`~/*/*/*` patterns must not trigger an unbounded glob.glob walk of
+        $HOME in this synchronous hook — the cheap lexical check fires first."""
+        import time
+        t0 = time.time()
+        # `*` at the .met-dsl depth lexically targets the secret root → blocks,
+        # but crucially must do so WITHOUT a multi-second filesystem walk.
+        self.assertEqual(
+            self._policy("echo ~/*/*/*/x"),
+            "forbid_operator_secret_direct_read")
+        self._policy("cat " + " ".join(["~/*/*/*/q"] * 40))
+        self.assertLess(time.time() - t0, 2.0)
+
+    def test_single_wildcard_glob_allowed_fast(self) -> None:
+        """A single-wildcard glob not targeting the secret root is allowed and fast."""
+        import time
+        t0 = time.time()
+        self.assertNotEqual(
+            self._policy("ls ~/.config/*"),
+            "forbid_operator_secret_direct_read")
+        self.assertLess(time.time() - t0, 2.0)
+
+    def test_giant_brace_sequence_no_dos(self) -> None:
+        """A huge single `{0..N}` sequence must not allocate/hang the hook,
+        and a met-dsl-targeting one must still block."""
+        import time
+        t0 = time.time()
+        self.assertEqual(
+            self._policy("cat ~/.met-ds{0..999999999}/operator_tokens/x.txt"),
+            "forbid_operator_secret_direct_read")
+        self._policy("cat ~/x{0..999999999}/y")  # non-secret, must also be fast
+        self.assertLess(time.time() - t0, 2.0)
+
+    def test_blocks_embedded_quote_backslash_fallback(self) -> None:
+        """When shlex parse fails and evaluate_common_policy falls back to
+        command.split(), embedded quote/backslash forms (`~/.met-d''sl`,
+        `~/\\.met-dsl`) must still be caught by the collapse pass."""
+        from pathlib import Path
+        from tools.hooks.common import _command_reads_operator_secret
+        repo = Path.cwd()
+        root = (Path.home() / ".met-dsl").resolve()
+        for cmd in (
+            r"cat ~/\.met-dsl/operator_tokens/x.txt 'unbalanced",
+            "cat ~/.met-d''sl/operator_tokens/x.txt 'unbalanced",
+        ):
+            self.assertTrue(
+                _command_reads_operator_secret(cmd, cmd.split(), repo, root),
+                msg=cmd)
+
+    def test_brace_expansion_is_bounded_no_dos(self) -> None:
+        """A crafted many-group brace token must not hang the hook."""
+        import time
+        c = "cat " + "{a,b}" * 25 + "x"
+        t0 = time.time()
+        self._policy(c)  # must return quickly
+        self.assertLess(time.time() - t0, 2.0)
+
+    def test_blocks_home_var_and_absolute_and_traversal(self) -> None:
+        from pathlib import Path
+        home = str(Path.home())
+        for c in (
+            "cat $HOME/.met-dsl/operator_tokens/x.txt",
+            "cat ${HOME}/.met-dsl/operator_tokens/x.txt",
+            f"cat {home}/.met-dsl/operator_tokens/x.txt",
+            f"cat {home}/foo/../.met-dsl/operator_tokens/x.txt",
+        ):
+            self.assertEqual(
+                self._policy(c), "forbid_operator_secret_direct_read", msg=c)
+
+    def test_allows_normal_reads(self) -> None:
+        for c in (
+            "cat docs/RUNBOOK.md",
+            "cat workspace/orchestrations/o/meta.json",
+            "echo met-dsl is fine in text",
+        ):
+            self.assertNotEqual(
+                self._policy(c), "forbid_operator_secret_direct_read", msg=c)
+
+    def test_legit_dotfile_braces_not_overblocked(self) -> None:
+        """Precise brace expansion must not over-block unrelated `~/.{a,b}` reads."""
+        for c in (
+            "cat ~/.{bashrc,profile}",
+            "tar czf x ~/.{config,local}",
+            "ls ~/.{cache,config}/app",
+        ):
+            self.assertNotEqual(
+                self._policy(c), "forbid_operator_secret_direct_read", msg=c)
+
+
+class ForbidDismissViolationTokenizationTests(unittest.TestCase):
+    """P1: dismiss-violation block resists quote/backslash/var reassembly."""
+
+    def _policy(self, command: str) -> str:
+        with patch.dict(os.environ, {"METDSL_WORKFLOW_MODE": "1"}, clear=False):
+            d = evaluate_common_policy(
+                HookInput(
+                    event_name=HookEventName.PRE_COMMAND_EXECUTE,
+                    backend="claude",
+                    payload={"command": command, "repo_root": os.getcwd()},
+                    command=command,
+                )
+            )
+        return (d.audit_detail or {}).get("policy", "")
+
+    def test_blocks_literal(self) -> None:
+        self.assertEqual(
+            self._policy("python3 tools/orchestration_runtime.py dismiss-violation --operator-token X"),
+            "forbid_dismiss_violation_in_workflow")
+
+    def test_blocks_quote_split(self) -> None:
+        self.assertEqual(
+            self._policy('python3 tools/orchestration_runtime.py dismiss-vio""lation --operator-token X'),
+            "forbid_dismiss_violation_in_workflow")
+
+    def test_blocks_backslash_split(self) -> None:
+        self.assertEqual(
+            self._policy(r"python3 tools/orchestration_runtime.py dismiss-vi\olation --operator-token X"),
+            "forbid_dismiss_violation_in_workflow")
+
+    def test_blocks_variable_indirection(self) -> None:
+        self.assertEqual(
+            self._policy("V=violation; python3 tools/orchestration_runtime.py dismiss-${V} --operator-token X"),
+            "forbid_dismiss_violation_in_workflow")
+
+    def test_blocks_pattern_substitution(self) -> None:
+        """bash `${V//from/to}` replacement reaches argparse as dismiss-violation."""
+        self.assertEqual(
+            self._policy(
+                "V=dismiss_violation; python3 tools/orchestration_runtime.py "
+                "${V//_/-} --operator-token X"),
+            "forbid_dismiss_violation_in_workflow")
+
+    def test_blocks_command_substitution_literal(self) -> None:
+        self.assertEqual(
+            self._policy(
+                "python3 tools/orchestration_runtime.py "
+                "$(echo dismiss-violation) --operator-token X"),
+            "forbid_dismiss_violation_in_workflow")
+
+    def test_blocks_case_modification(self) -> None:
+        """bash `${V,,}` / `${V^^}` case modification reassembly."""
+        for c in (
+            "V=DISMISS-VIOLATION; python3 tools/orchestration_runtime.py ${V,,} --operator-token X",
+            "V=dismiss-violation; python3 tools/orchestration_runtime.py ${V^^} --operator-token X",
+        ):
+            self.assertEqual(
+                self._policy(c), "forbid_dismiss_violation_in_workflow", msg=c)
+
+    def test_allows_unrelated_command(self) -> None:
+        self.assertNotEqual(
+            self._policy("python3 tools/orchestration_runtime.py record-agent-run --foo bar"),
+            "forbid_dismiss_violation_in_workflow")
+
+
 if __name__ == "__main__":
     unittest.main()

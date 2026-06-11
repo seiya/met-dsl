@@ -1401,6 +1401,13 @@ _SLUG_DATE_SEQ3_PATTERN = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*_[0-9]{8}_[0-9]{
 # of a silent downstream no-match. IMPORTANT: keep this in lock-step with the
 # canonical run dir grammar that `post_execute` discovery relies on.
 _RUN_ID_RE = re.compile(r"^run_[0-9]{8}_[0-9]{3}$")
+# Canonical source_id format for the Generate step: `src_<YYYYMMDD>_<seq3>`.
+# This is the ONLY accepted prefix — unlike ir_id / pipeline_id which use an
+# arbitrary slug, source_id always starts with the literal `src_` prefix.
+# Validated at record-launch time so a malformed source_id (e.g. inheriting
+# the ir_id slug format) fails fast before the generate agent wastes a full
+# substep run that would only be caught by generate.verify.
+_SOURCE_ID_RE = re.compile(r"^src_[0-9]{8}_[0-9]{3}$")
 
 # Codex round 31 F2 → round 36: keep reader (`_FRESHNESS_CANONICAL_ID_RE`)
 # and writer (`_SLUG_DATE_SEQ3_PATTERN`) grammars in lock-step. The capture
@@ -3839,6 +3846,21 @@ def run_gate(
     result: dict[str, Any] = {"violations": violations, "gate_result_ref": gate_ref}
     if inline_result is not None:
         result["result"] = inline_result
+    # Emit a one-line JSON status summary to stderr so agents can consume the
+    # gate result without needing to Read the persisted gate file.  The gate
+    # file path (gate_result_ref) is in a gates/<arid>/ directory that is
+    # outside most agents' read_manifests, causing read_manifest_read_guard
+    # blocks when agents attempt to read it directly (observed in
+    # orch_20260610T130256Z_ebe96a51).  Agents should redirect stderr to a
+    # tmp file (`2>workspace/tmp/<arid>/last_gate_stderr.txt`) and read that
+    # instead — which IS in their allowed_tmp_root and thus read-allowed.
+    _gate_summary = {
+        "gate": gate,
+        "status": status,
+        "violations": violations,
+        "gate_result_ref": gate_ref,
+    }
+    print(json.dumps(_gate_summary), file=sys.stderr)
     return result
 
 
@@ -5348,6 +5370,10 @@ def _should_ignore_runtime_snapshot_path(
     # Ignore Claude local/runtime settings mutated by system-level hooks.
     if token.startswith(".claude/"):
         return True
+    # NOTE: No blanket pyc/__pycache__ exemption here.  PYTHONDONTWRITEBYTECODE=1
+    # (set in run_workflow.py) is the primary protection against incidental bytecode
+    # writes.  Any explicit bytecode generation (e.g. python3 -m py_compile) is an
+    # agent action that SHOULD surface as an unauthorized_write_violation.
     orch_root = _normalize_rel_posix(f"workspace/orchestrations/{orchestration_id}")
     runtime_prefixes = (
         f"{orch_root}/access_logs/",
@@ -6200,8 +6226,179 @@ def _write_unauthorized_write_violation(
         record["manifest_file_tool_paths"] = manifest_file_tool_paths
     if directory_authorized_paths is not None:
         record["directory_authorized_paths"] = directory_authorized_paths
+    # P2-B: preserve prior operator dismissal evidence.  When a re-detection
+    # surfaces unauthorized paths that are NOT a subset of a previously
+    # dismissed set, this function overwrites the existing violation file.
+    # Without carrying it forward, the operator's prior `dismissed_at` /
+    # `dismiss_reason` / `dismissed_paths` approval would be silently destroyed,
+    # misleading auditors into thinking no dismissal ever happened.  Accumulate
+    # the history under `prior_dismissals` so the full trail survives overwrite.
+    if out.exists():
+        try:
+            prior = json.loads(out.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            prior = None
+        if isinstance(prior, dict):
+            # Always carry forward any accumulated history first, so a SECOND
+            # consecutive re-detection (no intervening re-dismiss, hence no
+            # `dismissed_at` on the prior record) does not drop the earlier
+            # entries.  Then append the current dismissal if the prior record
+            # was itself in a dismissed state.
+            prior_history = prior.get("prior_dismissals")
+            history_list = list(prior_history) if isinstance(prior_history, list) else []
+            if prior.get("dismissed_at"):
+                history_list.append({
+                    "dismissed_at": prior.get("dismissed_at"),
+                    "dismiss_reason": prior.get("dismiss_reason"),
+                    "dismissed_paths": prior.get("dismissed_paths"),
+                    "superseded_at": record["detected_at"],
+                })
+            if history_list:
+                record["prior_dismissals"] = history_list
     _write_json(out, record)
     return out
+
+
+def dismiss_violation(
+    repo_root: Path,
+    orchestration_id: str,
+    *,
+    agent_run_id: str,
+    dismiss_reason: str,
+    paths: list[str],
+    operator_token: str,
+) -> dict[str, Any]:
+    """dismiss-violation: 既知の良性 unauthorized_write_violation を operator が承認済みとしてマークする。
+
+    violations/<arid>.unauthorized_write_violation.json に ``dismissed_at`` /
+    ``dismiss_reason`` / ``dismissed_paths`` を追記する。次回の
+    ``_validate_actual_write_paths`` 呼び出し時、検出 unauthorized paths が
+    dismissed_paths の部分集合であれば raise をスキップする。
+
+    Args:
+        repo_root: リポジトリルート
+        orchestration_id: orchestration ID
+        agent_run_id: dismiss 対象の agent run ID
+        dismiss_reason: dismiss 理由（free-form、audit ログに残る）
+        paths: dismiss 対象のファイルパス（repo root 相対）
+        operator_token: ~/.met-dsl/operator_tokens/<oid>.txt の内容
+    """
+    # Operator-only gate via token validation.
+    # The token is written to ~/.met-dsl/operator_tokens/<oid>.txt at orchestration
+    # init (mode 0o600) and is NOT under any workspace/ path that agents may read.
+    # Two hook layers keep it out of agent reach: (a) the orchestration agent's
+    # allowed_read_roots include workspace/ but NOT ~/.met-dsl/, so the Read tool
+    # is blocked by read_manifest_read_guard; (b) forbid_operator_secret_direct_read
+    # blocks `cat ~/.met-dsl/...` (and $HOME/absolute spellings) via Bash.
+    # Residual: a written `python3 script.py` whose body reads the token file
+    # internally is not interceptable by PreToolUse hooks — this is an accepted
+    # architectural limit shared by all on-disk secrets; the operator passes the
+    # token from their own terminal and is not expected to materialize it on disk
+    # where the agent runs.
+    # This replaces the prior mutable-env-var check, which an agent could bypass
+    # by clearing os.environ['METDSL_WORKFLOW_MODE'] before calling this function
+    # from a tmp Python script.
+    token_path = Path.home() / ".met-dsl" / "operator_tokens" / f"{orchestration_id}.txt"
+    if not token_path.exists():
+        raise ValueError(
+            f"dismiss-violation: operator_token.txt not found at {token_path}. "
+            "Re-run orchestration init to generate the token."
+        )
+    expected_token = token_path.read_text(encoding="utf-8").strip()
+    # Reject an empty/corrupt stored token: a 0-byte file (e.g. from a crash
+    # mid-write) must NEVER validate.  Without this, `compare_digest("", "")`
+    # is True and `--operator-token " "` (which survives the `not` guard but
+    # strips to "") would pass — letting an agent self-approve a violation.
+    if not expected_token:
+        raise ValueError(
+            "dismiss-violation: stored operator token is empty or corrupt at "
+            f"{token_path}. Re-run orchestration init to regenerate it."
+        )
+    _candidate = operator_token.strip() if operator_token else ""
+    # Constant-time compare so the gate does not leak the token via timing.
+    if not _candidate or not secrets.compare_digest(_candidate, expected_token):
+        raise ValueError(
+            "dismiss-violation: --operator-token does not match the stored "
+            f"token in {token_path}. Read the token from that file and pass it "
+            "as --operator-token."
+        )
+    if not dismiss_reason or not dismiss_reason.strip():
+        raise ValueError("dismiss-violation: --dismiss-reason must be non-empty")
+    if not paths:
+        raise ValueError("dismiss-violation: --paths must contain at least one path")
+    viol_path = _violations_dir(repo_root, orchestration_id) / f"{agent_run_id}.unauthorized_write_violation.json"
+    if not viol_path.exists():
+        raise ValueError(
+            f"dismiss-violation: violation file not found: {viol_path}. "
+            "Run record-agent-run once to produce the violation, then dismiss."
+        )
+    viol_doc = _read_json(viol_path)
+    if not isinstance(viol_doc, dict):
+        raise ValueError(f"dismiss-violation: violation file is not a JSON object: {viol_path}")
+    # Validate: every requested dismiss path must be present in the violation's
+    # recorded unauthorized_paths. This prevents operators from over-broadly
+    # pre-approving paths that were never in the evidence, which would create a
+    # wildcard pass-gate for future unauthorized writes.
+    recorded_unauthorized: set[str] = set()
+    up_obj = viol_doc.get("unauthorized_paths")
+    if isinstance(up_obj, list):
+        recorded_unauthorized = {
+            _normalize_rel_posix(str(p)) for p in up_obj if isinstance(p, str) and p.strip()
+        }
+    normalized_paths = sorted({_normalize_rel_posix(p) for p in paths if p.strip()})
+    unknown = set(normalized_paths) - recorded_unauthorized
+    if unknown:
+        raise ValueError(
+            f"dismiss-violation: the following paths are not in the violation's "
+            f"unauthorized_paths and cannot be dismissed: {sorted(unknown)}. "
+            f"Dismissable paths: {sorted(recorded_unauthorized)}"
+        )
+    # Allow re-dismiss with updated reason/paths; overwrite previous dismiss.
+    viol_doc["dismissed_at"] = _utc_now_iso()
+    viol_doc["dismiss_reason"] = dismiss_reason.strip()
+    viol_doc["dismissed_paths"] = normalized_paths
+    _write_json(viol_path, viol_doc)
+    return {
+        "dismissed": True,
+        "violation_path": str(viol_path.relative_to(repo_root)),
+        "dismissed_paths": normalized_paths,
+        "dismissed_at": viol_doc["dismissed_at"],
+        "dismiss_reason": viol_doc["dismiss_reason"],
+    }
+
+
+def _is_violation_dismissed(
+    repo_root: Path,
+    orchestration_id: str,
+    *,
+    agent_run_id: str,
+    unauthorized_paths: list[str],
+) -> bool:
+    """_validate_actual_write_paths の pass-gate: 既に dismiss 承認済みなら True。
+
+    violation ファイルが存在し ``dismissed_at`` フィールドを持ち、
+    今回検出した ``unauthorized_paths`` が ``dismissed_paths`` の部分集合であれば
+    True を返す（raise をスキップさせる）。
+    """
+    viol_path = _violations_dir(repo_root, orchestration_id) / f"{agent_run_id}.unauthorized_write_violation.json"
+    if not viol_path.exists():
+        return False
+    try:
+        viol_doc = _read_json(viol_path)
+    except Exception:
+        return False
+    if not isinstance(viol_doc, dict):
+        return False
+    if not viol_doc.get("dismissed_at"):
+        return False
+    dismissed_set: set[str] = set()
+    dp_obj = viol_doc.get("dismissed_paths")
+    if isinstance(dp_obj, list):
+        dismissed_set = {_normalize_rel_posix(str(p)) for p in dp_obj if isinstance(p, str) and p.strip()}
+    if not dismissed_set:
+        return False
+    unauthorized_normalized = {_normalize_rel_posix(p) for p in unauthorized_paths}
+    return unauthorized_normalized <= dismissed_set
 
 
 def _validate_actual_write_paths(
@@ -6431,29 +6628,42 @@ def _validate_actual_write_paths(
             manifest_allowed_output_dirs=manifest_allowed_output_dirs,
         )
     if unauthorized:
-        violation_path = _write_unauthorized_write_violation(
+        # Pass-gate: operator が dismiss-violation で既に承認済みの violation は
+        # raise をスキップし、record-agent-run を通過させる。
+        # dismiss 対象が検出 unauthorized の厳密な部分集合であることを確認する。
+        if _is_violation_dismissed(
             repo_root,
             orchestration_id,
             agent_run_id=run_id,
-            actor_role=actor_role,
-            actual_changed_paths=actual_changed_paths,
             unauthorized_paths=unauthorized,
-            output_refs=output_refs,
-            gate_changed_paths=gate_changed_paths,
-            missing_from_gate_changed_paths=missing_from_gate_changed_paths,
-            write_roots=write_roots,
-            manifest_file_tool_paths=sorted(manifest_file_tool_paths) if manifest_file_tool_paths else None,
-            directory_authorized_paths=directory_authorized if directory_authorized else None,
-        )
-        if actor_role in {"step", "substep"}:
-            # Cleanup runs AFTER violation is recorded so evidence is preserved for auditors.
-            _cleanup_empty_file_pin_stubs(repo_root, orchestration_id, agent_run_id=run_id)
-            _cleanup_agent_tmp_root(repo_root, orchestration_id, agent_run_id=run_id)
-        raise ValueError(
-            "terminal run has unauthorized write paths: "
-            + ", ".join(unauthorized)
-            + f" (violation: {violation_path})"
-        )
+        ):
+            # 証跡: violation ファイルの dismissed_at は既に dismiss_violation() が書いており、
+            # 今回の pass を示す追記は不要（ファイルはそのまま残る）。
+            pass
+        else:
+            violation_path = _write_unauthorized_write_violation(
+                repo_root,
+                orchestration_id,
+                agent_run_id=run_id,
+                actor_role=actor_role,
+                actual_changed_paths=actual_changed_paths,
+                unauthorized_paths=unauthorized,
+                output_refs=output_refs,
+                gate_changed_paths=gate_changed_paths,
+                missing_from_gate_changed_paths=missing_from_gate_changed_paths,
+                write_roots=write_roots,
+                manifest_file_tool_paths=sorted(manifest_file_tool_paths) if manifest_file_tool_paths else None,
+                directory_authorized_paths=directory_authorized if directory_authorized else None,
+            )
+            if actor_role in {"step", "substep"}:
+                # Cleanup runs AFTER violation is recorded so evidence is preserved for auditors.
+                _cleanup_empty_file_pin_stubs(repo_root, orchestration_id, agent_run_id=run_id)
+                _cleanup_agent_tmp_root(repo_root, orchestration_id, agent_run_id=run_id)
+            raise ValueError(
+                "terminal run has unauthorized write paths: "
+                + ", ".join(unauthorized)
+                + f" (violation: {violation_path})"
+            )
     if actor_role in {"step", "substep"}:
         # Success path: clean up any stubs the agent never wrote to.
         # NEW-M2: tmp cleanup is DEFERRED to the post-lock end-of-function
@@ -6925,6 +7135,13 @@ def _launch_prompt_template_path() -> Path:
 
 @lru_cache(maxsize=1)
 def _load_launch_prompt_templates() -> dict[str, str]:
+    """launch_prompts.md からテンプレートと共有 boilerplate を読み込む。
+
+    Returns:
+        dict with keys "step agent", "substep agent", and "common boilerplate".
+        "step agent" / "substep agent" の値は `{{COMMON_BOILERPLATE}}` プレースホルダを含む。
+        "common boilerplate" の値は `{{ACTOR_ROLE}}` プレースホルダを含む。
+    """
     text = _launch_prompt_template_path().read_text(encoding="utf-8")
     pattern = re.compile(
         r"## `(?P<name>step agent|substep agent)` 起動要求テンプレート\s+```text\n(?P<body>.*?)\n```",
@@ -6935,6 +7152,18 @@ def _load_launch_prompt_templates() -> dict[str, str]:
         templates[match.group("name")] = match.group("body")
     if set(templates) != {"step agent", "substep agent"}:
         raise RuntimeError("launch prompt templates must define step agent and substep agent")
+    # Extract the shared boilerplate section (## 共通 agent contract boilerplate).
+    shared_pattern = re.compile(
+        r"## 共通 agent contract boilerplate\b.*?```text\n(?P<body>.*?)\n```",
+        re.DOTALL,
+    )
+    shared_match = shared_pattern.search(text)
+    if shared_match is None:
+        raise RuntimeError(
+            "launch_prompts.md must define '## 共通 agent contract boilerplate' "
+            "with a ```text block for {{COMMON_BOILERPLATE}} expansion"
+        )
+    templates["common boilerplate"] = shared_match.group("body")
     return templates
 
 
@@ -6988,8 +7217,23 @@ def _template_placeholder_values(request_payload: dict[str, Any]) -> dict[str, s
 
 
 def _render_launch_prompt_template(request_payload: dict[str, Any]) -> str:
-    template = _load_launch_prompt_templates()[_launch_prompt_template_name(request_payload)]
-    rendered = template
+    """launch prompt テンプレートをレンダリングする。
+
+    展開順序:
+    1. テンプレート名を決定 (step / substep)
+    2. 共有 boilerplate の `{{ACTOR_ROLE}}` を role 文字列で置換
+    3. テンプレート本文の `{{COMMON_BOILERPLATE}}` を展開済み boilerplate で置換
+    4. `<key>` プレースホルダを request_payload の値で置換
+    """
+    templates = _load_launch_prompt_templates()
+    template_name = _launch_prompt_template_name(request_payload)
+    template = templates[template_name]
+    # Resolve actor_role for the common boilerplate's {{ACTOR_ROLE}} placeholder.
+    actor_role = "substep" if template_name == "substep agent" else "step"
+    common_boilerplate = templates["common boilerplate"].replace("{{ACTOR_ROLE}}", actor_role)
+    # Expand {{COMMON_BOILERPLATE}} in the template.
+    rendered = template.replace("{{COMMON_BOILERPLATE}}", common_boilerplate)
+    # Apply <key> placeholder substitutions from the request payload.
     for key, value in _template_placeholder_values(request_payload).items():
         rendered = rendered.replace(f"<{key}>", value)
     return rendered
@@ -8468,7 +8712,29 @@ def _validate_launch_request_payload(request_payload: dict[str, Any]) -> None:
         and isinstance(substep, str)
         and substep.strip().lower() == "verify"
     )
+    # Validate source_id format for any generate-step launch (both generate and
+    # verify substeps).  The orchestration agent must supply source_id in the
+    # launch request when step=generate; validate format here so a mis-formatted
+    # source_id (e.g. using the ir_id slug format instead of `src_YYYYMMDD_seq3`)
+    # is rejected before the child agent runs, rather than discovered later by
+    # generate.verify after a full substep execution.
+    if isinstance(step, str) and step.strip().lower() == "generate":
+        gen_id = request_payload.get("source_id")
+        if not isinstance(gen_id, str) or not gen_id.strip():
+            raise ValueError(
+                "generate step launch request must include non-empty source_id "
+                "(format: src_<YYYYMMDD>_<seq3>, e.g. src_20260511_001)"
+            )
+        if not _SOURCE_ID_RE.match(gen_id.strip()):
+            raise ValueError(
+                f"generate step launch request source_id={gen_id!r} does not match "
+                "required format src_<YYYYMMDD>_<seq3> (e.g. src_20260511_001). "
+                "source_id must start with literal 'src_' prefix followed by 8-digit "
+                "date and 3-digit sequence; do not reuse the ir_id / pipeline_id slug format."
+            )
     if is_verify_substep and isinstance(step, str) and step.strip().lower() == "generate":
+        # source_id presence and format already validated above; keep this branch
+        # for the additional non-empty guard that predates the format check.
         gen_id = request_payload.get("source_id")
         if not isinstance(gen_id, str) or not gen_id.strip():
             raise ValueError("generate verify launch request must include non-empty source_id")
@@ -9894,6 +10160,75 @@ def _probe_help_fallback_backend(
     return checks, features, multi_agent_enabled, version_proc.stdout.strip()
 
 
+def _probe_claude_backend(
+    backend_token: str,
+    command: str,
+    runner: Callable[..., subprocess.CompletedProcess[str]],
+) -> tuple[list[dict[str, Any]], dict[str, bool], bool, str]:
+    """claude バックエンド専用プローブ。
+
+    `claude features list` は Claude Code CLI に存在しないサブコマンドであり、
+    実行すると claude がチャット応答をそのまま stdout に返す（exit 0）。
+    この応答が `features_list_available.detail` に混入し preflight.json を汚染する
+    (orch_20260610T130256Z_ebe96a51 で観測)。
+
+    修正: claude backend では `features list` を実行せず advisory 扱いとし、
+    `--help` の liveness probe を multi_agent の best-effort 検出に使う。
+    Claude Code の子 agent は CLI subcommand ではなく `Agent` tool で起動するため
+    `--help` 出力に `agents` subcommand は現れない（旧 docstring の主張は誤り）。
+    本 probe は (a) `--help` が exit 0 で (b) stdout に help テキストを返すことを要求し、
+    `claude` を騙る空出力バイナリの false-pass を防ぐ。`multi_agent` の authoritative gate は
+    `record_launch` の launch-time live preflight 側に残る。
+    """
+    version_proc = runner([command, "--version"], text=True, capture_output=True, check=False)
+    # Skip `features list` for claude: the subcommand does not exist in Claude Code CLI
+    # and would result in a full chat session response being captured as the probe output,
+    # contaminating preflight.json with assistant text.  Mark as advisory (pass=None).
+    features_list_pass: bool | None = None
+    features_list_detail = (
+        "skipped for claude backend: 'claude features list' is not a structured CLI "
+        "subcommand; Claude Code responds with a chat reply which is not machine-parseable. "
+        "multi_agent detection uses --help probe instead."
+    )
+
+    help_proc = runner([command, "--help"], text=True, capture_output=True, check=False)
+    help_stdout = help_proc.stdout.strip()
+    # P2-C: require BOTH exit 0 AND non-empty help stdout.  Exit-code alone is a
+    # weak proxy — any binary named `claude` that exits 0 (even with no output)
+    # would otherwise pass.  Requiring help text on stdout rules out broken or
+    # substitute binaries.  This is still a best-effort liveness signal; the
+    # authoritative multi_agent gate is the launch-time live preflight.
+    multi_agent_enabled = help_proc.returncode == 0 and bool(help_stdout)
+    features: dict[str, bool] = {"multi_agent": multi_agent_enabled}
+    help_probe_pass = multi_agent_enabled
+    help_detail = help_stdout or help_proc.stderr.strip()
+    help_probe_detail = help_detail if help_detail else "(no stdout/stderr from --help)"
+
+    checks = [
+        {
+            "name": f"{backend_token}_version_available",
+            "pass": version_proc.returncode == 0,
+            "detail": version_proc.stdout.strip() or version_proc.stderr.strip(),
+        },
+        {
+            "name": f"{backend_token}_features_list_available",
+            "pass": features_list_pass,
+            "detail": features_list_detail,
+        },
+        {
+            "name": f"{backend_token}_help_probe_available",
+            "pass": help_probe_pass,
+            "detail": help_probe_detail,
+        },
+        {
+            "name": "multi_agent_enabled",
+            "pass": multi_agent_enabled,
+            "detail": f"multi_agent={features.get('multi_agent')}",
+        },
+    ]
+    return checks, features, multi_agent_enabled, version_proc.stdout.strip()
+
+
 _BACKEND_PROBERS: dict[
     str,
     Callable[
@@ -9903,7 +10238,7 @@ _BACKEND_PROBERS: dict[
 ] = {
     "codex": _probe_codex_backend,
     "cursor": _probe_help_fallback_backend,
-    "claude": _probe_help_fallback_backend,
+    "claude": _probe_claude_backend,
 }
 
 
@@ -10510,6 +10845,57 @@ def init_orchestration(
         )
     meta["orchestration_agent_run_id"] = orchestration_agent_run_id
     _write_json(meta_path, meta)
+    # Operator token: written once at init to ~/.met-dsl/operator_tokens/<oid>.txt
+    # (mode 0o600), never overwritten on resume so the same token remains valid
+    # across restarts.  Stored OUTSIDE workspace/ so the orchestration agent's
+    # allowed_read_roots (which include workspace/) cannot reach it via the Read
+    # tool, and forbid_operator_secret_direct_read blocks `cat ~/.met-dsl/...` via
+    # Bash.  dismiss-violation requires this token to prevent agents from calling
+    # the function programmatically (e.g. from a tmp Python script) to self-approve
+    # their own unauthorized_write_violations.
+    operator_token_path = Path.home() / ".met-dsl" / "operator_tokens" / f"{orchestration_id}.txt"
+    operator_token_path.parent.mkdir(parents=True, exist_ok=True)
+    # Restrict the directory to the owner so other local users on a shared host
+    # cannot enumerate or read operator tokens.
+    try:
+        operator_token_path.parent.chmod(0o700)
+    except OSError:
+        pass
+    # Create the token atomically with mode 0o600.  Keep a VALID existing token
+    # unchanged (so the same token survives across resume), but REPAIR a 0-byte
+    # or whitespace-only file left by a crash mid-write — otherwise that broken
+    # token is permanent and (combined with the dismiss_violation guard) would
+    # be a self-approval hole.  temp-file + os.replace makes the write atomic:
+    # the file is either absent or fully populated, never a 0-byte window, and
+    # mode 0o600 avoids the umask-default (0o644) world-readable window that
+    # write_text()-then-chmod() would leave.
+    _existing_token = ""
+    if operator_token_path.exists():
+        try:
+            _existing_token = operator_token_path.read_text(encoding="utf-8").strip()
+        except OSError:
+            _existing_token = ""
+    if not _existing_token:
+        _tok_fd, _tok_tmp = tempfile.mkstemp(
+            dir=str(operator_token_path.parent), prefix=".operator_token."
+        )
+        try:
+            os.fchmod(_tok_fd, 0o600)
+            os.write(_tok_fd, str(uuid.uuid4()).encode("utf-8"))
+            os.close(_tok_fd)
+            os.replace(_tok_tmp, operator_token_path)
+        except OSError:
+            # Do not leave a .operator_token.* temp file (holding an unused UUID)
+            # littering the dir on failure between mkstemp and replace.
+            try:
+                os.close(_tok_fd)
+            except OSError:
+                pass
+            try:
+                os.unlink(_tok_tmp)
+            except OSError:
+                pass
+            raise
     _write_read_access_manifest(
         repo_root,
         orchestration_id=orchestration_id,
@@ -13419,6 +13805,42 @@ def main(argv: list[str] | None = None) -> int:
         ),
     )
 
+    dismiss_viol_parser = subparsers.add_parser(
+        "dismiss-violation",
+        help=(
+            "Operator approval gate: mark an unauthorized_write_violation as "
+            "intentional / benign so record-agent-run can proceed past the "
+            "terminal validation guard on retry."
+        ),
+    )
+    dismiss_viol_parser.add_argument("--repo-root", required=True)
+    dismiss_viol_parser.add_argument("--orchestration-id", required=True)
+    dismiss_viol_parser.add_argument(
+        "--agent-run-id",
+        required=True,
+        help="agent_run_id of the failing run whose violation is to be dismissed",
+    )
+    dismiss_viol_parser.add_argument(
+        "--dismiss-reason",
+        required=True,
+        help="Free-form explanation stored in violation JSON (e.g. 'tools/__pycache__ is gitignored Python bytecode')",
+    )
+    dismiss_viol_parser.add_argument(
+        "--operator-token",
+        required=True,
+        help=(
+            "Content of ~/.met-dsl/operator_tokens/<oid>.txt. "
+            "Read with: cat ~/.met-dsl/operator_tokens/<oid>.txt"
+        ),
+    )
+    dismiss_viol_parser.add_argument(
+        "--paths",
+        nargs="+",
+        required=True,
+        metavar="PATH",
+        help="Repo-root-relative paths to dismiss (must be subset of violation's unauthorized_paths)",
+    )
+
     args = parser.parse_args(argv)
     repo_root = Path(getattr(args, "repo_root")).resolve()
 
@@ -13839,6 +14261,19 @@ def main(argv: list[str] | None = None) -> int:
             orchestration_id=args.orchestration_id,
             agent_model=args.agent_model,
         )
+    elif args.command == "dismiss-violation":
+        try:
+            result = dismiss_violation(
+                repo_root,
+                args.orchestration_id,
+                agent_run_id=args.agent_run_id,
+                dismiss_reason=args.dismiss_reason,
+                paths=args.paths,
+                operator_token=args.operator_token,
+            )
+        except (ValueError, FileNotFoundError) as exc:
+            print(f"dismiss-violation: {exc}", file=sys.stderr)
+            return 1
     elif args.command == "set-status":
         result = update_orchestration_status(
             repo_root=repo_root,

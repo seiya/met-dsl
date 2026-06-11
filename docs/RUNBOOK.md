@@ -223,6 +223,41 @@ workflow 実行中に hook がブロックした場合、`reason` と `audit_det
 | `forbid_git_reset_hard` | `git reset --hard` を実行しようとした | `git restore <file>` または `git checkout <file>` で個別ファイルを戻す |
 | `capability_invalid_empty_write_roots` | `write_roots=[]` の capability で書き込もうとした | `record-launch` の `--request-json` に `allowed_output_paths` が正しく設定されているか確認する |
 
+## unauthorized_write_violation の dismiss {#dismiss-violation-recovery}
+
+`record-agent-run` が `terminal run has unauthorized write paths: ...` で fail する場合、以下の手順で operator が良性 violation を承認（dismiss）して再試行できる。
+
+**典型的な発生原因（良性）**
+
+- `tools/__pycache__/*.pyc` — git-ignored Python bytecode（Fix 1b の snapshot ignore でほぼ消えるが既存 pyc が残っている場合の保険）
+- MCP server が生成した audit log が `manifest_integrity_protected_logs` に含まれていなかった
+
+**回復手順**
+
+1. violation の unauthorized_paths を確認する。
+   ```
+   cat workspace/orchestrations/<orch_id>/violations/<arid>.unauthorized_write_violation.json
+   ```
+2. 良性パスのみを dismiss する（`--paths` は violation の `unauthorized_paths` の部分集合として照合される）。
+   ```bash
+   python3 tools/orchestration_runtime.py dismiss-violation \
+     --repo-root . \
+     --orchestration-id <orch_id> \
+     --agent-run-id <arid> \
+     --dismiss-reason "tools/__pycache__ は gitignore 済み Python bytecode であり無害" \
+     --operator-token "$(cat ~/.met-dsl/operator_tokens/<orch_id>.txt)" \
+     --paths tools/__pycache__/orchestration_runtime.cpython-313.pyc
+   ```
+   operator token は orchestration init 時に `~/.met-dsl/operator_tokens/<orch_id>.txt` へ自動生成される。`workspace/` 配下ではないため agent からは読み取れず、operator のみが参照できる。
+3. 同一 `agent_run_id` で `record-agent-run` を再実行する。検出された unauthorized_paths が `dismissed_paths` の部分集合（= dismissed_paths が unauthorized_paths を包含）であれば terminal validation を通過する。違反パスを一部しか dismiss していない場合は再実行が再度 fail するため、未 dismiss の違反パスが残っていないか確認すること。
+
+**注意**
+
+- dismiss-violation は operator の明示的承認を記録するための safety gate であり、自動化スクリプトで呼ばないこと。
+- 新規パスを後から追加 dismiss する場合は同じコマンドを再実行する（`dismissed_paths` が上書きされる）。
+- dismiss 済み violation に対し、後続の再検出が **dismiss 対象外の新規 unauthorized path** を含む場合、violation file は再生成され terminal validation は再 fail する。このとき従前の operator 承認は失われず、`prior_dismissals[]`（`dismissed_at` / `dismiss_reason` / `dismissed_paths` / `superseded_at`）として履歴に保全される（監査証跡の連続性確保）。
+- Fix 1a（`PYTHONDONTWRITEBYTECODE=1` 環境変数）が適用されていれば `.pyc` violation 自体が発生しないため、通常この手順は不要。
+
 ## duplicate agent_run_id recovery {#duplicate-agent_run_id-recovery}
 
 `record-agent-run` を **同一 `agent_run_id`** で 2 回 invoke すると `ValueError: duplicate agent_run_id: <id>` を raise する。idempotent ではない hard error として設計されており、同じ `agent_run_id` を後から更新／upsert する経路は無い。

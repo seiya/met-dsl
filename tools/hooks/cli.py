@@ -965,6 +965,7 @@ def _evaluate_pre_command_file_access_policy(
                 resolved_run_id,
                 decoded.file_path,
                 agent_role=agent_role,
+                session_id=decoded.session_id,
             )
         # Write / Edit: manifest 一致時は permissionDecision=allow を返して harness の
         # permission prompt を bypass する。manifest 不一致は BLOCK のまま伝播する。

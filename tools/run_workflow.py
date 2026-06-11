@@ -1032,6 +1032,16 @@ def main(argv: list[str] | None = None) -> int:
     env["METDSL_WORKFLOW_EXEC_MODE"] = workflow_mode
     env["METDSL_MISSING_ORCHESTRATION_ID_POLICY"] = "strict"
     env["PYTHONPATH"] = str(repo_root) + (f":{env['PYTHONPATH']}" if env.get("PYTHONPATH") else "")
+    # Prevent Python from writing *.pyc / __pycache__ bytecode under tools/.
+    # Without this, any `python3 tools/orchestration_runtime.py` call made by
+    # the orchestration agent (or child subprocesses) generates
+    # tools/__pycache__/orchestration_runtime.cpython-<ver>.pyc, which is not
+    # in any agent's output_manifest and triggers unauthorized_write_violation
+    # at record-agent-run terminal validation.  Setting this in the shared env
+    # dict ensures it propagates to: (a) _runtime_command() subprocesses,
+    # (b) the orchestration agent launch subprocess, and (c) any grandchild
+    # `python3 tools/...` invocations the agent makes.
+    env.setdefault("PYTHONDONTWRITEBYTECODE", "1")
 
     try:
         if resume_mode:

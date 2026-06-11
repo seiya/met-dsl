@@ -62,7 +62,7 @@ Generate ステージ出力の検証責務を固定し、`Build` 失敗を事前
 ## 運用ルール
 1. 検査結果に基づき `source_meta.json` の `verification_status` を更新する。
 2. `fail` の場合は `last_fail_reason` に規約違反内容と修正対象を記録する。`Validate` retry を起点とする場合は `source_meta.json` の `attribution_hint` に `code` を必須記録する（routing 整合）。
-3. `verification_status=fail` の場合は regenerate を要求し、同一 `ir_id` で新しい `source_id` を発行する。
+3. `verification_status=fail` の場合は regenerate を要求し、同一 `ir_id` で新しい `source_id` を発行する。`source_id` の形式は `src_<YYYYMMDD>_<seq3>`（例: `src_20260511_001`）とする。canonical: `docs/workflow/phases/phase_02_generate.md`。`ir_id` の `<slug>_<YYYYMMDD>_<seq3>` 形式を流用してはならない。
 4. `verification_status=pass` の場合のみ `Build` を開始する。
 5. workflow 実行開始前に `workspace/` が存在しない場合、リポジトリルート直下へ `workspace/` を作成する。
 6. 開始前と完了前に `python3 tools/validate_workspace_root.py` を実行し、`fail` 時は `Generate fail` とする。
