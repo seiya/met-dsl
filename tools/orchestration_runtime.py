@@ -6170,6 +6170,13 @@ def _cleanup_agent_tmp_root(
         except OSError:
             return False
         # Successful rmtree (or post-rmtree absence). Confirm directory is gone.
+        # NOTE: the `<arid>.lock` fcntl sidecar is intentionally NOT unlinked
+        # here. It is the very primitive serializing this scan + rmtree against
+        # a concurrent cleanup; deleting it would let a waiter proceed on the
+        # orphaned inode while a new entrant O_CREATs a fresh inode and locks
+        # it without contention, breaking serialization. The sidecar is a
+        # 0-byte benign file that `validate_workspace_root` tolerates, so it is
+        # left in place (bounded accumulation under session-scoped scratch).
         return not target.exists()
 
 

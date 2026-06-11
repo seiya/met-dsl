@@ -891,6 +891,24 @@ def _scan_workspace_for_forbidden_scripts(workspace_root: Path) -> list[str]:
     return violations
 
 
+def _is_empty_regular_file(path: Path) -> bool:
+    """Return True iff `path` is a real, empty, regular file (not a symlink).
+
+    Used to narrow the workspace/tmp/<arid>.lock exemption to exactly the
+    0-byte fcntl sidecar the runtime produces. A symlink (even one named
+    <arid>.lock) or any non-empty / non-regular entry must NOT be exempted —
+    otherwise arbitrary content could be smuggled under workspace/tmp/ past the
+    layout gate. Uses lstat() so a symlink is judged by the link itself, never
+    its target.
+    """
+    try:
+        st = path.lstat()
+    except OSError:
+        return False
+    import stat as _stat
+    return _stat.S_ISREG(st.st_mode) and st.st_size == 0
+
+
 def _scan_workspace_layout(workspace_root: Path) -> list[str]:
     violations: list[str] = []
     for child in sorted(workspace_root.iterdir()):
@@ -906,6 +924,20 @@ def _scan_workspace_layout(workspace_root: Path) -> list[str]:
     if tmp_root.exists() and tmp_root.is_dir():
         for child in sorted(tmp_root.iterdir()):
             if not child.is_dir():
+                # Runtime-managed fcntl cleanup sidecar (orchestration_runtime.py
+                # _cleanup_agent_tmp_root locks workspace/tmp/<arid>.lock; the
+                # unauthorized-write guard already exempts it at :6586-6591).
+                # The sidecar persists by design (it is the serialization
+                # primitive and is never unlinked) — tolerate it so a residual
+                # one does not dead-lock the gate for sibling verify/judge
+                # substeps. Narrow the exemption to exactly what the runtime
+                # produces: a valid <arid>.lock name AND a real, empty, regular
+                # file (NOT a symlink, NOT non-empty). Anything else — arbitrary
+                # content, a symlink redirect, a fifo/socket — is still flagged.
+                if child.name.endswith(".lock"):
+                    stem = child.name[: -len(".lock")]
+                    if stem and AGENT_RUN_ID_PATTERN.match(stem) and _is_empty_regular_file(child):
+                        continue
                 violations.append(
                     f"{child}: non-directory entry directly under workspace/tmp/ is not allowed"
                 )

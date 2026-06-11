@@ -18030,7 +18030,11 @@ class TmpCleanupLockTests(unittest.TestCase):
     against concurrent cleanup attempts."""
 
     def test_cleanup_creates_lock_sidecar(self) -> None:
-        """Smoke: `_cleanup_agent_tmp_root` creates the lock file."""
+        """Smoke: `_cleanup_agent_tmp_root` creates (and intentionally retains)
+        the fcntl lock file. The sidecar is the serialization primitive and is
+        deliberately never unlinked — deleting it would break serialization
+        against a concurrent cleanup. `validate_workspace_root` tolerates the
+        0-byte sidecar so its persistence does not fail the workspace gate."""
         from tools.orchestration_runtime import _cleanup_agent_tmp_root
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)

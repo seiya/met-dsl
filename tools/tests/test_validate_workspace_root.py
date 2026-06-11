@@ -1240,6 +1240,71 @@ class ValidateWorkspaceRootTests(unittest.TestCase):
                 any(str(misplaced) in v and "python script under workspace/ is forbidden" in v for v in violations)
             )
 
+    def test_tolerates_arid_lock_sentinel_directly_under_tmp(self) -> None:
+        """A residual runtime-managed fcntl sidecar workspace/tmp/<arid>.lock
+        (0-byte, left by _cleanup_agent_tmp_root after the <arid>/ dir is torn
+        down) must NOT be flagged as a non-directory entry — otherwise it
+        dead-locks the gate for sibling verify/judge substeps."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            lock = repo_root / "workspace" / "tmp" / "580e30de-1234-4abc-9def-0123456789ab.lock"
+            lock.parent.mkdir(parents=True, exist_ok=True)
+            lock.write_text("", encoding="utf-8")
+
+            violations, _ = validate(repo_root=repo_root, workspace_root="workspace")
+            self.assertFalse(
+                any(str(lock) in v for v in violations),
+                f"runtime-managed <arid>.lock sidecar must be tolerated: {violations}",
+            )
+
+    def test_still_rejects_malformed_non_directory_under_tmp(self) -> None:
+        """Tolerance is narrow: a non-.lock file, and a .lock with an invalid
+        agent_run_id stem, are still flagged as non-directory entries."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            note = repo_root / "workspace" / "tmp" / "note.txt"
+            bad_lock = repo_root / "workspace" / "tmp" / "bad name.lock"
+            note.parent.mkdir(parents=True, exist_ok=True)
+            note.write_text("", encoding="utf-8")
+            bad_lock.write_text("", encoding="utf-8")
+
+            violations, _ = validate(repo_root=repo_root, workspace_root="workspace")
+            self.assertTrue(
+                any(str(note) in v and "non-directory entry" in v for v in violations),
+                f"non-.lock file must still be flagged: {violations}",
+            )
+            self.assertTrue(
+                any(str(bad_lock) in v and "non-directory entry" in v for v in violations),
+                f".lock with invalid arid stem must still be flagged: {violations}",
+            )
+
+    def test_rejects_non_empty_and_symlink_lock_under_tmp(self) -> None:
+        """The exemption is for the runtime's 0-byte regular-file sidecar only.
+        A well-named <arid>.lock that is non-empty, or a symlink (which could
+        redirect content past the layout gate), must still be flagged."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            tmp_dir = repo_root / "workspace" / "tmp"
+            tmp_dir.mkdir(parents=True, exist_ok=True)
+            # Valid arid stem but NON-EMPTY content.
+            fat_lock = tmp_dir / "580e30de-1234-4abc-9def-0123456789ab.lock"
+            fat_lock.write_text("smuggled\n", encoding="utf-8")
+            # Valid arid stem but a SYMLINK (target irrelevant).
+            link_target = repo_root / "secret.txt"
+            link_target.write_text("x\n", encoding="utf-8")
+            sym_lock = tmp_dir / "a52c180c-9999-4fff-8aaa-bbbbccccdddd.lock"
+            sym_lock.symlink_to(link_target)
+
+            violations, _ = validate(repo_root=repo_root, workspace_root="workspace")
+            self.assertTrue(
+                any(str(fat_lock) in v and "non-directory entry" in v for v in violations),
+                f"non-empty <arid>.lock must still be flagged: {violations}",
+            )
+            self.assertTrue(
+                any(str(sym_lock) in v and "non-directory entry" in v for v in violations),
+                f"symlink <arid>.lock must still be flagged: {violations}",
+            )
+
     def test_detects_quality_check_script_under_workspace(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
