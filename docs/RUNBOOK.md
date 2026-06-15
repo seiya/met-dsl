@@ -159,6 +159,7 @@ python3 tools/run_workflow.py --resume build
 - `--orchestration-id` を省略した場合は `workspace/orchestrations/` 内で時系列最新（`orchestration_meta.json#started_at` 順）の orchestration を対象とする。ただし最新が非 terminal status（`running` 等）の場合は、実行中の並行 run へ誤接続して共有 `workspace/tmp/<arid>` を破壊する事故を避けるため `latest_orchestration_not_resumable` で停止する（その run を resume するには `--orchestration-id` を明示する）。
 - resume 時に `spec_ref` を明示 override した場合、override 後の `spec_ref` / `source_dependency_ref` は `orchestration_meta.json` へ反映される（次回の implicit resume が stale な旧値へ revert しないようにするため）。
 - 内部動作: `--resume` は `orchestration_runtime.py init --resume-from-checkpoint`（= `resume_enabled=true` 設定、`orchestration_agent_run_id` 保持、`phase_state` merge）を実行してから起動する。対象 orchestration が terminal status（`fail` / `fail_closed` / `pass` 等）で終端済みの場合、live status を `running` へ戻す（terminal → 他 status の遷移は `fail` → `fail_closed` を除き runtime が reject するため、reset しないと resume した agent が完了しても `pass` を記録できない）。reset 時、終端時の `reason_code` / `reason_detail` / `blocking_policy_scope` は `resumed_from_*` に退避し、`finished_at` / `detected_at` を除去する（履歴は `failure_analysis.json` と `phase_state_log.jsonl` に残る）。完了済み `step` の skip 判定は orchestration agent が `check-step-completed` で行う（SKILL.md 運用ルール 19）。`verify-checkpoint-integrity` で `stale` 検出された `step` は skip されず再実行される。
+- **並行 `claude` session の禁止（workflow 実行中）**: workflow 実行中は同一 project dir で別の `claude` session を起動しないこと。別 session の startup cleanup が走行中 workflow の `workspace/tmp/<orchestration_arid>/.../tasks/*.output` を削除し、Bash tool 出力が `output file ... could not be read (ENOENT) ... another Claude Code process ... deleted it during startup cleanup` で取得不能になる（実観測）。並行作業が必要な場合は `git worktree` で別 checkout に隔離して実行する。症状が出た場合は当該 Bash を再実行すれば回復する（artifact 自体は破損しない）。
 - legacy record の自動補修: `init --resume-from-checkpoint` は併せて `repair-agent-runs` を実行し、`agent_model` 必須化 + 自動 backfill 導入（commit `caa10ab`）**以前**に記録された `agent_runs.jsonl` の step/substep 行に欠落した `parent_agent_run_id` / `agent_model` を補完する。これらは append-only かつ duplicate `record-agent-run` も拒否されるため forward では復元できず、`Validate.judge` の `pre_judge` gate を恒久的に fail させ resume を不能にしていた。補修は既存 artifact から authoritative に導出する（`parent_agent_run_id`: substep は `step_result.json#executor_agent_run_id`、step は `orchestration_meta.json#orchestration_agent_run_id` を `agent_graph.json` の child→parent edge と cross-check; `agent_model`: 同 orchestration の uniform な非空値を採用）。既存非空値は上書きせず、補修行に provenance を付与し `record_repairs.jsonl` に監査ログを残す。idempotent。`agent_model` が auto 導出できない場合（sibling に非空値が無い / 複数値が混在）は補修結果が `needs_manual` となり resume はそのまま続行（後段で gate が落ちる）するため、operator が `python3 tools/orchestration_runtime.py repair-agent-runs --repo-root . --orchestration-id <id> --agent-model <model_id>` を明示実行してから再 resume する。
 - `Build` 失敗は決定的処理のため Build を内部 retry せず `Generate` へ戻す（本表 §3）。Build step は checkpoint 上「未完了」のままとなり、resume 時に Generate から再実行される。
 
@@ -265,14 +266,14 @@ workflow 実行中に hook がブロックした場合、`reason` と `audit_det
 **典型的な発生原因**
 
 - 既に `agent_runs.jsonl` へ append 済みの child agent_run について retry を試みた
-- orchestration agent 自身の entry を terminal で再 append しようとした（orchestration の終端は `set-status` 経由が canonical で、`record-agent-run` を 2 回目に呼ぶ経路は存在しない）
+- orchestration agent 自身の entry を terminal で再 append しようとした（orchestration の終端は `set-status` 経由が canonical で、`record-agent-run` を 2 回目に呼ぶ経路は存在しない）。**`set-status` が terminal status を書く際に `agent_runs.jsonl` の orchestration 行（`status:running`）を自動で in-place 終端化する**ため、orchestration 行を手動で append/更新する必要はない（`record-agent-run` で再 append すると本エラーになる）。
 
 **回復手順**
 
 1. `python3 tools/new_agent_run_id.py` で新しい `agent_run_id` を採番する。
 2. `python3 tools/orchestration_runtime.py reserve-phase-root --orchestration-id <oid> --agent-run-id <new_arid> --node-key <node_key> --step <step>` で `ir_id` / `pipeline_id` を新規予約する（旧 `agent_run_id` が予約済みの場合は予約の reuse 可否を operator に確認）。
 3. `record-launch` → `Agent` tool 起動 → `record-child-return` → `deactivate-child` → `record-reply` → `record-agent-run` の正規 sequence を新 `agent_run_id` で再実行する（CLAUDE.md の手順 1–9 を参照）。
-4. orchestration 自体を終端させる場合は `set-status --status fail_closed --reason-code <code> --reason-detail <detail>` を呼ぶ。`agent_runs.jsonl` の orchestration 行を更新しないこと。
+4. orchestration 自体を終端させる場合は `set-status --status fail_closed --reason-code <code> --reason-detail <detail>` を呼ぶ。`agent_runs.jsonl` の orchestration 行は `set-status` が自動で in-place 終端化するため、手動で更新しないこと。
 
 詳細な CLI 規約は [docs/CLI_REFERENCE.md#record-agent-run](CLI_REFERENCE.md#record-agent-run) を canonical source とする。
 
@@ -287,14 +288,20 @@ workflow 実行中に hook がブロックした場合、`reason` と `audit_det
 3. `record-timeout --agent-run-id <arid> --reason ...`: 終端 entry を記録。
 
 ```bash
-# return-token は $(cat ...) をインライン引数として渡す。VAR=$(cat ...) の 2-step
-# shell var 形式は先頭 `VAR=` が `Bash(python3 ...)` allowlist 一致を壊し session
-# approval を要求するため使用しない。
+# return-token は二段方式で渡す（CLAUDE.md 手順 6a→6b と同じ）。
+# 手順 6a: token を単独 cat で印字する（allowlist `Bash(cat workspace/orchestrations/*)`
+#          に一致し approval 不要）。$(cat ...) command substitution 形式は Bash tool の
+#          静的解析が `Contains shell syntax ... cannot be statically analyzed` で reject
+#          するため使わない。VAR=$(cat ...) の 2-step shell var 形式も allowlist 一致を
+#          壊すため使わない。
+cat workspace/orchestrations/<orchestration_id>/launches/<child_agent_run_id>.parent_return_token
+
+# 手順 6b: 上で印字された token を literal 文字列として埋め込む。
 python3 tools/orchestration_runtime.py record-child-return \
   --repo-root . \
   --orchestration-id <orchestration_id> \
   --agent-run-id <child_agent_run_id> \
-  --return-token "$(cat workspace/orchestrations/<orchestration_id>/launches/<child_agent_run_id>.parent_return_token)"
+  --return-token "<literal token>"
 
 python3 tools/orchestration_runtime.py deactivate-child \
   --repo-root . \

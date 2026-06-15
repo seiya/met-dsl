@@ -2655,6 +2655,308 @@ shell_tool                       stable             true
         self.assertIn(in_phase_log, out)
         self.assertNotIn(cross_log, out)
 
+    def test_validate_execute_auto_injects_snapshot_schema(self) -> None:
+        """Validate.execute launches must auto-inject the canonical
+        raw/state_snapshots/snapshot_schema.json so an executor that writes it
+        is not rejected by post_execute / restarted (P3)."""
+        from tools.orchestration_runtime import _allowed_output_paths_for_launch
+
+        node_safe = "problem__shallow_water2d__0.3.0"
+        run_id = "run_20260201_002"
+        run_dir = f"{_FIX_PIPE_REF}/runs/{run_id}/{node_safe}"
+        req = {
+            "agent_role": "substep",
+            "node_key": "problem/shallow_water2d@0.3.0",
+            "step": "validate", "substep": "execute",
+            "ir_ref": _FIX_IR_REF,
+            "pipeline_ref": _FIX_PIPE_REF,
+            "run_id": run_id,
+            "allowed_output_paths": [
+                f"{run_dir}/diagnostics.json",
+                f"{run_dir}/perf.json",
+                f"{run_dir}/quality_check.json",
+            ],
+        }
+        out = _allowed_output_paths_for_launch(
+            request_payload=req,
+            write_roots=[f"{_FIX_PIPE_REF}/runs/"],
+        )
+        expected = f"{run_dir}/raw/state_snapshots/snapshot_schema.json"
+        self.assertIn(expected, out)
+        # Idempotent: pre-listing it must not duplicate.
+        req2 = dict(req)
+        req2["allowed_output_paths"] = req["allowed_output_paths"] + [expected]
+        out2 = _allowed_output_paths_for_launch(
+            request_payload=req2,
+            write_roots=[f"{_FIX_PIPE_REF}/runs/"],
+        )
+        self.assertEqual([p for p in out2 if p == expected], [expected])
+
+    def test_validate_judge_does_not_inject_snapshot_schema(self) -> None:
+        """The judge substep writes no raw/ evidence and its phase contract
+        rejects raw/ paths; the snapshot schema must NOT be injected there
+        (injecting would make _matches_phase_contract raise) (P3)."""
+        from tools.orchestration_runtime import _allowed_output_paths_for_launch
+
+        node_safe = "problem__shallow_water2d__0.3.0"
+        run_id = "run_20260201_003"
+        run_dir = f"{_FIX_PIPE_REF}/runs/{run_id}/{node_safe}"
+        req = {
+            "agent_role": "substep",
+            "node_key": "problem/shallow_water2d@0.3.0",
+            "step": "validate", "substep": "judge",
+            "ir_ref": _FIX_IR_REF,
+            "pipeline_ref": _FIX_PIPE_REF,
+            "run_id": run_id,
+            "allowed_output_paths": [
+                f"{run_dir}/aggregate_verdict.json",
+            ],
+        }
+        out = _allowed_output_paths_for_launch(
+            request_payload=req,
+            write_roots=[f"{_FIX_PIPE_REF}/runs/"],
+        )
+        for p in out:
+            self.assertFalse(
+                p.endswith("snapshot_schema.json"),
+                f"unexpected snapshot_schema inject for judge: {p}",
+            )
+
+    def test_required_child_agent_kind_lists_valid_steps_on_unknown(self) -> None:
+        """An unsupported step must raise a ValueError that enumerates the valid
+        steps rather than a bare message (P5)."""
+        from tools.orchestration_runtime import _required_child_agent_kind
+
+        with self.assertRaisesRegex(
+            ValueError,
+            r"unsupported workflow step 'plan'.*valid steps.*compile.*validate",
+        ):
+            _required_child_agent_kind("plan")
+
+    def test_finalize_orchestration_run_row_transitions_running(self) -> None:
+        """The orchestration's own agent_runs row (status:running) must be
+        terminalized in place on set-status so audits don't see it stuck
+        running; child rows are untouched and the op is idempotent (P1)."""
+        from tools.orchestration_runtime import _finalize_orchestration_run_row
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            oid = "orch_finalize_001"
+            root = repo_root / "workspace" / "orchestrations" / oid
+            root.mkdir(parents=True)
+            orch_arid = "0a5b035a-3b8c-4d9d-9dc0-19595759e542"
+            (root / "orchestration_meta.json").write_text(
+                json.dumps({
+                    "orchestration_id": oid,
+                    "status": "pass",
+                    "orchestration_agent_run_id": orch_arid,
+                }),
+                encoding="utf-8",
+            )
+            rows = [
+                {"agent_run_id": orch_arid, "agent_role": "orchestration",
+                 "agent_backend": "claude", "status": "running",
+                 "started_at": "2026-06-15T03:38:50Z"},
+                {"agent_run_id": "child-001", "agent_role": "substep",
+                 "status": "pass", "finished_at": "2026-06-15T03:48:51Z"},
+            ]
+            (root / "agent_runs.jsonl").write_text(
+                "\n".join(json.dumps(r) for r in rows) + "\n", encoding="utf-8"
+            )
+
+            changed = _finalize_orchestration_run_row(
+                repo_root, oid, status="pass", finished_at="2026-06-15T05:17:05Z"
+            )
+            self.assertTrue(changed)
+            after = [
+                json.loads(line)
+                for line in (root / "agent_runs.jsonl").read_text().splitlines()
+                if line.strip()
+            ]
+            orow = next(r for r in after if r["agent_run_id"] == orch_arid)
+            self.assertEqual(orow["status"], "pass")
+            self.assertEqual(orow["finished_at"], "2026-06-15T05:17:05Z")
+            crow = next(r for r in after if r["agent_run_id"] == "child-001")
+            self.assertEqual(crow["status"], "pass")
+            self.assertEqual(crow["finished_at"], "2026-06-15T03:48:51Z")
+
+            # Idempotent: re-run is a no-op and must not overwrite finished_at.
+            changed2 = _finalize_orchestration_run_row(
+                repo_root, oid, status="pass", finished_at="2026-06-15T06:00:00Z"
+            )
+            self.assertFalse(changed2)
+            orow2 = next(
+                json.loads(line)
+                for line in (root / "agent_runs.jsonl").read_text().splitlines()
+                if line.strip() and json.loads(line)["agent_run_id"] == orch_arid
+            )
+            self.assertEqual(orow2["finished_at"], "2026-06-15T05:17:05Z")
+
+    def test_set_status_terminalizes_orchestration_run_row(self) -> None:
+        """End-to-end: update_orchestration_status(fail_closed) flips the
+        orchestration's running agent_runs row to terminal (P1)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            oid = "orch_setstatus_term_001"
+            init_orchestration(repo_root=repo_root, orchestration_id=oid)
+            root = repo_root / "workspace" / "orchestrations" / oid
+            meta = json.loads(
+                (root / "orchestration_meta.json").read_text(encoding="utf-8")
+            )
+            orch_arid = meta["orchestration_agent_run_id"]
+
+            def _orch_row() -> dict:
+                for line in (root / "agent_runs.jsonl").read_text().splitlines():
+                    if not line.strip():
+                        continue
+                    obj = json.loads(line)
+                    if obj.get("agent_run_id") == orch_arid:
+                        return obj
+                raise AssertionError("orchestration row missing")
+
+            self.assertEqual(_orch_row()["status"], "running")
+            update_orchestration_status(
+                repo_root=repo_root,
+                orchestration_id=oid,
+                status="fail_closed",
+                reason_code="sandbox_enforcement_violation",
+                reason_detail="test",
+            )
+            row = _orch_row()
+            self.assertEqual(row["status"], "fail_closed")
+            self.assertIn("finished_at", row)
+
+    def test_set_status_fail_then_fail_closed_updates_run_row(self) -> None:
+        """The permitted fail -> fail_closed promotion must carry the orchestration
+        agent_runs row forward too (the row is already `fail`, not `running`, when
+        the second set-status runs) so it matches orchestration_meta.status (P1)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            oid = "orch_fail_promote_001"
+            init_orchestration(repo_root=repo_root, orchestration_id=oid)
+            root = repo_root / "workspace" / "orchestrations" / oid
+            orch_arid = json.loads(
+                (root / "orchestration_meta.json").read_text(encoding="utf-8")
+            )["orchestration_agent_run_id"]
+
+            def _orch_row() -> dict:
+                for line in (root / "agent_runs.jsonl").read_text().splitlines():
+                    if line.strip() and json.loads(line).get("agent_run_id") == orch_arid:
+                        return json.loads(line)
+                raise AssertionError("orchestration row missing")
+
+            update_orchestration_status(
+                repo_root=repo_root, orchestration_id=oid, status="fail",
+                reason_detail="first",
+            )
+            self.assertEqual(_orch_row()["status"], "fail")
+            update_orchestration_status(
+                repo_root=repo_root, orchestration_id=oid, status="fail_closed",
+                reason_code="sandbox_enforcement_violation", reason_detail="promote",
+            )
+            meta_status = json.loads(
+                (root / "orchestration_meta.json").read_text(encoding="utf-8")
+            )["status"]
+            self.assertEqual(meta_status, "fail_closed")
+            self.assertEqual(_orch_row()["status"], "fail_closed")
+            self.assertIn("finished_at", _orch_row())
+
+    def test_resume_reopens_terminalized_orchestration_run_row(self) -> None:
+        """Resuming a terminal orchestration must re-open its agent_runs row to
+        `running` (clearing finished_at), symmetric with the meta.status reset,
+        so a live resumed run never carries a stale terminal row that
+        validate_workspace_root would age out as cleanup-pending (P1 resume)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            oid = "orch_resume_reopen_001"
+            init_orchestration(repo_root=repo_root, orchestration_id=oid)
+            root = repo_root / "workspace" / "orchestrations" / oid
+            orch_arid = json.loads(
+                (root / "orchestration_meta.json").read_text(encoding="utf-8")
+            )["orchestration_agent_run_id"]
+
+            def _orch_row() -> dict:
+                for line in (root / "agent_runs.jsonl").read_text().splitlines():
+                    if line.strip() and json.loads(line).get("agent_run_id") == orch_arid:
+                        return json.loads(line)
+                raise AssertionError("orchestration row missing")
+
+            # First run terminalizes the row.
+            update_orchestration_status(
+                repo_root=repo_root,
+                orchestration_id=oid,
+                status="fail_closed",
+                reason_code="sandbox_enforcement_violation",
+                reason_detail="first run",
+            )
+            self.assertEqual(_orch_row()["status"], "fail_closed")
+            self.assertIn("finished_at", _orch_row())
+
+            # Resume must re-open the row to running and drop finished_at.
+            enable_checkpoint_resume(repo_root, oid)
+            reopened = _orch_row()
+            self.assertEqual(reopened["status"], "running")
+            self.assertNotIn("finished_at", reopened)
+
+            # The resumed run can re-terminalize it fresh (forward transition).
+            update_orchestration_status(
+                repo_root=repo_root,
+                orchestration_id=oid,
+                status="fail_closed",
+                reason_code="sandbox_enforcement_violation",
+                reason_detail="resumed run",
+            )
+            self.assertEqual(_orch_row()["status"], "fail_closed")
+            self.assertIn("finished_at", _orch_row())
+
+    def test_resume_row_reset_is_recoverable_on_interrupt(self) -> None:
+        """The agent_runs row reset runs BEFORE the meta is committed to `running`,
+        so an interrupted reset keeps meta terminal on disk; a retry re-enters the
+        terminal_reset branch and completes the reset rather than skipping it
+        permanently (P1 resume recoverability)."""
+        from unittest import mock
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            oid = "orch_resume_recover_001"
+            init_orchestration(repo_root=repo_root, orchestration_id=oid)
+            root = repo_root / "workspace" / "orchestrations" / oid
+            orch_arid = json.loads(
+                (root / "orchestration_meta.json").read_text(encoding="utf-8")
+            )["orchestration_agent_run_id"]
+
+            def _meta_status() -> str:
+                return json.loads(
+                    (root / "orchestration_meta.json").read_text(encoding="utf-8")
+                )["status"]
+
+            def _orch_row() -> dict:
+                for line in (root / "agent_runs.jsonl").read_text().splitlines():
+                    if line.strip() and json.loads(line).get("agent_run_id") == orch_arid:
+                        return json.loads(line)
+                raise AssertionError("orchestration row missing")
+
+            update_orchestration_status(
+                repo_root=repo_root, orchestration_id=oid, status="fail_closed",
+                reason_code="sandbox_enforcement_violation", reason_detail="x",
+            )
+
+            # Interrupt the reopen → meta must stay terminal on disk (not yet running).
+            with mock.patch(
+                "tools.orchestration_runtime._reopen_orchestration_run_row",
+                side_effect=RuntimeError("boom"),
+            ):
+                with self.assertRaises(RuntimeError):
+                    enable_checkpoint_resume(repo_root, oid)
+            self.assertEqual(_meta_status(), "fail_closed")
+            self.assertEqual(_orch_row()["status"], "fail_closed")
+
+            # Retry (no fault) re-enters terminal_reset and completes the reset.
+            enable_checkpoint_resume(repo_root, oid)
+            self.assertEqual(_meta_status(), "running")
+            self.assertEqual(_orch_row()["status"], "running")
+            self.assertNotIn("finished_at", _orch_row())
+
     def test_build_launch_rejects_cross_phase_log_for_failed_generation(self) -> None:
         """Build cross-phase log authorization mirrors execute: failed/stale
         generation must be rejected at record_launch (verification_status=fail)

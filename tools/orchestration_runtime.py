@@ -2607,7 +2607,10 @@ def _required_child_agent_kind(step: str) -> str:
     step_token = step.strip().lower()
     required = STEP_REQUIRED_CHILD_AGENT.get(step_token)
     if required is None:
-        raise ValueError(f"unsupported workflow step for child-agent requirement: {step!r}")
+        raise ValueError(
+            f"unsupported workflow step {step!r}; valid steps: "
+            f"{sorted(STEP_REQUIRED_CHILD_AGENT)}"
+        )
     return required
 
 
@@ -4427,6 +4430,14 @@ def _allowed_output_paths_for_launch(
         if mandatory_pin not in allowed:
             allowed.append(mandatory_pin)
 
+    # Mandatory canonical phase outputs (e.g. Validate's snapshot_schema.json)
+    # whose names are not covered by a directory allowlist entry. Inject so the
+    # executor's write is authorized rather than failing post_execute and forcing
+    # a restart. The _matches_phase_contract pass below validates placement.
+    for mandatory_output in _mandatory_phase_outputs_for_launch(request_payload, allowed):
+        if mandatory_output not in allowed:
+            allowed.append(mandatory_output)
+
     for idx, path in enumerate(allowed):
         if path in canonical_logs_set:
             # Canonical MCP-owned audit logs are pre-validated against
@@ -4767,6 +4778,68 @@ def _mandatory_file_tool_pins_for_launch(
     if not source_id:
         return []
     return [f"{generate_prefix}{source_id}/src/Makefile"]
+
+
+def _mandatory_phase_outputs_for_launch(
+    request_payload: dict[str, Any],
+    allowed_output_paths: Sequence[str],
+) -> list[str]:
+    """Canonical phase outputs that MUST be pre-authorized for the launch.
+
+    The Validate ``post_execute`` gate (``tools/validate_pipeline_semantics.py``)
+    requires the snapshot schema at
+    ``<pipeline_ref>/runs/<run_id>/<node_safe>/raw/state_snapshots/snapshot_schema.json``
+    whenever the spec mandates state-snapshot evidence. Its ``.json`` name is not
+    covered by a bare ``raw/state_snapshots/`` directory allowlist entry (the
+    directory-allowlist source-extension set excludes it, same reason the
+    ``Makefile`` needs an explicit pin), so an executor that writes it without
+    listing it gets rejected with ``allowed_output_paths manifest violation`` and
+    the orchestration restarts. Pre-authorizing the canonical path is harmless
+    when the spec does not require snapshots (the file is simply never written),
+    so we inject it for the Validate.execute substep and let the
+    ``_matches_phase_contract`` check below confirm it stays in-contract.
+
+    Restricted to the ``execute`` substep: only execute writes ``raw/`` evidence,
+    and the ``judge`` contract rejects ``raw/`` paths — injecting there would make
+    ``_matches_phase_contract`` raise. Mirrors
+    ``_mandatory_file_tool_pins_for_launch``: returns paths to be merged into
+    ``allowed`` only when missing; never raises.
+    """
+    step_token = str(request_payload.get("step") or "").strip().lower()
+    substep_token = str(request_payload.get("substep") or "").strip().lower()
+    pipeline_ref = _normalize_rel_posix(str(request_payload.get("pipeline_ref") or ""))
+    if step_token != "validate" or substep_token != "execute" or not pipeline_ref:
+        return []
+    node_key = str(request_payload.get("node_key") or "").strip()
+    node_safe = _node_key_to_safe(node_key) if node_key else ""
+    if not node_safe:
+        return []
+    validate_prefix = f"{pipeline_ref}/runs/"
+    run_id = str(request_payload.get("run_id") or "").strip()
+    if not run_id:
+        # Single-namespace enforcement guarantees at most one run_id under the
+        # validate prefix; derive it from the listed paths when the request does
+        # not carry an explicit `run_id` field.
+        run_ids: set[str] = set()
+        for item in allowed_output_paths:
+            if not isinstance(item, str):
+                continue
+            tok = _normalize_rel_posix(item)
+            if not tok.startswith(validate_prefix):
+                continue
+            tail = tok[len(validate_prefix):]
+            parts = [s for s in tail.split("/") if s]
+            if parts:
+                run_ids.add(parts[0])
+        if len(run_ids) == 1:
+            run_id = next(iter(run_ids))
+    if not run_id:
+        # run_id not determinable → inject nothing and preserve the loud
+        # downstream failure rather than guessing a placement.
+        return []
+    return [
+        f"{validate_prefix}{run_id}/{node_safe}/raw/state_snapshots/snapshot_schema.json"
+    ]
 
 
 def _assert_mandatory_file_tool_pins_present(
@@ -8235,6 +8308,14 @@ def enable_checkpoint_resume(
                 marker.unlink()
             except FileNotFoundError:
                 pass
+        # Re-open the orchestration's own agent_runs row (terminalized in place by
+        # the prior set-status) so the resumed run's row is `running` again, its
+        # eventual set-status can re-terminalize it, and validate_workspace_root
+        # does not age the live tmp root out as cleanup-pending. Done BEFORE the
+        # meta commit below so the still-terminal on-disk meta gates recovery: if
+        # this is interrupted, a retry re-enters `terminal_reset` and re-runs it
+        # (idempotent — the helper no-ops once the row is already `running`).
+        _reopen_orchestration_run_row(repo_root, orchestration_id)
     _write_json(meta_path, meta)
     merge_phase_state_for_resume(repo_root, orchestration_id)
     if terminal_reset:
@@ -12644,6 +12725,144 @@ def write_step_result(
     return result
 
 
+def _rewrite_orchestration_run_row(
+    repo_root: Path,
+    orchestration_id: str,
+    *,
+    should_rewrite: Callable[[dict[str, Any]], bool],
+    apply_mutation: Callable[[dict[str, Any]], None],
+) -> bool:
+    """Rewrite the orchestration's own agent_runs.jsonl row in place.
+
+    `init` appends a `{agent_role:orchestration, status:running}` row but
+    agent_runs.jsonl is append-only and a second `record-agent-run` for the same
+    arid is rejected as `duplicate agent_run_id`, so there is no forward path to
+    update it. This helper rewrites the single row matching the meta's
+    `orchestration_agent_run_id` with `agent_role == "orchestration"` IN PLACE
+    (not append) under the agent_runs.jsonl exclusive lock, mirroring
+    `repair_legacy_agent_runs`' atomic rewrite, so it never trips the duplicate
+    guard. `should_rewrite` decides whether the matched row needs changing (for
+    idempotency); `apply_mutation` mutates it. Returns True iff a row was rewritten.
+    """
+    root = _orchestration_root(repo_root, orchestration_id)
+    runs_path = root / "agent_runs.jsonl"
+    if not runs_path.is_file():
+        return False
+
+    orch_arid: str | None = None
+    try:
+        meta = _read_json(root / "orchestration_meta.json")
+    except (OSError, json.JSONDecodeError):
+        meta = None
+    if isinstance(meta, dict):
+        v = meta.get("orchestration_agent_run_id")
+        if isinstance(v, str) and v.strip():
+            orch_arid = v.strip()
+    if orch_arid is None:
+        return False
+
+    changed = False
+    with _runs_jsonl_exclusive_lock(repo_root, orchestration_id):
+        raw = runs_path.read_text(encoding="utf-8")
+        ends_nl = raw.endswith("\n")
+        raw_lines = raw.splitlines()
+        for idx, line in enumerate(raw_lines):
+            s = line.strip()
+            if not s:
+                continue
+            try:
+                obj = json.loads(s)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(obj, dict):
+                continue
+            if (
+                str(obj.get("agent_run_id", "")).strip() == orch_arid
+                and str(obj.get("agent_role", "")).strip() == "orchestration"
+                and should_rewrite(obj)
+            ):
+                apply_mutation(obj)
+                raw_lines[idx] = json.dumps(obj, ensure_ascii=False)
+                changed = True
+                break
+        if changed:
+            body = "\n".join(raw_lines)
+            if ends_nl:
+                body += "\n"
+            _atomic_write_text(runs_path, body)
+    return changed
+
+
+def _finalize_orchestration_run_row(
+    repo_root: Path,
+    orchestration_id: str,
+    *,
+    status: str,
+    finished_at: str | None = None,
+) -> bool:
+    """Terminalize the orchestration's own agent_runs.jsonl row.
+
+    Called on terminal `set-status` so agent_runs-based audits and
+    `validate_workspace_root` no longer see the orchestration row stuck `running`
+    even after `orchestration_meta.json` reaches `pass`/`fail`/`fail_closed`.
+    Rewrites whenever the row's status differs from `status`, so it (a)
+    terminalizes a `running` row, (b) follows the permitted `fail -> fail_closed`
+    promotion (the row was already rewritten to `fail` by the first set-status),
+    and (c) repairs a row left `running` by a half-committed prior finalize on
+    replay. Idempotent: a no-op once the row already equals `status`, so
+    same-terminal set-status replays do not rewrite it (preserving `finished_at`).
+    Only invoked after update_orchestration_status' own transition guard accepts
+    the meta status change, so a non-`running`→terminal rewrite here only ever
+    reflects the allowed `fail -> fail_closed` case. Returns True iff the row was
+    transitioned. See `_reopen_orchestration_run_row` for the resume inverse.
+    """
+    finished = (
+        finished_at if isinstance(finished_at, str) and finished_at.strip() else _utc_now_iso()
+    )
+
+    def _mutate(obj: dict[str, Any]) -> None:
+        obj["status"] = status
+        obj["finished_at"] = finished
+
+    return _rewrite_orchestration_run_row(
+        repo_root,
+        orchestration_id,
+        should_rewrite=lambda obj: str(obj.get("status", "")).strip() != status,
+        apply_mutation=_mutate,
+    )
+
+
+def _reopen_orchestration_run_row(
+    repo_root: Path,
+    orchestration_id: str,
+) -> bool:
+    """Re-open the orchestration's own agent_runs.jsonl row for a resumed run.
+
+    Inverse of `_finalize_orchestration_run_row`, symmetric with
+    `enable_checkpoint_resume` resetting `orchestration_meta.status` to `running`
+    and dropping the cleanup_committed marker. When a terminal orchestration is
+    resumed, its agent_runs row (terminalized in place by the prior set-status)
+    must also be reset to `running` with `finished_at` cleared. Otherwise the live
+    resumed run carries a stale terminal row, which (a) lets
+    `validate_workspace_root` treat the live orchestration tmp root as
+    cleanup-pending/terminated after the TTL, and (b) leaves the resumed run's
+    eventual set-status unable to re-terminalize it (the finalizer only matches
+    `running` rows). Targets only a non-`running` row (idempotent). Returns True
+    iff the row was reset.
+    """
+
+    def _mutate(obj: dict[str, Any]) -> None:
+        obj["status"] = "running"
+        obj.pop("finished_at", None)
+
+    return _rewrite_orchestration_run_row(
+        repo_root,
+        orchestration_id,
+        should_rewrite=lambda obj: str(obj.get("status", "")).strip() != "running",
+        apply_mutation=_mutate,
+    )
+
+
 def update_orchestration_status(
     repo_root: Path,
     orchestration_id: str,
@@ -12748,6 +12967,14 @@ def update_orchestration_status(
                                 "backfill_reason": "missing_canonical_set_status_event",
                             },
                         )
+                    # Idempotent backfill: terminalize the orchestration's
+                    # agent_runs row if a pre-fix run left it `running`.
+                    _finalize_orchestration_run_row(
+                        repo_root,
+                        orchestration_id,
+                        status=status,
+                        finished_at=meta.get("finished_at"),
+                    )
                     _append_phase_state_log(
                         repo_root,
                         orchestration_id,
@@ -12763,6 +12990,12 @@ def update_orchestration_status(
                 # Codex round 18 F2: also backfill the canonical set_status
                 # event if it's missing (original call may have failed before
                 # logging).
+                _finalize_orchestration_run_row(
+                    repo_root,
+                    orchestration_id,
+                    status=status,
+                    finished_at=meta.get("finished_at"),
+                )
                 if orch_arid is not None:
                     cleanup_done = _cleanup_agent_tmp_root(
                         repo_root,
@@ -12827,6 +13060,15 @@ def update_orchestration_status(
         # rather than orphaning recovery artifacts.
         _write_json(meta_path, meta)
         if status in TERMINAL_STATUSES or status == "fail_closed":
+            # Terminalize the orchestration's own agent_runs.jsonl row in place so
+            # agent_runs-based audits no longer see it stuck `running`. Done before
+            # tmp cleanup; the append-only duplicate guard is bypassed by rewrite.
+            _finalize_orchestration_run_row(
+                repo_root,
+                orchestration_id,
+                status=status,
+                finished_at=meta.get("finished_at"),
+            )
             if orch_arid is not None:
                 cleanup_done = _cleanup_agent_tmp_root(
                     repo_root,
@@ -14317,15 +14559,24 @@ def main(argv: list[str] | None = None) -> int:
             print(f"mark-dependency-readiness: {exc}", file=sys.stderr)
             return 1
     elif args.command == "workflow-launch-check":
-        result = pre_phase_launch(
-            repo_root,
-            orchestration_id=args.orchestration_id,
-            node_key=args.node_key,
-            step=args.step,
-            backend=args.backend,
-            require_child_agent=args.require_child_agent,
-            launch_request=getattr(args, "launch_request_json", None),
-        )
+        # Convert expected validation failures (e.g. an unsupported --step like
+        # 'plan') into a clean stderr message + exit 1 rather than letting a
+        # Python traceback escape — orchestration wrappers classify tracebacks
+        # as infrastructure crashes, not request rejections. Mirrors the
+        # mark-dependency-readiness dispatch below.
+        try:
+            result = pre_phase_launch(
+                repo_root,
+                orchestration_id=args.orchestration_id,
+                node_key=args.node_key,
+                step=args.step,
+                backend=args.backend,
+                require_child_agent=args.require_child_agent,
+                launch_request=getattr(args, "launch_request_json", None),
+            )
+        except ValueError as exc:
+            print(f"workflow-launch-check: {exc}", file=sys.stderr)
+            return 1
     elif args.command == "reserve-phase-root":
         result = reserve_phase_root(
             repo_root,
