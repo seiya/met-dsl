@@ -1,63 +1,63 @@
 ---
 name: workflow-compile-verify
-description: Compile ステージの verify を実行し、`spec.ir.yaml` の構造 invariant 検査と `io_contract` セクションの導出・検査を行うときに使用する。Compile 生成後の `verification_status` 判定に適用する。
+description: Use this when running the verify of the Compile stage and performing the structural-invariant check of `spec.ir.yaml` and the derivation/check of the `io_contract` section. It applies to the `verification_status` judgment after Compile generation.
 ---
 
 # Workflow Compile Verify
 
-## 目的
-Compile ステージ出力の構造 invariant 違反を検出し、`Generate` へ進める条件を判定する。意味的正しさは `Validate` 実行結果に委ねる「ハイブリッド検証」原則（`docs/workflow/phases/phase_01_compile.md`）に従い、self-check の範囲を構造 invariant に限定する。
+## Purpose
+Detect structural-invariant violations of the Compile stage output, and judge the conditions for proceeding to `Generate`. Following the "hybrid verification" principle that delegates semantic correctness to the `Validate` execution result (`docs/workflow/phases/phase_01_compile.md`), limit the scope of the self-check to structural invariants.
 
-## 適用範囲
-- `workspace/ir/<node_key_safe>/<ir_id>/` の `spec.ir.yaml` を検査する作業
-- `spec.ir.yaml` の `io_contract` セクションを `controlled_spec.md` と `tests.md` と `deps.yaml` から導出する作業
-- `ir_meta.json` の `verification_status` を更新する作業
+## Scope
+- the work of checking the `spec.ir.yaml` of `workspace/ir/<node_key_safe>/<ir_id>/`
+- the work of deriving the `io_contract` section of `spec.ir.yaml` from `controlled_spec.md`, `tests.md`, and `deps.yaml`
+- the work of updating the `verification_status` of `ir_meta.json`
 
-## 要件
-- 判定規則の canonical source は `docs/workflow/WORKFLOW_CORE.md` と `docs/workflow/phases/phase_01_compile.md` と `docs/RUNBOOK.md` と `controlled_spec.md` と `tests.md` と `deps.yaml` と検査対象 `spec.ir.yaml` に限定する。`tools/` 配下の実装、検証 `script`、test code、validator code を読んで要求や判定規則を抽出してはならない。
-- 起動要求の `dependency_ref` は必ず `spec/<component_path>/deps.yaml` 形式の値を受け取らなければならない。`workspace/ir/` 形式の値は誤りであり、検出時は即座に `fail` で停止しなければならない。`dependency_ref` は読み取りや写経の対象ではなく、規約確認のみに使用する。
-- `spec.ir.yaml` の `case` / `algorithm` / `impl_defaults` / `io_contract` / `dependency` 5 セクションの必須項目を検査する。
-- `spec.ir.yaml` と `ir_meta.json` が `python3 tools/check_artifact_syntax.py --expect-top object` を通過することを検査する。
-- `spec.ir.yaml.algorithm` の `execution_mode` と `steps[]` と `ordering` と `control_condition` と `iteration_contract` と `derived_field_rules` と `invariants` を検査する。`steps[].inputs` と `steps[].outputs` が **非空文字列の list**（例: `["U_L", "U_R"]`）であることを必須検査とし、object list 形式（`[{name: ..., source: ...}]`）は `must be string list` 違反として `fail` とする。参考形式: `docs/examples/spec_ir_algorithm_section.example.yaml`。
-- `steps[].inputs` / `steps[].outputs` に現れる各 string token が、`controlled_spec.md` の直接入出力変数・`temporaries` の中間変数・`derived_field_rules` の派生量のいずれかに**追跡可能**であることを検査する。スライス・エイリアス・コンポーネント分解による派生名は `temporaries` または `derived_field_rules` に宣言されていれば有効とする。直接名・派生名のいずれにも対応付けできないトークンは未定義バインディングとして `Compile fail` とする。
-- `spec.ir.yaml.algorithm.step_kind` が許可語彙に一致し、`steps[]` の `operation_ref` と `spec.ir.yaml.dependency` の解決結果が矛盾しないことを検査する。
-- `spec.ir.yaml.io_contract` セクションの存在と整合性を検査する。導出元は `controlled_spec.md` と `tests.md` と `deps.yaml` に限定する。
-- `spec.ir.yaml.io_contract` セクションは `Compile.verify substep` の責務として導出して `spec.ir.yaml` 本体へ書き込まなければならない。`Compile.generate substep` が生成してはならない。
-- 本 substep が起動できる validator gate は `skills/workflow-orchestration/references/launch_prompts.md` の「substep ↔ allowed validator gate 対応表」を canonical source とする (`validate_pipeline_semantics --stage compile` は本 substep の責務であり、`Compile.generate` の launch prompt に含めてはならない)。
-- `spec.ir.yaml` の書き込み先は必ず `workspace/ir/<node_key_safe>/<ir_id>/spec.ir.yaml` でなければならない。`ir/` 直下（`workspace/` プレフィックスなし）への書き込みは禁止する。書き込み前に `output_manifests/<agent_run_id>.json` の `allowed_output_paths` を確認し、`workspace/ir/` で始まる path と一致することを検証すること。
-- `io_contract.inputs` と `io_contract.outputs` の必須項目（`name` / `evidence_ref` / `shape_expr`）を検査する。
-- `io_contract.outputs` で `evidence_ref` が `raw/state_snapshots` 以外を参照し、かつ `artifact=state_snapshots` を必須宣言する場合、`raw_variables` が非空配列であり、`schema.variables` または `schema.time_variable` を参照していることを検査する。
-- `io_contract.raw_requirements.required_evidence` を検査し、`artifact` と `required` と `min_samples` と `schema`（必要時）の整合を確認する。
-- `raw_requirements.required_evidence` で `artifact=state_snapshots` を `required=true` で宣言する場合、`schema.variables[].name` と `schema.variables[].shape_expr` と `schema.time_variable` と `schema.time_shape_expr` の存在と妥当性を検査する。
-- `io_contract.test_evidence_requirements` を検査し、`tests.md` の全 `test_id` を過不足なく保持し、各 `required_raw_variables` が `schema` で宣言された変数に解決できることを確認する。
-- `io_contract` セクションが生成契約を保持していないことを検査する。統合順序、更新順序、`numerical_kernel_contract`、反復条件は `spec.ir.yaml.algorithm` にのみ存在しなければならない。
-- `impl_defaults` の fixed / knob レイヤ境界を検査する。fixed sub-key (`target.class` / `target.backend` / `target.architecture` / `toolchain.language` / `toolchain.standard` / `toolchain.build_system` / `selected.backend_key`) が全て値を持つこと (V6 invariant)、knob sub-key (`abstract.*` / `backend_overrides.*`) の leaf 値が plug-hole (`null` / `<TBD>`) でないこと (V7 invariant) を検査する。詳細は `docs/workflow/phases/phase_01_compile.md`。
-- 既定値適用規則を検査する。対象は言語既定値、`toolchain.build_system` 既定値、`OpenMP` 既定値である。
-- 直下依存 `node` の `ir_ref` と `ir_meta.json.verification_status` を確認できない場合を `dependency compile missing` として `fail` とする。
-- `spec.ir.yaml.dependency` の `node_key` と依存集合と `topo_level` の整合性を検査する。
-- 同一入力から再生成した `spec.ir.yaml` との差分を検査し、determinism違反を検出する。
-- 構造 invariant の導出に必要な情報が不足する場合は `fail` とし、推測補完で `pass` を付与してはならない。
-- workflow mode は `METDSL_WORKFLOW_EXEC_MODE` を canonical source とし、未設定時は `dev` を適用する。
-- `dev` mode では `issue_severity=major|critical` を検出した時点で `Compile fail` とし、軽微例外扱いを禁止する。
-- 依存解決エラーの `node` が `blocked` 扱いであることを検査する。
-- 検査対象 artifact の保存先ルートが `workspace/` であることを検査し、workflow ルート判定は `workspace/` のみを対象とする。
+## Requirements
+- The canonical source for the judgment rules is limited to `docs/workflow/WORKFLOW_CORE.md`, `docs/workflow/phases/phase_01_compile.md`, `docs/RUNBOOK.md`, `controlled_spec.md`, `tests.md`, `deps.yaml`, and the `spec.ir.yaml` to be checked. The implementation under `tools/`, verification `script`, test code, and validator code must not be read to extract requirements or judgment rules.
+- The `dependency_ref` of the launch request must always receive a value of the form `spec/<component_path>/deps.yaml`. A value of the `workspace/ir/` form is wrong, and on detection it must immediately stop with `fail`. `dependency_ref` is not a target of reading or transcription, and is used only for convention confirmation.
+- Check the required items of the 5 sections `case` / `algorithm` / `impl_defaults` / `io_contract` / `dependency` of `spec.ir.yaml`.
+- Check that `spec.ir.yaml` and `ir_meta.json` pass `python3 tools/check_artifact_syntax.py --expect-top object`.
+- Check `execution_mode`, `steps[]`, `ordering`, `control_condition`, `iteration_contract`, `derived_field_rules`, and `invariants` of `spec.ir.yaml.algorithm`. It is a required check that `steps[].inputs` and `steps[].outputs` are a **list of non-empty strings** (e.g. `["U_L", "U_R"]`), and the object list form (`[{name: ..., source: ...}]`) is a `must be string list` violation and a `fail`. Reference form: `docs/examples/spec_ir_algorithm_section.example.yaml`.
+- Check that each string token appearing in `steps[].inputs` / `steps[].outputs` is **traceable** to one of a direct input/output variable of `controlled_spec.md`, an intermediate variable of `temporaries`, or a derived quantity of `derived_field_rules`. A name derived by a slice, alias, or component decomposition is valid if it is declared in `temporaries` or `derived_field_rules`. A token that cannot be mapped to either a direct name or a derived name is an undefined binding and a `Compile fail`.
+- Check that `spec.ir.yaml.algorithm.step_kind` matches the allowed vocabulary and that the `operation_ref` of `steps[]` and the resolution result of `spec.ir.yaml.dependency` do not contradict.
+- Check the existence and consistency of the `spec.ir.yaml.io_contract` section. The derivation source is limited to `controlled_spec.md`, `tests.md`, and `deps.yaml`.
+- The `spec.ir.yaml.io_contract` section must be derived as the responsibility of the `Compile.verify substep` and written into the `spec.ir.yaml` body. The `Compile.generate substep` must not generate it.
+- The validator gates this substep can launch use the "substep ↔ allowed validator gate correspondence table" of `skills/workflow-orchestration/references/launch_prompts.md` as the canonical source (`validate_pipeline_semantics --stage compile` is the responsibility of this substep and must not be included in the launch prompt of `Compile.generate`).
+- The write destination of `spec.ir.yaml` must always be `workspace/ir/<node_key_safe>/<ir_id>/spec.ir.yaml`. A write directly under `ir/` (without the `workspace/` prefix) is forbidden. Before writing, confirm the `allowed_output_paths` of `output_manifests/<agent_run_id>.json`, and verify that it matches a path starting with `workspace/ir/`.
+- Check the required items (`name` / `evidence_ref` / `shape_expr`) of `io_contract.inputs` and `io_contract.outputs`.
+- In `io_contract.outputs`, when `evidence_ref` references something other than `raw/state_snapshots` and declares `artifact=state_snapshots` as required, check that `raw_variables` is a non-empty array and references `schema.variables` or `schema.time_variable`.
+- Check `io_contract.raw_requirements.required_evidence`, and confirm the consistency of `artifact`, `required`, `min_samples`, and `schema` (when needed).
+- When `raw_requirements.required_evidence` declares `artifact=state_snapshots` with `required=true`, check the existence and validity of `schema.variables[].name`, `schema.variables[].shape_expr`, `schema.time_variable`, and `schema.time_shape_expr`.
+- Check `io_contract.test_evidence_requirements`, confirm that it holds all `test_id` of `tests.md` neither more nor less, and that each `required_raw_variables` resolves to a variable declared in `schema`.
+- Check that the `io_contract` section does not hold the generation contract. The integration order, update order, `numerical_kernel_contract`, and iteration conditions must exist only in `spec.ir.yaml.algorithm`.
+- Check the fixed / knob layer boundary of `impl_defaults`. Check that all fixed sub-keys (`target.class` / `target.backend` / `target.architecture` / `toolchain.language` / `toolchain.standard` / `toolchain.build_system` / `selected.backend_key`) have a value (V6 invariant), and that the leaf values of the knob sub-keys (`abstract.*` / `backend_overrides.*`) are not a plug-hole (`null` / `<TBD>`) (V7 invariant). For details, `docs/workflow/phases/phase_01_compile.md`.
+- Check the default-application rules. The targets are the language default, the `toolchain.build_system` default, and the `OpenMP` default.
+- The case where the `ir_ref` and `ir_meta.json.verification_status` of an immediate dependency `node` cannot be confirmed is a `dependency compile missing` and a `fail`.
+- Check the consistency of the `node_key`, the dependency set, and `topo_level` of `spec.ir.yaml.dependency`.
+- Check the diff against a `spec.ir.yaml` regenerated from the same input, and detect a determinism violation.
+- When the information needed to derive a structural invariant is insufficient, it is a `fail`, and `pass` must not be assigned by guessed completion.
+- The workflow mode uses `METDSL_WORKFLOW_EXEC_MODE` as the canonical source, and applies `dev` when unset.
+- In `dev` mode, it is a `Compile fail` the moment `issue_severity=major|critical` is detected, and treating it as a minor exception is forbidden.
+- Check that a `node` with a dependency-resolution error is treated as `blocked`.
+- Check that the storage root of the checked artifact is `workspace/`, and the workflow-root judgment targets only `workspace/`.
 
-## 運用ルール
-0. 作業開始直後に `output_manifests/<agent_run_id>.json` の `allowed_file_tool_paths` と `allowed_output_paths` を Read し、`spec.ir.yaml` の出力先が `workspace/ir/<node_key_safe>/<ir_id>/spec.ir.yaml` と一致することを確認する。不一致の場合は即座に fail で停止すること。
-0.5. `spec.ir.yaml` への `io_contract` セクション追記は `guarded-apply-patch` を唯一の経路とする。手順: (a) `allowed_output_paths` から `workspace/ir/<node_key_safe>/<ir_id>/spec.ir.yaml` を確認（`workspace/` で始まることを必須検証）、(b) 存在確認→apply 失敗時に逆の patch 形式で 1 回リトライして race window を吸収すること、(c) `python3 tools/orchestration_runtime.py guarded-apply-patch ...` を実行する。`--patch-file workspace/tmp/<agent_run_id>/guarded_patch_input.txt`（`<agent_run_id>` は literal 置換）で patch を渡すことで argv の ARG_MAX 制限を回避すること。NG: `tee`・`cat <<EOF >file` 等のリダイレクト・`python3 -c` によるファイル書き込み、`workspace/` 接頭辞欠落のパス指定。
-1. 検査結果を `ir_meta.json` に反映し、`verification_status` を `pass` または `fail` に更新する。
-2. `fail` の場合は `last_fail_reason` を具体化し、違反 invariant ID (V1〜V7) と修正対象セクションと規約名を記録する。
-3. `verification_status=pass` の `ir_id` のみ `Generate` へ進める。
-4. `ir_meta.json` の必須 key（`attempt_count`、`verification_status`、`last_fail_reason`、`debug_mode`、`context_isolated`）を検査し、欠落時は `fail` とする。
-5. `context_isolated=false` の場合、`constraint_reason` の非空文字列を必須検査とする。
-6. `debug_mode=false` では失敗試行 artifact を保存しない。
-7. workflow artifact の保存先ルートが `workspace/` でない場合は、下流 phase を開始せず `Compile fail` とする。
-8. workflow 実行開始前に `workspace/` が存在しない場合、リポジトリルート直下へ `workspace/` を作成する。
-9. 開始前と完了前に `python3 tools/validate_workspace_root.py` を実行し、`fail` 時は `Compile fail` とする。
-10. verify 完了前に `python3 tools/validate_pipeline_semantics.py --stage compile --ir-ref workspace/ir/<node_key_safe>/<ir_id>/` を実行し、`exit code 0` を必須とする。`fail` 時は `ir_meta.json` の `verification_status=pass` を付与してはならない。
-11. `dev` mode で `fail` した場合は、`failure_analysis.json` 作成に必要な根拠（違反規約、対象 artifact、失敗理由）を `last_fail_reason` に記録する。
+## Operations Rules
+0. Immediately after starting work, Read the `allowed_file_tool_paths` and `allowed_output_paths` of `output_manifests/<agent_run_id>.json`, and confirm that the output destination of `spec.ir.yaml` matches `workspace/ir/<node_key_safe>/<ir_id>/spec.ir.yaml`. On a mismatch, immediately stop with fail.
+0.5. The `io_contract`-section append to `spec.ir.yaml` uses `guarded-apply-patch` as the only path. Procedure: (a) confirm `workspace/ir/<node_key_safe>/<ir_id>/spec.ir.yaml` from `allowed_output_paths` (verify that it starts with `workspace/` as required), (b) existence check → on apply failure, retry once with the reverse patch form to absorb the race window, (c) run `python3 tools/orchestration_runtime.py guarded-apply-patch ...`. Pass the patch with `--patch-file workspace/tmp/<agent_run_id>/guarded_patch_input.txt` (`<agent_run_id>` is literally substituted) to avoid the argv ARG_MAX limit. NG: redirection such as `tee` / `cat <<EOF >file`, a file write via `python3 -c`, and a path specification missing the `workspace/` prefix.
+1. Reflect the check result into `ir_meta.json`, and update `verification_status` to `pass` or `fail`.
+2. On `fail`, concretize `last_fail_reason`, and record the violated invariant ID (V1–V7), the section to fix, and the convention name.
+3. Proceed to `Generate` only the `ir_id` with `verification_status=pass`.
+4. Check the required keys (`attempt_count`, `verification_status`, `last_fail_reason`, `debug_mode`, `context_isolated`) of `ir_meta.json`, and on omission it is a `fail`.
+5. When `context_isolated=false`, a non-empty string for `constraint_reason` is a required check.
+6. With `debug_mode=false`, do not save failed-attempt artifacts.
+7. When the storage root for workflow artifacts is not `workspace/`, do not start a downstream phase and it is a `Compile fail`.
+8. When `workspace/` does not exist before workflow execution starts, create `workspace/` directly under the repository root.
+9. Before start and before completion, run `python3 tools/validate_workspace_root.py`, and on `fail` it is a `Compile fail`.
+10. Before verify completes, run `python3 tools/validate_pipeline_semantics.py --stage compile --ir-ref workspace/ir/<node_key_safe>/<ir_id>/`, and `exit code 0` is required. On `fail`, `verification_status=pass` must not be assigned to `ir_meta.json`.
+11. When it `fail` in `dev` mode, record in `last_fail_reason` the basis needed to create `failure_analysis.json` (the violated convention, the target artifact, the failure reason).
 
-## 判定基準
-- 構造 invariant V1〜V7 の違反がない場合のみ `verification_status=pass` を付与する。
-- 検査結果に再現可能な根拠ファイルを必ず付与する。
-- 判定規則が `docs/workflow/WORKFLOW_CORE.md` と `docs/workflow/phases/phase_01_compile.md` と `docs/RUNBOOK.md` と一致する。
+## Decision Criteria
+- Assign `verification_status=pass` only when there is no violation of the structural invariants V1–V7.
+- Always attach a reproducible basis file to the check result.
+- The judgment rules match `docs/workflow/WORKFLOW_CORE.md`, `docs/workflow/phases/phase_01_compile.md`, and `docs/RUNBOOK.md`.

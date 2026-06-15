@@ -1,45 +1,45 @@
 ---
 name: workflow-audit-codex
-description: 実行済み workflow の orchestration ログを調査し、hook ブロック・情報収集行動・チェック失敗によるやり直しを洗い出して報告するときに使用する。対象 orchestration_id と session_id は自動検出する。Codex 専用
+description: Use this when investigating the orchestration logs of an executed workflow and surfacing/reporting hook blocks, information-gathering behavior, and redos due to check failures. The target orchestration_id and session_id are auto-detected. Codex-only
 ---
 
 # Workflow Audit For Codex
 
-## 目的
-完了または中断した workflow 実行のログを横断的に調査し、以下の 3 カテゴリで問題点を列挙する。
+## Purpose
+Investigate the logs of a completed or interrupted workflow execution across the board, and enumerate problems in the following 3 categories.
 
-1. **hook ブロック** - hook が `action=block` を返した操作
-2. **情報収集行動** - CLI 仕様不明・状態把握不足により `--help` 参照やファイル探索を行った箇所
-3. **チェック失敗によるやり直し** - gate / validator の失敗、phase launch の複数回試行、status 設定ミス
+1. **hook blocks** - operations for which a hook returned `action=block`
+2. **information-gathering behavior** - places where, due to unclear CLI specifications or insufficient state awareness, a `--help` reference or file exploration was performed
+3. **redos due to check failures** - gate / validator failures, multiple phase-launch attempts, status-setting mistakes
 
-## ログ収集元
+## Log collection sources
 
-| ログ | 収集先 |
+| log | collection source |
 |---|---|
-| hook ブロック | `workspace/orchestrations/<orch_id>/hooks/native_hook_events.jsonl` |
-| workflow フック経緯 | `workspace/orchestrations/<orch_id>/hooks/workflow_hooks.jsonl` |
-| agent 実行結果 | `workspace/orchestrations/<orch_id>/agent_runs.jsonl` |
-| phase 状態遷移 | `workspace/orchestrations/<orch_id>/phase_state_log.jsonl` |
-| gate 結果 | `workspace/orchestrations/<orch_id>/gates/<agent_run_id>/*.json` |
-| sandbox 違反 | `workspace/orchestrations/<orch_id>/violations/*.json` |
-| アクセスログ | `workspace/orchestrations/<orch_id>/access_logs/<agent_run_id>.jsonl` |
-| 失敗分析 | `workspace/orchestrations/<orch_id>/failure_analysis.json` |
-| session 会話ログ | `~/.codex/sessions/YYYY/MM/DD/rollout-*-<session_id>.jsonl` |
+| hook blocks | `workspace/orchestrations/<orch_id>/hooks/native_hook_events.jsonl` |
+| workflow hook history | `workspace/orchestrations/<orch_id>/hooks/workflow_hooks.jsonl` |
+| agent execution results | `workspace/orchestrations/<orch_id>/agent_runs.jsonl` |
+| phase state transitions | `workspace/orchestrations/<orch_id>/phase_state_log.jsonl` |
+| gate results | `workspace/orchestrations/<orch_id>/gates/<agent_run_id>/*.json` |
+| sandbox violations | `workspace/orchestrations/<orch_id>/violations/*.json` |
+| access logs | `workspace/orchestrations/<orch_id>/access_logs/<agent_run_id>.jsonl` |
+| failure analysis | `workspace/orchestrations/<orch_id>/failure_analysis.json` |
+| session conversation log | `~/.codex/sessions/YYYY/MM/DD/rollout-*-<session_id>.jsonl` |
 
-## 調査手順
+## Investigation procedure
 
-### Step 1 - orchestration_id を特定する
+### Step 1 - Identify the orchestration_id
 
 ```bash
 ls workspace/orchestrations/
 ```
 
-対象が複数ある場合は最新の `orch_YYYYMMDDTHHMMSSZ_*` ディレクトリを選ぶ。
-特定の orchestration を調査する場合は指示された `orchestration_id` を使う。
+When there are multiple targets, choose the most recent `orch_YYYYMMDDTHHMMSSZ_*` directory.
+To investigate a specific orchestration, use the instructed `orchestration_id`.
 
-### Step 2 - session_id を自動検出する
+### Step 2 - Auto-detect the session_id
 
-`native_hook_events.jsonl` に記録された `payload_summary.session_id` を読み取り、`~/.codex/sessions` 配下の対応する `rollout-*.jsonl` を特定する。
+Read the `payload_summary.session_id` recorded in `native_hook_events.jsonl`, and identify the corresponding `rollout-*.jsonl` under `~/.codex/sessions`.
 
 ```bash
 python3 - <<'EOF'
@@ -69,11 +69,11 @@ for sid in sorted(session_ids):
 EOF
 ```
 
-検出した session_id ごとに対応する `rollout-*.jsonl` のパスを確定する。
+For each detected session_id, fix the path of the corresponding `rollout-*.jsonl`.
 
-### Step 3 - hook ブロックを抽出する
+### Step 3 - Extract hook blocks
 
-`native_hook_events.jsonl` から `action=block` のレコードをすべて抽出する。
+Extract all records with `action=block` from `native_hook_events.jsonl`.
 
 ```bash
 python3 - <<'EOF'
@@ -96,17 +96,17 @@ for b in blocks:
 EOF
 ```
 
-各ブロックについて以下を記録する。
+Record the following for each block.
 
-- `ts` - 発生時刻
-- `tool_name` - ブロックされたツール（`Read` / `Bash` / `Write` 等）
-- `reason` - ブロック理由
-- `audit_detail.policy` - 適用されたポリシー名
-- `payload_summary` - 操作対象パスまたはコマンド（先頭 200 文字）
+- `ts` - the time of occurrence
+- `tool_name` - the blocked tool (`Read` / `Bash` / `Write` etc.)
+- `reason` - the block reason
+- `audit_detail.policy` - the applied policy name
+- `payload_summary` - the operation-target path or command (first 200 characters)
 
-### Step 4 - 情報収集行動を抽出する
+### Step 4 - Extract information-gathering behavior
 
-Codex の `rollout-*.jsonl` から `function_call` レコードを抽出し、`--help` 呼び出し、ファイル探索コマンド、ランタイム実装の `grep` / `sed` / 直接 `Read` を検出する。
+Extract `function_call` records from Codex's `rollout-*.jsonl`, and detect `--help` calls, file-exploration commands, and `grep` / `sed` / direct `Read` of the runtime implementation.
 
 ```bash
 python3 - <<'EOF'
@@ -164,17 +164,17 @@ for r in results:
 EOF
 ```
 
-抽出結果を以下の観点で分類する。
+Classify the extracted results by the following perspectives.
 
-- `--help` 参照 - CLI 仕様が不明だった箇所（引数フォーマット、サブコマンド名等）
-- `tools/` 直接 `grep` / `sed` / `read` - ランタイム実装からルールを導こうとした箇所（hook ポリシー上禁止）
-- ファイル存在確認（`ls`, `find`） - phase artifact 生成前の状態把握
+- `--help` references - places where the CLI specification was unclear (argument format, subcommand name, etc.)
+- `tools/` direct `grep` / `sed` / `read` - places where a rule was attempted to be derived from the runtime implementation (forbidden by hook policy)
+- file-existence confirmation (`ls`, `find`) - state awareness before phase-artifact generation
 
-### Step 5 - チェック失敗とやり直しを抽出する
+### Step 5 - Extract check failures and redos
 
-#### 5-a. phase launch の複数回試行
+#### 5-a. Multiple phase-launch attempts
 
-`workflow_hooks.jsonl` で同じ `node_key + step` の `pre_phase_launch` が 2 回以上現れる場合、起動失敗によるやり直しが発生している。
+When the `pre_phase_launch` of the same `node_key + step` appears 2 or more times in `workflow_hooks.jsonl`, a redo due to a launch failure has occurred.
 
 ```bash
 python3 - <<'EOF'
@@ -201,9 +201,9 @@ for key, cnt in counter.items():
 EOF
 ```
 
-#### 5-b. gate 失敗と再実行回数
+#### 5-b. Gate failures and re-execution counts
 
-`workflow_hooks.jsonl` で `hook=pre_command_execute` かつ同じ `gate` が複数回現れる場合、gate 失敗後の修正ループが発生している。
+When `hook=pre_command_execute` and the same `gate` appears multiple times in `workflow_hooks.jsonl`, a fix loop after a gate failure has occurred.
 
 ```bash
 python3 - <<'EOF'
@@ -226,7 +226,7 @@ for key, cnt in counter.items():
 EOF
 ```
 
-実際の gate 失敗内容は `gates/<agent_run_id>/<gate_name>.json` を読んで `violations` フィールドを確認する。
+For the actual gate-failure content, read `gates/<agent_run_id>/<gate_name>.json` and confirm the `violations` field.
 
 ```bash
 ls workspace/orchestrations/<orch_id>/gates/
@@ -242,7 +242,7 @@ for p in sorted(pathlib.Path(f'workspace/orchestrations/{orch_id}/gates').rglob(
 "
 ```
 
-#### 5-c. sandbox 違反の確認
+#### 5-c. Confirm sandbox violations
 
 ```bash
 ls workspace/orchestrations/<orch_id>/violations/
@@ -256,7 +256,7 @@ for p in sorted(pathlib.Path(f'workspace/orchestrations/{orch_id}/violations').g
 "
 ```
 
-#### 5-d. phase_state_log で fail/fail_closed を確認
+#### 5-d. Confirm fail/fail_closed in phase_state_log
 
 ```bash
 python3 -c "
@@ -270,34 +270,34 @@ with open(f'workspace/orchestrations/{orch_id}/phase_state_log.jsonl') as f:
 "
 ```
 
-### Step 6 - 結果を報告する
+### Step 6 - Report the results
 
-以下の形式で 3 カテゴリにまとめて報告する。
+Report grouped into the 3 categories in the following format.
 
 ---
 
-#### 1. hook でブロックされたもの
+#### 1. Blocked by hooks
 
-各ブロックを表形式で列挙する。
+Enumerate each block in a table.
 
-| 時刻 (UTC) | agent | ツール | ポリシー | 操作対象 |
+| time (UTC) | agent | tool | policy | operation target |
 |---|---|---|---|---|
 | ... | ... | ... | ... | ... |
 
-ポリシーが同種のものはグループ化して原因を一行で説明する。
+Group those with the same policy and explain the cause in one line.
 
-#### 2. 情報収集を行ったもの
+#### 2. Performed information gathering
 
-`--help` 参照・`tools/` `grep`・状態把握 `ls` / `find` をそれぞれ列挙し、何が分からなかったかを一文で添える。
+Enumerate `--help` references, `tools/` `grep`, and state-awareness `ls` / `find` respectively, and add one sentence on what was unclear.
 
-#### 3. チェック失敗によるやり直し
+#### 3. Redos due to check failures
 
-phase launch 複数回試行・gate 失敗ループ・sandbox 違反・status 設定ミスを時系列で列挙し、各やり直しの原因と最終結果を記す。
+Enumerate multiple phase-launch attempts, gate-failure loops, sandbox violations, and status-setting mistakes chronologically, and note the cause and final result of each redo.
 
 ---
 
-## 注意事項
+## Notes
 
-- `tools/` 配下の実装は hook ポリシーで直接読み込みが禁止されている。ルールの導出は `docs/` と `spec/` のみを参照すること。
-- session `jsonl` は数万行になる場合がある。先頭から全行読まず、`python` で必要フィールドのみを抽出すること。
-- `payload_summary.session_id` が欠落している場合は `agent_runs.jsonl` の `agent_session_id` を優先し、`~/.codex/sessions/**/rollout-*-<agent_session_id>.jsonl` で逆引きすること。
+- The implementation under `tools/` is forbidden to read directly by hook policy. Derive rules by referencing only `docs/` and `spec/`.
+- The session `jsonl` can be tens of thousands of lines. Do not read all lines from the top; extract only the necessary fields with `python`.
+- When `payload_summary.session_id` is missing, prefer the `agent_session_id` of `agent_runs.jsonl`, and reverse-look it up with `~/.codex/sessions/**/rollout-*-<agent_session_id>.jsonl`.

@@ -1,38 +1,38 @@
-# 全体ワークフロー: Spec -> Compile -> Generate -> Build -> Validate
+# Overall workflow: Spec -> Compile -> Generate -> Build -> Validate
 
-`workflow` の最終目的は、自然言語の `Controlled Spec` から実行可能なコード（`model` + `runner`）を生成し、`tests` で要求された振る舞いを満たすことを実行結果で確認することにある。本 workflow はこの目的のために 5 phase で構成し、各 phase は **observable な primary producer** として一次成果物を 1 種類だけ生産する。
+The ultimate goal of the `workflow` is to generate executable code (`model` + `runner`) from the natural-language `Controlled Spec`, and to confirm via the execution result that it satisfies the behavior required by `tests`. For this goal, this workflow consists of 5 phases, and each phase, as an **observable primary producer**, produces exactly one kind of primary artifact.
 
-workflow の契約本文は `docs/workflow/` 配下に分割して配置する。本ファイルはその入口である。terms は `GLOSSARY.md` を参照する。
+The contract body of the workflow is split and placed under `docs/workflow/`. This file is its entry point. For terms, refer to `GLOSSARY.md`.
 
-## phase 序列と一次成果物
+## Phase order and primary artifacts
 
-| # | phase | 役割 | 一次成果物 |
+| # | phase | role | primary artifact |
 |---|-------|------|----------|
-| 0 | Spec | 自然言語仕様の人手記述 | `controlled_spec.md` / `tests.md` / `deps.yaml` |
-| 1 | Compile | 自然言語仕様 → 構造化 IR | `spec.ir.yaml` |
-| 2 | Generate | IR → ソースコード | `source/<source_id>/` |
-| 3 | Build | ソース → バイナリ（決定的） | `binary/<binary_id>/bin/` |
-| 4 | Validate | 実行 + 合否判定 | `verdict.json` / `aggregate_verdict.json` |
+| 0 | Spec | manual writing of the natural-language specification | `controlled_spec.md` / `tests.md` / `deps.yaml` |
+| 1 | Compile | natural-language specification → structured IR | `spec.ir.yaml` |
+| 2 | Generate | IR → source code | `source/<source_id>/` |
+| 3 | Build | source → binary (deterministic) | `binary/<binary_id>/bin/` |
+| 4 | Validate | execution + pass/fail judgment | `verdict.json` / `aggregate_verdict.json` |
 
-phase 境界は **「観測可能な一次成果物の階層」** で切る。失敗時のフィードバック方向（例: Build 失敗 → Generate 再走）は phase 境界の判定基準としない。
+The phase boundary is cut by **"the hierarchy of observable primary artifacts"**. The feedback direction on failure (e.g. Build failure → Generate re-run) is not a criterion for the phase boundary.
 
-## 任意フロー
+## Optional flows
 
-最適化 (`Tune`) と昇格 (`Promote`) は core workflow の必須経路から外し、独立した任意フローとして扱う。core workflow は構造 IR と実装裁量の混在を持たず、Tune がこれを variant 探索する。詳細は別 plan で扱う。
+Optimization (`Tune`) and promotion (`Promote`) are removed from the required path of the core workflow and treated as independent optional flows. The core workflow does not mix structural IR and implementation discretion; Tune explores this as variants. Details are handled in a separate plan.
 
-## 共通編（canonical source）
+## Common part (canonical source)
 
-- [workflow/WORKFLOW_CORE.md](workflow/WORKFLOW_CORE.md): phase sequence、workflow 共通不変規範、`phase` 別 I/O 契約一覧、artifact layout rules、完了判定基準、エージェント参照範囲
+- [workflow/WORKFLOW_CORE.md](workflow/WORKFLOW_CORE.md): phase sequence, workflow common invariants, the per-`phase` I/O contract list, artifact layout rules, completion criteria, agent reference scope
 
-## phase 契約詳細（canonical source）
+## Phase contract details (canonical source)
 
-- [workflow/phases/phase_00_spec.md](workflow/phases/phase_00_spec.md): 0 Spec（人手）
+- [workflow/phases/phase_00_spec.md](workflow/phases/phase_00_spec.md): 0 Spec (manual)
 - [workflow/phases/phase_01_compile.md](workflow/phases/phase_01_compile.md): 1 Compile
 - [workflow/phases/phase_02_generate.md](workflow/phases/phase_02_generate.md): 2 Generate
 - [workflow/phases/phase_03_build.md](workflow/phases/phase_03_build.md): 3 Build
 - [workflow/phases/phase_04_validate.md](workflow/phases/phase_04_validate.md): 4 Validate
 
-## 横断規約（canonical source）
+## Cross-cutting conventions (canonical source)
 
-- [ORCHESTRATION.md](ORCHESTRATION.md): エージェント階層実行契約
-- [SPEC.md](SPEC.md): 全体方針、`spec` 管理要件、registry 要件
+- [ORCHESTRATION.md](ORCHESTRATION.md): agent hierarchical execution contract
+- [SPEC.md](SPEC.md): overall policy, `spec` management requirements, registry requirements

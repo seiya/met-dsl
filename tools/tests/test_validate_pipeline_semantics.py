@@ -74,9 +74,9 @@ def _step_prompt_fixture(orchestration_id: str, node_key: str, step: str, run_id
         f"skills/workflow-{step}/SKILL.md,"
         f"docs/workflow/WORKFLOW_CORE.md,docs/ORCHESTRATION.md,{phase_path}"
     )
-    return f"""あなたは step agent である。
-対象 node_key: {node_key}
-対象 step: {step}
+    return f"""You are a step agent.
+Target node_key: {node_key}
+Target step: {step}
 orchestration_id: {orchestration_id}
 agent_run_id: {run_id}
 parent_agent_run_id: orch_run_001
@@ -86,8 +86,8 @@ dependency_ref: {_dependency_ref_for_step(step)}
 skill_name: workflow-{step}
 skill_ref: skills/workflow-{step}/SKILL.md
 skill_must_read_refs: {refs}
-必須要件:
-- 契約を完了すること。
+Required requirements:
+- Complete the contract.
 """
 
 
@@ -103,10 +103,10 @@ def _substep_prompt_fixture(
         f"skills/workflow-{step}-{substep}/SKILL.md,"
         f"docs/workflow/WORKFLOW_CORE.md,docs/ORCHESTRATION.md,{phase_path}"
     )
-    return f"""あなたは substep agent である。
-対象 node_key: {node_key}
-対象 step: {step}
-対象 substep: {substep}
+    return f"""You are a substep agent.
+Target node_key: {node_key}
+Target step: {step}
+Target substep: {substep}
 orchestration_id: {orchestration_id}
 agent_run_id: {run_id}
 parent_agent_run_id: orch_run_001
@@ -116,8 +116,8 @@ dependency_ref: {_dependency_ref_for_step(step)}
 skill_name: workflow-{step}-{substep}
 skill_ref: skills/workflow-{step}-{substep}/SKILL.md
 skill_must_read_refs: {refs}
-必須要件:
-- 契約を完了すること。
+Required requirements:
+- Complete the contract.
 """
 
 
@@ -751,6 +751,39 @@ def _create_minimal_orchestration_tree(
                 "substep_agent_run_ids": [],
             },
         )
+
+
+class LegacyLaunchPromptMarkerTests(unittest.TestCase):
+    def test_marker_present_accepts_english_and_legacy_japanese(self) -> None:
+        # Backward compatibility: a launch_prompt_ref persisted before the English
+        # translation contains Japanese template markers. pre_judge / full
+        # validation must accept both the current English marker and its legacy form.
+        from tools.validate_pipeline_semantics import (
+            _launch_prompt_marker_present,
+            _required_launch_prompt_markers_for_role,
+        )
+
+        legacy_step_prompt = (
+            "あなたは step agent である。\n"
+            "対象 node_key: component/x@0.1.0\n"
+            "対象 step: compile\n"
+            "orchestration_id: o\nagent_run_id: a\nparent_agent_run_id: p\n"
+            "ir_ref: i\npipeline_ref: pp\ndependency_ref: spec/x/deps.yaml\n"
+            "skill_name: s\nskill_ref: sr\nskill_must_read_refs: smr\n"
+            "必須要件:\n- x\n"
+        )
+        markers = _required_launch_prompt_markers_for_role("step")
+        missing = [m for m in markers if not _launch_prompt_marker_present(m, legacy_step_prompt)]
+        self.assertEqual(missing, [], f"legacy Japanese prompt rejected: {missing}")
+
+        # The current English prompt markers are still accepted.
+        english_step_prompt = legacy_step_prompt.replace(
+            "あなたは step agent である。", "You are a step agent."
+        ).replace("対象 node_key:", "Target node_key:").replace(
+            "対象 step:", "Target step:"
+        ).replace("必須要件:", "Required requirements:")
+        missing_en = [m for m in markers if not _launch_prompt_marker_present(m, english_step_prompt)]
+        self.assertEqual(missing_en, [], f"english prompt rejected: {missing_en}")
 
 
 class ValidatePipelineSemanticsTests(unittest.TestCase):
@@ -1798,8 +1831,8 @@ end program shallow_water2d_runner
             sd.mkdir(parents=True)
             schema = {
                 "oneOf": [
-                    {"title": "0次元 (zero-dim)", "pattern": r"^[Ss][Cc][Aa][Ll][Aa][Rr]$"},
-                    {"title": "リスト形 (list form)", "pattern": r"^\[[0-9]+(?:,[0-9]+)*\]$"},
+                    {"title": "0-dimensional (zero-dim)", "pattern": r"^[Ss][Cc][Aa][Ll][Aa][Rr]$"},
+                    {"title": "list form", "pattern": r"^\[[0-9]+(?:,[0-9]+)*\]$"},
                 ]
             }
             (sd / "shape_expr.schema.json").write_text(
@@ -4024,7 +4057,7 @@ end program shallow_water2d_runner
             tests_md = repo_root / "spec" / "problem" / "mock_domain" / "mock_family" / "mock_spec" / "tests.md"
             tests_md.parent.mkdir(parents=True, exist_ok=True)
             tests_md.write_text(
-                "## 7. テスト定義\n"
+                "## 7. Test definitions\n"
                 "### 7-1. `test_a`\n"
                 "### 7-2. `test_b`\n",
                 encoding="utf-8",
@@ -4131,7 +4164,7 @@ end program shallow_water2d_runner
             )
             tests_md.parent.mkdir(parents=True, exist_ok=True)
             tests_md.write_text(
-                "## 7. テスト定義\n"
+                "## 7. Test definitions\n"
                 "### 7-1. `l1_refinement_mass_and_positivity`\n",
                 encoding="utf-8",
             )
@@ -4250,7 +4283,7 @@ end program shallow_water2d_runner
             )
             tests_md.parent.mkdir(parents=True, exist_ok=True)
             tests_md.write_text(
-                "## 7. テスト定義\n"
+                "## 7. Test definitions\n"
                 "### 7-1. `test_a`\n"
                 "### 7-2. `test_b`\n",
                 encoding="utf-8",
@@ -4315,7 +4348,7 @@ end program shallow_water2d_runner
             )
             tests_path.parent.mkdir(parents=True, exist_ok=True)
             tests_path.write_text(
-                "## 7. テスト定義\n"
+                "## 7. Test definitions\n"
                 "### 7-1. `test_a`\n"
                 "### 7-2. `test_b`\n",
                 encoding="utf-8",
@@ -4407,7 +4440,7 @@ end program shallow_water2d_runner
             )
             tests_path.parent.mkdir(parents=True, exist_ok=True)
             tests_path.write_text(
-                "## 7. テスト定義\n"
+                "## 7. Test definitions\n"
                 "### 7-1. `test_a`\n",
                 encoding="utf-8",
             )
@@ -6869,7 +6902,7 @@ shallow_water2d_runner.o: shallow_water2d_runner.f90 shallow_water2d_model.mod
             self.assertEqual(violations, [])
 
     def test_create_minimal_execution_tree_writes_metrics_basis_to_raw(self) -> None:
-        """metrics_basis 引数が raw/metrics_basis.json に反映されること（trivial 検証テストの前提）。"""
+        """The metrics_basis argument is reflected in raw/metrics_basis.json (premise of the trivial-verification test)."""
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
             _seed_shape_expr_schema_into(repo_root)
@@ -6914,7 +6947,7 @@ end program shallow_water2d_runner
 
 
     def test_validate_rejects_all_zero_metrics_basis(self) -> None:
-        """metrics_basis.json の全数値が 0.0 のとき violation が発生すること。"""
+        """A violation occurs when all numbers in metrics_basis.json are 0.0."""
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
             _seed_shape_expr_schema_into(repo_root)
@@ -6948,7 +6981,7 @@ end program shallow_water2d_runner
             )
 
     def test_validate_rejects_all_null_metrics_basis(self) -> None:
-        """metrics_basis.json の全フィールドが null のとき violation が発生すること。"""
+        """A violation occurs when all fields of metrics_basis.json are null."""
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
             _seed_shape_expr_schema_into(repo_root)
@@ -6982,7 +7015,7 @@ end program shallow_water2d_runner
             )
 
     def test_validate_accepts_partially_nonzero_metrics_basis(self) -> None:
-        """metrics_basis.json の一部に非ゼロ実数値があれば通過すること。"""
+        """It passes if some part of metrics_basis.json has a non-zero real value."""
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
             _seed_shape_expr_schema_into(repo_root)
@@ -7016,7 +7049,7 @@ end program shallow_water2d_runner
             )
 
     def test_validate_skips_metrics_basis_check_if_no_numeric_fields(self) -> None:
-        """metrics_basis.json に数値フィールドが一切なければ trivial チェックをスキップする。"""
+        """If metrics_basis.json has no numeric field at all, skip the trivial check."""
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
             _seed_shape_expr_schema_into(repo_root)

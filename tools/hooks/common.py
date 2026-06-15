@@ -1531,7 +1531,7 @@ def _is_self_agent_manifest_read_path(
     agent_run_id: str,
     file_path: str,
 ) -> bool:
-    """当該 child の output / read manifest JSON への Read は run-gate 外でも許可する。"""
+    """Allow a Read of the relevant child's output / read manifest JSON even outside run-gate."""
     orch = orchestration_id.strip()
     rid = agent_run_id.strip()
     if not orch or not rid:
@@ -1594,7 +1594,7 @@ _CLI_MANAGED_PATHS: list[_CliManagedPath] = [
 
 
 def check_cli_managed_path(repo_root: Path, file_path: str) -> "HookDecision | None":
-    """CLI 管理パスに一致するなら BLOCK の HookDecision を返す。一致なしは None。"""
+    """Return a BLOCK HookDecision if it matches a CLI-managed path. None on no match."""
     abs_target = _resolve_target_path(repo_root, file_path)
     try:
         rel = abs_target.relative_to(repo_root).as_posix()
@@ -1641,7 +1641,7 @@ def validate_write_access(
     tool_name: str | None = None,
     bash_command: str | None = None,
 ) -> HookDecision:
-    """output manifest の allowed_output_paths に対して write/edit 対象を検証する。"""
+    """Verify the write/edit target against the output manifest's allowed_output_paths."""
     manifest_path = (
         repo_root
         / "workspace"
@@ -1775,7 +1775,7 @@ def validate_write_access(
         if used_fallback_or_hardcode:
             fix_hint_block["tmpdir_fallback_or_hardcode"] = True
             fix_hint_block["canonical_doc"] = (
-                "skills/workflow-orchestration/references/startup_contract.md#tmp-area-の使い方必須前提"
+                "skills/workflow-orchestration/references/startup_contract.md#how-to-use-the-tmp-area-required-premise"
             )
         return HookDecision(
             action=HookDecisionAction.BLOCK,
@@ -1904,7 +1904,7 @@ def _is_auto_read_tolerated(
     agent_role: str | None,
     file_path: str,
 ) -> bool:
-    """Claude Code auto-read 対象であれば True を返す。
+    """Return True if it is a Claude Code auto-read target.
 
     Two categories of tolerated auto-reads are recognised:
 
@@ -2237,7 +2237,7 @@ def validate_read_access(
     agent_role: str | None = None,
     session_id: str | None = None,
 ) -> HookDecision:
-    """read manifest の allowed_read_roots に対して read 対象を検証する。"""
+    """Verify the read target against the read manifest's allowed_read_roots."""
     # Category 2a: persisted tool-results for any agent role.
     # These are harness-internal files (never in read_manifest) that agents must
     # be able to read when large tool outputs have been persisted as

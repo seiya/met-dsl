@@ -1,107 +1,107 @@
 # Workflow Orchestration Startup Contract
 
-## 目的
-- `workflow orchestration` 起動前の必須判定を最小トークンで確定する。
+## Purpose
+- Finalize the required decisions before `workflow orchestration` launch with minimal tokens.
 
-## 適用範囲
-- `orchestration agent` 起動直後
-- 子 `agent` の初回起動前
+## Scope
+- immediately after `orchestration agent` launch
+- before the first launch of a child `agent`
 
-## tmp area の使い方（必須前提）
+## How to use the tmp area (required premise)
 
-orchestration agent / 子 agent の `allowed_tmp_root` は `workspace/tmp/<agent_run_id>/` 固定で、`record-launch` 時に `output_manifests/<agent_run_id>.json` の `allowed_tmp_root` フィールドへ記録される。一時ファイル書き込みは当該 literal path 配下を **直接** 指定すれば `output_manifest_write_guard` を通過する。
+The `allowed_tmp_root` of the orchestration agent / child agent is fixed at `workspace/tmp/<agent_run_id>/`, and is recorded in the `allowed_tmp_root` field of `output_manifests/<agent_run_id>.json` at `record-launch` time. A temporary-file write passes `output_manifest_write_guard` by specifying **directly** under that literal path.
 
 ```
 # orchestration agent
 workspace/tmp/<orchestration_agent_run_id>/
 
-# 子 agent
+# child agent
 workspace/tmp/<agent_run_id>/
 ```
 
-- `<orchestration_agent_run_id>` は `orchestration_meta.json#orchestration_agent_run_id`、子 agent の `<agent_run_id>` は `record-launch` 時に発行した値。
-- agent は当該 literal path を直接 `cat > workspace/tmp/<arid>/x.patch <<EOF` 等で使う。`$TMPDIR` env への参照は許容するが必須ではない (`output_manifest_write_guard` は write 対象 path のみを判定し env を参照しない、cf. `tools/hooks/common.py:_validate_write_access` の `allowed_tmp_root` 分岐)。
-- **bootstrap Bash 禁止**: `export TMPDIR=...`、`jq -er ...`、`printenv`、`bash -c '...'`、`env` (read-only debug 用途以外) を呼んではならない。Claude Code session sandbox の approval 要求で workflow が連続停止する原因になる。env (`METDSL_ORCHESTRATION_ID` / `ORCHESTRATION_AGENT_RUN_ID` / `TMPDIR`) は `tools/run_workflow.py` が subprocess に inherit 済み。
-- tmp 外への直接書き込み（`workspace/<canonical>/...` など）は `guarded-apply-patch` 経由を必須とし、`Edit`/`Write` tool は `allowed_file_tool_paths` 登録済みパスにのみ使用する。Bash heredoc で canonical path に直接書くと `enforce_guarded_apply_patch` でブロックされる。
+- `<orchestration_agent_run_id>` is `orchestration_meta.json#orchestration_agent_run_id`, and the child agent's `<agent_run_id>` is the value issued at `record-launch` time.
+- The agent uses that literal path directly with `cat > workspace/tmp/<arid>/x.patch <<EOF` etc. A reference to the `$TMPDIR` env is allowed but not required (`output_manifest_write_guard` judges only the write-target path and does not reference the env, cf. the `allowed_tmp_root` branch of `tools/hooks/common.py:_validate_write_access`).
+- **bootstrap Bash forbidden**: `export TMPDIR=...`, `jq -er ...`, `printenv`, `bash -c '...'`, and `env` (other than for read-only debug) must not be called. They are a cause of the workflow stopping repeatedly on Claude Code session-sandbox approval requests. The env (`METDSL_ORCHESTRATION_ID` / `ORCHESTRATION_AGENT_RUN_ID` / `TMPDIR`) is already inherited into the subprocess by `tools/run_workflow.py`.
+- A direct write outside tmp (`workspace/<canonical>/...` etc.) requires going via `guarded-apply-patch`, and the `Edit`/`Write` tool is used only for paths registered in `allowed_file_tool_paths`. Writing directly to a canonical path with a Bash heredoc is blocked by `enforce_guarded_apply_patch`.
 
-## 要件
-- workflow 起動は `python3 tools/run_workflow.py <spec_ref> <until_phase> [--llm <codex|cursor|claude>]` を canonical entrypoint としなければならない。
-- workflow mode は `python3 tools/run_workflow.py ... --mode <dev|prod>` で指定し、未指定時は `dev` を適用しなければならない。
-- `dev` mode では verify 判定の緩和を禁止し、`issue_severity=major|critical` 検出時は fail 停止を必須とする。
-- `dev` mode で fail した場合は `workspace/orchestrations/<orchestration_id>/failure_analysis.json` を保存し、失敗要因と根拠参照を必須記録とする。この file は orchestration agent が `Edit`/`Write` tool で直接書き込む（`failure_analysis.json` は `allowed_file_tool_paths` に登録済み）。`tools/run_workflow.py` は orchestration agent が書かなかった場合のみ同 path へ safety-net として書き込む（既存ファイルは上書きしない）。orchestration agent が既に書いていた場合は runtime 収集データを `failure_analysis.runtime.<uuid12>.json`（例: `failure_analysis.runtime.3a7f9c2e14b0.json`）へ別書きする。uuid12 は実行ごとに一意な 12 文字 hex で、並行実行時の上書き衝突を防ぐ。`tools/run_workflow.py` が返す `analysis_ref` は常に current-run データを指す（canonical が有効なら `failure_analysis.json`、stale/invalid なら sidecar）。一時ファイルを経由する場合は必ず `allowed_tmp_root` (= `workspace/tmp/<orchestration_agent_run_id>/`) 配下の literal path を使用し、`/tmp/` ハードコードは禁止する。
-- 起動前確認の canonical implementation は `tools/run_workflow.py` と `tools/orchestration_runtime.py` の組み合わせとし、`preflight` の backend 指定は `tools/run_workflow.py --llm` を通じて行わなければならない。
-- 子 `agent` へ渡す要求定義と判定規則の canonical source は `docs/` と `spec/` と当該試行 artifact に限定し、`tools/` 配下の実装、検証 `script`、test code、validator code を rule source として参照してはならない。
-- validator invocation は `run-gate` を原則とし、直接実行を許可する場合は read-only 検査かつ gate 非依存検査に限定する。許可対象は `validate_workspace_root.py` と `check_artifact_syntax.py` のみとし、それ以外の validator 直実行を禁止する。
-- `init` と `preflight` は各 1 回以上実行しなければならない。
-- `preflight.json` が `status=pass` かつ `can_launch_step_agents=true` かつ `can_launch_substep_agents=true` を満たさない場合、子 `agent` を起動してはならない。
-- Claude backend では `preflight.json#checks` に `claude_mcp_build_runtime_registered: pass=true` **かつ** `claude_mcp_build_runtime_permission_granted: pass=true` が含まれることを判定対象とする (server 登録 ∧ tool permission 付与の AND)。`probe_execution_platform` が AND 評価済みであり、orchestration agent 側で `claude mcp list` を再実行する必要はない。いずれかが `pass=false` の時は `status=fail` で停止済みのため、当該分岐に達することはない (Generate/Build/Validate 子 agent 起動の前段で必ず検知される)。permission 未付与時の remediation は `.claude/settings.json` の `permissions.allow` への `mcp__build-runtime` 追加 (詳細は [CLAUDE.md](../../../CLAUDE.md) preflight 節)。
-- phase 着手前に、対象 phase が `substep agent` 必須か `step agent` 必須かを固定表で確認しなければならない。`Compile` / `Generate` / `Validate` は `substep agent`、`Build` は `step agent` とする。
-- 最初の `commentary` で、対象 phase、使用する `SKILL`、起動する `agent` 種別、`MCP` 使用箇所を実行宣言しなければならない。
-- `Compile` の子 `agent` を起動する前に、対象 `node` の直下依存 `node` が `direct dependency compile readiness` を満たすことを確認しなければならない。
-- `Generate` 以降の子 `agent` を起動する前に、対象 `node` の直下依存 `node` が `direct dependency execution readiness` を満たすことを確認しなければならない。
-- 子 `agent` 起動直前の live 検査は `record-launch` 実行時にのみ必須とする。
-- `record-agent-run` と `write-step-result` は、`preflight.json` の整合確認を満たす場合に実行してよい。
-- 起動要求本文は `launches/<agent_run_id>.prompt.txt`、起動返答本文は `launches/<agent_run_id>.reply.txt` に保存しなければならない。
-- phase artifact を直接編集または `MCP` 実行する前に、`preflight` 済み、launch prompt 準備済み、child `agent` 起動済みを満たさなければならない。
-- workflow の正当性確認、検証、疎通確認を目的とした仮実装であっても、親 `agent` が子 `agent` 必須 phase の本体処理を代行してはならない。
+## Requirements
+- Workflow launch must use `python3 tools/run_workflow.py <spec_ref> <until_phase> [--llm <codex|cursor|claude>]` as the canonical entrypoint.
+- The workflow mode is specified with `python3 tools/run_workflow.py ... --mode <dev|prod>`, and when unspecified, `dev` must be applied.
+- In `dev` mode, relaxing the verify judgment is forbidden, and a fail-stop is required when `issue_severity=major|critical` is detected.
+- When it fails in `dev` mode, save `workspace/orchestrations/<orchestration_id>/failure_analysis.json`, and recording the failure cause and basis reference is required. This file is written directly by the orchestration agent with the `Edit`/`Write` tool (`failure_analysis.json` is registered in `allowed_file_tool_paths`). `tools/run_workflow.py` writes to the same path as a safety-net only when the orchestration agent did not write it (it does not overwrite an existing file). When the orchestration agent already wrote it, it writes the runtime-collected data separately to `failure_analysis.runtime.<uuid12>.json` (e.g. `failure_analysis.runtime.3a7f9c2e14b0.json`). uuid12 is a 12-character hex unique per execution and prevents an overwrite collision on concurrent execution. The `analysis_ref` that `tools/run_workflow.py` returns always points to the current-run data (`failure_analysis.json` if the canonical is valid, the sidecar if stale/invalid). When going through a temporary file, always use a literal path under `allowed_tmp_root` (= `workspace/tmp/<orchestration_agent_run_id>/`), and hard-coding `/tmp/` is forbidden.
+- The canonical implementation of the pre-launch confirmation is the combination of `tools/run_workflow.py` and `tools/orchestration_runtime.py`, and the backend specification of `preflight` must be done through `tools/run_workflow.py --llm`.
+- The canonical source for the requirement definition and judgment rules passed to a child `agent` is limited to `docs/`, `spec/`, and the relevant trial's artifacts, and the implementation under `tools/`, verification `script`, test code, and validator code must not be referenced as a rule source.
+- The validator invocation defaults to `run-gate`, and when direct execution is permitted, it is limited to a read-only check and a gate-independent check. The permitted targets are only `validate_workspace_root.py` and `check_artifact_syntax.py`, and a direct execution of any other validator is forbidden.
+- `init` and `preflight` must each be run at least once.
+- When `preflight.json` does not satisfy `status=pass` and `can_launch_step_agents=true` and `can_launch_substep_agents=true`, a child `agent` must not be launched.
+- On the Claude backend, the inclusion of `claude_mcp_build_runtime_registered: pass=true` **and** `claude_mcp_build_runtime_permission_granted: pass=true` in `preflight.json#checks` is the judgment target (the AND of server registration ∧ tool-permission grant). `probe_execution_platform` has already AND-evaluated it, and there is no need for the orchestration agent side to re-run `claude mcp list`. When either is `pass=false`, it has already stopped with `status=fail`, so that branch is never reached (it is always detected before the launch of a Generate/Build/Validate child agent). The remediation when permission is not granted is to add `mcp__build-runtime` to the `permissions.allow` of `.claude/settings.json` (for details, the preflight section of [CLAUDE.md](../../../CLAUDE.md)).
+- Before starting a phase, whether the target phase requires a `substep agent` or a `step agent` must be confirmed by a fixed table. `Compile` / `Generate` / `Validate` are `substep agent`, and `Build` is `step agent`.
+- In the first `commentary`, the target phase, the `SKILL` to use, the kind of `agent` to launch, and the place that uses `MCP` must be declared as an execution declaration.
+- Before launching the child `agent` of `Compile`, it must be confirmed that the immediate dependency `node` of the target `node` satisfies `direct dependency compile readiness`.
+- Before launching the child `agent` of `Generate` onward, it must be confirmed that the immediate dependency `node` of the target `node` satisfies `direct dependency execution readiness`.
+- The live check just before launching a child `agent` is required only at `record-launch` time.
+- `record-agent-run` and `write-step-result` may be run when the consistency confirmation of `preflight.json` is satisfied.
+- The launch-request body must be saved to `launches/<agent_run_id>.prompt.txt`, and the launch-reply body to `launches/<agent_run_id>.reply.txt`.
+- Before directly editing a phase artifact or running `MCP`, preflight-done, launch-prompt-prepared, and child-`agent`-launched must be satisfied.
+- Even for a provisional implementation aimed at workflow validity confirmation, verification, or a connectivity check, the parent `agent` must not proxy the body processing of a child-`agent`-required phase.
 
-## 運用ルール
-1. `tools/run_workflow.py` を実行して `workspace/orchestrations/<orchestration_id>/` の初期化と `preflight.json` 生成を行う。
-2. `tools/run_workflow.py` 以外の経路で workflow を開始してはならない。
-3. `METDSL_WORKFLOW_MODE=1` で起動した orchestration agent は `~/.claude/projects/` 配下の `memory/` ディレクトリ（`MEMORY.md` 等）を読んではならない。workflow 実行は決定論的に進めるため、conversation 外部の persistent state を参照しない。以下の **Claude Code auto-read 系ファイル**が起動直後に自動 Read された場合、`audit_detail.policy=auto_read_expected_block` で benign 分類されるが **これは想定動作**であり workflow の継続に影響しない。エラーとして扱わず、再試行やこれらのファイルへの追加参照を試みてはならない。
+## Operations Rules
+1. Run `tools/run_workflow.py` to perform the initialization of `workspace/orchestrations/<orchestration_id>/` and the generation of `preflight.json`.
+2. The workflow must not be started by a path other than `tools/run_workflow.py`.
+3. An orchestration agent launched with `METDSL_WORKFLOW_MODE=1` must not read the `memory/` directory (`MEMORY.md` etc.) under `~/.claude/projects/`. Because workflow execution proceeds deterministically, it does not reference persistent state outside the conversation. When the following **Claude Code auto-read files** are auto-read immediately after startup, they are classified benign with `audit_detail.policy=auto_read_expected_block`, but **this is expected behavior** and does not affect the continuation of the workflow. Do not treat it as an error, and do not attempt a retry or an additional reference to these files.
 
-   許容対象は **(A) harness 強制 auto-read（全 agent role 適用）** と **(B) orchestration agent のみ許容** の 2 ブロックに分かれる。実装は `tools/hooks/common.py` の `_HARNESS_AUTO_READ_TOLERATED_REPO_RELPATHS` / `_HARNESS_AUTO_READ_TOLERATED_REPO_PREFIXES` および `_AUTO_READ_TOLERATED_REPO_RELPATHS` に対応する。
+   The permitted targets are divided into 2 blocks: **(A) harness-forced auto-read (applies to all agent roles)** and **(B) permitted only for the orchestration agent**. The implementation corresponds to `_HARNESS_AUTO_READ_TOLERATED_REPO_RELPATHS` / `_HARNESS_AUTO_READ_TOLERATED_REPO_PREFIXES` and `_AUTO_READ_TOLERATED_REPO_RELPATHS` of `tools/hooks/common.py`.
 
-   **(A) harness 強制 auto-read（全 agent role 適用）**
+   **(A) harness-forced auto-read (applies to all agent roles)**
 
-   Claude Code harness が agent role に依らず startup 直後に Read するファイル群。`orchestration agent` / `step agent` / `substep agent` のいずれでも benign 扱いとする。harness の動作であり、agent が能動的にこれらを Read することは禁止する。
+   The group of files the Claude Code harness Reads immediately after startup regardless of the agent role. It is treated as benign on any of `orchestration agent` / `step agent` / `substep agent`. It is the harness's behavior, and an agent actively Reading these is forbidden.
    - `.claude/settings.json`
-   - `.cursor/mcp.json`（Claude Code の MCP discovery が起動直後に自動 Read する）
-   - `mcp_servers/README.md`（同上）
-   - `mcp_servers/mcp_servers.example.json`（同上）
-   - `mcp_servers/tools/` 配下の全ファイル（MCP tool 定義の auto-discovery。実装は prefix-tolerate しており harness が読むのは `*.json` のみ）
+   - `.cursor/mcp.json` (Claude Code's MCP discovery auto-reads it immediately after startup)
+   - `mcp_servers/README.md` (same as above)
+   - `mcp_servers/mcp_servers.example.json` (same as above)
+   - all files under `mcp_servers/tools/` (the auto-discovery of MCP tool definitions. The implementation prefix-tolerates, and the harness reads only `*.json`)
 
-   **(B) orchestration agent のみ許容**
+   **(B) permitted only for the orchestration agent**
 
-   `orchestration agent` の startup 時に Claude Code harness が project state を read する経路。`substep agent` には適用されない（substep の harness は project state を再 read しないため）。
+   The path by which the Claude Code harness reads project state at `orchestration agent` startup. It does not apply to a `substep agent` (because the substep's harness does not re-read project state).
    - `~/.claude/projects/.../memory/MEMORY.md`
-   - `README.md`（プロジェクトルート）
-   - `TODO.md`（プロジェクトルート）
-   - `CLAUDE.md`（プロジェクトルート）
-   - プロジェクトルート直下の `MEMORY.md`
+   - `README.md` (project root)
+   - `TODO.md` (project root)
+   - `CLAUDE.md` (project root)
+   - `MEMORY.md` directly under the project root
 
-   **substep agent はブロック (B) のファイルを Read してはならない**（substep にとっては通常エラーで `read_manifest_read_guard` が発火する）。ブロック (A) は harness 経由でのみ許容され、agent prompt から能動的に Read することは全 role で禁止する。
-4. `preflight` 判定が `pass` でない場合は `set-status --status fail` を実行して停止する。
-5. 最初の `commentary` で、対象 phase、使用する `SKILL`、起動する `agent` 種別、`MCP` 使用箇所を宣言する。
-6. 固定表で phase 種別を確認し、`Compile` / `Generate` / `Validate` では `substep agent`、`Build` では `step agent` を起動対象として確定する。
-7. `Compile` の子 `agent` 起動前に、直下依存 `node` の `ir_ref` と `ir_meta.json.verification_status` を確認する。
-8. `Generate` 以降の子 `agent` 起動前に、直下依存 `node` の `ir_ref` と `pipeline_ref` と `aggregate_verdict` を確認する。
-9. `preflight` 済み、launch prompt 準備済み、child `agent` 起動済みを満たすまで phase artifact 編集と `MCP` 実行を開始しない。
-10. 子 `agent` 起動時は `record-launch` を実行する。
-11. 子 `agent` 完了後は `record-agent-run` を追記する。
-12. phase 完了後は `write-step-result` を記録する。
-13. 契約に反する近道へ逸脱しそうな場合は、子 `agent` 起動必須であることを明示して launch 手順へ戻る。
+   **A substep agent must not Read a block (B) file** (for the substep it is a normal error and `read_manifest_read_guard` fires). Block (A) is permitted only via the harness, and actively Reading it from the agent prompt is forbidden for all roles.
+4. When the `preflight` judgment is not `pass`, run `set-status --status fail` to stop.
+5. In the first `commentary`, declare the target phase, the `SKILL` to use, the kind of `agent` to launch, and the place that uses `MCP`.
+6. Confirm the phase type by a fixed table, and finalize the launch target as a `substep agent` for `Compile` / `Generate` / `Validate` and a `step agent` for `Build`.
+7. Before launching the child `agent` of `Compile`, confirm the `ir_ref` and `ir_meta.json.verification_status` of the immediate dependency `node`.
+8. Before launching the child `agent` of `Generate` onward, confirm the `ir_ref`, `pipeline_ref`, and `aggregate_verdict` of the immediate dependency `node`.
+9. Do not start phase-artifact editing and `MCP` execution until preflight-done, launch-prompt-prepared, and child-`agent`-launched are satisfied.
+10. When launching a child `agent`, run `record-launch`.
+11. After the child `agent` completes, append `record-agent-run`.
+12. After the phase completes, record `write-step-result`.
+13. When about to deviate into a contract-violating shortcut, make explicit that a child-`agent` launch is required and return to the launch procedure.
 
-## 判定基準
-- `preflight.json` が存在し、`pass` 条件を満たしている。
-- 最初の `commentary` に実行宣言が存在する。
-- phase 種別と起動した `agent` 種別が固定表と一致している。
-- `launches/` と `agent_runs.jsonl` と `step_result.json` の参照整合が取れている。
-- 子 `agent` の起動失敗時に `set-status --status fail` が記録されている。
+## Decision Criteria
+- `preflight.json` exists and satisfies the `pass` conditions.
+- An execution declaration exists in the first `commentary`.
+- The phase type and the kind of `agent` launched match the fixed table.
+- The reference consistency of `launches/`, `agent_runs.jsonl`, and `step_result.json` holds.
+- On a child-`agent` launch failure, `set-status --status fail` is recorded.
 
-## node_key / ID フォーマット早見表
+## node_key / ID format quick reference
 
-### `node_key` の構成
+### Composition of `node_key`
 
 ```
 <spec_kind>/<spec_id>@<spec_version>
 ```
 
-- `spec_kind` / `spec_id` は対象 `deps.yaml` の同名フィールドから取得する。
-- `spec_version` は対象 `controlled_spec.md` の `spec_version` フィールドから取得する。
-- **ファイルシステムパス**（`spec/component/dynamics/...`）とは別物。`workflow-launch-check` / `record-launch` / `reserve-phase-root` 等の `--node-key` には常にこの形式を渡す。
+- `spec_kind` / `spec_id` are obtained from the same-named fields of the target `deps.yaml`.
+- `spec_version` is obtained from the `spec_version` field of the target `controlled_spec.md`.
+- It is distinct from a **filesystem path** (`spec/component/dynamics/...`). Always pass this form to `--node-key` of `workflow-launch-check` / `record-launch` / `reserve-phase-root` etc.
 
-例:
+Example:
 ```
 deps.yaml    → spec_kind: component, spec_id: dynamics_shallow_water_flux_2d_rusanov_p0
 controlled_spec.md → spec_version: 0.1.0
@@ -109,92 +109,92 @@ node_key     → component/dynamics_shallow_water_flux_2d_rusanov_p0@0.1.0
 node_key_safe → component__dynamics_shallow_water_flux_2d_rusanov_p0__0.1.0
 ```
 
-### `ir_id` / `pipeline_id` の命名規則
+### Naming rule of `ir_id` / `pipeline_id`
 
-形式: `<slug>_<YYYYMMDD>_<seq3>`
+Format: `<slug>_<YYYYMMDD>_<seq3>`
 
-- `slug` は **ハイフン区切り** の英小文字・数字（アンダースコア不可）。
-- 正規表現: `^[a-z0-9]+(?:-[a-z0-9]+)*_[0-9]{8}_[0-9]{3}$`
-- 例: `flux-rsn-p0_20260425_001` ✓　`flux_rsn_p0_20260425_001` ✗
+- `slug` is **hyphen-separated** lowercase letters and digits (underscore not allowed).
+- Regex: `^[a-z0-9]+(?:-[a-z0-9]+)*_[0-9]{8}_[0-9]{3}$`
+- Example: `flux-rsn-p0_20260425_001` ✓  `flux_rsn_p0_20260425_001` ✗
 
-`reserve-phase-root` の `--reserved-id` にはこの形式で渡す。
+Pass this form to `--reserved-id` of `reserve-phase-root`.
 
-> **`run_id` は例外:** 上記 `<slug>_<YYYYMMDD>_<seq3>` 形式は `ir_id` / `pipeline_id` 専用。`Validate` の `run_id` は **固定 literal `run_` prefix** を持つ `run_<YYYYMMDD>_<seq3>` 形式（例: `run_20260605_001` ✓）であり、slug 形式を流用してはならない（`run-rsn-p0_20260605_001` ✗）。ハイフン slug 形式は generic slug 正規表現には合致してしまうが、`record-launch` の Validate phase contract が `outside phase contract` で reject し、仮に通過しても `post_execute` の run 発見が silent fail する。
+> **`run_id` is an exception:** the above `<slug>_<YYYYMMDD>_<seq3>` form is exclusive to `ir_id` / `pipeline_id`. The `run_id` of `Validate` is the `run_<YYYYMMDD>_<seq3>` form with a **fixed literal `run_` prefix** (e.g. `run_20260605_001` ✓), and the slug form must not be reused (`run-rsn-p0_20260605_001` ✗). A hyphen-slug form happens to match the generic slug regex, but the Validate phase contract of `record-launch` rejects it with `outside phase contract`, and even if it passed, the run discovery of `post_execute` would silently fail.
 
-### `ir_ref` / `pipeline_ref` の形式
+### Form of `ir_ref` / `pipeline_ref`
 
 ```
 workspace/ir/<node_key_safe>/<ir_id>
 workspace/pipelines/<node_key_safe>/<pipeline_id>
 ```
 
-- **Compile substep** でも `pipeline_ref` は必須。パイプラインはまだ存在しないが、`reserve-phase-root --step generate` で pipeline_id を先行予約し、`workspace/pipelines/<node_key_safe>/<pipeline_id>` 形式で指定する。
-- `record-launch` の `--request-json` に `pipeline_ref="none"` や空文字は渡せない。
+- Even in a **Compile substep**, `pipeline_ref` is required. The pipeline does not exist yet, but reserve the pipeline_id in advance with `reserve-phase-root --step generate`, and specify it in the `workspace/pipelines/<node_key_safe>/<pipeline_id>` form.
+- `pipeline_ref="none"` or an empty string cannot be passed to `--request-json` of `record-launch`.
 
-### orchestration_agent_run_id の取得
+### Acquisition of orchestration_agent_run_id
 
-orchestration agent 自身の `agent_run_id` は startup context の `orchestration_agent_run_id` フィールドを canonical source とする。
+The orchestration agent's own `agent_run_id` uses the `orchestration_agent_run_id` field of the startup context as the canonical source.
 
-- `tools/run_workflow.py` が `init_orchestration()` 経由で生成し、`orchestration_meta.json` に記録済みである。
-- orchestration agent は `uuid.uuid4()` などで独自生成してはならない。
-- `record-agent-run`（orchestration role）の `running` 初期 entry は `init_orchestration()` が自動挿入するため、orchestration agent が手動で呼び出す必要はない。
-- `record-agent-run`（orchestration role）の終端 entry（`pass` / `fail` / `fail_closed`）は orchestration agent が `set-status` 実行後に呼び出す。
+- It is generated by `tools/run_workflow.py` via `init_orchestration()` and is already recorded in `orchestration_meta.json`.
+- The orchestration agent must not generate it on its own with `uuid.uuid4()` etc.
+- The `running` initial entry of `record-agent-run` (orchestration role) is auto-inserted by `init_orchestration()`, so the orchestration agent need not call it manually.
+- The terminal entry (`pass` / `fail` / `fail_closed`) of `record-agent-run` (orchestration role) is called by the orchestration agent after running `set-status`.
 
-## `record-launch` 手順（Claude Code backend）
+## `record-launch` procedure (Claude Code backend)
 
-Claude Code では `spawn_agent` が存在しないため、以下の順序で実行する。
+Because Claude Code has no `spawn_agent`, run in the following order.
 
 ```
-1. agent_run_id (UUID) を生成する
-   - canonical 経路: `python3 tools/new_agent_run_id.py` を bare 実行し、Bash 出力に印字された UUID を後続コマンドへ literal 文字列として埋め込む。
-   - `CHILD_ARID=$(python3 tools/new_agent_run_id.py)` の **2-step shell var 割り当て形式は使わない** — 先頭 `CHILD_ARID=` が `Bash(python3 tools/new_agent_run_id.py)` allowlist 一致を壊し session approval を要求する。
-   - `cat /proc/sys/kernel/random/uuid` / `uuidgen` は session sandbox の approval 要求で都度停止するため使用しない。
-   - `python3 -c 'import uuid; …'` は `forbid_python_inline_write` でブロックされる。
-2. reserve-phase-root で ir_id / pipeline_id を先行予約する（未実行なら）
-   - Compile phase のみ: `--step compile`（ir_id 予約）と `--step generate`（pipeline_id 予約）の 2 回実行が必要。他の phase は 1 回のみ。
-   - どちらも `--reserved-id` は同じ ID（例: `flux-rsn-p0_20260428_001`）を指定する。
-3. record-launch を呼び出す（Agent tool 起動 前）
-   - request-json: node_key / step / substep / ir_ref / pipeline_ref / dependency_ref /
-                   skill_name / skill_ref 等の起動パラメータを含む JSON
+1. Generate an agent_run_id (UUID)
+   - Canonical path: run `python3 tools/new_agent_run_id.py` bare, and embed the UUID printed to Bash output into subsequent commands as a literal string.
+   - Do **not** use the 2-step shell var assignment form `CHILD_ARID=$(python3 tools/new_agent_run_id.py)` — the leading `CHILD_ARID=` breaks the `Bash(python3 tools/new_agent_run_id.py)` allowlist match and requires session approval.
+   - Do not use `cat /proc/sys/kernel/random/uuid` / `uuidgen` because they stop on session-sandbox approval requests every time.
+   - `python3 -c 'import uuid; …'` is blocked by `forbid_python_inline_write`.
+2. Reserve ir_id / pipeline_id in advance with reserve-phase-root (if not yet done)
+   - Compile phase only: 2 runs of `--step compile` (ir_id reservation) and `--step generate` (pipeline_id reservation) are needed. Other phases only once.
+   - In both, specify the same ID (e.g. `flux-rsn-p0_20260428_001`) for `--reserved-id`.
+3. Call record-launch (before launching the Agent tool)
+   - request-json: a JSON including the launch parameters node_key / step / substep / ir_ref / pipeline_ref / dependency_ref /
+                   skill_name / skill_ref etc.
    - response-json: {"agent_session_id": "<agent_run_id>",
                      "agent_run_id": "<agent_run_id>",
                      "started_at": "<ISO8601>",
                      "backend": "claude"}
-   → capability_token / sandbox_profile / output manifest / read manifest が生成される
-4. Agent tool を起動する（子 agent は capabilities/<agent_run_id>.json から
-   capability_token を読んで guarded-apply-patch 等を実行する）
-5. Agent tool の戻り値（最終応答テキスト）を受け取る
-5.4. record-child-return で Agent tool return 観測の証跡を残す（Adv-20/Adv-30 ガード必須）
-     - return-token は `$(cat ...)` をインライン引数として渡す。`VAR=$(cat ...)` の 2-step
-       形式は使わない（先頭 `VAR=` が `Bash(python3 ...)` allowlist 一致を壊し session
-       approval を要求する）。
+   → capability_token / sandbox_profile / output manifest / read manifest are generated
+4. Launch the Agent tool (the child agent reads the capability_token from
+   capabilities/<agent_run_id>.json and runs guarded-apply-patch etc.)
+5. Receive the Agent tool's return value (the final response text)
+5.4. Leave the evidence of observing the Agent tool return with record-child-return (the Adv-20/Adv-30 guards require it)
+     - Pass the return-token with `$(cat ...)` as an inline argument. Do not use the 2-step form
+       `VAR=$(cat ...)` (the leading `VAR=` breaks the `Bash(python3 ...)` allowlist match and requires session
+       approval).
      python3 tools/orchestration_runtime.py record-child-return \
        --repo-root <repo_root> \
        --orchestration-id <orchestration_id> \
        --agent-run-id <agent_run_id> \
        --return-token "$(cat <repo_root>/workspace/orchestrations/<orchestration_id>/launches/<agent_run_id>.parent_return_token)"
-5.5. deactivate-child を実行して active context を orchestration agent に戻す
-     （上の record-child-return 完了後でなければ ValueError で拒否される）
+5.5. Run deactivate-child to return the active context to the orchestration agent
+     (it is rejected with a ValueError unless the record-child-return above has completed)
      python3 tools/orchestration_runtime.py deactivate-child \
        --repo-root <repo_root> \
        --orchestration-id <orchestration_id> \
        --child-run-id <agent_run_id>
-6. record-reply で launches/<agent_run_id>.reply.txt に応答テキストを保存する
+6. Save the response text to launches/<agent_run_id>.reply.txt with record-reply
    python3 tools/orchestration_runtime.py record-reply \
      --repo-root <repo_root> \
      --orchestration-id <orchestration_id> \
      --agent-run-id <agent_run_id> \
-     --reply-text "<Agent tool の戻り値>"
-7. record-agent-run を実行して agent_runs.jsonl へ追記する
+     --reply-text "<the Agent tool's return value>"
+7. Run record-agent-run to append to agent_runs.jsonl
 ```
 
-`record-launch` を Agent tool より前に呼ぶ理由: capability_token と output manifest を子 agent が実行開始前に参照できるようにするため。
+The reason for calling `record-launch` before the Agent tool: so that the child agent can reference the capability_token and output manifest before it starts execution.
 
-## `record-launch` コマンドテンプレート（Claude Code backend）
+## `record-launch` command template (Claude Code backend)
 
-コマンドを構築するときは下記テンプレートをそのままコピーして値を埋める。本テンプレートで列挙する 4 つは頻出 subcommand であり、payload schema の完全仕様は `docs/CLI_REFERENCE.md` (Tier-A) を canonical source とする。稀少 subcommand (例: `init` / `preflight` / `record-timeout` / `read-checkpoint` 等) は `python3 tools/orchestration_runtime.py <sub> --help` を canonical source とし、`docs/CLI_REFERENCE_RARE.md` に overview を置く。tool 単位の使い分けは `CLAUDE.md` の「CLI 仕様の確認規約」節を参照。
+When building the command, copy the template below as-is and fill in the values. The 4 enumerated in this template are frequent subcommands, and the complete specification of the payload schema uses `docs/CLI_REFERENCE.md` (Tier-A) as the canonical source. The rare subcommands (e.g. `init` / `preflight` / `record-timeout` / `read-checkpoint` etc.) use `python3 tools/orchestration_runtime.py <sub> --help` as the canonical source, with an overview in `docs/CLI_REFERENCE_RARE.md`. For the per-tool usage, see the "CLI reference conventions" section of `CLAUDE.md`.
 
-**started_at の取扱い**: `STARTED_AT=$(date ...)` の **2-step shell var 割り当ては使わない**（先頭 `STARTED_AT=` が `Bash(python3 ...)` allowlist 一致を壊し session approval を要求する）。`--response-json` の `started_at` 値には `$(date -u +"%Y-%m-%dT%H:%M:%SZ")` を **インライン** command substitution で埋め込む。コマンド全体は `python3 tools/orchestration_runtime.py …` で始まるため `Bash(python3 tools/orchestration_runtime.py *)` allowlist と一致する。`date -u *` は補強として allowlist に追加済み (`.claude/settings.json`)。
+**Handling of started_at**: do **not** use the 2-step shell var assignment `STARTED_AT=$(date ...)` (the leading `STARTED_AT=` breaks the `Bash(python3 ...)` allowlist match and requires session approval). For the `started_at` value of `--response-json`, embed `$(date -u +"%Y-%m-%dT%H:%M:%SZ")` as an **inline** command substitution. Because the whole command starts with `python3 tools/orchestration_runtime.py …`, it matches the `Bash(python3 tools/orchestration_runtime.py *)` allowlist. `date -u *` has been added to the allowlist as reinforcement (`.claude/settings.json`).
 
 ```bash
 python3 tools/orchestration_runtime.py record-launch \
@@ -210,14 +210,14 @@ python3 tools/orchestration_runtime.py record-launch \
     "orchestration_id": "<orchestration_id>",
     "agent_run_id": "<agent_run_id>",
     "parent_agent_run_id": "<orchestration_agent_run_id>",
-    "agent_model": "<子 agent の LLM model id, 例 claude-opus-4-8>",
+    "agent_model": "<the child agent's LLM model id, e.g. claude-opus-4-8>",
     "workflow_mode": "<dev|prod>",
     "ir_ref": "<ir_ref>",
     "pipeline_ref": "<pipeline_ref>",
     "dependency_ref": "<dependency_ref>",
     "skill_name": "<skill_name>",
     "skill_ref": "<skill_ref>",
-    "allowed_output_paths": ["<出力ファイルのパス一覧>"]
+    "allowed_output_paths": ["<list of output file paths>"]
   }' \
   --response-json "{
     \"agent_run_id\": \"<agent_run_id>\",
@@ -227,52 +227,52 @@ python3 tools/orchestration_runtime.py record-launch \
   }"
 ```
 
-- `--parent-agent-run-id` と `--child-agent-run-id` はそれぞれ独立した位置引数であり、`--request-json` の内側のフィールドとは別に指定する。
-- `--response-json` は必須の独立引数。`--request-json` の中に含めてはならない。
-- `allowed_output_paths` は step/substep agent では必須フィールド。省略すると exit code 1 で失敗する。
-- `substep` フィールドは step agent（substep なし）の場合は省略する。
+- `--parent-agent-run-id` and `--child-agent-run-id` are each independent positional arguments, specified separately from the inner fields of `--request-json`.
+- `--response-json` is a required independent argument. It must not be included inside `--request-json`.
+- `allowed_output_paths` is a required field for a step/substep agent. Omitting it fails with exit code 1.
+- The `substep` field is omitted for a step agent (without a substep).
 
-## `record-launch --request-json` の最小必須フィールド
+## Minimal required fields of `record-launch --request-json`
 
-| フィールド | 説明 |
+| field | description |
 |---|---|
-| `agent_role` | `"substep"` または `"step"` |
-| `node_key` | `<spec_kind>/<spec_id>@<spec_version>` 形式 |
-| `step` | `"plan"` / `"generate"` / `"build"` / `"execute"` / `"judge"` 等 |
-| `substep` | `"generate"` / `"verify"`（substep agent の場合）|
-| `orchestration_id` | orchestration ID |
-| `agent_run_id` | 子 agent の UUID |
-| `parent_agent_run_id` | 親（orchestration）agent の UUID |
-| `agent_model` | 子 agent を実行する LLM model id（例 `"claude-opus-4-8"`）。runtime からは導出できないため launch 時に必須。`record-agent-run` が `agent_runs.jsonl` の step/substep entry へ自動転記する（`pre_judge` が両 role に必須要求） |
-| `workflow_mode` | `"dev"` または `"prod"` |
-| `ir_ref` | `workspace/ir/<node_key_safe>/<ir_id>` 形式 |
-| `pipeline_ref` | `workspace/pipelines/<node_key_safe>/<pipeline_id>` 形式（Compile phase でも必須）|
-| `dependency_ref` | phase 別 canonical path。`Compile` は `spec/.../deps.yaml`、`Generate` 以降は `workspace/...` の phase root（`ir_ref` または `pipeline_ref`） |
-| `skill_name` | 命名規則: `workflow-{step}-{substep}`（例: `"workflow-compile-generate"`）|
-| `skill_ref` | 命名規則: `skills/{skill_name}/SKILL.md`（例: `"skills/workflow-compile-generate/SKILL.md"`）|
-| `skill_must_read_refs` | 子 `SKILL.md` を読んで導出してはならない。orchestration `SKILL.md` の「`Compile verify` の起動要求」「`Generate verify` の起動要求」の各項を canonical source とする |
-| `allowed_output_paths` | 子 agent が書き込める全出力 path のリスト。step/substep では必須。`guarded-apply-patch` と `apply_patch_writes` gate がこのリストを参照する |
+| `agent_role` | `"substep"` or `"step"` |
+| `node_key` | the `<spec_kind>/<spec_id>@<spec_version>` form |
+| `step` | `"plan"` / `"generate"` / `"build"` / `"execute"` / `"judge"` etc. |
+| `substep` | `"generate"` / `"verify"` (for a substep agent) |
+| `orchestration_id` | the orchestration ID |
+| `agent_run_id` | the child agent's UUID |
+| `parent_agent_run_id` | the parent (orchestration) agent's UUID |
+| `agent_model` | the LLM model id that runs the child agent (e.g. `"claude-opus-4-8"`). Required at launch because it cannot be derived by the runtime. `record-agent-run` auto-copies it to the step/substep entry of `agent_runs.jsonl` (`pre_judge` requires it for both roles) |
+| `workflow_mode` | `"dev"` or `"prod"` |
+| `ir_ref` | the `workspace/ir/<node_key_safe>/<ir_id>` form |
+| `pipeline_ref` | the `workspace/pipelines/<node_key_safe>/<pipeline_id>` form (required even in the Compile phase) |
+| `dependency_ref` | the per-phase canonical path. `Compile` is `spec/.../deps.yaml`, and from `Generate` onward the phase root of `workspace/...` (`ir_ref` or `pipeline_ref`) |
+| `skill_name` | naming rule: `workflow-{step}-{substep}` (e.g. `"workflow-compile-generate"`) |
+| `skill_ref` | naming rule: `skills/{skill_name}/SKILL.md` (e.g. `"skills/workflow-compile-generate/SKILL.md"`) |
+| `skill_must_read_refs` | must not be derived by reading the child `SKILL.md`. Use the "`Compile verify` launch request" and "`Generate verify` launch request" items of the orchestration `SKILL.md` as the canonical source |
+| `allowed_output_paths` | the list of all output paths the child agent can write. Required for step/substep. `guarded-apply-patch` and the `apply_patch_writes` gate reference this list |
 
-## `record-agent-run --agent-run-json` の最小必須フィールド
+## Minimal required fields of `record-agent-run --agent-run-json`
 
-| フィールド | 説明 | 備考 |
+| field | description | note |
 |---|---|---|
 | `agent_run_id` | UUID | |
 | `agent_role` | `"orchestration"` / `"step"` / `"substep"` | |
 | `agent_backend` | `"claude"` / `"codex"` / `"cursor"` | |
-| `status` | `"running"` / `"pass"` / `"fail"` 等 | |
+| `status` | `"running"` / `"pass"` / `"fail"` etc. | |
 | `started_at` | ISO8601 | |
-| `agent_session_id` | step/substep では必須。Claude Code では agent_run_id と同値 | |
-| `context_id` | step/substep では必須 | |
-| `context_isolated` | step/substep では必須（常に `true`）| |
-| `node_key` | step/substep では必須 | |
-| `output_refs` | pass 終端時に必須 | |
-| `parent_agent_run_id` | 自動転記（payload 不要）| `record-agent-run` が `launches/<arid>.request.json` から補完する。step/substep entry で `pre_judge` が必須要求するが、launch request に既存のため payload へ書く必要はない |
-| `agent_model` | 自動転記（payload 不要）| 同上。record-launch 時に指定した `agent_model` から補完される |
+| `agent_session_id` | required for step/substep. In Claude Code the same value as agent_run_id | |
+| `context_id` | required for step/substep | |
+| `context_isolated` | required for step/substep (always `true`) | |
+| `node_key` | required for step/substep | |
+| `output_refs` | required at a pass termination | |
+| `parent_agent_run_id` | auto-copied (no payload needed) | `record-agent-run` completes it from `launches/<arid>.request.json`. `pre_judge` requires it for a step/substep entry, but it need not be written in the payload because it already exists in the launch request |
+| `agent_model` | auto-copied (no payload needed) | same as above. completed from the `agent_model` specified at record-launch time |
 
-## `reserve-phase-root` コマンドテンプレート（Claude Code backend）
+## `reserve-phase-root` command template (Claude Code backend)
 
-コマンドを構築するときは下記テンプレートをそのままコピーして値を埋める。本テンプレートで列挙する 4 つは頻出 subcommand であり、payload schema の完全仕様は `docs/CLI_REFERENCE.md` (Tier-A) を canonical source とする。稀少 subcommand (例: `init` / `preflight` / `record-timeout` / `read-checkpoint` 等) は `python3 tools/orchestration_runtime.py <sub> --help` を canonical source とし、`docs/CLI_REFERENCE_RARE.md` に overview を置く。tool 単位の使い分けは `CLAUDE.md` の「CLI 仕様の確認規約」節を参照。
+When building the command, copy the template below as-is and fill in the values. The 4 enumerated in this template are frequent subcommands, and the complete specification of the payload schema uses `docs/CLI_REFERENCE.md` (Tier-A) as the canonical source. The rare subcommands (e.g. `init` / `preflight` / `record-timeout` / `read-checkpoint` etc.) use `python3 tools/orchestration_runtime.py <sub> --help` as the canonical source, with an overview in `docs/CLI_REFERENCE_RARE.md`. For the per-tool usage, see the "CLI reference conventions" section of `CLAUDE.md`.
 
 ```bash
 python3 tools/orchestration_runtime.py reserve-phase-root \
@@ -284,13 +284,13 @@ python3 tools/orchestration_runtime.py reserve-phase-root \
   --reserved-by-agent-run-id <agent_run_id>
 ```
 
-- `--step compile` で ir_id を、`--step generate` で pipeline_id を予約する。Compile phase は両方を 1 回ずつ実行し、`--reserved-id` には**同じ ID**（例: `flux-rsn-p0_20260509_001`）を指定する。他 phase は `--step generate` の 1 回のみ。
-- `--reserved-id` は `<slug>_<YYYYMMDD>_<seq3>` 形式（slug はハイフン区切り小文字英数。アンダースコアを slug 内に含めてはならない）。
-- `--reserved-by-agent-run-id` は当該 ID を実際に使う子 agent の UUID。
+- Reserve ir_id with `--step compile` and pipeline_id with `--step generate`. The Compile phase runs both once each, and specifies the **same ID** (e.g. `flux-rsn-p0_20260509_001`) for `--reserved-id`. Other phases run only `--step generate` once.
+- `--reserved-id` is the `<slug>_<YYYYMMDD>_<seq3>` form (slug is hyphen-separated lowercase alphanumeric. An underscore must not be included in the slug).
+- `--reserved-by-agent-run-id` is the UUID of the child agent that actually uses that ID.
 
-## `record-agent-run` コマンドテンプレート（Claude Code backend）
+## `record-agent-run` command template (Claude Code backend)
 
-コマンドを構築するときは下記テンプレートをそのままコピーして値を埋める。本テンプレートで列挙する 4 つは頻出 subcommand であり、payload schema の完全仕様は `docs/CLI_REFERENCE.md` (Tier-A) を canonical source とする。稀少 subcommand (例: `init` / `preflight` / `record-timeout` / `read-checkpoint` 等) は `python3 tools/orchestration_runtime.py <sub> --help` を canonical source とし、`docs/CLI_REFERENCE_RARE.md` に overview を置く。tool 単位の使い分けは `CLAUDE.md` の「CLI 仕様の確認規約」節を参照。
+When building the command, copy the template below as-is and fill in the values. The 4 enumerated in this template are frequent subcommands, and the complete specification of the payload schema uses `docs/CLI_REFERENCE.md` (Tier-A) as the canonical source. The rare subcommands (e.g. `init` / `preflight` / `record-timeout` / `read-checkpoint` etc.) use `python3 tools/orchestration_runtime.py <sub> --help` as the canonical source, with an overview in `docs/CLI_REFERENCE_RARE.md`. For the per-tool usage, see the "CLI reference conventions" section of `CLAUDE.md`.
 
 ```bash
 python3 tools/orchestration_runtime.py record-agent-run \
@@ -313,14 +313,14 @@ python3 tools/orchestration_runtime.py record-agent-run \
   }'
 ```
 
-- 終端 status (`pass` / `fail` / `fail_closed` / `blocked` / `timeout` / `cancel`) では `finished_at` を必須とする。
-- `pass` 終端では `output_refs` を必須とする。
-- step/substep role では `agent_session_id` / `context_id` / `context_isolated` / `node_key` を必須とする。Claude Code では `agent_session_id` と `context_id` は `agent_run_id` と同値で記録する。
-- orchestration role の `running` 初期 entry は `init_orchestration()` が自動挿入するため orchestration agent からは呼び出さない。終端 entry のみ orchestration agent が `set-status` 実行後に追記する。
+- For a terminal status (`pass` / `fail` / `fail_closed` / `blocked` / `timeout` / `cancel`), `finished_at` is required.
+- For a `pass` termination, `output_refs` is required.
+- For a step/substep role, `agent_session_id` / `context_id` / `context_isolated` / `node_key` are required. In Claude Code, `agent_session_id` and `context_id` are recorded with the same value as `agent_run_id`.
+- The `running` initial entry of the orchestration role is auto-inserted by `init_orchestration()`, so it is not called from the orchestration agent. Only the terminal entry is appended by the orchestration agent after running `set-status`.
 
-## `set-status` コマンドテンプレート（Claude Code backend）
+## `set-status` command template (Claude Code backend)
 
-コマンドを構築するときは下記テンプレートをそのままコピーして値を埋める。本テンプレートで列挙する 4 つは頻出 subcommand であり、payload schema の完全仕様は `docs/CLI_REFERENCE.md` (Tier-A) を canonical source とする。稀少 subcommand (例: `init` / `preflight` / `record-timeout` / `read-checkpoint` 等) は `python3 tools/orchestration_runtime.py <sub> --help` を canonical source とし、`docs/CLI_REFERENCE_RARE.md` に overview を置く。tool 単位の使い分けは `CLAUDE.md` の「CLI 仕様の確認規約」節を参照。
+When building the command, copy the template below as-is and fill in the values. The 4 enumerated in this template are frequent subcommands, and the complete specification of the payload schema uses `docs/CLI_REFERENCE.md` (Tier-A) as the canonical source. The rare subcommands (e.g. `init` / `preflight` / `record-timeout` / `read-checkpoint` etc.) use `python3 tools/orchestration_runtime.py <sub> --help` as the canonical source, with an overview in `docs/CLI_REFERENCE_RARE.md`. For the per-tool usage, see the "CLI reference conventions" section of `CLAUDE.md`.
 
 ```bash
 python3 tools/orchestration_runtime.py set-status \
@@ -332,10 +332,10 @@ python3 tools/orchestration_runtime.py set-status \
   --blocking-policy-scope <scope_or_omit>
 ```
 
-- `--reason-code` / `--reason-detail` / `--blocking-policy-scope` は `fail` / `fail_closed` 時に必要。`pass` では省略可。
-- 省略する optional flag は **flag ごと外す**（空文字や `omit` 文字列を値として渡してはならない）。例: `pass` 時は `--reason-code` の行ごと削除する。
-- orchestration agent は本コマンドを実行した後に `record-agent-run` で orchestration role の終端 entry を追記する。
+- `--reason-code` / `--reason-detail` / `--blocking-policy-scope` are needed for `fail` / `fail_closed`. They can be omitted for `pass`.
+- For an optional flag to omit, **drop the flag entirely** (do not pass an empty string or the string `omit` as a value). Example: for `pass`, delete the entire `--reason-code` line.
+- The orchestration agent appends the orchestration-role terminal entry with `record-agent-run` after running this command.
 
-## execution platform 別の補足
+## Supplement per execution platform
 
-execution platform ごとの子 `agent` 起動ツールと `preflight` 引数の対応は `CLAUDE.md` の「execution platform 別の子 `agent` 起動ツール」を参照する。
+For the correspondence between the child-`agent` launch tool and the `preflight` arguments per execution platform, refer to "child `agent` launch tool per execution platform" of `CLAUDE.md`.

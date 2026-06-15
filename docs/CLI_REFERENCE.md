@@ -1,108 +1,108 @@
-# CLI Reference (Tier-A 頻出 subcommand): `tools/orchestration_runtime.py`
+# CLI Reference (Tier-A frequent subcommands): `tools/orchestration_runtime.py`
 
-## このドキュメントの位置づけ
+## Position of this document
 
-`tools/orchestration_runtime.py` のうち **頻出 subcommand (Tier-A) の canonical CLI reference**。payload schema が複雑で phase 別の必須切替があり、`--help` 出力だけでは確定できないものを網羅する: `record-launch` / `record-agent-run` / `record-child-return` / `deactivate-child` / `record-reply` / `set-status` / `write-step-result` / `workflow-launch-check` / `reserve-phase-root` / `mark-dependency-readiness` / `guarded-apply-patch` / `run-gate` (計 12)。
+The **canonical CLI reference for the frequent subcommands (Tier-A)** of `tools/orchestration_runtime.py`. It covers those whose payload schema is complex, that have per-phase required-argument switching, and that cannot be determined from the `--help` output alone: `record-launch` / `record-agent-run` / `record-child-return` / `deactivate-child` / `record-reply` / `set-status` / `write-step-result` / `workflow-launch-check` / `reserve-phase-root` / `mark-dependency-readiness` / `guarded-apply-patch` / `run-gate` (12 total).
 
-稀少 subcommand (Tier-B: `init` / `preflight` / `preflight-status` / `record-timeout` / `read-checkpoint` / `verify-checkpoint-integrity` / `check-step-completed` / `orchestration-read` / `repair-agent-runs`) は overview のみ [docs/CLI_REFERENCE_RARE.md](CLI_REFERENCE_RARE.md) に置き、詳細は `python3 tools/orchestration_runtime.py <sub> --help` を canonical source とする。
+For the rare subcommands (Tier-B: `init` / `preflight` / `preflight-status` / `record-timeout` / `read-checkpoint` / `verify-checkpoint-integrity` / `check-step-completed` / `orchestration-read` / `repair-agent-runs`), only an overview is in [docs/CLI_REFERENCE_RARE.md](CLI_REFERENCE_RARE.md), and the canonical source for details is `python3 tools/orchestration_runtime.py <sub> --help`.
 
-tool / subcommand 別の情報取得方針 (頻出 vs 稀少、`--help` vs doc) は `CLAUDE.md` の「CLI 仕様の確認規約」節を canonical source とする。
+The information-acquisition policy per tool / subcommand (frequent vs rare, `--help` vs doc) uses the "CLI reference conventions" section of `CLAUDE.md` as the canonical source.
 
-argparse 定義が更新されたら本 file も同期して更新する (`tools/orchestration_runtime.py` の編集レビュー時に CLI_REFERENCE への追記漏れを check する。`tools/tests/test_cli_reference_sync.py` で機械的に diff を取る)。
+When the argparse definition is updated, update this file in sync (during a `tools/orchestration_runtime.py` edit review, check for a missing addition to CLI_REFERENCE. `tools/tests/test_cli_reference_sync.py` mechanically takes the diff).
 
-関連 canonical source:
-- 稀少 subcommand overview: [docs/CLI_REFERENCE_RARE.md](CLI_REFERENCE_RARE.md)
-- workflow 全体の起動契約: `skills/workflow-orchestration/SKILL.md` および `skills/workflow-orchestration/references/startup_contract.md`
-- 起動 prompt template: `skills/workflow-orchestration/references/launch_prompts.md`
-- workspace artifact 配置: `docs/WORKSPACE_LAYOUT.md`
-- hook 復旧 cheat sheet: `docs/RUNBOOK.md#hook-recovery`
+Related canonical sources:
+- rare subcommand overview: [docs/CLI_REFERENCE_RARE.md](CLI_REFERENCE_RARE.md)
+- the startup contract of the whole workflow: `skills/workflow-orchestration/SKILL.md` and `skills/workflow-orchestration/references/startup_contract.md`
+- launch prompt templates: `skills/workflow-orchestration/references/launch_prompts.md`
+- workspace artifact placement: `docs/WORKSPACE_LAYOUT.md`
+- hook recovery cheat sheet: `docs/RUNBOOK.md#hook-recovery`
 
-## 共通規約
+## Common conventions
 
-- `--repo-root` / `--orchestration-id` は (ほぼ) 全 subcommand で **required**。
-- agent_run_id は UUID。新規発行は `python3 tools/new_agent_run_id.py` を canonical 経路とする (`python3 -c 'import uuid; …'` は hook policy で reject)。
-- `node_key` の形式は `<spec_kind>/<spec_id>@<spec_version>` (例: `component/dynamics_shallow_water_flux_2d_rusanov_p0@0.1.0`)。filesystem path ではない。
-- `ir_id` / `pipeline_id` の形式は `<slug>_<YYYYMMDD>_<seq3>` (slug は hyphen-separated lowercase alphanumeric)。例: `flux-rsn-p0_20260425_001`。slug 中の underscore は invalid。
-- ISO 8601 timestamp は UTC (`Z` suffix) を canonical とする。
-- JSON 引数 (`--*-json`) は shell quoting に注意。複雑な payload は `--patch-file` のような file 指定を使う。
+- `--repo-root` / `--orchestration-id` are **required** in (almost) all subcommands.
+- agent_run_id is a UUID. The canonical path for issuing a new one is `python3 tools/new_agent_run_id.py` (`python3 -c 'import uuid; …'` is rejected by hook policy).
+- The form of `node_key` is `<spec_kind>/<spec_id>@<spec_version>` (e.g. `component/dynamics_shallow_water_flux_2d_rusanov_p0@0.1.0`). It is not a filesystem path.
+- The form of `ir_id` / `pipeline_id` is `<slug>_<YYYYMMDD>_<seq3>` (slug being hyphen-separated lowercase alphanumeric). E.g. `flux-rsn-p0_20260425_001`. An underscore in the slug is invalid.
+- ISO 8601 timestamps are canonically UTC (`Z` suffix).
+- For JSON arguments (`--*-json`), be careful with shell quoting. For a complex payload, use a file specification like `--patch-file`.
 
 ---
 
-## Tier-A 頻出 subcommand 一覧
+## Tier-A frequent subcommand list
 
-本 file で詳細を網羅する 12 subcommand。
+The 12 subcommands whose details are covered in this file.
 
-| subcommand | 用途 | section |
+| subcommand | purpose | section |
 |---|---|---|
-| `record-launch` | 子 agent 起動証跡 + capability_token + manifest 生成 | [record-launch](#record-launch) |
-| `record-child-return` | Adv-20: Agent tool return ack 記録 | [record-child-return](#record-child-return) |
-| `deactivate-child` | active_children marker 解除 | [deactivate-child](#deactivate-child) |
-| `record-reply` | launches/<arid>.reply.txt を Agent tool 応答で上書き | [record-reply](#record-reply) |
-| `record-agent-run` | agent_runs.jsonl へ 1 行追記 + agent.result.json/agent.summary.txt 保存 | [record-agent-run](#record-agent-run) |
-| `set-status` | orchestration_meta.json status 更新 + agent_runs.jsonl の orchestration 行を in-place 終端化 | [set-status](#set-status) |
-| `mark-dependency-readiness` | dependency_readiness detail flag を更新し top-level を派生 | [mark-dependency-readiness](#mark-dependency-readiness) |
-| `write-step-result` | step_result.json 生成と検証 | [write-step-result](#write-step-result) |
-| `reserve-phase-root` | ir_id / pipeline_id の予約 (path 実体化はしない) | [reserve-phase-root](#reserve-phase-root) |
-| `workflow-launch-check` | phase 着手前 gate (依存 readiness, agent 種別) | [workflow-launch-check](#workflow-launch-check) |
-| `run-gate` | validator gate (validate_pipeline_semantics 等) を capability 越しに実行 | [run-gate](#run-gate) |
-| `guarded-apply-patch` | `.json` / `.txt` への canonical 書き込み | [guarded-apply-patch](#guarded-apply-patch) |
+| `record-launch` | child-agent launch evidence + capability_token + manifest generation | [record-launch](#record-launch) |
+| `record-child-return` | Adv-20: record the Agent tool return ack | [record-child-return](#record-child-return) |
+| `deactivate-child` | release the active_children marker | [deactivate-child](#deactivate-child) |
+| `record-reply` | overwrite launches/<arid>.reply.txt with the Agent tool response | [record-reply](#record-reply) |
+| `record-agent-run` | append 1 line to agent_runs.jsonl + save agent.result.json/agent.summary.txt | [record-agent-run](#record-agent-run) |
+| `set-status` | update orchestration_meta.json status + terminate the orchestration row of agent_runs.jsonl in-place | [set-status](#set-status) |
+| `mark-dependency-readiness` | update the dependency_readiness detail flags and derive the top-level | [mark-dependency-readiness](#mark-dependency-readiness) |
+| `write-step-result` | generate and verify step_result.json | [write-step-result](#write-step-result) |
+| `reserve-phase-root` | reserve ir_id / pipeline_id (does not materialize the path) | [reserve-phase-root](#reserve-phase-root) |
+| `workflow-launch-check` | the pre-phase gate (dependency readiness, agent type) | [workflow-launch-check](#workflow-launch-check) |
+| `run-gate` | run a validator gate (validate_pipeline_semantics etc.) across the capability | [run-gate](#run-gate) |
+| `guarded-apply-patch` | the canonical write to `.json` / `.txt` | [guarded-apply-patch](#guarded-apply-patch) |
 
-## Tier-B 稀少 subcommand 一覧 (overview のみ)
+## Tier-B rare subcommand list (overview only)
 
-詳細は `python3 tools/orchestration_runtime.py <sub> --help`、overview は [docs/CLI_REFERENCE_RARE.md](CLI_REFERENCE_RARE.md)。
+For details `python3 tools/orchestration_runtime.py <sub> --help`, for the overview [docs/CLI_REFERENCE_RARE.md](CLI_REFERENCE_RARE.md).
 
-| subcommand | 用途 |
+| subcommand | purpose |
 |---|---|
-| `init` | orchestration 開始 / orchestration_meta.json 生成 (通常は `tools/run_workflow.py` 経由) |
-| `preflight` | execution platform 起動可否判定 |
-| `preflight-status` | 既存 preflight.json を読み返す |
-| `record-timeout` | API stream idle timeout の canonical 復旧 |
-| `orchestration-read` | manifest 外 path の gate-mediated read |
-| `read-checkpoint` | orchestration_checkpoint.json 取得 |
-| `verify-checkpoint-integrity` | checkpoint と artifact hash の照合 |
-| `check-step-completed` | resume_enabled で当該 step の完了を確認 |
+| `init` | start an orchestration / generate orchestration_meta.json (usually via `tools/run_workflow.py`) |
+| `preflight` | judge the launchability of the execution platform |
+| `preflight-status` | read back an existing preflight.json |
+| `record-timeout` | the canonical recovery for an API stream idle timeout |
+| `orchestration-read` | the gate-mediated read of a path outside the manifest |
+| `read-checkpoint` | obtain orchestration_checkpoint.json |
+| `verify-checkpoint-integrity` | reconcile the checkpoint with the artifact hash |
+| `check-step-completed` | with resume_enabled, confirm the completion of the relevant step |
 
 ---
 
 ## record-launch
 
-子 agent 起動の最重要 entry point。capability_token・sandbox_profile・output_manifest・read_manifest を生成し `launches/<child_agent_run_id>.{request,response,prompt,reply}.txt` を書く。
+The most important entry point of a child-agent launch. It generates the capability_token, sandbox_profile, output_manifest, and read_manifest, and writes `launches/<child_agent_run_id>.{request,response,prompt,reply}.txt`.
 
-**Claude Code では `Agent` tool 起動の前**に呼ぶこと (子 agent が起動直後に capabilities/<arid>.json を Read する必要があるため)。
+In Claude Code, call it **before launching the `Agent` tool** (because the child agent needs to Read capabilities/<arid>.json immediately after launch).
 
-| arg | 必須 | 説明 |
+| arg | required | description |
 |---|---|---|
 | `--repo-root` | yes | |
 | `--orchestration-id` | yes | |
-| `--parent-agent-run-id` | yes | orchestration agent (親) の UUID |
-| `--child-agent-run-id` | yes | 事前発行した子 UUID。Claude Code では `agent_session_id` も同値となる |
-| `--request-json` | yes | 子起動 request payload (下記 schema) |
-| `--response-json` | yes | spawn 応答 payload (下記 schema) |
-| `--relation-type` | no | 既定 `launch` |
+| `--parent-agent-run-id` | yes | the UUID of the orchestration agent (parent) |
+| `--child-agent-run-id` | yes | the pre-issued child UUID. In Claude Code, `agent_session_id` is also the same value |
+| `--request-json` | yes | the child-launch request payload (schema below) |
+| `--response-json` | yes | the spawn response payload (schema below) |
+| `--relation-type` | no | default `launch` |
 
-### `--request-json` payload (主要 field)
+### `--request-json` payload (main fields)
 
-| field | required | 内容 |
+| field | required | content |
 |---|---|---|
-| `agent_role` | yes | `step` または `substep` |
+| `agent_role` | yes | `step` or `substep` |
 | `node_key` | yes | `<spec_kind>/<spec_id>@<spec_version>` |
-| `step` | yes | `compile` / `generate` / `build` / `validate` (core 5-phase)。Tune / Promote は任意フローで別 entrypoint |
-| `substep` | substep agent では yes | Compile / Generate: `generate` / `verify`。Validate: `execute` / `judge` |
+| `step` | yes | `compile` / `generate` / `build` / `validate` (core 5-phase). Tune / Promote are optional flows with a separate entrypoint |
+| `substep` | yes for a substep agent | Compile / Generate: `generate` / `verify`. Validate: `execute` / `judge` |
 | `orchestration_id` | yes | |
-| `agent_run_id` | yes | child_agent_run_id と一致 |
+| `agent_run_id` | yes | matches child_agent_run_id |
 | `parent_agent_run_id` | yes | |
-| `agent_model` | yes | 子 agent を実行する LLM model id (例 `claude-opus-4-8`)。runtime からは導出できない provenance 情報なので launch 時に必須。record-launch が request に永続化し、`record-agent-run` が `agent_runs.jsonl` の当該 step/substep entry へ自動転記する (下記参照)。未指定なら `ValueError: launch request must include non-empty agent_model` で fail-fast |
+| `agent_model` | yes | the LLM model id that runs the child agent (e.g. `claude-opus-4-8`). It is provenance information that cannot be derived by the runtime, so it is required at launch. record-launch persists it in the request, and `record-agent-run` auto-copies it to the relevant step/substep entry of `agent_runs.jsonl` (see below). When unspecified, it fail-fasts with `ValueError: launch request must include non-empty agent_model` |
 | `workflow_mode` | yes | `dev` / `prod` |
-| `ir_ref` | yes | `workspace/ir/<node_key_safe>/<ir_id>` (Compile phase 含めて全 phase で必須) |
-| `pipeline_ref` | yes | `workspace/pipelines/<node_key_safe>/<pipeline_id>` (Compile phase でも必須。未生成なら先に `reserve-phase-root --step generate` で予約) |
-| `dependency_ref` | yes | Compile: `spec/.../deps.yaml`、Generate 以降: workspace 内 phase root |
-| `skill_name` | yes | `workflow-<step>` または `workflow-<step>-<substep>` |
+| `ir_ref` | yes | `workspace/ir/<node_key_safe>/<ir_id>` (required in all phases including the Compile phase) |
+| `pipeline_ref` | yes | `workspace/pipelines/<node_key_safe>/<pipeline_id>` (required even in the Compile phase. If not yet generated, reserve it first with `reserve-phase-root --step generate`) |
+| `dependency_ref` | yes | Compile: `spec/.../deps.yaml`, from Generate onward: the phase root in workspace |
+| `skill_name` | yes | `workflow-<step>` or `workflow-<step>-<substep>` |
 | `skill_ref` | yes | `skills/<skill_name>/SKILL.md` |
-| `allowed_output_paths` または `required_outputs` または `output_refs` | step/substep では 1 つ必須 | 書き込み許可 path のリスト |
-| `allowed_file_tool_paths` | optional | `Edit` / `Write` 直接書き込み path。`allowed_output_paths` の subset |
-| `run_id` | Validate step では yes | 実行 ID (1 launch につき 1 つ pin) |
-| `source_id` | Generate substep / Validate / Build (cross-phase Make) では yes | Generate 出力を識別 |
-| `source_binary_id` | Validate step では yes | 使用する `binary_id` |
+| `allowed_output_paths` or `required_outputs` or `output_refs` | one required for step/substep | the list of write-permitted paths |
+| `allowed_file_tool_paths` | optional | the path for direct `Edit` / `Write`. A subset of `allowed_output_paths` |
+| `run_id` | yes for a Validate step | the execution ID (1 pinned per launch) |
+| `source_id` | yes for a Generate substep / Validate / Build (cross-phase Make) | identifies the Generate output |
+| `source_binary_id` | yes for a Validate step | the `binary_id` to use |
 
 ### `--response-json` payload (Claude Code)
 
@@ -115,320 +115,319 @@ argparse 定義が更新されたら本 file も同期して更新する (`tools
 }
 ```
 
-`sandbox_runtime` / `sandbox_enforced` / `sandbox_profile_ref` は record-launch が自動付与する。
+`sandbox_runtime` / `sandbox_enforced` / `sandbox_profile_ref` are auto-added by record-launch.
 
-**Make build の `src/Makefile` auto-inject + provisioning 検証:** `step=generate` かつ `spec.ir.yaml.impl_defaults.toolchain.build_system=make` のとき、record-launch は `<pipeline_ref>/source/<source_id>/src/Makefile` を `allowed_output_paths` / `allowed_file_tool_paths` へ自動注入する (bare `src/` directory entry だけでは拡張子なしの Makefile が全経路で書けないため)。明示 `allowed_file_tool_paths` を渡して Makefile pin を漏らした場合は **child 起動前に `ValueError` で fail-fast** する。canonical 契約は [docs/ORCHESTRATION.md](ORCHESTRATION.md) を参照。
+**Make build's `src/Makefile` auto-inject + provisioning verification:** when `step=generate` and `spec.ir.yaml.impl_defaults.toolchain.build_system=make`, record-launch auto-injects `<pipeline_ref>/source/<source_id>/src/Makefile` into `allowed_output_paths` / `allowed_file_tool_paths` (because with only a bare `src/` directory entry the extension-less Makefile cannot be written via any path). When an explicit `allowed_file_tool_paths` is passed and the Makefile pin is missed, it **fail-fasts with a `ValueError` before launching the child**. For the canonical contract, refer to [docs/ORCHESTRATION.md](ORCHESTRATION.md).
 
 ---
 
 ## record-child-return
 
-Adv-20: orchestration agent が `Agent` tool の return を観測した証跡 (`child_returns/<arid>.txt`) を記録。`deactivate-child` の前提。
+Adv-20: record the evidence (`child_returns/<arid>.txt`) that the orchestration agent observed the `Agent` tool return. A premise of `deactivate-child`.
 
-| arg | 必須 | 説明 |
+| arg | required | description |
 |---|---|---|
 | `--repo-root` | yes | |
 | `--orchestration-id` | yes | |
-| `--agent-run-id` | yes | 子 agent の UUID |
-| `--return-token` | yes | Adv-30: `workspace/orchestrations/<orch>/launches/<arid>.parent_return_token` の値。`$(cat <path>)` で渡す。**`Read` tool 等で当該 file を先に読んではならない**（active_child window 中の Read は child arid の `read_manifest` で評価され `read_manifest_read_guard` で block される） |
-| `--reply-excerpt` | no | 任意短文 (200 chars 截断)。audit 用 |
+| `--agent-run-id` | yes | the child agent's UUID |
+| `--return-token` | yes | Adv-30: the value of `workspace/orchestrations/<orch>/launches/<arid>.parent_return_token`. Pass it with `$(cat <path>)`. **Do not read that file in advance with the `Read` tool etc.** (a Read during the active_child window is evaluated against the child arid's `read_manifest` and blocked by `read_manifest_read_guard`) |
+| `--reply-excerpt` | no | an optional short text (truncated to 200 chars). For audit |
 
 ---
 
 ## deactivate-child
 
-active context を orchestration agent に切り戻す。`record-child-return` の ack が無いと `ValueError` で reject される。
+Switch the active context back to the orchestration agent. Without the ack of `record-child-return`, it is rejected with a `ValueError`.
 
-| arg | 必須 | 説明 |
+| arg | required | description |
 |---|---|---|
 | `--repo-root` | yes | |
 | `--orchestration-id` | yes | |
-| `--child-run-id` | yes | 子 agent の UUID |
+| `--child-run-id` | yes | the child agent's UUID |
 
 ---
 
 ## record-reply
 
-`launches/<arid>.reply.txt` を `Agent` tool の最終応答テキストで上書き。
+Overwrite `launches/<arid>.reply.txt` with the final response text of the `Agent` tool.
 
-| arg | 必須 | 説明 |
+| arg | required | description |
 |---|---|---|
 | `--repo-root` | yes | |
 | `--orchestration-id` | yes | |
-| `--agent-run-id` | yes | 子 agent の UUID |
-| `--reply-text` | 1 つ必須 | 直接テキスト |
-| `--reply-from-stdin` | 1 つ必須 | flag。stdin から読む (大きい reply 用) |
+| `--agent-run-id` | yes | the child agent's UUID |
+| `--reply-text` | one required | direct text |
+| `--reply-from-stdin` | one required | flag. read from stdin (for a large reply) |
 
 ---
 
 ## record-agent-run
 
-`agent_runs.jsonl` へ 1 行追記。step/substep role では `agent.result.json` と `agent.summary.txt` も保存。capability の write_root に含まれない `unauthorized write` を検出した場合 reject。
+Append 1 line to `agent_runs.jsonl`. For a step/substep role, also save `agent.result.json` and `agent.summary.txt`. When an `unauthorized write` not included in the capability's write_root is detected, reject.
 
-| arg | 必須 | 説明 |
+| arg | required | description |
 |---|---|---|
 | `--repo-root` | yes | |
 | `--orchestration-id` | yes | |
-| `--agent-run-json` | yes | 下記 schema |
+| `--agent-run-json` | yes | schema below |
 
 ### `--agent-run-json` payload
 
-| field | required | 内容 |
+| field | required | content |
 |---|---|---|
 | `agent_run_id` | yes | UUID |
 | `agent_role` | yes | `orchestration` / `step` / `substep` |
 | `agent_backend` | yes | `claude` / `codex` / `cursor` |
 | `status` | yes | `running` / `pass` / `fail` / `blocked` / `timeout` / `cancel` |
 | `started_at` | yes | ISO 8601 |
-| `agent_session_id` | step/substep では yes | Claude Code では `agent_run_id` と同値 |
-| `context_id` | step/substep では yes | unique UUID |
-| `context_isolated` | step/substep では yes | `true` (Claude Code) |
-| `node_key` | step/substep では yes | |
-| `finished_at` | terminal status では yes | ISO 8601 |
-| `output_refs` | `pass` では yes | 書き込んだ artifact path のリスト |
-| `parent_agent_run_id` | 自動 | step/substep entry で必須だが **payload に書く必要はない**。`record-agent-run` が `launches/<arid>.request.json` から自動転記する (record-launch が `--parent-agent-run-id` から永続化済み)。明示指定した値が優先される |
-| `agent_model` | 自動 | 同上。launch request の `agent_model` (record-launch 時に必須指定) から自動転記される。明示指定した値が優先される |
+| `agent_session_id` | yes for step/substep | in Claude Code, the same value as `agent_run_id` |
+| `context_id` | yes for step/substep | unique UUID |
+| `context_isolated` | yes for step/substep | `true` (Claude Code) |
+| `node_key` | yes for step/substep | |
+| `finished_at` | yes for a terminal status | ISO 8601 |
+| `output_refs` | yes for `pass` | the list of written artifact paths |
+| `parent_agent_run_id` | automatic | required for a step/substep entry but **need not be written in the payload**. `record-agent-run` auto-copies it from `launches/<arid>.request.json` (record-launch already persisted it from `--parent-agent-run-id`). An explicitly specified value takes precedence |
+| `agent_model` | automatic | same as above. auto-copied from the launch request's `agent_model` (required at record-launch time). An explicitly specified value takes precedence |
 | `issue_severity` | optional | `minor` / `major` / `critical` |
 
-> **`parent_agent_run_id` / `agent_model` の自動転記:** `validate_pipeline_semantics --stage pre_judge` は全 step/substep entry に両 field を要求する。これらは launch request に既に存在するため、`record-agent-run` が payload 欠落時に launch request から `setdefault` で補完する。orchestration agent は record-agent-run payload にこれらを明示する必要はない (`agent_model` は record-launch 時に 1 度だけ指定する)。
+> **Auto-copy of `parent_agent_run_id` / `agent_model`:** `validate_pipeline_semantics --stage pre_judge` requires both fields in every step/substep entry. Because these already exist in the launch request, `record-agent-run` completes them from the launch request with `setdefault` when missing from the payload. The orchestration agent need not make these explicit in the record-agent-run payload (`agent_model` is specified only once at record-launch time).
 
-**呼び出し規約**
+**Calling conventions**
 
-- **同一 `agent_run_id` の二重登録は不可。** 既存行と同じ `agent_run_id` で `record-agent-run` を再 invoke すると `ValueError: duplicate agent_run_id: <id>` を raise する。idempotent ではないため、再試行する場合は `python3 tools/new_agent_run_id.py` で新規 `agent_run_id` を採番し直し、`record-launch` から sequence をやり直す。回復手順の詳細は [docs/RUNBOOK.md#duplicate-agent_run_id-recovery](RUNBOOK.md#duplicate-agent_run_id-recovery)。
-- **orchestration agent 自身の entry は orchestration 起動直後に 1 回 append する**。`agent_role=orchestration`、`status=running` で append する。orchestration agent 自身は `record-agent-run` でこの行を更新してはならない（2 回目の `record-agent-run` は `duplicate agent_run_id` で reject される）。代わりに、終端時に [set-status](#set-status) が runtime 権限でこの行を in-place に terminal status へ書き換え `finished_at` を付与する（resume 時は逆に `running` へ戻す）。orchestration の canonical な terminal 状態は引き続き `orchestration_meta.json` 側で表現される。
-- **runtime placeholder 復元**: terminal 検査の baseline diff の前に、`record-agent-run` は `created_file_pin_stubs` の runtime-owned placeholder (例 `lineage.json`) のうち gate 非経由で collateral 削除されたものを 0-byte で復元する。これにより削除された runtime placeholder が `unauthorized_write` 判定され、復元手段の無い orchestration が恒久 `fail_closed` deadlock に陥るのを防ぐ (`status=fail`/`blocked`/`timeout` でも適用し失敗 run を記録可能にする)。canonical 契約は [docs/ORCHESTRATION.md](ORCHESTRATION.md) を参照。
+- **Double registration of the same `agent_run_id` is not possible.** Re-invoking `record-agent-run` with the same `agent_run_id` as an existing row raises `ValueError: duplicate agent_run_id: <id>`. Because it is not idempotent, to retry, re-number a new `agent_run_id` with `python3 tools/new_agent_run_id.py` and redo the sequence from `record-launch`. For the detailed recovery procedure, [docs/RUNBOOK.md#duplicate-agent_run_id-recovery](RUNBOOK.md#duplicate-agent_run_id-recovery).
+- **The orchestration agent's own entry is appended once immediately after orchestration launch**. Append with `agent_role=orchestration`, `status=running`. The orchestration agent itself must not update this row with `record-agent-run` (a second `record-agent-run` is rejected with `duplicate agent_run_id`). Instead, at termination, [set-status](#set-status) rewrites this row in-place to a terminal status with runtime privilege and assigns `finished_at` (on resume, it conversely returns it to `running`). The orchestration's canonical terminal state continues to be expressed on the `orchestration_meta.json` side.
+- **runtime placeholder restoration**: before the terminal-check baseline diff, `record-agent-run` restores, as 0-byte, the runtime-owned placeholders of `created_file_pin_stubs` (e.g. `lineage.json`) that were collaterally deleted without going through a gate. This prevents a deleted runtime placeholder from being judged an `unauthorized_write` and the orchestration, with no means of restoration, falling into a permanent `fail_closed` deadlock (it also applies to `status=fail`/`blocked`/`timeout` to make it possible to record a failed run). For the canonical contract, refer to [docs/ORCHESTRATION.md](ORCHESTRATION.md).
 
 ---
 
 ## set-status
 
-`orchestration_meta.json` の `status` / `reason_code` / `reason_detail` / `blocking_policy_scope` を更新。**orchestration finalize / finalization の正規 entrypoint** であり、`finalize_orchestration` 等の別 subcommand は存在しない。`pass` / `fail` / `fail_closed` への遷移が orchestration 全体の terminal 操作となる。terminal 遷移時には併せて `agent_runs.jsonl` の orchestration 自身の行（`agent_role=orchestration`）を **in-place で当該 terminal status へ書き換え**、`finished_at` を付与する（append ではなく rewrite なので `duplicate agent_run_id` guard には抵触しない）。`running` 行の終端化に加え、許容される `fail` → `fail_closed` 昇格でも行を追従させる（既に `fail` の行を `fail_closed` へ更新）。行が既に目標 status と一致する場合は no-op（同一 terminal の replay は `finished_at` を保持）。これは agent_runs ベースの audit / `validate_workspace_root` が orchestration 行を恒久 `running` と誤認するのを防ぐためで、`orchestration_meta.json` が canonical な終端状態であることは変わらない。`record-agent-run` を 2 回目に呼んで行を更新する経路は依然として存在しない（その経路は `duplicate agent_run_id` で reject される）。resume（`init --resume-from-checkpoint` の terminal reset）時は逆操作として当該行を `running` へ戻し `finished_at` を除去する。
+Update `status` / `reason_code` / `reason_detail` / `blocking_policy_scope` of `orchestration_meta.json`. It is the **legitimate entrypoint for orchestration finalize / finalization**, and there is no separate subcommand such as `finalize_orchestration`. A transition to `pass` / `fail` / `fail_closed` is the terminal operation of the whole orchestration. On a terminal transition, it also **rewrites the orchestration's own row (`agent_role=orchestration`) of `agent_runs.jsonl` in-place to that terminal status** and assigns `finished_at` (it is a rewrite, not an append, so it does not hit the `duplicate agent_run_id` guard). In addition to terminating a `running` row, it also follows the row for the permitted `fail` → `fail_closed` promotion (updating an already-`fail` row to `fail_closed`). When the row already matches the target status, it is a no-op (a replay of the same terminal preserves `finished_at`). This is to prevent the agent_runs-based audit / `validate_workspace_root` from mistaking the orchestration row as permanently `running`, and `orchestration_meta.json` remains the canonical terminal state. There is still no path to update the row by calling `record-agent-run` a second time (that path is rejected with `duplicate agent_run_id`). On resume (the terminal reset of `init --resume-from-checkpoint`), as the inverse operation, it returns the relevant row to `running` and removes `finished_at`.
 
-| arg | 必須 | 説明 |
+| arg | required | description |
 |---|---|---|
 | `--repo-root` | yes | |
 | `--orchestration-id` | yes | |
-| `--status` | yes | `pass` / `fail` / `fail_closed` / `blocked` / 等 |
-| `--reason-code` | no | snake_case 識別子 (例: `compile_verify_shape_expr_invalid`) |
-| `--reason-detail` | no | 自由文 |
-| `--blocking-policy-scope` | no | `sandbox` / `verify` / `dependency` 等 |
+| `--status` | yes | `pass` / `fail` / `fail_closed` / `blocked` / etc. |
+| `--reason-code` | no | a snake_case identifier (e.g. `compile_verify_shape_expr_invalid`) |
+| `--reason-detail` | no | free text |
+| `--blocking-policy-scope` | no | `sandbox` / `verify` / `dependency` etc. |
 
-**呼び出し規約**
+**Calling conventions**
 
-- 同一 terminal 値の再呼び出しは at-least-once retry を許容する **idempotent な操作**。replay は status-specific の precondition (`pass` の preflight/completion 検証、`fail_closed` の reason_code 必須) を再実行しない (lock 取得後の terminal-replay 検出が status-specific 検証より先に行われる)。**replay 時に phase_state_log.jsonl に canonical `set_status` event が無い場合 (元の forward 呼び出しが meta + marker commit 後に log append で失敗した場合)、persisted meta の reason_code / reason_detail / blocking_policy_scope から backfill されてから replay 完了する**。backfill された event は `backfilled: true` フラグ付き:
-  - `cleanup_committed/<orch_arid>.json` marker 未書き込み → cleanup retry (`_cleanup_agent_tmp_root` + marker 書き込みのみ再実行、narrative fields は不変)。`phase_state_log.jsonl` に `event=set_status_cleanup_retry`。
-  - marker 書き込み済み (fully committed) → no-op replay (既存 meta をそのまま返す)。`phase_state_log.jsonl` に `event=set_status_noop_replay`。defensive retry や response loss 後の reissue が `ValueError` にならないことを保証。
-- narrative fields (`reason_code` / `reason_detail` / `blocking_policy_scope`) は 1 回目の `set-status` で固定する。再呼び出しは narrative を上書きしない。narrative の追記は `workspace/orchestrations/<orchestration_id>/failure_analysis.json` を直接編集する (orchestration agent の `allowed_file_tool_paths` に登録済み)。
-- terminal 間遷移で唯一許容されるのは `fail` → `fail_closed` (live preflight gate fail 後に fail_closed を確定する流れ)。それ以外の terminal-to-terminal 遷移は `ValueError` で reject される。
-- 並行 terminalizer から呼ばれることを想定し、read-check-write-cleanup-marker の critical section は `orchestration_meta.json.lock` 上の fcntl `LOCK_EX` で serialize される (POSIX 環境)。`write_preflight` の `orchestration_meta.json` 更新と `mark-dependency-readiness` の更新は同じロックを共有するため、`mark-dependency-readiness` で verified された flag が並行 preflight に上書きされる race は発生しない。
-- `phase_state_log.jsonl` の canonical `set_status` event は **commit 後の `orchestration_meta.json` から読み返した値** (`.strip()` 正規化後、`fail → fail_closed` 昇格後等) を記録する。raw call arguments でなく persisted state を audit するため、forward 書き込みと replay backfill が同一 shape になり、recovery / postmortem tooling での乖離が起きない。
+- A re-call with the same terminal value is an **idempotent operation** that tolerates at-least-once retry. A replay does not re-run the status-specific precondition (the preflight/completion verification of `pass`, the reason_code requirement of `fail_closed`) (the terminal-replay detection after lock acquisition happens before the status-specific verification). **On replay, when there is no canonical `set_status` event in phase_state_log.jsonl (the original forward call failed at the log append after committing meta + marker), it is backfilled from the persisted meta's reason_code / reason_detail / blocking_policy_scope before the replay completes.** The backfilled event is flagged `backfilled: true`:
+  - `cleanup_committed/<orch_arid>.json` marker not written → cleanup retry (re-run only `_cleanup_agent_tmp_root` + marker write, narrative fields unchanged). `event=set_status_cleanup_retry` in `phase_state_log.jsonl`.
+  - marker written (fully committed) → no-op replay (return the existing meta as-is). `event=set_status_noop_replay` in `phase_state_log.jsonl`. Guarantees that a defensive retry or a reissue after response loss does not become a `ValueError`.
+- The narrative fields (`reason_code` / `reason_detail` / `blocking_policy_scope`) are fixed at the first `set-status`. A re-call does not overwrite the narrative. To append a narrative, directly edit `workspace/orchestrations/<orchestration_id>/failure_analysis.json` (already registered in the orchestration agent's `allowed_file_tool_paths`).
+- The only permitted terminal-to-terminal transition is `fail` → `fail_closed` (the flow of finalizing fail_closed after a live preflight gate fail). Any other terminal-to-terminal transition is rejected with a `ValueError`.
+- Assuming it is called from a concurrent terminalizer, the read-check-write-cleanup-marker critical section is serialized by an fcntl `LOCK_EX` on `orchestration_meta.json.lock` (POSIX environment). Because the `orchestration_meta.json` update of `write_preflight` and the update of `mark-dependency-readiness` share the same lock, the race in which a flag verified by `mark-dependency-readiness` is overwritten by a concurrent preflight does not occur.
+- The canonical `set_status` event of `phase_state_log.jsonl` records the value **read back from `orchestration_meta.json` after commit** (after `.strip()` normalization, after the `fail → fail_closed` promotion, etc.). Because it audits the persisted state, not the raw call arguments, the forward write and the replay backfill have the same shape, and no divergence occurs in recovery / postmortem tooling.
 
 ---
 
 ## write-step-result
 
-`workspace/orchestrations/<orch>/steps/<node_key_safe>/<step>/<arid>/step_result.json` を生成し validation を実行。
+Generate `workspace/orchestrations/<orch>/steps/<node_key_safe>/<step>/<arid>/step_result.json` and run validation.
 
-| arg | 必須 | 説明 |
+| arg | required | description |
 |---|---|---|
 | `--repo-root` | yes | |
 | `--orchestration-id` | yes | |
 | `--node-key` | yes | |
 | `--step` | yes | |
-| `--agent-run-id` | yes | step を執行した primary agent (orchestration agent for substep-aware phases) |
-| `--result-json` | yes | 下記 schema |
+| `--agent-run-id` | yes | the primary agent that executed the step (the orchestration agent for substep-aware phases) |
+| `--result-json` | yes | schema below |
 
 ### `--result-json` payload
 
-| field | required | 内容 |
+| field | required | content |
 |---|---|---|
 | `status` | yes | `pass` / `fail` / `blocked` / `timeout` / `cancel` |
 | `required_outputs` | yes | list[str] |
 | `executor_agent_run_id` | yes | UUID |
-| `substep_agent_run_ids` | yes | list[str]。substep を持つ phase は全 substep の UUID を欠落なく含める |
+| `substep_agent_run_ids` | yes | list[str]. A phase that has substeps includes the UUID of all substeps without omission |
 | `failed_substeps` | optional | list[str] |
-| `retry_decisions` | optional | list[object]。各 item: `{issue_severity, repair_strategy, repair_target_agent_run_id, new_agent_run_id, repair_reason}` |
-| `validation_stage` | compile/generate/build/validate の terminal status では yes | `compile` / `post_generate` / `post_build` / `post_execute` / `pre_judge` / `full` のいずれか (step 別の許容値あり) |
+| `retry_decisions` | optional | list[object]. Each item: `{issue_severity, repair_strategy, repair_target_agent_run_id, new_agent_run_id, repair_reason}` |
+| `validation_stage` | yes for a terminal status of compile/generate/build/validate | one of `compile` / `post_generate` / `post_build` / `post_execute` / `pre_judge` / `full` (with per-step allowed values) |
 
 ---
 
 ## reserve-phase-root
 
-`ir_id` または `pipeline_id` を予約。実 directory は作成しない (子 agent が作成する)。Compile phase の launch 前に `--step compile` (ir_id 予約) と `--step generate` (pipeline_id 予約) の両方が必要。
+Reserve an `ir_id` or `pipeline_id`. It does not create the actual directory (the child agent creates it). Before the Compile phase launch, both `--step compile` (ir_id reservation) and `--step generate` (pipeline_id reservation) are needed.
 
-| arg | 必須 | 説明 |
+| arg | required | description |
 |---|---|---|
 | `--repo-root` | yes | |
 | `--orchestration-id` | yes | |
 | `--node-key` | yes | |
-| `--step` | yes | `compile` で ir_id 予約、`generate` で pipeline_id 予約 |
-| `--reserved-id` | yes | `<slug>_<YYYYMMDD>_<seq3>` (slug 中の underscore は invalid; hyphen を使う) |
-| `--reserved-by-agent-run-id` | yes | 予約 ID を使う agent の UUID |
+| `--step` | yes | reserve ir_id with `compile`, reserve pipeline_id with `generate` |
+| `--reserved-id` | yes | `<slug>_<YYYYMMDD>_<seq3>` (an underscore in the slug is invalid; use a hyphen) |
+| `--reserved-by-agent-run-id` | yes | the UUID of the agent that uses the reserved ID |
 
 ---
 
 ## workflow-launch-check
 
-phase 着手前 gate。execution platform 可用性、session policy、依存 readiness、必要な child agent 種別を check する。最初の phase 着手前に 1 回実行。`status=fail_closed` を返したら `set-status` で停止する。
+The pre-phase gate. Checks execution-platform availability, session policy, dependency readiness, and the required child-agent type. Run once before the first phase. When it returns `status=fail_closed`, stop with `set-status`.
 
-| arg | 必須 | 説明 |
+| arg | required | description |
 |---|---|---|
 | `--repo-root` | yes | |
 | `--orchestration-id` | yes | |
 | `--node-key` | yes | |
 | `--step` | yes | `compile` / `generate` / `build` / `validate` (core 5-phase) |
-| `--backend` | no | 既定 `codex` |
-| `--require-child-agent` | yes | `step` または `substep`。Compile / Generate / Validate は `substep`、Build は `step` |
-| `--launch-request-json` | no | downstream artifact check 用の launch request payload |
+| `--backend` | no | default `codex` |
+| `--require-child-agent` | yes | `step` or `substep`. Compile / Generate / Validate are `substep`, Build is `step` |
+| `--launch-request-json` | no | the launch request payload for the downstream artifact check |
 
-返値: `{"status": "pass"|"fail_closed", "next_action": "...", ...}`。
+Return value: `{"status": "pass"|"fail_closed", "next_action": "...", ...}`.
 
-### dependency_readiness (orchestration_meta.json) の canonical field
+### Canonical fields of dependency_readiness (orchestration_meta.json)
 
-`workflow-launch-check` が参照する依存 readiness の canonical key を以下に定義する。`preflight` サブコマンドが orchestration_meta 初期化時に書き込み、`mark-dependency-readiness` (下記) が verification 完了後に flag を更新する。
+Below are the canonical keys of the dependency readiness that `workflow-launch-check` references. The `preflight` subcommand writes them at orchestration_meta initialization, and `mark-dependency-readiness` (below) updates the flags after verification completes.
 
-| key | step | 内容 |
+| key | step | content |
 |---|---|---|
-| `dependency_readiness.direct_dependency_compile_readiness` | `compile` | 直下依存 node の `ir_ref` と `ir_meta.json.verification_status` が満たされているか |
-| `dependency_readiness.direct_dependency_execution_readiness` | `generate` / `build` / `validate` | 直下依存 node の `ir_ref` / `pipeline_ref` / 最新 `aggregate_verdict` が満たされているか |
-| `dependency_readiness.detail.ir_ref_verified` | `compile` 以降 | |
-| `dependency_readiness.detail.pipeline_ref_verified` | `generate` 以降 | |
+| `dependency_readiness.direct_dependency_compile_readiness` | `compile` | whether the immediate dependency node's `ir_ref` and `ir_meta.json.verification_status` are satisfied |
+| `dependency_readiness.direct_dependency_execution_readiness` | `generate` / `build` / `validate` | whether the immediate dependency node's `ir_ref` / `pipeline_ref` / latest `aggregate_verdict` are satisfied |
+| `dependency_readiness.detail.ir_ref_verified` | `compile` onward | |
+| `dependency_readiness.detail.pipeline_ref_verified` | `generate` onward | |
 | `dependency_readiness.detail.aggregate_verdict_verified` | `validate` | |
 
-未記録または `true` 以外の値が記録されている場合、`workflow-launch-check` は `fail_closed` (`reason_detail=direct_dependency_<step>_readiness_not_pass` または `dependency_readiness_detail_not_pass:<key>`) を返す。stored `dep_set_fingerprint` と現在計算した fingerprint が一致しない場合は `reason_detail=dep_set_fingerprint_stale` で reject される。**さらに launch-time で deps.yaml が存在する場合、gate は live recompute を行い、persisted booleans でなく recomputed booleans を authoritative として判定する**: `orchestration_meta.json` を直接編集して flag を forge しても、live recompute が false を返せば gate は reject する。live recompute が失敗した場合、production は **fail-closed** で具体的な reason を返す: `deps_yaml_missing_or_unparseable` (deps.yaml 不在または YAML パース失敗) と `deps_yaml_malformed_schema` (schema が malformed) は区別される (Codex round 25 F2)。test scaffolding が persisted booleans への legacy fallback を必要とする場合は環境変数 `METDSL_DEP_READINESS_ALLOW_PERSISTED_FALLBACK=1` で opt-in する (production 環境では設定しない)。PyYAML は deps.yaml / spec_catalog.yaml を parse する経路 (`_read_deps_yaml`, `_load_spec_catalog_from_bytes`) のみで lazy resolve される (Codex round 27 F1)。未 install 時はこれら関数の最初の YAML touch で `RuntimeError` (install hint 付き) が呼び出し元に伝播し silent fail-closed を防ぐ一方、`set-status` / `record-timeout` / `workflow-launch-check` (leaf 経路) などの recovery / non-dep commands は PyYAML 不在でも実行可能であり、control-plane outage を回避する。`_dependency_ready` の meta read + fingerprint recompute は `mark-dependency-readiness` / `write_preflight` / `update_orchestration_status` と同じ `orchestration_meta.json.lock` 上の fcntl `LOCK_EX` で serialize されており (Codex round 27 F2)、writer と reader が同時に走っても torn read で `dep_set_fingerprint_stale` を誤検出することはない。参照: `skills/workflow-orchestration/SKILL.md` items 60-62。
+When not recorded or recorded with a value other than `true`, `workflow-launch-check` returns `fail_closed` (`reason_detail=direct_dependency_<step>_readiness_not_pass` or `dependency_readiness_detail_not_pass:<key>`). When the stored `dep_set_fingerprint` does not match the currently computed fingerprint, it is rejected with `reason_detail=dep_set_fingerprint_stale`. **Furthermore, when deps.yaml exists at launch time, the gate performs a live recompute and judges by the recomputed booleans, not the persisted booleans, as authoritative**: even if you directly edit `orchestration_meta.json` to forge the flag, if the live recompute returns false the gate rejects. When the live recompute fails, production returns a concrete reason **fail-closed**: `deps_yaml_missing_or_unparseable` (deps.yaml absent or YAML parse failure) and `deps_yaml_malformed_schema` (the schema is malformed) are distinguished (Codex round 25 F2). When test scaffolding needs the legacy fallback to persisted booleans, opt in with the environment variable `METDSL_DEP_READINESS_ALLOW_PERSISTED_FALLBACK=1` (do not set it in a production environment). PyYAML is lazily resolved only in the paths that parse deps.yaml / spec_catalog.yaml (`_read_deps_yaml`, `_load_spec_catalog_from_bytes`) (Codex round 27 F1). When not installed, a `RuntimeError` (with an install hint) propagates to the caller at the first YAML touch of these functions, preventing a silent fail-closed, while recovery / non-dep commands such as `set-status` / `record-timeout` / `workflow-launch-check` (leaf paths) can run even without PyYAML, avoiding a control-plane outage. The meta read + fingerprint recompute of `_dependency_ready` is serialized by an fcntl `LOCK_EX` on the same `orchestration_meta.json.lock` as `mark-dependency-readiness` / `write_preflight` / `update_orchestration_status` (Codex round 27 F2), so even if a writer and reader run simultaneously, a torn read will not falsely detect `dep_set_fingerprint_stale`. Reference: `skills/workflow-orchestration/SKILL.md` items 60-62.
 
-**初期値の計算ルール** (`_compute_initial_dependency_readiness`):
-- `orchestration_meta.spec_ref` 配下に `deps.yaml` が存在し `dependencies.components` と `dependencies.profiles` の双方が空 → 全フラグ `true` (vacuous truth; leaf node 用)
-- `spec_ref` 未設定、`deps.yaml` 不在、または非空依存が記載 → 全フラグ **`false` (fail-closed)**。`workflow-launch-check` は phase 起動を block する。
-- 非自明な依存を持つ node は、orchestration agent が SKILL.md item 60-61 の手順で検証した後、`mark-dependency-readiness` で明示的に flag を立てる。
+**Initial-value computation rules** (`_compute_initial_dependency_readiness`):
+- `deps.yaml` exists under `orchestration_meta.spec_ref` and both `dependencies.components` and `dependencies.profiles` are empty → all flags `true` (vacuous truth; for a leaf node)
+- `spec_ref` unset, `deps.yaml` absent, or a non-empty dependency is listed → all flags **`false` (fail-closed)**. `workflow-launch-check` blocks the phase launch.
+- For a node with a non-trivial dependency, after the orchestration agent verifies by the procedure of SKILL.md items 60-61, it explicitly raises the flags with `mark-dependency-readiness`.
 
-**dep_set_fingerprint と invalidation 規約**:
-- 各 `dependency_readiness` には `dep_set_fingerprint` が記録される。fingerprint は以下を SHA-256 でまとめたもの:
+**dep_set_fingerprint and invalidation conventions**:
+- Each `dependency_readiness` records a `dep_set_fingerprint`. The fingerprint is a SHA-256 of the following:
   - `spec_ref` (normalized)
-  - `<spec_ref>/deps.yaml` の bytes
-  - **deps-relevant な catalog subset**: deps.yaml に登場する `(spec_kind, spec_id)` pair のみについて、catalog の sorted version list を deterministic JSON で表現した bytes (全 catalog bytes ではない。Codex round 19 F1 — 無関係な spec publication で全 orchestration を invalidate しない)
-  - 各 certified direct dep について、`(spec_kind, spec_id, spec_version, stage)` 識別子 + 該当 stage の最新 workspace artifact bytes (`ir_meta.json` / `binary_meta.json` / `aggregate_verdict.json`)。識別子 prefix は Codex round 19 F2 — artifact bytes が偶然一致しても certified version drift を検出する
-- 検査タイミング:
-  - `write_preflight` 再実行時: fingerprint mismatch 検出で `dependency_readiness` を初期値 (leaf=trivial-true / non-leaf=fail-closed) にリセット (`phase_state_log.jsonl` に `event=dependency_readiness_invalidated` で記録)。
-  - `_dependency_ready` (launch-time gate): fingerprint mismatch を `reason=dep_set_fingerprint_stale` で reject。preflight 再実行を待たず即時検出。
-- これにより以下のすべての drift シナリオで gate が通過することを防ぐ: spec_ref 差し替え / deps.yaml 編集 / spec_catalog.yaml の drift (新 matching version 追加 / 既存 version 削除 / constraint 解決が ambiguous に変化) / **post-mark の dep artifact regression** (新しい ir_meta.json / binary_meta.json / aggregate_verdict.json で verification_status や verdict が変化)。
-- fingerprint が一致する場合:
-  - leaf node (computed が trivial-true) → 上書き recompute (idempotent)。
-  - non-leaf node → 既存値を保持 (`mark-dependency-readiness` で立てた flag が preflight 再実行で消えないことを保証)。
-- existing が未設定 → 上記初期値ルールで初期化。
+  - the bytes of `<spec_ref>/deps.yaml`
+  - **a deps-relevant catalog subset**: only for the `(spec_kind, spec_id)` pairs appearing in deps.yaml, the bytes representing the catalog's sorted version list in deterministic JSON (not the full catalog bytes. Codex round 19 F1 — does not invalidate all orchestrations on an unrelated spec publication)
+  - for each certified direct dep, the `(spec_kind, spec_id, spec_version, stage)` identifier + the latest workspace artifact bytes of that stage (`ir_meta.json` / `binary_meta.json` / `aggregate_verdict.json`). The identifier prefix is Codex round 19 F2 — it detects certified version drift even if the artifact bytes happen to match
+- Check timing:
+  - On `write_preflight` re-run: on fingerprint mismatch detection, reset `dependency_readiness` to the initial value (leaf=trivial-true / non-leaf=fail-closed) (recorded in `phase_state_log.jsonl` as `event=dependency_readiness_invalidated`).
+  - `_dependency_ready` (launch-time gate): reject a fingerprint mismatch with `reason=dep_set_fingerprint_stale`. Detected immediately, without waiting for a preflight re-run.
+- This prevents the gate from passing in all of the following drift scenarios: spec_ref replacement / deps.yaml edit / spec_catalog.yaml drift (adding a new matching version / removing an existing version / a constraint resolution becoming ambiguous) / **a post-mark dep artifact regression** (a new ir_meta.json / binary_meta.json / aggregate_verdict.json changing the verification_status or verdict).
+- When the fingerprint matches:
+  - leaf node (computed is trivial-true) → overwrite recompute (idempotent).
+  - non-leaf node → preserve the existing value (guarantees that a flag raised by `mark-dependency-readiness` is not lost on a preflight re-run).
+- When existing is unset → initialize by the initial-value rules above.
 
 ---
 
 ## mark-dependency-readiness
 
-`orchestration_meta.dependency_readiness` を **runtime による artifact 検証**から再計算し、**全 detail flag を毎回 overwrite** する。CLI は caller assertion ではなく、検証要求として動作する。`<spec_ref>/deps.yaml` を解析し、`spec/registry/spec_catalog.yaml` で各 dep を `(spec_kind, spec_id, spec_version)` に resolve した後、全 stage の workspace artifact を実 inspect する。
+Recompute `orchestration_meta.dependency_readiness` from **artifact verification by the runtime**, and **overwrite all detail flags every time**. The CLI acts as a verification request, not a caller assertion. It parses `<spec_ref>/deps.yaml`, resolves each dep to `(spec_kind, spec_id, spec_version)` with `spec/registry/spec_catalog.yaml`, then actually inspects the workspace artifacts of all stages.
 
-| arg | 必須 | 説明 |
+| arg | required | description |
 |---|---|---|
 | `--repo-root` | yes | |
 | `--orchestration-id` | yes | |
 
-**毎回 full-recompute (per-stage 部分更新は許可しない)**: 全 detail flag を毎回 artifact 検証結果で上書きする。部分更新を許容すると、ある stage で過去に立った `true` flag が後続の dependency regression (新しい artifact が fail に転じる等) を生き残ってしまい、`workflow-launch-check` が stale な persisted boolean を信用して gate を通してしまうため。
+**Full-recompute every time (partial per-stage update is not allowed)**: overwrite all detail flags with the artifact-verification result every time. If partial updates were allowed, a `true` flag raised in some stage in the past would survive a subsequent dependency regression (a new artifact turning to fail, etc.), and `workflow-launch-check` would trust the stale persisted boolean and pass the gate.
 
-**path-safety validation**: `spec_kind` / `spec_id` / `spec_version` の各 token は workspace path に補間されるため、`[A-Za-z0-9._+-]` 範囲外の文字、`..` 部分文字列、path separator (`/`, `\\`) を含む値は受理しない。deps.yaml で unsafe token が登場すれば well_formed=False で全 stage fail-closed、spec_catalog.yaml の unsafe entry は indexing 時に skip される (resolve はその id に対して None を返す)。
+**path-safety validation**: because each token of `spec_kind` / `spec_id` / `spec_version` is interpolated into the workspace path, a value containing characters outside the `[A-Za-z0-9._+-]` range, the `..` substring, or a path separator (`/`, `\\`) is not accepted. If an unsafe token appears in deps.yaml, all stages are fail-closed with well_formed=False, and an unsafe entry in spec_catalog.yaml is skipped at indexing time (resolve returns None for that id).
 
-**within-mark consistency**: `mark-dependency-readiness` は `_compute_dep_readiness_and_fingerprint` 単一 pass で全 artifact bytes を **一度だけ** 読み、その同一 snapshot から readiness booleans と `dep_set_fingerprint` の両方を派生させる。これにより検証 read と fingerprint read が別タイミングで異なる byte 状態を観測する within-mark TOCTOU window を閉じる。`_dependency_set_fingerprint` (gate 用) も同じ walker を使うため、同一 on-disk state は必ず同一 hash を生む。
+**within-mark consistency**: `mark-dependency-readiness` reads all artifact bytes **only once** in a single `_compute_dep_readiness_and_fingerprint` pass, and derives both the readiness booleans and the `dep_set_fingerprint` from that same snapshot. This closes the within-mark TOCTOU window in which the verification read and the fingerprint read observe a different byte state at different times. Because `_dependency_set_fingerprint` (for the gate) also uses the same walker, the same on-disk state always produces the same hash.
 
-**build-variant ambiguity rejection**: 範囲・不等価 constraint (例: `>=1.0.0`) が build metadata だけ異なる複数 catalog entry (`1.0.0+cpu`, `1.0.0+gpu`) にマッチするとき、`_matching_dep_versions` は空 tuple を返し fail-closed にする。workspace artifact root は full version string で key 化されるため、`+cpu` と `+gpu` の選択を range 制約に委ねるのは ambiguity となる。特定 variant を pin するには `==1.0.0+cpu` のような exact-string constraint を使う。
+**build-variant ambiguity rejection**: when a range / inequality constraint (e.g. `>=1.0.0`) matches multiple catalog entries differing only in build metadata (`1.0.0+cpu`, `1.0.0+gpu`), `_matching_dep_versions` returns an empty tuple and is fail-closed. Because the workspace artifact root is keyed by the full version string, delegating the choice between `+cpu` and `+gpu` to a range constraint is an ambiguity. To pin a specific variant, use an exact-string constraint like `==1.0.0+cpu`.
 
-**version 解決ルール**: 各 dep の `(spec_kind, spec_id, version_constraint)` を `spec/registry/spec_catalog.yaml` の全 catalog version に対して評価する。constraint は AND 結合の `>=`/`>`/`<=`/`<`/`==`/`!=` 演算子をサポートし、版本値は semver-style (`X.Y.Z[-prerelease][+build]`) を受理する。演算子セマンティクス:
-- 順序演算子 (`>`, `>=`, `<`, `<=`) は SemVer-numeric precedence (§11 prerelease、§10 build metadata を無視)。
-- 等価演算子 (`==`, `!=`) は build metadata を含む **正規化文字列の完全一致** で評価する。workspace artifact root が full version string で key 化されるため、`==1.0.0+cpu` が `1.0.0+gpu` に silent match することを防ぐ。
+**version resolution rules**: evaluate each dep's `(spec_kind, spec_id, version_constraint)` against all catalog versions of `spec/registry/spec_catalog.yaml`. The constraint supports AND-combined `>=`/`>`/`<=`/`<`/`==`/`!=` operators, and the version value accepts semver-style (`X.Y.Z[-prerelease][+build]`). Operator semantics:
+- The ordering operators (`>`, `>=`, `<`, `<=`) use SemVer-numeric precedence (ignoring §11 prerelease and §10 build metadata).
+- The equality operators (`==`, `!=`) are evaluated by an **exact match of the normalized string including build metadata**. Because the workspace artifact root is keyed by the full version string, this prevents `==1.0.0+cpu` from silently matching `1.0.0+gpu`.
 
-**per-stage verification (same-version coherence + certified version pinning)**: 各 stage を独立に判定するのではなく、**同一 catalog version に対する cumulative chain** を要求する。さらに per-dep で **certified version を 1 つだけ** 選ぶ:
-- 各 dep の matched catalog versions について、cumulative level (ir=1, ir+pipeline=2, ir+pipeline+verdict=3) を計算。
-- 最大 level を達成した version の中で **最も高い version** を certified version として選択。
-- 全 stage の readiness flag は certified version の level から派生。
-- `dep_set_fingerprint` は certified version の artifact bytes のみを hash する。
+**per-stage verification (same-version coherence + certified version pinning)**: rather than judging each stage independently, it requires a **cumulative chain against the same catalog version**. Furthermore, it selects **only one certified version** per dep:
+- For each dep's matched catalog versions, compute the cumulative level (ir=1, ir+pipeline=2, ir+pipeline+verdict=3).
+- Among the versions that achieved the maximum level, select the **highest version** as the certified version.
+- The readiness flags of all stages are derived from the certified version's level.
+- `dep_set_fingerprint` hashes only the certified version's artifact bytes.
 
-これにより:
-- cross-version mixing (ir が版本 A、pipeline が版本 B) を防ぐ
-- per-dep の canonical version (`certified_deps` field) が `meta.dependency_readiness` に永続化され、downstream consumer は同 version で resolve できる
-- non-certified version の artifact churn (例: 新版が部分的に published / 旧版が cleanup) で readiness が誤って invalidate されることを防ぐ
-- certified version の artifact regression は fingerprint mismatch で invalidate される
+This:
+- prevents cross-version mixing (ir in version A, pipeline in version B)
+- persists the per-dep canonical version (`certified_deps` field) in `meta.dependency_readiness`, so a downstream consumer can resolve with the same version
+- prevents readiness from being erroneously invalidated by artifact churn of a non-certified version (e.g. a new version partially published / an old version cleaned up)
+- a certified-version artifact regression is invalidated by a fingerprint mismatch
 
-constraint にマッチする version が 1 つも無ければ fail-closed。`>=0.1.0 <1.0.0` のような range は新版公開 (例: 0.2.0) で artifact 未整備でも旧版 (0.1.0) で完備された chain で引き続き launchable (0.1.0 が certified)。
+If no version matches the constraint, it is fail-closed. A range like `>=0.1.0 <1.0.0` remains launchable with the chain completed in the old version (0.1.0) even after a new version is published (e.g. 0.2.0) with its artifacts not yet prepared (0.1.0 is certified).
 
-**stage 別の verification 条件** (各 dep の **最新 (canonical id 順) artifact のみ** を評価、ALL deps pass で stage true):
+**Per-stage verification conditions** (evaluate **only the latest (by canonical id order) artifact** of each dep, stage true with ALL deps pass):
 
-| stage | 条件 |
+| stage | condition |
 |---|---|
-| `ir_ref` | `workspace/ir/<kind>__<id>__<version>/*/ir_meta.json` の **最新ファイル** の `verification_status == "pass"` |
-| `pipeline_ref` | `workspace/pipelines/<kind>__<id>__<version>/` 配下で「最新の pipeline_id ディレクトリ」(`_latest_pipeline_dir`) を選び、その pipeline 内の最新 `binary/*/binary_meta.json` の `verification_status == "pass"` |
-| `aggregate_verdict` | 同じ最新 pipeline ディレクトリ内で、**pipeline_ref で選ばれた binary** に `trial_meta.json.source_binary_id` が一致する verdict のみを候補とし、その最新 `aggregate_verdict ∈ {"pass", "xfail"}` (docs/GLOSSARY.md)。当該 binary に対応する verdict が無ければ fail-closed (Codex round 24: 旧 binary の passing verdict を新 binary に流用させない) |
+| `ir_ref` | the `verification_status == "pass"` of the **latest file** of `workspace/ir/<kind>__<id>__<version>/*/ir_meta.json` |
+| `pipeline_ref` | under `workspace/pipelines/<kind>__<id>__<version>/`, select the "latest pipeline_id directory" (`_latest_pipeline_dir`), and the `verification_status == "pass"` of the latest `binary/*/binary_meta.json` in that pipeline |
+| `aggregate_verdict` | within the same latest pipeline directory, take as candidates only the verdicts whose `trial_meta.json.source_binary_id` matches the **binary selected by pipeline_ref**, and that latest `aggregate_verdict ∈ {"pass", "xfail"}` (docs/GLOSSARY.md). If there is no verdict corresponding to that binary, fail-closed (Codex round 24: do not let the old binary's passing verdict be reused for the new binary) |
 
-`pipeline_ref` と `aggregate_verdict` は **同じ pipeline_id** に bind される (Codex round 11 F2 + round 24)。これにより「新しい pipeline の binary は pass / 古い pipeline の verdict は pass」というクロス pipeline mixing で execution_readiness が誤って通過することを防ぐ。
+`pipeline_ref` and `aggregate_verdict` are bound to the **same pipeline_id** (Codex round 11 F2 + round 24). This prevents execution_readiness from erroneously passing on cross-pipeline mixing of "the new pipeline's binary is pass / the old pipeline's verdict is pass".
 
-「最新」は **canonical id suffix (`<slug>_<YYYYMMDD>_<seq3>`) から parse した `(date, seq)`** の順序で決定する (mtime ではない、raw path lex でもない、slug でもない)。canonical な suffix を持たない directory (例: stray `zzz/`、`dep_a_001` のような short form、`dep_a_0.1.0_002` の version 混入形) は **selector で filter out** される (Codex round 23 F2 / round 31 F2: reader と writer の grammar を lock-step に揃え、非 canonical 名による gate bypass を防ぐ)。同一 `(date, seq)` を持つ複数の canonical id (slug 違い) が同じ親 directory 配下に存在する場合は **明示的な collision として fail-closed** にする (Codex round 35 F1: slug-tiebreaker による silent な選択を許さず、stderr に `freshness_id_collision at (date=…, seq=…): …` を emit して `_select_max_by_id_extracted` が None を返す)。mtime を信用しない理由は touch / copy / restore / clock skew で容易に偽造されるため。historical 過去 run の passing artifact が残っていても、新しい id の run が fail なら gate は通さない。unresolvable dep (catalog 未登録、または constraint 解決不能) が一つでも存在する場合は全 stage を fail-closed にする。`deps.yaml` の `dependencies` block は **canonical 2 key `{components, profiles}` を厳密に要求** する: 両 key とも明示的に list 形で存在し、未知 key (例: 単数形タイポ `component:`、追加 section `extras:`) が一切無いことが leaf trivial-true の前提。各 list item は **dict 形 (`{component_id|profile_id, version_constraint?}`) のみ** を受理し、bare string (`"dep_a"`、`"profile/foo"`、`"../dep_a"` 等) は schema malformed として一律 fail-closed (silent normalization による wrong-dep certification 防止)。
+"Latest" is determined by the order of the **`(date, seq)` parsed from the canonical id suffix (`<slug>_<YYYYMMDD>_<seq3>`)** (not mtime, not raw path lex, not slug). A directory without a canonical suffix (e.g. a stray `zzz/`, a short form like `dep_a_001`, a version-mixed form like `dep_a_0.1.0_002`) is **filtered out by the selector** (Codex round 23 F2 / round 31 F2: align the reader's and writer's grammar in lock-step and prevent a gate bypass by a non-canonical name). When multiple canonical ids with the same `(date, seq)` (differing slugs) exist under the same parent directory, it is **explicitly fail-closed as a collision** (Codex round 35 F1: it does not allow a silent choice by slug-tiebreaker, emits `freshness_id_collision at (date=…, seq=…): …` to stderr, and `_select_max_by_id_extracted` returns None). The reason for not trusting mtime is that it is easily forged by touch / copy / restore / clock skew. Even if a historical past run's passing artifact remains, if the new-id run is fail the gate does not pass. If even one unresolvable dep (not registered in the catalog, or constraint-unresolvable) exists, all stages are fail-closed. The `dependencies` block of `deps.yaml` **strictly requires the canonical 2 keys `{components, profiles}`**: both keys exist explicitly in list form, and the absence of any unknown key (e.g. the singular typo `component:`, an extra section `extras:`) is a premise for leaf trivial-true. Each list item accepts **only dict form (`{component_id|profile_id, version_constraint?}`)**, and a bare string (`"dep_a"`, `"profile/foo"`, `"../dep_a"` etc.) is uniformly fail-closed as schema malformed (to prevent wrong-dep certification by silent normalization).
 
-派生規則:
+Derivation rules:
 - `direct_dependency_compile_readiness = detail.ir_ref_verified`
 - `direct_dependency_execution_readiness = detail.ir_ref_verified AND detail.pipeline_ref_verified AND detail.aggregate_verdict_verified`
 
-`dep_set_fingerprint` (`spec_ref + deps.yaml` の SHA-256) も毎回 refresh する。書き込みは `orchestration_meta.json.lock` 上の fcntl `LOCK_EX` で serialize される。`phase_state_log.jsonl` に `event=mark_dependency_readiness` と `verified` / `detail` を記録する。
+`dep_set_fingerprint` (the SHA-256 of `spec_ref + deps.yaml`) is also refreshed every time. The write is serialized by an fcntl `LOCK_EX` on `orchestration_meta.json.lock`. `event=mark_dependency_readiness` with `verified` / `detail` is recorded in `phase_state_log.jsonl`.
 
-**verification 失敗時の挙動**: 以下のいずれかが検出された場合、runtime は **raise する前に `dependency_readiness` を fail-closed payload で上書きし**、`phase_state_log.jsonl` に `event=mark_dependency_readiness_failed` で `reason` 付きで記録する。CLI 経由 (`tools/orchestration_runtime.py mark-dependency-readiness`) では traceback を吐かず stderr に reason を出し exit 1 を返す (Codex round 26 F2)。
-- `reason=deps_yaml_missing_or_unparseable`: `deps.yaml` 不在、または YAML パース失敗。
-- `reason=deps_yaml_malformed_schema`: `deps.yaml` はパースできるが schema が malformed (`dependencies` 直下が `{components, profiles}` の完全一致でない、list 型でない、各 entry の `*_id` 欠落、`version_constraint` が非 string、path-traversal token 等)。
-- `reason=spec_catalog_corrupt` (Codex round 33 F2 + round 34 F2 + round 35 F2): `spec/registry/spec_catalog.yaml` が不在、unreadable、zero-byte、YAML パース失敗、または top-level schema が malformed (`specs:` list 欠落、`dict` でない等)。これは repository-wide outage であり ordinary な dependency miss と区別される。`mark-dependency-readiness` は CLI 経由でも `ValueError` を `print` し exit 1 を返す。
+**Behavior on verification failure**: when any of the following is detected, the runtime **overwrites `dependency_readiness` with a fail-closed payload before raising**, and records it in `phase_state_log.jsonl` as `event=mark_dependency_readiness_failed` with a `reason`. Via the CLI (`tools/orchestration_runtime.py mark-dependency-readiness`), it does not spit out a traceback but outputs the reason to stderr and returns exit 1 (Codex round 26 F2).
+- `reason=deps_yaml_missing_or_unparseable`: `deps.yaml` absent, or YAML parse failure.
+- `reason=deps_yaml_malformed_schema`: `deps.yaml` can be parsed but the schema is malformed (the level directly under `dependencies` is not an exact match of `{components, profiles}`, not a list type, a missing `*_id` in each entry, a non-string `version_constraint`, a path-traversal token, etc.).
+- `reason=spec_catalog_corrupt` (Codex round 33 F2 + round 34 F2 + round 35 F2): `spec/registry/spec_catalog.yaml` is absent, unreadable, zero-byte, YAML parse failure, or its top-level schema is malformed (`specs:` list missing, not a `dict`, etc.). This is a repository-wide outage and is distinguished from an ordinary dependency miss. `mark-dependency-readiness`, even via the CLI, `print`s the `ValueError` and returns exit 1.
 
-`workflow-launch-check` の `_dependency_ready` 経路が返す追加 reason:
-- `reason=pyyaml_unavailable` (Codex round 28 F1): PyYAML 未 install で live recompute 不能。leaf orchestration (`certified_deps == []` かつ persisted byte-only fingerprint が一致) のみ launch を許可、それ以外は fail-closed。
-- `freshness_id_collision` (stderr 出力のみ、Codex round 35 F1): 同一 `(date, seq)` を持つ canonical id 衝突。`_select_max_by_id_extracted` が `None` を返すため、gate 上は `direct_dependency_<step>_readiness_not_pass` / `dependency_readiness_detail_not_pass:<key>` として現れる。原因特定には runtime の stderr (`freshness_id_collision at (date=…, seq=…): <colliding paths>`) を参照する。
+Additional reasons returned by the `_dependency_ready` path of `workflow-launch-check`:
+- `reason=pyyaml_unavailable` (Codex round 28 F1): PyYAML not installed, so a live recompute is impossible. Only a leaf orchestration (`certified_deps == []` and the persisted byte-only fingerprint matches) is permitted to launch; otherwise fail-closed.
+- `freshness_id_collision` (stderr output only, Codex round 35 F1): a canonical id collision with the same `(date, seq)`. Because `_select_max_by_id_extracted` returns `None`, on the gate it appears as `direct_dependency_<step>_readiness_not_pass` / `dependency_readiness_detail_not_pass:<key>`. To identify the cause, refer to the runtime's stderr (`freshness_id_collision at (date=…, seq=…): <colliding paths>`).
 
-distinct な reason 設計により、observability tooling は「spec 定義の defect」を「ordinary な negative verification」から識別できる。エラー前に passing 状態であった orchestration が、後続の `workflow-launch-check` で launch 可能なまま残存することを防ぐ。
+With the distinct reason design, observability tooling can distinguish a "spec-definition defect" from an "ordinary negative verification". It prevents an orchestration that was in a passing state before the error from remaining launchable in a subsequent `workflow-launch-check`.
 
-**設計上の trust boundary**: CLI を呼んだだけでは flag を立てられない。caller が boolean を渡す形ではなく、runtime が version_constraint を resolve して特定された catalog version の **canonical id 順 (`<slug>_<YYYYMMDD>_<seq3>` の `(date, seq)`) で選んだ workspace artifact** を inspect する (Codex round 26 F1: catalog cache も content-keyed なので mtime 偽造に影響されない)。stale artifact / version mismatch / verdict=fail / constraint ambiguous のいずれかが検出されれば flag は false のまま。さらに毎回 full-overwrite、`dep_set_fingerprint` 一致確認 (launch-time でも実施)、catalog cache の content-keyed invalidation、verification 失敗時の即時 fail-closed persist、fingerprint への per-dep artifact bytes 組み込みにより、(a) CLI 呼び出しで gate bypass、(b) 古い passing artifact で新規 launch unblock、(c) constraint と異なる version の artifact 採用、(d) 部分更新で stale `true` 残存、(e) spec_ref 差し替え / deps.yaml 編集後の stale state 残存、(f) preflight 再実行までの間 out-of-band edit で gate bypass、(g) verification 失敗で passing state が survive、(h) post-mark の dep artifact regression で stale `true` が gate を通過、(i) 長寿命プロセスで catalog cache が in-process edit を反映せず resolution drift、を全て防ぐ。
+**Design trust boundary**: merely calling the CLI cannot raise a flag. Rather than the caller passing a boolean, the runtime resolves the version_constraint and inspects the **workspace artifact selected by canonical id order (`(date, seq)` of `<slug>_<YYYYMMDD>_<seq3>`)** of the identified catalog version (Codex round 26 F1: because the catalog cache is also content-keyed, it is not affected by mtime forgery). If any of stale artifact / version mismatch / verdict=fail / constraint ambiguous is detected, the flag stays false. Furthermore, with full-overwrite every time, `dep_set_fingerprint` match confirmation (also performed at launch time), content-keyed invalidation of the catalog cache, immediate fail-closed persist on verification failure, and incorporating per-dep artifact bytes into the fingerprint, it prevents all of: (a) gate bypass by a CLI call, (b) unblocking a new launch with an old passing artifact, (c) adopting an artifact of a version different from the constraint, (d) a stale `true` remaining from a partial update, (e) a stale state remaining after spec_ref replacement / deps.yaml edit, (f) gate bypass by an out-of-band edit in the interval until a preflight re-run, (g) a passing state surviving a verification failure, (h) a stale `true` passing the gate due to a post-mark dep artifact regression, and (i) resolution drift in a long-lived process where the catalog cache does not reflect an in-process edit.
 
 ---
 
 ## run-gate
 
-validator gate を capability_token 越しに実行。validator 直接呼び出しを禁じる context での canonical 経路。
+Run a validator gate across the capability_token. The canonical path in a context that forbids a direct validator call.
 
-| arg | 必須 | 説明 |
+| arg | required | description |
 |---|---|---|
 | `--repo-root` | yes | |
 | `--orchestration-id` | yes | |
 | `--gate` | yes | `validate_pipeline_semantics` / `check_artifact_syntax` / `validate_workspace_root` / `orchestration_read` |
-| `--agent-run-id` | yes | 子 agent の UUID |
-| `--args-json` | yes | gate 別 schema (下記) |
+| `--agent-run-id` | yes | the child agent's UUID |
+| `--args-json` | yes | per-gate schema (below) |
 | `--capability-token` | yes | `capabilities/<agent_run_id>.json#capability_token` |
 
-### `--args-json` schema (gate 別)
+### `--args-json` schema (per gate)
 
 | gate | schema |
 |---|---|
 | `orchestration_read` | `{"read_path": "docs/..."}` |
 | `validate_workspace_root` | `{"paths": ["workspace"]}` (optional, defaults to repo workspace) |
 | `check_artifact_syntax` | `{"expect_top": "object", "paths": ["workspace/.../file.yaml", ...]}` |
-| `validate_pipeline_semantics` | `{"stage": "compile|post_generate|post_build|post_execute|pre_judge|full", "ir_ref": "workspace/ir/..." (compile stage), "pipeline_root": "workspace/pipelines/..." または list, "source_id": "<id>" (optional)}` |
+| `validate_pipeline_semantics` | `{"stage": "compile|post_generate|post_build|post_execute|pre_judge|full", "ir_ref": "workspace/ir/..." (compile stage), "pipeline_root": "workspace/pipelines/..." or a list, "source_id": "<id>" (optional)}` |
 
-key は CLI flag に変換される (`pipeline_root` → `--pipeline-root`)。
+The keys are converted into CLI flags (`pipeline_root` → `--pipeline-root`).
 
-stderr の最終行に gate 結果 JSON (`status`, `violations`, ...) が出力される。`2>workspace/tmp/<agent_run_id>/last_gate_stderr.txt` で保存して参照する（`<agent_run_id>` は literal 置換）。
+The gate result JSON (`status`, `violations`, ...) is output on the last line of stderr. Save and reference it with `2>workspace/tmp/<agent_run_id>/last_gate_stderr.txt` (`<agent_run_id>` is literally substituted).
 
 ---
 
 ## guarded-apply-patch
 
-`.json` / `.txt` 出力の唯一の canonical 書き込み経路。allowed_output_paths に列挙された path に unified diff を適用する。
+The only canonical write path for `.json` / `.txt` output. Applies a unified diff to a path enumerated in allowed_output_paths.
 
-| arg | 必須 | 説明 |
+| arg | required | description |
 |---|---|---|
 | `--repo-root` | yes | |
 | `--orchestration-id` | yes | |
 | `--actor-role` | yes | `step` / `substep` / `orchestration` |
 | `--agent-run-id` | yes | UUID |
-| `--paths-json` | yes | JSON list of path strings (例: `'["workspace/ir/.../ir_meta.json"]'`) |
-| `--patch-text` | 1 つ必須 | unified diff 本文 (inline) |
-| `--patch-file` | 1 つ必須 | unified diff を含む file への path (大型 patch では OS ARG_MAX 回避のため必須) |
+| `--paths-json` | yes | JSON list of path strings (e.g. `'["workspace/ir/.../ir_meta.json"]'`) |
+| `--patch-text` | one required | the unified diff body (inline) |
+| `--patch-file` | one required | a path to a file containing the unified diff (required for a large patch to avoid the OS ARG_MAX) |
 | `--capability-token` | yes | |
 
 ---
-

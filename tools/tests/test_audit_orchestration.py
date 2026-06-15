@@ -344,7 +344,7 @@ class CollectAgentRunSummaryTests(unittest.TestCase):
 
 
 class CollectAllowAutoApproveStatsTests(unittest.TestCase):
-    """`action=allow_auto_approve` イベントの可視化用集計。"""
+    """Aggregation for visualizing `action=allow_auto_approve` events."""
 
     def _make_allow_auto(self, tool_name: str) -> dict:
         return {

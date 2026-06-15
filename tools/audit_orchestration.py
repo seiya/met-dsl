@@ -99,12 +99,12 @@ def collect_policy_block_counts(
 def collect_allow_auto_approve_stats(
     hook_events: list[dict[str, Any]],
 ) -> dict[str, Any]:
-    """`action=allow_auto_approve` の総数と tool_name 別内訳を返す。
+    """Return the total of `action=allow_auto_approve` and the breakdown by tool_name.
 
-    `hookSpecificOutput.permissionDecision="allow"` で harness の permission
-    prompt を bypass した Write/Edit イベントの可視化用。volume が想定外に
-    大きい場合は manifest 検証が緩い、または agent 側で意図しない多重 write
-    が走っているシグナル。
+    For visualizing Write/Edit events that bypassed the harness's permission
+    prompt with `hookSpecificOutput.permissionDecision="allow"`. When the volume
+    is unexpectedly large, it is a signal that manifest verification is lax, or
+    that unintended multiple writes are running on the agent side.
     """
     by_tool: Counter = Counter()
     total = 0
@@ -434,9 +434,9 @@ def _render_markdown(result: dict[str, Any]) -> str:
         )
         lines.append("")
         lines.append(f"Total: {aa.get('total', 0)}")
-        # collect_allow_auto_approve_stats() は total>0 のとき必ず by_tool を
-        # 1 件以上含む (tool_name 不明時は "unknown" を採用) ため、ここでは
-        # 空チェックを省略できる。
+        # Because collect_allow_auto_approve_stats() always includes at least 1
+        # by_tool entry when total>0 (adopting "unknown" when tool_name is unknown),
+        # the empty check can be omitted here.
         lines.append("")
         lines.append("| Tool | Count |")
         lines.append("|---|---|")

@@ -1,8 +1,8 @@
 # TODO
-この文書は、リポジトリ全体で管理する未完了タスクを集約する canonical source である。
+This document is the canonical source that aggregates incomplete tasks managed across the whole repository.
 
-## TODO 一覧
+## TODO list
 
-- Claude backend が hook payload から `session_id` または `agent_session_id` を取得可能になった時点で、`active_child_agent_run_id.txt` に依存した `agent_run_id` 解決を廃止し、Codex backend と同一の session 識別子ベース解決へ統一する。
-  - 削除対象: `tools/orchestration_runtime.py` の active file 管理ヘルパーと Claude 専用分岐、`tools/hooks/cli.py` の active file 参照分岐、active file 前提の関連テスト。
-  - 完了判定: Claude/Codex の双方で hook payload の session 識別子だけで `agent_run_id` を一意解決でき、active file が生成されないことをテストで検証済みである。
+- Once the Claude backend can obtain `session_id` or `agent_session_id` from the hook payload, abolish the `agent_run_id` resolution that depends on `active_child_agent_run_id.txt`, and unify it to the same session-identifier-based resolution as the Codex backend.
+  - Removal targets: the active-file management helpers and Claude-specific branches in `tools/orchestration_runtime.py`, the active-file reference branch in `tools/hooks/cli.py`, and the related tests that assume the active file.
+  - Completion criterion: `agent_run_id` can be uniquely resolved using only the session identifier from the hook payload on both Claude and Codex, and it has been verified by tests that no active file is generated.

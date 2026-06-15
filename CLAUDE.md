@@ -1,100 +1,100 @@
 # CLAUDE.md
 
-このファイルは Claude Code 向けのプロジェクト固有規約を定義する。文体ルール、用語規則、ドキュメント参照ルール、MCP 実行ルールなどの一般規約は [AGENTS.md](AGENTS.md) を canonical source とする。
+This file defines the project-specific conventions for Claude Code. For general conventions such as writing-style rules, terminology rules, document reference rules, and MCP execution rules, [AGENTS.md](AGENTS.md) is the canonical source.
 
-## workflow 実行
-- core workflow は `Spec → Compile → Generate → Build → Validate` の 5 phase 構成。仕様への入口は [docs/WORKFLOW.md](docs/WORKFLOW.md) とする。
-- `orchestration agent` と `step agent` / `substep agent` の階層実行契約は [docs/ORCHESTRATION.md](docs/ORCHESTRATION.md) を canonical source とする。
-- `orchestration agent` の起動手順は [skills/workflow-orchestration/SKILL.md](skills/workflow-orchestration/SKILL.md) を参照する。
-- 起動前の最小確認手順は [skills/workflow-orchestration/references/startup_contract.md](skills/workflow-orchestration/references/startup_contract.md) を参照する。
-- workflow 起動は `python3 tools/run_workflow.py <spec_ref> <until_phase> [--llm <codex|cursor|claude>]` を canonical entrypoint とする。`<until_phase>` は `compile` / `generate` / `build` / `validate` のいずれかを指定する。
-- 途中で fail した workflow の再開は `python3 tools/run_workflow.py --resume [--orchestration-id <id>]` を canonical 経路とする。`--resume` 時は `spec_ref` / `until_phase` / `--llm` / `--mode` を省略でき、対象 orchestration の既存 artifact（`orchestration_meta.json` / `preflight.json` / `launches/orchestration.start.prompt.txt`）から復元される（明示指定が優先、`--orchestration-id` 省略時は時系列最新を対象）。内部で `init --resume-from-checkpoint`（`resume_enabled=true`、terminal status を `running` へ reset）を実行し、併せて `repair-agent-runs` で pre-`caa10ab` の `agent_runs.jsonl` 旧行に欠落した `parent_agent_run_id` / `agent_model` を authoritative source から backfill する（`agent_model` が auto 導出不能なら `needs_manual` となり、operator が `repair-agent-runs --agent-model <id>` を手動実行する）。詳細は [docs/RUNBOOK.md](docs/RUNBOOK.md) §3-1 を参照する。
-- workflow 実行時の `METDSL_WORKFLOW_MODE=1` と `METDSL_ORCHESTRATION_ID=<orchestration_id>` は `tools/run_workflow.py` が設定する値を canonical source とする。
-- 任意フロー `Tune`（実装裁量 variant 探索）と `Promote`（正式版昇格）は core workflow と分離した entrypoint で起動する（詳細は別 plan で定義）。
+## workflow execution
+- The core workflow is a 5-phase structure: `Spec → Compile → Generate → Build → Validate`. The entry point to the specification is [docs/WORKFLOW.md](docs/WORKFLOW.md).
+- [docs/ORCHESTRATION.md](docs/ORCHESTRATION.md) is the canonical source for the hierarchical execution contract between the `orchestration agent` and the `step agent` / `substep agent`.
+- For the startup procedure of the `orchestration agent`, refer to [skills/workflow-orchestration/SKILL.md](skills/workflow-orchestration/SKILL.md).
+- For the minimal pre-startup checks, refer to [skills/workflow-orchestration/references/startup_contract.md](skills/workflow-orchestration/references/startup_contract.md).
+- The canonical entrypoint for starting the workflow is `python3 tools/run_workflow.py <spec_ref> <until_phase> [--llm <codex|cursor|claude>]`. `<until_phase>` specifies one of `compile` / `generate` / `build` / `validate`.
+- The canonical path for resuming a workflow that failed midway is `python3 tools/run_workflow.py --resume [--orchestration-id <id>]`. With `--resume`, `spec_ref` / `until_phase` / `--llm` / `--mode` can be omitted and are restored from the target orchestration's existing artifacts (`orchestration_meta.json` / `preflight.json` / `launches/orchestration.start.prompt.txt`) (an explicit argument takes precedence; when `--orchestration-id` is omitted, the most recent one in chronological order is targeted). Internally it runs `init --resume-from-checkpoint` (`resume_enabled=true`, resetting a terminal status to `running`), and together runs `repair-agent-runs` to backfill the `parent_agent_run_id` / `agent_model` missing from pre-`caa10ab` legacy rows of `agent_runs.jsonl` from the authoritative source (if `agent_model` cannot be auto-derived it becomes `needs_manual`, and the operator runs `repair-agent-runs --agent-model <id>` manually). For details, refer to [docs/RUNBOOK.md](docs/RUNBOOK.md) §3-1.
+- During workflow execution, the canonical source for `METDSL_WORKFLOW_MODE=1` and `METDSL_ORCHESTRATION_ID=<orchestration_id>` is the values set by `tools/run_workflow.py`.
+- The optional flows `Tune` (implementation-discretion variant exploration) and `Promote` (promotion to the official version) are started from an entrypoint separate from the core workflow (details defined in a separate plan).
 
-## execution platform 別の子 `agent` 起動ツール
+## child `agent` launch tool per execution platform
 
-| execution platform | `preflight` の `--backend` 引数 | 子 `agent` 起動ツール | `agent_session_id` の取得方法 |
+| execution platform | `--backend` argument of `preflight` | child `agent` launch tool | how to obtain `agent_session_id` |
 |---|---|---|---|
-| Codex | `codex` | `spawn_agent` | `spawn_agent` 実応答から取得 |
-| Cursor | `cursor` | `spawn_agent` | `spawn_agent` 実応答から取得 |
-| Claude Code | `claude` | `Agent` tool | 起動前に発行した `agent_run_id` を `agent_session_id` として代用する |
+| Codex | `codex` | `spawn_agent` | obtained from the actual `spawn_agent` response |
+| Cursor | `cursor` | `spawn_agent` | obtained from the actual `spawn_agent` response |
+| Claude Code | `claude` | `Agent` tool | use the `agent_run_id` issued before launch as the `agent_session_id` |
 
-## hook 実装方針
-- backend 非依存の検証は `tools/hooks/common.py` を canonical source とする。
-- backend 固有の呼び出し仕様は `tools/hooks/adapters/` 配下の adapter で吸収する。
-- `Codex` の hook 呼び出し定義は `.codex/hooks.json` を canonical source とする。
-- `codex` backend の `preflight` は `feature_states.codex_hooks=true` を必須とする。`codex_hooks` が未有効な環境は `status=fail` として停止する。
-- `Claude Code` の hook 呼び出し定義は `.claude/settings.json` の `hooks` セクションを canonical source とする。`PreToolUse` / `PostToolUse` / `UserPromptSubmit` / `Stop` の 4 イベントを配線する。
-- `Claude Code` backend は feature flag probe が不要であり、`codex_hooks` 必須チェックは Codex backend 限定。共通ポリシーは `tools/hooks/common.py` の `evaluate_common_policy()` に従う。
-- `.claude/settings.json` の `matcher` は **完全一致文字列**（正規表現ではない）。`.codex/hooks.json` の `^Bash$` とは異なり、`"Bash"` と記述する。
+## hook implementation policy
+- `tools/hooks/common.py` is the canonical source for backend-independent validation.
+- Backend-specific invocation specifications are absorbed by the adapters under `tools/hooks/adapters/`.
+- `.codex/hooks.json` is the canonical source for `Codex` hook invocation definitions.
+- The `preflight` of the `codex` backend requires `feature_states.codex_hooks=true`. An environment where `codex_hooks` is not enabled stops with `status=fail`.
+- The `hooks` section of `.claude/settings.json` is the canonical source for `Claude Code` hook invocation definitions. It wires the 4 events `PreToolUse` / `PostToolUse` / `UserPromptSubmit` / `Stop`.
+- The `Claude Code` backend does not need a feature flag probe, and the `codex_hooks` requirement check is limited to the Codex backend. The common policy follows `evaluate_common_policy()` in `tools/hooks/common.py`.
+- The `matcher` in `.claude/settings.json` is an **exact-match string** (not a regular expression). Unlike `^Bash$` in `.codex/hooks.json`, write `"Bash"`.
 
-## Claude Code 固有の実行規約
+## Claude Code-specific execution conventions
 
 ### preflight
-- `preflight` 実行時は `--backend claude` を指定する。
-- コマンド例: `python3 tools/run_workflow.py <spec_ref> <until_phase> --llm claude`
-- Claude backend の `preflight` は **リポジトリにコミットされた `.claude/settings.json`** の `enabledMcpjsonServers` に `build-runtime` が含まれること (または `enableAllProjectMcpServers=true` かつ `.mcp.json` が `build-runtime` を定義) を必須とする (`run_linter` / `compile_project` / `run_program` / `run_quality_checks` / `detect_build_system` を提供)。判定は `(.claude/settings.json: enabledMcpjsonServers ∪ enableAll 展開) − (.claude/settings.json: disabledMcpjsonServers) − (.claude/settings.local.json: disabledMcpjsonServers)` の集合で行う。**`~/.claude.json` (per-user / per-machine の trust 履歴) は意図的に参照しない** — マシンごとに preflight 結果が揺れる原因になるため、enablement は repo コミットで宣言し再現性を担保する (`.claude/settings.local.json` の disable のみ個人 opt-out として減算する; `~/.claude.json` 経由の disable は見ないため false-pass しうる割り切り)。`claude mcp list` は workspace trust dialog を skip して stdio server を spawn するため `✓ Connected` でも session が tool を露出する保証にならず (false-positive 源)、preflight gate には使わず advisory 表示のみに留める。未 enable 時は `preflight.json#checks` の `claude_mcp_build_runtime_registered` が `pass=false` となり `status=fail` で停止する。remediation はコミット対象 `.claude/settings.json` の top-level に `"enabledMcpjsonServers": ["build-runtime"]` を追加し、`.claude/settings.local.json` に `build-runtime` の disable が無いことを確認する。
-- Claude backend の `preflight` は **server 登録に加えて MCP tool が子 `Agent` session に permission-granted されていること** も必須とする。登録 (enable) されていても tool 呼び出し許可が無いと子 agent は `run_linter` 等を呼べず `Claude requested permissions … but you haven't granted it yet.` で blocked になる (Generate/Build/Validate が全停止)。判定は `preflight.json#checks` の `claude_mcp_build_runtime_permission_granted` で行い、`claude_mcp_build_runtime_registered` との **AND** が launch gate (`can_launch_*` / `status`) になる。granted 条件は次のいずれか: (a) コミット対象 `.claude/settings.json` の `permissions.allow` に server 単位 grant `mcp__build-runtime` がある (deny に無い)、(b) 必須 4 tool `mcp__build-runtime__run_linter` / `__compile_project` / `__run_program` / `__run_quality_checks` を個別 allow (各々 deny に無い)、(c) `permissions.defaultMode == "bypassPermissions"`。`.claude/settings.local.json` の `permissions.allow` も合算し、`permissions.deny` は減算する。**Claude Code の permission rule は MCP tool 名部分の wildcard (`mcp__build-runtime__*`) を解さない** ため、全 tool を許可するには server 単位 `mcp__build-runtime` を使う。remediation はコミット対象 `.claude/settings.json` の `permissions.allow` に `"mcp__build-runtime"` を追加すること。permission 反映には Claude Code session の再起動が必要な場合がある。
+- When running `preflight`, specify `--backend claude`.
+- Command example: `python3 tools/run_workflow.py <spec_ref> <until_phase> --llm claude`
+- The `preflight` of the Claude backend requires that the **`.claude/settings.json` committed to the repository** include `build-runtime` in `enabledMcpjsonServers` (or that `enableAllProjectMcpServers=true` and `.mcp.json` define `build-runtime`) (providing `run_linter` / `compile_project` / `run_program` / `run_quality_checks` / `detect_build_system`). The decision is made over the set `(.claude/settings.json: enabledMcpjsonServers ∪ enableAll expansion) − (.claude/settings.json: disabledMcpjsonServers) − (.claude/settings.local.json: disabledMcpjsonServers)`. **`~/.claude.json` (per-user / per-machine trust history) is intentionally not referenced** — because it would cause preflight results to vary per machine, enablement is declared via repo commit to ensure reproducibility (only the disable in `.claude/settings.local.json` is subtracted as a personal opt-out; since disables via `~/.claude.json` are not seen, this is a deliberate trade-off that can false-pass). Because `claude mcp list` skips the workspace trust dialog and spawns the stdio server, even a `✓ Connected` does not guarantee that the session exposes the tool (a false-positive source), so it is not used for the preflight gate and is kept as advisory display only. When not enabled, `claude_mcp_build_runtime_registered` in `preflight.json#checks` becomes `pass=false` and stops with `status=fail`. Remediation is to add `"enabledMcpjsonServers": ["build-runtime"]` at the top level of the committed `.claude/settings.json`, and confirm there is no disable of `build-runtime` in `.claude/settings.local.json`.
+- The `preflight` of the Claude backend also requires that, **in addition to server registration, the MCP tool be permission-granted to the child `Agent` session**. Even if registered (enabled), without tool-invocation permission the child agent cannot call `run_linter` etc. and gets blocked with `Claude requested permissions … but you haven't granted it yet.` (stopping Generate/Build/Validate entirely). The decision is made by `claude_mcp_build_runtime_permission_granted` in `preflight.json#checks`, and its **AND** with `claude_mcp_build_runtime_registered` becomes the launch gate (`can_launch_*` / `status`). The granted condition is one of: (a) the committed `.claude/settings.json` `permissions.allow` has the server-level grant `mcp__build-runtime` (and not in deny), (b) the required 4 tools `mcp__build-runtime__run_linter` / `__compile_project` / `__run_program` / `__run_quality_checks` are individually allowed (and none in deny), (c) `permissions.defaultMode == "bypassPermissions"`. The `permissions.allow` of `.claude/settings.local.json` is also combined, and `permissions.deny` is subtracted. **Claude Code's permission rule does not interpret a wildcard in the MCP tool name part (`mcp__build-runtime__*`)**, so to allow all tools use the server-level `mcp__build-runtime`. Remediation is to add `"mcp__build-runtime"` to the `permissions.allow` of the committed `.claude/settings.json`. A restart of the Claude Code session may be required for the permission to take effect.
 
-### 子 `agent` 起動
-- Claude Code では `spawn_agent` の代わりに `Agent` tool を使用して子 `agent` を起動する。
-- `Agent` tool の `prompt` 引数には [skills/workflow-orchestration/references/launch_prompts.md](skills/workflow-orchestration/references/launch_prompts.md) の対応テンプレートを適用する。
-- `Agent` tool の `subagent_type` は `general-purpose` を既定とし、起動する phase に応じて適切な値を選択する。
-- `context_isolated=true` は Claude Code の `Agent` tool が独立コンテキストで実行されることを指し、常に `true` として記録する。
+### child `agent` launch
+- In Claude Code, use the `Agent` tool instead of `spawn_agent` to launch a child `agent`.
+- For the `prompt` argument of the `Agent` tool, apply the corresponding template in [skills/workflow-orchestration/references/launch_prompts.md](skills/workflow-orchestration/references/launch_prompts.md).
+- The `subagent_type` of the `Agent` tool defaults to `general-purpose`; select an appropriate value according to the phase being launched.
+- `context_isolated=true` indicates that the Claude Code `Agent` tool runs in an isolated context, and is always recorded as `true`.
 
-### Claude Code における `record-launch` の実行順序
+### Execution order of `record-launch` in Claude Code
 
-Claude Code では `record-launch` を **Agent tool より前** に呼び出す。Codex の `spawn_agent` と異なり、同期的に `Agent` tool を呼び出すためには子 agent が実行中に参照する `capability_token` と `output_manifest` を事前に生成しておく必要がある。
+In Claude Code, call `record-launch` **before the Agent tool**. Unlike Codex's `spawn_agent`, in order to call the `Agent` tool synchronously, the `capability_token` and `output_manifest` that the child agent references during execution must be generated in advance.
 
 ```
-手順:
-1. agent_run_id（UUID）を発行する
-   - canonical 経路: `python3 tools/new_agent_run_id.py` を bare 実行し、Bash の標準出力に印字された UUID を後続コマンドへ literal 文字列として埋め込む。
-   - `CHILD_ARID=$(python3 tools/new_agent_run_id.py)` の **2-step shell var 割り当て形式は使わない** — 先頭 `CHILD_ARID=` が `Bash(python3 tools/new_agent_run_id.py)` allowlist 一致を壊し、session sandbox の approval を都度要求する原因になる。
-   - `cat /proc/sys/kernel/random/uuid` / `uuidgen` は session sandbox の approval 要求で都度停止するため使用しない。`python3 -c 'import uuid; …'` は `forbid_python_inline_write` でブロックされる。
-2. reserve-phase-root で ir_id / pipeline_id を予約する（未予約なら）
-3. record-launch を実行する（Agent tool 起動 前）
-   → capability_token / sandbox_profile / output manifest / read manifest が生成される
-   → launches/<agent_run_id>.reply.txt には暫定内容が書き込まれる
-4. Agent tool を起動する（子 agent は capabilities/<agent_run_id>.json から
-   capability_token を読み取って guarded-apply-patch 等を実行する）
-5. Agent tool の戻り値（最終応答テキスト）を受け取る
-6. record-child-return を実行して Agent tool 戻り観測の証跡 (child_returns/<agent_run_id>.txt) を残す
-   → 必須引数: `--return-token "<literal token>"` (Adv-30: 任意 caller による forge 防止の parent-bound token; record-launch が自動生成)
-   → token は **二段方式** で渡す（手順 6a → 6b。詳細は下記「`parent_return_token` の参照規約」）。`$(cat ...)` command substitution 形式は Bash tool の静的解析を通らないため使わない。
-   → ack 不在 or token 不一致だと手順 7 の deactivate-child が ValueError で拒否される（Adv-20/Adv-30 ガード）
-7. deactivate-child を実行して active context を orchestration agent へ切り戻す
-8. record-reply で launches/<agent_run_id>.reply.txt に応答テキストを上書き保存する
-9. record-agent-run を実行して agent_runs.jsonl へ追記する
+Steps:
+1. Issue an agent_run_id (UUID)
+   - Canonical path: run `python3 tools/new_agent_run_id.py` bare, and embed the UUID printed to Bash stdout into subsequent commands as a literal string.
+   - Do **not** use the 2-step shell var assignment form `CHILD_ARID=$(python3 tools/new_agent_run_id.py)` — the leading `CHILD_ARID=` breaks the `Bash(python3 tools/new_agent_run_id.py)` allowlist match and causes the session sandbox to request approval every time.
+   - Do not use `cat /proc/sys/kernel/random/uuid` / `uuidgen` because they stop on session-sandbox approval requests every time. `python3 -c 'import uuid; …'` is blocked by `forbid_python_inline_write`.
+2. Reserve ir_id / pipeline_id with reserve-phase-root (if not yet reserved)
+3. Run record-launch (before launching the Agent tool)
+   → capability_token / sandbox_profile / output manifest / read manifest are generated
+   → launches/<agent_run_id>.reply.txt is written with provisional content
+4. Launch the Agent tool (the child agent reads the capability_token from
+   capabilities/<agent_run_id>.json and runs guarded-apply-patch etc.)
+5. Receive the Agent tool's return value (the final response text)
+6. Run record-child-return to leave evidence of observing the Agent tool return (child_returns/<agent_run_id>.txt)
+   → required argument: `--return-token "<literal token>"` (Adv-30: a parent-bound token to prevent forgery by an arbitrary caller; auto-generated by record-launch)
+   → pass the token via the **two-step method** (steps 6a → 6b; see "`parent_return_token` reference convention" below). Do not use the `$(cat ...)` command-substitution form because it does not pass the Bash tool's static analysis.
+   → if the ack is absent or the token mismatches, deactivate-child in step 7 is rejected with a ValueError (Adv-20/Adv-30 guard)
+7. Run deactivate-child to switch the active context back to the orchestration agent
+8. Run record-reply to overwrite launches/<agent_run_id>.reply.txt with the response text
+9. Run record-agent-run to append to agent_runs.jsonl
 ```
 
-**手順 4–9 連続実行の必須性 (active_child window):** 手順 4 で `Agent` tool を起動すると active context が child へ切り替わり、手順 7 の `deactivate-child` まで child のままとなる。**この間（手順 5 の Agent tool 戻りから手順 7 完了まで）に親 orchestration agent が `Write` / `Edit` / `Bash` による file write を発行してはならない**。発行すると親自身の `workspace/tmp/<self_arid>/` への書き込みであっても child の `output_manifest` で評価され、`output_manifest_write_guard` (`agent_run_id=<child>`) で reject される（同 hook ブロックは過去 audit で実観測）。手順 4 から 9 までは中断なく連続実行し、親自身の tmp script や任意 path 書き込みは手順 9 完了後または手順 3 (`record-launch`) 直前にまとめること。
+**Necessity of running steps 4–9 contiguously (active_child window):** Launching the `Agent` tool in step 4 switches the active context to the child, and it remains the child until `deactivate-child` in step 7. **During this period (from the Agent tool return in step 5 until step 7 completes), the parent orchestration agent must not issue any file write via `Write` / `Edit` / `Bash`.** If it does, even a write to the parent's own `workspace/tmp/<self_arid>/` is evaluated against the child's `output_manifest` and rejected by `output_manifest_write_guard` (`agent_run_id=<child>`) (this hook block has been observed in past audits). Run steps 4 through 9 contiguously without interruption, and batch the parent's own tmp scripts or arbitrary-path writes after step 9 completes or just before step 3 (`record-launch`).
 
-**手順 6 における `parent_return_token` の参照規約 (二段方式):** token は次の 2 ステップで取得・受け渡しする。`$(cat ...)` の **Bash command substitution 形式は使わない** — Claude Code の Bash tool 静的解析が `Contains shell syntax (string) that cannot be statically analyzed` で reject する（過去 workflow で 4 回連続失敗を観測）。
+**`parent_return_token` reference convention in step 6 (two-step method):** Obtain and pass the token in the following 2 steps. Do **not** use the `$(cat ...)` Bash command-substitution form — Claude Code's Bash tool static analysis rejects it with `Contains shell syntax (string) that cannot be statically analyzed` (4 consecutive failures observed in a past workflow).
 
-- **手順 6a (取得):** `cat workspace/orchestrations/<orchestration_id>/launches/<agent_run_id>.parent_return_token` を **単独の Bash command** として実行し、token を標準出力へ印字する（allowlist `Bash(cat workspace/orchestrations/*)` に一致し approval 不要）。`<orchestration_id>` / `<agent_run_id>` は literal 置換。
-- **手順 6b (受け渡し):** 6a で印字された token を **literal 文字列** として `record-child-return --return-token "<literal token>"` に埋め込んで実行する。
+- **Step 6a (obtain):** run `cat workspace/orchestrations/<orchestration_id>/launches/<agent_run_id>.parent_return_token` as a **single Bash command** to print the token to stdout (it matches the allowlist `Bash(cat workspace/orchestrations/*)` and requires no approval). Substitute `<orchestration_id>` / `<agent_run_id>` literally.
+- **Step 6b (pass):** embed the token printed in 6a as a **literal string** into `record-child-return --return-token "<literal token>"` and run it.
 
-**`Read` tool で当該 file を読んではならない**。active_child window 中の Read は child arid の `read_manifest` で評価され、parent 自身の broader manifest にあっても `read_manifest_read_guard` で block される（過去 audit で `launches/<arid>.parent_return_token` への Read tool ブロックを観測）。そのため取得は `Read` ではなく allowlist 一致の単独 `cat`（手順 6a）で行う。
+**Do not read the file with the `Read` tool.** A Read during the active_child window is evaluated against the child arid's `read_manifest`, and even if it is in the parent's own broader manifest it is blocked by `read_manifest_read_guard` (a Read tool block on `launches/<arid>.parent_return_token` has been observed in past audits). Therefore obtain it not with `Read` but with the allowlist-matching single `cat` (step 6a).
 
-### CLI 仕様の確認規約 (場所別 total cost 最適化)
+### CLI reference conventions (per-location total-cost optimization)
 
-CLI 引数情報の取得経路は、対象 subcommand の頻度・payload schema 複雑度・doc 同期コストで使い分ける。canonical source の選択は次表に従う。
+Choose the path for obtaining CLI argument information based on the target subcommand's frequency, payload schema complexity, and doc synchronization cost. The choice of canonical source follows the table below.
 
-| 対象 | canonical source | 理由 |
+| target | canonical source | reason |
 |---|---|---|
-| `tools/orchestration_runtime.py` の頻出 subcommand (`record-launch` / `record-agent-run` / `record-child-return` / `deactivate-child` / `record-reply` / `set-status` / `write-step-result` / `workflow-launch-check` / `reserve-phase-root` / `mark-dependency-readiness` / `guarded-apply-patch` / `run-gate`) | [docs/CLI_REFERENCE.md](docs/CLI_REFERENCE.md) (Tier-A) + `references/startup_contract.md` のテンプレート | payload schema 複雑、phase 別必須切替あり、`--help` 単独では不足 |
-| `tools/orchestration_runtime.py` の稀少 subcommand (`init` / `preflight` / `preflight-status` / `record-timeout` / `read-checkpoint` / `verify-checkpoint-integrity` / `check-step-completed` / `orchestration-read` / `repair-agent-runs`) | `python3 tools/orchestration_runtime.py <sub> --help`。overview は [docs/CLI_REFERENCE_RARE.md](docs/CLI_REFERENCE_RARE.md) | doc maintenance cost が使用頻度に見合わない |
-| `tools/run_workflow.py` / `tools/validate_pipeline_semantics.py` / `tools/audit_orchestration.py` | `<tool> --help` | 専用 doc を作らない |
-| `tools/new_agent_run_id.py` | literal (`python3 tools/new_agent_run_id.py`) | 引数なし |
-| step / substep agent から `guarded-apply-patch` / `run-gate` 等の呼び出し | parent の launch prompt に埋め込まれた literal (`references/launch_prompts.md`) | child context 節約、parent が template で pin |
+| Frequent subcommands of `tools/orchestration_runtime.py` (`record-launch` / `record-agent-run` / `record-child-return` / `deactivate-child` / `record-reply` / `set-status` / `write-step-result` / `workflow-launch-check` / `reserve-phase-root` / `mark-dependency-readiness` / `guarded-apply-patch` / `run-gate`) | [docs/CLI_REFERENCE.md](docs/CLI_REFERENCE.md) (Tier-A) + templates in `references/startup_contract.md` | complex payload schema, per-phase required-argument switching, `--help` alone is insufficient |
+| Rare subcommands of `tools/orchestration_runtime.py` (`init` / `preflight` / `preflight-status` / `record-timeout` / `read-checkpoint` / `verify-checkpoint-integrity` / `check-step-completed` / `orchestration-read` / `repair-agent-runs`) | `python3 tools/orchestration_runtime.py <sub> --help`. Overview is [docs/CLI_REFERENCE_RARE.md](docs/CLI_REFERENCE_RARE.md) | doc maintenance cost does not match usage frequency |
+| `tools/run_workflow.py` / `tools/validate_pipeline_semantics.py` / `tools/audit_orchestration.py` | `<tool> --help` | no dedicated doc is created |
+| `tools/new_agent_run_id.py` | literal (`python3 tools/new_agent_run_id.py`) | no arguments |
+| Calls to `guarded-apply-patch` / `run-gate` etc. from a step / substep agent | the literal embedded in the parent's launch prompt (`references/launch_prompts.md`) | saves child context; the parent pins it via template |
 
-`tools/` 配下の実装直読 (`Read` tool / `grep` / `sed` / `cat` 等で `.py` 実装を読む経路) は `forbid_tools_direct_read` および `read_manifest_read_guard` の対象として引き続き禁止する。`<tool> --help` は argparse 出力に限定された情報取得経路であり、`forbid_tools_direct_read` の対象外として許容する (hook は audit-log のみ記録)。
+Reading the implementations under `tools/` directly (the path of reading `.py` implementations via the `Read` tool / `grep` / `sed` / `cat` etc.) remains forbidden and subject to `forbid_tools_direct_read` and `read_manifest_read_guard`. `<tool> --help` is an information-acquisition path limited to argparse output and is allowed outside the scope of `forbid_tools_direct_read` (the hook only records an audit log).
 
-### `record-launch` の `response.json`
-- `Agent` tool の起動応答には Codex の `spawn_agent` のような構造化 JSON が存在しない。
-- `record-launch --response-json` には以下の最小構成 JSON を渡す。`sandbox_runtime`・`sandbox_enforced`・`sandbox_profile_ref` は `record-launch` が自動付与する。
+### `response.json` of `record-launch`
+- The Agent tool's launch response has no structured JSON like Codex's `spawn_agent`.
+- Pass the following minimal JSON to `record-launch --response-json`. `sandbox_runtime`, `sandbox_enforced`, and `sandbox_profile_ref` are auto-added by `record-launch`.
 
 ```json
 {
@@ -105,6 +105,6 @@ CLI 引数情報の取得経路は、対象 subcommand の頻度・payload schem
 }
 ```
 
-- `agent_session_id` は発行した `agent_run_id` と同一値を使用する（Claude Code には Codex のような固有 session ID が存在しないため）。
-- `launches/<agent_run_id>.response.json` と `agents/<agent_run_id>/dialogs/child.response.json` には上記と `record-launch` が付与したフィールドを含む内容が保存される。
-- `launches/<agent_run_id>.reply.txt` は手順 3 で record-launch が暫定書き込みし、手順 8 の record-reply で Agent tool の実際の応答テキストに上書きする。
+- Use the same value for `agent_session_id` as the issued `agent_run_id` (because Claude Code has no dedicated session ID like Codex).
+- `launches/<agent_run_id>.response.json` and `agents/<agent_run_id>/dialogs/child.response.json` store content including the above plus the fields added by `record-launch`.
+- `launches/<agent_run_id>.reply.txt` is provisionally written by record-launch in step 3, and overwritten with the actual Agent tool response text by record-reply in step 8.

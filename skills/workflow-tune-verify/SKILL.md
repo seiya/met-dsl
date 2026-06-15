@@ -1,34 +1,34 @@
 ---
 name: workflow-tune-verify
-description: Tune ステージの verify を実行し、候補 `spec.ir.yaml.impl_defaults` variant の物理合格、品質条件、性能目的関数を評価して採用可否を判定するときに使用する。`best impl` の固定と回帰移行判定に適用する。
+description: Use this when running the verify of the Tune stage and evaluating the physics passing, quality conditions, and performance objective function of a candidate `spec.ir.yaml.impl_defaults` variant to judge whether to adopt it. It applies to fixing the `best impl` and judging the move to regression.
 ---
 
 # Workflow Tune Verify
 
-## 目的
-Tune ステージ候補の検証責務を固定し、採用候補を客観指標で選別する。本フローは core workflow から分離された **任意フロー** の一部である。
+## Purpose
+Fix the verification responsibility of the Tune stage candidates, and select the adopted candidate by objective metrics. This flow is part of an **optional flow** separated from the core workflow.
 
-## 適用範囲
-- 候補 `spec.ir.yaml.impl_defaults` variant の trial 結果評価
-- `best impl` の確定と再チューニング判定
+## Scope
+- the trial-result evaluation of a candidate `spec.ir.yaml.impl_defaults` variant
+- the finalization of the `best impl` and the re-tuning judgment
 
-## 要件
-- 物理 `fail` 候補は性能評価対象から除外する。
-- 品質比較結果が不合格の候補は採用しない。
-- 性能評価は `perf.json` の統計値を用い、目的関数で順位付けする。
-- 同一点の再測定結果を扱い、ノイズに頑健な判定を行う。
-- 採用候補は `trial_meta.json` と `lineage.json` で追跡可能であることを必須条件にする。
-- workflow mode は `METDSL_WORKFLOW_EXEC_MODE` を canonical source とし、未設定時は `dev` を適用する。
-- `dev` mode では `issue_severity=major|critical` を検出した時点で `Tune fail` とし、軽微例外扱いを禁止する。
+## Requirements
+- Exclude a physics `fail` candidate from the performance-evaluation target.
+- Do not adopt a candidate whose quality-comparison result is a failure.
+- The performance evaluation uses the statistics of `perf.json`, and ranks by the objective function.
+- Handle the re-measurement result of the same point, and make a noise-robust judgment.
+- Make it a required condition that the adopted candidate is traceable in `trial_meta.json` and `lineage.json`.
+- The workflow mode uses `METDSL_WORKFLOW_EXEC_MODE` as the canonical source, and applies `dev` when unset.
+- In `dev` mode, it is a `Tune fail` the moment `issue_severity=major|critical` is detected, and treating it as a minor exception is forbidden.
 
-## 運用ルール
-1. `verdict` と `aggregate_verdict` が `pass` の候補のみ採用候補に残す。
-2. 採用候補の中から目的関数最大の variant `spec.ir.yaml.impl_defaults` を `best impl` に固定する。
-3. 新アーキテクチャまたは新コンパイラ条件では再チューニング判定を実行する。
-4. 判定根拠を `tuning` 系メタデータに保存し、回帰監視へ引き渡す。
-5. `dev` mode で `fail` した場合は、`failure_analysis.json` 作成に必要な根拠（失敗理由、対象 trial、判定エビデンス）を記録する。
+## Operations Rules
+1. Keep only candidates whose `verdict` and `aggregate_verdict` are `pass` as adoption candidates.
+2. Among the adoption candidates, fix the variant `spec.ir.yaml.impl_defaults` with the maximum objective function as the `best impl`.
+3. Under a new-architecture or new-compiler condition, run the re-tuning judgment.
+4. Save the judgment basis in the `tuning`-family metadata, and hand it to regression monitoring.
+5. When it `fail` in `dev` mode, record the basis needed to create `failure_analysis.json` (the failure reason, the target trial, the judgment evidence).
 
-## 判定基準
-- 採用候補が物理と品質の必須条件を満たす。
-- 性能順位付けが `perf.json` の保存値で再現できる。
-- `best impl` の確定根拠が追跡可能である。
+## Decision Criteria
+- The adopted candidate satisfies the required physics and quality conditions.
+- The performance ranking can be reproduced from the saved values of `perf.json`.
+- The finalization basis of the `best impl` is traceable.

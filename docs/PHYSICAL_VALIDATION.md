@@ -1,32 +1,32 @@
-# 物理妥当性判定（最重要要件）
+# Physical-validity judgment (most important requirement)
 
-## 目的
-本基盤の合否判定は、bitwise 一致ではなく**物理妥当性**で行う。
-本書で定義する判定は、当該 `node` の `self_verdict` を構成する根拠とする。
+## Purpose
+The pass/fail judgment of this framework is done by **physical validity**, not by bitwise agreement.
+The judgment defined in this document constitutes the basis that forms the relevant `node`'s `self_verdict`.
 
-## 基本ルール
-- 物理問題ごとに判定可能な項目は異なるが、**定義できる項目は必ず検証対象に含める**。
-- 定義できない項目は黙って省略せず、`diagnostics.json` / `verdict.json` に **N/A と理由**を明記する。
+## Basic rules
+- The judgeable items differ per physics problem, but **always include the definable items in the verification scope**.
+- Do not silently omit an item that cannot be defined; clearly state **N/A and the reason** in `diagnostics.json` / `verdict.json`.
 
-## 必須チェック（定義可能な場合）
-1. **CFL 条件チェック**
-- 時空間離散化と波速（または移流速度）から `CFL` 数を評価する。
-- 最大 `CFL`、閾値、違反有無を記録する。
-2. **離散保存性（保存量すべて）**
-- 保存されるべき量（質量、運動量、エネルギー等）のドリフトを検証する。
-- 保存量ごとに誤差指標と許容値を明示し、個別に合否判定する。
-3. **離散対称性**
-- 初期条件・境界条件・方程式が持つ対称性（鏡映、回転、平行移動等）を検証する。
-- 対称性誤差ノルムと許容値を定義する。
-4. **理論との比較（線形問題など）**
-- 理論増幅率と数値増幅率（必要に応じて位相誤差）を比較する。
-- 代表モード群に対する誤差指標と判定結果を記録する。
+## Required checks (when definable)
+1. **CFL condition check**
+- Evaluate the `CFL` number from the space-time discretization and the wave speed (or advection speed).
+- Record the maximum `CFL`, the threshold, and whether there is a violation.
+2. **Discrete conservation (all conserved quantities)**
+- Verify the drift of quantities that should be conserved (mass, momentum, energy, etc.).
+- State the error metric and tolerance per conserved quantity, and judge pass/fail individually.
+3. **Discrete symmetry**
+- Verify the symmetries that the initial conditions, boundary conditions, and equations have (reflection, rotation, translation, etc.).
+- Define the symmetry-error norm and tolerance.
+4. **Comparison with theory (linear problems, etc.)**
+- Compare the theoretical amplification rate and the numerical amplification rate (and the phase error as needed).
+- Record the error metric and judgment result for the representative mode group.
 
-## 運用ルール
-- 各テストケースで「適用可否・評価式（または評価手順）・許容値」を事前に定義する。
-- `LLM` を使うステージでは、ステージ内部の `verify` で評価式と閾値が `tests` と一致することを確認する。
-- `verifier` は `generator` と独立したコンテキスト（別セッションまたは別エージェント）での実行を可能な限り優先する。
-- 実行環境の制約で独立コンテキストを確保できない場合は、同一コンテキスト実行を許容し、対応する `<stage>_meta.json`（`Compile` は `ir_meta.json`、`Generate` は `source_meta.json`、`Validate` は `validate_meta.json`）に制約理由を記録する。
-- 失敗試行の保存可否は `SPEC.md` の `debug_mode` 規則に従う。
-- `verdict.json` は各項目の部分判定と総合判定の両方を持ち、根拠を追跡可能にする。
-- 依存込みの総合判定は `aggregate_verdict.json` で行い、本書の判定式は直接参照しない。
+## Operations Rules
+- For each test case, define "applicability, evaluation expression (or evaluation procedure), tolerance" in advance.
+- In an `LLM`-using stage, confirm in the in-stage `verify` that the evaluation expressions and thresholds match `tests`.
+- The `verifier` prioritizes, as far as possible, execution in a context independent of the `generator` (a separate session or a separate agent).
+- When an isolated context cannot be secured due to execution-environment constraints, same-context execution is permitted, and the constraint reason is recorded in the corresponding `<stage>_meta.json` (`ir_meta.json` for `Compile`, `source_meta.json` for `Generate`, `validate_meta.json` for `Validate`).
+- Whether failed attempts may be saved follows the `debug_mode` rule in `SPEC.md`.
+- `verdict.json` has both the partial judgments of each item and the overall judgment, and makes the basis traceable.
+- The overall judgment including dependencies is done in `aggregate_verdict.json`, and the judgment expressions of this document are not referenced directly.

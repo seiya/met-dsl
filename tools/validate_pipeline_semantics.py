@@ -444,24 +444,46 @@ def _required_launch_prompt_markers_for_role(
         "skill_name:",
         "skill_ref:",
         "skill_must_read_refs:",
-        "必須要件:",
+        "Required requirements:",
     ]
     if role == "substep":
         return [
-            "あなたは substep agent である。",
-            "対象 node_key:",
-            "対象 step:",
-            "対象 substep:",
+            "You are a substep agent.",
+            "Target node_key:",
+            "Target step:",
+            "Target substep:",
             *markers,
         ]
     if role == "step":
         return [
-            "あなたは step agent である。",
-            "対象 node_key:",
-            "対象 step:",
+            "You are a step agent.",
+            "Target node_key:",
+            "Target step:",
             *markers,
         ]
     return []
+
+
+# Backward compatibility: orchestrations launched before the English translation
+# of the launch-prompt templates persisted Japanese template markers in their
+# `launch_prompt_ref`. Map each current English marker to its legacy Japanese
+# equivalent so `pre_judge` / `full` validation accepts both marker sets.
+_LEGACY_LAUNCH_PROMPT_MARKERS: dict[str, str] = {
+    "Required requirements:": "必須要件:",
+    "You are a substep agent.": "あなたは substep agent である。",
+    "You are a step agent.": "あなたは step agent である。",
+    "Target node_key:": "対象 node_key:",
+    "Target step:": "対象 step:",
+    "Target substep:": "対象 substep:",
+}
+
+
+def _launch_prompt_marker_present(marker: str, launch_text: str) -> bool:
+    """True if the current English marker or its legacy Japanese form is present."""
+    if marker in launch_text:
+        return True
+    legacy = _LEGACY_LAUNCH_PROMPT_MARKERS.get(marker)
+    return bool(legacy) and legacy in launch_text
 
 
 def _normalize_workspace_root_token(workspace_root: str) -> str:
@@ -498,11 +520,11 @@ def _node_key_to_safe(node_key: str) -> str | None:
 
 
 def _node_safe_to_node_key(node_safe: str) -> str | None:
-    """`<spec_kind>__<spec_id>__<spec_version>` を `<spec_kind>/<spec_id>@<spec_version>` へ復元する。
+    """Restore `<spec_kind>__<spec_id>__<spec_version>` to `<spec_kind>/<spec_id>@<spec_version>`.
 
-    `_node_key_to_safe` の逆変換。`spec_kind` / `spec_version` は `__` を含まないため、
-    先頭 token を `spec_kind`、末尾 token を `spec_version`、中間を `__` で再結合した値を
-    `spec_id` とする（`spec_id` 内の `__` も復元できる）。
+    The inverse of `_node_key_to_safe`. Because `spec_kind` / `spec_version` do not contain `__`,
+    the value re-joining the leading token as `spec_kind`, the trailing token as `spec_version`,
+    and the middle (re-joined with `__`) is `spec_id` (the `__` inside `spec_id` is also restored).
     """
     parts = node_safe.split("__")
     if len(parts) < 3:
@@ -5676,11 +5698,11 @@ def _validate_tests_verdict_summary_consistency(
 
 
 def _collect_numeric_leaves(obj: Any, _depth: int = 0) -> list[float | None]:
-    """JSON オブジェクト/配列から数値・null リーフを再帰収集する（深さ上限 8）。"""
+    """Recursively collect numeric / null leaves from a JSON object/array (depth limit 8)."""
     if _depth > 8:
         return []
     if isinstance(obj, bool):
-        return []  # bool は int のサブクラスなので先にチェック
+        return []  # bool is a subclass of int, so check it first
     if isinstance(obj, (int, float)):
         return [float(obj)]
     if obj is None:
@@ -5702,22 +5724,22 @@ def _validate_metrics_basis_not_trivial(
     execution: NodeExecution,
     violations: list[str],
 ) -> None:
-    """metrics_basis.json が全ゼロ/全 null でないことを検証する。"""
+    """Verify that metrics_basis.json is not all-zero / all-null."""
     metrics_path = execution.node_dir / "raw" / "metrics_basis.json"
     if not metrics_path.exists():
-        return  # 存在チェックは _validate_raw_evidence が担当
+        return  # existence check is handled by _validate_raw_evidence
 
     try:
         data = _read_json(metrics_path)
     except json.JSONDecodeError:
-        return  # JSON 構文エラーは他の関数で処理済み
+        return  # JSON syntax errors are already handled by another function
 
     if not isinstance(data, dict):
         return
 
     numeric_values = _collect_numeric_leaves(data)
     if not numeric_values:
-        return  # 数値フィールドが一切なければスキップ
+        return  # skip if there is no numeric field at all
 
     non_trivial_count = sum(
         1 for v in numeric_values if v is not None and v != 0.0
@@ -6212,7 +6234,9 @@ def _validate_orchestration_hierarchy(
                             if key == "launch_prompt_ref":
                                 required_markers = _required_launch_prompt_markers_for_role(role_l)
                                 missing_markers = [
-                                    marker for marker in required_markers if marker not in launch_text
+                                    marker
+                                    for marker in required_markers
+                                    if not _launch_prompt_marker_present(marker, launch_text)
                                 ]
                                 if missing_markers:
                                     violations.append(

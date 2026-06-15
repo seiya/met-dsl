@@ -1,111 +1,111 @@
-# 全体ワークフロー共通契約: Spec -> Compile -> Generate -> Build -> Validate
+# Overall workflow common contract: Spec -> Compile -> Generate -> Build -> Validate
 
-この文書は workflow の phase sequence、inter-phase input/output contract、workflow 共通規範を定義する。terms は `GLOSSARY.md` を参照する。
+This document defines the workflow's phase sequence, inter-phase input/output contract, and workflow common norms. For terms, refer to `GLOSSARY.md`.
 
-## 目的
-- workflow を `Spec -> Compile -> Generate -> Build -> Validate` の 5 phase で定義する。
-- phase 境界は **observable な primary producer の階層** で切る。各 phase は一次成果物を 1 種類だけ生産する。
-- `node` 間の実行順序は `spec` の依存宣言から決定し、各 `node` 内では `Compile -> Generate -> Build -> Validate` の順で実行する。
-- 各 phase の `execution input` と `verification input` と `output` を一意に定義する。
-- 独立 `node` の並列実行は明示的な指示がある場合に限定し、既定では逐次実行する。
+## Purpose
+- Define the workflow as the 5 phases `Spec -> Compile -> Generate -> Build -> Validate`.
+- The phase boundary is cut by **the hierarchy of observable primary producers**. Each phase produces exactly one kind of primary artifact.
+- The execution order between `node` is determined from the `spec` dependency declarations, and within each `node` execution proceeds in the order `Compile -> Generate -> Build -> Validate`.
+- Uniquely define each phase's `execution input`, `verification input`, and `output`.
+- Limit the parallel execution of independent `node` to cases with an explicit instruction; by default execute sequentially.
 
-## 適用範囲
-- `spec` 起点モードと `resolved` 起点モードの workflow 実行
+## Scope
+- Workflow execution in `spec`-origin mode and `resolved`-origin mode
 - `Compile` / `Generate` / `Build` / `Validate`
-- `node` 単位 workflow、依存 `DAG` 展開、`workspace/` 配下 artifact
+- Per-`node` workflow, dependency `DAG` expansion, artifacts under `workspace/`
 
-## 文書責務
-- 本書（`WORKFLOW_CORE.md`）は workflow 共通の不変規範、phase sequence、`phase` 別 I/O 契約一覧、artifact layout rules、完了判定基準を canonical source として定義する。各 `phase` の詳細契約は [phases/](phases/) 配下のファイルを canonical source とする。
-- `ORCHESTRATION.md` は workflow のエージェント階層実行規約を canonical source として定義する。
-- `SPEC.md` は全体方針、`spec` 管理要件、registry 要件を canonical source として定義する。
-- 各 phase の実行手順、再試行手順、ツール呼び出し順、失敗時オペレーションは対応 `SKILL.md` を canonical source とする。
-- 任意フロー（`Tune` / `Promote`）の契約は別 plan で扱う。core workflow には含めない。
+## Document responsibility
+- This document (`WORKFLOW_CORE.md`) defines, as the canonical source, the workflow common invariants, phase sequence, per-`phase` I/O contract list, artifact layout rules, and completion criteria. The detailed contract of each `phase` uses the files under [phases/](phases/) as the canonical source.
+- `ORCHESTRATION.md` defines the workflow's agent hierarchical execution conventions as the canonical source.
+- `SPEC.md` defines the overall policy, `spec` management requirements, and registry requirements as the canonical source.
+- The execution procedure, retry procedure, tool-call order, and on-failure operations of each phase use the corresponding `SKILL.md` as the canonical source.
+- The contracts of the optional flows (`Tune` / `Promote`) are handled in a separate plan. They are not included in the core workflow.
 
 ## term rules
-- `phase` は workflow を構成する論理単位を指し、`Spec` / `Compile` / `Generate` / `Build` / `Validate` を含む。
-- `step` は 1 つの phase に対応するオーケストレーション上の実行単位として扱う。
-- `substep` は `step` を分解した下位実行単位を指す。
-  - `Compile` / `Generate` は `generate` と `verify` の 2 substep を持つ。
-  - `Validate` は `execute` と `judge` の 2 substep を持つ。
-  - `Build` は標準 substep を持たない単一 step とする。
-- `stage` は `generated_by_stage`、`<stage>_meta.json`、`write_scope_baseline.json.stage` など既存フィールド名としてのみ使用する。本文では `phase` または `step` の同義語として使用してはならない。
+- `phase` refers to the logical unit that composes the workflow, including `Spec` / `Compile` / `Generate` / `Build` / `Validate`.
+- `step` is treated as the orchestration-level execution unit corresponding to one phase.
+- `substep` refers to a lower execution unit decomposed from a `step`.
+  - `Compile` / `Generate` have the 2 substeps `generate` and `verify`.
+  - `Validate` has the 2 substeps `execute` and `judge`.
+  - `Build` is a single step that has no standard substep.
+- `stage` is used only as existing field names such as `generated_by_stage`, `<stage>_meta.json`, and `write_scope_baseline.json.stage`. It must not be used as a synonym for `phase` or `step` in the body text.
 
-## workflow 全体像
+## Workflow overview
 ### phase sequence
-0. `Spec`（人手）: `controlled_spec.md`、`tests.md`、`deps.yaml` を作成する。
-1. `Compile`: 自然言語仕様 + 依存解決を **単一構造 IR** (`spec.ir.yaml`) に統合する。
-2. `Generate`: IR を入力に `model` と `runner` のソースを生成する。
-3. `Build`: 生成ソースを標準ビルドツールで決定的にバイナリ化する。
-4. `Validate`: バイナリを実行し、一次証跡から判定指標を再計算して `verdict` を確定する。
+0. `Spec` (manual): create `controlled_spec.md`, `tests.md`, and `deps.yaml`.
+1. `Compile`: integrate the natural-language specification + dependency resolution into a **single structural IR** (`spec.ir.yaml`).
+2. `Generate`: take the IR as input and generate the source of `model` and `runner`.
+3. `Build`: deterministically turn the generated source into a binary with a standard build tool.
+4. `Validate`: run the binary, recompute the judgment metrics from the primary evidence, and finalize the `verdict`.
 
 ### primary deliverable
-| phase | primary deliverable | 性質 |
+| phase | primary deliverable | nature |
 |-------|---------------------|------|
-| Spec | `controlled_spec.md` / `tests.md` / `deps.yaml` | 自然言語（人手） |
-| Compile | `spec.ir.yaml` | 構造化（LLM） |
-| Generate | `source/<source_id>/` 配下のコード | ソース（LLM） |
-| Build | `binary/<binary_id>/bin/` | バイナリ（決定的） |
-| Validate | `verdict.json` / `aggregate_verdict.json` | 判定（実行 + LLM） |
+| Spec | `controlled_spec.md` / `tests.md` / `deps.yaml` | natural language (manual) |
+| Compile | `spec.ir.yaml` | structured (LLM) |
+| Generate | code under `source/<source_id>/` | source (LLM) |
+| Build | `binary/<binary_id>/bin/` | binary (deterministic) |
+| Validate | `verdict.json` / `aggregate_verdict.json` | judgment (execution + LLM) |
 
-## workflow 共通不変規範
-1. `tests` 合格または workflow 進行を目的とした `dummy` 出力を禁止する。
-2. `diagnostics.json` と `perf.json` は対象 `runner` の execution result としてのみ生成する。手書き、固定値埋め込み、外部後編集を禁止する。
-3. `verdict.json` と `aggregate_verdict.json` は `tests.md` と同一 `run_id` の実行 artifact から導出しなければならない。
-4. phase input が不足する場合は当該 phase を `fail` で停止し、推測補完を禁止する。
-5. phase 失敗時に下流 phase 開始条件を満たす目的で artifact ファイルを人工生成してはならない。
-6. 明示的な指定がない場合、既存 workflow 出力（過去 `ir_id` / `pipeline_id` / `source_id` / `binary_id` / `run_id`）の内容参照を禁止する。`orchestration_meta.json` に `resume_enabled=true` が記録されている orchestration では、`orchestration_checkpoint.json` に記録された完了済みステップの artifact 参照を許可する。
-7. `workspace/` 配下に過去 artifact が存在する場合も、中身の閲覧と入力参照を禁止する。
-8. workflow 実行は、リポジトリ管理下の `spec` canonical source と当該試行で生成した前段 artifact のみを入力として使用する。
-9. `docs/` と `spec/` と当該試行 artifact に定義されていない要求、判定規則、入出力契約を、`tools/` 配下の実装、検証 script、test code、validator code から抽出して補完してはならない。
-10. workflow 実行は、各 phase（`Compile` / `Generate` / `Validate`）を `LLM` で実行しなければならない。`Build` は決定的処理であり、MCP サーバー経由のビルドコマンド呼び出しで実行する。
-11. workflow 実行のために、複数 phase を一括代行する script を新規生成または実行してはならない。phase 実行は `orchestration agent -> step agent` または `orchestration agent -> substep agent` のみを許可する。
-12. workflow artifact の保存先ルートは `workspace/` のみを許可する。`workspace/` が存在しない場合はリポジトリルート直下へ作成する。
-13. workflow 実行中は対象 `DAG` の `workspace/ir` と `workspace/pipelines` 配下 artifact を削除してはならない。
-14. `quality check` は `diagnostics.json` と `verdict.json` の比較を canonical source とし、`stdout` 差分のみで合否を確定してはならない。
-15. `lineage.json` と `trial_meta.json` の artifact 参照パスは `workspace/` 起点で記録しなければならない。
-16. `trial_meta.json` は `generated_by_stage`、`source_source_id`、`source_binary_id`、`source_command_ref`、`source_artifact_hash` を必須記録とする (`run_id` は trial_meta が配置される `runs/<run_id>/` directory path 自体が canonical encoding であり、別途 `source_run_id` フィールドを記録しない — self-referential / circular なため)。`source_command_ref` の各 entry は `tool_name` (`run_program` または `run_quality_checks`) を宣言し、対応する MCP `command_log` record の `tool_name` と一致しなければならない。`Validate` の execute 部の trial_meta は最低 1 つ `tool_name='run_program'` の entry を持たなければならない。`source_source_id` の指す `source_meta.json` は `verification_status=pass` でなければならない。`source_binary_id` の指す `<pipeline>/binary/<source_binary_id>/bin/` は実在し、`run_program` log record の executable はその bin/ 配下に解決しなければならない。
-17. 異なる `pipeline_id` 間で `id` 系メタデータのみを変更して artifact 本文を流用してはならない。検出時は `copy_based_artifact_reuse` として `invalid` とする。
-18. 本規範違反は workflow 仕様違反とし、当該 `pipeline` を `invalid` とする。
-19. core workflow の全 phase は `workspace/` 配下以外へ書き込みを行ってはならない。任意フロー（`Promote`）の例外は別 plan で定義する。
-20. 全 phase 開始前に、リポジトリルート配下ファイル集合の `baseline` を取得し、当該 phase 完了前に差分比較を実施しなければならない。
-21. 差分比較は `workspace/` 配下以外の `add` / `modify` / `delete` を違反として検出しなければならない。
-22. `python` 実行を workflow 経路で使用する場合、`__pycache__` が `workspace/` 配下以外へ生成されない設定を必須とする。`PYTHONDONTWRITEBYTECODE=1` または `PYTHONPYCACHEPREFIX=workspace/.pycache/<pipeline_id>/` を使用する。
-23. 書き込み範囲違反を検出した phase は `fail` とし、下流 phase を開始してはならない。違反内容は `workspace/` 配下のメタデータへ記録しなければならない。
-24. 書き込み範囲違反を検出した `pipeline` は `invalid` とする。違反状態を解消せずに同一試行を継続してはならない。
-25. workflow の階層実行契約、`preflight`、`agent_runs.jsonl`、`agent_graph.json`、`step_result.json` の要件は `ORCHESTRATION.md` を canonical source として適用しなければならない。
-26. workflow 起動は `python3 tools/run_workflow.py <spec_ref> <until_phase> [--llm <codex|cursor|claude>]` を canonical entrypoint とする。`<until_phase>` は `compile` / `generate` / `build` / `validate` のいずれかを指定する。
-27. `preflight` が `fail` の場合、`orchestration agent` は子 `agent` を起動してはならない。workflow は `fail` で停止しなければならない。
-28. `preflight.json` を手動編集または後編集して `pass` 化してはならない。
-29. 子 `agent` 起動直前に execution platform の live 検査を再実行し、`multi_agent=true` と子 `agent` 起動可否の充足を確認しなければならない。
-30. `workspace/ir/` と `workspace/pipelines/` の phase artifact は、正規 child `agent` capability 以外で生成してはならない。`orchestration agent` は reservation artifact のみを生成できる。
-31. 出力形式、input/output contract、判定条件の要求定義は `controlled_spec.md` と `tests.md` と `deps.yaml` と `spec.ir.yaml` と `docs/` canonical source 文書のみを参照しなければならない。
-32. `tools/` 配下の検証 python script、quality check 実装、verify 実装は妥当性確認専用入力として扱い、要求定義または出力形式定義の入力として参照してはならない。
-33. 要求定義が不足する場合、検証実装からの逆算補完を禁止し、当該 phase を `fail` で停止しなければならない。
-34. `quality check` 実行に必要な preset-compatible quality path は `Generate` の正式出力だけで成立しなければならない。下流 phase が `workspace/` 配下へ test source、harness、補助 script、一時 Makefile を追加生成して成立させる運用を禁止する。
-35. `quality check` 実行方式は `spec.ir.yaml` の `impl_defaults.toolchain.language` と `impl_defaults.toolchain.build_system` に整合しなければならない。`toolchain.build_system=make` かつ `toolchain.language=fortran` / `c` / `cpp` / `mixed` 系では `make_test` または `make_check` を使用し、`pytest` による代替を禁止する。
-36. 依存関係上は独立な `node` であっても、workflow は明示的な並列実行指示が存在しない限り逐次実行しなければならない。
+## Workflow common invariants
+1. Forbid `dummy` output for the purpose of passing `tests` or advancing the workflow.
+2. Generate `diagnostics.json` and `perf.json` only as the execution result of the target `runner`. Forbid hand-writing, fixed-value embedding, and external post-editing.
+3. `verdict.json` and `aggregate_verdict.json` must be derived from `tests.md` and the execution artifacts of the same `run_id`.
+4. When a phase input is insufficient, stop the relevant phase with `fail`, and forbid guessed completion.
+5. On a phase failure, an artifact file must not be artificially generated for the purpose of satisfying a downstream phase's start condition.
+6. Without an explicit specification, forbid referencing the content of existing workflow output (past `ir_id` / `pipeline_id` / `source_id` / `binary_id` / `run_id`). For an orchestration where `resume_enabled=true` is recorded in `orchestration_meta.json`, referencing the artifacts of completed steps recorded in `orchestration_checkpoint.json` is permitted.
+7. Even when past artifacts exist under `workspace/`, forbid viewing their content and referencing them as input.
+8. Workflow execution uses, as input, only the repository-managed `spec` canonical source and the preceding artifacts generated in the relevant trial.
+9. Do not extract and complete a requirement, judgment rule, or input/output contract not defined in `docs/`, `spec/`, or the relevant trial's artifacts from the implementation under `tools/`, verification scripts, test code, or validator code.
+10. Workflow execution must execute each phase (`Compile` / `Generate` / `Validate`) with the `LLM`. `Build` is a deterministic process and is executed by a build-command call via the MCP server.
+11. For workflow execution, a script that proxies multiple phases at once must not be newly generated or executed. Phase execution allows only `orchestration agent -> step agent` or `orchestration agent -> substep agent`.
+12. The storage root for workflow artifacts allows only `workspace/`. If `workspace/` does not exist, create it directly under the repository root.
+13. During workflow execution, the artifacts under `workspace/ir` and `workspace/pipelines` of the target `DAG` must not be deleted.
+14. `quality check` uses the comparison of `diagnostics.json` and `verdict.json` as the canonical source, and must not finalize pass/fail by `stdout` diff alone.
+15. The artifact reference paths of `lineage.json` and `trial_meta.json` must be recorded relative to `workspace/`.
+16. `trial_meta.json` requires recording `generated_by_stage`, `source_source_id`, `source_binary_id`, `source_command_ref`, and `source_artifact_hash` (`run_id` is canonically encoded by the `runs/<run_id>/` directory path itself where the trial_meta is placed, and a separate `source_run_id` field is not recorded — because it is self-referential / circular). Each entry of `source_command_ref` declares a `tool_name` (`run_program` or `run_quality_checks`), and must match the `tool_name` of the corresponding MCP `command_log` record. The trial_meta of the execute part of `Validate` must have at least 1 entry with `tool_name='run_program'`. The `source_meta.json` that `source_source_id` points to must have `verification_status=pass`. The `<pipeline>/binary/<source_binary_id>/bin/` that `source_binary_id` points to must exist, and the executable of the `run_program` log record must resolve under that bin/.
+17. Across different `pipeline_id`, the artifact body must not be reused by changing only the `id`-family metadata. When detected, treat it as `copy_based_artifact_reuse` and mark it `invalid`.
+18. A violation of these norms is a workflow specification violation, and marks the relevant `pipeline` `invalid`.
+19. All phases of the core workflow must not write outside of `workspace/`. The exception for the optional flow (`Promote`) is defined in a separate plan.
+20. Before all phases start, capture a `baseline` of the file set under the repository root, and perform a diff comparison before the relevant phase completes.
+21. The diff comparison must detect an `add` / `modify` / `delete` outside of `workspace/` as a violation.
+22. When `python` execution is used in the workflow path, a setting in which `__pycache__` is not generated outside of `workspace/` is required. Use `PYTHONDONTWRITEBYTECODE=1` or `PYTHONPYCACHEPREFIX=workspace/.pycache/<pipeline_id>/`.
+23. A phase that detected a write-scope violation is `fail`, and a downstream phase must not start. The violation content must be recorded in metadata under `workspace/`.
+24. A `pipeline` that detected a write-scope violation is `invalid`. The same trial must not continue without resolving the violation state.
+25. The workflow's hierarchical execution contract, and the requirements of `preflight`, `agent_runs.jsonl`, `agent_graph.json`, and `step_result.json` must be applied using `ORCHESTRATION.md` as the canonical source.
+26. The canonical entrypoint for starting the workflow is `python3 tools/run_workflow.py <spec_ref> <until_phase> [--llm <codex|cursor|claude>]`. `<until_phase>` specifies one of `compile` / `generate` / `build` / `validate`.
+27. When `preflight` is `fail`, the `orchestration agent` must not launch a child `agent`. The workflow must stop with `fail`.
+28. `preflight.json` must not be manually edited or post-edited to make it `pass`.
+29. Just before launching a child `agent`, re-run the execution platform's live check, and confirm the satisfaction of `multi_agent=true` and the launchability of the child `agent`.
+30. The phase artifacts of `workspace/ir/` and `workspace/pipelines/` must not be generated by anything other than a legitimate child `agent` capability. The `orchestration agent` can generate only reservation artifacts.
+31. The requirement definition for the output format, input/output contract, and judgment conditions must reference only `controlled_spec.md`, `tests.md`, `deps.yaml`, `spec.ir.yaml`, and `docs/` canonical-source documents.
+32. The verification python scripts, quality-check implementations, and verify implementations under `tools/` are treated as input dedicated to validity confirmation, and must not be referenced as input for the requirement definition or output-format definition.
+33. When a requirement definition is insufficient, forbid back-deriving completion from the verification implementation, and stop the relevant phase with `fail`.
+34. The preset-compatible quality path needed for `quality check` execution must be established by the official output of `Generate` alone. Forbid the operation of having a downstream phase additionally generate test source, harness, auxiliary scripts, or a temporary Makefile under `workspace/` to establish it.
+35. The `quality check` execution method must be consistent with `impl_defaults.toolchain.language` and `impl_defaults.toolchain.build_system` of `spec.ir.yaml`. With `toolchain.build_system=make` and `toolchain.language=fortran` / `c` / `cpp` / `mixed` families, use `make_test` or `make_check`, and forbid substitution by `pytest`.
+36. Even for `node` that are independent in terms of dependencies, the workflow must execute sequentially unless an explicit parallel-execution instruction exists.
 
-## 共通規約
-### `LLM` 利用 phase
-- `LLM` を利用する全 phase に `SPEC.md` の「`LLM` の扱い（全体原則）」を適用する。
-- `LLM` 利用 phase は各 phase の `<stage>_meta.json`（`Compile` は `ir_meta.json`、`Generate` は `source_meta.json`、`Validate` は `validate_meta.json`）を必須出力とする。
-- `<stage>_meta.json` の共通必須 key は `attempt_count`、`verification_status`、`last_fail_reason`、`debug_mode`、`context_isolated` とする。
-- `context_isolated=false` の場合、`constraint_reason` を必須とする。
-- `ir_meta.json` は上記共通 key のみを必須とする。
-- `source_meta.json` は上記共通 key を必須とし、`verification_status=pass` の場合のみ `lint_command_ref.run_linter[]`（`command_id`、`command_log_ref`、`preset`）を必須とする。
-- `validate_meta.json` は上記共通 key を必須とし、`verification_status=pass` の場合のみ `judge_command_ref` で LLM 意味検査の証跡を必須とする。
-- `debug_mode=false` では失敗試行 artifact を保存しない。`debug_mode=true` で保存した場合は保存件数と保存先をメタデータへ記録する。
-- workflow 起動時の execution mode は `tools/run_workflow.py` の `--mode` で指定し、既定値は `dev` とする。
-- `dev` mode の `verify substep` は、`issue_severity=minor` のみを軽微問題として継続可能とし、`major` / `critical` は `fail` としなければならない。
-- `dev` mode で workflow が `fail` した場合、`workspace/orchestrations/<orchestration_id>/failure_analysis.json` を生成し、失敗理由、関連 `agent_run`、関連 `step_result`、補助ログ要約を記録しなければならない。
+## Common conventions
+### `LLM`-using phases
+- Apply the "Handling of the `LLM` (overall principles)" of `SPEC.md` to all phases that use the `LLM`.
+- An `LLM`-using phase produces each phase's `<stage>_meta.json` (`ir_meta.json` for `Compile`, `source_meta.json` for `Generate`, `validate_meta.json` for `Validate`) as a required output.
+- The common required keys of `<stage>_meta.json` are `attempt_count`, `verification_status`, `last_fail_reason`, `debug_mode`, and `context_isolated`.
+- When `context_isolated=false`, `constraint_reason` is required.
+- `ir_meta.json` requires only the common keys above.
+- `source_meta.json` requires the common keys above, and only when `verification_status=pass` requires `lint_command_ref.run_linter[]` (`command_id`, `command_log_ref`, `preset`).
+- `validate_meta.json` requires the common keys above, and only when `verification_status=pass` requires the evidence of the LLM semantic check in `judge_command_ref`.
+- With `debug_mode=false`, do not save failed-attempt artifacts. When saved with `debug_mode=true`, record the saved count and storage location in metadata.
+- The execution mode at workflow start is specified by `--mode` of `tools/run_workflow.py`, with a default of `dev`.
+- In `dev` mode, the `verify substep` can continue treating only `issue_severity=minor` as a minor problem, and must treat `major` / `critical` as `fail`.
+- When the workflow `fail` in `dev` mode, it must generate `workspace/orchestrations/<orchestration_id>/failure_analysis.json` and record the failure reason, the related `agent_run`, the related `step_result`, and an auxiliary log summary.
 
-### エージェント階層実行
-- workflow の階層実行契約、親子関係、起動順、停止条件、実行記録形式は `ORCHESTRATION.md` を適用する。
-- 本書は `orchestration agent` が子 `agent` へ渡す phase contract の canonical source として、各 phase の `execution input` と `verification input` と `出力` を定義する。
+### Agent hierarchical execution
+- Apply `ORCHESTRATION.md` for the workflow's hierarchical execution contract, parent-child relationships, launch order, stop conditions, and execution-record format.
+- This document, as the canonical source for the phase contract the `orchestration agent` passes to the child `agent`, defines each phase's `execution input`, `verification input`, and `output`.
 
 ### artifact layout rules
-#### ルート構造
-workflow artifact の保存先は `workspace/` を canonical source とし、次の構造を必須とする。
+#### Root structure
+The storage location for workflow artifacts uses `workspace/` as the canonical source, and requires the following structure.
 
 ```text
 workspace/
@@ -155,7 +155,7 @@ workspace/
           <source_id>/
             src/
             source_meta.json
-            attempts/  # optional: debug_mode=true の場合のみ
+            attempts/  # optional: only when debug_mode=true
         binary/
           <binary_id>/
             bin/
@@ -183,131 +183,131 @@ workspace/
     pipeline_index.json
 ```
 
-#### `ID` と不変条件
+#### `ID` and invariants
 
-##### `node_key` フォーマット
-- `node_key` は `<spec_kind>/<spec_id>@<spec_version>` 形式とする。
-  - `spec_kind`: `deps.yaml` の `spec_kind` フィールド値（例: `component`、`problem`、`profile`）
-  - `spec_id`: `deps.yaml` の `spec_id` フィールド値
-  - `spec_version`: `controlled_spec.md` の `spec_version` フィールド値
-- `node_key_safe` は `node_key` の保存用表記とし、`<spec_kind>__<spec_id>__<spec_version>` 形式とする。
-  - 正規表現: `^[a-z][a-z0-9_]*__[a-z0-9][a-z0-9_]*__[0-9][0-9A-Za-z._-]*$`
+##### `node_key` format
+- `node_key` is of the form `<spec_kind>/<spec_id>@<spec_version>`.
+  - `spec_kind`: the value of the `spec_kind` field of `deps.yaml` (e.g. `component`, `problem`, `profile`)
+  - `spec_id`: the value of the `spec_id` field of `deps.yaml`
+  - `spec_version`: the value of the `spec_version` field of `controlled_spec.md`
+- `node_key_safe` is the storage notation of `node_key`, of the form `<spec_kind>__<spec_id>__<spec_version>`.
+  - Regex: `^[a-z][a-z0-9_]*__[a-z0-9][a-z0-9_]*__[0-9][0-9A-Za-z._-]*$`
 
-##### `ID` 命名規則
-- `orchestration_id` は 1 回の workflow 全体を識別する `ID` とする。
-- `ir_id` は `node` 単位で `spec.ir.yaml` を識別する `ID` とする。
-  - 形式: `<slug>_<YYYYMMDD>_<seq3>`
-  - `slug` は `spec_id` 由来の短い可読 token（ハイフン区切り、英数字）。
-  - 正規表現: `^[a-z0-9]+(?:-[a-z0-9]+)*_[0-9]{8}_[0-9]{3}$`
-- `pipeline_id` は `node` 単位で 1 回の `Generate -> Build -> Validate` 系列を識別する `ID` とする。`ir_id` と同一形式・正規表現とする。
-- `source_id` / `binary_id` / `run_id` は各段階の試行単位 `ID` とし、推奨形式は `<prefix>_<date>_<seq3>` とする。`prefix` は `src` / `bin` / `run` を使用する。
-- workflow は毎回独立実行し、`ir_id` / `pipeline_id` / `source_id` / `binary_id` / `run_id` を毎回新規発行しなければならない。
-- `agent_run_id` は `step agent` / `substep agent` / `orchestration agent` の実行単位 `ID` とし、`step` / `substep` では `parent_agent_run_id` を必須記録とする。
-- `agent_runs.jsonl` の `step` / `substep` ロールは `agent_backend` と `agent_model` と `context_id` と `context_isolated` を必須記録とする。
-- `agent_runs.jsonl` の終端状態行（`pass` / `fail` / `blocked` / `timeout` / `cancel`）は `finished_at` を必須記録とする。
-- `step` / `substep` ロールの `context_id` は `orchestration_id` 内で一意でなければならない。
-- `Validate` の判定単位は `node_key` とする。`run_id` 配下で複数 `node_key` を扱う場合は `node_key` ごとの artifact 分離を必須とする。
-- `ir_id` 配下の `spec.ir.yaml` は `immutable` とし、更新時は新規 `ir_id` を発行する。
-- `pipeline_id` 配下は `append-only` とし、既存 `run_id` の上書きを禁止する。
+##### `ID` naming rules
+- `orchestration_id` is the `ID` that identifies one entire workflow.
+- `ir_id` is the `ID` that identifies the `spec.ir.yaml` per `node`.
+  - Format: `<slug>_<YYYYMMDD>_<seq3>`
+  - `slug` is a short readable token derived from `spec_id` (hyphen-separated, alphanumeric).
+  - Regex: `^[a-z0-9]+(?:-[a-z0-9]+)*_[0-9]{8}_[0-9]{3}$`
+- `pipeline_id` is the `ID` that identifies one `Generate -> Build -> Validate` series per `node`. Same format and regex as `ir_id`.
+- `source_id` / `binary_id` / `run_id` are per-trial `ID` of each stage, with a recommended form of `<prefix>_<date>_<seq3>`. `prefix` uses `src` / `bin` / `run`.
+- The workflow runs independently each time, and must newly issue `ir_id` / `pipeline_id` / `source_id` / `binary_id` / `run_id` each time.
+- `agent_run_id` is the per-execution `ID` of a `step agent` / `substep agent` / `orchestration agent`, and `step` / `substep` require recording `parent_agent_run_id`.
+- The `step` / `substep` roles of `agent_runs.jsonl` require recording `agent_backend`, `agent_model`, `context_id`, and `context_isolated`.
+- The terminal-status rows (`pass` / `fail` / `blocked` / `timeout` / `cancel`) of `agent_runs.jsonl` require recording `finished_at`.
+- The `context_id` of the `step` / `substep` roles must be unique within the `orchestration_id`.
+- The judgment unit of `Validate` is `node_key`. When multiple `node_key` are handled under a `run_id`, per-`node_key` artifact separation is required.
+- The `spec.ir.yaml` under an `ir_id` is `immutable`, and on update a new `ir_id` is issued.
+- Under a `pipeline_id` is `append-only`, and overwriting an existing `run_id` is forbidden.
 
-#### 起点モード
-- `spec` 起点モード: `spec` から依存 `DAG` を解決し、`node` ごとに新しい `ir_id` を発行して `pipeline` を開始する。
-- `ir` 起点モード: 既存 `ir_id` を指定し、`Generate` 以降のみを実行する。
-- `lineage.json` は `spec_ref`、`ir_ref`、各段階 `id`、`dependency_ref`、`node_key`、`direct_dependency_status` を必須記録とする。
+#### Origin modes
+- `spec`-origin mode: resolve the dependency `DAG` from the `spec`, issue a new `ir_id` per `node`, and start the `pipeline`.
+- `ir`-origin mode: specify an existing `ir_id` and execute only from `Generate` onward.
+- `lineage.json` requires recording `spec_ref`, `ir_ref`, each stage `id`, `dependency_ref`, `node_key`, and `direct_dependency_status`.
 
-#### 再実行規則
-- 同一 `ir_id` で `Generate` を複数回実行してよい。各試行は別 `source_id` とする。
-- 同一 `source_id` で `Build` を複数回実行してよい。各試行は別 `binary_id` とする。
-- 同一 `binary_id` で `Validate` を複数回実行してよい。各試行は別 `run_id` とする。これは full Validate retry (`execute` 再実行 + `judge` 再評価) と judge 単独再評価 (`execute` 出力を流用して `judge` のみ再実行) の両方に適用する: いずれの場合も新規 `run_id` を発行し、既存 `runs/<run_id>/` ディレクトリに上書きしてはならない。同一 `run_id` 配下で `judge` を 2 回以上実行すると `verdict.json` / `aggregate_verdict.json` / `summary.json` / `semantic_review.json` (judge の canonical 出力) が上書きされて以前の判定根拠が失われるため、同一 `run_id` の再利用を禁止する。judge 単独再評価で `execute` の `raw/` / `diagnostics.json` / `perf.json` / `quality_check.json` / `trial_meta.json` をそのまま流用する場合、orchestration agent はそれらを新 `run_id` 配下にコピーし、`trial_meta.json` の `source_source_id` / `source_binary_id` は元 `run_id` と一致しなければならない (binary を生成した source と build の provenance を維持するため)。さらに、判定根拠の存続条件として、`trial_meta.json.source_source_id` の指す `<pipeline_ref>/source/<source_source_id>/` ディレクトリと `trial_meta.json.source_binary_id` の指す `<pipeline_ref>/binary/<source_binary_id>/` ディレクトリは、当該 `trial_meta.json` を保持する全ての `run_id` (元 + 再評価で複製された全ての run) が存在する限り削除してはならない (judge が `source_meta.json` 検査と `source/<source_id>/src/` の意味検査に依存するため、provenance チェーンが宙ぶらりんになると再評価不能になる)。
-- `Build` 開始条件は対象 `source_id` の `source_meta.json` で `verification_status=pass` であることとする。
-- `debug_mode=false` の `Generate` は `attempts/` を生成してはならない。
-- `Validate` 入力は常に同一 `run_id` 配下 artifact とし、他 `run_id` との混在を禁止する。
-- 各 phase `fail` 時は下流 phase 開始条件を満たす目的のファイル後付け生成を禁止する。
-- `substep` を持つ phase の再投入戦略（`repair_strategy=reuse` / `restart`）と記録要件は `ORCHESTRATION.md` を canonical source として適用する。
+#### Re-execution rules
+- `Generate` may be run multiple times with the same `ir_id`. Each trial is a different `source_id`.
+- `Build` may be run multiple times with the same `source_id`. Each trial is a different `binary_id`.
+- `Validate` may be run multiple times with the same `binary_id`. Each trial is a different `run_id`. This applies to both a full Validate retry (`execute` re-run + `judge` re-evaluation) and a judge-only re-evaluation (reusing the `execute` output and re-running only `judge`): in either case, issue a new `run_id`, and do not overwrite the existing `runs/<run_id>/` directory. Because running `judge` more than once under the same `run_id` would overwrite `verdict.json` / `aggregate_verdict.json` / `summary.json` / `semantic_review.json` (the canonical output of judge) and lose the previous judgment basis, reusing the same `run_id` is forbidden. When a judge-only re-evaluation reuses the `execute`'s `raw/` / `diagnostics.json` / `perf.json` / `quality_check.json` / `trial_meta.json` as-is, the orchestration agent copies them under the new `run_id`, and the `source_source_id` / `source_binary_id` of `trial_meta.json` must match the original `run_id` (to maintain the provenance of the source and build that generated the binary). Furthermore, as a survival condition of the judgment basis, the `<pipeline_ref>/source/<source_source_id>/` directory that `trial_meta.json.source_source_id` points to and the `<pipeline_ref>/binary/<source_binary_id>/` directory that `trial_meta.json.source_binary_id` points to must not be deleted as long as all `run_id` that hold the relevant `trial_meta.json` (the original + all runs duplicated in re-evaluation) exist (because judge depends on the `source_meta.json` check and the semantic check of `source/<source_id>/src/`, a dangling provenance chain makes re-evaluation impossible).
+- The start condition for `Build` is that the target `source_id`'s `source_meta.json` has `verification_status=pass`.
+- A `Generate` with `debug_mode=false` must not generate `attempts/`.
+- The `Validate` input is always the artifacts under the same `run_id`, and mixing with other `run_id` is forbidden.
+- On each phase `fail`, forbid the after-the-fact generation of files for the purpose of satisfying a downstream phase's start condition.
+- The re-submission strategy (`repair_strategy=reuse` / `restart`) and recording requirements for a phase that has `substep` are applied using `ORCHESTRATION.md` as the canonical source.
 
-#### 参照規則
-- `orchestration` から `step` / `substep` 実行を参照するときは `orchestration_id + agent_run_id` を使用し、ログ本文の全文検索だけで追跡してはならない。
-- `step` 完了判定は `workspace/orchestrations/<orchestration_id>/steps/<node_key_safe>/<step>/<agent_run_id>/step_result.json` を canonical source とする。
-- `pipeline` から `ir` を参照するときは `node_key_safe + ir_id` を使用し、相対ファイルパス直参照を禁止する。
-- `Validate` の再現は `lineage.json` と `trial_meta.json` のみで可能でなければならない。
-- `trial_meta.json` は `runner_command`、`process_trace_ref`、`raw_artifact_refs` を必須記録とする。
-- `index/ir_index.json` と `index/pipeline_index.json` は探索専用とし、判定ロジックの canonical source に使ってはならない。
-- `aggregate_verdict.json` は常に `spec.ir.yaml` の `dependency` セクションと整合し、依存集合の省略を禁止する。
+#### Reference rules
+- When referencing a `step` / `substep` execution from the `orchestration`, use `orchestration_id + agent_run_id`, and do not track it by full-text search of the log body alone.
+- The `step` completion judgment uses `workspace/orchestrations/<orchestration_id>/steps/<node_key_safe>/<step>/<agent_run_id>/step_result.json` as the canonical source.
+- When referencing an `ir` from a `pipeline`, use `node_key_safe + ir_id`, and forbid a direct relative-file-path reference.
+- The reproduction of `Validate` must be possible with `lineage.json` and `trial_meta.json` alone.
+- `trial_meta.json` requires recording `runner_command`, `process_trace_ref`, and `raw_artifact_refs`.
+- `index/ir_index.json` and `index/pipeline_index.json` are search-only, and must not be used as the canonical source for judgment logic.
+- `aggregate_verdict.json` is always consistent with the `dependency` section of `spec.ir.yaml`, and forbids omission of the dependency set.
 
-#### 依存 workflow 網羅チェック
-- `spec.ir.yaml` の `dependency.all_nodes` 集合と `workspace/ir/*/<ir_id>/` の `node_key_safe` 集合は 1 対 1 で一致しなければならない。
-- `spec.ir.yaml` の `dependency.all_nodes` 集合と `workspace/pipelines/*/<pipeline_id>/lineage.json` の `node_key` 集合は 1 対 1 で一致しなければならない。
-- 異なる `node_key` で生成された `source/<source_id>/src/` のコードハッシュが一致した場合、共通ライブラリとして明示されたファイルを除き `copy_based_artifact_reuse` として `invalid` にしなければならない。
-- workflow 実行の完了宣言前に、対象依存 `DAG` の `workspace/ir` / `workspace/pipelines` artifact を削除してはならない。
+#### Dependency workflow coverage check
+- The `dependency.all_nodes` set of `spec.ir.yaml` and the `node_key_safe` set of `workspace/ir/*/<ir_id>/` must match one-to-one.
+- The `dependency.all_nodes` set of `spec.ir.yaml` and the `node_key` set of `workspace/pipelines/*/<pipeline_id>/lineage.json` must match one-to-one.
+- When the code hash of `source/<source_id>/src/` generated under different `node_key` matches, except for a file explicitly stated as a common library, it must be marked `copy_based_artifact_reuse` and `invalid`.
+- Before the completion declaration of a workflow execution, the `workspace/ir` / `workspace/pipelines` artifacts of the target dependency `DAG` must not be deleted.
 
-#### 書き込み範囲ガード
-- 各 phase 開始時に `write_scope_baseline.json` を `workspace/` 配下へ保存し、比較対象の `baseline` を固定しなければならない。
-- `write_scope_baseline.json` は、少なくとも `stage`、`node_key`、`pipeline_id`、`captured_at`、`tracked_diff`、`untracked_files` を保持しなければならない。
-- 各 phase 完了前に `write_scope_baseline.json` との差分を計算し、`workspace/` 配下以外の変化を `write_scope_violation` として判定しなければならない。
-- 違反未検出時は `write_scope_check.status=pass` を phase メタデータへ記録しなければならない。
-- 違反検出時は `write_scope_violation.json` を `workspace/` 配下へ出力し、`violation_paths` と `stage` と `node_key` と `pipeline_id` と `detected_at` を必須記録しなければならない。
-- `write_scope_violation` 検出時は当該 phase を `fail` とし、当該 `pipeline` の `aggregate_verdict` 確定を禁止する。
+#### Write-scope guard
+- At the start of each phase, save `write_scope_baseline.json` under `workspace/`, and fix the `baseline` to be compared.
+- `write_scope_baseline.json` must hold at least `stage`, `node_key`, `pipeline_id`, `captured_at`, `tracked_diff`, and `untracked_files`.
+- Before each phase completes, compute the diff against `write_scope_baseline.json`, and must judge a change outside of `workspace/` as a `write_scope_violation`.
+- When no violation is detected, `write_scope_check.status=pass` must be recorded in the phase metadata.
+- When a violation is detected, output `write_scope_violation.json` under `workspace/`, and must record `violation_paths`, `stage`, `node_key`, `pipeline_id`, and `detected_at`.
+- When a `write_scope_violation` is detected, the relevant phase is `fail`, and the `aggregate_verdict` finalization of the relevant `pipeline` is forbidden.
 
-## phase 別 input/output contract 一覧
-本節では、各 phase の入力を `execution input` と `verification input` に分けて記述する。両者の role が重なる場合、同一 artifact を両方へ記載してよい。
+## Per-phase input/output contract list
+In this section, the input of each phase is described separately as `execution input` and `verification input`. When the two roles overlap, the same artifact may be listed in both.
 
-### 0. Spec（人手）
-- execution input: workflow 外部で与える要求事項、物理要件、依存選択方針
-- verification input: なし
-- 出力: `spec/<spec_kind>/<domain>/<family>/<spec_id>/controlled_spec.md`、`spec/<spec_kind>/<domain>/<family>/<spec_id>/tests.md`、`spec/<spec_kind>/<domain>/<family>/<spec_id>/deps.yaml`
+### 0. Spec (manual)
+- execution input: the requirements, physics requirements, and dependency-selection policy given outside the workflow
+- verification input: none
+- output: `spec/<spec_kind>/<domain>/<family>/<spec_id>/controlled_spec.md`, `spec/<spec_kind>/<domain>/<family>/<spec_id>/tests.md`, `spec/<spec_kind>/<domain>/<family>/<spec_id>/deps.yaml`
 
 ### 1. Compile
-- execution input: `controlled_spec.md`、`tests.md`、`deps.yaml`、`spec/registry/spec_catalog.yaml`
-- verification input: `controlled_spec.md`、`tests.md`、`deps.yaml`、`spec/registry/spec_catalog.yaml`、生成された `spec.ir.yaml`
-- 出力: `spec.ir.yaml`、`ir_meta.json`
+- execution input: `controlled_spec.md`, `tests.md`, `deps.yaml`, `spec/registry/spec_catalog.yaml`
+- verification input: `controlled_spec.md`, `tests.md`, `deps.yaml`, `spec/registry/spec_catalog.yaml`, the generated `spec.ir.yaml`
+- output: `spec.ir.yaml`, `ir_meta.json`
 
 ### 2. Generate
 - execution input: `spec.ir.yaml`
-- verification input: `spec.ir.yaml`、生成された `source/<source_id>/src/`
-- 出力: `source/<source_id>/src/`、`source_meta.json`
-- `Generate` 完了前に、`spec.ir.yaml` の `impl_defaults.toolchain.language` に整合する MCP `run_linter` を成功させ、`source_meta.json` の `lint_command_ref.run_linter` へ MCP 証跡（各要素に `command_id` と `command_log_ref` と `preset`）を記録しなければならない。
-- `Generate` は `Validate.execute` が `run_quality_checks` の `preset` だけで実行可能な preset-compatible quality path を正式出力へ含めなければならない。不足時は `Generate fail` とする。
-- `toolchain.build_system=make` かつ `toolchain.language=fortran` / `c` / `cpp` / `mixed` 系では、`source/<source_id>/src/Makefile` に `test` または `check` target を必須定義しなければならない。欠落時は `Generate fail` とする。
+- verification input: `spec.ir.yaml`, the generated `source/<source_id>/src/`
+- output: `source/<source_id>/src/`, `source_meta.json`
+- Before `Generate` completes, succeed at the MCP `run_linter` consistent with `impl_defaults.toolchain.language` of `spec.ir.yaml`, and must record the MCP evidence (each element with `command_id`, `command_log_ref`, and `preset`) in `lint_command_ref.run_linter` of `source_meta.json`.
+- `Generate` must include in its official output a preset-compatible quality path with which `Validate.execute` can run using only the `preset` of `run_quality_checks`. On shortage, it is `Generate fail`.
+- With `toolchain.build_system=make` and `toolchain.language=fortran` / `c` / `cpp` / `mixed` families, a `test` or `check` target must be defined in `source/<source_id>/src/Makefile`. On absence, it is `Generate fail`.
 
 ### 3. Build
-- execution input: `source/<source_id>/src/`、`spec.ir.yaml` の `impl_defaults`
-- verification input: `spec.ir.yaml`、`source_meta.json`
-- 出力: `binary/<binary_id>/bin/`、`binary_meta.json`、`compile_project` の `command_id` と `command_log_ref`
+- execution input: `source/<source_id>/src/`, the `impl_defaults` of `spec.ir.yaml`
+- verification input: `spec.ir.yaml`, `source_meta.json`
+- output: `binary/<binary_id>/bin/`, `binary_meta.json`, the `command_id` and `command_log_ref` of `compile_project`
 
 ### 4. Validate
-- execution input: `binary/<binary_id>/bin/`、`spec.ir.yaml`、`tests.md`
-- verification input: `spec.ir.yaml`、`source/<source_id>/`、同一 `run_id` 配下の `raw/` / `diagnostics.json` / `perf.json` / `quality_check.json`
-- 出力: `diagnostics.json`、`perf.json`、`quality_check.json`、`raw/`、`stdout.log`、`stderr.log`、`semantic_review.json`、`verdict.json`、`aggregate_verdict.json`、`summary.json`、`trial_meta.json`、`validate_meta.json`、`run_program` の `command_id` と `command_log_ref`
-- `Validate` は `execute` substep と `judge` substep を持つ。`execute` substep は MCP 経由で `run_program` を呼んで実行証跡を生成し、`judge` substep は LLM 意味検査と判定指標再計算で `verdict` を確定する。
+- execution input: `binary/<binary_id>/bin/`, `spec.ir.yaml`, `tests.md`
+- verification input: `spec.ir.yaml`, `source/<source_id>/`, the `raw/` / `diagnostics.json` / `perf.json` / `quality_check.json` under the same `run_id`
+- output: `diagnostics.json`, `perf.json`, `quality_check.json`, `raw/`, `stdout.log`, `stderr.log`, `semantic_review.json`, `verdict.json`, `aggregate_verdict.json`, `summary.json`, `trial_meta.json`, `validate_meta.json`, the `command_id` and `command_log_ref` of `run_program`
+- `Validate` has the `execute` substep and the `judge` substep. The `execute` substep calls `run_program` via MCP to generate execution evidence, and the `judge` substep finalizes the `verdict` by an LLM semantic check and judgment-metric recomputation.
 
-## phase 詳細（参照）
+## Phase details (reference)
 
-本節では、`Compile` / `Generate` / `Validate` を substep を持つ phase として記述し、`Build` を単一 step として記述する。
+In this section, `Compile` / `Generate` / `Validate` are described as phases that have substeps, and `Build` is described as a single step.
 
-phase ごとの契約詳細は [phases/](phases/) 配下のファイルを canonical source とする。
+The contract details per phase use the files under [phases/](phases/) as the canonical source.
 
-| phase | ファイル | substep |
+| phase | file | substep |
 |-------|----------|---------|
-| 0 Spec（人手） | [phases/phase_00_spec.md](phases/phase_00_spec.md) | - |
+| 0 Spec (manual) | [phases/phase_00_spec.md](phases/phase_00_spec.md) | - |
 | 1 Compile | [phases/phase_01_compile.md](phases/phase_01_compile.md) | generate / verify |
 | 2 Generate | [phases/phase_02_generate.md](phases/phase_02_generate.md) | generate / verify |
 | 3 Build | [phases/phase_03_build.md](phases/phase_03_build.md) | - |
 | 4 Validate | [phases/phase_04_validate.md](phases/phase_04_validate.md) | execute / judge |
 
-## エージェント参照範囲
+## Agent reference scope
 
-- 子 `step agent` / `substep agent` の `skill_must_read_refs` は `tools/orchestration_runtime.py` の `build_skill_must_read_refs` で組み立てられる。
-- 既定では `docs/workflow/WORKFLOW_CORE.md` と `docs/ORCHESTRATION.md` と対象 phase の `docs/workflow/phases/phase_*.md` と `skill_ref` と verify 必須 artifact を含む。`docs/WORKFLOW.md` は仕様への入口である。
+- The `skill_must_read_refs` of a child `step agent` / `substep agent` is assembled by `build_skill_must_read_refs` of `tools/orchestration_runtime.py`.
+- By default it includes `docs/workflow/WORKFLOW_CORE.md`, `docs/ORCHESTRATION.md`, the target phase's `docs/workflow/phases/phase_*.md`, the `skill_ref`, and the verify-required artifacts. `docs/WORKFLOW.md` is the entry point to the specification.
 
-## 完了判定基準
-- workflow 完了条件は、対象 workflow の `orchestration_id` 配下に `orchestration_meta.json` と `agent_graph.json` と `agent_runs.jsonl` が存在することとする。
-- workflow 完了条件は、`spec.ir.yaml` の `dependency.all_nodes` 集合に対して `workspace/ir/<node_key_safe>/<ir_id>/` と `workspace/pipelines/<node_key_safe>/<pipeline_id>/` が存在し、`lineage.json` の `node_key` と `dependency_ref` が一致することとする。
-- workflow 完了宣言は、`dependency workflow` 網羅チェックと `trial_meta` 完整性チェックと `copy_based_artifact_reuse` 非検出を同時に満たす場合のみ許可する。
-- workflow 完了宣言は、上位 `node` の `src/` に依存 `node` 実装の内包が存在しないことを同時に満たす場合のみ許可する。
-- workflow 完了宣言は、全 phase で `write_scope_violation` 非検出を同時に満たす場合のみ許可する。
-- `CI` は `python3 tools/validate_workspace_root.py` と `python3 tools/validate_pipeline_semantics.py`（`--stage full` または省略時）の execution result を `pass` 条件として扱う。
+## Completion criteria
+- The workflow completion condition is that `orchestration_meta.json`, `agent_graph.json`, and `agent_runs.jsonl` exist under the target workflow's `orchestration_id`.
+- The workflow completion condition is that, for the `dependency.all_nodes` set of `spec.ir.yaml`, `workspace/ir/<node_key_safe>/<ir_id>/` and `workspace/pipelines/<node_key_safe>/<pipeline_id>/` exist, and the `node_key` and `dependency_ref` of `lineage.json` match.
+- The workflow completion declaration is permitted only when the `dependency workflow` coverage check, the `trial_meta` integrity check, and the non-detection of `copy_based_artifact_reuse` are simultaneously satisfied.
+- The workflow completion declaration is permitted only when, simultaneously, there is no embedding of a dependency `node` implementation in the `src/` of an upper `node`.
+- The workflow completion declaration is permitted only when, simultaneously, no `write_scope_violation` is detected in all phases.
+- `CI` treats the execution result of `python3 tools/validate_workspace_root.py` and `python3 tools/validate_pipeline_semantics.py` (`--stage full` or omitted) as a `pass` condition.
 
-## 参照文書
+## Reference documents
 - `ORCHESTRATION.md`
 - `PERFORMANCE_DIAGNOSTICS.md`
 - `SPEC.md`

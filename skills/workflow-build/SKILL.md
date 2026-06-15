@@ -1,46 +1,46 @@
 ---
 name: workflow-build
-description: Build ステージを実行し、`source` artifact を `MCP` サーバー経由の `compile_project` でビルドして `binary_id` artifact を作成するときに使用する。`fortran` / `c` / `cpp` / `mixed` 系の標準ビルドツール制約を守る作業に適用する。
+description: Use this when running the Build stage and building a `source` artifact with `compile_project` via the `MCP` server to create a `binary_id` artifact. It applies to the work of observing the standard-build-tool constraint of `fortran` / `c` / `cpp` / `mixed` families.
 ---
 
 # Workflow Build
 
-## 目的
-Build ステージの実行責務を固定し、再現可能なビルド artifact を生成する。
+## Purpose
+Fix the execution responsibility of the Build stage, and generate a reproducible build artifact.
 
-## 適用範囲
-- `workspace/pipelines/<pipeline_id>/binary/<binary_id>/` を生成する作業
-- `source_meta.json` が `verification_status=pass` の artifact をビルドする作業
+## Scope
+- the work of generating `workspace/pipelines/<pipeline_id>/binary/<binary_id>/`
+- the work of building an artifact whose `source_meta.json` has `verification_status=pass`
 
-## 要件
-- 本 phase が起動できる validator gate は `skills/workflow-orchestration/references/launch_prompts.md` の「substep ↔ allowed validator gate 対応表」を canonical source とする。
-- `compile` は `MCP` サーバーの `compile_project` を使用する。
-- `fortran` / `c` / `cpp` / `mixed` 系は `make` / `cmake` / `meson` / `ninja` の標準ビルドツールのみを許可する。
-- `gcc` / `clang` / `gfortran` の単発ビルドを禁止する。
-- `spec.ir.yaml.impl_defaults.toolchain.build_system=make` の場合、入力 `src/Makefile` は言語依存のコンパイル順序依存をターゲット前提条件として明示し、`make -j` で成否が変化しないことを必須とする。
-- **out-of-source override (`build_system=make`):** in-source Make は `compile_project` の `extra_args` で `OBJDIR=<abs>/workspace/tmp/<agent_run_id>/build` と `BINDIR=<abs>/<pipeline>/binary/<binary_id>/bin` を渡す（`make -j<jobs> <target>` の後ろに append される make variable override）。これにより object/`.mod` は per-run tmp（auto-authorize + 成功時 auto-clean）へ、実行 binary は `binary/<binary_id>/bin/` へ出力され、`src/` には cross-phase audit log 以外を書かない。実行 binary `binary/<binary_id>/bin/<exe>` は launch の `allowed_output_paths` に **file 形式**で列挙する（auto-derive で `allowed_file_tool_paths` に入り terminal validation で authorize される。`allowed_file_tool_paths` は通常明示せず auto-derive に委ねる）。
-- 依存を持つ `node` は、依存 `operation` の解決先が `spec.ir.yaml.dependency` と一致することを `Build` 時に検証しなければならない。不一致時は `Build fail` とする。
-- `binary_meta.json` に `build_system` と `compiler` と `build_log_ref` と `status` と `source_source_id` を記録する。`source_source_id` は本ビルドが入力として使用した `<pipeline>/source/<source_source_id>/` の id を必須記録とする (`Validate.execute` が cross-phase MCP audit log の lineage 検証に使用する)。
-- `binary_meta.json#binary_artifact_ref` は実行 binary の canonical 配置 `<pipeline>/binary/<binary_id>/bin/<exe>` を指す（out-of-source `BINDIR` 出力。`src/` 配下を指してはならない。`Validate.execute` の `run_program` 入力検証が `binary/<binary_id>/bin/` 配下解決を要求する）。
-- 失敗時は `binary_meta.json` に `failure_category` / `failure_source_refs[]` / `failure_excerpt` を必須記録する（`docs/workflow/phases/phase_03_build.md` の「retry trigger（LLM 非介在）」節を canonical source とする）。`failure_category` は `compile_error` / `link_error` / `make_error` / `dependency_violation` / `validate_post_build_violation` のいずれか。
-- `compile_project` の MCP `command_log` 出力は以下 2 つの canonical placement のみ許可する:
-  - In-source build (Make for Fortran/C/cpp/mixed): `<pipeline>/source/<source_id>/src/mcp_command_log.jsonl` (cross-phase, project_dir=`<src>/src/`)。launch request に `source_id` を必ず含めて record_launch に通すこと (failed/stale source は record_launch が verification_status check で reject する)。
-  - Out-of-source build (CMake/Meson/Ninja): `<pipeline>/binary/<binary_id>/mcp_command_log.jsonl` (in-phase、project_dir=`<binary_id>/`)。
-  非 canonical placement に log が落ちる構成 (例: `<binary_id>/bin/mcp_command_log.jsonl`) は terminal validation で `unauthorized_write_violation` になる。
-- 出力 `bin/` は `Validate.execute` が参照可能な相対配置にする。
-- workflow artifact の保存先ルートは `workspace/` のみを許可し、workflow ルート判定は `workspace/` のみを対象とする。
+## Requirements
+- The validator gates this phase can launch use the "substep ↔ allowed validator gate correspondence table" of `skills/workflow-orchestration/references/launch_prompts.md` as the canonical source.
+- `compile` uses the `MCP` server's `compile_project`.
+- For `fortran` / `c` / `cpp` / `mixed` families, only the standard build tools `make` / `cmake` / `meson` / `ninja` are allowed.
+- A one-off build of `gcc` / `clang` / `gfortran` is forbidden.
+- With `spec.ir.yaml.impl_defaults.toolchain.build_system=make`, the input `src/Makefile` makes explicit the language-dependent compile-order dependencies as target prerequisites, and requires that its success/failure does not change with `make -j`.
+- **out-of-source override (`build_system=make`):** the in-source Make passes `OBJDIR=<abs>/workspace/tmp/<agent_run_id>/build` and `BINDIR=<abs>/<pipeline>/binary/<binary_id>/bin` via the `extra_args` of `compile_project` (make variable overrides appended after `make -j<jobs> <target>`). This outputs object/`.mod` to a per-run tmp (auto-authorize + auto-clean on success) and the execution binary to `binary/<binary_id>/bin/`, writing nothing other than the cross-phase audit log to `src/`. Enumerate the execution binary `binary/<binary_id>/bin/<exe>` in the launch's `allowed_output_paths` in **file form** (it enters `allowed_file_tool_paths` by auto-derive and is authorized in terminal validation. `allowed_file_tool_paths` is usually not made explicit and is left to auto-derive).
+- A `node` that has dependencies must verify at `Build` time that the resolution target of the dependency `operation` matches `spec.ir.yaml.dependency`. On mismatch, it is a `Build fail`.
+- Record `build_system`, `compiler`, `build_log_ref`, `status`, and `source_source_id` in `binary_meta.json`. `source_source_id` requires recording the id of `<pipeline>/source/<source_source_id>/` that this build used as input (`Validate.execute` uses it for the lineage verification of the cross-phase MCP audit log).
+- `binary_meta.json#binary_artifact_ref` points to the canonical placement of the execution binary `<pipeline>/binary/<binary_id>/bin/<exe>` (the out-of-source `BINDIR` output. It must not point under `src/`. The `run_program` input verification of `Validate.execute` requires resolution under `binary/<binary_id>/bin/`).
+- On failure, record `failure_category` / `failure_source_refs[]` / `failure_excerpt` in `binary_meta.json` as required (the "retry trigger (no LLM involvement)" section of `docs/workflow/phases/phase_03_build.md` is the canonical source). `failure_category` is one of `compile_error` / `link_error` / `make_error` / `dependency_violation` / `validate_post_build_violation`.
+- The MCP `command_log` output of `compile_project` allows only the following 2 canonical placements:
+  - In-source build (Make for Fortran/C/cpp/mixed): `<pipeline>/source/<source_id>/src/mcp_command_log.jsonl` (cross-phase, project_dir=`<src>/src/`). Always include `source_id` in the launch request and pass it through record_launch (a failed/stale source is rejected by record_launch's verification_status check).
+  - Out-of-source build (CMake/Meson/Ninja): `<pipeline>/binary/<binary_id>/mcp_command_log.jsonl` (in-phase, project_dir=`<binary_id>/`).
+  A composition where the log lands in a non-canonical placement (e.g. `<binary_id>/bin/mcp_command_log.jsonl`) becomes an `unauthorized_write_violation` in terminal validation.
+- The output `bin/` has a relative placement that `Validate.execute` can reference.
+- The storage root for workflow artifacts allows only `workspace/`, and the workflow-root judgment targets only `workspace/`.
 
-## 運用ルール
-1. `binary_id` を発行し、出力先を `workspace/pipelines/<pipeline_id>/binary/<binary_id>/` に固定する。
-2. `source_meta.json` の `verification_status=pass` を開始条件にする。
-3. ビルド失敗時は `binary_meta.json` に `failure_category` 等の retry trigger 情報を記録し、`Generate` へ戻す（deterministic な mapping は `docs/workflow/phases/phase_03_build.md` を canonical source）。
-4. 同一 `source_id` の再ビルドは別 `binary_id` で append-only 運用にする。
-5. 出力先が `workspace/` でない場合は `Build fail` とする。
-6. workflow 実行開始前に `workspace/` が存在しない場合、リポジトリルート直下へ `workspace/` を作成する。
-7. 開始前と完了前に `python3 tools/validate_workspace_root.py` を実行し、`fail` 時は `Build fail` とする。
-8. 完了前に `python3 tools/validate_pipeline_semantics.py --stage post_build --pipeline-root workspace/pipelines/<node_key_safe>/<pipeline_id>/` を実行し、必要に応じて `--source-id <source_id>` を付与する。`exit code 0` を必須とし、`fail` 時は `Build fail` とする。
+## Operations Rules
+1. Issue a `binary_id`, and fix the output destination to `workspace/pipelines/<pipeline_id>/binary/<binary_id>/`.
+2. Make `source_meta.json`'s `verification_status=pass` the start condition.
+3. On a build failure, record the retry-trigger information such as `failure_category` in `binary_meta.json`, and go back to `Generate` (the deterministic mapping uses `docs/workflow/phases/phase_03_build.md` as the canonical source).
+4. A rebuild of the same `source_id` is operated append-only with a different `binary_id`.
+5. When the output destination is not `workspace/`, it is a `Build fail`.
+6. When `workspace/` does not exist before workflow execution starts, create `workspace/` directly under the repository root.
+7. Before start and before completion, run `python3 tools/validate_workspace_root.py`, and on `fail` it is a `Build fail`.
+8. Before completion, run `python3 tools/validate_pipeline_semantics.py --stage post_build --pipeline-root workspace/pipelines/<node_key_safe>/<pipeline_id>/`, and add `--source-id <source_id>` as needed. `exit code 0` is required, and on `fail` it is a `Build fail`.
 
-## 判定基準
-- ビルド手段が `MCP compile_project` のみである。
-- `binary_meta.json` の必須項目が欠落しない（失敗時は `failure_category` 等も欠落不可）。
-- `workspace` 配置規約が `docs/workflow/WORKFLOW_CORE.md` と `docs/workflow/phases/phase_03_build.md` と一致する。
+## Decision Criteria
+- The build means is only `MCP compile_project`.
+- The required items of `binary_meta.json` are not missing (on failure, `failure_category` etc. also cannot be missing).
+- The `workspace` placement convention matches `docs/workflow/WORKFLOW_CORE.md` and `docs/workflow/phases/phase_03_build.md`.

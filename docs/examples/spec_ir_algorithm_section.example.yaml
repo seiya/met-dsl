@@ -1,28 +1,31 @@
-# spec.ir.yaml の algorithm セクション — 正しい形式のサンプル
+# algorithm section of spec.ir.yaml — sample of the correct format
 #
-# このファイルは Compile phase が出力する spec.ir.yaml の `algorithm:` セクション部分を
-# 最小 2-step で示す参考形式である。`workflow-compile-generate` / `workflow-compile-verify`
-# スキル（および validate_pipeline_semantics --stage compile ゲート）が要求する構造を示す。
+# This file is a reference format showing, in a minimal 2-step form, the `algorithm:`
+# section part of the spec.ir.yaml that the Compile phase outputs. It shows the
+# structure required by the `workflow-compile-generate` / `workflow-compile-verify`
+# skills (and the validate_pipeline_semantics --stage compile gate).
 #
-# 本ファイルは algorithm セクションのみを抜粋した形で記載しており、
-# 実際の spec.ir.yaml ではこのブロックを `algorithm:` キーの値として配置し、
-# `case` / `impl_defaults` / `io_contract` / `dependency` の各セクションと併置する。
+# This file is written as an excerpt of only the algorithm section; in an actual
+# spec.ir.yaml, place this block as the value of the `algorithm:` key, alongside
+# the `case` / `impl_defaults` / `io_contract` / `dependency` sections.
 #
-# 重要: steps[].inputs と steps[].outputs は「非空文字列の list」でなければならない。
+# Important: steps[].inputs and steps[].outputs must be a "list of non-empty strings".
 #   OK: ["U_L", "U_R", "g"]
-#   NG: [{name: U_L, source: U_L[0]}, ...]   ← object list は禁止
+#   NG: [{name: U_L, source: U_L[0]}, ...]   ← object lists are forbidden
 #
-# バインディング規約: steps[*].inputs/outputs に現れる各 token は
-#   - controlled_spec.md の直接入出力変数（例: U_L, U_R, g）、または
-#   - temporaries に列挙された中間変数（例: guard_pass）、または
-#   - derived_field_rules に定義された派生量
-# のいずれかに追跡可能でなければならない。
-# コンポーネント分解由来の名前（例: h_L ← U_L[0]）は temporaries に宣言してはじめて有効になる。
-# このサンプルでは分解を行わず controlled_spec.md の入力変数名（U_L 等）をそのまま使う。
+# Binding convention: each token appearing in steps[*].inputs/outputs must be
+# traceable to one of:
+#   - a direct input/output variable of controlled_spec.md (e.g. U_L, U_R, g), or
+#   - an intermediate variable listed in temporaries (e.g. guard_pass), or
+#   - a derived quantity defined in derived_field_rules.
+# A name derived from component decomposition (e.g. h_L ← U_L[0]) becomes valid only
+# once it is declared in temporaries.
+# This sample does not perform decomposition and uses the input variable names of
+# controlled_spec.md (U_L etc.) as-is.
 #
-# algorithm_id に "2d"/"3d" を含めない: problem 型 node の 2D/3D 必須契約
-#   （state_variables / required_update_paths / diagnostics_from_state=true）は
-#   このサンプルでは示さない。2D problem の契約例は別途 docs/examples/ に追加予定。
+# Do not include "2d"/"3d" in algorithm_id: the 2D/3D required contract of a problem-type node
+#   (state_variables / required_update_paths / diagnostics_from_state=true) is
+#   not shown in this sample. A contract example for a 2D problem will be added separately under docs/examples/.
 
 algorithm_id: example_flux_compute
 execution_mode: sequence
@@ -31,14 +34,14 @@ steps:
   - step_id: step_01_boundary_guard
     step_kind: boundary_apply
     operation_ref: input_guard
-    # U_L / U_R / U_B / U_T は controlled_spec.md の直接入力変数
+    # U_L / U_R / U_B / U_T are direct input variables of controlled_spec.md
     inputs: ["U_L", "U_R", "U_B", "U_T"]
     outputs: ["guard_pass"]
 
   - step_id: step_02_flux_compute
     step_kind: flux_compute
     operation_ref: rusanov_flux_2d
-    # U_L / U_R は controlled_spec.md の直接入力; g は重力加速度パラメータ（同上）
+    # U_L / U_R are direct inputs of controlled_spec.md; g is the gravitational-acceleration parameter (same source)
     inputs: ["U_L", "U_R", "g"]
     outputs: ["F_h", "F_u", "F_v"]
 
@@ -50,34 +53,34 @@ control_condition: ""
 
 iteration_contract: {}
 
-# target_variables: このコンポーネントが書き出す最終変数（flux F_h/F_u/F_v）
+# target_variables: the final variables that this component writes out (flux F_h/F_u/F_v)
 update_semantics:
   target_variables: ["F_h", "F_u", "F_v"]
   update_order: sequential
 
-# temporaries: step 間でのみ生存する中間変数（spec 外・target 外）
+# temporaries: intermediate variables that live only between steps (outside spec, outside target)
 #
-# shape_expr の表現規則は spec/schema/plan/shape_expr.schema.json を canonical source とする。
-# 許容形式は次の 3 つに限る:
-#   - "scalar" (case-insensitive)              … 0 次元
-#   - "[d1, d2, ...]"  (bracket list form)     … 例: "[3]", "[nx, ny]"
-#   - "(d1, d2, ...)"  (paren tuple form)      … 例: "(d1, d2)", "(nx, ny, nz)"
-# 関数呼び出し記法 (vector(N) / matrix(M,N) / tensor 等) は validator が reject し Compile fail となる。
+# spec/schema/plan/shape_expr.schema.json is the canonical source for the shape_expr notation rules.
+# Only the following 3 allowed forms exist:
+#   - "scalar" (case-insensitive)              … 0-dimensional
+#   - "[d1, d2, ...]"  (bracket list form)     … e.g. "[3]", "[nx, ny]"
+#   - "(d1, d2, ...)"  (paren tuple form)      … e.g. "(d1, d2)", "(nx, ny, nz)"
+# Function-call notation (vector(N) / matrix(M,N) / tensor etc.) is rejected by the validator and causes a Compile fail.
 temporaries:
   - name: guard_pass
     shape_expr: "scalar"
-  # 以下はマルチ次元 shape_expr の許容形式の参考例（このサンプルでは未使用）。
+  # The following are reference examples of allowed multi-dimensional shape_expr forms (unused in this sample).
   # - name: flux_vec_example
   #   shape_expr: "[3]"            # OK: bracket list form
   # - name: state_grid_example
-  #   shape_expr: "[nx, ny]"       # OK: 2 次元 grid
+  #   shape_expr: "[nx, ny]"       # OK: 2-dimensional grid
   # - name: tensor_example
   #   shape_expr: "(d1, d2, d3)"   # OK: paren tuple form
   #
-  # 禁止例 (validate_pipeline_semantics でブロックされる):
-  #   shape_expr: "vector(3)"      # NG: 関数呼び出し記法 → "[3]" を使う
-  #   shape_expr: "matrix(3,3)"    # NG: 同上 → "[3, 3]" を使う
-  #   shape_expr: "tensor"         # NG: 列挙外 token
+  # Forbidden examples (blocked by validate_pipeline_semantics):
+  #   shape_expr: "vector(3)"      # NG: function-call notation → use "[3]"
+  #   shape_expr: "matrix(3,3)"    # NG: same → use "[3, 3]"
+  #   shape_expr: "tensor"         # NG: token outside the enumeration
 
 derived_field_rules: []
 
@@ -87,8 +90,8 @@ invariants:
 splitting_policy:
   kind: none
 
-# state_variables / required_update_paths / diagnostics_from_state=true は
-# problem 型 node で spec_id に "2d"/"3d" を含む場合の必須フィールド。
-# component 型の flux compute コンポーネントはこれらを省略する。
+# state_variables / required_update_paths / diagnostics_from_state=true are
+# required fields for a problem-type node when spec_id contains "2d"/"3d".
+# A component-type flux-compute component omits these.
 diagnostics_from_state: false
 fallback_policy: fail_closed

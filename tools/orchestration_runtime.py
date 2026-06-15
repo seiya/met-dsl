@@ -90,9 +90,10 @@ except ModuleNotFoundError:  # pragma: no cover - import bootstrap for direct CL
     )
 
 TERMINAL_STATUSES = {"pass", "fail", "blocked", "timeout", "cancel"}
-# `set-status` の冪等化対象。一度この集合に入った status は、許可された昇格 (fail -> fail_closed) を除き
-# 同一値・他 terminal への遷移ともに reject する。failure narrative の追記は failure_analysis.json で行う。
-# 同一値再呼び出しは cleanup_committed marker が無い場合に限り cleanup retry を許可する (F2)。
+# Idempotency target of `set-status`. A status once in this set rejects both a same-value and an
+# other-terminal transition, except for the permitted promotion (fail -> fail_closed). Appending the
+# failure narrative is done in failure_analysis.json.
+# A same-value re-call permits a cleanup retry only when the cleanup_committed marker is absent (F2).
 IDEMPOTENT_TERMINAL_STATUSES = TERMINAL_STATUSES | {"fail_closed"}
 
 
@@ -788,7 +789,7 @@ def _verify_dep_stage(
         if not isinstance(doc, dict):
             return False
         verdict = str(doc.get("aggregate_verdict", "")).strip().lower()
-        # docs/GLOSSARY.md: "最新 aggregate_verdict が `pass` または `xfail` である状態"
+        # docs/GLOSSARY.md: "a state in which the latest aggregate_verdict is `pass` or `xfail`"
         return verdict in {"pass", "xfail"}
     raise ValueError(f"unknown readiness stage: {stage!r}")
 
@@ -1366,7 +1367,7 @@ def _compute_initial_dependency_readiness(
     if not entries:
         return trivial
     return fail_closed
-# Judge の pre_phase_complete 検証で semantic_review を要求しない終了理由（未完了扱い）。
+# Termination reasons for which Judge's pre_phase_complete verification does not require semantic_review (treated as incomplete).
 JUDGE_SEMANTIC_REVIEW_SKIPPED_STATUSES = frozenset({"timeout", "cancel"})
 SUPPORTED_BACKENDS = {"codex", "cursor", "claude"}
 PREFLIGHT_TTL_DEFAULT_SECONDS: int = 1800
@@ -1556,7 +1557,7 @@ def _orchestration_root(repo_root: Path, orchestration_id: str) -> Path:
 
 
 def _active_child_agent_run_id_path(repo_root: Path, orchestration_id: str) -> Path:
-    """Claude backend 専用の active child `agent_run_id` 管理ファイル。"""
+    """The active child `agent_run_id` management file specific to the Claude backend."""
     return _orchestration_root(repo_root, orchestration_id) / "active_child_agent_run_id.txt"
 
 
@@ -2072,7 +2073,7 @@ def _merge_node_states(
     existing: Any,
     orchestration_id: str,
 ) -> dict[str, dict[str, str]]:
-    """checkpoint と矛盾しないよう既存 node_states を保持しつつ欠損キーを補う。"""
+    """Keep the existing node_states so as not to contradict the checkpoint, while filling missing keys."""
     merged: dict[str, dict[str, str]] = {}
     if isinstance(existing, dict):
         for node_key, steps in existing.items():
@@ -2097,7 +2098,7 @@ def init_phase_state_json(
     *,
     reason: str = "init",
 ) -> dict[str, Any]:
-    """`phase_state.json` を新規 orchestration 用に書き出す。"""
+    """Write out `phase_state.json` for a new orchestration."""
     _ensure_orchestration_audit_dirs(repo_root, orchestration_id)
     doc = _new_phase_state_document(orchestration_id)
     _write_phase_state(repo_root, orchestration_id, doc)
@@ -2118,7 +2119,7 @@ def _initial_current_state_when_phase_state_missing(
     repo_root: Path,
     orchestration_id: str,
 ) -> str:
-    """レガシー orchestration で `phase_state.json` が無い場合の `current_state` 推定値。"""
+    """The estimated `current_state` when `phase_state.json` is absent in a legacy orchestration."""
     path = _preflight_path(repo_root, orchestration_id)
     if not path.exists():
         return "initialized"
@@ -2135,11 +2136,11 @@ def merge_phase_state_for_resume(
     repo_root: Path,
     orchestration_id: str,
 ) -> dict[str, Any]:
-    """`--resume-from-checkpoint` 時: 既存 `phase_state` を破棄せず `node_states` を保持する。
+    """On `--resume-from-checkpoint`: keep `node_states` without discarding the existing `phase_state`.
 
-    `orchestration_checkpoint.json` の完了情報とは別ファイルのため直接マージは行わない。
-    欠損の `phase_state.json` のみ初期化し、既存がある場合は `current_state` と
-    `node_states` を上書きしない。監査用に `phase_state_log.jsonl` へ `resume_enabled` を追記する。
+    Because it is a separate file from the completion information of `orchestration_checkpoint.json`, no direct merge is done.
+    Initialize only a missing `phase_state.json`; when one exists, do not overwrite `current_state` and
+    `node_states`. For audit, append `resume_enabled` to `phase_state_log.jsonl`.
     """
     _ensure_orchestration_audit_dirs(repo_root, orchestration_id)
     existing = _load_phase_state(repo_root, orchestration_id)
@@ -2285,7 +2286,7 @@ def _write_roots_for_launch(
     # NOTE: `tune` / `promote` are out-of-scope for the core 5-phase workflow
     # (Spec -> Compile -> Generate -> Build -> Validate). They are retained
     # here as optional flows invoked via a separate entrypoint (see CLAUDE.md
-    # "任意フロー Tune / Promote"). The core workflow does not produce these
+    # "optional flows Tune / Promote"). The core workflow does not produce these
     # step tokens, so the branches below are reachable only from the optional
     # entrypoints; their tests assert the contract those entrypoints rely on.
     if st == "tune":
@@ -2331,7 +2332,7 @@ def build_capability_document(
     orchestration_id: str,
     request_payload: dict[str, Any],
 ) -> dict[str, Any]:
-    """`capabilities/<agent_run_id>.json` のペイロードを組み立てる。"""
+    """Assemble the payload of `capabilities/<agent_run_id>.json`."""
     role_raw = request_payload.get("agent_role")
     role = role_raw.strip().lower() if isinstance(role_raw, str) and role_raw.strip() else ""
     if role not in {"orchestration", "step", "substep"}:
@@ -2424,7 +2425,7 @@ def _transition_node_step_phase_state(
     event: str,
     agent_run_id: str | None = None,
 ) -> dict[str, Any]:
-    """`phase_state.json` の `node_states[node_key_safe][step]` を更新する。"""
+    """Update `node_states[node_key_safe][step]` of `phase_state.json`."""
     node_safe = _node_key_to_safe(node_key.strip())
     step_key = step.strip().lower()
     if step_key not in STEP_KEYS_FOR_NODE_STATE:
@@ -2477,7 +2478,7 @@ def _phase_state_allows_write_step_result(
     node_key: str,
     step: str,
 ) -> None:
-    """`write_step_result` は `child_finished` 到達済み step のみ許可する。"""
+    """`write_step_result` permits only a step that has reached `child_finished`."""
     doc = _load_phase_state(repo_root, orchestration_id)
     if doc is None:
         raise RuntimeError("write_step_result phase gate: phase_state.json missing")
@@ -2926,7 +2927,7 @@ def _resolve_judge_execution_dir(
     node_key: str,
     launch_request: dict[str, Any],
 ) -> tuple[Path | None, str | None]:
-    """`Validate.judge` 入力となる `runs/<run_id>/<node_key_safe>/` を返す。失敗時は (None, reason)。"""
+    """Return the `runs/<run_id>/<node_key_safe>/` that is the `Validate.judge` input. On failure, (None, reason)."""
     rel = _normalize_rel_posix(pipeline_ref)
     pr_abs = repo_root / rel
     if not pr_abs.is_dir():
@@ -2960,7 +2961,7 @@ def _downstream_phase_launch_gate(
     pipeline_ref: str,
     launch_request: dict[str, Any],
 ) -> tuple[bool, str | None]:
-    """`pipeline_ref` がディスク上に存在する場合のみ下流 phase 開始条件を検査する。"""
+    """Check the downstream phase start condition only when `pipeline_ref` exists on disk."""
     rel = _normalize_rel_posix(pipeline_ref)
     pr_abs = repo_root / rel
     if not pr_abs.is_dir():
@@ -3029,7 +3030,7 @@ def pre_phase_launch(
     require_child_agent: str,
     launch_request: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """`workflow_launch_check` と下流 artifact 開始条件（`pipeline_ref` がディスク上に存在する場合）をまとめる hook。"""
+    """A hook bundling `workflow_launch_check` and the downstream artifact start condition (when `pipeline_ref` exists on disk)."""
     base = workflow_launch_check(
         repo_root,
         orchestration_id=orchestration_id,
@@ -3089,7 +3090,7 @@ def pre_orchestration_start(
     *,
     event: str,
 ) -> dict[str, Any]:
-    """`init` / `preflight` 入口で冪等に適用する workflow 開始前 hook。"""
+    """A pre-workflow-start hook applied idempotently at the `init` / `preflight` entry."""
     ws = repo_root / "workspace"
     created_ws: str | None = None
     if not ws.exists():
@@ -3185,9 +3186,9 @@ def gate_apply_patch_writes(
     agent_run_id: str,
     capability_token: str | None = None,
 ) -> dict[str, Any]:
-    """`apply_patch` 相当の書き込み先が actor の権限と整合するか検査する。
+    """Check whether the `apply_patch`-equivalent write destination is consistent with the actor's authority.
 
-    違反時は `phase_authority_violation` を書き、RuntimeError を送出する。
+    On violation, write `phase_authority_violation` and raise a RuntimeError.
     """
     role = actor_role.strip().lower()
     if not agent_run_id.strip():
@@ -3282,7 +3283,7 @@ def validate_mcp_build_tool_invocation(
     tool_name: str,
     mcp_args: dict[str, Any] | None = None,
 ) -> None:
-    """`compile_project` / `run_linter` / `run_program` / `run_quality_checks` 呼び出し前の位相ゲート。"""
+    """The phase gate before a `compile_project` / `run_linter` / `run_program` / `run_quality_checks` call."""
     _require_preflight_launchable(repo_root, orchestration_id, enforce_live_probe=False)
 
     root = _orchestration_root(repo_root, orchestration_id)
@@ -4944,7 +4945,7 @@ def build_access_policy_payload(
     agent_run_id: str,
     request_payload: dict[str, Any],
 ) -> dict[str, Any]:
-    """`access_policies/<agent_run_id>.json` の内容を組み立てる。"""
+    """Assemble the content of `access_policies/<agent_run_id>.json`."""
     node_key = request_payload.get("node_key")
     step = request_payload.get("step")
     if not isinstance(node_key, str) or not node_key.strip():
@@ -5286,9 +5287,9 @@ def log_orchestration_read(
     agent_run_id: str,
     read_path: str,
 ) -> dict[str, Any]:
-    """read 監査: `denied_read_roots`（`tools/`）一致時は `rule_source_violation` を記録し orchestration を fail にする。
+    """Read audit: on a `denied_read_roots` (`tools/`) match, record `rule_source_violation` and fail the orchestration.
 
-    許可された read のみ本文を返す。
+    Return the body only for a permitted read.
     """
     manifest = _load_read_access_manifest(
         repo_root,
@@ -5388,9 +5389,9 @@ def _checkpoint_path(repo_root: Path, orchestration_id: str) -> Path:
 
 
 def _compute_sha256(path: Path) -> str:
-    """ファイルの SHA-256 ハッシュを "sha256:<hex>" 形式で返す。
+    """Return the file's SHA-256 hash in the form "sha256:<hex>".
 
-    ファイルが存在しない場合は "sha256:missing" を返す（エラーにしない）。
+    When the file does not exist, return "sha256:missing" (not an error).
     """
     if not path.exists():
         return "sha256:missing"
@@ -5405,7 +5406,7 @@ def _build_artifact_hashes(
     repo_root: Path,
     output_refs: list[str],
 ) -> dict[str, str]:
-    """output_refs の各パスを repo_root 起点で解決し SHA-256 を計算する。"""
+    """Resolve each output_refs path relative to repo_root and compute the SHA-256."""
     hashes: dict[str, str] = {}
     for ref in output_refs:
         if not isinstance(ref, str) or not ref.strip():
@@ -6348,20 +6349,20 @@ def dismiss_violation(
     paths: list[str],
     operator_token: str,
 ) -> dict[str, Any]:
-    """dismiss-violation: 既知の良性 unauthorized_write_violation を operator が承認済みとしてマークする。
+    """dismiss-violation: mark a known benign unauthorized_write_violation as operator-approved.
 
-    violations/<arid>.unauthorized_write_violation.json に ``dismissed_at`` /
-    ``dismiss_reason`` / ``dismissed_paths`` を追記する。次回の
-    ``_validate_actual_write_paths`` 呼び出し時、検出 unauthorized paths が
-    dismissed_paths の部分集合であれば raise をスキップする。
+    Append ``dismissed_at`` / ``dismiss_reason`` / ``dismissed_paths`` to
+    violations/<arid>.unauthorized_write_violation.json. On the next
+    ``_validate_actual_write_paths`` call, if the detected unauthorized paths are
+    a subset of dismissed_paths, skip the raise.
 
     Args:
-        repo_root: リポジトリルート
+        repo_root: the repository root
         orchestration_id: orchestration ID
-        agent_run_id: dismiss 対象の agent run ID
-        dismiss_reason: dismiss 理由（free-form、audit ログに残る）
-        paths: dismiss 対象のファイルパス（repo root 相対）
-        operator_token: ~/.met-dsl/operator_tokens/<oid>.txt の内容
+        agent_run_id: the agent run ID to dismiss
+        dismiss_reason: the dismiss reason (free-form, remains in the audit log)
+        paths: the file paths to dismiss (relative to repo root)
+        operator_token: the content of ~/.met-dsl/operator_tokens/<oid>.txt
     """
     # Operator-only gate via token validation.
     # The token is written to ~/.met-dsl/operator_tokens/<oid>.txt at orchestration
@@ -6454,11 +6455,11 @@ def _is_violation_dismissed(
     agent_run_id: str,
     unauthorized_paths: list[str],
 ) -> bool:
-    """_validate_actual_write_paths の pass-gate: 既に dismiss 承認済みなら True。
+    """Pass-gate of _validate_actual_write_paths: True if already dismiss-approved.
 
-    violation ファイルが存在し ``dismissed_at`` フィールドを持ち、
-    今回検出した ``unauthorized_paths`` が ``dismissed_paths`` の部分集合であれば
-    True を返す（raise をスキップさせる）。
+    If the violation file exists and has a ``dismissed_at`` field,
+    and the ``unauthorized_paths`` detected this time are a subset of ``dismissed_paths``,
+    return True (to skip the raise).
     """
     viol_path = _violations_dir(repo_root, orchestration_id) / f"{agent_run_id}.unauthorized_write_violation.json"
     if not viol_path.exists():
@@ -6708,17 +6709,17 @@ def _validate_actual_write_paths(
             manifest_allowed_output_dirs=manifest_allowed_output_dirs,
         )
     if unauthorized:
-        # Pass-gate: operator が dismiss-violation で既に承認済みの violation は
-        # raise をスキップし、record-agent-run を通過させる。
-        # dismiss 対象が検出 unauthorized の厳密な部分集合であることを確認する。
+        # Pass-gate: a violation already approved by the operator via dismiss-violation
+        # skips the raise and passes record-agent-run.
+        # Confirm that the dismissed target is a strict subset of the detected unauthorized.
         if _is_violation_dismissed(
             repo_root,
             orchestration_id,
             agent_run_id=run_id,
             unauthorized_paths=unauthorized,
         ):
-            # 証跡: violation ファイルの dismissed_at は既に dismiss_violation() が書いており、
-            # 今回の pass を示す追記は不要（ファイルはそのまま残る）。
+            # Evidence: the violation file's dismissed_at is already written by dismiss_violation(),
+            # so an append indicating this pass is unnecessary (the file remains as-is).
             pass
         else:
             violation_path = _write_unauthorized_write_violation(
@@ -6774,9 +6775,9 @@ def _load_checkpoint(
     repo_root: Path,
     orchestration_id: str,
 ) -> dict[str, Any] | None:
-    """orchestration_checkpoint.json を読み込む。存在しない場合は None を返す。
+    """Load orchestration_checkpoint.json. Return None if it does not exist.
 
-    JSON 構造が不正な場合は RuntimeError を送出する。
+    Raise a RuntimeError if the JSON structure is invalid.
     """
     path = _checkpoint_path(repo_root, orchestration_id)
     if not path.exists():
@@ -6949,12 +6950,12 @@ def _validate_preflight_payload(payload: dict[str, Any]) -> None:
 
 
 def _live_preflight_mode() -> str:
-    """METDSL_ORCHESTRATION_ENFORCE_LIVE_PREFLIGHT の値から動作モードを返す。
+    """Return the operation mode from the value of METDSL_ORCHESTRATION_ENFORCE_LIVE_PREFLIGHT.
 
-    戻り値: 'never' | 'always' | 'ttl'
-    - 'never' : プローブをスキップ
-    - 'always': 毎回プローブ（TTL 無視、後方互換）
-    - 'ttl'   : TTL キャッシュ付きプローブ（デフォルト）
+    Return value: 'never' | 'always' | 'ttl'
+    - 'never' : skip the probe
+    - 'always': probe every time (ignore TTL, backward compatible)
+    - 'ttl'   : probe with TTL cache (default)
     """
     raw = os.environ.get("METDSL_ORCHESTRATION_ENFORCE_LIVE_PREFLIGHT", "").strip().lower()
     if raw in {"0", "false", "no"}:
@@ -6965,9 +6966,9 @@ def _live_preflight_mode() -> str:
 
 
 def _live_preflight_ttl_seconds() -> int:
-    """METDSL_PREFLIGHT_TTL_SECONDS を読み非負整数を返す。
+    """Read METDSL_PREFLIGHT_TTL_SECONDS and return a non-negative integer.
 
-    未設定または無効値の場合は PREFLIGHT_TTL_DEFAULT_SECONDS を返す。
+    Return PREFLIGHT_TTL_DEFAULT_SECONDS when unset or an invalid value.
     """
     raw = os.environ.get("METDSL_PREFLIGHT_TTL_SECONDS", "").strip()
     if not raw:
@@ -6980,10 +6981,10 @@ def _live_preflight_ttl_seconds() -> int:
 
 
 def _is_within_preflight_ttl(probed_at_iso: str, ttl_seconds: int) -> bool:
-    """probed_at_iso からの経過秒が ttl_seconds 未満なら True。
+    """True if the elapsed seconds from probed_at_iso is less than ttl_seconds.
 
-    ttl_seconds == 0 の場合は常に False（キャッシュなし）。
-    パース失敗時は False（安全側に倒してプローブを実行する）。
+    Always False when ttl_seconds == 0 (no cache).
+    False on a parse failure (err on the safe side and run the probe).
     """
     if ttl_seconds <= 0:
         return False
@@ -6996,9 +6997,9 @@ def _is_within_preflight_ttl(probed_at_iso: str, ttl_seconds: int) -> bool:
 
 
 def _live_preflight_enforced() -> bool:
-    """後方互換ラッパー。
+    """Backward-compatibility wrapper.
 
-    新規コードは _live_preflight_mode() を使用すること。
+    New code should use _live_preflight_mode().
     """
     return _live_preflight_mode() != "never"
 
@@ -7008,10 +7009,10 @@ def _update_preflight_probed_at(
     orchestration_id: str,
     probed_at_iso: str,
 ) -> None:
-    """preflight.json の probed_at フィールドのみを更新する。
+    """Update only the probed_at field of preflight.json.
 
-    他のフィールド（status / can_launch_* 等）は変更しない。
-    preflight.json が存在しない場合は何もしない（エラーにしない）。
+    Do not change other fields (status / can_launch_* etc.).
+    Do nothing when preflight.json does not exist (not an error).
     """
     path = _preflight_path(repo_root, orchestration_id)
     if not path.exists():
@@ -7031,9 +7032,9 @@ def _run_live_probe_and_update(
     orchestration_id: str,
     cached_payload: dict[str, Any],
 ) -> None:
-    """live probe を実行し、成功時に preflight.json の probed_at を更新する。
+    """Run a live probe and, on success, update the probed_at of preflight.json.
 
-    失敗時は RuntimeError を送出する（呼び出し元で orchestration を fail に遷移させる）。
+    Raise a RuntimeError on failure (the caller transitions the orchestration to fail).
     """
     backend = cached_payload.get("backend")
     if not isinstance(backend, str) or backend.strip() not in SUPPORTED_BACKENDS:
@@ -7095,7 +7096,7 @@ def get_preflight_ttl_status(
     repo_root: Path,
     orchestration_id: str,
 ) -> dict[str, Any]:
-    """preflight-status コマンド向け: TTL 状態の詳細を返す。"""
+    """For the preflight-status command: return the details of the TTL state."""
     mode = _live_preflight_mode()
     ttl_seconds = _live_preflight_ttl_seconds()
     path = _preflight_path(repo_root, orchestration_id)
@@ -7215,16 +7216,16 @@ def _launch_prompt_template_path() -> Path:
 
 @lru_cache(maxsize=1)
 def _load_launch_prompt_templates() -> dict[str, str]:
-    """launch_prompts.md からテンプレートと共有 boilerplate を読み込む。
+    """Load the templates and the shared boilerplate from launch_prompts.md.
 
     Returns:
         dict with keys "step agent", "substep agent", and "common boilerplate".
-        "step agent" / "substep agent" の値は `{{COMMON_BOILERPLATE}}` プレースホルダを含む。
-        "common boilerplate" の値は `{{ACTOR_ROLE}}` プレースホルダを含む。
+        The "step agent" / "substep agent" values contain the `{{COMMON_BOILERPLATE}}` placeholder.
+        The "common boilerplate" value contains the `{{ACTOR_ROLE}}` placeholder.
     """
     text = _launch_prompt_template_path().read_text(encoding="utf-8")
     pattern = re.compile(
-        r"## `(?P<name>step agent|substep agent)` 起動要求テンプレート\s+```text\n(?P<body>.*?)\n```",
+        r"## `(?P<name>step agent|substep agent)` launch request template\s+```text\n(?P<body>.*?)\n```",
         re.DOTALL,
     )
     templates: dict[str, str] = {}
@@ -7232,15 +7233,15 @@ def _load_launch_prompt_templates() -> dict[str, str]:
         templates[match.group("name")] = match.group("body")
     if set(templates) != {"step agent", "substep agent"}:
         raise RuntimeError("launch prompt templates must define step agent and substep agent")
-    # Extract the shared boilerplate section (## 共通 agent contract boilerplate).
+    # Extract the shared boilerplate section (## Common agent contract boilerplate).
     shared_pattern = re.compile(
-        r"## 共通 agent contract boilerplate\b.*?```text\n(?P<body>.*?)\n```",
+        r"## Common agent contract boilerplate\b.*?```text\n(?P<body>.*?)\n```",
         re.DOTALL,
     )
     shared_match = shared_pattern.search(text)
     if shared_match is None:
         raise RuntimeError(
-            "launch_prompts.md must define '## 共通 agent contract boilerplate' "
+            "launch_prompts.md must define '## Common agent contract boilerplate' "
             "with a ```text block for {{COMMON_BOILERPLATE}} expansion"
         )
     templates["common boilerplate"] = shared_match.group("body")
@@ -7297,13 +7298,13 @@ def _template_placeholder_values(request_payload: dict[str, Any]) -> dict[str, s
 
 
 def _render_launch_prompt_template(request_payload: dict[str, Any]) -> str:
-    """launch prompt テンプレートをレンダリングする。
+    """Render the launch prompt template.
 
-    展開順序:
-    1. テンプレート名を決定 (step / substep)
-    2. 共有 boilerplate の `{{ACTOR_ROLE}}` を role 文字列で置換
-    3. テンプレート本文の `{{COMMON_BOILERPLATE}}` を展開済み boilerplate で置換
-    4. `<key>` プレースホルダを request_payload の値で置換
+    Expansion order:
+    1. Determine the template name (step / substep)
+    2. Replace `{{ACTOR_ROLE}}` of the shared boilerplate with the role string
+    3. Replace `{{COMMON_BOILERPLATE}}` of the template body with the expanded boilerplate
+    4. Replace the `<key>` placeholders with the values of request_payload
     """
     templates = _load_launch_prompt_templates()
     template_name = _launch_prompt_template_name(request_payload)
@@ -7525,21 +7526,21 @@ def _required_launch_prompt_markers(request_payload: dict[str, Any]) -> list[str
         "skill_name:",
         "skill_ref:",
         "skill_must_read_refs:",
-        "必須要件:",
+        "Required requirements:",
     ]
     substep = request_payload.get("substep")
     if isinstance(substep, str) and substep.strip():
         return [
-            "あなたは substep agent である。",
-            "対象 node_key:",
-            "対象 step:",
-            "対象 substep:",
+            "You are a substep agent.",
+            "Target node_key:",
+            "Target step:",
+            "Target substep:",
             *markers,
         ]
     return [
-        "あなたは step agent である。",
-        "対象 node_key:",
-        "対象 step:",
+        "You are a step agent.",
+        "Target node_key:",
+        "Target step:",
         *markers,
     ]
 
@@ -7562,25 +7563,25 @@ def _required_launch_prompt_constraint_lines(request_payload: dict[str, Any]) ->
     if not isinstance(step, str) or not step.strip():
         return []
     required_fragments = (
-        "`run-gate --gate apply_patch_writes` と `apply-patch-gate`",
+        "`run-gate --gate apply_patch_writes` and `apply-patch-gate`",
         "`output_manifests/",
         "/capabilities/",
-        "`capability_token` が未取得または不一致の場合は処理を開始せず fail",
-        "`.json` と `.txt` の出力は",
-        "`.yaml` / `.yml` / `.md` および source code 等の上記以外の出力は",
+        "`capability_token` is not obtained or mismatched: do not start processing and stop with fail",
+        "`.json` and `.txt` output",
+        "`.yaml` / `.yml` / `.md` and source code",
     )
     return [
         line
         for line in render_launch_prompt_text(request_payload).splitlines()
         if any(fragment in line for fragment in required_fragments)
-        and "読み取ってよい" not in line
+        and "may be read directly" not in line
     ]
 
 
 # Issue 1 of the recurrence-prevention plan: per-(step, substep) allowed
 # `validate_pipeline_semantics --stage <X>` invocations. Canonical source:
 # `skills/workflow-orchestration/references/launch_prompts.md` "substep ↔
-# allowed validator gate 対応表". `record-launch` rejects any launch
+# allowed validator gate correspondence table". `record-launch` rejects any launch
 # prompt where an actionable invocation line targets a stage outside the
 # substep's allow-set. Override with env `METDSL_ENFORCE_GATE_ALLOWLIST=0`
 # for emergency rollback.
@@ -7662,11 +7663,7 @@ _NEGATION_MARKERS: tuple[str, ...] = (
     "shouldn't ",
     "must not ",
     "mustn't ",
-    "してはならない",
-    "してはいけない",
-    "含めてはならない",
-    "含めるな",
-    "禁止",
+    "forbidden",
     "ng:",
 )
 
@@ -7719,7 +7716,7 @@ def _find_stage_near_invocation(
 # listed.
 ALLOWED_VALIDATE_PIPELINE_STAGES: dict[tuple[str, str], frozenset[str]] = {
     # Strict per-substep mapping. Authoritative source: the "substep ↔
-    # allowed validator gate 対応表" in
+    # allowed validator gate correspondence table" in
     # `skills/workflow-orchestration/references/launch_prompts.md`. Each
     # substep is restricted to the single canonical `--stage` it owns;
     # cross-substep / `full` invocations are rejected at `record-launch`
@@ -7756,7 +7753,7 @@ def _iter_validate_pipeline_invocations(prompt_text: str) -> list[str]:
         preceded by `python3` within `_RUN_GATE_LOOKBACK_BYTES`, covering
         Bash backslash-continued multi-line commands), AND
       - The line containing the marker has no negation marker (e.g.
-        "do not run …", "禁止", "してはならない") — such lines are treated
+        "do not run …", "forbidden", "must not") — such lines are treated
         as documentation prose (Codex review round 7 P2).
 
     For each accepted invocation the stage is extracted from a bounded
@@ -7855,7 +7852,7 @@ def _validate_launch_prompt_text(request_payload: dict[str, Any], prompt_text: s
             if violations:
                 raise ValueError(
                     f"launch prompt for step={step_raw!r} substep={substep_raw!r} "
-                    f"violates substep ↔ allowed validator gate 対応表: {violations}. "
+                    f"violates substep ↔ allowed validator gate correspondence table: {violations}. "
                     f"See skills/workflow-orchestration/references/launch_prompts.md "
                     f"for the canonical allowlist."
                 )
@@ -7894,7 +7891,7 @@ def _validate_launch_prompt_text(request_payload: dict[str, Any], prompt_text: s
                 f"launch prompt for step={step_raw!r} substep={substep_raw!r} "
                 f"contains forbidden gate keyword(s): {hits}. "
                 f"See skills/workflow-orchestration/references/launch_prompts.md "
-                f"`substep ↔ allowed validator gate 対応表` for the canonical allowlist."
+                f"`substep ↔ allowed validator gate correspondence table` for the canonical allowlist."
             )
 
 
@@ -7988,11 +7985,11 @@ def update_checkpoint(
     agent_run_id: str,
     result: dict[str, Any],
 ) -> dict[str, Any]:
-    """write_step_result 完了後にチェックポイントへ完了エントリを追記/更新する。
+    """After write_step_result completes, append/update a completion entry to the checkpoint.
 
-    status=pass の場合のみ記録する。それ以外は即時 return する。
+    Record only when status=pass. Otherwise return immediately.
 
-    既に同一 (node_key, step) のエントリが存在する場合は上書きする。
+    Overwrite when an entry for the same (node_key, step) already exists.
     """
     status = result.get("status")
     if not isinstance(status, str) or status.strip().lower() != "pass":
@@ -8094,7 +8091,7 @@ def read_checkpoint(
     repo_root: Path,
     orchestration_id: str,
 ) -> dict[str, Any] | None:
-    """orchestration_checkpoint.json を読んで返す。存在しない場合は None。"""
+    """Read and return orchestration_checkpoint.json. None if it does not exist."""
     _guard_checkpoint_read_requires_resume(repo_root, orchestration_id)
     return _load_checkpoint(repo_root, orchestration_id)
 
@@ -8103,7 +8100,7 @@ def verify_checkpoint_integrity(
     repo_root: Path,
     orchestration_id: str,
 ) -> dict[str, Any]:
-    """チェックポイントの全 artifact ハッシュを再計算し整合性を検証する。"""
+    """Recompute all artifact hashes of the checkpoint and verify the integrity."""
     checkpoint = _load_checkpoint(repo_root, orchestration_id)
     if checkpoint is None:
         return {
@@ -8177,10 +8174,10 @@ def check_step_completed(
     step: str,
     verify_integrity: bool = True,
 ) -> dict[str, Any] | None:
-    """指定 (node_key, step) の完了状況を返す。
+    """Return the completion status of the specified (node_key, step).
 
-    未完了またはチェックポイントが存在しない場合は None を返す。
-    verify_integrity=True の場合はハッシュ検証を実施し、stale なら None を返す。
+    Return None when incomplete or when the checkpoint does not exist.
+    When verify_integrity=True, perform hash verification and return None if stale.
     """
     meta_path = _orchestration_root(repo_root, orchestration_id) / "orchestration_meta.json"
     if meta_path.exists():
@@ -8243,20 +8240,20 @@ def enable_checkpoint_resume(
     spec_ref: str | None = None,
     source_dependency_ref: str | None = None,
 ) -> dict[str, Any]:
-    """orchestration_meta.json に resume_enabled=true を設定する。
+    """Set resume_enabled=true in orchestration_meta.json.
 
-    `spec_ref` / `source_dependency_ref` が指定された場合のみ meta を更新する
-    (resume 時に CLI で override された値を meta へ反映し、次回 resume の復元元が
-    stale にならないようにするため)。未指定時は既存 meta を保持する。
+    Update the meta only when `spec_ref` / `source_dependency_ref` is specified
+    (to reflect the value overridden via the CLI at resume time into the meta so that
+    the restoration source of the next resume does not become stale). When unspecified, keep the existing meta.
 
-    既に terminal status (pass / fail / fail_closed / blocked / timeout / cancel) で
-    終端した orchestration を resume する場合、live status を `running` へ戻す。
-    `update_orchestration_status` は terminal → 他 status の遷移を `fail` → `fail_closed`
-    を除き reject するため、reset しないと resume した agent が完了しても `pass` を記録
-    できず、resume が成立しない。prior terminal の narrative は `resumed_from_*` に退避し、
-    failure_analysis.json / phase_state_log に履歴が残る。
+    When resuming an orchestration already terminated with a terminal status
+    (pass / fail / fail_closed / blocked / timeout / cancel), return the live status to `running`.
+    Because `update_orchestration_status` rejects a terminal → other status transition except `fail` → `fail_closed`,
+    without a reset the resumed agent could not record `pass` even if it completed,
+    and the resume would not hold. The prior terminal narrative is saved to `resumed_from_*`,
+    and the history remains in failure_analysis.json / phase_state_log.
 
-    orchestration が存在しない場合は RuntimeError を送出する。
+    Raise a RuntimeError when the orchestration does not exist.
     """
     meta_path = _orchestration_root(repo_root, orchestration_id) / "orchestration_meta.json"
     if not meta_path.exists():
@@ -8764,7 +8761,7 @@ def _validate_launch_request_payload(request_payload: dict[str, Any]) -> None:
                 "not workspace/ir/."
             )
 
-    # repair_strategy / issue_severity の値検証
+    # value validation of repair_strategy / issue_severity
     repair_strategy = str(request_payload.get("repair_strategy", "none")).strip()
     if repair_strategy not in VALID_REPAIR_STRATEGIES:
         raise ValueError(
@@ -8779,7 +8776,7 @@ def _validate_launch_request_payload(request_payload: dict[str, Any]) -> None:
             f"got {issue_severity!r}"
         )
 
-    # repair_strategy が reuse/restart のとき repair フィールドを必須にする
+    # require the repair fields when repair_strategy is reuse/restart
     if repair_strategy in {"reuse", "restart"}:
         repair_target = str(request_payload.get("repair_target_agent_run_id", "none")).strip()
         if not repair_target or repair_target == "none":
@@ -9263,7 +9260,7 @@ def _validate_apply_patch_gate_coverage(
     *,
     caller_holds_lock: bool = False,
 ) -> None:
-    """`apply_patch` 書き込み経路の gate 実行証跡を終端時に強制する。"""
+    """Enforce the gate execution evidence of the `apply_patch` write path at terminalization."""
     role = payload.get("agent_role")
     if not isinstance(role, str):
         return
@@ -9865,7 +9862,7 @@ def _validate_step_result_payload(
     status = payload.get("status")
     status_token = status.strip().lower() if isinstance(status, str) else ""
 
-    # validation_stage チェック（generate/build/execute/judge の terminal 時）
+    # validation_stage check (at terminal of generate/build/execute/judge)
     if step_token in STEP_REQUIRED_VALIDATION_STAGES and status_token in TERMINAL_STATUSES:
         allowed = STEP_REQUIRED_VALIDATION_STAGES[step_token]
         validation_stage = payload.get("validation_stage")
@@ -9890,7 +9887,7 @@ def _validate_step_result_payload(
             payload=payload,
         )
 
-    # 以下は既存の substep 検証（compile/generate/validate のみ）
+    # the following is the existing substep verification (compile/generate/validate only)
     if step_token not in {"compile", "generate", "validate"}:
         return
     if status_token != "pass":
@@ -9920,7 +9917,7 @@ def _validate_step_result_payload(
             if isinstance(output_ref, str) and output_ref.strip():
                 substep_outputs.add(output_ref.strip())
 
-    # meta ファイル検証（plan/generate の pass 時のみ）
+    # meta file verification (only on pass of plan/generate)
     if step_token in _STEP_META_FILENAME:
         meta_filename = _STEP_META_FILENAME[step_token]
         meta_refs = [ref for ref in declared_outputs if ref.endswith(meta_filename)]
@@ -10097,7 +10094,7 @@ def _probe_codex_backend(
     command: str,
     runner: Callable[..., subprocess.CompletedProcess[str]],
 ) -> tuple[list[dict[str, Any]], dict[str, bool], bool, str]:
-    """codex バックエンドのプローブを実行し (checks, features, multi_agent_enabled, agent_version) を返す。"""
+    """Run the codex backend probe and return (checks, features, multi_agent_enabled, agent_version)."""
     version_proc = runner([command, "--version"], text=True, capture_output=True, check=False)
     features_proc = runner([command, "features", "list"], text=True, capture_output=True, check=False)
     features: dict[str, bool] = {}
@@ -10128,7 +10125,7 @@ def _probe_codex_backend(
 
 
 def _pass_values_by_check_name(checks: list[dict[str, Any]]) -> dict[str, Any]:
-    """各 check の `pass` を名前で引けるようにする。`pass` は bool または None（未実行スキップ）。"""
+    """Make each check's `pass` lookupable by name. `pass` is bool or None (skipped, not run)."""
     by_name: dict[str, Any] = {}
     for item in checks:
         if not isinstance(item, dict):
@@ -10142,24 +10139,24 @@ def _pass_values_by_check_name(checks: list[dict[str, Any]]) -> dict[str, Any]:
 def _can_launch_from_help_fallback_checks(
     backend_token: str, checks: list[dict[str, Any]]
 ) -> bool:
-    """cursor/claude 用。`features list` が無くても `--help` が通れば起動可能とみなす。"""
+    """For cursor/claude. Even without `features list`, treat it as launchable if `--help` passes."""
     passes = _pass_values_by_check_name(checks)
     version_ok = passes.get(f"{backend_token}_version_available") is True
     features_list_ok = passes.get(f"{backend_token}_features_list_available") is True
     help_pass = passes.get(f"{backend_token}_help_probe_available")
     multi_ok = passes.get("multi_agent_enabled") is True
-    # `pass` が None のときは --help を実行していない（features list で multi_agent 確定済み）。
-    # その場合は `features_list_ok` に委ね、`None` を黙って False 相当にしない。
+    # When `pass` is None, --help was not run (multi_agent already determined by features list).
+    # In that case, delegate to `features_list_ok` and do not silently treat `None` as False-equivalent.
     help_confirms_launch = help_pass is True
     return version_ok and multi_ok and (features_list_ok or help_confirms_launch)
 
 
 def _all_strict_boolean_probe_checks_pass(checks: list[dict[str, Any]]) -> bool:
-    """codex 等。`pass` キーは必須。値が None の check は未実行プローブとして評価から除外する。
+    """For codex etc. The `pass` key is required. A check with value None is excluded from evaluation as an unrun probe.
 
-    明示的に False の `pass` は不合格。少なくとも 1 件は None 以外の `pass` が存在し、
-    それらがすべて True でなければならない。help fallback 由来の check 列を誤って渡した
-    場合でも、`pass: None` のみを黙って不合格にしない。
+    An explicit False `pass` is a failure. At least 1 non-None `pass` must exist,
+    and all of them must be True. Even if a check column from the help fallback is mistakenly passed,
+    do not silently fail on only `pass: None`.
     """
     evaluated_any = False
     for item in checks:
@@ -10181,7 +10178,7 @@ def _probe_help_fallback_backend(
     command: str,
     runner: Callable[..., subprocess.CompletedProcess[str]],
 ) -> tuple[list[dict[str, Any]], dict[str, bool], bool, str]:
-    """cursor/claude バックエンドのプローブを実行し (checks, features, multi_agent_enabled, agent_version) を返す。"""
+    """Run the cursor/claude backend probe and return (checks, features, multi_agent_enabled, agent_version)."""
     version_proc = runner([command, "--version"], text=True, capture_output=True, check=False)
     features_proc = runner([command, "features", "list"], text=True, capture_output=True, check=False)
     features: dict[str, bool] = {}
@@ -10253,20 +10250,20 @@ def _probe_claude_backend(
     command: str,
     runner: Callable[..., subprocess.CompletedProcess[str]],
 ) -> tuple[list[dict[str, Any]], dict[str, bool], bool, str]:
-    """claude バックエンド専用プローブ。
+    """A probe specific to the claude backend.
 
-    `claude features list` は Claude Code CLI に存在しないサブコマンドであり、
-    実行すると claude がチャット応答をそのまま stdout に返す（exit 0）。
-    この応答が `features_list_available.detail` に混入し preflight.json を汚染する
-    (orch_20260610T130256Z_ebe96a51 で観測)。
+    `claude features list` is a subcommand that does not exist in the Claude Code CLI,
+    and running it makes claude return its chat response as-is to stdout (exit 0).
+    This response mixes into `features_list_available.detail` and contaminates preflight.json
+    (observed in orch_20260610T130256Z_ebe96a51).
 
-    修正: claude backend では `features list` を実行せず advisory 扱いとし、
-    `--help` の liveness probe を multi_agent の best-effort 検出に使う。
-    Claude Code の子 agent は CLI subcommand ではなく `Agent` tool で起動するため
-    `--help` 出力に `agents` subcommand は現れない（旧 docstring の主張は誤り）。
-    本 probe は (a) `--help` が exit 0 で (b) stdout に help テキストを返すことを要求し、
-    `claude` を騙る空出力バイナリの false-pass を防ぐ。`multi_agent` の authoritative gate は
-    `record_launch` の launch-time live preflight 側に残る。
+    Fix: on the claude backend, do not run `features list` and treat it as advisory,
+    and use the `--help` liveness probe for the best-effort detection of multi_agent.
+    Because Claude Code's child agent is launched not by a CLI subcommand but by the `Agent` tool,
+    no `agents` subcommand appears in the `--help` output (the old docstring's claim is wrong).
+    This probe requires (a) `--help` to exit 0 and (b) stdout to return help text,
+    preventing a false-pass of an empty-output binary impersonating `claude`. The authoritative gate of `multi_agent`
+    remains on the launch-time live preflight side of `record_launch`.
     """
     version_proc = runner([command, "--version"], text=True, capture_output=True, check=False)
     # Skip `features list` for claude: the subcommand does not exist in Claude Code CLI
@@ -10332,9 +10329,9 @@ _BACKEND_PROBERS: dict[
 
 _CLAUDE_MCP_BUILD_RUNTIME_SERVER_RELPATH = "mcp_servers/build_runtime_server.py"
 _CLAUDE_MCP_BUILD_RUNTIME_NAME_TOKENS = ("build-runtime", "build_runtime")
-# enablement の canonical source は repo にコミットされる project settings。`~/.claude.json`
-# (per-user / per-machine の trust 履歴) は意図的に参照しない — マシン依存で preflight 結果が
-# 揺れる原因になるため (再現性優先)。
+# The canonical source for enablement is the project settings committed to the repo. `~/.claude.json`
+# (per-user / per-machine trust history) is intentionally not referenced — because it would cause the
+# preflight result to vary per machine (reproducibility first).
 _CLAUDE_PROJECT_SETTINGS_RELPATH = ".claude/settings.json"
 _CLAUDE_PROJECT_LOCAL_SETTINGS_RELPATH = ".claude/settings.local.json"
 _MCP_JSON_RELPATH = ".mcp.json"
@@ -10349,26 +10346,26 @@ _CLAUDE_MCP_REMEDIATION = (
     "exists in `.claude/settings.json` / `.claude/settings.local.json`. "
     "Reference: `mcp_servers/README.md`."
 )
-# permission rule 文字列の canonical 形。Claude Code の permission rule は MCP tool 名部分の
-# wildcard (`mcp__build-runtime__*`) を解さないため、server 単位 grant が全 tool を覆う正攻法。
-# remediation メッセージ表示用の canonical (hyphen) token。
+# The canonical form of the permission rule string. Because Claude Code's permission rule does not
+# interpret a wildcard in the MCP tool name part (`mcp__build-runtime__*`), a server-level grant covering all tools is the proper approach.
+# The canonical (hyphen) token for displaying the remediation message.
 _CLAUDE_MCP_SERVER_PERMISSION_TOKEN = "mcp__build-runtime"
-# granted 判定に必須の個別 tool 名。detect_build_system は advisory (granted 判定に
-# 含めない) — Generate/Build/Validate が必須依存する 4 tool のみを gate 対象とする。
+# The individual tool names required for the granted decision. detect_build_system is advisory (not
+# included in the granted decision) — only the 4 tools that Generate/Build/Validate require are gated.
 _CLAUDE_MCP_REQUIRED_TOOL_NAMES = (
     "run_linter",
     "compile_project",
     "run_program",
     "run_quality_checks",
 )
-# remediation メッセージ表示用の canonical (hyphen) token。
+# The canonical (hyphen) token for displaying the remediation message.
 _CLAUDE_MCP_REQUIRED_TOOL_PERMISSION_TOKENS = tuple(
     f"mcp__build-runtime__{name}" for name in _CLAUDE_MCP_REQUIRED_TOOL_NAMES
 )
-# 判定で accept する permission token は registration で実際に enable された server alias から
-# 導出する (下記 _evaluate_build_runtime_tool_permission)。enable された alias (例 `build-runtime`)
-# と permission の alias (例 `mcp__build_runtime`) が食い違うと Claude は実 server 名で permission
-# を keyed するため child Agent が tool を呼べない — alias 横断の無条件 accept は false-pass の元。
+# The permission token accepted in the decision is derived from the server alias actually enabled in
+# registration (see _evaluate_build_runtime_tool_permission below). When the enabled alias (e.g. `build-runtime`)
+# and the permission's alias (e.g. `mcp__build_runtime`) diverge, Claude keys the permission by the actual
+# server name, so the child Agent cannot call the tool — an unconditional cross-alias accept is a source of false-pass.
 _CLAUDE_MCP_PERMISSION_REMEDIATION = (
     "build-runtime MCP tools are registered/connected but not permission-granted to the "
     "orchestration's spawned child Agent sessions. Add the server-level grant "
@@ -10384,10 +10381,10 @@ _CLAUDE_MCP_PERMISSION_REMEDIATION = (
 
 
 def _load_json_object(path: Path) -> tuple[dict[str, Any] | None, str | None]:
-    """path から JSON object を読む。返り値 (obj, error)。
+    """Read a JSON object from path. Return value (obj, error).
 
-    存在しなければ (None, None)（呼び出し側で「無し」を扱える）。読み込み/parse 失敗や
-    非 object は (None, error_string) を返す。
+    If it does not exist, (None, None) (the caller can handle "none"). On a read/parse failure or
+    a non-object, return (None, error_string).
     """
     if not path.exists():
         return None, None
@@ -10408,21 +10405,21 @@ def _read_repo_enabled_mcp_servers(
     local_settings_path: Path | None = None,
     mcp_json_path: Path | None = None,
 ) -> tuple[set[str] | None, str]:
-    """repo にコミットされた project settings から enabled MCP server 名集合を読み出す。
+    """Read the set of enabled MCP server names from the project settings committed to the repo.
 
-    canonical source は `<repo>/.claude/settings.json` (flat key)。`~/.claude.json`
-    (per-user / per-machine の trust 履歴) は意図的に参照しない — マシン依存で結果が揺れる
-    のを避け再現性を担保するため。集合は次の演算で得る:
+    The canonical source is `<repo>/.claude/settings.json` (flat key). `~/.claude.json`
+    (per-user / per-machine trust history) is intentionally not referenced — to avoid the result
+    varying per machine and ensure reproducibility. The set is obtained by the following operation:
         (.claude/settings.json: enabledMcpjsonServers)
-        ∪ (enableAllProjectMcpServers=true のとき .mcp.json の mcpServers キー全部)
+        ∪ (all mcpServers keys of .mcp.json when enableAllProjectMcpServers=true)
         − (.claude/settings.json: disabledMcpjsonServers)
-        − (.claude/settings.local.json: disabledMcpjsonServers)   # 個人 opt-out 検出
+        − (.claude/settings.local.json: disabledMcpjsonServers)   # personal opt-out detection
 
-    `.claude/settings.json` 不在 / 不正 JSON / 非 object の場合は (None, 説明) を返す。
-    None は「未判定」を意味し gate fail として扱う (repo が未構成)。
+    When `.claude/settings.json` is absent / invalid JSON / a non-object, return (None, explanation).
+    None means "undetermined" and is treated as a gate fail (the repo is not configured).
 
-    既知の割り切り: `~/.claude.json` の disabledMcpjsonServers による opt-out は見ないため、
-    その経路で無効化したユーザーは false-pass しうる (再現性優先で許容)。
+    Known trade-off: because the opt-out via disabledMcpjsonServers of `~/.claude.json` is not seen,
+    a user who disabled it via that path can false-pass (allowed, reproducibility first).
     """
     settings = (
         settings_path
@@ -10487,18 +10484,18 @@ def _read_repo_mcp_tool_permissions(
     settings_path: Path | None = None,
     local_settings_path: Path | None = None,
 ) -> tuple[set[str], set[str], str | None, str]:
-    """repo にコミットされた project settings から MCP tool permission の状態を読み出す。
+    """Read the state of MCP tool permission from the project settings committed to the repo.
 
-    canonical source は `<repo>/.claude/settings.json` の `permissions` セクション。
-    `.claude/settings.local.json` の `permissions.allow` (個人 opt-in 追加) と
-    `permissions.deny` (個人 opt-out) も合算/減算する。`~/.claude.json` は
-    enablement check と同じ理由 (マシン依存・再現性) で参照しない。
+    The canonical source is the `permissions` section of `<repo>/.claude/settings.json`.
+    The `permissions.allow` (personal opt-in addition) and `permissions.deny` (personal opt-out)
+    of `.claude/settings.local.json` are also combined/subtracted. `~/.claude.json` is not
+    referenced for the same reason as the enablement check (machine-dependent, reproducibility).
 
-    戻り値 `(allow_set, deny_set, default_mode, detail)`:
-      - allow_set: project + local の `permissions.allow` 文字列集合
-      - deny_set:  project + local の `permissions.deny` 文字列集合
-      - default_mode: `permissions.defaultMode` (project 優先、無ければ local、無ければ None)
-      - detail: 診断用文字列
+    Return value `(allow_set, deny_set, default_mode, detail)`:
+      - allow_set: the string set of project + local `permissions.allow`
+      - deny_set:  the string set of project + local `permissions.deny`
+      - default_mode: `permissions.defaultMode` (project first, else local, else None)
+      - detail: a diagnostic string
     """
     settings = (
         settings_path
@@ -10518,8 +10515,8 @@ def _read_repo_mcp_tool_permissions(
         perms = data.get("permissions")
         if not isinstance(perms, dict):
             return set(), set(), None
-        # 非 list (null / str / int 等) は無視して空集合扱いとする。`for x in value` を
-        # list 確定後にのみ行い、malformed value での TypeError (preflight abort) を防ぐ。
+        # Ignore a non-list (null / str / int etc.) and treat it as an empty set. Do `for x in value`
+        # only after confirming a list, to prevent a TypeError (preflight abort) on a malformed value.
         allow_raw = perms.get("allow")
         allow = (
             {str(x) for x in allow_raw if isinstance(x, str)}
@@ -10556,26 +10553,25 @@ def _evaluate_build_runtime_tool_permission(
     settings_path: Path | None = None,
     local_settings_path: Path | None = None,
 ) -> tuple[bool, str]:
-    """build-runtime MCP tool が子 Agent session に permission-granted されているか判定する。
+    """Determine whether the build-runtime MCP tool is permission-granted to the child Agent session.
 
-    `enabled_aliases` は registration で実際に enable された build-runtime の server alias
-    集合 (`{"build-runtime"}` / `{"build_runtime"}` 等)。permission token はこの **enable
-    された alias からのみ** 導出する。Claude は実 server 名で permission を keyed するため、
-    enable 名と permission alias が食い違うと child Agent が tool を呼べないにも関わらず
-    preflight が pass してしまう (false-pass)。`enabled_aliases` が空/None の場合は
-    registration AND-gate が別途 fail するため、診断目的で既知 alias 全体を fallback に使う。
+    `enabled_aliases` is the set of build-runtime server aliases actually enabled in registration
+    (`{"build-runtime"}` / `{"build_runtime"}` etc.). The permission token is derived **only from this
+    enabled alias**. Because Claude keys the permission by the actual server name,
+    when the enabled name and the permission alias diverge, preflight passes (false-pass) even though
+    the child Agent cannot call the tool. When `enabled_aliases` is empty/None, the
+    registration AND-gate fails separately, so for diagnostic purposes the whole known alias set is used as a fallback.
 
-    granted 条件 (いずれか):
-      - `permissions.defaultMode == "bypassPermissions"` (全 tool 無条件許可)
-      - server 単位 grant (`mcp__<enabled-alias>`) が allow にあり、server 単位 deny も
-        必須 tool の個別 deny も無い
-      - 必須 4 tool (`run_linter` / `compile_project` / `run_program` /
-        `run_quality_checks`) が各々「enable alias の allow を1つ以上持ち deny されていない」
-        (かつ server 単位 deny が無い)
-    Claude Code の deny rule は allow より優先。tool 固有 deny は server 単位 allow を、
-    server 単位 deny は個別 tool allow を、それぞれ打ち消すため、いずれの deny があっても
-    granted=false とする (false-pass 防止)。`detect_build_system` は advisory (どの phase も
-    invoke しないため gate 対象外)。
+    granted condition (any of):
+      - `permissions.defaultMode == "bypassPermissions"` (unconditional permission for all tools)
+      - a server-level grant (`mcp__<enabled-alias>`) is in allow, and there is neither a server-level deny
+        nor an individual deny of a required tool
+      - the required 4 tools (`run_linter` / `compile_project` / `run_program` /
+        `run_quality_checks`) each "have at least 1 allow of an enabled alias and are not denied"
+        (and there is no server-level deny)
+    Claude Code's deny rule takes precedence over allow. Because a tool-specific deny cancels a server-level allow,
+    and a server-level deny cancels an individual tool allow, granted=false if either deny exists
+    (false-pass prevention). `detect_build_system` is advisory (out of gate scope because no phase invokes it).
     """
     allow_set, deny_set, default_mode, perms_detail = _read_repo_mcp_tool_permissions(
         repo_root,
@@ -10586,8 +10582,8 @@ def _evaluate_build_runtime_tool_permission(
     if default_mode == "bypassPermissions":
         return True, f"granted via defaultMode=bypassPermissions | {perms_detail}"
 
-    # enable された alias のみ accept (canonical 順を保持)。未指定/空は registration が
-    # 別途 fail するため fallback として既知 alias 全体を使う。
+    # Accept only the enabled alias (preserving canonical order). When unspecified/empty, registration
+    # fails separately, so use the whole known alias set as a fallback.
     aliases = tuple(
         a for a in _CLAUDE_MCP_BUILD_RUNTIME_NAME_TOKENS if a in (enabled_aliases or set())
     ) or _CLAUDE_MCP_BUILD_RUNTIME_NAME_TOKENS
@@ -10602,17 +10598,17 @@ def _evaluate_build_runtime_tool_permission(
     server_denied = bool(server_tokens & deny_set)
 
     def _tool_allowed(alias_tokens: tuple[str, ...]) -> bool:
-        # 当該 tool に allow alias が1つでもあり、その alias が deny されていなければ true
+        # true if the tool has at least 1 allow alias and that alias is not denied
         return any(tok in allow_set and tok not in deny_set for tok in alias_tokens)
 
     def _tool_denied(alias_tokens: tuple[str, ...]) -> bool:
         return any(tok in deny_set for tok in alias_tokens)
 
-    # 必須 tool のいずれかが個別 deny されていれば server 単位 grant を打ち消す
+    # if any required tool is individually denied, cancel the server-level grant
     required_tool_denied = any(_tool_denied(toks) for toks in required_tool_aliases)
     server_granted = server_allowed and not server_denied and not required_tool_denied
 
-    # server 単位 deny は server の全 tool を block するため、個別 allow があっても granted 不可。
+    # because a server-level deny blocks all tools of the server, granted is impossible even with an individual allow.
     tools_granted = (not server_denied) and all(
         _tool_allowed(toks) for toks in required_tool_aliases
     )
@@ -10642,19 +10638,19 @@ def _probe_claude_mcp_registry(
     local_settings_path: Path | None = None,
     mcp_json_path: Path | None = None,
 ) -> tuple[list[dict[str, Any]], bool]:
-    """Claude session が target repo で build-runtime MCP tool を露出するかを判定する。
+    """Determine whether the Claude session exposes the build-runtime MCP tool in the target repo.
 
-    canonical signal は repo にコミットされた `<repo>/.claude/settings.json`
-    (`enabledMcpjsonServers` / `enableAllProjectMcpServers` − `disabledMcpjsonServers`、
-    及び `.claude/settings.local.json` の disable 減算)。`~/.claude.json` (per-user /
-    per-machine の trust 履歴) は参照しない — マシン依存で preflight 結果が揺れる原因に
-    なるため (再現性優先)。
-    `claude mcp list` は trust dialog を skip して stdio server を spawn するため
-    false-positive (workspace 未信頼でも `✓ Connected` を返す) を起こす — 補助 diagnostic
-    として扱い preflight gate には使わない (Codex review P1)。`mcp list` の timeout は
-    advisory のみで Claude orchestration を block しない (P2)。
+    The canonical signal is the `<repo>/.claude/settings.json` committed to the repo
+    (`enabledMcpjsonServers` / `enableAllProjectMcpServers` − `disabledMcpjsonServers`,
+    and subtracting the disable of `.claude/settings.local.json`). `~/.claude.json` (per-user /
+    per-machine trust history) is not referenced — because it would cause the preflight result
+    to vary per machine (reproducibility first).
+    Because `claude mcp list` skips the trust dialog and spawns the stdio server, it causes a
+    false-positive (returns `✓ Connected` even for an untrusted workspace) — it is treated as an auxiliary
+    diagnostic and is not used for the preflight gate (Codex review P1). The timeout of `mcp list` is
+    advisory only and does not block the Claude orchestration (P2).
 
-    `repo_root` が None の場合 (主に unit test) は advisory-only check のみ返す。
+    When `repo_root` is None (mainly in unit tests), return only the advisory-only check.
     """
     if repo_root is None:
         return (
@@ -10668,8 +10664,8 @@ def _probe_claude_mcp_registry(
                     ),
                 },
                 {
-                    # registered と permission は常に対で評価する契約 (CLAUDE.md / startup_contract.md)。
-                    # repo_root 不在の advisory-only 経路でも permission check を省かず skipped で含める。
+                    # The contract evaluates registered and permission always as a pair (CLAUDE.md / startup_contract.md).
+                    # Even on the advisory-only path without repo_root, include the permission check as skipped rather than omitting it.
                     "name": "claude_mcp_build_runtime_permission_granted",
                     "pass": None,
                     "detail": (
@@ -10695,7 +10691,7 @@ def _probe_claude_mcp_registry(
         enabled_build_runtime_aliases = enabled_servers & build_runtime_token_set
         session_enabled = bool(enabled_build_runtime_aliases)
 
-    # `claude mcp list` は advisory diagnostic として軽く呼ぶ。timeout は gate しない。
+    # Call `claude mcp list` lightly as an advisory diagnostic. The timeout does not gate.
     try:
         proc = runner(
             [command, "mcp", "list"],
@@ -10706,7 +10702,7 @@ def _probe_claude_mcp_registry(
             cwd=str(repo_root),
         )
     except (subprocess.TimeoutExpired, FileNotFoundError, OSError) as exc:
-        list_available: bool | None = None  # advisory: timeout / spawn error は inconclusive
+        list_available: bool | None = None  # advisory: timeout / spawn error is inconclusive
         list_stdout = ""
         list_stderr = f"{type(exc).__name__}: {exc}"
         returncode = -1
@@ -10783,8 +10779,8 @@ def _probe_claude_mcp_registry(
             "detail": permission_detail,
         },
     ]
-    # registration と permission の AND を gate signal とする。registered=true でも tool が
-    # 子 Agent session に permission-granted されていなければ launch を許可しない。
+    # The AND of registration and permission is the gate signal. Even with registered=true, if the tool
+    # is not permission-granted to the child Agent session, the launch is not permitted.
     mcp_ok = registered_pass and permission_granted
     return checks, mcp_ok
 
@@ -11315,7 +11311,7 @@ def record_launch(
     )
     backend_token = preflight_backend if preflight_backend in SUPPORTED_BACKENDS else "codex"
 
-    # Claude backend は active file で sequential child launch を強制する。
+    # The Claude backend enforces sequential child launch via the active file.
     if backend_token == "claude":
         active_path = _active_child_agent_run_id_path(repo_root, orchestration_id)
         if active_path.exists():
@@ -13590,7 +13586,7 @@ def guarded_apply_patch(
 
 
 def _validate_record_launch_response_fields(payload: dict[str, Any]) -> None:
-    """record-launch --response-json の必須フィールドを CLI dispatch 時点で検証する。"""
+    """Validate the required fields of record-launch --response-json at CLI dispatch time."""
     label = "record-launch --response-json"
     for key in ("agent_run_id", "agent_session_id", "started_at", "backend"):
         value = payload.get(key)
@@ -13609,7 +13605,7 @@ def _validate_record_launch_response_fields(payload: dict[str, Any]) -> None:
 
 
 def _validate_record_agent_run_fields(payload: dict[str, Any]) -> None:
-    """record-agent-run --agent-run-json の必須フィールドを CLI dispatch 時点で検証する。"""
+    """Validate the required fields of record-agent-run --agent-run-json at CLI dispatch time."""
     label = "record-agent-run --agent-run-json"
     for key in ("agent_run_id", "agent_backend", "status"):
         value = payload.get(key)
@@ -13629,7 +13625,7 @@ def _validate_record_agent_run_fields(payload: dict[str, Any]) -> None:
 
 
 def _validate_write_step_result_fields(payload: dict[str, Any], step: str) -> None:
-    """write-step-result --result-json の必須フィールドを CLI dispatch 時点で検証する。"""
+    """Validate the required fields of write-step-result --result-json at CLI dispatch time."""
     label = "write-step-result --result-json"
     status_raw = payload.get("status")
     if not isinstance(status_raw, str) or not status_raw.strip():
@@ -14341,7 +14337,7 @@ def main(argv: list[str] | None = None) -> int:
             )
         except (RuntimeError, ValueError) as exc:
             # Emit a stable JSON envelope on stderr so agents following the
-            # docs/ORCHESTRATION.md "出力契約" contract can parse failure
+            # docs/ORCHESTRATION.md "output contract" contract can parse failure
             # detail without reading the gate file directly. We attempt to
             # extract violations[] from a JSON-shaped exception message; if the
             # message is plain text, we fall back to a single-violation entry.

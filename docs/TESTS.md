@@ -1,59 +1,59 @@
-# tests（canonical source）の要件と書式
+# Requirements and format of tests (canonical source)
 
-## 目的
-`tests.md` は `spec` の verification input と判定条件の canonical source である。`problem` / `component` / `profile` の全 `spec_kind` で共通利用する。
-`tests.md` の評価結果は当該 `node` の `self_verdict` として `verdict.json` へ写像し、依存込みの集約判定は `aggregate_verdict.json` で扱う。
+## Purpose
+`tests.md` is the canonical source for the verification input and judgment conditions of a `spec`. It is commonly used for all `spec_kind` of `problem` / `component` / `profile`.
+The evaluation result of `tests.md` is mapped to the relevant `node`'s `self_verdict` in `verdict.json`, and the aggregated judgment including dependencies is handled in `aggregate_verdict.json`.
 
-## 適用範囲
+## Scope
 - `spec/problem/<domain>/<family>/<spec_id>/tests.md`
 - `spec/component/<domain>/<family>/<spec_id>/tests.md`
 - `spec/profile/<domain>/<family>/<spec_id>/tests.md`
 
-## 要件
-1. canonical source 形式は `Markdown` とする。
-2. 文書先頭に `test_profile_id`、`test_profile_version`、`status`、`spec_ref` を必須記載する。
-3. `spec_ref` は `spec_kind`、`spec_id`、`spec_version`、`controlled_spec_path` を必須とする。
-4. 各 `spec` は `L0` テストを少なくとも 1 件定義する。
-5. `L1` / `L2` / `L3` は検証目的に応じて定義する。`spec_kind` で禁止しない。
-6. テスト件数の固定下限は設けない。要件網羅規則で十分性を判定する。
-7. 未定義項目は補完せずエラーとする。
-8. 判定条件は `node_key` 単位で評価できなければならない。依存 `node` の状態を暗黙参照してはならない。
+## Requirements
+1. The canonical source format is `Markdown`.
+2. State `test_profile_id`, `test_profile_version`, `status`, and `spec_ref` at the top of the document as required.
+3. `spec_ref` requires `spec_kind`, `spec_id`, `spec_version`, and `controlled_spec_path`.
+4. Each `spec` defines at least 1 `L0` test.
+5. Define `L1` / `L2` / `L3` according to the verification purpose. They are not forbidden by `spec_kind`.
+6. No fixed lower bound on the number of tests is set. Sufficiency is judged by the requirement-coverage rule.
+7. Treat an undefined item as an error without completion.
+8. The judgment condition must be evaluable per `node_key`. It must not implicitly reference the state of a dependency `node`.
 
-## `spec_kind` 別の網羅規則
+## Coverage rules per `spec_kind`
 - `problem`
-  - 実行制御、ケース展開、判定式、合否集約規則を定義する。
-  - 妥当性判定で非適用項目がある場合は `N/A` と `reason_na` を定義する。
+  - Define execution control, case expansion, judgment expressions, and pass/fail aggregation rules.
+  - When there is a non-applicable item in the validity judgment, define `N/A` and `reason_na`.
 
 - `component`
-  - 公開 `operation` ごとに、正常系とガード系（`fail` または `xfail`）を少なくとも 1 件ずつ定義する。
-  - 必要に応じて `L1` 以上の精度・保存性・同値性テストを追加する。
+  - For each published `operation`, define at least one normal case and one guard case (`fail` or `xfail`) each.
+  - Add `L1`-and-above accuracy / conservation / equivalence tests as needed.
 
 - `profile`
-  - 選択成立条件、排他条件、フォールバック禁止条件の判定を定義する。
-  - 互換範囲外入力に対するガード系テストを定義する。
+  - Define the judgment of the selection-establishment condition, exclusion condition, and fallback-prohibition condition.
+  - Define guard-case tests for input outside the compatibility range.
 
-## 記述フォーマット
-0. メタ情報
-1. テスト目的
-2. 入力既定化規則
-3. 実行制御規則
-4. ケース展開規則
-5. 診断契約
-6. テスト定義
-7. 合否集約規則
-8. トレーサビリティ
+## Description format
+0. Meta information
+1. Test purpose
+2. Input-defaulting rules
+3. Execution-control rules
+4. Case-expansion rules
+5. Diagnostics contract
+6. Test definitions
+7. Pass/fail aggregation rules
+8. Traceability
 
-`spec_kind` により不要節がある場合は、省略ではなく `N/A` と理由を記載する。
+When there is an unnecessary section depending on the `spec_kind`, state `N/A` and the reason rather than omitting it.
 
-## 運用ルール
-- `Controlled Spec` 変更で判定条件に影響する場合、同一変更で `tests.md` を更新する。
-- `xfail` は `xfail_condition` と `pass_when` を同時定義する。
-- 閾値変更時は影響 `test_id` を明示する。
-- 依存込みの合否は `tests.md` ではなく `dependency.resolved.yaml` と `aggregate_verdict.json` で判定する。
+## Operations Rules
+- When a `Controlled Spec` change affects the judgment conditions, update `tests.md` in the same change.
+- For `xfail`, define `xfail_condition` and `pass_when` simultaneously.
+- When changing a threshold, state the affected `test_id`.
+- Judge pass/fail including dependencies not in `tests.md` but in `dependency.resolved.yaml` and `aggregate_verdict.json`.
 
-## 判定基準
-- 文書単独でテスト入力と合否判定を復元できる。
-- `spec_ref` と `controlled_spec.md` の対応が一意である。
-- `L0` テストが存在する。
-- 要件網羅規則を満たす。
-- 判定結果を `node_key` 単位の `self_verdict` として再現できる。
+## Decision Criteria
+- The test input and pass/fail judgment can be restored from the document alone.
+- The correspondence between `spec_ref` and `controlled_spec.md` is unique.
+- An `L0` test exists.
+- The requirement-coverage rule is satisfied.
+- The judgment result can be reproduced as a per-`node_key` `self_verdict`.

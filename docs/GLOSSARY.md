@@ -1,150 +1,150 @@
 # Glossary / Notation / Level Definitions
 
-この文書は、他のドキュメントが参照する term を 1 か所に集約し、単独で読んでも意味が通るようにする。
+This document aggregates the terms referenced by other documents in one place, so it reads coherently on its own.
 
 ## 1. Artifacts
-- **controlled_spec.md**: 物理・数値アルゴリズム定義の canonical source。生成器が `model`（実装本体）を作るために参照する。
-- **problem spec**: `spec_kind=problem` の `controlled_spec.md`。統合シナリオ、実行時 input contract、依存 `component` / 採用 `profile` を定義する。
-- **component spec**: `spec_kind=component` の `controlled_spec.md`。再利用可能な物理演算の input/output contract と公開 `operation` を定義する。
-- **profile spec**: `spec_kind=profile` の `controlled_spec.md`。`component` の選択規則、既定値、拘束条件を定義する。
-- **tests.md**: 検証プロファイル（入力インスタンス、ケース展開、判定条件）の canonical source。`problem` / `component` / `profile` の全 `spec_kind` で使用し、テストランナーは必要箇所を決定的に解釈して参照する。
-- **spec_catalog.yaml**: `spec` の registry。`spec_kind`、`domain`、`family`、`spec_id`、配置先（`controlled_spec_path`、`tests_path` など）、状態、`official_releases`（正式版実装の登録情報）を保持する。
-- **component_catalog.yaml**: 再利用 `component` / `operation` の registry。保存先は `releases/registry/component_catalog.yaml` とし、責務、公開 `API`、互換性、実装状態を保持する。
-- **deps.yaml**: 各 `spec` が要求する依存宣言。`component_id` / `profile_id` と `version constraint` を定義する。
-- **case.yaml**: 人間が書く（または将来 `Spec` から生成する）テストケース定義。`sweep` / `refinement` などを含み得る。
-- **spec.ir.yaml**: `Compile` が導出する構造化中間表現（IR）の canonical source。`case`、`algorithm`、`impl_defaults`、`io_contract`、`dependency` の 5 section を単一ファイルに統合し、`Generate` 以降の唯一の生成・検証契約として使用する。`controlled_spec.md` の自然言語意図を構造化し、`Generate` 以降は本 IR のみを正典として参照する（`controlled_spec.md` の Read は禁止）。`algorithm` section は `execution_mode` と `steps[]` と `ordering` と `control_condition` と `iteration_contract` と `update_semantics` と `temporaries` と `derived_field_rules` と `invariants` と `splitting_policy` を必須語彙とし、`io_contract` section は `inputs` / `outputs` / `semantic_dependency.required_sources` / `raw_requirements.required_evidence` / `test_evidence_requirements` を保持する。
-- **dependency.resolved.yaml**: 依存解決結果の canonical source。`node_key`、`direct_deps`、`transitive_deps`、`topo_level` を保持する。
-- **direct dependency compile readiness**: 対象 `node` の直下依存 `node` について、対応する `ir_id` が発行済みであり、`ir_meta.json.verification_status=pass` を満たす状態。この条件を満たさない上位 `node` は `Compile` を開始してはならない。
-- **direct dependency execution readiness**: 対象 `node` の直下依存 `node` について、対応する `ir_id` と `pipeline_id` が発行済みであり、最新 `aggregate_verdict` が `pass` または `xfail` である状態。この条件を満たさない上位 `node` は `Generate` 以降を開始してはならない。
-- **expected_node_set**: `deps.yaml` と `spec_catalog.yaml` から再構成した期待 `node` 集合。`dependency.resolved.yaml` の網羅検証に使用する。
-- **node workflow**: 単一 `node_key` を対象にした `Compile -> Generate -> Build -> Validate` の 1 系列実行（core 5-phase）。
-- **orchestration agent**: `workflow` 全体の進行制御を担当する統括エージェント。`step` / `substep` 起動、依存順序管理、状態集約を担当し、phase artifactsを直接生成しない。`substep` を持つ phase では `substep agent` を直接管理し、`step_result.json` を集約する。
-- **step agent**: 単一 `node` の単一 `step` を担当するエージェント。標準 `substep` を持たない phase の artifact generation と検証を担当する。
-- **substep agent**: 単一 `substep` を担当するエージェント。input contract に従って artifact を生成し、`orchestration agent` へ返却する。
-- **node_key_safe**: `node_key` の保存用表記。推奨形式は `<spec_kind>__<spec_id>__<spec_version>`。
-- **orchestration_id**: 1 回の `workflow` 実行全体を識別する `ID`。`workspace/orchestrations/<orchestration_id>/` の保存キーとして使用する。
-- **ir_id**: `node` 単位で `spec.ir.yaml` を識別する `ID`。推奨形式は `<slug>_<date>_<seq3>`。`workspace/ir/<node_key_safe>/<ir_id>/` 配下に IR と `ir_meta.json` を配置する。
-- **pipeline_id**: `node` 単位の `Generate -> Build -> Validate` 系列を識別する `ID`。推奨形式は `<slug>_<date>_<seq3>`。
-- **source_id / binary_id / run_id**: 各段階の試行を識別する `ID`。推奨形式は `<prefix>_<date>_<seq3>`（`prefix` は `src` / `bin` / `run`）。`source_id` は `Generate` 出力（ソース一式）、`binary_id` は `Build` 出力（バイナリ）、`run_id` は `Validate` 実行（execute + judge）を識別する。
-- **agent_run_id**: `step agent` / `substep agent` / `orchestration agent` の 1 回の実行を識別する `ID`。`parent_agent_run_id` と組で親子関係を表す。
-- **issue_severity**: 子 `agent` artifact の問題重大度。`minor` / `major` / `critical` の 3 値を使用する。
-- **repair_strategy**: 子 `agent` への再投入方針。`reuse` は同一 `agent_session_id` 継続修正、`restart` は新規 `agent_session_id` 再起動を表す。
-- **repair_target_agent_run_id**: 再投入判断の対象にした直前 `agent_run` を示す参照 `ID`。
-- **node_key**: 実行 / 判定対象 `node` の識別子。形式は `<spec_kind>/<spec_id>@<spec_version>` とする。
-- **topo_level**: 依存 `DAG` におけるトポロジカル階層。小さい値ほど下層 `node` を表す。
-- **release_id**: 各 `spec` の正式版実装を識別する `ID`。推奨形式は `<spec_version>_<utc_ts>_<seq3>`。
-- **target_architecture**: 正式版 artifact を分離するアーキテクチャ識別子。例: `x86_64`,`aarch64`,`nvidia_sm80`。
-- **release artifact root**: 正式版 artifact の保存ルート。`releases/<spec_kind>/<domain>/<family>/<spec_id>/<target_architecture>/<toolchain_language>/<release_id>/` を canonical source とする。
-- **official_releases**: `spec_catalog.yaml` に保持する正式版実装の登録配列。`target_architecture`、`toolchain_language`、`target_backend`、`source_pipeline_id`、`source_source_id`、`source_binary_id`、`source_run_id`、`artifact_root`、`promoted_at`、`status` を持つ。任意フローである Promote が更新する。
-- **lineage.json**: `spec_ref`、`ir_ref`、`pipeline_id`、各段階 `ID`（`source_id` / `binary_id` / `run_id`）の関係を記録する来歴ファイル。
-- **orchestration_meta.json**: `orchestration` 実行メタデータ。`orchestration_id`、対象 `spec_ref`、`source_dependency_ref`（orchestration 起点の `spec/.../deps.yaml` への参照。launch_request の phase 別 `dependency_ref` とは別概念）、開始時刻、実行状態を記録する。チェックポイント再開を許可する場合は `resume_enabled`（真偽）と `resumed_at`（任意）を追加する。
-- **orchestration_checkpoint.json**: `pass` 完了済み `step` と `output_refs` の SHA-256 を保持する orchestration 証跡。`write-step-result` が `status=pass` で完了したときに `tools/orchestration_runtime.py` により更新される。手動編集を禁止する。
-- **resume_enabled**: `orchestration_meta.json` の真偽フィールド。`true` の orchestration のみ `orchestration_checkpoint.json` をスキップ判定の入力として使用してよい。
-- **skipped_by_checkpoint**: `agent_runs.jsonl` の `agent_role` 値のひとつ。チェックポイント整合性が確認でき当該 `step` を起動しなかったことを記録する。
-- **agent_graph.json**: `orchestration` における `agent` 親子関係。`parent_agent_run_id` と `child_agent_run_id` と `relation_type` を記録する。
-- **context_id**: `LLM` 実行コンテキスト識別子。`step agent` / `substep agent` ごとに固有値を持ち、同一 `orchestration_id` 内で重複を禁止する。
-- **context_isolated**: `step agent` / `substep agent` が独立コンテキストで実行されたことを示す真偽値。`true` を必須とする。
-- **agent_runs.jsonl**: `agent` 実行イベントの時系列ログ。`agent_run_id`、`parent_agent_run_id`、`agent_role`、`status`、`started_at`、`finished_at`、`agent_backend`、`agent_model`、`context_id`、`context_isolated`、`launch_request_ref`、`launch_response_ref`、`launch_prompt_ref`、`launch_reply_ref`、`agent_result_ref`、`agent_summary_ref` を記録する。再投入時は `launch_request_ref` 先へ `issue_severity` と `repair_strategy` と `repair_target_agent_run_id` と `repair_reason` を記録する。
-- **step_result.json**: phase 集約結果。`status`、`required_outputs`、`failed_substeps`、`executor_agent_run_id`、`substep_agent_run_ids` を記録する。`substep` を持つ phase では `executor_agent_run_id` は `orchestration agent_run_id`、標準 `substep` を持たない phase では `step agent_run_id` とする。`substep_agent_run_ids` は `substep` を持たない phase で空配列を許可する。再投入を実施した phase は `retry_decisions` を追加し、`issue_severity` と `repair_strategy` と `repair_target_agent_run_id` と `new_agent_run_id` と `repair_reason` を保持する。
-- **model**: 物理計算を実行する計算コンポーネント / ライブラリ。入力状態から次状態を計算する責務を持つ。
-- **runner（例: `simulate`）**: 実行エントリポイント。入力読込・`model` 呼び出し・`diagnostics` / `perf` 出力を担当する。
-- **`<stage>_meta.json`**: `LLM` 利用ステージの実行メタデータ。`attempt_count`、`verification_status`、`last_fail_reason`、`context_isolated`、`debug_mode` を保持する。`context_isolated=false` では `constraint_reason` を必須とする。`debug_mode=true` で失敗試行を保存した場合は `retained_failed_attempts` と保存先を保持する。
-- **source_meta.json**: `Generate` ステージの `<stage>_meta.json`。`source_id` 配下に配置する。
-- **verifier（in-stage）**: `LLM` ステージ内部で実行される整合チェック担当。artifact のみを入力に取り、`generate -> verify -> regenerate` ループで合否を返す。
-- **diagnostics.json**: `runner` が出す物理・数値診断（保存量、誤差、`CFL` など）。合否は含めない。
-- **perf.json**: `runner` が出す性能診断（最低限 `walltime_sec`、`throughput_cells_per_sec`、`parallelism`）。合否は含めない。
-- **verdict.json**: 当該 `node` の合否判定（`self_verdict`）と根拠。
-- **aggregate_verdict.json**: 当該 `node` と推移依存 `node` を含む集約合否判定。
-- **summary.json**: `run` 全体の集計。`self_summary` と `dependency_summary` を必須保持する。
-- **dependency_summary**: 依存集約件数。`total`、`pass`、`xfail`、`fail`、`blocked` を保持する。
-- **dependency workflow coverage check**: `dependency.resolved.yaml` の `node_key` 集合と `workspace/ir` / `workspace/pipelines` の `node` 集合が 1 対 1 で一致することを確認する検証。
-- **dependency implementation encapsulation**: 依存 `node` の実装本体を依存元 `node` の `source/<source_id>/src/` 配下へ複製・再配置・再定義しない境界規則。依存元 `node` は依存 `node` の公開 `operation` 呼び出し、共有 `library`、または `profile` 参照のみを保持できる。
-- **blocked_reason**: `node` が `blocked` で終了した直接理由。依存 `node` の `fail` / `blocked` を識別可能に記録する。
-- **blocking_direct_deps**: `blocked` を引き起こした直下依存 `node_key` の配列。
-- **stdout.log / stderr.log**: 実行ログ（必ず保存し、後追いデバッグ可能にする）。
-- **attempts/**: `debug_mode=true` のときにのみ作成される失敗試行保存ディレクトリ。標準運用（`debug_mode=false`）では作成しない。
-- **dummy output**: workflow 進行または `tests` 合格を目的に、実行根拠なしで人工生成した artifact。`diagnostics` / `perf` / `verdict` / `aggregate_verdict` を含む。
-- **dummy computation**: 物理計算を実行せず、固定値や定型文字列のみで計算結果を代替する実装。
-- **fail-fast stop**: phase input 不足または契約不一致を検知した時点で当該 phase を `fail` で停止し、推測補完や人工生成で継続しない運用規則。
-- **pipeline semantic validation**: `python3 tools/validate_pipeline_semantics.py` の `--stage` invocation による内容検証ゲートである。`--stage compile` / `post_generate` / `post_build` は execution artifact 無しで該当段階の契約と生成物を検証し、`post_execute` / `pre_judge` / 省略時（`full`）は `raw` 一次証跡、`trial_meta` 追跡整合、`quality check` 比較 canonical source、固定値生成パターン、`copy_based_artifact_reuse` 等を機械検証する。
-- **static lint**: `Generate` ステージで MCP `run_linter` により実行するソース静的解析である。`Build` の `compile_project` や `toolchain.build_system` 経由のビルドとは別手順とする。`quality check`（`run_quality_checks`）とは別物である。
-- **lint_command_ref**: `source_meta.json` が保持する `static lint` の MCP 証跡である。`verification_status=pass` の場合に必須とし、`run_linter` キー配下に `command_id` と `command_log_ref` と `preset` を持つ object 配列を記録する。
-- **metrics basis**: `raw/metrics_basis.json` に保存する per-test evidence index。`test_evidence_requirements` の全 `test_id` を保持し、各 `test_id` の `Validate.judge` 再計算に必要な `required_raw_variables` を raw 値または raw 参照として保持する。suite 全体 summary や `diagnostics.json` の複写で代替してはならない。
-- **raw snapshot schema**: `problem` `node` の `raw/state_snapshots/snapshot_schema.json` に保存する項目定義。`variables[].name` と `variables[].shape_expr` と `time_variable` と `time_shape_expr` により、各問題設定で判定再計算に使用する状態量と時刻情報を表す。
-- **algorithm contract**: `spec.ir.yaml` の `algorithm` section が保持する演算構成 IR。`execution_mode` と `steps[]` と `ordering` と `control_condition` と `iteration_contract` と `update_semantics` と `temporaries` と `derived_field_rules` と `invariants` と `splitting_policy` を必須語彙とする。
+- **controlled_spec.md**: The canonical source for the physics / numerical algorithm definition. The generator references it to create the `model` (the implementation body).
+- **problem spec**: A `controlled_spec.md` with `spec_kind=problem`. It defines the integration scenario, the runtime input contract, and the dependent `component` / adopted `profile`.
+- **component spec**: A `controlled_spec.md` with `spec_kind=component`. It defines the input/output contract of a reusable physics operation and the published `operation`.
+- **profile spec**: A `controlled_spec.md` with `spec_kind=profile`. It defines the selection rules, defaults, and constraints for a `component`.
+- **tests.md**: The canonical source for the verification profile (input instances, case expansion, decision conditions). It is used for all `spec_kind` of `problem` / `component` / `profile`, and the test runner deterministically interprets and references the necessary parts.
+- **spec_catalog.yaml**: The registry of `spec`. It holds `spec_kind`, `domain`, `family`, `spec_id`, placement (`controlled_spec_path`, `tests_path`, etc.), state, and `official_releases` (registration information for official-version implementations).
+- **component_catalog.yaml**: The registry of reusable `component` / `operation`. Its storage location is `releases/registry/component_catalog.yaml`, and it holds responsibilities, the published `API`, compatibility, and implementation state.
+- **deps.yaml**: The dependency declarations required by each `spec`. It defines `component_id` / `profile_id` and `version constraint`.
+- **case.yaml**: A test-case definition written by a human (or, in the future, generated from `Spec`). It can include `sweep` / `refinement` etc.
+- **spec.ir.yaml**: The canonical source for the structured intermediate representation (IR) derived by `Compile`. It integrates the 5 sections `case`, `algorithm`, `impl_defaults`, `io_contract`, `dependency` into a single file and uses them as the sole generation/verification contract from `Generate` onward. It structures the natural-language intent of `controlled_spec.md`, and from `Generate` onward only this IR is referenced as authoritative (reading `controlled_spec.md` is forbidden). The `algorithm` section requires the vocabulary `execution_mode`, `steps[]`, `ordering`, `control_condition`, `iteration_contract`, `update_semantics`, `temporaries`, `derived_field_rules`, `invariants`, and `splitting_policy`, and the `io_contract` section holds `inputs` / `outputs` / `semantic_dependency.required_sources` / `raw_requirements.required_evidence` / `test_evidence_requirements`.
+- **dependency.resolved.yaml**: The canonical source for the dependency-resolution result. It holds `node_key`, `direct_deps`, `transitive_deps`, and `topo_level`.
+- **direct dependency compile readiness**: A state in which, for the immediate dependency `node` of the target `node`, the corresponding `ir_id` has been issued and `ir_meta.json.verification_status=pass` is satisfied. An upper `node` that does not satisfy this condition must not start `Compile`.
+- **direct dependency execution readiness**: A state in which, for the immediate dependency `node` of the target `node`, the corresponding `ir_id` and `pipeline_id` have been issued and the latest `aggregate_verdict` is `pass` or `xfail`. An upper `node` that does not satisfy this condition must not start `Generate` onward.
+- **expected_node_set**: The expected `node` set reconstructed from `deps.yaml` and `spec_catalog.yaml`. Used for the completeness verification of `dependency.resolved.yaml`.
+- **node workflow**: One series of `Compile -> Generate -> Build -> Validate` execution targeting a single `node_key` (the core 5-phase).
+- **orchestration agent**: The supervising agent responsible for controlling the progress of the whole `workflow`. It is responsible for launching `step` / `substep`, managing dependency ordering, and aggregating state, and does not directly generate phase artifacts. For a phase that has `substep`, it directly manages the `substep agent` and aggregates `step_result.json`.
+- **step agent**: An agent responsible for a single `step` of a single `node`. It is responsible for artifact generation and verification of a phase that does not have a standard `substep`.
+- **substep agent**: An agent responsible for a single `substep`. It generates the artifact according to the input contract and returns it to the `orchestration agent`.
+- **node_key_safe**: The storage notation of `node_key`. The recommended form is `<spec_kind>__<spec_id>__<spec_version>`.
+- **orchestration_id**: The `ID` that identifies one entire `workflow` execution. Used as the storage key for `workspace/orchestrations/<orchestration_id>/`.
+- **ir_id**: The `ID` that identifies the `spec.ir.yaml` per `node`. The recommended form is `<slug>_<date>_<seq3>`. The IR and `ir_meta.json` are placed under `workspace/ir/<node_key_safe>/<ir_id>/`.
+- **pipeline_id**: The `ID` that identifies the `Generate -> Build -> Validate` series per `node`. The recommended form is `<slug>_<date>_<seq3>`.
+- **source_id / binary_id / run_id**: The `ID` that identifies the trial of each stage. The recommended form is `<prefix>_<date>_<seq3>` (`prefix` is `src` / `bin` / `run`). `source_id` identifies the `Generate` output (the full source set), `binary_id` the `Build` output (the binary), and `run_id` the `Validate` execution (execute + judge).
+- **agent_run_id**: The `ID` that identifies one execution of a `step agent` / `substep agent` / `orchestration agent`. Together with `parent_agent_run_id` it expresses the parent-child relationship.
+- **issue_severity**: The severity of a problem in a child `agent` artifact. The 3 values `minor` / `major` / `critical` are used.
+- **repair_strategy**: The re-submission policy for a child `agent`. `reuse` means continuing repair with the same `agent_session_id`, and `restart` means a fresh restart with a new `agent_session_id`.
+- **repair_target_agent_run_id**: A reference `ID` indicating the immediately preceding `agent_run` that was the target of the re-submission decision.
+- **node_key**: The identifier of the `node` to execute / judge. The format is `<spec_kind>/<spec_id>@<spec_version>`.
+- **topo_level**: The topological level in the dependency `DAG`. A smaller value represents a lower `node`.
+- **release_id**: The `ID` that identifies the official-version implementation of each `spec`. The recommended form is `<spec_version>_<utc_ts>_<seq3>`.
+- **target_architecture**: The architecture identifier that separates official-version artifacts. Examples: `x86_64`, `aarch64`, `nvidia_sm80`.
+- **release artifact root**: The storage root for official-version artifacts. `releases/<spec_kind>/<domain>/<family>/<spec_id>/<target_architecture>/<toolchain_language>/<release_id>/` is the canonical source.
+- **official_releases**: The registration array of official-version implementations held in `spec_catalog.yaml`. It has `target_architecture`, `toolchain_language`, `target_backend`, `source_pipeline_id`, `source_source_id`, `source_binary_id`, `source_run_id`, `artifact_root`, `promoted_at`, and `status`. The optional flow Promote updates it.
+- **lineage.json**: A provenance file that records the relationship of `spec_ref`, `ir_ref`, `pipeline_id`, and each stage `ID` (`source_id` / `binary_id` / `run_id`).
+- **orchestration_meta.json**: `orchestration` execution metadata. It records `orchestration_id`, the target `spec_ref`, `source_dependency_ref` (a reference to the orchestration's starting `spec/.../deps.yaml`; a separate concept from the per-phase `dependency_ref` of the launch_request), the start time, and the execution state. When checkpoint resume is permitted, it adds `resume_enabled` (boolean) and `resumed_at` (optional).
+- **orchestration_checkpoint.json**: The orchestration evidence that holds the `pass`-completed `step` and the SHA-256 of `output_refs`. It is updated by `tools/orchestration_runtime.py` when `write-step-result` completes with `status=pass`. Manual editing is forbidden.
+- **resume_enabled**: A boolean field of `orchestration_meta.json`. Only an orchestration with `true` may use `orchestration_checkpoint.json` as input to the skip decision.
+- **skipped_by_checkpoint**: One of the `agent_role` values of `agent_runs.jsonl`. It records that checkpoint consistency was confirmed and the relevant `step` was not launched.
+- **agent_graph.json**: The `agent` parent-child relationships in an `orchestration`. It records `parent_agent_run_id`, `child_agent_run_id`, and `relation_type`.
+- **context_id**: The `LLM` execution-context identifier. It has a unique value per `step agent` / `substep agent`, and duplicates within the same `orchestration_id` are forbidden.
+- **context_isolated**: A boolean indicating that the `step agent` / `substep agent` was executed in an isolated context. `true` is required.
+- **agent_runs.jsonl**: A chronological log of `agent` execution events. It records `agent_run_id`, `parent_agent_run_id`, `agent_role`, `status`, `started_at`, `finished_at`, `agent_backend`, `agent_model`, `context_id`, `context_isolated`, `launch_request_ref`, `launch_response_ref`, `launch_prompt_ref`, `launch_reply_ref`, `agent_result_ref`, and `agent_summary_ref`. On re-submission, it records `issue_severity`, `repair_strategy`, `repair_target_agent_run_id`, and `repair_reason` at the `launch_request_ref` target.
+- **step_result.json**: The phase aggregation result. It records `status`, `required_outputs`, `failed_substeps`, `executor_agent_run_id`, and `substep_agent_run_ids`. For a phase that has `substep`, `executor_agent_run_id` is the `orchestration agent_run_id`; for a phase that does not have a standard `substep`, it is the `step agent_run_id`. `substep_agent_run_ids` may be an empty array for a phase that does not have `substep`. A phase that performed re-submission adds `retry_decisions`, holding `issue_severity`, `repair_strategy`, `repair_target_agent_run_id`, `new_agent_run_id`, and `repair_reason`.
+- **model**: The computation component / library that performs the physics computation. It is responsible for computing the next state from the input state.
+- **runner (e.g. `simulate`)**: The execution entry point. It is responsible for reading input, calling `model`, and outputting `diagnostics` / `perf`.
+- **`<stage>_meta.json`**: The execution metadata of an `LLM`-using stage. It holds `attempt_count`, `verification_status`, `last_fail_reason`, `context_isolated`, and `debug_mode`. With `context_isolated=false`, `constraint_reason` is required. When failed attempts are saved with `debug_mode=true`, it holds `retained_failed_attempts` and the storage location.
+- **source_meta.json**: The `<stage>_meta.json` of the `Generate` stage. Placed under `source_id`.
+- **verifier (in-stage)**: The consistency-check responsibility executed inside the `LLM` stage. It takes only artifacts as input and returns a pass/fail in the `generate -> verify -> regenerate` loop.
+- **diagnostics.json**: The physics / numerical diagnostics emitted by the `runner` (conserved quantities, errors, `CFL`, etc.). It does not include pass/fail.
+- **perf.json**: The performance diagnostics emitted by the `runner` (at minimum `walltime_sec`, `throughput_cells_per_sec`, `parallelism`). It does not include pass/fail.
+- **verdict.json**: The pass/fail judgment of the relevant `node` (`self_verdict`) and its basis.
+- **aggregate_verdict.json**: The aggregated pass/fail judgment including the relevant `node` and its transitive dependency `node`.
+- **summary.json**: The aggregation of the whole `run`. It must hold `self_summary` and `dependency_summary`.
+- **dependency_summary**: The dependency-aggregation counts. It holds `total`, `pass`, `xfail`, `fail`, and `blocked`.
+- **dependency workflow coverage check**: A verification that confirms the `node_key` set of `dependency.resolved.yaml` and the `node` set of `workspace/ir` / `workspace/pipelines` match one-to-one.
+- **dependency implementation encapsulation**: A boundary rule that does not copy, relocate, or redefine the implementation body of a dependency `node` under the depending `node`'s `source/<source_id>/src/`. The depending `node` may hold only calls to the published `operation` of the dependency `node`, a shared `library`, or a `profile` reference.
+- **blocked_reason**: The direct reason a `node` ended in `blocked`. It records the `fail` / `blocked` of the dependency `node` in an identifiable way.
+- **blocking_direct_deps**: The array of immediate dependency `node_key` that caused the `blocked`.
+- **stdout.log / stderr.log**: Execution logs (always saved to make post-hoc debugging possible).
+- **attempts/**: A failed-attempt storage directory created only when `debug_mode=true`. It is not created in standard operation (`debug_mode=false`).
+- **dummy output**: An artifact artificially generated without execution basis, for the purpose of advancing the workflow or passing `tests`. It includes `diagnostics` / `perf` / `verdict` / `aggregate_verdict`.
+- **dummy computation**: An implementation that does not perform the physics computation and substitutes the computation result with only fixed values or boilerplate strings.
+- **fail-fast stop**: The operational rule of stopping the relevant phase with `fail` at the moment a phase input shortage or contract mismatch is detected, without continuing via guessed completion or artificial generation.
+- **pipeline semantic validation**: The content-verification gate via the `--stage` invocation of `python3 tools/validate_pipeline_semantics.py`. `--stage compile` / `post_generate` / `post_build` verify the relevant stage's contract and outputs without execution artifacts, and `post_execute` / `pre_judge` / omitted (`full`) mechanically verify the `raw` primary evidence, `trial_meta` tracking consistency, the `quality check` comparison canonical source, fixed-value generation patterns, `copy_based_artifact_reuse`, etc.
+- **static lint**: The source static analysis executed by the MCP `run_linter` in the `Generate` stage. It is a separate step from a build via `Build`'s `compile_project` or `toolchain.build_system`. It is distinct from `quality check` (`run_quality_checks`).
+- **lint_command_ref**: The `static lint` MCP evidence held by `source_meta.json`. It is required when `verification_status=pass`, and records under the `run_linter` key an object array with `command_id`, `command_log_ref`, and `preset`.
+- **metrics basis**: The per-test evidence index saved in `raw/metrics_basis.json`. It holds all `test_id` of `test_evidence_requirements` and, for each `test_id`, holds the `required_raw_variables` needed for `Validate.judge` recomputation as raw values or raw references. It must not be substituted by a whole-suite summary or a copy of `diagnostics.json`.
+- **raw snapshot schema**: The item definition saved in `raw/state_snapshots/snapshot_schema.json` of a `problem` `node`. Via `variables[].name`, `variables[].shape_expr`, `time_variable`, and `time_shape_expr`, it expresses the state quantities and time information used for judgment recomputation in each problem setting.
+- **algorithm contract**: The operation-composition IR held by the `algorithm` section of `spec.ir.yaml`. It requires the vocabulary `execution_mode`, `steps[]`, `ordering`, `control_condition`, `iteration_contract`, `update_semantics`, `temporaries`, `derived_field_rules`, `invariants`, and `splitting_policy`.
 
-補足:
-- `perf.json` は `diagnostics.json` とは分離して出力する（同居しない）。
-- `verifier` は `generator` と独立したコンテキストでの実行を可能な限り優先する。
-- 実行環境の制約で独立コンテキストを確保できない場合は、同一コンテキスト実行を許容し、各ステージの `<stage>_meta.json` に制約理由を記録する。
-- 失敗試行の中間 artifact は標準運用で保存しない。保存は `debug_mode=true` の場合のみ許可する。
+Notes:
+- `perf.json` is output separately from `diagnostics.json` (they do not coexist).
+- The `verifier` prioritizes execution in a context independent of the `generator` as far as possible.
+- When an isolated context cannot be secured due to execution-environment constraints, same-context execution is permitted, and the constraint reason is recorded in each stage's `<stage>_meta.json`.
+- Intermediate artifacts of failed attempts are not saved in standard operation. Saving is permitted only when `debug_mode=true`.
 
 ## 2. Test Levels (L0-L3)
-`L0-L3` は「テストの粒度と目的」を表す classification であり、実装の層番号ではない。
+`L0-L3` is a classification representing "the granularity and purpose of a test", not an implementation layer number.
 
-- **L0: 部品テスト（Unit / Operator / Guard）**
-- **L1: 解析解・収束傾向テスト（Analytic / MMS / Refinement）**
-- **L2: 保存則・制約テスト（Invariants / Constraints）**
-- **L3: ロバスト性・同値性テスト（Robustness / Equivalence）**
-- 同値性に「性能回帰（`performance regression`）」も含める（物理合格の上で性能を比較する）。
+- **L0: Component tests (Unit / Operator / Guard)**
+- **L1: Analytic-solution / convergence-trend tests (Analytic / MMS / Refinement)**
+- **L2: Conservation-law / constraint tests (Invariants / Constraints)**
+- **L3: Robustness / equivalence tests (Robustness / Equivalence)**
+- Equivalence also includes "performance regression" (comparing performance on top of physical passing).
 
 ## 3. Expected Failure (Guard / XFAIL)
-- 正しく実装されていれば「失敗する」べきテスト。
-- expected failure条件を満たした場合は `PASS` と判定する。
+- A test that "should fail" if correctly implemented.
+- When the expected-failure condition is satisfied, judge it as `PASS`.
 
 ## 3-1. Dependency Block (Blocked)
-- 直下依存 `node` の `fail` または依存未解決により、上位 `node` の判定を開始できない状態。
-- `blocked` は `aggregate_verdict` と `dependency_summary` に必須記録する。
-- `blocked` が発生した上位 `node` の workflow execution result は `fail` とする。
+- A state in which the judgment of an upper `node` cannot start due to a `fail` of an immediate dependency `node` or unresolved dependency.
+- `blocked` must be recorded in `aggregate_verdict` and `dependency_summary`.
+- The workflow execution result of an upper `node` where `blocked` occurred is `fail`.
 
 ## 4. Physical Validity
-bitwise 一致は要求しない。以下の性質で一致を判定する。
-- 保存則ドリフトが許容内
-- 制約（非負性、過大なオーバーシュート）が許容内
-- 解析解や参照解に対する誤差が許容内
-- `refinement` で誤差が改善
-- 将来: 統計・スペクトル・アンサンブル指標
+Bitwise agreement is not required. Agreement is judged by the following properties.
+- Conservation-law drift is within tolerance
+- Constraints (non-negativity, excessive overshoot) are within tolerance
+- The error against the analytic solution or reference solution is within tolerance
+- The error improves with `refinement`
+- Future: statistical, spectral, and ensemble metrics
 
 ## 5. Algorithm Classes
-本プロジェクトでは「アルゴリズム」を 2 種類に分ける。
+This project divides "algorithms" into 2 kinds.
 
-### A) 物理アルゴリズム（Physics-affecting）
-- 物理結果（精度・安定性）に影響する選択。
-- 例: 空間離散化（中央 2 次、一次風上、`WENO` 等）、時間積分、フィルタ、拡散、物理過程の近似、境界条件の数値実装。
-- **`spec.ir.yaml` の `case` section と `algorithm` section で決定し、決定的である必要がある**（同じ `case` と同じ `algorithm` なら同じ物理解が期待される）。
+### A) Physics algorithms (Physics-affecting)
+- Choices that affect the physics result (accuracy, stability).
+- Examples: spatial discretization (central 2nd order, first-order upwind, `WENO`, etc.), time integration, filters, diffusion, approximation of physical processes, numerical implementation of boundary conditions.
+- **Determined by the `case` section and `algorithm` section of `spec.ir.yaml`, and must be deterministic** (the same `case` and the same `algorithm` are expected to give the same physics solution).
 
-### B) 実行アルゴリズム（Execution-only / Performance-affecting）
-- 物理結果（理想的には）を変えず、計算過程（性能、メモリ、並列効率）に影響する選択。
-- 例: ループ順序、タイル / ブロッキング、配列レイアウト、融合 / 分割、ベクトル化、`GPU` カーネル分割、非同期、数値的に等価な式変形、通信重ね合わせ。
-- **`spec.ir.yaml` の `impl_defaults` で core workflow の既定値を表現する。Tune flow が `tuning.spec`（任意フロー専用入力）で knob 上書きの探索対象を指定する**。
+### B) Execution algorithms (Execution-only / Performance-affecting)
+- Choices that (ideally) do not change the physics result but affect the computation process (performance, memory, parallel efficiency).
+- Examples: loop order, tiling / blocking, array layout, fusion / splitting, vectorization, `GPU` kernel splitting, async, numerically equivalent expression transformation, communication overlap.
+- **The `impl_defaults` of `spec.ir.yaml` expresses the core-workflow defaults. The Tune flow specifies the knob-override exploration targets via `tuning.spec` (an input dedicated to the optional flow)**.
 
-注意:
-- 実行アルゴリズムでも丸め誤差の差は起こり得る。許容は「物理的妥当性一致」で吸収する。
+Note:
+- Differences in rounding error can still occur even in execution algorithms. The tolerance is absorbed by "physical-validity agreement".
 
 ## 6. Determinism
-- determinismは「物理結果の再現性」を保証するために必要である。
-- ただし、物理結果を保証するdeterminismは主に **物理アルゴリズム（A）** と入力条件の決定に関わる。
-- **実行アルゴリズム（B）は必ずしも固定しない**。性能チューニングでは B を意図的に変えて探索する。
+- Determinism is necessary to guarantee "reproducibility of the physics result".
+- However, the determinism that guarantees the physics result is mainly related to the determination of the **physics algorithm (A)** and the input conditions.
+- **The execution algorithm (B) is not necessarily fixed.** In performance tuning, B is intentionally varied to explore.
 
 ## 7. run_id
-- `Validate` phase の 1 回の実行（`execute` + `judge`）に付与する識別子。
-- 形式: `run_<YYYYMMDD>_<seq3>`（例: `run_20260511_001`）。
-- `workspace/pipelines/<node_key_safe>/<pipeline_id>/runs/<run_id>/` 配下に一次証跡と判定 artifact を集約する。
+- The identifier assigned to one execution (`execute` + `judge`) of the `Validate` phase.
+- Format: `run_<YYYYMMDD>_<seq3>` (e.g. `run_20260511_001`).
+- The primary evidence and judgment artifacts are aggregated under `workspace/pipelines/<node_key_safe>/<pipeline_id>/runs/<run_id>/`.
 
-## 8. MCP（Model Context Protocol）
-- ツール実行を標準化するためのプロトコル。
-- 本プロジェクトでは `compile` / `run` / `quality check` を `MCP` サーバー経由で実行する。
-- `fortran` / `c` / `cpp` / `mixed` 系の `compile` は、依存関係を扱える標準ビルドツール（既定値 `make`）を介して実行する。
+## 8. MCP (Model Context Protocol)
+- A protocol for standardizing tool execution.
+- In this project, `compile` / `run` / `quality check` are executed through the `MCP` server.
+- The `compile` of `fortran` / `c` / `cpp` / `mixed` families is executed via a standard build tool that can handle dependencies (default `make`).
 
 ## 9. Automatic Differentiation (AD)
-- 離散実装された計算グラフに対して導関数（`JVP` / `VJP` / `gradient`）を機械的に求める手法。
-- 本プロジェクトでは将来対応を前提とし、現段階では「`AD` を阻害しない仕様・実装構造」を要求する。
-- 非微分演算（例: `clip`、`limiter`、分岐）を含む場合は、仕様上で扱いを明示する。
+- A technique for mechanically obtaining derivatives (`JVP` / `VJP` / `gradient`) for a discretely implemented computation graph.
+- This project assumes future support, and at the current stage requires a "specification / implementation structure that does not impede `AD`".
+- When non-differentiable operations (e.g. `clip`, `limiter`, branching) are included, their handling is made explicit in the specification.
 
 ## 10. `spec` Classification Vocabulary (`spec_kind` / `domain` / `family`)
-- **spec_kind**: `spec` の種別。`problem` / `component` / `profile` の 3 値のみを許可する。
-- **domain**: 物理モデルの上位 classification。`spec` 配置と `component_id` 接頭辞の一貫性を保つための固定語彙。例: `dynamics`, `microphysics`, `radiation`, `land_surface`。
-- **family**: `domain` 内の classification 単位。`problem` では方程式群、`component` では再利用演算群、`profile` では選択規則群を表す。
-- **component**: `component spec` が定義する再利用可能な物理演算単位。方程式系または離散化責務で分割する。例: `advection_flux`, `time_integrator`, `boundary_periodic`。
-- **operation**: `component` が公開する呼び出し単位。言語固有の関数・手続き・メソッドなどの実体を抽象化した語彙。
-- **適用規則**: `spec` の配置は `spec/<spec_kind>/<domain>/<family>/<spec_id>/...` とする。`component_id` 推奨形式 `<domain>_<family>_<operator>_<dim>d_<scheme>` の先頭 2 要素は `domain` と `family` に一致させる。`operation_id` は `<component_id>__<action>` 形式を用いる。
+- **spec_kind**: The kind of `spec`. Only the 3 values `problem` / `component` / `profile` are allowed.
+- **domain**: The top-level classification of the physics model. A fixed vocabulary to keep `spec` placement and the `component_id` prefix consistent. Examples: `dynamics`, `microphysics`, `radiation`, `land_surface`.
+- **family**: The classification unit within a `domain`. In `problem` it represents a group of equations, in `component` a group of reusable operations, and in `profile` a group of selection rules.
+- **component**: A reusable physics-operation unit defined by a `component spec`. Divided by equation system or discretization responsibility. Examples: `advection_flux`, `time_integrator`, `boundary_periodic`.
+- **operation**: The callable unit published by a `component`. A vocabulary that abstracts the actual entity of a language-specific function, procedure, method, etc.
+- **Application rule**: The placement of a `spec` is `spec/<spec_kind>/<domain>/<family>/<spec_id>/...`. The first 2 elements of the recommended `component_id` form `<domain>_<family>_<operator>_<dim>d_<scheme>` match `domain` and `family`. The `operation_id` uses the `<component_id>__<action>` form.

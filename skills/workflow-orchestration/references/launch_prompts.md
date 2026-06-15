@@ -1,48 +1,48 @@
 # Launch Prompts
 
-> **Audience: orchestration agent のみ。**
-> このファイルは orchestration agent が `Agent` tool（または `spawn_agent`）の `prompt` 引数を生成するためのテンプレ集である。
-> **`step agent` / `substep agent` はこのファイルを `Read` してはならない。** 起動後の child agent には必要なテンプレ内容が既に `Agent` tool の prompt 引数として渡されており、当該 path は `read_manifest_read_guard` で fail-closed にブロックされる（再発防止のため意図的）。
+> **Audience: orchestration agent only.**
+> This file is a collection of templates by which the orchestration agent generates the `prompt` argument of the `Agent` tool (or `spawn_agent`).
+> **A `step agent` / `substep agent` must not `Read` this file.** The necessary template content has already been passed as the prompt argument of the `Agent` tool to the child agent after launch, and that path is blocked fail-closed by `read_manifest_read_guard` (intentional, to prevent recurrence).
 
-## 共通 agent contract boilerplate
+## Common agent contract boilerplate
 
-> `{{COMMON_BOILERPLATE}}` プレースホルダの展開ソース。`tools/orchestration_runtime.py:_render_launch_prompt_template` が step / substep テンプレート内の `{{COMMON_BOILERPLATE}}` をこのセクションの `text` ブロック本文で置換する。`{{ACTOR_ROLE}}` は起動する agent の role (`step` または `substep`) に置換される。child agent はこのファイルを直接 Read しない。
+> The expansion source for the `{{COMMON_BOILERPLATE}}` placeholder. `tools/orchestration_runtime.py:_render_launch_prompt_template` replaces `{{COMMON_BOILERPLATE}}` in the step / substep templates with the `text` block body of this section. `{{ACTOR_ROLE}}` is replaced with the role of the agent being launched (`step` or `substep`). The child agent does not Read this file directly.
 
 ```text
-- 起動直後に `skill_ref` を読み、`skill_must_read_refs` と矛盾しない契約で実行すること。
-- 要求定義と判定規則は `docs/` と `spec/` と `skill_must_read_refs` に含まれる当該試行 artifact だけから解釈すること。`tools/` 配下の実装、検証 `script`、test code、validator code から rule を抽出してはならない。
-- `capability_token` は `workspace/orchestrations/<orchestration_id>/capabilities/<agent_run_id>.json` を canonical source とし、起動直後に同 file を読み `capability_token` を抽出して以後の `run-gate` / `guarded-apply-patch` へ渡すこと。
-- `capability_token` が未取得または不一致の場合は処理を開始せず fail で停止すること。
-- `workspace/orchestrations/<orchestration_id>/output_manifests/<agent_run_id>.json` と `workspace/orchestrations/<orchestration_id>/read_manifests/<agent_run_id>.json` は `Read` tool で直接読み取ってよい（`run-gate` 不要）。
-- 上記 2 file の path 以外についての `orchestration-read` は `python3 tools/orchestration_runtime.py run-gate --gate orchestration_read --agent-run-id <agent_run_id> --capability-token <capability_token> --args-json '{"read_path":"..."}'` を唯一の経路として実行し、`orchestration-read` 直呼びを禁止する。
-- `orchestration-read` は `read_manifests/<agent_run_id>.json` を canonical source とし、manifest 外 path を読んではならない。
-- child 実行は `bwrap` sandbox 内でのみ実行すること。非 sandbox 実行を禁止する。
-- 書き込み経路は出力 path の extension で分岐する。`output_manifests/<agent_run_id>.json` を canonical source として参照し、`allowed_output_paths` と `allowed_file_tool_paths` の両 list を起動直後に確認すること。
-- `.json` と `.txt` の出力は `python3 tools/orchestration_runtime.py guarded-apply-patch --repo-root <repo_root> --orchestration-id <orchestration_id> --actor-role {{ACTOR_ROLE}} --agent-run-id <agent_run_id> --paths-json '["..."]' --patch-text '<patch_text>' --capability-token <capability_token>` を唯一の経路として実行し、拒否時は編集を停止すること。
-- `.yaml` / `.yml` / `.md` および source code 等の上記以外の出力は、`output_manifests/<agent_run_id>.json` の `allowed_file_tool_paths` に列挙された path に限り、`Edit` / `Write` tool で直接書き込むこと。
-- `run-gate --gate apply_patch_writes` と `apply-patch-gate` の公開経路としての使用、shell redirection・`tee`・`sed -i`・任意コマンドによる file write、`allowed_output_paths` 外への書き込みは引き続き禁止する。
-- `guarded-apply-patch` と `Edit` / `Write` のいずれも `output_manifests/<agent_run_id>.json` を参照して manifest 外 path を reject する。manifest 外 path へ書いてはならない。
-- 一時ファイルが必要な場合は `/tmp`・`/dev/shm` を直接指定せず、`allowed_tmp_root` の literal path (`workspace/tmp/<agent_run_id>/...`) を直接指定すること。拡張子により書込手段を切り替える: **(a)** `.py` / `.yaml` / `.sh` 等 (非 `.json` / `.txt`) は Bash heredoc 可 (例: `cat > workspace/tmp/<agent_run_id>/work.py <<'EOF'`)、**(b)** `.json` / `.txt` は `Write` tool を使う (Bash heredoc redirect は本ファイルの NG 例 (下記) 参照: hook の file_path parser が一部の quoted 形式で `'\"'` をパスと誤検知して block する場合がある)。`output_manifest_write_guard` は write 対象 path が `allowed_tmp_root` 配下かのみ判定し `$TMPDIR` env を参照しない（`tools/hooks/common.py:_validate_write_access`）。`export TMPDIR=...`、`jq -er ...`、`printenv`、`bash -c '...'` の bootstrap Bash は使用禁止（session sandbox approval 要求で workflow が停止する）。`/tmp/`・`/dev/shm/` のハードコードは引き続き `output_manifest_write_guard` でブロックされる。
-- `gates/<agent_run_id>/` 配下の内部 gate ファイル（`apply_patch_writes.json` 等）は、自身の `agent_run_id` に対応するものであっても直接読んではならない。gate 実行結果の取得は **`run-gate` / `guarded-apply-patch` の stderr** を canonical 経路とし、`2>workspace/tmp/<agent_run_id>/last_gate_stderr.txt` で保存して参照すること（例: `python3 tools/orchestration_runtime.py run-gate --gate ... 2>workspace/tmp/<agent_run_id>/last_gate_stderr.txt`）。`<agent_run_id>` 部分は自身の値を literal 置換すること（`${TMPDIR}` env 参照は contract 上禁止ではないが env 依存を減らすため literal を canonical とする）。失敗時の `violations[]` は stderr に JSON 形式で出力される。要約は `agent.summary.txt` / `step_result.json` を参照すること。他 agent の内部 artifact（`capabilities/`・`output_manifests/`・`read_manifests/`・`access_logs/`・`agents/<other_agent_run_id>/`・`dialogs/` 配下で自身の `agent_run_id` に対応しないファイル）も同様に直接読んではならない。cross-agent read は `rule_source_violation` を発火し phase を fail させる。
-- `python3 -c "..."` や `python3 - <<'EOF'` でファイルへの書き込み（`open(path, 'w'/'a'/'x')`・`Path.write_text`・`shutil.copy*` 等）を行ってはならない。`forbid_python_inline_write` でブロックされる。`.json`/`.txt` は `guarded-apply-patch`、その他は `Edit`/`Write` tool を使うこと。
-- JSON ファイルの内容確認は `Read` tool を使うこと。`python3 -c "import json; ..."` は `forbid_python_inline_write` でブロックされる。Python 処理がどうしても必要な場合のみ `workspace/tmp/<agent_run_id>/x.py` に script を書き `python3 workspace/tmp/<agent_run_id>/x.py` で実行する（`<agent_run_id>` は literal 置換）。
-- UUID 生成は `python3 tools/new_agent_run_id.py` を使うこと。`python3 -c 'import uuid; print(uuid.uuid4())'` は `-S` 等の flag を含めて全て `forbid_python_inline_write` でブロックされる。`cat /proc/sys/kernel/random/uuid` は session sandbox の approval 要求で都度停止するため使用しない。
-- 自身の launch prompt 本文は Agent tool 起動時の入力で渡されている。`launches/<agent_run_id>.prompt.txt` を `Read` で再読する必要はなく、`read_manifest_read_guard` でブロックされる。
-- `tools/`・`tests/`・validator script・hook 実装への `Read`/`grep`/`sed`/`cat` は `forbid_tools_direct_read` でブロックされる。要件と判定規則は `docs/`・`spec/`・`skill_must_read_refs` のみから解釈すること。`guarded-apply-patch` の内部動作（strip 判定等）は `docs/ORCHESTRATION.md` の「Patch 適用契約」と本ファイル末尾「`guarded-apply-patch` の strip について」を canonical 参照先とする。
-- 自身が生成した artifact を参照する際は `output_manifests/<agent_run_id>.json` の `allowed_output_paths` に列挙されたプロジェクトルートからの相対パス（例: `workspace/ir/...`）を使うこと。`/home/<user>/...` 等の絶対パスや `workspace/` 接頭辞を持たないパスを使ってはならない。
-- `orchestration_id`・`agent_run_id`・`node_key`・`step`・`write_roots` 等の orchestration メタデータは `capabilities/<agent_run_id>.json` を canonical source とする。`orchestration_meta.json` は `read_manifest_read_guard` でブロックされる。
-- `skill_name` と `skill_ref` が未指定の場合は fail で停止すること。launch prompt で指定された `skill_ref` の 1 ファイルのみを読み、**自 phase 以外の SKILL.md を追加 Read してはならない**（phase ↔ skill 対応は本ファイル末尾参照）。
-- 入力不足時は推測補完せず fail で停止すること。
-- `workflow_mode=dev` の場合、verify 系判定で `issue_severity=major|critical` を検出した時点で fail 停止すること。
-- `workflow_mode=dev` で fail した場合、`failure_analysis.json` 生成に必要な根拠（失敗理由、関連 output_refs、主要ログ要約）を返答へ含めること。
+- Immediately after launch, read `skill_ref` and execute with a contract not contradicting `skill_must_read_refs`.
+- Interpret the requirement definition and judgment rules only from `docs/`, `spec/`, and the relevant trial's artifacts included in `skill_must_read_refs`. Do not extract rules from the implementation under `tools/`, verification `script`, test code, or validator code.
+- Use `workspace/orchestrations/<orchestration_id>/capabilities/<agent_run_id>.json` as the canonical source for `capability_token`; immediately after launch, read that file, extract `capability_token`, and pass it to subsequent `run-gate` / `guarded-apply-patch`.
+- If `capability_token` is not obtained or mismatched: do not start processing and stop with fail.
+- `workspace/orchestrations/<orchestration_id>/output_manifests/<agent_run_id>.json` and `workspace/orchestrations/<orchestration_id>/read_manifests/<agent_run_id>.json` may be read directly with the `Read` tool (`run-gate` not needed).
+- For an `orchestration-read` of a path other than those 2 files, run `python3 tools/orchestration_runtime.py run-gate --gate orchestration_read --agent-run-id <agent_run_id> --capability-token <capability_token> --args-json '{"read_path":"..."}'` as the only path, and forbid calling `orchestration-read` directly.
+- `orchestration-read` uses `read_manifests/<agent_run_id>.json` as the canonical source, and must not read a path outside the manifest.
+- Run the child only inside the `bwrap` sandbox. Forbid non-sandbox execution.
+- Branch the write path by the output path's extension. Reference `output_manifests/<agent_run_id>.json` as the canonical source, and immediately after launch confirm both the `allowed_output_paths` and `allowed_file_tool_paths` lists.
+- For `.json` and `.txt` output, run `python3 tools/orchestration_runtime.py guarded-apply-patch --repo-root <repo_root> --orchestration-id <orchestration_id> --actor-role {{ACTOR_ROLE}} --agent-run-id <agent_run_id> --paths-json '["..."]' --patch-text '<patch_text>' --capability-token <capability_token>` as the only path, and stop editing on rejection.
+- For output other than the above such as `.yaml` / `.yml` / `.md` and source code, write directly with the `Edit` / `Write` tool only to a path enumerated in the `allowed_file_tool_paths` of `output_manifests/<agent_run_id>.json`.
+- The use of `run-gate --gate apply_patch_writes` and `apply-patch-gate` as a public path, a file write via shell redirection / `tee` / `sed -i` / an arbitrary command, and a write outside `allowed_output_paths` remain forbidden.
+- Both `guarded-apply-patch` and `Edit` / `Write` reference `output_manifests/<agent_run_id>.json` and reject a path outside the manifest. Do not write to a path outside the manifest.
+- When a temporary file is needed, do not specify `/tmp` / `/dev/shm` directly; directly specify the literal path of `allowed_tmp_root` (`workspace/tmp/<agent_run_id>/...`). Switch the write means by extension: **(a)** for `.py` / `.yaml` / `.sh` etc. (non-`.json` / `.txt`), a Bash heredoc is OK (e.g. `cat > workspace/tmp/<agent_run_id>/work.py <<'EOF'`); **(b)** for `.json` / `.txt`, use the `Write` tool (a Bash heredoc redirect is in the NG examples (below) of this file: the hook's file_path parser may, in some quoted forms, mis-detect `'\"'` as a path and block it). `output_manifest_write_guard` judges only whether the write-target path is under `allowed_tmp_root` and does not reference the `$TMPDIR` env (`tools/hooks/common.py:_validate_write_access`). Bootstrap Bash such as `export TMPDIR=...`, `jq -er ...`, `printenv`, `bash -c '...'` is forbidden (the workflow stops on a session-sandbox approval request). Hard-coding `/tmp/` / `/dev/shm/` remains blocked by `output_manifest_write_guard`.
+- The internal gate files under `gates/<agent_run_id>/` (`apply_patch_writes.json` etc.) must not be read directly even if they correspond to your own `agent_run_id`. Use the **stderr of `run-gate` / `guarded-apply-patch`** as the canonical path for obtaining the gate execution result, and save and reference it with `2>workspace/tmp/<agent_run_id>/last_gate_stderr.txt` (e.g. `python3 tools/orchestration_runtime.py run-gate --gate ... 2>workspace/tmp/<agent_run_id>/last_gate_stderr.txt`). Literally substitute your own value for the `<agent_run_id>` part (a `${TMPDIR}` env reference is not forbidden by contract, but to reduce env dependence the literal is canonical). On failure, `violations[]` is output to stderr in JSON form. For a summary, refer to `agent.summary.txt` / `step_result.json`. Another agent's internal artifact (files under `capabilities/` / `output_manifests/` / `read_manifests/` / `access_logs/` / `agents/<other_agent_run_id>/` / `dialogs/` that do not correspond to your own `agent_run_id`) must likewise not be read directly. A cross-agent read fires `rule_source_violation` and fails the phase.
+- Do not write to a file (`open(path, 'w'/'a'/'x')` / `Path.write_text` / `shutil.copy*` etc.) with `python3 -c "..."` or `python3 - <<'EOF'`. It is blocked by `forbid_python_inline_write`. Use `guarded-apply-patch` for `.json`/`.txt`, and the `Edit`/`Write` tool for others.
+- Use the `Read` tool to confirm the content of a JSON file. `python3 -c "import json; ..."` is blocked by `forbid_python_inline_write`. Only when Python processing is truly necessary, write a script to `workspace/tmp/<agent_run_id>/x.py` and run it with `python3 workspace/tmp/<agent_run_id>/x.py` (`<agent_run_id>` is literally substituted).
+- For UUID generation, use `python3 tools/new_agent_run_id.py`. `python3 -c 'import uuid; print(uuid.uuid4())'`, including with flags such as `-S`, is all blocked by `forbid_python_inline_write`. Do not use `cat /proc/sys/kernel/random/uuid` because it stops on a session-sandbox approval request every time.
+- Your own launch prompt body is passed as input at Agent tool launch. There is no need to re-read `launches/<agent_run_id>.prompt.txt` with `Read`, and it is blocked by `read_manifest_read_guard`.
+- A `Read`/`grep`/`sed`/`cat` of `tools/` / `tests/` / a validator script / a hook implementation is blocked by `forbid_tools_direct_read`. Interpret the requirements and judgment rules only from `docs/` / `spec/` / `skill_must_read_refs`. For the internal behavior of `guarded-apply-patch` (strip decision etc.), the canonical references are "Patch application contract" of `docs/ORCHESTRATION.md` and "About the strip of `guarded-apply-patch`" at the end of this file.
+- When referencing an artifact you generated, use the relative path from the project root enumerated in the `allowed_output_paths` of `output_manifests/<agent_run_id>.json` (e.g. `workspace/ir/...`). Do not use an absolute path such as `/home/<user>/...` or a path without the `workspace/` prefix.
+- Use `capabilities/<agent_run_id>.json` as the canonical source for orchestration metadata such as `orchestration_id` / `agent_run_id` / `node_key` / `step` / `write_roots`. `orchestration_meta.json` is blocked by `read_manifest_read_guard`.
+- If `skill_name` and `skill_ref` are unspecified, stop with fail. Read only the single file `skill_ref` specified in the launch prompt, and **do not additionally Read a SKILL.md of any phase other than your own** (for the phase ↔ skill mapping, see the end of this file).
+- On input shortage, do not complete by guessing; stop with fail.
+- With `workflow_mode=dev`, stop with fail the moment `issue_severity=major|critical` is detected in a verify-family judgment.
+- When it fails with `workflow_mode=dev`, include in the reply the basis needed to generate `failure_analysis.json` (the failure reason, related output_refs, a summary of the main logs).
 ```
 
-## `step agent` 起動要求テンプレート
+## `step agent` launch request template
 
 ```text
-あなたは step agent である。
-対象 node_key: <node_key>
-対象 step: <step>
+You are a step agent.
+Target node_key: <node_key>
+Target step: <step>
 orchestration_id: <orchestration_id>
 agent_run_id: <agent_run_id>
 parent_agent_run_id: <parent_agent_run_id>
@@ -58,28 +58,28 @@ repair_strategy: <repair_strategy>
 repair_target_agent_run_id: <repair_target_agent_run_id>
 repair_reason: <repair_reason>
 
-**tmp area (literal path で参照)**: `allowed_tmp_root` は `workspace/tmp/<agent_run_id>/` 固定 (`output_manifests/<agent_run_id>.json` の同名フィールドに記録済み)。一時ファイルは当該 literal path 配下を `cat > workspace/tmp/<agent_run_id>/...` のように直接指定する。`output_manifest_write_guard` は path のみ判定し `$TMPDIR` env を参照しない。`export TMPDIR=...`、`jq -er ...`、`printenv`、`bash -c '...'` の bootstrap Bash を呼んではならない (Claude Code session sandbox の approval 要求で workflow が停止する根本原因)。canonical path（`workspace/pipelines/...`、`workspace/ir/...`、`lineage.json` 等）への直接書き込みは、`Edit`/`Write` tool で `allowed_file_tool_paths` に登録済みのものに限る。それ以外は `guarded-apply-patch` を必須とし、Bash heredoc で canonical path に書くと `enforce_guarded_apply_patch` でブロックされる。
+**tmp area (reference by literal path)**: `allowed_tmp_root` is fixed at `workspace/tmp/<agent_run_id>/` (already recorded in the same-named field of `output_manifests/<agent_run_id>.json`). For a temporary file, directly specify under that literal path like `cat > workspace/tmp/<agent_run_id>/...`. `output_manifest_write_guard` judges only the path and does not reference the `$TMPDIR` env. Do not call bootstrap Bash such as `export TMPDIR=...`, `jq -er ...`, `printenv`, `bash -c '...'` (the root cause of the workflow stopping on a Claude Code session-sandbox approval request). A direct write to a canonical path (`workspace/pipelines/...`, `workspace/ir/...`, `lineage.json` etc.) is limited to those registered in `allowed_file_tool_paths` via the `Edit`/`Write` tool. Otherwise `guarded-apply-patch` is required, and writing to a canonical path with a Bash heredoc is blocked by `enforce_guarded_apply_patch`.
 
-必須要件:
-- **自身の launch prompt 本文 (`launches/<agent_run_id>.prompt.txt`) を `Read` で読んではならない。** prompt は `Agent` tool の入力として既に渡されているため再読不要であり、当該 path は `read_manifest_read_guard` で fail-closed にブロックされる。`launches/<agent_run_id>.prompt.txt` は audit / replay 用途で `Agent` tool に渡された原文を 1 対 1 保存する canonical artifact である。
-- あなたは phase artifacts を直接生成する担当である。
-- この step は標準 substep を持たない phase である。自身で step 契約を完了させること。
+Required requirements:
+- **Do not `Read` your own launch prompt body (`launches/<agent_run_id>.prompt.txt`).** Because the prompt is already passed as the input of the `Agent` tool, re-reading is unnecessary, and that path is blocked fail-closed by `read_manifest_read_guard`. `launches/<agent_run_id>.prompt.txt` is the canonical artifact that stores, 1-to-1, the original text passed to the `Agent` tool for audit / replay use.
+- You are responsible for directly generating phase artifacts.
+- This step is a phase with no standard substep. Complete the step contract yourself.
 {{COMMON_BOILERPLATE}}
-- `Compile` の場合、直下依存 `node` の `direct dependency compile readiness` を満たさない限り開始してはならない。
-- `Compile` の `ir_meta.json` 更新時は `attempt_count` と `verification_status` と `last_fail_reason` と `debug_mode` と `context_isolated` を必須記録し、`context_isolated=false` の場合は `constraint_reason` を必須記録すること。
-- `Generate` / `Build` / `Validate` の場合、直下依存 `node` の `direct dependency execution readiness` を満たさない限り開始してはならない。
-- 直下依存 `node` が未完了でも、依存先 code を自身の `src/` へ内包して代替してはならない。
-- 完了後は required_outputs と failed_substeps と substep_agent_run_ids を親へ返すこと。
-- 完了返答には `launch_reply` として、実施内容と判定結果を平文で含めること。
+- For `Compile`, do not start unless the immediate dependency `node` satisfies `direct dependency compile readiness`.
+- When updating `ir_meta.json` of `Compile`, record `attempt_count`, `verification_status`, `last_fail_reason`, `debug_mode`, and `context_isolated` as required, and when `context_isolated=false`, record `constraint_reason` as required.
+- For `Generate` / `Build` / `Validate`, do not start unless the immediate dependency `node` satisfies `direct dependency execution readiness`.
+- Even if the immediate dependency `node` is incomplete, do not substitute by embedding the dependency's code into your own `src/`.
+- After completion, return required_outputs, failed_substeps, and substep_agent_run_ids to the parent.
+- The completion reply must include, as `launch_reply`, the actions performed and the judgment result in plain text.
 ```
 
-## `substep agent` 起動要求テンプレート
+## `substep agent` launch request template
 
 ```text
-あなたは substep agent である。
-対象 node_key: <node_key>
-対象 step: <step>
-対象 substep: <substep>
+You are a substep agent.
+Target node_key: <node_key>
+Target step: <step>
+Target substep: <substep>
 orchestration_id: <orchestration_id>
 agent_run_id: <agent_run_id>
 parent_agent_run_id: <parent_agent_run_id>
@@ -95,91 +95,91 @@ repair_strategy: <repair_strategy>
 repair_target_agent_run_id: <repair_target_agent_run_id>
 repair_reason: <repair_reason>
 
-**tmp area (literal path で参照)**: `allowed_tmp_root` は `workspace/tmp/<agent_run_id>/` 固定 (`output_manifests/<agent_run_id>.json` の同名フィールドに記録済み)。一時ファイルは当該 literal path 配下を `cat > workspace/tmp/<agent_run_id>/...` のように直接指定する。`output_manifest_write_guard` は path のみ判定し `$TMPDIR` env を参照しない。`export TMPDIR=...`、`jq -er ...`、`printenv`、`bash -c '...'` の bootstrap Bash を呼んではならない (Claude Code session sandbox の approval 要求で workflow が停止する根本原因)。canonical path（`workspace/pipelines/...`、`workspace/ir/...`、`lineage.json` 等）への直接書き込みは、`Edit`/`Write` tool で `allowed_file_tool_paths` に登録済みのものに限る。それ以外は `guarded-apply-patch` を必須とし、Bash heredoc で canonical path に書くと `enforce_guarded_apply_patch` でブロックされる。
+**tmp area (reference by literal path)**: `allowed_tmp_root` is fixed at `workspace/tmp/<agent_run_id>/` (already recorded in the same-named field of `output_manifests/<agent_run_id>.json`). For a temporary file, directly specify under that literal path like `cat > workspace/tmp/<agent_run_id>/...`. `output_manifest_write_guard` judges only the path and does not reference the `$TMPDIR` env. Do not call bootstrap Bash such as `export TMPDIR=...`, `jq -er ...`, `printenv`, `bash -c '...'` (the root cause of the workflow stopping on a Claude Code session-sandbox approval request). A direct write to a canonical path (`workspace/pipelines/...`, `workspace/ir/...`, `lineage.json` etc.) is limited to those registered in `allowed_file_tool_paths` via the `Edit`/`Write` tool. Otherwise `guarded-apply-patch` is required, and writing to a canonical path with a Bash heredoc is blocked by `enforce_guarded_apply_patch`.
 
-必須要件:
-- **自身の launch prompt 本文 (`launches/<agent_run_id>.prompt.txt`) を `Read` で読んではならない。** prompt は `Agent` tool の入力として既に渡されているため再読不要であり、当該 path は `read_manifest_read_guard` で fail-closed にブロックされる。`launches/<agent_run_id>.prompt.txt` は audit / replay 用途で `Agent` tool に渡された原文を 1 対 1 保存する canonical artifact である。
-- 契約された入力だけを読むこと。
-- 契約された artifacts だけを書くこと。
-- expected output と保存先を守ること。
+Required requirements:
+- **Do not `Read` your own launch prompt body (`launches/<agent_run_id>.prompt.txt`).** Because the prompt is already passed as the input of the `Agent` tool, re-reading is unnecessary, and that path is blocked fail-closed by `read_manifest_read_guard`. `launches/<agent_run_id>.prompt.txt` is the canonical artifact that stores, 1-to-1, the original text passed to the `Agent` tool for audit / replay use.
+- Read only the contracted input.
+- Write only the contracted artifacts.
+- Observe the expected output and storage location.
 {{COMMON_BOILERPLATE}}
-- `Compile` の substep は、直下依存 `node` の `direct dependency compile readiness` を満たさない限り開始してはならない。
-- `Compile` の `ir_meta.json` 更新時は `attempt_count` と `verification_status` と `last_fail_reason` と `debug_mode` と `context_isolated` を必須記録し、`context_isolated=false` の場合は `constraint_reason` を必須記録すること。
-- `Generate` / `Build` / `Validate` の substep は、直下依存 `node` の `direct dependency execution readiness` を満たさない限り開始してはならない。
-- 直下依存 `node` が未完了でも、依存先 code を対象 `node` の `src/` へ内包して代替してはならない。
-- **MCP 副次出力の `mcp_command_log.jsonl` を必ず `allowed_output_paths` に含めること**。canonical placement は phase ごとに以下:
-  - Generate substep: `<pipeline_ref>/source/<source_id>/src/mcp_command_log.jsonl` (run_linter)。**この auto-inject と `run_linter` 副次出力は `generate.generate` substep のみ**に対応する。`generate.verify` substep の `allowed_output_paths` は `run_linter` 副次出力 (`mcp_command_log.jsonl`) を authorize しないため、verify launch prompt に `run_linter` 実行を記載してはならない (verify が記載してよい `validate_pipeline_semantics --stage` は下記「substep ↔ allowed validator gate 対応表」のとおり `post_generate` のみ; read-only の `validate_workspace_root.py` は別途許可)。
+- A `Compile` substep must not start unless the immediate dependency `node` satisfies `direct dependency compile readiness`.
+- When updating `ir_meta.json` of `Compile`, record `attempt_count`, `verification_status`, `last_fail_reason`, `debug_mode`, and `context_isolated` as required, and when `context_isolated=false`, record `constraint_reason` as required.
+- A `Generate` / `Build` / `Validate` substep must not start unless the immediate dependency `node` satisfies `direct dependency execution readiness`.
+- Even if the immediate dependency `node` is incomplete, do not substitute by embedding the dependency's code into the target `node`'s `src/`.
+- **Always include the MCP side output `mcp_command_log.jsonl` in `allowed_output_paths`.** The canonical placement per phase is the following:
+  - Generate substep: `<pipeline_ref>/source/<source_id>/src/mcp_command_log.jsonl` (run_linter). **This auto-inject and the `run_linter` side output correspond only to the `generate.generate` substep**. Because the `allowed_output_paths` of the `generate.verify` substep does not authorize the `run_linter` side output (`mcp_command_log.jsonl`), do not write `run_linter` execution in the verify launch prompt (the `validate_pipeline_semantics --stage` the verify may write is only `post_generate` as in the "substep ↔ allowed validator gate correspondence table" below; the read-only `validate_workspace_root.py` is separately permitted).
   - Build step (in-phase, CMake/Meson out-of-source): `<pipeline_ref>/binary/<binary_id>/mcp_command_log.jsonl` (compile_project, project_dir=<binary_id>/)
-  - Build step (cross-phase, Make in-source for Fortran/C-family): `<pipeline_ref>/source/<source_id>/src/mcp_command_log.jsonl` (compile_project, project_dir=<gen>/src/)。launch request の `source_id` で bind され、`record-launch` が `source_meta.json` の `verification_status=pass` を検証する
-  - Validate.execute substep (in-phase): `<pipeline_ref>/runs/<run_id>/<node_key_safe>/mcp_command_log.jsonl` (run_program 等)
-  - Validate.execute substep (cross-phase quality_check): `<pipeline_ref>/source/<source_id>/src/mcp_command_log.jsonl` (`skills/workflow-validate-execute/SKILL.md` L20 — `toolchain.build_system=make` + Fortran/C-family では `run_quality_checks` を `project_dir=source/<source_id>/src/` で実行するため、log は generate ツリーに副次出力される)。Validate.execute substep の launch request に `source_id` を含めると runtime が cross-phase canonical placement を auto-inject し、phase contract と write_roots check を bypass する。`source_id` は `<pipeline_ref>/source/<source_id>/source_meta.json` の存在で検証され、未知の source_id (実際の generate 実行に対応しない値) を渡すと `record-launch` が `ValueError` で reject する (任意 caller による cross-phase write authorization injection 防止)。
+  - Build step (cross-phase, Make in-source for Fortran/C-family): `<pipeline_ref>/source/<source_id>/src/mcp_command_log.jsonl` (compile_project, project_dir=<gen>/src/). Bound by the `source_id` of the launch request, and `record-launch` verifies `verification_status=pass` of `source_meta.json`
+  - Validate.execute substep (in-phase): `<pipeline_ref>/runs/<run_id>/<node_key_safe>/mcp_command_log.jsonl` (run_program etc.)
+  - Validate.execute substep (cross-phase quality_check): `<pipeline_ref>/source/<source_id>/src/mcp_command_log.jsonl` (`skills/workflow-validate-execute/SKILL.md` L20 — with `toolchain.build_system=make` + Fortran/C-family, `run_quality_checks` runs with `project_dir=source/<source_id>/src/`, so the log is side-output into the generate tree). When `source_id` is included in the launch request of the Validate.execute substep, the runtime auto-injects the cross-phase canonical placement and bypasses the phase contract and write_roots check. `source_id` is verified by the existence of `<pipeline_ref>/source/<source_id>/source_meta.json`, and passing an unknown source_id (a value not corresponding to an actual generate execution) makes `record-launch` reject with a `ValueError` (prevention of cross-phase write authorization injection by an arbitrary caller).
 
-  さらに、`validate_pipeline_semantics.py` は MCP tool 実行証跡として trust する全 `command_log_ref` を canonical placement のみに制限する:
+  In addition, `validate_pipeline_semantics.py` restricts all `command_log_ref` it trusts as MCP tool execution evidence to only the canonical placement:
   - `lint_command_ref.run_linter[].command_log_ref`: `<gen_dir>/src/mcp_command_log.jsonl`
   - `source_command_ref.<run_program-key>.command_log_ref`: `<execute node_dir>/mcp_command_log.jsonl` (sibling of trial_meta)
-  - `source_command_ref.run_quality_checks.command_log_ref`: `<pipeline_ref>/generate/<source_source_id>/src/mcp_command_log.jsonl` — `trial_meta.source_source_id` で **単一の gen_id にのみ bind** される。同 pipeline の sibling/older generation の canonical placement は受理しない。
+  - `source_command_ref.run_quality_checks.command_log_ref`: `<pipeline_ref>/generate/<source_source_id>/src/mcp_command_log.jsonl` — bound to **only the single gen_id** by `trial_meta.source_source_id`. The canonical placement of a sibling/older generation of the same pipeline is not accepted.
 
-  非 canonical path への placement (例: `<execute>/raw/forged.jsonl`) は post_generate / post_execute gate が reject する (forge MCP execution evidence の防止)。
+  A placement to a non-canonical path (e.g. `<execute>/raw/forged.jsonl`) is rejected by the post_generate / post_execute gate (prevention of forged MCP execution evidence).
 
-  さらに `_validate_trial_meta` は `source_command_ref` の各 entry が指す log record に **recognized MCP `tool_name`** (`run_program` / `run_quality_checks`) が含まれることを必須とする。`compile_project` は build phase の道具で execute trial_meta では受理しない。`tool_name` 欠落 / 未知の値の forge record は reject される (tool-specific validator が silent skip する経路を遮断)。
+  Furthermore, `_validate_trial_meta` requires that the log record each entry of `source_command_ref` points to include a **recognized MCP `tool_name`** (`run_program` / `run_quality_checks`). `compile_project` is a build-phase tool and is not accepted in the execute trial_meta. A forge record with a missing / unknown `tool_name` is rejected (blocking the path where a tool-specific validator silently skips).
 
-  Validate.execute substep の cross-phase canonical 配置は launch request の `source_id` フィールドにのみ bind される。`allowed_output_paths` に `<pipeline_ref>/generate/<other_gen>/src/...` (request の `source_id` と異なる generation) を含めると phase contract が reject する。Trial_meta 側でも `source_source_id` を必須記録とし、execute と generate の bind を確定させる。
+  The cross-phase canonical placement of the Validate.execute substep is bound only to the `source_id` field of the launch request. Including `<pipeline_ref>/generate/<other_gen>/src/...` (a generation different from the request's `source_id`) in `allowed_output_paths` is rejected by the phase contract. On the trial_meta side too, `source_source_id` is a required record, fixing the bind between execute and generate.
 
-  **単一 namespace 強制:** generate / build / validate step (Validate.execute substep) の `allowed_output_paths` は単一の `<source_id>` / `<binary_id>` / `<run_id>` のみを target としなければならない。同 pipeline 配下に複数 id を混在 listing すると `record-launch` が `ValueError` で reject する (sibling/older run の audit log への write authority 付与を防止)。Generate / Validate.execute では追加で request の `source_id` / `run_id` と listed paths の id が一致することを要求する (mismatch は `does not match request ...id` で reject)。
+  **Single-namespace enforcement:** the `allowed_output_paths` of a generate / build / validate step (Validate.execute substep) must target only a single `<source_id>` / `<binary_id>` / `<run_id>`. Mixing and listing multiple ids under the same pipeline makes `record-launch` reject with a `ValueError` (prevention of granting write authority to the audit log of a sibling/older run). For Generate / Validate.execute, it additionally requires that the request's `source_id` / `run_id` matches the ids of the listed paths (a mismatch is rejected with `does not match request ...id`).
 
-  **`run_id` の canonical 形式 (Validate execute/judge):** `run_id` は id 一族で唯一 **固定 literal `run_` prefix** を持ち、形式は `run_<YYYYMMDD>_<seq3>` (例: `run_20260605_001`)。`ir_id` / `pipeline_id` の `<slug>_<YYYYMMDD>_<seq3>` 形式 (slug はハイフン区切り) を **流用してはならない** — 例えば `run-rsn-p0_20260605_001` は slug 形式 (slug=`run-rsn-p0`) には合致するが canonical `run_id` ではなく、`record-launch` の phase contract が `outside phase contract` で reject する。仮に通過しても Validate `post_execute` の run 発見は literal `run_` layout のみ認識し `no execution artifacts found` で silent fail する。良例 `run_20260605_001` ✓ / 悪例 `run-rsn-p0_20260605_001` ✗。
+  **Canonical form of `run_id` (Validate execute/judge):** `run_id` is the only one in the id family with a **fixed literal `run_` prefix**, in the form `run_<YYYYMMDD>_<seq3>` (e.g. `run_20260605_001`). The `<slug>_<YYYYMMDD>_<seq3>` form of `ir_id` / `pipeline_id` (slug being hyphen-separated) **must not be reused** — for example `run-rsn-p0_20260605_001` matches the slug form (slug=`run-rsn-p0`) but is not a canonical `run_id`, and the phase contract of `record-launch` rejects it with `outside phase contract`. Even if it passed, the run discovery of Validate `post_execute` recognizes only the literal `run_` layout and silently fails with `no execution artifacts found`. Good example `run_20260605_001` ✓ / bad example `run-rsn-p0_20260605_001` ✗.
 
-  **Quality_check stale-generation 対策:** `trial_meta.source_source_id` が指す `source_meta.json` は `verification_status=pass` でなければならない。失敗 / 古い generation を quality_check evidence として参照すると post_execute validator が reject する。さらに **`record-launch` も** `verification_status` を check し、failed generation 配下の MCP audit log に対する write authority 付与を launch 時点で reject する (failed gen tree の provenance contamination 防止)。
+  **Quality_check stale-generation countermeasure:** the `source_meta.json` that `trial_meta.source_source_id` points to must have `verification_status=pass`. Referencing a failed / old generation as quality_check evidence is rejected by the post_execute validator. Furthermore, **`record-launch` also** checks `verification_status` and rejects, at launch time, granting write authority to the MCP audit log under a failed generation (prevention of provenance contamination of a failed gen tree).
 
-  **Build lineage bind (specific build):** Validate.execute substep の launch request は `source_binary_id` を必須記録とし、`<pipeline>/binary/<source_binary_id>/binary_meta.json` の `source_source_id` と request の `source_id` が一致しなければならない。`source_binary_id` 欠落、binary_meta.json 不在、`source_source_id` 未記録、または値の mismatch は record_launch が reject する。これにより mixed-build forge (build A の binary を実行しながら build B の quality_check evidence を流用) を防止。Build step は `binary_meta.json` に `source_source_id` を必須記録 (`skills/workflow-build/SKILL.md` 参照)。
+  **Build lineage bind (specific build):** the launch request of the Validate.execute substep requires recording `source_binary_id`, and the `source_source_id` of `<pipeline>/binary/<source_binary_id>/binary_meta.json` must match the request's `source_id`. A missing `source_binary_id`, an absent binary_meta.json, an unrecorded `source_source_id`, or a value mismatch is rejected by record_launch. This prevents a mixed-build forge (reusing the quality_check evidence of build B while running the binary of build A). The Build step records `source_source_id` in `binary_meta.json` as required (see `skills/workflow-build/SKILL.md`).
 
-  **Cross-phase auto-inject の Make-only ゲート:** `<pipeline>/source/<source_id>/src/mcp_command_log.jsonl` への cross-phase write authority は `toolchain.build_system=make` (Fortran/C-family in-source build) のときのみ auto-inject される。CMake/Meson/Ninja 等の out-of-source toolchain では cross-phase は注入されず、build/execute の log は in-phase canonical (`<binary_id>/mcp_command_log.jsonl` または `<exec_id>/<node_key_safe>/mcp_command_log.jsonl`) のみ許可される。`record-launch` は `spec.ir.yaml.impl_defaults` の `toolchain.build_system` を読んで自動判定する。
+  **Make-only gate of cross-phase auto-inject:** the cross-phase write authority to `<pipeline>/source/<source_id>/src/mcp_command_log.jsonl` is auto-injected only when `toolchain.build_system=make` (a Fortran/C-family in-source build). For an out-of-source toolchain such as CMake/Meson/Ninja, cross-phase is not injected, and the build/execute log allows only the in-phase canonical (`<binary_id>/mcp_command_log.jsonl` or `<exec_id>/<node_key_safe>/mcp_command_log.jsonl`). `record-launch` reads `toolchain.build_system` of `spec.ir.yaml.impl_defaults` and judges automatically.
 
-  **Make build の out-of-source dir override (`build_system=make`):** in-source Make の `compile_project`/`run_quality_checks` は `project_dir=<pipeline>/source/<source_id>/src/` で実行されるが、build artifact を `src/` に出すと Build/Validate capability write_root (Build=`binary/` のみ、Validate.execute=`runs/` のみ) の外となり `unauthorized_write_violation` → `fail_closed` になる。生成 `src/Makefile` は `OBJDIR ?= .` / `BINDIR ?= .` / `RUNDIR ?= .` でパラメタライズ済み（[workflow-generate-generate](../../workflow-generate-generate/SKILL.md)）なので、launch 時に絶対 path の override を渡して artifact を write_root 内へ誘導する:
-  - **Build step:** `compile_project extra_args=["OBJDIR=<repo_abs>/workspace/tmp/<build_agent_run_id>/build", "BINDIR=<repo_abs>/<pipeline_ref>/binary/<binary_id>/bin"]`。object/`.mod` は per-run tmp (`workspace/tmp/<agent_run_id>/` — auto-authorize + 成功時 auto-clean) へ、実行 binary は `binary/<binary_id>/bin/` へ落ちる。`allowed_output_paths` に実行 binary `<pipeline_ref>/binary/<binary_id>/bin/<exe>` を **file 形式**で含める（`/bin/` を含むため build phase contract を通り、auto-derive で `allowed_file_tool_paths`→`_exact_declared_set` に入り terminal validation で authorize される）。`allowed_file_tool_paths` は明示せず auto-derive に委ねる（明示する場合は当該 exe path を必ず含める）。`binary_meta.json#binary_artifact_ref` は `binary/<binary_id>/bin/<exe>` を指す。
-  - **Validate.execute substep:** `run_quality_checks env={"OBJDIR":"<repo_abs>/workspace/tmp/<exec_agent_run_id>/build", "BINDIR":"<repo_abs>/<pipeline_ref>/binary/<source_binary_id>/bin", "RUNDIR":"<repo_abs>/workspace/tmp/<exec_agent_run_id>/qc_run"}`（`run_quality_checks` は固定コマンドだが `env` を make へ伝播する）。`binary/`・`source/` は read-only bind のため `make test` は relink せず（Makefile guard で既存 binary 参照）、`make test` の binary 再実行が吐く `diagnostics.json` / `raw/*` は tmp（`workspace/tmp/<exec_agent_run_id>/qc_run`、`run_program` の `run/` とは別 subdir）配下に閉じる。`RUNDIR` を canonical run node dir に向けると binary 直書きが gate-authored copy を上書きし `unauthorized_write_violation` → `fail_closed` を招くため、必ず tmp へ向ける（詳細は下記「Validate.execute の program output routing — binary 直書き禁止」）。全 canonical `.json` は `run_program` と `run_quality_checks` の両方完了後に agent が `guarded-apply-patch` で再 author する（最終 step）。`src/` への write は cross-phase audit log のみ。
+  **Out-of-source dir override of a Make build (`build_system=make`):** the in-source Make's `compile_project`/`run_quality_checks` runs with `project_dir=<pipeline>/source/<source_id>/src/`, but emitting build artifacts to `src/` is outside the Build/Validate capability write_root (Build=`binary/` only, Validate.execute=`runs/` only) and becomes an `unauthorized_write_violation` → `fail_closed`. Because the generated `src/Makefile` is already parameterized with `OBJDIR ?= .` / `BINDIR ?= .` / `RUNDIR ?= .` ([workflow-generate-generate](../../workflow-generate-generate/SKILL.md)), pass an absolute-path override at launch to route artifacts into the write_root:
+  - **Build step:** `compile_project extra_args=["OBJDIR=<repo_abs>/workspace/tmp/<build_agent_run_id>/build", "BINDIR=<repo_abs>/<pipeline_ref>/binary/<binary_id>/bin"]`. object/`.mod` land in a per-run tmp (`workspace/tmp/<agent_run_id>/` — auto-authorize + auto-clean on success), and the execution binary lands in `binary/<binary_id>/bin/`. Include the execution binary `<pipeline_ref>/binary/<binary_id>/bin/<exe>` in `allowed_output_paths` in **file form** (because it contains `/bin/`, it passes the build phase contract, and by auto-derive enters `allowed_file_tool_paths`→`_exact_declared_set` and is authorized in terminal validation). Do not make `allowed_file_tool_paths` explicit and leave it to auto-derive (if made explicit, always include that exe path). `binary_meta.json#binary_artifact_ref` points to `binary/<binary_id>/bin/<exe>`.
+  - **Validate.execute substep:** `run_quality_checks env={"OBJDIR":"<repo_abs>/workspace/tmp/<exec_agent_run_id>/build", "BINDIR":"<repo_abs>/<pipeline_ref>/binary/<source_binary_id>/bin", "RUNDIR":"<repo_abs>/workspace/tmp/<exec_agent_run_id>/qc_run"}` (`run_quality_checks` is a fixed command but propagates `env` to make). Because `binary/` and `source/` are read-only-bound, `make test` does not relink (it references the existing binary via the Makefile guard), and the `diagnostics.json` / `raw/*` emitted by the `make test` binary re-run are confined under tmp (`workspace/tmp/<exec_agent_run_id>/qc_run`, a separate subdir from `run_program`'s `run/`). Pointing `RUNDIR` at the canonical run node dir would have the direct binary write overwrite the gate-authored copy and invite an `unauthorized_write_violation` → `fail_closed`, so always point it at tmp (for details see "Validate.execute program output routing — direct binary write forbidden" below). All canonical `.json` is re-authored by the agent with `guarded-apply-patch` after both `run_program` and `run_quality_checks` complete (the final step). The only write to `src/` is the cross-phase audit log.
 
-  **`ok=true` requirement for execute evidence:** post_execute validator は `run_program` / `run_quality_checks` record の `ok=true` を必須要求する。`ok=false` または `ok` 欠落の record は失敗実行とみなし、tool-execution evidence として認めない (lint validator と同じポリシー)。
+  **`ok=true` requirement for execute evidence:** the post_execute validator requires `ok=true` in the `run_program` / `run_quality_checks` record. A record with `ok=false` or a missing `ok` is regarded as a failed execution and is not accepted as tool-execution evidence (the same policy as the lint validator).
 
-  **Role binding for source_command_ref:** Validate.execute trial_meta の `source_command_ref` 各 entry は `tool_name` フィールド (= `run_program` または `run_quality_checks`) を宣言し、log record の `tool_name` と一致しなければならない。`compile_project` は build phase 専用で validate trial_meta では受理しない。trial_meta は最低 1 つ `tool_name='run_program'` entry を含むことが必須 (実プログラム実行証跡)。role mismatch (例: run_program slot に compile_project record) は forge とみなし reject される。
+  **Role binding for source_command_ref:** each entry of `source_command_ref` of the Validate.execute trial_meta declares the `tool_name` field (= `run_program` or `run_quality_checks`), and it must match the `tool_name` of the log record. `compile_project` is build-phase-only and is not accepted in the validate trial_meta. The trial_meta must include at least 1 `tool_name='run_program'` entry (the actual program-execution evidence). A role mismatch (e.g. a compile_project record in the run_program slot) is regarded as a forge and rejected.
 
-  **Run_program log canonical placement (MCP gate enforcement):** `validate_mcp_build_tool_invocation` (MCP server pre-call gate) は `tool_name=run_program` かつ `step=execute` の呼び出しで log placement を canonical (`<pipeline_ref>/runs/<run_id>/<node_key_safe>/mcp_command_log.jsonl`) のみに強制する。`project_dir` を execute node_dir に設定するか、`command_log_path` 引数で canonical absolute/relative path を明示すること。非 canonical 配置は MCP 呼び出し時点で `RuntimeError` で reject され、後の post_execute validator まで遅延しない。
+  **Run_program log canonical placement (MCP gate enforcement):** `validate_mcp_build_tool_invocation` (the MCP server pre-call gate) enforces the log placement to only the canonical (`<pipeline_ref>/runs/<run_id>/<node_key_safe>/mcp_command_log.jsonl`) for a call with `tool_name=run_program` and `step=execute`. Set `project_dir` to the execute node_dir, or make the canonical absolute/relative path explicit with the `command_log_path` argument. A non-canonical placement is rejected with a `RuntimeError` at MCP call time, not delayed to the later post_execute validator.
 
-  **Validate.execute の program output (`diagnostics.json`/`perf.json`) routing — binary 直書き禁止:** `mcp_command_log.jsonl` は **MCP-owned audit log** で canonical 直書きが許可される (上記 trust model)。一方 `diagnostics.json` / `perf.json` は `run_program` が実行する **binary (runner) のプログラム出力**であり、canonical `.json` として **`guarded-apply-patch` の gate evidence を必須**とする。binary は gate を経由できないため、canonical run dir (`<pipeline_ref>/runs/<run_id>/<node_key_safe>/`) へ直書きさせると終端 `record-agent-run` の baseline-diff が `unauthorized_write_violation` を検出し `fail_closed` になる (`mcp_owned_audit_logs` に登録されない `.json` は MCP-owned として tolerate されない)。launch は次の routing を指定すること:
-  - **binary 出力先を tmp に向ける:** `run_program` の `project_dir` (= binary の cwd) または case の出力先を `allowed_tmp_root` (`workspace/tmp/<exec_agent_run_id>/run/`) にし、binary は `diagnostics.json` / `perf.json` / raw / logs を **tmp (auto-authorize)** へ落とす。**`run_quality_checks` (`make test`) も同様**: `env.RUNDIR` を `workspace/tmp/<exec_agent_run_id>/qc_run` (run_program の `run/` とは別 subdir) へ向け、`make test` の binary 再実行が吐く `diagnostics.json` / `raw/*` も tmp へ閉じる。`RUNDIR` を canonical run node dir に向けると、`run_program` 後に再 author 済みの gate-authored copy を `make test` の binary 直書きが上書きし `unauthorized_write_violation` を招く (典型 ordering defect)。
-  - **command_log_path は canonical を明示:** `project_dir` を tmp にすると MCP log も tmp へ落ちてしまうため、`command_log_path` 引数で `<repo_abs>/<pipeline_ref>/runs/<run_id>/<node_key_safe>/mcp_command_log.jsonl` を明示し、上記「Run_program log canonical placement」gate を満たす。
-  - **agent が canonical `.json` を再 author (最終 step):** execute agent が **`run/` tmp tree** (`workspace/tmp/<exec_agent_run_id>/run/`、= `spec.ir.yaml.case` を引数とする `run_program` 実行の出力) の `diagnostics.json` / `perf.json` / `raw/*` を `Read` し、canonical `runs/<run_id>/<node_key_safe>/diagnostics.json` / `perf.json` / `raw/metrics_basis.json` / `raw/state_snapshots/*` を **`guarded-apply-patch` (create-form)** で再 author する。**runner のプログラム出力 (`diagnostics.json` / `perf.json` / `raw/metrics_basis.json` / `raw/state_snapshots/*`) は必ず `run/` から promote し、`qc_run/` (make test 再実行の出力) から promote してはならない** — `qc_run/` を promote すると canonical 証跡が required `run_program` invocation (`spec.ir.yaml.case` とその `command_log`) に対応せず、`Validate.judge` が provenance 不一致の証跡を消費する。`qc_run/` の出力は quality-check 比較 (`quality_check.json` の verdict 算出) のためにのみ参照する。`trial_meta.json` と `quality_check.json` は **runner 出力ではなく agent が author するメタデータ** (`trial_meta.json` は MCP command refs / `source_source_id` / `source_command_ref` から構成、`quality_check.json` は比較結果から構成。runner は両 file を直接出力してはならない) であり、tmp からの promote ではなく `guarded-apply-patch` で生成する。**再 author は `run_program` と `run_quality_checks` の両方完了後の最終 step** とし、後続の binary 再実行が gate-authored copy を上書きしない順序を保証する (run_program 後に author してから make test を canonical RUNDIR で走らせる ordering は上書き defect となる)。
-  - **raw `.json` は guarded-apply-patch / raw 非-`.json` と log は Write tool:** `raw/` 配下の `.json` (`metrics_basis.json` / `state_snapshots/*.json` 等) **も canonical `.json` であり `guarded-apply-patch` で再 author する** (上記「agent が canonical `.json` を再 author」の対象に含む)。`Write` tool で書くのは `raw/` 配下の**非 `.json`** ファイル・`stdout.log`・`stderr.log` に限り、`allowed_file_tool_paths` 内 path へ書く (`allowed_output_paths` に当該 path を file 形式で含めれば auto-derive される)。raw `.json` を `Write` tool で書くと `enforce_guarded_apply_patch` で reject され、仮に書けても `record-agent-run` が gate evidence 欠落で `unauthorized_write_violation` を検出する。
-  この区別 (MCP-owned log は canonical 直書き可 / program output `.json` は tmp 経由 + 再 author 必須) を Validate.execute launch prompt に明記すること。
+  **Validate.execute program output (`diagnostics.json`/`perf.json`) routing — direct binary write forbidden:** `mcp_command_log.jsonl` is an **MCP-owned audit log** for which a canonical direct write is permitted (the trust model above). On the other hand, `diagnostics.json` / `perf.json` are the **program output of the binary (runner)** that `run_program` runs, and as canonical `.json` they **require the gate evidence of `guarded-apply-patch`**. Because the binary cannot go through a gate, having it write directly to the canonical run dir (`<pipeline_ref>/runs/<run_id>/<node_key_safe>/`) makes the terminal `record-agent-run`'s baseline-diff detect an `unauthorized_write_violation` and become `fail_closed` (a `.json` not registered in `mcp_owned_audit_logs` is not tolerated as MCP-owned). The launch specifies the following routing:
+  - **Point the binary output destination at tmp:** make `run_program`'s `project_dir` (= the binary's cwd) or the case's output destination `allowed_tmp_root` (`workspace/tmp/<exec_agent_run_id>/run/`), and have the binary drop `diagnostics.json` / `perf.json` / raw / logs to **tmp (auto-authorize)**. **`run_quality_checks` (`make test`) likewise**: point `env.RUNDIR` at `workspace/tmp/<exec_agent_run_id>/qc_run` (a separate subdir from run_program's `run/`), and confine the `diagnostics.json` / `raw/*` emitted by the `make test` binary re-run to tmp too. Pointing `RUNDIR` at the canonical run node dir would have the `make test` direct binary write overwrite the gate-authored copy already re-authored after `run_program` and invite an `unauthorized_write_violation` (a typical ordering defect).
+  - **Make command_log_path canonical explicit:** because making `project_dir` tmp would drop the MCP log into tmp too, make `<repo_abs>/<pipeline_ref>/runs/<run_id>/<node_key_safe>/mcp_command_log.jsonl` explicit with the `command_log_path` argument to satisfy the "Run_program log canonical placement" gate above.
+  - **The agent re-authors the canonical `.json` (final step):** the execute agent `Read`s the `diagnostics.json` / `perf.json` / `raw/*` of the **`run/` tmp tree** (`workspace/tmp/<exec_agent_run_id>/run/`, = the output of the `run_program` execution with `spec.ir.yaml.case` as arguments), and re-authors the canonical `runs/<run_id>/<node_key_safe>/diagnostics.json` / `perf.json` / `raw/metrics_basis.json` / `raw/state_snapshots/*` with **`guarded-apply-patch` (create-form)**. **The runner's program output (`diagnostics.json` / `perf.json` / `raw/metrics_basis.json` / `raw/state_snapshots/*`) is always promoted from `run/`, and must not be promoted from `qc_run/` (the output of the make-test re-run)** — if `qc_run/` is promoted, the canonical evidence does not correspond to the required `run_program` invocation (the `spec.ir.yaml.case` and its `command_log`), and `Validate.judge` consumes evidence with a provenance mismatch. The output of `qc_run/` is referenced only for the quality-check comparison (the verdict computation of `quality_check.json`). `trial_meta.json` and `quality_check.json` are **not runner output but metadata the agent authors** (`trial_meta.json` is composed from the MCP command refs / `source_source_id` / `source_command_ref`, and `quality_check.json` from the comparison result. The runner must not output either file directly), and are generated with `guarded-apply-patch` rather than promoted from tmp. **The re-author is the final step after both `run_program` and `run_quality_checks` complete**, ensuring an order in which a subsequent binary re-run does not overwrite the gate-authored copy (the ordering of authoring after run_program then running make test in the canonical RUNDIR is an overwrite defect).
+  - **raw `.json` via guarded-apply-patch / raw non-`.json` and log via the Write tool:** the `.json` under `raw/` (`metrics_basis.json` / `state_snapshots/*.json` etc.) **is also canonical `.json` and is re-authored with `guarded-apply-patch`** (included in the target of "the agent re-authors the canonical `.json`" above). What is written with the `Write` tool is limited to **non-`.json`** files under `raw/`, `stdout.log`, and `stderr.log`, written to a path within `allowed_file_tool_paths` (it is auto-derived if that path is included in `allowed_output_paths` in file form). Writing raw `.json` with the `Write` tool is rejected by `enforce_guarded_apply_patch`, and even if it could be written, `record-agent-run` detects an `unauthorized_write_violation` from the missing gate evidence.
+  Make this distinction (an MCP-owned log may be written canonically directly / a program output `.json` must go via tmp + re-author) explicit in the Validate.execute launch prompt.
 
-  **MCP audit log trust model (defense-in-depth, not cryptographic proof):** `mcp_owned_audit_logs` フィールド経由で manifest に登録された canonical log path は terminalization 時に「authorized MCP-owned write」として承認される。これは MCP server から path への write が以下 3 防御層で他経路をすべて遮断していることに依拠する: (a) hook 層が `Edit`/`Write` を `allowed_file_tool_paths` 除外で reject、(b) `guarded-apply-patch` が `mcp_owned_audit_logs` 内の path への mutation を `RuntimeError` で reject、(c) Bash heredoc/redirect も同 hook で reject。これにより canonical path への write は MCP server 経由のみが事実上可能。**ただし、これは out-of-band な MCP-side 署名や invocation cross-reference を持たないため**、もし将来 hook 層に新たな write 経路 (MCP 以外) が漏れた場合は、forge を再び許す可能性がある。完全な防御には MCP server が独自の audit ledger を残し、validator が path とその ledger を cross-reference する設計拡張が必要 (現時点では future work として認識)。
+  **MCP audit log trust model (defense-in-depth, not cryptographic proof):** a canonical log path registered in the manifest via the `mcp_owned_audit_logs` field is approved as an "authorized MCP-owned write" at terminalization. This relies on the write from the MCP server to the path having all other paths blocked by the following 3 defense layers: (a) the hook layer rejects `Edit`/`Write` by excluding it from `allowed_file_tool_paths`, (b) `guarded-apply-patch` rejects a mutation to a path within `mcp_owned_audit_logs` with a `RuntimeError`, (c) a Bash heredoc/redirect is also rejected by the same hook. This makes a write to the canonical path effectively possible only via the MCP server. **However, because this has no out-of-band MCP-side signature or invocation cross-reference**, if a new write path (other than MCP) leaks into the hook layer in the future, it could allow a forge again. A complete defense needs a design extension where the MCP server keeps its own audit ledger and the validator cross-references the path with that ledger (recognized as future work at this point).
 
-  **Make build の `src/Makefile` auto-inject:** `Generate` step かつ `spec.ir.yaml.impl_defaults.toolchain.build_system=make` のとき、`record-launch` は `<pipeline_ref>/source/<source_id>/src/Makefile` を `allowed_output_paths` と `allowed_file_tool_paths` に自動注入する。bare な `src/` directory entry だけでは source 拡張子 (`.f90`/`.c`) は `guarded-apply-patch` で書けても拡張子なしの `Makefile` は directory-allowlist の source-extension 集合から意図的に除外され全経路で書けない (make+Fortran/C に必須の `test`/`check` target が書けず child が mid-run fail-stop する原因)。**orchestration agent は Generate launch で通常 `allowed_file_tool_paths` を明示せず auto-derive に委ねればよい**。明示する場合は `src/Makefile` を必ず含めること — 欠落すると `record-launch` が child 起動前に `ValueError` で fail-fast する (mid-run fail-stop の予防)。
+  **Make build's `src/Makefile` auto-inject:** when the step is `Generate` and `spec.ir.yaml.impl_defaults.toolchain.build_system=make`, `record-launch` auto-injects `<pipeline_ref>/source/<source_id>/src/Makefile` into `allowed_output_paths` and `allowed_file_tool_paths`. With only a bare `src/` directory entry, source extensions (`.f90`/`.c`) can be written with `guarded-apply-patch` but the extension-less `Makefile` is intentionally excluded from the source-extension set of the directory allowlist and cannot be written via any path (a cause of the child fail-stopping mid-run because the `test`/`check` target required for make+Fortran/C cannot be written). **The orchestration agent usually just does not make `allowed_file_tool_paths` explicit in a Generate launch and leaves it to auto-derive.** If made explicit, always include `src/Makefile` — an omission makes `record-launch` fail-fast with a `ValueError` before launching the child (prevention of a mid-run fail-stop).
 
-  `tools/orchestration_runtime.py` の `_allowed_output_paths_for_launch()` が generate/build/execute いずれの phase でも defensive auto-inject を行うが、`record-launch` の `--request-json` で明示列挙すれば auto-inject に依存せず確定する。漏れた場合は `record-agent-run` で `unauthorized_write_violation` が発生し orchestration が `fail_closed` で停止する。本 log は integrity-protected で以下 3 経路がすべて拒否される (`validate_pipeline_semantics.py` が log の内容を信頼するため、生成は MCP server 経由のみに限定する):
-  - `Edit` / `Write` tool 直接書き込み (`allowed_file_tool_paths` から自動除外)
-  - `guarded-apply-patch` 経由のパッチ適用 (`changed_paths` / `numstat_targets` / rename 元/先 のいずれかに該当する場合 `RuntimeError`)
-  - 上記を回避する任意の Bash redirect (既存の `enforce_guarded_apply_patch` と `output_manifest_write_guard` で既にブロック済み)
-- `repair_strategy=reuse` の場合は、`repair_target_agent_run_id` の出力との差分修正に限定すること。
-- `repair_strategy=restart` の場合は、過去出力を流用せず契約入力から再生成すること。
-- 完了時は artifact 参照と status を `orchestration agent` へ返すこと。
-- 完了返答には `launch_reply` として、実施内容と判定結果を平文で含めること。
+  `_allowed_output_paths_for_launch()` of `tools/orchestration_runtime.py` does a defensive auto-inject in any of the generate/build/execute phases, but making it explicit in `record-launch`'s `--request-json` fixes it without depending on the auto-inject. On omission, an `unauthorized_write_violation` occurs at `record-agent-run` and the orchestration stops with `fail_closed`. This log is integrity-protected and all of the following 3 paths are rejected (because `validate_pipeline_semantics.py` trusts the log's content, its generation is limited to via the MCP server):
+  - direct `Edit` / `Write` tool write (auto-excluded from `allowed_file_tool_paths`)
+  - patch application via `guarded-apply-patch` (`RuntimeError` if it matches any of `changed_paths` / `numstat_targets` / a rename source/destination)
+  - any Bash redirect that bypasses the above (already blocked by the existing `enforce_guarded_apply_patch` and `output_manifest_write_guard`)
+- With `repair_strategy=reuse`, limit it to a diff fix against the output of `repair_target_agent_run_id`.
+- With `repair_strategy=restart`, regenerate from the contract input without reusing past output.
+- On completion, return the artifact references and status to the `orchestration agent`.
+- The completion reply must include, as `launch_reply`, the actions performed and the judgment result in plain text.
 
-#### `.json` artifact 書き込み — `guarded-apply-patch` 使用手順
+#### `.json` artifact write — `guarded-apply-patch` usage procedure
 
-`.json` / `.txt` の出力は必ず以下の手順で行うこと。ファイルへの書き込みを伴う手段（heredoc リダイレクト・`tee`・`python3 -c` によるファイル書き込み・`echo > file` 等）はすべて禁止される。patch text を変数へ組み立てることは許可される。
+`.json` / `.txt` output must always be done by the following procedure. All means that involve a file write (heredoc redirect / `tee` / a file write via `python3 -c` / `echo > file` etc.) are forbidden. Assembling the patch text into a variable is permitted.
 
-**手順（正解パターン — create-or-overwrite with retry）:**
+**Procedure (the correct pattern — create-or-overwrite with retry):**
 
-`guarded-apply-patch` は内部で `git apply` を使用するため、patch 形式はファイルの存在有無によって異なる。`os.path.exists()` とパッチ適用の間には race window があるため、パッチ失敗時に逆の形式で 1 回リトライする。同一出力パスへの並行書き込みは orchestration の設計上発生しないが、retry/repair で前回の空ファイルが残存する場合に備えて吸収する。
+Because `guarded-apply-patch` internally uses `git apply`, the patch form differs depending on whether the file exists. Because there is a race window between `os.path.exists()` and the patch application, on a patch failure retry once with the reverse form. Concurrent writes to the same output path do not occur by orchestration design, but absorb the case where an empty file from a previous attempt remains during retry/repair.
 
-**手順 (Bash + Write tool ベース、`python3 -c` / `python3 - <<EOF` は `forbid_python_inline_write` で block されるため不可):**
+**Procedure (Bash + Write tool based; `python3 -c` / `python3 - <<EOF` is blocked by `forbid_python_inline_write` so it is not usable):**
 
-1. **target file の状態確認**: `Read` tool で `workspace/ir/<node_key_safe>/<ir_id>/spec.ir.yaml` を読む (存在しない場合 `Read` がエラーを返すので、その場合は `/dev/null` create 形式の patch を組む)。既存ならその行数 (`len(old_lines)`) を controll する。
-2. **patch text を組み立てる**: 既存・新規・空ファイル の 3 形式があり、いずれも単純な文字列連結で構築できる。テンプレート (`<old_lines>` / `<new_lines>` は agent が literal 値で置換):
+1. **Confirm the target file's state**: read `workspace/ir/<node_key_safe>/<ir_id>/spec.ir.yaml` with the `Read` tool (if it does not exist, `Read` returns an error, in which case assemble a `/dev/null` create-form patch). If it exists, control its line count (`len(old_lines)`).
+2. **Assemble the patch text**: there are 3 forms — existing / new / empty file — and all can be built by simple string concatenation. Template (`<old_lines>` / `<new_lines>` are substituted by the agent with literal values):
 
    ```text
-   # update / replace 形式 (既存ファイル, len(old_lines)=N>0, len(new_lines)=M)
+   # update / replace form (existing file, len(old_lines)=N>0, len(new_lines)=M)
    --- a/<target>
    +++ b/<target>
    @@ -1,N +1,M @@
@@ -190,14 +190,14 @@ repair_reason: <repair_reason>
    +<new line 2>
    ...
 
-   # 0 バイト既存ファイル (len(old_lines)=0)
+   # 0-byte existing file (len(old_lines)=0)
    --- a/<target>
    +++ b/<target>
    @@ -0,0 +1,M @@
    +<new line 1>
    ...
 
-   # ファイル不在: /dev/null create hunk
+   # file absent: /dev/null create hunk
    --- /dev/null
    +++ b/<target>
    @@ -0,0 +1,M @@
@@ -205,8 +205,8 @@ repair_reason: <repair_reason>
    ...
    ```
 
-3. **patch text を `workspace/tmp/<agent_run_id>/guarded_patch_input.txt` へ書き込む**: `Write` tool を使う (literal path は `allowed_tmp_root` 配下のため `output_manifest_write_guard` を通過する。`.json` / `.txt` への Bash heredoc redirect は本ファイルの NG 例 (下記参照) で禁止しているため、`Write` tool が canonical 経路)。
-4. **guarded-apply-patch を実行**:
+3. **Write the patch text to `workspace/tmp/<agent_run_id>/guarded_patch_input.txt`**: use the `Write` tool (because the literal path is under `allowed_tmp_root`, it passes `output_manifest_write_guard`. A Bash heredoc redirect to a `.json` / `.txt` is forbidden in this file's NG examples (see below), so the `Write` tool is the canonical path).
+4. **Run guarded-apply-patch**:
 
    ```bash
    python3 tools/orchestration_runtime.py guarded-apply-patch \
@@ -219,67 +219,67 @@ repair_reason: <repair_reason>
      --capability-token <capability_token>
    ```
 
-5. **race window retry**: コマンドが失敗した場合、`os.path.exists()` と `git apply` の間の race を吸収するため、逆の patch 形式 (update ↔ create) を `Write` tool で再構築して再度 `guarded-apply-patch` を実行する。失敗判定は Bash の終了コード (`echo $?` または出力に含まれる error 文字列) で行う。retry は最大 1 回まで。同一出力パスへの並行書き込みは orchestration の設計上発生しないが、retry/repair で前回の空ファイルが残存する場合に備えて吸収する。
+5. **race window retry**: if the command fails, to absorb the race between `os.path.exists()` and `git apply`, rebuild the reverse patch form (update ↔ create) with the `Write` tool and run `guarded-apply-patch` again. Judge failure by the Bash exit code (`echo $?` or an error string contained in the output). Retry at most once. Concurrent writes to the same output path do not occur by orchestration design, but absorb the case where an empty file from a previous attempt remains during retry/repair.
 
-**禁止される代替パターン:**
-- `python3 -c "..."` / `python3 - <<'EOF'` で patch を build して subprocess.run する形式 → `forbid_python_inline_write` で **無条件 block** (workflow mode の `tools/hooks/common.py:_validate_workflow_bash_policy` 内 regex `python3?\s+-\s*<<`)。
-- `VAR=$(...)` の shell var 割り当て + command substitution → `Bash(python3 ...)` allowlist 一致を壊し session approval 要求。
-- `tee` / `cat <<EOF >file` 等で patch を書き出す → `output_manifest_write_guard` または `enforce_guarded_apply_patch` で block。
+**Forbidden alternative patterns:**
+- The form of building a patch with `python3 -c "..."` / `python3 - <<'EOF'` and running subprocess.run → **unconditionally blocked** by `forbid_python_inline_write` (the regex `python3?\s+-\s*<<` inside `tools/hooks/common.py:_validate_workflow_bash_policy` in workflow mode).
+- A shell var assignment `VAR=$(...)` + command substitution → breaks the `Bash(python3 ...)` allowlist match and requires session approval.
+- Writing out a patch with `tee` / `cat <<EOF >file` etc. → blocked by `output_manifest_write_guard` or `enforce_guarded_apply_patch`.
 
-**禁止パターン（NG — hook がブロックする）:**
+**Forbidden patterns (NG — the hook blocks):**
 
 ```bash
-# NG: workspace/ prefix なしのパス
+# NG: a path without the workspace/ prefix
 echo "$CONTENT" > ir/spec.ir.yaml
 
-# NG: python3 -c によるインラインファイル書き込み (intent_detected=write)
+# NG: an inline file write via python3 -c (intent_detected=write)
 python3 -c "import json; open('workspace/ir/.../spec.ir.yaml','w').write(json.dumps({}))"
 
-# NG: python3 -c による JSON 読み取り (intent_detected=json_read) — Read tool または jq を使う
+# NG: a JSON read via python3 -c (intent_detected=json_read) — use the Read tool or jq
 python3 -c "import json; print(json.load(open('workspace/orchestrations/<oid>/output_manifests/<id>.json'))['allowed_tmp_root'])"
 
-# NG: python3 -c による UUID 生成 (intent_detected=uuid) — python3 tools/new_agent_run_id.py を使う
+# NG: UUID generation via python3 -c (intent_detected=uuid) — use python3 tools/new_agent_run_id.py
 python3 -c "import uuid; print(uuid.uuid4())"
 
-# NG: heredoc リダイレクト（直接ファイル指定）
+# NG: a heredoc redirect (direct file specification)
 cat <<EOF > workspace/ir/.../spec.ir.yaml
 {"key": "value"}
 EOF
 
-# NG: workspace/tmp/<agent_run_id>/ 配下であっても、.json/.txt 出力 path への
-# heredoc redirect は禁止 (hook は file_path を解釈できず '\"' をパスと誤検知してブロックする)。
-# 加えて TMPFILE=$(mktemp ...) のような shell var 割り当ては allowlist 一致を壊し
-# session approval を要求するため使用しない。
+# NG: even under workspace/tmp/<agent_run_id>/, a heredoc redirect to a .json/.txt output
+# path is forbidden (the hook cannot interpret the file_path and mis-detects '\"' as a path and blocks).
+# In addition, a shell var assignment like TMPFILE=$(mktemp ...) breaks the allowlist match
+# and requires session approval, so do not use it.
 cat > workspace/tmp/<agent_run_id>/work.json << 'EOF'
 {"key": "value"}
 EOF
-# → patch text を Write tool で workspace/tmp/<arid>/guarded_patch_input.txt に書き込んでから
-# guarded-apply-patch --patch-file に渡すこと (本ファイル「`.json` artifact 書き込み — `guarded-apply-patch` 使用手順」節 参照)
+# → write the patch text to workspace/tmp/<arid>/guarded_patch_input.txt with the Write tool, then
+# pass it to guarded-apply-patch --patch-file (see the "`.json` artifact write — `guarded-apply-patch` usage procedure" section of this file)
 ```
 
-**重要:** `.json` / `.txt` の出力は本ファイル「`.json` artifact 書き込み — `guarded-apply-patch` 使用手順」節の `guarded-apply-patch` 手順**以外の手段をすべて禁止する**。patch text を `Write` tool で `workspace/tmp/<agent_run_id>/guarded_patch_input.txt` に書き込んだのち、`guarded-apply-patch --patch-file` 経由で適用すること。
+**Important:** for `.json` / `.txt` output, **forbid all means other than** the `guarded-apply-patch` procedure of the "`.json` artifact write — `guarded-apply-patch` usage procedure" section of this file. After writing the patch text to `workspace/tmp/<agent_run_id>/guarded_patch_input.txt` with the `Write` tool, apply it via `guarded-apply-patch --patch-file`.
 
-**重要:** `--paths-json` と `--patch-text` の `+++ b/` パスはいずれも `workspace/` で始まるプロジェクトルート相対パスとすること。`plans/...`（`workspace/` 接頭辞なし）や絶対パスは `output_manifest_write_guard` でブロックされる。
-
----
-
-#### `guarded-apply-patch` の strip について
-
-`guarded-apply-patch` に `--strip` という CLI 引数は存在しない。`--paths-json` で渡した `changed_paths` を oracle として `-p1` → `-p0` の順で `git apply --check` を内部試行し、すべての `changed_paths` を被覆できる strip を自動選択する。agent が strip を指定する必要はない。
-
-**エラー `cannot determine patch strip level` が出た場合の対処:**
-
-1. `--paths-json` の path と patch ヘッダ（`+++ b/...`）の prefix を照合する。
-   - strip=0（-p0）適用時: `--- workspace/foo/bar.json` + `+++ workspace/foo/bar.json` → changed_path は `workspace/foo/bar.json`
-   - strip=1（-p1）適用時: `--- a/workspace/foo/bar.json` + `+++ b/workspace/foo/bar.json` → changed_path は `workspace/foo/bar.json`
-2. path の前後に余計な `/` や相対パス記号（`./`）が混入していないか確認する。
-3. 新規ファイル作成なら `--- /dev/null` / `+++ b/<path>` 形式にする。
-
-`tools/orchestration_runtime.py` を grep してこのロジックを確認しようとしてはならない（`forbid_tools_direct_read` でブロックされる）。正規参照先はこの段落と `docs/ORCHESTRATION.md#patch-適用契約` である。
+**Important:** the `+++ b/` path of `--paths-json` and `--patch-text` must both be a project-root-relative path starting with `workspace/`. `plans/...` (without the `workspace/` prefix) or an absolute path is blocked by `output_manifest_write_guard`.
 
 ---
 
-#### phase ↔ skill 対応表
+#### About the strip of `guarded-apply-patch`
+
+`guarded-apply-patch` has no CLI argument `--strip`. Using the `changed_paths` passed via `--paths-json` as an oracle, it internally tries `git apply --check` in the order `-p1` → `-p0`, and automatically selects a strip that can cover all `changed_paths`. The agent need not specify the strip.
+
+**Response when the error `cannot determine patch strip level` appears:**
+
+1. Reconcile the path of `--paths-json` with the prefix of the patch header (`+++ b/...`).
+   - When applied with strip=0 (-p0): `--- workspace/foo/bar.json` + `+++ workspace/foo/bar.json` → the changed_path is `workspace/foo/bar.json`
+   - When applied with strip=1 (-p1): `--- a/workspace/foo/bar.json` + `+++ b/workspace/foo/bar.json` → the changed_path is `workspace/foo/bar.json`
+2. Confirm that no extra `/` or relative-path symbol (`./`) is mixed into the path before or after.
+3. For a new-file creation, use the `--- /dev/null` / `+++ b/<path>` form.
+
+Do not attempt to confirm this logic by grepping `tools/orchestration_runtime.py` (it is blocked by `forbid_tools_direct_read`). The legitimate references are this paragraph and `docs/ORCHESTRATION.md#patch-application-contract`.
+
+---
+
+#### phase ↔ skill correspondence table
 
 | step | substep | skill_name | skill_ref |
 |---|---|---|---|
@@ -294,66 +294,66 @@ EOF
 | judge | — | workflow-validate-judge | skills/workflow-validate-judge/SKILL.md |
 | promote | — | workflow-promote | skills/workflow-promote/SKILL.md |
 
-**ネガティブ制約:** 自 phase 以外の SKILL.md を Read してはならない（例: generate substep が `skills/workflow-compile-verify/SKILL.md` を読む行為は `rule_source_violation` を発火する）。launch prompt の `skill_ref` で渡された 1 ファイルだけを読むこと。
+**Negative constraint:** do not Read a SKILL.md of any phase other than your own (e.g. a generate substep reading `skills/workflow-compile-verify/SKILL.md` fires `rule_source_violation`). Read only the single file passed via the launch prompt's `skill_ref`.
 
 ---
 
-#### substep ↔ allowed validator gate 対応表
+#### substep ↔ allowed validator gate correspondence table
 
-`orchestration agent` が launch prompt 本文に明示・列挙してよい `validate_pipeline_semantics --stage <X>` invocation を `(step, substep)` ごとに canonical 化する。下表の "allowed_stage" 列で許可された `--stage` 以外を launch prompt に記載してはならない。再発防止プラン (Issue 1) を canonical source とする。
+It canonicalizes, per `(step, substep)`, the `validate_pipeline_semantics --stage <X>` invocation the `orchestration agent` may state/enumerate in the launch prompt body. Do not state in the launch prompt a `--stage` other than the one permitted in the "allowed_stage" column of the table below. The recurrence-prevention plan (Issue 1) is the canonical source.
 
-| step | substep | allowed `validate_pipeline_semantics --stage` | 備考 |
+| step | substep | allowed `validate_pipeline_semantics --stage` | note |
 |---|---|---|---|
-| compile | generate | (なし) | gate 呼び出しは `validate_workspace_root` / `check_artifact_syntax --expect-top object` に限定。`io_contract` 関連は `Compile.verify` 責務。 |
-| compile | verify | `compile` | `io_contract` 導出後の verify 完了前に必須。 |
-| generate | generate | (なし) | `--stage post_generate` は `Generate.verify` 責務。 |
+| compile | generate | (none) | gate calls are limited to `validate_workspace_root` / `check_artifact_syntax --expect-top object`. `io_contract`-related is the `Compile.verify` responsibility. |
+| compile | verify | `compile` | required before verify completes after `io_contract` derivation. |
+| generate | generate | (none) | `--stage post_generate` is the `Generate.verify` responsibility. |
 | generate | verify | `post_generate` | |
-| build | — | `post_build` | MCP `compile_project` 呼び出し後に invoke。 |
-| validate | execute | `post_execute` | `run_program` / `run_quality_checks` 結果の判定に invoke。 |
-| validate | judge | `pre_judge` | `aggregate_verdict` 確定前の最終 validation。 |
+| build | — | `post_build` | invoked after the MCP `compile_project` call. |
+| validate | execute | `post_execute` | invoked for the judgment of the `run_program` / `run_quality_checks` result. |
+| validate | judge | `pre_judge` | the final validation before `aggregate_verdict` finalization. |
 
-`--stage full` は end-to-end validation を行う debug 用 stage であり、上記いずれの (step, substep) でも明示的には allow-list に含めない (定常 workflow は per-phase stage を canonical とする)。canonical な `--stage` 値の網羅一覧は `tools/validate_pipeline_semantics.py` の argparse `choices` (`compile` / `post_generate` / `post_build` / `post_execute` / `pre_judge` / `full`) を一次 source とする。
+`--stage full` is a debug stage that performs end-to-end validation, and is not explicitly included in the allow-list for any of the (step, substep) above (the steady workflow uses per-phase stages as canonical). The exhaustive list of canonical `--stage` values uses the argparse `choices` of `tools/validate_pipeline_semantics.py` (`compile` / `post_generate` / `post_build` / `post_execute` / `pre_judge` / `full`) as the primary source.
 
-**recording-layer との区別:** `skills/workflow-orchestration/SKILL.md` line 116 は `step_result.json#validation_stage` に**記録してよい**値として step 単位の広めの集合 (`full` を含む) を定義しており、これは write-step-result 時の recording-layer contract である。本表は launch-prompt 時の invocation-layer contract であり、recording-layer よりも厳格な per-substep 制約を課す。両者は別 layer の contract であり、本表で per-substep に絞られた結果として recording される `validation_stage` 値も自動的に SKILL.md line 116 の許容集合に含まれる (例: `compile/verify` で実行可能なのは `compile` のみ → SKILL.md `compile`/`full` 集合の subset)。
+**Distinction from the recording layer:** line 116 of `skills/workflow-orchestration/SKILL.md` defines the values that **may be recorded** in `step_result.json#validation_stage` as a broader per-step set (including `full`), and this is the recording-layer contract at write-step-result time. This table is the invocation-layer contract at launch-prompt time, and imposes a stricter per-substep constraint than the recording layer. They are contracts of different layers, and a `validation_stage` value recorded as a result of being narrowed per-substep by this table is automatically included in the allowed set of SKILL.md line 116 (e.g. only `compile` is executable for `compile/verify` → a subset of the SKILL.md `compile`/`full` set).
 
-**negative constraint:** 上記表に許可されていない `--stage` の `validate_pipeline_semantics` 呼び出しを本 `(step, substep)` の launch prompt に記載してはならない。例: `Compile.generate` 用 prompt に `validate_pipeline_semantics --stage compile` を含めると `Compile.verify` 責務を侵害し `noncanonical_phase_write_attempt` を発火する。MCP tool 名 (`compile_project` 等) の単なる言及 (説明文・negative constraint 等) は本 lint の対象外とする。
+**negative constraint:** do not state in the launch prompt of this `(step, substep)` a `validate_pipeline_semantics` call with a `--stage` not permitted in the table above. Example: including `validate_pipeline_semantics --stage compile` in the `Compile.generate` prompt invades the `Compile.verify` responsibility and fires `noncanonical_phase_write_attempt`. A mere mention of an MCP tool name (`compile_project` etc.) (in explanatory text, a negative constraint, etc.) is outside the scope of this lint.
 
-**negative constraint (MCP write tool):** `generate/verify` 用 launch prompt に `run_linter` 等の `build-runtime` MCP write tool の実行を記載してはならない。lint は `generate.generate` 責務であり (`docs/workflow/phases/phase_02_generate.md` 2-1)、verify での実行は verify の `allowed_output_paths` が authorize しない `mcp_command_log.jsonl` への書き込みを誘発し `unauthorized_write_violation` → `fail_closed` を招く。本制約は `build-runtime` MCP write tool のみを対象とし、read-only の `validate_workspace_root.py` および `validate_pipeline_semantics --stage post_generate` (上表) は引き続き許可する。
+**negative constraint (MCP write tool):** do not state in the `generate/verify` launch prompt the execution of a `build-runtime` MCP write tool such as `run_linter`. lint is the `generate.generate` responsibility (`docs/workflow/phases/phase_02_generate.md` 2-1), and execution in verify induces a write to `mcp_command_log.jsonl` that verify's `allowed_output_paths` does not authorize and invites an `unauthorized_write_violation` → `fail_closed`. This constraint targets only the `build-runtime` MCP write tool, and the read-only `validate_workspace_root.py` and `validate_pipeline_semantics --stage post_generate` (table above) remain permitted.
 
-`record-launch` は `_validate_launch_prompt_text` 内で `launch_prompt_ref` のテキストに対して per-(step, substep) の allowed-stage 集合を照合する。actionable な invocation 行 (`python3` / `tools/validate_pipeline_semantics.py` / `--gate validate_pipeline_semantics` を含む行) のみを scan し、direct CLI 形式と canonical run-gate JSON 形式 (`--args-json '{"stage": "..."}'`) の両方を抽出して allowed-stage 外なら `ValueError` で reject する (`tools/orchestration_runtime.py::_lint_launch_prompt_gate_allowlist` と `ALLOWED_VALIDATE_PIPELINE_STAGES` が canonical 実装)。緊急 rollback 用に env `METDSL_ENFORCE_GATE_ALLOWLIST=0` で lint を無効化できる (default は有効)。
+`record-launch`, inside `_validate_launch_prompt_text`, reconciles the text of `launch_prompt_ref` against the per-(step, substep) allowed-stage set. It scans only actionable invocation lines (lines containing `python3` / `tools/validate_pipeline_semantics.py` / `--gate validate_pipeline_semantics`), extracts both the direct CLI form and the canonical run-gate JSON form (`--args-json '{"stage": "..."}'`), and rejects with a `ValueError` if it is outside the allowed-stage (`tools/orchestration_runtime.py::_lint_launch_prompt_gate_allowlist` and `ALLOWED_VALIDATE_PIPELINE_STAGES` are the canonical implementation). For an emergency rollback, the lint can be disabled with the env `METDSL_ENFORCE_GATE_ALLOWLIST=0` (default is enabled).
 
-#### `repair_strategy=reuse` 時の追加契約
+#### Additional contract on `repair_strategy=reuse`
 
-`repair_strategy=reuse` での再投入は、`record-agent-run` の `apply_patch_writes` 証跡を `repair_target_agent_run_id` から継承する (`docs/ORCHESTRATION.md` の repair / retry 節を canonical source とする)。launch prompt 本文の `guarded-apply-patch` 関連の constraint 行はそのまま保持してよい — child が実際に同 path を再書き込みする場合は通常通り gate を経由し、何も書かなければ継承証跡で coverage を満たす。継承の信頼性は runtime 側の同一 identity 検証 (`(node_key, step, substep)` 一致) で担保される。
+A re-submission with `repair_strategy=reuse` inherits the `apply_patch_writes` evidence of `record-agent-run` from `repair_target_agent_run_id` (the repair / retry section of `docs/ORCHESTRATION.md` is the canonical source). The `guarded-apply-patch`-related constraint lines of the launch prompt body may be kept as-is — if the child actually re-writes the same path, it goes through the gate as usual, and if it writes nothing, the inherited evidence satisfies the coverage. The reliability of the inheritance is ensured by the runtime-side same-identity verification (`(node_key, step, substep)` match).
 
 ---
 
-#### `allowed_tmp_root` の利用契約
+#### Usage contract of `allowed_tmp_root`
 
-`record-launch` は `workspace/tmp/<agent_run_id>/` を作成して `output_manifests/<agent_run_id>.json` の `allowed_tmp_root` フィールドに記録する。**agent はこの literal path を直接使う**ことで `output_manifest_write_guard` を通過する (write 対象 path のみを判定し `$TMPDIR` env は参照しない、`tools/hooks/common.py:_validate_write_access`)。
+`record-launch` creates `workspace/tmp/<agent_run_id>/` and records it in the `allowed_tmp_root` field of `output_manifests/<agent_run_id>.json`. **The agent uses this literal path directly** to pass `output_manifest_write_guard` (it judges only the write-target path and does not reference the `$TMPDIR` env, `tools/hooks/common.py:_validate_write_access`).
 
-**禁止される bootstrap Bash:**
+**Forbidden bootstrap Bash:**
 
-- `export TMPDIR=$(jq -er ...)`、`export TMPDIR=...` — Claude Code session sandbox の approval 要求で workflow が停止する根本原因。
-- `jq -er ...` / `printenv` / `bash -c '...'` — 同上。
-- `python3 -c "import json; ..."` — `forbid_python_inline_write` (intent_detected=`json_read`) でブロックされる。
+- `export TMPDIR=$(jq -er ...)`, `export TMPDIR=...` — the root cause of the workflow stopping on a Claude Code session-sandbox approval request.
+- `jq -er ...` / `printenv` / `bash -c '...'` — same as above.
+- `python3 -c "import json; ..."` — blocked by `forbid_python_inline_write` (intent_detected=`json_read`).
 
-**正しい一時ファイル書き込み:**
+**Correct temporary-file write:**
 
-- **`.json` / `.txt` ファイル**: `Write` tool で `workspace/tmp/<agent_run_id>/<name>.{json,txt}` を直接書き込む。Bash heredoc redirect は `cat > "path" <<EOF` の quoted 形式で hook の file_path parser が `'\"'` をパスと誤検知する既知のリスクがあるため避ける。
-- **`.py` / `.yaml` / `.sh` 等**: Bash heredoc で OK。
+- **`.json` / `.txt` files**: write `workspace/tmp/<agent_run_id>/<name>.{json,txt}` directly with the `Write` tool. Avoid a Bash heredoc redirect because the quoted form `cat > "path" <<EOF` has the known risk that the hook's file_path parser mis-detects `'\"'` as a path.
+- **`.py` / `.yaml` / `.sh` etc.**: a Bash heredoc is OK.
 
 ```bash
-# gate stderr 退避 (非 .json/.txt path への redirect は安全)
+# saving gate stderr (a redirect to a non-.json/.txt path is safe)
 python3 tools/orchestration_runtime.py run-gate --gate ... 2>workspace/tmp/<agent_run_id>/last_gate_stderr.txt
 
-# 一時 python script
+# a temporary python script
 cat > workspace/tmp/<agent_run_id>/build_patch.py <<'EOF'
 # script body ...
 EOF
 python3 workspace/tmp/<agent_run_id>/build_patch.py
 ```
 
-`.json` / `.txt` patch file の書込は `Write` tool 経由を canonical とする (本ファイル「`.json` artifact 書き込み — `guarded-apply-patch` 使用手順」節 参照)。
+The write of a `.json` / `.txt` patch file is canonically via the `Write` tool (see the "`.json` artifact write — `guarded-apply-patch` usage procedure" section of this file).
 
-`<agent_run_id>` は launch prompt の対応フィールドで literal 置換すること。`$TMPDIR` env は `tools/run_workflow.py` が subprocess に inherit させているため `${TMPDIR}/...` 形式の参照も結果的に動作するが、env 依存を最小化するため literal path を canonical とする。`/tmp/`・`/dev/shm/`・`$(mktemp)` 無引数は引き続き `output_manifest_write_guard` でブロックされる。
+`<agent_run_id>` is literally substituted in the corresponding field of the launch prompt. The `$TMPDIR` env is inherited into the subprocess by `tools/run_workflow.py`, so a `${TMPDIR}/...`-form reference also works as a result, but to minimize env dependence the literal path is canonical. `/tmp/`, `/dev/shm/`, and an argument-less `$(mktemp)` remain blocked by `output_manifest_write_guard`.

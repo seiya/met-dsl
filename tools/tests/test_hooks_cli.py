@@ -1205,7 +1205,7 @@ class ClaudeHookCliTests(unittest.TestCase):
             self.assertIn("guarded-apply-patch", body.get("reason", ""))
 
     def test_claude_read_allows_self_output_and_read_manifest_without_allowed_root(self) -> None:
-        """output/read manifest は allowed_read_roots に含まれなくても Read 可能。"""
+        """The output/read manifest can be Read even if not in allowed_read_roots."""
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
             orch = "orch_manifest_read_001"
@@ -2368,7 +2368,7 @@ class GetAgentRoleFromCapabilityTests(unittest.TestCase):
 
 
 class WriteToolExtensionPolicyTests(unittest.TestCase):
-    """`Edit` / `Write` 直接書き込みの extension 別 policy 検証。"""
+    """Verify the per-extension policy of direct `Edit` / `Write` writes."""
 
     def _setup_orchestration_for_write(
         self,
@@ -2541,11 +2541,11 @@ class WriteToolExtensionPolicyTests(unittest.TestCase):
             self.assertEqual(body.get("decision"), "block")
 
     def test_bash_redirect_to_allowed_path_is_plain_allow_not_auto_approve(self) -> None:
-        """Regression: ALLOW_AUTO_APPROVE は Write/Edit branch 限定。
-        Bash redirect が manifest match で ALLOW になっても hookSpecificOutput を
-        emit してはならない（Bash は harness の permission prompt 対象外であり、
-        auto-approve は不要かつ event scope が PreToolUse 以外でも適用される
-        誤拡張を防ぐ）。"""
+        """Regression: ALLOW_AUTO_APPROVE is limited to the Write/Edit branch.
+        Even if a Bash redirect becomes ALLOW on a manifest match, it must not
+        emit hookSpecificOutput (Bash is outside the harness's permission prompt,
+        auto-approve is unnecessary, and this prevents the mis-extension of
+        applying it even when the event scope is other than PreToolUse)."""
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
             orch = "orch_bash_scope_001"
@@ -2583,8 +2583,8 @@ class WriteToolExtensionPolicyTests(unittest.TestCase):
             self.assertEqual(body_text, "", f"Bash ALLOW must not emit auto-approve payload; got: {body_text!r}")
 
     def test_apply_patch_match_is_plain_allow_not_auto_approve(self) -> None:
-        """Regression: apply_patch も Write/Edit と異なる経路を通り、
-        ALLOW_AUTO_APPROVE には昇格してはならない。"""
+        """Regression: apply_patch also goes through a path different from Write/Edit,
+        and must not be promoted to ALLOW_AUTO_APPROVE."""
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
             orch = "orch_apply_patch_scope_001"

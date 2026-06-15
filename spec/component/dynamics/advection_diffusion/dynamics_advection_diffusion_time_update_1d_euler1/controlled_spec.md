@@ -1,6 +1,6 @@
-# Controlled Spec: 1 次元 前進 Euler 更新（component spec）
+# Controlled Spec: 1D forward Euler update (component spec)
 
-## 0. メタ情報
+## 0. Meta information
 - `spec_id`: `dynamics_advection_diffusion_time_update_1d_euler1`
 - `spec_version`: `0.1.0`
 - `status`: `controlled_draft`
@@ -8,14 +8,14 @@
 - `domain`: `dynamics`
 - `family`: `advection_diffusion`
 
-## 1. 責務と適用範囲
-本 `component` は 1 次元 移流拡散 問題の時間更新を実行する責務を持つ。
+## 1. Responsibility and scope
+This `component` is responsible for executing the time update of the 1D advection-diffusion problem.
 
 ## 2. input/output contract
-入力は `u^n(i)`、`a`、`nu`、`dx`、`dt`、境界適用済みの近傍セル値とする。出力は `u^{n+1}(i)` とする。
+The input is `u^n(i)`, `a`, `nu`, `dx`, `dt`, and the boundary-applied neighboring cell values. The output is `u^{n+1}(i)`.
 
-## 3. 演算定義
-公開 `operation` は `dynamics_advection_diffusion_time_update_1d_euler1__advance` とする。更新式は
+## 3. Operation definition
+The published `operation` is `dynamics_advection_diffusion_time_update_1d_euler1__advance`. The update expression is
 $$
 u_i^{n+1}
 = u_i^n
@@ -25,22 +25,21 @@ $$
 $$
 C=a\frac{\Delta t}{\Delta x},\quad D=\nu\frac{\Delta t}{\Delta x^2}
 $$
-とする。
 
-## 4. 失敗条件と制約
-`dx<=0`、`dt<=0` を入力不正としてエラーとする。
+## 4. Failure conditions and constraints
+Treat `dx<=0` and `dt<=0` as invalid input and an error.
 
-## 5. 公開 API と互換性
-公開 `operation_id` は `dynamics_advection_diffusion_time_update_1d_euler1__advance` のみとする。
+## 5. Public API and compatibility
+The only published `operation_id` is `dynamics_advection_diffusion_time_update_1d_euler1__advance`.
 
-## 6. 禁止事項
-時間積分法の自動切替を禁止する。
+## 6. Prohibitions
+Forbid automatic switching of the time-integration method.
 
-## 7. トレーサビリティ
-`component_catalog.yaml` と `case.resolved.yaml` に採用結果を必須記録とする。
+## 7. Traceability
+Require recording the adoption result in `component_catalog.yaml` and `case.resolved.yaml`.
 
-## 8. AD 準備情報
-`ad_readiness.enabled` は `true` とする。非微分演算として `ceil`（`dt` 規則に用いる場合）を明示する。
+## 8. AD preparation information
+`ad_readiness.enabled` is `true`. `ceil` (when used in the `dt` rule) is made explicit as a non-differentiable operation.
 
-## 9. tests 参照
-対応する `tests.md` を同一ディレクトリに配置し、`test_profile_version` を `0.1.0` とする。
+## 9. tests reference
+Place the corresponding `tests.md` in the same directory, with `test_profile_version` of `0.1.0`.

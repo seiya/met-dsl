@@ -1,242 +1,242 @@
 # Workflow Orchestration
 
-この文書は、`workflow` 全体を統括する `orchestration agent` と、phase / substep の独立エージェント実行規約を定義する。`Spec -> Compile -> Generate -> Build -> Validate` の 5 phase 構成を前提とする。
+This document defines the `orchestration agent` that supervises the whole `workflow`, and the independent-agent execution conventions for phases / substeps. It presumes the 5-phase structure `Spec -> Compile -> Generate -> Build -> Validate`.
 
-## 関連文書
+## Related documents
 
-- CLI 全 subcommand reference: [`docs/CLI_REFERENCE.md`](CLI_REFERENCE.md)
-- workspace artifact 配置: [`docs/WORKSPACE_LAYOUT.md`](WORKSPACE_LAYOUT.md)
-- workflow 起動契約: [`skills/workflow-orchestration/SKILL.md`](../skills/workflow-orchestration/SKILL.md) と [`skills/workflow-orchestration/references/startup_contract.md`](../skills/workflow-orchestration/references/startup_contract.md)
-- launch 要求テンプレート: [`skills/workflow-orchestration/references/launch_prompts.md`](../skills/workflow-orchestration/references/launch_prompts.md)
+- CLI reference of all subcommands: [`docs/CLI_REFERENCE.md`](CLI_REFERENCE.md)
+- workspace artifact placement: [`docs/WORKSPACE_LAYOUT.md`](WORKSPACE_LAYOUT.md)
+- workflow startup contract: [`skills/workflow-orchestration/SKILL.md`](../skills/workflow-orchestration/SKILL.md) and [`skills/workflow-orchestration/references/startup_contract.md`](../skills/workflow-orchestration/references/startup_contract.md)
+- launch request templates: [`skills/workflow-orchestration/references/launch_prompts.md`](../skills/workflow-orchestration/references/launch_prompts.md)
 
-## 目的
-- workflow 実行を階層化し、phase responsibilities と監査責務を分離する。
-- 各 `step` / 各 `substep` を独立エージェントとして実行し、実行経路を追跡可能にする。
+## Purpose
+- Hierarchize the workflow execution and separate phase responsibilities from audit responsibilities.
+- Execute each `step` / each `substep` as an independent agent, and make the execution path traceable.
 
-## 適用範囲
+## Scope
 - `Compile` / `Generate` / `Build` / `Validate`
-- `node workflow` 単位の phase 実行と、phase 内 `substep`（`generate` / `verify` / `execute` / `judge`）の実行
+- Per-`node workflow` phase execution, and the execution of in-phase `substep` (`generate` / `verify` / `execute` / `judge`)
 
 ## term rules
-- `phase` は `docs/workflow/WORKFLOW_CORE.md` と `docs/workflow/phases/` 配下の契約文書で定義する workflow の論理単位を指す。
-- `step` は 1 つの phase に対応するオーケストレーション上の実行単位を指す。
-- `substep` は `step` を分解した下位実行単位を指す。
-- `stage` は `generated_by_stage` などの既存フィールド名としてのみ使用する。
+- `phase` refers to the workflow's logical unit defined in the contract documents under `docs/workflow/WORKFLOW_CORE.md` and `docs/workflow/phases/`.
+- `step` refers to the orchestration-level execution unit corresponding to one phase.
+- `substep` refers to a lower execution unit decomposed from a `step`.
+- `stage` is used only as existing field names such as `generated_by_stage`.
 
-## phase / substep 種別
+## phase / substep types
 
-| phase | step 種別 | substep |
+| phase | step type | substep |
 |-------|-----------|---------|
-| Compile | substep を持つ | `generate` / `verify` |
-| Generate | substep を持つ | `generate` / `verify` |
-| Build | 単一 step | - |
-| Validate | substep を持つ | `execute` / `judge` |
+| Compile | has substeps | `generate` / `verify` |
+| Generate | has substeps | `generate` / `verify` |
+| Build | single step | - |
+| Validate | has substeps | `execute` / `judge` |
 
-## 要件
+## Requirements
 
-### preflight と起動制御
-- workflow 実行は、必ず 1 つの `orchestration agent` を最初に起動して開始する。
-- workflow 開始前に、`step agent` と `substep agent` を独立起動できる execution platform の preflight を必須実行しなければならない。preflight は `multi_agent` 機能と子 `agent` 起動可否を検証対象に含め、`pass` でない場合は workflow を開始してはならない。
-- `backend=codex` の preflight は、`feature_states.codex_hooks=true` と `checks.codex_hooks_enabled.pass=true` と `checks.codex_home_writable.pass=true` を同時に満たさなければならない。
-- preflight は `sandbox_runtime=bwrap` と `sandbox_enforced=true` を必須条件に含めなければならない。`checks.sandbox_bwrap_available.pass=true` または `checks.sandbox_bwrap_userns.pass=true` または `checks.sandbox_bwrap_exec.pass=true` の少なくとも 1 つを満たさない場合、workflow を開始してはならない。
-- native hook 実行時の `codex_hooks` feature 判定は `orchestration_id` ごとに最初の 1 回だけ実行し、結果を `workspace/orchestrations/<orchestration_id>/hooks/codex_feature_check.json` へキャッシュしなければならない。
-- `preflight.json` の手動編集による `pass` 化を禁止する。
-- 子 `agent` 起動直前に execution platform の live probe で `multi_agent` と子 `agent` 起動可否を再検査しなければならない。`fail` の場合は `record-launch` と子 `agent` 起動を禁止し、workflow を `fail` へ遷移させる。
-- 各 phase の着手前に `workflow-launch-check` を実行し、required child `agent` 種別判定、execution platform 可否、session policy 可否、dependency readiness を同時に検査しなければならない。
+### preflight and launch control
+- Workflow execution always starts by first launching exactly one `orchestration agent`.
+- Before the workflow starts, the preflight of an execution platform that can launch the `step agent` and `substep agent` independently must be run. The preflight includes the `multi_agent` feature and the launchability of a child `agent` in its verification scope, and when it is not `pass` the workflow must not start.
+- The preflight of `backend=codex` must simultaneously satisfy `feature_states.codex_hooks=true`, `checks.codex_hooks_enabled.pass=true`, and `checks.codex_home_writable.pass=true`.
+- The preflight must include `sandbox_runtime=bwrap` and `sandbox_enforced=true` as required conditions. When at least 1 of `checks.sandbox_bwrap_available.pass=true`, `checks.sandbox_bwrap_userns.pass=true`, or `checks.sandbox_bwrap_exec.pass=true` is not satisfied, the workflow must not start.
+- The `codex_hooks` feature decision at native-hook execution time runs only once per `orchestration_id`, and the result must be cached in `workspace/orchestrations/<orchestration_id>/hooks/codex_feature_check.json`.
+- Making `preflight.json` `pass` by manual editing is forbidden.
+- Just before launching a child `agent`, `multi_agent` and the launchability of the child `agent` must be re-checked by a live probe of the execution platform. On `fail`, `record-launch` and the child-`agent` launch are forbidden, and the workflow transitions to `fail`.
+- Before starting each phase, run `workflow-launch-check`, and simultaneously check the required child-`agent`-type decision, execution-platform allowability, session-policy allowability, and dependency readiness.
 
-### phase 種別と agent 種別
-- 各 phase の着手前に、対象 phase が `step agent` 必須か `substep agent` 必須かを phase 種別で明示判定しなければならない。`Compile` / `Generate` / `Validate` は `substep agent` 必須、`Build` は `step agent` 必須とする。
-- phase 着手前判定で子 `agent` 必須と確定した場合、親 `agent` は `spawn_agent` 完了前に phase artifact 生成、MCP 実行、検証目的の仮実装を開始してはならない。
-- `workspace/ir/` と `workspace/pipelines/` の phase artifact root は、`record-launch` と capability token と `phase_state=child_running` の 3 条件を満たした child `agent` だけが実体化できる。`orchestration agent` による直接生成を禁止する。
-- child `agent` 起動前に root path 予約が必要な場合は、`workspace/orchestrations/<orchestration_id>/reservations/<node_key_safe>/<step>.json` の reservation artifact のみを生成し、`workspace/ir/` と `workspace/pipelines/` の実ディレクトリを作成してはならない。
-- `orchestration agent` は workflow 全体の進行制御のみを担当し、phase 本体の artifact（例: `spec.ir.yaml`、`diagnostics.json`）を直接生成してはならない。
-- workflow 実行の代替として、複数 phase の進行と artifact generation を一括自動化する script を新規生成または実行してはならない。
-- `Build` step は MCP `compile_project` を呼び出す determinstic な処理で、LLM 推論を要しない。`step agent` は MCP 呼び出しと結果記録に責務を限定する。
-- `Compile` / `Generate` / `Validate` の各 substep は `orchestration agent` が `spawn_agent` で直接起動する。
+### phase type and agent type
+- Before starting each phase, explicitly judge by phase type whether the target phase requires a `step agent` or a `substep agent`. `Compile` / `Generate` / `Validate` require a `substep agent`, and `Build` requires a `step agent`.
+- When the pre-phase judgment determines that a child `agent` is required, the parent `agent` must not start phase-artifact generation, MCP execution, or a verification-purpose provisional implementation before `spawn_agent` completes.
+- The phase-artifact roots of `workspace/ir/` and `workspace/pipelines/` can be materialized only by a child `agent` that satisfies the 3 conditions of `record-launch`, a capability token, and `phase_state=child_running`. Direct generation by the `orchestration agent` is forbidden.
+- When a root-path reservation is needed before launching a child `agent`, generate only the reservation artifact `workspace/orchestrations/<orchestration_id>/reservations/<node_key_safe>/<step>.json`, and the actual directories of `workspace/ir/` and `workspace/pipelines/` must not be created.
+- The `orchestration agent` is responsible only for the progress control of the whole workflow, and must not directly generate the phase-body artifacts (e.g. `spec.ir.yaml`, `diagnostics.json`).
+- As a substitute for workflow execution, a script that batch-automates the progress of multiple phases and artifact generation must not be newly generated or executed.
+- The `Build` step is a deterministic process that calls the MCP `compile_project` and requires no LLM inference. The `step agent` limits its responsibility to the MCP call and recording the result.
+- The `orchestration agent` directly launches each substep of `Compile` / `Generate` / `Validate` via `spawn_agent`.
 
 ### capability / write_root
-- child `agent` に許可する phase artifact の変更は、capability token が許可した `write_root` 配下に限定しなければならない。
+- The changes to phase artifacts permitted to a child `agent` must be limited to under the `write_root` permitted by the capability token.
   - `Compile.generate` / `Compile.verify`: `workspace/ir/<node_key_safe>/<ir_id>/`
   - `Generate.generate` / `Generate.verify`: `workspace/pipelines/<node_key_safe>/<pipeline_id>/source/<source_id>/`
   - `Build`: `workspace/pipelines/<node_key_safe>/<pipeline_id>/binary/<binary_id>/`
   - `Validate.execute` / `Validate.judge`: `workspace/pipelines/<node_key_safe>/<pipeline_id>/runs/<run_id>/<node_key_safe>/`
-- `ir_ref` / `pipeline_ref` 配下の変更は、`.json` / `.txt` 出力については `guarded-apply-patch` を通過した canonical path、それ以外の extension については `output_manifests/<agent_run_id>.json` の `allowed_file_tool_paths` に列挙された path への `Edit` / `Write` 直接書き込みに限定する。
-- `record-launch` は child `agent_run_id` ごとに `workspace/orchestrations/<orchestration_id>/output_manifests/<agent_run_id>.json` を生成し、`allowed_output_paths` と `allowed_file_tool_paths` と `allowed_tmp_root`（`workspace/tmp/<agent_run_id>`）を確定しなければならない。
-- **Make build の必須 file pin auto-inject**: `Generate` step かつ `spec.ir.yaml.impl_defaults.toolchain.build_system=make` のとき、`record-launch` は in-source `Makefile` (`<pipeline_ref>/source/<source_id>/src/Makefile`) を `allowed_output_paths` へ自動注入し、`allowed_file_tool_paths` へ流す。bare な `src/` directory entry だけでは source 拡張子 (`.f90`/`.c`) は `guarded-apply-patch` で書けても拡張子なしの `Makefile` は directory-allowlist の source-extension 集合から意図的に除外 (`tools/hooks/common.py`) されるため全経路で書けず、child が mid-run で推測回避 fail-stop する。orchestration agent は通常 `allowed_file_tool_paths` を省略 (auto-derive) すればよい。
-- **launch-time provisioning 検証**: `record-launch` は、Make build Generate launch で必須 `Makefile` pin が確定後の `allowed_file_tool_paths` に欠落している場合 (caller が明示 `allowed_file_tool_paths` を渡して pin を漏らした等)、**child 起動前に `ValueError` で fail-fast** する。artifact を汚染する mid-run fail-stop を、安価で recoverable な launch-time error に変換する。
-- `record-launch` は child `agent_run_id` ごとに `workspace/orchestrations/<orchestration_id>/read_manifests/<agent_run_id>.json` を生成し、`allowed_read_roots` と `denied_read_roots` を確定しなければならない。
-- `record-launch` は child `agent_run_id` ごとに `workspace/orchestrations/<orchestration_id>/sandbox_profiles/<agent_run_id>.json` を生成し、`bwrap` 実行に必要な `read_roots` と `write_roots` と runtime bind 構成を確定しなければならない。child 起動は当該 profile を用いた `bwrap` 実行のみを許可する。
+- Changes under `ir_ref` / `pipeline_ref` are limited to: for `.json` / `.txt` output, the canonical path that passed `guarded-apply-patch`; for other extensions, a direct `Edit` / `Write` to a path enumerated in `allowed_file_tool_paths` of `output_manifests/<agent_run_id>.json`.
+- `record-launch` must generate `workspace/orchestrations/<orchestration_id>/output_manifests/<agent_run_id>.json` per child `agent_run_id`, and finalize `allowed_output_paths`, `allowed_file_tool_paths`, and `allowed_tmp_root` (`workspace/tmp/<agent_run_id>`).
+- **Required file-pin auto-inject for Make builds**: when the step is `Generate` and `spec.ir.yaml.impl_defaults.toolchain.build_system=make`, `record-launch` auto-injects the in-source `Makefile` (`<pipeline_ref>/source/<source_id>/src/Makefile`) into `allowed_output_paths` and flows it into `allowed_file_tool_paths`. With only a bare `src/` directory entry, source extensions (`.f90`/`.c`) can be written with `guarded-apply-patch`, but the extension-less `Makefile` is intentionally excluded from the source-extension set of the directory allowlist (`tools/hooks/common.py`), so it cannot be written via any path and the child fail-stops mid-run to avoid guessing. The orchestration agent usually just omits `allowed_file_tool_paths` (auto-derive).
+- **launch-time provisioning verification**: when, in a Make-build Generate launch, the required `Makefile` pin is missing from the finalized `allowed_file_tool_paths` (e.g. the caller passed an explicit `allowed_file_tool_paths` and missed the pin), `record-launch` **fail-fasts with a `ValueError` before launching the child**. This converts an artifact-contaminating mid-run fail-stop into a cheap, recoverable launch-time error.
+- `record-launch` must generate `workspace/orchestrations/<orchestration_id>/read_manifests/<agent_run_id>.json` per child `agent_run_id`, and finalize `allowed_read_roots` and `denied_read_roots`.
+- `record-launch` must generate `workspace/orchestrations/<orchestration_id>/sandbox_profiles/<agent_run_id>.json` per child `agent_run_id`, and finalize the `read_roots`, `write_roots`, and runtime bind composition needed for `bwrap` execution. The child launch allows only `bwrap` execution using that profile.
 
-### file write 経路
-- `step agent` / `substep agent` は phase artifact を変更する場合、出力 path の extension で書き込み経路を分岐しなければならない。`.json` / `.txt` の出力は `apply_patch_writes` gate を通過した `guarded-apply-patch` を canonical invocation とし、`.yaml` / `.yml` / `.md` / source code 等の上記以外の extension は `output_manifests/<agent_run_id>.json.allowed_file_tool_paths` に列挙された path への `Edit` / `Write` 直接書き込みを canonical invocation とする。
-- `spec.ir.yaml` は `.yaml` 形式なので `Edit` / `Write` で書き込む。
-- 通常 `apply_patch` の直接実行、shell redirection、`tee`、`sed -i`、`perl -0pi`、`python` / `sh` / `bash` による file write は禁止する。
-- `guarded-apply-patch` の疎通確認は dry-run または no-op patch で実施しなければならない。
-- shell による file write は、対象 path が phase artifact かどうかを問わず、child `agent` 起動要求で明示した canonical invocation に含まれない限り禁止しなければならない。
+### file write paths
+- When a `step agent` / `substep agent` changes a phase artifact, it must branch the write path by the output path's extension. For `.json` / `.txt` output, the canonical invocation is `guarded-apply-patch` that passed the `apply_patch_writes` gate, and for extensions other than the above such as `.yaml` / `.yml` / `.md` / source code, the canonical invocation is a direct `Edit` / `Write` to a path enumerated in `output_manifests/<agent_run_id>.json.allowed_file_tool_paths`.
+- `spec.ir.yaml` is in `.yaml` format, so write it with `Edit` / `Write`.
+- The direct execution of normal `apply_patch`, shell redirection, `tee`, `sed -i`, `perl -0pi`, and file writes via `python` / `sh` / `bash` are forbidden.
+- The connectivity check of `guarded-apply-patch` must be performed with a dry-run or no-op patch.
+- A file write via shell, regardless of whether the target path is a phase artifact, must be forbidden unless it is included in the canonical invocation explicitly stated in the child-`agent` launch request.
 
-### LLM コンテキスト
-- `step agent` と `substep agent` は、同一 `LLM` コンテキストを共有してはならない。各 `agent_run_id` は固有の `context_id` を持ち、`context_isolated=true` を必須記録とする。
-- `Compile.generate` と `Compile.verify` は独立コンテキストで起動する。`Generate.generate` と `Generate.verify`、`Validate.execute` と `Validate.judge` も同様。
+### LLM context
+- The `step agent` and `substep agent` must not share the same `LLM` context. Each `agent_run_id` has a unique `context_id` and requires recording `context_isolated=true`.
+- `Compile.generate` and `Compile.verify` are launched in independent contexts. The same applies to `Generate.generate` and `Generate.verify`, and `Validate.execute` and `Validate.judge`.
 
-### agent_run 記録
-- `orchestration agent` は `substep` を持つ phase で必要な `substep` 群を起動し、完了判定を行った後に `step_result.json` を確定しなければならない。
-- `orchestration agent` は `deps.yaml` と `spec_catalog.yaml` から再構成した依存関係と `spec.ir.yaml` の `dependency` セクションに基づいて `step agent` または `substep agent` の起動可否を判定しなければならない。
-- すべての `agent` 実行は `agent_run_id` を持ち、入力参照・出力参照・親子関係を記録しなければならない。
-- `agent_runs.jsonl` の各行は `started_at` と `status` を必須記録とし、`status` が終端状態（`pass` / `fail` / `blocked` / `timeout` / `cancel`）の場合は `finished_at` を必須記録とする。
-- `fail_closed` は `orchestration_meta.status` の終端状態としてのみ使用する。
-- `step` / `substep` ロールの `agent_runs.jsonl` は `parent_agent_run_id` と `agent_backend` と `agent_model` と `context_id` と `context_isolated` と `agent_session_id` と `launch_request_ref` と `launch_response_ref` と `launch_prompt_ref` と `launch_reply_ref` と `agent_result_ref` と `agent_summary_ref` を必須記録とする。
-- `substep agent` の `parent_agent_run_id` は、当該 `substep` を起動した `orchestration agent_run_id` を指す。
-- `spawn_agent` の応答で得た子 `agent` 識別子は `agent_session_id` として記録しなければならない。
-- `record-launch` は child 起動直後に `workspace/orchestrations/<orchestration_id>/session_run_index.json` を更新し、`agent_run_id` と `agent_session_id` と `context_id` と `agent_role` と `status` を記録しなければならない。
-- `agent_graph.json` の `edge` は、`orchestration -> step` または `orchestration -> substep` を canonical source とする。
-- `agent_runs.jsonl` と `agent_graph.json` は、実行中イベントを逐次追記して生成しなければならない。後生成を禁止する。
-- `orchestration agent` 自身の `agent_runs.jsonl` 行は **起動直後に 1 回だけ** `agent_role=orchestration`、`status=running` で append する。`orchestration agent` 自身が `record-agent-run` でこの行を更新する経路は持たない（二重 invoke は `ValueError: duplicate agent_run_id` で reject される）。終端時には `set-status` が runtime 権限でこの行を in-place に terminal status へ書き換え `finished_at` を付与し（append ではなく rewrite のため duplicate guard に抵触しない）、resume（terminal reset）時は逆に `running` へ戻す。これは agent_runs ベースの audit / `validate_workspace_root` が orchestration 行を恒久 `running` と誤認するのを防ぐためであり、orchestration 全体の canonical な terminal 状態は引き続き `set-status` 経由で `orchestration_meta.json` 側に表現する。詳細は [docs/CLI_REFERENCE.md#record-agent-run](CLI_REFERENCE.md#record-agent-run) と [docs/CLI_REFERENCE.md#set-status](CLI_REFERENCE.md#set-status) を canonical source とする。
-- `record-launch` は、`spawn_agent` 成功直後の request/response 保存専用処理としなければならない。
-- `record-launch` は launch response に `sandbox_runtime=bwrap` と `sandbox_enforced=true` と `sandbox_profile_ref` を記録しなければならない。
+### agent_run recording
+- For a phase that has `substep`, the `orchestration agent` must launch the required `substep` group, make the completion judgment, and then finalize `step_result.json`.
+- The `orchestration agent` must judge the launchability of a `step agent` or `substep agent` based on the dependencies reconstructed from `deps.yaml` and `spec_catalog.yaml` and the `dependency` section of `spec.ir.yaml`.
+- Every `agent` execution has an `agent_run_id` and must record the input references, output references, and parent-child relationship.
+- Each line of `agent_runs.jsonl` requires recording `started_at` and `status`, and when `status` is a terminal status (`pass` / `fail` / `blocked` / `timeout` / `cancel`), requires recording `finished_at`.
+- `fail_closed` is used only as a terminal status of `orchestration_meta.status`.
+- The `agent_runs.jsonl` of the `step` / `substep` roles requires recording `parent_agent_run_id`, `agent_backend`, `agent_model`, `context_id`, `context_isolated`, `agent_session_id`, `launch_request_ref`, `launch_response_ref`, `launch_prompt_ref`, `launch_reply_ref`, `agent_result_ref`, and `agent_summary_ref`.
+- The `parent_agent_run_id` of a `substep agent` points to the `orchestration agent_run_id` that launched that `substep`.
+- The child-`agent` identifier obtained from the `spawn_agent` response must be recorded as `agent_session_id`.
+- `record-launch` must update `workspace/orchestrations/<orchestration_id>/session_run_index.json` immediately after launching the child, and record `agent_run_id`, `agent_session_id`, `context_id`, `agent_role`, and `status`.
+- The `edge` of `agent_graph.json` uses `orchestration -> step` or `orchestration -> substep` as the canonical source.
+- `agent_runs.jsonl` and `agent_graph.json` must be generated by sequentially appending in-flight events. Post-generation is forbidden.
+- The `agent_runs.jsonl` row of the `orchestration agent` itself is appended **only once, immediately after launch** with `agent_role=orchestration`, `status=running`. The `orchestration agent` itself has no path to update this row via `record-agent-run` (a double invoke is rejected with `ValueError: duplicate agent_run_id`). At termination, `set-status` rewrites this row in-place to a terminal status with runtime privilege and assigns `finished_at` (it is a rewrite, not an append, so it does not hit the duplicate guard), and on resume (terminal reset) it conversely returns it to `running`. This is to prevent the agent_runs-based audit / `validate_workspace_root` from mistaking the orchestration row as permanently `running`, and the canonical terminal state of the whole orchestration continues to be expressed on the `orchestration_meta.json` side via `set-status`. For details, [docs/CLI_REFERENCE.md#record-agent-run](CLI_REFERENCE.md#record-agent-run) and [docs/CLI_REFERENCE.md#set-status](CLI_REFERENCE.md#set-status) are the canonical source.
+- `record-launch` must be a process dedicated to saving the request/response immediately after `spawn_agent` succeeds.
+- `record-launch` must record `sandbox_runtime=bwrap`, `sandbox_enforced=true`, and `sandbox_profile_ref` in the launch response.
 
-### child agent 起動要求
-- `orchestration agent` は、子 `agent` 起動時に `docs/workflow/WORKFLOW_CORE.md` と対象 `step` に対応する `docs/workflow/phases/phase_*.md` を canonical source として、対象 `step` または `substep` の `execution input` と `verification input` と `expected output` を明示しなければならない。
-- `orchestration agent` は、子 `agent` 起動要求に要求定義と判定規則の canonical source が `docs/` と `spec/` と当該試行 artifact であることを明示しなければならない。`tools/` 配下の実装を読んで rule を抽出する指示または黙示を禁止する。
-- 子 `agent` の validator invocation は `run-gate` を原則とし、`python3 tools/orchestration_runtime.py run-gate --gate <gate_name> --agent-run-id <agent_run_id> --capability-token <capability_token> --args-json '<json>'` を canonical invocation とする。
-- validator script の直接実行は例外運用としてのみ許可する。許可対象は `validate_workspace_root.py` と `check_artifact_syntax.py` に限定する。
-- 子 `agent` が `apply_patch` を実行する場合、`python3 tools/orchestration_runtime.py guarded-apply-patch --repo-root <repo_root> --orchestration-id <orchestration_id> --actor-role <step|substep> --agent-run-id <agent_run_id> --paths-json '["..."]' --patch-text '<patch_text>' --capability-token <capability_token>` を canonical invocation とする。`guarded-apply-patch` の使用対象は `.json` / `.txt` 出力に限定する。
-- `record-agent-run` は、child `agent` が申告した `output_refs` と `apply_patch_writes` gate 記録、および `output_manifests/<agent_run_id>.json.allowed_file_tool_paths` に加えて、baseline との差分で実変更 path を検査しなければならない。実変更 path が capability token の `write_root` 配下にない、または gate 許可 path と `allowed_file_tool_paths` のいずれにも含まれない場合、`unauthorized write` として reject する。
-- **runtime placeholder 復元 (recoverability)**: 終端検査の baseline diff の前に、`record-agent-run` は `created_file_pin_stubs` に記録された runtime-owned placeholder (例 `lineage.json`) のうち、gate 経由で書換えられておらず (= `gate_changed_paths` 非被覆) 現在 absent なものを 0-byte で復元する。これにより、collateral に削除された runtime placeholder が `unauthorized write` として判定され、復元手段を持たない orchestration agent が恒久 `fail_closed` に陥る deadlock を防ぐ。`status=fail`/`blocked`/`timeout` の terminal record でも適用し、失敗 run を `agent_runs.jsonl` に記録可能とする (clean restart を可能にする)。`record-agent-run` は runtime 権限で動作するため、orchestration agent 自身には禁止される canonical-path write がここでは許容される。
-- `orchestration agent` は、子 `agent` 起動要求本文を `skills/workflow-orchestration/references/launch_prompts.md` の対応テンプレートから生成しなければならない。テンプレートを使わない自由形式 prompt を禁止する。
-- `ir_ref` と `pipeline_ref` と `dependency_ref` は、子 `agent` 起動前に canonical path を確定しなければならない。placeholder を起動要求へ記録してはならない。
+### child agent launch request
+- When launching a child `agent`, the `orchestration agent` must, using `docs/workflow/WORKFLOW_CORE.md` and the `docs/workflow/phases/phase_*.md` corresponding to the target `step` as the canonical source, make explicit the `execution input`, `verification input`, and `expected output` of the target `step` or `substep`.
+- The `orchestration agent` must make explicit, in the child-`agent` launch request, that the canonical source for the requirement definition and judgment rules is `docs/`, `spec/`, and the relevant trial's artifacts. An instruction or implication to read the implementation under `tools/` and extract rules is forbidden.
+- The validator invocation by the child `agent` defaults to `run-gate`, and the canonical invocation is `python3 tools/orchestration_runtime.py run-gate --gate <gate_name> --agent-run-id <agent_run_id> --capability-token <capability_token> --args-json '<json>'`.
+- The direct execution of a validator script is permitted only as an exceptional operation. The permitted targets are limited to `validate_workspace_root.py` and `check_artifact_syntax.py`.
+- When a child `agent` runs `apply_patch`, the canonical invocation is `python3 tools/orchestration_runtime.py guarded-apply-patch --repo-root <repo_root> --orchestration-id <orchestration_id> --actor-role <step|substep> --agent-run-id <agent_run_id> --paths-json '["..."]' --patch-text '<patch_text>' --capability-token <capability_token>`. The use of `guarded-apply-patch` is limited to `.json` / `.txt` output.
+- `record-agent-run` must, in addition to the `output_refs` the child `agent` declared, the `apply_patch_writes` gate record, and `output_manifests/<agent_run_id>.json.allowed_file_tool_paths`, inspect the actually-changed paths by the diff against the baseline. When an actually-changed path is not under the capability token's `write_root`, or is included in neither the gate-permitted paths nor `allowed_file_tool_paths`, it is rejected as an `unauthorized write`.
+- **runtime placeholder restoration (recoverability)**: before the terminal-check baseline diff, `record-agent-run` restores, as 0-byte, the runtime-owned placeholders recorded in `created_file_pin_stubs` (e.g. `lineage.json`) that have not been rewritten via a gate (= not covered by `gate_changed_paths`) and are currently absent. This prevents the deadlock in which a runtime placeholder deleted as collateral is judged an `unauthorized write` and the orchestration agent, having no means of restoration, falls into permanent `fail_closed`. It also applies to a terminal record with `status=fail`/`blocked`/`timeout`, making it possible to record a failed run in `agent_runs.jsonl` (enabling a clean restart). Because `record-agent-run` operates with runtime privilege, the canonical-path write that is forbidden to the orchestration agent itself is permitted here.
+- The `orchestration agent` must generate the child-`agent` launch-request body from the corresponding template in `skills/workflow-orchestration/references/launch_prompts.md`. A free-form prompt that does not use the template is forbidden.
+- `ir_ref`, `pipeline_ref`, and `dependency_ref` must be finalized to canonical paths before launching the child `agent`. A placeholder must not be recorded in the launch request.
 
 ### repair / retry
-- `orchestration agent` は、子 `agent` の返却結果を評価して `issue_severity`（`minor` / `major` / `critical`）を判定しなければならない。
-- `orchestration agent` は、`issue_severity` と契約逸脱範囲に基づいて再投入要否を判定し、再投入が必要な場合は `repair_strategy`（`reuse` / `restart`）を選択しなければならない。
-- `orchestration agent` は、phase artifact の repair を自身で直接実施してはならない。repair が必要な場合は、対象 `step` または `substep` の child `agent` へ再委譲しなければならない。
-- `repair_strategy=reuse` は、対象 `step` または `substep` の input contract と expected output を変更せず、局所修正で収束可能な場合にのみ選択してよい。
-- `repair_strategy=restart` は、契約再解釈、設計再構成、広範囲再生成のいずれかが必要な場合に選択する。
-- 再投入時は `repair_strategy` を問わず、新規 `agent_run_id` と新規 `context_id` を発行する。
-- `repair_strategy=reuse` の場合、`agent_session_id` は再利用してよい。`repair_strategy=restart` の場合、`agent_session_id` は新規発行しなければならない。
-- 再投入時の `launches/<agent_run_id>.request.json` は、`issue_severity` と `repair_strategy` と `repair_target_agent_run_id` と `repair_reason` を必須記録とする。
-- `repair_strategy=reuse` で `apply_patch_writes` gate 証跡は `repair_target_agent_run_id` から継承する。新規 `guarded-apply-patch` 呼び出しは不要とし、`record-agent-run` は `gates/<repair_target>/apply_patch_writes.json` を canonical な証跡として参照する。継承の事実は `<orch_root>/agents/<agent_run_id>/audit/gate_inheritance.json` に記録され audit 経路を構成する。`repair_strategy=restart` の場合は継承しない（契約再解釈のため新規証跡を必須とする）。
+- The `orchestration agent` must evaluate the child `agent`'s returned result and judge `issue_severity` (`minor` / `major` / `critical`).
+- The `orchestration agent` must judge whether re-submission is needed based on `issue_severity` and the scope of contract deviation, and when re-submission is needed, must choose `repair_strategy` (`reuse` / `restart`).
+- The `orchestration agent` must not directly perform the repair of a phase artifact itself. When a repair is needed, it must re-delegate to the child `agent` of the target `step` or `substep`.
+- `repair_strategy=reuse` may be chosen only when it can converge with a local fix without changing the input contract and expected output of the target `step` or `substep`.
+- `repair_strategy=restart` is chosen when any of contract reinterpretation, design reconstruction, or wide-scope regeneration is needed.
+- On re-submission, regardless of `repair_strategy`, a new `agent_run_id` and a new `context_id` are issued.
+- With `repair_strategy=reuse`, the `agent_session_id` may be reused. With `repair_strategy=restart`, a new `agent_session_id` must be issued.
+- The `launches/<agent_run_id>.request.json` on re-submission requires recording `issue_severity`, `repair_strategy`, `repair_target_agent_run_id`, and `repair_reason`.
+- With `repair_strategy=reuse`, the `apply_patch_writes` gate evidence is inherited from `repair_target_agent_run_id`. A new `guarded-apply-patch` call is unnecessary, and `record-agent-run` references `gates/<repair_target>/apply_patch_writes.json` as the canonical evidence. The fact of inheritance is recorded in `<orch_root>/agents/<agent_run_id>/audit/gate_inheritance.json` and constitutes the audit path. With `repair_strategy=restart`, there is no inheritance (because of contract reinterpretation, new evidence is required).
 
-### 再投入時の baseline diff 契約
-- `record-agent-run` reject 後の retry における child baseline diff は、毎回 live workspace を walk して baseline と比較する (`_compute_changed_paths_against_baseline`)。これにより deactivate 後の任意の filesystem 改変も terminal write validation の対象に残る。
-- retry の brick-cascade 防止のため、`<orch_root>/agent_runs_invalid.jsonl` (および lock sidecar) のみを runtime-owned 単体 file として live diff から narrow に除外する。これは前回の `record-agent-run` 失敗が次回 retry の diff を contaminate する原因 file であり、`record-agent-run` 自身が writer であることが確定している。`<orch_root>/audit/`・`<orch_root>/violations/`・`<orch_root>/failure_analysis.json` 等の他 control-plane path は blanket exempt **しない** — child の hook-bypass write が terminal validation に backstop として残る (`tools/orchestration_runtime.py::_should_ignore_runtime_snapshot_path` を canonical source とする)。
-- `<orch_root>/launches/...`・`<orch_root>/violations/...`・`<orch_root>/agents/...` 等の per-arid runtime-managed prefix も diff から除外する (元来 runtime-only directories)。`workspace/tmp/<parent_arid>/` 配下の parent scratch は `_validate_actual_write_paths` の `parent_tmp_root` exclusion で除外する。
-- `deactivate-child` は `<orch_root>/agents/<agent_run_id>/deactivate_snapshot.json` に child-authored path 集合を audit 用に保存する。本 snapshot は人手 audit と将来の debug 用途のみで、`record-agent-run` の validation 経路では参照しない (live diff を必ず通す)。
+### baseline diff contract on re-submission
+- The child baseline diff in a retry after a `record-agent-run` reject walks the live workspace each time and compares it with the baseline (`_compute_changed_paths_against_baseline`). This keeps any filesystem modification after deactivate within the scope of terminal write validation.
+- To prevent retry brick-cascade, only `<orch_root>/agent_runs_invalid.jsonl` (and the lock sidecar) is narrowly excluded from the live diff as a runtime-owned single file. This is the file that causes the previous `record-agent-run` failure to contaminate the next retry's diff, and `record-agent-run` itself is confirmed to be the writer. Other control-plane paths such as `<orch_root>/audit/`, `<orch_root>/violations/`, and `<orch_root>/failure_analysis.json` are **not** blanket-exempt — a hook-bypass write by the child remains as a backstop for terminal validation (`tools/orchestration_runtime.py::_should_ignore_runtime_snapshot_path` is the canonical source).
+- Per-arid runtime-managed prefixes such as `<orch_root>/launches/...`, `<orch_root>/violations/...`, and `<orch_root>/agents/...` are also excluded from the diff (originally runtime-only directories). The parent scratch under `workspace/tmp/<parent_arid>/` is excluded by the `parent_tmp_root` exclusion of `_validate_actual_write_paths`.
+- `deactivate-child` saves the child-authored path set in `<orch_root>/agents/<agent_run_id>/deactivate_snapshot.json` for audit. This snapshot is for manual audit and future debug use only, and is not referenced in the `record-agent-run` validation path (the live diff is always run).
 
-- 失敗 phase からのフィードバック方向は phase ごとに固定する:
-  - `Compile` 失敗 → Compile 内 retry のみ（上流は人手 Spec のため自動 retry なし）。
-  - `Generate` 失敗 → Generate 内 retry。`source_meta.json` の verify 失敗が `attribution=ir` と判定された場合は `Compile` まで戻す。
-  - `Build` 失敗 → Generate に戻す。Build 自体は決定的処理ゆえ LLM を介さず、`build_log` に記録された `compile_error` / `link_error` / `make_error` のいずれかを `repair_reason` として Generate へ転送する（詳細は `docs/workflow/phases/phase_03_build.md` の retry trigger 節）。
-  - `Validate` 失敗 → `judge` の `semantic_review.json#findings[*].attribution` と `verdict.json#failure_class` の組合せで Generate / Compile / Spec のどこに戻すかを deterministic に決定する（canonical 判定テーブルは `docs/workflow/phases/phase_04_validate.md` の「失敗時 retry の判定基準」節）。
+- The feedback direction from a failed phase is fixed per phase:
+  - `Compile` failure → only an in-Compile retry (no automatic retry because upstream is the manual Spec).
+  - `Generate` failure → an in-Generate retry. When a verify failure of `source_meta.json` is judged `attribution=ir`, go back to `Compile`.
+  - `Build` failure → go back to Generate. Because Build itself is a deterministic process, it does not involve an LLM, and forwards to Generate, as `repair_reason`, one of `compile_error` / `link_error` / `make_error` recorded in `build_log` (for details, the retry-trigger section of `docs/workflow/phases/phase_03_build.md`).
+  - `Validate` failure → deterministically decide whether to go back to Generate / Compile / Spec by the combination of the `judge`'s `semantic_review.json#findings[*].attribution` and `verdict.json#failure_class` (the canonical decision table is the "Decision criteria for retry on failure" section of `docs/workflow/phases/phase_04_validate.md`).
 
-## 設計方針
-- 単一責務: 1 つの `agent` は 1 つの責務のみを持つ。
-- 階層委譲: `orchestration agent -> step agent` と `orchestration agent -> substep agent` の 2 系統で制御する。
-- 契約駆動: 子 `agent` 起動時は input contract と output contract を固定し、契約外の読み書きを禁止する。
-- 追跡可能性: すべての起動・終了イベントを時系列で保存し、再実行時に同一判断を再現可能にする。
+## Design Policy
+- Single responsibility: one `agent` has only one responsibility.
+- Hierarchical delegation: control via the 2 systems `orchestration agent -> step agent` and `orchestration agent -> substep agent`.
+- Contract-driven: when launching a child `agent`, fix the input contract and output contract, and forbid reads/writes outside the contract.
+- Traceability: save all launch / termination events chronologically, and make the same judgment reproducible on re-execution.
 
-## オーケストレーション指示契約
-### 共通必須項目
-- `orchestration agent` は、子 `agent` への起動要求に `orchestration_id` と `agent_run_id` と `parent_agent_run_id` と `node_key` と `step` と `substep`（存在する場合）と `ir_ref` と `pipeline_ref` と `dependency_ref` を必須記録しなければならない。
-- 子 `agent` への起動要求本文は `skills/workflow-orchestration/references/launch_prompts.md` の対応テンプレートを基底とし、テンプレート内プレースホルダーを対象 `agent_run` の実値で置換して生成する。
-- 子 `agent` への起動要求には、`execution input` と `verification input` と `expected output` と `write_root` と `read_roots` を必須記録する。
-- `execution input` は当該 `agent` が artifact を生成するために直接参照してよい入力に限定する。
-- `verification input` は当該 `agent` が pass/fail 判定、整合確認、依存確認にのみ使用してよい入力として明示する。
-- `expected output` はファイル名、保存先、更新責務を含めて明示する。
-- 親 `agent` は入力不足時に推測補完を指示してはならない。不足入力がある場合は `fail-fast` 停止を指示する。
-- 子 `agent` への起動要求には `skill_name` と `skill_ref` と `skill_must_read_refs` を必須記録する。
+## Orchestration instruction contract
+### Common required items
+- The `orchestration agent` must record, in the launch request to a child `agent`, `orchestration_id`, `agent_run_id`, `parent_agent_run_id`, `node_key`, `step`, `substep` (when it exists), `ir_ref`, `pipeline_ref`, and `dependency_ref` as required.
+- The launch-request body to a child `agent` is based on the corresponding template in `skills/workflow-orchestration/references/launch_prompts.md`, generated by substituting the in-template placeholders with the actual values of the target `agent_run`.
+- The launch request to a child `agent` records `execution input`, `verification input`, `expected output`, `write_root`, and `read_roots` as required.
+- `execution input` is limited to the input that the relevant `agent` may directly reference to generate the artifact.
+- `verification input` is made explicit as input that the relevant `agent` may use only for pass/fail judgment, consistency confirmation, and dependency confirmation.
+- `expected output` is made explicit including the file name, storage location, and update responsibility.
+- The parent `agent` must not instruct guessed completion on an input shortage. When there is an input shortage, it instructs a `fail-fast` stop.
+- The launch request to a child `agent` records `skill_name`, `skill_ref`, and `skill_must_read_refs` as required.
 
-### `ir_ref` / `pipeline_ref` / `dependency_ref` の規約
-- `ir_ref` は `workspace/ir/<node_key_safe>/<ir_id>` のみとし、追加のパスセグメントを付けてはならない。`<ir_id>` は canonical な `<slug>_<YYYYMMDD>_<seq3>` 形式とする（正規表現 `^[a-z0-9]+(?:-[a-z0-9]+)*_[0-9]{8}_[0-9]{3}$`、canonical source: `docs/workflow/WORKFLOW_CORE.md` と `tools/orchestration_runtime.py` の `_SLUG_DATE_SEQ3_PATTERN`）。`<node_key_safe>` は `<ir_id>` の親 directory として配置し、`<ir_id>` 自体に prefix として付与してはならない（`node_key_safe` は `__` / `_` を含むため slug 正規表現に違反する）。
-- `pipeline_ref` は `workspace/pipelines/<node_key_safe>/<pipeline_id>` のみとし、追加のパスセグメント（`source/` や `source_meta.json` を含む）を付けてはならない。
-- `dependency_ref` は phase ごとに canonical path を固定する。`Compile` は `spec/.../deps.yaml`、`Generate` 以降は `workspace/...` の phase root（`ir_ref` または `pipeline_ref`）を記録し、`spec` 直参照を禁止する。
-- `Generate verify` の起動要求では、`source_id` を必須記録しなければならない。
-- `step agent` / `substep agent` が `pass` で終了するとき、`output_refs` の各パスは、対応する起動要求に記録された `ir_ref` または `pipeline_ref` ディレクトリ配下に含まれなければならない。
+### Conventions for `ir_ref` / `pipeline_ref` / `dependency_ref`
+- `ir_ref` is only `workspace/ir/<node_key_safe>/<ir_id>`, and an additional path segment must not be appended. `<ir_id>` is in the canonical `<slug>_<YYYYMMDD>_<seq3>` form (regex `^[a-z0-9]+(?:-[a-z0-9]+)*_[0-9]{8}_[0-9]{3}$`, canonical source: `docs/workflow/WORKFLOW_CORE.md` and `_SLUG_DATE_SEQ3_PATTERN` of `tools/orchestration_runtime.py`). Place `<node_key_safe>` as the parent directory of `<ir_id>`, and do not prepend it as a prefix to `<ir_id>` itself (because `node_key_safe` contains `__` / `_`, it violates the slug regex).
+- `pipeline_ref` is only `workspace/pipelines/<node_key_safe>/<pipeline_id>`, and an additional path segment (including `source/` or `source_meta.json`) must not be appended.
+- `dependency_ref` fixes the canonical path per phase. `Compile` records `spec/.../deps.yaml`, and from `Generate` onward records the phase root of `workspace/...` (`ir_ref` or `pipeline_ref`), forbidding a direct `spec` reference.
+- In the launch request of `Generate verify`, `source_id` must be recorded as required.
+- When a `step agent` / `substep agent` ends with `pass`, each path of `output_refs` must be included under the `ir_ref` or `pipeline_ref` directory recorded in the corresponding launch request.
 
-### `Compile` 起動要求
-- `Compile.generate` の `skill_must_read_refs` には `controlled_spec.md` と `tests.md` と `deps.yaml` と `spec/registry/spec_catalog.yaml` を含める。
-- `Compile.verify` の `skill_must_read_refs` には `Compile.generate` が生成した `spec.ir.yaml` と `controlled_spec.md` と `tests.md` と `deps.yaml` を含める。
-- `Compile.verify` は `spec.ir.yaml` の構造 invariant 検証（全 case が algorithm.steps に被覆 / 依存解決の閉包整合 / output 契約と algorithm 出力の整合）を必須責務とする。加えて `impl_defaults.toolchain.language` / `impl_defaults.toolchain.standard` / `impl_defaults.toolchain.build_system` / `impl_defaults.target.architecture` が未定義の場合は `fail` とする (canonical source: `docs/IMPL_PLAN_SPEC.md` "必須項目")。
+### `Compile` launch request
+- The `skill_must_read_refs` of `Compile.generate` includes `controlled_spec.md`, `tests.md`, `deps.yaml`, and `spec/registry/spec_catalog.yaml`.
+- The `skill_must_read_refs` of `Compile.verify` includes the `spec.ir.yaml` generated by `Compile.generate`, `controlled_spec.md`, `tests.md`, and `deps.yaml`.
+- `Compile.verify` has as a required responsibility the structural-invariant verification of `spec.ir.yaml` (all cases covered by algorithm.steps / closure consistency of dependency resolution / consistency of the output contract and the algorithm output). In addition, when `impl_defaults.toolchain.language` / `impl_defaults.toolchain.standard` / `impl_defaults.toolchain.build_system` / `impl_defaults.target.architecture` are undefined, it is a `fail` (canonical source: `docs/IMPL_PLAN_SPEC.md` "Required items").
 
-### `Generate` 起動要求
-- `Generate.generate` の `skill_must_read_refs` には `spec.ir.yaml` を含める。`controlled_spec.md` を直接読んではならない。
-- `Generate.verify` の `skill_must_read_refs` には `spec.ir.yaml` と `pipeline_ref` を基準とする相対パスとして `lineage.json` と `source/<source_id>/source_meta.json` を含める。
+### `Generate` launch request
+- The `skill_must_read_refs` of `Generate.generate` includes `spec.ir.yaml`. It must not read `controlled_spec.md` directly.
+- The `skill_must_read_refs` of `Generate.verify` includes `spec.ir.yaml` and, as relative paths based on `pipeline_ref`, `lineage.json` and `source/<source_id>/source_meta.json`.
 
-### `Validate` 起動要求
-- `Validate.execute` の `skill_must_read_refs` には `spec.ir.yaml` と `pipeline_ref/binary/<binary_id>/binary_meta.json` を含める。
-- `Validate.judge` の `skill_must_read_refs` には `spec.ir.yaml` と `tests.md` と同一 `run_id` 配下の `raw/` / `diagnostics.json` / `perf.json` / `quality_check.json` / `trial_meta.json` と `pipeline_ref/source/<source_id>/` を含める。judge の launch request は `source_id` / `source_binary_id` を必須にしない (runtime は `run_id` のみ enforce する); 代わりに judge は同一 `run_id` 配下の `trial_meta.json` を読み、`trial_meta.json.source_source_id` を `<source_id>` として解決する (trial_meta は Validate.execute が書き込み、runtime が `binary_meta.json.source_source_id` との一致を verify 済みのため、retry で複数 source が共存する pipeline でも judge が誤った source を読む経路は無い)。
-- `Validate.judge` は `raw/` から独立経路で判定指標を再計算し、`diagnostics.json` と整合確認しなければならない。`LLM` 意味検査を必須実行する。
+### `Validate` launch request
+- The `skill_must_read_refs` of `Validate.execute` includes `spec.ir.yaml` and `pipeline_ref/binary/<binary_id>/binary_meta.json`.
+- The `skill_must_read_refs` of `Validate.judge` includes `spec.ir.yaml`, `tests.md`, the `raw/` / `diagnostics.json` / `perf.json` / `quality_check.json` / `trial_meta.json` under the same `run_id`, and `pipeline_ref/source/<source_id>/`. The judge's launch request does not require `source_id` / `source_binary_id` (the runtime enforces only `run_id`); instead the judge reads `trial_meta.json` under the same `run_id` and resolves `trial_meta.json.source_source_id` as `<source_id>` (because trial_meta is written by Validate.execute and the runtime has verified its match with `binary_meta.json.source_source_id`, there is no path for the judge to read the wrong source even in a pipeline where multiple sources coexist due to retries).
+- `Validate.judge` must recompute the judgment metrics from `raw/` via an independent path, and confirm consistency with `diagnostics.json`. It must execute an `LLM` semantic check.
 
-## 運用ルール
-1. workflow 開始時に `orchestration_id` を発行し、`workspace/orchestrations/<orchestration_id>/orchestration_meta.json` を作成する。
-2. workflow 開始前に preflight 結果を `workspace/orchestrations/<orchestration_id>/preflight.json` へ記録し、`can_launch_step_agents=true` と `can_launch_substep_agents=true` と `sandbox_enforced=true` を同時に満たさない場合は `fail` として停止する。
-3. 各 phase の着手前に phase 種別を確認し、`Compile` / `Generate` / `Validate` では `substep agent`、`Build` では `step agent` を起動対象として確定する。
-4. `orchestration agent` は `step agent` または `substep agent` の起動要求ごとに `launches/<agent_run_id>.request.json` と `launches/<agent_run_id>.response.json` と `launches/<agent_run_id>.prompt.txt` と `launches/<agent_run_id>.reply.txt` を保存する。
-5. `record-launch` に保存する `response.json` と `child.response.json` は、`spawn_agent` 実応答の完全保存とし、子 `agent` 識別子を欠落させてはならない。
-6. 各 `step agent` と各 `substep agent` の完了時には、`agents/<agent_run_id>/dialogs/agent.result.json` と `agents/<agent_run_id>/dialogs/agent.summary.txt` を保存する。
-7. `agent.summary.txt` には、少なくとも最終 `status` と失敗要因または主要成果物参照を含める。
-8. `launches/<agent_run_id>.prompt.txt` は `skills/workflow-orchestration/references/launch_prompts.md` の対応テンプレートを具体化した本文とする。
-9. `orchestration agent` は `deps.yaml` と `spec_catalog.yaml` と `spec.ir.yaml` の `dependency` セクションを照合し、`spec` 依存関係に基づく実行キューを確定する。
-10. `orchestration agent` は起動対象ごとに `step agent` または `substep agent` を発行し、`node_key` と `step` と `ir_ref` と `pipeline_ref` と `dependency_ref` を入力として渡す。
-11. `orchestration agent` は上位 `node` の `Compile` を起動する前に、直下依存 `node` ごとの `ir_ref` と `ir_meta.json.verification_status` を照合し、`direct dependency ir readiness` を満たさない場合は起動してはならない。
-12. `orchestration agent` は上位 `node` の `Generate` 以降を起動する前に、直下依存 `node` ごとの `ir_ref` と `pipeline_ref` と最新 `aggregate_verdict` を照合し、`direct dependency execution readiness` を満たさない場合は起動してはならない。
-13. `direct dependency ir readiness` または `direct dependency execution readiness` を満たさない場合、`orchestration agent` は当該 `node` を `blocked` または `fail` として記録する。
-14. `orchestration agent` は対象 `step` の `execution input` と `verification input` と `expected output` を明示する。
-15. `substep` を持つ phase では、`orchestration agent` が各 `substep agent` を逐次起動する。
-16. `substep agent` は自身の artifact と対応 phase のメタデータを生成し、`agent_output_ref` を `orchestration agent` へ返却する。
-17. `orchestration agent` は子 `agent` の返却結果を評価し、`issue_severity` と再投入要否を確定する。
-18. 再投入が必要で `repair_strategy=reuse` の場合、`orchestration agent` は同一 `agent_session_id` の継続修正を許可してよい。新規 `agent_run_id` を発行し、`relation_type` を `reuse` として `record-launch` 記録を追加する。
-19. 再投入が必要で `repair_strategy=restart` の場合、`orchestration agent` は新規 `agent_session_id` を持つ `substep agent` を再起動し、`relation_type` を `restart` として `record-launch` 記録を追加する。
-20. `orchestration agent` は `substep` を持つ phase で全 `substep` の必須 artifact を検証し、`workspace/orchestrations/<orchestration_id>/steps/<node_key_safe>/<step>/<agent_run_id>/step_result.json` へ `step_result.json` を出力する。この `agent_run_id` は `orchestration agent_run_id` とする。`step_result.json` の `substep_agent_run_ids` は、当該 `step` で起動して `agent_runs.jsonl` に記録された **全** `substep` の `agent_run_id` を欠落なく列挙する。
-21. `step_result.json` は、再投入を実施した場合に `retry_decisions` 配列を保持し、各要素へ `issue_severity` と `repair_strategy` と `repair_target_agent_run_id` と `new_agent_run_id` と `repair_reason` を記録する。`status=pass` の `write-step-result` に記録する `retry_decisions` では、各 `new_agent_run_id` は `effective pass substep` 集合へ最終採用された `pass` run に限る。
-22. `noncanonical_phase_write_attempt` を起因とする再投入では、`repair_strategy=restart` を必須とする。
-23. `substep` を持つ phase の `step_result.json` における `status=pass` 判定は、`effective pass substep` 集合に対して行う。
-24. `status=pass` の `step_result` では、`effective pass substep` 集合に含まれる各 run が `pass` で終端していなければならない。
-25. `status=pass` の `step_result` における `required_outputs` 被覆判定は、`effective pass substep` 集合の `output_refs` のみを対象に行う。
-26. `step agent` は標準 `substep` を持たない phase（`Build`）で自身の artifact を検証し、`step_result.json` を出力する。
-27. `orchestration agent` は `step_result.json` を受け取り、次 `step` の起動可否を判定する。
-28. `node` 実行は `deps.yaml` と `spec_catalog.yaml` と `spec.ir.yaml.dependency` から再構成した依存順で逐次実行する。明示指示がない限り並列実行を行わない。
-29. `step agent` または `substep agent` が `fail` / `timeout` / `cancel` の場合、当該 `node` の当該 `step` を `fail` とし、下流 `step` 起動を禁止する。
-30. `orchestration agent` は各 `agent` 実行イベントを `workspace/orchestrations/<orchestration_id>/agent_runs.jsonl` へ追記する。
-31. `orchestration agent` は親子関係を `workspace/orchestrations/<orchestration_id>/agent_graph.json` へ保存し、`parent_agent_run_id` と `child_agent_run_id` と `relation_type` を必須記録とする。
-32. core workflow の全 `agent` は `workspace/` 配下以外へ書き込んではならない。
-33. workflow 実行時に `step` / `substep` の実処理を script で代行した場合は `fail` とし、当該試行を破棄する。
-34. 再投入時は新規 `agent_run_id` を発行し、既存 `launch` 証跡や `agent_runs` 行を上書きしてはならない。
-35. `preflight.json` の手動編集または後編集で `status` と `can_launch_*` を変更してはならない。
-36. 子 `agent` 起動直前の live probe が `fail` の場合、`record-launch` を実行してはならない。
-37. `record-launch` が実行する live probe は、`METDSL_PREFLIGHT_TTL_SECONDS` で設定した TTL（既定 30 分）以内に成功済みのプローブが存在する場合はスキップされる。`METDSL_ORCHESTRATION_ENFORCE_LIVE_PREFLIGHT=1` が明示設定されている場合は無効化される。
-38. native hook の実行結果は `workspace/orchestrations/<orchestration_id>/hooks/native_hook_events.jsonl` へ追記する。
-39. `tools/run_workflow.py` はワークフロー起動時に `METDSL_MISSING_ORCHESTRATION_ID_POLICY=strict` を設定し、orchestration_id なしの hook 実行を禁止する。
-40. 子 `agent` 必須 phase で契約に反する近道へ逸脱しそうな場合、`orchestration agent` は当該 phase が子 `agent` 起動必須であることを明示し、正規の起動手順へ復帰する。
-41. `write-step-result` が `status=pass` で完了した後、`orchestration_checkpoint.json` が `tools/orchestration_runtime.py` により自動更新される。
-42. `resume_enabled=true` の orchestration において、`orchestration agent` は `check-step-completed` を各 `step` 起動前に実行し、`completed=true` かつ `integrity=ok` の場合のみ当該 `step` のスキップを許可する。
-43. チェックポイントによりスキップした `step` は `agent_runs.jsonl` に `agent_role=skipped_by_checkpoint` として記録する。
-44. `resume_enabled=false` の orchestration では `orchestration_checkpoint.json` を信頼して `step` をスキップしてはならない。
-45. `write-step-result` の `status` が terminal (`pass` / `fail` / `blocked` / `timeout` / `cancel`) の場合、`Compile` / `Generate` / `Build` / `Validate` の `step_result.json` に `validation_stage` を必須記録する。許容値は `Compile: compile|full`、`Generate: post_generate|full`、`Build: post_build|full`、`Validate: post_execute|pre_judge|full`（runtime canonical: `tools/orchestration_runtime.py` の `STEP_REQUIRED_VALIDATION_STAGES`）。step ごとの許容値以外、または欠落時は runtime が `ValueError` で reject する。
-46. `codex_feature_check.json` の `status_kind=probe_error` の結果は永続固定してはならない。`METDSL_HOOK_FEATURE_RETRY_TTL_SECONDS`（既定 30 秒）経過後に再プローブを許可する。
-47. `workspace/tmp/<agent_run_id>/` は各 agent の一時作業領域として使用できる。agent は当該 literal path を直接指定する（`output_manifest_write_guard` は write 対象 path のみを判定し `$TMPDIR` env を参照しない）。`record-agent-run` は当該 `agent_run` 記録後に `workspace/tmp/<agent_run_id>/` を自動削除する。`tools/run_workflow.py` は `init` 成功後に環境変数 `TMPDIR` を `workspace/tmp/<orchestration_agent_run_id>/` に設定するが、これは subprocess inherit 用の保険であり agent 側での `export TMPDIR=...` は不要かつ禁止（Claude Code session sandbox の approval 要求で workflow が停止する）。
+## Operations Rules
+1. At workflow start, issue an `orchestration_id` and create `workspace/orchestrations/<orchestration_id>/orchestration_meta.json`.
+2. Before the workflow starts, record the preflight result in `workspace/orchestrations/<orchestration_id>/preflight.json`, and when `can_launch_step_agents=true`, `can_launch_substep_agents=true`, and `sandbox_enforced=true` are not simultaneously satisfied, stop with `fail`.
+3. Before starting each phase, confirm the phase type, and finalize the launch target as a `substep agent` for `Compile` / `Generate` / `Validate` and a `step agent` for `Build`.
+4. The `orchestration agent` saves `launches/<agent_run_id>.request.json`, `launches/<agent_run_id>.response.json`, `launches/<agent_run_id>.prompt.txt`, and `launches/<agent_run_id>.reply.txt` per launch request of a `step agent` or `substep agent`.
+5. The `response.json` and `child.response.json` saved by `record-launch` are a complete save of the actual `spawn_agent` response, and must not drop the child-`agent` identifier.
+6. On completion of each `step agent` and each `substep agent`, save `agents/<agent_run_id>/dialogs/agent.result.json` and `agents/<agent_run_id>/dialogs/agent.summary.txt`.
+7. `agent.summary.txt` includes at least the final `status` and the failure cause or main-artifact reference.
+8. `launches/<agent_run_id>.prompt.txt` is the body that concretizes the corresponding template in `skills/workflow-orchestration/references/launch_prompts.md`.
+9. The `orchestration agent` reconciles `deps.yaml`, `spec_catalog.yaml`, and the `dependency` section of `spec.ir.yaml`, and finalizes the execution queue based on the `spec` dependencies.
+10. The `orchestration agent` issues a `step agent` or `substep agent` per launch target, and passes `node_key`, `step`, `ir_ref`, `pipeline_ref`, and `dependency_ref` as input.
+11. Before launching the `Compile` of an upper `node`, the `orchestration agent` reconciles the `ir_ref` and `ir_meta.json.verification_status` per immediate dependency `node`, and must not launch when `direct dependency ir readiness` is not satisfied.
+12. Before launching `Generate` onward of an upper `node`, the `orchestration agent` reconciles the `ir_ref`, `pipeline_ref`, and latest `aggregate_verdict` per immediate dependency `node`, and must not launch when `direct dependency execution readiness` is not satisfied.
+13. When `direct dependency ir readiness` or `direct dependency execution readiness` is not satisfied, the `orchestration agent` records the relevant `node` as `blocked` or `fail`.
+14. The `orchestration agent` makes explicit the `execution input`, `verification input`, and `expected output` of the target `step`.
+15. For a phase that has `substep`, the `orchestration agent` launches each `substep agent` sequentially.
+16. The `substep agent` generates its own artifact and the corresponding phase's metadata, and returns `agent_output_ref` to the `orchestration agent`.
+17. The `orchestration agent` evaluates the child `agent`'s returned result, and finalizes `issue_severity` and whether re-submission is needed.
+18. When re-submission is needed and `repair_strategy=reuse`, the `orchestration agent` may permit continuation repair of the same `agent_session_id`. It issues a new `agent_run_id` and adds a `record-launch` record with `relation_type` of `reuse`.
+19. When re-submission is needed and `repair_strategy=restart`, the `orchestration agent` relaunches a `substep agent` with a new `agent_session_id` and adds a `record-launch` record with `relation_type` of `restart`.
+20. For a phase that has `substep`, the `orchestration agent` verifies the required artifacts of all `substep`, and outputs `step_result.json` to `workspace/orchestrations/<orchestration_id>/steps/<node_key_safe>/<step>/<agent_run_id>/step_result.json`. This `agent_run_id` is the `orchestration agent_run_id`. The `substep_agent_run_ids` of `step_result.json` enumerates, without omission, the `agent_run_id` of **all** `substep` launched in that `step` and recorded in `agent_runs.jsonl`.
+21. `step_result.json` holds a `retry_decisions` array when re-submission was performed, and records `issue_severity`, `repair_strategy`, `repair_target_agent_run_id`, `new_agent_run_id`, and `repair_reason` in each element. In the `retry_decisions` recorded in a `write-step-result` with `status=pass`, each `new_agent_run_id` is limited to a `pass` run finally adopted into the `effective pass substep` set.
+22. A re-submission triggered by a `noncanonical_phase_write_attempt` requires `repair_strategy=restart`.
+23. The `status=pass` judgment in the `step_result.json` of a phase that has `substep` is made over the `effective pass substep` set.
+24. In a `step_result` with `status=pass`, each run included in the `effective pass substep` set must have terminated with `pass`.
+25. The `required_outputs` coverage judgment in a `step_result` with `status=pass` is made over only the `output_refs` of the `effective pass substep` set.
+26. The `step agent` verifies its own artifact in a phase that has no standard `substep` (`Build`), and outputs `step_result.json`.
+27. The `orchestration agent` receives `step_result.json` and judges the launchability of the next `step`.
+28. `node` execution proceeds sequentially in the dependency order reconstructed from `deps.yaml`, `spec_catalog.yaml`, and `spec.ir.yaml.dependency`. It does not perform parallel execution unless explicitly instructed.
+29. When a `step agent` or `substep agent` is `fail` / `timeout` / `cancel`, the relevant `step` of the relevant `node` is `fail`, and downstream `step` launch is forbidden.
+30. The `orchestration agent` appends each `agent` execution event to `workspace/orchestrations/<orchestration_id>/agent_runs.jsonl`.
+31. The `orchestration agent` saves the parent-child relationship in `workspace/orchestrations/<orchestration_id>/agent_graph.json`, and requires recording `parent_agent_run_id`, `child_agent_run_id`, and `relation_type`.
+32. All `agent` of the core workflow must not write outside of `workspace/`.
+33. When the actual processing of a `step` / `substep` is proxied by a script during workflow execution, it is a `fail`, and the relevant trial is discarded.
+34. On re-submission, issue a new `agent_run_id`, and do not overwrite existing `launch` evidence or `agent_runs` rows.
+35. `status` and `can_launch_*` must not be changed by manual editing or post-editing of `preflight.json`.
+36. When the live probe just before launching a child `agent` is `fail`, `record-launch` must not be run.
+37. The live probe that `record-launch` runs is skipped when a probe that succeeded within the TTL set by `METDSL_PREFLIGHT_TTL_SECONDS` (default 30 minutes) exists. It is disabled when `METDSL_ORCHESTRATION_ENFORCE_LIVE_PREFLIGHT=1` is explicitly set.
+38. The execution result of a native hook is appended to `workspace/orchestrations/<orchestration_id>/hooks/native_hook_events.jsonl`.
+39. `tools/run_workflow.py` sets `METDSL_MISSING_ORCHESTRATION_ID_POLICY=strict` at workflow start, and forbids hook execution without an orchestration_id.
+40. When about to deviate into a contract-violating shortcut in a child-`agent`-required phase, the `orchestration agent` makes explicit that the relevant phase requires a child-`agent` launch, and returns to the legitimate launch procedure.
+41. After `write-step-result` completes with `status=pass`, `orchestration_checkpoint.json` is auto-updated by `tools/orchestration_runtime.py`.
+42. In an orchestration with `resume_enabled=true`, the `orchestration agent` runs `check-step-completed` before launching each `step`, and permits skipping the relevant `step` only when `completed=true` and `integrity=ok`.
+43. A `step` skipped by checkpoint is recorded in `agent_runs.jsonl` as `agent_role=skipped_by_checkpoint`.
+44. In an orchestration with `resume_enabled=false`, a `step` must not be skipped by trusting `orchestration_checkpoint.json`.
+45. When the `status` of `write-step-result` is terminal (`pass` / `fail` / `blocked` / `timeout` / `cancel`), `validation_stage` is required in the `step_result.json` of `Compile` / `Generate` / `Build` / `Validate`. The allowed values are `Compile: compile|full`, `Generate: post_generate|full`, `Build: post_build|full`, `Validate: post_execute|pre_judge|full` (runtime canonical: `STEP_REQUIRED_VALIDATION_STAGES` of `tools/orchestration_runtime.py`). The runtime rejects with `ValueError` for anything other than the per-step allowed values, or on omission.
+46. A result of `codex_feature_check.json` with `status_kind=probe_error` must not be permanently fixed. A re-probe is permitted after `METDSL_HOOK_FEATURE_RETRY_TTL_SECONDS` (default 30 seconds) elapses.
+47. `workspace/tmp/<agent_run_id>/` can be used as each agent's temporary working area. The agent directly specifies that literal path (`output_manifest_write_guard` judges only the write-target path and does not reference the `$TMPDIR` env). `record-agent-run` auto-deletes `workspace/tmp/<agent_run_id>/` after recording that `agent_run`. `tools/run_workflow.py` sets the environment variable `TMPDIR` to `workspace/tmp/<orchestration_agent_run_id>/` after `init` succeeds, but this is an insurance for subprocess inherit, and `export TMPDIR=...` on the agent side is unnecessary and forbidden (the Claude Code session sandbox's approval request would stop the workflow).
 
-## 判定基準
-- workflow ごとに `orchestration_id` が発行され、`orchestration_meta.json` が存在する。
-- 各 `step` または各 `substep` が独立 `agent_run_id` を持つ。
-- `step` と `substep` の `context_id` が重複せず、全件で `context_isolated=true` が記録される。
-- `step` と `substep` の `agent_runs.jsonl` に `agent_session_id` と各種参照が記録され、参照先実体が存在する。
-- `launches/<agent_run_id>.response.json` と `agents/<agent_run_id>/dialogs/child.response.json` が `spawn_agent` 実応答の同一内容を保持する。
-- `agent_runs.jsonl.agent_session_id` が、対応 `launch response` の子 `agent` 識別子と一致する。
-- `preflight.json` が存在し、`can_launch_step_agents=true` と `can_launch_substep_agents=true` を満たす。
-- preflight で `sandbox_runtime=bwrap` と `sandbox_enforced=true` が記録されている。
-- 各 phase の実行記録から、`Compile` / `Generate` / `Validate` は `substep agent`、`Build` は `step agent` を使用したことを追跡できる。
-- `agent_graph.json` で `orchestration -> step` または `orchestration -> substep` の親子関係を追跡できる。
-- `step_result.json` の `executor_agent_run_id` が当該ディレクトリ名と一致し、`substep_agent_run_ids` が親子関係と整合する。標準 `substep` を持たない phase（`Build`）では `substep_agent_run_ids=[]` を許可する。
-- `substep` を持つ `step` では、`agent_runs.jsonl` に記録された当該 `step` の全 `substep` の `agent_run_id` が、いずれかの `step_result.json` の `substep_agent_run_ids` に含まれる。
-- `step_result.json` の `required_outputs` が `docs/workflow/WORKFLOW_CORE.md` および対応する `docs/workflow/phases/phase_*.md` の phase contract と一致する。
-- `step_result.json` が `retry_decisions` を保持する場合、`effective pass substep` 集合を一意に復元できる。
-- `step_result.json` が terminal status の `Compile` / `Generate` / `Build` / `Validate` では、`validation_stage` が phase ごとの許容値 (項 45) に一致する。
+## Decision Criteria
+- Per workflow, an `orchestration_id` is issued and `orchestration_meta.json` exists.
+- Each `step` or each `substep` has an independent `agent_run_id`.
+- The `context_id` of `step` and `substep` do not duplicate, and `context_isolated=true` is recorded for all.
+- The `agent_runs.jsonl` of `step` and `substep` records `agent_session_id` and the various references, and the referenced entities exist.
+- `launches/<agent_run_id>.response.json` and `agents/<agent_run_id>/dialogs/child.response.json` hold the same content of the actual `spawn_agent` response.
+- `agent_runs.jsonl.agent_session_id` matches the child-`agent` identifier of the corresponding `launch response`.
+- `preflight.json` exists and satisfies `can_launch_step_agents=true` and `can_launch_substep_agents=true`.
+- `sandbox_runtime=bwrap` and `sandbox_enforced=true` are recorded in the preflight.
+- From the execution record of each phase, it can be traced that `Compile` / `Generate` / `Validate` used a `substep agent` and `Build` used a `step agent`.
+- The parent-child relationship `orchestration -> step` or `orchestration -> substep` can be traced in `agent_graph.json`.
+- The `executor_agent_run_id` of `step_result.json` matches the relevant directory name, and `substep_agent_run_ids` is consistent with the parent-child relationship. For a phase with no standard `substep` (`Build`), `substep_agent_run_ids=[]` is allowed.
+- For a `step` that has `substep`, the `agent_run_id` of all `substep` of that `step` recorded in `agent_runs.jsonl` is included in the `substep_agent_run_ids` of some `step_result.json`.
+- The `required_outputs` of `step_result.json` match the phase contract of `docs/workflow/WORKFLOW_CORE.md` and the corresponding `docs/workflow/phases/phase_*.md`.
+- When `step_result.json` holds `retry_decisions`, the `effective pass substep` set can be uniquely restored.
+- For `Compile` / `Generate` / `Build` / `Validate` where `step_result.json` has a terminal status, `validation_stage` matches the per-phase allowed values (item 45).
 
-## Patch 適用契約
+## Patch application contract
 
-`guarded-apply-patch` サブコマンドの仕様（canonical source: この節。`tools/orchestration_runtime.py` の実装を直接参照してはならない）。
+The specification of the `guarded-apply-patch` subcommand (canonical source: this section. The implementation of `tools/orchestration_runtime.py` must not be referenced directly).
 
-### CLI インタフェース
+### CLI interface
 
 ```
 python3 tools/orchestration_runtime.py guarded-apply-patch \
@@ -249,61 +249,61 @@ python3 tools/orchestration_runtime.py guarded-apply-patch \
   --capability-token <capability_token>
 ```
 
-`--patch-text` による直接埋め込みも可能だが、ARG_MAX 制限を避けるため `--patch-file` 経由を推奨する。`--patch-file` の保存先は `allowed_tmp_root` (= `workspace/tmp/<agent_run_id>/`) 配下の literal path のみ許可（`$TMPDIR` env への参照は動作するが env 依存を最小化するため literal を canonical とする）。
+Direct embedding via `--patch-text` is also possible, but to avoid the ARG_MAX limit, going through `--patch-file` is recommended. The storage location of `--patch-file` allows only a literal path under `allowed_tmp_root` (= `workspace/tmp/<agent_run_id>/`) (a reference to the `$TMPDIR` env works, but to minimize env dependence the literal is canonical).
 
-### strip 自動判定
+### automatic strip decision
 
-`--strip` という CLI 引数は存在しない。`--paths-json` で渡した `changed_paths` を oracle として `-p1` → `-p0` の順で `git apply --check` を内部試行し、すべての `changed_paths` を被覆できる最初の strip を自動選択する。
+The CLI argument `--strip` does not exist. Using the `changed_paths` passed via `--paths-json` as an oracle, it internally tries `git apply --check` in the order `-p1` → `-p0`, and automatically selects the first strip that can cover all `changed_paths`.
 
-### 出力契約
+### Output contract
 
-- 成功時は exit code 0、失敗時は 0 以外。
-- `violations[]` と失敗理由は **stderr** に JSON 形式で出力される。
-- gate 結果は `workspace/orchestrations/<orch_id>/gates/<agent_run_id>/apply_patch_writes.json` に書き込まれるが、このファイルを直接 Read してはならない。
+- On success, exit code 0; on failure, non-0.
+- `violations[]` and the failure reason are output to **stderr** in JSON format.
+- The gate result is written to `workspace/orchestrations/<orch_id>/gates/<agent_run_id>/apply_patch_writes.json`, but this file must not be read directly.
 
-### 許可対象 extension
+### Permitted extensions
 
-`.json` / `.txt` の出力のみ。`.yaml`・`.yml`・`.md`・source code は `Edit`/`Write` tool（`allowed_file_tool_paths` 経由）を使うこと。`spec.ir.yaml` は `Edit`/`Write` 経由で書き込む。
+Only `.json` / `.txt` output. For `.yaml`, `.yml`, `.md`, and source code, use the `Edit`/`Write` tool (via `allowed_file_tool_paths`). `spec.ir.yaml` is written via `Edit`/`Write`.
 
-### runtime 生成 placeholder の保護
+### Protection of runtime-generated placeholders
 
-`record-launch` は file pin (例 Generate の `lineage.json`) を bwrap が file 粒度で bind できるよう 0-byte placeholder として事前生成し、`sandbox_profiles/<agent_run_id>.json` の `created_file_pin_stubs` に記録する。`guarded-apply-patch` は apply 完了後に、**`changed_paths` に含まれない `created_file_pin_stubs` の placeholder が消えていれば 0-byte で復元する** (defense-in-depth)。`changed_paths` 被覆外の path を `git apply` が削除することは strip 判定後の被覆検査で既に reject されるが、万一の out-of-band 削除でも runtime-owned placeholder を残さないことを保証し、後段 `record-agent-run` の終端検査で「runtime artifact への非 gate 変更 = `unauthorized_write`」として恒久 `fail_closed` 化するのを防ぐ。`changed_paths` で被覆された path (agent が gate 経由で意図的に書換/削除した path) は復元対象外とする。
+`record-launch` pre-generates a file pin (e.g. Generate's `lineage.json`) as a 0-byte placeholder so that bwrap can bind it at file granularity, and records it in `created_file_pin_stubs` of `sandbox_profiles/<agent_run_id>.json`. After the apply completes, `guarded-apply-patch` **restores, as 0-byte, a placeholder of `created_file_pin_stubs` not included in `changed_paths` if it has disappeared** (defense-in-depth). That `git apply` deletes a path outside the `changed_paths` coverage is already rejected by the coverage check after the strip decision, but even in case of an out-of-band deletion, it guarantees that the runtime-owned placeholder is not lost, preventing the downstream `record-agent-run` terminal check from making it permanent `fail_closed` as "a non-gate change to a runtime artifact = `unauthorized_write`". A path covered by `changed_paths` (a path the agent intentionally rewrote/deleted via a gate) is excluded from restoration.
 
-## Capability / Manifest 契約
+## Capability / Manifest contract
 
-`record-launch` が発行する 3 つの manifest の必須フィールドと不変条件（canonical source: この節）。
+The required fields and invariants of the 3 manifests that `record-launch` issues (canonical source: this section).
 
-### `capabilities/<agent_run_id>.json` 必須フィールド
+### Required fields of `capabilities/<agent_run_id>.json`
 
-| フィールド | 型 | 説明 |
+| field | type | description |
 |---|---|---|
-| `agent_run_id` | string | 子 agent の UUID |
-| `capability_token` | string | 32 byte hex token |
-| `orchestration_id` | string | orchestration ID |
-| `agent_role` | `"orchestration"\|"step"\|"substep"` | agent ロール |
+| `agent_run_id` | string | the child agent's UUID |
+| `capability_token` | string | a 32-byte hex token |
+| `orchestration_id` | string | the orchestration ID |
+| `agent_role` | `"orchestration"\|"step"\|"substep"` | the agent role |
 | `node_key` | string | `<spec_kind>/<spec_id>@<spec_version>` |
 | `step` | string | `"compile"\|"generate"\|"build"\|"validate"` |
-| `write_roots` | array of strings | capability が許可する write root リスト |
-| `mcp_permissions` | object | MCP 権限スコープ |
-| `expires_at` | ISO8601 | capability 有効期限 |
+| `write_roots` | array of strings | the list of write roots the capability permits |
+| `mcp_permissions` | object | the MCP permission scope |
+| `expires_at` | ISO8601 | the capability expiry |
 
-**不変条件:** `agent_role` が `"step"` または `"substep"` の capability は `write_roots` が空配列であってはならない。
+**Invariant:** a capability whose `agent_role` is `"step"` or `"substep"` must not have an empty array for `write_roots`.
 
-### `output_manifests/<agent_run_id>.json` 必須フィールド
+### Required fields of `output_manifests/<agent_run_id>.json`
 
-| フィールド | 型 | 説明 |
+| field | type | description |
 |---|---|---|
-| `allowed_output_paths` | array of strings | `.json`/`.txt` 出力の許可 path 集合 |
-| `allowed_file_tool_paths` | array of strings | `Edit`/`Write` 直接書き込みの許可 path 集合 |
-| `allowed_tmp_root` | string | 一時ファイル許可ルート（`workspace/tmp/<agent_run_id>`） |
+| `allowed_output_paths` | array of strings | the permitted path set for `.json`/`.txt` output |
+| `allowed_file_tool_paths` | array of strings | the permitted path set for direct `Edit`/`Write` |
+| `allowed_tmp_root` | string | the temporary-file permission root (`workspace/tmp/<agent_run_id>`) |
 
-**使用方法:** agent は `allowed_tmp_root` の literal path (`workspace/tmp/<agent_run_id>/...`) を直接指定して書き込む。`output_manifest_write_guard` は write 対象 path のみを判定し `$TMPDIR` env を参照しないため、`export TMPDIR=...` / `jq -er ...` 等の bootstrap Bash は不要かつ禁止 (Claude Code session sandbox の approval 要求で workflow が停止する。詳細は `skills/workflow-orchestration/references/startup_contract.md` の tmp area 利用契約 参照)。
+**Usage:** the agent writes by directly specifying the literal path of `allowed_tmp_root` (`workspace/tmp/<agent_run_id>/...`). Because `output_manifest_write_guard` judges only the write-target path and does not reference the `$TMPDIR` env, bootstrap Bash such as `export TMPDIR=...` / `jq -er ...` is unnecessary and forbidden (the Claude Code session sandbox's approval request would stop the workflow; for details see the tmp-area usage contract of `skills/workflow-orchestration/references/startup_contract.md`).
 
-### `read_manifests/<agent_run_id>.json` 必須フィールド
+### Required fields of `read_manifests/<agent_run_id>.json`
 
-| フィールド | 型 | 説明 |
+| field | type | description |
 |---|---|---|
-| `allowed_read_roots` | array of strings | read が許可されるルートパスのリスト |
-| `denied_read_roots` | array of strings | 明示的に拒否されるルートパスのリスト |
+| `allowed_read_roots` | array of strings | the list of root paths that are permitted to read |
+| `denied_read_roots` | array of strings | the list of root paths that are explicitly denied |
 
-`output_manifests/<agent_run_id>.json` と `read_manifests/<agent_run_id>.json` は `Read` tool で直接読み取ってよい（`run-gate` 不要）。
+`output_manifests/<agent_run_id>.json` and `read_manifests/<agent_run_id>.json` may be read directly with the `Read` tool (`run-gate` not needed).

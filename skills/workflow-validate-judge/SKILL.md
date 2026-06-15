@@ -1,54 +1,54 @@
 ---
 name: workflow-validate-judge
-description: Validate ステージの judge substep を実行し、`tests.md` と `diagnostics.json` と依存情報に基づいて `verdict.json` と `aggregate_verdict.json` と `summary.json` を判定するときに使用する。依存 `DAG` の `blocked` 判定と `self_verdict` / `aggregate_verdict` 集約および `Validate` 失敗時の retry routing 用 `findings` 記録を行う作業に適用する。
+description: Use this when running the judge substep of the Validate stage and judging `verdict.json`, `aggregate_verdict.json`, and `summary.json` based on `tests.md`, `diagnostics.json`, and dependency information. It applies to the work of the `blocked` judgment of the dependency `DAG`, the `self_verdict` / `aggregate_verdict` aggregation, and the `findings` recording for retry routing on a `Validate` failure.
 ---
 
 # Workflow Validate Judge
 
-## 目的
-Validate phase の judge substep として、物理合否と依存集約合否を再現可能に決定し、失敗時の retry routing に必要な `findings` 分類を記録する。本 substep は独立 LLM context で動作し、execute substep が生成した一次証跡のみを根拠に判定する。
+## Purpose
+As the judge substep of the Validate phase, reproducibly decide the physics pass/fail and the dependency-aggregated pass/fail, and record the `findings` classification needed for retry routing on failure. This substep operates in an independent LLM context, and judges based only on the primary evidence the execute substep generated.
 
-## 適用範囲
-- `workspace/pipelines/<pipeline_id>/runs/<run_id>/<node_key_safe>/` の判定処理
-- `verdict.json` と `aggregate_verdict.json` と `summary.json` と `semantic_review.json` の生成
+## Scope
+- the judgment processing of `workspace/pipelines/<pipeline_id>/runs/<run_id>/<node_key_safe>/`
+- the generation of `verdict.json`, `aggregate_verdict.json`, `summary.json`, and `semantic_review.json`
 
-## 要件
-- 判定 canonical source は対象 `node` の `tests.md` と `spec.ir.yaml.io_contract` に固定する。
-- `self_verdict` は当該 `node` 単体の判定結果として `verdict.json` に保存する。
-- `aggregate_verdict` は推移依存 `node` を集約して `aggregate_verdict.json` に保存する。
-- 直下依存 `node` が `pass` または `xfail` でない場合、当該 `node` を `blocked` にする。
-- 判定指標は `runs/<run_id>/<node_key_safe>/raw/` の実行証跡から再計算し、`diagnostics.json` と整合確認する。再計算不能または不整合は `Validate.judge fail` とする。
-- 再計算入力は `raw` 一次証跡のみに限定し、`diagnostics.json` を再計算入力へ流用してはならない。
-- `raw` の必須構成は `spec.ir.yaml.io_contract.raw_requirements.required_evidence` を canonical source として判定し、固定の証跡構成を一律必須にしてはならない。
-- `raw/metrics_basis.json` は `io_contract.test_evidence_requirements` の全 `test_id` を対象とする per-test evidence index でなければならない。各 `test_id` の entry が `required_raw_variables` を欠落する場合、または suite 全体 summary しか持たない場合は `Validate.judge fail` とする。
-- 物理 `fail` の場合は性能評価をスキップする。
-- `summary.json` に `self_summary` と `dependency_summary` を必須保存し、`dependency_summary` は `total` と `pass` と `xfail` と `fail` と `blocked` を持つ。
-- LLM 意味検査結果は `semantic_review.json` として `runs/<run_id>/<node_key_safe>/` 配下へ保存し、`review_method`、`decision`、`scope.model_ref`、`scope.runner_ref`、`scope.raw_refs`、`findings` を必須記録とする。
-- `verdict.json` は `failure_class` を必須記録する。値域は `physics_fail` / `runtime_error` / `evidence_mismatch` / `structural_violation` / `pass` のいずれかとする。
-- 失敗を検出した `semantic_review.json#findings[*]` は次のキーを必須記録する: `finding_id` (string), `attribution` (`code` / `ir` / `spec` / `evidence` のいずれか), `evidence_refs[]` (path list), `confidence` (`high` / `medium` / `low`), `description` (text)。これらは `orchestration agent` が retry 対象 (Generate / Compile / Spec / Validate.execute) を deterministic に決定するための入力となる (canonical mapping: `docs/workflow/phases/phase_04_validate.md` の「失敗時 retry の判定基準」節)。
-- 判定 artifact の保存先ルートは `workspace/` のみを許可し、workflow ルート判定は `workspace/` のみを対象とする。
-- `Validate.judge` 開始前と完了前に `python3 tools/validate_pipeline_semantics.py --stage pre_judge --in-flight-agent-run-id <自身の agent_run_id>` を実行し、`fail` 時は `Validate.judge fail` とする。`--allow-missing-orchestration` と `--allow-missing-llm-review` を指定してはならない。
-  - **`--in-flight-agent-run-id <自身の agent_run_id>` を必ず付与すること（`<...>` は自身の `agent_run_id` を literal 置換）。** `record-launch` は judge 起動時に `agent_graph.json` の自 edge を append するが、judge 自身の `agent_runs.jsonl` entry と `validate` の `step_result.json` は judge 返却後に親が書くため、judge が自身の substep 内から `pre_judge` を実行する時点では未記録である。`pre_judge` はこの自己 in-flight 例外を **active marker の有無では判定せず**（crash や backend 差で残留・欠落しうるため）、live caller が宣言した `--in-flight-agent-run-id` のみを信頼し、かつ launch request が `step=validate, substep=judge` であることを検証した上で当該 edge と `validate` step_result を許容する。flag を付けないと自身の dangling edge と未生成 step_result が violation となり fail-closed で停止する。
-  - **`semantic_review.json` は「完了前」`pre_judge` の前に当該 judge 自身の実際の `decision` で書く（または上書きする）こと。** `pre_judge` は `semantic_review.json#decision != "pass"` を violation として検出するため、前の judge 試行が残した `decision=fail` を上書きしないまま「完了前」`pre_judge` を実行すると、自身の判定が pass でも stale な値で fail する。
-  - **node physics は pass（`semantic_review.json#decision=pass`）でも、physics 以外の blocker（例: orchestration-record integrity による `pre_judge` fail で当該 run 内で復旧不能）により certify できない場合は、`validate` の `step_result.json` を `status=blocked` で書ける。** `write-step-result` は `decision=pass` と `status=blocked` の併存を許容する（`status=pass` には finalize された verdict が、`status=fail` には `decision!=pass` が必要なため、`fail_closed` 以外の正直な終端経路として `blocked` を用いる）。ただし `blocked` 終端時も `aggregate_verdict.json` / `summary.json` / `trial_meta.json` の生成は必須であり、これらを欠くと `write-step-result` が reject する。
+## Requirements
+- The judgment canonical source is fixed at the target `node`'s `tests.md` and `spec.ir.yaml.io_contract`.
+- `self_verdict` is saved in `verdict.json` as the judgment result of the relevant `node` alone.
+- `aggregate_verdict` aggregates the transitive dependency `node` and is saved in `aggregate_verdict.json`.
+- When an immediate dependency `node` is not `pass` or `xfail`, make the relevant `node` `blocked`.
+- The judgment metrics are recomputed from the execution evidence of `runs/<run_id>/<node_key_safe>/raw/` and reconciled with `diagnostics.json`. Recomputation impossible or inconsistent is a `Validate.judge fail`.
+- The recomputation input is limited to the `raw` primary evidence only, and `diagnostics.json` must not be reused as recomputation input.
+- The required composition of `raw` is judged using `spec.ir.yaml.io_contract.raw_requirements.required_evidence` as the canonical source, and a fixed evidence composition must not be uniformly required.
+- `raw/metrics_basis.json` must be a per-test evidence index targeting all `test_id` of `io_contract.test_evidence_requirements`. When an entry of some `test_id` is missing `required_raw_variables`, or has only a whole-suite summary, it is a `Validate.judge fail`.
+- On a physics `fail`, skip the performance evaluation.
+- Require saving `self_summary` and `dependency_summary` in `summary.json`, and `dependency_summary` has `total`, `pass`, `xfail`, `fail`, and `blocked`.
+- The LLM semantic-check result is saved as `semantic_review.json` under `runs/<run_id>/<node_key_safe>/`, and requires recording `review_method`, `decision`, `scope.model_ref`, `scope.runner_ref`, `scope.raw_refs`, and `findings`.
+- `verdict.json` requires recording `failure_class`. The range is one of `physics_fail` / `runtime_error` / `evidence_mismatch` / `structural_violation` / `pass`.
+- A `semantic_review.json#findings[*]` that detected a failure requires recording the following keys: `finding_id` (string), `attribution` (one of `code` / `ir` / `spec` / `evidence`), `evidence_refs[]` (path list), `confidence` (`high` / `medium` / `low`), `description` (text). These are the input by which the `orchestration agent` deterministically decides the retry target (Generate / Compile / Spec / Validate.execute) (canonical mapping: the "Decision criteria for retry on failure" section of `docs/workflow/phases/phase_04_validate.md`).
+- The storage root for judgment artifacts allows only `workspace/`, and the workflow-root judgment targets only `workspace/`.
+- Before `Validate.judge` starts and before it completes, run `python3 tools/validate_pipeline_semantics.py --stage pre_judge --in-flight-agent-run-id <own agent_run_id>`, and on `fail` it is a `Validate.judge fail`. `--allow-missing-orchestration` and `--allow-missing-llm-review` must not be specified.
+  - **Always attach `--in-flight-agent-run-id <own agent_run_id>` (`<...>` is the literal substitution of your own `agent_run_id`).** `record-launch` appends the own edge of `agent_graph.json` at judge launch, but because the judge's own `agent_runs.jsonl` entry and the `validate` `step_result.json` are written by the parent after the judge returns, they are not yet recorded at the point the judge runs `pre_judge` from within its own substep. `pre_judge` does **not** judge this self in-flight exception by the presence of the active marker (because it can remain/be missing due to a crash or backend difference), but trusts only the `--in-flight-agent-run-id` declared by the live caller, and, after verifying that the launch request is `step=validate, substep=judge`, permits that edge and the `validate` step_result. Without the flag, its own dangling edge and the not-yet-generated step_result become a violation and it stops fail-closed.
+  - **Write (or overwrite) `semantic_review.json` with this judge's own actual `decision` before the "before completion" `pre_judge`.** Because `pre_judge` detects `semantic_review.json#decision != "pass"` as a violation, running the "before completion" `pre_judge` without overwriting the `decision=fail` left by a previous judge attempt fails on the stale value even if your own judgment is pass.
+  - **Even if the node physics is pass (`semantic_review.json#decision=pass`), when it cannot be certified due to a non-physics blocker (e.g. a `pre_judge` fail by orchestration-record integrity that is unrecoverable within that run), the `validate` `step_result.json` can be written with `status=blocked`.** `write-step-result` permits the coexistence of `decision=pass` and `status=blocked` (because `status=pass` requires a finalized verdict and `status=fail` requires `decision!=pass`, `blocked` is used as an honest terminal path other than `fail_closed`). However, even on a `blocked` termination, the generation of `aggregate_verdict.json` / `summary.json` / `trial_meta.json` is required, and lacking these rejects `write-step-result`.
 
-## 運用ルール
-1. 判定入力は同一 `run_id` 配下 artifact のみに限定する。
-2. 判定入力は `diagnostics.json` と `perf.json` と `raw` 実行証跡の同時存在を必須とし、いずれか欠落時は `Validate.judge` を開始しない。
-3. `aggregate_verdict.json` は `spec.ir.yaml.dependency` の依存集合と一致させる。
-4. `impl_defaults.target.class=cpu` の品質比較結果は `quality check` として記録し、`tests` 判定と分離する。
-5. `quality check` の比較 canonical source は `diagnostics.json` と `verdict.json` とし、`stdout` 差分のみで合否を確定してはならない。
-6. 判定失敗時は `summary.json` に失敗 classification を明示し、`semantic_review.json#findings[*].attribution` で戻り先ステージを指定する。
-7. 出力先が `workspace/` でない場合は `Validate.judge fail` とする。
-8. workflow 実行開始前に `workspace/` が存在しない場合、リポジトリルート直下へ `workspace/` を作成する。
-9. 開始前と完了前に `python3 tools/validate_workspace_root.py` を実行し、`fail` 時は `Validate.judge fail` とする。
-10. `python3 tools/validate_pipeline_semantics.py --stage pre_judge` の `exit code` が `0` でない場合、または `--allow-missing-orchestration` / `--allow-missing-llm-review` を指定した場合は、`verdict.json` と `aggregate_verdict.json` を確定してはならない。
-11. `attribution=spec` を判定した場合は、`fail_closed` で停止して `failure_analysis.json` に詳細 (finding 全文、evidence_refs、description) を記録するよう `orchestration agent` に通知する（自動 retry はしない）。
+## Operations Rules
+1. Limit the judgment input to only artifacts under the same `run_id`.
+2. The judgment input requires the simultaneous existence of `diagnostics.json`, `perf.json`, and the `raw` execution evidence, and when any is missing, `Validate.judge` does not start.
+3. Make `aggregate_verdict.json` match the dependency set of `spec.ir.yaml.dependency`.
+4. Record the quality-comparison result of `impl_defaults.target.class=cpu` as a `quality check`, separated from the `tests` judgment.
+5. The comparison canonical source of `quality check` is `diagnostics.json` and `verdict.json`, and pass/fail must not be finalized by `stdout` diff alone.
+6. On a judgment failure, make explicit the failure classification in `summary.json`, and specify the return-target stage by `semantic_review.json#findings[*].attribution`.
+7. When the output destination is not `workspace/`, it is a `Validate.judge fail`.
+8. When `workspace/` does not exist before workflow execution starts, create `workspace/` directly under the repository root.
+9. Before start and before completion, run `python3 tools/validate_workspace_root.py`, and on `fail` it is a `Validate.judge fail`.
+10. When the `exit code` of `python3 tools/validate_pipeline_semantics.py --stage pre_judge` is not `0`, or when `--allow-missing-orchestration` / `--allow-missing-llm-review` is specified, `verdict.json` and `aggregate_verdict.json` must not be finalized.
+11. When `attribution=spec` is judged, notify the `orchestration agent` to stop with `fail_closed` and record the details (the full finding, evidence_refs, description) in `failure_analysis.json` (no automatic retry).
 
-## 判定基準
-- 判定根拠が `tests.md` と `spec.ir.yaml.io_contract` と `diagnostics.json` に追跡できる。
-- 判定根拠が `raw` 実行証跡から再計算可能である。
-- `blocked` 判定条件が依存状態と一致する。
-- `aggregate_verdict.json` と `summary.json` が `spec.ir.yaml.dependency` と整合する。
-- `verdict.json#failure_class` と `semantic_review.json#findings[*].attribution` の組合せが `docs/workflow/phases/phase_04_validate.md` の retry 判定テーブルで一意に解釈可能である。
-- `python3 tools/validate_pipeline_semantics.py --stage pre_judge` が `exit code 0` を返す。
+## Decision Criteria
+- The judgment basis is traceable to `tests.md`, `spec.ir.yaml.io_contract`, and `diagnostics.json`.
+- The judgment basis is recomputable from the `raw` execution evidence.
+- The `blocked` judgment condition matches the dependency state.
+- `aggregate_verdict.json` and `summary.json` are consistent with `spec.ir.yaml.dependency`.
+- The combination of `verdict.json#failure_class` and `semantic_review.json#findings[*].attribution` is uniquely interpretable by the retry decision table of `docs/workflow/phases/phase_04_validate.md`.
+- `python3 tools/validate_pipeline_semantics.py --stage pre_judge` returns `exit code 0`.

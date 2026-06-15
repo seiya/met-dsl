@@ -1,6 +1,6 @@
-# Controlled Spec: 1 次元 周期境界 写像（component spec）
+# Controlled Spec: 1D periodic-boundary mapping (component spec)
 
-## 0. メタ情報
+## 0. Meta information
 - `spec_id`: `dynamics_advection_diffusion_boundary_1d_periodic_copy`
 - `spec_version`: `0.1.0`
 - `status`: `controlled_draft`
@@ -8,33 +8,32 @@
 - `domain`: `dynamics`
 - `family`: `advection_diffusion`
 
-## 1. 責務と適用範囲
-本 `component` は 1 次元 配列の 周期境界 ghost 写像のみを担当する。
+## 1. Responsibility and scope
+This `component` is responsible only for the periodic-boundary ghost mapping of a 1D array.
 
 ## 2. input/output contract
-入力は `u(-ng:nx-1+ng)`、`nx`、`ng` とする。出力は 周期写像後の `u` とする。
+The input is `u(-ng:nx-1+ng)`, `nx`, and `ng`. The output is `u` after the periodic mapping.
 
-## 3. 演算定義
-公開 `operation` は `dynamics_advection_diffusion_boundary_1d_periodic_copy__apply` とする。`ng=1` のとき
+## 3. Operation definition
+The published `operation` is `dynamics_advection_diffusion_boundary_1d_periodic_copy__apply`. When `ng=1`, apply
 $$
 u_{-1}=u_{nx-1},\quad u_{nx}=u_0
 $$
-を適用する。
 
-## 4. 失敗条件と制約
-`nx<2`、`ng<1` を入力不正としてエラーとする。
+## 4. Failure conditions and constraints
+Treat `nx<2` and `ng<1` as invalid input and an error.
 
-## 5. 公開 API と互換性
-公開 `operation_id` は `dynamics_advection_diffusion_boundary_1d_periodic_copy__apply` のみとする。`major` 互換破壊時は `spec_id` を分離する。
+## 5. Public API and compatibility
+The only published `operation_id` is `dynamics_advection_diffusion_boundary_1d_periodic_copy__apply`. On a `major` compatibility break, separate the `spec_id`.
 
-## 6. 禁止事項
-非周期境界への自動フォールバックを禁止する。
+## 6. Prohibitions
+Forbid automatic fallback to a non-periodic boundary.
 
-## 7. トレーサビリティ
-`component_catalog.yaml` と `case.resolved.yaml` に採用結果を必須記録とする。
+## 7. Traceability
+Require recording the adoption result in `component_catalog.yaml` and `case.resolved.yaml`.
 
-## 8. AD 準備情報
-`ad_readiness.enabled` は `true` とする。離散演算として 周期インデックス wrap を明示する。
+## 8. AD preparation information
+`ad_readiness.enabled` is `true`. The periodic-index wrap is made explicit as a discrete operation.
 
-## 9. tests 参照
-対応する `tests.md` を同一ディレクトリに配置し、`test_profile_version` を `0.1.0` とする。
+## 9. tests reference
+Place the corresponding `tests.md` in the same directory, with `test_profile_version` of `0.1.0`.

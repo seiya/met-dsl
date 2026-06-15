@@ -1,95 +1,95 @@
-# 自動チューニング運用ワークフロー（任意フロー）
+# Auto-tuning operational workflow (optional flow)
 
-## 位置づけ
-`Tune` は core workflow（`Spec → Compile → Generate → Build → Validate`）から分離した **任意フロー** として扱う。core workflow は `spec.ir.yaml` の `impl_defaults` を固定値として使用するが、`Tune` は `spec.ir.yaml` を不変前提として `impl_defaults` の variant を探索する。
+## Position
+`Tune` is treated as an **optional flow** separated from the core workflow (`Spec → Compile → Generate → Build → Validate`). The core workflow uses the `impl_defaults` of `spec.ir.yaml` as a fixed value, but `Tune` explores variants of `impl_defaults` with `spec.ir.yaml` as an invariant premise.
 
-## 基本方針
-tuner は generator から分離し、次のループを標準運用とする。
+## Basic policy
+The tuner is separated from the generator, and the following loop is the standard operation.
 
-1. 構造 IR 固定（`spec.ir.yaml`、core workflow で合格済み）
-2. 実装裁量 variant 探索（`tuning.spec` で `impl_defaults` の **knob レイヤのみ**上書きを定義）
-3. 生成/ビルド/実行/評価の自動化（core workflow と同等の Generate / Build / Validate を variant ごとに実行）
-4. 物理合格を制約とした性能目的関数の最適化
-5. 最良候補の固定と回帰監視への移行
+1. Fix the structural IR (`spec.ir.yaml`, already passed in the core workflow)
+2. Explore implementation-discretion variants (define overrides of **only the knob layer** of `impl_defaults` in `tuning.spec`)
+3. Automate generation/build/execution/evaluation (run the same Generate / Build / Validate as the core workflow per variant)
+4. Optimize a performance objective function with physical passing as a constraint
+5. Fix the best candidate and move to regression monitoring
 
-## `impl_defaults` の上書き可能境界（必読）
-`Tune` が `tuning.spec` で上書き可能な範囲は **`impl_defaults` の knob レイヤに限定**する。canonical な fixed / knob 境界は `docs/workflow/phases/phase_01_compile.md` の「impl_defaults の fixed / knob 境界」節を参照する。要点:
+## The override-allowed boundary of `impl_defaults` (must read)
+The range `Tune` can override via `tuning.spec` is **limited to the knob layer of `impl_defaults`**. For the canonical fixed / knob boundary, refer to the "fixed / knob boundary of impl_defaults" section of `docs/workflow/phases/phase_01_compile.md`. Key points:
 
-| 越境禁止 (fixed) | 上書き可能 (knob) |
+| crossing-forbidden (fixed) | override-allowed (knob) |
 |---|---|
-| `target.class` / `target.backend` / `target.architecture` | `abstract.*`（並列化粒度・レイアウト・融合・タイル等の意図） |
-| `toolchain.language` / `toolchain.standard` / `toolchain.build_system` | `backend_overrides.<key>.*`（スレッド数・block size・ベクトル幅等の backend 固有値） |
+| `target.class` / `target.backend` / `target.architecture` | `abstract.*` (the intent of parallelization granularity / layout / fusion / tiling, etc.) |
+| `toolchain.language` / `toolchain.standard` / `toolchain.build_system` | `backend_overrides.<key>.*` (backend-specific values such as thread count / block size / vector width) |
 | `selected.backend_key` | |
 
-`tuning.spec` が fixed sub-key を上書きする entry を含む場合、`Tune` 起動時に **fail_closed で停止する**ものとし、`Tune` 内部で variant 生成してはならない。これにより、Tune が `spec.ir.yaml` の構造を破壊しないことを保証する。
+When `tuning.spec` includes an entry that overrides a fixed sub-key, `Tune` shall **stop with fail_closed at launch**, and must not generate a variant inside `Tune`. This guarantees that Tune does not break the structure of `spec.ir.yaml`.
 
-新しいハードウェア/コンパイラ向けに fixed レイヤを変更する場合は、core workflow から `Compile` をやり直して新しい `ir_id` を発行する。これは Tune の責務ではない。
+To change the fixed layer for new hardware/compiler, redo `Compile` from the core workflow and issue a new `ir_id`. This is not the responsibility of Tune.
 
-設計要点:
-- 物理保証（A 固定）と性能探索（B 探索）を明確に分離できる（IR レベルでの分離）
-- 生成モデルを交換しても tuner のロジックが変わらない
-- 失敗時の原因局所化がしやすい（物理 fail vs 性能ノイズ vs 実装未対応）
+Design points:
+- The physics guarantee (A fixed) and the performance exploration (B exploration) can be clearly separated (separation at the IR level)
+- Even if the generation model is replaced, the tuner's logic does not change
+- The cause is easy to localize on failure (physics fail vs performance noise vs unimplemented)
 
-## 1. ループの構成（実務的な最小形）
+## 1. Composition of the loop (the practical minimal form)
 ### Inputs
-- `spec.ir.yaml`（不変、core workflow で確定済み）
-- `tuning.spec`（探索範囲 search_space を定義する Tune 専用入力）
-- コードテンプレ（実装パターン群）
+- `spec.ir.yaml` (invariant, finalized in the core workflow)
+- `tuning.spec` (a Tune-dedicated input that defines the search_space of the exploration range)
+- code templates (a group of implementation patterns)
 
 ### Per-trial Outputs
-- variant 用の `spec.ir.yaml`（`impl_defaults` を `tuning.spec` で上書きしたコピー）
-- `<stage>_meta.json`（`LLM` 利用ステージ内検証の結果）
-- `diagnostics.json`（物理）
-- `perf.json`（性能）
-- `verdict.json`（物理合否 + 可能なら性能判定）
-- `trial_meta.json`（ビルドログ、環境、乱数、git sha）
+- a `spec.ir.yaml` for the variant (a copy with `impl_defaults` overridden by `tuning.spec`)
+- `<stage>_meta.json` (the result of the in-`LLM`-stage verification)
+- `diagnostics.json` (physics)
+- `perf.json` (performance)
+- `verdict.json` (physics pass/fail + performance judgment if possible)
+- `trial_meta.json` (build log, environment, random seed, git sha)
 
 ### Loop
-- 候補生成（LLM 支援/BO/ ルール）
-- （必要なら）generator でコード差分生成
-- `LLM` を利用する候補生成・コード生成は `SPEC.md` の「LLM の扱い」を適用する
-- 標準運用は `debug_mode=false` とし、失敗試行 artifact を保存しない。調査時のみ `debug_mode=true` を許可する
-- 推奨: **コードの構造はテンプレで固定し、impl ノブで分岐**。 LLM は新しい実装パターン追加時のみ使う。
-- ビルド（ターゲット別）
-- quick physics gate（L0-L2 のサブセット）
-- perf 測定（複数回・統計）
-- モデル更新（次候補を提案）
+- candidate generation (LLM-assisted / BO / rules)
+- (if needed) generate a code diff with the generator
+- LLM-using candidate generation / code generation applies the "Handling of the LLM" of `SPEC.md`
+- the standard operation is `debug_mode=false`, and does not save failed-attempt artifacts. Only during investigation is `debug_mode=true` permitted
+- recommended: **fix the code structure with templates and branch with impl knobs**. Use the LLM only when adding a new implementation pattern.
+- build (per target)
+- quick physics gate (a subset of L0-L2)
+- perf measurement (multiple times, statistics)
+- model update (propose the next candidate)
 
-## 2. 候補生成方式
-段階戦略を選択する。
+## 2. Candidate-generation method
+Select a staged strategy.
 
-### Stage A: ルールベース（最初に必須）
-- 安全なノブのみ（tile,fuse,vectorize,layout）
-- 探索点数を絞る（例: 20-50）
-- 目的: “明確に速くなる”領域を見つける
+### Stage A: rule-based (required first)
+- only safe knobs (tile, fuse, vectorize, layout)
+- narrow the number of exploration points (e.g. 20-50)
+- purpose: find the region that "clearly gets faster"
 
-### Stage B: ベイズ最適化（推奨）
-- 離散ノブでも扱える BO（TPE 等）を想定
-- ノイズを考慮し、同一点を再測定する
+### Stage B: Bayesian optimization (recommended)
+- assume a BO that can handle discrete knobs (TPE etc.)
+- considering noise, re-measure the same point
 
-### Stage C: LLM 支援（必要時のみ）
-- 新しい実装パターンの追加（例: fused kernel を新設、async halo を追加）
-- “ノブの追加”を提案し、search_space を拡張する
-- 注意: LLM は探索の主役ではなく、探索空間の設計支援に使う
+### Stage C: LLM-assisted (only when needed)
+- add a new implementation pattern (e.g. newly create a fused kernel, add an async halo)
+- propose "knob additions" and expand the search_space
+- note: the LLM is not the main player of the exploration but is used to assist the design of the exploration space
 
-## 3. 物理合格ゲート
-- 物理 fail の候補は性能評価しない（評価コスト削減）
-- 許容は物理的妥当性一致（bitwise 不要）
-- quick→full の 2 段階を選択
-- quick: 小さい nx/ 短い t_end（ノイズと時間のバランス）
-- full: 本番に近いケース
+## 3. Physics-passing gate
+- do not evaluate the performance of a physics-fail candidate (reduce evaluation cost)
+- the tolerance is physical-validity agreement (bitwise not needed)
+- select the 2-stage quick→full
+- quick: small nx / short t_end (the balance of noise and time)
+- full: a case close to production
 
-## 4. 性能測定の扱い
-- `perf.json` は最小でも `walltime_sec`、`throughput_cells_per_sec`、`parallelism` を必須
-- GPU はウォームアップを入れ、複数回測定して平均/分散を保存
-- baseline と比較する performance regression を L3 に追加可能
+## 4. Handling of performance measurement
+- `perf.json` requires at minimum `walltime_sec`, `throughput_cells_per_sec`, and `parallelism`
+- for GPU, add a warm-up, measure multiple times, and save the mean/variance
+- a performance regression compared with the baseline can be added to L3
 
-## 5. キャッシュと再利用
-- `case_hash` と `impl_hash` で結果をキャッシュし、同一試行を再実行しない
-- ビルド artifact も hash で再利用する（可能なら）
+## 5. Cache and reuse
+- cache the result by `case_hash` and `impl_hash`, and do not re-run the same trial
+- reuse the build artifact by hash too (if possible)
 
-## 6. いつ"決め打ち"するか
-- チューニングで得た best impl を `spec.ir.yaml.impl_defaults` の上書き variant として固定する。
-- 固定後は回帰（物理 + 性能）へ移行する。
-- 新アーキ/新コンパイラのときだけ再チューニングする
-- 採用 variant は任意フロー `Promote` で `releases/` へ昇格する。
+## 6. When to "fix"
+- fix the best impl obtained by tuning as an override variant of `spec.ir.yaml.impl_defaults`.
+- after fixing, move to regression (physics + performance).
+- re-tune only for a new architecture / new compiler
+- promote the adopted variant to `releases/` with the optional flow `Promote`.

@@ -1,47 +1,47 @@
 # Docs Index
 
-このドキュメント群は「読む順 = 進め方」になるように構成する。
+This document set is organized so that "the reading order = the way to proceed".
 
-## 最短の読む順
-1. `SPEC.md`（不変原則・最終ゴール・`spec_kind` 3 層設計）
-2. `CONTROLLED_SPEC.md`（`problem` / `component` / `profile` の書式と必須要件）
-3. `TESTS.md`（`tests` の書式と必須要件）
-4. `PHYSICAL_VALIDATION.md`（物理妥当性判定の要件）
-5. `GLOSSARY.md`（`Artifacts` / `terms`）
-6. `WORKFLOW.md`（5-phase `Spec → Compile → Generate → Build → Validate` の入口。本文は `workflow/WORKFLOW_CORE.md` と `workflow/phases/` に分割）
-7. `ORCHESTRATION.md`（`orchestration agent -> substep agent` と `orchestration agent -> step agent` の実行規約）
-8. `RUNBOOK.md`（試行を回すための最小運用手順）
-9. `IMPL_PLAN_SPEC.md`（`spec.ir.yaml.impl_defaults` セクションの既定値規則）
-10. `PERFORMANCE_DIAGNOSTICS.md`（`perf.json` 仕様）
-11. `TUNING_WORKFLOW.md`（任意フロー: 性能探索の運用指針）
+## Shortest reading order
+1. `SPEC.md` (invariant principles, final goal, `spec_kind` 3-layer design)
+2. `CONTROLLED_SPEC.md` (format and required items for `problem` / `component` / `profile`)
+3. `TESTS.md` (format and required items for `tests`)
+4. `PHYSICAL_VALIDATION.md` (requirements for physical-validity judgment)
+5. `GLOSSARY.md` (`Artifacts` / `terms`)
+6. `WORKFLOW.md` (entry point for the 5-phase `Spec → Compile → Generate → Build → Validate`; the body is split into `workflow/WORKFLOW_CORE.md` and `workflow/phases/`)
+7. `ORCHESTRATION.md` (execution conventions for `orchestration agent -> substep agent` and `orchestration agent -> step agent`)
+8. `RUNBOOK.md` (minimal operational procedures for running trials)
+9. `IMPL_PLAN_SPEC.md` (default-value rules for the `spec.ir.yaml.impl_defaults` section)
+10. `PERFORMANCE_DIAGNOSTICS.md` (`perf.json` specification)
+11. `TUNING_WORKFLOW.md` (optional flow: operational guidance for performance exploration)
 
 ## Role-based Structure
-### Core（方向性・契約）
+### Core (direction / contracts)
 - `SPEC.md`
 - `CONTROLLED_SPEC.md`
 - `TESTS.md`
 - `PHYSICAL_VALIDATION.md`
 - `GLOSSARY.md`
 
-### Loop（試行を回す, core workflow）
+### Loop (running trials, core workflow)
 - `WORKFLOW.md` / `workflow/WORKFLOW_CORE.md` / `workflow/phases/`
 - `ORCHESTRATION.md`
 - `RUNBOOK.md`
 
-### Execution / Performance（実装と性能）
+### Execution / Performance (implementation and performance)
 - `IMPL_PLAN_SPEC.md`
 - `PERFORMANCE_DIAGNOSTICS.md`
 
-### Optional flows（任意フロー, core workflow 外）
-- `TUNING_WORKFLOW.md`（Tune: 実装裁量 variant 探索 / Promote: 正式版昇格）
+### Optional flows (optional flows, outside the core workflow)
+- `TUNING_WORKFLOW.md` (Tune: implementation-discretion variant exploration / Promote: promotion to the official version)
 
-## 運用ルール
-- 迷ったら `SPEC.md` の「不変原則」に立ち戻る。
-- 仕様の追加・変更は `SPEC.md` と `CONTROLLED_SPEC.md` と `TESTS.md` と対象 `spec` の `tests.md` を更新する。
-- `problem` / `component` / `profile` の責務境界を跨ぐ変更は、関連する `spec` を同一変更で更新する。
-- 言語に依らず、生成コードは `model`（物理計算）と `runner`（実行・判定連携）を分離する。
-- `LLM` を使うステージは、ステージ内部で `generate -> verify -> regenerate` を実施し、最終合格 artifact のみを保存する。
-- `LLM` 利用ステージは各ステージの `<stage>_meta.json` を必須出力とし、標準運用（`debug_mode=false`）では失敗試行 artifact を保存しない。
-- `workflow` 実行は `ORCHESTRATION.md` の規約に従い、`orchestration agent` 起点で開始する。
-- 試行手順が固まり次第、`RUNBOOK.md` を前提に自動化を進める。
-- `compile` / `run` / `quality check` は `MCP` サーバー（`mcp_servers/build_runtime_server.py`）経由で実行する。
+## Operations Rules
+- When in doubt, return to the "invariant principles" in `SPEC.md`.
+- To add or change a specification, update `SPEC.md`, `CONTROLLED_SPEC.md`, `TESTS.md`, and the target `spec`'s `tests.md`.
+- For a change that crosses the responsibility boundary of `problem` / `component` / `profile`, update the related `spec` in the same change.
+- Regardless of language, the generated code separates `model` (physics computation) and `runner` (execution / judgment coordination).
+- A stage that uses the `LLM` performs `generate -> verify -> regenerate` inside the stage, and saves only the final accepted artifact.
+- A stage that uses the `LLM` produces each stage's `<stage>_meta.json` as a required output, and in standard operation (`debug_mode=false`) does not save failed-attempt artifacts.
+- `workflow` execution follows the conventions in `ORCHESTRATION.md` and starts from the `orchestration agent`.
+- As soon as the trial procedure is settled, proceed with automation on the premise of `RUNBOOK.md`.
+- Run `compile` / `run` / `quality check` through the `MCP` server (`mcp_servers/build_runtime_server.py`).

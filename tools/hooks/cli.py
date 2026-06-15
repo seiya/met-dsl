@@ -228,9 +228,9 @@ def _append_hook_audit(
             if isinstance(inner_repo_root, str) and inner_repo_root.strip():
                 repo_root_raw = inner_repo_root
 
-    # `repo_root` が未指定の ambient hook 呼び出しでは実 workspace を汚染しない。
-    # 監査ログを永続化する場合は、明示的に `repo_root`（または env 経由の
-    # `METDSL_HOOK_REPO_ROOT`）を与える。
+    # For an ambient hook call where `repo_root` is unspecified, do not pollute the
+    # actual workspace. To persist the audit log, give an explicit `repo_root`
+    # (or `METDSL_HOOK_REPO_ROOT` via env).
     if not (isinstance(repo_root_raw, str) and repo_root_raw.strip()):
         if env_repo_root:
             repo_root = Path(env_repo_root).resolve()
@@ -398,7 +398,7 @@ def _active_child_agent_run_id_path(repo_root: Path, orchestration_id: str) -> P
 
 
 def _get_orchestration_agent_run_id(repo_root: Path, orchestration_id: str) -> str | None:
-    """orchestration_meta.json から orchestration_agent_run_id を取得する。"""
+    """Obtain orchestration_agent_run_id from orchestration_meta.json."""
     meta_path = (
         repo_root
         / "workspace"
@@ -650,7 +650,7 @@ def _detect_sed_inplace_targets(command: str) -> list[str]:
 
 
 def _detect_bash_write_targets(command: str | None) -> list[str]:
-    """Bash コマンドから書き込み先パスを抽出する。"""
+    """Extract write-target paths from a Bash command."""
     if not command:
         return []
     targets: list[str] = []
@@ -967,8 +967,8 @@ def _evaluate_pre_command_file_access_policy(
                 agent_role=agent_role,
                 session_id=decoded.session_id,
             )
-        # Write / Edit: manifest 一致時は permissionDecision=allow を返して harness の
-        # permission prompt を bypass する。manifest 不一致は BLOCK のまま伝播する。
+        # Write / Edit: on a manifest match, return permissionDecision=allow to bypass
+        # the harness's permission prompt. A manifest mismatch propagates as BLOCK.
         write_decision = _validate_write_targets(
             repo_root=repo_root,
             orchestration_id=orchestration_id,

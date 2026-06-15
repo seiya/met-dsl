@@ -1,18 +1,19 @@
 #!/usr/bin/env python3
-"""argparse ↔ docs/CLI_REFERENCE.md{,_RARE} の sync test.
+"""Sync test for argparse ↔ docs/CLI_REFERENCE.md{,_RARE}.
 
-CLI 引数情報の取得方針 (`CLAUDE.md` の「CLI 仕様の確認規約」節) では、頻出
-subcommand (Tier-A) を `docs/CLI_REFERENCE.md` で網羅、稀少 subcommand (Tier-B)
-を `docs/CLI_REFERENCE_RARE.md` で overview のみ保持する。本テストは:
+In the CLI argument-information acquisition policy (the "CLI reference conventions"
+section of `CLAUDE.md`), the frequent subcommands (Tier-A) are covered in
+`docs/CLI_REFERENCE.md`, and the rare subcommands (Tier-B) are kept as an
+overview only in `docs/CLI_REFERENCE_RARE.md`. This test:
 
-1. argparse 上の subcommand 集合と Tier-A/Tier-B 分類の網羅性を確認する。
-2. Tier-A subcommand では、argparse 引数集合が doc 引数表に**含まれている**ことを
-   確認する (doc 側の追加記述は許容、欠落は reject)。
-3. Tier-B subcommand では、RARE doc の table に登場することのみ確認する
-   (詳細引数は `--help` を canonical とする方針のため diff しない)。
+1. Confirms the completeness of the argparse subcommand set and the Tier-A/Tier-B classification.
+2. For a Tier-A subcommand, confirms that the argparse argument set is **included** in the
+   doc argument table (additional descriptions on the doc side are allowed, an omission is rejected).
+3. For a Tier-B subcommand, confirms only that it appears in the RARE doc's table
+   (the detailed arguments are not diffed because the policy is `--help` as canonical).
 
-差分が検出された場合、Tier-A / Tier-B のどちらに記載すべきかのレビューを
-強制する目的で fail する。
+When a diff is detected, it fails for the purpose of forcing a review of whether it
+should be documented in Tier-A or Tier-B.
 """
 
 from __future__ import annotations
@@ -64,9 +65,9 @@ ARG_FLAG_RE = re.compile(r"--[a-z][a-z0-9-]*")
 
 
 def _argparse_args_for(subcommand: str) -> set[str]:
-    """`<sub> --help` を invoke して引数 flag 集合を抽出する。
+    """Invoke `<sub> --help` and extract the argument flag set.
 
-    `-h` / `--help` は除外する (argparse が自動付与する universal flag)。
+    `-h` / `--help` are excluded (the universal flag argparse auto-adds).
     """
     buf = io.StringIO()
     with redirect_stdout(buf):
@@ -81,10 +82,10 @@ def _argparse_args_for(subcommand: str) -> set[str]:
 
 
 def _doc_section_args(doc_path: Path, subcommand: str) -> set[str]:
-    """doc 内の `## <subcommand>` section から `--xxx` 引数を抽出する。
+    """Extract `--xxx` arguments from the `## <subcommand>` section in the doc.
 
-    section は次の `## ` heading または EOF まで。表記は markdown table
-    `| `--name` | yes | ... |` を想定。
+    The section runs until the next `## ` heading or EOF. The notation assumes a
+    markdown table `| `--name` | yes | ... |`.
     """
     text = doc_path.read_text(encoding="utf-8")
     pattern = re.compile(
@@ -101,11 +102,11 @@ def _doc_section_args(doc_path: Path, subcommand: str) -> set[str]:
 
 
 def _enumerate_argparse_subcommands() -> set[str]:
-    """argparse の subparser 登録を monkey-patch で intercept して列挙する。
+    """Enumerate the argparse subparser registrations by intercepting them with a monkey-patch.
 
-    `--help` 出力の regex parse は argparse の出力形式変更で fragile になる
-    ため、`add_subparsers().add_parser(name, ...)` 呼び出しを capture して
-    subcommand 集合を取得する。
+    Because a regex parse of the `--help` output becomes fragile against changes
+    in the argparse output format, capture the `add_subparsers().add_parser(name, ...)`
+    calls to obtain the subcommand set.
     """
     captured: set[str] = set()
     real_add_subparsers = argparse.ArgumentParser.add_subparsers
@@ -132,35 +133,35 @@ def _enumerate_argparse_subcommands() -> set[str]:
 
 
 class CliReferenceSyncTests(unittest.TestCase):
-    """argparse と doc の sync を確認する。"""
+    """Confirm the sync of argparse and the doc."""
 
     def test_tier_classification_covers_all_argparse_subcommands(self) -> None:
-        """argparse の全 subcommand が Tier-A / Tier-B のいずれかに分類されている。"""
+        """Every argparse subcommand is classified as either Tier-A or Tier-B."""
         argparse_subs = _enumerate_argparse_subcommands()
         self.assertTrue(
             argparse_subs,
-            "argparse subcommand 集合を抽出できなかった (parser 形式変更の可能性)",
+            "could not extract the argparse subcommand set (possible parser format change)",
         )
         classified = TIER_A_SUBCOMMANDS | TIER_B_SUBCOMMANDS
         unclassified = argparse_subs - classified
         stale = classified - argparse_subs
         self.assertFalse(
             unclassified,
-            f"未分類の subcommand: {sorted(unclassified)}。"
-            f"docs/CLI_REFERENCE.md (Tier-A) または docs/CLI_REFERENCE_RARE.md (Tier-B) "
-            f"へ追加し、本 test の TIER_A_SUBCOMMANDS / TIER_B_SUBCOMMANDS にも反映すること。",
+            f"unclassified subcommand: {sorted(unclassified)}. "
+            f"Add it to docs/CLI_REFERENCE.md (Tier-A) or docs/CLI_REFERENCE_RARE.md (Tier-B) "
+            f"and also reflect it in this test's TIER_A_SUBCOMMANDS / TIER_B_SUBCOMMANDS.",
         )
         self.assertFalse(
             stale,
-            f"argparse 側で削除された subcommand: {sorted(stale)}。"
-            f"本 test の TIER_A_SUBCOMMANDS / TIER_B_SUBCOMMANDS と doc から除去すること。",
+            f"subcommand removed on the argparse side: {sorted(stale)}. "
+            f"Remove it from this test's TIER_A_SUBCOMMANDS / TIER_B_SUBCOMMANDS and the doc.",
         )
 
     def test_tier_a_doc_covers_all_argparse_flags(self) -> None:
-        """Tier-A subcommand の argparse 引数が doc 引数表に欠落なく登場する。
+        """The argparse arguments of a Tier-A subcommand appear in the doc argument table without omission.
 
-        doc 側の追加記述 (派生 field, JSON payload, etc) は許容する。
-        argparse 側にあって doc に無い flag を欠落として fail させる。
+        Additional descriptions on the doc side (derived fields, JSON payload, etc.) are allowed.
+        A flag present on the argparse side but absent in the doc is failed as an omission.
         """
         missing: dict[str, set[str]] = {}
         for sub in sorted(TIER_A_SUBCOMMANDS):
@@ -171,27 +172,27 @@ class CliReferenceSyncTests(unittest.TestCase):
                 missing[sub] = absent
         self.assertFalse(
             missing,
-            "Tier-A doc に欠落している argparse 引数: "
+            "argparse arguments missing from the Tier-A doc: "
             + ", ".join(f"{sub}: {sorted(flags)}" for sub, flags in missing.items())
-            + "。docs/CLI_REFERENCE.md の該当 section に追記すること。",
+            + ". Add them to the relevant section of docs/CLI_REFERENCE.md.",
         )
 
     def test_tier_b_doc_lists_all_rare_subcommands(self) -> None:
-        """Tier-B subcommand が RARE doc の overview table に登場する。
+        """A Tier-B subcommand appears in the overview table of the RARE doc.
 
-        詳細引数は `--help` を canonical とする方針のため、doc table に名前が
-        登場するかのみ check する。
+        Because the policy is `--help` as canonical for the detailed arguments, only
+        whether the name appears in the doc table is checked.
         """
         text = DOC_TIER_B.read_text(encoding="utf-8")
         missing = [sub for sub in sorted(TIER_B_SUBCOMMANDS) if f"`{sub}`" not in text]
         self.assertFalse(
             missing,
-            f"docs/CLI_REFERENCE_RARE.md に未掲載の Tier-B subcommand: {missing}。"
-            f"overview table に追加すること。",
+            f"Tier-B subcommand not listed in docs/CLI_REFERENCE_RARE.md: {missing}. "
+            f"Add it to the overview table.",
         )
 
     def test_tier_b_subcommands_absent_from_tier_a_doc(self) -> None:
-        """Tier-B subcommand が Tier-A doc に section を持たない (圧縮の維持)。"""
+        """A Tier-B subcommand has no section in the Tier-A doc (maintaining compression)."""
         text = DOC_TIER_A.read_text(encoding="utf-8")
         present = [
             sub
@@ -200,8 +201,8 @@ class CliReferenceSyncTests(unittest.TestCase):
         ]
         self.assertFalse(
             present,
-            f"Tier-B 扱いだが docs/CLI_REFERENCE.md に section が残存: {present}。"
-            f"section を削除して overview のみ Tier-B doc に置くこと。",
+            f"treated as Tier-B but a section remains in docs/CLI_REFERENCE.md: {present}. "
+            f"Remove the section and keep only the overview in the Tier-B doc.",
         )
 
 

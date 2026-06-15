@@ -541,11 +541,11 @@ class HookCommonTests(unittest.TestCase):
 
 
 class DetectCliHelpInvocationTests(unittest.TestCase):
-    """`_detect_cli_help_invocation`: `python3 tools/<name>.py [<sub>] --help` を audit する。
+    """`_detect_cli_help_invocation`: audit `python3 tools/<name>.py [<sub>] --help`.
 
-    CLI 仕様確認方針 (CLAUDE.md「CLI 仕様の確認規約」節) で `--help` 経由の
-    argparse 出力読取を first-class 経路として扱うため、hook は block せず
-    audit_detail のみ付与して使用頻度を記録する。
+    Because the CLI reference policy (the "CLI reference conventions" section of CLAUDE.md)
+    treats reading argparse output via `--help` as a first-class path, the hook does not
+    block but only attaches audit_detail and records the usage frequency.
     """
 
     def _shlex(self, command: str) -> list[str]:
@@ -600,13 +600,13 @@ class DetectCliHelpInvocationTests(unittest.TestCase):
         self.assertIsNone(_detect_cli_help_invocation(self._shlex(cmd), cmd))
 
     def test_returns_none_for_module_form_invocation(self) -> None:
-        """`python -m tools.orchestration_runtime` 形式は canonical でなく検出対象外。"""
+        """The `python -m tools.orchestration_runtime` form is not canonical and is out of detection scope."""
         cmd = "python3 -m tools.orchestration_runtime record-launch --help"
         self.assertIsNone(_detect_cli_help_invocation(self._shlex(cmd), cmd))
 
 
 class EvaluateCommonPolicyCliHelpAuditTests(unittest.TestCase):
-    """`evaluate_common_policy` の cli_help audit が ALLOW 経路で audit_detail を残す。"""
+    """`evaluate_common_policy`'s cli_help audit leaves audit_detail on the ALLOW path."""
 
     def _make(self, command: str) -> HookInput:
         return HookInput(
@@ -637,7 +637,7 @@ class EvaluateCommonPolicyCliHelpAuditTests(unittest.TestCase):
         self.assertIsNone(decision.audit_detail)
 
     def test_implementation_read_still_blocked_in_workflow_mode(self) -> None:
-        """`--help` 経路を許容しても `cat tools/X.py` 等の実装直読は引き続き block。"""
+        """Even while permitting the `--help` path, a direct implementation read such as `cat tools/X.py` remains blocked."""
         with patch.dict(os.environ, {"METDSL_WORKFLOW_MODE": "1"}):
             decision = evaluate_common_policy(
                 self._make("cat tools/orchestration_runtime.py")
@@ -647,7 +647,7 @@ class EvaluateCommonPolicyCliHelpAuditTests(unittest.TestCase):
         self.assertEqual(decision.audit_detail["policy"], "forbid_tools_direct_read")
 
     def test_cli_help_audit_skipped_outside_workflow_mode(self) -> None:
-        """workflow mode が無効なら hook は audit_detail を付けない。"""
+        """When workflow mode is disabled, the hook does not attach audit_detail."""
         with patch.dict(os.environ, {"METDSL_WORKFLOW_MODE": "0"}):
             decision = evaluate_common_policy(
                 self._make("python3 tools/orchestration_runtime.py record-launch --help")

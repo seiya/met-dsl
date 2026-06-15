@@ -70,12 +70,12 @@ class ClaudeHookAdapter(HookBackendAdapter):
             return 2, json.dumps(body, ensure_ascii=False)
 
         if decision.action == HookDecisionAction.ALLOW_AUTO_APPROVE:
-            # hookSpecificOutput.permissionDecision="allow" は harness の
-            # permission prompt を bypass し、operator approval なしで実行を継続する。
-            # 前提: ALLOW_AUTO_APPROVE は cli.py の Write/Edit branch (PreToolUse
-            # event) でのみ発行される。他 event で混入させた場合 hookEventName が
-            # 不整合になるので、新規発行箇所を追加するときは PreToolUse である
-            # ことを保証すること。
+            # hookSpecificOutput.permissionDecision="allow" bypasses the harness's
+            # permission prompt and continues execution without operator approval.
+            # Premise: ALLOW_AUTO_APPROVE is issued only in the Write/Edit branch
+            # (PreToolUse event) of cli.py. If mixed into another event, the
+            # hookEventName becomes inconsistent, so when adding a new issuing
+            # site, guarantee that it is PreToolUse.
             audit = decision.audit_detail or {}
             tool_name = audit.get("tool_name") or "tool"
             file_path = audit.get("file_path") or ""

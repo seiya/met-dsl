@@ -1,49 +1,49 @@
-# 性能診断（perf.json）仕様
+# Performance diagnostics (perf.json) specification
 
-## 目的
-- 物理妥当性テストと同じ“枠組み”で、性能測定・性能回帰検知を扱えるようにする。
-- CPU/GPU や最適化変換の比較を、記録と可視化が可能な形で残す。
+## Purpose
+- Make it possible to handle performance measurement and performance-regression detection in the same "framework" as the physical-validity tests.
+- Leave CPU/GPU and optimization-transformation comparisons in a form that can be recorded and visualized.
 
-## 1. 収集単位
-- 1 ケース実行（case_id,target,impl 設定）ごとに `perf.json` を 1 つ出力する。
-- refinement や sweep の各サブケースも同様に出力する。
+## 1. Collection unit
+- Output 1 `perf.json` per single case execution (case_id, target, impl setting).
+- Output each sub-case of refinement or sweep likewise.
 
-## 2. 最小フィールド（必須）
-- `case_id`: 文字列
+## 2. Minimal fields (required)
+- `case_id`: string
 - `target`: cpu|gpu|...
-- `walltime_sec`: 実行全体の壁時計時間（秒）
-- `steps`: 実行ステップ数
-- `cells_updated`: 更新したセル数の総数（nx*ny*nz*steps 等）
+- `walltime_sec`: the wall-clock time of the whole execution (seconds)
+- `steps`: the number of execution steps
+- `cells_updated`: the total number of updated cells (nx*ny*nz*steps etc.)
 - `throughput_cells_per_sec`: cells_updated / walltime_sec
-- `parallelism`: 並列度情報（必須オブジェクト）
-  - `mpi_ranks`: MPI ランク数（非 MPI 時は 1）
-  - `threads_per_rank`: 1 ランクあたりスレッド数（単一スレッド時は 1）
-  - `gpu_devices`: 使用 GPU デバイス数（CPU のみは 0）
-  - `parallel_degree_total`: 総並列度。定義は `mpi_ranks * threads_per_rank * max(gpu_devices,1)`
-- `timestamp_utc`: ISO8601（任意でもよいが推奨）
+- `parallelism`: parallelism information (required object)
+  - `mpi_ranks`: the number of MPI ranks (1 when non-MPI)
+  - `threads_per_rank`: the number of threads per rank (1 when single-threaded)
+  - `gpu_devices`: the number of GPU devices used (0 for CPU-only)
+  - `parallel_degree_total`: the total parallelism. Defined as `mpi_ranks * threads_per_rank * max(gpu_devices,1)`
+- `timestamp_utc`: ISO8601 (may be optional but recommended)
 
-## 3. 推奨フィールド（可能なら）
-- `kernel_breakdown`: 主要カーネルごとの時間（秒）と比率
-- `memory_bytes_read/write`: 推定でもよい
-- `device`: GPU 名、SM 数等
-- `compiler`: コンパイラ/バージョン、主要フラグ
-- `impl_hash`: `spec.ir.yaml.impl_defaults` の hash
-- `git_sha`: 実行したコードのコミット
+## 3. Recommended fields (if possible)
+- `kernel_breakdown`: the time (seconds) and ratio per main kernel
+- `memory_bytes_read/write`: may be an estimate
+- `device`: GPU name, SM count, etc.
+- `compiler`: compiler/version, main flags
+- `impl_hash`: the hash of `spec.ir.yaml.impl_defaults`
+- `git_sha`: the commit of the executed code
 
-## 4. 測定上の注意
-- ウォームアップ（GPU）やキャッシュ効果があるので、可能なら複数回実行して統計（平均/分散）も記録する。
-- Phase 0 では walltime と throughput の取得を必須とし、測定項目を過度に拡張しない。
+## 4. Measurement notes
+- Because there are warm-up (GPU) and cache effects, if possible run multiple times and also record statistics (mean/variance).
+- In Phase 0, make the acquisition of walltime and throughput required, and do not over-expand the measurement items.
 
-## 5. 性能テストの位置づけ
-- 性能評価は「物理テスト合格」が前提。
-- L3 に performance regression を追加できる。
-- 例: throughput が基準より 10% 以上低下したら fail（ただしノイズを考慮し、統計的に扱うのが望ましい）。
+## 5. Position of performance tests
+- Performance evaluation presumes "physical-test passing".
+- A performance regression can be added to L3.
+- Example: fail if throughput drops 10% or more below the baseline (but considering noise, it is preferable to handle it statistically).
 
-## 6. runner との連携
-- runner は `perf.json` を読み、性能チェックを `verdict.json` に追記できる。
-- 物理 fail 時は性能評価をスキップする（意味が薄い）。
-- `parallelism` が欠落している `perf.json` は不正入力として扱い、判定不能（error）にする。
-- `perf.json` は UTF-8 の単一 `JSON object` として標準 parser で復元可能でなければならない。
-- 数値 token は `RFC 8259` に従い、先頭 0 を欠落させた `.123` と `-.123` を禁止する。
-- `toolchain.language=fortran` の `runner` は、`F0.d` 書式を `JSON` 数値 token へ直接埋め込んではならない。
-- `toolchain.language=fortran` の `runner` は、論理値を `JSON` へ出力する際に `L` 系 edit descriptor（`L1` 等）が生成する `T`/`F` トークンを `JSON` boolean token へ直接埋め込んではならない。`JSON` boolean は literal `true` / `false` のみ許容し、論理値で分岐して文字列を書く。
+## 6. Coordination with the runner
+- The runner can read `perf.json` and append the performance check to `verdict.json`.
+- On a physics fail, skip the performance evaluation (it has little meaning).
+- A `perf.json` with `parallelism` missing is treated as invalid input and made unjudgeable (error).
+- `perf.json` must be a single UTF-8 `JSON object` restorable by a standard parser.
+- Numeric tokens follow `RFC 8259`, and `.123` and `-.123` with a missing leading zero are forbidden.
+- A `toolchain.language=fortran` `runner` must not directly embed the `F0.d` format into a `JSON` numeric token.
+- A `toolchain.language=fortran` `runner`, when outputting a logical value to `JSON`, must not directly embed the `T`/`F` token that the `L`-family edit descriptor (`L1` etc.) generates into a `JSON` boolean token. A `JSON` boolean allows only the literals `true` / `false`, so branch on the logical value and write the string.

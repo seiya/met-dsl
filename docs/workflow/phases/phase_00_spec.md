@@ -1,24 +1,24 @@
-# Phase 0: Spec（人手）
+# Phase 0: Spec (manual)
 
-## 概要
-`Controlled Spec` と `tests` と `deps` を人手で記述し、core workflow の起点を成立させる phase。LLM 利用 phase ではなく、orchestration の対象外。
+## Overview
+The phase that manually writes the `Controlled Spec`, `tests`, and `deps` and establishes the starting point of the core workflow. It is not an LLM-using phase and is outside the scope of orchestration.
 
-## I/O 契約
-- execution input: workflow 外部で与える要求事項、物理要件、依存選択方針
-- verification input: なし
-- 出力:
+## I/O contract
+- execution input: the requirements, physics requirements, and dependency-selection policy given outside the workflow
+- verification input: none
+- output:
   - `spec/<spec_kind>/<domain>/<family>/<spec_id>/controlled_spec.md`
   - `spec/<spec_kind>/<domain>/<family>/<spec_id>/tests.md`
   - `spec/<spec_kind>/<domain>/<family>/<spec_id>/deps.yaml`
 
-## 必須要件
-- `Controlled Spec` で物理アルゴリズム（A）の意図を定義する。
-- `problem spec` は依存 `component` と採用 `profile` を `deps.yaml` で宣言する。
-- `tests.md` は実験条件と判定条件、および `test_id` ごとの要求証跡を定義する。
-- 自然言語表記を canonical source とし、`Compile` phase が構造化 IR (`spec.ir.yaml`) へ統合する。
-- `controlled_spec.md` の `spec_version` を必須記録とする。spec を更新する場合は `spec_version` を更新する。
+## Required requirements
+- Define the intent of the physics algorithm (A) in the `Controlled Spec`.
+- A `problem spec` declares its dependent `component` and adopted `profile` in `deps.yaml`.
+- `tests.md` defines the experiment conditions, judgment conditions, and the required evidence per `test_id`.
+- The natural-language notation is the canonical source, and the `Compile` phase integrates it into the structured IR (`spec.ir.yaml`).
+- The `spec_version` of `controlled_spec.md` is a required record. When updating a spec, update `spec_version`.
 
-## 後段との接続
-- `Compile` phase は `controlled_spec.md` + `tests.md` + `deps.yaml` + `spec/registry/spec_catalog.yaml` を入力に `spec.ir.yaml` を生成する。
-- `Generate` 以降の段は `spec.ir.yaml` を canonical source とし、`controlled_spec.md` を直接読まない。
-- 仕様変更は `controlled_spec.md` / `tests.md` / `deps.yaml` のいずれかの更新で表現し、実装側の修正のみで仕様を変えてはならない（Spec-First 原則）。
+## Connection to later stages
+- The `Compile` phase takes `controlled_spec.md` + `tests.md` + `deps.yaml` + `spec/registry/spec_catalog.yaml` as input and generates `spec.ir.yaml`.
+- The stages from `Generate` onward use `spec.ir.yaml` as the canonical source and do not read `controlled_spec.md` directly.
+- A specification change is expressed by updating one of `controlled_spec.md` / `tests.md` / `deps.yaml`, and a specification must not be changed by an implementation-side modification alone (the Spec-First principle).

@@ -90,7 +90,7 @@ def _dep_ref_for_step(step: str) -> str:
 
 
 def _fixture_generate_downstream_ready(repo_root: Path, *, source_id: str = "src_fixture_001") -> None:
-    """`build` の `pre_phase_launch` downstream gate 用に verification pass の source ツリーを置く。"""
+    """Place a verification-pass source tree for the `build` `pre_phase_launch` downstream gate."""
     gen_dir = repo_root / _FIX_PIPE_REF / "source" / source_id
     gen_dir.mkdir(parents=True, exist_ok=True)
     (gen_dir / "source_meta.json").write_text(
@@ -548,11 +548,11 @@ shell_tool                       stable             true
         local_allow_permissions: list[str] | None = None,
         local_deny_permissions: list[str] | None = None,
     ) -> None:
-        """repo にコミットされる project settings を temp repo_root へ書き出す。
+        """Write out the project settings committed to the repo, to temp repo_root.
 
-        enablement の canonical source は `<repo>/.claude/settings.json` (flat key)。
-        `.mcp.json` は `enableAllProjectMcpServers` 展開の確認用、`settings.local.json` は
-        個人 opt-out (disabledMcpjsonServers) の検出確認用。
+        The canonical source for enablement is `<repo>/.claude/settings.json` (flat key).
+        `.mcp.json` is for confirming `enableAllProjectMcpServers` expansion, and `settings.local.json` is
+        for confirming the detection of a personal opt-out (disabledMcpjsonServers).
         """
         claude_dir = repo_root / ".claude"
         claude_dir.mkdir(parents=True, exist_ok=True)
@@ -603,7 +603,7 @@ shell_tool                       stable             true
     def test_probe_claude_mcp_registry_passes_when_repo_settings_enables_build_runtime(
         self,
     ) -> None:
-        """repo `.claude/settings.json` の `enabledMcpjsonServers` に build-runtime があれば pass。"""
+        """Pass if build-runtime is in the `enabledMcpjsonServers` of the repo `.claude/settings.json`."""
         with tempfile.TemporaryDirectory() as td:
             repo_root = Path(td)
             self._write_project_settings(
@@ -626,7 +626,7 @@ shell_tool                       stable             true
         self.assertTrue(by_name["claude_mcp_build_runtime_permission_granted"]["pass"])
 
     def test_probe_claude_mcp_registry_passes_when_enable_all_project_mcp_servers(self) -> None:
-        """`enableAllProjectMcpServers:true` + `.mcp.json` が build-runtime を定義していれば pass。"""
+        """Pass if `enableAllProjectMcpServers:true` + `.mcp.json` defines build-runtime."""
         with tempfile.TemporaryDirectory() as td:
             repo_root = Path(td)
             self._write_project_settings(
@@ -649,15 +649,15 @@ shell_tool                       stable             true
     def test_probe_claude_mcp_registry_fails_when_repo_settings_missing_enable_even_if_mcp_list_connected(
         self,
     ) -> None:
-        """`mcp list` で Connected と出ても、repo settings で enable されていなければ fail。
+        """Fail when not enabled in repo settings, even if `mcp list` shows Connected.
 
-        `claude mcp list` は workspace trust を skip して health check を回すため、
-        session が tools を露出する保証にはならない (Codex review P1)。
+        Because `claude mcp list` skips workspace trust and runs the health check,
+        it is not a guarantee that the session exposes the tools (Codex review P1).
         """
         with tempfile.TemporaryDirectory() as td:
             repo_root = Path(td)
             self._write_project_settings(
-                repo_root, enabled_mcpjson_servers=[]  # repo settings で enable されていない
+                repo_root, enabled_mcpjson_servers=[]  # not enabled in repo settings
             )
             runner = self._claude_runner_with_mcp(
                 "build-runtime: stdio python3 ./mcp_servers/build_runtime_server.py - ✓ Connected\n"
@@ -677,7 +677,7 @@ shell_tool                       stable             true
         self.assertIn("is not enabled", detail)
 
     def test_probe_claude_mcp_registry_fails_when_disabled_overrides_enabled(self) -> None:
-        """settings.json の `disabledMcpjsonServers` が `enabledMcpjsonServers` を打ち消すこと。"""
+        """The `disabledMcpjsonServers` of settings.json cancels `enabledMcpjsonServers`."""
         with tempfile.TemporaryDirectory() as td:
             repo_root = Path(td)
             self._write_project_settings(
@@ -695,7 +695,7 @@ shell_tool                       stable             true
         self.assertFalse(by_name["claude_mcp_build_runtime_registered"]["pass"])
 
     def test_probe_claude_mcp_registry_fails_when_local_settings_disable(self) -> None:
-        """`.claude/settings.local.json` の disable (個人 opt-out) で fail すること。"""
+        """Fail on a disable (personal opt-out) in `.claude/settings.local.json`."""
         with tempfile.TemporaryDirectory() as td:
             repo_root = Path(td)
             self._write_project_settings(
@@ -715,9 +715,9 @@ shell_tool                       stable             true
         self.assertIn("local_disabled=['build-runtime']", detail)
 
     def test_probe_claude_mcp_registry_fails_when_project_settings_missing(self) -> None:
-        """`.claude/settings.json` が存在しなければ未判定として fail。"""
+        """Fail as undetermined when `.claude/settings.json` does not exist."""
         with tempfile.TemporaryDirectory() as td:
-            repo_root = Path(td)  # .claude/settings.json を作らない
+            repo_root = Path(td)  # do not create .claude/settings.json
             runner = self._claude_runner_with_mcp("")
             result = probe_execution_platform(
                 backend="claude", runner=runner, repo_root=repo_root
@@ -732,9 +732,9 @@ shell_tool                       stable             true
         )
 
     def test_probe_claude_mcp_registry_mcp_list_timeout_is_advisory_not_gate(self) -> None:
-        """`claude mcp list` の timeout は advisory のみで gate しない (Codex review P2)。
+        """The timeout of `claude mcp list` is advisory only and does not gate (Codex review P2).
 
-        repo settings が enable していれば、`mcp list` が timeout しても workflow は許可する。
+        If repo settings enable it, the workflow is permitted even if `mcp list` times out.
         """
         with tempfile.TemporaryDirectory() as td:
             repo_root = Path(td)
@@ -753,20 +753,20 @@ shell_tool                       stable             true
         self.assertEqual(result["status"], "pass")
         self.assertTrue(result["can_launch_step_agents"])
         by_name = {c["name"]: c for c in result["checks"]}
-        # registered gate は repo settings で pass
+        # the registered gate passes via repo settings
         self.assertTrue(by_name["claude_mcp_build_runtime_registered"]["pass"])
-        # list_available は advisory (None) on timeout — gate しない
+        # list_available is advisory (None) on timeout — does not gate
         self.assertIsNone(by_name["claude_mcp_list_available"]["pass"])
         self.assertIn(
             "TimeoutExpired", by_name["claude_mcp_list_available"]["detail"]
         )
 
     def test_probe_claude_mcp_registry_runs_mcp_list_in_repo_root(self) -> None:
-        """`claude mcp list` は target repo_root を cwd として実行する必要がある。
+        """`claude mcp list` must run with the target repo_root as cwd.
 
-        Claude は project-scoped `.mcp.json` を cwd 経由で解決するため、cwd 不指定だと
-        `tools/run_workflow.py` を別 cwd から `--repo-root <repo>` 付きで呼んだ場合に
-        false-negative が出る。runner が `cwd=str(repo_root)` で呼ばれることを lock。
+        Because Claude resolves the project-scoped `.mcp.json` via cwd, without specifying cwd
+        a false-negative arises when `tools/run_workflow.py` is called from a different cwd with `--repo-root <repo>`.
+        Lock that the runner is called with `cwd=str(repo_root)`.
         """
         captured: dict[str, Any] = {}
 
@@ -796,7 +796,7 @@ shell_tool                       stable             true
         self.assertEqual(captured.get("cwd"), str(repo_root))
 
     def test_probe_claude_mcp_registry_skipped_when_repo_root_none(self) -> None:
-        """既存 Claude probe テスト互換: repo_root 未指定なら advisory-only で AND しない。"""
+        """Existing Claude probe test compatibility: when repo_root is unspecified, advisory-only and no AND."""
         result = probe_execution_platform(
             backend="claude",
             runner=self._claude_runner_with_mcp("ignored"),
@@ -808,7 +808,7 @@ shell_tool                       stable             true
         self.assertIn("claude_mcp_build_runtime_registered", by_name)
         self.assertIsNone(by_name["claude_mcp_build_runtime_registered"]["pass"])
         self.assertIn("skipped", by_name["claude_mcp_build_runtime_registered"]["detail"])
-        # registered と permission は常に対で評価する契約: None 経路でも両 check を含める
+        # the contract evaluates registered and permission always as a pair: include both checks even on the None path
         self.assertIn("claude_mcp_build_runtime_permission_granted", by_name)
         self.assertIsNone(by_name["claude_mcp_build_runtime_permission_granted"]["pass"])
         self.assertIn(
@@ -818,7 +818,7 @@ shell_tool                       stable             true
     def test_probe_claude_mcp_registry_fails_when_registered_but_permission_not_granted(
         self,
     ) -> None:
-        """registered=true でも permissions.allow に build-runtime が無ければ fail (本障害の再現)。"""
+        """Fail when build-runtime is not in permissions.allow even with registered=true (reproduction of this failure)."""
         with tempfile.TemporaryDirectory() as td:
             repo_root = Path(td)
             self._write_project_settings(
@@ -836,7 +836,7 @@ shell_tool                       stable             true
         self.assertEqual(result["status"], "fail")
         self.assertFalse(result["can_launch_step_agents"])
         by_name = {c["name"]: c for c in result["checks"]}
-        # registered は pass、permission は fail
+        # registered passes, permission fails
         self.assertTrue(by_name["claude_mcp_build_runtime_registered"]["pass"])
         self.assertFalse(by_name["claude_mcp_build_runtime_permission_granted"]["pass"])
         self.assertIn(
@@ -847,7 +847,7 @@ shell_tool                       stable             true
     def test_probe_claude_mcp_registry_passes_when_individual_tool_permissions_granted(
         self,
     ) -> None:
-        """server 単位 grant が無くても必須 4 tool を個別 allow すれば permission pass。"""
+        """Permission passes if the required 4 tools are individually allowed, even without a server-level grant."""
         with tempfile.TemporaryDirectory() as td:
             repo_root = Path(td)
             self._write_project_settings(
@@ -874,7 +874,7 @@ shell_tool                       stable             true
     def test_probe_claude_mcp_registry_fails_when_individual_tool_permissions_incomplete(
         self,
     ) -> None:
-        """個別 grant が必須 4 tool に満たない (run_quality_checks 欠落) と permission fail。"""
+        """Permission fails when the individual grant falls short of the required 4 tools (run_quality_checks missing)."""
         with tempfile.TemporaryDirectory() as td:
             repo_root = Path(td)
             self._write_project_settings(
@@ -896,7 +896,7 @@ shell_tool                       stable             true
         self.assertFalse(by_name["claude_mcp_build_runtime_permission_granted"]["pass"])
 
     def test_probe_claude_mcp_registry_fails_when_server_permission_denied(self) -> None:
-        """server 単位 deny は server 単位 allow を打ち消し permission fail。"""
+        """A server-level deny cancels a server-level allow and permission fails."""
         with tempfile.TemporaryDirectory() as td:
             repo_root = Path(td)
             self._write_project_settings(
@@ -917,7 +917,7 @@ shell_tool                       stable             true
     def test_probe_claude_mcp_registry_fails_when_server_allowed_but_required_tool_denied(
         self,
     ) -> None:
-        """server 単位 allow でも必須 tool の個別 deny があれば fail (Claude は deny を優先)。"""
+        """Fail if there is an individual deny of a required tool even with a server-level allow (Claude prioritizes deny)."""
         with tempfile.TemporaryDirectory() as td:
             repo_root = Path(td)
             self._write_project_settings(
@@ -942,7 +942,7 @@ shell_tool                       stable             true
         )
 
     def test_probe_claude_mcp_registry_passes_for_underscore_server_alias(self) -> None:
-        """`build_runtime` (underscore) alias を enable + `mcp__build_runtime` allow で pass。"""
+        """Pass by enabling the `build_runtime` (underscore) alias + `mcp__build_runtime` allow."""
         with tempfile.TemporaryDirectory() as td:
             repo_root = Path(td)
             self._write_project_settings(
@@ -965,7 +965,7 @@ shell_tool                       stable             true
     def test_probe_claude_mcp_registry_passes_for_underscore_individual_tool_aliases(
         self,
     ) -> None:
-        """underscore で enable + underscore 個別 tool allow (alias 一致) で permission pass。"""
+        """Permission passes with underscore enable + an underscore individual tool allow (alias match)."""
         with tempfile.TemporaryDirectory() as td:
             repo_root = Path(td)
             self._write_project_settings(
@@ -990,10 +990,10 @@ shell_tool                       stable             true
     def test_probe_claude_mcp_registry_fails_when_permission_alias_mismatches_enabled(
         self,
     ) -> None:
-        """enable は hyphen `build-runtime` だが permission が underscore alias のみ → fail。
+        """Enable is the hyphen `build-runtime` but permission is the underscore alias only → fail.
 
-        Claude は実 server 名 (`build-runtime`) で permission を keyed するため、`mcp__build_runtime`
-        だけ allow しても child Agent は tool を呼べない。preflight が false-pass しないことを lock。
+        Because Claude keys the permission by the actual server name (`build-runtime`), allowing only `mcp__build_runtime`
+        does not let the child Agent call the tool. Lock that preflight does not false-pass.
         """
         with tempfile.TemporaryDirectory() as td:
             repo_root = Path(td)
@@ -1019,7 +1019,7 @@ shell_tool                       stable             true
         )
 
     def test_probe_claude_mcp_registry_server_deny_blocks_individual_allows(self) -> None:
-        """server 単位 deny は個別 tool allow があっても全 tool を block し permission fail。"""
+        """A server-level deny blocks all tools even with an individual tool allow, and permission fails."""
         with tempfile.TemporaryDirectory() as td:
             repo_root = Path(td)
             self._write_project_settings(
@@ -1049,13 +1049,13 @@ shell_tool                       stable             true
     def test_probe_claude_mcp_registry_passes_without_detect_build_system_grant(
         self,
     ) -> None:
-        """detect_build_system は advisory: 個別 grant に含めなくても permission pass。"""
+        """detect_build_system is advisory: permission passes even without including it in the individual grant."""
         with tempfile.TemporaryDirectory() as td:
             repo_root = Path(td)
             self._write_project_settings(
                 repo_root,
                 enabled_mcpjson_servers=["build-runtime"],
-                # detect_build_system を意図的に省く
+                # intentionally omit detect_build_system
                 allow_permissions=[
                     "mcp__build-runtime__run_linter",
                     "mcp__build-runtime__compile_project",
@@ -1075,7 +1075,7 @@ shell_tool                       stable             true
     def test_probe_claude_mcp_registry_handles_non_list_permissions_without_crash(
         self,
     ) -> None:
-        """`permissions.allow` が非 list (null) でも TypeError で abort せず permission fail。"""
+        """Even if `permissions.allow` is a non-list (null), permission fails without aborting with a TypeError."""
         with tempfile.TemporaryDirectory() as td:
             repo_root = Path(td)
             claude_dir = repo_root / ".claude"
@@ -1090,7 +1090,7 @@ shell_tool                       stable             true
                 encoding="utf-8",
             )
             runner = self._claude_runner_with_mcp("")
-            # 例外を投げず status=fail に落ちることを確認 (preflight abort しない)
+            # confirm it falls to status=fail without throwing (preflight does not abort)
             result = probe_execution_platform(
                 backend="claude", runner=runner, repo_root=repo_root
             )
@@ -1102,7 +1102,7 @@ shell_tool                       stable             true
     def test_probe_claude_mcp_registry_passes_when_default_mode_bypass_permissions(
         self,
     ) -> None:
-        """`permissions.defaultMode=bypassPermissions` は全 tool 無条件許可で permission pass。"""
+        """`permissions.defaultMode=bypassPermissions` is unconditional permission for all tools and permission passes."""
         with tempfile.TemporaryDirectory() as td:
             repo_root = Path(td)
             self._write_project_settings(
@@ -1126,7 +1126,7 @@ shell_tool                       stable             true
         )
 
     def test_probe_claude_mcp_registry_permission_granted_via_local_settings(self) -> None:
-        """`.claude/settings.local.json` の permissions.allow も grant として合算される。"""
+        """The permissions.allow of `.claude/settings.local.json` is also combined as a grant."""
         with tempfile.TemporaryDirectory() as td:
             repo_root = Path(td)
             self._write_project_settings(
@@ -1235,7 +1235,7 @@ shell_tool                       stable             true
         self.assertEqual(result["probe_command"], "agent")
 
     def test_probe_codex_backend_calls_features_list(self) -> None:
-        """_probe_codex_backend が features list コマンドを呼び、multi_agent を検出すること。"""
+        """_probe_codex_backend calls the features list command and detects multi_agent."""
         import subprocess as _subprocess
         from tools.orchestration_runtime import _probe_codex_backend
         calls: list[list[str]] = []
@@ -1278,7 +1278,7 @@ shell_tool                       stable             true
         self.assertFalse(by_name["codex_hooks_enabled"]["pass"])
 
     def test_all_strict_boolean_probe_checks_pass_skips_none_pass(self) -> None:
-        """`pass: None` の check は未実行扱いとし、それ以外がすべて True なら合格とする。"""
+        """A check with `pass: None` is treated as unrun, and it passes if all others are True."""
         from tools.orchestration_runtime import _all_strict_boolean_probe_checks_pass
 
         checks_ok = [
@@ -1305,7 +1305,7 @@ shell_tool                       stable             true
         )
 
     def test_probe_help_fallback_uses_help_when_features_list_fails(self) -> None:
-        """_probe_help_fallback_backend が features list 失敗時に --help fallback を試みること。"""
+        """_probe_help_fallback_backend tries the --help fallback on a features list failure."""
         from tools.orchestration_runtime import _probe_help_fallback_backend
         calls: list[list[str]] = []
 
@@ -1314,7 +1314,7 @@ shell_tool                       stable             true
             if cmd[-1] == "--version":
                 return _FakeCompletedProcess(0, stdout="claude 1.0.0")
             if cmd[-2:] == ["features", "list"]:
-                return _FakeCompletedProcess(1, stdout="")  # features list 失敗
+                return _FakeCompletedProcess(1, stdout="")  # features list failure
             if cmd[-1] == "--help":
                 return _FakeCompletedProcess(0, stdout="Usage: claude ...")
             return _FakeCompletedProcess(1, stdout="")
@@ -1330,7 +1330,7 @@ shell_tool                       stable             true
         self.assertTrue(by_name["claude_help_probe_available"]["pass"])
 
     def test_probe_help_fallback_skips_help_when_features_list_confirms_multi_agent(self) -> None:
-        """features list で multi_agent が分かる場合は --help を走らせず、help プローブは pass=null とする。"""
+        """When multi_agent is known from features list, do not run --help, and the help probe is pass=null."""
         from tools.orchestration_runtime import (
             _can_launch_from_help_fallback_checks,
             _probe_help_fallback_backend,
@@ -1380,7 +1380,7 @@ shell_tool                       stable             true
             "workspace/ir/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/spec.ir.yaml",
             payload["skill_must_read_refs"],
         )
-        self.assertIn("必須要件:", payload["launch_prompt_full"])
+        self.assertIn("Required requirements:", payload["launch_prompt_full"])
 
     def test_render_launch_prompt_text_renders_full_template_body(self) -> None:
         prompt = render_launch_prompt_text(
@@ -1402,9 +1402,9 @@ shell_tool                       stable             true
                 "repair_reason": "none",
             }
         )
-        self.assertIn("あなたは step agent である。", prompt)
-        self.assertIn("必須要件:", prompt)
-        self.assertIn("完了返答には `launch_reply`", prompt)
+        self.assertIn("You are a step agent.", prompt)
+        self.assertIn("Required requirements:", prompt)
+        self.assertIn("The completion reply must include, as `launch_reply`", prompt)
         self.assertIn("guarded-apply-patch", prompt)
 
     def test_record_agent_run_auto_populates_parent_and_model_from_launch_request(self) -> None:
@@ -2084,7 +2084,7 @@ shell_tool                       stable             true
                         "generate",
                         "substep_run_plan_generate_001",
                     )
-                    + "\n追加指示: 最詳細 prompt を保存すること。",
+                    + "\nAdditional instruction: save the most detailed prompt.",
                 },
                 response_payload=_spawn_response_payload("sess_substep_plan_generate_001"),
             )
@@ -2104,7 +2104,7 @@ shell_tool                       stable             true
                     "generate",
                     "substep_run_plan_generate_001",
                 )
-                + "\n追加指示: 最詳細 prompt を保存すること。\n",
+                + "\nAdditional instruction: save the most detailed prompt.\n",
             )
 
     def test_record_launch_uses_spawn_request_task_when_present(self) -> None:
@@ -3743,7 +3743,7 @@ shell_tool                       stable             true
                 request_payload["skill_must_read_refs"],
             )
             prompt_text = prompt_path.read_text(encoding="utf-8")
-            self.assertIn("必須要件:", prompt_text)
+            self.assertIn("Required requirements:", prompt_text)
             self.assertIn("skill_name: workflow-compile-verify", prompt_text)
 
     def test_rejects_launch_prompt_when_field_values_do_not_match_request_payload(self) -> None:
@@ -3786,7 +3786,7 @@ shell_tool                       stable             true
             prompt = build_launch_prompt_text(prepared).replace(
                 "skill_name: workflow-compile-verify",
                 "skill_name: workflow-compile-generate",
-            ) + "\n\n必須要件:\n- 契約された substep を完了すること。\n"
+            ) + "\n\nRequired requirements:\n- Complete the contracted substep.\n"
             with self.assertRaisesRegex(
                 ValueError, "must preserve workflow-orchestration template field values"
             ):
@@ -3893,7 +3893,7 @@ shell_tool                       stable             true
                 line
                 for line in render_launch_prompt_text(prepared).splitlines()
                 if "/capabilities/" not in line
-                and "`capability_token` が未取得または不一致の場合" not in line
+                and "`capability_token` is not obtained or mismatched" not in line
             )
             with self.assertRaisesRegex(ValueError, "shell-write constraints"):
                 record_launch(
@@ -3978,15 +3978,15 @@ shell_tool                       stable             true
         )
         constraint_lines = _required_launch_prompt_constraint_lines(prepared)
         self.assertTrue(constraint_lines)
-        # The read-manifest canonical-source line ("直接読み取ってよい") is a permission
+        # The read-manifest canonical-source line ("may be read directly") is a permission
         # guidance line, not a constraint — it must be excluded.
-        self.assertFalse(any("読み取ってよい" in line for line in constraint_lines))
+        self.assertFalse(any("may be read directly" in line for line in constraint_lines))
         # The cross-agent artifact prohibition is a security constraint — it must be included.
-        self.assertTrue(any("他 agent の内部 artifact" in line for line in constraint_lines))
-        self.assertTrue(any("`.json` と `.txt` の出力は" in line for line in constraint_lines))
+        self.assertTrue(any("agent's internal artifact" in line for line in constraint_lines))
+        self.assertTrue(any("`.json` and `.txt` output" in line for line in constraint_lines))
         self.assertTrue(
             any(
-                "`.yaml` / `.yml` / `.md` および source code 等の上記以外の出力は" in line
+                "`.yaml` / `.yml` / `.md` and source code" in line
                 for line in constraint_lines
             )
         )
@@ -7674,7 +7674,7 @@ shell_tool                       stable             true
                 )
 
     def test_record_agent_run_requires_agent_backend(self) -> None:
-        """agent_backend を含まないペイロードが ValueError を上げること。"""
+        """A payload not including agent_backend raises a ValueError."""
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
             init_orchestration(repo_root=repo_root, orchestration_id="orch_001")
@@ -7691,7 +7691,7 @@ shell_tool                       stable             true
                 )
 
     def test_record_agent_run_rejects_unknown_backend(self) -> None:
-        """agent_backend に未知のバックエンド名を指定すると ValueError を上げること。"""
+        """Specifying an unknown backend name in agent_backend raises a ValueError."""
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
             init_orchestration(repo_root=repo_root, orchestration_id="orch_001")
@@ -7709,7 +7709,7 @@ shell_tool                       stable             true
                 )
 
     def test_record_agent_run_accepts_valid_backends(self) -> None:
-        """codex / cursor / claude がそれぞれ受け付けられること。"""
+        """codex / cursor / claude are each accepted."""
         for backend in ("codex", "cursor", "claude"):
             with self.subTest(backend=backend):
                 with tempfile.TemporaryDirectory() as tmp:
@@ -7729,7 +7729,7 @@ shell_tool                       stable             true
                     self.assertEqual(payload["agent_backend"], backend)
 
     def _setup_preflight_and_orch_agent(self, repo_root: Path) -> None:
-        """共通セットアップ: init_orchestration + write_preflight + orchestration record_agent_run。"""
+        """Common setup: init_orchestration + write_preflight + orchestration record_agent_run."""
         init_orchestration(repo_root=repo_root, orchestration_id="orch_001")
         _mark_dependencies_ready(repo_root)
         write_preflight(
@@ -7804,7 +7804,7 @@ shell_tool                       stable             true
         return payload
 
     def test_write_step_result_requires_validation_stage_for_build_pass(self) -> None:
-        """validation_stage のない pass build step_result が ValueError を上げること。"""
+        """A pass build step_result without validation_stage raises a ValueError."""
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
             self._setup_preflight_and_orch_agent(repo_root)
@@ -7860,11 +7860,11 @@ shell_tool                       stable             true
                 )
 
     def test_write_step_result_accepts_valid_validation_stage_for_build(self) -> None:
-        """validation_stage="post_build" を持つ pass build step_result が通ること。"""
+        """A pass build step_result with validation_stage="post_build" passes."""
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
             self._setup_preflight_and_orch_agent(repo_root)
-            # validation_stage="post_build" を含む payload で write_step_result が成功することを確認
+            # confirm write_step_result succeeds with a payload including validation_stage="post_build"
             write_step_result(
                 repo_root=repo_root,
                 orchestration_id="orch_001",
@@ -7883,7 +7883,7 @@ shell_tool                       stable             true
             )
 
     def test_write_step_result_requires_validation_stage_for_validate_pass(self) -> None:
-        """validation_stage のない pass validate step_result が ValueError を上げること。"""
+        """A pass validate step_result without validation_stage raises a ValueError."""
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
             self._setup_preflight_and_orch_agent(repo_root)
@@ -7906,11 +7906,11 @@ shell_tool                       stable             true
                 )
 
     def test_write_step_result_requires_validation_stage_for_compile_pass(self) -> None:
-        """compile step の pass step_result には validation_stage='compile' を必須とすること。"""
+        """A pass step_result of a compile step requires validation_stage='compile'."""
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
             self._setup_preflight_and_orch_agent(repo_root)
-            # substep record が必要なので agent_runs.jsonl に直接追記する
+            # a substep record is needed, so append directly to agent_runs.jsonl
             orch_root = repo_root / "workspace" / "orchestrations" / "orch_001"
             runs_path = orch_root / "agent_runs.jsonl"
             substep_record = {
@@ -7929,14 +7929,14 @@ shell_tool                       stable             true
             }
             with runs_path.open("a", encoding="utf-8") as fh:
                 fh.write(json.dumps(substep_record) + "\n")
-            # ir_meta.json をディスクに作成する
+            # create ir_meta.json on disk
             ir_meta_path = repo_root / "workspace" / "ir" / "problem__shallow_water2d__0.3.0" / "shallow-water2d_20260415_001" / "ir_meta.json"
             ir_meta_path.parent.mkdir(parents=True, exist_ok=True)
             ir_meta_path.write_text(
                 json.dumps(self._valid_ir_meta()),
                 encoding="utf-8",
             )
-            # compile step は pass で validation_stage='compile' を必須とする
+            # a compile step requires validation_stage='compile' on pass
             write_step_result(
                 repo_root=repo_root,
                 orchestration_id="orch_001",
@@ -7956,7 +7956,7 @@ shell_tool                       stable             true
             )
 
     def test_record_agent_run_normalizes_backend_to_lowercase(self) -> None:
-        """大文字混在・前後スペース付きの agent_backend が小文字・トリム済みに正規化されること。"""
+        """An agent_backend with mixed case and surrounding spaces is normalized to lowercase and trimmed."""
         cases = [
             ("Claude", "claude"),
             ("  Claude  ", "claude"),
@@ -7983,13 +7983,13 @@ shell_tool                       stable             true
 
 
     def test_write_step_result_requires_source_meta_in_substep_outputs(self) -> None:
-        """generate pass step_result で source_meta.json が substep output_refs にない場合 ValueError。"""
+        """ValueError when source_meta.json is not in the substep output_refs in a generate pass step_result."""
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
             self._setup_preflight_and_orch_agent(repo_root)
             orch_root = repo_root / "workspace" / "orchestrations" / "orch_001"
             runs_path = orch_root / "agent_runs.jsonl"
-            # substep record: source_meta.json を含まない
+            # substep record: does not include source_meta.json
             substep_record = {
                 "agent_run_id": "substep_run_gen_verify_001",
                 "agent_role": "substep",
@@ -8023,14 +8023,14 @@ shell_tool                       stable             true
                 )
 
     def test_write_step_result_validates_source_meta_required_keys(self) -> None:
-        """source_meta.json に必須キーが欠けている場合 ValueError。"""
+        """ValueError when a required key is missing from source_meta.json."""
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
             self._setup_preflight_and_orch_agent(repo_root)
             orch_root = repo_root / "workspace" / "orchestrations" / "orch_001"
             runs_path = orch_root / "agent_runs.jsonl"
             meta_ref = "workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/source/src_20260413_001/source_meta.json"
-            # 不完全な source_meta.json を作成（attempt_count のみ）
+            # create an incomplete source_meta.json (attempt_count only)
             meta_path = repo_root / meta_ref
             meta_path.parent.mkdir(parents=True, exist_ok=True)
             meta_path.write_text(json.dumps({"attempt_count": 1}), encoding="utf-8")
@@ -8243,14 +8243,14 @@ shell_tool                       stable             true
                 )
 
     def test_write_step_result_validates_ir_meta_required_keys(self) -> None:
-        """ir_meta.json に必須キーが欠けている場合 ValueError。"""
+        """ValueError when a required key is missing from ir_meta.json."""
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
             self._setup_preflight_and_orch_agent(repo_root)
             orch_root = repo_root / "workspace" / "orchestrations" / "orch_001"
             runs_path = orch_root / "agent_runs.jsonl"
             meta_ref = "workspace/ir/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/ir_meta.json"
-            # 不完全な ir_meta.json（verification_status が欠けている）
+            # an incomplete ir_meta.json (verification_status missing)
             meta_path = repo_root / meta_ref
             meta_path.parent.mkdir(parents=True, exist_ok=True)
             meta_path.write_text(json.dumps({"attempt_count": 1, "context_isolated": True}), encoding="utf-8")
@@ -8371,14 +8371,14 @@ shell_tool                       stable             true
                 )
 
     def test_write_step_result_accepts_valid_source_meta(self) -> None:
-        """必須キーがすべて揃った source_meta.json を含む pass generate step_result が成功する。"""
+        """A pass generate step_result including a source_meta.json with all required keys succeeds."""
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
             self._setup_preflight_and_orch_agent(repo_root)
             orch_root = repo_root / "workspace" / "orchestrations" / "orch_001"
             runs_path = orch_root / "agent_runs.jsonl"
             meta_ref = "workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/source/src_20260413_001/source_meta.json"
-            # 完全な source_meta.json を作成
+            # create a complete source_meta.json
             meta_path = repo_root / meta_ref
             meta_path.parent.mkdir(parents=True, exist_ok=True)
             meta_path.write_text(
@@ -8397,7 +8397,7 @@ shell_tool                       stable             true
             }
             with runs_path.open("a", encoding="utf-8") as fh:
                 fh.write(json.dumps(substep_record) + "\n")
-            # 例外なく完了することを確認
+            # confirm it completes without an exception
             result = write_step_result(
                 repo_root=repo_root,
                 orchestration_id="orch_001",
@@ -8677,7 +8677,7 @@ shell_tool                       stable             true
 
 
     def _minimal_preflight_setup(self, repo_root: Path) -> None:
-        """orchestration / preflight / orchestration agent run を最小構成でセットアップする。"""
+        """Set up orchestration / preflight / orchestration agent run with a minimal configuration."""
         init_orchestration(repo_root=repo_root, orchestration_id="orch_001")
         _mark_dependencies_ready(repo_root)
         write_preflight(
@@ -8705,7 +8705,7 @@ shell_tool                       stable             true
         )
 
     def _minimal_request_payload(self, **overrides: object) -> dict[str, object]:
-        """repair_strategy / issue_severity テスト用の最小 request_payload を返す。"""
+        """Return a minimal request_payload for the repair_strategy / issue_severity tests."""
         base: dict[str, object] = {
             "orchestration_id": "orch_001",
             "agent_run_id": "step_run_repair_001",
@@ -8730,7 +8730,7 @@ shell_tool                       stable             true
         return base
 
     def test_record_launch_rejects_invalid_repair_strategy(self) -> None:
-        """repair_strategy に未定義の値を渡すと ValueError が発生すること。"""
+        """Passing an undefined value to repair_strategy raises a ValueError."""
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
             self._minimal_preflight_setup(repo_root)
@@ -8745,7 +8745,7 @@ shell_tool                       stable             true
                 )
 
     def test_record_launch_rejects_invalid_issue_severity(self) -> None:
-        """issue_severity に未定義の値を渡すと ValueError が発生すること。"""
+        """Passing an undefined value to issue_severity raises a ValueError."""
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
             self._minimal_preflight_setup(repo_root)
@@ -8760,7 +8760,7 @@ shell_tool                       stable             true
                 )
 
     def test_record_launch_requires_repair_target_for_reuse(self) -> None:
-        """repair_strategy=reuse で repair_target_agent_run_id が "none" のとき ValueError。"""
+        """ValueError when repair_target_agent_run_id is "none" with repair_strategy=reuse."""
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
             self._minimal_preflight_setup(repo_root)
@@ -8814,11 +8814,11 @@ shell_tool                       stable             true
                         )
 
     def test_record_launch_accepts_none_strategy_without_repair_fields(self) -> None:
-        """repair_strategy=none では repair_target と repair_reason が "none" でも成功する。"""
+        """With repair_strategy=none, it succeeds even if repair_target and repair_reason are "none"."""
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
             self._minimal_preflight_setup(repo_root)
-            # repair_strategy=none では repair フィールドが "none" でも成功すること
+            # with repair_strategy=none, it succeeds even if the repair fields are "none"
             result = record_launch(
                 repo_root=repo_root,
                 orchestration_id="orch_001",
@@ -8834,7 +8834,7 @@ shell_tool                       stable             true
             self.assertIsInstance(result, dict)
 
     def test_main_help_run_gate_includes_args_json_schema_examples(self) -> None:
-        """`run-gate --help` が gate 別 args_json schema 要約を表示すること。"""
+        """`run-gate --help` displays a per-gate args_json schema summary."""
         import re as _re
         stdout = io.StringIO()
         with redirect_stdout(stdout):
@@ -8846,7 +8846,7 @@ shell_tool                       stable             true
         self.assertIn("validate_pipeline_semantics => {'stage':", out)
 
     def test_main_help_write_step_result_includes_result_json_schema(self) -> None:
-        """`write-step-result --help` が result_json schema 要約を表示すること。"""
+        """`write-step-result --help` displays a result_json schema summary."""
         import re as _re
         stdout = io.StringIO()
         with redirect_stdout(stdout):
@@ -8858,7 +8858,7 @@ shell_tool                       stable             true
         self.assertIn("validation_stage is required", out)
 
     def test_main_help_record_launch_includes_dependency_ref_phase_rule(self) -> None:
-        """`record-launch --help` が dependency_ref の phase 規則を表示すること。"""
+        """`record-launch --help` displays the phase rules of dependency_ref."""
         import re as _re
         stdout = io.StringIO()
         with redirect_stdout(stdout):
@@ -8899,7 +8899,7 @@ shell_tool                       stable             true
         self.assertEqual(str(parsed), token)
 
     def test_render_launch_prompt_includes_capability_token_source_line(self) -> None:
-        """launch prompt が capability_token の取得元と fail-fast 条件を含むこと。"""
+        """The launch prompt includes the source of capability_token and the fail-fast condition."""
         payload = {
             "node_key": "problem/shallow_water2d@0.3.0",
             "step": "build",
@@ -8920,11 +8920,11 @@ shell_tool                       stable             true
         }
         prompt = render_launch_prompt_text(payload)
         self.assertIn("capabilities/step_run_build_001.json", prompt)
-        self.assertIn("`capability_token` が未取得または不一致の場合", prompt)
+        self.assertIn("`capability_token` is not obtained or mismatched", prompt)
 
 
 class CheckpointResumeRuntimeTests(unittest.TestCase):
-    """Item 8: orchestration checkpoint / resume のユニットテスト。"""
+    """Item 8: unit tests for orchestration checkpoint / resume."""
 
     _NK = "component/solver@0.1.0"
     _OUT = "workspace/ir/component__solver__0.1.0/solver_20260415_001/out.txt"
@@ -9035,7 +9035,7 @@ class CheckpointResumeRuntimeTests(unittest.TestCase):
     def test_update_checkpoint_fills_refs_from_launch_request_when_result_refs_are_none(
         self,
     ) -> None:
-        """ir_ref / pipeline_ref が JSON で明示的に null のとき、launch_request から補完する。"""
+        """When ir_ref / pipeline_ref are explicitly null in JSON, complete them from launch_request."""
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp)
             init_orchestration(repo_root=repo, orchestration_id="o1")
@@ -10112,7 +10112,7 @@ class OrchestrationMetaAndJudgeHookTests(unittest.TestCase):
             self.assertEqual(terminal_entry.get("status"), "blocked")
 
     def test_pre_orchestration_start_logs_persisted_parallel_nodes_explicit(self) -> None:
-        """setdefault で保持した値と hook 返却・ログ用 detail が一致すること。"""
+        """The value kept by setdefault matches the detail for the hook return / log."""
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp)
             orch = "orch_parallel_audit"
@@ -10448,7 +10448,7 @@ class PreflightLiveProbeTtlTests(unittest.TestCase):
                     self.assertEqual(probe_mock.call_count, 1)
 
     def test_require_preflight_launchable_passes_repo_root_to_live_probe(self) -> None:
-        """live probe にも repo_root を渡すこと (Claude MCP gate を live preflight でも有効化)。"""
+        """Pass repo_root to the live probe too (enable the Claude MCP gate in live preflight as well)."""
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp)
             init_orchestration(repo_root=repo, orchestration_id="o1")
@@ -10563,7 +10563,7 @@ class PreflightLiveProbeTtlTests(unittest.TestCase):
             self.assertEqual(raw["probed_at"], new_checked)
 
     def test_require_preflight_launchable_missing_checked_at_falls_back_to_utc_now(self) -> None:
-        """live probe が checked_at を返さない場合でも probed_at 更新で KeyError としない。"""
+        """Even if the live probe does not return checked_at, do not KeyError on the probed_at update."""
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp)
             init_orchestration(repo_root=repo, orchestration_id="o1")
@@ -13809,7 +13809,7 @@ class TestPhase3RunGate(unittest.TestCase):
 
 
 class DirectWritePathExtensionPolicyTests(unittest.TestCase):
-    """書き込み path の extension 別 policy helper の挙動確認。"""
+    """Confirm the behavior of the per-extension policy helper for the write path."""
 
     def test_cli_managed_extensions_are_json_and_txt(self) -> None:
         self.assertEqual(CLI_MANAGED_EXTENSIONS, frozenset({".json", ".txt"}))
@@ -13947,7 +13947,7 @@ class DirectWritePathExtensionPolicyTests(unittest.TestCase):
 
 
 class TerminalUnauthorizedWriteDirectWriteTests(unittest.TestCase):
-    """`_validate_actual_write_paths` が direct write extension の path を許容する確認。"""
+    """Confirm that `_validate_actual_write_paths` permits a path of a direct-write extension."""
 
     def _setup_step_run_state(
         self,
@@ -14497,7 +14497,7 @@ class LoadWriteRootsFromCapTests(unittest.TestCase):
 
 
 class ApplyPatchGateCoverageExtensionTests(unittest.TestCase):
-    """`_validate_apply_patch_gate_coverage` の extension 別 gate 要件確認。"""
+    """Confirm the per-extension gate requirements of `_validate_apply_patch_gate_coverage`."""
 
     def _make_payload(
         self,
@@ -16983,12 +16983,12 @@ class RecordTimeoutTests(unittest.TestCase):
 
 
 class SetStatusIdempotencyTests(unittest.TestCase):
-    """set-status の冪等化 guard を検証する。
+    """Verify the idempotency guard of set-status.
 
-    audit (orch_20260511T065637Z_5b7d93d4) で orchestration agent が同一 terminal status
-    (`fail_closed`) を 4 回連続 set-status し reason_detail を逐次上書きしていた。failure
-    narrative の canonical 保存先は failure_analysis.json であり、orchestration_meta の
-    terminal status は 1 回のみ確定するのが正しい。
+    In the audit (orch_20260511T065637Z_5b7d93d4), the orchestration agent set-status the same terminal status
+    (`fail_closed`) 4 times in a row and successively overwrote reason_detail. The canonical
+    storage location for the failure narrative is failure_analysis.json, and the terminal status of
+    orchestration_meta should be finalized only once.
     """
 
     def _orch_meta(self, repo_root: Path, orchestration_id: str) -> dict:
@@ -17070,17 +17070,17 @@ class SetStatusIdempotencyTests(unittest.TestCase):
 
 
 class PreflightDependencyReadinessInitTests(unittest.TestCase):
-    """preflight が orchestration_meta.dependency_readiness を初期化する際の動作:
+    """Behavior when preflight initializes orchestration_meta.dependency_readiness:
 
-    1. canonical field 名 (`direct_dependency_compile_readiness`) のみが書かれる
-    2. spec_ref に対応する deps.yaml の依存が空 (`components: [] & profiles: []`) のとき、
-       trivial に true で初期化される (vacuous truth, audit 互換)
-    3. spec_ref 未設定または deps.yaml 不在のとき、**fail-closed (false)** で初期化される
-    4. deps.yaml に依存が記載されているとき、**fail-closed (false)** で初期化される
-       (将来の readiness builder がフラグを明示的に flip するまで gate は通さない)
+    1. Only the canonical field name (`direct_dependency_compile_readiness`) is written
+    2. When the dependencies of the deps.yaml corresponding to spec_ref are empty (`components: [] & profiles: []`),
+       it is trivially initialized to true (vacuous truth, audit-compatible)
+    3. When spec_ref is unset or deps.yaml is absent, it is initialized **fail-closed (false)**
+    4. When dependencies are listed in deps.yaml, it is initialized **fail-closed (false)**
+       (the gate does not pass until a future readiness builder explicitly flips the flag)
 
-    audit (orch_20260511T065637Z_5b7d93d4) では legacy 名 `direct_dependency_plan_readiness`
-    が all-true で書かれており、`workflow-launch-check` を fail-open させていた。
+    In the audit (orch_20260511T065637Z_5b7d93d4), the legacy name `direct_dependency_plan_readiness`
+    was written all-true, fail-opening `workflow-launch-check`.
     """
 
     _PREFLIGHT_PAYLOAD = {
@@ -17186,11 +17186,11 @@ class PreflightDependencyReadinessInitTests(unittest.TestCase):
 
 
 class SetStatusCleanupRetryTests(unittest.TestCase):
-    """F2: terminal status の cleanup が途中失敗した orchestration では、cleanup_committed
-    marker が存在しない。この状態で同一 terminal status を再呼び出しすると、meta の narrative
-    fields を上書きせず、cleanup と marker write のみを retry することを検証する。
+    """F2: in an orchestration where the terminal-status cleanup failed midway, the cleanup_committed
+    marker does not exist. Verify that re-calling the same terminal status in this state retries
+    only the cleanup and the marker write without overwriting the meta's narrative fields.
 
-    marker が既に存在する (fully committed) 場合のみ同一 terminal 再呼び出しを reject する。
+    Reject a same-terminal re-call only when the marker already exists (fully committed).
     """
 
     def _arid(self, repo_root: Path, orch: str) -> str:
@@ -17268,11 +17268,11 @@ class SetStatusCleanupRetryTests(unittest.TestCase):
 
 
 class UpdateOrchestrationStatusLockTests(unittest.TestCase):
-    """F3: terminal-status critical section が fcntl で serialize されていることを検証する。
+    """F3: verify that the terminal-status critical section is serialized with fcntl.
 
-    厳密な concurrent process race を unit test で再現するのは難しいが、lock 用 sidecar
-    file の作成と、外部 lock holder 中の set-status 呼び出しが lock を取得して進行することを
-    確認する (lock primitive そのものの存在検証)。
+    Reproducing a strict concurrent-process race in a unit test is hard, but confirm the creation of
+    the lock sidecar file and that a set-status call during an external lock holder acquires the lock and
+    proceeds (verification of the existence of the lock primitive itself).
     """
 
     def test_meta_lock_path_is_created_on_terminal_call(self) -> None:
@@ -20920,9 +20920,9 @@ class MarkDependencyReadinessTests(unittest.TestCase):
 
 
 class PreflightLeafRecomputeTests(unittest.TestCase):
-    """F2 (Codex round 3): write_preflight が leaf node では毎回 recompute し、
-    earlier-setup-order issue (spec_ref unset at first preflight など) で fail-closed
-    が sticky 化することを防ぐ。non-leaf は CLI-set state を保持する。
+    """F2 (Codex round 3): write_preflight recomputes every time for a leaf node, and
+    prevents fail-closed from becoming sticky due to an earlier-setup-order issue (such as spec_ref unset at first preflight).
+    A non-leaf keeps the CLI-set state.
     """
 
     _PAYLOAD = {

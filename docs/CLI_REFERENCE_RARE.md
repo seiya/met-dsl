@@ -1,49 +1,49 @@
-# CLI Reference (稀少 subcommand overview)
+# CLI Reference (rare subcommand overview)
 
-## このドキュメントの位置づけ
+## Position of this document
 
-`tools/orchestration_runtime.py` のうち **使用頻度が低い** 稀少 subcommand の overview を置く。詳細な引数仕様は `python3 tools/orchestration_runtime.py <sub> --help` を canonical source とする。
+An overview of the **infrequently used** rare subcommands of `tools/orchestration_runtime.py`. For the detailed argument specification, `python3 tools/orchestration_runtime.py <sub> --help` is the canonical source.
 
-頻出 subcommand (Tier-A) の詳細仕様は [docs/CLI_REFERENCE.md](CLI_REFERENCE.md) を参照する。tool / subcommand 別の情報取得方針は `CLAUDE.md` の「CLI 仕様の確認規約」節を canonical source とする。
+For the detailed specification of the frequent subcommands (Tier-A), refer to [docs/CLI_REFERENCE.md](CLI_REFERENCE.md). The information-acquisition policy per tool / subcommand uses the "CLI reference conventions" section of `CLAUDE.md` as the canonical source.
 
-関連 canonical source:
-- 頻出 subcommand 詳細: [docs/CLI_REFERENCE.md](CLI_REFERENCE.md)
-- workflow 全体の起動契約: `skills/workflow-orchestration/SKILL.md` および `skills/workflow-orchestration/references/startup_contract.md`
-- 例外復旧手順: [docs/RUNBOOK.md](RUNBOOK.md)
+Related canonical sources:
+- frequent subcommand details: [docs/CLI_REFERENCE.md](CLI_REFERENCE.md)
+- the startup contract of the whole workflow: `skills/workflow-orchestration/SKILL.md` and `skills/workflow-orchestration/references/startup_contract.md`
+- exception recovery procedures: [docs/RUNBOOK.md](RUNBOOK.md)
 
-## 共通規約
+## Common conventions
 
-- `--repo-root` / `--orchestration-id` は (ほぼ) 全 subcommand で **required**。
-- ISO 8601 timestamp は UTC (`Z` suffix) を canonical とする。
-- 詳細な引数 (required / optional / default 値) は `<sub> --help` で確認する。
+- `--repo-root` / `--orchestration-id` are **required** in (almost) all subcommands.
+- ISO 8601 timestamps are canonically UTC (`Z` suffix).
+- For the detailed arguments (required / optional / default values), confirm with `<sub> --help`.
 
-## 稀少 subcommand 一覧
+## Rare subcommand list
 
-| subcommand | 用途 | 主な caller / 状況 |
+| subcommand | purpose | main caller / situation |
 |---|---|---|
-| `init` | orchestration 開始 / `orchestration_meta.json` 生成 | 通常は `tools/run_workflow.py` 経由で起動。直接呼び出すのは例外運用のみ |
-| `preflight` | execution platform 起動可否 probe / `preflight.json` 生成 | `tools/run_workflow.py` が内部で呼ぶ。手動呼び出しは禁止 (`AGENTS.md` 参照) |
-| `preflight-status` | 既存 `preflight.json` を読み返す | 起動後の状態確認 |
-| `record-timeout` | `Agent` tool の API stream idle timeout 等の canonical 復旧経路 | child agent が wedge した例外復旧フロー。`--force-reason` は marker check bypass の最終手段 |
-| `read-checkpoint` | `workspace/orchestrations/<orch>/orchestration_checkpoint.json` を取得 | `resume_enabled=true` の orchestration で resume 判定時 |
-| `verify-checkpoint-integrity` | checkpoint に記録された artifact hash と現状を照合 | resume 開始時の整合性確認。`stale` 検出時はその step を skip してはならない |
-| `check-step-completed` | `resume_enabled=true` で対象 step の完了状態を確認 | canonical な skip 判定経路。`step_result.json` の直接参照で skip 判断してはならない |
-| `orchestration-read` | manifest 外 path の gate-mediated read | 通常は `run-gate --gate orchestration_read --args-json '{"read_path": "..."}'` 経由で呼ぶ |
-| `repair-agent-runs` | pre-`caa10ab` の `agent_runs.jsonl` step/substep 行に欠落した `parent_agent_run_id` / `agent_model` を in-place backfill し `pre_judge` 準拠にする | `--resume` 時に自動実行される。auto 導出が `needs_manual` の場合のみ `--agent-model <id>` を付けて手動実行（詳細は `RUNBOOK.md` §3-1） |
-| `dismiss-violation` | 既知の良性 `unauthorized_write_violation` を operator が承認済みとしてマークし、再試行時に `record-agent-run` の terminal validation を通過させる | gitignore 由来の `.pyc` / `.pycache` など意図的な良性パスが violation に記録された場合に使用。`--paths` は `violations/<arid>.unauthorized_write_violation.json` の `unauthorized_paths` に含まれるパスのみ指定可（部分集合として照合）。再試行時の `record-agent-run` は `dismissed_paths` が検出 unauthorized paths を包含する場合のみ通過する |
+| `init` | start an orchestration / generate `orchestration_meta.json` | usually launched via `tools/run_workflow.py`. A direct call is for exceptional operation only |
+| `preflight` | execution-platform launchability probe / generate `preflight.json` | called internally by `tools/run_workflow.py`. A manual call is forbidden (see `AGENTS.md`) |
+| `preflight-status` | read back an existing `preflight.json` | post-launch state confirmation |
+| `record-timeout` | the canonical recovery path for an `Agent` tool API stream idle timeout etc. | the exception recovery flow when a child agent wedges. `--force-reason` is the last resort for a marker-check bypass |
+| `read-checkpoint` | obtain `workspace/orchestrations/<orch>/orchestration_checkpoint.json` | at the resume decision in an orchestration with `resume_enabled=true` |
+| `verify-checkpoint-integrity` | reconcile the artifact hash recorded in the checkpoint with the current state | the consistency confirmation at resume start. On `stale` detection, that step must not be skipped |
+| `check-step-completed` | with `resume_enabled=true`, confirm the completion state of the target step | the canonical skip-decision path. A skip must not be decided by a direct reference to `step_result.json` |
+| `orchestration-read` | the gate-mediated read of a path outside the manifest | usually called via `run-gate --gate orchestration_read --args-json '{"read_path": "..."}'` |
+| `repair-agent-runs` | in-place backfill the `parent_agent_run_id` / `agent_model` missing from the step/substep rows of a pre-`caa10ab` `agent_runs.jsonl`, and make it `pre_judge`-compliant | auto-run at `--resume`. Only when auto-derivation is `needs_manual`, run it manually with `--agent-model <id>` (for details, `RUNBOOK.md` §3-1) |
+| `dismiss-violation` | mark a known benign `unauthorized_write_violation` as operator-approved, and pass the terminal validation of `record-agent-run` on retry | used when an intentionally benign path such as a gitignore-derived `.pyc` / `.pycache` is recorded in a violation. `--paths` can specify only a path included in the `unauthorized_paths` of `violations/<arid>.unauthorized_write_violation.json` (matched as a subset). The `record-agent-run` on retry passes only when `dismissed_paths` contains the detected unauthorized paths |
 
-## 引数取得経路
+## Argument-acquisition path
 
-各 subcommand の required / optional 引数および返値 schema は次のコマンドで確認する。
+Confirm the required / optional arguments and return-value schema of each subcommand with the following command.
 
 ```bash
 python3 tools/orchestration_runtime.py <subcommand> --help
 ```
 
-argparse の出力には description / 全引数の help 文字列が含まれ、本 doc を補完する形で詳細を提供する。`--help` 呼び出し自体は `forbid_tools_direct_read` の対象外であり、`tools/hooks/common.py` の `cli_help_invocation_observed` audit ポリシーで使用頻度が記録される (block されない)。
+The argparse output includes the description / the help string of all arguments, and provides details in a way that complements this doc. The `--help` call itself is outside the scope of `forbid_tools_direct_read`, and its usage frequency is recorded by the `cli_help_invocation_observed` audit policy of `tools/hooks/common.py` (it is not blocked).
 
-## 例外復旧フローへの link
+## Links to exception recovery flows
 
-- `record-timeout` の `--force-reason` 使用条件: `docs/RUNBOOK.md#substep-timeout-recovery`
-- `verify-checkpoint-integrity` で `stale` 検出時の対応: `docs/RUNBOOK.md` 該当節
-- `check-step-completed` を含む resume フロー全体: `skills/workflow-orchestration/SKILL.md` 運用ルール 19
+- the use condition of `record-timeout`'s `--force-reason`: `docs/RUNBOOK.md#substep-timeout-recovery`
+- the response when `verify-checkpoint-integrity` detects `stale`: the relevant section of `docs/RUNBOOK.md`
+- the whole resume flow including `check-step-completed`: `skills/workflow-orchestration/SKILL.md` Operations Rule 19

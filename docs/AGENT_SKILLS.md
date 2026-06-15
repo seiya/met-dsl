@@ -1,37 +1,37 @@
 # Agent Skills Mapping
 
-この文書は、プロジェクト内で利用する `skills` の参照規約を定義する。
+This document defines the reference conventions for the `skills` used in the project.
 
-## 目的
-- `Codex` / `Gemini` / `Claude Code` で同一の phase 定義を使う。
+## Purpose
+- Use the same phase definitions on `Codex` / `Gemini` / `Claude Code`.
 
-## 適用範囲
-- `workflow` 全体を統括する `orchestration agent`
-- core workflow phase `Compile` / `Generate` / `Build` / `Validate`
-- 各 phase で参照する `skills/<skill_name>/SKILL.md`
-- 任意フロー `Tune` / `Promote` の SKILL は core workflow と分離して扱う。
+## Scope
+- The `orchestration agent` that supervises the whole `workflow`
+- The core workflow phases `Compile` / `Generate` / `Build` / `Validate`
+- The `skills/<skill_name>/SKILL.md` referenced in each phase
+- The SKILL of the optional flows `Tune` / `Promote` is handled separately from the core workflow.
 
-## 要件
-- エージェントは、作業対象 phase を特定してから対応 `SKILL.md` を読み込む。
-- `generate -> verify -> regenerate` を持つ phase は、`generate` 用と `verify` 用の 2 つの `SKILL` を必ず分離適用する。
-- workflow 共通の不変規範（過去 artifact 参照禁止、`dummy` 禁止、検証契約導出、`workspace/` ルート制約、`quality check` 判定軸）は `docs/workflow/WORKFLOW_CORE.md` を canonical source とする。各 `phase` の詳細契約は `docs/workflow/phases/` 配下のファイルを canonical source とする。仕様への入口は `docs/WORKFLOW.md` とする。
-- エージェント階層の実行契約（`orchestration -> step` と `orchestration -> substep`）は `ORCHESTRATION.md` を canonical source とする。
-- 全体方針と `spec` 管理要件（`spec_kind` / registry / 正式版配置 / 命名規則）は `SPEC.md` を canonical source とする。
-- `Build` / `Validate.execute` / `quality check` は `MCP` サーバー経由で実行し、`AGENTS.md` の `MCP 実行ルール` と対応 `SKILL.md` の契約を同時適用する。
-- 各 phase は、対応 `SKILL.md` に定義された必須出力（例: `ir_meta.json`、`source_meta.json`、`binary_meta.json`、`verdict.json`、`validate_meta.json`）を欠落させてはならない。
-- `SKILL.md` へは実行手順と当該 `SKILL` 固有の手続きを記述し、`phase` の I/O 契約・artifact 形式・数値的正規要件を `docs/workflow/WORKFLOW_CORE.md` または `docs/workflow/phases/phase_*.md` と矛盾する形で重複定義してはならない。
-- hook 実装は backend 非依存の `common validation` と backend 固有の adapter を分離し、`common validation` は `tools/hooks/common.py`、backend adapter は `tools/hooks/adapters/` を canonical source とする。
-- `codex` backend では `.codex/hooks.json` を hook 呼び出し定義の canonical source とし、`preflight` 判定で `feature_states.codex_hooks=true` を必須とする。
+## Requirements
+- The agent identifies the target phase, then reads the corresponding `SKILL.md`.
+- A phase that has `generate -> verify -> regenerate` must apply the 2 `SKILL`, one for `generate` and one for `verify`, separately.
+- The workflow common invariants (the ban on referencing past artifacts, the `dummy` prohibition, verification-contract derivation, the `workspace/` root constraint, the `quality check` judgment axis) use `docs/workflow/WORKFLOW_CORE.md` as the canonical source. The detailed contract of each `phase` uses the files under `docs/workflow/phases/` as the canonical source. The entry point to the specification is `docs/WORKFLOW.md`.
+- The execution contract of the agent hierarchy (`orchestration -> step` and `orchestration -> substep`) uses `ORCHESTRATION.md` as the canonical source.
+- The overall policy and `spec` management requirements (`spec_kind` / registry / official-version placement / naming rules) use `SPEC.md` as the canonical source.
+- `Build` / `Validate.execute` / `quality check` run via the `MCP` server, and simultaneously apply the `MCP execution rules` of `AGENTS.md` and the contract of the corresponding `SKILL.md`.
+- Each phase must not drop the required outputs defined in the corresponding `SKILL.md` (e.g. `ir_meta.json`, `source_meta.json`, `binary_meta.json`, `verdict.json`, `validate_meta.json`).
+- Write into `SKILL.md` the execution procedure and the procedures specific to that `SKILL`, and do not duplicate the `phase`'s I/O contract / artifact format / numerical canonical requirements in a form that contradicts `docs/workflow/WORKFLOW_CORE.md` or `docs/workflow/phases/phase_*.md`.
+- The hook implementation separates backend-independent `common validation` from backend-specific adapters, and uses `tools/hooks/common.py` as the canonical source for `common validation` and `tools/hooks/adapters/` for the backend adapters.
+- On the `codex` backend, use `.codex/hooks.json` as the canonical source for the hook invocation definitions, and require `feature_states.codex_hooks=true` in the `preflight` decision.
 
-## 責務判定フロー
-1. 追加・変更する規則が workflow artifact の正当性を直接左右するかを判定する。
-2. 正当性を直接左右する場合は `docs/workflow/WORKFLOW_CORE.md` または該当する `docs/workflow/phases/phase_*.md` へ記述する。
-3. workflow 共通規範ではなく、`spec` registry・命名・配置・昇格などの全体方針を定義する場合は `SPEC.md` へ記述する。
-4. 規則がツール呼び出し手順、入力収集順、再生成手順、失敗時オペレーションなど実行方法の詳細である場合は対応 `SKILL.md` へ記述する。
-5. エージェント固有の実行便宜（例: プロンプト順序、ログ整理手順）は `SKILL.md` に限定し、`docs/workflow/WORKFLOW_CORE.md` および `docs/workflow/phases/` へ混在させない。
-6. 判定に迷う場合は、規則違反時の影響が監査可能性・再現性・判定整合の破壊に及ぶかを判定軸とする。破壊する場合は `docs/workflow/` 配下の契約文書、破壊しない場合は `SKILL.md` を選択する。
+## Responsibility-decision flow
+1. Judge whether the rule to add/change directly affects the validity of a workflow artifact.
+2. When it directly affects validity, write it into `docs/workflow/WORKFLOW_CORE.md` or the relevant `docs/workflow/phases/phase_*.md`.
+3. When it defines an overall policy such as `spec` registry / naming / placement / promotion, rather than a workflow common norm, write it into `SPEC.md`.
+4. When the rule is a detail of the execution method such as the tool-call procedure, input-collection order, regeneration procedure, or on-failure operations, write it into the corresponding `SKILL.md`.
+5. Agent-specific execution conveniences (e.g. prompt order, log-organization procedure) are limited to `SKILL.md`, and are not mixed into `docs/workflow/WORKFLOW_CORE.md` or `docs/workflow/phases/`.
+6. When the decision is hard, use as the decision axis whether the impact of a rule violation extends to the destruction of auditability / reproducibility / judgment consistency. When it destroys, choose the contract documents under `docs/workflow/`; when it does not, choose `SKILL.md`.
 
-## phase と Skill 対応表（core workflow）
+## phase-to-Skill correspondence table (core workflow)
 - `Workflow orchestration`: `skills/workflow-orchestration/SKILL.md`
 - `Compile generate`: `skills/workflow-compile-generate/SKILL.md`
 - `Compile verify`: `skills/workflow-compile-verify/SKILL.md`
@@ -41,27 +41,27 @@
 - `Validate execute`: `skills/workflow-validate-execute/SKILL.md`
 - `Validate judge`: `skills/workflow-validate-judge/SKILL.md`
 
-## phase と Skill 対応表（任意フロー）
+## phase-to-Skill correspondence table (optional flows)
 - `Tune generate`: `skills/workflow-tune-generate/SKILL.md`
 - `Tune verify`: `skills/workflow-tune-verify/SKILL.md`
 - `Promote`: `skills/workflow-promote/SKILL.md`
 
-## 補助 Skill
+## Auxiliary Skills
 - `Workflow audit (Codex)`: `skills/workflow-audit-codex/SKILL.md`
 - `Workflow audit (Claude Code)`: `skills/workflow-audit-claude/SKILL.md`
 
-## 運用ルール
-1. 1 回の作業で複数 phase を扱う場合、phase ごとに対応 `SKILL` を切り替える。
-2. `verify` で失敗した場合、同一 phase の `generate` に戻し、再生成後に再検証する。
-3. ループの状態と失敗理由は、該当 phase のメタデータへ記録する。
-4. `SKILL` 定義を変更した場合、この対応表を同一変更で更新する。
-5. workflow 契約を変更する場合は `docs/workflow/WORKFLOW_CORE.md` または該当 `docs/workflow/phases/phase_*.md` を先に更新し、その変更に追従して `SKILL.md` を更新する。
-6. workflow 共通規範の変更は `docs/workflow/WORKFLOW_CORE.md`、各 `phase` 詳細契約の変更は `docs/workflow/phases/`、階層実行契約の変更は `ORCHESTRATION.md`、phase 手順の変更は対応 `SKILL.md` へ記述する。
-7. `AGENT_SKILLS.md` へは規則本文を再掲せず、参照先と責務判定を記述する。
+## Operations Rules
+1. When handling multiple phases in one piece of work, switch the corresponding `SKILL` per phase.
+2. When `verify` fails, go back to the `generate` of the same phase, and re-verify after regeneration.
+3. Record the loop state and the failure reason in the metadata of the relevant phase.
+4. When the `SKILL` definition is changed, update this correspondence table in the same change.
+5. When changing a workflow contract, first update `docs/workflow/WORKFLOW_CORE.md` or the relevant `docs/workflow/phases/phase_*.md`, and update `SKILL.md` following that change.
+6. Write a change to the workflow common norms into `docs/workflow/WORKFLOW_CORE.md`, a change to each `phase`'s detailed contract into `docs/workflow/phases/`, a change to the hierarchical execution contract into `ORCHESTRATION.md`, and a change to the phase procedure into the corresponding `SKILL.md`.
+7. Do not restate the rule body in `AGENT_SKILLS.md`; write the reference target and the responsibility decision.
 
-## 判定基準
-- 対象 phase で使用した `SKILL` パスを説明できる。
-- 生成 artifact と判定 artifact が、対応 `SKILL` の契約と一致する。
-- エージェント間で同一入力に対する phase 選択が一致する。
-- workflow 共通規範、階層実行契約、phase 手順の参照先が一意に定まる。
-- 同一規則が `docs/workflow/WORKFLOW_CORE.md` または `docs/workflow/phases/` と `ORCHESTRATION.md` と `SKILL.md` に重複再掲されていない。
+## Decision Criteria
+- The `SKILL` path used in the target phase can be explained.
+- The generated artifacts and judgment artifacts match the contract of the corresponding `SKILL`.
+- The phase choice for the same input is consistent across agents.
+- The reference target for the workflow common norms, the hierarchical execution contract, and the phase procedure is uniquely determined.
+- The same rule is not duplicated/restated across `docs/workflow/WORKFLOW_CORE.md` or `docs/workflow/phases/`, `ORCHESTRATION.md`, and `SKILL.md`.

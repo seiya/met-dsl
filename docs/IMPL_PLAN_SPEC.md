@@ -1,56 +1,56 @@
-# Implementation Plan（`spec.ir.yaml.impl_defaults` セクション）
+# Implementation Plan (the `spec.ir.yaml.impl_defaults` section)
 
-## 位置づけ
-`spec.ir.yaml` の `impl_defaults` セクションは、実装裁量（B）のデフォルト値を保持する。core workflow ではこの値を **固定値** として `Generate` 以降が使用する。実装裁量の variant 探索は任意フロー `Tune` の責務であり、`Tune` は `spec.ir.yaml` を不変前提として variant 候補を別途生成する。
+## Position
+The `impl_defaults` section of `spec.ir.yaml` holds the default values for implementation discretion (B). In the core workflow, the stages from `Generate` onward use this value as a **fixed value**. Variant exploration of implementation discretion is the responsibility of the optional flow `Tune`, and `Tune` separately generates variant candidates with `spec.ir.yaml` as an invariant premise.
 
-## 設計方針
-実装裁量は **2 層構造（Abstract Knobs + Backend Overrides）** で表現する。
+## Design Policy
+Implementation discretion is expressed in a **2-layer structure (Abstract Knobs + Backend Overrides)**.
 
-- **abstract**: ハードウェア/言語に依存しにくい "意図" の表現（自動探索しやすい）
-- **backend**: OpenACC / CUDA Fortran / CUDA C++ 等のバックエンド固有パラメタ（実装に落とすため）
+- **abstract**: the expression of "intent" that is less hardware/language dependent (easy to auto-explore)
+- **backend**: backend-specific parameters such as OpenACC / CUDA Fortran / CUDA C++ (to land in an implementation)
 
-この構造により、次を満たす。
-- 任意フロー `Tune` で探索空間を拡大しても表現が破綻しにくい
-- 実装に必要な具体パラメタを明示できる
-- backend 追加時も既存のチューニング履歴が無駄になりにくい
+This structure satisfies the following.
+- Even if the optional flow `Tune` expands the exploration space, the expression is less likely to break down
+- The concrete parameters needed for the implementation can be made explicit
+- Even when a backend is added, the existing tuning history is less likely to be wasted
 
-## 1. 汎用化の境界
-- 汎用化する: ループ変換の "意図"（タイル、融合、並列粒度、ベクトル化、メモリレイアウトの方針、非同期/重ね合わせの方針）
-- 汎用化しない: コンパイラ固有フラグ、GPU アーキ固有の詳細、具体的な pragma/attribute の書き方
-- これらは `backend_overrides` に隔離する
+## 1. The boundary of generalization
+- Generalize: the "intent" of loop transformation (tiling, fusion, parallel granularity, vectorization, the memory-layout policy, the async/overlap policy)
+- Do not generalize: compiler-specific flags, GPU-architecture-specific details, the concrete way of writing a pragma/attribute
+- Isolate these in `backend_overrides`
 
-## 2. 必須項目
-`spec.ir.yaml.impl_defaults` は次を必須とする。
+## 2. Required items
+`spec.ir.yaml.impl_defaults` requires the following.
 
-- `target.class`（cpu/gpu など）
-- `target.backend`（例: `cpu_fortran_reference`、`cuda_fortran`）
-- `target.architecture`（例: `x86_64`、`aarch64`、`nvidia_sm80`）
-- `toolchain.language`（例: `fortran`、`cpp`、`cuda_fortran`）
-- `toolchain.standard`（例: `2008`、`c++17`）
-- `toolchain.build_system`（例: `make`、`cmake`、`meson`、`ninja`）
-- `abstract`（言語非依存ノブ）
-- `backend_overrides`（言語/バックエンド依存ノブ）
+- `target.class` (cpu/gpu etc.)
+- `target.backend` (e.g. `cpu_fortran_reference`, `cuda_fortran`)
+- `target.architecture` (e.g. `x86_64`, `aarch64`, `nvidia_sm80`)
+- `toolchain.language` (e.g. `fortran`, `cpp`, `cuda_fortran`)
+- `toolchain.standard` (e.g. `2008`, `c++17`)
+- `toolchain.build_system` (e.g. `make`, `cmake`, `meson`, `ninja`)
+- `abstract` (language-independent knobs)
+- `backend_overrides` (language/backend-dependent knobs)
 - `selected.backend_key`
 
-ルール:
-- **プログラミング言語は `Compile` で必ず固定する。**
-- **ターゲットアーキテクチャは `Compile` で必ず固定する。**
-- `toolchain.language` は `Compile` 時に固定する。ユーザーからプログラミング言語の明示指定がない場合、`target.class=cpu` では `fortran`、`target.class=gpu` では `cuda_fortran` を必ず採用する。
-- `toolchain.language` の既定値からの逸脱は、ユーザーがプログラミング言語を明示指定した場合にのみ許可する。
-- `target.class=cpu` でユーザーがループ並列化方式を明示指定しない場合、生成器は並列化可能ループへ `OpenMP` を適用する。
-- ユーザーがループ並列化方式を明示指定した場合は、その指定を優先する。並列化不可能ループへの強制 `OpenMP` 付与を禁止する。
-- `target.class` が `cpu` / `gpu` 以外の場合、`toolchain.language` の既定値補完を禁止する。
-- `impl_defaults` で `toolchain.language` / `toolchain.standard` / `toolchain.build_system` が未定義の場合、`Compile.verify` で `fail` とする。
-- `target.architecture` が未定義の場合、`Compile.verify` で `fail` とする。
-- `toolchain.language` が `fortran` / `c` / `cpp` / `mixed` 系の場合、`toolchain.build_system` は `make` / `cmake` / `meson` / `ninja` のいずれかとする。既定値は `make` とする。
+Rules:
+- **The programming language must be fixed in `Compile`.**
+- **The target architecture must be fixed in `Compile`.**
+- `toolchain.language` is fixed at `Compile` time. When the user does not explicitly specify the programming language, `target.class=cpu` must adopt `fortran`, and `target.class=gpu` must adopt `cuda_fortran`.
+- A deviation from the default of `toolchain.language` is permitted only when the user explicitly specifies the programming language.
+- When the user does not explicitly specify the loop parallelization method for `target.class=cpu`, the generator applies `OpenMP` to parallelizable loops.
+- When the user explicitly specifies the loop parallelization method, that specification takes precedence. Forcing `OpenMP` onto a non-parallelizable loop is forbidden.
+- When `target.class` is other than `cpu` / `gpu`, default-value completion of `toolchain.language` is forbidden.
+- When `toolchain.language` / `toolchain.standard` / `toolchain.build_system` are undefined in `impl_defaults`, it is a `fail` in `Compile.verify`.
+- When `target.architecture` is undefined, it is a `fail` in `Compile.verify`.
+- When `toolchain.language` is a `fortran` / `c` / `cpp` / `mixed` family, `toolchain.build_system` is one of `make` / `cmake` / `meson` / `ninja`. The default is `make`.
 
-## 3. 任意項目（環境依存）
-- `toolchain.compiler` / `toolchain.linker` は **任意** とする。
-- compiler 種別・バージョンを固定したい場合（CI 再現性重視）のみ記載する。
-- 固定しない場合は、実行環境の既定コンパイラを使う。
-- 直接 `gcc` / `clang` / `gfortran` を呼び出して単発ビルドする運用を禁止し、必ず `toolchain.build_system` を介してビルドする。
+## 3. Optional items (environment-dependent)
+- `toolchain.compiler` / `toolchain.linker` are **optional**.
+- State them only when you want to fix the compiler type/version (emphasizing CI reproducibility).
+- When not fixed, use the execution environment's default compiler.
+- The operation of directly calling `gcc` / `clang` / `gfortran` for a one-off build is forbidden; always build via `toolchain.build_system`.
 
-## 4. 生成物の構成ルール（言語共通）
-- 生成コードは言語に依らず、`model`（物理計算）と `runner`（input/output・判定連携）を分離する。
-- `runner` は `model` を `call` / `use` / `import` で呼び出す。
-- 物理更新ロジックを `runner` 側に重複実装してはならない。
+## 4. Composition rules of the output (common across languages)
+- Regardless of language, the generated code separates `model` (physics computation) and `runner` (input/output / judgment coordination).
+- The `runner` calls the `model` via `call` / `use` / `import`.
+- The physics-update logic must not be duplicated on the `runner` side.

@@ -161,7 +161,7 @@ class RunWorkflowTests(unittest.TestCase):
         self.assertIn("dependency_ref: `spec/problem/deps.yaml`", text)
         self.assertNotIn("(not specified)", text)
         self.assertIn("METDSL_WORKFLOW_MODE=1", text)
-        self.assertIn("不足している場合は即停止", text)
+        self.assertIn("If the information needed to start is insufficient, stop immediately", text)
         self.assertIn("issue_severity", text)
 
     def test_parse_args_defaults(self) -> None:
@@ -224,6 +224,20 @@ class RunWorkflowTests(unittest.TestCase):
             self.assertEqual(extracted.get("until_phase"), until_phase)
             self.assertEqual(extracted.get("mode"), mode)
             self.assertEqual(extracted.get("spec_ref"), "spec/problem/test.md")
+
+    def test_prompt_params_recovers_legacy_japanese_start_prompt(self) -> None:
+        # Backward compatibility: an orchestration.start.prompt.txt written before
+        # the English translation used the Japanese "終了 phase:" label. Resume must
+        # still recover until_phase from such persisted prompts.
+        legacy_prompt = (
+            "target_phases: `compile, generate`（終了 phase: `generate`）\n"
+            "workflow_mode: `dev`\n"
+            "target_spec_ref: `spec/problem/test.md`\n"
+        )
+        extracted = run_workflow._extract_prompt_params(legacy_prompt)
+        self.assertEqual(extracted.get("until_phase"), "generate")
+        self.assertEqual(extracted.get("mode"), "dev")
+        self.assertEqual(extracted.get("spec_ref"), "spec/problem/test.md")
 
     def _seed_resumable_orchestration(
         self,

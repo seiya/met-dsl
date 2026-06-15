@@ -1,6 +1,6 @@
-# Controlled Spec: 2 次元 周期境界 写像（component spec）
+# Controlled Spec: 2D periodic-boundary mapping (component spec)
 
-## 0. メタ情報
+## 0. Meta information
 - `spec_id`: `dynamics_shallow_water_boundary_2d_periodic_copy`
 - `spec_version`: `0.1.0`
 - `status`: `controlled_draft`
@@ -8,29 +8,29 @@
 - `domain`: `dynamics`
 - `family`: `shallow_water`
 
-## 1. 責務と適用範囲
-本 `component` は 2 次元 周期境界 ghost 写像のみを担当する。
+## 1. Responsibility and scope
+This `component` is responsible only for the 2D periodic-boundary ghost mapping.
 
 ## 2. input/output contract
-入力は `U(i,j)`、`nx`、`ny`、`ng` とする。出力は 周期写像後の `U` とする。
+The input is `U(i,j)`, `nx`, `ny`, and `ng`. The output is `U` after the periodic mapping.
 
-## 3. 演算定義
-公開 `operation` は `dynamics_shallow_water_boundary_2d_periodic_copy__apply` とする。`x` と `y` 方向の周期写像を順に適用する。
+## 3. Operation definition
+The published `operation` is `dynamics_shallow_water_boundary_2d_periodic_copy__apply`. It applies the periodic mapping in the `x` and `y` directions in order.
 
-## 4. 失敗条件と制約
-`nx<2`、`ny<2`、`ng<1` を入力不正としてエラーとする。
+## 4. Failure conditions and constraints
+Treat `nx<2`, `ny<2`, and `ng<1` as invalid input and an error.
 
-## 5. 公開 API と互換性
-公開 `operation_id` は `dynamics_shallow_water_boundary_2d_periodic_copy__apply` のみとする。
+## 5. Public API and compatibility
+The only published `operation_id` is `dynamics_shallow_water_boundary_2d_periodic_copy__apply`.
 
-## 6. 禁止事項
-非周期境界への自動フォールバックを禁止する。
+## 6. Prohibitions
+Forbid automatic fallback to a non-periodic boundary.
 
-## 7. トレーサビリティ
-`component_catalog.yaml` と `case.resolved.yaml` に採用結果を必須記録とする。
+## 7. Traceability
+Require recording the adoption result in `component_catalog.yaml` and `case.resolved.yaml`.
 
-## 8. AD 準備情報
-`ad_readiness.enabled` は `true` とする。離散演算として 周期インデックス wrap を明示する。
+## 8. AD preparation information
+`ad_readiness.enabled` is `true`. The periodic-index wrap is made explicit as a discrete operation.
 
-## 9. tests 参照
-対応する `tests.md` を同一ディレクトリに配置し、`test_profile_version` を `0.1.0` とする。
+## 9. tests reference
+Place the corresponding `tests.md` in the same directory, with `test_profile_version` of `0.1.0`.

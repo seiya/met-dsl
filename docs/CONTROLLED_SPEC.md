@@ -1,153 +1,153 @@
-# Controlled Spec（canonical source）の要件と書式
+# Requirements and format of the Controlled Spec (canonical source)
 
-## 目的
-`Controlled Spec` は本プロジェクトの**唯一の物理仕様 canonical source**であり、次を同時に満たす必要がある。
-- ドメイン研究者が読んで理解できること
-- 各 `spec` が定義する計算課題を実装するサブルーチン群（`model`）と、input/output・実行・判定連携を担う `runner` へ**決定的に**変換できること
+## Purpose
+The `Controlled Spec` is the project's **sole physics-specification canonical source**, and must simultaneously satisfy the following.
+- It can be read and understood by a domain researcher.
+- It can be **deterministically** converted into the subroutine groups (`model`) that implement the computation task defined by each `spec`, and the `runner` responsible for input/output, execution, and judgment coordination.
 
-## role 分離（最重要）
-本プロジェクトでは、仕様を次の 2 層に分ける。
+## Role separation (most important)
+This project divides the specification into the following 2 layers.
 
-1. `Controlled Spec`（本書）
-- `Controlled Spec` は `spec_kind` を持ち、`problem` / `component` / `profile` の 3 種に classification する。
-- `problem` は統合対象の方程式系と実行時 input contract を定義し、依存 `component` と採用 `profile` を参照する。
-- `component` は再利用可能な物理演算の input/output contract と公開 `operation` を定義する。
-- `profile` は `component` に対する選択規則とパラメタ拘束を定義する。
+1. `Controlled Spec` (this document)
+- The `Controlled Spec` has a `spec_kind` and is classified into the 3 kinds `problem` / `component` / `profile`.
+- `problem` defines the equation system to be integrated and the runtime input contract, and references the dependent `component` and adopted `profile`.
+- `component` defines the input/output contract of a reusable physics operation and the published `operation`.
+- `profile` defines the selection rules and parameter constraints for a `component`.
 
-2. `tests`（`tests.md`）
-- 検証で使う入力条件（初期条件、実行条件、ケース展開）と判定閾値を書く。
-- `tests` は `problem` / `component` / `profile` のすべてで適用する。
-- 記述規律は `TESTS.md` を canonical source とし、自然言語中心で定義する。
+2. `tests` (`tests.md`)
+- It describes the input conditions used in verification (initial conditions, execution conditions, case expansion) and the judgment thresholds.
+- `tests` applies to all of `problem` / `component` / `profile`.
+- The description discipline uses `TESTS.md` as the canonical source and is defined natural-language-first.
 
-注意:
-- 実行モジュールはテスト専用ではない。科学計算の本番実行では、ユーザーが目的に応じて実行時入力を設計できる。
-- `tests` は、その実行時入力のうち「検証に使う既定プロファイル」を定義する文書である。
-- 言語に依らず、生成物は `model`（物理計算）と `runner`（実行・判定連携）を分離し、`runner` が `model` を呼び出す構造にする。
+Note:
+- The execution module is not test-only. In production execution of scientific computation, the user can design the runtime input according to their purpose.
+- `tests` is the document that defines, among that runtime input, the "default profile used for verification".
+- Regardless of language, the output separates `model` (physics computation) and `runner` (execution / judgment coordination), with a structure in which the `runner` calls the `model`.
 
-境界ルール:
-- `problem spec` に `component` の内部実装手順を書かない。`component_id` と `profile_id` の参照で定義する。
-- `component spec` にケース固有設定（`nx` sweep、`t_end`、`case_id` 群など）を書かない。
-- `profile spec` に方程式定義や保存量更新式の新規導入を書かない。
-- `tests` に離散化スキーム定義そのものを書かない。
+Boundary rules:
+- Do not write the internal implementation procedure of a `component` in a `problem spec`. Define it by reference to `component_id` and `profile_id`.
+- Do not write case-specific settings (`nx` sweep, `t_end`, the `case_id` group, etc.) in a `component spec`.
+- Do not write the new introduction of an equation definition or conserved-quantity update expression in a `profile spec`.
+- Do not write the discretization-scheme definition itself in `tests`.
 
-## 基本方針（自然言語ファースト）
-- 記述の主役は**自然言語**とする。
-- 構造化ブロック（`YAML` / `JSON` / 表）は、**自然言語だけでは曖昧になる箇所**に限定する。
-- `Markdown` の数式記法は、インラインを `$...$`、ブロックを `$$...$$` とし、`\(...\)` と `\[...\]` を使用しない。
-- `LLM` や変換器による欠落補完は禁止する。**不足はエラー**として扱う。
-- 物理アルゴリズム（A）は `Controlled Spec` で固定し、実行アルゴリズム（B）は `spec.ir.yaml` の `impl_defaults` セクションで扱う。
+## Basic policy (natural-language-first)
+- The main vehicle of description is **natural language**.
+- Limit structured blocks (`YAML` / `JSON` / tables) to **places that would be ambiguous with natural language alone**.
+- For the `Markdown` math notation, use `$...$` for inline and `$$...$$` for block, and do not use `\(...\)` or `\[...\]`.
+- Forbid completion of omissions by the `LLM` or a converter. Treat **a shortage as an error**.
+- Fix the physics algorithm (A) in the `Controlled Spec`, and handle the execution algorithm (B) in the `impl_defaults` section of `spec.ir.yaml`.
 
-## 記述フォーマット（固定テンプレート）
-冒頭に **0. メタ情報** を置く。以降の節は `spec_kind` ごとに固定する。
+## Description format (fixed template)
+Place **0. Meta information** at the top. The subsequent sections are fixed per `spec_kind`.
 
-0. **メタ情報（先頭固定）**
-- 必須文: `spec_id`、`spec_version`、`status`、`spec_kind`、`domain`、`family` を文書先頭で明示する。
+0. **Meta information (fixed at the top)**
+- Required statement: state `spec_id`, `spec_version`, `status`, `spec_kind`, `domain`, and `family` at the top of the document.
 
-### `problem spec` の必須節
-1. **問題定義**
-- 必須文: 対象方程式、保存形 / 非保存形、対象変数、物理仮定を文章で明示する。
+### Required sections of a `problem spec`
+1. **Problem definition**
+- Required statement: state the target equations, conservative / non-conservative form, target variables, and physical assumptions in prose.
 
-2. **変数と座標の定義**
-- 必須文: 各変数について「名前・意味・配置・単位」を文章で明示する。
-- 必須文: 座標系と次元を文章で明示する。
+2. **Definition of variables and coordinates**
+- Required statement: for each variable, state "name, meaning, placement, unit" in prose.
+- Required statement: state the coordinate system and dimension in prose.
 
-3. **領域と境界条件の型定義**
-- 必須文: 領域の型と境界条件アルゴリズムを文章で明示する。
-- 必須文: 実行時入力（`runtime inputs`）として可変な項目を明示する。
-- 必須文: 検証時に `tests` が与えるのは実行時入力の一部プロファイルであることを明示する。
+3. **Type definition of domain and boundary conditions**
+- Required statement: state the domain type and the boundary-condition algorithm in prose.
+- Required statement: state the items that are variable as runtime inputs (`runtime inputs`).
+- Required statement: state that at verification time `tests` provides a partial profile of the runtime input.
 
-4. **依存 `component` と採用 `profile`**
-- 必須文: 参照する `component_id` と `profile_id`、適用順序、互換制約を明示する。
+4. **Dependent `component` and adopted `profile`**
+- Required statement: state the referenced `component_id` and `profile_id`, the application order, and the compatibility constraints.
 
-5. **統合アルゴリズム**
-- 必須文: `component` 呼び出し順序、データ受け渡し、時間更新順序を明示する。
+5. **Integration algorithm**
+- Required statement: state the `component` call order, data passing, and time-update order.
 
-6. **モデルパラメタと実行時 input contract**
-- 必須文: 物理定数の固定 / 可変、単位、既定値を明示する。
-- 必須文: 実行時 input contract（初期条件、終了時刻、刻み規則など）を列挙する。
+6. **Model parameters and the runtime input contract**
+- Required statement: state the fixed / variable physical constants, units, and default values.
+- Required statement: enumerate the runtime input contract (initial conditions, end time, step rules, etc.).
 
-7. **禁止事項**
-- 必須文: 未サポート機能、暗黙補完禁止、未定義パラメタの扱いを文章で明示する。
+7. **Prohibitions**
+- Required statement: state the unsupported features, the prohibition of implicit completion, and the handling of undefined parameters in prose.
 
-8. **トレーサビリティ**
-- 必須文: `spec_version`、参照文献 / 根拠、`spec.ir.yaml` の `case` セクションへ落ち込む決定値の対応規則を文章で明示する。
+8. **Traceability**
+- Required statement: state `spec_version`, the referenced literature / basis, and the correspondence rule for the determined values that fall into the `case` section of `spec.ir.yaml`, in prose.
 
-9. **tests 参照**
-- 必須文: 対応する `tests.md` の参照パスと `test_profile_version` を明示する。
+9. **tests reference**
+- Required statement: state the reference path of the corresponding `tests.md` and the `test_profile_version`.
 
-10. **AD 準備情報**
-- 必須文: `ad_readiness.enabled` の値と、`true` の場合の必須情報を文章で明示する。
+10. **AD preparation information**
+- Required statement: state the value of `ad_readiness.enabled` and, when `true`, the required information, in prose.
 
-### `component spec` の必須節
-1. **責務と適用範囲**
-- 必須文: `component` が担う演算責務、対象外責務、入力状態の前提を明示する。
+### Required sections of a `component spec`
+1. **Responsibility and scope**
+- Required statement: state the operation responsibility the `component` bears, the out-of-scope responsibilities, and the premise of the input state.
 
 2. **input/output contract**
-- 必須文: 入力変数、出力変数、配列配置、単位、次元、境界取り扱いを明示する。
+- Required statement: state the input variables, output variables, array placement, units, dimensions, and boundary handling.
 
-3. **演算定義**
-- 必須文: 公開 `operation` ごとの数式、離散化、選択規則を明示する。
+3. **Operation definition**
+- Required statement: state, per published `operation`, the equations, discretization, and selection rules.
 
-4. **失敗条件と制約**
-- 必須文: 不正入力の判定条件、エラー終了条件、許容範囲外の扱いを明示する。
+4. **Failure conditions and constraints**
+- Required statement: state the judgment conditions for invalid input, the error-termination conditions, and the handling of out-of-tolerance.
 
-5. **公開 API と互換性**
-- 必須文: `operation_id` 一覧、`major` / `minor` の更新規則、後方互換方針を明示する。
+5. **Public API and compatibility**
+- Required statement: state the `operation_id` list, the `major` / `minor` update rules, and the backward-compatibility policy.
 
-6. **禁止事項**
-- 必須文: 自動切替、暗黙補完、仕様外入力の黙殺を禁止する規則を明示する。
+6. **Prohibitions**
+- Required statement: state the rules that forbid automatic switching, implicit completion, and silent ignoring of out-of-spec input.
 
-7. **トレーサビリティ**
-- 必須文: `component_catalog.yaml` と `spec.ir.yaml` の `case` セクションへ落ち込む決定値の対応規則を明示する。
+7. **Traceability**
+- Required statement: state the correspondence rule for the determined values that fall into `component_catalog.yaml` and the `case` section of `spec.ir.yaml`.
 
-8. **tests 参照**
-- 必須文: 対応する `tests.md` の参照パスと `test_profile_version` を明示する。
+8. **tests reference**
+- Required statement: state the reference path of the corresponding `tests.md` and the `test_profile_version`.
 
-9. **AD 準備情報**
-- 必須文: 微分不可能演算、勾配対象外演算、分岐規則を明示する。
+9. **AD preparation information**
+- Required statement: state the non-differentiable operations, gradient-excluded operations, and branching rules.
 
-### `profile spec` の必須節
-1. **対象 `component` と互換範囲**
-- 必須文: 対象 `component_id`、対象 `operation_id`、適用可能 `major` 範囲を明示する。
+### Required sections of a `profile spec`
+1. **Target `component` and compatibility range**
+- Required statement: state the target `component_id`, the target `operation_id`, and the applicable `major` range.
 
-2. **選択規則**
-- 必須文: 適用条件、優先順位、排他条件を明示する。
+2. **Selection rules**
+- Required statement: state the application conditions, priority, and exclusion conditions.
 
-3. **パラメタ拘束**
-- 必須文: 既定値、許容範囲、単位、導出規則を明示する。
+3. **Parameter constraints**
+- Required statement: state the default values, allowed ranges, units, and derivation rules.
 
-4. **フォールバック規則**
-- 必須文: 条件不成立時の代替選択、禁止条件、エラー条件を明示する。
+4. **Fallback rules**
+- Required statement: state the alternative selection when a condition is not met, the prohibition conditions, and the error conditions.
 
-5. **トレーサビリティ**
-- 必須文: `spec.ir.yaml` の `case` セクションへ固定するキーと値の対応規則を明示する。
+5. **Traceability**
+- Required statement: state the correspondence rule for the keys and values fixed into the `case` section of `spec.ir.yaml`.
 
-6. **tests 参照**
-- 必須文: 対応する `tests.md` の参照パスと `test_profile_version` を明示する。
+6. **tests reference**
+- Required statement: state the reference path of the corresponding `tests.md` and the `test_profile_version`.
 
-## 構造化ブロックの使用基準
-### 使ってよい場合（真に必要な場合のみ）
-- パラメタ一覧のように、**項目数が多く取り違えやすい**場合
-- input/outputスキーマのように、**機械処理で厳密一致が必要**な場合
-- 自然言語では冗長になり、可読性が下がる場合
+## Usage criteria for structured blocks
+### When it may be used (only when truly necessary)
+- When, like a parameter list, **there are many items and they are easy to mix up**
+- When, like an input/output schema, **strict match is needed for machine processing**
+- When natural language would become verbose and reduce readability
 
-### 使ってはいけない場合
-- 方針説明、背景説明、選定理由などの説明文
-- 1 つか 2 つの値を示すだけの箇所
-- 文章で一意に定義できる箇所
+### When it must not be used
+- Explanatory text such as policy explanations, background explanations, and selection rationale
+- A place that shows only one or two values
+- A place that can be uniquely defined in prose
 
-## 曖昧性排除ルール
-- 「適切」「十分小さい」などの主観表現は禁止する。
-- 取り得る選択肢が複数ある場合は、**選択規則**（優先順位または固定値）を明示する。
-- 単位・閾値・数式・手順で記述する。
-- 未定義項目は「暗黙の既定値」で埋めず、`Spec` 不備として差し戻す。
+## Ambiguity-elimination rules
+- Forbid subjective expressions such as "appropriate" or "sufficiently small".
+- When there are multiple possible options, state the **selection rule** (priority or fixed value).
+- Describe with units, thresholds, equations, and procedures.
+- Do not fill an undefined item with an "implicit default"; send it back as a `Spec` deficiency.
 
-## レビュー時チェックリスト
-- 文書先頭にメタ情報（`spec_id`、`spec_version`、`status`、`spec_kind`、`domain`、`family`）がある。
-- `spec_kind` に対応する必須節がすべて存在する。
-- 物理・アルゴリズム定義とテスト入力条件が混在していない。
-- `problem spec` では依存 `component` と採用 `profile` が明示されている。
-- `component spec` では公開 `operation` と失敗条件が明示されている。
-- `profile spec` では適用条件と排他条件が明示されている。
-- 各 `spec` で `tests.md` 参照が明示され、`spec_ref` と突合できる。
-- 未定義パラメタ、単位抜け、閾値抜けがない。
+## Review checklist
+- The meta information (`spec_id`, `spec_version`, `status`, `spec_kind`, `domain`, `family`) is at the top of the document.
+- All required sections corresponding to the `spec_kind` exist.
+- The physics / algorithm definition and the test input conditions are not mixed.
+- For a `problem spec`, the dependent `component` and adopted `profile` are stated.
+- For a `component spec`, the published `operation` and failure conditions are stated.
+- For a `profile spec`, the application conditions and exclusion conditions are stated.
+- For each `spec`, the `tests.md` reference is stated and can be reconciled with `spec_ref`.
+- There are no undefined parameters, missing units, or missing thresholds.
