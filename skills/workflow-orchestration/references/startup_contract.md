@@ -315,7 +315,7 @@ python3 tools/orchestration_runtime.py record-agent-run \
 ```
 
 - For a terminal status (`pass` / `fail` / `fail_closed` / `blocked` / `timeout` / `cancel`), `finished_at` is required.
-- For a `pass` termination, `output_refs` is required.
+- For a `pass` termination, `output_refs` is required. **List concrete file paths only — a directory entry (e.g. `.../src/`, `raw/`, `raw/state_snapshots/`) is rejected with `allowed_output_paths manifest violation`. Enumerate each file** (`.../src/<name>.f90`, `.../src/Makefile`, `.../src/mcp_command_log.jsonl`, `raw/state_snapshots/<case_id>.json`, ...).
 - For a step/substep role, `agent_session_id` / `context_id` / `context_isolated` / `node_key` are required. In Claude Code, `agent_session_id` and `context_id` are recorded with the same value as `agent_run_id`.
 - The `running` initial entry of the orchestration role is auto-inserted by `init_orchestration()`, so it is not called from the orchestration agent. Only the terminal entry is appended by the orchestration agent after running `set-status`.
 

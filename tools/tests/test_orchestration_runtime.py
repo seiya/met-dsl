@@ -2880,6 +2880,28 @@ shell_tool                       stable             true
             (root / "agent_runs.jsonl").write_text(
                 "\n".join(json.dumps(r) for r in rows) + "\n", encoding="utf-8"
             )
+            # session_run_index seeded `running` by init; must be terminalized too.
+            (root / "session_run_index.json").write_text(
+                json.dumps({"entries": [
+                    {"agent_run_id": orch_arid, "agent_session_id": orch_arid,
+                     "session_id": orch_arid, "context_id": orch_arid,
+                     "agent_role": "orchestration", "status": "running",
+                     "recorded_at": "2026-06-15T03:38:50Z"},
+                    {"agent_run_id": "child-001", "agent_session_id": "child-001",
+                     "session_id": "child-001", "context_id": None,
+                     "agent_role": "substep", "status": "pass",
+                     "recorded_at": "2026-06-15T03:48:51Z"},
+                ]}),
+                encoding="utf-8",
+            )
+
+            def _session_orch_row() -> dict:
+                doc = json.loads(
+                    (root / "session_run_index.json").read_text(encoding="utf-8")
+                )
+                return next(
+                    e for e in doc["entries"] if e["agent_run_id"] == orch_arid
+                )
 
             changed = _finalize_orchestration_run_row(
                 repo_root, oid, status="pass", finished_at="2026-06-15T05:17:05Z"
@@ -2896,12 +2918,18 @@ shell_tool                       stable             true
             crow = next(r for r in after if r["agent_run_id"] == "child-001")
             self.assertEqual(crow["status"], "pass")
             self.assertEqual(crow["finished_at"], "2026-06-15T03:48:51Z")
+            # session_run_index orchestration row terminalized; child untouched.
+            self.assertEqual(_session_orch_row()["status"], "pass")
+            sess_updated_at = _session_orch_row().get("updated_at")
+            self.assertIsNotNone(sess_updated_at)
 
             # Idempotent: re-run is a no-op and must not overwrite finished_at.
             changed2 = _finalize_orchestration_run_row(
                 repo_root, oid, status="pass", finished_at="2026-06-15T06:00:00Z"
             )
             self.assertFalse(changed2)
+            # session_run_index reconcile is also a no-op (updated_at unchanged).
+            self.assertEqual(_session_orch_row().get("updated_at"), sess_updated_at)
             orow2 = next(
                 json.loads(line)
                 for line in (root / "agent_runs.jsonl").read_text().splitlines()
@@ -2931,7 +2959,16 @@ shell_tool                       stable             true
                         return obj
                 raise AssertionError("orchestration row missing")
 
+            def _session_orch_status() -> str:
+                doc = json.loads(
+                    (root / "session_run_index.json").read_text(encoding="utf-8")
+                )
+                return next(
+                    e for e in doc["entries"] if e["agent_run_id"] == orch_arid
+                )["status"]
+
             self.assertEqual(_orch_row()["status"], "running")
+            self.assertEqual(_session_orch_status(), "running")
             update_orchestration_status(
                 repo_root=repo_root,
                 orchestration_id=oid,
@@ -2942,6 +2979,8 @@ shell_tool                       stable             true
             row = _orch_row()
             self.assertEqual(row["status"], "fail_closed")
             self.assertIn("finished_at", row)
+            # session_run_index orchestration row mirrors the terminal status.
+            self.assertEqual(_session_orch_status(), "fail_closed")
 
     def test_set_status_fail_then_fail_closed_updates_run_row(self) -> None:
         """The permitted fail -> fail_closed promotion must carry the orchestration
@@ -2998,6 +3037,14 @@ shell_tool                       stable             true
                         return json.loads(line)
                 raise AssertionError("orchestration row missing")
 
+            def _session_orch_status() -> str:
+                doc = json.loads(
+                    (root / "session_run_index.json").read_text(encoding="utf-8")
+                )
+                return next(
+                    e for e in doc["entries"] if e["agent_run_id"] == orch_arid
+                )["status"]
+
             # First run terminalizes the row.
             update_orchestration_status(
                 repo_root=repo_root,
@@ -3008,12 +3055,15 @@ shell_tool                       stable             true
             )
             self.assertEqual(_orch_row()["status"], "fail_closed")
             self.assertIn("finished_at", _orch_row())
+            self.assertEqual(_session_orch_status(), "fail_closed")
 
             # Resume must re-open the row to running and drop finished_at.
             enable_checkpoint_resume(repo_root, oid)
             reopened = _orch_row()
             self.assertEqual(reopened["status"], "running")
             self.assertNotIn("finished_at", reopened)
+            # session_run_index orchestration row is reset symmetrically.
+            self.assertEqual(_session_orch_status(), "running")
 
             # The resumed run can re-terminalize it fresh (forward transition).
             update_orchestration_status(
@@ -3025,6 +3075,7 @@ shell_tool                       stable             true
             )
             self.assertEqual(_orch_row()["status"], "fail_closed")
             self.assertIn("finished_at", _orch_row())
+            self.assertEqual(_session_orch_status(), "fail_closed")
 
     def test_resume_row_reset_is_recoverable_on_interrupt(self) -> None:
         """The agent_runs row reset runs BEFORE the meta is committed to `running`,

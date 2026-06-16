@@ -12818,6 +12818,58 @@ def _rewrite_orchestration_run_row(
     return changed
 
 
+def _sync_orchestration_session_index_status(
+    repo_root: Path,
+    orchestration_id: str,
+    status: str,
+) -> bool:
+    """Reconcile the orchestration's own session_run_index.json row to `status`.
+
+    The session index orchestration row is seeded `running` by `init` and — unlike
+    the agent_runs.jsonl row, which `_finalize_orchestration_run_row` rewrites — had
+    no forward path to a terminal status, leaving session-index-based audits seeing
+    the orchestration `running` even after `orchestration_meta.json` reached
+    `pass`/`fail`/`fail_closed`. Called alongside `_finalize_orchestration_run_row`
+    (terminal) and `_reopen_orchestration_run_row` (`running`, resume inverse) so both
+    audit surfaces stay in sync at every call site. Idempotent: a no-op once the row
+    already equals `status`, so same-terminal set-status replays do not rewrite it
+    (preserving `updated_at`). Returns True iff the row was updated.
+    """
+    root = _orchestration_root(repo_root, orchestration_id)
+    orch_arid: str | None = None
+    try:
+        meta = _read_json(root / "orchestration_meta.json")
+    except (OSError, json.JSONDecodeError):
+        meta = None
+    if isinstance(meta, dict):
+        v = meta.get("orchestration_agent_run_id")
+        if isinstance(v, str) and v.strip():
+            orch_arid = v.strip()
+    if orch_arid is None:
+        return False
+    target = status.strip().lower()
+    doc = _read_session_run_index(repo_root, orchestration_id)
+    entries = doc.get("entries")
+    if isinstance(entries, list):
+        for item in entries:
+            if (
+                isinstance(item, dict)
+                and str(item.get("agent_run_id", "")).strip() == orch_arid
+                and str(item.get("status", "")).strip().lower() == target
+            ):
+                return False
+    _append_session_run_index_entry(
+        repo_root,
+        orchestration_id,
+        agent_run_id=orch_arid,
+        agent_session_id=orch_arid,
+        context_id=orch_arid,
+        agent_role="orchestration",
+        status=status,
+    )
+    return True
+
+
 def _finalize_orchestration_run_row(
     repo_root: Path,
     orchestration_id: str,
@@ -12849,12 +12901,16 @@ def _finalize_orchestration_run_row(
         obj["status"] = status
         obj["finished_at"] = finished
 
-    return _rewrite_orchestration_run_row(
+    row_changed = _rewrite_orchestration_run_row(
         repo_root,
         orchestration_id,
         should_rewrite=lambda obj: str(obj.get("status", "")).strip() != status,
         apply_mutation=_mutate,
     )
+    # Mirror the terminalization into session_run_index.json (idempotent), so
+    # session-index-based audits do not see the orchestration row stuck `running`.
+    _sync_orchestration_session_index_status(repo_root, orchestration_id, status)
+    return row_changed
 
 
 def _reopen_orchestration_run_row(
@@ -12880,12 +12936,15 @@ def _reopen_orchestration_run_row(
         obj["status"] = "running"
         obj.pop("finished_at", None)
 
-    return _rewrite_orchestration_run_row(
+    row_changed = _rewrite_orchestration_run_row(
         repo_root,
         orchestration_id,
         should_rewrite=lambda obj: str(obj.get("status", "")).strip() != "running",
         apply_mutation=_mutate,
     )
+    # Symmetric reset of the session_run_index.json orchestration row (idempotent).
+    _sync_orchestration_session_index_status(repo_root, orchestration_id, "running")
+    return row_changed
 
 
 def update_orchestration_status(

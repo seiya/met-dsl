@@ -60,7 +60,7 @@ Fix the verification responsibility of the Generate stage output, and reduce `Bu
 - Check that the storage root of the checked artifact is `workspace/`, and the workflow-root judgment targets only `workspace/`.
 
 ## Operations Rules
-1. Based on the check result, update the `verification_status` of `source_meta.json`.
+1. Based on the check result, update the `verification_status` of `source_meta.json`. **This update MUST be written via `guarded-apply-patch` (a substep `pass` requires `apply_patch_writes` gate evidence; `record-agent-run` rejects a `pass` with no gate record — `pass status for substep requires apply_patch_writes gate evidence`).** Even when the inspection finds nothing to change, re-author `source_meta.json` through `guarded-apply-patch` (e.g. refresh an idempotent field such as `verify_attempts`) so the gate evidence exists. An inspect-only verify that writes nothing cannot terminate `pass`.
 2. On `fail`, record the convention-violation content and the fix target in `last_fail_reason`. When originating from a `Validate` retry, record `code` in the `attribution_hint` of `source_meta.json` as required (routing consistency).
 3. On `verification_status=fail`, request regenerate, and issue a new `source_id` with the same `ir_id`. The form of `source_id` is `src_<YYYYMMDD>_<seq3>` (e.g. `src_20260511_001`). canonical: `docs/workflow/phases/phase_02_generate.md`. The `<slug>_<YYYYMMDD>_<seq3>` form of `ir_id` must not be reused.
 4. Start `Build` only on `verification_status=pass`.

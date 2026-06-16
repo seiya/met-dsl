@@ -185,7 +185,7 @@ Append 1 line to `agent_runs.jsonl`. For a step/substep role, also save `agent.r
 | `context_isolated` | yes for step/substep | `true` (Claude Code) |
 | `node_key` | yes for step/substep | |
 | `finished_at` | yes for a terminal status | ISO 8601 |
-| `output_refs` | yes for `pass` | the list of written artifact paths |
+| `output_refs` | yes for `pass` | the list of written artifact paths. **Concrete file paths only — a directory entry is rejected** (e.g. `.../src/` fails terminal-payload validation with `allowed_output_paths manifest violation`; enumerate each file: `.../src/<name>.f90`, `.../src/Makefile`, `.../src/mcp_command_log.jsonl`). For Validate.execute likewise enumerate each `raw/state_snapshots/<case_id>.json` rather than `raw/`. |
 | `parent_agent_run_id` | automatic | required for a step/substep entry but **need not be written in the payload**. `record-agent-run` auto-copies it from `launches/<arid>.request.json` (record-launch already persisted it from `--parent-agent-run-id`). An explicitly specified value takes precedence |
 | `agent_model` | automatic | same as above. auto-copied from the launch request's `agent_model` (required at record-launch time). An explicitly specified value takes precedence |
 | `issue_severity` | optional | `minor` / `major` / `critical` |
