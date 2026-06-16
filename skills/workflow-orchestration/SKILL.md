@@ -27,7 +27,7 @@ On the target execution platform, run the whole workflow not as the single-threa
 - In `dev` mode, operate the verify judgment strictly, and when `issue_severity=major|critical` is detected, it must stop with `fail`.
 - When a fail occurs in `dev` mode, `workspace/orchestrations/<orchestration_id>/failure_analysis.json` must be saved as a required output recording the cause-investigation result.
 - Making `preflight.json` `pass` by manual editing or post-editing is forbidden. `preflight` uses the execution result of `tools/orchestration_runtime.py preflight` as the canonical source.
-- The preflight of `backend=codex` must simultaneously satisfy `checks.codex_hooks_enabled.pass=true` and `checks.codex_home_writable.pass=true`. When not met, the workflow must not start.
+- The preflight of `backend=codex` must simultaneously satisfy `checks.hooks_enabled.pass=true` and `checks.codex_home_writable.pass=true`. When not met, the workflow must not start.
 - Just before launching a child `agent`, satisfying the live preflight gate is required, and when the live check is `fail`, `record-launch` must not be run.
 - The initial loading before launch uses `references/startup_contract.md` as the primary reference, and only when the detailed contract is needed must it additionally reference `docs/workflow/WORKFLOW_CORE.md` and `docs/ORCHESTRATION.md`.
 - Before starting each phase, whether the target phase requires a `substep agent` or a `step agent` must be judged by a fixed table. `Compile` / `Generate` / `Validate` are `substep agent`, and `Build` is `step agent`. In the optional flows, `Tune` is `substep agent` and `Promote` is `step agent`.

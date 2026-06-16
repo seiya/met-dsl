@@ -37,9 +37,10 @@ This document defines the `orchestration agent` that supervises the whole `workf
 ### preflight and launch control
 - Workflow execution always starts by first launching exactly one `orchestration agent`.
 - Before the workflow starts, the preflight of an execution platform that can launch the `step agent` and `substep agent` independently must be run. The preflight includes the `multi_agent` feature and the launchability of a child `agent` in its verification scope, and when it is not `pass` the workflow must not start.
-- The preflight of `backend=codex` must simultaneously satisfy `feature_states.codex_hooks=true`, `checks.codex_hooks_enabled.pass=true`, and `checks.codex_home_writable.pass=true`.
+- The preflight of `backend=codex` must simultaneously satisfy `feature_states.hooks=true`, `checks.hooks_enabled.pass=true`, and `checks.codex_home_writable.pass=true`.
+- A pre-existing `preflight.json` that contains `feature_states.codex_hooks=true` and `checks.codex_hooks_enabled.pass=true` is accepted only as a read-time compatibility input. A newly generated `preflight.json` must use `feature_states.hooks` and `checks.hooks_enabled`.
 - The preflight must include `sandbox_runtime=bwrap` and `sandbox_enforced=true` as required conditions. When at least 1 of `checks.sandbox_bwrap_available.pass=true`, `checks.sandbox_bwrap_userns.pass=true`, or `checks.sandbox_bwrap_exec.pass=true` is not satisfied, the workflow must not start.
-- The `codex_hooks` feature decision at native-hook execution time runs only once per `orchestration_id`, and the result must be cached in `workspace/orchestrations/<orchestration_id>/hooks/codex_feature_check.json`.
+- The `hooks` feature decision at native-hook execution time runs only once per `orchestration_id`, and the result must be cached in `workspace/orchestrations/<orchestration_id>/hooks/codex_feature_check.json`.
 - Making `preflight.json` `pass` by manual editing is forbidden.
 - Just before launching a child `agent`, `multi_agent` and the launchability of the child `agent` must be re-checked by a live probe of the execution platform. On `fail`, `record-launch` and the child-`agent` launch are forbidden, and the workflow transitions to `fail`.
 - Before starting each phase, run `workflow-launch-check`, and simultaneously check the required child-`agent`-type decision, execution-platform allowability, session-policy allowability, and dependency readiness.

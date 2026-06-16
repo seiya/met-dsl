@@ -71,7 +71,7 @@ When absent, it fail-fasts at the point `tools/run_workflow.py` starts.
 ## 1-3. Agent launch conventions (operationally required)
 - Workflow execution starts from the `orchestration agent` and requires issuing an `orchestration_id`.
 - Before the workflow starts, run the `preflight` that verifies the independent launchability of a `step agent` and a `substep agent`, and when it is not `pass` do not start.
-- The preflight of `backend=codex` must simultaneously satisfy `checks.codex_hooks_enabled.pass=true` and `checks.codex_home_writable.pass=true`.
+- The preflight of `backend=codex` must simultaneously satisfy `checks.hooks_enabled.pass=true` and `checks.codex_home_writable.pass=true`.
 - The `preflight` includes `sandbox_runtime=bwrap` and `sandbox_enforced=true` as required conditions.
 - The canonical entrypoint for starting the workflow is `python3 tools/run_workflow.py <spec_ref> <until_phase> [--llm <codex|cursor|claude>]`. `<until_phase>` specifies one of `compile` / `generate` / `build` / `validate`.
 - The `Build` step, which has no standard `substep`, runs by launching a `step agent` independently.

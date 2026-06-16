@@ -6817,15 +6817,17 @@ def _preflight_allows_agent_launch(payload: dict[str, Any]) -> bool:
     if feature_states.get("multi_agent") is not True:
         return False
     backend_token = str(payload.get("backend", "")).strip().lower()
-    codex_hooks = feature_states.get("codex_hooks")
-    if backend_token == "codex" and codex_hooks is not True:
+    hooks = feature_states.get("hooks")
+    if hooks is None:
+        hooks = feature_states.get("codex_hooks")
+    if backend_token == "codex" and hooks is not True:
         return False
 
     checks = payload.get("checks")
     if not isinstance(checks, list):
         return False
     multi_agent_check_pass: bool | None = None
-    codex_hooks_check_pass: bool | None = None
+    hooks_check_pass: bool | None = None
     codex_home_writable_check_pass: bool | None = None
     for item in checks:
         if not isinstance(item, dict):
@@ -6834,8 +6836,14 @@ def _preflight_allows_agent_launch(payload: dict[str, Any]) -> bool:
         pass_value = item.get("pass")
         if check_name == "multi_agent_enabled" and isinstance(pass_value, bool):
             multi_agent_check_pass = pass_value
-        if check_name == "codex_hooks_enabled" and isinstance(pass_value, bool):
-            codex_hooks_check_pass = pass_value
+        if check_name == "hooks_enabled" and isinstance(pass_value, bool):
+            hooks_check_pass = pass_value
+        if (
+            check_name == "codex_hooks_enabled"
+            and hooks_check_pass is None
+            and isinstance(pass_value, bool)
+        ):
+            hooks_check_pass = pass_value
         if check_name == "codex_home_writable" and isinstance(pass_value, bool):
             codex_home_writable_check_pass = pass_value
 
@@ -6849,7 +6857,7 @@ def _preflight_allows_agent_launch(payload: dict[str, Any]) -> bool:
     if backend_token == "codex":
         launchable = (
             launchable
-            and codex_hooks_check_pass is True
+            and hooks_check_pass is True
             and codex_home_writable_check_pass is True
         )
     return launchable
@@ -6875,23 +6883,25 @@ def _validate_preflight_payload(payload: dict[str, Any]) -> None:
                 raise ValueError(
                     "feature_states.multi_agent=false is incompatible with launchable preflight"
                 )
-        codex_hooks = feature_states.get("codex_hooks")
+        hooks = feature_states.get("hooks")
+        if hooks is None:
+            hooks = feature_states.get("codex_hooks")
         if (
             backend_token == "codex"
-            and codex_hooks is not True
+            and hooks is not True
             and (
                 payload.get("can_launch_step_agents") is True
                 or payload.get("can_launch_substep_agents") is True
             )
         ):
             raise ValueError(
-                "feature_states.codex_hooks=true is required for codex launchable preflight"
+                "feature_states.hooks=true is required for codex launchable preflight"
             )
 
     checks = payload.get("checks")
     if isinstance(checks, list):
         multi_agent_check_pass: bool | None = None
-        codex_hooks_check_pass: bool | None = None
+        hooks_check_pass: bool | None = None
         codex_home_writable_check_pass: bool | None = None
         for item in checks:
             if not isinstance(item, dict):
@@ -6900,8 +6910,14 @@ def _validate_preflight_payload(payload: dict[str, Any]) -> None:
             pass_value = item.get("pass")
             if check_name == "multi_agent_enabled" and isinstance(pass_value, bool):
                 multi_agent_check_pass = pass_value
-            if check_name == "codex_hooks_enabled" and isinstance(pass_value, bool):
-                codex_hooks_check_pass = pass_value
+            if check_name == "hooks_enabled" and isinstance(pass_value, bool):
+                hooks_check_pass = pass_value
+            if (
+                check_name == "codex_hooks_enabled"
+                and hooks_check_pass is None
+                and isinstance(pass_value, bool)
+            ):
+                hooks_check_pass = pass_value
             if check_name == "codex_home_writable" and isinstance(pass_value, bool):
                 codex_home_writable_check_pass = pass_value
         if multi_agent_check_pass is False:
@@ -6913,14 +6929,14 @@ def _validate_preflight_payload(payload: dict[str, Any]) -> None:
                 )
         if (
             backend_token == "codex"
-            and codex_hooks_check_pass is not True
+            and hooks_check_pass is not True
             and (
                 payload.get("can_launch_step_agents") is True
                 or payload.get("can_launch_substep_agents") is True
             )
         ):
             raise ValueError(
-                "checks.codex_hooks_enabled.pass=true is required for codex launchable preflight"
+                "checks.hooks_enabled.pass=true is required for codex launchable preflight"
             )
         if (
             backend_token == "codex"
@@ -6951,9 +6967,12 @@ def _validate_preflight_payload(payload: dict[str, Any]) -> None:
             raise ValueError(
                 "feature_states.multi_agent=true is required when preflight is launchable"
             )
-        if backend_token == "codex" and feature_states.get("codex_hooks") is not True:
+        hooks = feature_states.get("hooks")
+        if hooks is None:
+            hooks = feature_states.get("codex_hooks")
+        if backend_token == "codex" and hooks is not True:
             raise ValueError(
-                "feature_states.codex_hooks=true is required when codex preflight is launchable"
+                "feature_states.hooks=true is required when codex preflight is launchable"
             )
         if payload.get("sandbox_enforced") is not True:
             raise ValueError("sandbox_enforced=true is required when preflight is launchable")
@@ -10833,15 +10852,15 @@ def probe_execution_platform(
             can_launch_agents = can_launch_agents and mcp_ok
     else:
         can_launch_agents = _all_strict_boolean_probe_checks_pass(checks)
-        codex_hooks_enabled = features.get("codex_hooks") is True
+        hooks_enabled = features.get("hooks") is True
         checks.append(
             {
-                "name": "codex_hooks_enabled",
-                "pass": codex_hooks_enabled,
-                "detail": f"codex_hooks={features.get('codex_hooks')}",
+                "name": "hooks_enabled",
+                "pass": hooks_enabled,
+                "detail": f"hooks={features.get('hooks')}",
             }
         )
-        can_launch_agents = can_launch_agents and codex_hooks_enabled
+        can_launch_agents = can_launch_agents and hooks_enabled
         codex_home_check = _probe_codex_home_writable()
         checks.append(codex_home_check)
         can_launch_agents = can_launch_agents and (codex_home_check.get("pass") is True)
@@ -10865,7 +10884,7 @@ def probe_execution_platform(
         "checks": checks,
         "sandbox_runtime": "bwrap",
         "sandbox_enforced": sandbox_enforced,
-        "codex_hooks_enabled": (features.get("codex_hooks") is True) if backend_token == "codex" else None,
+        "hooks_enabled": (features.get("hooks") is True) if backend_token == "codex" else None,
         "can_launch_step_agents": can_launch_agents,
         "can_launch_substep_agents": can_launch_agents,
         "session_policy": session_policy,

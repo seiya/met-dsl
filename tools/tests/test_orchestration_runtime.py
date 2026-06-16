@@ -362,7 +362,7 @@ shell_tool                       stable             true
                     0,
                     stdout=(
                         "multi_agent experimental true\n"
-                        "codex_hooks under-development true\n"
+                        "hooks under-development true\n"
                         "child_agents_md under development false\n"
                     ),
                 )
@@ -380,7 +380,7 @@ shell_tool                       stable             true
             if args[1:] == ["features", "list"]:
                 return _FakeCompletedProcess(
                     0,
-                    stdout="multi_agent experimental false\ncodex_hooks under-development true\n",
+                    stdout="multi_agent experimental false\nhooks under-development true\n",
                 )
             raise AssertionError(args)
 
@@ -1152,7 +1152,7 @@ shell_tool                       stable             true
                 return _FakeCompletedProcess(0, stdout="custom 1.0.0\n")
             if args[1:] == ["features", "list"]:
                 return _FakeCompletedProcess(
-                    0, stdout="multi_agent experimental true\ncodex_hooks under-development true\n"
+                    0, stdout="multi_agent experimental true\nhooks under-development true\n"
                 )
             raise AssertionError(args)
 
@@ -1171,7 +1171,7 @@ shell_tool                       stable             true
             if args[1:] == ["features", "list"]:
                 return _FakeCompletedProcess(
                     0,
-                    stdout="multi_agent experimental true\ncodex_hooks under-development true\n",
+                    stdout="multi_agent experimental true\nhooks under-development true\n",
                 )
             raise AssertionError(args)
 
@@ -1190,7 +1190,7 @@ shell_tool                       stable             true
             if args[1:] == ["features", "list"]:
                 return _FakeCompletedProcess(
                     0,
-                    stdout="multi_agent experimental true\ncodex_hooks under-development true\n",
+                    stdout="multi_agent experimental true\nhooks under-development true\n",
                 )
             raise AssertionError(args)
 
@@ -1259,14 +1259,14 @@ shell_tool                       stable             true
         self.assertIn("codex_features_list_available", by_name)
         self.assertNotIn("codex_features_available", by_name)
 
-    def test_probe_codex_cli_fails_when_codex_hooks_is_disabled(self) -> None:
+    def test_probe_codex_cli_fails_when_hooks_is_disabled(self) -> None:
         def runner(args, **kwargs):  # type: ignore[no-untyped-def]
             if args[1:] == ["--version"]:
                 return _FakeCompletedProcess(0, stdout="codex-cli 0.120.0\n")
             if args[1:] == ["features", "list"]:
                 return _FakeCompletedProcess(
                     0,
-                    stdout="multi_agent stable true\ncodex_hooks under-development false\n",
+                    stdout="multi_agent stable true\nhooks under-development false\n",
                 )
             raise AssertionError(args)
 
@@ -1274,8 +1274,8 @@ shell_tool                       stable             true
         self.assertEqual(result["status"], "fail")
         self.assertFalse(result["can_launch_step_agents"])
         by_name = {c["name"]: c for c in result["checks"]}
-        self.assertIn("codex_hooks_enabled", by_name)
-        self.assertFalse(by_name["codex_hooks_enabled"]["pass"])
+        self.assertIn("hooks_enabled", by_name)
+        self.assertFalse(by_name["hooks_enabled"]["pass"])
 
     def test_all_strict_boolean_probe_checks_pass_skips_none_pass(self) -> None:
         """A check with `pass: None` is treated as unrun, and it passes if all others are True."""
@@ -1431,7 +1431,7 @@ shell_tool                       stable             true
                     "sandbox_enforced": True,
                     "can_launch_step_agents": True,
                     "can_launch_substep_agents": True,
-                    "feature_states": {"multi_agent": True, "codex_hooks": True},
+                    "feature_states": {"multi_agent": True, "hooks": True},
                     "checks": [{"name": "multi_agent_enabled", "pass": True}],
                 },
             )
@@ -1556,7 +1556,7 @@ shell_tool                       stable             true
                     "sandbox_enforced": True,
                     "can_launch_step_agents": True,
                     "can_launch_substep_agents": True,
-                    "feature_states": {"multi_agent": True, "codex_hooks": True},
+                    "feature_states": {"multi_agent": True, "hooks": True},
                     "checks": [
                         {"name": "multi_agent_enabled", "pass": True},
                     ],
@@ -1929,7 +1929,7 @@ shell_tool                       stable             true
             "sandbox_enforced": True,
             "can_launch_step_agents": True,
             "can_launch_substep_agents": True,
-            "feature_states": {"multi_agent": True, "codex_hooks": True},
+            "feature_states": {"multi_agent": True, "hooks": True},
             "checks": [{"name": "multi_agent_enabled", "pass": True}],
         }
         non_launchable_payload = {
@@ -1938,7 +1938,7 @@ shell_tool                       stable             true
             "sandbox_enforced": True,
             "can_launch_step_agents": False,
             "can_launch_substep_agents": False,
-            "feature_states": {"multi_agent": True, "codex_hooks": True},
+            "feature_states": {"multi_agent": True, "hooks": True},
             "checks": [{"name": "multi_agent_enabled", "pass": True}],
         }
 
@@ -1986,7 +1986,7 @@ shell_tool                       stable             true
                     "sandbox_enforced": True,
                     "can_launch_step_agents": True,
                     "can_launch_substep_agents": True,
-                    "feature_states": {"multi_agent": True, "codex_hooks": True},
+                    "feature_states": {"multi_agent": True, "hooks": True},
                     "checks": [{"name": "multi_agent_enabled", "pass": True}],
                 },
             )
@@ -2053,8 +2053,8 @@ shell_tool                       stable             true
                     "sandbox_enforced": True,
                     "can_launch_step_agents": True,
                     "can_launch_substep_agents": True,
-                    "feature_states": {"multi_agent": True, "codex_hooks": True},
-                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
+                    "feature_states": {"multi_agent": True, "hooks": True},
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
                 },
             )
             full_prompt = _substep_launch_prompt(
@@ -2110,8 +2110,8 @@ shell_tool                       stable             true
                     "sandbox_enforced": True,
                     "can_launch_step_agents": True,
                     "can_launch_substep_agents": True,
-                    "feature_states": {"multi_agent": True, "codex_hooks": True},
-                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
+                    "feature_states": {"multi_agent": True, "hooks": True},
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
                 },
             )
             record_launch(
@@ -2182,8 +2182,8 @@ shell_tool                       stable             true
                     "sandbox_enforced": True,
                     "can_launch_step_agents": True,
                     "can_launch_substep_agents": True,
-                    "feature_states": {"multi_agent": True, "codex_hooks": True},
-                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
+                    "feature_states": {"multi_agent": True, "hooks": True},
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
                 },
             )
             record_launch(
@@ -2248,8 +2248,8 @@ shell_tool                       stable             true
                     "sandbox_enforced": True,
                     "can_launch_step_agents": True,
                     "can_launch_substep_agents": True,
-                    "feature_states": {"multi_agent": True, "codex_hooks": True},
-                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
+                    "feature_states": {"multi_agent": True, "hooks": True},
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
                 },
             )
             with self.assertRaisesRegex(ValueError, "template markers"):
@@ -2294,8 +2294,8 @@ shell_tool                       stable             true
                     "sandbox_enforced": True,
                     "can_launch_step_agents": True,
                     "can_launch_substep_agents": True,
-                    "feature_states": {"multi_agent": True, "codex_hooks": True},
-                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
+                    "feature_states": {"multi_agent": True, "hooks": True},
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
                 },
             )
             launch_refs = record_launch(
@@ -2356,10 +2356,10 @@ shell_tool                       stable             true
                     "sandbox_enforced": True,
                     "can_launch_step_agents": True,
                     "can_launch_substep_agents": True,
-                    "feature_states": {"multi_agent": True, "codex_hooks": True},
+                    "feature_states": {"multi_agent": True, "hooks": True},
                     "checks": [
                         {"name": "multi_agent_enabled", "pass": True},
-                        {"name": "codex_hooks_enabled", "pass": True},
+                        {"name": "hooks_enabled", "pass": True},
                         {"name": "codex_home_writable", "pass": True},
                         {"name": "sandbox_bwrap_available", "pass": True},
                         {"name": "sandbox_bwrap_userns", "pass": True},
@@ -2428,10 +2428,10 @@ shell_tool                       stable             true
                 "sandbox_enforced": True,
                 "can_launch_step_agents": True,
                 "can_launch_substep_agents": True,
-                "feature_states": {"multi_agent": True, "codex_hooks": True},
+                "feature_states": {"multi_agent": True, "hooks": True},
                 "checks": [
                     {"name": "multi_agent_enabled", "pass": True},
-                    {"name": "codex_hooks_enabled", "pass": True},
+                    {"name": "hooks_enabled", "pass": True},
                     {"name": "codex_home_writable", "pass": True},
                     {"name": "sandbox_bwrap_available", "pass": True},
                     {"name": "sandbox_bwrap_userns", "pass": True},
@@ -3144,8 +3144,8 @@ shell_tool                       stable             true
                     "sandbox_enforced": True,
                     "can_launch_step_agents": True,
                     "can_launch_substep_agents": True,
-                    "feature_states": {"multi_agent": True, "codex_hooks": True},
-                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
+                    "feature_states": {"multi_agent": True, "hooks": True},
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
                 },
             )
             record_agent_run(
@@ -3645,8 +3645,8 @@ shell_tool                       stable             true
                     "sandbox_enforced": True,
                     "can_launch_step_agents": True,
                     "can_launch_substep_agents": True,
-                    "feature_states": {"multi_agent": True, "codex_hooks": True},
-                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
+                    "feature_states": {"multi_agent": True, "hooks": True},
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
                 },
             )
             with self.assertRaisesRegex(ValueError, "ir_ref must not contain placeholder"):
@@ -3693,8 +3693,8 @@ shell_tool                       stable             true
                     "sandbox_enforced": True,
                     "can_launch_step_agents": True,
                     "can_launch_substep_agents": True,
-                    "feature_states": {"multi_agent": True, "codex_hooks": True},
-                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
+                    "feature_states": {"multi_agent": True, "hooks": True},
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
                 },
             )
             with self.assertRaisesRegex(ValueError, "launch request must include non-empty dependency_ref"):
@@ -3740,8 +3740,8 @@ shell_tool                       stable             true
                     "sandbox_enforced": True,
                     "can_launch_step_agents": True,
                     "can_launch_substep_agents": True,
-                    "feature_states": {"multi_agent": True, "codex_hooks": True},
-                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
+                    "feature_states": {"multi_agent": True, "hooks": True},
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
                 },
             )
             with self.assertRaisesRegex(ValueError, "launch request dependency_ref must not contain placeholder tokens"):
@@ -3788,8 +3788,8 @@ shell_tool                       stable             true
                     "sandbox_enforced": True,
                     "can_launch_step_agents": True,
                     "can_launch_substep_agents": True,
-                    "feature_states": {"multi_agent": True, "codex_hooks": True},
-                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
+                    "feature_states": {"multi_agent": True, "hooks": True},
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
                 },
             )
             bad_pipeline = (
@@ -3835,8 +3835,8 @@ shell_tool                       stable             true
                     "sandbox_enforced": True,
                     "can_launch_step_agents": True,
                     "can_launch_substep_agents": True,
-                    "feature_states": {"multi_agent": True, "codex_hooks": True},
-                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
+                    "feature_states": {"multi_agent": True, "hooks": True},
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
                 },
             )
             with self.assertRaisesRegex(ValueError, "source_id"):
@@ -3878,8 +3878,8 @@ shell_tool                       stable             true
                     "sandbox_enforced": True,
                     "can_launch_step_agents": True,
                     "can_launch_substep_agents": True,
-                    "feature_states": {"multi_agent": True, "codex_hooks": True},
-                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
+                    "feature_states": {"multi_agent": True, "hooks": True},
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
                 },
             )
             launch_refs = record_launch(
@@ -3928,8 +3928,8 @@ shell_tool                       stable             true
                     "sandbox_enforced": True,
                     "can_launch_step_agents": True,
                     "can_launch_substep_agents": True,
-                    "feature_states": {"multi_agent": True, "codex_hooks": True},
-                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
+                    "feature_states": {"multi_agent": True, "hooks": True},
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
                 },
             )
             base = {
@@ -3981,8 +3981,8 @@ shell_tool                       stable             true
                     "sandbox_enforced": True,
                     "can_launch_step_agents": True,
                     "can_launch_substep_agents": True,
-                    "feature_states": {"multi_agent": True, "codex_hooks": True},
-                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
+                    "feature_states": {"multi_agent": True, "hooks": True},
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
                 },
             )
             prepared = prepare_launch_request_payload(
@@ -4034,8 +4034,8 @@ shell_tool                       stable             true
                     "sandbox_enforced": True,
                     "can_launch_step_agents": True,
                     "can_launch_substep_agents": True,
-                    "feature_states": {"multi_agent": True, "codex_hooks": True},
-                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
+                    "feature_states": {"multi_agent": True, "hooks": True},
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
                 },
             )
             prepared = prepare_launch_request_payload(
@@ -4087,8 +4087,8 @@ shell_tool                       stable             true
                     "sandbox_enforced": True,
                     "can_launch_step_agents": True,
                     "can_launch_substep_agents": True,
-                    "feature_states": {"multi_agent": True, "codex_hooks": True},
-                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
+                    "feature_states": {"multi_agent": True, "hooks": True},
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
                 },
             )
             prepared = prepare_launch_request_payload(
@@ -4173,8 +4173,8 @@ shell_tool                       stable             true
                     "sandbox_enforced": True,
                     "can_launch_step_agents": True,
                     "can_launch_substep_agents": True,
-                    "feature_states": {"multi_agent": True, "codex_hooks": True},
-                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
+                    "feature_states": {"multi_agent": True, "hooks": True},
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
                 },
             )
             record_agent_run(
@@ -4295,8 +4295,8 @@ shell_tool                       stable             true
                     "sandbox_enforced": True,
                     "can_launch_step_agents": True,
                     "can_launch_substep_agents": True,
-                    "feature_states": {"multi_agent": True, "codex_hooks": True},
-                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
+                    "feature_states": {"multi_agent": True, "hooks": True},
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
                 },
             )
             payload = record_agent_run(
@@ -4334,8 +4334,8 @@ shell_tool                       stable             true
                     "sandbox_enforced": True,
                     "can_launch_step_agents": True,
                     "can_launch_substep_agents": True,
-                    "feature_states": {"multi_agent": True, "codex_hooks": True},
-                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
+                    "feature_states": {"multi_agent": True, "hooks": True},
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
                 },
             )
             with self.assertRaisesRegex(
@@ -4369,8 +4369,8 @@ shell_tool                       stable             true
                     "sandbox_enforced": True,
                     "can_launch_step_agents": True,
                     "can_launch_substep_agents": True,
-                    "feature_states": {"multi_agent": True, "codex_hooks": True},
-                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
+                    "feature_states": {"multi_agent": True, "hooks": True},
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
                 },
             )
             out_ref = "workspace/orchestrations/orch_001/logs/orchestrator.note.txt"
@@ -4411,8 +4411,8 @@ shell_tool                       stable             true
                     "sandbox_enforced": True,
                     "can_launch_step_agents": True,
                     "can_launch_substep_agents": True,
-                    "feature_states": {"multi_agent": True, "codex_hooks": True},
-                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
+                    "feature_states": {"multi_agent": True, "hooks": True},
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
                 },
             )
             payload = record_agent_run(
@@ -4445,8 +4445,8 @@ shell_tool                       stable             true
                     "sandbox_enforced": True,
                     "can_launch_step_agents": True,
                     "can_launch_substep_agents": True,
-                    "feature_states": {"multi_agent": True, "codex_hooks": True},
-                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
+                    "feature_states": {"multi_agent": True, "hooks": True},
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
                 },
             )
             out_ref = "workspace/orchestrations/orch_001/logs/orchestrator.note.txt"
@@ -4491,8 +4491,8 @@ shell_tool                       stable             true
                     "sandbox_enforced": True,
                     "can_launch_step_agents": True,
                     "can_launch_substep_agents": True,
-                    "feature_states": {"multi_agent": True, "codex_hooks": True},
-                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
+                    "feature_states": {"multi_agent": True, "hooks": True},
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
                 },
             )
             out_ref = "workspace/orchestrations/orch_001/logs/orchestrator.note.txt"
@@ -4535,8 +4535,8 @@ shell_tool                       stable             true
                     "sandbox_enforced": True,
                     "can_launch_step_agents": True,
                     "can_launch_substep_agents": True,
-                    "feature_states": {"multi_agent": True, "codex_hooks": True},
-                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
+                    "feature_states": {"multi_agent": True, "hooks": True},
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
                 },
             )
             bad_ref = (
@@ -4573,8 +4573,8 @@ shell_tool                       stable             true
                     "sandbox_enforced": True,
                     "can_launch_step_agents": True,
                     "can_launch_substep_agents": True,
-                    "feature_states": {"multi_agent": True, "codex_hooks": True},
-                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
+                    "feature_states": {"multi_agent": True, "hooks": True},
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
                 },
             )
             record_agent_run(
@@ -4652,8 +4652,8 @@ shell_tool                       stable             true
                     "sandbox_enforced": True,
                     "can_launch_step_agents": True,
                     "can_launch_substep_agents": True,
-                    "feature_states": {"multi_agent": True, "codex_hooks": True},
-                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
+                    "feature_states": {"multi_agent": True, "hooks": True},
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
                 },
             )
             record_agent_run(
@@ -4731,8 +4731,8 @@ shell_tool                       stable             true
                     "sandbox_enforced": True,
                     "can_launch_step_agents": True,
                     "can_launch_substep_agents": True,
-                    "feature_states": {"multi_agent": True, "codex_hooks": True},
-                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
+                    "feature_states": {"multi_agent": True, "hooks": True},
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
                 },
             )
             record_agent_run(
@@ -4817,8 +4817,8 @@ shell_tool                       stable             true
                     "sandbox_enforced": True,
                     "can_launch_step_agents": True,
                     "can_launch_substep_agents": True,
-                    "feature_states": {"multi_agent": True, "codex_hooks": True},
-                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
+                    "feature_states": {"multi_agent": True, "hooks": True},
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
                 },
             )
             record_agent_run(
@@ -4910,8 +4910,8 @@ shell_tool                       stable             true
                     "sandbox_enforced": True,
                     "can_launch_step_agents": True,
                     "can_launch_substep_agents": True,
-                    "feature_states": {"multi_agent": True, "codex_hooks": True},
-                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
+                    "feature_states": {"multi_agent": True, "hooks": True},
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
                 },
             )
             src_id = "src_20260510_010"
@@ -4996,8 +4996,8 @@ shell_tool                       stable             true
                     "sandbox_enforced": True,
                     "can_launch_step_agents": True,
                     "can_launch_substep_agents": True,
-                    "feature_states": {"multi_agent": True, "codex_hooks": True},
-                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
+                    "feature_states": {"multi_agent": True, "hooks": True},
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
                 },
             )
             record_agent_run(
@@ -5117,8 +5117,8 @@ shell_tool                       stable             true
                     "sandbox_enforced": True,
                     "can_launch_step_agents": True,
                     "can_launch_substep_agents": True,
-                    "feature_states": {"multi_agent": True, "codex_hooks": True},
-                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
+                    "feature_states": {"multi_agent": True, "hooks": True},
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
                 },
             )
             record_agent_run(
@@ -5245,8 +5245,8 @@ shell_tool                       stable             true
                     "sandbox_enforced": True,
                     "can_launch_step_agents": True,
                     "can_launch_substep_agents": True,
-                    "feature_states": {"multi_agent": True, "codex_hooks": True},
-                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
+                    "feature_states": {"multi_agent": True, "hooks": True},
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
                 },
             )
             record_agent_run(
@@ -5408,8 +5408,8 @@ shell_tool                       stable             true
                     "sandbox_enforced": True,
                     "can_launch_step_agents": True,
                     "can_launch_substep_agents": True,
-                    "feature_states": {"multi_agent": True, "codex_hooks": True},
-                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
+                    "feature_states": {"multi_agent": True, "hooks": True},
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
                 },
             )
             record_agent_run(
@@ -5503,8 +5503,8 @@ shell_tool                       stable             true
                     "sandbox_enforced": True,
                     "can_launch_step_agents": True,
                     "can_launch_substep_agents": True,
-                    "feature_states": {"multi_agent": True, "codex_hooks": True},
-                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
+                    "feature_states": {"multi_agent": True, "hooks": True},
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
                 },
             )
             record_agent_run(
@@ -5615,8 +5615,8 @@ shell_tool                       stable             true
                     "sandbox_enforced": True,
                     "can_launch_step_agents": True,
                     "can_launch_substep_agents": True,
-                    "feature_states": {"multi_agent": True, "codex_hooks": True},
-                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
+                    "feature_states": {"multi_agent": True, "hooks": True},
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
                 },
             )
             record_agent_run(
@@ -5709,8 +5709,8 @@ shell_tool                       stable             true
                     "sandbox_enforced": True,
                     "can_launch_step_agents": True,
                     "can_launch_substep_agents": True,
-                    "feature_states": {"multi_agent": True, "codex_hooks": True},
-                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
+                    "feature_states": {"multi_agent": True, "hooks": True},
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
                 },
             )
             record_agent_run(
@@ -5811,8 +5811,8 @@ shell_tool                       stable             true
                     "sandbox_enforced": True,
                     "can_launch_step_agents": True,
                     "can_launch_substep_agents": True,
-                    "feature_states": {"multi_agent": True, "codex_hooks": True},
-                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
+                    "feature_states": {"multi_agent": True, "hooks": True},
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
                 },
             )
             record_agent_run(
@@ -5906,8 +5906,8 @@ shell_tool                       stable             true
                     "sandbox_enforced": True,
                     "can_launch_step_agents": True,
                     "can_launch_substep_agents": True,
-                    "feature_states": {"multi_agent": True, "codex_hooks": True},
-                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
+                    "feature_states": {"multi_agent": True, "hooks": True},
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
                 },
             )
             record_agent_run(
@@ -5988,8 +5988,8 @@ shell_tool                       stable             true
                     "sandbox_enforced": True,
                     "can_launch_step_agents": True,
                     "can_launch_substep_agents": True,
-                    "feature_states": {"multi_agent": True, "codex_hooks": True},
-                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
+                    "feature_states": {"multi_agent": True, "hooks": True},
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
                 },
             )
             record_agent_run(
@@ -6084,8 +6084,8 @@ shell_tool                       stable             true
                             "sandbox_enforced": True,
                             "can_launch_step_agents": True,
                             "can_launch_substep_agents": True,
-                            "feature_states": {"multi_agent": True, "codex_hooks": True},
-                            "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
+                            "feature_states": {"multi_agent": True, "hooks": True},
+                            "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
                         },
                     )
                     record_agent_run(
@@ -6186,8 +6186,8 @@ shell_tool                       stable             true
                     "sandbox_enforced": True,
                     "can_launch_step_agents": True,
                     "can_launch_substep_agents": True,
-                    "feature_states": {"multi_agent": True, "codex_hooks": True},
-                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
+                    "feature_states": {"multi_agent": True, "hooks": True},
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
                 },
             )
             record_agent_run(
@@ -6279,8 +6279,8 @@ shell_tool                       stable             true
                     "sandbox_enforced": True,
                     "can_launch_step_agents": True,
                     "can_launch_substep_agents": True,
-                    "feature_states": {"multi_agent": True, "codex_hooks": True},
-                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
+                    "feature_states": {"multi_agent": True, "hooks": True},
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
                 },
             )
             record_agent_run(
@@ -6375,8 +6375,8 @@ shell_tool                       stable             true
                     "sandbox_enforced": True,
                     "can_launch_step_agents": True,
                     "can_launch_substep_agents": True,
-                    "feature_states": {"multi_agent": True, "codex_hooks": True},
-                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
+                    "feature_states": {"multi_agent": True, "hooks": True},
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
                 },
             )
             record_agent_run(
@@ -6472,8 +6472,8 @@ shell_tool                       stable             true
                     "sandbox_enforced": True,
                     "can_launch_step_agents": True,
                     "can_launch_substep_agents": True,
-                    "feature_states": {"multi_agent": True, "codex_hooks": True},
-                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
+                    "feature_states": {"multi_agent": True, "hooks": True},
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
                 },
             )
             record_agent_run(
@@ -6577,8 +6577,8 @@ shell_tool                       stable             true
                     "sandbox_enforced": True,
                     "can_launch_step_agents": True,
                     "can_launch_substep_agents": True,
-                    "feature_states": {"multi_agent": True, "codex_hooks": True},
-                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
+                    "feature_states": {"multi_agent": True, "hooks": True},
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
                 },
             )
             record_agent_run(
@@ -6671,8 +6671,8 @@ shell_tool                       stable             true
                     "sandbox_enforced": True,
                     "can_launch_step_agents": True,
                     "can_launch_substep_agents": True,
-                    "feature_states": {"multi_agent": True, "codex_hooks": True},
-                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
+                    "feature_states": {"multi_agent": True, "hooks": True},
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
                 },
             )
             with self.assertRaisesRegex(ValueError, "child agent identifier"):
@@ -7185,8 +7185,8 @@ shell_tool                       stable             true
                     "sandbox_enforced": True,
                     "can_launch_step_agents": True,
                     "can_launch_substep_agents": True,
-                    "feature_states": {"multi_agent": True, "codex_hooks": True},
-                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
+                    "feature_states": {"multi_agent": True, "hooks": True},
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
                 },
             )
             record_agent_run(
@@ -7354,8 +7354,8 @@ shell_tool                       stable             true
                     "sandbox_enforced": True,
                     "can_launch_step_agents": True,
                     "can_launch_substep_agents": True,
-                    "feature_states": {"multi_agent": True, "codex_hooks": True},
-                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
+                    "feature_states": {"multi_agent": True, "hooks": True},
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
                 },
             )
             record_launch(
@@ -7421,7 +7421,7 @@ shell_tool                       stable             true
                     "sandbox_enforced": True,
                     "can_launch_step_agents": True,
                     "can_launch_substep_agents": True,
-                    "feature_states": {"multi_agent": True, "codex_hooks": True},
+                    "feature_states": {"multi_agent": True, "hooks": True},
                     "checks": [
                         {"name": "multi_agent_enabled", "pass": True},
                     ],
@@ -7530,12 +7530,12 @@ shell_tool                       stable             true
                     },
                 )
 
-    def test_rejects_codex_launchable_preflight_when_codex_hooks_state_missing(self) -> None:
+    def test_rejects_codex_launchable_preflight_when_hooks_state_missing(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
             init_orchestration(repo_root=repo_root, orchestration_id="orch_001")
             _mark_dependencies_ready(repo_root)
-            with self.assertRaisesRegex(ValueError, "feature_states.codex_hooks=true"):
+            with self.assertRaisesRegex(ValueError, "feature_states.hooks=true"):
                 write_preflight(
                     repo_root=repo_root,
                     orchestration_id="orch_001",
@@ -7549,18 +7549,18 @@ shell_tool                       stable             true
                         "feature_states": {"multi_agent": True},
                         "checks": [
                             {"name": "multi_agent_enabled", "pass": True},
-                            {"name": "codex_hooks_enabled", "pass": True},
+                            {"name": "hooks_enabled", "pass": True},
                             {"name": "codex_home_writable", "pass": True},
                         ],
                     },
                 )
 
-    def test_rejects_codex_launchable_preflight_when_codex_hooks_check_missing(self) -> None:
+    def test_rejects_codex_launchable_preflight_when_hooks_check_missing(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
             init_orchestration(repo_root=repo_root, orchestration_id="orch_001")
             _mark_dependencies_ready(repo_root)
-            with self.assertRaisesRegex(ValueError, "checks.codex_hooks_enabled.pass=true"):
+            with self.assertRaisesRegex(ValueError, "checks.hooks_enabled.pass=true"):
                 write_preflight(
                     repo_root=repo_root,
                     orchestration_id="orch_001",
@@ -7571,12 +7571,39 @@ shell_tool                       stable             true
                         "sandbox_enforced": True,
                         "can_launch_step_agents": True,
                         "can_launch_substep_agents": True,
-                        "feature_states": {"multi_agent": True, "codex_hooks": True},
+                        "feature_states": {"multi_agent": True, "hooks": True},
                         "checks": [
                             {"name": "multi_agent_enabled", "pass": True},
                         ],
                     },
                 )
+
+    def test_accepts_legacy_codex_hooks_preflight_alias(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            init_orchestration(repo_root=repo_root, orchestration_id="orch_001")
+            _mark_dependencies_ready(repo_root)
+            write_preflight(
+                repo_root=repo_root,
+                orchestration_id="orch_001",
+                payload={
+                    "status": "pass",
+                    "backend": "codex",
+                    "sandbox_runtime": "bwrap",
+                    "sandbox_enforced": True,
+                    "can_launch_step_agents": True,
+                    "can_launch_substep_agents": True,
+                    "feature_states": {"multi_agent": True, "codex_hooks": True},
+                    "checks": [
+                        {"name": "multi_agent_enabled", "pass": True},
+                        {"name": "codex_hooks_enabled", "pass": True},
+                        {"name": "codex_home_writable", "pass": True},
+                        {"name": "sandbox_bwrap_available", "pass": True},
+                        {"name": "sandbox_bwrap_userns", "pass": True},
+                    ],
+                },
+            )
+            _require_preflight_launchable(repo_root, "orch_001", enforce_live_probe=False)
 
     def test_rejects_codex_launchable_preflight_when_codex_home_check_missing(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -7594,10 +7621,10 @@ shell_tool                       stable             true
                         "sandbox_enforced": True,
                         "can_launch_step_agents": True,
                         "can_launch_substep_agents": True,
-                        "feature_states": {"multi_agent": True, "codex_hooks": True},
+                        "feature_states": {"multi_agent": True, "hooks": True},
                         "checks": [
                             {"name": "multi_agent_enabled", "pass": True},
-                            {"name": "codex_hooks_enabled", "pass": True},
+                            {"name": "hooks_enabled", "pass": True},
                         ],
                     },
                 )
@@ -7616,8 +7643,8 @@ shell_tool                       stable             true
                     "sandbox_enforced": True,
                     "can_launch_step_agents": True,
                     "can_launch_substep_agents": True,
-                    "feature_states": {"multi_agent": True, "codex_hooks": True},
-                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
+                    "feature_states": {"multi_agent": True, "hooks": True},
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
                 },
             )
             os.environ["METDSL_ORCHESTRATION_ENFORCE_LIVE_PREFLIGHT"] = "1"
@@ -7629,8 +7656,8 @@ shell_tool                       stable             true
                     "sandbox_enforced": True,
                     "can_launch_step_agents": True,
                     "can_launch_substep_agents": True,
-                    "feature_states": {"multi_agent": True, "codex_hooks": True},
-                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
+                    "feature_states": {"multi_agent": True, "hooks": True},
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
                 }
                 record_launch(
                     repo_root=repo_root,
@@ -7680,8 +7707,8 @@ shell_tool                       stable             true
                     "sandbox_enforced": True,
                     "can_launch_step_agents": True,
                     "can_launch_substep_agents": True,
-                    "feature_states": {"multi_agent": True, "codex_hooks": True},
-                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
+                    "feature_states": {"multi_agent": True, "hooks": True},
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
                 },
             )
             os.environ["METDSL_ORCHESTRATION_ENFORCE_LIVE_PREFLIGHT"] = "0"
@@ -7792,8 +7819,8 @@ shell_tool                       stable             true
                     "sandbox_enforced": True,
                     "can_launch_step_agents": True,
                     "can_launch_substep_agents": True,
-                    "feature_states": {"multi_agent": True, "codex_hooks": True},
-                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
+                    "feature_states": {"multi_agent": True, "hooks": True},
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
                 },
             )
             record_agent_run(
@@ -7909,8 +7936,8 @@ shell_tool                       stable             true
                 "sandbox_enforced": True,
                 "can_launch_step_agents": True,
                 "can_launch_substep_agents": True,
-                "feature_states": {"multi_agent": True, "codex_hooks": True},
-                "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
+                "feature_states": {"multi_agent": True, "hooks": True},
+                "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
             },
         )
         record_agent_run(
@@ -8007,8 +8034,8 @@ shell_tool                       stable             true
                     "sandbox_enforced": True,
                     "can_launch_step_agents": True,
                     "can_launch_substep_agents": True,
-                    "feature_states": {"multi_agent": True, "codex_hooks": True},
-                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
+                    "feature_states": {"multi_agent": True, "hooks": True},
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
                 },
             )
             with self.assertRaisesRegex(RuntimeError, "write_step_result phase gate"):
@@ -8857,8 +8884,8 @@ shell_tool                       stable             true
                 "sandbox_enforced": True,
                 "can_launch_step_agents": True,
                 "can_launch_substep_agents": True,
-                "feature_states": {"multi_agent": True, "codex_hooks": True},
-                "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
+                "feature_states": {"multi_agent": True, "hooks": True},
+                "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
             },
         )
         record_agent_run(
@@ -9109,8 +9136,8 @@ class CheckpointResumeRuntimeTests(unittest.TestCase):
                 "sandbox_enforced": True,
                 "can_launch_step_agents": True,
                 "can_launch_substep_agents": True,
-                "feature_states": {"multi_agent": True, "codex_hooks": True},
-                "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
+                "feature_states": {"multi_agent": True, "hooks": True},
+                "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
             },
         )
         record_agent_run(
@@ -10070,10 +10097,10 @@ def _launchable_preflight_dict(**extra: object) -> dict[str, object]:
             "allow_substep_agent_launch": True,
         },
         "session_policy_launchable": True,
-        "feature_states": {"multi_agent": True, "codex_hooks": True},
+        "feature_states": {"multi_agent": True, "hooks": True},
         "checks": [
             {"name": "multi_agent_enabled", "pass": True},
-            {"name": "codex_hooks_enabled", "pass": True},
+            {"name": "hooks_enabled", "pass": True},
             {"name": "codex_home_writable", "pass": True},
             {"name": "sandbox_bwrap_available", "pass": True},
             {"name": "sandbox_bwrap_userns", "pass": True},
@@ -11066,8 +11093,8 @@ class TestPhase1RuleSourceAudit(unittest.TestCase):
                     "sandbox_enforced": True,
                     "can_launch_step_agents": True,
                     "can_launch_substep_agents": True,
-                    "feature_states": {"multi_agent": True, "codex_hooks": True},
-                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
+                    "feature_states": {"multi_agent": True, "hooks": True},
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
                 },
             )
             ps1 = json.loads((orch / "phase_state.json").read_text(encoding="utf-8"))
@@ -11193,8 +11220,8 @@ class TestPhase1RuleSourceAudit(unittest.TestCase):
                     "sandbox_enforced": True,
                     "can_launch_step_agents": True,
                     "can_launch_substep_agents": True,
-                    "feature_states": {"multi_agent": True, "codex_hooks": True},
-                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
+                    "feature_states": {"multi_agent": True, "hooks": True},
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
                 },
             )
             record_launch(
@@ -11276,8 +11303,8 @@ class TestPhase1RuleSourceAudit(unittest.TestCase):
                     "sandbox_enforced": True,
                     "can_launch_step_agents": True,
                     "can_launch_substep_agents": True,
-                    "feature_states": {"multi_agent": True, "codex_hooks": True},
-                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
+                    "feature_states": {"multi_agent": True, "hooks": True},
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
                 },
             )
             record_launch(
@@ -11348,8 +11375,8 @@ class TestPhase1RuleSourceAudit(unittest.TestCase):
                     "sandbox_enforced": True,
                     "can_launch_step_agents": True,
                     "can_launch_substep_agents": True,
-                    "feature_states": {"multi_agent": True, "codex_hooks": True},
-                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
+                    "feature_states": {"multi_agent": True, "hooks": True},
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
                 },
             )
             record_launch(
@@ -11411,8 +11438,8 @@ class TestPhase1RuleSourceAudit(unittest.TestCase):
                     "sandbox_enforced": True,
                     "can_launch_step_agents": True,
                     "can_launch_substep_agents": True,
-                    "feature_states": {"multi_agent": True, "codex_hooks": True},
-                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
+                    "feature_states": {"multi_agent": True, "hooks": True},
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
                 },
             )
             record_launch(
@@ -11475,8 +11502,8 @@ class TestPhase1RuleSourceAudit(unittest.TestCase):
                     "sandbox_enforced": True,
                     "can_launch_step_agents": True,
                     "can_launch_substep_agents": True,
-                    "feature_states": {"multi_agent": True, "codex_hooks": True},
-                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
+                    "feature_states": {"multi_agent": True, "hooks": True},
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
                 },
             )
             orch = repo_root / "workspace/orchestrations/orch_p1m"
@@ -11501,8 +11528,8 @@ class TestPhase1RuleSourceAudit(unittest.TestCase):
                     "sandbox_enforced": True,
                     "can_launch_step_agents": True,
                     "can_launch_substep_agents": True,
-                    "feature_states": {"multi_agent": True, "codex_hooks": True},
-                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
+                    "feature_states": {"multi_agent": True, "hooks": True},
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
                 },
             )
             record_launch(
@@ -11594,8 +11621,8 @@ class TestPhase2PlanGuardsIntegration(unittest.TestCase):
                     "can_launch_step_agents": True,
                     "can_launch_substep_agents": True,
                     "session_policy": {"allow_substep_agent_launch": False},
-                    "feature_states": {"multi_agent": True, "codex_hooks": True},
-                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
+                    "feature_states": {"multi_agent": True, "hooks": True},
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
                 },
             )
             out = workflow_launch_check(
@@ -11643,8 +11670,8 @@ class TestPhase2PlanGuardsIntegration(unittest.TestCase):
                         "sandbox_enforced": True,
                         "can_launch_step_agents": True,
                         "can_launch_substep_agents": True,
-                        "feature_states": {"multi_agent": True, "codex_hooks": True},
-                        "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
+                        "feature_states": {"multi_agent": True, "hooks": True},
+                        "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
                     },
                     ensure_ascii=False,
                     indent=2,
@@ -11683,8 +11710,8 @@ class TestPhase2PlanGuardsIntegration(unittest.TestCase):
                         "allow_step_agent_launch": True,
                         "allow_substep_agent_launch": True,
                     },
-                    "feature_states": {"multi_agent": True, "codex_hooks": True},
-                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
+                    "feature_states": {"multi_agent": True, "hooks": True},
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
                 },
             )
             base = {
@@ -11754,7 +11781,7 @@ class TestPhase2PlanGuardsIntegration(unittest.TestCase):
                 if args[1:] == ["features", "list"]:
                     return _FakeCompletedProcess(
                         0,
-                        stdout="multi_agent experimental true\ncodex_hooks under-development true\n",
+                        stdout="multi_agent experimental true\nhooks under-development true\n",
                     )
                 raise AssertionError(args)
 
@@ -11808,8 +11835,8 @@ class TestPhase2PlanGuardsIntegration(unittest.TestCase):
                     "can_launch_step_agents": True,
                     "can_launch_substep_agents": True,
                     "session_policy": {"allow_substep_agent_launch": False},
-                    "feature_states": {"multi_agent": True, "codex_hooks": True},
-                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
+                    "feature_states": {"multi_agent": True, "hooks": True},
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
                 },
             )
             req = {
@@ -11887,8 +11914,8 @@ class TestPhase2PlanGuardsIntegration(unittest.TestCase):
                     "sandbox_enforced": True,
                     "can_launch_step_agents": True,
                     "can_launch_substep_agents": True,
-                    "feature_states": {"multi_agent": True, "codex_hooks": True},
-                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
+                    "feature_states": {"multi_agent": True, "hooks": True},
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
                 },
             )
             with self.assertRaises(RuntimeError) as ctx:
@@ -11915,8 +11942,8 @@ class TestPhase2PlanGuardsIntegration(unittest.TestCase):
                     "sandbox_enforced": True,
                     "can_launch_step_agents": True,
                     "can_launch_substep_agents": True,
-                    "feature_states": {"multi_agent": True, "codex_hooks": True},
-                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
+                    "feature_states": {"multi_agent": True, "hooks": True},
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
                 },
             )
             g2_req = {
@@ -11999,8 +12026,8 @@ class TestPhase2PlanGuardsIntegration(unittest.TestCase):
                     "sandbox_enforced": True,
                     "can_launch_step_agents": True,
                     "can_launch_substep_agents": True,
-                    "feature_states": {"multi_agent": True, "codex_hooks": True},
-                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
+                    "feature_states": {"multi_agent": True, "hooks": True},
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
                 },
             )
             # No record-launch for agent_run_id="nolaunch" → real
@@ -12068,8 +12095,8 @@ class TestPhase2PlanGuardsIntegration(unittest.TestCase):
                     "sandbox_enforced": True,
                     "can_launch_step_agents": True,
                     "can_launch_substep_agents": True,
-                    "feature_states": {"multi_agent": True, "codex_hooks": True},
-                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
+                    "feature_states": {"multi_agent": True, "hooks": True},
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
                 },
             )
             g6_req = {
@@ -12334,8 +12361,8 @@ class TestPhase3RunGate(unittest.TestCase):
                 "sandbox_enforced": True,
                 "can_launch_step_agents": True,
                 "can_launch_substep_agents": True,
-                "feature_states": {"multi_agent": True, "codex_hooks": True},
-                "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
+                "feature_states": {"multi_agent": True, "hooks": True},
+                "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
             },
         )
         req = {
@@ -12410,8 +12437,8 @@ class TestPhase3RunGate(unittest.TestCase):
                     "sandbox_enforced": True,
                     "can_launch_step_agents": True,
                     "can_launch_substep_agents": True,
-                    "feature_states": {"multi_agent": True, "codex_hooks": True},
-                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
+                    "feature_states": {"multi_agent": True, "hooks": True},
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
                 },
             )
             bad_req = {
@@ -12477,8 +12504,8 @@ class TestPhase3RunGate(unittest.TestCase):
                     "sandbox_enforced": True,
                     "can_launch_step_agents": True,
                     "can_launch_substep_agents": True,
-                    "feature_states": {"multi_agent": True, "codex_hooks": True},
-                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
+                    "feature_states": {"multi_agent": True, "hooks": True},
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
                 },
             )
             bad_req = {
@@ -13717,8 +13744,8 @@ class TestPhase3RunGate(unittest.TestCase):
                     "sandbox_enforced": True,
                     "can_launch_step_agents": True,
                     "can_launch_substep_agents": True,
-                    "feature_states": {"multi_agent": True, "codex_hooks": True},
-                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "codex_hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
+                    "feature_states": {"multi_agent": True, "hooks": True},
+                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
                 },
             )
             pipe = repo_root / _FIX_PIPE_REF
@@ -15819,10 +15846,10 @@ class RecordTimeoutTests(unittest.TestCase):
                 "sandbox_enforced": True,
                 "can_launch_step_agents": True,
                 "can_launch_substep_agents": True,
-                "feature_states": {"multi_agent": True, "codex_hooks": True},
+                "feature_states": {"multi_agent": True, "hooks": True},
                 "checks": [
                     {"name": "multi_agent_enabled", "pass": True},
-                    {"name": "codex_hooks_enabled", "pass": True},
+                    {"name": "hooks_enabled", "pass": True},
                     {"name": "codex_home_writable", "pass": True},
                     {"name": "sandbox_bwrap_available", "pass": True},
                     {"name": "sandbox_bwrap_userns", "pass": True},
@@ -17257,10 +17284,10 @@ class PreflightDependencyReadinessInitTests(unittest.TestCase):
         "sandbox_enforced": True,
         "can_launch_step_agents": True,
         "can_launch_substep_agents": True,
-        "feature_states": {"multi_agent": True, "codex_hooks": True},
+        "feature_states": {"multi_agent": True, "hooks": True},
         "checks": [
             {"name": "multi_agent_enabled", "pass": True},
-            {"name": "codex_hooks_enabled", "pass": True},
+            {"name": "hooks_enabled", "pass": True},
             {"name": "codex_home_writable", "pass": True},
             {"name": "sandbox_bwrap_available", "pass": True},
             {"name": "sandbox_bwrap_userns", "pass": True},
@@ -21096,10 +21123,10 @@ class PreflightLeafRecomputeTests(unittest.TestCase):
     _PAYLOAD = {
         "status": "pass", "sandbox_runtime": "bwrap", "sandbox_enforced": True,
         "can_launch_step_agents": True, "can_launch_substep_agents": True,
-        "feature_states": {"multi_agent": True, "codex_hooks": True},
+        "feature_states": {"multi_agent": True, "hooks": True},
         "checks": [
             {"name": "multi_agent_enabled", "pass": True},
-            {"name": "codex_hooks_enabled", "pass": True},
+            {"name": "hooks_enabled", "pass": True},
             {"name": "codex_home_writable", "pass": True},
             {"name": "sandbox_bwrap_available", "pass": True},
             {"name": "sandbox_bwrap_userns", "pass": True},

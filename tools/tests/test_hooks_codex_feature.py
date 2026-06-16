@@ -19,23 +19,23 @@ class _FakeCompletedProcess:
 class HookCodexFeatureTests(unittest.TestCase):
     def test_parse_feature_list_extracts_flags(self) -> None:
         parsed = parse_feature_list(
-            "multi_agent stable true\ncodex_hooks under-development false\n"
+            "multi_agent stable true\nhooks under-development false\n"
         )
         self.assertEqual(parsed.get("multi_agent"), True)
-        self.assertEqual(parsed.get("codex_hooks"), False)
+        self.assertEqual(parsed.get("hooks"), False)
 
     def test_codex_hooks_feature_enabled_true(self) -> None:
         def runner(args, **kwargs):  # type: ignore[no-untyped-def]
             if args[1:] == ["features", "list"]:
                 return _FakeCompletedProcess(
                     0,
-                    stdout="multi_agent stable true\ncodex_hooks under-development true\n",
+                    stdout="multi_agent stable true\nhooks under-development true\n",
                 )
             raise AssertionError(args)
 
         enabled, detail = codex_hooks_feature_enabled(runner=runner)
         self.assertTrue(enabled)
-        self.assertEqual(detail, "codex_hooks=true")
+        self.assertEqual(detail, "hooks=true")
 
     def test_codex_hooks_feature_enabled_false_when_missing(self) -> None:
         def runner(args, **kwargs):  # type: ignore[no-untyped-def]
@@ -48,7 +48,7 @@ class HookCodexFeatureTests(unittest.TestCase):
 
         enabled, detail = codex_hooks_feature_enabled(runner=runner)
         self.assertFalse(enabled)
-        self.assertIn("codex_hooks=None", detail)
+        self.assertIn("hooks=None", detail)
 
     def test_codex_hooks_feature_enabled_false_on_command_failure(self) -> None:
         def runner(args, **kwargs):  # type: ignore[no-untyped-def]

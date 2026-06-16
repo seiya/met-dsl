@@ -24,9 +24,8 @@ This file defines the project-specific conventions for Claude Code. For general 
 - `tools/hooks/common.py` is the canonical source for backend-independent validation.
 - Backend-specific invocation specifications are absorbed by the adapters under `tools/hooks/adapters/`.
 - `.codex/hooks.json` is the canonical source for `Codex` hook invocation definitions.
-- The `preflight` of the `codex` backend requires `feature_states.codex_hooks=true`. An environment where `codex_hooks` is not enabled stops with `status=fail`.
 - The `hooks` section of `.claude/settings.json` is the canonical source for `Claude Code` hook invocation definitions. It wires the 4 events `PreToolUse` / `PostToolUse` / `UserPromptSubmit` / `Stop`.
-- The `Claude Code` backend does not need a feature flag probe, and the `codex_hooks` requirement check is limited to the Codex backend. The common policy follows `evaluate_common_policy()` in `tools/hooks/common.py`.
+- The `Claude Code` backend does not need a feature flag probe, and the `hooks` requirement check is limited to the Codex backend. The common policy follows `evaluate_common_policy()` in `tools/hooks/common.py`.
 - The `matcher` in `.claude/settings.json` is an **exact-match string** (not a regular expression). Unlike `^Bash$` in `.codex/hooks.json`, write `"Bash"`.
 
 ## Claude Code-specific execution conventions

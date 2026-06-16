@@ -1121,7 +1121,7 @@ def main(argv: list[str] | None = None) -> int:
                     enabled, detail = cached_enabled, cached_detail
                 if not enabled:
                     decision = _decision_error(
-                        "codex_hooks feature is required but not enabled: " + detail
+                        "hooks feature is required but not enabled: " + detail
                     )
                     _append_hook_audit(
                         backend=args.backend,

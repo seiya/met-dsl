@@ -164,7 +164,7 @@ class HookCliTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
             with patch("tools.hooks.cli.codex_hooks_feature_enabled") as feature_mock:
-                feature_mock.side_effect = lambda: (False, "codex_hooks=false")
+                feature_mock.side_effect = lambda: (False, "hooks=false")
                 payload = {
                     "orchestration_id": "orch_disabled_002",
                     "repo_root": str(repo_root),
@@ -184,13 +184,13 @@ class HookCliTests(unittest.TestCase):
                 self.assertEqual(code, 2)
                 payload = json.loads(out.getvalue().strip())
                 self.assertEqual(payload.get("decision"), "block")
-                self.assertIn("codex_hooks", payload.get("reason", ""))
+                self.assertIn("hooks", payload.get("reason", ""))
 
     def test_feature_disabled_path_writes_audit_log(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
             with patch("tools.hooks.cli.codex_hooks_feature_enabled") as feature_mock:
-                feature_mock.return_value = (False, "codex_hooks=false")
+                feature_mock.return_value = (False, "hooks=false")
                 payload = {
                     "orchestration_id": "orch_disabled_001",
                     "repo_root": str(repo_root),
@@ -251,7 +251,7 @@ class HookCliTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
             with patch("tools.hooks.cli.codex_hooks_feature_enabled") as feature_mock:
-                feature_mock.return_value = (True, "codex_hooks=true")
+                feature_mock.return_value = (True, "hooks=true")
                 payload = {
                     "orchestration_id": "orch_block_001",
                     "repo_root": str(repo_root),
@@ -317,7 +317,7 @@ class HookCliTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
             with patch("tools.hooks.cli.codex_hooks_feature_enabled") as feature_mock:
-                feature_mock.return_value = (True, "codex_hooks=true")
+                feature_mock.return_value = (True, "hooks=true")
                 payload = {
                     "orchestration_id": "orch_allow_001",
                     "repo_root": str(repo_root),
@@ -343,7 +343,7 @@ class HookCliTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
             with patch("tools.hooks.cli.codex_hooks_feature_enabled") as feature_mock:
-                feature_mock.return_value = (True, "codex_hooks=true")
+                feature_mock.return_value = (True, "hooks=true")
                 payload = {
                     "orchestration_id": "orch_dev_policy_001",
                     "repo_root": str(repo_root),
@@ -377,7 +377,7 @@ class HookCliTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
             with patch("tools.hooks.cli.codex_hooks_feature_enabled") as feature_mock:
-                feature_mock.return_value = (True, "codex_hooks=true")
+                feature_mock.return_value = (True, "hooks=true")
                 payload = {
                     "orchestration_id": "orch_default_dev_policy_001",
                     "repo_root": str(repo_root),
@@ -411,7 +411,7 @@ class HookCliTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
             with patch("tools.hooks.cli.codex_hooks_feature_enabled") as feature_mock:
-                feature_mock.return_value = (True, "codex_hooks=true")
+                feature_mock.return_value = (True, "hooks=true")
                 payload = {
                     "orchestration_id": "orch_prod_policy_001",
                     "repo_root": str(repo_root),
@@ -443,7 +443,7 @@ class HookCliTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
             with patch("tools.hooks.cli.codex_hooks_feature_enabled") as feature_mock:
-                feature_mock.return_value = (True, "codex_hooks=true")
+                feature_mock.return_value = (True, "hooks=true")
                 payload = {
                     "orchestration_id": "orch_test_001",
                     "repo_root": str(repo_root),
@@ -480,7 +480,7 @@ class HookCliTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
             with patch("tools.hooks.cli.codex_hooks_feature_enabled") as feature_mock:
-                feature_mock.return_value = (True, "codex_hooks=true")
+                feature_mock.return_value = (True, "hooks=true")
                 payload = {
                     "repo_root": str(repo_root),
                     "tool_name": "Bash",
@@ -505,7 +505,7 @@ class HookCliTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
             with patch("tools.hooks.cli.codex_hooks_feature_enabled") as feature_mock:
-                feature_mock.return_value = (True, "codex_hooks=true")
+                feature_mock.return_value = (True, "hooks=true")
                 payload = {"repo_root": str(repo_root)}
                 out = io.StringIO()
                 with redirect_stdout(out):
@@ -534,7 +534,7 @@ class HookCliTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
             with patch("tools.hooks.cli.codex_hooks_feature_enabled") as feature_mock:
-                feature_mock.return_value = (True, "codex_hooks=true")
+                feature_mock.return_value = (True, "hooks=true")
                 payload = {
                     "repo_root": str(repo_root),
                     "tool_name": "Bash",
@@ -573,7 +573,7 @@ class HookCliTests(unittest.TestCase):
                 "tool_input": {"command": "echo hello"},
             }
             with patch("tools.hooks.cli.codex_hooks_feature_enabled") as feature_mock:
-                feature_mock.return_value = (True, "codex_hooks=true")
+                feature_mock.return_value = (True, "hooks=true")
                 out1 = io.StringIO()
                 with redirect_stdout(out1):
                     code1 = cli.main(
@@ -615,7 +615,7 @@ class HookCliTests(unittest.TestCase):
                 with patch("tools.hooks.cli.codex_hooks_feature_enabled") as feature_mock:
                     feature_mock.side_effect = [
                         (False, self._timeout_detail()),
-                        (True, "codex_hooks=true"),
+                        (True, "hooks=true"),
                     ]
                     out1 = io.StringIO()
                     with redirect_stdout(out1):

@@ -44,6 +44,6 @@ def codex_hooks_feature_enabled(
     if proc.returncode != 0:
         return False, f"codex features list failed: {detail}"
     features = parse_feature_list(proc.stdout)
-    if features.get("codex_hooks") is True:
-        return True, "codex_hooks=true"
-    return False, f"codex_hooks={features.get('codex_hooks')}"
+    if features.get("hooks") is True:
+        return True, "hooks=true"
+    return False, f"hooks={features.get('hooks')}"

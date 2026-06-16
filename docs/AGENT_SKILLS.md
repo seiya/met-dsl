@@ -21,7 +21,7 @@ This document defines the reference conventions for the `skills` used in the pro
 - Each phase must not drop the required outputs defined in the corresponding `SKILL.md` (e.g. `ir_meta.json`, `source_meta.json`, `binary_meta.json`, `verdict.json`, `validate_meta.json`).
 - Write into `SKILL.md` the execution procedure and the procedures specific to that `SKILL`, and do not duplicate the `phase`'s I/O contract / artifact format / numerical canonical requirements in a form that contradicts `docs/workflow/WORKFLOW_CORE.md` or `docs/workflow/phases/phase_*.md`.
 - The hook implementation separates backend-independent `common validation` from backend-specific adapters, and uses `tools/hooks/common.py` as the canonical source for `common validation` and `tools/hooks/adapters/` for the backend adapters.
-- On the `codex` backend, use `.codex/hooks.json` as the canonical source for the hook invocation definitions, and require `feature_states.codex_hooks=true` in the `preflight` decision.
+- On the `codex` backend, use `.codex/hooks.json` as the canonical source for the hook invocation definitions, and require `feature_states.hooks=true` in the `preflight` decision.
 
 ## Responsibility-decision flow
 1. Judge whether the rule to add/change directly affects the validity of a workflow artifact.
