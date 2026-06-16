@@ -2812,6 +2812,8 @@ def _validate_raw_evidence(
         if isinstance(metrics_basis, dict):
             _validate_metrics_basis_per_test(repo_root, execution, metrics_basis, violations)
 
+    _validate_diagnostics_contract_output(repo_root, execution, violations)
+
     quality_path = execution.node_dir / "quality_check.json"
     if quality_path.exists():
         try:
@@ -3231,6 +3233,7 @@ def _io_contract_for_execution(
             "raw_requirements",
             "semantic_dependency",
             "test_evidence_requirements",
+            "diagnostics_contract",
             "source",
         ):
             if key in section:
@@ -4165,6 +4168,7 @@ def _validate_io_contract_file(
             "raw_requirements",
             "semantic_dependency",
             "test_evidence_requirements",
+            "diagnostics_contract",
             "source",
         ):
             if key in io_section:
@@ -4463,6 +4467,208 @@ def _validate_io_contract_file(
         snapshot_required=snapshot_required,
         violations=violations,
     )
+
+    _validate_diagnostics_contract(contract_path, contract, violations)
+
+
+_DIAGNOSTICS_CONTRACT_ABSENT = object()
+
+
+def _raw_diagnostics_contract_value(contract: dict[str, Any]) -> Any:
+    """Return the raw diagnostics_contract value (any type), or the sentinel
+    ``_DIAGNOSTICS_CONTRACT_ABSENT`` when the key is not present at all.
+
+    Accepts both the lifted form (top-level diagnostics_contract) and the raw
+    nested form (io_contract.diagnostics_contract). Unlike
+    _diagnostics_contract_section, this preserves the distinction between
+    "absent" and "present but malformed (non-object)" so the structural
+    validator can flag the latter instead of silently skipping it.
+    """
+    if "diagnostics_contract" in contract:
+        return contract["diagnostics_contract"]
+    io_contract = contract.get("io_contract")
+    if isinstance(io_contract, dict) and "diagnostics_contract" in io_contract:
+        return io_contract["diagnostics_contract"]
+    return _DIAGNOSTICS_CONTRACT_ABSENT
+
+
+def _diagnostics_contract_section(contract: dict[str, Any]) -> dict[str, Any] | None:
+    """Return the diagnostics_contract dict from a (lifted) io_contract, or None.
+
+    Accepts both the lifted form (where _validate_io_contract_file hoists
+    diagnostics_contract to the top level) and the raw nested form
+    (spec.ir.yaml.io_contract.diagnostics_contract). A present-but-malformed
+    (non-object) value normalizes to None here; the structural validator
+    (_validate_diagnostics_contract) is responsible for flagging that case.
+    """
+    section = _raw_diagnostics_contract_value(contract)
+    return section if isinstance(section, dict) else None
+
+
+def _diagnostics_contract_check_ids(contract: dict[str, Any]) -> list[str]:
+    """Return the declared checks[].id list (empty when absent/malformed)."""
+    section = _diagnostics_contract_section(contract)
+    if section is None:
+        return []
+    checks = section.get("checks")
+    ids: list[str] = []
+    if isinstance(checks, list):
+        for item in checks:
+            if isinstance(item, dict):
+                cid = item.get("id")
+                if isinstance(cid, str) and cid.strip():
+                    ids.append(cid.strip())
+    return ids
+
+
+def _diagnostics_contract_verdict_fields(contract: dict[str, Any]) -> list[str]:
+    """Return verdict.fields when verdict.required is true, else empty list."""
+    section = _diagnostics_contract_section(contract)
+    if section is None:
+        return []
+    verdict = section.get("verdict")
+    if not isinstance(verdict, dict) or verdict.get("required") is not True:
+        return []
+    fields = verdict.get("fields")
+    out: list[str] = []
+    if isinstance(fields, list):
+        for field in fields:
+            if isinstance(field, str) and field.strip():
+                out.append(field.strip())
+    return out
+
+
+def _validate_diagnostics_contract(
+    contract_path: Path, contract: dict[str, Any], violations: list[str]
+) -> None:
+    """Structural validation of io_contract.diagnostics_contract when present.
+
+    Presence is optional (a node whose tests.md has no §3 diagnostics contract
+    omits it); coverage against tests.md §3 is the LLM Compile.verify
+    responsibility (hybrid verification). Here we only enforce well-formedness:
+    checks must be a non-empty list of {id: <non-empty string>}, and when a
+    verdict block is present it must carry required: bool and (when
+    required=true) a non-empty fields list of strings.
+    """
+    raw = _raw_diagnostics_contract_value(contract)
+    if raw is _DIAGNOSTICS_CONTRACT_ABSENT:
+        return
+    if not isinstance(raw, dict):
+        violations.append(
+            f"{contract_path}:io_contract.diagnostics_contract must be object when present"
+        )
+        return
+    section = raw
+
+    checks = section.get("checks")
+    if not isinstance(checks, list) or not checks:
+        violations.append(
+            f"{contract_path}:io_contract.diagnostics_contract.checks must be non-empty list when diagnostics_contract is present"
+        )
+    else:
+        seen_ids: set[str] = set()
+        for idx, item in enumerate(checks):
+            if not isinstance(item, dict):
+                violations.append(
+                    f"{contract_path}:io_contract.diagnostics_contract.checks[{idx}] must be object"
+                )
+                continue
+            cid = item.get("id")
+            if not isinstance(cid, str) or not cid.strip():
+                violations.append(
+                    f"{contract_path}:io_contract.diagnostics_contract.checks[{idx}].id must be non-empty string"
+                )
+                continue
+            if cid.strip() in seen_ids:
+                violations.append(
+                    f"{contract_path}:io_contract.diagnostics_contract.checks[{idx}].id duplicate ({cid.strip()})"
+                )
+            seen_ids.add(cid.strip())
+
+    verdict = section.get("verdict")
+    if verdict is not None:
+        if not isinstance(verdict, dict):
+            violations.append(
+                f"{contract_path}:io_contract.diagnostics_contract.verdict must be object when present"
+            )
+        else:
+            required_value = verdict.get("required")
+            if not isinstance(required_value, bool):
+                violations.append(
+                    f"{contract_path}:io_contract.diagnostics_contract.verdict.required must be bool"
+                )
+            fields = verdict.get("fields")
+            if required_value is True:
+                if not isinstance(fields, list) or not fields:
+                    violations.append(
+                        f"{contract_path}:io_contract.diagnostics_contract.verdict.fields must be non-empty list when verdict.required is true"
+                    )
+                else:
+                    for f_idx, field in enumerate(fields):
+                        if not isinstance(field, str) or not field.strip():
+                            violations.append(
+                                f"{contract_path}:io_contract.diagnostics_contract.verdict.fields[{f_idx}] must be non-empty string"
+                            )
+
+
+def _validate_diagnostics_contract_output(
+    repo_root: Path, execution: NodeExecution, violations: list[str]
+) -> None:
+    """At post_execute/pre_judge, verify diagnostics.json satisfies the IR's
+    io_contract.diagnostics_contract (the tests.md §3 contract encoded in the IR).
+
+    When the contract declares checks[].id, diagnostics.json must carry a top-level
+    `checks` object holding each id. When verdict.required is true, diagnostics.json
+    must carry a top-level `verdict` object holding the declared fields. This catches
+    the structural_violation earlier than the LLM judge. A node without a
+    diagnostics_contract is unaffected.
+    """
+    contract = _io_contract_for_execution(repo_root, execution)
+    if not isinstance(contract, dict):
+        return
+    check_ids = _diagnostics_contract_check_ids(contract)
+    verdict_fields = _diagnostics_contract_verdict_fields(contract)
+    if not check_ids and not verdict_fields:
+        return
+
+    diagnostics_path = execution.node_dir / "diagnostics.json"
+    if not diagnostics_path.exists():
+        # presence of diagnostics.json itself is already required by _validate_raw_evidence
+        return
+    try:
+        diagnostics = _read_json(diagnostics_path)
+    except json.JSONDecodeError:
+        # invalid json already reported elsewhere
+        return
+    if not isinstance(diagnostics, dict):
+        violations.append(f"{diagnostics_path}: must be json object")
+        return
+
+    if check_ids:
+        checks = diagnostics.get("checks")
+        if not isinstance(checks, dict):
+            violations.append(
+                f"{diagnostics_path}:checks must be an object holding the io_contract.diagnostics_contract checks ({sorted(check_ids)})"
+            )
+        else:
+            missing = [cid for cid in check_ids if cid not in checks]
+            if missing:
+                violations.append(
+                    f"{diagnostics_path}:checks missing io_contract.diagnostics_contract ids ({sorted(missing)})"
+                )
+
+    if verdict_fields:
+        verdict = diagnostics.get("verdict")
+        if not isinstance(verdict, dict):
+            violations.append(
+                f"{diagnostics_path}:verdict must be an object holding io_contract.diagnostics_contract.verdict.fields ({sorted(verdict_fields)})"
+            )
+        else:
+            missing_fields = [f for f in verdict_fields if f not in verdict]
+            if missing_fields:
+                violations.append(
+                    f"{diagnostics_path}:verdict missing io_contract.diagnostics_contract.verdict.fields ({sorted(missing_fields)})"
+                )
 
 
 def _validate_io_contract_schema(

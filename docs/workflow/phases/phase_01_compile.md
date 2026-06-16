@@ -81,7 +81,7 @@ impl_defaults:
   backend_overrides: {...}     # overrides per backend (knob area)
 
 io_contract:
-  # integrates and holds the IO contract and verification contract: inputs / outputs / semantic_dependency / raw_requirements / test_evidence_requirements
+  # integrates and holds the IO contract and verification contract: inputs / outputs / semantic_dependency / raw_requirements / test_evidence_requirements / diagnostics_contract
   inputs:
     - name: "<name>"
       shape_expr: "<scalar | [d1,d2,...] | (d1,d2,...)>"
@@ -103,7 +103,15 @@ io_contract:
           time_shape_expr: "<...>"
   test_evidence_requirements:
     - test_id: "<test_id>"
-      required_raw_variables: ["<var1>", ...]
+      required_raw_variables: ["<var1>", ...]   # must be SUFFICIENT for Validate.judge to independently recompute this test's judgment, i.e. include the recompute inputs (e.g. U_L/U_R for an "F*=F(U_L)" judgment), not only the outputs. Each name resolves to a raw_requirements...schema.variables[].name
+  diagnostics_contract:
+    # derived from tests.md §3 (Diagnostics contract) + any tests.md §4 test whose pass_when references verdict.*
+    # this is the runner output contract that Generate consumes (Generate never reads tests.md), so the §3 checks/verdict must live here
+    checks:
+      - id: "<check_id>"   # one id per checks.<id> key tests.md §3 requires in diagnostics.json (e.g. equal_state_consistency)
+    verdict:
+      required: true|false               # true when some test's pass_when references verdict.*
+      fields: ["overall", "failed_checks"]   # the verdict.* keys the runner must self-emit in diagnostics.json (required when required=true)
   semantic_dependency:
     required_sources: ["<var1>", "<var2>", ...]   # a non-empty string array
 
@@ -168,7 +176,9 @@ The required invariant set for the self-check (finalized as a **minimal set**):
 #### V3. io_contract consistency
 - Each `name` of `io_contract.outputs[]` appears in one of the `outputs` of `algorithm.steps[]`, or is derived by `algorithm.derived_field_rules`.
 - When `io_contract.outputs[].evidence_ref=raw/state_snapshots`, `raw_variables` is a non-empty array, and each element references `io_contract.raw_requirements.required_evidence[].schema.variables[].name` or `time_variable`.
-- `io_contract.test_evidence_requirements[].required_raw_variables` covers all `test_id` of `tests.md`.
+- `io_contract.test_evidence_requirements[].required_raw_variables` covers all `test_id` of `tests.md`, and for each `test_id` is **sufficient for independent recomputation** of that test's judgment: it includes the recompute *inputs* (e.g. `U_L`/`U_R` for a `F*=F(U_L)` judgment), and every listed variable resolves to a `raw_requirements.required_evidence[].schema.variables[].name` (so the inputs are also present in the `state_snapshots` schema). A `required_raw_variables` that lists only outputs while the judgment needs the inputs is a `fail`.
+- `io_contract.diagnostics_contract.checks[].id` covers every `checks.<id>` key named in `tests.md §3` (neither more nor less).
+- When any `tests.md §4` test's `pass_when` references `verdict.*`, `io_contract.diagnostics_contract.verdict.required=true` and `verdict.fields` covers the referenced keys (e.g. `overall` / `failed_checks`). When no test references `verdict.*`, `verdict.required=false` is allowed.
 - `io_contract.semantic_dependency.required_sources` is a non-empty string array.
 
 #### V4. dependency consistency

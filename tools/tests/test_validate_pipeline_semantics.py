@@ -11,12 +11,17 @@ from pathlib import Path
 
 import yaml
 
+import tools.validate_pipeline_semantics as vps
 from tools.validate_pipeline_semantics import (
     _BUNDLED_SHAPE_EXPR_SCHEMA_PATH,
     NodeExecution,
+    _diagnostics_contract_check_ids,
+    _diagnostics_contract_verdict_fields,
     _node_executions,
     _parse_makefile_rules,
     _required_raw_evidence,
+    _validate_diagnostics_contract,
+    _validate_diagnostics_contract_output,
     _validate_fortran_makefile_src_dir,
     _validate_generate_lint_command_logs,
     _validate_source_meta_json_files,
@@ -7853,6 +7858,143 @@ class FortranMakefileObjdirPrefixTest(unittest.TestCase):
         self.assertEqual(
             [], violations, f"in-source bare Makefile must stay valid; got: {violations}"
         )
+
+
+class DiagnosticsContractTest(unittest.TestCase):
+    """Tests for the io_contract.diagnostics_contract (tests.md §3) field."""
+
+    @staticmethod
+    def _struct(contract: dict) -> list[str]:
+        violations: list[str] = []
+        _validate_diagnostics_contract(Path("spec.ir.yaml"), contract, violations)
+        return violations
+
+    def test_absent_diagnostics_contract_is_allowed(self) -> None:
+        # A node whose tests.md has no §3 contract omits the field entirely.
+        self.assertEqual([], self._struct({"io_contract": {}}))
+
+    def test_wellformed_contract_passes_lifted_and_nested(self) -> None:
+        section = {
+            "checks": [
+                {"id": "equal_state_consistency"},
+                {"id": "wave_speed_nonnegative"},
+                {"id": "input_guard"},
+            ],
+            "verdict": {"required": True, "fields": ["overall", "failed_checks"]},
+        }
+        self.assertEqual([], self._struct({"diagnostics_contract": section}))
+        self.assertEqual([], self._struct({"io_contract": {"diagnostics_contract": section}}))
+
+    def test_empty_checks_and_required_verdict_without_fields_flagged(self) -> None:
+        violations = self._struct(
+            {"diagnostics_contract": {"checks": [], "verdict": {"required": True}}}
+        )
+        self.assertTrue(any("checks must be non-empty list" in v for v in violations))
+        self.assertTrue(
+            any("verdict.fields must be non-empty list" in v for v in violations)
+        )
+
+    def test_present_but_non_object_section_is_flagged(self) -> None:
+        # Regression: a present-but-malformed section (e.g. `diagnostics_contract: []`)
+        # must be rejected, not silently skipped as if absent.
+        for malformed in ([], "nope", 3):
+            self.assertTrue(
+                any(
+                    "diagnostics_contract must be object when present" in v
+                    for v in self._struct({"diagnostics_contract": malformed})
+                ),
+                f"malformed value {malformed!r} must be flagged",
+            )
+            self.assertTrue(
+                any(
+                    "diagnostics_contract must be object when present" in v
+                    for v in self._struct(
+                        {"io_contract": {"diagnostics_contract": malformed}}
+                    )
+                ),
+                f"nested malformed value {malformed!r} must be flagged",
+            )
+
+    def test_missing_id_and_duplicate_id_flagged(self) -> None:
+        violations = self._struct(
+            {"diagnostics_contract": {"checks": [{"id": "a"}, {"id": "a"}, {"foo": 1}]}}
+        )
+        self.assertTrue(any("duplicate (a)" in v for v in violations))
+        self.assertTrue(any("must be non-empty string" in v for v in violations))
+
+    def test_accessors_only_return_verdict_fields_when_required(self) -> None:
+        contract = {
+            "diagnostics_contract": {
+                "checks": [{"id": "c1"}, {"id": "c2"}],
+                "verdict": {"required": False, "fields": ["overall"]},
+            }
+        }
+        self.assertEqual(["c1", "c2"], _diagnostics_contract_check_ids(contract))
+        self.assertEqual([], _diagnostics_contract_verdict_fields(contract))
+
+    def test_compile_stage_unaffected_when_field_absent(self) -> None:
+        # Regression guard: existing IRs without diagnostics_contract stay valid.
+        self.assertEqual([], self._struct({"io_contract": {"inputs": [], "outputs": []}}))
+
+
+class DiagnosticsContractOutputTest(unittest.TestCase):
+    """Tests for the post_execute/pre_judge diagnostics.json output check."""
+
+    CONTRACT = {
+        "diagnostics_contract": {
+            "checks": [
+                {"id": "equal_state_consistency"},
+                {"id": "wave_speed_nonnegative"},
+                {"id": "input_guard"},
+            ],
+            "verdict": {"required": True, "fields": ["overall", "failed_checks"]},
+        }
+    }
+
+    def _run(self, diagnostics: dict, contract: dict | None = CONTRACT) -> list[str]:
+        node_dir = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, node_dir, ignore_errors=True)
+        (node_dir / "diagnostics.json").write_text(json.dumps(diagnostics))
+        execution = NodeExecution(
+            node_key="n", node_dir=node_dir, exec_dir=node_dir, pipeline_dir=node_dir
+        )
+        original = vps._io_contract_for_execution
+        vps._io_contract_for_execution = lambda repo_root, ex: contract
+        self.addCleanup(setattr, vps, "_io_contract_for_execution", original)
+        violations: list[str] = []
+        _validate_diagnostics_contract_output(Path("."), execution, violations)
+        return violations
+
+    def test_broken_per_case_array_is_flagged(self) -> None:
+        # The exact failure shape from orch_20260616T071613Z_5d13cc57.
+        violations = self._run(
+            {"cases": [{"case_id": "x", "guard_pass": True, "a_x": 1.0, "a_y": 2.0}]}
+        )
+        self.assertTrue(any("checks must be an object" in v for v in violations))
+        self.assertTrue(any("verdict must be an object" in v for v in violations))
+
+    def test_conformant_diagnostics_passes(self) -> None:
+        good = {
+            "checks": {
+                "equal_state_consistency": {"pass": True},
+                "wave_speed_nonnegative": {"pass": True},
+                "input_guard": {"pass": True},
+            },
+            "verdict": {"overall": "fail", "failed_checks": ["input_guard"]},
+        }
+        self.assertEqual([], self._run(good))
+
+    def test_partial_checks_and_verdict_flagged(self) -> None:
+        partial = {
+            "checks": {"equal_state_consistency": {}, "input_guard": {}},
+            "verdict": {"overall": "pass"},
+        }
+        violations = self._run(partial)
+        self.assertTrue(any("wave_speed_nonnegative" in v for v in violations))
+        self.assertTrue(any("failed_checks" in v for v in violations))
+
+    def test_no_contract_means_no_check(self) -> None:
+        self.assertEqual([], self._run({"cases": []}, contract={"io_contract": {}}))
 
 
 if __name__ == "__main__":
