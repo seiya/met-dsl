@@ -437,7 +437,7 @@ From Step 3.5 / 4.5 / 5.5, summarize the **legitimate action the agent should ta
 | read_manifest_read_guard | … | … | obtain via `guarded-apply-patch` / `run-gate` |
 | output_manifest_write_guard | … | … | directly specify the literal path of `allowed_tmp_root` (`workspace/tmp/<agent_run_id>/...`). Bootstrap Bash such as `export TMPDIR=...` / `jq -er ...` is forbidden (the workflow stops on a Claude Code session sandbox approval) |
 | forbid_python_inline_write | … | … | use `guarded-apply-patch` or the Edit/Write tool |
-| forbid_tools_direct_read | … | … | reference only `docs/` / `spec/` |
+| forbid_tools_direct_read | … | … | during workflow execution, reference only `docs/` / `spec/` |
 | enforce_guarded_apply_patch | … | … | use `guarded-apply-patch` and add to `allowed_file_tool_paths` |
 
 Highlight a repeated error pattern (5 or more) in bold, and add the corresponding line number of `docs/RUNBOOK.md#hook-recovery`.
@@ -446,6 +446,6 @@ Highlight a repeated error pattern (5 or more) in bold, and add the correspondin
 
 ## Notes
 
-- The implementation under `tools/` is forbidden to read directly by hook policy. Derive rules by referencing only `docs/` and `spec/`.
+- During workflow execution, the implementation under `tools/` is forbidden to read directly by hook policy. Derive workflow rules by referencing only `docs/` and `spec/`. During repository improvement, maintenance, testing, and refactoring, `tools/*.py` may be inspected directly.
 - The session `.jsonl` can be tens of thousands of lines. Do not read all lines from the top; extract only the necessary fields with Python.
 - When the orchestration agent and a child agent are mixed under the same session_id (on the Claude backend they are recorded in the same session), determine the agent_role not by `payload_summary.session_id` but by `capabilities/<agent_run_id>.json` corresponding to the `agent_run_id` of `native_hook_events.jsonl`.

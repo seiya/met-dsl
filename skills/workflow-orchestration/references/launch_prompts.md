@@ -29,7 +29,7 @@
 - Use the `Read` tool to confirm the content of a JSON file. `python3 -c "import json; ..."` is blocked by `forbid_python_inline_write`. Only when Python processing is truly necessary, write a script to `workspace/tmp/<agent_run_id>/x.py` and run it with `python3 workspace/tmp/<agent_run_id>/x.py` (`<agent_run_id>` is literally substituted).
 - For UUID generation, use `python3 tools/new_agent_run_id.py`. `python3 -c 'import uuid; print(uuid.uuid4())'`, including with flags such as `-S`, is all blocked by `forbid_python_inline_write`. Do not use `cat /proc/sys/kernel/random/uuid` because it stops on a session-sandbox approval request every time.
 - Your own launch prompt body is passed as input at Agent tool launch. There is no need to re-read `launches/<agent_run_id>.prompt.txt` with `Read`, and it is blocked by `read_manifest_read_guard`.
-- A `Read`/`grep`/`sed`/`cat` of `tools/` / `tests/` / a validator script / a hook implementation is blocked by `forbid_tools_direct_read`. Interpret the requirements and judgment rules only from `docs/` / `spec/` / `skill_must_read_refs`. For the internal behavior of `guarded-apply-patch` (strip decision etc.), the canonical references are "Patch application contract" of `docs/ORCHESTRATION.md` and "About the strip of `guarded-apply-patch`" at the end of this file.
+- During workflow execution, a `Read`/`grep`/`sed`/`cat` of `tools/` / `tests/` / a validator script / a hook implementation is blocked by `forbid_tools_direct_read`. Interpret the requirements and judgment rules only from `docs/` / `spec/` / `skill_must_read_refs`. For the internal behavior of `guarded-apply-patch` (strip decision etc.), the canonical references are "Patch application contract" of `docs/ORCHESTRATION.md` and "About the strip of `guarded-apply-patch`" at the end of this file.
 - When referencing an artifact you generated, use the relative path from the project root enumerated in the `allowed_output_paths` of `output_manifests/<agent_run_id>.json` (e.g. `workspace/ir/...`). Do not use an absolute path such as `/home/<user>/...` or a path without the `workspace/` prefix.
 - Use `capabilities/<agent_run_id>.json` as the canonical source for orchestration metadata such as `orchestration_id` / `agent_run_id` / `node_key` / `step` / `write_roots`. `orchestration_meta.json` is blocked by `read_manifest_read_guard`.
 - If `skill_name` and `skill_ref` are unspecified, stop with fail. Read only the single file `skill_ref` specified in the launch prompt, and **do not additionally Read a SKILL.md of any phase other than your own** (for the phase ↔ skill mapping, see the end of this file).
@@ -279,7 +279,7 @@ EOF
 2. Confirm that no extra `/` or relative-path symbol (`./`) is mixed into the path before or after.
 3. For a new-file creation, use the `--- /dev/null` / `+++ b/<path>` form.
 
-Do not attempt to confirm this logic by grepping `tools/orchestration_runtime.py` (it is blocked by `forbid_tools_direct_read`). The legitimate references are this paragraph and `docs/ORCHESTRATION.md#patch-application-contract`.
+During workflow execution, do not attempt to confirm this logic by grepping `tools/orchestration_runtime.py` (it is blocked by `forbid_tools_direct_read`). The legitimate references are this paragraph and `docs/ORCHESTRATION.md#patch-application-contract`.
 
 ---
 

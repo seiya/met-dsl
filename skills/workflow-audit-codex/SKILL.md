@@ -298,6 +298,6 @@ Enumerate multiple phase-launch attempts, gate-failure loops, sandbox violations
 
 ## Notes
 
-- The implementation under `tools/` is forbidden to read directly by hook policy. Derive rules by referencing only `docs/` and `spec/`.
+- During workflow execution, the implementation under `tools/` is forbidden to read directly by hook policy. Derive workflow rules by referencing only `docs/` and `spec/`. During repository improvement, maintenance, testing, and refactoring, `tools/*.py` may be inspected directly.
 - The session `jsonl` can be tens of thousands of lines. Do not read all lines from the top; extract only the necessary fields with `python`.
 - When `payload_summary.session_id` is missing, prefer the `agent_session_id` of `agent_runs.jsonl`, and reverse-look it up with `~/.codex/sessions/**/rollout-*-<agent_session_id>.jsonl`.

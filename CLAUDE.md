@@ -89,7 +89,9 @@ Choose the path for obtaining CLI argument information based on the target subco
 | `tools/new_agent_run_id.py` | literal (`python3 tools/new_agent_run_id.py`) | no arguments |
 | Calls to `guarded-apply-patch` / `run-gate` etc. from a step / substep agent | the literal embedded in the parent's launch prompt (`references/launch_prompts.md`) | saves child context; the parent pins it via template |
 
-Reading the implementations under `tools/` directly (the path of reading `.py` implementations via the `Read` tool / `grep` / `sed` / `cat` etc.) remains forbidden and subject to `forbid_tools_direct_read` and `read_manifest_read_guard`. `<tool> --help` is an information-acquisition path limited to argparse output and is allowed outside the scope of `forbid_tools_direct_read` (the hook only records an audit log).
+During workflow execution, reading the implementations under `tools/` directly (the path of reading `.py` implementations via the `Read` tool / `grep` / `sed` / `cat` etc.) remains forbidden and subject to `forbid_tools_direct_read` and `read_manifest_read_guard`. `<tool> --help` is an information-acquisition path limited to argparse output and is allowed outside the scope of `forbid_tools_direct_read` (the hook only records an audit log).
+
+During repository improvement, maintenance, testing, or refactoring, `tools/*.py` is ordinary source code and may be inspected directly. The workflow-execution restriction does not apply to that work.
 
 ### `response.json` of `record-launch`
 - The Agent tool's launch response has no structured JSON like Codex's `spawn_agent`.
