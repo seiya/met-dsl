@@ -5927,6 +5927,67 @@ shallow_water2d_runner.o: shallow_water2d_runner.f90 shallow_water2d_model.mod
             )
             self.assertEqual(violations, [])
 
+    def test_validate_post_generate_stage_rejects_bad_top_level_pipeline_id(self) -> None:
+        """post_generate must enforce the lineage top-level pipeline_id schema (the
+        same check post_execute runs), so a malformed pipeline_id surfaces at Generate
+        rather than far downstream at Validate (audit: orch_20260615T095217Z_74450292)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            _seed_shape_expr_schema_into(repo_root)
+            dep_model_text = (
+                "module dynamics_shallow_water_flux_2d_rusanov_p0_model\n"
+                "implicit none\ncontains\n"
+                "subroutine dynamics_shallow_water_flux_2d_rusanov_p0__compute_flux(flag)\n"
+                "  logical, intent(out) :: flag\n  flag = .true.\n"
+                "end subroutine dynamics_shallow_water_flux_2d_rusanov_p0__compute_flux\n"
+                "end module dynamics_shallow_water_flux_2d_rusanov_p0_model\n"
+            )
+            model_text = (
+                "module shallow_water2d_model\n"
+                "use dynamics_shallow_water_flux_2d_rusanov_p0_model\n"
+                "implicit none\ncontains\n"
+                "subroutine solve(flag)\n  logical, intent(out) :: flag\n"
+                "  call dynamics_shallow_water_flux_2d_rusanov_p0__compute_flux(flag)\n"
+                "end subroutine solve\nend module shallow_water2d_model\n"
+            )
+            runner_text = (
+                "program shallow_water2d_runner\nimplicit none\n"
+                "write(*,*) 'ok'\nend program shallow_water2d_runner\n"
+            )
+            makefile_text = (
+                "FC ?= gfortran\nOBJS = dynamics_shallow_water_flux_2d_rusanov_p0_model.o "
+                "shallow_water2d_model.o shallow_water2d_runner.o\n\n"
+                "simulate: $(OBJS)\n\t$(FC) -o $@ $(OBJS)\n"
+            )
+            _create_minimal_execution_tree(
+                repo_root,
+                dep_spec_id="dynamics_shallow_water_flux_2d_rusanov_p0",
+                model_text=model_text,
+                runner_text=runner_text,
+                run_command=["x", "y"],
+                extra_sources={
+                    "dynamics_shallow_water_flux_2d_rusanov_p0_model.f90": dep_model_text
+                },
+                makefile_text=makefile_text,
+            )
+            pipeline_ref = (
+                "workspace/pipelines/problem__shallow_water2d__0.3.0/"
+                "shallow-water2d_20260415_001"
+            )
+            # Corrupt the top-level pipeline_id so it no longer matches the directory.
+            lineage_path = repo_root / pipeline_ref / "lineage.json"
+            lineage = json.loads(lineage_path.read_text(encoding="utf-8"))
+            lineage["pipeline_id"] = "not-the-pipeline-id"
+            lineage_path.write_text(json.dumps(lineage), encoding="utf-8")
+
+            violations = validate_post_generate_stage(
+                repo_root, "workspace", pipeline_ref, source_id="src_20260415_001"
+            )
+            self.assertTrue(
+                any("pipeline_id" in v for v in violations),
+                f"expected a pipeline_id violation, got: {violations}",
+            )
+
     def test_validate_post_generate_stage_leaf_node_directory_dependency_ref(self) -> None:
         """Regression: a leaf node (direct_deps=[]) with dependency_ref pointing at the
         IR phase-root *directory* (per ORCHESTRATION.md:151) must resolve the dependency

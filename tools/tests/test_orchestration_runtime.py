@@ -1911,6 +1911,67 @@ shell_tool                       stable             true
             self.assertIn("agent_run_id: substep_run_plan_generate_001", summary_text)
             self.assertIn("output_refs:", summary_text)
 
+    def test_write_preflight_records_host_session_id_only_when_launchable(self) -> None:
+        import json as _json
+
+        def _read_meta(repo_root: Path) -> dict:
+            return _json.loads(
+                (
+                    repo_root
+                    / "workspace" / "orchestrations" / "orch_001"
+                    / "orchestration_meta.json"
+                ).read_text(encoding="utf-8")
+            )
+
+        launchable_payload = {
+            "status": "pass",
+            "sandbox_runtime": "bwrap",
+            "sandbox_enforced": True,
+            "can_launch_step_agents": True,
+            "can_launch_substep_agents": True,
+            "feature_states": {"multi_agent": True, "codex_hooks": True},
+            "checks": [{"name": "multi_agent_enabled", "pass": True}],
+        }
+        non_launchable_payload = {
+            "status": "fail",
+            "sandbox_runtime": "bwrap",
+            "sandbox_enforced": True,
+            "can_launch_step_agents": False,
+            "can_launch_substep_agents": False,
+            "feature_states": {"multi_agent": True, "codex_hooks": True},
+            "checks": [{"name": "multi_agent_enabled", "pass": True}],
+        }
+
+        # Launchable preflight: host_session_id is recorded.
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            init_orchestration(repo_root=repo_root, orchestration_id="orch_001")
+            _mark_dependencies_ready(repo_root)
+            write_preflight(
+                repo_root=repo_root,
+                orchestration_id="orch_001",
+                payload=dict(launchable_payload),
+                host_session_id="aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+            )
+            self.assertEqual(
+                _read_meta(repo_root).get("host_session_id"),
+                "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+            )
+
+        # Non-launchable preflight: host_session_id must NOT be recorded (it would
+        # point meta at a session that never started).
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            init_orchestration(repo_root=repo_root, orchestration_id="orch_001")
+            _mark_dependencies_ready(repo_root)
+            write_preflight(
+                repo_root=repo_root,
+                orchestration_id="orch_001",
+                payload=dict(non_launchable_payload),
+                host_session_id="ffffffff-0000-1111-2222-333333333333",
+            )
+            self.assertNotIn("host_session_id", _read_meta(repo_root))
+
     def test_record_launch_strips_child_agent_run_id_for_tmp_and_manifest_paths(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
@@ -2691,6 +2752,62 @@ shell_tool                       stable             true
             write_roots=[f"{_FIX_PIPE_REF}/runs/"],
         )
         self.assertEqual([p for p in out2 if p == expected], [expected])
+
+    def test_generate_generate_auto_injects_lineage(self) -> None:
+        """Generate.generate launches must auto-inject <pipeline_ref>/lineage.json
+        so an orchestration that omits it from allowed_output_paths cannot block the
+        child from authoring it (audit: orch_20260615T095217Z_74450292)."""
+        from tools.orchestration_runtime import _allowed_output_paths_for_launch
+
+        source_id = "src_20260415_001"
+        req = {
+            "agent_role": "substep",
+            "node_key": "problem/shallow_water2d@0.3.0",
+            "step": "generate", "substep": "generate",
+            "ir_ref": _FIX_IR_REF,
+            "pipeline_ref": _FIX_PIPE_REF,
+            "source_id": source_id,
+            "allowed_output_paths": [
+                f"{_FIX_PIPE_REF}/source/{source_id}/src/",
+            ],
+        }
+        out = _allowed_output_paths_for_launch(
+            request_payload=req,
+            write_roots=[f"{_FIX_PIPE_REF}/"],
+        )
+        expected = f"{_FIX_PIPE_REF}/lineage.json"
+        self.assertIn(expected, out)
+        # Idempotent: pre-listing it must not duplicate.
+        req2 = dict(req)
+        req2["allowed_output_paths"] = req["allowed_output_paths"] + [expected]
+        out2 = _allowed_output_paths_for_launch(
+            request_payload=req2,
+            write_roots=[f"{_FIX_PIPE_REF}/"],
+        )
+        self.assertEqual([p for p in out2 if p == expected], [expected])
+
+    def test_generate_verify_does_not_inject_lineage(self) -> None:
+        """The verify substep only reads lineage.json; it must NOT be auto-injected
+        into the verify launch's allowed_output_paths."""
+        from tools.orchestration_runtime import _allowed_output_paths_for_launch
+
+        source_id = "src_20260415_001"
+        req = {
+            "agent_role": "substep",
+            "node_key": "problem/shallow_water2d@0.3.0",
+            "step": "generate", "substep": "verify",
+            "ir_ref": _FIX_IR_REF,
+            "pipeline_ref": _FIX_PIPE_REF,
+            "source_id": source_id,
+            "allowed_output_paths": [
+                f"{_FIX_PIPE_REF}/source/{source_id}/src/",
+            ],
+        }
+        out = _allowed_output_paths_for_launch(
+            request_payload=req,
+            write_roots=[f"{_FIX_PIPE_REF}/"],
+        )
+        self.assertNotIn(f"{_FIX_PIPE_REF}/lineage.json", out)
 
     def test_validate_judge_does_not_inject_snapshot_schema(self) -> None:
         """The judge substep writes no raw/ evidence and its phase contract

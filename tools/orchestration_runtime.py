@@ -4809,6 +4809,16 @@ def _mandatory_phase_outputs_for_launch(
     step_token = str(request_payload.get("step") or "").strip().lower()
     substep_token = str(request_payload.get("substep") or "").strip().lower()
     pipeline_ref = _normalize_rel_posix(str(request_payload.get("pipeline_ref") or ""))
+    # Generate.generate authors the pipeline ``lineage.json`` (its absence is a
+    # ``post_generate`` fail). Pre-authorize the canonical ``<pipeline_ref>/lineage.json``
+    # placement so an orchestration that omits it from ``allowed_output_paths`` cannot
+    # block the child from writing it and stall Generate.verify on ``post_generate``
+    # (audit: orch_20260615T095217Z_74450292 lost ~5 child re-launches to this). The
+    # generate phase contract already permits this path; ``_matches_phase_contract``
+    # confirms it stays in-contract. Restricted to the ``generate`` substep — ``verify``
+    # only reads lineage.json.
+    if step_token == "generate" and substep_token == "generate" and pipeline_ref:
+        return [f"{pipeline_ref}/lineage.json"]
     if step_token != "validate" or substep_token != "execute" or not pipeline_ref:
         return []
     node_key = str(request_payload.get("node_key") or "").strip()
@@ -11065,7 +11075,13 @@ def init_orchestration(
     return meta
 
 
-def write_preflight(repo_root: Path, orchestration_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+def write_preflight(
+    repo_root: Path,
+    orchestration_id: str,
+    payload: dict[str, Any],
+    *,
+    host_session_id: str | None = None,
+) -> dict[str, Any]:
     _validate_preflight_payload(payload)
     root = _orchestration_root(repo_root, orchestration_id)
     root.mkdir(parents=True, exist_ok=True)
@@ -11231,6 +11247,19 @@ def write_preflight(repo_root: Path, orchestration_id: str, payload: dict[str, A
                         meta["dependency_readiness"] = computed
                         _write_json(meta_path, meta)
     if _preflight_allows_agent_launch(stored):
+        # Record the host session id ONLY when preflight is launchable — i.e. when the
+        # caller will actually start the backend session. Recording it at init (before
+        # preflight) would leave a failed-preflight orchestration, or a resume whose
+        # preflight then fails, pointing meta.host_session_id at a session that never
+        # launched (Codex review). orchestration_meta.json is runtime-owned and exempt
+        # from the agent write-baseline check (_should_ignore_runtime_snapshot_path),
+        # so this post-init meta write is safe.
+        if isinstance(host_session_id, str) and host_session_id.strip():
+            with _orchestration_meta_exclusive_lock(repo_root, orchestration_id):
+                hs_meta = _read_json(meta_path)
+                if isinstance(hs_meta, dict):
+                    hs_meta["host_session_id"] = host_session_id.strip()
+                    _write_json(meta_path, hs_meta)
         _transition_phase_state(
             repo_root,
             orchestration_id,
@@ -13674,6 +13703,16 @@ def main(argv: list[str] | None = None) -> int:
     preflight_parser.add_argument("--agent-command")
     preflight_parser.add_argument("--codex-command", default="codex")
     preflight_parser.add_argument("--claude-command", default="claude")
+    preflight_parser.add_argument(
+        "--host-session-id",
+        help=(
+            "The real backend session id the orchestration agent will run inside (e.g. "
+            "the Claude Code session UUID pinned via `claude --session-id`). Recorded in "
+            "orchestration_meta.json#host_session_id ONLY when preflight is launchable, "
+            "so a failed/non-launchable preflight does not point meta at a session that "
+            "never started."
+        ),
+    )
 
     preflight_status_parser = subparsers.add_parser("preflight-status")
     preflight_status_parser.add_argument("--repo-root", required=True)
@@ -14134,6 +14173,7 @@ def main(argv: list[str] | None = None) -> int:
                 agent_command=agent_command,
                 repo_root=repo_root,
             ),
+            host_session_id=getattr(args, "host_session_id", None),
         )
     elif args.command == "preflight-status":
         result = get_preflight_ttl_status(

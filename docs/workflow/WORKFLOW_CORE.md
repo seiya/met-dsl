@@ -214,6 +214,7 @@ workspace/
 - `spec`-origin mode: resolve the dependency `DAG` from the `spec`, issue a new `ir_id` per `node`, and start the `pipeline`.
 - `ir`-origin mode: specify an existing `ir_id` and execute only from `Generate` onward.
 - `lineage.json` requires recording `spec_ref`, `ir_ref`, each stage `id`, `dependency_ref`, `node_key`, and `direct_dependency_status`.
+- The stage ids — `pipeline_id`, `source_id`, `binary_id`, `run_id` — must be recorded as **top-level keys** of `lineage.json` (not nested under a sub-object). `pipeline_id` must be present and match the `<pipeline_id>` directory name (`<slug>_<YYYYMMDD>_<seq3>`) already at `Generate` time; the remaining stage ids are filled in as their phases run. Both `post_generate` and `post_execute` enforce the top-level `pipeline_id` schema (`validate_pipeline_semantics.py:_validate_pipeline_lineage_presence`), so a malformed or nested `pipeline_id` fails at `Generate` rather than at `Validate`.
 
 #### Re-execution rules
 - `Generate` may be run multiple times with the same `ir_id`. Each trial is a different `source_id`.

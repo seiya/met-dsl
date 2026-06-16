@@ -126,7 +126,9 @@ def _runtime_command(repo_root: Path, env: dict[str, str], args: list[str]) -> R
     return RuntimeResult(payload=payload, raw_stdout=stdout)
 
 
-def _launch_command_and_input(*, llm: str, llm_command: str, prompt_text: str) -> tuple[list[str], str | None]:
+def _launch_command_and_input(
+    *, llm: str, llm_command: str, prompt_text: str, session_id: str | None = None
+) -> tuple[list[str], str | None]:
     command = shlex.split(llm_command)
     if not command:
         raise ValueError("llm_command must be non-empty")
@@ -136,9 +138,12 @@ def _launch_command_and_input(*, llm: str, llm_command: str, prompt_text: str) -
         return [*command, "exec", prompt_text], None
     # Claude Code defaults to launching the interactive TUI; `-p` (--print) runs
     # the prompt non-interactively and exits, which is required when invoked from
-    # this bootstrap script.
+    # this bootstrap script. `--session-id` pins the host session UUID so the
+    # transcript at ~/.claude/projects/<slug>/<session_id>.jsonl is addressable and
+    # recordable in orchestration_meta.json#host_session_id (observability).
     if llm == "claude":
-        return [*command, "-p", prompt_text], None
+        session_flags = ["--session-id", session_id] if session_id else []
+        return [*command, *session_flags, "-p", prompt_text], None
     return command, prompt_text
 
 
@@ -341,10 +346,31 @@ def _collect_failure_analysis(repo_root: Path, orchestration_id: str) -> dict[st
     meta = _read_json_if_exists(meta_path) or {}
     runs = _read_jsonl(orch_root / "agent_runs.jsonl")
     terminal_fail_statuses = {"fail", "blocked", "timeout", "cancel"}
+
+    def _run_key(run: dict[str, Any]) -> tuple[str, str, str]:
+        return (
+            str(run.get("node_key") or ""),
+            str(run.get("step") or ""),
+            str(run.get("substep") or ""),
+        )
+
+    # Index of the last passing run per (node_key, step, substep). A terminal-nonpass
+    # run is "resolved" (superseded) when a *later* run of the same key passed — e.g. the
+    # judge timeout that the orchestration re-ran to pass, or a blocked/cancelled verify
+    # later re-run green. Such runs must not be reported as the workflow failure. The
+    # agent_runs `superseded`/`superseded_by` fields are not currently written, so
+    # reconcile by key + replay order instead.
+    last_pass_index: dict[tuple[str, str, str], int] = {}
+    for idx, run in enumerate(runs):
+        if isinstance(run.get("status"), str) and str(run.get("status")).strip().lower() == "pass":
+            last_pass_index[_run_key(run)] = idx
+
     failed_runs = [
         run
-        for run in runs
-        if isinstance(run.get("status"), str) and str(run.get("status")).strip().lower() in terminal_fail_statuses
+        for idx, run in enumerate(runs)
+        if isinstance(run.get("status"), str)
+        and str(run.get("status")).strip().lower() in terminal_fail_statuses
+        and last_pass_index.get(_run_key(run), -1) < idx
     ]
     failed_run = failed_runs[-1] if failed_runs else None
 
@@ -1047,6 +1073,18 @@ def main(argv: list[str] | None = None) -> int:
     # `python3 tools/...` invocations the agent makes.
     env.setdefault("PYTHONDONTWRITEBYTECODE", "1")
 
+    # For the Claude backend, pin a fresh host session UUID per launch so the real
+    # Claude Code transcript (~/.claude/projects/<slug>/<host_session_id>.jsonl) is
+    # addressable and can be recorded in orchestration_meta.json#host_session_id.
+    # A resume spawns a new session, so a fresh id is generated each invocation.
+    # Gate on args.invoke_llm: with --no-invoke-llm no `claude --session-id` process
+    # ever starts, so recording a host_session_id would point meta at a transcript
+    # that does not exist. (host_session_id is recorded at init for run-write-baseline
+    # integrity; on a subsequent real launch via --resume it is regenerated.)
+    host_session_id: str | None = (
+        str(uuid.uuid4()) if (llm == "claude" and args.invoke_llm) else None
+    )
+
     try:
         if resume_mode:
             # Resume an existing orchestration: enable checkpoint resume (sets
@@ -1096,21 +1134,24 @@ def main(argv: list[str] | None = None) -> int:
             env["ORCHESTRATION_AGENT_RUN_ID"] = orchestration_agent_run_id
             orchestration_tmp_for_cleanup = orch_tmp
 
-            preflight_result = _runtime_command(
-                repo_root,
-                env,
-                [
-                    "preflight",
-                    "--repo-root",
-                    str(repo_root),
-                    "--orchestration-id",
-                    orchestration_id,
-                    "--backend",
-                    llm,
-                    "--agent-command",
-                    llm_command,
-                ],
-            ).payload
+            preflight_args = [
+                "preflight",
+                "--repo-root",
+                str(repo_root),
+                "--orchestration-id",
+                orchestration_id,
+                "--backend",
+                llm,
+                "--agent-command",
+                llm_command,
+            ]
+            # Record host_session_id only when preflight is launchable (write_preflight
+            # gates it), so a failed/non-launchable preflight never points meta at a
+            # session that did not start. host_session_id is set only for claude +
+            # invoke_llm.
+            if host_session_id:
+                preflight_args += ["--host-session-id", host_session_id]
+            preflight_result = _runtime_command(repo_root, env, preflight_args).payload
         except RuntimeError as exc:
             print(
                 json.dumps(
@@ -1179,11 +1220,13 @@ def main(argv: list[str] | None = None) -> int:
 
         launched = False
         workflow_status = "running"
+        cli_returncode_warning: int | None = None
         if args.invoke_llm:
             launch_command, launch_input = _launch_command_and_input(
                 llm=llm,
                 llm_command=llm_command,
                 prompt_text=prompt_text,
+                session_id=host_session_id,
             )
             proc = subprocess.run(
                 launch_command,
@@ -1193,12 +1236,30 @@ def main(argv: list[str] | None = None) -> int:
                 input=launch_input,
                 check=False,
             )
-            launched = proc.returncode == 0
+            # `launched` means "the LLM subprocess was actually invoked" (distinguishing
+            # the ok path from --no-invoke-llm), NOT "it returned 0". Success/return-code
+            # is conveyed separately: a nonzero exit either takes the fail branch below or,
+            # when meta.status=pass, surfaces as `cli_returncode_warning` in the ok output.
+            launched = True
             meta_after_launch = _read_json_if_exists(
                 repo_root / "workspace" / "orchestrations" / orchestration_id / "orchestration_meta.json"
             )
             if isinstance(meta_after_launch, dict):
                 workflow_status = str(meta_after_launch.get("status") or "running")
+            # The orchestration agent records meta.status="pass" via the gated set-status
+            # only after aggregate_verdict=pass and the pre_judge gate. That recorded
+            # terminal success is authoritative over a transport-induced nonzero CLI
+            # returncode or a superseded/recovered nonpass agent_run, so it short-circuits
+            # the failure-reporting path below (audit: orch_20260615T095217Z_74450292
+            # reported workflow_failed for a fully-passing run).
+            meta_status_is_pass = workflow_status.strip().lower() == "pass"
+            # A dev-mode major/critical verify issue is a fail-closed contract violation
+            # (docs/workflow/WORKFLOW_CORE.md, startup_contract.md, SKILL.md: dev mode
+            # must treat major/critical verify severities as fail). It overrides even a
+            # recorded meta.status=pass — the backstop for an orchestration agent that
+            # wrongly records pass despite a severe verify issue. The meta=pass
+            # short-circuit below is scoped to the CLI returncode only, never to this.
+            severe_verify_fail = False
             if workflow_mode == "dev":
                 severe_verify_issue = _detect_non_minor_verify_issue(repo_root, orchestration_id)
                 if severe_verify_issue is not None:
@@ -1228,13 +1289,23 @@ def main(argv: list[str] | None = None) -> int:
                         workflow_status = "fail"
                     except RuntimeError:
                         workflow_status = "fail"
-            if proc.returncode != 0 or workflow_status.lower() in {
-                "fail",
-                "fail_closed",
-                "blocked",
-                "timeout",
-                "cancel",
-            }:
+                    severe_verify_fail = True
+            # meta.status=pass is authoritative ONLY over a transport-induced nonzero CLI
+            # returncode / a superseded-and-recovered nonpass agent_run — NOT over a
+            # severe_verify_fail, which fails closed regardless.
+            if severe_verify_fail or (
+                not meta_status_is_pass
+                and (
+                    proc.returncode != 0
+                    or workflow_status.lower() in {
+                        "fail",
+                        "fail_closed",
+                        "blocked",
+                        "timeout",
+                        "cancel",
+                    }
+                )
+            ):
                 # When the launched LLM process exited without the orchestration
                 # agent recording a terminal status (e.g. a token/session-limit
                 # kill mid-run), the orchestration meta is still non-terminal
@@ -1346,27 +1417,30 @@ def main(argv: list[str] | None = None) -> int:
                     print(json.dumps(fail_output, ensure_ascii=False))
                     return 2
                 return proc.returncode if proc.returncode != 0 else 2
+            elif proc.returncode != 0:
+                # meta.status=pass but the launched CLI exited nonzero (e.g. a transport
+                # hiccup the orchestration already recovered from). Treat the recorded
+                # pass as authoritative; surface the returncode as an advisory only.
+                cli_returncode_warning = proc.returncode
 
-        print(
-            json.dumps(
-                {
-                    "status": "ok",
-                    "orchestration_id": orchestration_id,
-                    "resumed": resume_mode,
-                    "llm": llm,
-                    "llm_command": llm_command,
-                    "target_spec_ref": spec_ref,
-                    "until_phase": until_phase,
-                    "workflow_mode": workflow_mode,
-                    "metdsl_workflow_mode": env["METDSL_WORKFLOW_MODE"],
-                    "metdsl_workflow_exec_mode": env["METDSL_WORKFLOW_EXEC_MODE"],
-                    "workflow_status": workflow_status,
-                    "prompt_ref": str(prompt_path.relative_to(repo_root)),
-                    "llm_invoked": launched,
-                },
-                ensure_ascii=False,
-            )
-        )
+        ok_output: dict[str, Any] = {
+            "status": "ok",
+            "orchestration_id": orchestration_id,
+            "resumed": resume_mode,
+            "llm": llm,
+            "llm_command": llm_command,
+            "target_spec_ref": spec_ref,
+            "until_phase": until_phase,
+            "workflow_mode": workflow_mode,
+            "metdsl_workflow_mode": env["METDSL_WORKFLOW_MODE"],
+            "metdsl_workflow_exec_mode": env["METDSL_WORKFLOW_EXEC_MODE"],
+            "workflow_status": workflow_status,
+            "prompt_ref": str(prompt_path.relative_to(repo_root)),
+            "llm_invoked": launched,
+        }
+        if cli_returncode_warning is not None:
+            ok_output["cli_returncode_warning"] = cli_returncode_warning
+        print(json.dumps(ok_output, ensure_ascii=False))
         return 0
     finally:
         if orchestration_tmp_for_cleanup is not None and orchestration_tmp_for_cleanup.exists():

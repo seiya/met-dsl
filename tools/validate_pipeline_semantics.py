@@ -6842,6 +6842,15 @@ def _validate_post_generate_stage_impl(
             violations.append(f"{derived_path}: missing (ir_ref {ir_ref})")
 
     execution = _stub_execution(pipeline_dir, node_key)
+    # Enforce the lineage top-level schema (pipeline_id presence + the
+    # <slug>_<YYYYMMDD>_<seq3> format + node_key↔directory binding) at Generate time —
+    # the same check post_execute runs via _validate_pipeline_lineage_presence.
+    # Previously this ran only at post_execute, so a malformed / non-top-level
+    # pipeline_id surfaced far downstream at Validate and forced a corrective generate
+    # re-run (audit: orch_20260615T095217Z_74450292). source_id/binary_id/run_id are not
+    # required here — the presence check validates only node_key and pipeline_id, which
+    # are the fields lineage.json already carries at Generate time.
+    _validate_pipeline_lineage_presence([execution], violations)
     _validate_generate_outputs_for_generation(
         repo_root, execution, gen_id, violations
     )
