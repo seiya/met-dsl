@@ -123,6 +123,56 @@ class RunWorkflowTests(unittest.TestCase):
             analysis = run_workflow._collect_failure_analysis(repo_root, "orch_allok")
             self.assertIsNone(analysis.get("failed_agent_run"))
 
+    def test_is_valid_failure_analysis_accepts_launch_incident_refs_only(self) -> None:
+        """In the degraded dangling-launch path the incident ref is the sole evidence
+        (no reason_code/detail, no failed_agent_run). It must count as evidence so the
+        canonical failure_analysis.json is not misclassified as stale (Codex P3)."""
+        obj = {
+            "orchestration_id": "orch_x",
+            "status": "fail",
+            "orchestration_agent_run_id": "orch_arid_1",
+            "reason_code": None,
+            "reason_detail": None,
+            "failed_agent_run": None,
+            "failed_step_results": [],
+            "recommended_retry_decisions": [],
+            "launch_reply_tail": "",
+            "agent_summary_tail": "",
+            "launch_incident_refs": [
+                "workspace/orchestrations/orch_x/launch_incident.runtime.0123456789ab.json"
+            ],
+        }
+        self.assertTrue(
+            run_workflow._is_valid_failure_analysis(
+                obj, "orch_x", orchestration_agent_run_id="orch_arid_1"
+            )
+        )
+        # With no evidence at all (empty incident refs too), it is invalid.
+        obj_no_evidence = {**obj, "launch_incident_refs": []}
+        self.assertFalse(
+            run_workflow._is_valid_failure_analysis(
+                obj_no_evidence, "orch_x", orchestration_agent_run_id="orch_arid_1"
+            )
+        )
+
+    def test_collect_failure_analysis_includes_launch_incident_refs(self) -> None:
+        """A `launch_incident.runtime.*.json` snapshot is linked from failure_analysis."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            orch_root = repo_root / "workspace" / "orchestrations" / "orch_inc"
+            orch_root.mkdir(parents=True, exist_ok=True)
+            (orch_root / "orchestration_meta.json").write_text(
+                json.dumps({"orchestration_id": "orch_inc", "status": "fail"}, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            snap = orch_root / "launch_incident.runtime.0123456789ab.json"
+            snap.write_text(json.dumps({"schema": "launch_incident/v1"}), encoding="utf-8")
+            analysis = run_workflow._collect_failure_analysis(repo_root, "orch_inc")
+            self.assertEqual(
+                analysis.get("launch_incident_refs"),
+                ["workspace/orchestrations/orch_inc/launch_incident.runtime.0123456789ab.json"],
+            )
+
     def test_discover_source_dependency_ref_from_file_spec_ref(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
@@ -921,6 +971,132 @@ class RunWorkflowTests(unittest.TestCase):
                 and "llm_launch_interrupted" in c
             ]
             self.assertEqual(interrupt_calls, [], calls)
+
+    def _run_main_with_dangling_launch(
+        self,
+        repo_root: Path,
+        *,
+        set_status_raises: bool,
+        orchestration_id: str = "orch_dangling",
+    ) -> tuple[int, dict, list[list[str]]]:
+        """Drive main() through invoke_llm with a CLEAN (returncode 0) subprocess
+        exit but an open active_child window left behind (dangling launch).
+
+        set_status_raises simulates the terminalize set-status failing, to prove the
+        run still reports failure (not ok) via the launch_incident_detected flag.
+        """
+        self._seed_spec_tree(repo_root)
+        orch_root = repo_root / "workspace" / "orchestrations" / orchestration_id
+        orch_root.mkdir(parents=True, exist_ok=True)
+        (orch_root / "orchestration_meta.json").write_text(
+            json.dumps(
+                {
+                    "orchestration_id": orchestration_id,
+                    "status": "running",
+                    "orchestration_agent_run_id": "orch_agent_run_003",
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+        child = "dangling-child-arid"
+        (orch_root / "active_child_agent_run_id.txt").write_text(child, encoding="utf-8")
+        (orch_root / "active_children").mkdir(exist_ok=True)
+        (orch_root / "active_children" / f"{child}.txt").write_text(child, encoding="utf-8")
+
+        observed_calls: list[list[str]] = []
+
+        def fake_runtime_command(root, env, args):  # type: ignore[no-untyped-def]
+            observed_calls.append(args)
+            if args[0] == "init":
+                return run_workflow.RuntimeResult(
+                    payload={"status": "ok", "orchestration_agent_run_id": "orch_agent_run_003"},
+                    raw_stdout="{}",
+                )
+            if args[0] == "preflight":
+                return run_workflow.RuntimeResult(
+                    payload={
+                        "status": "pass",
+                        "can_launch_step_agents": True,
+                        "can_launch_substep_agents": True,
+                    },
+                    raw_stdout="{}",
+                )
+            if args[0] == "set-status" and set_status_raises:
+                raise RuntimeError("simulated set-status failure")
+            return run_workflow.RuntimeResult(payload={"status": "ok"}, raw_stdout="{}")
+
+        def fake_subprocess_run(cmd, *a, **kw):  # type: ignore[no-untyped-def]
+            return subprocess.CompletedProcess(args=cmd, returncode=0)
+
+        original_runtime = run_workflow._runtime_command
+        original_run = run_workflow.subprocess.run
+        buf = io.StringIO()
+        try:
+            run_workflow._runtime_command = fake_runtime_command  # type: ignore[assignment]
+            run_workflow.subprocess.run = fake_subprocess_run  # type: ignore[assignment]
+            with redirect_stdout(buf):
+                code = run_workflow.main(
+                    [
+                        "spec/problem/test.md",
+                        "build",
+                        "--repo-root",
+                        str(repo_root),
+                        "--orchestration-id",
+                        orchestration_id,
+                    ]
+                )
+        finally:
+            run_workflow._runtime_command = original_runtime  # type: ignore[assignment]
+            run_workflow.subprocess.run = original_run  # type: ignore[assignment]
+        out = json.loads(buf.getvalue().strip().splitlines()[-1])
+        return code, out, observed_calls
+
+    def test_dangling_launch_clean_exit_terminalizes(self) -> None:
+        # Clean (returncode 0) exit but the child launch never returned: run_workflow
+        # must terminalize with reason_code launch_incomplete_active_child and report
+        # failure (NOT ok), and snapshot the incident.
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            code, out, calls = self._run_main_with_dangling_launch(
+                repo_root, set_status_raises=False
+            )
+            self.assertEqual(code, 2, out)
+            self.assertEqual(out["reason"], "workflow_failed")
+            self.assertEqual(out["workflow_status"], "fail")
+            incident_calls = [
+                c for c in calls
+                if c and c[0] == "set-status" and "launch_incomplete_active_child" in c
+            ]
+            self.assertEqual(len(incident_calls), 1, calls)
+            snapshots = list(
+                (repo_root / "workspace" / "orchestrations" / "orch_dangling").glob(
+                    "launch_incident.runtime.*.json"
+                )
+            )
+            self.assertEqual(len(snapshots), 1, "incident snapshot must be persisted")
+
+    def test_dangling_launch_clean_exit_still_fails_when_set_status_raises(self) -> None:
+        # P2 regression: even if BOTH terminalize set-status calls fail, a detected
+        # dangling launch must not be reported as ok. launch_incident_detected forces
+        # the failure path despite returncode 0 + non-terminal workflow_status.
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            code, out, calls = self._run_main_with_dangling_launch(
+                repo_root, set_status_raises=True
+            )
+            self.assertEqual(code, 2, out)
+            self.assertEqual(out["reason"], "workflow_failed")
+            self.assertNotEqual(out.get("status"), "ok")
+            # The degraded fallback must preserve the dangling-launch reason, not
+            # downgrade to the generic returncode reason (P3).
+            status_calls = [c for c in calls if c and c[0] == "set-status"]
+            self.assertTrue(status_calls)
+            for c in status_calls:
+                self.assertEqual(c[c.index("--reason-code") + 1], "launch_incomplete_active_child")
+            self.assertFalse(
+                any("llm_launch_interrupted" in c for c in status_calls), calls
+            )
 
     def test_recorded_pass_meta_overrides_nonzero_cli_returncode(self) -> None:
         # The orchestration agent recorded a terminal pass, but the launched CLI

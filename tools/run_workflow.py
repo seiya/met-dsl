@@ -39,6 +39,10 @@ except ModuleNotFoundError:  # pragma: no cover - direct CLI execution
     # Re-probe so the in-function imports later in main() succeed.
     from tools import validate_pipeline_semantics as _probe  # noqa: F401
 
+# Post-mortem diagnostics for an incomplete (dangling) child launch. Imported
+# after the path bootstrap above so `tools` is importable under direct CLI run.
+from tools.orchestration_diagnostics import build_launch_incident
+
 SUPPORTED_LLMS = ("codex", "cursor", "claude")
 SUPPORTED_WORKFLOW_MODES = ("dev", "prod")
 # Applied when --llm / --mode are omitted on a non-resume run. Kept as the
@@ -400,6 +404,14 @@ def _collect_failure_analysis(repo_root: Path, orchestration_id: str) -> dict[st
         if isinstance(agent_summary_ref, str) and agent_summary_ref.strip():
             agent_summary_tail = _tail_text(repo_root / agent_summary_ref.strip())
 
+    # Surface any dangling-launch incident snapshot (written at incident time by the
+    # synchronous-launch capture in main()) so failure_analysis links to it. Globbed
+    # rather than threaded through a parameter so it also resolves on resume / re-collect.
+    launch_incident_refs = [
+        str(p.relative_to(repo_root))
+        for p in sorted(orch_root.glob("launch_incident.runtime.*.json"))
+    ]
+
     noncanonical_write_violations = _collect_noncanonical_write_violations(repo_root, orchestration_id)
     unauthorized_write_violations = _collect_unauthorized_write_violations(repo_root, orchestration_id)
     write_contract_violations = [*noncanonical_write_violations, *unauthorized_write_violations]
@@ -436,6 +448,7 @@ def _collect_failure_analysis(repo_root: Path, orchestration_id: str) -> dict[st
         "recommended_retry_decisions": recommended_retry_decisions,
         "launch_reply_tail": launch_reply_tail,
         "agent_summary_tail": agent_summary_tail,
+        "launch_incident_refs": launch_incident_refs,
     }
 
 
@@ -486,6 +499,10 @@ def _is_valid_failure_analysis(
         "recommended_retry_decisions",
         "launch_reply_tail",
         "agent_summary_tail",
+        # In the degraded dangling-launch path (both terminalize set-status calls
+        # failed), the dangling child has no terminal agent_runs row and meta carries
+        # no reason_code/detail, so the incident snapshot ref is the only evidence.
+        "launch_incident_refs",
     )
     has_evidence = any(
         obj.get(f) not in (None, "", []) for f in evidence_fields
@@ -1246,6 +1263,74 @@ def main(argv: list[str] | None = None) -> int:
             )
             if isinstance(meta_after_launch, dict):
                 workflow_status = str(meta_after_launch.get("status") or "running")
+            # Capture an incomplete (dangling) child launch. record-launch opened the
+            # active_child window but the child never returned (hang/interrupt), and the
+            # host process may still have exited cleanly (returncode 0 — orchestration
+            # agent ended its turn with an "I've paused" message). The returncode!=0
+            # terminalize below would miss that, silently leaving the orchestration
+            # "running" with no in-repo record of WHY. Detect it here (returncode-agnostic),
+            # snapshot the decisive — and ephemeral — ~/.claude transcript tail in-repo, and
+            # terminalize so `--resume` can recover it. The snapshot uses the runtime-owned
+            # `launch_incident.runtime.<uuid12>.json` name exempted in
+            # orchestration_runtime._should_ignore_runtime_snapshot_path so it is not
+            # misattributed as an unauthorized child write in the terminal diff.
+            launch_incident_ref: str | None = None
+            launch_incident_detected = False
+            try:
+                launch_incident = build_launch_incident(repo_root, orchestration_id)
+            except Exception:  # noqa: BLE001 - diagnostics must never break the run
+                launch_incident = None
+            if launch_incident is not None:
+                launch_incident_detected = True
+                orch_dir = repo_root / "workspace" / "orchestrations" / orchestration_id
+                snapshot_path = orch_dir / f"launch_incident.runtime.{uuid.uuid4().hex[:12]}.json"
+                try:
+                    if _atomic_write_json_exclusive(snapshot_path, launch_incident, tmp_dir=orch_dir):
+                        launch_incident_ref = str(snapshot_path.relative_to(repo_root))
+                except Exception:  # noqa: BLE001 - best-effort snapshot; never block the run
+                    launch_incident_ref = None
+                if workflow_status.lower() not in _RESUMABLE_TERMINAL_STATUSES:
+                    child = launch_incident.get("dangling_child", {})
+                    abort = launch_incident.get("abort_marker") or {}
+                    detail = (
+                        "child launch did not return (active_child window left open): "
+                        f"child={child.get('agent_run_id')} "
+                        f"step={child.get('step')}/{child.get('substep')} "
+                        f"launch_recorded_at={child.get('launch_recorded_at')} "
+                        f"elapsed={child.get('elapsed_seconds')}s "
+                        f"last_activity={abort.get('last_activity_ts')} "
+                        f"dead_air={abort.get('dead_air_seconds')}s "
+                        f"abort={abort.get('interrupt_text')}"
+                    )
+                    if launch_incident_ref:
+                        detail += f" incident_ref={launch_incident_ref}"
+                    try:
+                        _runtime_command(
+                            repo_root,
+                            env,
+                            [
+                                "set-status",
+                                "--repo-root",
+                                str(repo_root),
+                                "--orchestration-id",
+                                orchestration_id,
+                                "--status",
+                                "fail",
+                                "--reason-code",
+                                "launch_incomplete_active_child",
+                                "--reason-detail",
+                                detail,
+                                "--blocking-policy-scope",
+                                "launch",
+                            ],
+                        )
+                        workflow_status = "fail"
+                    except RuntimeError:
+                        # set-status failed: leave workflow_status as-is. The failure
+                        # path below is still entered via launch_incident_detected (NOT
+                        # via workflow_status, which is still non-terminal here), and its
+                        # own set-status retry re-attempts terminalization as a fallback.
+                        pass
             # The orchestration agent records meta.status="pass" via the gated set-status
             # only after aggregate_verdict=pass and the pre_judge gate. That recorded
             # terminal success is authoritative over a transport-induced nonzero CLI
@@ -1297,6 +1382,7 @@ def main(argv: list[str] | None = None) -> int:
                 not meta_status_is_pass
                 and (
                     proc.returncode != 0
+                    or launch_incident_detected
                     or workflow_status.lower() in {
                         "fail",
                         "fail_closed",
@@ -1317,6 +1403,25 @@ def main(argv: list[str] | None = None) -> int:
                 # set-status raises. Runs before failure-analysis collection so the
                 # reason is reflected in meta.reason_code/reason_detail.
                 if workflow_status.lower() not in _RESUMABLE_TERMINAL_STATUSES:
+                    # Preserve the specific dangling-launch signal when this fallback
+                    # is reached because the dedicated launch_incomplete_active_child
+                    # set-status above raised — otherwise resume diagnostics would
+                    # degrade to the generic returncode reason.
+                    if launch_incident_detected:
+                        fallback_reason_code = "launch_incomplete_active_child"
+                        fallback_reason_detail = (
+                            "child launch did not return (active_child window left open); "
+                            "dedicated terminalization failed, recovered via launch fallback "
+                            f"(returncode={proc.returncode}, status '{workflow_status}')"
+                        )
+                    else:
+                        fallback_reason_code = "llm_launch_interrupted"
+                        fallback_reason_detail = (
+                            "LLM launch process exited (returncode="
+                            f"{proc.returncode}) without the orchestration agent "
+                            "recording a terminal status; orchestration left non-terminal "
+                            f"'{workflow_status}'"
+                        )
                     try:
                         _runtime_command(
                             repo_root,
@@ -1330,14 +1435,9 @@ def main(argv: list[str] | None = None) -> int:
                                 "--status",
                                 "fail",
                                 "--reason-code",
-                                "llm_launch_interrupted",
+                                fallback_reason_code,
                                 "--reason-detail",
-                                (
-                                    "LLM launch process exited (returncode="
-                                    f"{proc.returncode}) without the orchestration agent "
-                                    "recording a terminal status; orchestration left non-terminal "
-                                    f"'{workflow_status}'"
-                                ),
+                                fallback_reason_detail,
                                 "--blocking-policy-scope",
                                 "launch",
                             ],

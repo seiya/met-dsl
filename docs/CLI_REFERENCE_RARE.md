@@ -45,5 +45,6 @@ The argparse output includes the description / the help string of all arguments,
 ## Links to exception recovery flows
 
 - the use condition of `record-timeout`'s `--force-reason`: `docs/RUNBOOK.md#substep-timeout-recovery`
+- the recovery for an incomplete launch (dangling active_child window / `reason_code=launch_incomplete_active_child`), and reading the `launch_incident.runtime.*.json` diagnostics snapshot via `python3 tools/audit_orchestration.py --orchestration-id <id>` ("Dangling launch" section): `docs/RUNBOOK.md#launch-incomplete-recovery`
 - the response when `verify-checkpoint-integrity` detects `stale`: the relevant section of `docs/RUNBOOK.md`
 - the whole resume flow including `check-step-completed`: `skills/workflow-orchestration/SKILL.md` Operations Rule 19

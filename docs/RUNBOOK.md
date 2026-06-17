@@ -321,3 +321,31 @@ After the calls, the orchestration agent subsequently calls `set-status --status
 ### Escape hatch for a wedged child
 
 Only when `record-child-return` cannot be written because the Agent tool process is in an abnormal state where it can observe no return at all, the marker check can be bypassed with `record-timeout --force-reason "<operator override content>"`. Prioritize the normal flow, and use it as a last resort.
+
+## Incomplete launch recovery (dangling active_child window) {#launch-incomplete-recovery}
+
+Distinct from the substep-timeout case above (where the orchestration agent is still alive and finalizes the child itself): here the **host LLM process itself exits** while a child launch is mid-flight. `record-launch` opened the active_child window — the backend-neutral per-arid marker `active_children/<arid>.txt` is written for **all** backends (Claude additionally writes the sequential pointer `active_child_agent_run_id.txt`) — but the child hung or was interrupted before returning, so there is no `child_returns/<arid>.txt` and no terminal `agent_runs.jsonl` row for `<arid>`. The host can even exit cleanly (returncode 0 — e.g. the Claude orchestration agent ends its turn with an "I've paused" message), which the returncode-based failure path would otherwise miss, leaving the orchestration silently `running`. Detection keys off the backend-neutral marker, so it covers Codex/Cursor as well as Claude (the `~/.claude` transcript correlation below is Claude-specific; for other backends the in-repo dangling-child facts are still captured).
+
+`tools/run_workflow.py` now detects this when the synchronous launch subprocess returns and:
+
+- terminalizes the orchestration with `set-status --status fail --reason-code launch_incomplete_active_child` (so `--resume` can recover it; a non-terminal `running` is otherwise refused by implicit resume — see §3-1), and
+- writes a one-shot diagnostics snapshot **`workspace/orchestrations/<id>/launch_incident.runtime.<uuid12>.json`** capturing the dangling child (arid / step / substep / `launch_recorded_at` / elapsed) and the **decisive, otherwise-ephemeral** child subagent transcript tail correlated from `~/.claude` (`last_activity_ts`, last `tool_use`, `dead_air_seconds`, and the interrupt/abort marker). `failure_analysis.json#launch_incident_refs` links to it.
+
+To diagnose (now or later, even after `~/.claude` cleanup removes the live transcript):
+
+```bash
+python3 tools/audit_orchestration.py --orchestration-id <orchestration_id>
+# → "## Dangling launch (active_child window)" section: which child, when launched,
+#   last activity, dead-air seconds, and the abort marker.
+```
+
+`audit_orchestration.py` reproduces the same correlation on demand from in-repo artifacts plus the `~/.claude` transcript when still present; when the transcript has been cleaned it degrades to the in-repo facts and points at the captured `launch_incident.runtime.*.json`.
+
+Recovery is the normal `python3 tools/run_workflow.py --resume --orchestration-id <orchestration_id>` (§3-1): the completed substeps are skipped and the dangling substep is re-launched. As part of the terminal→`running` reset (`enable_checkpoint_resume`), `--resume` reconciles the artifacts the dead host left behind for the abandoned launch:
+
+1. **Stale active_child markers** (`active_child_agent_run_id.txt` / `active_children/<arid>.txt`, with no `deactivate-child` having run) are cleared (logged as `resume_cleared_stale_active_child`) — without this the resumed agent's `record-launch` would be rejected by the Claude-backend sequential-child check while the stale pointer persists.
+2. **Orphan `agent_graph.json` edges** — `record_launch` writes the parent→child edge before the marker, so the abandoned child has a graph edge but never a terminal `agent_runs.jsonl` row. Such edges are pruned (logged as `resume_pruned_orphan_graph_edges`) — without this the resumed run's eventual `set-status pass` is rejected by `_validate_orchestration_completion_for_pass` with `agent_graph edge child_agent_run_id missing from agent_runs.jsonl`. Pruning is scoped to genuine abandonment on both sides. An edge is removed only when its child (a) **was** genuinely launched — proven by a durable `launches/<arid>.request.json` (the same `is_owner_via_launch` signal) — **and** (b) has **no** evidence of reaching/returning from a run: it is in none of `agent_runs.jsonl`, any `step_result.json` reference, `agent_runs_invalid.jsonl`, or a `child_returns/<arid>.txt` ack. So an arbitrarily-corrupted edge whose child was never launched (no request artifact) is **kept** and still rejected by validation; and a child that completed (step_result-referenced) but lost its run row, one diverted to `agent_runs_invalid.jsonl` (sandbox / session-id failure), or one that already returned (`child_returns` ack) all keep their edge too. Only a launch interrupted **before** the Agent tool returned — launched, but no ack and no run/invalid record — is pruned, which is exactly the dangling-launch case. The launch artifacts (`launches/<arid>.*`, the incident snapshot) are kept for forensics; only the spurious edge is removed.
+
+3. **Stale `child_running` phase state** — `record_launch` sets the node/step to `child_running`, which the phase gates (`apply-patch`, the MCP phase gate, `run-gate`) treat as authorization for child work. The abandoned launch leaves it there even after the marker is cleared, so any such node/step is reset to `not_started` (logged as `resume_reset_stale_child_running`) to drop the dead child's lingering phase authority; the re-launch transitions it back to `child_running` for the real new child.
+
+All three reconciliations are scoped to the terminal-reset path, so a genuinely-running orchestration's live markers / edges / phase state are never touched.

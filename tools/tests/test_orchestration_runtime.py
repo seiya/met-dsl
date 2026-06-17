@@ -3077,6 +3077,360 @@ shell_tool                       stable             true
             self.assertIn("finished_at", _orch_row())
             self.assertEqual(_session_orch_status(), "fail_closed")
 
+    def test_resume_clears_stale_active_child_markers(self) -> None:
+        """A host that died mid-launch leaves the active_child window open. Resuming
+        a TERMINAL orchestration must clear `active_child_agent_run_id.txt` and the
+        per-arid `active_children/<arid>.txt` markers, else the resumed agent's first
+        Claude record-launch hits the sequential-child check and recovery is wedged
+        (Codex P1: launch_incomplete_active_child recovery)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            oid = "orch_resume_active_child"
+            init_orchestration(repo_root=repo_root, orchestration_id=oid)
+            root = repo_root / "workspace" / "orchestrations" / oid
+            child = "f00d83b5-bfbf-4c0b-8e78-95da6bf6ba5e"
+            (root / "active_child_agent_run_id.txt").write_text(child, encoding="utf-8")
+            markers = root / "active_children"
+            markers.mkdir(exist_ok=True)
+            (markers / f"{child}.txt").write_text(child, encoding="utf-8")
+
+            # Terminalize (a dangling launch is terminalized to fail by run_workflow).
+            update_orchestration_status(
+                repo_root=repo_root,
+                orchestration_id=oid,
+                status="fail",
+                reason_code="launch_incomplete_active_child",
+                reason_detail="child launch did not return",
+            )
+
+            enable_checkpoint_resume(repo_root, oid)
+
+            self.assertFalse((root / "active_child_agent_run_id.txt").exists())
+            self.assertFalse((markers / f"{child}.txt").exists())
+            log_events = [
+                json.loads(line)
+                for line in (root / "phase_state_log.jsonl").read_text().splitlines()
+                if line.strip()
+            ]
+            cleared = [e for e in log_events if e.get("event") == "resume_cleared_stale_active_child"]
+            self.assertEqual(len(cleared), 1)
+            self.assertEqual(cleared[0].get("cleared_active_child_arids"), [child])
+
+    def test_resume_prunes_orphan_agent_graph_edge(self) -> None:
+        """The abandoned child's agent_graph edge (written by record_launch before the
+        marker) has no terminal agent_runs row. Resuming a TERMINAL orchestration must
+        prune that orphan edge, else the resumed run's set-status pass is rejected by
+        _validate_orchestration_completion_for_pass (Codex P1). A valid edge whose child
+        has a run row must be kept."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            oid = "orch_resume_orphan_edge"
+            init_orchestration(repo_root=repo_root, orchestration_id=oid)
+            root = repo_root / "workspace" / "orchestrations" / oid
+            orch_arid = json.loads(
+                (root / "orchestration_meta.json").read_text(encoding="utf-8")
+            )["orchestration_agent_run_id"]
+            good_child = "good-child-arid"
+            dangling = "f00d83b5-dangling"
+            # The dangling child was genuinely launched (record_launch wrote its
+            # launches/<arid>.request.json) — the scope signal for pruning.
+            (root / "launches").mkdir(exist_ok=True)
+            (root / "launches" / f"{dangling}.request.json").write_text("{}", encoding="utf-8")
+            # A real terminal run only for the good child.
+            with (root / "agent_runs.jsonl").open("a", encoding="utf-8") as f:
+                f.write(
+                    json.dumps(
+                        {"agent_run_id": good_child, "agent_role": "substep",
+                         "status": "pass", "finished_at": "2026-06-16T12:40:00Z"}
+                    )
+                    + "\n"
+                )
+            (root / "agent_graph.json").write_text(
+                json.dumps(
+                    {
+                        "edges": [
+                            {"parent_agent_run_id": orch_arid, "child_agent_run_id": good_child,
+                             "relation_type": "launch"},
+                            {"parent_agent_run_id": orch_arid, "child_agent_run_id": dangling,
+                             "relation_type": "launch"},
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            update_orchestration_status(
+                repo_root=repo_root,
+                orchestration_id=oid,
+                status="fail",
+                reason_code="launch_incomplete_active_child",
+                reason_detail="child launch did not return",
+            )
+            enable_checkpoint_resume(repo_root, oid)
+
+            edges = json.loads((root / "agent_graph.json").read_text(encoding="utf-8"))["edges"]
+            children = [e["child_agent_run_id"] for e in edges]
+            self.assertIn(good_child, children)
+            self.assertNotIn(dangling, children)
+            log_events = [
+                json.loads(line)
+                for line in (root / "phase_state_log.jsonl").read_text().splitlines()
+                if line.strip()
+            ]
+            pruned = [e for e in log_events if e.get("event") == "resume_pruned_orphan_graph_edges"]
+            self.assertEqual(len(pruned), 1)
+            self.assertEqual(pruned[0].get("pruned_child_agent_run_ids"), [dangling])
+
+    def test_resume_keeps_orphan_edge_for_step_result_referenced_child(self) -> None:
+        """A child referenced by a step_result.json but missing its agent_runs row is
+        durable corruption / lost provenance, NOT an abandoned launch. Its edge must
+        be KEPT so _validate_orchestration_completion_for_pass still rejects it — the
+        prune must not hide it (Codex P2 scope)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            oid = "orch_resume_keep_corrupt"
+            init_orchestration(repo_root=repo_root, orchestration_id=oid)
+            root = repo_root / "workspace" / "orchestrations" / oid
+            orch_arid = json.loads(
+                (root / "orchestration_meta.json").read_text(encoding="utf-8")
+            )["orchestration_agent_run_id"]
+            completed_child = "completed-but-no-row"
+            # A step_result vouches for the child as completed, but there is NO
+            # agent_runs row for it (corruption).
+            sr_dir = root / "steps" / "component__x__0.1.0" / "compile" / "step-exec"
+            sr_dir.mkdir(parents=True, exist_ok=True)
+            (sr_dir / "step_result.json").write_text(
+                json.dumps(
+                    {
+                        "executor_agent_run_id": "step-exec",
+                        "substep_agent_run_ids": [completed_child],
+                        "status": "pass",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (root / "agent_graph.json").write_text(
+                json.dumps(
+                    {
+                        "edges": [
+                            {"parent_agent_run_id": orch_arid,
+                             "child_agent_run_id": completed_child, "relation_type": "launch"},
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            update_orchestration_status(
+                repo_root=repo_root, orchestration_id=oid, status="fail",
+                reason_code="launch_incomplete_active_child", reason_detail="x",
+            )
+            enable_checkpoint_resume(repo_root, oid)
+
+            edges = json.loads((root / "agent_graph.json").read_text(encoding="utf-8"))["edges"]
+            children = [e["child_agent_run_id"] for e in edges]
+            self.assertIn(completed_child, children, "step_result-referenced orphan must be kept")
+
+    def test_resume_keeps_corrupt_edge_for_never_launched_child(self) -> None:
+        """A graph edge whose child was never launched (no launches/<arid>.request.json)
+        is arbitrary graph corruption, not an abandoned launch. Pruning must NOT remove
+        it, so _validate_orchestration_completion_for_pass still rejects the corruption
+        instead of a resumed run silently passing (Codex P2 scope)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            oid = "orch_resume_corrupt_edge"
+            init_orchestration(repo_root=repo_root, orchestration_id=oid)
+            root = repo_root / "workspace" / "orchestrations" / oid
+            orch_arid = json.loads(
+                (root / "orchestration_meta.json").read_text(encoding="utf-8")
+            )["orchestration_agent_run_id"]
+            never_launched = "bogus-corrupt-child"  # NO launches/<arid>.request.json
+            (root / "agent_graph.json").write_text(
+                json.dumps(
+                    {"edges": [{"parent_agent_run_id": orch_arid,
+                                "child_agent_run_id": never_launched, "relation_type": "launch"}]}
+                ),
+                encoding="utf-8",
+            )
+            update_orchestration_status(
+                repo_root=repo_root, orchestration_id=oid, status="fail",
+                reason_code="some_unrelated_failure", reason_detail="x",
+            )
+            enable_checkpoint_resume(repo_root, oid)
+            edges = json.loads((root / "agent_graph.json").read_text(encoding="utf-8"))["edges"]
+            self.assertIn(never_launched, [e["child_agent_run_id"] for e in edges])
+
+    def test_resume_keeps_orphan_edge_for_invalid_run_child(self) -> None:
+        """A child diverted to agent_runs_invalid.jsonl (terminal-payload validation
+        failure) has no agent_runs.jsonl row and usually no step_result reference, but
+        it DID reach record-agent-run. Its edge must be KEPT so pass-validation still
+        surfaces the invalid terminal attempt (Codex P2)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            oid = "orch_resume_invalid_run"
+            init_orchestration(repo_root=repo_root, orchestration_id=oid)
+            root = repo_root / "workspace" / "orchestrations" / oid
+            orch_arid = json.loads(
+                (root / "orchestration_meta.json").read_text(encoding="utf-8")
+            )["orchestration_agent_run_id"]
+            invalid_child = "child-diverted-to-invalid"
+            (root / "agent_runs_invalid.jsonl").write_text(
+                json.dumps(
+                    {"agent_run_id": invalid_child, "status": "fail",
+                     "fail_reason": "sandbox_enforcement_violation"}
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            (root / "agent_graph.json").write_text(
+                json.dumps(
+                    {
+                        "edges": [
+                            {"parent_agent_run_id": orch_arid,
+                             "child_agent_run_id": invalid_child, "relation_type": "launch"},
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            update_orchestration_status(
+                repo_root=repo_root, orchestration_id=oid, status="fail",
+                reason_code="launch_incomplete_active_child", reason_detail="x",
+            )
+            enable_checkpoint_resume(repo_root, oid)
+
+            edges = json.loads((root / "agent_graph.json").read_text(encoding="utf-8"))["edges"]
+            children = [e["child_agent_run_id"] for e in edges]
+            self.assertIn(invalid_child, children, "invalid-run child edge must be kept")
+
+    def test_resume_keeps_orphan_edge_for_returned_child(self) -> None:
+        """A child with a child_returns/<arid>.txt ack already RETURNED from the Agent
+        tool; a missing agent_runs row is then incomplete finalization / corruption,
+        not an abandoned launch. Its edge must be KEPT (Codex P2). The genuine dangling
+        case has no ack, so it stays prunable."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            oid = "orch_resume_returned_child"
+            init_orchestration(repo_root=repo_root, orchestration_id=oid)
+            root = repo_root / "workspace" / "orchestrations" / oid
+            orch_arid = json.loads(
+                (root / "orchestration_meta.json").read_text(encoding="utf-8")
+            )["orchestration_agent_run_id"]
+            returned = "child-returned-no-row"
+            (root / "child_returns").mkdir(exist_ok=True)
+            (root / "child_returns" / f"{returned}.txt").write_text("ack", encoding="utf-8")
+            (root / "agent_graph.json").write_text(
+                json.dumps(
+                    {"edges": [{"parent_agent_run_id": orch_arid,
+                                "child_agent_run_id": returned, "relation_type": "launch"}]}
+                ),
+                encoding="utf-8",
+            )
+            update_orchestration_status(
+                repo_root=repo_root, orchestration_id=oid, status="fail",
+                reason_code="launch_incomplete_active_child", reason_detail="x",
+            )
+            enable_checkpoint_resume(repo_root, oid)
+            edges = json.loads((root / "agent_graph.json").read_text(encoding="utf-8"))["edges"]
+            self.assertIn(returned, [e["child_agent_run_id"] for e in edges])
+
+    def test_resume_resets_stale_child_running_node_step(self) -> None:
+        """An abandoned launch leaves the node/step at `child_running`, which the phase
+        gates (apply-patch / MCP / run-gate) treat as authorization for child work.
+        A terminal-reset resume must reset it to `not_started` so the dead child's
+        capability is no longer phase-authorized (Codex P2)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            oid = "orch_resume_child_running"
+            init_orchestration(repo_root=repo_root, orchestration_id=oid)
+            root = repo_root / "workspace" / "orchestrations" / oid
+            node = "component__demo__0.1.0"
+            # Simulate record_launch having set compile -> child_running.
+            ps = json.loads((root / "phase_state.json").read_text(encoding="utf-8"))
+            ps["node_states"] = {
+                node: {"compile": "child_running", "generate": "not_started",
+                       "build": "not_started", "validate": "not_started"}
+            }
+            (root / "phase_state.json").write_text(json.dumps(ps), encoding="utf-8")
+
+            update_orchestration_status(
+                repo_root=repo_root, orchestration_id=oid, status="fail",
+                reason_code="launch_incomplete_active_child", reason_detail="x",
+            )
+            enable_checkpoint_resume(repo_root, oid)
+
+            after = json.loads((root / "phase_state.json").read_text(encoding="utf-8"))
+            self.assertEqual(after["node_states"][node]["compile"], "not_started")
+            log_events = [
+                json.loads(line)
+                for line in (root / "phase_state_log.jsonl").read_text().splitlines()
+                if line.strip()
+            ]
+            reset = [e for e in log_events if e.get("event") == "resume_reset_stale_child_running"]
+            self.assertEqual(len(reset), 1)
+            self.assertEqual(
+                reset[0]["reset_node_steps"], [{"node_key_safe": node, "step": "compile"}]
+            )
+
+    def test_resume_survives_malformed_step_result_during_prune(self) -> None:
+        """A malformed/partial step_result.json must not abort checkpoint resume during
+        orphan-edge pruning — resume is the recovery path for exactly such corrupt runs
+        (Codex P2). The dangling orphan edge is still pruned."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            oid = "orch_resume_bad_step_result"
+            init_orchestration(repo_root=repo_root, orchestration_id=oid)
+            root = repo_root / "workspace" / "orchestrations" / oid
+            orch_arid = json.loads(
+                (root / "orchestration_meta.json").read_text(encoding="utf-8")
+            )["orchestration_agent_run_id"]
+            # A corrupt step_result.json that _read_json would choke on.
+            sr_dir = root / "steps" / "component__x__0.1.0" / "compile" / "step-exec"
+            sr_dir.mkdir(parents=True, exist_ok=True)
+            (sr_dir / "step_result.json").write_text("{ this is not json", encoding="utf-8")
+            dangling = "dangling-orphan"
+            (root / "launches").mkdir(exist_ok=True)
+            (root / "launches" / f"{dangling}.request.json").write_text("{}", encoding="utf-8")
+            (root / "agent_graph.json").write_text(
+                json.dumps(
+                    {"edges": [{"parent_agent_run_id": orch_arid,
+                                "child_agent_run_id": dangling, "relation_type": "launch"}]}
+                ),
+                encoding="utf-8",
+            )
+            update_orchestration_status(
+                repo_root=repo_root, orchestration_id=oid, status="fail",
+                reason_code="launch_incomplete_active_child", reason_detail="x",
+            )
+            # Must not raise.
+            meta = enable_checkpoint_resume(repo_root, oid)
+            self.assertEqual(meta["status"], "running")
+            edges = json.loads((root / "agent_graph.json").read_text(encoding="utf-8"))["edges"]
+            self.assertNotIn(dangling, [e["child_agent_run_id"] for e in edges])
+
+    def test_resume_of_running_orchestration_keeps_active_child_markers(self) -> None:
+        """A non-terminal (`running`) resume must NOT clear active-child markers: the
+        child may be genuinely live, and clobbering its liveness guard could let a
+        concurrent record-timeout wipe live scratch. Clearing is scoped to the
+        terminal-reset path only."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            oid = "orch_resume_running"
+            init_orchestration(repo_root=repo_root, orchestration_id=oid)
+            root = repo_root / "workspace" / "orchestrations" / oid
+            child = "live-child-arid"
+            (root / "active_child_agent_run_id.txt").write_text(child, encoding="utf-8")
+            markers = root / "active_children"
+            markers.mkdir(exist_ok=True)
+            (markers / f"{child}.txt").write_text(child, encoding="utf-8")
+
+            # init leaves status non-terminal (running) → terminal_reset is False.
+            enable_checkpoint_resume(repo_root, oid)
+
+            self.assertTrue((root / "active_child_agent_run_id.txt").exists())
+            self.assertTrue((markers / f"{child}.txt").exists())
+
     def test_resume_row_reset_is_recoverable_on_interrupt(self) -> None:
         """The agent_runs row reset runs BEFORE the meta is committed to `running`,
         so an interrupted reset keeps meta terminal on disk; a retry re-enters the
@@ -22611,6 +22965,31 @@ class FailureAnalysisRuntimeSidecarExemptionTests(unittest.TestCase):
         self.assertFalse(
             _should_ignore_runtime_snapshot_path(
                 f"{base}/failure_analysis.runtime.deadbeef.json", **kwargs
+            )
+        )
+
+    def test_should_ignore_classifies_launch_incident_runtime_sidecar(self) -> None:
+        from tools.orchestration_runtime import _should_ignore_runtime_snapshot_path
+
+        orch_id = "orch_001"
+        base = f"workspace/orchestrations/{orch_id}"
+        kwargs = {"orchestration_id": orch_id, "agent_run_id": "child_arid"}
+
+        # UUID-suffixed launch_incident runtime sidecar → exempt.
+        self.assertTrue(
+            _should_ignore_runtime_snapshot_path(
+                f"{base}/launch_incident.runtime.abc123abc123.json", **kwargs
+            )
+        )
+        # Non-conforming slug must NOT be blanket-exempt.
+        self.assertFalse(
+            _should_ignore_runtime_snapshot_path(
+                f"{base}/launch_incident.runtime.NOTHEX12345.json", **kwargs
+            )
+        )
+        self.assertFalse(
+            _should_ignore_runtime_snapshot_path(
+                f"{base}/launch_incident.json", **kwargs
             )
         )
 

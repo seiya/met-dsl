@@ -547,5 +547,63 @@ class AuditIntegrationTests(unittest.TestCase):
         self.assertIn("run_bad", result["invalid_run_ids"])
 
 
+class LaunchIncidentSnapshotTests(unittest.TestCase):
+    def test_audit_surfaces_persisted_snapshot_after_window_cleared(self) -> None:
+        # P2: after --resume clears the active-child markers, live detection returns
+        # None, but a persisted launch_incident.runtime.*.json must still be surfaced
+        # so the documented later-diagnosis path works.
+        with tempfile.TemporaryDirectory() as tmp:
+            orch_id = "orch_snap"
+            orch_root = Path(tmp) / "workspace" / "orchestrations" / orch_id
+            orch_root.mkdir(parents=True)
+            # No active_child markers (window cleared) → live build returns None.
+            (orch_root / "launch_incident.runtime.0123456789ab.json").write_text(
+                json.dumps(
+                    {
+                        "schema": "launch_incident/v1",
+                        "orchestration_id": orch_id,
+                        "dangling_child": {
+                            "agent_run_id": "f00d83b5",
+                            "node_key_safe": "component__x__0.1.0",
+                            "step": "compile",
+                            "substep": "verify",
+                            "launch_recorded_at": "2026-06-16T12:36:58Z",
+                            "elapsed_seconds": 700.0,
+                        },
+                        "host_session_id": "b60f2e51",
+                        "transcripts": {"child_transcript": {"found": False, "reason": "cleaned"}},
+                        "abort_marker": {
+                            "interrupted": True,
+                            "interrupt_ts": "2026-06-16T12:48:47Z",
+                            "interrupt_text": "[Request interrupted by user]",
+                            "last_activity_ts": "2026-06-16T12:38:47Z",
+                            "dead_air_seconds": 600.0,
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            result = audit(Path(tmp), orch_id)
+            self.assertIsNone(result["launch_incident"])
+            self.assertEqual(len(result["launch_incident_snapshots"]), 1)
+            md = _render_markdown(result)
+        self.assertIn("Captured incident snapshots", md)
+        self.assertIn("launch_incident.runtime.0123456789ab.json", md)
+        # Decisive evidence from the snapshot's abort_marker is rendered even though
+        # the live transcript is gone.
+        self.assertIn("[Request interrupted by user]", md)
+        self.assertIn("600s", md)
+
+    def test_audit_reports_nothing_when_no_window_and_no_snapshot(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            orch_id = "orch_clean"
+            (Path(tmp) / "workspace" / "orchestrations" / orch_id).mkdir(parents=True)
+            result = audit(Path(tmp), orch_id)
+            self.assertIsNone(result["launch_incident"])
+            self.assertEqual(result["launch_incident_snapshots"], [])
+            md = _render_markdown(result)
+        self.assertIn("no captured incident snapshots", md)
+
+
 if __name__ == "__main__":
     unittest.main()

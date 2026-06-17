@@ -1577,6 +1577,202 @@ def _active_child_marker_path(repo_root: Path, orchestration_id: str, agent_run_
     return _active_children_dir(repo_root, orchestration_id) / f"{agent_run_id}.txt"
 
 
+def _clear_stale_active_child_markers(
+    repo_root: Path, orchestration_id: str
+) -> list[str]:
+    """Clear a stale active_child window left by a host that died mid-launch.
+
+    When the host process exits while a child launch is in flight (interrupted /
+    hung child, or a token-limit kill), no live orchestration agent runs
+    deactivate-child / record-timeout, so `active_child_agent_run_id.txt` and the
+    `active_children/<arid>.txt` markers persist. The Claude-backend sequential
+    check in `record_launch` then rejects the next launch, permanently wedging the
+    documented recovery (`launch_incomplete_active_child` / `llm_launch_interrupted`).
+
+    This is only safe to call when the orchestration is being reset from a TERMINAL
+    status — a terminal status proves no child is actually running, so the markers
+    are stale by definition. Removes the legacy active-child file and every per-arid
+    marker, returning the cleared arids for audit.
+    """
+    cleared: list[str] = []
+    active_path = _active_child_agent_run_id_path(repo_root, orchestration_id)
+    try:
+        pointed = active_path.read_text(encoding="utf-8").strip()
+    except OSError:
+        pointed = ""
+    if pointed:
+        cleared.append(pointed)
+    active_path.unlink(missing_ok=True)
+    markers_dir = _active_children_dir(repo_root, orchestration_id)
+    if markers_dir.is_dir():
+        for marker in sorted(markers_dir.glob("*.txt")):
+            arid = marker.stem
+            if arid and arid not in cleared:
+                cleared.append(arid)
+            marker.unlink(missing_ok=True)
+    return cleared
+
+
+def _prune_orphan_agent_graph_edges(
+    repo_root: Path, orchestration_id: str
+) -> list[str]:
+    """Remove agent_graph.json edges left by an ABANDONED child launch.
+
+    `record_launch` writes the parent→child graph edge BEFORE the active-child
+    marker, so a launch abandoned mid-flight (the dangling-launch case) leaves an
+    orphan edge with no terminal `agent_runs.jsonl` row for the child. On resume the
+    agent re-launches under a fresh agent_run_id (never reusing the abandoned one),
+    so that edge stays orphaned forever — and `_validate_orchestration_completion_for_pass`
+    rejects `set-status pass` with "agent_graph edge child_agent_run_id missing from
+    agent_runs.jsonl". Prune those orphan edges so the recovered run can reach pass.
+
+    Scope is deliberately narrow on BOTH sides so this does NOT hide unrelated
+    integrity problems. An edge is pruned only when its child:
+
+    (1) WAS genuinely launched via record_launch — proven by a durable
+        `launches/<child>.request.json` (the same `is_owner_via_launch` signal). This
+        excludes an arbitrarily-corrupted graph edge whose child_agent_run_id was never
+        launched: that edge has no launch artifact, so it is kept and
+        `_validate_orchestration_completion_for_pass` still rejects the corruption; AND
+
+    (2) appears in NONE of these "completed/attempted" sources:
+          - an `agent_runs.jsonl` row (terminalized normally);
+          - a `step_result.json` reference (executor_agent_run_id / substep_agent_run_ids)
+            — a child a step_result vouches for, whose missing run row is corruption;
+          - an `agent_runs_invalid.jsonl` row — a child diverted there by terminal-payload
+            validation (sandbox / session-id / output-manifest). It has no
+            `agent_runs.jsonl` row, but its edge must be kept so validation surfaces the
+            invalid terminal attempt;
+          - a `child_returns/<child>.txt` ack — the Agent tool already returned, so a
+            missing run row is lost finalization, not abandonment.
+
+    The remaining set — launched but with no record of returning/attempting to
+    terminalize — is exactly the abandoned dangling launch. Both criteria derive from
+    durable artifacts only, so this is idempotent and does not depend on the active-child
+    markers the resume reset clears just before this runs.
+
+    Only meaningful from the terminal-reset path (a terminal status proves no child
+    run is still pending a row). Launch artifacts (launches/<arid>.*, the incident
+    snapshot) are kept for forensics — only the spurious graph edge is removed.
+    Returns the pruned child arids.
+    """
+    root = _orchestration_root(repo_root, orchestration_id)
+    graph_path = root / "agent_graph.json"
+    if not graph_path.is_file():
+        return []
+    # A corrupt agent_graph.json must not abort resume (recovery is exactly for such
+    # runs); degrade to no-op pruning.
+    try:
+        graph = _load_graph(graph_path)
+    except (OSError, json.JSONDecodeError):
+        return []
+    edges = graph.get("edges")
+    if not isinstance(edges, list) or not edges:
+        return []
+
+    # Protection set: any child with evidence it reached (or completed) a run, in any
+    # form, must keep its edge so validation can still vouch for / reject it.
+    protected: set[str] = set(_load_run_records(root).keys())
+    for result_path in _iter_step_result_paths(root):
+        # A malformed / partially written step_result must NOT block resume — resume is
+        # the recovery path for exactly such failed/corrupt runs. Skip it: a corrupt
+        # step_result still makes _validate_orchestration_completion_for_pass reject the
+        # eventual set-status(pass), so no bad pass can slip through from skipping here.
+        try:
+            doc = _read_json(result_path)
+        except (OSError, json.JSONDecodeError):
+            continue
+        if not isinstance(doc, dict):
+            continue
+        executor = doc.get("executor_agent_run_id")
+        if isinstance(executor, str) and executor.strip():
+            protected.add(executor.strip())
+        substeps = doc.get("substep_agent_run_ids")
+        if isinstance(substeps, list):
+            for sub in substeps:
+                if isinstance(sub, str) and sub.strip():
+                    protected.add(sub.strip())
+    invalid_path = root / "agent_runs_invalid.jsonl"
+    if invalid_path.is_file():
+        try:
+            for line in invalid_path.read_text(encoding="utf-8").splitlines():
+                token = line.strip()
+                if not token:
+                    continue
+                try:
+                    rec = json.loads(token)
+                except json.JSONDecodeError:
+                    continue
+                rid = rec.get("agent_run_id") if isinstance(rec, dict) else None
+                if isinstance(rid, str) and rid.strip():
+                    protected.add(rid.strip())
+        except OSError:
+            pass
+    # A child_returns/<arid>.txt ack means the Agent tool already RETURNED for that
+    # child (record-child-return ran). A missing run row is then incomplete
+    # finalization / corruption, not an abandoned launch, so keep the edge for
+    # validation to surface. (The genuine dangling case — interrupted before the
+    # Agent tool returned — has no ack, so it stays prunable.)
+    returns_dir = _child_returns_dir(repo_root, orchestration_id)
+    if returns_dir.is_dir():
+        for ack in returns_dir.glob("*.txt"):
+            if ack.stem:
+                protected.add(ack.stem)
+
+    launches_dir = root / "launches"
+    kept: list[Any] = []
+    pruned: list[str] = []
+    for edge in edges:
+        child = edge.get("child_agent_run_id") if isinstance(edge, dict) else None
+        child_id = child.strip() if isinstance(child, str) and child.strip() else None
+        was_launched = (
+            child_id is not None and (launches_dir / f"{child_id}.request.json").is_file()
+        )
+        if child_id is not None and was_launched and child_id not in protected:
+            pruned.append(child_id)
+        else:
+            kept.append(edge)
+    if pruned:
+        graph["edges"] = kept
+        _write_json(graph_path, graph)
+    return pruned
+
+
+def _reset_stale_child_running_node_steps(
+    repo_root: Path, orchestration_id: str
+) -> list[dict[str, str]]:
+    """Reset any node/step left at `child_running` by an abandoned launch.
+
+    `record_launch` transitions the node/step to `child_running`; an abandoned launch
+    (host died mid-flight) leaves it there even after its active-child marker is
+    cleared. The phase gates authorize child work when the node/step is
+    `child_running` — apply-patch (`_phase_write_requires_child_running`), the MCP
+    phase gate, and `run-gate` — so a terminal-reset resume must drop that stale
+    authority, otherwise the abandoned child's capability stays phase-authorized and
+    agents reading phase_state still see the substep as running. A terminal status
+    proves no child is actually running, so any `child_running` node/step is stale →
+    reset to `not_started`; the resumed re-launch transitions it back to
+    `child_running` for the real new child. Returns the reset [{node_key_safe, step}].
+    """
+    doc = _load_phase_state(repo_root, orchestration_id)
+    if not isinstance(doc, dict):
+        return []
+    node_states = doc.get("node_states")
+    if not isinstance(node_states, dict):
+        return []
+    reset: list[dict[str, str]] = []
+    for node_safe, steps in node_states.items():
+        if not isinstance(steps, dict):
+            continue
+        for step_key, state in list(steps.items()):
+            if state == "child_running":
+                steps[step_key] = "not_started"
+                reset.append({"node_key_safe": str(node_safe), "step": str(step_key)})
+    if reset:
+        _write_phase_state(repo_root, orchestration_id, doc)
+    return reset
+
+
 def _runs_jsonl_lock_path(repo_root: Path, orchestration_id: str) -> Path:
     """Sidecar lock file used by Adv-24 to serialize concurrent finalizers.
 
@@ -5502,6 +5698,19 @@ def _should_ignore_runtime_snapshot_path(
         token,
     ):
         return True
+    # `launch_incident.runtime.<uuid12>.json` is written by run_workflow.py's
+    # synchronous-launch capture when it detects a dangling active_child window
+    # (a child launch that never returned). Same runtime-owned rationale as the
+    # failure_analysis sidecar above: emitted only by the outer run_workflow
+    # process, never by a child agent, and it can land while the dangling child's
+    # launch baseline is still captured — without this exemption it would surface
+    # in that child's terminal diff as an unauthorized_write_violation and dead-lock
+    # terminalization. Intentionally narrow: only the UUID-suffixed runtime sidecar.
+    if re.fullmatch(
+        rf"{re.escape(orch_root)}/launch_incident\.runtime\.[0-9a-f]{{12}}\.json",
+        token,
+    ):
+        return True
     runtime_files = {
         f"{orch_root}/agent_graph.json",
         f"{orch_root}/agent_runs.jsonl",
@@ -8342,6 +8551,24 @@ def enable_checkpoint_resume(
         # this is interrupted, a retry re-enters `terminal_reset` and re-runs it
         # (idempotent — the helper no-ops once the row is already `running`).
         _reopen_orchestration_run_row(repo_root, orchestration_id)
+        # A host that died mid-launch leaves the active_child window open (no live
+        # agent ran deactivate-child / record-timeout). The terminal status proves
+        # no child is actually running, so clear the stale markers here — otherwise
+        # the resumed agent's first record-launch hits the Claude-backend sequential
+        # check and is rejected, permanently wedging recovery for
+        # launch_incomplete_active_child / llm_launch_interrupted. Captured before the
+        # meta commit so a retry re-enters terminal_reset and re-runs it (idempotent).
+        cleared_active_child = _clear_stale_active_child_markers(repo_root, orchestration_id)
+        # The abandoned child's agent_graph edge was written by record_launch before
+        # the marker and never gets a terminal agent_runs row; prune it so the
+        # resumed run's eventual set-status(pass) is not rejected by the orphan-edge
+        # check in _validate_orchestration_completion_for_pass. Idempotent.
+        pruned_graph_children = _prune_orphan_agent_graph_edges(repo_root, orchestration_id)
+        # Drop stale `child_running` authority for the abandoned launch — the phase
+        # gates (apply-patch / MCP / run-gate) authorize child work on that state, and
+        # a terminal status proves no child is live. merge_phase_state_for_resume below
+        # preserves node_states, so this reset survives into the resumed run.
+        reset_child_running = _reset_stale_child_running_node_steps(repo_root, orchestration_id)
     _write_json(meta_path, meta)
     merge_phase_state_for_resume(repo_root, orchestration_id)
     if terminal_reset:
@@ -8356,6 +8583,43 @@ def enable_checkpoint_resume(
                 "note": "terminal status reset to running for checkpoint resume",
             },
         )
+        if pruned_graph_children:
+            _append_phase_state_log(
+                repo_root,
+                orchestration_id,
+                {
+                    "ts": _utc_now_iso(),
+                    "event": "resume_pruned_orphan_graph_edges",
+                    "note": "orphan agent_graph edges (no agent_runs row) pruned for checkpoint resume",
+                    "pruned_child_agent_run_ids": pruned_graph_children,
+                },
+            )
+        if cleared_active_child:
+            _append_phase_state_log(
+                repo_root,
+                orchestration_id,
+                {
+                    "ts": _utc_now_iso(),
+                    "event": "resume_cleared_stale_active_child",
+                    "from": "child_running",
+                    "to": "not_started",
+                    "note": "stale active_child markers cleared for checkpoint resume",
+                    "cleared_active_child_arids": cleared_active_child,
+                },
+            )
+        if reset_child_running:
+            _append_phase_state_log(
+                repo_root,
+                orchestration_id,
+                {
+                    "ts": _utc_now_iso(),
+                    "event": "resume_reset_stale_child_running",
+                    "from": "child_running",
+                    "to": "not_started",
+                    "note": "stale child_running node/step authority reset for checkpoint resume",
+                    "reset_node_steps": reset_child_running,
+                },
+            )
     return meta
 
 

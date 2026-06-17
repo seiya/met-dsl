@@ -10,6 +10,11 @@ Collects and aggregates:
 - Last 5 hook events before fail_closed
 - phase_state_log fail/fail_closed entries
 - agent_runs.jsonl completion status
+- Dangling launch (open active_child window with no child return / terminal run),
+  correlated with the ephemeral ~/.claude transcript tail (see
+  orchestration_diagnostics.build_launch_incident), AND any persisted
+  launch_incident.runtime.*.json snapshots (which survive after --resume clears the
+  window or ~/.claude cleanup removes the transcript)
 """
 from __future__ import annotations
 
@@ -20,6 +25,11 @@ from collections import Counter, defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+try:  # script run: sys.path[0] is tools/ ; package import: repo root on path
+    from orchestration_diagnostics import build_launch_incident
+except ImportError:  # pragma: no cover - import-path shim
+    from tools.orchestration_diagnostics import build_launch_incident
 
 
 def _load_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -61,6 +71,14 @@ def _load_jsonl_with_errors(path: Path) -> tuple[list[dict[str, Any]], list[dict
 
 def _orch_root(repo_root: Path, orchestration_id: str) -> Path:
     return repo_root / "workspace" / "orchestrations" / orchestration_id
+
+
+def _load_json_if_dict(path: Path) -> dict[str, Any] | None:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return payload if isinstance(payload, dict) else None
 
 
 _EXPECTED_BENIGN_POLICIES: frozenset[str] = frozenset({
@@ -344,6 +362,27 @@ def audit(repo_root: Path, orchestration_id: str) -> dict[str, Any]:
     parse_errors = hook_errs + phase_errs + runs_errs + inv_errs
     timeline = collect_fail_closed_timeline(hook_events, phase_log)
     unparseable_count = timeline.get("unparseable_timestamp_count", 0)
+    # Dangling launch (open active_child window with no child return / terminal
+    # run): reproduces the post-mortem of an interrupted/hung child launch and
+    # correlates the (ephemeral) ~/.claude transcript. None when the window is
+    # closed. Defensive: degrades to found=False rather than raising.
+    try:
+        launch_incident = build_launch_incident(repo_root, orchestration_id)
+    except Exception:  # noqa: BLE001 - diagnostics must never break the audit
+        launch_incident = None
+    # Persisted incident snapshots captured at run time. These survive after
+    # `--resume` clears the active-child markers (live detection then returns None)
+    # and after ~/.claude cleanup removes the transcript, so they are the durable
+    # diagnosis source for the documented later-analysis path. Surfaced even when
+    # the live window is closed.
+    launch_incident_snapshots: list[dict[str, Any]] = []
+    for snap_path in sorted(root.glob("launch_incident.runtime.*.json")):
+        doc = _load_json_if_dict(snap_path)
+        if doc is None:
+            continue
+        launch_incident_snapshots.append(
+            {"ref": str(snap_path.relative_to(repo_root)), "incident": doc}
+        )
 
     return {
         "orchestration_id": orchestration_id,
@@ -357,6 +396,8 @@ def audit(repo_root: Path, orchestration_id: str) -> dict[str, Any]:
         "allow_auto_approve_stats": collect_allow_auto_approve_stats(hook_events),
         "fix_hint_stats": collect_fix_hint_stats(substantive_blocks),
         "fail_closed_timeline": timeline,
+        "launch_incident": launch_incident,
+        "launch_incident_snapshots": launch_incident_snapshots,
         "agent_run_summary": collect_agent_run_summary(agent_runs, invalid_runs),
         "invalid_run_count": len(invalid_runs),
         "invalid_run_ids": [r.get("agent_run_id") for r in invalid_runs if r.get("agent_run_id")],
@@ -365,6 +406,110 @@ def audit(repo_root: Path, orchestration_id: str) -> dict[str, Any]:
         "parse_errors": parse_errors,
         "unparseable_timestamp_count": unparseable_count,
     }
+
+
+def _render_incident_body(incident: dict[str, Any], lines: list[str]) -> None:
+    """Render the decisive fields of one launch-incident dict (live or persisted)."""
+    child = incident.get("dangling_child", {})
+    lines.append("| field | value |")
+    lines.append("|---|---|")
+    lines.append(f"| child agent_run_id | `{child.get('agent_run_id')}` |")
+    lines.append(f"| node_key | `{child.get('node_key_safe')}` |")
+    lines.append(f"| step / substep | `{child.get('step')}` / `{child.get('substep')}` |")
+    lines.append(f"| launch_recorded_at | `{child.get('launch_recorded_at')}` |")
+    elapsed = child.get("elapsed_seconds")
+    lines.append(f"| elapsed since launch | {f'{elapsed:.0f}s' if isinstance(elapsed, (int, float)) else 'n/a'} |")
+    lines.append(f"| host_session_id | `{incident.get('host_session_id')}` |")
+    lines.append("")
+
+    transcripts = incident.get("transcripts", {})
+    ct = transcripts.get("child_transcript", {})
+    if ct.get("found"):
+        dead_air = ct.get("dead_air_seconds")
+        lines.append("Child subagent transcript (decisive evidence):")
+        lines.append("")
+        lines.append(f"- transcript: `{ct.get('path')}` (matched via `{ct.get('match_method')}`)")
+        lines.append(f"- last activity: `{ct.get('last_activity_ts')}` (event `{ct.get('last_event_type')}`)")
+        last_tool = ct.get("last_tool_use") or {}
+        if last_tool:
+            lines.append(f"- last tool_use: `{last_tool.get('name')}` — {last_tool.get('input_preview')}")
+        lines.append(
+            f"- dead-air before abort: "
+            f"{f'{dead_air:.0f}s' if isinstance(dead_air, (int, float)) else 'n/a'}"
+        )
+        if ct.get("interrupted"):
+            lines.append(
+                f"- abort marker: `{ct.get('interrupt_text')}` at `{ct.get('interrupt_ts')}`"
+            )
+    else:
+        # Live re-derivation: ~/.claude transcript ephemeral. A persisted snapshot
+        # (rendered from "Captured incident snapshots" below) keeps the evidence even
+        # then, since the decisive tail was copied in-repo at incident time.
+        abort = incident.get("abort_marker")
+        if isinstance(abort, dict) and abort:
+            dead_air = abort.get("dead_air_seconds")
+            lines.append("Child subagent transcript (decisive evidence, from snapshot):")
+            lines.append("")
+            lines.append(f"- last activity: `{abort.get('last_activity_ts')}`")
+            lines.append(
+                f"- dead-air before abort: "
+                f"{f'{dead_air:.0f}s' if isinstance(dead_air, (int, float)) else 'n/a'}"
+            )
+            if abort.get("interrupted"):
+                lines.append(
+                    f"- abort marker: `{abort.get('interrupt_text')}` at `{abort.get('interrupt_ts')}`"
+                )
+        else:
+            lines.append(
+                f"Child subagent transcript not available: {ct.get('reason', 'unknown')} "
+                "(~/.claude transcripts are machine-local and ephemeral)."
+            )
+    lines.append("")
+
+
+def _render_launch_incident(
+    incident: dict[str, Any] | None,
+    snapshots: list[dict[str, Any]] | None,
+    lines: list[str],
+) -> None:
+    """Render the dangling-launch section: live window and/or persisted snapshots."""
+    snapshots = snapshots or []
+    lines.append("## Dangling launch (active_child window)")
+    lines.append("")
+
+    if incident:
+        lines.append(
+            "An open active_child window was found with no child return / terminal "
+            "agent_runs row — the child launch never completed."
+        )
+        lines.append("")
+        _render_incident_body(incident, lines)
+    elif not snapshots:
+        lines.append(
+            "No dangling active_child window detected and no captured incident snapshots."
+        )
+        lines.append("")
+        return
+    else:
+        lines.append(
+            "No active_child window is currently open (e.g. cleared by `--resume`), but "
+            "incident snapshot(s) captured at run time are preserved in-repo below."
+        )
+        lines.append("")
+
+    if snapshots:
+        lines.append("### Captured incident snapshots (`launch_incident.runtime.*.json`)")
+        lines.append("")
+        for snap in snapshots:
+            ref = snap.get("ref")
+            doc = snap.get("incident")
+            lines.append(f"- `{ref}`")
+            lines.append("")
+            if isinstance(doc, dict):
+                _render_incident_body(doc, lines)
+            else:
+                lines.append("  (unreadable snapshot)")
+                lines.append("")
 
 
 def _render_markdown(result: dict[str, Any]) -> str:
@@ -479,6 +624,10 @@ def _render_markdown(result: dict[str, Any]) -> str:
                 f"| {e.get('policy','')} | {e['payload_summary']} |"
             )
     lines.append("")
+
+    _render_launch_incident(
+        result.get("launch_incident"), result.get("launch_incident_snapshots"), lines
+    )
 
     if result.get("data_integrity_warning"):
         lines.append("## ⚠ data integrity warning")
