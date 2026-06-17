@@ -2,11 +2,11 @@
 
 ## 0. Meta information
 - `test_profile_id`: `dynamics_shallow_water_time_update_2d_ssprk2_l0`
-- `test_profile_version`: `0.2.0`
+- `test_profile_version`: `0.3.0`
 - `status`: `draft`
 - `spec_ref.spec_kind`: `component`
 - `spec_ref.spec_id`: `dynamics_shallow_water_time_update_2d_ssprk2`
-- `spec_ref.spec_version`: `0.2.0`
+- `spec_ref.spec_version`: `0.3.0`
 - `spec_ref.controlled_spec_path`: `spec/component/dynamics/shallow_water/dynamics_shallow_water_time_update_2d_ssprk2/controlled_spec.md`
 
 ## 1. Tested `operation`
@@ -14,22 +14,34 @@
 
 ## 2. Input-defaulting rules
 - The normal case uses `dt>0`, `dx>0`, `dy>0`, and includes both `S_b=0` and `S_b!=0` in the evaluation target.
+- `L_flux` and `S_b` are supplied as fixed fields; the runner does not recompute them.
+- The `z_b`-invariance case holds `U^n`, `L_flux`, and `S_b` fixed and evaluates the update for two distinct `z_b` fields, comparing the two `U^{n+1}` results.
 - The abnormal case uses `dt<=0`.
 
 ## 3. Diagnostics contract
-- Require outputting `checks.zero_rhs_invariance`, `checks.stage_weight_consistency`, and `checks.input_guard` in `diagnostics.json`.
+- Require outputting `checks.zero_rhs_invariance`, `checks.stage_weight_consistency`, `checks.input_guard`, `checks.zb_invariance`, and `checks.frozen_rhs_exactness` in `diagnostics.json`.
 
 ## 4. Test definitions
 - `test_id`: `l0_zero_rhs_invariance_pass`
   - `level`: `L0`
   - `operation_id`: `dynamics_shallow_water_time_update_2d_ssprk2__advance`
   - `expected_outcome`: `pass`
-  - `judgment`: with an `L(U)=0` input, satisfy `U^{n+1}=U^n`.
+  - `judgment`: with `L_flux=0` and `S_b=0`, satisfy `U^{n+1}=U^n`.
 - `test_id`: `l0_stage_weight_consistency_pass`
   - `level`: `L0`
   - `operation_id`: `dynamics_shallow_water_time_update_2d_ssprk2__advance`
   - `expected_outcome`: `pass`
   - `judgment`: the weights of the 2-stage composition are applied as `1/2,1/2`.
+- `test_id`: `l0_frozen_rhs_exactness_pass`
+  - `level`: `L0`
+  - `operation_id`: `dynamics_shallow_water_time_update_2d_ssprk2__advance`
+  - `expected_outcome`: `pass`
+  - `judgment`: with fixed nonzero `L_flux` and `S_b`, satisfy `U^{n+1} = U^n + dt*(L_flux + S_b)` (frozen-field closed form; both stages use the identical RHS).
+- `test_id`: `l0_zb_invariance_pass`
+  - `level`: `L0`
+  - `operation_id`: `dynamics_shallow_water_time_update_2d_ssprk2__advance`
+  - `expected_outcome`: `pass`
+  - `judgment`: with `U^n`, `L_flux`, and `S_b` held fixed, the update evaluated for two distinct `z_b` fields yields the identical `U^{n+1}` (`z_b` is inert at L0).
 - `test_id`: `l0_invalid_dt_xfail`
   - `level`: `L0`
   - `operation_id`: `dynamics_shallow_water_time_update_2d_ssprk2__advance`
