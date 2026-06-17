@@ -27,9 +27,9 @@ from pathlib import Path
 from typing import Any
 
 try:  # script run: sys.path[0] is tools/ ; package import: repo root on path
-    from orchestration_diagnostics import build_launch_incident
+    from orchestration_diagnostics import build_launch_incident, api_error_from_records
 except ImportError:  # pragma: no cover - import-path shim
-    from tools.orchestration_diagnostics import build_launch_incident
+    from tools.orchestration_diagnostics import build_launch_incident, api_error_from_records
 
 
 def _load_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -408,6 +408,16 @@ def audit(repo_root: Path, orchestration_id: str) -> dict[str, Any]:
     }
 
 
+def _render_api_error_line(api_error: Any, lines: list[str]) -> None:
+    """Render a transient-API-error line (e.g. 529 Overloaded) when present, so the
+    reader sees the dangling launch was a transport blip rather than a hang."""
+    if not isinstance(api_error, dict) or api_error.get("status") is None:
+        return
+    retry_hint = " (retryable — safe to `--resume`)" if api_error.get("retryable") else ""
+    msg = str(api_error.get("message") or "").strip()
+    lines.append(f"- transient API error: `{api_error.get('status')}` {msg}{retry_hint}")
+
+
 def _render_incident_body(incident: dict[str, Any], lines: list[str]) -> None:
     """Render the decisive fields of one launch-incident dict (live or persisted)."""
     child = incident.get("dangling_child", {})
@@ -441,6 +451,11 @@ def _render_incident_body(incident: dict[str, Any], lines: list[str]) -> None:
             lines.append(
                 f"- abort marker: `{ct.get('interrupt_text')}` at `{ct.get('interrupt_ts')}`"
             )
+        # Fall back to parsing raw_tail for legacy snapshots captured before the
+        # structured api_error field existed.
+        _render_api_error_line(
+            ct.get("api_error") or api_error_from_records(ct.get("raw_tail")), lines
+        )
     else:
         # Live re-derivation: ~/.claude transcript ephemeral. A persisted snapshot
         # (rendered from "Captured incident snapshots" below) keeps the evidence even
@@ -459,6 +474,11 @@ def _render_incident_body(incident: dict[str, Any], lines: list[str]) -> None:
                 lines.append(
                     f"- abort marker: `{abort.get('interrupt_text')}` at `{abort.get('interrupt_ts')}`"
                 )
+            # Legacy snapshot fallback: abort_marker predates api_error; recover it
+            # from the child transcript's raw_tail if that field is missing.
+            _render_api_error_line(
+                abort.get("api_error") or api_error_from_records(ct.get("raw_tail")), lines
+            )
         else:
             lines.append(
                 f"Child subagent transcript not available: {ct.get('reason', 'unknown')} "

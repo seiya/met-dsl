@@ -480,6 +480,120 @@ class RunWorkflowTests(unittest.TestCase):
             idx = init_calls[0].index("--spec-ref")
             self.assertEqual(init_calls[0][idx + 1], "spec/problem/test.md")
 
+    def test_resume_forwards_explicit_agent_model(self) -> None:
+        """An explicit --agent-model on --resume reaches the resume init (and thus
+        repair-agent-runs), so an operator can fix a needs_manual row on resume."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._seed_spec_tree(repo_root)
+            self._seed_resumable_orchestration(
+                repo_root, "orch_20260101T000000Z_aaaaaaaa",
+                spec_ref="spec/problem/test.md", until_phase="Build",
+                mode="dev", backend="claude",
+            )
+            code, out, calls = self._run_main_with_fake_runtime(
+                ["--resume", "--repo-root", str(repo_root), "--no-invoke-llm",
+                 "--agent-model", "claude-opus-4-8"]
+            )
+            self.assertEqual(code, 0, out)
+            init_calls = [c for c in calls if c and c[0] == "init"]
+            self.assertIn("--resume-from-checkpoint", init_calls[0])
+            idx = init_calls[0].index("--agent-model")
+            self.assertEqual(init_calls[0][idx + 1], "claude-opus-4-8")
+
+    def test_resume_without_agent_model_omits_default(self) -> None:
+        """No override on --resume: --agent-model is NOT injected, so repair uses the
+        more-accurate sibling_uniform derivation rather than a possibly-wrong default."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._seed_spec_tree(repo_root)
+            self._seed_resumable_orchestration(
+                repo_root, "orch_20260101T000000Z_aaaaaaaa",
+                spec_ref="spec/problem/test.md", until_phase="Build",
+                mode="dev", backend="claude",
+            )
+            code, out, calls = self._run_main_with_fake_runtime(
+                ["--resume", "--repo-root", str(repo_root), "--no-invoke-llm"]
+            )
+            self.assertEqual(code, 0, out)
+            init_calls = [c for c in calls if c and c[0] == "init"]
+            self.assertNotIn("--agent-model", init_calls[0])
+
+    def test_fresh_claude_run_records_orchestration_agent_model(self) -> None:
+        """A fresh (non-resume) claude run threads --agent-model into init so the
+        orchestration agent_runs row records the model (P2)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._seed_spec_tree(repo_root)
+            code, out, calls = self._run_main_with_fake_runtime(
+                ["spec/problem/test.md", "compile", "--llm", "claude",
+                 "--repo-root", str(repo_root), "--no-invoke-llm"]
+            )
+            self.assertEqual(code, 0, out)
+            init_calls = [c for c in calls if c and c[0] == "init"]
+            self.assertEqual(len(init_calls), 1)
+            self.assertNotIn("--resume-from-checkpoint", init_calls[0])
+            idx = init_calls[0].index("--agent-model")
+            self.assertEqual(init_calls[0][idx + 1], "claude-opus-4-8")
+
+    def test_fresh_run_explicit_agent_model_overrides_default(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._seed_spec_tree(repo_root)
+            code, out, calls = self._run_main_with_fake_runtime(
+                ["spec/problem/test.md", "compile", "--llm", "claude",
+                 "--agent-model", "claude-sonnet-4-6",
+                 "--repo-root", str(repo_root), "--no-invoke-llm"]
+            )
+            self.assertEqual(code, 0, out)
+            init_calls = [c for c in calls if c and c[0] == "init"]
+            idx = init_calls[0].index("--agent-model")
+            self.assertEqual(init_calls[0][idx + 1], "claude-sonnet-4-6")
+
+    def test_fresh_codex_run_omits_agent_model_default(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._seed_spec_tree(repo_root)
+            code, out, calls = self._run_main_with_fake_runtime(
+                ["spec/problem/test.md", "compile", "--llm", "codex",
+                 "--repo-root", str(repo_root), "--no-invoke-llm"]
+            )
+            self.assertEqual(code, 0, out)
+            init_calls = [c for c in calls if c and c[0] == "init"]
+            self.assertNotIn("--agent-model", init_calls[0])
+
+    def test_overridden_claude_command_omits_opus_default(self) -> None:
+        """A custom --llm-command may launch a non-Opus model, so the Opus default
+        must NOT be asserted; without --agent-model, agent_model is left to sibling
+        backfill rather than wrongly recording Opus."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._seed_spec_tree(repo_root)
+            code, out, calls = self._run_main_with_fake_runtime(
+                ["spec/problem/test.md", "compile", "--llm", "claude",
+                 "--llm-command", "claude --model claude-sonnet-4-6",
+                 "--repo-root", str(repo_root), "--no-invoke-llm"]
+            )
+            self.assertEqual(code, 0, out)
+            init_calls = [c for c in calls if c and c[0] == "init"]
+            self.assertNotIn("--agent-model", init_calls[0])
+
+    def test_overridden_claude_command_with_explicit_agent_model(self) -> None:
+        """An explicit --agent-model is still honored even with a custom --llm-command."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._seed_spec_tree(repo_root)
+            code, out, calls = self._run_main_with_fake_runtime(
+                ["spec/problem/test.md", "compile", "--llm", "claude",
+                 "--llm-command", "claude --model claude-sonnet-4-6",
+                 "--agent-model", "claude-sonnet-4-6",
+                 "--repo-root", str(repo_root), "--no-invoke-llm"]
+            )
+            self.assertEqual(code, 0, out)
+            init_calls = [c for c in calls if c and c[0] == "init"]
+            idx = init_calls[0].index("--agent-model")
+            self.assertEqual(init_calls[0][idx + 1], "claude-sonnet-4-6")
+
     def test_resume_picks_latest_by_started_at(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)

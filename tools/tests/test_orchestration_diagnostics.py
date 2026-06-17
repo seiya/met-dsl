@@ -218,6 +218,107 @@ class TranscriptSummaryTests(unittest.TestCase):
         summary = diag.summarize_transcript_tail(Path("/nonexistent/x.jsonl"))
         self.assertFalse(summary["found"])
 
+    def test_transient_api_error_529_surfaced(self) -> None:
+        """A synthetic 529 assistant record is extracted as a structured, retryable
+        api_error so the operator can tell the dangling launch was a transport blip."""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "child.jsonl"
+            records = [
+                {
+                    "type": "user",
+                    "timestamp": "2026-06-17T01:14:13.121Z",
+                    "message": {"role": "user", "content": "You are a substep agent."},
+                },
+                {
+                    "type": "assistant",
+                    "timestamp": "2026-06-17T01:17:30.724Z",
+                    "isApiErrorMessage": True,
+                    "apiErrorStatus": 529,
+                    "message": {
+                        "role": "assistant",
+                        "content": [
+                            {"type": "text", "text": "API Error: 529 Overloaded. Temporary."}
+                        ],
+                    },
+                },
+            ]
+            path.write_text("\n".join(json.dumps(r) for r in records) + "\n", encoding="utf-8")
+            summary = diag.summarize_transcript_tail(path)
+            self.assertTrue(summary["found"])
+            self.assertFalse(summary["interrupted"])
+            self.assertIsNotNone(summary["api_error"])
+            self.assertEqual(summary["api_error"]["status"], 529)
+            self.assertTrue(summary["api_error"]["retryable"])
+            self.assertIn("Overloaded", summary["api_error"]["message"])
+
+    def test_recovered_api_error_cleared_by_later_activity(self) -> None:
+        """A 529 that is FOLLOWED by normal activity was recovered — it must not be
+        reported, else a later unrelated hang would be mislabeled safe-to-resume."""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "child.jsonl"
+            records = [
+                {
+                    "type": "assistant",
+                    "timestamp": "2026-06-17T01:17:30.724Z",
+                    "isApiErrorMessage": True,
+                    "apiErrorStatus": 529,
+                    "message": {
+                        "role": "assistant",
+                        "content": [{"type": "text", "text": "API Error: 529 Overloaded."}],
+                    },
+                },
+                # Normal activity after the error → the error was recovered.
+                {
+                    "type": "assistant",
+                    "timestamp": "2026-06-17T01:18:05.000Z",
+                    "message": {
+                        "role": "assistant",
+                        "content": [
+                            {"type": "tool_use", "name": "Bash", "input": {"command": "ls"}}
+                        ],
+                    },
+                },
+            ]
+            path.write_text("\n".join(json.dumps(r) for r in records) + "\n", encoding="utf-8")
+            summary = diag.summarize_transcript_tail(path)
+            self.assertIsNone(summary["api_error"])
+            self.assertEqual(summary["last_tool_use"]["name"], "Bash")
+
+    def test_non_retryable_api_error_marked(self) -> None:
+        """A 400-class API error is surfaced but flagged non-retryable."""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "child.jsonl"
+            records = [
+                {
+                    "type": "assistant",
+                    "timestamp": "2026-06-17T01:17:30.724Z",
+                    "isApiErrorMessage": True,
+                    "apiErrorStatus": 400,
+                    "message": {
+                        "role": "assistant",
+                        "content": [{"type": "text", "text": "API Error: 400 Bad Request."}],
+                    },
+                },
+            ]
+            path.write_text("\n".join(json.dumps(r) for r in records) + "\n", encoding="utf-8")
+            summary = diag.summarize_transcript_tail(path)
+            self.assertEqual(summary["api_error"]["status"], 400)
+            self.assertFalse(summary["api_error"]["retryable"])
+
+    def test_no_api_error_when_clean_tail(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "child.jsonl"
+            records = [
+                {
+                    "type": "assistant",
+                    "timestamp": "2026-06-17T01:17:30.724Z",
+                    "message": {"role": "assistant", "content": [{"type": "text", "text": "done"}]},
+                },
+            ]
+            path.write_text("\n".join(json.dumps(r) for r in records) + "\n", encoding="utf-8")
+            summary = diag.summarize_transcript_tail(path)
+            self.assertIsNone(summary["api_error"])
+
 
 class BuildLaunchIncidentTests(unittest.TestCase):
     def _fake_home_with_transcripts(self, repo: Path, home: Path) -> None:

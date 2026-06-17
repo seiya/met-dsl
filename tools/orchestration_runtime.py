@@ -1670,8 +1670,37 @@ def _prune_orphan_agent_graph_edges(
     if not isinstance(edges, list) or not edges:
         return []
 
-    # Protection set: any child with evidence it reached (or completed) a run, in any
-    # form, must keep its edge so validation can still vouch for / reject it.
+    protected = _protected_child_arids(repo_root, orchestration_id)
+    launches_dir = root / "launches"
+    kept: list[Any] = []
+    pruned: list[str] = []
+    for edge in edges:
+        child = edge.get("child_agent_run_id") if isinstance(edge, dict) else None
+        child_id = child.strip() if isinstance(child, str) and child.strip() else None
+        was_launched = (
+            child_id is not None and (launches_dir / f"{child_id}.request.json").is_file()
+        )
+        if child_id is not None and was_launched and child_id not in protected:
+            pruned.append(child_id)
+        else:
+            kept.append(edge)
+    if pruned:
+        graph["edges"] = kept
+        _write_json(graph_path, graph)
+    return pruned
+
+
+def _protected_child_arids(repo_root: Path, orchestration_id: str) -> set[str]:
+    """Child arids with durable evidence they reached / completed / attempted a run.
+
+    Any child appearing here is NOT an abandoned launch: it has a terminal
+    `agent_runs.jsonl` row, is vouched for by a `step_result.json`, has an
+    `agent_runs_invalid.jsonl` entry (terminal-payload validation diverted it), or
+    left a `child_returns/<arid>.txt` ack (the Agent tool already returned). Used to
+    keep `_prune_orphan_agent_graph_edges` from pruning such edges AND to keep the
+    resume orphan-tombstone set from mislabeling these as expected orphans.
+    """
+    root = _orchestration_root(repo_root, orchestration_id)
     protected: set[str] = set(_load_run_records(root).keys())
     for result_path in _iter_step_result_paths(root):
         # A malformed / partially written step_result must NOT block resume — resume is
@@ -1710,32 +1739,137 @@ def _prune_orphan_agent_graph_edges(
             pass
     # A child_returns/<arid>.txt ack means the Agent tool already RETURNED for that
     # child (record-child-return ran). A missing run row is then incomplete
-    # finalization / corruption, not an abandoned launch, so keep the edge for
-    # validation to surface. (The genuine dangling case — interrupted before the
-    # Agent tool returned — has no ack, so it stays prunable.)
+    # finalization / corruption, not an abandoned launch.
     returns_dir = _child_returns_dir(repo_root, orchestration_id)
     if returns_dir.is_dir():
         for ack in returns_dir.glob("*.txt"):
             if ack.stem:
                 protected.add(ack.stem)
+    return protected
 
+
+def _latest_launch_incident_ref(repo_root: Path, orchestration_id: str) -> str | None:
+    """Newest `launch_incident.runtime.*.json` (repo-relative), or None.
+
+    The filename suffix is a random uuid fragment (`uuid4().hex[:12]`), so
+    lexicographic order is meaningless — ranking by it could attach the tombstone
+    to an older / unrelated incident. Rank by each snapshot's own `detected_at`
+    (its authoritative logical time), falling back to file mtime when that field is
+    absent or unparseable.
+    """
+    root = _orchestration_root(repo_root, orchestration_id)
+    snaps = list(root.glob("launch_incident.runtime.*.json"))
+    if not snaps:
+        return None
+
+    def _recency_key(p: Path) -> float:
+        try:
+            mtime = p.stat().st_mtime
+        except OSError:
+            mtime = 0.0
+        try:
+            doc = _read_json(p)
+        except (OSError, json.JSONDecodeError):
+            doc = None
+        if isinstance(doc, dict):
+            detected = doc.get("detected_at")
+            if isinstance(detected, str) and detected.strip():
+                s = detected.strip()
+                if s.endswith("Z"):
+                    s = s[:-1] + "+00:00"
+                try:
+                    return datetime.fromisoformat(s).timestamp()
+                except ValueError:
+                    pass
+        return mtime
+
+    newest = max(snaps, key=_recency_key)
+    return str(newest.relative_to(repo_root))
+
+
+def _write_orphan_launch_tombstones(
+    repo_root: Path, orchestration_id: str, orphan_arids: list[str]
+) -> list[str]:
+    """Write a `launches/<arid>.pruned.json` tombstone for each abandoned-launch arid
+    cleared/pruned during resume.
+
+    A dangling launch (host died mid-Agent-call) leaves orphan launch artifacts
+    (`launches/<arid>.{prompt,request,response,reply}`, `capabilities/<arid>.json`,
+    `output_manifests/<arid>.json`) with NO terminal `agent_runs.jsonl` row and NO
+    `child_returns/<arid>.txt` ack. Resume keeps those artifacts for forensics but,
+    without a marker, a later manual inspection / audit tool cannot distinguish them
+    from a genuine protocol violation (a launched child that vanished). The tombstone
+    records that the runtime intentionally pruned the orphan during recovery. It lives
+    under `launches/` (already baseline-exempt via the runtime prefix in
+    `_should_ignore_runtime_snapshot_path`), so writing it never contaminates a diff.
+    Idempotent: an existing tombstone is overwritten with the same content.
+
+    Candidates are derived from the DURABLE residual launch artifacts
+    (`launches/*.request.json`), not only from the destructive resume steps'
+    return values (`_clear_stale_active_child_markers` deletes markers,
+    `_prune_orphan_agent_graph_edges` removes edges). This makes the tombstone
+    resilient to an interrupted resume retry: if the host dies after those deletions
+    but before the meta commit, the retry re-enters terminal_reset with empty
+    cleared/pruned lists — yet the launch artifacts persist, so the orphan is still
+    found and tombstoned. The passed `orphan_arids` are folded in as a supplementary
+    hint. The set is then filtered to GENUINE orphans: launched
+    (`launches/<arid>.request.json` exists) AND not in `_protected_child_arids` (no
+    terminal row / step_result vouch / invalid-run entry / child_returns ack) AND with
+    no `agents/<arid>/deactivate_snapshot.json`. The deactivate-snapshot exclusion is
+    separate from `_protected_child_arids` on purpose: `deactivate-child` CONSUMES the
+    `child_returns/<arid>.txt` ack (so a child that returned + deactivated but died
+    before `record-agent-run` is no longer ack-protected), yet the durable snapshot
+    proves the Agent tool returned — that is a lost-finalization / corruption case,
+    not an abandoned launch, so it must not be tombstoned as an "expected orphan". It
+    is excluded HERE rather than in `_protected_child_arids` because
+    `_prune_orphan_agent_graph_edges` must still prune that child's orphan edge for the
+    resumed run's `set-status pass` to be accepted.
+    """
+    root = _orchestration_root(repo_root, orchestration_id)
     launches_dir = root / "launches"
-    kept: list[Any] = []
-    pruned: list[str] = []
-    for edge in edges:
-        child = edge.get("child_agent_run_id") if isinstance(edge, dict) else None
-        child_id = child.strip() if isinstance(child, str) and child.strip() else None
-        was_launched = (
-            child_id is not None and (launches_dir / f"{child_id}.request.json").is_file()
+    launches_dir.mkdir(parents=True, exist_ok=True)
+    protected = _protected_child_arids(repo_root, orchestration_id)
+    # Children that returned + deactivated (Agent tool returned) — proven by the
+    # durable deactivate snapshot even after the ack was consumed. Not orphans.
+    deactivated: set[str] = {
+        p.parent.name for p in (root / "agents").glob("*/deactivate_snapshot.json")
+    }
+    # Durable candidate source: every launched arid still has its request.json
+    # (the tombstone is <arid>.pruned.json, so it is never re-globbed here).
+    candidate_set: set[str] = {p.name[: -len(".request.json")] for p in launches_dir.glob("*.request.json")}
+    candidate_set.update(a.strip() for a in orphan_arids if isinstance(a, str) and a.strip())
+    orphans = sorted(
+        arid
+        for arid in candidate_set
+        if arid
+        and arid not in protected
+        and arid not in deactivated
+        and (launches_dir / f"{arid}.request.json").is_file()
+    )
+    if not orphans:
+        return []
+    incident_ref = _latest_launch_incident_ref(repo_root, orchestration_id)
+    written: list[str] = []
+    for arid in orphans:
+        _write_json(
+            launches_dir / f"{arid}.pruned.json",
+            {
+                "schema": "launch_orphan_tombstone/v1",
+                "agent_run_id": arid,
+                "orchestration_id": orchestration_id,
+                "reason": "resume_pruned_orphan",
+                "note": (
+                    "Abandoned launch (active_child window left open, no terminal "
+                    "agent_runs row and no child_returns ack); pruned during "
+                    "checkpoint resume. Residual launches/capabilities/output_manifests "
+                    "artifacts for this arid are expected orphans, not a violation."
+                ),
+                "pruned_at": _utc_now_iso(),
+                "incident_ref": incident_ref,
+            },
         )
-        if child_id is not None and was_launched and child_id not in protected:
-            pruned.append(child_id)
-        else:
-            kept.append(edge)
-    if pruned:
-        graph["edges"] = kept
-        _write_json(graph_path, graph)
-    return pruned
+        written.append(arid)
+    return written
 
 
 def _reset_stale_child_running_node_steps(
@@ -5650,6 +5784,12 @@ def _should_ignore_runtime_snapshot_path(
     # Ignore Claude local/runtime settings mutated by system-level hooks.
     if token.startswith(".claude/"):
         return True
+    # NOTE: dated archive / backup workspaces at the repo root (`workspace_<date>/`,
+    # `workspace_backup_*/`) are deliberately NOT exempted. They bloat the baseline,
+    # but exempting them from BOTH the baseline and the terminal diff would blind
+    # unauthorized-write validation to any child write under a `workspace_*` path
+    # (the diff is the defense-in-depth backstop for an output_manifest_write_guard
+    # bypass). Correctness of write validation outranks the snapshot-size win.
     # NOTE: No blanket pyc/__pycache__ exemption here.  PYTHONDONTWRITEBYTECODE=1
     # (set in run_workflow.py) is the primary protection against incidental bytecode
     # writes.  Any explicit bytecode generation (e.g. python3 -m py_compile) is an
@@ -8569,6 +8709,18 @@ def enable_checkpoint_resume(
         # a terminal status proves no child is live. merge_phase_state_for_resume below
         # preserves node_states, so this reset survives into the resumed run.
         reset_child_running = _reset_stale_child_running_node_steps(repo_root, orchestration_id)
+        # Tombstone the abandoned launches' residual artifacts so a later manual
+        # inspection / audit can tell them apart from a genuine protocol violation.
+        # _write_orphan_launch_tombstones self-derives candidates from the durable
+        # launches/*.request.json artifacts (resilient to an interrupted resume retry
+        # where the cleared/pruned lists below would be empty) and filters to GENUINE
+        # orphans (launched ∧ not in _protected_child_arids). The pruned/cleared lists
+        # are passed only as a supplementary hint.
+        orphan_tombstones = _write_orphan_launch_tombstones(
+            repo_root,
+            orchestration_id,
+            list(pruned_graph_children) + list(cleared_active_child),
+        )
     _write_json(meta_path, meta)
     merge_phase_state_for_resume(repo_root, orchestration_id)
     if terminal_reset:
@@ -8618,6 +8770,17 @@ def enable_checkpoint_resume(
                     "to": "not_started",
                     "note": "stale child_running node/step authority reset for checkpoint resume",
                     "reset_node_steps": reset_child_running,
+                },
+            )
+        if orphan_tombstones:
+            _append_phase_state_log(
+                repo_root,
+                orchestration_id,
+                {
+                    "ts": _utc_now_iso(),
+                    "event": "resume_tombstoned_orphan_launches",
+                    "note": "orphan launch artifacts marked with launches/<arid>.pruned.json for checkpoint resume",
+                    "tombstoned_agent_run_ids": orphan_tombstones,
                 },
             )
     return meta
@@ -8697,13 +8860,21 @@ def repair_legacy_agent_runs(
     the pre_judge gate scans every line and the substep-linkage check, so the
     legacy lines permanently fail the gate and make resume impossible.
 
+    The orchestration row (written by init_orchestration, which has no launch and
+    thus no record-launch agent_model) is also covered for `agent_model` only —
+    it is the graph root and legitimately has no parent_agent_run_id, so the
+    parent backfill is skipped for it. This fixes the top-level cost-attribution
+    blind spot (audit orch_20260617T010118Z_f5a9577c: every child row carried a
+    model, the orchestration row carried none).
+
     This repair reconstructs the missing values from existing artifacts and fills
     ONLY missing fields (never overwriting a present non-empty value):
 
-    - parent_agent_run_id: substep -> step_result.json executor_agent_run_id;
-      step -> orchestration_meta.json orchestration_agent_run_id. Both are
-      cross-checked against agent_graph.json child->parent edges; a disagreement
-      marks the line unrepairable rather than guessing.
+    - parent_agent_run_id (step/substep only): substep -> step_result.json
+      executor_agent_run_id; step -> orchestration_meta.json
+      orchestration_agent_run_id. Both are cross-checked against agent_graph.json
+      child->parent edges; a disagreement marks the line unrepairable rather than
+      guessing.
     - agent_model: runtime non-derivable by design (orchestration_runtime: the
       LLM that produced a child's artifacts is not knowable from the runtime), so
       it is taken from an explicit `agent_model` override or, failing that, from
@@ -8792,7 +8963,7 @@ def repair_legacy_agent_runs(
             role_token = (
                 role.strip().lower() if isinstance(role, str) and role.strip() else None
             )
-            if role_token not in {"step", "substep"}:
+            if role_token not in {"orchestration", "step", "substep"}:
                 continue
             arid_val = obj.get("agent_run_id")
             arid = arid_val.strip() if isinstance(arid_val, str) and arid_val.strip() else None
@@ -8801,8 +8972,13 @@ def repair_legacy_agent_runs(
             line_missing: list[str] = []
             parent_src_used: str | None = None
 
+            # The orchestration agent is the graph root — it has no
+            # parent_agent_run_id, so only agent_model is backfillable for it.
+            # step/substep rows still get the parent backfill below.
             cur_parent = obj.get("parent_agent_run_id")
-            if not (isinstance(cur_parent, str) and cur_parent.strip()):
+            if role_token in {"step", "substep"} and not (
+                isinstance(cur_parent, str) and cur_parent.strip()
+            ):
                 derived: str | None = None
                 parent_source: str | None = None
                 if role_token == "substep" and arid in substep_parent:
@@ -11179,6 +11355,7 @@ def init_orchestration(
     source_dependency_ref: str | None = None,
     status: str = "running",
     agent_backend: str = "codex",
+    agent_model: str | None = None,
 ) -> dict[str, Any]:
     root = _orchestration_root(repo_root, orchestration_id)
     root.mkdir(parents=True, exist_ok=True)
@@ -11329,20 +11506,22 @@ def init_orchestration(
                     has_orchestration_running_entry = True
                     break
         if not has_orchestration_running_entry:
+            orchestration_row: dict[str, Any] = {
+                "agent_run_id": orchestration_agent_run_id,
+                "agent_role": "orchestration",
+                "agent_backend": backend_token,
+                "status": "running",
+                "started_at": _utc_now_iso(),
+            }
+            # Record the orchestration agent's own model when supplied so the
+            # top-level row is not a blind spot for cost attribution / repro.
+            # Children record agent_model at record-launch; the orchestration row
+            # has no launch, so it is threaded in here (legacy/omitted rows are
+            # backfilled by repair-agent-runs from sibling_uniform).
+            if isinstance(agent_model, str) and agent_model.strip():
+                orchestration_row["agent_model"] = agent_model.strip()
             with runs_path.open("a", encoding="utf-8") as fh:
-                fh.write(
-                    json.dumps(
-                        {
-                            "agent_run_id": orchestration_agent_run_id,
-                            "agent_role": "orchestration",
-                            "agent_backend": backend_token,
-                            "status": "running",
-                            "started_at": _utc_now_iso(),
-                        },
-                        ensure_ascii=False,
-                    )
-                    + "\n"
-                )
+                fh.write(json.dumps(orchestration_row, ensure_ascii=False) + "\n")
     _append_session_run_index_entry(
         repo_root,
         orchestration_id,
@@ -14033,6 +14212,11 @@ def main(argv: list[str] | None = None) -> int:
     init_parser.add_argument("--status", default="running")
     init_parser.add_argument("--agent-backend", default="codex", choices=sorted(SUPPORTED_BACKENDS))
     init_parser.add_argument(
+        "--agent-model",
+        default=None,
+        help="Model id of the orchestration agent itself (e.g. claude-opus-4-8); recorded on the orchestration agent_runs row for cost attribution / reproducibility.",
+    )
+    init_parser.add_argument(
         "--resume-from-checkpoint",
         action="store_true",
         help="Enable checkpoint resume on an existing orchestration (sets resume_enabled; resets a terminal status back to running).",
@@ -14481,12 +14665,14 @@ def main(argv: list[str] | None = None) -> int:
             # Bring any pre-caa10ab legacy agent_runs.jsonl lines into pre_judge
             # compliance before the resumed run reaches the gate. Runs at init
             # time (before any child launch / outside the active_child window),
-            # so the agent_runs.jsonl write is safe. Non-fatal: a `needs_manual`
-            # result (agent_model not auto-derivable) leaves resume to proceed so
-            # the operator can re-run `repair-agent-runs --agent-model <id>`.
+            # so the agent_runs.jsonl write is safe. An explicit --agent-model is
+            # forwarded so an operator resolving a `needs_manual` row (agent_model
+            # not auto-derivable) can fix it directly on the `--resume` command;
+            # without it, repair falls back to sibling_uniform derivation.
             repair_summary = repair_legacy_agent_runs(
                 repo_root=repo_root,
                 orchestration_id=args.orchestration_id,
+                agent_model=args.agent_model,
             )
             if isinstance(result, dict):
                 result = {**result, "legacy_record_repair": repair_summary}
@@ -14498,6 +14684,7 @@ def main(argv: list[str] | None = None) -> int:
                 source_dependency_ref=args.source_dependency_ref,
                 status=args.status,
                 agent_backend=args.agent_backend,
+                agent_model=args.agent_model,
             )
     elif args.command == "preflight":
         agent_command = args.agent_command

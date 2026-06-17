@@ -17,6 +17,7 @@ from tools.audit_orchestration import (
     detect_suspicious_benign_volume,
     split_substantive_and_benign,
     _render_markdown,
+    _render_incident_body,
 )
 
 
@@ -603,6 +604,42 @@ class LaunchIncidentSnapshotTests(unittest.TestCase):
             self.assertEqual(result["launch_incident_snapshots"], [])
             md = _render_markdown(result)
         self.assertIn("no captured incident snapshots", md)
+
+
+class LegacyIncidentApiErrorRenderTests(unittest.TestCase):
+    def test_renders_api_error_from_raw_tail_when_structured_field_missing(self) -> None:
+        """A legacy snapshot predating the structured api_error field still carries the
+        529 marker in raw_tail; audit must surface it from there."""
+        incident = {
+            "dangling_child": {"agent_run_id": "child-1", "step": "compile",
+                               "substep": "generate"},
+            "host_session_id": "host-1",
+            "transcripts": {
+                "child_transcript": {
+                    "found": True,
+                    "path": "/x.jsonl",
+                    "match_method": "tool_use_id",
+                    "last_activity_ts": "2026-06-17T01:17:30.724Z",
+                    "last_event_type": "assistant",
+                    # No structured "api_error" field (legacy snapshot) ...
+                    "raw_tail": [
+                        {
+                            "type": "assistant",
+                            "isApiErrorMessage": True,
+                            "apiErrorStatus": 529,
+                            "message": {"role": "assistant", "content": [
+                                {"type": "text", "text": "API Error: 529 Overloaded."}]},
+                        }
+                    ],
+                }
+            },
+        }
+        lines: list[str] = []
+        _render_incident_body(incident, lines)
+        md = "\n".join(lines)
+        self.assertIn("transient API error", md)
+        self.assertIn("529", md)
+        self.assertIn("safe to", md)
 
 
 if __name__ == "__main__":

@@ -270,6 +270,55 @@ def _last_tool_use(record: dict[str, Any]) -> dict[str, Any] | None:
     return None
 
 
+# HTTP statuses that the Claude transport retries / that are transient and safe to
+# `--resume` without investigation (overload, rate limit, gateway/server blips).
+_RETRYABLE_API_STATUSES: frozenset[int] = frozenset({429, 500, 502, 503, 529})
+
+
+def _api_error(record: dict[str, Any]) -> dict[str, Any] | None:
+    """Extract a transient API-error marker from a transcript record.
+
+    Claude Code writes a synthetic assistant record with ``isApiErrorMessage:true``
+    and ``apiErrorStatus:<code>`` when a model turn fails (e.g. ``529 Overloaded``).
+    Surfacing it structurally lets the operator see at a glance that a dangling
+    launch was a transient transport failure (safe to resume) rather than a hang.
+    """
+    if record.get("isApiErrorMessage") is not True:
+        return None
+    status = record.get("apiErrorStatus")
+    status_int = status if isinstance(status, int) else None
+    blocks = _record_text_blocks(record)
+    message = blocks[-1][:200] if blocks else None
+    return {
+        "status": status_int,
+        "message": message,
+        "retryable": status_int in _RETRYABLE_API_STATUSES,
+    }
+
+
+def api_error_from_records(records: list[dict[str, Any]] | None) -> dict[str, Any] | None:
+    """Derive the transient API error to report from a sequence of transcript records.
+
+    Reports an API error only when it is the FINAL relevant activity: any later
+    non-interrupt, non-error record means the error was recovered, so it is cleared
+    (otherwise a later unrelated hang would be mislabeled as a retryable transport
+    blip). Shared by `summarize_transcript_tail` and the audit renderer's fallback
+    for legacy incident snapshots that predate the structured `api_error` field but
+    still carry `isApiErrorMessage` / `apiErrorStatus` in their `raw_tail`.
+    """
+    if not records:
+        return None
+    api_error: dict[str, Any] | None = None
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        if _is_interrupt_record(record):
+            continue
+        err = _api_error(record)
+        api_error = err if err is not None else None
+    return api_error
+
+
 def summarize_transcript_tail(path: Path, *, n: int = 40) -> dict[str, Any]:
     """Summarize the last ``n`` records of a transcript jsonl.
 
@@ -310,6 +359,9 @@ def summarize_transcript_tail(path: Path, *, n: int = 40) -> dict[str, Any]:
         if tu is not None:
             last_tool = tu
 
+    # Surface an API error only when it is the final relevant activity (see helper).
+    api_error = api_error_from_records(records)
+
     dead_air_seconds: float | None = None
     if last_activity_dt is not None:
         end_dt = interrupt_dt or datetime.now(timezone.utc)
@@ -326,6 +378,7 @@ def summarize_transcript_tail(path: Path, *, n: int = 40) -> dict[str, Any]:
         "interrupt_ts": interrupt_ts,
         "interrupt_text": interrupt_text,
         "dead_air_seconds": dead_air_seconds,
+        "api_error": api_error,
         "raw_tail": tail,
     }
 
@@ -461,6 +514,7 @@ def build_launch_incident(
             "interrupt_text": child.get("interrupt_text"),
             "last_activity_ts": child.get("last_activity_ts"),
             "dead_air_seconds": child.get("dead_air_seconds"),
+            "api_error": child.get("api_error"),
         }
 
     return {

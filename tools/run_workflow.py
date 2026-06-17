@@ -54,6 +54,11 @@ DEFAULT_LLM_COMMANDS = {
     "cursor": "cursor",
     "claude": "claude",
 }
+# Default orchestration-agent model recorded on the orchestration agent_runs row
+# for the claude backend (the host session runs Opus). Operators on a different
+# model override it with --agent-model. codex/cursor model ids are not knowable to
+# this entrypoint, so they are left to repair-agent-runs sibling backfill.
+DEFAULT_CLAUDE_AGENT_MODEL = "claude-opus-4-8"
 
 PHASE_ALIASES = {
     "compile": "Compile",
@@ -831,6 +836,18 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     )
     parser.add_argument("--llm", default=None, choices=SUPPORTED_LLMS)
     parser.add_argument("--llm-command", help="Override backend command used by preflight and optional launch.")
+    parser.add_argument(
+        "--agent-model",
+        default=None,
+        help=(
+            "Model id of the orchestration agent itself, recorded on its agent_runs "
+            "row for cost attribution / reproducibility. Defaults to "
+            f"'{DEFAULT_CLAUDE_AGENT_MODEL}' only for the claude backend running the "
+            "unmodified default command; with a custom --llm-command (which may launch "
+            "a different model) it is omitted unless given here. When omitted, "
+            "repair-agent-runs backfills it from sibling rows on resume."
+        ),
+    )
     parser.add_argument("--repo-root", default=".")
     parser.add_argument("--orchestration-id", help="If omitted, generated automatically (or, with --resume, the latest orchestration).")
     parser.add_argument("--status", default="running", help="Initial orchestration status for init.")
@@ -1122,6 +1139,12 @@ def main(argv: list[str] | None = None) -> int:
                 "--source-dependency-ref",
                 source_dependency_ref,
             ]
+            # Forward an EXPLICIT --agent-model to the resume repair (it overrides
+            # repair-agent-runs' sibling derivation, e.g. for a `needs_manual` row).
+            # Do NOT apply the claude default here: with no override, sibling_uniform
+            # derives the run's actual model, which is more accurate than a default.
+            if args.agent_model:
+                init_args += ["--agent-model", args.agent_model]
         else:
             init_args = [
                 "init",
@@ -1138,6 +1161,21 @@ def main(argv: list[str] | None = None) -> int:
                 "--source-dependency-ref",
                 source_dependency_ref,
             ]
+            # Record the orchestration agent's own model so its agent_runs row is
+            # not a cost-attribution blind spot. Explicit --agent-model wins.
+            # Otherwise default to Opus ONLY for the claude backend running the
+            # UNMODIFIED default command — an overridden --llm-command (e.g. a wrapper
+            # selecting a different model) could launch a non-Opus model, so we must
+            # not assert Opus there; leave it for sibling backfill on resume instead.
+            orchestration_model = args.agent_model
+            if (
+                not orchestration_model
+                and llm == "claude"
+                and llm_command == DEFAULT_LLM_COMMANDS["claude"]
+            ):
+                orchestration_model = DEFAULT_CLAUDE_AGENT_MODEL
+            if orchestration_model:
+                init_args += ["--agent-model", orchestration_model]
         try:
             init_result = _runtime_command(repo_root, env, init_args).payload
             orchestration_agent_run_id = str(init_result.get("orchestration_agent_run_id", "")).strip()
@@ -1302,6 +1340,17 @@ def main(argv: list[str] | None = None) -> int:
                         f"dead_air={abort.get('dead_air_seconds')}s "
                         f"abort={abort.get('interrupt_text')}"
                     )
+                    # Surface a transient API error (e.g. 529 Overloaded) so the
+                    # operator can tell at a glance this dangling launch was a
+                    # transport blip — safe to `--resume` without investigation —
+                    # rather than a genuine hang.
+                    api_error = abort.get("api_error") if isinstance(abort, dict) else None
+                    if isinstance(api_error, dict) and api_error.get("status") is not None:
+                        retry_hint = " retryable, safe to --resume" if api_error.get("retryable") else ""
+                        detail += (
+                            f" api_error={api_error.get('status')}"
+                            f" {str(api_error.get('message') or '').strip()[:120]}{retry_hint}"
+                        )
                     if launch_incident_ref:
                         detail += f" incident_ref={launch_incident_ref}"
                     try:

@@ -21,7 +21,7 @@ Related canonical sources:
 
 | subcommand | purpose | main caller / situation |
 |---|---|---|
-| `init` | start an orchestration / generate `orchestration_meta.json` | usually launched via `tools/run_workflow.py`. A direct call is for exceptional operation only |
+| `init` | start an orchestration / generate `orchestration_meta.json` | usually launched via `tools/run_workflow.py`. A direct call is for exceptional operation only. `--agent-model <id>` records the orchestration agent's own model on its `agent_runs.jsonl` row (`run_workflow.py` passes `claude-opus-4-8` by default for the claude backend) |
 | `preflight` | execution-platform launchability probe / generate `preflight.json` | called internally by `tools/run_workflow.py`. A manual call is forbidden (see `AGENTS.md`) |
 | `preflight-status` | read back an existing `preflight.json` | post-launch state confirmation |
 | `record-timeout` | the canonical recovery path for an `Agent` tool API stream idle timeout etc. | the exception recovery flow when a child agent wedges. `--force-reason` is the last resort for a marker-check bypass |
@@ -29,7 +29,7 @@ Related canonical sources:
 | `verify-checkpoint-integrity` | reconcile the artifact hash recorded in the checkpoint with the current state | the consistency confirmation at resume start. On `stale` detection, that step must not be skipped |
 | `check-step-completed` | with `resume_enabled=true`, confirm the completion state of the target step | the canonical skip-decision path. A skip must not be decided by a direct reference to `step_result.json` |
 | `orchestration-read` | the gate-mediated read of a path outside the manifest | usually called via `run-gate --gate orchestration_read --args-json '{"read_path": "..."}'` |
-| `repair-agent-runs` | in-place backfill the `parent_agent_run_id` / `agent_model` missing from the step/substep rows of a pre-`caa10ab` `agent_runs.jsonl`, and make it `pre_judge`-compliant | auto-run at `--resume`. Only when auto-derivation is `needs_manual`, run it manually with `--agent-model <id>` (for details, `RUNBOOK.md` §3-1) |
+| `repair-agent-runs` | in-place backfill the `parent_agent_run_id` / `agent_model` missing from the step/substep rows of a pre-`caa10ab` `agent_runs.jsonl`, and make it `pre_judge`-compliant. The orchestration row is also covered for `agent_model` only (it is the graph root, so no `parent_agent_run_id` is added) | auto-run at `--resume`. Only when auto-derivation is `needs_manual`, run it manually with `--agent-model <id>` (for details, `RUNBOOK.md` §3-1) |
 | `dismiss-violation` | mark a known benign `unauthorized_write_violation` as operator-approved, and pass the terminal validation of `record-agent-run` on retry | used when an intentionally benign path such as a gitignore-derived `.pyc` / `.pycache` is recorded in a violation. `--paths` can specify only a path included in the `unauthorized_paths` of `violations/<arid>.unauthorized_write_violation.json` (matched as a subset). The `record-agent-run` on retry passes only when `dismissed_paths` contains the detected unauthorized paths |
 
 ## Argument-acquisition path
