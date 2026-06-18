@@ -62,7 +62,10 @@ Forbid non-periodic boundary. Forbid the addition of `limiter` / `clip` / `filte
 ## 8. Traceability
 `case.resolved.yaml` requires recording the resolution result of `spec_kind`, `spec_id`, `spec_version`, `component_id@version`, and `profile_id@version`.
 
-The reference basis is LeVeque (2002). For the verification profile, refer to `spec/problem/dynamics/advection_diffusion/advdiff1d_linear/tests.md`.
+The reference basis is LeVeque (2002).
 
-## 9. AD preparation information
+## 9. tests reference
+The corresponding `tests.md` is `spec/problem/dynamics/advection_diffusion/advdiff1d_linear/tests.md`, with `test_profile_version` of `0.1.1`.
+
+## 10. AD preparation information
 `ad_readiness.enabled` is `true`. The state update is expressed in the form $u_{next}=F(u_{now}, params)$, and `ceil` and the periodic-index wrap are made explicit as non-differentiable operations.

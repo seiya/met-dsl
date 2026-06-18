@@ -9,8 +9,8 @@
 - `spec_ref.spec_version`: `0.3.0`
 - `spec_ref.controlled_spec_path`: `spec/component/dynamics/shallow_water/dynamics_shallow_water_time_update_2d_ssprk2/controlled_spec.md`
 
-## 1. Tested `operation`
-- `dynamics_shallow_water_time_update_2d_ssprk2__advance`
+## 1. Test purpose
+This suite verifies the published `operation` `dynamics_shallow_water_time_update_2d_ssprk2__advance` at `L0`: the zero-`RHS` invariance, the 2-stage weight consistency, the frozen-`RHS` exactness, the `z_b`-invariance, and the input guard for an invalid time step (`dt<=0`).
 
 ## 2. Input-defaulting rules
 - The normal case uses `dt>0`, `dx>0`, `dy>0`, and includes both `S_b=0` and `S_b!=0` in the evaluation target.
@@ -18,15 +18,21 @@
 - The `z_b`-invariance case holds `U^n`, `L_flux`, and `S_b` fixed and evaluates the update for two distinct `z_b` fields, comparing the two `U^{n+1}` results.
 - The abnormal case uses `dt<=0`.
 
-## 3. Diagnostics contract
+## 3. Execution-control rules
+`N/A`: this `component` advances a single step for a given `dt` and does not control the time loop or its cadence. Execution control is the responsibility of the `problem` runner.
+
+## 4. Case-expansion rules
+`N/A`: the `L0` suite uses fixed inputs and defines no `case` sweep. Case expansion is defined at the `problem` level.
+
+## 5. Diagnostics contract
 - Require outputting `checks.zero_rhs_invariance`, `checks.stage_weight_consistency`, `checks.input_guard`, `checks.zb_invariance`, and `checks.frozen_rhs_exactness` in `diagnostics.json`.
 
-## 4. Test definitions
+## 6. Test definitions
 - `test_id`: `l0_zero_rhs_invariance_pass`
   - `level`: `L0`
   - `operation_id`: `dynamics_shallow_water_time_update_2d_ssprk2__advance`
   - `expected_outcome`: `pass`
-  - `judgment`: with `L_flux=0` and `S_b=0`, satisfy `U^{n+1}=U^n`.
+  - `judgment`: with `L_flux=0` and `S_b=0`, satisfy `U^{n+1}=U^n` within an absolute tolerance of `1e-12` (component-wise max deviation `<= 1e-12`).
 - `test_id`: `l0_stage_weight_consistency_pass`
   - `level`: `L0`
   - `operation_id`: `dynamics_shallow_water_time_update_2d_ssprk2__advance`
@@ -36,7 +42,7 @@
   - `level`: `L0`
   - `operation_id`: `dynamics_shallow_water_time_update_2d_ssprk2__advance`
   - `expected_outcome`: `pass`
-  - `judgment`: with fixed nonzero `L_flux` and `S_b`, satisfy `U^{n+1} = U^n + dt*(L_flux + S_b)` (frozen-field closed form; both stages use the identical RHS).
+  - `judgment`: with fixed nonzero `L_flux` and `S_b`, satisfy `U^{n+1} = U^n + dt*(L_flux + S_b)` within an absolute tolerance of `1e-12` (component-wise max deviation `<= 1e-12`; frozen-field closed form; both stages use the identical RHS).
 - `test_id`: `l0_zb_invariance_pass`
   - `level`: `L0`
   - `operation_id`: `dynamics_shallow_water_time_update_2d_ssprk2__advance`
@@ -49,10 +55,10 @@
   - `xfail_condition`: `dt<=0`
   - `pass_when`: `verdict.overall == fail and verdict.failed_checks includes 'input_guard'`
 
-## 5. Pass/fail aggregation rules
+## 7. Pass/fail aggregation rules
 - `per_test.pass_rule`: `pass` when the judgment expression is satisfied.
 - `per_test.xfail_rule`: `xfail` when `xfail_condition` is true and `pass_when` is satisfied.
 - `suite.pass_rule`: `pass` when all `test_id` are `pass` or `xfail`.
 
-## 6. Traceability
+## 8. Traceability
 - Record `test_profile_id` and `test_profile_version` in `trial_meta.json`.

@@ -9,10 +9,10 @@
 - `spec_ref.spec_version`: `0.3.0`
 - `spec_ref.controlled_spec_path`: `spec/problem/dynamics/shallow_water/shallow_water2d/controlled_spec.md`
 
-## 1. Purpose
+## 1. Test purpose
 This suite verifies, for the discrete implementation of the 2D shallow water equation including bottom topography, conservation, lake-at-rest invariance, stability under topographic forcing, agreement with the theoretical solution, translation equivariance, and the `CFL` guard. The conservation judgment targets mass for all cases, and momentum for the `topography_profile=flat` cases. The judgment targets are `L0` to `L3`, and include an expected failure (`xfail`).
 
-## 2. Input defaulting
+## 2. Input-defaulting rules
 ### 2-1. Basic constants
 - The domain lengths are `L_x=L_y=1.0`.
 - The representative water level is `H_0=1.0`.
@@ -69,7 +69,7 @@ h_{ref}(x,t)=H_0+\eta_0\sin\left(2\pi\left(\frac{x}{L_x}-\frac{c_0 t}{L_x}-\math
 $$
 A theoretical-agreement judgment for variables other than `h` is not required in this suite.
 
-## 3. Defaults of execution control
+## 3. Execution-control rules
 - $t_{start}=0.0$ and $t_{end}=0.2$.
 - `dt` is decided by the following procedure.
   1. Evaluate $\lambda_0=\max_{i,j}\left((|u_{i,j}|+\sqrt{gh_{i,j}})/dx+(|v_{i,j}|+\sqrt{gh_{i,j}})/dy\right)$ at the initial time.
@@ -106,7 +106,7 @@ The `sweep` and fixed values per `family` are defined below.
 - Add the `case_id` `swe2d_flat_sym_n064_sx025_sy012_dts100`.
 - The `base_case_id` references `swe2d_flat_sym_n064_sx000_sy000_dts100`, and overrides only `shift_x_fraction=0.25` and `shift_y_fraction=0.125`.
 
-## 5. Diagnostic artifacts and contract
+## 5. Diagnostics contract
 ### 5-1. Artifacts
 - The diagnostic output file is `diagnostics.json`.
 - The judgment output file is `verdict.json`.
@@ -183,7 +183,7 @@ $$
 \quad \eta=h+z_b
 $$
 
-## 6. Default thresholds
+### 5-5. Default thresholds
 - $\mathrm{cfl.max} \le 1.0$
 - $h_{min} \ge 5.0e{-2}$
 - $\mathrm{mass\_drift\_rel} \le 1.0e{-10}$
@@ -195,8 +195,8 @@ $$
 - `lake_rest.max_surface_deviation \le 1.0e{-12}`
 - `symmetry_h_l2_rel \le 2.0e{-11}`
 
-## 7. Test definitions
-### 7-1. `l1_refinement_mass_and_positivity`
+## 6. Test definitions
+### 6-1. `l1_refinement_mass_and_positivity`
 - `level`: `L1`
 - `objective`: confirm mass conservation and positivity against refinement for `williamson_tc5_cone + linear_wave_x`.
 - target cases:
@@ -213,7 +213,7 @@ $$
   - The translation-equivariance judgment is not applied. The non-application basis is "because the pair case is not run".
   - The lake-at-rest invariance judgment is not applied. The non-application basis is "because the initial condition is not `lake_at_rest`".
 
-### 7-2. `l1_refinement_linear_wave`
+### 6-2. `l1_refinement_linear_wave`
 - `level`: `L1`
 - `objective`: confirm the theoretical-solution error decrease with refinement for `flat + linear_wave_x`.
 - target cases:
@@ -230,7 +230,7 @@ $$
   - The translation-equivariance judgment is not applied. The non-application basis is "because the pair case is not run".
   - The lake-at-rest invariance judgment is not applied. The non-application basis is "because the initial condition is not `lake_at_rest`".
 
-### 7-3. `l2_lake_at_rest_invariance`
+### 6-3. `l2_lake_at_rest_invariance`
 - `level`: `L2`
 - `objective`: confirm that the velocity and free surface are invariant for `williamson_tc5_cone + lake_at_rest`.
 - target cases:
@@ -245,7 +245,7 @@ $$
   - The theoretical-comparison judgment is not applied. The non-application basis is "because it is a topography lake-at-rest case".
   - The translation-equivariance judgment is not applied. The non-application basis is "because it is a single-case verification".
 
-### 7-4. `l2_long_run_mass_conservation`
+### 6-4. `l2_long_run_mass_conservation`
 - `level`: `L2`
 - `objective`: confirm that mass and depth positivity are maintained in long-time integration of `williamson_tc5_cone + linear_wave_x`.
 - target cases:
@@ -260,7 +260,7 @@ $$
   - The translation-equivariance judgment is not applied. The non-application basis is "because the pair case is not run".
   - The lake-at-rest invariance judgment is not applied. The non-application basis is "because the initial condition is not `lake_at_rest`".
 
-### 7-5. `l3_topography_forced_response_stability`
+### 6-5. `l3_topography_forced_response_stability`
 - `level`: `L3`
 - `objective`: confirm the numerical stability under topographic forcing for `williamson_tc5_cone + oblique_mode`.
 - target cases:
@@ -275,7 +275,7 @@ $$
   - The translation-equivariance judgment is not applied. The non-application basis is "because equivariance is not required in this test for a case with topography".
   - The lake-at-rest invariance judgment is not applied. The non-application basis is "because the initial condition is not `lake_at_rest`".
 
-### 7-6. `l3_translation_equivariance`
+### 6-6. `l3_translation_equivariance`
 - `level`: `L3`
 - `objective`: confirm that the numerical solution is equivariant to the translation of the `flat + oblique_mode` initial condition.
 - pair cases:
@@ -291,7 +291,7 @@ $$
   - The theoretical-comparison judgment is not applied. The non-application basis is "because `oblique_mode` is outside the target of the theoretical-agreement judgment".
   - The lake-at-rest invariance judgment is not applied. The non-application basis is "because the initial condition is not `lake_at_rest`".
 
-### 7-7. `l0_cfl_guard_xfail`
+### 6-7. `l0_cfl_guard_xfail`
 - `level`: `L0`
 - `objective`: confirm that a `CFL`-violation case can be detected (expected failure).
 - target cases:
@@ -308,13 +308,16 @@ $$
   - The translation-equivariance judgment is not applied. The non-application basis is "because the pair case is not run".
   - The lake-at-rest invariance judgment is not applied. The non-application basis is "because the initial condition is not `lake_at_rest`".
 
-## 8. verdict aggregation rules
+## 7. Pass/fail aggregation rules
 - `per_test.pass_rule`: `pass` when all applicable checks are `pass`.
 - `per_test.xfail_rule`: `xfail` when `expected_outcome == xfail` and `xfail_condition` is true and `pass_when` is satisfied.
 - `suite.pass_rule`: `pass` when all `test_id` satisfy `pass_rule` or `xfail_rule`.
 
-## 9. Output requirements and traceability
+## 8. Traceability
+### 8-1. Output requirements
 - `verdict.json` requires each check's `status`, `metric_value`, `threshold`, and `reason_na` when `applicable=false`.
 - `summary.json` requires the counts of `pass`, `fail`, `xfail`, and `skipped`.
+
+### 8-2. Traceability records
 - The `test_profile_id` and `test_profile_version` of this document must be recorded in `case.resolved.yaml` and `trial_meta.json`.
 - The judgment conditions of this document must be mappable to the evaluation basis of `verdict.json`.

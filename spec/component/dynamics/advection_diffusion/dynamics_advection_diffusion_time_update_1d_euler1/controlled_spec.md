@@ -38,8 +38,8 @@ Forbid automatic switching of the time-integration method.
 ## 7. Traceability
 Require recording the adoption result in `component_catalog.yaml` and `case.resolved.yaml`.
 
-## 8. AD preparation information
-`ad_readiness.enabled` is `true`. `ceil` (when used in the `dt` rule) is made explicit as a non-differentiable operation.
+## 8. tests reference
+The corresponding `tests.md` is `spec/component/dynamics/advection_diffusion/dynamics_advection_diffusion_time_update_1d_euler1/tests.md`, with `test_profile_version` of `0.1.0`.
 
-## 9. tests reference
-Place the corresponding `tests.md` in the same directory, with `test_profile_version` of `0.1.0`.
+## 9. AD preparation information
+`ad_readiness.enabled` is `true`. `ceil` (when used in the `dt` rule) is made explicit as a non-differentiable operation.

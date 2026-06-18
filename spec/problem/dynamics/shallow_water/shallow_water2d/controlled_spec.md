@@ -95,7 +95,10 @@ Forbid non-periodic boundary, automatic switching of `topography_profile`, the i
 ## 8. Traceability
 `case.resolved.yaml` requires recording the resolution result of `spec_kind`, `spec_id`, `spec_version`, `component_id@version`, and `profile_id@version`.
 
-The reference basis is Williamson et al. (1992, JCP, DOI:10.1016/S0021-9991(05)80016-6), LeVeque (2002), and Toro (2009). For the verification profile, refer to `spec/problem/dynamics/shallow_water/shallow_water2d/tests.md`.
+The reference basis is Williamson et al. (1992, JCP, DOI:10.1016/S0021-9991(05)80016-6), LeVeque (2002), and Toro (2009).
 
-## 9. AD preparation information
+## 9. tests reference
+The corresponding `tests.md` is `spec/problem/dynamics/shallow_water/shallow_water2d/tests.md`, with `test_profile_version` of `0.2.0`.
+
+## 10. AD preparation information
 `ad_readiness.enabled` is `true`. The state update is expressed in the form $U_{next}=F(U_{now}, params)$, and `max`, `abs`, `ceil`, and the periodic-index wrap are made explicit as non-differentiable operations.

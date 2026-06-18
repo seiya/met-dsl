@@ -21,7 +21,7 @@ This suite verifies the default-profile selection rule and the compatibility gua
 - The abnormal case uses `dynamics_advection_diffusion_flux_1d_upwind_center2@1.0.0` as an out-of-compatibility-range version.
 
 ## 3. Execution-control rules
-This suite targets only the judgment of the `profile`-selection logic. The execution control of the time integration is `N/A`. The reason is "because this suite verifies only profile resolution".
+This suite targets only the judgment of the `profile`-selection logic. The execution control of the time integration is `N/A`. The non-application basis is "because this suite verifies only profile resolution".
 
 ## 4. Case-expansion rules
 - `case_id=profile_select_default`

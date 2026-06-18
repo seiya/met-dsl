@@ -12,7 +12,15 @@
 This `component` is responsible for the interface-flux computation of the shallow water equation. Reconstruction is fixed to first-order `p0`.
 
 ## 2. input/output contract
-The input is the left/right states and bottom/top states of `U=[h,hu,hv]^T`, and the gravitational acceleration `g`. The output is `F*` and `G*`.
+The input variables are the left/right states `U_L`, `U_R` across an `x`-interface and the bottom/top states `U_B`, `U_T` across a `y`-interface, each the conserved-variable vector `U=[h, hu, hv]^T`, together with the gravitational acceleration `g`. The output variables are the numerical flux `F*` across the `x`-interface and `G*` across the `y`-interface, each a length-3 vector ordered as `[h, hu, hv]` and aligned with `U`.
+
+Array placement: all inputs and outputs are interface-located values. The caller supplies the reconstructed left/right and bottom/top states at each interface, and receives the flux at the same interface. The operation is pointwise per interface; vectorized application over a 2D grid is the caller's responsibility.
+
+Units: `h` is in `$\mathrm{m}$`, `hu` and `hv` are in `$\mathrm{m^2\,s^{-1}}$`, `g` is in `$\mathrm{m\,s^{-2}}$`, `F*` and `G*` carry the corresponding flux units (`$\mathrm{m^2\,s^{-1}}$` for the `h` component and `$\mathrm{m^3\,s^{-2}}$` for the `hu` / `hv` components).
+
+Dimensions: each state and flux is a 3-component vector. The component is 2D in the sense that it produces the `x`-direction flux `F*` and the `y`-direction flux `G*` from the respective interface states.
+
+Boundary handling: out of scope. This `component` does not apply boundary conditions and assumes the caller provides valid interface states; boundary treatment is the responsibility of the boundary `component`.
 
 ## 3. Operation definition
 The published `operation` is `dynamics_shallow_water_flux_2d_rusanov_p0__compute_flux`. The Rusanov flux is defined by
@@ -39,8 +47,8 @@ Forbid automatic switching of the reconstruction order and the implicit applicat
 ## 7. Traceability
 Require recording the adoption result in `component_catalog.yaml` and `case.resolved.yaml`.
 
-## 8. AD preparation information
-`ad_readiness.enabled` is `true`. `max` and `abs` are made explicit as non-differentiable operations.
+## 8. tests reference
+The corresponding `tests.md` is `spec/component/dynamics/shallow_water/dynamics_shallow_water_flux_2d_rusanov_p0/tests.md`, with `test_profile_version` of `0.1.0`.
 
-## 9. tests reference
-Place the corresponding `tests.md` in the same directory, with `test_profile_version` of `0.1.0`.
+## 9. AD preparation information
+`ad_readiness.enabled` is `true`. `max` and `abs` are made explicit as non-differentiable operations.

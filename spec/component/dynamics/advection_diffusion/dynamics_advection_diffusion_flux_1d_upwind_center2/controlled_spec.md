@@ -35,8 +35,8 @@ The discretization order must not be changed automatically. Forbid implicit comp
 ## 7. Traceability
 This `operation_id` requires registration in `component_catalog.yaml`. `case.resolved.yaml` requires recording the adopted `component_id@version`.
 
-## 8. AD preparation information
-`ad_readiness.enabled` is `true`. It includes no non-differentiable operations.
+## 8. tests reference
+The corresponding `tests.md` is `spec/component/dynamics/advection_diffusion/dynamics_advection_diffusion_flux_1d_upwind_center2/tests.md`, with `test_profile_version` of `0.1.0`.
 
-## 9. tests reference
-Place the corresponding `tests.md` in the same directory, with `test_profile_version` of `0.1.0`.
+## 9. AD preparation information
+`ad_readiness.enabled` is `true`. It includes no non-differentiable operations.

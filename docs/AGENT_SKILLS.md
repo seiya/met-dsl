@@ -49,6 +49,7 @@ This document defines the reference conventions for the `skills` used in the pro
 ## Auxiliary Skills
 - `Workflow audit (Codex)`: `skills/workflow-audit-codex/SKILL.md`
 - `Workflow audit (Claude Code)`: `skills/workflow-audit-claude/SKILL.md`
+- `Spec input check`: `skills/spec-input-check/SKILL.md` (pre-`Compile` advisory check of `controlled_spec.md` / `deps.yaml` / `tests.md`; proposal only, does not modify the spec)
 
 ## Operations Rules
 1. When handling multiple phases in one piece of work, switch the corresponding `SKILL` per phase.

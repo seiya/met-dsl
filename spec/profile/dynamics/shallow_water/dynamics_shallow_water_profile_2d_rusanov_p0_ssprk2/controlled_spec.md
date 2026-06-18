@@ -31,4 +31,4 @@ When the compatibility condition of a target `component` is not satisfied, it is
 `case.resolved.yaml` requires recording `profile_id=dynamics_shallow_water_profile_2d_rusanov_p0_ssprk2` and the resolved `component_id@version`.
 
 ## 6. tests reference
-Place the corresponding `tests.md` in the same directory, with `test_profile_version` of `0.1.0`.
+The corresponding `tests.md` is `spec/profile/dynamics/shallow_water/dynamics_shallow_water_profile_2d_rusanov_p0_ssprk2/tests.md`, with `test_profile_version` of `0.1.0`.
