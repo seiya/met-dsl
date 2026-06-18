@@ -140,6 +140,25 @@ Optional flows:
 - Performance shortfall (insufficient exploration of B) → launch the `impl_defaults` variant exploration of the optional flow `Tune`.
 - Official-version promotion → go to `releases/` with the optional flow `Promote`.
 
+## 3-0. Auto-running dependencies (`--with-deps`)
+
+When a `node` is fail-closed with `dependency_not_ready` (`direct_dependency_compile_readiness_not_pass` / `..._execution_readiness_not_pass`) because its dependency nodes have not been compiled/built/validated yet, there are two ways forward:
+
+1. Run the core workflow for each dependency node manually (bottom-up: components → profile → problem), then run the target.
+2. Run the target with `--with-deps`, which resolves the target's transitive dependency closure (`deps.yaml` + `spec_catalog.yaml`) and runs each not-yet-ready dependency node bottom-up (one orchestration per node) before the target.
+
+```bash
+# auto-run the dependency closure, then the target
+python3 tools/run_workflow.py spec/problem/dynamics/advection_diffusion/advdiff1d_linear validate --llm claude --with-deps
+```
+
+Behavior:
+- Dependency nodes run to **Compile** when `<until_phase>=compile` (compile readiness), else to **Validate** (execution readiness).
+- Dependency nodes that already satisfy the required readiness are **skipped** (idempotent).
+- Execution is **sequential** in dependency order; on the first dependency-node failure the run **stops** before the dependent/target node, and the JSON output records `failed_dependency_node` + its `orchestration_id` + the `dependency_runs` summary.
+- The target node's final JSON result carries a `dependency_runs` summary of which nodes ran / were skipped.
+- `--with-deps` is **ignored with `--resume`** (resume re-enters a single existing orchestration — the target — only).
+
 ## 3-1. Resuming a failed workflow (`--resume`)
 
 The canonical path to resume a workflow that failed midway, from the failure point while reusing completed `step` (e.g. already-compiled), is `python3 tools/run_workflow.py --resume`.

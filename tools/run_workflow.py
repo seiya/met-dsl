@@ -848,6 +848,18 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
             "repair-agent-runs backfills it from sibling rows on resume."
         ),
     )
+    parser.add_argument(
+        "--with-deps",
+        action="store_true",
+        help=(
+            "Before running the target, resolve its transitive dependency closure "
+            "(deps.yaml + spec_catalog.yaml) and run each not-yet-ready dependency "
+            "node's workflow bottom-up (dependency order), one orchestration per "
+            "node. Dependency nodes run to Compile when the target ends at compile, "
+            "else to Validate (matching compile / execution readiness). Already-ready "
+            "dependencies are skipped. Ignored with --resume (target only)."
+        ),
+    )
     parser.add_argument("--repo-root", default=".")
     parser.add_argument("--orchestration-id", help="If omitted, generated automatically (or, with --resume, the latest orchestration).")
     parser.add_argument("--status", default="running", help="Initial orchestration status for init.")
@@ -1083,19 +1095,17 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 2
 
-    tmp_parent = repo_root / "workspace" / "tmp"
-    tmp_parent.mkdir(parents=True, exist_ok=True)
-    # TMPDIR must match output_manifest.allowed_tmp_root for the active agent (orchestration uses
-    # workspace/tmp/<orchestration_agent_run_id>). Set only after init returns that id; cleanup only
-    # that directory so concurrent workflows' workspace/tmp/<other_agent_run_id>/ are untouched.
-    orchestration_tmp_for_cleanup: Path | None = None
-
-    env = dict(os.environ)
-    env["METDSL_WORKFLOW_MODE"] = "1"
-    env["METDSL_ORCHESTRATION_ID"] = orchestration_id
-    env["METDSL_WORKFLOW_EXEC_MODE"] = workflow_mode
-    env["METDSL_MISSING_ORCHESTRATION_ID_POLICY"] = "strict"
-    env["PYTHONPATH"] = str(repo_root) + (f":{env['PYTHONPATH']}" if env.get("PYTHONPATH") else "")
+    # Base env shared by every node. METDSL_ORCHESTRATION_ID / TMPDIR /
+    # ORCHESTRATION_AGENT_RUN_ID are per-node and set inside _run_node so a
+    # dependency-closure run (one orchestration per node) never leaks the
+    # previous node's ids/tmp into the next.
+    base_env = dict(os.environ)
+    base_env["METDSL_WORKFLOW_MODE"] = "1"
+    base_env["METDSL_WORKFLOW_EXEC_MODE"] = workflow_mode
+    base_env["METDSL_MISSING_ORCHESTRATION_ID_POLICY"] = "strict"
+    base_env["PYTHONPATH"] = str(repo_root) + (
+        f":{base_env['PYTHONPATH']}" if base_env.get("PYTHONPATH") else ""
+    )
     # Prevent Python from writing *.pyc / __pycache__ bytecode under tools/.
     # Without this, any `python3 tools/orchestration_runtime.py` call made by
     # the orchestration agent (or child subprocesses) generates
@@ -1105,18 +1115,89 @@ def main(argv: list[str] | None = None) -> int:
     # dict ensures it propagates to: (a) _runtime_command() subprocesses,
     # (b) the orchestration agent launch subprocess, and (c) any grandchild
     # `python3 tools/...` invocations the agent makes.
-    env.setdefault("PYTHONDONTWRITEBYTECODE", "1")
+    base_env.setdefault("PYTHONDONTWRITEBYTECODE", "1")
+
+    # `--with-deps` runs the target's transitive dependency closure bottom-up
+    # (one orchestration per node) before the target. Scoped to fresh runs:
+    # `--resume` re-enters a single existing orchestration (the target), so the
+    # closure is not re-walked there.
+    if getattr(args, "with_deps", False) and not resume_mode:
+        return _run_with_dependency_closure(
+            repo_root=repo_root,
+            base_env=base_env,
+            target_orchestration_id=orchestration_id,
+            target_spec_ref=spec_ref,
+            target_source_dependency_ref=source_dependency_ref,
+            until_phase=until_phase,
+            llm=llm,
+            llm_command=llm_command,
+            workflow_mode=workflow_mode,
+            agent_model=args.agent_model,
+            status=args.status,
+            invoke_llm=args.invoke_llm,
+        )
+
+    return _run_node(
+        repo_root=repo_root,
+        base_env=base_env,
+        orchestration_id=orchestration_id,
+        spec_ref=spec_ref,
+        source_dependency_ref=source_dependency_ref,
+        until_phase=until_phase,
+        llm=llm,
+        llm_command=llm_command,
+        workflow_mode=workflow_mode,
+        agent_model=args.agent_model,
+        status=args.status,
+        invoke_llm=args.invoke_llm,
+        resume_mode=resume_mode,
+    )
+
+
+def _run_node(
+    *,
+    repo_root: Path,
+    base_env: dict[str, str],
+    orchestration_id: str,
+    spec_ref: str,
+    source_dependency_ref: str,
+    until_phase: str,
+    llm: str,
+    llm_command: str,
+    workflow_mode: str,
+    agent_model: str | None,
+    status: str,
+    invoke_llm: bool,
+    resume_mode: bool,
+    extra_output: dict[str, Any] | None = None,
+) -> int:
+    """Run a single node's orchestration (init → preflight → prompt → launch →
+    terminalize) and print its JSON result. Returns the process exit code
+    (0 = ok). Each call uses its own orchestration_id / TMPDIR so the
+    dependency-closure driver can run one orchestration per node without
+    cross-node env/tmp leakage. `extra_output`, when given, is merged into the
+    final ok/fail JSON (used to carry the `dependency_runs` summary onto the
+    target node's result)."""
+    env = dict(base_env)
+    env["METDSL_ORCHESTRATION_ID"] = orchestration_id
+
+    tmp_parent = repo_root / "workspace" / "tmp"
+    tmp_parent.mkdir(parents=True, exist_ok=True)
+    # TMPDIR must match output_manifest.allowed_tmp_root for the active agent (orchestration uses
+    # workspace/tmp/<orchestration_agent_run_id>). Set only after init returns that id; cleanup only
+    # that directory so concurrent workflows' workspace/tmp/<other_agent_run_id>/ are untouched.
+    orchestration_tmp_for_cleanup: Path | None = None
 
     # For the Claude backend, pin a fresh host session UUID per launch so the real
     # Claude Code transcript (~/.claude/projects/<slug>/<host_session_id>.jsonl) is
     # addressable and can be recorded in orchestration_meta.json#host_session_id.
     # A resume spawns a new session, so a fresh id is generated each invocation.
-    # Gate on args.invoke_llm: with --no-invoke-llm no `claude --session-id` process
+    # Gate on invoke_llm: with --no-invoke-llm no `claude --session-id` process
     # ever starts, so recording a host_session_id would point meta at a transcript
     # that does not exist. (host_session_id is recorded at init for run-write-baseline
     # integrity; on a subsequent real launch via --resume it is regenerated.)
     host_session_id: str | None = (
-        str(uuid.uuid4()) if (llm == "claude" and args.invoke_llm) else None
+        str(uuid.uuid4()) if (llm == "claude" and invoke_llm) else None
     )
 
     try:
@@ -1143,8 +1224,8 @@ def main(argv: list[str] | None = None) -> int:
             # repair-agent-runs' sibling derivation, e.g. for a `needs_manual` row).
             # Do NOT apply the claude default here: with no override, sibling_uniform
             # derives the run's actual model, which is more accurate than a default.
-            if args.agent_model:
-                init_args += ["--agent-model", args.agent_model]
+            if agent_model:
+                init_args += ["--agent-model", agent_model]
         else:
             init_args = [
                 "init",
@@ -1155,7 +1236,7 @@ def main(argv: list[str] | None = None) -> int:
                 "--spec-ref",
                 spec_ref,
                 "--status",
-                args.status,
+                status,
                 "--agent-backend",
                 llm,
                 "--source-dependency-ref",
@@ -1167,7 +1248,7 @@ def main(argv: list[str] | None = None) -> int:
             # UNMODIFIED default command — an overridden --llm-command (e.g. a wrapper
             # selecting a different model) could launch a non-Opus model, so we must
             # not assert Opus there; leave it for sibling backfill on resume instead.
-            orchestration_model = args.agent_model
+            orchestration_model = agent_model
             if (
                 not orchestration_model
                 and llm == "claude"
@@ -1276,7 +1357,7 @@ def main(argv: list[str] | None = None) -> int:
         launched = False
         workflow_status = "running"
         cli_returncode_warning: int | None = None
-        if args.invoke_llm:
+        if invoke_llm:
             launch_command, launch_input = _launch_command_and_input(
                 llm=llm,
                 llm_command=llm_command,
@@ -1507,6 +1588,8 @@ def main(argv: list[str] | None = None) -> int:
                         "workflow_mode": workflow_mode,
                         "workflow_status": workflow_status,
                     }
+                    if extra_output:
+                        fail_output.update(extra_output)
                     try:
                         analysis_ref, runtime_analysis_ref, stale_canonical_ref = _write_failure_analysis(
                             repo_root,
@@ -1589,11 +1672,372 @@ def main(argv: list[str] | None = None) -> int:
         }
         if cli_returncode_warning is not None:
             ok_output["cli_returncode_warning"] = cli_returncode_warning
+        if extra_output:
+            ok_output.update(extra_output)
         print(json.dumps(ok_output, ensure_ascii=False))
         return 0
     finally:
         if orchestration_tmp_for_cleanup is not None and orchestration_tmp_for_cleanup.exists():
             shutil.rmtree(orchestration_tmp_for_cleanup, ignore_errors=True)
+
+
+def _dependency_node_ready(
+    repo_root: Path, node: dict[str, Any], required_stages: list[str]
+) -> bool:
+    """True iff the dependency node already satisfies `required_stages`.
+
+    Mirrors the runtime readiness contract (`_verify_dependency_readiness`): a
+    node is ready when ANY single matching catalog version has a coherent
+    artifact chain across all required stages (the same version V must satisfy
+    every stage). Kept module-level so the closure driver uses one consistent
+    readiness rule for both the pre-run skip check and the post-run
+    verification."""
+    from tools.orchestration_runtime import _verify_dep_stage
+
+    kind, sid = node["spec_kind"], node["spec_id"]
+    return any(
+        all(_verify_dep_stage(repo_root, kind, sid, v, st) for st in required_stages)
+        for v in node["spec_versions"]
+    )
+
+
+def _resolve_dependency_closure(
+    repo_root: Path, target_spec_ref: str
+) -> tuple[list[dict[str, Any]], dict[str, str] | None]:
+    """Resolve the target's transitive dependency closure in topological order.
+
+    Returns `(ordered, error)`:
+      - `ordered`: dependency nodes in dependency order (dependencies before
+        dependents), EXCLUDING the target. Each is
+        `{spec_ref, spec_kind, spec_id, spec_versions}`. `spec_versions` is the
+        descending list of catalog versions satisfying the requiring edge's
+        constraint (intersected across edges when a node is required more than
+        once). The readiness check mirrors the runtime contract
+        (`_verify_dependency_readiness`): a node is ready when ANY one of these
+        versions has a coherent artifact chain — so we keep all of them, not
+        just the highest, to avoid re-running a dependency that an older
+        matching version already satisfies.
+      - `error`: None on success; else `{reason, detail}` for a cycle,
+        unresolvable dependency, version conflict, malformed/missing deps.yaml,
+        or catalog corruption (all fail-closed — no node is run).
+
+    Edges come from `<spec_ref>/deps.yaml` resolved against `spec_catalog.yaml`
+    via the canonical runtime helpers (`_parse_dep_entries`,
+    `_matching_dep_versions`, `resolve_spec_ref_for`). Post-order DFS yields the
+    topological order; a node already on the DFS stack is a cycle.
+    """
+    from tools.orchestration_runtime import (
+        SpecCatalogCorruption,
+        _load_spec_catalog,
+        _matching_dep_versions,
+        _parse_dep_entries,
+        _read_deps_yaml,
+        resolve_spec_ref_for,
+    )
+
+    # The catalog is loaded lazily — only once a dependency edge is actually
+    # encountered. A leaf target (empty deps.yaml) needs no catalog, so a
+    # missing/corrupt registry must not turn an otherwise-launchable leaf
+    # workflow into a failure (matching the runtime readiness path, which
+    # treats no-deps specs as vacuously ready without the catalog).
+    catalog_cache: dict[tuple[str, str], tuple[str, ...]] | None = None
+
+    def _get_catalog() -> dict[tuple[str, str], tuple[str, ...]]:
+        nonlocal catalog_cache
+        if catalog_cache is None:
+            catalog_cache = _load_spec_catalog(str(repo_root.resolve()))
+        return catalog_cache
+
+    ordered_refs: list[str] = []
+    # Per spec_ref: the (kind, sid) identity, and the set of catalog versions
+    # satisfying every edge that required it (intersection across edges).
+    kindid_by_ref: dict[str, tuple[str, str]] = {}
+    matched_by_ref: dict[str, tuple[str, ...]] = {}
+    visiting: set[str] = set()
+    done: set[str] = set()
+    error: dict[str, str] | None = None
+
+    def visit(spec_ref: str) -> None:
+        nonlocal error
+        if error is not None or spec_ref in done:
+            return
+        if spec_ref in visiting:
+            error = {
+                "reason": "dependency_cycle",
+                "detail": f"dependency cycle detected at {spec_ref}",
+            }
+            return
+        visiting.add(spec_ref)
+        deps_doc = _read_deps_yaml(repo_root, spec_ref)
+        if not isinstance(deps_doc, dict):
+            error = {
+                "reason": "dependency_deps_unreadable",
+                "detail": f"{spec_ref}/deps.yaml is missing or unparseable",
+            }
+            return
+        entries, well_formed = _parse_dep_entries(deps_doc)
+        if not well_formed:
+            error = {
+                "reason": "dependency_deps_malformed",
+                "detail": f"{spec_ref}/deps.yaml has a malformed dependency schema",
+            }
+            return
+        for kind, sid, constraint in entries:
+            try:
+                matched = _matching_dep_versions(_get_catalog(), kind, sid, constraint)
+            except SpecCatalogCorruption as exc:
+                error = {"reason": "spec_catalog_corrupt", "detail": str(exc)}
+                return
+            if not matched:
+                error = {
+                    "reason": "dependency_unresolvable",
+                    "detail": (
+                        f"{kind}/{sid} constraint {constraint!r} has no matching "
+                        "catalog version"
+                    ),
+                }
+                return
+            dep_spec_ref = resolve_spec_ref_for(repo_root, kind, sid)
+            if not dep_spec_ref:
+                error = {
+                    "reason": "dependency_spec_ref_unresolved",
+                    "detail": f"no unique spec directory in catalog for {kind}/{sid}",
+                }
+                return
+            prior_kindid = kindid_by_ref.get(dep_spec_ref)
+            if prior_kindid is not None and prior_kindid != (kind, sid):
+                error = {
+                    "reason": "dependency_identity_conflict",
+                    "detail": (
+                        f"{dep_spec_ref} required as both {prior_kindid} and "
+                        f"{(kind, sid)}"
+                    ),
+                }
+                return
+            kindid_by_ref[dep_spec_ref] = (kind, sid)
+            # Intersect the matching-version sets across edges. An empty
+            # intersection means two edges pin incompatible version ranges for
+            # the same node — a genuine conflict, fail-closed.
+            prior_versions = matched_by_ref.get(dep_spec_ref)
+            if prior_versions is None:
+                matched_by_ref[dep_spec_ref] = tuple(matched)
+            else:
+                matched_set = set(matched)
+                intersection = tuple(v for v in prior_versions if v in matched_set)
+                if not intersection:
+                    error = {
+                        "reason": "dependency_version_conflict",
+                        "detail": (
+                            f"{dep_spec_ref} ({kind}/{sid}) required with "
+                            f"incompatible constraints: {prior_versions} vs {tuple(matched)}"
+                        ),
+                    }
+                    return
+                matched_by_ref[dep_spec_ref] = intersection
+            visit(dep_spec_ref)
+            if error is not None:
+                return
+        visiting.discard(spec_ref)
+        done.add(spec_ref)
+        ordered_refs.append(spec_ref)
+
+    visit(target_spec_ref)
+    if error is not None:
+        return [], error
+    ordered: list[dict[str, Any]] = []
+    for ref in ordered_refs:
+        if ref == target_spec_ref:
+            continue
+        kind, sid = kindid_by_ref[ref]
+        ordered.append(
+            {
+                "spec_ref": ref,
+                "spec_kind": kind,
+                "spec_id": sid,
+                "spec_versions": list(matched_by_ref[ref]),
+            }
+        )
+    return ordered, None
+
+
+def _run_with_dependency_closure(
+    *,
+    repo_root: Path,
+    base_env: dict[str, str],
+    target_orchestration_id: str,
+    target_spec_ref: str,
+    target_source_dependency_ref: str,
+    until_phase: str,
+    llm: str,
+    llm_command: str,
+    workflow_mode: str,
+    agent_model: str | None,
+    status: str,
+    invoke_llm: bool,
+) -> int:
+    """Run the target's dependency closure bottom-up, then the target.
+
+    Each dependency node runs as its own fresh orchestration (one per node).
+    Nodes already satisfying the required readiness are skipped. On the first
+    dependency failure the run stops (the target is not launched). The target's
+    final JSON result carries a `dependency_runs` summary.
+    """
+    ordered, error = _resolve_dependency_closure(repo_root, target_spec_ref)
+    if error is not None:
+        print(
+            json.dumps(
+                {
+                    "status": "fail",
+                    "reason": "dependency_closure_unresolved",
+                    "detail": error.get("detail"),
+                    "reason_code": error.get("reason"),
+                    "target_spec_ref": target_spec_ref,
+                },
+                ensure_ascii=False,
+            )
+        )
+        return 2
+
+    # Dependency depth follows the target: Compile-only readiness when the
+    # target stops at Compile, else full execution readiness (Build+Validate).
+    dep_until_phase = "Compile" if until_phase == "Compile" else "Validate"
+    required_stages = (
+        ["ir_ref"]
+        if dep_until_phase == "Compile"
+        else ["ir_ref", "pipeline_ref", "aggregate_verdict"]
+    )
+
+    dependency_runs: list[dict[str, Any]] = []
+    for node in ordered:
+        kind, sid, spec_ref = node["spec_kind"], node["spec_id"], node["spec_ref"]
+        node_label = f"{kind}/{sid}@{node['spec_versions'][0]}"
+        if _dependency_node_ready(repo_root, node, required_stages):
+            dependency_runs.append(
+                {"node": node_label, "spec_ref": spec_ref, "skipped": True, "status": "ready"}
+            )
+            continue
+
+        dep_orch_id = _new_orchestration_id()
+        try:
+            dep_source_dependency_ref = _discover_source_dependency_ref(repo_root, spec_ref)
+        except ValueError as exc:
+            print(
+                json.dumps(
+                    {
+                        "status": "fail",
+                        "reason": "dependency_dep_ref_unresolved",
+                        "detail": str(exc),
+                        "failed_dependency_node": node_label,
+                        "spec_ref": spec_ref,
+                        "dependency_runs": dependency_runs,
+                        "target_spec_ref": target_spec_ref,
+                    },
+                    ensure_ascii=False,
+                )
+            )
+            return 2
+        print(
+            json.dumps(
+                {
+                    "status": "info",
+                    "event": "dependency_node_start",
+                    "node": node_label,
+                    "spec_ref": spec_ref,
+                    "until_phase": dep_until_phase,
+                    "orchestration_id": dep_orch_id,
+                },
+                ensure_ascii=False,
+            )
+        )
+        rc = _run_node(
+            repo_root=repo_root,
+            base_env=base_env,
+            orchestration_id=dep_orch_id,
+            spec_ref=spec_ref,
+            source_dependency_ref=dep_source_dependency_ref,
+            until_phase=dep_until_phase,
+            llm=llm,
+            llm_command=llm_command,
+            workflow_mode=workflow_mode,
+            agent_model=agent_model,
+            status=status,
+            invoke_llm=invoke_llm,
+            resume_mode=False,
+        )
+        dependency_runs.append(
+            {
+                "node": node_label,
+                "spec_ref": spec_ref,
+                "skipped": False,
+                "orchestration_id": dep_orch_id,
+                "exit_code": rc,
+            }
+        )
+        if rc != 0:
+            print(
+                json.dumps(
+                    {
+                        "status": "fail",
+                        "reason": "dependency_node_failed",
+                        "failed_dependency_node": node_label,
+                        "spec_ref": spec_ref,
+                        "orchestration_id": dep_orch_id,
+                        "exit_code": rc,
+                        "dependency_runs": dependency_runs,
+                        "target_spec_ref": target_spec_ref,
+                    },
+                    ensure_ascii=False,
+                )
+            )
+            return rc
+
+        # A zero exit code does not by itself prove the dependency reached the
+        # required readiness: `--no-invoke-llm` only prepares artifacts, and a
+        # launched agent can exit cleanly with the orchestration still
+        # non-terminal ("running") without producing the ir/pipeline/verdict
+        # evidence. Re-verify before launching the dependent/target node;
+        # otherwise the next node would just fail-close at workflow-launch-check.
+        if not _dependency_node_ready(repo_root, node, required_stages):
+            dependency_runs[-1]["status"] = "not_ready_after_run"
+            print(
+                json.dumps(
+                    {
+                        "status": "fail",
+                        "reason": "dependency_not_ready_after_run",
+                        "detail": (
+                            f"{node_label} ran (exit 0) but did not produce the "
+                            f"required readiness ({'/'.join(required_stages)}); "
+                            "common causes: --no-invoke-llm, or the agent exited "
+                            "without recording a terminal pass (status still running)."
+                        ),
+                        "failed_dependency_node": node_label,
+                        "spec_ref": spec_ref,
+                        "orchestration_id": dep_orch_id,
+                        "dependency_runs": dependency_runs,
+                        "target_spec_ref": target_spec_ref,
+                    },
+                    ensure_ascii=False,
+                )
+            )
+            return 2
+
+    # All dependencies are ready — run the target node, carrying the summary.
+    return _run_node(
+        repo_root=repo_root,
+        base_env=base_env,
+        orchestration_id=target_orchestration_id,
+        spec_ref=target_spec_ref,
+        source_dependency_ref=target_source_dependency_ref,
+        until_phase=until_phase,
+        llm=llm,
+        llm_command=llm_command,
+        workflow_mode=workflow_mode,
+        agent_model=agent_model,
+        status=status,
+        invoke_llm=invoke_llm,
+        resume_mode=False,
+        extra_output={"dependency_runs": dependency_runs},
+    )
 
 
 if __name__ == "__main__":

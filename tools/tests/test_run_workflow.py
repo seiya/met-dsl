@@ -2000,5 +2000,305 @@ class RunWorkflowTests(unittest.TestCase):
         self.assertEqual(payload.get("detail"), "missing tools: jq,git")
 
 
+def _write_catalog(repo_root: Path, entries: list[dict]) -> None:
+    """Write a minimal spec_catalog.yaml from a list of {spec_kind, spec_id,
+    spec_version, deps_path} dicts."""
+    lines = ["catalog_version: 0.2.0", "updated_at: 2026-06-18", "specs:"]
+    for e in entries:
+        lines.append(f"  - spec_kind: {e['spec_kind']}")
+        lines.append(f"    spec_id: {e['spec_id']}")
+        lines.append(f"    spec_version: \"{e['spec_version']}\"")
+        lines.append(f"    deps_path: {e['deps_path']}")
+    (repo_root / "spec" / "registry").mkdir(parents=True, exist_ok=True)
+    (repo_root / "spec" / "registry" / "spec_catalog.yaml").write_text(
+        "\n".join(lines) + "\n", encoding="utf-8"
+    )
+
+
+def _write_deps(repo_root: Path, spec_ref: str, spec_kind: str, spec_id: str,
+                components: list[tuple[str, str]] | None = None,
+                profiles: list[tuple[str, str]] | None = None) -> None:
+    """Write a deps.yaml under <spec_ref>/. components/profiles are
+    (id, version_constraint) tuples."""
+    d = repo_root / spec_ref
+    d.mkdir(parents=True, exist_ok=True)
+    lines = [f"spec_id: {spec_id}", f"spec_kind: {spec_kind}", "dependencies:"]
+    lines.append("  components:")
+    for cid, c in (components or []):
+        lines.append(f"    - component_id: {cid}")
+        lines.append(f"      version_constraint: \"{c}\"")
+    if not components:
+        lines[-1] = "  components: []"
+    lines.append("  profiles:")
+    for pid, c in (profiles or []):
+        lines.append(f"    - profile_id: {pid}")
+        lines.append(f"      version_constraint: \"{c}\"")
+    if not profiles:
+        lines[-1] = "  profiles: []"
+    (d / "deps.yaml").write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+class DependencyClosureTests(unittest.TestCase):
+    def _seed_diamond(self, repo_root: Path) -> None:
+        # problem A → components B, C ; B → component C ; C leaf.
+        _write_catalog(repo_root, [
+            {"spec_kind": "problem", "spec_id": "a", "spec_version": "0.3.0",
+             "deps_path": "spec/problem/a/deps.yaml"},
+            {"spec_kind": "component", "spec_id": "b", "spec_version": "0.1.0",
+             "deps_path": "spec/component/b/deps.yaml"},
+            {"spec_kind": "component", "spec_id": "c", "spec_version": "0.1.0",
+             "deps_path": "spec/component/c/deps.yaml"},
+        ])
+        _write_deps(repo_root, "spec/problem/a", "problem", "a",
+                    components=[("b", ">=0.1.0 <1.0.0"), ("c", ">=0.1.0 <1.0.0")])
+        _write_deps(repo_root, "spec/component/b", "component", "b",
+                    components=[("c", ">=0.1.0 <1.0.0")])
+        _write_deps(repo_root, "spec/component/c", "component", "c")
+
+    def test_topological_order_dependencies_before_dependents(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._seed_diamond(repo_root)
+            ordered, err = run_workflow._resolve_dependency_closure(
+                repo_root, "spec/problem/a")
+            self.assertIsNone(err)
+            refs = [n["spec_id"] for n in ordered]
+            # target 'a' excluded; c precedes b (b depends on c).
+            self.assertEqual(refs, ["c", "b"])
+            self.assertTrue(all(n["spec_versions"] == ["0.1.0"] for n in ordered))
+
+    def test_cycle_detection_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            _write_catalog(repo_root, [
+                {"spec_kind": "component", "spec_id": "b", "spec_version": "0.1.0",
+                 "deps_path": "spec/component/b/deps.yaml"},
+                {"spec_kind": "component", "spec_id": "c", "spec_version": "0.1.0",
+                 "deps_path": "spec/component/c/deps.yaml"},
+            ])
+            # b → c → b
+            _write_deps(repo_root, "spec/component/b", "component", "b",
+                        components=[("c", ">=0.1.0")])
+            _write_deps(repo_root, "spec/component/c", "component", "c",
+                        components=[("b", ">=0.1.0")])
+            ordered, err = run_workflow._resolve_dependency_closure(
+                repo_root, "spec/component/b")
+            self.assertEqual(ordered, [])
+            self.assertEqual(err["reason"], "dependency_cycle")
+
+    def test_unresolvable_dependency_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            _write_catalog(repo_root, [
+                {"spec_kind": "problem", "spec_id": "a", "spec_version": "0.3.0",
+                 "deps_path": "spec/problem/a/deps.yaml"},
+                {"spec_kind": "component", "spec_id": "b", "spec_version": "0.1.0",
+                 "deps_path": "spec/component/b/deps.yaml"},
+            ])
+            # constraint matches no catalog version of b
+            _write_deps(repo_root, "spec/problem/a", "problem", "a",
+                        components=[("b", ">=2.0.0")])
+            _write_deps(repo_root, "spec/component/b", "component", "b")
+            ordered, err = run_workflow._resolve_dependency_closure(
+                repo_root, "spec/problem/a")
+            self.assertEqual(ordered, [])
+            self.assertEqual(err["reason"], "dependency_unresolvable")
+
+    def test_version_conflict_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            _write_catalog(repo_root, [
+                {"spec_kind": "problem", "spec_id": "a", "spec_version": "0.3.0",
+                 "deps_path": "spec/problem/a/deps.yaml"},
+                {"spec_kind": "component", "spec_id": "b", "spec_version": "1.0.0",
+                 "deps_path": "spec/component/b/deps.yaml"},
+                {"spec_kind": "component", "spec_id": "b", "spec_version": "2.0.0",
+                 "deps_path": "spec/component/b/deps.yaml"},
+                {"spec_kind": "component", "spec_id": "c", "spec_version": "0.1.0",
+                 "deps_path": "spec/component/c/deps.yaml"},
+            ])
+            # a → b==1.0.0, c ; c → b==2.0.0  → same spec dir, different version
+            _write_deps(repo_root, "spec/problem/a", "problem", "a",
+                        components=[("b", "==1.0.0"), ("c", ">=0.1.0")])
+            _write_deps(repo_root, "spec/component/b", "component", "b")
+            _write_deps(repo_root, "spec/component/c", "component", "c",
+                        components=[("b", "==2.0.0")])
+            ordered, err = run_workflow._resolve_dependency_closure(
+                repo_root, "spec/problem/a")
+            self.assertEqual(ordered, [])
+            self.assertEqual(err["reason"], "dependency_version_conflict")
+
+    def test_driver_runs_dependencies_bottom_up_then_target(self) -> None:
+        from tools.orchestration_runtime import _load_spec_catalog
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            _seed_shape_expr_schema_into(repo_root)
+            self._seed_diamond(repo_root)
+            _load_spec_catalog.cache_clear()
+
+            calls: list[tuple[str, str]] = []
+            ran: set[str] = set()
+
+            def fake_run_node(**kw):
+                calls.append((kw["spec_ref"], kw["until_phase"]))
+                ran.add(kw["spec_ref"])
+                return 0
+
+            # A node becomes ready once it has run (simulates artifact production
+            # without a real workflow). Exercises both the pre-run skip check and
+            # the post-run readiness verification.
+            def fake_ready(repo_root, node, required_stages):
+                return node["spec_ref"] in ran
+
+            orig = run_workflow._run_node
+            orig_ready = run_workflow._dependency_node_ready
+            run_workflow._run_node = fake_run_node  # type: ignore[assignment]
+            run_workflow._dependency_node_ready = fake_ready  # type: ignore[assignment]
+            try:
+                buf = io.StringIO()
+                with redirect_stdout(buf):
+                    rc = run_workflow._run_with_dependency_closure(
+                        repo_root=repo_root,
+                        base_env={"PATH": os.environ.get("PATH", "")},
+                        target_orchestration_id="orch_target",
+                        target_spec_ref="spec/problem/a",
+                        target_source_dependency_ref="spec/problem/a/deps.yaml",
+                        until_phase="Validate",
+                        llm="claude",
+                        llm_command="claude",
+                        workflow_mode="dev",
+                        agent_model=None,
+                        status="running",
+                        invoke_llm=False,
+                    )
+            finally:
+                run_workflow._run_node = orig  # type: ignore[assignment]
+                run_workflow._dependency_node_ready = orig_ready  # type: ignore[assignment]
+
+            self.assertEqual(rc, 0)
+            # deps (c, b) run before the target a; target last.
+            self.assertEqual([c[0] for c in calls],
+                             ["spec/component/c", "spec/component/b", "spec/problem/a"])
+            # target until_phase >= generate → deps run to Validate.
+            self.assertTrue(all(c[1] == "Validate" for c in calls))
+
+    def test_driver_stops_when_dependency_not_ready_after_run(self) -> None:
+        # A dependency that exits 0 without producing readiness evidence
+        # (e.g. --no-invoke-llm) must stop the run before the dependent/target.
+        from tools.orchestration_runtime import _load_spec_catalog
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            _seed_shape_expr_schema_into(repo_root)
+            self._seed_diamond(repo_root)
+            _load_spec_catalog.cache_clear()
+
+            calls: list[str] = []
+
+            def fake_run_node(**kw):
+                calls.append(kw["spec_ref"])
+                return 0  # success, but no artifacts are produced
+
+            orig = run_workflow._run_node
+            run_workflow._run_node = fake_run_node  # type: ignore[assignment]
+            try:
+                buf = io.StringIO()
+                with redirect_stdout(buf):
+                    rc = run_workflow._run_with_dependency_closure(
+                        repo_root=repo_root,
+                        base_env={"PATH": os.environ.get("PATH", "")},
+                        target_orchestration_id="orch_target",
+                        target_spec_ref="spec/problem/a",
+                        target_source_dependency_ref="spec/problem/a/deps.yaml",
+                        until_phase="Validate",
+                        llm="claude",
+                        llm_command="claude",
+                        workflow_mode="dev",
+                        agent_model=None,
+                        status="running",
+                        invoke_llm=False,
+                    )
+            finally:
+                run_workflow._run_node = orig  # type: ignore[assignment]
+
+            self.assertEqual(rc, 2)
+            # Stops after the first dependency (c); b and target never run.
+            self.assertEqual(calls, ["spec/component/c"])
+            last = json.loads(buf.getvalue().strip().splitlines()[-1])
+            self.assertEqual(last["reason"], "dependency_not_ready_after_run")
+            self.assertEqual(last["failed_dependency_node"], "component/c@0.1.0")
+
+    def test_driver_stops_on_first_dependency_failure(self) -> None:
+        from tools.orchestration_runtime import _load_spec_catalog
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            _seed_shape_expr_schema_into(repo_root)
+            self._seed_diamond(repo_root)
+            _load_spec_catalog.cache_clear()
+
+            calls: list[str] = []
+
+            def fake_run_node(**kw):
+                calls.append(kw["spec_ref"])
+                # Fail the first dependency (c).
+                return 2 if kw["spec_ref"] == "spec/component/c" else 0
+
+            orig = run_workflow._run_node
+            run_workflow._run_node = fake_run_node  # type: ignore[assignment]
+            try:
+                buf = io.StringIO()
+                with redirect_stdout(buf):
+                    rc = run_workflow._run_with_dependency_closure(
+                        repo_root=repo_root,
+                        base_env={"PATH": os.environ.get("PATH", "")},
+                        target_orchestration_id="orch_target",
+                        target_spec_ref="spec/problem/a",
+                        target_source_dependency_ref="spec/problem/a/deps.yaml",
+                        until_phase="Validate",
+                        llm="claude",
+                        llm_command="claude",
+                        workflow_mode="dev",
+                        agent_model=None,
+                        status="running",
+                        invoke_llm=False,
+                    )
+            finally:
+                run_workflow._run_node = orig  # type: ignore[assignment]
+
+            self.assertEqual(rc, 2)
+            # Stopped after c failed; b and the target a never ran.
+            self.assertEqual(calls, ["spec/component/c"])
+            last = json.loads(buf.getvalue().strip().splitlines()[-1])
+            self.assertEqual(last["reason"], "dependency_node_failed")
+            self.assertEqual(last["failed_dependency_node"], "component/c@0.1.0")
+
+    def test_leaf_target_closure_does_not_require_catalog(self) -> None:
+        # A leaf target (empty deps) must resolve to an empty closure without
+        # loading the catalog, so a missing/corrupt registry does not break an
+        # otherwise-launchable leaf --with-deps run.
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            _write_deps(repo_root, "spec/component/leaf", "component", "leaf")
+            # Intentionally NO spec/registry/spec_catalog.yaml on disk.
+            ordered, err = run_workflow._resolve_dependency_closure(
+                repo_root, "spec/component/leaf")
+            self.assertIsNone(err)
+            self.assertEqual(ordered, [])
+
+    def test_resolve_spec_ref_for_uses_deps_path_dirname(self) -> None:
+        from tools.orchestration_runtime import resolve_spec_ref_for, _load_spec_catalog
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            _write_catalog(repo_root, [
+                {"spec_kind": "component", "spec_id": "b", "spec_version": "0.1.0",
+                 "deps_path": "spec/component/b/deps.yaml"},
+            ])
+            _load_spec_catalog.cache_clear()
+            self.assertEqual(
+                resolve_spec_ref_for(repo_root, "component", "b"),
+                "spec/component/b",
+            )
+            self.assertIsNone(resolve_spec_ref_for(repo_root, "component", "missing"))
+
+
 if __name__ == "__main__":
     unittest.main()

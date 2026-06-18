@@ -288,6 +288,76 @@ def _load_spec_catalog(repo_root_str: str) -> dict[tuple[str, str], tuple[str, .
 _load_spec_catalog.cache_clear = _load_spec_catalog_from_bytes.cache_clear  # type: ignore[attr-defined]
 
 
+def resolve_spec_ref_for(
+    repo_root: Path, spec_kind: Any, spec_id: Any
+) -> str | None:
+    """Map a catalog `(spec_kind, spec_id)` to its spec_ref (spec directory).
+
+    The dependency closure driver (`tools/run_workflow.py --with-deps`) needs
+    the spec_ref PATH of each dependency node so it can run that node's own
+    workflow. `_load_spec_catalog` only retains versions per `(kind, spec_id)`
+    and drops paths, so this is a separate, path-preserving read of the same
+    canonical registry.
+
+    The spec_ref is the dirname of the entry's `deps_path`
+    (e.g. `spec/.../advdiff1d_linear/deps.yaml` → `spec/.../advdiff1d_linear`);
+    `controlled_spec_path` is used as a fallback. Returns the repo-relative
+    spec_ref string, or None when no catalog entry matches.
+
+    Assumes one spec directory per `(spec_kind, spec_id)` (version lives inside
+    `controlled_spec.md`, not in the directory path). When multiple entries for
+    the same `(kind, spec_id)` resolve to DIFFERENT directories, that ambiguity
+    is fail-closed (returns None) rather than silently picking one.
+
+    `spec_kind` / `spec_id` are validated with `_is_safe_path_token` before any
+    path use, consistent with the rest of the dependency-resolution layer.
+    """
+    if not (_is_safe_path_token(spec_kind) and _is_safe_path_token(spec_id)):
+        return None
+    catalog_path = Path(repo_root) / "spec" / "registry" / "spec_catalog.yaml"
+    if not catalog_path.is_file():
+        raise SpecCatalogCorruption(
+            f"spec_catalog.yaml is missing at {catalog_path}. Dependency "
+            "resolution requires the canonical registry."
+        )
+    yaml_mod = _require_yaml()
+    try:
+        doc = yaml_mod.safe_load(catalog_path.read_text(encoding="utf-8"))
+    except Exception as exc:  # noqa: BLE001
+        raise SpecCatalogCorruption(
+            f"spec_catalog.yaml could not be parsed as YAML: {exc}"
+        ) from exc
+    if not isinstance(doc, dict) or not isinstance(doc.get("specs"), list):
+        raise SpecCatalogCorruption(
+            "spec_catalog.yaml is missing the canonical `specs:` list"
+        )
+    repo_root_resolved = Path(repo_root).resolve()
+    found: set[str] = set()
+    for entry in doc["specs"]:
+        if not isinstance(entry, dict):
+            continue
+        if entry.get("spec_kind") != spec_kind or entry.get("spec_id") != spec_id:
+            continue
+        ref_source = entry.get("deps_path") or entry.get("controlled_spec_path")
+        if not isinstance(ref_source, str) or not ref_source.strip():
+            continue
+        spec_ref = str(Path(ref_source.strip()).parent).replace("\\", "/").strip("/")
+        if not spec_ref:
+            continue
+        # Confine to the repo tree (reject traversal) before trusting the path.
+        candidate = (repo_root_resolved / spec_ref).resolve()
+        try:
+            candidate.relative_to(repo_root_resolved)
+        except ValueError:
+            continue
+        found.add(spec_ref)
+    if len(found) != 1:
+        # No match → None. Multiple distinct dirs for one (kind, spec_id) →
+        # ambiguous; fail closed rather than silently choosing.
+        return None
+    return next(iter(found))
+
+
 _SEMVER_RE = re.compile(
     r"^(?P<core>\d+(?:\.\d+)*)"
     r"(?:-(?P<pre>[0-9A-Za-z.-]+))?"
