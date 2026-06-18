@@ -8111,5 +8111,69 @@ class FortranIdentifierLengthTests(unittest.TestCase):
         self.assertEqual(violations, [])
 
 
+class ModelSourceNotFoundMessageTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.src = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.src, ignore_errors=True)
+
+    def test_spec_id_unknown_stays_generic(self) -> None:
+        msg = vps._model_source_not_found_violation(self.src, None)
+        self.assertEqual(msg, f"{self.src}: model source not found")
+
+    def test_no_model_file_emitted(self) -> None:
+        msg = vps._model_source_not_found_violation(self.src, "foo_model.f90")
+        self.assertEqual(
+            msg, f"{self.src}: node model source not found (foo_model.f90)"
+        )
+
+    def test_abbreviated_model_file_names_offender_and_instructs_rename(self) -> None:
+        # A *_model.f90 exists but under an abbreviated (non-literal) name: the
+        # message must name the offender and say "rename", not the misleading
+        # "not found" that reads as if no file was written.
+        (self.src / "advdiff_bndry_pcopy_model.f90").write_text("", encoding="utf-8")
+        msg = vps._model_source_not_found_violation(
+            self.src, "dynamics_advection_diffusion_boundary_1d_periodic_copy_model.f90"
+        )
+        self.assertIn("advdiff_bndry_pcopy_model.f90 present", msg)
+        self.assertIn(
+            "dynamics_advection_diffusion_boundary_1d_periodic_copy_model.f90", msg
+        )
+        self.assertIn("rename", msg)
+        self.assertNotIn("not found", msg)
+
+    def test_overlong_literal_name_reports_spec_level_not_rename(self) -> None:
+        # When <spec_id>_model exceeds the f2008 63-char identifier limit, no
+        # legal literal name exists, so renaming an abbreviated file cannot fix
+        # it. The message must point at the spec-level problem, not say "rename".
+        spec_id = "x" * 70  # <spec_id>_model = 76 chars > 63
+        expected = f"{spec_id}_model.f90"
+        (self.src / "abbrev_model.f90").write_text("", encoding="utf-8")
+        msg = vps._model_source_not_found_violation(self.src, expected)
+        self.assertIn("exceeds", msg)
+        self.assertIn("spec-level", msg)
+        self.assertNotIn("rename", msg)
+
+    def test_dependency_usage_does_not_duplicate_no_model_report(self) -> None:
+        # _validate_dependency_operation_usage runs right after
+        # _validate_generate_outputs on the same src_dir, which already reports an
+        # absent / mis-named model source. The dependency check must stay silent
+        # in the no-model case so the abbreviated-name diagnostic is not paired
+        # with the stale "node model source not found" wording.
+        node = vps.NodeExecution(
+            node_key="component/dynamics_advection_diffusion_boundary_1d_periodic_copy@0.1.0",
+            node_dir=self.src,
+            exec_dir=self.src,
+            pipeline_dir=self.src,
+        )
+        # Abbreviated model file present (not the literal <spec_id>_model.f90).
+        (self.src / "advdiff_bndry_pcopy_model.f90").write_text("", encoding="utf-8")
+        original = vps._component_dep_spec_ids
+        vps._component_dep_spec_ids = lambda repo_root, ex: ["some_dependency_component"]
+        self.addCleanup(setattr, vps, "_component_dep_spec_ids", original)
+        violations: list[str] = []
+        vps._validate_dependency_operation_usage(self.src, node, self.src, violations)
+        self.assertEqual(violations, [])
+
+
 if __name__ == "__main__":
     unittest.main()

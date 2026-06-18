@@ -2950,12 +2950,9 @@ def _validate_generate_outputs(
 ) -> None:
     model_files, expected_model_name = _model_files_in_src_dir(src_dir, execution)
     if not model_files:
-        if expected_model_name is None:
-            violations.append(f"{src_dir}: model source not found")
-        else:
-            violations.append(
-                f"{src_dir}: node model source not found ({expected_model_name})"
-            )
+        violations.append(
+            _model_source_not_found_violation(src_dir, expected_model_name)
+        )
         return
 
     dep_spec_ids = _component_dep_spec_ids(repo_root, execution)
@@ -3114,12 +3111,9 @@ def _validate_generate_outputs_for_generation(
 
     model_files, expected_model_name = _model_files_in_src_dir(src_dir, execution)
     if not model_files:
-        if expected_model_name is None:
-            violations.append(f"{src_dir}: model source not found")
-        else:
-            violations.append(
-                f"{src_dir}: node model source not found ({expected_model_name})"
-            )
+        violations.append(
+            _model_source_not_found_violation(src_dir, expected_model_name)
+        )
         return
 
     dep_spec_ids = _component_dep_spec_ids(repo_root, execution)
@@ -5382,6 +5376,50 @@ def _model_files_in_src_dir(
     return [], expected_name
 
 
+def _model_source_not_found_violation(
+    src_dir: Path, expected_model_name: str | None
+) -> str:
+    """Build the violation message for an absent node model source.
+
+    When ``expected_model_name`` is None the spec_id could not be derived, so the
+    name is unknown and the message stays generic. Otherwise, distinguish the
+    real causes: (a) the required literal module name ``<spec_id>_model`` exceeds
+    the f2008 identifier limit, so no valid literal name exists and renaming
+    cannot fix it; (b) no ``*_model.f90`` was emitted at all; (c) a model source
+    exists but under a non-literal (abbreviated/derived) name. Case (c) is the
+    common Generate mistake — the literal ``<spec_id>_model.f90`` is required (a
+    depending node resolves it via ``use <spec_id>_model``) — so the message names
+    the offending file and instructs a rename rather than the misleading
+    "not found", which reads as if no file was written.
+    """
+    if expected_model_name is None:
+        return f"{src_dir}: model source not found"
+    # The module identifier is the expected name without the ``.f90`` suffix.
+    expected_module = expected_model_name[: -len(".f90")]
+    if len(expected_module) > _FORTRAN_NAME_LIMIT:
+        # No legal literal name exists: <spec_id>_model is itself over the f2008
+        # limit. Renaming the abbreviated file would only trade one violation for
+        # another, so this is a spec-level problem (the spec_id is too long) and
+        # must stop there rather than be "fixed" at Generate's discretion.
+        return (
+            f"{src_dir}: required model module name {expected_module} "
+            f"({len(expected_module)} chars) exceeds the f2008 "
+            f"{_FORTRAN_NAME_LIMIT}-char identifier limit; the spec_id is too "
+            "long for a literal <spec_id>_model name — stop as a spec-level "
+            "problem (do not abbreviate at Generate's discretion)"
+        )
+    present = sorted(
+        p.name for p in src_dir.glob("*_model.f90") if p.is_file()
+    )
+    if present:
+        return (
+            f"{src_dir}: model source {', '.join(present)} present but must be "
+            f"named {expected_model_name} (literal spec_id prefix required; "
+            "abbreviated/derived prefix rejected) — rename to match"
+        )
+    return f"{src_dir}: node model source not found ({expected_model_name})"
+
+
 def _validate_dependency_operation_on_model_files(
     model_files: list[Path],
     dep_spec_ids: list[str],
@@ -5419,12 +5457,15 @@ def _validate_dependency_operation_usage(
     if not dep_spec_ids:
         return
 
-    model_files, expected_model_name = _model_files_in_src_dir(src_dir, execution)
+    model_files, _expected_model_name = _model_files_in_src_dir(src_dir, execution)
     if not model_files:
-        if expected_model_name is not None:
-            violations.append(
-                f"{src_dir}: node model source not found ({expected_model_name})"
-            )
+        # The absent / mis-named model source is already reported by
+        # _validate_generate_outputs (which always runs on this same src_dir just
+        # before this check), via _model_source_not_found_violation. Re-reporting
+        # here would emit a duplicate — and, for the abbreviated-name case, the
+        # stale "node model source not found" wording alongside the clearer
+        # rename instruction. Stay silent and let the generate-outputs check own
+        # the diagnostic.
         return
 
     _validate_dependency_operation_on_model_files(
