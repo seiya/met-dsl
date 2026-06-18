@@ -12087,6 +12087,15 @@ def record_launch(
         "child_launch_response_ref": child_response_ref,
         "child_launch_prompt_ref": child_prompt_ref,
         "child_launch_reply_ref": child_reply_ref,
+        # The exact prompt text record-launch rendered and wrote to
+        # launches/<child_arid>.prompt.txt. Returned so the orchestration agent
+        # can pass it verbatim to the Agent tool WITHOUT reading the template
+        # (launch_prompts.md) or the written prompt file (both blocked for the
+        # orchestration). The Agent-tool prompt is then identical in content to
+        # the recorded artifact by construction (audit 1-to-1); the .prompt.txt
+        # file only differs by a trailing newline the text writer appends.
+        # Retained in terse output.
+        "launch_prompt_text": prompt_text,
     }
     if not (isinstance(nk, str) and nk.strip() and isinstance(st, str) and st.strip()):
         raise ValueError("record-launch requires non-empty node_key and step for sandbox-enforced launch")
@@ -14410,6 +14419,69 @@ def _validate_write_step_result_fields(payload: dict[str, Any], step: str) -> No
             )
 
 
+# Default (terse) result projections for the high-frequency bookkeeping
+# subcommands. Each maps a subcommand to the result fields the orchestration
+# agent actually consumes downstream. Anything not listed is dropped from the
+# default stdout to keep the orchestration's resident context small (its
+# cache-read cost scales with context size times turn count). The full payload
+# is still written to its canonical artifact files and recoverable with
+# --verbose. Commands absent from this map are emitted unprojected.
+_TERSE_RESULT_FIELDS: dict[str, tuple[str, ...]] = {
+    "record-launch": (
+        "capability_token",
+        "capability_ref",
+        "read_access_manifest_ref",
+        "allowed_output_manifest_ref",
+        "sandbox_profile_ref",
+        "launch_prompt_ref",
+        # The rendered prompt text the orchestration must pass verbatim to the
+        # Agent tool (it cannot read the template or the written prompt file).
+        "launch_prompt_text",
+    ),
+    # record_agent_run returns the run record; it carries started_at/finished_at,
+    # not a `recorded_at` field.
+    "record-agent-run": ("agent_run_id", "status", "started_at", "finished_at"),
+    "record-child-return": ("agent_run_id", "recorded_at", "return_token"),
+    "deactivate-child": (
+        "deactivated_child_run_id",
+        "orchestration_id",
+        "deactivated_at",
+        "already_inactive",
+    ),
+    "record-reply": ("orchestration_id", "agent_run_id", "reply_ref", "recorded_at"),
+    # `step` is a CLI arg, not part of the result payload; the status/executor/
+    # failed_substeps fields are what the orchestration consumes.
+    "write-step-result": ("status", "executor_agent_run_id", "failed_substeps"),
+    # run_gate's stdout result contains only violations/gate_result_ref/result
+    # (gate/status live in the persisted gate doc + stderr summary). `result`
+    # carries the orchestration_read content (the only path child agents may use
+    # for those reads), so it must survive the terse projection.
+    "run-gate": ("violations", "gate_result_ref", "result"),
+}
+
+# Fields preserved in a terse result whenever present and non-empty, even if not
+# in the per-command list above, so a terse success can never silently hide a
+# soft-failure signal carried in the payload.
+_TERSE_ALWAYS_KEEP: tuple[str, ...] = ("violations", "error", "errors", "warning", "warnings")
+
+
+def _project_terse_result(command: str, result: Any) -> Any:
+    """Project a bookkeeping subcommand result to its terse field subset.
+
+    Returns ``result`` unchanged when the command has no projection or the
+    result is not a dict. Hard failures already exit non-zero via stderr before
+    reaching here; this only trims successful-path payloads.
+    """
+    fields = _TERSE_RESULT_FIELDS.get(command)
+    if fields is None or not isinstance(result, dict):
+        return result
+    projected: dict[str, Any] = {key: result[key] for key in fields if key in result}
+    for key in _TERSE_ALWAYS_KEEP:
+        if key not in projected and result.get(key):
+            projected[key] = result[key]
+    return projected
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -14873,6 +14945,28 @@ def main(argv: list[str] | None = None) -> int:
         metavar="PATH",
         help="Repo-root-relative paths to dismiss (must be subset of violation's unauthorized_paths)",
     )
+
+    # The bookkeeping subcommands default to a terse result projection (see
+    # _project_terse_result): the orchestration agent re-reads its whole
+    # transcript every turn, so echoing the full payload (record-agent-run
+    # reflects the entire input, up to ~50KB) inflates its resident context and
+    # the cache-read cost that scales with it. --verbose restores the full JSON
+    # for debugging/audit. The flag lives on each terse subparser so it can be
+    # appended after the subcommand (e.g. `record-launch ... --verbose`).
+    for _terse_parser in (
+        launch_parser,
+        gate_parser,
+        run_parser,
+        step_parser,
+        deactivate_child_parser,
+        record_reply_parser,
+        record_child_return_parser,
+    ):
+        _terse_parser.add_argument(
+            "--verbose",
+            action="store_true",
+            help="Emit the full result JSON instead of the default terse projection.",
+        )
 
     args = parser.parse_args(argv)
     repo_root = Path(getattr(args, "repo_root")).resolve()
@@ -15378,6 +15472,8 @@ def main(argv: list[str] | None = None) -> int:
     else:
         raise RuntimeError(f"unhandled command: {args.command}")
 
+    if not getattr(args, "verbose", False):
+        result = _project_terse_result(args.command, result)
     json.dump(result, sys.stdout, ensure_ascii=False, indent=2)
     sys.stdout.write("\n")
     return 0

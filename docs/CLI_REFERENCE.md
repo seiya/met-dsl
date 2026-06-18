@@ -25,6 +25,9 @@ Related canonical sources:
 - The form of `ir_id` / `pipeline_id` is `<slug>_<YYYYMMDD>_<seq3>` (slug being hyphen-separated lowercase alphanumeric). E.g. `flux-rsn-p0_20260425_001`. An underscore in the slug is invalid.
 - ISO 8601 timestamps are canonically UTC (`Z` suffix).
 - For JSON arguments (`--*-json`), be careful with shell quoting. For a complex payload, use a file specification like `--patch-file`.
+- **Terse stdout by default.** The high-frequency bookkeeping subcommands (`record-launch` / `record-agent-run` / `record-child-return` / `deactivate-child` / `record-reply` / `write-step-result` / `run-gate`) print **only the result fields the orchestration agent consumes downstream** to stdout, not the full payload. This keeps the orchestration's resident context small (its cache-read cost scales with context size × turn count). The full payload is always persisted to the canonical artifact files regardless (`launches/<arid>.*`, `agent_runs.jsonl`, `steps/.../step_result.json`, `gates/<arid>/<gate>.json`, etc.); pass `--verbose` to also emit the full JSON to stdout for debugging/audit. Soft-failure signals (`violations` / `error[s]` / `warning[s]`) are retained in terse output when present, and hard failures still exit non-zero via stderr.
+  - `record-launch` terse fields: `capability_token`, `capability_ref`, `read_access_manifest_ref`, `allowed_output_manifest_ref`, `sandbox_profile_ref`, `launch_prompt_ref`, and **`launch_prompt_text`** (the exact rendered prompt the orchestration passes verbatim to the Agent tool — it cannot read the template or the written prompt file). The remaining `launch_*_ref` / `child_launch_*_ref` paths are deterministic from `<orchestration_id>`+`<arid>` and are dropped from terse stdout.
+  - `run-gate` terse keeps `result` (the `orchestration_read` content — child agents' only allowed path for those reads) in addition to `violations` / `gate_result_ref`.
 
 ---
 

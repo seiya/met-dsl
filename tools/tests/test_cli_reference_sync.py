@@ -163,11 +163,16 @@ class CliReferenceSyncTests(unittest.TestCase):
         Additional descriptions on the doc side (derived fields, JSON payload, etc.) are allowed.
         A flag present on the argparse side but absent in the doc is failed as an omission.
         """
+        # Cross-cutting flags documented once in the "Common conventions" section
+        # rather than repeated in every per-subcommand section. `--verbose`
+        # toggles off the default terse stdout projection and applies uniformly
+        # to all bookkeeping subcommands (see CLI_REFERENCE.md Common conventions).
+        global_doc_flags = {"--verbose"}
         missing: dict[str, set[str]] = {}
         for sub in sorted(TIER_A_SUBCOMMANDS):
             cli_flags = _argparse_args_for(sub)
             doc_flags = _doc_section_args(DOC_TIER_A, sub)
-            absent = cli_flags - doc_flags
+            absent = cli_flags - doc_flags - global_doc_flags
             if absent:
                 missing[sub] = absent
         self.assertFalse(

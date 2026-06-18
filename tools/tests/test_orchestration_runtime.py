@@ -55,6 +55,7 @@ from tools.orchestration_runtime import (
     init_orchestration,
     log_orchestration_read,
     main,
+    _project_terse_result,
     merge_phase_state_for_resume,
     parse_feature_list,
     pre_orchestration_start,
@@ -10039,6 +10040,54 @@ shell_tool                       stable             true
             )
             self.assertIsInstance(result, dict)
 
+    def test_terse_record_launch_keys_exist_in_real_return(self) -> None:
+        """Anti-drift guard: every record-launch terse field must be a real key.
+
+        The synthetic _project_terse_result tests cannot catch a tuple field
+        name drifting from the actual record_launch return key (which would
+        silently emit a smaller dict). This runs a real record_launch and
+        asserts the load-bearing keys survive the projection with truthy values.
+        """
+        from tools.orchestration_runtime import _TERSE_RESULT_FIELDS
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._minimal_preflight_setup(repo_root)
+            result = record_launch(
+                repo_root=repo_root,
+                orchestration_id="orch_001",
+                parent_agent_run_id="orch_run_001",
+                child_agent_run_id="step_run_terse_001",
+                request_payload=self._minimal_request_payload(
+                    agent_run_id="step_run_terse_001"
+                ),
+                response_payload=_spawn_response_payload("sess_step_terse_001"),
+            )
+            terse = _project_terse_result("record-launch", result)
+            # The keys the orchestration depends on must be present and truthy in
+            # the real (terse) return — catches a rename of either the out_refs
+            # key or the terse tuple entry.
+            for key in ("capability_token", "launch_prompt_text", "launch_prompt_ref"):
+                self.assertIn(key, terse, msg=f"{key} missing from real terse record-launch")
+                self.assertTrue(terse[key], msg=f"{key} empty in real terse record-launch")
+            # No terse field may name a key the real payload never produced
+            # (would be a phantom/aspirational entry).
+            phantom = [
+                k for k in _TERSE_RESULT_FIELDS["record-launch"] if k not in result
+            ]
+            self.assertEqual(phantom, [], msg=f"phantom record-launch terse fields: {phantom}")
+            # launch_prompt_text must be the same content record-launch wrote to
+            # the audit artifact (the .prompt.txt file carries a trailing newline
+            # added by the text writer; the returned text does not — same content).
+            prompt_path = (
+                repo_root / "workspace/orchestrations/orch_001/launches"
+                / "step_run_terse_001.prompt.txt"
+            )
+            self.assertEqual(
+                terse["launch_prompt_text"].rstrip("\n"),
+                prompt_path.read_text(encoding="utf-8").rstrip("\n"),
+            )
+
     def test_main_help_run_gate_includes_args_json_schema_examples(self) -> None:
         """`run-gate --help` displays a per-gate args_json schema summary."""
         import re as _re
@@ -13997,6 +14046,12 @@ class TestPhase3RunGate(unittest.TestCase):
             gate_doc = json.loads((repo_root / str(gate_ref)).read_text(encoding="utf-8"))
             self.assertEqual(gate_doc.get("status"), "pass")
             self.assertEqual(gate_doc.get("result", {}).get("content"), "inline\n")
+            # Anti-drift: the terse projection of the REAL run_gate return must
+            # preserve `result` (the only path child agents have to the
+            # orchestration_read content). Catches a tuple/return key rename.
+            terse = _project_terse_result("run-gate", out)
+            self.assertEqual(terse.get("result", {}).get("content"), "inline\n")
+            self.assertIn("gate_result_ref", terse)
 
     def test_run_gate_rejects_apply_patch_writes(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -24239,6 +24294,118 @@ class DismissViolationTests(unittest.TestCase):
                         dismiss_reason="x", paths=["never-seen.txt"],
                         operator_token="real-token",
                     )
+
+
+class TerseResultProjectionTests(unittest.TestCase):
+    """Default terse stdout projection for high-frequency bookkeeping subcommands.
+
+    The orchestration agent re-reads its whole transcript every turn, so echoing
+    the full bookkeeping payload (record-agent-run reflects the entire input,
+    up to ~50KB) inflates its resident context and the cache-read cost that
+    scales with it. The CLI sink projects successful results to a minimal field
+    set by default; --verbose restores the full JSON.
+    """
+
+    def test_record_agent_run_drops_payload_echo(self) -> None:
+        # Mirror the real record_agent_run return shape (the run record carries
+        # started_at/finished_at, not recorded_at) plus a large echoed field.
+        full = {
+            "agent_run_id": "arid-1",
+            "status": "pass",
+            "started_at": "2026-06-18T00:00:00Z",
+            "finished_at": "2026-06-18T00:05:00Z",
+            "agent_role": "step",
+            "node_key": "component/x@0.1.0",
+            "huge": "A" * 50000,
+        }
+        terse = _project_terse_result("record-agent-run", full)
+        self.assertEqual(
+            terse,
+            {
+                "agent_run_id": "arid-1",
+                "status": "pass",
+                "started_at": "2026-06-18T00:00:00Z",
+                "finished_at": "2026-06-18T00:05:00Z",
+            },
+        )
+        self.assertNotIn("huge", terse)
+
+    def test_record_launch_keeps_capability_token_drops_deterministic_refs(self) -> None:
+        full = {
+            "capability_token": "tok",
+            "capability_ref": "cap.json",
+            "launch_prompt_ref": "p.txt",
+            "launch_request_ref": "req.json",
+            "child_launch_request_ref": "creq.json",
+        }
+        terse = _project_terse_result("record-launch", full)
+        self.assertEqual(terse["capability_token"], "tok")
+        self.assertIn("launch_prompt_ref", terse)
+        self.assertNotIn("launch_request_ref", terse)
+        self.assertNotIn("child_launch_request_ref", terse)
+
+    def test_run_gate_retains_violations_signal(self) -> None:
+        full = {
+            "gate": "g",
+            "status": "fail",
+            "violations": [{"rule": "x"}],
+            "gate_result_ref": "r.json",
+        }
+        terse = _project_terse_result("run-gate", full)
+        self.assertEqual(terse["violations"], [{"rule": "x"}])
+
+    def test_run_gate_preserves_orchestration_read_result(self) -> None:
+        # orchestration_read returns the read content only in `result`; child
+        # agents use run-gate as the sole path for those reads, so terse output
+        # must keep it.
+        full = {
+            "violations": [],
+            "gate_result_ref": "r.json",
+            "result": {"read_path": "docs/x.md", "content": "hello"},
+        }
+        terse = _project_terse_result("run-gate", full)
+        self.assertEqual(terse["result"], {"read_path": "docs/x.md", "content": "hello"})
+
+    def test_record_launch_keeps_prompt_text(self) -> None:
+        full = {
+            "capability_token": "tok",
+            "launch_prompt_ref": "p.txt",
+            "launch_prompt_text": "You are a substep agent...",
+            "launch_request_ref": "req.json",
+        }
+        terse = _project_terse_result("record-launch", full)
+        self.assertEqual(terse["launch_prompt_text"], "You are a substep agent...")
+        self.assertNotIn("launch_request_ref", terse)
+
+    def test_always_keep_surfaces_soft_failure_field(self) -> None:
+        # An 'error' signal on an otherwise-unlisted command field must survive.
+        terse = _project_terse_result(
+            "deactivate-child",
+            {"deactivated_child_run_id": "c", "error": "soft problem", "noise": "x"},
+        )
+        self.assertEqual(terse.get("error"), "soft problem")
+        self.assertNotIn("noise", terse)
+
+    def test_unknown_command_passthrough(self) -> None:
+        payload = {"a": 1, "b": 2}
+        self.assertIs(_project_terse_result("set-status", payload), payload)
+
+    def test_verbose_flag_on_terse_subparsers_only(self) -> None:
+        import io as _io
+        import re as _re
+        from contextlib import redirect_stdout as _rso
+
+        def _help(cmd: str) -> str:
+            buf = _io.StringIO()
+            with _rso(buf):
+                with self.assertRaises(SystemExit):
+                    main([cmd, "--help"])
+            return _re.sub(r"\s+", " ", buf.getvalue())
+
+        for cmd in ("record-launch", "record-agent-run", "run-gate", "write-step-result"):
+            self.assertIn("--verbose", _help(cmd), msg=f"{cmd} should accept --verbose")
+        # A non-bookkeeping subcommand must not gain the flag.
+        self.assertNotIn("--verbose", _help("set-status"))
 
 
 if __name__ == "__main__":

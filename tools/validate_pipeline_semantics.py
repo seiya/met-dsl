@@ -3015,7 +3015,84 @@ def _validate_generate_outputs(
             violations=violations,
         )
 
+    _validate_fortran_identifier_length(src_dir, violations)
     _validate_fortran_makefile_src_dir(src_dir, violations)
+
+
+# Fortran 2008 (and the earlier standards the generated code targets) limit a
+# name (identifier) to 63 characters. An over-limit identifier compiles nowhere
+# and only surfaces at the build step as a compile_error, which forces an
+# expensive regenerate -> rebuild retry loop (observed in a past run: an
+# over-63-char subroutine name). Catching it here at post_generate fails the
+# cheap generate.verify substep instead, before the build phase ever runs.
+# (See docs/workflow/phases/phase_02_generate.md; the generated code uses the
+# f2008 standard series — cf. the C003 / -std=f2008 note there.)
+_FORTRAN_NAME_LIMIT = 63
+# Free-form suffixes only. The workflow generates free-form Fortran (`.f90`),
+# and the stripper below handles free-form `!` comments. Fixed-form sources
+# (`.f` / `.for`) use column-1 `C` / `c` / `*` comment markers that this
+# stripper does not understand, so scanning them would mis-report a long word
+# in a comment as an over-limit identifier; they are intentionally excluded.
+_FORTRAN_SOURCE_SUFFIXES = (".f90", ".f95", ".f03", ".f08")
+_FORTRAN_IDENT_RE = re.compile(r"[A-Za-z][A-Za-z0-9_]*")
+
+
+def _strip_fortran_comments_and_strings(
+    line: str, quote: str | None = None
+) -> tuple[str, str | None]:
+    """Drop quoted strings and the trailing free-form ``!`` comment from a line.
+
+    Returns ``(code, quote)`` where ``quote`` is the still-open string delimiter
+    at end of line (or ``None``). Pass it back in for the next physical line so a
+    `&`-continued character literal carries its in-string state across lines —
+    otherwise a long word on the continuation line would be scanned as code and
+    falsely flagged. Free-form only — see _FORTRAN_SOURCE_SUFFIXES for why
+    fixed-form sources are not scanned. (A token inside a string is never an
+    identifier, so over-carrying state can only under-report, never false-flag;
+    the build step remains the backstop.)
+    """
+    out: list[str] = []
+    for ch in line:
+        if quote is not None:
+            if ch == quote:
+                quote = None
+            continue
+        if ch in ("'", '"'):
+            quote = ch
+            continue
+        if ch == "!":
+            break
+        out.append(ch)
+    return "".join(out), quote
+
+
+def _validate_fortran_identifier_length(src_dir: Path, violations: list[str]) -> None:
+    """Flag any Fortran identifier exceeding the 63-char f2008 name limit.
+
+    Any identifier-like token longer than 63 characters is necessarily an
+    invalid name (no keyword or intrinsic is that long), so reporting it is
+    safe. Each distinct offending name is reported once per file.
+    """
+    if not src_dir.is_dir():
+        return
+    for path in sorted(src_dir.iterdir()):
+        if not path.is_file() or path.suffix.lower() not in _FORTRAN_SOURCE_SUFFIXES:
+            continue
+        try:
+            text = path.read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            continue
+        seen: set[str] = set()
+        quote: str | None = None
+        for raw in text.splitlines():
+            code, quote = _strip_fortran_comments_and_strings(raw, quote)
+            for tok in _FORTRAN_IDENT_RE.findall(code):
+                if len(tok) > _FORTRAN_NAME_LIMIT and tok not in seen:
+                    seen.add(tok)
+                    violations.append(
+                        f"{path}: Fortran identifier exceeds the {_FORTRAN_NAME_LIMIT}-char "
+                        f"f2008 name limit ({len(tok)} chars): {tok!r}"
+                    )
 
 
 def _validate_generate_outputs_for_generation(
@@ -3102,6 +3179,7 @@ def _validate_generate_outputs_for_generation(
             violations=violations,
         )
 
+    _validate_fortran_identifier_length(src_dir, violations)
     _validate_fortran_makefile_src_dir(src_dir, violations)
     runner_files = sorted(src_dir.glob("*_runner.f90"))
     _validate_runner_source_files(execution, runner_files, violations)

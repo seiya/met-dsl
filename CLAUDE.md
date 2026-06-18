@@ -38,7 +38,7 @@ This file defines the project-specific conventions for Claude Code. For general 
 
 ### child `agent` launch
 - In Claude Code, use the `Agent` tool instead of `spawn_agent` to launch a child `agent`.
-- For the `prompt` argument of the `Agent` tool, apply the corresponding template in [skills/workflow-orchestration/references/launch_prompts.md](skills/workflow-orchestration/references/launch_prompts.md).
+- For the `prompt` argument of the `Agent` tool, pass **verbatim** the `launch_prompt_text` that `record-launch` returns in its stdout (record-launch renders it from the [skills/workflow-orchestration/references/launch_prompts.md](skills/workflow-orchestration/references/launch_prompts.md) template and writes it to `launches/<agent_run_id>.prompt.txt`). The orchestration agent must **not** `Read` `launch_prompts.md` itself nor the written `launches/<agent_run_id>.prompt.txt` (both blocked / context-budgeted); the returned `launch_prompt_text` is the canonical source. Do not author, abbreviate, or re-author the prompt.
 - The `subagent_type` of the `Agent` tool defaults to `general-purpose`; select an appropriate value according to the phase being launched.
 - `context_isolated=true` indicates that the Claude Code `Agent` tool runs in an isolated context, and is always recorded as `true`.
 
@@ -55,8 +55,12 @@ Steps:
 2. Reserve ir_id / pipeline_id with reserve-phase-root (if not yet reserved)
 3. Run record-launch (before launching the Agent tool)
    → capability_token / sandbox_profile / output manifest / read manifest are generated
+   → the launch prompt is rendered from the template, written to launches/<agent_run_id>.prompt.txt,
+     and returned in the record-launch stdout `launch_prompt_text` field (do not author it yourself,
+     and omit `launch_prompt_full` from the request so record-launch renders it)
    → launches/<agent_run_id>.reply.txt is written with provisional content
-4. Launch the Agent tool (the child agent reads the capability_token from
+4. Launch the Agent tool, passing the `launch_prompt_text` from step 3 verbatim as the `prompt`
+   argument (the child agent reads the capability_token from
    capabilities/<agent_run_id>.json and runs guarded-apply-patch etc.)
 5. Receive the Agent tool's return value (the final response text)
 6. Run record-child-return to leave evidence of observing the Agent tool return (child_returns/<agent_run_id>.txt)

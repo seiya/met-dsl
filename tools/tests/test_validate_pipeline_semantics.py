@@ -22,6 +22,7 @@ from tools.validate_pipeline_semantics import (
     _required_raw_evidence,
     _validate_diagnostics_contract,
     _validate_diagnostics_contract_output,
+    _validate_fortran_identifier_length,
     _validate_fortran_makefile_src_dir,
     _validate_generate_lint_command_logs,
     _validate_source_meta_json_files,
@@ -7995,6 +7996,119 @@ class DiagnosticsContractOutputTest(unittest.TestCase):
 
     def test_no_contract_means_no_check(self) -> None:
         self.assertEqual([], self._run({"cases": []}, contract={"io_contract": {}}))
+
+
+class FortranIdentifierLengthTests(unittest.TestCase):
+    """post_generate flags over-63-char Fortran identifiers (f2008 name limit).
+
+    An over-limit name only fails at the Build step as a compile_error,
+    forcing a regenerate -> rebuild retry. Catching it at post_generate fails
+    the cheap generate.verify substep first.
+    """
+
+    def _src_dir(self, body: str) -> Path:
+        d = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, d, ignore_errors=True)
+        (d / "mod.f90").write_text(body, encoding="utf-8")
+        return d
+
+    def test_boundary_63_ok_64_flagged(self) -> None:
+        ok = "a" * 63
+        bad = "b" * 64
+        src = self._src_dir(
+            f"subroutine {ok}()\nend subroutine\n"
+            f"subroutine {bad}(x)\nend subroutine\n"
+        )
+        violations: list[str] = []
+        _validate_fortran_identifier_length(src, violations)
+        self.assertEqual(len(violations), 1, msg=violations)
+        self.assertIn(bad, violations[0])
+        self.assertNotIn(ok, violations[0])
+
+    def test_ignores_comments_and_strings(self) -> None:
+        long_tok = "c" * 70
+        src = self._src_dir(
+            f"! a comment with {long_tok}\n"
+            f'call foo("{long_tok}")\n'
+        )
+        violations: list[str] = []
+        _validate_fortran_identifier_length(src, violations)
+        self.assertEqual(violations, [])
+
+    def test_reports_each_distinct_name_once(self) -> None:
+        bad = "d" * 80
+        src = self._src_dir(
+            f"call {bad}(1)\ncall {bad}(2)\ninteger :: {bad}\n"
+        )
+        violations: list[str] = []
+        _validate_fortran_identifier_length(src, violations)
+        self.assertEqual(len(violations), 1, msg=violations)
+
+    def test_only_scans_fortran_suffixes(self) -> None:
+        d = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, d, ignore_errors=True)
+        (d / "notes.txt").write_text("e" * 80 + "\n", encoding="utf-8")
+        violations: list[str] = []
+        _validate_fortran_identifier_length(d, violations)
+        self.assertEqual(violations, [])
+
+    def test_ignores_long_word_in_continued_string_literal(self) -> None:
+        # A free-form `&`-continued character literal carries its in-string state
+        # to the continuation line; a long word there must not be flagged.
+        long_word = "x" * 80
+        src = self._src_dir(
+            'print *, "a long diagnostic message that wraps &\n'
+            f'&with {long_word} inside the string"\n'
+            "end\n"
+        )
+        violations: list[str] = []
+        _validate_fortran_identifier_length(src, violations)
+        self.assertEqual(violations, [])
+
+    def test_still_flags_long_identifier_after_continued_string(self) -> None:
+        # State must reset once the string closes: a real over-limit identifier
+        # on a later line is still caught.
+        long_word = "y" * 80
+        bad = "z" * 64
+        src = self._src_dir(
+            'print *, "wrapped &\n'
+            f'&{long_word}"\n'
+            f"call {bad}()\n"
+        )
+        violations: list[str] = []
+        _validate_fortran_identifier_length(src, violations)
+        self.assertEqual(len(violations), 1, msg=violations)
+        self.assertIn(bad, violations[0])
+
+    def test_identifier_split_across_continuation_is_not_flagged(self) -> None:
+        # Documented accepted limitation: an identifier split by a free-form `&`
+        # continuation is seen as two short tokens, so it is NOT flagged here —
+        # the build step's compile_error is the backstop. This test pins that
+        # behavior so a future reader does not assume completeness.
+        half = "n" * 40  # each half < 63, joined name would be 80 > 63
+        src = self._src_dir(f"subroutine very_{half}&\n&{half}()\nend subroutine\n")
+        violations: list[str] = []
+        _validate_fortran_identifier_length(src, violations)
+        self.assertEqual(violations, [])
+
+    def test_missing_src_dir_is_safe(self) -> None:
+        missing = Path(tempfile.mkdtemp()) / "does_not_exist"
+        violations: list[str] = []
+        _validate_fortran_identifier_length(missing, violations)
+        self.assertEqual(violations, [])
+
+    def test_does_not_scan_fixed_form_sources(self) -> None:
+        # Fixed-form .f / .for use column-1 C/c/* comment markers the free-form
+        # stripper does not understand; scanning them would mis-flag a long word
+        # in a comment. The generator emits free-form .f90, so they are skipped.
+        d = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, d, ignore_errors=True)
+        long_word = "f" * 80
+        (d / "legacy.f").write_text(f"C this fixed-form comment has {long_word}\n", encoding="utf-8")
+        (d / "legacy.for").write_text(f"* another comment {long_word}\n", encoding="utf-8")
+        violations: list[str] = []
+        _validate_fortran_identifier_length(d, violations)
+        self.assertEqual(violations, [])
 
 
 if __name__ == "__main__":

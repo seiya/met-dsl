@@ -7,6 +7,11 @@
 - immediately after `orchestration agent` launch
 - before the first launch of a child `agent`
 
+## Context budget (read minimally)
+The `orchestration agent` re-reads its whole transcript every turn, so each document it `Read`s stays resident and its token cost is multiplied by the turn count. Keep the resident context small: do **not** `Read` the child-facing phase docs `docs/workflow/phases/phase_0[1-4]_*.md`, `docs/AGENT_CONTRACT.md` (all child-facing), or the full `docs/CLI_REFERENCE.md` / `preflight.json` up front. Pull only the minimal slice on demand (a single Tier-A CLI section, `preflight-status`, the specific phase doc's retry mapping when deciding a retry).
+
+`references/launch_prompts.md` is **backend-dependent**: on the **Claude Code backend** do **not** `Read` it — `record-launch` runs before the Agent tool, renders the prompt, and returns it in stdout `launch_prompt_text` (pass that verbatim to the Agent tool). On the **Codex / Cursor backend** `spawn_agent` needs the prompt before `record-launch` runs, so the orchestration renders it first via the canonical render rules and **may** consult `references/launch_prompts.md` for that single render (then pass the same text to both `spawn_agent` and `record-launch` as `launch_prompt_full`). See `skills/workflow-orchestration/SKILL.md` "Context budget" and Operations Rule 12 for the full per-backend rule.
+
 ## How to use the tmp area (required premise)
 
 The `allowed_tmp_root` of the orchestration agent / child agent is fixed at `workspace/tmp/<agent_run_id>/`, and is recorded in the `allowed_tmp_root` field of `output_manifests/<agent_run_id>.json` at `record-launch` time. A temporary-file write passes `output_manifest_write_guard` by specifying **directly** under that literal path.
@@ -162,18 +167,18 @@ Because Claude Code has no `spawn_agent`, run in the following order.
                      "started_at": "<ISO8601>",
                      "backend": "claude"}
    → capability_token / sandbox_profile / output manifest / read manifest are generated
+   - **Do not author or include the prompt yourself.** Pass only the launch parameters (node_key / step / substep / ir_ref / ... / skill_ref) in `--request-json`; **omit `launch_prompt_full`**. record-launch renders the prompt from the canonical template internally, writes it to `launches/<agent_run_id>.prompt.txt`, and **returns the exact rendered text in its stdout `launch_prompt_text` field** (kept in the default terse output). This is the only allowed way for you to obtain the prompt — you must not `Read` `references/launch_prompts.md` (orchestration context budget) nor `launches/<agent_run_id>.prompt.txt` (the child's artifact, blocked by `read_manifest_read_guard`).
 4. Launch the Agent tool (the child agent reads the capability_token from
-   capabilities/<agent_run_id>.json and runs guarded-apply-patch etc.)
+   capabilities/<agent_run_id>.json and runs guarded-apply-patch etc.).
+   Pass the `launch_prompt_text` returned by record-launch in step 3 **verbatim** as the Agent tool `prompt` argument. Because both the written `launches/<agent_run_id>.prompt.txt` and this returned text come from the same single render, the Agent-tool prompt is identical in content to the recorded artifact by construction (audit 1-to-1; the `.prompt.txt` file only adds a trailing newline) — do not edit, abbreviate, or re-author it.
 5. Receive the Agent tool's return value (the final response text)
 5.4. Leave the evidence of observing the Agent tool return with record-child-return (the Adv-20/Adv-30 guards require it)
-     - Pass the return-token with `$(cat ...)` as an inline argument. Do not use the 2-step form
-       `VAR=$(cat ...)` (the leading `VAR=` breaks the `Bash(python3 ...)` allowlist match and requires session
-       approval).
+     - **Obtain the return-token via the two-step method (CLAUDE.md `parent_return_token` reference convention).** Do **not** use the inline `$(cat ...)` command-substitution form — Claude Code's Bash tool static analysis rejects it (`Contains shell syntax (string) that cannot be statically analyzed`). Step (a): run `cat workspace/orchestrations/<orchestration_id>/launches/<agent_run_id>.parent_return_token` as a single Bash command (matches the `Bash(cat workspace/orchestrations/*)` allowlist, no approval) to print the token to stdout. Step (b): embed that printed token as a **literal string** in `--return-token "<literal token>"`. Do not read the token with the `Read` tool (blocked by `read_manifest_read_guard` during the active_child window).
      python3 tools/orchestration_runtime.py record-child-return \
        --repo-root <repo_root> \
        --orchestration-id <orchestration_id> \
        --agent-run-id <agent_run_id> \
-       --return-token "$(cat <repo_root>/workspace/orchestrations/<orchestration_id>/launches/<agent_run_id>.parent_return_token)"
+       --return-token "<literal token printed by the cat in step (a)>"
 5.5. Run deactivate-child to return the active context to the orchestration agent
      (it is rejected with a ValueError unless the record-child-return above has completed)
      python3 tools/orchestration_runtime.py deactivate-child \
