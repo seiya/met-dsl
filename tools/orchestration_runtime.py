@@ -90,6 +90,10 @@ except ModuleNotFoundError:  # pragma: no cover - import bootstrap for direct CL
     )
 
 TERMINAL_STATUSES = {"pass", "fail", "blocked", "timeout", "cancel"}
+# Phases that run via substep agents (the orchestration agent aggregates and is the
+# step_result executor). Build is the only no-substep phase (step agent is the executor).
+# Mirrors SUBSTEP_WORKFLOW_STEPS in tools/validate_pipeline_semantics.py.
+SUBSTEP_AWARE_STEPS = frozenset({"compile", "generate", "validate"})
 # Idempotency target of `set-status`. A status once in this set rejects both a same-value and an
 # other-terminal transition, except for the permitted promotion (fail -> fail_closed). Appending the
 # failure narrative is done in failure_analysis.json.
@@ -10465,7 +10469,7 @@ def _validate_step_result_payload(
         )
 
     # the following is the existing substep verification (compile/generate/validate only)
-    if step_token not in {"compile", "generate", "validate"}:
+    if step_token not in SUBSTEP_AWARE_STEPS:
         return
     if status_token != "pass":
         return
@@ -13363,6 +13367,42 @@ def write_step_result(
             node_key=node_key,
             step=step,
         )
+        # Fail-fast executor-role guard. For substep-aware phases the executor must be
+        # the orchestration agent (the substeps' parent), and for the no-substep Build
+        # phase it must be the step agent. Without this, a wrong --agent-run-id (e.g. a
+        # verify-substep arid) is only caught downstream at the Validate pre_judge gate
+        # (validate_pipeline_semantics.py), by which point the phase is locked at
+        # step_result_written with no public reset. Raising here — before _write_json and
+        # the phase transition below — leaves the phase at child_finished so the agent can
+        # simply re-run with the correct arid.
+        # Only enforce when the executor's role is resolvable from agent_runs.jsonl. An
+        # absent record (unresolved role) is left to the downstream validator's
+        # "parent directory must match existing executor agent_run_id" check; in a real
+        # run the executor is always recorded (orchestration row at init, step agent via
+        # record-agent-run), so the recurrence case — a recorded wrong-role arid — is
+        # fully covered here.
+        run_records = _load_run_records(_orchestration_root(repo_root, orchestration_id))
+        executor_role = str(run_records.get(agent_run_id.strip(), {}).get("agent_role") or "").strip().lower()
+        if executor_role:
+            if step_token in SUBSTEP_AWARE_STEPS:
+                if executor_role != "orchestration":
+                    raise RuntimeError(
+                        f"write_step_result: step {step_token!r} is substep-aware; --agent-run-id must be "
+                        f"the orchestration agent_run_id (role=orchestration), got role={executor_role!r} "
+                        f"for {agent_run_id}. The phase stays child_finished — re-run write-step-result with the "
+                        f"orchestration arid as both --agent-run-id and executor_agent_run_id."
+                    )
+            elif executor_role != "step":
+                raise RuntimeError(
+                    f"write_step_result: step {step_token!r} is a no-substep phase; --agent-run-id must be the "
+                    f"step agent_run_id (role=step), got role={executor_role!r} for {agent_run_id}."
+                )
+        explicit_executor = payload.get("executor_agent_run_id")
+        if isinstance(explicit_executor, str) and explicit_executor.strip() and explicit_executor.strip() != agent_run_id.strip():
+            raise RuntimeError(
+                f"write_step_result: executor_agent_run_id ({explicit_executor.strip()}) must equal "
+                f"--agent-run-id ({agent_run_id.strip()})."
+            )
 
     result = dict(payload)
     result.setdefault("executor_agent_run_id", agent_run_id)

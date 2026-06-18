@@ -238,9 +238,11 @@ Generate `workspace/orchestrations/<orch>/steps/<node_key_safe>/<step>/<arid>/st
 | `--orchestration-id` | yes | |
 | `--node-key` | yes | |
 | `--step` | yes | |
-| `--agent-run-id` | yes | the primary agent that executed the step (the orchestration agent for substep-aware phases) |
+| `--agent-run-id` | yes | the primary agent that executed the step (the **orchestration** arid for substep-aware phases `compile`/`generate`/`validate`; the **step** agent arid for the no-substep `build` phase) |
 | `--result-json` | yes | schema below |
 | `--backfill` | no | recovery-only. Write a step_result for an already-terminal step agent that lacks one, bypassing the `child_finished` phase gate and **without** advancing the phase state. See below. |
+
+**Executor-role guard (fail-fast).** When the executor's role is resolvable in `agent_runs.jsonl`, the runtime rejects a wrong-role `--agent-run-id` at write time: a substep-aware phase requires `role=orchestration`, and `build` requires `role=step`. The rejection raises **before** the file is written and before the phase transitions, so the node/step stays `child_finished` and the orchestration agent simply re-runs with the correct arid (use the orchestration arid as both `--agent-run-id` and `executor_agent_run_id` for substep-aware phases). This surfaces the defect here instead of deferring it to the unrecoverable Validate `pre_judge` gate (`validate_pipeline_semantics.py`), where the phase is already locked at `step_result_written`.
 
 ### `--backfill` (recovery)
 

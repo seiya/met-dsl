@@ -1721,6 +1721,39 @@ shell_tool                       stable             true
                 json.dumps(self._valid_ir_meta()),
                 encoding="utf-8",
             )
+            # Fail-fast executor-role guard: a substep-aware phase (compile) rejects a
+            # non-orchestration --agent-run-id (here the verify-substep and the build
+            # step arid) BEFORE the file is written and BEFORE the phase transitions, so
+            # the phase stays child_finished and the agent can retry with the orch arid.
+            compile_step_dir = (
+                repo_root
+                / "workspace/orchestrations/orch_001/steps"
+                / "problem__shallow_water2d__0.3.0/compile"
+            )
+            for wrong_arid in ("substep_run_plan_generate_001", "step_run_build_001"):
+                with self.assertRaises(RuntimeError):
+                    write_step_result(
+                        repo_root=repo_root,
+                        orchestration_id="orch_001",
+                        node_key="problem/shallow_water2d@0.3.0",
+                        step="compile",
+                        agent_run_id=wrong_arid,
+                        payload={
+                            "status": "pass",
+                            "required_outputs": [
+                                "workspace/ir/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/spec.ir.yaml",
+                                "workspace/ir/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/ir_meta.json",
+                            ],
+                            "failed_substeps": [],
+                            "substep_agent_run_ids": ["substep_run_plan_generate_001"],
+                            "executor_agent_run_id": wrong_arid,
+                            "validation_stage": "compile",
+                        },
+                    )
+                self.assertFalse(
+                    (compile_step_dir / wrong_arid / "step_result.json").exists(),
+                    "guard must reject before writing step_result.json",
+                )
             write_step_result(
                 repo_root=repo_root,
                 orchestration_id="orch_001",
@@ -1739,6 +1772,26 @@ shell_tool                       stable             true
                     "validation_stage": "compile",
                 },
             )
+            # Symmetric guard: the no-substep Build phase requires the step agent arid,
+            # so the orchestration arid is rejected.
+            with self.assertRaises(RuntimeError):
+                write_step_result(
+                    repo_root=repo_root,
+                    orchestration_id="orch_001",
+                    node_key="problem/shallow_water2d@0.3.0",
+                    step="build",
+                    agent_run_id="orch_run_001",
+                    payload={
+                        "status": "pass",
+                        "validation_stage": "post_build",
+                        "required_outputs": [
+                            "workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/binary/bin_20260101_001/bin/simulate"
+                        ],
+                        "failed_substeps": [],
+                        "substep_agent_run_ids": [],
+                        "executor_agent_run_id": "orch_run_001",
+                    },
+                )
             write_step_result(
                 repo_root=repo_root,
                 orchestration_id="orch_001",
