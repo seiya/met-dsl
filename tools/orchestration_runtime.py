@@ -2871,6 +2871,44 @@ def _transition_node_step_phase_state(
     return doc
 
 
+def _build_step_agents_missing_step_result(
+    repo_root: Path,
+    orchestration_id: str,
+    *,
+    node_key: str,
+) -> list[str]:
+    """Terminal build `step` agents for the node whose step_result.json is absent.
+
+    This is the true invariant behind the relaunch guard / completion check:
+    every terminal build step agent must leave a step_result. Keying the guard
+    on this (rather than on a `child_finished` phase-state proxy) avoids wedging
+    recovery when the phase transition was interrupted after the result file was
+    already written (crash between `_write_json` and the phase transition).
+    """
+    root = _orchestration_root(repo_root, orchestration_id)
+    node_safe = _node_key_to_safe(node_key.strip())
+    missing: list[str] = []
+    for run_id, payload in _load_run_records(root).items():
+        if not isinstance(payload, dict):
+            continue
+        role = payload.get("agent_role")
+        if not (isinstance(role, str) and role.strip().lower() == "step"):
+            continue
+        step_val = payload.get("step")
+        if not (isinstance(step_val, str) and step_val.strip().lower() == "build"):
+            continue
+        nk_val = payload.get("node_key")
+        if not (isinstance(nk_val, str) and nk_val.strip() == node_key.strip()):
+            continue
+        status = payload.get("status")
+        if not (isinstance(status, str) and status.strip().lower() in TERMINAL_STATUSES):
+            continue
+        result_path = root / "steps" / node_safe / "build" / run_id / "step_result.json"
+        if not result_path.exists():
+            missing.append(run_id)
+    return missing
+
+
 def _phase_state_allows_write_step_result(
     repo_root: Path,
     orchestration_id: str,
@@ -11894,6 +11932,34 @@ def record_launch(
 
     step_raw = request_payload.get("step")
     node_key_raw = request_payload.get("node_key")
+    # Recurrence guard: Build is the only step-only phase (one child == one
+    # step_result). Launching the next build while a prior terminal build agent
+    # still lacks a step_result means that result was silently skipped — the exact
+    # original gap that later deadlocked completion. Fail-closed and require the
+    # missing step_result be written first. The condition is checked against the
+    # actual step_result files (not the `child_finished` phase-state proxy): a
+    # crash between write-step-result writing the file and advancing the phase can
+    # leave a stale `child_finished` even though the result is present, and that
+    # must NOT wedge recovery (both write paths refuse to overwrite an existing
+    # result). Substep phases (compile/generate/validate) legitimately revisit
+    # `child_finished` between substeps, so this stays scoped to build. This runs
+    # BEFORE any durable launch/session/graph mutation, so a blocked relaunch
+    # leaves no dangling agent_graph edge or session-index row.
+    if (
+        isinstance(step_raw, str)
+        and step_raw.strip().lower() == "build"
+        and isinstance(node_key_raw, str)
+        and node_key_raw.strip()
+    ):
+        missing_build_step_results = _build_step_agents_missing_step_result(
+            repo_root, orchestration_id, node_key=node_key_raw.strip()
+        )
+        if missing_build_step_results:
+            raise RuntimeError(
+                f"record-launch: prior build agent(s) for {node_key_raw.strip()}/build finished "
+                f"without a step_result ({', '.join(sorted(missing_build_step_results))}); write it "
+                "with `write-step-result` (or `write-step-result --backfill`) before launching another build"
+            )
     if isinstance(step_raw, str) and step_raw.strip() and isinstance(node_key_raw, str) and node_key_raw.strip():
         required = _required_child_agent_kind(step_raw)
         launch_ctx = dict(request_payload)
@@ -13203,22 +13269,91 @@ def write_step_result(
     step: str,
     agent_run_id: str,
     payload: dict[str, Any],
+    backfill: bool = False,
 ) -> dict[str, Any]:
     _require_preflight_launchable(
         repo_root,
         orchestration_id,
         enforce_live_probe=False,
     )
-    _phase_state_allows_write_step_result(
-        repo_root,
-        orchestration_id,
-        node_key=node_key,
-        step=step,
-    )
     node_safe = _node_key_to_safe(node_key)
     step_token = step.strip().lower()
     root = _orchestration_root(repo_root, orchestration_id)
     result_path = root / "steps" / node_safe / step_token / agent_run_id / "step_result.json"
+
+    if backfill:
+        # Backfill writes a step_result for an already-terminal step agent that
+        # never received one (e.g. an original-run gap stranded by a checkpoint
+        # resume that reset the build phase out of `child_finished`). It bypasses
+        # the live `child_finished` gate and does NOT advance the phase state, so
+        # it adds no new step agent and is net-negative on the missing-step_result
+        # count — the only way to break the completion-check deadlock without
+        # launching net-new step agents. Guards keep the completion invariant
+        # honest: gap-fill only, recorded run must be a terminal step agent for
+        # this node/step, and the payload status must match the recorded status.
+        if result_path.exists():
+            raise RuntimeError(
+                f"write_step_result --backfill: step_result already exists for "
+                f"agent_run_id={agent_run_id} (backfill only fills a genuine gap, never overwrites)"
+            )
+        runs = _load_run_records(root)
+        record = runs.get(agent_run_id.strip())
+        if not isinstance(record, dict):
+            raise RuntimeError(
+                f"write_step_result --backfill: no agent_runs.jsonl record for agent_run_id={agent_run_id}"
+            )
+        # The recorded run must be a `step` agent for exactly this node/step.
+        # result_path is built from the caller-supplied node_key/step, so without
+        # this the command could write a step_result into the wrong directory
+        # (mistyped node_key/step, or a substep/other run id) while the genuinely
+        # stranded step stays uncovered — completion would still be blocked.
+        recorded_role = record.get("agent_role")
+        if not (isinstance(recorded_role, str) and recorded_role.strip().lower() == "step"):
+            raise RuntimeError(
+                f"write_step_result --backfill: agent_run_id={agent_run_id} is not a step agent "
+                f"(agent_role={recorded_role!r}); only a step agent can be backfilled"
+            )
+        recorded_node_key = record.get("node_key")
+        if not (isinstance(recorded_node_key, str) and recorded_node_key.strip() == node_key.strip()):
+            raise RuntimeError(
+                f"write_step_result --backfill: node_key mismatch for agent_run_id={agent_run_id} "
+                f"(recorded={recorded_node_key!r}, requested={node_key!r})"
+            )
+        recorded_step = record.get("step")
+        recorded_step_token = recorded_step.strip().lower() if isinstance(recorded_step, str) else ""
+        if recorded_step_token != step_token:
+            raise RuntimeError(
+                f"write_step_result --backfill: step mismatch for agent_run_id={agent_run_id} "
+                f"(recorded={recorded_step!r}, requested={step!r})"
+            )
+        recorded_status = record.get("status")
+        recorded_token = recorded_status.strip().lower() if isinstance(recorded_status, str) else ""
+        if recorded_token not in TERMINAL_STATUSES:
+            raise RuntimeError(
+                f"write_step_result --backfill: agent_run_id={agent_run_id} is not terminal "
+                f"(status={recorded_status!r}); only a terminated step agent can be backfilled"
+            )
+        # A `pass` is backfillable too: a build child can record terminal `pass`
+        # (its outputs validated by record-agent-run) yet lose its `child_finished`
+        # authority before write-step-result ran, leaving it stranded with no
+        # recovery path otherwise (the relaunch guard would block, and the normal
+        # write path needs the lost `child_finished`). The status-match check below
+        # is what prevents fabricating a pass — backfill can only mirror the
+        # authoritative recorded status, never invent a better one.
+        payload_status = payload.get("status")
+        payload_token = payload_status.strip().lower() if isinstance(payload_status, str) else ""
+        if payload_token != recorded_token:
+            raise RuntimeError(
+                f"write_step_result --backfill: payload status={payload_status!r} must match the "
+                f"recorded run status={recorded_status!r} for agent_run_id={agent_run_id}"
+            )
+    else:
+        _phase_state_allows_write_step_result(
+            repo_root,
+            orchestration_id,
+            node_key=node_key,
+            step=step,
+        )
 
     result = dict(payload)
     result.setdefault("executor_agent_run_id", agent_run_id)
@@ -13252,17 +13387,22 @@ def write_step_result(
             pass
         raise
 
-    _transition_node_step_phase_state(
-        repo_root,
-        orchestration_id,
-        node_key=node_key,
-        step=step_token,
-        new_state="step_result_written",
-        event="write_step_result",
-        agent_run_id=agent_run_id,
-    )
+    # Backfill never advances the phase state — it accounts for a terminal agent
+    # whose `child_finished` authority is gone, so consuming a transition would
+    # either corrupt the live phase or be impossible. The completion check keys
+    # solely on the per-agent step_result file existing, which is now written.
+    if not backfill:
+        _transition_node_step_phase_state(
+            repo_root,
+            orchestration_id,
+            node_key=node_key,
+            step=step_token,
+            new_state="step_result_written",
+            event="write_step_result",
+            agent_run_id=agent_run_id,
+        )
 
-    if result.get("status", "").strip().lower() == "pass":
+    if not backfill and result.get("status", "").strip().lower() == "pass":
         try:
             update_checkpoint(
                 repo_root,
@@ -14483,6 +14623,19 @@ def main(argv: list[str] | None = None) -> int:
     step_parser.add_argument("--step", required=True)
     step_parser.add_argument("--agent-run-id", required=True)
     step_parser.add_argument("--result-json", required=True, type=_json_arg, help=_STEP_RESULT_HELP)
+    step_parser.add_argument(
+        "--backfill",
+        action="store_true",
+        help=(
+            "Write a step_result for an already-terminal step agent that lacks one, "
+            "bypassing the child_finished phase gate and without advancing the phase "
+            "state. Only fills a genuine gap (refuses to overwrite), requires the recorded "
+            "run to be a terminal step agent for the same node/step, and requires the "
+            "payload status to equal the recorded run status (the anti-fabrication guard; "
+            "a recorded pass is backfillable too). Used to remediate a step agent stranded "
+            "by a checkpoint resume (see docs/CLI_REFERENCE.md)."
+        ),
+    )
 
     deactivate_child_parser = subparsers.add_parser("deactivate-child")
     deactivate_child_parser.add_argument("--repo-root", required=True)
@@ -15050,6 +15203,7 @@ def main(argv: list[str] | None = None) -> int:
                 step=args.step,
                 agent_run_id=args.agent_run_id,
                 payload=args.result_json,
+                backfill=args.backfill,
             )
         except (ValueError, RuntimeError) as exc:
             print(str(exc), file=sys.stderr)

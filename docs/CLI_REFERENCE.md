@@ -237,6 +237,19 @@ Generate `workspace/orchestrations/<orch>/steps/<node_key_safe>/<step>/<arid>/st
 | `--step` | yes | |
 | `--agent-run-id` | yes | the primary agent that executed the step (the orchestration agent for substep-aware phases) |
 | `--result-json` | yes | schema below |
+| `--backfill` | no | recovery-only. Write a step_result for an already-terminal step agent that lacks one, bypassing the `child_finished` phase gate and **without** advancing the phase state. See below. |
+
+### `--backfill` (recovery)
+
+The normal write path requires the node/step phase to be exactly `child_finished` (a freshly-recorded terminal child) and advances it to `step_result_written`. That makes one step_result writable per live child. After a checkpoint resume resets the build phase out of `child_finished` (`resume_reset_stale_child_running`), a step agent whose step_result was never written becomes **stranded**: launching a new child to reach `child_finished` is itself a step agent that needs its own step_result, so `_validate_orchestration_completion_for_pass` can never be satisfied (each `run child → write one step_result` is net-zero). `--backfill` breaks this deadlock by writing the missing step_result directly.
+
+Guards (all enforced; otherwise `RuntimeError`):
+- the target `step_result.json` must **not** already exist (gap-fill only, never overwrites);
+- `--agent-run-id` must be present and **terminal** in `agent_runs.jsonl`;
+- the recorded run must be a `step` agent whose `node_key` / `step` match `--node-key` / `--step` (the result path is built from the supplied values, so an identity mismatch would write to the wrong directory and leave the real stranded step uncovered);
+- the `--result-json` `status` must **equal** the recorded run status. This is the anti-fabrication guard: backfill can only mirror the authoritative recorded terminal status, never invent a better one. A recorded `pass` is backfillable too (a build child can record `pass` — with its outputs validated by `record-agent-run` — yet lose its `child_finished` before the result was written), so the only path that would otherwise be wedged is recoverable.
+
+`validation_stage` is still required (e.g. `post_build` for a build fail) and `substep_agent_run_ids=[]` for build. Backfill does not advance the phase state and does not update the checkpoint. The recurrence root (a build agent leaving its phase without a step_result) is itself blocked at `record-launch` time: a build cannot relaunch while a prior terminal build step agent for the node still lacks its `step_result.json` (checked against the actual result files, so an interrupted phase transition does not wedge recovery).
 
 ### `--result-json` payload
 
