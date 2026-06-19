@@ -13471,6 +13471,312 @@ def write_step_result(
     return result
 
 
+def repair_step_result_executor(
+    repo_root: Path,
+    orchestration_id: str,
+    *,
+    node_key: str,
+    step: str,
+) -> dict[str, Any]:
+    """Repair a substep-aware step_result.json whose executor arid is a substep.
+
+    Failure mode (orch_20260618T111853Z_17038507): a compile/generate/validate
+    `step_result.json` was written under a verify-substep arid directory with its
+    `executor_agent_run_id` field set to that same substep arid, instead of the
+    orchestration arid. For substep-aware phases the executor MUST be the
+    orchestration agent (the substeps' parent). The Validate `pre_judge` gate
+    rejects the mismatch, the phase is locked at `step_result_written`, and there
+    was no public repair path: `--backfill` is keyed to a terminal step agent +
+    status match, `repair-agent-runs` only touches agent_runs.jsonl rows, and the
+    forward guard in `write_step_result` only blocks a *new* bad write. The only
+    remedy was a fresh orchestration (re-paying the whole node cost).
+
+    This relocates the file to `steps/<node>/<step>/<orch_arid>/step_result.json`,
+    rewrites `executor_agent_run_id` to the orchestration arid, and appends the old
+    (substep) arid to `substep_agent_run_ids` if absent — preserving the
+    substep→step_result linkage the gate checks. It refuses (leaving the file
+    untouched) unless: the step is substep-aware; the corrupt directory arid is a
+    recorded `substep` for this exact node/step (never inventing linkage); the
+    target arid is the orchestration row; no legitimate step_result already exists
+    at the target; and the corrected payload passes `_validate_step_result_payload`.
+    Idempotent: a re-run with the file already correct is a `noop`. An audit entry
+    is appended to record_repairs.jsonl.
+    """
+    step_token = step.strip().lower()
+    if step_token not in SUBSTEP_AWARE_STEPS:
+        raise RuntimeError(
+            f"repair-step-result-executor: step {step_token!r} is not substep-aware; this repair "
+            f"only applies to {sorted(SUBSTEP_AWARE_STEPS)} (no-substep Build uses write-step-result)."
+        )
+    node_safe = _node_key_to_safe(node_key.strip())
+    root = _orchestration_root(repo_root, orchestration_id)
+
+    runs = _load_run_records(root)
+    orch_arids = [
+        arid
+        for arid, rec in runs.items()
+        if isinstance(rec, dict) and str(rec.get("agent_role") or "").strip().lower() == "orchestration"
+    ]
+    # orchestration_meta.json is the authoritative source; cross-check against runs.
+    meta_arid: str | None = None
+    try:
+        meta = _read_json(root / "orchestration_meta.json")
+    except (OSError, json.JSONDecodeError):
+        meta = None
+    if isinstance(meta, dict):
+        cand = meta.get("orchestration_agent_run_id")
+        if isinstance(cand, str) and cand.strip():
+            meta_arid = cand.strip()
+    if meta_arid is not None:
+        orch_arid = meta_arid
+    elif len(orch_arids) == 1:
+        orch_arid = orch_arids[0]
+    else:
+        raise RuntimeError(
+            "repair-step-result-executor: cannot resolve a single orchestration arid "
+            f"(meta orchestration_agent_run_id missing; agent_runs orchestration rows={orch_arids})"
+        )
+
+    step_dir = root / "steps" / node_safe / step_token
+    result_paths = sorted(step_dir.glob("*/step_result.json")) if step_dir.exists() else []
+    if not result_paths:
+        raise RuntimeError(
+            f"repair-step-result-executor: no step_result.json under {step_dir} "
+            f"(node_key={node_key!r}, step={step_token!r})"
+        )
+
+    target_path = step_dir / orch_arid / "step_result.json"
+    corrupt_paths = [p for p in result_paths if p.parent.name != orch_arid]
+
+    if not corrupt_paths:
+        # Already at the orchestration arid dir; confirm the field agrees.
+        doc = _read_json(target_path)
+        field = doc.get("executor_agent_run_id") if isinstance(doc, dict) else None
+        if isinstance(field, str) and field.strip() == orch_arid:
+            return {
+                "status": "noop",
+                "orchestration_id": orchestration_id,
+                "node_key": node_key,
+                "step": step_token,
+                "executor_agent_run_id": orch_arid,
+                "reason": "step_result already keyed to the orchestration arid",
+            }
+        # Dir is correct but the field is wrong — rewrite the field in place.
+        corrupt_paths = [target_path]
+
+    if len(corrupt_paths) > 1:
+        raise RuntimeError(
+            "repair-step-result-executor: multiple non-orchestration step_result directories "
+            f"({[p.parent.name for p in corrupt_paths]}); refuse to guess — resolve manually."
+        )
+
+    corrupt_path = corrupt_paths[0]
+    corrupt_arid = corrupt_path.parent.name
+    doc = _read_json(corrupt_path)
+    if not isinstance(doc, dict):
+        raise RuntimeError(f"repair-step-result-executor: step_result.json must be object: {corrupt_path}")
+    original_executor = str(doc.get("executor_agent_run_id") or "").strip()
+
+    relocate = corrupt_arid != orch_arid
+
+    # The wrong executor arid(s) that must stay linked as substeps: the directory
+    # key (relocate case, where the file sat under the substep arid) AND the
+    # original `executor_agent_run_id` field (field-only case, where the file sits
+    # under the orchestration dir but the field points at the verify substep). Both
+    # represent a real substep whose substep→step_result linkage the pre_judge /
+    # completion check requires; overwriting the field to the orchestration arid
+    # without preserving these would drop the linkage.
+    wrong_substeps: list[str] = []
+    for cand in ((corrupt_arid if relocate else ""), original_executor):
+        c = cand.strip()
+        if c and c != orch_arid and c not in wrong_substeps:
+            wrong_substeps.append(c)
+
+    # Each wrong executor arid must be a recorded substep for this exact node/step —
+    # never invent linkage for an arbitrary arid, and refuse rather than silently
+    # dropping an unknown one.
+    for arid in wrong_substeps:
+        rec = runs.get(arid)
+        rec_role = str(rec.get("agent_role") or "").strip().lower() if isinstance(rec, dict) else ""
+        rec_node = str(rec.get("node_key") or "").strip() if isinstance(rec, dict) else ""
+        rec_step = str(rec.get("step") or "").strip().lower() if isinstance(rec, dict) else ""
+        if rec_role != "substep" or rec_node != node_key.strip() or rec_step != step_token:
+            raise RuntimeError(
+                f"repair-step-result-executor: executor arid {arid} is not a recorded substep "
+                f"for node {node_key!r} step {step_token!r} (role={rec_role!r}, node={rec_node!r}, "
+                f"step={rec_step!r}); refuse to rewrite."
+            )
+
+    if relocate and target_path.exists():
+        raise RuntimeError(
+            f"repair-step-result-executor: a step_result already exists at the orchestration dir "
+            f"{target_path}; refuse to overwrite (resolve manually)."
+        )
+
+    corrected = dict(doc)
+    corrected["executor_agent_run_id"] = orch_arid
+    substeps = corrected.get("substep_agent_run_ids")
+    substep_list = [s for s in substeps if isinstance(s, str) and s.strip()] if isinstance(substeps, list) else []
+    for arid in wrong_substeps:
+        if arid not in substep_list:
+            substep_list.append(arid)
+    corrected["substep_agent_run_ids"] = substep_list
+
+    # Validate the corrected payload exactly as the write path would; refuse and
+    # leave the original untouched if it would not pass (e.g. broken linkage).
+    _validate_step_result_payload(
+        repo_root,
+        orchestration_id,
+        node_key=node_key,
+        step=step,
+        agent_run_id=orch_arid,
+        payload=corrected,
+    )
+
+    _write_json(target_path, corrected)
+    if relocate:
+        try:
+            corrupt_path.unlink(missing_ok=True)
+            corrupt_path.parent.rmdir()
+        except OSError:
+            pass
+
+    from_executor = original_executor or corrupt_arid
+    prov = {
+        "at": _utc_now_iso(),
+        "reason": "step_result executor arid repair (repair-step-result-executor)",
+        "node_key": node_key,
+        "step": step_token,
+        "from_executor_agent_run_id": from_executor,
+        "to_executor_agent_run_id": orch_arid,
+        "relocated": relocate,
+        "linked_substeps": wrong_substeps,
+    }
+    repairs_path = root / "record_repairs.jsonl"
+    with repairs_path.open("a", encoding="utf-8") as fh:
+        fh.write(json.dumps(prov, ensure_ascii=False) + "\n")
+
+    return {
+        "status": "repaired",
+        "orchestration_id": orchestration_id,
+        "node_key": node_key,
+        "step": step_token,
+        "executor_agent_run_id": orch_arid,
+        "from_executor_agent_run_id": from_executor,
+        "relocated": relocate,
+        "step_result_ref": str(target_path.relative_to(repo_root)) if target_path.is_relative_to(repo_root) else str(target_path),
+    }
+
+
+def repair_all_step_result_executors(
+    repo_root: Path,
+    orchestration_id: str,
+) -> dict[str, Any]:
+    """Best-effort resume self-heal: repair every corrupt substep-aware step_result.
+
+    Scans all `step_result.json` under substep-aware phases and, for each whose
+    executor arid is not the orchestration arid (either the directory key or the
+    `executor_agent_run_id` field), invokes `repair_step_result_executor`. Used by
+    `init --resume-from-checkpoint` so a resume self-heals the
+    `validate_pre_judge_step_result_executor_integrity` lock instead of dead-ending
+    on a fresh-orchestration requirement. Idempotent and non-fatal: a repair that
+    cannot be safely performed is recorded under `skipped`, never raised.
+    """
+    root = _orchestration_root(repo_root, orchestration_id)
+    runs = _load_run_records(root)
+    orch_arid: str | None = None
+    try:
+        meta = _read_json(root / "orchestration_meta.json")
+    except (OSError, json.JSONDecodeError):
+        meta = None
+    if isinstance(meta, dict):
+        cand = meta.get("orchestration_agent_run_id")
+        if isinstance(cand, str) and cand.strip():
+            orch_arid = cand.strip()
+    repaired: list[dict[str, Any]] = []
+    skipped: list[dict[str, Any]] = []
+    if orch_arid is None:
+        return {"status": "noop", "reason": "orchestration arid unresolved", "repaired": [], "skipped": []}
+
+    # node_safe -> node_key, from any run row carrying a node_key. The corrupt
+    # directory arid is not a reliable node_key source (a field-only mismatch has
+    # the orchestration arid as the dir, and the orchestration row has no
+    # node_key), so resolve the node from the path's node_safe instead.
+    node_key_by_safe: dict[str, str] = {}
+    for rec in runs.values():
+        if not isinstance(rec, dict):
+            continue
+        nk = str(rec.get("node_key") or "").strip()
+        if not nk:
+            continue
+        try:
+            node_key_by_safe.setdefault(_node_key_to_safe(nk), nk)
+        except (ValueError, RuntimeError):
+            continue
+
+    seen: set[tuple[str, str]] = set()
+    for path in _iter_step_result_paths(root):
+        # steps/<node_safe>/<step>/<arid>/step_result.json
+        dir_arid = path.parent.name
+        step_token = path.parent.parent.name
+        node_safe = path.parent.parent.parent.name
+        if step_token not in SUBSTEP_AWARE_STEPS:
+            continue
+        corrupt = dir_arid != orch_arid
+        doc: Any = None
+        if not corrupt:
+            try:
+                doc = _read_json(path)
+            except (OSError, json.JSONDecodeError):
+                continue
+            field = doc.get("executor_agent_run_id") if isinstance(doc, dict) else None
+            corrupt = not (isinstance(field, str) and field.strip() == orch_arid)
+        if not corrupt:
+            continue
+        # Resolve node_key from the path's node_safe; fall back to a substep listed
+        # in the corrupt step_result (covers the field-only case where dir_arid is
+        # the orchestration arid). Never rely on the dir_arid run row alone.
+        node_key = node_key_by_safe.get(node_safe, "")
+        if not node_key:
+            if doc is None:
+                try:
+                    doc = _read_json(path)
+                except (OSError, json.JSONDecodeError):
+                    doc = None
+            if isinstance(doc, dict):
+                for sid in doc.get("substep_agent_run_ids") or []:
+                    srec = runs.get(sid) if isinstance(sid, str) else None
+                    cand = str(srec.get("node_key") or "").strip() if isinstance(srec, dict) else ""
+                    if cand:
+                        node_key = cand
+                        break
+        if not node_key:
+            skipped.append({"step": step_token, "node_safe": node_safe, "dir_arid": dir_arid, "error": "node_key unresolved"})
+            continue
+        key = (node_key, step_token)
+        if key in seen:
+            continue
+        seen.add(key)
+        try:
+            repaired.append(
+                repair_step_result_executor(
+                    repo_root,
+                    orchestration_id,
+                    node_key=node_key,
+                    step=step_token,
+                )
+            )
+        except (ValueError, RuntimeError) as exc:
+            skipped.append({"node_key": node_key, "step": step_token, "error": str(exc)})
+
+    actionable = [r for r in repaired if r.get("status") == "repaired"]
+    return {
+        "status": "repaired" if actionable else "noop",
+        "repaired": repaired,
+        "skipped": skipped,
+    }
+
+
 def _rewrite_orchestration_run_row(
     repo_root: Path,
     orchestration_id: str,
@@ -14950,6 +15256,22 @@ def main(argv: list[str] | None = None) -> int:
         ),
     )
 
+    repair_step_executor_parser = subparsers.add_parser(
+        "repair-step-result-executor",
+        help=(
+            "Repair a substep-aware step_result.json whose executor_agent_run_id "
+            "is a verify-substep arid instead of the orchestration arid (relocates "
+            "the file to the orchestration dir, rewrites the field, preserves "
+            "substep linkage). Recovers an orchestration locked at "
+            "step_result_written by validate_pre_judge_step_result_executor_integrity "
+            "without a fresh orchestration. Idempotent."
+        ),
+    )
+    repair_step_executor_parser.add_argument("--repo-root", required=True)
+    repair_step_executor_parser.add_argument("--orchestration-id", required=True)
+    repair_step_executor_parser.add_argument("--node-key", required=True)
+    repair_step_executor_parser.add_argument("--step", required=True)
+
     dismiss_viol_parser = subparsers.add_parser(
         "dismiss-violation",
         help=(
@@ -15019,7 +15341,21 @@ def main(argv: list[str] | None = None) -> int:
                 spec_ref=args.spec_ref,
                 source_dependency_ref=args.source_dependency_ref,
             )
-            # Bring any pre-caa10ab legacy agent_runs.jsonl lines into pre_judge
+            # Self-heal any step_result.json whose executor arid is a verify-substep
+            # arid instead of the orchestration arid (the
+            # validate_pre_judge_step_result_executor_integrity lock). Best-effort:
+            # runs at init time before any child launch, idempotent, never fatal.
+            # MUST run BEFORE repair_legacy_agent_runs: the legacy backfill derives a
+            # substep's missing parent_agent_run_id from the step_result's
+            # executor_agent_run_id (_load_substep_parent_map), so a still-corrupt
+            # executor would either leave the parent unrepairable (graph disagreement)
+            # or persist the wrong parent — and the step-result repair does not re-run
+            # the parent backfill afterward, so pre_judge would still fail.
+            step_executor_repair = repair_all_step_result_executors(
+                repo_root=repo_root,
+                orchestration_id=args.orchestration_id,
+            )
+            # Then bring any pre-caa10ab legacy agent_runs.jsonl lines into pre_judge
             # compliance before the resumed run reaches the gate. Runs at init
             # time (before any child launch / outside the active_child window),
             # so the agent_runs.jsonl write is safe. An explicit --agent-model is
@@ -15032,7 +15368,11 @@ def main(argv: list[str] | None = None) -> int:
                 agent_model=args.agent_model,
             )
             if isinstance(result, dict):
-                result = {**result, "legacy_record_repair": repair_summary}
+                result = {
+                    **result,
+                    "legacy_record_repair": repair_summary,
+                    "step_result_executor_repair": step_executor_repair,
+                }
         else:
             result = init_orchestration(
                 repo_root=repo_root,
@@ -15433,6 +15773,17 @@ def main(argv: list[str] | None = None) -> int:
             orchestration_id=args.orchestration_id,
             agent_model=args.agent_model,
         )
+    elif args.command == "repair-step-result-executor":
+        try:
+            result = repair_step_result_executor(
+                repo_root=repo_root,
+                orchestration_id=args.orchestration_id,
+                node_key=args.node_key,
+                step=args.step,
+            )
+        except (ValueError, RuntimeError) as exc:
+            print(f"repair-step-result-executor: {exc}", file=sys.stderr)
+            return 1
     elif args.command == "dismiss-violation":
         try:
             result = dismiss_violation(

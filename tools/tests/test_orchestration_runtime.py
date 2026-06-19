@@ -68,6 +68,8 @@ from tools.orchestration_runtime import (
     record_launch,
     record_timeout,
     repair_legacy_agent_runs,
+    repair_step_result_executor,
+    repair_all_step_result_executors,
     reserve_phase_root,
     render_launch_prompt_text,
     run_gate,
@@ -24459,6 +24461,266 @@ class TerseResultProjectionTests(unittest.TestCase):
             self.assertIn("--verbose", _help(cmd), msg=f"{cmd} should accept --verbose")
         # A non-bookkeeping subcommand must not gain the flag.
         self.assertNotIn("--verbose", _help("set-status"))
+
+
+class RepairStepResultExecutorTests(unittest.TestCase):
+    """repair-step-result-executor: recover a step_result.json whose executor arid
+    is a verify-substep arid instead of the orchestration arid
+    (validate_pre_judge_step_result_executor_integrity), without a fresh orchestration."""
+
+    NODE_KEY = "problem/shallow_water2d@0.3.0"
+    NODE_SAFE = "problem__shallow_water2d__0.3.0"
+    ORCH = "orch_repair_se_001"
+    ORCH_ARID = "orch-aaaa-0001"
+    SUB_ARID = "sub-bbbb-0001"
+
+    def _seed(
+        self,
+        tmp: str,
+        *,
+        dir_arid: str,
+        executor_field: str,
+        substep_role: str = "substep",
+        substep_ids: list[str] | None = None,
+    ) -> tuple[Path, Path]:
+        repo_root = Path(tmp)
+        root = repo_root / "workspace" / "orchestrations" / self.ORCH
+        root.mkdir(parents=True)
+        (root / "orchestration_meta.json").write_text(
+            json.dumps({
+                "orchestration_id": self.ORCH,
+                "status": "running",
+                "orchestration_agent_run_id": self.ORCH_ARID,
+            }),
+            encoding="utf-8",
+        )
+        rows = [
+            {"agent_run_id": self.ORCH_ARID, "agent_role": "orchestration",
+             "status": "running", "started_at": "2026-06-18T00:00:00Z"},
+            {"agent_run_id": self.SUB_ARID, "agent_role": substep_role,
+             "node_key": self.NODE_KEY, "step": "compile", "substep": "generate",
+             "status": "pass", "finished_at": "2026-06-18T00:01:00Z"},
+        ]
+        (root / "agent_runs.jsonl").write_text(
+            "\n".join(json.dumps(r) for r in rows) + "\n", encoding="utf-8"
+        )
+        sr_dir = root / "steps" / self.NODE_SAFE / "compile" / dir_arid
+        sr_dir.mkdir(parents=True)
+        (sr_dir / "step_result.json").write_text(
+            json.dumps({
+                "status": "fail",
+                "validation_stage": "compile",
+                "required_outputs": [],
+                "failed_substeps": [],
+                "substep_agent_run_ids": substep_ids if substep_ids is not None else [self.SUB_ARID],
+                "executor_agent_run_id": executor_field,
+            }),
+            encoding="utf-8",
+        )
+        return repo_root, root
+
+    def test_relocates_and_rewrites_executor_then_idempotent(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            # Corruption: both the directory key and the field are the substep arid,
+            # and the substep is not yet listed (so the repair must add the linkage).
+            repo_root, root = self._seed(
+                tmp, dir_arid=self.SUB_ARID, executor_field=self.SUB_ARID, substep_ids=[]
+            )
+            wrong = root / "steps" / self.NODE_SAFE / "compile" / self.SUB_ARID
+            right = root / "steps" / self.NODE_SAFE / "compile" / self.ORCH_ARID
+
+            res = repair_step_result_executor(
+                repo_root, self.ORCH, node_key=self.NODE_KEY, step="compile"
+            )
+            self.assertEqual(res["status"], "repaired")
+            self.assertTrue(res["relocated"])
+            self.assertEqual(res["executor_agent_run_id"], self.ORCH_ARID)
+
+            self.assertFalse(wrong.exists(), "corrupt directory must be removed")
+            self.assertTrue((right / "step_result.json").exists())
+            doc = json.loads((right / "step_result.json").read_text(encoding="utf-8"))
+            self.assertEqual(doc["executor_agent_run_id"], self.ORCH_ARID)
+            self.assertIn(self.SUB_ARID, doc["substep_agent_run_ids"],
+                          "substep linkage must be preserved for the pre_judge gate")
+
+            audit = (root / "record_repairs.jsonl").read_text(encoding="utf-8").splitlines()
+            self.assertEqual(len(audit), 1)
+            self.assertEqual(json.loads(audit[0])["to_executor_agent_run_id"], self.ORCH_ARID)
+
+            # Idempotent: a second run is a no-op (already at the orchestration dir).
+            res2 = repair_step_result_executor(
+                repo_root, self.ORCH, node_key=self.NODE_KEY, step="compile"
+            )
+            self.assertEqual(res2["status"], "noop")
+            self.assertEqual(
+                len((root / "record_repairs.jsonl").read_text(encoding="utf-8").splitlines()), 1
+            )
+
+    def test_refuses_when_wrong_arid_is_not_a_recorded_substep(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            # The directory arid resolves to a `step` role, not a recorded substep —
+            # relocating would invent linkage, so the repair must refuse and leave the
+            # original file untouched.
+            repo_root, root = self._seed(
+                tmp, dir_arid=self.SUB_ARID, executor_field=self.SUB_ARID, substep_role="step"
+            )
+            wrong = root / "steps" / self.NODE_SAFE / "compile" / self.SUB_ARID
+            with self.assertRaises(RuntimeError):
+                repair_step_result_executor(
+                    repo_root, self.ORCH, node_key=self.NODE_KEY, step="compile"
+                )
+            self.assertTrue((wrong / "step_result.json").exists(),
+                            "refused repair must not delete the original")
+            self.assertFalse(
+                (root / "steps" / self.NODE_SAFE / "compile" / self.ORCH_ARID).exists()
+            )
+
+    def test_rejects_non_substep_aware_step(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root, _ = self._seed(
+                tmp, dir_arid=self.SUB_ARID, executor_field=self.SUB_ARID
+            )
+            with self.assertRaises(RuntimeError):
+                repair_step_result_executor(
+                    repo_root, self.ORCH, node_key=self.NODE_KEY, step="build"
+                )
+
+    def test_resume_scan_repairs_all_corrupt(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root, root = self._seed(
+                tmp, dir_arid=self.SUB_ARID, executor_field=self.SUB_ARID
+            )
+            summary = repair_all_step_result_executors(repo_root, self.ORCH)
+            self.assertEqual(summary["status"], "repaired")
+            self.assertEqual(len(summary["repaired"]), 1)
+            self.assertEqual(summary["skipped"], [])
+            right = root / "steps" / self.NODE_SAFE / "compile" / self.ORCH_ARID
+            self.assertTrue((right / "step_result.json").exists())
+            # Second scan is a no-op.
+            self.assertEqual(repair_all_step_result_executors(repo_root, self.ORCH)["status"], "noop")
+
+    def test_step_result_repair_must_precede_legacy_backfill(self) -> None:
+        # Combined legacy case: a corrupt step_result (executor = verify-substep arid)
+        # AND a generate-substep row missing parent_agent_run_id. repair_legacy_agent_runs
+        # derives the substep parent from the step_result executor, so it must run AFTER
+        # repair_all_step_result_executors. This test pins the order dependency.
+        SUB_VERIFY = "sub-verify-0001"
+        SUB_GEN = "sub-gen-0001"
+
+        def _seed_combined(tmp: str) -> tuple[Path, Path]:
+            repo_root = Path(tmp)
+            root = repo_root / "workspace" / "orchestrations" / self.ORCH
+            root.mkdir(parents=True)
+            (root / "orchestration_meta.json").write_text(
+                json.dumps({"orchestration_id": self.ORCH, "orchestration_agent_run_id": self.ORCH_ARID}),
+                encoding="utf-8",
+            )
+            rows = [
+                {"agent_run_id": self.ORCH_ARID, "agent_role": "orchestration", "status": "running", "agent_model": "m"},
+                {"agent_run_id": SUB_VERIFY, "agent_role": "substep", "node_key": self.NODE_KEY,
+                 "step": "compile", "substep": "verify", "status": "pass",
+                 "parent_agent_run_id": self.ORCH_ARID, "agent_model": "m"},
+                # generate substep is missing parent_agent_run_id (the legacy gap).
+                {"agent_run_id": SUB_GEN, "agent_role": "substep", "node_key": self.NODE_KEY,
+                 "step": "compile", "substep": "generate", "status": "pass", "agent_model": "m"},
+            ]
+            (root / "agent_runs.jsonl").write_text(
+                "\n".join(json.dumps(r) for r in rows) + "\n", encoding="utf-8"
+            )
+            # agent_graph: the true parent edges are orch -> each substep.
+            (root / "agent_graph.json").write_text(
+                json.dumps({"edges": [
+                    {"parent_agent_run_id": self.ORCH_ARID, "child_agent_run_id": SUB_VERIFY, "relation_type": "spawn"},
+                    {"parent_agent_run_id": self.ORCH_ARID, "child_agent_run_id": SUB_GEN, "relation_type": "spawn"},
+                ]}),
+                encoding="utf-8",
+            )
+            sr_dir = root / "steps" / self.NODE_SAFE / "compile" / SUB_VERIFY
+            sr_dir.mkdir(parents=True)
+            (sr_dir / "step_result.json").write_text(
+                json.dumps({
+                    "status": "fail", "validation_stage": "compile", "required_outputs": [],
+                    "failed_substeps": [], "substep_agent_run_ids": [SUB_GEN],
+                    "executor_agent_run_id": SUB_VERIFY,  # corrupt: a substep arid
+                }),
+                encoding="utf-8",
+            )
+            return repo_root, root
+
+        def _gen_parent(root: Path) -> str | None:
+            for line in (root / "agent_runs.jsonl").read_text(encoding="utf-8").splitlines():
+                if line.strip() and json.loads(line)["agent_run_id"] == SUB_GEN:
+                    return json.loads(line).get("parent_agent_run_id")
+            return None
+
+        # Correct order (as wired in the init dispatch): step-result repair first.
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root, root = _seed_combined(tmp)
+            repair_all_step_result_executors(repo_root, self.ORCH)
+            repair_legacy_agent_runs(repo_root=repo_root, orchestration_id=self.ORCH)
+            self.assertEqual(_gen_parent(root), self.ORCH_ARID,
+                             "step-result repair before legacy backfill must yield the correct substep parent")
+
+        # Reverse order leaves the generate substep parent unrepaired (graph
+        # disagreement against the still-corrupt executor) — pins why the order matters.
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root2, root2 = _seed_combined(tmp)
+            repair_legacy_agent_runs(repo_root=repo_root2, orchestration_id=self.ORCH)
+            repair_all_step_result_executors(repo_root2, self.ORCH)
+            self.assertIsNone(_gen_parent(root2),
+                              "legacy backfill before step-result repair must not have fixed the parent")
+
+    def test_resume_scan_repairs_field_only_mismatch(self) -> None:
+        # The directory key is already the orchestration arid, but the
+        # executor_agent_run_id field is a substep arid. The orchestration row has
+        # no node_key, so the scan must resolve the node from the path's node_safe
+        # (not from the dir arid's run row) or it would skip and leave the lock.
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root, root = self._seed(
+                tmp, dir_arid=self.ORCH_ARID, executor_field=self.SUB_ARID
+            )
+            summary = repair_all_step_result_executors(repo_root, self.ORCH)
+            self.assertEqual(summary["status"], "repaired", msg=f"skipped={summary['skipped']}")
+            self.assertEqual(summary["skipped"], [])
+            doc = json.loads(
+                (root / "steps" / self.NODE_SAFE / "compile" / self.ORCH_ARID / "step_result.json")
+                .read_text(encoding="utf-8")
+            )
+            self.assertEqual(doc["executor_agent_run_id"], self.ORCH_ARID)
+
+    def test_field_only_repair_preserves_original_executor_linkage(self) -> None:
+        # Field-only corruption where the wrong executor substep is NOT already in
+        # substep_agent_run_ids: the repair must add it so the substep→step_result
+        # linkage the pre_judge/completion check needs is not dropped.
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root, root = self._seed(
+                tmp, dir_arid=self.ORCH_ARID, executor_field=self.SUB_ARID, substep_ids=[]
+            )
+            res = repair_step_result_executor(
+                repo_root, self.ORCH, node_key=self.NODE_KEY, step="compile"
+            )
+            self.assertEqual(res["status"], "repaired")
+            self.assertFalse(res["relocated"])
+            self.assertEqual(res["from_executor_agent_run_id"], self.SUB_ARID)
+            doc = json.loads(
+                (root / "steps" / self.NODE_SAFE / "compile" / self.ORCH_ARID / "step_result.json")
+                .read_text(encoding="utf-8")
+            )
+            self.assertEqual(doc["executor_agent_run_id"], self.ORCH_ARID)
+            self.assertIn(self.SUB_ARID, doc["substep_agent_run_ids"],
+                          "the original (wrong) executor substep must be preserved as linkage")
+
+    def test_field_only_refuses_when_executor_field_not_a_recorded_substep(self) -> None:
+        # Field-only corruption where the wrong executor field is an unknown arid
+        # (not a recorded substep): refuse rather than silently drop the linkage.
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root, root = self._seed(
+                tmp, dir_arid=self.ORCH_ARID, executor_field="ghost-9999", substep_ids=[]
+            )
+            with self.assertRaises(RuntimeError):
+                repair_step_result_executor(
+                    repo_root, self.ORCH, node_key=self.NODE_KEY, step="compile"
+                )
 
 
 if __name__ == "__main__":

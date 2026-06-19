@@ -54,6 +54,7 @@ TIER_B_SUBCOMMANDS: frozenset[str] = frozenset({
     "check-step-completed",
     "orchestration-read",
     "repair-agent-runs",
+    "repair-step-result-executor",
     "dismiss-violation",
 })
 
