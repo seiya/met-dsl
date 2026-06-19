@@ -259,7 +259,7 @@ Direct embedding via `--patch-text` is also possible, but to avoid the ARG_MAX l
 
 ### automatic strip decision
 
-The CLI argument `--strip` does not exist. Using the `changed_paths` passed via `--paths-json` as an oracle, it internally tries `git apply --check` in the order `-p1` → `-p0`, and automatically selects the first strip that can cover all `changed_paths`.
+The CLI argument `--strip` does not exist. Using the `changed_paths` passed via `--paths-json` as an oracle, it internally tries `git apply --check` in the order `-p1` → `-p0`, and automatically selects the first strip that can cover all `changed_paths`. When neither strip level produces targets fully covered by `changed_paths`, the `cannot determine patch strip level` error reports, per strip level, the paths `git` resolves and the subset not covered by `changed_paths`. These reported targets identify the patch header / `--paths-json` mismatch to correct.
 
 ### Output contract
 

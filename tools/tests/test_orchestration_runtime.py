@@ -14277,6 +14277,46 @@ class TestPhase3RunGate(unittest.TestCase):
                     )
             self.assertEqual(run_mock.call_count, 0)
 
+    def test_select_patch_strip_error_names_actual_targets_and_uncovered(self) -> None:
+        # A strip-selection failure must tell the author what git would actually
+        # touch (per strip level) and which paths weren't covered — so the patch
+        # is fixed in one shot instead of a blind re-author loop.
+        from tools.orchestration_runtime import _select_patch_strip
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            with patch(
+                "tools.orchestration_runtime._numstat_targets",
+                return_value=["workspace/out/actual_target.json"],
+            ):
+                with self.assertRaises(RuntimeError) as ctx:
+                    _select_patch_strip(
+                        repo_root,
+                        "patch-text",
+                        ["workspace/out/declared/"],
+                    )
+            msg = str(ctx.exception)
+            self.assertIn("cannot determine patch strip level", msg)
+            self.assertIn("workspace/out/actual_target.json", msg)
+            self.assertIn("not covered by changed_paths", msg)
+            self.assertIn("declared changed_paths=['workspace/out/declared/']", msg)
+            # Both strip levels are reported.
+            self.assertIn("-p1:", msg)
+            self.assertIn("-p0:", msg)
+
+    def test_select_patch_strip_error_surfaces_numstat_rejection(self) -> None:
+        from tools.orchestration_runtime import _select_patch_strip
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            with patch(
+                "tools.orchestration_runtime._numstat_targets",
+                side_effect=RuntimeError("pre-apply numstat failed: corrupt patch"),
+            ):
+                with self.assertRaises(RuntimeError) as ctx:
+                    _select_patch_strip(repo_root, "bad", ["workspace/out/x/"])
+            msg = str(ctx.exception)
+            self.assertIn("numstat rejected the patch", msg)
+            self.assertIn("corrupt patch", msg)
+
     def test_guarded_apply_patch_rejects_patch_outside_output_manifest(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
@@ -17110,6 +17150,44 @@ class RecordTimeoutTests(unittest.TestCase):
             self.assertFalse(
                 _parent_return_token_path(repo_root, "orch_to_001", arid).exists()
             )
+
+    def test_finalize_child_persists_best_effort_child_usage(self) -> None:
+        # The finalize path embeds a best-effort `usage` field into the
+        # agent_runs.jsonl entry so child token cost is durable in-repo. With no
+        # ~/.claude transcript present (test env), it degrades to a status marker
+        # rather than breaking finalization.
+        from tools.orchestration_runtime import finalize_child, _parent_return_token_path
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            arid = self._setup_substep_launch(repo_root)
+            token = _parent_return_token_path(
+                repo_root, "orch_to_001", arid
+            ).read_text(encoding="utf-8").strip()
+            finalize_child(
+                repo_root=repo_root,
+                orchestration_id="orch_to_001",
+                agent_run_id=arid,
+                return_token=token,
+                reply_text="status: fail\noutput_refs:\n- (none)\nrationale: t",
+                agent_run_payload={
+                    "agent_run_id": arid,
+                    "agent_role": "substep",
+                    "agent_backend": "claude",
+                    "status": "fail",
+                    "agent_session_id": arid,
+                    "context_id": "ctx_finalize_usage",
+                    "context_isolated": True,
+                    "node_key": "problem/shallow_water2d@0.3.0",
+                    "started_at": "2026-05-09T08:00:00Z",
+                    "finished_at": "2026-05-09T08:05:00Z",
+                    "result_summary": "t",
+                },
+            )
+            runs_path = repo_root / "workspace/orchestrations/orch_to_001/agent_runs.jsonl"
+            entries = [json.loads(l) for l in runs_path.read_text().splitlines() if l.strip()]
+            entry = next(e for e in entries if e.get("agent_run_id") == arid)
+            self.assertIn("usage", entry)
+            self.assertEqual(entry["usage"].get("status"), "unavailable")
 
     def test_finalize_child_rejects_agent_run_id_mismatch(self) -> None:
         from tools.orchestration_runtime import finalize_child
@@ -24885,6 +24963,37 @@ class StartupDocSizeTests(unittest.TestCase):
     def test_startup_contract_within_budget(self) -> None:
         size = (self.REPO_ROOT / "skills/workflow-orchestration/references/startup_contract.md").stat().st_size
         self.assertLessEqual(size, 33000, f"startup_contract.md grew to {size} bytes; trim or justify the ceiling")
+
+
+class ChildContextDocSizeTests(unittest.TestCase):
+    """Regression guard: the docs each child step/substep agent reads after launch
+    (AGENT_CONTRACT + its phase doc + MCP_COMMAND_LOG_PLACEMENT for Generate/Build/
+    Validate.execute) are resident every child turn, and child subagents are the
+    majority of a node's token cost (their cache_read scales with this floor ×
+    turns × children). Cap the per-child doc floor to catch re-bloat. Ceilings sit
+    just above current sizes; a deeper safe de-dup (making each phase doc the true
+    superset, then trimming the conceptual overlap with AGENT_CONTRACT /
+    MCP_COMMAND_LOG_PLACEMENT) is review-gated follow-up work — lowering these
+    ceilings is its deliverable, and raising one needs an explicit justification."""
+
+    REPO_ROOT = Path(__file__).resolve().parents[2]
+
+    # path -> byte ceiling (current size + small headroom)
+    _CEILINGS = {
+        "docs/AGENT_CONTRACT.md": 16800,
+        "docs/workflow/MCP_COMMAND_LOG_PLACEMENT.md": 21000,
+        "docs/workflow/phases/phase_01_compile.md": 17000,
+        "docs/workflow/phases/phase_02_generate.md": 21500,
+        "docs/workflow/phases/phase_03_build.md": 8000,
+        "docs/workflow/phases/phase_04_validate.md": 19000,
+    }
+
+    def test_child_context_docs_within_budget(self) -> None:
+        for rel, ceiling in self._CEILINGS.items():
+            size = (self.REPO_ROOT / rel).stat().st_size
+            self.assertLessEqual(
+                size, ceiling, f"{rel} grew to {size} bytes (ceiling {ceiling}); trim or justify"
+            )
 
 
 class ReplyBudgetTests(unittest.TestCase):

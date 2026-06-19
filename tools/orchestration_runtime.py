@@ -13338,6 +13338,49 @@ def record_reply_text(
     }
 
 
+def _collect_child_usage_for_finalize(
+    repo_root: Path, orchestration_id: str, agent_run_id: str
+) -> dict[str, Any]:
+    """Best-effort token usage for a just-returned child, for durable in-repo persistence.
+
+    Child ``Agent`` subagents carry no usage in ``agent_runs.jsonl`` and are not
+    sidechains in the host transcript, so child cost (empirically the majority of
+    a node's total) is invisible once the machine-local, ephemeral ``~/.claude``
+    transcript is cleaned. Capturing it at finalize time — when the child has just
+    returned and its transcript is on disk — persists the numbers in-repo so later
+    audits aren't blind. Never raises and never blocks finalization: any failure
+    yields a ``status: "unavailable"`` marker. The post-hoc reconstruction path is
+    ``tools/audit_orchestration.py`` (same aggregator).
+    """
+    try:
+        try:  # script run: tools/ on sys.path ; package import: repo root on path
+            from orchestration_diagnostics import aggregate_child_usage
+        except ImportError:  # pragma: no cover - import-path shim
+            from tools.orchestration_diagnostics import aggregate_child_usage
+        # The just-returned child is under the current host session, so hint that
+        # session to avoid scanning every other session's subagents on each finalize.
+        meta = _read_json(
+            _orchestration_root(repo_root, orchestration_id) / "orchestration_meta.json"
+        )
+        host_session_id = None
+        if isinstance(meta, dict):
+            hs = meta.get("host_session_id")
+            if isinstance(hs, str) and hs.strip():
+                host_session_id = hs.strip()
+        agg = aggregate_child_usage(
+            repo_root, [agent_run_id], host_session_id=host_session_id
+        )
+        usage = (agg.get("per_child") or {}).get(agent_run_id)
+        if isinstance(usage, dict) and usage:
+            return usage
+        return {
+            "status": "unavailable",
+            "reason": agg.get("reason") or "no locatable child transcript",
+        }
+    except Exception as exc:  # noqa: BLE001 - usage capture must never break finalize
+        return {"status": "unavailable", "reason": f"usage capture error: {exc}"}
+
+
 def finalize_child(
     repo_root: Path,
     orchestration_id: str,
@@ -13428,6 +13471,14 @@ def finalize_child(
         agent_run_id=arid,
         reply_text=reply_text,
     )
+    # Persist child token usage in-repo (resolves the measurement blind spot for
+    # later audits, since ~/.claude transcripts are ephemeral). Best-effort and
+    # additive: never overrides a caller-supplied value, never blocks finalize.
+    if "usage" not in agent_run_payload:
+        agent_run_payload = dict(agent_run_payload)
+        agent_run_payload["usage"] = _collect_child_usage_for_finalize(
+            repo_root, orchestration_id, arid
+        )
     run_record = record_agent_run(
         repo_root,
         orchestration_id,
@@ -14616,20 +14667,39 @@ def _select_patch_strip(
     Returns (strip, numstat_targets). Raises RuntimeError if neither strip level produces
     targets covered by changed_paths (includes mixed-prefix and out-of-scope patches).
     """
+    # Collect, per strip level, the actual numstat outcome so a rejection tells the
+    # author exactly what git would touch vs. what was declared — turning a blind
+    # re-author loop (observed costing many turns in validate substeps) into a
+    # one-shot fix.
+    diagnostics: list[str] = []
     for strip in (1, 0):
         try:
             numstat = _numstat_targets(repo_root, patch_text, strip)
-        except RuntimeError:
+        except RuntimeError as exc:
+            diagnostics.append(f"-p{strip}: numstat rejected the patch ({exc})")
             continue
-        if numstat and all(
-            any(_repo_path_under_prefix(p, cp) for cp in normalized_paths) for p in numstat
-        ):
+        if not numstat:
+            diagnostics.append(f"-p{strip}: numstat produced no targets")
+            continue
+        uncovered = [
+            p
+            for p in numstat
+            if not any(_repo_path_under_prefix(p, cp) for cp in normalized_paths)
+        ]
+        if not uncovered:
             return strip, numstat
+        diagnostics.append(
+            f"-p{strip}: git would touch {numstat}; not covered by changed_paths: {uncovered}"
+        )
     raise RuntimeError(
         "guarded-apply-patch: cannot determine patch strip level — "
         "neither -p1 nor -p0 produces targets covered by declared changed_paths "
         "(patch may have mixed prefixes or targets outside changed_paths). "
-        f"changed_paths={normalized_paths}"
+        f"declared changed_paths={normalized_paths}. "
+        + " | ".join(diagnostics)
+        + ". Fix: make each patch's '+++ b/<path>' header (after -p1 strip) exactly "
+        "match a declared changed_paths entry, declare every touched path, and keep "
+        "one file per patch."
     )
 
 

@@ -32,6 +32,8 @@ Callers:
 from __future__ import annotations
 
 import json
+import re
+from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -486,6 +488,286 @@ def resolve_transcripts(
         summary["match_method"] = match_method
         result["child_transcript"] = summary
 
+    return result
+
+
+def summarize_jsonl_usage(records: list[dict[str, Any]]) -> dict[str, Any]:
+    """Sum token usage across the assistant turns of a Claude Code transcript.
+
+    Each assistant record carries ``message.usage`` with input / output /
+    cache_read / cache_creation token counts. ``total_tokens`` is their sum;
+    ``peak_context_tokens`` is the max per-turn resident context
+    (input + cache_read + cache_creation), which exposes the quadratic
+    cache_read growth that dominates long agent sessions. Defensive: records
+    without a ``message.usage`` dict are skipped.
+    """
+    inp = out = cache_read = cache_creation = turns = 0
+    peak = 0
+    for record in records:
+        message = record.get("message")
+        if not isinstance(message, dict):
+            continue
+        usage = message.get("usage")
+        if not isinstance(usage, dict):
+            continue
+        turns += 1
+        i = int(usage.get("input_tokens") or 0)
+        o = int(usage.get("output_tokens") or 0)
+        cr = int(usage.get("cache_read_input_tokens") or 0)
+        cc = int(usage.get("cache_creation_input_tokens") or 0)
+        inp += i
+        out += o
+        cache_read += cr
+        cache_creation += cc
+        peak = max(peak, i + cr + cc)
+    return {
+        "input_tokens": inp,
+        "output_tokens": out,
+        "cache_read_input_tokens": cache_read,
+        "cache_creation_input_tokens": cache_creation,
+        "total_tokens": inp + out + cache_read + cache_creation,
+        "assistant_turns": turns,
+        "peak_context_tokens": peak,
+    }
+
+
+def summarize_transcript_usage(path: Path) -> dict[str, Any]:
+    """Token-usage summary for a single transcript jsonl (``found=False`` if absent)."""
+    if not path.exists():
+        return {"found": False, "path": str(path)}
+    summary = summarize_jsonl_usage(_read_jsonl(path))
+    summary["found"] = True
+    summary["path"] = str(path)
+    return summary
+
+
+_USAGE_SUM_KEYS: tuple[str, ...] = (
+    "input_tokens",
+    "output_tokens",
+    "cache_read_input_tokens",
+    "cache_creation_input_tokens",
+    "total_tokens",
+    "assistant_turns",
+)
+
+# A child's OWN arid is the one in its capability / output-manifest paths. Its
+# PARENT arid also appears in the body (as ``parent_agent_run_id``), so a bare
+# substring match would misattribute the transcript to the parent. These paths
+# disambiguate: they only ever name the child itself.
+_OWN_ARID_PATH_RE = re.compile(
+    r"(?:capabilities|output_manifests|read_manifests|sandbox_profiles)/"
+    r"([0-9a-fA-F-]{36})\.json"
+)
+
+
+def _own_arid_of_transcript(text: str, targets: set[str]) -> str | None:
+    """Identify which target arid a child subagent transcript belongs to.
+
+    Prefers the arid named in the child's own capability/output-manifest paths
+    (unambiguous). Falls back to the most frequently mentioned target arid, since
+    the child's own arid dominates its transcript while the parent arid appears
+    only incidentally.
+    """
+    owned = [a for a in _OWN_ARID_PATH_RE.findall(text) if a in targets]
+    if owned:
+        return Counter(owned).most_common(1)[0][0]
+    present = [a for a in targets if a in text]
+    if not present:
+        return None
+    counts = {a: text.count(a) for a in present}
+    return max(counts, key=counts.get)
+
+
+def _first_user_text_contains(records: list[dict[str, Any]], needle: str) -> bool:
+    """True if the first ``type=="user"`` record's text content contains ``needle``."""
+    for record in records:
+        if record.get("type") != "user":
+            continue
+        message = record.get("message")
+        content = message.get("content") if isinstance(message, dict) else None
+        text = ""
+        if isinstance(content, str):
+            text = content
+        elif isinstance(content, list):
+            parts = []
+            for block in content:
+                if isinstance(block, dict):
+                    if isinstance(block.get("text"), str):
+                        parts.append(block["text"])
+                    elif isinstance(block.get("content"), str):
+                        parts.append(block["content"])
+            text = " ".join(parts)
+        # A type=="user" record carrying only a tool_result block yields no text
+        # here and is intentionally skipped, so the real opening launch-prompt user
+        # record is the one tested — do not "fix" this to inspect tool_result bodies.
+        if not text.strip():
+            continue
+        return needle in text
+    return False
+
+
+def aggregate_child_usage(
+    repo_root: Path,
+    agent_run_ids: list[str],
+    *,
+    host_session_id: str | None = None,
+) -> dict[str, Any]:
+    """Attribute per-child token usage from the ephemeral ``~/.claude`` transcripts.
+
+    Child ``Agent`` subagents are NOT recorded as sidechains in the host
+    transcript and ``agent_runs.jsonl`` carries no usage fields, so child token
+    cost (empirically the majority of a workflow node's cost) is otherwise
+    invisible. This locates each child's
+    ``~/.claude/projects/<slug>/<host>/subagents/agent-*.jsonl`` transcript by
+    arid-in-body (the child launch prompt embeds its own arid) and sums usage.
+
+    By default scans every host session's ``subagents`` dir (not just one), which
+    is robust to multi-session nodes — e.g. a ``--resume`` that ran some children
+    under a different host session than the others. Pass ``host_session_id`` to
+    restrict the scan to a single session's ``subagents`` dir; the live
+    ``finalize_child`` path uses this because the just-returned child is always
+    under the current host session, which avoids reading every other session's
+    transcripts on each finalize. Best-effort: returns ``available=False`` with a
+    reason when ``~/.claude`` is absent/cleaned; never raises.
+    """
+    targets = [a for a in agent_run_ids if isinstance(a, str) and a]
+    projects_dir = _claude_projects_dir(repo_root)
+    result: dict[str, Any] = {
+        "projects_dir": str(projects_dir),
+        "per_child": {},
+        "matched_count": 0,
+        "unmatched_arids": sorted(set(targets)),
+    }
+    if not targets:
+        result["available"] = False
+        result["reason"] = "no agent_run_ids to attribute"
+        return result
+    if not projects_dir.is_dir():
+        result["available"] = False
+        result["reason"] = "claude projects dir missing (transcripts machine-local/ephemeral)"
+        return result
+
+    target_set = set(targets)
+    per_child: dict[str, Any] = {}
+    glob_pat = (
+        f"{host_session_id}/subagents/agent-*.jsonl"
+        if host_session_id
+        else "*/subagents/agent-*.jsonl"
+    )
+    for sub in sorted(projects_dir.glob(glob_pat)):
+        try:
+            text = sub.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        owner = _own_arid_of_transcript(text, target_set)
+        if owner is None or owner in per_child:
+            continue
+        records: list[dict[str, Any]] = []
+        for line in text.splitlines():
+            token = line.strip()
+            if not token:
+                continue
+            try:
+                payload = json.loads(token)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(payload, dict):
+                records.append(payload)
+        usage = summarize_jsonl_usage(records)
+        usage["transcript"] = str(sub)
+        per_child[owner] = usage
+        if len(per_child) == len(target_set):
+            break
+
+    totals = {k: 0 for k in _USAGE_SUM_KEYS}
+    for usage in per_child.values():
+        for key in _USAGE_SUM_KEYS:
+            totals[key] += int(usage.get(key, 0) or 0)
+    totals["peak_context_tokens"] = max(
+        (int(u.get("peak_context_tokens", 0) or 0) for u in per_child.values()),
+        default=0,
+    )
+
+    result["available"] = True
+    result["per_child"] = per_child
+    result["children_total"] = totals
+    result["matched_count"] = len(per_child)
+    result["unmatched_arids"] = sorted(target_set - set(per_child))
+    return result
+
+
+def aggregate_parent_usage(
+    repo_root: Path, orchestration_agent_run_id: str
+) -> dict[str, Any]:
+    """Sum the orchestration (parent) agent's token usage across all its host sessions.
+
+    A node that was ``--resume``-d runs the parent under more than one host session
+    (the original plus each resume), so reading only the current
+    ``host_session_id`` understates the parent total and skews the parent/children
+    ratio. A parent session's *first user message* is the orchestration launch
+    prompt, which embeds ``workspace/tmp/<orchestration_agent_run_id>`` (its
+    allowed_tmp_root) — a token unique to this parent. Matching on the FIRST user
+    message (not anywhere in the body) is what makes this precise: a diagnostic /
+    ``/plan`` session that merely *discusses* this orchestration also contains the
+    token, but not as its opening prompt. Best-effort: ``available=False`` (never
+    raises) when ``~/.claude`` is gone or the id is empty.
+    """
+    arid = (orchestration_agent_run_id or "").strip()
+    projects_dir = _claude_projects_dir(repo_root)
+    result: dict[str, Any] = {"sessions": []}
+    if not arid:
+        result["available"] = False
+        result["reason"] = "no orchestration_agent_run_id"
+        return result
+    if not projects_dir.is_dir():
+        result["available"] = False
+        result["reason"] = "claude projects dir missing (transcripts machine-local/ephemeral)"
+        return result
+
+    marker = f"workspace/tmp/{arid}"
+    totals = {k: 0 for k in _USAGE_SUM_KEYS}
+    peak = 0
+    sessions: list[dict[str, Any]] = []
+    for sess in sorted(projects_dir.glob("*.jsonl")):
+        try:
+            text = sess.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        if marker not in text:
+            continue
+        records: list[dict[str, Any]] = []
+        for line in text.splitlines():
+            token = line.strip()
+            if not token:
+                continue
+            try:
+                payload = json.loads(token)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(payload, dict):
+                records.append(payload)
+        # Precise gate: the marker must be in this session's FIRST user message
+        # (the launch prompt), not merely somewhere in the body — otherwise a
+        # session that only discusses this orchestration would be counted.
+        if not _first_user_text_contains(records, marker):
+            continue
+        usage = summarize_jsonl_usage(records)
+        usage["transcript"] = str(sess)
+        for key in _USAGE_SUM_KEYS:
+            totals[key] += int(usage.get(key, 0) or 0)
+        peak = max(peak, int(usage.get("peak_context_tokens", 0) or 0))
+        sessions.append(usage)
+
+    if not sessions:
+        result["available"] = False
+        result["reason"] = "no parent transcript located"
+        return result
+    totals["peak_context_tokens"] = peak
+    result["available"] = True
+    result["found"] = True
+    result.update(totals)
+    result["session_count"] = len(sessions)
+    result["sessions"] = sessions
     return result
 
 

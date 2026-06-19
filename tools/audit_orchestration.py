@@ -27,9 +27,23 @@ from pathlib import Path
 from typing import Any
 
 try:  # script run: sys.path[0] is tools/ ; package import: repo root on path
-    from orchestration_diagnostics import build_launch_incident, api_error_from_records
+    from orchestration_diagnostics import (
+        build_launch_incident,
+        api_error_from_records,
+        aggregate_child_usage,
+        aggregate_parent_usage,
+        summarize_transcript_usage,
+        _claude_projects_dir,
+    )
 except ImportError:  # pragma: no cover - import-path shim
-    from tools.orchestration_diagnostics import build_launch_incident, api_error_from_records
+    from tools.orchestration_diagnostics import (
+        build_launch_incident,
+        api_error_from_records,
+        aggregate_child_usage,
+        aggregate_parent_usage,
+        summarize_transcript_usage,
+        _claude_projects_dir,
+    )
 
 
 def _load_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -349,12 +363,132 @@ def collect_agent_run_summary(
     }
 
 
+def collect_token_cost_summary(
+    repo_root: Path,
+    meta: dict[str, Any] | None,
+    agent_runs: list[dict[str, Any]],
+    invalid_runs: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Attribute token cost across the orchestration (parent) and its children.
+
+    Resolves the measurement blind spot where child ``Agent`` subagents — the
+    majority of a node's cost — are not sidechains in the host transcript. Child
+    usage comes first from the durable ``usage`` field ``finalize_child`` writes
+    into ``agent_runs.jsonl`` (survives ``~/.claude`` cleanup), then falls back to
+    the ephemeral subagent transcript for any child lacking it. ``parent`` is the
+    orchestration session(s)' own usage. Best-effort — reports ``available=False``
+    (never raises) when neither side yields data.
+    """
+    meta = meta or {}
+    # The orchestration agent's own arid appears in agent_runs.jsonl but is the
+    # parent, not a child subagent — exclude it so it isn't reported as an
+    # unlocatable child.
+    parent_arid = str(meta.get("orchestration_agent_run_id") or "").strip()
+    arids: list[str] = []
+    persisted: dict[str, dict[str, Any]] = {}
+    seen: set[str] = set()
+    for run in list(agent_runs) + list(invalid_runs or []):
+        arid = run.get("agent_run_id")
+        if not (isinstance(arid, str) and arid and arid != parent_arid and arid not in seen):
+            continue
+        seen.add(arid)
+        arids.append(arid)
+        # Durable per-child usage persisted into agent_runs.jsonl by finalize_child
+        # survives ~/.claude cleanup; prefer it over the ephemeral transcript so a
+        # later post-cleanup audit still sees child totals. The
+        # {"status": "unavailable"} marker (no numeric total) is not data.
+        u = run.get("usage")
+        if isinstance(u, dict) and isinstance(u.get("total_tokens"), int):
+            entry = dict(u)
+            entry.setdefault("source", "agent_runs.jsonl")
+            persisted[arid] = entry
+
+    # Reconstruct from the ephemeral transcripts only for children that lack durable
+    # usage (legacy rows, or non-finalize-child paths) — skipping ~/.claude entirely
+    # when every child is already covered.
+    missing = [a for a in arids if a not in persisted]
+    transcripts = (
+        aggregate_child_usage(repo_root, missing)
+        if missing
+        else {"available": True, "per_child": {}, "unmatched_arids": [], "matched_count": 0}
+    )
+    per_child: dict[str, Any] = dict(persisted)
+    for c_arid, c_usage in (transcripts.get("per_child") or {}).items():
+        if isinstance(c_usage, dict):
+            c_usage.setdefault("source", "transcript")
+        per_child[c_arid] = c_usage
+
+    sum_keys = (
+        "input_tokens",
+        "output_tokens",
+        "cache_read_input_tokens",
+        "cache_creation_input_tokens",
+        "total_tokens",
+        "assistant_turns",
+    )
+    children_total = {k: 0 for k in sum_keys}
+    for u in per_child.values():
+        for k in sum_keys:
+            children_total[k] += int(u.get(k, 0) or 0)
+    children_total["peak_context_tokens"] = max(
+        (int(u.get("peak_context_tokens", 0) or 0) for u in per_child.values()),
+        default=0,
+    )
+    children: dict[str, Any] = {
+        "available": bool(per_child) or bool(transcripts.get("available")),
+        "per_child": per_child,
+        "children_total": children_total,
+        "matched_count": len(per_child),
+        "unmatched_arids": sorted(set(arids) - set(per_child)),
+        "projects_dir": transcripts.get("projects_dir"),
+    }
+    if not per_child:
+        children["reason"] = transcripts.get("reason") or "no child usage located"
+
+    # Parent usage: prefer the multi-session sum (a resumed node ran the parent
+    # under more than one host session), falling back to the single current host
+    # transcript when the orchestration_agent_run_id is unknown.
+    parent: dict[str, Any] = {"found": False}
+    host_session_id = str(meta.get("host_session_id") or "").strip()
+    if parent_arid:
+        agg_parent = aggregate_parent_usage(repo_root, parent_arid)
+        if agg_parent.get("available"):
+            parent = agg_parent
+            if host_session_id:
+                parent["host_session_id"] = host_session_id
+    if not parent.get("found") and host_session_id:
+        host_path = _claude_projects_dir(repo_root) / f"{host_session_id}.jsonl"
+        parent = summarize_transcript_usage(host_path)
+        parent["host_session_id"] = host_session_id
+
+    # Available when EITHER side actually yielded data: in a post-cleanup audit the
+    # parent session may survive while child transcripts are gone (or vice-versa),
+    # and the surviving total is worth showing. But when NEITHER side matched
+    # anything, report unavailable rather than a misleading 0-token breakdown — a
+    # present-but-empty ~/.claude dir must not count as "available".
+    summary: dict[str, Any] = {
+        "available": bool(per_child) or bool(parent.get("found")),
+        "parent": parent,
+        "children": children,
+    }
+    parent_total = int(parent.get("total_tokens", 0) or 0) if parent.get("found") else 0
+    child_total = int((children.get("children_total") or {}).get("total_tokens", 0) or 0)
+    node_total = parent_total + child_total
+    summary["node_total_tokens"] = node_total
+    summary["parent_total_tokens"] = parent_total
+    summary["children_total_tokens"] = child_total
+    if node_total > 0:
+        summary["children_fraction"] = round(child_total / node_total, 3)
+    return summary
+
+
 def audit(repo_root: Path, orchestration_id: str) -> dict[str, Any]:
     root = _orch_root(repo_root, orchestration_id)
     hook_events, hook_errs = _load_jsonl_with_errors(root / "hooks" / "native_hook_events.jsonl")
     phase_log, phase_errs = _load_jsonl_with_errors(root / "phase_state_log.jsonl")
     agent_runs, runs_errs = _load_jsonl_with_errors(root / "agent_runs.jsonl")
     invalid_runs, inv_errs = _load_jsonl_with_errors(root / "agent_runs_invalid.jsonl")
+    meta = _load_json_if_dict(root / "orchestration_meta.json") or {}
 
     all_blocks = [e for e in hook_events if e.get("action") == "block"]
     substantive_blocks, benign_blocks = split_substantive_and_benign(all_blocks)
@@ -370,6 +504,15 @@ def audit(repo_root: Path, orchestration_id: str) -> dict[str, Any]:
         launch_incident = build_launch_incident(repo_root, orchestration_id)
     except Exception:  # noqa: BLE001 - diagnostics must never break the audit
         launch_incident = None
+    # Token-cost attribution (parent orchestration vs child subagents). Children
+    # carry no usage in agent_runs.jsonl and aren't sidechains, so this reads the
+    # ephemeral ~/.claude transcripts. Best-effort — must never break the audit.
+    try:
+        token_cost_summary = collect_token_cost_summary(
+            repo_root, meta, agent_runs, invalid_runs
+        )
+    except Exception:  # noqa: BLE001 - diagnostics must never break the audit
+        token_cost_summary = {"available": False, "reason": "token-cost collection failed"}
     # Persisted incident snapshots captured at run time. These survive after
     # `--resume` clears the active-child markers (live detection then returns None)
     # and after ~/.claude cleanup removes the transcript, so they are the durable
@@ -399,6 +542,7 @@ def audit(repo_root: Path, orchestration_id: str) -> dict[str, Any]:
         "launch_incident": launch_incident,
         "launch_incident_snapshots": launch_incident_snapshots,
         "agent_run_summary": collect_agent_run_summary(agent_runs, invalid_runs),
+        "token_cost_summary": token_cost_summary,
         "invalid_run_count": len(invalid_runs),
         "invalid_run_ids": [r.get("agent_run_id") for r in invalid_runs if r.get("agent_run_id")],
         "data_integrity_warning": (len(parse_errors) > 0) or (unparseable_count > 0),
@@ -532,6 +676,84 @@ def _render_launch_incident(
                 lines.append("")
 
 
+def _fmt_tok(n: Any) -> str:
+    try:
+        return f"{int(n):,}"
+    except (TypeError, ValueError):
+        return "n/a"
+
+
+def _render_token_cost(summary: dict[str, Any] | None, lines: list[str]) -> None:
+    """Render the parent-vs-children token breakdown — the measurement that makes
+    the (usually dominant) child subagent cost visible."""
+    lines.append("## Token cost breakdown (parent vs child subagents)")
+    lines.append("")
+    if not isinstance(summary, dict) or not summary.get("available"):
+        reason = (summary or {}).get("reason") or (
+            (summary or {}).get("children", {}) or {}
+        ).get("reason", "unavailable")
+        lines.append(
+            f"Child token attribution unavailable: {reason}. "
+            "(`~/.claude` transcripts are machine-local and ephemeral; run the "
+            "audit on the machine that executed the workflow, before cleanup.)"
+        )
+        lines.append("")
+        return
+
+    children = summary.get("children", {}) or {}
+    parent = summary.get("parent", {}) or {}
+    parent_ok = bool(parent.get("found"))
+    # "available" but zero matched transcripts (dir present, all arids cleaned) is
+    # not a measurement — showing "0 (0%)" would read as "children cost nothing".
+    children_ok = bool(children.get("available")) and int(children.get("matched_count", 0) or 0) > 0
+    node = _fmt_tok(summary.get("node_total_tokens"))
+    parent_t = summary.get("parent_total_tokens", 0)
+    child_t = summary.get("children_total_tokens", 0)
+    frac = summary.get("children_fraction")
+    frac_str = f" ({frac:.0%} of node)" if isinstance(frac, (int, float)) else ""
+    note = ""
+    if not (parent_ok and children_ok):
+        # Partial data (post-cleanup audit): node total covers only the side(s) below.
+        missing = "child subagent" if not children_ok else "parent"
+        note = f" (partial — {missing} transcript(s) unavailable)"
+    lines.append(f"- **node total**: {node} tokens{note}")
+    lines.append(
+        f"- parent orchestration: {_fmt_tok(parent_t) if parent_ok else 'unavailable'}"
+    )
+    lines.append(
+        f"- **child subagents**: "
+        f"{(_fmt_tok(child_t) + frac_str) if children_ok else 'unavailable'}"
+    )
+    if parent.get("found"):
+        lines.append(
+            f"  - parent peak context: {_fmt_tok(parent.get('peak_context_tokens'))} "
+            f"over {parent.get('assistant_turns', 'n/a')} turns"
+        )
+    unmatched = children.get("unmatched_arids") or []
+    if unmatched:
+        lines.append(
+            f"  - ⚠ {len(unmatched)} child arid(s) had no locatable transcript "
+            "(ephemeral/cleaned)"
+        )
+    lines.append("")
+    per_child = children.get("per_child") or {}
+    if per_child:
+        ranked = sorted(
+            per_child.items(),
+            key=lambda kv: int(kv[1].get("total_tokens", 0) or 0),
+            reverse=True,
+        )
+        lines.append("| child agent_run_id | total | turns | peak ctx |")
+        lines.append("|---|---|---|---|")
+        for arid, usage in ranked:
+            lines.append(
+                f"| `{arid}` | {_fmt_tok(usage.get('total_tokens'))} | "
+                f"{usage.get('assistant_turns', 'n/a')} | "
+                f"{_fmt_tok(usage.get('peak_context_tokens'))} |"
+            )
+        lines.append("")
+
+
 def _render_markdown(result: dict[str, Any]) -> str:
     lines: list[str] = []
     orch_id = result["orchestration_id"]
@@ -657,6 +879,8 @@ def _render_markdown(result: dict[str, Any]) -> str:
         for err in result.get("parse_errors", [])[:10]:
             lines.append(f"- `{err['path']}:{err['line_number']}` — {err['message']}")
         lines.append("")
+
+    _render_token_cost(result.get("token_cost_summary"), lines)
 
     ar = result["agent_run_summary"]
     lines.append("## agent_runs summary")

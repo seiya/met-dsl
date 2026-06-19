@@ -6,7 +6,9 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
+from tools import orchestration_diagnostics as diag
 from tools.audit_orchestration import (
     audit,
     collect_allow_auto_approve_stats,
@@ -14,6 +16,7 @@ from tools.audit_orchestration import (
     collect_policy_block_counts,
     collect_fail_closed_timeline,
     collect_agent_run_summary,
+    collect_token_cost_summary,
     detect_suspicious_benign_volume,
     split_substantive_and_benign,
     _render_markdown,
@@ -101,6 +104,240 @@ class SplitSubstantiveAndBenignTests(unittest.TestCase):
         self.assertEqual(
             result["benign_policy_block_counts"]["auto_read_expected_block"], 2
         )
+
+
+def _usage_rec(inp: int, out: int, cr: int, cc: int) -> dict:
+    return {
+        "type": "assistant",
+        "message": {
+            "role": "assistant",
+            "usage": {
+                "input_tokens": inp,
+                "output_tokens": out,
+                "cache_read_input_tokens": cr,
+                "cache_creation_input_tokens": cc,
+            },
+        },
+    }
+
+
+class TokenCostSummaryTests(unittest.TestCase):
+    """The parent-vs-children token breakdown — surfaces the child subagent cost
+    that agent_runs.jsonl and the host transcript otherwise hide."""
+
+    def _setup(self, tmp: str) -> tuple[Path, str]:
+        repo = Path(tmp) / "repo"
+        orch_id = "orch_tokens"
+        root = repo / "workspace" / "orchestrations" / orch_id
+        root.mkdir(parents=True)
+        parent_arid = "0e750000-0000-4000-8000-000000000000"
+        child_a = "aaaa1111-1111-4111-8111-111111111111"
+        child_b = "bbbb2222-2222-4222-8222-222222222222"
+        host_session = "hostsess"
+        (root / "orchestration_meta.json").write_text(
+            json.dumps(
+                {
+                    "orchestration_id": orch_id,
+                    "host_session_id": host_session,
+                    "orchestration_agent_run_id": parent_arid,
+                }
+            ),
+            encoding="utf-8",
+        )
+        _write_jsonl(
+            root / "agent_runs.jsonl",
+            [
+                {"agent_run_id": parent_arid, "agent_role": "orchestration", "status": "pass"},
+                {"agent_run_id": child_a, "agent_role": "substep", "status": "pass"},
+                {"agent_run_id": child_b, "agent_role": "substep", "status": "pass"},
+            ],
+        )
+        home = Path(tmp) / "home"
+        slug = str(repo.resolve()).replace("/", "-")
+        projects = home / ".claude" / "projects" / slug
+        subagents = projects / host_session / "subagents"
+        subagents.mkdir(parents=True, exist_ok=True)
+        # Parent host transcript: 1 turn.
+        (projects / f"{host_session}.jsonl").write_text(
+            json.dumps(_usage_rec(100, 50, 2000, 0)) + "\n", encoding="utf-8"
+        )
+
+        def _child(fname: str, arid: str, rec: dict) -> None:
+            head = json.dumps(
+                {
+                    "type": "user",
+                    "message": {
+                        "role": "user",
+                        "content": (
+                            f"capabilities/{arid}.json output_manifests/{arid}.json "
+                            f"parent_agent_run_id {parent_arid}"
+                        ),
+                    },
+                }
+            )
+            (subagents / fname).write_text(head + "\n" + json.dumps(rec) + "\n", encoding="utf-8")
+
+        _child("agent-a.jsonl", child_a, _usage_rec(10, 10, 1000, 0))
+        _child("agent-b.jsonl", child_b, _usage_rec(5, 5, 500, 0))
+        return repo, orch_id
+
+    def test_collect_token_cost_summary_attributes_parent_and_children(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, orch_id = self._setup(tmp)
+            home = Path(tmp) / "home"
+            with mock.patch.object(diag.Path, "home", return_value=home):
+                result = audit(repo, orch_id)
+            tcs = result["token_cost_summary"]
+            self.assertTrue(tcs["available"])
+            self.assertEqual(tcs["parent_total_tokens"], 100 + 50 + 2000)
+            self.assertEqual(tcs["children_total_tokens"], 1020 + 510)
+            self.assertEqual(tcs["node_total_tokens"], 2150 + 1530)
+            # Parent arid is excluded from the child set (not an unlocatable child).
+            self.assertEqual(tcs["children"]["unmatched_arids"], [])
+            self.assertEqual(tcs["children"]["matched_count"], 2)
+            md = _render_markdown(result)
+            self.assertIn("Token cost breakdown", md)
+            self.assertIn("child subagents", md)
+
+    def test_available_and_renders_when_only_parent_locatable(self) -> None:
+        # Post-cleanup audit: parent session survives, child transcripts are gone.
+        # The surviving parent total must still be reported, not discarded.
+        from tools.audit_orchestration import collect_token_cost_summary, _render_token_cost
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            repo.mkdir()
+            home = Path(tmp) / "home"
+            slug = str(repo.resolve()).replace("/", "-")
+            base = home / ".claude" / "projects" / slug
+            base.mkdir(parents=True, exist_ok=True)
+            parent_arid = "88c4f71a-efb3-4c89-a706-9d41969cc12e"
+            marker = f"workspace/tmp/{parent_arid}"
+            (base / "orig.jsonl").write_text(
+                "\n".join(
+                    [
+                        json.dumps({"type": "user", "message": {"role": "user", "content": f"Start the workflow {marker}"}}),
+                        json.dumps(_usage_rec(100, 50, 2000, 0)),
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            meta = {"orchestration_agent_run_id": parent_arid, "host_session_id": "orig"}
+            # No child agent_runs (only the parent): child attribution is
+            # unavailable, but the parent total must still be reported.
+            runs = [{"agent_run_id": parent_arid, "agent_role": "orchestration", "status": "pass"}]
+            with mock.patch.object(diag.Path, "home", return_value=home):
+                tcs = collect_token_cost_summary(repo, meta, runs)
+            self.assertEqual(tcs["children"]["matched_count"], 0)  # no children measured
+            self.assertTrue(tcs["available"])  # parent rescues availability
+            self.assertEqual(tcs["parent_total_tokens"], 2150)
+            self.assertEqual(tcs["children_total_tokens"], 0)
+            lines: list[str] = []
+            _render_token_cost(tcs, lines)
+            joined = "\n".join(lines)
+            self.assertIn("2,150", joined)
+            self.assertIn("partial", joined)
+            self.assertIn("child subagents**: unavailable", joined)
+
+    def test_prefers_persisted_usage_over_missing_transcript(self) -> None:
+        # finalize_child persists each child's usage into agent_runs.jsonl; a later
+        # audit must use it even when the ephemeral transcript is gone.
+        from tools.audit_orchestration import collect_token_cost_summary
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            repo.mkdir()
+            home = Path(tmp) / "home"
+            slug = str(repo.resolve()).replace("/", "-")
+            (home / ".claude" / "projects" / slug).mkdir(parents=True)  # dir exists, no transcripts
+            child = "aaaa1111-1111-4111-8111-111111111111"
+            runs = [
+                {
+                    "agent_run_id": child,
+                    "agent_role": "substep",
+                    "status": "pass",
+                    "usage": {
+                        "input_tokens": 10, "output_tokens": 10,
+                        "cache_read_input_tokens": 1000, "cache_creation_input_tokens": 0,
+                        "total_tokens": 1020, "assistant_turns": 5, "peak_context_tokens": 1010,
+                    },
+                }
+            ]
+            with mock.patch.object(diag.Path, "home", return_value=home):
+                tcs = collect_token_cost_summary(repo, {}, runs)
+            self.assertEqual(tcs["children_total_tokens"], 1020)
+            self.assertEqual(tcs["children"]["per_child"][child]["source"], "agent_runs.jsonl")
+            # The {"status":"unavailable"} marker must NOT count as usage.
+            runs2 = [{"agent_run_id": child, "agent_role": "substep", "status": "pass",
+                      "usage": {"status": "unavailable", "reason": "x"}}]
+            with mock.patch.object(diag.Path, "home", return_value=home):
+                tcs2 = collect_token_cost_summary(repo, {}, runs2)
+            self.assertEqual(tcs2["children"]["matched_count"], 0)
+
+    def test_unavailable_when_nothing_matched(self) -> None:
+        # ~/.claude dir present but holds no transcripts for this orchestration, and
+        # no persisted usage / parent: report unavailable, not a 0-token breakdown.
+        from tools.audit_orchestration import collect_token_cost_summary, _render_token_cost
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            repo.mkdir()
+            home = Path(tmp) / "home"
+            slug = str(repo.resolve()).replace("/", "-")
+            (home / ".claude" / "projects" / slug).mkdir(parents=True)
+            runs = [{"agent_run_id": "bbbb2222-2222-4222-8222-222222222222", "agent_role": "substep", "status": "pass"}]
+            with mock.patch.object(diag.Path, "home", return_value=home):
+                tcs = collect_token_cost_summary(repo, {}, runs)
+            self.assertFalse(tcs["available"])
+            lines: list[str] = []
+            _render_token_cost(tcs, lines)
+            self.assertIn("unavailable", "\n".join(lines))
+            self.assertNotIn("0 tokens", "\n".join(lines))
+
+    def test_render_partial_when_only_children_locatable(self) -> None:
+        # Children present, parent session not locatable (no orchestration_agent_run_id
+        # / host_session in meta): the child total must still render, with the parent
+        # side marked unavailable and the node total flagged partial.
+        from tools.audit_orchestration import collect_token_cost_summary, _render_token_cost
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            repo.mkdir()
+            home = Path(tmp) / "home"
+            slug = str(repo.resolve()).replace("/", "-")
+            subagents = home / ".claude" / "projects" / slug / "hostsess" / "subagents"
+            subagents.mkdir(parents=True, exist_ok=True)
+            child = "aaaa1111-1111-4111-8111-111111111111"
+            head = json.dumps(
+                {"type": "user", "message": {"role": "user", "content": f"capabilities/{child}.json"}}
+            )
+            (subagents / "agent-a.jsonl").write_text(
+                head + "\n" + json.dumps(_usage_rec(10, 10, 1000, 0)) + "\n", encoding="utf-8"
+            )
+            meta: dict = {}  # no parent identity → parent unavailable
+            runs = [{"agent_run_id": child, "agent_role": "substep", "status": "pass"}]
+            with mock.patch.object(diag.Path, "home", return_value=home):
+                tcs = collect_token_cost_summary(repo, meta, runs)
+            self.assertTrue(tcs["available"])
+            self.assertFalse(tcs["parent"].get("found"))
+            self.assertEqual(tcs["children_total_tokens"], 1020)
+            lines: list[str] = []
+            _render_token_cost(tcs, lines)
+            joined = "\n".join(lines)
+            self.assertIn("parent orchestration: unavailable", joined)
+            self.assertIn("partial — parent transcript(s) unavailable", joined)
+            self.assertIn("1,020", joined)
+
+    def test_render_handles_unavailable(self) -> None:
+        summary = {"available": False, "reason": "claude projects dir missing"}
+        from tools.audit_orchestration import _render_token_cost
+
+        lines: list[str] = []
+        _render_token_cost(summary, lines)
+        joined = "\n".join(lines)
+        self.assertIn("unavailable", joined)
+        self.assertIn("claude projects dir missing", joined)
 
 
 class DetectSuspiciousBenignVolumeTests(unittest.TestCase):
