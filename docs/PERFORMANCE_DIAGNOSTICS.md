@@ -45,5 +45,22 @@
 - A `perf.json` with `parallelism` missing is treated as invalid input and made unjudgeable (error).
 - `perf.json` must be a single UTF-8 `JSON object` restorable by a standard parser.
 - Numeric tokens follow `RFC 8259`, and `.123` and `-.123` with a missing leading zero are forbidden.
-- A `toolchain.language=fortran` `runner` must not directly embed the `F0.d` format into a `JSON` numeric token.
+- A `toolchain.language=fortran` `runner` must not directly embed the `F0` / `F0.d` format into a `JSON` numeric token.
 - A `toolchain.language=fortran` `runner`, when outputting a logical value to `JSON`, must not directly embed the `T`/`F` token that the `L`-family edit descriptor (`L1` etc.) generates into a `JSON` boolean token. A `JSON` boolean allows only the literals `true` / `false`, so branch on the logical value and write the string.
+- **Enforcement is descriptor-syntactic, not output-based.** The `post_generate` static analysis (`validate_pipeline_semantics --stage post_generate`) flags the mere *presence* of an `F0` / `F0.d` numeric descriptor (and the `L`-family logical descriptor) in any runner `JSON` write format spec. It never inspects the runtime output, so a manual leading-zero fixup (e.g. computing the value, then string-patching a missing `0`) does **not** satisfy the gate — the forbidden descriptor must not appear in the format spec at all.
+- **Canonical safe idiom (`fortran`):** emit reals with an explicit scientific descriptor such as `ES24.16E3` (always emits a leading digit; width 24 = sign + `d.dddddddddddddddd` + `E±ddd`, so it never overflows to `****` even for negatives — `ES23.16E3` is one column too narrow and prints `***` for a negative value), then `trim(adjustl(...))`; or, when the magnitude range is known small, a bounded explicit-width `Fw.d` (e.g. `F20.6`, never `F0`/`F0.d`) with `trim(adjustl(...))`. Emit integers with `I0`. Emit booleans by branching on the logical and writing the literal `true` / `false`. Example:
+
+  ```fortran
+  function jnum(x) result(s)
+    real(8), intent(in) :: x
+    character(len=32) :: s
+    write(s, '(ES24.16E3)') x      ! leading digit guaranteed; width fits a sign; never F0/F0.d
+    s = adjustl(s)                 ! trim(adjustl(s)) at the JSON write site
+  end function jnum
+
+  function jbool(b) result(s)
+    logical, intent(in) :: b
+    character(len=5) :: s
+    s = merge('true ', 'false', b) ! literal true/false; never an L descriptor
+  end function jbool
+  ```

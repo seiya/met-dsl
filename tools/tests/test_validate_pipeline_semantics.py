@@ -2165,7 +2165,7 @@ end program shallow_water2d_runner
 
             violations = validate(repo_root=repo_root, workspace_root="workspace")
             self.assertTrue(
-                any("Fortran F0 formatting" in v for v in violations)
+                any("Fortran F0/F0.d descriptor" in v for v in violations)
             )
 
     def test_detects_unsafe_fortran_l1_boolean_serialization(self) -> None:
@@ -2254,7 +2254,7 @@ end program shallow_water2d_runner
                 msg=f"expected L-descriptor violation (keyword fmt=), got: {violations}",
             )
             self.assertTrue(
-                any("Fortran F0 formatting" in v for v in violations),
+                any("Fortran F0/F0.d descriptor" in v for v in violations),
                 msg=f"expected F0 violation (keyword fmt=/unit=), got: {violations}",
             )
 
@@ -2294,7 +2294,7 @@ end program shallow_water2d_runner
 
             violations = validate(repo_root=repo_root, workspace_root="workspace")
             self.assertTrue(
-                any("Fortran F0 formatting" in v for v in violations),
+                any("Fortran F0/F0.d descriptor" in v for v in violations),
                 msg=f"expected F0 violation after 1P scale factor, got: {violations}",
             )
 
@@ -2381,7 +2381,7 @@ end program shallow_water2d_runner
             violations = validate(repo_root=repo_root, workspace_root="workspace")
             self.assertFalse(
                 any(
-                    "Fortran L edit descriptor" in v or "Fortran F0 formatting" in v
+                    "Fortran L edit descriptor" in v or "Fortran F0/F0.d descriptor" in v
                     for v in violations
                 ),
                 msg=f"read-input L descriptor must not be flagged, got: {violations}",
@@ -2508,7 +2508,7 @@ end program shallow_water2d_runner
             violations = validate(repo_root=repo_root, workspace_root="workspace")
             self.assertFalse(
                 any(
-                    "Fortran L edit descriptor" in v or "Fortran F0 formatting" in v
+                    "Fortran L edit descriptor" in v or "Fortran F0/F0.d descriptor" in v
                     for v in violations
                 ),
                 msg=f"embedded format text must not be flagged, got: {violations}",
@@ -2598,7 +2598,7 @@ end program shallow_water2d_runner
             violations = validate(repo_root=repo_root, workspace_root="workspace")
             self.assertFalse(
                 any(
-                    "Fortran L edit descriptor" in v or "Fortran F0 formatting" in v
+                    "Fortran L edit descriptor" in v or "Fortran F0/F0.d descriptor" in v
                     for v in violations
                 ),
                 msg=f"read-side format must not reach the write, got: {violations}",
@@ -2739,7 +2739,7 @@ end program shallow_water2d_runner
             violations = validate(repo_root=repo_root, workspace_root="workspace")
             self.assertFalse(
                 any(
-                    "Fortran L edit descriptor" in v or "Fortran F0 formatting" in v
+                    "Fortran L edit descriptor" in v or "Fortran F0/F0.d descriptor" in v
                     for v in violations
                 ),
                 msg=f"per-scope label must not cross units, got: {violations}",
@@ -2911,7 +2911,7 @@ end program shallow_water2d_runner
 
             violations = validate(repo_root=repo_root, workspace_root="workspace")
             self.assertTrue(
-                any("Fortran F0 formatting" in v for v in violations),
+                any("Fortran F0/F0.d descriptor" in v for v in violations),
                 msg=f"concatenated inline format must be scanned, got: {violations}",
             )
 
@@ -2954,7 +2954,7 @@ end program shallow_water2d_runner
             violations = validate(repo_root=repo_root, workspace_root="workspace")
             self.assertFalse(
                 any(
-                    "Fortran L edit descriptor" in v or "Fortran F0 formatting" in v
+                    "Fortran L edit descriptor" in v or "Fortran F0/F0.d descriptor" in v
                     for v in violations
                 ),
                 msg=f"later same-line assignment must not reach the write, got: {violations}",
@@ -3043,7 +3043,7 @@ end program shallow_water2d_runner
             violations = validate(repo_root=repo_root, workspace_root="workspace")
             self.assertFalse(
                 any(
-                    "Fortran L edit descriptor" in v or "Fortran F0 formatting" in v
+                    "Fortran L edit descriptor" in v or "Fortran F0/F0.d descriptor" in v
                     for v in violations
                 ),
                 msg=f"stdout debug write must not be flagged, got: {violations}",
@@ -3126,7 +3126,7 @@ end program shallow_water2d_runner
 
             violations = validate(repo_root=repo_root, workspace_root="workspace")
             self.assertTrue(
-                any("Fortran F0 formatting" in v for v in violations),
+                any("Fortran F0/F0.d descriptor" in v for v in violations),
                 msg=f"blank-separated F0 descriptor must be scanned, got: {violations}",
             )
 

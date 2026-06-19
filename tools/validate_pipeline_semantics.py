@@ -1688,8 +1688,9 @@ def _scan_runner_format_text(
         )
     if _RUNNER_FORMAT_F0_DESC.search(descriptor_stream):
         violations.append(
-            f"{runner_file}:{lineno}: runner write uses Fortran F0 formatting; "
-            f"JSON numeric serialization must be leading-zero safe"
+            f"{runner_file}:{lineno}: runner write uses Fortran F0/F0.d descriptor in a "
+            f"JSON numeric write; forbidden regardless of runtime fixup — use ES/EN "
+            f"(e.g. ES24.16E3) or an explicit-width Fw.d with trim(adjustl()) instead"
         )
 
 
