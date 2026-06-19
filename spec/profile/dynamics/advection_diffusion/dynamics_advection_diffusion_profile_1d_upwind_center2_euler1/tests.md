@@ -15,10 +15,10 @@ This suite verifies the default-profile selection rule and the compatibility gua
 ## 2. Input-defaulting rules
 - The normal case takes `problem.family=advection_diffusion`, `dimension=1d`, `boundary=periodic` as input.
 - The normal-case `component` versions use the following.
-  - `dynamics_advection_diffusion_flux_1d_upwind_center2@0.1.0`
+  - `dynamics_advdiff_flux_1d_upwind_center2@0.1.0`
   - `dynamics_advection_diffusion_boundary_1d_periodic_copy@0.1.0`
   - `dynamics_advection_diffusion_time_update_1d_euler1@0.1.0`
-- The abnormal case uses `dynamics_advection_diffusion_flux_1d_upwind_center2@1.0.0` as an out-of-compatibility-range version.
+- The abnormal case uses `dynamics_advdiff_flux_1d_upwind_center2@1.0.0` as an out-of-compatibility-range version.
 
 ## 3. Execution-control rules
 This suite targets only the judgment of the `profile`-selection logic. The execution control of the time integration is `N/A`. The non-application basis is "because this suite verifies only profile resolution".

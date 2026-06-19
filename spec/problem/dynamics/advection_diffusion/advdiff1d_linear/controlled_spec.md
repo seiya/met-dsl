@@ -26,7 +26,7 @@ The boundary condition is fixed to periodic boundary. The default input used for
 
 ## 4. Dependent `component` and adopted `profile`
 This `problem spec` references the following `component`.
-- `dynamics_advection_diffusion_flux_1d_upwind_center2`
+- `dynamics_advdiff_flux_1d_upwind_center2`
 - `dynamics_advection_diffusion_boundary_1d_periodic_copy`
 - `dynamics_advection_diffusion_time_update_1d_euler1`
 
@@ -35,7 +35,7 @@ The adopted `profile` is `dynamics_advection_diffusion_profile_1d_upwind_center2
 ## 5. Integration algorithm
 The update step is fixed to the following order.
 1. Update the ghost region with `dynamics_advection_diffusion_boundary_1d_periodic_copy__apply`.
-2. Compute the advection/diffusion flux with `dynamics_advection_diffusion_flux_1d_upwind_center2__compute_flux`.
+2. Compute the advection/diffusion flux with `dynamics_advdiff_flux_1d_upwind_center2__compute_flux`.
 3. Execute the forward Euler update with `dynamics_advection_diffusion_time_update_1d_euler1__advance`.
 
 The stability index is defined as

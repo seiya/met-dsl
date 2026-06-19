@@ -24,14 +24,14 @@ specs:
     official_releases: []
 
   - spec_kind: component
-    spec_id: dynamics_advection_diffusion_flux_1d_upwind_center2
+    spec_id: dynamics_advdiff_flux_1d_upwind_center2
     spec_version: 0.1.0
     status: controlled_draft
     domain: dynamics
     family: advection_diffusion
-    controlled_spec_path: spec/component/dynamics/advection_diffusion/dynamics_advection_diffusion_flux_1d_upwind_center2/controlled_spec.md
-    tests_path: spec/component/dynamics/advection_diffusion/dynamics_advection_diffusion_flux_1d_upwind_center2/tests.md
-    deps_path: spec/component/dynamics/advection_diffusion/dynamics_advection_diffusion_flux_1d_upwind_center2/deps.yaml
+    controlled_spec_path: spec/component/dynamics/advection_diffusion/dynamics_advdiff_flux_1d_upwind_center2/controlled_spec.md
+    tests_path: spec/component/dynamics/advection_diffusion/dynamics_advdiff_flux_1d_upwind_center2/tests.md
+    deps_path: spec/component/dynamics/advection_diffusion/dynamics_advdiff_flux_1d_upwind_center2/deps.yaml
     official_releases: []
 
   - spec_kind: component
