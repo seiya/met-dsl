@@ -71,6 +71,8 @@ from tools.orchestration_runtime import (
     repair_step_result_executor,
     repair_all_step_result_executors,
     reserve_phase_root,
+    _evaluate_reply_budget,
+    REPLY_BUDGET_CHARS,
     render_launch_prompt_text,
     run_gate,
     update_checkpoint,
@@ -1407,7 +1409,7 @@ shell_tool                       stable             true
         )
         self.assertIn("You are a step agent.", prompt)
         self.assertIn("Required requirements:", prompt)
-        self.assertIn("The completion reply must include, as `launch_reply`", prompt)
+        self.assertIn("Keep your final message (the `launch_reply`) **terse and bounded**", prompt)
         self.assertIn("guarded-apply-patch", prompt)
 
     def test_record_agent_run_auto_populates_parent_and_model_from_launch_request(self) -> None:
@@ -17058,6 +17060,149 @@ class RecordTimeoutTests(unittest.TestCase):
             child_run_id=arid,
         )
 
+    def test_finalize_child_runs_full_sequence_in_one_call(self) -> None:
+        from tools.orchestration_runtime import finalize_child, _parent_return_token_path
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            arid = self._setup_substep_launch(repo_root)
+            token = _parent_return_token_path(
+                repo_root, "orch_to_001", arid
+            ).read_text(encoding="utf-8").strip()
+            reply = (
+                "status: fail\noutput_refs:\n- (none)\n"
+                "rationale: generate fail-stopped (test fixture)"
+            )
+            result = finalize_child(
+                repo_root=repo_root,
+                orchestration_id="orch_to_001",
+                agent_run_id=arid,
+                return_token=token,
+                reply_text=reply,
+                agent_run_payload={
+                    "agent_run_id": arid,
+                    "agent_role": "substep",
+                    "agent_backend": "claude",
+                    "status": "fail",
+                    "agent_session_id": arid,
+                    "context_id": "ctx_finalize_001",
+                    "context_isolated": True,
+                    "node_key": "problem/shallow_water2d@0.3.0",
+                    "started_at": "2026-05-09T08:00:00Z",
+                    "finished_at": "2026-05-09T08:05:00Z",
+                    "result_summary": "generate fail-stopped (test fixture)",
+                },
+            )
+            self.assertEqual(result["status"], "fail")
+            self.assertEqual(result["deactivated_child_run_id"], arid)
+            self.assertNotIn("reply_over_budget", result)  # short reply is under budget
+            # record-agent-run ran: terminal entry present.
+            runs_path = repo_root / "workspace/orchestrations/orch_to_001/agent_runs.jsonl"
+            entries = [json.loads(l) for l in runs_path.read_text().splitlines() if l.strip()]
+            self.assertTrue(
+                any(e.get("agent_run_id") == arid and e.get("status") == "fail" for e in entries)
+            )
+            # record-reply ran: reply.txt holds the verbatim reply.
+            reply_path = (
+                repo_root / "workspace/orchestrations/orch_to_001/launches" / f"{arid}.reply.txt"
+            )
+            self.assertEqual(reply_path.read_text(encoding="utf-8").rstrip("\n"), reply)
+            # deactivate-child ran: the parent_return_token sidecar is consumed.
+            self.assertFalse(
+                _parent_return_token_path(repo_root, "orch_to_001", arid).exists()
+            )
+
+    def test_finalize_child_rejects_agent_run_id_mismatch(self) -> None:
+        from tools.orchestration_runtime import finalize_child
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(ValueError):
+                finalize_child(
+                    repo_root=Path(tmp),
+                    orchestration_id="o1",
+                    agent_run_id="a",
+                    return_token="t",
+                    reply_text="status: pass",
+                    agent_run_payload={"agent_run_id": "DIFFERENT"},
+                )
+
+    def test_finalize_child_hard_budget_fails_before_consuming_state(self) -> None:
+        from tools.orchestration_runtime import (
+            finalize_child, _parent_return_token_path, REPLY_BUDGET_CHARS,
+        )
+        from unittest.mock import patch as _patch
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            arid = self._setup_substep_launch(repo_root)
+            token = _parent_return_token_path(
+                repo_root, "orch_to_001", arid
+            ).read_text(encoding="utf-8").strip()
+            with _patch.dict(os.environ, {"METDSL_ENFORCE_REPLY_BUDGET": "1"}):
+                with self.assertRaises(ValueError):
+                    finalize_child(
+                        repo_root=repo_root,
+                        orchestration_id="orch_to_001",
+                        agent_run_id=arid,
+                        return_token=token,
+                        reply_text="x" * (REPLY_BUDGET_CHARS + 10),
+                        agent_run_payload={
+                            "agent_run_id": arid, "agent_role": "substep",
+                            "agent_backend": "claude", "status": "fail",
+                            "agent_session_id": arid, "context_id": "ctx_finalize_hard",
+                            "context_isolated": True,
+                            "node_key": "problem/shallow_water2d@0.3.0",
+                            "started_at": "2026-05-09T08:00:00Z",
+                            "finished_at": "2026-05-09T08:05:00Z",
+                            "result_summary": "x",
+                        },
+                    )
+            # State must NOT be consumed: the parent_return_token sidecar still exists,
+            # and no terminal agent_runs.jsonl entry was written for the run.
+            self.assertTrue(_parent_return_token_path(repo_root, "orch_to_001", arid).exists())
+            runs_path = repo_root / "workspace/orchestrations/orch_to_001/agent_runs.jsonl"
+            entries = [json.loads(l) for l in runs_path.read_text().splitlines() if l.strip()]
+            self.assertFalse(
+                any(e.get("agent_run_id") == arid and e.get("status") == "fail" for e in entries)
+            )
+            # The hard reject is still audited to the workflow hook log.
+            hook_log = repo_root / "workspace/orchestrations/orch_to_001/hooks/workflow_hooks.jsonl"
+            self.assertTrue(
+                hook_log.exists() and "reply_over_budget" in hook_log.read_text(encoding="utf-8")
+            )
+
+    def test_finalize_child_hard_budget_counts_persisted_trailing_newline(self) -> None:
+        # Exact-boundary reply (== budget, no trailing newline): record_reply_text's
+        # appended newline pushes the persisted size to budget+1, so the precheck must
+        # reject it BEFORE consuming state (it counts the persisted form, not the raw arg).
+        from tools.orchestration_runtime import (
+            finalize_child, _parent_return_token_path, REPLY_BUDGET_CHARS,
+        )
+        from unittest.mock import patch as _patch
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            arid = self._setup_substep_launch(repo_root)
+            token = _parent_return_token_path(
+                repo_root, "orch_to_001", arid
+            ).read_text(encoding="utf-8").strip()
+            with _patch.dict(os.environ, {"METDSL_ENFORCE_REPLY_BUDGET": "1"}):
+                with self.assertRaises(ValueError):
+                    finalize_child(
+                        repo_root=repo_root,
+                        orchestration_id="orch_to_001",
+                        agent_run_id=arid,
+                        return_token=token,
+                        reply_text="z" * REPLY_BUDGET_CHARS,  # exactly the budget, no newline
+                        agent_run_payload={
+                            "agent_run_id": arid, "agent_role": "substep",
+                            "agent_backend": "claude", "status": "fail",
+                            "agent_session_id": arid, "context_id": "ctx_finalize_boundary",
+                            "context_isolated": True,
+                            "node_key": "problem/shallow_water2d@0.3.0",
+                            "started_at": "2026-05-09T08:00:00Z",
+                            "finished_at": "2026-05-09T08:05:00Z",
+                            "result_summary": "z",
+                        },
+                    )
+            self.assertTrue(_parent_return_token_path(repo_root, "orch_to_001", arid).exists())
+
     def test_record_timeout_appends_terminal_entry_and_cleans_tmp(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
@@ -24721,6 +24866,71 @@ class RepairStepResultExecutorTests(unittest.TestCase):
                 repair_step_result_executor(
                     repo_root, self.ORCH, node_key=self.NODE_KEY, step="compile"
                 )
+
+
+class StartupDocSizeTests(unittest.TestCase):
+    """Regression guard: the docs the orchestration loads at startup are resident every
+    turn (cache_read scales with context × turns), so cap their size to catch re-bloat.
+    Ceilings sit just above the current sizes — a deeper safe trim (de-duplicating the
+    Requirements / Operations-Rules / Decision-Criteria overlap against docs/ORCHESTRATION.md
+    without losing any normative criterion) is staged follow-up work; lowering these ceilings
+    is its deliverable, and raising them needs an explicit justification here."""
+
+    REPO_ROOT = Path(__file__).resolve().parents[2]
+
+    def test_skill_md_within_budget(self) -> None:
+        size = (self.REPO_ROOT / "skills/workflow-orchestration/SKILL.md").stat().st_size
+        self.assertLessEqual(size, 44500, f"SKILL.md grew to {size} bytes; trim or justify the ceiling")
+
+    def test_startup_contract_within_budget(self) -> None:
+        size = (self.REPO_ROOT / "skills/workflow-orchestration/references/startup_contract.md").stat().st_size
+        self.assertLessEqual(size, 33000, f"startup_contract.md grew to {size} bytes; trim or justify the ceiling")
+
+
+class ReplyBudgetTests(unittest.TestCase):
+    """record_agent_run's child-reply budget guard (_evaluate_reply_budget)."""
+
+    def _write_reply(self, tmp: str, text: str) -> tuple[Path, str]:
+        repo_root = Path(tmp)
+        ref = "workspace/orchestrations/o1/launches/a.reply.txt"
+        p = repo_root / ref
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(text, encoding="utf-8")
+        return repo_root, ref
+
+    def test_under_budget_is_silent(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root, ref = self._write_reply(tmp, "status: pass\noutput_refs:\n- x")
+            self.assertIsNone(
+                _evaluate_reply_budget(repo_root, "o1", agent_run_id="a", reply_ref=ref)
+            )
+
+    def test_over_budget_soft_returns_info_and_audits(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root, ref = self._write_reply(tmp, "x" * (REPLY_BUDGET_CHARS + 25))
+            info = _evaluate_reply_budget(repo_root, "o1", agent_run_id="a", reply_ref=ref)
+            self.assertEqual(info, {"chars": REPLY_BUDGET_CHARS + 25, "budget": REPLY_BUDGET_CHARS})
+            # An audit entry is appended to the workflow hook log.
+            hook_log = repo_root / "workspace/orchestrations/o1/hooks/workflow_hooks.jsonl"
+            self.assertTrue(
+                hook_log.exists() and "reply_over_budget" in hook_log.read_text(encoding="utf-8")
+            )
+
+    def test_over_budget_hard_raises_under_env(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root, ref = self._write_reply(tmp, "y" * (REPLY_BUDGET_CHARS + 1))
+            with patch.dict(os.environ, {"METDSL_ENFORCE_REPLY_BUDGET": "1"}):
+                with self.assertRaises(ValueError):
+                    _evaluate_reply_budget(repo_root, "o1", agent_run_id="a", reply_ref=ref)
+
+    def test_missing_reply_file_is_under_budget(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertIsNone(
+                _evaluate_reply_budget(
+                    Path(tmp), "o1", agent_run_id="a",
+                    reply_ref="workspace/orchestrations/o1/launches/missing.reply.txt",
+                )
+            )
 
 
 if __name__ == "__main__":

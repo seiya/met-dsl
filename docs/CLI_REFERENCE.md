@@ -2,7 +2,7 @@
 
 ## Position of this document
 
-The **canonical CLI reference for the frequent subcommands (Tier-A)** of `tools/orchestration_runtime.py`. It covers those whose payload schema is complex, that have per-phase required-argument switching, and that cannot be determined from the `--help` output alone: `record-launch` / `record-agent-run` / `record-child-return` / `deactivate-child` / `record-reply` / `set-status` / `write-step-result` / `workflow-launch-check` / `reserve-phase-root` / `mark-dependency-readiness` / `guarded-apply-patch` / `run-gate` (12 total).
+The **canonical CLI reference for the frequent subcommands (Tier-A)** of `tools/orchestration_runtime.py`. It covers those whose payload schema is complex, that have per-phase required-argument switching, and that cannot be determined from the `--help` output alone: `record-launch` / `record-agent-run` / `finalize-child` / `record-child-return` / `deactivate-child` / `record-reply` / `set-status` / `write-step-result` / `workflow-launch-check` / `reserve-phase-root` / `mark-dependency-readiness` / `guarded-apply-patch` / `run-gate` (13 total).
 
 For the rare subcommands (Tier-B: `init` / `preflight` / `preflight-status` / `record-timeout` / `read-checkpoint` / `verify-checkpoint-integrity` / `check-step-completed` / `orchestration-read` / `repair-agent-runs`), only an overview is in [docs/CLI_REFERENCE_RARE.md](CLI_REFERENCE_RARE.md), and the canonical source for details is `python3 tools/orchestration_runtime.py <sub> --help`.
 
@@ -25,7 +25,7 @@ Related canonical sources:
 - The form of `ir_id` / `pipeline_id` is `<slug>_<YYYYMMDD>_<seq3>` (slug being hyphen-separated lowercase alphanumeric). E.g. `flux-rsn-p0_20260425_001`. An underscore in the slug is invalid.
 - ISO 8601 timestamps are canonically UTC (`Z` suffix).
 - For JSON arguments (`--*-json`), be careful with shell quoting. For a complex payload, use a file specification like `--patch-file`.
-- **Terse stdout by default.** The high-frequency bookkeeping subcommands (`record-launch` / `record-agent-run` / `record-child-return` / `deactivate-child` / `record-reply` / `write-step-result` / `run-gate`) print **only the result fields the orchestration agent consumes downstream** to stdout, not the full payload. This keeps the orchestration's resident context small (its cache-read cost scales with context size × turn count). The full payload is always persisted to the canonical artifact files regardless (`launches/<arid>.*`, `agent_runs.jsonl`, `steps/.../step_result.json`, `gates/<arid>/<gate>.json`, etc.); pass `--verbose` to also emit the full JSON to stdout for debugging/audit. Soft-failure signals (`violations` / `error[s]` / `warning[s]`) are retained in terse output when present, and hard failures still exit non-zero via stderr.
+- **Terse stdout by default.** The high-frequency bookkeeping subcommands (`record-launch` / `record-agent-run` / `finalize-child` / `record-child-return` / `deactivate-child` / `record-reply` / `write-step-result` / `run-gate`) print **only the result fields the orchestration agent consumes downstream** to stdout, not the full payload. This keeps the orchestration's resident context small (its cache-read cost scales with context size × turn count). The full payload is always persisted to the canonical artifact files regardless (`launches/<arid>.*`, `agent_runs.jsonl`, `steps/.../step_result.json`, `gates/<arid>/<gate>.json`, etc.); pass `--verbose` to also emit the full JSON to stdout for debugging/audit. Soft-failure signals (`violations` / `error[s]` / `warning[s]`) are retained in terse output when present, and hard failures still exit non-zero via stderr.
   - `record-launch` terse fields: `capability_token`, `capability_ref`, `read_access_manifest_ref`, `allowed_output_manifest_ref`, `sandbox_profile_ref`, `launch_prompt_ref`, and **`launch_prompt_text`** (the exact rendered prompt the orchestration passes verbatim to the Agent tool — it cannot read the template or the written prompt file). The remaining `launch_*_ref` / `child_launch_*_ref` paths are deterministic from `<orchestration_id>`+`<arid>` and are dropped from terse stdout.
   - `run-gate` terse keeps `result` (the `orchestration_read` content — child agents' only allowed path for those reads) in addition to `violations` / `gate_result_ref`.
 
@@ -33,11 +33,12 @@ Related canonical sources:
 
 ## Tier-A frequent subcommand list
 
-The 12 subcommands whose details are covered in this file.
+The 13 subcommands whose details are covered in this file.
 
 | subcommand | purpose | section |
 |---|---|---|
 | `record-launch` | child-agent launch evidence + capability_token + manifest generation | [record-launch](#record-launch) |
+| `finalize-child` | one-call child finalization (record-child-return → deactivate-child → record-reply → record-agent-run) | [finalize-child](#finalize-child) |
 | `record-child-return` | Adv-20: record the Agent tool return ack | [record-child-return](#record-child-return) |
 | `deactivate-child` | release the active_children marker | [deactivate-child](#deactivate-child) |
 | `record-reply` | overwrite launches/<arid>.reply.txt with the Agent tool response | [record-reply](#record-reply) |
@@ -200,6 +201,25 @@ Append 1 line to `agent_runs.jsonl`. For a step/substep role, also save `agent.r
 - **Double registration of the same `agent_run_id` is not possible.** Re-invoking `record-agent-run` with the same `agent_run_id` as an existing row raises `ValueError: duplicate agent_run_id: <id>`. Because it is not idempotent, to retry, re-number a new `agent_run_id` with `python3 tools/new_agent_run_id.py` and redo the sequence from `record-launch`. For the detailed recovery procedure, [docs/RUNBOOK.md#duplicate-agent_run_id-recovery](RUNBOOK.md#duplicate-agent_run_id-recovery).
 - **The orchestration agent's own entry is appended once immediately after orchestration launch**. Append with `agent_role=orchestration`, `status=running`. The orchestration agent itself must not update this row with `record-agent-run` (a second `record-agent-run` is rejected with `duplicate agent_run_id`). Instead, at termination, [set-status](#set-status) rewrites this row in-place to a terminal status with runtime privilege and assigns `finished_at` (on resume, it conversely returns it to `running`). The orchestration's canonical terminal state continues to be expressed on the `orchestration_meta.json` side.
 - **runtime placeholder restoration**: before the terminal-check baseline diff, `record-agent-run` restores, as 0-byte, the runtime-owned placeholders of `created_file_pin_stubs` (e.g. `lineage.json`) that were collaterally deleted without going through a gate. This prevents a deleted runtime placeholder from being judged an `unauthorized_write` and the orchestration, with no means of restoration, falling into a permanent `fail_closed` deadlock (it also applies to `status=fail`/`blocked`/`timeout` to make it possible to record a failed run). For the canonical contract, refer to [docs/ORCHESTRATION.md](ORCHESTRATION.md).
+
+---
+
+## finalize-child
+
+**One-call child finalization.** Performs, in one process and in the mandated order, `record-child-return` → `deactivate-child` → `record-reply` → `record-agent-run`, reusing each function so every guard is preserved (Adv-30 return-token verification, the Adv-20 ack-file precondition for `deactivate-child`, the active_child ordering, and the child-reply budget guard). It collapses the 4 finalize Bash round-trips into one, which is the canonical finalize path for the Claude Code backend — fewer round-trips keep the orchestration transcript (and its per-turn cache-read cost) small. The 4 individual subcommands remain available for edge recovery.
+
+| arg | required | description |
+|---|---|---|
+| `--repo-root` | yes | |
+| `--orchestration-id` | yes | |
+| `--agent-run-id` | yes | the child agent's UUID; must equal `--agent-run-json`'s `agent_run_id` |
+| `--return-token` | yes | the Adv-30 parent-bound token from `launches/<arid>.parent_return_token` (same as `record-child-return`) |
+| `--reply-text` | one required | the child's verbatim final message (budget-checked; see below) |
+| `--reply-from-stdin` | one required | flag. read the reply from stdin (for a large reply) |
+| `--reply-excerpt` | optional | short audit metadata; defaults to the first non-empty line of the reply |
+| `--agent-run-json` | yes | the `record-agent-run` payload (same schema as [record-agent-run](#record-agent-run)) |
+
+> **Child-reply budget:** `record-agent-run` measures `launches/<arid>.reply.txt` against a ~2000-char budget. An over-budget reply adds a `reply_over_budget` field to the result (telemetry, kept through the terse projection) and is audited to `hooks/workflow_hooks.jsonl`. With `METDSL_ENFORCE_REPLY_BUDGET=1` it instead fails the call, so the child must be re-launched with a terse final message (a `status:` line, `output_refs`, and a few lines of rationale — full detail belongs in the child's artifacts). The same budget applies whether `record-agent-run` is called directly or via `finalize-child`.
 
 ---
 

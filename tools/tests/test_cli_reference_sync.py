@@ -35,6 +35,7 @@ TIER_A_SUBCOMMANDS: frozenset[str] = frozenset({
     "deactivate-child",
     "record-reply",
     "record-agent-run",
+    "finalize-child",
     "set-status",
     "mark-dependency-readiness",
     "write-step-result",

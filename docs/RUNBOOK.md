@@ -292,7 +292,7 @@ Invoking `record-agent-run` twice with the **same `agent_run_id`** raises `Value
 
 1. Number a new `agent_run_id` with `python3 tools/new_agent_run_id.py`.
 2. Newly reserve `ir_id` / `pipeline_id` with `python3 tools/orchestration_runtime.py reserve-phase-root --orchestration-id <oid> --agent-run-id <new_arid> --node-key <node_key> --step <step>` (when the old `agent_run_id` already reserved, confirm with the operator whether the reservation can be reused).
-3. Re-run the legitimate sequence `record-launch` → `Agent` tool launch → `record-child-return` → `deactivate-child` → `record-reply` → `record-agent-run` with the new `agent_run_id` (see steps 1–9 of CLAUDE.md).
+3. Re-run the legitimate sequence `record-launch` → `Agent` tool launch → `finalize-child` (the single call that performs `record-child-return` → `deactivate-child` → `record-reply` → `record-agent-run`) with the new `agent_run_id` (see steps 1–6 of CLAUDE.md).
 4. To terminate the orchestration itself, call `set-status --status fail_closed --reason-code <code> --reason-detail <detail>`. Because `set-status` automatically terminates the orchestration row of `agent_runs.jsonl` in-place, do not update it manually.
 
 The detailed CLI conventions use [docs/CLI_REFERENCE.md#record-agent-run](CLI_REFERENCE.md#record-agent-run) as the canonical source.

@@ -172,26 +172,20 @@ Because Claude Code has no `spawn_agent`, run in the following order.
    capabilities/<agent_run_id>.json and runs guarded-apply-patch etc.).
    Pass the `launch_prompt_text` returned by record-launch in step 3 **verbatim** as the Agent tool `prompt` argument. Because both the written `launches/<agent_run_id>.prompt.txt` and this returned text come from the same single render, the Agent-tool prompt is identical in content to the recorded artifact by construction (audit 1-to-1; the `.prompt.txt` file only adds a trailing newline) — do not edit, abbreviate, or re-author it.
 5. Receive the Agent tool's return value (the final response text)
-5.4. Leave the evidence of observing the Agent tool return with record-child-return (the Adv-20/Adv-30 guards require it)
+6. Finalize the child in ONE call with finalize-child (it runs, in order and with every guard,
+   record-child-return → deactivate-child → record-reply → record-agent-run). One call instead
+   of four keeps the orchestration transcript — and its per-turn cache-read cost — small.
      - **Obtain the return-token via the two-step method (CLAUDE.md `parent_return_token` reference convention).** Do **not** use the inline `$(cat ...)` command-substitution form — Claude Code's Bash tool static analysis rejects it (`Contains shell syntax (string) that cannot be statically analyzed`). Step (a): run `cat workspace/orchestrations/<orchestration_id>/launches/<agent_run_id>.parent_return_token` as a single Bash command (matches the `Bash(cat workspace/orchestrations/*)` allowlist, no approval) to print the token to stdout. Step (b): embed that printed token as a **literal string** in `--return-token "<literal token>"`. Do not read the token with the `Read` tool (blocked by `read_manifest_read_guard` during the active_child window).
-     python3 tools/orchestration_runtime.py record-child-return \
+     - **Keep `--reply-text` terse** (a `status:` line, `output_refs:`, and a few lines of rationale; full detail lives in the child's artifacts, which you read on demand). An over-budget reply is flagged in the result (`reply_over_budget`) and is rejected when `METDSL_ENFORCE_REPLY_BUDGET=1`.
+     python3 tools/orchestration_runtime.py finalize-child \
        --repo-root <repo_root> \
        --orchestration-id <orchestration_id> \
        --agent-run-id <agent_run_id> \
-       --return-token "<literal token printed by the cat in step (a)>"
-5.5. Run deactivate-child to return the active context to the orchestration agent
-     (it is rejected with a ValueError unless the record-child-return above has completed)
-     python3 tools/orchestration_runtime.py deactivate-child \
-       --repo-root <repo_root> \
-       --orchestration-id <orchestration_id> \
-       --child-run-id <agent_run_id>
-6. Save the response text to launches/<agent_run_id>.reply.txt with record-reply
-   python3 tools/orchestration_runtime.py record-reply \
-     --repo-root <repo_root> \
-     --orchestration-id <orchestration_id> \
-     --agent-run-id <agent_run_id> \
-     --reply-text "<the Agent tool's return value>"
-7. Run record-agent-run to append to agent_runs.jsonl
+       --return-token "<literal token printed by the cat in step (a)>" \
+       --reply-text "<the Agent tool's return value (terse)>" \
+       --agent-run-json '<the record-agent-run payload JSON>'
+     (For edge recovery the four individual subcommands — record-child-return / deactivate-child /
+      record-reply / record-agent-run — remain available and must run in that order.)
 ```
 
 The reason for calling `record-launch` before the Agent tool: so that the child agent can reference the capability_token and output manifest before it starts execution.

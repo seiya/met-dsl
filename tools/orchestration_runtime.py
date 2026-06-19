@@ -90,6 +90,14 @@ except ModuleNotFoundError:  # pragma: no cover - import bootstrap for direct CL
     )
 
 TERMINAL_STATUSES = {"pass", "fail", "blocked", "timeout", "cancel"}
+# Budget (chars) for a child's verbatim final reply (launches/<arid>.reply.txt). The reply
+# lands in the orchestration transcript twice (the Agent tool return + the record-reply
+# argument) and is re-read every turn (cache_read scales with context × turns), so an
+# over-long reply is a primary driver of the quadratic orchestration cost. record_agent_run
+# flags an over-budget reply as telemetry by default; METDSL_ENFORCE_REPLY_BUDGET=1 makes it
+# a hard fail so the child must be re-launched with a terse final message (full detail belongs
+# in the child's artifacts, which the orchestration reads on demand — not in the reply).
+REPLY_BUDGET_CHARS = 2000
 # Phases that run via substep agents (the orchestration agent aggregates and is the
 # step_result executor). Build is the only no-substep phase (step agent is the executor).
 # Mirrors SUBSTEP_WORKFLOW_STEPS in tools/validate_pipeline_semantics.py.
@@ -8449,6 +8457,47 @@ def _validate_agent_summary_text(payload: dict[str, Any], summary_text: str) -> 
         raise ValueError("agent.summary.txt must include summary or failure reason")
 
 
+def _evaluate_reply_budget(
+    repo_root: Path,
+    orchestration_id: str,
+    *,
+    agent_run_id: str,
+    reply_ref: str,
+) -> dict[str, Any] | None:
+    """Measure a child's verbatim reply against REPLY_BUDGET_CHARS.
+
+    Returns ``{"chars": n, "budget": REPLY_BUDGET_CHARS}`` when the reply exceeds the
+    budget (so record_agent_run can surface it as telemetry), else ``None``. Always
+    appends an audit entry on an over-budget reply. With METDSL_ENFORCE_REPLY_BUDGET=1
+    it raises instead of returning, turning the soft warning into a hard fail (the
+    orchestration must then re-launch the child with a terse final message). A missing /
+    unreadable reply file is treated as under budget (never blocks on absence).
+    """
+    path = repo_root / reply_ref
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return None
+    n = len(text)
+    if n <= REPLY_BUDGET_CHARS:
+        return None
+    info = {"chars": n, "budget": REPLY_BUDGET_CHARS}
+    _append_workflow_hook_log(
+        repo_root,
+        orchestration_id,
+        hook_name="reply_over_budget",
+        status="warn",
+        detail={"agent_run_id": agent_run_id, **info},
+    )
+    if os.environ.get("METDSL_ENFORCE_REPLY_BUDGET") == "1":
+        raise ValueError(
+            f"record-agent-run: child reply is {n} chars, over the {REPLY_BUDGET_CHARS}-char budget "
+            f"(METDSL_ENFORCE_REPLY_BUDGET=1). Re-launch the child with a terse final message — a status "
+            f"line, output_refs, and a few lines of rationale; full detail belongs in the child's artifacts."
+        )
+    return info
+
+
 def _split_skill_refs(value: Any) -> list[str]:
     if isinstance(value, str):
         return [item.strip() for item in value.split(",") if item.strip()]
@@ -12868,6 +12917,7 @@ def record_agent_run(
     payload["agent_role"] = role_token
     payload.setdefault("started_at", _utc_now_iso())
 
+    reply_budget_info: dict[str, Any] | None = None
     if role_token in {"step", "substep"}:
         payload.setdefault("context_isolated", True)
         request_ref, response_ref = _launch_refs(orchestration_id, agent_run_id)
@@ -12877,6 +12927,15 @@ def record_agent_run(
         payload.setdefault("launch_prompt_ref", prompt_ref)
         payload.setdefault("launch_reply_ref", reply_ref)
         _validate_step_or_substep_launch_refs(repo_root, payload)
+        # Budget the child's verbatim reply (telemetry by default; hard fail under
+        # METDSL_ENFORCE_REPLY_BUDGET=1). Evaluated before the terminal append so a
+        # hard fail leaves no durable record — the orchestration re-launches terser.
+        reply_budget_info = _evaluate_reply_budget(
+            repo_root,
+            orchestration_id,
+            agent_run_id=agent_run_id,
+            reply_ref=str(payload["launch_reply_ref"]),
+        )
 
         # Auto-derive identity fields the orchestration agent need not re-supply.
         # `parent_agent_run_id` and `agent_model` are recorded into the launch
@@ -13107,6 +13166,11 @@ def record_agent_run(
                 repo_root, orchestration_id, agent_run_id=agent_run_id
             )
 
+    # Surface an over-budget reply in the CLI result (soft mode) without persisting it
+    # into the durable agent_runs.jsonl record. _TERSE_ALWAYS_KEEP retains it through the
+    # terse projection so the orchestration always sees the warning.
+    if reply_budget_info is not None:
+        return {**payload, "reply_over_budget": reply_budget_info}
     return payload
 
 
@@ -13272,6 +13336,116 @@ def record_reply_text(
         "reply_ref": reply_ref,
         "recorded_at": _utc_now_iso(),
     }
+
+
+def finalize_child(
+    repo_root: Path,
+    orchestration_id: str,
+    *,
+    agent_run_id: str,
+    return_token: str,
+    reply_text: str,
+    agent_run_payload: dict[str, Any],
+    reply_excerpt: str | None = None,
+) -> dict[str, Any]:
+    """One-call child finalization: collapse the 4 finalize CLI round-trips into one.
+
+    Performs, in the mandated order and in a single process,
+    `record_child_return` -> `deactivate_child_agent` -> `record_reply_text` ->
+    `record_agent_run`, reusing those functions unchanged so every guard is preserved
+    (Adv-30 return-token verification, the Adv-20 ack-file precondition for deactivate,
+    the active_child ordering, and the reply budget guard which reads the reply written
+    by step 3). Cutting the per-child finalize from 4 Bash round-trips to 1 removes the
+    bulk of the per-child command+output that otherwise stays resident in the
+    orchestration transcript (a driver of the quadratic cache_read cost).
+
+    `agent_run_payload` is the `record-agent-run` payload; its `agent_run_id` must match
+    the `--agent-run-id` argument (a mismatch is a caller error). The reply excerpt
+    defaults to the first non-empty line of `reply_text` when not supplied.
+    """
+    arid = agent_run_id.strip() if isinstance(agent_run_id, str) else ""
+    if not arid:
+        raise ValueError("finalize-child requires non-empty --agent-run-id")
+    if not isinstance(reply_text, str) or not reply_text.strip():
+        raise ValueError("finalize-child requires non-empty --reply-text")
+    if not isinstance(agent_run_payload, dict):
+        raise ValueError("finalize-child requires --agent-run-json to be a JSON object")
+    payload_arid = agent_run_payload.get("agent_run_id")
+    if not (isinstance(payload_arid, str) and payload_arid.strip() == arid):
+        raise ValueError(
+            f"finalize-child: --agent-run-json agent_run_id ({payload_arid!r}) must equal "
+            f"--agent-run-id ({arid!r})"
+        )
+    if reply_excerpt is None:
+        first_line = next((ln.strip() for ln in reply_text.splitlines() if ln.strip()), "")
+        reply_excerpt = first_line or None
+
+    # Hard reply-budget gate runs BEFORE any state-consuming side effect. Without this,
+    # record_agent_run's hard check (METDSL_ENFORCE_REPLY_BUDGET=1) would fire only after
+    # record-child-return + deactivate-child have already consumed the ack / active marker /
+    # parent_return_token, leaving the run un-retriable via finalize-child. The soft path
+    # (telemetry) is still handled by record_agent_run below, which reads the written reply.
+    # Measure the EXACT persisted form: record_reply_text -> _write_text appends a trailing
+    # newline when absent, so an exact-boundary reply (== budget, no newline) becomes
+    # budget+1 on disk; counting the persisted length keeps this precheck consistent with the
+    # downstream record_agent_run check and avoids a boundary leak past the side effects.
+    persisted_reply = reply_text if reply_text.endswith("\n") else reply_text + "\n"
+    if (
+        len(persisted_reply) > REPLY_BUDGET_CHARS
+        and os.environ.get("METDSL_ENFORCE_REPLY_BUDGET") == "1"
+    ):
+        # Audit the reject before raising — mirrors _evaluate_reply_budget's hook entry on
+        # the direct record-agent-run path, so finalize-child hard failures stay visible in
+        # hooks/workflow_hooks.jsonl (operators diagnose budget failures from that log).
+        _append_workflow_hook_log(
+            repo_root,
+            orchestration_id,
+            hook_name="reply_over_budget",
+            status="reject",
+            detail={"agent_run_id": arid, "chars": len(persisted_reply), "budget": REPLY_BUDGET_CHARS},
+        )
+        raise ValueError(
+            f"finalize-child: child reply is {len(persisted_reply)} chars, over the {REPLY_BUDGET_CHARS}-char "
+            f"budget (METDSL_ENFORCE_REPLY_BUDGET=1). Re-launch the child with a terse final message — a "
+            f"status line, output_refs, and a few lines of rationale; full detail belongs in the artifacts."
+        )
+
+    child_return = record_child_return(
+        repo_root,
+        orchestration_id,
+        agent_run_id=arid,
+        return_token=return_token,
+        reply_excerpt=reply_excerpt,
+    )
+    deactivation = deactivate_child_agent(
+        repo_root,
+        orchestration_id,
+        child_run_id=arid,
+    )
+    reply = record_reply_text(
+        repo_root,
+        orchestration_id,
+        agent_run_id=arid,
+        reply_text=reply_text,
+    )
+    run_record = record_agent_run(
+        repo_root,
+        orchestration_id,
+        agent_run_payload,
+    )
+
+    result: dict[str, Any] = {
+        "orchestration_id": orchestration_id,
+        "agent_run_id": arid,
+        "status": run_record.get("status"),
+        "deactivated_child_run_id": deactivation.get("deactivated_child_run_id", arid),
+        "child_return_recorded_at": child_return.get("recorded_at"),
+        "reply_ref": reply.get("reply_ref"),
+        "finalized_at": _utc_now_iso(),
+    }
+    if isinstance(run_record, dict) and run_record.get("reply_over_budget"):
+        result["reply_over_budget"] = run_record["reply_over_budget"]
+    return result
 
 
 def write_step_result(
@@ -14787,6 +14961,15 @@ _TERSE_RESULT_FIELDS: dict[str, tuple[str, ...]] = {
     # record_agent_run returns the run record; it carries started_at/finished_at,
     # not a `recorded_at` field.
     "record-agent-run": ("agent_run_id", "status", "started_at", "finished_at"),
+    # finalize-child composes record-child-return/deactivate/record-reply/record-agent-run;
+    # the orchestration only needs the terminal status + the deactivation confirmation.
+    "finalize-child": (
+        "agent_run_id",
+        "status",
+        "deactivated_child_run_id",
+        "reply_ref",
+        "finalized_at",
+    ),
     "record-child-return": ("agent_run_id", "recorded_at", "return_token"),
     "deactivate-child": (
         "deactivated_child_run_id",
@@ -14808,7 +14991,7 @@ _TERSE_RESULT_FIELDS: dict[str, tuple[str, ...]] = {
 # Fields preserved in a terse result whenever present and non-empty, even if not
 # in the per-command list above, so a terse success can never silently hide a
 # soft-failure signal carried in the payload.
-_TERSE_ALWAYS_KEEP: tuple[str, ...] = ("violations", "error", "errors", "warning", "warnings")
+_TERSE_ALWAYS_KEEP: tuple[str, ...] = ("violations", "error", "errors", "warning", "warnings", "reply_over_budget")
 
 
 def _project_terse_result(command: str, result: Any) -> Any:
@@ -15027,6 +15210,26 @@ def main(argv: list[str] | None = None) -> int:
             "Required on pass: output_refs (list of written artifact paths)."
         ),
     )
+
+    finalize_parser = subparsers.add_parser(
+        "finalize-child",
+        description=(
+            "One-call child finalization: record-child-return -> deactivate-child -> "
+            "record-reply -> record-agent-run, in that order, reusing each guard. Collapses "
+            "the 4 finalize Bash round-trips into one to keep the orchestration transcript "
+            "small. --agent-run-json is the record-agent-run payload (its agent_run_id must "
+            "equal --agent-run-id); --reply-text is the child's verbatim final message "
+            "(budget-checked); --return-token is the Adv-30 parent-bound token."
+        ),
+    )
+    finalize_parser.add_argument("--repo-root", required=True)
+    finalize_parser.add_argument("--orchestration-id", required=True)
+    finalize_parser.add_argument("--agent-run-id", required=True)
+    finalize_parser.add_argument("--return-token", required=True)
+    finalize_parser.add_argument("--reply-text")
+    finalize_parser.add_argument("--reply-from-stdin", action="store_true")
+    finalize_parser.add_argument("--reply-excerpt", default=None)
+    finalize_parser.add_argument("--agent-run-json", required=True, type=_json_arg)
 
     step_parser = subparsers.add_parser(
         "write-step-result",
@@ -15320,6 +15523,7 @@ def main(argv: list[str] | None = None) -> int:
         gate_parser,
         run_parser,
         step_parser,
+        finalize_parser,
         deactivate_child_parser,
         record_reply_parser,
         record_child_return_parser,
@@ -15663,6 +15867,28 @@ def main(argv: list[str] | None = None) -> int:
                 repo_root=repo_root,
                 orchestration_id=args.orchestration_id,
                 payload=args.agent_run_json,
+            )
+        except (ValueError, RuntimeError) as exc:
+            print(str(exc), file=sys.stderr)
+            return 1
+    elif args.command == "finalize-child":
+        if args.reply_from_stdin:
+            reply_text = sys.stdin.read()
+        else:
+            reply_text = args.reply_text
+        if not isinstance(reply_text, str) or not reply_text.strip():
+            print("finalize-child requires --reply-text or --reply-from-stdin", file=sys.stderr)
+            return 1
+        try:
+            _validate_record_agent_run_fields(args.agent_run_json)
+            result = finalize_child(
+                repo_root=repo_root,
+                orchestration_id=args.orchestration_id,
+                agent_run_id=args.agent_run_id,
+                return_token=args.return_token,
+                reply_text=reply_text,
+                agent_run_payload=args.agent_run_json,
+                reply_excerpt=args.reply_excerpt,
             )
         except (ValueError, RuntimeError) as exc:
             print(str(exc), file=sys.stderr)

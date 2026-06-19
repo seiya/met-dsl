@@ -53,7 +53,7 @@ Required requirements:
 - For `Generate` / `Build` / `Validate`, do not start unless the immediate dependency `node` satisfies `direct dependency execution readiness`.
 - Even if the immediate dependency `node` is incomplete, do not substitute by embedding the dependency's code into your own `src/`.
 - After completion, return required_outputs, failed_substeps, and substep_agent_run_ids to the parent.
-- The completion reply must include, as `launch_reply`, the actions performed and the judgment result in plain text.
+- Keep your final message (the `launch_reply`) **terse and bounded**: a `status:` line, an `output_refs:` list, and at most ~8 lines of rationale — nothing more. Put all detail (diffs, full logs, per-check output) in your artifacts (`step_result.json` / `*_meta.json`), which the orchestration reads on demand via the gated read path; do **not** restate that detail in the reply. An over-budget reply is flagged by `record-agent-run` (and rejected when `METDSL_ENFORCE_REPLY_BUDGET=1`).
 ```
 
 ## `substep agent` launch request template
@@ -95,7 +95,7 @@ Required requirements:
 - With `repair_strategy=reuse`, limit it to a diff fix against the output of `repair_target_agent_run_id`.
 - With `repair_strategy=restart`, regenerate from the contract input without reusing past output.
 - On completion, return the artifact references and status to the `orchestration agent`.
-- The completion reply must include, as `launch_reply`, the actions performed and the judgment result in plain text.
+- Keep your final message (the `launch_reply`) **terse and bounded**: a `status:` line, an `output_refs:` list, and at most ~8 lines of rationale — nothing more. Put all detail (diffs, full logs, per-check output) in your artifacts (`step_result.json` / `*_meta.json`), which the orchestration reads on demand via the gated read path; do **not** restate that detail in the reply. An over-budget reply is flagged by `record-agent-run` (and rejected when `METDSL_ENFORCE_REPLY_BUDGET=1`).
 
 ```
 
