@@ -24,7 +24,9 @@ from tools.validate_pipeline_semantics import (
     _validate_diagnostics_contract_output,
     _validate_fortran_identifier_length,
     _validate_fortran_makefile_src_dir,
+    _impl_toolchain_from_pipeline_dir,
     _validate_generate_lint_command_logs,
+    _validate_makefile_test_no_relink,
     _validate_source_meta_json_files,
     validate,
     validate_compile_stage,
@@ -7859,6 +7861,680 @@ class FortranMakefileObjdirPrefixTest(unittest.TestCase):
         self.assertEqual(
             [], violations, f"in-source bare Makefile must stay valid; got: {violations}"
         )
+
+
+class MakefileTestNoRelinkTest(unittest.TestCase):
+    """post_generate gate: the `test`/`check` target must use a non-relinking
+    fail-closed guard and must not recurse into make. A relinking guard in
+    Validate.execute writes into the read-only-bound binary/ and escalates a
+    binary-name/availability mismatch into an unauthorized_write_violation ->
+    fail_closed (orch_20260619T113225Z_f48fe14b)."""
+
+    def _run(
+        self,
+        makefile_text: str,
+        build_system: str = "make",
+        language: str = "fortran",
+    ) -> list[str]:
+        with tempfile.TemporaryDirectory() as tmp:
+            src_dir = Path(tmp)
+            (src_dir / "Makefile").write_text(makefile_text, encoding="utf-8")
+            violations: list[str] = []
+            _validate_makefile_test_no_relink(
+                src_dir, violations, build_system=build_system, language=language
+            )
+            return violations
+
+    def test_non_make_toolchain_is_skipped(self) -> None:
+        # The non-relinking contract only applies to make-based quality checks; a
+        # relinking Makefile under another toolchain must not be flagged here.
+        makefile = (
+            "BINDIR ?= .\n"
+            "BIN := app_runner\n"
+            "test:\n"
+            "\ttest -x $(BINDIR)/$(BIN) || $(MAKE) $(BINDIR)/$(BIN)\n"
+        )
+        self.assertEqual([], self._run(makefile, build_system="cmake", language="cpp"))
+        self.assertEqual(
+            [], self._run(makefile, build_system="make", language="python")
+        )
+
+    def test_relinking_test_target_make_var_is_flagged(self) -> None:
+        makefile = (
+            "BINDIR ?= .\n"
+            "BIN := app_runner\n"
+            "test:\n"
+            "\ttest -x $(BINDIR)/$(BIN) || $(MAKE) $(BINDIR)/$(BIN)\n"
+            "\tcd $(RUNDIR) && $(BINDIR)/$(BIN)\n"
+        )
+        violations = self._run(makefile)
+        self.assertTrue(
+            any("relinks the binary" in v for v in violations),
+            f"relinking test target ($(MAKE)) must be flagged; got: {violations}",
+        )
+
+    def test_relinking_test_target_bare_make_is_flagged(self) -> None:
+        makefile = (
+            "BINDIR ?= .\n"
+            "BIN := app_runner\n"
+            "test:\n"
+            "\ttest -x $(BINDIR)/$(BIN) || make $(BINDIR)/$(BIN)\n"
+        )
+        violations = self._run(makefile)
+        self.assertTrue(
+            any("relinks the binary" in v for v in violations),
+            f"relinking test target (bare make) must be flagged; got: {violations}",
+        )
+
+    def test_relinking_check_target_is_flagged(self) -> None:
+        makefile = (
+            "BINDIR ?= .\n"
+            "BIN := app_runner\n"
+            "check:\n"
+            "\ttest -x $(BINDIR)/$(BIN) || ${MAKE} $(BINDIR)/$(BIN)\n"
+        )
+        violations = self._run(makefile)
+        self.assertTrue(
+            any("relinks the binary" in v and "check" in v for v in violations),
+            f"relinking check target must be flagged; got: {violations}",
+        )
+
+    def test_non_relinking_failclosed_guard_is_accepted(self) -> None:
+        # The exact guard text the four canonical docs recommend — its echo
+        # message contains the word `make` ("run 'make all' first"), which must
+        # NOT be mistaken for a recursive make invocation (quoted spans are
+        # stripped before the relink scan).
+        makefile = (
+            "BINDIR ?= .\n"
+            "RUNDIR ?= .\n"
+            "BIN := app_runner\n"
+            "test:\n"
+            "\ttest -x $(BINDIR)/$(BIN) || { echo \"error: $(BINDIR)/$(BIN) not built; run 'make all' first\" >&2; exit 1; }\n"
+            "\tmkdir -p $(RUNDIR)/raw/state_snapshots\n"
+            "\tcd $(RUNDIR) && $(abspath $(BINDIR)/$(BIN))\n"
+        )
+        violations = self._run(makefile)
+        self.assertEqual(
+            [], violations, f"non-relinking fail-closed guard must be accepted; got: {violations}"
+        )
+
+    def test_make_word_in_double_and_single_quoted_message_is_not_flagged(self) -> None:
+        makefile = (
+            "BINDIR ?= .\n"
+            "BIN := app_runner\n"
+            "test:\n"
+            "\ttest -x $(BINDIR)/$(BIN) || echo 'please run make all' >&2\n"
+            "\ttest -x $(BINDIR)/$(BIN) || { echo \"need make\" >&2; exit 1; }\n"
+        )
+        violations = self._run(makefile)
+        self.assertEqual(
+            [], violations, f"make inside quoted messages must not be flagged; got: {violations}"
+        )
+
+    def test_comment_mentioning_make_in_recipe_is_not_flagged(self) -> None:
+        # A `make` token inside a recipe comment must not trip the check — even
+        # when the comment text contains a shell separator before the tool word
+        # (a trailing comment is not executed by the shell).
+        for comment in (
+            "# do not relink with make here",
+            "# build first; make all",
+            "# see docs | make help",
+            "# rebuild (gfortran -o ...)",
+        ):
+            makefile = (
+                "BINDIR ?= .\n"
+                "RUNDIR ?= .\n"
+                "BIN := app_runner\n"
+                "test:\n"
+                f"\t{comment}\n"
+                "\ttest -x $(BINDIR)/$(BIN) || { echo no >&2; exit 1; }\n"
+                f"\tcd $(RUNDIR) && $(abspath $(BINDIR)/$(BIN))  {comment}\n"
+            )
+            violations = self._run(makefile)
+            self.assertEqual(
+                [], violations, f"recipe comment {comment!r} must not be flagged; got: {violations}"
+            )
+
+    def test_attached_hash_is_not_treated_as_comment(self) -> None:
+        # `#` not at a word boundary (`a#b`) is literal, so a later command on the
+        # same line is still scanned.
+        makefile = (
+            "BINDIR ?= .\n"
+            "BIN := app_runner\n"
+            "test:\n"
+            "\techo a#b; $(MAKE) $(BINDIR)/$(BIN)\n"
+        )
+        violations = self._run(makefile)
+        self.assertTrue(
+            any("relinks the binary" in v for v in violations),
+            f"command after an attached-# token must still be scanned; got: {violations}",
+        )
+
+    def test_binary_prerequisite_relink_is_flagged(self) -> None:
+        # `test: $(BINDIR)/$(BIN)` makes `make test` (re)build the binary even
+        # though the recipe itself does not call make -> relinks in Validate.execute.
+        makefile = (
+            "BINDIR ?= .\n"
+            "RUNDIR ?= .\n"
+            "BIN := app_runner\n"
+            "test: $(BINDIR)/$(BIN)\n"
+            "\tcd $(RUNDIR) && $(BINDIR)/$(BIN)\n"
+        )
+        violations = self._run(makefile)
+        self.assertTrue(
+            any("build prerequisite" in v for v in violations),
+            f"binary build prerequisite must be flagged; got: {violations}",
+        )
+
+    def test_all_prerequisite_relink_is_flagged(self) -> None:
+        # `check: all` where `all` is a build rule target -> relink risk.
+        makefile = (
+            "BINDIR ?= .\n"
+            "BIN := app_runner\n"
+            "all: $(BINDIR)/$(BIN)\n"
+            "\t@true\n"
+            "check: all\n"
+            "\t$(BINDIR)/$(BIN)\n"
+        )
+        violations = self._run(makefile)
+        self.assertTrue(
+            any("build prerequisite" in v and "check" in v for v in violations),
+            f"`check: all` build prerequisite must be flagged; got: {violations}",
+        )
+
+    def test_check_aliasing_test_is_accepted(self) -> None:
+        # Canonical: `check: test` aliases the phony test entrypoint (not a build
+        # target). It must not be read as a relink-triggering prerequisite.
+        makefile = (
+            "BINDIR ?= .\n"
+            "RUNDIR ?= .\n"
+            "BIN := app_runner\n"
+            "test:\n"
+            "\ttest -x $(BINDIR)/$(BIN) || { echo \"error: run 'make all' first\" >&2; exit 1; }\n"
+            "\tcd $(RUNDIR) && $(abspath $(BINDIR)/$(BIN))\n"
+            "check: test\n"
+        )
+        violations = self._run(makefile)
+        self.assertEqual(
+            [], violations, f"`check: test` alias must be accepted; got: {violations}"
+        )
+
+    def test_order_only_dir_prerequisite_is_accepted(self) -> None:
+        # An order-only directory prerequisite (mkdir, not a relink) is fine.
+        makefile = (
+            "BINDIR ?= .\n"
+            "RUNDIR ?= .\n"
+            "BIN := app_runner\n"
+            "$(RUNDIR):\n"
+            "\tmkdir -p $(RUNDIR)\n"
+            "test: | $(RUNDIR)\n"
+            "\ttest -x $(BINDIR)/$(BIN) || { echo no >&2; exit 1; }\n"
+            "\tcd $(RUNDIR) && $(abspath $(BINDIR)/$(BIN))\n"
+        )
+        violations = self._run(makefile)
+        self.assertEqual(
+            [], violations, f"order-only dir prerequisite must be accepted; got: {violations}"
+        )
+
+    def test_inline_recipe_make_is_flagged(self) -> None:
+        # A single-line rule `test: ; $(MAKE) ...` puts the relink in the inline
+        # recipe after `;`, not on a tab-indented line.
+        makefile = (
+            "BINDIR ?= .\n"
+            "BIN := app_runner\n"
+            "test: ; $(MAKE) $(BINDIR)/$(BIN)\n"
+        )
+        violations = self._run(makefile)
+        self.assertTrue(
+            any("recipe relinks the binary" in v for v in violations),
+            f"inline-recipe relink must be flagged; got: {violations}",
+        )
+
+    def test_variable_indirect_binary_prerequisite_is_flagged(self) -> None:
+        # The binary prerequisite is stored behind a variable; expansion must
+        # resolve it to `$(BINDIR)/$(BIN)` so the relink is still detected.
+        makefile = (
+            "BINDIR ?= .\n"
+            "BIN := app_runner\n"
+            "TEST_DEPS := $(BINDIR)/$(BIN)\n"
+            "test: $(TEST_DEPS)\n"
+            "\tcd $(RUNDIR) && $(BINDIR)/$(BIN)\n"
+        )
+        violations = self._run(makefile)
+        self.assertTrue(
+            any("build prerequisite" in v for v in violations),
+            f"variable-indirect binary prerequisite must be flagged; got: {violations}",
+        )
+
+    def test_order_only_binary_prerequisite_is_flagged(self) -> None:
+        # GNU make still builds an order-only prerequisite if missing/out of
+        # date, so an order-only binary prerequisite still relinks.
+        makefile = (
+            "BINDIR ?= .\n"
+            "BIN := app_runner\n"
+            "test: | $(BINDIR)/$(BIN)\n"
+            "\tcd $(RUNDIR) && $(BINDIR)/$(BIN)\n"
+        )
+        violations = self._run(makefile)
+        self.assertTrue(
+            any("build prerequisite" in v for v in violations),
+            f"order-only binary prerequisite must be flagged; got: {violations}",
+        )
+
+    def test_order_only_build_helper_is_flagged(self) -> None:
+        # An order-only helper whose recipe links the binary must be flagged
+        # (only pure directory/no-op helpers are safe).
+        makefile = (
+            "FC ?= gfortran\n"
+            "BINDIR ?= .\n"
+            "BIN := app_runner\n"
+            "build-bin:\n"
+            "\t$(FC) -o $(BINDIR)/$(BIN) main.o\n"
+            "test: | build-bin\n"
+            "\tcd $(RUNDIR) && $(BINDIR)/$(BIN)\n"
+        )
+        violations = self._run(makefile)
+        self.assertTrue(
+            any("build prerequisite" in v for v in violations),
+            f"order-only build helper must be flagged; got: {violations}",
+        )
+
+    def test_compiler_relink_in_recipe_is_flagged(self) -> None:
+        # A recipe that rebuilds the binary with the compiler (no make) still
+        # writes into the read-only binary/ in Validate.execute.
+        makefile = (
+            "FC ?= gfortran\n"
+            "BINDIR ?= .\n"
+            "BIN := app_runner\n"
+            "test:\n"
+            "\ttest -x $(BINDIR)/$(BIN) || $(FC) -o $(BINDIR)/$(BIN) main.o\n"
+        )
+        violations = self._run(makefile)
+        self.assertTrue(
+            any("relinks the binary" in v for v in violations),
+            f"compiler relink in recipe must be flagged; got: {violations}",
+        )
+
+    def test_variable_named_binary_target_dependency_is_flagged(self) -> None:
+        # The binary rule is variable-named (`$(BIN):`) and `test` depends on the
+        # binary by its resolved name (no literal `$(BIN)`). Resolving variable
+        # targets is required to catch this.
+        makefile = (
+            "FC ?= gfortran\n"
+            "BINDIR ?= .\n"
+            "BIN := app_runner\n"
+            "RUNNER := app_runner\n"
+            "$(BIN): main.o\n"
+            "\t$(FC) -o $(BIN) main.o\n"
+            "test: $(RUNNER)\n"
+            "\t./run\n"
+        )
+        violations = self._run(makefile)
+        self.assertTrue(
+            any("build prerequisite" in v for v in violations),
+            f"variable-named binary target dependency must be flagged; got: {violations}",
+        )
+
+    def test_quoted_command_word_relink_is_flagged(self) -> None:
+        # The relink command word is quoted; the shell still executes it, so it
+        # must be flagged (command-position detection unquotes the command word).
+        for cmd in ('"$(MAKE)" $(BINDIR)/$(BIN)', "'make' $(BINDIR)/$(BIN)"):
+            makefile = (
+                "BINDIR ?= .\n"
+                "BIN := app_runner\n"
+                "test:\n"
+                f"\ttest -x $(BINDIR)/$(BIN) || {cmd}\n"
+            )
+            violations = self._run(makefile)
+            self.assertTrue(
+                any("relinks the binary" in v for v in violations),
+                f"quoted command-word relink ({cmd!r}) must be flagged; got: {violations}",
+            )
+
+    def test_separator_then_tool_inside_message_is_accepted(self) -> None:
+        # A quoted diagnostic message containing a shell separator before a tool
+        # name (e.g. "missing; make all") is an argument, not an executed
+        # command, and must not be flagged.
+        for msg in ("missing; make all", "do && make it", "use | make", "x; $(MAKE)"):
+            makefile = (
+                "BINDIR ?= .\n"
+                "BIN := app_runner\n"
+                "test:\n"
+                f'\ttest -x $(BINDIR)/$(BIN) || {{ echo "{msg}" >&2; exit 1; }}\n'
+            )
+            self.assertEqual(
+                [], self._run(makefile), f"message {msg!r} must not be flagged"
+            )
+
+    def test_make_force_prefix_relink_is_flagged(self) -> None:
+        # GNU make's `+` recipe prefix forces command execution; a `+$(MAKE)` /
+        # `+make` recipe still relinks and must be flagged.
+        for recipe in ("+$(MAKE) $(BINDIR)/$(BIN)", "+make $(BINDIR)/$(BIN)"):
+            makefile = (
+                "BINDIR ?= .\n"
+                "BIN := app_runner\n"
+                "test:\n"
+                f"\t{recipe}\n"
+            )
+            violations = self._run(makefile)
+            self.assertTrue(
+                any("relinks the binary" in v for v in violations),
+                f"`+` prefixed relink ({recipe!r}) must be flagged; got: {violations}",
+            )
+
+    def test_shell_conditional_relink_is_flagged(self) -> None:
+        # A single-line shell conditional whose body relinks must be flagged; the
+        # relink command follows shell control keywords (`then`/`!`).
+        makefile = (
+            "BINDIR ?= .\n"
+            "BIN := app_runner\n"
+            "test:\n"
+            "\tif ! test -x $(BINDIR)/$(BIN); then $(MAKE) $(BINDIR)/$(BIN); fi\n"
+        )
+        violations = self._run(makefile)
+        self.assertTrue(
+            any("relinks the binary" in v for v in violations),
+            f"shell-conditional relink must be flagged; got: {violations}",
+        )
+
+    def test_compiler_wrapper_relink_is_flagged(self) -> None:
+        # A relink behind a command wrapper (ccache/distcc/env …) must be flagged.
+        for cmd in (
+            "ccache gfortran -o $(BINDIR)/$(BIN) main.o",
+            "distcc $(FC) -o $(BINDIR)/$(BIN) main.o",
+            "env FC=gfortran make $(BINDIR)/$(BIN)",
+        ):
+            makefile = (
+                "FC ?= gfortran\n"
+                "BINDIR ?= .\n"
+                "BIN := app_runner\n"
+                "test:\n"
+                f"\ttest -x $(BINDIR)/$(BIN) || {cmd}\n"
+            )
+            violations = self._run(makefile)
+            self.assertTrue(
+                any("relinks the binary" in v for v in violations),
+                f"wrapped relink ({cmd!r}) must be flagged; got: {violations}",
+            )
+
+    def test_build_driver_utility_mode_is_accepted(self) -> None:
+        # Build-driver names are NOT treated as relinks: in a make Makefile they
+        # mostly appear in non-building utility modes, so flagging the bare command
+        # word would be a false positive (e.g. cmake's portable mkdir).
+        makefile = (
+            "BINDIR ?= .\n"
+            "RUNDIR ?= .\n"
+            "BIN := app_runner\n"
+            "test:\n"
+            "\tcmake -E make_directory $(RUNDIR)\n"
+            "\tcd $(RUNDIR) && $(BINDIR)/$(BIN)\n"
+        )
+        violations = self._run(makefile)
+        self.assertEqual(
+            [], violations, f"build-driver utility mode must be accepted; got: {violations}"
+        )
+
+    def test_gmake_and_escaped_make_relink_is_flagged(self) -> None:
+        # `gmake` (GNU make on BSD/macOS) and a recipe-escaped `$${MAKE}` both
+        # relink and must be flagged.
+        for cmd in ("gmake $(BINDIR)/$(BIN)", "$${MAKE} $(BINDIR)/$(BIN)"):
+            makefile = (
+                "BINDIR ?= .\n"
+                "BIN := app_runner\n"
+                "test:\n"
+                f"\ttest -x $(BINDIR)/$(BIN) || {cmd}\n"
+            )
+            violations = self._run(makefile)
+            self.assertTrue(
+                any("relinks the binary" in v for v in violations),
+                f"gmake/escaped-make relink ({cmd!r}) must be flagged; got: {violations}",
+            )
+
+    def test_combined_flag_sh_c_relink_is_flagged(self) -> None:
+        # `bash -lc 'make all'` (combined short flags) must still be descended into.
+        makefile = (
+            "BINDIR ?= .\n"
+            "BIN := app_runner\n"
+            "test:\n"
+            "\tbash -lc 'make all'\n"
+        )
+        violations = self._run(makefile)
+        self.assertTrue(
+            any("relinks the binary" in v for v in violations),
+            f"combined-flag sh -c relink must be flagged; got: {violations}",
+        )
+
+    def test_nested_substitution_relink_is_flagged(self) -> None:
+        # A relink hidden in a command substitution or `sh -c` body must be flagged.
+        for recipe in (
+            "$(shell $(MAKE) $(BINDIR)/$(BIN))",
+            "X=$$(make $(BINDIR)/$(BIN)); ./run",
+            "OUT=`gfortran -o $(BINDIR)/$(BIN) main.o`",
+            'bash -c "make $(BINDIR)/$(BIN)"',
+            "sh -c 'make all'",
+        ):
+            makefile = (
+                "BINDIR ?= .\n"
+                "BIN := app_runner\n"
+                "test:\n"
+                f"\t{recipe}\n"
+            )
+            violations = self._run(makefile)
+            self.assertTrue(
+                any("relinks the binary" in v for v in violations),
+                f"nested-substitution relink ({recipe!r}) must be flagged; got: {violations}",
+            )
+
+    def test_nested_substitution_run_only_is_accepted(self) -> None:
+        # A command substitution / `sh -c` body that does not relink stays accepted.
+        makefile = (
+            "BINDIR ?= .\n"
+            "RUNDIR ?= .\n"
+            "BIN := app_runner\n"
+            "test:\n"
+            "\tOUT=$$($(BINDIR)/$(BIN) --version); echo $$OUT\n"
+            "\tsh -c 'cd $(RUNDIR) && echo done'\n"
+        )
+        violations = self._run(makefile)
+        self.assertEqual(
+            [], violations, f"non-relinking nested substitution must be accepted; got: {violations}"
+        )
+
+    def test_builtin_variable_alias_relink_is_flagged(self) -> None:
+        # A relink reached via an alias of a make built-in tool variable
+        # (`M := $(MAKE)`, `L := $(LD)`) must be flagged even though the built-in
+        # is never explicitly assigned in the Makefile.
+        for setup, cmd in (
+            ("M := $(MAKE)\n", "$(M) $(BINDIR)/$(BIN)"),
+            ("L := $(LD)\n", "$(L) -o $(BINDIR)/$(BIN) main.o"),
+        ):
+            makefile = (
+                f"{setup}"
+                "BINDIR ?= .\n"
+                "BIN := app_runner\n"
+                "test:\n"
+                f"\t{cmd}\n"
+            )
+            violations = self._run(makefile)
+            self.assertTrue(
+                any("relinks the binary" in v for v in violations),
+                f"built-in alias relink ({cmd!r}) must be flagged; got: {violations}",
+            )
+
+    def test_make_variable_alias_relink_is_flagged(self) -> None:
+        # The relink command is reached through a make-variable alias; the command
+        # word must be expanded with the variable map before matching.
+        makefile = (
+            "FC ?= gfortran\n"
+            "LINK := $(FC)\n"
+            "BINDIR ?= .\n"
+            "BIN := app_runner\n"
+            "test:\n"
+            "\ttest -x $(BINDIR)/$(BIN) || $(LINK) -o $(BINDIR)/$(BIN) main.o\n"
+        )
+        violations = self._run(makefile)
+        self.assertTrue(
+            any("relinks the binary" in v for v in violations),
+            f"make-variable alias relink must be flagged; got: {violations}",
+        )
+
+    def test_env_assignment_prefixed_relink_is_flagged(self) -> None:
+        # A relink command preceded by shell env assignments must be flagged.
+        for cmd in ("VAR=1 $(MAKE) $(BINDIR)/$(BIN)", "FC=gfortran make $(BINDIR)/$(BIN)"):
+            makefile = (
+                "BINDIR ?= .\n"
+                "BIN := app_runner\n"
+                "test:\n"
+                f"\t{cmd}\n"
+            )
+            violations = self._run(makefile)
+            self.assertTrue(
+                any("relinks the binary" in v for v in violations),
+                f"env-assignment-prefixed relink ({cmd!r}) must be flagged; got: {violations}",
+            )
+
+    def test_shell_conditional_run_only_is_accepted(self) -> None:
+        # The same conditional shape that only runs the binary must be accepted.
+        makefile = (
+            "BINDIR ?= .\n"
+            "RUNDIR ?= .\n"
+            "BIN := app_runner\n"
+            "test:\n"
+            "\tif test -x $(BINDIR)/$(BIN); then cd $(RUNDIR) && $(BINDIR)/$(BIN); fi\n"
+        )
+        violations = self._run(makefile)
+        self.assertEqual(
+            [], violations, f"shell-conditional run-only must be accepted; got: {violations}"
+        )
+
+    def test_run_and_cleanup_helper_prerequisite_is_accepted(self) -> None:
+        # A prerequisite helper that only cleans up and runs the already-built
+        # binary (no make/compiler) does not relink and must be accepted.
+        makefile = (
+            "BINDIR ?= .\n"
+            "RUNDIR ?= .\n"
+            "BIN := app_runner\n"
+            "prepare-run:\n"
+            "\trm -rf $(RUNDIR)/old\n"
+            "\tmkdir -p $(RUNDIR)/raw\n"
+            "\tcd $(RUNDIR) && $(abspath $(BINDIR)/$(BIN))\n"
+            "test: prepare-run\n"
+            "\t@true\n"
+        )
+        violations = self._run(makefile)
+        self.assertEqual(
+            [], violations, f"run/cleanup helper prerequisite must be accepted; got: {violations}"
+        )
+
+    def test_chained_build_after_mkdir_prereq_is_flagged(self) -> None:
+        # A prerequisite helper recipe that chains a compiler after mkdir must not
+        # be classified directory-only by its leading `mkdir`.
+        makefile = (
+            "FC ?= gfortran\n"
+            "BINDIR ?= .\n"
+            "BIN := app_runner\n"
+            "prepare:\n"
+            "\tmkdir -p $(BINDIR) && $(FC) -o $(BINDIR)/$(BIN) main.o\n"
+            "test: prepare\n"
+            "\t./run\n"
+        )
+        violations = self._run(makefile)
+        self.assertTrue(
+            any("build prerequisite" in v for v in violations),
+            f"mkdir-then-compiler prerequisite must be flagged; got: {violations}",
+        )
+
+    def test_inline_recipe_build_prerequisite_is_flagged(self) -> None:
+        # A prerequisite target whose *inline* recipe links the binary must be
+        # classified as a build target.
+        makefile = (
+            "FC ?= gfortran\n"
+            "BINDIR ?= .\n"
+            "BIN := app_runner\n"
+            "build-bin: ; $(FC) -o $(BINDIR)/$(BIN) main.o\n"
+            "test: build-bin\n"
+            "\t./run\n"
+        )
+        violations = self._run(makefile)
+        self.assertTrue(
+            any("build prerequisite" in v for v in violations),
+            f"inline-recipe build prerequisite must be flagged; got: {violations}",
+        )
+
+    def test_running_the_binary_in_recipe_is_accepted(self) -> None:
+        # Running the binary (not building it) must not be mistaken for a relink.
+        makefile = (
+            "BINDIR ?= .\n"
+            "RUNDIR ?= .\n"
+            "BIN := app_runner\n"
+            "test:\n"
+            "\ttest -x $(BINDIR)/$(BIN) || { echo no >&2; exit 1; }\n"
+            "\tmkdir -p $(RUNDIR)/raw\n"
+            "\tcd $(RUNDIR) && $(abspath $(BINDIR)/$(BIN)) --run\n"
+        )
+        violations = self._run(makefile)
+        self.assertEqual(
+            [], violations, f"running the binary must be accepted; got: {violations}"
+        )
+
+    def test_variable_defined_after_rule_is_accepted(self) -> None:
+        # `test: $(TEST_DEPS)` before `TEST_DEPS := ...`: make expands the
+        # prerequisite immediately and sees nothing, so it must not be flagged.
+        makefile = (
+            "BINDIR ?= .\n"
+            "RUNDIR ?= .\n"
+            "BIN := app_runner\n"
+            "test: $(TEST_DEPS)\n"
+            "\ttest -x $(BINDIR)/$(BIN) || { echo no >&2; exit 1; }\n"
+            "\tcd $(RUNDIR) && $(abspath $(BINDIR)/$(BIN))\n"
+            "TEST_DEPS := $(BINDIR)/$(BIN)\n"
+        )
+        violations = self._run(makefile)
+        self.assertEqual(
+            [], violations, f"forward-referenced prereq variable must be accepted; got: {violations}"
+        )
+
+    def test_order_only_helper_rule_is_accepted(self) -> None:
+        # An order-only prerequisite naming a helper rule that only creates run
+        # directories must not be read as a relinking build prerequisite.
+        makefile = (
+            "BINDIR ?= .\n"
+            "RUNDIR ?= .\n"
+            "BIN := app_runner\n"
+            "prepare-run:\n"
+            "\tmkdir -p $(RUNDIR)/raw/state_snapshots\n"
+            "test: | prepare-run\n"
+            "\ttest -x $(BINDIR)/$(BIN) || { echo no >&2; exit 1; }\n"
+            "\tcd $(RUNDIR) && $(abspath $(BINDIR)/$(BIN))\n"
+        )
+        violations = self._run(makefile)
+        self.assertEqual(
+            [], violations, f"order-only helper rule must be accepted; got: {violations}"
+        )
+
+    def test_missing_makefile_is_noop(self) -> None:
+        # Pass the make toolchain so the missing-Makefile branch is actually
+        # exercised (not short-circuited by the toolchain gate).
+        with tempfile.TemporaryDirectory() as tmp:
+            violations: list[str] = []
+            _validate_makefile_test_no_relink(
+                Path(tmp), violations, build_system="make", language="fortran"
+            )
+            self.assertEqual([], violations)
+
+    def test_malformed_lineage_does_not_crash_toolchain_lookup(self) -> None:
+        # A malformed lineage.json must resolve to (None, None) rather than raise,
+        # so the post_build/post_generate stage reports a violation instead of a
+        # traceback.
+        with tempfile.TemporaryDirectory() as tmp:
+            pipeline_dir = Path(tmp)
+            (pipeline_dir / "lineage.json").write_text(
+                "{ not: valid json ", encoding="utf-8"
+            )
+            self.assertEqual(
+                (None, None),
+                _impl_toolchain_from_pipeline_dir(pipeline_dir, pipeline_dir),
+            )
 
 
 class DiagnosticsContractTest(unittest.TestCase):

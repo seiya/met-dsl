@@ -1125,6 +1125,129 @@ def _parse_makefile_rules(makefile_text: str) -> dict[str, set[str]]:
     return rules
 
 
+def _apply_make_assignment(
+    var_map: dict[str, str],
+    var_flavor: dict[str, str],
+    name: str,
+    op: str,
+    value: str,
+    preserve: frozenset[str] | None = None,
+) -> None:
+    """Apply one variable assignment to ``var_map`` honoring make's flavors:
+    `?=` (set if unset), `:=` (immediate expansion), `+=` (append, immediate for a
+    simply-expanded var else lazy), `=` (recursive, stored raw). ``preserve`` names
+    are kept as literal `$(NAME)` references through immediate expansion."""
+    if op == "?":
+        if name not in var_map:
+            var_map[name] = value
+            var_flavor[name] = "recursive"
+    elif op == ":":
+        var_map[name] = _expand_make_vars(
+            value, var_map, strip_unknown=True, preserve=preserve
+        )
+        var_flavor[name] = "simple"
+    elif op == "+":
+        if name not in var_map:
+            var_map[name] = value
+            var_flavor[name] = "recursive"
+        else:
+            addition = (
+                _expand_make_vars(value, var_map, strip_unknown=True, preserve=preserve)
+                if var_flavor.get(name) == "simple"
+                else value
+            )
+            existing = var_map[name]
+            var_map[name] = (
+                (existing + " " + addition).strip() if existing else addition
+            )
+    else:
+        var_map[name] = value
+        var_flavor[name] = "recursive"
+
+
+# Make's built-in tool variables (`$(MAKE)`, `$(FC)`, …). They are predefined by
+# make and usually never assigned in the Makefile, so they are absent from a map
+# built only from explicit assignments. Preserving them through `:=`/`+=`
+# expansion keeps the reference alive in an alias (`M := $(MAKE)` stores
+# `$(MAKE)`, not the empty string), so a relink reached via that alias is still
+# detected — and `$(MAKE)` matches `_RELINK_TOOL_PATTERN` literally.
+_RELINK_BUILTIN_VARS = frozenset(
+    {"MAKE", "FC", "CC", "CXX", "LD", "AR", "F90", "F95", "F77"}
+)
+
+
+def _makefile_full_var_map(makefile_text: str) -> dict[str, str]:
+    """Variable map after reading the whole Makefile (definition order honored,
+    `?=`/`:=`/`+=`/`=` flavors handled). Unlike the per-rule incremental map this
+    resolves every reference (no preserved sentinels) so a variable-named target
+    such as `$(BIN):` or `$(BINDIR)/$(BIN):` resolves to its concrete basename. The
+    relink built-in tool variables are preserved through immediate expansion so an
+    alias of `$(MAKE)`/`$(LD)`/… survives."""
+    var_map: dict[str, str] = {}
+    var_flavor: dict[str, str] = {}
+    for line in _makefile_logical_lines(makefile_text):
+        match = _MAKE_ASSIGNMENT_PATTERN.match(line)
+        if match is None:
+            continue
+        _apply_make_assignment(
+            var_map,
+            var_flavor,
+            match.group(1),
+            match.group(2),
+            match.group(3).strip(),
+            preserve=_RELINK_BUILTIN_VARS,
+        )
+    return var_map
+
+
+def _makefile_target_recipes(
+    makefile_text: str, var_map: dict[str, str]
+) -> dict[str, list[str]]:
+    """Map of resolved target basename -> its recipe lines (tab-indented and
+    inline `; …`). Target names are expanded with ``var_map`` so a variable-named
+    rule (`$(BIN):`) is keyed by its concrete basename."""
+    recipes: dict[str, list[str]] = {}
+    current_targets: list[str] = []
+    for raw_line in makefile_text.splitlines():
+        if raw_line.startswith("\t"):
+            for target in current_targets:
+                recipes.setdefault(target, []).append(raw_line)
+            continue
+        stripped = raw_line.lstrip()
+        if not stripped or stripped.startswith("#") or ":" not in raw_line:
+            current_targets = []
+            continue
+        head, rest = raw_line.split(":", 1)
+        if "=" in head:
+            current_targets = []
+            continue
+        current_targets = [
+            norm
+            for tok in _expand_make_vars(head, var_map).split()
+            if (norm := _normalize_make_token(tok)) is not None
+        ]
+        # An inline recipe (`target: prereqs ; recipe`) is part of the recipe and
+        # must be classified too, not just tab-indented lines.
+        inline_recipe = rest.partition(";")[2]
+        if inline_recipe.strip():
+            for target in current_targets:
+                recipes.setdefault(target, []).append(inline_recipe)
+    return recipes
+
+
+def _makefile_relinking_recipe_targets(
+    recipes: dict[str, list[str]], var_map: dict[str, str]
+) -> set[str]:
+    """Targets whose recipe relinks the binary — i.e. invokes a recursive make or
+    a compiler/linker. A target that only runs the (already-built) binary, mkdirs,
+    cleans up, etc. does not relink and is not included."""
+    return {
+        target
+        for target, body in recipes.items()
+        if any(_recipe_line_relinks(line, var_map) for line in body if line.strip())
+    }
+
+
 # Out-of-source directory sentinels parameterized in generated Makefiles. They
 # default to "." for in-source `make` but are overridden at Build/Validate time
 # (e.g. `OBJDIR=<per-run tmp>`), so a prerequisite's `$(OBJDIR)/` prefix is NOT
@@ -1362,6 +1485,333 @@ def _validate_fortran_makefile_src_dir(src_dir: Path, violations: list[str]) -> 
                 f"producing rule target; a bare basename has no rule under an "
                 f"out-of-source OBJDIR override and breaks make -j (no rule to make target)"
             )
+
+
+# A relinking command word: a recursive make or a compiler/linker/archiver, as
+# the *first* word of a shell command. Anchored at the start of an extracted
+# command word, so a tool name appearing inside an argument (e.g. an echo message)
+# is never matched. The make-variable form allows an optional second `$` so a
+# recipe-escaped `$$(MAKE)` / `$${MAKE}` is recognized too. `g++`/`c++`/`clang++`
+# need no trailing word boundary (a `+` is not a word char). The command word's
+# path basename is also tested so an absolute path (`/usr/bin/make`) is recognized.
+# Build drivers (cmake/ninja/meson/libtool) are intentionally NOT matched: in a
+# `build_system=make` Makefile they appear mostly in non-building utility modes
+# (`cmake -E`, `ninja -t`, `meson test`, `libtool --mode=execute`), so a bare
+# command-word match would be a false positive.
+_RELINK_TOOL_PATTERN = re.compile(
+    r"""^(?:
+        \$\$?[({](?:MAKE|FC|CC|CXX|LD|AR|F90|F95|F77)[)}]
+      | (?:make|gmake|mingw32-make|gfortran|gcc|clang|cc|ld|ar|nvcc|nvfortran|ifort|ifx|f90|f95|f77)\b
+      | (?:g|c|clang)\+\+
+    )""",
+    re.VERBOSE,
+)
+# The phony test entrypoints are not themselves build targets, so a `check: test`
+# alias (canonical) must not be read as a relink-triggering prerequisite.
+_PHONY_TEST_TARGETS = frozenset({"test", "check"})
+# Shell control words that introduce another command directly (no separator), so
+# the *following* token is itself a command word (e.g. `then $(MAKE)`, `if ! make`).
+_SHELL_CMD_PREFIX_KEYWORDS = frozenset(
+    {"if", "elif", "then", "else", "while", "until", "do", "time", "!"}
+)
+# Command wrappers whose *next* token is the wrapped command (`ccache gfortran …`,
+# `env FC=gfortran make …`): skip the wrapper and examine that command word. Only
+# wrappers that take no argument before the command are included — wrappers that
+# take their own options/args first (`timeout 60 make`, `nice -n10 make`,
+# `sudo -u x make`, `xargs -n1 make`) would mis-identify the arg as the command,
+# so they are intentionally omitted (a documented low-realism gap).
+_SHELL_CMD_WRAPPER_PREFIXES = frozenset(
+    {"ccache", "distcc", "sccache", "nohup", "env"}
+)
+# A leading `NAME=value` shell assignment precedes the actual command, so the
+# following token is the command word (e.g. `FC=gfortran make …`).
+_SHELL_ASSIGNMENT_PREFIX = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+
+
+def _shell_command_words(recipe: str) -> list[str]:
+    """Extract the command word (first token) of each shell command in a recipe
+    line, honoring quotes and make's `$(...)`/`${...}` syntax. Commands are
+    delimited by unquoted `;` / `&` / `|`, and by `{` / `(` *group openers* (a `{`
+    or `(` not immediately following `$`, so `${VAR}` / `$(VAR)` stay intact).
+    Surrounding quotes are stripped from a quoted command word (`"$(MAKE)"` ->
+    `$(MAKE)`), while separators/words inside an argument's quotes are ignored."""
+    words: list[str] = []
+    word: list[str] = []
+    reading = False
+    cmd_start = True
+    quote: str | None = None
+    prev = ""
+
+    def emit() -> None:
+        nonlocal reading, word
+        if reading:
+            words.append("".join(word))
+            word = []
+            reading = False
+
+    for char in recipe:
+        if quote is not None:
+            if char == quote:
+                quote = None
+            elif reading:
+                word.append(char)
+            prev = char
+            continue
+        if char in "'\"":
+            if cmd_start:
+                reading = True  # a quoted command word; the quotes are dropped
+            quote = char
+            prev = char
+            continue
+        if char == "#" and (prev == "" or prev in " \t;&|({"):
+            # An unquoted `#` at a word boundary starts a shell comment; the rest
+            # of the line is not executed (`… $(BIN)  # build first; make all`).
+            break
+        if char in ";&|" or (char in "{(" and prev != "$"):
+            emit()
+            cmd_start = True
+            prev = char
+            continue
+        if char in " \t":
+            if reading:
+                emit()
+                # A shell control keyword (`then`/`do`/`!`/…), a command wrapper
+                # (`ccache`/`env`/…), or a leading `NAME=value` assignment is
+                # followed by another command, so the next token is also a command
+                # word.
+                cmd_start = (
+                    words[-1] in _SHELL_CMD_PREFIX_KEYWORDS
+                    or words[-1] in _SHELL_CMD_WRAPPER_PREFIXES
+                    or bool(_SHELL_ASSIGNMENT_PREFIX.match(words[-1]))
+                )
+            prev = char
+            continue
+        # Ordinary char.
+        if cmd_start and not reading and char in "@+-":
+            prev = char  # skip leading make recipe prefixes (@ silent, - ignore, + force)
+            continue
+        if cmd_start:
+            reading = True
+            word.append(char)
+        prev = char
+    emit()
+    return words
+
+
+_SHELL_DASH_C_ARG = re.compile(
+    r"""\b(?:sh|bash|dash|zsh|ksh)\s+-[A-Za-z]*c\s+   # -c, possibly with combined flags (-lc)
+        ("(?:[^"]*)"|'(?:[^']*)'|\S+)""",
+    re.VERBOSE,
+)
+_BACKTICK_SPAN = re.compile(r"`([^`]*)`")
+
+
+def _command_word_relinks(command: str, var_map: dict[str, str] | None) -> bool:
+    """True if a command word is a relink tool, after optionally resolving a
+    make-variable alias (`$(LINK)` -> `gfortran`) via ``var_map``."""
+    candidates = {command}
+    if var_map:
+        candidates.add(_expand_make_vars(command, var_map))
+    for candidate in candidates:
+        if _RELINK_TOOL_PATTERN.search(candidate) or _RELINK_TOOL_PATTERN.search(
+            candidate.rsplit("/", 1)[-1]
+        ):
+            return True
+    return False
+
+
+def _nested_command_texts(text: str) -> list[str]:
+    """Shell-command substrings nested inside a recipe line: make `$(shell …)`
+    function bodies, shell `$$(…)` command substitutions, backtick substitutions,
+    and the argument of `sh -c` / `bash -c`. Returned so the relink scan can
+    recurse into them (a relink hidden in `$(shell $(MAKE) …)` etc.)."""
+    bodies: list[str] = []
+    n = len(text)
+    i = 0
+    while i < n:
+        if text[i] == "$" and i + 1 < n:
+            j = i + 1
+            shell_subst = False
+            if text[j] == "$":  # `$$(` -> shell command substitution
+                j += 1
+                shell_subst = True
+            if j < n and text[j] == "(":
+                depth = 1
+                k = j + 1
+                start = k
+                while k < n and depth:
+                    if text[k] == "(":
+                        depth += 1
+                    elif text[k] == ")":
+                        depth -= 1
+                        if depth == 0:
+                            break
+                    k += 1
+                body = text[start:k]
+                if shell_subst:
+                    bodies.append(body)
+                else:
+                    shell_fn = re.match(r"shell\s+(.*)", body, re.S)
+                    if shell_fn:
+                        bodies.append(shell_fn.group(1))
+                i = k + 1
+                continue
+        i += 1
+    bodies.extend(m.group(1) for m in _BACKTICK_SPAN.finditer(text))
+    for match in _SHELL_DASH_C_ARG.finditer(text):
+        arg = match.group(1)
+        if len(arg) >= 2 and arg[0] in "'\"" and arg[-1] == arg[0]:
+            arg = arg[1:-1]
+        bodies.append(arg)
+    return bodies
+
+
+def _text_relinks(text: str, var_map: dict[str, str] | None, depth: int = 0) -> bool:
+    if depth > 6:  # bound pathological nesting
+        return False
+    if any(_command_word_relinks(cmd, var_map) for cmd in _shell_command_words(text)):
+        return True
+    return any(
+        _text_relinks(body, var_map, depth + 1) for body in _nested_command_texts(text)
+    )
+
+
+def _recipe_line_relinks(recipe_line: str, var_map: dict[str, str] | None = None) -> bool:
+    """True if a recipe line executes a relinking command (recursive make, a build
+    driver, or a compiler/linker) as a command word — at the top level or nested
+    in a `$(shell …)` / `$$(…)` / backtick substitution or a `sh -c` body. Command
+    words are expanded with ``var_map`` so a make-variable alias resolves first."""
+    return _text_relinks(recipe_line.lstrip("\t"), var_map)
+
+
+def _validate_makefile_test_no_relink(
+    src_dir: Path,
+    violations: list[str],
+    build_system: str | None = None,
+    language: str | None = None,
+) -> None:
+    # The non-relinking `test`/`check` contract applies only to the make-based
+    # quality-check toolchains (`Validate.execute` runs `make_test`/`make_check`
+    # only then). Skip any other toolchain — a Makefile kept for local
+    # convenience must not fail post_generate/post_build here.
+    if build_system != "make" or language not in MAKE_QUALITY_CHECK_REQUIRED_LANGUAGES:
+        return
+    if not src_dir.is_dir():
+        return
+    makefile_path = src_dir / "Makefile"
+    if not makefile_path.exists():
+        return
+
+    text = makefile_path.read_text(encoding="utf-8", errors="ignore")
+    # Whole-file variable map: resolves variable-named targets/recipes and the
+    # binary basename (`$(BIN)`). Targets/recipes are position-independent, so the
+    # final map is correct for them; `test`/`check` *prerequisites* are resolved
+    # with an incremental map below to honor make's read-time expansion order.
+    full_var_map = _makefile_full_var_map(text)
+    binary_basename = _normalize_make_token(_expand_make_vars("$(BIN)", full_var_map))
+    recipes = _makefile_target_recipes(text, full_var_map)
+    relinking_recipe_targets = _makefile_relinking_recipe_targets(recipes, full_var_map)
+
+    # Incremental pass mirroring GNU make: a rule's prerequisites are expanded
+    # immediately at read time, so only definitions seen *before* the rule are
+    # visible (a forward reference expands to empty). Records each rule target's
+    # resolved prerequisite basenames; `test`/`check` rules are captured for the
+    # verdict.
+    inc_var_map: dict[str, str] = {}
+    inc_var_flavor: dict[str, str] = {}
+    prereq_names_by_target: dict[str, set[str]] = {}
+    test_check_rules: list[tuple[frozenset[str], set[str], str]] = []
+    for line in _makefile_logical_lines(text):
+        assign_match = _MAKE_ASSIGNMENT_PATTERN.match(line)
+        if assign_match is not None:
+            _apply_make_assignment(
+                inc_var_map,
+                inc_var_flavor,
+                assign_match.group(1),
+                assign_match.group(2),
+                assign_match.group(3).strip(),
+            )
+            continue
+
+        if ":" not in line:
+            continue
+        head, rest = line.split(":", 1)
+        target_names = {
+            norm
+            for tok in _expand_make_vars(head, inc_var_map).split()
+            if (norm := _normalize_make_token(tok)) is not None
+        }
+        if not target_names:
+            continue
+
+        # Right-hand side: prerequisites (normal + order-only, both built by make)
+        # and an optional inline recipe (`target: prereqs ; recipe`).
+        prereq_part, _, inline_recipe = rest.partition(";")
+        prereq_names = {
+            norm
+            for tok in _expand_make_vars(
+                prereq_part.replace("|", " "), inc_var_map
+            ).split()
+            if (norm := _normalize_make_token(tok)) is not None
+        }
+        for target in target_names:
+            prereq_names_by_target.setdefault(target, set()).update(prereq_names)
+
+        guarded_targets = target_names & _PHONY_TEST_TARGETS
+        if guarded_targets:
+            test_check_rules.append(
+                (frozenset(guarded_targets), prereq_names, inline_recipe)
+            )
+
+    # A rule target relinks when made if its recipe builds (links) or it is the
+    # binary itself, plus any target that transitively depends on such a target.
+    # Computed as a fixpoint over the prerequisite graph; the phony test
+    # entrypoints are excluded (a `check: test` alias is not a build prerequisite).
+    relinking = set(relinking_recipe_targets)
+    if binary_basename is not None:
+        relinking.add(binary_basename)
+    relinking -= _PHONY_TEST_TARGETS
+    changed = True
+    while changed:
+        changed = False
+        for target in set(prereq_names_by_target) - relinking - _PHONY_TEST_TARGETS:
+            if prereq_names_by_target[target] & relinking:
+                relinking.add(target)
+                changed = True
+
+    for guarded_targets, prereq_names, inline_recipe in test_check_rules:
+        target_label = "/".join(sorted(guarded_targets))
+
+        # Prerequisite relink: a prerequisite (normal or order-only) that is the
+        # binary or a target that relinks when built.
+        if prereq_names & relinking:
+            violations.append(
+                f"{makefile_path}: {target_label} target has a build prerequisite "
+                f"that relinks the binary; the target must reference the existing "
+                f"binary via a non-relinking recipe guard "
+                f"'test -x $(BINDIR)/$(BIN) || {{ echo \"error: ...\" >&2; exit 1; }}' "
+                f"with no build prerequisite, so Validate.execute does not write into "
+                f"the read-only-bound binary/ (unauthorized_write_violation -> fail_closed)"
+            )
+
+        # Recipe relink: an inline (`; ...`) or tab-indented recipe line that
+        # rebuilds the binary (recursive make or a compiler/linker invocation).
+        recipe_lines: list[str] = []
+        if inline_recipe.strip():
+            recipe_lines.append(inline_recipe)
+        for tgt in guarded_targets:
+            recipe_lines.extend(recipes.get(tgt, []))
+        for recipe_line in recipe_lines:
+            if _recipe_line_relinks(recipe_line, full_var_map):
+                violations.append(
+                    f"{makefile_path}: {target_label} target recipe relinks the binary "
+                    f"(recursive make or compiler/linker invocation); use a non-relinking "
+                    f"fail-closed guard "
+                    f"'test -x $(BINDIR)/$(BIN) || {{ echo \"error: ...\" >&2; exit 1; }}' "
+                    f"so Validate.execute does not write into the read-only-bound "
+                    f"binary/ (unauthorized_write_violation -> fail_closed)"
+                )
+                break
 
 
 def _validate_problem_runner_diagnostics_dependency(
@@ -3015,6 +3465,12 @@ def _validate_generate_outputs(
 
     _validate_fortran_identifier_length(src_dir, violations)
     _validate_fortran_makefile_src_dir(src_dir, violations)
+    _build_system, _language = _impl_toolchain_from_pipeline_dir(
+        repo_root, execution.pipeline_dir
+    )
+    _validate_makefile_test_no_relink(
+        src_dir, violations, build_system=_build_system, language=_language
+    )
 
 
 # Fortran 2008 (and the earlier standards the generated code targets) limit a
@@ -3176,6 +3632,12 @@ def _validate_generate_outputs_for_generation(
 
     _validate_fortran_identifier_length(src_dir, violations)
     _validate_fortran_makefile_src_dir(src_dir, violations)
+    _build_system, _language = _impl_toolchain_from_pipeline_dir(
+        repo_root, execution.pipeline_dir
+    )
+    _validate_makefile_test_no_relink(
+        src_dir, violations, build_system=_build_system, language=_language
+    )
     runner_files = sorted(src_dir.glob("*_runner.f90"))
     _validate_runner_source_files(execution, runner_files, violations)
 
@@ -3244,12 +3706,20 @@ def _dependency_resolved_for_execution(repo_root: Path, execution: NodeExecution
     return dep_data
 
 
-def _ir_dir_for_execution(repo_root: Path, execution: NodeExecution) -> Path | None:
-    lineage_path = execution.pipeline_dir / "lineage.json"
+def _ir_dir_from_pipeline_dir(repo_root: Path, pipeline_dir: Path) -> Path | None:
+    lineage_path = pipeline_dir / "lineage.json"
     if not lineage_path.exists():
         return None
 
-    lineage = _read_json(lineage_path)
+    try:
+        lineage = _read_json(lineage_path)
+    except json.JSONDecodeError:
+        # A malformed lineage.json is reported as a violation by the dedicated
+        # lineage validators; here we only resolve the IR dir best-effort and
+        # must not crash the stage.
+        return None
+    if not isinstance(lineage, dict):
+        return None
     ir_ref = lineage.get("ir_ref")
     if not isinstance(ir_ref, str) or not ir_ref.startswith("workspace/"):
         return None
@@ -3258,6 +3728,44 @@ def _ir_dir_for_execution(repo_root: Path, execution: NodeExecution) -> Path | N
     if not ir_dir.exists() or not ir_dir.is_dir():
         return None
     return ir_dir
+
+
+def _ir_dir_for_execution(repo_root: Path, execution: NodeExecution) -> Path | None:
+    return _ir_dir_from_pipeline_dir(repo_root, execution.pipeline_dir)
+
+
+def _impl_toolchain_from_pipeline_dir(
+    repo_root: Path, pipeline_dir: Path
+) -> tuple[str | None, str | None]:
+    """Resolve ``(build_system, language)`` from the pipeline's
+    `spec.ir.yaml#impl_defaults.toolchain`, lowercased; either may be None when
+    unresolvable. Used to gate make-only checks to the documented toolchain
+    scope."""
+    ir_dir = _ir_dir_from_pipeline_dir(repo_root, pipeline_dir)
+    if ir_dir is None:
+        return (None, None)
+    contract_path = ir_dir / "spec.ir.yaml"
+    if not contract_path.exists():
+        return (None, None)
+    try:
+        data = _read_yaml(contract_path)
+    except (json.JSONDecodeError, yaml.YAMLError):
+        return (None, None)
+    if not isinstance(data, dict):
+        return (None, None)
+    impl_defaults = data.get("impl_defaults")
+    toolchain = (
+        impl_defaults.get("toolchain")
+        if isinstance(impl_defaults, dict)
+        else data.get("toolchain")
+    )
+    if not isinstance(toolchain, dict):
+        return (None, None)
+
+    def _norm(value: Any) -> str | None:
+        return value.strip().lower() if isinstance(value, str) and value.strip() else None
+
+    return (_norm(toolchain.get("build_system")), _norm(toolchain.get("language")))
 
 
 def _io_contract_for_execution(
@@ -7243,6 +7751,10 @@ def _validate_post_build_stage_impl(
 
     src_dir = pipeline_dir / "source" / gen_id / "src"
     _validate_fortran_makefile_src_dir(src_dir, violations)
+    _build_system, _language = _impl_toolchain_from_pipeline_dir(repo_root, pipeline_dir)
+    _validate_makefile_test_no_relink(
+        src_dir, violations, build_system=_build_system, language=_language
+    )
     return violations
 
 
