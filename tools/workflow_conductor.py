@@ -734,7 +734,8 @@ class Conductor:
 
     def _agent_run_json(self, refs: NodeRefs, phase: str, substep: str | None,
                         child_arid: str, status: str,
-                        output_refs: list[str]) -> dict[str, Any]:
+                        output_refs: list[str],
+                        result_summary: str | None = None) -> dict[str, Any]:
         payload: dict[str, Any] = {
             "agent_run_id": child_arid,
             "agent_role": child_agent_role(phase),
@@ -755,6 +756,11 @@ class Conductor:
             payload["substep"] = substep
         if status == "pass":
             payload["output_refs"] = output_refs
+        elif result_summary and result_summary.strip():
+            # A failed substep carries no output_refs, so _validate_agent_summary_text
+            # requires a summary/reason token; surface the leaf failure reason here so
+            # finalize-child produces a valid agent.summary.txt instead of crashing.
+            payload["result_summary"] = result_summary.strip()
         return payload
 
     def run_substep(self, refs: NodeRefs, phase: str, substep: str | None,
@@ -774,19 +780,56 @@ class Conductor:
         # (re)written during this child window, not stale files from a prior attempt.
         launched_at = time.time()
         proc = self.spawn_leaf(rec["launch_prompt_text"], self._child_env(child_arid))
+        # Persist the leaf's verbatim stdout/stderr durably (every run, pass or
+        # fail) so the LLM's actual response — including an infra failure message
+        # such as a token-limit abort — is never lost. These conductor-side writes
+        # land in the child's bookkeeping dir (not its allowed_output_paths) and are
+        # not hook-guarded, so they don't trip the output-manifest guard.
+        self._persist_leaf_output(child_arid, proc)
         token = self.read_parent_return_token(child_arid)
         status, output_refs = self.determine_substep_status(
             refs, phase, substep, request["allowed_output_paths"], min_mtime=launched_at)
         # A nonzero leaf exit (crash / transport failure) fails the substep even if
         # the expected artifacts happen to exist (e.g. stale outputs from a prior
         # attempt) — the process return code gates artifact-based success.
+        # EVERY non-pass status must carry a result_summary: a failed payload has no
+        # output_refs, so without one _validate_agent_summary_text rejects the
+        # auto-generated agent.summary.txt and finalize-child crashes. A nonzero exit
+        # uses the leaf's stderr tail; a returncode-0 content failure (verify/judge
+        # fail, missing deliverable) uses a generic tag — the detailed diagnostics
+        # live in the canonical artifacts (ir_meta/verdict.json) that classify_failure
+        # reads for routing.
+        result_summary: str | None = None
         if proc.returncode != 0:
             status = "fail"
+            result_summary = self._leaf_failure_summary(proc)
+        elif status != "pass":
+            result_summary = f"substep_fail: {phase}" + (f".{substep}" if substep else "")
         reply = f"status: {status}\noutput_refs: {len(output_refs)}\nleaf rc={proc.returncode}"
+        if result_summary:
+            reply += f"\nresult_summary: {result_summary}"
         self.finalize_child(
             child_arid, token, reply,
-            self._agent_run_json(refs, phase, substep, child_arid, status, output_refs))
-        return SubstepOutcome(child_arid, status, output_refs)
+            self._agent_run_json(refs, phase, substep, child_arid, status,
+                                 output_refs, result_summary))
+        return SubstepOutcome(child_arid, status, output_refs, proc.returncode)
+
+    def _persist_leaf_output(self, child_arid: str, proc: ProcResult,
+                             prefix: str = "leaf") -> None:
+        """Write the leaf process stdout/stderr to the child's dialogs dir."""
+        dialogs = (self.repo_root / "workspace" / "orchestrations" / self.orchestration_id
+                   / "agents" / child_arid / "dialogs")
+        dialogs.mkdir(parents=True, exist_ok=True)
+        (dialogs / f"{prefix}.stdout.log").write_text(proc.stdout or "", encoding="utf-8")
+        (dialogs / f"{prefix}.stderr.log").write_text(proc.stderr or "", encoding="utf-8")
+
+    @staticmethod
+    def _leaf_failure_summary(proc: ProcResult) -> str:
+        """A terse one-line reason from a failed leaf's output tail (stderr first,
+        else stdout), bounded so the reply/summary stays well under the budget."""
+        tail = (proc.stderr.strip() or proc.stdout.strip() or "")[-400:]
+        tail = " ".join(tail.split())
+        return f"leaf_exit={proc.returncode}; {tail}".strip()
 
     # -- phase + conduct ------------------------------------------------------
 
@@ -902,8 +945,20 @@ class Conductor:
                 f"workspace/orchestrations/{self.orchestration_id}"
                 f"/launches/{outcomes[-1].agent_run_id}.request.json")
         self.write_step_result(node_key, phase, executor, result)
-        decision = (RouteDecision("advance") if status == "pass"
-                    else self.classify_failure(refs, phase, outcomes))
+        if status == "pass":
+            decision = RouteDecision("advance")
+        else:
+            # A nonzero leaf exit is an infra/transport failure (token limit, OOM,
+            # transport) the decision tables cannot classify, and a diagnostician
+            # leaf would likely hit the same limit — route straight to fail_closed
+            # with the captured reason so the operator can --resume.
+            transport = next((oc for oc in outcomes if oc.leaf_returncode != 0), None)
+            if transport is not None:
+                decision = RouteDecision(
+                    "fail_closed",
+                    reason=f"leaf_transport_error: leaf_exit={transport.leaf_returncode}")
+            else:
+                decision = self.classify_failure(refs, phase, outcomes)
         return PhaseOutcome(phase, status, substep_arids, failed, decision)
 
     def _gather_failure_context(self, refs: NodeRefs, phase: str) -> dict[str, Any]:
@@ -934,6 +989,8 @@ class Conductor:
         prompt = _diagnosis_prompt(refs.node_key, phase, outcome.failed_substeps,
                                    context, self.workflow_mode)
         proc = self.spawn_leaf(prompt, self._child_env(self.orchestration_agent_run_id))
+        self._persist_leaf_output(self.orchestration_agent_run_id, proc,
+                                  prefix=f"diagnose.{phase}")
         decision = _parse_directive(proc.stdout)
         if decision is None:
             return RouteDecision("fail_closed", reason=f"{phase}_diagnose_unparsable")
@@ -992,8 +1049,14 @@ class Conductor:
             if decision.action == "escalate":
                 decision = self.escalate(refs, phase, outcome)
             if decision.action == "fail_closed":
-                self.set_status("fail_closed", reason_code=f"{phase}_fail",
-                                reason_detail=(decision.reason or "")[:200])
+                reason = decision.reason or ""
+                # Name a leaf transport/token-limit failure in the status code itself
+                # (not just reason_detail) so the terminal record is self-describing.
+                reason_code = ("leaf_transport_error"
+                               if reason.startswith("leaf_transport_error")
+                               else f"{phase}_fail")
+                self.set_status("fail_closed", reason_code=reason_code,
+                                reason_detail=reason[:200])
                 return "fail_closed"
 
             target = decision.target_phase or phase
@@ -1084,6 +1147,10 @@ class SubstepOutcome:
     agent_run_id: str
     status: str
     output_refs: list[str]
+    # The leaf process exit code. Nonzero is an infra/transport failure (token
+    # limit, OOM, transport) — not a content failure the decision tables can
+    # classify — so run_phase routes it straight to fail_closed.
+    leaf_returncode: int = 0
 
 
 @dataclass

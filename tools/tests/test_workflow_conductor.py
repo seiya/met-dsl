@@ -12,6 +12,7 @@ import glob
 import io
 import json
 import os
+import tempfile
 import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
@@ -211,7 +212,8 @@ class _FakeConductor(wc.Conductor):
             if flag in args:
                 captured[flag] = json.loads(args[args.index(flag) + 1])
         for flag in ("--node-key", "--step", "--agent-run-id", "--status",
-                     "--from-phase", "--reason", "--trigger-agent-run-id"):
+                     "--from-phase", "--reason", "--trigger-agent-run-id",
+                     "--reason-code", "--reason-detail"):
             if flag in args:
                 captured[flag] = args[args.index(flag) + 1]
         self.calls.append((sub, captured))
@@ -863,17 +865,126 @@ class LeafSpawnTest(unittest.TestCase):
         self.assertEqual(self._c(backend="codex").leaf_command("P"), ["codex", "exec", "P"])
 
     def test_nonzero_leaf_exit_fails_substep(self) -> None:
-        c = _FakeConductor(repo_root=Path("/tmp/repo"), orchestration_id="o",
-                           orchestration_agent_run_id="ORCH", backend="claude", env={})
-        c.calls = []
-        c.status_fn = lambda phase, substep, n: "pass"  # artifacts claim pass
-        c.spawn_leaf = lambda prompt, env: wc.ProcResult(1, "", "boom")  # but leaf crashed
-        refs = wc.NodeRefs(node_key="component/spec_x@0.1.0", spec_path="spec/component/spec_x",
-                           ir_id="x_1_001", pipeline_id="x_1_001")
-        status = c.conduct(refs, "compile")
-        self.assertIn(status, ("fail", "fail_closed"))
-        runs = [cap["--agent-run-json"] for s, cap in c.calls if s == "finalize-child"]
-        self.assertEqual(runs[0]["status"], "fail")  # returncode gate overrides artifact pass
+        with tempfile.TemporaryDirectory() as tmp:
+            c = _FakeConductor(repo_root=Path(tmp), orchestration_id="o",
+                               orchestration_agent_run_id="ORCH", backend="claude", env={})
+            c.calls = []
+            c.status_fn = lambda phase, substep, n: "pass"  # artifacts claim pass
+            # leaf crashed (e.g. token limit), emitting a diagnostic to stderr
+            c.spawn_leaf = lambda prompt, env: wc.ProcResult(1, "", "context limit exceeded")
+            refs = wc.NodeRefs(node_key="component/spec_x@0.1.0",
+                               spec_path="spec/component/spec_x",
+                               ir_id="x_1_001", pipeline_id="x_1_001")
+            status = c.conduct(refs, "compile")
+
+            # 1. a leaf transport failure routes straight to fail_closed (no diagnostician)
+            self.assertEqual(status, "fail_closed")
+            set_status = [cap for s, cap in c.calls if s == "set-status"][-1]
+            self.assertEqual(set_status["--status"], "fail_closed")
+
+            # 2. the fail summary carries result_summary so finalize-child won't crash,
+            #    and the returncode gate overrides the artifact "pass"
+            runs = [cap["--agent-run-json"] for s, cap in c.calls if s == "finalize-child"]
+            self.assertEqual(runs[0]["status"], "fail")
+            self.assertIn("context limit exceeded", runs[0]["result_summary"])
+            self.assertTrue(runs[0]["result_summary"].startswith("leaf_exit=1"))
+
+            # 3. the leaf's verbatim stderr is persisted durably (was lost before)
+            child = runs[0]["agent_run_id"]
+            stderr_log = (Path(tmp) / "workspace" / "orchestrations" / "o" / "agents"
+                          / child / "dialogs" / "leaf.stderr.log")
+            self.assertEqual(stderr_log.read_text(encoding="utf-8"), "context limit exceeded")
+
+    def test_set_status_reason_code_names_leaf_transport(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            c = _FakeConductor(repo_root=Path(tmp), orchestration_id="o",
+                               orchestration_agent_run_id="ORCH", backend="claude", env={})
+            c.calls = []
+            c.spawn_leaf = lambda prompt, env: wc.ProcResult(1, "", "boom")
+            refs = wc.NodeRefs(node_key="component/spec_x@0.1.0",
+                               spec_path="spec/component/spec_x",
+                               ir_id="x_1_001", pipeline_id="x_1_001")
+            c.conduct(refs, "compile")
+            set_status = [cap for s, cap in c.calls if s == "set-status"][-1]
+            self.assertEqual(set_status["--status"], "fail_closed")
+            self.assertEqual(set_status["--reason-code"], "leaf_transport_error")
+            self.assertIn("leaf_transport_error", set_status["--reason-detail"])
+
+    def test_leaf_stdout_persisted_on_success(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            c = _FakeConductor(repo_root=Path(tmp), orchestration_id="o",
+                               orchestration_agent_run_id="ORCH", backend="claude", env={})
+            c.calls = []
+            c.spawn_leaf = lambda prompt, env: wc.ProcResult(0, "all good", "")
+            refs = wc.NodeRefs(node_key="component/spec_x@0.1.0",
+                               spec_path="spec/component/spec_x",
+                               ir_id="x_1_001", pipeline_id="x_1_001")
+            c.conduct(refs, "compile")
+            runs = [cap["--agent-run-json"] for s, cap in c.calls if s == "finalize-child"]
+            child = runs[0]["agent_run_id"]
+            stdout_log = (Path(tmp) / "workspace" / "orchestrations" / "o" / "agents"
+                          / child / "dialogs" / "leaf.stdout.log")
+            self.assertEqual(stdout_log.read_text(encoding="utf-8"), "all good")
+            # a passing substep carries no result_summary
+            self.assertNotIn("result_summary", runs[0])
+
+
+class FailSummaryContractTest(unittest.TestCase):
+    """Every non-pass substep payload must satisfy the REAL runtime summary
+    validator so finalize-child never crashes (the bug that aborted runs as
+    conductor_error). The other tests stub runtime(), so these feed the produced
+    payload through orchestration_runtime's actual validator end-to-end."""
+
+    def _run_one_substep(self, proc, status_fn, phase="compile", substep="verify"):
+        import tools.orchestration_runtime as rt
+        with tempfile.TemporaryDirectory() as tmp:
+            c = _FakeConductor(repo_root=Path(tmp), orchestration_id="o",
+                               orchestration_agent_run_id="ORCH", backend="claude", env={})
+            c.calls = []
+            c.status_fn = status_fn
+            c.spawn_leaf = lambda prompt, env: proc
+            refs = wc.NodeRefs(node_key="component/spec_x@0.1.0",
+                               spec_path="spec/component/spec_x",
+                               ir_id="x_1_001", pipeline_id="x_1_001")
+            oc = c.run_substep(refs, phase, substep)
+            payload = [cap["--agent-run-json"] for s, cap in c.calls
+                       if s == "finalize-child"][0]
+        text = rt._extract_agent_summary_text(payload)
+        rt._validate_agent_summary_text(payload, text)  # must NOT raise
+        return oc, payload, text
+
+    def test_nonzero_exit_payload_passes_real_validator(self) -> None:
+        oc, payload, text = self._run_one_substep(
+            wc.ProcResult(1, "", "context limit exceeded"), lambda p, s, n: "pass")
+        self.assertEqual(payload["status"], "fail")
+        self.assertIn("context limit exceeded", payload["result_summary"])
+        self.assertIn("result_summary:", text)
+
+    def test_returncode0_content_fail_payload_passes_real_validator(self) -> None:
+        # The path the first fix missed: leaf exited 0 but artifacts say fail.
+        oc, payload, text = self._run_one_substep(
+            wc.ProcResult(0, "ok", ""), lambda p, s, n: "fail")
+        self.assertEqual(oc.leaf_returncode, 0)
+        self.assertEqual(payload["status"], "fail")
+        self.assertEqual(payload["result_summary"], "substep_fail: compile.verify")
+        self.assertIn("result_summary:", text)
+
+    def test_build_phase_substep_none_content_fail_validates(self) -> None:
+        # Build is a single step with substep=None: exercise the `if substep else ""`
+        # branch so the generic tag stays `substep_fail: build` (not `build.None`).
+        oc, payload, text = self._run_one_substep(
+            wc.ProcResult(0, "ok", ""), lambda p, s, n: "fail",
+            phase="build", substep=None)
+        self.assertEqual(payload["status"], "fail")
+        self.assertEqual(payload["result_summary"], "substep_fail: build")
+        self.assertIn("result_summary:", text)
+
+    def test_pass_payload_carries_output_refs_not_summary(self) -> None:
+        oc, payload, text = self._run_one_substep(
+            wc.ProcResult(0, "ok", ""), lambda p, s, n: "pass")
+        self.assertEqual(payload["status"], "pass")
+        self.assertNotIn("result_summary", payload)
+        self.assertIn("output_refs:", text)
 
 
 if __name__ == "__main__":  # pragma: no cover
