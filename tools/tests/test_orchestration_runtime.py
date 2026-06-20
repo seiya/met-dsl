@@ -24994,9 +24994,14 @@ class ChildContextDocSizeTests(unittest.TestCase):
         "docs/AGENT_CONTRACT.md": 16800,
         "docs/workflow/MCP_COMMAND_LOG_PLACEMENT.md": 21000,
         "docs/workflow/phases/phase_01_compile.md": 17000,
-        "docs/workflow/phases/phase_02_generate.md": 21500,
-        "docs/workflow/phases/phase_03_build.md": 8000,
-        "docs/workflow/phases/phase_04_validate.md": 19000,
+        # phase_02/03/04 bumps: 5378cfc ("Refine build and validation processes
+        # for Fortran and C/C++ toolchains") added the necessary non-relink
+        # Makefile / out-of-source / toolchain contract text (prevents the
+        # Validate.execute relink unauthorized-write that forced reopen_seq=2).
+        # Justified bumps over the prior 21500 / 8000 / 19000.
+        "docs/workflow/phases/phase_02_generate.md": 22000,
+        "docs/workflow/phases/phase_03_build.md": 8200,
+        "docs/workflow/phases/phase_04_validate.md": 19500,
     }
 
     def test_child_context_docs_within_budget(self) -> None:
