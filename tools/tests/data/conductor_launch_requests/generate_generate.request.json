@@ -1,0 +1,30 @@
+{
+ "agent_role": "substep",
+ "node_key": "component/dynamics_advdiff_flux_1d_upwind_center2@0.1.0",
+ "step": "generate",
+ "substep": "generate",
+ "orchestration_id": "orch_20260619T113225Z_f48fe14b",
+ "agent_run_id": "5ee9e8d8-7970-42f5-9d09-97b84bea5c55",
+ "parent_agent_run_id": "55536416-6b56-40d6-b764-995588145c52",
+ "agent_model": "claude-opus-4-8",
+ "workflow_mode": "dev",
+ "source_id": "src_20260620_002",
+ "ir_ref": "workspace/ir/component__dynamics_advdiff_flux_1d_upwind_center2__0.1.0/advdiff-flux-1d-uc2_20260620_001",
+ "pipeline_ref": "workspace/pipelines/component__dynamics_advdiff_flux_1d_upwind_center2__0.1.0/advdiff-flux-1d-uc2_20260620_002",
+ "dependency_ref": "workspace/ir/component__dynamics_advdiff_flux_1d_upwind_center2__0.1.0/advdiff-flux-1d-uc2_20260620_001",
+ "skill_name": "workflow-generate-generate",
+ "skill_ref": "skills/workflow-generate-generate/SKILL.md",
+ "skill_must_read_refs": "skills/workflow-generate-generate/SKILL.md,docs/workflow/WORKFLOW_CORE.md,docs/ORCHESTRATION.md,docs/workflow/phases/phase_02_generate.md,docs/workflow/phases/phase_03_build.md,docs/workflow/MCP_COMMAND_LOG_PLACEMENT.md,workspace/ir/component__dynamics_advdiff_flux_1d_upwind_center2__0.1.0/advdiff-flux-1d-uc2_20260620_001/spec.ir.yaml,spec/component/dynamics/advection_diffusion/dynamics_advdiff_flux_1d_upwind_center2/controlled_spec.md,spec/component/dynamics/advection_diffusion/dynamics_advdiff_flux_1d_upwind_center2/tests.md",
+ "issue_severity": "critical",
+ "repair_strategy": "restart",
+ "repair_target_agent_run_id": "d870e12d-86bf-4ef4-8785-1734e83f3584",
+ "repair_reason": "Prior generate (d870e12d) had two code defects that must both be fixed. (1) Makefile binary-name mismatch: line 10 hard-assigns non-overridable `BIN = dynamics_advdiff_flux_1d_upwind_center2_runner`, but Build records the canonical binary as `advdiff_flux_1d_uc2` (the pipeline slug advdiff-flux-1d-uc2 underscored). During Validate.execute the test target guard `test -x $(BINDIR)/$(BIN)` cannot find that name and RELINKS a fresh binary into the read-only canonical binary dir => unauthorized write => fail_closed. Fix: make the Makefile output binary name consistent end-to-end with the canonical name Build records — set the default BIN to `advdiff_flux_1d_uc2` (and/or make it overridable `BIN ?=` AND ensure the test/run target never relinks an already-built binary). Follow docs/workflow/phases/phase_03_build.md and docs/workflow/MCP_COMMAND_LOG_PLACEMENT.md for the canonical binary-naming and cross-phase Make-rule contract. (2) Runner l0_invalid_a (a<=0) sets guard_ok=true and omits input_guard from verdict.failed_checks; tests.md sec6 l0_invalid_a_xfail pass_when requires verdict.overall==fail with input_guard present in failed_checks. Fix the runner so the a<=0 case reports verdict.overall=fail with input_guard in failed_checks per tests.md sec6/sec7. The compile io_contract in ir advdiff-flux-1d-uc2_20260620_001 is the reference per-case verdict design.",
+ "allowed_output_paths": [
+  "workspace/pipelines/component__dynamics_advdiff_flux_1d_upwind_center2__0.1.0/advdiff-flux-1d-uc2_20260620_002/source/src_20260620_002/src/dynamics_advdiff_flux_1d_upwind_center2_model.f90",
+  "workspace/pipelines/component__dynamics_advdiff_flux_1d_upwind_center2__0.1.0/advdiff-flux-1d-uc2_20260620_002/source/src_20260620_002/src/dynamics_advdiff_flux_1d_upwind_center2_runner.f90",
+  "workspace/pipelines/component__dynamics_advdiff_flux_1d_upwind_center2__0.1.0/advdiff-flux-1d-uc2_20260620_002/source/src_20260620_002/src/Makefile",
+  "workspace/pipelines/component__dynamics_advdiff_flux_1d_upwind_center2__0.1.0/advdiff-flux-1d-uc2_20260620_002/source/src_20260620_002/src/mcp_command_log.jsonl",
+  "workspace/pipelines/component__dynamics_advdiff_flux_1d_upwind_center2__0.1.0/advdiff-flux-1d-uc2_20260620_002/source/src_20260620_002/source_meta.json",
+  "workspace/pipelines/component__dynamics_advdiff_flux_1d_upwind_center2__0.1.0/advdiff-flux-1d-uc2_20260620_002/lineage.json"
+ ]
+}

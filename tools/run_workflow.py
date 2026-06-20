@@ -262,6 +262,14 @@ def _read_json_if_exists(path: Path) -> dict[str, Any] | None:
     return payload if isinstance(payload, dict) else None
 
 
+def _orchestration_used_conductor(repo_root: Path, orchestration_id: str) -> bool:
+    """True when the orchestration was driven by the deterministic conductor
+    (run_conductor writes an orchestrator marker), so --resume restores the driver."""
+    marker = _read_json_if_exists(
+        repo_root / "workspace" / "orchestrations" / orchestration_id / "orchestrator.json")
+    return isinstance(marker, dict) and marker.get("orchestrator") == "conductor"
+
+
 def _read_jsonl(path: Path) -> list[dict[str, Any]]:
     if not path.exists():
         return []
@@ -876,6 +884,18 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
         action="store_false",
         help="Prepare orchestration artifacts only; do not invoke the LLM command.",
     )
+    parser.add_argument(
+        "--orchestrator",
+        choices=("llm", "conductor"),
+        default=None,
+        help=(
+            "Orchestration driver. 'llm' (default): spawn an LLM orchestration agent "
+            "to drive the phase loop. 'conductor': drive the deterministic phase/substep "
+            "loop in Python (tools/workflow_conductor.py), invoking the LLM only as a "
+            "leaf for each substep body — removes the parent orchestration LLM's "
+            "per-turn cache_read overhead. See docs/design/deterministic_conductor.md."
+        ),
+    )
     return parser.parse_args(argv)
 
 
@@ -920,6 +940,7 @@ def main(argv: list[str] | None = None) -> int:
     resume_recovered_dep_ref: str | None = None
     resume_recovered_llm: str | None = None
     resume_recovered_llm_command: str | None = None
+    resume_recovered_orchestrator: str | None = None
     if resume_mode:
         explicit_id = bool(args.orchestration_id)
         orchestration_id = args.orchestration_id or _find_latest_orchestration(repo_root)
@@ -961,6 +982,10 @@ def main(argv: list[str] | None = None) -> int:
                 )
                 return 2
         recovered = _load_resume_params(repo_root, orchestration_id)
+        # Restore the orchestration driver: a conductor-driven run leaves a marker,
+        # so a plain `--resume` does not silently fall back to the LLM orchestrator.
+        if _orchestration_used_conductor(repo_root, orchestration_id):
+            resume_recovered_orchestrator = "conductor"
         spec_ref_arg = args.spec_ref
         until_phase_arg = args.until_phase
         # A lone positional is ambiguous on resume: argparse binds it to spec_ref,
@@ -1015,12 +1040,23 @@ def main(argv: list[str] | None = None) -> int:
         llm_in = args.llm or DEFAULT_LLM
         mode_in = args.mode or DEFAULT_WORKFLOW_MODE
 
+    # Effective orchestration driver: explicit --orchestrator wins; otherwise on
+    # --resume restore the original run's driver (from its marker); else default llm.
+    orchestrator = args.orchestrator or resume_recovered_orchestrator or "llm"
+
     try:
         workflow_mode = _normalize_workflow_mode(mode_in)
         if not until_phase_in:
             raise ValueError("until_phase is required unless --resume is set")
         until_phase = _normalize_phase(until_phase_in)
         llm = llm_in
+        # The deterministic conductor only has a leaf launcher for claude/codex;
+        # reject an unsupported backend up front instead of failing at the first
+        # substep after init/preflight already created the orchestration.
+        if orchestrator == "conductor" and llm not in ("claude", "codex"):
+            raise ValueError(
+                f"--orchestrator conductor supports --llm claude|codex, not {llm!r}"
+            )
         # Reuse the recovered agent command unless --llm-command was given or the
         # backend actually changed; restating the same --llm must keep the command.
         if args.llm_command:
@@ -1103,6 +1139,10 @@ def main(argv: list[str] | None = None) -> int:
     base_env["METDSL_WORKFLOW_MODE"] = "1"
     base_env["METDSL_WORKFLOW_EXEC_MODE"] = workflow_mode
     base_env["METDSL_MISSING_ORCHESTRATION_ID_POLICY"] = "strict"
+    # Orchestration driver selector, read back in _run_node. Carried via base_env
+    # (rather than threaded through every _run_node / dependency-closure call site)
+    # to keep the wiring localized; it is a harmless no-op in child subprocess env.
+    base_env["METDSL_ORCHESTRATOR"] = orchestrator
     base_env["PYTHONPATH"] = str(repo_root) + (
         f":{base_env['PYTHONPATH']}" if base_env.get("PYTHONPATH") else ""
     )
@@ -1357,7 +1397,55 @@ def _run_node(
         launched = False
         workflow_status = "running"
         cli_returncode_warning: int | None = None
-        if invoke_llm:
+        if invoke_llm and env.get("METDSL_ORCHESTRATOR") == "conductor":
+            # Deterministic conductor: drive the phase loop in Python (no parent
+            # orchestration LLM). The leaf substeps are spawned by the conductor.
+            from tools.workflow_conductor import run_conductor
+
+            try:
+                workflow_status = run_conductor(
+                    repo_root=repo_root,
+                    orchestration_id=orchestration_id,
+                    orchestration_agent_run_id=orchestration_agent_run_id,
+                    spec_ref=spec_ref,
+                    source_dependency_ref=source_dependency_ref,
+                    until_phase=until_phase,
+                    backend=llm,
+                    agent_model=agent_model or "",
+                    workflow_mode=workflow_mode,
+                    env=env,
+                    llm_command=llm_command,
+                    resume=resume_mode,
+                )
+            except Exception as exc:  # noqa: BLE001 - terminalize on conductor error
+                _runtime_command(
+                    repo_root, env,
+                    ["set-status", "--repo-root", str(repo_root), "--orchestration-id",
+                     orchestration_id, "--status", "fail", "--reason-code",
+                     "conductor_error", "--reason-detail", str(exc)[:200]],
+                )
+                print(json.dumps(
+                    {"status": "fail", "reason": "conductor_error", "detail": str(exc),
+                     "orchestration_id": orchestration_id}, ensure_ascii=False))
+                return 2
+            launched = True
+            # The conductor terminalizes meta itself. The LLM-path failure-reporting
+            # block below is skipped for the conductor, so report a non-pass terminal
+            # here and exit nonzero (otherwise a failed run falls through to the
+            # generic ok output with exit 0).
+            if workflow_status.strip().lower() != "pass":
+                fail_output: dict[str, Any] = {
+                    "status": "fail",
+                    "reason": "workflow_failed",
+                    "orchestration_id": orchestration_id,
+                    "workflow_mode": workflow_mode,
+                    "workflow_status": workflow_status,
+                }
+                if extra_output:
+                    fail_output.update(extra_output)
+                print(json.dumps(fail_output, ensure_ascii=False))
+                return 2
+        elif invoke_llm:
             launch_command, launch_input = _launch_command_and_input(
                 llm=llm,
                 llm_command=llm_command,

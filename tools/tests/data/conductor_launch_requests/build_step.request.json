@@ -1,0 +1,27 @@
+{
+ "agent_role": "step",
+ "node_key": "component/dynamics_advdiff_flux_1d_upwind_center2@0.1.0",
+ "step": "build",
+ "orchestration_id": "orch_20260619T113225Z_f48fe14b",
+ "agent_run_id": "112a49b1-666d-4532-affe-df8f6488a9a5",
+ "parent_agent_run_id": "55536416-6b56-40d6-b764-995588145c52",
+ "agent_model": "claude-opus-4-8",
+ "workflow_mode": "dev",
+ "source_id": "src_20260620_002",
+ "binary_id": "bin_20260620_002",
+ "ir_ref": "workspace/ir/component__dynamics_advdiff_flux_1d_upwind_center2__0.1.0/advdiff-flux-1d-uc2_20260620_001",
+ "pipeline_ref": "workspace/pipelines/component__dynamics_advdiff_flux_1d_upwind_center2__0.1.0/advdiff-flux-1d-uc2_20260620_002",
+ "dependency_ref": "workspace/pipelines/component__dynamics_advdiff_flux_1d_upwind_center2__0.1.0/advdiff-flux-1d-uc2_20260620_002",
+ "skill_name": "workflow-build",
+ "skill_ref": "skills/workflow-build/SKILL.md",
+ "skill_must_read_refs": "skills/workflow-build/SKILL.md,docs/workflow/WORKFLOW_CORE.md,docs/ORCHESTRATION.md,docs/workflow/phases/phase_03_build.md,workspace/ir/component__dynamics_advdiff_flux_1d_upwind_center2__0.1.0/advdiff-flux-1d-uc2_20260620_001/spec.ir.yaml,workspace/pipelines/component__dynamics_advdiff_flux_1d_upwind_center2__0.1.0/advdiff-flux-1d-uc2_20260620_002/source/src_20260620_002/source_meta.json",
+ "allowed_output_paths": [
+  "workspace/pipelines/component__dynamics_advdiff_flux_1d_upwind_center2__0.1.0/advdiff-flux-1d-uc2_20260620_002/binary/bin_20260620_002/bin/dynamics_advdiff_flux_1d_upwind_center2_runner",
+  "workspace/pipelines/component__dynamics_advdiff_flux_1d_upwind_center2__0.1.0/advdiff-flux-1d-uc2_20260620_002/binary/bin_20260620_002/binary_meta.json",
+  "workspace/pipelines/component__dynamics_advdiff_flux_1d_upwind_center2__0.1.0/advdiff-flux-1d-uc2_20260620_002/binary/bin_20260620_002/mcp_command_log.jsonl"
+ ],
+ "issue_severity": "none",
+ "repair_strategy": "none",
+ "repair_target_agent_run_id": "none",
+ "repair_reason": "none"
+}

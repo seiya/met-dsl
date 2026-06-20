@@ -1,0 +1,29 @@
+{
+ "agent_role": "substep",
+ "node_key": "component/dynamics_advdiff_flux_1d_upwind_center2@0.1.0",
+ "step": "validate",
+ "substep": "judge",
+ "orchestration_id": "orch_20260619T113225Z_f48fe14b",
+ "agent_run_id": "00855079-3b3c-445a-bae3-7c7c37c166b9",
+ "parent_agent_run_id": "55536416-6b56-40d6-b764-995588145c52",
+ "agent_model": "claude-opus-4-8",
+ "workflow_mode": "dev",
+ "run_id": "run_20260620_002",
+ "ir_ref": "workspace/ir/component__dynamics_advdiff_flux_1d_upwind_center2__0.1.0/advdiff-flux-1d-uc2_20260620_001",
+ "pipeline_ref": "workspace/pipelines/component__dynamics_advdiff_flux_1d_upwind_center2__0.1.0/advdiff-flux-1d-uc2_20260620_002",
+ "dependency_ref": "workspace/pipelines/component__dynamics_advdiff_flux_1d_upwind_center2__0.1.0/advdiff-flux-1d-uc2_20260620_002",
+ "skill_name": "workflow-validate-judge",
+ "skill_ref": "skills/workflow-validate-judge/SKILL.md",
+ "skill_must_read_refs": "skills/workflow-validate-judge/SKILL.md,docs/workflow/WORKFLOW_CORE.md,docs/ORCHESTRATION.md,docs/workflow/phases/phase_04_validate.md,workspace/ir/component__dynamics_advdiff_flux_1d_upwind_center2__0.1.0/advdiff-flux-1d-uc2_20260620_001/spec.ir.yaml,workspace/pipelines/component__dynamics_advdiff_flux_1d_upwind_center2__0.1.0/advdiff-flux-1d-uc2_20260620_002/source/src_20260620_002/source_meta.json,workspace/pipelines/component__dynamics_advdiff_flux_1d_upwind_center2__0.1.0/advdiff-flux-1d-uc2_20260620_002/binary/bin_20260620_002/binary_meta.json,spec/component/dynamics/advection_diffusion/dynamics_advdiff_flux_1d_upwind_center2/tests.md",
+ "allowed_output_paths": [
+  "workspace/pipelines/component__dynamics_advdiff_flux_1d_upwind_center2__0.1.0/advdiff-flux-1d-uc2_20260620_002/runs/run_20260620_002/component__dynamics_advdiff_flux_1d_upwind_center2__0.1.0/semantic_review.json",
+  "workspace/pipelines/component__dynamics_advdiff_flux_1d_upwind_center2__0.1.0/advdiff-flux-1d-uc2_20260620_002/runs/run_20260620_002/component__dynamics_advdiff_flux_1d_upwind_center2__0.1.0/verdict.json",
+  "workspace/pipelines/component__dynamics_advdiff_flux_1d_upwind_center2__0.1.0/advdiff-flux-1d-uc2_20260620_002/runs/run_20260620_002/component__dynamics_advdiff_flux_1d_upwind_center2__0.1.0/aggregate_verdict.json",
+  "workspace/pipelines/component__dynamics_advdiff_flux_1d_upwind_center2__0.1.0/advdiff-flux-1d-uc2_20260620_002/runs/run_20260620_002/component__dynamics_advdiff_flux_1d_upwind_center2__0.1.0/summary.json",
+  "workspace/pipelines/component__dynamics_advdiff_flux_1d_upwind_center2__0.1.0/advdiff-flux-1d-uc2_20260620_002/runs/run_20260620_002/component__dynamics_advdiff_flux_1d_upwind_center2__0.1.0/validate_meta.json"
+ ],
+ "issue_severity": "none",
+ "repair_strategy": "none",
+ "repair_target_agent_run_id": "none",
+ "repair_reason": "none"
+}

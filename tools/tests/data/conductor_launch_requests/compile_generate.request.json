@@ -1,0 +1,25 @@
+{
+ "agent_role": "substep",
+ "node_key": "component/dynamics_advdiff_flux_1d_upwind_center2@0.1.0",
+ "step": "compile",
+ "substep": "generate",
+ "orchestration_id": "orch_20260619T113225Z_f48fe14b",
+ "agent_run_id": "4995869d-3e76-4dc3-b502-3063e6ee936f",
+ "parent_agent_run_id": "55536416-6b56-40d6-b764-995588145c52",
+ "agent_model": "claude-opus-4-8",
+ "workflow_mode": "dev",
+ "ir_ref": "workspace/ir/component__dynamics_advdiff_flux_1d_upwind_center2__0.1.0/advdiff-flux-1d-uc2_20260620_001",
+ "pipeline_ref": "workspace/pipelines/component__dynamics_advdiff_flux_1d_upwind_center2__0.1.0/advdiff-flux-1d-uc2_20260620_001",
+ "dependency_ref": "spec/component/dynamics/advection_diffusion/dynamics_advdiff_flux_1d_upwind_center2/deps.yaml",
+ "skill_name": "workflow-compile-generate",
+ "skill_ref": "skills/workflow-compile-generate/SKILL.md",
+ "skill_must_read_refs": "skills/workflow-compile-generate/SKILL.md,docs/workflow/WORKFLOW_CORE.md,docs/ORCHESTRATION.md,docs/workflow/phases/phase_01_compile.md,spec/component/dynamics/advection_diffusion/dynamics_advdiff_flux_1d_upwind_center2/controlled_spec.md,spec/component/dynamics/advection_diffusion/dynamics_advdiff_flux_1d_upwind_center2/tests.md,spec/component/dynamics/advection_diffusion/dynamics_advdiff_flux_1d_upwind_center2/deps.yaml",
+ "allowed_output_paths": [
+  "workspace/ir/component__dynamics_advdiff_flux_1d_upwind_center2__0.1.0/advdiff-flux-1d-uc2_20260620_001/spec.ir.yaml",
+  "workspace/ir/component__dynamics_advdiff_flux_1d_upwind_center2__0.1.0/advdiff-flux-1d-uc2_20260620_001/ir_meta.json"
+ ],
+ "issue_severity": "none",
+ "repair_strategy": "none",
+ "repair_target_agent_run_id": "none",
+ "repair_reason": "none"
+}
