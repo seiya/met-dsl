@@ -72,6 +72,8 @@ from tools.orchestration_runtime import (
     repair_all_step_result_executors,
     reopen_phase,
     _load_superseded_run_ids,
+    _load_invalid_run_records,
+    _derive_unauthorized_write_resume_directive,
     _node_key_to_safe,
     _validate_orchestration_completion_for_pass,
     reserve_phase_root,
@@ -25237,6 +25239,234 @@ class ReopenPhaseTest(unittest.TestCase):
                     reason="x", trigger_agent_run_id="no-such-arid",
                 )
 
+    def _inject_invalid_unauthorized_run(
+        self,
+        root: Path,
+        arid: str,
+        *,
+        step: str,
+        substep: str | None = None,
+        with_violation: bool = True,
+    ) -> None:
+        """Divert a terminal `fail` step/substep run to agent_runs_invalid.jsonl
+        (as record_agent_run does on an unauthorized-write reject) and optionally
+        write the authoritative unauthorized_write_violation.json marker."""
+        row = {
+            "agent_run_id": arid,
+            "agent_role": "substep" if substep else "step",
+            "step": step,
+            "status": "fail",
+            "node_key": self.NODE_KEY,
+            "fail_reason": "terminal_payload_validation_error",
+        }
+        if substep:
+            row["substep"] = substep
+        with (root / "agent_runs_invalid.jsonl").open("a", encoding="utf-8") as f:
+            f.write(json.dumps(row) + "\n")
+        if with_violation:
+            vdir = root / "violations"
+            vdir.mkdir(parents=True, exist_ok=True)
+            (vdir / f"{arid}.unauthorized_write_violation.json").write_text(
+                json.dumps({
+                    "kind": "unauthorized_write_violation",
+                    "agent_run_id": arid,
+                    "actor_role": row["agent_role"],
+                    "unauthorized_paths": ["workspace/pipelines/p/binary/bin_x/runner"],
+                }),
+                encoding="utf-8",
+            )
+
+    def test_reopen_accepts_invalid_log_trigger_with_violation(self) -> None:
+        """A downstream run whose failure mode IS an unauthorized write lands only
+        in agent_runs_invalid.jsonl; reopen accepts it as a trigger when a matching
+        violation file exists."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            oid = "orch_reopen_invalid_trigger"
+            arids = self._build_fixture(repo_root, oid)
+            root = repo_root / "workspace" / "orchestrations" / oid
+            self._inject_invalid_unauthorized_run(
+                root, "validate-exec-unauth", step="validate", substep="execute",
+            )
+
+            result = reopen_phase(
+                repo_root, oid, node_key=self.NODE_KEY, from_phase="generate",
+                reason="unauthorized_write validate.execute -> reopen generate",
+                trigger_agent_run_id="validate-exec-unauth",
+            )
+            self.assertEqual(result["status"], "reopened")
+            self.assertEqual(result["trigger_source"], "agent_runs_invalid")
+            self.assertEqual(result["affected_phases"], ["generate", "build", "validate"])
+            # The invalid-log trigger is recorded as superseded for idempotency.
+            self.assertIn("validate-exec-unauth", _load_superseded_run_ids(repo_root, oid))
+
+    def test_reopen_rejects_invalid_log_trigger_without_violation(self) -> None:
+        """An invalid-log entry with NO violation file is not an unauthorized-write
+        reject and must not be accepted as a trigger."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            oid = "orch_reopen_invalid_noviol"
+            arids = self._build_fixture(repo_root, oid)
+            root = repo_root / "workspace" / "orchestrations" / oid
+            self._inject_invalid_unauthorized_run(
+                root, "validate-exec-sandbox", step="validate", substep="execute",
+                with_violation=False,
+            )
+            with self.assertRaises(RuntimeError):
+                reopen_phase(
+                    repo_root, oid, node_key=self.NODE_KEY, from_phase="generate",
+                    reason="x", trigger_agent_run_id="validate-exec-sandbox",
+                )
+
+    def test_reopen_invalid_log_trigger_is_idempotent(self) -> None:
+        """A second reopen with the same invalid-log trigger is a no-op (the trigger
+        was persisted into superseded_runs.json on the first call)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            oid = "orch_reopen_invalid_idem"
+            arids = self._build_fixture(repo_root, oid)
+            root = repo_root / "workspace" / "orchestrations" / oid
+            self._inject_invalid_unauthorized_run(
+                root, "validate-exec-unauth", step="validate", substep="execute",
+            )
+            first = reopen_phase(
+                repo_root, oid, node_key=self.NODE_KEY, from_phase="generate",
+                reason="x", trigger_agent_run_id="validate-exec-unauth",
+            )
+            self.assertEqual(first["status"], "reopened")
+            second = reopen_phase(
+                repo_root, oid, node_key=self.NODE_KEY, from_phase="generate",
+                reason="x", trigger_agent_run_id="validate-exec-unauth",
+            )
+            self.assertEqual(second["status"], "noop")
+
+    def test_derive_unauthorized_write_resume_directive(self) -> None:
+        """The resume directive points reopen at the invalid-log trigger and maps
+        the attribution (code (Generate)) to reopen_from=generate; a non-mapping
+        attribution yields None."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            oid = "orch_resume_directive"
+            arids = self._build_fixture(repo_root, oid)
+            root = repo_root / "workspace" / "orchestrations" / oid
+            self._inject_invalid_unauthorized_run(
+                root, "validate-exec-unauth", step="validate", substep="execute",
+            )
+            (root / "failure_analysis.json").write_text(
+                json.dumps({
+                    "node_key": self.NODE_KEY,
+                    "root_cause": {"attribution": "code (Generate)"},
+                }),
+                encoding="utf-8",
+            )
+            directive = _derive_unauthorized_write_resume_directive(
+                repo_root, oid, "noncanonical_phase_write_attempt")
+            self.assertEqual(directive["reopen_from"], "generate")
+            self.assertEqual(directive["trigger_agent_run_id"], "validate-exec-unauth")
+            self.assertEqual(directive["node_key"], self.NODE_KEY)
+            self.assertEqual(directive["source"], "agent_runs_invalid.unauthorized_write")
+
+            # No attribution that maps to an upstream phase -> None (agent falls back).
+            (root / "failure_analysis.json").write_text(
+                json.dumps({"node_key": self.NODE_KEY, "root_cause": {"attribution": "infra"}}),
+                encoding="utf-8",
+            )
+            self.assertIsNone(_derive_unauthorized_write_resume_directive(
+                repo_root, oid, "noncanonical_phase_write_attempt"))
+
+    def test_derive_resume_directive_gated_on_current_reason(self) -> None:
+        """A resume whose CURRENT failure is unrelated must not emit a stale directive
+        off a leftover violation-backed invalid row + code attribution."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            oid = "orch_resume_directive_gate"
+            arids = self._build_fixture(repo_root, oid)
+            root = repo_root / "workspace" / "orchestrations" / oid
+            self._inject_invalid_unauthorized_run(
+                root, "validate-exec-unauth", step="validate", substep="execute",
+            )
+            (root / "failure_analysis.json").write_text(
+                json.dumps({"node_key": self.NODE_KEY,
+                            "root_cause": {"attribution": "code (Generate)"}}),
+                encoding="utf-8",
+            )
+            # Current terminal reason is NOT an unauthorized write -> None.
+            self.assertIsNone(_derive_unauthorized_write_resume_directive(
+                repo_root, oid, "sandbox_enforcement_violation"))
+            self.assertIsNone(_derive_unauthorized_write_resume_directive(repo_root, oid, None))
+            # The unauthorized-write reason DOES fire.
+            self.assertIsNotNone(_derive_unauthorized_write_resume_directive(
+                repo_root, oid, "noncanonical_phase_write_attempt"))
+
+    def test_derive_resume_directive_ignores_consumed_invalid_trigger(self) -> None:
+        """Repeated unauthorized-write retry: a prior consumed (superseded) invalid
+        trigger plus a new one must NOT suppress the directive — the consumed one is
+        ignored and the directive points at the latest un-consumed trigger."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            oid = "orch_resume_directive_repeat"
+            arids = self._build_fixture(repo_root, oid)
+            root = repo_root / "workspace" / "orchestrations" / oid
+            # Prior attempt already consumed by an earlier reopen (superseded), plus
+            # the current failure that has not been consumed yet.
+            self._inject_invalid_unauthorized_run(
+                root, "validate-exec-prior", step="validate", substep="execute",
+            )
+            self._inject_invalid_unauthorized_run(
+                root, "validate-exec-new", step="validate", substep="execute",
+            )
+            (root / "reopen").mkdir(exist_ok=True)
+            (root / "reopen" / "superseded_runs.json").write_text(
+                json.dumps({"orchestration_id": oid,
+                            "superseded_agent_run_ids": ["validate-exec-prior"]}),
+                encoding="utf-8",
+            )
+            (root / "failure_analysis.json").write_text(
+                json.dumps({"node_key": self.NODE_KEY,
+                            "root_cause": {"attribution": "code (Generate)"}}),
+                encoding="utf-8",
+            )
+            directive = _derive_unauthorized_write_resume_directive(
+                repo_root, oid, "noncanonical_phase_write_attempt")
+            self.assertIsNotNone(directive)
+            self.assertEqual(directive["trigger_agent_run_id"], "validate-exec-new")
+            self.assertEqual(directive["reopen_from"], "generate")
+
+    def test_derive_resume_directive_ignores_recovered_invalid_row(self) -> None:
+        """A prior unauthorized-write arid retried to success with the SAME arid leaves
+        a stale invalid-log row + violation file, but now has a canonical agent_runs.jsonl
+        record. It must be ignored so it does not inflate the count and suppress the
+        directive for the current (invalid-only) failure."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            oid = "orch_resume_directive_recovered"
+            arids = self._build_fixture(repo_root, oid)
+            root = repo_root / "workspace" / "orchestrations" / oid
+            # Stale: an invalid row + violation for an arid that later succeeded under
+            # the same arid (so it now also has a canonical agent_runs.jsonl row).
+            self._inject_invalid_unauthorized_run(
+                root, "validate-exec-recovered", step="validate", substep="execute",
+            )
+            with (root / "agent_runs.jsonl").open("a", encoding="utf-8") as f:
+                f.write(json.dumps({
+                    "agent_run_id": "validate-exec-recovered", "agent_role": "substep",
+                    "step": "validate", "substep": "execute", "status": "pass",
+                    "node_key": self.NODE_KEY,
+                }) + "\n")
+            # Current failure: invalid-only, not recovered.
+            self._inject_invalid_unauthorized_run(
+                root, "validate-exec-current", step="validate", substep="execute",
+            )
+            (root / "failure_analysis.json").write_text(
+                json.dumps({"node_key": self.NODE_KEY,
+                            "root_cause": {"attribution": "code (Generate)"}}),
+                encoding="utf-8",
+            )
+            directive = _derive_unauthorized_write_resume_directive(
+                repo_root, oid, "noncanonical_phase_write_attempt")
+            self.assertIsNotNone(directive)
+            self.assertEqual(directive["trigger_agent_run_id"], "validate-exec-current")
+
     def test_reopen_is_idempotent(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
@@ -25451,6 +25681,63 @@ class CompletionValidatorSupersededTest(unittest.TestCase):
             with self.assertRaises(RuntimeError) as ctx:
                 _validate_orchestration_completion_for_pass(repo_root, oid)
             self.assertIn("no fresh", str(ctx.exception))
+
+    def _add_invalid_log_trigger(
+        self, root: Path, orch_arid: str, arid: str, *, superseded: bool, with_violation: bool = True,
+    ) -> None:
+        """A compile substep whose failure mode was an unauthorized write: diverted to
+        agent_runs_invalid.jsonl (never agent_runs.jsonl), with a KEPT agent_graph edge
+        and a violation marker. Optionally recorded as superseded (reopen-consumed)."""
+        with (root / "agent_runs_invalid.jsonl").open("a", encoding="utf-8") as f:
+            f.write(json.dumps({
+                "agent_run_id": arid, "agent_role": "substep", "step": "compile",
+                "substep": "generate", "status": "fail", "node_key": self.NODE_KEY,
+                "fail_reason": "terminal_payload_validation_error",
+            }) + "\n")
+        graph = json.loads((root / "agent_graph.json").read_text(encoding="utf-8"))
+        graph["edges"].append(
+            {"parent_agent_run_id": orch_arid, "child_agent_run_id": arid, "relation_type": "launch"}
+        )
+        (root / "agent_graph.json").write_text(json.dumps(graph), encoding="utf-8")
+        if with_violation:
+            vdir = root / "violations"
+            vdir.mkdir(parents=True, exist_ok=True)
+            (vdir / f"{arid}.unauthorized_write_violation.json").write_text(
+                json.dumps({"kind": "unauthorized_write_violation", "agent_run_id": arid}),
+                encoding="utf-8",
+            )
+        if superseded:
+            sp = root / "reopen" / "superseded_runs.json"
+            doc = json.loads(sp.read_text(encoding="utf-8"))
+            ids = sorted(set(doc.get("superseded_agent_run_ids", [])) | {arid})
+            sp.write_text(json.dumps({"orchestration_id": root.name, "superseded_agent_run_ids": ids}), encoding="utf-8")
+
+    def test_superseded_invalid_log_trigger_edge_does_not_block_pass(self) -> None:
+        """Codex P1: a reopen-consumed unauthorized-write trigger lives only in
+        agent_runs_invalid.jsonl but keeps its agent_graph edge; that kept edge must
+        not block pass once a fresh replacement vouches the reopened phase."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            oid = "orch_completion_invalid_trigger"
+            orch_arid, _stale = self._seed(repo_root, oid)
+            root = repo_root / "workspace" / "orchestrations" / oid
+            self._add_invalid_log_trigger(root, orch_arid, "unauth-compile-trigger", superseded=True)
+            self._add_fresh_compile_substep(root, orch_arid, "fresh-compile-substep")
+            # Pass succeeds: the kept invalid-log edge is tolerated (superseded + in invalid log).
+            _validate_orchestration_completion_for_pass(repo_root, oid)
+
+    def test_unconsumed_invalid_log_edge_still_blocks_pass(self) -> None:
+        """Safety preserved: an invalid terminal attempt NOT consumed by reopen (absent
+        from superseded_runs.json) still blocks pass via its kept edge."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            oid = "orch_completion_unconsumed_invalid"
+            orch_arid, _stale = self._seed(repo_root, oid)
+            root = repo_root / "workspace" / "orchestrations" / oid
+            self._add_fresh_compile_substep(root, orch_arid, "fresh-compile-substep")
+            self._add_invalid_log_trigger(root, orch_arid, "unauth-not-consumed", superseded=False)
+            with self.assertRaisesRegex(RuntimeError, "child_agent_run_id missing from agent_runs.jsonl"):
+                _validate_orchestration_completion_for_pass(repo_root, oid)
 
 
 class ResumeDirectiveTest(unittest.TestCase):

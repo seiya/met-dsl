@@ -2331,6 +2331,11 @@ FAIL_CLOSED_REASON_CODES = {
     "sandbox_enforcement_violation",
 }
 
+# The fail_closed reason an orchestration records when a phase's failure mode is an
+# unauthorized write (the nearest FAIL_CLOSED_REASON_CODES fit). Gates the
+# unauthorized-write resume directive so it only fires for the current such failure.
+_UNAUTHORIZED_WRITE_FAIL_REASON = "noncanonical_phase_write_attempt"
+
 PARALLEL_NODES_ENV_VAR = "METDSL_ALLOW_PARALLEL_NODES"
 
 PHASE_ARTIFACT_GUARDED_PREFIXES: tuple[str, ...] = ("workspace/ir/", "workspace/pipelines/")
@@ -8824,6 +8829,128 @@ def _derive_resume_directive(
     }
 
 
+def _attribution_phase_tokens(value: object) -> list[str]:
+    """Return the workflow phase tokens (compile/generate/build) named in a
+    free-form attribution string, in canonical phase order. `validate` is
+    excluded — it is never a reopen *target* (an unauthorized write attributed
+    to Validate's own execution is not an upstream-phase defect)."""
+    if not isinstance(value, str) or not value.strip():
+        return []
+    low = value.lower()
+    return [tok for tok in ("compile", "generate", "build") if tok in low]
+
+
+def _derive_unauthorized_write_resume_directive(
+    repo_root: Path,
+    orchestration_id: str,
+    reason_code: str | None,
+) -> dict[str, Any] | None:
+    """Build a `resume_directive` when the prior terminal failure was an
+    unauthorized write attributed to an upstream phase.
+
+    Such a run never reached `agent_runs.jsonl` (`record_agent_run` diverted its
+    terminal `fail` to `agent_runs_invalid.jsonl`); the resumed agent must feed
+    that diverted arid to `reopen-phase` so the attributed upstream phase is
+    invalidated and re-run — `reopen_phase` accepts it because a matching
+    `unauthorized_write_violation.json` exists. This makes the resume
+    deterministic instead of re-deriving the `resume_reopen_no_valid_trigger`
+    dead end (mirrors `_derive_resume_directive` for the `_ir` case).
+
+    Conservative: returns None unless (a) the CURRENT terminal failure is the
+    unauthorized-write reason code (gated like the `_ir` path's `reason_code`
+    check — without this, a resume that failed for an unrelated reason could emit a
+    stale directive off a leftover invalid-log row + `failure_analysis.json`
+    attribution), (b) exactly one *not-yet-consumed* node's downstream run in the
+    invalid log is backed by a violation file, and (c) `failure_analysis.json`
+    attributes it to a single upstream phase strictly above the run's own phase.
+    On None the agent falls back to the decision table — `reopen_phase` still
+    accepts the invalid-log trigger if the agent supplies it.
+    """
+    # Gate on the CURRENT terminal reason. An unauthorized-write fail_closed is
+    # recorded as `noncanonical_phase_write_attempt` (the nearest FAIL_CLOSED enum
+    # fit); any other reason means this resume is not recovering an unauthorized
+    # write, so a leftover violation-backed invalid row must not drive a reopen.
+    if not isinstance(reason_code, str) or reason_code.strip() != _UNAUTHORIZED_WRITE_FAIL_REASON:
+        return None
+    root = _orchestration_root(repo_root, orchestration_id)
+    invalid_runs = _load_invalid_run_records(root)
+    if not invalid_runs:
+        return None
+    # Already-superseded invalid IDs are prior attempts a previous reopen already
+    # consumed; excluding them is what keeps a REPEATED unauthorized-write retry
+    # deterministic. Without it, the second failure leaves two violation-backed rows
+    # in the invalid log (the consumed one + the new one), the uniqueness check below
+    # suppresses the directive, and resume can re-derive the consumed trigger
+    # (`reopen-phase` -> noop) — the `resume_reopen_no_valid_trigger` dead end again.
+    superseded_run_ids = _load_superseded_run_ids(repo_root, orchestration_id)
+    # An invalid-log arid that now also has a canonical `agent_runs.jsonl` row was
+    # retried to success with the same arid (the documented same-arid retry path, e.g.
+    # after `dismiss-violation`); its stale invalid row + violation file linger but are
+    # NOT the current failure — and `reopen_phase` would reject it anyway (it accepts a
+    # trigger only when absent from `agent_runs.jsonl`). Exclude such recovered IDs so
+    # they do not inflate the candidate count and suppress the directive.
+    recovered_run_ids = set(_load_run_records(root).keys())
+    violations_dir = _violations_dir(repo_root, orchestration_id)
+    # Candidate failing runs: step/substep, non-pass, not yet consumed by a prior
+    # reopen, not recovered via same-arid retry, backed by an unauthorized-write
+    # violation file, with a known phase.
+    candidates: list[tuple[str, dict[str, Any]]] = []
+    for arid, rec in invalid_runs.items():
+        if arid in superseded_run_ids or arid in recovered_run_ids:
+            continue
+        if str(rec.get("agent_role") or "").strip().lower() not in {"step", "substep"}:
+            continue
+        if str(rec.get("status") or "").strip().lower() == "pass":
+            continue
+        step = str(rec.get("step") or "").strip().lower()
+        if step not in STEP_KEYS_FOR_NODE_STATE:
+            continue
+        if not (violations_dir / f"{arid}.unauthorized_write_violation.json").is_file():
+            continue
+        candidates.append((arid, rec))
+    if len(candidates) != 1:
+        return None
+    trigger_arid, rec = candidates[0]
+    node_key = str(rec.get("node_key") or "").strip()
+    if not node_key:
+        return None
+    trig_idx = STEP_KEYS_FOR_NODE_STATE.index(str(rec.get("step")).strip().lower())
+
+    fa_path = root / "failure_analysis.json"
+    if not fa_path.exists():
+        return None
+    try:
+        fa = _read_json(fa_path)
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(fa, dict):
+        return None
+    # Gather attribution strings from the agent-authored failure_analysis. The
+    # schema is conventional (not enforced), so probe the well-known locations.
+    attribution_values: list[object] = []
+    for container_key in ("original_finding", "root_cause", "secondary_known_defect"):
+        container = fa.get(container_key)
+        if isinstance(container, dict):
+            attribution_values.append(container.get("attribution"))
+    attribution_values.append(fa.get("attribution"))
+    phase_tokens: list[str] = []
+    for val in attribution_values:
+        for tok in _attribution_phase_tokens(val):
+            if tok not in phase_tokens:
+                phase_tokens.append(tok)
+    # Require a single upstream phase strictly above the failing run's phase.
+    upstream = [tok for tok in phase_tokens if STEP_KEYS_FOR_NODE_STATE.index(tok) < trig_idx]
+    if len(upstream) != 1:
+        return None
+    reopen_from = upstream[0]
+    return {
+        "reopen_from": reopen_from,
+        "node_key": node_key,
+        "trigger_agent_run_id": trigger_arid,
+        "source": "agent_runs_invalid.unauthorized_write",
+    }
+
+
 def enable_checkpoint_resume(
     repo_root: Path,
     orchestration_id: str,
@@ -8891,6 +9018,17 @@ def enable_checkpoint_resume(
             orchestration_id,
             prior_reason_code if isinstance(prior_reason_code, str) else None,
         )
+        # When the prior failure was an unauthorized write attributed to an
+        # upstream phase, the failing run is only in `agent_runs_invalid.jsonl`;
+        # point the resumed agent at it so `reopen-phase` (which now accepts a
+        # violation-backed invalid-log trigger) invalidates the attributed phase
+        # rather than re-deriving the `resume_reopen_no_valid_trigger` dead end.
+        if directive is None:
+            directive = _derive_unauthorized_write_resume_directive(
+                repo_root,
+                orchestration_id,
+                prior_reason_code if isinstance(prior_reason_code, str) else None,
+            )
         if directive is not None:
             meta["resume_directive"] = directive
         else:
@@ -9607,6 +9745,44 @@ def _load_run_records(
     return records
 
 
+def _load_invalid_run_records(
+    orchestration_root: Path,
+) -> dict[str, dict[str, Any]]:
+    """Load `agent_runs_invalid.jsonl` into a dict keyed by agent_run_id.
+
+    Mirrors `_load_run_records` but reads the SEPARATE invalid log that
+    `record_agent_run` diverts terminal payloads to when terminal-write
+    validation rejects them (e.g. an unauthorized write — see the `except
+    ValueError` handler in `record_agent_run`). Unlike the canonical log this
+    file is not the durable agent ledger, so a malformed line is skipped rather
+    than raised: it is a best-effort recovery source consulted only when a run
+    is absent from `agent_runs.jsonl`. On a duplicate arid the LAST entry wins
+    (a re-rejected retry overwrites the earlier diagnostic row).
+    """
+    invalid_path = orchestration_root / "agent_runs_invalid.jsonl"
+    records: dict[str, dict[str, Any]] = {}
+    if not invalid_path.is_file():
+        return records
+    try:
+        lines = invalid_path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return records
+    for raw in lines:
+        token = raw.strip()
+        if not token:
+            continue
+        try:
+            item = json.loads(token)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(item, dict):
+            continue
+        run_id = item.get("agent_run_id")
+        if isinstance(run_id, str) and run_id.strip():
+            records[run_id.strip()] = item
+    return records
+
+
 def _validate_terminal_run_payload(
     repo_root: Path,
     orchestration_id: str,
@@ -10165,6 +10341,18 @@ def _validate_orchestration_completion_for_pass(
             if isinstance(substep_run_id, str) and substep_run_id.strip():
                 step_result_refs_by_substep[substep_run_id.strip()] = result_path
 
+    # Runs tombstoned by a `reopen-phase` cross-phase retry are prior attempts for a
+    # reopened phase: their step_result.json was archived aside and a fresh attempt
+    # now vouches the phase. Exempt them from the terminal/vouch requirements below —
+    # otherwise the orphaned superseded substep rows would block the resumed pass.
+    # Loaded BEFORE the edge check because a reopen trigger may be a downstream child
+    # whose failure mode was an unauthorized write: that run was diverted to
+    # `agent_runs_invalid.jsonl` (never `agent_runs.jsonl`), but its launch edge in
+    # `agent_graph.json` is deliberately KEPT by `_prune_orphan_agent_graph_edges`.
+    # Once `reopen-phase` has consumed and superseded it, that edge must not block pass.
+    superseded_run_ids = _load_superseded_run_ids(repo_root, orchestration_id)
+    invalid_runs = _load_invalid_run_records(root)
+
     for idx, edge in enumerate(edges):
         if not isinstance(edge, dict):
             raise RuntimeError(f"agent_graph edge must be object: index={idx}")
@@ -10174,16 +10362,19 @@ def _validate_orchestration_completion_for_pass(
             raise RuntimeError(
                 f"agent_graph edge parent_agent_run_id missing from agent_runs.jsonl: index={idx}"
             )
-        if not isinstance(child_id, str) or not child_id.strip() or child_id.strip() not in runs:
+        child_norm = child_id.strip() if isinstance(child_id, str) and child_id.strip() else None
+        if child_norm is None or (
+            child_norm not in runs
+            # A reopen-consumed unauthorized-write trigger lives only in the invalid
+            # log; tolerate its kept edge. Tightly gated (superseded AND in the invalid
+            # log) so an UN-consumed invalid terminal attempt still blocks pass — that
+            # is the safety the kept edge exists to enforce.
+            and not (child_norm in superseded_run_ids and child_norm in invalid_runs)
+        ):
             raise RuntimeError(
                 f"agent_graph edge child_agent_run_id missing from agent_runs.jsonl: index={idx}"
             )
 
-    # Runs tombstoned by a `reopen-phase` cross-phase retry are prior attempts for a
-    # reopened phase: their step_result.json was archived aside and a fresh attempt
-    # now vouches the phase. Exempt them from the terminal/vouch requirements below —
-    # otherwise the orphaned superseded substep rows would block the resumed pass.
-    superseded_run_ids = _load_superseded_run_ids(repo_root, orchestration_id)
     # The (node_key, phase) pairs a reopen invalidated, derived from the tombstoned
     # runs' own records. Each must regain at least one fresh (non-superseded) terminal
     # run below before pass — otherwise an orchestration could be marked pass right
@@ -10191,7 +10382,9 @@ def _validate_orchestration_completion_for_pass(
     # replacement attempt yet.
     reopened_node_phases: set[tuple[str, str]] = set()
     for sid in superseded_run_ids:
-        rec = runs.get(sid)
+        # A superseded invalid-log trigger is absent from `runs`; fall back to its
+        # diverted record so its (node, phase) still demands a fresh replacement.
+        rec = runs.get(sid) or invalid_runs.get(sid)
         if not isinstance(rec, dict):
             continue
         nk = rec.get("node_key")
@@ -14091,10 +14284,35 @@ def reopen_phase(
     # — reopen must never erase a genuinely-passing pipeline; it can only follow a
     # downstream phase that actually failed and attributed back to `from_phase`
     # (mirrors the Compile-retry launch contract in phase_04_validate.md).
-    trigger = runs.get(trigger_agent_run_id.strip())
+    trigger_arid = trigger_agent_run_id.strip()
+    trigger = runs.get(trigger_arid)
+    trigger_from_invalid_log = False
+    if not isinstance(trigger, dict):
+        # Recovery path: a downstream phase whose failure mode *is* an
+        # unauthorized write never reaches `agent_runs.jsonl` — `record_agent_run`
+        # diverts its terminal `fail` payload to `agent_runs_invalid.jsonl` and
+        # re-raises (so the orchestration fail_closes). Without a usable trigger
+        # the defective upstream phase can never be invalidated and resume
+        # dead-locks (`resume_reopen_no_valid_trigger`). Accept the diverted entry
+        # — but ONLY when a `violations/<arid>.unauthorized_write_violation.json`
+        # exists, which is the authoritative proof the run terminally failed on an
+        # unauthorized write (not a sandbox/identity reject, where reopening an
+        # upstream phase would be wrong). This keeps the anti-abuse property: reopen
+        # still only follows a genuinely-failed downstream run backed by hard evidence.
+        invalid_runs = _load_invalid_run_records(root)
+        candidate = invalid_runs.get(trigger_arid)
+        violation_path = (
+            _violations_dir(repo_root, orchestration_id)
+            / f"{trigger_arid}.unauthorized_write_violation.json"
+        )
+        if isinstance(candidate, dict) and violation_path.is_file():
+            trigger = candidate
+            trigger_from_invalid_log = True
     if not isinstance(trigger, dict):
         raise RuntimeError(
-            f"reopen-phase: --trigger-agent-run-id {trigger_agent_run_id!r} not found in agent_runs.jsonl"
+            f"reopen-phase: --trigger-agent-run-id {trigger_agent_run_id!r} not found in "
+            f"agent_runs.jsonl (nor as an unauthorized-write reject in agent_runs_invalid.jsonl "
+            f"with a matching violation file)"
         )
     trig_role = str(trigger.get("agent_role") or "").strip().lower()
     if trig_role not in {"step", "substep"}:
@@ -14148,14 +14366,22 @@ def reopen_phase(
     # (1) Snapshot every step/substep run for this node in an affected phase. The
     # temporal cut: these become superseded; anything recorded after this call is
     # the new attempt.
-    superseded_now = sorted(
+    superseded_set = {
         arid
         for arid, rec in runs.items()
         if isinstance(rec, dict)
         and str(rec.get("agent_role") or "").strip().lower() in {"step", "substep"}
         and str(rec.get("node_key") or "").strip() == node_key_norm
         and str(rec.get("step") or "").strip().lower() in affected_phases
-    )
+    }
+    # An invalid-log trigger lives in `agent_runs_invalid.jsonl`, not `runs`, so the
+    # snapshot above never captures it. Add it explicitly: otherwise the idempotency
+    # guard (`trigger in existing`) could never fire for this trigger, and a
+    # redundant re-invocation would re-archive the in-progress fresh attempt's
+    # step_result — the very tombstoning the guard exists to prevent.
+    if trigger_from_invalid_log:
+        superseded_set.add(trigger_arid)
+    superseded_now = sorted(superseded_set)
 
     log_path = _reopen_log_path(repo_root, orchestration_id)
     prior_reopens = 0
@@ -14226,6 +14452,7 @@ def reopen_phase(
         "affected_phases": affected_phases,
         "reason": reason,
         "trigger_agent_run_id": trigger_agent_run_id.strip(),
+        "trigger_source": "agent_runs_invalid" if trigger_from_invalid_log else "agent_runs",
         "finding_id": finding_id,
         "superseded_agent_run_ids": superseded_now,
         "archived_step_results": archived,
@@ -14250,6 +14477,7 @@ def reopen_phase(
         "from_phase": from_token,
         "affected_phases": affected_phases,
         "reopen_seq": reopen_seq,
+        "trigger_source": "agent_runs_invalid" if trigger_from_invalid_log else "agent_runs",
         "superseded_run_count": len(superseded_now),
         "archived_step_results": archived,
         "dropped_checkpoint_steps": dropped_checkpoint_steps,
