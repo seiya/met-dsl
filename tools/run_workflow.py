@@ -262,12 +262,36 @@ def _read_json_if_exists(path: Path) -> dict[str, Any] | None:
     return payload if isinstance(payload, dict) else None
 
 
-def _orchestration_used_conductor(repo_root: Path, orchestration_id: str) -> bool:
-    """True when the orchestration was driven by the deterministic conductor
-    (run_conductor writes an orchestrator marker), so --resume restores the driver."""
-    marker = _read_json_if_exists(
-        repo_root / "workspace" / "orchestrations" / orchestration_id / "orchestrator.json")
-    return isinstance(marker, dict) and marker.get("orchestrator") == "conductor"
+def _orchestrator_marker_path(repo_root: Path, orchestration_id: str) -> Path:
+    return (
+        repo_root / "workspace" / "orchestrations" / orchestration_id / "orchestrator.json"
+    )
+
+
+def _write_orchestrator_marker(repo_root: Path, orchestration_id: str, orchestrator: str) -> None:
+    """Record the effective driver so `--resume` restores the SAME driver. This is
+    written symmetrically for both drivers at the TOP of _run_node, before init
+    creates orchestration_meta.json — so any run that got far enough to have
+    orchestration state necessarily wrote the marker first (even a fresh conductor
+    run that then fails preflight). A missing marker therefore means a legacy run
+    that predates symmetric marking, and those were always LLM-driven (the
+    historical default). (run_conductor re-writes the same value for the conductor
+    path; both writes agree because they read the same METDSL_ORCHESTRATOR.)"""
+    marker = _orchestrator_marker_path(repo_root, orchestration_id)
+    try:
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text(json.dumps({"orchestrator": orchestrator}) + "\n", encoding="utf-8")
+    except OSError:
+        pass
+
+
+def _recorded_orchestrator(repo_root: Path, orchestration_id: str) -> str | None:
+    """Return the driver recorded in the orchestrator.json marker ('llm' or
+    'conductor'), or None when no (valid) marker exists."""
+    marker = _read_json_if_exists(_orchestrator_marker_path(repo_root, orchestration_id))
+    if isinstance(marker, dict) and marker.get("orchestrator") in ("llm", "conductor"):
+        return str(marker.get("orchestrator"))
+    return None
 
 
 def _read_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -889,11 +913,13 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
         choices=("llm", "conductor"),
         default=None,
         help=(
-            "Orchestration driver. 'llm' (default): spawn an LLM orchestration agent "
-            "to drive the phase loop. 'conductor': drive the deterministic phase/substep "
-            "loop in Python (tools/workflow_conductor.py), invoking the LLM only as a "
-            "leaf for each substep body — removes the parent orchestration LLM's "
-            "per-turn cache_read overhead. See docs/design/deterministic_conductor.md."
+            "Orchestration driver. 'conductor' (default for claude/codex): drive the "
+            "deterministic phase/substep loop in Python (tools/workflow_conductor.py), "
+            "invoking the LLM only as a leaf for each substep body — removes the parent "
+            "orchestration LLM's per-turn cache_read overhead. 'llm': spawn an LLM "
+            "orchestration agent to drive the phase loop (the default for the cursor "
+            "backend, which has no conductor leaf launcher). "
+            "See docs/design/deterministic_conductor.md."
         ),
     )
     return parser.parse_args(argv)
@@ -982,10 +1008,14 @@ def main(argv: list[str] | None = None) -> int:
                 )
                 return 2
         recovered = _load_resume_params(repo_root, orchestration_id)
-        # Restore the orchestration driver: a conductor-driven run leaves a marker,
-        # so a plain `--resume` does not silently fall back to the LLM orchestrator.
-        if _orchestration_used_conductor(repo_root, orchestration_id):
-            resume_recovered_orchestrator = "conductor"
+        # Restore the orchestration driver from the symmetric marker so a plain
+        # `--resume` never silently flips an in-flight run to the other driver.
+        # A missing marker means a legacy (pre-symmetric-marking) run, which was
+        # always LLM-driven — restore "llm" rather than letting the fresh-run
+        # conductor default (below) take over the resume.
+        resume_recovered_orchestrator = (
+            _recorded_orchestrator(repo_root, orchestration_id) or "llm"
+        )
         spec_ref_arg = args.spec_ref
         until_phase_arg = args.until_phase
         # A lone positional is ambiguous on resume: argparse binds it to spec_ref,
@@ -1041,8 +1071,14 @@ def main(argv: list[str] | None = None) -> int:
         mode_in = args.mode or DEFAULT_WORKFLOW_MODE
 
     # Effective orchestration driver: explicit --orchestrator wins; otherwise on
-    # --resume restore the original run's driver (from its marker); else default llm.
-    orchestrator = args.orchestrator or resume_recovered_orchestrator or "llm"
+    # --resume restore the original run's driver (from its marker); else default to
+    # the deterministic conductor (Python phase loop, no parent orchestration LLM —
+    # avoids the per-turn cache_read overhead). The conductor only has a leaf
+    # launcher for claude/codex, so a cursor backend with no explicit --orchestrator
+    # falls back to the LLM driver rather than erroring at backend validation below.
+    orchestrator = args.orchestrator or resume_recovered_orchestrator or (
+        "conductor" if llm_in in ("claude", "codex") else "llm"
+    )
 
     try:
         workflow_mode = _normalize_workflow_mode(mode_in)
@@ -1255,6 +1291,16 @@ def _run_node(
             ensure_ascii=False,
         ),
         flush=True,
+    )
+
+    # Record the effective driver BEFORE init/preflight so the "missing marker ⟹
+    # legacy llm run" invariant is airtight: any run that entered _run_node marks
+    # itself before init creates orchestration_meta.json, so a fresh conductor run
+    # that later fails preflight (or is killed mid-setup) still leaves a marker and
+    # `--resume` restores the conductor rather than silently downgrading to the LLM
+    # driver. The conductor also re-writes it in run_conductor (same value).
+    _write_orchestrator_marker(
+        repo_root, orchestration_id, env.get("METDSL_ORCHESTRATOR", "llm")
     )
 
     try:
@@ -1765,6 +1811,7 @@ def _run_node(
             "orchestration_id": orchestration_id,
             "resumed": resume_mode,
             "llm": llm,
+            "orchestrator": env.get("METDSL_ORCHESTRATOR", "llm"),
             "llm_command": llm_command,
             "target_spec_ref": spec_ref,
             "until_phase": until_phase,

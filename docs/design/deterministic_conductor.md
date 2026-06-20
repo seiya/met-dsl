@@ -2,8 +2,12 @@
 
 Status: M2–M5 landed (`tools/workflow_conductor.py`) — deterministic loop, failure
 routing + reopen, LLM diagnostician escalation, and run_workflow `--orchestrator`
-wiring. Only M1 (real `claude -p` MCP/hooks verification + the cost-measuring
-integration run) is pending, so `--orchestrator llm` remains the default.
+wiring. The conductor is now the **default** driver for the `claude` / `codex`
+backends; `cursor` still defaults to `--orchestrator llm` (no conductor leaf
+launcher). M1 (real `claude -p` MCP/hooks verification + the cost-measuring
+integration run) is the remaining gap: the leaf path is exercised only by mocked
+unit tests, so `--orchestrator llm` is retained as an explicit fallback if a live
+conductor run misbehaves.
 
 ## Why
 
@@ -54,11 +58,13 @@ action/target vocabulary, falling back to `fail_closed` on anything malformed.
 ## Usage
 
 ```
-python3 tools/run_workflow.py <spec_ref> <until_phase> --llm claude --orchestrator conductor
+python3 tools/run_workflow.py <spec_ref> <until_phase> --llm claude
 ```
 
-`--orchestrator llm` (default) keeps the legacy LLM-orchestrator path unchanged, so the
-two are A/B comparable via `tools/audit_orchestration.py`.
+The conductor is the default for `claude`/`codex`, so `--orchestrator conductor` is
+now optional for those backends. `--orchestrator llm` selects the legacy
+LLM-orchestrator path unchanged, so the two stay A/B comparable via
+`tools/audit_orchestration.py`.
 
 ## Open risks (verified by the integration run / M1)
 
