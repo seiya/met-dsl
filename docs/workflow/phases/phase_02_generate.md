@@ -97,4 +97,4 @@ Before `Generate.verify` completes, run `python3 tools/validate_pipeline_semanti
 
 ## On-failure behavior
 - A `Generate fail` retry defaults to an in-phase retry.
-- When `Generate.verify` judges that "the IR itself has an error", record "ir_inconsistency" in `source_meta.json.last_fail_reason`, and the `orchestration agent` decides whether to go back to `Compile`.
+- When `Generate.verify` judges that "the IR itself has an error", record "ir_inconsistency" in `source_meta.json.last_fail_reason`, and the `orchestration agent` decides whether to go back to `Compile`. When `Compile` is already checkpointed `pass`, the return to `Compile` first runs `reopen-phase --from-phase compile --node-key <node_key> --trigger-agent-run-id <generate_verify_fail_substep_agent_run_id> --reason <reason_code>` to invalidate the stale `Compile` checkpoint / `step_result` and reset its `phase_state`, then re-runs `Compile` → `Generate`. Canonical: `docs/CLI_REFERENCE_RARE.md#reopen-phase`, `docs/RUNBOOK.md` §3-1.

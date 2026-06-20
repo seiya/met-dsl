@@ -70,6 +70,10 @@ from tools.orchestration_runtime import (
     repair_legacy_agent_runs,
     repair_step_result_executor,
     repair_all_step_result_executors,
+    reopen_phase,
+    _load_superseded_run_ids,
+    _node_key_to_safe,
+    _validate_orchestration_completion_for_pass,
     reserve_phase_root,
     _evaluate_reply_budget,
     REPLY_BUDGET_CHARS,
@@ -24957,8 +24961,13 @@ class StartupDocSizeTests(unittest.TestCase):
     REPO_ROOT = Path(__file__).resolve().parents[2]
 
     def test_skill_md_within_budget(self) -> None:
+        # Ceiling raised 44500 -> 44900 for the `reopen-phase` cross-phase-retry step
+        # (the orchestration must reopen a checkpointed-pass Compile before re-running
+        # it). The added ~280 bytes are net token-positive: without the step a
+        # Validate.judge attribution=ir retry dead-ends and the agent re-derives the
+        # impasse (orders of magnitude more tokens — see the resume failure it fixes).
         size = (self.REPO_ROOT / "skills/workflow-orchestration/SKILL.md").stat().st_size
-        self.assertLessEqual(size, 44500, f"SKILL.md grew to {size} bytes; trim or justify the ceiling")
+        self.assertLessEqual(size, 44900, f"SKILL.md grew to {size} bytes; trim or justify the ceiling")
 
     def test_startup_contract_within_budget(self) -> None:
         size = (self.REPO_ROOT / "skills/workflow-orchestration/references/startup_contract.md").stat().st_size
@@ -25040,6 +25049,534 @@ class ReplyBudgetTests(unittest.TestCase):
                     reply_ref="workspace/orchestrations/o1/launches/missing.reply.txt",
                 )
             )
+
+
+_REOPEN_LAUNCHABLE_PREFLIGHT = {
+    "status": "pass",
+    "sandbox_runtime": "bwrap",
+    "sandbox_enforced": True,
+    "can_launch_step_agents": True,
+    "can_launch_substep_agents": True,
+    "feature_states": {"multi_agent": True, "hooks": True},
+    "checks": [{"name": "multi_agent_enabled", "pass": True}],
+}
+
+
+class ReopenPhaseTest(unittest.TestCase):
+    """`reopen-phase`: cross-phase Compile retry made executable in place."""
+
+    NODE_KEY = "component/foo@0.1.0"
+
+    def _build_fixture(self, repo_root: Path, oid: str) -> dict[str, str]:
+        """A node with checkpointed-pass compile/generate/build + a failed validate.judge."""
+        init_orchestration(repo_root=repo_root, orchestration_id=oid)
+        _mark_dependencies_ready(repo_root)
+        write_preflight(
+            repo_root=repo_root,
+            orchestration_id=oid,
+            payload=dict(_REOPEN_LAUNCHABLE_PREFLIGHT),
+            host_session_id="aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+        )
+        root = repo_root / "workspace" / "orchestrations" / oid
+        orch_arid = json.loads(
+            (root / "orchestration_meta.json").read_text(encoding="utf-8")
+        )["orchestration_agent_run_id"]
+        node_safe = _node_key_to_safe(self.NODE_KEY)
+
+        arids = {
+            "c1": "compile-sub-1", "c2": "compile-sub-2",
+            "g1": "generate-sub-1", "g2": "generate-sub-2",
+            "b1": "build-step-1",
+            "v_exec": "validate-exec-1", "v_judge": "validate-judge-1",
+        }
+        rows = [
+            {"agent_run_id": arids["c1"], "agent_role": "substep", "step": "compile", "substep": "generate", "status": "pass"},
+            {"agent_run_id": arids["c2"], "agent_role": "substep", "step": "compile", "substep": "verify", "status": "pass"},
+            {"agent_run_id": arids["g1"], "agent_role": "substep", "step": "generate", "substep": "generate", "status": "pass"},
+            {"agent_run_id": arids["g2"], "agent_role": "substep", "step": "generate", "substep": "verify", "status": "pass"},
+            {"agent_run_id": arids["b1"], "agent_role": "step", "step": "build", "status": "pass"},
+            {"agent_run_id": arids["v_exec"], "agent_role": "substep", "step": "validate", "substep": "execute", "status": "pass"},
+            {"agent_run_id": arids["v_judge"], "agent_role": "substep", "step": "validate", "substep": "judge", "status": "fail"},
+        ]
+        with (root / "agent_runs.jsonl").open("a", encoding="utf-8") as f:
+            for row in rows:
+                row["node_key"] = self.NODE_KEY
+                f.write(json.dumps(row) + "\n")
+
+        # step_results at their deterministic paths (compile/generate keyed by the
+        # orchestration arid; build keyed by the step agent arid).
+        for phase, executor, substeps in (
+            ("compile", orch_arid, [arids["c1"], arids["c2"]]),
+            ("generate", orch_arid, [arids["g1"], arids["g2"]]),
+            ("build", arids["b1"], []),
+        ):
+            p = root / "steps" / node_safe / phase / executor / "step_result.json"
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(
+                json.dumps({
+                    "status": "pass",
+                    "executor_agent_run_id": executor,
+                    "substep_agent_run_ids": substeps,
+                }),
+                encoding="utf-8",
+            )
+
+        (root / "orchestration_checkpoint.json").write_text(
+            json.dumps({
+                "orchestration_id": oid,
+                "schema_version": "1",
+                "completed_steps": [
+                    {"node_key": self.NODE_KEY, "step": "compile", "agent_run_id": orch_arid,
+                     "status": "pass", "artifact_hashes": {}},
+                    {"node_key": self.NODE_KEY, "step": "generate", "agent_run_id": orch_arid,
+                     "status": "pass", "artifact_hashes": {}},
+                    {"node_key": self.NODE_KEY, "step": "build", "agent_run_id": arids["b1"],
+                     "status": "pass", "artifact_hashes": {}},
+                ],
+            }),
+            encoding="utf-8",
+        )
+        arids["orch"] = orch_arid
+        arids["node_safe"] = node_safe
+        return arids
+
+    def test_reopen_from_compile_invalidates_downstream(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            oid = "orch_reopen_compile"
+            arids = self._build_fixture(repo_root, oid)
+            root = repo_root / "workspace" / "orchestrations" / oid
+
+            result = reopen_phase(
+                repo_root,
+                oid,
+                node_key=self.NODE_KEY,
+                from_phase="compile",
+                reason="validate_judge_structural_violation_ir",
+                trigger_agent_run_id=arids["v_judge"],
+                finding_id="xfail_verdict_contract_gap",
+            )
+
+            self.assertEqual(result["status"], "reopened")
+            self.assertEqual(result["affected_phases"], ["compile", "generate", "build", "validate"])
+            # All 7 prior step/substep runs for the node are superseded.
+            self.assertEqual(result["superseded_run_count"], 7)
+            self.assertEqual(result["reopen_seq"], 1)
+
+            # The three pass step_results are archived aside (canonical filename gone).
+            node_safe = arids["node_safe"]
+            for phase, executor in (
+                ("compile", arids["orch"]), ("generate", arids["orch"]), ("build", arids["b1"]),
+            ):
+                d = root / "steps" / node_safe / phase / executor
+                self.assertFalse((d / "step_result.json").exists())
+                self.assertTrue((d / "step_result.superseded.1.json").exists())
+
+            # The superseded set holds every prior run.
+            superseded = _load_superseded_run_ids(repo_root, oid)
+            self.assertEqual(
+                superseded,
+                {arids["c1"], arids["c2"], arids["g1"], arids["g2"],
+                 arids["b1"], arids["v_exec"], arids["v_judge"]},
+            )
+
+            # Checkpoint entries for the affected phases are dropped.
+            ck = json.loads((root / "orchestration_checkpoint.json").read_text(encoding="utf-8"))
+            self.assertEqual(ck["completed_steps"], [])
+
+            # phase_state is reset to not_started for all four phases.
+            ns = json.loads((root / "phase_state.json").read_text(encoding="utf-8"))["node_states"][node_safe]
+            for phase in ("compile", "generate", "build", "validate"):
+                self.assertEqual(ns[phase], "not_started")
+
+            # An audit line is written.
+            log_lines = [
+                line for line in (root / "reopen" / "reopen_log.jsonl").read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+            self.assertEqual(len(log_lines), 1)
+            self.assertEqual(json.loads(log_lines[0])["finding_id"], "xfail_verdict_contract_gap")
+
+            # check_step_completed now reports the phases as not completed.
+            self.assertIsNone(
+                check_step_completed(repo_root, oid, node_key=self.NODE_KEY, step="compile",
+                                     verify_integrity=False)
+            )
+
+    def test_reopen_rejects_passing_trigger(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            oid = "orch_reopen_pass_trigger"
+            arids = self._build_fixture(repo_root, oid)
+            with self.assertRaises(RuntimeError):
+                reopen_phase(
+                    repo_root, oid, node_key=self.NODE_KEY, from_phase="compile",
+                    reason="x", trigger_agent_run_id=arids["v_exec"],  # pass run
+                )
+
+    def test_reopen_rejects_upstream_trigger(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            oid = "orch_reopen_upstream_trigger"
+            arids = self._build_fixture(repo_root, oid)
+            # Trigger phase (validate) is NOT strictly downstream of from_phase=validate.
+            with self.assertRaises(RuntimeError):
+                reopen_phase(
+                    repo_root, oid, node_key=self.NODE_KEY, from_phase="validate",
+                    reason="x", trigger_agent_run_id=arids["v_judge"],
+                )
+
+    def test_reopen_rejects_unknown_trigger(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            oid = "orch_reopen_unknown_trigger"
+            self._build_fixture(repo_root, oid)
+            with self.assertRaises(RuntimeError):
+                reopen_phase(
+                    repo_root, oid, node_key=self.NODE_KEY, from_phase="compile",
+                    reason="x", trigger_agent_run_id="no-such-arid",
+                )
+
+    def test_reopen_is_idempotent(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            oid = "orch_reopen_idempotent"
+            arids = self._build_fixture(repo_root, oid)
+            reopen_phase(
+                repo_root, oid, node_key=self.NODE_KEY, from_phase="compile",
+                reason="x", trigger_agent_run_id=arids["v_judge"],
+            )
+            # A re-invocation with the SAME (already-superseded) trigger is a no-op,
+            # never re-snapshotting or re-archiving.
+            second = reopen_phase(
+                repo_root, oid, node_key=self.NODE_KEY, from_phase="compile",
+                reason="x", trigger_agent_run_id=arids["v_judge"],
+            )
+            self.assertEqual(second["status"], "noop")
+            self.assertEqual(len(_load_superseded_run_ids(repo_root, oid)), 7)
+
+    def test_reopen_noop_preserves_in_progress_retry(self) -> None:
+        """A redundant re-invocation (same trigger) must not tombstone the fresh
+        attempt's runs/step_results recorded after the first reopen."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            oid = "orch_reopen_progress"
+            arids = self._build_fixture(repo_root, oid)
+            root = repo_root / "workspace" / "orchestrations" / oid
+            node_safe = arids["node_safe"]
+
+            reopen_phase(
+                repo_root, oid, node_key=self.NODE_KEY, from_phase="compile",
+                reason="x", trigger_agent_run_id=arids["v_judge"],
+            )
+
+            # Simulate retry progress: a fresh compile substep + its new step_result.
+            new_sub = "compile-sub-retry"
+            with (root / "agent_runs.jsonl").open("a", encoding="utf-8") as f:
+                f.write(json.dumps({
+                    "agent_run_id": new_sub, "agent_role": "substep", "step": "compile",
+                    "substep": "generate", "status": "pass", "node_key": self.NODE_KEY,
+                }) + "\n")
+            fresh = root / "steps" / node_safe / "compile" / arids["orch"] / "step_result.json"
+            fresh.write_text(json.dumps({
+                "status": "pass", "executor_agent_run_id": arids["orch"],
+                "substep_agent_run_ids": [new_sub],
+            }), encoding="utf-8")
+
+            # Re-invoke with the SAME, already-superseded trigger.
+            again = reopen_phase(
+                repo_root, oid, node_key=self.NODE_KEY, from_phase="compile",
+                reason="x", trigger_agent_run_id=arids["v_judge"],
+            )
+            self.assertEqual(again["status"], "noop")
+            # The fresh attempt is intact: step_result not archived, new run not superseded.
+            self.assertTrue(fresh.exists())
+            self.assertNotIn(new_sub, _load_superseded_run_ids(repo_root, oid))
+
+    def test_reopen_proceeds_for_a_new_downstream_failure(self) -> None:
+        """A genuine subsequent reopen — the fresh attempt failed again with a NEW
+        trigger — proceeds and supersedes the fresh attempt."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            oid = "orch_reopen_second"
+            arids = self._build_fixture(repo_root, oid)
+            root = repo_root / "workspace" / "orchestrations" / oid
+
+            reopen_phase(
+                repo_root, oid, node_key=self.NODE_KEY, from_phase="compile",
+                reason="x", trigger_agent_run_id=arids["v_judge"],
+            )
+            # Fresh attempt produces a NEW failed validate.judge.
+            new_judge = "validate-judge-2"
+            with (root / "agent_runs.jsonl").open("a", encoding="utf-8") as f:
+                f.write(json.dumps({
+                    "agent_run_id": new_judge, "agent_role": "substep", "step": "validate",
+                    "substep": "judge", "status": "fail", "node_key": self.NODE_KEY,
+                }) + "\n")
+
+            again = reopen_phase(
+                repo_root, oid, node_key=self.NODE_KEY, from_phase="compile",
+                reason="x", trigger_agent_run_id=new_judge,
+            )
+            self.assertEqual(again["status"], "reopened")
+            self.assertIn(new_judge, _load_superseded_run_ids(repo_root, oid))
+
+    def test_reopen_completes_after_crash_before_commit_marker(self) -> None:
+        """`superseded_runs.json` is the commit marker, written last. A crash before
+        it (here: the checkpoint-drop write fails) leaves the trigger NOT superseded,
+        so a same-trigger retry proceeds and completes the cleanup rather than
+        no-op-ing over a stale checkpoint / phase_state."""
+        import tools.orchestration_runtime as ort
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            oid = "orch_reopen_crash"
+            arids = self._build_fixture(repo_root, oid)
+            root = repo_root / "workspace" / "orchestrations" / oid
+
+            real_write = ort._write_json
+
+            def fail_on_checkpoint(path, payload):
+                if Path(path).name == "orchestration_checkpoint.json":
+                    raise RuntimeError("simulated crash before commit marker")
+                return real_write(path, payload)
+
+            with patch.object(ort, "_write_json", side_effect=fail_on_checkpoint):
+                with self.assertRaises(RuntimeError):
+                    reopen_phase(
+                        repo_root, oid, node_key=self.NODE_KEY, from_phase="compile",
+                        reason="x", trigger_agent_run_id=arids["v_judge"],
+                    )
+
+            # Crash state: the commit marker was never written, so the trigger is not
+            # yet superseded and the checkpoint is still stale.
+            self.assertNotIn(arids["v_judge"], _load_superseded_run_ids(repo_root, oid))
+            ck = json.loads((root / "orchestration_checkpoint.json").read_text(encoding="utf-8"))
+            self.assertNotEqual(ck["completed_steps"], [])
+
+            # Retry with the same trigger proceeds (not no-op) and finishes the cleanup.
+            result = reopen_phase(
+                repo_root, oid, node_key=self.NODE_KEY, from_phase="compile",
+                reason="x", trigger_agent_run_id=arids["v_judge"],
+            )
+            self.assertEqual(result["status"], "reopened")
+            ck = json.loads((root / "orchestration_checkpoint.json").read_text(encoding="utf-8"))
+            self.assertEqual(ck["completed_steps"], [])
+            ns = json.loads((root / "phase_state.json").read_text(encoding="utf-8"))["node_states"][arids["node_safe"]]
+            self.assertEqual(ns["compile"], "not_started")
+            self.assertIn(arids["v_judge"], _load_superseded_run_ids(repo_root, oid))
+
+
+class CompletionValidatorSupersededTest(unittest.TestCase):
+    """Superseded runs are exempt from the pass-completion vouch requirement, but a
+    reopened phase still needs a fresh replacement run before pass."""
+
+    NODE_KEY = "component/foo@0.1.0"
+
+    def _seed(self, repo_root: Path, oid: str) -> tuple[str, str]:
+        """Returns (orch_arid, stale_superseded_compile_substep). The stale substep
+        has no step_result vouch and no launch refs — what would block pass without
+        the exemption."""
+        init_orchestration(repo_root=repo_root, orchestration_id=oid)
+        root = repo_root / "workspace" / "orchestrations" / oid
+        orch_arid = json.loads(
+            (root / "orchestration_meta.json").read_text(encoding="utf-8")
+        )["orchestration_agent_run_id"]
+        stale = "stale-substep-arid"
+        with (root / "agent_runs.jsonl").open("a", encoding="utf-8") as f:
+            f.write(json.dumps({
+                "agent_run_id": stale, "agent_role": "substep", "step": "compile",
+                "status": "fail", "node_key": self.NODE_KEY,
+            }) + "\n")
+        (root / "agent_graph.json").write_text(
+            json.dumps({"edges": [
+                {"parent_agent_run_id": orch_arid, "child_agent_run_id": stale,
+                 "relation_type": "launch"},
+            ]}),
+            encoding="utf-8",
+        )
+        (root / "reopen").mkdir(exist_ok=True)
+        (root / "reopen" / "superseded_runs.json").write_text(
+            json.dumps({"orchestration_id": oid, "superseded_agent_run_ids": [stale]}),
+            encoding="utf-8",
+        )
+        return orch_arid, stale
+
+    def _add_fresh_compile_substep(self, root: Path, orch_arid: str, arid: str) -> None:
+        """A fully-vouched, non-superseded compile substep: launch refs + agent_runs
+        row + a compile step_result + an agent_graph edge."""
+        launches = root / "launches"
+        launches.mkdir(exist_ok=True)
+        (launches / f"{arid}.request.json").write_text("{}", encoding="utf-8")
+        (launches / f"{arid}.response.json").write_text("{}", encoding="utf-8")
+        (launches / f"{arid}.prompt.txt").write_text("p", encoding="utf-8")
+        (launches / f"{arid}.reply.txt").write_text("r", encoding="utf-8")
+        base = f"workspace/orchestrations/{root.name}/launches/{arid}"
+        with (root / "agent_runs.jsonl").open("a", encoding="utf-8") as f:
+            f.write(json.dumps({
+                "agent_run_id": arid, "agent_role": "substep", "step": "compile",
+                "substep": "generate", "status": "pass", "node_key": self.NODE_KEY,
+                "launch_request_ref": f"{base}.request.json",
+                "launch_response_ref": f"{base}.response.json",
+                "launch_prompt_ref": f"{base}.prompt.txt",
+                "launch_reply_ref": f"{base}.reply.txt",
+            }) + "\n")
+        node_safe = _node_key_to_safe(self.NODE_KEY)
+        sr = root / "steps" / node_safe / "compile" / orch_arid / "step_result.json"
+        sr.parent.mkdir(parents=True, exist_ok=True)
+        sr.write_text(json.dumps({
+            "status": "pass", "executor_agent_run_id": orch_arid,
+            "substep_agent_run_ids": [arid],
+        }), encoding="utf-8")
+        graph = json.loads((root / "agent_graph.json").read_text(encoding="utf-8"))
+        graph["edges"].append(
+            {"parent_agent_run_id": orch_arid, "child_agent_run_id": arid, "relation_type": "launch"}
+        )
+        (root / "agent_graph.json").write_text(json.dumps(graph), encoding="utf-8")
+
+    def test_superseded_run_with_fresh_replacement_passes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            oid = "orch_completion_superseded"
+            orch_arid, _stale = self._seed(repo_root, oid)
+            root = repo_root / "workspace" / "orchestrations" / oid
+            # A fresh replacement for the reopened compile phase → pass succeeds.
+            self._add_fresh_compile_substep(root, orch_arid, "fresh-compile-substep")
+            _validate_orchestration_completion_for_pass(repo_root, oid)
+
+    def test_reopened_phase_without_replacement_blocks_pass(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            oid = "orch_completion_no_replacement"
+            self._seed(repo_root, oid)  # superseded compile run, no fresh replacement
+            with self.assertRaises(RuntimeError) as ctx:
+                _validate_orchestration_completion_for_pass(repo_root, oid)
+            self.assertIn("no fresh", str(ctx.exception))
+
+
+class ResumeDirectiveTest(unittest.TestCase):
+    """Resume records a reopen directive for an attribution=ir cross-phase retry."""
+
+    def test_records_directive_from_failure_analysis(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            oid = "orch_resume_directive"
+            init_orchestration(repo_root=repo_root, orchestration_id=oid)
+            root = repo_root / "workspace" / "orchestrations" / oid
+            (root / "failure_analysis.json").write_text(
+                json.dumps({
+                    "node_key": "component/foo@0.1.0",
+                    "original_finding": {
+                        "finding_id": "xfail_verdict_contract_gap",
+                        "attribution": "ir",
+                        "failed_substep_agent_run_id": "validate-judge-1",
+                    },
+                }),
+                encoding="utf-8",
+            )
+            update_orchestration_status(
+                repo_root=repo_root, orchestration_id=oid, status="fail",
+                reason_code="validate_judge_structural_violation_ir",
+                reason_detail="ir contract gap",
+            )
+            enable_checkpoint_resume(repo_root, oid)
+
+            meta = json.loads((root / "orchestration_meta.json").read_text(encoding="utf-8"))
+            directive = meta.get("resume_directive")
+            self.assertIsNotNone(directive)
+            self.assertEqual(directive["reopen_from"], "compile")
+            self.assertEqual(directive["node_key"], "component/foo@0.1.0")
+            self.assertEqual(directive["trigger_agent_run_id"], "validate-judge-1")
+            self.assertEqual(directive["finding_id"], "xfail_verdict_contract_gap")
+
+    def test_no_directive_for_non_ir_attribution(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            oid = "orch_resume_no_directive"
+            init_orchestration(repo_root=repo_root, orchestration_id=oid)
+            root = repo_root / "workspace" / "orchestrations" / oid
+            (root / "failure_analysis.json").write_text(
+                json.dumps({
+                    "node_key": "component/foo@0.1.0",
+                    "original_finding": {
+                        "finding_id": "f", "attribution": "code",
+                        "failed_substep_agent_run_id": "validate-judge-1",
+                    },
+                }),
+                encoding="utf-8",
+            )
+            update_orchestration_status(
+                repo_root=repo_root, orchestration_id=oid, status="fail",
+                reason_code="validate_judge_structural_violation_code",
+                reason_detail="code defect",
+            )
+            enable_checkpoint_resume(repo_root, oid)
+            meta = json.loads((root / "orchestration_meta.json").read_text(encoding="utf-8"))
+            self.assertNotIn("resume_directive", meta)
+
+    def test_no_directive_when_reason_non_ir_but_finding_stale_ir(self) -> None:
+        """A non-ir terminal reason must not emit a directive off a stale ir finding
+        left in failure_analysis.json — the reason_code gates the derivation."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            oid = "orch_resume_stale_finding"
+            init_orchestration(repo_root=repo_root, orchestration_id=oid)
+            root = repo_root / "workspace" / "orchestrations" / oid
+            (root / "failure_analysis.json").write_text(json.dumps({
+                "node_key": "component/foo@0.1.0",
+                "original_finding": {
+                    "finding_id": "stale", "attribution": "ir",
+                    "failed_substep_agent_run_id": "validate-judge-1",
+                },
+            }), encoding="utf-8")
+            update_orchestration_status(
+                repo_root=repo_root, orchestration_id=oid, status="fail",
+                reason_code="build_compile_error", reason_detail="a non-ir failure",
+            )
+            enable_checkpoint_resume(repo_root, oid)
+            meta = json.loads((root / "orchestration_meta.json").read_text(encoding="utf-8"))
+            self.assertNotIn("resume_directive", meta)
+
+    def test_stale_directive_cleared_on_non_ir_resume(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            oid = "orch_resume_stale_directive"
+            init_orchestration(repo_root=repo_root, orchestration_id=oid)
+            root = repo_root / "workspace" / "orchestrations" / oid
+            fa = root / "failure_analysis.json"
+
+            # First cycle: an attribution=ir failure records a directive.
+            fa.write_text(json.dumps({
+                "node_key": "component/foo@0.1.0",
+                "original_finding": {
+                    "finding_id": "g", "attribution": "ir",
+                    "failed_substep_agent_run_id": "validate-judge-1",
+                },
+            }), encoding="utf-8")
+            update_orchestration_status(
+                repo_root=repo_root, orchestration_id=oid, status="fail",
+                reason_code="validate_judge_structural_violation_ir", reason_detail="ir",
+            )
+            enable_checkpoint_resume(repo_root, oid)
+            self.assertIn(
+                "resume_directive",
+                json.loads((root / "orchestration_meta.json").read_text(encoding="utf-8")),
+            )
+
+            # Second cycle: an unrelated non-ir failure must clear the stale directive.
+            fa.write_text(json.dumps({
+                "node_key": "component/foo@0.1.0",
+                "original_finding": {
+                    "finding_id": "h", "attribution": "code",
+                    "failed_substep_agent_run_id": "validate-judge-9",
+                },
+            }), encoding="utf-8")
+            update_orchestration_status(
+                repo_root=repo_root, orchestration_id=oid, status="fail",
+                reason_code="validate_judge_structural_violation_code", reason_detail="code",
+            )
+            enable_checkpoint_resume(repo_root, oid)
+            meta = json.loads((root / "orchestration_meta.json").read_text(encoding="utf-8"))
+            self.assertNotIn("resume_directive", meta)
 
 
 if __name__ == "__main__":

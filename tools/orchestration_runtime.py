@@ -8772,6 +8772,58 @@ def check_step_completed(
     }
 
 
+def _derive_resume_directive(
+    repo_root: Path,
+    orchestration_id: str,
+    reason_code: str | None,
+) -> dict[str, Any] | None:
+    """Build a `resume_directive` for a cross-phase Compile retry on resume.
+
+    A terminal `*_ir` attribution (e.g. `validate_judge_structural_violation_ir`)
+    routes the retry to Compile, but the resumed run cannot proceed until the
+    checkpointed-pass Compile/Generate/Build phases are reopened (see `reopen_phase`).
+    Reading `failure_analysis.json#original_finding`, this records the parameters the
+    resumed orchestration agent feeds to `reopen-phase --from-phase compile` so the
+    resume is deterministic and does not re-derive the dead end (token-cost saver).
+    Returns None when the reason does not map to a Compile reopen or the finding
+    evidence is incomplete — the agent then falls back to the decision table.
+    """
+    # Gate on the CURRENT terminal reason, not just `failure_analysis.json`. The
+    # attribution=ir reason codes carry the `_ir` suffix (e.g.
+    # `validate_judge_structural_violation_ir`); a non-ir resume must not emit a
+    # directive off a stale ir `original_finding` left in failure_analysis.json.
+    if not isinstance(reason_code, str) or not reason_code.strip().lower().endswith("_ir"):
+        return None
+    fa_path = _orchestration_root(repo_root, orchestration_id) / "failure_analysis.json"
+    if not fa_path.exists():
+        return None
+    try:
+        fa = _read_json(fa_path)
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(fa, dict):
+        return None
+    finding = fa.get("original_finding")
+    if not isinstance(finding, dict):
+        return None
+    if str(finding.get("attribution") or "").strip().lower() != "ir":
+        return None
+    node_key = fa.get("node_key")
+    trigger = finding.get("failed_substep_agent_run_id")
+    if not (isinstance(node_key, str) and node_key.strip()):
+        return None
+    if not (isinstance(trigger, str) and trigger.strip()):
+        return None
+    return {
+        "reopen_from": "compile",
+        "node_key": node_key.strip(),
+        "trigger_agent_run_id": trigger.strip(),
+        "finding_id": finding.get("finding_id"),
+        "reason_code": reason_code.strip(),
+        "source": "failure_analysis.original_finding",
+    }
+
+
 def enable_checkpoint_resume(
     repo_root: Path,
     orchestration_id: str,
@@ -8821,6 +8873,7 @@ def enable_checkpoint_resume(
         # in-progress lifecycle so its eventual set-status(pass/fail) is a valid
         # forward transition from `running` rather than a rejected terminal-to-terminal one.
         meta["resumed_from_status"] = prior_status
+        prior_reason_code = meta.get("reason_code")
         for live_field, archive_field in (
             ("reason_code", "resumed_from_reason_code"),
             ("reason_detail", "resumed_from_reason_detail"),
@@ -8829,6 +8882,22 @@ def enable_checkpoint_resume(
             if meta.get(live_field) is not None:
                 meta[archive_field] = meta.get(live_field)
                 meta.pop(live_field, None)
+        # When the prior failure was a cross-phase Compile retry (attribution=ir),
+        # record the parameters the resumed agent feeds to `reopen-phase` so the
+        # checkpointed-pass upstream phases are reopened deterministically rather
+        # than the resume re-running only Validate and reproducing the same fail.
+        directive = _derive_resume_directive(
+            repo_root,
+            orchestration_id,
+            prior_reason_code if isinstance(prior_reason_code, str) else None,
+        )
+        if directive is not None:
+            meta["resume_directive"] = directive
+        else:
+            # Drop a directive left by a prior IR resume; the resumed agent is told
+            # to honor `resume_directive` first, so a stale node/trigger would make an
+            # unrelated later resume reopen Compile with the wrong parameters.
+            meta.pop("resume_directive", None)
         meta.pop("finished_at", None)
         meta.pop("detected_at", None)
         meta["status"] = "running"
@@ -10110,9 +10179,32 @@ def _validate_orchestration_completion_for_pass(
                 f"agent_graph edge child_agent_run_id missing from agent_runs.jsonl: index={idx}"
             )
 
+    # Runs tombstoned by a `reopen-phase` cross-phase retry are prior attempts for a
+    # reopened phase: their step_result.json was archived aside and a fresh attempt
+    # now vouches the phase. Exempt them from the terminal/vouch requirements below —
+    # otherwise the orphaned superseded substep rows would block the resumed pass.
+    superseded_run_ids = _load_superseded_run_ids(repo_root, orchestration_id)
+    # The (node_key, phase) pairs a reopen invalidated, derived from the tombstoned
+    # runs' own records. Each must regain at least one fresh (non-superseded) terminal
+    # run below before pass — otherwise an orchestration could be marked pass right
+    # after `reopen-phase` archived the only evidence and reset phase_state, with no
+    # replacement attempt yet.
+    reopened_node_phases: set[tuple[str, str]] = set()
+    for sid in superseded_run_ids:
+        rec = runs.get(sid)
+        if not isinstance(rec, dict):
+            continue
+        nk = rec.get("node_key")
+        st = rec.get("step")
+        if isinstance(nk, str) and nk.strip() and isinstance(st, str) and st.strip():
+            reopened_node_phases.add((nk.strip(), st.strip().lower()))
+    fresh_node_phases: set[tuple[str, str]] = set()
+
     for run_id, payload in runs.items():
         role = payload.get("agent_role")
         if not isinstance(role, str) or role not in {"step", "substep"}:
+            continue
+        if run_id in superseded_run_ids:
             continue
         status = payload.get("status")
         if not isinstance(status, str) or status.strip().lower() not in TERMINAL_STATUSES:
@@ -10135,6 +10227,18 @@ def _validate_orchestration_completion_for_pass(
                 raise RuntimeError(
                     f"step_result.json missing substep_agent_run_ids entry for substep agent_run_id={run_id}"
                 )
+        fresh_node_phases.add((node_key.strip(), step_token))
+
+    # A reopened phase must have a replacement: at least one fresh (non-superseded)
+    # terminal run vouched above. Without this, the superseded-run exemption would let
+    # pass succeed on reopened phases whose evidence was archived and not yet rebuilt.
+    missing_replacements = sorted(reopened_node_phases - fresh_node_phases)
+    if missing_replacements:
+        detail = ", ".join(f"{nk}:{ph}" for nk, ph in missing_replacements)
+        raise RuntimeError(
+            "cannot mark orchestration pass: reopened phase(s) have no fresh (non-superseded) "
+            f"run after reopen-phase — re-run them before pass: {detail}"
+        )
 
 
 _STEP_META_FILENAME = STAGE_META_FILENAME_BY_STEP
@@ -13893,6 +13997,266 @@ def repair_step_result_executor(
     }
 
 
+def _reopen_dir(repo_root: Path, orchestration_id: str) -> Path:
+    return _orchestration_root(repo_root, orchestration_id) / "reopen"
+
+
+def _superseded_runs_path(repo_root: Path, orchestration_id: str) -> Path:
+    return _reopen_dir(repo_root, orchestration_id) / "superseded_runs.json"
+
+
+def _reopen_log_path(repo_root: Path, orchestration_id: str) -> Path:
+    return _reopen_dir(repo_root, orchestration_id) / "reopen_log.jsonl"
+
+
+def _load_superseded_run_ids(repo_root: Path, orchestration_id: str) -> set[str]:
+    """The set of step/substep agent_run_ids tombstoned by a `reopen-phase` call.
+
+    A superseded run is a prior cross-phase-retry attempt for a reopened phase: it
+    is exempt from the `_validate_orchestration_completion_for_pass` terminal/vouch
+    requirements because its `step_result.json` was archived aside and a fresh
+    attempt now vouches the phase. Returns an empty set when no reopen has occurred
+    (tolerant of a missing / malformed file — a corrupt tombstone must never wedge
+    the completion check, only widen the vouch requirement back to every run).
+    """
+    path = _superseded_runs_path(repo_root, orchestration_id)
+    if not path.exists():
+        return set()
+    try:
+        data = _read_json(path)
+    except (OSError, json.JSONDecodeError):
+        return set()
+    if isinstance(data, dict):
+        ids = data.get("superseded_agent_run_ids")
+    else:
+        ids = data
+    if not isinstance(ids, list):
+        return set()
+    return {s.strip() for s in ids if isinstance(s, str) and s.strip()}
+
+
+def reopen_phase(
+    repo_root: Path,
+    orchestration_id: str,
+    *,
+    node_key: str,
+    from_phase: str,
+    reason: str,
+    trigger_agent_run_id: str,
+    finding_id: str | None = None,
+) -> dict[str, Any]:
+    """Reopen a checkpointed-pass phase and everything downstream for a node.
+
+    Makes the decision table's cross-phase retry (`structural_violation`/`ir` ->
+    Compile, or `Generate.verify` `ir_inconsistency` -> Compile) executable in
+    place. Once Compile has produced a `pass` step_result + checkpoint entry, the
+    retry cannot be expressed: `check_step_completed` keys "done" on artifact-hash
+    integrity (a stale-but-intact IR reads `integrity=ok`), the phase sits at
+    `step_result_written` (not the `child_finished` the write path needs), and
+    `retry_decisions` only models within-step substep retries. This invalidates the
+    `from_phase` and all downstream phases so the orchestration agent re-runs
+    `Compile -> Generate -> Build -> Validate` against a corrected IR.
+
+    Temporal-cut supersede model (mirrors the orphan-tombstone precedent): every
+    step/substep run recorded for the reopened phases *before* this call is snapshot
+    into `reopen/superseded_runs.json` and exempted from the completion-vouch
+    requirement; every run created afterwards is the new attempt, vouched normally.
+
+    Operations (idempotent): (1) validate the trigger is a recorded terminal
+    non-pass substep/step strictly downstream of `from_phase`; (2) snapshot the
+    superseded runs + append `reopen/reopen_log.jsonl`; (3) archive each affected
+    `step_result.json` to `step_result.superseded.<seq>.json` (drops it from the
+    `_iter_step_result_paths` glob and frees the deterministic executor path);
+    (4) drop the affected `completed_steps` checkpoint entries; (5) reset the
+    affected `phase_state` node_states to `not_started`.
+    """
+    _require_preflight_launchable(repo_root, orchestration_id, enforce_live_probe=False)
+
+    from_token = from_phase.strip().lower()
+    if from_token not in STEP_KEYS_FOR_NODE_STATE:
+        raise RuntimeError(
+            f"reopen-phase: unsupported --from-phase {from_phase!r}; expected one of "
+            f"{list(STEP_KEYS_FOR_NODE_STATE)}"
+        )
+    from_idx = STEP_KEYS_FOR_NODE_STATE.index(from_token)
+    affected_phases = list(STEP_KEYS_FOR_NODE_STATE[from_idx:])
+
+    node_key_norm = node_key.strip()
+    node_safe = _node_key_to_safe(node_key_norm)
+    root = _orchestration_root(repo_root, orchestration_id)
+    runs = _load_run_records(root)
+
+    # Validate the trigger: a real terminal non-pass step/substep run for this node,
+    # whose phase is strictly downstream of `from_phase`. This is the anti-abuse gate
+    # — reopen must never erase a genuinely-passing pipeline; it can only follow a
+    # downstream phase that actually failed and attributed back to `from_phase`
+    # (mirrors the Compile-retry launch contract in phase_04_validate.md).
+    trigger = runs.get(trigger_agent_run_id.strip())
+    if not isinstance(trigger, dict):
+        raise RuntimeError(
+            f"reopen-phase: --trigger-agent-run-id {trigger_agent_run_id!r} not found in agent_runs.jsonl"
+        )
+    trig_role = str(trigger.get("agent_role") or "").strip().lower()
+    if trig_role not in {"step", "substep"}:
+        raise RuntimeError(
+            f"reopen-phase: trigger {trigger_agent_run_id!r} must be a step/substep run (role={trig_role!r})"
+        )
+    trig_node = str(trigger.get("node_key") or "").strip()
+    if trig_node != node_key_norm:
+        raise RuntimeError(
+            f"reopen-phase: trigger node_key {trig_node!r} does not match --node-key {node_key_norm!r}"
+        )
+    trig_step = str(trigger.get("step") or "").strip().lower()
+    if trig_step not in STEP_KEYS_FOR_NODE_STATE or STEP_KEYS_FOR_NODE_STATE.index(trig_step) <= from_idx:
+        raise RuntimeError(
+            f"reopen-phase: trigger phase {trig_step!r} must be strictly downstream of "
+            f"--from-phase {from_token!r}"
+        )
+    trig_status = str(trigger.get("status") or "").strip().lower()
+    if trig_status not in TERMINAL_STATUSES or trig_status == "pass":
+        raise RuntimeError(
+            f"reopen-phase: trigger {trigger_agent_run_id!r} must be a terminal non-pass run "
+            f"(status={trig_status!r}); refuse to reopen a passing pipeline"
+        )
+
+    existing = _load_superseded_run_ids(repo_root, orchestration_id)
+
+    # Idempotency guard. A redundant re-invocation carries a trigger that a prior
+    # reopen already superseded; re-snapshotting would tombstone the in-progress
+    # fresh attempt's runs (recorded after that reopen) and archive their new
+    # `step_result.json`, discarding retry progress. No-op in that case. A genuine
+    # *subsequent* reopen — the fresh attempt itself failed again and attributed
+    # back to `from_phase` — carries a NEW, not-yet-superseded trigger and proceeds
+    # (correctly superseding the fresh attempt and starting another).
+    # `superseded_runs.json` is written LAST, as the atomic commit marker: the
+    # trigger appears in the snapshot (it is a downstream substep of an affected
+    # phase), so `trigger in existing` holds only once a prior reopen fully
+    # completed. A reopen interrupted before the marker (checkpoint still stale,
+    # phase_state not reset) therefore leaves the trigger NOT superseded, so this
+    # guard does not fire and the retry re-runs the remaining (idempotent) cleanup.
+    if trigger_agent_run_id.strip() in existing:
+        return {
+            "status": "noop",
+            "orchestration_id": orchestration_id,
+            "node_key": node_key_norm,
+            "from_phase": from_token,
+            "affected_phases": affected_phases,
+            "reason": "trigger already superseded by a fully-applied prior reopen; nothing to reopen",
+            "superseded_run_count": len(existing),
+        }
+
+    # (1) Snapshot every step/substep run for this node in an affected phase. The
+    # temporal cut: these become superseded; anything recorded after this call is
+    # the new attempt.
+    superseded_now = sorted(
+        arid
+        for arid, rec in runs.items()
+        if isinstance(rec, dict)
+        and str(rec.get("agent_role") or "").strip().lower() in {"step", "substep"}
+        and str(rec.get("node_key") or "").strip() == node_key_norm
+        and str(rec.get("step") or "").strip().lower() in affected_phases
+    )
+
+    log_path = _reopen_log_path(repo_root, orchestration_id)
+    prior_reopens = 0
+    if log_path.exists():
+        prior_reopens = sum(
+            1 for line in log_path.read_text(encoding="utf-8").splitlines() if line.strip()
+        )
+    reopen_seq = prior_reopens + 1
+
+    # (2) Archive the affected step_results aside so they drop out of the vouch glob
+    # and free the deterministic executor path for the new write. Idempotent on a
+    # post-crash retry: the canonical files are already renamed, so the glob is empty.
+    archived: list[str] = []
+    for phase in affected_phases:
+        phase_dir = root / "steps" / node_safe / phase
+        if not phase_dir.exists():
+            continue
+        for result_path in sorted(phase_dir.glob("*/step_result.json")):
+            archived_path = result_path.with_name(f"step_result.superseded.{reopen_seq}.json")
+            result_path.rename(archived_path)
+            archived.append(
+                str(archived_path.relative_to(repo_root))
+                if archived_path.is_relative_to(repo_root)
+                else str(archived_path)
+            )
+
+    # (3) Drop the affected checkpoint entries so check_step_completed re-runs them.
+    checkpoint = _load_checkpoint(repo_root, orchestration_id)
+    dropped_checkpoint_steps: list[str] = []
+    if isinstance(checkpoint, dict):
+        steps = checkpoint.get("completed_steps")
+        if isinstance(steps, list):
+            kept = []
+            for entry in steps:
+                if (
+                    isinstance(entry, dict)
+                    and entry.get("node_key") == node_key_norm
+                    and str(entry.get("step") or "").strip().lower() in affected_phases
+                ):
+                    dropped_checkpoint_steps.append(str(entry.get("step")))
+                    continue
+                kept.append(entry)
+            if len(kept) != len(steps):
+                checkpoint["completed_steps"] = kept
+                checkpoint["last_updated_at"] = _utc_now_iso()
+                _write_json(_checkpoint_path(repo_root, orchestration_id), checkpoint)
+
+    # (4) Reset the affected phase_state node_states so the phases are re-runnable.
+    for phase in affected_phases:
+        _transition_node_step_phase_state(
+            repo_root,
+            orchestration_id,
+            node_key=node_key_norm,
+            step=phase,
+            new_state="not_started",
+            event="reopen_phase",
+            agent_run_id=trigger_agent_run_id.strip(),
+        )
+
+    # (5) Append the audit log, then commit by writing the superseded set LAST. Only
+    # after this does `trigger in existing` hold, gating the no-op above on full
+    # completion of steps (1)-(4).
+    log_record = {
+        "at": _utc_now_iso(),
+        "reopen_seq": reopen_seq,
+        "node_key": node_key_norm,
+        "from_phase": from_token,
+        "affected_phases": affected_phases,
+        "reason": reason,
+        "trigger_agent_run_id": trigger_agent_run_id.strip(),
+        "finding_id": finding_id,
+        "superseded_agent_run_ids": superseded_now,
+        "archived_step_results": archived,
+    }
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    with log_path.open("a", encoding="utf-8") as fh:
+        fh.write(json.dumps(log_record, ensure_ascii=False) + "\n")
+
+    merged_ids = sorted(existing | set(superseded_now))
+    _write_json(
+        _superseded_runs_path(repo_root, orchestration_id),
+        {
+            "orchestration_id": orchestration_id,
+            "superseded_agent_run_ids": merged_ids,
+        },
+    )
+
+    return {
+        "status": "reopened",
+        "orchestration_id": orchestration_id,
+        "node_key": node_key_norm,
+        "from_phase": from_token,
+        "affected_phases": affected_phases,
+        "reopen_seq": reopen_seq,
+        "superseded_run_count": len(superseded_now),
+        "archived_step_results": archived,
+        "dropped_checkpoint_steps": dropped_checkpoint_steps,
+        "next_action": f"relaunch from {from_token}",
+    }
+
+
 def repair_all_step_result_executors(
     repo_root: Path,
     orchestration_id: str,
@@ -15545,6 +15909,44 @@ def main(argv: list[str] | None = None) -> int:
     repair_step_executor_parser.add_argument("--node-key", required=True)
     repair_step_executor_parser.add_argument("--step", required=True)
 
+    reopen_phase_parser = subparsers.add_parser(
+        "reopen-phase",
+        help=(
+            "Reopen a checkpointed-pass phase and everything downstream so a "
+            "cross-phase retry (Validate.judge structural_violation/ir -> Compile, "
+            "or Generate.verify ir_inconsistency -> Compile) runs in place. Snapshots "
+            "the prior attempt's runs as superseded (exempt from the completion "
+            "vouch), archives their step_results aside, drops the affected checkpoint "
+            "entries, and resets the affected phase_state to not_started. Idempotent. "
+            "Requires --trigger-agent-run-id to be a terminal non-pass step/substep "
+            "strictly downstream of --from-phase."
+        ),
+    )
+    reopen_phase_parser.add_argument("--repo-root", required=True)
+    reopen_phase_parser.add_argument("--orchestration-id", required=True)
+    reopen_phase_parser.add_argument("--node-key", required=True, help=_NODE_KEY_HELP)
+    reopen_phase_parser.add_argument(
+        "--from-phase",
+        required=True,
+        choices=list(STEP_KEYS_FOR_NODE_STATE),
+        help="The earliest phase to reopen; it and all downstream phases are invalidated.",
+    )
+    reopen_phase_parser.add_argument(
+        "--reason",
+        required=True,
+        help="Reason code for the reopen (e.g. validate_judge_structural_violation_ir).",
+    )
+    reopen_phase_parser.add_argument(
+        "--trigger-agent-run-id",
+        required=True,
+        help="agent_run_id of the failed downstream substep/step that attributed back to --from-phase.",
+    )
+    reopen_phase_parser.add_argument(
+        "--finding-id",
+        default=None,
+        help="Optional semantic_review finding id that drove the attribution.",
+    )
+
     dismiss_viol_parser = subparsers.add_parser(
         "dismiss-violation",
         help=(
@@ -16079,6 +16481,20 @@ def main(argv: list[str] | None = None) -> int:
             )
         except (ValueError, RuntimeError) as exc:
             print(f"repair-step-result-executor: {exc}", file=sys.stderr)
+            return 1
+    elif args.command == "reopen-phase":
+        try:
+            result = reopen_phase(
+                repo_root=repo_root,
+                orchestration_id=args.orchestration_id,
+                node_key=args.node_key,
+                from_phase=args.from_phase,
+                reason=args.reason,
+                trigger_agent_run_id=args.trigger_agent_run_id,
+                finding_id=args.finding_id,
+            )
+        except (ValueError, RuntimeError) as exc:
+            print(f"reopen-phase: {exc}", file=sys.stderr)
             return 1
     elif args.command == "dismiss-violation":
         try:
