@@ -5460,6 +5460,8 @@ end program shallow_water2d_runner
         remove_validate_step_result: bool = False,
         phantom_judge_request_arid: str | None = None,
         reparent_removed_child_to: str | None = None,
+        divert_removed_child_to_invalid: bool = False,
+        superseded_arids: list[str] | None = None,
     ) -> list[str]:
         """Build the minimal execution + orchestration tree, optionally drop
         ``removed_arid`` from agent_runs.jsonl (leaving its agent_graph edge
@@ -5469,7 +5471,13 @@ end program shallow_water2d_runner
         ``phantom_judge_request_arid`` writes a validate/judge launch request for
         an arid that is NOT present in agent_graph.json or agent_runs.jsonl — a
         stale/mistyped/cross-orchestration id with no dangling edge — to verify it
-        cannot trigger any exemption."""
+        cannot trigger any exemption.
+
+        ``divert_removed_child_to_invalid`` re-appends the removed child's row to
+        agent_runs_invalid.jsonl (the terminal-payload-validation diversion, e.g. an
+        unauthorized write). ``superseded_arids`` writes
+        reopen/superseded_runs.json — together these model a reopen-consumed
+        unauthorized-write trigger whose kept agent_graph edge must be exempted."""
         _seed_shape_expr_schema_into(repo_root)
         model_text = """module shallow_water2d_model
 use dynamics_shallow_water_flux_2d_rusanov_p0_model
@@ -5501,12 +5509,30 @@ end program shallow_water2d_runner
             for line in runs_path.read_text(encoding="utf-8").splitlines()
             if line.strip()
         ]
+        removed_items = [
+            item for item in items if item.get("agent_run_id") == removed_arid
+        ] if removed_arid is not None else []
         if removed_arid is not None:
             items = [item for item in items if item.get("agent_run_id") != removed_arid]
         runs_path.write_text(
             "\n".join(json.dumps(item, ensure_ascii=False) for item in items) + "\n",
             encoding="utf-8",
         )
+        if divert_removed_child_to_invalid and removed_items:
+            (orch_root / "agent_runs_invalid.jsonl").write_text(
+                "\n".join(json.dumps(item, ensure_ascii=False) for item in removed_items)
+                + "\n",
+                encoding="utf-8",
+            )
+        if superseded_arids:
+            (orch_root / "reopen").mkdir(parents=True, exist_ok=True)
+            _write_json(
+                orch_root / "reopen" / "superseded_runs.json",
+                {
+                    "orchestration_id": "orch_test_001",
+                    "superseded_agent_run_ids": list(superseded_arids),
+                },
+            )
         if reparent_removed_child_to is not None and removed_arid is not None:
             graph_path = orch_root / "agent_graph.json"
             graph = json.loads(graph_path.read_text(encoding="utf-8"))
@@ -5730,6 +5756,74 @@ end program shallow_water2d_runner
             self.assertFalse(
                 self._has_dangling_edge(violations, judge_arid),
                 msg=f"in-flight judge missing-child record should be tolerated; got: {violations}",
+            )
+            # ...but the substep-parent hierarchy violation must surface.
+            self.assertTrue(
+                any("substep must not be parent role" in v for v in violations),
+                msg=f"substep-parent edge must still fail closed; got: {violations}",
+            )
+
+    def test_pre_judge_exempts_superseded_invalid_unauthorized_write_edge(self) -> None:
+        """A reopen-consumed unauthorized-write trigger lives only in
+        agent_runs_invalid.jsonl (no agent_runs.jsonl row), is listed in
+        reopen/superseded_runs.json, and its agent_graph edge is deliberately KEPT.
+        The pre_judge edge scan must tolerate that kept edge (mirroring
+        _validate_orchestration_completion_for_pass) so a clean reopened run can pass."""
+        execute_arid = "substep_run_validate_execute_001"
+        with tempfile.TemporaryDirectory() as tmp:
+            violations = self._violations_with_removed_child(
+                Path(tmp),
+                removed_arid=execute_arid,
+                divert_removed_child_to_invalid=True,
+                superseded_arids=[execute_arid],
+            )
+            self.assertFalse(
+                self._has_dangling_edge(violations, execute_arid),
+                msg=(
+                    "a superseded child diverted to agent_runs_invalid.jsonl must not "
+                    f"trip the dangling-edge check; got: {violations}"
+                ),
+            )
+
+    def test_pre_judge_still_fails_unconsumed_invalid_edge(self) -> None:
+        """Safety: an invalid-log diversion that has NOT been consumed by reopen
+        (absent from superseded_runs.json) must still fail closed — the kept edge
+        exists precisely to surface an un-consumed invalid terminal attempt."""
+        execute_arid = "substep_run_validate_execute_001"
+        with tempfile.TemporaryDirectory() as tmp:
+            violations = self._violations_with_removed_child(
+                Path(tmp),
+                removed_arid=execute_arid,
+                divert_removed_child_to_invalid=True,
+                superseded_arids=None,  # not reopen-consumed
+            )
+            self.assertTrue(
+                self._has_dangling_edge(violations, execute_arid),
+                msg=(
+                    "an un-consumed invalid-log child (no superseded_runs entry) must "
+                    f"still fail the dangling-edge check; got: {violations}"
+                ),
+            )
+
+    def test_superseded_invalid_edge_with_substep_parent_still_fails(self) -> None:
+        """The superseded-invalid exemption suppresses ONLY the missing-child
+        record. The parent role is known from agent_runs.jsonl, so a malformed edge
+        whose parent is a substep must still fail closed even when the child is a
+        reopen-consumed invalid-log run (mirrors the in-flight exemption's behavior)."""
+        execute_arid = "substep_run_validate_execute_001"
+        substep_parent = "substep_run_compile_generate_001"  # a recorded substep
+        with tempfile.TemporaryDirectory() as tmp:
+            violations = self._violations_with_removed_child(
+                Path(tmp),
+                removed_arid=execute_arid,
+                divert_removed_child_to_invalid=True,
+                superseded_arids=[execute_arid],
+                reparent_removed_child_to=substep_parent,
+            )
+            # The missing-child record itself is still tolerated...
+            self.assertFalse(
+                self._has_dangling_edge(violations, execute_arid),
+                msg=f"superseded-invalid missing-child record should be tolerated; got: {violations}",
             )
             # ...but the substep-parent hierarchy violation must surface.
             self.assertTrue(

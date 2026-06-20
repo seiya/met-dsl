@@ -7237,6 +7237,53 @@ def _validate_orchestration_hierarchy(
                             f"{runs_path}:line {idx + 1} context_id must not be sequential placeholder ({context_id})"
                         )
 
+        # Children that a `reopen-phase` cross-phase retry consumed AND that were
+        # diverted to agent_runs_invalid.jsonl (terminal-payload validation, e.g. an
+        # unauthorized write). record-launch wrote their agent_graph edge before the
+        # run, and _prune_orphan_agent_graph_edges deliberately KEEPS that edge (so an
+        # UN-consumed invalid attempt still surfaces). Once reopen has superseded such
+        # a run, the kept edge must not block pass — mirror the same-named exemption in
+        # _validate_orchestration_completion_for_pass (orchestration_runtime.py). Both
+        # loads are fail-tolerant: a missing/corrupt file widens the requirement back to
+        # every edge rather than wedging the gate.
+        superseded_arids: set[str] = set()
+        superseded_path = orchestration_dir / "reopen" / "superseded_runs.json"
+        if superseded_path.is_file():
+            try:
+                superseded_doc = _read_json(superseded_path)
+            except (OSError, json.JSONDecodeError):
+                superseded_doc = None
+            superseded_ids = (
+                superseded_doc.get("superseded_agent_run_ids")
+                if isinstance(superseded_doc, dict)
+                else superseded_doc
+            )
+            if isinstance(superseded_ids, list):
+                superseded_arids = {
+                    s.strip() for s in superseded_ids if isinstance(s, str) and s.strip()
+                }
+        invalid_arids: set[str] = set()
+        invalid_runs_path = orchestration_dir / "agent_runs_invalid.jsonl"
+        if invalid_runs_path.is_file():
+            try:
+                invalid_lines = invalid_runs_path.read_text(encoding="utf-8").splitlines()
+            except OSError:
+                invalid_lines = []
+            for raw_invalid in invalid_lines:
+                token = raw_invalid.strip()
+                if not token:
+                    continue
+                try:
+                    invalid_item = json.loads(token)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(invalid_item, dict):
+                    continue
+                invalid_arid = invalid_item.get("agent_run_id")
+                if isinstance(invalid_arid, str) and invalid_arid.strip():
+                    invalid_arids.add(invalid_arid.strip())
+        superseded_invalid_arids = superseded_arids & invalid_arids
+
         for edge_idx, parent_id, child_id in graph_edges:
             parent_role = run_roles.get(parent_id)
             child_role = run_roles.get(child_id)
@@ -7259,6 +7306,27 @@ def _validate_orchestration_hierarchy(
                     # a substep can never be a parent, regardless of the in-flight
                     # child, so keep failing closed on that malformed hierarchy.
                     observed_inflight_dangling.add(child_id)
+                    if parent_role == "substep":
+                        violations.append(
+                            f"{graph_path}:edges[{edge_idx}] substep must not be parent role"
+                        )
+                    continue
+                if child_id in superseded_invalid_arids:
+                    # A reopen-consumed unauthorized-write trigger: superseded by
+                    # reopen-phase AND diverted to agent_runs_invalid.jsonl (no
+                    # agent_runs.jsonl row). Its edge is deliberately KEPT by
+                    # _prune_orphan_agent_graph_edges so an UN-consumed invalid attempt
+                    # still fails; once reopen has consumed and superseded it, tolerate
+                    # the kept edge. The tight superseded-AND-invalid conjunction keeps
+                    # an un-consumed invalid terminal attempt (not in superseded_runs)
+                    # and an arbitrarily corrupt edge failing closed. Mirrors the
+                    # same-named exemption in _validate_orchestration_completion_for_pass.
+                    #
+                    # As with the in-flight exemption above, this tolerates ONLY the
+                    # missing-child record. The parent role is known from
+                    # agent_runs.jsonl and the hierarchy invariant still holds: a
+                    # substep can never be a parent, so keep failing closed on that
+                    # malformed edge.
                     if parent_role == "substep":
                         violations.append(
                             f"{graph_path}:edges[{edge_idx}] substep must not be parent role"
