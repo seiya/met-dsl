@@ -449,6 +449,58 @@ class RunWorkflowTests(unittest.TestCase):
         out = json.loads(buf.getvalue().strip().splitlines()[-1])
         return code, out, observed_calls
 
+    def test_node_start_event_emitted_once_on_stdout(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._seed_spec_tree(repo_root)
+
+            def fake_runtime_command(root, env, args):  # type: ignore[no-untyped-def]
+                if args[0] == "init":
+                    return run_workflow.RuntimeResult(
+                        payload={"status": "ok", "orchestration_agent_run_id": "orch_agent_run_002"},
+                        raw_stdout="{}",
+                    )
+                if args[0] == "preflight":
+                    return run_workflow.RuntimeResult(
+                        payload={
+                            "status": "pass",
+                            "can_launch_step_agents": True,
+                            "can_launch_substep_agents": True,
+                        },
+                        raw_stdout="{}",
+                    )
+                return run_workflow.RuntimeResult(payload={"status": "ok"}, raw_stdout="{}")
+
+            original = run_workflow._runtime_command
+            buf = io.StringIO()
+            try:
+                run_workflow._runtime_command = fake_runtime_command  # type: ignore[assignment]
+                with redirect_stdout(buf):
+                    code = run_workflow.main(
+                        [
+                            "spec/problem/test.md",
+                            "build",
+                            "--repo-root",
+                            str(repo_root),
+                            "--orchestration-id",
+                            "orch_node_start",
+                            "--no-invoke-llm",
+                        ]
+                    )
+            finally:
+                run_workflow._runtime_command = original  # type: ignore[assignment]
+
+            self.assertEqual(code, 0)
+            events = [json.loads(line) for line in buf.getvalue().splitlines() if line.strip()]
+            node_starts = [e for e in events if e.get("event") == "node_start"]
+            self.assertEqual(len(node_starts), 1)
+            self.assertEqual(node_starts[0]["spec_ref"], "spec/problem/test.md")
+            self.assertEqual(node_starts[0]["until_phase"], "Build")
+            self.assertEqual(node_starts[0]["orchestration_id"], "orch_node_start")
+            self.assertFalse(node_starts[0]["resume"])
+            # node_start carries no `ts` (consistent with sibling info events)
+            self.assertNotIn("ts", node_starts[0])
+
     def test_resume_recovers_params_and_uses_checkpoint_init(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
@@ -1651,7 +1703,7 @@ class RunWorkflowTests(unittest.TestCase):
                 run_workflow._runtime_command = original_runtime  # type: ignore[assignment]
 
             self.assertEqual(code, 2)
-            payload = json.loads(stdout.getvalue().strip())
+            payload = json.loads(stdout.getvalue().strip().splitlines()[-1])
             self.assertEqual(payload["status"], "fail")
             self.assertEqual(payload["reason"], "runtime_command_failed")
             self.assertEqual(payload["orchestration_id"], "orch_init_fail")
@@ -1698,7 +1750,7 @@ class RunWorkflowTests(unittest.TestCase):
                 run_workflow._runtime_command = original_runtime  # type: ignore[assignment]
 
             self.assertEqual(code, 2)
-            payload = json.loads(stdout.getvalue().strip())
+            payload = json.loads(stdout.getvalue().strip().splitlines()[-1])
             self.assertEqual(payload["status"], "fail")
             self.assertEqual(payload["reason"], "runtime_command_failed")
             self.assertEqual(payload["orchestration_id"], "orch_preflight_fail")
@@ -1740,7 +1792,7 @@ class RunWorkflowTests(unittest.TestCase):
                 run_workflow._runtime_command = original_runtime  # type: ignore[assignment]
 
             self.assertEqual(code, 2)
-            payload = json.loads(stdout.getvalue().strip())
+            payload = json.loads(stdout.getvalue().strip().splitlines()[-1])
             self.assertEqual(payload["status"], "fail")
             self.assertEqual(payload["reason"], "runtime_command_failed")
             self.assertEqual(payload["orchestration_id"], "orch_init_missing_run_id")
@@ -1800,7 +1852,7 @@ class RunWorkflowTests(unittest.TestCase):
                 run_workflow.subprocess.run = original_subprocess_run  # type: ignore[assignment]
 
             self.assertEqual(code, 2)
-            payload = json.loads(stdout.getvalue().strip())
+            payload = json.loads(stdout.getvalue().strip().splitlines()[-1])
             self.assertEqual(payload["status"], "fail")
             self.assertEqual(payload["reason"], "workflow_failed")
             self.assertEqual(payload["workflow_mode"], "dev")

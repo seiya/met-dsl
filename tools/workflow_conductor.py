@@ -533,6 +533,17 @@ class Conductor:
     # --llm-command); empty falls back to the bare backend name.
     llm_command: str = ""
 
+    def emit(self, event: str, **fields: Any) -> None:
+        """Write one JSONL info event to stdout (the conductor runs in-process
+        under run_workflow.py, so these join its node-level event stream)."""
+        payload = {
+            "status": "info",
+            "event": event,
+            "orchestration_id": self.orchestration_id,
+            **fields,
+        }
+        print(json.dumps(payload, ensure_ascii=False), flush=True)
+
     def runtime(self, args: list[str]) -> dict[str, Any]:
         """Call an orchestration_runtime.py subcommand; return parsed JSON stdout."""
         proc = subprocess.run(
@@ -851,7 +862,8 @@ class Conductor:
                 node_key, phase, completed.get("agent_run_id"))
             if producer:
                 self._producer_arid[phase] = producer
-            return PhaseOutcome(phase, "pass", decision=RouteDecision("advance"))
+            return PhaseOutcome(phase, "pass", decision=RouteDecision("advance"),
+                                skipped=True)
         self.workflow_launch_check(node_key, phase, child_agent_role(phase))
         self._ensure_fresh_producer_id(refs, phase)
 
@@ -959,7 +971,19 @@ class Conductor:
         idx = 0
         while idx < len(phases):
             phase = phases[idx]
+            self.emit("phase_start", node_key=refs.node_key, phase=phase,
+                      attempt=attempts[phase] + 1)
+            phase_started = time.monotonic()
             outcome = self.run_phase(refs, phase, repair=pending_repair.pop(phase, None))
+            if outcome.skipped:
+                # Already checkpointed complete (resume): no body ran, so an
+                # elapsed time would be misleading — report it as skipped instead.
+                self.emit("phase_complete", node_key=refs.node_key, phase=phase,
+                          result="skipped")
+            else:
+                self.emit("phase_complete", node_key=refs.node_key, phase=phase,
+                          result=outcome.status,
+                          elapsed_seconds=round(time.monotonic() - phase_started, 2))
             if outcome.status == "pass":
                 idx += 1
                 continue
@@ -1069,6 +1093,10 @@ class PhaseOutcome:
     substep_arids: list[str] = field(default_factory=list)
     failed_substeps: list[str] = field(default_factory=list)
     decision: RouteDecision | None = None
+    # True when a --resume short-circuited the phase because it was already
+    # checkpointed complete (no body re-run). Lets conduct() avoid reporting a
+    # misleading ~0.0s elapsed time for a phase that did not actually execute.
+    skipped: bool = False
 
 
 # --- node resolution + id allocation + entrypoint ------------------------------

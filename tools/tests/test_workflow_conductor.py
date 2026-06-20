@@ -9,9 +9,11 @@ assembled. The decision-table tests pin the deterministic failure routing.
 from __future__ import annotations
 
 import glob
+import io
 import json
 import os
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
 
 import tools.workflow_conductor as wc
@@ -311,6 +313,48 @@ class ConductHappyPathTest(unittest.TestCase):
 
         # final set-status is pass
         self.assertEqual(c.calls[-1][1]["--status"], "pass")
+
+    def test_emits_phase_start_and_complete_with_elapsed(self) -> None:
+        c = self._conductor()
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            status = c.conduct(self._refs(), "validate")
+        self.assertEqual(status, "pass")
+        events = [json.loads(line) for line in buf.getvalue().splitlines() if line.strip()]
+        starts = [e for e in events if e["event"] == "phase_start"]
+        completes = [e for e in events if e["event"] == "phase_complete"]
+        # one start + one complete per phase, in order
+        self.assertEqual([e["phase"] for e in starts],
+                         ["compile", "generate", "build", "validate"])
+        self.assertEqual([e["phase"] for e in completes],
+                         ["compile", "generate", "build", "validate"])
+        for e in completes:
+            self.assertEqual(e["result"], "pass")
+            self.assertIsInstance(e["elapsed_seconds"], (int, float))
+            self.assertEqual(e["node_key"], "component/spec_x@0.1.0")
+            self.assertEqual(e["orchestration_id"], "orch_x")
+        for e in starts:
+            self.assertEqual(e["attempt"], 1)
+
+    def test_resume_skipped_phase_reports_skipped_without_elapsed(self) -> None:
+        c = self._conductor()
+        # compile is already checkpointed complete -> run_phase short-circuits.
+        c.check_step_completed = (  # type: ignore[method-assign]
+            lambda node_key, step: {"integrity": "ok", "agent_run_id": "prev"}
+            if step == "compile" else None
+        )
+        c._completed_producer_arid = lambda nk, ph, arid: ""  # type: ignore[method-assign]
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            status = c.conduct(self._refs(), "compile")
+        self.assertEqual(status, "pass")
+        completes = [
+            json.loads(line) for line in buf.getvalue().splitlines()
+            if line.strip() and json.loads(line)["event"] == "phase_complete"
+        ]
+        self.assertEqual(len(completes), 1)
+        self.assertEqual(completes[0]["result"], "skipped")
+        self.assertNotIn("elapsed_seconds", completes[0])
 
     def test_agent_run_json_carries_step_and_substep(self) -> None:
         c = self._conductor()

@@ -1240,6 +1240,23 @@ def _run_node(
         str(uuid.uuid4()) if (llm == "claude" and invoke_llm) else None
     )
 
+    # Announce node start on stdout (uniform for the single/target/dependency
+    # nodes), matching the JSONL info-event stream the rest of this driver emits.
+    print(
+        json.dumps(
+            {
+                "status": "info",
+                "event": "node_start",
+                "spec_ref": spec_ref,
+                "until_phase": until_phase,
+                "orchestration_id": orchestration_id,
+                "resume": resume_mode,
+            },
+            ensure_ascii=False,
+        ),
+        flush=True,
+    )
+
     try:
         if resume_mode:
             # Resume an existing orchestration: enable checkpoint resume (sets
@@ -2024,18 +2041,22 @@ def _run_with_dependency_closure(
                 )
             )
             return 2
+        # The per-node `node_start` event is emitted uniformly inside _run_node;
+        # here we only announce which dependency node (with its pretty label) the
+        # closure is about to drive, so the stream stays human-traceable.
         print(
             json.dumps(
                 {
                     "status": "info",
-                    "event": "dependency_node_start",
+                    "event": "dependency_node_begin",
                     "node": node_label,
                     "spec_ref": spec_ref,
                     "until_phase": dep_until_phase,
                     "orchestration_id": dep_orch_id,
                 },
                 ensure_ascii=False,
-            )
+            ),
+            flush=True,
         )
         rc = _run_node(
             repo_root=repo_root,
