@@ -6,14 +6,23 @@ The **canonical CLI reference for the frequent subcommands (Tier-A)** of `tools/
 
 For the rare subcommands (Tier-B: `init` / `preflight` / `preflight-status` / `record-timeout` / `read-checkpoint` / `verify-checkpoint-integrity` / `check-step-completed` / `orchestration-read` / `repair-agent-runs`), only an overview is in [docs/CLI_REFERENCE_RARE.md](CLI_REFERENCE_RARE.md), and the canonical source for details is `python3 tools/orchestration_runtime.py <sub> --help`.
 
-The information-acquisition policy per tool / subcommand (frequent vs rare, `--help` vs doc) uses the "CLI reference conventions" section of `CLAUDE.md` as the canonical source.
+This document is the canonical source for the **information-acquisition policy** per tool / subcommand (frequent vs rare, `--help` vs doc) — see the section below.
 
 When the argparse definition is updated, update this file in sync (during a `tools/orchestration_runtime.py` edit review, check for a missing addition to CLI_REFERENCE. `tools/tests/test_cli_reference_sync.py` mechanically takes the diff).
 
+## Information-acquisition policy
+
+Choose the path for obtaining CLI argument information based on the target subcommand's frequency, payload schema complexity, and doc synchronization cost (cross-backend; applies to Codex / Claude Code alike).
+
+- Frequent subcommands of `tools/orchestration_runtime.py` (the 13 Tier-A listed above): this document is canonical (complex payload schema, per-phase required-argument switching — `--help` alone is insufficient).
+- Rare subcommands of `tools/orchestration_runtime.py` (`init` / `preflight` / `preflight-status` / `record-timeout` / `read-checkpoint` / `verify-checkpoint-integrity` / `check-step-completed` / `orchestration-read` / `repair-agent-runs` / `repair-step-result-executor` / `reopen-phase` / `dismiss-violation`), and `tools/run_workflow.py` / `tools/validate_pipeline_semantics.py` / `tools/audit_orchestration.py`: `<tool> [<sub>] --help` is canonical. [docs/CLI_REFERENCE_RARE.md](CLI_REFERENCE_RARE.md) retains only an overview of the rare subcommands.
+- `tools/new_agent_run_id.py` takes no arguments. A step / substep (leaf) agent does not consult this policy: its `guarded-apply-patch` / `run-gate` invocations use the literal embedded in its launch prompt (rendered from `skills/workflow-orchestration/references/launch_prompts.md`).
+- During workflow execution, reading the `.py` implementations under `tools/` directly via the `Read` tool / `grep` / `sed` / `cat` etc. is forbidden (`forbid_tools_direct_read`, `read_manifest_read_guard`); the argparse output via `--help` is not blocked. During repository improvement / maintenance / testing / refactoring, `tools/*.py` is ordinary source code and may be inspected directly.
+
 Related canonical sources:
 - rare subcommand overview: [docs/CLI_REFERENCE_RARE.md](CLI_REFERENCE_RARE.md)
-- the startup contract of the whole workflow: `skills/workflow-orchestration/SKILL.md` and `skills/workflow-orchestration/references/startup_contract.md`
-- launch prompt templates: `skills/workflow-orchestration/references/launch_prompts.md`
+- workflow operation / startup: [docs/RUNBOOK.md](RUNBOOK.md) (operator procedure) and [docs/ORCHESTRATION.md](ORCHESTRATION.md) (conductor/orchestration contract)
+- launch prompt templates (rendered by the conductor's `record-launch`): `skills/workflow-orchestration/references/launch_prompts.md`
 - workspace artifact placement: `docs/WORKSPACE_LAYOUT.md`
 - hook recovery cheat sheet: `docs/RUNBOOK.md#hook-recovery`
 
@@ -26,7 +35,7 @@ Related canonical sources:
 - ISO 8601 timestamps are canonically UTC (`Z` suffix).
 - For JSON arguments (`--*-json`), be careful with shell quoting. For a complex payload, use a file specification like `--patch-file`.
 - **Terse stdout by default.** The high-frequency bookkeeping subcommands (`record-launch` / `record-agent-run` / `finalize-child` / `record-child-return` / `deactivate-child` / `record-reply` / `write-step-result` / `run-gate`) print **only the result fields the orchestration agent consumes downstream** to stdout, not the full payload. This keeps the orchestration's resident context small (its cache-read cost scales with context size × turn count). The full payload is always persisted to the canonical artifact files regardless (`launches/<arid>.*`, `agent_runs.jsonl`, `steps/.../step_result.json`, `gates/<arid>/<gate>.json`, etc.); pass `--verbose` to also emit the full JSON to stdout for debugging/audit. Soft-failure signals (`violations` / `error[s]` / `warning[s]`) are retained in terse output when present, and hard failures still exit non-zero via stderr.
-  - `record-launch` terse fields: `capability_token`, `capability_ref`, `read_access_manifest_ref`, `allowed_output_manifest_ref`, `sandbox_profile_ref`, `launch_prompt_ref`, and **`launch_prompt_text`** (the exact rendered prompt the orchestration passes verbatim to the Agent tool — it cannot read the template or the written prompt file). The remaining `launch_*_ref` / `child_launch_*_ref` paths are deterministic from `<orchestration_id>`+`<arid>` and are dropped from terse stdout.
+  - `record-launch` terse fields: `capability_token`, `capability_ref`, `read_access_manifest_ref`, `allowed_output_manifest_ref`, `sandbox_profile_ref`, `launch_prompt_ref`, and **`launch_prompt_text`** (the exact rendered prompt the orchestration passes verbatim to the leaf subprocess — it cannot read the template or the written prompt file). The remaining `launch_*_ref` / `child_launch_*_ref` paths are deterministic from `<orchestration_id>`+`<arid>` and are dropped from terse stdout.
   - `run-gate` terse keeps `result` (the `orchestration_read` content — child agents' only allowed path for those reads) in addition to `violations` / `gate_result_ref`.
 
 ---
@@ -39,9 +48,9 @@ The 13 subcommands whose details are covered in this file.
 |---|---|---|
 | `record-launch` | child-agent launch evidence + capability_token + manifest generation | [record-launch](#record-launch) |
 | `finalize-child` | one-call child finalization (record-child-return → deactivate-child → record-reply → record-agent-run) | [finalize-child](#finalize-child) |
-| `record-child-return` | Adv-20: record the Agent tool return ack | [record-child-return](#record-child-return) |
+| `record-child-return` | Adv-20: record the leaf return ack | [record-child-return](#record-child-return) |
 | `deactivate-child` | release the active_children marker | [deactivate-child](#deactivate-child) |
-| `record-reply` | overwrite launches/<arid>.reply.txt with the Agent tool response | [record-reply](#record-reply) |
+| `record-reply` | overwrite launches/<arid>.reply.txt with the leaf response | [record-reply](#record-reply) |
 | `record-agent-run` | append 1 line to agent_runs.jsonl + save agent.result.json/agent.summary.txt | [record-agent-run](#record-agent-run) |
 | `set-status` | update orchestration_meta.json status + terminate the orchestration row of agent_runs.jsonl in-place | [set-status](#set-status) |
 | `mark-dependency-readiness` | update the dependency_readiness detail flags and derive the top-level | [mark-dependency-readiness](#mark-dependency-readiness) |
@@ -181,7 +190,7 @@ Append 1 line to `agent_runs.jsonl`. For a step/substep role, also save `agent.r
 |---|---|---|
 | `agent_run_id` | yes | UUID |
 | `agent_role` | yes | `orchestration` / `step` / `substep` |
-| `agent_backend` | yes | `claude` / `codex` / `cursor` |
+| `agent_backend` | yes | `claude` / `codex` |
 | `status` | yes | `running` / `pass` / `fail` / `blocked` / `timeout` / `cancel` |
 | `started_at` | yes | ISO 8601 |
 | `agent_session_id` | yes for step/substep | in Claude Code, the same value as `agent_run_id` |
@@ -333,12 +342,12 @@ Below are the canonical keys of the dependency readiness that `workflow-launch-c
 | `dependency_readiness.detail.pipeline_ref_verified` | `generate` onward | |
 | `dependency_readiness.detail.aggregate_verdict_verified` | `validate` | |
 
-When not recorded or recorded with a value other than `true`, `workflow-launch-check` returns `fail_closed` (`reason_detail=direct_dependency_<step>_readiness_not_pass` or `dependency_readiness_detail_not_pass:<key>`). When the stored `dep_set_fingerprint` does not match the currently computed fingerprint, it is rejected with `reason_detail=dep_set_fingerprint_stale`. **Furthermore, when deps.yaml exists at launch time, the gate performs a live recompute and judges by the recomputed booleans, not the persisted booleans, as authoritative**: even if you directly edit `orchestration_meta.json` to forge the flag, if the live recompute returns false the gate rejects. When the live recompute fails, production returns a concrete reason **fail-closed**: `deps_yaml_missing_or_unparseable` (deps.yaml absent or YAML parse failure) and `deps_yaml_malformed_schema` (the schema is malformed) are distinguished (Codex round 25 F2). When test scaffolding needs the legacy fallback to persisted booleans, opt in with the environment variable `METDSL_DEP_READINESS_ALLOW_PERSISTED_FALLBACK=1` (do not set it in a production environment). PyYAML is lazily resolved only in the paths that parse deps.yaml / spec_catalog.yaml (`_read_deps_yaml`, `_load_spec_catalog_from_bytes`) (Codex round 27 F1). When not installed, a `RuntimeError` (with an install hint) propagates to the caller at the first YAML touch of these functions, preventing a silent fail-closed, while recovery / non-dep commands such as `set-status` / `record-timeout` / `workflow-launch-check` (leaf paths) can run even without PyYAML, avoiding a control-plane outage. The meta read + fingerprint recompute of `_dependency_ready` is serialized by an fcntl `LOCK_EX` on the same `orchestration_meta.json.lock` as `mark-dependency-readiness` / `write_preflight` / `update_orchestration_status` (Codex round 27 F2), so even if a writer and reader run simultaneously, a torn read will not falsely detect `dep_set_fingerprint_stale`. Reference: `skills/workflow-orchestration/SKILL.md` items 60-62.
+When not recorded or recorded with a value other than `true`, `workflow-launch-check` returns `fail_closed` (`reason_detail=direct_dependency_<step>_readiness_not_pass` or `dependency_readiness_detail_not_pass:<key>`). When the stored `dep_set_fingerprint` does not match the currently computed fingerprint, it is rejected with `reason_detail=dep_set_fingerprint_stale`. **Furthermore, when deps.yaml exists at launch time, the gate performs a live recompute and judges by the recomputed booleans, not the persisted booleans, as authoritative**: even if you directly edit `orchestration_meta.json` to forge the flag, if the live recompute returns false the gate rejects. When the live recompute fails, production returns a concrete reason **fail-closed**: `deps_yaml_missing_or_unparseable` (deps.yaml absent or YAML parse failure) and `deps_yaml_malformed_schema` (the schema is malformed) are distinguished (Codex round 25 F2). When test scaffolding needs the legacy fallback to persisted booleans, opt in with the environment variable `METDSL_DEP_READINESS_ALLOW_PERSISTED_FALLBACK=1` (do not set it in a production environment). PyYAML is lazily resolved only in the paths that parse deps.yaml / spec_catalog.yaml (`_read_deps_yaml`, `_load_spec_catalog_from_bytes`) (Codex round 27 F1). When not installed, a `RuntimeError` (with an install hint) propagates to the caller at the first YAML touch of these functions, preventing a silent fail-closed, while recovery / non-dep commands such as `set-status` / `record-timeout` / `workflow-launch-check` (leaf paths) can run even without PyYAML, avoiding a control-plane outage. The meta read + fingerprint recompute of `_dependency_ready` is serialized by an fcntl `LOCK_EX` on the same `orchestration_meta.json.lock` as `mark-dependency-readiness` / `write_preflight` / `update_orchestration_status` (Codex round 27 F2), so even if a writer and reader run simultaneously, a torn read will not falsely detect `dep_set_fingerprint_stale`. Reference: the dependency-readiness contract in `docs/ORCHESTRATION.md`.
 
 **Initial-value computation rules** (`_compute_initial_dependency_readiness`):
 - `deps.yaml` exists under `orchestration_meta.spec_ref` and both `dependencies.components` and `dependencies.profiles` are empty → all flags `true` (vacuous truth; for a leaf node)
 - `spec_ref` unset, `deps.yaml` absent, or a non-empty dependency is listed → all flags **`false` (fail-closed)**. `workflow-launch-check` blocks the phase launch.
-- For a node with a non-trivial dependency, after the orchestration agent verifies by the procedure of SKILL.md items 60-61, it explicitly raises the flags with `mark-dependency-readiness`.
+- For a node with a non-trivial dependency, after the conductor verifies dependency readiness (the dependency-readiness contract in `docs/ORCHESTRATION.md`), the flags are raised with `mark-dependency-readiness`.
 
 **dep_set_fingerprint and invalidation conventions**:
 - Each `dependency_readiness` records a `dep_set_fingerprint`. The fingerprint is a SHA-256 of the following:

@@ -1,8 +1,8 @@
 # Launch Prompts
 
-> **Audience: orchestration agent only.**
-> This file is a collection of templates by which the orchestration agent generates the `prompt` argument of the `Agent` tool (or `spawn_agent`).
-> **A `step agent` / `substep agent` must not `Read` this file.** The necessary template content has already been passed as the prompt argument of the `Agent` tool to the child agent after launch, and that path is blocked fail-closed by `read_manifest_read_guard` (intentional, to prevent recurrence).
+> **Audience: the conductor render path (`record-launch`).**
+> The conductor renders each leaf's launch prompt from these templates via `record-launch`; the rendered text is passed to the leaf subprocess.
+> **A `step agent` / `substep agent` must not `Read` this file.** Its launch prompt is already passed to it at launch, and this path is blocked fail-closed by `read_manifest_read_guard` (intentional, to prevent recurrence).
 
 ## Common agent contract boilerplate
 
@@ -94,7 +94,7 @@ Required requirements:
 - **MCP command-log & program-output placement (Generate / Build / Validate.execute):** the canonical `allowed_output_paths` placement of the MCP side output `mcp_command_log.jsonl` per phase, the `lineage.json` / `src/Makefile` auto-inject, the cross-phase Make rules, the `run_id` literal form, the trusted `command_log_ref` set, and the Validate.execute program-output (`diagnostics.json` / `perf.json` / `raw/*`) routing with the direct-binary-write prohibition are canonical in [docs/workflow/MCP_COMMAND_LOG_PLACEMENT.md](docs/workflow/MCP_COMMAND_LOG_PLACEMENT.md) (in your `read_manifest` under `docs/`). When your phase is Generate / Build / Validate.execute, read that doc and follow it. The actionable minimum: always include `mcp_command_log.jsonl` in `allowed_output_paths` at the canonical per-phase path (and `lineage.json` for the `generate.generate` substep); `record-launch` also defensively auto-injects these, but the explicit enumeration is canonical.
 - With `repair_strategy=reuse`, limit it to a diff fix against the output of `repair_target_agent_run_id`.
 - With `repair_strategy=restart`, regenerate from the contract input without reusing past output.
-- On completion, return the artifact references and status to the `orchestration agent`.
+- On completion, return the artifact references and status to the conductor.
 - Keep your final message (the `launch_reply`) **terse and bounded**: a `status:` line, an `output_refs:` list, and at most ~8 lines of rationale — nothing more. Put all detail (diffs, full logs, per-check output) in your artifacts (`step_result.json` / `*_meta.json`), which the orchestration reads on demand via the gated read path; do **not** restate that detail in the reply. An over-budget reply is flagged by `record-agent-run` (and rejected when `METDSL_ENFORCE_REPLY_BUDGET=1`).
 
 ```
@@ -124,7 +124,7 @@ Required requirements:
 
 #### substep ↔ allowed validator gate correspondence table
 
-It canonicalizes, per `(step, substep)`, the `validate_pipeline_semantics --stage <X>` invocation the `orchestration agent` may state/enumerate in the launch prompt body. Do not state in the launch prompt a `--stage` other than the one permitted in the "allowed_stage" column of the table below. The recurrence-prevention plan (Issue 1) is the canonical source.
+It canonicalizes, per `(step, substep)`, the `validate_pipeline_semantics --stage <X>` invocation that may appear in the rendered launch prompt body. Do not state in the launch prompt a `--stage` other than the one permitted in the "allowed_stage" column of the table below. The recurrence-prevention plan (Issue 1) is the canonical source.
 
 | step | substep | allowed `validate_pipeline_semantics --stage` | note |
 |---|---|---|---|
@@ -138,7 +138,7 @@ It canonicalizes, per `(step, substep)`, the `validate_pipeline_semantics --stag
 
 `--stage full` is a debug stage that performs end-to-end validation, and is not explicitly included in the allow-list for any of the (step, substep) above (the steady workflow uses per-phase stages as canonical). The exhaustive list of canonical `--stage` values uses the argparse `choices` of `tools/validate_pipeline_semantics.py` (`compile` / `post_generate` / `post_build` / `post_execute` / `pre_judge` / `full`) as the primary source.
 
-**Distinction from the recording layer:** the `validation_stage` recording rule of `skills/workflow-orchestration/SKILL.md` (the item beginning "In the completion record of each child `agent`") defines the values that **may be recorded** in `step_result.json#validation_stage` as a broader per-step set (including `full`), and this is the recording-layer contract at write-step-result time. This table is the invocation-layer contract at launch-prompt time, and imposes a stricter per-substep constraint than the recording layer. They are contracts of different layers, and a `validation_stage` value recorded as a result of being narrowed per-substep by this table is automatically included in that recording-layer allowed set (e.g. only `compile` is executable for `compile/verify` → a subset of the SKILL.md `compile`/`full` set).
+**Distinction from the recording layer:** the `validation_stage` recording rule (applied at `write-step-result` time) defines the values that **may be recorded** in `step_result.json#validation_stage` as a broader per-step set (including `full`), and is the recording-layer contract. This table is the invocation-layer contract at launch-prompt time, and imposes a stricter per-substep constraint than the recording layer. They are contracts of different layers, and a `validation_stage` value recorded as a result of being narrowed per-substep by this table is automatically included in that recording-layer allowed set (e.g. only `compile` is executable for `compile/verify` → a subset of the `compile`/`full` recording set).
 
 **negative constraint:** do not state in the launch prompt of this `(step, substep)` a `validate_pipeline_semantics` call with a `--stage` not permitted in the table above. Example: including `validate_pipeline_semantics --stage compile` in the `Compile.generate` prompt invades the `Compile.verify` responsibility and fires `noncanonical_phase_write_attempt`. A mere mention of an MCP tool name (`compile_project` etc.) (in explanatory text, a negative constraint, etc.) is outside the scope of this lint.
 

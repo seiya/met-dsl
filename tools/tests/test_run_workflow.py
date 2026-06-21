@@ -173,6 +173,10 @@ class RunWorkflowTests(unittest.TestCase):
                 ["workspace/orchestrations/orch_inc/launch_incident.runtime.0123456789ab.json"],
             )
 
+
+
+
+
     def test_discover_source_dependency_ref_from_file_spec_ref(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
@@ -269,14 +273,14 @@ class RunWorkflowTests(unittest.TestCase):
         )
         self.assertIn("orch_test", text)
         self.assertIn("run_orch_001", text)
-        self.assertIn("spec/problem/sample.md", text)
-        self.assertIn("Validate", text)
+        # Load-bearing resume markers parsed by _extract_prompt_params.
+        self.assertIn("target_spec_ref: `spec/problem/sample.md`", text)
+        self.assertIn("end phase: `Validate`", text)
         self.assertIn("workflow_mode: `dev`", text)
         self.assertIn("dependency_ref: `spec/problem/deps.yaml`", text)
         self.assertNotIn("(not specified)", text)
-        self.assertIn("METDSL_WORKFLOW_MODE=1", text)
-        self.assertIn("If the information needed to start is insufficient, stop immediately", text)
-        self.assertIn("issue_severity", text)
+        # Conductor-only: the record is no longer an LLM prompt.
+        self.assertIn("driver: conductor", text)
 
     def test_parse_args_defaults(self) -> None:
         ns = run_workflow._parse_args(["spec/problem.md", "generate"])
@@ -303,23 +307,7 @@ class RunWorkflowTests(unittest.TestCase):
         )
         self.assertFalse(ns.invoke_llm)
 
-    def test_launch_command_for_codex_uses_exec_subcommand(self) -> None:
-        command, stdin_text = run_workflow._launch_command_and_input(
-            llm="codex",
-            llm_command="codex",
-            prompt_text="run workflow",
-        )
-        self.assertEqual(command, ["codex", "exec", "run workflow"])
-        self.assertIsNone(stdin_text)
 
-    def test_launch_command_for_claude_uses_print_flag(self) -> None:
-        command, stdin_text = run_workflow._launch_command_and_input(
-            llm="claude",
-            llm_command="claude",
-            prompt_text="run workflow",
-        )
-        self.assertEqual(command, ["claude", "-p", "run workflow"])
-        self.assertIsNone(stdin_text)
 
     def test_prompt_params_roundtrip(self) -> None:
         # The resume extractor must recover until_phase/mode/spec_ref from the
@@ -501,11 +489,56 @@ class RunWorkflowTests(unittest.TestCase):
             # node_start carries no `ts` (consistent with sibling info events)
             self.assertNotIn("ts", node_starts[0])
 
+    def test_conductor_dev_failure_writes_failure_analysis(self) -> None:
+        # In dev mode, a non-pass conductor run must persist failure_analysis.json
+        # (the documented dev-failure artifact that init --resume-from-checkpoint
+        # reads to build the cross-phase reopen resume_directive).
+        import tools.workflow_conductor as wc
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._seed_spec_tree(repo_root)
+
+            def fake_runtime_command(root, env, args):  # type: ignore[no-untyped-def]
+                if args[0] == "init":
+                    return run_workflow.RuntimeResult(
+                        payload={"status": "ok", "orchestration_agent_run_id": "oar"},
+                        raw_stdout="{}",
+                    )
+                if args[0] == "preflight":
+                    return run_workflow.RuntimeResult(
+                        payload={"status": "pass", "can_launch_step_agents": True,
+                                 "can_launch_substep_agents": True},
+                        raw_stdout="{}",
+                    )
+                return run_workflow.RuntimeResult(payload={"status": "ok"}, raw_stdout="{}")
+
+            orig_rt = run_workflow._runtime_command
+            orig_rc = wc.run_conductor
+            buf = io.StringIO()
+            try:
+                run_workflow._runtime_command = fake_runtime_command  # type: ignore[assignment]
+                wc.run_conductor = lambda **kw: "fail"  # type: ignore[assignment]
+                with redirect_stdout(buf):
+                    code = run_workflow.main([
+                        "spec/problem/test.md", "build",
+                        "--repo-root", str(repo_root),
+                        "--orchestration-id", "orch_devfail",
+                        "--llm", "claude", "--mode", "dev",
+                    ])
+            finally:
+                run_workflow._runtime_command = orig_rt  # type: ignore[assignment]
+                wc.run_conductor = orig_rc  # type: ignore[assignment]
+
+            out = json.loads(buf.getvalue().strip().splitlines()[-1])
+            self.assertEqual(code, 2, out)
+            self.assertEqual(out["status"], "fail")
+            self.assertIn("analysis_ref", out)
+            fa = repo_root / "workspace" / "orchestrations" / "orch_devfail" / "failure_analysis.json"
+            self.assertTrue(fa.exists(), "conductor dev failure must write failure_analysis.json")
+
     def test_fresh_conductor_run_marks_driver_before_preflight(self) -> None:
-        # The marker must be written BEFORE init/preflight: a fresh conductor-default
-        # run (claude backend, no --orchestrator) that then FAILS preflight must still
-        # leave a "conductor" marker, so a later --resume restores the conductor
-        # rather than silently downgrading to the LLM driver.
+        # The marker must be written BEFORE init/preflight: a run that then FAILS
+        # preflight must still leave a "conductor" marker for resume/audit.
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
             self._seed_spec_tree(repo_root)
@@ -546,8 +579,6 @@ class RunWorkflowTests(unittest.TestCase):
             marker = repo_root / "workspace" / "orchestrations" / oid / "orchestrator.json"
             self.assertTrue(marker.exists(), "marker must be written before preflight")
             self.assertEqual(json.loads(marker.read_text())["orchestrator"], "conductor")
-            # And it round-trips: a later resume would restore conductor, not llm.
-            self.assertEqual(run_workflow._recorded_orchestrator(repo_root, oid), "conductor")
 
     def test_resume_recovers_params_and_uses_checkpoint_init(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -580,27 +611,6 @@ class RunWorkflowTests(unittest.TestCase):
             idx = init_calls[0].index("--spec-ref")
             self.assertEqual(init_calls[0][idx + 1], "spec/problem/test.md")
 
-    def test_resume_of_unmarked_llm_run_does_not_flip_to_conductor(self) -> None:
-        # Regression: the conductor is the fresh-run default for claude/codex, but a
-        # legacy llm-driven run leaves no orchestrator.json marker. A plain --resume
-        # of it must restore the llm driver (the historical default), NOT silently
-        # flip to the conductor.
-        with tempfile.TemporaryDirectory() as tmp:
-            repo_root = Path(tmp)
-            self._seed_spec_tree(repo_root)
-            oid = "orch_20260101T000000Z_aaaaaaaa"
-            self._seed_resumable_orchestration(
-                repo_root, oid, spec_ref="spec/problem/test.md",
-                until_phase="Build", mode="dev", backend="claude",
-            )
-            # No orchestrator.json marker (legacy llm run).
-            self.assertFalse((repo_root / "workspace" / "orchestrations" / oid
-                              / "orchestrator.json").exists())
-            code, out, _ = self._run_main_with_fake_runtime(
-                ["--resume", "--repo-root", str(repo_root), "--no-invoke-llm"]
-            )
-            self.assertEqual(code, 0, out)
-            self.assertEqual(out["orchestrator"], "llm")
 
     def test_resume_of_conductor_marked_run_restores_conductor(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -777,7 +787,7 @@ class RunWorkflowTests(unittest.TestCase):
             # custom id that sorts lexically last ('u' > '2') but is oldest
             self._seed_resumable_orchestration(
                 repo_root, "orch_unit_run", spec_ref="spec/problem/test.md",
-                until_phase="Build", mode="dev", backend="cursor",
+                until_phase="Build", mode="dev", backend="codex",
                 started_at="2026-01-01T00:00:00.000000Z",
             )
             code, out, _ = self._run_main_with_fake_runtime(
@@ -1112,501 +1122,18 @@ class RunWorkflowTests(unittest.TestCase):
             prompt_text = prompt_path.read_text(encoding="utf-8")
             self.assertIn("orchestration_agent_run_id: `orch_agent_run_001`", prompt_text)
 
-    def _run_main_with_failing_launch(
-        self,
-        repo_root: Path,
-        *,
-        meta_status_after_launch: str | None,
-        orchestration_id: str = "orch_interrupt",
-    ) -> tuple[int, dict, list[list[str]]]:
-        """Drive main() through the invoke_llm branch with a non-zero subprocess
-        exit (simulating a token/session-limit kill mid-run).
 
-        meta_status_after_launch seeds orchestration_meta.json so the post-launch
-        status read reflects whether the orchestration agent terminalized
-        (e.g. "fail") or was killed non-terminal (None → file absent → "running").
-        """
-        self._seed_spec_tree(repo_root)
-        orch_root = repo_root / "workspace" / "orchestrations" / orchestration_id
-        if meta_status_after_launch is not None:
-            orch_root.mkdir(parents=True, exist_ok=True)
-            (orch_root / "orchestration_meta.json").write_text(
-                json.dumps(
-                    {
-                        "orchestration_id": orchestration_id,
-                        "status": meta_status_after_launch,
-                        "orchestration_agent_run_id": "orch_agent_run_002",
-                    },
-                    ensure_ascii=False,
-                ),
-                encoding="utf-8",
-            )
 
-        observed_calls: list[list[str]] = []
 
-        def fake_runtime_command(root, env, args):  # type: ignore[no-untyped-def]
-            observed_calls.append(args)
-            if args[0] == "init":
-                return run_workflow.RuntimeResult(
-                    payload={"status": "ok", "orchestration_agent_run_id": "orch_agent_run_002"},
-                    raw_stdout="{}",
-                )
-            if args[0] == "preflight":
-                return run_workflow.RuntimeResult(
-                    payload={
-                        "status": "pass",
-                        "can_launch_step_agents": True,
-                        "can_launch_substep_agents": True,
-                    },
-                    raw_stdout="{}",
-                )
-            return run_workflow.RuntimeResult(payload={"status": "ok"}, raw_stdout="{}")
 
-        def fake_subprocess_run(cmd, *a, **kw):  # type: ignore[no-untyped-def]
-            return subprocess.CompletedProcess(args=cmd, returncode=1)
 
-        original_runtime = run_workflow._runtime_command
-        original_run = run_workflow.subprocess.run
-        buf = io.StringIO()
-        try:
-            run_workflow._runtime_command = fake_runtime_command  # type: ignore[assignment]
-            run_workflow.subprocess.run = fake_subprocess_run  # type: ignore[assignment]
-            with redirect_stdout(buf):
-                code = run_workflow.main(
-                    [
-                        "spec/problem/test.md",
-                        "build",
-                        "--repo-root",
-                        str(repo_root),
-                        "--orchestration-id",
-                        orchestration_id,
-                        "--orchestrator",
-                        "llm",
-                    ]
-                )
-        finally:
-            run_workflow._runtime_command = original_runtime  # type: ignore[assignment]
-            run_workflow.subprocess.run = original_run  # type: ignore[assignment]
-        out = json.loads(buf.getvalue().strip().splitlines()[-1])
-        return code, out, observed_calls
 
-    def test_failing_launch_terminalizes_nonterminal_orchestration(self) -> None:
-        # A token-limit kill leaves the orchestration meta non-terminal ("running").
-        # run_workflow must terminalize it (set-status fail) so an implicit --resume
-        # is not refused by the non-terminal-latest guard.
-        with tempfile.TemporaryDirectory() as tmp:
-            repo_root = Path(tmp)
-            code, out, calls = self._run_main_with_failing_launch(
-                repo_root, meta_status_after_launch=None
-            )
-            self.assertEqual(code, 2, out)
-            self.assertEqual(out["reason"], "workflow_failed")
-            self.assertEqual(out["workflow_status"], "fail")
-            status_calls = [c for c in calls if c and c[0] == "set-status"]
-            self.assertEqual(len(status_calls), 1, calls)
-            call = status_calls[0]
-            self.assertEqual(call[call.index("--status") + 1], "fail")
-            self.assertEqual(
-                call[call.index("--reason-code") + 1], "llm_launch_interrupted"
-            )
 
-    def test_failing_launch_does_not_double_terminalize(self) -> None:
-        # When the orchestration agent already recorded a terminal status before
-        # the non-zero exit, run_workflow must NOT issue a redundant set-status.
-        with tempfile.TemporaryDirectory() as tmp:
-            repo_root = Path(tmp)
-            code, out, calls = self._run_main_with_failing_launch(
-                repo_root, meta_status_after_launch="fail"
-            )
-            self.assertEqual(code, 2, out)
-            self.assertEqual(out["reason"], "workflow_failed")
-            self.assertEqual(out["workflow_status"], "fail")
-            interrupt_calls = [
-                c
-                for c in calls
-                if c
-                and c[0] == "set-status"
-                and "llm_launch_interrupted" in c
-            ]
-            self.assertEqual(interrupt_calls, [], calls)
 
-    def _run_main_with_dangling_launch(
-        self,
-        repo_root: Path,
-        *,
-        set_status_raises: bool,
-        orchestration_id: str = "orch_dangling",
-    ) -> tuple[int, dict, list[list[str]]]:
-        """Drive main() through invoke_llm with a CLEAN (returncode 0) subprocess
-        exit but an open active_child window left behind (dangling launch).
 
-        set_status_raises simulates the terminalize set-status failing, to prove the
-        run still reports failure (not ok) via the launch_incident_detected flag.
-        """
-        self._seed_spec_tree(repo_root)
-        orch_root = repo_root / "workspace" / "orchestrations" / orchestration_id
-        orch_root.mkdir(parents=True, exist_ok=True)
-        (orch_root / "orchestration_meta.json").write_text(
-            json.dumps(
-                {
-                    "orchestration_id": orchestration_id,
-                    "status": "running",
-                    "orchestration_agent_run_id": "orch_agent_run_003",
-                },
-                ensure_ascii=False,
-            ),
-            encoding="utf-8",
-        )
-        child = "dangling-child-arid"
-        (orch_root / "active_child_agent_run_id.txt").write_text(child, encoding="utf-8")
-        (orch_root / "active_children").mkdir(exist_ok=True)
-        (orch_root / "active_children" / f"{child}.txt").write_text(child, encoding="utf-8")
 
-        observed_calls: list[list[str]] = []
 
-        def fake_runtime_command(root, env, args):  # type: ignore[no-untyped-def]
-            observed_calls.append(args)
-            if args[0] == "init":
-                return run_workflow.RuntimeResult(
-                    payload={"status": "ok", "orchestration_agent_run_id": "orch_agent_run_003"},
-                    raw_stdout="{}",
-                )
-            if args[0] == "preflight":
-                return run_workflow.RuntimeResult(
-                    payload={
-                        "status": "pass",
-                        "can_launch_step_agents": True,
-                        "can_launch_substep_agents": True,
-                    },
-                    raw_stdout="{}",
-                )
-            if args[0] == "set-status" and set_status_raises:
-                raise RuntimeError("simulated set-status failure")
-            return run_workflow.RuntimeResult(payload={"status": "ok"}, raw_stdout="{}")
 
-        def fake_subprocess_run(cmd, *a, **kw):  # type: ignore[no-untyped-def]
-            return subprocess.CompletedProcess(args=cmd, returncode=0)
-
-        original_runtime = run_workflow._runtime_command
-        original_run = run_workflow.subprocess.run
-        buf = io.StringIO()
-        try:
-            run_workflow._runtime_command = fake_runtime_command  # type: ignore[assignment]
-            run_workflow.subprocess.run = fake_subprocess_run  # type: ignore[assignment]
-            with redirect_stdout(buf):
-                code = run_workflow.main(
-                    [
-                        "spec/problem/test.md",
-                        "build",
-                        "--repo-root",
-                        str(repo_root),
-                        "--orchestration-id",
-                        orchestration_id,
-                        "--orchestrator",
-                        "llm",
-                    ]
-                )
-        finally:
-            run_workflow._runtime_command = original_runtime  # type: ignore[assignment]
-            run_workflow.subprocess.run = original_run  # type: ignore[assignment]
-        out = json.loads(buf.getvalue().strip().splitlines()[-1])
-        return code, out, observed_calls
-
-    def test_dangling_launch_clean_exit_terminalizes(self) -> None:
-        # Clean (returncode 0) exit but the child launch never returned: run_workflow
-        # must terminalize with reason_code launch_incomplete_active_child and report
-        # failure (NOT ok), and snapshot the incident.
-        with tempfile.TemporaryDirectory() as tmp:
-            repo_root = Path(tmp)
-            code, out, calls = self._run_main_with_dangling_launch(
-                repo_root, set_status_raises=False
-            )
-            self.assertEqual(code, 2, out)
-            self.assertEqual(out["reason"], "workflow_failed")
-            self.assertEqual(out["workflow_status"], "fail")
-            incident_calls = [
-                c for c in calls
-                if c and c[0] == "set-status" and "launch_incomplete_active_child" in c
-            ]
-            self.assertEqual(len(incident_calls), 1, calls)
-            snapshots = list(
-                (repo_root / "workspace" / "orchestrations" / "orch_dangling").glob(
-                    "launch_incident.runtime.*.json"
-                )
-            )
-            self.assertEqual(len(snapshots), 1, "incident snapshot must be persisted")
-
-    def test_dangling_launch_clean_exit_still_fails_when_set_status_raises(self) -> None:
-        # P2 regression: even if BOTH terminalize set-status calls fail, a detected
-        # dangling launch must not be reported as ok. launch_incident_detected forces
-        # the failure path despite returncode 0 + non-terminal workflow_status.
-        with tempfile.TemporaryDirectory() as tmp:
-            repo_root = Path(tmp)
-            code, out, calls = self._run_main_with_dangling_launch(
-                repo_root, set_status_raises=True
-            )
-            self.assertEqual(code, 2, out)
-            self.assertEqual(out["reason"], "workflow_failed")
-            self.assertNotEqual(out.get("status"), "ok")
-            # The degraded fallback must preserve the dangling-launch reason, not
-            # downgrade to the generic returncode reason (P3).
-            status_calls = [c for c in calls if c and c[0] == "set-status"]
-            self.assertTrue(status_calls)
-            for c in status_calls:
-                self.assertEqual(c[c.index("--reason-code") + 1], "launch_incomplete_active_child")
-            self.assertFalse(
-                any("llm_launch_interrupted" in c for c in status_calls), calls
-            )
-
-    def test_recorded_pass_meta_overrides_nonzero_cli_returncode(self) -> None:
-        # The orchestration agent recorded a terminal pass, but the launched CLI
-        # exited nonzero (e.g. a transport hiccup it already recovered from — the
-        # audit case orch_20260615T095217Z_74450292). The recorded pass is
-        # authoritative: report ok with a cli_returncode_warning, do NOT emit
-        # workflow_failed, and do NOT terminalize to fail.
-        with tempfile.TemporaryDirectory() as tmp:
-            repo_root = Path(tmp)
-            code, out, calls = self._run_main_with_failing_launch(
-                repo_root, meta_status_after_launch="pass"
-            )
-            self.assertEqual(code, 0, out)
-            self.assertEqual(out["status"], "ok")
-            self.assertEqual(out["workflow_status"], "pass")
-            self.assertEqual(out.get("cli_returncode_warning"), 1)
-            # The subprocess WAS invoked (it just returned nonzero), so llm_invoked
-            # must be true — distinct from a --no-invoke-llm (prompt-only) run.
-            self.assertIs(out["llm_invoked"], True)
-            interrupt_calls = [
-                c
-                for c in calls
-                if c and c[0] == "set-status" and "llm_launch_interrupted" in c
-            ]
-            self.assertEqual(interrupt_calls, [], calls)
-
-    def test_no_invoke_llm_claude_does_not_record_host_session_id(self) -> None:
-        # With --no-invoke-llm no `claude --session-id` process starts, so NO runtime
-        # call (init or preflight) may carry --host-session-id (recording it would point
-        # meta at a transcript that never exists).
-        with tempfile.TemporaryDirectory() as tmp:
-            repo_root = Path(tmp)
-            self._seed_spec_tree(repo_root)
-            code, out, calls = self._run_main_with_fake_runtime(
-                [
-                    "spec/problem/test.md",
-                    "build",
-                    "--repo-root",
-                    str(repo_root),
-                    "--llm",
-                    "claude",
-                    "--no-invoke-llm",
-                ]
-            )
-            self.assertEqual(code, 0, out)
-            self.assertTrue([c for c in calls if c and c[0] == "preflight"], calls)
-            for call in calls:
-                self.assertNotIn("--host-session-id", call)
-
-    def test_invoke_llm_claude_records_host_session_id_via_preflight(self) -> None:
-        # A real claude launch pins the host session UUID and threads it into PREFLIGHT
-        # (not init) so it is recorded only when preflight is launchable. The same id is
-        # pinned on the launch via --session-id, and init must NOT carry it.
-        with tempfile.TemporaryDirectory() as tmp:
-            repo_root = Path(tmp)
-            self._seed_spec_tree(repo_root)
-
-            captured: dict[str, list[str]] = {}
-
-            def fake_runtime_command(root, env, args):  # type: ignore[no-untyped-def]
-                if args and args[0] == "init":
-                    captured["init"] = args
-                    return run_workflow.RuntimeResult(
-                        payload={"status": "ok", "orchestration_agent_run_id": "oar"},
-                        raw_stdout="{}",
-                    )
-                if args and args[0] == "preflight":
-                    captured["preflight"] = args
-                    return run_workflow.RuntimeResult(
-                        payload={
-                            "status": "pass",
-                            "can_launch_step_agents": True,
-                            "can_launch_substep_agents": True,
-                        },
-                        raw_stdout="{}",
-                    )
-                return run_workflow.RuntimeResult(payload={"status": "ok"}, raw_stdout="{}")
-
-            captured_cmd: dict[str, list[str]] = {}
-
-            def fake_subprocess_run(cmd, *a, **kw):  # type: ignore[no-untyped-def]
-                captured_cmd["cmd"] = cmd
-                return subprocess.CompletedProcess(args=cmd, returncode=0)
-
-            original_runtime = run_workflow._runtime_command
-            original_run = run_workflow.subprocess.run
-            buf = io.StringIO()
-            try:
-                run_workflow._runtime_command = fake_runtime_command  # type: ignore[assignment]
-                run_workflow.subprocess.run = fake_subprocess_run  # type: ignore[assignment]
-                with redirect_stdout(buf):
-                    code = run_workflow.main(
-                        [
-                            "spec/problem/test.md",
-                            "build",
-                            "--repo-root",
-                            str(repo_root),
-                            "--llm",
-                            "claude",
-                            "--orchestrator",
-                            "llm",
-                        ]
-                    )
-            finally:
-                run_workflow._runtime_command = original_runtime  # type: ignore[assignment]
-                run_workflow.subprocess.run = original_run  # type: ignore[assignment]
-            self.assertEqual(code, 0, buf.getvalue())
-            self.assertNotIn("--host-session-id", captured["init"])
-            self.assertIn("--host-session-id", captured["preflight"])
-            hsid = captured["preflight"][
-                captured["preflight"].index("--host-session-id") + 1
-            ]
-            # The same id is pinned on the claude launch via --session-id.
-            self.assertIn("--session-id", captured_cmd["cmd"])
-            self.assertEqual(
-                captured_cmd["cmd"][captured_cmd["cmd"].index("--session-id") + 1], hsid
-            )
-
-    def _write_verify_step_result(
-        self,
-        repo_root: Path,
-        orchestration_id: str,
-        *,
-        step: str,
-        status: str,
-        severity: str,
-        node_safe: str = "component__x__0.1.0",
-        agent_run_id: str = "writer_arid",
-    ) -> None:
-        d = (
-            repo_root
-            / "workspace" / "orchestrations" / orchestration_id
-            / "steps" / node_safe / step / agent_run_id
-        )
-        d.mkdir(parents=True, exist_ok=True)
-        (d / "step_result.json").write_text(
-            json.dumps(
-                {
-                    "status": status,
-                    "retry_decisions": [
-                        {"issue_severity": severity, "repair_reason": "x"}
-                    ],
-                },
-                ensure_ascii=False,
-            ),
-            encoding="utf-8",
-        )
-
-    def test_detect_verify_issue_flags_major_even_in_passed_step(self) -> None:
-        # dev-mode contract (WORKFLOW_CORE.md/startup_contract.md/SKILL.md): a
-        # major/critical verify severity must fail closed, with no "resolved" exception.
-        # So even a step_result whose final status is `pass` but whose retry_decisions
-        # contain a major issue must be flagged.
-        with tempfile.TemporaryDirectory() as tmp:
-            repo_root = Path(tmp)
-            self._write_verify_step_result(
-                repo_root, "orch_v", step="generate", status="pass", severity="major"
-            )
-            issue = run_workflow._detect_non_minor_verify_issue(repo_root, "orch_v")
-            self.assertIsNotNone(issue)
-            self.assertEqual(issue["issue_severity"], "major")
-
-    def test_detect_verify_issue_ignores_minor(self) -> None:
-        # A minor severity is acceptable and must not be flagged.
-        with tempfile.TemporaryDirectory() as tmp:
-            repo_root = Path(tmp)
-            self._write_verify_step_result(
-                repo_root, "orch_v", step="validate", status="pass", severity="minor"
-            )
-            self.assertIsNone(
-                run_workflow._detect_non_minor_verify_issue(repo_root, "orch_v")
-            )
-
-    def test_unresolved_severe_verify_fails_closed_even_when_meta_pass(self) -> None:
-        # Codex P1: even with meta.status=pass and a zero CLI returncode, an UNRESOLVED
-        # severe verify issue (non-pass step_result) must fail closed in dev mode.
-        with tempfile.TemporaryDirectory() as tmp:
-            repo_root = Path(tmp)
-            self._seed_spec_tree(repo_root)
-            oid = "orch_verify_failclosed"
-            orch_root = repo_root / "workspace" / "orchestrations" / oid
-            orch_root.mkdir(parents=True, exist_ok=True)
-            (orch_root / "orchestration_meta.json").write_text(
-                json.dumps(
-                    {"orchestration_id": oid, "status": "pass",
-                     "orchestration_agent_run_id": "oar"},
-                    ensure_ascii=False,
-                ),
-                encoding="utf-8",
-            )
-            # A verify step that did NOT pass but carries a major issue.
-            self._write_verify_step_result(
-                repo_root, oid, step="validate", status="fail", severity="major"
-            )
-
-            observed: list[list[str]] = []
-
-            def fake_runtime_command(root, env, args):  # type: ignore[no-untyped-def]
-                observed.append(args)
-                if args and args[0] == "init":
-                    return run_workflow.RuntimeResult(
-                        payload={"status": "ok", "orchestration_agent_run_id": "oar"},
-                        raw_stdout="{}",
-                    )
-                if args and args[0] == "preflight":
-                    return run_workflow.RuntimeResult(
-                        payload={
-                            "status": "pass",
-                            "can_launch_step_agents": True,
-                            "can_launch_substep_agents": True,
-                        },
-                        raw_stdout="{}",
-                    )
-                return run_workflow.RuntimeResult(payload={"status": "ok"}, raw_stdout="{}")
-
-            def fake_subprocess_run(cmd, *a, **kw):  # type: ignore[no-untyped-def]
-                return subprocess.CompletedProcess(args=cmd, returncode=0)
-
-            original_runtime = run_workflow._runtime_command
-            original_run = run_workflow.subprocess.run
-            buf = io.StringIO()
-            try:
-                run_workflow._runtime_command = fake_runtime_command  # type: ignore[assignment]
-                run_workflow.subprocess.run = fake_subprocess_run  # type: ignore[assignment]
-                with redirect_stdout(buf):
-                    code = run_workflow.main(
-                        [
-                            "spec/problem/test.md",
-                            "build",
-                            "--repo-root",
-                            str(repo_root),
-                            "--orchestration-id",
-                            oid,
-                            "--orchestrator",
-                            "llm",
-                        ]
-                    )
-            finally:
-                run_workflow._runtime_command = original_runtime  # type: ignore[assignment]
-                run_workflow.subprocess.run = original_run  # type: ignore[assignment]
-            out = json.loads(buf.getvalue().strip().splitlines()[-1])
-            self.assertEqual(code, 2, out)
-            self.assertEqual(out["reason"], "workflow_failed")
-            # The dev-mode verify backstop must have fired despite meta=pass.
-            violation_calls = [
-                c
-                for c in observed
-                if c and c[0] == "set-status" and "verify_issue_severity_violation" in c
-            ]
-            self.assertTrue(violation_calls, observed)
 
     def test_direct_script_invocation_does_not_crash_on_module_import(self) -> None:
         """Regression: `python3 tools/run_workflow.py ...` is the canonical
@@ -1896,69 +1423,6 @@ class RunWorkflowTests(unittest.TestCase):
             self.assertEqual(payload["orchestration_id"], "orch_init_missing_run_id")
             self.assertIn("missing orchestration_agent_run_id", payload["detail"])
 
-    def test_main_dev_mode_writes_failure_analysis_on_llm_failure(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            repo_root = Path(tmp)
-            _seed_shape_expr_schema_into(repo_root)
-            (repo_root / "tools").mkdir(parents=True, exist_ok=True)
-            (repo_root / "workspace").mkdir(parents=True, exist_ok=True)
-            (repo_root / "spec" / "problem").mkdir(parents=True, exist_ok=True)
-            (repo_root / "spec" / "problem" / "test.md").write_text("spec\n", encoding="utf-8")
-            dep_ref = "spec/problem/deps.yaml"
-            (repo_root / dep_ref).write_text("nodes: []\n", encoding="utf-8")
-
-            def fake_runtime_command(root: Path, env: dict[str, str], args: list[str]) -> run_workflow.RuntimeResult:
-                if args[0] == "preflight":
-                    return run_workflow.RuntimeResult(
-                        payload={
-                            "status": "pass",
-                            "can_launch_step_agents": True,
-                            "can_launch_substep_agents": True,
-                        },
-                        raw_stdout="{}",
-                    )
-                if args[0] == "init":
-                    return run_workflow.RuntimeResult(
-                        payload={"status": "ok", "orchestration_agent_run_id": "orch_agent_run_dev_fail"},
-                        raw_stdout="{}",
-                    )
-                return run_workflow.RuntimeResult(payload={"status": "ok"}, raw_stdout="{}")
-
-            class DummyCompletedProcess:
-                def __init__(self, returncode: int) -> None:
-                    self.returncode = returncode
-
-            original_runtime = run_workflow._runtime_command
-            original_subprocess_run = run_workflow.subprocess.run
-            try:
-                run_workflow._runtime_command = fake_runtime_command  # type: ignore[assignment]
-                run_workflow.subprocess.run = lambda *args, **kwargs: DummyCompletedProcess(1)  # type: ignore[assignment]
-                stdout = io.StringIO()
-                with redirect_stdout(stdout):
-                    code = run_workflow.main(
-                        [
-                            "spec/problem/test.md",
-                            "build",
-                            "--repo-root",
-                            str(repo_root),
-                            "--orchestration-id",
-                            "orch_dev_fail",
-                            "--orchestrator",
-                            "llm",
-                        ]
-                    )
-            finally:
-                run_workflow._runtime_command = original_runtime  # type: ignore[assignment]
-                run_workflow.subprocess.run = original_subprocess_run  # type: ignore[assignment]
-
-            self.assertEqual(code, 2)
-            payload = json.loads(stdout.getvalue().strip().splitlines()[-1])
-            self.assertEqual(payload["status"], "fail")
-            self.assertEqual(payload["reason"], "workflow_failed")
-            self.assertEqual(payload["workflow_mode"], "dev")
-            analysis_ref = payload.get("analysis_ref")
-            self.assertIsInstance(analysis_ref, str)
-            self.assertTrue((repo_root / str(analysis_ref)).exists())
 
     def test_main_resolves_dependency_ref_from_spec_deps_yaml(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

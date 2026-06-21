@@ -1,5 +1,0 @@
-interface:
-  display_name: "Workflow Tune Verify"
-  short_description: "Help with Workflow Tune Verify tasks"
-  backend: "claude"
-  spawn_agent_tool: "Agent"

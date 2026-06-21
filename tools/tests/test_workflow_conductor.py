@@ -755,19 +755,14 @@ class SubstepStatusAndResumeTest(unittest.TestCase):
 
 
 class RunWorkflowConductorGuardTest(unittest.TestCase):
-    """Codex follow-up: reject conductor + unsupported backend up front."""
+    """Orchestration is conductor-only; unsupported backends are rejected up front."""
 
-    def test_rejects_conductor_with_cursor_backend(self) -> None:
-        import io
-        import contextlib
+    def test_rejects_cursor_backend(self) -> None:
+        # cursor was removed with the LLM-orchestrator driver; argparse rejects it
+        # as an invalid --llm choice (SystemExit) before any orchestration state.
         import tools.run_workflow as rw
-        buf = io.StringIO()
-        with contextlib.redirect_stdout(buf):
-            rc = rw.main(["spec/component/x", "validate",
-                          "--orchestrator", "conductor", "--llm", "cursor",
-                          "--no-invoke-llm"])
-        self.assertNotEqual(rc, 0)
-        self.assertIn("conductor", buf.getvalue())
+        with self.assertRaises(SystemExit):
+            rw._parse_args(["spec/component/x", "validate", "--llm", "cursor"])
 
 
 class ResumeRecoveryTest(unittest.TestCase):
@@ -824,24 +819,6 @@ class ResumeRecoveryTest(unittest.TestCase):
             marker = root / "workspace" / "orchestrations" / "oX" / "orchestrator.json"
             self.assertTrue(marker.exists())
             self.assertEqual(json.loads(marker.read_text())["orchestrator"], "conductor")
-
-    def test_run_workflow_reads_orchestrator_marker(self) -> None:
-        import tempfile
-        import tools.run_workflow as rw
-        with tempfile.TemporaryDirectory() as d:
-            root = Path(d)
-            # No marker -> None (caller treats a missing marker as a legacy llm run).
-            self.assertIsNone(rw._recorded_orchestrator(root, "oX"))
-            m = root / "workspace" / "orchestrations" / "oX" / "orchestrator.json"
-            m.parent.mkdir(parents=True)
-            m.write_text(json.dumps({"orchestrator": "conductor"}), encoding="utf-8")
-            self.assertEqual(rw._recorded_orchestrator(root, "oX"), "conductor")
-            # The marker is symmetric: the llm driver writes it too.
-            m.write_text(json.dumps({"orchestrator": "llm"}), encoding="utf-8")
-            self.assertEqual(rw._recorded_orchestrator(root, "oX"), "llm")
-            # An invalid value is ignored (treated as absent).
-            m.write_text(json.dumps({"orchestrator": "bogus"}), encoding="utf-8")
-            self.assertIsNone(rw._recorded_orchestrator(root, "oX"))
 
 
 class LeafSpawnTest(unittest.TestCase):

@@ -1,5 +1,0 @@
-interface:
-  display_name: "Workflow Build"
-  short_description: "Help with Workflow Build tasks"
-  backend: "claude"
-  spawn_agent_tool: "Agent"

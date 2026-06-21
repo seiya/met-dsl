@@ -8,7 +8,6 @@ import json
 import os
 import re
 import shutil
-import shlex
 import subprocess
 import sys
 import tempfile
@@ -21,7 +20,7 @@ from typing import Any
 
 # Direct-CLI import bootstrap. When this script is executed as
 # `python3 tools/run_workflow.py ...` (the canonical entrypoint per
-# CLAUDE.md), `sys.path[0]` is `tools/`, not the repo root, so absolute
+# AGENTS.md), `sys.path[0]` is `tools/`, not the repo root, so absolute
 # package imports like `from tools.validate_pipeline_semantics import ...`
 # fail with `ModuleNotFoundError` before any structured error handling
 # can run. Mirror the pattern used by `tools/validate_pipeline_semantics.py`
@@ -39,11 +38,12 @@ except ModuleNotFoundError:  # pragma: no cover - direct CLI execution
     # Re-probe so the in-function imports later in main() succeed.
     from tools import validate_pipeline_semantics as _probe  # noqa: F401
 
-# Post-mortem diagnostics for an incomplete (dangling) child launch. Imported
-# after the path bootstrap above so `tools` is importable under direct CLI run.
-from tools.orchestration_diagnostics import build_launch_incident
 
-SUPPORTED_LLMS = ("codex", "cursor", "claude")
+# Orchestration is conductor-only (the deterministic Python phase loop in
+# tools/workflow_conductor.py). The conductor has leaf launchers for claude and
+# codex; the former LLM-orchestrator driver and the cursor backend (which only ran
+# under that driver) were removed.
+SUPPORTED_LLMS = ("codex", "claude")
 SUPPORTED_WORKFLOW_MODES = ("dev", "prod")
 # Applied when --llm / --mode are omitted on a non-resume run. Kept as the
 # historical defaults so plain `run_workflow.py <spec> <phase>` is unchanged.
@@ -51,13 +51,12 @@ DEFAULT_LLM = "codex"
 DEFAULT_WORKFLOW_MODE = "dev"
 DEFAULT_LLM_COMMANDS = {
     "codex": "codex",
-    "cursor": "cursor",
     "claude": "claude",
 }
 # Default orchestration-agent model recorded on the orchestration agent_runs row
 # for the claude backend (the host session runs Opus). Operators on a different
-# model override it with --agent-model. codex/cursor model ids are not knowable to
-# this entrypoint, so they are left to repair-agent-runs sibling backfill.
+# model override it with --agent-model. The codex model id is not knowable to
+# this entrypoint, so it is left to repair-agent-runs sibling backfill.
 DEFAULT_CLAUDE_AGENT_MODEL = "claude-opus-4-8"
 
 PHASE_ALIASES = {
@@ -135,25 +134,6 @@ def _runtime_command(repo_root: Path, env: dict[str, str], args: list[str]) -> R
     return RuntimeResult(payload=payload, raw_stdout=stdout)
 
 
-def _launch_command_and_input(
-    *, llm: str, llm_command: str, prompt_text: str, session_id: str | None = None
-) -> tuple[list[str], str | None]:
-    command = shlex.split(llm_command)
-    if not command:
-        raise ValueError("llm_command must be non-empty")
-    # Codex default entrypoint requires a terminal in interactive mode.
-    # Use non-interactive subcommand to run from this bootstrap script.
-    if llm == "codex":
-        return [*command, "exec", prompt_text], None
-    # Claude Code defaults to launching the interactive TUI; `-p` (--print) runs
-    # the prompt non-interactively and exits, which is required when invoked from
-    # this bootstrap script. `--session-id` pins the host session UUID so the
-    # transcript at ~/.claude/projects/<slug>/<session_id>.jsonl is addressable and
-    # recordable in orchestration_meta.json#host_session_id (observability).
-    if llm == "claude":
-        session_flags = ["--session-id", session_id] if session_id else []
-        return [*command, *session_flags, "-p", prompt_text], None
-    return command, prompt_text
 
 
 def _build_orchestration_prompt(
@@ -165,27 +145,20 @@ def _build_orchestration_prompt(
     until_phase: str,
     workflow_mode: str,
 ) -> str:
+    """Render the orchestration start record written to
+    `launches/orchestration.start.prompt.txt`.
+
+    Orchestration is conductor-driven (Python, no parent orchestration LLM), so
+    this is no longer an LLM prompt — it is the canonical carrier of the run's
+    startup parameters. `--resume` recovers `spec_ref` / `until_phase` /
+    `workflow_mode` from this file via `_extract_prompt_params`, so the
+    `target_spec_ref:` / `end phase:` / `workflow_mode:` markers are load-bearing
+    and pinned by a round-trip unit test. Keep them when editing the wording.
+    """
     phase_list = ", ".join(PHASE_ORDER[: PHASE_ORDER.index(until_phase) + 1])
-    allowed_tmp_root = f"workspace/tmp/{orchestration_agent_run_id}"
-    base = textwrap.dedent(
+    return textwrap.dedent(
         f"""
-        Start the workflow.
-
-        ## tmp area (reference by literal path)
-
-        This orchestration agent's `allowed_tmp_root` is the following literal path:
-
-        ```
-        {allowed_tmp_root}
-        ```
-
-        When a temporary file is needed, specify `{allowed_tmp_root}/...` **literally**.
-        Because `output_manifest_write_guard` only judges whether it is under the manifest's `allowed_tmp_root`
-        and does not look at the `$TMPDIR` env, a reference via an env variable is unnecessary.
-        Do not call `export TMPDIR=...`, `jq -er ...`, `printenv`, or `bash -c` in Bash
-        (it is a cause of the workflow stopping on a session-sandbox approval request).
-        The env (`METDSL_ORCHESTRATION_ID` / `ORCHESTRATION_AGENT_RUN_ID` / `TMPDIR`) is
-        already inherited into the subprocess by `tools/run_workflow.py`, so a confirmation Bash is also unnecessary.
+        Conductor workflow start record (driver: conductor).
 
         ## startup context
         - orchestration_id: `{orchestration_id}`
@@ -194,32 +167,8 @@ def _build_orchestration_prompt(
         - target_spec_ref: `{spec_ref}`
         - dependency_ref: `{source_dependency_ref}`
         - target_phases: `{phase_list}` (end phase: `{until_phase}`)
-
-        ## execution constraints
-        - First read `skills/workflow-orchestration/SKILL.md` and `skills/workflow-orchestration/references/startup_contract.md`.
-        - Maintain `METDSL_WORKFLOW_MODE=1` during workflow execution.
-        - If the information needed to start is insufficient, stop immediately, enumerate the missing items, and report.
-        - Do not proceed by guessing or completing the missing information.
-        - This launch uses the context generated by `tools/run_workflow.py` as the canonical input. Do not start the workflow by any other path.
-        - Delegate the body processing of phase artifacts to the child agent; the parent agent does not proxy it.
-        - The canonical source for the child agent's requirement definition and judgment rules is limited to `docs/`, `spec/`, and the relevant trial's artifacts.
-        - Run `workflow-launch-check` before launching a child agent, and stop on failure.
-        - Proceed from the starting phase up to `{until_phase}`, and do not proceed to any later phase.
-        - When a temporary file is needed, do not specify `/tmp` or `/dev/shm`; directly use the literal path of the `tmp area` section above (`{allowed_tmp_root}/...`). Hard-coding `/tmp/` is blocked by `output_manifest_write_guard`.
-        - The auto-Read of `~/.claude/projects/.../memory/MEMORY.md` immediately after Claude Code startup is blocked by `read_manifest_read_guard`, but this is expected behavior and does not affect the continuation of the workflow. Do not retry or attempt a reference under `MEMORY.md`.
         """
     ).strip() + "\n"
-
-    if workflow_mode == "dev":
-        base += textwrap.dedent(
-            f"""
-            - In the verify substep, if `issue_severity` is other than `minor`, stop with fail.
-            - On fail, prioritize the primary evidence (`agent_runs.jsonl`, `step_result.json`, `agent.summary.txt`, `launches/*.reply.txt`) to investigate the cause, and report it with the basis.
-            - Save the information needed to investigate the progress, as far as possible, under `workspace/orchestrations/<orchestration_id>/`.
-            - When writing `failure_analysis.json`, always include the `"orchestration_agent_run_id": "{orchestration_agent_run_id}"` field. Because the runtime uses this field to identify the current run, omitting it demotes it to a timestamp fallback and causes a misjudgment when the ID is reused.
-            """
-        )
-    return base
 
 
 def _canonicalize_spec_ref(repo_root: Path, spec_ref: str) -> str:
@@ -285,13 +234,14 @@ def _write_orchestrator_marker(repo_root: Path, orchestration_id: str, orchestra
         pass
 
 
-def _recorded_orchestrator(repo_root: Path, orchestration_id: str) -> str | None:
-    """Return the driver recorded in the orchestrator.json marker ('llm' or
-    'conductor'), or None when no (valid) marker exists."""
-    marker = _read_json_if_exists(_orchestrator_marker_path(repo_root, orchestration_id))
-    if isinstance(marker, dict) and marker.get("orchestrator") in ("llm", "conductor"):
-        return str(marker.get("orchestrator"))
-    return None
+
+
+
+
+
+
+
+
 
 
 def _read_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -492,6 +442,7 @@ def _collect_failure_analysis(repo_root: Path, orchestration_id: str) -> dict[st
 _FAILURE_STATUS_VALUES: frozenset[str] = frozenset(
     {"fail", "fail_closed", "blocked", "timeout", "cancel"}
 )
+
 # Statuses that make an orchestration safe to auto-select as "the latest" for
 # implicit (`--resume` without `--orchestration-id`) resume. A non-terminal status
 # (e.g. `running`) is ambiguous — it may be an active concurrent run whose shared
@@ -697,32 +648,14 @@ def _atomic_write_json(path: Path, payload: dict[str, Any], *, tmp_dir: Path) ->
         raise
 
 
-def _detect_non_minor_verify_issue(repo_root: Path, orchestration_id: str) -> dict[str, Any] | None:
-    orch_root = repo_root / "workspace" / "orchestrations" / orchestration_id
-    verify_steps = {"compile", "generate", "validate"}
-    for step_result_path in sorted(orch_root.glob("steps/*/*/*/step_result.json")):
-        payload = _read_json_if_exists(step_result_path)
-        if not payload:
-            continue
-        step_token = step_result_path.parts[-3].strip().lower()
-        if step_token not in verify_steps:
-            continue
-        retry_decisions = payload.get("retry_decisions")
-        if not isinstance(retry_decisions, list):
-            continue
-        for idx, decision in enumerate(retry_decisions):
-            if not isinstance(decision, dict):
-                continue
-            severity = str(decision.get("issue_severity") or "").strip().lower()
-            if severity and severity != "minor":
-                return {
-                    "step_result_ref": str(step_result_path.relative_to(repo_root)),
-                    "step": step_token,
-                    "retry_decision_index": idx,
-                    "issue_severity": severity,
-                    "repair_reason": decision.get("repair_reason"),
-                }
-    return None
+
+
+
+
+
+
+
+
 
 
 def _ensure_preflight_pass(preflight: dict[str, Any]) -> tuple[bool, str]:
@@ -906,21 +839,7 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
         "--no-invoke-llm",
         dest="invoke_llm",
         action="store_false",
-        help="Prepare orchestration artifacts only; do not invoke the LLM command.",
-    )
-    parser.add_argument(
-        "--orchestrator",
-        choices=("llm", "conductor"),
-        default=None,
-        help=(
-            "Orchestration driver. 'conductor' (default for claude/codex): drive the "
-            "deterministic phase/substep loop in Python (tools/workflow_conductor.py), "
-            "invoking the LLM only as a leaf for each substep body — removes the parent "
-            "orchestration LLM's per-turn cache_read overhead. 'llm': spawn an LLM "
-            "orchestration agent to drive the phase loop (the default for the cursor "
-            "backend, which has no conductor leaf launcher). "
-            "See docs/design/deterministic_conductor.md."
-        ),
+        help="Prepare orchestration artifacts only; do not run the conductor.",
     )
     return parser.parse_args(argv)
 
@@ -966,7 +885,6 @@ def main(argv: list[str] | None = None) -> int:
     resume_recovered_dep_ref: str | None = None
     resume_recovered_llm: str | None = None
     resume_recovered_llm_command: str | None = None
-    resume_recovered_orchestrator: str | None = None
     if resume_mode:
         explicit_id = bool(args.orchestration_id)
         orchestration_id = args.orchestration_id or _find_latest_orchestration(repo_root)
@@ -1008,14 +926,6 @@ def main(argv: list[str] | None = None) -> int:
                 )
                 return 2
         recovered = _load_resume_params(repo_root, orchestration_id)
-        # Restore the orchestration driver from the symmetric marker so a plain
-        # `--resume` never silently flips an in-flight run to the other driver.
-        # A missing marker means a legacy (pre-symmetric-marking) run, which was
-        # always LLM-driven — restore "llm" rather than letting the fresh-run
-        # conductor default (below) take over the resume.
-        resume_recovered_orchestrator = (
-            _recorded_orchestrator(repo_root, orchestration_id) or "llm"
-        )
         spec_ref_arg = args.spec_ref
         until_phase_arg = args.until_phase
         # A lone positional is ambiguous on resume: argparse binds it to spec_ref,
@@ -1070,15 +980,10 @@ def main(argv: list[str] | None = None) -> int:
         llm_in = args.llm or DEFAULT_LLM
         mode_in = args.mode or DEFAULT_WORKFLOW_MODE
 
-    # Effective orchestration driver: explicit --orchestrator wins; otherwise on
-    # --resume restore the original run's driver (from its marker); else default to
-    # the deterministic conductor (Python phase loop, no parent orchestration LLM —
-    # avoids the per-turn cache_read overhead). The conductor only has a leaf
-    # launcher for claude/codex, so a cursor backend with no explicit --orchestrator
-    # falls back to the LLM driver rather than erroring at backend validation below.
-    orchestrator = args.orchestrator or resume_recovered_orchestrator or (
-        "conductor" if llm_in in ("claude", "codex") else "llm"
-    )
+    # Orchestration is conductor-only (deterministic Python phase loop, no parent
+    # orchestration LLM — avoids the per-turn cache_read overhead). The driver is
+    # no longer selectable; the marker is still written/read for back-compat.
+    orchestrator = "conductor"
 
     try:
         workflow_mode = _normalize_workflow_mode(mode_in)
@@ -1086,12 +991,12 @@ def main(argv: list[str] | None = None) -> int:
             raise ValueError("until_phase is required unless --resume is set")
         until_phase = _normalize_phase(until_phase_in)
         llm = llm_in
-        # The deterministic conductor only has a leaf launcher for claude/codex;
-        # reject an unsupported backend up front instead of failing at the first
-        # substep after init/preflight already created the orchestration.
-        if orchestrator == "conductor" and llm not in ("claude", "codex"):
+        # The conductor only has a leaf launcher for claude/codex; reject an
+        # unsupported backend up front instead of failing at the first substep
+        # after init/preflight already created the orchestration.
+        if llm not in ("claude", "codex"):
             raise ValueError(
-                f"--orchestrator conductor supports --llm claude|codex, not {llm!r}"
+                f"conductor orchestration supports --llm claude|codex, not {llm!r}"
             )
         # Reuse the recovered agent command unless --llm-command was given or the
         # backend actually changed; restating the same --llm must keep the command.
@@ -1264,18 +1169,6 @@ def _run_node(
     # that directory so concurrent workflows' workspace/tmp/<other_agent_run_id>/ are untouched.
     orchestration_tmp_for_cleanup: Path | None = None
 
-    # For the Claude backend, pin a fresh host session UUID per launch so the real
-    # Claude Code transcript (~/.claude/projects/<slug>/<host_session_id>.jsonl) is
-    # addressable and can be recorded in orchestration_meta.json#host_session_id.
-    # A resume spawns a new session, so a fresh id is generated each invocation.
-    # Gate on invoke_llm: with --no-invoke-llm no `claude --session-id` process
-    # ever starts, so recording a host_session_id would point meta at a transcript
-    # that does not exist. (host_session_id is recorded at init for run-write-baseline
-    # integrity; on a subsequent real launch via --resume it is regenerated.)
-    host_session_id: str | None = (
-        str(uuid.uuid4()) if (llm == "claude" and invoke_llm) else None
-    )
-
     # Announce node start on stdout (uniform for the single/target/dependency
     # nodes), matching the JSONL info-event stream the rest of this driver emits.
     print(
@@ -1293,14 +1186,11 @@ def _run_node(
         flush=True,
     )
 
-    # Record the effective driver BEFORE init/preflight so the "missing marker ⟹
-    # legacy llm run" invariant is airtight: any run that entered _run_node marks
-    # itself before init creates orchestration_meta.json, so a fresh conductor run
-    # that later fails preflight (or is killed mid-setup) still leaves a marker and
-    # `--resume` restores the conductor rather than silently downgrading to the LLM
-    # driver. The conductor also re-writes it in run_conductor (same value).
+    # Record the driver BEFORE init/preflight so every run that entered _run_node
+    # leaves a marker even if it fails preflight or is killed mid-setup. Orchestration
+    # is conductor-only; the conductor also re-writes the same value in run_conductor.
     _write_orchestrator_marker(
-        repo_root, orchestration_id, env.get("METDSL_ORCHESTRATOR", "llm")
+        repo_root, orchestration_id, env.get("METDSL_ORCHESTRATOR", "conductor")
     )
 
     try:
@@ -1384,12 +1274,6 @@ def _run_node(
                 "--agent-command",
                 llm_command,
             ]
-            # Record host_session_id only when preflight is launchable (write_preflight
-            # gates it), so a failed/non-launchable preflight never points meta at a
-            # session that did not start. host_session_id is set only for claude +
-            # invoke_llm.
-            if host_session_id:
-                preflight_args += ["--host-session-id", host_session_id]
             preflight_result = _runtime_command(repo_root, env, preflight_args).payload
         except RuntimeError as exc:
             print(
@@ -1459,8 +1343,7 @@ def _run_node(
 
         launched = False
         workflow_status = "running"
-        cli_returncode_warning: int | None = None
-        if invoke_llm and env.get("METDSL_ORCHESTRATOR") == "conductor":
+        if invoke_llm:
             # Deterministic conductor: drive the phase loop in Python (no parent
             # orchestration LLM). The leaf substeps are spawned by the conductor.
             from tools.workflow_conductor import run_conductor
@@ -1492,243 +1375,13 @@ def _run_node(
                      "orchestration_id": orchestration_id}, ensure_ascii=False))
                 return 2
             launched = True
-            # The conductor terminalizes meta itself. The LLM-path failure-reporting
-            # block below is skipped for the conductor, so report a non-pass terminal
-            # here and exit nonzero (otherwise a failed run falls through to the
-            # generic ok output with exit 0).
+            # The conductor terminalizes meta itself; report a non-pass terminal here
+            # and exit nonzero (otherwise a failed run falls through to the generic ok
+            # output with exit 0). In dev mode, also collect + persist
+            # `failure_analysis.json` — the documented dev-failure artifact that
+            # `init --resume-from-checkpoint` reads (`_derive_resume_directive`) to
+            # build the cross-phase reopen `resume_directive` on resume.
             if workflow_status.strip().lower() != "pass":
-                fail_output: dict[str, Any] = {
-                    "status": "fail",
-                    "reason": "workflow_failed",
-                    "orchestration_id": orchestration_id,
-                    "workflow_mode": workflow_mode,
-                    "workflow_status": workflow_status,
-                }
-                if extra_output:
-                    fail_output.update(extra_output)
-                print(json.dumps(fail_output, ensure_ascii=False))
-                return 2
-        elif invoke_llm:
-            launch_command, launch_input = _launch_command_and_input(
-                llm=llm,
-                llm_command=llm_command,
-                prompt_text=prompt_text,
-                session_id=host_session_id,
-            )
-            proc = subprocess.run(
-                launch_command,
-                cwd=repo_root,
-                env=env,
-                text=True,
-                input=launch_input,
-                check=False,
-            )
-            # `launched` means "the LLM subprocess was actually invoked" (distinguishing
-            # the ok path from --no-invoke-llm), NOT "it returned 0". Success/return-code
-            # is conveyed separately: a nonzero exit either takes the fail branch below or,
-            # when meta.status=pass, surfaces as `cli_returncode_warning` in the ok output.
-            launched = True
-            meta_after_launch = _read_json_if_exists(
-                repo_root / "workspace" / "orchestrations" / orchestration_id / "orchestration_meta.json"
-            )
-            if isinstance(meta_after_launch, dict):
-                workflow_status = str(meta_after_launch.get("status") or "running")
-            # Capture an incomplete (dangling) child launch. record-launch opened the
-            # active_child window but the child never returned (hang/interrupt), and the
-            # host process may still have exited cleanly (returncode 0 — orchestration
-            # agent ended its turn with an "I've paused" message). The returncode!=0
-            # terminalize below would miss that, silently leaving the orchestration
-            # "running" with no in-repo record of WHY. Detect it here (returncode-agnostic),
-            # snapshot the decisive — and ephemeral — ~/.claude transcript tail in-repo, and
-            # terminalize so `--resume` can recover it. The snapshot uses the runtime-owned
-            # `launch_incident.runtime.<uuid12>.json` name exempted in
-            # orchestration_runtime._should_ignore_runtime_snapshot_path so it is not
-            # misattributed as an unauthorized child write in the terminal diff.
-            launch_incident_ref: str | None = None
-            launch_incident_detected = False
-            try:
-                launch_incident = build_launch_incident(repo_root, orchestration_id)
-            except Exception:  # noqa: BLE001 - diagnostics must never break the run
-                launch_incident = None
-            if launch_incident is not None:
-                launch_incident_detected = True
-                orch_dir = repo_root / "workspace" / "orchestrations" / orchestration_id
-                snapshot_path = orch_dir / f"launch_incident.runtime.{uuid.uuid4().hex[:12]}.json"
-                try:
-                    if _atomic_write_json_exclusive(snapshot_path, launch_incident, tmp_dir=orch_dir):
-                        launch_incident_ref = str(snapshot_path.relative_to(repo_root))
-                except Exception:  # noqa: BLE001 - best-effort snapshot; never block the run
-                    launch_incident_ref = None
-                if workflow_status.lower() not in _RESUMABLE_TERMINAL_STATUSES:
-                    child = launch_incident.get("dangling_child", {})
-                    abort = launch_incident.get("abort_marker") or {}
-                    detail = (
-                        "child launch did not return (active_child window left open): "
-                        f"child={child.get('agent_run_id')} "
-                        f"step={child.get('step')}/{child.get('substep')} "
-                        f"launch_recorded_at={child.get('launch_recorded_at')} "
-                        f"elapsed={child.get('elapsed_seconds')}s "
-                        f"last_activity={abort.get('last_activity_ts')} "
-                        f"dead_air={abort.get('dead_air_seconds')}s "
-                        f"abort={abort.get('interrupt_text')}"
-                    )
-                    # Surface a transient API error (e.g. 529 Overloaded) so the
-                    # operator can tell at a glance this dangling launch was a
-                    # transport blip — safe to `--resume` without investigation —
-                    # rather than a genuine hang.
-                    api_error = abort.get("api_error") if isinstance(abort, dict) else None
-                    if isinstance(api_error, dict) and api_error.get("status") is not None:
-                        retry_hint = " retryable, safe to --resume" if api_error.get("retryable") else ""
-                        detail += (
-                            f" api_error={api_error.get('status')}"
-                            f" {str(api_error.get('message') or '').strip()[:120]}{retry_hint}"
-                        )
-                    if launch_incident_ref:
-                        detail += f" incident_ref={launch_incident_ref}"
-                    try:
-                        _runtime_command(
-                            repo_root,
-                            env,
-                            [
-                                "set-status",
-                                "--repo-root",
-                                str(repo_root),
-                                "--orchestration-id",
-                                orchestration_id,
-                                "--status",
-                                "fail",
-                                "--reason-code",
-                                "launch_incomplete_active_child",
-                                "--reason-detail",
-                                detail,
-                                "--blocking-policy-scope",
-                                "launch",
-                            ],
-                        )
-                        workflow_status = "fail"
-                    except RuntimeError:
-                        # set-status failed: leave workflow_status as-is. The failure
-                        # path below is still entered via launch_incident_detected (NOT
-                        # via workflow_status, which is still non-terminal here), and its
-                        # own set-status retry re-attempts terminalization as a fallback.
-                        pass
-            # The orchestration agent records meta.status="pass" via the gated set-status
-            # only after aggregate_verdict=pass and the pre_judge gate. That recorded
-            # terminal success is authoritative over a transport-induced nonzero CLI
-            # returncode or a superseded/recovered nonpass agent_run, so it short-circuits
-            # the failure-reporting path below (audit: orch_20260615T095217Z_74450292
-            # reported workflow_failed for a fully-passing run).
-            meta_status_is_pass = workflow_status.strip().lower() == "pass"
-            # A dev-mode major/critical verify issue is a fail-closed contract violation
-            # (docs/workflow/WORKFLOW_CORE.md, startup_contract.md, SKILL.md: dev mode
-            # must treat major/critical verify severities as fail). It overrides even a
-            # recorded meta.status=pass — the backstop for an orchestration agent that
-            # wrongly records pass despite a severe verify issue. The meta=pass
-            # short-circuit below is scoped to the CLI returncode only, never to this.
-            severe_verify_fail = False
-            if workflow_mode == "dev":
-                severe_verify_issue = _detect_non_minor_verify_issue(repo_root, orchestration_id)
-                if severe_verify_issue is not None:
-                    try:
-                        _runtime_command(
-                            repo_root,
-                            env,
-                            [
-                                "set-status",
-                                "--repo-root",
-                                str(repo_root),
-                                "--orchestration-id",
-                                orchestration_id,
-                                "--status",
-                                "fail",
-                                "--reason-code",
-                                "verify_issue_severity_violation",
-                                "--reason-detail",
-                                (
-                                    "verify substep severity must be minor in dev mode: "
-                                    f"{severe_verify_issue['issue_severity']} ({severe_verify_issue['step_result_ref']})"
-                                ),
-                                "--blocking-policy-scope",
-                                "verify",
-                            ],
-                        )
-                        workflow_status = "fail"
-                    except RuntimeError:
-                        workflow_status = "fail"
-                    severe_verify_fail = True
-            # meta.status=pass is authoritative ONLY over a transport-induced nonzero CLI
-            # returncode / a superseded-and-recovered nonpass agent_run — NOT over a
-            # severe_verify_fail, which fails closed regardless.
-            if severe_verify_fail or (
-                not meta_status_is_pass
-                and (
-                    proc.returncode != 0
-                    or launch_incident_detected
-                    or workflow_status.lower() in {
-                        "fail",
-                        "fail_closed",
-                        "blocked",
-                        "timeout",
-                        "cancel",
-                    }
-                )
-            ):
-                # When the launched LLM process exited without the orchestration
-                # agent recording a terminal status (e.g. a token/session-limit
-                # kill mid-run), the orchestration meta is still non-terminal
-                # ("running"). run_workflow launched the child synchronously and
-                # it has now returned, so the child is provably dead — terminalize
-                # the orchestration ourselves so an implicit `--resume` (which
-                # refuses a non-terminal latest, see _RESUMABLE_TERMINAL_STATUSES)
-                # can recover it. Best-effort: failure reporting continues even if
-                # set-status raises. Runs before failure-analysis collection so the
-                # reason is reflected in meta.reason_code/reason_detail.
-                if workflow_status.lower() not in _RESUMABLE_TERMINAL_STATUSES:
-                    # Preserve the specific dangling-launch signal when this fallback
-                    # is reached because the dedicated launch_incomplete_active_child
-                    # set-status above raised — otherwise resume diagnostics would
-                    # degrade to the generic returncode reason.
-                    if launch_incident_detected:
-                        fallback_reason_code = "launch_incomplete_active_child"
-                        fallback_reason_detail = (
-                            "child launch did not return (active_child window left open); "
-                            "dedicated terminalization failed, recovered via launch fallback "
-                            f"(returncode={proc.returncode}, status '{workflow_status}')"
-                        )
-                    else:
-                        fallback_reason_code = "llm_launch_interrupted"
-                        fallback_reason_detail = (
-                            "LLM launch process exited (returncode="
-                            f"{proc.returncode}) without the orchestration agent "
-                            "recording a terminal status; orchestration left non-terminal "
-                            f"'{workflow_status}'"
-                        )
-                    try:
-                        _runtime_command(
-                            repo_root,
-                            env,
-                            [
-                                "set-status",
-                                "--repo-root",
-                                str(repo_root),
-                                "--orchestration-id",
-                                orchestration_id,
-                                "--status",
-                                "fail",
-                                "--reason-code",
-                                fallback_reason_code,
-                                "--reason-detail",
-                                fallback_reason_detail,
-                                "--blocking-policy-scope",
-                                "launch",
-                            ],
-                        )
-                        workflow_status = "fail"
-                    except RuntimeError:
-                        # set-status failed — proceed with failure reporting using
-                        # the observed non-terminal status; resume may still need an
-                        # explicit --orchestration-id in this degraded case.
-                        pass
                 if workflow_mode == "dev":
                     analysis = _collect_failure_analysis(repo_root, orchestration_id)
                     fail_output: dict[str, Any] = {
@@ -1763,17 +1416,12 @@ def _run_node(
                         canonical_path = orch_dir / "failure_analysis.json"
                         try:
                             orch_dir.mkdir(parents=True, exist_ok=True)
-                            # Try exclusive-create on canonical first (succeeds only when absent).
                             wrote_canonical = _atomic_write_json_exclusive(
-                                canonical_path,
-                                emergency_payload,
-                                tmp_dir=orch_dir,
+                                canonical_path, emergency_payload, tmp_dir=orch_dir
                             )
                             if wrote_canonical:
                                 fallback_ref = str(canonical_path.relative_to(repo_root))
                             else:
-                                # Canonical already exists (agent owns it) — write to unique sidecar.
-                                # Retry with a fresh UUID on collision (bounded to avoid infinite loop).
                                 _MAX_SIDECAR_ATTEMPTS = 5
                                 fallback_ref = None
                                 for _ in range(_MAX_SIDECAR_ATTEMPTS):
@@ -1793,25 +1441,28 @@ def _run_node(
                             fail_output["analysis_ref_error"] = str(primary_exc)
                             fail_output["analysis_ref_write_mode"] = "emergency_fallback"
                         except Exception as fallback_exc:  # noqa: BLE001
-                            # Both writes failed — no artifact on disk.
                             fail_output["reason"] = "failure_analysis_persist_failed"
                             fail_output["analysis_ref_error"] = str(primary_exc)
                             fail_output["analysis_ref_fallback_error"] = str(fallback_exc)
                     print(json.dumps(fail_output, ensure_ascii=False))
                     return 2
-                return proc.returncode if proc.returncode != 0 else 2
-            elif proc.returncode != 0:
-                # meta.status=pass but the launched CLI exited nonzero (e.g. a transport
-                # hiccup the orchestration already recovered from). Treat the recorded
-                # pass as authoritative; surface the returncode as an advisory only.
-                cli_returncode_warning = proc.returncode
-
+                fail_output = {
+                    "status": "fail",
+                    "reason": "workflow_failed",
+                    "orchestration_id": orchestration_id,
+                    "workflow_mode": workflow_mode,
+                    "workflow_status": workflow_status,
+                }
+                if extra_output:
+                    fail_output.update(extra_output)
+                print(json.dumps(fail_output, ensure_ascii=False))
+                return 2
         ok_output: dict[str, Any] = {
             "status": "ok",
             "orchestration_id": orchestration_id,
             "resumed": resume_mode,
             "llm": llm,
-            "orchestrator": env.get("METDSL_ORCHESTRATOR", "llm"),
+            "orchestrator": env.get("METDSL_ORCHESTRATOR", "conductor"),
             "llm_command": llm_command,
             "target_spec_ref": spec_ref,
             "until_phase": until_phase,
@@ -1822,8 +1473,6 @@ def _run_node(
             "prompt_ref": str(prompt_path.relative_to(repo_root)),
             "llm_invoked": launched,
         }
-        if cli_returncode_warning is not None:
-            ok_output["cli_returncode_warning"] = cli_returncode_warning
         if extra_output:
             ok_output.update(extra_output)
         print(json.dumps(ok_output, ensure_ascii=False))

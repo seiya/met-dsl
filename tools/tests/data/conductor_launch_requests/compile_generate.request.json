@@ -13,7 +13,7 @@
  "dependency_ref": "spec/component/dynamics/advection_diffusion/dynamics_advdiff_flux_1d_upwind_center2/deps.yaml",
  "skill_name": "workflow-compile-generate",
  "skill_ref": "skills/workflow-compile-generate/SKILL.md",
- "skill_must_read_refs": "skills/workflow-compile-generate/SKILL.md,docs/workflow/WORKFLOW_CORE.md,docs/ORCHESTRATION.md,docs/workflow/phases/phase_01_compile.md,spec/component/dynamics/advection_diffusion/dynamics_advdiff_flux_1d_upwind_center2/controlled_spec.md,spec/component/dynamics/advection_diffusion/dynamics_advdiff_flux_1d_upwind_center2/tests.md,spec/component/dynamics/advection_diffusion/dynamics_advdiff_flux_1d_upwind_center2/deps.yaml",
+ "skill_must_read_refs": "skills/workflow-compile-generate/SKILL.md,docs/workflow/WORKFLOW_CORE.md,docs/AGENT_CONTRACT.md,docs/workflow/phases/phase_01_compile.md,spec/component/dynamics/advection_diffusion/dynamics_advdiff_flux_1d_upwind_center2/controlled_spec.md,spec/component/dynamics/advection_diffusion/dynamics_advdiff_flux_1d_upwind_center2/tests.md,spec/component/dynamics/advection_diffusion/dynamics_advdiff_flux_1d_upwind_center2/deps.yaml",
  "allowed_output_paths": [
   "workspace/ir/component__dynamics_advdiff_flux_1d_upwind_center2__0.1.0/advdiff-flux-1d-uc2_20260620_001/spec.ir.yaml",
   "workspace/ir/component__dynamics_advdiff_flux_1d_upwind_center2__0.1.0/advdiff-flux-1d-uc2_20260620_001/ir_meta.json"

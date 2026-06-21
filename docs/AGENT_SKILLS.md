@@ -6,7 +6,7 @@ This document defines the reference conventions for the `skills` used in the pro
 - Use the same phase definitions on `Codex` / `Gemini` / `Claude Code`.
 
 ## Scope
-- The `orchestration agent` that supervises the whole `workflow`
+- The conductor (`tools/workflow_conductor.py`) that drives the whole `workflow`
 - The core workflow phases `Compile` / `Generate` / `Build` / `Validate`
 - The `skills/<skill_name>/SKILL.md` referenced in each phase
 - The SKILL of the optional flows `Tune` / `Promote` is handled separately from the core workflow.
@@ -33,7 +33,6 @@ This document defines the reference conventions for the `skills` used in the pro
 6. When the decision is hard, use as the decision axis whether the impact of a rule violation extends to the destruction of auditability / reproducibility / judgment consistency. When it destroys, choose the contract documents under `docs/workflow/`; when it does not, choose `SKILL.md`.
 
 ## phase-to-Skill correspondence table (core workflow)
-- `Workflow orchestration`: `skills/workflow-orchestration/SKILL.md`
 - `Compile generate`: `skills/workflow-compile-generate/SKILL.md`
 - `Compile verify`: `skills/workflow-compile-verify/SKILL.md`
 - `Generate generate`: `skills/workflow-generate-generate/SKILL.md`

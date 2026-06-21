@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Sync test for argparse ↔ docs/CLI_REFERENCE.md{,_RARE}.
 
-In the CLI argument-information acquisition policy (the "CLI reference conventions"
-section of `CLAUDE.md`), the frequent subcommands (Tier-A) are covered in
+In the CLI argument information-acquisition policy (the "Information-acquisition
+policy" section of `docs/CLI_REFERENCE.md`), the frequent subcommands (Tier-A) are covered in
 `docs/CLI_REFERENCE.md`, and the rare subcommands (Tier-B) are kept as an
 overview only in `docs/CLI_REFERENCE_RARE.md`. This test:
 

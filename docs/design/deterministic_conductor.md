@@ -1,24 +1,21 @@
 # Deterministic Conductor
 
-Status: M2–M5 landed (`tools/workflow_conductor.py`) — deterministic loop, failure
-routing + reopen, LLM diagnostician escalation, and run_workflow `--orchestrator`
-wiring. The conductor is now the **default** driver for the `claude` / `codex`
-backends; `cursor` still defaults to `--orchestrator llm` (no conductor leaf
-launcher). M1 (real `claude -p` MCP/hooks verification + the cost-measuring
-integration run) is the remaining gap: the leaf path is exercised only by mocked
-unit tests, so `--orchestrator llm` is retained as an explicit fallback if a live
-conductor run misbehaves.
+Status: landed (`tools/workflow_conductor.py`) — deterministic loop, failure
+routing + reopen, LLM diagnostician escalation. The conductor drives orchestration
+for the `claude` / `codex` backends. M1 (a live `claude -p` MCP/hooks cost-measuring
+integration run) remains the open verification gap: the leaf path is exercised by
+mocked unit tests, not yet by a live run.
 
 ## Why
 
-The legacy path uses an **LLM orchestration agent** to drive the Compile → Generate →
-Build → Validate phase/substep loop. For a trivial node the orchestration LLM makes
-essentially no decisions, yet:
+An LLM-driven orchestration loop — one LLM agent driving the Compile → Generate →
+Build → Validate phase/substep loop — makes essentially no decisions for a trivial
+node, yet:
 
 - every bookkeeping CLI output (`record-launch`, `finalize-child`, `write-step-result`,
   `check-step-completed`, …) accumulates in its context and is re-read every turn, so
   `cache_read` grows **O(turns²)**;
-- it must keep ~70K of static protocol docs (SKILL / startup_contract / CLI_REFERENCE /
+- it must keep ~70K of static protocol docs (orchestration skill / startup contract / CLI_REFERENCE /
   phase docs) resident;
 - its reasoning is spent reconciling the framework's own bookkeeping state, not physics.
 
@@ -61,17 +58,13 @@ action/target vocabulary, falling back to `fail_closed` on anything malformed.
 python3 tools/run_workflow.py <spec_ref> <until_phase> --llm claude
 ```
 
-The conductor is the default for `claude`/`codex`, so `--orchestrator conductor` is
-now optional for those backends. `--orchestrator llm` selects the legacy
-LLM-orchestrator path unchanged, so the two stay A/B comparable via
-`tools/audit_orchestration.py`.
+`tools/audit_orchestration.py` reports per-run token/turn cost.
 
 ## Open risks (verified by the integration run / M1)
 
 1. **headless `claude -p` MCP + permissions** — leaf Build/Validate.execute need
    build-runtime MCP non-interactively (the committed `.claude/settings.json` grants it;
-   may need `--permission-mode`). If unavailable, fall back to the Agent path for those
-   two substeps only.
+   may need `--permission-mode`).
 2. **hooks on a top-level leaf** — `output_manifest_write_guard` etc. must attribute to
    the leaf's `agent_run_id` (`record-launch` opens the active_child window;
    `finalize-child` closes it).

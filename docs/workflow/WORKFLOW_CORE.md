@@ -73,7 +73,7 @@ This document defines the workflow's phase sequence, inter-phase input/output co
 23. A phase that detected a write-scope violation is `fail`, and a downstream phase must not start. The violation content must be recorded in metadata under `workspace/`.
 24. A `pipeline` that detected a write-scope violation is `invalid`. The same trial must not continue without resolving the violation state.
 25. The workflow's hierarchical execution contract, and the requirements of `preflight`, `agent_runs.jsonl`, `agent_graph.json`, and `step_result.json` must be applied using `ORCHESTRATION.md` as the canonical source.
-26. The canonical entrypoint for starting the workflow is `python3 tools/run_workflow.py <spec_ref> <until_phase> [--llm <codex|cursor|claude>]`. `<until_phase>` specifies one of `compile` / `generate` / `build` / `validate`.
+26. The canonical entrypoint for starting the workflow is `python3 tools/run_workflow.py <spec_ref> <until_phase> [--llm <codex|claude>]`. `<until_phase>` specifies one of `compile` / `generate` / `build` / `validate`.
 27. When `preflight` is `fail`, the `orchestration agent` must not launch a child `agent`. The workflow must stop with `fail`.
 28. `preflight.json` must not be manually edited or post-edited to make it `pass`.
 29. Just before launching a child `agent`, re-run the execution platform's live check, and confirm the satisfaction of `multi_agent=true` and the launchability of the child `agent`.

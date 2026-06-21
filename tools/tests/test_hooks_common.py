@@ -488,7 +488,7 @@ class HookCommonTests(unittest.TestCase):
                 "policy": "output_manifest_write_guard",
                 "fix_hint": {
                     "write_under": "workspace/tmp/run123/...",
-                    "docs_ref": "skills/workflow-orchestration/references/startup_contract.md",
+                    "docs_ref": "docs/AGENT_CONTRACT.md",
                     "note": "use literal allowed_tmp_root path",
                 },
             },
@@ -499,7 +499,7 @@ class HookCommonTests(unittest.TestCase):
         reason = body.get("reason", "")
         self.assertIn("unauthorized write: foo", reason)
         self.assertIn("Write under: workspace/tmp/run123/...", reason)
-        self.assertIn("Docs: skills/workflow-orchestration/references/startup_contract.md", reason)
+        self.assertIn("Docs: docs/AGENT_CONTRACT.md", reason)
         self.assertIn("Note: use literal allowed_tmp_root path", reason)
 
     def test_codex_adapter_encode_decision_block_surfaces_fix_hint(self) -> None:
@@ -543,7 +543,7 @@ class HookCommonTests(unittest.TestCase):
 class DetectCliHelpInvocationTests(unittest.TestCase):
     """`_detect_cli_help_invocation`: audit `python3 tools/<name>.py [<sub>] --help`.
 
-    Because the CLI reference policy (the "CLI reference conventions" section of CLAUDE.md)
+    Because the CLI reference policy (the "Information-acquisition policy" section of docs/CLI_REFERENCE.md)
     treats reading argparse output via `--help` as a first-class path, the hook does not
     block but only attaches audit_detail and records the usage frequency.
     """
@@ -1718,11 +1718,6 @@ class AutoReadToleratedTests(unittest.TestCase):
             (decision.audit_detail or {}).get("policy"), "auto_read_expected_block",
         )
 
-    def test_substep_reads_cursor_mcp_json_is_harness_tolerated(self) -> None:
-        decision = self._call_validate_read(".cursor/mcp.json", "substep")
-        self.assertEqual(
-            (decision.audit_detail or {}).get("policy"), "auto_read_expected_block",
-        )
 
     def test_substep_reads_mcp_servers_tools_run_linter_is_harness_tolerated(self) -> None:
         decision = self._call_validate_read(
@@ -2007,12 +2002,12 @@ class FixHintInAuditDetailTests(unittest.TestCase):
         self.assertIn("write_under", fix_hint)
         self.assertIn("workspace/tmp/", fix_hint["write_under"])
         self.assertIn("docs_ref", fix_hint)
-        self.assertIn("startup_contract.md", fix_hint["docs_ref"])
+        self.assertIn("AGENT_CONTRACT.md", fix_hint["docs_ref"])
 
     def test_fix_hint_flags_tmpdir_fallback_or_hardcode_in_bash(self) -> None:
         """Regression: when the offending Bash command contains `${TMPDIR:-fallback}`
         or hardcodes /tmp/, the fix_hint should mark tmpdir_fallback_or_hardcode=True
-        and surface the canonical_doc anchor for startup_contract.md tmp-area section.
+        and surface the canonical_doc anchor for the AGENT_CONTRACT.md tmp-area rules.
         The recovery hint must instruct the agent to use the literal allowed_tmp_root
         path, never `export TMPDIR=...` (which would itself need session approval)."""
         from tools.hooks.common import validate_write_access
@@ -2039,7 +2034,7 @@ class FixHintInAuditDetailTests(unittest.TestCase):
         self.assertEqual(audit.get("policy"), "output_manifest_write_guard")
         fix_hint = audit.get("fix_hint") or {}
         self.assertTrue(fix_hint.get("tmpdir_fallback_or_hardcode"))
-        self.assertIn("startup_contract.md", fix_hint.get("canonical_doc", ""))
+        self.assertIn("AGENT_CONTRACT.md", fix_hint.get("canonical_doc", ""))
         self.assertIn("workspace/tmp/", fix_hint.get("write_under", ""))
         # Recovery hint must not recommend an approval-blocking Bash form.
         note = fix_hint.get("note", "")
@@ -2231,7 +2226,7 @@ class DevShmWriteBlockTests(unittest.TestCase):
         # Recovery hint must not be a runnable shell command.
         self.assertNotIn("next_command", fix_hint)
         docs_ref = fix_hint.get("docs_ref", "")
-        self.assertIn("startup_contract.md", docs_ref)
+        self.assertIn("AGENT_CONTRACT.md", docs_ref)
 
     def test_blocks_mv_to_dev_shm(self) -> None:
         decision = self._call("mv /tmp/result.json /dev/shm/result.json")

@@ -1451,7 +1451,7 @@ def _compute_initial_dependency_readiness(
     return fail_closed
 # Termination reasons for which Judge's pre_phase_complete verification does not require semantic_review (treated as incomplete).
 JUDGE_SEMANTIC_REVIEW_SKIPPED_STATUSES = frozenset({"timeout", "cancel"})
-SUPPORTED_BACKENDS = {"codex", "cursor", "claude"}
+SUPPORTED_BACKENDS = {"codex", "claude"}
 PREFLIGHT_TTL_DEFAULT_SECONDS: int = 1800
 VALID_REPAIR_STRATEGIES = frozenset({"none", "reuse", "restart"})
 VALID_ISSUE_SEVERITIES = frozenset({"none", "minor", "major", "critical"})
@@ -1565,7 +1565,6 @@ def _parse_node_key_strict(node_key: Any) -> tuple[str, str, str]:
 _AGENT_RUN_ID_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_-]*$")
 DEFAULT_BACKEND_COMMANDS = {
     "codex": "codex",
-    "cursor": "agent",
     "claude": "claude",
 }
 
@@ -1649,7 +1648,7 @@ def _active_children_dir(repo_root: Path, orchestration_id: str) -> Path:
     Each launched child writes `active_children/<agent_run_id>.txt` here.
     deactivate_child / record_agent_run terminal / record_timeout's success
     path remove the marker. record_timeout REFUSES to proceed while the
-    marker exists — this provides Codex/Cursor with the same liveness
+    marker exists — this provides Codex with the same liveness
     handshake protection that Claude got from active_child_agent_run_id.txt.
     """
     return _orchestration_root(repo_root, orchestration_id) / "active_children"
@@ -2152,7 +2151,7 @@ def _child_returns_dir(repo_root: Path, orchestration_id: str) -> Path:
     witnessed the Agent tool return for THIS specific arid. deactivate-child
     refuses to clear the active_children marker without this ack — without
     it a misrouted deactivate-child call would erase the only liveness guard
-    for a still-running Codex/Cursor child.
+    for a still-running Codex child.
     """
     return _orchestration_root(repo_root, orchestration_id) / "child_returns"
 
@@ -2702,8 +2701,8 @@ def _write_roots_for_launch(
         return [_with_trailing_slash(_normalize_rel_posix(f"{pipeline_ref.rstrip('/')}/runs"))]
     # NOTE: `tune` / `promote` are out-of-scope for the core 5-phase workflow
     # (Spec -> Compile -> Generate -> Build -> Validate). They are retained
-    # here as optional flows invoked via a separate entrypoint (see CLAUDE.md
-    # "optional flows Tune / Promote"). The core workflow does not produce these
+    # here as optional flows invoked via a separate entrypoint (Tune / Promote
+    # are defined outside the core workflow). The core workflow does not produce these
     # step tokens, so the branches below are reachable only from the optional
     # entrypoints; their tests assert the contract those entrypoints rely on.
     if st == "tune":
@@ -5946,31 +5945,32 @@ def _should_ignore_runtime_snapshot_path(
     )
     if any(token.startswith(prefix) for prefix in runtime_prefixes):
         return True
-    # `failure_analysis.runtime.<uuid12>.json` safety-net sidecar is written by
-    # `run_workflow.py:_write_failure_analysis` at the orchestration root when a
-    # canonical `failure_analysis.json` already exists. It is emitted by the
-    # outer run_workflow process — never by a child agent, which cannot reach
-    # the path through tool hooks (`output_manifest_write_guard`). The write can
-    # land after an interrupted child's launch baseline is captured but before
-    # `record-timeout` terminalizes it; without this exemption the sidecar shows
-    # up in that child's terminal-diff and is misattributed as an
-    # unauthorized_write_violation, dead-locking terminalization. Same
-    # runtime-owned rationale as `agent_runs_invalid.jsonl` below; intentionally
-    # narrow — only the UUID-suffixed runtime sidecar, NOT the canonical
-    # `failure_analysis.json` (which the orchestration agent owns via the gate).
+    # `failure_analysis.runtime.<uuid12>.json` safety-net sidecar (LEGACY: written
+    # by the removed LLM-orchestrator launch path's `_write_failure_analysis`; the
+    # conductor never emits it, so this exemption only matters when reading older
+    # on-disk runs). It was emitted by the outer run_workflow process — never by a
+    # child agent, which cannot reach the path through tool hooks
+    # (`output_manifest_write_guard`). The write could land after an interrupted
+    # child's launch baseline is captured but before `record-timeout` terminalizes
+    # it; without this exemption the sidecar shows up in that child's terminal-diff
+    # and is misattributed as an unauthorized_write_violation, dead-locking
+    # terminalization. Same runtime-owned rationale as `agent_runs_invalid.jsonl`
+    # below; intentionally narrow — only the UUID-suffixed runtime sidecar, NOT the
+    # canonical `failure_analysis.json`.
     if re.fullmatch(
         rf"{re.escape(orch_root)}/failure_analysis\.runtime\.[0-9a-f]{{12}}\.json",
         token,
     ):
         return True
-    # `launch_incident.runtime.<uuid12>.json` is written by run_workflow.py's
-    # synchronous-launch capture when it detects a dangling active_child window
-    # (a child launch that never returned). Same runtime-owned rationale as the
-    # failure_analysis sidecar above: emitted only by the outer run_workflow
-    # process, never by a child agent, and it can land while the dangling child's
-    # launch baseline is still captured — without this exemption it would surface
-    # in that child's terminal diff as an unauthorized_write_violation and dead-lock
-    # terminalization. Intentionally narrow: only the UUID-suffixed runtime sidecar.
+    # `launch_incident.runtime.<uuid12>.json` (LEGACY: written by the removed
+    # LLM-orchestrator launch path's dangling-active_child capture; the conductor
+    # never emits it, so this exemption only matters when reading older on-disk
+    # runs). Same runtime-owned rationale as the failure_analysis sidecar above:
+    # emitted only by the outer run_workflow process, never by a child agent, and it
+    # could land while the dangling child's launch baseline is still captured —
+    # without this exemption it would surface in that child's terminal diff as an
+    # unauthorized_write_violation and dead-lock terminalization. Intentionally
+    # narrow: only the UUID-suffixed runtime sidecar.
     if re.fullmatch(
         rf"{re.escape(orch_root)}/launch_incident\.runtime\.[0-9a-f]{{12}}\.json",
         token,
@@ -7887,7 +7887,11 @@ def _merge_unique_refs(*ref_groups: list[str]) -> list[str]:
 
 
 def _workflow_contract_refs_for_launch(request_payload: dict[str, Any]) -> list[str]:
-    refs = [WORKFLOW_CORE_REF, "docs/ORCHESTRATION.md"]
+    # The child contract is docs/AGENT_CONTRACT.md (the canonical, child-readable
+    # agent contract). docs/ORCHESTRATION.md is the orchestrator/conductor design
+    # spec and is NOT included here — no step/substep agent reads it (audit: 0/6
+    # substeps did), so listing it only bloated every launch prompt's must_read.
+    refs = [WORKFLOW_CORE_REF, "docs/AGENT_CONTRACT.md"]
     step = request_payload.get("step")
     if isinstance(step, str) and step.strip():
         phase_doc = WORKFLOW_PHASE_DOC_BY_STEP.get(step.strip().lower())
@@ -8224,10 +8228,10 @@ ALLOWED_VALIDATE_PIPELINE_STAGES: dict[tuple[str, str], frozenset[str]] = {
     # substep is restricted to the single canonical `--stage` it owns;
     # cross-substep / `full` invocations are rejected at `record-launch`
     # because they widen the substep's responsibility surface beyond the
-    # recurrence-prevention contract. (SKILL.md line 116 documents the
-    # broader per-step allow-set for `write-step-result`'s
-    # `validation_stage` field — a separate recording-layer contract — but
-    # the launch-prompt layer enforced here is strictly per-substep.)
+    # recurrence-prevention contract. (The broader per-step allow-set for
+    # `write-step-result`'s `validation_stage` field is a separate
+    # recording-layer contract; the launch-prompt layer enforced here is
+    # strictly per-substep.)
     #
     # Compile.generate / Generate.generate must not invoke
     # `validate_pipeline_semantics` at all — that responsibility lies with
@@ -11066,7 +11070,7 @@ def _pass_values_by_check_name(checks: list[dict[str, Any]]) -> dict[str, Any]:
 def _can_launch_from_help_fallback_checks(
     backend_token: str, checks: list[dict[str, Any]]
 ) -> bool:
-    """For cursor/claude. Even without `features list`, treat it as launchable if `--help` passes."""
+    """For claude. Even without `features list`, treat it as launchable if `--help` passes."""
     passes = _pass_values_by_check_name(checks)
     version_ok = passes.get(f"{backend_token}_version_available") is True
     features_list_ok = passes.get(f"{backend_token}_features_list_available") is True
@@ -11098,78 +11102,6 @@ def _all_strict_boolean_probe_checks_pass(checks: list[dict[str, Any]]) -> bool:
         if p is not True:
             return False
     return evaluated_any
-
-
-def _probe_help_fallback_backend(
-    backend_token: str,
-    command: str,
-    runner: Callable[..., subprocess.CompletedProcess[str]],
-) -> tuple[list[dict[str, Any]], dict[str, bool], bool, str]:
-    """Run the cursor/claude backend probe and return (checks, features, multi_agent_enabled, agent_version)."""
-    version_proc = runner([command, "--version"], text=True, capture_output=True, check=False)
-    features_proc = runner([command, "features", "list"], text=True, capture_output=True, check=False)
-    features: dict[str, bool] = {}
-    features_list_available = features_proc.returncode == 0
-    multi_agent_enabled = False
-    features_list_detail = features_proc.stdout.strip() or features_proc.stderr.strip()
-    help_proc: subprocess.CompletedProcess[str] | None = None
-    if features_proc.returncode == 0:
-        features = parse_feature_list(features_proc.stdout)
-        multi_agent_enabled = features.get("multi_agent") is True
-    if not multi_agent_enabled:
-        # Cursor and Claude Code CLIs do not expose `features list` as a structured command.
-        # Use --help as a best-effort launchability probe instead.
-        # Launch-time live preflight in `record_launch` remains the fail-safe.
-        help_proc = runner([command, "--help"], text=True, capture_output=True, check=False)
-        if help_proc.returncode == 0:
-            multi_agent_enabled = True
-            features = {"multi_agent": True}
-    if help_proc is None:
-        # Do not record pass=true for a probe that was not executed; launchability
-        # still uses features_list_ok in _can_launch_from_help_fallback_checks.
-        help_probe_pass: bool | None = None
-        help_probe_detail = (
-            "skipped; multi_agent was already confirmed from features list output "
-            "(no --help probe run)"
-        )
-    else:
-        help_probe_pass = help_proc.returncode == 0
-        help_detail = help_proc.stdout.strip() or help_proc.stderr.strip()
-        if help_probe_pass:
-            help_probe_detail = (
-                f"{backend_token} backend multi_agent could not be confirmed from features list; "
-                "fallback to --help succeeded"
-            )
-            if features_list_detail:
-                help_probe_detail += f"\nfeatures list: {features_list_detail}"
-            if help_detail:
-                help_probe_detail += f"\n{help_detail}"
-        else:
-            help_probe_detail = help_detail or "(no stdout/stderr from --help)"
-
-    checks = [
-        {
-            "name": f"{backend_token}_version_available",
-            "pass": version_proc.returncode == 0,
-            "detail": version_proc.stdout.strip() or version_proc.stderr.strip(),
-        },
-        {
-            "name": f"{backend_token}_features_list_available",
-            "pass": features_list_available,
-            "detail": features_list_detail,
-        },
-        {
-            "name": f"{backend_token}_help_probe_available",
-            "pass": help_probe_pass,
-            "detail": help_probe_detail,
-        },
-        {
-            "name": "multi_agent_enabled",
-            "pass": multi_agent_enabled,
-            "detail": f"multi_agent={features.get('multi_agent')}",
-        },
-    ]
-    return checks, features, multi_agent_enabled, version_proc.stdout.strip()
 
 
 def _probe_claude_backend(
@@ -11249,7 +11181,6 @@ _BACKEND_PROBERS: dict[
     ],
 ] = {
     "codex": _probe_codex_backend,
-    "cursor": _probe_help_fallback_backend,
     "claude": _probe_claude_backend,
 }
 
@@ -11591,7 +11522,7 @@ def _probe_claude_mcp_registry(
                     ),
                 },
                 {
-                    # The contract evaluates registered and permission always as a pair (CLAUDE.md / startup_contract.md).
+                    # The contract evaluates registered and permission always as a pair (see docs/RUNBOOK.md §0-2).
                     # Even on the advisory-only path without repo_root, include the permission check as skipped rather than omitting it.
                     "name": "claude_mcp_build_runtime_permission_granted",
                     "pass": None,
@@ -11742,12 +11673,11 @@ def probe_execution_platform(
     prober = _BACKEND_PROBERS[backend_token]
     checks, features, multi_agent_enabled, agent_version = prober(backend_token, command, runner)
 
-    if backend_token in ("cursor", "claude"):
+    if backend_token == "claude":
         can_launch_agents = _can_launch_from_help_fallback_checks(backend_token, checks)
-        if backend_token == "claude":
-            mcp_checks, mcp_ok = _probe_claude_mcp_registry(command, repo_root, runner)
-            checks.extend(mcp_checks)
-            can_launch_agents = can_launch_agents and mcp_ok
+        mcp_checks, mcp_ok = _probe_claude_mcp_registry(command, repo_root, runner)
+        checks.extend(mcp_checks)
+        can_launch_agents = can_launch_agents and mcp_ok
     else:
         can_launch_agents = _all_strict_boolean_probe_checks_pass(checks)
         hooks_enabled = features.get("hooks") is True
@@ -12780,7 +12710,7 @@ def record_launch(
             _active_child_agent_run_id_path(repo_root, orchestration_id),
             child_agent_run_id,
         )
-    # Adv-16: backend-neutral per-arid active-child marker. Codex/Cursor lack
+    # Adv-16: backend-neutral per-arid active-child marker. Codex lack
     # the single-active-child constraint that the Claude marker enforces, but
     # they still need a "the Agent tool actually returned" handshake before
     # record-timeout may finalize a run. Marker is created here for ALL
@@ -13030,7 +12960,7 @@ def record_timeout(
     # documented signal that the Agent tool returned) removes it. While the
     # marker exists, the orchestration agent has not yet acknowledged that the
     # child finished — firing record-timeout in that state would race the
-    # still-pending Agent tool return on Codex/Cursor as well as Claude.
+    # still-pending leaf return on Codex as well as Claude.
     # Adv-26: forced=True skips this guard for genuinely-wedged children
     # (operator override; force_reason is recorded in the audit trail).
     # Adv-37: forced bypass NO LONGER unlinks markers up-front. If
@@ -13519,7 +13449,7 @@ def deactivate_child_agent(
         }
     # Adv-20: require explicit "Agent tool returned" ack. The orchestration
     # agent must call record-child-return before deactivate-child. Without
-    # this gate, a misrouted deactivate-child for a still-running Codex/Cursor
+    # this gate, a misrouted deactivate-child for a still-running Codex
     # child clears its only liveness guard (active_children marker) and lets
     # record-timeout finalize and wipe its scratch.
     return_ack = _child_return_marker_path(repo_root, orchestration_id, child_run_id)
@@ -15862,7 +15792,7 @@ def main(argv: list[str] | None = None) -> int:
         help=(
             "JSON object for the agent run record. "
             "Always required: agent_run_id (UUID), agent_role ('orchestration'|'step'|'substep'), "
-            "agent_backend ('claude'|'codex'|'cursor'), status ('running'|'pass'|'fail'|...), "
+            "agent_backend ('claude'|'codex'), status ('running'|'pass'|'fail'|...), "
             "started_at (ISO8601). "
             "Required for step/substep: agent_session_id (for Claude Code = agent_run_id), "
             "context_id (unique UUID per run), context_isolated (true), node_key "

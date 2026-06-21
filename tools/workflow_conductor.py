@@ -330,9 +330,13 @@ class NodeRefs:
 # assembles by following references/launch_prompts.md. Validated field-for-field
 # against real working launches/*.request.json (test_workflow_conductor.py).
 # NOTE: `launch_prompt_full` is intentionally OMITTED so record-launch renders the
-# canonical prompt and returns it as `launch_prompt_text` (CLAUDE.md contract).
+# canonical prompt and returns it as `launch_prompt_text` (launch_prompts.md template).
 
-_DOC_CORE = ("docs/workflow/WORKFLOW_CORE.md", "docs/ORCHESTRATION.md")
+# Universal child-contract docs every substep must read. docs/AGENT_CONTRACT.md is
+# the canonical child-readable contract; docs/ORCHESTRATION.md (orchestrator/conductor
+# design spec) is intentionally excluded — no substep reads it. record-launch's
+# _workflow_contract_refs_for_launch keeps this aligned on the runtime side.
+_DOC_CORE = ("docs/workflow/WORKFLOW_CORE.md", "docs/AGENT_CONTRACT.md")
 _PHASE_DOC = {
     "compile": "docs/workflow/phases/phase_01_compile.md",
     "generate": "docs/workflow/phases/phase_02_generate.md",
@@ -416,6 +420,11 @@ def build_launch_request(
             must_read += [
                 _PHASE_DOC["build"],
                 "docs/workflow/MCP_COMMAND_LOG_PLACEMENT.md",
+                # The runner emits JSON; PERFORMANCE_DIAGNOSTICS §6 pins the safe
+                # numeric/descriptor forms that post_generate gates on. Declaring it
+                # up front avoids the agent discovering the need mid-run (an extra
+                # exploration turn observed in audits).
+                "docs/PERFORMANCE_DIAGNOSTICS.md",
                 f"{refs.ir_ref}/spec.ir.yaml",
                 f"{spec}/controlled_spec.md",
                 f"{spec}/tests.md",
@@ -1286,13 +1295,13 @@ def run_conductor(*, repo_root: Path | str, orchestration_id: str,
                   source_dependency_ref: str, until_phase: str, backend: str,
                   agent_model: str, workflow_mode: str, env: dict[str, str],
                   llm_command: str = "", resume: bool = False) -> str:
-    """Entrypoint used by run_workflow.py --orchestrator conductor. Resolves the
-    node, allocates+reserves ids (or, on resume, reuses the checkpointed ids), and
-    runs the deterministic phase loop. Returns the terminal orchestration status
-    (pass | fail | fail_closed)."""
+    """Conductor entrypoint used by run_workflow.py (the only orchestration driver).
+    Resolves the node, allocates+reserves ids (or, on resume, reuses the checkpointed
+    ids), and runs the deterministic phase loop. Returns the terminal orchestration
+    status (pass | fail | fail_closed)."""
     root = Path(repo_root)
-    # Mark this orchestration as conductor-driven so `--resume` restores the same
-    # driver instead of falling back to the LLM orchestrator.
+    # Record the conductor driver in the marker (orchestration is conductor-only;
+    # the marker is retained for back-compat with readers/audit).
     marker = root / "workspace" / "orchestrations" / orchestration_id / "orchestrator.json"
     try:
         marker.parent.mkdir(parents=True, exist_ok=True)

@@ -8,7 +8,7 @@ Related canonical sources:
 - orchestration contract: `docs/ORCHESTRATION.md`
 - workflow phase contracts: `docs/workflow/phases/phase_*.md`
 - CLI: `docs/CLI_REFERENCE.md`
-- startup contract: `skills/workflow-orchestration/references/startup_contract.md`
+- workflow operation / startup: `docs/RUNBOOK.md`
 
 ## Overall structure
 
@@ -33,8 +33,8 @@ workspace/
 │       │   ├── orchestration.start.prompt.txt     (the prompt run_workflow.py passed to the orchestration agent)
 │       │   ├── <agent_run_id>.request.json        (the launch request written by record-launch)
 │       │   ├── <agent_run_id>.response.json       (the launch response written by record-launch)
-│       │   ├── <agent_run_id>.prompt.txt          (the child agent prompt body. 1-to-1 with the Agent tool input; the child is blocked from Reading this file by read_manifest_read_guard)
-│       │   ├── <agent_run_id>.reply.txt           (overwritten by record-reply with the Agent tool response)
+│       │   ├── <agent_run_id>.prompt.txt          (the child agent prompt body. 1-to-1 with the leaf launch prompt input; the child is blocked from Reading this file by read_manifest_read_guard)
+│       │   ├── <agent_run_id>.reply.txt           (overwritten by record-reply with the leaf response)
 │       │   └── <agent_run_id>.parent_return_token (issued by record-launch, consumed by record-child-return)
 │       │
 │       ├── agents/
@@ -42,7 +42,7 @@ workspace/
 │       │       ├── dialogs/
 │       │       │   ├── child.request.json          (mirror of launches/<arid>.request.json)
 │       │       │   ├── child.response.json         (mirror)
-│       │       │   ├── child.prompt.txt            (mirror; 1-to-1 with the Agent tool input)
+│       │       │   ├── child.prompt.txt            (mirror; 1-to-1 with the leaf launch prompt input)
 │       │       │   ├── child.reply.txt             (mirror)
 │       │       │   ├── agent.result.json           (written by record-agent-run on pass)
 │       │       │   └── agent.summary.txt           (same as above)
@@ -166,8 +166,8 @@ workspace/
 
 | path | generated | writer | reader | note |
 |---|---|---|---|---|
-| `launches/<arid>.prompt.txt` | `record-launch` | runtime | **self Read forbidden** (read_manifest_read_guard) | the canonical artifact 1-to-1 with the Agent tool input (for audit / replay) |
-| `launches/<arid>.reply.txt` | `record-launch` (provisional) → `record-reply` (overwrite) | runtime | runtime / validator / parent orchestration agent | the Agent tool final response |
+| `launches/<arid>.prompt.txt` | `record-launch` | runtime | **self Read forbidden** (read_manifest_read_guard) | the canonical artifact 1-to-1 with the leaf launch prompt input (for audit / replay) |
+| `launches/<arid>.reply.txt` | `record-launch` (provisional) → `record-reply` (overwrite) | runtime | runtime / validator / parent orchestration agent | the leaf final response |
 | `launches/<arid>.parent_return_token` | `record-launch` | runtime | parent agent (for record-child-return) | prevents forgery by an arbitrary caller |
 | `capabilities/<arid>.json` | `record-launch` | runtime | **only self can Read** | includes `capability_token` / `write_roots` |
 | `output_manifests/<arid>.json` | `record-launch` | runtime | self can Read | `allowed_output_paths` / `allowed_file_tool_paths` / `allowed_tmp_root` |
@@ -199,4 +199,4 @@ Example: `component/dynamics_shallow_water_flux_2d_rusanov_p0@0.1.0` → `compon
 
 Each agent's `allowed_tmp_root` is **`workspace/tmp/<agent_run_id>/`** (directly under workspace, not under orchestration_id). The runtime canonical source is `init_orchestration` (for the orchestration agent) and `record_launch` (for the child agent) of `tools/orchestration_runtime.py`, both of which write `workspace/tmp/<agent_run_id>` into `output_manifests/<agent_run_id>.json#allowed_tmp_root`.
 
-The agent directly specifies that literal path (`workspace/tmp/<agent_run_id>/...`). Because `output_manifest_write_guard` judges only the write-target path and does not reference the `$TMPDIR` env, bootstrap Bash such as `export TMPDIR=...` / `jq -er ...` is unnecessary (see `skills/workflow-orchestration/references/startup_contract.md`). These Bash commands are forbidden because they cause the workflow to stop with a Claude Code session sandbox approval request. Using a path other than the one the manifest declares (`/tmp/`, `/dev/shm/`, `workspace/orchestrations/<orch>/tmp/...` etc.) as tmp is blocked by `output_manifest_write_guard`.
+The agent directly specifies that literal path (`workspace/tmp/<agent_run_id>/...`). Because `output_manifest_write_guard` judges only the write-target path and does not reference the `$TMPDIR` env, bootstrap Bash such as `export TMPDIR=...` / `jq -er ...` is unnecessary (see the tmp-area rules in `docs/AGENT_CONTRACT.md`). These Bash commands are forbidden because they cause the workflow to stop with a Claude Code session sandbox approval request. Using a path other than the one the manifest declares (`/tmp/`, `/dev/shm/`, `workspace/orchestrations/<orch>/tmp/...` etc.) as tmp is blocked by `output_manifest_write_guard`.

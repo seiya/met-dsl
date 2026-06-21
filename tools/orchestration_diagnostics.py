@@ -24,10 +24,10 @@ against the Claude Code transcript format: parse failures degrade to raw tails
 and ``found=False`` markers rather than raising.
 
 Callers:
-- ``tools/run_workflow.py`` invokes ``build_launch_incident`` right after the
-  synchronous ``claude`` subprocess returns (regardless of returncode) and snapshots
-  the result to ``launch_incident.runtime.<uuid12>.json``.
-- ``tools/audit_orchestration.py`` invokes it on demand for after-the-fact analysis.
+- ``tools/audit_orchestration.py`` invokes it on demand for after-the-fact analysis
+  of a dangling launch (open active_child window with no child return / terminal run).
+  (Legacy ``launch_incident.runtime.<uuid12>.json`` snapshots from older runs are also
+  surfaced when present; the conductor does not write new ones.)
 """
 from __future__ import annotations
 
@@ -109,7 +109,7 @@ def detect_dangling_active_child(
     ``active_children/<arid>.txt``, which ``record_launch`` writes for ALL backends
     — the Claude-only ``active_child_agent_run_id.txt`` pointer is used merely to
     choose the primary among several dangling children (Claude is sequential, so it
-    is the one). codex/cursor have no such pointer but still leave the per-arid
+    is the one). codex has no such pointer but still leaves the per-arid
     marker, so keying off it covers every backend. Path conventions mirror
     ``tools/orchestration_runtime.py`` (``_active_children_dir`` /
     ``_child_returns_dir``); paths are rebuilt as strings to avoid importing the
@@ -121,7 +121,7 @@ def detect_dangling_active_child(
     # Candidate arids = the Claude sequential pointer (written FIRST by record_launch,
     # so a crash before the per-arid marker leaves a pointer-only open window that
     # still blocks the next record-launch) UNION the backend-neutral per-arid markers
-    # (written for ALL backends; codex/cursor have no pointer).
+    # (written for ALL backends; codex has no pointer).
     candidate_arids: list[str] = []
     try:
         pointed = (root / "active_child_agent_run_id.txt").read_text(encoding="utf-8").strip()

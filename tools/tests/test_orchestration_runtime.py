@@ -400,56 +400,8 @@ shell_tool                       stable             true
         self.assertFalse(result["can_launch_step_agents"])
         self.assertFalse(result["can_launch_substep_agents"])
 
-    def test_probe_execution_platform_supports_cursor_backend(self) -> None:
-        def runner(args, **kwargs):  # type: ignore[no-untyped-def]
-            if args[0] == "agent" and args[1:] == ["--version"]:
-                return _FakeCompletedProcess(0, stdout="agent 1.0.0\n")
-            if args[0] == "agent" and args[1:] == ["features", "list"]:
-                return _FakeCompletedProcess(0, stdout="multi_agent experimental true\n")
-            raise AssertionError(args)
 
-        result = probe_execution_platform(backend="cursor", runner=runner)
-        self.assertEqual(result["backend"], "cursor")
-        self.assertEqual(result["probe_command"], "agent")
-        self.assertEqual(result["status"], "pass")
-        self.assertTrue(result["can_launch_step_agents"])
-        by_name = {c["name"]: c for c in result["checks"]}
-        self.assertIsNone(by_name["cursor_help_probe_available"]["pass"])
-        self.assertIn("skipped", by_name["cursor_help_probe_available"]["detail"])
 
-    def test_probe_execution_platform_cursor_fallback_when_features_list_unavailable(self) -> None:
-        def runner(args, **kwargs):  # type: ignore[no-untyped-def]
-            if args[0] == "agent" and args[1:] == ["--version"]:
-                return _FakeCompletedProcess(0, stdout="agent 1.0.0\n")
-            if args[0] == "agent" and args[1:] == ["features", "list"]:
-                return _FakeCompletedProcess(1, stderr="unknown command: features\n")
-            if args[0] == "agent" and args[1:] == ["--help"]:
-                return _FakeCompletedProcess(0, stdout="Usage: agent [options] [command] [prompt...]\n")
-            raise AssertionError(args)
-
-        result = probe_execution_platform(backend="cursor", runner=runner)
-        self.assertEqual(result["backend"], "cursor")
-        self.assertEqual(result["probe_command"], "agent")
-        self.assertEqual(result["status"], "pass")
-        self.assertTrue(result["can_launch_step_agents"])
-        self.assertEqual(result["feature_states"].get("multi_agent"), True)
-
-    def test_probe_execution_platform_cursor_fallback_when_features_list_has_no_multi_agent(self) -> None:
-        def runner(args, **kwargs):  # type: ignore[no-untyped-def]
-            if args[0] == "agent" and args[1:] == ["--version"]:
-                return _FakeCompletedProcess(0, stdout="agent 1.0.0\n")
-            if args[0] == "agent" and args[1:] == ["features", "list"]:
-                return _FakeCompletedProcess(0, stdout="some_feature stable true\n")
-            if args[0] == "agent" and args[1:] == ["--help"]:
-                return _FakeCompletedProcess(0, stdout="Usage: agent [options] [command] [prompt...]\n")
-            raise AssertionError(args)
-
-        result = probe_execution_platform(backend="cursor", runner=runner)
-        self.assertEqual(result["backend"], "cursor")
-        self.assertEqual(result["probe_command"], "agent")
-        self.assertEqual(result["status"], "pass")
-        self.assertTrue(result["can_launch_step_agents"])
-        self.assertEqual(result["feature_states"].get("multi_agent"), True)
 
     def test_probe_execution_platform_supports_claude_backend(self) -> None:
         def runner(args, **kwargs):  # type: ignore[no-untyped-def]
@@ -1222,7 +1174,7 @@ shell_tool                       stable             true
     def test_probe_execution_platform_rejects_backend_command_mismatch(self) -> None:
         with self.assertRaisesRegex(ValueError, "agent_command/backend mismatch"):
             probe_execution_platform(
-                backend="cursor",
+                backend="claude",
                 agent_command="codex",
             )
 
@@ -1231,19 +1183,19 @@ shell_tool                       stable             true
 
         def runner(args, **kwargs):  # type: ignore[no-untyped-def]
             seen["command"] = args[0]
-            if args[0] == "agent" and args[1:] == ["--version"]:
-                return _FakeCompletedProcess(0, stdout="agent 1.0.0\n")
-            if args[0] == "agent" and args[1:] == ["features", "list"]:
+            if args[0] == "codex" and args[1:] == ["--version"]:
+                return _FakeCompletedProcess(0, stdout="codex 1.0.0\n")
+            if args[0] == "codex" and args[1:] == ["features", "list"]:
                 return _FakeCompletedProcess(0, stdout="multi_agent experimental true\n")
             raise AssertionError(args)
 
         result = probe_execution_platform(
-            backend="cursor",
+            backend="codex",
             agent_command=None,
             runner=runner,
         )
-        self.assertEqual(seen["command"], "agent")
-        self.assertEqual(result["probe_command"], "agent")
+        self.assertEqual(seen["command"], "codex")
+        self.assertEqual(result["probe_command"], "codex")
 
     def test_probe_codex_backend_calls_features_list(self) -> None:
         """_probe_codex_backend calls the features list command and detects multi_agent."""
@@ -1315,56 +1267,7 @@ shell_tool                       stable             true
             _all_strict_boolean_probe_checks_pass([{"name": "x"}])
         )
 
-    def test_probe_help_fallback_uses_help_when_features_list_fails(self) -> None:
-        """_probe_help_fallback_backend tries the --help fallback on a features list failure."""
-        from tools.orchestration_runtime import _probe_help_fallback_backend
-        calls: list[list[str]] = []
 
-        def runner(cmd, **kwargs):  # type: ignore[no-untyped-def]
-            calls.append(list(cmd))
-            if cmd[-1] == "--version":
-                return _FakeCompletedProcess(0, stdout="claude 1.0.0")
-            if cmd[-2:] == ["features", "list"]:
-                return _FakeCompletedProcess(1, stdout="")  # features list failure
-            if cmd[-1] == "--help":
-                return _FakeCompletedProcess(0, stdout="Usage: claude ...")
-            return _FakeCompletedProcess(1, stdout="")
-
-        checks, features, multi_agent_enabled, agent_version = _probe_help_fallback_backend(
-            "claude", "claude", runner
-        )
-        self.assertTrue(multi_agent_enabled)
-        called_cmds = [" ".join(c) for c in calls]
-        self.assertTrue(any("--help" in c for c in called_cmds))
-        by_name = {c["name"]: c for c in checks}
-        self.assertFalse(by_name["claude_features_list_available"]["pass"])
-        self.assertTrue(by_name["claude_help_probe_available"]["pass"])
-
-    def test_probe_help_fallback_skips_help_when_features_list_confirms_multi_agent(self) -> None:
-        """When multi_agent is known from features list, do not run --help, and the help probe is pass=null."""
-        from tools.orchestration_runtime import (
-            _can_launch_from_help_fallback_checks,
-            _probe_help_fallback_backend,
-        )
-
-        calls: list[list[str]] = []
-
-        def runner(cmd, **kwargs):  # type: ignore[no-untyped-def]
-            calls.append(list(cmd))
-            if cmd[-1] == "--version":
-                return _FakeCompletedProcess(0, stdout="claude 1.0.0")
-            if cmd[-2:] == ["features", "list"]:
-                return _FakeCompletedProcess(0, stdout="multi_agent experimental true\n")
-            raise AssertionError(cmd)
-
-        checks, features, multi_agent_enabled, agent_version = _probe_help_fallback_backend(
-            "claude", "claude", runner
-        )
-        self.assertTrue(multi_agent_enabled)
-        self.assertFalse(any("--help" in c for c in calls))
-        by_name = {c["name"]: c for c in checks}
-        self.assertIsNone(by_name["claude_help_probe_available"]["pass"])
-        self.assertTrue(_can_launch_from_help_fallback_checks("claude", checks))
 
     def test_prepare_launch_request_payload_fills_verify_defaults(self) -> None:
         payload = prepare_launch_request_payload(
@@ -1385,7 +1288,8 @@ shell_tool                       stable             true
         self.assertEqual(payload["issue_severity"], "none")
         self.assertIn("docs/workflow/WORKFLOW_CORE.md", payload["skill_must_read_refs"])
         self.assertIn("docs/workflow/phases/phase_01_compile.md", payload["skill_must_read_refs"])
-        self.assertIn("docs/ORCHESTRATION.md", payload["skill_must_read_refs"])
+        self.assertIn("docs/AGENT_CONTRACT.md", payload["skill_must_read_refs"])
+        self.assertNotIn("docs/ORCHESTRATION.md", payload["skill_must_read_refs"])
         self.assertIn("skills/workflow-compile-verify/SKILL.md", payload["skill_must_read_refs"])
         self.assertIn(
             "workspace/ir/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/spec.ir.yaml",
@@ -8558,8 +8462,8 @@ shell_tool                       stable             true
                 )
 
     def test_record_agent_run_accepts_valid_backends(self) -> None:
-        """codex / cursor / claude are each accepted."""
-        for backend in ("codex", "cursor", "claude"):
+        """codex / claude are each accepted."""
+        for backend in ("codex", "claude"):
             with self.subTest(backend=backend):
                 with tempfile.TemporaryDirectory() as tmp:
                     repo_root = Path(tmp)
@@ -9231,7 +9135,6 @@ shell_tool                       stable             true
             ("Claude", "claude"),
             ("  Claude  ", "claude"),
             ("CODEX", "codex"),
-            ("Cursor", "cursor"),
         ]
         for idx, (raw, expected) in enumerate(cases):
             with self.subTest(raw=raw):
@@ -21450,7 +21353,7 @@ class SetStatusReplayE2ETests(unittest.TestCase):
             arid = first["orchestration_agent_run_id"]
             self.assertTrue(_cleanup_committed_marker_path(
                 repo_root, "replay", arid).is_file())
-            # Defensive retry per SKILL.md item 34: same terminal, same fields.
+            # Defensive retry (idempotent terminalization): same terminal, same fields.
             replayed = update_orchestration_status(
                 repo_root=repo_root, orchestration_id="replay",
                 status="fail_closed", reason_code="dependency_not_ready",
@@ -24952,28 +24855,6 @@ class RepairStepResultExecutorTests(unittest.TestCase):
                 )
 
 
-class StartupDocSizeTests(unittest.TestCase):
-    """Regression guard: the docs the orchestration loads at startup are resident every
-    turn (cache_read scales with context × turns), so cap their size to catch re-bloat.
-    Ceilings sit just above the current sizes — a deeper safe trim (de-duplicating the
-    Requirements / Operations-Rules / Decision-Criteria overlap against docs/ORCHESTRATION.md
-    without losing any normative criterion) is staged follow-up work; lowering these ceilings
-    is its deliverable, and raising them needs an explicit justification here."""
-
-    REPO_ROOT = Path(__file__).resolve().parents[2]
-
-    def test_skill_md_within_budget(self) -> None:
-        # Ceiling raised 44500 -> 44900 for the `reopen-phase` cross-phase-retry step
-        # (the orchestration must reopen a checkpointed-pass Compile before re-running
-        # it). The added ~280 bytes are net token-positive: without the step a
-        # Validate.judge attribution=ir retry dead-ends and the agent re-derives the
-        # impasse (orders of magnitude more tokens — see the resume failure it fixes).
-        size = (self.REPO_ROOT / "skills/workflow-orchestration/SKILL.md").stat().st_size
-        self.assertLessEqual(size, 44900, f"SKILL.md grew to {size} bytes; trim or justify the ceiling")
-
-    def test_startup_contract_within_budget(self) -> None:
-        size = (self.REPO_ROOT / "skills/workflow-orchestration/references/startup_contract.md").stat().st_size
-        self.assertLessEqual(size, 33000, f"startup_contract.md grew to {size} bytes; trim or justify the ceiling")
 
 
 class ChildContextDocSizeTests(unittest.TestCase):
@@ -24992,6 +24873,9 @@ class ChildContextDocSizeTests(unittest.TestCase):
     # path -> byte ceiling (current size + small headroom)
     _CEILINGS = {
         "docs/AGENT_CONTRACT.md": 16800,
+        # generate.generate must_read (runner-JSON numeric/descriptor rules, §6);
+        # resident every generate child turn, so guarded against re-bloat too.
+        "docs/PERFORMANCE_DIAGNOSTICS.md": 5200,
         "docs/workflow/MCP_COMMAND_LOG_PLACEMENT.md": 21000,
         "docs/workflow/phases/phase_01_compile.md": 17000,
         # phase_02/03/04 bumps: 5378cfc ("Refine build and validation processes

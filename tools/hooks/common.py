@@ -59,7 +59,7 @@ WRITE_HINT = (
     "For temp files, write directly under the literal allowed_tmp_root path "
     "(workspace/tmp/<agent_run_id>/...); do NOT use `export TMPDIR=...`, "
     "`jq -er ...`, or any bootstrap Bash (Claude Code session sandbox approval "
-    "would stall the workflow). See skills/workflow-orchestration/references/startup_contract.md "
+    "would stall the workflow). See docs/AGENT_CONTRACT.md "
     "for the tmp-area contract."
 )
 
@@ -86,6 +86,9 @@ _AUTO_READ_TOLERATED_REPO_RELPATHS: frozenset[str] = frozenset({
 #   "/" so it cannot extend across path components (no suffix bypass).
 _HARNESS_AUTO_READ_TOLERATED_REPO_RELPATHS: frozenset[str] = frozenset({
     ".claude/settings.json",
+    # Claude Code's harness auto-reads project config files at startup regardless
+    # of the configured backend; `.cursor/mcp.json` is still probed when present in
+    # the checkout, so it stays tolerated even though the cursor backend is gone.
     ".cursor/mcp.json",
     "mcp_servers/README.md",
     "mcp_servers/mcp_servers.example.json",
@@ -1249,7 +1252,7 @@ def evaluate_common_policy(hook_input: HookInput) -> HookDecision:
                     f"blocked: command touches {offending!r} which is forbidden. "
                     "/dev/shm reads/writes are not permitted; write under the literal "
                     "allowed_tmp_root path (workspace/tmp/<agent_run_id>/) for temporary files. "
-                    "See skills/workflow-orchestration/references/startup_contract.md."
+                    "See docs/AGENT_CONTRACT.md."
                 ),
                 continue_processing=False,
                 audit_detail={
@@ -1258,7 +1261,7 @@ def evaluate_common_policy(hook_input: HookInput) -> HookDecision:
                     "destination": offending,
                     "fix_hint": {
                         "write_under": "workspace/tmp/<agent_run_id>/...",
-                        "docs_ref": "skills/workflow-orchestration/references/startup_contract.md",
+                        "docs_ref": "docs/AGENT_CONTRACT.md",
                     },
                 },
             )
@@ -1765,7 +1768,7 @@ def validate_write_access(
             # write target sits under allowed_tmp_root and ignores $TMPDIR env, so a literal
             # path works without any shell variable setup.
             "write_under": f"{tmp_root_str}/...",
-            "docs_ref": "skills/workflow-orchestration/references/startup_contract.md",
+            "docs_ref": "docs/AGENT_CONTRACT.md",
             "note": (
                 "Write under the literal allowed_tmp_root path "
                 f"({tmp_root_str}/...). Do not use `export TMPDIR=...`, `jq -er ...`, "
@@ -1775,7 +1778,7 @@ def validate_write_access(
         if used_fallback_or_hardcode:
             fix_hint_block["tmpdir_fallback_or_hardcode"] = True
             fix_hint_block["canonical_doc"] = (
-                "skills/workflow-orchestration/references/startup_contract.md#how-to-use-the-tmp-area-required-premise"
+                "docs/AGENT_CONTRACT.md"
             )
         return HookDecision(
             action=HookDecisionAction.BLOCK,
@@ -1822,7 +1825,7 @@ def validate_write_access(
                 f"--patch-file workspace/tmp/{agent_run_id}/x.patch "
                 f"--capability-token <token>"
             ),
-            "docs_ref": "skills/workflow-orchestration/references/startup_contract.md",
+            "docs_ref": "docs/AGENT_CONTRACT.md",
         }
         if bash_note:
             fix_hint["note"] = bash_note
@@ -1859,8 +1862,8 @@ def _is_persisted_tool_result_read(
     Matches: ~/.claude/projects/<repo-slug>/<session_dir>/tool-results/<id>.txt
     The session_dir component must equal either `agent_run_id` or `session_id`.
     Two IDs are checked because:
-    - Claude Code backend records agent_run_id as agent_session_id (per CLAUDE.md),
-      so tool-results may be stored under agent_run_id.
+    - Claude Code backend records agent_run_id as agent_session_id (see
+      docs/ORCHESTRATION.md), so tool-results may be stored under agent_run_id.
     - The hook payload's session_id is the live Claude Code session identifier
       actually used to name the directory; pass it to cover cases where the two
       differ.

@@ -4,11 +4,11 @@
 
 An overview of the **infrequently used** rare subcommands of `tools/orchestration_runtime.py`. For the detailed argument specification, `python3 tools/orchestration_runtime.py <sub> --help` is the canonical source.
 
-For the detailed specification of the frequent subcommands (Tier-A), refer to [docs/CLI_REFERENCE.md](CLI_REFERENCE.md). The information-acquisition policy per tool / subcommand uses the "CLI reference conventions" section of `CLAUDE.md` as the canonical source.
+For the detailed specification of the frequent subcommands (Tier-A), refer to [docs/CLI_REFERENCE.md](CLI_REFERENCE.md). The information-acquisition policy per tool / subcommand uses the "Information-acquisition policy" section of [docs/CLI_REFERENCE.md](CLI_REFERENCE.md) as the canonical source.
 
 Related canonical sources:
 - frequent subcommand details: [docs/CLI_REFERENCE.md](CLI_REFERENCE.md)
-- the startup contract of the whole workflow: `skills/workflow-orchestration/SKILL.md` and `skills/workflow-orchestration/references/startup_contract.md`
+- workflow operation / startup: [docs/RUNBOOK.md](RUNBOOK.md) (operator procedure) and [docs/ORCHESTRATION.md](ORCHESTRATION.md) (conductor/orchestration contract)
 - exception recovery procedures: [docs/RUNBOOK.md](RUNBOOK.md)
 
 ## Common conventions
@@ -22,7 +22,7 @@ Related canonical sources:
 | subcommand | purpose | main caller / situation |
 |---|---|---|
 | `init` | start an orchestration / generate `orchestration_meta.json` | usually launched via `tools/run_workflow.py`. A direct call is for exceptional operation only. `--agent-model <id>` records the orchestration agent's own model on its `agent_runs.jsonl` row (`run_workflow.py` passes `claude-opus-4-8` by default for the claude backend) |
-| `preflight` | execution-platform launchability probe / generate `preflight.json` | called internally by `tools/run_workflow.py`. A manual call is forbidden (see `AGENTS.md`) |
+| `preflight` | execution-platform launchability probe / generate `preflight.json` | called internally by `tools/run_workflow.py`. A manual call is forbidden |
 | `preflight-status` | read back an existing `preflight.json` | post-launch state confirmation |
 | `record-timeout` | the canonical recovery path for an `Agent` tool API stream idle timeout etc. | the exception recovery flow when a child agent wedges. `--force-reason` is the last resort for a marker-check bypass |
 | `read-checkpoint` | obtain `workspace/orchestrations/<orch>/orchestration_checkpoint.json` | at the resume decision in an orchestration with `resume_enabled=true` |
@@ -49,4 +49,4 @@ The argparse output includes the description / the help string of all arguments,
 - the use condition of `record-timeout`'s `--force-reason`: `docs/RUNBOOK.md#substep-timeout-recovery`
 - the recovery for an incomplete launch (dangling active_child window / `reason_code=launch_incomplete_active_child`), and reading the `launch_incident.runtime.*.json` diagnostics snapshot via `python3 tools/audit_orchestration.py --orchestration-id <id>` ("Dangling launch" section): `docs/RUNBOOK.md#launch-incomplete-recovery`
 - the response when `verify-checkpoint-integrity` detects `stale`: the relevant section of `docs/RUNBOOK.md`
-- the whole resume flow including `check-step-completed`: `skills/workflow-orchestration/SKILL.md` Operations Rule 19
+- the whole resume flow including `check-step-completed`: [docs/RUNBOOK.md](RUNBOOK.md) §3-1 (the conductor drives resume; `tools/workflow_conductor.py` is the implementation)
