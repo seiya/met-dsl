@@ -69,6 +69,30 @@ anchoring on the defective reasoning. This is gated by the env flag
 command construction is unit-tested, but the `--resume`/`--fork-session`/`--session-id`
 composition is not yet verified against a live `claude -p`.
 
+**Leaf sandboxing (bwrap, opt-in).** `record-launch` builds a per-arid bwrap profile
+(`sandbox_profiles/<arid>.json`: repo read-only; writes confined to the child's
+`write_roots` + `workspace/tmp`; the backend's install dir bound read-only and its
+config/credential home — `~/.claude{,.json}` — bound writable for auth + session
+transcript) and records `sandbox_enforced: true`. When `METDSL_CONDUCTOR_BWRAP` is set
+(**default off**), `spawn_leaf` wraps every leaf (claude and codex) in that profile via
+`render_bwrap_command`; otherwise the leaf runs unconfined. With the flag on the conductor
+**fails closed** — a leaf with no usable profile (a missing/invalid file, or a caller with
+no `child_arid` such as the read-only diagnostician) raises rather than launching
+unconfined; the diagnostician's failure is caught and routed to `fail_closed`. The backend
+type (not the launch command string, which may be a custom `--llm-command` wrapper) keys
+the config-home bind, and a creatable-but-absent home (e.g. `~/.codex` in a fresh env) is
+created before binding. Note `sandbox_enforced: true` is a runtime-**required
+invariant** — preflight and `record-launch` reject anything else (writing a
+`sandbox_not_enforced` violation) — so it cannot simply be recorded as `false` when the
+flag is off; the contract-honest end state is enforcement enabled by default (once the live
+`claude -p` run below confirms it), and `METDSL_CONDUCTOR_BWRAP=off` is a temporary
+divergence where the leaf runs unconfined despite the recorded invariant. The sandbox is
+*strictly* more confined than the unconfined leaf —
+which already runs with the user's full filesystem access — so enabling it is a net
+restriction, not a new exposure. `claude --version` runs under the rendered profile; a full
+`claude -p` run (auth / MCP build-runtime / hooks / `--session-id` transcript under the
+sandbox) still needs a live integration run before the flag becomes the default.
+
 ## Usage
 
 ```

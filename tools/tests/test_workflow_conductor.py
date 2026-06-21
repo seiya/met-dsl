@@ -432,6 +432,46 @@ class ConductRoutingTest(unittest.TestCase):
             binary_id="bin_1_001", run_id="run_1_001", source_binary_id="bin_1_001",
         )
 
+    def test_conductor_fail_closed_codes_are_allowlisted(self) -> None:
+        # Every reason_code the conductor uses for set-status fail_closed must be in the
+        # runtime's FAIL_CLOSED_REASON_CODES, or set-status rejects it (→ crash).
+        from tools.orchestration_runtime import FAIL_CLOSED_REASON_CODES
+        for code in ("leaf_transport_error", "retry_budget_exhausted",
+                     "conductor_phase_fail_closed", "sandbox_enforcement_violation"):
+            self.assertIn(code, FAIL_CLOSED_REASON_CODES)
+
+    def test_generic_fail_closed_uses_allowlisted_reason_code(self) -> None:
+        # A generic phase fail_closed decision (e.g. judge spec-attribution) maps to the
+        # allowlisted conductor_phase_fail_closed code, with the specific reason in detail.
+        from tools.orchestration_runtime import FAIL_CLOSED_REASON_CODES
+        c = self._conductor()
+        c.status_fn = lambda phase, substep, n: "fail" if phase == "compile" else "pass"
+        c.decision_fn = lambda phase, outcomes: wc.RouteDecision(
+            "fail_closed", reason="judge_physics_fail_spec")
+        status = c.conduct(self._refs(), "compile")
+        self.assertEqual(status, "fail_closed")
+        ss = [cap for s, cap in c.calls if s == "set-status"][-1]
+        self.assertEqual(ss["--reason-code"], "conductor_phase_fail_closed")
+        self.assertIn(ss["--reason-code"], FAIL_CLOSED_REASON_CODES)
+        self.assertEqual(ss["--reason-detail"], "judge_physics_fail_spec")
+
+    def test_conduct_terminalizes_sandbox_enforcement_as_fail_closed(self) -> None:
+        # A SandboxEnforcementError from a substep (bwrap on, no profile) must
+        # terminalize as fail_closed(sandbox_not_enforced), not bubble up as a generic
+        # conductor error / plain fail.
+        c = self._conductor()
+
+        def boom_run_phase(refs, phase, repair=None):  # type: ignore[no-untyped-def]
+            raise wc.SandboxEnforcementError("no usable sandbox profile for child")
+
+        c.run_phase = boom_run_phase  # type: ignore[assignment]
+        status = c.conduct(self._refs(), "compile")
+        self.assertEqual(status, "fail_closed")
+        ss = [cap for s, cap in c.calls if s == "set-status"][-1]
+        self.assertEqual(ss["--status"], "fail_closed")
+        # must be an allowlisted FAIL_CLOSED_REASON_CODES value (runtime rejects others)
+        self.assertEqual(ss["--reason-code"], "sandbox_enforcement_violation")
+
     def test_reopen_compile_on_ir_then_succeed(self) -> None:
         c = self._conductor()
         state = {"validate_fail_used": False}
@@ -599,6 +639,19 @@ class DiagnosticianTest(unittest.TestCase):
         c.spawn_leaf = lambda prompt, env, **kw: wc.ProcResult(0, "I am unsure; no directive", "")  # type: ignore[assignment]
         d = c.escalate(self._refs(), "build", wc.PhaseOutcome("build", "fail"))
         self.assertEqual(d.action, "fail_closed")
+
+    def test_escalate_fail_closed_when_diagnostician_unsandboxable(self) -> None:
+        # Under bwrap-enforced mode the diagnostician has no profile → spawn_leaf raises;
+        # escalate must convert that to a conservative fail_closed, not crash.
+        c = self._conductor()
+
+        def boom(prompt, env, **kw):  # type: ignore[no-untyped-def]
+            raise RuntimeError("METDSL_CONDUCTOR_BWRAP enabled but no usable sandbox profile")
+
+        c.spawn_leaf = boom  # type: ignore[assignment]
+        d = c.escalate(self._refs(), "validate", wc.PhaseOutcome("validate", "fail"))
+        self.assertEqual(d.action, "fail_closed")
+        self.assertIn("sandbox_unavailable", d.reason or "")
 
     def test_conduct_escalates_then_reopens(self) -> None:
         c = self._conductor()
@@ -961,6 +1014,81 @@ class LeafSpawnTest(unittest.TestCase):
         restart = run({"METDSL_CONDUCTOR_REUSE_RESUME": "1"},
                       {"repair_strategy": "restart", "repair_target_agent_run_id": "producer-arid"})
         self.assertIsNone(restart.get("resume_session_id"))
+
+    def test_bwrap_flag_default_off(self) -> None:
+        self.assertFalse(self._c(env={})._bwrap_enabled())
+        self.assertTrue(self._c(env={"METDSL_CONDUCTOR_BWRAP": "1"})._bwrap_enabled())
+
+    def test_spawn_leaf_wraps_in_bwrap_when_enabled(self) -> None:
+        # With the flag on and a recorded sandbox profile, the leaf argv is wrapped in
+        # `bwrap ... -- <leaf command>`; with the flag off it runs the bare command.
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            ws_tmp = repo / "workspace" / "tmp" / "A"
+            ws_tmp.mkdir(parents=True)
+            prof_dir = repo / "workspace" / "orchestrations" / "o" / "sandbox_profiles"
+            prof_dir.mkdir(parents=True)
+            (prof_dir / "A.json").write_text(json.dumps({
+                "repo_root": str(repo), "tmp_dir": str(ws_tmp),
+                "workspace_tmp_rw_abs": str(ws_tmp),
+                "read_roots": [], "write_roots": [],
+                "runtime_ro_bind_paths": [], "runtime_rw_bind_paths": [],
+            }), encoding="utf-8")
+
+            captured: dict = {}
+
+            def fake_run(argv, **kw):  # type: ignore[no-untyped-def]
+                captured["argv"] = argv
+
+                class _R:
+                    returncode = 0
+                    stdout = ""
+                    stderr = ""
+                return _R()
+
+            orig = wc.subprocess.run
+            try:
+                wc.subprocess.run = fake_run  # type: ignore[assignment]
+                # flag ON + profile present → bwrap-wrapped (claude)
+                self._c(repo_root=repo, env={"METDSL_CONDUCTOR_BWRAP": "1"}).spawn_leaf(
+                    "P", {"HOME": "/h"}, session_id="A", child_arid="A")
+                self.assertEqual(captured["argv"][0], "bwrap")
+                self.assertIn("claude", captured["argv"])
+                self.assertIn("--", captured["argv"])
+                # codex backend is also wrapped (it gets a profile + sandbox_enforced too)
+                captured.clear()
+                self._c(repo_root=repo, backend="codex",
+                        env={"METDSL_CONDUCTOR_BWRAP": "1"}).spawn_leaf(
+                    "P", {"HOME": "/h"}, child_arid="A")
+                self.assertEqual(captured["argv"][0], "bwrap")
+                self.assertIn("codex", captured["argv"])
+                # flag OFF → bare leaf command (no bwrap)
+                captured.clear()
+                self._c(repo_root=repo, env={}).spawn_leaf(
+                    "P", {"HOME": "/h"}, session_id="A", child_arid="A")
+                self.assertEqual(captured["argv"][0], "claude")
+                # flag ON but profile missing → fail closed (never launch unconfined)
+                captured.clear()
+                with self.assertRaises(RuntimeError):
+                    self._c(repo_root=repo, env={"METDSL_CONDUCTOR_BWRAP": "1"}).spawn_leaf(
+                        "P", {"HOME": "/h"}, session_id="Z", child_arid="Z")
+                self.assertNotIn("argv", captured)
+                # flag ON but no child_arid (e.g. diagnostician) → also fail closed
+                with self.assertRaises(RuntimeError):
+                    self._c(repo_root=repo, env={"METDSL_CONDUCTOR_BWRAP": "1"}).spawn_leaf(
+                        "P", {"HOME": "/h"})
+                self.assertNotIn("argv", captured)
+                # flag ON + structurally invalid profile (missing repo_root/tmp_dir) →
+                # SandboxEnforcementError (so conduct terminalizes fail_closed), not a
+                # bare ValueError bubbling up as a generic conductor error.
+                (prof_dir / "BAD.json").write_text(json.dumps({"read_roots": []}),
+                                                   encoding="utf-8")
+                with self.assertRaises(wc.SandboxEnforcementError):
+                    self._c(repo_root=repo, env={"METDSL_CONDUCTOR_BWRAP": "1"}).spawn_leaf(
+                        "P", {"HOME": "/h"}, session_id="BAD", child_arid="BAD")
+                self.assertNotIn("argv", captured)
+            finally:
+                wc.subprocess.run = orig  # type: ignore[assignment]
 
 
 class FailSummaryContractTest(unittest.TestCase):

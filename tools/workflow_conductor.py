@@ -142,6 +142,12 @@ class RouteDecision:
     reason: str | None = None
 
 
+class SandboxEnforcementError(RuntimeError):
+    """Raised when `METDSL_CONDUCTOR_BWRAP` is enabled but a leaf cannot be sandboxed
+    (no usable profile). Surfaced so the conductor terminalizes as `fail_closed` rather
+    than a generic conductor error."""
+
+
 def classify_build_failure(failure_category: str | None) -> RouteDecision:
     if not failure_category:
         return RouteDecision("escalate", reason="build_fail_no_category")
@@ -614,6 +620,27 @@ class Conductor:
             return [*base, "exec", prompt_text]
         raise ValueError(f"unsupported backend for leaf spawn: {self.backend}")
 
+    def _bwrap_enabled(self) -> bool:
+        """Opt-in (default off) for launching each leaf under the bwrap sandbox
+        recorded at record-launch. Off by default until verified by a live run
+        (auth/MCP/hooks/session under the sandbox); toggled via env
+        `METDSL_CONDUCTOR_BWRAP`."""
+        return str(self.env.get("METDSL_CONDUCTOR_BWRAP", "")).strip().lower() in {
+            "1", "true", "yes",
+        }
+
+    def _sandbox_profile_for(self, child_arid: str) -> dict[str, Any] | None:
+        """The bwrap profile record-launch wrote for this child, or None."""
+        path = (self.repo_root / "workspace" / "orchestrations" / self.orchestration_id
+                / "sandbox_profiles" / f"{child_arid}.json")
+        if not path.exists():
+            return None
+        try:
+            doc = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return None
+        return doc if isinstance(doc, dict) else None
+
     def spawn_leaf(
         self,
         prompt_text: str,
@@ -621,11 +648,38 @@ class Conductor:
         *,
         session_id: str | None = None,
         resume_session_id: str | None = None,
+        child_arid: str | None = None,
     ) -> ProcResult:
+        argv = self.leaf_command(
+            prompt_text, session_id=session_id, resume_session_id=resume_session_id)
+        # When enabled, wrap the leaf in the bwrap sandbox that record-launch already
+        # built (repo read-only; writes confined to the child's write_roots +
+        # workspace/tmp). record-launch records sandbox_enforced=True for every backend,
+        # so applying it here makes that record true (the conductor leaf is otherwise
+        # unconfined). Applies to both claude and codex — both get a profile at launch.
+        if self._bwrap_enabled():
+            # Fail closed: the operator opted into enforcement and record-launch records
+            # sandbox_enforced=true, so ANY leaf without a usable profile — a missing/
+            # invalid one (older orchestration resumed, corrupted/deleted file) or a
+            # caller that supplies no child_arid (the diagnostician) — must NOT silently
+            # fall back to an unconfined launch.
+            profile = self._sandbox_profile_for(child_arid) if child_arid else None
+            if profile is None:
+                raise SandboxEnforcementError(
+                    "METDSL_CONDUCTOR_BWRAP is enabled but no usable sandbox profile is "
+                    f"available for this leaf (child_arid={child_arid!r}); refusing to "
+                    "launch unconfined (fail-closed)")
+            from tools.orchestration_runtime import render_bwrap_command
+            try:
+                argv = render_bwrap_command(profile=profile, command_argv=argv)
+            except ValueError as exc:
+                # A structurally invalid/corrupted profile (missing repo_root/tmp_dir,
+                # bad file pin, …) must also fail closed as a sandbox error, not bubble
+                # up as a generic conductor error.
+                raise SandboxEnforcementError(
+                    f"sandbox profile for {child_arid} is invalid: {exc}") from exc
         proc = subprocess.run(
-            self.leaf_command(
-                prompt_text, session_id=session_id, resume_session_id=resume_session_id),
-            cwd=self.repo_root, env=child_env, text=True, capture_output=True, check=False,
+            argv, cwd=self.repo_root, env=child_env, text=True, capture_output=True, check=False,
         )
         return ProcResult(proc.returncode, proc.stdout, proc.stderr)
 
@@ -840,7 +894,8 @@ class Conductor:
         launched_at = time.time()
         proc = self.spawn_leaf(
             rec["launch_prompt_text"], self._child_env(child_arid),
-            session_id=child_arid, resume_session_id=resume_session_id)
+            session_id=child_arid, resume_session_id=resume_session_id,
+            child_arid=child_arid)
         # Persist the leaf's verbatim stdout/stderr durably (every run, pass or
         # fail) so the LLM's actual response — including an infra failure message
         # such as a token-limit abort — is never lost. These conductor-side writes
@@ -1049,7 +1104,14 @@ class Conductor:
         context = self._gather_failure_context(refs, phase)
         prompt = _diagnosis_prompt(refs.node_key, phase, outcome.failed_substeps,
                                    context, self.workflow_mode)
-        proc = self.spawn_leaf(prompt, self._child_env(self.orchestration_agent_run_id))
+        try:
+            proc = self.spawn_leaf(prompt, self._child_env(self.orchestration_agent_run_id))
+        except RuntimeError:
+            # Under bwrap-enforced mode the read-only diagnostician has no record-launch
+            # sandbox profile, so spawn_leaf fails closed. Treat an un-sandboxable
+            # diagnosis as conservatively terminal — same posture as an unparsable
+            # directive — rather than crashing the conductor or launching unconfined.
+            return RouteDecision("fail_closed", reason=f"{phase}_diagnose_sandbox_unavailable")
         self._persist_leaf_output(self.orchestration_agent_run_id, proc,
                                   prefix=f"diagnose.{phase}")
         decision = _parse_directive(proc.stdout)
@@ -1092,7 +1154,15 @@ class Conductor:
             self.emit("phase_start", node_key=refs.node_key, phase=phase,
                       attempt=attempts[phase] + 1)
             phase_started = time.monotonic()
-            outcome = self.run_phase(refs, phase, repair=pending_repair.pop(phase, None))
+            try:
+                outcome = self.run_phase(refs, phase, repair=pending_repair.pop(phase, None))
+            except SandboxEnforcementError as exc:
+                # bwrap-enforced mode + a leaf with no usable profile: terminalize as
+                # fail_closed (the sandbox-enforcement failure path) rather than letting
+                # it bubble to run_workflow's generic conductor_error/fail handler.
+                self.set_status("fail_closed", reason_code="sandbox_enforcement_violation",
+                                reason_detail=str(exc)[:200])
+                return "fail_closed"
             if outcome.skipped:
                 # Already checkpointed complete (resume): no body ran, so an
                 # elapsed time would be misleading — report it as skipped instead.
@@ -1111,11 +1181,16 @@ class Conductor:
                 decision = self.escalate(refs, phase, outcome)
             if decision.action == "fail_closed":
                 reason = decision.reason or ""
-                # Name a leaf transport/token-limit failure in the status code itself
-                # (not just reason_detail) so the terminal record is self-describing.
-                reason_code = ("leaf_transport_error"
-                               if reason.startswith("leaf_transport_error")
-                               else f"{phase}_fail")
+                # Map to an allowlisted FAIL_CLOSED_REASON_CODES value (the runtime
+                # rejects any other code for fail_closed); the specific routing reason is
+                # preserved in reason_detail.
+                if reason.startswith("leaf_transport_error"):
+                    reason_code = "leaf_transport_error"
+                elif "sandbox" in reason:
+                    # diagnostician could not be sandboxed under METDSL_CONDUCTOR_BWRAP
+                    reason_code = "sandbox_enforcement_violation"
+                else:
+                    reason_code = "conductor_phase_fail_closed"
                 self.set_status("fail_closed", reason_code=reason_code,
                                 reason_detail=reason[:200])
                 return "fail_closed"

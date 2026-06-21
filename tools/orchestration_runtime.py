@@ -2328,6 +2328,16 @@ FAIL_CLOSED_REASON_CODES = {
     "post_phase_complete_violation",
     "parallel_nodes_not_explicitly_allowed",
     "sandbox_enforcement_violation",
+    # Conductor (deterministic driver) terminal failure modes. The conductor is the
+    # canonical driver, so its fail_closed terminalizations must use allowlisted codes:
+    #   - leaf_transport_error: a leaf process crashed / hit a token limit / transport.
+    #   - retry_budget_exhausted: a phase exceeded its cross-phase reopen budget.
+    #   - conductor_phase_fail_closed: a generic phase fail_closed routing decision
+    #     (e.g. judge spec-attribution, dev-mode severe verify) — the specific reason is
+    #     carried in reason_detail.
+    "leaf_transport_error",
+    "retry_budget_exhausted",
+    "conductor_phase_fail_closed",
 }
 
 # The fail_closed reason an orchestration records when a phase's failure mode is an
@@ -5542,12 +5552,82 @@ def _safe_host_env_for_child() -> dict[str, str]:
     return body
 
 
+def _resolve_backend_type(backend_type: str, backend_command: str) -> str:
+    """The backend family (``claude`` / ``codex``), preferring the explicit type and
+    falling back to the launch command string. A custom ``--llm-command`` wrapper means
+    the command is not literally ``claude``/``codex``, so the explicit type (recorded as
+    the launch response ``backend``) is authoritative; the command is only a fallback."""
+    bt = (backend_type or "").strip().lower()
+    if bt in {"claude", "codex"}:
+        return bt
+    cmd = (backend_command or "").lower()
+    if "claude" in cmd:
+        return "claude"
+    if "codex" in cmd:
+        return "codex"
+    return ""
+
+
+def _backend_runtime_bind_paths(
+    backend_type: str, backend_command: str
+) -> tuple[list[str], list[str]]:
+    """Absolute host paths the backend CLI needs that live outside ``repo_root``.
+
+    Returns ``(ro_paths, rw_paths)``:
+    - ro: the backend's install location (binary dir + resolved-symlink dir). The
+      `claude` CLI installs under ``~/.local/...``, outside the system dirs that
+      `_runtime_ro_bind_paths` covers, so the bare profile cannot find it. Resolved
+      from the command's first token (a custom wrapper resolves to the wrapper binary).
+    - rw: the backend's config/credential home (``~/.claude`` + ``~/.claude.json``
+      for claude; ``~/.codex`` for codex), keyed on the backend *type* (not the command
+      string, which may be a wrapper). Writable because the CLI refreshes auth and writes
+      its session transcript there (the latter is also what Phase 4's ``--session-id`` /
+      ``--resume`` rely on). An unconfined leaf already had full access to these, so
+      binding them is strictly less permissive than today.
+    """
+    btype = _resolve_backend_type(backend_type, backend_command)
+    ro: set[str] = set()
+    rw: set[str] = set()
+    first_token = (backend_command or "").split()
+    exe = shutil.which(first_token[0]) if first_token else None
+    if exe:
+        ro.add(str(Path(exe).parent))
+        ro.add(str(Path(os.path.realpath(exe)).parent))
+    home = (os.environ.get("HOME") or "").strip()
+    if home:
+        if btype == "claude":
+            ro.add(str(Path(home) / ".local" / "share" / "claude"))
+            rw.add(str(Path(home) / ".claude"))  # config dir (creatable if absent)
+            # auth FILE: include only if present — it cannot be fabricated, and gating it
+            # here means every *missing* rw entry the caller sees is a creatable dir (no
+            # fragile dir-vs-file suffix guessing during materialization).
+            auth_file = Path(home) / ".claude.json"
+            if auth_file.exists():
+                rw.add(str(auth_file))
+        elif btype == "codex":
+            # Mirror preflight's codex-home resolution (`Path(raw).expanduser()`) so the
+            # bound dir matches what preflight checked; coerce to absolute because bwrap
+            # binds require an absolute source (a `~`/relative METDSL_HOME otherwise
+            # yields a wrong or non-absolute bind target).
+            raw_codex = os.environ.get("METDSL_HOME", "").strip()
+            codex_home = Path(raw_codex).expanduser() if raw_codex else Path(home) / ".codex"
+            rw.add(str(codex_home if codex_home.is_absolute() else codex_home.resolve()))
+    ro_paths = sorted(p for p in ro if p and Path(p).exists())
+    # rw (backend config/credential home) is returned unfiltered by existence; the
+    # caller (build_bwrap_profile) materializes a missing config *dir* before binding,
+    # so a fresh environment whose home does not yet exist (but is creatable — preflight
+    # verifies the parent is writable) still gets a writable bind.
+    rw_paths = sorted(p for p in rw if p)
+    return ro_paths, rw_paths
+
+
 def build_bwrap_profile(
     *,
     repo_root: Path,
     orchestration_id: str,
     agent_run_id: str,
     backend_command: str,
+    backend_type: str = "",
 ) -> dict[str, Any]:
     read_manifest = _load_read_access_manifest(
         repo_root,
@@ -5633,6 +5713,39 @@ def build_bwrap_profile(
     workspace_tmp_host.mkdir(parents=True, exist_ok=True)
     child_env = _safe_host_env_for_child()
     child_env["TMPDIR"] = str(workspace_tmp_host)
+    backend_ro, backend_rw_desired = _backend_runtime_bind_paths(backend_type, backend_command)
+    resolved_repo = repo_root.resolve()
+    backend_rw: list[str] = []
+    for _rwp in backend_rw_desired:
+        _pp = Path(_rwp)
+        _rw_resolved = _pp.resolve()
+        # The backend config home must be ENTIRELY OUTSIDE repo_root. render_bwrap_command
+        # emits rw binds after the repo `--ro-bind` (bwrap later-overrides-earlier), so any
+        # rw path with a containment relationship to repo_root grants writes that defeat
+        # the sandbox: covering repo_root (repo root, ~, /) remounts the whole repo
+        # writable, and an in-repo home (e.g. METDSL_HOME=$repo/workspace) makes that
+        # subtree — including other agents' artifacts/audit logs — writable beyond the
+        # child's declared write_roots. Reject both.
+        if (resolved_repo == _rw_resolved
+                or resolved_repo.is_relative_to(_rw_resolved)
+                or _rw_resolved.is_relative_to(resolved_repo)):
+            raise ValueError(
+                f"runtime rw bind {_rwp!r} is not outside repo_root {resolved_repo}; a "
+                f"backend config home inside/covering the repo would grant writes beyond "
+                f"the child write_roots and defeat the sandbox")
+        if not _pp.exists():
+            # Every missing rw entry is a creatable config dir (the only file,
+            # ~/.claude.json, is existence-gated at source). Create it — including a
+            # dotted custom home like ~/.codex.v2 — so bwrap can bind it writable. A
+            # creation failure (non-writable/racing parent) must fail closed, not drop
+            # the bind and emit a profile missing the required auth/session home.
+            try:
+                _pp.mkdir(parents=True, exist_ok=True)
+            except OSError as exc:
+                raise ValueError(
+                    f"runtime rw bind {_rwp!r} (backend config home) is absent and could "
+                    f"not be created: {exc}") from exc
+        backend_rw.append(_rwp)
     return {
         "orchestration_id": orchestration_id,
         "agent_run_id": agent_run_id,
@@ -5641,7 +5754,11 @@ def build_bwrap_profile(
         "repo_root": str(repo_root),
         "read_roots": read_roots,
         "write_roots": write_roots,
-        "runtime_ro_bind_paths": _runtime_ro_bind_paths(),
+        "runtime_ro_bind_paths": _runtime_ro_bind_paths() + backend_ro,
+        # Writable binds outside repo_root: the backend's config/credential home
+        # (auth refresh + session transcript). Bound writable so the CLI runs and
+        # Phase 4 `--session-id`/`--resume` can read/write their session files.
+        "runtime_rw_bind_paths": backend_rw,
         "tmp_dir": str(tmp_root),
         "workspace_tmp_rw_abs": str(workspace_tmp_host),
         "workdir": str(repo_root),
@@ -5686,6 +5803,13 @@ def render_bwrap_command(
         if abs_path.exists():
             abs_token = str(abs_path)
             cmd.extend(["--ro-bind", abs_token, abs_token])
+    # Writable runtime binds (backend config/credential home) — emitted AFTER the repo
+    # and read-root ro-binds so a home located INSIDE repo_root (a custom HOME /
+    # METDSL_HOME) stays writable: bwrap applies binds in order, later overriding earlier
+    # overlaps. For a home outside repo_root the order is immaterial.
+    for item in profile.get("runtime_rw_bind_paths", []):
+        if isinstance(item, str) and item.strip():
+            cmd.extend(["--bind", item.strip(), item.strip()])
     for rel in profile.get("write_roots", []):
         if not isinstance(rel, str) or not rel.strip():
             continue
@@ -12610,11 +12734,13 @@ def record_launch(
         )
         out_refs["allowed_output_manifest_ref"] = manifest_ref
         try:
+            _resp_backend = response_payload.get("backend")
             profile = build_bwrap_profile(
                 repo_root=repo_root,
                 orchestration_id=orchestration_id,
                 agent_run_id=child_agent_run_id,
                 backend_command=backend_command,
+                backend_type=_resp_backend if isinstance(_resp_backend, str) else "",
             )
             command_argv = [backend_command]
             rendered = render_bwrap_command(profile=profile, command_argv=command_argv)

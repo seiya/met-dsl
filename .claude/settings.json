@@ -16,7 +16,9 @@
       "Bash(cat workspace/tmp/*)",
       "Bash(jq -er * workspace/orchestrations/*)",
       "Bash(jq -er * workspace/tmp/*)",
-      "Bash(date -u *)"
+      "Bash(date -u *)",
+      "Bash(echo \"EXIT=$?\")",
+      "Bash(echo \"---exit:$?---\")"
     ]
   },
   "hooks": {

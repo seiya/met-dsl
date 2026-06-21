@@ -15875,6 +15875,56 @@ class BwrapProfileFilePinTests(unittest.TestCase):
             encoding="utf-8",
         )
 
+    def test_build_bwrap_profile_materializes_missing_codex_home(self) -> None:
+        """A creatable-but-absent backend config home (e.g. ~/.codex in a fresh env) must
+        be created and bound writable, not silently dropped — otherwise the sandboxed CLI
+        cannot write its config/session state."""
+        from tools.orchestration_runtime import build_bwrap_profile
+
+        with tempfile.TemporaryDirectory() as tmp, tempfile.TemporaryDirectory() as home:
+            repo_root = Path(tmp)
+            orch = "orch_codexhome_001"
+            run_id = "run_codexhome_001"
+            self._write_cap_and_manifest(
+                repo_root, orchestration_id=orch, agent_run_id=run_id,
+                write_roots=["workspace/out/"],
+            )
+            codex_home = Path(home) / ".codex"
+            self.assertFalse(codex_home.exists())
+            with patch.dict(os.environ, {"HOME": home}, clear=False):
+                os.environ.pop("METDSL_HOME", None)
+                profile = build_bwrap_profile(
+                    repo_root=repo_root, orchestration_id=orch, agent_run_id=run_id,
+                    backend_command="codex", backend_type="codex",
+                )
+            self.assertTrue(codex_home.exists(), "missing codex home must be created")
+            self.assertIn(str(codex_home), profile["runtime_rw_bind_paths"])
+
+    def test_build_bwrap_profile_rejects_rw_home_not_outside_repo(self) -> None:
+        """A backend rw home with any containment relationship to repo_root must be
+        rejected: covering it (METDSL_HOME=repo root/ancestor) would remount the repo
+        writable, and an in-repo home (METDSL_HOME=$repo/workspace) would grant writes
+        beyond the child write_roots. Only a home fully outside repo_root is allowed."""
+        from tools.orchestration_runtime import build_bwrap_profile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            orch = "orch_rwcover_001"
+            run_id = "run_rwcover_001"
+            self._write_cap_and_manifest(
+                repo_root, orchestration_id=orch, agent_run_id=run_id,
+                write_roots=["workspace/out/"],
+            )
+            for bad_home in (str(repo_root), str(repo_root / "workspace")):
+                with self.subTest(home=bad_home):
+                    with patch.dict(os.environ, {"METDSL_HOME": bad_home}, clear=False):
+                        with self.assertRaises(ValueError):
+                            build_bwrap_profile(
+                                repo_root=repo_root, orchestration_id=orch,
+                                agent_run_id=run_id,
+                                backend_command="codex", backend_type="codex",
+                            )
+
     def test_file_pin_write_root_pre_creates_target_file(self) -> None:
         """build_bwrap_profile must touch a file-pin target so render_bwrap_command can bind it."""
         from tools.orchestration_runtime import build_bwrap_profile
@@ -15925,6 +15975,88 @@ class BwrapProfileFilePinTests(unittest.TestCase):
             bind_targets = [cmd[i + 1] for i, tok in enumerate(cmd) if tok == "--bind"]
             self.assertIn(pin_abs, bind_targets, "file-pin target must appear in bwrap --bind list")
             self.assertNotIn(parent_abs, bind_targets, "parent directory must NOT be bound — that would grant access to sibling files")
+
+    def test_runtime_rw_bind_paths_emitted_as_writable_bind(self) -> None:
+        """render_bwrap_command must emit a writable --bind (not --ro-bind) for each
+        runtime_rw_bind_paths entry — the backend's config/credential home that lives
+        outside repo_root and must be writable for auth refresh + session transcripts."""
+        from tools.orchestration_runtime import build_bwrap_profile, render_bwrap_command
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            orch = "orch_rw_001"
+            run_id = "run_rw_001"
+            self._write_cap_and_manifest(
+                repo_root, orchestration_id=orch, agent_run_id=run_id,
+                write_roots=["workspace/out/"],
+            )
+            home_like = repo_root / "_home_cfg"
+            home_like.mkdir()
+            profile = build_bwrap_profile(
+                repo_root=repo_root, orchestration_id=orch, agent_run_id=run_id,
+                backend_command="python3 agent.py",
+            )
+            # In-repo home: must stay writable, so its --bind must come AFTER the repo
+            # --ro-bind (bwrap later-overrides-earlier), otherwise the repo mount would
+            # remount it read-only.
+            in_repo_home = repo_root / "_in_repo_home"
+            in_repo_home.mkdir()
+            profile["runtime_rw_bind_paths"] = [str(home_like), str(in_repo_home)]
+            cmd = render_bwrap_command(profile=profile, command_argv=["python3", "agent.py"])
+            bind_targets = [cmd[i + 1] for i, t in enumerate(cmd) if t == "--bind"]
+            robind_targets = [cmd[i + 1] for i, t in enumerate(cmd) if t == "--ro-bind"]
+            self.assertIn(str(home_like), bind_targets,
+                          "runtime_rw_bind_paths entry must be a writable --bind")
+            self.assertNotIn(str(home_like), robind_targets,
+                             "runtime_rw_bind_paths must not be read-only")
+            repo_robind_idx = next(
+                i for i, t in enumerate(cmd)
+                if t == "--ro-bind" and cmd[i + 1] == str(repo_root))
+            in_repo_bind_idx = next(
+                i for i, t in enumerate(cmd)
+                if t == "--bind" and cmd[i + 1] == str(in_repo_home))
+            self.assertGreater(in_repo_bind_idx, repo_robind_idx,
+                               "in-repo writable home must be bound AFTER the repo ro-bind")
+
+    def test_backend_runtime_bind_paths_claude_home(self) -> None:
+        """_backend_runtime_bind_paths(claude) must expose the claude install (ro) and
+        ~/.claude{,.json} (rw) so the CLI can run + write its session transcript."""
+        from tools.orchestration_runtime import _backend_runtime_bind_paths
+
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            (home / ".claude").mkdir()
+            (home / ".claude.json").write_text("{}", encoding="utf-8")
+            (home / ".local" / "share" / "claude").mkdir(parents=True)
+            with patch.dict(os.environ, {"HOME": str(home)}):
+                ro, rw = _backend_runtime_bind_paths("claude", "claude")
+            self.assertIn(str(home / ".claude"), rw)
+            self.assertIn(str(home / ".claude.json"), rw)
+            self.assertIn(str(home / ".local" / "share" / "claude"), ro)
+
+    def test_backend_runtime_bind_paths_uses_type_not_command_string(self) -> None:
+        """The backend home is keyed on the explicit type, not the command string —
+        a custom --llm-command wrapper (command != 'claude') must still bind ~/.claude."""
+        from tools.orchestration_runtime import _backend_runtime_bind_paths
+
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            (home / ".claude").mkdir()
+            (home / ".claude.json").write_text("{}", encoding="utf-8")
+            (home / ".codex").mkdir()
+            with patch.dict(os.environ, {"HOME": str(home)}, clear=False):
+                os.environ.pop("METDSL_HOME", None)
+                # explicit claude type + opaque wrapper command → claude home still bound
+                _, rw_wrap = _backend_runtime_bind_paths("claude", "mywrap --model Z")
+                self.assertIn(str(home / ".claude"), rw_wrap)
+                self.assertIn(str(home / ".claude.json"), rw_wrap)
+                # codex type → ~/.codex bound writable
+                _, rw_codex = _backend_runtime_bind_paths("codex", "codex")
+                self.assertIn(str(home / ".codex"), rw_codex)
+                # METDSL_HOME with a `~` is expanded to an absolute path (matches preflight)
+                with patch.dict(os.environ, {"METDSL_HOME": "~/.codexcustom"}, clear=False):
+                    _, rw_custom = _backend_runtime_bind_paths("codex", "codex")
+                self.assertIn(str(home / ".codexcustom"), rw_custom)
 
     def test_dotted_directory_write_root_not_misclassified_as_file_pin(self) -> None:
         """A directory write_root with a dotted name (e.g. v1.0/) must not be treated as a file pin."""

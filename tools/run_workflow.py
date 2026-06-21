@@ -1364,6 +1364,21 @@ def _run_node(
                     resume=resume_mode,
                 )
             except Exception as exc:  # noqa: BLE001 - terminalize on conductor error
+                # If the conductor/runtime already terminalized with a specific terminal
+                # status (e.g. record-launch set fail_closed/sandbox_enforcement_violation
+                # when a bwrap profile could not be built), preserve it rather than
+                # clobbering it with a generic conductor_error.
+                meta_now = _read_json_if_exists(
+                    repo_root / "workspace" / "orchestrations" / orchestration_id
+                    / "orchestration_meta.json") or {}
+                cur_status = str(meta_now.get("status") or "").strip().lower()
+                if cur_status in {"fail_closed", "blocked", "timeout", "cancel"}:
+                    print(json.dumps(
+                        {"status": cur_status,
+                         "reason": meta_now.get("reason_code") or "conductor_terminal",
+                         "detail": str(exc), "orchestration_id": orchestration_id},
+                        ensure_ascii=False))
+                    return 2
                 _runtime_command(
                     repo_root, env,
                     ["set-status", "--repo-root", str(repo_root), "--orchestration-id",
