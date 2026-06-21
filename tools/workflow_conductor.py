@@ -574,22 +574,57 @@ class Conductor:
             raise RuntimeError(f"new_agent_run_id failed: {proc.stderr.strip()}")
         return proc.stdout.strip()
 
-    def leaf_command(self, prompt_text: str) -> list[str]:
+    def _reuse_resume_enabled(self) -> bool:
+        """Opt-in (default off) for minor-fix reuse session resume (claude only).
+        Off by default until verified by a live integration run; toggled via env
+        `METDSL_CONDUCTOR_REUSE_RESUME`."""
+        return str(self.env.get("METDSL_CONDUCTOR_REUSE_RESUME", "")).strip().lower() in {
+            "1", "true", "yes",
+        }
+
+    def leaf_command(
+        self,
+        prompt_text: str,
+        *,
+        session_id: str | None = None,
+        resume_session_id: str | None = None,
+    ) -> list[str]:
         """Headless command to run one substep body as an isolated leaf agent.
         Honors a custom llm_command (wrapper + flags) so the conductor launches the
-        same executable/model as the configured backend, not a hard-coded binary."""
+        same executable/model as the configured backend, not a hard-coded binary.
+
+        For the claude backend, `session_id` pins the leaf's Claude Code session id
+        to its `agent_run_id` (so the per-arid transcript is addressable and a later
+        repair can `--resume` it). `resume_session_id` (claude only) resumes a prior
+        leaf's session for context inheritance on a minor-fix `repair_strategy=reuse`,
+        forked into the new session so the prior transcript is not mutated. Guards key
+        on the active_child marker (= the new arid), not the session, so the resumed
+        repair is still evaluated against its own manifest."""
         base = shlex.split(self.llm_command) if self.llm_command.strip() else [self.backend]
         if self.backend == "claude":
             # `-p` runs non-interactively; the committed .claude/settings.json supplies
             # MCP build-runtime registration + permission grants (see preflight gate).
-            return [*base, "-p", prompt_text]
+            flags: list[str] = []
+            if resume_session_id:
+                flags += ["--resume", resume_session_id, "--fork-session"]
+            if session_id:
+                flags += ["--session-id", session_id]
+            return [*base, *flags, "-p", prompt_text]
         if self.backend == "codex":
             return [*base, "exec", prompt_text]
         raise ValueError(f"unsupported backend for leaf spawn: {self.backend}")
 
-    def spawn_leaf(self, prompt_text: str, child_env: dict[str, str]) -> ProcResult:
+    def spawn_leaf(
+        self,
+        prompt_text: str,
+        child_env: dict[str, str],
+        *,
+        session_id: str | None = None,
+        resume_session_id: str | None = None,
+    ) -> ProcResult:
         proc = subprocess.run(
-            self.leaf_command(prompt_text),
+            self.leaf_command(
+                prompt_text, session_id=session_id, resume_session_id=resume_session_id),
             cwd=self.repo_root, env=child_env, text=True, capture_output=True, check=False,
         )
         return ProcResult(proc.returncode, proc.stdout, proc.stderr)
@@ -785,10 +820,27 @@ class Conductor:
             repair=repair,
         )
         rec = self.record_launch(child_arid, request)
+        # Minor-fix reuse (claude only, opt-in): resume the producer leaf's session so
+        # the repair inherits its context (and design intent) instead of cold-starting.
+        # restart stays cold (no resume) to avoid anchoring on the defective reasoning.
+        # The producer's session id == its agent_run_id (pinned via --session-id at its
+        # own launch), so it is addressable by repair_target_agent_run_id.
+        resume_session_id: str | None = None
+        if (
+            self.backend == "claude"
+            and self._reuse_resume_enabled()
+            and repair is not None
+            and repair.get("repair_strategy") == "reuse"
+        ):
+            target = str(repair.get("repair_target_agent_run_id") or "").strip()
+            if target and target != "none":
+                resume_session_id = target
         # Capture the launch instant so a producer substep only passes on outputs
         # (re)written during this child window, not stale files from a prior attempt.
         launched_at = time.time()
-        proc = self.spawn_leaf(rec["launch_prompt_text"], self._child_env(child_arid))
+        proc = self.spawn_leaf(
+            rec["launch_prompt_text"], self._child_env(child_arid),
+            session_id=child_arid, resume_session_id=resume_session_id)
         # Persist the leaf's verbatim stdout/stderr durably (every run, pass or
         # fail) so the LLM's actual response — including an infra failure message
         # such as a token-limit abort — is never lost. These conductor-side writes

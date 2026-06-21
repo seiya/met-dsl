@@ -52,6 +52,23 @@ conductor embeds the failure-artifact content in a prompt, spawns a read-only re
 leaf, and parses its final JSON directive (`_parse_directive`) — validated against the
 action/target vocabulary, falling back to `fail_closed` on anything malformed.
 
+### Leaf session handling
+
+Each substep leaf is launched with `claude --session-id <agent_run_id>` so its Claude
+Code session id equals its `agent_run_id` — the per-arid transcript is addressable, and a
+later repair can `--resume` it. Guard evaluation keys on the active_child marker
+(`active_child_agent_run_id.txt` = the new arid), not the session id, so a resumed leaf is
+still evaluated against its own manifest.
+
+**Minor-fix reuse resume (opt-in, claude only).** On a `repair_strategy=reuse` retry, the
+repair leaf can resume the producer leaf's session (`--resume <producer_arid>
+--fork-session`) to inherit its context and design intent instead of cold-starting
+(re-reading the spec/source from scratch). `restart` stays cold (no resume) to avoid
+anchoring on the defective reasoning. This is gated by the env flag
+`METDSL_CONDUCTOR_REUSE_RESUME` (**default off**) pending a live integration run; the
+command construction is unit-tested, but the `--resume`/`--fork-session`/`--session-id`
+composition is not yet verified against a live `claude -p`.
+
 ## Usage
 
 ```

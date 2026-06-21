@@ -229,7 +229,7 @@ class _FakeConductor(wc.Conductor):
         self._n = getattr(self, "_n", 0) + 1
         return f"child-{self._n}"
 
-    def spawn_leaf(self, prompt_text, child_env):  # type: ignore[override]
+    def spawn_leaf(self, prompt_text, child_env, **kwargs):  # type: ignore[override]
         return wc.ProcResult(0, "", "")
 
     def read_parent_return_token(self, child_arid):  # type: ignore[override]
@@ -588,7 +588,7 @@ class DiagnosticianTest(unittest.TestCase):
 
     def test_escalate_routes_from_diagnostician(self) -> None:
         c = self._conductor()
-        c.spawn_leaf = lambda prompt, env: wc.ProcResult(  # type: ignore[assignment]
+        c.spawn_leaf = lambda prompt, env, **kw: wc.ProcResult(  # type: ignore[assignment]
             0, 'analysis\n{"action":"reopen","target_phase":"compile","reason":"diag_ir"}', "")
         d = c.escalate(self._refs(), "validate",
                        wc.PhaseOutcome("validate", "fail", failed_substeps=["child-9"]))
@@ -596,7 +596,7 @@ class DiagnosticianTest(unittest.TestCase):
 
     def test_escalate_unparsable_is_fail_closed(self) -> None:
         c = self._conductor()
-        c.spawn_leaf = lambda prompt, env: wc.ProcResult(0, "I am unsure; no directive", "")  # type: ignore[assignment]
+        c.spawn_leaf = lambda prompt, env, **kw: wc.ProcResult(0, "I am unsure; no directive", "")  # type: ignore[assignment]
         d = c.escalate(self._refs(), "build", wc.PhaseOutcome("build", "fail"))
         self.assertEqual(d.action, "fail_closed")
 
@@ -613,7 +613,7 @@ class DiagnosticianTest(unittest.TestCase):
         c.status_fn = status_fn
         c.decision_fn = lambda phase, outcomes: wc.RouteDecision("escalate", reason="novel")
 
-        def spawn(prompt, env):
+        def spawn(prompt, env, **kw):
             if "diagnostician" in prompt:
                 return wc.ProcResult(
                     0, '{"action":"reopen","target_phase":"compile","reason":"diag"}', "")
@@ -841,6 +841,30 @@ class LeafSpawnTest(unittest.TestCase):
         self.assertEqual(self._c(backend="claude").leaf_command("P"), ["claude", "-p", "P"])
         self.assertEqual(self._c(backend="codex").leaf_command("P"), ["codex", "exec", "P"])
 
+    def test_leaf_command_pins_session_id_for_claude(self) -> None:
+        c = self._c(backend="claude")
+        self.assertEqual(
+            c.leaf_command("P", session_id="arid-1"),
+            ["claude", "--session-id", "arid-1", "-p", "P"],
+        )
+        # codex has no per-session flag; session_id is ignored.
+        self.assertEqual(
+            self._c(backend="codex").leaf_command("P", session_id="arid-1"),
+            ["codex", "exec", "P"],
+        )
+
+    def test_leaf_command_reuse_resume_forks_producer_session(self) -> None:
+        c = self._c(backend="claude")
+        self.assertEqual(
+            c.leaf_command("P", session_id="new-arid", resume_session_id="producer-arid"),
+            ["claude", "--resume", "producer-arid", "--fork-session",
+             "--session-id", "new-arid", "-p", "P"],
+        )
+
+    def test_reuse_resume_flag_default_off(self) -> None:
+        self.assertFalse(self._c(env={})._reuse_resume_enabled())
+        self.assertTrue(self._c(env={"METDSL_CONDUCTOR_REUSE_RESUME": "1"})._reuse_resume_enabled())
+
     def test_nonzero_leaf_exit_fails_substep(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             c = _FakeConductor(repo_root=Path(tmp), orchestration_id="o",
@@ -848,7 +872,7 @@ class LeafSpawnTest(unittest.TestCase):
             c.calls = []
             c.status_fn = lambda phase, substep, n: "pass"  # artifacts claim pass
             # leaf crashed (e.g. token limit), emitting a diagnostic to stderr
-            c.spawn_leaf = lambda prompt, env: wc.ProcResult(1, "", "context limit exceeded")
+            c.spawn_leaf = lambda prompt, env, **kw: wc.ProcResult(1, "", "context limit exceeded")
             refs = wc.NodeRefs(node_key="component/spec_x@0.1.0",
                                spec_path="spec/component/spec_x",
                                ir_id="x_1_001", pipeline_id="x_1_001")
@@ -877,7 +901,7 @@ class LeafSpawnTest(unittest.TestCase):
             c = _FakeConductor(repo_root=Path(tmp), orchestration_id="o",
                                orchestration_agent_run_id="ORCH", backend="claude", env={})
             c.calls = []
-            c.spawn_leaf = lambda prompt, env: wc.ProcResult(1, "", "boom")
+            c.spawn_leaf = lambda prompt, env, **kw: wc.ProcResult(1, "", "boom")
             refs = wc.NodeRefs(node_key="component/spec_x@0.1.0",
                                spec_path="spec/component/spec_x",
                                ir_id="x_1_001", pipeline_id="x_1_001")
@@ -892,7 +916,7 @@ class LeafSpawnTest(unittest.TestCase):
             c = _FakeConductor(repo_root=Path(tmp), orchestration_id="o",
                                orchestration_agent_run_id="ORCH", backend="claude", env={})
             c.calls = []
-            c.spawn_leaf = lambda prompt, env: wc.ProcResult(0, "all good", "")
+            c.spawn_leaf = lambda prompt, env, **kw: wc.ProcResult(0, "all good", "")
             refs = wc.NodeRefs(node_key="component/spec_x@0.1.0",
                                spec_path="spec/component/spec_x",
                                ir_id="x_1_001", pipeline_id="x_1_001")
@@ -904,6 +928,39 @@ class LeafSpawnTest(unittest.TestCase):
             self.assertEqual(stdout_log.read_text(encoding="utf-8"), "all good")
             # a passing substep carries no result_summary
             self.assertNotIn("result_summary", runs[0])
+
+    def test_run_substep_reuse_resume_gated_by_flag(self) -> None:
+        refs = wc.NodeRefs(node_key="component/spec_x@0.1.0", spec_path="spec/component/spec_x",
+                           ir_id="x_1_001", pipeline_id="x_1_001", source_id="src_1")
+        reuse = {"repair_strategy": "reuse", "repair_target_agent_run_id": "producer-arid"}
+
+        def run(env, repair):
+            cap: dict = {}
+            with tempfile.TemporaryDirectory() as tmp:
+                c = _FakeConductor(repo_root=Path(tmp), orchestration_id="o",
+                                   orchestration_agent_run_id="ORCH", backend="claude", env=env)
+                c.calls = []
+
+                def spawn(prompt, env_, **kw):
+                    cap.update(kw)
+                    return wc.ProcResult(0, "", "")
+
+                c.spawn_leaf = spawn  # type: ignore[assignment]
+                c.run_substep(refs, "generate", "generate", repair=repair)
+            return cap
+
+        # flag ON + reuse → resume the producer session; new arid pinned as session_id.
+        cap = run({"METDSL_CONDUCTOR_REUSE_RESUME": "1"}, reuse)
+        self.assertEqual(cap.get("session_id"), "child-1")
+        self.assertEqual(cap.get("resume_session_id"), "producer-arid")
+        # flag OFF → no resume even on reuse (session_id still pinned).
+        off = run({}, reuse)
+        self.assertEqual(off.get("session_id"), "child-1")
+        self.assertIsNone(off.get("resume_session_id"))
+        # restart never resumes (avoid anchoring on the defective reasoning), flag or not.
+        restart = run({"METDSL_CONDUCTOR_REUSE_RESUME": "1"},
+                      {"repair_strategy": "restart", "repair_target_agent_run_id": "producer-arid"})
+        self.assertIsNone(restart.get("resume_session_id"))
 
 
 class FailSummaryContractTest(unittest.TestCase):
@@ -919,7 +976,7 @@ class FailSummaryContractTest(unittest.TestCase):
                                orchestration_agent_run_id="ORCH", backend="claude", env={})
             c.calls = []
             c.status_fn = status_fn
-            c.spawn_leaf = lambda prompt, env: proc
+            c.spawn_leaf = lambda prompt, env, **kw: proc
             refs = wc.NodeRefs(node_key="component/spec_x@0.1.0",
                                spec_path="spec/component/spec_x",
                                ir_id="x_1_001", pipeline_id="x_1_001")
