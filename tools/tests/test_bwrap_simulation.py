@@ -150,6 +150,46 @@ class BwrapSimulationTests(unittest.TestCase):
             # out-of-scope file must be unchanged on the host
             self.assertEqual((repo / "AGENTS_SIM.md").read_text(), "orig\n")
 
+    def test_hook_runtime_writes_land_in_scope(self) -> None:
+        # The leaf's own PreToolUse/PostToolUse hooks (confined subprocesses) write runtime
+        # bookkeeping outside write_roots: hook-event audit (hooks/) and the first-read
+        # state (audit/<arid>.auto_reads_seen.json, which FAIL-CLOSES the hook if unwritable).
+        # Both per-orchestration dirs must be writable inside the sandbox.
+        with tempfile.TemporaryDirectory() as t:
+            repo = Path(t).resolve()
+            orch, arid = "orch_hook", "arid_hook"
+            self._setup(repo, orch, arid)
+            _write_run_write_baseline(repo, orch, agent_run_id=arid)
+            script = textwrap.dedent(f"""
+                import os
+                from pathlib import Path
+                O = "workspace/orchestrations/{orch}"
+                def report(tag, ok, e=""):
+                    print(f"{{tag}}:{{'OK' if ok else 'FAIL'}}", e, flush=True)
+                try:
+                    p = Path(O + "/hooks/native_hook_events.jsonl")
+                    with p.open("a", encoding="utf-8") as h:
+                        h.write("{{}}\\n")
+                    report("HOOK_AUDIT", True)
+                except Exception as e:
+                    report("HOOK_AUDIT", False, repr(e))
+                try:
+                    sp = O + "/audit/{arid}.auto_reads_seen.json"
+                    fd = os.open(sp, os.O_RDWR | os.O_CREAT, 0o644)
+                    os.write(fd, b"[]"); os.close(fd)
+                    report("AUTO_READS_SEEN", True)
+                except Exception as e:
+                    report("AUTO_READS_SEEN", False, repr(e))
+            """)
+            profile = build_bwrap_profile(
+                repo_root=repo, orchestration_id=orch, agent_run_id=arid,
+                backend_command="python3", backend_type="claude")
+            cmd = render_bwrap_command(
+                profile=profile, command_argv=["python3", "-c", script])
+            out = subprocess.run(cmd, capture_output=True, text=True, timeout=90).stdout
+            self.assertIn("HOOK_AUDIT:OK", out, out)
+            self.assertIn("AUTO_READS_SEEN:OK", out, out)
+
     def test_fs_diff_attributes_in_scope_writes_only(self) -> None:
         with tempfile.TemporaryDirectory() as t:
             repo = Path(t).resolve()
@@ -167,6 +207,113 @@ class BwrapSimulationTests(unittest.TestCase):
             for p in changed:
                 self.assertTrue(
                     p.startswith(self.IR_DIR), f"{p} escaped write_root {self.IR_DIR}")
+
+
+@unittest.skipUnless(_bwrap_usable(), "bwrap / user namespaces not available")
+class BwrapBuildPathSimulationTests(unittest.TestCase):
+    """Model the Build phase's filesystem writes under bwrap (the highest-risk path per
+    docs/BWRAP_ENABLEMENT.md). A Make/Fortran build routes outputs via OBJDIR/BINDIR
+    overrides and side-outputs a cross-phase MCP command log into the (read-only) source
+    tree. Confirm each lands inside -- or is correctly blocked outside -- the leaf's bwrap
+    write scope before the billed E2E."""
+
+    PIPE = "workspace/pipelines/n/p_001"
+    BINARY_ROOT = PIPE + "/binary/"
+    SRC_DIR = PIPE + "/source/src_001/src/"
+
+    def _setup(self, repo: Path, orch: str, arid: str) -> None:
+        _ensure_orchestration_audit_dirs(repo, orch)
+        (repo / self.BINARY_ROOT).mkdir(parents=True, exist_ok=True)
+        # The source tree is a READ input for Build (the code to compile).
+        (repo / self.SRC_DIR).mkdir(parents=True, exist_ok=True)
+        (repo / self.SRC_DIR / "foo_model.f90").write_text("module foo\nend module\n")
+        cap_dir = _capabilities_dir(repo, orch); cap_dir.mkdir(parents=True, exist_ok=True)
+        (cap_dir / f"{arid}.json").write_text(
+            json.dumps({"agent_run_id": arid, "write_roots": [self.BINARY_ROOT]}),
+            encoding="utf-8")
+        rm_dir = _read_manifests_dir(repo, orch); rm_dir.mkdir(parents=True, exist_ok=True)
+        (rm_dir / f"{arid}.json").write_text(
+            json.dumps({"agent_run_id": arid,
+                        "allowed_read_roots": [self.PIPE + "/source/"]}),
+            encoding="utf-8")
+        # The output manifest records the authorized cross-phase MCP log (a Make build
+        # side-outputs it into the source tree); build_bwrap_profile reads it to make that
+        # path writable inside the sandbox.
+        from tools.orchestration_runtime import _write_allowed_output_manifest
+        _write_allowed_output_manifest(
+            repo, orchestration_id=orch, agent_run_id=arid,
+            allowed_output_paths=[self.BINARY_ROOT + "bin_001/binary_meta.json"],
+            allowed_file_tool_paths=[],
+            allowed_tmp_root=f"workspace/tmp/{arid}",
+            mcp_owned_audit_logs=[self.SRC_DIR + "mcp_command_log.jsonl"])
+
+    def _leaf_script(self, arid: str) -> str:
+        return textwrap.dedent(f"""
+            import os
+            from pathlib import Path
+            PIPE = "{self.PIPE}"; ARID = "{arid}"
+            def report(tag, ok, e=""):
+                print(f"{{tag}}:{{'OK' if ok else 'FAIL'}}", e, flush=True)
+            # OBJDIR override -> .o/.mod into the per-run tmp (workspace/tmp/<arid>/build)
+            try:
+                od = f"workspace/tmp/{{ARID}}/build"; os.makedirs(od, exist_ok=True)
+                Path(od + "/foo.o").write_text("obj"); Path(od + "/foo.mod").write_text("mod")
+                report("OBJDIR", True)
+            except Exception as e:
+                report("OBJDIR", False, repr(e))
+            # BINDIR override -> the execution binary into the binary write_root
+            try:
+                bd = f"{{PIPE}}/binary/bin_001/bin"; os.makedirs(bd, exist_ok=True)
+                Path(bd + "/foo_runner").write_text("ELF"); report("BINDIR", True)
+            except Exception as e:
+                report("BINDIR", False, repr(e))
+            # binary_meta.json into the binary write_root
+            try:
+                Path(f"{{PIPE}}/binary/bin_001/binary_meta.json").write_text("{{}}")
+                report("BINARY_META", True)
+            except Exception as e:
+                report("BINARY_META", False, repr(e))
+            # cross-phase MCP command log -> source/<id>/src/ (outside write_roots, a read input)
+            try:
+                Path(f"{{PIPE}}/source/src_001/src/mcp_command_log.jsonl").write_text("{{}}\\n")
+                report("XPHASE_MCP_LOG", True)
+            except Exception as e:
+                report("XPHASE_MCP_LOG", False, repr(e))
+        """)
+
+    def _run(self, repo: Path, orch: str, arid: str) -> str:
+        profile = build_bwrap_profile(
+            repo_root=repo, orchestration_id=orch, agent_run_id=arid,
+            backend_command="python3", backend_type="claude")
+        cmd = render_bwrap_command(
+            profile=profile, command_argv=["python3", "-c", self._leaf_script(arid)])
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=90).stdout
+
+    def test_build_outputs_land_in_write_scope(self) -> None:
+        with tempfile.TemporaryDirectory() as t:
+            repo = Path(t).resolve()
+            orch, arid = "orch_build", "arid_build"
+            self._setup(repo, orch, arid)
+            _write_run_write_baseline(repo, orch, agent_run_id=arid)
+            out = self._run(repo, orch, arid)
+            # The make-or-break: object/.mod (OBJDIR->per-run tmp) and the exe + meta
+            # (BINDIR/binary write_root) must all be writable inside the sandbox.
+            self.assertIn("OBJDIR:OK", out, out)
+            self.assertIn("BINDIR:OK", out, out)
+            self.assertIn("BINARY_META:OK", out, out)
+
+    def test_cross_phase_mcp_log_is_writable(self) -> None:
+        # A Make/Fortran build side-outputs its MCP command log into source/<id>/src/,
+        # which is outside the Build write_root (binary/ only) and is a read input. Under
+        # Phase-2 the bwrap profile must still make that authorized cross-phase log path
+        # writable, or compile_project fails with EROFS mid-build.
+        with tempfile.TemporaryDirectory() as t:
+            repo = Path(t).resolve()
+            orch, arid = "orch_build2", "arid_build2"
+            self._setup(repo, orch, arid)
+            _write_run_write_baseline(repo, orch, agent_run_id=arid)
+            out = self._run(repo, orch, arid)
+            self.assertIn("XPHASE_MCP_LOG:OK", out, out)
 
 
 if __name__ == "__main__":

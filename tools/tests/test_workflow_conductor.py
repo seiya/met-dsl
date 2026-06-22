@@ -1015,9 +1015,13 @@ class LeafSpawnTest(unittest.TestCase):
                       {"repair_strategy": "restart", "repair_target_agent_run_id": "producer-arid"})
         self.assertIsNone(restart.get("resume_session_id"))
 
-    def test_bwrap_flag_default_off(self) -> None:
-        self.assertFalse(self._c(env={})._bwrap_enabled())
+    def test_bwrap_flag_default_on(self) -> None:
+        # Phase-2: bwrap leaf sandboxing is mandatory by default; only an explicit off
+        # value of METDSL_CONDUCTOR_BWRAP disables it.
+        self.assertTrue(self._c(env={})._bwrap_enabled())
         self.assertTrue(self._c(env={"METDSL_CONDUCTOR_BWRAP": "1"})._bwrap_enabled())
+        self.assertFalse(self._c(env={"METDSL_CONDUCTOR_BWRAP": "off"})._bwrap_enabled())
+        self.assertFalse(self._c(env={"METDSL_CONDUCTOR_BWRAP": "0"})._bwrap_enabled())
 
     def test_spawn_leaf_wraps_in_bwrap_when_enabled(self) -> None:
         # With the flag on and a recorded sandbox profile, the leaf argv is wrapped in
@@ -1062,9 +1066,9 @@ class LeafSpawnTest(unittest.TestCase):
                     "P", {"HOME": "/h"}, child_arid="A")
                 self.assertEqual(captured["argv"][0], "bwrap")
                 self.assertIn("codex", captured["argv"])
-                # flag OFF → bare leaf command (no bwrap)
+                # explicit flag OFF → bare leaf command (no bwrap)
                 captured.clear()
-                self._c(repo_root=repo, env={}).spawn_leaf(
+                self._c(repo_root=repo, env={"METDSL_CONDUCTOR_BWRAP": "off"}).spawn_leaf(
                     "P", {"HOME": "/h"}, session_id="A", child_arid="A")
                 self.assertEqual(captured["argv"][0], "claude")
                 # flag ON but profile missing → fail closed (never launch unconfined)

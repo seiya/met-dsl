@@ -5117,7 +5117,7 @@ shell_tool                       stable             true
                     },
                 )
 
-    def test_record_agent_run_rejects_step_terminal_with_undeclared_actual_write(self) -> None:
+    def test_record_agent_run_rejects_step_terminal_write_outside_write_roots(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
             init_orchestration(repo_root=repo_root, orchestration_id="orch_001")
@@ -5177,6 +5177,12 @@ shell_tool                       stable             true
             out_path = repo_root / out_ref
             out_path.parent.mkdir(parents=True, exist_ok=True)
             out_path.write_text('{"status":"ok"}\n', encoding="utf-8")
+            # Phase-2: the declared output above is authorized by write_roots containment;
+            # the surviving unauthorized case (defense-in-depth) is a write that landed
+            # OUTSIDE write_roots -- impossible under bwrap, but still rejected if it appears.
+            rogue = repo_root / "workspace" / "rogue_outside.json"
+            rogue.parent.mkdir(parents=True, exist_ok=True)
+            rogue.write_text("{}\n", encoding="utf-8")
             with self.assertRaisesRegex(ValueError, "terminal run has unauthorized write paths"):
                 record_agent_run(
                     repo_root=repo_root,
@@ -5192,11 +5198,11 @@ shell_tool                       stable             true
                         "agent_model": "gpt-5-codex",
                         "context_id": "ctx_step_build_001",
                         "agent_session_id": "sess_step_build_001",
-                        "result_summary": "shell write bypassed apply_patch gate",
+                        "result_summary": "write landed outside write_roots",
                     },
                 )
 
-    def test_record_agent_run_rejects_step_pass_output_ref_write_without_gate_evidence(self) -> None:
+    def test_record_agent_run_authorizes_step_pass_in_write_roots_without_gate_evidence(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
             init_orchestration(repo_root=repo_root, orchestration_id="orch_001")
@@ -5256,26 +5262,27 @@ shell_tool                       stable             true
             out_path = repo_root / out_ref
             out_path.parent.mkdir(parents=True, exist_ok=True)
             out_path.write_text('{"status":"ok"}\n', encoding="utf-8")
-            with self.assertRaisesRegex(ValueError, "terminal run has unauthorized write paths"):
-                record_agent_run(
-                    repo_root=repo_root,
-                    orchestration_id="orch_001",
-                    payload={
-                        "agent_run_id": "step_run_build_001",
-                        "agent_role": "step",
-                        "parent_agent_run_id": "orch_run_001",
-                        "step": "build",
-                        "node_key": "problem/shallow_water2d@0.3.0",
-                        "status": "pass",
-                        "agent_backend": "codex",
-                        "agent_model": "gpt-5-codex",
-                        "context_id": "ctx_step_build_001",
-                        "agent_session_id": "sess_step_build_001",
-                        "output_refs": [out_ref],
-                    },
-                )
+            # Phase-2: the output is inside write_roots, so it is authorized by FS-diff
+            # containment with no apply_patch_writes gate evidence -- the pass must record.
+            record_agent_run(
+                repo_root=repo_root,
+                orchestration_id="orch_001",
+                payload={
+                    "agent_run_id": "step_run_build_001",
+                    "agent_role": "step",
+                    "parent_agent_run_id": "orch_run_001",
+                    "step": "build",
+                    "node_key": "problem/shallow_water2d@0.3.0",
+                    "status": "pass",
+                    "agent_backend": "codex",
+                    "agent_model": "gpt-5-codex",
+                    "context_id": "ctx_step_build_001",
+                    "agent_session_id": "sess_step_build_001",
+                    "output_refs": [out_ref],
+                },
+            )
 
-    def test_record_agent_run_rejects_step_terminal_write_outside_gate_changed_paths(self) -> None:
+    def test_record_agent_run_authorizes_step_pass_in_write_roots_ignoring_stale_gate(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
             init_orchestration(repo_root=repo_root, orchestration_id="orch_001")
@@ -5335,6 +5342,8 @@ shell_tool                       stable             true
             out_path = repo_root / out_ref
             out_path.parent.mkdir(parents=True, exist_ok=True)
             out_path.write_text('{"status":"ok"}\n', encoding="utf-8")
+            # A stale gate pointing at a different path is irrelevant under Phase-2:
+            # authorization is FS-diff containment, not gate provenance.
             _write_apply_patch_gate_evidence(
                 repo_root,
                 orchestration_id="orch_001",
@@ -5342,24 +5351,24 @@ shell_tool                       stable             true
                 actor_role="step",
                 changed_paths=[f"{_FIX_PIPE_REF}/binary/bin_20260101_001/bin/other"],
             )
-            with self.assertRaisesRegex(ValueError, "terminal run has unauthorized write paths"):
-                record_agent_run(
-                    repo_root=repo_root,
-                    orchestration_id="orch_001",
-                    payload={
-                        "agent_run_id": "step_run_build_001",
-                        "agent_role": "step",
-                        "parent_agent_run_id": "orch_run_001",
-                        "step": "build",
-                        "node_key": "problem/shallow_water2d@0.3.0",
-                        "status": "pass",
-                        "agent_backend": "codex",
-                        "agent_model": "gpt-5-codex",
-                        "context_id": "ctx_step_build_001",
-                        "agent_session_id": "sess_step_build_001",
-                        "output_refs": [out_ref],
-                    },
-                )
+            # binary_meta.json is inside write_roots -> authorized; the pass must record.
+            record_agent_run(
+                repo_root=repo_root,
+                orchestration_id="orch_001",
+                payload={
+                    "agent_run_id": "step_run_build_001",
+                    "agent_role": "step",
+                    "parent_agent_run_id": "orch_run_001",
+                    "step": "build",
+                    "node_key": "problem/shallow_water2d@0.3.0",
+                    "status": "pass",
+                    "agent_backend": "codex",
+                    "agent_model": "gpt-5-codex",
+                    "context_id": "ctx_step_build_001",
+                    "agent_session_id": "sess_step_build_001",
+                    "output_refs": [out_ref],
+                },
+            )
 
     def test_record_agent_run_accepts_step_terminal_when_gate_matches_actual_write(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -15286,7 +15295,10 @@ class TerminalUnauthorizedWriteDirectWriteTests(unittest.TestCase):
                 },
             )
 
-    def test_step_terminal_rejects_direct_write_yaml_when_not_in_manifest(self) -> None:
+    def test_step_terminal_authorizes_in_write_roots_write_without_gate_evidence(self) -> None:
+        # Phase-2: a leaf write landing inside its write_roots is authorized by bwrap
+        # FS-diff containment alone -- no guarded-apply-patch gate evidence required.
+        # (Pre-Phase-2 this same scenario was rejected as a gate-bypass.)
         from tools.orchestration_runtime import _validate_actual_write_paths
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -15306,6 +15318,41 @@ class TerminalUnauthorizedWriteDirectWriteTests(unittest.TestCase):
             yaml_path.parent.mkdir(parents=True, exist_ok=True)
             yaml_path.write_text("case: ok\n", encoding="utf-8")
 
+            # No gate evidence written; the write is inside write_roots -> must not raise.
+            _validate_actual_write_paths(
+                repo_root,
+                orch,
+                {
+                    "agent_run_id": run_id,
+                    "agent_role": "step",
+                    "status": "pass",
+                    "output_refs": [yaml_rel],
+                },
+            )
+
+    def test_step_terminal_rejects_write_outside_write_roots(self) -> None:
+        # Phase-2 surviving boundary (defense-in-depth): a change that landed OUTSIDE the
+        # leaf's write_roots is impossible under bwrap, and if it appears in the FS-diff it
+        # is rejected regardless of any (now-ignored) gate evidence.
+        from tools.orchestration_runtime import _validate_actual_write_paths
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            orch = "orch_term_dw_002b"
+            run_id = "step_run_term_dw_002b"
+            rogue_rel = "workspace/pipelines/p/rogue.yaml"  # outside write_roots
+            self._setup_step_run_state(
+                repo_root,
+                orchestration_id=orch,
+                agent_run_id=run_id,
+                write_roots=["workspace/ir/"],
+                allowed_output_paths=["workspace/ir/p/spec.ir.yaml"],
+                allowed_file_tool_paths=[],
+            )
+            rogue_path = repo_root / rogue_rel
+            rogue_path.parent.mkdir(parents=True, exist_ok=True)
+            rogue_path.write_text("case: rogue\n", encoding="utf-8")
+
             with self.assertRaisesRegex(ValueError, "unauthorized write paths"):
                 _validate_actual_write_paths(
                     repo_root,
@@ -15314,7 +15361,7 @@ class TerminalUnauthorizedWriteDirectWriteTests(unittest.TestCase):
                         "agent_run_id": run_id,
                         "agent_role": "step",
                         "status": "pass",
-                        "output_refs": [yaml_rel],
+                        "output_refs": ["workspace/ir/p/spec.ir.yaml"],
                     },
                 )
 
@@ -15371,28 +15418,32 @@ class TerminalUnauthorizedWriteDirectWriteTests(unittest.TestCase):
                 },
             )
 
-    def test_step_terminal_violation_includes_missing_from_gate_changed_paths(self) -> None:
+    def test_step_terminal_violation_flags_only_out_of_write_roots_path(self) -> None:
+        # Phase-2: only a write OUTSIDE write_roots is unauthorized. An in-write_roots
+        # write (A.json) is authorized by FS-diff containment and must NOT appear in the
+        # violation; only the out-of-root path (C.json) is flagged.
         from tools.orchestration_runtime import _validate_actual_write_paths
 
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
             orch = "orch_term_dw_004"
             run_id = "step_run_term_dw_004"
-            allowed_rel = "workspace/pipelines/p/binary/bin_20260101_001/A.json"
-            unauthorized_rel = "workspace/pipelines/p/binary/bin_20260101_001/C.json"
+            in_root_rel = "workspace/pipelines/p/binary/bin_20260101_001/A.json"
+            out_of_root_rel = "workspace/pipelines/p/source/C.json"  # outside write_roots
             self._setup_step_run_state(
                 repo_root,
                 orchestration_id=orch,
                 agent_run_id=run_id,
                 write_roots=["workspace/pipelines/p/binary/"],
-                allowed_output_paths=[allowed_rel],
+                allowed_output_paths=[in_root_rel],
                 allowed_file_tool_paths=[],
             )
-            allowed_path = repo_root / allowed_rel
-            unauthorized_path = repo_root / unauthorized_rel
-            allowed_path.parent.mkdir(parents=True, exist_ok=True)
-            allowed_path.write_text('{"a": 1}\n', encoding="utf-8")
-            unauthorized_path.write_text('{"c": 1}\n', encoding="utf-8")
+            in_root_path = repo_root / in_root_rel
+            out_of_root_path = repo_root / out_of_root_rel
+            in_root_path.parent.mkdir(parents=True, exist_ok=True)
+            in_root_path.write_text('{"a": 1}\n', encoding="utf-8")
+            out_of_root_path.parent.mkdir(parents=True, exist_ok=True)
+            out_of_root_path.write_text('{"c": 1}\n', encoding="utf-8")
 
             with self.assertRaisesRegex(ValueError, "unauthorized write paths"):
                 _validate_actual_write_paths(
@@ -15402,7 +15453,7 @@ class TerminalUnauthorizedWriteDirectWriteTests(unittest.TestCase):
                         "agent_run_id": run_id,
                         "agent_role": "step",
                         "status": "pass",
-                        "output_refs": [allowed_rel],
+                        "output_refs": [in_root_rel],
                     },
                 )
             violation_path = (
@@ -15414,10 +15465,8 @@ class TerminalUnauthorizedWriteDirectWriteTests(unittest.TestCase):
                 / f"{run_id}.unauthorized_write_violation.json"
             )
             violation = json.loads(violation_path.read_text(encoding="utf-8"))
-            self.assertEqual(
-                violation.get("missing_from_gate_changed_paths"),
-                [allowed_rel, unauthorized_rel],
-            )
+            self.assertEqual(violation.get("unauthorized_paths"), [out_of_root_rel])
+            self.assertNotIn(in_root_rel, violation.get("unauthorized_paths") or [])
 
     def test_step_terminal_falls_back_to_gate_file_when_cumulative_store_is_invalid_json(self) -> None:
         from tools.orchestration_runtime import (
@@ -15797,7 +15846,11 @@ class ApplyPatchGateCoverageExtensionTests(unittest.TestCase):
             )
             _validate_apply_patch_gate_coverage(repo_root, "orch_ext_001", payload)
 
-    def test_step_pass_requires_gate_for_json_output(self) -> None:
+    def test_step_pass_no_longer_requires_gate_for_json_output(self) -> None:
+        # Phase-2: a leaf (step/substep) writes its managed artifacts directly under bwrap
+        # confinement; FS-diff containment is the attribution, so apply_patch_writes gate
+        # evidence is no longer required even for CLI-managed (.json) outputs. The coverage
+        # check returns early for step/substep and must not raise.
         from tools.orchestration_runtime import _validate_apply_patch_gate_coverage
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -15812,10 +15865,7 @@ class ApplyPatchGateCoverageExtensionTests(unittest.TestCase):
                     "workspace/ir/p/ir_meta.json",
                 ],
             )
-            with self.assertRaisesRegex(
-                ValueError, "apply_patch_writes gate evidence"
-            ):
-                _validate_apply_patch_gate_coverage(repo_root, "orch_ext_002", payload)
+            _validate_apply_patch_gate_coverage(repo_root, "orch_ext_002", payload)
 
     def test_step_pass_with_gate_covers_only_cli_extension_refs(self) -> None:
         from tools.orchestration_runtime import _validate_apply_patch_gate_coverage

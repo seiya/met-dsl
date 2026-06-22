@@ -625,12 +625,15 @@ class Conductor:
         raise ValueError(f"unsupported backend for leaf spawn: {self.backend}")
 
     def _bwrap_enabled(self) -> bool:
-        """Opt-in (default off) for launching each leaf under the bwrap sandbox
-        recorded at record-launch. Off by default until verified by a live run
-        (auth/MCP/hooks/session under the sandbox); toggled via env
-        `METDSL_CONDUCTOR_BWRAP`."""
-        return str(self.env.get("METDSL_CONDUCTOR_BWRAP", "")).strip().lower() in {
-            "1", "true", "yes",
+        """bwrap leaf sandboxing is MANDATORY by default (Phase-2). The FS-diff
+        write-authorization model (`_validate_actual_write_paths` authorizes a leaf
+        write purely by write_roots containment) is only sound while bwrap actually
+        confines each leaf to its write_roots, so enforcement is on unless explicitly
+        disabled by an off value of `METDSL_CONDUCTOR_BWRAP` (off/0/false/no). A host
+        that cannot sandbox the leaf fails closed at launch rather than running
+        unconfined (an unconfined leaf + FS-diff would authorize writes anywhere)."""
+        return str(self.env.get("METDSL_CONDUCTOR_BWRAP", "")).strip().lower() not in {
+            "off", "0", "false", "no",
         }
 
     def _sandbox_profile_for(self, child_arid: str) -> dict[str, Any] | None:

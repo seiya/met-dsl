@@ -5776,6 +5776,64 @@ def build_bwrap_profile(
     # arid only, never another child's.
     gates_rel = f"workspace/orchestrations/{orchestration_id}/gates/{agent_run_id}/"
     (repo_root / gates_rel).mkdir(parents=True, exist_ok=True)
+    # The leaf's own PreToolUse/PostToolUse hooks (running as confined subprocesses) write
+    # runtime bookkeeping under the orchestration root: hook-event audit
+    # (hooks/native_hook_events.jsonl) and the first-read-invariant state
+    # (audit/<arid>.auto_reads_seen.json, which FAIL-CLOSES the hook if it cannot persist).
+    # Both live outside write_roots, so bind their per-orchestration dirs writable (runtime
+    # bookkeeping, excluded from the artifact-write violation check). Shared dirs, but the
+    # conductor launches leaves sequentially and these are append/per-arid bookkeeping.
+    hooks_rel = f"workspace/orchestrations/{orchestration_id}/hooks/"
+    audit_rel = f"workspace/orchestrations/{orchestration_id}/audit/"
+    (repo_root / hooks_rel).mkdir(parents=True, exist_ok=True)
+    (repo_root / audit_rel).mkdir(parents=True, exist_ok=True)
+    # Cross-phase MCP audit logs: compile_project / run_quality_checks for a Make/Fortran
+    # build side-output their mcp_command_log.jsonl into the read-only source tree
+    # (source/<id>/src/), which is outside the leaf's write_roots and inside a read input,
+    # so bwrap would block the physical append (EROFS) mid-build. The manifest already
+    # authorizes these paths (mcp_owned_audit_logs, honored by _validate_actual_write_paths
+    # as integrity-protected). Pre-create each and bind it WRITABLE as an individual file
+    # (rendered after the read-root ro-binds, so it overrides the ro source dir while the
+    # rest of the source stays read-only).
+    runtime_rw_file_paths: list[str] = []
+    try:
+        _out_manifest = _load_allowed_output_manifest(
+            repo_root, orchestration_id=orchestration_id, agent_run_id=agent_run_id)
+    except ValueError:
+        _out_manifest = None
+    if isinstance(_out_manifest, dict):
+        _mcp_logs = _out_manifest.get("mcp_owned_audit_logs")
+        if isinstance(_mcp_logs, list):
+            for _log in _mcp_logs:
+                if not isinstance(_log, str) or not _log.strip():
+                    continue
+                _log_rel = _normalize_rel_posix(_log.strip())
+                # An in-phase log already lives under a write_root (bound rw by its dir);
+                # only a CROSS-phase log inside a read input needs an explicit writable
+                # file bind. Skipping in-phase logs also avoids creating a stray file under
+                # a write_root that would surface in the FS-diff.
+                if _path_under_any_write_root(_log_rel, write_roots):
+                    continue
+                # Reject a symlink at the canonical log path on the UNRESOLVED path
+                # (resolve() follows symlinks, so the containment check below would pass a
+                # redirected target). Mirrors the write_roots file-pin symlink guard so a
+                # swapped symlink fails closed instead of binding a redirected file writable.
+                _orig_log = repo_root / _log_rel
+                if _orig_log.is_symlink():
+                    raise ValueError(
+                        f"mcp_owned_audit_logs entry {_log_rel!r} is a symlink "
+                        f"({_orig_log}); only a regular file is permitted")
+                _log_abs = (repo_root / _log_rel).resolve()
+                try:
+                    _log_abs.relative_to(resolved_repo_root)
+                except ValueError:
+                    raise ValueError(
+                        f"mcp_owned_audit_logs entry {_log_rel!r} resolves outside "
+                        f"repo_root ({_log_abs} is not under {resolved_repo_root})")
+                _log_abs.parent.mkdir(parents=True, exist_ok=True)
+                if not _log_abs.exists():
+                    _log_abs.touch()
+                runtime_rw_file_paths.append(_log_rel)
     return {
         "orchestration_id": orchestration_id,
         "agent_run_id": agent_run_id,
@@ -5794,7 +5852,10 @@ def build_bwrap_profile(
         # In-repo runtime bookkeeping dirs the leaf writes via the runtime CLI (gate
         # evidence). Bound writable by render_bwrap_command; kept separate from the
         # backend-home runtime_rw_bind_paths, which must be OUTSIDE repo_root.
-        "runtime_rw_rel_paths": [gates_rel],
+        "runtime_rw_rel_paths": [gates_rel, hooks_rel, audit_rel],
+        # Individual in-repo files bound writable (rendered after read-root ro-binds):
+        # authorized cross-phase MCP audit logs that live inside a read input.
+        "runtime_rw_file_paths": runtime_rw_file_paths,
         "workdir": str(repo_root),
         "env": child_env,
         "generated_at": _utc_now_iso(),
@@ -5896,6 +5957,18 @@ def render_bwrap_command(
             continue
         abs_path = (Path(repo_root) / _normalize_rel_posix(rel)).resolve()
         if abs_path.is_dir():
+            abs_token = str(abs_path)
+            cmd.extend(["--bind", abs_token, abs_token])
+    # Authorized cross-phase MCP audit logs bound writable as individual files. Emitted
+    # AFTER the read-root ro-binds so a log inside a read input (e.g. a Make build's
+    # source/<id>/src/mcp_command_log.jsonl) becomes writable while the rest of that read
+    # input stays read-only (bwrap later-overrides-earlier). build_bwrap_profile
+    # pre-creates each file.
+    for rel in profile.get("runtime_rw_file_paths", []):
+        if not isinstance(rel, str) or not rel.strip():
+            continue
+        abs_path = (Path(repo_root) / _normalize_rel_posix(rel)).resolve()
+        if abs_path.is_file():
             abs_token = str(abs_path)
             cmd.extend(["--bind", abs_token, abs_token])
     ws_rw = str(profile.get("workspace_tmp_rw_abs") or "").strip()
@@ -6113,6 +6186,9 @@ def _should_ignore_runtime_snapshot_path(
         # Adv-35: per-arid cleanup-committed markers (two-phase finalization).
         f"{orch_root}/cleanup_committed/",
         f"{orch_root}/agents/",
+        # Per-arid first-read-invariant state + other runtime audit the leaf's hooks write
+        # (e.g. audit/<arid>.auto_reads_seen.json). Runtime bookkeeping, never an artifact.
+        f"{orch_root}/audit/",
         f"{orch_root}/capabilities/",
         f"{orch_root}/gates/",
         f"{orch_root}/hooks/",
@@ -7359,12 +7435,21 @@ def _validate_actual_write_paths(
         if write_roots and not _path_under_any_write_root(path, write_roots):
             unauthorized.append(path)
             continue
+        if actor_role in {"step", "substep"}:
+            # Phase-2 FS-diff attribution: bwrap is mandatory (a host that cannot
+            # sandbox the leaf fails closed at launch), so a leaf can only write
+            # inside its declared write_roots. A change that landed under a
+            # write_root is therefore the leaf's own confined output and is
+            # authorized by containment — no guarded-apply-patch gate provenance is
+            # required (gate_changed_paths / manifest_file_tool_paths are no longer
+            # consulted for authorization). Writes outside write_roots are
+            # impossible under the sandbox and already rejected above.
+            continue
+        # orchestration actor (the trusted, unconfined conductor): keep the
+        # declared-paths gate (its writes are bookkeeping under the orch root).
         if _exact_declared_set and path in _exact_declared_set:
             continue
         if manifest_allowed_output_dirs and any(_repo_path_under_prefix(path, d) for d in manifest_allowed_output_dirs):
-            # All writes under a directory allowlist must have gate provenance (guarded-apply-patch).
-            # Compiler byproducts (.mod, .o, .a) are also unauthorized without provenance —
-            # agents must clean them up before record-agent-run to prevent unaudited binary injection.
             unauthorized.append(path)
             continue
         if not declared_paths:
@@ -10333,6 +10418,12 @@ def _validate_apply_patch_gate_coverage(
         return
     actor_role = role.strip().lower()
     if actor_role not in {"orchestration", "step", "substep"}:
+        return
+    if actor_role in {"step", "substep"}:
+        # Phase-2: a leaf writes its managed artifacts directly under mandatory bwrap
+        # confinement; FS-diff containment (see _validate_actual_write_paths) is the
+        # attribution. The producer no longer routes writes through guarded-apply-patch,
+        # so apply_patch_writes gate evidence is neither produced nor required.
         return
 
     agent_run_id = payload.get("agent_run_id")
