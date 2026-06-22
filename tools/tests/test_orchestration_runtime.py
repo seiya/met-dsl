@@ -4709,10 +4709,10 @@ shell_tool                       stable             true
         self.assertFalse(any("may be read directly" in line for line in constraint_lines))
         # The cross-agent artifact prohibition is a security constraint — it must be included.
         self.assertTrue(any("agent's internal artifact" in line for line in constraint_lines))
-        self.assertTrue(any("`.json` and `.txt` output" in line for line in constraint_lines))
+        # The direct Edit/Write artifact-write constraint must be included.
         self.assertTrue(
             any(
-                "`.yaml` / `.yml` / `.md` and source code" in line
+                "directly with the `Edit` / `Write` tool" in line
                 for line in constraint_lines
             )
         )
@@ -15112,7 +15112,10 @@ class DirectWritePathExtensionPolicyTests(unittest.TestCase):
     def test_is_direct_write_path_rejects_empty(self) -> None:
         self.assertFalse(_is_direct_write_path(""))
 
-    def test_allowed_file_tool_paths_auto_derive_excludes_cli_extensions(self) -> None:
+    def test_allowed_file_tool_paths_auto_derive_includes_managed_json(self) -> None:
+        # Phase-2: managed `.json` outputs (e.g. ir_meta.json) are written directly
+        # by the confined leaf, so the auto-derive now includes them alongside
+        # source / .yaml / .md outputs. Only canonical MCP audit logs stay excluded.
         allowed_output_paths = [
             "workspace/ir/p/spec.ir.yaml",
             "workspace/ir/p/io_contract.yaml",
@@ -15125,20 +15128,12 @@ class DirectWritePathExtensionPolicyTests(unittest.TestCase):
             request_payload={},
             allowed_output_paths=allowed_output_paths,
         )
-        self.assertEqual(
-            derived,
-            sorted(
-                [
-                    "workspace/ir/p/spec.ir.yaml",
-                    "workspace/ir/p/io_contract.yaml",
-                    "workspace/ir/p/algorithm.summary.md",
-                    "workspace/ir/p/case_summary.yaml",
-                    "workspace/pipelines/p/source/g/src/main.f90",
-                ]
-            ),
-        )
+        self.assertEqual(derived, sorted(allowed_output_paths))
 
-    def test_allowed_file_tool_paths_auto_derive_returns_empty_when_all_cli(self) -> None:
+    def test_allowed_file_tool_paths_auto_derive_includes_all_managed_json(self) -> None:
+        # Phase-2: a launch whose outputs are all managed JSON now derives all of
+        # them as direct-write eligible (previously they were excluded as
+        # "CLI-managed" and the list came back empty).
         derived = _allowed_file_tool_paths_for_launch(
             request_payload={},
             allowed_output_paths=[
@@ -15146,7 +15141,10 @@ class DirectWritePathExtensionPolicyTests(unittest.TestCase):
                 "workspace/ir/p/ir_meta.json",
             ],
         )
-        self.assertEqual(derived, [])
+        self.assertEqual(
+            derived,
+            ["workspace/ir/p/ir_meta.json", "workspace/ir/p/plan_meta.json"],
+        )
 
     def test_allowed_file_tool_paths_explicit_subset_validation(self) -> None:
         allowed_output_paths = [
@@ -15164,20 +15162,23 @@ class DirectWritePathExtensionPolicyTests(unittest.TestCase):
         )
         self.assertEqual(explicit, ["workspace/ir/p/spec.ir.yaml"])
 
-    def test_allowed_file_tool_paths_explicit_rejects_cli_managed_extensions(self) -> None:
-        with self.assertRaisesRegex(ValueError, "must not include CLI-managed extensions"):
-            _allowed_file_tool_paths_for_launch(
-                request_payload={
-                    "agent_model": "claude-opus-4-8",
-                    "allowed_file_tool_paths": [
-                        "workspace/ir/p/ir_meta.json",
-                    ]
-                },
-                allowed_output_paths=[
-                    "workspace/ir/p/spec.ir.yaml",
+    def test_allowed_file_tool_paths_explicit_accepts_managed_json(self) -> None:
+        # Phase-2: an explicit allowed_file_tool_paths list may include managed
+        # `.json` outputs (direct-write under bwrap). They are no longer rejected
+        # as "CLI-managed"; only canonical MCP audit logs remain off-limits.
+        explicit = _allowed_file_tool_paths_for_launch(
+            request_payload={
+                "agent_model": "claude-opus-4-8",
+                "allowed_file_tool_paths": [
                     "workspace/ir/p/ir_meta.json",
                 ],
-            )
+            },
+            allowed_output_paths=[
+                "workspace/ir/p/spec.ir.yaml",
+                "workspace/ir/p/ir_meta.json",
+            ],
+        )
+        self.assertEqual(explicit, ["workspace/ir/p/ir_meta.json"])
 
     def test_allowed_file_tool_paths_explicit_rejects_path_outside_outputs(self) -> None:
         with self.assertRaisesRegex(ValueError, "must be included in allowed_output_paths"):
@@ -15206,20 +15207,22 @@ class DirectWritePathExtensionPolicyTests(unittest.TestCase):
         """Directory entries (trailing /) must not appear in auto-derived allowed_file_tool_paths.
 
         Regression: _normalize_rel_posix strips '/', making 'src/' become 'src' which
-        passes _is_direct_write_path (no extension → True). This leaked directory tokens
-        into the manifest, enabling a prefix-match bypass of extension policy at terminal.
+        would leak a directory token into the manifest, enabling a prefix-match bypass
+        of the per-file write policy at terminal. Directory entries are filtered before
+        derivation; the managed `lineage.json` file entry IS derived (Phase-2 direct
+        write), so the directory exclusion is verified independently of it.
         """
         src_dir = "workspace/pipelines/p/source/src_001/src/"
         derived = _allowed_file_tool_paths_for_launch(
             request_payload={},
             allowed_output_paths=[
                 src_dir,
-                "workspace/pipelines/p/lineage.json",  # CLI-managed: also excluded
+                "workspace/pipelines/p/lineage.json",  # managed JSON: direct-write
             ],
         )
         self.assertNotIn("workspace/pipelines/p/source/src_001/src", derived)
-        self.assertNotIn("workspace/pipelines/p/lineage.json", derived)
-        self.assertEqual(derived, [])
+        # The managed JSON file entry is now direct-write eligible.
+        self.assertEqual(derived, ["workspace/pipelines/p/lineage.json"])
 
 
 class TerminalUnauthorizedWriteDirectWriteTests(unittest.TestCase):

@@ -5126,7 +5126,8 @@ def _allowed_file_tool_paths_for_launch(
 ) -> list[str]:
     raw = request_payload.get("allowed_file_tool_paths")
     # Exclude directory entries (trailing "/") from allowed_set: _normalize_rel_posix strips the
-    # slash, which would make directory paths appear extension-free and pass _is_direct_write_path.
+    # slash, so a directory token would otherwise leak into the manifest as a file entry and
+    # enable a prefix-match bypass of the per-file write policy at the hook / terminal check.
     allowed_set = {
         _normalize_rel_posix(str(item))
         for item in allowed_output_paths
@@ -5140,15 +5141,26 @@ def _allowed_file_tool_paths_for_launch(
         _canonical_mcp_audit_log_paths_for_request(request_payload, list(allowed_output_paths))
     )
     if raw is None:
-        # Auto-derive: every output path whose extension is not CLI-managed and
-        # is not a canonical MCP audit log is permitted to be written via
-        # direct Edit/Write tools.
+        # Auto-derive: every output path that is not a canonical MCP audit log is
+        # permitted to be written via direct Edit/Write tools.
+        #
+        # Phase-2: under mandatory bwrap confinement a leaf writes its managed
+        # artifacts (`lineage.json`, `*_meta.json`) and source directly via the
+        # Write/Edit tools; FS-diff containment within the leaf's `write_roots`
+        # is the authoritative attribution (`_validate_actual_write_paths`), so
+        # managed `.json` / `.txt` outputs no longer route through
+        # guarded-apply-patch. A file-pin write_root (e.g. the top-level
+        # `lineage.json`) only accepts an in-place truncate-write, which the
+        # Write tool performs; `git apply` (unlink+create) would fail EROFS on a
+        # bind-mounted file, which is why direct Write — not the gate — is the
+        # leaf's write path. Canonical MCP audit logs stay excluded: they are
+        # MCP-owned and integrity-protected (forging a successful tool run must
+        # remain impossible regardless of bwrap confinement).
         derived = {
             path
             for path in allowed_set
             if path
             and path not in canonical_log_set
-            and _is_direct_write_path(path)
         }
         result = sorted(derived)
         _assert_mandatory_file_tool_pins_present(
@@ -5172,11 +5184,10 @@ def _allowed_file_tool_paths_for_launch(
                 f"allowed_file_tool_paths[{idx}] must not include canonical MCP audit "
                 f"log path: {path!r} (written exclusively by MCP tooling)"
             )
-        if not _is_direct_write_path(path):
-            raise ValueError(
-                f"allowed_file_tool_paths[{idx}] must not include CLI-managed extensions "
-                f"{sorted(CLI_MANAGED_EXTENSIONS)!r}: {path!r}"
-            )
+        # Phase-2: managed `.json` / `.txt` artifacts are written directly by the
+        # confined leaf (FS-diff attribution), so they are no longer rejected here
+        # as "CLI-managed". Only canonical MCP audit logs (handled above) remain
+        # off-limits to direct file tools.
         if path not in allowed_set:
             raise ValueError(
                 f"allowed_file_tool_paths[{idx}] must be included in allowed_output_paths: {path!r}"
@@ -8347,8 +8358,7 @@ def _required_launch_prompt_constraint_lines(request_payload: dict[str, Any]) ->
         "`output_manifests/",
         "/capabilities/",
         "`capability_token` is not obtained or mismatched: do not start processing and stop with fail",
-        "`.json` and `.txt` output",
-        "`.yaml` / `.yml` / `.md` and source code",
+        "directly with the `Edit` / `Write` tool",
     )
     return [
         line

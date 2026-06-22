@@ -16,7 +16,7 @@ Choose the path for obtaining CLI argument information based on the target subco
 
 - Frequent subcommands of `tools/orchestration_runtime.py` (the 13 Tier-A listed above): this document is canonical (complex payload schema, per-phase required-argument switching — `--help` alone is insufficient).
 - Rare subcommands of `tools/orchestration_runtime.py` (`init` / `preflight` / `preflight-status` / `record-timeout` / `read-checkpoint` / `verify-checkpoint-integrity` / `check-step-completed` / `orchestration-read` / `repair-agent-runs` / `repair-step-result-executor` / `reopen-phase` / `dismiss-violation`), and `tools/run_workflow.py` / `tools/validate_pipeline_semantics.py` / `tools/audit_orchestration.py`: `<tool> [<sub>] --help` is canonical. [docs/CLI_REFERENCE_RARE.md](CLI_REFERENCE_RARE.md) retains only an overview of the rare subcommands.
-- `tools/new_agent_run_id.py` takes no arguments. A step / substep (leaf) agent does not consult this policy: its `guarded-apply-patch` / `run-gate` invocations use the literal embedded in its launch prompt (rendered from `skills/workflow-orchestration/references/launch_prompts.md`).
+- `tools/new_agent_run_id.py` takes no arguments. A step / substep (leaf) agent does not consult this policy: its `run-gate` invocations use the literal embedded in its launch prompt (rendered from `skills/workflow-orchestration/references/launch_prompts.md`).
 - During workflow execution, reading the `.py` implementations under `tools/` directly via the `Read` tool / `grep` / `sed` / `cat` etc. is forbidden (`forbid_tools_direct_read`, `read_manifest_read_guard`); the argparse output via `--help` is not blocked. During repository improvement / maintenance / testing / refactoring, `tools/*.py` is ordinary source code and may be inspected directly.
 
 Related canonical sources:
@@ -58,7 +58,7 @@ The 13 subcommands whose details are covered in this file.
 | `reserve-phase-root` | reserve ir_id / pipeline_id (does not materialize the path) | [reserve-phase-root](#reserve-phase-root) |
 | `workflow-launch-check` | the pre-phase gate (dependency readiness, agent type) | [workflow-launch-check](#workflow-launch-check) |
 | `run-gate` | run a validator gate (validate_pipeline_semantics etc.) across the capability | [run-gate](#run-gate) |
-| `guarded-apply-patch` | the canonical write to `.json` / `.txt` | [guarded-apply-patch](#guarded-apply-patch) |
+| `guarded-apply-patch` | **deprecated** (Phase-2: artifacts are written directly with `Edit`/`Write`); retained pending removal | [guarded-apply-patch](#guarded-apply-patch) |
 
 ## Tier-B rare subcommand list (overview only)
 

@@ -1344,7 +1344,7 @@ class ClaudeHookCliTests(unittest.TestCase):
             body = json.loads(out.getvalue().strip())
             self.assertEqual(body.get("decision"), "block")
             self.assertIn("unauthorized write", body.get("reason", ""))
-            self.assertIn("guarded-apply-patch", body.get("reason", ""))
+            self.assertIn("Edit/Write", body.get("reason", ""))
 
     def test_claude_read_allows_self_output_and_read_manifest_without_allowed_root(self) -> None:
         """The output/read manifest can be Read even if not in allowed_read_roots."""
@@ -1701,7 +1701,7 @@ class ClaudeHookCliTests(unittest.TestCase):
             body = json.loads(out.getvalue().strip())
             self.assertEqual(body.get("decision"), "block")
             self.assertIn("session-to-run mapping not found", body.get("reason", ""))
-            self.assertIn("guarded-apply-patch", body.get("reason", ""))
+            self.assertIn("Edit/Write", body.get("reason", ""))
             self.assertNotIn("orchestration_read", body.get("reason", ""))
 
     def test_codex_raw_apply_patch_allows_when_target_is_in_allowed_file_tool_paths(self) -> None:
@@ -2028,7 +2028,7 @@ class ClaudeHookCliTests(unittest.TestCase):
             body = json.loads(out.getvalue().strip())
             self.assertEqual(body.get("decision"), "block")
             self.assertIn("session-to-run mapping not found", body.get("reason", ""))
-            self.assertIn("guarded-apply-patch", body.get("reason", ""))
+            self.assertIn("Edit/Write", body.get("reason", ""))
 
     def test_bash_audit_redacts_capability_token(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -2580,7 +2580,10 @@ class WriteToolExtensionPolicyTests(unittest.TestCase):
             )
             self.assertEqual(code, 2)
             self.assertEqual(body.get("decision"), "block")
-            self.assertIn("guarded-apply-patch", body.get("reason", ""))
+            # A path in allowed_output_paths but NOT in allowed_file_tool_paths is not
+            # Edit/Write-eligible; the recovery is to add it to allowed_file_tool_paths
+            # (no longer guarded-apply-patch, which is deprecated under Phase-2).
+            self.assertIn("allowed_file_tool_paths", body.get("reason", ""))
 
     def test_write_tool_allows_yaml_when_listed_in_allowed_file_tool_paths(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -2682,12 +2685,13 @@ class WriteToolExtensionPolicyTests(unittest.TestCase):
             self.assertEqual(code, 2)
             self.assertEqual(body.get("decision"), "block")
 
-    def test_bash_redirect_to_allowed_path_is_plain_allow_not_auto_approve(self) -> None:
-        """Regression: a Bash command that WRITES (file redirect) is never
-        auto-approved, even on a manifest match — it stays plain ALLOW and emits
-        no hookSpecificOutput. Auto-approve (ALLOW_AUTO_APPROVE) is reserved for
-        the Write/Edit branch and for provably read-only Bash compositions
-        (no write targets); a redirect write is neither."""
+    def test_bash_redirect_to_managed_artifact_is_blocked(self) -> None:
+        """Phase-2: a Bash command that WRITES (file redirect) to a managed
+        artifact is blocked even on a manifest match — shell redirection is never
+        an authorized artifact-write path (managed artifacts go through the
+        Edit/Write / codex apply_patch tools; Bash may only write scratch under
+        allowed_tmp_root). This also guards the auto-approve invariant: a writing
+        Bash command is certainly never auto-approved."""
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
             orch = "orch_bash_scope_001"
@@ -2719,10 +2723,9 @@ class WriteToolExtensionPolicyTests(unittest.TestCase):
                             json.dumps(payload),
                         ]
                     )
-            self.assertEqual(code, 0)
-            body_text = out.getvalue().strip()
-            # plain ALLOW for Bash → empty stdout, NOT hookSpecificOutput JSON
-            self.assertEqual(body_text, "", f"Bash ALLOW must not emit auto-approve payload; got: {body_text!r}")
+            self.assertEqual(code, 2)
+            body = json.loads(out.getvalue().strip())
+            self.assertEqual(body.get("decision"), "block")
 
     def test_readonly_bash_compound_emits_auto_approve(self) -> None:
         """A-2 increment 1: a provably read-only Bash composition (no write

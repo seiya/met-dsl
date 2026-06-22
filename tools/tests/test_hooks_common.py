@@ -1138,16 +1138,17 @@ class ForbidPythonInlineWriteNewPatternsTests(unittest.TestCase):
             (detail.get("fix_hint") or {}).get("next_command", ""),
         )
 
-    def test_default_write_intent_emits_guarded_apply_patch_hint(self) -> None:
+    def test_default_write_intent_emits_edit_write_hint(self) -> None:
         decision = self._call("python3 -c \"open('x.json','w').write('{}')\"")
         self.assertEqual(decision.action, HookDecisionAction.BLOCK)
         detail = decision.audit_detail or {}
         self.assertEqual(detail.get("policy"), "forbid_python_inline_write")
         self.assertEqual(detail.get("intent_detected"), "write")
-        self.assertIn(
-            "guarded-apply-patch",
-            (detail.get("fix_hint") or {}).get("next_command", ""),
-        )
+        # Phase-2: the write-intent recovery is the Edit/Write tool, not the
+        # deprecated guarded-apply-patch.
+        next_command = (detail.get("fix_hint") or {}).get("next_command", "")
+        self.assertIn("Edit/Write tool", next_command)
+        self.assertNotIn("guarded-apply-patch", next_command)
 
     def test_heredoc_uuid_intent_emits_proc_random_hint(self) -> None:
         """Boundary: intent classification must work for the heredoc form, not
@@ -2098,9 +2099,14 @@ class FixHintInAuditDetailTests(unittest.TestCase):
         self.assertEqual(audit.get("policy"), "enforce_guarded_apply_patch")
         self.assertEqual(audit.get("tool_name"), "Bash")
 
-    def test_bash_redirect_to_allowed_file_tool_path_is_allowed(self) -> None:
-        """Bash redirect to a path explicitly in allowed_file_tool_paths is
-        allowed (matches Edit/Write semantics and post-hoc acceptance)."""
+    def test_bash_redirect_to_allowed_file_tool_path_is_blocked(self) -> None:
+        """Phase-2: a Bash redirect / tee / sed -i is NEVER an authorized
+        artifact-write path, even when the target is in allowed_file_tool_paths.
+        Managed artifacts are written with the structured Edit/Write (or codex
+        apply_patch) tools; Bash may only write scratch under allowed_tmp_root.
+        Allowing a Bash redirect to a listed canonical path would let a managed
+        output that became Edit/Write-eligible also silently authorize shell
+        writes (incl. command-substitution exfil) to it."""
         from tools.hooks.common import validate_write_access
         import tempfile
         import json as _json
@@ -2122,7 +2128,9 @@ class FixHintInAuditDetailTests(unittest.TestCase):
                 "workspace/pipelines/x/src/foo.f90",
                 tool_name="Bash",
             )
-        self.assertEqual(decision.action, HookDecisionAction.ALLOW)
+        self.assertEqual(decision.action, HookDecisionAction.BLOCK)
+        self.assertEqual((decision.audit_detail or {}).get("policy"), "enforce_guarded_apply_patch")
+        self.assertEqual((decision.audit_detail or {}).get("tool_name"), "Bash")
 
     def test_output_manifest_write_guard_fix_hint_is_literal_path(self) -> None:
         """The recovery hint surfaced for an unauthorized write must be a literal

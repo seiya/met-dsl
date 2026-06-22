@@ -182,11 +182,11 @@ workspace/
 | path | generating phase | writer | reader | note |
 |---|---|---|---|---|
 | `workspace/ir/.../<ir_id>/spec.ir.yaml` | Compile/generate | substep agent (Edit/Write) | all of Generate onward | the single structural IR. The notation rules for `temporaries[].shape_expr` etc. are `spec/schema/plan/shape_expr.schema.json` |
-| `workspace/ir/.../<ir_id>/ir_meta.json` | Compile/generate / verify | substep agent (guarded-apply-patch) | runtime / validator | `verification_status` is assigned only when verify passes |
+| `workspace/ir/.../<ir_id>/ir_meta.json` | Compile/generate / verify | substep agent (Edit/Write) | runtime / validator | `verification_status` is assigned only when verify passes |
 | `workspace/pipelines/.../<pipeline_id>/source/<source_id>/src/` | Generate | substep agent | subsequent phases | |
-| `workspace/pipelines/.../<pipeline_id>/source/<source_id>/source_meta.json` | Generate | substep agent (guarded-apply-patch) | Build / validator | |
-| `workspace/pipelines/.../<pipeline_id>/binary/<binary_id>/binary_meta.json` | Build | step agent (guarded-apply-patch) | Validate / validator | pins `source_source_id` |
-| `workspace/pipelines/.../<pipeline_id>/runs/<run_id>/<node_key_safe>/verdict.json` | Validate/judge | substep agent (guarded-apply-patch) | runtime / validator / upper node | |
+| `workspace/pipelines/.../<pipeline_id>/source/<source_id>/source_meta.json` | Generate | substep agent (Edit/Write) | Build / validator | |
+| `workspace/pipelines/.../<pipeline_id>/binary/<binary_id>/binary_meta.json` | Build | step agent (Edit/Write) | Validate / validator | pins `source_source_id` |
+| `workspace/pipelines/.../<pipeline_id>/runs/<run_id>/<node_key_safe>/verdict.json` | Validate/judge | substep agent (Edit/Write) | runtime / validator / upper node | |
 | `workspace/pipelines/.../<pipeline_id>/lineage.json` | added by each phase | (via write-step-result) | runtime / validator | the phase id lineage |
 
 ## Generation rule of node_key_safe

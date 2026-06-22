@@ -51,11 +51,11 @@ READ_HINT = (
 )
 
 WRITE_HINT = (
-    "Hint: Write paths route by extension. .json/.txt outputs go through "
-    "'guarded-apply-patch' (tools/orchestration_runtime.py) within "
-    "output_manifests/<agent_run_id>.json.allowed_output_paths. Other "
-    "extensions (.yaml/.yml/.md/source code) are written via Edit/Write "
-    "directly and must be listed under allowed_file_tool_paths. "
+    "Hint: write every artifact (any extension, including managed .json/.txt) "
+    "directly with the Edit/Write tool, to a path listed in "
+    "output_manifests/<agent_run_id>.json.allowed_file_tool_paths "
+    "(guarded-apply-patch is deprecated). The MCP-owned mcp_command_log.jsonl is "
+    "written only by the build-runtime MCP server and is never file-tool-writable. "
     "For temp files, write directly under the literal allowed_tmp_root path "
     "(workspace/tmp/<agent_run_id>/...); do NOT use `export TMPDIR=...`, "
     "`jq -er ...`, or any bootstrap Bash (Claude Code session sandbox approval "
@@ -1170,10 +1170,10 @@ def evaluate_common_policy(hook_input: HookInput) -> HookDecision:
                 # the retry loop.
                 intent = "write"
                 hint_next = (
-                    "python3 tools/orchestration_runtime.py guarded-apply-patch "
-                    "--repo-root . --orchestration-id <oid> --actor-role <role> "
-                    "--agent-run-id <id> --paths-json '[\"<path>\"]' "
-                    "--patch-file workspace/tmp/<agent_run_id>/x.patch --capability-token <token>"
+                    "Write the artifact with the Edit/Write tool to a path listed in "
+                    "output_manifests/<agent_run_id>.json.allowed_file_tool_paths "
+                    "(any extension, including managed .json/.txt). Do not write files "
+                    "from inline Python."
                 )
                 if re.search(r"uuid\.uuid[1345]\s*\(", command):
                     # Cover uuid1/uuid3/uuid4/uuid5 — agents typically reach
@@ -1200,8 +1200,8 @@ def evaluate_common_policy(hook_input: HookInput) -> HookDecision:
                         "Use a real script file (python3 script.py) "
                         "for execution, or tools/audit_orchestration.py for "
                         "log inspection. "
-                        "Use guarded-apply-patch for .json/.txt outputs, "
-                        "or Edit/Write tool for .yaml/.yml/.md/source code. "
+                        "Write artifacts (any extension) with the Edit/Write tool to a "
+                        "path in allowed_file_tool_paths. "
                         "See docs/RUNBOOK.md#hook-recovery."
                     ),
                     continue_processing=False,
@@ -1493,14 +1493,15 @@ _ALLOWED_EXTENSIONLESS_BYPRODUCT_NAMES: frozenset[str] = frozenset({
     "readme", "license", "changelog", "authors", "install", "notice", "copying",
 })
 
-# True compiler byproducts — created directly by the compiler, never via guarded-apply-patch.
-# Terminal validation may accept these under a directory allowlist without gate provenance.
-# (All other extension-allowlisted files are written through guarded-apply-patch and must
-# therefore appear in gate_changed_paths to pass terminal validation.)
+# True compiler byproducts — created directly by the compiler as subprocess output.
+# Terminal validation accepts these under a directory allowlist as confined build output.
+# (NOTE: the legacy "gate provenance / gate_changed_paths" terminal model is deprecated for
+# step/substep — Phase-2 authorizes by write_roots-containment of the FS-diff; the gate code
+# is reserved for P2-7 removal. See docs/ORCHESTRATION.md.)
 _COMPILER_BYPRODUCT_EXTENSIONS: frozenset[str] = frozenset({".mod", ".o", ".a"})
 
-# Allowlist of extensions permitted under a directory allowlist entry via file tools
-# (Edit/Write/guarded-apply-patch). Restricted to source code only.
+# Allowlist of extensions permitted under a directory allowlist entry via the
+# Edit/Write file tools. Restricted to source code only.
 #
 # Excluded (must use explicit file pins):
 #   - Build control files (.mk, .cmake, .toml, .cfg, .ini, .nml) — can alter downstream
@@ -1796,46 +1797,65 @@ def validate_write_access(
                 "fix_hint": fix_hint_block,
             },
         )
-    if tool_name in {"Edit", "Write", "apply_patch", "Bash"} and rel_target_norm not in allowed_file_tool_paths:
-        # Bash redirects (`cat > path`, `tee path`, `>>`) leave no gate
-        # provenance, so they must satisfy the same constraint as Edit/Write:
-        # either be in allowed_file_tool_paths, or go through guarded-apply-patch.
-        # This matches the post-hoc record-agent-run integrity check at
-        # tools/orchestration_runtime.py:_validate_actual_write_paths, which
-        # rejects writes lacking gate provenance unless they appear in
-        # manifest_file_tool_paths.
-        # L2: include a Bash-specific recovery note on top of the concrete
-        # guarded-apply-patch template so operators redirecting via heredoc
-        # see both options ("stage under allowed_tmp_root first" vs "go through
-        # guarded-apply-patch") rather than only the patch path.
-        bash_note = (
-            f"Bash redirects must target the literal allowed_tmp_root "
-            f"(workspace/tmp/{agent_run_id}/...). For canonical paths, stage the "
-            f"content under workspace/tmp/{agent_run_id}/x.patch and apply via "
-            f"guarded-apply-patch — see fix_hint.next_command. Do NOT use "
-            f"`export TMPDIR=...` or $TMPDIR env (session approval would stall)."
-            if tool_name == "Bash" else None
-        )
-        fix_hint: dict[str, Any] = {
-            "next_command": (
-                f"python3 tools/orchestration_runtime.py guarded-apply-patch "
-                f"--repo-root . --orchestration-id {orchestration_id} "
-                f"--actor-role <role> --agent-run-id {agent_run_id} "
-                f"--paths-json '[\"{file_path}\"]' "
-                f"--patch-file workspace/tmp/{agent_run_id}/x.patch "
-                f"--capability-token <token>"
-            ),
-            "docs_ref": "docs/AGENT_CONTRACT.md",
-        }
-        if bash_note:
-            fix_hint["note"] = bash_note
+    # Phase-2: shell writes (Bash redirect `cat > path` / `tee` / `sed -i`) are
+    # NEVER an authorized artifact-write path — not even when the target is in
+    # `allowed_file_tool_paths`. Managed artifacts are written with the structured
+    # file-edit tools (Edit / Write, or `apply_patch` on the Codex backend), which
+    # are auditable; Bash writes are confined to `allowed_tmp_root` (the tmp check
+    # above already ALLOWed those, so any Bash target reaching here is non-tmp).
+    # Blocking it regardless of `allowed_file_tool_paths` membership is what keeps a
+    # managed output — now Edit/Write-eligible under the direct-write contract —
+    # from ALSO silently authorizing shell writes (e.g. `cat > lineage.json`, or a
+    # command-substitution exfil like `echo $(cat secret) > out.json`) to a
+    # canonical path. The leaf must use the Edit/Write tool instead.
+    if tool_name == "Bash":
         return HookDecision(
             action=HookDecisionAction.BLOCK,
             reason=(
-                f"direct write via {tool_name} is forbidden for this target path. "
-                "Use guarded-apply-patch instead or include the path in "
-                "output_manifest allowed_file_tool_paths: "
-                "python3 tools/orchestration_runtime.py guarded-apply-patch ..."
+                "shell writes (redirect / tee / sed -i) are forbidden for managed "
+                "artifacts. Write the artifact with the Edit/Write tool to a path in "
+                "output_manifest allowed_file_tool_paths; Bash may only write scratch "
+                f"under allowed_tmp_root (workspace/tmp/{agent_run_id}/...)."
+            ),
+            continue_processing=False,
+            audit_detail={
+                # Policy id kept as `enforce_guarded_apply_patch` for audit-log /
+                # remediation-table continuity: it is the stable identifier for the
+                # whole "a direct artifact write was rejected — use the Edit/Write
+                # tool" class (docs/RUNBOOK.md#hook-recovery and the audit-claude
+                # SKILL key on it). The id is forensic-only and never surfaced to the
+                # leaf (only `reason` + `fix_hint` are). Full rename is P2-7 cleanup
+                # alongside the guarded-apply-patch retirement.
+                "policy": "enforce_guarded_apply_patch",
+                "tool_name": tool_name,
+                "file_path": file_path,
+                "agent_run_id": agent_run_id,
+                "allowed_file_tool_paths": list(allowed_file_tool_paths),
+                "fix_hint": {
+                    "write_under": f"workspace/tmp/{agent_run_id}/...",
+                    "docs_ref": "docs/AGENT_CONTRACT.md",
+                    "note": (
+                        "Write managed artifacts with the Edit/Write tool (not a shell "
+                        "redirect / tee / sed -i). Do NOT use `export TMPDIR=...` or "
+                        "$TMPDIR env (session approval would stall)."
+                    ),
+                },
+            },
+        )
+    if tool_name in {"Edit", "Write", "apply_patch"} and rel_target_norm not in allowed_file_tool_paths:
+        # The target is a declared output (it passed the allowed_output_paths check
+        # above) but is not Edit/Write-eligible — i.e. it is excluded from
+        # `allowed_file_tool_paths` (a canonical MCP audit log, or a path the
+        # orchestration did not declare as a file-tool output). The recovery is to
+        # add the path to `allowed_file_tool_paths` (the orchestration's launch
+        # request), not a shell write.
+        return HookDecision(
+            action=HookDecisionAction.BLOCK,
+            reason=(
+                f"direct write via {tool_name} is forbidden for this target path: it is "
+                "not in output_manifest allowed_file_tool_paths (e.g. an MCP-owned audit "
+                "log written only by the build-runtime MCP server). Write only paths "
+                "enumerated in allowed_file_tool_paths."
             ),
             continue_processing=False,
             audit_detail={
@@ -1844,7 +1864,13 @@ def validate_write_access(
                 "file_path": file_path,
                 "agent_run_id": agent_run_id,
                 "allowed_file_tool_paths": list(allowed_file_tool_paths),
-                "fix_hint": fix_hint,
+                "fix_hint": {
+                    "docs_ref": "docs/AGENT_CONTRACT.md",
+                    "note": (
+                        "The path must be listed in output_manifest allowed_file_tool_paths "
+                        "to be written with the Edit/Write tool."
+                    ),
+                },
             },
         )
     return HookDecision(action=HookDecisionAction.ALLOW)
