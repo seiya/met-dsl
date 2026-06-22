@@ -103,6 +103,10 @@ python3 tools/run_workflow.py <spec_ref> <until_phase> --llm claude
 
 ## Open risks (verified by the integration run / M1)
 
+> The one-time live verification that closes the bwrap-enablement risk (items below + the
+> Build-output-in-`write_roots` check) and the procedure to flip `METDSL_CONDUCTOR_BWRAP`
+> to default-on are in `docs/BWRAP_ENABLEMENT.md`.
+
 1. **headless `claude -p` MCP + permissions** — leaf Build/Validate.execute need
    build-runtime MCP non-interactively (the committed `.claude/settings.json` grants it;
    may need `--permission-mode`).

@@ -15843,6 +15843,32 @@ class ApplyPatchGateCoverageExtensionTests(unittest.TestCase):
             _validate_apply_patch_gate_coverage(repo_root, "orch_ext_003", payload)
 
 
+class RuntimeRoBindDnsTests(unittest.TestCase):
+    """_runtime_ro_bind_paths must bind the resolv.conf symlink target so DNS works
+    in-sandbox (WSL2: /mnt/wsl/resolv.conf; systemd-resolved: stub under /run).
+    Verified end-to-end separately via `claude -p` inside the sandbox; this guards the
+    bind logic in CI where the live API call cannot run."""
+
+    def test_resolv_symlink_target_is_bound(self) -> None:
+        from tools.orchestration_runtime import _runtime_ro_bind_paths
+        paths = _runtime_ro_bind_paths()
+        self.assertIn("/etc", paths)
+        resolv = Path("/etc/resolv.conf")
+        try:
+            real = resolv.resolve()
+        except OSError:
+            self.skipTest("/etc/resolv.conf not resolvable on this host")
+        if real != resolv and real.exists() and not real.is_relative_to(Path("/etc")):
+            self.assertIn(
+                str(real), paths,
+                "resolv.conf points outside /etc; its target must be bound or DNS "
+                "(and the leaf claude -p API call) fails inside the sandbox",
+            )
+        else:
+            # Plain resolv.conf under /etc — nothing extra to bind.
+            self.assertEqual([p for p in paths if p.startswith("/etc/")], [])
+
+
 class BwrapProfileFilePinTests(unittest.TestCase):
     """build_bwrap_profile + render_bwrap_command: file-pin write_roots must get a bind mount."""
 

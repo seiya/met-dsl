@@ -5538,7 +5538,27 @@ def _load_read_access_manifest(
 
 def _runtime_ro_bind_paths() -> list[str]:
     runtime_paths = ["/usr", "/bin", "/sbin", "/lib", "/lib64", "/etc"]
-    return [p for p in runtime_paths if Path(p).exists()]
+    paths = [p for p in runtime_paths if Path(p).exists()]
+    # DNS: `/etc/resolv.conf` is frequently a symlink to a file OUTSIDE /etc — WSL2
+    # points it at `/mnt/wsl/resolv.conf`, systemd-resolved at
+    # `/run/systemd/resolve/stub-resolv.conf`. ro-binding `/etc` alone leaves that
+    # symlink dangling inside the sandbox, so name resolution fails and the leaf
+    # `claude -p` cannot reach the API (it surfaces as "Unable to connect to API
+    # (ConnectionRefused)"). Bind the resolved target at its own path so the symlink
+    # resolves in-sandbox. A plain (non-symlink) resolv.conf resolves to itself under
+    # the already-bound /etc and needs nothing extra.
+    try:
+        resolv = Path("/etc/resolv.conf")
+        real = resolv.resolve()
+        if (
+            real != resolv
+            and real.exists()
+            and not any(real == Path(p) or real.is_relative_to(Path(p)) for p in paths)
+        ):
+            paths.append(str(real))
+    except OSError:
+        pass
+    return paths
 
 
 def _safe_host_env_for_child() -> dict[str, str]:
@@ -5746,6 +5766,16 @@ def build_bwrap_profile(
                     f"runtime rw bind {_rwp!r} (backend config home) is absent and could "
                     f"not be created: {exc}") from exc
         backend_rw.append(_rwp)
+    # The leaf runs `guarded-apply-patch` (a runtime-CLI subprocess) which records gate
+    # attribution evidence under workspace/orchestrations/<orch>/gates/<arid>/. That path
+    # is outside the artifact `write_roots`, so without a writable bind bwrap blocks the
+    # evidence write, leaving `gate_changed_paths` empty and the artifact (e.g. ir_meta.json)
+    # flagged as an unauthorized write at finalize-child. Bind the per-arid gates dir
+    # writable — it is excluded from the artifact-write violation check as runtime
+    # bookkeeping (see the `{orch_root}/gates/` runtime-prefix exemption). Scoped to THIS
+    # arid only, never another child's.
+    gates_rel = f"workspace/orchestrations/{orchestration_id}/gates/{agent_run_id}/"
+    (repo_root / gates_rel).mkdir(parents=True, exist_ok=True)
     return {
         "orchestration_id": orchestration_id,
         "agent_run_id": agent_run_id,
@@ -5761,6 +5791,10 @@ def build_bwrap_profile(
         "runtime_rw_bind_paths": backend_rw,
         "tmp_dir": str(tmp_root),
         "workspace_tmp_rw_abs": str(workspace_tmp_host),
+        # In-repo runtime bookkeeping dirs the leaf writes via the runtime CLI (gate
+        # evidence). Bound writable by render_bwrap_command; kept separate from the
+        # backend-home runtime_rw_bind_paths, which must be OUTSIDE repo_root.
+        "runtime_rw_rel_paths": [gates_rel],
         "workdir": str(repo_root),
         "env": child_env,
         "generated_at": _utc_now_iso(),
@@ -5796,13 +5830,28 @@ def render_bwrap_command(
         if isinstance(item, str) and item.strip():
             cmd.extend(["--ro-bind", item.strip(), item.strip()])
     cmd.extend(["--ro-bind", repo_root, repo_root])
+    # write_root absolute paths, used to suppress an ro read-bind that would otherwise
+    # make a writable artifact read-only.
+    _write_abs = [
+        (Path(repo_root) / _normalize_rel_posix(w)).resolve()
+        for w in profile.get("write_roots", [])
+        if isinstance(w, str) and w.strip()
+    ]
     for rel in profile.get("read_roots", []):
         if not isinstance(rel, str) or not rel.strip():
             continue
         abs_path = (Path(repo_root) / _normalize_rel_posix(rel)).resolve()
-        if abs_path.exists():
-            abs_token = str(abs_path)
-            cmd.extend(["--ro-bind", abs_token, abs_token])
+        if not abs_path.exists():
+            continue
+        # Do NOT ro-bind a read input that lives inside a writable write_root: the rw
+        # write_root bind already exposes it, and an ro file-pin would make it unwritable,
+        # breaking an in-place rewrite (git apply / atomic rename -> EBUSY) of a file that
+        # is both a read input and a managed output (e.g. compile.verify appending
+        # io_contract to spec.ir.yaml).
+        if any(abs_path == w or abs_path.is_relative_to(w) for w in _write_abs):
+            continue
+        abs_token = str(abs_path)
+        cmd.extend(["--ro-bind", abs_token, abs_token])
     # Writable runtime binds (backend config/credential home) — emitted AFTER the repo
     # and read-root ro-binds so a home located INSIDE repo_root (a custom HOME /
     # METDSL_HOME) stays writable: bwrap applies binds in order, later overriding earlier
@@ -5840,6 +5889,15 @@ def render_bwrap_command(
                 )
         abs_token = str(abs_path)
         cmd.extend(["--bind", abs_token, abs_token])
+    # In-repo runtime bookkeeping dirs the leaf writes via the runtime CLI (gate
+    # evidence under gates/<arid>/). Pre-created by build_bwrap_profile; bound writable.
+    for rel in profile.get("runtime_rw_rel_paths", []):
+        if not isinstance(rel, str) or not rel.strip():
+            continue
+        abs_path = (Path(repo_root) / _normalize_rel_posix(rel)).resolve()
+        if abs_path.is_dir():
+            abs_token = str(abs_path)
+            cmd.extend(["--bind", abs_token, abs_token])
     ws_rw = str(profile.get("workspace_tmp_rw_abs") or "").strip()
     if not ws_rw:
         raise ValueError("profile must include workspace_tmp_rw_abs")
@@ -6305,9 +6363,15 @@ def _gate_changed_paths_store_path(
     *,
     agent_run_id: str,
 ) -> Path:
+    # Stored under gates/<arid>/ (NOT agents/<arid>/) so a sandboxed leaf can persist
+    # it: the leaf's guarded-apply-patch writes this gate-attribution evidence, and
+    # gates/<arid>/ is the per-arid gate dir the bwrap profile binds writable. Keeping
+    # it out of agents/<arid>/ also avoids exposing that dir's integrity baseline
+    # (run_write_baseline.json) to leaf writes. Both dirs are runtime-prefix excluded
+    # from the unauthorized-write check, so the location move is attribution-neutral.
     return (
         _orchestration_root(repo_root, orchestration_id)
-        / "agents"
+        / "gates"
         / agent_run_id.strip()
         / "gate_changed_paths.json"
     )
