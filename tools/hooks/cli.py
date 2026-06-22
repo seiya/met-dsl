@@ -604,6 +604,38 @@ def _extract_command_substitution_bodies(command: str) -> list[str]:
 
 _SHELL_CONTROL_TOKENS = frozenset({"|", "||", "&&", ";"})
 
+# Bash commands whose ONLY file-write vector is shell redirection (which
+# _detect_bash_write_targets catches) — they carry no own write/exec flags.
+# Deliberately EXCLUDES find (-exec/-delete), awk (in-program `print > f`),
+# sed (`w`/`e`/`-i`), sort (-o), env/xargs (exec), all interpreters, and all
+# network tools, because those can write or execute without a shell redirect
+# the detector would see. Also EXCLUDES ripgrep (`rg`): its `--pre`/`--pre-glob`
+# run an arbitrary preprocessor command (and `RIPGREP_CONFIG_PATH` can inject
+# the same out-of-band) — GNU grep/egrep/fgrep have no such flag and stay.
+# Used only by _is_auto_approvable_readonly_bash.
+_SAFE_READONLY_BASH_CMDS = frozenset({
+    "grep", "egrep", "fgrep", "ls", "cat", "wc", "head", "tail",
+    "echo", "printf", "date", "dirname", "basename", "realpath", "readlink",
+    "pwd", "true", "false", "test", "[", "nl", "tac", "cut", "tr", "comm",
+    "diff", "jq",
+})
+
+# fd-duplication redirects (`2>&1`, `>&2`, `1>&2`) are NOT file writes. The RHS
+# digits must be the WHOLE token (negative lookahead for a following filename
+# char): bash treats `n>&word` as fd-dup only when `word` is all digits, else
+# `word` is a file. Without the lookahead, `1>&9secret` would match the `1>&9`
+# prefix, get stripped, and leave `secret` as an inert token — auto-approving a
+# file write. With it, such glued forms survive and trip the residual `>`/`&`
+# rejection below, while genuine dups (`2>&1`, `1>&12`) still strip cleanly.
+_FD_DUP_RE = re.compile(r"\d*>&\d+(?![\w./-])")
+# Leading `VAR=value` assignment prefix on a command segment.
+_ASSIGNMENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+# Shell command separators we split on for per-command argv0 validation. `||`
+# must precede `|` in the alternation. Split is applied to the quote-stripped
+# command string (NOT the shlex token list), because shlex does not surface a
+# separator glued to an adjacent word (`cat a;curl x` -> ['cat','a;curl','x']).
+_SEPARATOR_RE = re.compile(r"\|\||&&|;|\|")
+
 
 def _looks_like_sed_script(token: str) -> bool:
     if not token:
@@ -686,6 +718,65 @@ def _detect_bash_write_targets(command: str | None) -> list[str]:
             targets.append(arg)
     targets.extend(_detect_sed_inplace_targets(command))
     return targets
+
+
+def _is_auto_approvable_readonly_bash(command: str | None) -> bool:
+    """True iff `command` is a provably read-only composition safe to auto-approve.
+
+    Auto-approval (ALLOW_AUTO_APPROVE -> permissionDecision="allow") bypasses the
+    harness's native permission allowlist, so this is fail-closed: it returns True
+    only for compositions (pipe / ; / && / ||) of a tight set of read-only
+    commands, with no command substitution, no process substitution / subshell,
+    and no file-output redirection (fd-duplication like `2>&1` is allowed).
+    Anything it cannot prove safe returns False, falling back to the existing
+    allowlist-governed behavior. Callers must only invoke this when there are no
+    authorized write targets (purely read-only commands); writes are out of scope
+    for this increment.
+    """
+    if not command or not command.strip():
+        return False
+    # No command substitution ($(...) / backticks).
+    if _extract_command_substitution_bodies(command):
+        return False
+    scanned = _strip_quoted_strings(command)
+    # Remove fd-duplication, then blank out the RECOGNIZED control operators so a
+    # stray `&` (background `cmd &`, stderr-pipe `|&`) is not confused with the
+    # allowed `&&`. After that, any remaining redirect (`>`/`<`), subshell /
+    # process-substitution paren, stray `&`, comment `#`, or newline means we
+    # cannot prove the command read-only. `shlex.split` (used below) treats
+    # `\n`, `&`, and `#` as ordinary word characters rather than command
+    # separators, so without this guard a trailing command glued on after them
+    # (`cat a\ncurl ...`) would be swallowed into a safe segment and silently
+    # auto-approved — this residual scan is what closes that hole.
+    residual = _FD_DUP_RE.sub("", scanned)
+    for op in ("&&", "||", ";", "|"):
+        residual = residual.replace(op, " ")
+    if any(ch in residual for ch in (">", "<", "(", ")", "&", "#", "\n")):
+        return False
+    # Segment on shell command separators and validate every command's argv0.
+    # Split the QUOTE-STRIPPED string (`scanned`) — not the shlex token list —
+    # so a separator glued to an adjacent word (`cat a;curl x`) still segments
+    # and the trailing command cannot escape the argv0 check. Quote-stripping
+    # first ensures a separator inside a quoted argument is not a real separator.
+    fragments = _SEPARATOR_RE.split(scanned)
+    if not fragments:
+        return False
+    for fragment in fragments:
+        try:
+            toks = shlex.split(fragment)
+        except ValueError:
+            return False
+        # A leading `VAR=value` command-prefix is an in-process code-execution
+        # channel independent of argv0 (LD_PRELOAD / LD_AUDIT / LD_LIBRARY_PATH /
+        # BASH_ENV / ENV / IFS / ...), so reject any fragment that carries one
+        # (and any empty / bare-assignment fragment). Benign env prefixes on
+        # read-only commands are rare; falling back to the allowlist is fine.
+        if not toks or _ASSIGNMENT_RE.match(toks[0]):
+            return False
+        argv0 = toks[0].split("/")[-1]
+        if argv0 not in _SAFE_READONLY_BASH_CMDS:
+            return False
+    return True
 
 
 def _resolve_codex_agent_run_id_from_session(
@@ -1000,6 +1091,23 @@ def _evaluate_pre_command_file_access_policy(
             return common_decision
         write_targets = _detect_bash_write_targets(decoded.command)
         if not write_targets:
+            # Purely read-only command: if it is a provably-safe composition,
+            # auto-approve to bypass the harness's native `;`/pipe permission
+            # decomposition (the source of compound-command friction). Anything
+            # not proven safe falls back to the allowlist-governed path.
+            if (
+                common_decision.action == HookDecisionAction.ALLOW
+                and _is_auto_approvable_readonly_bash(decoded.command)
+            ):
+                return HookDecision(
+                    action=HookDecisionAction.ALLOW_AUTO_APPROVE,
+                    reason="read-only Bash composition auto-approved (no file writes)",
+                    audit_detail={
+                        "policy": "bash_readonly_auto_approve",
+                        "tool_name": "Bash",
+                        "command": decoded.command,
+                    },
+                )
             return common_decision
         resolved_run_id, resolution_error = _resolve_agent_run_id_for_file_tool(
             backend=backend,

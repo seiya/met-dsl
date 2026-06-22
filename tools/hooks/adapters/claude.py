@@ -77,12 +77,17 @@ class ClaudeHookAdapter(HookBackendAdapter):
             # hookEventName becomes inconsistent, so when adding a new issuing
             # site, guarantee that it is PreToolUse.
             audit = decision.audit_detail or {}
-            tool_name = audit.get("tool_name") or "tool"
-            file_path = audit.get("file_path") or ""
-            agent_run_id = audit.get("agent_run_id") or ""
-            reason = f"{tool_name} to {file_path} matched output_manifest.allowed_file_tool_paths"
-            if agent_run_id:
-                reason += f" (agent_run_id={agent_run_id})"
+            if decision.reason:
+                # Issuing site provided an explicit reason (e.g. the Bash
+                # read-only auto-approve path); use it verbatim.
+                reason = decision.reason
+            else:
+                tool_name = audit.get("tool_name") or "tool"
+                file_path = audit.get("file_path") or ""
+                agent_run_id = audit.get("agent_run_id") or ""
+                reason = f"{tool_name} to {file_path} matched output_manifest.allowed_file_tool_paths"
+                if agent_run_id:
+                    reason += f" (agent_run_id={agent_run_id})"
             body = {
                 "hookSpecificOutput": {
                     "hookEventName": "PreToolUse",
