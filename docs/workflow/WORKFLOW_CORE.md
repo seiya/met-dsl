@@ -264,7 +264,7 @@ In this section, the input of each phase is described separately as `execution i
 
 ### 2. Generate
 - execution input: `spec.ir.yaml`
-- verification input: `spec.ir.yaml`, the generated `source/<source_id>/src/`
+- verification input: `spec.ir.yaml`, `controlled_spec.md` (verify-only, requirement-fidelity cross-check), the generated `source/<source_id>/src/`
 - output: `source/<source_id>/src/`, `source_meta.json`
 - Before `Generate` completes, succeed at the MCP `run_linter` consistent with `impl_defaults.toolchain.language` of `spec.ir.yaml`, and must record the MCP evidence (each element with `command_id`, `command_log_ref`, and `preset`) in `lint_command_ref.run_linter` of `source_meta.json`.
 - `Generate` must include in its official output a preset-compatible quality path with which `Validate.execute` can run using only the `preset` of `run_quality_checks`. On shortage, it is `Generate fail`.

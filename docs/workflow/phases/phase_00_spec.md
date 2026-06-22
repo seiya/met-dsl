@@ -20,5 +20,5 @@ The phase that manually writes the `Controlled Spec`, `tests`, and `deps` and es
 
 ## Connection to later stages
 - The `Compile` phase takes `controlled_spec.md` + `tests.md` + `deps.yaml` + `spec/registry/spec_catalog.yaml` as input and generates `spec.ir.yaml`.
-- The stages from `Generate` onward use `spec.ir.yaml` as the canonical source and do not read `controlled_spec.md` directly.
+- The stages from `Generate` onward use `spec.ir.yaml` as the canonical source and do not read `controlled_spec.md` directly — the sole exception is `Generate.verify`, which reads `controlled_spec.md` as a requirement-fidelity cross-check (`spec.ir.yaml` stays its primary basis).
 - A specification change is expressed by updating one of `controlled_spec.md` / `tests.md` / `deps.yaml`, and a specification must not be changed by an implementation-side modification alone (the Spec-First principle).

@@ -1,11 +1,11 @@
 # Phase 2: Generate
 
 ## Overview
-The phase that, with `spec.ir.yaml` as the canonical input, generates the source code of the target `node`'s `model` (physics computation) and `runner` (input/output / execution coordination). Reading `controlled_spec.md` directly is forbidden.
+The phase that, with `spec.ir.yaml` as the canonical input, generates the source code of the target `node`'s `model` (physics computation) and `runner` (input/output / execution coordination). `Generate.generate` (§2-1) must not read `controlled_spec.md` directly — it works only from `spec.ir.yaml`. `Generate.verify` (§2-2) **does** read `controlled_spec.md`, as an independent requirement-fidelity cross-check against the generated source (it catches cases where the `spec.ir.yaml` translation itself dropped or distorted a requirement); `spec.ir.yaml` stays its primary judgment basis.
 
 ## I/O contract
 - execution input: `spec.ir.yaml`
-- verification input: `spec.ir.yaml`, the generated `source/<source_id>/src/`
+- verification input: `spec.ir.yaml`, `controlled_spec.md` (verify-only, requirement-fidelity cross-check), the generated `source/<source_id>/src/`
 - output: `workspace/pipelines/<node_key_safe>/<pipeline_id>/source/<source_id>/src/`, `source_meta.json`
 
 ## substep structure
@@ -61,6 +61,10 @@ The phase that, with `spec.ir.yaml` as the canonical input, generates the source
 Before `Generate.verify` completes, run `python3 tools/validate_pipeline_semantics.py --stage post_generate --pipeline-root workspace/pipelines/<node_key_safe>/<pipeline_id>/`, and when fixing the `source_id` to verify, add `--source-id <source_id>`. `exit code 0` is required.
 
 `Generate.verify` must not run the write-family tools of the `build-runtime` MCP including `run_linter` (`run_linter` / `compile_project` / `run_program` / `run_quality_checks`) (`static lint` is the responsibility of `Generate.generate` in 2-1). The external gates verify may launch are limited to the read-only `validate_workspace_root.py` and `validate_pipeline_semantics --stage post_generate`, and `lint_command_ref.run_linter` is limited to being the target of an *inspection* of an existing record. Because verify's `allowed_output_paths` does not authorize the side output of `run_linter` (`mcp_command_log.jsonl`), running `run_linter` from verify makes that write outside the manifest and invites an `unauthorized_write_violation` → `fail_closed`.
+
+Unlike `Generate.generate` (which is forbidden from reading `controlled_spec.md`), `Generate.verify` **reads `controlled_spec.md`** and uses it as an independent requirement-fidelity reference: it cross-checks that the generated `source` faithfully realizes the original controlled requirement, catching a requirement that the `spec.ir.yaml` translation itself dropped or distorted. `spec.ir.yaml` remains the primary judgment basis; `controlled_spec.md` is the secondary cross-check (a generated path absent from `spec.ir.yaml` is still a `fail` per the items below).
+
+Disagreement resolution (kept deterministic to avoid judge nondeterminism): when `controlled_spec.md` defines a load-bearing requirement that `spec.ir.yaml` dropped or distorted — such that the generated source, even if faithful to the IR, cannot satisfy the original requirement — `Generate.verify` records a `fail` attributed to the `spec.ir.yaml` translation (a `Compile`-stage defect), rather than silently accepting the IR. The IR legitimately abstracts the natural-language flavor of `controlled_spec.md`; only a dropped or distorted **requirement** (not abstracted prose) is a `fail`. So a genuine controlled-vs-IR requirement discrepancy always surfaces as a `fail`, never a silent pass.
 
 `Generate.verify` required verification items:
 

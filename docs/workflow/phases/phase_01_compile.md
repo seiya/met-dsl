@@ -1,7 +1,7 @@
 # Phase 1: Compile
 
 ## Overview
-The phase that integrates the natural-language specification (`controlled_spec.md` / `tests.md` / `deps.yaml`) into a **single structural IR (`spec.ir.yaml`)**. It is the only phase in the core workflow that reads `controlled_spec.md` directly, and the subsequent `Generate` / `Build` / `Validate` use `spec.ir.yaml` as the canonical source.
+The phase that integrates the natural-language specification (`controlled_spec.md` / `tests.md` / `deps.yaml`) into a **single structural IR (`spec.ir.yaml`)**. It is the only phase that reads `controlled_spec.md` as a **generation input**, and the subsequent `Generate` / `Build` / `Validate` use `spec.ir.yaml` as the canonical source (the lone read of `controlled_spec.md` downstream is `Generate.verify`'s requirement-fidelity cross-check, not a generation input).
 
 ## I/O contract
 - execution input: `controlled_spec.md`, `tests.md`, `deps.yaml`, `spec/registry/spec_catalog.yaml`

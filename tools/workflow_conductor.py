@@ -432,7 +432,11 @@ def build_launch_request(
                 # exploration turn observed in audits).
                 "docs/PERFORMANCE_DIAGNOSTICS.md",
                 f"{refs.ir_ref}/spec.ir.yaml",
-                f"{spec}/controlled_spec.md",
+                # controlled_spec.md is intentionally NOT must-read here: phase_02
+                # §2-1 forbids Generate.generate from taking controlled_spec.md as
+                # input (re-introducing controlled_spec-derived info is a fail), so
+                # the requirement composition is read from spec.ir.yaml.algorithm.
+                # tests.md stays (used for case_id coverage).
                 f"{spec}/tests.md",
             ]
             req["allowed_output_paths"] = [

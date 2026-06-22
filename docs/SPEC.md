@@ -44,7 +44,7 @@ Using the `Controlled Spec` and `tests` as the canonical source, generate, at op
 - The default for `debug_mode` is `false`. Only when `debug_mode=true` is saving failed-attempt artifacts permitted, recording `retained_failed_attempts` and the storage location.
 
 ## Architecture policy
-- The core workflow generates a **single structural IR (`spec.ir.yaml`)** in the `Compile` phase, and the stages from `Generate` onward treat the IR as the canonical source. Reading `controlled_spec.md` directly from `Generate` onward is forbidden.
+- The core workflow generates a **single structural IR (`spec.ir.yaml`)** in the `Compile` phase, and the stages from `Generate` onward treat the IR as the canonical source. Reading `controlled_spec.md` directly from `Generate` onward is forbidden, with the sole exception of `Generate.verify`, which reads it as a requirement-fidelity cross-check (`spec.ir.yaml` remains the primary basis).
 - `spec.ir.yaml` integrates and holds the following 5 sections:
   - `case`: the determined values of runtime input (with `sweep` already expanded).
   - `algorithm`: the structural representation of the physics algorithm (A). It requires the vocabulary `execution_mode` / `steps[]` / `ordering` / `control_condition` / `iteration_contract` / `update_semantics` / `temporaries` / `derived_field_rules` / `invariants` / `splitting_policy`.

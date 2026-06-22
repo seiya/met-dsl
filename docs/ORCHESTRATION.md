@@ -164,7 +164,7 @@ This document defines the orchestration contract — the **conductor** (`tools/w
 
 ### `Generate` launch request
 - The `skill_must_read_refs` of `Generate.generate` includes `spec.ir.yaml`. It must not read `controlled_spec.md` directly.
-- The `skill_must_read_refs` of `Generate.verify` includes `spec.ir.yaml` and, as relative paths based on `pipeline_ref`, `lineage.json` and `source/<source_id>/source_meta.json`.
+- The `skill_must_read_refs` of `Generate.verify` includes `spec.ir.yaml`, `controlled_spec.md` (verify-only requirement-fidelity cross-check; `Generate.generate` does not read it), and `tests.md`, plus — as relative paths based on `pipeline_ref` — `lineage.json` and `source/<source_id>/source_meta.json`.
 
 ### `Validate` launch request
 - The `skill_must_read_refs` of `Validate.execute` includes `spec.ir.yaml` and `pipeline_ref/binary/<binary_id>/binary_meta.json`.

@@ -99,8 +99,8 @@ When running with `--llm claude` (preflight `--backend claude`):
 3. **Fix the hierarchical execution order**: fix the execution order in ascending `spec.ir.yaml.dependency.topo_level`. The `Compile` of a parent `node` must not start until the immediate dependency `node` satisfies `direct dependency ir readiness`. `Generate` onward of a parent `node` must not start until the immediate dependency `node` satisfies `direct dependency execution readiness`. Independent `node` of the same `topo_level` are also executed sequentially one at a time.
 4. **Per-`node` workflow issuance**: the `orchestration agent` issues an individual `ir_id` and an individual `pipeline_id` per `node_key`.
 5. **Generate**: per target `node`, generate `model` and `runner` separately with the `LLM`.
-   - `Generate` must not take `controlled_spec.md` as direct input, and uses `spec.ir.yaml` as the canonical source.
-   - `Generate.verify` performs the G1–G7 verification items (see `phase_02_generate.md`) against each section of `spec.ir.yaml`.
+   - `Generate.generate` must not take `controlled_spec.md` as direct input, and uses `spec.ir.yaml` as the canonical source.
+   - `Generate.verify` performs the G1–G7 verification items (see `phase_02_generate.md`) against each section of `spec.ir.yaml`, and additionally reads `controlled_spec.md` as a secondary requirement-fidelity cross-check (`spec.ir.yaml` stays primary).
    - A `node` that has dependencies requires an implementation that calls the published `operation` of the dependency `node` resolved by `spec.ir.yaml.dependency.direct_deps`, and forbids re-implementing an equivalent function.
 6. **Build**: per target `node`, run the standard build tool that can handle dependencies via the `MCP` server's `compile_project`.
    - A `Build` failure **always becomes a retry feedback to `Generate`** (because it is a deterministic process, there is no room for fixing other than the code).
