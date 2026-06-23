@@ -18,7 +18,7 @@
  "allowed_output_paths": [
   "workspace/pipelines/component__dynamics_advdiff_flux_1d_upwind_center2__0.1.0/advdiff-flux-1d-uc2_20260620_002/binary/bin_20260620_002/bin/dynamics_advdiff_flux_1d_upwind_center2_runner",
   "workspace/pipelines/component__dynamics_advdiff_flux_1d_upwind_center2__0.1.0/advdiff-flux-1d-uc2_20260620_002/binary/bin_20260620_002/binary_meta.json",
-  "workspace/pipelines/component__dynamics_advdiff_flux_1d_upwind_center2__0.1.0/advdiff-flux-1d-uc2_20260620_002/binary/bin_20260620_002/mcp_command_log.jsonl"
+  "workspace/pipelines/component__dynamics_advdiff_flux_1d_upwind_center2__0.1.0/advdiff-flux-1d-uc2_20260620_002/binary/bin_20260620_002/command_log.jsonl"
  ],
  "issue_severity": "none",
  "repair_strategy": "none",

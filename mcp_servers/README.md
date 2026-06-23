@@ -24,7 +24,7 @@ This directory provides the implementation for running `compile` / `run` / `qual
 - The `preset=pytest` of `run_quality_checks` prepends `project_dir` to `PYTHONPATH` to ensure the reproducibility of import resolution.
 - `run_linter` allows only the `preset` specification, and forbids the execution of an arbitrary `command`.
 - `compile_project` / `run_program` / `run_quality_checks` / `run_linter` always record the executed command in `JSONL` format.
-- The default for `command_log_path` when unspecified is `<project_dir>/mcp_command_log.jsonl`.
+- The default for `command_log_path` when unspecified is `<project_dir>/command_log.jsonl`.
 - The execution result returns `command_id`, `executed_command`, and `command_log_path`, and when the log is under the repository, returns `command_log_ref`.
 
 ## MCP configuration examples
@@ -124,7 +124,7 @@ An example of `Generate`'s `static lint` (assuming `fortran`):
   "name": "run_linter",
   "arguments": {
     "project_dir": "/path/to/workspace/pipelines/<node_key_safe>/<pipeline_id>/generate/<generation_id>/src",
-    "command_log_path": "mcp_command_log.jsonl",
+    "command_log_path": "command_log.jsonl",
     "preset": "fortitude",
     "timeout_sec": 1800
   }

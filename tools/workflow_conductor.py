@@ -28,6 +28,7 @@ from __future__ import annotations
 import json
 import re
 import shlex
+import shutil
 import subprocess
 import time
 from dataclasses import dataclass, field
@@ -77,8 +78,16 @@ SUBSTEP_AWARE_PHASES: frozenset[str] = frozenset({"compile", "generate", "valida
 # check: audit/process logs whose presence/placement is not a deliverable contract
 # (the MCP command log placement in particular varies by build system).
 _OPTIONAL_OUTPUT_BASENAMES: frozenset[str] = frozenset({
-    "mcp_command_log.jsonl", "stdout.log", "stderr.log",
+    "command_log.jsonl", "stdout.log", "stderr.log",
+    "compile.stdout.log", "compile.stderr.log",
 })
+
+# Deterministic in-process build/run capture limit. The canonical per-step
+# stdout/stderr log files must be FULL (untrimmed); the MCP `_run_command` trims its
+# returned stdout/stderr to this byte budget, so we pass a large value to avoid losing
+# detail (e.g. a big compiler error dump). The runner writes its data to JSON files,
+# not stdout, so program stdout/stderr are normally tiny regardless.
+_FULL_CAPTURE_LIMIT: int = 50_000_000
 
 
 def child_agent_role(step: str) -> str:
@@ -366,11 +375,15 @@ def build_launch_request(
     agent_model: str,
     workflow_mode: str,
     case_ids: tuple[str, ...] = (),
+    evidence_artifacts: tuple[str, ...] = ("state_snapshots",),
     repair: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     """Construct the record-launch --request-json payload for one substep.
 
     case_ids is required for validate.execute (per-case raw/state_snapshots paths).
+    evidence_artifacts is the IR's required raw-evidence artifact types (validate.execute
+    only); it drives which raw/* paths are deliverables so an IR that does not require
+    state_snapshots is not forced to produce them (phase_04 §44).
     repair carries issue_severity/repair_strategy/repair_target_agent_run_id/
     repair_reason on a retry (defaults to the literal "none" the templates use).
     """
@@ -446,7 +459,7 @@ def build_launch_request(
                 f"{src}/src/{refs.spec_id}_model.f90",
                 f"{src}/src/{refs.spec_id}_runner.f90",
                 f"{src}/src/Makefile",
-                f"{src}/src/mcp_command_log.jsonl",
+                f"{src}/src/command_log.jsonl",
                 f"{src}/source_meta.json",
             ]
         else:  # verify
@@ -461,7 +474,7 @@ def build_launch_request(
                 f"{src}/src/{refs.spec_id}_model.f90",
                 f"{src}/src/{refs.spec_id}_runner.f90",
                 f"{src}/src/Makefile",
-                f"{src}/src/mcp_command_log.jsonl",
+                f"{src}/src/command_log.jsonl",
                 f"{src}/source_meta.json",
             ]
     elif step == "build":
@@ -476,7 +489,7 @@ def build_launch_request(
         req["allowed_output_paths"] = [
             f"{bdir}/bin/{refs.spec_id}_runner",
             f"{bdir}/binary_meta.json",
-            f"{bdir}/mcp_command_log.jsonl",
+            f"{bdir}/command_log.jsonl",
         ]
     elif step == "validate":
         req["run_id"] = refs.run_id
@@ -491,20 +504,25 @@ def build_launch_request(
                 f"{refs.binary_dir(refs.source_binary_id)}/binary_meta.json",
             ]
             outs = [
-                f"{rundir}/mcp_command_log.jsonl",
+                f"{rundir}/command_log.jsonl",
                 f"{rundir}/diagnostics.json",
                 f"{rundir}/perf.json",
                 f"{rundir}/trial_meta.json",
                 f"{rundir}/quality_check.json",
                 f"{rundir}/raw/metrics_basis.json",
             ]
-            for cid in case_ids:
-                outs.append(f"{rundir}/raw/state_snapshots/{cid}.json")
+            # Raw-evidence deliverables are IR-driven (phase_04 §44): only require the
+            # artifacts the IR's required_evidence declares.
+            if "state_snapshots" in evidence_artifacts:
+                for cid in case_ids:
+                    outs.append(f"{rundir}/raw/state_snapshots/{cid}.json")
+                outs.append(f"{rundir}/raw/state_snapshots/snapshot_schema.json")
+            if "execution_trace.json" in evidence_artifacts:
+                outs.append(f"{rundir}/raw/execution_trace.json")
             outs += [
-                f"{rundir}/raw/state_snapshots/snapshot_schema.json",
                 f"{rundir}/stdout.log",
                 f"{rundir}/stderr.log",
-                f"{refs.source_dir()}/src/mcp_command_log.jsonl",
+                f"{refs.source_dir()}/src/command_log.jsonl",
             ]
             req["allowed_output_paths"] = outs
         else:  # judge
@@ -877,6 +895,16 @@ class Conductor:
             sorted(c["case_id"] for c in tcs if isinstance(c, dict) and c.get("case_id"))
         )
 
+    def _read_evidence_artifacts(self, refs: NodeRefs) -> tuple[str, ...]:
+        """IR-declared required raw-evidence artifact types for validate.execute
+        allowed_output_paths. Returns the IR's actual artifacts with NO fallback so the
+        deliverable set stays identical to what `_promote_run_evidence` /
+        `_author_snapshot_schema` (which read the same `_required_evidence_artifacts`)
+        produce — a fallback here would require evidence the promoter never creates
+        (fail-closed) and violate phase_04 §44 for IRs that declare no state_snapshots."""
+        ir = _read_yaml(self.repo_root / refs.ir_ref / "spec.ir.yaml") or {}
+        return tuple(self._required_evidence_artifacts(ir))
+
     def determine_substep_status(self, refs: NodeRefs, phase: str, substep: str | None,
                                  allowed_output_paths: list[str],
                                  min_mtime: float = 0.0) -> tuple[str, list[str]]:
@@ -904,7 +932,7 @@ class Conductor:
             # DELIVERABLE outputs — not the phase required_outputs (for validate
             # those are the judge's), and not the audit/process logs whose
             # placement varies by build system (e.g. a Make build's
-            # mcp_command_log lands under source/<src>/src, not binary/<bin>) —
+            # command_log lands under source/<src>/src, not binary/<bin>) —
             # AND each was authored in this attempt (mtime >= min_mtime) so a retry
             # never passes on stale files. The downstream verify/judge certifies it.
             required = [p for p in allowed_output_paths
@@ -959,6 +987,472 @@ class Conductor:
             payload["result_summary"] = result_summary.strip()
         return payload
 
+    # -- deterministic (non-LLM) substep execution ----------------------------
+    # Build and Validate.execute are contractually non-LLM (deterministic compile /
+    # run). The conductor runs their body IN-PROCESS (no `claude -p` leaf) by reusing
+    # the build-runtime MCP tool handlers directly, then plays the child-return itself
+    # so the SAME record_launch / record-child-return / finalize_child bookkeeping
+    # applies and the executor remains a normal step/substep agent_run_id (the
+    # integrity validators pass unchanged). Only the LLM cost is removed.
+
+    def _deterministic_build_enabled(self) -> bool:
+        """Opt-in (default off) until verified by a live run; toggled via env
+        `METDSL_CONDUCTOR_DETERMINISTIC_BUILD`."""
+        return str(self.env.get("METDSL_CONDUCTOR_DETERMINISTIC_BUILD", "")).strip().lower() in {
+            "1", "true", "yes",
+        }
+
+    def _deterministic_execute_enabled(self) -> bool:
+        """Opt-in (default off); toggled via `METDSL_CONDUCTOR_DETERMINISTIC_EXECUTE`."""
+        return str(self.env.get("METDSL_CONDUCTOR_DETERMINISTIC_EXECUTE", "")).strip().lower() in {
+            "1", "true", "yes",
+        }
+
+    def _is_deterministic_substep(self, phase: str, substep: str | None) -> bool:
+        if phase == "build":
+            return self._deterministic_build_enabled()
+        if phase == "validate" and substep == "execute":
+            return self._deterministic_execute_enabled()
+        return False
+
+    def _capability_token(self, child_arid: str) -> str:
+        path = (self.repo_root / "workspace" / "orchestrations" / self.orchestration_id
+                / "capabilities" / f"{child_arid}.json")
+        cap = _read_json(path) or {}
+        token = str(cap.get("capability_token", "")).strip()
+        if not token:
+            raise RuntimeError(f"deterministic step: missing capability_token at {path}")
+        return token
+
+    @staticmethod
+    def _classify_build_failure_category(return_code: int, stderr: str) -> str:
+        """Mechanical classification per phase_03_build.md (no LLM)."""
+        s = (stderr or "").lower()
+        if "no rule to make target" in s:
+            return "make_error"
+        if "undefined reference" in s or "unresolved external" in s:
+            return "link_error"
+        return "compile_error"
+
+    @staticmethod
+    def _extract_failure_source_refs(stderr: str, src_ref: str) -> list[str]:
+        """Source paths the compiler/linker named in its error output, rebased under
+        the canonical `<src_ref>` so Generate can target only the offending files
+        (phase_03 retry trigger). Best-effort: empty when nothing parseable."""
+        names: set[str] = set()
+        for m in re.finditer(r"([\w./-]+\.(?:f90|f95|f|c|cc|cxx|cpp|h|hpp))",
+                             stderr or "", re.IGNORECASE):
+            names.add(Path(m.group(1)).name)
+        return sorted(f"{src_ref}/{n}" for n in names)
+
+    def _run_deterministic_substep(self, refs: NodeRefs, phase: str, substep: str | None,
+                                   child_arid: str, request: dict[str, Any]) -> ProcResult:
+        """Run a non-LLM substep body in-process and return a ProcResult shaped like a
+        leaf's (returncode 0 == clean conductor run; a content failure such as a
+        compile error is still rc 0 and routed via binary_meta.failure_category).
+        A nonzero rc means a conductor-side/MCP-gate failure -> transport fail_closed."""
+        try:
+            cap_token = self._capability_token(child_arid)
+            if phase == "build":
+                out = self._build_inproc(refs, child_arid, cap_token)
+            elif phase == "validate" and substep == "execute":
+                out = self._execute_inproc(refs, child_arid, cap_token)
+            else:
+                raise RuntimeError(f"no deterministic body for {phase}.{substep}")
+        except Exception as exc:  # noqa: BLE001 - surfaced as transport failure
+            return ProcResult(1, "", f"deterministic_{phase}_error: {exc}")
+        return ProcResult(int(out.get("returncode", 0)), out.get("stdout", ""), out.get("stderr", ""))
+
+    def _build_inproc(self, refs: NodeRefs, child_arid: str, cap_token: str) -> dict[str, str]:
+        """Deterministic Build: in-process compile_project + binary_meta + post_build gate."""
+        import sys as _sys
+        mcp_dir = str(self.repo_root / "mcp_servers")
+        if mcp_dir not in _sys.path:
+            _sys.path.insert(0, mcp_dir)
+        from build_runtime_server import tool_compile_project
+
+        ir = _read_yaml(self.repo_root / refs.ir_ref / "spec.ir.yaml") or {}
+        impl = (ir.get("impl_defaults") or {}) if isinstance(ir, dict) else {}
+        toolchain = (impl.get("toolchain") or {}) if isinstance(impl, dict) else {}
+        language = str(toolchain.get("language") or "fortran")
+        build_system = str(toolchain.get("build_system") or "make")
+
+        src_dir = self.repo_root / refs.source_dir() / "src"
+        bin_dir = self.repo_root / refs.binary_dir() / "bin"
+        obj_dir = self.repo_root / "workspace" / "tmp" / child_arid / "build"
+        exe = f"{refs.spec_id}_runner"
+
+        result = tool_compile_project({
+            "project_dir": str(src_dir),
+            # The MCP orchestration gate resolves the orchestration root from repo_root
+            # (defaulting to project_dir); pass our repo_root so it finds the capability.
+            "repo_root": str(self.repo_root),
+            "language": language,
+            "build_system": build_system,
+            # Only OBJDIR/BINDIR overrides (NOT BIN); see phase_03_build.md.
+            "extra_args": [f"OBJDIR={obj_dir}", f"BINDIR={bin_dir}"],
+            "capture_limit": _FULL_CAPTURE_LIMIT,
+            "orchestration_id": self.orchestration_id,
+            "agent_run_id": child_arid,
+            "capability_token": cap_token,
+        })
+        ok = bool(result.get("ok"))
+        # return_code is None on a subprocess timeout; treat that as a build failure.
+        rc = result.get("return_code") or 1
+        stdout = result.get("stdout", "") or ""
+        stderr = result.get("stderr", "") or ""
+        # A compile that reports success but did NOT produce the binary at the contract
+        # path (bin/<spec_id>_runner) means the Makefile's BIN default is non-conformant
+        # (phase_03 pins <spec_id>_runner). Treat as a build failure that regenerates the
+        # Makefile rather than writing a pass binary_meta pointing at a missing file (which
+        # desyncs from determine_substep_status -> inconsistent escalate/fail_closed).
+        binary_missing = ok and not (bin_dir / exe).is_file()
+        if binary_missing:
+            ok = False
+        # `command_log_ref` from the handler is cwd-relative (`_path_to_ref` uses
+        # Path.cwd()), which is unreliable for the in-process caller — derive it from
+        # our repo_root + the known canonical placement instead. Make's in-source build
+        # writes the log to <src>/command_log.jsonl (project_dir = src_dir).
+        command_log_ref = self._rel(src_dir / "command_log.jsonl")
+
+        # Full (untrimmed) per-step compiler logs in the binary dir (build has no
+        # canonical stdout/stderr.log otherwise — only the lean command_log audit).
+        bdir = self.repo_root / refs.binary_dir()
+        bdir.mkdir(parents=True, exist_ok=True)
+        (bdir / "compile.stdout.log").write_text(stdout, encoding="utf-8")
+        (bdir / "compile.stderr.log").write_text(stderr, encoding="utf-8")
+
+        dep = (ir.get("dependency") or {}) if isinstance(ir, dict) else {}
+        direct_deps = dep.get("direct_deps") or []
+        dep_keys = [d.get("node_key") if isinstance(d, dict) else d for d in direct_deps]
+        # The dependency-encapsulation contract (phase_03 §23-25,53) is enforced by the
+        # post_build gate below (`validate_pipeline_semantics --stage post_build` →
+        # validate_post_build_violation); binary_meta.dependency_check is metadata.
+        # `resolved` is "match" only when the build itself succeeded.
+
+        binary_meta: dict[str, Any] = {
+            "binary_id": refs.binary_id,
+            "node_key": refs.node_key,
+            "pipeline_id": refs.pipeline_id,
+            "attempt_count": 1,
+            "verification_status": "pass" if ok else "fail",
+            "last_fail_reason": "" if ok else "compile",
+            "status": "pass" if ok else "fail",
+            "validation_stage": "post_build",
+            "source_source_id": refs.source_id,
+            "build_system": build_system,
+            "compiler": result.get("compiler") or "",
+            "binary_artifact_ref": f"binary/{refs.binary_id}/bin/{exe}",
+            "command_id": result.get("command_id"),
+            "command_log_ref": command_log_ref,
+            "command_log_path": command_log_ref,
+            "build_log_ref": command_log_ref,
+            "dependency_check": {"direct_deps": dep_keys,
+                                 "resolved": "match" if ok else "unresolved"},
+            "failure_category": None,
+            "failure_source_refs": [],
+            "failure_excerpt": None,
+        }
+        if binary_missing:
+            # Makefile BIN-default defect -> restart (regenerate the Makefile).
+            binary_meta["failure_category"] = "make_error"
+            binary_meta["last_fail_reason"] = "binary_not_at_contract_path"
+            binary_meta["failure_excerpt"] = (
+                f"compile reported success but no binary at the contract path bin/{exe}; "
+                f"the Makefile BIN default must resolve to '{exe}' (phase_03_build.md)")
+            binary_meta["failure_source_refs"] = [f"{self._rel(src_dir)}/Makefile"]
+        elif not ok:
+            binary_meta["failure_category"] = self._classify_build_failure_category(rc, stderr)
+            binary_meta["failure_excerpt"] = "\n".join(stderr.splitlines()[-50:])
+            # Point Generate at the offending source(s) (phase_03 retry trigger).
+            binary_meta["failure_source_refs"] = self._extract_failure_source_refs(
+                stderr, self._rel(src_dir))
+
+        meta_path = self.repo_root / refs.binary_dir() / "binary_meta.json"
+        meta_path.parent.mkdir(parents=True, exist_ok=True)
+        meta_path.write_text(
+            json.dumps(binary_meta, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+
+        # A clean compile failure routes via binary_meta.failure_category (rc 0 here, so
+        # run_phase classifies it -> Generate). A post_build gate failure on an otherwise
+        # successful compile must NOT pass: the binary exists so the existence-based
+        # determine_substep_status would otherwise return pass — signal it via rc 1.
+        returncode = 0
+        if ok:
+            gate = subprocess.run(
+                ["python3", "tools/validate_pipeline_semantics.py", "--stage", "post_build",
+                 "--pipeline-root", refs.pipeline_ref, "--source-id", refs.source_id or ""],
+                cwd=self.repo_root, env=self.env, text=True, capture_output=True, check=False)
+            if gate.returncode != 0:
+                binary_meta.update({
+                    "verification_status": "fail", "status": "fail",
+                    "failure_category": "validate_post_build_violation",
+                    "failure_excerpt": "\n".join((gate.stdout + gate.stderr).splitlines()[-50:]),
+                })
+                meta_path.write_text(
+                    json.dumps(binary_meta, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+                stderr += "\n[post_build gate fail]\n" + gate.stdout + gate.stderr
+                returncode = 1
+        return {"returncode": returncode, "stdout": stdout, "stderr": stderr}
+
+    # -- deterministic Validate.execute (run + quality_check + evidence promote) --
+
+    @staticmethod
+    def _required_evidence_artifacts(ir: dict[str, Any]) -> list[str]:
+        """IR-declared required raw-evidence artifact types (closed set:
+        metrics_basis.json / execution_trace.json / state_snapshots)."""
+        io = (ir.get("io_contract") or {}) if isinstance(ir, dict) else {}
+        rr = (io.get("raw_requirements") or {}) if isinstance(io, dict) else {}
+        out: list[str] = []
+        for e in rr.get("required_evidence") or []:
+            if isinstance(e, dict) and e.get("required") and e.get("artifact"):
+                out.append(str(e["artifact"]))
+        return out
+
+    def _promote_run_evidence(self, run_tmp: Path, node_dir: Path,
+                              artifacts: list[str]) -> list[str]:
+        """Promote the runner's `run/` output to the canonical run node dir.
+        Selective per artifact type (NOT a blind copytree): the runner's auxiliary
+        per-case files (e.g. execution_trace_<case>.json) are deterministically dropped.
+        Returns the repo-relative raw_artifact_refs of what was promoted."""
+        node_dir.mkdir(parents=True, exist_ok=True)
+        for name in ("diagnostics.json", "perf.json"):
+            src = run_tmp / name
+            if src.exists():
+                shutil.copy2(src, node_dir / name)
+        raw_dst = node_dir / "raw"
+        raw_dst.mkdir(parents=True, exist_ok=True)
+        raw_refs: list[str] = []
+        node_ref = self._rel(node_dir)
+        mb = run_tmp / "raw" / "metrics_basis.json"
+        if mb.exists():
+            shutil.copy2(mb, raw_dst / "metrics_basis.json")
+            raw_refs.append(f"{node_ref}/raw/metrics_basis.json")
+        for art in artifacts:
+            if art == "state_snapshots":
+                sdst = raw_dst / "state_snapshots"
+                sdst.mkdir(parents=True, exist_ok=True)
+                for f in sorted((run_tmp / "raw" / "state_snapshots").glob("*.json")):
+                    shutil.copy2(f, sdst / f.name)
+                    raw_refs.append(f"{node_ref}/raw/state_snapshots/{f.name}")
+            elif art == "execution_trace.json":
+                src = run_tmp / "raw" / "execution_trace.json"
+                if src.exists():
+                    shutil.copy2(src, raw_dst / "execution_trace.json")
+                    raw_refs.append(f"{node_ref}/raw/execution_trace.json")
+        return raw_refs
+
+    def _author_snapshot_schema(self, ir: dict[str, Any], node_dir: Path) -> str | None:
+        """Author raw/state_snapshots/snapshot_schema.json from the IR schema +
+        the per-case files actually present. Deterministic (no judgment)."""
+        io = (ir.get("io_contract") or {}) if isinstance(ir, dict) else {}
+        rr = (io.get("raw_requirements") or {}) if isinstance(io, dict) else {}
+        entry = next((e for e in (rr.get("required_evidence") or [])
+                      if isinstance(e, dict) and e.get("artifact") == "state_snapshots"), None)
+        if entry is None:
+            return None
+        sdir = node_dir / "raw" / "state_snapshots"
+        if not sdir.exists():
+            return None
+        schema = entry.get("schema") or {}
+        present = {f.name for f in sdir.glob("*.json") if f.name != "snapshot_schema.json"}
+        # Order samples by IR test_case_set declaration order (fallback: sorted).
+        case = (ir.get("case") or {}) if isinstance(ir, dict) else {}
+        tcs = case.get("test_case_set") or [] if isinstance(case, dict) else []
+        ordered = [f"{c['case_id']}.json" for c in tcs
+                   if isinstance(c, dict) and c.get("case_id")
+                   and f"{c['case_id']}.json" in present]
+        samples = ordered + sorted(present - set(ordered))
+        doc = {
+            "variables": schema.get("variables", []),
+            "time_variable": schema.get("time_variable"),
+            "time_shape_expr": schema.get("time_shape_expr"),
+            "min_samples": entry.get("min_samples", 1),
+            "samples": samples,
+        }
+        (sdir / "snapshot_schema.json").write_text(
+            json.dumps(doc, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+        return f"{self._rel(node_dir)}/raw/state_snapshots/snapshot_schema.json"
+
+    @staticmethod
+    def _author_quality_check(node_dir: Path, run_diag: dict[str, Any],
+                              qc_diag: dict[str, Any], run_cmd_id: str | None,
+                              qc_cmd_id: str | None, preset: str,
+                              threads: int) -> str:
+        """quality_check.json = deterministic value-equality of run_program vs the
+        make-test re-run (per phase_04 §4-1). Returns the top-level status."""
+        def _check_map(d: dict[str, Any]) -> dict[str, Any]:
+            return {k: (v.get("status") if isinstance(v, dict) else v)
+                    for k, v in (d.get("checks") or {}).items()}
+
+        run_checks, qc_checks = _check_map(run_diag), _check_map(qc_diag)
+        run_verdict, qc_verdict = run_diag.get("verdict"), qc_diag.get("verdict")
+        verdict_available = bool(run_verdict) and bool(qc_verdict)
+        diagnostics_match = run_checks == qc_checks
+        verdict_match = run_verdict == qc_verdict
+        run_cases = {c.get("case_id"): c.get("verdict")
+                     for c in run_diag.get("cases") or [] if isinstance(c, dict)}
+        qc_cases = {c.get("case_id"): c.get("verdict")
+                    for c in qc_diag.get("cases") or [] if isinstance(c, dict)}
+        per_case = {cid: (run_cases.get(cid) == qc_cases.get(cid)) for cid in run_cases}
+        checks_match = {k: (run_checks.get(k) == qc_checks.get(k)) for k in run_checks}
+        status = "pass" if (verdict_available and diagnostics_match and verdict_match) else "fail"
+        doc = {
+            "status": status,
+            "preset": preset,
+            "checks": {
+                "verdict_available": verdict_available,
+                "diagnostics_match": diagnostics_match,
+                "verdict_match": verdict_match,
+            },
+            "comparison": {
+                "reference": {"source": "run_program", "command_id": run_cmd_id,
+                              "threads_per_rank": threads, "verdict": run_verdict},
+                "candidate": {"source": f"run_quality_checks/{preset}", "command_id": qc_cmd_id,
+                              "threads_per_rank": "make_default", "verdict": qc_verdict},
+                "diagnostics_checks_match": checks_match,
+                "per_case_verdict_match": per_case,
+            },
+            "notes": ("conductor in-process: run_program (threads_per_rank=1) and "
+                      f"{preset} re-run diagnostics checks and verdicts compared."),
+        }
+        (node_dir / "quality_check.json").write_text(
+            json.dumps(doc, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+        return status
+
+    def _rel(self, path: Path) -> str:
+        """repo-root-relative POSIX path for canonical refs."""
+        return str(path.relative_to(self.repo_root)).replace("\\", "/")
+
+    def _execute_inproc(self, refs: NodeRefs, child_arid: str, cap_token: str) -> dict[str, Any]:
+        """Deterministic Validate.execute: in-process run_program + run_quality_checks,
+        promote the runner's primary evidence to the canonical run node dir, author the
+        agent-owned metadata (snapshot_schema/quality_check/trial_meta/stdout/stderr),
+        then run the post_execute gate. The runner's evidence bytes are never authored
+        by an LLM (preserving Validate.judge's non-fabrication independence)."""
+        import sys as _sys
+        mcp_dir = str(self.repo_root / "mcp_servers")
+        if mcp_dir not in _sys.path:
+            _sys.path.insert(0, mcp_dir)
+        from build_runtime_server import tool_run_program, tool_run_quality_checks
+
+        ir = _read_yaml(self.repo_root / refs.ir_ref / "spec.ir.yaml") or {}
+        impl = (ir.get("impl_defaults") or {}) if isinstance(ir, dict) else {}
+        toolchain = (impl.get("toolchain") or {}) if isinstance(impl, dict) else {}
+        target = (impl.get("target") or {}) if isinstance(impl, dict) else {}
+        target_class = str(target.get("class") or "cpu")
+        threads = 1
+
+        node_dir = self.repo_root / refs.run_node_dir()
+        src_dir = self.repo_root / refs.source_dir() / "src"
+        bin_dir = self.repo_root / refs.binary_dir(refs.source_binary_id) / "bin"
+        exe = f"{refs.spec_id}_runner"
+        binary = (bin_dir / exe).resolve()
+        ir_spec = (self.repo_root / refs.ir_ref / "spec.ir.yaml").resolve()
+        run_tmp = self.repo_root / "workspace" / "tmp" / child_arid / "run"
+        qc_tmp = self.repo_root / "workspace" / "tmp" / child_arid / "qc_run"
+        obj_tmp = self.repo_root / "workspace" / "tmp" / child_arid / "build"
+        cmd_log = node_dir / "command_log.jsonl"
+        qc_cmd_log = src_dir / "command_log.jsonl"
+        case_ids = list(self.read_case_ids(refs))
+
+        # The runner opens raw/ paths relatively (cwd=RUNDIR); pre-create them.
+        (run_tmp / "raw" / "state_snapshots").mkdir(parents=True, exist_ok=True)
+        qc_tmp.mkdir(parents=True, exist_ok=True)
+
+        gate_args = {"orchestration_id": self.orchestration_id,
+                     "agent_run_id": child_arid, "capability_token": cap_token,
+                     # so the MCP orchestration gate resolves the right orchestration root
+                     "repo_root": str(self.repo_root)}
+
+        # 1. run_program (primary evidence) — include spec.ir.yaml.case per phase_04 §4-1.
+        res_run = tool_run_program({
+            "project_dir": str(run_tmp),
+            "command": [str(binary), "--cases", str(ir_spec), *case_ids],
+            "target": {"class": target_class},
+            "threads_per_rank": threads,
+            "command_log_path": str(cmd_log),
+            "capture_limit": _FULL_CAPTURE_LIMIT,
+            **gate_args,
+        })
+        stdout = res_run.get("stdout", "") or ""
+        stderr = res_run.get("stderr", "") or ""
+        if not res_run.get("ok"):
+            return {"returncode": 1, "stdout": stdout,
+                    "stderr": stderr + "\n[run_program failed: runtime_error]"}
+
+        # 2. run_quality_checks (make_test re-run; output to a SEPARATE tmp).
+        res_qc = tool_run_quality_checks({
+            "project_dir": str(src_dir),
+            "preset": "make_test",
+            "env": {"OBJDIR": str(obj_tmp), "BINDIR": str(bin_dir), "RUNDIR": str(qc_tmp)},
+            "command_log_path": str(qc_cmd_log),
+            "capture_limit": _FULL_CAPTURE_LIMIT,
+            **gate_args,
+        })
+
+        # 3. promote primary evidence (selective per artifact type) + author metadata.
+        artifacts = self._required_evidence_artifacts(ir)
+        raw_refs = self._promote_run_evidence(run_tmp, node_dir, artifacts)
+        schema_ref = self._author_snapshot_schema(ir, node_dir)
+        if schema_ref:
+            raw_refs.append(schema_ref)
+
+        run_diag = _read_json(run_tmp / "diagnostics.json") or {}
+        qc_diag = _read_json(qc_tmp / "diagnostics.json") or {}
+        qc_status = self._author_quality_check(
+            node_dir, run_diag, qc_diag, res_run.get("command_id"),
+            res_qc.get("command_id"), "make_test", threads)
+
+        (node_dir / "stdout.log").write_text(stdout, encoding="utf-8")
+        (node_dir / "stderr.log").write_text(stderr, encoding="utf-8")
+
+        trial_meta = {
+            "run_id": refs.run_id,
+            "node_key": refs.node_key,
+            "pipeline_id": refs.pipeline_id,
+            "source_source_id": refs.source_id,
+            "source_binary_id": refs.source_binary_id,
+            "runner_command": shlex.join([exe, "--cases", self._rel(ir_spec), *case_ids]),
+            "process_trace_ref": self._rel(cmd_log),
+            "source_command_ref": {
+                "run_program": {"tool_name": "run_program",
+                                "command_id": res_run.get("command_id"),
+                                "command_log_ref": self._rel(cmd_log)},
+                "run_quality_checks": {"tool_name": "run_quality_checks",
+                                       "command_id": res_qc.get("command_id"),
+                                       "command_log_ref": self._rel(qc_cmd_log)},
+            },
+            "raw_artifact_refs": raw_refs,
+            "environment": {
+                "target_class": target_class,
+                "backend": str(toolchain.get("backend") or "openmp"),
+                "threads_per_rank": threads,
+                "openmp_env": {"OMP_NUM_THREADS": str(threads), "OMP_THREAD_LIMIT": str(threads)},
+            },
+            "status": "pass" if qc_status == "pass" else "fail",
+        }
+        (node_dir / "trial_meta.json").write_text(
+            json.dumps(trial_meta, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+
+        # 4. gates: artifact syntax + post_execute structural check.
+        syn = subprocess.run(
+            ["python3", "tools/check_artifact_syntax.py", "--format", "json",
+             "--expect-top", "object",
+             str(node_dir / "diagnostics.json"), str(node_dir / "perf.json"),
+             str(node_dir / "quality_check.json")],
+            cwd=self.repo_root, env=self.env, text=True, capture_output=True, check=False)
+        gate = subprocess.run(
+            ["python3", "tools/validate_pipeline_semantics.py", "--stage", "post_execute",
+             "--pipeline-root", refs.pipeline_ref, "--run-id", refs.run_id or ""],
+            cwd=self.repo_root, env=self.env, text=True, capture_output=True, check=False)
+        rc = 0
+        if syn.returncode != 0 or gate.returncode != 0 or qc_status != "pass":
+            rc = 1
+            stderr += ("\n[execute gate fail]\n" + syn.stdout + syn.stderr
+                       + gate.stdout + gate.stderr)
+        return {"returncode": rc, "stdout": stdout, "stderr": stderr}
+
     def run_substep(self, refs: NodeRefs, phase: str, substep: str | None,
                     repair: dict[str, str] | None = None) -> SubstepOutcome:
         child_arid = self.new_agent_run_id()
@@ -969,38 +1463,53 @@ class Conductor:
             child_agent_run_id=child_arid,
             agent_model=self.agent_model, workflow_mode=self.workflow_mode,
             case_ids=self.read_case_ids(refs) if phase == "validate" else (),
+            evidence_artifacts=self._read_evidence_artifacts(refs) if phase == "validate"
+            else ("state_snapshots",),
             repair=repair,
         )
         rec = self.record_launch(child_arid, request)
-        # Minor-fix reuse (claude only, opt-in): resume the producer leaf's session so
-        # the repair inherits its context (and design intent) instead of cold-starting.
-        # restart stays cold (no resume) to avoid anchoring on the defective reasoning.
-        # The producer's session id == its agent_run_id (pinned via --session-id at its
-        # own launch), so it is addressable by repair_target_agent_run_id.
-        resume_session_id: str | None = None
-        if (
-            self.backend == "claude"
-            and self._reuse_resume_enabled()
-            and repair is not None
-            and repair.get("repair_strategy") == "reuse"
-        ):
-            target = str(repair.get("repair_target_agent_run_id") or "").strip()
-            if target and target != "none":
-                resume_session_id = target
         # Capture the launch instant so a producer substep only passes on outputs
         # (re)written during this child window, not stale files from a prior attempt.
         launched_at = time.time()
-        proc = self.spawn_leaf(
-            rec["launch_prompt_text"], self._child_env(child_arid),
-            session_id=child_arid, resume_session_id=resume_session_id,
-            child_arid=child_arid)
-        # Persist the leaf's verbatim stdout/stderr durably (every run, pass or
-        # fail) so the LLM's actual response — including an infra failure message
-        # such as a token-limit abort — is never lost. These conductor-side writes
-        # land in the child's bookkeeping dir (not its allowed_output_paths) and are
-        # not hook-guarded, so they don't trip the output-manifest guard.
-        self._persist_leaf_output(child_arid, proc)
-        token = self.read_parent_return_token(child_arid)
+        if self._is_deterministic_substep(phase, substep):
+            # Non-LLM step: run the body in-process and play the child-return ourselves
+            # (no `claude -p` leaf). record_launch above + record-child-return here +
+            # finalize_child below keep the executor a normal step/substep agent_run_id,
+            # so the integrity validators pass unchanged.
+            proc = self._run_deterministic_substep(refs, phase, substep, child_arid, request)
+            self._persist_leaf_output(child_arid, proc, prefix="deterministic")
+            token = self.read_parent_return_token(child_arid)
+            self.runtime([
+                "record-child-return", *self._oid_args(),
+                "--agent-run-id", child_arid, "--return-token", token,
+            ])
+        else:
+            # Minor-fix reuse (claude only, opt-in): resume the producer leaf's session so
+            # the repair inherits its context (and design intent) instead of cold-starting.
+            # restart stays cold (no resume) to avoid anchoring on the defective reasoning.
+            # The producer's session id == its agent_run_id (pinned via --session-id at its
+            # own launch), so it is addressable by repair_target_agent_run_id.
+            resume_session_id: str | None = None
+            if (
+                self.backend == "claude"
+                and self._reuse_resume_enabled()
+                and repair is not None
+                and repair.get("repair_strategy") == "reuse"
+            ):
+                target = str(repair.get("repair_target_agent_run_id") or "").strip()
+                if target and target != "none":
+                    resume_session_id = target
+            proc = self.spawn_leaf(
+                rec["launch_prompt_text"], self._child_env(child_arid),
+                session_id=child_arid, resume_session_id=resume_session_id,
+                child_arid=child_arid)
+            # Persist the leaf's verbatim stdout/stderr durably (every run, pass or
+            # fail) so the LLM's actual response — including an infra failure message
+            # such as a token-limit abort — is never lost. These conductor-side writes
+            # land in the child's bookkeeping dir (not its allowed_output_paths) and are
+            # not hook-guarded, so they don't trip the output-manifest guard.
+            self._persist_leaf_output(child_arid, proc)
+            token = self.read_parent_return_token(child_arid)
         status, output_refs = self.determine_substep_status(
             refs, phase, substep, request["allowed_output_paths"], min_mtime=launched_at)
         # A nonzero leaf exit (crash / transport failure) fails the substep even if
@@ -1377,7 +1886,7 @@ def phase_required_outputs(refs: NodeRefs, phase: str) -> list[str]:
         return [
             f"{bdir}/bin/{refs.spec_id}_runner",
             f"{bdir}/binary_meta.json",
-            f"{refs.source_dir()}/src/mcp_command_log.jsonl",
+            f"{refs.source_dir()}/src/command_log.jsonl",
         ]
     if phase == "validate":
         rundir = refs.run_node_dir()

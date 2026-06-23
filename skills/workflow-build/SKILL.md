@@ -5,6 +5,8 @@ description: Use this when running the Build stage and building a `source` artif
 
 # Workflow Build
 
+> **Execution mode.** This procedure runs either as a leaf `step agent` (default) or, when `METDSL_CONDUCTOR_DETERMINISTIC_BUILD` is set, **in-process by the conductor** (no leaf). The I/O contract — `compile_project` via MCP, out-of-source `OBJDIR`/`BINDIR` overrides (no `BIN`), `binary_meta.json`, `command_log.jsonl`, and the `post_build` gate — is identical in both modes; the conductor path additionally writes full `compile.stdout.log` / `compile.stderr.log`. See [`docs/workflow/phases/phase_03_build.md`](../../docs/workflow/phases/phase_03_build.md) "Deterministic conductor execution".
+
 ## Purpose
 Fix the execution responsibility of the Build stage, and generate a reproducible build artifact.
 
@@ -24,9 +26,9 @@ Fix the execution responsibility of the Build stage, and generate a reproducible
 - `binary_meta.json#binary_artifact_ref` points to the canonical placement of the execution binary `<pipeline>/binary/<binary_id>/bin/<exe>` (the out-of-source `BINDIR` output. It must not point under `src/`. The `run_program` input verification of `Validate.execute` requires resolution under `binary/<binary_id>/bin/`).
 - On failure, record `failure_category` / `failure_source_refs[]` / `failure_excerpt` in `binary_meta.json` as required (the "retry trigger (no LLM involvement)" section of `docs/workflow/phases/phase_03_build.md` is the canonical source). `failure_category` is one of `compile_error` / `link_error` / `make_error` / `dependency_violation` / `validate_post_build_violation`.
 - The MCP `command_log` output of `compile_project` allows only the following 2 canonical placements:
-  - In-source build (Make for Fortran/C/cpp/mixed): `<pipeline>/source/<source_id>/src/mcp_command_log.jsonl` (cross-phase, project_dir=`<src>/src/`). Always include `source_id` in the launch request and pass it through record_launch (a failed/stale source is rejected by record_launch's verification_status check).
-  - Out-of-source build (CMake/Meson/Ninja): `<pipeline>/binary/<binary_id>/mcp_command_log.jsonl` (in-phase, project_dir=`<binary_id>/`).
-  A composition where the log lands in a non-canonical placement (e.g. `<binary_id>/bin/mcp_command_log.jsonl`) becomes an `unauthorized_write_violation` in terminal validation.
+  - In-source build (Make for Fortran/C/cpp/mixed): `<pipeline>/source/<source_id>/src/command_log.jsonl` (cross-phase, project_dir=`<src>/src/`). Always include `source_id` in the launch request and pass it through record_launch (a failed/stale source is rejected by record_launch's verification_status check).
+  - Out-of-source build (CMake/Meson/Ninja): `<pipeline>/binary/<binary_id>/command_log.jsonl` (in-phase, project_dir=`<binary_id>/`).
+  A composition where the log lands in a non-canonical placement (e.g. `<binary_id>/bin/command_log.jsonl`) becomes an `unauthorized_write_violation` in terminal validation.
 - The output `bin/` has a relative placement that `Validate.execute` can reference.
 - The storage root for workflow artifacts allows only `workspace/`, and the workflow-root judgment targets only `workspace/`.
 

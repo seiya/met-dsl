@@ -19,7 +19,7 @@
   "workspace/pipelines/component__dynamics_advdiff_flux_1d_upwind_center2__0.1.0/advdiff-flux-1d-uc2_20260620_001/source/src_20260620_001/src/dynamics_advdiff_flux_1d_upwind_center2_model.f90",
   "workspace/pipelines/component__dynamics_advdiff_flux_1d_upwind_center2__0.1.0/advdiff-flux-1d-uc2_20260620_001/source/src_20260620_001/src/dynamics_advdiff_flux_1d_upwind_center2_runner.f90",
   "workspace/pipelines/component__dynamics_advdiff_flux_1d_upwind_center2__0.1.0/advdiff-flux-1d-uc2_20260620_001/source/src_20260620_001/src/Makefile",
-  "workspace/pipelines/component__dynamics_advdiff_flux_1d_upwind_center2__0.1.0/advdiff-flux-1d-uc2_20260620_001/source/src_20260620_001/src/mcp_command_log.jsonl",
+  "workspace/pipelines/component__dynamics_advdiff_flux_1d_upwind_center2__0.1.0/advdiff-flux-1d-uc2_20260620_001/source/src_20260620_001/src/command_log.jsonl",
   "workspace/pipelines/component__dynamics_advdiff_flux_1d_upwind_center2__0.1.0/advdiff-flux-1d-uc2_20260620_001/source/src_20260620_001/source_meta.json"
  ],
  "issue_severity": "none",

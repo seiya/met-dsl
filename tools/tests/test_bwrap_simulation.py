@@ -246,7 +246,7 @@ class BwrapBuildPathSimulationTests(unittest.TestCase):
             allowed_output_paths=[self.BINARY_ROOT + "bin_001/binary_meta.json"],
             allowed_file_tool_paths=[],
             allowed_tmp_root=f"workspace/tmp/{arid}",
-            mcp_owned_audit_logs=[self.SRC_DIR + "mcp_command_log.jsonl"])
+            mcp_owned_audit_logs=[self.SRC_DIR + "command_log.jsonl"])
 
     def _leaf_script(self, arid: str) -> str:
         return textwrap.dedent(f"""
@@ -276,7 +276,7 @@ class BwrapBuildPathSimulationTests(unittest.TestCase):
                 report("BINARY_META", False, repr(e))
             # cross-phase MCP command log -> source/<id>/src/ (outside write_roots, a read input)
             try:
-                Path(f"{{PIPE}}/source/src_001/src/mcp_command_log.jsonl").write_text("{{}}\\n")
+                Path(f"{{PIPE}}/source/src_001/src/command_log.jsonl").write_text("{{}}\\n")
                 report("XPHASE_MCP_LOG", True)
             except Exception as e:
                 report("XPHASE_MCP_LOG", False, repr(e))

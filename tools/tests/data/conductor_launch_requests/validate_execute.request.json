@@ -18,7 +18,7 @@
  "skill_ref": "skills/workflow-validate-execute/SKILL.md",
  "skill_must_read_refs": "skills/workflow-validate-execute/SKILL.md,docs/workflow/WORKFLOW_CORE.md,docs/AGENT_CONTRACT.md,docs/workflow/phases/phase_04_validate.md,workspace/ir/component__dynamics_advdiff_flux_1d_upwind_center2__0.1.0/advdiff-flux-1d-uc2_20260620_001/spec.ir.yaml,workspace/pipelines/component__dynamics_advdiff_flux_1d_upwind_center2__0.1.0/advdiff-flux-1d-uc2_20260620_002/source/src_20260620_002/source_meta.json,workspace/pipelines/component__dynamics_advdiff_flux_1d_upwind_center2__0.1.0/advdiff-flux-1d-uc2_20260620_002/binary/bin_20260620_003/binary_meta.json",
  "allowed_output_paths": [
-  "workspace/pipelines/component__dynamics_advdiff_flux_1d_upwind_center2__0.1.0/advdiff-flux-1d-uc2_20260620_002/runs/run_20260620_003/component__dynamics_advdiff_flux_1d_upwind_center2__0.1.0/mcp_command_log.jsonl",
+  "workspace/pipelines/component__dynamics_advdiff_flux_1d_upwind_center2__0.1.0/advdiff-flux-1d-uc2_20260620_002/runs/run_20260620_003/component__dynamics_advdiff_flux_1d_upwind_center2__0.1.0/command_log.jsonl",
   "workspace/pipelines/component__dynamics_advdiff_flux_1d_upwind_center2__0.1.0/advdiff-flux-1d-uc2_20260620_002/runs/run_20260620_003/component__dynamics_advdiff_flux_1d_upwind_center2__0.1.0/diagnostics.json",
   "workspace/pipelines/component__dynamics_advdiff_flux_1d_upwind_center2__0.1.0/advdiff-flux-1d-uc2_20260620_002/runs/run_20260620_003/component__dynamics_advdiff_flux_1d_upwind_center2__0.1.0/perf.json",
   "workspace/pipelines/component__dynamics_advdiff_flux_1d_upwind_center2__0.1.0/advdiff-flux-1d-uc2_20260620_002/runs/run_20260620_003/component__dynamics_advdiff_flux_1d_upwind_center2__0.1.0/trial_meta.json",
@@ -30,7 +30,7 @@
   "workspace/pipelines/component__dynamics_advdiff_flux_1d_upwind_center2__0.1.0/advdiff-flux-1d-uc2_20260620_002/runs/run_20260620_003/component__dynamics_advdiff_flux_1d_upwind_center2__0.1.0/raw/state_snapshots/snapshot_schema.json",
   "workspace/pipelines/component__dynamics_advdiff_flux_1d_upwind_center2__0.1.0/advdiff-flux-1d-uc2_20260620_002/runs/run_20260620_003/component__dynamics_advdiff_flux_1d_upwind_center2__0.1.0/stdout.log",
   "workspace/pipelines/component__dynamics_advdiff_flux_1d_upwind_center2__0.1.0/advdiff-flux-1d-uc2_20260620_002/runs/run_20260620_003/component__dynamics_advdiff_flux_1d_upwind_center2__0.1.0/stderr.log",
-  "workspace/pipelines/component__dynamics_advdiff_flux_1d_upwind_center2__0.1.0/advdiff-flux-1d-uc2_20260620_002/source/src_20260620_002/src/mcp_command_log.jsonl"
+  "workspace/pipelines/component__dynamics_advdiff_flux_1d_upwind_center2__0.1.0/advdiff-flux-1d-uc2_20260620_002/source/src_20260620_002/src/command_log.jsonl"
  ],
  "issue_severity": "none",
  "repair_strategy": "none",

@@ -89,7 +89,7 @@ def _maybe_enforce_orchestration_mcp_gate(
     )
 SERVER_VERSION = "0.1.0"
 DEFAULT_PROTOCOL_VERSION = "2024-11-05"
-DEFAULT_COMMAND_LOG_FILE = "mcp_command_log.jsonl"
+DEFAULT_COMMAND_LOG_FILE = "command_log.jsonl"
 
 FORTRAN_C_FAMILY = {
     "fortran",

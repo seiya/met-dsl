@@ -164,7 +164,7 @@ def _create_minimal_execution_tree(
     snapshots_dir = raw_dir / "state_snapshots"
     src_dir = pipeline_dir / "source" / "src_20260415_001" / "src"
     # Canonical placement for in-phase MCP audit log: sibling of trial_meta.
-    log_path = node_dir / "mcp_command_log.jsonl"
+    log_path = node_dir / "command_log.jsonl"
 
     _write_json(
         pipeline_dir / "lineage.json",
@@ -177,7 +177,7 @@ def _create_minimal_execution_tree(
     )
     lint_command_id = "lint_cmd_fixture_001"
     rel_lint_log = (
-        f"workspace/pipelines/{node_safe}/{pipeline_id}/source/src_20260415_001/src/mcp_command_log.jsonl"
+        f"workspace/pipelines/{node_safe}/{pipeline_id}/source/src_20260415_001/src/command_log.jsonl"
     )
     if dependency_resolved is None:
         dependency_resolved = {
@@ -430,7 +430,7 @@ shallow_water2d_runner.o: shallow_water2d_runner.f90 shallow_water2d_model.mod
 """
     (src_dir / "Makefile").write_text(makefile_text, encoding="utf-8")
 
-    (src_dir / "mcp_command_log.jsonl").write_text(
+    (src_dir / "command_log.jsonl").write_text(
         json.dumps(
             {
                 "command_id": lint_command_id,
@@ -3770,12 +3770,12 @@ end program shallow_water2d_runner
             trial_meta_path = node_dir / "trial_meta.json"
             trial_meta = json.loads(trial_meta_path.read_text(encoding="utf-8"))
             # run_quality_checks canonical placement: cross-phase under
-            # generate/<gen>/src/mcp_command_log.jsonl. Append to the existing
+            # generate/<gen>/src/command_log.jsonl. Append to the existing
             # canonical log written by the fixture.
             qc_log_ref = (
                 "workspace/pipelines/problem__shallow_water2d__0.3.0/"
                 "shallow-water2d_20260415_001/source/src_20260415_001/src/"
-                "mcp_command_log.jsonl"
+                "command_log.jsonl"
             )
             trial_meta["source_command_ref"]["run_quality_checks"] = {
                 "command_id": "cmd_quality_001",
@@ -3857,7 +3857,7 @@ end program shallow_water2d_runner
             qc_log_ref = (
                 "workspace/pipelines/problem__shallow_water2d__0.3.0/"
                 "shallow-water2d_20260415_001/source/src_20260415_001/src/"
-                "mcp_command_log.jsonl"
+                "command_log.jsonl"
             )
             trial_meta["source_command_ref"]["run_quality_checks"] = {
                 "command_id": "cmd_quality_001",
@@ -3952,7 +3952,7 @@ shallow_water2d_runner.o: shallow_water2d_runner.f90 shallow_water2d_model.mod
             qc_log_ref = (
                 "workspace/pipelines/problem__shallow_water2d__0.3.0/"
                 "shallow-water2d_20260415_001/source/src_20260415_001/src/"
-                "mcp_command_log.jsonl"
+                "command_log.jsonl"
             )
             trial_meta["source_command_ref"]["run_quality_checks"] = {
                 "command_id": "cmd_quality_001",
@@ -4022,7 +4022,7 @@ end program shallow_water2d_runner
             )
             trial_meta_path = node_dir / "trial_meta.json"
             trial_meta = json.loads(trial_meta_path.read_text(encoding="utf-8"))
-            outside_log = repo_root / "mcp_command_log.jsonl"
+            outside_log = repo_root / "command_log.jsonl"
             outside_log.write_text(
                 json.dumps(
                     {
@@ -4035,7 +4035,7 @@ end program shallow_water2d_runner
                 + "\n",
                 encoding="utf-8",
             )
-            trial_meta["source_command_ref"]["run_threads_1"]["command_log_ref"] = "mcp_command_log.jsonl"
+            trial_meta["source_command_ref"]["run_threads_1"]["command_log_ref"] = "command_log.jsonl"
             _write_json(trial_meta_path, trial_meta)
 
             violations = validate(repo_root=repo_root, workspace_root="workspace")
@@ -6306,7 +6306,7 @@ shallow_water2d_runner.o: shallow_water2d_runner.f90 shallow_water2d_model.mod
                 / "problem__shallow_water2d__0.3.0"
                 / "shallow-water2d_20260415_001"
             )
-            log_path = pipeline_dir / "source" / "src_20260415_001" / "src" / "mcp_command_log.jsonl"
+            log_path = pipeline_dir / "source" / "src_20260415_001" / "src" / "command_log.jsonl"
             log_path.write_text(
                 json.dumps(
                     {
@@ -6349,7 +6349,7 @@ shallow_water2d_runner.o: shallow_water2d_runner.f90 shallow_water2d_model.mod
                 / "problem__shallow_water2d__0.3.0"
                 / "shallow-water2d_20260415_001"
             )
-            log_path = pipeline_dir / "source" / "src_20260415_001" / "src" / "mcp_command_log.jsonl"
+            log_path = pipeline_dir / "source" / "src_20260415_001" / "src" / "command_log.jsonl"
             log_path.write_text(
                 json.dumps(
                     {
@@ -6378,11 +6378,11 @@ shallow_water2d_runner.o: shallow_water2d_runner.f90 shallow_water2d_model.mod
     def test_validate_post_generate_stage_rejects_noncanonical_lint_command_log_ref(self) -> None:
         """Defense against forged MCP execution evidence at non-canonical paths.
 
-        A child agent that writes a forged mcp_command_log.jsonl at a non-
-        canonical placement (e.g. <gen>/src/notes/mcp_command_log.jsonl) and
+        A child agent that writes a forged command_log.jsonl at a non-
+        canonical placement (e.g. <gen>/src/notes/command_log.jsonl) and
         points lint_command_ref.run_linter[].command_log_ref at it must be
         rejected by the post_generate validator. The canonical placement is
-        <gen>/src/mcp_command_log.jsonl (sibling of model/runner sources).
+        <gen>/src/command_log.jsonl (sibling of model/runner sources).
         """
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
@@ -6408,7 +6408,7 @@ shallow_water2d_runner.o: shallow_water2d_runner.f90 shallow_water2d_model.mod
                 / "src_20260415_001"
                 / "src"
                 / "notes"
-                / "mcp_command_log.jsonl"
+                / "command_log.jsonl"
             )
             forged_log.parent.mkdir(parents=True, exist_ok=True)
             forged_log.write_text(
@@ -6432,7 +6432,7 @@ shallow_water2d_runner.o: shallow_water2d_runner.f90 shallow_water2d_model.mod
             forged_ref = (
                 "workspace/pipelines/problem__shallow_water2d__0.3.0/"
                 "shallow-water2d_20260415_001/source/src_20260415_001/src/"
-                "notes/mcp_command_log.jsonl"
+                "notes/command_log.jsonl"
             )
             meta["lint_command_ref"]["run_linter"][0]["command_log_ref"] = forged_ref
             meta_path.write_text(
@@ -6485,7 +6485,7 @@ shallow_water2d_runner.o: shallow_water2d_runner.f90 shallow_water2d_model.mod
             )
             # Replace the canonical log with a compile_project record (wrong
             # tool for the run_program slot the fixture's trial_meta declares).
-            log_path = node_dir / "mcp_command_log.jsonl"
+            log_path = node_dir / "command_log.jsonl"
             log_path.write_text(
                 json.dumps(
                     {
@@ -6549,7 +6549,7 @@ shallow_water2d_runner.o: shallow_water2d_runner.f90 shallow_water2d_model.mod
             )
             # Overwrite the canonical log file with a record that has no
             # tool_name field — only command_id.
-            log_path = node_dir / "mcp_command_log.jsonl"
+            log_path = node_dir / "command_log.jsonl"
             log_path.write_text(
                 json.dumps(
                     {
@@ -6683,7 +6683,7 @@ shallow_water2d_runner.o: shallow_water2d_runner.f90 shallow_water2d_model.mod
             # Rewrite the log record's cwd to point at the sibling bin/, but
             # leave trial_meta.source_build_id pointing at the (declared)
             # canonical fixture build.
-            log_path = node_dir / "mcp_command_log.jsonl"
+            log_path = node_dir / "command_log.jsonl"
             recs = [
                 json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines() if line.strip()
             ]
@@ -6729,7 +6729,7 @@ shallow_water2d_runner.o: shallow_water2d_runner.f90 shallow_water2d_model.mod
             trial_meta_path = node_dir / "trial_meta.json"
             trial_meta = json.loads(trial_meta_path.read_text(encoding="utf-8"))
             cmd_id = trial_meta["source_command_ref"]["run_threads_1"]["command_id"]
-            log_path = node_dir / "mcp_command_log.jsonl"
+            log_path = node_dir / "command_log.jsonl"
             log_path.write_text(
                 json.dumps(
                     {
@@ -6757,7 +6757,7 @@ shallow_water2d_runner.o: shallow_water2d_runner.f90 shallow_water2d_model.mod
         """source_source_id must point to a generation in pass state.
 
         Pointing trial_meta at a failed/stale generation under the same
-        pipeline (even with a valid mcp_command_log.jsonl) must be rejected,
+        pipeline (even with a valid command_log.jsonl) must be rejected,
         otherwise stale evidence credits the current execute run.
         """
         with tempfile.TemporaryDirectory() as tmp:
@@ -6799,9 +6799,9 @@ shallow_water2d_runner.o: shallow_water2d_runner.f90 shallow_water2d_model.mod
             stale_log_ref = (
                 f"workspace/pipelines/problem__shallow_water2d__0.3.0/"
                 f"shallow-water2d_20260415_001/source/{stale_gen_id}/src/"
-                "mcp_command_log.jsonl"
+                "command_log.jsonl"
             )
-            (stale_src / "mcp_command_log.jsonl").write_text(
+            (stale_src / "command_log.jsonl").write_text(
                 json.dumps(
                     {
                         "command_id": "cmd_quality_stale",
@@ -6874,9 +6874,9 @@ shallow_water2d_runner.o: shallow_water2d_runner.f90 shallow_water2d_model.mod
             sibling_log_ref = (
                 f"workspace/pipelines/problem__shallow_water2d__0.3.0/"
                 f"shallow-water2d_20260415_001/source/{sibling_gen_id}/src/"
-                "mcp_command_log.jsonl"
+                "command_log.jsonl"
             )
-            (sibling_src / "mcp_command_log.jsonl").write_text(
+            (sibling_src / "command_log.jsonl").write_text(
                 json.dumps(
                     {
                         "command_id": "cmd_quality_sibling",
@@ -7104,17 +7104,17 @@ shallow_water2d_runner.o: shallow_water2d_runner.f90 shallow_water2d_model.mod
                 "run_linter": [
                     {
                         "command_id": "a",
-                        "command_log_ref": "workspace/pipelines/x/y/z/mcp_command_log.jsonl",
+                        "command_log_ref": "workspace/pipelines/x/y/z/command_log.jsonl",
                         "preset": "fortitude",
                     },
                     {
                         "command_id": "b",
-                        "command_log_ref": "workspace/pipelines/x/y/z/mcp_command_log.jsonl",
+                        "command_log_ref": "workspace/pipelines/x/y/z/command_log.jsonl",
                         "preset": "fortitude",
                     },
                     {
                         "command_id": "c",
-                        "command_log_ref": "workspace/pipelines/x/y/z/mcp_command_log.jsonl",
+                        "command_log_ref": "workspace/pipelines/x/y/z/command_log.jsonl",
                         "preset": "cppcheck",
                     },
                 ]
@@ -8080,6 +8080,38 @@ class FortranMakefileObjdirPrefixTest(unittest.TestCase):
         self.assertEqual(
             [], violations, f"in-source bare Makefile must stay valid; got: {violations}"
         )
+
+
+class MakefileBinDefaultTest(unittest.TestCase):
+    """post_generate gate: the Makefile BIN default must resolve to <spec_id>_runner
+    (the runner source stem). A divergent BIN (e.g. `BIN=$(SPEC)` without the _runner
+    suffix, or a short slug) links the binary at a path Build/Validate.execute do not
+    expect — caught at Generate so it regenerates rather than failing Build."""
+
+    _MODEL = "module foo_model\nimplicit none\nend module foo_model\n"
+    _RUNNER = "program foo_runner\nimplicit none\nend program foo_runner\n"
+
+    def _bin_violations(self, bin_line: str) -> list[str]:
+        with tempfile.TemporaryDirectory() as tmp:
+            src = Path(tmp)
+            (src / "foo_model.f90").write_text(self._MODEL, encoding="utf-8")
+            (src / "foo_runner.f90").write_text(self._RUNNER, encoding="utf-8")  # -> foo_runner
+            (src / "Makefile").write_text(
+                f"SPEC = foo\nOBJDIR ?= .\nBINDIR ?= .\n{bin_line}\nall: $(BINDIR)/$(BIN)\n",
+                encoding="utf-8")
+            violations: list[str] = []
+            _validate_fortran_makefile_src_dir(src, violations)
+            return [v for v in violations if "BIN default resolves" in v]
+
+    def test_conformant_bin_passes(self) -> None:
+        self.assertEqual(self._bin_violations("BIN = foo_runner"), [])
+
+    def test_bin_missing_runner_suffix_flagged(self) -> None:
+        v = self._bin_violations("BIN = $(SPEC)")  # resolves to 'foo'
+        self.assertTrue(v and "'foo'" in v[0] and "foo_runner" in v[0])
+
+    def test_bin_slug_flagged(self) -> None:
+        self.assertTrue(self._bin_violations("BIN = myslug"))
 
 
 class MakefileTestNoRelinkTest(unittest.TestCase):

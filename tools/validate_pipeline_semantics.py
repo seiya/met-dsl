@@ -1414,6 +1414,26 @@ def _validate_fortran_makefile_src_dir(src_dir: Path, violations: list[str]) -> 
         return
 
     makefile_text = makefile_path.read_text(encoding="utf-8", errors="ignore")
+
+    # The execution binary basename must default to `<spec_id>_runner` (phase_03 §10).
+    # Build and Validate.execute resolve `bin/<spec_id>_runner` via the shared launch
+    # `allowed_output_paths`, so a Makefile whose `BIN` default diverges (e.g.
+    # `BIN = $(SPEC)` without the `_runner` suffix, or a short slug) links the binary at
+    # the wrong path and fails Build with no actionable category. Enforce it here so the
+    # divergence is caught as a Generate defect (regenerate) rather than surfacing at Build.
+    _runner_srcs = [p for p in src_files if p.stem.endswith("_runner")]
+    if _runner_srcs:
+        _expected_bin = _runner_srcs[0].stem  # <spec_id>_runner
+        _resolved_bin = _normalize_make_token(
+            _expand_make_vars("$(BIN)", _makefile_full_var_map(makefile_text))
+        )
+        if _resolved_bin and "$" not in _resolved_bin and _resolved_bin != _expected_bin:
+            violations.append(
+                f"{makefile_path}: BIN default resolves to '{_resolved_bin}' but must be "
+                f"'{_expected_bin}' (phase_03_build.md: the execution binary basename is "
+                f"the Makefile BIN default `<spec_id>_runner`)"
+            )
+
     rules = _parse_makefile_rules(makefile_text)
     # Directory-prefix-aware view: detects a prerequisite whose `$(OBJDIR)/`
     # prefix structure disagrees with its producing object rule. The basename
@@ -2511,7 +2531,7 @@ def _subtree_has_any_file(root: Path) -> bool:
     (rather than a fixed marker set) covers every documented output: diagnostics
     / perf / verdict / summary / semantic_review / trial_meta / quality_check /
     validate_meta, raw evidence (metrics_basis, execution_trace, state_snapshots,
-    snapshot_schema), stdout/stderr logs, and mcp_command_log — plus any future
+    snapshot_schema), stdout/stderr logs, and command_log — plus any future
     additions. Recursive so legacy nested ``<kind>/<spec>/`` layouts are caught.
     """
     for path in root.rglob("*"):
@@ -2582,7 +2602,7 @@ def _validate_run_node_dir_names(
     non-canonical artifact directory would be silently ignored and could pass
     validation whenever a canonical execution also exists. Content detection is
     general (``_subtree_has_any_file``) so every documented Validate output —
-    including judge-only outputs, logs, mcp_command_log, validate_meta, and raw
+    including judge-only outputs, logs, command_log, validate_meta, and raw
     evidence — and legacy nested (``<kind>/<spec>/``) layouts are all covered.
     """
     for pipeline_dir in _pipeline_targets(workspace_root, pipeline_roots):
@@ -2826,14 +2846,14 @@ def _validate_ir_meta_json(ir_dir: Path, violations: list[str]) -> None:
             )
 
 
-_MCP_AUDIT_LOG_BASENAME: str = "mcp_command_log.jsonl"
+_MCP_AUDIT_LOG_BASENAME: str = "command_log.jsonl"
 
 
 def _canonical_mcp_log_refs_for_lint(meta_path: Path, repo_root: Path) -> set[str]:
     """Canonical command_log_ref placements for `source_meta.json` lint validation.
 
     Only one canonical placement: sibling under `<gen_dir>/src/`. A child agent
-    that writes a forged mcp_command_log.jsonl elsewhere and points the
+    that writes a forged command_log.jsonl elsewhere and points the
     `lint_command_ref.run_linter[].command_log_ref` at it should be rejected.
     """
     parent = meta_path.parent

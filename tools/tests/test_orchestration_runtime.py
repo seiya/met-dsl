@@ -2414,7 +2414,7 @@ shell_tool                       stable             true
         )
 
     def test_allowed_output_paths_auto_injects_mcp_command_log(self) -> None:
-        """Generate step launches must auto-inject <gen>/src/mcp_command_log.jsonl."""
+        """Generate step launches must auto-inject <gen>/src/command_log.jsonl."""
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
             src_id = "src_20260510_001"
@@ -2427,7 +2427,7 @@ shell_tool                       stable             true
                 allowed_output_paths=[src_dir],
             )
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-            log_path = f"{src_dir}mcp_command_log.jsonl"
+            log_path = f"{src_dir}command_log.jsonl"
             self.assertIn(log_path, manifest["allowed_output_paths"])
 
     def test_auto_inject_idempotent_when_already_listed(self) -> None:
@@ -2436,7 +2436,7 @@ shell_tool                       stable             true
             repo_root = Path(tmp)
             src_id = "src_20260510_002"
             src_dir = f"{_FIX_PIPE_REF}/source/{src_id}/src/"
-            log_path = f"{src_dir}mcp_command_log.jsonl"
+            log_path = f"{src_dir}command_log.jsonl"
             manifest_path = self._record_generate_launch_with_outputs(
                 repo_root=repo_root,
                 orchestration_id="orch_001",
@@ -2462,7 +2462,7 @@ shell_tool                       stable             true
                 allowed_output_paths=[src_file],
             )
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-            expected = f"{_FIX_PIPE_REF}/source/{src_id}/src/mcp_command_log.jsonl"
+            expected = f"{_FIX_PIPE_REF}/source/{src_id}/src/command_log.jsonl"
             self.assertIn(expected, manifest["allowed_output_paths"])
 
     def test_auto_inject_skipped_when_no_src_entry(self) -> None:
@@ -2485,7 +2485,7 @@ shell_tool                       stable             true
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
             for p in manifest["allowed_output_paths"]:
                 self.assertFalse(
-                    p.endswith("mcp_command_log.jsonl"),
+                    p.endswith("command_log.jsonl"),
                     f"unexpected auto-inject without src/ entry: {p}",
                 )
 
@@ -2577,10 +2577,10 @@ shell_tool                       stable             true
         src_id = "src_make_build_001"
         binary_id = "build-make_20260101_001"
         cross_log = (
-            f"{_FIX_PIPE_REF}/source/{src_id}/src/mcp_command_log.jsonl"
+            f"{_FIX_PIPE_REF}/source/{src_id}/src/command_log.jsonl"
         )
         in_phase_log = (
-            f"{_FIX_PIPE_REF}/binary/{binary_id}/mcp_command_log.jsonl"
+            f"{_FIX_PIPE_REF}/binary/{binary_id}/command_log.jsonl"
         )
         req = {
             "agent_role": "step",
@@ -2624,10 +2624,10 @@ shell_tool                       stable             true
         src_id = "src_cmake_001"
         binary_id = "build-cmake_20260101_001"
         cross_log = (
-            f"{_FIX_PIPE_REF}/source/{src_id}/src/mcp_command_log.jsonl"
+            f"{_FIX_PIPE_REF}/source/{src_id}/src/command_log.jsonl"
         )
         in_phase_log = (
-            f"{_FIX_PIPE_REF}/binary/{binary_id}/mcp_command_log.jsonl"
+            f"{_FIX_PIPE_REF}/binary/{binary_id}/command_log.jsonl"
         )
         req = {
             "agent_role": "step",
@@ -3718,7 +3718,7 @@ shell_tool                       stable             true
     def test_auto_inject_log_excluded_from_allowed_file_tool_paths(self) -> None:
         """Auto-injected MCP audit log must not become directly Edit/Write-eligible.
 
-        validate_pipeline_semantics.py reads mcp_command_log.jsonl as the source
+        validate_pipeline_semantics.py reads command_log.jsonl as the source
         of truth that MCP run_linter actually executed. Direct file-tool writes
         would let a child forge ok=true entries and bypass static-lint
         verification.
@@ -3735,12 +3735,12 @@ shell_tool                       stable             true
                 allowed_output_paths=[src_dir],
             )
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-            log_path = f"{src_dir}mcp_command_log.jsonl"
+            log_path = f"{src_dir}command_log.jsonl"
             self.assertIn(log_path, manifest["allowed_output_paths"])
             self.assertNotIn(log_path, manifest["allowed_file_tool_paths"])
             for p in manifest["allowed_file_tool_paths"]:
                 self.assertFalse(
-                    p.endswith("mcp_command_log.jsonl"),
+                    p.endswith("command_log.jsonl"),
                     f"integrity-protected log leaked into allowed_file_tool_paths: {p}",
                 )
 
@@ -3749,7 +3749,7 @@ shell_tool                       stable             true
         from tools.orchestration_runtime import _allowed_file_tool_paths_for_launch
 
         log_path = (
-            f"{_FIX_PIPE_REF}/source/src_20260510_008/src/mcp_command_log.jsonl"
+            f"{_FIX_PIPE_REF}/source/src_20260510_008/src/command_log.jsonl"
         )
         req = {
             "agent_role": "step",
@@ -3765,7 +3765,7 @@ shell_tool                       stable             true
             )
 
     def test_noncanonical_mcp_log_basename_remains_writable(self) -> None:
-        """Files with the basename mcp_command_log.jsonl at NON-canonical paths
+        """Files with the basename command_log.jsonl at NON-canonical paths
         (e.g. nested under src/subdir/) must be treated as ordinary outputs:
         Edit/Write-eligible and not protected as MCP-owned. The canonical
         placement under <gen>/src/ is still classified MCP-owned, but a
@@ -3778,10 +3778,10 @@ shell_tool                       stable             true
 
         src_id = "src_20260510_009"
         canonical_path = (
-            f"{_FIX_PIPE_REF}/source/{src_id}/src/mcp_command_log.jsonl"
+            f"{_FIX_PIPE_REF}/source/{src_id}/src/command_log.jsonl"
         )
         noncanonical_path = (
-            f"{_FIX_PIPE_REF}/source/{src_id}/src/notes/mcp_command_log.jsonl"
+            f"{_FIX_PIPE_REF}/source/{src_id}/src/notes/command_log.jsonl"
         )
         req = {
             "agent_role": "step",
@@ -3812,7 +3812,7 @@ shell_tool                       stable             true
         self.assertNotIn(canonical_path, out2)
 
     def test_build_phase_auto_injects_and_accepts_mcp_command_log(self) -> None:
-        """Build step must auto-inject <binary_id>/mcp_command_log.jsonl (compile_project log)."""
+        """Build step must auto-inject <binary_id>/command_log.jsonl (compile_project log)."""
         from tools.orchestration_runtime import _allowed_output_paths_for_launch
 
         binary_id = "bin_20260510_001"
@@ -3831,7 +3831,7 @@ shell_tool                       stable             true
             request_payload=req,
             write_roots=[f"{_FIX_PIPE_REF}/binary/"],
         )
-        expected_log = f"{_FIX_PIPE_REF}/binary/{binary_id}/mcp_command_log.jsonl"
+        expected_log = f"{_FIX_PIPE_REF}/binary/{binary_id}/command_log.jsonl"
         self.assertIn(expected_log, out)
 
     def test_build_phase_rejects_log_in_unrecognized_subdir(self) -> None:
@@ -3847,7 +3847,7 @@ shell_tool                       stable             true
             "pipeline_ref": _FIX_PIPE_REF,
             "allowed_output_paths": [
                 # Log path under an unrecognized subdir (not /bin/, not directly under binary_id).
-                f"{_FIX_PIPE_REF}/binary/{binary_id}/logs/mcp_command_log.jsonl",
+                f"{_FIX_PIPE_REF}/binary/{binary_id}/logs/command_log.jsonl",
             ],
         }
         with self.assertRaisesRegex(ValueError, "outside phase contract"):
@@ -3857,7 +3857,7 @@ shell_tool                       stable             true
             )
 
     def test_execute_phase_auto_injects_and_accepts_mcp_command_log(self) -> None:
-        """Execute step must auto-inject <run_id>/<node_safe>/mcp_command_log.jsonl."""
+        """Execute step must auto-inject <run_id>/<node_safe>/command_log.jsonl."""
         from tools.orchestration_runtime import _allowed_output_paths_for_launch
 
         run_id = "run_20260510_001"
@@ -3878,7 +3878,7 @@ shell_tool                       stable             true
             write_roots=[f"{_FIX_PIPE_REF}/runs/"],
         )
         expected_log = (
-            f"{_FIX_PIPE_REF}/runs/{run_id}/{node_safe}/mcp_command_log.jsonl"
+            f"{_FIX_PIPE_REF}/runs/{run_id}/{node_safe}/command_log.jsonl"
         )
         self.assertIn(expected_log, out)
 
@@ -3964,7 +3964,7 @@ shell_tool                       stable             true
             request_payload=req,
             allowed_output_paths=allowed,
         )
-        log_path = f"{_FIX_PIPE_REF}/binary/{binary_id}/mcp_command_log.jsonl"
+        log_path = f"{_FIX_PIPE_REF}/binary/{binary_id}/command_log.jsonl"
         self.assertIn(log_path, allowed)
         self.assertNotIn(log_path, file_tool)
 
@@ -5194,8 +5194,8 @@ shell_tool                       stable             true
             self.assertEqual(payload["output_refs"], [out_ref])
 
     def test_noncanonical_mcp_log_in_allowed_output_paths_is_not_mcp_trusted(self) -> None:
-        """A manifest entry with the basename mcp_command_log.jsonl at a
-        non-canonical path (e.g. <gen>/src/notes/mcp_command_log.jsonl) must
+        """A manifest entry with the basename command_log.jsonl at a
+        non-canonical path (e.g. <gen>/src/notes/command_log.jsonl) must
         NOT be persisted as an MCP-owned audit log. Only canonical placements
         under <gen>/src/ directly (alongside model/runner sources) qualify.
         Defense against an over-broad manifest silently auto-trusting an
@@ -5220,10 +5220,10 @@ shell_tool                       stable             true
             )
             src_id = "src_20260510_010"
             canonical_log = (
-                f"{_FIX_PIPE_REF}/source/{src_id}/src/mcp_command_log.jsonl"
+                f"{_FIX_PIPE_REF}/source/{src_id}/src/command_log.jsonl"
             )
             noncanonical = (
-                f"{_FIX_PIPE_REF}/source/{src_id}/src/notes/mcp_command_log.jsonl"
+                f"{_FIX_PIPE_REF}/source/{src_id}/src/notes/command_log.jsonl"
             )
             record_launch(
                 repo_root=repo_root,
@@ -5243,7 +5243,7 @@ shell_tool                       stable             true
                     "dependency_ref": f"{_FIX_IR_REF}/spec.ir.yaml",
                     "source_id": src_id,
                     # Caller declares both a canonical and a noncanonical
-                    # mcp_command_log.jsonl. Phase contract for /src/ is
+                    # command_log.jsonl. Phase contract for /src/ is
                     # loose enough to accept the noncanonical entry.
                     "allowed_output_paths": [
                         f"{_FIX_PIPE_REF}/source/{src_id}/src/main.f90",
@@ -5277,7 +5277,7 @@ shell_tool                       stable             true
             self.assertNotIn(canonical_log, manifest["allowed_file_tool_paths"])
 
     def test_record_agent_run_accepts_mcp_command_log_without_gate_provenance(self) -> None:
-        """Terminal validation must accept MCP-written mcp_command_log.jsonl.
+        """Terminal validation must accept MCP-written command_log.jsonl.
 
         MCP server writes the log directly (no guarded-apply-patch, no
         Edit/Write tool invocation). It is auto-injected into
@@ -5316,7 +5316,7 @@ shell_tool                       stable             true
             )
             binary_id = "bin_20260510_001"
             bin_ref = f"{_FIX_PIPE_REF}/binary/{binary_id}/bin/simulate"
-            log_ref = f"{_FIX_PIPE_REF}/binary/{binary_id}/mcp_command_log.jsonl"
+            log_ref = f"{_FIX_PIPE_REF}/binary/{binary_id}/command_log.jsonl"
             record_launch(
                 repo_root=repo_root,
                 orchestration_id="orch_001",
@@ -5397,7 +5397,7 @@ shell_tool                       stable             true
     def test_execute_run_quality_checks_cross_phase_mcp_log_authorized(self) -> None:
         """Execute's run_quality_checks runs with project_dir=generate/<gen>/src/
         per skills/workflow-execute/SKILL.md L20. The MCP server's default
-        command_log_path resolves to project_dir/mcp_command_log.jsonl, so the
+        command_log_path resolves to project_dir/command_log.jsonl, so the
         audit log lands under the generate tree even though the agent role is
         execute. The cross-phase canonical placement must be:
           - auto-injected when execute requests include `source_id`
@@ -5465,10 +5465,10 @@ shell_tool                       stable             true
                 encoding="utf-8",
             )
             cross_phase_log = (
-                f"{_FIX_PIPE_REF}/source/{src_id}/src/mcp_command_log.jsonl"
+                f"{_FIX_PIPE_REF}/source/{src_id}/src/command_log.jsonl"
             )
             in_phase_log = (
-                f"{_FIX_PIPE_REF}/runs/{run_id}/{node_safe}/mcp_command_log.jsonl"
+                f"{_FIX_PIPE_REF}/runs/{run_id}/{node_safe}/command_log.jsonl"
             )
             diagnostics_ref = (
                 f"{_FIX_PIPE_REF}/runs/{run_id}/{node_safe}/diagnostics.json"
@@ -5518,7 +5518,7 @@ shell_tool                       stable             true
 
             # Simulate the artefacts on disk:
             #   - diagnostics.json written under the step's write_roots (authorized by containment)
-            #   - cross-phase mcp_command_log.jsonl written by MCP run_quality_checks
+            #   - cross-phase command_log.jsonl written by MCP run_quality_checks
             #     (cross-phase placement under generate/)
             diag_path = repo_root / diagnostics_ref
             diag_path.parent.mkdir(parents=True, exist_ok=True)
@@ -5610,7 +5610,7 @@ shell_tool                       stable             true
                 f"{_FIX_PIPE_REF}/runs/{run_id}/{node_safe}/diagnostics.json"
             )
             other_log_ref = (
-                f"{_FIX_PIPE_REF}/source/{other_src}/src/mcp_command_log.jsonl"
+                f"{_FIX_PIPE_REF}/source/{other_src}/src/command_log.jsonl"
             )
             # Launch with source_id=real_gen but ALSO list a path under
             # the unrelated other_src tree. The phase contract for execute
@@ -5758,7 +5758,7 @@ shell_tool                       stable             true
                 ).read_text(encoding="utf-8")
             )
             cross_log = (
-                f"{_FIX_PIPE_REF}/source/{real_gen}/src/mcp_command_log.jsonl"
+                f"{_FIX_PIPE_REF}/source/{real_gen}/src/command_log.jsonl"
             )
             self.assertIn(cross_log, manifest["mcp_owned_audit_logs"])
 
@@ -12865,7 +12865,7 @@ class TestPhase3RunGate(unittest.TestCase):
             out,
             [
                 f"{_FIX_PIPE_REF}/source/{src_id}/src/",
-                f"{_FIX_PIPE_REF}/source/{src_id}/src/mcp_command_log.jsonl",
+                f"{_FIX_PIPE_REF}/source/{src_id}/src/command_log.jsonl",
             ],
         )
 

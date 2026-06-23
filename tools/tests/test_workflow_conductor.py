@@ -73,6 +73,15 @@ def _case_ids_from_outputs(paths: list[str]) -> tuple[str, ...]:
     return tuple(cids)
 
 
+def _evidence_artifacts_from_outputs(paths: list[str]) -> tuple[str, ...]:
+    arts = []
+    if any("/raw/state_snapshots/" in p for p in paths):
+        arts.append("state_snapshots")
+    if any(p.endswith("/raw/execution_trace.json") for p in paths):
+        arts.append("execution_trace.json")
+    return tuple(arts) or ("state_snapshots",)
+
+
 def _refs_from_request(req: dict) -> wc.NodeRefs:
     ir_id = req["ir_ref"].rsplit("/", 1)[1]
     pipeline_id = req["pipeline_ref"].rsplit("/", 1)[1]
@@ -116,6 +125,8 @@ class BuildLaunchRequestTest(unittest.TestCase):
                     agent_model=req["agent_model"],
                     workflow_mode=req["workflow_mode"],
                     case_ids=_case_ids_from_outputs(req.get("allowed_output_paths", [])),
+                    evidence_artifacts=_evidence_artifacts_from_outputs(
+                        req.get("allowed_output_paths", [])),
                     repair={
                         k: req[k]
                         for k in ("issue_severity", "repair_strategy",
@@ -784,7 +795,7 @@ class SubstepStatusAndResumeTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             root = Path(d)
             c = self._real_conductor(root)
-            paths = ["a/runner.bin", "a/binary_meta.json", "a/mcp_command_log.jsonl"]
+            paths = ["a/runner.bin", "a/binary_meta.json", "a/command_log.jsonl"]
             # none exist -> fail
             self.assertEqual(c.determine_substep_status(self._refs(), "build", None, paths)[0], "fail")
             # all exist -> pass
@@ -803,12 +814,12 @@ class SubstepStatusAndResumeTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             root = Path(d)
             c = self._real_conductor(root)
-            allowed = ["b/bin/runner", "b/binary_meta.json", "b/mcp_command_log.jsonl"]
+            allowed = ["b/bin/runner", "b/binary_meta.json", "b/command_log.jsonl"]
             for p in allowed[:2]:  # write the deliverables, NOT the audit log
                 (root / p).parent.mkdir(parents=True, exist_ok=True)
                 (root / p).write_text("x", encoding="utf-8")
             status, _ = c.determine_substep_status(self._refs(), "build", None, allowed)
-            self.assertEqual(status, "pass")  # binary-side mcp_command_log not required
+            self.assertEqual(status, "pass")  # binary-side command_log not required
 
     def test_ensure_fresh_producer_id_reallocates_when_outputs_exist(self) -> None:
         import tempfile
@@ -1310,6 +1321,249 @@ class WriteLineageTest(unittest.TestCase):
             self.assertEqual(lin["binary_id"], "bin_001")
             self.assertEqual(lin["run_id"], "run_001")
             self.assertEqual(lin["direct_dependency_status"], {"component/dep@0.1.0": "ready"})
+
+
+class DeterministicBuildTest(unittest.TestCase):
+    """WS-A/C: build runs in-process (no leaf) yet reuses the same bookkeeping."""
+
+    def _refs(self) -> wc.NodeRefs:
+        return wc.NodeRefs(
+            node_key="component/spec_x@0.1.0", spec_path="spec/component/spec_x",
+            ir_id="x_20260101_001", pipeline_id="x_20260101_001",
+            source_id="src_20260101_001", binary_id="bin_20260101_001",
+            run_id="run_20260101_001", source_binary_id="bin_20260101_001",
+        )
+
+    def test_build_runs_in_process_without_leaf(self) -> None:
+        captured: dict = {}
+
+        class C(_FakeConductor):
+            def spawn_leaf(self, *a, **k):  # type: ignore[override]
+                raise AssertionError("leaf must not spawn for deterministic build")
+
+            def _capability_token(self, child_arid):  # type: ignore[override]
+                return "captok"
+
+            def _build_inproc(self, refs, child_arid, cap_token):  # type: ignore[override]
+                captured["cap_token"] = cap_token
+                captured["child_arid"] = child_arid
+                return {"stdout": "compiled", "stderr": ""}
+
+            def _persist_leaf_output(self, child_arid, proc, prefix="leaf"):  # type: ignore[override]
+                captured["prefix"] = prefix
+
+        c = C(repo_root=Path("/tmp/repo"), orchestration_id="orch_x",
+              orchestration_agent_run_id="ORCH", backend="claude",
+              env={"METDSL_CONDUCTOR_DETERMINISTIC_BUILD": "1"})
+        c.calls = []
+        oc = c.run_substep(self._refs(), "build", None)
+
+        self.assertEqual(oc.status, "pass")
+        self.assertEqual(oc.leaf_returncode, 0)
+        self.assertEqual(captured["cap_token"], "captok")
+        self.assertEqual(captured["prefix"], "deterministic")
+        subs = [s for s, _ in c.calls]
+        # SAME bookkeeping as a leaf run, but the conductor issues the child-return.
+        self.assertIn("record-launch", subs)
+        self.assertIn("record-child-return", subs)
+        self.assertIn("finalize-child", subs)
+
+    def test_build_body_nonzero_returncode_fails_substep(self) -> None:
+        # A post_build gate failure (binary present) must surface as a fail, not pass,
+        # via the body's returncode (regression: gate-fail previously returned rc 0).
+        class C(_FakeConductor):
+            def _capability_token(self, child_arid):  # type: ignore[override]
+                return "captok"
+
+            def _build_inproc(self, refs, child_arid, cap_token):  # type: ignore[override]
+                return {"returncode": 1, "stdout": "", "stderr": "[post_build gate fail]"}
+
+            def _persist_leaf_output(self, *a, **k):  # type: ignore[override]
+                pass
+
+        c = C(repo_root=Path("/tmp/repo"), orchestration_id="orch_x",
+              orchestration_agent_run_id="ORCH", backend="claude",
+              env={"METDSL_CONDUCTOR_DETERMINISTIC_BUILD": "1"})
+        c.calls = []
+        oc = c.run_substep(self._refs(), "build", None)
+        self.assertEqual(oc.status, "fail")
+        self.assertEqual(oc.leaf_returncode, 1)
+
+    def test_build_inproc_fails_when_binary_not_at_contract_path(self) -> None:
+        # E2E regression: a compile that succeeds but whose Makefile BIN default is
+        # not <spec_id>_runner leaves no binary at the contract path. The build must
+        # produce a clean fail (verification_status=fail, make_error -> regenerate),
+        # NOT a pass binary_meta pointing at a missing file (which escalated/fail_closed).
+        import sys
+        import tempfile
+        from unittest import mock
+        sys.path.insert(0, str(Path("mcp_servers").resolve()))
+        import build_runtime_server  # type: ignore
+
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            c = wc.Conductor(repo_root=repo, orchestration_id="t",
+                             orchestration_agent_run_id="x", backend="claude", env={})
+            refs = wc.NodeRefs(
+                node_key="component/spec_x@0.1.0", spec_path="spec/component/spec_x",
+                ir_id="x_1", pipeline_id="x_1", source_id="src_1", binary_id="bin_1")
+            (repo / refs.ir_ref).mkdir(parents=True, exist_ok=True)
+            (repo / refs.source_dir() / "src").mkdir(parents=True, exist_ok=True)
+
+            def fake_compile(args):  # ok, but produces NO binary
+                return {"ok": True, "return_code": 0, "command_id": "cid"}
+
+            with mock.patch.object(build_runtime_server, "tool_compile_project", fake_compile):
+                out = c._build_inproc(refs, "child-1", "captok")
+
+            self.assertEqual(out["returncode"], 0)  # content fail, not transport
+            meta = json.loads((repo / refs.binary_dir() / "binary_meta.json").read_text())
+            self.assertEqual(meta["verification_status"], "fail")
+            self.assertEqual(meta["failure_category"], "make_error")
+            self.assertTrue(meta["failure_source_refs"][0].endswith("/Makefile"))
+
+    def test_flag_off_uses_leaf_path(self) -> None:
+        spawned: dict = {}
+
+        class C(_FakeConductor):
+            def spawn_leaf(self, prompt_text, child_env, **kwargs):  # type: ignore[override]
+                spawned["yes"] = True
+                return wc.ProcResult(0, "", "")
+
+            def _persist_leaf_output(self, *a, **k):  # type: ignore[override]
+                pass
+
+        c = C(repo_root=Path("/tmp/repo"), orchestration_id="orch_x",
+              orchestration_agent_run_id="ORCH", backend="claude", env={})
+        c.calls = []
+        c.run_substep(self._refs(), "build", None)
+
+        self.assertTrue(spawned.get("yes"))
+        subs = [s for s, _ in c.calls]
+        # the leaf calls record-child-return itself per AGENT_CONTRACT, not the conductor.
+        self.assertNotIn("record-child-return", subs)
+
+
+class ExecutePromoterTest(unittest.TestCase):
+    """WS-B: artifact-type-driven evidence promotion + metadata authoring."""
+
+    def _conductor(self, repo: Path) -> wc.Conductor:
+        return wc.Conductor(repo_root=repo, orchestration_id="t",
+                            orchestration_agent_run_id="x", backend="claude", env={})
+
+    def _write(self, p: Path, obj) -> None:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(json.dumps(obj), encoding="utf-8")
+
+    def test_execute_allowed_paths_are_evidence_artifact_driven(self) -> None:
+        refs = wc.NodeRefs(
+            node_key="component/spec_x@0.1.0", spec_path="spec/component/spec_x",
+            ir_id="x_20260101_001", pipeline_id="x_20260101_001",
+            source_id="src_20260101_001", binary_id="bin_20260101_001",
+            run_id="run_20260101_001", source_binary_id="bin_20260101_001")
+        common = dict(step="validate", substep="execute", orchestration_id="o",
+                      orchestration_agent_run_id="p", child_agent_run_id="c",
+                      agent_model="m", workflow_mode="dev", case_ids=("a", "b"))
+        snap = wc.build_launch_request(refs, evidence_artifacts=("state_snapshots",), **common)
+        snap_outs = snap["allowed_output_paths"]
+        self.assertTrue(any("/raw/state_snapshots/a.json" in p for p in snap_outs))
+        self.assertTrue(any("snapshot_schema.json" in p for p in snap_outs))
+        self.assertFalse(any("execution_trace.json" in p for p in snap_outs))
+
+        trace = wc.build_launch_request(
+            refs, evidence_artifacts=("execution_trace.json",), **common)
+        trace_outs = trace["allowed_output_paths"]
+        self.assertTrue(any(p.endswith("/raw/execution_trace.json") for p in trace_outs))
+        self.assertFalse(any("/raw/state_snapshots/" in p for p in trace_outs))
+
+    def test_required_evidence_artifacts(self) -> None:
+        c = self._conductor(Path("/tmp/repo"))
+        ir = {"io_contract": {"raw_requirements": {"required_evidence": [
+            {"artifact": "state_snapshots", "required": True},
+            {"artifact": "metrics_basis.json", "required": False},
+        ]}}}
+        self.assertEqual(c._required_evidence_artifacts(ir), ["state_snapshots"])
+
+    def test_promote_state_snapshots(self) -> None:
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            c = self._conductor(repo)
+            run = repo / "run"
+            self._write(run / "diagnostics.json", {"verdict": {"overall": "pass"}})
+            self._write(run / "perf.json", {"case_id": "a"})
+            self._write(run / "raw" / "metrics_basis.json", {"x": 1})
+            self._write(run / "raw" / "state_snapshots" / "caseA.json", {"u": [1]})
+            self._write(run / "raw" / "state_snapshots" / "caseB.json", {"u": [2]})
+            node = repo / "node"
+            refs = c._promote_run_evidence(run, node, ["state_snapshots"])
+            self.assertTrue((node / "diagnostics.json").exists())
+            self.assertTrue((node / "perf.json").exists())
+            self.assertTrue((node / "raw" / "metrics_basis.json").exists())
+            self.assertTrue((node / "raw" / "state_snapshots" / "caseA.json").exists())
+            self.assertTrue((node / "raw" / "state_snapshots" / "caseB.json").exists())
+            self.assertIn("node/raw/metrics_basis.json", refs)
+
+    def test_promote_execution_trace_drops_per_case_aux(self) -> None:
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            c = self._conductor(repo)
+            run = repo / "run"
+            self._write(run / "diagnostics.json", {"verdict": {"overall": "pass"}})
+            self._write(run / "perf.json", {"case_id": "a"})
+            self._write(run / "raw" / "execution_trace.json", {"trace": []})
+            # auxiliary per-case files the runner also emits -> must be DROPPED
+            self._write(run / "raw" / "execution_trace_caseA.json", {"trace": ["a"]})
+            node = repo / "node"
+            c._promote_run_evidence(run, node, ["execution_trace.json"])
+            self.assertTrue((node / "raw" / "execution_trace.json").exists())
+            self.assertFalse((node / "raw" / "execution_trace_caseA.json").exists())
+
+    def test_author_snapshot_schema_orders_by_ir_case(self) -> None:
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            c = self._conductor(repo)
+            node = repo / "node"
+            sdir = node / "raw" / "state_snapshots"
+            sdir.mkdir(parents=True)
+            for cid in ("left", "right", "invalid"):
+                (sdir / f"{cid}.json").write_text("{}", encoding="utf-8")
+            ir = {
+                "io_contract": {"raw_requirements": {"required_evidence": [
+                    {"artifact": "state_snapshots", "required": True, "min_samples": 1,
+                     "schema": {"variables": [{"name": "u", "shape_expr": "[n]"}],
+                                "time_variable": "t", "time_shape_expr": "scalar"}},
+                ]}},
+                "case": {"test_case_set": [
+                    {"case_id": "left"}, {"case_id": "right"}, {"case_id": "invalid"}]},
+            }
+            ref = c._author_snapshot_schema(ir, node)
+            self.assertIsNotNone(ref)
+            doc = json.loads((sdir / "snapshot_schema.json").read_text())
+            self.assertEqual(doc["samples"], ["left.json", "right.json", "invalid.json"])
+            self.assertEqual(doc["time_variable"], "t")
+            self.assertEqual(doc["min_samples"], 1)
+
+    def test_author_quality_check_pass_and_mismatch(self) -> None:
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            node = Path(td)
+            run_diag = {"checks": {"c1": {"status": "pass"}},
+                        "verdict": {"overall": "pass", "failed_checks": []},
+                        "cases": [{"case_id": "a", "verdict": {"overall": "pass"}}]}
+            c = self._conductor(node)
+            status = c._author_quality_check(node, run_diag, run_diag, "R", "Q", "make_test", 1)
+            self.assertEqual(status, "pass")
+            doc = json.loads((node / "quality_check.json").read_text())
+            self.assertTrue(all(doc["checks"].values()))
+            # mismatched verdict -> fail
+            qc_diag = {"checks": {"c1": {"status": "fail"}},
+                       "verdict": {"overall": "fail", "failed_checks": ["c1"]},
+                       "cases": [{"case_id": "a", "verdict": {"overall": "fail"}}]}
+            status2 = c._author_quality_check(node, run_diag, qc_diag, "R", "Q", "make_test", 1)
+            self.assertEqual(status2, "fail")
 
 
 if __name__ == "__main__":  # pragma: no cover

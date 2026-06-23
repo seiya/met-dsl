@@ -54,7 +54,7 @@ WRITE_HINT = (
     "Hint: write every artifact (any extension, including managed .json/.txt) "
     "directly with the Edit/Write tool, to a path listed in "
     "output_manifests/<agent_run_id>.json.allowed_file_tool_paths "
-    "(guarded-apply-patch is deprecated). The MCP-owned mcp_command_log.jsonl is "
+    "(guarded-apply-patch is deprecated). The MCP-owned command_log.jsonl is "
     "written only by the build-runtime MCP server and is never file-tool-writable. "
     "For temp files, write directly under the literal allowed_tmp_root path "
     "(workspace/tmp/<agent_run_id>/...); do NOT use `export TMPDIR=...`, "

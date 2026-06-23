@@ -3475,7 +3475,7 @@ def _downstream_phase_launch_gate(
         raw_dir = base / "raw"
         if not raw_dir.is_dir():
             return False, "downstream:judge_raw_dir_missing"
-        exec_ok = (base / "mcp_command_log.jsonl").is_file() or (
+        exec_ok = (base / "command_log.jsonl").is_file() or (
             (base / "stdout.log").is_file() and (base / "stderr.log").is_file()
         )
         if not exec_ok:
@@ -3732,7 +3732,7 @@ def validate_mcp_build_tool_invocation(
         # Canonical command_log_path enforcement: align with validator-side
         # post_execute check so non-canonical placements fail at MCP-call time
         # rather than after expensive execution. Required canonical:
-        #   <pipeline_ref>/runs/<run_id>/<node_safe>/mcp_command_log.jsonl
+        #   <pipeline_ref>/runs/<run_id>/<node_safe>/command_log.jsonl
         # The MCP server's `_resolve_command_log_path` resolves a relative
         # `command_log_path` against `project_dir`; we normalize both to a
         # repo-relative canonical comparison.
@@ -3756,7 +3756,7 @@ def validate_mcp_build_tool_invocation(
         if pipeline_ref_for_log and run_id_for_log:
             expected_log_rel = (
                 f"{pipeline_ref_for_log}/runs/{run_id_for_log}/"
-                f"{node_safe}/mcp_command_log.jsonl"
+                f"{node_safe}/command_log.jsonl"
             )
             project_dir_raw = args_obj.get("project_dir")
             command_log_path_raw = args_obj.get("command_log_path")
@@ -3802,7 +3802,7 @@ def validate_mcp_build_tool_invocation(
                         base = repo_root / base
                     try:
                         actual_log_rel = (
-                            (base / "mcp_command_log.jsonl")
+                            (base / "command_log.jsonl")
                             .resolve()
                             .relative_to(repo_root.resolve())
                             .as_posix()
@@ -4490,13 +4490,13 @@ def _allowed_output_paths_for_launch(
                 if "/bin/" in path or path.endswith("/binary_meta.json"):
                     return True
                 # MCP `compile_project` writes a side-effect command log to
-                # `<project_dir>/mcp_command_log.jsonl`. Per
+                # `<project_dir>/command_log.jsonl`. Per
                 # `docs/workflow/phases/phase_03_build.md`, the in-phase
                 # canonical placement (out-of-source CMake/Meson builds) is
                 # directly under `<binary_id>/`.
                 if (
                     len(tail_parts) == 2
-                    and tail_parts[1] == "mcp_command_log.jsonl"
+                    and tail_parts[1] == "command_log.jsonl"
                 ):
                     return True
             return False
@@ -4508,7 +4508,7 @@ def _allowed_output_paths_for_launch(
             # `project_dir=source/<source_id>/src/` for
             # `toolchain.build_system=make` + Fortran/C-family pipelines. The
             # MCP server's default command_log_path resolves to
-            # `<project_dir>/mcp_command_log.jsonl`, so the audit log lands in
+            # `<project_dir>/command_log.jsonl`, so the audit log lands in
             # the source tree. This is the only legitimate write the
             # Validate.execute substep makes outside runs/. Strictly bind the
             # allowed cross-phase placement to the launch request's
@@ -4556,7 +4556,7 @@ def _allowed_output_paths_for_launch(
                 "execution_trace.json",
                 # MCP `run_program` / `run_quality_checks` side-effect log
                 # (phase_04_validate.md).
-                "mcp_command_log.jsonl",
+                "command_log.jsonl",
             }
             return rel_under_node in allowed_files or rel_under_node.startswith("raw/")
         if step_token == "validate" and substep_token == "judge":
@@ -4655,7 +4655,7 @@ def _allowed_output_paths_for_launch(
         return False
 
     # Defensive auto-inject: MCP build/validate tooling writes a side-effect
-    # command log to `<project_dir>/mcp_command_log.jsonl` (run_linter for
+    # command log to `<project_dir>/command_log.jsonl` (run_linter for
     # generate per skills/workflow-generate-generate, compile_project per
     # docs/workflow/phases/phase_03_build.md, run_program /
     # run_quality_checks per docs/workflow/phases/phase_04_validate.md). If
@@ -4817,7 +4817,7 @@ def _allowed_output_paths_for_launch(
 # nested subdirectory) is treated as a normal file. This avoids both
 # (a) over-trusting any manifest entry whose basename happens to match
 # (b) over-blocking legitimate project files with this name.
-_MCP_AUDIT_LOG_BASENAME: str = "mcp_command_log.jsonl"
+_MCP_AUDIT_LOG_BASENAME: str = "command_log.jsonl"
 
 
 def _canonical_mcp_audit_log_paths(
@@ -4834,19 +4834,19 @@ def _canonical_mcp_audit_log_paths(
 
     Canonical placements (per docs/workflow/phases/phase_*.md and
     skills/workflow-validate-execute/SKILL.md):
-      - generate: `<pipeline_ref>/source/<source_id>/src/mcp_command_log.jsonl`
-      - build:    `<pipeline_ref>/binary/<binary_id>/mcp_command_log.jsonl`
-      - validate.execute (in-phase): `<pipeline_ref>/runs/<run_id>/<node_safe>/mcp_command_log.jsonl`
-      - validate.execute (cross-phase quality_check): `<pipeline_ref>/source/<source_id>/src/mcp_command_log.jsonl`
+      - generate: `<pipeline_ref>/source/<source_id>/src/command_log.jsonl`
+      - build:    `<pipeline_ref>/binary/<binary_id>/command_log.jsonl`
+      - validate.execute (in-phase): `<pipeline_ref>/runs/<run_id>/<node_safe>/command_log.jsonl`
+      - validate.execute (cross-phase quality_check): `<pipeline_ref>/source/<source_id>/src/command_log.jsonl`
         — `run_quality_checks` runs with `project_dir=source/<source_id>/src/`
         for `toolchain.build_system=make` + Fortran/C-family pipelines per
         `skills/workflow-validate-execute/SKILL.md`, so the MCP server's
         default `command_log_path` (resolved as
-        `project_dir/mcp_command_log.jsonl`) lands in the source tree even
+        `project_dir/command_log.jsonl`) lands in the source tree even
         though the substep is `validate.execute`.
 
     Only paths matching these structures are returned. A path like
-    `<source_id>/src/notes/mcp_command_log.jsonl` is **not** canonical and is
+    `<source_id>/src/notes/command_log.jsonl` is **not** canonical and is
     treated as a normal file (writable subject to the usual file-tool /
     apply-patch rules).
     """
@@ -4871,7 +4871,7 @@ def _canonical_mcp_audit_log_paths(
             tail = tok[len(prefix):]
             parts = [p for p in tail.split("/") if p]
             # Canonical (in-phase, e.g. CMake/Meson out-of-source builds with
-            # project_dir=<binary_id>/): <binary_id>/mcp_command_log.jsonl
+            # project_dir=<binary_id>/): <binary_id>/command_log.jsonl
             # alongside binary_meta.json.
             if parts:
                 canonical.add(f"{prefix}{parts[0]}/{_MCP_AUDIT_LOG_BASENAME}")
@@ -4892,7 +4892,7 @@ def _canonical_mcp_audit_log_paths(
     elif step_token == "validate" and substep_token == "execute" and node_safe:
         # Only the Validate.execute substep emits MCP command logs (run_program
         # / run_quality_checks). Validate.judge runs without MCP, so no
-        # auto-injection — adding mcp_command_log.jsonl would later fail
+        # auto-injection — adding command_log.jsonl would later fail
         # phase contract validation since judge does not list it as an allowed
         # output filename.
         prefix = f"{pipeline_ref}/runs/"
@@ -4901,7 +4901,7 @@ def _canonical_mcp_audit_log_paths(
                 continue
             tail = tok[len(prefix):]
             parts = [p for p in tail.split("/") if p]
-            # Canonical (in-phase): <run_id>/<node_safe>/mcp_command_log.jsonl
+            # Canonical (in-phase): <run_id>/<node_safe>/command_log.jsonl
             if len(parts) >= 2 and parts[1] == node_safe:
                 canonical.add(
                     f"{prefix}{parts[0]}/{node_safe}/{_MCP_AUDIT_LOG_BASENAME}"
@@ -5694,7 +5694,7 @@ def build_bwrap_profile(
     (repo_root / hooks_rel).mkdir(parents=True, exist_ok=True)
     (repo_root / audit_rel).mkdir(parents=True, exist_ok=True)
     # Cross-phase MCP audit logs: compile_project / run_quality_checks for a Make/Fortran
-    # build side-output their mcp_command_log.jsonl into the read-only source tree
+    # build side-output their command_log.jsonl into the read-only source tree
     # (source/<id>/src/), which is outside the leaf's write_roots and inside a read input,
     # so bwrap would block the physical append (EROFS) mid-build. The manifest already
     # authorizes these paths (mcp_owned_audit_logs, honored by _validate_actual_write_paths
@@ -5866,7 +5866,7 @@ def render_bwrap_command(
             cmd.extend(["--bind", abs_token, abs_token])
     # Authorized cross-phase MCP audit logs bound writable as individual files. Emitted
     # AFTER the read-root ro-binds so a log inside a read input (e.g. a Make build's
-    # source/<id>/src/mcp_command_log.jsonl) becomes writable while the rest of that read
+    # source/<id>/src/command_log.jsonl) becomes writable while the rest of that read
     # input stays read-only (bwrap later-overrides-earlier). build_bwrap_profile
     # pre-creates each file.
     for rel in profile.get("runtime_rw_file_paths", []):
@@ -6979,7 +6979,7 @@ def _validate_actual_write_paths(
                     raw_aop = item.strip()
                     if raw_aop.endswith("/"):
                         manifest_allowed_output_dirs.append(_normalize_rel_posix(raw_aop))
-            # Canonical MCP audit logs (e.g. mcp_command_log.jsonl at the
+            # Canonical MCP audit logs (e.g. command_log.jsonl at the
             # phase-specific canonical placement) are written by MCP server
             # tooling without going through guarded-apply-patch and are
             # excluded from allowed_file_tool_paths so children cannot
@@ -14957,11 +14957,11 @@ def main(argv: list[str] | None = None) -> int:
         "verification_status=pass), and source_build_id (the binary_id whose binary execute uses; "
         "record_launch reads <pipeline>/build/<source_build_id>/binary_meta.json and verifies "
         "source_source_id == request.source_id to prevent mixed-build forge). "
-        "Cross-phase MCP audit log auto-inject (`<gen>/src/mcp_command_log.jsonl`) only fires when "
+        "Cross-phase MCP audit log auto-inject (`<gen>/src/command_log.jsonl`) only fires when "
         "spec.ir.yaml.impl_defaults records `toolchain.build_system: make` (Fortran/C-family in-source builds). "
         "Generate substep extra-required: source_id matches the listed paths' single <gen_id>. "
         "Build step listed paths must use a single <binary_id>; cross-phase Make builds also accept "
-        "source_id-derived `<gen>/src/mcp_command_log.jsonl` placement."
+        "source_id-derived `<gen>/src/command_log.jsonl` placement."
     )
     _RECORD_LAUNCH_RESPONSE_HELP = (
         "JSON object with child agent response. For Claude Code backend use: "

@@ -124,13 +124,13 @@ workspace/
         └── <pipeline_id>/
             ├── source/
             │   └── <source_id>/
-            │       ├── src/                       (generated source code, including `mcp_command_log.jsonl`)
+            │       ├── src/                       (generated source code, including `command_log.jsonl`)
             │       └── source_meta.json
             ├── binary/
             │   └── <binary_id>/
             │       ├── bin/
             │       ├── binary_meta.json           (pins source_source_id)
-            │       └── mcp_command_log.jsonl      (the MCP audit of compile_project)
+            │       └── command_log.jsonl      (the MCP audit of compile_project)
             ├── runs/
             │   └── <run_id>/                      (Validate phase output: execute + judge)
             │       └── <node_key_safe>/
