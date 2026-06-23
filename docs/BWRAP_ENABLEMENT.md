@@ -1,32 +1,36 @@
-# bwrap leaf-sandboxing enablement runbook (one-time live verification)
+# bwrap leaf-sandboxing verification runbook (live re-verification)
 
-Procedure to verify the leaf bwrap sandbox under a real `claude -p` run and then flip
-`METDSL_CONDUCTOR_BWRAP` to **default-ON**. This is a one-time enablement gate, not a
-recurring trial step.
+Procedure to verify the leaf bwrap sandbox under a real `claude -p` run. bwrap leaf
+sandboxing is **unconditionally mandatory** (Linux + user-namespaces only); there is no
+opt-out. Use this runbook to re-verify the sandbox end-to-end after a change to the
+profile builder, the leaf-launch path, or the build toolchain.
 
 - **Design / rationale (canonical):** `docs/design/deterministic_conductor.md` §Leaf
-  sandboxing + §Open risks. Do not restate the design here — this file is only the
-  operator procedure and the pass/fail criteria.
-- **Why a live run is required:** `record-launch` already builds a per-arid bwrap profile
-  and records `sandbox_enforced: true`, but `spawn_leaf` runs leaves unconfined while the
-  flag is off, so the recorded invariant is not yet matched by reality. Only `claude
-  --version` has been confirmed under the rendered profile; a full `claude -p` run
-  (real auth, MCP `build-runtime` spawn, hooks firing, `--session-id` transcript, and —
-  the highest risk — the **compile/build toolchain writing `.o`/`.mod`/exe inside the
-  leaf's `write_roots`**) has not. This procedure closes that gap.
+  sandboxing. Do not restate the design here — this file is only the operator procedure
+  and the pass/fail criteria.
+- **Why a live run is required:** `record-launch` builds a per-arid bwrap profile and
+  records `sandbox_enforced: true`, and `spawn_leaf` wraps every leaf in
+  `render_bwrap_command`. A unit test confirms the wrapping, but only a full `claude -p`
+  run exercises real auth, the MCP `build-runtime` spawn, hooks firing, the
+  `--session-id` transcript, and — the highest risk — the **compile/build toolchain
+  writing `.o`/`.mod`/exe inside the leaf's `write_roots`** under the sandbox.
 
 ## 0. Preconditions
 
 1. The host supports unprivileged user namespaces and has `bwrap` on `PATH`
    (`bwrap --version` works as the invoking user). WSL2 / some container hosts disable
-   user namespaces — if so, enablement must wait for a host that supports it (the conductor
-   will fail-closed there, which is the correct behavior, not a regression).
+   user namespaces — if so, this host is unsupported (the conductor fails closed there,
+   which is the correct behavior, not a regression). bwrap is Linux-userns-only.
 2. Claude backend preflight already passes (MCP `build-runtime` registered + tool
    permission granted): see `docs/RUNBOOK.md` §0-2. Run the normal preflight first.
 3. **Run this standalone.** It is a billed, autonomous `--invoke-llm` orchestration; do
    not run it concurrently with other manual workflow activity or it will pollute the
    workspace-global baseline (the truth is `meta=pass` + `aggregate_verdict`; a polluted
    parallel run can false-fail). Use a clean workspace state.
+4. **Do not set `METDSL_ORCHESTRATION_ASSUME_BWRAP`.** That env var is a test-only
+   affordance that makes the preflight probe *assume* bwrap is available (so unit/
+   integration tests can drive the enforced launch path without bwrap installed). On a
+   real host it would only mask a missing sandbox — the run must verify bwrap for real.
 
 ## 1. Run one node end-to-end under the sandbox
 
@@ -34,15 +38,14 @@ Pick a small leaf component and run through `validate` so every phase — includ
 high-risk **Build** — executes under bwrap:
 
 ```
-! METDSL_CONDUCTOR_BWRAP=1 python3 tools/run_workflow.py \
+! python3 tools/run_workflow.py \
     spec/component/dynamics/advection_diffusion/dynamics_advdiff_flux_1d_upwind_center2 \
     validate --llm claude
 ```
 
-`run_workflow.py` does `base_env = dict(os.environ)`, so the shell-exported
-`METDSL_CONDUCTOR_BWRAP=1` propagates to the conductor; `spawn_leaf` then wraps every leaf
-in `render_bwrap_command`. (The `!` prefix runs it in this session so its output lands in
-the conversation.)
+bwrap enforcement is unconditional, so the conductor wraps every leaf in
+`render_bwrap_command` with no extra flags. (The `!` prefix runs it in this session so
+its output lands in the conversation.)
 
 ## 2. Pass criteria
 
@@ -71,36 +74,6 @@ status for a quick read.
   resolve under an authorized root. Re-run step 1 after the profile fix.
 - **`SandboxError` / leaf raises before launching.** The host lacks a usable bwrap profile
   or user namespaces. Confirm precondition 0.1; the conductor failing closed here is
-  correct — do not work around it by disabling the flag on an unsupported host.
+  correct — this host is unsupported, do not work around it.
 - **Preflight rejects** with `sandbox_not_enforced`: expected only if a profile is missing;
   see `docs/RUNBOOK.md` §0-2 and the design doc.
-
-## 4. After a clean pass — flip the default
-
-Once step 2 passes on a representative node (ideally re-confirm on a node **with a
-dependency**, so dependency `write_roots` are exercised too):
-
-1. Change `WorkflowConductor._bwrap_enabled()` (`tools/workflow_conductor.py`) so the
-   default is **on** — i.e. bwrap is enforced unless `METDSL_CONDUCTOR_BWRAP` is explicitly
-   set to an off value (`off`/`0`/`false`). This makes the recorded
-   `sandbox_enforced: true` invariant match reality (the design doc calls
-   `METDSL_CONDUCTOR_BWRAP=off` the *temporary* divergence; default-on is the
-   contract-honest end state).
-2. Update `docs/design/deterministic_conductor.md` §Leaf sandboxing / §Open risks to record
-   that the live run passed and the flag now defaults on (move it out of "opt-in" / "open
-   risk").
-3. Keep `METDSL_CONDUCTOR_BWRAP=off` as the documented escape hatch for an unsupported host
-   (with the caveat that it runs unconfined despite the recorded invariant).
-4. Run the existing conductor/bwrap unit tests; add a regression that a default
-   (env-unset) conductor enforces the sandbox.
-
-> The diff for step 1 is small (invert the default in one method) but **must not** be made
-> before step 2 passes live — enabling on a host where Build writes outside `write_roots`
-> would fail-close every run.
-
-## 5. Rollback
-
-Set `METDSL_CONDUCTOR_BWRAP=off` (after the default flip) to run unconfined on a host where
-the sandbox can't launch. This is a temporary divergence (the leaf runs unconfined while
-`record-launch` still records `sandbox_enforced: true`); prefer fixing the host or the
-profile over running with the escape hatch long-term.

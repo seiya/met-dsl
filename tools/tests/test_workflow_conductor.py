@@ -1029,17 +1029,16 @@ class LeafSpawnTest(unittest.TestCase):
                       {"repair_strategy": "restart", "repair_target_agent_run_id": "producer-arid"})
         self.assertIsNone(restart.get("resume_session_id"))
 
-    def test_bwrap_flag_default_on(self) -> None:
-        # Phase-2: bwrap leaf sandboxing is mandatory by default; only an explicit off
-        # value of METDSL_CONDUCTOR_BWRAP disables it.
+    def test_bwrap_always_enforced(self) -> None:
+        # Phase-2 (Linux+bwrap-only): bwrap leaf sandboxing is unconditionally mandatory;
+        # there is no opt-out env value. _bwrap_enabled() always returns True.
         self.assertTrue(self._c(env={})._bwrap_enabled())
-        self.assertTrue(self._c(env={"METDSL_CONDUCTOR_BWRAP": "1"})._bwrap_enabled())
-        self.assertFalse(self._c(env={"METDSL_CONDUCTOR_BWRAP": "off"})._bwrap_enabled())
-        self.assertFalse(self._c(env={"METDSL_CONDUCTOR_BWRAP": "0"})._bwrap_enabled())
+        self.assertTrue(self._c(env={"METDSL_CONDUCTOR_BWRAP": "off"})._bwrap_enabled())
 
-    def test_spawn_leaf_wraps_in_bwrap_when_enabled(self) -> None:
-        # With the flag on and a recorded sandbox profile, the leaf argv is wrapped in
-        # `bwrap ... -- <leaf command>`; with the flag off it runs the bare command.
+    def test_spawn_leaf_wraps_in_bwrap(self) -> None:
+        # With a recorded sandbox profile, the leaf argv is wrapped in
+        # `bwrap ... -- <leaf command>`. bwrap is unconditionally enforced (no opt-out),
+        # so a leaf without a usable profile fails closed rather than launching bare.
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp)
             ws_tmp = repo / "workspace" / "tmp" / "A"
@@ -1067,42 +1066,35 @@ class LeafSpawnTest(unittest.TestCase):
             orig = wc.subprocess.run
             try:
                 wc.subprocess.run = fake_run  # type: ignore[assignment]
-                # flag ON + profile present → bwrap-wrapped (claude)
-                self._c(repo_root=repo, env={"METDSL_CONDUCTOR_BWRAP": "1"}).spawn_leaf(
+                # profile present → bwrap-wrapped (claude)
+                self._c(repo_root=repo, env={}).spawn_leaf(
                     "P", {"HOME": "/h"}, session_id="A", child_arid="A")
                 self.assertEqual(captured["argv"][0], "bwrap")
                 self.assertIn("claude", captured["argv"])
                 self.assertIn("--", captured["argv"])
                 # codex backend is also wrapped (it gets a profile + sandbox_enforced too)
                 captured.clear()
-                self._c(repo_root=repo, backend="codex",
-                        env={"METDSL_CONDUCTOR_BWRAP": "1"}).spawn_leaf(
+                self._c(repo_root=repo, backend="codex", env={}).spawn_leaf(
                     "P", {"HOME": "/h"}, child_arid="A")
                 self.assertEqual(captured["argv"][0], "bwrap")
                 self.assertIn("codex", captured["argv"])
-                # explicit flag OFF → bare leaf command (no bwrap)
-                captured.clear()
-                self._c(repo_root=repo, env={"METDSL_CONDUCTOR_BWRAP": "off"}).spawn_leaf(
-                    "P", {"HOME": "/h"}, session_id="A", child_arid="A")
-                self.assertEqual(captured["argv"][0], "claude")
-                # flag ON but profile missing → fail closed (never launch unconfined)
+                # profile missing → fail closed (never launch unconfined)
                 captured.clear()
                 with self.assertRaises(RuntimeError):
-                    self._c(repo_root=repo, env={"METDSL_CONDUCTOR_BWRAP": "1"}).spawn_leaf(
+                    self._c(repo_root=repo, env={}).spawn_leaf(
                         "P", {"HOME": "/h"}, session_id="Z", child_arid="Z")
                 self.assertNotIn("argv", captured)
-                # flag ON but no child_arid (e.g. diagnostician) → also fail closed
+                # no child_arid (e.g. diagnostician) → also fail closed
                 with self.assertRaises(RuntimeError):
-                    self._c(repo_root=repo, env={"METDSL_CONDUCTOR_BWRAP": "1"}).spawn_leaf(
-                        "P", {"HOME": "/h"})
+                    self._c(repo_root=repo, env={}).spawn_leaf("P", {"HOME": "/h"})
                 self.assertNotIn("argv", captured)
-                # flag ON + structurally invalid profile (missing repo_root/tmp_dir) →
+                # structurally invalid profile (missing repo_root/tmp_dir) →
                 # SandboxEnforcementError (so conduct terminalizes fail_closed), not a
                 # bare ValueError bubbling up as a generic conductor error.
                 (prof_dir / "BAD.json").write_text(json.dumps({"read_roots": []}),
                                                    encoding="utf-8")
                 with self.assertRaises(wc.SandboxEnforcementError):
-                    self._c(repo_root=repo, env={"METDSL_CONDUCTOR_BWRAP": "1"}).spawn_leaf(
+                    self._c(repo_root=repo, env={}).spawn_leaf(
                         "P", {"HOME": "/h"}, session_id="BAD", child_arid="BAD")
                 self.assertNotIn("argv", captured)
             finally:

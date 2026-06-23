@@ -143,7 +143,7 @@ class RouteDecision:
 
 
 class SandboxEnforcementError(RuntimeError):
-    """Raised when `METDSL_CONDUCTOR_BWRAP` is enabled but a leaf cannot be sandboxed
+    """Raised when bwrap enforcement is mandatory but a leaf cannot be sandboxed
     (no usable profile). Surfaced so the conductor terminalizes as `fail_closed` rather
     than a generic conductor error."""
 
@@ -627,16 +627,14 @@ class Conductor:
         raise ValueError(f"unsupported backend for leaf spawn: {self.backend}")
 
     def _bwrap_enabled(self) -> bool:
-        """bwrap leaf sandboxing is MANDATORY by default (Phase-2). The FS-diff
-        write-authorization model (`_validate_actual_write_paths` authorizes a leaf
-        write purely by write_roots containment) is only sound while bwrap actually
-        confines each leaf to its write_roots, so enforcement is on unless explicitly
-        disabled by an off value of `METDSL_CONDUCTOR_BWRAP` (off/0/false/no). A host
-        that cannot sandbox the leaf fails closed at launch rather than running
-        unconfined (an unconfined leaf + FS-diff would authorize writes anywhere)."""
-        return str(self.env.get("METDSL_CONDUCTOR_BWRAP", "")).strip().lower() not in {
-            "off", "0", "false", "no",
-        }
+        """bwrap leaf sandboxing is unconditionally MANDATORY (Phase-2; Linux+bwrap
+        only). The FS-diff write-authorization model (`_validate_actual_write_paths`
+        authorizes a leaf write purely by write_roots containment) is only sound while
+        bwrap actually confines each leaf to its write_roots, so there is no opt-out: a
+        host that cannot sandbox the leaf fails closed at launch rather than running
+        unconfined (an unconfined leaf + FS-diff would authorize writes anywhere). The
+        method is retained as a single seam for the call sites; it always returns True."""
+        return True
 
     def _sandbox_profile_for(self, child_arid: str) -> dict[str, Any] | None:
         """The bwrap profile record-launch wrote for this child, or None."""
@@ -683,15 +681,15 @@ class Conductor:
     ) -> ProcResult:
         argv = self.leaf_command(
             prompt_text, session_id=session_id, resume_session_id=resume_session_id)
-        # When enabled, wrap the leaf in the bwrap sandbox that record-launch already
-        # built (repo read-only; writes confined to the child's write_roots +
-        # workspace/tmp). record-launch records sandbox_enforced=True for every backend,
-        # so applying it here makes that record true (the conductor leaf is otherwise
-        # unconfined). Applies to both claude and codex — both get a profile at launch.
-        # A caller may pass an explicit `profile` for a leaf that has no record-launch
-        # profile keyed by child_arid (the read-only diagnostician; see escalate()).
+        # Wrap the leaf in the bwrap sandbox that record-launch already built (repo
+        # read-only; writes confined to the child's write_roots + workspace/tmp).
+        # record-launch records sandbox_enforced=True for every backend, so applying it
+        # here makes that record true (the conductor leaf is otherwise unconfined).
+        # Applies to both claude and codex — both get a profile at launch. A caller may
+        # pass an explicit `profile` for a leaf that has no record-launch profile keyed
+        # by child_arid (the read-only diagnostician; see escalate()).
         if self._bwrap_enabled():
-            # Fail closed: the operator opted into enforcement and record-launch records
+            # Fail closed: enforcement is mandatory and record-launch records
             # sandbox_enforced=true, so ANY leaf without a usable profile — a missing/
             # invalid one (older orchestration resumed, corrupted/deleted file) or a
             # caller that supplies neither an explicit profile nor a child_arid — must
@@ -700,7 +698,7 @@ class Conductor:
                 profile = self._sandbox_profile_for(child_arid) if child_arid else None
             if profile is None:
                 raise SandboxEnforcementError(
-                    "METDSL_CONDUCTOR_BWRAP is enabled but no usable sandbox profile is "
+                    "bwrap enforcement is mandatory but no usable sandbox profile is "
                     f"available for this leaf (child_arid={child_arid!r}); refusing to "
                     "launch unconfined (fail-closed)")
             from tools.orchestration_runtime import render_bwrap_command
@@ -1272,7 +1270,7 @@ class Conductor:
                 if reason.startswith("leaf_transport_error"):
                     reason_code = "leaf_transport_error"
                 elif "sandbox" in reason:
-                    # diagnostician could not be sandboxed under METDSL_CONDUCTOR_BWRAP
+                    # diagnostician could not be sandboxed under mandatory bwrap
                     reason_code = "sandbox_enforcement_violation"
                 else:
                     reason_code = "conductor_phase_fail_closed"

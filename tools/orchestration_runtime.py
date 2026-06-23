@@ -10432,6 +10432,16 @@ def _probe_codex_home_writable() -> dict[str, Any]:
 
 
 def _probe_bwrap_sandbox() -> tuple[list[dict[str, Any]], bool]:
+    """Preflight probe: confirm the host can sandbox a leaf (bwrap present + user
+    namespaces + a dry-run exec). bwrap enforcement is mandatory (Linux+userns only), so
+    a host that fails this probe is unsupported and the run fails closed.
+
+    `METDSL_ORCHESTRATION_ASSUME_BWRAP=1` is a **test-only** affordance: it bypasses the
+    real probe and reports the sandbox as available, so unit/integration tests can
+    exercise the enforced launch path without bwrap actually installed in the test host.
+    It must not be set in production — if bwrap is in fact missing, the probe lies here
+    and the actual `bwrap` exec fails closed later at leaf launch (see the
+    sandbox-unavailable fail-closed handling in the conductor)."""
     checks: list[dict[str, Any]] = []
     assume = os.environ.get("METDSL_ORCHESTRATION_ASSUME_BWRAP", "").strip().lower()
     if assume in {"1", "true", "yes"}:
