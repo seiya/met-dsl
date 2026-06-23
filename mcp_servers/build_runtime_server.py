@@ -24,15 +24,31 @@ JSONRPC_VERSION = "2.0"
 SERVER_NAME = "build-runtime-server"
 
 
+def _disable_bytecode_writes() -> None:
+    """Stop this interpreter (and the build/gate subprocesses it spawns) from writing
+    `.pyc` files.
+
+    The MCP server runs inside a read-only bwrap sandbox where neither
+    `workspace/.pycache` nor the in-repo source `__pycache__` is writable. Importing the
+    large orchestration runtime would otherwise attempt a bytecode write that EROFSes
+    before any build runs (the previous code unconditionally `mkdir`-ed
+    `workspace/.pycache`, which succeeded only when that dir happened to pre-exist from a
+    non-sandboxed run). A runtime `PYTHONDONTWRITEBYTECODE` env var alone is too late to
+    flip `sys.dont_write_bytecode` for the already-started interpreter, so set it
+    directly; also export the env var so subprocesses inherit it. Disabling the cache is
+    negligible here — the server is short-lived and re-imported per leaf launch — and it
+    also avoids ever polluting the repo source tree with `.pyc`.
+    """
+    sys.dont_write_bytecode = True
+    os.environ["PYTHONDONTWRITEBYTECODE"] = "1"
+
+
 @lru_cache(maxsize=1)
 def _load_orchestration_runtime() -> Any:
     """Load `tools/orchestration_runtime.py` without requiring `tools` as a package."""
     root = Path(__file__).resolve().parent.parent
     path = root / "tools" / "orchestration_runtime.py"
-    pycache_root = (root / "workspace" / ".pycache").resolve()
-    pycache_root.mkdir(parents=True, exist_ok=True)
-    os.environ.setdefault("PYTHONDONTWRITEBYTECODE", "1")
-    os.environ["PYTHONPYCACHEPREFIX"] = str(pycache_root)
+    _disable_bytecode_writes()
     import importlib.util
 
     spec = importlib.util.spec_from_file_location("orchestration_runtime", path)
