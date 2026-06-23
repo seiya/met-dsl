@@ -45,9 +45,9 @@ except ModuleNotFoundError:  # pragma: no cover - direct CLI execution
 # under that driver) were removed.
 SUPPORTED_LLMS = ("codex", "claude")
 SUPPORTED_WORKFLOW_MODES = ("dev", "prod")
-# Applied when --llm / --mode are omitted on a non-resume run. Kept as the
-# historical defaults so plain `run_workflow.py <spec> <phase>` is unchanged.
-DEFAULT_LLM = "codex"
+# Applied when --llm / --mode are omitted on a non-resume run, so plain
+# `run_workflow.py <spec> <phase>` uses the claude backend by default.
+DEFAULT_LLM = "claude"
 DEFAULT_WORKFLOW_MODE = "dev"
 DEFAULT_LLM_COMMANDS = {
     "codex": "codex",
@@ -849,7 +849,7 @@ def main(argv: list[str] | None = None) -> int:
     # Resolve effective startup inputs. With --resume, omitted spec_ref /
     # until_phase / --llm / --mode are recovered from the target orchestration's
     # existing artifacts (orchestration_meta.json + preflight.json + the start
-    # prompt). Without --resume the historical defaults (codex / dev) apply.
+    # prompt). Without --resume the defaults (claude / dev) apply.
     resume_mode = bool(args.resume)
     # Recovered resume metadata (populated in the resume branch). The reuse decision
     # in the try block compares the effective spec/backend against these to tell an
