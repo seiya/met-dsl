@@ -70,7 +70,7 @@ This document defines the orchestration contract — the **conductor** (`tools/w
 - `record-launch` must generate `workspace/orchestrations/<orchestration_id>/sandbox_profiles/<agent_run_id>.json` per child `agent_run_id`, and finalize the `read_roots`, `write_roots`, and runtime bind composition needed for `bwrap` execution. The child launch allows only `bwrap` execution using that profile.
 
 ### file write paths
-- When a `step agent` / `substep agent` changes a phase artifact, the canonical invocation — uniform across extensions (managed `.json` / `.txt`, `.yaml` / `.yml` / `.md`, source code) — is a direct `Edit` / `Write` to a path enumerated in `output_manifests/<agent_run_id>.json.allowed_file_tool_paths`. Under mandatory `bwrap` confinement the write is authorized by `write_roots`-containment of the FS-diff at terminalization, so no `guarded-apply-patch` gate step is involved (`guarded-apply-patch` is deprecated; see the §"`guarded-apply-patch`" note). The MCP-owned `mcp_command_log.jsonl` is excluded from `allowed_file_tool_paths` and is written only by the MCP server.
+- When a `step agent` / `substep agent` changes a phase artifact, the canonical invocation — uniform across extensions (managed `.json` / `.txt`, `.yaml` / `.yml` / `.md`, source code) — is a direct `Edit` / `Write` to a path enumerated in `output_manifests/<agent_run_id>.json.allowed_file_tool_paths`. Under mandatory `bwrap` confinement the write is authorized by `write_roots`-containment of the FS-diff at terminalization, so no gate step is involved (`guarded-apply-patch` and the `apply_patch_writes` gate have been removed — see §"Patch application contract (removed in P2-7)"). The MCP-owned `mcp_command_log.jsonl` is excluded from `allowed_file_tool_paths` and is written only by the MCP server.
 - `spec.ir.yaml` is in `.yaml` format, so write it with `Edit` / `Write`.
 - The direct execution of normal `apply_patch`, shell redirection, `tee`, `sed -i`, `perl -0pi`, and file writes via `python` / `sh` / `bash` are forbidden.
 - A file write via shell, regardless of whether the target path is a phase artifact, must be forbidden unless it is included in the canonical invocation explicitly stated in the child-`agent` launch request.
@@ -102,7 +102,7 @@ This document defines the orchestration contract — the **conductor** (`tools/w
 - The prohibition on reading the implementation under `tools/` applies to workflow execution and child-`agent` rule derivation. Repository improvement, maintenance, testing, and refactoring may inspect `tools/*.py` directly.
 - The validator invocation by the child `agent` defaults to `run-gate`, and the canonical invocation is `python3 tools/orchestration_runtime.py run-gate --gate <gate_name> --agent-run-id <agent_run_id> --capability-token <capability_token> --args-json '<json>'`.
 - The direct execution of a validator script is permitted only as an exceptional operation. The permitted targets are limited to `validate_workspace_root.py` and `check_artifact_syntax.py`.
-- `guarded-apply-patch` is **deprecated** and no longer the write path for any artifact (it relied on `git apply`, which fails on a `bwrap` bind-mounted file-pin write_root); a child writes every artifact directly with `Edit` / `Write`. The subcommand and its spec (§"`guarded-apply-patch`") are retained only for backward compatibility pending removal.
+- `guarded-apply-patch` and the `apply_patch_writes` gate have been **removed** (P2-7); a child writes every artifact directly with `Edit` / `Write`, authorized by `write_roots`-containment of the FS-diff at terminalization.
 - `record-agent-run` authorizes a step/substep child's writes by `write_roots`-containment of the actually-changed paths (the diff against the baseline): a change that landed inside the capability token's `write_roots` is the child's own confined output and is authorized; a change outside `write_roots` is rejected as an `unauthorized write`. (Under mandatory `bwrap` a write outside `write_roots` is impossible by construction.) The canonical MCP audit logs are handled by their own placement check. No `apply_patch_writes` gate record is consulted for step/substep.
 - **runtime placeholder restoration (recoverability)**: before the terminal-check baseline diff, `record-agent-run` restores, as 0-byte, the runtime-owned placeholders recorded in `created_file_pin_stubs` that have not been rewritten via a gate (= not covered by `gate_changed_paths`) and are currently absent. (Phase-2 note: the core workflow no longer declares any file-pin write_root — `lineage.json`, the former example, is now authored host-side by the conductor — so `created_file_pin_stubs` is empty in practice and this path is dormant, retained for P2-7 cleanup.) This prevents the deadlock in which a runtime placeholder deleted as collateral is judged an `unauthorized write` and the run, having no means of restoration, falls into permanent `fail_closed`. It also applies to a terminal record with `status=fail`/`blocked`/`timeout`, making it possible to record a failed run in `agent_runs.jsonl` (enabling a clean restart). Because `record-agent-run` operates with runtime privilege, the canonical-path write that is otherwise forbidden at the orchestration level is permitted here.
 - The child-`agent` launch prompt must be rendered from the corresponding template in `skills/workflow-orchestration/references/launch_prompts.md`; a free-form prompt that does not use the template is forbidden. The conductor supplies the launch-request parameters; `record-launch` renders the prompt (the canonical render path) and returns the rendered `launch_prompt_text`, which the conductor passes to the leaf subprocess.
@@ -239,44 +239,9 @@ This document defines the orchestration contract — the **conductor** (`tools/w
 - When `step_result.json` holds `retry_decisions`, the `effective pass substep` set can be uniquely restored.
 - For `Compile` / `Generate` / `Build` / `Validate` where `step_result.json` has a terminal status, `validation_stage` matches the per-phase allowed values (item 45).
 
-## Patch application contract
+## Patch application contract (removed in P2-7)
 
-> **Deprecated (Phase-2):** `guarded-apply-patch` is no longer the write path for any artifact. A child writes every artifact directly with `Edit` / `Write` (authorized by `write_roots`-containment under `bwrap`); the child-facing canonical procedure is [docs/AGENT_CONTRACT.md](AGENT_CONTRACT.md) §"Artifact write — direct `Write` / `Edit` tool procedure". This section is retained only as the spec of the still-existing subcommand pending its removal, and as documentation of the file-pin placeholder restoration the runtime performs (`record-agent-run` recoverability). Agents read AGENT_CONTRACT, not this file (`docs/ORCHESTRATION.md` is not in any child's `must_read`).
-
-The specification of the `guarded-apply-patch` subcommand (canonical source: this section. The implementation of `tools/orchestration_runtime.py` must not be referenced directly).
-
-### CLI interface
-
-```
-python3 tools/orchestration_runtime.py guarded-apply-patch \
-  --repo-root <repo_root> \
-  --orchestration-id <orchestration_id> \
-  --actor-role <step|substep> \
-  --agent-run-id <agent_run_id> \
-  --paths-json '<JSON array of changed paths>' \
-  --patch-file <path_to_patch_file> \
-  --capability-token <capability_token>
-```
-
-Direct embedding via `--patch-text` is also possible, but to avoid the ARG_MAX limit, going through `--patch-file` is recommended. The storage location of `--patch-file` allows only a literal path under `allowed_tmp_root` (= `workspace/tmp/<agent_run_id>/`) (a reference to the `$TMPDIR` env works, but to minimize env dependence the literal is canonical).
-
-### automatic strip decision
-
-The CLI argument `--strip` does not exist. Using the `changed_paths` passed via `--paths-json` as an oracle, it internally tries `git apply --check` in the order `-p1` → `-p0`, and automatically selects the first strip that can cover all `changed_paths`. When neither strip level produces targets fully covered by `changed_paths`, the `cannot determine patch strip level` error reports, per strip level, the paths `git` resolves and the subset not covered by `changed_paths`. These reported targets identify the patch header / `--paths-json` mismatch to correct.
-
-### Output contract
-
-- On success, exit code 0; on failure, non-0.
-- `violations[]` and the failure reason are output to **stderr** in JSON format.
-- The gate result is written to `workspace/orchestrations/<orch_id>/gates/<agent_run_id>/apply_patch_writes.json`, but this file must not be read directly.
-
-### Permitted extensions
-
-Only `.json` / `.txt` output. For `.yaml`, `.yml`, `.md`, and source code, use the `Edit`/`Write` tool (via `allowed_file_tool_paths`). `spec.ir.yaml` is written via `Edit`/`Write`.
-
-### Protection of runtime-generated placeholders
-
-`record-launch` pre-generates a file pin (e.g. Generate's `lineage.json`) as a 0-byte placeholder so that bwrap can bind it at file granularity, and records it in `created_file_pin_stubs` of `sandbox_profiles/<agent_run_id>.json`. After the apply completes, `guarded-apply-patch` **restores, as 0-byte, a placeholder of `created_file_pin_stubs` not included in `changed_paths` if it has disappeared** (defense-in-depth). That `git apply` deletes a path outside the `changed_paths` coverage is already rejected by the coverage check after the strip decision, but even in case of an out-of-band deletion, it guarantees that the runtime-owned placeholder is not lost, preventing the downstream `record-agent-run` terminal check from making it permanent `fail_closed` as "a non-gate change to a runtime artifact = `unauthorized_write`". A path covered by `changed_paths` (a path the agent intentionally rewrote/deleted via a gate) is excluded from restoration.
+`guarded-apply-patch` and its `apply_patch_writes` gate have been **removed** (the subcommand no longer exists). Under Phase-2 a child writes every artifact **directly with the `Edit` / `Write` tool**; the write is authorized at terminalization by `write_roots`-containment of the FS-diff under mandatory `bwrap` (`_validate_actual_write_paths`), with no gate evidence. The child-facing canonical procedure is [docs/AGENT_CONTRACT.md](AGENT_CONTRACT.md) §"Artifact write — direct `Write` / `Edit` tool procedure".
 
 ## Capability / Manifest contract
 

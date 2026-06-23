@@ -42,7 +42,6 @@ TIER_A_SUBCOMMANDS: frozenset[str] = frozenset({
     "reserve-phase-root",
     "workflow-launch-check",
     "run-gate",
-    "guarded-apply-patch",
 })
 
 TIER_B_SUBCOMMANDS: frozenset[str] = frozenset({
