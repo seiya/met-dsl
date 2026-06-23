@@ -54,10 +54,15 @@ DEFAULT_LLM_COMMANDS = {
     "claude": "claude",
 }
 # Default orchestration-agent model recorded on the orchestration agent_runs row
-# for the claude backend (the host session runs Opus). Operators on a different
-# model override it with --agent-model. The codex model id is not knowable to
-# this entrypoint, so it is left to repair-agent-runs sibling backfill.
-DEFAULT_CLAUDE_AGENT_MODEL = "claude-opus-4-8"
+# for the claude backend, as an UNPINNED alias (e.g. "opus") read from the
+# operator's settings — never a pinned version, which would go stale as versions
+# update. Operators on a different model override it with --agent-model. The codex
+# model id is not knowable to this entrypoint, so it is left to repair-agent-runs
+# sibling backfill. The exact version each leaf actually ran is resolved post-run
+# from its transcript by the conductor (resolve_claude_model_from_transcript).
+def _default_claude_agent_model() -> str:
+    from tools.orchestration_runtime import resolve_claude_model_alias
+    return resolve_claude_model_alias()
 
 PHASE_ALIASES = {
     "compile": "Compile",
@@ -772,12 +777,13 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
         "--agent-model",
         default=None,
         help=(
-            "Model id of the orchestration agent itself, recorded on its agent_runs "
-            "row for cost attribution / reproducibility. Defaults to "
-            f"'{DEFAULT_CLAUDE_AGENT_MODEL}' only for the claude backend running the "
-            "unmodified default command; with a custom --llm-command (which may launch "
-            "a different model) it is omitted unless given here. When omitted, "
-            "repair-agent-runs backfills it from sibling rows on resume."
+            "Model id (or unpinned alias) of the orchestration agent itself, recorded "
+            "on its agent_runs row for cost attribution / reproducibility. Defaults to "
+            "the operator's configured claude alias (e.g. 'opus') only for the claude "
+            "backend running the unmodified default command; with a custom --llm-command "
+            "(which may launch a different model) it is omitted unless given here. When "
+            "omitted, repair-agent-runs backfills it from sibling rows on resume. Prefer "
+            "an unpinned alias over a pinned version so it does not go stale."
         ),
     )
     parser.add_argument(
@@ -1263,17 +1269,18 @@ def _run_node(
             ]
             # Record the orchestration agent's own model so its agent_runs row is
             # not a cost-attribution blind spot. Explicit --agent-model wins.
-            # Otherwise default to Opus ONLY for the claude backend running the
-            # UNMODIFIED default command — an overridden --llm-command (e.g. a wrapper
-            # selecting a different model) could launch a non-Opus model, so we must
-            # not assert Opus there; leave it for sibling backfill on resume instead.
+            # Otherwise default to the operator's configured (unpinned) claude alias
+            # ONLY for the claude backend running the UNMODIFIED default command — an
+            # overridden --llm-command (e.g. a wrapper selecting a different model)
+            # could launch a different model, so we must not assert the alias there;
+            # leave it for sibling backfill on resume instead.
             orchestration_model = agent_model
             if (
                 not orchestration_model
                 and llm == "claude"
                 and llm_command == DEFAULT_LLM_COMMANDS["claude"]
             ):
-                orchestration_model = DEFAULT_CLAUDE_AGENT_MODEL
+                orchestration_model = _default_claude_agent_model()
             if orchestration_model:
                 init_args += ["--agent-model", orchestration_model]
         try:

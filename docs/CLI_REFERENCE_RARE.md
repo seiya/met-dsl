@@ -21,7 +21,7 @@ Related canonical sources:
 
 | subcommand | purpose | main caller / situation |
 |---|---|---|
-| `init` | start an orchestration / generate `orchestration_meta.json` | usually launched via `tools/run_workflow.py`. A direct call is for exceptional operation only. `--agent-model <id>` records the orchestration agent's own model on its `agent_runs.jsonl` row (`run_workflow.py` passes `claude-opus-4-8` by default for the claude backend) |
+| `init` | start an orchestration / generate `orchestration_meta.json` | usually launched via `tools/run_workflow.py`. A direct call is for exceptional operation only. `--agent-model <id>` records the orchestration agent's own model on its `agent_runs.jsonl` row (`run_workflow.py` passes the operator's unpinned claude alias — e.g. `opus`, read from `~/.claude/settings.json` — by default for the claude backend; never a pinned version, which would go stale) |
 | `preflight` | execution-platform launchability probe / generate `preflight.json` | called internally by `tools/run_workflow.py`. A manual call is forbidden |
 | `preflight-status` | read back an existing `preflight.json` | post-launch state confirmation |
 | `record-timeout` | the canonical recovery path for an `Agent` tool API stream idle timeout etc. | the exception recovery flow when a child agent wedges. `--force-reason` is the last resort for a marker-check bypass |

@@ -358,6 +358,63 @@ class ConductHappyPathTest(unittest.TestCase):
         self.assertEqual(completes[0]["result"], "skipped")
         self.assertNotIn("elapsed_seconds", completes[0])
 
+    def test_run_conductor_falls_back_to_backend_alias(self) -> None:
+        """run_conductor with no explicit agent_model uses the backend's unpinned
+        alias (claude -> 'opus' default / codex -> 'codex'), never a pinned version."""
+        from unittest.mock import patch
+        seen: dict[str, str] = {}
+        orig_init = wc.Conductor.__init__
+
+        def _capture_init(self, **kw):  # type: ignore[no-untyped-def]
+            seen["agent_model"] = kw.get("agent_model", "")
+            orig_init(self, **kw)
+
+        for backend, expected in (("codex", "codex"), ("claude", "opus")):
+            seen.clear()
+            with patch.object(wc, "resolve_node", return_value=("c/x@0.1.0", "spec/c/x")), \
+                 patch.object(wc, "prepare_node",
+                              return_value=wc.NodeRefs(node_key="c/x@0.1.0", spec_path="spec/c/x",
+                                                       ir_id="x_1", pipeline_id="x_1")), \
+                 patch.object(wc.Conductor, "__init__", _capture_init), \
+                 patch.object(wc.Conductor, "conduct", return_value="pass"), \
+                 patch("tools.orchestration_runtime.resolve_claude_model_alias",
+                       return_value="opus"):
+                status = wc.run_conductor(
+                    repo_root="/tmp/repo", orchestration_id="o",
+                    orchestration_agent_run_id="O", spec_ref="spec/c/x",
+                    source_dependency_ref="d", until_phase="compile", backend=backend,
+                    agent_model="", workflow_mode="dev", env={})
+            self.assertEqual(status, "pass")
+            self.assertEqual(seen["agent_model"], expected)
+            self.assertNotRegex(seen["agent_model"], r"-\d+-\d+$")
+
+    def test_agent_run_json_records_transcript_resolved_model(self) -> None:
+        from unittest.mock import patch
+        c = self._conductor()  # backend="claude"
+        refs = self._refs()
+        with patch(
+            "tools.orchestration_runtime.resolve_claude_model_from_transcript",
+            return_value="claude-opus-4-8",
+        ) as m:
+            payload = c._agent_run_json(
+                refs, "compile", "generate", "child-arid-1", "pass", [])
+        # the leaf's session id == its agent_run_id, so resolution keys on it
+        m.assert_called_once_with("child-arid-1")
+        self.assertEqual(payload["agent_model"], "claude-opus-4-8")
+
+    def test_agent_run_json_omits_model_when_transcript_unresolved(self) -> None:
+        from unittest.mock import patch
+        c = self._conductor()  # backend="claude"
+        refs = self._refs()
+        with patch(
+            "tools.orchestration_runtime.resolve_claude_model_from_transcript",
+            return_value=None,
+        ):
+            payload = c._agent_run_json(
+                refs, "compile", "generate", "child-arid-2", "pass", [])
+        # unresolved -> left absent so record_agent_run backfills the launch alias
+        self.assertNotIn("agent_model", payload)
+
     def test_agent_run_json_carries_step_and_substep(self) -> None:
         c = self._conductor()
         c.conduct(self._refs(), "validate")

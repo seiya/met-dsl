@@ -103,7 +103,7 @@ In Claude Code, call it **before launching the `Agent` tool** (because the child
 | `orchestration_id` | yes | |
 | `agent_run_id` | yes | matches child_agent_run_id |
 | `parent_agent_run_id` | yes | |
-| `agent_model` | yes | the LLM model id that runs the child agent (e.g. `claude-opus-4-8`). It is provenance information that cannot be derived by the runtime, so it is required at launch. record-launch persists it in the request, and `record-agent-run` auto-copies it to the relevant step/substep entry of `agent_runs.jsonl` (see below). When unspecified, it fail-fasts with `ValueError: launch request must include non-empty agent_model` |
+| `agent_model` | yes | the model that runs the child agent. At launch only the **unpinned alias** is known (e.g. `opus`) — never a pinned version, which would go stale — so the launch request carries the alias and it is required (fail-fasts with `ValueError: launch request must include non-empty agent_model` when missing). The **exact version** that actually ran (e.g. `claude-opus-4-8`) is resolved post-run by the conductor from the leaf's session transcript and recorded onto its `agent_runs.jsonl` row; `record-agent-run` only `setdefault`s the launch-request alias, so the resolved version wins when present (see below). |
 | `workflow_mode` | yes | `dev` / `prod` |
 | `ir_ref` | yes | `workspace/ir/<node_key_safe>/<ir_id>` (required in all phases including the Compile phase) |
 | `pipeline_ref` | yes | `workspace/pipelines/<node_key_safe>/<pipeline_id>` (required even in the Compile phase. If not yet generated, reserve it first with `reserve-phase-root --step generate`) |

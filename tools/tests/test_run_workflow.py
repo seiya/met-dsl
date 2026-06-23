@@ -609,7 +609,9 @@ class RunWorkflowTests(unittest.TestCase):
 
     def test_fresh_claude_run_records_orchestration_agent_model(self) -> None:
         """A fresh (non-resume) claude run threads --agent-model into init so the
-        orchestration agent_runs row records the model (P2)."""
+        orchestration agent_runs row records the model (P2). The default is the
+        operator's UNPINNED alias (e.g. 'opus'), not a pinned version."""
+        from tools.orchestration_runtime import resolve_claude_model_alias
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
             self._seed_spec_tree(repo_root)
@@ -622,7 +624,10 @@ class RunWorkflowTests(unittest.TestCase):
             self.assertEqual(len(init_calls), 1)
             self.assertNotIn("--resume-from-checkpoint", init_calls[0])
             idx = init_calls[0].index("--agent-model")
-            self.assertEqual(init_calls[0][idx + 1], "claude-opus-4-8")
+            recorded = init_calls[0][idx + 1]
+            self.assertEqual(recorded, resolve_claude_model_alias())
+            # never a pinned version id
+            self.assertNotRegex(recorded, r"-\d+-\d+$")
 
     def test_fresh_run_explicit_agent_model_overrides_default(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

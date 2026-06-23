@@ -9090,6 +9090,99 @@ def _load_agent_graph_parent_map(root: Path) -> dict[str, str]:
     return mapping
 
 
+# Unpinned Claude model alias used as the spec-side default. It is deliberately
+# NOT a pinned version (e.g. "claude-opus-4-8"): the configured model alias maps
+# to whatever the current default version is, so it never goes stale as versions
+# update. The EXACT version that actually ran is recorded separately on each
+# step/substep agent_runs row, resolved at runtime from the leaf's own session
+# transcript by `resolve_claude_model_from_transcript`.
+DEFAULT_CLAUDE_MODEL_ALIAS = "opus"
+
+
+def resolve_claude_model_alias(home: Path | None = None) -> str:
+    """The unpinned Claude model alias the operator configured (e.g. "opus"), read
+    from the Claude Code settings files. settings.local.json takes precedence over
+    settings.json (matching Claude Code's own precedence), so an operator who pins
+    their model only in the local file is still honored. This is the spec-side value,
+    recorded on the launch request / orchestration row before any leaf has run — so
+    it must not pin a version. Falls back to DEFAULT_CLAUDE_MODEL_ALIAS when no
+    settings file is present / readable or none carries a `model` key. (Only the
+    spec-side label is affected; the EXACT version is always recovered post-run from
+    the transcript, so a fallback here is cosmetic.)"""
+    base = home if home is not None else Path.home()
+    resolved = DEFAULT_CLAUDE_MODEL_ALIAS
+    # Highest precedence last: a model key in settings.local.json overrides settings.json.
+    for name in ("settings.json", "settings.local.json"):
+        try:
+            doc = json.loads((base / ".claude" / name).read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if isinstance(doc, dict):
+            model = doc.get("model")
+            if isinstance(model, str) and model.strip():
+                resolved = model.strip()
+    return resolved
+
+
+def default_agent_model_for_backend(backend: str, home: Path | None = None) -> str:
+    """The spec-side default agent_model for a backend when the operator gave no
+    explicit --agent-model. For claude this is the unpinned alias from settings;
+    for codex it is the backend's own unpinned alias ("codex"). Other/unknown
+    backends get "" (left to sibling backfill). Never returns a pinned version —
+    the exact version is resolved post-run from the transcript (claude)."""
+    b = (backend or "").strip().lower()
+    if b == "claude":
+        return resolve_claude_model_alias(home)
+    if b == "codex":
+        return "codex"
+    return ""
+
+
+def resolve_claude_model_from_transcript(
+    session_id: str, home: Path | None = None
+) -> str | None:
+    """The EXACT Claude model id that actually ran in the session identified by
+    `session_id`, read from that session's transcript under
+    ~/.claude/projects/<slug>/<session_id>.jsonl (the conductor pins each leaf's
+    session id to its agent_run_id, so the leaf's transcript is addressable by it).
+
+    Returns the model id of the last assistant message that carries a real one, or
+    None when no transcript / no usable model id is found — in which case the caller
+    keeps the unpinned alias rather than recording a stale guess. Synthetic-message
+    placeholders (e.g. "<synthetic>") are skipped. This is the runtime-resolved
+    ground truth for the agent_runs log; the historical assumption that Claude Code
+    has no runtime-knowable model no longer holds."""
+    if not isinstance(session_id, str) or not session_id.strip():
+        return None
+    base = home if home is not None else Path.home()
+    proj = base / ".claude" / "projects"
+    try:
+        matches = sorted(proj.glob(f"*/{session_id.strip()}.jsonl"))
+    except OSError:
+        return None
+    model: str | None = None
+    for path in matches:
+        try:
+            with path.open(encoding="utf-8") as fh:
+                for line in fh:
+                    try:
+                        obj = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    msg = obj.get("message") if isinstance(obj, dict) else None
+                    if isinstance(msg, dict):
+                        m = msg.get("model")
+                        if (
+                            isinstance(m, str)
+                            and m.strip()
+                            and not m.strip().startswith("<")
+                        ):
+                            model = m.strip()
+        except OSError:
+            continue
+    return model
+
+
 def repair_legacy_agent_runs(
     repo_root: Path,
     orchestration_id: str,
@@ -9196,6 +9289,14 @@ def repair_legacy_agent_runs(
         elif len(models) == 1:
             chosen_model = next(iter(models))
             model_source = "sibling_uniform"
+        # NOTE: a healthy current-generation orchestration legitimately holds a MIX
+        # of agent_model values — the unpinned alias (e.g. "opus") on the orchestration
+        # row and on any step whose transcript did not resolve, vs the exact resolved
+        # version (e.g. "claude-opus-4-8") on resolved step rows. So `sibling_uniform`
+        # derivation only applies when siblings happen to agree; a row that is genuinely
+        # MISSING agent_model amid a mixed set falls through to `needs_manual` (operator
+        # supplies --agent-model). This only affects legacy/partial data: a normal run
+        # never leaves a step/substep row missing agent_model (record-launch requires it).
 
         substep_parent = _load_substep_parent_map(root)
         graph_parent = _load_agent_graph_parent_map(root)
@@ -9424,11 +9525,14 @@ def _validate_launch_request_payload(request_payload: dict[str, Any]) -> None:
         raise ValueError("launch request must include non-empty node_key")
     if not isinstance(step, str) or not step.strip():
         raise ValueError("launch request must include non-empty step")
-    # agent_model identifies the LLM that produced the child's artifacts; it is
-    # not derivable by the runtime (e.g. Claude Code has no runtime-knowable
-    # model), so the orchestration agent must supply it at launch. record-launch
-    # persists it into the request, and record_agent_run backfills it onto the
-    # agent_runs entry, satisfying the pre_judge step/substep requirement.
+    # agent_model identifies the LLM that produced the child's artifacts. At launch
+    # only the unpinned spec-side ALIAS is known (e.g. "opus"); the exact version is
+    # resolved post-run from the leaf transcript and recorded by the conductor onto
+    # the agent_runs row (see resolve_claude_model_from_transcript). record-launch
+    # persists the alias into the request; record_agent_run only backfills it onto
+    # the agent_runs entry when the conductor did not already supply the resolved
+    # version (setdefault), satisfying the pre_judge step/substep requirement either
+    # way. The launch request must still carry a non-empty alias here.
     agent_model = request_payload.get("agent_model")
     if not isinstance(agent_model, str) or not agent_model.strip():
         raise ValueError("launch request must include non-empty agent_model")
@@ -14797,7 +14901,7 @@ def main(argv: list[str] | None = None) -> int:
     init_parser.add_argument(
         "--agent-model",
         default=None,
-        help="Model id of the orchestration agent itself (e.g. claude-opus-4-8); recorded on the orchestration agent_runs row for cost attribution / reproducibility.",
+        help="Model id (or unpinned alias, e.g. 'opus') of the orchestration agent itself; recorded on the orchestration agent_runs row for cost attribution / reproducibility. Prefer an alias over a pinned version so it does not go stale.",
     )
     init_parser.add_argument(
         "--resume-from-checkpoint",

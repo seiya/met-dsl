@@ -548,7 +548,10 @@ class Conductor:
     orchestration_agent_run_id: str
     backend: str
     env: dict[str, str]
-    agent_model: str = "claude-opus-4-8"
+    # Unpinned spec-side alias (never a pinned version — that would go stale as
+    # versions update). The EXACT version each leaf actually ran is resolved from
+    # its session transcript and recorded onto its agent_runs row in _agent_run_json.
+    agent_model: str = "opus"
     workflow_mode: str = "dev"
     # The resolved backend command (may be a wrapper with flags, e.g. from
     # --llm-command); empty falls back to the bare backend name.
@@ -934,6 +937,19 @@ class Conductor:
         }
         if substep is not None:
             payload["substep"] = substep
+        # Record the EXACT model the leaf actually ran, resolved from its own session
+        # transcript (the leaf's session id == child_arid, pinned via --session-id at
+        # launch). This is the runtime-resolved ground truth that replaces the unpinned
+        # alias carried in the launch request — record_agent_run only setdefaults the
+        # alias, so a value set here wins. Claude only; a codex leaf's transcript lives
+        # outside ~/.claude, so it keeps the launch-request alias. If unresolvable
+        # (no transcript yet, or a leaf that crashed before any assistant message),
+        # we leave agent_model absent and let record_agent_run backfill the alias.
+        if self.backend == "claude":
+            from tools.orchestration_runtime import resolve_claude_model_from_transcript
+            resolved = resolve_claude_model_from_transcript(child_arid)
+            if resolved:
+                payload["agent_model"] = resolved
         if status == "pass":
             payload["output_refs"] = output_refs
         elif result_summary and result_summary.strip():
@@ -1528,11 +1544,16 @@ def run_conductor(*, repo_root: Path | str, orchestration_id: str,
     status (pass | fail | fail_closed)."""
     root = Path(repo_root)
     node_key, spec_path = resolve_node(root, spec_ref)
+    # An explicit --agent-model wins; otherwise fall back to the backend's unpinned
+    # spec-side alias (claude -> settings alias / "opus"; codex -> "codex"). Never a
+    # pinned version: the exact version is resolved post-run from the leaf transcript.
+    from tools.orchestration_runtime import default_agent_model_for_backend
+    resolved_agent_model = agent_model or default_agent_model_for_backend(backend)
     conductor = Conductor(
         repo_root=root, orchestration_id=orchestration_id,
         orchestration_agent_run_id=orchestration_agent_run_id,
         backend=backend, env=env,
-        agent_model=agent_model or "claude-opus-4-8", workflow_mode=workflow_mode,
+        agent_model=resolved_agent_model, workflow_mode=workflow_mode,
         llm_command=llm_command,
     )
     refs = (resume_node_refs(conductor, node_key, spec_path) if resume

@@ -84,6 +84,10 @@ from tools.orchestration_runtime import (
     workflow_launch_check,
     write_preflight,
     write_step_result,
+    DEFAULT_CLAUDE_MODEL_ALIAS,
+    resolve_claude_model_alias,
+    default_agent_model_for_backend,
+    resolve_claude_model_from_transcript,
 )
 
 _FIX_IR_REF = "workspace/ir/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001"
@@ -23947,6 +23951,96 @@ class ResumeDirectiveTest(unittest.TestCase):
             enable_checkpoint_resume(repo_root, oid)
             meta = json.loads((root / "orchestration_meta.json").read_text(encoding="utf-8"))
             self.assertNotIn("resume_directive", meta)
+
+
+class ModelResolutionTests(unittest.TestCase):
+    """Runtime model resolution: an unpinned alias as the spec-side default, and the
+    exact version resolved from the session transcript for the agent_runs log."""
+
+    def _write_settings(self, home: Path, model: str | None) -> None:
+        (home / ".claude").mkdir(parents=True, exist_ok=True)
+        doc: dict[str, Any] = {}
+        if model is not None:
+            doc["model"] = model
+        (home / ".claude" / "settings.json").write_text(
+            json.dumps(doc), encoding="utf-8")
+
+    def test_alias_reads_settings_model(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            self._write_settings(home, "opus")
+            self.assertEqual(resolve_claude_model_alias(home), "opus")
+
+    def test_alias_falls_back_when_settings_absent_or_modelless(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            # no settings.json at all
+            self.assertEqual(resolve_claude_model_alias(home), DEFAULT_CLAUDE_MODEL_ALIAS)
+            # settings.json present but no model key
+            self._write_settings(home, None)
+            self.assertEqual(resolve_claude_model_alias(home), DEFAULT_CLAUDE_MODEL_ALIAS)
+
+    def test_alias_local_settings_take_precedence(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            self._write_settings(home, "opus")
+            (home / ".claude" / "settings.local.json").write_text(
+                json.dumps({"model": "sonnet"}), encoding="utf-8")
+            self.assertEqual(resolve_claude_model_alias(home), "sonnet")
+            # local file present but with no model key -> base settings model wins
+            (home / ".claude" / "settings.local.json").write_text(
+                json.dumps({"theme": "dark"}), encoding="utf-8")
+            self.assertEqual(resolve_claude_model_alias(home), "opus")
+
+    def test_alias_is_never_a_pinned_version(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            self._write_settings(home, "opus")
+            self.assertNotRegex(resolve_claude_model_alias(home), r"-\d+-\d+$")
+
+    def test_default_agent_model_per_backend(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            self._write_settings(home, "opus")
+            self.assertEqual(default_agent_model_for_backend("claude", home), "opus")
+            self.assertEqual(default_agent_model_for_backend("codex", home), "codex")
+            self.assertEqual(default_agent_model_for_backend("other", home), "")
+
+    def _write_transcript(self, home: Path, session_id: str, lines: list[dict]) -> None:
+        proj = home / ".claude" / "projects" / "-some-slug"
+        proj.mkdir(parents=True, exist_ok=True)
+        with (proj / f"{session_id}.jsonl").open("w", encoding="utf-8") as fh:
+            for obj in lines:
+                fh.write(json.dumps(obj) + "\n")
+
+    def test_transcript_resolves_exact_version(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            sid = "arid-123"
+            self._write_transcript(home, sid, [
+                {"type": "user", "message": {"role": "user"}},
+                {"type": "assistant", "message": {"model": "claude-opus-4-8"}},
+                {"type": "assistant", "message": {"model": "claude-opus-4-8"}},
+            ])
+            self.assertEqual(
+                resolve_claude_model_from_transcript(sid, home), "claude-opus-4-8")
+
+    def test_transcript_skips_synthetic_and_returns_last_real(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            sid = "arid-syn"
+            self._write_transcript(home, sid, [
+                {"message": {"model": "claude-opus-4-8"}},
+                {"message": {"model": "<synthetic>"}},
+            ])
+            self.assertEqual(
+                resolve_claude_model_from_transcript(sid, home), "claude-opus-4-8")
+
+    def test_transcript_returns_none_when_missing_or_empty_session(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            self.assertIsNone(resolve_claude_model_from_transcript("nope", home))
+            self.assertIsNone(resolve_claude_model_from_transcript("", home))
 
 
 if __name__ == "__main__":
