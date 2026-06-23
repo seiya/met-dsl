@@ -5462,6 +5462,8 @@ end program shallow_water2d_runner
         reparent_removed_child_to: str | None = None,
         divert_removed_child_to_invalid: bool = False,
         superseded_arids: list[str] | None = None,
+        seed_foreign_crashed: bool = False,
+        current_orchestration_id: str | None = None,
     ) -> list[str]:
         """Build the minimal execution + orchestration tree, optionally drop
         ``removed_arid`` from agent_runs.jsonl (leaving its agent_graph edge
@@ -5556,11 +5558,39 @@ end program shallow_water2d_runner
                     "substep": "judge",
                 },
             )
+        if seed_foreign_crashed:
+            # A second, UNRELATED orchestration left as debris by a prior/crashed run:
+            # well-formed except for a dangling agent_graph edge (a child present in
+            # agent_graph.json but absent from agent_runs.jsonl). The conductor runs one
+            # orchestration per node, so such debris accumulates under
+            # workspace/orchestrations/ and previously failed a fresh healthy run.
+            _create_minimal_orchestration_tree(
+                repo_root, orchestration_id="orch_foreign_001"
+            )
+            foreign_runs = (
+                repo_root / "workspace" / "orchestrations" / "orch_foreign_001"
+                / "agent_runs.jsonl"
+            )
+            foreign_items = [
+                json.loads(line)
+                for line in foreign_runs.read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+            foreign_items = [
+                it for it in foreign_items
+                if it.get("agent_run_id") != "step_run_build_001"
+            ]
+            foreign_runs.write_text(
+                "\n".join(json.dumps(it, ensure_ascii=False) for it in foreign_items)
+                + "\n",
+                encoding="utf-8",
+            )
         return validate(
             repo_root=repo_root,
             workspace_root="workspace",
             require_orchestration=True,
             in_flight_agent_run_ids=set(in_flight_arids) if in_flight_arids else None,
+            current_orchestration_id=current_orchestration_id,
         )
 
     @staticmethod
@@ -5829,6 +5859,101 @@ end program shallow_water2d_runner
             self.assertTrue(
                 any("substep must not be parent role" in v for v in violations),
                 msg=f"substep-parent edge must still fail closed; got: {violations}",
+            )
+
+    def test_pre_judge_unscoped_scan_fails_on_foreign_crashed_orchestration(self) -> None:
+        """Phase-4 D2 (legacy/unscoped behavior): without --orchestration-id the
+        cross-orchestration integrity scan covers ALL orchestrations, so an unrelated
+        crashed orchestration's dangling agent_graph edge fails a healthy run."""
+        with tempfile.TemporaryDirectory() as tmp:
+            violations = self._violations_with_removed_child(
+                Path(tmp),
+                seed_foreign_crashed=True,
+                current_orchestration_id=None,
+            )
+            self.assertTrue(
+                any("orch_foreign_001" in v for v in violations),
+                msg=(
+                    "unscoped scan must surface the foreign orchestration's debris; "
+                    f"got: {violations}"
+                ),
+            )
+
+    def test_pre_judge_scoped_ignores_foreign_crashed_orchestration(self) -> None:
+        """Phase-4 D2: --orchestration-id scopes the integrity scan to the run being
+        judged, so an unrelated crashed orchestration's dangling edge no longer fails
+        the healthy current run. The current orchestration is itself well-formed, so
+        the scoped validation reports no violation referencing the foreign debris."""
+        with tempfile.TemporaryDirectory() as tmp:
+            violations = self._violations_with_removed_child(
+                Path(tmp),
+                seed_foreign_crashed=True,
+                current_orchestration_id="orch_test_001",
+            )
+            self.assertFalse(
+                any("orch_foreign_001" in v for v in violations),
+                msg=(
+                    "scoping to the current orchestration must ignore foreign debris; "
+                    f"got: {violations}"
+                ),
+            )
+            # Stronger: scoping must not silently drop the current node's own checks.
+            # The current orchestration is well-formed, so a correctly-scoped scan is
+            # fully clean (no dropped/false violations of any kind).
+            self.assertEqual(
+                violations, [],
+                msg=f"scoped validation of a healthy current run must be clean; got: {violations}",
+            )
+
+    def test_pre_judge_scoped_missing_current_orchestration_fails_closed(self) -> None:
+        """Phase-4 D2: a --orchestration-id naming a non-existent orchestration must
+        fail closed (the run being judged must be present), not silently pass."""
+        with tempfile.TemporaryDirectory() as tmp:
+            violations = self._violations_with_removed_child(
+                Path(tmp),
+                current_orchestration_id="orch_does_not_exist",
+            )
+            self.assertTrue(
+                any(
+                    "orch_does_not_exist" in v and "not found" in v
+                    for v in violations
+                ),
+                msg=f"missing current orchestration must fail closed; got: {violations}",
+            )
+
+    def test_pre_judge_scoped_narrows_node_safes_even_when_own_steps_empty(self) -> None:
+        """Phase-4 D2 regression: node_safes must be intersected with the scoped
+        orchestration's own nodes UNCONDITIONALLY. If the scoped orchestration has no
+        steps dir, leaving node_safes unnarrowed would retain the OTHER executions'
+        nodes (e.g. dependencies) and demand their step_results of this single scoped
+        dir — defeating the scoping. The orchestration genuinely missing its steps must
+        still fail closed via the per-orchestration "steps_root: missing" check, but
+        must NOT emit a per-node "missing step_result.json for [...]" that lists nodes
+        this orchestration does not own."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._violations_with_removed_child(repo_root)  # build healthy tree
+            shutil.rmtree(
+                repo_root / "workspace" / "orchestrations" / "orch_test_001" / "steps"
+            )
+            violations = validate(
+                repo_root=repo_root,
+                workspace_root="workspace",
+                require_orchestration=True,
+                current_orchestration_id="orch_test_001",
+            )
+            # Still fails closed on the genuinely-missing steps dir...
+            self.assertTrue(
+                any(v.endswith("/steps: missing") for v in violations),
+                msg=f"missing steps dir must fail closed; got: {violations}",
+            )
+            # ...but must NOT demand step_results for nodes not owned by this orch.
+            self.assertFalse(
+                any("missing step_result.json for" in v for v in violations),
+                msg=(
+                    "scoping must narrow node_safes to the orchestration's own nodes "
+                    f"even when it has no steps; got: {violations}"
+                ),
             )
 
     def test_detects_non_template_launch_prompt_when_orchestration_required(self) -> None:

@@ -6725,6 +6725,7 @@ def _validate_orchestration_hierarchy(
     executions: list[NodeExecution],
     violations: list[str],
     in_flight_agent_run_ids: set[str] | None = None,
+    current_orchestration_id: str | None = None,
 ) -> None:
     in_flight_agent_run_ids = in_flight_agent_run_ids or set()
     orchestrations_root = workspace_path / "orchestrations"
@@ -6744,6 +6745,43 @@ def _validate_orchestration_hierarchy(
         return
 
     node_safes = sorted({execution.pipeline_dir.parent.name for execution in executions})
+
+    # Phase-4 D2: scope the cross-orchestration integrity scan to the CURRENT
+    # orchestration when its id is supplied (pre_judge passes --orchestration-id).
+    # The conductor runs one orchestration per node (run_workflow `_run_node`), so
+    # workspace/orchestrations/ accumulates the current run, its dependency runs,
+    # AND debris from prior/crashed unrelated runs. The per-orchestration internal
+    # consistency checks below (dangling agent_graph edges, role-parent rules) must
+    # only police the run being judged: an unrelated crashed orchestration's
+    # dangling edge previously failed a healthy run (a fresh run inherited foreign
+    # debris). Dependencies are validated by their OWN pre_judge + the conductor's
+    # workflow_launch_check readiness gate, so they need not be re-policed here.
+    # When the id is absent (legacy callers / --stage full) the scan covers all
+    # orchestrations, preserving prior behavior.
+    if current_orchestration_id is not None:
+        scoped = [d for d in orchestration_dirs if d.name == current_orchestration_id]
+        if not scoped:
+            violations.append(
+                f"{orchestrations_root}/{current_orchestration_id}: current "
+                "orchestration directory not found"
+            )
+            return
+        orchestration_dirs = scoped
+        # Restrict coverage to the node(s) this orchestration actually produced, so
+        # scoping to one dir does not spuriously flag a dependency node's steps as
+        # missing (their step_results live in the dependency's own orchestration).
+        # Intersect UNCONDITIONALLY — even when this orchestration has no steps dir
+        # (own_node_safes empty): leaving node_safes unnarrowed would retain the other
+        # executions' nodes and demand their step_results of this single scoped dir,
+        # defeating the scoping. An orchestration genuinely missing its steps still
+        # fails closed via the per-orchestration "steps_root: missing" check below.
+        own_steps_root = scoped[0] / "steps"
+        own_node_safes = (
+            {p.name for p in own_steps_root.iterdir() if p.is_dir()}
+            if own_steps_root.is_dir() else set()
+        )
+        node_safes = sorted(set(node_safes) & own_node_safes)
+
     step_coverage = {
         (node_safe, step): False
         for node_safe in node_safes
@@ -7834,6 +7872,7 @@ def validate(
     require_orchestration: bool = False,
     run_ids: set[str] | None = None,
     in_flight_agent_run_ids: set[str] | None = None,
+    current_orchestration_id: str | None = None,
 ) -> list[str]:
     with _pinned_repo_root_for_schema(repo_root):
         return _validate_impl(
@@ -7844,6 +7883,7 @@ def validate(
             require_orchestration,
             run_ids,
             in_flight_agent_run_ids,
+            current_orchestration_id,
         )
 
 
@@ -7855,6 +7895,7 @@ def _validate_impl(
     require_orchestration: bool,
     run_ids: set[str] | None = None,
     in_flight_agent_run_ids: set[str] | None = None,
+    current_orchestration_id: str | None = None,
 ) -> list[str]:
     violations: list[str] = []
     normalized_workspace_root = _normalize_workspace_root_token(workspace_root)
@@ -7914,6 +7955,7 @@ def _validate_impl(
             executions=executions,
             violations=violations,
             in_flight_agent_run_ids=in_flight_agent_run_ids,
+            current_orchestration_id=current_orchestration_id,
         )
 
     source_hash_map: dict[str, list[SourceFingerprint]] = {}
@@ -8167,6 +8209,17 @@ def main(argv: list[str] | None = None) -> int:
         ),
     )
     parser.add_argument(
+        "--orchestration-id",
+        help=(
+            "orchestration_id of the run being judged. Effective only for --stage "
+            "pre_judge: scopes the cross-orchestration integrity scan to this single "
+            "orchestration so an unrelated crashed/prior orchestration's debris (a "
+            "dangling agent_graph edge) cannot fail a healthy run. Dependencies are "
+            "validated by their own pre_judge + the launch-check readiness gate. When "
+            "omitted, the scan covers all orchestrations (legacy behavior)."
+        ),
+    )
+    parser.add_argument(
         "--allow-missing-llm-review",
         action="store_true",
         help="Allow missing semantic_review.json for legacy pipelines.",
@@ -8287,6 +8340,11 @@ def _main_dispatch(args: argparse.Namespace, repo_root: Path) -> int:
                     in_flight_agent_run_ids=(
                         set(args.in_flight_agent_run_id)
                         if args.in_flight_agent_run_id
+                        else None
+                    ),
+                    current_orchestration_id=(
+                        args.orchestration_id.strip()
+                        if args.orchestration_id and args.orchestration_id.strip()
                         else None
                     ),
                 )

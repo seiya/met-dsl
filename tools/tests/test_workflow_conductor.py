@@ -1100,6 +1100,37 @@ class LeafSpawnTest(unittest.TestCase):
             finally:
                 wc.subprocess.run = orig  # type: ignore[assignment]
 
+    def test_spawn_leaf_missing_bwrap_binary_fails_closed(self) -> None:
+        # D3: when the bwrap binary is absent (e.g. preflight bypassed via
+        # ASSUME_BWRAP on a host without bwrap), subprocess.run raises
+        # FileNotFoundError. With a valid profile present, spawn_leaf must convert
+        # that to a SandboxEnforcementError so it routes to the unified fail-closed
+        # path instead of bubbling up as a generic conductor_error.
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            ws_tmp = repo / "workspace" / "tmp" / "A"
+            ws_tmp.mkdir(parents=True)
+            prof_dir = repo / "workspace" / "orchestrations" / "o" / "sandbox_profiles"
+            prof_dir.mkdir(parents=True)
+            (prof_dir / "A.json").write_text(json.dumps({
+                "repo_root": str(repo), "tmp_dir": str(ws_tmp),
+                "workspace_tmp_rw_abs": str(ws_tmp),
+                "read_roots": [], "write_roots": [],
+                "runtime_ro_bind_paths": [], "runtime_rw_bind_paths": [],
+            }), encoding="utf-8")
+
+            def fake_run(argv, **kw):  # type: ignore[no-untyped-def]
+                raise FileNotFoundError(2, "No such file or directory", "bwrap")
+
+            orig = wc.subprocess.run
+            try:
+                wc.subprocess.run = fake_run  # type: ignore[assignment]
+                with self.assertRaises(wc.SandboxEnforcementError):
+                    self._c(repo_root=repo, env={}).spawn_leaf(
+                        "P", {"HOME": "/h"}, session_id="A", child_arid="A")
+            finally:
+                wc.subprocess.run = orig  # type: ignore[assignment]
+
 
 class FailSummaryContractTest(unittest.TestCase):
     """Every non-pass substep payload must satisfy the REAL runtime summary

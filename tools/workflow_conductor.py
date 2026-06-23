@@ -710,9 +710,24 @@ class Conductor:
                 # up as a generic conductor error.
                 raise SandboxEnforcementError(
                     f"sandbox profile for {child_arid} is invalid: {exc}") from exc
-        proc = subprocess.run(
-            argv, cwd=self.repo_root, env=child_env, text=True, capture_output=True, check=False,
-        )
+        try:
+            proc = subprocess.run(
+                argv, cwd=self.repo_root, env=child_env, text=True, capture_output=True, check=False,
+            )
+        except FileNotFoundError as exc:
+            # The leaf executable could not be found. Under mandatory bwrap argv[0] is
+            # `bwrap`, so a missing binary means the host cannot sandbox the leaf at all
+            # (e.g. the startup preflight was bypassed via
+            # METDSL_ORCHESTRATION_ASSUME_BWRAP on a host where bwrap is absent — the
+            # probe lied). Funnel it into the SAME fail-closed path as a missing/invalid
+            # profile rather than letting a raw OSError bubble up as a generic
+            # conductor_error: every "leaf cannot be sandboxed" condition terminalizes
+            # consistently as a sandbox-enforcement failure.
+            if self._bwrap_enabled():
+                raise SandboxEnforcementError(
+                    f"cannot launch sandboxed leaf — executable not found "
+                    f"(bwrap missing on this host?): {exc}") from exc
+            raise
         return ProcResult(proc.returncode, proc.stdout, proc.stderr)
 
     def read_parent_return_token(self, child_arid: str) -> str:
