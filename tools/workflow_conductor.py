@@ -439,13 +439,15 @@ def build_launch_request(
                 # tests.md stays (used for case_id coverage).
                 f"{spec}/tests.md",
             ]
+            # lineage.json is authored host-side by the conductor (_write_lineage), not by
+            # the leaf — it sits at the pipeline root which must stay non-writable to the
+            # sandboxed leaf. So it is NOT in the leaf's allowed_output_paths.
             req["allowed_output_paths"] = [
                 f"{src}/src/{refs.spec_id}_model.f90",
                 f"{src}/src/{refs.spec_id}_runner.f90",
                 f"{src}/src/Makefile",
                 f"{src}/src/mcp_command_log.jsonl",
                 f"{src}/source_meta.json",
-                f"{refs.pipeline_ref}/lineage.json",
             ]
         else:  # verify
             must_read += [
@@ -648,6 +650,27 @@ class Conductor:
             return None
         return doc if isinstance(doc, dict) else None
 
+    def _readonly_sandbox_profile(self) -> dict[str, Any]:
+        """A read-only bwrap profile for a leaf with no record-launch (the failure
+        diagnostician): repo read-only, no write_roots, tmp-only scratch + backend
+        auth/session home + the hooks/audit bookkeeping dirs. Raises
+        SandboxEnforcementError if the host cannot build the profile (so the caller can
+        fail closed instead of crashing or launching unconfined)."""
+        from tools.orchestration_runtime import build_readonly_bwrap_profile
+        base = shlex.split(self.llm_command) if self.llm_command.strip() else [self.backend]
+        backend_command = base[0] if base else self.backend
+        try:
+            return build_readonly_bwrap_profile(
+                repo_root=self.repo_root,
+                orchestration_id=self.orchestration_id,
+                agent_run_id=self.orchestration_agent_run_id,
+                backend_command=backend_command,
+                backend_type=self.backend,
+            )
+        except (ValueError, OSError) as exc:
+            raise SandboxEnforcementError(
+                f"read-only diagnostician sandbox profile unavailable: {exc}") from exc
+
     def spawn_leaf(
         self,
         prompt_text: str,
@@ -656,6 +679,7 @@ class Conductor:
         session_id: str | None = None,
         resume_session_id: str | None = None,
         child_arid: str | None = None,
+        profile: dict[str, Any] | None = None,
     ) -> ProcResult:
         argv = self.leaf_command(
             prompt_text, session_id=session_id, resume_session_id=resume_session_id)
@@ -664,13 +688,16 @@ class Conductor:
         # workspace/tmp). record-launch records sandbox_enforced=True for every backend,
         # so applying it here makes that record true (the conductor leaf is otherwise
         # unconfined). Applies to both claude and codex — both get a profile at launch.
+        # A caller may pass an explicit `profile` for a leaf that has no record-launch
+        # profile keyed by child_arid (the read-only diagnostician; see escalate()).
         if self._bwrap_enabled():
             # Fail closed: the operator opted into enforcement and record-launch records
             # sandbox_enforced=true, so ANY leaf without a usable profile — a missing/
             # invalid one (older orchestration resumed, corrupted/deleted file) or a
-            # caller that supplies no child_arid (the diagnostician) — must NOT silently
-            # fall back to an unconfined launch.
-            profile = self._sandbox_profile_for(child_arid) if child_arid else None
+            # caller that supplies neither an explicit profile nor a child_arid — must
+            # NOT silently fall back to an unconfined launch.
+            if profile is None:
+                profile = self._sandbox_profile_for(child_arid) if child_arid else None
             if profile is None:
                 raise SandboxEnforcementError(
                     "METDSL_CONDUCTOR_BWRAP is enabled but no usable sandbox profile is "
@@ -724,6 +751,41 @@ class Conductor:
             "--reply-text", reply_text,
             "--agent-run-json", json.dumps(agent_run_json),
         ])
+
+    def _write_lineage(self, refs: NodeRefs) -> None:
+        """Author/refresh the pipeline `lineage.json` host-side (runtime-owned).
+
+        `lineage.json` lives at the pipeline root, which must stay non-writable to the
+        sandboxed leaf (the root contains the future source/binary/runs areas, and the
+        Edit/Write tools' atomic temp-sibling+rename would need the whole root writable).
+        So the conductor — which runs unconfined and already holds every id — writes it,
+        matching `docs/WORKSPACE_LAYOUT.md` ("added by each phase ... runtime"). Called at
+        each pipeline phase start after the producer id is reserved; idempotent, it
+        accumulates the stage ids (source_id at generate, +binary_id at build, +run_id at
+        validate). `direct_dependency_status` maps each direct dependency to "ready" — the
+        conductor only reaches here once `workflow_launch_check` confirmed readiness."""
+        ir = _read_yaml(self.repo_root / refs.ir_ref / "spec.ir.yaml") or {}
+        dep = ir.get("dependency") if isinstance(ir, dict) else None
+        direct_deps = dep.get("direct_deps") if isinstance(dep, dict) else None
+        status: dict[str, str] = {}
+        for d in direct_deps or []:
+            nk = d.get("node_key") if isinstance(d, dict) else d
+            if isinstance(nk, str) and nk.strip():
+                status[nk.strip()] = "ready"
+        lineage = {
+            "node_key": refs.node_key,
+            "spec_ref": refs.spec_path,
+            "ir_ref": refs.ir_ref,
+            "dependency_ref": refs.ir_ref,
+            "pipeline_id": refs.pipeline_id,
+            "source_id": refs.source_id,
+            "binary_id": refs.binary_id,
+            "run_id": refs.run_id,
+            "direct_dependency_status": status,
+        }
+        path = self.repo_root / refs.pipeline_ref / "lineage.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(lineage, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
 
     def write_step_result(self, node_key: str, step: str, executor_arid: str,
                           result: dict[str, Any]) -> dict[str, Any]:
@@ -1032,6 +1094,12 @@ class Conductor:
                                 skipped=True)
         self.workflow_launch_check(node_key, phase, child_agent_role(phase))
         self._ensure_fresh_producer_id(refs, phase)
+        # Author/refresh the pipeline lineage.json host-side BEFORE the substeps run:
+        # generate.verify's post_generate gate requires it, and the sandboxed leaf cannot
+        # write it (pipeline-root file; see _write_lineage). Pipeline phases only —
+        # compile writes under workspace/ir/, not the pipeline root.
+        if phase in ("generate", "build", "validate"):
+            self._write_lineage(refs)
 
         outcomes: list[SubstepOutcome] = []
         for i, substep in enumerate(SUBSTEPS[phase]):
@@ -1112,12 +1180,22 @@ class Conductor:
         prompt = _diagnosis_prompt(refs.node_key, phase, outcome.failed_substeps,
                                    context, self.workflow_mode)
         try:
-            proc = self.spawn_leaf(prompt, self._child_env(self.orchestration_agent_run_id))
-        except RuntimeError:
-            # Under bwrap-enforced mode the read-only diagnostician has no record-launch
-            # sandbox profile, so spawn_leaf fails closed. Treat an un-sandboxable
-            # diagnosis as conservatively terminal — same posture as an unparsable
-            # directive — rather than crashing the conductor or launching unconfined.
+            # The diagnostician has no record-launch profile (no child_arid); under
+            # bwrap-enforced mode build a dedicated read-only profile (repo ro, no
+            # write_roots) so it runs sandboxed instead of fail-closing. A read-only
+            # leaf has nothing to attribute, so the FS-diff is trivially empty.
+            profile = self._readonly_sandbox_profile() if self._bwrap_enabled() else None
+            proc = self.spawn_leaf(
+                prompt, self._child_env(self.orchestration_agent_run_id), profile=profile)
+        except (SandboxEnforcementError, OSError) as exc:
+            # The host cannot launch the sandboxed read-only diagnostician — either the
+            # profile is unbuildable (SandboxEnforcementError) or the bwrap/backend
+            # binary is missing (OSError/FileNotFoundError from subprocess.run, e.g. if
+            # the startup preflight was bypassed). The diagnostician is a best-effort
+            # recovery leaf, so treat an un-launchable diagnosis as conservatively
+            # terminal — same posture as an unparsable directive — rather than crashing
+            # the conductor or launching unconfined.
+            self.emit("diagnose_launch_failed", phase=phase, error=str(exc)[:200])
             return RouteDecision("fail_closed", reason=f"{phase}_diagnose_sandbox_unavailable")
         self._persist_leaf_output(self.orchestration_agent_run_id, proc,
                                   prefix=f"diagnose.{phase}")
@@ -1256,12 +1334,14 @@ def phase_required_outputs(refs: NodeRefs, phase: str) -> list[str]:
         return [f"{refs.ir_ref}/spec.ir.yaml", f"{refs.ir_ref}/ir_meta.json"]
     if phase == "generate":
         src = refs.source_dir()
+        # lineage.json is authored host-side by the conductor (_write_lineage), not a leaf
+        # output_ref, so it is NOT a step required_output (which must be covered by the
+        # producer leaf's output_refs). post_generate still verifies it independently.
         return [
             f"{src}/src/{refs.spec_id}_model.f90",
             f"{src}/src/{refs.spec_id}_runner.f90",
             f"{src}/src/Makefile",
             f"{src}/source_meta.json",
-            f"{refs.pipeline_ref}/lineage.json",
         ]
     if phase == "build":
         bdir = refs.binary_dir()

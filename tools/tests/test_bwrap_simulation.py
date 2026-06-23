@@ -29,6 +29,7 @@ from tools.orchestration_runtime import (
     _write_run_write_baseline,
     _actual_changed_paths_since_baseline,
     build_bwrap_profile,
+    build_readonly_bwrap_profile,
     render_bwrap_command,
 )
 
@@ -317,90 +318,61 @@ class BwrapBuildPathSimulationTests(unittest.TestCase):
 
 
 @unittest.skipUnless(_bwrap_usable(), "bwrap / user namespaces not available")
-class BwrapFilePinDirectWriteTests(unittest.TestCase):
-    """P2-5: a top-level managed-JSON FILE write_root (e.g. `lineage.json`) is bound rw as a
-    file-pin (`--bind <file> <file>`). The Phase-2 write path is the leaf's Write tool, which
-    performs an in-place truncate (open O_TRUNC); that succeeds on a bind-mounted file. The old
-    `guarded-apply-patch` path used `git apply` (unlink + create), whose unlink/rename of the
-    bind mount point fails (EROFS/EBUSY) -- the exact blocker that masked E2E
-    `orch_20260622T062842Z_f7d0804b` generate as `lineage.json cannot be written`. This case
-    proves the truncate-write succeeds AND the rename-over-pin fails, so direct Write -- not the
-    gate -- must be the leaf's write mechanism for file-pin managed JSON."""
+class BwrapReadonlyProfileTests(unittest.TestCase):
+    """P2-4b: the failure diagnostician runs under a read-only bwrap profile
+    (`build_readonly_bwrap_profile`) — no capability, no write_roots. Confirm the
+    rendered sandbox lets the leaf READ the repo and write tmp scratch, but BLOCKS any
+    repo write (no write_roots → repo stays ro), so a read-only reasoning leaf is
+    confined with nothing to attribute (FS-diff trivially empty)."""
 
-    PIPE = "workspace/pipelines/n/p_001"
-    LINEAGE = PIPE + "/lineage.json"
-
-    def _setup(self, repo: Path, orch: str, arid: str) -> None:
-        _ensure_orchestration_audit_dirs(repo, orch)
-        (repo / self.PIPE).mkdir(parents=True, exist_ok=True)
-        cap_dir = _capabilities_dir(repo, orch); cap_dir.mkdir(parents=True, exist_ok=True)
-        # No trailing slash -> a FILE write_root (file-pin). build_bwrap_profile pre-creates
-        # the empty stub and render binds it `--bind` rw.
-        (cap_dir / f"{arid}.json").write_text(
-            json.dumps({"agent_run_id": arid, "write_roots": [self.LINEAGE]}),
-            encoding="utf-8")
-        rm_dir = _read_manifests_dir(repo, orch); rm_dir.mkdir(parents=True, exist_ok=True)
-        (rm_dir / f"{arid}.json").write_text(
-            json.dumps({"agent_run_id": arid, "allowed_read_roots": []}), encoding="utf-8")
-
-    def _leaf_script(self) -> str:
+    def _leaf_script(self, arid: str) -> str:
         return textwrap.dedent(f"""
-            import os
+            import socket
             from pathlib import Path
-            LINEAGE = "{self.LINEAGE}"
             def report(tag, ok, e=""):
                 print(f"{{tag}}:{{'OK' if ok else 'FAIL'}}", e, flush=True)
-            # (Write-tool semantics) in-place truncate write of the file-pin -> must succeed.
+            # repo is ro-bound -> reading a repo file works
             try:
-                Path(LINEAGE).write_text('{{"schema_version":1,"nodes":[]}}')
-                report("TRUNCATE_WRITE", True)
+                Path("AGENTS_SIM.md").read_text(); report("READ_REPO", True)
             except Exception as e:
-                report("TRUNCATE_WRITE", False, repr(e))
-            # (git-apply / guarded-apply-patch semantics) write a tmp then rename OVER the
-            # bind-mounted pin -> must FAIL (cannot unlink/replace a bind mount point).
+                report("READ_REPO", False, repr(e))
+            # tmp scratch (workspace/tmp/<arid>) is bound rw
             try:
-                tmp = LINEAGE + ".tmp"
-                Path(tmp).write_text('{{"x":2}}')
-                os.replace(tmp, LINEAGE)
-                print("RENAME_OVER_PIN:ALLOWED", flush=True)   # bad: would defeat the file-pin
+                Path("workspace/tmp/{arid}/scratch.txt").write_text("x"); report("WRITE_TMP", True)
             except Exception as e:
-                print("RENAME_OVER_PIN:BLOCKED", repr(e), flush=True)   # expected
+                report("WRITE_TMP", False, repr(e))
+            # a repo write must be blocked: no write_roots, repo stays read-only
+            try:
+                Path("AGENTS_SIM.md").write_text("mutated")
+                print("WRITE_REPO:ALLOWED", flush=True)   # bad: confinement failed
+            except Exception:
+                print("WRITE_REPO:BLOCKED", flush=True)   # good
+            try:
+                socket.gethostbyname("api.anthropic.com"); report("DNS", True)
+            except Exception as e:
+                report("DNS", False, repr(e))
         """)
 
-    def _run(self, repo: Path, orch: str, arid: str) -> str:
-        profile = build_bwrap_profile(
-            repo_root=repo, orchestration_id=orch, agent_run_id=arid,
-            backend_command="python3", backend_type="claude")
-        cmd = render_bwrap_command(
-            profile=profile, command_argv=["python3", "-c", self._leaf_script()])
-        return subprocess.run(cmd, capture_output=True, text=True, timeout=90).stdout
-
-    def test_in_place_truncate_write_of_file_pin_succeeds(self) -> None:
+    def test_readonly_profile_reads_repo_blocks_repo_write(self) -> None:
         with tempfile.TemporaryDirectory() as t:
             repo = Path(t).resolve()
-            orch, arid = "orch_pin", "arid_pin"
-            self._setup(repo, orch, arid)
-            _write_run_write_baseline(repo, orch, agent_run_id=arid)
-            out = self._run(repo, orch, arid)
-            # The make-or-break: the leaf's direct Write (truncate) lands on the file-pin.
-            self.assertIn("TRUNCATE_WRITE:OK", out, out)
-            # The legacy git-apply unlink+rename path is structurally blocked on the file-pin.
-            self.assertIn("RENAME_OVER_PIN:BLOCKED", out, out)
-            # Host file reflects the truncate write (proves it wrote through the bind).
-            self.assertEqual(
-                (repo / self.LINEAGE).read_text(encoding="utf-8"),
-                '{"schema_version":1,"nodes":[]}',
-            )
-
-    def test_fs_diff_attributes_file_pin_write(self) -> None:
-        with tempfile.TemporaryDirectory() as t:
-            repo = Path(t).resolve()
-            orch, arid = "orch_pin2", "arid_pin2"
-            self._setup(repo, orch, arid)
-            _write_run_write_baseline(repo, orch, agent_run_id=arid)
-            self._run(repo, orch, arid)
-            changed = set(_actual_changed_paths_since_baseline(repo, orch, agent_run_id=arid))
-            self.assertIn(self.LINEAGE, changed, changed)
+            orch, arid = "orch_ro", "arid_ro"
+            _ensure_orchestration_audit_dirs(repo, orch)
+            (repo / "AGENTS_SIM.md").write_text("orig\n", encoding="utf-8")
+            profile = build_readonly_bwrap_profile(
+                repo_root=repo, orchestration_id=orch, agent_run_id=arid,
+                backend_command="python3", backend_type="claude")
+            self.assertTrue(profile.get("readonly"))
+            self.assertEqual(profile.get("write_roots"), [])
+            cmd = render_bwrap_command(
+                profile=profile, command_argv=["python3", "-c", self._leaf_script(arid)])
+            out = subprocess.run(cmd, capture_output=True, text=True, timeout=90).stdout
+            self.assertIn("READ_REPO:OK", out, out)
+            self.assertIn("WRITE_TMP:OK", out, out)
+            self.assertIn("WRITE_REPO:BLOCKED", out, out)
+            self.assertIn("DNS:OK", out, out)
+            # the repo file is unchanged on the host
+            self.assertEqual((repo / "AGENTS_SIM.md").read_text(), "orig\n")
 
 
 if __name__ == "__main__":

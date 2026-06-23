@@ -24,7 +24,6 @@
   "workspace/pipelines/component__dynamics_advdiff_flux_1d_upwind_center2__0.1.0/advdiff-flux-1d-uc2_20260620_002/source/src_20260620_002/src/dynamics_advdiff_flux_1d_upwind_center2_runner.f90",
   "workspace/pipelines/component__dynamics_advdiff_flux_1d_upwind_center2__0.1.0/advdiff-flux-1d-uc2_20260620_002/source/src_20260620_002/src/Makefile",
   "workspace/pipelines/component__dynamics_advdiff_flux_1d_upwind_center2__0.1.0/advdiff-flux-1d-uc2_20260620_002/source/src_20260620_002/src/mcp_command_log.jsonl",
-  "workspace/pipelines/component__dynamics_advdiff_flux_1d_upwind_center2__0.1.0/advdiff-flux-1d-uc2_20260620_002/source/src_20260620_002/source_meta.json",
-  "workspace/pipelines/component__dynamics_advdiff_flux_1d_upwind_center2__0.1.0/advdiff-flux-1d-uc2_20260620_002/lineage.json"
+  "workspace/pipelines/component__dynamics_advdiff_flux_1d_upwind_center2__0.1.0/advdiff-flux-1d-uc2_20260620_002/source/src_20260620_002/source_meta.json"
  ]
 }

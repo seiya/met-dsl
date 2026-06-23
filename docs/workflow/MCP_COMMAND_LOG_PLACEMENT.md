@@ -2,20 +2,21 @@
 
 > **Audience: child agents of the Generate / Build / Validate.execute phases.**
 > This is the canonical source for where the MCP side output `mcp_command_log.jsonl`, the
-> pipeline `lineage.json`, the Make `src/Makefile`, and the Validate.execute program output
+> Make `src/Makefile`, and the Validate.execute program output
 > (`diagnostics.json` / `perf.json` / `raw/*`) must be placed in `allowed_output_paths`, and
 > for the routing / forge-prevention rules the post_generate / post_build / post_execute gates
-> enforce. It lives under `docs/`, which is in every child's `read_manifest`. The substep
-> launch prompt carries a one-line pointer to this doc instead of inlining the full content
-> (per-launch token-cost reduction); `record-launch` also defensively auto-injects the
-> canonical `mcp_command_log.jsonl` / `lineage.json` / `src/Makefile` paths, so this doc is the
+> enforce. (The pipeline `lineage.json` is NOT a leaf output — the conductor authors it
+> host-side; see below.) It lives under `docs/`, which is in every child's `read_manifest`. The
+> substep launch prompt carries a one-line pointer to this doc instead of inlining the full
+> content (per-launch token-cost reduction); `record-launch` also defensively auto-injects the
+> canonical `mcp_command_log.jsonl` / `src/Makefile` paths, so this doc is the
 > explanatory canonical, not the sole enforcement path.
 
 ## Canonical `allowed_output_paths` placement of `mcp_command_log.jsonl`
 
 - **Always include the MCP side output `mcp_command_log.jsonl` in `allowed_output_paths`.** The canonical placement per phase is the following:
   - Generate substep: `<pipeline_ref>/source/<source_id>/src/mcp_command_log.jsonl` (run_linter). **This auto-inject and the `run_linter` side output correspond only to the `generate.generate` substep**. Because the `allowed_output_paths` of the `generate.verify` substep does not authorize the `run_linter` side output (`mcp_command_log.jsonl`), do not write `run_linter` execution in the verify launch prompt (the `validate_pipeline_semantics --stage` the verify may write is only `post_generate` as in the "substep ↔ allowed validator gate correspondence table"; the read-only `validate_workspace_root.py` is separately permitted).
-- **Always include the pipeline `lineage.json` (`<pipeline_ref>/lineage.json`) in the `allowed_output_paths` of the `generate.generate` substep.** The `generate.generate` substep authors `lineage.json` (its absence is a `post_generate` fail), so omitting it from `allowed_output_paths` prevents the child from writing it and stalls `Generate.verify` on `post_generate`. `record-launch` defensively auto-injects it for `generate.generate` (the same pattern as `mcp_command_log.jsonl`), but the explicit enumeration is canonical. Do **not** include it for `generate.verify`, which only reads it.
+- **The pipeline `lineage.json` is NOT a leaf output — do not list it in any `allowed_output_paths`.** It sits at the pipeline root, which must stay non-writable to the sandboxed leaf (the Edit/Write tools' atomic temp-sibling+rename would need the whole root writable), so the conductor authors it host-side (`tools/workflow_conductor.py:_write_lineage`) before `Generate.verify` runs, per `docs/WORKSPACE_LAYOUT.md`. `Generate.verify` only **reads** it (it is in verify's `skill_must_read_refs`).
   - Build step (in-phase, CMake/Meson out-of-source): `<pipeline_ref>/binary/<binary_id>/mcp_command_log.jsonl` (compile_project, project_dir=<binary_id>/)
   - Build step (cross-phase, Make in-source for Fortran/C-family): `<pipeline_ref>/source/<source_id>/src/mcp_command_log.jsonl` (compile_project, project_dir=<gen>/src/). Bound by the `source_id` of the launch request, and `record-launch` verifies `verification_status=pass` of `source_meta.json`
   - Validate.execute substep (in-phase): `<pipeline_ref>/runs/<run_id>/<node_key_safe>/mcp_command_log.jsonl` (run_program etc.)

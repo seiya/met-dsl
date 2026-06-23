@@ -2542,7 +2542,6 @@ shell_tool                       stable             true
                 child_agent_run_id="run_auto_inject_no_src",
                 src_id=src_id,
                 allowed_output_paths=[
-                    f"{_FIX_PIPE_REF}/lineage.json",
                     source_meta,
                 ],
             )
@@ -2754,10 +2753,10 @@ shell_tool                       stable             true
         )
         self.assertEqual([p for p in out2 if p == expected], [expected])
 
-    def test_generate_generate_auto_injects_lineage(self) -> None:
-        """Generate.generate launches must auto-inject <pipeline_ref>/lineage.json
-        so an orchestration that omits it from allowed_output_paths cannot block the
-        child from authoring it (audit: orch_20260615T095217Z_74450292)."""
+    def test_generate_generate_does_not_inject_lineage(self) -> None:
+        """Phase-2: lineage.json is authored host-side by the conductor (it sits at the
+        pipeline root, which must stay non-writable to the sandboxed leaf), so it must
+        NOT be auto-injected into the generate child's allowed_output_paths."""
         from tools.orchestration_runtime import _allowed_output_paths_for_launch
 
         source_id = "src_20260415_001"
@@ -2774,18 +2773,9 @@ shell_tool                       stable             true
         }
         out = _allowed_output_paths_for_launch(
             request_payload=req,
-            write_roots=[f"{_FIX_PIPE_REF}/"],
+            write_roots=[f"{_FIX_PIPE_REF}/source/"],
         )
-        expected = f"{_FIX_PIPE_REF}/lineage.json"
-        self.assertIn(expected, out)
-        # Idempotent: pre-listing it must not duplicate.
-        req2 = dict(req)
-        req2["allowed_output_paths"] = req["allowed_output_paths"] + [expected]
-        out2 = _allowed_output_paths_for_launch(
-            request_payload=req2,
-            write_roots=[f"{_FIX_PIPE_REF}/"],
-        )
-        self.assertEqual([p for p in out2 if p == expected], [expected])
+        self.assertNotIn(f"{_FIX_PIPE_REF}/lineage.json", out)
 
     def test_generate_verify_does_not_inject_lineage(self) -> None:
         """The verify substep only reads lineage.json; it must NOT be auto-injected
@@ -5663,129 +5653,6 @@ shell_tool                       stable             true
                 / "step_run_build_mcp_log.unauthorized_write_violation.json"
             )
             self.assertFalse(violation_path.exists())
-
-    def test_record_agent_run_recovers_collaterally_deleted_lineage_placeholder(self) -> None:
-        """Fix 4 (recoverability): a failed Generate run whose runtime-created
-        lineage.json placeholder was collaterally deleted outside the gate must
-        still be recordable. record-agent-run restores the 0-byte placeholder
-        before the baseline diff so the run is appended to agent_runs.jsonl
-        instead of fail-closing on an unrecoverable unauthorized_write over a
-        runtime-owned artifact."""
-        with tempfile.TemporaryDirectory() as tmp:
-            repo_root = Path(tmp)
-            init_orchestration(repo_root=repo_root, orchestration_id="orch_001")
-            _mark_dependencies_ready(repo_root)
-            write_preflight(
-                repo_root=repo_root,
-                orchestration_id="orch_001",
-                payload={
-                    "status": "pass",
-                    "sandbox_runtime": "bwrap",
-                    "sandbox_enforced": True,
-                    "can_launch_step_agents": True,
-                    "can_launch_substep_agents": True,
-                    "feature_states": {"multi_agent": True, "hooks": True},
-                    "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
-                },
-            )
-            record_agent_run(
-                repo_root=repo_root,
-                orchestration_id="orch_001",
-                payload={
-                    "agent_run_id": "orch_run_001",
-                    "agent_role": "orchestration",
-                    "status": "running",
-                    "agent_backend": "claude",
-                },
-            )
-            src_id = "src_20260604_010"
-            src_dir = f"{_FIX_PIPE_REF}/source/{src_id}/src/"
-            lineage_ref = f"{_FIX_PIPE_REF}/lineage.json"
-            record_launch(
-                repo_root=repo_root,
-                orchestration_id="orch_001",
-                parent_agent_run_id="orch_run_001",
-                child_agent_run_id="step_run_gen_recover",
-                request_payload={
-                    "agent_model": "claude-opus-4-8",
-                    "node_key": "problem/shallow_water2d@0.3.0",
-                    "step": "generate",
-                    "agent_role": "step",
-                    "orchestration_id": "orch_001",
-                    "agent_run_id": "step_run_gen_recover",
-                    "parent_agent_run_id": "orch_run_001",
-                    "ir_ref": _FIX_IR_REF,
-                    "pipeline_ref": _FIX_PIPE_REF,
-                    "dependency_ref": f"{_FIX_IR_REF}/spec.ir.yaml",
-                    "source_id": src_id,
-                    "allowed_output_paths": [src_dir],
-                    "skill_name": "workflow-generate",
-                    "skill_ref": "skills/workflow-generate/SKILL.md",
-                    "skill_must_read_refs": _fixture_skill_must_read_refs_step("generate"),
-                    "launch_prompt_full": _step_launch_prompt(
-                        "problem/shallow_water2d@0.3.0",
-                        "generate",
-                        "step_run_gen_recover",
-                    ),
-                },
-                response_payload=_spawn_response_payload("sess_step_run_gen_recover"),
-            )
-            # record_launch pre-creates the lineage.json file-pin placeholder.
-            lineage_path = repo_root / lineage_ref
-            self.assertTrue(
-                lineage_path.exists(),
-                "launch must pre-create the lineage.json placeholder",
-            )
-            # Simulate the collateral deletion of the placeholder outside the gate.
-            lineage_path.unlink()
-            self.assertFalse(lineage_path.exists())
-
-            # The failed run must record without raising; pre-fix this raised a
-            # ValueError (unauthorized_write over lineage.json) and the run was
-            # diverted to agent_runs_invalid.jsonl, dead-locking the orchestration.
-            payload = record_agent_run(
-                repo_root=repo_root,
-                orchestration_id="orch_001",
-                payload={
-                    "agent_run_id": "step_run_gen_recover",
-                    "agent_role": "step",
-                    "parent_agent_run_id": "orch_run_001",
-                    "step": "generate",
-                    "node_key": "problem/shallow_water2d@0.3.0",
-                    "status": "fail",
-                    "agent_backend": "claude",
-                    "agent_session_id": "sess_step_run_gen_recover",
-                    "result_summary": "generate fail-stopped (test fixture)",
-                    "output_refs": [],
-                },
-            )
-            self.assertEqual(payload["status"], "fail")
-            violation_path = (
-                repo_root
-                / "workspace/orchestrations/orch_001/violations"
-                / "step_run_gen_recover.unauthorized_write_violation.json"
-            )
-            self.assertFalse(
-                violation_path.exists(),
-                "collateral deletion of a runtime-owned placeholder must not be "
-                "recorded as an unauthorized write",
-            )
-            # The failed run is durably recorded (valid log), not diverted to the
-            # invalid log.
-            runs_log = (
-                repo_root
-                / "workspace/orchestrations/orch_001/agent_runs.jsonl"
-            )
-            self.assertIn("step_run_gen_recover", runs_log.read_text(encoding="utf-8"))
-            invalid_log = (
-                repo_root
-                / "workspace/orchestrations/orch_001/agent_runs_invalid.jsonl"
-            )
-            if invalid_log.exists():
-                self.assertNotIn(
-                    "step_run_gen_recover",
-                    invalid_log.read_text(encoding="utf-8"),
-                )
 
     def test_execute_run_quality_checks_cross_phase_mcp_log_authorized(self) -> None:
         """Execute's run_quality_checks runs with project_dir=generate/<gen>/src/
@@ -16655,7 +16522,11 @@ class BwrapProfileFilePinTests(unittest.TestCase):
             orch = "orch_bwrap_fp_007"
             run_id = "run_bwrap_fp_007"
             pipeline_root = "workspace/pipelines/a__b__1.0/pipe_001"
-            # generate step write_roots: generate/ dir + lineage.json file pin
+            # Synthetic write_roots exercising a file-pin at the pipeline root (a dir
+            # write_root + a file pin). NOTE: the real generate contract no longer
+            # declares lineage.json as a write_root (it is conductor-authored host-side);
+            # this fixture only asserts the general rendering property that a file pin's
+            # parent directory is NOT bound writable.
             write_roots = [
                 f"{pipeline_root}/source/",
                 f"{pipeline_root}/lineage.json",

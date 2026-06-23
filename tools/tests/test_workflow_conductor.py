@@ -641,17 +641,46 @@ class DiagnosticianTest(unittest.TestCase):
         self.assertEqual(d.action, "fail_closed")
 
     def test_escalate_fail_closed_when_diagnostician_unsandboxable(self) -> None:
-        # Under bwrap-enforced mode the diagnostician has no profile → spawn_leaf raises;
-        # escalate must convert that to a conservative fail_closed, not crash.
+        # Under bwrap-enforced mode, if the host cannot build the read-only diagnostician
+        # profile, escalate must convert that to a conservative fail_closed, not crash.
         c = self._conductor()
 
-        def boom(prompt, env, **kw):  # type: ignore[no-untyped-def]
-            raise RuntimeError("METDSL_CONDUCTOR_BWRAP enabled but no usable sandbox profile")
+        def boom():  # type: ignore[no-untyped-def]
+            raise wc.SandboxEnforcementError("no bwrap on this host")
 
-        c.spawn_leaf = boom  # type: ignore[assignment]
+        c._readonly_sandbox_profile = boom  # type: ignore[assignment]
         d = c.escalate(self._refs(), "validate", wc.PhaseOutcome("validate", "fail"))
         self.assertEqual(d.action, "fail_closed")
         self.assertIn("sandbox_unavailable", d.reason or "")
+
+    def test_escalate_spawns_diagnostician_with_readonly_profile(self) -> None:
+        # P2-4b: under bwrap-enforced mode the diagnostician runs sandboxed with a
+        # dedicated read-only profile (no write_roots) instead of fail-closing.
+        # Uses a TemporaryDirectory repo_root because this exercises the REAL
+        # _readonly_sandbox_profile() (which mkdir's sandbox/tmp/hooks/audit dirs).
+        with tempfile.TemporaryDirectory() as tmp:
+            c = _FakeConductor(
+                repo_root=Path(tmp), orchestration_id="o",
+                orchestration_agent_run_id="ORCH", backend="claude", env={},
+            )
+            c.calls = []
+            self.assertTrue(c._bwrap_enabled())  # the test conductor enforces bwrap
+            captured: dict[str, object] = {}
+
+            def spawn(prompt, env, **kw):  # type: ignore[no-untyped-def]
+                captured["profile"] = kw.get("profile")
+                return wc.ProcResult(
+                    0, '{"action":"reopen","target_phase":"compile","reason":"diag"}', "")
+
+            c.spawn_leaf = spawn  # type: ignore[assignment]
+            d = c.escalate(self._refs(), "validate", wc.PhaseOutcome("validate", "fail"))
+        self.assertEqual(d.action, "reopen")
+        profile = captured["profile"]
+        self.assertIsInstance(profile, dict)
+        assert isinstance(profile, dict)
+        self.assertTrue(profile.get("readonly"))
+        self.assertEqual(profile.get("write_roots"), [])
+        self.assertEqual(profile.get("read_roots"), [])
 
     def test_conduct_escalates_then_reopens(self) -> None:
         c = self._conductor()
@@ -1151,6 +1180,71 @@ class FailSummaryContractTest(unittest.TestCase):
         self.assertEqual(payload["status"], "pass")
         self.assertNotIn("result_summary", payload)
         self.assertIn("output_refs:", text)
+
+
+class WriteLineageTest(unittest.TestCase):
+    """P2: lineage.json is authored host-side by the conductor (it lives at the pipeline
+    root, which must stay non-writable to the sandboxed leaf)."""
+
+    def _conductor(self, repo: Path) -> _FakeConductor:
+        c = _FakeConductor(
+            repo_root=repo, orchestration_id="o",
+            orchestration_agent_run_id="ORCH", backend="claude", env={},
+        )
+        c.calls = []
+        return c
+
+    def test_authors_pipeline_lineage_for_leaf_node(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            refs = wc.NodeRefs(
+                node_key="component/dynamics_advdiff_flux_1d_upwind_center2@0.1.0",
+                spec_path="spec/component/dynamics/advection_diffusion/dynamics_advdiff_flux_1d_upwind_center2",
+                ir_id="advdiff_20260622_001",
+                pipeline_id="advdiff_20260622_002",
+                source_id="src_20260622_001",
+            )
+            ir_dir = repo / refs.ir_ref
+            ir_dir.mkdir(parents=True)
+            (ir_dir / "spec.ir.yaml").write_text(
+                'dependency:\n'
+                '  node_key: "component/dynamics_advdiff_flux_1d_upwind_center2@0.1.0"\n'
+                '  direct_deps: []\n',
+                encoding="utf-8")
+            self._conductor(repo)._write_lineage(refs)
+            lin_path = repo / refs.pipeline_ref / "lineage.json"
+            self.assertTrue(lin_path.exists())
+            lin = json.loads(lin_path.read_text(encoding="utf-8"))
+            self.assertEqual(lin["node_key"], refs.node_key)
+            self.assertEqual(lin["pipeline_id"], refs.pipeline_id)
+            self.assertEqual(lin["ir_ref"], refs.ir_ref)
+            self.assertEqual(lin["dependency_ref"], refs.ir_ref)
+            self.assertEqual(lin["spec_ref"], refs.spec_path)
+            self.assertEqual(lin["source_id"], refs.source_id)
+            self.assertIsNone(lin["binary_id"])
+            self.assertIsNone(lin["run_id"])
+            self.assertEqual(lin["direct_dependency_status"], {})
+
+    def test_accumulates_stage_ids_and_marks_direct_deps_ready(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            refs = wc.NodeRefs(
+                node_key="component/x@0.1.0", spec_path="spec/component/x",
+                ir_id="x_20260622_001", pipeline_id="x_20260622_002",
+                source_id="src_001", binary_id="bin_001", run_id="run_001")
+            ir_dir = repo / refs.ir_ref
+            ir_dir.mkdir(parents=True)
+            (ir_dir / "spec.ir.yaml").write_text(
+                'dependency:\n'
+                '  direct_deps:\n'
+                '    - node_key: "component/dep@0.1.0"\n',
+                encoding="utf-8")
+            self._conductor(repo)._write_lineage(refs)
+            lin = json.loads((repo / refs.pipeline_ref / "lineage.json").read_text(encoding="utf-8"))
+            self.assertEqual(lin["source_id"], "src_001")
+            self.assertEqual(lin["binary_id"], "bin_001")
+            self.assertEqual(lin["run_id"], "run_001")
+            self.assertEqual(lin["direct_dependency_status"], {"component/dep@0.1.0": "ready"})
 
 
 if __name__ == "__main__":  # pragma: no cover

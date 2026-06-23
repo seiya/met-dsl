@@ -2696,13 +2696,13 @@ def _write_roots_for_launch(
     if st == "compile":
         return [ir_norm]
     if st == "generate":
-        # pipeline_ref contains the unique pipeline_id (reserved by reserve-phase-root),
-        # so lineage.json is exclusive to this run — no concurrent agent shares this path.
-        # bwrap binds lineage.json's parent directory (not the file) so the agent can create
-        # it; the file must not be pre-created before the agent writes it.
+        # lineage.json is NOT a leaf write_root: it sits at the pipeline root, which must
+        # stay non-writable to the sandboxed leaf (atomic temp-sibling+rename would need
+        # the whole root writable). It is authored host-side by the conductor
+        # (workflow_conductor._write_lineage), matching docs/WORKSPACE_LAYOUT.md. The leaf
+        # writes only the source tree.
         return [
             _with_trailing_slash(_normalize_rel_posix(f"{pipeline_ref.rstrip('/')}/source")),
-            _normalize_rel_posix(f"{pipeline_ref.rstrip('/')}/lineage.json"),
         ]
     if st == "build":
         return [_with_trailing_slash(_normalize_rel_posix(f"{pipeline_ref.rstrip('/')}/binary"))]
@@ -4586,8 +4586,9 @@ def _allowed_output_paths_for_launch(
         if step_token == "compile":
             return path in compile_required
         if step_token == "generate":
-            if pipeline_ref and path == f"{pipeline_ref}/lineage.json":
-                return True
+            # lineage.json is NOT a generate leaf output (it is authored host-side by the
+            # conductor; see workflow_conductor._write_lineage). The generate leaf writes
+            # only the source tree.
             if generate_prefix and path.startswith(generate_prefix):
                 if "/src/" in path:
                     return True
@@ -5145,17 +5146,17 @@ def _allowed_file_tool_paths_for_launch(
         # permitted to be written via direct Edit/Write tools.
         #
         # Phase-2: under mandatory bwrap confinement a leaf writes its managed
-        # artifacts (`lineage.json`, `*_meta.json`) and source directly via the
+        # artifacts (`*_meta.json`, `verdict.json`, …) and source directly via the
         # Write/Edit tools; FS-diff containment within the leaf's `write_roots`
         # is the authoritative attribution (`_validate_actual_write_paths`), so
         # managed `.json` / `.txt` outputs no longer route through
-        # guarded-apply-patch. A file-pin write_root (e.g. the top-level
-        # `lineage.json`) only accepts an in-place truncate-write, which the
-        # Write tool performs; `git apply` (unlink+create) would fail EROFS on a
-        # bind-mounted file, which is why direct Write — not the gate — is the
-        # leaf's write path. Canonical MCP audit logs stay excluded: they are
-        # MCP-owned and integrity-protected (forging a successful tool run must
-        # remain impossible regardless of bwrap confinement).
+        # guarded-apply-patch. (A managed artifact's write_root is always a
+        # directory — the Edit/Write tools write via a temp sibling + rename, which
+        # needs a writable parent; a pipeline-root file like `lineage.json` is
+        # therefore NOT a leaf output and is authored host-side by the conductor.)
+        # Canonical MCP audit logs stay excluded: they are MCP-owned and
+        # integrity-protected (forging a successful tool run must remain impossible
+        # regardless of bwrap confinement).
         derived = {
             path
             for path in allowed_set
@@ -5284,16 +5285,12 @@ def _mandatory_phase_outputs_for_launch(
     step_token = str(request_payload.get("step") or "").strip().lower()
     substep_token = str(request_payload.get("substep") or "").strip().lower()
     pipeline_ref = _normalize_rel_posix(str(request_payload.get("pipeline_ref") or ""))
-    # Generate.generate authors the pipeline ``lineage.json`` (its absence is a
-    # ``post_generate`` fail). Pre-authorize the canonical ``<pipeline_ref>/lineage.json``
-    # placement so an orchestration that omits it from ``allowed_output_paths`` cannot
-    # block the child from writing it and stall Generate.verify on ``post_generate``
-    # (audit: orch_20260615T095217Z_74450292 lost ~5 child re-launches to this). The
-    # generate phase contract already permits this path; ``_matches_phase_contract``
-    # confirms it stays in-contract. Restricted to the ``generate`` substep — ``verify``
-    # only reads lineage.json.
-    if step_token == "generate" and substep_token == "generate" and pipeline_ref:
-        return [f"{pipeline_ref}/lineage.json"]
+    # Phase-2: the pipeline ``lineage.json`` is no longer a leaf output — it sits at the
+    # pipeline root, which must stay non-writable to the sandboxed leaf (the Edit/Write
+    # tools' atomic temp-sibling+rename would need the whole root writable). The conductor
+    # authors it host-side (workflow_conductor._write_lineage) before generate.verify's
+    # post_generate gate runs, so it is NOT injected into the generate child's
+    # allowed_output_paths (historical audit: orch_20260615T095217Z_74450292 predates this).
     if step_token != "validate" or substep_token != "execute" or not pipeline_ref:
         return []
     node_key = str(request_payload.get("node_key") or "").strip()
@@ -5652,6 +5649,104 @@ def _backend_runtime_bind_paths(
     return ro_paths, rw_paths
 
 
+def _resolve_backend_rw_binds(repo_root: Path, backend_rw_desired: Sequence[str]) -> list[str]:
+    """Validate + materialize the backend config/credential home rw binds.
+
+    Each rw bind (the backend's auth/session home) must be ENTIRELY OUTSIDE repo_root.
+    render_bwrap_command emits rw binds after the repo `--ro-bind` (bwrap
+    later-overrides-earlier), so any rw path with a containment relationship to
+    repo_root grants writes that defeat the sandbox: covering repo_root (repo root, ~,
+    /) remounts the whole repo writable, and an in-repo home (e.g.
+    METDSL_HOME=$repo/workspace) makes that subtree — including other agents'
+    artifacts/audit logs — writable beyond the child's declared write_roots. Reject
+    both. A missing config *dir* is created (the only file, ~/.claude.json, is
+    existence-gated at source) so bwrap can bind it writable; a creation failure must
+    fail closed rather than emit a profile missing the required auth/session home.
+    Shared by build_bwrap_profile and build_readonly_bwrap_profile.
+    """
+    resolved_repo = repo_root.resolve()
+    backend_rw: list[str] = []
+    for _rwp in backend_rw_desired:
+        _pp = Path(_rwp)
+        _rw_resolved = _pp.resolve()
+        if (resolved_repo == _rw_resolved
+                or resolved_repo.is_relative_to(_rw_resolved)
+                or _rw_resolved.is_relative_to(resolved_repo)):
+            raise ValueError(
+                f"runtime rw bind {_rwp!r} is not outside repo_root {resolved_repo}; a "
+                f"backend config home inside/covering the repo would grant writes beyond "
+                f"the child write_roots and defeat the sandbox")
+        if not _pp.exists():
+            try:
+                _pp.mkdir(parents=True, exist_ok=True)
+            except OSError as exc:
+                raise ValueError(
+                    f"runtime rw bind {_rwp!r} (backend config home) is absent and could "
+                    f"not be created: {exc}") from exc
+        backend_rw.append(_rwp)
+    return backend_rw
+
+
+def build_readonly_bwrap_profile(
+    *,
+    repo_root: Path,
+    orchestration_id: str,
+    agent_run_id: str,
+    backend_command: str,
+    backend_type: str = "",
+) -> dict[str, Any]:
+    """A bwrap profile for a READ-ONLY leaf that has no capability / write_roots.
+
+    Used by the conductor's failure diagnostician (spawned with no `child_arid`, hence
+    no record-launch, capability, or read manifest). The repo is bound read-only, there
+    are NO write_roots and NO read-root file pins, and the only writable surfaces are: a
+    tmp scratch (sandbox tmp + workspace/tmp/<arid>), the backend's config/credential
+    home (auth/session, outside repo_root), and the per-orchestration hooks/ + audit/
+    bookkeeping dirs the leaf's own PreToolUse/PostToolUse hooks persist to. A read-only
+    agent has nothing to attribute, so the FS-diff is trivially empty; any artifact
+    write it attempts is blocked by bwrap (repo ro, no write_roots) AND by the hook (no
+    output manifest). Mirrors build_bwrap_profile's bind composition minus the
+    capability/manifest-derived read_roots, write_roots, file pins, gate dir, and
+    cross-phase MCP log binds.
+    """
+    sandbox_root = _orchestration_root(repo_root, orchestration_id) / "sandboxes" / agent_run_id
+    tmp_root = sandbox_root / "tmp"
+    tmp_root.mkdir(parents=True, exist_ok=True)
+    workspace_tmp_host = (repo_root / "workspace" / "tmp" / agent_run_id).resolve()
+    workspace_tmp_host.mkdir(parents=True, exist_ok=True)
+    child_env = _safe_host_env_for_child()
+    child_env["TMPDIR"] = str(workspace_tmp_host)
+    backend_ro, backend_rw_desired = _backend_runtime_bind_paths(backend_type, backend_command)
+    backend_rw = _resolve_backend_rw_binds(repo_root, backend_rw_desired)
+    # The leaf's own hooks persist hook-event audit (hooks/) and the first-read-invariant
+    # state (audit/<arid>.auto_reads_seen.json, which fail-closes the hook if unwritable),
+    # both outside any write_root. Bind their per-orchestration dirs writable.
+    hooks_rel = f"workspace/orchestrations/{orchestration_id}/hooks/"
+    audit_rel = f"workspace/orchestrations/{orchestration_id}/audit/"
+    (repo_root / hooks_rel).mkdir(parents=True, exist_ok=True)
+    (repo_root / audit_rel).mkdir(parents=True, exist_ok=True)
+    return {
+        "orchestration_id": orchestration_id,
+        "agent_run_id": agent_run_id,
+        "sandbox_runtime": "bwrap",
+        "backend_command": backend_command.strip(),
+        "repo_root": str(repo_root),
+        "read_roots": [],
+        "write_roots": [],
+        "runtime_ro_bind_paths": _runtime_ro_bind_paths() + backend_ro,
+        "runtime_rw_bind_paths": backend_rw,
+        "tmp_dir": str(tmp_root),
+        "workspace_tmp_rw_abs": str(workspace_tmp_host),
+        "runtime_rw_rel_paths": [hooks_rel, audit_rel],
+        "runtime_rw_file_paths": [],
+        "workdir": str(repo_root),
+        "env": child_env,
+        "generated_at": _utc_now_iso(),
+        "created_file_pin_stubs": [],
+        "readonly": True,
+    }
+
+
 def build_bwrap_profile(
     *,
     repo_root: Path,
@@ -5745,38 +5840,7 @@ def build_bwrap_profile(
     child_env = _safe_host_env_for_child()
     child_env["TMPDIR"] = str(workspace_tmp_host)
     backend_ro, backend_rw_desired = _backend_runtime_bind_paths(backend_type, backend_command)
-    resolved_repo = repo_root.resolve()
-    backend_rw: list[str] = []
-    for _rwp in backend_rw_desired:
-        _pp = Path(_rwp)
-        _rw_resolved = _pp.resolve()
-        # The backend config home must be ENTIRELY OUTSIDE repo_root. render_bwrap_command
-        # emits rw binds after the repo `--ro-bind` (bwrap later-overrides-earlier), so any
-        # rw path with a containment relationship to repo_root grants writes that defeat
-        # the sandbox: covering repo_root (repo root, ~, /) remounts the whole repo
-        # writable, and an in-repo home (e.g. METDSL_HOME=$repo/workspace) makes that
-        # subtree — including other agents' artifacts/audit logs — writable beyond the
-        # child's declared write_roots. Reject both.
-        if (resolved_repo == _rw_resolved
-                or resolved_repo.is_relative_to(_rw_resolved)
-                or _rw_resolved.is_relative_to(resolved_repo)):
-            raise ValueError(
-                f"runtime rw bind {_rwp!r} is not outside repo_root {resolved_repo}; a "
-                f"backend config home inside/covering the repo would grant writes beyond "
-                f"the child write_roots and defeat the sandbox")
-        if not _pp.exists():
-            # Every missing rw entry is a creatable config dir (the only file,
-            # ~/.claude.json, is existence-gated at source). Create it — including a
-            # dotted custom home like ~/.codex.v2 — so bwrap can bind it writable. A
-            # creation failure (non-writable/racing parent) must fail closed, not drop
-            # the bind and emit a profile missing the required auth/session home.
-            try:
-                _pp.mkdir(parents=True, exist_ok=True)
-            except OSError as exc:
-                raise ValueError(
-                    f"runtime rw bind {_rwp!r} (backend config home) is absent and could "
-                    f"not be created: {exc}") from exc
-        backend_rw.append(_rwp)
+    backend_rw = _resolve_backend_rw_binds(repo_root, backend_rw_desired)
     # The leaf runs `guarded-apply-patch` (a runtime-CLI subprocess) which records gate
     # attribution evidence under workspace/orchestrations/<orch>/gates/<arid>/. That path
     # is outside the artifact `write_roots`, so without a writable bind bwrap blocks the
@@ -6716,8 +6780,11 @@ def _runtime_created_pin_stub_paths(
     """Return the repo-relative file-pin stubs this run pre-created, mapped to
     the ``mtime_ns`` recorded at creation (``created_file_pin_stubs``).
 
-    These are runtime-owned canonical placeholders (e.g. the Generate step's
-    ``lineage.json``) created so bwrap can bind them at file granularity. They
+    These are runtime-owned canonical placeholders for any file-pin write_roots
+    created so bwrap can bind them at file granularity. (Phase-2: the core
+    workflow declares no file-pin write_roots — the former example, the Generate
+    step's ``lineage.json``, is now authored host-side by the conductor — so this
+    is dormant, retained for P2-7 cleanup.) They
     carry no agent-authored content unless the agent wrote them through the
     gate, so their collateral deletion is semantically harmless (and is even
     performed deliberately by ``_cleanup_empty_file_pin_stubs`` for untouched
@@ -7263,7 +7330,7 @@ def _validate_actual_write_paths(
     baseline_agent_run_id = run_id if actor_role in {"step", "substep"} else None
     if actor_role in {"step", "substep"}:
         # Fix 4 (recoverability): re-create any runtime-owned file-pin stub
-        # (e.g. lineage.json) that was collaterally deleted outside the gate so
+        # that was collaterally deleted outside the gate so
         # the baseline diff is clean and a failed run remains recordable instead
         # of dead-locking the orchestration. Stubs the agent legitimately
         # mutated through guarded-apply-patch (gate_changed_paths) are skipped.
@@ -15727,7 +15794,7 @@ def guarded_apply_patch(
         msg = (proc.stderr or proc.stdout or "").strip()
         raise RuntimeError(f"guarded-apply-patch: git apply failed: {msg}")
     # Fix 3 (probing-deletion safety): defense-in-depth — re-create any
-    # runtime-owned file-pin stub (e.g. lineage.json) that this apply removed
+    # runtime-owned file-pin stub that this apply removed
     # without it being declared in changed_paths. `not_covered` above already
     # rejects out-of-scope targets, so a placeholder outside changed_paths must
     # not have been a legitimate target; restoring the 0-byte canonical
