@@ -1852,5 +1852,133 @@ class DependencyClosureTests(unittest.TestCase):
             self.assertIsNone(resolve_spec_ref_for(repo_root, "component", "missing"))
 
 
+class StdoutTeeTests(unittest.TestCase):
+    """Cover the host-side run-log tee added to run_workflow: stdout mirroring,
+    best-effort IO suppression, attribute fall-through, and the open helper's
+    success / failure (None) contract plus filename collision-safety."""
+
+    def test_tee_mirrors_to_both_stream_and_log(self) -> None:
+        terminal = io.StringIO()
+        logf = io.StringIO()
+        tee = run_workflow._StdoutTee(terminal, logf)
+        n = tee.write("hello\n")
+        self.assertEqual(n, len("hello\n"))
+        self.assertEqual(terminal.getvalue(), "hello\n")
+        self.assertEqual(logf.getvalue(), "hello\n")
+
+    def test_tee_swallows_log_write_errors_without_losing_terminal(self) -> None:
+        terminal = io.StringIO()
+
+        class _BrokenLog:
+            def write(self, data: str) -> int:
+                raise OSError("disk full")
+
+            def flush(self) -> None:
+                raise OSError("disk full")
+
+        tee = run_workflow._StdoutTee(terminal, _BrokenLog())
+        # Must not raise, and the terminal must still receive the data.
+        tee.write("payload\n")
+        tee.flush()
+        self.assertEqual(terminal.getvalue(), "payload\n")
+
+    def test_tee_attribute_fall_through(self) -> None:
+        # fileno() is load-bearing: subprocesses derive stdout from the parent fd.
+        tee = run_workflow._StdoutTee(sys.__stdout__, io.StringIO())
+        self.assertEqual(tee.fileno(), sys.__stdout__.fileno())
+
+    def test_open_run_log_writes_unique_files(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            oid = "orch_log_001"
+            f1 = run_workflow._open_run_log(repo_root, oid)
+            f2 = run_workflow._open_run_log(repo_root, oid)
+            self.assertIsNotNone(f1)
+            self.assertIsNotNone(f2)
+            try:
+                run_logs = repo_root / "workspace" / "orchestrations" / oid / "run_logs"
+                files = sorted(run_logs.glob("run_*.jsonl"))
+                # Two opens against the SAME orchestration_id (the --resume case)
+                # must not collide.
+                self.assertEqual(len(files), 2)
+                for p in files:
+                    self.assertTrue(p.name.startswith("run_"))
+                    self.assertTrue(p.name.endswith(".jsonl"))
+            finally:
+                for f in (f1, f2):
+                    if f is not None:
+                        f.close()
+
+    def test_open_run_log_returns_none_on_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            # Make `workspace` a regular file so mkdir of the run_logs dir fails;
+            # the helper must degrade to None rather than raise.
+            (repo_root / "workspace").write_text("not a dir", encoding="utf-8")
+            self.assertIsNone(run_workflow._open_run_log(repo_root, "orch_x"))
+
+    def test_run_node_closes_log_and_restores_stdout_when_node_start_print_raises(
+        self,
+    ) -> None:
+        """Regression: the tee swap + node_start print must be INSIDE the try so a
+        raising print (e.g. a broken terminal pipe, which the tee does not swallow
+        for the real stream) still triggers the finally — closing the log file and
+        restoring stdout — instead of leaking the handle and leaving stdout
+        wrapped."""
+
+        class _TrackedLog:
+            def __init__(self) -> None:
+                self.closed = False
+
+            def write(self, data: str) -> int:
+                return len(data)
+
+            def flush(self) -> None:
+                pass
+
+            def close(self) -> None:
+                self.closed = True
+
+        class _BrokenStdout:
+            def write(self, data: str) -> int:
+                raise BrokenPipeError("closed pipe")
+
+            def flush(self) -> None:
+                pass
+
+        tracked = _TrackedLog()
+        orig_open = run_workflow._open_run_log
+        run_workflow._open_run_log = lambda *a, **k: tracked  # type: ignore[assignment]
+        saved_stdout = sys.stdout
+        broken = _BrokenStdout()
+        with tempfile.TemporaryDirectory() as tmp:
+            sys.stdout = broken  # type: ignore[assignment]
+            try:
+                with self.assertRaises(BrokenPipeError):
+                    run_workflow._run_node(
+                        repo_root=Path(tmp),
+                        base_env={},
+                        orchestration_id="orch_leak_001",
+                        spec_ref="spec/x",
+                        source_dependency_ref="spec/x/deps.yaml",
+                        until_phase="compile",
+                        llm="claude",
+                        llm_command="claude",
+                        workflow_mode="dev",
+                        agent_model=None,
+                        status="running",
+                        invoke_llm=False,
+                        resume_mode=False,
+                    )
+                # stdout restored to the original stream (not left wrapped), and the
+                # log file handle closed — no leak.
+                self.assertIs(sys.stdout, broken)
+                self.assertNotIsInstance(sys.stdout, run_workflow._StdoutTee)
+                self.assertTrue(tracked.closed)
+            finally:
+                sys.stdout = saved_stdout
+                run_workflow._open_run_log = orig_open  # type: ignore[assignment]
+
+
 if __name__ == "__main__":
     unittest.main()

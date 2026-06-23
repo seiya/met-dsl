@@ -22067,6 +22067,29 @@ class FailureAnalysisRuntimeSidecarExemptionTests(unittest.TestCase):
             )
         )
 
+    def test_should_ignore_classifies_host_run_log(self) -> None:
+        """Host-side run logs (run_workflow.py's stdout JSONL tee, under
+        `<orch>/run_logs/`) must be exempt: the outer driver — not a child —
+        writes them, and the log grows while a leaf runs, so without the
+        exemption it would surface in that leaf's terminal write-diff."""
+        from tools.orchestration_runtime import _should_ignore_runtime_snapshot_path
+
+        orch_id = "orch_001"
+        base = f"workspace/orchestrations/{orch_id}"
+        kwargs = {"orchestration_id": orch_id, "agent_run_id": "child_arid"}
+
+        self.assertTrue(
+            _should_ignore_runtime_snapshot_path(
+                f"{base}/run_logs/run_20260623T051301Z_abc123de.jsonl", **kwargs
+            )
+        )
+        # A file directly at the orch root (not under run_logs/) is NOT exempt.
+        self.assertFalse(
+            _should_ignore_runtime_snapshot_path(
+                f"{base}/run_20260623T051301Z_abc123de.jsonl", **kwargs
+            )
+        )
+
     def test_dated_archive_workspaces_are_not_exempt_from_validation(self) -> None:
         """A child write under a top-level `workspace_*` archive must NOT be exempted
         from the snapshot/diff — exempting it would blind unauthorized-write

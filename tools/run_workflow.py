@@ -1093,6 +1093,65 @@ def main(argv: list[str] | None = None) -> int:
     )
 
 
+class _StdoutTee:
+    """Mirror everything written to stdout into a run-log file as well.
+
+    Installed for the duration of a node run so the JSONL event stream printed
+    to the terminal — `node_start`, the conductor's `phase_start` /
+    `phase_complete` emits, and the final ok/fail summary — is also persisted to
+    the workspace, where the same information is otherwise not recoverable
+    (the conductor's emits and per-phase `elapsed_seconds` are stdout-only).
+
+    Writes to the log file are best-effort: a log-file IO error must never break
+    the run or swallow terminal output, so file errors are silently ignored.
+    Attribute access falls through to the wrapped stream so the object remains a
+    drop-in `sys.stdout`.
+    """
+
+    def __init__(self, stream: Any, log_file: Any) -> None:
+        self._stream = stream
+        self._log = log_file
+
+    def write(self, data: str) -> int:
+        written = self._stream.write(data)
+        try:
+            self._log.write(data)
+        except Exception:  # noqa: BLE001 - never let log IO break the run
+            pass
+        return written
+
+    def flush(self) -> None:
+        self._stream.flush()
+        try:
+            self._log.flush()
+        except Exception:  # noqa: BLE001
+            pass
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._stream, name)
+
+
+def _open_run_log(repo_root: Path, orchestration_id: str) -> Any:
+    """Open a fresh timestamped run-log file under the orchestration dir.
+
+    The name is `run_<UTC timestamp>_<uuid8>.jsonl` so repeated runs against the
+    same orchestration_id (notably `--resume`) never collide. The `run_logs/`
+    prefix is exempt from the runtime write-snapshot
+    (`_should_ignore_runtime_snapshot_path`), so this host-side write never
+    contaminates a leaf's terminal write-diff. Returns the open file object, or
+    None if it could not be created (logging is best-effort)."""
+    try:
+        run_logs_dir = (
+            repo_root / "workspace" / "orchestrations" / orchestration_id / "run_logs"
+        )
+        run_logs_dir.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        path = run_logs_dir / f"run_{stamp}_{uuid.uuid4().hex[:8]}.jsonl"
+        return path.open("w", encoding="utf-8")
+    except Exception:  # noqa: BLE001 - logging must never break the run
+        return None
+
+
 def _run_node(
     *,
     repo_root: Path,
@@ -1127,24 +1186,40 @@ def _run_node(
     # that directory so concurrent workflows' workspace/tmp/<other_agent_run_id>/ are untouched.
     orchestration_tmp_for_cleanup: Path | None = None
 
-    # Announce node start on stdout (uniform for the single/target/dependency
-    # nodes), matching the JSONL info-event stream the rest of this driver emits.
-    print(
-        json.dumps(
-            {
-                "status": "info",
-                "event": "node_start",
-                "spec_ref": spec_ref,
-                "until_phase": until_phase,
-                "orchestration_id": orchestration_id,
-                "resume": resume_mode,
-            },
-            ensure_ascii=False,
-        ),
-        flush=True,
-    )
+    # Tee this node's stdout JSONL event stream to a timestamped run-log file
+    # under the orchestration dir, so the same information (node_start, the
+    # conductor's phase_start/phase_complete emits, final ok/fail summary) is
+    # recoverable from the workspace afterwards, not only on the terminal.
+    # `_open_run_log` is internally exception-safe (returns None on failure), and
+    # the `saved_stdout` capture cannot raise, so both stay outside the try. The
+    # stdout swap and the node_start print, however, go INSIDE the try: otherwise
+    # a raising print (e.g. BrokenPipeError when terminal stdout is a closed pipe,
+    # which the tee does not swallow for the real stream) would skip the finally,
+    # leaking the log handle and leaving sys.stdout wrapped.
+    run_log_file = _open_run_log(repo_root, orchestration_id)
+    saved_stdout = sys.stdout
 
     try:
+        if run_log_file is not None:
+            sys.stdout = _StdoutTee(saved_stdout, run_log_file)
+
+        # Announce node start on stdout (uniform for the single/target/dependency
+        # nodes), matching the JSONL info-event stream the rest of this driver emits.
+        print(
+            json.dumps(
+                {
+                    "status": "info",
+                    "event": "node_start",
+                    "spec_ref": spec_ref,
+                    "until_phase": until_phase,
+                    "orchestration_id": orchestration_id,
+                    "resume": resume_mode,
+                },
+                ensure_ascii=False,
+            ),
+            flush=True,
+        )
+
         if resume_mode:
             # Resume an existing orchestration: enable checkpoint resume (sets
             # resume_enabled=true and preserves orchestration_agent_run_id) instead
@@ -1443,6 +1518,12 @@ def _run_node(
         print(json.dumps(ok_output, ensure_ascii=False))
         return 0
     finally:
+        if run_log_file is not None:
+            sys.stdout = saved_stdout
+            try:
+                run_log_file.close()
+            except Exception:  # noqa: BLE001
+                pass
         if orchestration_tmp_for_cleanup is not None and orchestration_tmp_for_cleanup.exists():
             shutil.rmtree(orchestration_tmp_for_cleanup, ignore_errors=True)
 

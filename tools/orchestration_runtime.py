@@ -6105,6 +6105,14 @@ def _should_ignore_runtime_snapshot_path(
         f"{orch_root}/violations/",
         f"{orch_root}/steps/",
         f"{orch_root}/reservations/",
+        # Host-side run logs (run_workflow.py's stdout JSONL tee:
+        # run_<timestamp>_<uuid>.jsonl). Written only by the outer driver
+        # process, never by a child agent (a child cannot reach the path through
+        # tool hooks — `output_manifest_write_guard` blocks writes outside its
+        # allowed_file_tool_paths). The log grows while a leaf is running, so
+        # without this exemption it would surface in that leaf's terminal
+        # write-diff and be misattributed as an unauthorized_write_violation.
+        f"{orch_root}/run_logs/",
     )
     if any(token.startswith(prefix) for prefix in runtime_prefixes):
         return True
