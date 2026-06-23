@@ -95,6 +95,24 @@ def _load_json_if_dict(path: Path) -> dict[str, Any] | None:
     return payload if isinstance(payload, dict) else None
 
 
+# Audit-log continuity: a hook-policy id that was renamed forward keeps a legacy
+# alias here so historical block records (carrying the old id) aggregate under the
+# new id rather than splitting into a separate, stale bucket. Add an entry whenever
+# a policy id is renamed; the right-hand side is the current canonical id.
+_LEGACY_POLICY_ALIASES: dict[str, str] = {
+    # P2-7 cleanup: the guard that rejects unauthorized direct artifact writes was
+    # renamed from the guarded-apply-patch-era id to one that names its actual job.
+    "enforce_guarded_apply_patch": "forbid_unauthorized_file_write",
+}
+
+
+def _policy_of(block: dict[str, Any]) -> str:
+    """Canonical policy id for a block record, applying legacy-id aliases so a
+    record written before a policy rename is counted under the current id."""
+    policy = (block.get("audit_detail") or {}).get("policy", "unknown")
+    return _LEGACY_POLICY_ALIASES.get(policy, policy)
+
+
 _EXPECTED_BENIGN_POLICIES: frozenset[str] = frozenset({
     # Claude Code platform-level auto-reads at session start.  Hooks must keep
     # blocking these to preserve the read trust boundary, but they are not real
@@ -123,7 +141,7 @@ def collect_policy_block_counts(
 ) -> dict[str, int]:
     counter: Counter = Counter()
     for b in blocks:
-        policy = (b.get("audit_detail") or {}).get("policy", "unknown")
+        policy = _policy_of(b)
         counter[policy] += 1
     return dict(counter.most_common())
 
@@ -164,7 +182,7 @@ def split_substantive_and_benign(
     substantive: list[dict[str, Any]] = []
     benign: list[dict[str, Any]] = []
     for b in blocks:
-        policy = (b.get("audit_detail") or {}).get("policy", "unknown")
+        policy = _policy_of(b)
         if policy in _EXPECTED_BENIGN_POLICIES:
             benign.append(b)
         else:
@@ -189,7 +207,7 @@ def detect_suspicious_benign_volume(
     counts: dict[tuple[str, str], int] = {}
     for b in benign_blocks:
         audit_detail = b.get("audit_detail") or {}
-        policy = audit_detail.get("policy", "unknown")
+        policy = _policy_of(b)
         # Resolution order for agent_run_id: audit_detail (canonical, set by
         # validate_read_access for auto_read_expected_block) → top-level →
         # payload_summary → "<unknown>".
@@ -226,7 +244,7 @@ def collect_fix_hint_stats(
     repeated: defaultdict = defaultdict(list)
     seen_commands: list[str] = []
     for b in blocks:
-        policy = (b.get("audit_detail") or {}).get("policy", "unknown")
+        policy = _policy_of(b)
         fix_hint = (b.get("audit_detail") or {}).get("fix_hint")
         cmd = (
             (b.get("payload_summary") or {}).get("command", "")
@@ -321,7 +339,12 @@ def collect_fail_closed_timeline(
             "tool_name": e.get("tool_name") or (
                 (e.get("payload_summary") or {}).get("tool_name") if isinstance(e.get("payload_summary"), dict) else None
             ),
-            "policy": (e.get("audit_detail") or {}).get("policy"),
+            # Preserve None for non-block events (no policy), but alias a legacy id.
+            "policy": (
+                _LEGACY_POLICY_ALIASES.get(_raw_policy, _raw_policy)
+                if (_raw_policy := (e.get("audit_detail") or {}).get("policy")) is not None
+                else None
+            ),
             "payload_summary": str(e.get("payload_summary", ""))[:120],
         }
 

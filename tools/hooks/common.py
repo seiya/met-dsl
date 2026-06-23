@@ -1819,14 +1819,12 @@ def validate_write_access(
             ),
             continue_processing=False,
             audit_detail={
-                # Policy id kept as `enforce_guarded_apply_patch` for audit-log /
-                # remediation-table continuity: it is the stable identifier for the
-                # whole "a direct artifact write was rejected — use the Edit/Write
-                # tool" class (docs/RUNBOOK.md#hook-recovery and the audit-claude
-                # SKILL key on it). The id is forensic-only and never surfaced to the
-                # leaf (only `reason` + `fix_hint` are). Full rename is P2-7 cleanup
-                # alongside the guarded-apply-patch retirement.
-                "policy": "enforce_guarded_apply_patch",
+                # `forbid_unauthorized_file_write` is the stable forensic identifier for
+                # the whole "a direct artifact write was rejected — use the Edit/Write
+                # tool" class (docs/RUNBOOK.md#hook-recovery and the audit-claude SKILL
+                # key on it). The id is forensic-only and never surfaced to the leaf
+                # (only `reason` + `fix_hint` are).
+                "policy": "forbid_unauthorized_file_write",
                 "tool_name": tool_name,
                 "file_path": file_path,
                 "agent_run_id": agent_run_id,
@@ -1859,7 +1857,7 @@ def validate_write_access(
             ),
             continue_processing=False,
             audit_detail={
-                "policy": "enforce_guarded_apply_patch",
+                "policy": "forbid_unauthorized_file_write",
                 "tool_name": tool_name,
                 "file_path": file_path,
                 "agent_run_id": agent_run_id,

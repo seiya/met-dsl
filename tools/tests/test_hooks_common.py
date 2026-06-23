@@ -2096,7 +2096,7 @@ class FixHintInAuditDetailTests(unittest.TestCase):
             )
         self.assertEqual(decision.action, HookDecisionAction.BLOCK)
         audit = decision.audit_detail or {}
-        self.assertEqual(audit.get("policy"), "enforce_guarded_apply_patch")
+        self.assertEqual(audit.get("policy"), "forbid_unauthorized_file_write")
         self.assertEqual(audit.get("tool_name"), "Bash")
 
     def test_bash_redirect_to_allowed_file_tool_path_is_blocked(self) -> None:
@@ -2129,7 +2129,7 @@ class FixHintInAuditDetailTests(unittest.TestCase):
                 tool_name="Bash",
             )
         self.assertEqual(decision.action, HookDecisionAction.BLOCK)
-        self.assertEqual((decision.audit_detail or {}).get("policy"), "enforce_guarded_apply_patch")
+        self.assertEqual((decision.audit_detail or {}).get("policy"), "forbid_unauthorized_file_write")
         self.assertEqual((decision.audit_detail or {}).get("tool_name"), "Bash")
 
     def test_output_manifest_write_guard_fix_hint_is_literal_path(self) -> None:

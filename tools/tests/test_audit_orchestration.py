@@ -63,6 +63,18 @@ class CollectPolicyBlockCountsTests(unittest.TestCase):
         result = collect_policy_block_counts(blocks)
         self.assertIn("unknown", result)
 
+    def test_legacy_policy_id_aggregates_under_current_id(self) -> None:
+        # Audit-log continuity: a historical record carrying the pre-rename id
+        # (enforce_guarded_apply_patch) must count under the current id so the two
+        # do not split into separate buckets in retrospective aggregation.
+        blocks = [
+            _make_block("enforce_guarded_apply_patch"),
+            _make_block("forbid_unauthorized_file_write"),
+        ]
+        result = collect_policy_block_counts(blocks)
+        self.assertEqual(result["forbid_unauthorized_file_write"], 2)
+        self.assertNotIn("enforce_guarded_apply_patch", result)
+
 
 class SplitSubstantiveAndBenignTests(unittest.TestCase):
     def test_auto_read_expected_block_is_benign(self) -> None:
