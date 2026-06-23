@@ -1495,9 +1495,9 @@ _ALLOWED_EXTENSIONLESS_BYPRODUCT_NAMES: frozenset[str] = frozenset({
 
 # True compiler byproducts — created directly by the compiler as subprocess output.
 # Terminal validation accepts these under a directory allowlist as confined build output.
-# (NOTE: the legacy "gate provenance / gate_changed_paths" terminal model is deprecated for
-# step/substep — Phase-2 authorizes by write_roots-containment of the FS-diff; the gate code
-# is reserved for P2-7 removal. See docs/ORCHESTRATION.md.)
+# (NOTE: the legacy "gate provenance / gate_changed_paths" terminal model is gone —
+# Phase-2 authorizes step/substep writes by write_roots-containment of the FS-diff.
+# See docs/ORCHESTRATION.md.)
 _COMPILER_BYPRODUCT_EXTENSIONS: frozenset[str] = frozenset({".mod", ".o", ".a"})
 
 # Allowlist of extensions permitted under a directory allowlist entry via the
@@ -1510,8 +1510,8 @@ _COMPILER_BYPRODUCT_EXTENSIONS: frozenset[str] = frozenset({".mod", ".o", ".a"})
 #     data injection is unauditable and can poison downstream steps.
 #   - Compiler byproducts (.mod, .o, .a) — created directly by the compiler as subprocess
 #     output, never via Edit/Write. File-tool writes of these extensions are blocked here;
-#     terminal validation also rejects them unless they have gate provenance — agents must
-#     clean up build artefacts before record-agent-run.
+#     terminal validation also rejects them unless they land under the step's write_roots —
+#     agents must clean up build artefacts before record-agent-run.
 #
 # Extensionless files are gated by _ALLOWED_EXTENSIONLESS_BYPRODUCT_NAMES.
 # Everything else is rejected (fail-closed).

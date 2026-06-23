@@ -6662,8 +6662,6 @@ def _write_unauthorized_write_violation(
     actual_changed_paths: list[str],
     unauthorized_paths: list[str],
     output_refs: list[str],
-    gate_changed_paths: list[str],
-    missing_from_gate_changed_paths: list[str],
     write_roots: list[str],
     manifest_file_tool_paths: list[str] | None = None,
     directory_authorized_paths: list[str] | None = None,
@@ -6678,8 +6676,6 @@ def _write_unauthorized_write_violation(
         "actual_changed_paths": actual_changed_paths,
         "unauthorized_paths": unauthorized_paths,
         "output_refs": output_refs,
-        "gate_changed_paths": gate_changed_paths,
-        "missing_from_gate_changed_paths": missing_from_gate_changed_paths,
         "write_roots": write_roots,
     }
     if manifest_file_tool_paths is not None:
@@ -6887,11 +6883,6 @@ def _validate_actual_write_paths(
         agent_run_id=baseline_agent_run_id,
     )
     output_refs = _declared_output_refs(payload)
-    # P2-7: the apply_patch_writes gate is retired (no file-pin write_roots remain and
-    # no gate writer exists), so there is never any gate-changed-paths evidence. Kept as
-    # an empty placeholder: step/substep writes are authorized by write_roots containment
-    # below, and the orchestration role's declared-paths gate falls back to output_refs.
-    gate_changed_paths: list[str] = []
 
     if actor_role == "orchestration":
         child_excludable = _child_managed_paths_excludable_from_orchestration_diff(
@@ -6945,19 +6936,12 @@ def _validate_actual_write_paths(
                 _parent_run_id = _raw_payload.strip()
         if _parent_run_id:
             parent_tmp_root = _normalize_rel_posix(f"workspace/tmp/{_parent_run_id}")
-    missing_from_gate_changed_paths = sorted(
-        {
-            path
-            for path in actual_changed_paths
-            if not any(_repo_path_under_prefix(path, gate_path) for gate_path in gate_changed_paths)
-        }
-    )
     manifest_file_tool_paths: set[str] = set()
     manifest_allowed_tmp_root: str | None = None
     manifest_allowed_output_dirs: list[str] = []
     manifest_integrity_protected_logs: set[str] = set()
     if actor_role == "orchestration":
-        declared_paths = sorted(set(output_refs) | set(gate_changed_paths))
+        declared_paths = sorted(set(output_refs))
         exact_declared_paths = declared_paths  # orchestration: no directory entries
     else:
         # step/substep: include manifest-permitted direct write paths so that
@@ -7015,13 +6999,12 @@ def _validate_actual_write_paths(
                     )
                 manifest_allowed_tmp_root = _tmp_norm
         exact_declared_paths = sorted(
-            set(gate_changed_paths)
-            | manifest_file_tool_paths
+            manifest_file_tool_paths
             | manifest_integrity_protected_logs
         )
         declared_paths = sorted(set(exact_declared_paths) | set(manifest_allowed_output_dirs))
     # Use a frozenset for O(1) exact-match lookup. exact_declared_paths contains
-    # concrete file paths (gate_changed_paths + manifest_file_tool_paths); prefix
+    # concrete file paths (manifest_file_tool_paths + integrity-protected logs); prefix
     # matching would allow a directory token that leaked in to bypass extension policy.
     _exact_declared_set: frozenset[str] = frozenset(exact_declared_paths)
     directory_authorized: list[str] = []
@@ -7057,10 +7040,10 @@ def _validate_actual_write_paths(
             # sandbox the leaf fails closed at launch), so a leaf can only write
             # inside its declared write_roots. A change that landed under a
             # write_root is therefore the leaf's own confined output and is
-            # authorized by containment — no guarded-apply-patch gate provenance is
-            # required (gate_changed_paths / manifest_file_tool_paths are no longer
-            # consulted for authorization). Writes outside write_roots are
-            # impossible under the sandbox and already rejected above.
+            # authorized by containment — no gate provenance is required
+            # (manifest_file_tool_paths is no longer consulted for authorization).
+            # Writes outside write_roots are impossible under the sandbox and already
+            # rejected above.
             continue
         # orchestration actor (the trusted, unconfined conductor): keep the
         # declared-paths gate (its writes are bookkeeping under the orch root).
@@ -7104,8 +7087,6 @@ def _validate_actual_write_paths(
                 actual_changed_paths=actual_changed_paths,
                 unauthorized_paths=unauthorized,
                 output_refs=output_refs,
-                gate_changed_paths=gate_changed_paths,
-                missing_from_gate_changed_paths=missing_from_gate_changed_paths,
                 write_roots=write_roots,
                 manifest_file_tool_paths=sorted(manifest_file_tool_paths) if manifest_file_tool_paths else None,
                 directory_authorized_paths=directory_authorized if directory_authorized else None,

@@ -5352,8 +5352,8 @@ shell_tool                       stable             true
             self.assertNotIn(log_ref, manifest["allowed_file_tool_paths"])
 
             # Simulate build artefacts on disk:
-            #   - the binary, written via guarded-apply-patch (gate provenance)
-            #   - the MCP audit log, written by MCP server directly (no gate)
+            #   - the binary, written under the step's write_roots (authorized by containment)
+            #   - the MCP audit log, written by MCP server directly
             bin_path = repo_root / bin_ref
             bin_path.parent.mkdir(parents=True, exist_ok=True)
             bin_path.write_text("binary\n", encoding="utf-8")
@@ -5513,9 +5513,9 @@ shell_tool                       stable             true
             self.assertNotIn(cross_phase_log, manifest["allowed_file_tool_paths"])
 
             # Simulate the artefacts on disk:
-            #   - diagnostics.json written via guarded-apply-patch (gate provenance)
+            #   - diagnostics.json written under the step's write_roots (authorized by containment)
             #   - cross-phase mcp_command_log.jsonl written by MCP run_quality_checks
-            #     (no gate provenance; cross-phase placement under generate/)
+            #     (cross-phase placement under generate/)
             diag_path = repo_root / diagnostics_ref
             diag_path.parent.mkdir(parents=True, exist_ok=True)
             diag_path.write_text("{}\n", encoding="utf-8")
@@ -6321,7 +6321,7 @@ shell_tool                       stable             true
                             },
                         )
 
-    def test_record_agent_run_accepts_step_terminal_when_gate_changed_paths_uses_directory_prefix(self) -> None:
+    def test_record_agent_run_accepts_step_terminal_when_output_under_write_root(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
             init_orchestration(repo_root=repo_root, orchestration_id="orch_001")
@@ -13851,8 +13851,8 @@ class TerminalUnauthorizedWriteDirectWriteTests(unittest.TestCase):
             self.assertEqual(violation.get("unauthorized_paths"), [out_of_root_rel])
             self.assertNotIn(in_root_rel, violation.get("unauthorized_paths") or [])
 
-    def test_step_terminal_rejects_mod_file_without_gate_provenance(self) -> None:
-        """Compiler byproducts (.mod) under directory allowlist are unauthorized without gate provenance.
+    def test_step_terminal_rejects_mod_file_outside_write_roots(self) -> None:
+        """Compiler byproducts (.mod) written outside write_roots are unauthorized.
 
         Agents must clean up build artefacts before record-agent-run to prevent unaudited binary injection.
         """
@@ -13944,18 +13944,18 @@ class TerminalUnauthorizedWriteDirectWriteTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "unauthorized write paths"):
                 self._run_validate(repo_root, "orch_dw_bl_003", "run_dw_bl_003")
 
-    def test_step_terminal_rejects_source_file_without_gate_provenance(self) -> None:
-        """A source file (.f90) written outside guarded-apply-patch must fail terminal validation."""
+    def test_step_terminal_rejects_source_file_outside_write_roots(self) -> None:
+        """A source file (.f90) written outside the step's write_roots must fail terminal validation."""
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
-            # Write the source file directly (not via guarded-apply-patch → not in gate_changed_paths)
+            # Write the source file directly into a path outside the step's write_roots
             self._setup_src_dir_state(repo_root, orch="orch_dw_gate_001", run_id="run_dw_gate_001",
                                       src_files={"flux.f90": "MODULE flux\nEND MODULE\n"})
             with self.assertRaisesRegex(ValueError, "unauthorized write paths"):
                 self._run_validate(repo_root, "orch_dw_gate_001", "run_dw_gate_001")
 
-    def test_step_terminal_rejects_compiler_byproduct_without_gate_provenance(self) -> None:
-        """Compiler byproducts (.mod, .o, .a) are unauthorized without gate provenance.
+    def test_step_terminal_rejects_compiler_byproduct_outside_write_roots(self) -> None:
+        """Compiler byproducts (.mod, .o, .a) written outside write_roots are unauthorized.
 
         Agents must clean up compiler artefacts before record-agent-run to prevent
         unaudited binary injection into the pipeline.
@@ -22449,8 +22449,7 @@ class DismissViolationTests(unittest.TestCase):
         return _write_unauthorized_write_violation(
             repo, oid, agent_run_id=arid, actor_role="step",
             actual_changed_paths=list(paths), unauthorized_paths=list(paths),
-            output_refs=[], gate_changed_paths=[], missing_from_gate_changed_paths=[],
-            write_roots=[],
+            output_refs=[], write_roots=[],
         )
 
     def test_prior_dismissal_preserved_on_overwrite(self) -> None:
@@ -22472,8 +22471,7 @@ class DismissViolationTests(unittest.TestCase):
                 repo, oid, agent_run_id=arid, actor_role="step",
                 actual_changed_paths=["a.txt", "b.txt"],
                 unauthorized_paths=["a.txt", "b.txt"],
-                output_refs=[], gate_changed_paths=[],
-                missing_from_gate_changed_paths=[], write_roots=[],
+                output_refs=[], write_roots=[],
             )
             final = json.loads(p.read_text(encoding="utf-8"))
             self.assertIn("prior_dismissals", final)
@@ -22502,8 +22500,7 @@ class DismissViolationTests(unittest.TestCase):
                     repo, oid, agent_run_id=arid, actor_role="step",
                     actual_changed_paths=["a.txt", f"new{i}.txt"],
                     unauthorized_paths=["a.txt", f"new{i}.txt"],
-                    output_refs=[], gate_changed_paths=[],
-                    missing_from_gate_changed_paths=[], write_roots=[],
+                    output_refs=[], write_roots=[],
                 )
             final = json.loads(p.read_text(encoding="utf-8"))
             self.assertEqual(len(final["prior_dismissals"]), 2)
@@ -22531,8 +22528,7 @@ class DismissViolationTests(unittest.TestCase):
                 _write_unauthorized_write_violation(
                     repo, oid, agent_run_id=arid, actor_role="step",
                     actual_changed_paths=paths, unauthorized_paths=paths,
-                    output_refs=[], gate_changed_paths=[],
-                    missing_from_gate_changed_paths=[], write_roots=[],
+                    output_refs=[], write_roots=[],
                 )
 
             redetect(["a.txt", "b.txt"])           # #1 — captures the dismissal
