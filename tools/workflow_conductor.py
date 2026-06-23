@@ -1514,14 +1514,6 @@ def run_conductor(*, repo_root: Path | str, orchestration_id: str,
     ids), and runs the deterministic phase loop. Returns the terminal orchestration
     status (pass | fail | fail_closed)."""
     root = Path(repo_root)
-    # Record the conductor driver in the marker (orchestration is conductor-only;
-    # the marker is retained for back-compat with readers/audit).
-    marker = root / "workspace" / "orchestrations" / orchestration_id / "orchestrator.json"
-    try:
-        marker.parent.mkdir(parents=True, exist_ok=True)
-        marker.write_text(json.dumps({"orchestrator": "conductor"}) + "\n", encoding="utf-8")
-    except OSError:
-        pass
     node_key, spec_path = resolve_node(root, spec_ref)
     conductor = Conductor(
         repo_root=root, orchestration_id=orchestration_id,

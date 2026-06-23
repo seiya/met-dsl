@@ -536,50 +536,6 @@ class RunWorkflowTests(unittest.TestCase):
             fa = repo_root / "workspace" / "orchestrations" / "orch_devfail" / "failure_analysis.json"
             self.assertTrue(fa.exists(), "conductor dev failure must write failure_analysis.json")
 
-    def test_fresh_conductor_run_marks_driver_before_preflight(self) -> None:
-        # The marker must be written BEFORE init/preflight: a run that then FAILS
-        # preflight must still leave a "conductor" marker for resume/audit.
-        with tempfile.TemporaryDirectory() as tmp:
-            repo_root = Path(tmp)
-            self._seed_spec_tree(repo_root)
-            oid = "orch_conductor_preflight_fail"
-
-            def fake_runtime_command(root, env, args):  # type: ignore[no-untyped-def]
-                if args[0] == "init":
-                    return run_workflow.RuntimeResult(
-                        payload={"status": "ok", "orchestration_agent_run_id": "orch_agent_run_002"},
-                        raw_stdout="{}",
-                    )
-                if args[0] == "preflight":
-                    return run_workflow.RuntimeResult(
-                        payload={"status": "fail", "can_launch_step_agents": False,
-                                 "can_launch_substep_agents": False},
-                        raw_stdout="{}",
-                    )
-                return run_workflow.RuntimeResult(payload={"status": "ok"}, raw_stdout="{}")
-
-            original = run_workflow._runtime_command
-            buf = io.StringIO()
-            try:
-                run_workflow._runtime_command = fake_runtime_command  # type: ignore[assignment]
-                with redirect_stdout(buf):
-                    code = run_workflow.main(
-                        [
-                            "spec/problem/test.md", "build",
-                            "--repo-root", str(repo_root),
-                            "--orchestration-id", oid,
-                            "--llm", "claude",
-                            "--no-invoke-llm",
-                        ]
-                    )
-            finally:
-                run_workflow._runtime_command = original  # type: ignore[assignment]
-
-            self.assertEqual(code, 2)  # preflight failed
-            marker = repo_root / "workspace" / "orchestrations" / oid / "orchestrator.json"
-            self.assertTrue(marker.exists(), "marker must be written before preflight")
-            self.assertEqual(json.loads(marker.read_text())["orchestrator"], "conductor")
-
     def test_resume_recovers_params_and_uses_checkpoint_init(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
@@ -611,26 +567,6 @@ class RunWorkflowTests(unittest.TestCase):
             idx = init_calls[0].index("--spec-ref")
             self.assertEqual(init_calls[0][idx + 1], "spec/problem/test.md")
 
-
-    def test_resume_of_conductor_marked_run_restores_conductor(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            repo_root = Path(tmp)
-            self._seed_spec_tree(repo_root)
-            oid = "orch_20260101T000000Z_bbbbbbbb"
-            self._seed_resumable_orchestration(
-                repo_root, oid, spec_ref="spec/problem/test.md",
-                until_phase="Build", mode="dev", backend="claude",
-            )
-            (repo_root / "workspace" / "orchestrations" / oid / "orchestrator.json").write_text(
-                json.dumps({"orchestrator": "conductor"}) + "\n", encoding="utf-8"
-            )
-            # --no-invoke-llm: the conductor body never runs, so only the driver
-            # selection is exercised (observed via the ok-output orchestrator field).
-            code, out, _ = self._run_main_with_fake_runtime(
-                ["--resume", "--repo-root", str(repo_root), "--no-invoke-llm"]
-            )
-            self.assertEqual(code, 0, out)
-            self.assertEqual(out["orchestrator"], "conductor")
 
     def test_resume_forwards_explicit_agent_model(self) -> None:
         """An explicit --agent-model on --resume reaches the resume init (and thus

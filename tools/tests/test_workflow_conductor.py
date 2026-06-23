@@ -887,21 +887,6 @@ class ResumeRecoveryTest(unittest.TestCase):
         self.assertEqual(po.status, "pass")  # skipped (completed)
         self.assertEqual(c._producer_arid.get("generate"), "GEN")
 
-    def test_run_conductor_writes_orchestrator_marker(self) -> None:
-        import tempfile
-        with tempfile.TemporaryDirectory() as d:
-            root = Path(d)
-            # No spec_catalog -> resolve_node raises, but the marker is written first.
-            with self.assertRaises(Exception):
-                wc.run_conductor(
-                    repo_root=root, orchestration_id="oX", orchestration_agent_run_id="O",
-                    spec_ref="spec/component/x", source_dependency_ref="spec/component/x/deps.yaml",
-                    until_phase="validate", backend="claude", agent_model="",
-                    workflow_mode="dev", env={})
-            marker = root / "workspace" / "orchestrations" / "oX" / "orchestrator.json"
-            self.assertTrue(marker.exists())
-            self.assertEqual(json.loads(marker.read_text())["orchestrator"], "conductor")
-
 
 class LeafSpawnTest(unittest.TestCase):
     """Codex follow-ups: honor custom llm_command; gate substep on leaf returncode."""

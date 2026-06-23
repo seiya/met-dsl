@@ -211,39 +211,6 @@ def _read_json_if_exists(path: Path) -> dict[str, Any] | None:
     return payload if isinstance(payload, dict) else None
 
 
-def _orchestrator_marker_path(repo_root: Path, orchestration_id: str) -> Path:
-    return (
-        repo_root / "workspace" / "orchestrations" / orchestration_id / "orchestrator.json"
-    )
-
-
-def _write_orchestrator_marker(repo_root: Path, orchestration_id: str, orchestrator: str) -> None:
-    """Record the effective driver so `--resume` restores the SAME driver. This is
-    written symmetrically for both drivers at the TOP of _run_node, before init
-    creates orchestration_meta.json — so any run that got far enough to have
-    orchestration state necessarily wrote the marker first (even a fresh conductor
-    run that then fails preflight). A missing marker therefore means a legacy run
-    that predates symmetric marking, and those were always LLM-driven (the
-    historical default). (run_conductor re-writes the same value for the conductor
-    path; both writes agree because they read the same METDSL_ORCHESTRATOR.)"""
-    marker = _orchestrator_marker_path(repo_root, orchestration_id)
-    try:
-        marker.parent.mkdir(parents=True, exist_ok=True)
-        marker.write_text(json.dumps({"orchestrator": orchestrator}) + "\n", encoding="utf-8")
-    except OSError:
-        pass
-
-
-
-
-
-
-
-
-
-
-
-
 def _read_jsonl(path: Path) -> list[dict[str, Any]]:
     if not path.exists():
         return []
@@ -980,11 +947,6 @@ def main(argv: list[str] | None = None) -> int:
         llm_in = args.llm or DEFAULT_LLM
         mode_in = args.mode or DEFAULT_WORKFLOW_MODE
 
-    # Orchestration is conductor-only (deterministic Python phase loop, no parent
-    # orchestration LLM — avoids the per-turn cache_read overhead). The driver is
-    # no longer selectable; the marker is still written/read for back-compat.
-    orchestrator = "conductor"
-
     try:
         workflow_mode = _normalize_workflow_mode(mode_in)
         if not until_phase_in:
@@ -1080,10 +1042,6 @@ def main(argv: list[str] | None = None) -> int:
     base_env["METDSL_WORKFLOW_MODE"] = "1"
     base_env["METDSL_WORKFLOW_EXEC_MODE"] = workflow_mode
     base_env["METDSL_MISSING_ORCHESTRATION_ID_POLICY"] = "strict"
-    # Orchestration driver selector, read back in _run_node. Carried via base_env
-    # (rather than threaded through every _run_node / dependency-closure call site)
-    # to keep the wiring localized; it is a harmless no-op in child subprocess env.
-    base_env["METDSL_ORCHESTRATOR"] = orchestrator
     base_env["PYTHONPATH"] = str(repo_root) + (
         f":{base_env['PYTHONPATH']}" if base_env.get("PYTHONPATH") else ""
     )
@@ -1184,13 +1142,6 @@ def _run_node(
             ensure_ascii=False,
         ),
         flush=True,
-    )
-
-    # Record the driver BEFORE init/preflight so every run that entered _run_node
-    # leaves a marker even if it fails preflight or is killed mid-setup. Orchestration
-    # is conductor-only; the conductor also re-writes the same value in run_conductor.
-    _write_orchestrator_marker(
-        repo_root, orchestration_id, env.get("METDSL_ORCHESTRATOR", "conductor")
     )
 
     try:
@@ -1477,7 +1428,6 @@ def _run_node(
             "orchestration_id": orchestration_id,
             "resumed": resume_mode,
             "llm": llm,
-            "orchestrator": env.get("METDSL_ORCHESTRATOR", "conductor"),
             "llm_command": llm_command,
             "target_spec_ref": spec_ref,
             "until_phase": until_phase,
