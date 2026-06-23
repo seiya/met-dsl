@@ -4751,8 +4751,8 @@ def _allowed_output_paths_for_launch(
             allowed.append(log_path)
 
     # Mandatory build-control file pins (e.g. Make's in-source Makefile). A bare
-    # `src/` directory allowlist entry covers source extensions (.f90/.c) via
-    # guarded-apply-patch but NOT the extensionless `Makefile`, which is
+    # `src/` directory allowlist entry covers source extensions (.f90/.c) via the
+    # Edit/Write tools but NOT the extensionless `Makefile`, which is
     # intentionally excluded from the directory-allowlist source-extension set
     # (tools/hooks/common.py) and would therefore be unwritable through every
     # channel. Inject the explicit file pin so it is authorized as an output and
@@ -4810,7 +4810,7 @@ def _allowed_output_paths_for_launch(
 # of truth that an MCP tool actually ran. Direct `Edit` / `Write` access by
 # child agents would let them forge successful runs, so canonical placements
 # (computed by `_canonical_mcp_audit_log_paths()`) are excluded from
-# `allowed_file_tool_paths` and rejected from `guarded-apply-patch`.
+# `allowed_file_tool_paths` (and so are never file-tool-writable by a child).
 #
 # Protection is scoped to canonical placements only — a non-canonical file
 # that happens to share this basename (e.g. an unrelated source asset under a
@@ -5582,7 +5582,6 @@ def build_readonly_bwrap_profile(
         "workdir": str(repo_root),
         "env": child_env,
         "generated_at": _utc_now_iso(),
-        "created_file_pin_stubs": [],
         "readonly": True,
     }
 
@@ -5621,7 +5620,6 @@ def build_bwrap_profile(
     )
     write_roots = _load_write_roots_from_cap(writes_obj)
     resolved_repo_root = repo_root.resolve()
-    created_file_pin_stubs: list[dict[str, Any]] = []
     for root_entry in write_roots:
         if root_entry.endswith("/"):
             candidate = (repo_root / root_entry.rstrip("/")).resolve()
@@ -5634,11 +5632,11 @@ def build_bwrap_profile(
                 )
             candidate.mkdir(parents=True, exist_ok=True)
         else:
-            # File pin: pre-create so bwrap can --bind it at file granularity.
+            # File pin: pre-create (touch) so bwrap can --bind it at file granularity.
             # File-level bind ensures bwrap cannot write to sibling files/directories —
             # the sandbox boundary is exactly the declared pin, nothing broader.
-            # The stub is created empty here; _cleanup_empty_file_pin_stubs removes it
-            # if the agent terminates without writing to it.
+            # (P2-7: the stub-recovery machinery was removed; the core workflow declares
+            # no file-pin write_roots, so this is dormant defensive support.)
             pin_path = (repo_root / root_entry).resolve()
             try:
                 pin_path.relative_to(resolved_repo_root)
@@ -5666,12 +5664,6 @@ def build_bwrap_profile(
                     )
             else:
                 pin_path.touch()
-                # Record path + mtime_ns so cleanup can distinguish an untouched stub
-                # from a legitimately empty file written by a subprocess after touch().
-                created_file_pin_stubs.append({
-                    "path": _normalize_rel_posix(root_entry),
-                    "mtime_ns": pin_path.stat().st_mtime_ns,
-                })
     sandbox_root = _orchestration_root(repo_root, orchestration_id) / "sandboxes" / agent_run_id
     tmp_root = sandbox_root / "tmp"
     tmp_root.mkdir(parents=True, exist_ok=True)
@@ -5681,14 +5673,13 @@ def build_bwrap_profile(
     child_env["TMPDIR"] = str(workspace_tmp_host)
     backend_ro, backend_rw_desired = _backend_runtime_bind_paths(backend_type, backend_command)
     backend_rw = _resolve_backend_rw_binds(repo_root, backend_rw_desired)
-    # The leaf runs `guarded-apply-patch` (a runtime-CLI subprocess) which records gate
-    # attribution evidence under workspace/orchestrations/<orch>/gates/<arid>/. That path
-    # is outside the artifact `write_roots`, so without a writable bind bwrap blocks the
-    # evidence write, leaving `gate_changed_paths` empty and the artifact (e.g. ir_meta.json)
-    # flagged as an unauthorized write at finalize-child. Bind the per-arid gates dir
-    # writable — it is excluded from the artifact-write violation check as runtime
-    # bookkeeping (see the `{orch_root}/gates/` runtime-prefix exemption). Scoped to THIS
-    # arid only, never another child's.
+    # The leaf runs `run-gate` (a runtime-CLI subprocess) which records each gate result
+    # under workspace/orchestrations/<orch>/gates/<arid>/<gate>.json (validate_pipeline_
+    # semantics / orchestration_read / etc.). That path is outside the artifact
+    # `write_roots`, so without a writable bind bwrap would block the gate-result write.
+    # Bind the per-arid gates dir writable — it is excluded from the artifact-write
+    # violation check as runtime bookkeeping (see the `{orch_root}/gates/` runtime-prefix
+    # exemption). Scoped to THIS arid only, never another child's.
     gates_rel = f"workspace/orchestrations/{orchestration_id}/gates/{agent_run_id}/"
     (repo_root / gates_rel).mkdir(parents=True, exist_ok=True)
     # The leaf's own PreToolUse/PostToolUse hooks (running as confined subprocesses) write
@@ -5774,7 +5765,6 @@ def build_bwrap_profile(
         "workdir": str(repo_root),
         "env": child_env,
         "generated_at": _utc_now_iso(),
-        "created_file_pin_stubs": created_file_pin_stubs,
     }
 
 
@@ -6338,122 +6328,6 @@ def _actual_changed_paths_since_baseline(
     )
 
 
-def _normalize_rel_path_list(paths: Sequence[str]) -> list[str]:
-    return sorted(
-        {
-            _normalize_rel_posix(str(path))
-            for path in paths
-            if isinstance(path, str) and path.strip()
-        }
-    )
-
-
-def _gate_changed_paths_store_path(
-    repo_root: Path,
-    orchestration_id: str,
-    *,
-    agent_run_id: str,
-) -> Path:
-    # Stored under gates/<arid>/ (NOT agents/<arid>/) so a sandboxed leaf can persist
-    # it: the leaf's guarded-apply-patch writes this gate-attribution evidence, and
-    # gates/<arid>/ is the per-arid gate dir the bwrap profile binds writable. Keeping
-    # it out of agents/<arid>/ also avoids exposing that dir's integrity baseline
-    # (run_write_baseline.json) to leaf writes. Both dirs are runtime-prefix excluded
-    # from the unauthorized-write check, so the location move is attribution-neutral.
-    return (
-        _orchestration_root(repo_root, orchestration_id)
-        / "gates"
-        / agent_run_id.strip()
-        / "gate_changed_paths.json"
-    )
-
-
-def _load_cumulative_gate_changed_paths_for_run(
-    repo_root: Path,
-    orchestration_id: str,
-    *,
-    agent_run_id: str,
-) -> list[str]:
-    path = _gate_changed_paths_store_path(
-        repo_root,
-        orchestration_id,
-        agent_run_id=agent_run_id,
-    )
-    if not path.exists():
-        return []
-    try:
-        payload = _read_json(path)
-    except (OSError, json.JSONDecodeError):
-        return []
-    if not isinstance(payload, dict):
-        return []
-    paths_obj = payload.get("gate_changed_paths")
-    if not isinstance(paths_obj, list):
-        return []
-    return _normalize_rel_path_list([str(item) for item in paths_obj if isinstance(item, str)])
-
-
-def _update_cumulative_gate_changed_paths_for_run(
-    repo_root: Path,
-    orchestration_id: str,
-    *,
-    agent_run_id: str,
-    changed_paths: Sequence[str],
-) -> list[str]:
-    current = _load_cumulative_gate_changed_paths_for_run(
-        repo_root,
-        orchestration_id,
-        agent_run_id=agent_run_id,
-    )
-    incoming = _normalize_rel_path_list(changed_paths)
-    merged = sorted(set(current) | set(incoming))
-    path = _gate_changed_paths_store_path(
-        repo_root,
-        orchestration_id,
-        agent_run_id=agent_run_id,
-    )
-    _write_json(
-        path,
-        {
-            "orchestration_id": orchestration_id,
-            "agent_run_id": agent_run_id.strip(),
-            "gate_changed_paths": merged,
-            "updated_at": _utc_now_iso(),
-        },
-    )
-    return merged
-
-
-def _gate_changed_paths_for_run(
-    repo_root: Path,
-    orchestration_id: str,
-    *,
-    agent_run_id: str,
-) -> list[str]:
-    cumulative = _load_cumulative_gate_changed_paths_for_run(
-        repo_root,
-        orchestration_id,
-        agent_run_id=agent_run_id,
-    )
-    if cumulative:
-        return cumulative
-    gate_path = _gates_dir(repo_root, orchestration_id) / agent_run_id.strip() / "apply_patch_writes.json"
-    if not gate_path.exists():
-        return []
-    gate_doc = _read_json(gate_path)
-    if not isinstance(gate_doc, dict):
-        return []
-    if str(gate_doc.get("status", "")).strip().lower() != "pass":
-        return []
-    args_json = gate_doc.get("args_json")
-    if not isinstance(args_json, dict):
-        return []
-    changed_paths = args_json.get("changed_paths")
-    if not isinstance(changed_paths, list):
-        return []
-    return _normalize_rel_path_list([str(item) for item in changed_paths if isinstance(item, str)])
-
-
 def _declared_output_refs(payload: dict[str, Any]) -> list[str]:
     output_refs_obj = payload.get("output_refs")
     if not isinstance(output_refs_obj, list):
@@ -6609,167 +6483,6 @@ def _child_managed_paths_excludable_from_orchestration_diff(
         if manifest_digest != "__MISSING__" and baseline_files.get(manifest_rel) != manifest_digest:
             excludable.add(manifest_rel)
     return excludable
-
-
-def _runtime_created_pin_stub_paths(
-    repo_root: Path,
-    orchestration_id: str,
-    *,
-    agent_run_id: str,
-) -> dict[str, int | None]:
-    """Return the repo-relative file-pin stubs this run pre-created, mapped to
-    the ``mtime_ns`` recorded at creation (``created_file_pin_stubs``).
-
-    These are runtime-owned canonical placeholders for any file-pin write_roots
-    created so bwrap can bind them at file granularity. (Phase-2: the core
-    workflow declares no file-pin write_roots — the former example, the Generate
-    step's ``lineage.json``, is now authored host-side by the conductor — so this
-    is dormant, retained for P2-7 cleanup.) They
-    carry no agent-authored content unless the agent wrote them through the
-    gate, so their collateral deletion is semantically harmless (and is even
-    performed deliberately by ``_cleanup_empty_file_pin_stubs`` for untouched
-    stubs). The recorded ``mtime_ns`` lets a restore reproduce the exact stub
-    state so ``_cleanup_empty_file_pin_stubs`` (which matches on mtime) still
-    treats the restored placeholder as an untouched stub. ``None`` indicates the
-    entry recorded no usable mtime."""
-    profile_path = _sandbox_profiles_dir(repo_root, orchestration_id) / f"{agent_run_id.strip()}.json"
-    if not profile_path.exists():
-        return {}
-    try:
-        profile_doc = _read_json(profile_path)
-    except (OSError, json.JSONDecodeError):
-        return {}
-    if not isinstance(profile_doc, dict):
-        return {}
-    stubs_obj = profile_doc.get("created_file_pin_stubs")
-    if not isinstance(stubs_obj, list):
-        return {}
-    result: dict[str, int | None] = {}
-    for entry in stubs_obj:
-        if isinstance(entry, dict):
-            p = entry.get("path")
-            if isinstance(p, str) and p.strip():
-                m = entry.get("mtime_ns")
-                result[_normalize_rel_posix(p)] = m if isinstance(m, int) else None
-    return result
-
-
-def _restore_deleted_file_pin_stubs(
-    repo_root: Path,
-    orchestration_id: str,
-    *,
-    agent_run_id: str,
-    skip_prefixes: Sequence[str] = (),
-) -> list[str]:
-    """Re-create as a 0-byte file any runtime-created file-pin stub that is
-    currently absent (collaterally deleted outside the gate).
-
-    Restoring the canonical placeholder returns the workspace to its launch
-    baseline so a (possibly failed) run can be recorded instead of dead-locking
-    the orchestration with a permanently unrecordable ``unauthorized_write``
-    over a runtime-owned artifact. ``record-launch`` / ``record-agent-run`` /
-    ``guarded-apply-patch`` all run with runtime authority (outside the child
-    sandbox), so this restore is permitted where the orchestration agent's own
-    canonical-path writes are not.
-
-    Stubs covered by ``skip_prefixes`` (typically the run's
-    ``gate_changed_paths`` — paths the agent legitimately mutated through
-    guarded-apply-patch) are left untouched so a deliberate gate write/removal
-    is never clobbered. Returns the list of restored paths."""
-    stubs = _runtime_created_pin_stub_paths(
-        repo_root, orchestration_id, agent_run_id=agent_run_id
-    )
-    if not stubs:
-        return []
-    resolved_root = repo_root.resolve()
-    skip = [_normalize_rel_posix(str(p)) for p in skip_prefixes if str(p).strip()]
-    restored: list[str] = []
-    for rel in sorted(stubs):
-        if any(_repo_path_under_prefix(rel, prefix) for prefix in skip):
-            continue
-        target = (repo_root / rel).resolve()
-        try:
-            target.relative_to(resolved_root)
-        except ValueError:
-            continue
-        if target.exists():
-            continue
-        try:
-            target.parent.mkdir(parents=True, exist_ok=True)
-            target.touch()
-            # Reproduce the mtime recorded at stub creation so
-            # `_cleanup_empty_file_pin_stubs` (which deletes only zero-byte
-            # stubs whose mtime still matches `created_file_pin_stubs`) still
-            # treats this restored placeholder as an untouched stub. Without
-            # this, touch()'s fresh mtime would make the empty placeholder
-            # un-cleanable and leave it lingering as canonical workspace data.
-            recorded_mtime_ns = stubs.get(rel)
-            if isinstance(recorded_mtime_ns, int):
-                os.utime(target, ns=(recorded_mtime_ns, recorded_mtime_ns))
-        except OSError:
-            continue
-        restored.append(rel)
-    return restored
-
-
-def _cleanup_empty_file_pin_stubs(
-    repo_root: Path,
-    orchestration_id: str,
-    *,
-    agent_run_id: str,
-) -> None:
-    """Remove empty file-pin stubs created by this run's build_bwrap_profile.
-
-    Only paths recorded in the sandbox profile's `created_file_pin_stubs` are
-    candidates — pre-existing files are never touched. A stub is removed iff:
-    - It is listed in created_file_pin_stubs (was created as empty stub by this run)
-    - It currently exists and is zero bytes
-    - It was not written by the agent via guarded-apply-patch (not in gate_changed_paths)
-    """
-    profile_path = _sandbox_profiles_dir(repo_root, orchestration_id) / f"{agent_run_id}.json"
-    if not profile_path.exists():
-        return
-    try:
-        profile_doc = _read_json(profile_path)
-    except (OSError, json.JSONDecodeError):
-        return
-    if not isinstance(profile_doc, dict):
-        return
-    stubs_obj = profile_doc.get("created_file_pin_stubs")
-    if not isinstance(stubs_obj, list):
-        return
-    # Build path → recorded_mtime_ns mapping for stubs created by this run.
-    # Each entry is {"path": str, "mtime_ns": int} recorded immediately after touch().
-    candidate_stubs: dict[str, int] = {}
-    for entry in stubs_obj:
-        if isinstance(entry, dict):
-            p = entry.get("path")
-            m = entry.get("mtime_ns")
-            if isinstance(p, str) and p.strip() and isinstance(m, int):
-                candidate_stubs[_normalize_rel_posix(p)] = m
-    if not candidate_stubs:
-        return
-    gate_changed = {
-        _normalize_rel_posix(p)
-        for p in _load_cumulative_gate_changed_paths_for_run(
-            repo_root, orchestration_id, agent_run_id=agent_run_id
-        )
-        if p
-    }
-    for norm, recorded_mtime_ns in candidate_stubs.items():
-        if norm in gate_changed:
-            continue
-        stub_path = repo_root / norm
-        if not stub_path.exists():
-            continue
-        st = stub_path.stat()
-        # Only delete if the file is still zero bytes AND its mtime is unchanged since
-        # our touch() — a subprocess that writes (even zero bytes) updates the mtime.
-        if st.st_size == 0 and st.st_mtime_ns == recorded_mtime_ns:
-            try:
-                stub_path.unlink()
-            except OSError:
-                pass
 
 
 def _cleanup_agent_tmp_root(
@@ -7168,31 +6881,17 @@ def _validate_actual_write_paths(
 
     run_id = agent_run_id_obj.strip()
     baseline_agent_run_id = run_id if actor_role in {"step", "substep"} else None
-    if actor_role in {"step", "substep"}:
-        # Fix 4 (recoverability): re-create any runtime-owned file-pin stub
-        # that was collaterally deleted outside the gate so
-        # the baseline diff is clean and a failed run remains recordable instead
-        # of dead-locking the orchestration. Stubs the agent legitimately
-        # mutated through guarded-apply-patch (gate_changed_paths) are skipped.
-        _restore_deleted_file_pin_stubs(
-            repo_root,
-            orchestration_id,
-            agent_run_id=run_id,
-            skip_prefixes=_gate_changed_paths_for_run(
-                repo_root, orchestration_id, agent_run_id=run_id
-            ),
-        )
     actual_changed_paths = _actual_changed_paths_since_baseline(
         repo_root,
         orchestration_id,
         agent_run_id=baseline_agent_run_id,
     )
     output_refs = _declared_output_refs(payload)
-    gate_changed_paths = _gate_changed_paths_for_run(
-        repo_root,
-        orchestration_id,
-        agent_run_id=run_id,
-    )
+    # P2-7: the apply_patch_writes gate is retired (no file-pin write_roots remain and
+    # no gate writer exists), so there is never any gate-changed-paths evidence. Kept as
+    # an empty placeholder: step/substep writes are authorized by write_roots containment
+    # below, and the orchestration role's declared-paths gate falls back to output_refs.
+    gate_changed_paths: list[str] = []
 
     if actor_role == "orchestration":
         child_excludable = _child_managed_paths_excludable_from_orchestration_diff(
@@ -7413,7 +7112,6 @@ def _validate_actual_write_paths(
             )
             if actor_role in {"step", "substep"}:
                 # Cleanup runs AFTER violation is recorded so evidence is preserved for auditors.
-                _cleanup_empty_file_pin_stubs(repo_root, orchestration_id, agent_run_id=run_id)
                 _cleanup_agent_tmp_root(repo_root, orchestration_id, agent_run_id=run_id)
             raise ValueError(
                 "terminal run has unauthorized write paths: "
@@ -7421,7 +7119,7 @@ def _validate_actual_write_paths(
                 + f" (violation: {violation_path})"
             )
     if actor_role in {"step", "substep"}:
-        # Success path: clean up any stubs the agent never wrote to.
+        # Success path: persist the managed-write snapshot.
         # NEW-M2: tmp cleanup is DEFERRED to the post-lock end-of-function
         # phase in record_agent_run (Adv-35 two-phase commit). Doing it
         # here, before the durable terminal append at runs.jsonl, would
@@ -7430,10 +7128,6 @@ def _validate_actual_write_paths(
         # left without a terminal entry AND without diagnostic scratch.
         # NEW-L3: wrap each cleanup helper call so an unexpected OSError
         # in one does not skip the snapshot write that follows.
-        try:
-            _cleanup_empty_file_pin_stubs(repo_root, orchestration_id, agent_run_id=run_id)
-        except OSError:
-            pass
         try:
             _write_managed_write_snapshot(
                 repo_root,
@@ -12993,9 +12687,8 @@ def record_agent_run(
     # Adv-24/H2: serialize the duplicate-recheck + terminal validation +
     # dialog/append commit phase against any concurrent finalizer for the
     # same orchestration. _validate_terminal_run_payload runs inside the
-    # lock (H2 fix) because its violation path calls
-    # _cleanup_empty_file_pin_stubs / _cleanup_agent_tmp_root — destructive
-    # operations that two unsynchronized finalizers must not race.
+    # lock (H2 fix) because its violation path calls _cleanup_agent_tmp_root —
+    # a destructive operation that two unsynchronized finalizers must not race.
     with _runs_jsonl_exclusive_lock(repo_root, orchestration_id):
         # NEW-H1: caller holds the lock, so writer-active probe would
         # self-contend. Pass the flag so durable corruption is surfaced

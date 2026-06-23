@@ -233,41 +233,6 @@ def _plant_spec_ir_yaml_make(repo_root: Path, ir_ref: str = _FIX_IR_REF) -> None
     )
 
 
-def _write_apply_patch_gate_evidence(
-    repo_root: Path,
-    *,
-    orchestration_id: str,
-    agent_run_id: str,
-    actor_role: str,
-    changed_paths: list[str],
-) -> None:
-    gate_path = (
-        repo_root
-        / "workspace"
-        / "orchestrations"
-        / orchestration_id
-        / "gates"
-        / agent_run_id
-        / "apply_patch_writes.json"
-    )
-    gate_path.parent.mkdir(parents=True, exist_ok=True)
-    gate_path.write_text(
-        json.dumps(
-            {
-                "orchestration_id": orchestration_id,
-                "agent_run_id": agent_run_id,
-                "gate": "apply_patch_writes",
-                "args_json": {"actor_role": actor_role, "changed_paths": changed_paths},
-                "status": "pass",
-                "exit_code": 0,
-                "violations": [],
-            },
-            ensure_ascii=False,
-            indent=2,
-        )
-        + "\n",
-        encoding="utf-8",
-    )
 
 
 class _FakeCompletedProcess:
@@ -1392,15 +1357,6 @@ shell_tool                       stable             true
                     **_spawn_response_payload("sess_substep_ap_generate_001"),
                 },
             )
-            _write_apply_patch_gate_evidence(
-                repo_root,
-                orchestration_id="orch_001",
-                agent_run_id="substep_run_ap_generate_001",
-                actor_role="substep",
-                changed_paths=[
-                    "workspace/ir/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/spec.ir.yaml",
-                ],
-            )
             record_agent_run(
                 repo_root=repo_root,
                 orchestration_id="orch_001",
@@ -1554,16 +1510,6 @@ shell_tool                       stable             true
                     "started_at": "2026-03-11T00:00:00Z",
                 },
             )
-            _write_apply_patch_gate_evidence(
-                repo_root,
-                orchestration_id="orch_001",
-                agent_run_id="substep_run_plan_generate_001",
-                actor_role="substep",
-                changed_paths=[
-                    "workspace/ir/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/spec.ir.yaml",
-                    "workspace/ir/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/ir_meta.json",
-                ],
-            )
             record_agent_run(
                 repo_root=repo_root,
                 orchestration_id="orch_001",
@@ -1590,15 +1536,6 @@ shell_tool                       stable             true
                         "workspace/ir/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/ir_meta.json",
                     ],
                 },
-            )
-            _write_apply_patch_gate_evidence(
-                repo_root,
-                orchestration_id="orch_001",
-                agent_run_id="step_run_build_001",
-                actor_role="step",
-                changed_paths=[
-                    "workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/binary/bin_20260101_001/bin/simulate"
-                ],
             )
             record_agent_run(
                 repo_root=repo_root,
@@ -4769,15 +4706,6 @@ shell_tool                       stable             true
             )
             impl_path.parent.mkdir(parents=True, exist_ok=True)
             impl_path.write_text("{}\n", encoding="utf-8")
-            _write_apply_patch_gate_evidence(
-                repo_root,
-                orchestration_id="orch_001",
-                agent_run_id="substep_run_plan_generate_001",
-                actor_role="substep",
-                changed_paths=[
-                    "workspace/ir/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/spec.ir.yaml",
-                ],
-            )
             record_agent_run(
                 repo_root=repo_root,
                 orchestration_id="orch_001",
@@ -5163,13 +5091,6 @@ shell_tool                       stable             true
             out_path.write_text('{"status":"ok"}\n', encoding="utf-8")
             # A stale gate pointing at a different path is irrelevant under Phase-2:
             # authorization is FS-diff containment, not gate provenance.
-            _write_apply_patch_gate_evidence(
-                repo_root,
-                orchestration_id="orch_001",
-                agent_run_id="step_run_build_001",
-                actor_role="step",
-                changed_paths=[f"{_FIX_PIPE_REF}/binary/bin_20260101_001/bin/other"],
-            )
             # binary_meta.json is inside write_roots -> authorized; the pass must record.
             record_agent_run(
                 repo_root=repo_root,
@@ -5249,13 +5170,6 @@ shell_tool                       stable             true
             out_path = repo_root / out_ref
             out_path.parent.mkdir(parents=True, exist_ok=True)
             out_path.write_text("binary\n", encoding="utf-8")
-            _write_apply_patch_gate_evidence(
-                repo_root,
-                orchestration_id="orch_001",
-                agent_run_id="step_run_build_001",
-                actor_role="step",
-                changed_paths=[out_ref],
-            )
             payload = record_agent_run(
                 repo_root=repo_root,
                 orchestration_id="orch_001",
@@ -5449,13 +5363,6 @@ shell_tool                       stable             true
                 '{"command_id":"abc","tool_name":"compile_project","ok":true}\n',
                 encoding="utf-8",
             )
-            _write_apply_patch_gate_evidence(
-                repo_root,
-                orchestration_id="orch_001",
-                agent_run_id="step_run_build_mcp_log",
-                actor_role="step",
-                changed_paths=[bin_ref],
-            )
             payload = record_agent_run(
                 repo_root=repo_root,
                 orchestration_id="orch_001",
@@ -5617,13 +5524,6 @@ shell_tool                       stable             true
             log_path.write_text(
                 '{"command_id":"qc1","tool_name":"run_quality_checks","ok":true}\n',
                 encoding="utf-8",
-            )
-            _write_apply_patch_gate_evidence(
-                repo_root,
-                orchestration_id="orch_001",
-                agent_run_id="step_run_exec_qc",
-                actor_role="substep",
-                changed_paths=[diagnostics_ref],
             )
             payload = record_agent_run(
                 repo_root=repo_root,
@@ -6299,13 +6199,6 @@ shell_tool                       stable             true
             out_path = repo_root / out_ref
             out_path.parent.mkdir(parents=True, exist_ok=True)
             out_path.write_text('{"status":"ok"}\n', encoding="utf-8")
-            _write_apply_patch_gate_evidence(
-                repo_root,
-                orchestration_id="orch_001",
-                agent_run_id="substep_run_gen_001",
-                actor_role="substep",
-                changed_paths=[out_ref],
-            )
             tmp_file_path = repo_root / "workspace" / "tmp" / "substep_run_gen_001" / "guarded_patch_ir_meta.txt"
             tmp_file_path.parent.mkdir(parents=True, exist_ok=True)
             tmp_file_path.write_text("patch metadata\n", encoding="utf-8")
@@ -6395,13 +6288,6 @@ shell_tool                       stable             true
                     out_path = repo_root / out_ref
                     out_path.parent.mkdir(parents=True, exist_ok=True)
                     out_path.write_text('{"status":"ok"}\n', encoding="utf-8")
-                    _write_apply_patch_gate_evidence(
-                        repo_root,
-                        orchestration_id="orch_001",
-                        agent_run_id="substep_run_gen_001",
-                        actor_role="substep",
-                        changed_paths=[out_ref],
-                    )
                     # Overwrite the manifest with an over-broad allowed_tmp_root
                     _write_allowed_output_manifest(
                         repo_root,
@@ -6495,13 +6381,6 @@ shell_tool                       stable             true
             out_path = repo_root / out_ref
             out_path.parent.mkdir(parents=True, exist_ok=True)
             out_path.write_text("binary\n", encoding="utf-8")
-            _write_apply_patch_gate_evidence(
-                repo_root,
-                orchestration_id="orch_001",
-                agent_run_id="step_run_build_001",
-                actor_role="step",
-                changed_paths=[f"{_FIX_PIPE_REF}/binary/bin_20260101_001/bin/"],
-            )
             payload = record_agent_run(
                 repo_root=repo_root,
                 orchestration_id="orch_001",
@@ -6585,13 +6464,6 @@ shell_tool                       stable             true
                 response_payload=_spawn_response_payload("sess_step_build_001"),
             )
             out_path.unlink()
-            _write_apply_patch_gate_evidence(
-                repo_root,
-                orchestration_id="orch_001",
-                agent_run_id="step_run_build_001",
-                actor_role="step",
-                changed_paths=[out_ref],
-            )
             record_agent_run(
                 repo_root=repo_root,
                 orchestration_id="orch_001",
@@ -6684,13 +6556,6 @@ shell_tool                       stable             true
             out_path = repo_root / out_ref
             out_path.parent.mkdir(parents=True, exist_ok=True)
             out_path.write_text("binary\n", encoding="utf-8")
-            _write_apply_patch_gate_evidence(
-                repo_root,
-                orchestration_id="orch_001",
-                agent_run_id="step_run_build_001",
-                actor_role="step",
-                changed_paths=[out_ref],
-            )
             record_agent_run(
                 repo_root=repo_root,
                 orchestration_id="orch_001",
@@ -6781,13 +6646,6 @@ shell_tool                       stable             true
             out_path = repo_root / out_ref
             out_path.parent.mkdir(parents=True, exist_ok=True)
             out_path.write_text("binary-v1\n", encoding="utf-8")
-            _write_apply_patch_gate_evidence(
-                repo_root,
-                orchestration_id="orch_001",
-                agent_run_id="step_run_build_001",
-                actor_role="step",
-                changed_paths=[out_ref],
-            )
             record_agent_run(
                 repo_root=repo_root,
                 orchestration_id="orch_001",
@@ -6881,13 +6739,6 @@ shell_tool                       stable             true
                     ),
                 },
                 response_payload=_spawn_response_payload("sess_step_build_001"),
-            )
-            _write_apply_patch_gate_evidence(
-                repo_root,
-                orchestration_id="orch_001",
-                agent_run_id="step_run_build_001",
-                actor_role="step",
-                changed_paths=[out_ref],
             )
             record_agent_run(
                 repo_root=repo_root,
@@ -7416,13 +7267,6 @@ shell_tool                       stable             true
             bad_path = repo_root / bad_ref
             bad_path.parent.mkdir(parents=True, exist_ok=True)
             bad_path.write_text("leak\n", encoding="utf-8")
-            _write_apply_patch_gate_evidence(
-                repo_root,
-                orchestration_id="orch_001",
-                agent_run_id="substep_run_tune_001",
-                actor_role="substep",
-                changed_paths=[bad_ref],
-            )
             with self.assertRaisesRegex(ValueError, "terminal run has unauthorized write paths"):
                 record_agent_run(
                     repo_root=repo_root,
@@ -7860,15 +7704,6 @@ shell_tool                       stable             true
                     },
                     response_payload=_spawn_response_payload("sess_step_build_001"),
                 )
-                _write_apply_patch_gate_evidence(
-                    repo_root,
-                    orchestration_id="orch_001",
-                    agent_run_id="step_run_build_001",
-                    actor_role="step",
-                    changed_paths=[
-                        "workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/binary/bin_20260101_001/bin/simulate"
-                    ],
-                )
                 record_agent_run(
                     repo_root=repo_root,
                     orchestration_id="orch_001",
@@ -8212,16 +8047,8 @@ shell_tool                       stable             true
             "workspace/pipelines/problem__shallow_water2d__0.3.0/"
             "shallow-water2d_20260415_001/binary/bin_20260101_001/bin/simulate"
         )
-        # A pass step run requires non-empty output_refs and apply_patch gate evidence.
+        # A pass step run requires non-empty output_refs.
         output_refs = [binary_ref] if status == "pass" else []
-        if status == "pass":
-            _write_apply_patch_gate_evidence(
-                repo_root,
-                orchestration_id="orch_001",
-                agent_run_id=agent_run_id,
-                actor_role="step",
-                changed_paths=[binary_ref],
-            )
         record_agent_run(
             repo_root=repo_root,
             orchestration_id="orch_001",
@@ -13689,13 +13516,6 @@ class TestPhase3RunGate(unittest.TestCase):
             )
             self.assertTrue(active_path.exists())
             out_ref = f"{_FIX_PIPE_REF}/binary/bin_20260101_001/bin/simulate"
-            _write_apply_patch_gate_evidence(
-                repo_root,
-                orchestration_id="orch_001",
-                agent_run_id="step_run_build_001",
-                actor_role="step",
-                changed_paths=[out_ref],
-            )
             record_agent_run(
                 repo_root=repo_root,
                 orchestration_id="orch_001",
@@ -14590,71 +14410,8 @@ class BwrapProfileFilePinTests(unittest.TestCase):
             dir_path = repo_root / "workspace" / "ir" / "v1.0"
             self.assertTrue(dir_path.is_dir(), "dotted directory write_root must be created as directory")
 
-    def test_restore_deleted_file_pin_stubs_recreates_absent_stub(self) -> None:
-        """_restore_deleted_file_pin_stubs must re-create (as 0-byte) a
-        runtime-created file-pin stub that was collaterally deleted, while
-        leaving gate-covered stubs and present stubs untouched."""
-        from tools.orchestration_runtime import (
-            build_bwrap_profile,
-            _restore_deleted_file_pin_stubs,
-        )
-
-        with tempfile.TemporaryDirectory() as tmp:
-            repo_root = Path(tmp)
-            orch = "orch_restore_001"
-            run_id = "run_restore_001"
-            pin = "workspace/pipelines/a__b__1.0/lineage.json"
-            self._write_cap_and_manifest(
-                repo_root, orchestration_id=orch, agent_run_id=run_id,
-                write_roots=[pin],
-            )
-            profile = build_bwrap_profile(
-                repo_root=repo_root,
-                orchestration_id=orch,
-                agent_run_id=run_id,
-                backend_command="python3 agent.py",
-            )
-            self._save_profile(repo_root, orch, run_id, profile)
-            pin_path = repo_root / pin
-            self.assertTrue(pin_path.exists())
-
-            # Collateral deletion.
-            pin_path.unlink()
-            restored = _restore_deleted_file_pin_stubs(
-                repo_root, orch, agent_run_id=run_id
-            )
-            self.assertEqual(restored, [pin])
-            self.assertTrue(pin_path.exists())
-            self.assertEqual(pin_path.stat().st_size, 0)
-            # Regression: the restored stub must reproduce the recorded mtime so
-            # _cleanup_empty_file_pin_stubs still treats it as an untouched stub
-            # and removes it (otherwise an empty placeholder lingers as
-            # canonical workspace data).
-            from tools.orchestration_runtime import _cleanup_empty_file_pin_stubs
-            _cleanup_empty_file_pin_stubs(repo_root, orch, agent_run_id=run_id)
-            self.assertFalse(
-                pin_path.exists(),
-                "a restored untouched stub must remain eligible for cleanup",
-            )
-
-            # Idempotent: a present stub is not re-touched / re-reported.
-            pin_path.touch()
-            restored_again = _restore_deleted_file_pin_stubs(
-                repo_root, orch, agent_run_id=run_id
-            )
-            self.assertEqual(restored_again, [])
-
-            # A stub covered by skip_prefixes (e.g. a path the agent mutated
-            # through guarded-apply-patch) is left untouched.
-            pin_path.unlink()
-            skipped = _restore_deleted_file_pin_stubs(
-                repo_root, orch, agent_run_id=run_id, skip_prefixes=[pin]
-            )
-            self.assertEqual(skipped, [])
-            self.assertFalse(pin_path.exists())
-
     def _save_profile(self, repo_root: Path, orchestration_id: str, agent_run_id: str, profile: dict) -> None:
-        """Helper: save bwrap profile to disk so _cleanup_empty_file_pin_stubs can find it."""
+        """Helper: save a bwrap profile to disk for the cleanup tests."""
         import json as _json
         from tools.orchestration_runtime import _sandbox_profiles_dir
         profiles_dir = _sandbox_profiles_dir(repo_root, orchestration_id)
@@ -14847,158 +14604,6 @@ class BwrapProfileFilePinTests(unittest.TestCase):
             self.assertTrue(
                 (external / "important.txt").exists(),
                 "symlink target must not be touched",
-            )
-
-    def test_file_pin_stub_cleaned_up_when_agent_never_writes(self) -> None:
-        """_cleanup_empty_file_pin_stubs must delete empty stubs if the agent never wrote to the pin."""
-        from tools.orchestration_runtime import build_bwrap_profile, _cleanup_empty_file_pin_stubs
-
-        with tempfile.TemporaryDirectory() as tmp:
-            repo_root = Path(tmp)
-            orch = "orch_bwrap_fp_005"
-            run_id = "run_bwrap_fp_005"
-            pin = "workspace/pipelines/a__b__1.0/pipe_001/lineage.json"
-            self._write_cap_and_manifest(
-                repo_root, orchestration_id=orch, agent_run_id=run_id,
-                write_roots=[pin],
-            )
-            # Profile build pre-creates the stub; profile is saved so cleanup can read it.
-            profile = build_bwrap_profile(
-                repo_root=repo_root,
-                orchestration_id=orch,
-                agent_run_id=run_id,
-                backend_command="python3 agent.py",
-            )
-            self._save_profile(repo_root, orch, run_id, profile)
-            pin_path = repo_root / pin
-            self.assertTrue(pin_path.exists(), "stub must exist after build_bwrap_profile")
-            self.assertEqual(pin_path.stat().st_size, 0, "stub must be empty")
-
-            # Simulate terminal cleanup: agent terminated without writing to the pin.
-            _cleanup_empty_file_pin_stubs(repo_root, orch, agent_run_id=run_id)
-            self.assertFalse(
-                pin_path.exists(),
-                "empty stub must be removed by _cleanup_empty_file_pin_stubs when agent never wrote",
-            )
-
-    def test_file_pin_stub_preserved_when_agent_wrote_content(self) -> None:
-        """_cleanup_empty_file_pin_stubs must not delete a pin file that the agent wrote content to."""
-        from tools.orchestration_runtime import (
-            build_bwrap_profile, _cleanup_empty_file_pin_stubs,
-            _gate_changed_paths_store_path, _ensure_orchestration_audit_dirs,
-        )
-
-        with tempfile.TemporaryDirectory() as tmp:
-            repo_root = Path(tmp)
-            orch = "orch_bwrap_fp_006"
-            run_id = "run_bwrap_fp_006"
-            pin = "workspace/pipelines/a__b__1.0/pipe_001/lineage.json"
-            self._write_cap_and_manifest(
-                repo_root, orchestration_id=orch, agent_run_id=run_id,
-                write_roots=[pin],
-            )
-            profile = build_bwrap_profile(
-                repo_root=repo_root,
-                orchestration_id=orch,
-                agent_run_id=run_id,
-                backend_command="python3 agent.py",
-            )
-            self._save_profile(repo_root, orch, run_id, profile)
-            pin_path = repo_root / pin
-            # Simulate agent writing content to the pin.
-            pin_path.write_text('{"node_key":"a"}', encoding="utf-8")
-            # Simulate gate_changed_paths recording the write.
-            _ensure_orchestration_audit_dirs(repo_root, orch)
-            gcp_path = _gate_changed_paths_store_path(repo_root, orch, agent_run_id=run_id)
-            gcp_path.parent.mkdir(parents=True, exist_ok=True)
-            import json as _json
-            gcp_path.write_text(
-                _json.dumps({"gate_changed_paths": [pin]}), encoding="utf-8"
-            )
-            _cleanup_empty_file_pin_stubs(repo_root, orch, agent_run_id=run_id)
-            self.assertTrue(
-                pin_path.exists(),
-                "non-empty pin file must NOT be removed by cleanup",
-            )
-
-    def test_pre_existing_empty_file_pin_not_deleted_by_cleanup(self) -> None:
-        """A zero-byte file that existed BEFORE build_bwrap_profile must survive _cleanup_empty_file_pin_stubs."""
-        from tools.orchestration_runtime import build_bwrap_profile, _cleanup_empty_file_pin_stubs
-
-        with tempfile.TemporaryDirectory() as tmp:
-            repo_root = Path(tmp)
-            orch = "orch_bwrap_fp_008"
-            run_id = "run_bwrap_fp_008"
-            pin = "workspace/pipelines/a__b__1.0/pipe_001/lineage.json"
-            # Pre-create the file BEFORE build_bwrap_profile (simulates pre-existing file).
-            pin_path = repo_root / pin
-            pin_path.parent.mkdir(parents=True, exist_ok=True)
-            pin_path.write_bytes(b"")  # zero bytes, pre-existing
-            self._write_cap_and_manifest(
-                repo_root, orchestration_id=orch, agent_run_id=run_id,
-                write_roots=[pin],
-            )
-            # build_bwrap_profile must NOT add it to created_file_pin_stubs (file already existed).
-            profile = build_bwrap_profile(
-                repo_root=repo_root,
-                orchestration_id=orch,
-                agent_run_id=run_id,
-                backend_command="python3 agent.py",
-            )
-            stub_paths = [
-                entry["path"]
-                for entry in profile.get("created_file_pin_stubs", [])
-                if isinstance(entry, dict)
-            ]
-            self.assertNotIn(
-                "workspace/pipelines/a__b__1.0/pipe_001/lineage.json",
-                stub_paths,
-                "pre-existing file must NOT be recorded as a stub",
-            )
-            # Cleanup must leave the pre-existing file untouched.
-            _cleanup_empty_file_pin_stubs(repo_root, orch, agent_run_id=run_id)
-            self.assertTrue(
-                pin_path.exists(),
-                "pre-existing empty file must NOT be deleted by cleanup",
-            )
-
-    def test_file_pin_stub_preserved_when_subprocess_writes_zero_bytes(self) -> None:
-        """A subprocess that writes zero bytes to a pinned file updates the mtime.
-        _cleanup_empty_file_pin_stubs must NOT delete a stub whose mtime has changed,
-        even if the file is still zero bytes — the subprocess output is legitimate."""
-        from tools.orchestration_runtime import build_bwrap_profile, _cleanup_empty_file_pin_stubs
-        import time
-
-        with tempfile.TemporaryDirectory() as tmp:
-            repo_root = Path(tmp)
-            orch = "orch_bwrap_fp_009"
-            run_id = "run_bwrap_fp_009"
-            pin = "workspace/pipelines/a__b__1.0/pipe_001/lineage.json"
-            self._write_cap_and_manifest(
-                repo_root, orchestration_id=orch, agent_run_id=run_id,
-                write_roots=[pin],
-            )
-            profile = build_bwrap_profile(
-                repo_root=repo_root,
-                orchestration_id=orch,
-                agent_run_id=run_id,
-                backend_command="python3 agent.py",
-            )
-            self._save_profile(repo_root, orch, run_id, profile)
-            pin_path = repo_root / pin
-            self.assertTrue(pin_path.exists())
-            self.assertEqual(pin_path.stat().st_size, 0)
-
-            # Simulate a subprocess writing zero bytes — this updates mtime even though
-            # file size stays at zero.
-            time.sleep(0.01)  # ensure mtime advances
-            pin_path.write_bytes(b"")  # zero-byte write updates mtime
-
-            # Cleanup must preserve the file because mtime changed since our touch().
-            _cleanup_empty_file_pin_stubs(repo_root, orch, agent_run_id=run_id)
-            self.assertTrue(
-                pin_path.exists(),
-                "zero-byte file written by subprocess (mtime changed) must NOT be deleted",
             )
 
     def test_generate_step_bwrap_does_not_bind_pipeline_root_as_writable(self) -> None:

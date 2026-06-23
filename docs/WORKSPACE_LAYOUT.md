@@ -46,7 +46,6 @@ workspace/
 │       │       │   ├── child.reply.txt             (mirror)
 │       │       │   ├── agent.result.json           (written by record-agent-run on pass)
 │       │       │   └── agent.summary.txt           (same as above)
-│       │       ├── gate_changed_paths.json
 │       │       ├── managed_write_snapshot.json
 │       │       └── run_write_baseline.json
 │       │
@@ -77,8 +76,7 @@ workspace/
 │       │   └── workflow_hooks.jsonl               (pre_phase_launch, pre_command_execute, etc.)
 │       │
 │       ├── gates/
-│       │   └── <agent_run_id>/                    internal gate results (direct Read by the child agent forbidden)
-│       │       ├── apply_patch_writes.json
+│       │   └── <agent_run_id>/                    internal run-gate results (direct Read by the child agent forbidden)
 │       │       ├── validate_pipeline_semantics.json
 │       │       └── ...
 │       │
