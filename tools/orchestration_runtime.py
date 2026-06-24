@@ -4503,7 +4503,7 @@ def _allowed_output_paths_for_launch(
         if step_token == "validate" and substep_token == "execute":
             if not validate_prefix or not node_safe:
                 return False
-            # Cross-phase exception: skills/workflow-validate-execute/SKILL.md
+            # Cross-phase exception: docs/workflow/phases/phase_04_validate.md
             # mandates `run_quality_checks` against
             # `project_dir=source/<source_id>/src/` for
             # `toolchain.build_system=make` + Fortran/C-family pipelines. The
@@ -4833,14 +4833,14 @@ def _canonical_mcp_audit_log_paths(
     """Derive canonical MCP audit log paths from the listed allowed_output_paths.
 
     Canonical placements (per docs/workflow/phases/phase_*.md and
-    skills/workflow-validate-execute/SKILL.md):
+    docs/workflow/phases/phase_04_validate.md):
       - generate: `<pipeline_ref>/source/<source_id>/src/command_log.jsonl`
       - build:    `<pipeline_ref>/binary/<binary_id>/command_log.jsonl`
       - validate.execute (in-phase): `<pipeline_ref>/runs/<run_id>/<node_safe>/command_log.jsonl`
       - validate.execute (cross-phase quality_check): `<pipeline_ref>/source/<source_id>/src/command_log.jsonl`
         — `run_quality_checks` runs with `project_dir=source/<source_id>/src/`
         for `toolchain.build_system=make` + Fortran/C-family pipelines per
-        `skills/workflow-validate-execute/SKILL.md`, so the MCP server's
+        `docs/workflow/phases/phase_04_validate.md`, so the MCP server's
         default `command_log_path` (resolved as
         `project_dir/command_log.jsonl`) lands in the source tree even
         though the substep is `validate.execute`.
@@ -4876,7 +4876,7 @@ def _canonical_mcp_audit_log_paths(
             if parts:
                 canonical.add(f"{prefix}{parts[0]}/{_MCP_AUDIT_LOG_BASENAME}")
         # Cross-phase placement is reserved for in-source Make builds
-        # (Fortran/C-family per skills/workflow-build): compile_project runs
+        # (Fortran/C-family per docs/workflow/phases/phase_03_build.md): compile_project runs
         # with `project_dir=<pipeline>/source/<source_id>/src/` (where the
         # Makefile lives), so the MCP server's default command_log_path
         # resolves under the source tree. Gate on `build_system=make` —
@@ -4909,7 +4909,7 @@ def _canonical_mcp_audit_log_paths(
         # Cross-phase quality_check log placement: derive ONLY from the
         # explicit `source_id` field AND only when the toolchain is
         # `build_system=make` (the documented Make-only exception per
-        # skills/workflow-validate-execute/SKILL.md). For non-Make runs
+        # docs/workflow/phases/phase_04_validate.md). For non-Make runs
         # (run_program against a CMake/Meson out-of-source binary), the log
         # belongs in-phase and cross-phase authorization must not be
         # granted — otherwise a child could steer MCP logging into the
@@ -7674,6 +7674,34 @@ def _template_placeholder_values(request_payload: dict[str, Any]) -> dict[str, s
     }
 
 
+DETERMINISTIC_PROMPT_SENTINEL = "Conductor-executed deterministic step"
+
+
+def _render_deterministic_launch_prompt(request_payload: dict[str, Any]) -> str:
+    """Minimal launch prompt for a step the conductor runs IN-PROCESS (Build /
+    Validate.execute). No leaf agent reads it; it exists only so the launch bookkeeping
+    (capability / phase_state / agent_runs) is well-formed. It carries no skill section
+    and no leaf instructions — only the sentinel the validator keys on plus the core
+    identifiers."""
+    p = request_payload
+    lines = [
+        f"{DETERMINISTIC_PROMPT_SENTINEL} (no leaf agent runs this body; the conductor "
+        "runs it in-process).",
+        f"Target node_key: {p.get('node_key', '')}",
+        f"Target step: {p.get('step', '')}",
+    ]
+    if str(p.get("substep", "")).strip():
+        lines.append(f"Target substep: {p.get('substep')}")
+    lines += [
+        f"orchestration_id: {p.get('orchestration_id', '')}",
+        f"agent_run_id: {p.get('agent_run_id', '')}",
+        f"parent_agent_run_id: {p.get('parent_agent_run_id', '')}",
+        f"ir_ref: {p.get('ir_ref', '')}",
+        f"pipeline_ref: {p.get('pipeline_ref', '')}",
+    ]
+    return "\n".join(lines) + "\n"
+
+
 def _render_launch_prompt_template(request_payload: dict[str, Any]) -> str:
     """Render the launch prompt template.
 
@@ -7683,6 +7711,8 @@ def _render_launch_prompt_template(request_payload: dict[str, Any]) -> str:
     3. Replace `{{COMMON_BOILERPLATE}}` of the template body with the expanded boilerplate
     4. Replace the `<key>` placeholders with the values of request_payload
     """
+    if request_payload.get("deterministic"):
+        return _render_deterministic_launch_prompt(request_payload)
     templates = _load_launch_prompt_templates()
     template_name = _launch_prompt_template_name(request_payload)
     template = templates[template_name]
@@ -7789,20 +7819,27 @@ def render_launch_prompt_text(request_payload: dict[str, Any]) -> str:
 
 def prepare_launch_request_payload(request_payload: dict[str, Any]) -> dict[str, Any]:
     payload = dict(request_payload)
-    if not isinstance(payload.get("skill_name"), str) or not payload.get("skill_name", "").strip():
-        skill_name = _skill_name_for_request(payload)
-        if skill_name is not None:
-            payload["skill_name"] = skill_name
-    if not isinstance(payload.get("skill_ref"), str) or not payload.get("skill_ref", "").strip():
-        skill_name = payload.get("skill_name")
-        if isinstance(skill_name, str) and skill_name.strip():
-            payload["skill_ref"] = f"skills/{skill_name.strip()}/SKILL.md"
+    # Deterministic (in-process Build / Validate.execute) requests carry no skill: no
+    # leaf runs them, and their SKILL.md files do not exist. Leave skill_name/skill_ref
+    # stripped and skill_must_read_refs empty (mirror build_launch_request) so the
+    # persisted request stays self-consistent and references no deleted SKILL.
+    deterministic = bool(payload.get("deterministic"))
+    if not deterministic:
+        if not isinstance(payload.get("skill_name"), str) or not payload.get("skill_name", "").strip():
+            skill_name = _skill_name_for_request(payload)
+            if skill_name is not None:
+                payload["skill_name"] = skill_name
+        if not isinstance(payload.get("skill_ref"), str) or not payload.get("skill_ref", "").strip():
+            skill_name = payload.get("skill_name")
+            if isinstance(skill_name, str) and skill_name.strip():
+                payload["skill_ref"] = f"skills/{skill_name.strip()}/SKILL.md"
     payload.setdefault("issue_severity", "none")
     payload.setdefault("workflow_mode", os.environ.get("METDSL_WORKFLOW_EXEC_MODE", "dev"))
     payload.setdefault("repair_strategy", "none")
     payload.setdefault("repair_target_agent_run_id", "none")
     payload.setdefault("repair_reason", "none")
-    payload["skill_must_read_refs"] = ",".join(build_skill_must_read_refs(payload))
+    payload["skill_must_read_refs"] = (
+        "" if deterministic else ",".join(build_skill_must_read_refs(payload)))
     explicit_prompt_present = any(
         _coerce_nested_launch_text(payload, path) is not None
         for path in (
@@ -7897,6 +7934,18 @@ def _required_launch_prompt_markers(request_payload: dict[str, Any]) -> list[str
     step = request_payload.get("step")
     if not isinstance(step, str) or not step.strip():
         return []
+    if request_payload.get("deterministic"):
+        # In-process Build / Validate.execute: minimal prompt, no skill section.
+        det = [
+            DETERMINISTIC_PROMPT_SENTINEL,
+            "Target node_key:", "Target step:",
+            "orchestration_id:", "agent_run_id:", "parent_agent_run_id:",
+            "ir_ref:", "pipeline_ref:",
+        ]
+        substep = request_payload.get("substep")
+        if isinstance(substep, str) and substep.strip():
+            det.append("Target substep:")
+        return det
     markers = [
         "orchestration_id:",
         "agent_run_id:",
@@ -7942,6 +7991,10 @@ def _required_launch_prompt_lines(request_payload: dict[str, Any]) -> list[str]:
 def _required_launch_prompt_constraint_lines(request_payload: dict[str, Any]) -> list[str]:
     step = request_payload.get("step")
     if not isinstance(step, str) or not step.strip():
+        return []
+    if request_payload.get("deterministic"):
+        # No leaf runs the deterministic prompt, so the leaf security-constraint lines
+        # (apply-patch gate, capability_token handling, direct Edit/Write) do not apply.
         return []
     required_fragments = (
         "`run-gate --gate apply_patch_writes` and `apply-patch-gate`",
@@ -9525,6 +9578,19 @@ def _validate_launch_request_payload(request_payload: dict[str, Any]) -> None:
         raise ValueError("launch request must include non-empty node_key")
     if not isinstance(step, str) or not step.strip():
         raise ValueError("launch request must include non-empty step")
+    # Defense-in-depth: `deterministic` (in-process, skill-/constraint-line-exempt) is
+    # only legitimate for the non-LLM steps Build and Validate.execute. Reject the flag
+    # on any other step so a forged/buggy payload cannot claim the reduced launch-prompt
+    # guards while being a leaf step. (The flag is host-set by the conductor today; this
+    # makes the invariant explicit at the validation chokepoint.)
+    if request_payload.get("deterministic"):
+        step_l = step.strip().lower()
+        substep_l = str(substep).strip().lower() if isinstance(substep, str) else ""
+        if not (step_l == "build" or (step_l == "validate" and substep_l == "execute")):
+            raise ValueError(
+                "launch request: deterministic=True is only valid for step=build or "
+                f"step=validate substep=execute (got step={step!r} substep={substep!r})"
+            )
     # agent_model identifies the LLM that produced the child's artifacts. At launch
     # only the unpinned spec-side ALIAS is known (e.g. "opus"); the exact version is
     # resolved post-run from the leaf transcript and recorded by the conductor onto
@@ -10244,6 +10310,13 @@ def _pre_phase_complete_judge_checks(
         raise ValueError(f"judge launch_request_ref invalid json: {lr_ref}") from exc
     if not isinstance(lr, dict):
         raise ValueError(f"judge launch_request must be object: {lr_ref}")
+    # When the Validate phase failed at `execute` (the deterministic substep), `judge`
+    # never ran and the launch_request_ref points to the execute substep. There is no
+    # judge output to verify, so skip the semantic_review requirement — the conductor
+    # routes the execute failure via its decision tables (classify_failure / escalate).
+    # A normal terminal points launch_request_ref at the judge substep.
+    if str(lr.get("substep") or "").strip().lower() != "judge":
+        return
     pr = lr.get("pipeline_ref")
     if not isinstance(pr, str) or not pr.strip():
         raise ValueError("judge launch_request missing pipeline_ref")

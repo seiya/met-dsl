@@ -376,6 +376,7 @@ def build_launch_request(
     workflow_mode: str,
     case_ids: tuple[str, ...] = (),
     evidence_artifacts: tuple[str, ...] = ("state_snapshots",),
+    exe_name: str | None = None,
     repair: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     """Construct the record-launch --request-json payload for one substep.
@@ -390,6 +391,9 @@ def build_launch_request(
     spec = refs.spec_path
     skill = _skill_name(step, substep)
     role = child_agent_role(step)
+    # Build and Validate.execute run in-process (no leaf), so they carry no skill /
+    # leaf prompt — only the bookkeeping the capability/phase_state need.
+    deterministic = step == "build" or (step == "validate" and substep == "execute")
     rep = {
         "issue_severity": "none",
         "repair_strategy": "none",
@@ -410,13 +414,17 @@ def build_launch_request(
         "workflow_mode": workflow_mode,
         "ir_ref": refs.ir_ref,
         "pipeline_ref": refs.pipeline_ref,
-        "skill_name": skill,
-        "skill_ref": f"skills/{skill}/SKILL.md",
     }
+    if deterministic:
+        req["deterministic"] = True
+    else:
+        req["skill_name"] = skill
+        req["skill_ref"] = f"skills/{skill}/SKILL.md"
     if substep is not None:
         req["substep"] = substep
 
-    must_read: list[str] = [f"skills/{skill}/SKILL.md", *_DOC_CORE, _PHASE_DOC[step]]
+    must_read: list[str] = ([] if deterministic
+                            else [f"skills/{skill}/SKILL.md", *_DOC_CORE, _PHASE_DOC[step]])
 
     if step == "compile":
         req["dependency_ref"] = f"{spec}/deps.yaml"
@@ -486,8 +494,10 @@ def build_launch_request(
             f"{refs.source_dir()}/source_meta.json",
         ]
         bdir = refs.binary_dir()
+        # The binary basename is the Makefile's BIN (resolved by the conductor and passed
+        # in); fall back to the <spec_id>_runner name when unknown (e.g. unit fixtures).
         req["allowed_output_paths"] = [
-            f"{bdir}/bin/{refs.spec_id}_runner",
+            f"{bdir}/bin/{exe_name or (refs.spec_id + '_runner')}",
             f"{bdir}/binary_meta.json",
             f"{bdir}/command_log.jsonl",
         ]
@@ -542,7 +552,9 @@ def build_launch_request(
     else:  # pragma: no cover - guarded by SUBSTEPS keys
         raise ValueError(f"unknown step: {step}")
 
-    req["skill_must_read_refs"] = ",".join(must_read)
+    # Deterministic steps have no leaf, so no skill_must_read_refs (the conductor reads
+    # what it needs in-process; the read_manifest is irrelevant for them).
+    req["skill_must_read_refs"] = "" if deterministic else ",".join(must_read)
     req.update(rep)
     return req
 
@@ -917,6 +929,17 @@ class Conductor:
         outputs. The downstream verify/judge then certifies the content.
         """
         output_refs = [p for p in allowed_output_paths if (self.repo_root / p).exists()]
+
+        def _fresh_deliverables_written(paths: list[str]) -> bool:
+            # All DELIVERABLE outputs (excluding the audit/process logs whose placement
+            # varies by build system) exist AND were authored in this attempt
+            # (mtime >= min_mtime), so a retry/reopen never passes on stale files.
+            required = [p for p in paths if Path(p).name not in _OPTIONAL_OUTPUT_BASENAMES]
+            present = [p for p in required if (self.repo_root / p).exists()]
+            if len(present) != len(required):
+                return False
+            return all((self.repo_root / p).stat().st_mtime >= min_mtime for p in present)
+
         if phase == "compile" and substep == "verify":
             meta = _read_json(self.repo_root / refs.ir_ref / "ir_meta.json") or {}
             status = "pass" if meta.get("verification_status") == "pass" else "fail"
@@ -926,21 +949,28 @@ class Conductor:
         elif phase == "validate" and substep == "judge":
             agg = _read_json(self.repo_root / refs.run_node_dir() / "aggregate_verdict.json") or {}
             status = "pass" if str(agg.get("aggregate_verdict") or agg.get("overall")) in ("pass", "xfail") else "fail"
+        elif phase == "build":
+            # Deterministic build: the conductor-authored binary_meta records the compile
+            # + post_build-gate verdict. A content failure (compile/link error, post_build
+            # violation) is verification_status=fail with rc 0, so the substep fails here
+            # and classify_build_failure routes it to Generate (not transport fail_closed).
+            meta = _read_json(self.repo_root / refs.binary_dir() / "binary_meta.json") or {}
+            status = "pass" if (meta.get("verification_status") == "pass"
+                                and _fresh_deliverables_written(allowed_output_paths)) else "fail"
+        elif phase == "validate" and substep == "execute":
+            # Deterministic execute: trial_meta.status reflects run_program +
+            # quality_check + post_execute gate; content failures (rc 0) route via the
+            # validate tables / diagnostician. A run_program runtime error writes no
+            # trial_meta, so the missing-status read fails the substep here too.
+            meta = _read_json(self.repo_root / refs.run_node_dir() / "trial_meta.json") or {}
+            status = "pass" if (meta.get("status") == "pass"
+                                and _fresh_deliverables_written(allowed_output_paths)) else "fail"
         else:
-            # producing substep (compile.generate / generate.generate / build /
-            # validate.execute): it passes only when it wrote ALL of its
-            # DELIVERABLE outputs — not the phase required_outputs (for validate
-            # those are the judge's), and not the audit/process logs whose
-            # placement varies by build system (e.g. a Make build's
-            # command_log lands under source/<src>/src, not binary/<bin>) —
-            # AND each was authored in this attempt (mtime >= min_mtime) so a retry
-            # never passes on stale files. The downstream verify/judge certifies it.
-            required = [p for p in allowed_output_paths
-                        if Path(p).name not in _OPTIONAL_OUTPUT_BASENAMES]
-            present = [p for p in required if (self.repo_root / p).exists()]
-            all_written = len(present) == len(required)
-            fresh = all((self.repo_root / p).stat().st_mtime >= min_mtime for p in present)
-            status = "pass" if all_written and fresh else "fail"
+            # remaining producing substeps (compile.generate / generate.generate): pass
+            # only when ALL DELIVERABLE outputs were written this attempt (mtime guard);
+            # the audit/process logs (optional basenames) are excluded. The downstream
+            # verify certifies the content.
+            status = "pass" if _fresh_deliverables_written(allowed_output_paths) else "fail"
         return status, output_refs
 
     def _agent_run_json(self, refs: NodeRefs, phase: str, substep: str | None,
@@ -989,31 +1019,13 @@ class Conductor:
 
     # -- deterministic (non-LLM) substep execution ----------------------------
     # Build and Validate.execute are contractually non-LLM (deterministic compile /
-    # run). The conductor runs their body IN-PROCESS (no `claude -p` leaf) by reusing
-    # the build-runtime MCP tool handlers directly, then plays the child-return itself
-    # so the SAME record_launch / record-child-return / finalize_child bookkeeping
-    # applies and the executor remains a normal step/substep agent_run_id (the
-    # integrity validators pass unchanged). Only the LLM cost is removed.
+    # run), so the conductor ALWAYS runs their body IN-PROCESS (no `claude -p` leaf) by
+    # calling the build-runtime MCP tool handlers directly. Validate.judge stays an LLM
+    # leaf (its independent semantic check is essential).
 
-    def _deterministic_build_enabled(self) -> bool:
-        """Opt-in (default off) until verified by a live run; toggled via env
-        `METDSL_CONDUCTOR_DETERMINISTIC_BUILD`."""
-        return str(self.env.get("METDSL_CONDUCTOR_DETERMINISTIC_BUILD", "")).strip().lower() in {
-            "1", "true", "yes",
-        }
-
-    def _deterministic_execute_enabled(self) -> bool:
-        """Opt-in (default off); toggled via `METDSL_CONDUCTOR_DETERMINISTIC_EXECUTE`."""
-        return str(self.env.get("METDSL_CONDUCTOR_DETERMINISTIC_EXECUTE", "")).strip().lower() in {
-            "1", "true", "yes",
-        }
-
-    def _is_deterministic_substep(self, phase: str, substep: str | None) -> bool:
-        if phase == "build":
-            return self._deterministic_build_enabled()
-        if phase == "validate" and substep == "execute":
-            return self._deterministic_execute_enabled()
-        return False
+    @staticmethod
+    def _is_deterministic_substep(phase: str, substep: str | None) -> bool:
+        return phase == "build" or (phase == "validate" and substep == "execute")
 
     def _capability_token(self, child_arid: str) -> str:
         path = (self.repo_root / "workspace" / "orchestrations" / self.orchestration_id
@@ -1023,6 +1035,39 @@ class Conductor:
         if not token:
             raise RuntimeError(f"deterministic step: missing capability_token at {path}")
         return token
+
+    def _resolve_exe_name(self, src_dir: Path, refs: NodeRefs) -> str:
+        """The execution binary basename = the generated Makefile's BIN default
+        (expanded). Build and Validate.execute both derive it from the SAME Makefile so
+        they always agree on the binary path regardless of what name the generator chose
+        (the generator commonly emits BIN=<spec_id> rather than <spec_id>_runner). Falls
+        back to <spec_id>_runner only when the Makefile is absent/unparseable."""
+        fallback = f"{refs.spec_id}_runner"
+        mk = src_dir / "Makefile"
+        if not mk.is_file():
+            return fallback
+        try:
+            from tools.validate_pipeline_semantics import (
+                _expand_make_vars, _makefile_full_var_map, _normalize_make_token)
+            resolved = _normalize_make_token(
+                _expand_make_vars("$(BIN)", _makefile_full_var_map(
+                    mk.read_text(encoding="utf-8", errors="ignore"))))
+        except Exception:  # noqa: BLE001 - any parse error falls back to the contract name
+            return fallback
+        return resolved if (resolved and "$" not in resolved) else fallback
+
+    @staticmethod
+    def _require_make_build_system(build_system: str, phase: str) -> None:
+        """The in-process deterministic bodies hard-code the in-source Make layout
+        (OBJDIR/BINDIR/RUNDIR overrides, make_test preset, binary under binary/<id>/bin,
+        Make command-log placement). Non-Make toolchains (cmake/meson/ninja) would be
+        silently misplaced, so fail loudly until in-process support is implemented for
+        them. All current specs are build_system=make."""
+        if str(build_system).strip().lower() != "make":
+            raise RuntimeError(
+                f"deterministic in-process {phase} supports build_system=make only "
+                f"(got {build_system!r}); non-Make toolchains are not implemented for the "
+                f"in-process path")
 
     @staticmethod
     def _classify_build_failure_category(return_code: int, stderr: str) -> str:
@@ -1076,11 +1121,12 @@ class Conductor:
         toolchain = (impl.get("toolchain") or {}) if isinstance(impl, dict) else {}
         language = str(toolchain.get("language") or "fortran")
         build_system = str(toolchain.get("build_system") or "make")
+        self._require_make_build_system(build_system, "build")
 
         src_dir = self.repo_root / refs.source_dir() / "src"
         bin_dir = self.repo_root / refs.binary_dir() / "bin"
         obj_dir = self.repo_root / "workspace" / "tmp" / child_arid / "build"
-        exe = f"{refs.spec_id}_runner"
+        exe = self._resolve_exe_name(src_dir, refs)
 
         result = tool_compile_project({
             "project_dir": str(src_dir),
@@ -1101,11 +1147,11 @@ class Conductor:
         rc = result.get("return_code") or 1
         stdout = result.get("stdout", "") or ""
         stderr = result.get("stderr", "") or ""
-        # A compile that reports success but did NOT produce the binary at the contract
-        # path (bin/<spec_id>_runner) means the Makefile's BIN default is non-conformant
-        # (phase_03 pins <spec_id>_runner). Treat as a build failure that regenerates the
-        # Makefile rather than writing a pass binary_meta pointing at a missing file (which
-        # desyncs from determine_substep_status -> inconsistent escalate/fail_closed).
+        # A compile that reports success but did NOT produce the binary at bin/<BIN>
+        # (BIN resolved from the Makefile) means the Makefile's BIN variable and its build
+        # rule disagree. Treat as a build failure that regenerates the Makefile rather than
+        # writing a pass binary_meta pointing at a missing file (which desyncs from
+        # determine_substep_status -> inconsistent escalate/fail_closed).
         binary_missing = ok and not (bin_dir / exe).is_file()
         if binary_missing:
             ok = False
@@ -1156,10 +1202,10 @@ class Conductor:
         if binary_missing:
             # Makefile BIN-default defect -> restart (regenerate the Makefile).
             binary_meta["failure_category"] = "make_error"
-            binary_meta["last_fail_reason"] = "binary_not_at_contract_path"
+            binary_meta["last_fail_reason"] = "binary_not_built_at_bindir"
             binary_meta["failure_excerpt"] = (
-                f"compile reported success but no binary at the contract path bin/{exe}; "
-                f"the Makefile BIN default must resolve to '{exe}' (phase_03_build.md)")
+                f"compile reported success but no binary at bin/{exe} (BIN resolved from "
+                f"the Makefile); the Makefile BIN variable and its build rule must agree")
             binary_meta["failure_source_refs"] = [f"{self._rel(src_dir)}/Makefile"]
         elif not ok:
             binary_meta["failure_category"] = self._classify_build_failure_category(rc, stderr)
@@ -1173,11 +1219,11 @@ class Conductor:
         meta_path.write_text(
             json.dumps(binary_meta, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
 
-        # A clean compile failure routes via binary_meta.failure_category (rc 0 here, so
-        # run_phase classifies it -> Generate). A post_build gate failure on an otherwise
-        # successful compile must NOT pass: the binary exists so the existence-based
-        # determine_substep_status would otherwise return pass — signal it via rc 1.
-        returncode = 0
+        # A content failure (compile/link error, post_build violation) is recorded in
+        # binary_meta (verification_status=fail + failure_category) and returns rc 0 so
+        # run_phase routes it via classify_build_failure -> Generate (NOT transport
+        # fail_closed). determine_substep_status reads binary_meta.verification_status,
+        # so a gate failure on an otherwise-built binary still fails the substep.
         if ok:
             gate = subprocess.run(
                 ["python3", "tools/validate_pipeline_semantics.py", "--stage", "post_build",
@@ -1192,8 +1238,7 @@ class Conductor:
                 meta_path.write_text(
                     json.dumps(binary_meta, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
                 stderr += "\n[post_build gate fail]\n" + gate.stdout + gate.stderr
-                returncode = 1
-        return {"returncode": returncode, "stdout": stdout, "stderr": stderr}
+        return {"returncode": 0, "stdout": stdout, "stderr": stderr}
 
     # -- deterministic Validate.execute (run + quality_check + evidence promote) --
 
@@ -1342,11 +1387,13 @@ class Conductor:
         target = (impl.get("target") or {}) if isinstance(impl, dict) else {}
         target_class = str(target.get("class") or "cpu")
         threads = 1
+        self._require_make_build_system(
+            str(toolchain.get("build_system") or "make"), "validate.execute")
 
         node_dir = self.repo_root / refs.run_node_dir()
         src_dir = self.repo_root / refs.source_dir() / "src"
         bin_dir = self.repo_root / refs.binary_dir(refs.source_binary_id) / "bin"
-        exe = f"{refs.spec_id}_runner"
+        exe = self._resolve_exe_name(src_dir, refs)
         binary = (bin_dir / exe).resolve()
         ir_spec = (self.repo_root / refs.ir_ref / "spec.ir.yaml").resolve()
         run_tmp = self.repo_root / "workspace" / "tmp" / child_arid / "run"
@@ -1378,7 +1425,10 @@ class Conductor:
         stdout = res_run.get("stdout", "") or ""
         stderr = res_run.get("stderr", "") or ""
         if not res_run.get("ok"):
-            return {"returncode": 1, "stdout": stdout,
+            # Runtime error is a CONTENT failure (buggy generated code): rc 0 so run_phase
+            # routes it via the validate tables / diagnostician, not transport fail_closed.
+            # No trial_meta is written, so determine_substep_status fails this substep.
+            return {"returncode": 0, "stdout": stdout,
                     "stderr": stderr + "\n[run_program failed: runtime_error]"}
 
         # 2. run_quality_checks (make_test re-run; output to a SEPARATE tmp).
@@ -1446,12 +1496,16 @@ class Conductor:
             ["python3", "tools/validate_pipeline_semantics.py", "--stage", "post_execute",
              "--pipeline-root", refs.pipeline_ref, "--run-id", refs.run_id or ""],
             cwd=self.repo_root, env=self.env, text=True, capture_output=True, check=False)
-        rc = 0
         if syn.returncode != 0 or gate.returncode != 0 or qc_status != "pass":
-            rc = 1
-            stderr += ("\n[execute gate fail]\n" + syn.stdout + syn.stderr
+            # Content failure: record it in trial_meta.status (read by
+            # determine_substep_status) and return rc 0 so run_phase routes it via the
+            # validate tables / diagnostician, NOT transport fail_closed.
+            stderr += ("\n[execute fail]\n" + syn.stdout + syn.stderr
                        + gate.stdout + gate.stderr)
-        return {"returncode": rc, "stdout": stdout, "stderr": stderr}
+            trial_meta["status"] = "fail"
+            (node_dir / "trial_meta.json").write_text(
+                json.dumps(trial_meta, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+        return {"returncode": 0, "stdout": stdout, "stderr": stderr}
 
     def run_substep(self, refs: NodeRefs, phase: str, substep: str | None,
                     repair: dict[str, str] | None = None) -> SubstepOutcome:
@@ -1465,6 +1519,9 @@ class Conductor:
             case_ids=self.read_case_ids(refs) if phase == "validate" else (),
             evidence_artifacts=self._read_evidence_artifacts(refs) if phase == "validate"
             else ("state_snapshots",),
+            # build's allowed_output_paths binary path = the Makefile's resolved BIN.
+            exe_name=(self._resolve_exe_name(self.repo_root / refs.source_dir() / "src", refs)
+                      if phase == "build" else None),
             repair=repair,
         )
         rec = self.record_launch(child_arid, request)
@@ -1749,6 +1806,14 @@ class Conductor:
             meta = _read_json(self.repo_root / refs.binary_dir() / "binary_meta.json") or {}
             return classify_build_failure(meta.get("failure_category"))
         if phase == "validate":
+            # An execute-substep failure (deterministic) means judge never ran, so there
+            # is no verdict.json. The runner produced bad/missing primary evidence (a
+            # runtime error or a post_execute structural violation), which is a code
+            # defect -> regenerate. Route to Generate deterministically rather than
+            # escalating with no verdict (the judge-centric table can't classify it).
+            if not (self.repo_root / refs.run_node_dir() / "verdict.json").is_file():
+                return RouteDecision("retry", target_phase="generate", repair_strategy="restart",
+                                     reason="validate_execute_fail")
             verdict = _read_json(self.repo_root / refs.run_node_dir() / "verdict.json") or {}
             review = _read_json(self.repo_root / refs.run_node_dir() / "semantic_review.json") or {}
             findings = review.get("findings") or []

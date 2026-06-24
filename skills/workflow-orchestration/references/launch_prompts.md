@@ -112,8 +112,8 @@ Required requirements:
 | generate | verify | workflow-generate-verify | skills/workflow-generate-verify/SKILL.md |
 | tune | generate | workflow-tune-generate | skills/workflow-tune-generate/SKILL.md |
 | tune | verify | workflow-tune-verify | skills/workflow-tune-verify/SKILL.md |
-| build | — | workflow-build | skills/workflow-build/SKILL.md |
-| execute | — | workflow-validate-execute | skills/workflow-validate-execute/SKILL.md |
+| build | — | _(conductor in-process; no skill, deterministic launch prompt)_ | — |
+| execute | — | _(conductor in-process; no skill, deterministic launch prompt)_ | — |
 | judge | — | workflow-validate-judge | skills/workflow-validate-judge/SKILL.md |
 | promote | — | workflow-promote | skills/workflow-promote/SKILL.md |
 

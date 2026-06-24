@@ -243,6 +243,11 @@ class _FakeConductor(wc.Conductor):
     def spawn_leaf(self, prompt_text, child_env, **kwargs):  # type: ignore[override]
         return wc.ProcResult(0, "", "")
 
+    def _run_deterministic_substep(self, refs, phase, substep, child_arid, request):  # type: ignore[override]
+        # Build / Validate.execute always run in-process; the fake body is a clean
+        # success so the stubbed determine_substep_status/status_fn drives the outcome.
+        return wc.ProcResult(0, "", "")
+
     def read_parent_return_token(self, child_arid):  # type: ignore[override]
         return "rtok"
 
@@ -292,20 +297,24 @@ class ConductHappyPathTest(unittest.TestCase):
         self.assertEqual(status, "pass")
         subs = [s for s, _ in c.calls]
 
-        # per phase: check-step-completed, workflow-launch-check, then
-        # (record-launch, finalize-child) per substep, then write-step-result.
+        # per phase: check-step-completed, workflow-launch-check, then per substep
+        # (record-launch, [record-child-return if deterministic], finalize-child),
+        # then write-step-result. Build and Validate.execute are deterministic (the
+        # conductor issues their record-child-return); compile/generate/judge are leaves.
         expected = (
             ["check-step-completed", "workflow-launch-check",
              "record-launch", "finalize-child", "record-launch", "finalize-child",
-             "write-step-result"]  # compile (2 substeps)
+             "write-step-result"]  # compile (2 leaf substeps)
             + ["check-step-completed", "workflow-launch-check",
                "record-launch", "finalize-child", "record-launch", "finalize-child",
-               "write-step-result"]  # generate (2 substeps)
+               "write-step-result"]  # generate (2 leaf substeps)
             + ["check-step-completed", "workflow-launch-check",
-               "record-launch", "finalize-child", "write-step-result"]  # build (1 step)
+               "record-launch", "record-child-return", "finalize-child",
+               "write-step-result"]  # build (1 deterministic step)
             + ["check-step-completed", "workflow-launch-check",
-               "record-launch", "finalize-child", "record-launch", "finalize-child",
-               "write-step-result"]  # validate (2 substeps)
+               "record-launch", "record-child-return", "finalize-child",  # execute (deterministic)
+               "record-launch", "finalize-child",  # judge (leaf)
+               "write-step-result"]  # validate
             + ["set-status"]
         )
         self.assertEqual(subs, expected)
@@ -790,11 +799,19 @@ class SubstepStatusAndResumeTest(unittest.TestCase):
                            ir_id="x_1_001", pipeline_id="x_1_001", source_id="src_1_001",
                            binary_id="bin_1_001", run_id="run_1_001", source_binary_id="bin_1_001")
 
+    def _seed_binary_meta(self, root: Path, refs: wc.NodeRefs, status: str = "pass") -> None:
+        # Build status now reads binary_meta.verification_status (deterministic build);
+        # seed it so the freshness/all-outputs producer logic is what these tests exercise.
+        mp = root / refs.binary_dir() / "binary_meta.json"
+        mp.parent.mkdir(parents=True, exist_ok=True)
+        mp.write_text(json.dumps({"verification_status": status}), encoding="utf-8")
+
     def test_producer_requires_all_its_outputs(self) -> None:
         import tempfile
         with tempfile.TemporaryDirectory() as d:
             root = Path(d)
             c = self._real_conductor(root)
+            self._seed_binary_meta(root, self._refs())
             paths = ["a/runner.bin", "a/binary_meta.json", "a/command_log.jsonl"]
             # none exist -> fail
             self.assertEqual(c.determine_substep_status(self._refs(), "build", None, paths)[0], "fail")
@@ -809,11 +826,27 @@ class SubstepStatusAndResumeTest(unittest.TestCase):
             (root / paths[0]).unlink()
             self.assertEqual(c.determine_substep_status(self._refs(), "build", None, paths)[0], "fail")
 
+    def test_build_fails_when_binary_meta_verification_fail(self) -> None:
+        # A post_build content failure (binary built but verification_status=fail) must
+        # fail the substep even though all deliverables exist (rc 0 content-failure route).
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            c = self._real_conductor(root)
+            self._seed_binary_meta(root, self._refs(), status="fail")
+            allowed = ["b/bin/runner", "b/binary_meta.json"]
+            for p in allowed:
+                (root / p).parent.mkdir(parents=True, exist_ok=True)
+                (root / p).write_text("x", encoding="utf-8")
+            self.assertEqual(
+                c.determine_substep_status(self._refs(), "build", None, allowed)[0], "fail")
+
     def test_build_passes_without_binary_side_mcp_log(self) -> None:
         import tempfile
         with tempfile.TemporaryDirectory() as d:
             root = Path(d)
             c = self._real_conductor(root)
+            self._seed_binary_meta(root, self._refs())
             allowed = ["b/bin/runner", "b/binary_meta.json", "b/command_log.jsonl"]
             for p in allowed[:2]:  # write the deliverables, NOT the audit log
                 (root / p).parent.mkdir(parents=True, exist_ok=True)
@@ -846,6 +879,7 @@ class SubstepStatusAndResumeTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             root = Path(d)
             c = self._real_conductor(root)
+            self._seed_binary_meta(root, self._refs())
             paths = ["a/runner.bin", "a/binary_meta.json"]
             for p in paths:
                 (root / p).parent.mkdir(parents=True, exist_ok=True)
@@ -1338,6 +1372,10 @@ class DeterministicBuildTest(unittest.TestCase):
         captured: dict = {}
 
         class C(_FakeConductor):
+            # exercise the REAL deterministic dispatch (not the _FakeConductor stub)
+            def _run_deterministic_substep(self, *a, **k):  # type: ignore[override]
+                return wc.Conductor._run_deterministic_substep(self, *a, **k)
+
             def spawn_leaf(self, *a, **k):  # type: ignore[override]
                 raise AssertionError("leaf must not spawn for deterministic build")
 
@@ -1353,8 +1391,7 @@ class DeterministicBuildTest(unittest.TestCase):
                 captured["prefix"] = prefix
 
         c = C(repo_root=Path("/tmp/repo"), orchestration_id="orch_x",
-              orchestration_agent_run_id="ORCH", backend="claude",
-              env={"METDSL_CONDUCTOR_DETERMINISTIC_BUILD": "1"})
+              orchestration_agent_run_id="ORCH", backend="claude", env={})
         c.calls = []
         oc = c.run_substep(self._refs(), "build", None)
 
@@ -1368,22 +1405,22 @@ class DeterministicBuildTest(unittest.TestCase):
         self.assertIn("record-child-return", subs)
         self.assertIn("finalize-child", subs)
 
-    def test_build_body_nonzero_returncode_fails_substep(self) -> None:
-        # A post_build gate failure (binary present) must surface as a fail, not pass,
-        # via the body's returncode (regression: gate-fail previously returned rc 0).
+    def test_build_infra_failure_nonzero_returncode_fails_substep(self) -> None:
+        # A conductor/MCP INFRA failure (the _run_deterministic_substep except clause,
+        # e.g. missing capability) returns rc != 0 -> transport fail (leaf_returncode 1).
+        # Content failures (compile/gate) instead return rc 0 and route via the tables.
         class C(_FakeConductor):
-            def _capability_token(self, child_arid):  # type: ignore[override]
-                return "captok"
+            def _run_deterministic_substep(self, *a, **k):  # type: ignore[override]
+                return wc.Conductor._run_deterministic_substep(self, *a, **k)
 
-            def _build_inproc(self, refs, child_arid, cap_token):  # type: ignore[override]
-                return {"returncode": 1, "stdout": "", "stderr": "[post_build gate fail]"}
+            def _capability_token(self, child_arid):  # type: ignore[override]
+                raise RuntimeError("missing capability token")  # infra failure
 
             def _persist_leaf_output(self, *a, **k):  # type: ignore[override]
                 pass
 
         c = C(repo_root=Path("/tmp/repo"), orchestration_id="orch_x",
-              orchestration_agent_run_id="ORCH", backend="claude",
-              env={"METDSL_CONDUCTOR_DETERMINISTIC_BUILD": "1"})
+              orchestration_agent_run_id="ORCH", backend="claude", env={})
         c.calls = []
         oc = c.run_substep(self._refs(), "build", None)
         self.assertEqual(oc.status, "fail")
@@ -1422,26 +1459,63 @@ class DeterministicBuildTest(unittest.TestCase):
             self.assertEqual(meta["failure_category"], "make_error")
             self.assertTrue(meta["failure_source_refs"][0].endswith("/Makefile"))
 
-    def test_flag_off_uses_leaf_path(self) -> None:
-        spawned: dict = {}
+    def test_build_content_failure_routes_to_generate_not_transport(self) -> None:
+        # Codex finding 1: a build content failure (rc 0 + binary_meta verification_status
+        # =fail) must route via classify_build_failure -> Generate, NOT leaf_transport_error
+        # fail_closed. Drive run_phase with a stubbed deterministic body + binary_meta.
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            refs = self._refs()
 
-        class C(_FakeConductor):
-            def spawn_leaf(self, prompt_text, child_env, **kwargs):  # type: ignore[override]
-                spawned["yes"] = True
-                return wc.ProcResult(0, "", "")
+            class C(_FakeConductor):
+                def _run_deterministic_substep(self, refs2, phase, substep, child_arid, request):  # type: ignore[override]
+                    # content failure: rc 0, and author a failing binary_meta
+                    mp = self.repo_root / refs2.binary_dir() / "binary_meta.json"
+                    mp.parent.mkdir(parents=True, exist_ok=True)
+                    mp.write_text(json.dumps({"verification_status": "fail",
+                                              "failure_category": "compile_error"}),
+                                  encoding="utf-8")
+                    return wc.ProcResult(0, "", "compile error")
 
-            def _persist_leaf_output(self, *a, **k):  # type: ignore[override]
-                pass
+                def determine_substep_status(self, *a, **k):  # type: ignore[override]
+                    return "fail", []
 
-        c = C(repo_root=Path("/tmp/repo"), orchestration_id="orch_x",
-              orchestration_agent_run_id="ORCH", backend="claude", env={})
-        c.calls = []
-        c.run_substep(self._refs(), "build", None)
+                def _write_lineage(self, *a, **k):  # type: ignore[override]
+                    pass
 
-        self.assertTrue(spawned.get("yes"))
-        subs = [s for s, _ in c.calls]
-        # the leaf calls record-child-return itself per AGENT_CONTRACT, not the conductor.
-        self.assertNotIn("record-child-return", subs)
+            c = C(repo_root=repo, orchestration_id="orch_x",
+                  orchestration_agent_run_id="ORCH", backend="claude", env={})
+            c.calls = []
+            outcome = c.run_phase(refs, "build")
+            self.assertEqual(outcome.status, "fail")
+            # routed by the decision table to Generate (retry), NOT fail_closed/transport
+            self.assertEqual(outcome.decision.action, "retry")
+            self.assertEqual(outcome.decision.target_phase, "generate")
+            self.assertNotIn("transport", (outcome.decision.reason or ""))
+
+    def test_require_make_build_system_rejects_non_make(self) -> None:
+        c = wc.Conductor(repo_root=Path("/tmp/r"), orchestration_id="o",
+                         orchestration_agent_run_id="O", backend="claude", env={})
+        c._require_make_build_system("make", "build")  # no raise
+        for bs in ("cmake", "meson", "ninja"):
+            with self.assertRaisesRegex(RuntimeError, "build_system=make only"):
+                c._require_make_build_system(bs, "build")
+
+    def test_execute_failure_routes_to_generate(self) -> None:
+        # An execute-substep failure (no verdict.json, judge never ran) is a runner code
+        # defect -> retry Generate (restart), not escalate/fail_closed.
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            c = wc.Conductor(repo_root=repo, orchestration_id="o",
+                             orchestration_agent_run_id="O", backend="claude", env={})
+            refs = self._refs()
+            # no verdict.json under the run node dir -> execute failed before judge
+            decision = c.classify_failure(refs, "validate", [])
+            self.assertEqual(decision.action, "retry")
+            self.assertEqual(decision.target_phase, "generate")
+            self.assertEqual(decision.repair_strategy, "restart")
 
 
 class ExecutePromoterTest(unittest.TestCase):

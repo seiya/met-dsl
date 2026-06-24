@@ -431,9 +431,26 @@ def _has_informative_agent_summary(text: str) -> bool:
     )
 
 
+DETERMINISTIC_PROMPT_SENTINEL = "Conductor-executed deterministic step"
+
+
 def _required_launch_prompt_markers_for_role(
     role: str,
+    deterministic: bool = False,
 ) -> list[str]:
+    if deterministic:
+        # Build / Validate.execute run in-process (no leaf); their minimal launch prompt
+        # carries no skill section or leaf instructions — only the sentinel + core ids
+        # + node/step. See _render_deterministic_launch_prompt in orchestration_runtime.
+        det = [
+            DETERMINISTIC_PROMPT_SENTINEL,
+            "Target node_key:", "Target step:",
+            "orchestration_id:", "agent_run_id:", "parent_agent_run_id:",
+            "ir_ref:", "pipeline_ref:",
+        ]
+        if role == "substep":
+            det.append("Target substep:")
+        return det
     markers = [
         "orchestration_id:",
         "agent_run_id:",
@@ -1415,24 +1432,11 @@ def _validate_fortran_makefile_src_dir(src_dir: Path, violations: list[str]) -> 
 
     makefile_text = makefile_path.read_text(encoding="utf-8", errors="ignore")
 
-    # The execution binary basename must default to `<spec_id>_runner` (phase_03 §10).
-    # Build and Validate.execute resolve `bin/<spec_id>_runner` via the shared launch
-    # `allowed_output_paths`, so a Makefile whose `BIN` default diverges (e.g.
-    # `BIN = $(SPEC)` without the `_runner` suffix, or a short slug) links the binary at
-    # the wrong path and fails Build with no actionable category. Enforce it here so the
-    # divergence is caught as a Generate defect (regenerate) rather than surfacing at Build.
-    _runner_srcs = [p for p in src_files if p.stem.endswith("_runner")]
-    if _runner_srcs:
-        _expected_bin = _runner_srcs[0].stem  # <spec_id>_runner
-        _resolved_bin = _normalize_make_token(
-            _expand_make_vars("$(BIN)", _makefile_full_var_map(makefile_text))
-        )
-        if _resolved_bin and "$" not in _resolved_bin and _resolved_bin != _expected_bin:
-            violations.append(
-                f"{makefile_path}: BIN default resolves to '{_resolved_bin}' but must be "
-                f"'{_expected_bin}' (phase_03_build.md: the execution binary basename is "
-                f"the Makefile BIN default `<spec_id>_runner`)"
-            )
+    # The execution binary basename is NOT pinned to a specific value: Build and
+    # Validate.execute derive it from this Makefile's BIN default (see
+    # Conductor._resolve_exe_name), so any BIN works as long as the build rule produces
+    # bin/$(BIN). The earlier `BIN must be <spec_id>_runner` gate was removed because the
+    # generator frequently emits BIN=<spec_id> and the deterministic bodies now adapt.
 
     rules = _parse_makefile_rules(makefile_text)
     # Directory-prefix-aware view: detects a prerequisite whose `$(OBJDIR)/`
@@ -6061,7 +6065,7 @@ def _canonical_log_ref_for_run_quality_checks(
 ) -> str | None:
     """Canonical command_log_ref placement for the trial's specific source.
 
-    skills/workflow-validate-execute/SKILL.md mandates run_quality_checks
+    docs/workflow/phases/phase_04_validate.md mandates run_quality_checks
     against `project_dir=source/<source_id>/src/`. The canonical placement
     is bound strictly to the trial_meta's declared `source_source_id` —
     sibling or older sources under the same pipeline are NOT acceptable.
@@ -7124,7 +7128,9 @@ def _validate_orchestration_hierarchy(
                                     f"{runs_path}:line {idx + 1} {key} target must be non-empty ({ref_token})"
                                 )
                             if key == "launch_prompt_ref":
-                                required_markers = _required_launch_prompt_markers_for_role(role_l)
+                                is_deterministic = DETERMINISTIC_PROMPT_SENTINEL in launch_text
+                                required_markers = _required_launch_prompt_markers_for_role(
+                                    role_l, deterministic=is_deterministic)
                                 missing_markers = [
                                     marker
                                     for marker in required_markers

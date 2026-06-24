@@ -10743,7 +10743,7 @@ class OrchestrationMetaAndJudgeHookTests(unittest.TestCase):
             lr_rel = "workspace/launches/judge_lr.json"
             (repo / lr_rel).parent.mkdir(parents=True, exist_ok=True)
             (repo / lr_rel).write_text(
-                json.dumps({"pipeline_ref": pipe_rel, "run_id": "run_j1"}),
+                json.dumps({"pipeline_ref": pipe_rel, "run_id": "run_j1", "substep": "judge"}),
                 encoding="utf-8",
             )
             payload = {"launch_request_ref": lr_rel}
@@ -10782,7 +10782,7 @@ class OrchestrationMetaAndJudgeHookTests(unittest.TestCase):
             lr_rel = "workspace/launches/judge_lr_blocked.json"
             (repo / lr_rel).parent.mkdir(parents=True, exist_ok=True)
             (repo / lr_rel).write_text(
-                json.dumps({"pipeline_ref": pipe_rel, "run_id": "run_b1"}),
+                json.dumps({"pipeline_ref": pipe_rel, "run_id": "run_b1", "substep": "judge"}),
                 encoding="utf-8",
             )
             payload = {"launch_request_ref": lr_rel}
@@ -10813,7 +10813,7 @@ class OrchestrationMetaAndJudgeHookTests(unittest.TestCase):
             lr_rel = "workspace/launches/judge_lr_blocked_missing.json"
             (repo / lr_rel).parent.mkdir(parents=True, exist_ok=True)
             (repo / lr_rel).write_text(
-                json.dumps({"pipeline_ref": pipe_rel, "run_id": "run_b2"}),
+                json.dumps({"pipeline_ref": pipe_rel, "run_id": "run_b2", "substep": "judge"}),
                 encoding="utf-8",
             )
             payload = {"launch_request_ref": lr_rel}
@@ -10841,7 +10841,7 @@ class OrchestrationMetaAndJudgeHookTests(unittest.TestCase):
             lr_rel = "workspace/launches/judge_lr_timeout.json"
             (repo / lr_rel).parent.mkdir(parents=True, exist_ok=True)
             (repo / lr_rel).write_text(
-                json.dumps({"pipeline_ref": pipe_rel, "run_id": "run_to1"}),
+                json.dumps({"pipeline_ref": pipe_rel, "run_id": "run_to1", "substep": "judge"}),
                 encoding="utf-8",
             )
             payload = {"launch_request_ref": lr_rel}
@@ -10852,6 +10852,26 @@ class OrchestrationMetaAndJudgeHookTests(unittest.TestCase):
                     status_token=st,
                     payload=payload,
                 )
+
+    def test_pre_phase_complete_judge_checks_skips_when_execute_failed(self) -> None:
+        # When Validate fails at the deterministic `execute` substep, judge never runs
+        # and launch_request_ref points to the execute substep. The judge check must skip
+        # the semantic_review.json requirement (no judge output exists) so the conductor
+        # can route the execute failure via its decision tables instead of erroring.
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            node_key = "problem/shallow_water2d@0.3.0"
+            pipe_rel = "workspace/pipelines/judge_exec_fail_pipe"
+            lr_rel = "workspace/launches/execute_lr.json"
+            (repo / lr_rel).parent.mkdir(parents=True, exist_ok=True)
+            (repo / lr_rel).write_text(
+                json.dumps({"pipeline_ref": pipe_rel, "run_id": "run_e1",
+                            "substep": "execute"}),  # execute, not judge
+                encoding="utf-8")
+            # no semantic_review.json anywhere -> would raise if not skipped
+            _pre_phase_complete_judge_checks(
+                repo, node_key=node_key, status_token="fail",
+                payload={"launch_request_ref": lr_rel})
 
 
 class PreflightLiveProbeTtlTests(unittest.TestCase):

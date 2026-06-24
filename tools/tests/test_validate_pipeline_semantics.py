@@ -8082,11 +8082,106 @@ class FortranMakefileObjdirPrefixTest(unittest.TestCase):
         )
 
 
-class MakefileBinDefaultTest(unittest.TestCase):
-    """post_generate gate: the Makefile BIN default must resolve to <spec_id>_runner
-    (the runner source stem). A divergent BIN (e.g. `BIN=$(SPEC)` without the _runner
-    suffix, or a short slug) links the binary at a path Build/Validate.execute do not
-    expect — caught at Generate so it regenerates rather than failing Build."""
+class DeterministicLaunchPromptMarkerTest(unittest.TestCase):
+    """Build / Validate.execute run in-process (no leaf, no skill): their minimal
+    deterministic launch prompt satisfies a reduced marker set (no skill markers)."""
+
+    def test_sentinel_constants_match_across_modules(self) -> None:
+        # The validator detects deterministic prompts by text (sentinel in launch_text);
+        # the runtime renders them. A desync would silently break the marker exemption.
+        from tools.validate_pipeline_semantics import DETERMINISTIC_PROMPT_SENTINEL as V
+        from tools.orchestration_runtime import DETERMINISTIC_PROMPT_SENTINEL as R
+        self.assertEqual(V, R)
+
+    def test_reduced_markers_exclude_skill(self) -> None:
+        from tools.validate_pipeline_semantics import (
+            _required_launch_prompt_markers_for_role, DETERMINISTIC_PROMPT_SENTINEL)
+        det = _required_launch_prompt_markers_for_role("step", deterministic=True)
+        self.assertIn(DETERMINISTIC_PROMPT_SENTINEL, det)
+        self.assertNotIn("skill_ref:", det)
+        self.assertNotIn("skill_name:", det)
+        # the leaf set still requires skill markers
+        leaf = _required_launch_prompt_markers_for_role("step", deterministic=False)
+        self.assertIn("skill_ref:", leaf)
+
+    def test_prepare_payload_keeps_deterministic_skill_free(self) -> None:
+        # Regression: prepare_launch_request_payload (the real record-launch path) must
+        # NOT re-inject skill_name/skill_ref (to a deleted SKILL) for a deterministic
+        # build/execute payload — it must mirror build_launch_request's stripping.
+        import tools.workflow_conductor as wc
+        from tools.orchestration_runtime import prepare_launch_request_payload
+        refs = wc.NodeRefs(node_key="component/spec_x@0.1.0", spec_path="spec/component/spec_x",
+                           ir_id="x_1", pipeline_id="x_1", source_id="src_1", binary_id="bin_1",
+                           run_id="run_1", source_binary_id="bin_1")
+        for step, substep in [("build", None), ("validate", "execute")]:
+            req = wc.build_launch_request(
+                refs, step=step, substep=substep, orchestration_id="o",
+                orchestration_agent_run_id="p", child_agent_run_id="c", agent_model="m",
+                workflow_mode="dev", case_ids=("a",), evidence_artifacts=("state_snapshots",))
+            prepared = prepare_launch_request_payload(req)
+            self.assertIsNone(prepared.get("skill_name"))
+            self.assertIsNone(prepared.get("skill_ref"))
+            self.assertEqual(prepared.get("skill_must_read_refs"), "")
+        # the leaf path (judge) still derives a real skill_ref
+        judge = wc.build_launch_request(
+            refs, step="validate", substep="judge", orchestration_id="o",
+            orchestration_agent_run_id="p", child_agent_run_id="c", agent_model="m",
+            workflow_mode="dev")
+        self.assertTrue(prepare_launch_request_payload(judge).get("skill_ref"))
+
+    def test_validate_rejects_forged_deterministic_on_leaf_step(self) -> None:
+        # Defense-in-depth: deterministic=True is only valid for build / validate.execute.
+        from tools.orchestration_runtime import _validate_launch_request_payload
+        forged = {"node_key": "component/x@0.1.0", "step": "validate", "substep": "judge",
+                  "agent_model": "opus", "deterministic": True}
+        with self.assertRaisesRegex(ValueError, "deterministic=True is only valid"):
+            _validate_launch_request_payload(forged)
+        forged_gen = {"node_key": "component/x@0.1.0", "step": "generate",
+                      "substep": "generate", "agent_model": "opus", "deterministic": True}
+        with self.assertRaisesRegex(ValueError, "deterministic=True is only valid"):
+            _validate_launch_request_payload(forged_gen)
+
+    def test_forged_deterministic_on_leaf_step_still_renders_full_prompt(self) -> None:
+        # A non-build/execute step that forges deterministic:True must NOT downgrade to
+        # the minimal prompt in a way that hides the leaf constraint lines: the renderer
+        # branches on the flag, but the invariant we lock is that build_launch_request
+        # never sets deterministic for a leaf step, and a forged flag still carries the
+        # full leaf prompt's security-constraint lines through record-launch validation.
+        from tools.orchestration_runtime import (
+            _required_launch_prompt_constraint_lines, _required_launch_prompt_markers)
+        # leaf judge payload, no deterministic flag -> full constraint lines required
+        leaf = {"step": "validate", "substep": "judge", "node_key": "component/x@0.1.0",
+                "skill_ref": "skills/workflow-validate-judge/SKILL.md"}
+        self.assertTrue(_required_launch_prompt_constraint_lines(leaf))
+        self.assertIn("skill_ref:", _required_launch_prompt_markers(leaf))
+
+    def test_deterministic_prompt_satisfies_reduced_markers(self) -> None:
+        import tools.workflow_conductor as wc
+        from tools.orchestration_runtime import render_launch_prompt_text
+        from tools.validate_pipeline_semantics import (
+            _required_launch_prompt_markers_for_role, _launch_prompt_marker_present,
+            DETERMINISTIC_PROMPT_SENTINEL)
+        refs = wc.NodeRefs(node_key="component/spec_x@0.1.0", spec_path="spec/component/spec_x",
+                           ir_id="x_1", pipeline_id="x_1", source_id="src_1", binary_id="bin_1",
+                           run_id="run_1", source_binary_id="bin_1")
+        for step, substep, role in [("build", None, "step"), ("validate", "execute", "substep")]:
+            req = wc.build_launch_request(
+                refs, step=step, substep=substep, orchestration_id="o",
+                orchestration_agent_run_id="p", child_agent_run_id="c", agent_model="m",
+                workflow_mode="dev", case_ids=("a",), evidence_artifacts=("state_snapshots",))
+            self.assertTrue(req.get("deterministic"))
+            self.assertNotIn("skill_ref", req)
+            prompt = render_launch_prompt_text(req)
+            self.assertIn(DETERMINISTIC_PROMPT_SENTINEL, prompt)
+            markers = _required_launch_prompt_markers_for_role(role, deterministic=True)
+            self.assertEqual([m for m in markers
+                              if not _launch_prompt_marker_present(m, prompt)], [])
+
+
+class MakefileBinNotPinnedTest(unittest.TestCase):
+    """post_generate no longer pins the Makefile BIN to <spec_id>_runner: Build and
+    Validate.execute derive the binary basename from the Makefile's BIN, so any value is
+    accepted. (Conductor._resolve_exe_name resolves it; the bodies adapt.)"""
 
     _MODEL = "module foo_model\nimplicit none\nend module foo_model\n"
     _RUNNER = "program foo_runner\nimplicit none\nend program foo_runner\n"
@@ -8095,23 +8190,34 @@ class MakefileBinDefaultTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             src = Path(tmp)
             (src / "foo_model.f90").write_text(self._MODEL, encoding="utf-8")
-            (src / "foo_runner.f90").write_text(self._RUNNER, encoding="utf-8")  # -> foo_runner
+            (src / "foo_runner.f90").write_text(self._RUNNER, encoding="utf-8")
             (src / "Makefile").write_text(
                 f"SPEC = foo\nOBJDIR ?= .\nBINDIR ?= .\n{bin_line}\nall: $(BINDIR)/$(BIN)\n",
                 encoding="utf-8")
             violations: list[str] = []
             _validate_fortran_makefile_src_dir(src, violations)
-            return [v for v in violations if "BIN default resolves" in v]
+            return [v for v in violations if "BIN" in v]
 
-    def test_conformant_bin_passes(self) -> None:
-        self.assertEqual(self._bin_violations("BIN = foo_runner"), [])
+    def test_bin_equals_spec_id_accepted(self) -> None:
+        # BIN=$(SPEC) (no _runner) used to be flagged; now accepted (bodies adapt).
+        self.assertEqual(self._bin_violations("BIN = $(SPEC)"), [])
 
-    def test_bin_missing_runner_suffix_flagged(self) -> None:
-        v = self._bin_violations("BIN = $(SPEC)")  # resolves to 'foo'
-        self.assertTrue(v and "'foo'" in v[0] and "foo_runner" in v[0])
+    def test_bin_slug_accepted(self) -> None:
+        self.assertEqual(self._bin_violations("BIN = myslug"), [])
 
-    def test_bin_slug_flagged(self) -> None:
-        self.assertTrue(self._bin_violations("BIN = myslug"))
+    def test_resolve_exe_name_reads_makefile_bin(self) -> None:
+        import tools.workflow_conductor as wc
+        with tempfile.TemporaryDirectory() as tmp:
+            src = Path(tmp)
+            (src / "Makefile").write_text(
+                "SPEC = foo\nBIN = $(SPEC)\nall: $(BIN)\n", encoding="utf-8")
+            c = wc.Conductor(repo_root=src.parent, orchestration_id="o",
+                             orchestration_agent_run_id="O", backend="claude", env={})
+            refs = wc.NodeRefs(node_key="component/foo@0.1.0", spec_path="spec/component/foo",
+                               ir_id="i", pipeline_id="p", source_id="s", binary_id="b")
+            self.assertEqual(c._resolve_exe_name(src, refs), "foo")
+            # missing Makefile -> fallback to <spec_id>_runner
+            self.assertEqual(c._resolve_exe_name(src / "nope", refs), "foo_runner")
 
 
 class MakefileTestNoRelinkTest(unittest.TestCase):

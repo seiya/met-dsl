@@ -18,7 +18,7 @@ This document defines the reference conventions for the `skills` used in the pro
 - The execution contract of the agent hierarchy (`orchestration -> step` and `orchestration -> substep`) uses `ORCHESTRATION.md` as the canonical source.
 - The common contract that every child `step agent` / `substep agent` must apply (capability_token usage, read/write permission guards, the direct `Write` / `Edit` artifact-write procedure, tmp-area rules, the no-inline-write / no-cross-agent-read constraints, dev-mode fail rules) uses `docs/AGENT_CONTRACT.md` as the canonical source. It is child-readable (under `docs/`, in every child's `read_manifest`) and is referenced by the rendered launch prompt rather than inlined per child; the security-critical constraint lines that `record-launch`'s `_required_launch_prompt_constraint_lines` guard requires are additionally kept inline in the launch prompt (`skills/workflow-orchestration/references/launch_prompts.md`).
 - The overall policy and `spec` management requirements (`spec_kind` / registry / official-version placement / naming rules) use `SPEC.md` as the canonical source.
-- `Build` / `Validate.execute` / `quality check` run via the `MCP` server, and simultaneously apply the `MCP execution rules` of `AGENTS.md` and the contract of the corresponding `SKILL.md`.
+- `Build` and `Validate.execute` are non-LLM steps the **conductor runs in-process** (no leaf agent, no `SKILL.md`); their contract is `docs/workflow/phases/phase_03_build.md` / `phase_04_validate.md`. They still go through the `MCP` server (`compile_project` / `run_program` / `run_quality_checks`) and apply the `MCP execution rules` of `AGENTS.md`.
 - Each phase must not drop the required outputs defined in the corresponding `SKILL.md` (e.g. `ir_meta.json`, `source_meta.json`, `binary_meta.json`, `verdict.json`, `validate_meta.json`).
 - Write into `SKILL.md` the execution procedure and the procedures specific to that `SKILL`, and do not duplicate the `phase`'s I/O contract / artifact format / numerical canonical requirements in a form that contradicts `docs/workflow/WORKFLOW_CORE.md` or `docs/workflow/phases/phase_*.md`.
 - The hook implementation separates backend-independent `common validation` from backend-specific adapters, and uses `tools/hooks/common.py` as the canonical source for `common validation` and `tools/hooks/adapters/` for the backend adapters.
@@ -37,8 +37,8 @@ This document defines the reference conventions for the `skills` used in the pro
 - `Compile verify`: `skills/workflow-compile-verify/SKILL.md`
 - `Generate generate`: `skills/workflow-generate-generate/SKILL.md`
 - `Generate verify`: `skills/workflow-generate-verify/SKILL.md`
-- `Build`: `skills/workflow-build/SKILL.md`
-- `Validate execute`: `skills/workflow-validate-execute/SKILL.md`
+- `Build`: conductor in-process (no SKILL; see `docs/workflow/phases/phase_03_build.md`)
+- `Validate execute`: conductor in-process (no SKILL; see `docs/workflow/phases/phase_04_validate.md`)
 - `Validate judge`: `skills/workflow-validate-judge/SKILL.md`
 
 ## phase-to-Skill correspondence table (optional flows)
