@@ -1715,7 +1715,10 @@ class Conductor:
 
         result: dict[str, Any] = {
             "status": status,
-            "required_outputs": phase_required_outputs(refs, phase),
+            "required_outputs": phase_required_outputs(
+                refs, phase,
+                exe_name=(self._resolve_exe_name(self.repo_root / refs.source_dir() / "src", refs)
+                          if phase == "build" else None)),
             "executor_agent_run_id": executor,
             "substep_agent_run_ids": substep_arids,
             "failed_substeps": failed,
@@ -1812,6 +1815,27 @@ class Conductor:
             # defect -> regenerate. Route to Generate deterministically rather than
             # escalating with no verdict (the judge-centric table can't classify it).
             if not (self.repo_root / refs.run_node_dir() / "verdict.json").is_file():
+                # Backstop (C2): a Generate restart regenerates the RUNNER, which cannot
+                # fix an IR-rooted structural mismatch (the runner keeps emitting its
+                # natural shape; the IR is the wrong side). Count execute (no-verdict)
+                # failures per node; once a Generate restart has already failed to fix one
+                # (threshold 2, still within MAX_ATTEMPTS_PER_PHASE=3), attribute the
+                # defect to the IR and reopen Compile instead of looping Generate.
+                #
+                # The counter resets BOTH (a) when escalating to Compile here and (b) when
+                # validate advances (conduct, on validate pass). (a) is essential: the
+                # Compile reopen regenerates the IR (and downstream source), so the next
+                # execute failure is against FRESH artifacts and must get its own
+                # Generate-retry-first cycle rather than immediately re-escalating because
+                # a stale count is still >= 2.
+                if not hasattr(self, "_validate_execute_fail_count"):
+                    self._validate_execute_fail_count: dict[str, int] = {}
+                count = self._validate_execute_fail_count.get(refs.node_key, 0) + 1
+                if count >= 2:
+                    self._validate_execute_fail_count[refs.node_key] = 0
+                    return RouteDecision("reopen", target_phase="compile",
+                                         reason="validate_execute_fail_ir")
+                self._validate_execute_fail_count[refs.node_key] = count
                 return RouteDecision("retry", target_phase="generate", repair_strategy="restart",
                                      reason="validate_execute_fail")
             verdict = _read_json(self.repo_root / refs.run_node_dir() / "verdict.json") or {}
@@ -1861,6 +1885,10 @@ class Conductor:
                           result=outcome.status,
                           elapsed_seconds=round(time.monotonic() - phase_started, 2))
             if outcome.status == "pass":
+                # validate advanced: a later, unrelated execute failure should start its
+                # escalation count fresh (C2 backstop counter).
+                if phase == "validate" and hasattr(self, "_validate_execute_fail_count"):
+                    self._validate_execute_fail_count.pop(refs.node_key, None)
                 idx += 1
                 continue
 
@@ -1932,7 +1960,7 @@ PHASE_VALIDATION_STAGE: dict[str, str] = {
 }
 
 
-def phase_required_outputs(refs: NodeRefs, phase: str) -> list[str]:
+def phase_required_outputs(refs: NodeRefs, phase: str, exe_name: str | None = None) -> list[str]:
     if phase == "compile":
         return [f"{refs.ir_ref}/spec.ir.yaml", f"{refs.ir_ref}/ir_meta.json"]
     if phase == "generate":
@@ -1948,8 +1976,11 @@ def phase_required_outputs(refs: NodeRefs, phase: str) -> list[str]:
         ]
     if phase == "build":
         bdir = refs.binary_dir()
+        # The binary basename = the Makefile's resolved BIN (mirrors build_launch_request's
+        # exe_name); falls back to <spec_id>_runner. Hardcoding <spec_id>_runner here
+        # recorded a non-existent path for a BIN=<spec_id> build.
         return [
-            f"{bdir}/bin/{refs.spec_id}_runner",
+            f"{bdir}/bin/{exe_name or (refs.spec_id + '_runner')}",
             f"{bdir}/binary_meta.json",
             f"{refs.source_dir()}/src/command_log.jsonl",
         ]

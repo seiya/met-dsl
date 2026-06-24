@@ -2913,9 +2913,18 @@ def _build_step_agents_missing_step_result(
     """
     root = _orchestration_root(repo_root, orchestration_id)
     node_safe = _node_key_to_safe(node_key.strip())
+    # A build agent whose step_result was archived by `reopen_phase` (the canonical
+    # file moved aside to `step_result.superseded.<seq>.json` and the run_id recorded
+    # in the superseded set) is a deliberately-tombstoned prior attempt — exempt it
+    # exactly as `_validate_orchestration_completion_for_pass` does at the vouch check.
+    # Without this, a `Validate→Generate→build` reopen loop sees the archived build
+    # agent as "finished without a step_result" and wrongly blocks the next launch.
+    superseded_run_ids = _load_superseded_run_ids(repo_root, orchestration_id)
     missing: list[str] = []
     for run_id, payload in _load_run_records(root).items():
         if not isinstance(payload, dict):
+            continue
+        if run_id in superseded_run_ids:
             continue
         role = payload.get("agent_role")
         if not (isinstance(role, str) and role.strip().lower() == "step"):

@@ -100,7 +100,7 @@ io_contract:
             - name: "<name>"
               shape_expr: "<...>"
           time_variable: "<name>"
-          time_shape_expr: "<...>"
+          time_shape_expr: "scalar"   # MUST be "scalar": the per-snapshot time index is a scalar loop counter the runner always emits as a scalar; "[1]" (or any non-scalar) is rejected at compile and fails post_execute
   test_evidence_requirements:
     - test_id: "<test_id>"
       required_raw_variables: ["<var1>", ...]   # must be SUFFICIENT for Validate.judge to independently recompute this test's judgment, i.e. include the recompute inputs (e.g. U_L/U_R for an "F*=F(U_L)" judgment), not only the outputs. Each name resolves to a raw_requirements...schema.variables[].name

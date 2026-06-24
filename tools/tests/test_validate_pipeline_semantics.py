@@ -5236,6 +5236,110 @@ end program shallow_water2d_runner
             violations = validate(repo_root=repo_root, workspace_root="workspace")
             self.assertTrue(any("shape_expr must match referenced state_snapshots schema shape" in v for v in violations))
 
+    def test_snapshot_time_shape_expr_must_be_scalar(self) -> None:
+        """C1: the per-snapshot time index is canonically a scalar loop counter; a
+        non-scalar `time_shape_expr` (e.g. "[1]") is rejected at the compile io_contract
+        gate so the IR regenerates to scalar instead of failing post_execute."""
+        from tools.validate_pipeline_semantics import (
+            _active_repo_root_for_schema,
+            _validate_io_contract_file,
+        )
+
+        def _contract(time_shape_expr: str) -> dict:
+            return {
+                "io_contract": {
+                    "inputs": [{"name": "case", "evidence_ref": "spec.ir.yaml"}],
+                    "outputs": [
+                        {
+                            "name": "U",
+                            "shape_expr": "[2,2]",
+                            "evidence_ref": "raw/state_snapshots",
+                            "raw_variables": ["h"],
+                        }
+                    ],
+                },
+                "raw_requirements": {
+                    "required_evidence": [
+                        {
+                            "artifact": "state_snapshots",
+                            "required": True,
+                            "min_samples": 1,
+                            "schema": {
+                                "variables": [{"name": "h", "shape_expr": "[2,2]"}],
+                                "time_variable": "snapshot_index",
+                                "time_shape_expr": time_shape_expr,
+                            },
+                        }
+                    ]
+                },
+            }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            _seed_shape_expr_schema_into(repo_root)
+            token = _active_repo_root_for_schema.set(repo_root)
+            try:
+                bad_path = repo_root / "bad_contract.json"
+                _write_json(bad_path, _contract("[1]"))
+                bad_violations: list[str] = []
+                _validate_io_contract_file(repo_root, bad_path, bad_violations)
+                self.assertTrue(
+                    any(
+                        "time_shape_expr" in v and 'must be "scalar"' in v
+                        for v in bad_violations
+                    ),
+                    f"expected a scalar violation, got: {bad_violations}",
+                )
+
+                good_path = repo_root / "good_contract.json"
+                _write_json(good_path, _contract("scalar"))
+                good_violations: list[str] = []
+                _validate_io_contract_file(repo_root, good_path, good_violations)
+                self.assertFalse(
+                    any("time_shape_expr" in v and "scalar" in v for v in good_violations),
+                    f"scalar must not be flagged, got: {good_violations}",
+                )
+            finally:
+                _active_repo_root_for_schema.reset(token)
+
+    def test_runner_source_name_must_match_spec_id(self) -> None:
+        """B2 (cosmetic): a runner whose basename is not `<spec_id>_runner.f90` is
+        flagged with a clear violation, matching generate's write-authorization. The
+        correctly-named runner is not flagged."""
+        from tools.validate_pipeline_semantics import (
+            NodeExecution,
+            _validate_runner_source_files,
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            src_dir = Path(tmp)
+            execution = NodeExecution(
+                node_key="problem/shallow_water2d@0.3.0",
+                node_dir=src_dir,
+                exec_dir=src_dir,
+                pipeline_dir=src_dir,
+            )
+            wrong = src_dir / "wrong_runner.f90"
+            wrong.write_text("program wrong_runner\nend program wrong_runner\n", encoding="utf-8")
+            bad: list[str] = []
+            _validate_runner_source_files(execution, [wrong], bad)
+            self.assertTrue(
+                any("must be named shallow_water2d_runner.f90" in v for v in bad),
+                f"expected a runner-name violation, got: {bad}",
+            )
+
+            wrong.unlink()
+            right = src_dir / "shallow_water2d_runner.f90"
+            right.write_text(
+                "program shallow_water2d_runner\nend program shallow_water2d_runner\n",
+                encoding="utf-8",
+            )
+            good: list[str] = []
+            _validate_runner_source_files(execution, [right], good)
+            self.assertFalse(
+                any("must be named" in v for v in good),
+                f"correctly-named runner must not be flagged, got: {good}",
+            )
+
     def test_detects_unknown_required_raw_variables_from_tests_mapping(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)

@@ -1368,6 +1368,17 @@ class DeterministicBuildTest(unittest.TestCase):
             run_id="run_20260101_001", source_binary_id="bin_20260101_001",
         )
 
+    def test_build_required_outputs_use_resolved_exe_name(self) -> None:
+        # B1: the build step_result records the binary at the resolved BIN basename;
+        # the default falls back to <spec_id>_runner.
+        refs = self._refs()
+        bdir = refs.binary_dir()
+        resolved = wc.phase_required_outputs(refs, "build", exe_name="foo")
+        self.assertIn(f"{bdir}/bin/foo", resolved)
+        self.assertNotIn(f"{bdir}/bin/{refs.spec_id}_runner", resolved)
+        default = wc.phase_required_outputs(refs, "build")
+        self.assertIn(f"{bdir}/bin/{refs.spec_id}_runner", default)
+
     def test_build_runs_in_process_without_leaf(self) -> None:
         captured: dict = {}
 
@@ -1516,6 +1527,29 @@ class DeterministicBuildTest(unittest.TestCase):
             self.assertEqual(decision.action, "retry")
             self.assertEqual(decision.target_phase, "generate")
             self.assertEqual(decision.repair_strategy, "restart")
+
+    def test_recurring_execute_failure_escalates_to_compile(self) -> None:
+        # C2 backstop: a first execute failure (no verdict.json) routes to Generate
+        # restart; a second consecutive one on the same node escalates to a Compile
+        # reopen (the IR is the likely wrong side once a Generate restart did not fix it).
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            c = wc.Conductor(repo_root=repo, orchestration_id="o",
+                             orchestration_agent_run_id="O", backend="claude", env={})
+            refs = self._refs()
+            first = c.classify_failure(refs, "validate", [])
+            self.assertEqual((first.action, first.target_phase), ("retry", "generate"))
+            second = c.classify_failure(refs, "validate", [])
+            self.assertEqual((second.action, second.target_phase), ("reopen", "compile"))
+            self.assertEqual(second.reason, "validate_execute_fail_ir")
+            # After escalating to Compile the counter resets: the Compile reopen
+            # regenerates the IR, so the next execute failure (fresh artifacts) gets its
+            # own Generate-retry-first cycle rather than immediately re-escalating.
+            third = c.classify_failure(refs, "validate", [])
+            self.assertEqual((third.action, third.target_phase), ("retry", "generate"))
+            fourth = c.classify_failure(refs, "validate", [])
+            self.assertEqual((fourth.action, fourth.target_phase), ("reopen", "compile"))
 
 
 class ExecutePromoterTest(unittest.TestCase):

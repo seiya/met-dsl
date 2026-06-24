@@ -68,6 +68,7 @@ from tools.orchestration_runtime import (
     repair_all_step_result_executors,
     reopen_phase,
     _load_superseded_run_ids,
+    _build_step_agents_missing_step_result,
     _load_invalid_run_records,
     _derive_unauthorized_write_resume_directive,
     _node_key_to_safe,
@@ -8277,6 +8278,48 @@ shell_tool                       stable             true
                     "step_run_build_002",
                     json.dumps(json.loads(session_index_path.read_text(encoding="utf-8"))),
                 )
+
+    def test_missing_step_result_skips_superseded_build_agent(self) -> None:
+        """A build agent whose step_result was archived by `reopen_phase` (run_id in
+        the superseded set) must NOT be flagged "finished without a step_result" — the
+        `Validate→Generate→build` reopen loop would otherwise wrongly block relaunch.
+        A genuinely-missing (non-superseded) build step_result is still flagged."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._setup_preflight_and_orch_agent(repo_root)
+            node_key = "problem/shallow_water2d@0.3.0"
+            # Terminal build agent with NO canonical step_result on disk.
+            self._record_terminal_build_agent(
+                repo_root, agent_run_id="step_run_build_fail_001", status="fail"
+            )
+            # Genuinely missing → flagged.
+            self.assertEqual(
+                _build_step_agents_missing_step_result(
+                    repo_root, "orch_001", node_key=node_key
+                ),
+                ["step_run_build_fail_001"],
+            )
+            # Record it as superseded by a reopen → exempt.
+            superseded_path = (
+                repo_root
+                / "workspace/orchestrations/orch_001/reopen/superseded_runs.json"
+            )
+            superseded_path.parent.mkdir(parents=True, exist_ok=True)
+            superseded_path.write_text(
+                json.dumps(
+                    {
+                        "orchestration_id": "orch_001",
+                        "superseded_agent_run_ids": ["step_run_build_fail_001"],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            self.assertEqual(
+                _build_step_agents_missing_step_result(
+                    repo_root, "orch_001", node_key=node_key
+                ),
+                [],
+            )
 
     def test_record_launch_build_allowed_when_stale_child_finished(self) -> None:
         """A crash between write-step-result writing the result file and advancing

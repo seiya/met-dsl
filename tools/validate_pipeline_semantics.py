@@ -4991,6 +4991,17 @@ def _validate_io_contract_file(
                 )
             else:
                 snapshot_time_shape_expr = _canonical_shape_expr(raw_time_shape)
+                # The per-snapshot time index (e.g. snapshot_index) is canonically a
+                # SCALAR loop counter — the runner always emits it as a scalar. A `[1]`
+                # mis-declaration here makes post_execute fail ("shape [] does not match
+                # declared time_shape_expr [1]"); reject it at the source (compile) so the
+                # IR regenerates to scalar instead of looping execute. See C1 in
+                # docs/design/deterministic_followups.md.
+                if snapshot_time_shape_expr != "scalar":
+                    violations.append(
+                        f"{contract_path}:raw_requirements.required_evidence[{idx}].schema.time_shape_expr "
+                        f"for the per-snapshot time index must be \"scalar\" (got {raw_time_shape!r})"
+                    )
 
     if snapshot_required and not snapshot_variables:
         violations.append(
@@ -6011,6 +6022,22 @@ def _validate_runner_source_files(
     runner_files: list[Path],
     violations: list[str],
 ) -> None:
+    # B2 (cosmetic): the runner source is found by `*_runner.f90` glob, which is
+    # looser than generate's write-authorization (allowed_output_paths pins exactly
+    # `<spec_id>_runner.f90`, so a leaf writing any other name already fails as an
+    # unauthorized_write). Assert the basename matches so the validator's expectation
+    # is explicit and consistent with the authorization — mirrors the model side
+    # (_model_files_in_src_dir). No functional change: the authorization enforces it.
+    spec_id = _spec_id_from_node_key(execution.node_key)
+    if spec_id is not None:
+        expected_runner_name = f"{spec_id}_runner.f90"
+        for runner_file in runner_files:
+            if runner_file.name != expected_runner_name:
+                violations.append(
+                    f"{runner_file}: runner source must be named {expected_runner_name} "
+                    "(literal spec_id prefix required; matches generate write-authorization) "
+                    "— rename to match"
+                )
     for runner_file in runner_files:
         text = runner_file.read_text(encoding="utf-8", errors="ignore").lower()
         for output_name in FORBIDDEN_RUNNER_OUTPUTS:
