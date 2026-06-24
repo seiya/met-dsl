@@ -7,6 +7,26 @@ is generator/IR nondeterminism). This document enumerates the concrete fixes.
 
 Priority key: **P1** blocks auto-repair; **P2** data/robustness; **P3** latent.
 
+## Follow-up: deterministic binary name (2026-06-24)
+
+B1 made the recorded binary path robust to whatever `BIN` the generator chose, but the
+binary name itself still dropped `_runner` (generator commonly emits `BIN=<spec_id>`),
+leaving it inconsistent with the `<spec_id>_runner.f90` source / `<spec_id>_runner`
+program. Rather than keep adapting (or re-add the removed `BIN must be <spec_id>_runner`
+value gate, which churned), the binary name is now **imposed deterministically**:
+
+- `Conductor._resolve_exe_name` returns the constant `<spec_id>_runner`.
+- Build passes `BIN=<spec_id>_runner` on the make command line; `Validate.execute`
+  imposes the same value via the `make test` environment.
+- Because the execute override travels through the environment (which overrides a `?=`
+  assignment only), the Makefile must declare `BIN ?=`. A new structural post_generate
+  check (`_validate_makefile_bin_overridable`) requires the overridable `?=` form — NOT a
+  specific value (the conductor imposes the value), so it does not re-introduce the
+  churn-prone value gate. Mirrors the `OBJDIR/BINDIR/RUNDIR ?=` parameterization.
+- Contracts updated: `phase_02_generate.md`, `phase_03_build.md`, `phase_04_validate.md`,
+  and both generate SKILLs. Tests: `MakefileBinNotPinnedTest` (now asserts `?=` required,
+  value free), `test_build_inproc_imposes_canonical_bin_override`.
+
 ## Status (2026-06-24)
 
 All five follow-ups are implemented with unit tests:

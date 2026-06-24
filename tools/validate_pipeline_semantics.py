@@ -1405,6 +1405,42 @@ def _fortran_source_module_deps(src_files: list[Path]) -> dict[str, set[str]]:
     return deps_by_stem
 
 
+# BIN assignment forms. `?=` is overridable by the make environment (the only channel
+# Validate.execute's run_quality_checks make_test has); `=`/`:=`/`+=` are not, so a
+# make-env BIN override is silently ignored and `make test` desyncs from the binary Build
+# produced with its command-line BIN override.
+# Leading whitespace is spaces only: a make variable ASSIGNMENT cannot start with a tab
+# (a tab-indented line is a recipe command, e.g. a shell `BIN=...` inside a target body),
+# so excluding a leading tab avoids a false positive on recipe lines.
+_MAKE_BIN_ASSIGN_RE = re.compile(r"^[ ]*BIN[ \t]*(\?=|:=|\+=|=)", re.MULTILINE)
+_MAKE_BIN_REF_RE = re.compile(r"\$[({]BIN[)}]")
+
+
+def _validate_makefile_bin_overridable(
+    makefile_path: Path, makefile_text: str, violations: list[str]
+) -> None:
+    """Require `BIN ?= <name>` when the Makefile builds a binary via `$(BIN)`.
+
+    The VALUE is not constrained (the conductor imposes `<spec_id>_runner`); only the
+    overridable `?=` form is required so the execute make_test environment override
+    applies. A Makefile that never references `$(BIN)` (degenerate in-source object-only)
+    is exempt.
+    """
+    ops = _MAKE_BIN_ASSIGN_RE.findall(makefile_text)
+    references_bin = bool(_MAKE_BIN_REF_RE.search(makefile_text))
+    if not ops and not references_bin:
+        return
+    has_overridable = any(op == "?=" for op in ops)
+    has_hard = any(op != "?=" for op in ops)
+    if has_hard or not has_overridable:
+        violations.append(
+            f"{makefile_path}: BIN must be declared overridable as `BIN ?= <name>` "
+            "(not `=`/`:=`/`+=`) so Build and Validate.execute can impose the canonical "
+            "<spec_id>_runner binary name (Validate.execute's make_test overrides BIN only "
+            "via the environment, which applies to `?=` assignments only)"
+        )
+
+
 def _validate_fortran_makefile_src_dir(src_dir: Path, violations: list[str]) -> None:
     if not src_dir.is_dir():
         return
@@ -1432,11 +1468,18 @@ def _validate_fortran_makefile_src_dir(src_dir: Path, violations: list[str]) -> 
 
     makefile_text = makefile_path.read_text(encoding="utf-8", errors="ignore")
 
-    # The execution binary basename is NOT pinned to a specific value: Build and
-    # Validate.execute derive it from this Makefile's BIN default (see
-    # Conductor._resolve_exe_name), so any BIN works as long as the build rule produces
-    # bin/$(BIN). The earlier `BIN must be <spec_id>_runner` gate was removed because the
-    # generator frequently emits BIN=<spec_id> and the deterministic bodies now adapt.
+    # The execution binary basename is NOT pinned to a specific VALUE here, but BIN must
+    # be declared OVERRIDABLE (`BIN ?= <name>`). Build and Validate.execute impose the
+    # canonical `<spec_id>_runner` binary name on the SAME Makefile so they always agree:
+    # Build passes `BIN=...` on the make command line (overrides any assignment), but
+    # Validate.execute re-runs `make test` via run_quality_checks, which can only pass BIN
+    # through the environment — and a make environment value overrides a `?=` assignment
+    # only (not a plain `=`/`:=`/`+=`). A hard BIN assignment would therefore desync
+    # `make test`'s `$(BINDIR)/$(BIN)` guard from the binary Build actually produced. The
+    # default VALUE stays the generator's choice (any value; conductor overrides it), so
+    # this is a structural `?=` requirement, not the removed `BIN must be <spec_id>_runner`
+    # value gate. Mirrors the `OBJDIR/BINDIR/RUNDIR ?=` out-of-source parameterization.
+    _validate_makefile_bin_overridable(makefile_path, makefile_text, violations)
 
     rules = _parse_makefile_rules(makefile_text)
     # Directory-prefix-aware view: detects a prerequisite whose `$(OBJDIR)/`

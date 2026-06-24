@@ -1036,25 +1036,15 @@ class Conductor:
             raise RuntimeError(f"deterministic step: missing capability_token at {path}")
         return token
 
-    def _resolve_exe_name(self, src_dir: Path, refs: NodeRefs) -> str:
-        """The execution binary basename = the generated Makefile's BIN default
-        (expanded). Build and Validate.execute both derive it from the SAME Makefile so
-        they always agree on the binary path regardless of what name the generator chose
-        (the generator commonly emits BIN=<spec_id> rather than <spec_id>_runner). Falls
-        back to <spec_id>_runner only when the Makefile is absent/unparseable."""
-        fallback = f"{refs.spec_id}_runner"
-        mk = src_dir / "Makefile"
-        if not mk.is_file():
-            return fallback
-        try:
-            from tools.validate_pipeline_semantics import (
-                _expand_make_vars, _makefile_full_var_map, _normalize_make_token)
-            resolved = _normalize_make_token(
-                _expand_make_vars("$(BIN)", _makefile_full_var_map(
-                    mk.read_text(encoding="utf-8", errors="ignore"))))
-        except Exception:  # noqa: BLE001 - any parse error falls back to the contract name
-            return fallback
-        return resolved if (resolved and "$" not in resolved) else fallback
+    def _resolve_exe_name(self, refs: NodeRefs) -> str:
+        """The canonical execution binary basename: `<spec_id>_runner`.
+
+        Build and Validate.execute IMPOSE this name on the Makefile (Build via the make
+        command line, Validate.execute via the make_test environment — which requires the
+        Makefile's `BIN ?=` overridable form, enforced by post_generate). The binary name
+        is thus deterministic and consistent with the runner source/program names, instead
+        of varying with whatever default `BIN` the generator chose."""
+        return f"{refs.spec_id}_runner"
 
     @staticmethod
     def _require_make_build_system(build_system: str, phase: str) -> None:
@@ -1126,7 +1116,7 @@ class Conductor:
         src_dir = self.repo_root / refs.source_dir() / "src"
         bin_dir = self.repo_root / refs.binary_dir() / "bin"
         obj_dir = self.repo_root / "workspace" / "tmp" / child_arid / "build"
-        exe = self._resolve_exe_name(src_dir, refs)
+        exe = self._resolve_exe_name(refs)
 
         result = tool_compile_project({
             "project_dir": str(src_dir),
@@ -1135,8 +1125,11 @@ class Conductor:
             "repo_root": str(self.repo_root),
             "language": language,
             "build_system": build_system,
-            # Only OBJDIR/BINDIR overrides (NOT BIN); see phase_03_build.md.
-            "extra_args": [f"OBJDIR={obj_dir}", f"BINDIR={bin_dir}"],
+            # OBJDIR/BINDIR out-of-source overrides + BIN imposed to the canonical
+            # <spec_id>_runner (command-line override wins over any Makefile BIN
+            # assignment). Validate.execute imposes the same BIN via the make_test env;
+            # see phase_03_build.md.
+            "extra_args": [f"OBJDIR={obj_dir}", f"BINDIR={bin_dir}", f"BIN={exe}"],
             "capture_limit": _FULL_CAPTURE_LIMIT,
             "orchestration_id": self.orchestration_id,
             "agent_run_id": child_arid,
@@ -1147,11 +1140,11 @@ class Conductor:
         rc = result.get("return_code") or 1
         stdout = result.get("stdout", "") or ""
         stderr = result.get("stderr", "") or ""
-        # A compile that reports success but did NOT produce the binary at bin/<BIN>
-        # (BIN resolved from the Makefile) means the Makefile's BIN variable and its build
-        # rule disagree. Treat as a build failure that regenerates the Makefile rather than
-        # writing a pass binary_meta pointing at a missing file (which desyncs from
-        # determine_substep_status -> inconsistent escalate/fail_closed).
+        # A compile that reports success but did NOT produce the binary at the imposed
+        # bin/<spec_id>_runner (Build passes BIN=<spec_id>_runner) means the Makefile's
+        # build rule does not honor $(BIN). Treat as a build failure that regenerates the
+        # Makefile rather than writing a pass binary_meta pointing at a missing file (which
+        # desyncs from determine_substep_status -> inconsistent escalate/fail_closed).
         binary_missing = ok and not (bin_dir / exe).is_file()
         if binary_missing:
             ok = False
@@ -1200,12 +1193,12 @@ class Conductor:
             "failure_excerpt": None,
         }
         if binary_missing:
-            # Makefile BIN-default defect -> restart (regenerate the Makefile).
+            # Makefile build-rule defect -> restart (regenerate the Makefile).
             binary_meta["failure_category"] = "make_error"
             binary_meta["last_fail_reason"] = "binary_not_built_at_bindir"
             binary_meta["failure_excerpt"] = (
-                f"compile reported success but no binary at bin/{exe} (BIN resolved from "
-                f"the Makefile); the Makefile BIN variable and its build rule must agree")
+                f"compile reported success but no binary at bin/{exe} (imposed BIN); the "
+                f"Makefile build rule must produce $(BINDIR)/$(BIN)")
             binary_meta["failure_source_refs"] = [f"{self._rel(src_dir)}/Makefile"]
         elif not ok:
             binary_meta["failure_category"] = self._classify_build_failure_category(rc, stderr)
@@ -1393,7 +1386,7 @@ class Conductor:
         node_dir = self.repo_root / refs.run_node_dir()
         src_dir = self.repo_root / refs.source_dir() / "src"
         bin_dir = self.repo_root / refs.binary_dir(refs.source_binary_id) / "bin"
-        exe = self._resolve_exe_name(src_dir, refs)
+        exe = self._resolve_exe_name(refs)
         binary = (bin_dir / exe).resolve()
         ir_spec = (self.repo_root / refs.ir_ref / "spec.ir.yaml").resolve()
         run_tmp = self.repo_root / "workspace" / "tmp" / child_arid / "run"
@@ -1435,7 +1428,12 @@ class Conductor:
         res_qc = tool_run_quality_checks({
             "project_dir": str(src_dir),
             "preset": "make_test",
-            "env": {"OBJDIR": str(obj_tmp), "BINDIR": str(bin_dir), "RUNDIR": str(qc_tmp)},
+            # BIN imposed to the canonical <spec_id>_runner so `make test`'s
+            # `$(BINDIR)/$(BIN)` guard resolves the same binary Build produced. make_test
+            # passes overrides via the environment only, which overrides the Makefile's
+            # `BIN ?=` form (enforced by post_generate).
+            "env": {"OBJDIR": str(obj_tmp), "BINDIR": str(bin_dir),
+                    "RUNDIR": str(qc_tmp), "BIN": str(exe)},
             "command_log_path": str(qc_cmd_log),
             "capture_limit": _FULL_CAPTURE_LIMIT,
             **gate_args,
@@ -1519,9 +1517,8 @@ class Conductor:
             case_ids=self.read_case_ids(refs) if phase == "validate" else (),
             evidence_artifacts=self._read_evidence_artifacts(refs) if phase == "validate"
             else ("state_snapshots",),
-            # build's allowed_output_paths binary path = the Makefile's resolved BIN.
-            exe_name=(self._resolve_exe_name(self.repo_root / refs.source_dir() / "src", refs)
-                      if phase == "build" else None),
+            # build's allowed_output_paths binary path = the imposed canonical exe name.
+            exe_name=(self._resolve_exe_name(refs) if phase == "build" else None),
             repair=repair,
         )
         rec = self.record_launch(child_arid, request)
@@ -1717,8 +1714,7 @@ class Conductor:
             "status": status,
             "required_outputs": phase_required_outputs(
                 refs, phase,
-                exe_name=(self._resolve_exe_name(self.repo_root / refs.source_dir() / "src", refs)
-                          if phase == "build" else None)),
+                exe_name=(self._resolve_exe_name(refs) if phase == "build" else None)),
             "executor_agent_run_id": executor,
             "substep_agent_run_ids": substep_arids,
             "failed_substeps": failed,
@@ -1976,9 +1972,9 @@ def phase_required_outputs(refs: NodeRefs, phase: str, exe_name: str | None = No
         ]
     if phase == "build":
         bdir = refs.binary_dir()
-        # The binary basename = the Makefile's resolved BIN (mirrors build_launch_request's
-        # exe_name); falls back to <spec_id>_runner. Hardcoding <spec_id>_runner here
-        # recorded a non-existent path for a BIN=<spec_id> build.
+        # The binary basename = the imposed canonical exe name (mirrors
+        # build_launch_request's exe_name); the <spec_id>_runner fallback applies only
+        # when no exe_name is threaded (non-build callers).
         return [
             f"{bdir}/bin/{exe_name or (refs.spec_id + '_runner')}",
             f"{bdir}/binary_meta.json",

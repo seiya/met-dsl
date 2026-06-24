@@ -1369,8 +1369,8 @@ class DeterministicBuildTest(unittest.TestCase):
         )
 
     def test_build_required_outputs_use_resolved_exe_name(self) -> None:
-        # B1: the build step_result records the binary at the resolved BIN basename;
-        # the default falls back to <spec_id>_runner.
+        # B1: the build step_result records the binary at the imposed exe basename;
+        # the default (no exe_name threaded) falls back to <spec_id>_runner.
         refs = self._refs()
         bdir = refs.binary_dir()
         resolved = wc.phase_required_outputs(refs, "build", exe_name="foo")
@@ -1438,10 +1438,10 @@ class DeterministicBuildTest(unittest.TestCase):
         self.assertEqual(oc.leaf_returncode, 1)
 
     def test_build_inproc_fails_when_binary_not_at_contract_path(self) -> None:
-        # E2E regression: a compile that succeeds but whose Makefile BIN default is
-        # not <spec_id>_runner leaves no binary at the contract path. The build must
-        # produce a clean fail (verification_status=fail, make_error -> regenerate),
-        # NOT a pass binary_meta pointing at a missing file (which escalated/fail_closed).
+        # E2E regression: a compile that succeeds but produces no binary at the contract
+        # path (bin/<spec_id>_runner) must produce a clean fail (verification_status=fail,
+        # make_error -> regenerate), NOT a pass binary_meta pointing at a missing file
+        # (which escalated/fail_closed).
         import sys
         import tempfile
         from unittest import mock
@@ -1469,6 +1469,39 @@ class DeterministicBuildTest(unittest.TestCase):
             self.assertEqual(meta["verification_status"], "fail")
             self.assertEqual(meta["failure_category"], "make_error")
             self.assertTrue(meta["failure_source_refs"][0].endswith("/Makefile"))
+
+    def test_build_inproc_imposes_canonical_bin_override(self) -> None:
+        # The binary name is imposed (not derived from the Makefile): Build passes
+        # BIN=<spec_id>_runner on the make command line and produces the binary there.
+        import sys
+        import tempfile
+        from unittest import mock
+        sys.path.insert(0, str(Path("mcp_servers").resolve()))
+        import build_runtime_server  # type: ignore
+
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            c = wc.Conductor(repo_root=repo, orchestration_id="t",
+                             orchestration_agent_run_id="x", backend="claude", env={})
+            refs = wc.NodeRefs(
+                node_key="component/spec_x@0.1.0", spec_path="spec/component/spec_x",
+                ir_id="x_1", pipeline_id="x_1", source_id="src_1", binary_id="bin_1")
+            (repo / refs.ir_ref).mkdir(parents=True, exist_ok=True)
+            (repo / refs.source_dir() / "src").mkdir(parents=True, exist_ok=True)
+
+            captured: dict = {}
+
+            def fake_compile(args):
+                captured["extra_args"] = args.get("extra_args")
+                # honor the BIN override: write the binary where Build expects it
+                (repo / refs.binary_dir() / "bin").mkdir(parents=True, exist_ok=True)
+                (repo / refs.binary_dir() / "bin" / "spec_x_runner").write_text("x")
+                return {"ok": True, "return_code": 0, "command_id": "cid"}
+
+            with mock.patch.object(build_runtime_server, "tool_compile_project", fake_compile):
+                c._build_inproc(refs, "child-1", "captok")
+
+            self.assertIn("BIN=spec_x_runner", captured["extra_args"])
 
     def test_build_content_failure_routes_to_generate_not_transport(self) -> None:
         # Codex finding 1: a build content failure (rc 0 + binary_meta verification_status

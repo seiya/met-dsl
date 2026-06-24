@@ -8091,7 +8091,7 @@ class FortranMakefileObjdirPrefixTest(unittest.TestCase):
             "FC ?= gfortran\n"
             "OBJDIR ?= .\n"
             "BINDIR ?= .\n"
-            "BIN := app\n"
+            "BIN ?= app\n"
             "MAIN_OBJ := $(OBJDIR)/main.o\n"
             "$(BINDIR)/$(BIN): $(MAIN_OBJ) | $(BINDIR)\n"
             "\t$(FC) -o $@ $(MAIN_OBJ)\n"
@@ -8283,9 +8283,10 @@ class DeterministicLaunchPromptMarkerTest(unittest.TestCase):
 
 
 class MakefileBinNotPinnedTest(unittest.TestCase):
-    """post_generate no longer pins the Makefile BIN to <spec_id>_runner: Build and
-    Validate.execute derive the binary basename from the Makefile's BIN, so any value is
-    accepted. (Conductor._resolve_exe_name resolves it; the bodies adapt.)"""
+    """post_generate does not pin the Makefile BIN to a specific VALUE, but BIN must be
+    declared OVERRIDABLE (`BIN ?=`): Build and Validate.execute impose the canonical
+    <spec_id>_runner name on the Makefile (Build via the make command line, execute via
+    the make_test env, which overrides `?=` only). A hard `=`/`:=`/`+=` BIN is rejected."""
 
     _MODEL = "module foo_model\nimplicit none\nend module foo_model\n"
     _RUNNER = "program foo_runner\nimplicit none\nend program foo_runner\n"
@@ -8302,26 +8303,40 @@ class MakefileBinNotPinnedTest(unittest.TestCase):
             _validate_fortran_makefile_src_dir(src, violations)
             return [v for v in violations if "BIN" in v]
 
-    def test_bin_equals_spec_id_accepted(self) -> None:
-        # BIN=$(SPEC) (no _runner) used to be flagged; now accepted (bodies adapt).
-        self.assertEqual(self._bin_violations("BIN = $(SPEC)"), [])
+    def test_overridable_bin_value_not_pinned(self) -> None:
+        # Any VALUE is accepted as long as BIN is overridable (?=): the conductor imposes
+        # the canonical name, so the Makefile default is free.
+        self.assertEqual(self._bin_violations("BIN ?= $(SPEC)"), [])
+        self.assertEqual(self._bin_violations("BIN ?= myslug"), [])
+        self.assertEqual(self._bin_violations("BIN ?= foo_runner"), [])
 
-    def test_bin_slug_accepted(self) -> None:
-        self.assertEqual(self._bin_violations("BIN = myslug"), [])
+    def test_hard_bin_assignment_rejected(self) -> None:
+        # A non-overridable BIN desyncs Validate.execute's make_test (env override applies
+        # to ?= only) from the binary Build produced -> rejected at post_generate.
+        for hard in ("BIN = $(SPEC)", "BIN := myslug", "BIN += foo"):
+            self.assertTrue(
+                any("must be declared overridable" in v for v in self._bin_violations(hard)),
+                f"hard BIN assignment {hard!r} must be flagged",
+            )
 
-    def test_resolve_exe_name_reads_makefile_bin(self) -> None:
+    def test_tab_indented_recipe_bin_assignment_not_flagged(self) -> None:
+        # A tab-indented shell `BIN=...` inside a recipe body is NOT a make variable
+        # assignment (a tab line is a recipe command), so it must not trigger the gate.
+        # The overridable top-level `BIN ?=` is what satisfies it.
+        self.assertEqual(
+            self._bin_violations("BIN ?= foo_runner\nrun:\n\tBIN=/tmp/x $(BINDIR)/$(BIN)"),
+            [],
+        )
+
+    def test_resolve_exe_name_is_canonical_runner(self) -> None:
+        # _resolve_exe_name is now deterministic: always <spec_id>_runner, independent of
+        # the Makefile BIN default (the conductor imposes it via build/execute overrides).
         import tools.workflow_conductor as wc
-        with tempfile.TemporaryDirectory() as tmp:
-            src = Path(tmp)
-            (src / "Makefile").write_text(
-                "SPEC = foo\nBIN = $(SPEC)\nall: $(BIN)\n", encoding="utf-8")
-            c = wc.Conductor(repo_root=src.parent, orchestration_id="o",
-                             orchestration_agent_run_id="O", backend="claude", env={})
-            refs = wc.NodeRefs(node_key="component/foo@0.1.0", spec_path="spec/component/foo",
-                               ir_id="i", pipeline_id="p", source_id="s", binary_id="b")
-            self.assertEqual(c._resolve_exe_name(src, refs), "foo")
-            # missing Makefile -> fallback to <spec_id>_runner
-            self.assertEqual(c._resolve_exe_name(src / "nope", refs), "foo_runner")
+        c = wc.Conductor(repo_root=Path("/tmp/r"), orchestration_id="o",
+                         orchestration_agent_run_id="O", backend="claude", env={})
+        refs = wc.NodeRefs(node_key="component/foo@0.1.0", spec_path="spec/component/foo",
+                           ir_id="i", pipeline_id="p", source_id="s", binary_id="b")
+        self.assertEqual(c._resolve_exe_name(refs), "foo_runner")
 
 
 class MakefileTestNoRelinkTest(unittest.TestCase):
