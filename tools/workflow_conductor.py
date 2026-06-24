@@ -377,6 +377,7 @@ def build_launch_request(
     case_ids: tuple[str, ...] = (),
     evidence_artifacts: tuple[str, ...] = ("state_snapshots",),
     exe_name: str | None = None,
+    makefile_host_authored: bool = False,
     repair: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     """Construct the record-launch --request-json payload for one substep.
@@ -443,6 +444,10 @@ def build_launch_request(
         req["source_id"] = refs.source_id
         req["dependency_ref"] = refs.ir_ref
         src = refs.source_dir()
+        # For a leaf node the conductor authors src/Makefile host-side (_write_makefile),
+        # so it is NOT a leaf output — omit it from allowed_output_paths (and required
+        # outputs) exactly like lineage.json. Dependency nodes keep LLM authoring.
+        make_entry = [] if makefile_host_authored else [f"{src}/src/Makefile"]
         if substep == "generate":
             must_read += [
                 _PHASE_DOC["build"],
@@ -466,7 +471,7 @@ def build_launch_request(
             req["allowed_output_paths"] = [
                 f"{src}/src/{refs.spec_id}_model.f90",
                 f"{src}/src/{refs.spec_id}_runner.f90",
-                f"{src}/src/Makefile",
+                *make_entry,
                 f"{src}/src/command_log.jsonl",
                 f"{src}/source_meta.json",
             ]
@@ -481,7 +486,7 @@ def build_launch_request(
             req["allowed_output_paths"] = [
                 f"{src}/src/{refs.spec_id}_model.f90",
                 f"{src}/src/{refs.spec_id}_runner.f90",
-                f"{src}/src/Makefile",
+                *make_entry,
                 f"{src}/src/command_log.jsonl",
                 f"{src}/source_meta.json",
             ]
@@ -833,6 +838,170 @@ class Conductor:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(lineage, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
 
+    def _is_leaf_node(self, refs: NodeRefs) -> bool:
+        """A node whose `dependency.direct_deps` is explicitly present and empty. An absent
+        dependency block / absent direct_deps returns False (undeterminable -> treat as
+        non-leaf, matching the runtime's `_impl_is_leaf_node` which returns None there), so
+        the conductor and runtime never disagree on whether to author/authorize the Makefile.
+        Leaf nodes have a fully IR-determined `src/Makefile` (fixed runner->model use-graph),
+        so the conductor authors it host-side (`_write_makefile`); dependency nodes keep LLM
+        authoring until the dependency-build model is implemented (see docs/design)."""
+        ir = _read_yaml(self.repo_root / refs.ir_ref / "spec.ir.yaml") or {}
+        dep = ir.get("dependency") if isinstance(ir, dict) else None
+        if not isinstance(dep, dict) or "direct_deps" not in dep:
+            return False
+        return not dep.get("direct_deps")
+
+    def _conductor_authors_makefile(self, refs: NodeRefs) -> bool:
+        """The conductor authors `src/Makefile` iff the node is a leaf AND build_system=make
+        AND language=fortran — exactly the scope of `_write_makefile`. Single source of truth
+        for the live author call AND the leaf write-authorization removal, so they cannot
+        disagree (which would orphan the Makefile, or leave it double-owned)."""
+        if not self._is_leaf_node(refs):
+            return False
+        ir = _read_yaml(self.repo_root / refs.ir_ref / "spec.ir.yaml") or {}
+        impl = (ir.get("impl_defaults") or {}) if isinstance(ir, dict) else {}
+        tc = (impl.get("toolchain") or {}) if isinstance(impl, dict) else {}
+        return (str(tc.get("build_system") or "make").lower() == "make"
+                and str(tc.get("language") or "fortran").lower() == "fortran")
+
+    def _dependency_closure(self, refs: NodeRefs) -> list[str]:
+        """Dependency spec_ids in compile order (deepest first) from the IR closure.
+
+        DESIGN-GRADE / UNVERIFIED (Model B, docs/design): no spec with dependencies exists
+        yet, so this path never runs live (run_phase authors the Makefile only for leaf
+        nodes); it is exercised only by synthetic-IR unit tests. Orders `dependency.
+        transitive_deps` by `dependency.all_nodes[].topo_level` ascending (deepest deps,
+        which provide modules the shallower ones `use`, compile first)."""
+        ir = _read_yaml(self.repo_root / refs.ir_ref / "spec.ir.yaml") or {}
+        dep = (ir.get("dependency") or {}) if isinstance(ir, dict) else {}
+        levels: dict[str, int] = {}
+        for n in dep.get("all_nodes") or []:
+            if isinstance(n, dict) and isinstance(n.get("node_key"), str):
+                levels[n["node_key"]] = n.get("topo_level") or 0
+        closure: list[str] = []
+        for d in dep.get("transitive_deps") or []:
+            nk = d.get("node_key") if isinstance(d, dict) else d
+            if isinstance(nk, str) and nk.strip() and nk != refs.node_key:
+                closure.append(nk)
+        closure.sort(key=lambda nk: levels.get(nk, 0))
+        return [spec_id_of(nk) for nk in closure]
+
+    def _write_makefile(self, refs: NodeRefs) -> None:
+        """Author the `src/Makefile` host-side (runtime-owned), deterministically.
+
+        For a leaf node (no dependencies) the Makefile is a pure function of the IR: the
+        pinned `<spec_id>_model/runner.f90` names, the fixed runner->model `use`-graph, and
+        the structured `impl_defaults.toolchain`/`target` flags. Authoring it here removes a
+        class of generate regenerate-loops (Makefile-shape failures) and the long Makefile
+        contract the generate leaf would otherwise internalize, and makes the build
+        reproducible. Mirrors `_write_lineage` (runtime-owned artifact). Scoped to
+        build_system=make + language=fortran; c/cpp/mixed fall back to LLM authoring. The
+        post_generate validators still run against this file as a safety net.
+
+        Imposes `BIN ?= <spec_id>_runner` (overridable so Build/Validate.execute can pin the
+        canonical binary name) and FFLAGS derived from toolchain.standard + target.backend.
+
+        A non-empty dependency closure (Model B, docs/design) emits per-dep object rules +
+        a `DEP_OBJS` link list, assuming the conductor stages each `<dep>_model.f90` into
+        `$(OBJDIR)` before `make` (see `_build_inproc` TODO). That branch is DESIGN-GRADE /
+        UNVERIFIED — run_phase authors the Makefile only for leaf nodes today, so it is
+        reached only by synthetic-IR unit tests.
+        """
+        ir = _read_yaml(self.repo_root / refs.ir_ref / "spec.ir.yaml") or {}
+        impl = (ir.get("impl_defaults") or {}) if isinstance(ir, dict) else {}
+        tc = (impl.get("toolchain") or {}) if isinstance(impl, dict) else {}
+        language = str(tc.get("language") or "fortran").lower()
+        standard = str(tc.get("standard") or "f2008")
+        build_system = str(tc.get("build_system") or "make").lower()
+        if build_system != "make" or language != "fortran":
+            return  # c/cpp/mixed (or non-make) keep LLM authoring — out of scope.
+        target = (impl.get("target") or {}) if isinstance(impl, dict) else {}
+        backend = str(target.get("backend") or "").lower()
+
+        model = f"{refs.spec_id}_model"
+        runner = f"{refs.spec_id}_runner"
+        exe = self._resolve_exe_name(refs)  # canonical <spec_id>_runner
+        flags = f"-std={standard} -O2"
+        if backend == "openmp":
+            flags += " -fopenmp"
+        flags += " -J$(OBJDIR) -I$(OBJDIR)"
+
+        # Dependency closure (Model B, design-grade). Empty for leaf nodes -> the blocks
+        # below collapse to "" and the leaf template is emitted byte-for-byte.
+        closure = self._dependency_closure(refs)
+        dep_objs_line = ""
+        dep_rules = ""
+        model_dep_prereq = ""
+        link_dep_prereq = ""
+        if closure:
+            dep_objs = " ".join(f"$(OBJDIR)/{d}_model.o" for d in closure)
+            dep_objs_line = f"\nDEP_OBJS = {dep_objs}\n"
+            model_dep_prereq = " $(DEP_OBJS)"
+            link_dep_prereq = "$(DEP_OBJS) "
+            # Deepest-first: each dep object depends on all deeper dep objects so their
+            # `.mod` exist first (conservative over-ordering — safe for correctness). The
+            # conductor stages `<dep>_model.f90` into $(OBJDIR) before make.
+            parts = []
+            for i, d in enumerate(closure):
+                deeper = " ".join(f"$(OBJDIR)/{closure[j]}_model.o" for j in range(i))
+                deeper = (deeper + " ") if deeper else ""
+                parts.append(
+                    f"$(OBJDIR)/{d}_model.o: $(OBJDIR)/{d}_model.f90 {deeper}| $(OBJDIR)\n"
+                    f"\t$(FC) $(FFLAGS) -c $(OBJDIR)/{d}_model.f90 -o $(OBJDIR)/{d}_model.o\n")
+            dep_rules = "\n" + "\n".join(parts)
+
+        template = f"""\
+# Deterministic Makefile authored by the conductor (build_system=make, language=fortran).
+# Out-of-source capable: OBJDIR/BINDIR/RUNDIR default to "." and are overridden by
+# Build (compile_project) and Validate.execute (run_quality_checks).
+
+# FC is pinned with := (not ?=): make ships a built-in FC=f77 (origin default), and ?= does
+# NOT override a default-origin variable, so `FC ?= gfortran` would silently leave FC=f77.
+# The dirs/BIN stay ?= because Build/Validate.execute inject them via command line / env.
+FC      := gfortran
+OBJDIR  ?= .
+BINDIR  ?= .
+RUNDIR  ?= .
+FFLAGS  ?= {flags}
+
+BIN ?= {exe}
+
+MODEL_SRC  = {model}.f90
+RUNNER_SRC = {runner}.f90
+
+MODEL_OBJ  = $(OBJDIR)/{model}.o
+RUNNER_OBJ = $(OBJDIR)/{runner}.o
+{dep_objs_line}
+.PHONY: all test clean
+.DEFAULT_GOAL := all
+
+all: $(BINDIR)/$(BIN)
+{dep_rules}
+$(MODEL_OBJ): $(MODEL_SRC){model_dep_prereq} | $(OBJDIR)
+\t$(FC) $(FFLAGS) -c $(MODEL_SRC) -o $(MODEL_OBJ)
+
+$(RUNNER_OBJ): $(RUNNER_SRC) $(MODEL_OBJ) | $(OBJDIR)
+\t$(FC) $(FFLAGS) -c $(RUNNER_SRC) -o $(RUNNER_OBJ)
+
+$(BINDIR)/$(BIN): {link_dep_prereq}$(MODEL_OBJ) $(RUNNER_OBJ) | $(BINDIR)
+\t$(FC) $(FFLAGS) {link_dep_prereq}$(MODEL_OBJ) $(RUNNER_OBJ) -o $(BINDIR)/$(BIN)
+
+$(OBJDIR) $(BINDIR):
+\tmkdir -p $@
+
+test:
+\ttest -x $(BINDIR)/$(BIN) || {{ echo "error: $(BINDIR)/$(BIN) not built; run 'make all' first" >&2; exit 1; }}
+\tmkdir -p $(RUNDIR)/raw/state_snapshots
+\tcd $(RUNDIR) && $(BINDIR)/$(BIN)
+
+clean:
+\trm -f $(OBJDIR)/*.o $(OBJDIR)/*.mod $(BINDIR)/$(BIN)
+"""
+        path = self.repo_root / refs.source_dir() / "src" / "Makefile"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(template, encoding="utf-8")
+
     def write_step_result(self, node_key: str, step: str, executor_arid: str,
                           result: dict[str, Any]) -> dict[str, Any]:
         return self.runtime([
@@ -1117,6 +1286,13 @@ class Conductor:
         bin_dir = self.repo_root / refs.binary_dir() / "bin"
         obj_dir = self.repo_root / "workspace" / "tmp" / child_arid / "build"
         exe = self._resolve_exe_name(refs)
+        # DEPENDENCY BUILD (Model B, docs/design — DESIGN-GRADE, NOT YET WIRED): for a node
+        # with dependencies, stage each closure `<dep>_model.f90` into obj_dir ($(OBJDIR))
+        # here (via _dependency_closure + each dep's lineage source_id) BEFORE compile, so the
+        # conductor-authored dependency Makefile (_write_makefile non-leaf branch) compiles +
+        # links the closure. Unwired because no dependency spec exists to verify against and
+        # the dependency build is currently leaf-only in practice. Reconcile phase_02 §
+        # encapsulation (transient OBJDIR staging is not a canonical-src copy) before enabling.
 
         result = tool_compile_project({
             "project_dir": str(src_dir),
@@ -1519,6 +1695,9 @@ class Conductor:
             else ("state_snapshots",),
             # build's allowed_output_paths binary path = the imposed canonical exe name.
             exe_name=(self._resolve_exe_name(refs) if phase == "build" else None),
+            # leaf generate: src/Makefile is conductor-authored, so drop it from the leaf's
+            # allowed_output_paths (it must not author it).
+            makefile_host_authored=(phase == "generate" and self._conductor_authors_makefile(refs)),
             repair=repair,
         )
         rec = self.record_launch(child_arid, request)
@@ -1692,6 +1871,12 @@ class Conductor:
         # compile writes under workspace/ir/, not the pipeline root.
         if phase in ("generate", "build", "validate"):
             self._write_lineage(refs)
+        # For a leaf node the conductor authors src/Makefile deterministically (runtime-owned,
+        # like lineage.json) BEFORE the substeps run: the generate leaf must not author it, and
+        # generate.verify's post_generate gate inspects it. Leaf-only — the template encodes the
+        # fixed runner->model use-graph; dependency nodes keep LLM authoring (see _write_makefile).
+        if phase == "generate" and self._conductor_authors_makefile(refs):
+            self._write_makefile(refs)
 
         outcomes: list[SubstepOutcome] = []
         for i, substep in enumerate(SUBSTEPS[phase]):
@@ -1714,7 +1899,8 @@ class Conductor:
             "status": status,
             "required_outputs": phase_required_outputs(
                 refs, phase,
-                exe_name=(self._resolve_exe_name(refs) if phase == "build" else None)),
+                exe_name=(self._resolve_exe_name(refs) if phase == "build" else None),
+                makefile_required=not (phase == "generate" and self._conductor_authors_makefile(refs))),
             "executor_agent_run_id": executor,
             "substep_agent_run_ids": substep_arids,
             "failed_substeps": failed,
@@ -1956,18 +2142,22 @@ PHASE_VALIDATION_STAGE: dict[str, str] = {
 }
 
 
-def phase_required_outputs(refs: NodeRefs, phase: str, exe_name: str | None = None) -> list[str]:
+def phase_required_outputs(refs: NodeRefs, phase: str, exe_name: str | None = None,
+                           *, makefile_required: bool = True) -> list[str]:
     if phase == "compile":
         return [f"{refs.ir_ref}/spec.ir.yaml", f"{refs.ir_ref}/ir_meta.json"]
     if phase == "generate":
         src = refs.source_dir()
         # lineage.json is authored host-side by the conductor (_write_lineage), not a leaf
         # output_ref, so it is NOT a step required_output (which must be covered by the
-        # producer leaf's output_refs). post_generate still verifies it independently.
+        # producer leaf's output_refs). post_generate still verifies it independently. For a
+        # leaf node src/Makefile is likewise conductor-authored (_write_makefile), so it is
+        # excluded when makefile_required is False (same rationale as lineage).
+        make_entry = [f"{src}/src/Makefile"] if makefile_required else []
         return [
             f"{src}/src/{refs.spec_id}_model.f90",
             f"{src}/src/{refs.spec_id}_runner.f90",
-            f"{src}/src/Makefile",
+            *make_entry,
             f"{src}/source_meta.json",
         ]
     if phase == "build":

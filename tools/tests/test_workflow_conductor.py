@@ -1357,6 +1357,275 @@ class WriteLineageTest(unittest.TestCase):
             self.assertEqual(lin["direct_dependency_status"], {"component/dep@0.1.0": "ready"})
 
 
+class WriteMakefileTest(unittest.TestCase):
+    """The conductor authors a leaf node's src/Makefile deterministically (runtime-owned,
+    like lineage.json), for build_system=make + language=fortran."""
+
+    def _conductor(self, repo: Path) -> _FakeConductor:
+        c = _FakeConductor(repo_root=repo, orchestration_id="o",
+                           orchestration_agent_run_id="ORCH", backend="claude", env={})
+        c.calls = []
+        return c
+
+    def _refs(self) -> wc.NodeRefs:
+        return wc.NodeRefs(
+            node_key="component/foo_bar@0.1.0", spec_path="spec/component/foo_bar",
+            ir_id="i1", pipeline_id="p1", source_id="s1", binary_id="b1")
+
+    def _write_ir(self, repo: Path, refs: wc.NodeRefs, *, language="fortran",
+                  build_system="make", backend="openmp", direct_deps="[]") -> None:
+        ir_dir = repo / refs.ir_ref
+        ir_dir.mkdir(parents=True, exist_ok=True)
+        (ir_dir / "spec.ir.yaml").write_text(
+            "impl_defaults:\n"
+            "  toolchain:\n"
+            f"    language: {language}\n"
+            "    standard: f2008\n"
+            f"    build_system: {build_system}\n"
+            "  target:\n"
+            f"    backend: {backend}\n"
+            "dependency:\n"
+            f"  direct_deps: {direct_deps}\n",
+            encoding="utf-8")
+
+    def test_authors_makefile_for_leaf_node(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            refs = self._refs()
+            self._write_ir(repo, refs)
+            c = self._conductor(repo)
+            self.assertTrue(c._is_leaf_node(refs))
+            c._write_makefile(refs)
+            mk = repo / refs.source_dir() / "src" / "Makefile"
+            self.assertTrue(mk.is_file())
+            text = mk.read_text(encoding="utf-8")
+            self.assertIn("BIN ?= foo_bar_runner", text)
+            self.assertIn("-std=f2008 -O2 -fopenmp -J$(OBJDIR) -I$(OBJDIR)", text)
+            self.assertIn("$(RUNNER_OBJ): $(RUNNER_SRC) $(MODEL_OBJ)", text)
+            self.assertIn(
+                'test -x $(BINDIR)/$(BIN) || { echo "error: $(BINDIR)/$(BIN) not built',
+                text)
+            # recipe lines must be tab-indented
+            self.assertIn("\n\t$(FC) $(FFLAGS) -c $(MODEL_SRC)", text)
+
+    def test_authored_makefile_passes_post_generate_validators(self) -> None:
+        from tools.validate_pipeline_semantics import (
+            _validate_fortran_makefile_src_dir, _validate_makefile_bin_overridable,
+            _validate_makefile_test_no_relink)
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            refs = self._refs()
+            self._write_ir(repo, refs)
+            c = self._conductor(repo)
+            c._write_makefile(refs)
+            src = repo / refs.source_dir() / "src"
+            (src / "foo_bar_model.f90").write_text(
+                "module foo_bar_model\nimplicit none\nend module foo_bar_model\n", encoding="utf-8")
+            (src / "foo_bar_runner.f90").write_text(
+                "program foo_bar_runner\nuse foo_bar_model\nimplicit none\nend program foo_bar_runner\n",
+                encoding="utf-8")
+            mk = src / "Makefile"
+            violations: list[str] = []
+            _validate_makefile_bin_overridable(mk, mk.read_text(encoding="utf-8"), violations)
+            _validate_fortran_makefile_src_dir(src, violations)
+            _validate_makefile_test_no_relink(src, violations, build_system="make", language="fortran")
+            self.assertEqual(violations, [])
+
+    def test_no_fopenmp_when_backend_not_openmp(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            refs = self._refs()
+            self._write_ir(repo, refs, backend="serial")
+            c = self._conductor(repo)
+            c._write_makefile(refs)
+            text = (repo / refs.source_dir() / "src" / "Makefile").read_text(encoding="utf-8")
+            self.assertNotIn("-fopenmp", text)
+            self.assertIn("-std=f2008 -O2 -J$(OBJDIR) -I$(OBJDIR)", text)
+
+    def test_skips_non_fortran_and_non_make(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            refs = self._refs()
+            # language=c -> out of scope (keep LLM authoring)
+            self._write_ir(repo, refs, language="c")
+            self._conductor(repo)._write_makefile(refs)
+            self.assertFalse((repo / refs.source_dir() / "src" / "Makefile").exists())
+            # build_system=cmake -> out of scope
+            self._write_ir(repo, refs, build_system="cmake")
+            self._conductor(repo)._write_makefile(refs)
+            self.assertFalse((repo / refs.source_dir() / "src" / "Makefile").exists())
+
+    def test_is_leaf_node_false_for_dependency(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            refs = self._refs()
+            self._write_ir(repo, refs, direct_deps="[component/dep@0.1.0]")
+            self.assertFalse(self._conductor(repo)._is_leaf_node(refs))
+
+    def test_is_leaf_node_false_when_direct_deps_absent(self) -> None:
+        # Undeterminable leaf-ness (no dependency block / no direct_deps key) -> False, to
+        # agree with the runtime's _impl_is_leaf_node (None -> treated as non-leaf). A
+        # disagreement would author the Makefile but still pin it (or vice versa).
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            refs = self._refs()
+            ir_dir = repo / refs.ir_ref
+            ir_dir.mkdir(parents=True, exist_ok=True)
+            (ir_dir / "spec.ir.yaml").write_text(
+                "impl_defaults:\n  toolchain:\n    language: fortran\n    build_system: make\n",
+                encoding="utf-8")
+            self.assertFalse(self._conductor(repo)._is_leaf_node(refs))
+
+    def test_conductor_authors_makefile_requires_leaf_make_fortran(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            refs = self._refs()
+            c = self._conductor(repo)
+            self._write_ir(repo, refs)
+            self.assertTrue(c._conductor_authors_makefile(refs))
+            self._write_ir(repo, refs, language="c")
+            self.assertFalse(c._conductor_authors_makefile(refs))  # non-fortran -> no author
+            self._write_ir(repo, refs, build_system="cmake")
+            self.assertFalse(c._conductor_authors_makefile(refs))  # non-make -> no author
+            self._write_ir(repo, refs, direct_deps="[component/dep@0.1.0]")
+            self.assertFalse(c._conductor_authors_makefile(refs))  # dependency -> LLM authors
+
+    def test_conductor_runtime_leaf_detection_agree(self) -> None:
+        # The conductor (_conductor_authors_makefile) and the runtime
+        # (_resolved_makefile_host_authored, computed in record_launch) must agree on whether
+        # the Makefile is host-authored, else a launch is double-owned (pinned + dropped) or
+        # orphaned (neither authors). Covers absent keys (build_system/direct_deps), where the
+        # two sides must apply the SAME defaults. The reconstruction below mirrors the runtime
+        # computation in orchestration_runtime.record_launch verbatim.
+        from tools.orchestration_runtime import (
+            _impl_is_leaf_node, _impl_resolved_build_system, _impl_resolved_language)
+        cases = [
+            # (label, spec.ir.yaml text)
+            ("leaf+make+fortran",
+             "impl_defaults:\n  toolchain:\n    language: fortran\n    build_system: make\n"
+             "dependency:\n  direct_deps: []\n"),
+            ("leaf+c",
+             "impl_defaults:\n  toolchain:\n    language: c\n    build_system: make\n"
+             "dependency:\n  direct_deps: []\n"),
+            ("leaf+cmake",
+             "impl_defaults:\n  toolchain:\n    language: fortran\n    build_system: cmake\n"
+             "dependency:\n  direct_deps: []\n"),
+            ("dependency",
+             "impl_defaults:\n  toolchain:\n    language: fortran\n    build_system: make\n"
+             "dependency:\n  direct_deps:\n    - node_key: component/dep@0.1.0\n"),
+            ("leaf+build_system absent",
+             "impl_defaults:\n  toolchain:\n    language: fortran\n"
+             "dependency:\n  direct_deps: []\n"),
+            ("leaf+language absent",
+             "impl_defaults:\n  toolchain:\n    build_system: make\n"
+             "dependency:\n  direct_deps: []\n"),
+            ("direct_deps absent",
+             "impl_defaults:\n  toolchain:\n    language: fortran\n    build_system: make\n"
+             "dependency:\n  node_key: component/x@0.1.0\n"),
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            refs = self._refs()
+            ir_path = repo / refs.ir_ref / "spec.ir.yaml"
+            ir_path.parent.mkdir(parents=True, exist_ok=True)
+            c = self._conductor(repo)
+            for label, ir_text in cases:
+                ir_path.write_text(ir_text, encoding="utf-8")
+                conductor_authors = c._conductor_authors_makefile(refs)
+                # reconstruct the runtime's _resolved_makefile_host_authored verbatim
+                leaf = _impl_is_leaf_node(repo, refs.ir_ref)
+                bs = (_impl_resolved_build_system(repo, refs.ir_ref) or "")
+                lang = _impl_resolved_language(repo, refs.ir_ref)
+                runtime_host_authored = (
+                    leaf is True and (bs or "make") == "make"
+                    and (lang or "fortran") == "fortran")
+                self.assertEqual(conductor_authors, runtime_host_authored,
+                                 f"conductor/runtime disagree for {label!r}")
+
+    # --- Part 2 (Model B): dependency Makefile rendering. DESIGN-GRADE / UNVERIFIED — the
+    # non-leaf branch never runs live (run_phase authors only for leaf nodes); these
+    # synthetic-IR tests pin the generated structure for when a dependency spec exists. ---
+
+    def _write_dep_ir(self, repo: Path, refs: wc.NodeRefs) -> None:
+        ir_dir = repo / refs.ir_ref
+        ir_dir.mkdir(parents=True, exist_ok=True)
+        (ir_dir / "spec.ir.yaml").write_text(
+            "impl_defaults:\n  toolchain:\n    language: fortran\n    standard: f2008\n"
+            "    build_system: make\n  target:\n    backend: openmp\n"
+            "dependency:\n"
+            '  node_key: "component/top@0.1.0"\n'
+            "  direct_deps:\n    - node_key: \"component/mid@0.1.0\"\n"
+            "  transitive_deps:\n"
+            '    - node_key: "component/mid@0.1.0"\n'
+            '    - node_key: "component/base@0.1.0"\n'
+            "  all_nodes:\n"
+            '    - node_key: "component/base@0.1.0"\n      topo_level: 0\n'
+            '    - node_key: "component/mid@0.1.0"\n      topo_level: 1\n'
+            '    - node_key: "component/top@0.1.0"\n      topo_level: 2\n',
+            encoding="utf-8")
+
+    def test_dependency_closure_is_deepest_first(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            refs = wc.NodeRefs(node_key="component/top@0.1.0", spec_path="spec/component/top",
+                               ir_id="i", pipeline_id="p", source_id="s", binary_id="b")
+            self._write_dep_ir(repo, refs)
+            self.assertEqual(self._conductor(repo)._dependency_closure(refs), ["base", "mid"])
+
+    def test_dependency_makefile_emits_closure_rules(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            refs = wc.NodeRefs(node_key="component/top@0.1.0", spec_path="spec/component/top",
+                               ir_id="i", pipeline_id="p", source_id="s", binary_id="b")
+            self._write_dep_ir(repo, refs)
+            self._conductor(repo)._write_makefile(refs)
+            text = (repo / refs.source_dir() / "src" / "Makefile").read_text(encoding="utf-8")
+            self.assertIn("DEP_OBJS = $(OBJDIR)/base_model.o $(OBJDIR)/mid_model.o", text)
+            # deepest-first: base before mid, and mid depends on base
+            self.assertIn("$(OBJDIR)/base_model.o: $(OBJDIR)/base_model.f90 | $(OBJDIR)", text)
+            self.assertIn(
+                "$(OBJDIR)/mid_model.o: $(OBJDIR)/mid_model.f90 $(OBJDIR)/base_model.o | $(OBJDIR)",
+                text)
+            self.assertIn("$(MODEL_OBJ): $(MODEL_SRC) $(DEP_OBJS) | $(OBJDIR)", text)
+            self.assertIn("$(BINDIR)/$(BIN): $(DEP_OBJS) $(MODEL_OBJ) $(RUNNER_OBJ)", text)
+
+
+class GenerateLeafAuthorizationTest(unittest.TestCase):
+    """For a leaf node, src/Makefile is conductor-authored, so it is dropped from the leaf's
+    generate allowed_output_paths and required_outputs (it must not author it)."""
+
+    def _refs(self) -> wc.NodeRefs:
+        return wc.NodeRefs(
+            node_key="component/foo_bar@0.1.0", spec_path="spec/component/foo_bar",
+            ir_id="i1", pipeline_id="p1", source_id="s1", binary_id="b1")
+
+    def _launch(self, refs: wc.NodeRefs, substep: str, *, host_authored: bool) -> dict:
+        return wc.build_launch_request(
+            refs, step="generate", substep=substep, orchestration_id="o",
+            orchestration_agent_run_id="p", child_agent_run_id="c", agent_model="m",
+            workflow_mode="dev", makefile_host_authored=host_authored)
+
+    def test_leaf_generate_launch_omits_makefile(self) -> None:
+        refs = self._refs()
+        mk = f"{refs.source_dir()}/src/Makefile"
+        for substep in ("generate", "verify"):
+            req = self._launch(refs, substep, host_authored=True)
+            self.assertNotIn(mk, req["allowed_output_paths"], f"{substep} should omit Makefile")
+
+    def test_dependency_generate_launch_keeps_makefile(self) -> None:
+        refs = self._refs()
+        mk = f"{refs.source_dir()}/src/Makefile"
+        for substep in ("generate", "verify"):
+            req = self._launch(refs, substep, host_authored=False)
+            self.assertIn(mk, req["allowed_output_paths"], f"{substep} should keep Makefile")
+
+    def test_phase_required_outputs_leaf_omits_makefile(self) -> None:
+        refs = self._refs()
+        mk = f"{refs.source_dir()}/src/Makefile"
+        self.assertNotIn(mk, wc.phase_required_outputs(refs, "generate", makefile_required=False))
+        self.assertIn(mk, wc.phase_required_outputs(refs, "generate", makefile_required=True))
+
+
 class DeterministicBuildTest(unittest.TestCase):
     """WS-A/C: build runs in-process (no leaf) yet reuses the same bookkeeping."""
 

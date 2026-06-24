@@ -3890,6 +3890,92 @@ def _impl_resolved_build_system(repo_root: Path, ir_ref: str) -> str | None:
     return None
 
 
+def _impl_resolved_language(repo_root: Path, ir_ref: str) -> str | None:
+    """spec.ir.yaml's `impl_defaults.toolchain.language`, line-scanned (mirrors
+    `_impl_resolved_build_system`). None when absent/unreadable."""
+    path = repo_root / _normalize_rel_posix(ir_ref) / "spec.ir.yaml"
+    if not path.is_file():
+        return None
+    try:
+        text = path.read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return None
+    for raw in text.splitlines():
+        line = raw.split("#", 1)[0].strip()
+        if not line or ":" not in line:
+            continue
+        key, _, rest = line.partition(":")
+        if key.strip().lower() != "language":
+            continue
+        val = rest.strip().strip("\"'")
+        return val.lower() or None
+    return None
+
+
+def _impl_is_leaf_node(repo_root: Path, ir_ref: str) -> bool | None:
+    """True iff spec.ir.yaml's `dependency.direct_deps` is empty (a leaf node).
+
+    Returns None when the IR / dependency block cannot be located. Line-scanned (no yaml
+    import here, mirroring `_impl_resolved_build_system`): finds the top-level `dependency:`
+    block, then `direct_deps:` within it — empty (`[]` inline, or no `- ` list item before
+    the block dedents) means leaf.
+    """
+    path = repo_root / _normalize_rel_posix(ir_ref) / "spec.ir.yaml"
+    if not path.is_file():
+        return None
+    try:
+        text = path.read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return None
+    lines = text.splitlines()
+    in_dep = False
+    dep_indent = 0
+    for i, raw in enumerate(lines):
+        stripped = raw.split("#", 1)[0].rstrip()
+        if not stripped.strip():
+            continue
+        indent = len(stripped) - len(stripped.lstrip())
+        key = stripped.strip()
+        if not in_dep:
+            if indent == 0 and key.split(":", 1)[0].strip() == "dependency":
+                in_dep = True
+                dep_indent = indent
+            continue
+        # inside dependency block
+        if indent <= dep_indent:
+            # dedented out of dependency without finding direct_deps
+            return None
+        head, _, rest = key.partition(":")
+        if head.strip() == "direct_deps":
+            rest = rest.strip()
+            if rest:
+                # inline flow value: an empty list with ANY internal whitespace (`[]`, `[ ]`,
+                # `[   ]`) is a leaf; a bracketed list with content (`[a]`) is non-leaf. Strip
+                # the brackets and test the inner content rather than matching exact strings,
+                # so the runtime agrees with the conductor's YAML parser (a stricter match
+                # would call `[  ]` non-leaf while the parser sees an empty list -> a
+                # host-author disagreement -> record_launch fail-closed).
+                if rest.startswith("[") and rest.endswith("]"):
+                    return rest[1:-1].strip() == ""
+                return False  # unexpected non-list inline scalar -> treat as non-leaf
+            # block form: scan following lines for a `- ` list item. A YAML block sequence
+            # may sit at the SAME indent as its key or deeper, so a `- ` item counts when its
+            # indent >= direct_deps' indent; a non-`-` line at indent <= direct_deps' is a
+            # sibling/parent key (dedent) -> no items -> leaf.
+            dd_indent = indent
+            for follow in lines[i + 1:]:
+                fstr = follow.split("#", 1)[0].rstrip()
+                if not fstr.strip():
+                    continue
+                find = len(fstr) - len(fstr.lstrip())
+                if fstr.strip().startswith("- ") and find >= dd_indent:
+                    return False  # has a dependency -> non-leaf
+                if find <= dd_indent:
+                    break  # dedented to a sibling/parent key: no list items -> leaf
+            return True
+    return None
+
+
 def _gate_script_command(
     *,
     repo_root: Path,
@@ -5065,9 +5151,11 @@ def _mandatory_file_tool_pins_for_launch(
     ``<pipeline_ref>/source/<source_id>/src/`` directory entry therefore leaves
     it unwritable through every channel, so it must be pinned explicitly.
 
-    ``build_system`` is resolved from ``_resolved_build_system`` (populated by
-    ``record_launch`` from ``spec.ir.yaml.impl_defaults``). Absence disables the
-    requirement, so direct callers / non-Make toolchains are unaffected.
+    ``build_system`` is resolved from ``_resolved_build_system``. ``record_launch`` always
+    populates it, defaulting an absent build_system to ``"make"`` (mirroring the conductor),
+    so a Make node with an under-specified IR still gets the pin. Only DIRECT callers that
+    omit the field see absence-disables-requirement (``bs_norm=""``), keeping them / non-Make
+    toolchains unaffected.
     """
     step_token = str(request_payload.get("step") or "").strip().lower()
     substep_token = str(request_payload.get("substep") or "").strip().lower()
@@ -5077,6 +5165,12 @@ def _mandatory_file_tool_pins_for_launch(
     # (build-control) write authority would let the verifier mutate the very
     # artifact it is supposed to judge, so it must be excluded.
     if step_token != "generate" or substep_token == "verify" or not pipeline_ref:
+        return []
+    # When the conductor authors src/Makefile host-side (_write_makefile: leaf AND make AND
+    # fortran) it is NOT a leaf deliverable and must not be pinned (the file already exists;
+    # pinning would require the leaf to write it). `_resolved_makefile_host_authored` is
+    # populated by record_launch to mirror Conductor._conductor_authors_makefile exactly.
+    if request_payload.get("_resolved_makefile_host_authored") is True:
         return []
     bs_raw = request_payload.get("_resolved_build_system")
     bs_norm = bs_raw.strip().lower() if isinstance(bs_raw, str) and bs_raw.strip() else ""
@@ -12095,9 +12189,34 @@ def record_launch(
         _ir_ref_for_bs = str(request_payload.get("ir_ref") or "").strip()
         if _ir_ref_for_bs:
             _bs_resolved = _impl_resolved_build_system(repo_root, _ir_ref_for_bs)
-            if isinstance(_bs_resolved, str) and _bs_resolved.strip():
-                request_payload = dict(request_payload)
-                request_payload["_resolved_build_system"] = _bs_resolved.strip().lower()
+            request_payload = dict(request_payload)
+            # Default an ABSENT build_system to "make" to mirror the conductor's
+            # `str(toolchain.build_system or "make")` default. Previously the key was set only
+            # when build_system resolved to a non-empty string, so a missing build_system left
+            # it unset -> `_mandatory_file_tool_pins_for_launch` saw bs_norm="" and skipped the
+            # Makefile pin, while the conductor still listed/required the Makefile for a
+            # non-host-authored generate node -> a launch that proceeds without authorizing the
+            # extensionless Makefile. The project is make-only (Conductor._require_make_build_system
+            # hard-fails non-make) and real compile-produced IR always carries an explicit
+            # build_system; an explicit non-make value (e.g. cmake) is preserved as-is.
+            request_payload["_resolved_build_system"] = (
+                _bs_resolved.strip().lower()
+                if isinstance(_bs_resolved, str) and _bs_resolved.strip() else "make")
+            # The conductor authors src/Makefile host-side iff leaf AND make AND fortran
+            # (= Conductor._conductor_authors_makefile). Mirror that exact condition so the
+            # mandatory-Makefile pin is suppressed only when the conductor really authored it
+            # (and kept otherwise), matching the leaf's allowed_output_paths. Computed here
+            # rather than as separate flags so conductor and runtime cannot disagree.
+            _leaf_resolved = _impl_is_leaf_node(repo_root, _ir_ref_for_bs)
+            _lang_resolved = _impl_resolved_language(repo_root, _ir_ref_for_bs)
+            _bs_for_mk = (_bs_resolved or "").strip().lower() if isinstance(_bs_resolved, str) else ""
+            # Mirror the conductor's defaulting EXACTLY (`str(... or "make")` / `... or
+            # "fortran")`): an absent build_system/language defaults to make/fortran on both
+            # sides, so the two never disagree (an absent build_system must not make the
+            # conductor author while the runtime keeps the pin -> record_launch fail-closed).
+            request_payload["_resolved_makefile_host_authored"] = (
+                _leaf_resolved is True and (_bs_for_mk or "make") == "make"
+                and (_lang_resolved or "fortran") == "fortran")
         allowed_output_paths = _allowed_output_paths_for_launch(
             request_payload=request_payload,
             write_roots=write_roots,

@@ -7,6 +7,39 @@ is generator/IR nondeterminism). This document enumerates the concrete fixes.
 
 Priority key: **P1** blocks auto-repair; **P2** data/robustness; **P3** latent.
 
+## Follow-up: deterministic `src/Makefile` (2026-06-24)
+
+The `src/Makefile` is a pure function of known inputs (pinned `<spec_id>_model/runner.f90`
+names, the fixed `use`-graph, structured `impl_defaults.toolchain`/`target`), yet the LLM
+authored it and a large static validator rejected deviations (regenerate-loop cost). It is now
+authored deterministically host-side, mirroring `lineage.json`.
+
+**Part 1 — leaf nodes (implemented, default-on).** `Conductor._write_makefile(refs)` emits the
+fixed runner→model Makefile (`BIN ?= <spec_id>_runner`, FFLAGS from `toolchain.standard` +
+`target.backend`); called from `run_phase` at generate start, gated to `_is_leaf_node` +
+make/fortran (c/cpp/mixed keep LLM authoring). The Makefile is dropped from the leaf's
+write-authorization at all four sites (`build_launch_request` generate/verify
+`allowed_output_paths`, `phase_required_outputs`, and orchestration_runtime
+`_mandatory_file_tool_pins_for_launch` via `_resolved_is_leaf`/`_impl_is_leaf_node`). The
+post_generate validators stay as the safety net (the template passes all three by
+construction). Docs/SKILLs note the conductor authorship.
+
+**Part 2 — dependency nodes (DESIGN-GRADE, Model B, UNVERIFIED).** No spec with `direct_deps`
+exists, and the dependency build is itself unimplemented/contradictory (no `.o`/`.mod` staging;
+`phase_02 §41` forbids copying dep sources into `src/`, but the only historically-working build
+copied them in). Chosen model: **Model B — transient source staging.** The conductor stages each
+closure `<dep>_model.f90` into the per-run build tmp `$(OBJDIR)` (NOT canonical `src/`), and the
+deterministic Makefile compiles + links the closure (`_write_makefile` non-leaf branch:
+deepest-first `$(OBJDIR)/<dep>_model.o` rules + `DEP_OBJS`, derived from
+`dependency.transitive_deps`/`all_nodes` via `_dependency_closure`). Rationale over Model A
+(prebuilt `.o`/`.mod` reuse): no gfortran `.mod` ABI coupling, reuses the already-durable dep
+source, single-toolchain build, canonical `src/` stays pristine. Shipped as code-paths +
+synthetic-IR unit tests only; the non-leaf branch is **not wired live** (run_phase authors only
+for leaf), and `_build_inproc` carries a TODO for the staging step. Reconciliation: `phase_02
+§41` carve-out (transient `$(OBJDIR)` staging ≠ canonical-tree copy); phase_03
+`dependency_violation` already targets `src/` mixing only, so it needs no change. Implement +
+verify when a real dependency spec lands.
+
 ## Follow-up: deterministic binary name (2026-06-24)
 
 B1 made the recorded binary path robust to whatever `BIN` the generator chose, but the

@@ -4011,6 +4011,96 @@ shell_tool                       stable             true
         )
         self.assertIn(makefile, file_tool)
 
+    def test_generate_leaf_make_launch_does_not_inject_makefile_pin(self) -> None:
+        """When the conductor authors src/Makefile host-side (_write_makefile: leaf AND make
+        AND fortran), even a Make Generate launch must NOT auto-inject the Makefile pin
+        (`_resolved_makefile_host_authored` True) — the leaf must not author it."""
+        from tools.orchestration_runtime import (
+            _allowed_output_paths_for_launch,
+            _mandatory_file_tool_pins_for_launch,
+        )
+
+        src_id = "src_20260604_004"
+        src_dir = f"{_FIX_PIPE_REF}/source/{src_id}/src/"
+        makefile = f"{_FIX_PIPE_REF}/source/{src_id}/src/Makefile"
+        req = {
+            "agent_role": "step",
+            "step": "generate",
+            "node_key": "component/foo_bar@0.1.0",
+            "ir_ref": _FIX_IR_REF,
+            "pipeline_ref": _FIX_PIPE_REF,
+            "source_id": src_id,
+            "_resolved_build_system": "make",
+            "_resolved_makefile_host_authored": True,
+            "allowed_output_paths": [src_dir],
+        }
+        self.assertEqual(_mandatory_file_tool_pins_for_launch(req, [src_dir]), [])
+        allowed = _allowed_output_paths_for_launch(
+            request_payload=req,
+            write_roots=[f"{_FIX_PIPE_REF}/source/", f"{_FIX_PIPE_REF}/lineage.json"],
+        )
+        self.assertNotIn(makefile, allowed)
+
+    def test_build_system_absent_defaults_to_make_for_makefile_pin(self) -> None:
+        """Regression: a generate IR that OMITS impl_defaults.toolchain.build_system must not
+        silently skip the Makefile pin for a non-host-authored node. `_impl_resolved_build_system`
+        returns None there, and record_launch now defaults `_resolved_build_system` to "make"
+        (mirroring the conductor's `or "make"`), so the pin is still required — matching the
+        conductor, which lists/requires the Makefile. Without the default the pin was skipped
+        while the conductor required the file -> a launch unauthorized for the Makefile."""
+        from tools.orchestration_runtime import (
+            _impl_resolved_build_system, _mandatory_file_tool_pins_for_launch)
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            ir = repo / "ir"
+            ir.mkdir()
+            (ir / "spec.ir.yaml").write_text(
+                "impl_defaults:\n  toolchain:\n    language: fortran\n"
+                "dependency:\n  direct_deps:\n    - node_key: component/dep@0.1.0\n",
+                encoding="utf-8")
+            # precondition: build_system is genuinely unresolved
+            self.assertIsNone(_impl_resolved_build_system(repo, "ir"))
+            src_id = "src_x"
+            src_dir = f"{_FIX_PIPE_REF}/source/{src_id}/src/"
+            makefile = f"{src_dir}Makefile"
+            # payload as the FIXED record_launch populates it: bs absent -> "make",
+            # not host-authored (dependency node).
+            req = {
+                "agent_role": "step", "step": "generate",
+                "node_key": "component/top@0.1.0",
+                "ir_ref": "ir", "pipeline_ref": _FIX_PIPE_REF, "source_id": src_id,
+                "_resolved_build_system": "make",
+                "_resolved_makefile_host_authored": False,
+                "allowed_output_paths": [src_dir],
+            }
+            self.assertEqual(
+                _mandatory_file_tool_pins_for_launch(req, [src_dir]), [makefile])
+
+    def test_impl_is_leaf_node_reads_dependency_block(self) -> None:
+        from tools.orchestration_runtime import _impl_is_leaf_node
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            ir = repo / "ir"
+            ir.mkdir()
+
+            def _w(dep: str) -> bool | None:
+                (ir / "spec.ir.yaml").write_text(
+                    "impl_defaults:\n  toolchain:\n    build_system: make\n" + dep,
+                    encoding="utf-8")
+                return _impl_is_leaf_node(repo, "ir")
+
+            self.assertIs(_w("dependency:\n  direct_deps: []\n"), True)
+            # empty flow list with arbitrary internal whitespace is still leaf (valid YAML)
+            self.assertIs(_w("dependency:\n  direct_deps: [ ]\n"), True)
+            self.assertIs(_w("dependency:\n  direct_deps: [  ]\n"), True)
+            self.assertIs(_w("dependency:\n  direct_deps: [   ]\n"), True)
+            self.assertIs(_w("dependency:\n  direct_deps:\n  transitive_deps: []\n"), True)
+            self.assertIs(_w("dependency:\n  direct_deps:\n  - node_key: x\n"), False)
+            self.assertIs(_w("dependency:\n  direct_deps:\n    - node_key: x\n"), False)
+            self.assertIs(_w("dependency:\n  direct_deps: [component/x@0.1.0]\n"), False)
+            self.assertIs(_w("dependency:\n  direct_deps: [ component/x@0.1.0 ]\n"), False)
+            self.assertIsNone(_w("other: 1\n"))
+
     def test_generate_non_make_launch_does_not_inject_makefile_pin(self) -> None:
         """Fix 1 is Make-scoped: CMake/Meson Generate launches must NOT get a
         Makefile pin auto-injected (out-of-source toolchains do not build with
