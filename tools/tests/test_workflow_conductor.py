@@ -1564,7 +1564,7 @@ class WriteMakefileTest(unittest.TestCase):
                 encoding="utf-8")
             self.assertFalse(self._conductor(repo)._is_leaf_node(refs))
 
-    def test_conductor_authors_makefile_requires_leaf_make_fortran(self) -> None:
+    def test_conductor_authors_makefile_requires_make_fortran(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp)
             refs = self._refs()
@@ -1575,18 +1575,21 @@ class WriteMakefileTest(unittest.TestCase):
             self.assertFalse(c._conductor_authors_makefile(refs))  # non-fortran -> no author
             self._write_ir(repo, refs, build_system="cmake")
             self.assertFalse(c._conductor_authors_makefile(refs))  # non-make -> no author
+            # A dependency make+fortran node is ALSO conductor-authored (Model B): the
+            # dependency Makefile is as IR-determined as the leaf one.
             self._write_ir(repo, refs, direct_deps="[component/dep@0.1.0]")
-            self.assertFalse(c._conductor_authors_makefile(refs))  # dependency -> LLM authors
+            self.assertTrue(c._conductor_authors_makefile(refs))
 
-    def test_conductor_runtime_leaf_detection_agree(self) -> None:
+    def test_conductor_runtime_makefile_authorship_agree(self) -> None:
         # The conductor (_conductor_authors_makefile) and the runtime
         # (_resolved_makefile_host_authored, computed in record_launch) must agree on whether
         # the Makefile is host-authored, else a launch is double-owned (pinned + dropped) or
-        # orphaned (neither authors). Covers absent keys (build_system/direct_deps), where the
+        # orphaned (neither authors). Authorship keys off make+fortran for BOTH leaf and
+        # dependency nodes (Model B); covers absent keys (build_system/language), where the
         # two sides must apply the SAME defaults. The reconstruction below mirrors the runtime
         # computation in orchestration_runtime.record_launch verbatim.
         from tools.orchestration_runtime import (
-            _impl_is_leaf_node, _impl_resolved_build_system, _impl_resolved_language)
+            _impl_resolved_build_system, _impl_resolved_language)
         cases = [
             # (label, spec.ir.yaml text)
             ("leaf+make+fortran",
@@ -1621,20 +1624,23 @@ class WriteMakefileTest(unittest.TestCase):
                 ir_path.write_text(ir_text, encoding="utf-8")
                 conductor_authors = c._conductor_authors_makefile(refs)
                 # reconstruct the runtime's _resolved_makefile_host_authored verbatim
-                leaf = _impl_is_leaf_node(repo, refs.ir_ref)
                 bs = (_impl_resolved_build_system(repo, refs.ir_ref) or "")
                 lang = _impl_resolved_language(repo, refs.ir_ref)
                 runtime_host_authored = (
-                    leaf is True and (bs or "make") == "make"
+                    (bs or "make") == "make"
                     and (lang or "fortran") == "fortran")
                 self.assertEqual(conductor_authors, runtime_host_authored,
                                  f"conductor/runtime disagree for {label!r}")
 
-    # --- Part 2 (Model B): dependency Makefile rendering. DESIGN-GRADE / UNVERIFIED — the
-    # non-leaf branch never runs live (run_phase authors only for leaf nodes); these
-    # synthetic-IR tests pin the generated structure for when a dependency spec exists. ---
+    # --- Part 2 (Model B): dependency Makefile rendering. The non-leaf branch DOES run live —
+    # run_phase authors for every make+fortran node (leaf OR dependency; _conductor_authors_
+    # makefile has no leaf gate). E2E-UNVERIFIED only in that no real dependency spec has run
+    # the full compile->validate path yet; these synthetic-IR tests pin the generated structure. ---
 
     def _write_dep_ir(self, repo: Path, refs: wc.NodeRefs) -> None:
+        # Contract-faithful (phase_01 §V4): `transitive_deps` lists ONLY the indirect deps
+        # (base, reached `via` mid); the direct dep (mid) is in `direct_deps` only. The build
+        # closure is the union of the two — exercises that union (not transitive_deps alone).
         ir_dir = repo / refs.ir_ref
         ir_dir.mkdir(parents=True, exist_ok=True)
         (ir_dir / "spec.ir.yaml").write_text(
@@ -1644,8 +1650,7 @@ class WriteMakefileTest(unittest.TestCase):
             '  node_key: "component/top@0.1.0"\n'
             "  direct_deps:\n    - node_key: \"component/mid@0.1.0\"\n"
             "  transitive_deps:\n"
-            '    - node_key: "component/mid@0.1.0"\n'
-            '    - node_key: "component/base@0.1.0"\n'
+            '    - node_key: "component/base@0.1.0"\n      via: ["component/mid@0.1.0"]\n'
             "  all_nodes:\n"
             '    - node_key: "component/base@0.1.0"\n      topo_level: 0\n'
             '    - node_key: "component/mid@0.1.0"\n      topo_level: 1\n'
@@ -1659,6 +1664,31 @@ class WriteMakefileTest(unittest.TestCase):
                                ir_id="i", pipeline_id="p", source_id="s", binary_id="b")
             self._write_dep_ir(repo, refs)
             self.assertEqual(self._conductor(repo)._dependency_closure(refs), ["base", "mid"])
+
+    def test_dependency_closure_one_hop_direct_only(self) -> None:
+        # A one-hop chain (top -> base, base a leaf) has a non-empty direct_deps and an EMPTY
+        # transitive_deps (no indirect deps). The closure must still resolve to [base] — the
+        # union of direct+transitive, not transitive alone (regression: an empty result here
+        # would fail-close the whole dependency build for the common single-edge case).
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            refs = wc.NodeRefs(node_key="component/top@0.1.0", spec_path="spec/component/top",
+                               ir_id="i", pipeline_id="p", source_id="s", binary_id="b")
+            ir_dir = repo / refs.ir_ref
+            ir_dir.mkdir(parents=True, exist_ok=True)
+            (ir_dir / "spec.ir.yaml").write_text(
+                "impl_defaults:\n  toolchain:\n    language: fortran\n    build_system: make\n"
+                "dependency:\n"
+                '  node_key: "component/top@0.1.0"\n'
+                "  direct_deps:\n    - node_key: \"component/base@0.1.0\"\n"
+                "  transitive_deps: []\n"
+                "  all_nodes:\n"
+                '    - node_key: "component/base@0.1.0"\n      topo_level: 0\n'
+                '    - node_key: "component/top@0.1.0"\n      topo_level: 1\n',
+                encoding="utf-8")
+            c = self._conductor(repo)
+            self.assertEqual(c._dependency_closure_nodes(refs), ["component/base@0.1.0"])
+            self.assertEqual(c._dependency_closure(refs), ["base"])
 
     def test_dependency_makefile_emits_closure_rules(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1676,6 +1706,130 @@ class WriteMakefileTest(unittest.TestCase):
                 text)
             self.assertIn("$(MODEL_OBJ): $(MODEL_SRC) $(DEP_OBJS) | $(OBJDIR)", text)
             self.assertIn("$(BINDIR)/$(BIN): $(DEP_OBJS) $(MODEL_OBJ) $(RUNNER_OBJ)", text)
+
+    def _seed_dep_pipeline(self, repo: Path, node_key: str, pipeline_id: str,
+                           source_id: str, body: str, *, binary_id: str = "bin_20260101_001",
+                           binary_source_id: str | None = None,
+                           lineage_source_id: str | None = None) -> Path:
+        """Create a ready dependency pipeline under the canonical version-pinned workspace
+        path so _stage_dependency_sources resolves it: the <dep>_model.f90 source, a
+        binary_meta.json whose `source_source_id` is the CERTIFIED source (what staging binds
+        to), and lineage.json. `binary_source_id`/`lineage_source_id` default to `source_id`;
+        override them separately to model a lineage advanced past the certified binary's
+        source. Returns the certified-source model path."""
+        safe = wc.node_key_safe(node_key)
+        sid = wc.spec_id_of(node_key)
+        binary_source_id = binary_source_id or source_id
+        lineage_source_id = lineage_source_id or source_id
+        pipe = repo / "workspace" / "pipelines" / safe / pipeline_id
+        (pipe / "source" / binary_source_id / "src").mkdir(parents=True, exist_ok=True)
+        (pipe / "binary" / binary_id).mkdir(parents=True, exist_ok=True)
+        (pipe / "binary" / binary_id / "binary_meta.json").write_text(
+            wc.json.dumps({"verification_status": "pass",
+                           "source_source_id": binary_source_id}) + "\n", encoding="utf-8")
+        (pipe / "lineage.json").write_text(
+            wc.json.dumps({"source_id": lineage_source_id}) + "\n", encoding="utf-8")
+        model = pipe / "source" / binary_source_id / "src" / f"{sid}_model.f90"
+        model.write_text(body, encoding="utf-8")
+        return model
+
+    def test_stage_dependency_sources_copies_closure_into_objdir(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            refs = wc.NodeRefs(node_key="component/top@0.1.0", spec_path="spec/component/top",
+                               ir_id="i", pipeline_id="p", source_id="s", binary_id="b")
+            self._write_dep_ir(repo, refs)
+            self._seed_dep_pipeline(repo, "component/base@0.1.0", "base_20260101_001",
+                                    "src_base", "module base_model\nend module base_model\n")
+            self._seed_dep_pipeline(repo, "component/mid@0.1.0", "mid_20260101_001",
+                                    "src_mid", "module mid_model\nend module mid_model\n")
+            obj_dir = repo / "workspace" / "tmp" / "arid_x" / "build"
+            staged = self._conductor(repo)._stage_dependency_sources(refs, obj_dir)
+            # deepest-first (base before mid), matching the Makefile object order
+            self.assertEqual(len(staged), 2)
+            self.assertTrue(staged[0].endswith("base_model.f90"))
+            self.assertTrue(staged[1].endswith("mid_model.f90"))
+            self.assertEqual((obj_dir / "base_model.f90").read_text(encoding="utf-8"),
+                             "module base_model\nend module base_model\n")
+            self.assertEqual((obj_dir / "mid_model.f90").read_text(encoding="utf-8"),
+                             "module mid_model\nend module mid_model\n")
+            # canonical src/ of the depending node is never touched (no top model written)
+            self.assertFalse((repo / refs.source_dir() / "src").exists())
+
+    def test_stage_dependency_sources_binds_to_certified_binary_source(self) -> None:
+        # Regression (Codex P2): when lineage.json has advanced to a NEWER source than the
+        # certified binary was built from, staging must use the CERTIFIED binary's
+        # source_source_id, not the latest lineage source (which is unverified).
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            refs = wc.NodeRefs(node_key="component/top@0.1.0", spec_path="spec/component/top",
+                               ir_id="i", pipeline_id="p", source_id="s", binary_id="b")
+            ir_dir = repo / refs.ir_ref
+            ir_dir.mkdir(parents=True, exist_ok=True)
+            (ir_dir / "spec.ir.yaml").write_text(
+                "impl_defaults:\n  toolchain:\n    language: fortran\n    build_system: make\n"
+                "dependency:\n  direct_deps:\n    - node_key: \"component/base@0.1.0\"\n",
+                encoding="utf-8")
+            # certified binary built from src_cert; lineage advanced to src_new (unverified).
+            self._seed_dep_pipeline(
+                repo, "component/base@0.1.0", "base_20260101_001", "src_cert",
+                "module base_model ! CERTIFIED\nend module base_model\n",
+                lineage_source_id="src_new")
+            # the newer, unverified source the lineage points at — must NOT be staged.
+            new_src = (repo / "workspace" / "pipelines" / "component__base__0.1.0"
+                       / "base_20260101_001" / "source" / "src_new" / "src")
+            new_src.mkdir(parents=True, exist_ok=True)
+            (new_src / "base_model.f90").write_text(
+                "module base_model ! NEWER UNVERIFIED\nend module base_model\n", encoding="utf-8")
+            obj_dir = repo / "workspace" / "tmp" / "arid_x" / "build"
+            staged = self._conductor(repo)._stage_dependency_sources(refs, obj_dir)
+            self.assertEqual(len(staged), 1)
+            self.assertIn("CERTIFIED", (obj_dir / "base_model.f90").read_text(encoding="utf-8"))
+            self.assertIn("src_cert", staged[0])
+
+    def test_stage_dependency_sources_noop_for_leaf(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            refs = self._refs()
+            self._write_ir(repo, refs)  # leaf (direct_deps: [])
+            obj_dir = repo / "workspace" / "tmp" / "arid_x" / "build"
+            self.assertEqual(self._conductor(repo)._stage_dependency_sources(refs, obj_dir), [])
+
+    def test_stage_dependency_sources_raises_when_dep_unbuilt(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            refs = wc.NodeRefs(node_key="component/top@0.1.0", spec_path="spec/component/top",
+                               ir_id="i", pipeline_id="p", source_id="s", binary_id="b")
+            self._write_dep_ir(repo, refs)
+            # only base is built; mid is missing -> fail-closed (build precondition)
+            self._seed_dep_pipeline(repo, "component/base@0.1.0", "base_20260101_001",
+                                    "src_base", "module base_model\nend module base_model\n")
+            obj_dir = repo / "workspace" / "tmp" / "arid_x" / "build"
+            with self.assertRaises(RuntimeError):
+                self._conductor(repo)._stage_dependency_sources(refs, obj_dir)
+
+    def test_stage_dependency_sources_raises_on_malformed_ir(self) -> None:
+        # direct_deps non-empty but its entries carry no resolvable node_key -> the union
+        # closure resolves empty (a compile-contract violation). Fail closed instead of
+        # staging a leaf-shaped build.
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            refs = self._refs()
+            self._write_ir(repo, refs, direct_deps="[{operations: [x]}]")
+            obj_dir = repo / "workspace" / "tmp" / "arid_x" / "build"
+            with self.assertRaisesRegex(RuntimeError, "closure resolved empty"):
+                self._conductor(repo)._stage_dependency_sources(refs, obj_dir)
+
+    def test_stage_dependency_sources_noop_for_non_fortran(self) -> None:
+        # A c/cpp/mixed dependency node keeps its LLM-authored Makefile and owns its own
+        # dependency build; the conductor must NOT stage Fortran <dep>_model.f90 (they do not
+        # exist under that name) — staging is a no-op, not a fail-closed.
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            refs = self._refs()
+            self._write_ir(repo, refs, language="c", direct_deps="[component/dep@0.1.0]")
+            obj_dir = repo / "workspace" / "tmp" / "arid_x" / "build"
+            self.assertEqual(self._conductor(repo)._stage_dependency_sources(refs, obj_dir), [])
 
 
 class GenerateLeafAuthorizationTest(unittest.TestCase):

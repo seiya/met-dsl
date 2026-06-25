@@ -129,7 +129,7 @@ In Claude Code, call it **before launching the `Agent` tool** (because the child
 
 `sandbox_runtime` / `sandbox_enforced` / `sandbox_profile_ref` are auto-added by record-launch.
 
-**Make build's `src/Makefile` auto-inject + provisioning verification:** when `step=generate` and `spec.ir.yaml.impl_defaults.toolchain.build_system=make`, record-launch auto-injects `<pipeline_ref>/source/<source_id>/src/Makefile` into `allowed_output_paths` / `allowed_file_tool_paths` (because with only a bare `src/` directory entry the extension-less Makefile cannot be written via any path). When an explicit `allowed_file_tool_paths` is passed and the Makefile pin is missed, it **fail-fasts with a `ValueError` before launching the child**. For the canonical contract, refer to [docs/ORCHESTRATION.md](ORCHESTRATION.md).
+**Make build's `src/Makefile` auto-inject + provisioning verification:** when `step=generate` and `spec.ir.yaml.impl_defaults.toolchain.build_system=make` **and the Makefile is not conductor-authored** (a non-fortran make family — c/cpp/mixed), record-launch auto-injects `<pipeline_ref>/source/<source_id>/src/Makefile` into `allowed_output_paths` / `allowed_file_tool_paths` (because with only a bare `src/` directory entry the extension-less Makefile cannot be written via any path). When an explicit `allowed_file_tool_paths` is passed and the Makefile pin is missed, it **fail-fasts with a `ValueError` before launching the child**. For a `make` ∧ `fortran` node (leaf or with dependencies) the conductor authors `src/Makefile` host-side (`_resolved_makefile_host_authored`), so the pin is suppressed and the file dropped from the child's `allowed_output_paths`. For the canonical contract, refer to [docs/ORCHESTRATION.md](ORCHESTRATION.md).
 
 ---
 

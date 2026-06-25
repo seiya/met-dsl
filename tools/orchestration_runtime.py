@@ -3915,6 +3915,12 @@ def _impl_resolved_language(repo_root: Path, ir_ref: str) -> str | None:
 def _impl_is_leaf_node(repo_root: Path, ir_ref: str) -> bool | None:
     """True iff spec.ir.yaml's `dependency.direct_deps` is empty (a leaf node).
 
+    Retained as the canonical runtime-side leaf predicate (and the agreement partner of
+    Conductor._is_leaf_node) even though Makefile host-authorship no longer keys off it
+    (authorship is now make∧fortran for leaf OR dependency nodes — see
+    `_resolved_makefile_host_authored` in record_launch); covered by its own unit test and
+    referenced by latent item L4 in docs/design/deterministic_followups.md.
+
     Returns None when the IR / dependency block cannot be located. Line-scanned (no yaml
     import here, mirroring `_impl_resolved_build_system`): finds the top-level `dependency:`
     block, then `direct_deps:` within it — empty (`[]` inline, or no `- ` list item before
@@ -5166,10 +5172,10 @@ def _mandatory_file_tool_pins_for_launch(
     # artifact it is supposed to judge, so it must be excluded.
     if step_token != "generate" or substep_token == "verify" or not pipeline_ref:
         return []
-    # When the conductor authors src/Makefile host-side (_write_makefile: leaf AND make AND
-    # fortran) it is NOT a leaf deliverable and must not be pinned (the file already exists;
-    # pinning would require the leaf to write it). `_resolved_makefile_host_authored` is
-    # populated by record_launch to mirror Conductor._conductor_authors_makefile exactly.
+    # When the conductor authors src/Makefile host-side (_write_makefile: make AND fortran,
+    # leaf OR dependency) it is NOT a leaf deliverable and must not be pinned (the file already
+    # exists; pinning would require the leaf to write it). `_resolved_makefile_host_authored`
+    # is populated by record_launch to mirror Conductor._conductor_authors_makefile exactly.
     if request_payload.get("_resolved_makefile_host_authored") is True:
         return []
     bs_raw = request_payload.get("_resolved_build_system")
@@ -12202,12 +12208,13 @@ def record_launch(
             request_payload["_resolved_build_system"] = (
                 _bs_resolved.strip().lower()
                 if isinstance(_bs_resolved, str) and _bs_resolved.strip() else "make")
-            # The conductor authors src/Makefile host-side iff leaf AND make AND fortran
-            # (= Conductor._conductor_authors_makefile). Mirror that exact condition so the
-            # mandatory-Makefile pin is suppressed only when the conductor really authored it
-            # (and kept otherwise), matching the leaf's allowed_output_paths. Computed here
-            # rather than as separate flags so conductor and runtime cannot disagree.
-            _leaf_resolved = _impl_is_leaf_node(repo_root, _ir_ref_for_bs)
+            # The conductor authors src/Makefile host-side iff make AND fortran, for BOTH leaf
+            # and dependency nodes (= Conductor._conductor_authors_makefile; the dependency
+            # Makefile is as IR-determined as the leaf one — Model B). Mirror that exact
+            # condition so the mandatory-Makefile pin is suppressed only when the conductor
+            # really authored it (and kept otherwise, e.g. c/cpp), matching the leaf's
+            # allowed_output_paths. Computed here rather than as separate flags so conductor
+            # and runtime cannot disagree.
             _lang_resolved = _impl_resolved_language(repo_root, _ir_ref_for_bs)
             _bs_for_mk = (_bs_resolved or "").strip().lower() if isinstance(_bs_resolved, str) else ""
             # Mirror the conductor's defaulting EXACTLY (`str(... or "make")` / `... or
@@ -12215,7 +12222,7 @@ def record_launch(
             # sides, so the two never disagree (an absent build_system must not make the
             # conductor author while the runtime keeps the pin -> record_launch fail-closed).
             request_payload["_resolved_makefile_host_authored"] = (
-                _leaf_resolved is True and (_bs_for_mk or "make") == "make"
+                (_bs_for_mk or "make") == "make"
                 and (_lang_resolved or "fortran") == "fortran")
         allowed_output_paths = _allowed_output_paths_for_launch(
             request_payload=request_payload,

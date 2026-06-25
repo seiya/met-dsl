@@ -16,29 +16,49 @@ authored deterministically host-side, mirroring `lineage.json`.
 
 **Part 1 — leaf nodes (implemented, default-on).** `Conductor._write_makefile(refs)` emits the
 fixed runner→model Makefile (`BIN ?= <spec_id>_runner`, FFLAGS from `toolchain.standard` +
-`target.backend`); called from `run_phase` at generate start, gated to `_is_leaf_node` +
-make/fortran (c/cpp/mixed keep LLM authoring). The Makefile is dropped from the leaf's
-write-authorization at all four sites (`build_launch_request` generate/verify
-`allowed_output_paths`, `phase_required_outputs`, and orchestration_runtime
-`_mandatory_file_tool_pins_for_launch` via `_resolved_is_leaf`/`_impl_is_leaf_node`). The
+`target.backend`); called from `run_phase` at generate start, originally gated to
+`_is_leaf_node` + make/fortran (**Part 2 below dropped the leaf gate**: authorship is now
+make/fortran for leaf OR dependency nodes; c/cpp/mixed keep LLM authoring). The Makefile is
+dropped from the node's write-authorization at all four sites (`build_launch_request`
+generate/verify `allowed_output_paths`, `phase_required_outputs`, and orchestration_runtime
+`_mandatory_file_tool_pins_for_launch` via `_resolved_makefile_host_authored`). The
 post_generate validators stay as the safety net (the template passes all three by
 construction). Docs/SKILLs note the conductor authorship.
 
-**Part 2 — dependency nodes (DESIGN-GRADE, Model B, UNVERIFIED).** No spec with `direct_deps`
-exists, and the dependency build is itself unimplemented/contradictory (no `.o`/`.mod` staging;
-`phase_02 §41` forbids copying dep sources into `src/`, but the only historically-working build
-copied them in). Chosen model: **Model B — transient source staging.** The conductor stages each
-closure `<dep>_model.f90` into the per-run build tmp `$(OBJDIR)` (NOT canonical `src/`), and the
-deterministic Makefile compiles + links the closure (`_write_makefile` non-leaf branch:
-deepest-first `$(OBJDIR)/<dep>_model.o` rules + `DEP_OBJS`, derived from
-`dependency.transitive_deps`/`all_nodes` via `_dependency_closure`). Rationale over Model A
-(prebuilt `.o`/`.mod` reuse): no gfortran `.mod` ABI coupling, reuses the already-durable dep
-source, single-toolchain build, canonical `src/` stays pristine. Shipped as code-paths +
-synthetic-IR unit tests only; the non-leaf branch is **not wired live** (run_phase authors only
-for leaf), and `_build_inproc` carries a TODO for the staging step. Reconciliation: `phase_02
-§41` carve-out (transient `$(OBJDIR)` staging ≠ canonical-tree copy); phase_03
-`dependency_violation` already targets `src/` mixing only, so it needs no change. Implement +
-verify when a real dependency spec lands.
+**Part 2 — dependency nodes (Model B, IMPLEMENTED; E2E-UNVERIFIED).** The dependency build was
+unimplemented/contradictory (no `.o`/`.mod` staging; `phase_02 §41` forbids copying dep sources
+into `src/`, but the only historically-working build copied them in). Chosen + now-implemented
+model: **Model B — transient source staging.** The conductor stages each closure `<dep>_model.f90`
+into the per-run build tmp `$(OBJDIR)` (NOT canonical `src/`) and the deterministic Makefile
+compiles + links the closure (`_write_makefile` non-leaf branch: deepest-first
+`$(OBJDIR)/<dep>_model.o` rules + `DEP_OBJS`, derived from the union of
+`dependency.direct_deps` + `dependency.transitive_deps`, ordered by `all_nodes[].topo_level`,
+via `_dependency_closure`). Rationale over Model A (prebuilt `.o`/`.mod` reuse): no gfortran `.mod`
+ABI coupling, reuses the already-durable dep source, single-toolchain build, canonical `src/` stays
+pristine.
+
+**What shipped:** `_conductor_authors_makefile` (and the runtime mirror
+`_resolved_makefile_host_authored`) now author the Makefile host-side for **every** make∧fortran
+node — leaf or dependency — so `run_phase` wires the non-leaf branch live and the generate leaf is
+dropped from the Makefile write-authorization at all sites. `_build_inproc` stages the closure via
+`_stage_dependency_sources` (resolves each dep's `<dep>_model.f90` from the **certified binary**'s
+`binary_meta.source_source_id` — the same binary `_verify_dep_stage` certifies readiness against,
+NOT the pipeline `lineage.json` which tracks the latest *generated* source and may have advanced
+past the validated binary; a missing dep → transport `fail_closed`, not a content retry). Staging self-gates on make∧fortran — it is a no-op for
+c/cpp/mixed dependency nodes (the LLM-authored Makefile owns their dependency build). The closure
+is the **union** of `direct_deps` + `transitive_deps` (per the compile §V4 contract; a one-hop dep
+has an empty `transitive_deps`, so a transitive-only read would wrongly fail-close it).
+`_execute_inproc` needs no staging (`make test` only runs the already-built binary). Reconciliation:
+`phase_02 §41` carve-out + §47 authorship updated; phase_03 `dependency_violation` targets `src/`
+mixing only, so unchanged. Covered by synthetic-IR unit tests (`test_workflow_conductor.py`: closure
+order, direct-only one-hop closure, dependency-Makefile rules, staging copy / leaf no-op /
+non-fortran no-op / unbuilt-dep + malformed-IR fail-closed; conductor↔runtime authorship agreement).
+
+**Still UNVERIFIED end-to-end:** the wired path has never run through a real
+`compile→generate→build→validate`. A minimal 2-node dependency spec is now authored (the
+`demo_dep_base`/`demo_dep_top` chain — see D1 below), but running
+`run_workflow.py <ref> validate --llm claude --with-deps` to `meta=pass` +
+`aggregate_verdict=pass` (billed, long) is the only way to confirm and remains outstanding.
 
 ## Follow-up: deterministic binary name (2026-06-24)
 
@@ -194,31 +214,30 @@ in-scope bugs are all fixed (suite green; Codex review clean). The items below a
 **deliberately deferred** — pick them up in a future session. A ready-to-paste starter
 prompt lives at `docs/design/dependency_build_followup_prompt.md`.
 
-## D1 (PRIMARY) — dependency-node build is unimplemented + the contract is contradictory
-The deterministic-Makefile work (Part 1) covers **leaf** nodes only. Dependency nodes are
-blocked on an upstream design+build gap:
-- No spec with non-empty `dependency.direct_deps` exists in any workspace; the dependency
-  build has never run end-to-end.
-- No dep `.o`/`.mod` staging exists: `_build_inproc` uses a fresh empty `OBJDIR`;
-  `_fortran_source_module_deps` resolves only intra-`src/` `use` edges; `--with-deps`
-  (`run_workflow.py`) runs dep nodes to "ready" but wires **no** build artifacts between them.
-- The contract is self-contradictory: `phase_02_generate.md:41` (encapsulation) forbids
+## D1 (PRIMARY) — dependency-node build: code IMPLEMENTED (Model B); E2E verification remains
+The Model B dependency build is now wired live (see "Part 2 — dependency nodes" above for the
+full implementation note). What was the gap, and what closed it:
+- The contract was self-contradictory: `phase_02_generate.md:41` (encapsulation) forbids
   copying dep sources into `src/`, yet the only historically-working dependency build
   (`workspace_20260319/.../problem__shallow_water2d__0.3.0/.../Makefile`) did exactly that.
-- **Recommended approach = Model B** (transient source staging): the conductor stages each
-  closure `<dep>_model.f90` into the per-run build tmp `$(OBJDIR)` (never canonical `src/`)
-  and the Makefile compiles+links the closure. Rationale + the §41 carve-out are in the
-  "deterministic `src/Makefile`" section above.
-- **Already in place (unwired, synthetic-tested):** `Conductor._dependency_closure`,
-  `_write_makefile` non-leaf branch (deepest-first `$(OBJDIR)/<dep>_model.o` rules +
-  `DEP_OBJS`), and a staging TODO in `_build_inproc` (`tools/workflow_conductor.py`).
-- **To do:** implement the `_build_inproc` (+ execute) staging of the closure sources, wire
-  `_write_makefile`'s non-leaf branch into `run_phase` (it is currently leaf-gated), reconcile
-  the phase_02 §41 / phase_03 `dependency_violation` contracts, and **author a real
-  dependency spec** to verify end-to-end (the only way to confirm — it is untestable today).
+  Resolved: §41 carve-out (transient `$(OBJDIR)` staging ≠ canonical-tree copy) + §47.
+- **Done:** `_conductor_authors_makefile`/`_resolved_makefile_host_authored` author the Makefile
+  for every make∧fortran node (leaf or dependency), so `run_phase` drives the `_write_makefile`
+  non-leaf branch live; `_stage_dependency_sources` (called from `_build_inproc`) stages each
+  closure `<dep>_model.f90` into `$(OBJDIR)` from the dep's ready pipeline lineage; synthetic-IR
+  unit tests cover closure order, Makefile rules, staging, and conductor↔runtime agreement.
+- **Remaining (the reason this stays open):** the wired path has never run end-to-end. A
+  minimal 2-node dependency spec is now **authored** (`spec/component/demo/dep_chain/demo_dep_base`
+  leaf + `demo_dep_top` which `use`s it; both registered in `spec/registry/spec_catalog.yaml`;
+  closure resolution verified offline via `_resolve_dependency_closure` → `[demo_dep_base@0.1.0]`).
+  The remaining operator-gated step is the **billed, long** run:
+  `python3 tools/run_workflow.py spec/component/demo/dep_chain/demo_dep_top validate --llm claude --with-deps`
+  confirmed to `meta=pass` + `aggregate_verdict=pass`. That is the only outstanding D1 work.
 
-## D2 — `--with-deps` closure wires no build artifacts (same root as D1)
-Building node N consumes nothing from its dependency nodes' builds. Resolve together with D1.
+## D2 — `--with-deps` closure wires build artifacts via staging (resolved with D1)
+Building node N now consumes its dependency nodes' built sources through
+`_stage_dependency_sources` (each dep's `<dep>_model.f90` from its ready pipeline). Closed with
+D1's implementation; E2E verification is the same outstanding item as D1.
 
 ## L (latent / low severity — fix opportunistically)
 - **L1** Generated Makefile emits a harmless `make` warning `target '.' given more than once`
@@ -235,6 +254,15 @@ Building node N consumes nothing from its dependency nodes' builds. Resolve toge
 - **L5** A judge session/usage-limit now ends as a clean resumable `fail_closed`
   (`leaf_transport_error`) but still requires a **manual `--resume`** after the quota
   resets — no auto-retry/scheduling. By design; revisit if it becomes operationally painful.
+- **L6** The dependency build (Model B) keys staged source filenames and Makefile object
+  rules on the bare `spec_id_of(node_key)` (`_dependency_closure` / `_stage_dependency_sources`),
+  dropping `kind` and `@version`. A closure containing two deps that share a `spec_id` but
+  differ in version or kind (e.g. `component/foo@1.0.0` + `component/foo@2.0.0`, a diamond) would
+  collide on `foo_model.f90` (last-write-wins stage + duplicate `$(OBJDIR)/foo_model.o` rules).
+  The version-pinned *pipeline* path stays unambiguous (node_key carries `@version`); only the
+  in-`$(OBJDIR)` basename is not. Not reachable by the minimal 2-node verification spec. Guard
+  (or version-qualify the object/staged basenames) before allowing multi-version/diamond
+  closures.
 
 ## T1 — testing gap (minor)
 The transport+resume path is covered by two unit layers (conductor routing in

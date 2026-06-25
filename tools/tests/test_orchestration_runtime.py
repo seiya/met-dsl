@@ -4012,9 +4012,9 @@ shell_tool                       stable             true
         self.assertIn(makefile, file_tool)
 
     def test_generate_leaf_make_launch_does_not_inject_makefile_pin(self) -> None:
-        """When the conductor authors src/Makefile host-side (_write_makefile: leaf AND make
-        AND fortran), even a Make Generate launch must NOT auto-inject the Makefile pin
-        (`_resolved_makefile_host_authored` True) — the leaf must not author it."""
+        """When the conductor authors src/Makefile host-side (_write_makefile: make AND
+        fortran, leaf OR dependency), even a Make Generate launch must NOT auto-inject the
+        Makefile pin (`_resolved_makefile_host_authored` True) — the leaf must not author it."""
         from tools.orchestration_runtime import (
             _allowed_output_paths_for_launch,
             _mandatory_file_tool_pins_for_launch,
@@ -4054,8 +4054,11 @@ shell_tool                       stable             true
             repo = Path(tmp)
             ir = repo / "ir"
             ir.mkdir()
+            # language=c -> NOT conductor-authored (c/cpp keep LLM authoring), so the Makefile
+            # pin is genuinely required. (A make+fortran node — leaf or dependency — is
+            # host-authored under Model B, so it would be pinned-suppressed instead.)
             (ir / "spec.ir.yaml").write_text(
-                "impl_defaults:\n  toolchain:\n    language: fortran\n"
+                "impl_defaults:\n  toolchain:\n    language: c\n"
                 "dependency:\n  direct_deps:\n    - node_key: component/dep@0.1.0\n",
                 encoding="utf-8")
             # precondition: build_system is genuinely unresolved
@@ -4064,7 +4067,7 @@ shell_tool                       stable             true
             src_dir = f"{_FIX_PIPE_REF}/source/{src_id}/src/"
             makefile = f"{src_dir}Makefile"
             # payload as the FIXED record_launch populates it: bs absent -> "make",
-            # not host-authored (dependency node).
+            # not host-authored (c node).
             req = {
                 "agent_role": "step", "step": "generate",
                 "node_key": "component/top@0.1.0",

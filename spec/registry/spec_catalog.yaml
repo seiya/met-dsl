@@ -110,3 +110,28 @@ specs:
     tests_path: spec/profile/dynamics/shallow_water/dynamics_shallow_water_profile_2d_rusanov_p0_ssprk2/tests.md
     deps_path: spec/profile/dynamics/shallow_water/dynamics_shallow_water_profile_2d_rusanov_p0_ssprk2/deps.yaml
     official_releases: []
+
+  # Minimal two-node dependency chain to exercise the deterministic dependency
+  # build (Model B): demo_dep_top `use`s demo_dep_base. See
+  # docs/design/deterministic_followups.md (D1).
+  - spec_kind: component
+    spec_id: demo_dep_base
+    spec_version: 0.1.0
+    status: controlled_draft
+    domain: demo
+    family: dep_chain
+    controlled_spec_path: spec/component/demo/dep_chain/demo_dep_base/controlled_spec.md
+    tests_path: spec/component/demo/dep_chain/demo_dep_base/tests.md
+    deps_path: spec/component/demo/dep_chain/demo_dep_base/deps.yaml
+    official_releases: []
+
+  - spec_kind: component
+    spec_id: demo_dep_top
+    spec_version: 0.1.0
+    status: controlled_draft
+    domain: demo
+    family: dep_chain
+    controlled_spec_path: spec/component/demo/dep_chain/demo_dep_top/controlled_spec.md
+    tests_path: spec/component/demo/dep_chain/demo_dep_top/tests.md
+    deps_path: spec/component/demo/dep_chain/demo_dep_top/deps.yaml
+    official_releases: []

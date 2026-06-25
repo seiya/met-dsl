@@ -1,0 +1,7 @@
+spec_id: demo_dep_top
+spec_kind: component
+dependencies:
+  components:
+    - component_id: demo_dep_base
+      version_constraint: ">=0.1.0 <1.0.0"
+  profiles: []

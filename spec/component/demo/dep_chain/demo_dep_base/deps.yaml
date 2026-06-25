@@ -1,0 +1,5 @@
+spec_id: demo_dep_base
+spec_kind: component
+dependencies:
+  components: []
+  profiles: []

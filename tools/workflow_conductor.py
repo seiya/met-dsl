@@ -444,9 +444,10 @@ def build_launch_request(
         req["source_id"] = refs.source_id
         req["dependency_ref"] = refs.ir_ref
         src = refs.source_dir()
-        # For a leaf node the conductor authors src/Makefile host-side (_write_makefile),
-        # so it is NOT a leaf output — omit it from allowed_output_paths (and required
-        # outputs) exactly like lineage.json. Dependency nodes keep LLM authoring.
+        # For any make+fortran node (leaf or dependency) the conductor authors src/Makefile
+        # host-side (_write_makefile), so it is NOT a leaf output — omit it from
+        # allowed_output_paths (and required outputs) exactly like lineage.json. c/cpp/mixed
+        # keep LLM authoring, so the leaf still lists it there.
         make_entry = [] if makefile_host_authored else [f"{src}/src/Makefile"]
         if substep == "generate":
             must_read += [
@@ -841,11 +842,12 @@ class Conductor:
     def _is_leaf_node(self, refs: NodeRefs) -> bool:
         """A node whose `dependency.direct_deps` is explicitly present and empty. An absent
         dependency block / absent direct_deps returns False (undeterminable -> treat as
-        non-leaf, matching the runtime's `_impl_is_leaf_node` which returns None there), so
-        the conductor and runtime never disagree on whether to author/authorize the Makefile.
-        Leaf nodes have a fully IR-determined `src/Makefile` (fixed runner->model use-graph),
-        so the conductor authors it host-side (`_write_makefile`); dependency nodes keep LLM
-        authoring until the dependency-build model is implemented (see docs/design)."""
+        non-leaf, matching the runtime's `_impl_is_leaf_node` which returns None there).
+
+        NOTE: leaf-ness no longer gates `src/Makefile` authorship — the conductor authors it
+        for every make+fortran node (leaf OR dependency; see `_conductor_authors_makefile` /
+        `_write_makefile`'s Model B branch). Retained as the canonical leaf predicate for the
+        leaf concept itself (and its agreement with `_impl_is_leaf_node`)."""
         ir = _read_yaml(self.repo_root / refs.ir_ref / "spec.ir.yaml") or {}
         dep = ir.get("dependency") if isinstance(ir, dict) else None
         if not isinstance(dep, dict) or "direct_deps" not in dep:
@@ -853,26 +855,33 @@ class Conductor:
         return not dep.get("direct_deps")
 
     def _conductor_authors_makefile(self, refs: NodeRefs) -> bool:
-        """The conductor authors `src/Makefile` iff the node is a leaf AND build_system=make
-        AND language=fortran — exactly the scope of `_write_makefile`. Single source of truth
-        for the live author call AND the leaf write-authorization removal, so they cannot
-        disagree (which would orphan the Makefile, or leave it double-owned)."""
-        if not self._is_leaf_node(refs):
-            return False
+        """The conductor authors `src/Makefile` iff build_system=make AND language=fortran —
+        exactly the scope of `_write_makefile`, for BOTH leaf and dependency nodes. The
+        dependency Makefile is as IR-determined as the leaf one (the closure + per-dep object
+        rules come from `dependency.transitive_deps`/`all_nodes`; Model B), so the conductor
+        authors it too and the generate leaf must not. Single source of truth for the live
+        author call AND the write-authorization removal, so they cannot disagree (which would
+        orphan the Makefile, or leave it double-owned). c/cpp/mixed keep LLM authoring."""
         ir = _read_yaml(self.repo_root / refs.ir_ref / "spec.ir.yaml") or {}
         impl = (ir.get("impl_defaults") or {}) if isinstance(ir, dict) else {}
         tc = (impl.get("toolchain") or {}) if isinstance(impl, dict) else {}
         return (str(tc.get("build_system") or "make").lower() == "make"
                 and str(tc.get("language") or "fortran").lower() == "fortran")
 
-    def _dependency_closure(self, refs: NodeRefs) -> list[str]:
-        """Dependency spec_ids in compile order (deepest first) from the IR closure.
+    def _dependency_closure_nodes(self, refs: NodeRefs) -> list[str]:
+        """Dependency node_keys in compile order (deepest first) from the IR closure.
 
-        DESIGN-GRADE / UNVERIFIED (Model B, docs/design): no spec with dependencies exists
-        yet, so this path never runs live (run_phase authors the Makefile only for leaf
-        nodes); it is exercised only by synthetic-IR unit tests. Orders `dependency.
-        transitive_deps` by `dependency.all_nodes[].topo_level` ascending (deepest deps,
-        which provide modules the shallower ones `use`, compile first)."""
+        The build closure is the **union** of `dependency.direct_deps[]` and
+        `dependency.transitive_deps[]` (per the compile V4 contract, phase_01 §V4: their union
+        matches `all_nodes`). `transitive_deps` lists only the INDIRECT deps reached `via` an
+        intermediate, so a one-hop dependency (e.g. `top -> base` with `base` a leaf) has a
+        non-empty `direct_deps` and an empty `transitive_deps` — reading only `transitive_deps`
+        would resolve the closure empty and wrongly block the build. Deduped (first occurrence
+        wins) and ordered by `dependency.all_nodes[].topo_level` ascending (deepest deps, which
+        provide modules the shallower ones `use`, compile first). The node_keys carry the
+        resolved `@<version>`, so the staging path (`_stage_dependency_sources`) and the
+        Makefile object names (`_dependency_closure` -> spec_ids) derive from a single ordered
+        list and cannot disagree on which dep / which version."""
         ir = _read_yaml(self.repo_root / refs.ir_ref / "spec.ir.yaml") or {}
         dep = (ir.get("dependency") or {}) if isinstance(ir, dict) else {}
         levels: dict[str, int] = {}
@@ -880,12 +889,22 @@ class Conductor:
             if isinstance(n, dict) and isinstance(n.get("node_key"), str):
                 levels[n["node_key"]] = n.get("topo_level") or 0
         closure: list[str] = []
-        for d in dep.get("transitive_deps") or []:
-            nk = d.get("node_key") if isinstance(d, dict) else d
-            if isinstance(nk, str) and nk.strip() and nk != refs.node_key:
-                closure.append(nk)
+        seen: set[str] = set()
+        for list_key in ("direct_deps", "transitive_deps"):
+            for d in dep.get(list_key) or []:
+                nk = d.get("node_key") if isinstance(d, dict) else d
+                if isinstance(nk, str) and nk.strip() and nk != refs.node_key and nk not in seen:
+                    seen.add(nk)
+                    closure.append(nk)
         closure.sort(key=lambda nk: levels.get(nk, 0))
-        return [spec_id_of(nk) for nk in closure]
+        return closure
+
+    def _dependency_closure(self, refs: NodeRefs) -> list[str]:
+        """Dependency spec_ids in compile order (deepest first) — the `<dep>_model.o`/`.f90`
+        basenames the deterministic dependency Makefile (`_write_makefile` non-leaf branch)
+        compiles + links. Derived from `_dependency_closure_nodes` so the Makefile object
+        names and the staged source filenames stay in lockstep."""
+        return [spec_id_of(nk) for nk in self._dependency_closure_nodes(refs)]
 
     def _write_makefile(self, refs: NodeRefs) -> None:
         """Author the `src/Makefile` host-side (runtime-owned), deterministically.
@@ -903,10 +922,10 @@ class Conductor:
         canonical binary name) and FFLAGS derived from toolchain.standard + target.backend.
 
         A non-empty dependency closure (Model B, docs/design) emits per-dep object rules +
-        a `DEP_OBJS` link list, assuming the conductor stages each `<dep>_model.f90` into
-        `$(OBJDIR)` before `make` (see `_build_inproc` TODO). That branch is DESIGN-GRADE /
-        UNVERIFIED — run_phase authors the Makefile only for leaf nodes today, so it is
-        reached only by synthetic-IR unit tests.
+        a `DEP_OBJS` link list; the conductor stages each `<dep>_model.f90` into `$(OBJDIR)`
+        before `make` (`_stage_dependency_sources`, called from `_build_inproc`). `run_phase`
+        authors this for every make+fortran node (leaf or dependency) — see
+        `_conductor_authors_makefile`.
         """
         ir = _read_yaml(self.repo_root / refs.ir_ref / "spec.ir.yaml") or {}
         impl = (ir.get("impl_defaults") or {}) if isinstance(ir, dict) else {}
@@ -927,7 +946,7 @@ class Conductor:
             flags += " -fopenmp"
         flags += " -J$(OBJDIR) -I$(OBJDIR)"
 
-        # Dependency closure (Model B, design-grade). Empty for leaf nodes -> the blocks
+        # Dependency closure (Model B). Empty for leaf nodes -> the blocks
         # below collapse to "" and the leaf template is emitted byte-for-byte.
         closure = self._dependency_closure(refs)
         dep_objs_line = ""
@@ -1277,6 +1296,92 @@ clean:
             return ProcResult(1, "", f"deterministic_{phase}_error: {exc}")
         return ProcResult(int(out.get("returncode", 0)), out.get("stdout", ""), out.get("stderr", ""))
 
+    def _stage_dependency_sources(self, refs: NodeRefs, obj_dir: Path) -> list[str]:
+        """Model B (docs/design): stage each dependency-closure `<dep>_model.f90` into the
+        per-run build tmp `$(OBJDIR)` so the conductor-authored dependency Makefile
+        (`_write_makefile` non-leaf branch) compiles + links the closure. Never touches the
+        canonical `src/` — phase_02 §41 carve-out: a transient `$(OBJDIR)` stage is not a
+        canonical-tree copy, so it is not the forbidden dependency mix-in.
+
+        Each dep's model source is resolved from the dep's latest ready pipeline, then from the
+        **certified binary** (`_latest_meta_under(.../binary/*/binary_meta.json)` — the same
+        binary `_verify_dep_stage` certifies readiness against) via its `source_source_id` ->
+        `source/<source_source_id>/src/<dep>_model.f90`. Binding to the certified binary's
+        source (not the pipeline `lineage.json`, which tracks the latest *generated* source)
+        guarantees the staged code is the exact source the ready binary/verdict was built from.
+        node_keys carry `@<version>`, so the per-version workspace path is unambiguous.
+
+        Returns the repo-relative refs of the staged sources (deepest-first). Raises on an
+        unresolvable dependency: a missing dep source means the dependency was not built
+        ready (run `--with-deps` first), which is a build precondition failure routed to
+        transport fail_closed (operator --resume), NOT a content failure the generate retry
+        loop could fix.
+
+        No-op (returns []) unless the node is make ∧ fortran — staging is paired with the
+        conductor-authored Fortran Makefile (`_write_makefile` non-leaf branch), which is the
+        only consumer of the staged `<dep>_model.f90`. For a c/cpp/mixed dependency node the
+        Generate child still owns the (LLM-authored) Makefile and its own dependency build, so
+        the conductor must not stage Fortran sources (they do not exist under those names)."""
+        from tools.orchestration_runtime import _latest_meta_under, _latest_pipeline_dir
+        if not self._conductor_authors_makefile(refs):
+            return []
+        nodes = self._dependency_closure_nodes(refs)
+        if not nodes:
+            # Defense-in-depth: a genuine leaf has empty `direct_deps`. If `direct_deps` is
+            # non-empty yet the closure (the direct+transitive union) still resolves empty, the
+            # `direct_deps` entries have no resolvable `node_key` — a malformed IR violating the
+            # compile closure contract (phase_01 §V4). The Makefile would have been authored
+            # leaf-shaped (no DEP_OBJS) and the node's `use <dep>_model` would fail Build as a
+            # missing-module compile error that misroutes to a Generate retry it cannot fix.
+            # Fail closed here with a clear cause instead.
+            ir = _read_yaml(self.repo_root / refs.ir_ref / "spec.ir.yaml") or {}
+            dep = (ir.get("dependency") or {}) if isinstance(ir, dict) else {}
+            if dep.get("direct_deps"):
+                raise RuntimeError(
+                    f"malformed IR for {refs.node_key}: dependency.direct_deps is non-empty "
+                    f"but the build closure resolved empty (no resolvable node_key in "
+                    f"direct_deps/transitive_deps); recompile (phase_01 §V4 closure contract)")
+            return []
+        obj_dir.mkdir(parents=True, exist_ok=True)
+        staged: list[str] = []
+        for nk in nodes:
+            safe = node_key_safe(nk)
+            sid = spec_id_of(nk)
+            pipe_dir = _latest_pipeline_dir(
+                self.repo_root / "workspace" / "pipelines" / safe)
+            if pipe_dir is None:
+                raise RuntimeError(
+                    f"dependency {nk}: no ready pipeline under workspace/pipelines/{safe} "
+                    f"to stage {sid}_model.f90 from (build the dependency closure first, "
+                    f"e.g. run_workflow.py --with-deps)")
+            # Bind the staged source to the SAME binary the readiness gate certified, NOT to
+            # the pipeline-level lineage.json. `_verify_dep_stage` certifies the latest
+            # `binary/*/binary_meta.json` (selected by id) and binds the aggregate_verdict to
+            # it; that binary records the source it was actually built from in
+            # `source_source_id`. The pipeline lineage.json, by contrast, tracks the latest
+            # GENERATED source, which a Generate retry may have advanced past the certified
+            # binary's source (newer source, not yet rebuilt/validated) — staging from lineage
+            # would then compile the depending node against UNVERIFIED dependency code. Use the
+            # certified binary's `source_source_id` so the staged source == the validated one.
+            binary_meta_path = _latest_meta_under(pipe_dir, "binary/*/binary_meta.json")
+            if binary_meta_path is None:
+                raise RuntimeError(
+                    f"dependency {nk}: no binary_meta.json under {self._rel(pipe_dir)} to "
+                    f"resolve the certified source (dependency not built ready; "
+                    f"run_workflow.py --with-deps first)")
+            binary_meta = _read_json(binary_meta_path) or {}
+            source_id = binary_meta.get("source_source_id")
+            if not isinstance(source_id, str) or not source_id.strip():
+                raise RuntimeError(
+                    f"dependency {nk}: {self._rel(binary_meta_path)} has no source_source_id")
+            model_src = pipe_dir / "source" / source_id / "src" / f"{sid}_model.f90"
+            if not model_src.is_file():
+                raise RuntimeError(
+                    f"dependency {nk}: model source not found at {self._rel(model_src)}")
+            shutil.copy2(model_src, obj_dir / f"{sid}_model.f90")
+            staged.append(self._rel(model_src))
+        return staged
+
     def _build_inproc(self, refs: NodeRefs, child_arid: str, cap_token: str) -> dict[str, str]:
         """Deterministic Build: in-process compile_project + binary_meta + post_build gate."""
         import sys as _sys
@@ -1296,13 +1401,15 @@ clean:
         bin_dir = self.repo_root / refs.binary_dir() / "bin"
         obj_dir = self.repo_root / "workspace" / "tmp" / child_arid / "build"
         exe = self._resolve_exe_name(refs)
-        # DEPENDENCY BUILD (Model B, docs/design — DESIGN-GRADE, NOT YET WIRED): for a node
-        # with dependencies, stage each closure `<dep>_model.f90` into obj_dir ($(OBJDIR))
-        # here (via _dependency_closure + each dep's lineage source_id) BEFORE compile, so the
+        # DEPENDENCY BUILD (Model B, docs/design): for a make∧fortran node with dependencies,
+        # stage each closure `<dep>_model.f90` into obj_dir ($(OBJDIR)) BEFORE compile, so the
         # conductor-authored dependency Makefile (_write_makefile non-leaf branch) compiles +
-        # links the closure. Unwired because no dependency spec exists to verify against and
-        # the dependency build is currently leaf-only in practice. Reconcile phase_02 §
-        # encapsulation (transient OBJDIR staging is not a canonical-src copy) before enabling.
+        # links the closure. Self-gated: a no-op for a leaf node (empty closure) and for
+        # c/cpp/mixed nodes (LLM-authored Makefile owns its own dependency build). A staging
+        # failure raises -> _run_deterministic_substep catches it as a transport fail_closed
+        # (build precondition: the dependency must be built ready first). The transient OBJDIR
+        # stage never touches canonical src/ (phase_02 §41 carve-out).
+        self._stage_dependency_sources(refs, obj_dir)
 
         result = tool_compile_project({
             "project_dir": str(src_dir),
@@ -1618,6 +1725,9 @@ clean:
             # `$(BINDIR)/$(BIN)` guard resolves the same binary Build produced. make_test
             # passes overrides via the environment only, which overrides the Makefile's
             # `BIN ?=` form (enforced by post_generate).
+            # No dependency-source staging here (unlike _build_inproc): `make test` only runs
+            # the already-built binary (the `test:` target has no build prerequisite, so it
+            # never recompiles), so the closure `.f90`/`.mod` are not needed in OBJDIR.
             "env": {"OBJDIR": str(obj_tmp), "BINDIR": str(bin_dir),
                     "RUNDIR": str(qc_tmp), "BIN": str(exe)},
             "command_log_path": str(qc_cmd_log),
@@ -1881,10 +1991,12 @@ clean:
         # compile writes under workspace/ir/, not the pipeline root.
         if phase in ("generate", "build", "validate"):
             self._write_lineage(refs)
-        # For a leaf node the conductor authors src/Makefile deterministically (runtime-owned,
-        # like lineage.json) BEFORE the substeps run: the generate leaf must not author it, and
-        # generate.verify's post_generate gate inspects it. Leaf-only — the template encodes the
-        # fixed runner->model use-graph; dependency nodes keep LLM authoring (see _write_makefile).
+        # The conductor authors src/Makefile deterministically (runtime-owned, like
+        # lineage.json) for every make+fortran node BEFORE the substeps run: the generate leaf
+        # must not author it, and generate.verify's post_generate gate inspects it. The
+        # template encodes the fixed runner->model use-graph and, for a dependency node, the
+        # closure object rules (Model B); the dep sources are staged at build (see
+        # _stage_dependency_sources). c/cpp/mixed keep LLM authoring (see _write_makefile).
         if phase == "generate" and self._conductor_authors_makefile(refs):
             self._write_makefile(refs)
 

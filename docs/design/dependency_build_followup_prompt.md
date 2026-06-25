@@ -1,5 +1,16 @@
 # Starter prompt — dependency-build (Model B) implementation + deferred hardening
 
+> **STATUS (superseded — read first):** the Model B implementation described below has
+> **shipped** (conductor authors `src/Makefile` host-side for every make∧fortran node — leaf
+> OR dependency; `_build_inproc` stages each closure `<dep>_model.f90` into `$(OBJDIR)`;
+> authorization integration + contract docs done; unit tests green). A verification 2-node
+> spec (`spec/component/demo/dep_chain/{demo_dep_base,demo_dep_top}`) is also authored. The
+> ONLY outstanding item is the **billed E2E run**
+> (`run_workflow.py spec/component/demo/dep_chain/demo_dep_top validate --llm claude --with-deps`
+> to `meta=pass` + `aggregate_verdict=pass`). The "前提（完了済み）" / main-task wording below
+> predates that and is kept only for historical context — defer to the
+> "Part 2 — dependency nodes" / "D1 (PRIMARY)" status in `docs/design/deterministic_followups.md`.
+
 Paste the block below into a fresh session (in `/home/seiya/work/met-dsl`) to resume this
 work. It is self-contained; the canonical record is the "Known limitations & deferred work"
 section of `docs/design/deterministic_followups.md`.
