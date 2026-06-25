@@ -3228,6 +3228,22 @@ def _validate_raw_evidence(
                     elif state_variables and time_variable:
                         missing_state_by_file: dict[str, list[str]] = {}
                         missing_time = set()
+                        # Scope each snapshot's required state variables to the
+                        # raw variables its case's test actually declares
+                        # (io_contract.test_evidence_requirements). An
+                        # input-guard rejection case (e.g. n <= 0) produces no
+                        # output state, so its snapshot legitimately carries
+                        # only the rejected input; requiring the global union of
+                        # declared variables in every snapshot would falsely
+                        # fail it. Falls back to all declared variables when no
+                        # per-test contract / case mapping is available.
+                        contract = _io_contract_for_execution(repo_root, execution)
+                        per_test_required = (
+                            _contract_test_evidence_requirements(contract)
+                            if isinstance(contract, dict)
+                            else {}
+                        )
+                        case_to_test = _case_id_to_test_id(repo_root, execution)
                         for snapshot in snapshot_data_files:
                             if snapshot.suffix.lower() != ".json":
                                 continue
@@ -3238,7 +3254,29 @@ def _validate_raw_evidence(
                             if not isinstance(data, dict):
                                 continue
                             keys = set(data.keys())
-                            missing_state = sorted(name for name in state_variables if name not in keys)
+                            required_state_names = state_variables
+                            if per_test_required and case_to_test:
+                                snapshot_case_id = data.get("case_id")
+                                if not (
+                                    isinstance(snapshot_case_id, str)
+                                    and snapshot_case_id.strip()
+                                ):
+                                    snapshot_case_id = snapshot.stem
+                                snapshot_test_id = case_to_test.get(
+                                    snapshot_case_id.strip()
+                                    if isinstance(snapshot_case_id, str)
+                                    else ""
+                                )
+                                case_required = per_test_required.get(
+                                    snapshot_test_id or ""
+                                )
+                                if case_required is not None:
+                                    required_state_names = [
+                                        name
+                                        for name in state_variables
+                                        if name in case_required
+                                    ]
+                            missing_state = sorted(name for name in required_state_names if name not in keys)
                             if missing_state:
                                 missing_state_by_file[snapshot.name] = missing_state
                             if time_variable not in keys:
@@ -4118,6 +4156,41 @@ def _contract_test_evidence_requirements(
         if variables:
             result[raw_test_id.strip()] = variables
     return result
+
+
+def _case_id_to_test_id(
+    repo_root: Path, execution: NodeExecution
+) -> dict[str, str]:
+    """Map each IR case_id to its tests.md test_id (case.test_case_set).
+
+    Used to scope per-snapshot evidence: a snapshot file named for a case need
+    only carry the raw variables that case's test declares in
+    io_contract.test_evidence_requirements (e.g. an input-guard rejection case
+    that produces no output state), not the global union of declared variables.
+    """
+    data = _algorithm_contract_for_execution(repo_root, execution)
+    if not isinstance(data, dict):
+        return {}
+    case_section = data.get("case")
+    if not isinstance(case_section, dict):
+        return {}
+    test_case_set = case_section.get("test_case_set")
+    if not isinstance(test_case_set, list):
+        return {}
+    mapping: dict[str, str] = {}
+    for item in test_case_set:
+        if not isinstance(item, dict):
+            continue
+        case_id = item.get("case_id")
+        test_id = item.get("test_id")
+        if (
+            isinstance(case_id, str)
+            and case_id.strip()
+            and isinstance(test_id, str)
+            and test_id.strip()
+        ):
+            mapping[case_id.strip()] = test_id.strip()
+    return mapping
 
 
 def _metrics_basis_entries(

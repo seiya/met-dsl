@@ -296,6 +296,45 @@ Note: the demo `tests.md` xfail wording was ALSO clarified (2026-06-25) so the r
 `verdict.overall=pass` with `input_guard` as a passing guard — a real robustness improvement, but it
 was NOT the blocker (this DAG-scope check is). Both E2E runs failed here.
 
+## D3 — `post_execute` snapshot completeness over-strict for guard-rejection cases (FIXED 2026-06-25)
+**Found by the billed dev `--with-deps` E2E re-run (2026-06-25, orch `orch_20260625T141819Z_2692801d`).**
+With the D2 validate-scope fix in place, the run reached further but `fail_closed` at the **leaf
+dependency node `demo_dep_base`** (so the target `demo_dep_top` never ran): `validate.execute` failed,
+and the dev F1 gate correctly stopped on the first cross-phase rollback (`reason_code=dev_phase_rollback`,
+`reason_detail=validate_execute_fail`, zero budget burned). The runner itself was clean
+(`diagnostics.json verdict.overall=pass`); the blocker was the deterministic `post_execute` snapshot
+gate:
+```
+raw/state_snapshots: declared state_variables missing in snapshot files ({'c_l0_invalid_length.json': ['y']})
+```
+**Root cause:** `_validate_raw_evidence` (`tools/validate_pipeline_semantics.py`) required the **global
+union** of declared schema `variables[]` (`{x, y}`) in **every** snapshot file. But the input-guard
+rejection case (`n <= 0`) produces no output state, so its snapshot legitimately carries only the
+rejected input `x` and omits the output `y`. The IR was already correct and self-consistent — its
+`io_contract.test_evidence_requirements` scopes `l0_invalid_length_xfail` to `required_raw_variables:
+[x]` (judged on `input_guard` diagnostics) vs `[x, y]` for the valid case. The gate ignored that
+per-case scoping (the `metrics_basis` gate at `:~5904` already honored it; this gate did not). A
+C-class cross-phase robustness gap surfacing as a gate-vs-contract disagreement, NOT a
+dependency-build/migration bug — and the dependency-build path (D1/D2) was not even exercised this run.
+
+**Fix — IMPLEMENTED (validator-side, deterministic).** `_validate_raw_evidence` now scopes each
+snapshot's required state variables to its case's test: it builds `_case_id_to_test_id` (from
+`case.test_case_set`, via `_algorithm_contract_for_execution`) and intersects the per-test
+`_contract_test_evidence_requirements` with the declared schema variables. A snapshot tagged with a
+`case_id` (in-file field, else filename stem) is only required to carry that case's test's
+`required_raw_variables`. Falls back to the prior strict union when no per-test contract / case mapping
+is resolvable (backward compatible); strictness is preserved for any case whose test *does* require the
+variable. phase_04_validate.md §43 reconciled. **Verified read-only against the captured failing
+artifacts** (`orch_20260625T141819Z_2692801d` → pipeline `demo-dep-base_20260625_001` run
+`run_20260625_001`): the previously-failing `post_execute` gate now returns **PASS**. Unit test added
+(`test_validate_pipeline_semantics.py::...::test_snapshot_state_variables_scoped_to_per_case_evidence`:
+guard case excused / valid case still flagged when it omits `y`); suite green (1592).
+
+**Not yet done:** the billed dev `--with-deps` re-run to confirm `demo_dep_base` reaches
+`aggregate_verdict=pass` AND the target `demo_dep_top` then completes the D1/D2 dependency path
+end-to-end (the original outstanding verification — now unblocked by this fix, deferred pending operator
+go-ahead for another billed run).
+
 ## L (latent / low severity — fix opportunistically)
 - **L1 — DONE (2026-06-25).** Generated Makefile emitted a harmless `make` warning
   `target '.' given more than once` for the `$(OBJDIR) $(BINDIR):` rule when `OBJDIR==BINDIR=="."`.

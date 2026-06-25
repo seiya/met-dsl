@@ -951,6 +951,207 @@ end program shallow_water2d_runner
             required = _required_raw_evidence(repo_root, execution)
             self.assertIn("execution_trace.json", required)
 
+    def test_snapshot_state_variables_scoped_to_per_case_evidence(self) -> None:
+        """A state_snapshot file is only required to carry the raw variables its
+        own case's test declares in io_contract.test_evidence_requirements, not
+        the global union of declared variables.
+
+        Motivating case (demo_dep_base, billed E2E 2026-06-25): an input-guard
+        rejection case (n <= 0) produces no output state, so its snapshot
+        legitimately carries only the rejected input `x` and omits the output
+        `y`. The IR correctly scopes that case to required_raw_variables=[x],
+        yet the post_execute completeness gate demanded {x, y} in *every*
+        snapshot and falsely failed validate.execute. This asserts:
+          (a) the guard case (y-less) does NOT raise 'declared state_variables
+              missing' now that the gate honors per-case evidence;
+          (b) strictness is preserved: a *valid* case that needs y but omits it
+              still raises the missing-variable violation.
+        """
+        for omit_y_from_valid_case in (False, True):
+            with tempfile.TemporaryDirectory() as tmp:
+                repo_root = Path(tmp)
+                node_safe = "component__demo_scope__0.1.0"
+                ir_ref = f"workspace/ir/{node_safe}/demo-scope_20260625_001"
+                pipeline_dir = (
+                    repo_root / "workspace" / "pipelines" / node_safe
+                    / "demo-scope_20260625_001"
+                )
+                ir_dir = repo_root / ir_ref
+                pipeline_dir.mkdir(parents=True, exist_ok=True)
+                ir_dir.mkdir(parents=True, exist_ok=True)
+                _write_json(pipeline_dir / "lineage.json", {"ir_ref": ir_ref})
+
+                schema = {
+                    "variables": [
+                        {"name": "x", "shape_expr": "[n]"},
+                        {"name": "y", "shape_expr": "[n]"},
+                    ],
+                    "time_variable": "snapshot_index",
+                    "time_shape_expr": "scalar",
+                }
+                _write_json(
+                    ir_dir / "spec.ir.yaml",
+                    {
+                        "case": {
+                            "test_case_set": [
+                                {"case_id": "c_valid", "test_id": "t_valid"},
+                                {"case_id": "c_guard", "test_id": "t_guard"},
+                            ]
+                        },
+                        "io_contract": {
+                            "inputs": [{"name": "x", "shape_expr": "[n]"}],
+                            "outputs": [{"name": "y", "shape_expr": "[n]"}],
+                            "raw_requirements": {
+                                "required_evidence": [
+                                    {
+                                        "artifact": "state_snapshots",
+                                        "required": True,
+                                        "min_samples": 1,
+                                        "schema": schema,
+                                    }
+                                ]
+                            },
+                            "test_evidence_requirements": [
+                                {
+                                    "test_id": "t_valid",
+                                    "required_raw_variables": ["x", "y"],
+                                },
+                                {
+                                    "test_id": "t_guard",
+                                    "required_raw_variables": ["x"],
+                                },
+                            ],
+                        },
+                    },
+                )
+
+                node_dir = pipeline_dir / "runs" / "run_test_001" / node_safe
+                snapshots_dir = node_dir / "raw" / "state_snapshots"
+                snapshots_dir.mkdir(parents=True, exist_ok=True)
+                _write_json(snapshots_dir / "snapshot_schema.json", {
+                    **schema,
+                    "min_samples": 1,
+                    "samples": ["c_valid.json", "c_guard.json"],
+                })
+                valid_case = {"snapshot_index": 0, "case_id": "c_valid",
+                              "x": [1.0, 2.0, 3.0]}
+                if not omit_y_from_valid_case:
+                    valid_case["y"] = [2.0, 4.0, 6.0]
+                _write_json(snapshots_dir / "c_valid.json", valid_case)
+                # Guard (rejection) case: only the rejected input, no output y.
+                _write_json(snapshots_dir / "c_guard.json",
+                            {"snapshot_index": 1, "case_id": "c_guard", "x": []})
+
+                execution = NodeExecution(
+                    node_key="component/demo_scope@0.1.0",
+                    node_dir=node_dir,
+                    exec_dir=pipeline_dir / "runs" / "run_test_001",
+                    pipeline_dir=pipeline_dir,
+                )
+                violations: list[str] = []
+                vps._validate_raw_evidence(repo_root, execution, violations)
+
+                missing_state = [
+                    v for v in violations
+                    if "declared state_variables missing in snapshot files" in v
+                ]
+                # The guard case must never be flagged for the absent output y.
+                self.assertFalse(
+                    any("c_guard.json" in v for v in missing_state),
+                    f"guard case wrongly flagged; got: {missing_state}",
+                )
+                if omit_y_from_valid_case:
+                    # (b) strictness preserved: the valid case needs y.
+                    self.assertTrue(
+                        any("c_valid.json" in v for v in missing_state),
+                        f"valid case missing y should be flagged; got: {violations}",
+                    )
+                else:
+                    # (a) fully-formed run is clean of the completeness violation.
+                    self.assertFalse(
+                        missing_state,
+                        f"unexpected missing-state violation; got: {missing_state}",
+                    )
+
+    def test_snapshot_completeness_falls_back_to_strict_union_without_per_test_contract(self) -> None:
+        """Backward-compat: when the IR carries no per-test evidence scoping
+        (`io_contract.test_evidence_requirements`) and/or no `case.test_case_set`
+        mapping, the snapshot completeness gate falls back to requiring EVERY
+        declared schema variable in every snapshot file. A snapshot omitting a
+        declared variable must still be flagged — the per-case fix must not
+        silently weaken the gate for specs that don't declare per-test evidence.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            node_safe = "component__demo_strict__0.1.0"
+            ir_ref = f"workspace/ir/{node_safe}/demo-strict_20260625_001"
+            pipeline_dir = (
+                repo_root / "workspace" / "pipelines" / node_safe
+                / "demo-strict_20260625_001"
+            )
+            ir_dir = repo_root / ir_ref
+            pipeline_dir.mkdir(parents=True, exist_ok=True)
+            ir_dir.mkdir(parents=True, exist_ok=True)
+            _write_json(pipeline_dir / "lineage.json", {"ir_ref": ir_ref})
+
+            schema = {
+                "variables": [
+                    {"name": "x", "shape_expr": "[n]"},
+                    {"name": "y", "shape_expr": "[n]"},
+                ],
+                "time_variable": "snapshot_index",
+                "time_shape_expr": "scalar",
+            }
+            # No `case` section and no `test_evidence_requirements` -> no per-case
+            # scoping is resolvable, so the strict union {x, y} applies.
+            _write_json(
+                ir_dir / "spec.ir.yaml",
+                {
+                    "io_contract": {
+                        "inputs": [{"name": "x", "shape_expr": "[n]"}],
+                        "outputs": [{"name": "y", "shape_expr": "[n]"}],
+                        "raw_requirements": {
+                            "required_evidence": [
+                                {
+                                    "artifact": "state_snapshots",
+                                    "required": True,
+                                    "min_samples": 1,
+                                    "schema": schema,
+                                }
+                            ]
+                        },
+                    },
+                },
+            )
+
+            node_dir = pipeline_dir / "runs" / "run_test_001" / node_safe
+            snapshots_dir = node_dir / "raw" / "state_snapshots"
+            snapshots_dir.mkdir(parents=True, exist_ok=True)
+            _write_json(snapshots_dir / "snapshot_schema.json", {
+                **schema, "min_samples": 1, "samples": ["c_only.json"],
+            })
+            # Snapshot omits the declared output `y`.
+            _write_json(snapshots_dir / "c_only.json",
+                        {"snapshot_index": 0, "case_id": "c_only", "x": [1.0]})
+
+            execution = NodeExecution(
+                node_key="component/demo_strict@0.1.0",
+                node_dir=node_dir,
+                exec_dir=pipeline_dir / "runs" / "run_test_001",
+                pipeline_dir=pipeline_dir,
+            )
+            violations: list[str] = []
+            vps._validate_raw_evidence(repo_root, execution, violations)
+
+            self.assertTrue(
+                any(
+                    "declared state_variables missing in snapshot files" in v
+                    and "c_only.json" in v
+                    for v in violations
+                ),
+                f"strict fallback should flag the absent y; got: {violations}",
+            )
+
     def test_post_execute_run_id_scope_requires_every_pipeline_root(self) -> None:
         """With repeated --pipeline-root, --run-id scoping must fail when any
         requested root lacks an execution for the requested run, instead of
