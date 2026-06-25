@@ -9,12 +9,11 @@ import os
 import re
 import shlex
 import sys
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from tools.hooks.adapters import ClaudeHookAdapter, CodexHookAdapter
-from tools.hooks.codex_feature import codex_hooks_feature_enabled
+from tools.hooks.codex_feature import read_codex_feature_cache
 from tools.hooks.common import (
     HookDecision,
     HookDecisionAction,
@@ -276,95 +275,6 @@ def _resolve_repo_root(payload: dict[str, Any], backend: str = "") -> Path:
         if isinstance(repo_root_raw, str) and repo_root_raw.strip()
         else Path.cwd()
     )
-
-
-def _codex_feature_cache_path(
-    *,
-    repo_root: Path,
-    orchestration_id: str,
-) -> Path:
-    return (
-        repo_root
-        / "workspace"
-        / "orchestrations"
-        / orchestration_id
-        / "hooks"
-        / "codex_feature_check.json"
-    )
-
-
-def _read_codex_feature_cache(
-    *,
-    repo_root: Path,
-    orchestration_id: str,
-) -> tuple[bool, str, str, str] | None:
-    path = _codex_feature_cache_path(repo_root=repo_root, orchestration_id=orchestration_id)
-    if not path.is_file():
-        return None
-    try:
-        doc = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return None
-    if not isinstance(doc, dict):
-        return None
-    enabled = doc.get("enabled")
-    detail = doc.get("detail")
-    status_kind = doc.get("status_kind")
-    checked_at = doc.get("checked_at")
-    if not isinstance(enabled, bool):
-        raise ValueError("codex_feature_check.json enabled must be bool")
-    if not isinstance(detail, str):
-        raise ValueError("codex_feature_check.json detail must be string")
-    if not isinstance(status_kind, str):
-        raise ValueError("codex_feature_check.json status_kind must be string")
-    if not isinstance(checked_at, str):
-        raise ValueError("codex_feature_check.json checked_at must be string")
-    return (enabled, detail, status_kind, checked_at)
-
-
-def _write_codex_feature_cache(
-    *,
-    repo_root: Path,
-    orchestration_id: str,
-    enabled: bool,
-    detail: str,
-    status_kind: str,
-) -> None:
-    path = _codex_feature_cache_path(repo_root=repo_root, orchestration_id=orchestration_id)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    doc = {
-        "checked_at": _utc_now_iso(),
-        "enabled": enabled,
-        "detail": detail,
-        "status_kind": status_kind,
-    }
-    path.write_text(json.dumps(doc, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-
-
-def _is_retryable_probe_error(detail: str) -> bool:
-    return detail.startswith("codex features list failed:") or detail.startswith(
-        "codex features list timed out"
-    )
-
-
-def _is_recent_iso_timestamp(ts: str, ttl_seconds: int) -> bool:
-    try:
-        checked = datetime.fromisoformat(ts.replace("Z", "+00:00"))
-    except ValueError:
-        return False
-    now = datetime.now(timezone.utc)
-    return (now - checked).total_seconds() <= float(ttl_seconds)
-
-
-def _safe_retry_ttl_seconds() -> int:
-    raw = os.environ.get("METDSL_HOOK_FEATURE_RETRY_TTL_SECONDS", "30").strip()
-    try:
-        ttl = int(raw or "30")
-    except ValueError:
-        ttl = 30
-    if ttl < 0:
-        return 0
-    return ttl
 
 
 def _env_flag_true(name: str, default: str = "0") -> bool:
@@ -1198,35 +1108,30 @@ def main(argv: list[str] | None = None) -> int:
         if args.backend == "codex":
             require_flag = os.environ.get("METDSL_REQUIRE_CODEX_HOOKS_FEATURE", "1").strip().lower()
             if require_flag not in {"0", "false", "no"}:
-                cached = _read_codex_feature_cache(
-                    repo_root=repo_root,
-                    orchestration_id=orchestration_id,
-                )
-                recache = False
-                if cached is None:
-                    recache = True
-                else:
-                    cached_enabled, cached_detail, cached_kind, cached_checked_at = cached
-                    if (
-                        cached_enabled is False
-                        and cached_kind == "probe_error"
-                        and isinstance(cached_checked_at, str)
-                    ):
-                        retry_ttl = _safe_retry_ttl_seconds()
-                        if not _is_recent_iso_timestamp(cached_checked_at, retry_ttl):
-                            recache = True
-                if recache:
-                    enabled, detail = codex_hooks_feature_enabled()
-                    status_kind = "ok" if enabled or not _is_retryable_probe_error(detail) else "probe_error"
-                    _write_codex_feature_cache(
+                # Read-only: the codex-hooks feature is probed HOST-side by the conductor
+                # (Conductor._ensure_codex_feature_cache) and written to a cache at the
+                # orchestration-dir root, which is read-only inside the bwrap sandbox. The
+                # hook never probes or writes — a confined leaf must not be able to forge
+                # `enabled=true` (the cache used to live in the leaf-writable hooks/ dir).
+                # A missing/invalid/disabled cache fail-closes: under mandatory bwrap a
+                # codex leaf is only launched after the host wrote the cache, so absence
+                # means the host did not certify the feature (or the file was tampered).
+                try:
+                    cached = read_codex_feature_cache(
                         repo_root=repo_root,
                         orchestration_id=orchestration_id,
-                        enabled=enabled,
-                        detail=detail,
-                        status_kind=status_kind,
                     )
+                except ValueError as exc:
+                    cached = None
+                    detail = f"codex feature cache malformed: {exc}"
                 else:
-                    enabled, detail = cached_enabled, cached_detail
+                    detail = (
+                        "codex feature cache missing (host did not certify the hooks "
+                        "feature for this orchestration)"
+                        if cached is None
+                        else cached[1]
+                    )
+                enabled = bool(cached[0]) if cached is not None else False
                 if not enabled:
                     decision = _decision_error(
                         "hooks feature is required but not enabled: " + detail

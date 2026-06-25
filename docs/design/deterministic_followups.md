@@ -297,15 +297,18 @@ Note: the demo `tests.md` xfail wording was ALSO clarified (2026-06-25) so the r
 was NOT the blocker (this DAG-scope check is). Both E2E runs failed here.
 
 ## L (latent / low severity — fix opportunistically)
-- **L1** Generated Makefile emits a harmless `make` warning `target '.' given more than once`
-  for the `$(OBJDIR) $(BINDIR):` rule when `OBJDIR==BINDIR=="."` (local in-source `make`
-  only; exit 0; not on Build/Validate which pass distinct dirs). Cosmetic; in the conductor
-  template (`_write_makefile`) and prior LLM templates alike. Could split into two rules.
+- **L1 — DONE (2026-06-25).** Generated Makefile emitted a harmless `make` warning
+  `target '.' given more than once` for the `$(OBJDIR) $(BINDIR):` rule when `OBJDIR==BINDIR=="."`.
+  Fixed in `_write_makefile` by wrapping the target list in GNU make `$(sort $(OBJDIR) $(BINDIR)):`
+  which dedups (collapses to one target when equal; two when distinct) — no warning, single rule.
+  Test: `test_authors_makefile_for_leaf_node`.
 - **L2** The C1 scalar gate assumes the per-snapshot time index is always scalar; a future
   spec needing a vector per-file time dimension would need a carve-out
   (`validate_pipeline_semantics._validate_io_contract_file`).
-- **L3** C2 escalation threshold is hardcoded `2` (`workflow_conductor.classify_failure`);
-  tune if it proves too eager/lazy in practice.
+- **L3 — DONE (2026-06-25).** C2 escalation threshold was the bare literal `2` in
+  `workflow_conductor.classify_failure`; extracted to the named module constant
+  `C2_EXECUTE_FAIL_ESCALATION_THRESHOLD = 2` (near `MAX_ATTEMPTS_PER_PHASE`) for tunability.
+  Behavior unchanged; covered by `test_recurring_execute_failure_escalates_to_compile`.
 - **L4** `_impl_is_leaf_node` disagrees with the YAML parser only for **invalid** YAML
   (tab-indented `direct_deps`) — benign/unreachable (fails compile), not worth fixing.
 - **L5** A judge session/usage-limit now ends as a clean resumable `fail_closed`
@@ -327,13 +330,17 @@ was NOT the blocker (this DAG-scope check is). Both E2E runs failed here.
   larger change, deferred until a multi-version/diamond closure is actually required). Test:
   `test_dependency_closure_raises_on_spec_id_basename_collision`.
 
-## T1 — testing gap (minor)
+## T1 — testing gap (PARTIALLY CLOSED 2026-06-25)
 The transport+resume path is covered by two unit layers (conductor routing in
 `test_workflow_conductor.py::TransportFailureTest`; runtime helper + completion exemption in
-`test_orchestration_runtime.py::TransportOrphanCompletionTest`). There is **no single
-end-to-end fault-injection integration test** driving the real conductor → runtime CLI →
-completion check; the conductor→CLI seam is covered only by a smoke check. Add one if the
-seam changes.
+`test_orchestration_runtime.py::TransportOrphanCompletionTest`). **Added
+`test_workflow_conductor.py::TransportTombstoneRealCliTest`** — drives the **real**
+`Conductor.runtime()` subprocess (symlinks the real `tools/` into a temp repo) calling the actual
+`add-superseded-runs` CLI and asserts the persisted superseded set via `_load_superseded_run_ids`
+(the exact reader the completion check consults) + idempotency. This closes the conductor→CLI seam
+that was previously only smoke-tested. Deliberately narrowed to the tombstone seam: the full
+conduct→judge→resume loop (seeding a node to `validate.judge`) is still covered only by the unit
+layers — extend to the full loop if that seam changes.
 
 ## F1 — dev-mode retry scoping: stop on phase rollback, auto-retry only within a phase (DONE 2026-06-25)
 > Ready-to-paste starter prompt (begins in plan mode): `docs/design/dev_mode_retry_scoping_followup_prompt.md`.

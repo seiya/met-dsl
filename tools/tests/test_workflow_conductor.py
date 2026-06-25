@@ -1614,6 +1614,11 @@ class WriteMakefileTest(unittest.TestCase):
                 text)
             # recipe lines must be tab-indented
             self.assertIn("\n\t$(FC) $(FFLAGS) -c $(MODEL_SRC)", text)
+            # L1: the dir rule dedups its targets via $(sort ...) so OBJDIR==BINDIR=="."
+            # (in-source make) collapses to one target — no `target '.' given more than
+            # once` warning. The bare two-target form must not appear.
+            self.assertIn("$(sort $(OBJDIR) $(BINDIR)):", text)
+            self.assertNotIn("\n$(OBJDIR) $(BINDIR):", text)
 
     def test_authored_makefile_passes_post_generate_validators(self) -> None:
         from tools.validate_pipeline_semantics import (
@@ -2370,6 +2375,167 @@ class ExecutePromoterTest(unittest.TestCase):
                        "cases": [{"case_id": "a", "verdict": {"overall": "fail"}}]}
             status2 = c._author_quality_check(node, run_diag, qc_diag, "R", "Q", "make_test", 1)
             self.assertEqual(status2, "fail")
+
+
+class TransportTombstoneRealCliTest(unittest.TestCase):
+    """T1: integration coverage of the conductor -> REAL runtime CLI -> completion-exemption
+    seam for the leaf-transport tombstone. The unit layers stub `runtime()`
+    (`TransportFailureTest`) or call the runtime helper in-process
+    (`test_orchestration_runtime.TransportOrphanCompletionTest`); this drives the actual
+    `Conductor.runtime()` subprocess against a real `orchestration_runtime.py` and asserts the
+    persisted superseded set is what the completion check consults via `_load_superseded_run_ids`.
+    """
+
+    def _repo_with_real_tools(self, tmp: str) -> Path:
+        # Symlink the real tools/ into the temp repo so `runtime()` (cwd=repo_root,
+        # `python3 tools/orchestration_runtime.py`) resolves the real script while all
+        # orchestration state (`--repo-root .`) lives under the temp repo. The script's
+        # imports resolve via the symlink target (real repo), so nothing leaks into the
+        # real workspace.
+        repo = Path(tmp)
+        real_tools = Path(wc.__file__).resolve().parent
+        os.symlink(real_tools, repo / "tools")
+        return repo
+
+    def test_add_superseded_runs_persists_via_real_cli_and_is_idempotent(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = self._repo_with_real_tools(tmp)
+            oid = "orch_t1"
+            (repo / "workspace" / "orchestrations" / oid).mkdir(parents=True)
+            c = wc.Conductor(repo_root=repo, orchestration_id=oid,
+                             orchestration_agent_run_id="ORCH", backend="claude",
+                             env=os.environ.copy())
+            # the conductor shells out to the REAL add-superseded-runs CLI
+            c._add_superseded_run_ids(
+                ["child-1", "child-2"],
+                reason="leaf_transport_error_orphan: leaf_exit=1")
+            # the exact reader the completion check consults sees both orphans tombstoned
+            from tools.orchestration_runtime import _load_superseded_run_ids
+            self.assertEqual(
+                _load_superseded_run_ids(repo, oid), {"child-1", "child-2"})
+            # idempotent: re-tombstoning the same ids does not duplicate/lose them
+            c._add_superseded_run_ids(["child-2"], reason="leaf_transport_error_orphan: leaf_exit=1")
+            self.assertEqual(
+                _load_superseded_run_ids(repo, oid), {"child-1", "child-2"})
+
+
+class CodexFeatureCacheTest(unittest.TestCase):
+    """The conductor host-certifies the codex hooks feature into a leaf-unwritable cache
+    (orchestration-dir root) before launching codex leaves, so the in-sandbox hook reads a
+    value it cannot forge. No-op for claude; probed once per orchestration."""
+
+    def _conductor(self, repo: Path, backend: str, llm_command: str = "",
+                   env: dict | None = None) -> wc.Conductor:
+        return wc.Conductor(repo_root=repo, orchestration_id="orch_cfc",
+                            orchestration_agent_run_id="ORCH", backend=backend,
+                            env=env if env is not None else {}, llm_command=llm_command)
+
+    def test_codex_probes_once_and_writes_unwritable_cache(self) -> None:
+        from unittest.mock import patch
+        from tools.hooks.codex_feature import codex_feature_cache_path
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            (repo / "workspace" / "orchestrations" / "orch_cfc").mkdir(parents=True)
+            c = self._conductor(repo, "codex")
+            with patch("tools.hooks.codex_feature.codex_hooks_feature_enabled",
+                       return_value=(True, "hooks=true")) as probe:
+                c._ensure_codex_feature_cache()
+                c._ensure_codex_feature_cache()  # memoized -> still one probe
+            self.assertEqual(probe.call_count, 1)
+            # bare backend -> probe the bare `codex` executable
+            self.assertEqual(probe.call_args.kwargs["command"], ["codex"])
+            path = codex_feature_cache_path(repo_root=repo, orchestration_id="orch_cfc")
+            self.assertTrue(path.is_file())
+            # the cache must NOT live under the leaf-writable hooks/ (or audit/) bind
+            self.assertNotIn("/hooks/", str(path))
+            self.assertNotIn("/audit/", str(path))
+            doc = json.loads(path.read_text(encoding="utf-8"))
+            self.assertIs(doc["enabled"], True)
+
+    def test_codex_probe_uses_custom_llm_command(self) -> None:
+        # A custom --llm-command wrapper must be probed verbatim (same prefix the leaf
+        # runs via leaf_command), not the hardcoded `codex` — else the host certifies a
+        # different executable than the leaf will use.
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            (repo / "workspace" / "orchestrations" / "orch_cfc").mkdir(parents=True)
+            c = self._conductor(repo, "codex", llm_command="codexwrap --profile x")
+            with patch("tools.hooks.codex_feature.codex_hooks_feature_enabled",
+                       return_value=(True, "hooks=true")) as probe:
+                c._ensure_codex_feature_cache()
+            self.assertEqual(probe.call_args.kwargs["command"], ["codexwrap", "--profile", "x"])
+
+    def test_codex_fails_closed_when_hooks_not_certified(self) -> None:
+        # hooks=false / probe error → the leaf's hooks would not fire, so the in-sandbox
+        # fail-closed read never happens. The conductor must fail closed BEFORE launch
+        # (SandboxEnforcementError → conduct terminalizes as sandbox_enforcement_violation),
+        # and must NOT memoize (so a retry cannot degrade into an allow).
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            (repo / "workspace" / "orchestrations" / "orch_cfc").mkdir(parents=True)
+            c = self._conductor(repo, "codex")
+            with patch("tools.hooks.codex_feature.codex_hooks_feature_enabled",
+                       return_value=(False, "hooks=false")):
+                with self.assertRaises(wc.SandboxEnforcementError):
+                    c._ensure_codex_feature_cache()
+            self.assertFalse(getattr(c, "_codex_feature_cache_written", False))
+
+    def test_certification_fails_closed_before_record_launch(self) -> None:
+        # The cert runs at the top of run_substep, BEFORE record_launch — so a fail-closed
+        # cert never orphans a recorded launch (phantom child_running active run).
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            (repo / "workspace" / "orchestrations" / "orch_cfc").mkdir(parents=True)
+            c = self._conductor(repo, "codex")
+
+            def _boom_record_launch(*a, **k):
+                raise AssertionError("record_launch ran before codex cert")
+
+            c.record_launch = _boom_record_launch  # type: ignore[assignment]
+            refs = wc.NodeRefs(
+                node_key="component/x@0.1.0", spec_path="spec/component/x",
+                ir_id="i", pipeline_id="p", source_id="s", binary_id="b",
+                run_id="r", source_binary_id="b")
+            with patch("tools.hooks.codex_feature.codex_hooks_feature_enabled",
+                       return_value=(False, "hooks=false")):
+                # SandboxEnforcementError (cert), NOT AssertionError (record_launch) —
+                # proves the cert short-circuits before the launch is recorded.
+                with self.assertRaises(wc.SandboxEnforcementError):
+                    c.run_substep(refs, "compile", "generate")
+
+    def test_codex_disabled_requirement_opt_out_does_not_fail_closed(self) -> None:
+        # With METDSL_REQUIRE_CODEX_HOOKS_FEATURE=0 (same opt-out the hook honours), an
+        # uncertified feature is recorded but does NOT fail closed.
+        from unittest.mock import patch
+        from tools.hooks.codex_feature import codex_feature_cache_path
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            (repo / "workspace" / "orchestrations" / "orch_cfc").mkdir(parents=True)
+            c = self._conductor(repo, "codex",
+                                env={"METDSL_REQUIRE_CODEX_HOOKS_FEATURE": "0"})
+            with patch("tools.hooks.codex_feature.codex_hooks_feature_enabled",
+                       return_value=(False, "hooks=false")):
+                c._ensure_codex_feature_cache()  # no raise
+            self.assertTrue(getattr(c, "_codex_feature_cache_written", False))
+            doc = json.loads(codex_feature_cache_path(
+                repo_root=repo, orchestration_id="orch_cfc").read_text(encoding="utf-8"))
+            self.assertIs(doc["enabled"], False)
+
+    def test_claude_backend_is_noop(self) -> None:
+        from unittest.mock import patch
+        from tools.hooks.codex_feature import codex_feature_cache_path
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            (repo / "workspace" / "orchestrations" / "orch_cfc").mkdir(parents=True)
+            c = self._conductor(repo, "claude")
+            with patch("tools.hooks.codex_feature.codex_hooks_feature_enabled",
+                       side_effect=AssertionError("claude must not probe codex")):
+                c._ensure_codex_feature_cache()
+            path = codex_feature_cache_path(repo_root=repo, orchestration_id="orch_cfc")
+            self.assertFalse(path.is_file())
 
 
 if __name__ == "__main__":  # pragma: no cover

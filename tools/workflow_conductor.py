@@ -140,6 +140,12 @@ VALIDATE_JUDGE_ROUTING: dict[tuple[str, str], tuple[str, str | None]] = {
 # spin forever; matches the operator-observed ceiling of ~3 reopens.
 MAX_ATTEMPTS_PER_PHASE = 3
 
+# C2 backstop: after this many consecutive execute (no-verdict) failures on a node, a
+# Generate restart is deemed unable to fix the (IR-rooted) structural mismatch, so the
+# defect is reattributed to the IR and Compile is reopened instead of looping Generate.
+# Kept < MAX_ATTEMPTS_PER_PHASE so the escalation fires within the attempt budget.
+C2_EXECUTE_FAIL_ESCALATION_THRESHOLD = 2
+
 
 @dataclass(frozen=True)
 class RouteDecision:
@@ -675,6 +681,46 @@ class Conductor:
         method is retained as a single seam for the call sites; it always returns True."""
         return True
 
+    def _ensure_codex_feature_cache(self) -> None:
+        """Host-side: probe the codex hooks feature ONCE per orchestration and persist the
+        result to the leaf-unwritable cache (orchestration-dir root, RO inside the bwrap
+        sandbox), so the in-sandbox codex hook reads a host-certified value it cannot
+        forge. No-op for non-codex backends and after the first call (memoized). The probe
+        runs the SAME command prefix the leaf runs (`leaf_command`'s `base` — a custom
+        `--llm-command` wrapper, else the bare backend), so it certifies the executable the
+        leaf will actually use, not a hardcoded `codex`. A leaf can never write this cache
+        (the prior design wrote it from the in-sandbox hook into the leaf-writable hooks/
+        dir).
+
+        Fails closed when the feature is NOT certified (hooks disabled or the probe errored)
+        and the requirement is on: a codex leaf whose PreToolUse/PostToolUse file-access
+        hooks would not fire must not launch at all — the in-sandbox gate fail-closes only if
+        the hook actually runs, which it does not when the hooks feature is off, so recording
+        a disabled cache without blocking would leave the leaf unguarded by the hook layer.
+        Honours the same `METDSL_REQUIRE_CODEX_HOOKS_FEATURE` opt-out the hook does."""
+        if self.backend != "codex":
+            return
+        if getattr(self, "_codex_feature_cache_written", False):
+            return
+        from tools.hooks.codex_feature import probe_and_write_codex_feature_cache
+        # Mirror leaf_command()/_readonly_sandbox_profile: the leaf's invocation prefix is
+        # the parsed llm_command (with any wrapper flags), else the bare backend.
+        command = shlex.split(self.llm_command) if self.llm_command.strip() else [self.backend]
+        enabled, detail = probe_and_write_codex_feature_cache(
+            repo_root=self.repo_root, orchestration_id=self.orchestration_id,
+            command=command or [self.backend])
+        # Read the requirement from self.env (the same env the leaf's hook inherits via
+        # _child_env), defaulting to required — matches the hook's gate semantics.
+        require_raw = self.env.get("METDSL_REQUIRE_CODEX_HOOKS_FEATURE", "1").strip().lower()
+        hooks_required = require_raw not in {"0", "false", "no"}
+        if hooks_required and not enabled:
+            # Fail closed BEFORE memoizing, so this never degrades into an allow on a retry.
+            raise SandboxEnforcementError(
+                f"codex hooks feature not certified for orchestration "
+                f"{self.orchestration_id} ({detail}); refusing to launch a codex leaf whose "
+                "file-access hooks would not fire (fail-closed)")
+        self._codex_feature_cache_written = True
+
     def _sandbox_profile_for(self, child_arid: str) -> dict[str, Any] | None:
         """The bwrap profile record-launch wrote for this child, or None."""
         path = (self.repo_root / "workspace" / "orchestrations" / self.orchestration_id
@@ -718,6 +764,10 @@ class Conductor:
         child_arid: str | None = None,
         profile: dict[str, Any] | None = None,
     ) -> ProcResult:
+        # Host-certify the codex hooks feature into the leaf-unwritable cache before the
+        # codex leaf launches (the in-sandbox hook reads it read-only; see
+        # _ensure_codex_feature_cache). Memoized; no-op for claude.
+        self._ensure_codex_feature_cache()
         argv = self.leaf_command(
             prompt_text, session_id=session_id, resume_session_id=resume_session_id)
         # Wrap the leaf in the bwrap sandbox that record-launch already built (repo
@@ -1029,7 +1079,10 @@ $(RUNNER_OBJ): $(RUNNER_SRC) $(MODEL_OBJ) | $(OBJDIR)
 $(BINDIR)/$(BIN): {link_dep_prereq}$(MODEL_OBJ) $(RUNNER_OBJ) | $(BINDIR)
 \t$(FC) $(FFLAGS) {link_dep_prereq}$(MODEL_OBJ) $(RUNNER_OBJ) -o $(BINDIR)/$(BIN)
 
-$(OBJDIR) $(BINDIR):
+# $(sort ...) dedups the target list: when OBJDIR==BINDIR (in-source make, both ".")
+# it collapses to a single target, avoiding the harmless `target '.' given more than
+# once` warning (and without two recipes for the same target).
+$(sort $(OBJDIR) $(BINDIR)):
 \tmkdir -p $@
 
 test:
@@ -1826,6 +1879,13 @@ clean:
 
     def run_substep(self, refs: NodeRefs, phase: str, substep: str | None,
                     repair: dict[str, str] | None = None) -> SubstepOutcome:
+        # Certify the codex hooks feature BEFORE record_launch: this can fail closed
+        # (SandboxEnforcementError) when the feature is uncertified, and doing it here —
+        # ahead of allocating an arid / recording a durable launch — avoids orphaning a
+        # recorded launch (phantom `child_running` active run) on that fail-closed path.
+        # Memoized per orchestration (no-op after the first); spawn_leaf also calls it as a
+        # safety net for the record-launch-less diagnostician leaf.
+        self._ensure_codex_feature_cache()
         child_arid = self.new_agent_run_id()
         request = build_launch_request(
             refs, step=phase, substep=substep,
@@ -2173,7 +2233,7 @@ clean:
                 if not hasattr(self, "_validate_execute_fail_count"):
                     self._validate_execute_fail_count: dict[str, int] = {}
                 count = self._validate_execute_fail_count.get(refs.node_key, 0) + 1
-                if count >= 2:
+                if count >= C2_EXECUTE_FAIL_ESCALATION_THRESHOLD:
                     self._validate_execute_fail_count[refs.node_key] = 0
                     return RouteDecision("reopen", target_phase="compile",
                                          reason="validate_execute_fail_ir")

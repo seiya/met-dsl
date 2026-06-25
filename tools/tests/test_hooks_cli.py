@@ -14,7 +14,10 @@ from pathlib import Path
 from unittest.mock import patch
 
 from tools.hooks import cli
-from tools.hooks.codex_feature import DEFAULT_FEATURE_PROBE_TIMEOUT_SECONDS
+from tools.hooks.codex_feature import (
+    codex_feature_cache_path,
+    write_codex_feature_cache,
+)
 
 
 class HookCliTests(unittest.TestCase):
@@ -35,10 +38,6 @@ class HookCliTests(unittest.TestCase):
         body = json.loads(json_lines[-1])
         assert isinstance(body, dict)
         assert body.get("decision") == "allow"
-
-    @staticmethod
-    def _timeout_detail() -> str:
-        return f"codex features list timed out after {DEFAULT_FEATURE_PROBE_TIMEOUT_SECONDS:.1f}s"
 
     def test_subprocess_command_works_with_module_entrypoint(self) -> None:
         repo_root = Path(__file__).resolve().parents[2]
@@ -163,8 +162,8 @@ class HookCliTests(unittest.TestCase):
     def test_blocks_when_codex_hooks_feature_disabled(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
-            with patch("tools.hooks.cli.codex_hooks_feature_enabled") as feature_mock:
-                feature_mock.side_effect = lambda: (False, "hooks=false")
+            with patch("tools.hooks.cli.read_codex_feature_cache") as feature_mock:
+                feature_mock.return_value = (False, "hooks=false", "ok", "2026-01-01T00:00:00Z")
                 payload = {
                     "orchestration_id": "orch_disabled_002",
                     "repo_root": str(repo_root),
@@ -189,8 +188,8 @@ class HookCliTests(unittest.TestCase):
     def test_feature_disabled_path_writes_audit_log(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
-            with patch("tools.hooks.cli.codex_hooks_feature_enabled") as feature_mock:
-                feature_mock.return_value = (False, "hooks=false")
+            with patch("tools.hooks.cli.read_codex_feature_cache") as feature_mock:
+                feature_mock.return_value = (False, "hooks=false", "ok", "2026-01-01T00:00:00Z")
                 payload = {
                     "orchestration_id": "orch_disabled_001",
                     "repo_root": str(repo_root),
@@ -250,8 +249,8 @@ class HookCliTests(unittest.TestCase):
     def test_blocks_dangerous_command(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
-            with patch("tools.hooks.cli.codex_hooks_feature_enabled") as feature_mock:
-                feature_mock.return_value = (True, "hooks=true")
+            with patch("tools.hooks.cli.read_codex_feature_cache") as feature_mock:
+                feature_mock.return_value = (True, "hooks=true", "ok", "2026-01-01T00:00:00Z")
                 payload = {
                     "orchestration_id": "orch_block_001",
                     "repo_root": str(repo_root),
@@ -316,8 +315,8 @@ class HookCliTests(unittest.TestCase):
     def test_allows_non_dangerous_command(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
-            with patch("tools.hooks.cli.codex_hooks_feature_enabled") as feature_mock:
-                feature_mock.return_value = (True, "hooks=true")
+            with patch("tools.hooks.cli.read_codex_feature_cache") as feature_mock:
+                feature_mock.return_value = (True, "hooks=true", "ok", "2026-01-01T00:00:00Z")
                 payload = {
                     "orchestration_id": "orch_allow_001",
                     "repo_root": str(repo_root),
@@ -342,8 +341,8 @@ class HookCliTests(unittest.TestCase):
     def test_dev_mode_blocks_verify_bypass_flags(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
-            with patch("tools.hooks.cli.codex_hooks_feature_enabled") as feature_mock:
-                feature_mock.return_value = (True, "hooks=true")
+            with patch("tools.hooks.cli.read_codex_feature_cache") as feature_mock:
+                feature_mock.return_value = (True, "hooks=true", "ok", "2026-01-01T00:00:00Z")
                 payload = {
                     "orchestration_id": "orch_dev_policy_001",
                     "repo_root": str(repo_root),
@@ -376,8 +375,8 @@ class HookCliTests(unittest.TestCase):
     def test_unset_workflow_mode_defaults_to_dev_and_blocks_verify_bypass_flags(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
-            with patch("tools.hooks.cli.codex_hooks_feature_enabled") as feature_mock:
-                feature_mock.return_value = (True, "hooks=true")
+            with patch("tools.hooks.cli.read_codex_feature_cache") as feature_mock:
+                feature_mock.return_value = (True, "hooks=true", "ok", "2026-01-01T00:00:00Z")
                 payload = {
                     "orchestration_id": "orch_default_dev_policy_001",
                     "repo_root": str(repo_root),
@@ -410,8 +409,8 @@ class HookCliTests(unittest.TestCase):
     def test_prod_mode_allows_same_command(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
-            with patch("tools.hooks.cli.codex_hooks_feature_enabled") as feature_mock:
-                feature_mock.return_value = (True, "hooks=true")
+            with patch("tools.hooks.cli.read_codex_feature_cache") as feature_mock:
+                feature_mock.return_value = (True, "hooks=true", "ok", "2026-01-01T00:00:00Z")
                 payload = {
                     "orchestration_id": "orch_prod_policy_001",
                     "repo_root": str(repo_root),
@@ -442,8 +441,8 @@ class HookCliTests(unittest.TestCase):
     def test_writes_native_hook_audit_log_when_orchestration_id_is_provided(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
-            with patch("tools.hooks.cli.codex_hooks_feature_enabled") as feature_mock:
-                feature_mock.return_value = (True, "hooks=true")
+            with patch("tools.hooks.cli.read_codex_feature_cache") as feature_mock:
+                feature_mock.return_value = (True, "hooks=true", "ok", "2026-01-01T00:00:00Z")
                 payload = {
                     "orchestration_id": "orch_test_001",
                     "repo_root": str(repo_root),
@@ -479,8 +478,8 @@ class HookCliTests(unittest.TestCase):
     def test_missing_orchestration_id_uses_global_policy_by_default(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
-            with patch("tools.hooks.cli.codex_hooks_feature_enabled") as feature_mock:
-                feature_mock.return_value = (True, "hooks=true")
+            with patch("tools.hooks.cli.read_codex_feature_cache") as feature_mock:
+                feature_mock.return_value = (True, "hooks=true", "ok", "2026-01-01T00:00:00Z")
                 payload = {
                     "repo_root": str(repo_root),
                     "tool_name": "Bash",
@@ -504,8 +503,8 @@ class HookCliTests(unittest.TestCase):
     def test_session_start_without_orchestration_id_uses_global_log(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
-            with patch("tools.hooks.cli.codex_hooks_feature_enabled") as feature_mock:
-                feature_mock.return_value = (True, "hooks=true")
+            with patch("tools.hooks.cli.read_codex_feature_cache") as feature_mock:
+                feature_mock.return_value = (True, "hooks=true", "ok", "2026-01-01T00:00:00Z")
                 payload = {"repo_root": str(repo_root)}
                 out = io.StringIO()
                 with redirect_stdout(out):
@@ -533,8 +532,8 @@ class HookCliTests(unittest.TestCase):
     def test_missing_orchestration_id_falls_back_to_global_by_default(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
-            with patch("tools.hooks.cli.codex_hooks_feature_enabled") as feature_mock:
-                feature_mock.return_value = (True, "hooks=true")
+            with patch("tools.hooks.cli.read_codex_feature_cache") as feature_mock:
+                feature_mock.return_value = (True, "hooks=true", "ok", "2026-01-01T00:00:00Z")
                 payload = {
                     "repo_root": str(repo_root),
                     "tool_name": "Bash",
@@ -563,113 +562,97 @@ class HookCliTests(unittest.TestCase):
                 )
                 self.assertFalse(log_path.exists())
 
-    def test_codex_feature_check_is_cached_after_first_call(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            repo_root = Path(tmp)
-            payload = {
-                "orchestration_id": "orch_cache_001",
-                "repo_root": str(repo_root),
-                "tool_name": "Bash",
-                "tool_input": {"command": "echo hello"},
-            }
-            with patch("tools.hooks.cli.codex_hooks_feature_enabled") as feature_mock:
-                feature_mock.return_value = (True, "hooks=true")
-                out1 = io.StringIO()
-                with redirect_stdout(out1):
-                    code1 = cli.main(
-                        [
-                            "--backend",
-                            "codex",
-                            "--event",
-                            "PreToolUse",
-                            "--input-json",
-                            json.dumps(payload),
-                        ]
-                    )
-                out2 = io.StringIO()
-                with redirect_stdout(out2):
-                    code2 = cli.main(
-                        [
-                            "--backend",
-                            "codex",
-                            "--event",
-                            "PreToolUse",
-                            "--input-json",
-                            json.dumps(payload),
-                        ]
-                    )
-                self.assertEqual(code1, 0)
-                self.assertEqual(code2, 0)
-                self.assertEqual(feature_mock.call_count, 1)
+    @staticmethod
+    def _run_codex_pre(payload: dict) -> int:
+        with redirect_stdout(io.StringIO()):
+            return cli.main(
+                ["--backend", "codex", "--event", "PreToolUse",
+                 "--input-json", json.dumps(payload)]
+            )
 
-    def test_probe_error_cache_is_retried_after_ttl(self) -> None:
+    def test_codex_gate_reads_host_seeded_cache_without_probing(self) -> None:
+        # The hook reads the host-written cache (orchestration-dir root, RO in-sandbox)
+        # and never probes codex itself. A real on-disk enabled=true → allow.
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
+            write_codex_feature_cache(
+                repo_root=repo_root, orchestration_id="orch_seed_ok",
+                enabled=True, detail="hooks=true", status_kind="ok")
             payload = {
-                "orchestration_id": "orch_retry_001",
+                "orchestration_id": "orch_seed_ok",
                 "repo_root": str(repo_root),
                 "tool_name": "Bash",
                 "tool_input": {"command": "echo hello"},
             }
-            with patch.dict(os.environ, {"METDSL_HOOK_FEATURE_RETRY_TTL_SECONDS": "0"}):
-                with patch("tools.hooks.cli.codex_hooks_feature_enabled") as feature_mock:
-                    feature_mock.side_effect = [
-                        (False, self._timeout_detail()),
-                        (True, "hooks=true"),
-                    ]
-                    out1 = io.StringIO()
-                    with redirect_stdout(out1):
-                        code1 = cli.main(
-                            [
-                                "--backend",
-                                "codex",
-                                "--event",
-                                "PreToolUse",
-                                "--input-json",
-                                json.dumps(payload),
-                            ]
-                        )
-                    out2 = io.StringIO()
-                    with redirect_stdout(out2):
-                        code2 = cli.main(
-                            [
-                                "--backend",
-                                "codex",
-                                "--event",
-                                "PreToolUse",
-                                "--input-json",
-                                json.dumps(payload),
-                            ]
-                        )
-                    self.assertEqual(code1, 2)
-                    self.assertEqual(code2, 0)
-                    self.assertEqual(feature_mock.call_count, 2)
+            # the probe must never be invoked by the hook
+            with patch("tools.hooks.codex_feature.codex_hooks_feature_enabled",
+                       side_effect=AssertionError("hook must not probe codex")):
+                self.assertEqual(self._run_codex_pre(payload), 0)
 
-    def test_invalid_retry_ttl_env_falls_back_to_default(self) -> None:
+    def test_codex_gate_fail_closed_on_host_seeded_disabled(self) -> None:
+        # Real on-disk cache that the host wrote with enabled=false (feature off / probe
+        # error) → fail closed, via the real read path (no mock).
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
+            write_codex_feature_cache(
+                repo_root=repo_root, orchestration_id="orch_seed_off",
+                enabled=False, detail="hooks=false", status_kind="ok")
             payload = {
-                "orchestration_id": "orch_retry_invalid_ttl_001",
+                "orchestration_id": "orch_seed_off",
                 "repo_root": str(repo_root),
                 "tool_name": "Bash",
                 "tool_input": {"command": "echo hello"},
             }
-            with patch.dict(os.environ, {"METDSL_HOOK_FEATURE_RETRY_TTL_SECONDS": "abc"}):
-                with patch("tools.hooks.cli.codex_hooks_feature_enabled") as feature_mock:
-                    feature_mock.return_value = (False, self._timeout_detail())
-                    out = io.StringIO()
-                    with redirect_stdout(out):
-                        code = cli.main(
-                            [
-                                "--backend",
-                                "codex",
-                                "--event",
-                                "PreToolUse",
-                                "--input-json",
-                                json.dumps(payload),
-                            ]
-                        )
-                    self.assertEqual(code, 2)
+            self.assertEqual(self._run_codex_pre(payload), 2)
+
+    def test_codex_gate_fail_closed_when_cache_missing(self) -> None:
+        # No host-written cache → fail closed (the host did not certify the feature).
+        with tempfile.TemporaryDirectory() as tmp:
+            payload = {
+                "orchestration_id": "orch_no_cache",
+                "repo_root": tmp,
+                "tool_name": "Bash",
+                "tool_input": {"command": "echo hello"},
+            }
+            self.assertEqual(self._run_codex_pre(payload), 2)
+
+    def test_codex_gate_ignores_forged_legacy_hooks_path(self) -> None:
+        # Security regression: the OLD location was the leaf-writable hooks/ dir. A leaf
+        # forging enabled=true THERE must NOT be honored — the hook reads only the new
+        # RO orchestration-dir-root path, which here is absent → fail closed.
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            legacy = (repo_root / "workspace" / "orchestrations" / "orch_forge"
+                      / "hooks" / "codex_feature_check.json")
+            legacy.parent.mkdir(parents=True, exist_ok=True)
+            legacy.write_text(json.dumps(
+                {"enabled": True, "detail": "hooks=true", "status_kind": "ok",
+                 "checked_at": "2026-01-01T00:00:00Z"}), encoding="utf-8")
+            payload = {
+                "orchestration_id": "orch_forge",
+                "repo_root": str(repo_root),
+                "tool_name": "Bash",
+                "tool_input": {"command": "echo hello"},
+            }
+            self.assertEqual(self._run_codex_pre(payload), 2)
+            # the new RO path must be where the real cache lives, NOT under hooks/
+            real = codex_feature_cache_path(repo_root=repo_root, orchestration_id="orch_forge")
+            self.assertNotIn("/hooks/", str(real))
+            self.assertFalse(real.is_file())
+
+    def test_codex_gate_fail_closed_on_malformed_cache(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            path = codex_feature_cache_path(repo_root=repo_root, orchestration_id="orch_bad")
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps({"enabled": "yes-please"}), encoding="utf-8")
+            payload = {
+                "orchestration_id": "orch_bad",
+                "repo_root": str(repo_root),
+                "tool_name": "Bash",
+                "tool_input": {"command": "echo hello"},
+            }
+            self.assertEqual(self._run_codex_pre(payload), 2)
 
 
 class ClaudeHookCliTests(unittest.TestCase):
@@ -1056,8 +1039,8 @@ class ClaudeHookCliTests(unittest.TestCase):
                 "tool_name": "Bash",
                 "tool_input": {"command": "echo hi"},
             }
-            with patch("tools.hooks.cli.codex_hooks_feature_enabled") as probe_mock:
-                probe_mock.side_effect = AssertionError("codex probe must not be called for claude")
+            with patch("tools.hooks.cli.read_codex_feature_cache") as probe_mock:
+                probe_mock.side_effect = AssertionError("codex feature cache must not be read for claude")
                 out = io.StringIO()
                 with redirect_stdout(out):
                     code = cli.main(
