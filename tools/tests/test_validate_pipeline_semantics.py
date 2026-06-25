@@ -1073,6 +1073,110 @@ end program shallow_water2d_runner
                         f"unexpected missing-state violation; got: {missing_state}",
                     )
 
+    def test_snapshot_scope_resolves_via_in_file_test_id_when_case_map_empty(self) -> None:
+        """C-class IR-shape robustness: scope per-case evidence even when
+        `case.test_case_set` omits `test_id` (so the case_id->test_id map is
+        empty) by reading the snapshot's own `test_id` field.
+
+        This is the second observed Compile/runner output shape (billed dev E2E
+        2026-06-25, orch `…150418Z_6571ad31`): snapshots are named
+        `<test_id>_NNNN.json` and carry in-file `test_id` (and a `case_id` equal
+        to the test_id), while `test_case_set[].test_id` is null. The first fix
+        keyed only on the case_id->test_id map and fell back to the strict union
+        here, wrongly failing the guard case for the absent output `y`.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            node_safe = "component__demo_tid__0.1.0"
+            ir_ref = f"workspace/ir/{node_safe}/demo-tid_20260625_001"
+            pipeline_dir = (
+                repo_root / "workspace" / "pipelines" / node_safe
+                / "demo-tid_20260625_001"
+            )
+            ir_dir = repo_root / ir_ref
+            pipeline_dir.mkdir(parents=True, exist_ok=True)
+            ir_dir.mkdir(parents=True, exist_ok=True)
+            _write_json(pipeline_dir / "lineage.json", {"ir_ref": ir_ref})
+
+            schema = {
+                "variables": [
+                    {"name": "x", "shape_expr": "[n]"},
+                    {"name": "y", "shape_expr": "[n]"},
+                ],
+                "time_variable": "snapshot_index",
+                "time_shape_expr": "scalar",
+            }
+            _write_json(
+                ir_dir / "spec.ir.yaml",
+                {
+                    # test_case_set carries case_id but NULL test_id -> the
+                    # case_id->test_id map is empty.
+                    "case": {
+                        "test_case_set": [
+                            {"case_id": "l0_scale_identity_pass", "test_id": None},
+                            {"case_id": "l0_invalid_length_xfail", "test_id": None},
+                        ]
+                    },
+                    "io_contract": {
+                        "inputs": [{"name": "x", "shape_expr": "[n]"}],
+                        "outputs": [{"name": "y", "shape_expr": "[n]"}],
+                        "raw_requirements": {
+                            "required_evidence": [
+                                {
+                                    "artifact": "state_snapshots",
+                                    "required": True,
+                                    "min_samples": 1,
+                                    "schema": schema,
+                                }
+                            ]
+                        },
+                        "test_evidence_requirements": [
+                            {"test_id": "l0_scale_identity_pass",
+                             "required_raw_variables": ["x", "y"]},
+                            {"test_id": "l0_invalid_length_xfail",
+                             "required_raw_variables": ["x"]},
+                        ],
+                    },
+                },
+            )
+
+            node_dir = pipeline_dir / "runs" / "run_test_001" / node_safe
+            snapshots_dir = node_dir / "raw" / "state_snapshots"
+            snapshots_dir.mkdir(parents=True, exist_ok=True)
+            _write_json(snapshots_dir / "snapshot_schema.json", {
+                **schema, "min_samples": 1,
+                "samples": ["l0_scale_identity_pass_0000.json",
+                            "l0_invalid_length_xfail_0000.json"],
+            })
+            _write_json(snapshots_dir / "l0_scale_identity_pass_0000.json", {
+                "snapshot_index": 0, "case_id": "l0_scale_identity_pass",
+                "test_id": "l0_scale_identity_pass",
+                "x": [1.0, 2.0, 3.0], "y": [2.0, 4.0, 6.0],
+            })
+            # Guard case: in-file test_id present, only the rejected input x.
+            _write_json(snapshots_dir / "l0_invalid_length_xfail_0000.json", {
+                "snapshot_index": 0, "case_id": "l0_invalid_length_xfail",
+                "test_id": "l0_invalid_length_xfail", "x": [],
+            })
+
+            execution = NodeExecution(
+                node_key="component/demo_tid@0.1.0",
+                node_dir=node_dir,
+                exec_dir=pipeline_dir / "runs" / "run_test_001",
+                pipeline_dir=pipeline_dir,
+            )
+            violations: list[str] = []
+            vps._validate_raw_evidence(repo_root, execution, violations)
+
+            missing_state = [
+                v for v in violations
+                if "declared state_variables missing in snapshot files" in v
+            ]
+            self.assertFalse(
+                missing_state,
+                f"guard case should be excused via in-file test_id; got: {missing_state}",
+            )
+
     def test_snapshot_completeness_falls_back_to_strict_union_without_per_test_contract(self) -> None:
         """Backward-compat: when the IR carries no per-test evidence scoping
         (`io_contract.test_evidence_requirements`) and/or no `case.test_case_set`

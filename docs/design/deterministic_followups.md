@@ -326,14 +326,35 @@ snapshot's required state variables to its case's test: it builds `_case_id_to_t
 is resolvable (backward compatible); strictness is preserved for any case whose test *does* require the
 variable. phase_04_validate.md §43 reconciled. **Verified read-only against the captured failing
 artifacts** (`orch_20260625T141819Z_2692801d` → pipeline `demo-dep-base_20260625_001` run
-`run_20260625_001`): the previously-failing `post_execute` gate now returns **PASS**. Unit test added
-(`test_validate_pipeline_semantics.py::...::test_snapshot_state_variables_scoped_to_per_case_evidence`:
-guard case excused / valid case still flagged when it omits `y`); suite green (1592).
+`run_20260625_001`): the previously-failing `post_execute` gate returns **PASS**. Unit tests added; suite
+green.
+
+**Hardened for a second IR shape (2026-06-26).** A second billed dev `--with-deps` re-run
+(`orch_20260625T150418Z_6571ad31`, on the committed first fix) `fail_closed` at `demo_dep_base`
+validate.execute with the *same* error class but a *different* Compile/runner output shape — C-class IR
+nondeterminism: the snapshot was named `l0_invalid_length_xfail_0000.json`, carried an in-file
+**`test_id`** field, and `case.test_case_set[].test_id` was **null** (so `_case_id_to_test_id` returned
+an empty map). The first fix keyed only on the case_id→test_id map and so fell back to the strict union,
+again wrongly failing the guard case. **Hardened resolution:** the scope now anchors on whatever
+authoritative identity the snapshot self-declares, trying in order — (1) the snapshot's in-file
+`test_id`, (2) `case_id` mapped via `case.test_case_set`, (3) `case_id`/filename-stem used directly as a
+test_id — and uses the first that is a key in `test_evidence_requirements`; only then falls back to the
+strict union (the `if per_test_required and case_to_test` guard was relaxed to `if per_test_required`,
+since an in-file `test_id` no longer needs the map). **Verified read-only:** post_execute now PASS on
+BOTH shapes (`demo-dep-base_20260625_001` run-1 case_id-only, and `demo-dep-base_20260625_002` run-2
+in-file-`test_id`/empty-map). Tests:
+`test_snapshot_state_variables_scoped_to_per_case_evidence` (shape 1),
+`test_snapshot_scope_resolves_via_in_file_test_id_when_case_map_empty` (shape 2),
+`test_snapshot_completeness_falls_back_to_strict_union_without_per_test_contract` (strict fallback);
+suite green (1594).
 
 **Not yet done:** the billed dev `--with-deps` re-run to confirm `demo_dep_base` reaches
 `aggregate_verdict=pass` AND the target `demo_dep_top` then completes the D1/D2 dependency path
-end-to-end (the original outstanding verification — now unblocked by this fix, deferred pending operator
-go-ahead for another billed run).
+end-to-end. Two dev runs (2026-06-25/26) each `fail_closed` at the base's snapshot gate on a distinct IR
+shape (both now handled); a third run is needed to confirm — but note dev fail-fasts on ANY *new*
+cross-phase rollback, so residual C-class nondeterminism elsewhere could still stop it. Deferred pending
+operator go-ahead for another billed run (prod mode would absorb residual nondeterminism via the retry
+budget if a first-try-clean dev run remains elusive).
 
 ## L (latent / low severity — fix opportunistically)
 - **L1 — DONE (2026-06-25).** Generated Makefile emitted a harmless `make` warning

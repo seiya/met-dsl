@@ -3255,21 +3255,39 @@ def _validate_raw_evidence(
                                 continue
                             keys = set(data.keys())
                             required_state_names = state_variables
-                            if per_test_required and case_to_test:
-                                snapshot_case_id = data.get("case_id")
-                                if not (
-                                    isinstance(snapshot_case_id, str)
-                                    and snapshot_case_id.strip()
-                                ):
-                                    snapshot_case_id = snapshot.stem
-                                snapshot_test_id = case_to_test.get(
-                                    snapshot_case_id.strip()
-                                    if isinstance(snapshot_case_id, str)
-                                    else ""
+                            if per_test_required:
+                                # Identify this snapshot's test_id to scope its
+                                # required raw variables. Compile/runner output
+                                # shape varies across runs (C-class IR
+                                # nondeterminism): the snapshot may carry an
+                                # explicit `test_id`, or only a `case_id`
+                                # (mapped via case.test_case_set, which itself
+                                # sometimes omits test_id), and is named
+                                # `<case_or_test>[_NNNN].json`; case_id sometimes
+                                # equals the test_id. Try each anchor in order of
+                                # reliability and use the first that resolves to
+                                # a declared per-test requirement; otherwise fall
+                                # back to requiring every declared variable.
+                                raw_case_id = data.get("case_id")
+                                case_token = (
+                                    raw_case_id.strip()
+                                    if isinstance(raw_case_id, str)
+                                    and raw_case_id.strip()
+                                    else snapshot.stem
                                 )
-                                case_required = per_test_required.get(
-                                    snapshot_test_id or ""
-                                )
+                                candidate_test_ids: list[str] = []
+                                raw_test_id = data.get("test_id")
+                                if isinstance(raw_test_id, str) and raw_test_id.strip():
+                                    candidate_test_ids.append(raw_test_id.strip())
+                                mapped_test_id = case_to_test.get(case_token)
+                                if mapped_test_id:
+                                    candidate_test_ids.append(mapped_test_id)
+                                candidate_test_ids.append(case_token)
+                                case_required = None
+                                for candidate in candidate_test_ids:
+                                    if candidate in per_test_required:
+                                        case_required = per_test_required[candidate]
+                                        break
                                 if case_required is not None:
                                     required_state_names = [
                                         name
