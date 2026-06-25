@@ -881,7 +881,9 @@ class Conductor:
         provide modules the shallower ones `use`, compile first). The node_keys carry the
         resolved `@<version>`, so the staging path (`_stage_dependency_sources`) and the
         Makefile object names (`_dependency_closure` -> spec_ids) derive from a single ordered
-        list and cannot disagree on which dep / which version."""
+        list and cannot disagree on which dep / which version. The spec_id basenames must
+        nonetheless be unique across the closure (the staged `<spec_id>_model.f90` / object
+        rules are keyed on the bare spec_id); a same-spec_id clash (diamond) raises here (L6)."""
         ir = _read_yaml(self.repo_root / refs.ir_ref / "spec.ir.yaml") or {}
         dep = (ir.get("dependency") or {}) if isinstance(ir, dict) else {}
         levels: dict[str, int] = {}
@@ -897,6 +899,27 @@ class Conductor:
                     seen.add(nk)
                     closure.append(nk)
         closure.sort(key=lambda nk: levels.get(nk, 0))
+        # L6 guard: the Model B staged source basename (`<spec_id>_model.f90`) and the
+        # Makefile object rules (`$(OBJDIR)/<spec_id>_model.o`) are keyed on the bare
+        # spec_id (kind/@version dropped), and the dep's generated source declares a Fortran
+        # `module <spec_id>_model`. Two distinct closure node_keys sharing a spec_id (a
+        # diamond: `component/foo@1.0.0` + `component/foo@2.0.0`, or `component/foo` +
+        # `model/foo`) would silently clobber each other (last-write-wins stage + duplicate
+        # `.o` rules + a duplicate module). Version-qualifying the basename alone would not
+        # fix the module-name clash, so fail closed with an actionable cause until proper
+        # multi-version support (module renaming) lands.
+        by_sid: dict[str, list[str]] = {}
+        for nk in closure:
+            by_sid.setdefault(spec_id_of(nk), []).append(nk)
+        clashes = {sid: nks for sid, nks in by_sid.items() if len(nks) > 1}
+        if clashes:
+            raise RuntimeError(
+                f"dependency closure for {refs.node_key} has spec_id basename collisions "
+                f"{clashes}: the Model B staged source `<spec_id>_model.f90` and Makefile "
+                f"`<spec_id>_model.o`/`module <spec_id>_model` are keyed on the bare spec_id, "
+                f"so two deps sharing a spec_id (differing version/kind) would clobber each "
+                f"other. Version-qualify the object/staged/module basenames before allowing "
+                f"multi-version/diamond closures (deterministic_followups.md L6).")
         return closure
 
     def _dependency_closure(self, refs: NodeRefs) -> list[str]:
@@ -2235,13 +2258,34 @@ clean:
                 self.set_status("fail", reason_code=f"{phase}_fail",
                                 reason_detail=f"route_target_out_of_scope:{target}")
                 return "fail"
+
+            target_idx = phases.index(target)
+            # F1: dev confines auto-retry to WITHIN a single phase (the run_phase substep
+            # loop, e.g. generate.generate -> generate.verify -> regenerate). A cross-phase
+            # backward rollback — the only routing that actually reopens an already-passed
+            # upstream phase (target_idx < idx, the branch below) — fail_closes immediately so
+            # the operator sees the structural issue on the first occurrence instead of burning
+            # the whole attempt budget on a regeneration loop that cannot fix it (the
+            # C1/C2/D2 "regenerating one side can't fix the other" pattern). This generalizes
+            # the older dev verify/judge-severity gate (classify_verify_severity) to "any
+            # cross-phase rollback regardless of failure classification". `target_idx < idx`
+            # already covers every real reopen (they all target compile = upstream) and every
+            # earlier-phase retry; a same-phase/forward (malformed) reopen is NOT a backward
+            # rollback, so it falls through to the `target_idx >= idx` terminal-fail branch
+            # below — same as prod — rather than being mislabeled a dev_phase_rollback. prod
+            # keeps today's bounded cross-phase reopen/retry (the C2 backstop's compile reopen
+            # stays live for prod and is a no-op here for dev).
+            if self.workflow_mode == "dev" and target_idx < idx:
+                self.set_status("fail_closed", reason_code="dev_phase_rollback",
+                                reason_detail=(decision.reason or f"{phase}->{target}")[:200])
+                return "fail_closed"
+
             attempts[target] += 1
             if attempts[target] > MAX_ATTEMPTS_PER_PHASE:
                 self.set_status("fail_closed", reason_code="retry_budget_exhausted",
                                 reason_detail=f"{target} exceeded {MAX_ATTEMPTS_PER_PHASE}")
                 return "fail_closed"
 
-            target_idx = phases.index(target)
             if target_idx >= idx:
                 # same/downstream target reaching conduct means run_phase already
                 # exhausted its in-place retries -> terminal.

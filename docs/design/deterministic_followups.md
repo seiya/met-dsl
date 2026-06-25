@@ -311,15 +311,21 @@ was NOT the blocker (this DAG-scope check is). Both E2E runs failed here.
 - **L5** A judge session/usage-limit now ends as a clean resumable `fail_closed`
   (`leaf_transport_error`) but still requires a **manual `--resume`** after the quota
   resets — no auto-retry/scheduling. By design; revisit if it becomes operationally painful.
-- **L6** The dependency build (Model B) keys staged source filenames and Makefile object
-  rules on the bare `spec_id_of(node_key)` (`_dependency_closure` / `_stage_dependency_sources`),
-  dropping `kind` and `@version`. A closure containing two deps that share a `spec_id` but
-  differ in version or kind (e.g. `component/foo@1.0.0` + `component/foo@2.0.0`, a diamond) would
-  collide on `foo_model.f90` (last-write-wins stage + duplicate `$(OBJDIR)/foo_model.o` rules).
-  The version-pinned *pipeline* path stays unambiguous (node_key carries `@version`); only the
-  in-`$(OBJDIR)` basename is not. Not reachable by the minimal 2-node verification spec. Guard
-  (or version-qualify the object/staged basenames) before allowing multi-version/diamond
-  closures.
+- **L6 — GUARDED (2026-06-25).** The dependency build (Model B) keys staged source filenames and
+  Makefile object rules on the bare `spec_id_of(node_key)` (`_dependency_closure` /
+  `_stage_dependency_sources`), dropping `kind` and `@version`. A closure containing two deps that
+  share a `spec_id` but differ in version or kind (e.g. `component/foo@1.0.0` + `component/foo@2.0.0`,
+  a diamond) would collide on `foo_model.f90` (last-write-wins stage + duplicate
+  `$(OBJDIR)/foo_model.o` rules + a duplicate `module foo_model`). The version-pinned *pipeline*
+  path stays unambiguous (node_key carries `@version`); only the in-`$(OBJDIR)` basename is not.
+  Not reachable by the minimal 2-node verification spec. **Fix:** `_dependency_closure_nodes` now
+  raises a clear `RuntimeError` ("spec_id basename collision …") when two distinct closure
+  node_keys map to the same spec_id, so both consumers (`_dependency_closure` Makefile rules and
+  `_stage_dependency_sources` staging) inherit the guard before any clobber. A guard, not
+  version-qualification, because qualifying the staged/object basename alone would not fix the
+  `module <spec_id>_model` name clash — proper multi-version support needs module renaming (a
+  larger change, deferred until a multi-version/diamond closure is actually required). Test:
+  `test_dependency_closure_raises_on_spec_id_basename_collision`.
 
 ## T1 — testing gap (minor)
 The transport+resume path is covered by two unit layers (conductor routing in
@@ -328,3 +334,67 @@ The transport+resume path is covered by two unit layers (conductor routing in
 end-to-end fault-injection integration test** driving the real conductor → runtime CLI →
 completion check; the conductor→CLI seam is covered only by a smoke check. Add one if the
 seam changes.
+
+## F1 — dev-mode retry scoping: stop on phase rollback, auto-retry only within a phase (DONE 2026-06-25)
+> Ready-to-paste starter prompt (begins in plan mode): `docs/design/dev_mode_retry_scoping_followup_prompt.md`.
+
+**Implemented (2026-06-25).** `Conductor.conduct` (`workflow_conductor.py`) now gates the
+cross-phase router: in dev mode, a backward rollback — the `target_idx < idx` case, the only
+routing that actually reopens an already-passed upstream phase — sets `fail_closed` with the
+dedicated reason_code `dev_phase_rollback` (allowlisted in
+`orchestration_runtime.FAIL_CLOSED_REASON_CODES`), carrying the routing reason in `reason_detail`,
+instead of reopening. `target_idx < idx` already covers every real reopen (they all target
+compile) and every earlier-phase retry; a same-phase/forward (malformed) reopen is not a backward
+rollback and falls through to the existing `target_idx >= idx` terminal-fail branch (plain `fail`,
+as in prod) rather than being mislabeled a rollback. The gate sits before the attempts-budget
+increment (so the rollback never consumes budget). The intra-phase substep loop
+(`run_phase`/`run_substep`, generate `verify→regenerate`) is untouched — that is the within-phase
+retry dev keeps. The C2 backstop (`classify_failure` execute-no-verdict → reopen compile) is
+unchanged code but is now intercepted by the dev gate (no-op in dev, live in prod). prod keeps the
+bounded cross-phase reopen/retry. Tests: `DevPhaseRollbackTest` (dev validate→generate /
+execute-no-verdict / reopen → first-occurrence `fail_closed`+no reopen; prod parity reopens;
+dev intra-phase same-phase route stays plain `fail`, not rollback); the existing prod reopen tests
+(`test_reopen_compile_on_ir_then_succeed`, `test_reopen_budget_exhausts_to_fail_closed`,
+`test_conduct_escalates_then_reopens`) pin `workflow_mode="prod"`; `dev_phase_rollback` added to the
+allowlist coherence test. Suite green.
+
+**Decision (operator):** in **dev** mode, a **cross-phase rollback** — any routing that goes back
+to an earlier phase (`build→compile`, `build→generate`, `validate→generate`, `validate→compile`,
+including the `validate.execute`-no-verdict → `generate`/`compile` routes and every `reopen`) — must
+**`fail_closed` immediately** (surface to the operator), NOT auto-retry. Dev-mode auto-retry is
+confined to **within a single phase** — the substep-level iteration (e.g. `generate.generate →
+generate.verify → regenerate` inside the `generate` phase). **prod** mode keeps today's full
+cross-phase reopen/retry behaviour (bounded by `MAX_ATTEMPTS_PER_PHASE`).
+
+**Why.** Dev is for fast feedback. Cross-phase regeneration loops frequently cannot fix the
+underlying problem (the C1/C2/D2 "structural mismatch that regenerating one side can't fix" pattern)
+and burn the entire attempt budget before surfacing. Example that motivated this: the D2
+`validate.execute` DAG-scope failure was (mis)classified as a code defect and routed
+`generate→build→validate→(compile reopen)→…` until `generate exceeded 3` → `fail_closed:
+retry_budget_exhausted`, ~90 min of billed churn for an infra/structural issue an operator should
+have seen on the first rollback. Under this decision dev would have stopped at the first
+`validate.execute→generate` rollback.
+
+**Scope / relation to current behaviour.** This GENERALIZES the existing dev-only gate
+`classify_verify_severity` (`workflow_conductor.py:193-202`: dev + verify/judge `major|critical` →
+`fail_closed`) from "verify/judge severity only" to "any cross-phase rollback regardless of failure
+classification". Intra-phase iteration is unchanged.
+
+**Where it was implemented** (original plan; the authoritative shipped form is the "Implemented
+(2026-06-25)" note at the top of this section — read that for the final gate condition).
+- `Conductor.conduct` (`workflow_conductor.py`) is the cross-phase router. It already computes
+  `target_idx = phases.index(target)` vs the current `idx`. The shipped gate fires when
+  `self.workflow_mode == "dev"` AND `target_idx < idx` (the backward-rollback predicate). The
+  originally-sketched extra `action == "reopen"` arm was dropped: every real reopen targets compile
+  (upstream) so `target_idx < idx` already covers it, and a same-phase/forward (malformed) reopen is
+  NOT a backward rollback — it falls through to the existing `target_idx >= idx` terminal-fail branch
+  (plain `fail`, as in prod) rather than being mislabeled `dev_phase_rollback`. Sets `fail_closed`
+  with `reason_code="dev_phase_rollback"` (allowlisted in `FAIL_CLOSED_REASON_CODES`), before the
+  attempts-budget increment. Forward `advance` and same-phase in-place handling are untouched.
+- Intra-phase substep retries (the `run_phase`/`run_substep` substep loop and the generate
+  verify→regenerate cycle) are unaffected — those are the "within a phase" retries dev keeps.
+- The C2 backstop (`classify_failure` `validate_execute_fail_count` → reopen compile) becomes a
+  no-op in dev (it routes a cross-phase reopen, which the dev gate now stops on) — kept for prod.
+- Tests: dev `validate→generate` / `validate→compile` / execute-no-verdict rollback → `fail_closed`
+  on first occurrence; same in prod → reopen/retry as today; dev intra-phase generate verify loop
+  still retries (`DevPhaseRollbackTest`).

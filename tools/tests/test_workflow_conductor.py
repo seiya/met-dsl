@@ -522,7 +522,8 @@ class ConductRoutingTest(unittest.TestCase):
         # runtime's FAIL_CLOSED_REASON_CODES, or set-status rejects it (→ crash).
         from tools.orchestration_runtime import FAIL_CLOSED_REASON_CODES
         for code in ("leaf_transport_error", "retry_budget_exhausted",
-                     "conductor_phase_fail_closed", "sandbox_enforcement_violation"):
+                     "conductor_phase_fail_closed", "sandbox_enforcement_violation",
+                     "dev_phase_rollback"):
             self.assertIn(code, FAIL_CLOSED_REASON_CODES)
 
     def test_generic_fail_closed_uses_allowlisted_reason_code(self) -> None:
@@ -559,6 +560,7 @@ class ConductRoutingTest(unittest.TestCase):
 
     def test_reopen_compile_on_ir_then_succeed(self) -> None:
         c = self._conductor()
+        c.workflow_mode = "prod"  # cross-phase reopen is prod-only (dev fail_closes; see F1 tests)
         state = {"validate_fail_used": False}
 
         def status_fn(phase, substep, n):
@@ -594,6 +596,7 @@ class ConductRoutingTest(unittest.TestCase):
 
     def test_reopen_budget_exhausts_to_fail_closed(self) -> None:
         c = self._conductor()
+        c.workflow_mode = "prod"  # cross-phase reopen budget is prod-only (dev fail_closes; F1)
         # validate always fails and always routes to reopen compile -> budget caps it.
         c.status_fn = lambda phase, substep, n: "fail" if phase == "validate" else "pass"
         c.decision_fn = lambda phase, outcomes: wc.RouteDecision(
@@ -620,6 +623,121 @@ class ConductRoutingTest(unittest.TestCase):
         self.assertEqual(rj["status"], "fail")
         self.assertIsNone(rj["retry_decisions"])  # never emits retry_decisions
         self.assertEqual(len(rj["substep_agent_run_ids"]), 2)  # one attempt: generate + verify
+
+
+class DevPhaseRollbackTest(unittest.TestCase):
+    """F1: in dev mode a cross-phase backward rollback (reopen, or a retry/reopen targeting
+    an earlier phase) fail_closes immediately instead of auto-retrying; prod is unchanged."""
+
+    def _conductor(self, mode: str = "dev") -> _FakeConductor:
+        c = _FakeConductor(
+            repo_root=Path("/tmp/repo"), orchestration_id="orch_x",
+            orchestration_agent_run_id="ORCH", backend="claude", env={},
+            workflow_mode=mode,
+        )
+        c.calls = []
+        return c
+
+    def _refs(self) -> wc.NodeRefs:
+        return wc.NodeRefs(
+            node_key="component/spec_x@0.1.0", spec_path="spec/component/spec_x",
+            ir_id="x_1_001", pipeline_id="x_1_001", source_id="src_1_001",
+            binary_id="bin_1_001", run_id="run_1_001", source_binary_id="bin_1_001")
+
+    def _last_set_status(self, c: _FakeConductor) -> dict:
+        return [cap for s, cap in c.calls if s == "set-status"][-1]
+
+    def test_dev_validate_to_generate_rollback_fails_closed_on_first(self) -> None:
+        # validate.judge fails and routes a cross-phase retry back to generate (target_idx <
+        # idx). In dev this must fail_closed immediately with no reopen.
+        c = self._conductor("dev")
+        c.status_fn = lambda phase, substep, n: "fail" if (phase == "validate" and substep == "judge") else "pass"
+        c.decision_fn = lambda phase, outcomes: wc.RouteDecision(
+            "retry", target_phase="generate", repair_strategy="restart", reason="code_defect")
+        status = c.conduct(self._refs(), "validate")
+        self.assertEqual(status, "fail_closed")
+        ss = self._last_set_status(c)
+        self.assertEqual(ss["--status"], "fail_closed")
+        self.assertEqual(ss["--reason-code"], "dev_phase_rollback")
+        self.assertEqual(ss["--reason-detail"], "code_defect")
+        self.assertEqual([s for s, _ in c.calls if s == "reopen-phase"], [])  # no reopen in dev
+
+    def test_dev_reopen_decision_fails_closed(self) -> None:
+        # A reopen decision (target compile) is a backward rollback by construction.
+        c = self._conductor("dev")
+        c.status_fn = lambda phase, substep, n: "fail" if (phase == "validate" and substep == "judge") else "pass"
+        c.decision_fn = lambda phase, outcomes: wc.RouteDecision(
+            "reopen", target_phase="compile", reason="judge_structural_violation_ir")
+        status = c.conduct(self._refs(), "validate")
+        self.assertEqual(status, "fail_closed")
+        ss = self._last_set_status(c)
+        self.assertEqual(ss["--reason-code"], "dev_phase_rollback")
+        self.assertEqual(ss["--reason-detail"], "judge_structural_violation_ir")
+        self.assertEqual([s for s, _ in c.calls if s == "reopen-phase"], [])
+
+    def test_dev_execute_no_verdict_routes_generate_fails_closed(self) -> None:
+        # The deterministic execute-no-verdict route (classify_failure) returns retry->generate;
+        # in dev that backward rollback fail_closes on the FIRST occurrence (the D2 motivating
+        # case), rather than looping generate->build->validate to budget exhaustion.
+        c = self._conductor("dev")
+        c.status_fn = lambda phase, substep, n: (
+            "fail" if (phase == "validate" and substep == "execute") else "pass")
+        # use the real classify_failure (no verdict.json -> retry generate)
+        status = c.conduct(self._refs(), "validate")
+        self.assertEqual(status, "fail_closed")
+        self.assertEqual(self._last_set_status(c)["--reason-code"], "dev_phase_rollback")
+        self.assertEqual([s for s, _ in c.calls if s == "reopen-phase"], [])
+
+    def test_prod_same_rollback_reopens_as_today(self) -> None:
+        # Identical scenario in prod: the cross-phase reopen still happens (F1 is dev-only).
+        c = self._conductor("prod")
+        state = {"used": False}
+
+        def status_fn(phase, substep, n):
+            if phase == "validate" and substep == "judge" and not state["used"]:
+                state["used"] = True
+                return "fail"
+            return "pass"
+
+        c.status_fn = status_fn
+        c.decision_fn = lambda phase, outcomes: wc.RouteDecision(
+            "reopen", target_phase="compile", reason="judge_structural_violation_ir")
+        status = c.conduct(self._refs(), "validate")
+        self.assertEqual(status, "pass")
+        reopens = [cap for s, cap in c.calls if s == "reopen-phase"]
+        self.assertEqual(len(reopens), 1)
+        self.assertEqual(reopens[0]["--from-phase"], "compile")
+
+    def test_dev_same_phase_reopen_is_not_rollback(self) -> None:
+        # Boundary: a (malformed) reopen whose target is NOT upstream — here a reopen of the
+        # current phase (target_idx == idx) — is not a backward rollback. The dev gate keys on
+        # target_idx < idx only, so this falls through to the same terminal-fail branch as prod
+        # (plain `fail`, reason_code <phase>_fail), NOT a dev_phase_rollback fail_closed.
+        c = self._conductor("dev")
+        c.status_fn = lambda phase, substep, n: "fail" if (phase == "compile" and substep == "verify") else "pass"
+        c.decision_fn = lambda phase, outcomes: wc.RouteDecision(
+            "reopen", target_phase="compile", reason="malformed_same_phase_reopen")
+        status = c.conduct(self._refs(), "compile")
+        self.assertEqual(status, "fail")  # terminal fail, not dev_phase_rollback
+        self.assertEqual([s for s, _ in c.calls if s == "reopen-phase"], [])
+        ss = self._last_set_status(c)
+        self.assertEqual(ss["--reason-code"], "compile_fail")
+        self.assertNotEqual(ss.get("--reason-code"), "dev_phase_rollback")
+
+    def test_dev_intra_phase_same_phase_retry_not_rollback(self) -> None:
+        # A same-phase decision (target == current phase, e.g. verify-minor) is intra-phase,
+        # not a backward rollback: dev terminalizes it as plain `fail` (no in-place retry at
+        # conduct level), NOT a dev_phase_rollback fail_closed. The within-phase substep loop
+        # (generate.generate -> generate.verify -> regenerate) is what dev keeps; this asserts
+        # the conduct gate does not mistake a same-phase route for a cross-phase rollback.
+        c = self._conductor("dev")
+        c.status_fn = lambda phase, substep, n: "fail" if (phase == "compile" and substep == "verify") else "pass"
+        c.decision_fn = lambda phase, outcomes: wc.RouteDecision("retry", reason="verify_minor")
+        status = c.conduct(self._refs(), "compile")
+        self.assertEqual(status, "fail")  # same-phase terminal, not fail_closed
+        self.assertEqual([s for s, _ in c.calls if s == "reopen-phase"], [])
+        ss = self._last_set_status(c)
+        self.assertNotEqual(ss.get("--reason-code"), "dev_phase_rollback")
 
 
 class TransportFailureTest(unittest.TestCase):
@@ -849,6 +967,7 @@ class DiagnosticianTest(unittest.TestCase):
 
     def test_conduct_escalates_then_reopens(self) -> None:
         c = self._conductor()
+        c.workflow_mode = "prod"  # the diagnostician's cross-phase reopen is prod-only (F1)
         state = {"used": False}
 
         def status_fn(phase, substep, n):
@@ -1689,6 +1808,41 @@ class WriteMakefileTest(unittest.TestCase):
             c = self._conductor(repo)
             self.assertEqual(c._dependency_closure_nodes(refs), ["component/base@0.1.0"])
             self.assertEqual(c._dependency_closure(refs), ["base"])
+
+    def test_dependency_closure_raises_on_spec_id_basename_collision(self) -> None:
+        # L6: two distinct closure node_keys sharing a spec_id (a diamond on `foo`: two
+        # versions) collide on the bare-spec_id staged source `foo_model.f90` / object
+        # `foo_model.o` / `module foo_model`. The closure must fail closed with an actionable
+        # cause rather than silently clobber (last-write-wins). Guarded at the shared
+        # `_dependency_closure_nodes` chokepoint, so both _dependency_closure (Makefile rules)
+        # and _stage_dependency_sources inherit it.
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            refs = wc.NodeRefs(node_key="component/top@0.1.0", spec_path="spec/component/top",
+                               ir_id="i", pipeline_id="p", source_id="s", binary_id="b")
+            ir_dir = repo / refs.ir_ref
+            ir_dir.mkdir(parents=True, exist_ok=True)
+            (ir_dir / "spec.ir.yaml").write_text(
+                "impl_defaults:\n  toolchain:\n    language: fortran\n    build_system: make\n"
+                "dependency:\n"
+                '  node_key: "component/top@0.1.0"\n'
+                "  direct_deps:\n"
+                '    - node_key: "component/foo@1.0.0"\n'
+                '    - node_key: "component/foo@2.0.0"\n'
+                "  transitive_deps: []\n"
+                "  all_nodes:\n"
+                '    - node_key: "component/foo@1.0.0"\n      topo_level: 0\n'
+                '    - node_key: "component/foo@2.0.0"\n      topo_level: 0\n'
+                '    - node_key: "component/top@0.1.0"\n      topo_level: 1\n',
+                encoding="utf-8")
+            c = self._conductor(repo)
+            with self.assertRaisesRegex(RuntimeError, "spec_id basename collision"):
+                c._dependency_closure_nodes(refs)
+            # both named consumers inherit the guard at the shared chokepoint
+            with self.assertRaisesRegex(RuntimeError, "spec_id basename collision"):
+                c._dependency_closure(refs)
+            with self.assertRaisesRegex(RuntimeError, "spec_id basename collision"):
+                c._stage_dependency_sources(refs, repo / "obj")
 
     def test_dependency_makefile_emits_closure_rules(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

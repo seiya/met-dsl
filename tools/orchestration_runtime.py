@@ -2335,9 +2335,14 @@ FAIL_CLOSED_REASON_CODES = {
     #   - conductor_phase_fail_closed: a generic phase fail_closed routing decision
     #     (e.g. judge spec-attribution, dev-mode severe verify) — the specific reason is
     #     carried in reason_detail.
+    #   - dev_phase_rollback: dev-mode only — a cross-phase backward rollback (reopen of an
+    #     already-passed upstream phase, or a retry/reopen targeting an earlier phase) is
+    #     stopped immediately instead of auto-retrying (F1); the routing reason is in
+    #     reason_detail. prod keeps the bounded cross-phase reopen/retry.
     "leaf_transport_error",
     "retry_budget_exhausted",
     "conductor_phase_fail_closed",
+    "dev_phase_rollback",
 }
 
 # The fail_closed reason an orchestration records when a phase's failure mode is an
