@@ -227,6 +227,14 @@ class _FakeConductor(wc.Conductor):
                      "--reason-code", "--reason-detail"):
             if flag in args:
                 captured[flag] = args[args.index(flag) + 1]
+        if "--run-ids" in args:  # nargs="+": collect until the next --flag or end
+            start = args.index("--run-ids") + 1
+            vals = []
+            for tok in args[start:]:
+                if tok.startswith("--"):
+                    break
+                vals.append(tok)
+            captured["--run-ids"] = vals
         self.calls.append((sub, captured))
         if sub == "check-step-completed":
             return {}
@@ -612,6 +620,86 @@ class ConductRoutingTest(unittest.TestCase):
         self.assertEqual(rj["status"], "fail")
         self.assertIsNone(rj["retry_decisions"])  # never emits retry_decisions
         self.assertEqual(len(rj["substep_agent_run_ids"]), 2)  # one attempt: generate + verify
+
+
+class TransportFailureTest(unittest.TestCase):
+    """A leaf transport failure (e.g. judge session limit, rc!=0) must route to a clean,
+    resumable fail_closed WITHOUT calling write_step_result (which would crash on the judge
+    semantic_review.json gate), and must tombstone the attempt's terminalized substep arids
+    so a later --resume can reach pass (orphaned-arid completion guard)."""
+
+    class _C(_FakeConductor):
+        def _write_lineage(self, refs):  # type: ignore[override]
+            pass  # avoid writing to the (fake) repo_root
+
+    def _conductor(self) -> "_FakeConductor":
+        c = self._C(repo_root=Path("/tmp/repo"), orchestration_id="orch_x",
+                    orchestration_agent_run_id="ORCH", backend="claude", env={})
+        c.calls = []
+        return c
+
+    def _refs(self) -> wc.NodeRefs:
+        return wc.NodeRefs(
+            node_key="component/spec_x@0.1.0", spec_path="spec/component/spec_x",
+            ir_id="x_1_001", pipeline_id="x_1_001", source_id="src_1_001",
+            binary_id="bin_1_001", run_id="run_1_001", source_binary_id="bin_1_001")
+
+    def test_judge_transport_failure_fails_closed_and_tombstones(self) -> None:
+        c = self._conductor()
+        # validate.execute is deterministic (rc 0, pass); the judge leaf hits a session limit.
+        c.spawn_leaf = lambda *a, **k: wc.ProcResult(1, "", "Claude usage limit reached")  # type: ignore[assignment]
+        oc = c.run_phase(self._refs(), "validate")
+        self.assertEqual(oc.status, "fail")
+        self.assertEqual(oc.decision.action, "fail_closed")
+        self.assertTrue(oc.decision.reason.startswith("leaf_transport_error: leaf_exit=1"))
+        subs = [s for s, _ in c.calls]
+        # the core Bug-2 assertion: no write-step-result (so the judge gate never crashes)
+        self.assertNotIn("write-step-result", subs)
+        # the Bug-1 tombstone: both substep arids superseded
+        sup = [cap for s, cap in c.calls if s == "add-superseded-runs"]
+        self.assertEqual(len(sup), 1)
+        self.assertEqual(sup[0]["--run-ids"], ["child-1", "child-2"])
+        self.assertIn("leaf_transport_error_orphan", sup[0]["--reason"])
+
+    def test_non_transport_content_fail_writes_and_routes(self) -> None:
+        # judge returns rc 0 but content-fails -> normal classify_failure routing, NOT transport:
+        # write-step-result IS called and no tombstone is written.
+        c = self._conductor()
+        c.status_fn = lambda phase, substep, n: "fail" if substep == "judge" else "pass"
+        c.decision_fn = lambda phase, outcomes: wc.RouteDecision(
+            "retry", target_phase="generate", repair_strategy="restart", reason="x")
+        oc = c.run_phase(self._refs(), "validate")
+        self.assertEqual(oc.status, "fail")
+        self.assertEqual(oc.decision.action, "retry")
+        subs = [s for s, _ in c.calls]
+        self.assertIn("write-step-result", subs)
+        self.assertNotIn("add-superseded-runs", subs)
+
+    def test_pass_path_unchanged(self) -> None:
+        c = self._conductor()
+        oc = c.run_phase(self._refs(), "validate")
+        self.assertEqual(oc.status, "pass")
+        self.assertEqual(oc.decision.action, "advance")
+        subs = [s for s, _ in c.calls]
+        self.assertIn("write-step-result", subs)
+        self.assertNotIn("add-superseded-runs", subs)
+
+    def test_build_transport_failure_tombstones_step_agent(self) -> None:
+        # Build is NOT substep-aware (substep_arids == []); a build in-process exception
+        # (rc=1) must still tombstone the step-role executor arid (outcomes[0]) so it is not
+        # left as an orphan that blocks a resumed pass.
+        c = self._conductor()
+        c._run_deterministic_substep = (  # type: ignore[assignment]
+            lambda refs, phase, substep, child_arid, request: wc.ProcResult(1, "", "mcp error"))
+        oc = c.run_phase(self._refs(), "build")
+        self.assertEqual(oc.status, "fail")
+        self.assertEqual(oc.decision.action, "fail_closed")
+        self.assertTrue(oc.decision.reason.startswith("leaf_transport_error: leaf_exit=1"))
+        subs = [s for s, _ in c.calls]
+        self.assertNotIn("write-step-result", subs)
+        sup = [cap for s, cap in c.calls if s == "add-superseded-runs"]
+        self.assertEqual(len(sup), 1)
+        self.assertEqual(sup[0]["--run-ids"], ["child-1"])  # the build step agent
 
 
 class NodeAllocationTest(unittest.TestCase):

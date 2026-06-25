@@ -184,3 +184,62 @@ disagreement rooted in the other side.
 2. **C1** (P2) — removes the recurring trigger that exposes A; Compile contract + gate.
 3. **B1** (P2) — step_result data correctness; thread resolved exe name.
 4. **B2 / C2** (P3 / design) — latent hardening; address if/when they bite.
+
+---
+
+# Known limitations & deferred work (recorded 2026-06-25)
+
+These surfaced while implementing the deterministic-Makefile + transport/resume fixes. The
+in-scope bugs are all fixed (suite green; Codex review clean). The items below are
+**deliberately deferred** — pick them up in a future session. A ready-to-paste starter
+prompt lives at `docs/design/dependency_build_followup_prompt.md`.
+
+## D1 (PRIMARY) — dependency-node build is unimplemented + the contract is contradictory
+The deterministic-Makefile work (Part 1) covers **leaf** nodes only. Dependency nodes are
+blocked on an upstream design+build gap:
+- No spec with non-empty `dependency.direct_deps` exists in any workspace; the dependency
+  build has never run end-to-end.
+- No dep `.o`/`.mod` staging exists: `_build_inproc` uses a fresh empty `OBJDIR`;
+  `_fortran_source_module_deps` resolves only intra-`src/` `use` edges; `--with-deps`
+  (`run_workflow.py`) runs dep nodes to "ready" but wires **no** build artifacts between them.
+- The contract is self-contradictory: `phase_02_generate.md:41` (encapsulation) forbids
+  copying dep sources into `src/`, yet the only historically-working dependency build
+  (`workspace_20260319/.../problem__shallow_water2d__0.3.0/.../Makefile`) did exactly that.
+- **Recommended approach = Model B** (transient source staging): the conductor stages each
+  closure `<dep>_model.f90` into the per-run build tmp `$(OBJDIR)` (never canonical `src/`)
+  and the Makefile compiles+links the closure. Rationale + the §41 carve-out are in the
+  "deterministic `src/Makefile`" section above.
+- **Already in place (unwired, synthetic-tested):** `Conductor._dependency_closure`,
+  `_write_makefile` non-leaf branch (deepest-first `$(OBJDIR)/<dep>_model.o` rules +
+  `DEP_OBJS`), and a staging TODO in `_build_inproc` (`tools/workflow_conductor.py`).
+- **To do:** implement the `_build_inproc` (+ execute) staging of the closure sources, wire
+  `_write_makefile`'s non-leaf branch into `run_phase` (it is currently leaf-gated), reconcile
+  the phase_02 §41 / phase_03 `dependency_violation` contracts, and **author a real
+  dependency spec** to verify end-to-end (the only way to confirm — it is untestable today).
+
+## D2 — `--with-deps` closure wires no build artifacts (same root as D1)
+Building node N consumes nothing from its dependency nodes' builds. Resolve together with D1.
+
+## L (latent / low severity — fix opportunistically)
+- **L1** Generated Makefile emits a harmless `make` warning `target '.' given more than once`
+  for the `$(OBJDIR) $(BINDIR):` rule when `OBJDIR==BINDIR=="."` (local in-source `make`
+  only; exit 0; not on Build/Validate which pass distinct dirs). Cosmetic; in the conductor
+  template (`_write_makefile`) and prior LLM templates alike. Could split into two rules.
+- **L2** The C1 scalar gate assumes the per-snapshot time index is always scalar; a future
+  spec needing a vector per-file time dimension would need a carve-out
+  (`validate_pipeline_semantics._validate_io_contract_file`).
+- **L3** C2 escalation threshold is hardcoded `2` (`workflow_conductor.classify_failure`);
+  tune if it proves too eager/lazy in practice.
+- **L4** `_impl_is_leaf_node` disagrees with the YAML parser only for **invalid** YAML
+  (tab-indented `direct_deps`) — benign/unreachable (fails compile), not worth fixing.
+- **L5** A judge session/usage-limit now ends as a clean resumable `fail_closed`
+  (`leaf_transport_error`) but still requires a **manual `--resume`** after the quota
+  resets — no auto-retry/scheduling. By design; revisit if it becomes operationally painful.
+
+## T1 — testing gap (minor)
+The transport+resume path is covered by two unit layers (conductor routing in
+`test_workflow_conductor.py::TransportFailureTest`; runtime helper + completion exemption in
+`test_orchestration_runtime.py::TransportOrphanCompletionTest`). There is **no single
+end-to-end fault-injection integration test** driving the real conductor → runtime CLI →
+completion check; the conductor→CLI seam is covered only by a smoke check. Add one if the
+seam changes.

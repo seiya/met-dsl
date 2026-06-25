@@ -1055,6 +1055,16 @@ clean:
             "--trigger-agent-run-id", trigger_arid, "--reason", reason,
         ])
 
+    def _add_superseded_run_ids(self, run_ids: list[str], reason: str) -> dict[str, Any]:
+        """Tombstone substep arids of a phase attempt that fail-closed on a leaf transport
+        error (it wrote no step_result), so a later --resume can reach pass: the orphaned
+        terminalized substeps are exempted from the completion vouch (see runtime
+        add_superseded_run_ids). No-op caller-side when run_ids is empty."""
+        return self.runtime([
+            "add-superseded-runs", *self._oid_args(),
+            "--reason", reason, "--run-ids", *run_ids,
+        ])
+
     # -- substep outcome (deterministic, reads canonical artifacts) -----------
 
     def _child_env(self, child_arid: str) -> dict[str, str]:
@@ -1915,21 +1925,36 @@ clean:
             result["launch_request_ref"] = (
                 f"workspace/orchestrations/{self.orchestration_id}"
                 f"/launches/{outcomes[-1].agent_run_id}.request.json")
+        # A nonzero leaf exit is an infra/transport failure (token limit, OOM, transport,
+        # session limit) the decision tables cannot classify — route straight to fail_closed
+        # so the operator can --resume. This is checked BEFORE write_step_result: a transport
+        # failure leaves no canonical evidence (e.g. a judge that died with no
+        # semantic_review.json), so writing the step_result would crash on the
+        # post_phase_complete judge gate instead of cleanly failing closed. Skipping the write
+        # leaves the attempt's already-terminalized agents without a step_result, so tombstone
+        # them (add-superseded-runs) — otherwise a later --resume (which re-runs the phase fresh)
+        # trips _validate_orchestration_completion_for_pass on the orphaned arids. Tombstone
+        # EVERY outcome arid: substep agents for substep-aware phases, or the single step-role
+        # agent for build (substep_arids is empty there, but outcomes[0] is recorded in
+        # agent_runs.jsonl and would be flagged as a step orphan).
+        transport = (next((oc for oc in outcomes if oc.leaf_returncode != 0), None)
+                     if status != "pass" else None)
+        if transport is not None:
+            orphan_arids = [oc.agent_run_id for oc in outcomes]
+            if orphan_arids:
+                self._add_superseded_run_ids(
+                    orphan_arids,
+                    reason=f"leaf_transport_error_orphan: leaf_exit={transport.leaf_returncode}")
+            decision = RouteDecision(
+                "fail_closed",
+                reason=f"leaf_transport_error: leaf_exit={transport.leaf_returncode}")
+            return PhaseOutcome(phase, status, substep_arids, failed, decision)
+
         self.write_step_result(node_key, phase, executor, result)
         if status == "pass":
             decision = RouteDecision("advance")
         else:
-            # A nonzero leaf exit is an infra/transport failure (token limit, OOM,
-            # transport) the decision tables cannot classify, and a diagnostician
-            # leaf would likely hit the same limit — route straight to fail_closed
-            # with the captured reason so the operator can --resume.
-            transport = next((oc for oc in outcomes if oc.leaf_returncode != 0), None)
-            if transport is not None:
-                decision = RouteDecision(
-                    "fail_closed",
-                    reason=f"leaf_transport_error: leaf_exit={transport.leaf_returncode}")
-            else:
-                decision = self.classify_failure(refs, phase, outcomes)
+            decision = self.classify_failure(refs, phase, outcomes)
         return PhaseOutcome(phase, status, substep_arids, failed, decision)
 
     def _gather_failure_context(self, refs: NodeRefs, phase: str) -> dict[str, Any]:

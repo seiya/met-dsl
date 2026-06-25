@@ -23980,6 +23980,128 @@ class CompletionValidatorSupersededTest(unittest.TestCase):
                 _validate_orchestration_completion_for_pass(repo_root, oid)
 
 
+class TransportOrphanCompletionTest(unittest.TestCase):
+    """A validate attempt that fail-closed on a leaf transport error (judge session limit)
+    leaves its terminalized execute/judge substeps in agent_runs.jsonl with NO step_result.
+    `add_superseded_run_ids` tombstones them so a later --resume (which re-runs validate fresh)
+    reaches pass; without the tombstone the completion check flags the orphans."""
+
+    NODE_KEY = "component/foo@0.1.0"
+
+    def _seed_orphans(self, repo_root: Path, oid: str) -> tuple[str, list[str]]:
+        """orphaned validate execute(pass)+judge(fail) substeps: no step_result, no launch
+        refs (what would block pass without the supersede exemption)."""
+        init_orchestration(repo_root=repo_root, orchestration_id=oid)
+        root = repo_root / "workspace" / "orchestrations" / oid
+        orch_arid = json.loads(
+            (root / "orchestration_meta.json").read_text(encoding="utf-8")
+        )["orchestration_agent_run_id"]
+        orphans = ["orphan-execute", "orphan-judge"]
+        launches = root / "launches"
+        launches.mkdir(exist_ok=True)
+        with (root / "agent_runs.jsonl").open("a", encoding="utf-8") as f:
+            for arid, st in (("orphan-execute", "pass"), ("orphan-judge", "fail")):
+                # orphans were real launches (have launch refs) — only the step_result is
+                # missing (the attempt fail-closed before writing it). That is what the
+                # completion check flags unless they are superseded.
+                for ext in ("request.json", "response.json", "prompt.txt", "reply.txt"):
+                    (launches / f"{arid}.{ext}").write_text(
+                        "{}" if ext.endswith(".json") else "x", encoding="utf-8")
+                base = f"workspace/orchestrations/{oid}/launches/{arid}"
+                f.write(json.dumps({
+                    "agent_run_id": arid, "agent_role": "substep", "step": "validate",
+                    "status": st, "node_key": self.NODE_KEY,
+                    "launch_request_ref": f"{base}.request.json",
+                    "launch_response_ref": f"{base}.response.json",
+                    "launch_prompt_ref": f"{base}.prompt.txt",
+                    "launch_reply_ref": f"{base}.reply.txt",
+                }) + "\n")
+        edges = [{"parent_agent_run_id": orch_arid, "child_agent_run_id": a,
+                  "relation_type": "launch"} for a in orphans]
+        (root / "agent_graph.json").write_text(json.dumps({"edges": edges}), encoding="utf-8")
+        return orch_arid, orphans
+
+    def _add_fresh_validate_substep(self, root: Path, orch_arid: str, arid: str) -> None:
+        """A fully-vouched fresh validate substep (the resumed attempt): launch refs +
+        agent_runs row + a validate step_result + an agent_graph edge."""
+        launches = root / "launches"
+        launches.mkdir(exist_ok=True)
+        for ext in ("request.json", "response.json", "prompt.txt", "reply.txt"):
+            (launches / f"{arid}.{ext}").write_text("{}" if ext.endswith(".json") else "x",
+                                                    encoding="utf-8")
+        base = f"workspace/orchestrations/{root.name}/launches/{arid}"
+        with (root / "agent_runs.jsonl").open("a", encoding="utf-8") as f:
+            f.write(json.dumps({
+                "agent_run_id": arid, "agent_role": "substep", "step": "validate",
+                "substep": "judge", "status": "pass", "node_key": self.NODE_KEY,
+                "launch_request_ref": f"{base}.request.json",
+                "launch_response_ref": f"{base}.response.json",
+                "launch_prompt_ref": f"{base}.prompt.txt",
+                "launch_reply_ref": f"{base}.reply.txt",
+            }) + "\n")
+        node_safe = _node_key_to_safe(self.NODE_KEY)
+        sr = root / "steps" / node_safe / "validate" / orch_arid / "step_result.json"
+        sr.parent.mkdir(parents=True, exist_ok=True)
+        sr.write_text(json.dumps({
+            "status": "pass", "executor_agent_run_id": orch_arid,
+            "substep_agent_run_ids": [arid],
+        }), encoding="utf-8")
+        graph = json.loads((root / "agent_graph.json").read_text(encoding="utf-8"))
+        graph["edges"].append(
+            {"parent_agent_run_id": orch_arid, "child_agent_run_id": arid, "relation_type": "launch"})
+        (root / "agent_graph.json").write_text(json.dumps(graph), encoding="utf-8")
+
+    def test_tombstoned_orphans_with_fresh_replacement_passes(self) -> None:
+        from tools.orchestration_runtime import add_superseded_run_ids
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            oid = "orch_transport_orphan_pass"
+            orch_arid, orphans = self._seed_orphans(repo_root, oid)
+            root = repo_root / "workspace" / "orchestrations" / oid
+            self._add_fresh_validate_substep(root, orch_arid, "fresh-validate-judge")
+            # tombstone via the real helper (what the conductor calls on transport fail)
+            add_superseded_run_ids(repo_root, oid, run_ids=orphans,
+                                   reason="leaf_transport_error_orphan")
+            _validate_orchestration_completion_for_pass(repo_root, oid)  # no raise
+
+    def test_orphans_without_supersede_block_pass(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            oid = "orch_transport_orphan_block"
+            orch_arid, _ = self._seed_orphans(repo_root, oid)
+            root = repo_root / "workspace" / "orchestrations" / oid
+            self._add_fresh_validate_substep(root, orch_arid, "fresh-validate-judge")
+            with self.assertRaisesRegex(
+                RuntimeError, "missing substep_agent_run_ids entry"):
+                _validate_orchestration_completion_for_pass(repo_root, oid)
+
+    def test_tombstoned_orphans_without_replacement_block_pass(self) -> None:
+        from tools.orchestration_runtime import add_superseded_run_ids
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            oid = "orch_transport_orphan_norepl"
+            _orch_arid, orphans = self._seed_orphans(repo_root, oid)
+            add_superseded_run_ids(repo_root, oid, run_ids=orphans,
+                                   reason="leaf_transport_error_orphan")
+            with self.assertRaisesRegex(RuntimeError, "no fresh"):
+                _validate_orchestration_completion_for_pass(repo_root, oid)
+
+    def test_add_superseded_run_ids_idempotent_and_audited(self) -> None:
+        from tools.orchestration_runtime import (
+            add_superseded_run_ids, _load_superseded_run_ids)
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            oid = "orch_helper_unit"
+            (repo_root / "workspace" / "orchestrations" / oid).mkdir(parents=True)
+            add_superseded_run_ids(repo_root, oid, run_ids=["a", "b", "a"], reason="r1")
+            add_superseded_run_ids(repo_root, oid, run_ids=["b", "c"], reason="r2")
+            self.assertEqual(_load_superseded_run_ids(repo_root, oid), {"a", "b", "c"})
+            log = (repo_root / "workspace" / "orchestrations" / oid
+                   / "reopen" / "reopen_log.jsonl").read_text(encoding="utf-8").splitlines()
+            self.assertEqual(len(log), 2)
+            self.assertTrue(all(json.loads(x)["event"] == "add_superseded_runs" for x in log))
+
+
 class ResumeDirectiveTest(unittest.TestCase):
     """Resume records a reopen directive for an attribution=ir cross-phase retry."""
 

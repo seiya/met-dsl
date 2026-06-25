@@ -13945,6 +13945,56 @@ def _load_superseded_run_ids(repo_root: Path, orchestration_id: str) -> set[str]
     return {s.strip() for s in ids if isinstance(s, str) and s.strip()}
 
 
+def add_superseded_run_ids(
+    repo_root: Path,
+    orchestration_id: str,
+    *,
+    run_ids: Sequence[str],
+    reason: str,
+) -> dict[str, Any]:
+    """Tombstone `run_ids` into the superseded set without a reopen.
+
+    `reopen_phase` tombstones prior-attempt runs when a cross-phase decision archives a
+    phase's step_results. This is the same temporal-cut supersede applied at a SECOND point:
+    a phase attempt that fail-closes on a leaf transport error (e.g. the judge leaf hit a
+    session limit) leaves its already-terminalized substep agents recorded in agent_runs.jsonl
+    but with NO step_result (the attempt never wrote one). On a later `--resume` the phase
+    re-runs fresh, and `_validate_orchestration_completion_for_pass` would otherwise flag those
+    orphaned substep arids ("missing substep_agent_run_ids entry"). Tombstoning them here makes
+    that check exempt them (the resumed fresh attempt supplies the required replacement run).
+
+    Unlike `reopen_phase` this does NOT archive step_results (there are none) and requires no
+    agent_runs trigger — it only merges the ids and appends an audit line. Idempotent.
+    """
+    add = {r.strip() for r in run_ids if isinstance(r, str) and r.strip()}
+    existing = _load_superseded_run_ids(repo_root, orchestration_id)
+    merged_ids = sorted(existing | add)
+    # Append the audit line first, then commit by writing the superseded set LAST (mirrors
+    # reopen_phase's ordering at :14161-14188).
+    log_path = _reopen_log_path(repo_root, orchestration_id)
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    with log_path.open("a", encoding="utf-8") as fh:
+        fh.write(json.dumps({
+            "at": _utc_now_iso(),
+            "event": "add_superseded_runs",
+            "reason": reason,
+            "superseded_agent_run_ids": sorted(add),
+        }, ensure_ascii=False) + "\n")
+    _write_json(
+        _superseded_runs_path(repo_root, orchestration_id),
+        {
+            "orchestration_id": orchestration_id,
+            "superseded_agent_run_ids": merged_ids,
+        },
+    )
+    return {
+        "status": "superseded",
+        "orchestration_id": orchestration_id,
+        "superseded_now": sorted(add),
+        "superseded_run_count": len(merged_ids),
+    }
+
+
 def reopen_phase(
     repo_root: Path,
     orchestration_id: str,
@@ -15575,6 +15625,27 @@ def main(argv: list[str] | None = None) -> int:
         help="Optional semantic_review finding id that drove the attribution.",
     )
 
+    add_superseded_parser = subparsers.add_parser(
+        "add-superseded-runs",
+        help=(
+            "Tombstone agent_run_ids into the superseded set without a reopen. Used when a "
+            "phase attempt fail-closes on a leaf transport error (e.g. judge session limit): "
+            "its already-terminalized substep agents have no step_result, so they must be "
+            "exempted from the completion vouch so a later --resume (which re-runs the phase "
+            "fresh) can reach pass. Idempotent; does not archive step_results."
+        ),
+    )
+    add_superseded_parser.add_argument("--repo-root", required=True)
+    add_superseded_parser.add_argument("--orchestration-id", required=True)
+    add_superseded_parser.add_argument(
+        "--run-ids", required=True, nargs="+",
+        help="agent_run_ids to tombstone (the failed attempt's terminalized substep arids).",
+    )
+    add_superseded_parser.add_argument(
+        "--reason", required=True,
+        help="Reason code for the tombstone (e.g. leaf_transport_error_orphan).",
+    )
+
     dismiss_viol_parser = subparsers.add_parser(
         "dismiss-violation",
         help=(
@@ -15915,6 +15986,17 @@ def main(argv: list[str] | None = None) -> int:
             )
         except (ValueError, RuntimeError) as exc:
             print(f"reopen-phase: {exc}", file=sys.stderr)
+            return 1
+    elif args.command == "add-superseded-runs":
+        try:
+            result = add_superseded_run_ids(
+                repo_root,
+                args.orchestration_id,
+                run_ids=args.run_ids,
+                reason=args.reason,
+            )
+        except (ValueError, RuntimeError, OSError) as exc:
+            print(f"add-superseded-runs: {exc}", file=sys.stderr)
             return 1
     elif args.command == "dismiss-violation":
         try:
