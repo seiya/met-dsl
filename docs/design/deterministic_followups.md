@@ -226,18 +226,75 @@ full implementation note). What was the gap, and what closed it:
   non-leaf branch live; `_stage_dependency_sources` (called from `_build_inproc`) stages each
   closure `<dep>_model.f90` into `$(OBJDIR)` from the dep's ready pipeline lineage; synthetic-IR
   unit tests cover closure order, Makefile rules, staging, and conductor↔runtime agreement.
-- **Remaining (the reason this stays open):** the wired path has never run end-to-end. A
-  minimal 2-node dependency spec is now **authored** (`spec/component/demo/dep_chain/demo_dep_base`
-  leaf + `demo_dep_top` which `use`s it; both registered in `spec/registry/spec_catalog.yaml`;
-  closure resolution verified offline via `_resolve_dependency_closure` → `[demo_dep_base@0.1.0]`).
-  The remaining operator-gated step is the **billed, long** run:
-  `python3 tools/run_workflow.py spec/component/demo/dep_chain/demo_dep_top validate --llm claude --with-deps`
-  confirmed to `meta=pass` + `aggregate_verdict=pass`. That is the only outstanding D1 work.
+- **E2E run (2026-06-25): dependency build VERIFIED.** Ran
+  `run_workflow.py spec/component/demo/dep_chain/demo_dep_top validate --llm claude --with-deps`
+  (orchestrations `orch_20260625T025619Z_3d1917e0` base / `…_9a123e7d` top). The dependency node
+  `demo_dep_base` completed `compile→validate` with `aggregate_verdict=pass`. For `demo_dep_top`
+  the conductor authored the dependency Makefile (`DEP_OBJS = $(OBJDIR)/demo_dep_base_model.o` +
+  the staged `$(OBJDIR)/demo_dep_base_model.o: $(OBJDIR)/demo_dep_base_model.f90` rule),
+  `_stage_dependency_sources` staged the certified `demo_dep_base_model.f90` into the per-run
+  `$(OBJDIR)`, and **real gfortran compiled + linked the closure** into `demo_dep_top_runner`
+  (`binary_meta: status=pass, dependency_check.resolved=match`; build phase passed). That is
+  conclusive proof Model B works end-to-end.
+- **Caveat — target node did not reach `aggregate_verdict=pass`.** `demo_dep_top` `fail_closed`
+  with `retry_budget_exhausted` at `validate.execute` — **NOT a dependency-build issue** (build
+  linked the closure correctly). Two E2E runs pinned the real blocker to the **validate
+  `post_execute` dependency-DAG scope check** that the `--with-deps` cross-orchestration model does
+  not satisfy — see **D2** below for the full root-cause + fix options. (A first-pass hypothesis
+  blamed the demo `tests.md` xfail wording; clarifying it did make the runner emit a clean
+  `verdict.overall=pass`, but Validate still failed on the DAG-scope check, so the spec was not the
+  blocker.)
 
-## D2 — `--with-deps` closure wires build artifacts via staging (resolved with D1)
+## D2 — `--with-deps` closure: build wired via staging; **validate-scope DAG check still open**
 Building node N now consumes its dependency nodes' built sources through
-`_stage_dependency_sources` (each dep's `<dep>_model.f90` from its ready pipeline). Closed with
-D1's implementation; E2E verification is the same outstanding item as D1.
+`_stage_dependency_sources` (each dep's `<dep>_model.f90` from its ready pipeline). The BUILD path
+is closed + E2E-verified (D1).
+
+**Open (found by the 2026-06-25 E2E re-runs):** the **validate `post_execute` dependency-DAG
+scope check** is incompatible with the `--with-deps` cross-orchestration model and blocks a
+dependency node from completing Validate. `_validate_impl`
+(`tools/validate_pipeline_semantics.py:8150-8215`) requires every closure node in `all_nodes` to be
+present in the *validation scope* (the executions/lineages gathered from the passed
+`--pipeline-root`/`--run-id`), unless the dependency block carries a `resolved_at` token (compiled
+IRs here carry none). But the conductor runs the gate with only the node's OWN pipeline/run
+(`_execute_inproc`: `--stage post_execute --pipeline-root <self> --run-id <self>`), so a dependency
+that ran as a SEPARATE `--with-deps` orchestration (its own pipeline) is never in scope →
+`dependency DAG incomplete for validation scope; missing node workflows [<dep>]` (+ "node plans /
+pipelines not issued"). This fails `validate.execute` on every attempt → `generate exceeded 3`
+fail_closed, even though the dependency build linked correctly (`binary_meta.resolved=match`) and
+the runner's diagnostics are clean (`verdict.overall=pass`). Confirmed on
+`orch_20260625T045636Z_9f9a00cb` (demo_dep_top): base ready+skipped, build pass, diagnostics pass,
+yet post_execute fails the DAG-scope check.
+
+**Fix — IMPLEMENTED (validator-side, 2026-06-25).** A conductor-only fix (pass dep pipeline-roots
+to the post_execute gate) would be **incomplete**: the `validate.judge` leaf runs its own
+`pre_judge` gate, which routes through the SAME `_validate_impl` DAG check
+(`validate_pipeline_semantics.py:8419-8435` — both `post_execute` and `pre_judge` call `validate()`),
+and the judge's scope is not conductor-controlled. So the fix is validator-side and covers every
+caller at once: `_closure_node_validated_in_own_pipeline(repo_root, <kind>/<spec_id>)` — only in the
+token-less ("validation scope") DAG branch — excuses a `missing` closure node when it has its OWN
+**fully built+validated** pipeline elsewhere (`workspace/pipelines/<kind>__<spec_id>__*/<pipe>` with
+a `binary/*/binary_meta.json` `verification_status=pass` AND a `runs/**/aggregate_verdict.json`
+`pass`/`xfail` whose sibling `trial_meta.source_binary_id` binds it to that SAME passing binary),
+which is exactly the `--with-deps` shape. Requiring the full chain (not a bare `binary_meta` field)
+means a stray/forged one-key JSON or a half-built leftover cannot excuse a node; the binary↔verdict
+binding prevents combining a passing binary from one attempt with an unrelated verdict from another
+(the cross-run mixing the readiness gate rejects via `bound_to_binary_id`, Codex round 24).
+The strict `resolved_at` per-token branch is untouched; a genuinely-incomplete dependency is still
+flagged; path tokens are regex-guarded against traversal; version/freshness binding of the SPECIFIC
+resolved dep is enforced separately at launch by the readiness gate
+(`_verify_dependency_readiness`). **Verified read-only against the real failed-run artifacts**
+(`orch_20260625T045636Z_9f9a00cb` run_20260625_003): the previously-failing `post_execute` gate now
+returns `PASS`. Unit tests added (`test_validate_pipeline_semantics.py`: built-dep excused /
+unbuilt-dep still flagged / failed-binary not excused / traversal guard); suite green (1571).
+
+**Not yet done:** a billed `--with-deps` re-run to confirm the target reaches `aggregate_verdict=pass`
+end-to-end (deferred by operator choice — the fix is verified against the captured failing artifacts,
+which is the same gate the live run invokes).
+
+Note: the demo `tests.md` xfail wording was ALSO clarified (2026-06-25) so the runner emits a clean
+`verdict.overall=pass` with `input_guard` as a passing guard — a real robustness improvement, but it
+was NOT the blocker (this DAG-scope check is). Both E2E runs failed here.
 
 ## L (latent / low severity — fix opportunistically)
 - **L1** Generated Makefile emits a harmless `make` warning `target '.' given more than once`

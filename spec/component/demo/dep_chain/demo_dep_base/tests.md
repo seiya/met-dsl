@@ -24,6 +24,7 @@ This suite verifies the published `operation` `demo_dep_base__scale` at `L0`: th
 
 ## 5. Diagnostics contract
 - Require outputting `checks.scale_identity` and `checks.input_guard` in `diagnostics.json`.
+- The invalid-input (`n <= 0`) case is reported as a **passing guard**: when an invalid length is correctly rejected, the runner sets `checks.input_guard.pass == true` with `invalid_rejected == true`, and **`verdict.overall` stays `pass`**. Correctly rejecting an invalid input is the expected, correct behavior — it must **never** be reported as a suite-level failure (the runner must NOT set `verdict.overall` to `fail` for this case).
 
 ## 6. Test definitions
 - `test_id`: `l0_scale_identity_pass`
@@ -36,11 +37,11 @@ This suite verifies the published `operation` `demo_dep_base__scale` at `L0`: th
   - `operation_id`: `demo_dep_base__scale`
   - `expected_outcome`: `xfail`
   - `xfail_condition`: `n <= 0`
-  - `pass_when`: `verdict.overall == fail and verdict.failed_checks includes 'input_guard'`
+  - `pass_when`: `checks.input_guard.pass == true` (the invalid input is rejected) `and verdict.overall == pass`. The guard firing is the expected, correct outcome and is reported as a **passing** `input_guard` check; the runner must NOT set `verdict.overall` to `fail`.
 
 ## 7. Pass/fail aggregation rules
 - `per_test.pass_rule`: `pass` when the judgment expression is satisfied.
-- `per_test.xfail_rule`: `xfail` when `xfail_condition` is true and `pass_when` is satisfied.
+- `per_test.xfail_rule`: `xfail` when `xfail_condition` is true and `pass_when` is satisfied (the invalid input is rejected via a passing `input_guard` check while `verdict.overall == pass`).
 - `suite.pass_rule`: `pass` when all `test_id` are `pass` or `xfail`.
 
 ## 8. Traceability

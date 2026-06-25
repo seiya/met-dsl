@@ -5942,6 +5942,101 @@ def _dependency_run_token(dep_data: dict[str, Any]) -> str | None:
     return None
 
 
+_NODE_KEY_TOKEN_PART_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+
+
+def _closure_node_validated_in_own_pipeline(repo_root: Path, normalized_token: str) -> bool:
+    """True iff a closure node (a normalized ``<kind>/<spec_id>`` token, version-agnostic to
+    match the DAG check's tokens) has its OWN fully-validated pipeline elsewhere in the
+    workspace — i.e. some ``workspace/pipelines/<kind>__<spec_id>__*/<pipe>`` that carries a
+    ``binary/*/binary_meta.json`` with ``verification_status == pass`` AND a
+    ``runs/**/aggregate_verdict.json`` (``pass``/``xfail``) whose sibling ``trial_meta.json`` binds
+    it (``source_binary_id``) to that SAME passing binary. The binary↔verdict binding prevents
+    combining a passing binary from one attempt with an unrelated verdict from another (the
+    cross-run mixing the readiness gate rejects via ``bound_to_binary_id``; Codex round 24).
+
+    Rationale: the ``--with-deps`` orchestration model runs each dependency node as a SEPARATE
+    orchestration/pipeline, then runs the dependent. The dependent's validation scope
+    (``--pipeline-root`` / ``--run-id``) therefore does NOT contain the dependency's pipeline, so
+    the DAG-completeness check below would wrongly flag a genuinely-completed dependency as a
+    missing node workflow / plan / pipeline. A dependency that has its own VALIDATED pipeline is a
+    completed workflow — accept it cross-pipeline. Only the ``resolved_at``-token-less
+    ("validation scope") branch consults this; the per-token branch keeps its strict, single-scope
+    semantics.
+
+    Requiring the full built+validated chain (not a bare ``binary_meta`` field) is deliberate:
+    it means only a node that genuinely completed its own ``compile→build→validate`` excuses the
+    DAG requirement, so a stray/forged single-key ``binary_meta.json`` or a half-built leftover
+    cannot. Freshness/version binding of the SPECIFIC resolved dependency is enforced separately
+    at launch by the dependency-readiness gate (``orchestration_runtime._verify_dependency_
+    readiness``); this check only certifies DAG completeness (the node ran), at the same
+    version-agnostic granularity the surrounding DAG comparison already uses.
+    """
+    token = normalized_token.strip()
+    if "/" not in token:
+        return False
+    kind, _, spec_id = token.partition("/")
+    kind = kind.strip()
+    spec_id = spec_id.strip()
+    if not (kind and spec_id
+            and _NODE_KEY_TOKEN_PART_RE.match(kind)
+            and _NODE_KEY_TOKEN_PART_RE.match(spec_id)):
+        return False
+    pipelines_root = repo_root / "workspace" / "pipelines"
+    if not pipelines_root.is_dir():
+        return False
+
+    def _passing_binary_ids(pipe: Path) -> set[str]:
+        ids: set[str] = set()
+        for meta_path in pipe.glob("binary/*/binary_meta.json"):
+            if not meta_path.is_file():
+                continue
+            try:
+                data = json.loads(meta_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            if (isinstance(data, dict)
+                    and str(data.get("verification_status", "")).strip().lower() == "pass"):
+                ids.add(meta_path.parent.name)  # binary_id == the binary/<id>/ dir name
+        return ids
+
+    def _has_verdict_bound_to(pipe: Path, passing_binary_ids: set[str]) -> bool:
+        # A pass/xfail aggregate_verdict counts ONLY when its sibling trial_meta.json binds it
+        # (source_binary_id) to a PASSING binary in this pipeline. This prevents combining a
+        # passing binary from one attempt with an unrelated verdict from another (the cross-run
+        # mixing the readiness gate rejects via bound_to_binary_id; Codex round 24).
+        for v_path in pipe.glob("runs/*/*/aggregate_verdict.json"):
+            if not v_path.is_file():
+                continue
+            try:
+                vdata = json.loads(v_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            if not (isinstance(vdata, dict)
+                    and str(vdata.get("aggregate_verdict", "")).strip().lower() in ("pass", "xfail")):
+                continue
+            tm_path = v_path.parent / "trial_meta.json"
+            try:
+                tmdata = json.loads(tm_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            source_binary_id = tmdata.get("source_binary_id") if isinstance(tmdata, dict) else None
+            if isinstance(source_binary_id, str) and source_binary_id in passing_binary_ids:
+                return True
+        return False
+
+    for safe_dir in pipelines_root.glob(f"{kind}__{spec_id}__*"):
+        if not safe_dir.is_dir():
+            continue
+        for pipe in safe_dir.iterdir():
+            if not pipe.is_dir():
+                continue
+            passing_binary_ids = _passing_binary_ids(pipe)
+            if passing_binary_ids and _has_verdict_bound_to(pipe, passing_binary_ids):
+                return True
+    return False
+
+
 def _spec_id_from_node_key(node_key: str) -> str | None:
     if "/" not in node_key:
         return None
@@ -8146,6 +8241,17 @@ def _validate_impl(
             continue
         scope_nodes_by_token.setdefault(token, set()).add(_normalize_node_key_token(execution.node_key))
 
+    # Cross-pipeline cache: a closure node absent from the current validation scope is still
+    # DAG-satisfied when it has its own fully-validated pipeline (the --with-deps model; see
+    # _closure_node_validated_in_own_pipeline). Only the token-less "validation scope" branch
+    # uses this — the per-token (resolved_at) branch keeps strict single-scope semantics.
+    _xp_cache: dict[str, bool] = {}
+
+    def _xp_satisfied(node_token: str) -> bool:
+        if node_token not in _xp_cache:
+            _xp_cache[node_token] = _closure_node_validated_in_own_pipeline(repo_root, node_token)
+        return _xp_cache[node_token]
+
     seen_dag_violations: set[tuple[Path, str, tuple[str, ...]]] = set()
     for execution, expected_nodes, token in dep_contexts:
         if token is None:
@@ -8155,6 +8261,8 @@ def _validate_impl(
             available_nodes = scope_nodes_by_token.get(token, set())
             scope_label = f"resolved_at={token}"
         missing = sorted(expected_nodes - available_nodes)
+        if token is None and missing:
+            missing = [m for m in missing if not _xp_satisfied(m)]
         if missing:
             key = (execution.pipeline_dir, scope_label, tuple(missing))
             if key in seen_dag_violations:
@@ -8194,6 +8302,10 @@ def _validate_impl(
             scope_label = f"resolved_at={token}"
         missing_pipeline_nodes = sorted(expected_nodes - available_pipeline_nodes)
         missing_plan_nodes = sorted(expected_nodes - available_plan_nodes)
+        if token is None:
+            # A dependency built in its own pipeline (--with-deps) is issued cross-pipeline.
+            missing_pipeline_nodes = [m for m in missing_pipeline_nodes if not _xp_satisfied(m)]
+            missing_plan_nodes = [m for m in missing_plan_nodes if not _xp_satisfied(m)]
         if not missing_pipeline_nodes and not missing_plan_nodes:
             continue
         key = (

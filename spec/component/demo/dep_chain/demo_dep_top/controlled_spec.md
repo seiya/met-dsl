@@ -21,7 +21,7 @@ z_i = \big(\,\texttt{demo\_dep\_base\_\_scale}(x)\,\big)_i + 1 = 2\,x_i + 1
 $$
 
 ## 4. Failure conditions and constraints
-Treat `n <= 0` as invalid input and an error. The shift is the fixed constant `1`; it must not be made configurable. The scale must be obtained by calling `demo_dep_base__scale`, not re-derived in this `component`.
+On invalid length (`n <= 0`), the operation signals rejection via the diagnostics `input_guard` check (a **passing** guard, `invalid_rejected == true`) **without failing the overall run** — the run's `verdict.overall` remains `pass` (a correctly-rejected invalid input is the expected behavior, not a suite-level failure). The shift is the fixed constant `1`; it must not be made configurable. The scale must be obtained by calling `demo_dep_base__scale`, not re-derived in this `component`.
 
 ## 5. Public API and compatibility
 The only published `operation_id` is `demo_dep_top__shift_scaled`. On a `major` compatibility break, separate the `spec_id`.

@@ -2044,6 +2044,127 @@ end program shallow_water2d_runner
             self.assertTrue(any("node plans not issued" in v for v in violations))
             self.assertTrue(any("node pipelines not issued" in v for v in violations))
 
+    # --- cross-pipeline dependency (the --with-deps model): a closure node absent from the
+    # current validation scope but BUILT in its own pipeline is DAG-satisfied (token-less branch). ---
+
+    _XP_MODEL = """module shallow_water2d_model
+use dynamics_shallow_water_flux_2d_rusanov_p0_model
+implicit none
+contains
+subroutine solve(flag)
+  logical, intent(out) :: flag
+  call dynamics_shallow_water_flux_2d_rusanov_p0__compute_flux(flag)
+end subroutine solve
+end module shallow_water2d_model
+"""
+    _XP_RUNNER = """program shallow_water2d_runner
+implicit none
+write(*,*) 'diagnostics only'
+end program shallow_water2d_runner
+"""
+    _XP_DEP_RESOLVED = {
+        "node_key": "problem/shallow_water2d@0.3.0",
+        "direct_deps": ["component/dynamics_shallow_water_flux_2d_rusanov_p0@0.1.0"],
+        "transitive_deps": ["component/dynamics_shallow_water_flux_2d_rusanov_p0@0.1.0"],
+        "topo_level": 1,
+        # NOTE: no `resolved_at` -> token-less "validation scope" branch (the one relaxed).
+        "all_nodes": [
+            {"node_key": "component/dynamics_shallow_water_flux_2d_rusanov_p0@0.1.0"},
+            {"node_key": "problem/shallow_water2d@0.3.0"},
+        ],
+    }
+
+    _XP_DEP_SAFE = "component__dynamics_shallow_water_flux_2d_rusanov_p0__0.1.0"
+
+    @classmethod
+    def _seed_built_dep_pipeline(cls, repo_root: Path, *, binary_status: str = "pass",
+                                 verdict: str | None = "pass", binary_id: str = "bin_20260415_001",
+                                 verdict_binary_id: str | None = None) -> None:
+        """Seed the dependency's OWN pipeline. A genuinely-completed dep needs a passing
+        binary_meta AND a pass/xfail aggregate_verdict whose sibling trial_meta.json binds it
+        (source_binary_id) to that SAME passing binary. `verdict=None` models a half-built
+        (binary only, never validated) leftover; `verdict_binary_id` overrides the binding target
+        to model cross-run mixing (verdict bound to a different/absent binary)."""
+        pipe = (repo_root / "workspace" / "pipelines" / cls._XP_DEP_SAFE / "flux_20260415_001")
+        shutil.rmtree(pipe, ignore_errors=True)  # reset so each call is a clean, well-defined state
+        bm = pipe / "binary" / binary_id / "binary_meta.json"
+        bm.parent.mkdir(parents=True, exist_ok=True)
+        bm.write_text(json.dumps({"verification_status": binary_status}), encoding="utf-8")
+        if verdict is not None:
+            run_node = pipe / "runs" / "run_20260415_001" / cls._XP_DEP_SAFE
+            run_node.mkdir(parents=True, exist_ok=True)
+            (run_node / "aggregate_verdict.json").write_text(
+                json.dumps({"aggregate_verdict": verdict}), encoding="utf-8")
+            (run_node / "trial_meta.json").write_text(
+                json.dumps({"source_binary_id": verdict_binary_id or binary_id}), encoding="utf-8")
+
+    def test_cross_pipeline_built_dependency_excused_from_dag_scope(self) -> None:
+        # --with-deps runs the dependency as a SEPARATE pipeline; it is not in the dependent's
+        # validation scope, but it IS built in its own pipeline -> no DAG-incomplete violation.
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            _seed_shape_expr_schema_into(repo_root)
+            _create_minimal_execution_tree(
+                repo_root,
+                dep_spec_id="dynamics_shallow_water_flux_2d_rusanov_p0",
+                model_text=self._XP_MODEL, runner_text=self._XP_RUNNER,
+                run_command=["./simulate", "workspace/spec.ir.yaml", "workspace/outdir"],
+                dependency_resolved=dict(self._XP_DEP_RESOLVED),
+            )
+            self._seed_built_dep_pipeline(repo_root)
+            pipeline_root = (repo_root / "workspace" / "pipelines"
+                             / "problem__shallow_water2d__0.3.0" / "shallow-water2d_20260415_001")
+            violations = validate(repo_root=repo_root, workspace_root="workspace",
+                                  pipeline_roots=[pipeline_root])
+            self.assertFalse(any("dependency DAG incomplete" in v for v in violations), violations)
+            self.assertFalse(any("not issued for validation scope" in v for v in violations), violations)
+
+    def test_cross_pipeline_unbuilt_dependency_still_flagged(self) -> None:
+        # Same token-less setup but the dependency has NO built pipeline anywhere -> the DAG
+        # relaxation must NOT excuse it (a genuinely-missing dependency still fails).
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            _seed_shape_expr_schema_into(repo_root)
+            _create_minimal_execution_tree(
+                repo_root,
+                dep_spec_id="dynamics_shallow_water_flux_2d_rusanov_p0",
+                model_text=self._XP_MODEL, runner_text=self._XP_RUNNER,
+                run_command=["./simulate", "workspace/spec.ir.yaml", "workspace/outdir"],
+                dependency_resolved=dict(self._XP_DEP_RESOLVED),
+            )
+            # no _seed_built_dep_pipeline
+            pipeline_root = (repo_root / "workspace" / "pipelines"
+                             / "problem__shallow_water2d__0.3.0" / "shallow-water2d_20260415_001")
+            violations = validate(repo_root=repo_root, workspace_root="workspace",
+                                  pipeline_roots=[pipeline_root])
+            self.assertTrue(any("dependency DAG incomplete" in v for v in violations), violations)
+
+    def test_cross_pipeline_helper_requires_full_validated_chain(self) -> None:
+        # The helper excuses a node ONLY when its own pipeline is fully built+validated. A
+        # non-pass binary, a binary-only (never-validated) pipeline, a non-pass verdict, a
+        # missing node, and a traversal token must all be rejected.
+        from tools.validate_pipeline_semantics import _closure_node_validated_in_own_pipeline as ok
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            tok = "component/dynamics_shallow_water_flux_2d_rusanov_p0"
+            self.assertFalse(ok(repo_root, tok))  # nothing yet
+            self._seed_built_dep_pipeline(repo_root, binary_status="fail", verdict="pass")
+            self.assertFalse(ok(repo_root, tok))  # binary fail -> not validated
+            self._seed_built_dep_pipeline(repo_root, binary_status="pass", verdict=None)
+            self.assertFalse(ok(repo_root, tok))  # binary pass but NO verdict (half-built leftover)
+            self._seed_built_dep_pipeline(repo_root, binary_status="pass", verdict="fail")
+            self.assertFalse(ok(repo_root, tok))  # verdict fail -> not validated
+            self._seed_built_dep_pipeline(repo_root, binary_status="pass", verdict="pass")
+            self.assertTrue(ok(repo_root, tok))  # full built+validated chain (verdict bound to the binary)
+            # cross-run mixing: passing binary present, but the verdict is bound (source_binary_id)
+            # to a DIFFERENT binary that is not a passing binary here -> must NOT excuse.
+            self._seed_built_dep_pipeline(repo_root, binary_status="pass", verdict="pass",
+                                          binary_id="bin_20260415_002",
+                                          verdict_binary_id="bin_absent_other")
+            self.assertFalse(ok(repo_root, tok))
+            # path-traversal guard
+            self.assertFalse(ok(repo_root, "component/../etc"))
+
     def test_detects_problem_constant_model_and_runner_diagnostics(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)

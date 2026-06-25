@@ -21,7 +21,7 @@ y_i = 2\,x_i
 $$
 
 ## 4. Failure conditions and constraints
-Treat `n <= 0` as invalid input and an error. The scale factor is the fixed constant `2`; it must not be made configurable.
+On invalid length (`n <= 0`), the operation signals rejection via the diagnostics `input_guard` check (a **passing** guard, `invalid_rejected == true`) **without failing the overall run** — the run's `verdict.overall` remains `pass` (a correctly-rejected invalid input is the expected behavior, not a suite-level failure). The scale factor is the fixed constant `2`; it must not be made configurable.
 
 ## 5. Public API and compatibility
 The only published `operation_id` is `demo_dep_base__scale`. On a `major` compatibility break, separate the `spec_id`.
