@@ -5816,6 +5816,42 @@ def build_bwrap_profile(
     # (rendered after the read-root ro-binds, so it overrides the ro source dir while the
     # rest of the source stays read-only).
     runtime_rw_file_paths: list[str] = []
+    # The leaf's own `run-gate --gate orchestration_read` (the gated-read path the leaf is
+    # directed to for read_manifest entries that are not directly readable) appends one
+    # audit line to access_logs/<arid>.jsonl. That file lives outside write_roots under the
+    # otherwise read-only orchestration root, so without a writable bind the append raises
+    # OSError (EROFS) and crashes the gate — the recurring friction every leaf wasted
+    # thinking on. Bind ONLY this leaf's own per-arid log writable as an individual file
+    # (never the whole access_logs/ dir, which would expose sibling children's logs),
+    # mirroring the gates/<arid>/ per-arid discipline. It is already excluded from the
+    # artifact-write violation check as runtime bookkeeping (`{orch_root}/access_logs/`
+    # runtime-prefix exemption), so this only aligns the bwrap mount with the existing
+    # write-authorization policy. (The audit remains observational, not an enforcement
+    # gate; its bypassability is a known, separately-tracked limitation.)
+    _access_log_rel = _normalize_rel_posix(
+        f"workspace/orchestrations/{orchestration_id}/access_logs/{agent_run_id}.jsonl"
+    )
+    # Reject a symlink at the canonical log path on the UNRESOLVED path (resolve() follows
+    # symlinks, so the containment check below would pass a redirected target) and verify
+    # the resolved path stays under repo_root — mirroring the mcp_owned_audit_logs file-pin
+    # guards below so a swapped symlink or a traversal-laden orchestration_id/agent_run_id
+    # fails closed instead of binding a redirected/out-of-repo file writable.
+    _access_log_orig = repo_root / _access_log_rel
+    if _access_log_orig.is_symlink():
+        raise ValueError(
+            f"access_logs file pin {_access_log_rel!r} is a symlink "
+            f"({_access_log_orig}); only a regular file is permitted")
+    _access_log_abs = _access_log_orig.resolve()
+    try:
+        _access_log_abs.relative_to(resolved_repo_root)
+    except ValueError:
+        raise ValueError(
+            f"access_logs file pin {_access_log_rel!r} resolves outside repo_root "
+            f"({_access_log_abs} is not under {resolved_repo_root})")
+    _access_log_abs.parent.mkdir(parents=True, exist_ok=True)
+    if not _access_log_abs.exists():
+        _access_log_abs.touch()
+    runtime_rw_file_paths.append(_access_log_rel)
     try:
         _out_manifest = _load_allowed_output_manifest(
             repo_root, orchestration_id=orchestration_id, agent_run_id=agent_run_id)
@@ -6014,8 +6050,23 @@ def _append_access_log_line(
     _ensure_orchestration_audit_dirs(repo_root, orchestration_id)
     path = _access_logs_dir(repo_root, orchestration_id) / f"{agent_run_id}.jsonl"
     line = json.dumps(entry, ensure_ascii=False)
-    with path.open("a", encoding="utf-8") as handle:
-        handle.write(line + "\n")
+    # The leaf's per-arid access_logs/<arid>.jsonl is bound writable into its sandbox
+    # (build_bwrap_profile), so the append normally succeeds and the audit trail is kept.
+    # Defense-in-depth: if a future config regresses that bind to read-only, degrade to a
+    # loud warning instead of crashing the gate with an unhandled OSError (the failure mode
+    # that previously made every leaf re-reason about "access_log read-only, non-blocking").
+    # The writable bind — not this except — is the audit-trail guarantee; we warn loudly so
+    # a dropped line is detectable rather than silently swallowed.
+    try:
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(line + "\n")
+    except OSError as exc:
+        print(
+            f"WARNING: access_log append skipped for agent_run_id={agent_run_id!r} "
+            f"(path={path}): {exc}. The orchestration_read gate continues; this audit "
+            "line is not recorded.",
+            file=sys.stderr,
+        )
 
 
 def log_orchestration_read(
@@ -7746,6 +7797,143 @@ def _launch_prompt_template_name(request_payload: dict[str, Any]) -> str:
     return "step agent"
 
 
+def _build_gate_runbook(request_payload: dict[str, Any]) -> str:
+    """Return a fully-resolved "Gate Runbook" block for an LLM ``(step, substep)``.
+
+    The conductor already knows every id / path / scoping value at launch time, so it
+    injects the exact gate commands the leaf must run — eliminating the recurring
+    "rediscover the gate CLI args / scoping / sandbox facts" thinking that dominated
+    category-B leaf wall time. The leaf still RUNS these commands and reacts to their
+    failures; only the mechanics are pre-resolved. Every id/path is substituted to a
+    literal here, leaving only ``<capability_token>`` (and the gated-read ``<PATH>``)
+    symbolic for the leaf to fill — so the subsequent ``<key>`` substitution loop in
+    ``_render_launch_prompt_template`` cannot double-substitute it (order-independent).
+
+    Returns ``""`` for deterministic requests (Build / Validate.execute render the
+    minimal prompt, never this template) and for any ``(step, substep)`` with no defined
+    gate sequence (e.g. ``tune/*`` until it is mapped).
+
+    Invariant: the ``validate_pipeline_semantics --stage`` it emits is exactly the single
+    stage in ``ALLOWED_VALIDATE_PIPELINE_STAGES[(step, substep)]`` (empty set -> no
+    ``validate_pipeline_semantics`` line), so the rendered prompt passes
+    ``_lint_launch_prompt_gate_allowlist`` by construction. The raised ``ValueError`` below
+    makes a future table edit that desyncs this generator fail fast at render time (and in
+    unit tests), independent of ``python3 -O``.
+    """
+    if request_payload.get("deterministic"):
+        return ""
+    step = str(request_payload.get("step", "")).strip()
+    substep = str(request_payload.get("substep", "")).strip()
+    oid = str(request_payload.get("orchestration_id", "")).strip()
+    arid = str(request_payload.get("agent_run_id", "")).strip()
+    ir_ref = str(request_payload.get("ir_ref", "")).strip().rstrip("/")
+    pipeline_ref = str(request_payload.get("pipeline_ref", "")).strip().rstrip("/")
+    run_id = str(request_payload.get("run_id", "")).strip()
+    source_id = str(request_payload.get("source_id", "")).strip()
+
+    # Per-(step, substep) gate command sequence. Each command is a single logical line
+    # (no `\` continuation) so the gate-allowlist stage scanner reads `--stage` within
+    # its bounded lookahead window. Direct-CLI form for the read-only validators (the
+    # form the per-phase SKILL.md files canonicalize); run-gate form only for the truly
+    # gated `orchestration_read` path (shared header below).
+    commands: list[str] = []
+    if step == "compile" and substep == "generate":
+        commands = [
+            "python3 tools/validate_workspace_root.py",
+            f"python3 tools/check_artifact_syntax.py --expect-top object {ir_ref}/spec.ir.yaml",
+        ]
+    elif step == "compile" and substep == "verify":
+        commands = [
+            "python3 tools/validate_workspace_root.py",
+            "python3 tools/check_artifact_syntax.py --expect-top object "
+            f"{ir_ref}/spec.ir.yaml {ir_ref}/ir_meta.json",
+            f"python3 tools/validate_pipeline_semantics.py --stage compile --ir-ref {ir_ref}",
+        ]
+    elif step == "generate" and substep == "generate":
+        commands = [
+            "python3 tools/validate_workspace_root.py",
+        ]
+    elif step == "generate" and substep == "verify":
+        post_generate = (
+            "python3 tools/validate_pipeline_semantics.py --stage post_generate "
+            f"--pipeline-root {pipeline_ref}"
+        )
+        if source_id:
+            post_generate += f" --source-id {source_id}"
+        commands = [
+            "python3 tools/validate_workspace_root.py",
+            post_generate,
+        ]
+    elif step == "validate" and substep == "judge":
+        # Scoped pre_judge: `--pipeline-root`/`--run-id` confine the loaded executions to
+        # this run so historically-broken sibling pipelines/runs cannot fail an otherwise-
+        # conformant node (the exact friction the leaf wasted ~73s rediscovering). This
+        # scoping does NOT relax dependency validation: the cross-pipeline dependency-DAG
+        # check (token-None "validation scope" branch, which accepts a dependency built in
+        # its own separate `--with-deps` pipeline) and the launch-time dependency readiness
+        # check both still run, so a dependent node need not list its dependency pipeline
+        # here.
+        pre_judge = (
+            "python3 tools/validate_pipeline_semantics.py --stage pre_judge "
+            f"--orchestration-id {oid} --in-flight-agent-run-id {arid} "
+            f"--pipeline-root {pipeline_ref}"
+        )
+        if run_id:
+            pre_judge += f" --run-id {run_id}"
+        commands = [
+            "python3 tools/validate_workspace_root.py",
+            pre_judge,
+        ]
+    else:
+        # Unknown / not-yet-mapped (step, substep): emit no runbook rather than guess.
+        return ""
+
+    # Invariant guard (see docstring): never emit a stage outside the canonical allow-set.
+    # Raised (not `assert`) so the check survives `python3 -O` and a future table desync
+    # fails fast at render time rather than producing a launch prompt the gate-allowlist
+    # lint would reject at record-launch.
+    allowed = ALLOWED_VALIDATE_PIPELINE_STAGES.get((step, substep), frozenset())
+    for cmd in commands:
+        if "validate_pipeline_semantics.py" not in cmd:
+            continue
+        match = re.search(r"--stage\s+(\w+)", cmd)
+        emitted = match.group(1) if match else None
+        if emitted not in allowed:
+            raise ValueError(
+                f"_build_gate_runbook emitted stage {emitted!r} not in allowed "
+                f"{sorted(allowed)} for (step={step!r}, substep={substep!r}) — keep it in "
+                "sync with ALLOWED_VALIDATE_PIPELINE_STAGES"
+            )
+
+    lines = [
+        "**Gate Runbook (conductor-resolved — run verbatim; do not re-derive args):** "
+        "run these from the repo root (your cwd); do not `cd`. Where a run-gate command "
+        "needs `<capability_token>`, fill it from your capabilities file.",
+    ]
+    if oid and arid:
+        # Shared gated-read template: only needed for a read_manifest path that a direct
+        # Read reports as blocked. Most reads are directly readable and need no gate.
+        lines.append(
+            "- Gated read of a read_manifest path that a direct Read reports as blocked: "
+            "python3 tools/orchestration_runtime.py run-gate --repo-root . "
+            f"--orchestration-id {oid} --gate orchestration_read --agent-run-id {arid} "
+            "--capability-token <capability_token> --args-json '{\"read_path\":\"<PATH>\"}'"
+        )
+    lines.append("- Required gate command(s) for this substep (exit code 0 required):")
+    for cmd in commands:
+        lines.append(f"  {cmd}")
+    if arid:
+        # Sandbox facts (mirror docs/AGENT_CONTRACT.md so no doc round-trip is needed).
+        lines.append(
+            f"- `workspace/tmp/{arid}/` already exists and is writable — redirect gate "
+            f"stderr there (e.g. `2>workspace/tmp/{arid}/last_gate_stderr.txt`), no need "
+            "to create it. `access_logs/` is runtime-managed audit (`orchestration_read` "
+            "writes it for you; a successful gate returns `result: ok`) — never read or "
+            "write it yourself."
+        )
+    return "\n".join(lines)
+
+
 def _template_placeholder_values(request_payload: dict[str, Any]) -> dict[str, str]:
     orchestration_id = str(request_payload.get("orchestration_id", ""))
     agent_run_id = str(request_payload.get("agent_run_id", ""))
@@ -7785,6 +7973,10 @@ def _template_placeholder_values(request_payload: dict[str, Any]) -> dict[str, s
         "capability_doc_path": capability_doc_path,
         "output_manifest_path": output_manifest_path,
         "read_manifest_path": read_manifest_path,
+        # Fully-resolved per-(step, substep) gate command runbook (empty for
+        # deterministic / unmapped phases). All ids pre-substituted to literals;
+        # only <capability_token> / <PATH> remain symbolic for the leaf to fill.
+        "gate_runbook": _build_gate_runbook(request_payload),
     }
 
 

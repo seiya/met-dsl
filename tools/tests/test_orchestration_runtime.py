@@ -14990,6 +14990,262 @@ class BwrapProfileFilePinTests(unittest.TestCase):
             self.assertIn("symlink", str(ctx.exception))
 
 
+class GateRunbookTests(unittest.TestCase):
+    """_build_gate_runbook emits fully-resolved, allowlist-compliant gate commands per
+    (step, substep), and the rendered launch prompt passes the gate-allowlist lint."""
+
+    BASE = dict(
+        orchestration_id="orch_RUNBOOK_001",
+        agent_run_id="arid-RUNBOOK",
+        node_key="component/demo_dep_top@0.1.0",
+        ir_ref="workspace/ir/component__demo_dep_top__0.1.0/d_002",
+        pipeline_ref="workspace/pipelines/component__demo_dep_top__0.1.0/d_002",
+        source_id="src_20260626_001",
+        run_id="run_20260626_001",
+        parent_agent_run_id="arid-PARENT",
+    )
+
+    def _payload(self, step: str, substep: str, **over: Any) -> dict[str, Any]:
+        p = dict(self.BASE, step=step, substep=substep)
+        p.update(over)
+        return p
+
+    def test_runbook_emits_only_allowed_stage_per_phase(self) -> None:
+        from tools.orchestration_runtime import (
+            _build_gate_runbook,
+            ALLOWED_VALIDATE_PIPELINE_STAGES,
+        )
+        import re as _re
+
+        for (step, substep), allowed in ALLOWED_VALIDATE_PIPELINE_STAGES.items():
+            if step == "build" or (step == "validate" and substep == "execute"):
+                continue  # deterministic — covered separately
+            with self.subTest(step=step, substep=substep):
+                rb = _build_gate_runbook(self._payload(step, substep))
+                self.assertTrue(rb, "LLM phase must produce a runbook")
+                stages = set(_re.findall(
+                    r"validate_pipeline_semantics\.py --stage (\w+)", rb))
+                # Every emitted vps stage must be in the allow-set; empty allow-set
+                # means no vps command at all.
+                self.assertTrue(stages <= set(allowed),
+                                f"emitted {stages} not subset of allowed {set(allowed)}")
+                if not allowed:
+                    self.assertNotIn("validate_pipeline_semantics.py", rb)
+
+    def test_runbook_ids_fully_resolved_only_token_symbolic(self) -> None:
+        from tools.orchestration_runtime import _build_gate_runbook
+        import re as _re
+
+        rb = _build_gate_runbook(self._payload("compile", "verify"))
+        # ir_ref / orchestration_id / agent_run_id resolved to literals.
+        self.assertIn("workspace/ir/component__demo_dep_top__0.1.0/d_002/spec.ir.yaml", rb)
+        self.assertIn("--orchestration-id orch_RUNBOOK_001", rb)
+        self.assertIn("arid-RUNBOOK", rb)
+        # Only <capability_token> / <PATH> remain as angle-bracket placeholders.
+        leftover = set(_re.findall(r"<([a-zA-Z_]+)>", rb))
+        self.assertEqual(leftover, {"capability_token", "PATH"})
+
+    def test_runbook_judge_scopes_pre_judge_to_own_run(self) -> None:
+        from tools.orchestration_runtime import _build_gate_runbook
+
+        rb = _build_gate_runbook(self._payload("validate", "judge"))
+        self.assertIn("--stage pre_judge", rb)
+        self.assertIn("--in-flight-agent-run-id arid-RUNBOOK", rb)
+        self.assertIn(
+            "--pipeline-root workspace/pipelines/component__demo_dep_top__0.1.0/d_002", rb)
+        self.assertIn("--run-id run_20260626_001", rb)
+
+    def test_runbook_generate_verify_includes_source_id_when_present(self) -> None:
+        from tools.orchestration_runtime import _build_gate_runbook
+
+        rb = _build_gate_runbook(self._payload("generate", "verify"))
+        self.assertIn("--stage post_generate", rb)
+        self.assertIn("--source-id src_20260626_001", rb)
+        # Without source_id the flag is omitted (no stray "--source-id").
+        rb2 = _build_gate_runbook(self._payload("generate", "verify", source_id=""))
+        self.assertIn("--stage post_generate", rb2)
+        self.assertNotIn("--source-id", rb2)
+
+    def test_runbook_empty_for_deterministic_and_unmapped(self) -> None:
+        from tools.orchestration_runtime import _build_gate_runbook
+
+        self.assertEqual(
+            _build_gate_runbook(self._payload("build", "", deterministic=True)), "")
+        self.assertEqual(
+            _build_gate_runbook(
+                self._payload("validate", "execute", deterministic=True)), "")
+        # Unmapped (e.g. tune/*) falls through to empty, never KeyError.
+        self.assertEqual(_build_gate_runbook(self._payload("tune", "generate")), "")
+
+    def test_rendered_prompt_substitutes_runbook_and_passes_lint(self) -> None:
+        from tools.orchestration_runtime import (
+            prepare_launch_request_payload,
+            render_launch_prompt_text,
+            _validate_launch_prompt_text,
+        )
+
+        for step, substep in (
+            ("compile", "generate"),
+            ("compile", "verify"),
+            ("generate", "generate"),
+            ("generate", "verify"),
+            ("validate", "judge"),
+        ):
+            with self.subTest(step=step, substep=substep):
+                payload = prepare_launch_request_payload(self._payload(step, substep))
+                rendered = render_launch_prompt_text(payload)
+                self.assertNotIn("<gate_runbook>", rendered)
+                self.assertIn("Gate Runbook", rendered)
+                # Must not raise (gate-allowlist lint + constraint-line checks).
+                _validate_launch_prompt_text(payload, rendered)
+
+    def test_rendered_prompt_unmapped_phase_no_stray_marker(self) -> None:
+        """An LLM phase with no runbook mapping (e.g. tune/*) must still render with the
+        <gate_runbook> placeholder cleanly collapsed, never left literal."""
+        from tools.orchestration_runtime import (
+            prepare_launch_request_payload,
+            render_launch_prompt_text,
+        )
+
+        payload = prepare_launch_request_payload(self._payload("tune", "generate"))
+        rendered = render_launch_prompt_text(payload)
+        self.assertNotIn("<gate_runbook>", rendered)
+        self.assertNotIn("Gate Runbook", rendered)
+
+    def test_rendered_prompt_lint_still_fires_on_forbidden_stage(self) -> None:
+        """Negative control: the runbook must not have disabled the allowlist lint."""
+        from tools.orchestration_runtime import (
+            prepare_launch_request_payload,
+            render_launch_prompt_text,
+            _validate_launch_prompt_text,
+        )
+
+        payload = prepare_launch_request_payload(self._payload("generate", "verify"))
+        rendered = render_launch_prompt_text(payload)
+        # Inject a forbidden stage (pre_judge) for generate/verify.
+        tampered = rendered + (
+            "\npython3 tools/validate_pipeline_semantics.py --stage pre_judge "
+            "--orchestration-id x\n")
+        with self.assertRaises(ValueError):
+            _validate_launch_prompt_text(payload, tampered)
+
+
+class AccessLogWritableBindTests(unittest.TestCase):
+    """The leaf's own access_logs/<arid>.jsonl is bound writable (per-file), and the
+    orchestration_read audit append degrades gracefully instead of crashing under EROFS."""
+
+    def _write_cap_and_manifest(
+        self, repo_root: Path, *, orchestration_id: str, agent_run_id: str
+    ) -> None:
+        from tools.orchestration_runtime import (
+            _capabilities_dir,
+            _read_manifests_dir,
+            _ensure_orchestration_audit_dirs,
+        )
+        _ensure_orchestration_audit_dirs(repo_root, orchestration_id)
+        cap_dir = _capabilities_dir(repo_root, orchestration_id)
+        cap_dir.mkdir(parents=True, exist_ok=True)
+        (cap_dir / f"{agent_run_id}.json").write_text(
+            json.dumps({"agent_run_id": agent_run_id, "write_roots": ["workspace/out/"]}),
+            encoding="utf-8",
+        )
+        rm_dir = _read_manifests_dir(repo_root, orchestration_id)
+        rm_dir.mkdir(parents=True, exist_ok=True)
+        (rm_dir / f"{agent_run_id}.json").write_text(
+            json.dumps({"agent_run_id": agent_run_id, "allowed_read_roots": ["workspace/"]}),
+            encoding="utf-8",
+        )
+
+    def test_own_access_log_pre_created_and_bound_per_file(self) -> None:
+        from tools.orchestration_runtime import build_bwrap_profile, render_bwrap_command
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            orch = "orch_acclog_001"
+            run_id = "run_acclog_001"
+            self._write_cap_and_manifest(repo_root, orchestration_id=orch, agent_run_id=run_id)
+            profile = build_bwrap_profile(
+                repo_root=repo_root, orchestration_id=orch, agent_run_id=run_id,
+                backend_command="python3 agent.py",
+            )
+            log_rel = f"workspace/orchestrations/{orch}/access_logs/{run_id}.jsonl"
+            log_abs = (repo_root / log_rel).resolve()
+            self.assertTrue(log_abs.exists(), "own access_log must be pre-created")
+            self.assertIn(log_rel, profile["runtime_rw_file_paths"])
+            # Must be a per-FILE bind, never the whole access_logs/ dir (sibling exposure).
+            self.assertNotIn(
+                f"workspace/orchestrations/{orch}/access_logs/",
+                profile["runtime_rw_rel_paths"])
+            cmd = render_bwrap_command(profile=profile, command_argv=["python3", "agent.py"])
+            bind_targets = [cmd[i + 1] for i, t in enumerate(cmd) if t == "--bind"]
+            self.assertIn(str(log_abs), bind_targets)
+            self.assertNotIn(str(log_abs.parent), bind_targets,
+                             "the access_logs/ dir itself must NOT be bound")
+
+    def test_append_access_log_degrades_on_readonly(self) -> None:
+        """A read-only access_logs append must not raise (gate would otherwise crash);
+        it warns and continues."""
+        from tools.orchestration_runtime import _append_access_log_line
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            orch = "orch_acclog_ro_001"
+            run_id = "run_acclog_ro_001"
+            # Patch Path.open to raise EROFS for the access_log path only.
+            real_open = Path.open
+
+            def fake_open(self_path, *a, **k):  # type: ignore[no-untyped-def]
+                if self_path.name == f"{run_id}.jsonl":
+                    raise OSError(30, "Read-only file system")
+                return real_open(self_path, *a, **k)
+
+            buf = io.StringIO()
+            with patch.object(Path, "open", fake_open), redirect_stderr(buf):
+                # Must not raise.
+                _append_access_log_line(repo_root, orch, run_id, {"path": "docs/x.md"})
+            self.assertIn("access_log append skipped", buf.getvalue())
+
+    def test_append_access_log_writes_line_normally(self) -> None:
+        from tools.orchestration_runtime import _append_access_log_line, _access_logs_dir
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            orch = "orch_acclog_ok_001"
+            run_id = "run_acclog_ok_001"
+            _append_access_log_line(repo_root, orch, run_id, {"path": "docs/x.md"})
+            log = _access_logs_dir(repo_root, orch) / f"{run_id}.jsonl"
+            self.assertTrue(log.exists())
+            self.assertIn("docs/x.md", log.read_text(encoding="utf-8"))
+
+    def test_access_log_symlink_pin_rejected(self) -> None:
+        """A symlink planted at the canonical access_log path must fail closed (parity with
+        the mcp_owned_audit_logs file-pin symlink guard) so resolve()+bind cannot expose a
+        redirected target writable."""
+        from tools.orchestration_runtime import (
+            build_bwrap_profile,
+            _access_logs_dir,
+            _ensure_orchestration_audit_dirs,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            orch = "orch_acclog_sym_001"
+            run_id = "run_acclog_sym_001"
+            self._write_cap_and_manifest(repo_root, orchestration_id=orch, agent_run_id=run_id)
+            _ensure_orchestration_audit_dirs(repo_root, orch)
+            log_dir = _access_logs_dir(repo_root, orch)
+            log_dir.mkdir(parents=True, exist_ok=True)
+            outside = repo_root / "outside_target.jsonl"
+            outside.write_text("", encoding="utf-8")
+            (log_dir / f"{run_id}.jsonl").symlink_to(outside)
+            with self.assertRaises(ValueError) as ctx:
+                build_bwrap_profile(
+                    repo_root=repo_root, orchestration_id=orch, agent_run_id=run_id,
+                    backend_command="python3 agent.py",
+                )
+            self.assertIn("symlink", str(ctx.exception))
+
+
 class PreWriteManifestExtensionPolicyTests(unittest.TestCase):
     """_validate_paths_against_allowed_output_manifest must enforce extension policy pre-mutation."""
 
