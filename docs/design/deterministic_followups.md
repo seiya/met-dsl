@@ -358,7 +358,7 @@ staged the certified `demo_dep_base_model`, and **real gfortran compiled+linked 
 (previously only the same-session two-orchestration evidence existed). **The target did NOT reach
 `aggregate_verdict=pass`, but the blocker is unrelated to dependencies — see D4.**
 
-## D4 — runner snapshot filename off the per-case `<case_id>.json` contract (code IMPLEMENTED 2026-06-26; E2E re-run pending)
+## D4 — runner snapshot filename off the per-case `<case_id>.json` contract (FIXED + E2E-CONFIRMED 2026-06-26)
 `demo_dep_top` `fail_closed` at `validate.execute` (dev `dev_phase_rollback`) **despite**
 `trial_meta.status=pass`, clean `diagnostics.json` (`verdict.overall=pass`), and the post_execute
 **semantic** gate passing (verified standalone PASS, both legacy and orchestration-context). Root cause is
@@ -409,8 +409,15 @@ a THIRD facet of the runner snapshot-filename nondeterminism (same family as D3)
   Authorization stays permissive (promotion still globs `*.json`); only the expected NAME is enforced. Unit
   tests: `test_runner_snapshot_filename_must_be_per_case` (static check: literal flagged / case_id-built ok /
   matching-case_id literal not a false positive / schema exempt / continuation-merge), `SnapshotDeliverableGapTest`
-  (backstop diagnostic). Suite green (1598). **Not yet done:** the billed `--with-deps` re-run confirming
-  `demo_dep_top` reaches `aggregate_verdict=pass` (operator-gated) — this was the LAST known blocker.
+  (backstop diagnostic). Suite green (1598). Committed `c69f9bc`.
+- **E2E-CONFIRMED (2026-06-26, orch `orch_20260626T020724Z_0d7b9e28`, dev `--with-deps`).** Reusing the already-ready
+  `demo_dep_base` (skipped, `status=ready`), `demo_dep_top` ran compile✅→generate✅→build✅→validate✅ all on
+  **attempt 1** and reached **`aggregate_verdict=pass`** (`workflow_status=pass`). Decisive because **dev mode
+  fail-fasts on the first cross-phase rollback** (F1): a clean attempt-1 pass means the taught generator emitted the
+  canonical per-case names on the first try — the runner wrote `l0_shift_scaled_identity_pass.json` +
+  `l0_invalid_length_xfail.json` (exactly the two declared `case_id`s), where the prior failing run wrote a single
+  combined `snapshot_0001.json`. The conductor deliverable gate passed without the backstop firing. This closes the
+  LAST known blocker — `demo_dep_top` now reaches `aggregate_verdict=pass` end-to-end.
 
 - **Proposed fix (NOT implemented — superseded by the IMPLEMENTED fix above):** align the conductor's execute
   snapshot-deliverable check with the canonical contract — require `snapshot_schema.json` + ≥`min_samples`
@@ -420,12 +427,11 @@ a THIRD facet of the runner snapshot-filename nondeterminism (same family as D3)
   This is the D3-style robustness fix one layer down; it is the LAST known blocker to `demo_dep_top`
   reaching `aggregate_verdict=pass`. Alternatively, a prod re-run's retry budget would also absorb it.
 
-**Net status of the original D1/D2 verification:** the dependency BUILD path is now E2E-proven in a live
-`--with-deps` run (the primary open item). Reaching the target's full `aggregate_verdict=pass` was blocked
-only by D4 (a generic, non-dependency snapshot-naming issue), whose **code fix is now implemented** (teach
-the runner the canonical `<case_id>.json` name + early static detection + a deterministic execute backstop;
-suite green 1598). The single remaining step is the operator-gated billed `--with-deps` re-run to confirm
-the target reaches `aggregate_verdict=pass`.
+**Net status of the original D1/D2 verification:** the dependency BUILD path is E2E-proven in a live
+`--with-deps` run, and as of 2026-06-26 the dependency TARGET also reaches full **`aggregate_verdict=pass`**
+end-to-end (orch `orch_20260626T020724Z_0d7b9e28`): `demo_dep_top` reused the ready `demo_dep_base`
+(skipped) and passed all phases on attempt 1 in dev mode. The D4 snapshot-naming blocker is fixed and
+confirmed. No known blockers remain for the demo dependency chain.
 
 ## L (latent / low severity — fix opportunistically)
 - **L1 — DONE (2026-06-25).** Generated Makefile emitted a harmless `make` warning
