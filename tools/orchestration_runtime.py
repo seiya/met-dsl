@@ -1835,7 +1835,16 @@ DEFAULT_BACKEND_COMMANDS = {
 }
 
 # Child agent `skill_must_read_refs`: split workflow spec (see docs/workflow/).
-WORKFLOW_CORE_REF = "docs/workflow/WORKFLOW_CORE.md"
+# WORKFLOW_CORE.md is no longer a leaf must-read (its leaf-actionable invariants
+# + stage-meta keys live in AGENT_CONTRACT.md); it stays readable under docs/, so
+# no module constant points at it. Canonical rationale:
+# docs/design/leaf_must_read_restructure.md.
+# Consolidated runner-output contract, read by the substeps that author/verify/
+# judge runner output (generate.generate, generate.verify, validate.judge).
+RUNNER_OUTPUT_CONTRACT_REF = "docs/workflow/RUNNER_OUTPUT_CONTRACT.md"
+# Canonical step -> phase-doc map. Of these, only `compile` is a leaf must-read
+# (see leaf_contract_doc_refs); the rest are retained as the canonical reference
+# mapping (phase docs stay readable under docs/, just not force-read by leaves).
 WORKFLOW_PHASE_DOC_BY_STEP: dict[str, str] = {
     "compile": "docs/workflow/phases/phase_01_compile.md",
     "generate": "docs/workflow/phases/phase_02_generate.md",
@@ -8531,18 +8540,38 @@ def _merge_unique_refs(*ref_groups: list[str]) -> list[str]:
     return merged
 
 
-def _workflow_contract_refs_for_launch(request_payload: dict[str, Any]) -> list[str]:
-    # The child contract is docs/AGENT_CONTRACT.md (the canonical, child-readable
-    # agent contract). docs/ORCHESTRATION.md is the orchestrator/conductor design
-    # spec and is NOT included here — no step/substep agent reads it (audit: 0/6
-    # substeps did), so listing it only bloated every launch prompt's must_read.
-    refs = [WORKFLOW_CORE_REF, "docs/AGENT_CONTRACT.md"]
-    step = request_payload.get("step")
-    if isinstance(step, str) and step.strip():
-        phase_doc = WORKFLOW_PHASE_DOC_BY_STEP.get(step.strip().lower())
-        if phase_doc:
-            refs.append(phase_doc)
+def leaf_contract_doc_refs(step: str | None) -> list[str]:
+    """The contract docs every LLM leaf of `step` force-reads, in canonical order.
+
+    SINGLE SOURCE OF TRUTH for the leaf contract-doc policy, shared by both
+    must-read assembly paths: the conductor's `workflow_conductor.build_launch_request`
+    (the full launch intent) and record-launch's `_workflow_contract_refs_for_launch`
+    (the security-boundary normalization that guarantees the contract docs are present
+    regardless of caller). Defining it once keeps the two paths from drifting — change
+    the policy here and both sites follow. (`build_launch_request` then appends the
+    node-specific spec artifacts it alone knows; this helper covers only the contract
+    docs, not the SKILL ref or node artifacts.)
+
+    - docs/AGENT_CONTRACT.md: every leaf (carries the leaf-actionable WORKFLOW_CORE
+      invariants + stage-meta keys; WORKFLOW_CORE.md / ORCHESTRATION.md are NOT leaf
+      must-reads — orchestration/operator material that stays readable under docs/).
+    - Compile: + phase_01 (its IR schema is the contract the compile SKILL defers to).
+    - Generate / Validate.judge: + the consolidated runner-output contract.
+      (Build / Validate.execute are deterministic — no leaf reaches here.)
+
+    Canonical: docs/design/leaf_must_read_restructure.md.
+    """
+    refs = ["docs/AGENT_CONTRACT.md"]
+    step_norm = step.strip().lower() if isinstance(step, str) and step.strip() else ""
+    if step_norm == "compile":
+        refs.append(WORKFLOW_PHASE_DOC_BY_STEP["compile"])
+    elif step_norm in ("generate", "validate"):
+        refs.append(RUNNER_OUTPUT_CONTRACT_REF)
     return refs
+
+
+def _workflow_contract_refs_for_launch(request_payload: dict[str, Any]) -> list[str]:
+    return leaf_contract_doc_refs(request_payload.get("step"))
 
 
 def build_skill_must_read_refs(request_payload: dict[str, Any]) -> list[str]:

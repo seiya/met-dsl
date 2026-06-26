@@ -297,8 +297,9 @@ The contract details per phase use the files under [phases/](phases/) as the can
 
 ## Agent reference scope
 
-- The `skill_must_read_refs` of a child `step agent` / `substep agent` is assembled by `build_skill_must_read_refs` of `tools/orchestration_runtime.py`.
-- By default it includes `docs/workflow/WORKFLOW_CORE.md`, `docs/ORCHESTRATION.md`, the target phase's `docs/workflow/phases/phase_*.md`, the `skill_ref`, and the verify-required artifacts. `docs/WORKFLOW.md` is the entry point to the specification.
+- The `skill_must_read_refs` (forced reading) of a child `step agent` / `substep agent` is assembled by `build_skill_must_read_refs` of `tools/orchestration_runtime.py` (and `build_launch_request` of `tools/workflow_conductor.py`). The whole `docs/` tree stays **readable** via the access policy regardless — `skill_must_read_refs` only controls what is *force-read* at cold start.
+- The single common leaf contract is `docs/AGENT_CONTRACT.md` (it carries the leaf-actionable invariants — the subset of this document's §"Workflow common invariants" — plus the `<stage>_meta.json` key rules). **This document (`WORKFLOW_CORE.md`) and `docs/ORCHESTRATION.md` are NOT leaf must-reads** (they are orchestration/operator canonical; no leaf acts on the bulk of them).
+- The phase doc (`docs/workflow/phases/phase_*.md`) is force-read **only for `Compile`** (`phase_01`'s IR schema is the contract the compile SKILL defers to). The `Generate` / `Validate` SKILLs are self-sufficient and cite their phase doc as canonical without force-reading it; `Generate.generate` / `Generate.verify` / `Validate.judge` instead force-read `docs/workflow/RUNNER_OUTPUT_CONTRACT.md` (the consolidated runner-output contract). Canonical rationale: `docs/design/leaf_must_read_restructure.md`. `docs/WORKFLOW.md` is the entry point to the specification.
 
 ## Completion criteria
 - The workflow completion condition is that `orchestration_meta.json`, `agent_graph.json`, and `agent_runs.jsonl` exist under the target workflow's `orchestration_id`.

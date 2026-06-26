@@ -1,5 +1,12 @@
 # Performance diagnostics (perf.json) specification
 
+> **Leaf agents:** the binding `perf.json` field set (§2) and the Fortran JSON
+> numeric/boolean descriptor rules (§6) are mirrored, as the leaf-facing
+> canonical, in [`docs/workflow/RUNNER_OUTPUT_CONTRACT.md`](workflow/RUNNER_OUTPUT_CONTRACT.md)
+> (your must-read for `Generate` / `Validate.judge`). This document remains the
+> full performance-measurement reference; keep the two consistent and add new
+> runner-output rules to `RUNNER_OUTPUT_CONTRACT.md`.
+
 ## Purpose
 - Make it possible to handle performance measurement and performance-regression detection in the same "framework" as the physical-validity tests.
 - Leave CPU/GPU and optimization-transformation comparisons in a form that can be recorded and visualized.

@@ -14,7 +14,7 @@
  "dependency_ref": "workspace/ir/component__dynamics_advdiff_flux_1d_upwind_center2__0.1.0/advdiff-flux-1d-uc2_20260620_001",
  "skill_name": "workflow-generate-generate",
  "skill_ref": "skills/workflow-generate-generate/SKILL.md",
- "skill_must_read_refs": "skills/workflow-generate-generate/SKILL.md,docs/workflow/WORKFLOW_CORE.md,docs/AGENT_CONTRACT.md,docs/workflow/phases/phase_02_generate.md,docs/workflow/phases/phase_03_build.md,docs/workflow/MCP_COMMAND_LOG_PLACEMENT.md,docs/PERFORMANCE_DIAGNOSTICS.md,workspace/ir/component__dynamics_advdiff_flux_1d_upwind_center2__0.1.0/advdiff-flux-1d-uc2_20260620_001/spec.ir.yaml,spec/component/dynamics/advection_diffusion/dynamics_advdiff_flux_1d_upwind_center2/tests.md",
+ "skill_must_read_refs": "skills/workflow-generate-generate/SKILL.md,docs/AGENT_CONTRACT.md,docs/workflow/RUNNER_OUTPUT_CONTRACT.md,workspace/ir/component__dynamics_advdiff_flux_1d_upwind_center2__0.1.0/advdiff-flux-1d-uc2_20260620_001/spec.ir.yaml,spec/component/dynamics/advection_diffusion/dynamics_advdiff_flux_1d_upwind_center2/tests.md",
  "issue_severity": "critical",
  "repair_strategy": "restart",
  "repair_target_agent_run_id": "d870e12d-86bf-4ef4-8785-1734e83f3584",

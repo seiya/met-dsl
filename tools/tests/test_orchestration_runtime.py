@@ -45,6 +45,7 @@ from tools.orchestration_runtime import (
     _validate_agent_summary_text,
     build_launch_prompt_text,
     build_skill_must_read_refs,
+    leaf_contract_doc_refs,
     check_step_completed,
     enable_checkpoint_resume,
     get_preflight_ttl_status,
@@ -1252,7 +1253,9 @@ shell_tool                       stable             true
         self.assertEqual(payload["skill_name"], "workflow-compile-verify")
         self.assertEqual(payload["skill_ref"], "skills/workflow-compile-verify/SKILL.md")
         self.assertEqual(payload["issue_severity"], "none")
-        self.assertIn("docs/workflow/WORKFLOW_CORE.md", payload["skill_must_read_refs"])
+        # WORKFLOW_CORE.md is no longer a leaf must-read (leaf invariants moved to
+        # AGENT_CONTRACT.md); compile still force-reads phase_01 (IR schema).
+        self.assertNotIn("docs/workflow/WORKFLOW_CORE.md", payload["skill_must_read_refs"])
         self.assertIn("docs/workflow/phases/phase_01_compile.md", payload["skill_must_read_refs"])
         self.assertIn("docs/AGENT_CONTRACT.md", payload["skill_must_read_refs"])
         self.assertNotIn("docs/ORCHESTRATION.md", payload["skill_must_read_refs"])
@@ -23994,43 +23997,112 @@ class RepairStepResultExecutorTests(unittest.TestCase):
 
 
 
+class LeafContractDocPolicyTests(unittest.TestCase):
+    """The leaf contract-doc policy (`leaf_contract_doc_refs`) is the single source
+    of truth shared by both must-read assembly paths. This locks in the policy AND
+    the record-launch path (`build_skill_must_read_refs`) directly — the conductor
+    path is separately covered by test_workflow_conductor's reproduce test, so the
+    two together prove the paths cannot drift."""
+
+    def test_leaf_contract_doc_refs_per_step(self) -> None:
+        AC = "docs/AGENT_CONTRACT.md"
+        P1 = "docs/workflow/phases/phase_01_compile.md"
+        RUN = "docs/workflow/RUNNER_OUTPUT_CONTRACT.md"
+        self.assertEqual(leaf_contract_doc_refs("compile"), [AC, P1])
+        self.assertEqual(leaf_contract_doc_refs("generate"), [AC, RUN])
+        self.assertEqual(leaf_contract_doc_refs("validate"), [AC, RUN])
+        # AGENT_CONTRACT is always present; WORKFLOW_CORE never is.
+        for step in ("compile", "generate", "validate", "build", "", None, "bogus"):
+            refs = leaf_contract_doc_refs(step)
+            self.assertEqual(refs[0], AC)
+            self.assertNotIn("docs/workflow/WORKFLOW_CORE.md", refs)
+
+    def test_record_launch_path_emits_same_contract_docs(self) -> None:
+        # The record-launch assembler must reproduce the policy: contract docs present,
+        # WORKFLOW_CORE / phase_02-04 / MCP / PERF absent for the substeps that dropped
+        # them. Feed a representative payload per substep through build_skill_must_read_refs.
+        def refs_for(step, substep, extra=None):
+            payload = {
+                "step": step,
+                "substep": substep,
+                "skill_ref": f"skills/workflow-{step}-{substep}/SKILL.md",
+                "ir_ref": "workspace/ir/component__x__0.1.0/x_20260101_001",
+                "pipeline_ref": "workspace/pipelines/component__x__0.1.0/x_20260101_001",
+            }
+            if extra:
+                payload.update(extra)
+            return build_skill_must_read_refs(payload)
+
+        gen = refs_for("generate", "generate")
+        self.assertIn("docs/AGENT_CONTRACT.md", gen)
+        self.assertIn("docs/workflow/RUNNER_OUTPUT_CONTRACT.md", gen)
+        for absent in (
+            "docs/workflow/WORKFLOW_CORE.md",
+            "docs/workflow/phases/phase_02_generate.md",
+            "docs/workflow/phases/phase_03_build.md",
+            "docs/workflow/MCP_COMMAND_LOG_PLACEMENT.md",
+            "docs/PERFORMANCE_DIAGNOSTICS.md",
+        ):
+            self.assertNotIn(absent, gen)
+
+        judge = refs_for("validate", "judge")
+        self.assertIn("docs/workflow/RUNNER_OUTPUT_CONTRACT.md", judge)
+        self.assertNotIn("docs/workflow/WORKFLOW_CORE.md", judge)
+        self.assertNotIn("docs/workflow/phases/phase_04_validate.md", judge)
+
+        comp = refs_for("compile", "generate")
+        self.assertIn("docs/workflow/phases/phase_01_compile.md", comp)
+        self.assertNotIn("docs/workflow/WORKFLOW_CORE.md", comp)
+
+
 class ChildContextDocSizeTests(unittest.TestCase):
-    """Regression guard: the docs each child step/substep agent reads after launch
-    (AGENT_CONTRACT + its phase doc + MCP_COMMAND_LOG_PLACEMENT for Generate/Build/
-    Validate.execute) are resident every child turn, and child subagents are the
-    majority of a node's token cost (their cache_read scales with this floor ×
-    turns × children). Cap the per-child doc floor to catch re-bloat. Ceilings sit
-    just above current sizes; a deeper safe de-dup (making each phase doc the true
-    superset, then trimming the conceptual overlap with AGENT_CONTRACT /
-    MCP_COMMAND_LOG_PLACEMENT) is review-gated follow-up work — lowering these
-    ceilings is its deliverable, and raising one needs an explicit justification."""
+    """Regression guard: the files each child step/substep LLM leaf FORCE-READS after
+    launch (its SKILL + AGENT_CONTRACT + phase_01 for Compile + RUNNER_OUTPUT_CONTRACT
+    for Generate/Validate.judge — see leaf_contract_doc_refs) are resident every child
+    turn, and child subagents are the majority of a node's token cost (their cache_read
+    scales with this floor × turns × children). Cap the per-child doc floor to catch
+    re-bloat. Only force-read files are guarded — a doc that left the leaf must-read set
+    (WORKFLOW_CORE, phase_02/03/04, PERF, MCP) no longer enters child context, so its
+    size is unguarded. Ceilings sit just above current sizes; raising one needs an
+    explicit justification."""
 
     REPO_ROOT = Path(__file__).resolve().parents[2]
 
     # path -> byte ceiling (current size + small headroom)
+    # Size ceilings apply ONLY to files the LLM leaf force-reads (they land in the
+    # child's cold-start context, so their size is a real cost). A file that is not
+    # a leaf must-read is NOT guarded here, however large — its size does not affect
+    # leaf context. After the leaf-must-read restructure
+    # (docs/design/leaf_must_read_restructure.md) the leaf-read files are:
+    #   - AGENT_CONTRACT.md          (every leaf)
+    #   - RUNNER_OUTPUT_CONTRACT.md  (generate.generate / generate.verify / validate.judge)
+    #   - phase_01_compile.md        (compile.generate / compile.verify — IR schema)
+    #   - skills/workflow-<step>-<substep>/SKILL.md  (each read by its own substep leaf)
+    # WORKFLOW_CORE.md, phase_02/03/04, PERFORMANCE_DIAGNOSTICS.md, and
+    # MCP_COMMAND_LOG_PLACEMENT.md left the leaf must-read set, so their ceilings
+    # were removed (they stay readable under docs/ but no longer enter leaf context).
+    # Build / Validate.execute are deterministic (no SKILL, no leaf), so only the
+    # 5 core LLM-substep SKILLs are guarded.
     _CEILINGS = {
-        "docs/AGENT_CONTRACT.md": 16800,
-        # generate.generate must_read (runner-JSON numeric/descriptor rules, §6);
-        # resident every generate child turn, so guarded against re-bloat too.
-        "docs/PERFORMANCE_DIAGNOSTICS.md": 5200,
-        "docs/workflow/MCP_COMMAND_LOG_PLACEMENT.md": 21000,
+        # AGENT_CONTRACT is the single common leaf contract; it absorbed
+        # WORKFLOW_CORE.md's leaf-actionable invariants + stage-meta keys + the
+        # command_log placement one-liner (bumped 16800->17400 for that).
+        "docs/AGENT_CONTRACT.md": 17400,
+        # Consolidated runner-output contract (was duplicated across phase_02/04 +
+        # PERF §2/§6); leaf must-read for generate.generate/verify + validate.judge.
+        "docs/workflow/RUNNER_OUTPUT_CONTRACT.md": 7600,
+        # Still force-read by compile.generate/verify (its IR schema is the contract
+        # the compile SKILL defers to).
         "docs/workflow/phases/phase_01_compile.md": 17000,
-        # phase_02/03/04 bumps: 5378cfc ("Refine build and validation processes
-        # for Fortran and C/C++ toolchains") added the necessary non-relink
-        # Makefile / out-of-source / toolchain contract text (prevents the
-        # Validate.execute relink unauthorized-write that forced reopen_seq=2).
-        # Justified bumps over the prior 21500 / 8000 / 19000.
-        # phase_02/04 further bumped (22000->22700 / 19500->20200) for the D4 fix:
-        # the per-case snapshot filename contract (runner writes one
-        # raw/state_snapshots/<case_id>.json per case) — closes the recurring
-        # validate.execute deliverable-gate blocker (deterministic_followups.md D4).
-        # phase_02 further bumped (22700->23700) for the D5 fix: the dependency
-        # call-site argument-order contract (§47 authoring + §G7 verify) — Generate
-        # must call <dep>__<op> in the conductor-resolved published-operation order
-        # from <dependency_facts> instead of guessing (deterministic_followups.md D5).
-        "docs/workflow/phases/phase_02_generate.md": 23700,
-        "docs/workflow/phases/phase_03_build.md": 8200,
-        "docs/workflow/phases/phase_04_validate.md": 20200,
+        # Per-substep SKILLs — each force-read by its own LLM leaf.
+        "skills/workflow-compile-generate/SKILL.md": 10800,
+        "skills/workflow-compile-verify/SKILL.md": 11800,
+        # Bumped 22000->22400: inlined the leaf-actionable C003 directive placement
+        # + the f2008 63-char identifier limit (previously only in phase_02, which
+        # generate.generate no longer force-reads) to avoid a lint/build round-trip.
+        "skills/workflow-generate-generate/SKILL.md": 22400,
+        "skills/workflow-generate-verify/SKILL.md": 21400,
+        "skills/workflow-validate-judge/SKILL.md": 10000,
     }
 
     def test_child_context_docs_within_budget(self) -> None:

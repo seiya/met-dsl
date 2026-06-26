@@ -40,6 +40,31 @@
 - With `workflow_mode=dev`, stop with fail the moment `issue_severity=major|critical` is detected in a verify-family judgment.
 - When it fails with `workflow_mode=dev`, include in the reply the basis needed to generate `failure_analysis.json` (the failure reason, related output_refs, a summary of the main logs).
 
+## Workflow behavioral invariants (every leaf)
+
+These are the workflow common norms a leaf must obey while authoring/verifying artifacts. (Canonical for the full orchestration-level invariant set — preflight, agent launch, completion criteria, ID minting, artifact layout — remains `docs/workflow/WORKFLOW_CORE.md`; it is readable under `docs/` but is **not** a leaf must-read. The subset below is what constrains a leaf's own output.)
+
+- Forbid `dummy` output to pass `tests` or advance the workflow. When a phase input is insufficient, stop with `fail`; never complete by guessing.
+- Generate `diagnostics.json` / `perf.json` only as the real execution result of the target `runner`. Forbid hand-writing, fixed-value embedding, and external post-editing. `verdict.json` / `aggregate_verdict.json` must be derived from `tests.md` and the same-`run_id` execution artifacts.
+- On a phase failure, do not artificially generate an artifact to satisfy a downstream phase's start condition.
+- Without explicit instruction, do not view or reference the content of existing/past workflow output (past `ir_id` / `pipeline_id` / `source_id` / `binary_id` / `run_id`). Use as input only the repository-managed `spec` canonical source and the preceding artifacts of the relevant trial.
+- Interpret the requirement definition, output format, and judgment conditions only from `controlled_spec.md` / `tests.md` / `deps.yaml` / `spec.ir.yaml` and the `docs/` canonical sources in your `skill_must_read_refs`. Do not back-derive a requirement from the implementation under `tools/`, verification scripts, test code, or validator code; when a requirement is insufficient, stop with `fail`.
+- The storage root for all workflow artifacts is `workspace/` only; never write outside `workspace/`. Create `workspace/` directly under the repo root if absent.
+
+## Stage meta keys (`<stage>_meta.json`)
+
+Every LLM substep produces its phase's `<stage>_meta.json` (`ir_meta.json` for Compile, `source_meta.json` for Generate, `validate_meta.json` for Validate) as a required output.
+
+- Common required keys: `attempt_count`, `verification_status`, `last_fail_reason`, `debug_mode`, `context_isolated`. When `context_isolated=false`, `constraint_reason` is required.
+- `source_meta.json`: additionally requires `lint_command_ref.run_linter[]` (`command_id`, `command_log_ref`, `preset`) **only when** `verification_status=pass`.
+- `validate_meta.json`: additionally requires the LLM semantic-check evidence in `judge_command_ref` **only when** `verification_status=pass`.
+- With `debug_mode=false`, do not save failed-attempt artifacts. `verification_status` presumes `fail_closed`: unperformed/unjudgeable verification must never be recorded `pass`.
+- **verify-family substeps (`compile.verify` / `generate.verify`):** a `pass` must (re-)author the verified meta with the `Write`/`Edit` tool even when the inspection finds nothing to change (refresh an idempotent field such as `verify_attempts`). An inspect-only verify that writes nothing cannot terminate `pass`.
+
+## MCP `command_log.jsonl` placement
+
+The MCP `build-runtime` server writes `command_log.jsonl` itself as a side effect of `run_linter` / `compile_project` / `run_program` / `run_quality_checks`. It appears in your `allowed_output_paths` at the canonical per-phase path (already enumerated in your manifest / task card) but **not** in `allowed_file_tool_paths` — never write it with a file tool. (Full per-phase placement reference: `docs/workflow/MCP_COMMAND_LOG_PLACEMENT.md`, readable under `docs/` but not a leaf must-read.)
+
 ## Artifact write — direct `Write` / `Edit` tool procedure
 
 Every output artifact — managed JSON (`*_meta.json`, `verdict.json`, …), source code, `.yaml` / `.md` — is written **directly with the `Write` / `Edit` tool** to a path listed in `allowed_file_tool_paths`. You run inside a mandatory `bwrap` sandbox whose only writable paths are your `write_roots`; a `Write` to an `allowed_file_tool_paths` entry is authorized by filesystem-diff containment at terminalization (a change that lands inside `write_roots` is your own confined output). There is no patch step and no separate gate evidence to record. (The pipeline `lineage.json` is not in your `allowed_file_tool_paths` — the conductor authors it host-side.)

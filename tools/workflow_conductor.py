@@ -353,17 +353,12 @@ class NodeRefs:
 # NOTE: `launch_prompt_full` is intentionally OMITTED so record-launch renders the
 # canonical prompt and returns it as `launch_prompt_text` (launch_prompts.md template).
 
-# Universal child-contract docs every substep must read. docs/AGENT_CONTRACT.md is
-# the canonical child-readable contract; docs/ORCHESTRATION.md (orchestrator/conductor
-# design spec) is intentionally excluded — no substep reads it. record-launch's
-# _workflow_contract_refs_for_launch keeps this aligned on the runtime side.
-_DOC_CORE = ("docs/workflow/WORKFLOW_CORE.md", "docs/AGENT_CONTRACT.md")
-_PHASE_DOC = {
-    "compile": "docs/workflow/phases/phase_01_compile.md",
-    "generate": "docs/workflow/phases/phase_02_generate.md",
-    "build": "docs/workflow/phases/phase_03_build.md",
-    "validate": "docs/workflow/phases/phase_04_validate.md",
-}
+# The contract docs every LLM leaf force-reads are derived by the single canonical
+# policy `orchestration_runtime.leaf_contract_doc_refs(step)` (imported lazily where
+# the must-read is assembled). record-launch's `_workflow_contract_refs_for_launch`
+# calls the same helper, so the two must-read assembly paths cannot drift. The
+# node-specific spec artifacts (which only the conductor knows) are appended per-step
+# below. Canonical rationale: docs/design/leaf_must_read_restructure.md.
 
 
 def _skill_name(step: str, substep: str | None) -> str:
@@ -435,8 +430,14 @@ def build_launch_request(
     if substep is not None:
         req["substep"] = substep
 
+    # Base leaf must-read = its SKILL + the contract docs from the single canonical
+    # policy (AGENT_CONTRACT for every leaf; phase_01 for Compile; runner-output
+    # contract for Generate/Validate). The same helper is used by record-launch, so
+    # the two assembly paths cannot drift. The node-specific spec artifacts are
+    # appended per-step below.
+    from tools.orchestration_runtime import leaf_contract_doc_refs
     must_read: list[str] = ([] if deterministic
-                            else [f"skills/{skill}/SKILL.md", *_DOC_CORE, _PHASE_DOC[step]])
+                            else [f"skills/{skill}/SKILL.md", *leaf_contract_doc_refs(step)])
 
     if step == "compile":
         req["dependency_ref"] = f"{spec}/deps.yaml"
@@ -461,14 +462,9 @@ def build_launch_request(
         # keep LLM authoring, so the leaf still lists it there.
         make_entry = [] if makefile_host_authored else [f"{src}/src/Makefile"]
         if substep == "generate":
+            # Contract docs (incl. the consolidated runner-output contract) come from
+            # leaf_contract_doc_refs above; here only node-specific spec artifacts.
             must_read += [
-                _PHASE_DOC["build"],
-                "docs/workflow/MCP_COMMAND_LOG_PLACEMENT.md",
-                # The runner emits JSON; PERFORMANCE_DIAGNOSTICS §6 pins the safe
-                # numeric/descriptor forms that post_generate gates on. Declaring it
-                # up front avoids the agent discovering the need mid-run (an extra
-                # exploration turn observed in audits).
-                "docs/PERFORMANCE_DIAGNOSTICS.md",
                 f"{refs.ir_ref}/spec.ir.yaml",
                 # controlled_spec.md is intentionally NOT must-read here: phase_02
                 # §2-1 forbids Generate.generate from taking controlled_spec.md as

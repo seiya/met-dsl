@@ -29,6 +29,7 @@ The phase that runs the binary produced by `Build`, obtains the primary evidence
 ## substep details
 
 ### 4-1. Validate.execute substep
+> **Runner program-output contract** (what `diagnostics.json` / `perf.json` / `raw/` must contain + the Fortran JSON descriptor rules) is canonical in [docs/workflow/RUNNER_OUTPUT_CONTRACT.md](../RUNNER_OUTPUT_CONTRACT.md). `Validate.execute` is run in-process by the conductor (no LLM leaf) and follows the placement/provenance rules below; `Validate.judge` (an LLM leaf) force-reads `RUNNER_OUTPUT_CONTRACT.md`.
 - `Validate.execute` does not involve standard LLM inference, and limits its responsibility to the `run_program` MCP call and recording the result.
 - Always include `spec.ir.yaml.case` in the `run_program` execution command (as the determined values of runtime input).
 - Save the actual-command record of `run_program` in `JSONL` format, with the default destination `project_dir/command_log.jsonl`.

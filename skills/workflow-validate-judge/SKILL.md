@@ -13,7 +13,7 @@ As the judge substep of the Validate phase, reproducibly decide the physics pass
 - the generation of `verdict.json`, `aggregate_verdict.json`, `summary.json`, and `semantic_review.json`
 
 ## Requirements
-- The judgment canonical source is fixed at the target `node`'s `tests.md` and `spec.ir.yaml.io_contract`.
+- The judgment canonical source is fixed at the target `node`'s `tests.md`, `spec.ir.yaml.io_contract`, and [docs/workflow/RUNNER_OUTPUT_CONTRACT.md](../../docs/workflow/RUNNER_OUTPUT_CONTRACT.md) (the runner-output contract you recompute/judge against — your must-read: `diagnostics.json` checks/verdict → §1, `raw/` per-test evidence → §3).
 - `self_verdict` is saved in `verdict.json` as the judgment result of the relevant `node` alone.
 - `aggregate_verdict` aggregates the transitive dependency `node` and is saved in `aggregate_verdict.json`.
 - When an immediate dependency `node` is not `pass` or `xfail`, make the relevant `node` `blocked`.
