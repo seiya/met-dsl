@@ -748,7 +748,7 @@ class TransportFailureTest(unittest.TestCase):
 
     class _C(_FakeConductor):
         def _write_lineage(self, refs):  # type: ignore[override]
-            pass  # avoid writing to the (fake) repo_root
+            return []  # avoid writing to the (fake) repo_root
 
     def _conductor(self) -> "_FakeConductor":
         c = self._C(repo_root=Path("/tmp/repo"), orchestration_id="orch_x",
@@ -1541,6 +1541,8 @@ class WriteLineageTest(unittest.TestCase):
             self.assertIsNone(lin["binary_id"])
             self.assertIsNone(lin["run_id"])
             self.assertEqual(lin["direct_dependency_status"], {})
+            # Leaf node: no resolved dependency facts.
+            self.assertEqual(lin["resolved_dependencies"], [])
 
     def test_accumulates_stage_ids_and_marks_direct_deps_ready(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1562,6 +1564,98 @@ class WriteLineageTest(unittest.TestCase):
             self.assertEqual(lin["binary_id"], "bin_001")
             self.assertEqual(lin["run_id"], "run_001")
             self.assertEqual(lin["direct_dependency_status"], {"component/dep@0.1.0": "ready"})
+            # The dep has no on-disk pipeline in this fixture → resolved facts empty.
+            self.assertEqual(lin["resolved_dependencies"], [])
+
+    def test_records_resolved_dependencies_when_dep_pipeline_present(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            refs = wc.NodeRefs(
+                node_key="component/top@0.1.0", spec_path="spec/component/top",
+                ir_id="top_20260622_001", pipeline_id="top_20260622_002",
+                source_id="src_001", binary_id="bin_001", run_id="run_001")
+            ir_dir = repo / refs.ir_ref
+            ir_dir.mkdir(parents=True)
+            (ir_dir / "spec.ir.yaml").write_text(
+                'dependency:\n'
+                '  direct_deps:\n'
+                '    - node_key: "component/base@0.1.0"\n',
+                encoding="utf-8")
+            # Materialize the dependency's on-disk pipeline (binary pass + bound verdict).
+            safe = "component__base__0.1.0"
+            pipe = repo / "workspace" / "pipelines" / safe / "base_20260622_003"
+            b = pipe / "binary" / "bin_20260622_001"
+            b.mkdir(parents=True)
+            (b / "binary_meta.json").write_text(
+                json.dumps({"verification_status": "pass"}), encoding="utf-8")
+            rd = pipe / "runs" / "run_20260622_001" / safe
+            rd.mkdir(parents=True)
+            (rd / "aggregate_verdict.json").write_text(
+                json.dumps({"aggregate_verdict": "pass"}), encoding="utf-8")
+            (rd / "trial_meta.json").write_text(
+                json.dumps({"source_binary_id": "bin_20260622_001"}), encoding="utf-8")
+
+            facts = self._conductor(repo)._write_lineage(refs)
+            self.assertEqual(len(facts), 1)
+            self.assertEqual(facts[0]["node_key"], "component/base@0.1.0")
+            self.assertEqual(facts[0]["run_id"], "run_20260622_001")
+            # _write_lineage returns the same list it persists.
+            lin = json.loads((repo / refs.pipeline_ref / "lineage.json").read_text(encoding="utf-8"))
+            self.assertEqual(lin["resolved_dependencies"], facts)
+            self.assertEqual(
+                facts[0]["aggregate_verdict_ref"],
+                f"workspace/pipelines/{safe}/base_20260622_003/runs/run_20260622_001/{safe}/"
+                "aggregate_verdict.json")
+
+
+class BuildLaunchRequestResolvedDependenciesTest(unittest.TestCase):
+    """build_launch_request attaches resolved_dependencies only for the LLM phases that
+    benefit (generate / validate.judge) and only when the kwarg is non-empty."""
+
+    DEP = {
+        "node_key": "component/base@0.1.0",
+        "pipeline_ref": "workspace/pipelines/component__base__0.1.0/p1",
+        "run_id": "run_b_001",
+        "aggregate_verdict_ref":
+            "workspace/pipelines/component__base__0.1.0/p1/runs/run_b_001/"
+            "component__base__0.1.0/aggregate_verdict.json",
+    }
+
+    def _refs(self) -> "wc.NodeRefs":
+        return wc.NodeRefs(
+            node_key="component/top@0.1.0", spec_path="spec/component/top",
+            ir_id="top_001", pipeline_id="top_002",
+            source_id="src_001", binary_id="bin_001",
+            source_binary_id="bin_001", run_id="run_001")
+
+    def _build(self, step: str, substep: str | None, deps) -> dict:
+        return wc.build_launch_request(
+            self._refs(), step=step, substep=substep, orchestration_id="o",
+            orchestration_agent_run_id="parent", child_agent_run_id="child",
+            agent_model="opus", workflow_mode="dev",
+            case_ids=("l0_pass",) if step == "validate" else (),
+            resolved_dependencies=deps)
+
+    def test_judge_includes_when_present(self) -> None:
+        req = self._build("validate", "judge", (self.DEP,))
+        self.assertEqual(req["resolved_dependencies"], [self.DEP])
+
+    def test_generate_includes_when_present(self) -> None:
+        req = self._build("generate", "generate", (self.DEP,))
+        self.assertEqual(req["resolved_dependencies"], [self.DEP])
+
+    def test_omitted_when_kwarg_empty(self) -> None:
+        self.assertNotIn("resolved_dependencies", self._build("validate", "judge", ()))
+
+    def test_omitted_for_deterministic_execute_and_build(self) -> None:
+        self.assertNotIn(
+            "resolved_dependencies", self._build("validate", "execute", (self.DEP,)))
+        self.assertNotIn(
+            "resolved_dependencies", self._build("build", None, (self.DEP,)))
+
+    def test_omitted_for_compile(self) -> None:
+        self.assertNotIn(
+            "resolved_dependencies", self._build("compile", "verify", (self.DEP,)))
 
 
 class SnapshotDeliverableGapTest(unittest.TestCase):
@@ -2244,7 +2338,7 @@ class DeterministicBuildTest(unittest.TestCase):
                     return "fail", []
 
                 def _write_lineage(self, *a, **k):  # type: ignore[override]
-                    pass
+                    return []
 
             c = C(repo_root=repo, orchestration_id="orch_x",
                   orchestration_agent_run_id="ORCH", backend="claude", env={})

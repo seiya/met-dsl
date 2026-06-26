@@ -876,6 +876,101 @@ def _verify_dep_stage(
     raise ValueError(f"unknown readiness stage: {stage!r}")
 
 
+def _resolve_dependency_facts(repo_root: Path, ir_ref: Any) -> list[dict[str, str]]:
+    """Resolve, host-side, the on-disk pipeline / run / aggregate_verdict each direct
+    dependency of ``<ir_ref>/spec.ir.yaml`` was certified to — ORIENTATION ONLY, never a
+    gate.
+
+    Mirrors ``_verify_dep_stage``'s execution-readiness selection EXACTLY so the hint a
+    leaf reads matches the artifacts readiness actually accepted:
+    ``_node_key_to_safe`` -> ``_latest_pipeline_dir`` ->
+    ``_latest_meta_under("binary/*/binary_meta.json")`` ->
+    ``_latest_aggregate_verdict_under(bound_to_binary_id=...)``. ``run_id`` is read from
+    the chosen verdict's ``runs/<run_id>/...`` location.
+
+    Returns a list of ``{node_key, pipeline_ref, run_id, aggregate_verdict_ref}`` (repo-
+    relative POSIX paths) for each direct dep that resolves to a bound verdict; deps that
+    do not resolve (a leaf with no closure artifact yet, a missing pipeline dir / binary /
+    bound verdict) are silently skipped.
+
+    The dependency ``@version`` is taken from the IR ``direct_deps[].node_key`` (a well-
+    formed IR pins the resolved version, consistent with how readiness resolves it from
+    ``deps.yaml`` + catalog). Because this output only orients the leaf's semantic review
+    and is NEVER consulted by any gate, a rare version drift would merely stale the hint,
+    never mis-authorize a launch.
+
+    Best-effort: NEVER raises. A leaf node (empty ``direct_deps``), a missing/unparseable
+    IR, a missing PyYAML, or a malformed dep ``node_key`` yields ``[]`` / a skipped entry.
+    """
+    facts: list[dict[str, str]] = []
+    try:
+        ir_ref_token = str(ir_ref or "").strip().rstrip("/")
+        if not ir_ref_token:
+            return []
+        ir_path = repo_root / ir_ref_token / "spec.ir.yaml"
+        if not ir_path.is_file():
+            return []
+        try:
+            ir_doc = _require_yaml().safe_load(ir_path.read_text(encoding="utf-8"))
+        except Exception:
+            return []
+        if not isinstance(ir_doc, dict):
+            return []
+        dep = ir_doc.get("dependency")
+        direct_deps = dep.get("direct_deps") if isinstance(dep, dict) else None
+        if not isinstance(direct_deps, list):
+            return []
+        repo_resolved = repo_root.resolve()
+        for entry in direct_deps:
+            node_key = entry.get("node_key") if isinstance(entry, dict) else entry
+            if not isinstance(node_key, str) or not node_key.strip():
+                continue
+            node_key = node_key.strip()
+            try:
+                safe = _node_key_to_safe(node_key)
+            except Exception:
+                # Malformed dep node_key: skip rather than raise (orientation-only).
+                continue
+            safe_root = repo_root / "workspace" / "pipelines" / safe
+            pipe_dir = _latest_pipeline_dir(safe_root)
+            if pipe_dir is None:
+                continue
+            latest_binary = _latest_meta_under(pipe_dir, "binary/*/binary_meta.json")
+            if latest_binary is None:
+                continue
+            chosen_binary_id = latest_binary.parent.name
+            verdict_path = _latest_aggregate_verdict_under(
+                pipe_dir, bound_to_binary_id=chosen_binary_id
+            )
+            if verdict_path is None:
+                continue
+            try:
+                rel_parts = verdict_path.relative_to(pipe_dir).parts
+            except ValueError:
+                continue
+            run_id = (
+                rel_parts[1]
+                if len(rel_parts) >= 2 and rel_parts[0] == "runs"
+                else ""
+            )
+            try:
+                pipeline_ref = pipe_dir.resolve().relative_to(repo_resolved).as_posix()
+                verdict_ref = verdict_path.resolve().relative_to(repo_resolved).as_posix()
+            except ValueError:
+                continue
+            facts.append(
+                {
+                    "node_key": node_key,
+                    "pipeline_ref": pipeline_ref,
+                    "run_id": run_id,
+                    "aggregate_verdict_ref": verdict_ref,
+                }
+            )
+    except Exception:
+        return facts
+    return facts
+
+
 def _stage_status_from_bytes(stage: str, raw: bytes) -> bool:
     """Decide whether `raw` (one artifact file's bytes) satisfies `stage`."""
     try:
@@ -7934,6 +8029,128 @@ def _build_gate_runbook(request_payload: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def _build_task_card(request_payload: dict[str, Any]) -> str:
+    """Return a conductor-resolved "Task Card" orienting an LLM ``(step, substep)`` leaf:
+    its identity, the exact deliverable file paths it must write, and the authoritative
+    inputs it must read in full. The conductor already holds every one of these values at
+    launch time, so injecting them removes the recurring category-A "reconstruct who I am
+    / what I write / what I read" thinking a context-isolated leaf otherwise repeats from
+    scratch. This is ORIENTATION ONLY — the SKILL, the phase doc, and the leaf's output
+    manifest remain the authority; on any conflict the leaf follows them, not this card.
+
+    Returns ``""`` for deterministic requests (Build / Validate.execute render the minimal
+    prompt, never this template) and for any role outside ``{step, substep}``.
+
+    The deliverable set is computed via ``_allowed_file_tool_paths_for_launch`` — the same
+    helper ``record-launch`` calls authoritatively when it pins the manifest. A malformed
+    payload fails loudly there; here it only degrades the card to ``""`` (try/except), so
+    this never opens a new failure path.
+    """
+    if request_payload.get("deterministic"):
+        return ""
+    role = str(request_payload.get("agent_role", "")).strip()
+    if role not in {"step", "substep"}:
+        return ""
+    step = str(request_payload.get("step", "")).strip()
+    substep = str(request_payload.get("substep", "")).strip()
+    node_key = str(request_payload.get("node_key", "")).strip()
+    raw_outputs = request_payload.get("allowed_output_paths")
+    if not isinstance(raw_outputs, list):
+        raw_outputs = []
+    try:
+        deliverables = _allowed_file_tool_paths_for_launch(
+            request_payload=request_payload, allowed_output_paths=raw_outputs
+        )
+    except Exception:
+        return ""
+    # Directory deliverables are the trailing-slash entries (excluded from the per-file
+    # set above by _allowed_file_tool_paths_for_launch).
+    out_dirs = [
+        item.strip()
+        for item in raw_outputs
+        if isinstance(item, str) and item.strip().endswith("/")
+    ]
+    must_read_raw = str(request_payload.get("skill_must_read_refs", "")).strip()
+    must_read = [m.strip() for m in must_read_raw.split(",") if m.strip()]
+
+    identity = (
+        f"You are the `{substep}` substep of `{step}` for `{node_key}`."
+        if substep
+        else f"You are the `{step}` step for `{node_key}`."
+    )
+    lines = [
+        "**Task Card (conductor-resolved orientation — authoritative values, do not "
+        f"re-derive):** {identity}",
+    ]
+    if deliverables:
+        lines.append(
+            "- Deliverables — write each EXACTLY at the path below with the Edit/Write "
+            "tool (these are the file-tool outputs your manifest authorizes):"
+        )
+        for path in deliverables:
+            lines.append(f"  - {path}")
+    if out_dirs:
+        lines.append(
+            "- Output directories you may create files under: " + ", ".join(out_dirs)
+        )
+    if must_read:
+        lines.append(
+            "- Must-read inputs — read each IN FULL; this card does not authorize "
+            "skipping or skimming any of them:"
+        )
+        for ref in must_read:
+            lines.append(f"  - {ref}")
+    lines.append(
+        "- This card only orients you. Your SKILL, your phase doc, and your manifest "
+        "remain authoritative; if anything here conflicts with them, follow them and "
+        "treat this card as stale."
+    )
+    return "\n".join(lines)
+
+
+def _build_dependency_facts(request_payload: dict[str, Any]) -> str:
+    """Return a conductor-resolved "Dependency facts" block listing the on-disk
+    pipeline / run / aggregate_verdict each direct dependency was certified to.
+
+    The conductor resolves these host-side (``_resolve_dependency_facts``) and stows the
+    structured list on ``request_payload["resolved_dependencies"]``; this renderer only
+    formats it. It removes the recurring category-C "scan the filesystem for the right
+    base pipeline / run / verdict" thinking a judge otherwise repeats. ORIENTATION ONLY:
+    ``pre_judge`` is already scoped to the leaf's own pipeline and each dependency's PASS
+    is resolved from the leaf's lineage — these facts are NOT a gate argument.
+
+    Returns ``""`` for deterministic requests and when no dependency facts are present
+    (a leaf node, or a phase the conductor does not inject them for).
+    """
+    if request_payload.get("deterministic"):
+        return ""
+    deps = request_payload.get("resolved_dependencies")
+    if not isinstance(deps, list) or not deps:
+        return ""
+    lines = [
+        "**Dependency facts (conductor-resolved — orientation for your semantic review, "
+        "NOT a gate argument):** your pre_judge is already scoped to your own pipeline, "
+        "and each dependency's PASS is resolved from your lineage. These are the on-disk "
+        "artifacts each direct dependency was certified to:",
+    ]
+    for dep in deps:
+        if not isinstance(dep, dict):
+            continue
+        node_key = str(dep.get("node_key", "")).strip()
+        if not node_key:
+            continue
+        pipeline_ref = str(dep.get("pipeline_ref", "")).strip()
+        run_id = str(dep.get("run_id", "")).strip()
+        verdict_ref = str(dep.get("aggregate_verdict_ref", "")).strip()
+        lines.append(
+            f"- {node_key}: pipeline_ref={pipeline_ref} run_id={run_id} "
+            f"aggregate_verdict={verdict_ref}"
+        )
+    if len(lines) == 1:
+        return ""
+    return "\n".join(lines)
+
+
 def _template_placeholder_values(request_payload: dict[str, Any]) -> dict[str, str]:
     orchestration_id = str(request_payload.get("orchestration_id", ""))
     agent_run_id = str(request_payload.get("agent_run_id", ""))
@@ -7977,6 +8194,11 @@ def _template_placeholder_values(request_payload: dict[str, Any]) -> dict[str, s
         # deterministic / unmapped phases). All ids pre-substituted to literals;
         # only <capability_token> / <PATH> remain symbolic for the leaf to fill.
         "gate_runbook": _build_gate_runbook(request_payload),
+        # Category-A orientation: identity + exact deliverable paths + must-read inputs
+        # (empty for deterministic / non step-substep). Category-C orientation: on-disk
+        # pipeline/run/verdict per direct dependency (empty when none are injected).
+        "task_card": _build_task_card(request_payload),
+        "dependency_facts": _build_dependency_facts(request_payload),
     }
 
 

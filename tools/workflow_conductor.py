@@ -385,6 +385,7 @@ def build_launch_request(
     exe_name: str | None = None,
     makefile_host_authored: bool = False,
     repair: dict[str, str] | None = None,
+    resolved_dependencies: tuple[dict[str, str], ...] = (),
 ) -> dict[str, Any]:
     """Construct the record-launch --request-json payload for one substep.
 
@@ -394,6 +395,10 @@ def build_launch_request(
     state_snapshots is not forced to produce them (phase_04 §44).
     repair carries issue_severity/repair_strategy/repair_target_agent_run_id/
     repair_reason on a retry (defaults to the literal "none" the templates use).
+    resolved_dependencies are the orientation-only dependency facts (pipeline/run/verdict
+    per direct dep, from `_resolve_dependency_facts`); when non-empty they are attached for
+    the LLM (generate / validate) leaves so the rendered `<dependency_facts>` block lets a
+    judge skip the filesystem lookup. They never gate (pure module function, no FS access).
     """
     spec = refs.spec_path
     skill = _skill_name(step, substep)
@@ -567,6 +572,12 @@ def build_launch_request(
     # Deterministic steps have no leaf, so no skill_must_read_refs (the conductor reads
     # what it needs in-process; the read_manifest is irrelevant for them).
     req["skill_must_read_refs"] = "" if deterministic else ",".join(must_read)
+    # Orientation-only dependency facts for the LLM leaves that benefit (generate's
+    # semantic authoring, validate.judge's dependency-PASS review). Deterministic phases
+    # (build / validate.execute) render the minimal prompt and never read them, so they
+    # are omitted there. The `<dependency_facts>` renderer drops them when empty.
+    if resolved_dependencies and not deterministic and step in ("generate", "validate"):
+        req["resolved_dependencies"] = list(resolved_dependencies)
     req.update(rep)
     return req
 
@@ -854,7 +865,7 @@ class Conductor:
             "--agent-run-json", json.dumps(agent_run_json),
         ])
 
-    def _write_lineage(self, refs: NodeRefs) -> None:
+    def _write_lineage(self, refs: NodeRefs) -> list[dict[str, str]]:
         """Author/refresh the pipeline `lineage.json` host-side (runtime-owned).
 
         `lineage.json` lives at the pipeline root, which must stay non-writable to the
@@ -865,7 +876,11 @@ class Conductor:
         each pipeline phase start after the producer id is reserved; idempotent, it
         accumulates the stage ids (source_id at generate, +binary_id at build, +run_id at
         validate). `direct_dependency_status` maps each direct dependency to "ready" — the
-        conductor only reaches here once `workflow_launch_check` confirmed readiness."""
+        conductor only reaches here once `workflow_launch_check` confirmed readiness.
+
+        Returns the resolved dependency facts (the same list stored on `resolved_dependencies`
+        below) so the caller can inject them into the leaf launch prompt without re-reading
+        disk. `[]` for a leaf node or when no dependency resolves on disk."""
         ir = _read_yaml(self.repo_root / refs.ir_ref / "spec.ir.yaml") or {}
         dep = ir.get("dependency") if isinstance(ir, dict) else None
         direct_deps = dep.get("direct_deps") if isinstance(dep, dict) else None
@@ -874,6 +889,11 @@ class Conductor:
             nk = d.get("node_key") if isinstance(d, dict) else d
             if isinstance(nk, str) and nk.strip():
                 status[nk.strip()] = "ready"
+        # Orientation-only resolved dependency facts (pipeline/run/verdict each direct dep
+        # was certified to). Best-effort, never raises; persisted additively so a later
+        # read (and the launch-prompt injection) need not re-derive them.
+        from tools.orchestration_runtime import _resolve_dependency_facts
+        facts = _resolve_dependency_facts(self.repo_root, refs.ir_ref)
         lineage = {
             "node_key": refs.node_key,
             "spec_ref": refs.spec_path,
@@ -884,10 +904,12 @@ class Conductor:
             "binary_id": refs.binary_id,
             "run_id": refs.run_id,
             "direct_dependency_status": status,
+            "resolved_dependencies": facts,
         }
         path = self.repo_root / refs.pipeline_ref / "lineage.json"
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(lineage, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+        return facts
 
     def _is_leaf_node(self, refs: NodeRefs) -> bool:
         """A node whose `dependency.direct_deps` is explicitly present and empty. An absent
@@ -1932,7 +1954,8 @@ clean:
         return {"returncode": 0, "stdout": stdout, "stderr": stderr}
 
     def run_substep(self, refs: NodeRefs, phase: str, substep: str | None,
-                    repair: dict[str, str] | None = None) -> SubstepOutcome:
+                    repair: dict[str, str] | None = None,
+                    resolved_dependencies: tuple[dict[str, str], ...] = ()) -> SubstepOutcome:
         # Certify the codex hooks feature BEFORE record_launch: this can fail closed
         # (SandboxEnforcementError) when the feature is uncertified, and doing it here —
         # ahead of allocating an arid / recording a durable launch — avoids orphaning a
@@ -1956,6 +1979,7 @@ clean:
             # allowed_output_paths (it must not author it).
             makefile_host_authored=(phase == "generate" and self._conductor_authors_makefile(refs)),
             repair=repair,
+            resolved_dependencies=resolved_dependencies,
         )
         rec = self.record_launch(child_arid, request)
         # Capture the launch instant so a producer substep only passes on outputs
@@ -2126,8 +2150,9 @@ clean:
         # generate.verify's post_generate gate requires it, and the sandboxed leaf cannot
         # write it (pipeline-root file; see _write_lineage). Pipeline phases only —
         # compile writes under workspace/ir/, not the pipeline root.
+        dep_facts: tuple[dict[str, str], ...] = ()
         if phase in ("generate", "build", "validate"):
-            self._write_lineage(refs)
+            dep_facts = tuple(self._write_lineage(refs))
         # The conductor authors src/Makefile deterministically (runtime-owned, like
         # lineage.json) for every make+fortran node BEFORE the substeps run: the generate leaf
         # must not author it, and generate.verify's post_generate gate inspects it. The
@@ -2139,7 +2164,8 @@ clean:
 
         outcomes: list[SubstepOutcome] = []
         for i, substep in enumerate(SUBSTEPS[phase]):
-            oc = self.run_substep(refs, phase, substep, repair=repair if i == 0 else None)
+            oc = self.run_substep(refs, phase, substep, repair=repair if i == 0 else None,
+                                  resolved_dependencies=dep_facts)
             outcomes.append(oc)
             if oc.status != "pass":
                 break

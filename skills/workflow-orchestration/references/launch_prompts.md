@@ -44,6 +44,10 @@ repair_reason: <repair_reason>
 
 <gate_runbook>
 
+<task_card>
+
+<dependency_facts>
+
 Required requirements:
 - **Do not `Read` your own launch prompt body (`launches/<agent_run_id>.prompt.txt`).** Because the prompt is already passed as the input of the `Agent` tool, re-reading is unnecessary, and that path is blocked fail-closed by `read_manifest_read_guard`. `launches/<agent_run_id>.prompt.txt` is the canonical artifact that stores, 1-to-1, the original text passed to the `Agent` tool for audit / replay use.
 - You are responsible for directly generating phase artifacts.
@@ -82,6 +86,10 @@ repair_reason: <repair_reason>
 **tmp area (reference by literal path)**: `allowed_tmp_root` is fixed at `workspace/tmp/<agent_run_id>/` (already recorded in the same-named field of `output_manifests/<agent_run_id>.json`). For a temporary file, directly specify under that literal path like `cat > workspace/tmp/<agent_run_id>/...`. `output_manifest_write_guard` judges only the path and does not reference the `$TMPDIR` env. Do not call bootstrap Bash such as `export TMPDIR=...`, `jq -er ...`, `printenv`, `bash -c '...'` (the root cause of the workflow stopping on a Claude Code session-sandbox approval request). A direct write to a canonical path (`workspace/pipelines/...`, `workspace/ir/...`, `*_meta.json` etc.) is done with the `Edit`/`Write` tool to a path registered in `allowed_file_tool_paths`; writing to a canonical path with a Bash heredoc is blocked by `forbid_unauthorized_file_write`. (The pipeline `lineage.json` is authored host-side by the conductor, not a leaf write.)
 
 <gate_runbook>
+
+<task_card>
+
+<dependency_facts>
 
 Required requirements:
 - **Do not `Read` your own launch prompt body (`launches/<agent_run_id>.prompt.txt`).** Because the prompt is already passed as the input of the `Agent` tool, re-reading is unnecessary, and that path is blocked fail-closed by `read_manifest_read_guard`. `launches/<agent_run_id>.prompt.txt` is the canonical artifact that stores, 1-to-1, the original text passed to the `Agent` tool for audit / replay use.

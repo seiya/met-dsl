@@ -15130,6 +15130,322 @@ class GateRunbookTests(unittest.TestCase):
             _validate_launch_prompt_text(payload, tampered)
 
 
+class TaskCardTests(unittest.TestCase):
+    """_build_task_card injects identity + deliverables + must-read inputs (category-A
+    orientation) and degrades to "" for deterministic / non step-substep requests, in a
+    guard-safe wording that does not add a new required-constraint line."""
+
+    BASE = dict(
+        agent_role="substep",
+        orchestration_id="orch_TC_001",
+        agent_run_id="arid-TC",
+        parent_agent_run_id="arid-PARENT",
+        node_key="component/demo_dep_top@0.1.0",
+        ir_ref="workspace/ir/component__demo_dep_top__0.1.0/d_002",
+        pipeline_ref="workspace/pipelines/component__demo_dep_top__0.1.0/d_002",
+        run_id="run_20260626_001",
+        skill_must_read_refs="skills/x/SKILL.md,docs/AGENT_CONTRACT.md",
+        allowed_output_paths=[
+            "workspace/pipelines/component__demo_dep_top__0.1.0/d_002/runs/run_20260626_001/component__demo_dep_top__0.1.0/verdict.json",
+            "workspace/pipelines/component__demo_dep_top__0.1.0/d_002/runs/run_20260626_001/component__demo_dep_top__0.1.0/aggregate_verdict.json",
+        ],
+    )
+
+    def _payload(self, step: str, substep: str | None, **over: Any) -> dict[str, Any]:
+        p = dict(self.BASE, step=step)
+        if substep is not None:
+            p["substep"] = substep
+        p["agent_role"] = "step" if substep is None else "substep"
+        p.update(over)
+        return p
+
+    def test_deliverables_match_allowed_file_tool_paths(self) -> None:
+        from tools.orchestration_runtime import (
+            _build_task_card,
+            _allowed_file_tool_paths_for_launch,
+        )
+
+        payload = self._payload("validate", "judge")
+        card = _build_task_card(payload)
+        expected = _allowed_file_tool_paths_for_launch(
+            request_payload=payload,
+            allowed_output_paths=payload["allowed_output_paths"],
+        )
+        self.assertTrue(expected)
+        for path in expected:
+            self.assertIn(f"  - {path}", card)
+
+    def test_must_read_is_comma_split(self) -> None:
+        from tools.orchestration_runtime import _build_task_card
+
+        card = _build_task_card(self._payload("validate", "judge"))
+        self.assertIn("  - skills/x/SKILL.md", card)
+        self.assertIn("  - docs/AGENT_CONTRACT.md", card)
+
+    def test_identity_step_vs_substep(self) -> None:
+        from tools.orchestration_runtime import _build_task_card
+
+        sub = _build_task_card(self._payload("generate", "verify"))
+        self.assertIn(
+            "You are the `verify` substep of `generate` for "
+            "`component/demo_dep_top@0.1.0`.", sub)
+        step = _build_task_card(self._payload("build", None))
+        self.assertIn(
+            "You are the `build` step for `component/demo_dep_top@0.1.0`.", step)
+
+    def test_empty_for_deterministic_and_non_step_substep(self) -> None:
+        from tools.orchestration_runtime import _build_task_card
+
+        self.assertEqual(
+            _build_task_card(self._payload("build", None, deterministic=True)), "")
+        self.assertEqual(
+            _build_task_card(self._payload("validate", "execute", deterministic=True)),
+            "")
+        # No agent_role (e.g. orchestration self-prompt) → empty.
+        no_role = self._payload("validate", "judge")
+        no_role.pop("agent_role")
+        self.assertEqual(_build_task_card(no_role), "")
+
+    def test_card_adds_no_new_required_constraint_line(self) -> None:
+        """The card must not contain the guarded constraint fragments — otherwise it would
+        register as a new required-constraint line. Render with vs without the card and
+        assert the required-constraint set is unchanged."""
+        from tools.orchestration_runtime import (
+            prepare_launch_request_payload,
+            render_launch_prompt_text,
+            _required_launch_prompt_constraint_lines,
+        )
+
+        payload = prepare_launch_request_payload(self._payload("validate", "judge"))
+        rendered = render_launch_prompt_text(payload)
+        self.assertIn("Task Card", rendered)
+        # No guarded fragment appears inside the Task Card block.
+        card_start = rendered.index("Task Card")
+        card_block = rendered[card_start:rendered.index("Required requirements:")]
+        for fragment in (
+            "`output_manifests/",
+            "/capabilities/",
+            "directly with the `Edit` / `Write` tool",
+            "`run-gate --gate apply_patch_writes`",
+        ):
+            self.assertNotIn(fragment, card_block)
+        # The required-constraint lines all still round-trip (present in the prompt).
+        for line in _required_launch_prompt_constraint_lines(payload):
+            self.assertIn(line, rendered)
+
+
+class DependencyFactsRenderTests(unittest.TestCase):
+    """_build_dependency_facts formats the orientation-only resolved dependency list and
+    the rendered judge prompt carries the verdict path; a no-dep prompt does not."""
+
+    BASE = dict(
+        agent_role="step",
+        orchestration_id="orch_DF_001",
+        agent_run_id="arid-DF",
+        parent_agent_run_id="arid-PARENT",
+        node_key="component/demo_dep_top@0.1.0",
+        step="validate",
+        ir_ref="workspace/ir/component__demo_dep_top__0.1.0/d_002",
+        pipeline_ref="workspace/pipelines/component__demo_dep_top__0.1.0/d_002",
+        run_id="run_20260626_001",
+        skill_must_read_refs="docs/AGENT_CONTRACT.md",
+        allowed_output_paths=[
+            "workspace/pipelines/component__demo_dep_top__0.1.0/d_002/runs/run_20260626_001/component__demo_dep_top__0.1.0/aggregate_verdict.json",
+        ],
+    )
+    DEP = {
+        "node_key": "component/demo_dep_base@0.1.0",
+        "pipeline_ref": "workspace/pipelines/component__demo_dep_base__0.1.0/p1",
+        "run_id": "run_b_001",
+        "aggregate_verdict_ref":
+            "workspace/pipelines/component__demo_dep_base__0.1.0/p1/runs/run_b_001/"
+            "component__demo_dep_base__0.1.0/aggregate_verdict.json",
+    }
+
+    def test_empty_when_no_resolved_dependencies(self) -> None:
+        from tools.orchestration_runtime import _build_dependency_facts
+
+        self.assertEqual(_build_dependency_facts(dict(self.BASE)), "")
+        self.assertEqual(
+            _build_dependency_facts(dict(self.BASE, resolved_dependencies=[])), "")
+        det = dict(self.BASE, deterministic=True, resolved_dependencies=[self.DEP])
+        self.assertEqual(_build_dependency_facts(det), "")
+
+    def test_one_line_per_dependency(self) -> None:
+        from tools.orchestration_runtime import _build_dependency_facts
+
+        block = _build_dependency_facts(
+            dict(self.BASE, resolved_dependencies=[self.DEP]))
+        self.assertIn(
+            "- component/demo_dep_base@0.1.0: "
+            f"pipeline_ref={self.DEP['pipeline_ref']} run_id={self.DEP['run_id']} "
+            f"aggregate_verdict={self.DEP['aggregate_verdict_ref']}", block)
+
+    def test_render_judge_carries_verdict_path_and_no_dep_does_not(self) -> None:
+        from tools.orchestration_runtime import (
+            prepare_launch_request_payload,
+            render_launch_prompt_text,
+            _validate_launch_prompt_text,
+        )
+
+        with_dep = prepare_launch_request_payload(
+            dict(self.BASE, resolved_dependencies=[self.DEP]))
+        rendered = render_launch_prompt_text(with_dep)
+        self.assertNotIn("<dependency_facts>", rendered)
+        self.assertNotIn("<task_card>", rendered)
+        self.assertIn(self.DEP["aggregate_verdict_ref"], rendered)
+        self.assertIn("Dependency facts", rendered)
+        _validate_launch_prompt_text(with_dep, rendered)
+
+        no_dep = prepare_launch_request_payload(dict(self.BASE))
+        rendered2 = render_launch_prompt_text(no_dep)
+        self.assertNotIn("Dependency facts", rendered2)
+        self.assertNotIn(self.DEP["aggregate_verdict_ref"], rendered2)
+        _validate_launch_prompt_text(no_dep, rendered2)
+
+
+class ResolveDependencyFactsTests(unittest.TestCase):
+    """_resolve_dependency_facts mirrors _verify_dep_stage's pipeline/binary/verdict
+    selection and is best-effort (never raises; leaf / unresolved → [])."""
+
+    def _write_ir(self, repo_root: Path, ir_ref: str, direct_deps: list[dict]) -> None:
+        import yaml as _yaml
+        ir_path = repo_root / ir_ref / "spec.ir.yaml"
+        ir_path.parent.mkdir(parents=True, exist_ok=True)
+        ir_path.write_text(
+            _yaml.safe_dump({"dependency": {"direct_deps": direct_deps}}),
+            encoding="utf-8")
+
+    def _write_dep_pipeline(
+        self, repo_root: Path, safe: str, pipe_id: str, binary_id: str, run_id: str,
+    ) -> tuple[str, str]:
+        pipe = repo_root / "workspace" / "pipelines" / safe / pipe_id
+        b = pipe / "binary" / binary_id
+        b.mkdir(parents=True)
+        (b / "binary_meta.json").write_text(
+            json.dumps({"verification_status": "pass"}), encoding="utf-8")
+        run_dir = pipe / "runs" / run_id / safe
+        run_dir.mkdir(parents=True)
+        (run_dir / "aggregate_verdict.json").write_text(
+            json.dumps({"aggregate_verdict": "pass"}), encoding="utf-8")
+        (run_dir / "trial_meta.json").write_text(
+            json.dumps({"source_binary_id": binary_id}), encoding="utf-8")
+        pipe_ref = f"workspace/pipelines/{safe}/{pipe_id}"
+        verdict_ref = f"{pipe_ref}/runs/{run_id}/{safe}/aggregate_verdict.json"
+        return pipe_ref, verdict_ref
+
+    def test_resolves_on_disk_selection(self) -> None:
+        from tools.orchestration_runtime import (
+            _resolve_dependency_facts, _verify_dep_stage,
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            safe = "component__dep_base__0.1.0"
+            # Two pipeline dirs: the later canonical id must win.
+            self._write_dep_pipeline(
+                repo_root, safe, "p_20260101_001", "bin_20260101_001", "run_20260101_001")
+            pipe_ref, verdict_ref = self._write_dep_pipeline(
+                repo_root, safe, "p_20260601_002", "bin_20260601_002", "run_20260601_002")
+            self._write_ir(
+                repo_root, "workspace/ir/component__dep_top__0.1.0/top_001",
+                [{"node_key": "component/dep_base@0.1.0", "kind": "component"}])
+            facts = _resolve_dependency_facts(
+                repo_root, "workspace/ir/component__dep_top__0.1.0/top_001")
+            self.assertEqual(len(facts), 1)
+            self.assertEqual(facts[0]["node_key"], "component/dep_base@0.1.0")
+            self.assertEqual(facts[0]["pipeline_ref"], pipe_ref)
+            self.assertEqual(facts[0]["run_id"], "run_20260601_002")
+            self.assertEqual(facts[0]["aggregate_verdict_ref"], verdict_ref)
+            # Selection coincides with the readiness gate's choice.
+            self.assertTrue(
+                _verify_dep_stage(repo_root, "component", "dep_base", "0.1.0",
+                                  "aggregate_verdict"))
+
+    def test_verdict_bound_to_chosen_binary_else_skipped(self) -> None:
+        """Mirror _verify_dep_stage's Codex-round-24 binding: when the latest binary has
+        no verdict and only an OLDER binary's verdict exists, the dep does not resolve (the
+        orientation hint must not borrow an unbound verdict)."""
+        from tools.orchestration_runtime import (
+            _resolve_dependency_facts, _verify_dep_stage,
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            safe = "component__dep_base__0.1.0"
+            pipe = repo_root / "workspace" / "pipelines" / safe / "p_20260101_001"
+            # Older binary + matching verdict.
+            old_bin = pipe / "binary" / "bin_20260101_001"
+            old_bin.mkdir(parents=True)
+            (old_bin / "binary_meta.json").write_text(
+                json.dumps({"verification_status": "pass"}), encoding="utf-8")
+            rd = pipe / "runs" / "run_20260101_001" / safe
+            rd.mkdir(parents=True)
+            (rd / "aggregate_verdict.json").write_text(
+                json.dumps({"aggregate_verdict": "pass"}), encoding="utf-8")
+            (rd / "trial_meta.json").write_text(
+                json.dumps({"source_binary_id": "bin_20260101_001"}), encoding="utf-8")
+            # Newer binary with NO verdict — the one the selection chooses.
+            new_bin = pipe / "binary" / "bin_20260601_001"
+            new_bin.mkdir(parents=True)
+            (new_bin / "binary_meta.json").write_text(
+                json.dumps({"verification_status": "pass"}), encoding="utf-8")
+            self._write_ir(
+                repo_root, "workspace/ir/component__dep_top__0.1.0/top_001",
+                [{"node_key": "component/dep_base@0.1.0"}])
+            # The readiness gate rejects this (verdict not bound to newer binary)...
+            self.assertFalse(
+                _verify_dep_stage(repo_root, "component", "dep_base", "0.1.0",
+                                  "aggregate_verdict"))
+            # ...and the orientation resolver agrees: the dep is skipped.
+            self.assertEqual(
+                _resolve_dependency_facts(
+                    repo_root, "workspace/ir/component__dep_top__0.1.0/top_001"),
+                [])
+
+    def test_leaf_node_returns_empty(self) -> None:
+        from tools.orchestration_runtime import _resolve_dependency_facts
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._write_ir(
+                repo_root, "workspace/ir/component__leaf__0.1.0/l_001", [])
+            self.assertEqual(
+                _resolve_dependency_facts(
+                    repo_root, "workspace/ir/component__leaf__0.1.0/l_001"),
+                [])
+
+    def test_unresolved_dep_is_skipped(self) -> None:
+        from tools.orchestration_runtime import _resolve_dependency_facts
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            # IR lists a dep with no on-disk pipeline → skipped, not raised.
+            self._write_ir(
+                repo_root, "workspace/ir/component__dep_top__0.1.0/top_001",
+                [{"node_key": "component/dep_missing@0.1.0"}])
+            self.assertEqual(
+                _resolve_dependency_facts(
+                    repo_root, "workspace/ir/component__dep_top__0.1.0/top_001"),
+                [])
+
+    def test_malformed_node_key_skipped_never_raises(self) -> None:
+        from tools.orchestration_runtime import _resolve_dependency_facts
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._write_ir(
+                repo_root, "workspace/ir/component__dep_top__0.1.0/top_001",
+                [{"node_key": "../etc/passwd@1.0.0"}, {"node_key": ""}])
+            self.assertEqual(
+                _resolve_dependency_facts(
+                    repo_root, "workspace/ir/component__dep_top__0.1.0/top_001"),
+                [])
+
+    def test_missing_ir_returns_empty(self) -> None:
+        from tools.orchestration_runtime import _resolve_dependency_facts
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self.assertEqual(
+                _resolve_dependency_facts(repo_root, "workspace/ir/nope/x"), [])
+            self.assertEqual(_resolve_dependency_facts(repo_root, ""), [])
+
+
 class AccessLogWritableBindTests(unittest.TestCase):
     """The leaf's own access_logs/<arid>.jsonl is bound writable (per-file), and the
     orchestration_read audit append degrades gracefully instead of crashing under EROFS."""
