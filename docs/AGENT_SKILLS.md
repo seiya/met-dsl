@@ -52,6 +52,7 @@ This document defines the reference conventions for the `skills` used in the pro
 - `Workflow audit (Codex)`: `skills/workflow-audit-codex/SKILL.md`
 - `Workflow audit (Claude Code)`: `skills/workflow-audit-claude/SKILL.md`
 - `Spec input check`: `skills/spec-input-check/SKILL.md` (pre-`Compile` advisory check of `controlled_spec.md` / `deps.yaml` / `tests.md`; proposal only, does not modify the spec)
+- `Workflow timing & token audit`: `skills/workflow-timing-audit/SKILL.md` (Claude Code-only post-run diagnostic; breaks an orchestration down into per-leaf elapsed time and output tokens via `phase_state_log.jsonl` + the per-leaf session transcripts, collapsing the transcript multiple-counting traps; read-only, does not modify any artifact)
 
 ## Operations Rules
 1. When handling multiple phases in one piece of work, switch the corresponding `SKILL` per phase.
