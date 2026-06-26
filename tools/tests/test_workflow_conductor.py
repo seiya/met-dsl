@@ -1381,10 +1381,16 @@ class LeafSpawnTest(unittest.TestCase):
                 self.assertEqual(captured["argv"][0], "bwrap")
                 self.assertIn("claude", captured["argv"])
                 self.assertIn("--", captured["argv"])
-                # codex backend is also wrapped (it gets a profile + sandbox_enforced too)
+                # codex backend is also wrapped (it gets a profile + sandbox_enforced too).
+                # Certify the codex hooks feature so _ensure_codex_feature_cache passes and
+                # spawn_leaf reaches the bwrap-wrapping path under test (the cert itself has
+                # dedicated coverage elsewhere).
                 captured.clear()
-                self._c(repo_root=repo, backend="codex", env={}).spawn_leaf(
-                    "P", {"HOME": "/h"}, child_arid="A")
+                from unittest.mock import patch
+                with patch("tools.hooks.codex_feature.codex_hooks_feature_enabled",
+                           return_value=(True, "hooks=true")):
+                    self._c(repo_root=repo, backend="codex", env={}).spawn_leaf(
+                        "P", {"HOME": "/h"}, child_arid="A")
                 self.assertEqual(captured["argv"][0], "bwrap")
                 self.assertIn("codex", captured["argv"])
                 # profile missing → fail closed (never launch unconfined)
