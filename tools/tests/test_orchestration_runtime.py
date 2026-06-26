@@ -23237,9 +23237,13 @@ class ChildContextDocSizeTests(unittest.TestCase):
         # Makefile / out-of-source / toolchain contract text (prevents the
         # Validate.execute relink unauthorized-write that forced reopen_seq=2).
         # Justified bumps over the prior 21500 / 8000 / 19000.
-        "docs/workflow/phases/phase_02_generate.md": 22000,
+        # phase_02/04 further bumped (22000->22700 / 19500->20200) for the D4 fix:
+        # the per-case snapshot filename contract (runner writes one
+        # raw/state_snapshots/<case_id>.json per case) — closes the recurring
+        # validate.execute deliverable-gate blocker (deterministic_followups.md D4).
+        "docs/workflow/phases/phase_02_generate.md": 22700,
         "docs/workflow/phases/phase_03_build.md": 8200,
-        "docs/workflow/phases/phase_04_validate.md": 19500,
+        "docs/workflow/phases/phase_04_validate.md": 20200,
     }
 
     def test_child_context_docs_within_budget(self) -> None:

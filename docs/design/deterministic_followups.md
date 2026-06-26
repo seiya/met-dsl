@@ -348,13 +348,84 @@ in-file-`test_id`/empty-map). Tests:
 `test_snapshot_completeness_falls_back_to_strict_union_without_per_test_contract` (strict fallback);
 suite green (1594).
 
-**Not yet done:** the billed dev `--with-deps` re-run to confirm `demo_dep_base` reaches
-`aggregate_verdict=pass` AND the target `demo_dep_top` then completes the D1/D2 dependency path
-end-to-end. Two dev runs (2026-06-25/26) each `fail_closed` at the base's snapshot gate on a distinct IR
-shape (both now handled); a third run is needed to confirm — but note dev fail-fasts on ANY *new*
-cross-phase rollback, so residual C-class nondeterminism elsewhere could still stop it. Deferred pending
-operator go-ahead for another billed run (prod mode would absorb residual nondeterminism via the retry
-budget if a first-try-clean dev run remains elusive).
+**Third dev run (2026-06-26, orch base `…234756Z_a89f1956` / top `…234756Z_9c50988f`, on committed
+`e992b60`): D1/D2 dependency BUILD path PROVEN end-to-end; base node fully passed.** `demo_dep_base`
+completed compile→generate→build→**validate all pass** (`workflow_status=pass`) — the D3 hardening
+cleared the snapshot gate that fail-fasted the two prior runs. `demo_dep_top` then went
+compile✅→generate✅→**build✅**: the conductor authored the dependency Makefile, `_stage_dependency_sources`
+staged the certified `demo_dep_base_model`, and **real gfortran compiled+linked the closure** into
+`demo_dep_top_runner` in a single live `--with-deps` run. That is the conclusive D1/D2 build verification
+(previously only the same-session two-orchestration evidence existed). **The target did NOT reach
+`aggregate_verdict=pass`, but the blocker is unrelated to dependencies — see D4.**
+
+## D4 — runner snapshot filename off the per-case `<case_id>.json` contract (code IMPLEMENTED 2026-06-26; E2E re-run pending)
+`demo_dep_top` `fail_closed` at `validate.execute` (dev `dev_phase_rollback`) **despite**
+`trial_meta.status=pass`, clean `diagnostics.json` (`verdict.overall=pass`), and the post_execute
+**semantic** gate passing (verified standalone PASS, both legacy and orchestration-context). Root cause is
+a THIRD facet of the runner snapshot-filename nondeterminism (same family as D3), this time at the
+**conductor's deliverable layer**, not the validator:
+- `build_launch_request` (`workflow_conductor.py:538-541`) derives `allowed_output_paths` for
+  validate.execute as one snapshot file **per case_id**: `raw/state_snapshots/{case_id}.json`.
+- `_classify_substep` (`:1234-1241`) gates execute pass on `trial_meta.status=="pass"` **AND**
+  `_fresh_deliverables_written(allowed_output_paths)` — i.e. every `{case_id}.json` must exist.
+- The `demo_dep_top` runner wrote a single combined `snapshot_0001.json` (schema `samples=['snapshot_0001.json']`),
+  so the expected `l0_shift_scaled_identity_pass.json` / `l0_invalid_length_xfail.json` were absent →
+  `_fresh_deliverables_written` False → execute fail. The deterministic logs are empty and there are no
+  write violations, because the failure is the deliverable presence check, not the runner or the gate.
+- Observed runner naming across runs (all valid per contract, but only some match `{case_id}.json`):
+  base run-1 `c_l0_invalid_length.json` (matched), run-2 `l0_invalid_length_xfail_0000.json` (didn't, but
+  failed on the semantic gate first), run-3 `l0_invalid_length_xfail.json` (matched → passed), top
+  `snapshot_0001.json` (matched nothing → failed). So the conductor passes only when the LLM happens to
+  name snapshots exactly `{case_id}.json`.
+- **The canonical contract does NOT require per-case filenames.** `phase_04_validate.md` §43/§44 require only
+  `snapshot_schema.json` + ≥`min_samples` data files (any names, listed in `schema.samples`); the
+  post_execute semantic gate enforces exactly that. The conductor's `{case_id}.json` requirement is an
+  over-specification stricter than both. **Judge recomputation reads `raw/metrics_basis.json` (per-test
+  index), NOT per-case snapshot files**, so per-case snapshot filenames are not needed downstream.
+- **Fix — IMPLEMENTED (2026-06-26; operator direction: keep the conductor strict, teach the runner the
+  canonical name, detect early).** The report-only "relax the conductor" proposal below was NOT taken;
+  instead the canonical `{case_id}.json` requirement is kept (it IS the contract now) and the rest of the
+  system is made to agree + catch a wrong name early. Two prongs:
+  1. **Teach the generator.** The runner already receives the exact case_id strings on argv
+     (`--cases <spec> *case_ids`, `workflow_conductor.py:1780`), so it can name files `<case_id>.json`
+     directly. Contracts/SKILLs updated to mandate **one snapshot per case at
+     `raw/state_snapshots/<case_id>.json`, built from the received `case_id`** (never a fixed/sequential
+     literal): `phase_02_generate.md` (runner-output rules), `phase_04_validate.md` §43,
+     `skills/workflow-generate-generate/SKILL.md`, `skills/workflow-generate-verify/SKILL.md`. This matches
+     the already-agreed `CLI_REFERENCE.md` `output_refs` name. (Doc-size ceilings for phase_02/04 bumped
+     with justification in `test_orchestration_runtime.py::ChildContextDocSizeTests`.)
+  2. **Detect early (best-effort static) + a deterministic backstop.**
+     - `post_generate`: `_validate_runner_snapshot_filenames` (`validate_pipeline_semantics.py`, wired into
+       `_validate_runner_source_files` ← `_validate_generate_outputs_for_generation`) flags a hardcoded
+       whole-path `state_snapshots/<name>.json` string literal not built from the `case_id`
+       (`snapshot_0001.json`). IR-aware via `_case_ids_for_execution`: a literal whose stem IS a declared
+       `case_id` is NOT flagged (it satisfies the deliverable gate — no false positive); `snapshot_schema.json`
+       is exempt. Best-effort (runtime-built names this parse can't resolve fall to the backstop).
+     - `validate.execute` backstop: `Conductor._snapshot_deliverable_gap` (`workflow_conductor.py`, called in
+       `_execute_inproc` after evidence promotion) compares the expected `{case_id}.json` set against what the
+       runner actually wrote and, on a gap, records an actionable diagnostic (`expected=…; runner wrote=…;
+       missing=…`) into the execute failure and sets `trial_meta.status=fail` (rc 0 → routes to Generate with a
+       clear cause, instead of the opaque `_fresh_deliverables_written` presence fail).
+  Authorization stays permissive (promotion still globs `*.json`); only the expected NAME is enforced. Unit
+  tests: `test_runner_snapshot_filename_must_be_per_case` (static check: literal flagged / case_id-built ok /
+  matching-case_id literal not a false positive / schema exempt / continuation-merge), `SnapshotDeliverableGapTest`
+  (backstop diagnostic). Suite green (1598). **Not yet done:** the billed `--with-deps` re-run confirming
+  `demo_dep_top` reaches `aggregate_verdict=pass` (operator-gated) — this was the LAST known blocker.
+
+- **Proposed fix (NOT implemented — superseded by the IMPLEMENTED fix above):** align the conductor's execute
+  snapshot-deliverable check with the canonical contract — require `snapshot_schema.json` + ≥`min_samples`
+  fresh snapshot data files in `raw/state_snapshots/` (derive-from-ground-truth, the `_fresh_deliverables_written`
+  smell test), instead of hardcoding `{case_id}.json`. Keep authorization permissive (the deterministic
+  execute already promotes tmp snapshots by glob, so any runner name is accepted into the canonical tree).
+  This is the D3-style robustness fix one layer down; it is the LAST known blocker to `demo_dep_top`
+  reaching `aggregate_verdict=pass`. Alternatively, a prod re-run's retry budget would also absorb it.
+
+**Net status of the original D1/D2 verification:** the dependency BUILD path is now E2E-proven in a live
+`--with-deps` run (the primary open item). Reaching the target's full `aggregate_verdict=pass` was blocked
+only by D4 (a generic, non-dependency snapshot-naming issue), whose **code fix is now implemented** (teach
+the runner the canonical `<case_id>.json` name + early static detection + a deterministic execute backstop;
+suite green 1598). The single remaining step is the operator-gated billed `--with-deps` re-run to confirm
+the target reaches `aggregate_verdict=pass`.
 
 ## L (latent / low severity — fix opportunistically)
 - **L1 — DONE (2026-06-25).** Generated Makefile emitted a harmless `make` warning

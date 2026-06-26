@@ -1564,6 +1564,54 @@ class WriteLineageTest(unittest.TestCase):
             self.assertEqual(lin["direct_dependency_status"], {"component/dep@0.1.0": "ready"})
 
 
+class SnapshotDeliverableGapTest(unittest.TestCase):
+    """D4: the execute-stage backstop produces an actionable diagnostic when the
+    runner names snapshots off the per-case <case_id>.json contract, instead of an
+    opaque deliverable-missing fail."""
+
+    def _conductor(self, repo: Path) -> _FakeConductor:
+        return _FakeConductor(
+            repo_root=repo, orchestration_id="o",
+            orchestration_agent_run_id="ORCH", backend="claude", env={},
+        )
+
+    def test_mismatch_yields_actionable_diagnostic(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            sdir = Path(tmp) / "raw" / "state_snapshots"
+            sdir.mkdir(parents=True)
+            # Runner wrote a single combined file; the per-case files are absent.
+            (sdir / "snapshot_0001.json").write_text("{}", encoding="utf-8")
+            (sdir / "snapshot_schema.json").write_text("{}", encoding="utf-8")
+            msg = self._conductor(Path(tmp))._snapshot_deliverable_gap(
+                sdir, ["l0_pass", "l0_xfail"], ["state_snapshots"])
+            self.assertIn("snapshot deliverable mismatch", msg)
+            self.assertIn("l0_pass.json", msg)
+            self.assertIn("l0_xfail.json", msg)
+            self.assertIn("snapshot_0001.json", msg)  # what the runner actually wrote
+            self.assertNotIn("snapshot_schema.json", msg)  # metadata excluded
+
+    def test_all_present_no_gap(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            sdir = Path(tmp) / "raw" / "state_snapshots"
+            sdir.mkdir(parents=True)
+            for cid in ("l0_pass", "l0_xfail"):
+                (sdir / f"{cid}.json").write_text("{}", encoding="utf-8")
+            msg = self._conductor(Path(tmp))._snapshot_deliverable_gap(
+                sdir, ["l0_pass", "l0_xfail"], ["state_snapshots"])
+            self.assertEqual(msg, "")
+
+    def test_no_gap_when_snapshots_not_required(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            sdir = Path(tmp) / "raw" / "state_snapshots"
+            c = self._conductor(Path(tmp))
+            self.assertEqual(
+                c._snapshot_deliverable_gap(sdir, ["l0_pass"], ["execution_trace.json"]),
+                "")
+            # No case_ids -> nothing to require.
+            self.assertEqual(
+                c._snapshot_deliverable_gap(sdir, [], ["state_snapshots"]), "")
+
+
 class WriteMakefileTest(unittest.TestCase):
     """The conductor authors a leaf node's src/Makefile deterministically (runtime-owned,
     like lineage.json), for build_system=make + language=fortran."""

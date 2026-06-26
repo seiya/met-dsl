@@ -1177,9 +1177,14 @@ clean:
         tcs = case.get("test_case_set") if isinstance(case, dict) else None
         if not isinstance(tcs, list):
             return ()
-        return tuple(
-            sorted(c["case_id"] for c in tcs if isinstance(c, dict) and c.get("case_id"))
-        )
+        # strip() so the case_id identity is the SAME across the runner argv
+        # (--cases), the expected raw/state_snapshots/<case_id>.json deliverable
+        # path, and the validator's _case_ids_for_execution exemption set.
+        return tuple(sorted(
+            c["case_id"].strip() for c in tcs
+            if isinstance(c, dict) and isinstance(c.get("case_id"), str)
+            and c["case_id"].strip()
+        ))
 
     def _read_evidence_artifacts(self, refs: NodeRefs) -> tuple[str, ...]:
         """IR-declared required raw-evidence artifact types for validate.execute
@@ -1664,11 +1669,15 @@ clean:
         schema = entry.get("schema") or {}
         present = {f.name for f in sdir.glob("*.json") if f.name != "snapshot_schema.json"}
         # Order samples by IR test_case_set declaration order (fallback: sorted).
+        # strip() to match the stripped case_id identity read_case_ids imposes on
+        # the runner argv / on-disk <case_id>.json name (else a whitespace-bearing
+        # case_id misses `present` and silently drops to sorted order).
         case = (ir.get("case") or {}) if isinstance(ir, dict) else {}
         tcs = case.get("test_case_set") or [] if isinstance(case, dict) else []
-        ordered = [f"{c['case_id']}.json" for c in tcs
-                   if isinstance(c, dict) and c.get("case_id")
-                   and f"{c['case_id']}.json" in present]
+        ordered = [f"{c['case_id'].strip()}.json" for c in tcs
+                   if isinstance(c, dict) and isinstance(c.get("case_id"), str)
+                   and c["case_id"].strip()
+                   and f"{c['case_id'].strip()}.json" in present]
         samples = ordered + sorted(present - set(ordered))
         doc = {
             "variables": schema.get("variables", []),
@@ -1680,6 +1689,42 @@ clean:
         (sdir / "snapshot_schema.json").write_text(
             json.dumps(doc, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
         return f"{self._rel(node_dir)}/raw/state_snapshots/snapshot_schema.json"
+
+    def _snapshot_deliverable_gap(self, snapshots_dir: Path, case_ids: list[str],
+                                  artifacts: list[str]) -> str:
+        """Diagnostic for a per-case snapshot deliverable mismatch, else "".
+
+        Validate.execute's deliverable gate (build_launch_request) requires one
+        raw/state_snapshots/<case_id>.json per case. The runner names snapshots
+        freely, so a fixed/sequential name (snapshot_0001.json) or a combined file
+        leaves the expected <case_id>.json absent and the deliverable gate fails
+        with no recorded cause. This returns an actionable message (expected vs
+        written vs missing) so the failure routes to Generate with a clear reason
+        instead of an opaque deliverable-missing fail. Empty when snapshots are not
+        required or every expected <case_id>.json is present.
+
+        ``snapshots_dir`` is the runner's THIS-attempt output dir (the per-run tmp
+        raw/state_snapshots), so the written set is fresh by construction — a stale
+        correctly-named file from a prior attempt in the canonical node dir cannot
+        mask a real gap (matching the gate's mtime freshness semantics).
+        """
+        if "state_snapshots" not in artifacts or not case_ids:
+            return ""
+        present = ({f.name for f in snapshots_dir.glob("*.json")
+                    if f.name != "snapshot_schema.json"}
+                   if snapshots_dir.exists() else set())
+        expected = {f"{cid}.json" for cid in case_ids}
+        missing = sorted(expected - present)
+        if not missing:
+            return ""
+        return (
+            "[execute fail: snapshot deliverable mismatch] Validate.execute requires "
+            "one raw/state_snapshots/<case_id>.json per case. "
+            f"expected={sorted(expected)}; runner wrote={sorted(present)}; "
+            f"missing={missing}. Name each snapshot exactly <case_id>.json, built "
+            "from the case_id passed via --cases (e.g. trim(case_id)//'.json'). "
+            "Canonical: phase_02_generate.md / phase_04_validate.md §43."
+        )
 
     @staticmethod
     def _author_quality_check(node_dir: Path, run_diag: dict[str, Any],
@@ -1817,6 +1862,13 @@ clean:
         schema_ref = self._author_snapshot_schema(ir, node_dir)
         if schema_ref:
             raw_refs.append(schema_ref)
+        # Per-case snapshot deliverable check (build_launch_request requires one
+        # raw/state_snapshots/<case_id>.json per case). Compute a clear diagnostic
+        # here so a misnamed/combined snapshot fails with an actionable cause rather
+        # than the opaque determine_substep_status deliverable-presence fail. Read
+        # the runner's THIS-attempt tmp output (fresh), not the promoted node dir.
+        snapshot_gap = self._snapshot_deliverable_gap(
+            run_tmp / "raw" / "state_snapshots", case_ids, artifacts)
 
         run_diag = _read_json(run_tmp / "diagnostics.json") or {}
         qc_diag = _read_json(qc_tmp / "diagnostics.json") or {}
@@ -1866,12 +1918,14 @@ clean:
             ["python3", "tools/validate_pipeline_semantics.py", "--stage", "post_execute",
              "--pipeline-root", refs.pipeline_ref, "--run-id", refs.run_id or ""],
             cwd=self.repo_root, env=self.env, text=True, capture_output=True, check=False)
-        if syn.returncode != 0 or gate.returncode != 0 or qc_status != "pass":
+        if syn.returncode != 0 or gate.returncode != 0 or qc_status != "pass" or snapshot_gap:
             # Content failure: record it in trial_meta.status (read by
             # determine_substep_status) and return rc 0 so run_phase routes it via the
             # validate tables / diagnostician, NOT transport fail_closed.
             stderr += ("\n[execute fail]\n" + syn.stdout + syn.stderr
                        + gate.stdout + gate.stderr)
+            if snapshot_gap:
+                stderr += "\n" + snapshot_gap
             trial_meta["status"] = "fail"
             (node_dir / "trial_meta.json").write_text(
                 json.dumps(trial_meta, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")

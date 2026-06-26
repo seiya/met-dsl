@@ -2526,6 +2526,64 @@ def _validate_runner_json_serialization(
                 _scan_runner_format_text(runner_file, lineno, reaching, violations)
 
 
+# A whole-path snapshot data filename embedded in a single string literal:
+# ``state_snapshots/<name>.json``. The per-case contract requires the runner to
+# BUILD the name from the case_id it receives on argv (e.g.
+# ``'raw/state_snapshots/'//trim(case_id)//'.json'``), which keeps ``.json`` in a
+# SEPARATE literal so this pattern does not match. A fixed/sequential literal
+# (``snapshot_0001.json``, a combined file) does match. The character class
+# excludes quotes so a match never crosses a string-literal boundary.
+_RUNNER_SNAPSHOT_LITERAL = re.compile(r"state_snapshots/([^/'\"]+)\.json")
+
+
+def _validate_runner_snapshot_filenames(
+    runner_file: Path,
+    text: str,
+    violations: list[str],
+    known_case_ids: set[str] | None = None,
+) -> None:
+    """Flag a hardcoded ``raw/state_snapshots/<name>.json`` filename in the runner.
+
+    ``Validate.execute``'s deliverable gate requires exactly one
+    ``raw/state_snapshots/<case_id>.json`` per ``case.test_case_set[].case_id``
+    (``workflow_conductor.build_launch_request``), so the runner must build the
+    snapshot path from the ``case_id`` it receives on argv (``--cases <spec>
+    <case_id>...``) rather than emitting a fixed/sequential name. This best-effort
+    static check catches the common failure: a whole-path string literal carrying
+    ``state_snapshots/<name>.json`` with no per-case concatenation — e.g.
+    ``snapshot_0001.json``. A correctly-built name (``trim(case_id)//'.json'``)
+    keeps ``.json`` in a separate literal and is not flagged; the runtime
+    deliverable gate is the deterministic backstop for constructions this static
+    parse cannot resolve. ``snapshot_schema.json`` (conductor-authored metadata)
+    is exempt. When ``known_case_ids`` is given, a hardcoded literal whose stem IS
+    a declared case_id is NOT flagged — it satisfies the deliverable gate, so
+    flagging it would be a false positive (case-insensitive: ``text`` is the
+    already-lowercased runner source and case_ids are lowercase by convention).
+    """
+    case_id_stems = (
+        {cid.lower() for cid in known_case_ids} if known_case_ids else set()
+    )
+    for lineno, line in _iter_fortran_logical_lines(text):
+        if "state_snapshots/" not in line:
+            continue
+        # Scope to file-opening statements so a snapshot path written as JSON
+        # *content* (not an output target) is never mistaken for a filename.
+        if "file=" not in line and not re.search(r"\bopen\s*\(", line):
+            continue
+        for match in _RUNNER_SNAPSHOT_LITERAL.finditer(line):
+            name = match.group(1)
+            if name == "snapshot_schema" or name in case_id_stems:
+                continue
+            violations.append(
+                f"{runner_file}:{lineno}: hardcoded snapshot filename "
+                f"'state_snapshots/{name}.json' — write one "
+                "raw/state_snapshots/<case_id>.json per case, building the name "
+                "from the case_id received on argv (e.g. trim(case_id)//'.json'); "
+                "a fixed/sequential name fails Validate.execute's per-case "
+                "deliverable gate (phase_02_generate.md / phase_04_validate.md §43)"
+            )
+
+
 @dataclass
 class NodeExecution:
     node_key: str
@@ -3762,7 +3820,10 @@ def _validate_generate_outputs_for_generation(
         src_dir, violations, build_system=_build_system, language=_language
     )
     runner_files = sorted(src_dir.glob("*_runner.f90"))
-    _validate_runner_source_files(execution, runner_files, violations)
+    _validate_runner_source_files(
+        execution, runner_files, violations,
+        known_case_ids=_case_ids_for_execution(repo_root, execution),
+    )
 
     if dep_spec_ids:
         _validate_dependency_operation_on_model_files(
@@ -4209,6 +4270,32 @@ def _case_id_to_test_id(
         ):
             mapping[case_id.strip()] = test_id.strip()
     return mapping
+
+
+def _case_ids_for_execution(repo_root: Path, execution: NodeExecution) -> set[str]:
+    """All declared ``case.test_case_set[].case_id`` for the execution's IR.
+
+    Used by the post_generate snapshot-filename check to avoid a false positive on
+    a hardcoded ``raw/state_snapshots/<case_id>.json`` literal that legitimately
+    matches a declared case (it satisfies the deliverable gate). Unlike
+    ``_case_id_to_test_id`` this includes cases whose ``test_id`` is null.
+    """
+    data = _algorithm_contract_for_execution(repo_root, execution)
+    if not isinstance(data, dict):
+        return set()
+    case_section = data.get("case")
+    if not isinstance(case_section, dict):
+        return set()
+    test_case_set = case_section.get("test_case_set")
+    if not isinstance(test_case_set, list):
+        return set()
+    return {
+        item["case_id"].strip()
+        for item in test_case_set
+        if isinstance(item, dict)
+        and isinstance(item.get("case_id"), str)
+        and item["case_id"].strip()
+    }
 
 
 def _metrics_basis_entries(
@@ -6250,6 +6337,7 @@ def _validate_runner_source_files(
     execution: NodeExecution,
     runner_files: list[Path],
     violations: list[str],
+    known_case_ids: set[str] | None = None,
 ) -> None:
     # B2 (cosmetic): the runner source is found by `*_runner.f90` glob, which is
     # looser than generate's write-authorization (allowed_output_paths pins exactly
@@ -6291,15 +6379,24 @@ def _validate_runner_source_files(
             text=text,
             violations=violations,
         )
+        _validate_runner_snapshot_filenames(
+            runner_file=runner_file,
+            text=text,
+            violations=violations,
+            known_case_ids=known_case_ids,
+        )
 
 
 def _validate_runner_outputs(
-    execution: NodeExecution, src_dir: Path, violations: list[str]
+    execution: NodeExecution, src_dir: Path, violations: list[str],
+    known_case_ids: set[str] | None = None,
 ) -> None:
     runner_files = sorted(src_dir.glob("*_runner.f90"))
     if not runner_files:
         return
-    _validate_runner_source_files(execution, runner_files, violations)
+    _validate_runner_source_files(
+        execution, runner_files, violations, known_case_ids=known_case_ids
+    )
 
 
 def _canonical_log_ref_for_run_program(
@@ -8270,7 +8367,10 @@ def _validate_impl(
             _validate_dependency_operation_usage(
                 repo_root, execution, in_scope_src_dir, violations
             )
-            _validate_runner_outputs(execution, in_scope_src_dir, violations)
+            _validate_runner_outputs(
+                execution, in_scope_src_dir, violations,
+                known_case_ids=_case_ids_for_execution(repo_root, execution),
+            )
         _validate_run_program_inputs(repo_root, execution, violations)
         _validate_quality_check_commands(repo_root, execution, violations)
         _validate_tests_verdict_summary_consistency(repo_root, execution, violations)

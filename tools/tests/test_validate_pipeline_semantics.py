@@ -5766,6 +5766,80 @@ end program shallow_water2d_runner
                 f"correctly-named runner must not be flagged, got: {good}",
             )
 
+    def test_runner_snapshot_filename_must_be_per_case(self) -> None:
+        """D4: a hardcoded raw/state_snapshots/<name>.json literal (e.g.
+        snapshot_0001.json) is flagged at post_generate; a per-case name built from
+        the case_id (trim(case_id)//'.json'), the conductor-authored
+        snapshot_schema.json, and a hardcoded literal that matches a declared
+        case_id are not. The runtime deliverable gate is the deterministic
+        backstop, so this static check stays conservative."""
+        from tools.validate_pipeline_semantics import (
+            _validate_runner_snapshot_filenames,
+        )
+        runner = Path("x_runner.f90")
+
+        def run(src: str, case_ids: set[str] | None = None) -> list[str]:
+            out: list[str] = []
+            _validate_runner_snapshot_filenames(runner, src.lower(), out, case_ids)
+            return out
+
+        # Hardcoded sequential name, no per-case construction -> flagged.
+        bad = run(
+            "open(unit=10, file='raw/state_snapshots/snapshot_0001.json', "
+            "status='replace')\n"
+        )
+        self.assertTrue(
+            any("hardcoded snapshot filename" in v and "snapshot_0001.json" in v
+                for v in bad),
+            f"expected a hardcoded-snapshot violation, got: {bad}",
+        )
+
+        # Name built from the case_id argv -> not flagged.
+        self.assertFalse(
+            run("open(unit=10, file='raw/state_snapshots/'//trim(case_id)//'.json')\n"),
+            "per-case snapshot name must not be flagged",
+        )
+
+        # Conductor-authored schema metadata is exempt.
+        self.assertFalse(
+            run("open(unit=11, file='raw/state_snapshots/snapshot_schema.json')\n"),
+            "snapshot_schema.json must be exempt",
+        )
+
+        # A non-snapshot output (diagnostics) is ignored.
+        self.assertFalse(
+            run("open(unit=12, file='diagnostics.json')\n"),
+            "non-snapshot open must be ignored",
+        )
+
+        # The literal in a non-open/non-file= line (e.g. written as content) is
+        # ignored: the open(/file= gating suppresses the false positive.
+        self.assertFalse(
+            run("write(u, '(a)') 'raw/state_snapshots/snapshot_0001.json'\n"),
+            "a snapshot path written as content (not a file= target) must be ignored",
+        )
+
+        # A continuation-split open is merged before matching.
+        self.assertTrue(
+            any("c1.json" in v for v in
+                run("open(unit=13, &\n  file='raw/state_snapshots/c1.json')\n")),
+            "continuation-split hardcoded snapshot must be flagged",
+        )
+
+        # A hardcoded literal whose stem IS a declared case_id is NOT a false
+        # positive (it satisfies the per-case deliverable gate).
+        self.assertFalse(
+            run("open(unit=14, file='raw/state_snapshots/l0_pass.json')\n",
+                {"l0_pass", "l0_xfail"}),
+            "a hardcoded name matching a declared case_id must not be flagged",
+        )
+        # ...but a non-matching hardcoded literal still is, even with case_ids known.
+        self.assertTrue(
+            run("open(unit=14, file='raw/state_snapshots/snapshot_0001.json')\n",
+                {"l0_pass", "l0_xfail"}),
+            "a hardcoded name not matching any case_id must be flagged",
+        )
+
     def test_detects_unknown_required_raw_variables_from_tests_mapping(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
