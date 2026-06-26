@@ -24090,7 +24090,12 @@ class ChildContextDocSizeTests(unittest.TestCase):
         "docs/AGENT_CONTRACT.md": 17400,
         # Consolidated runner-output contract (was duplicated across phase_02/04 +
         # PERF §2/§6); leaf must-read for generate.generate/verify + validate.judge.
-        "docs/workflow/RUNNER_OUTPUT_CONTRACT.md": 7600,
+        # Bumped 7600->8100: §3 disambiguated the guard-case snapshot rule (declared
+        # required vars must be present even when empty + shape-valid: 1-D as [],
+        # rank-≥2 must still shape-match its shape_expr) + correct/wrong examples,
+        # after an E2E top-node validate.execute failure where the runner dropped
+        # required x,z from an xfail snapshot.
+        "docs/workflow/RUNNER_OUTPUT_CONTRACT.md": 8100,
         # Still force-read by compile.generate/verify (its IR schema is the contract
         # the compile SKILL defers to).
         "docs/workflow/phases/phase_01_compile.md": 17000,

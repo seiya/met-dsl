@@ -75,11 +75,26 @@ source; do not uniformly require a fixed minimal composition.
   (`trim(case_id)//'.json'`), never a hardcoded/sequential literal
   (`snapshot_0001.json`) or a single combined file: a string-literal name is
   flagged by `post_generate`; a wrong runtime-built name fails
-  `Validate.execute`'s per-`<case_id>.json` deliverable gate. Each snapshot need
-  only hold its own case's `test_evidence_requirements` variables (not the
-  union); a no-output guard case may omit the output variables but still writes
-  its `<case_id>.json`. When `required_evidence` does not declare
-  `state_snapshots` as required, `raw/state_snapshots/` must not be required.
+  `Validate.execute`'s per-`<case_id>.json` deliverable gate. Each snapshot must
+  hold **every** state variable in *that case's*
+  `test_evidence_requirements.required_raw_variables` (not the union across
+  cases) **plus the declared `time_variable`**, each shape-matching its
+  `snapshot_schema.json` declaration (state variables their `shape_expr`, the
+  `time_variable` its `time_shape_expr`). A case that rejects its input or
+  produces no meaningful values (e.g. a `*_xfail` length-guard case) **still
+  emits those required variables, shape-valid, and must not drop the key** — a
+  1-D var as the empty array `[]` (infers shape `[0]`, binding its extent to 0).
+  Note a bare `[]` infers as 1-D `[0]` and satisfies **only** a 1-D `shape_expr`;
+  a rank-≥2 required var must instead emit a value whose JSON-inferred shape
+  matches its `shape_expr` (a nested empty such as `[[]]` infers `[1,0]`). It may
+  additionally record a guard flag. "May omit" applies
+  **only** to variables *outside* that case's required set; never omit a declared
+  required variable.
+  - Correct (rejected length-0 guard case): `{"case_id":"l0_invalid_length_xfail","step":0,"n":0,"x":[],"invalid_rejected":true}` — required `x` present as `[]` (1-D, extent 0).
+  - Wrong: `{"case_id":"l0_invalid_length_xfail","step":0,"invalid_rejected":true}` — drops the required `x` (and any other required var) → `post_execute` fails with "declared state_variables missing".
+
+  When `required_evidence` does not declare `state_snapshots` as required,
+  `raw/state_snapshots/` must not be required.
 
 ## 4. JSON serialization (UTF-8, standard-parseable)
 
