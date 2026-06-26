@@ -1425,7 +1425,7 @@ clean:
         only consumer of the staged `<dep>_model.f90`. For a c/cpp/mixed dependency node the
         Generate child still owns the (LLM-authored) Makefile and its own dependency build, so
         the conductor must not stage Fortran sources (they do not exist under those names)."""
-        from tools.orchestration_runtime import _latest_meta_under, _latest_pipeline_dir
+        from tools.orchestration_runtime import _certified_model_source, _latest_pipeline_dir
         if not self._conductor_authors_makefile(refs):
             return []
         nodes = self._dependency_closure_nodes(refs)
@@ -1466,21 +1466,16 @@ clean:
             # binary's source (newer source, not yet rebuilt/validated) — staging from lineage
             # would then compile the depending node against UNVERIFIED dependency code. Use the
             # certified binary's `source_source_id` so the staged source == the validated one.
-            binary_meta_path = _latest_meta_under(pipe_dir, "binary/*/binary_meta.json")
-            if binary_meta_path is None:
+            # `_certified_model_source` is the single-sourced selection the Generate-time
+            # interface hint (`_resolve_dependency_facts`) reads too, so the interface a
+            # consumer is SHOWN equals the source Build COMPILES (no drift).
+            model_src = _certified_model_source(pipe_dir, sid)
+            if model_src is None:
                 raise RuntimeError(
-                    f"dependency {nk}: no binary_meta.json under {self._rel(pipe_dir)} to "
-                    f"resolve the certified source (dependency not built ready; "
+                    f"dependency {nk}: cannot resolve certified {sid}_model.f90 under "
+                    f"{self._rel(pipe_dir)} (no binary_meta.json / no source_source_id / "
+                    f"missing source file; dependency not built ready — "
                     f"run_workflow.py --with-deps first)")
-            binary_meta = _read_json(binary_meta_path) or {}
-            source_id = binary_meta.get("source_source_id")
-            if not isinstance(source_id, str) or not source_id.strip():
-                raise RuntimeError(
-                    f"dependency {nk}: {self._rel(binary_meta_path)} has no source_source_id")
-            model_src = pipe_dir / "source" / source_id / "src" / f"{sid}_model.f90"
-            if not model_src.is_file():
-                raise RuntimeError(
-                    f"dependency {nk}: model source not found at {self._rel(model_src)}")
             shutil.copy2(model_src, obj_dir / f"{sid}_model.f90")
             staged.append(self._rel(model_src))
         return staged

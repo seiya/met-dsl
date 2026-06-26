@@ -876,7 +876,135 @@ def _verify_dep_stage(
     raise ValueError(f"unknown readiness stage: {stage!r}")
 
 
-def _resolve_dependency_facts(repo_root: Path, ir_ref: Any) -> list[dict[str, str]]:
+def _certified_model_source(pipe_dir: Path, spec_id: str) -> Path | None:
+    """Resolve the certified Fortran model source for a dependency pipeline — the EXACT
+    `<spec_id>_model.f90` Build stages/links — or ``None`` if it cannot be resolved.
+
+    Single-sources the load-bearing selection both the orientation hint
+    (``_resolve_dependency_facts``) and the deterministic Build staging
+    (``workflow_conductor._stage_dependency_sources``) depend on, so the interface a
+    consumer is SHOWN at Generate is always the source Build COMPILES. The selection
+    binds to the certified binary's ``source_source_id`` (``binary/*/binary_meta.json``),
+    NOT the pipeline ``lineage.json`` (which tracks the latest *generated* source and may
+    have advanced past the certified binary). The latest binary is chosen identically to
+    how ``_verify_dep_stage`` / ``_resolve_dependency_facts`` select it.
+
+    Pure and NEVER raises: any missing/unparseable artifact (no binary_meta, no
+    ``source_source_id``, no source file) yields ``None``. Callers decide the policy —
+    the orientation hint skips the dep; Build re-raises its fail-closed precondition.
+    """
+    try:
+        binary_meta_path = _latest_meta_under(pipe_dir, "binary/*/binary_meta.json")
+        if binary_meta_path is None:
+            return None
+        try:
+            binary_meta = json.loads(binary_meta_path.read_text(encoding="utf-8"))
+        except Exception:
+            return None
+        if not isinstance(binary_meta, dict):
+            return None
+        source_id = binary_meta.get("source_source_id")
+        if not isinstance(source_id, str) or not source_id.strip():
+            return None
+        model_src = pipe_dir / "source" / source_id.strip() / "src" / f"{spec_id}_model.f90"
+        return model_src if model_src.is_file() else None
+    except Exception:
+        return None
+
+
+# `subroutine` header opener: optional prefixes (pure / elemental / recursive / impure /
+# module), then `subroutine <name>(`. Case-insensitive, name captured for selection.
+_FORTRAN_SUBROUTINE_RE = re.compile(
+    r"(?:(?:pure|impure|elemental|recursive|module)\s+)*"
+    r"subroutine\s+(?P<name>[A-Za-z]\w*)\s*\(",
+    re.IGNORECASE,
+)
+
+
+def _extract_subroutine_interface(source_text: str, op_name: str) -> dict[str, Any] | None:
+    """Extract the published interface of subroutine ``op_name`` from Fortran source.
+
+    Returns ``{"interface": <verbatim header collapsed to one line>, "argument_order":
+    [<dummy names in order>]}`` or ``None`` when the subroutine is absent / unparseable.
+    The load-bearing datum is ``argument_order`` (Fortran is positional; a consumer that
+    swaps args builds against a type/rank mismatch). ``interface`` is the authoritative
+    header verbatim (no re-rendering risk).
+
+    Robust to the real shapes Generate emits: free-form ``&`` continuations on the header
+    (the generate SKILL forces wrapping at <=100 cols for fortitude S001), ``!`` comments
+    (incl. full-line comment between continuations), case-insensitivity, leading
+    ``pure``/``impure``/``elemental``/``recursive``/``module`` prefixes, and several
+    subroutines in one file (selects by name, not the first). NEVER raises.
+    """
+    try:
+        if not isinstance(source_text, str) or not op_name:
+            return None
+        # 1) Strip `!` comments line-by-line, then join `&` continuations into logical
+        #    lines so a wrapped header `(...)` parses as one unit. A trailing `&` continues
+        #    onto the next non-comment line; a leading `&` on the continuation is dropped.
+        #    A line that is blank or comment-only after the strip carries no statement text
+        #    and is skipped WHETHER OR NOT a continuation is in progress — a full-line
+        #    comment is permitted between continuation lines and must not flush the buffer
+        #    (otherwise the wrapped header would terminate early and fail to parse).
+        logical: list[str] = []
+        buf = ""
+        for raw in source_text.splitlines():
+            code = _strip_fortran_comment(raw)
+            if not code.strip():
+                continue
+            stripped = code.strip()
+            piece = stripped[1:].lstrip() if (buf and stripped.startswith("&")) else stripped
+            if piece.endswith("&"):
+                buf += piece[:-1].rstrip() + " "
+                continue
+            buf += piece
+            if buf.strip():
+                logical.append(buf.strip())
+            buf = ""
+        if buf.strip():
+            logical.append(buf.strip())
+        # 2) Find the `subroutine <op_name>(...)` header among possibly several.
+        for line in logical:
+            m = _FORTRAN_SUBROUTINE_RE.match(line)
+            if m is None or m.group("name").lower() != op_name.lower():
+                continue
+            open_idx = line.index("(", m.end() - 1)
+            depth = 0
+            close_idx = None
+            for i in range(open_idx, len(line)):
+                if line[i] == "(":
+                    depth += 1
+                elif line[i] == ")":
+                    depth -= 1
+                    if depth == 0:
+                        close_idx = i
+                        break
+            if close_idx is None:
+                return None
+            inner = line[open_idx + 1:close_idx]
+            args = [a.strip() for a in inner.split(",") if a.strip()]
+            header = line[: close_idx + 1].strip()
+            return {"interface": header, "argument_order": args}
+        return None
+    except Exception:
+        return None
+
+
+def _strip_fortran_comment(line: str) -> str:
+    """Drop a free-form Fortran `!` comment, respecting `'`/`"` string literals."""
+    quote = None
+    for i, ch in enumerate(line):
+        if quote is not None:
+            if ch == quote:
+                quote = None
+        elif ch in ("'", '"'):
+            quote = ch
+        elif ch == "!":
+            return line[:i]
+    return line
+
+
+def _resolve_dependency_facts(repo_root: Path, ir_ref: Any) -> list[dict[str, Any]]:
     """Resolve, host-side, the on-disk pipeline / run / aggregate_verdict each direct
     dependency of ``<ir_ref>/spec.ir.yaml`` was certified to — ORIENTATION ONLY, never a
     gate.
@@ -893,6 +1021,16 @@ def _resolve_dependency_facts(repo_root: Path, ir_ref: Any) -> list[dict[str, st
     do not resolve (a leaf with no closure artifact yet, a missing pipeline dir / binary /
     bound verdict) are silently skipped.
 
+    When the CONSUMER is a Fortran node, each fact additionally carries
+    ``published_operations`` — ``[{operation, interface, argument_order}]`` extracted from
+    the dependency's CERTIFIED ``<spec_id>_model.f90`` (the exact source Build links, via
+    the shared ``_certified_model_source``) for every op listed in that dep's
+    ``operations``. This pins the dependency call-site argument order so the consumer's
+    Generate need not guess it (a wrong positional order otherwise fails the build with a
+    type/rank mismatch). Best-effort: a dep whose source/op cannot be resolved simply omits
+    ``published_operations`` and keeps its pipeline/run/verdict fact. Non-Fortran consumers
+    (c/cpp/mixed call via their own ABI, not the Fortran signature) get no interfaces.
+
     The dependency ``@version`` is taken from the IR ``direct_deps[].node_key`` (a well-
     formed IR pins the resolved version, consistent with how readiness resolves it from
     ``deps.yaml`` + catalog). Because this output only orients the leaf's semantic review
@@ -902,7 +1040,7 @@ def _resolve_dependency_facts(repo_root: Path, ir_ref: Any) -> list[dict[str, st
     Best-effort: NEVER raises. A leaf node (empty ``direct_deps``), a missing/unparseable
     IR, a missing PyYAML, or a malformed dep ``node_key`` yields ``[]`` / a skipped entry.
     """
-    facts: list[dict[str, str]] = []
+    facts: list[dict[str, Any]] = []
     try:
         ir_ref_token = str(ir_ref or "").strip().rstrip("/")
         if not ir_ref_token:
@@ -920,6 +1058,15 @@ def _resolve_dependency_facts(repo_root: Path, ir_ref: Any) -> list[dict[str, st
         direct_deps = dep.get("direct_deps") if isinstance(dep, dict) else None
         if not isinstance(direct_deps, list):
             return []
+        # Surface dependency call-site interfaces only when the CONSUMER is Fortran: a
+        # c/cpp/mixed consumer calls via its own ABI, not the Fortran subroutine signature.
+        impl = ir_doc.get("impl_defaults")
+        toolchain = impl.get("toolchain") if isinstance(impl, dict) else None
+        consumer_language = (
+            str(toolchain.get("language") or "fortran").strip().lower()
+            if isinstance(toolchain, dict) else "fortran"
+        )
+        consumer_is_fortran = consumer_language == "fortran"
         repo_resolved = repo_root.resolve()
         for entry in direct_deps:
             node_key = entry.get("node_key") if isinstance(entry, dict) else entry
@@ -958,14 +1105,38 @@ def _resolve_dependency_facts(repo_root: Path, ir_ref: Any) -> list[dict[str, st
                 verdict_ref = verdict_path.resolve().relative_to(repo_resolved).as_posix()
             except ValueError:
                 continue
-            facts.append(
-                {
-                    "node_key": node_key,
-                    "pipeline_ref": pipeline_ref,
-                    "run_id": run_id,
-                    "aggregate_verdict_ref": verdict_ref,
-                }
-            )
+            fact: dict[str, Any] = {
+                "node_key": node_key,
+                "pipeline_ref": pipeline_ref,
+                "run_id": run_id,
+                "aggregate_verdict_ref": verdict_ref,
+            }
+            # Pin each called op's certified Fortran interface (argument order) so the
+            # consumer's Generate need not guess it. Extracted from the SAME certified
+            # source Build stages (`_certified_model_source`). Best-effort, never raises.
+            ops = entry.get("operations") if isinstance(entry, dict) else None
+            if consumer_is_fortran and isinstance(ops, list) and ops:
+                try:
+                    dep_spec_id = _parse_node_key_strict(node_key)[1]
+                    model_src = _certified_model_source(pipe_dir, dep_spec_id)
+                except Exception:
+                    model_src = None
+                if model_src is not None:
+                    try:
+                        source_text = model_src.read_text(encoding="utf-8")
+                    except Exception:
+                        source_text = None
+                    if source_text is not None:
+                        published: list[dict[str, Any]] = []
+                        for op in ops:
+                            if not isinstance(op, str) or not op.strip():
+                                continue
+                            iface = _extract_subroutine_interface(source_text, op.strip())
+                            if iface is not None:
+                                published.append({"operation": op.strip(), **iface})
+                        if published:
+                            fact["published_operations"] = published
+            facts.append(fact)
     except Exception:
         return facts
     return facts
@@ -8148,7 +8319,49 @@ def _build_dependency_facts(request_payload: dict[str, Any]) -> str:
         )
     if len(lines) == 1:
         return ""
+    op_lines = _published_operations_lines(deps)
+    if op_lines:
+        lines.append("")
+        lines.extend(op_lines)
     return "\n".join(lines)
+
+
+def _published_operations_lines(deps: list[Any]) -> list[str]:
+    """Render the conductor-resolved published-operation interfaces (argument order) for
+    each direct dependency, or ``[]`` when none were resolved.
+
+    Separate, role-aware sub-block: unlike the PASS/verdict facts above (orientation for a
+    judge, never a gate), the argument order is a correctness input to AUTHORING — the
+    consumer's Generate must call each op with exactly this positional order or the build
+    fails on a type/rank mismatch and is routed back to Generate. It is still
+    conductor-resolved orientation, never itself a gate.
+    """
+    rows: list[str] = []
+    for dep in deps:
+        if not isinstance(dep, dict):
+            continue
+        node_key = str(dep.get("node_key", "")).strip()
+        pub_ops = dep.get("published_operations")
+        if not node_key or not isinstance(pub_ops, list) or not pub_ops:
+            continue
+        for op in pub_ops:
+            if not isinstance(op, dict):
+                continue
+            iface = str(op.get("interface", "")).strip()
+            if not iface:
+                continue
+            rows.append(f"- {node_key} :: {iface}")
+    if not rows:
+        return []
+    return [
+        "**Published dependency operations (conductor-resolved from each dependency's "
+        "CERTIFIED source — the exact source Build will compile/link):** Fortran arguments "
+        "are positional; call each operation with EXACTLY this argument order. A wrong "
+        "order builds against a type/rank mismatch and fails the build (routed back to "
+        "Generate). For generate.generate this is authoring-binding; for verify/validate "
+        "it is the authoritative order to check the emitted `call` against.",
+        *rows,
+    ]
 
 
 def _template_placeholder_values(request_payload: dict[str, Any]) -> dict[str, str]:

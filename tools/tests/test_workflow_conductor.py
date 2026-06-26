@@ -1607,6 +1607,53 @@ class WriteLineageTest(unittest.TestCase):
                 f"workspace/pipelines/{safe}/base_20260622_003/runs/run_20260622_001/{safe}/"
                 "aggregate_verdict.json")
 
+    def test_persists_published_operations_for_fortran_consumer(self) -> None:
+        # D5: _write_lineage surfaces the dependency call-site argument order (from the
+        # certified source) into resolved_dependencies/lineage so the consumer's Generate
+        # need not guess it.
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            refs = wc.NodeRefs(
+                node_key="component/top@0.1.0", spec_path="spec/component/top",
+                ir_id="top_20260622_001", pipeline_id="top_20260622_002",
+                source_id="src_001", binary_id="bin_001", run_id="run_001")
+            ir_dir = repo / refs.ir_ref
+            ir_dir.mkdir(parents=True)
+            (ir_dir / "spec.ir.yaml").write_text(
+                'impl_defaults:\n  toolchain:\n    language: fortran\n'
+                'dependency:\n'
+                '  direct_deps:\n'
+                '    - node_key: "component/base@0.1.0"\n'
+                '      operations: ["base__scale"]\n',
+                encoding="utf-8")
+            safe = "component__base__0.1.0"
+            pipe = repo / "workspace" / "pipelines" / safe / "base_20260622_003"
+            b = pipe / "binary" / "bin_20260622_001"
+            b.mkdir(parents=True)
+            (b / "binary_meta.json").write_text(
+                json.dumps({"verification_status": "pass",
+                            "source_source_id": "src_b_001"}), encoding="utf-8")
+            src_dir = pipe / "source" / "src_b_001" / "src"
+            src_dir.mkdir(parents=True)
+            (src_dir / "base_model.f90").write_text(
+                "module base_model\ncontains\n"
+                "  subroutine base__scale(x, n, y)\n  end subroutine\n"
+                "end module base_model\n", encoding="utf-8")
+            rd = pipe / "runs" / "run_20260622_001" / safe
+            rd.mkdir(parents=True)
+            (rd / "aggregate_verdict.json").write_text(
+                json.dumps({"aggregate_verdict": "pass"}), encoding="utf-8")
+            (rd / "trial_meta.json").write_text(
+                json.dumps({"source_binary_id": "bin_20260622_001"}), encoding="utf-8")
+
+            facts = self._conductor(repo)._write_lineage(refs)
+            self.assertEqual(len(facts), 1)
+            pub = facts[0]["published_operations"]
+            self.assertEqual(pub[0]["operation"], "base__scale")
+            self.assertEqual(pub[0]["argument_order"], ["x", "n", "y"])
+            lin = json.loads((repo / refs.pipeline_ref / "lineage.json").read_text(encoding="utf-8"))
+            self.assertEqual(lin["resolved_dependencies"], facts)
+
 
 class BuildLaunchRequestResolvedDependenciesTest(unittest.TestCase):
     """build_launch_request attaches resolved_dependencies only for the LLM phases that

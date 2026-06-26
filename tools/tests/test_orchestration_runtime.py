@@ -15281,6 +15281,33 @@ class DependencyFactsRenderTests(unittest.TestCase):
             f"pipeline_ref={self.DEP['pipeline_ref']} run_id={self.DEP['run_id']} "
             f"aggregate_verdict={self.DEP['aggregate_verdict_ref']}", block)
 
+    DEP_WITH_OPS = {
+        **DEP,
+        "published_operations": [
+            {"operation": "demo_dep_base__scale",
+             "interface": "subroutine demo_dep_base__scale(x, n, y)",
+             "argument_order": ["x", "n", "y"]},
+        ],
+    }
+
+    def test_published_operations_block_present_with_order(self) -> None:
+        from tools.orchestration_runtime import _build_dependency_facts
+
+        block = _build_dependency_facts(
+            dict(self.BASE, resolved_dependencies=[self.DEP_WITH_OPS]))
+        self.assertIn("Published dependency operations", block)
+        self.assertIn(
+            "- component/demo_dep_base@0.1.0 :: "
+            "subroutine demo_dep_base__scale(x, n, y)", block)
+        self.assertIn("EXACTLY this argument order", block)
+
+    def test_published_operations_block_absent_when_none(self) -> None:
+        from tools.orchestration_runtime import _build_dependency_facts
+
+        block = _build_dependency_facts(
+            dict(self.BASE, resolved_dependencies=[self.DEP]))
+        self.assertNotIn("Published dependency operations", block)
+
     def test_render_judge_carries_verdict_path_and_no_dep_does_not(self) -> None:
         from tools.orchestration_runtime import (
             prepare_launch_request_payload,
@@ -15308,22 +15335,34 @@ class ResolveDependencyFactsTests(unittest.TestCase):
     """_resolve_dependency_facts mirrors _verify_dep_stage's pipeline/binary/verdict
     selection and is best-effort (never raises; leaf / unresolved → [])."""
 
-    def _write_ir(self, repo_root: Path, ir_ref: str, direct_deps: list[dict]) -> None:
+    def _write_ir(
+        self, repo_root: Path, ir_ref: str, direct_deps: list[dict],
+        *, impl_defaults: dict | None = None,
+    ) -> None:
         import yaml as _yaml
         ir_path = repo_root / ir_ref / "spec.ir.yaml"
         ir_path.parent.mkdir(parents=True, exist_ok=True)
-        ir_path.write_text(
-            _yaml.safe_dump({"dependency": {"direct_deps": direct_deps}}),
-            encoding="utf-8")
+        doc: dict = {"dependency": {"direct_deps": direct_deps}}
+        if impl_defaults is not None:
+            doc["impl_defaults"] = impl_defaults
+        ir_path.write_text(_yaml.safe_dump(doc), encoding="utf-8")
 
     def _write_dep_pipeline(
         self, repo_root: Path, safe: str, pipe_id: str, binary_id: str, run_id: str,
+        *, source_id: str | None = None, spec_id: str | None = None,
+        model_text: str | None = None,
     ) -> tuple[str, str]:
         pipe = repo_root / "workspace" / "pipelines" / safe / pipe_id
         b = pipe / "binary" / binary_id
         b.mkdir(parents=True)
-        (b / "binary_meta.json").write_text(
-            json.dumps({"verification_status": "pass"}), encoding="utf-8")
+        binary_meta: dict = {"verification_status": "pass"}
+        if source_id is not None:
+            binary_meta["source_source_id"] = source_id
+        (b / "binary_meta.json").write_text(json.dumps(binary_meta), encoding="utf-8")
+        if source_id is not None and spec_id is not None and model_text is not None:
+            src_dir = pipe / "source" / source_id / "src"
+            src_dir.mkdir(parents=True)
+            (src_dir / f"{spec_id}_model.f90").write_text(model_text, encoding="utf-8")
         run_dir = pipe / "runs" / run_id / safe
         run_dir.mkdir(parents=True)
         (run_dir / "aggregate_verdict.json").write_text(
@@ -15444,6 +15483,178 @@ class ResolveDependencyFactsTests(unittest.TestCase):
             self.assertEqual(
                 _resolve_dependency_facts(repo_root, "workspace/ir/nope/x"), [])
             self.assertEqual(_resolve_dependency_facts(repo_root, ""), [])
+
+    _SCALE_MODEL = (
+        "module dep_base_model\n"
+        "contains\n"
+        "  subroutine dep_base__scale(x, n, y)\n"
+        "    integer, intent(in) :: n\n"
+        "    real(8), intent(in) :: x(n)\n"
+        "    real(8), intent(out) :: y(n)\n"
+        "  end subroutine dep_base__scale\n"
+        "end module dep_base_model\n"
+    )
+
+    def test_published_operations_pin_argument_order_for_fortran_consumer(self) -> None:
+        from tools.orchestration_runtime import _resolve_dependency_facts
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            safe = "component__dep_base__0.1.0"
+            self._write_dep_pipeline(
+                repo_root, safe, "p_20260601_002", "bin_20260601_002", "run_20260601_002",
+                source_id="src_20260601_001", spec_id="dep_base",
+                model_text=self._SCALE_MODEL)
+            self._write_ir(
+                repo_root, "workspace/ir/component__dep_top__0.1.0/top_001",
+                [{"node_key": "component/dep_base@0.1.0", "kind": "component",
+                  "operations": ["dep_base__scale"]}],
+                impl_defaults={"toolchain": {"language": "fortran"}})
+            facts = _resolve_dependency_facts(
+                repo_root, "workspace/ir/component__dep_top__0.1.0/top_001")
+            self.assertEqual(len(facts), 1)
+            pub = facts[0]["published_operations"]
+            self.assertEqual(len(pub), 1)
+            self.assertEqual(pub[0]["operation"], "dep_base__scale")
+            self.assertEqual(pub[0]["argument_order"], ["x", "n", "y"])
+            self.assertEqual(pub[0]["interface"], "subroutine dep_base__scale(x, n, y)")
+
+    def test_non_fortran_consumer_gets_no_interfaces_but_keeps_verdict(self) -> None:
+        from tools.orchestration_runtime import _resolve_dependency_facts
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            safe = "component__dep_base__0.1.0"
+            self._write_dep_pipeline(
+                repo_root, safe, "p_20260601_002", "bin_20260601_002", "run_20260601_002",
+                source_id="src_20260601_001", spec_id="dep_base",
+                model_text=self._SCALE_MODEL)
+            self._write_ir(
+                repo_root, "workspace/ir/component__dep_top__0.1.0/top_001",
+                [{"node_key": "component/dep_base@0.1.0", "kind": "component",
+                  "operations": ["dep_base__scale"]}],
+                impl_defaults={"toolchain": {"language": "c"}})
+            facts = _resolve_dependency_facts(
+                repo_root, "workspace/ir/component__dep_top__0.1.0/top_001")
+            self.assertEqual(len(facts), 1)
+            self.assertNotIn("published_operations", facts[0])
+            self.assertTrue(facts[0]["aggregate_verdict_ref"])
+
+    def test_unresolvable_op_omits_published_but_keeps_fact(self) -> None:
+        from tools.orchestration_runtime import _resolve_dependency_facts
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            safe = "component__dep_base__0.1.0"
+            # No source_source_id / source file → interface unresolvable, fact still emitted.
+            self._write_dep_pipeline(
+                repo_root, safe, "p_20260601_002", "bin_20260601_002", "run_20260601_002")
+            self._write_ir(
+                repo_root, "workspace/ir/component__dep_top__0.1.0/top_001",
+                [{"node_key": "component/dep_base@0.1.0",
+                  "operations": ["dep_base__scale"]}])
+            facts = _resolve_dependency_facts(
+                repo_root, "workspace/ir/component__dep_top__0.1.0/top_001")
+            self.assertEqual(len(facts), 1)
+            self.assertNotIn("published_operations", facts[0])
+
+
+class CertifiedModelSourceTests(unittest.TestCase):
+    """_certified_model_source binds to the CERTIFIED binary's source_source_id (the exact
+    source Build stages), never raising — the single-sourced selection shared by the
+    Generate-time interface hint and Build staging."""
+
+    def test_resolves_certified_source_path(self) -> None:
+        from tools.orchestration_runtime import _certified_model_source
+        with tempfile.TemporaryDirectory() as tmp:
+            pipe = Path(tmp) / "pipe"
+            b = pipe / "binary" / "bin_20260601_002"
+            b.mkdir(parents=True)
+            (b / "binary_meta.json").write_text(
+                json.dumps({"source_source_id": "src_20260601_001"}), encoding="utf-8")
+            src_dir = pipe / "source" / "src_20260601_001" / "src"
+            src_dir.mkdir(parents=True)
+            model = src_dir / "dep_base_model.f90"
+            model.write_text("subroutine dep_base__scale(x, n, y)\nend subroutine\n",
+                             encoding="utf-8")
+            self.assertEqual(_certified_model_source(pipe, "dep_base"), model)
+
+    def test_returns_none_on_missing_artifacts(self) -> None:
+        from tools.orchestration_runtime import _certified_model_source
+        with tempfile.TemporaryDirectory() as tmp:
+            pipe = Path(tmp) / "pipe"
+            pipe.mkdir(parents=True)
+            self.assertIsNone(_certified_model_source(pipe, "dep_base"))  # no binary
+            b = pipe / "binary" / "bin_x"
+            b.mkdir(parents=True)
+            (b / "binary_meta.json").write_text(json.dumps({}), encoding="utf-8")
+            self.assertIsNone(_certified_model_source(pipe, "dep_base"))  # no source_source_id
+            (b / "binary_meta.json").write_text(
+                json.dumps({"source_source_id": "src_1"}), encoding="utf-8")
+            self.assertIsNone(_certified_model_source(pipe, "dep_base"))  # source file absent
+
+
+class ExtractSubroutineInterfaceTests(unittest.TestCase):
+    """_extract_subroutine_interface pins the dependency call-site argument order; robust to
+    continuations / comments / prefixes / multiple subroutines; never raises."""
+
+    def test_simple_signature(self) -> None:
+        from tools.orchestration_runtime import _extract_subroutine_interface
+        src = "subroutine foo__bar(a, b, c)\nend subroutine\n"
+        self.assertEqual(
+            _extract_subroutine_interface(src, "foo__bar"),
+            {"interface": "subroutine foo__bar(a, b, c)",
+             "argument_order": ["a", "b", "c"]})
+
+    def test_continuation_and_comments(self) -> None:
+        from tools.orchestration_runtime import _extract_subroutine_interface
+        src = (
+            "  subroutine foo__bar(a, &  ! lead arg\n"
+            "       & b, c,  &\n"
+            "       d)\n"
+            "  end subroutine\n"
+        )
+        self.assertEqual(
+            _extract_subroutine_interface(src, "foo__bar")["argument_order"],
+            ["a", "b", "c", "d"])
+
+    def test_full_line_comment_between_continuations(self) -> None:
+        # Regression: a comment-only (or blank) line between continuation lines must not
+        # flush the partial header — the wrapped signature must still parse.
+        from tools.orchestration_runtime import _extract_subroutine_interface
+        src = (
+            "  subroutine foo__bar(a, &\n"
+            "    ! a full-line comment between continuations\n"
+            "\n"
+            "       & b, c)\n"
+            "  end subroutine\n"
+        )
+        self.assertEqual(
+            _extract_subroutine_interface(src, "foo__bar"),
+            {"interface": "subroutine foo__bar(a, b, c)",
+             "argument_order": ["a", "b", "c"]})
+
+    def test_case_insensitive_and_prefixes(self) -> None:
+        from tools.orchestration_runtime import _extract_subroutine_interface
+        src = "PURE elemental subroutine Foo__Bar(x)\nend subroutine\n"
+        out = _extract_subroutine_interface(src, "foo__bar")
+        self.assertEqual(out["argument_order"], ["x"])
+        self.assertIn("Foo__Bar(x)", out["interface"])
+
+    def test_selects_correct_subroutine_among_several(self) -> None:
+        from tools.orchestration_runtime import _extract_subroutine_interface
+        src = (
+            "subroutine m__guard(n, ok)\nend subroutine\n"
+            "subroutine m__scale(x, n, y)\nend subroutine\n"
+        )
+        self.assertEqual(
+            _extract_subroutine_interface(src, "m__scale")["argument_order"],
+            ["x", "n", "y"])
+
+    def test_op_not_found_and_function_return_none(self) -> None:
+        from tools.orchestration_runtime import _extract_subroutine_interface
+        self.assertIsNone(
+            _extract_subroutine_interface("subroutine a(x)\nend subroutine\n", "b"))
+        self.assertIsNone(
+            _extract_subroutine_interface("function f(x)\nend function\n", "f"))
+        self.assertIsNone(_extract_subroutine_interface("", "x"))
 
 
 class AccessLogWritableBindTests(unittest.TestCase):
@@ -23813,7 +24024,11 @@ class ChildContextDocSizeTests(unittest.TestCase):
         # the per-case snapshot filename contract (runner writes one
         # raw/state_snapshots/<case_id>.json per case) — closes the recurring
         # validate.execute deliverable-gate blocker (deterministic_followups.md D4).
-        "docs/workflow/phases/phase_02_generate.md": 22700,
+        # phase_02 further bumped (22700->23700) for the D5 fix: the dependency
+        # call-site argument-order contract (§47 authoring + §G7 verify) — Generate
+        # must call <dep>__<op> in the conductor-resolved published-operation order
+        # from <dependency_facts> instead of guessing (deterministic_followups.md D5).
+        "docs/workflow/phases/phase_02_generate.md": 23700,
         "docs/workflow/phases/phase_03_build.md": 8200,
         "docs/workflow/phases/phase_04_validate.md": 20200,
     }

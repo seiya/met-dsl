@@ -433,6 +433,47 @@ end-to-end (orch `orch_20260626T020724Z_0d7b9e28`): `demo_dep_top` reused the re
 (skipped) and passed all phases on attempt 1 in dev mode. The D4 snapshot-naming blocker is fixed and
 confirmed. No known blockers remain for the demo dependency chain.
 
+## D5 — dependency call-site argument order surfaced to the consumer (IMPLEMENTED 2026-06-26)
+
+**Symptom.** With D1–D4 closed, the demo chain's `--with-deps` E2E was still not
+deterministic across runs: a consumer (`demo_dep_top`) emits `call <dep>__<op>(...)` to a
+dependency subroutine (`demo_dep_base__scale`) and **guessed the Fortran argument order**.
+A wrong guess (`(n,x,y)` for the certified `(x,n,y)` interface) compiles the consumer against
+a type/rank mismatch and **fails Build**. This is a variance-prone C-core inference: IR
+`dependency.direct_deps[].operations` carries only operation *names*, and at Generate time the
+dependency source is not staged into the consumer's `$(OBJDIR)` (only at Build, Model B / D1),
+so the agent had nothing authoritative to read.
+
+**Fix (host-side interface surfacing — no IR schema change, no guessing).** Under
+`--with-deps` the closure runs deepest-first, so the dependency's **certified** source already
+exists when the consumer generates. Surface its real signature host-side and inject it into the
+existing `<dependency_facts>` launch-prompt block:
+- New `orchestration_runtime._certified_model_source(pipe_dir, spec_id) -> Path|None`:
+  the single-sourced selection (latest `binary/*/binary_meta.json` → `source_source_id` →
+  `source/<id>/src/<spec_id>_model.f90`) that **both** the Generate-time hint
+  (`_resolve_dependency_facts`) and Build staging (`_stage_dependency_sources`, refactored onto
+  it) use — so the interface SHOWN equals the source Build COMPILES (the two had already drifted
+  once). Pure/never-raises; Build re-raises its fail-closed precondition on `None`, the hint
+  skips that dep.
+- New `_extract_subroutine_interface(source_text, op_name)`: robust to `&` continuations
+  (the generate SKILL forces wrapping for fortitude S001), `!` comments, case, prefixes
+  (`pure`/`elemental`/`recursive`/`module`), and multiple subroutines (selects by name). Returns
+  `{interface, argument_order}`, the load-bearing datum being the positional order.
+- `_resolve_dependency_facts` (gated on the **consumer** being Fortran; only **direct** deps —
+  the consumer call-sites only those) adds `published_operations:[{operation, interface,
+  argument_order}]`; `_build_dependency_facts` renders a role-aware "Published dependency
+  operations" sub-block instructing Generate to call with EXACTLY that order.
+- Docs/SKILLs: `phase_02_generate.md` §47 (authoring) + §G7 (verify), generate/verify SKILLs.
+
+**Not a new gate.** A deterministic argument-order check is infeasible (Fortran is positional;
+the consumer uses its own local names), so this is *variance reduction* — give Generate the
+correct order so it gets it right the first try. Build's compiler remains the deterministic
+backstop (a mismatch fails Build → routed back to Generate); the verify SKILL adds an LLM check.
+Cross-ref: D1 (Model B staging), L6 (spec_id basename keying). Tests:
+`ExtractSubroutineInterfaceTests`, `CertifiedModelSourceTests`, extended
+`ResolveDependencyFactsTests` / `DependencyFactsRenderTests`. **Residual:** billed `--with-deps`
+E2E re-run to confirm the consumer emits the correct order on attempt 1 (operator-gated).
+
 ## L (latent / low severity — fix opportunistically)
 - **L1 — DONE (2026-06-25).** Generated Makefile emitted a harmless `make` warning
   `target '.' given more than once` for the `$(OBJDIR) $(BINDIR):` rule when `OBJDIR==BINDIR=="."`.
