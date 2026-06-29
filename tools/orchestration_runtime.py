@@ -5449,8 +5449,9 @@ def _mandatory_file_tool_pins_for_launch(
     # Only the source-generating launch needs the Makefile. The Generate.verify
     # substep inspects src/ and writes source_meta.json — granting it Makefile
     # (build-control) write authority would let the verifier mutate the very
-    # artifact it is supposed to judge, so it must be excluded.
-    if step_token != "generate" or substep_token == "verify" or not pipeline_ref:
+    # artifact it is supposed to judge, so it must be excluded. The deterministic
+    # Generate.lint substep (conductor-run, no leaf) writes no Makefile either.
+    if step_token != "generate" or substep_token in ("verify", "lint") or not pipeline_ref:
         return []
     # When the conductor authors src/Makefile host-side (_write_makefile: make AND fortran,
     # leaf OR dependency) it is NOT a leaf deliverable and must not be pinned (the file already
@@ -8936,6 +8937,10 @@ ALLOWED_VALIDATE_PIPELINE_STAGES: dict[tuple[str, str], frozenset[str]] = {
     ("compile", "generate"): frozenset(),
     ("compile", "verify"): frozenset({"compile"}),
     ("generate", "generate"): frozenset(),
+    # generate.lint is the deterministic in-process lint substep (no leaf, no
+    # validate_pipeline_semantics invocation); the empty set keeps the table total so a
+    # lookup for it never KeyErrors.
+    ("generate", "lint"): frozenset(),
     ("generate", "verify"): frozenset({"post_generate"}),
     ("build", ""): frozenset({"post_build"}),
     ("validate", "execute"): frozenset({"post_execute"}),
@@ -10349,17 +10354,20 @@ def _validate_launch_request_payload(request_payload: dict[str, Any]) -> None:
     if not isinstance(step, str) or not step.strip():
         raise ValueError("launch request must include non-empty step")
     # Defense-in-depth: `deterministic` (in-process, skill-/constraint-line-exempt) is
-    # only legitimate for the non-LLM steps Build and Validate.execute. Reject the flag
-    # on any other step so a forged/buggy payload cannot claim the reduced launch-prompt
-    # guards while being a leaf step. (The flag is host-set by the conductor today; this
-    # makes the invariant explicit at the validation chokepoint.)
+    # only legitimate for the non-LLM substeps Build, Validate.execute and Generate.lint.
+    # Reject the flag on any other step so a forged/buggy payload cannot claim the reduced
+    # launch-prompt guards while being a leaf step. (The flag is host-set by the conductor
+    # today; this makes the invariant explicit at the validation chokepoint.)
     if request_payload.get("deterministic"):
         step_l = step.strip().lower()
         substep_l = str(substep).strip().lower() if isinstance(substep, str) else ""
-        if not (step_l == "build" or (step_l == "validate" and substep_l == "execute")):
+        if not (step_l == "build"
+                or (step_l == "validate" and substep_l == "execute")
+                or (step_l == "generate" and substep_l == "lint")):
             raise ValueError(
-                "launch request: deterministic=True is only valid for step=build or "
-                f"step=validate substep=execute (got step={step!r} substep={substep!r})"
+                "launch request: deterministic=True is only valid for step=build, "
+                "step=validate substep=execute, or step=generate substep=lint "
+                f"(got step={step!r} substep={substep!r})"
             )
     # agent_model identifies the LLM that produced the child's artifacts. At launch
     # only the unpinned spec-side ALIAS is known (e.g. "opus"); the exact version is
@@ -10874,33 +10882,6 @@ _RETRY_DECISION_REQUIRED_KEYS: tuple[str, ...] = (
 )
 
 
-def _validate_lint_command_ref(meta_data: dict[str, Any], *, meta_filename: str, meta_ref: str) -> None:
-    lint_command_ref = meta_data.get("lint_command_ref")
-    if meta_filename != "source_meta.json":
-        return
-    status = str(meta_data.get("verification_status", "")).strip().lower()
-    if status != "pass":
-        return
-    if not isinstance(lint_command_ref, dict):
-        raise ValueError(
-            f"{meta_filename} missing lint_command_ref when verification_status=pass: {meta_ref}"
-        )
-    run_linter = lint_command_ref.get("run_linter")
-    if not isinstance(run_linter, list) or not run_linter:
-        raise ValueError(f"{meta_filename} lint_command_ref.run_linter must be non-empty list: {meta_ref}")
-    for idx, item in enumerate(run_linter):
-        if not isinstance(item, dict):
-            raise ValueError(
-                f"{meta_filename} lint_command_ref.run_linter[{idx}] must be object: {meta_ref}"
-            )
-        for key in ("command_id", "command_log_ref", "preset"):
-            value = item.get(key)
-            if not isinstance(value, str) or not value.strip():
-                raise ValueError(
-                    f"{meta_filename} lint_command_ref.run_linter[{idx}].{key} must be non-empty string: {meta_ref}"
-                )
-
-
 def _validate_step_meta_payload(meta_data: dict[str, Any], *, step_token: str, meta_ref: str) -> None:
     meta_filename = _STEP_META_FILENAME[step_token]
     missing_keys = missing_required_meta_keys(meta_data, step_token=step_token)
@@ -10928,7 +10909,6 @@ def _validate_step_meta_payload(meta_data: dict[str, Any], *, step_token: str, m
             raise ValueError(
                 f"{meta_filename} requires non-empty constraint_reason when context_isolated=false: {meta_ref}"
             )
-    _validate_lint_command_ref(meta_data, meta_filename=meta_filename, meta_ref=meta_ref)
 
 
 def _effective_pass_substep_run_ids(
@@ -14760,7 +14740,17 @@ def reopen_phase(
             f"reopen-phase: trigger node_key {trig_node!r} does not match --node-key {node_key_norm!r}"
         )
     trig_step = str(trigger.get("step") or "").strip().lower()
-    if trig_step not in STEP_KEYS_FOR_NODE_STATE or STEP_KEYS_FOR_NODE_STATE.index(trig_step) <= from_idx:
+    trig_substep = str(trigger.get("substep") or "").strip().lower()
+    # Same-phase carve-out: a `generate.lint` finding reopens generate itself
+    # (from_phase == trigger phase) so the SAME generate.generate leaf warm-resumes to fix
+    # its source. This is the ONLY permitted same-phase reopen. It stays anti-abuse-safe:
+    # the trigger must still be a terminal NON-PASS generate.lint substep (checked below),
+    # so a passing pipeline can never be erased, and generate.generate / generate.verify can
+    # never reopen their own phase. Every other trigger must be strictly downstream.
+    same_phase_lint = trig_step == from_token == "generate" and trig_substep == "lint"
+    if trig_step not in STEP_KEYS_FOR_NODE_STATE or (
+        STEP_KEYS_FOR_NODE_STATE.index(trig_step) <= from_idx and not same_phase_lint
+    ):
         raise RuntimeError(
             f"reopen-phase: trigger phase {trig_step!r} must be strictly downstream of "
             f"--from-phase {from_token!r}"

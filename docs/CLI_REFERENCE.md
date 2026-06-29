@@ -99,7 +99,7 @@ In Claude Code, call it **before launching the `Agent` tool** (because the child
 | `agent_role` | yes | `step` or `substep` |
 | `node_key` | yes | `<spec_kind>/<spec_id>@<spec_version>` |
 | `step` | yes | `compile` / `generate` / `build` / `validate` (core 5-phase). Tune / Promote are optional flows with a separate entrypoint |
-| `substep` | yes for a substep agent | Compile / Generate: `generate` / `verify`. Validate: `execute` / `judge` |
+| `substep` | yes for a substep agent | Compile: `generate` / `verify`. Generate: `generate` / `lint` / `verify` (`lint` is conductor-run deterministic). Validate: `execute` / `judge` |
 | `orchestration_id` | yes | |
 | `agent_run_id` | yes | matches child_agent_run_id |
 | `parent_agent_run_id` | yes | |

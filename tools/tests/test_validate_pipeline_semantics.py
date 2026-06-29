@@ -451,15 +451,24 @@ shallow_water2d_runner.o: shallow_water2d_runner.f90 shallow_water2d_model.mod
             "last_fail_reason": "",
             "debug_mode": False,
             "context_isolated": True,
-            "lint_command_ref": {
-                "run_linter": [
-                    {
-                        "command_id": lint_command_id,
-                        "command_log_ref": rel_lint_log,
-                        "preset": "fortitude",
-                    }
-                ]
-            },
+        },
+    )
+    # Conductor-authored, leaf-non-writable lint evidence (pipeline-root). post_generate
+    # certifies the conductor-run lint against this, not source_meta.lint_command_ref.
+    _write_json(
+        pipeline_dir / "lint_evidence" / "src_20260415_001.json",
+        {
+            "checked_at": "2026-04-15T00:00:00Z",
+            "source_id": "src_20260415_001",
+            "preset": "fortitude",
+            "ok": True,
+            "run_linter": [
+                {
+                    "preset": "fortitude",
+                    "command_id": lint_command_id,
+                    "command_log_ref": rel_lint_log,
+                }
+            ],
         },
     )
 
@@ -7028,19 +7037,17 @@ shallow_water2d_runner.o: shallow_water2d_runner.f90 shallow_water2d_model.mod
                 + "\n",
                 encoding="utf-8",
             )
-            # Rewrite source_meta.json's lint_command_ref to point at the forged log.
-            meta_path = (
-                pipeline_dir / "source" / "src_20260415_001" / "source_meta.json"
-            )
-            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            # Rewrite the conductor lint evidence to point at the forged log.
+            evidence_path = pipeline_dir / "lint_evidence" / "src_20260415_001.json"
+            evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
             forged_ref = (
                 "workspace/pipelines/problem__shallow_water2d__0.3.0/"
                 "shallow-water2d_20260415_001/source/src_20260415_001/src/"
                 "notes/command_log.jsonl"
             )
-            meta["lint_command_ref"]["run_linter"][0]["command_log_ref"] = forged_ref
-            meta_path.write_text(
-                json.dumps(meta, ensure_ascii=False) + "\n", encoding="utf-8"
+            evidence["run_linter"][0]["command_log_ref"] = forged_ref
+            evidence_path.write_text(
+                json.dumps(evidence, ensure_ascii=False) + "\n", encoding="utf-8"
             )
             violations = validate_post_generate_stage(
                 repo_root,
@@ -7601,134 +7608,78 @@ shallow_water2d_runner.o: shallow_water2d_runner.f90 shallow_water2d_model.mod
             _validate_source_meta_json_files(pipeline_dir, violations)
             self.assertEqual(violations, [])
 
-    def test_validate_source_meta_rejects_pass_without_lint_command_ref(self) -> None:
+    def _lint_evidence_fixture(self, repo_root: Path, evidence: dict | None) -> Path:
+        """Build <repo>/workspace/pipelines/p/pid/source/src_x/source_meta.json and
+        (optionally) the conductor lint evidence at the pipeline root. Returns meta_path."""
+        pipe = repo_root / "workspace" / "pipelines" / "p" / "pid"
+        gen_dir = pipe / "source" / "src_x"
+        gen_dir.mkdir(parents=True)
+        meta_path = gen_dir / "source_meta.json"
+        if evidence is not None:
+            _write_json(pipe / "lint_evidence" / "src_x.json", evidence)
+        return meta_path
+
+    def test_validate_generate_lint_rejects_pass_without_evidence(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            pipeline_dir = Path(tmp) / "pipeline"
-            gen_dir = pipeline_dir / "source" / "gen_pass_001"
-            gen_dir.mkdir(parents=True)
-            _write_json(
-                gen_dir / "source_meta.json",
-                {
-                    "attempt_count": 1,
-                    "verification_status": "pass",
-                    "last_fail_reason": None,
-                    "debug_mode": False,
-                    "context_isolated": True,
-                },
-            )
+            repo_root = Path(tmp)
+            meta_path = self._lint_evidence_fixture(repo_root, None)
             violations: list[str] = []
-            _validate_source_meta_json_files(pipeline_dir, violations)
+            _validate_generate_lint_command_logs(
+                repo_root, meta_path, {"verification_status": "pass"}, "fortran", violations)
             self.assertTrue(
-                any("missing lint_command_ref" in v for v in violations),
-                violations,
-            )
+                any("missing conductor lint evidence" in v for v in violations), violations)
 
-    def test_validate_source_meta_rejects_empty_run_linter_when_pass(self) -> None:
+    def test_validate_generate_lint_rejects_evidence_not_ok(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            pipeline_dir = Path(tmp) / "pipeline"
-            gen_dir = pipeline_dir / "source" / "gen_pass_002"
-            gen_dir.mkdir(parents=True)
-            _write_json(
-                gen_dir / "source_meta.json",
-                {
-                    "attempt_count": 1,
-                    "verification_status": "pass",
-                    "last_fail_reason": None,
-                    "debug_mode": False,
-                    "context_isolated": True,
-                    "lint_command_ref": {"run_linter": []},
-                },
-            )
+            repo_root = Path(tmp)
+            meta_path = self._lint_evidence_fixture(repo_root, {
+                "checked_at": "t", "source_id": "src_x", "preset": "fortitude",
+                "ok": False,
+                "run_linter": [{"preset": "fortitude", "command_id": "a",
+                                "command_log_ref": "workspace/x/command_log.jsonl"}],
+            })
             violations: list[str] = []
-            _validate_source_meta_json_files(pipeline_dir, violations)
+            _validate_generate_lint_command_logs(
+                repo_root, meta_path, {"verification_status": "pass"}, "fortran", violations)
             self.assertTrue(
-                any("lint_command_ref.run_linter must be non-empty" in v for v in violations),
-                violations,
-            )
+                any("lint did not succeed" in v for v in violations), violations)
 
-    def test_validate_source_meta_ignores_lint_shape_when_not_pass(self) -> None:
+    def test_validate_generate_lint_rejects_preset_mismatch(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            pipeline_dir = Path(tmp) / "pipeline"
-            gen_dir = pipeline_dir / "source" / "gen_fail_002"
-            gen_dir.mkdir(parents=True)
-            _write_json(
-                gen_dir / "source_meta.json",
-                {
-                    "attempt_count": 1,
-                    "verification_status": "fail",
-                    "last_fail_reason": "compile failed",
-                    "debug_mode": False,
-                    "context_isolated": True,
-                    "lint_command_ref": "invalid-shape",
-                },
-            )
+            repo_root = Path(tmp)
+            meta_path = self._lint_evidence_fixture(repo_root, {
+                "checked_at": "t", "source_id": "src_x", "preset": "cppcheck",
+                "ok": True,
+                "run_linter": [{"preset": "cppcheck", "command_id": "a",
+                                "command_log_ref": "workspace/x/command_log.jsonl"}],
+            })
             violations: list[str] = []
-            _validate_source_meta_json_files(pipeline_dir, violations)
-            self.assertEqual(violations, [])
-
-    def test_validate_generate_lint_rejects_pass_without_lint_command_ref(self) -> None:
-        violations: list[str] = []
-        meta_path = Path("/tmp/source_meta.json")
-        _validate_generate_lint_command_logs(
-            Path("/repo"),
-            meta_path,
-            {"verification_status": "pass"},
-            "fortran",
-            violations,
-        )
-        self.assertTrue(
-            any("missing lint_command_ref when verification_status=pass" in v for v in violations),
-            violations,
-        )
-
-    def test_validate_generate_lint_rejects_non_dict_lint_command_ref_when_pass(self) -> None:
-        violations: list[str] = []
-        meta_path = Path("/tmp/source_meta.json")
-        _validate_generate_lint_command_logs(
-            Path("/repo"),
-            meta_path,
-            {"verification_status": "pass", "lint_command_ref": []},
-            "fortran",
-            violations,
-        )
-        self.assertTrue(
-            any(
-                "lint_command_ref must be json object when verification_status=pass" in v
-                for v in violations
-            ),
-            violations,
-        )
+            _validate_generate_lint_command_logs(
+                repo_root, meta_path, {"verification_status": "pass"}, "fortran", violations)
+            self.assertTrue(
+                any("evidence preset must be 'fortitude'" in v for v in violations), violations)
 
     def test_validate_generate_lint_mixed_requires_exactly_two_entries(self) -> None:
-        violations: list[str] = []
-        meta_path = Path("/tmp/source_meta.json")
-        data = {
-            "verification_status": "pass",
-            "lint_command_ref": {
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            meta_path = self._lint_evidence_fixture(repo_root, {
+                "checked_at": "t", "source_id": "src_x", "preset": "mixed", "ok": True,
                 "run_linter": [
-                    {
-                        "command_id": "a",
-                        "command_log_ref": "workspace/pipelines/x/y/z/command_log.jsonl",
-                        "preset": "fortitude",
-                    },
-                    {
-                        "command_id": "b",
-                        "command_log_ref": "workspace/pipelines/x/y/z/command_log.jsonl",
-                        "preset": "fortitude",
-                    },
-                    {
-                        "command_id": "c",
-                        "command_log_ref": "workspace/pipelines/x/y/z/command_log.jsonl",
-                        "preset": "cppcheck",
-                    },
-                ]
-            },
-        }
-        _validate_generate_lint_command_logs(Path("/repo"), meta_path, data, "mixed", violations)
-        self.assertTrue(
-            any("requires exactly two run_linter entries" in v for v in violations),
-            violations,
-        )
+                    {"preset": "fortitude", "command_id": "a",
+                     "command_log_ref": "workspace/x/command_log.jsonl"},
+                    {"preset": "fortitude", "command_id": "b",
+                     "command_log_ref": "workspace/x/command_log.jsonl"},
+                    {"preset": "cppcheck", "command_id": "c",
+                     "command_log_ref": "workspace/x/command_log.jsonl"},
+                ],
+            })
+            violations: list[str] = []
+            _validate_generate_lint_command_logs(
+                repo_root, meta_path, {"verification_status": "pass"}, "mixed", violations)
+            self.assertTrue(
+                any("requires exactly two run_linter entries" in v for v in violations),
+                violations,
+            )
 
     def test_validate_post_build_stage_passes(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

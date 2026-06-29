@@ -2906,9 +2906,9 @@ def _validate_source_meta_json_files(
                 violations.append(f"{meta_path}:debug_mode must be boolean")
             elif key == "context_isolated" and not isinstance(val, bool):
                 violations.append(f"{meta_path}:context_isolated must be boolean")
-        status_token = str(data.get("verification_status", "")).strip().lower()
-        if status_token == "pass":
-            _validate_source_meta_lint_shape(meta_path, data, violations)
+        # NOTE: lint is no longer recorded in source_meta.lint_command_ref (the leaf does
+        # not run run_linter); the conductor-run lint is certified by post_generate against
+        # the host-authored lint evidence (_validate_generate_lint_command_logs).
 
 
 def _validate_ir_meta_json(ir_dir: Path, violations: list[str]) -> None:
@@ -2959,7 +2959,7 @@ def _canonical_mcp_log_refs_for_lint(meta_path: Path, repo_root: Path) -> set[st
 
     Only one canonical placement: sibling under `<gen_dir>/src/`. A child agent
     that writes a forged command_log.jsonl elsewhere and points the
-    `lint_command_ref.run_linter[].command_log_ref` at it should be rejected.
+    `lint evidence run_linter[].command_log_ref` at it should be rejected.
     """
     parent = meta_path.parent
     canonical = parent / "src" / _MCP_AUDIT_LOG_BASENAME
@@ -3073,8 +3073,8 @@ def _validate_trial_meta(repo_root: Path, execution: NodeExecution, violations: 
     # The validator only checks command_id presence (no tool_name/ok inspection),
     # so the forge surface here is limited to "a record exists with this id" —
     # not meaningful evidence of successful MCP tool execution. Canonical
-    # placement is enforced separately for lint_command_ref where the validator
-    # inspects tool_name/ok and the forge becomes high-impact.
+    # placement is enforced separately for the conductor lint evidence where the
+    # validator inspects tool_name/ok and the forge becomes high-impact.
     for entry in _iter_command_ref_entries(source_command_ref):
         command_id = entry.get("command_id")
         log_ref = entry.get("command_log_ref") or entry.get("command_log_path")
@@ -4407,38 +4407,6 @@ def _infer_run_linter_preset_from_command(command: list[Any]) -> str | None:
     return None
 
 
-def _validate_source_meta_lint_shape(
-    meta_path: Path, data: dict[str, Any], violations: list[str]
-) -> None:
-    ref = data.get("lint_command_ref")
-    if ref is None:
-        violations.append(f"{meta_path}: missing lint_command_ref")
-        return
-    if not isinstance(ref, dict):
-        violations.append(f"{meta_path}: lint_command_ref must be json object")
-        return
-    run_entries = ref.get("run_linter")
-    if run_entries is None:
-        violations.append(f"{meta_path}: lint_command_ref.run_linter must be present")
-        return
-    if not isinstance(run_entries, list):
-        violations.append(f"{meta_path}: lint_command_ref.run_linter must be array")
-        return
-    if not run_entries:
-        violations.append(f"{meta_path}: lint_command_ref.run_linter must be non-empty")
-        return
-    for idx, item in enumerate(run_entries):
-        if not isinstance(item, dict):
-            violations.append(f"{meta_path}: lint_command_ref.run_linter[{idx}] must be object")
-            continue
-        for key in ("command_id", "command_log_ref", "preset"):
-            value = item.get(key)
-            if not isinstance(value, str) or not value.strip():
-                violations.append(
-                    f"{meta_path}: lint_command_ref.run_linter[{idx}].{key} must be non-empty string"
-                )
-
-
 def _validate_generate_lint_command_logs(
     repo_root: Path,
     meta_path: Path,
@@ -4446,7 +4414,14 @@ def _validate_generate_lint_command_logs(
     impl_language: str | None,
     violations: list[str],
 ) -> None:
-    """Validate MCP run_linter command logs for Generate static lint."""
+    """Certify the conductor-run static lint for Generate against its host-authored,
+    leaf-non-writable evidence (`<pipeline_root>/lint_evidence/<source_id>.json`).
+
+    Static lint is no longer run by the leaf (it is the deterministic `generate.lint`
+    substep run in-process by the conductor — Conductor._lint_inproc). The evidence
+    certificate cannot be forged by the leaf (the pipeline root is read-only inside the
+    sandbox), so this validates against it rather than the former leaf-written
+    `source_meta.lint_command_ref` (which is now ignored)."""
     status = data.get("verification_status")
     if not isinstance(status, str) or status.strip().lower() != "pass":
         return
@@ -4464,33 +4439,43 @@ def _validate_generate_lint_command_logs(
         )
         return
 
-    ref = data.get("lint_command_ref")
-    if ref is None:
-        violations.append(
-            f"{meta_path}: missing lint_command_ref when verification_status=pass"
-        )
-        return
-    if not isinstance(ref, dict):
-        violations.append(
-            f"{meta_path}: lint_command_ref must be json object when verification_status=pass"
-        )
-        return
-    run_entries = ref.get("run_linter")
-    if run_entries is None:
-        violations.append(
-            f"{meta_path}: lint_command_ref.run_linter must be present when verification_status=pass"
-        )
-        return
-    if not isinstance(run_entries, list):
-        violations.append(
-            f"{meta_path}: lint_command_ref.run_linter must be array when verification_status=pass"
-        )
-        return
+    # meta_path = <pipeline_root>/source/<source_id>/source_meta.json
+    source_id = meta_path.parent.name
+    pipeline_root = meta_path.parents[2]
+    from tools.hooks.lint_evidence import read_lint_evidence
 
-    if not run_entries:
+    try:
+        evidence = read_lint_evidence(pipeline_root=pipeline_root, source_id=source_id)
+    except ValueError as exc:
         violations.append(
-            f"{meta_path}: lint_command_ref.run_linter must be non-empty when "
-            "verification_status=pass and static lint applies"
+            f"{meta_path}: malformed conductor lint evidence "
+            f"({pipeline_root.name}/lint_evidence/{source_id}.json): {exc}"
+        )
+        return
+    if evidence is None:
+        violations.append(
+            f"{meta_path}: missing conductor lint evidence "
+            f"(expected {pipeline_root.name}/lint_evidence/{source_id}.json) when "
+            "verification_status=pass; lint is run by the conductor (generate.lint)"
+        )
+        return
+    if evidence.get("ok") is not True:
+        violations.append(
+            f"{meta_path}: conductor lint evidence reports lint did not succeed "
+            "(ok must be true)"
+        )
+        return
+    ev_preset = str(evidence.get("preset") or "").strip().lower()
+    if ev_preset != expected:
+        violations.append(
+            f"{meta_path}: conductor lint evidence preset must be {expected!r} for "
+            f"toolchain.language={impl_language} (got {ev_preset!r})"
+        )
+        return
+    run_entries = evidence.get("run_linter")
+    if not isinstance(run_entries, list) or not run_entries:
+        violations.append(
+            f"{meta_path}: conductor lint evidence run_linter must be a non-empty array"
         )
         return
 
@@ -4504,7 +4489,7 @@ def _validate_generate_lint_command_logs(
         for entry in run_entries:
             if not isinstance(entry, dict):
                 violations.append(
-                    f"{meta_path}: lint_command_ref.run_linter entries must be objects"
+                    f"{meta_path}: lint evidence run_linter entries must be objects"
                 )
                 continue
             p = entry.get("preset")
@@ -4518,14 +4503,14 @@ def _validate_generate_lint_command_logs(
     else:
         if len(run_entries) != 1:
             violations.append(
-                f"{meta_path}: lint_command_ref.run_linter must have exactly one entry "
+                f"{meta_path}: lint evidence run_linter must have exactly one entry "
                 f"for toolchain.language={impl_language}"
             )
         else:
             entry = run_entries[0]
             if not isinstance(entry, dict):
                 violations.append(
-                    f"{meta_path}: lint_command_ref.run_linter[0] must be object"
+                    f"{meta_path}: lint evidence run_linter[0] must be object"
                 )
             else:
                 p = entry.get("preset")
@@ -4538,7 +4523,7 @@ def _validate_generate_lint_command_logs(
     for idx, entry in enumerate(run_entries):
         if not isinstance(entry, dict):
             violations.append(
-                f"{meta_path}: lint_command_ref.run_linter[{idx}] must be object"
+                f"{meta_path}: lint evidence run_linter[{idx}] must be object"
             )
             continue
         command_id = entry.get("command_id")
@@ -4546,29 +4531,29 @@ def _validate_generate_lint_command_logs(
         preset_decl = entry.get("preset")
         if not isinstance(command_id, str) or not command_id.strip():
             violations.append(
-                f"{meta_path}: lint_command_ref.run_linter[{idx}].command_id invalid"
+                f"{meta_path}: lint evidence run_linter[{idx}].command_id invalid"
             )
             continue
         if not isinstance(log_ref, str) or not log_ref.strip():
             violations.append(
-                f"{meta_path}: lint_command_ref.run_linter[{idx}].command_log_ref invalid"
+                f"{meta_path}: lint evidence run_linter[{idx}].command_log_ref invalid"
             )
             continue
         if not isinstance(preset_decl, str) or not preset_decl.strip():
             violations.append(
-                f"{meta_path}: lint_command_ref.run_linter[{idx}].preset invalid"
+                f"{meta_path}: lint evidence run_linter[{idx}].preset invalid"
             )
             continue
         preset_decl_l = preset_decl.strip().lower()
         if preset_decl_l not in _LINT_ALLOWED_PRESETS:
             violations.append(
-                f"{meta_path}: lint_command_ref.run_linter[{idx}].preset must be one of "
+                f"{meta_path}: lint evidence run_linter[{idx}].preset must be one of "
                 f"{sorted(_LINT_ALLOWED_PRESETS)}"
             )
             continue
         if preset_decl_l == "mixed":
             violations.append(
-                f"{meta_path}: lint_command_ref.run_linter[{idx}].preset must not be "
+                f"{meta_path}: lint evidence run_linter[{idx}].preset must not be "
                 "'mixed'; record separate fortitude and cppcheck entries"
             )
             continue
@@ -4577,7 +4562,7 @@ def _validate_generate_lint_command_logs(
         log_ref_norm = log_ref.strip().rstrip("/")
         if canonical_refs_lint and log_ref_norm not in canonical_refs_lint:
             violations.append(
-                f"{meta_path}: lint_command_ref.run_linter[{idx}].command_log_ref "
+                f"{meta_path}: lint evidence run_linter[{idx}].command_log_ref "
                 f"must be the canonical MCP audit log placement "
                 f"(expected one of {sorted(canonical_refs_lint)!r}, got {log_ref_norm!r}). "
                 "Non-canonical placements are rejected to prevent forged tool-execution "
@@ -4588,32 +4573,32 @@ def _validate_generate_lint_command_logs(
         matched = _find_command_log_record(repo_root, command_id.strip(), log_ref.strip())
         if matched is None:
             violations.append(
-                f"{meta_path}: lint_command_ref.run_linter[{idx}]: command log not found "
+                f"{meta_path}: lint evidence run_linter[{idx}]: command log not found "
                 f"for command_id={command_id!r}"
             )
             continue
         if matched.get("tool_name") != "run_linter":
             violations.append(
-                f"{meta_path}: lint_command_ref.run_linter[{idx}]: command_id={command_id!r} "
+                f"{meta_path}: lint evidence run_linter[{idx}]: command_id={command_id!r} "
                 f"tool_name must be run_linter"
             )
             continue
         if matched.get("ok") is not True:
             violations.append(
-                f"{meta_path}: lint_command_ref.run_linter[{idx}]: command_id={command_id!r} "
+                f"{meta_path}: lint evidence run_linter[{idx}]: command_id={command_id!r} "
                 "run_linter did not succeed (ok must be true)"
             )
             continue
         command = matched.get("command")
         if not isinstance(command, list) or not command:
             violations.append(
-                f"{meta_path}: lint_command_ref.run_linter[{idx}]: command log missing command"
+                f"{meta_path}: lint evidence run_linter[{idx}]: command log missing command"
             )
             continue
         inferred = _infer_run_linter_preset_from_command(command)
         if inferred != preset_decl_l:
             violations.append(
-                f"{meta_path}: lint_command_ref.run_linter[{idx}]: logged command does not match "
+                f"{meta_path}: lint evidence run_linter[{idx}]: logged command does not match "
                 f"preset {preset_decl_l!r} (inferred {inferred!r})"
             )
 

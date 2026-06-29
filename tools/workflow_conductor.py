@@ -65,7 +65,11 @@ PHASE_ORDER: tuple[str, ...] = ("compile", "generate", "build", "validate")
 # represented as [None] so the loop body is uniform.
 SUBSTEPS: dict[str, tuple[str | None, ...]] = {
     "compile": ("generate", "verify"),
-    "generate": ("generate", "verify"),
+    # generate.lint is a deterministic in-process substep run by the conductor
+    # (Conductor._lint_inproc) AFTER generate.generate produces source/<id>/src/ and
+    # BEFORE generate.verify. The leaf no longer invokes run_linter; lint findings route
+    # back to generate.generate via a warm-resume reopen (LINT_FAILURE_ROUTING).
+    "generate": ("generate", "lint", "verify"),
     "build": (None,),
     "validate": ("execute", "judge"),
 }
@@ -117,6 +121,14 @@ BUILD_FAILURE_ROUTING: dict[str, tuple[str, str]] = {
     "make_error": ("generate", "restart"),
     "dependency_violation": ("generate", "restart"),
     "validate_post_build_violation": ("generate", "restart"),
+}
+
+# Lint failure_category -> (retry_target_phase, repair_strategy). Lint findings re-run
+# generate.generate with a warm resume (reuse) so the same leaf fixes its own source with
+# context intact, avoiding a cold restart. This is a SAME-PHASE reopen (target==generate
+# while the failing substep is generate.lint); conduct() handles that case specially.
+LINT_FAILURE_ROUTING: dict[str, tuple[str, str]] = {
+    "lint_findings": ("generate", "reuse"),
 }
 
 # Validate.judge (failure_class, attribution) -> routing action.
@@ -172,6 +184,17 @@ def classify_build_failure(failure_category: str | None) -> RouteDecision:
     target, strategy = routed
     return RouteDecision("retry", target_phase=target, repair_strategy=strategy,
                          reason=f"build_{failure_category}")
+
+
+def classify_lint_failure(failure_category: str | None) -> RouteDecision:
+    if not failure_category:
+        return RouteDecision("escalate", reason="lint_fail_no_category")
+    routed = LINT_FAILURE_ROUTING.get(failure_category)
+    if routed is None:
+        return RouteDecision("escalate", reason=f"lint_unknown_category:{failure_category}")
+    target, strategy = routed
+    return RouteDecision("retry", target_phase=target, repair_strategy=strategy,
+                         reason=f"lint_{failure_category}")
 
 
 def classify_validate_judge(failure_class: str | None, attribution: str | None) -> RouteDecision:
@@ -398,9 +421,11 @@ def build_launch_request(
     spec = refs.spec_path
     skill = _skill_name(step, substep)
     role = child_agent_role(step)
-    # Build and Validate.execute run in-process (no leaf), so they carry no skill /
-    # leaf prompt — only the bookkeeping the capability/phase_state need.
-    deterministic = step == "build" or (step == "validate" and substep == "execute")
+    # Build, Validate.execute and Generate.lint run in-process (no leaf), so they carry no
+    # skill / leaf prompt — only the bookkeeping the capability/phase_state need.
+    deterministic = (step == "build"
+                     or (step == "validate" and substep == "execute")
+                     or (step == "generate" and substep == "lint"))
     rep = {
         "issue_severity": "none",
         "repair_strategy": "none",
@@ -482,6 +507,15 @@ def build_launch_request(
                 *make_entry,
                 f"{src}/src/command_log.jsonl",
                 f"{src}/source_meta.json",
+            ]
+        elif substep == "lint":
+            # Deterministic in-process lint: the conductor authors lint_meta.json (the
+            # freshness-gated deliverable) and appends to the canonical src/command_log.jsonl.
+            # The host-authored lint evidence (pipeline-root, leaf-non-writable) is NOT a
+            # leaf output and is intentionally omitted from allowed_output_paths.
+            req["allowed_output_paths"] = [
+                f"{src}/lint_meta.json",
+                f"{src}/src/command_log.jsonl",
             ]
         else:  # verify
             must_read += [
@@ -641,10 +675,23 @@ class Conductor:
     def _reuse_resume_enabled(self) -> bool:
         """Opt-in (default off) for minor-fix reuse session resume (claude only).
         Off by default until verified by a live integration run; toggled via env
-        `METDSL_CONDUCTOR_REUSE_RESUME`."""
+        `METDSL_CONDUCTOR_REUSE_RESUME` (run_workflow.py sets it for live runs)."""
         return str(self.env.get("METDSL_CONDUCTOR_REUSE_RESUME", "")).strip().lower() in {
             "1", "true", "yes",
         }
+
+    def _claude_session_resumable(self, session_id: str) -> bool:
+        """True if a claude session transcript for `session_id` still exists under
+        ~/.claude/projects/*/<session_id>.jsonl. Used to decide whether a warm
+        `--resume` is viable or must fall back to a cold launch (the session may have
+        been expired/GC'd by Claude Code)."""
+        if not isinstance(session_id, str) or not session_id.strip():
+            return False
+        try:
+            proj = Path.home() / ".claude" / "projects"
+            return bool(sorted(proj.glob(f"*/{session_id.strip()}.jsonl")))
+        except OSError:
+            return False
 
     def leaf_command(
         self,
@@ -1254,6 +1301,15 @@ clean:
             meta = _read_json(self.repo_root / refs.binary_dir() / "binary_meta.json") or {}
             status = "pass" if (meta.get("verification_status") == "pass"
                                 and _fresh_deliverables_written(allowed_output_paths)) else "fail"
+        elif phase == "generate" and substep == "lint":
+            # Deterministic lint: the conductor-authored lint_meta records the run_linter
+            # verdict. Lint findings are lint_status=fail with rc 0, so the substep fails
+            # here and classify_lint_failure routes back to generate.generate (warm resume),
+            # not transport fail_closed. lint_meta.json is the only freshness-gated
+            # deliverable (command_log.jsonl is an optional basename).
+            meta = _read_json(self.repo_root / refs.source_dir() / "lint_meta.json") or {}
+            status = "pass" if (meta.get("lint_status") == "pass"
+                                and _fresh_deliverables_written(allowed_output_paths)) else "fail"
         elif phase == "validate" and substep == "execute":
             # Deterministic execute: trial_meta.status reflects run_program +
             # quality_check + post_execute gate; content failures (rc 0) route via the
@@ -1322,7 +1378,9 @@ clean:
 
     @staticmethod
     def _is_deterministic_substep(phase: str, substep: str | None) -> bool:
-        return phase == "build" or (phase == "validate" and substep == "execute")
+        return (phase == "build"
+                or (phase == "validate" and substep == "execute")
+                or (phase == "generate" and substep == "lint"))
 
     def _capability_token(self, child_arid: str) -> str:
         path = (self.repo_root / "workspace" / "orchestrations" / self.orchestration_id
@@ -1389,6 +1447,8 @@ clean:
                 out = self._build_inproc(refs, child_arid, cap_token)
             elif phase == "validate" and substep == "execute":
                 out = self._execute_inproc(refs, child_arid, cap_token)
+            elif phase == "generate" and substep == "lint":
+                out = self._lint_inproc(refs, child_arid, cap_token)
             else:
                 raise RuntimeError(f"no deterministic body for {phase}.{substep}")
         except Exception as exc:  # noqa: BLE001 - surfaced as transport failure
@@ -1619,6 +1679,120 @@ clean:
                     json.dumps(binary_meta, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
                 stderr += "\n[post_build gate fail]\n" + gate.stdout + gate.stderr
         return {"returncode": 0, "stdout": stdout, "stderr": stderr}
+
+    def _lint_inproc(self, refs: NodeRefs, child_arid: str, cap_token: str) -> dict[str, str]:
+        """Deterministic Generate.lint: in-process run_linter over source/<id>/src/ + a
+        conductor-authored lint_meta.json and a host-side (leaf-non-writable) lint evidence
+        certificate. Lint findings are a CONTENT failure (lint_status=fail, rc 0) routed by
+        classify_lint_failure back to generate.generate via a warm-resume reopen; a genuine
+        tool/infra error raises and surfaces as a transport fail_closed."""
+        import sys as _sys
+        mcp_dir = str(self.repo_root / "mcp_servers")
+        if mcp_dir not in _sys.path:
+            _sys.path.insert(0, mcp_dir)
+        from build_runtime_server import tool_run_linter
+        # Same language->preset table the post_generate validator certifies against, so the
+        # preset the conductor RUNS cannot drift from the preset the validator EXPECTS.
+        from tools.validate_pipeline_semantics import _LINT_PRESET_FOR_LANGUAGE
+        from tools.hooks.lint_evidence import write_lint_evidence
+
+        ir = _read_yaml(self.repo_root / refs.ir_ref / "spec.ir.yaml") or {}
+        impl = (ir.get("impl_defaults") or {}) if isinstance(ir, dict) else {}
+        toolchain = (impl.get("toolchain") or {}) if isinstance(impl, dict) else {}
+        language = str(toolchain.get("language") or "fortran")
+        preset = _LINT_PRESET_FOR_LANGUAGE.get(language)
+        if preset is None:
+            # No static-lint mapping for this language: a precondition error, not a content
+            # failure the generate retry loop could fix -> transport fail_closed.
+            raise RuntimeError(
+                f"generate.lint: toolchain.language={language!r} has no static lint preset "
+                f"mapping (expected one of {sorted(_LINT_PRESET_FOR_LANGUAGE)})")
+
+        src_dir = self.repo_root / refs.source_dir() / "src"
+        # Canonical lint command-log placement: <src>/command_log.jsonl (same file the
+        # generate leaf created). _run_command appends, so the lint record is added. The
+        # handler's own command_log_ref is cwd-relative/unreliable for the in-process
+        # caller, so derive the canonical repo-relative ref ourselves (as _build_inproc does).
+        command_log_ref = self._rel(src_dir / "command_log.jsonl")
+        result = tool_run_linter({
+            "preset": preset,
+            "project_dir": str(src_dir),
+            "repo_root": str(self.repo_root),
+            "command_log_path": str(src_dir / "command_log.jsonl"),
+            "capture_limit": _FULL_CAPTURE_LIMIT,
+            "orchestration_id": self.orchestration_id,
+            "agent_run_id": child_arid,
+            "capability_token": cap_token,
+        })
+
+        # Normalize single vs mixed (2 sub-runs) into a uniform run_linter entry list.
+        run_entries: list[dict[str, Any]] = []
+        excerpts: list[str] = []
+        if preset == "mixed":
+            ok = bool(result.get("ok"))
+            for sub in result.get("runs") or []:
+                run_entries.append({
+                    "preset": str(sub.get("sub_preset") or sub.get("preset") or ""),
+                    "command_id": str(sub.get("command_id") or ""),
+                    "command_log_ref": command_log_ref,
+                    "ok": bool(sub.get("ok")),
+                })
+                excerpts.append((sub.get("stdout", "") or "") + (sub.get("stderr", "") or ""))
+        else:
+            ok = bool(result.get("ok"))
+            run_entries.append({
+                "preset": preset,
+                "command_id": str(result.get("command_id") or ""),
+                "command_log_ref": command_log_ref,
+                "ok": ok,
+            })
+            excerpts.append((result.get("stdout", "") or "") + (result.get("stderr", "") or ""))
+
+        failure_excerpt = None
+        if not ok:
+            failure_excerpt = "\n".join("\n".join(e.splitlines()[-50:]) for e in excerpts)
+
+        lint_meta: dict[str, Any] = {
+            "source_id": refs.source_id,
+            "node_key": refs.node_key,
+            "pipeline_id": refs.pipeline_id,
+            "attempt_count": 1,
+            "lint_status": "pass" if ok else "fail",
+            "verification_status": "pass" if ok else "fail",
+            "status": "pass" if ok else "fail",
+            "preset": preset,
+            "language": language,
+            "run_linter": run_entries,
+            "failure_category": None if ok else "lint_findings",
+            "failure_excerpt": failure_excerpt,
+        }
+        meta_path = self.repo_root / refs.source_dir() / "lint_meta.json"
+        meta_path.parent.mkdir(parents=True, exist_ok=True)
+        meta_path.write_text(
+            json.dumps(lint_meta, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+
+        # Host-side, leaf-non-writable certificate the post_generate validator certifies
+        # against. The evidence keys (preset/command_id/command_log_ref) are exactly what
+        # _validate_generate_lint_command_logs needs; the leaf cannot forge it (pipeline
+        # root is read-only inside the sandbox, like lineage.json).
+        write_lint_evidence(
+            pipeline_root=self.repo_root / refs.pipeline_ref,
+            source_id=refs.source_id or "",
+            preset=preset,
+            ok=ok,
+            run_linter=[{
+                "preset": e["preset"],
+                "command_id": e["command_id"],
+                "command_log_ref": e["command_log_ref"],
+            } for e in run_entries],
+        )
+
+        # A content failure (lint findings) returns rc 0 so run_phase routes it via
+        # classify_lint_failure -> generate.generate (warm resume), NOT transport
+        # fail_closed. determine_substep_status reads lint_meta.lint_status.
+        return {"returncode": 0,
+                "stdout": "",
+                "stderr": "" if ok else (failure_excerpt or "")}
 
     # -- deterministic Validate.execute (run + quality_check + evidence promote) --
 
@@ -2003,7 +2177,15 @@ clean:
             ):
                 target = str(repair.get("repair_target_agent_run_id") or "").strip()
                 if target and target != "none":
-                    resume_session_id = target
+                    # Warm resume only if the producer's session transcript still exists
+                    # (Claude Code may have expired/GC'd it). If it is gone, fall back to a
+                    # cold launch (drop resume_session_id) rather than letting `claude
+                    # --resume <missing>` fail the leaf and fail-close the phase.
+                    if self._claude_session_resumable(target):
+                        resume_session_id = target
+                    else:
+                        self.emit("resume_session_unavailable", phase=phase,
+                                  substep=substep or "", target=target)
             proc = self.spawn_leaf(
                 rec["launch_prompt_text"], self._child_env(child_arid),
                 session_id=child_arid, resume_session_id=resume_session_id,
@@ -2281,6 +2463,15 @@ clean:
         if phase == "build":
             meta = _read_json(self.repo_root / refs.binary_dir() / "binary_meta.json") or {}
             return classify_build_failure(meta.get("failure_category"))
+        if phase == "generate" and outcomes and outcomes[-1].status != "pass":
+            # The substep that failed is the last one the run_phase loop ran (it breaks on
+            # first failure), so it maps to SUBSTEPS["generate"][len(outcomes)-1]. A lint
+            # failure routes via the deterministic lint table (warm resume); generate.generate
+            # / generate.verify fall through to the verify-severity gate below.
+            failed_substep = SUBSTEPS["generate"][len(outcomes) - 1]
+            if failed_substep == "lint":
+                meta = _read_json(self.repo_root / refs.source_dir() / "lint_meta.json") or {}
+                return classify_lint_failure(meta.get("failure_category"))
         if phase == "validate":
             # An execute-substep failure (deterministic) means judge never ran, so there
             # is no verdict.json. The runner produced bad/missing primary evidence (a
@@ -2416,6 +2607,29 @@ clean:
                 self.set_status("fail_closed", reason_code="retry_budget_exhausted",
                                 reason_detail=f"{target} exceeded {MAX_ATTEMPTS_PER_PHASE}")
                 return "fail_closed"
+
+            # Same-phase warm reopen for a generate.lint finding: re-run generate.generate
+            # with a reuse repair so the SAME leaf fixes its own source (context intact),
+            # instead of terminalizing here as the generic same/downstream branch does. The
+            # deterministic lint substep runs once per attempt (run_phase does NOT exhaust an
+            # in-place retry the way a verify failure does), so a same-phase re-run is the
+            # correct recovery, not a terminal. Bounded by attempts[target] above. The dev
+            # rollback guard (target_idx < idx) does not fire (this is a within-phase reopen,
+            # consistent with the dev "auto-retry within a single phase" policy).
+            if (target_idx == idx and target == "generate"
+                    and decision.action == "retry"
+                    and decision.repair_strategy == "reuse"
+                    and (decision.reason or "").startswith("lint_")):
+                trigger = outcome.failed_substeps[-1] if outcome.failed_substeps else None
+                if trigger is None:
+                    self.set_status("fail", reason_code="generate_fail",
+                                    reason_detail="lint_reopen_no_trigger")
+                    return "fail"
+                self.reopen_phase(refs.node_key, from_phase="generate", trigger_arid=trigger,
+                                  reason=decision.reason or "lint_reopen")
+                pending_repair["generate"] = self._repair_payload(
+                    decision, self._producer_arid.get("generate", "none"))
+                continue  # idx unchanged -> re-run generate with the reuse repair
 
             if target_idx >= idx:
                 # same/downstream target reaching conduct means run_phase already

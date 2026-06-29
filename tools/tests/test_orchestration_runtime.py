@@ -1412,6 +1412,28 @@ shell_tool                       stable             true
         with self.assertRaisesRegex(ValueError, "agent_model"):
             _validate_launch_request_payload(req)
 
+    def test_validate_launch_request_payload_accepts_deterministic_generate_lint(self) -> None:
+        """The record-launch validation chokepoint's deterministic-flag allowlist must
+        include generate.lint (else every generate node fails at the lint substep's
+        record-launch), and a non-lint deterministic generate substep is still rejected.
+
+        The deterministic-flag check runs before the agent_model/ref checks, so a lint
+        payload that passes it falls through to the agent_model error (proving the
+        deterministic gate did NOT reject it)."""
+        from tools.orchestration_runtime import _validate_launch_request_payload
+
+        lint = {"node_key": "component/spec_x@0.1.0", "step": "generate",
+                "substep": "lint", "deterministic": True}
+        # Passes the deterministic allowlist -> fails later on the missing agent_model.
+        with self.assertRaisesRegex(ValueError, "agent_model"):
+            _validate_launch_request_payload(lint)
+
+        # A deterministic flag on a non-lint generate substep IS rejected by the allowlist.
+        forged = {"node_key": "component/spec_x@0.1.0", "step": "generate",
+                  "substep": "generate", "deterministic": True}
+        with self.assertRaisesRegex(ValueError, "deterministic=True is only valid"):
+            _validate_launch_request_payload(forged)
+
     def test_writes_orchestration_artifacts_in_canonical_layout(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
@@ -8796,50 +8818,6 @@ shell_tool                       stable             true
                     },
                 )
 
-    def test_write_step_result_requires_source_meta_lint_command_ref(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            repo_root = Path(tmp)
-            self._setup_preflight_and_orch_agent(repo_root)
-            orch_root = repo_root / "workspace" / "orchestrations" / "orch_001"
-            runs_path = orch_root / "agent_runs.jsonl"
-            meta_ref = "workspace/pipelines/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/source/src_20260413_001/source_meta.json"
-            meta_path = repo_root / meta_ref
-            meta_path.parent.mkdir(parents=True, exist_ok=True)
-            meta_payload = self._valid_source_meta()
-            del meta_payload["lint_command_ref"]
-            meta_path.write_text(json.dumps(meta_payload), encoding="utf-8")
-            with runs_path.open("a", encoding="utf-8") as fh:
-                fh.write(
-                    json.dumps(
-                        {
-                            "agent_run_id": "substep_run_gen_verify_001",
-                            "agent_role": "substep",
-                            "node_key": "problem/shallow_water2d@0.3.0",
-                            "step": "generate",
-                            "substep": "verify",
-                            "status": "pass",
-                            "agent_backend": "claude",
-                            "output_refs": [meta_ref],
-                        }
-                    )
-                    + "\n"
-                )
-            with self.assertRaisesRegex(ValueError, "lint_command_ref"):
-                write_step_result(
-                    repo_root=repo_root,
-                    orchestration_id="orch_001",
-                    node_key="problem/shallow_water2d@0.3.0",
-                    step="generate",
-                    agent_run_id="orch_run_001",
-                    payload={
-                        "status": "pass",
-                        "validation_stage": "post_generate",
-                        "required_outputs": [meta_ref],
-                        "failed_substeps": [],
-                        "substep_agent_run_ids": ["substep_run_gen_verify_001"],
-                    },
-                )
-
     def test_write_step_result_allows_source_meta_without_lint_when_fail(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
@@ -15021,7 +14999,8 @@ class GateRunbookTests(unittest.TestCase):
         import re as _re
 
         for (step, substep), allowed in ALLOWED_VALIDATE_PIPELINE_STAGES.items():
-            if step == "build" or (step == "validate" and substep == "execute"):
+            if (step == "build" or (step == "validate" and substep == "execute")
+                    or (step == "generate" and substep == "lint")):
                 continue  # deterministic — covered separately
             with self.subTest(step=step, substep=substep):
                 rb = _build_gate_runbook(self._payload(step, substep))
@@ -24338,6 +24317,45 @@ class ReopenPhaseTest(unittest.TestCase):
                     repo_root, oid, node_key=self.NODE_KEY, from_phase="validate",
                     reason="x", trigger_agent_run_id=arids["v_judge"],
                 )
+
+    def test_reopen_accepts_same_phase_generate_lint_trigger(self) -> None:
+        # The lint carve-out: a failed generate.lint substep may reopen generate itself
+        # (same-phase) so generate.generate warm-resumes to fix its source.
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            oid = "orch_reopen_lint"
+            self._build_fixture(repo_root, oid)
+            root = repo_root / "workspace" / "orchestrations" / oid
+            with (root / "agent_runs.jsonl").open("a", encoding="utf-8") as f:
+                f.write(json.dumps({
+                    "agent_run_id": "generate-lint-1", "agent_role": "substep",
+                    "step": "generate", "substep": "lint", "status": "fail",
+                    "node_key": self.NODE_KEY,
+                }) + "\n")
+            result = reopen_phase(
+                repo_root, oid, node_key=self.NODE_KEY, from_phase="generate",
+                reason="lint_lint_findings", trigger_agent_run_id="generate-lint-1")
+            self.assertEqual(result["status"], "reopened")
+            self.assertEqual(result["affected_phases"], ["generate", "build", "validate"])
+
+    def test_reopen_rejects_same_phase_generate_verify_trigger(self) -> None:
+        # The same-phase carve-out is lint-ONLY: a generate.verify same-phase trigger must
+        # still be rejected so verify/generate can never reopen their own phase (anti-abuse).
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            oid = "orch_reopen_gen_verify"
+            self._build_fixture(repo_root, oid)
+            root = repo_root / "workspace" / "orchestrations" / oid
+            with (root / "agent_runs.jsonl").open("a", encoding="utf-8") as f:
+                f.write(json.dumps({
+                    "agent_run_id": "generate-verify-fail-1", "agent_role": "substep",
+                    "step": "generate", "substep": "verify", "status": "fail",
+                    "node_key": self.NODE_KEY,
+                }) + "\n")
+            with self.assertRaises(RuntimeError):
+                reopen_phase(
+                    repo_root, oid, node_key=self.NODE_KEY, from_phase="generate",
+                    reason="x", trigger_agent_run_id="generate-verify-fail-1")
 
     def test_reopen_rejects_unknown_trigger(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

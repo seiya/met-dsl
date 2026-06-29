@@ -40,7 +40,7 @@ Using the `Controlled Spec` and `tests` as the canonical source, generate, at op
 - In-stage `verify` aims to confirm structural / contract / traceability consistency, and does not substitute for the final assurance of physical validity.
 - An `LLM`-using stage produces `<stage>_meta.json` (`ir_meta.json` for `Compile`, `source_meta.json` for `Generate`, `validate_meta.json` for `Validate`) as a required output.
 - The required items of the metadata are `attempt_count`, `verification_status`, `last_fail_reason`, `context_isolated`, and `debug_mode`. When `context_isolated=false`, `constraint_reason` is required.
-- The `lint_command_ref` of `source_meta.json` is required when `verification_status=pass`, and optional when `verification_status!=pass`.
+- `source_meta.json` no longer records `lint_command_ref`: `static lint` is the deterministic conductor-run `Generate.lint` substep, certified by `post_generate` against the host-authored `<pipeline_root>/lint_evidence/<source_id>.json`.
 - The default for `debug_mode` is `false`. Only when `debug_mode=true` is saving failed-attempt artifacts permitted, recording `retained_failed_attempts` and the storage location.
 
 ## Architecture policy

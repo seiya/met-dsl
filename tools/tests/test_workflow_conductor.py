@@ -314,8 +314,10 @@ class ConductHappyPathTest(unittest.TestCase):
              "record-launch", "finalize-child", "record-launch", "finalize-child",
              "write-step-result"]  # compile (2 leaf substeps)
             + ["check-step-completed", "workflow-launch-check",
-               "record-launch", "finalize-child", "record-launch", "finalize-child",
-               "write-step-result"]  # generate (2 leaf substeps)
+               "record-launch", "finalize-child",  # generate.generate (leaf)
+               "record-launch", "record-child-return", "finalize-child",  # generate.lint (deterministic)
+               "record-launch", "finalize-child",  # generate.verify (leaf)
+               "write-step-result"]  # generate (2 leaf + 1 deterministic substeps)
             + ["check-step-completed", "workflow-launch-check",
                "record-launch", "record-child-return", "finalize-child",
                "write-step-result"]  # build (1 deterministic step)
@@ -332,7 +334,11 @@ class ConductHappyPathTest(unittest.TestCase):
         by_step = {cap["--step"]: cap for cap in wsr}
         for substep_aware in ("compile", "generate", "validate"):
             self.assertEqual(by_step[substep_aware]["--agent-run-id"], "ORCH")
-            self.assertEqual(len(by_step[substep_aware]["--result-json"]["substep_agent_run_ids"]), 2)
+            # generate now has 3 substeps (generate, lint, verify); compile/validate have 2.
+            expected_substeps = 3 if substep_aware == "generate" else 2
+            self.assertEqual(
+                len(by_step[substep_aware]["--result-json"]["substep_agent_run_ids"]),
+                expected_substeps)
             self.assertEqual(by_step[substep_aware]["--result-json"]["status"], "pass")
         # build executor is the (child) step agent, no substeps
         self.assertNotEqual(by_step["build"]["--agent-run-id"], "ORCH")
@@ -585,6 +591,34 @@ class ConductRoutingTest(unittest.TestCase):
         validate_writes = [cap for s, cap in c.calls
                            if s == "write-step-result" and cap["--step"] == "validate"]
         self.assertEqual(len(validate_writes), 2)
+
+    def test_lint_finding_warm_reopens_generate_same_phase(self) -> None:
+        # A generate.lint finding routes retry/generate/reuse(lint_*); conduct must do a
+        # SAME-PHASE warm reopen (reopen-phase --from-phase generate) and re-run generate,
+        # not terminalize like the generic same/downstream branch.
+        c = self._conductor()
+        state = {"lint_failed": False}
+
+        def status_fn(phase, substep, n):
+            if phase == "generate" and substep == "lint" and not state["lint_failed"]:
+                state["lint_failed"] = True
+                return "fail"
+            return "pass"
+
+        c.status_fn = status_fn
+        c.decision_fn = lambda phase, outcomes: wc.RouteDecision(
+            "retry", target_phase="generate", repair_strategy="reuse",
+            reason="lint_lint_findings")
+        status = c.conduct(self._refs(), "generate")
+        self.assertEqual(status, "pass")
+        reopens = [cap for s, cap in c.calls if s == "reopen-phase"]
+        self.assertEqual(len(reopens), 1)
+        self.assertEqual(reopens[0]["--from-phase"], "generate")
+        self.assertEqual(reopens[0]["--reason"], "lint_lint_findings")
+        # generate ran twice (lint-fail attempt, then clean attempt)
+        gen_writes = [cap for s, cap in c.calls
+                      if s == "write-step-result" and cap["--step"] == "generate"]
+        self.assertEqual(len(gen_writes), 2)
 
     def test_fail_closed_on_spec_attribution(self) -> None:
         c = self._conductor()
@@ -1322,6 +1356,9 @@ class LeafSpawnTest(unittest.TestCase):
                     return wc.ProcResult(0, "", "")
 
                 c.spawn_leaf = spawn  # type: ignore[assignment]
+                # The producer session transcript is assumed resumable here; the
+                # cold-fallback-when-missing case is covered separately below.
+                c._claude_session_resumable = lambda sid: True  # type: ignore[assignment]
                 c.run_substep(refs, "generate", "generate", repair=repair)
             return cap
 
@@ -1337,6 +1374,29 @@ class LeafSpawnTest(unittest.TestCase):
         restart = run({"METDSL_CONDUCTOR_REUSE_RESUME": "1"},
                       {"repair_strategy": "restart", "repair_target_agent_run_id": "producer-arid"})
         self.assertIsNone(restart.get("resume_session_id"))
+
+    def test_run_substep_reuse_resume_cold_fallback_when_session_missing(self) -> None:
+        """flag ON + reuse but the producer session transcript is gone → cold launch
+        (drop resume_session_id) instead of failing the leaf with `--resume <missing>`."""
+        refs = wc.NodeRefs(node_key="component/spec_x@0.1.0", spec_path="spec/component/spec_x",
+                           ir_id="x_1_001", pipeline_id="x_1_001", source_id="src_1")
+        reuse = {"repair_strategy": "reuse", "repair_target_agent_run_id": "producer-arid"}
+        cap: dict = {}
+        with tempfile.TemporaryDirectory() as tmp:
+            c = _FakeConductor(repo_root=Path(tmp), orchestration_id="o",
+                               orchestration_agent_run_id="ORCH", backend="claude",
+                               env={"METDSL_CONDUCTOR_REUSE_RESUME": "1"})
+            c.calls = []
+
+            def spawn(prompt, env_, **kw):
+                cap.update(kw)
+                return wc.ProcResult(0, "", "")
+
+            c.spawn_leaf = spawn  # type: ignore[assignment]
+            c._claude_session_resumable = lambda sid: False  # type: ignore[assignment]
+            c.run_substep(refs, "generate", "generate", repair=reuse)
+        self.assertEqual(cap.get("session_id"), "child-1")
+        self.assertIsNone(cap.get("resume_session_id"))
 
     def test_bwrap_always_enforced(self) -> None:
         # Phase-2 (Linux+bwrap-only): bwrap leaf sandboxing is unconditionally mandatory;
@@ -1705,6 +1765,16 @@ class BuildLaunchRequestResolvedDependenciesTest(unittest.TestCase):
             "resolved_dependencies", self._build("validate", "execute", (self.DEP,)))
         self.assertNotIn(
             "resolved_dependencies", self._build("build", None, (self.DEP,)))
+        # generate.lint is deterministic too: no resolved_dependencies / skill, and the
+        # deterministic flag is set with lint-only allowed_output_paths.
+        lint_req = self._build("generate", "lint", (self.DEP,))
+        self.assertNotIn("resolved_dependencies", lint_req)
+        self.assertNotIn("skill_name", lint_req)
+        self.assertTrue(lint_req["deterministic"])
+        outs = lint_req["allowed_output_paths"]
+        self.assertTrue(any(p.endswith("/lint_meta.json") for p in outs))
+        # lint does not author model/runner sources
+        self.assertFalse(any(p.endswith("_model.f90") for p in outs))
 
     def test_omitted_for_compile(self) -> None:
         self.assertNotIn(
@@ -2448,6 +2518,144 @@ class DeterministicBuildTest(unittest.TestCase):
             self.assertEqual((third.action, third.target_phase), ("retry", "generate"))
             fourth = c.classify_failure(refs, "validate", [])
             self.assertEqual((fourth.action, fourth.target_phase), ("reopen", "compile"))
+
+
+class DeterministicLintTest(unittest.TestCase):
+    """generate.lint runs in-process (no leaf): conductor authors lint_meta.json + the
+    host-side lint evidence; findings are a content failure routed to generate.generate."""
+
+    def _conductor(self, repo: Path) -> "wc.Conductor":
+        return wc.Conductor(repo_root=repo, orchestration_id="t",
+                            orchestration_agent_run_id="x", backend="claude", env={})
+
+    def _refs(self) -> wc.NodeRefs:
+        return wc.NodeRefs(
+            node_key="component/spec_x@0.1.0", spec_path="spec/component/spec_x",
+            ir_id="x_1", pipeline_id="x_1", source_id="src_1", binary_id="bin_1")
+
+    def _seed(self, repo: Path, refs: wc.NodeRefs, language: str | None = None) -> None:
+        (repo / refs.source_dir() / "src").mkdir(parents=True, exist_ok=True)
+        ir_dir = repo / refs.ir_ref
+        ir_dir.mkdir(parents=True, exist_ok=True)
+        if language is not None:
+            (ir_dir / "spec.ir.yaml").write_text(
+                f"impl_defaults:\n  toolchain:\n    language: {language}\n", encoding="utf-8")
+
+    def _patch_linter(self, fn):
+        import sys
+        from unittest import mock
+        sys.path.insert(0, str(Path("mcp_servers").resolve()))
+        import build_runtime_server  # type: ignore
+        return mock.patch.object(build_runtime_server, "tool_run_linter", fn)
+
+    def test_lint_inproc_pass_writes_meta_and_evidence(self) -> None:
+        import tempfile
+        from tools.hooks.lint_evidence import read_lint_evidence
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            refs = self._refs()
+            self._seed(repo, refs)  # default language fortran -> fortitude
+            c = self._conductor(repo)
+            with self._patch_linter(
+                lambda args: {"ok": True, "return_code": 0, "command_id": "cid",
+                              "preset": "fortitude"}):
+                out = c._lint_inproc(refs, "child-1", "captok")
+            self.assertEqual(out["returncode"], 0)
+            meta = json.loads((repo / refs.source_dir() / "lint_meta.json").read_text())
+            self.assertEqual(meta["lint_status"], "pass")
+            self.assertEqual(meta["preset"], "fortitude")
+            self.assertIsNone(meta["failure_category"])
+            ev = read_lint_evidence(pipeline_root=repo / refs.pipeline_ref, source_id="src_1")
+            assert ev is not None
+            self.assertTrue(ev["ok"])
+            self.assertEqual(ev["run_linter"][0]["command_id"], "cid")
+            self.assertTrue(
+                ev["run_linter"][0]["command_log_ref"].endswith("/src/command_log.jsonl"))
+
+    def test_lint_inproc_findings_is_content_fail(self) -> None:
+        import tempfile
+        from tools.hooks.lint_evidence import read_lint_evidence
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            refs = self._refs()
+            self._seed(repo, refs)
+            c = self._conductor(repo)
+            with self._patch_linter(
+                lambda args: {"ok": False, "return_code": 1, "command_id": "cid",
+                              "preset": "fortitude", "stdout": "S001 line too long"}):
+                out = c._lint_inproc(refs, "child-1", "captok")
+            self.assertEqual(out["returncode"], 0)  # content fail, not transport
+            meta = json.loads((repo / refs.source_dir() / "lint_meta.json").read_text())
+            self.assertEqual(meta["lint_status"], "fail")
+            self.assertEqual(meta["failure_category"], "lint_findings")
+            self.assertIn("S001", meta["failure_excerpt"])
+            ev = read_lint_evidence(pipeline_root=repo / refs.pipeline_ref, source_id="src_1")
+            assert ev is not None
+            self.assertFalse(ev["ok"])
+
+    def test_lint_inproc_mixed_records_two_entries(self) -> None:
+        import tempfile
+        from tools.hooks.lint_evidence import read_lint_evidence
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            refs = self._refs()
+            self._seed(repo, refs, language="mixed")
+            c = self._conductor(repo)
+            mixed = {
+                "ok": True, "preset": "mixed",
+                "runs": [
+                    {"sub_preset": "fortitude", "ok": True, "command_id": "f1"},
+                    {"sub_preset": "cppcheck", "ok": True, "command_id": "c1"},
+                ],
+            }
+            with self._patch_linter(lambda args: mixed):
+                c._lint_inproc(refs, "child-1", "captok")
+            ev = read_lint_evidence(pipeline_root=repo / refs.pipeline_ref, source_id="src_1")
+            assert ev is not None
+            self.assertEqual(ev["preset"], "mixed")
+            self.assertEqual({e["preset"] for e in ev["run_linter"]}, {"fortitude", "cppcheck"})
+
+    def test_lint_inproc_unknown_language_raises(self) -> None:
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            refs = self._refs()
+            self._seed(repo, refs, language="brainfuck")
+            c = self._conductor(repo)
+            with self.assertRaises(RuntimeError):
+                c._lint_inproc(refs, "child-1", "captok")
+
+    def test_determine_substep_status_lint_branch(self) -> None:
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            refs = self._refs()
+            (repo / refs.source_dir()).mkdir(parents=True, exist_ok=True)
+            c = self._conductor(repo)
+            meta_path = repo / refs.source_dir() / "lint_meta.json"
+            paths = [refs.source_dir() + "/lint_meta.json"]
+            meta_path.write_text(json.dumps({"lint_status": "pass"}), encoding="utf-8")
+            self.assertEqual(
+                c.determine_substep_status(refs, "generate", "lint", paths)[0], "pass")
+            meta_path.write_text(json.dumps({"lint_status": "fail"}), encoding="utf-8")
+            self.assertEqual(
+                c.determine_substep_status(refs, "generate", "lint", paths)[0], "fail")
+
+    def test_classify_failure_routes_lint_findings_to_generate_reuse(self) -> None:
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            refs = self._refs()
+            (repo / refs.source_dir()).mkdir(parents=True, exist_ok=True)
+            (repo / refs.source_dir() / "lint_meta.json").write_text(
+                json.dumps({"failure_category": "lint_findings"}), encoding="utf-8")
+            c = self._conductor(repo)
+            # outcomes models generate.generate(pass), generate.lint(fail) — lint is index 1.
+            outcomes = [wc.SubstepOutcome("g", "pass", [], 0),
+                        wc.SubstepOutcome("l", "fail", [], 0)]
+            d = c.classify_failure(refs, "generate", outcomes)
+            self.assertEqual((d.action, d.target_phase, d.repair_strategy), ("retry", "generate", "reuse"))
+            self.assertTrue(d.reason.startswith("lint_"))
 
 
 class ExecutePromoterTest(unittest.TestCase):

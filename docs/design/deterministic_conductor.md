@@ -45,8 +45,10 @@ the per-turn accumulation. The leaf substeps (the irreducible creative work) are
 
 ### What stays LLM
 
-The substep **bodies**: `compile.generate`/`verify`, `generate.generate`/`verify`,
-`build` (step), `validate.execute`/`judge` — spawned as isolated leaf agents. Plus the
+The LLM substep **bodies**: `compile.generate`/`verify`, `generate.generate`/`verify`,
+and `validate.judge` — spawned as isolated leaf agents. The deterministic substeps
+`generate.lint`, `build` (step), and `validate.execute` run IN-PROCESS in the conductor
+(no leaf), not as LLM. Plus the
 diagnostician (`escalate`): for a failure the decision tables can't classify, the
 conductor embeds the failure-artifact content in a prompt, spawns a read-only reasoning
 leaf, and parses its final JSON directive (`_parse_directive`) — validated against the

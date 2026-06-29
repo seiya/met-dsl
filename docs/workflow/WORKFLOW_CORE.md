@@ -25,7 +25,8 @@ This document defines the workflow's phase sequence, inter-phase input/output co
 - `phase` refers to the logical unit that composes the workflow, including `Spec` / `Compile` / `Generate` / `Build` / `Validate`.
 - `step` is treated as the orchestration-level execution unit corresponding to one phase.
 - `substep` refers to a lower execution unit decomposed from a `step`.
-  - `Compile` / `Generate` have the 2 substeps `generate` and `verify`.
+  - `Compile` has the 2 substeps `generate` and `verify`.
+  - `Generate` has the 3 substeps `generate`, `lint`, and `verify` — `lint` is a deterministic conductor-run substep (no leaf) between `generate` and `verify`; a lint finding warm-resumes `generate`.
   - `Validate` has the 2 substeps `execute` and `judge`.
   - `Build` is a single step that has no standard substep.
 - `stage` is used only as existing field names such as `generated_by_stage`, `<stage>_meta.json`, and `write_scope_baseline.json.stage`. It must not be used as a synonym for `phase` or `step` in the body text.
@@ -92,7 +93,7 @@ This document defines the workflow's phase sequence, inter-phase input/output co
 - The common required keys of `<stage>_meta.json` are `attempt_count`, `verification_status`, `last_fail_reason`, `debug_mode`, and `context_isolated`.
 - When `context_isolated=false`, `constraint_reason` is required.
 - `ir_meta.json` requires only the common keys above.
-- `source_meta.json` requires the common keys above, and only when `verification_status=pass` requires `lint_command_ref.run_linter[]` (`command_id`, `command_log_ref`, `preset`).
+- `source_meta.json` requires the common keys above. Lint is no longer recorded in `source_meta.lint_command_ref` — it is the deterministic conductor-run `Generate.lint` substep, certified by `post_generate` against the host-authored `<pipeline_root>/lint_evidence/<source_id>.json`.
 - `validate_meta.json` requires the common keys above, and only when `verification_status=pass` requires the evidence of the LLM semantic check in `judge_command_ref`.
 - With `debug_mode=false`, do not save failed-attempt artifacts. When saved with `debug_mode=true`, record the saved count and storage location in metadata.
 - The execution mode at workflow start is specified by `--mode` of `tools/run_workflow.py`, with a default of `dev`.
@@ -266,7 +267,7 @@ In this section, the input of each phase is described separately as `execution i
 - execution input: `spec.ir.yaml`
 - verification input: `spec.ir.yaml`, `controlled_spec.md` (verify-only, requirement-fidelity cross-check), the generated `source/<source_id>/src/`
 - output: `source/<source_id>/src/`, `source_meta.json`
-- Before `Generate` completes, succeed at the MCP `run_linter` consistent with `impl_defaults.toolchain.language` of `spec.ir.yaml`, and must record the MCP evidence (each element with `command_id`, `command_log_ref`, and `preset`) in `lint_command_ref.run_linter` of `source_meta.json`.
+- Before `Generate` completes, the conductor's deterministic `Generate.lint` substep runs the MCP `run_linter` consistent with `impl_defaults.toolchain.language` of `spec.ir.yaml` and writes the host-authored lint evidence (`<pipeline_root>/lint_evidence/<source_id>.json`, each element with `command_id`, `command_log_ref`, and `preset`); `post_generate` certifies it. The leaf does not run `run_linter`.
 - `Generate` must include in its official output a preset-compatible quality path with which `Validate.execute` can run using only the `preset` of `run_quality_checks`. On shortage, it is `Generate fail`.
 - With `toolchain.build_system=make` and `toolchain.language=fortran` / `c` / `cpp` / `mixed` families, a `test` or `check` target must be defined in `source/<source_id>/src/Makefile`. On absence, it is `Generate fail`.
 
@@ -291,7 +292,7 @@ The contract details per phase use the files under [phases/](phases/) as the can
 |-------|----------|---------|
 | 0 Spec (manual) | [phases/phase_00_spec.md](phases/phase_00_spec.md) | - |
 | 1 Compile | [phases/phase_01_compile.md](phases/phase_01_compile.md) | generate / verify |
-| 2 Generate | [phases/phase_02_generate.md](phases/phase_02_generate.md) | generate / verify |
+| 2 Generate | [phases/phase_02_generate.md](phases/phase_02_generate.md) | generate / lint / verify |
 | 3 Build | [phases/phase_03_build.md](phases/phase_03_build.md) | - |
 | 4 Validate | [phases/phase_04_validate.md](phases/phase_04_validate.md) | execute / judge |
 
