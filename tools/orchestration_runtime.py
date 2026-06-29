@@ -7335,6 +7335,56 @@ def _is_violation_dismissed(
     return unauthorized_normalized <= dismissed_set
 
 
+def _expected_lint_evidence_rel_path(
+    repo_root: Path,
+    orchestration_id: str,
+    *,
+    agent_run_id: str,
+    cap_doc: dict[str, Any],
+    write_roots: list[str],
+) -> str | None:
+    """The single host-authored generate.lint certificate path that is exempt from
+    write-attribution: ``<pipeline_ref>/lint_evidence/<source_id>.json``.
+
+    Returns None (no exemption -> the write is flagged, fail-closed) unless the actor is the
+    ``generate.lint`` substep AND both the pipeline root and a safe bare ``source_id`` resolve.
+    The exemption is bound to this EXACT file (not the whole ``lint_evidence/`` directory) so
+    an unexpected/stale sibling under that dir is still rejected. ``source_id`` is read from
+    the host-authored, leaf-non-writable launch request (``build_launch_request`` records it
+    for every generate launch), so a sandboxed leaf cannot influence it."""
+    if str(cap_doc.get("step") or "").strip().lower() != "generate":
+        return None
+    if str(cap_doc.get("substep") or "").strip().lower() != "lint":
+        return None
+    # generate write_root is exactly <pipeline_ref>/source/ (_write_roots_for_launch); the
+    # pipeline root is its parent. Derive it rather than re-deriving pipeline_ref elsewhere.
+    pipe_prefix: str | None = None
+    for root in write_roots:
+        if root.endswith("source/"):
+            pipe_prefix = root[: -len("source/")]
+            break
+    if not pipe_prefix:
+        return None
+    req_path = (
+        repo_root / "workspace" / "orchestrations" / orchestration_id
+        / "launches" / f"{agent_run_id}.request.json"
+    )
+    if not req_path.exists():
+        return None
+    doc = _read_json(req_path)
+    if not isinstance(doc, dict):
+        return None
+    sid_obj = doc.get("source_id")
+    if not isinstance(sid_obj, str):
+        return None
+    sid = sid_obj.strip()
+    # Reject anything that is not a bare, traversal-free component so a malformed source_id
+    # cannot widen the exempt path outside lint_evidence/ (mirrors lint_evidence._safe_component).
+    if not sid or sid in {".", ".."} or "/" in sid or "\\" in sid or "\x00" in sid:
+        return None
+    return _normalize_rel_posix(f"{pipe_prefix}lint_evidence/{sid}.json")
+
+
 def _validate_actual_write_paths(
     repo_root: Path,
     orchestration_id: str,
@@ -7384,6 +7434,27 @@ def _validate_actual_write_paths(
             raise ValueError(f"capability must be object for terminal write validation: {cap_path}")
         roots_obj = cap_doc.get("write_roots")
         write_roots = _load_write_roots_from_cap(roots_obj)
+
+    # generate.lint writes a host-authored, leaf-non-writable certificate at the EXACT
+    # path <pipeline_ref>/lint_evidence/<source_id>.json, deliberately OUTSIDE the substep's
+    # source/ write_root (same non-forgeability placement as lineage.json). It is a conductor
+    # host write made during the in-process substep window (workflow_conductor.Conductor.
+    # _lint_inproc -> write_lint_evidence), not a leaf write, so it lands in the FS-diff and
+    # would otherwise be misattributed as an unauthorized write. Exempt ONLY that one exact
+    # certificate (not the whole lint_evidence/ dir) so an unexpected/stale sibling under
+    # lint_evidence/ is still flagged. Scoped to the lint substep so the sandboxed
+    # generate.generate leaf is never exempted (and bwrap blocks that leaf from the pipeline
+    # root regardless). write_roots stays minimal — like lineage.json, the certificate is NOT
+    # a capability write_root.
+    lint_evidence_expected_path: str | None = None
+    if actor_role == "substep":
+        lint_evidence_expected_path = _expected_lint_evidence_rel_path(
+            repo_root,
+            orchestration_id,
+            agent_run_id=run_id,
+            cap_doc=cap_doc,
+            write_roots=write_roots,
+        )
 
     unauthorized: list[str] = []
     parent_tmp_root: str | None = None
@@ -7509,6 +7580,9 @@ def _validate_actual_write_paths(
             # cross-phase placements (e.g. Execute's run_quality_checks log
             # under generate/<gen>/src/) are not fail-closed for the very
             # file the MCP tool produced.
+            continue
+        if lint_evidence_expected_path is not None and path == lint_evidence_expected_path:
+            # Conductor host write of the exact generate.lint certificate (see above).
             continue
         if write_roots and not _path_under_any_write_root(path, write_roots):
             unauthorized.append(path)

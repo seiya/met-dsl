@@ -14380,6 +14380,193 @@ class TerminalUnauthorizedWriteDirectWriteTests(unittest.TestCase):
             )
 
 
+class TerminalLintEvidenceExemptionTests(unittest.TestCase):
+    """The conductor-run generate.lint substep writes a host-authored, leaf-non-writable
+    certificate at <pipeline_ref>/lint_evidence/<source_id>.json -- deliberately outside the
+    substep's source/ write_root (workflow_conductor.Conductor._lint_inproc). That host write
+    must be exempt from FS-diff write attribution, but ONLY for the lint substep."""
+
+    _SOURCE_ID = "src_20260415_001"
+    _EVIDENCE_REL = f"{_FIX_PIPE_REF}/lint_evidence/{_SOURCE_ID}.json"
+    _LINT_META_REL = f"{_FIX_PIPE_REF}/source/{_SOURCE_ID}/lint_meta.json"
+    # A sibling under lint_evidence/ that is NOT the run's own <source_id>.json certificate.
+    _OTHER_EVIDENCE_REL = f"{_FIX_PIPE_REF}/lint_evidence/src_other_999.json"
+
+    def _setup(
+        self,
+        repo_root: Path,
+        *,
+        orch: str,
+        run_id: str,
+        substep: str | None,
+        step: str = "generate",
+        source_id: str | None = _SOURCE_ID,
+    ) -> None:
+        from tools.orchestration_runtime import (
+            _capabilities_dir,
+            _write_allowed_output_manifest,
+            _write_run_write_baseline,
+        )
+
+        # No _mark_dependencies_ready: _validate_actual_write_paths does not consult
+        # dependency readiness, and the helper defaults to orch_001 (a different orch),
+        # so it would be a silent no-op here.
+        init_orchestration(repo_root=repo_root, orchestration_id=orch)
+        cap: dict[str, Any] = {
+            "orchestration_id": orch,
+            "agent_run_id": run_id,
+            "agent_role": "substep",
+            "step": step,
+            # Keep a source/ write_root regardless of `step` so that, for the
+            # step-scoping test, the ONLY thing preventing the exemption is the
+            # step==generate gate (not an absent source/ prefix).
+            "write_roots": [f"{_FIX_PIPE_REF}/source/"],
+        }
+        if substep is not None:
+            cap["substep"] = substep
+        cap_path = _capabilities_dir(repo_root, orch) / f"{run_id}.json"
+        cap_path.parent.mkdir(parents=True, exist_ok=True)
+        cap_path.write_text(json.dumps(cap), encoding="utf-8")
+        # The exempt certificate path is bound to the source_id recorded in the
+        # host-authored launch request (build_launch_request records it for every
+        # generate launch), so the exemption resolves to <pipe>/lint_evidence/<sid>.json.
+        if source_id is not None:
+            launch_dir = (
+                repo_root / "workspace" / "orchestrations" / orch / "launches"
+            )
+            launch_dir.mkdir(parents=True, exist_ok=True)
+            (launch_dir / f"{run_id}.request.json").write_text(
+                json.dumps({
+                    "agent_run_id": run_id,
+                    "step": step,
+                    "pipeline_ref": _FIX_PIPE_REF,
+                    "source_id": source_id,
+                }),
+                encoding="utf-8",
+            )
+        _write_allowed_output_manifest(
+            repo_root,
+            orchestration_id=orch,
+            agent_run_id=run_id,
+            allowed_output_paths=[f"{_FIX_PIPE_REF}/source/"],
+            allowed_file_tool_paths=[],
+        )
+        _write_run_write_baseline(repo_root, orch, agent_run_id=run_id)
+
+    def _write_evidence_and_meta(self, repo_root: Path) -> None:
+        for rel in (self._EVIDENCE_REL, self._LINT_META_REL):
+            p = repo_root / rel
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text('{"ok": true}\n', encoding="utf-8")
+
+    def test_lint_substep_exempts_pipeline_root_evidence(self) -> None:
+        from tools.orchestration_runtime import _validate_actual_write_paths
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            orch, run_id = "orch_lint_ev_001", "substep_lint_ev_001"
+            self._setup(repo_root, orch=orch, run_id=run_id, substep="lint")
+            self._write_evidence_and_meta(repo_root)
+
+            # Must NOT raise: lint_meta is in write_roots, lint_evidence is the exempt
+            # host-authored certificate.
+            _validate_actual_write_paths(
+                repo_root,
+                orch,
+                {
+                    "agent_run_id": run_id,
+                    "agent_role": "substep",
+                    "status": "pass",
+                    "output_refs": [self._LINT_META_REL],
+                },
+            )
+            violation = (
+                repo_root / "workspace" / "orchestrations" / orch / "violations"
+                / f"{run_id}.unauthorized_write_violation.json"
+            )
+            self.assertFalse(violation.exists())
+
+    def _assert_evidence_rejected(self, repo_root: Path, orch: str, run_id: str) -> None:
+        from tools.orchestration_runtime import _validate_actual_write_paths
+
+        with self.assertRaisesRegex(ValueError, "unauthorized write paths"):
+            _validate_actual_write_paths(
+                repo_root,
+                orch,
+                {
+                    "agent_run_id": run_id,
+                    "agent_role": "substep",
+                    "status": "pass",
+                    "output_refs": [self._LINT_META_REL],
+                },
+            )
+        violation = (
+            repo_root / "workspace" / "orchestrations" / orch / "violations"
+            / f"{run_id}.unauthorized_write_violation.json"
+        )
+        payload = json.loads(violation.read_text(encoding="utf-8"))
+        self.assertIn(self._EVIDENCE_REL, payload.get("unauthorized_paths") or [])
+
+    def test_non_lint_generate_substep_does_not_exempt_evidence(self) -> None:
+        # Scoping (substep gate): the sandboxed generate.generate leaf carries
+        # substep=="generate", NOT "lint" -- writing the same pipeline-root path is
+        # still rejected. Models the real actor the exemption must exclude.
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            orch, run_id = "orch_lint_ev_002", "substep_lint_ev_002"
+            self._setup(repo_root, orch=orch, run_id=run_id, step="generate", substep="generate")
+            self._write_evidence_and_meta(repo_root)
+            self._assert_evidence_rejected(repo_root, orch, run_id)
+
+    def test_non_generate_step_lint_substep_does_not_exempt_evidence(self) -> None:
+        # Scoping (step gate is load-bearing): a substep named "lint" under a NON-generate
+        # step, even with a source/ write_root present, is still rejected -- both halves of
+        # the step==generate AND substep==lint gate are required.
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            orch, run_id = "orch_lint_ev_003", "substep_lint_ev_003"
+            self._setup(repo_root, orch=orch, run_id=run_id, step="build", substep="lint")
+            self._write_evidence_and_meta(repo_root)
+            self._assert_evidence_rejected(repo_root, orch, run_id)
+
+    def test_lint_substep_does_not_exempt_sibling_evidence_file(self) -> None:
+        # The exemption is bound to the EXACT <source_id>.json certificate, not the whole
+        # lint_evidence/ dir: a stray sibling (e.g. left by a retry bug) under lint_evidence/
+        # is still flagged as an unauthorized write even for the lint substep.
+        from tools.orchestration_runtime import _validate_actual_write_paths
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            orch, run_id = "orch_lint_ev_004", "substep_lint_ev_004"
+            self._setup(repo_root, orch=orch, run_id=run_id, substep="lint")
+            # The run's own certificate (exempt) AND a foreign sibling (must be flagged).
+            for rel in (self._EVIDENCE_REL, self._LINT_META_REL, self._OTHER_EVIDENCE_REL):
+                p = repo_root / rel
+                p.parent.mkdir(parents=True, exist_ok=True)
+                p.write_text('{"ok": true}\n', encoding="utf-8")
+
+            with self.assertRaisesRegex(ValueError, "unauthorized write paths"):
+                _validate_actual_write_paths(
+                    repo_root,
+                    orch,
+                    {
+                        "agent_run_id": run_id,
+                        "agent_role": "substep",
+                        "status": "pass",
+                        "output_refs": [self._LINT_META_REL],
+                    },
+                )
+            violation = (
+                repo_root / "workspace" / "orchestrations" / orch / "violations"
+                / f"{run_id}.unauthorized_write_violation.json"
+            )
+            payload = json.loads(violation.read_text(encoding="utf-8"))
+            unauth = payload.get("unauthorized_paths") or []
+            # The foreign sibling is flagged; the run's own certificate is NOT.
+            self.assertIn(self._OTHER_EVIDENCE_REL, unauth)
+            self.assertNotIn(self._EVIDENCE_REL, unauth)
+
+
 class LoadWriteRootsFromCapTests(unittest.TestCase):
     """Tests for _load_write_roots_from_cap normalization and rejection rules."""
 
