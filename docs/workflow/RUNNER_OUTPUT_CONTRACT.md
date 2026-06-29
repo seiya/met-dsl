@@ -143,3 +143,8 @@ descriptor must not appear at all.
 - The `runner` writes its output paths **relatively** so a `cd $(RUNDIR)` in the
   `make test`/`check` target redirects them under the run dir (see the Makefile
   contract in `phase_02_generate.md` / the `generate-generate` SKILL).
+- The `runner` is **always** invoked with `--cases <spec.ir.yaml> <case_id>...`:
+  by `run_program` directly and by the `make test`/`check` target (which forwards
+  the same argv, so the re-run's `diagnostics.json` equals `run_program`'s). It
+  may treat a missing `--cases` as a hard error (no no-argv mode needed); it takes
+  the spec path positionally and need not read the spec file.

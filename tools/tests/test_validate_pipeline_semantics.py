@@ -27,6 +27,7 @@ from tools.validate_pipeline_semantics import (
     _impl_toolchain_from_pipeline_dir,
     _validate_generate_lint_command_logs,
     _validate_makefile_test_no_relink,
+    _validate_makefile_test_invokes_cases,
     _validate_source_meta_json_files,
     validate,
     validate_compile_stage,
@@ -8788,6 +8789,254 @@ class MakefileBinNotPinnedTest(unittest.TestCase):
         refs = wc.NodeRefs(node_key="component/foo@0.1.0", spec_path="spec/component/foo",
                            ir_id="i", pipeline_id="p", source_id="s", binary_id="b")
         self.assertEqual(c._resolve_exe_name(refs), "foo_runner")
+
+
+class MakefileTestInvokesCasesTest(unittest.TestCase):
+    """post_generate gate: the `test`/`check` target must invoke the runner with
+    `--cases $(SPEC) $(CASES)` so the make-test re-run matches run_program's argv.
+    A bare invocation makes the runner abort (no `--cases`) -> the make-test
+    candidate emits no diagnostics.json -> quality_check verdict_available=false
+    -> Validate.execute fail (orch_20260629T065607Z_011f8fc6)."""
+
+    def _run(
+        self,
+        makefile_text: str,
+        build_system: str = "make",
+        language: str = "fortran",
+    ) -> list[str]:
+        with tempfile.TemporaryDirectory() as tmp:
+            src_dir = Path(tmp)
+            (src_dir / "Makefile").write_text(makefile_text, encoding="utf-8")
+            violations: list[str] = []
+            _validate_makefile_test_invokes_cases(
+                src_dir, violations, build_system=build_system, language=language
+            )
+            return violations
+
+    def test_bare_test_target_is_flagged(self) -> None:
+        makefile = (
+            "BINDIR ?= .\n"
+            "RUNDIR ?= .\n"
+            "BIN ?= app_runner\n"
+            "test:\n"
+            "\ttest -x $(BINDIR)/$(BIN) || { echo \"error: $(BINDIR)/$(BIN) not built\" >&2; exit 1; }\n"
+            "\tmkdir -p $(RUNDIR)/raw/state_snapshots\n"
+            "\tcd $(RUNDIR) && $(BINDIR)/$(BIN)\n"
+        )
+        violations = self._run(makefile)
+        self.assertTrue(
+            any("test target does not invoke" in v for v in violations),
+            f"bare test target must be flagged; got: {violations}",
+        )
+
+    def test_hardcoded_cases_ignoring_env_is_flagged(self) -> None:
+        # A run that hardcodes `--cases <spec> <ids>` instead of forwarding
+        # $(SPEC)/$(CASES) ignores the env Validate.execute injects, so make test
+        # would run a different spec/case set than run_program — must be flagged.
+        makefile = (
+            "BINDIR ?= .\n"
+            "RUNDIR ?= .\n"
+            "BIN ?= app_runner\n"
+            "test:\n"
+            "\tcd $(RUNDIR) && $(BINDIR)/$(BIN) --cases spec.ir.yaml c_old\n"
+        )
+        violations = self._run(makefile)
+        self.assertTrue(
+            any("test target does not invoke" in v for v in violations),
+            f"hardcoded --cases (ignoring $(SPEC)/$(CASES)) must be flagged; got: {violations}",
+        )
+
+    def test_missing_cases_var_but_spec_present_is_flagged(self) -> None:
+        # Forwarding only $(SPEC) (no $(CASES)) still desyncs the case set.
+        makefile = (
+            "BINDIR ?= .\n"
+            "RUNDIR ?= .\n"
+            "BIN ?= app_runner\n"
+            "SPEC ?= spec.ir.yaml\n"
+            "test:\n"
+            "\tcd $(RUNDIR) && $(BINDIR)/$(BIN) --cases $(SPEC) c_old\n"
+        )
+        violations = self._run(makefile)
+        self.assertTrue(
+            any("test target does not invoke" in v for v in violations),
+            f"missing $(CASES) must be flagged; got: {violations}",
+        )
+
+    def test_cases_invocation_is_accepted(self) -> None:
+        makefile = (
+            "BINDIR ?= .\n"
+            "RUNDIR ?= .\n"
+            "BIN ?= app_runner\n"
+            "SPEC ?= spec.ir.yaml\n"
+            "CASES ?= c_alpha c_beta\n"
+            "test:\n"
+            "\ttest -x $(BINDIR)/$(BIN) || { echo \"error: $(BINDIR)/$(BIN) not built\" >&2; exit 1; }\n"
+            "\tmkdir -p $(RUNDIR)/raw/state_snapshots\n"
+            "\tcd $(RUNDIR) && $(BINDIR)/$(BIN) --cases $(SPEC) $(CASES)\n"
+        )
+        self.assertEqual([], self._run(makefile))
+
+    def test_helper_target_bare_run_is_flagged(self) -> None:
+        # `make test` runs the recipes of test's prerequisites too; a bare run in a
+        # delegated helper target must be traced and flagged.
+        makefile = (
+            "BINDIR ?= .\n"
+            "RUNDIR ?= .\n"
+            "BIN ?= app_runner\n"
+            "test: run-qc\n"
+            "run-qc:\n"
+            "\tcd $(RUNDIR) && $(BINDIR)/$(BIN)\n"
+        )
+        violations = self._run(makefile)
+        self.assertTrue(
+            any("test target does not invoke" in v for v in violations),
+            f"bare run in delegated helper target must be flagged; got: {violations}",
+        )
+
+    def test_helper_target_compliant_is_accepted(self) -> None:
+        makefile = (
+            "BINDIR ?= .\n"
+            "RUNDIR ?= .\n"
+            "BIN ?= app_runner\n"
+            "SPEC ?= spec.ir.yaml\n"
+            "CASES ?= c_alpha\n"
+            "test: run-qc\n"
+            "run-qc:\n"
+            "\tcd $(RUNDIR) && $(BINDIR)/$(BIN) --cases $(SPEC) $(CASES)\n"
+        )
+        self.assertEqual([], self._run(makefile))
+
+    def test_build_prerequisite_is_not_a_false_run(self) -> None:
+        # The binary's own build/link rule (reachable as a prerequisite) must NOT be
+        # misread as a runner invocation — only genuine runs count.
+        makefile = (
+            "BINDIR ?= .\n"
+            "RUNDIR ?= .\n"
+            "BIN ?= app_runner\n"
+            "SPEC ?= spec.ir.yaml\n"
+            "CASES ?= c_alpha\n"
+            "FC := gfortran\n"
+            "$(BINDIR)/$(BIN): main.o\n"
+            "\t$(FC) main.o -o $(BINDIR)/$(BIN)\n"
+            "test: $(BINDIR)/$(BIN)\n"
+            "\tcd $(RUNDIR) && $(BINDIR)/$(BIN) --cases $(SPEC) $(CASES)\n"
+        )
+        self.assertEqual([], self._run(makefile))
+
+    def test_quoted_spec_cases_is_accepted(self) -> None:
+        # Shell-quoted forwarding (`--cases "$(SPEC)" "$(CASES)"`) still forwards the
+        # env vars and must NOT be flagged: compliance is checked on the non-quote-
+        # stripped run segment.
+        makefile = (
+            "BINDIR ?= .\n"
+            "RUNDIR ?= .\n"
+            "BIN ?= app_runner\n"
+            "SPEC ?= spec.ir.yaml\n"
+            "CASES ?= c_alpha\n"
+            "test:\n"
+            "\tcd $(RUNDIR) && $(BINDIR)/$(BIN) --cases \"$(SPEC)\" \"$(CASES)\"\n"
+        )
+        self.assertEqual([], self._run(makefile))
+
+    def test_aliased_bare_runner_is_flagged(self) -> None:
+        # A runner factored through a make variable (`RUNNER = $(BINDIR)/$(BIN)`) is
+        # still a run after expansion; a bare aliased invocation must be flagged.
+        makefile = (
+            "BINDIR ?= .\n"
+            "RUNDIR ?= .\n"
+            "BIN ?= app_runner\n"
+            "RUNNER = $(BINDIR)/$(BIN)\n"
+            "test:\n"
+            "\tcd $(RUNDIR) && $(RUNNER)\n"
+        )
+        violations = self._run(makefile)
+        self.assertTrue(
+            any("test target does not invoke" in v for v in violations),
+            f"bare aliased runner must be flagged; got: {violations}",
+        )
+
+    def test_aliased_compliant_runner_is_accepted(self) -> None:
+        # When the whole command (incl. --cases $(SPEC) $(CASES)) is aliased, expansion
+        # reveals the forwarded vars, so it must NOT be flagged.
+        makefile = (
+            "BINDIR ?= .\n"
+            "RUNDIR ?= .\n"
+            "BIN ?= app_runner\n"
+            "SPEC ?= spec.ir.yaml\n"
+            "CASES ?= c_alpha\n"
+            "RUNNER = $(BINDIR)/$(BIN) --cases $(SPEC) $(CASES)\n"
+            "test:\n"
+            "\tcd $(RUNDIR) && $(RUNNER)\n"
+        )
+        self.assertEqual([], self._run(makefile))
+
+    def test_cases_on_continuation_line_is_accepted(self) -> None:
+        # A correct invocation that line-wraps with a trailing `\` must NOT be flagged:
+        # the --cases token lands on the continuation, so the scanner must fold the
+        # logical recipe line before checking.
+        makefile = (
+            "BINDIR ?= .\n"
+            "RUNDIR ?= .\n"
+            "BIN ?= app_runner\n"
+            "SPEC ?= spec.ir.yaml\n"
+            "CASES ?= c_alpha\n"
+            "test:\n"
+            "\tcd $(RUNDIR) && $(BINDIR)/$(BIN) \\\n"
+            "\t  --cases $(SPEC) $(CASES)\n"
+        )
+        self.assertEqual([], self._run(makefile))
+
+    def test_same_line_guard_and_bare_run_is_flagged(self) -> None:
+        # A guard and a bare run sharing one line (`test -x ... && cd ... && $(BIN)`)
+        # must still be flagged: the test -x exclusion is per-segment, not per-line.
+        makefile = (
+            "BINDIR ?= .\n"
+            "RUNDIR ?= .\n"
+            "BIN ?= app_runner\n"
+            "test:\n"
+            "\ttest -x $(BINDIR)/$(BIN) && cd $(RUNDIR) && $(BINDIR)/$(BIN)\n"
+        )
+        violations = self._run(makefile)
+        self.assertTrue(
+            any("test target does not invoke" in v for v in violations),
+            f"guard+bare-run on one line must be flagged; got: {violations}",
+        )
+
+    def test_check_target_without_cases_is_flagged(self) -> None:
+        makefile = (
+            "BINDIR ?= .\n"
+            "RUNDIR ?= .\n"
+            "BIN ?= app_runner\n"
+            "check:\n"
+            "\tcd $(RUNDIR) && $(BINDIR)/$(BIN)\n"
+        )
+        violations = self._run(makefile)
+        self.assertTrue(
+            any("check target does not invoke" in v for v in violations),
+            f"bare check target must be flagged; got: {violations}",
+        )
+
+    def test_guard_only_recipe_is_not_flagged(self) -> None:
+        # The `test -x $(BINDIR)/$(BIN)` existence guard mentions the binary but does
+        # not run it; a test target whose only binary reference is the guard (no run
+        # line) must not be flagged for a missing --cases.
+        makefile = (
+            "BINDIR ?= .\n"
+            "BIN ?= app_runner\n"
+            "test:\n"
+            "\ttest -x $(BINDIR)/$(BIN) || { echo \"error: $(BINDIR)/$(BIN) not built\" >&2; exit 1; }\n"
+        )
+        self.assertEqual([], self._run(makefile))
+
+    def test_non_make_toolchain_is_skipped(self) -> None:
+        makefile = (
+            "BINDIR ?= .\n"
+            "BIN ?= app_runner\n"
+            "test:\n"
+            "\tcd $(RUNDIR) && $(BINDIR)/$(BIN)\n"
+        )
+        self.assertEqual([], self._run(makefile, build_system="cmake", language="cpp"))
+        self.assertEqual([], self._run(makefile, build_system="make", language="python"))
 
 
 class MakefileTestNoRelinkTest(unittest.TestCase):

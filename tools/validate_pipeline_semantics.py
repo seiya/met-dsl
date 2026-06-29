@@ -1881,6 +1881,144 @@ def _validate_makefile_test_no_relink(
                 break
 
 
+def _validate_makefile_test_invokes_cases(
+    src_dir: Path,
+    violations: list[str],
+    build_system: str | None = None,
+    language: str | None = None,
+) -> None:
+    """Flag a ``test``/``check`` target whose recipe runs the runner binary but
+    does NOT forward ``--cases $(SPEC) $(CASES)``.
+
+    ``Validate.execute`` runs the binary two ways and compares them for value
+    equality (``quality_check.json``): ``run_program`` invokes it as
+    ``--cases <spec.ir.yaml> <case_id>...`` and ``make test`` must invoke it the
+    same way. The conductor injects ``SPEC``/``CASES`` via the make-test env so
+    the canonical recipe ``$(BINDIR)/$(BIN) --cases $(SPEC) $(CASES)`` is
+    byte-identical to ``run_program``. Two recipes desync the two invocations and
+    are flagged: (a) a bare run (no ``--cases``) — the runner aborts, the
+    candidate emits no ``diagnostics.json`` (``verdict_available=false``); and
+    (b) a run that hardcodes ``--cases <spec> <ids>`` instead of referencing the
+    ``$(SPEC)``/``$(CASES)`` variables — the env override has no effect and make
+    test runs a different spec/case set than ``run_program`` (wrong-evidence
+    comparison). The conductor-authored fortran Makefile already satisfies this;
+    the check guards the LLM-authored c/cpp/mixed path. Best-effort static parse —
+    the runtime ``quality_check`` is the deterministic backstop. Scoped to the
+    make-based quality-check toolchains (same as the no-relink check)."""
+    if build_system != "make" or language not in MAKE_QUALITY_CHECK_REQUIRED_LANGUAGES:
+        return
+    if not src_dir.is_dir():
+        return
+    makefile_path = src_dir / "Makefile"
+    if not makefile_path.exists():
+        return
+
+    text = makefile_path.read_text(encoding="utf-8", errors="ignore")
+    full_var_map = _makefile_full_var_map(text)
+    recipes = _makefile_target_recipes(text, full_var_map)
+    binary_basename = _normalize_make_token(_expand_make_vars("$(BIN)", full_var_map))
+
+    # `make test` also runs the recipes of `test`/`check`'s prerequisite targets, so
+    # a recipe that delegates the run to a helper (`test: run-qc`, run in `run-qc`)
+    # must be traced. Build/relink targets (the binary itself + any compile/link
+    # recipe) are EXCLUDED from the trace so a `$(FC) … -o $(BINDIR)/$(BIN)` line is
+    # not misread as a runner invocation (their no-build-prerequisite contract is the
+    # separate `_validate_makefile_test_no_relink` gate's concern).
+    rules = _parse_makefile_rules(text)
+    build_targets = set(_makefile_relinking_recipe_targets(recipes, full_var_map))
+    if binary_basename:
+        build_targets.add(binary_basename)
+
+    def _run_recipe_lines(entrypoint: str) -> list[str]:
+        seen: set[str] = set()
+        stack = [entrypoint]
+        collected: list[str] = []
+        while stack:
+            t = stack.pop()
+            if t in seen or t in build_targets:
+                continue
+            seen.add(t)
+            collected.extend(recipes.get(t, []))
+            stack.extend(rules.get(t, ()))
+        return collected
+
+    def _logical_recipe_lines(lines: list[str]) -> list[str]:
+        # Fold trailing-`\` continuations so an invocation wrapped across physical
+        # lines (`… $(BIN) \` / `  --cases …`) is scanned as one logical command.
+        logical: list[str] = []
+        buf = ""
+        for raw in lines:
+            chunk = raw.lstrip("\t")
+            if chunk.rstrip().endswith("\\"):
+                buf += chunk.rstrip()[:-1] + " "
+                continue
+            logical.append((buf + chunk).strip())
+            buf = ""
+        if buf.strip():
+            logical.append(buf.strip())
+        return logical
+
+    def _segment_is_noise(seg: str) -> bool:
+        # A segment that does not RUN the binary: the `test -x`/`[ -x ]` existence
+        # guard or an `echo`/`printf` message (which may mention `$(BIN)` in its text,
+        # e.g. the fail-closed guard's error string). Make recipe prefixes (`@`/`-`/
+        # `+`) and a leading `{` (from `|| { echo … }`) are trimmed first.
+        s = seg.strip().lower().lstrip("@-+{ \t")
+        return (s.startswith("test ") or s.startswith("test\t") or s.startswith("[")
+                or s.startswith("echo ") or s.startswith("echo\t") or s == "echo"
+                or s.startswith("printf"))
+
+    # Expand make variables (so a runner aliased via `RUNNER = $(BINDIR)/$(BIN)` is
+    # still detected as a run) but PRESERVE `SPEC`/`CASES`: their `$(SPEC)`/`$(CASES)`
+    # references must survive verbatim so the compliance check can confirm the recipe
+    # forwards the env-injected values rather than hardcoding a spec/case list.
+    for tgt in _PHONY_TEST_TARGETS:
+        if tgt not in recipes and tgt not in rules:
+            continue
+        recipe_lines = _run_recipe_lines(tgt)
+        if not recipe_lines:
+            continue
+        runs_binary = False
+        noncompliant_run = False
+        for line in _logical_recipe_lines(recipe_lines):
+            expanded = _expand_make_vars(
+                line, full_var_map, preserve={"SPEC", "CASES"})
+            # Remove quote CHARACTERS (keep the content) so a shell-quoted forward
+            # `--cases "$(SPEC)" "$(CASES)"` still exposes the `$(SPEC)`/`$(CASES)`
+            # tokens, while a `;`/`|` inside a (now-unquoted) echo message that splits
+            # a segment is harmless because echo segments are classified as noise.
+            cleaned = expanded.replace('"', "").replace("'", "").replace("`", "").lower()
+            # Split into shell command segments; compliance is checked on the SEGMENT
+            # that runs the binary (not the whole line) so an echo mentioning `--cases`
+            # elsewhere does not mask a bare run.
+            for seg in re.split(r"&&|\|\||;|\|", cleaned):
+                invokes = "$(bin)" in seg or "$(bindir)" in seg
+                if not invokes and binary_basename:
+                    invokes = re.search(
+                        rf"\b{re.escape(binary_basename)}\b", seg) is not None
+                if not invokes or _segment_is_noise(seg):
+                    continue
+                runs_binary = True
+                # Compliant iff the run forwards the env-injected SPEC/CASES vars; a
+                # bare run (no `--cases`) OR a hardcoded `--cases spec.ir.yaml c_old`
+                # that ignores the env override both desync make test from run_program.
+                forwards_spec = "$(spec)" in seg or "${spec}" in seg
+                forwards_cases = "$(cases)" in seg or "${cases}" in seg
+                if not ("--cases" in seg and forwards_spec and forwards_cases):
+                    noncompliant_run = True
+        if runs_binary and noncompliant_run:
+            violations.append(
+                f"{makefile_path}: {tgt} target does not invoke the runner as "
+                "`$(BINDIR)/$(BIN) --cases $(SPEC) $(CASES)` — the recipe must forward "
+                "the `$(SPEC)`/`$(CASES)` make variables (a bare run, or a hardcoded "
+                "`--cases <spec> <ids>` that ignores them, desyncs make test from "
+                "run_program: the runner requires `--cases`, and Validate.execute "
+                "injects the authoritative SPEC/CASES via the env, which override the "
+                "`?=` defaults kept for local use) "
+                "(docs/workflow/RUNNER_OUTPUT_CONTRACT.md §5 / phase_04_validate.md §4-1)"
+            )
+
+
 def _validate_problem_runner_diagnostics_dependency(
     execution: NodeExecution,
     runner_file: Path,
@@ -3652,6 +3790,9 @@ def _validate_generate_outputs(
     _validate_makefile_test_no_relink(
         src_dir, violations, build_system=_build_system, language=_language
     )
+    _validate_makefile_test_invokes_cases(
+        src_dir, violations, build_system=_build_system, language=_language
+    )
 
 
 # Fortran 2008 (and the earlier standards the generated code targets) limit a
@@ -3817,6 +3958,9 @@ def _validate_generate_outputs_for_generation(
         repo_root, execution.pipeline_dir
     )
     _validate_makefile_test_no_relink(
+        src_dir, violations, build_system=_build_system, language=_language
+    )
+    _validate_makefile_test_invokes_cases(
         src_dir, violations, build_system=_build_system, language=_language
     )
     runner_files = sorted(src_dir.glob("*_runner.f90"))
@@ -8223,6 +8367,9 @@ def _validate_post_build_stage_impl(
     _validate_fortran_makefile_src_dir(src_dir, violations)
     _build_system, _language = _impl_toolchain_from_pipeline_dir(repo_root, pipeline_dir)
     _validate_makefile_test_no_relink(
+        src_dir, violations, build_system=_build_system, language=_language
+    )
+    _validate_makefile_test_invokes_cases(
         src_dir, violations, build_system=_build_system, language=_language
     )
     return violations

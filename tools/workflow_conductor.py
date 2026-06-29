@@ -1079,6 +1079,12 @@ class Conductor:
         model = f"{refs.spec_id}_model"
         runner = f"{refs.spec_id}_runner"
         exe = self._resolve_exe_name(refs)  # canonical <spec_id>_runner
+        # CASES default baked from the IR so a local `make all test` runs the full
+        # case set standalone; Validate.execute overrides CASES/SPEC via the env so
+        # `make test` invokes the runner identically to run_program (`--cases <spec>
+        # <case_id>...`). The runner takes the spec path positionally but does not
+        # read it, so the `SPEC ?=` default is a harmless placeholder.
+        cases_default = " ".join(self.read_case_ids(refs))
         flags = f"-std={standard} -O2"
         if backend == "openmp":
             flags += " -fopenmp"
@@ -1116,6 +1122,9 @@ class Conductor:
 # FC is pinned with := (not ?=): make ships a built-in FC=f77 (origin default), and ?= does
 # NOT override a default-origin variable, so `FC ?= gfortran` would silently leave FC=f77.
 # The dirs/BIN stay ?= because Build/Validate.execute inject them via command line / env.
+# SPEC/CASES stay ?= because Validate.execute injects them via the make-test env so the
+# `make test` re-run invokes the runner identically to run_program (`--cases <spec> <ids>`);
+# the ?= defaults keep a local `make all test` runnable standalone.
 FC      := gfortran
 OBJDIR  ?= .
 BINDIR  ?= .
@@ -1123,6 +1132,8 @@ RUNDIR  ?= .
 FFLAGS  ?= {flags}
 
 BIN ?= {exe}
+SPEC ?= spec.ir.yaml
+CASES ?= {cases_default}
 
 MODEL_SRC  = {model}.f90
 RUNNER_SRC = {runner}.f90
@@ -1153,7 +1164,7 @@ $(sort $(OBJDIR) $(BINDIR)):
 test:
 \ttest -x $(BINDIR)/$(BIN) || {{ echo "error: $(BINDIR)/$(BIN) not built; run 'make all' first" >&2; exit 1; }}
 \tmkdir -p $(RUNDIR)/raw/state_snapshots
-\tcd $(RUNDIR) && $(BINDIR)/$(BIN)
+\tcd $(RUNDIR) && $(BINDIR)/$(BIN) --cases $(SPEC) $(CASES)
 
 clean:
 \trm -f $(OBJDIR)/*.o $(OBJDIR)/*.mod $(BINDIR)/$(BIN)
@@ -2033,11 +2044,18 @@ clean:
             # `$(BINDIR)/$(BIN)` guard resolves the same binary Build produced. make_test
             # passes overrides via the environment only, which overrides the Makefile's
             # `BIN ?=` form (enforced by post_generate).
+            # SPEC/CASES imposed so `make test` invokes the runner identically to
+            # run_program (`--cases <spec.ir.yaml> <case_id>...`) — without this the test
+            # target's `--cases $(SPEC) $(CASES)` would fall back to the Makefile's baked
+            # defaults; pinning them to the authoritative run_program spec/case set keeps the
+            # quality_check a true apples-to-apples value comparison (the runner requires
+            # `--cases` and aborts without it).
             # No dependency-source staging here (unlike _build_inproc): `make test` only runs
             # the already-built binary (the `test:` target has no build prerequisite, so it
             # never recompiles), so the closure `.f90`/`.mod` are not needed in OBJDIR.
             "env": {"OBJDIR": str(obj_tmp), "BINDIR": str(bin_dir),
-                    "RUNDIR": str(qc_tmp), "BIN": str(exe)},
+                    "RUNDIR": str(qc_tmp), "BIN": str(exe),
+                    "SPEC": str(ir_spec), "CASES": " ".join(case_ids)},
             "command_log_path": str(qc_cmd_log),
             "capture_limit": _FULL_CAPTURE_LIMIT,
             **gate_args,
@@ -2113,6 +2131,18 @@ clean:
                        + gate.stdout + gate.stderr)
             if snapshot_gap:
                 stderr += "\n" + snapshot_gap
+            # Actionable cause when the make-test candidate emitted no diagnostics/verdict:
+            # the `test` target must invoke the runner with `--cases $(SPEC) $(CASES)` (the
+            # runner requires `--cases` and aborts without it). run_program's diagnostics
+            # being present while the candidate's is absent isolates the test-target form as
+            # the cause rather than a buggy runner.
+            if qc_status != "pass" and not qc_diag.get("verdict") and run_diag.get("verdict"):
+                stderr += (
+                    "\n[execute fail: quality_check] the make-test re-run emitted no "
+                    "diagnostics.json/verdict while run_program's is present — the Makefile "
+                    "`test`/`check` target must invoke the runner with `--cases $(SPEC) "
+                    "$(CASES)` (the runner requires `--cases`); see "
+                    "docs/workflow/RUNNER_OUTPUT_CONTRACT.md §5 / phase_04_validate.md §4-1.")
             trial_meta["status"] = "fail"
             (node_dir / "trial_meta.json").write_text(
                 json.dumps(trial_meta, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")

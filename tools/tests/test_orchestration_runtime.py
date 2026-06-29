@@ -24396,7 +24396,11 @@ class ChildContextDocSizeTests(unittest.TestCase):
         # rank-≥2 must still shape-match its shape_expr) + correct/wrong examples,
         # after an E2E top-node validate.execute failure where the runner dropped
         # required x,z from an xfail snapshot.
-        "docs/workflow/RUNNER_OUTPUT_CONTRACT.md": 8100,
+        # Bumped 8100->8500: §5 stated the always-`--cases` invocation contract (the
+        # runner may require `--cases`; make test forwards the same argv) after an E2E
+        # validate.execute failure where a bare `make test` aborted a `--cases`-only
+        # runner (orch_20260629T065607Z_011f8fc6).
+        "docs/workflow/RUNNER_OUTPUT_CONTRACT.md": 8500,
         # Still force-read by compile.generate/verify (its IR schema is the contract
         # the compile SKILL defers to).
         "docs/workflow/phases/phase_01_compile.md": 17000,
@@ -24406,8 +24410,14 @@ class ChildContextDocSizeTests(unittest.TestCase):
         # Bumped 22000->22400: inlined the leaf-actionable C003 directive placement
         # + the f2008 63-char identifier limit (previously only in phase_02, which
         # generate.generate no longer force-reads) to avoid a lint/build round-trip.
-        "skills/workflow-generate-generate/SKILL.md": 22400,
-        "skills/workflow-generate-verify/SKILL.md": 21400,
+        # Bumped 22400->22700: test/check target must invoke the runner with
+        # `--cases $(SPEC) $(CASES)` (orch_20260629T065607Z_011f8fc6).
+        "skills/workflow-generate-generate/SKILL.md": 22700,
+        # Bumped 21400->21700: the test/check target must invoke the runner with
+        # `--cases $(SPEC) $(CASES)` (the runner aborts without it; make test must
+        # match run_program's argv) after a validate.execute failure where a bare
+        # `make test` aborted a `--cases`-only runner (orch_20260629T065607Z_011f8fc6).
+        "skills/workflow-generate-verify/SKILL.md": 21700,
         "skills/workflow-validate-judge/SKILL.md": 10000,
     }
 

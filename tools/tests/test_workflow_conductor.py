@@ -1872,6 +1872,12 @@ class WriteMakefileTest(unittest.TestCase):
             self.assertTrue(mk.is_file())
             text = mk.read_text(encoding="utf-8")
             self.assertIn("BIN ?= foo_bar_runner", text)
+            # SPEC/CASES are ?= overridable (Validate.execute injects the authoritative
+            # values; the defaults keep a local `make all test` runnable).
+            self.assertIn("SPEC ?= spec.ir.yaml", text)
+            self.assertIn("CASES ?=", text)
+            # the test recipe invokes the runner with --cases (same argv as run_program)
+            self.assertIn("$(BINDIR)/$(BIN) --cases $(SPEC) $(CASES)", text)
             self.assertIn("-std=f2008 -O2 -fopenmp -J$(OBJDIR) -I$(OBJDIR)", text)
             self.assertIn("$(RUNNER_OBJ): $(RUNNER_SRC) $(MODEL_OBJ)", text)
             self.assertIn(
@@ -1888,7 +1894,7 @@ class WriteMakefileTest(unittest.TestCase):
     def test_authored_makefile_passes_post_generate_validators(self) -> None:
         from tools.validate_pipeline_semantics import (
             _validate_fortran_makefile_src_dir, _validate_makefile_bin_overridable,
-            _validate_makefile_test_no_relink)
+            _validate_makefile_test_invokes_cases, _validate_makefile_test_no_relink)
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp)
             refs = self._refs()
@@ -1906,6 +1912,7 @@ class WriteMakefileTest(unittest.TestCase):
             _validate_makefile_bin_overridable(mk, mk.read_text(encoding="utf-8"), violations)
             _validate_fortran_makefile_src_dir(src, violations)
             _validate_makefile_test_no_relink(src, violations, build_system="make", language="fortran")
+            _validate_makefile_test_invokes_cases(src, violations, build_system="make", language="fortran")
             self.assertEqual(violations, [])
 
     def test_no_fopenmp_when_backend_not_openmp(self) -> None:
@@ -2437,6 +2444,57 @@ class DeterministicBuildTest(unittest.TestCase):
                 c._build_inproc(refs, "child-1", "captok")
 
             self.assertIn("BIN=spec_x_runner", captured["extra_args"])
+
+    def test_execute_inproc_injects_spec_and_cases_env(self) -> None:
+        # Validate.execute must run `make test` with the SAME runner argv run_program uses
+        # (--cases <spec> <case_id>...), so the make-test re-run's diagnostics match for the
+        # quality_check value comparison. The conductor imposes SPEC/CASES via the make-test
+        # env (the test target invokes `$(BINDIR)/$(BIN) --cases $(SPEC) $(CASES)`).
+        import sys
+        import tempfile
+        from unittest import mock
+        sys.path.insert(0, str(Path("mcp_servers").resolve()))
+        import build_runtime_server  # type: ignore
+
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            c = wc.Conductor(repo_root=repo, orchestration_id="t",
+                             orchestration_agent_run_id="x", backend="claude", env={})
+            refs = wc.NodeRefs(
+                node_key="component/spec_x@0.1.0", spec_path="spec/component/spec_x",
+                ir_id="x_1", pipeline_id="x_1", source_id="src_1", binary_id="bin_1",
+                run_id="run_1", source_binary_id="bin_1")
+            (repo / refs.ir_ref).mkdir(parents=True, exist_ok=True)
+            (repo / refs.ir_ref / "spec.ir.yaml").write_text(
+                "impl_defaults:\n"
+                "  toolchain:\n    language: fortran\n    standard: f2008\n"
+                "    build_system: make\n"
+                "  target:\n    class: cpu\n    backend: openmp\n"
+                "case:\n  test_case_set:\n    - case_id: c_alpha\n    - case_id: c_beta\n",
+                encoding="utf-8")
+            (repo / refs.source_dir() / "src").mkdir(parents=True, exist_ok=True)
+
+            captured: dict = {}
+
+            def fake_run_program(args):
+                return {"ok": True, "command_id": "R"}
+
+            def fake_run_quality_checks(args):
+                captured["env"] = dict(args.get("env") or {})
+                return {"ok": True, "command_id": "Q"}
+
+            with mock.patch.object(build_runtime_server, "tool_run_program", fake_run_program), \
+                 mock.patch.object(build_runtime_server, "tool_run_quality_checks", fake_run_quality_checks):
+                try:
+                    c._execute_inproc(refs, "child-1", "captok")
+                except Exception:
+                    pass  # downstream promotion/gates are irrelevant; env is captured above
+
+            env = captured["env"]
+            self.assertEqual(
+                env["SPEC"], str((repo / refs.ir_ref / "spec.ir.yaml").resolve()))
+            self.assertEqual(env["CASES"], "c_alpha c_beta")  # read_case_ids is sorted
+            self.assertEqual(env["BIN"], "spec_x_runner")
 
     def test_build_content_failure_routes_to_generate_not_transport(self) -> None:
         # Codex finding 1: a build content failure (rc 0 + binary_meta verification_status
