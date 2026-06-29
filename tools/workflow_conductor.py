@@ -2467,8 +2467,21 @@ clean:
 
         outcomes: list[SubstepOutcome] = []
         for i, substep in enumerate(SUBSTEPS[phase]):
+            # Surface substep activity on the host stdout event stream so an
+            # operator sees per-substep progress (the phase-level emits alone
+            # leave a long gap during multi-substep phases like generate). The
+            # build phase has no substep (SUBSTEPS["build"] == (None,)); use
+            # the agent_role label "step" so the line still reads cleanly.
+            substep_label = substep or "step"
+            substep_started = time.monotonic()
+            self.emit("substep_start", node_key=refs.node_key, phase=phase,
+                      substep=substep_label, attempt=i + 1)
             oc = self.run_substep(refs, phase, substep, repair=repair if i == 0 else None,
                                   resolved_dependencies=dep_facts)
+            self.emit("substep_complete", node_key=refs.node_key, phase=phase,
+                      substep=substep_label, result=oc.status,
+                      agent_run_id=oc.agent_run_id,
+                      elapsed_seconds=round(time.monotonic() - substep_started, 2))
             outcomes.append(oc)
             if oc.status != "pass":
                 break

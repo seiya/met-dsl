@@ -814,6 +814,20 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
         action="store_false",
         help="Prepare orchestration artifacts only; do not run the conductor.",
     )
+    parser.add_argument(
+        "--stdout-format",
+        choices=("human", "jsonl"),
+        default="human",
+        help=(
+            "Stdout output format for the orchestration event stream. 'human' "
+            "(default) renders the node/phase/substep events as compact human-"
+            "readable lines so an operator can follow progress at a glance. "
+            "'jsonl' emits the raw structured JSON payload of every event "
+            "(suitable for piping into a parser). Regardless of this flag, the "
+            "run_logs/ jsonl file under the orchestration directory always "
+            "receives the full raw JSON payload of every event."
+        ),
+    )
     return parser.parse_args(argv)
 
 
@@ -1086,6 +1100,7 @@ def main(argv: list[str] | None = None) -> int:
             agent_model=args.agent_model,
             status=args.status,
             invoke_llm=args.invoke_llm,
+            stdout_format=args.stdout_format,
         )
 
     return _run_node(
@@ -1102,37 +1117,210 @@ def main(argv: list[str] | None = None) -> int:
         status=args.status,
         invoke_llm=args.invoke_llm,
         resume_mode=resume_mode,
+        stdout_format=args.stdout_format,
     )
 
 
+def _format_event_human(payload: dict[str, Any]) -> str | None:
+    """Render a structured event payload as a compact human-readable line.
+
+    The event vocabulary is small and stable: the node/dependency announcements
+    written here by run_workflow.py, the conductor's `phase_start` /
+    `phase_complete` / `substep_start` / `substep_complete` / warn emits, and
+    the run's final `status: ok` / `status: fail` summary. An unknown payload
+    shape returns None so the caller can fall back to the raw JSON — the
+    human-mode formatter is best-effort presentation and must not swallow
+    information it cannot classify.
+
+    Indentation conveys nesting: node = column 0, phase = 2 spaces, substep /
+    warn = 4 spaces. Pass results are tagged `ok`; non-pass results carry the
+    raw verdict text (`fail`, `fail_closed`, `blocked`, ...) so the operator
+    sees the actual classification rather than a uniform red flag.
+    """
+    status = payload.get("status")
+    event = payload.get("event")
+
+    if status == "info" and event == "node_start":
+        spec = payload.get("spec_ref", "?")
+        until = payload.get("until_phase", "?")
+        orch = payload.get("orchestration_id", "?")
+        flag = " [resume]" if payload.get("resume") else ""
+        return f"[node] spec={spec} until={until} orch={orch}{flag}"
+
+    if status == "info" and event == "dependency_node_begin":
+        node = payload.get("node", "?")
+        spec = payload.get("spec_ref", "?")
+        until = payload.get("until_phase", "?")
+        orch = payload.get("orchestration_id", "?")
+        return f"[dep ] node={node} spec={spec} until={until} orch={orch}"
+
+    if status == "info" and event == "phase_start":
+        phase = payload.get("phase", "?")
+        attempt = payload.get("attempt", 1)
+        return f"  [phase   ] {phase} (attempt {attempt})"
+
+    if status == "info" and event == "phase_complete":
+        phase = payload.get("phase", "?")
+        result = payload.get("result", "?")
+        if result == "skipped":
+            return f"  [phase   ] {phase} skipped (resumed)"
+        marker = "ok" if result == "pass" else result
+        elapsed = payload.get("elapsed_seconds")
+        suffix = f" ({elapsed}s)" if elapsed is not None else ""
+        return f"  [phase   ] {phase} {marker}{suffix}"
+
+    if status == "info" and event == "substep_start":
+        phase = payload.get("phase", "?")
+        substep = payload.get("substep") or "step"
+        return f"    [substep] {phase}.{substep} ..."
+
+    if status == "info" and event == "substep_complete":
+        phase = payload.get("phase", "?")
+        substep = payload.get("substep") or "step"
+        result = payload.get("result", "?")
+        marker = "ok" if result == "pass" else result
+        elapsed = payload.get("elapsed_seconds")
+        suffix = f" ({elapsed}s)" if elapsed is not None else ""
+        arid = payload.get("agent_run_id")
+        arid_suffix = f" arid={arid}" if arid and result != "pass" else ""
+        return f"    [substep] {phase}.{substep} {marker}{suffix}{arid_suffix}"
+
+    if status == "info" and event == "resume_session_unavailable":
+        phase = payload.get("phase", "?")
+        substep = payload.get("substep") or "?"
+        target = payload.get("target", "?")
+        return f"    [warn   ] resume session unavailable: {phase}.{substep} target={target}"
+
+    if status == "info" and event == "diagnose_launch_failed":
+        phase = payload.get("phase", "?")
+        err = payload.get("error", "")
+        return f"    [warn   ] diagnose launch failed in {phase}: {err}"
+
+    if status == "ok":
+        orch = payload.get("orchestration_id", "?")
+        ws = payload.get("workflow_status") or "ok"
+        invoked = payload.get("llm_invoked")
+        suffix = "" if invoked is None else ("" if invoked else " (no-launch)")
+        deps = payload.get("dependency_runs")
+        dep_suffix = f" deps={len(deps)}" if isinstance(deps, list) and deps else ""
+        return f"[ok  ] orch={orch} workflow_status={ws}{suffix}{dep_suffix}"
+
+    if status == "fail":
+        orch = payload.get("orchestration_id")
+        reason = payload.get("reason", "?")
+        detail = payload.get("detail")
+        parts = [f"reason={reason}"]
+        if orch:
+            parts.append(f"orch={orch}")
+        if detail:
+            d = str(detail).replace("\n", " ").strip()
+            if len(d) > 240:
+                d = d[:240] + "..."
+            parts.append(f"detail={d}")
+        return "[FAIL] " + " ".join(parts)
+
+    return None
+
+
+def _emit_closure_event(payload: dict[str, Any], stdout_format: str) -> None:
+    """Print a dependency-closure-level event, honoring `--stdout-format`.
+
+    The closure driver (`_run_with_dependency_closure`) emits its own events
+    (`dependency_node_begin` and the various closure failure summaries) OUTSIDE
+    any `_run_node` call, so no `_StdoutTee` is installed to translate them. In
+    `human` mode this would leak raw JSON; route the payload through the same
+    `_format_event_human` renderer the tee uses, falling back to the raw JSON
+    line when the event shape is unknown so no information is dropped.
+    """
+    line = json.dumps(payload, ensure_ascii=False)
+    if stdout_format == "human":
+        human = _format_event_human(payload)
+        if human is not None:
+            line = human
+    print(line, flush=True)
+
+
 class _StdoutTee:
-    """Mirror everything written to stdout into a run-log file as well.
+    """Mirror writes to a run-log file while optionally rendering JSON event
+    lines to the real terminal in a compact human-readable form.
 
-    Installed for the duration of a node run so the JSONL event stream printed
-    to the terminal — `node_start`, the conductor's `phase_start` /
-    `phase_complete` emits, and the final ok/fail summary — is also persisted to
-    the workspace, where the same information is otherwise not recoverable
-    (the conductor's emits and per-phase `elapsed_seconds` are stdout-only).
+    Installed for the duration of a node run so the workflow event stream
+    (``node_start``, the conductor's ``phase_start`` / ``phase_complete`` /
+    ``substep_start`` / ``substep_complete`` emits, and the final ok/fail
+    summary) is uniformly persisted to the workspace and is presented to the
+    operator in the mode they asked for.
 
-    Writes to the log file are best-effort: a log-file IO error must never break
-    the run or swallow terminal output, so file errors are silently ignored.
-    Attribute access falls through to the wrapped stream so the object remains a
-    drop-in `sys.stdout`.
+    The ``mode`` parameter governs the terminal stream:
+    - ``"jsonl"`` (legacy default): every byte is passed through to the wrapped
+      terminal stream unchanged, identical to the pre-format-aware tee.
+    - ``"human"``: each completed stdout line is buffered, parsed as JSON, and
+      — if it matches a known event shape — rendered as a compact human-
+      readable line on the terminal. Lines that don't parse / don't match are
+      forwarded verbatim so the operator never loses output.
+
+    Run-log writes are mode-independent: the file ALWAYS receives the original
+    raw bytes (which, for the workflow event stream, is the full structured
+    JSON payload of every event). This means ``run_logs/run_*.jsonl`` is a
+    full-fidelity record regardless of ``--stdout-format``.
+
+    Writes to the log file are best-effort: a log-file IO error must never
+    break the run or swallow terminal output, so file errors are silently
+    ignored. Attribute access falls through to the wrapped stream so the
+    object remains a drop-in ``sys.stdout`` (e.g. subprocesses derive
+    ``fileno()`` from the parent fd via this fall-through).
     """
 
-    def __init__(self, stream: Any, log_file: Any) -> None:
+    def __init__(self, stream: Any, log_file: Any, mode: str = "jsonl") -> None:
         self._stream = stream
         self._log = log_file
+        self._mode = mode if mode in ("human", "jsonl") else "jsonl"
+        # Buffer of bytes received but not yet terminated by a newline; only
+        # used in human mode (jsonl mode pipes straight through).
+        self._buffer = ""
 
     def write(self, data: str) -> int:
-        written = self._stream.write(data)
+        # The run-log mirrors the inbound bytes verbatim, before any human-mode
+        # rewriting — so the workspace record stays canonical even when the
+        # operator picked the compact terminal format.
         try:
             self._log.write(data)
         except Exception:  # noqa: BLE001 - never let log IO break the run
             pass
-        return written
+        if self._mode != "human":
+            return self._stream.write(data)
+        self._buffer += data
+        while True:
+            nl = self._buffer.find("\n")
+            if nl == -1:
+                break
+            line = self._buffer[:nl]
+            self._buffer = self._buffer[nl + 1:]
+            self._stream.write(self._render_line(line) + "\n")
+        return len(data)
+
+    def _render_line(self, line: str) -> str:
+        stripped = line.strip()
+        if stripped.startswith("{") and stripped.endswith("}"):
+            try:
+                payload = json.loads(stripped)
+            except json.JSONDecodeError:
+                payload = None
+            if isinstance(payload, dict):
+                human = _format_event_human(payload)
+                if human is not None:
+                    return human
+        return line
 
     def flush(self) -> None:
+        # In human mode a trailing partial line (no newline yet) is held in the
+        # buffer; flush forwards it through the formatter so an operator sees
+        # the tail promptly. The run-log already saw it on the inbound write().
+        if self._mode == "human" and self._buffer:
+            try:
+                self._stream.write(self._render_line(self._buffer))
+            except Exception:  # noqa: BLE001
+                pass
+            self._buffer = ""
         self._stream.flush()
         try:
             self._log.flush()
@@ -1180,6 +1368,7 @@ def _run_node(
     invoke_llm: bool,
     resume_mode: bool,
     extra_output: dict[str, Any] | None = None,
+    stdout_format: str = "jsonl",
 ) -> int:
     """Run a single node's orchestration (init → preflight → prompt → launch →
     terminalize) and print its JSON result. Returns the process exit code
@@ -1213,7 +1402,7 @@ def _run_node(
 
     try:
         if run_log_file is not None:
-            sys.stdout = _StdoutTee(saved_stdout, run_log_file)
+            sys.stdout = _StdoutTee(saved_stdout, run_log_file, mode=stdout_format)
 
         # Announce node start on stdout (uniform for the single/target/dependency
         # nodes), matching the JSONL info-event stream the rest of this driver emits.
@@ -1734,6 +1923,7 @@ def _run_with_dependency_closure(
     agent_model: str | None,
     status: str,
     invoke_llm: bool,
+    stdout_format: str = "jsonl",
 ) -> int:
     """Run the target's dependency closure bottom-up, then the target.
 
@@ -1744,17 +1934,15 @@ def _run_with_dependency_closure(
     """
     ordered, error = _resolve_dependency_closure(repo_root, target_spec_ref)
     if error is not None:
-        print(
-            json.dumps(
-                {
-                    "status": "fail",
-                    "reason": "dependency_closure_unresolved",
-                    "detail": error.get("detail"),
-                    "reason_code": error.get("reason"),
-                    "target_spec_ref": target_spec_ref,
-                },
-                ensure_ascii=False,
-            )
+        _emit_closure_event(
+            {
+                "status": "fail",
+                "reason": "dependency_closure_unresolved",
+                "detail": error.get("detail"),
+                "reason_code": error.get("reason"),
+                "target_spec_ref": target_spec_ref,
+            },
+            stdout_format,
         )
         return 2
 
@@ -1781,37 +1969,32 @@ def _run_with_dependency_closure(
         try:
             dep_source_dependency_ref = _discover_source_dependency_ref(repo_root, spec_ref)
         except ValueError as exc:
-            print(
-                json.dumps(
-                    {
-                        "status": "fail",
-                        "reason": "dependency_dep_ref_unresolved",
-                        "detail": str(exc),
-                        "failed_dependency_node": node_label,
-                        "spec_ref": spec_ref,
-                        "dependency_runs": dependency_runs,
-                        "target_spec_ref": target_spec_ref,
-                    },
-                    ensure_ascii=False,
-                )
+            _emit_closure_event(
+                {
+                    "status": "fail",
+                    "reason": "dependency_dep_ref_unresolved",
+                    "detail": str(exc),
+                    "failed_dependency_node": node_label,
+                    "spec_ref": spec_ref,
+                    "dependency_runs": dependency_runs,
+                    "target_spec_ref": target_spec_ref,
+                },
+                stdout_format,
             )
             return 2
         # The per-node `node_start` event is emitted uniformly inside _run_node;
         # here we only announce which dependency node (with its pretty label) the
         # closure is about to drive, so the stream stays human-traceable.
-        print(
-            json.dumps(
-                {
-                    "status": "info",
-                    "event": "dependency_node_begin",
-                    "node": node_label,
-                    "spec_ref": spec_ref,
-                    "until_phase": dep_until_phase,
-                    "orchestration_id": dep_orch_id,
-                },
-                ensure_ascii=False,
-            ),
-            flush=True,
+        _emit_closure_event(
+            {
+                "status": "info",
+                "event": "dependency_node_begin",
+                "node": node_label,
+                "spec_ref": spec_ref,
+                "until_phase": dep_until_phase,
+                "orchestration_id": dep_orch_id,
+            },
+            stdout_format,
         )
         rc = _run_node(
             repo_root=repo_root,
@@ -1827,6 +2010,7 @@ def _run_with_dependency_closure(
             status=status,
             invoke_llm=invoke_llm,
             resume_mode=False,
+            stdout_format=stdout_format,
         )
         dependency_runs.append(
             {
@@ -1838,20 +2022,18 @@ def _run_with_dependency_closure(
             }
         )
         if rc != 0:
-            print(
-                json.dumps(
-                    {
-                        "status": "fail",
-                        "reason": "dependency_node_failed",
-                        "failed_dependency_node": node_label,
-                        "spec_ref": spec_ref,
-                        "orchestration_id": dep_orch_id,
-                        "exit_code": rc,
-                        "dependency_runs": dependency_runs,
-                        "target_spec_ref": target_spec_ref,
-                    },
-                    ensure_ascii=False,
-                )
+            _emit_closure_event(
+                {
+                    "status": "fail",
+                    "reason": "dependency_node_failed",
+                    "failed_dependency_node": node_label,
+                    "spec_ref": spec_ref,
+                    "orchestration_id": dep_orch_id,
+                    "exit_code": rc,
+                    "dependency_runs": dependency_runs,
+                    "target_spec_ref": target_spec_ref,
+                },
+                stdout_format,
             )
             return rc
 
@@ -1863,25 +2045,23 @@ def _run_with_dependency_closure(
         # otherwise the next node would just fail-close at workflow-launch-check.
         if not _dependency_node_ready(repo_root, node, required_stages):
             dependency_runs[-1]["status"] = "not_ready_after_run"
-            print(
-                json.dumps(
-                    {
-                        "status": "fail",
-                        "reason": "dependency_not_ready_after_run",
-                        "detail": (
-                            f"{node_label} ran (exit 0) but did not produce the "
-                            f"required readiness ({'/'.join(required_stages)}); "
-                            "common causes: --no-invoke-llm, or the agent exited "
-                            "without recording a terminal pass (status still running)."
-                        ),
-                        "failed_dependency_node": node_label,
-                        "spec_ref": spec_ref,
-                        "orchestration_id": dep_orch_id,
-                        "dependency_runs": dependency_runs,
-                        "target_spec_ref": target_spec_ref,
-                    },
-                    ensure_ascii=False,
-                )
+            _emit_closure_event(
+                {
+                    "status": "fail",
+                    "reason": "dependency_not_ready_after_run",
+                    "detail": (
+                        f"{node_label} ran (exit 0) but did not produce the "
+                        f"required readiness ({'/'.join(required_stages)}); "
+                        "common causes: --no-invoke-llm, or the agent exited "
+                        "without recording a terminal pass (status still running)."
+                    ),
+                    "failed_dependency_node": node_label,
+                    "spec_ref": spec_ref,
+                    "orchestration_id": dep_orch_id,
+                    "dependency_runs": dependency_runs,
+                    "target_spec_ref": target_spec_ref,
+                },
+                stdout_format,
             )
             return 2
 
@@ -1901,6 +2081,7 @@ def _run_with_dependency_closure(
         invoke_llm=invoke_llm,
         resume_mode=False,
         extra_output={"dependency_runs": dependency_runs},
+        stdout_format=stdout_format,
     )
 
 
