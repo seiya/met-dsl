@@ -428,10 +428,15 @@ class RunWorkflowTests(unittest.TestCase):
 
         original = run_workflow._runtime_command
         buf = io.StringIO()
+        # Force JSONL stdout so the harness can parse the final summary line
+        # regardless of the main() default (which is human-readable).
+        argv_with_jsonl = list(argv)
+        if "--stdout-format" not in argv_with_jsonl:
+            argv_with_jsonl += ["--stdout-format", "jsonl"]
         try:
             run_workflow._runtime_command = fake_runtime_command  # type: ignore[assignment]
             with redirect_stdout(buf):
-                code = run_workflow.main(argv)
+                code = run_workflow.main(argv_with_jsonl)
         finally:
             run_workflow._runtime_command = original  # type: ignore[assignment]
         out = json.loads(buf.getvalue().strip().splitlines()[-1])
@@ -473,6 +478,8 @@ class RunWorkflowTests(unittest.TestCase):
                             "--orchestration-id",
                             "orch_node_start",
                             "--no-invoke-llm",
+                            "--stdout-format",
+                            "jsonl",
                         ]
                     )
             finally:
@@ -524,6 +531,7 @@ class RunWorkflowTests(unittest.TestCase):
                         "--repo-root", str(repo_root),
                         "--orchestration-id", "orch_devfail",
                         "--llm", "claude", "--mode", "dev",
+                        "--stdout-format", "jsonl",
                     ])
             finally:
                 run_workflow._runtime_command = orig_rt  # type: ignore[assignment]
@@ -1154,6 +1162,7 @@ class RunWorkflowTests(unittest.TestCase):
                         "--repo-root", str(repo_root),
                         "--orchestration-id", "orch_no_schema",
                         "--no-invoke-llm",
+                        "--stdout-format", "jsonl",
                     ]
                 )
             output = buf.getvalue()
@@ -1196,6 +1205,7 @@ class RunWorkflowTests(unittest.TestCase):
                         "--repo-root", str(repo_root),
                         "--orchestration-id", "orch_corrupt_schema",
                         "--no-invoke-llm",
+                        "--stdout-format", "jsonl",
                     ]
                 )
             output = buf.getvalue()
@@ -1263,6 +1273,8 @@ class RunWorkflowTests(unittest.TestCase):
                             "--orchestration-id",
                             "orch_init_fail",
                             "--no-invoke-llm",
+                            "--stdout-format",
+                            "jsonl",
                         ]
                     )
             finally:
@@ -1310,6 +1322,8 @@ class RunWorkflowTests(unittest.TestCase):
                             "--orchestration-id",
                             "orch_preflight_fail",
                             "--no-invoke-llm",
+                            "--stdout-format",
+                            "jsonl",
                         ]
                     )
             finally:
@@ -1352,6 +1366,8 @@ class RunWorkflowTests(unittest.TestCase):
                             "--orchestration-id",
                             "orch_init_missing_run_id",
                             "--no-invoke-llm",
+                            "--stdout-format",
+                            "jsonl",
                         ]
                     )
             finally:
@@ -1499,6 +1515,8 @@ class RunWorkflowTests(unittest.TestCase):
                     "Compile",
                     "--llm",
                     "claude",
+                    "--stdout-format",
+                    "jsonl",
                 ])
         finally:
             run_workflow.shutil.which = original_which  # type: ignore[assignment]
@@ -1546,6 +1564,8 @@ class RunWorkflowTests(unittest.TestCase):
                     "Compile",
                     "--llm",
                     "claude",
+                    "--stdout-format",
+                    "jsonl",
                 ])
         finally:
             run_workflow.shutil.which = original_which  # type: ignore[assignment]
@@ -1983,6 +2003,350 @@ class StdoutTeeTests(unittest.TestCase):
             finally:
                 sys.stdout = saved_stdout
                 run_workflow._open_run_log = orig_open  # type: ignore[assignment]
+
+
+class StdoutFormatTests(unittest.TestCase):
+    """Cover the new --stdout-format flag, the human formatter, and the
+    run_logs always-full-jsonl contract."""
+
+    def _seed(self, repo_root: Path) -> None:
+        _seed_shape_expr_schema_into(repo_root)
+        (repo_root / "tools").mkdir(parents=True, exist_ok=True)
+        (repo_root / "workspace").mkdir(parents=True, exist_ok=True)
+        (repo_root / "spec" / "problem").mkdir(parents=True, exist_ok=True)
+        (repo_root / "spec" / "problem" / "test.md").write_text(
+            "spec\n", encoding="utf-8"
+        )
+        (repo_root / "spec" / "problem" / "deps.yaml").write_text(
+            "nodes: []\n", encoding="utf-8"
+        )
+
+    def _fake_runtime(self, args, *, oar: str = "orch_agent_run_fmt"):
+        # Minimal fake init/preflight so main() can reach the final summary.
+        if args[0] == "init":
+            return run_workflow.RuntimeResult(
+                payload={"status": "ok", "orchestration_agent_run_id": oar},
+                raw_stdout="{}",
+            )
+        if args[0] == "preflight":
+            return run_workflow.RuntimeResult(
+                payload={
+                    "status": "pass",
+                    "can_launch_step_agents": True,
+                    "can_launch_substep_agents": True,
+                },
+                raw_stdout="{}",
+            )
+        return run_workflow.RuntimeResult(payload={"status": "ok"}, raw_stdout="{}")
+
+    def test_human_format_renders_node_start_and_final_summary(self) -> None:
+        """In human mode the operator sees compact lines, not raw JSON, for the
+        node-start announcement and the final ok summary."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._seed(repo_root)
+            orig = run_workflow._runtime_command
+            buf = io.StringIO()
+            try:
+                run_workflow._runtime_command = (  # type: ignore[assignment]
+                    lambda root, env, args: self._fake_runtime(args))
+                with redirect_stdout(buf):
+                    code = run_workflow.main([
+                        "spec/problem/test.md", "build",
+                        "--repo-root", str(repo_root),
+                        "--orchestration-id", "orch_human_fmt",
+                        "--no-invoke-llm",
+                        "--stdout-format", "human",
+                    ])
+            finally:
+                run_workflow._runtime_command = orig  # type: ignore[assignment]
+            self.assertEqual(code, 0)
+            lines = [ln for ln in buf.getvalue().splitlines() if ln.strip()]
+            # No JSON braces leaking onto the terminal in human mode.
+            self.assertFalse(any(ln.lstrip().startswith("{") for ln in lines), lines)
+            # node_start renders with the [node] prefix and the spec/until fields.
+            self.assertTrue(
+                any(ln.startswith("[node]") and "spec=spec/problem/test.md" in ln
+                    and "until=Build" in ln for ln in lines),
+                lines,
+            )
+            # The final ok summary renders with the [ok  ] prefix.
+            self.assertTrue(any(ln.startswith("[ok") for ln in lines), lines)
+
+    def test_jsonl_format_keeps_raw_json_on_stdout(self) -> None:
+        """--stdout-format jsonl emits the raw structured payload so existing
+        parsers see the same JSONL contract they always have."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._seed(repo_root)
+            orig = run_workflow._runtime_command
+            buf = io.StringIO()
+            try:
+                run_workflow._runtime_command = (  # type: ignore[assignment]
+                    lambda root, env, args: self._fake_runtime(args))
+                with redirect_stdout(buf):
+                    code = run_workflow.main([
+                        "spec/problem/test.md", "build",
+                        "--repo-root", str(repo_root),
+                        "--orchestration-id", "orch_jsonl_fmt",
+                        "--no-invoke-llm",
+                        "--stdout-format", "jsonl",
+                    ])
+            finally:
+                run_workflow._runtime_command = orig  # type: ignore[assignment]
+            self.assertEqual(code, 0)
+            # Every non-empty line must parse as JSON in jsonl mode.
+            events = [json.loads(ln) for ln in buf.getvalue().splitlines() if ln.strip()]
+            self.assertTrue(any(e.get("event") == "node_start" for e in events))
+            self.assertEqual(events[-1].get("status"), "ok")
+
+    def test_run_logs_always_contain_full_jsonl_regardless_of_mode(self) -> None:
+        """Whichever stdout format the operator picked, the per-run jsonl file
+        under workspace/orchestrations/<oid>/run_logs/ must hold the raw JSON
+        payloads of every event — it is the workspace-side full-fidelity
+        record."""
+        for mode, oid in (("human", "orch_log_human"), ("jsonl", "orch_log_jsonl")):
+            with self.subTest(mode=mode):
+                with tempfile.TemporaryDirectory() as tmp:
+                    repo_root = Path(tmp)
+                    self._seed(repo_root)
+                    orig = run_workflow._runtime_command
+                    try:
+                        run_workflow._runtime_command = (  # type: ignore[assignment]
+                            lambda root, env, args: self._fake_runtime(args))
+                        code = run_workflow.main([
+                            "spec/problem/test.md", "build",
+                            "--repo-root", str(repo_root),
+                            "--orchestration-id", oid,
+                            "--no-invoke-llm",
+                            "--stdout-format", mode,
+                        ])
+                    finally:
+                        run_workflow._runtime_command = orig  # type: ignore[assignment]
+                    self.assertEqual(code, 0)
+                    run_logs = (
+                        repo_root / "workspace" / "orchestrations" / oid
+                        / "run_logs"
+                    )
+                    files = sorted(run_logs.glob("run_*.jsonl"))
+                    self.assertEqual(len(files), 1, mode)
+                    contents = files[0].read_text(encoding="utf-8")
+                    events = [
+                        json.loads(ln) for ln in contents.splitlines() if ln.strip()
+                    ]
+                    self.assertTrue(
+                        any(e.get("event") == "node_start" for e in events), mode)
+                    self.assertEqual(events[-1].get("status"), "ok", mode)
+
+    def test_format_event_human_known_events(self) -> None:
+        """Spot-check the human formatter for each shape the conductor and the
+        run_workflow driver actually emit, so a wording change is a deliberate
+        edit rather than a silent drift."""
+        f = run_workflow._format_event_human
+        self.assertEqual(
+            f({"status": "info", "event": "node_start",
+               "spec_ref": "spec/x", "until_phase": "Build",
+               "orchestration_id": "orch_1", "resume": False}),
+            "[node] spec=spec/x until=Build orch=orch_1",
+        )
+        self.assertIn(
+            "[resume]",
+            f({"status": "info", "event": "node_start",
+               "spec_ref": "spec/x", "until_phase": "Build",
+               "orchestration_id": "orch_1", "resume": True}) or "",
+        )
+        self.assertEqual(
+            f({"status": "info", "event": "phase_start",
+               "node_key": "n", "phase": "compile", "attempt": 2,
+               "orchestration_id": "o"}),
+            "  [phase   ] compile (attempt 2)",
+        )
+        self.assertEqual(
+            f({"status": "info", "event": "phase_complete",
+               "node_key": "n", "phase": "generate", "result": "pass",
+               "elapsed_seconds": 12.34, "orchestration_id": "o"}),
+            "  [phase   ] generate ok (12.34s)",
+        )
+        self.assertIn(
+            "skipped (resumed)",
+            f({"status": "info", "event": "phase_complete",
+               "node_key": "n", "phase": "compile", "result": "skipped",
+               "orchestration_id": "o"}) or "",
+        )
+        self.assertEqual(
+            f({"status": "info", "event": "substep_start",
+               "node_key": "n", "phase": "validate", "substep": "execute",
+               "attempt": 1, "orchestration_id": "o"}),
+            "    [substep] validate.execute ...",
+        )
+        self.assertEqual(
+            f({"status": "info", "event": "substep_complete",
+               "node_key": "n", "phase": "validate", "substep": "judge",
+               "result": "pass", "elapsed_seconds": 4.5,
+               "agent_run_id": "ar_judge", "orchestration_id": "o"}),
+            "    [substep] validate.judge ok (4.5s)",
+        )
+        # Non-pass substep tags arid so the operator can jump to its dir.
+        self.assertIn(
+            "FAIL".lower() if False else "",  # placeholder to keep test stable
+            f({"status": "info", "event": "substep_complete",
+               "node_key": "n", "phase": "build", "substep": "step",
+               "result": "fail", "elapsed_seconds": 2.0,
+               "agent_run_id": "ar_x", "orchestration_id": "o"}) or "",
+        )
+        fail_line = f({"status": "info", "event": "substep_complete",
+                       "node_key": "n", "phase": "build", "substep": "step",
+                       "result": "fail", "elapsed_seconds": 2.0,
+                       "agent_run_id": "ar_x", "orchestration_id": "o"})
+        self.assertIn("fail", fail_line or "")
+        self.assertIn("arid=ar_x", fail_line or "")
+        # Final ok / fail summaries.
+        self.assertTrue(
+            (f({"status": "ok", "orchestration_id": "orch_1",
+                "workflow_status": "pass", "llm_invoked": True}) or "")
+            .startswith("[ok"),
+        )
+        self.assertTrue(
+            (f({"status": "fail", "orchestration_id": "orch_1",
+                "reason": "preflight_failed", "detail": "x"}) or "")
+            .startswith("[FAIL]"),
+        )
+        # Unknown event shapes return None so the caller falls back to JSON.
+        self.assertIsNone(f({"status": "info", "event": "unknown_marker"}))
+        self.assertIsNone(f({"hello": "world"}))
+
+
+class SubstepEventTests(unittest.TestCase):
+    """The conductor must surface per-substep activity (start/complete) so the
+    host event stream is informative even during long substep loops."""
+
+    def test_run_phase_emits_substep_start_and_complete(self) -> None:
+        import tools.workflow_conductor as wc
+
+        # Drive run_phase via a minimal stub conductor. We only need to verify
+        # that the substep_start/substep_complete pair fire for every substep
+        # of a phase, in order, with the phase + substep labels and a result.
+        captured: list[dict[str, object]] = []
+
+        class _Stub(wc.Conductor):
+            def __init__(self):
+                pass
+
+            orchestration_id = "orch_sub"
+            orchestration_agent_run_id = "orch_agent_run"
+            workflow_mode = "dev"
+            backend = "claude"
+
+            def emit(self, event, **fields):
+                captured.append({"event": event, **fields})
+
+            def check_step_completed(self, *_a, **_k):
+                return None
+
+            def workflow_launch_check(self, *_a, **_k):
+                return None
+
+            def _ensure_fresh_producer_id(self, *_a, **_k):
+                return None
+
+            def _write_lineage(self, *_a, **_k):
+                return ()
+
+            def _conductor_authors_makefile(self, *_a, **_k):
+                return False
+
+            def run_substep(self, refs, phase, substep, repair=None,
+                            resolved_dependencies=()):
+                return wc.SubstepOutcome(
+                    agent_run_id=f"ar_{phase}_{substep or 'step'}",
+                    status="pass", output_refs=[], leaf_returncode=0,
+                )
+
+            def write_step_result(self, *_a, **_k):
+                return None
+
+            def _resolve_exe_name(self, *_a, **_k):
+                return None
+
+        stub = _Stub()
+        # Validate uses two substeps (execute, judge) so we get a 2-pair pattern.
+        refs = wc.NodeRefs(
+            node_key="component/x@0.1.0", spec_path="spec/x",
+            ir_id="ir1", pipeline_id="pl1",
+            source_id="src", binary_id="bin", run_id="r1", source_binary_id="bin",
+        )
+        outcome = stub.run_phase(refs, "validate")
+        self.assertEqual(outcome.status, "pass")
+        starts = [e for e in captured if e["event"] == "substep_start"]
+        completes = [e for e in captured if e["event"] == "substep_complete"]
+        self.assertEqual([(e["phase"], e["substep"]) for e in starts],
+                         [("validate", "execute"), ("validate", "judge")])
+        self.assertEqual([(e["phase"], e["substep"], e["result"]) for e in completes],
+                         [("validate", "execute", "pass"),
+                          ("validate", "judge", "pass")])
+        # Every complete carries a numeric elapsed_seconds and the substep's arid.
+        for e in completes:
+            self.assertIsInstance(e["elapsed_seconds"], (int, float))
+            self.assertTrue(str(e["agent_run_id"]).startswith("ar_validate_"))
+
+    def test_run_phase_build_emits_step_label_for_none_substep(self) -> None:
+        """Build's SUBSTEPS == (None,) — the host event stream must still label
+        the substep field so the operator gets a readable line. We render
+        ``None`` as ``"step"`` (the agent_role of the single child)."""
+        import tools.workflow_conductor as wc
+
+        captured: list[dict[str, object]] = []
+
+        class _Stub(wc.Conductor):
+            def __init__(self):
+                pass
+
+            orchestration_id = "orch_sub_build"
+            orchestration_agent_run_id = "orch_agent_run"
+            workflow_mode = "dev"
+            backend = "claude"
+
+            def emit(self, event, **fields):
+                captured.append({"event": event, **fields})
+
+            def check_step_completed(self, *_a, **_k):
+                return None
+
+            def workflow_launch_check(self, *_a, **_k):
+                return None
+
+            def _ensure_fresh_producer_id(self, *_a, **_k):
+                return None
+
+            def _write_lineage(self, *_a, **_k):
+                return ()
+
+            def _conductor_authors_makefile(self, *_a, **_k):
+                return False
+
+            def run_substep(self, refs, phase, substep, repair=None,
+                            resolved_dependencies=()):
+                return wc.SubstepOutcome(
+                    agent_run_id="ar_build", status="pass",
+                    output_refs=[], leaf_returncode=0,
+                )
+
+            def write_step_result(self, *_a, **_k):
+                return None
+
+            def _resolve_exe_name(self, *_a, **_k):
+                return None
+
+        stub = _Stub()
+        refs = wc.NodeRefs(
+            node_key="component/x@0.1.0", spec_path="spec/x",
+            ir_id="ir1", pipeline_id="pl1",
+            source_id="src", binary_id="bin", run_id="r1", source_binary_id="bin",
+        )
+        outcome = stub.run_phase(refs, "build")
+        self.assertEqual(outcome.status, "pass")
+        starts = [e for e in captured if e["event"] == "substep_start"]
+        self.assertEqual(starts[0]["substep"], "step")
 
 
 if __name__ == "__main__":
