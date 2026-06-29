@@ -2562,6 +2562,141 @@ shell_tool                       stable             true
                     allowed_output_paths=[src_other],
                 )
 
+    def test_generate_lint_launch_accepts_lint_meta_json(self) -> None:
+        """The deterministic Generate.lint substep declares
+        source/<source_id>/lint_meta.json as its conductor-authored deliverable
+        (workflow_conductor._lint_inproc). It sits at the source root — a sibling
+        of source_meta.json, NOT under src/ — so the generate phase contract must
+        accept it. Regression for the billed-E2E fail "allowed_output_paths[0] is
+        outside phase contract outputs for step='generate': .../lint_meta.json".
+        """
+        from tools.orchestration_runtime import _allowed_output_paths_for_launch
+
+        src_id = "src_lint_meta_001"
+        lint_meta = f"{_FIX_PIPE_REF}/source/{src_id}/lint_meta.json"
+        command_log = f"{_FIX_PIPE_REF}/source/{src_id}/src/command_log.jsonl"
+        req = {
+            "agent_role": "substep",
+            "node_key": "problem/shallow_water2d@0.3.0",
+            "step": "generate",
+            "substep": "lint",
+            "ir_ref": _FIX_IR_REF,
+            "pipeline_ref": _FIX_PIPE_REF,
+            "source_id": src_id,
+            "allowed_output_paths": [lint_meta, command_log],
+        }
+        out = _allowed_output_paths_for_launch(
+            request_payload=req,
+            write_roots=[f"{_FIX_PIPE_REF}/source/"],
+        )
+        self.assertIn(lint_meta, out)
+        self.assertIn(command_log, out)
+
+    def test_generate_non_lint_launch_rejects_lint_meta_json(self) -> None:
+        """lint_meta.json is conductor-authored and leaf-non-writable. A
+        Generate.generate / Generate.verify leaf launch (real leaf with Edit/Write)
+        must NOT be able to list it as an output — otherwise it would be
+        auto-authorized for direct file-tool writes and could overwrite the lint
+        verdict. The generate phase contract accepts lint_meta.json for the
+        deterministic Generate.lint substep ONLY.
+        """
+        from tools.orchestration_runtime import _allowed_output_paths_for_launch
+
+        src_id = "src_lint_meta_002"
+        lint_meta = f"{_FIX_PIPE_REF}/source/{src_id}/lint_meta.json"
+        model_src = f"{_FIX_PIPE_REF}/source/{src_id}/src/m_model.f90"
+        for substep in ("generate", "verify"):
+            with self.subTest(substep=substep):
+                req = {
+                    "agent_role": "substep",
+                    "node_key": "problem/shallow_water2d@0.3.0",
+                    "step": "generate",
+                    "substep": substep,
+                    "ir_ref": _FIX_IR_REF,
+                    "pipeline_ref": _FIX_PIPE_REF,
+                    "source_id": src_id,
+                    "allowed_output_paths": [model_src, lint_meta],
+                }
+                with self.assertRaisesRegex(
+                    ValueError, "outside phase contract outputs"
+                ):
+                    _allowed_output_paths_for_launch(
+                        request_payload=req,
+                        write_roots=[f"{_FIX_PIPE_REF}/source/"],
+                    )
+
+    def test_lint_meta_json_not_file_tool_writable(self) -> None:
+        """Even for the Generate.lint substep, lint_meta.json must stay out of the
+        auto-derived allowed_file_tool_paths set (no leaf may Edit/Write it; the
+        conductor writes it in-process). An explicit request listing it is rejected.
+        """
+        from tools.orchestration_runtime import _allowed_file_tool_paths_for_launch
+
+        src_id = "src_lint_meta_003"
+        lint_meta = f"{_FIX_PIPE_REF}/source/{src_id}/lint_meta.json"
+        command_log = f"{_FIX_PIPE_REF}/source/{src_id}/src/command_log.jsonl"
+        model_src = f"{_FIX_PIPE_REF}/source/{src_id}/src/m_model.f90"
+        req = {
+            "agent_role": "substep",
+            "node_key": "problem/shallow_water2d@0.3.0",
+            "step": "generate",
+            "substep": "lint",
+            "ir_ref": _FIX_IR_REF,
+            "pipeline_ref": _FIX_PIPE_REF,
+            "source_id": src_id,
+        }
+        # Auto-derive (allowed_file_tool_paths unset): lint_meta.json excluded.
+        derived = _allowed_file_tool_paths_for_launch(
+            request_payload=req,
+            allowed_output_paths=[lint_meta, model_src, command_log],
+        )
+        self.assertNotIn(lint_meta, derived)
+        self.assertIn(model_src, derived)
+        # Explicit list including lint_meta.json: rejected.
+        req_explicit = {**req, "allowed_file_tool_paths": [model_src, lint_meta]}
+        with self.assertRaisesRegex(ValueError, "conductor-authored lint deliverable"):
+            _allowed_file_tool_paths_for_launch(
+                request_payload=req_explicit,
+                allowed_output_paths=[lint_meta, model_src, command_log],
+            )
+
+    def test_src_tree_file_named_lint_meta_stays_writable(self) -> None:
+        """The conductor-owned deliverable is ONLY the source-ROOT
+        source/<source_id>/lint_meta.json. A legitimately generated source-tree
+        file that happens to be named lint_meta.json (under .../src/) is an
+        ordinary leaf output: the phase contract accepts it via the /src/ rule and
+        it must stay Edit/Write-eligible (not excluded by the source-root guard).
+        """
+        from tools.orchestration_runtime import (
+            _allowed_file_tool_paths_for_launch,
+            _allowed_output_paths_for_launch,
+        )
+
+        src_id = "src_lint_meta_004"
+        src_tree_file = f"{_FIX_PIPE_REF}/source/{src_id}/src/lint_meta.json"
+        req = {
+            "agent_role": "substep",
+            "node_key": "problem/shallow_water2d@0.3.0",
+            "step": "generate",
+            "substep": "generate",
+            "ir_ref": _FIX_IR_REF,
+            "pipeline_ref": _FIX_PIPE_REF,
+            "source_id": src_id,
+            "allowed_output_paths": [src_tree_file],
+        }
+        # Phase contract accepts it (under /src/) for any generate substep.
+        out = _allowed_output_paths_for_launch(
+            request_payload=req,
+            write_roots=[f"{_FIX_PIPE_REF}/source/"],
+        )
+        self.assertIn(src_tree_file, out)
+        # And it stays file-tool-writable (the source-root guard does not catch it).
+        derived = _allowed_file_tool_paths_for_launch(
+            request_payload=req,
+            allowed_output_paths=[src_tree_file],
+        )
+        self.assertIn(src_tree_file, derived)
+
     def test_validate_launch_rejects_listed_path_for_other_run_id(self) -> None:
         """If request.run_id is set, listed paths must use that run_id only."""
         from tools.orchestration_runtime import _allowed_output_paths_for_launch

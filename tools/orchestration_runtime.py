@@ -4841,6 +4841,18 @@ def _allowed_output_paths_for_launch(
                     return True
                 if path.endswith("/source_meta.json"):
                     return True
+                # Generate.lint deliverable: the conductor-authored, freshness-gated
+                # lint_meta.json sits at the source root (source/<source_id>/lint_meta.json),
+                # a sibling of source_meta.json — not under src/. See
+                # workflow_conductor._lint_inproc and docs/workflow/phases/phase_02_generate.md.
+                # Gated to the deterministic Generate.lint substep ONLY: it is
+                # conductor-authored and leaf-non-writable, so a Generate.generate /
+                # Generate.verify leaf launch must NOT be able to list it as an output
+                # (which would auto-authorize the leaf to overwrite the lint verdict via
+                # _allowed_file_tool_paths_for_launch). Belt-and-suspenders: that helper
+                # also excludes lint_meta.json from the auto-derived file-tool set.
+                if substep_token == "lint" and path.endswith("/lint_meta.json"):
+                    return True
             return False
         if step_token == "build":
             # Cross-phase exception: in-source Make builds for Fortran/C
@@ -5383,6 +5395,16 @@ def _allowed_file_tool_paths_for_launch(
             for path in allowed_set
             if path
             and path not in canonical_log_set
+            # The Generate.lint deliverable is the source-ROOT lint_meta.json
+            # (source/<source_id>/lint_meta.json — NOT under src/), conductor-authored
+            # in-process (workflow_conductor._lint_inproc, raw host write) and documented
+            # leaf-non-writable. Keep it out of the auto-derived file-tool set so no leaf
+            # can Edit/Write it, mirroring the canonical-audit-log exclusion above. The
+            # "/src/" guard scopes this to the conductor-owned placement: a legitimately
+            # generated source-tree file that happens to be named lint_meta.json (under
+            # .../src/) is an ordinary leaf output and stays writable (and _matches_phase_
+            # contract already accepts it via its /src/ rule, checked first).
+            and not (path.endswith("/lint_meta.json") and "/src/" not in path)
         }
         result = sorted(derived)
         _assert_mandatory_file_tool_pins_present(
@@ -5405,6 +5427,13 @@ def _allowed_file_tool_paths_for_launch(
             raise ValueError(
                 f"allowed_file_tool_paths[{idx}] must not include canonical MCP audit "
                 f"log path: {path!r} (written exclusively by MCP tooling)"
+            )
+        # Source-ROOT lint_meta.json only (see auto-derive branch above): a
+        # legitimately generated .../src/lint_meta.json stays writable.
+        if path.endswith("/lint_meta.json") and "/src/" not in path:
+            raise ValueError(
+                f"allowed_file_tool_paths[{idx}] must not include the conductor-authored "
+                f"lint deliverable: {path!r} (written exclusively by Generate.lint in-process)"
             )
         # Phase-2: managed `.json` / `.txt` artifacts are written directly by the
         # confined leaf (FS-diff attribution), so they are no longer rejected here

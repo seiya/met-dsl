@@ -6,7 +6,7 @@ The phase that, with `spec.ir.yaml` as the canonical input, generates the source
 ## I/O contract
 - execution input: `spec.ir.yaml`
 - verification input: `spec.ir.yaml`, `controlled_spec.md` (verify-only), the generated `source/<source_id>/src/`
-- output: `workspace/pipelines/<node_key_safe>/<pipeline_id>/source/<source_id>/src/`, `source_meta.json`
+- output: `workspace/pipelines/<node_key_safe>/<pipeline_id>/source/<source_id>/src/`, `source_meta.json`, `lint_meta.json` (the conductor-authored `Generate.lint` deliverable; see substep structure below)
 
 ## substep structure
 - `Generate.generate`: the LLM substep that reads `spec.ir.yaml` and generates the full source set.

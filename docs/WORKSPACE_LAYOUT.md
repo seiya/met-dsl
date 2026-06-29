@@ -125,7 +125,8 @@ workspace/
             ├── source/
             │   └── <source_id>/
             │       ├── src/                       (generated source code, including `command_log.jsonl`)
-            │       └── source_meta.json
+            │       ├── source_meta.json
+            │       └── lint_meta.json             (conductor-authored Generate.lint deliverable)
             ├── binary/
             │   └── <binary_id>/
             │       ├── bin/
@@ -183,6 +184,7 @@ workspace/
 | `workspace/ir/.../<ir_id>/ir_meta.json` | Compile/generate / verify | substep agent (Edit/Write) | runtime / validator | `verification_status` is assigned only when verify passes |
 | `workspace/pipelines/.../<pipeline_id>/source/<source_id>/src/` | Generate | substep agent | subsequent phases | |
 | `workspace/pipelines/.../<pipeline_id>/source/<source_id>/source_meta.json` | Generate | substep agent (Edit/Write) | Build / validator | |
+| `workspace/pipelines/.../<pipeline_id>/source/<source_id>/lint_meta.json` | Generate (`Generate.lint`) | conductor (deterministic in-process; `_lint_inproc`) | validator (`post_generate`) | records the `run_linter` verdict; the leaf cannot write it |
 | `workspace/pipelines/.../<pipeline_id>/binary/<binary_id>/binary_meta.json` | Build | step agent (Edit/Write) | Validate / validator | pins `source_source_id` |
 | `workspace/pipelines/.../<pipeline_id>/runs/<run_id>/<node_key_safe>/verdict.json` | Validate/judge | substep agent (Edit/Write) | runtime / validator / upper node | |
 | `workspace/pipelines/.../<pipeline_id>/lineage.json` | added by each phase | (via write-step-result) | runtime / validator | the phase id lineage |

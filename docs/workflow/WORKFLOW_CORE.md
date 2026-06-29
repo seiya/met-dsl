@@ -266,8 +266,8 @@ In this section, the input of each phase is described separately as `execution i
 ### 2. Generate
 - execution input: `spec.ir.yaml`
 - verification input: `spec.ir.yaml`, `controlled_spec.md` (verify-only, requirement-fidelity cross-check), the generated `source/<source_id>/src/`
-- output: `source/<source_id>/src/`, `source_meta.json`
-- Before `Generate` completes, the conductor's deterministic `Generate.lint` substep runs the MCP `run_linter` consistent with `impl_defaults.toolchain.language` of `spec.ir.yaml` and writes the host-authored lint evidence (`<pipeline_root>/lint_evidence/<source_id>.json`, each element with `command_id`, `command_log_ref`, and `preset`); `post_generate` certifies it. The leaf does not run `run_linter`.
+- output: `source/<source_id>/src/`, `source_meta.json`, `lint_meta.json` (the conductor-authored `Generate.lint` deliverable; see next bullet)
+- Before `Generate` completes, the conductor's deterministic `Generate.lint` substep runs the MCP `run_linter` consistent with `impl_defaults.toolchain.language` of `spec.ir.yaml` and writes both `source/<source_id>/lint_meta.json` (the freshness-gated deliverable recording the `run_linter` verdict) and the host-authored lint evidence (`<pipeline_root>/lint_evidence/<source_id>.json`, each element with `command_id`, `command_log_ref`, and `preset`); `post_generate` certifies it. The leaf does not run `run_linter`.
 - `Generate` must include in its official output a preset-compatible quality path with which `Validate.execute` can run using only the `preset` of `run_quality_checks`. On shortage, it is `Generate fail`.
 - With `toolchain.build_system=make` and `toolchain.language=fortran` / `c` / `cpp` / `mixed` families, a `test` or `check` target must be defined in `source/<source_id>/src/Makefile`. On absence, it is `Generate fail`.
 
