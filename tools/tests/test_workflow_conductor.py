@@ -171,6 +171,7 @@ class NodeRefsTest(unittest.TestCase):
 class PhaseStructureTest(unittest.TestCase):
     def test_substeps_and_roles(self) -> None:
         self.assertEqual(wc.SUBSTEPS["compile"], ("generate", "verify"))
+        self.assertEqual(wc.SUBSTEPS["generate"], ("generate", "lint", "static", "verify"))
         self.assertEqual(wc.SUBSTEPS["build"], (None,))
         self.assertEqual(wc.SUBSTEPS["validate"], ("execute", "judge"))
         self.assertEqual(wc.child_agent_role("build"), "step")
@@ -316,8 +317,9 @@ class ConductHappyPathTest(unittest.TestCase):
             + ["check-step-completed", "workflow-launch-check",
                "record-launch", "finalize-child",  # generate.generate (leaf)
                "record-launch", "record-child-return", "finalize-child",  # generate.lint (deterministic)
+               "record-launch", "record-child-return", "finalize-child",  # generate.static (deterministic)
                "record-launch", "finalize-child",  # generate.verify (leaf)
-               "write-step-result"]  # generate (2 leaf + 1 deterministic substeps)
+               "write-step-result"]  # generate (2 leaf + 2 deterministic substeps)
             + ["check-step-completed", "workflow-launch-check",
                "record-launch", "record-child-return", "finalize-child",
                "write-step-result"]  # build (1 deterministic step)
@@ -334,8 +336,8 @@ class ConductHappyPathTest(unittest.TestCase):
         by_step = {cap["--step"]: cap for cap in wsr}
         for substep_aware in ("compile", "generate", "validate"):
             self.assertEqual(by_step[substep_aware]["--agent-run-id"], "ORCH")
-            # generate now has 3 substeps (generate, lint, verify); compile/validate have 2.
-            expected_substeps = 3 if substep_aware == "generate" else 2
+            # generate now has 4 substeps (generate, lint, static, verify); compile/validate have 2.
+            expected_substeps = 4 if substep_aware == "generate" else 2
             self.assertEqual(
                 len(by_step[substep_aware]["--result-json"]["substep_agent_run_ids"]),
                 expected_substeps)
@@ -616,6 +618,34 @@ class ConductRoutingTest(unittest.TestCase):
         self.assertEqual(reopens[0]["--from-phase"], "generate")
         self.assertEqual(reopens[0]["--reason"], "lint_lint_findings")
         # generate ran twice (lint-fail attempt, then clean attempt)
+        gen_writes = [cap for s, cap in c.calls
+                      if s == "write-step-result" and cap["--step"] == "generate"]
+        self.assertEqual(len(gen_writes), 2)
+
+    def test_static_finding_warm_reopens_generate_same_phase(self) -> None:
+        # A generate.static finding routes retry/generate/reuse(static_*); conduct must do a
+        # SAME-PHASE warm reopen exactly like a lint finding (the broadened startswith guard),
+        # not terminalize like the generic same/downstream branch.
+        c = self._conductor()
+        state = {"static_failed": False}
+
+        def status_fn(phase, substep, n):
+            if phase == "generate" and substep == "static" and not state["static_failed"]:
+                state["static_failed"] = True
+                return "fail"
+            return "pass"
+
+        c.status_fn = status_fn
+        c.decision_fn = lambda phase, outcomes: wc.RouteDecision(
+            "retry", target_phase="generate", repair_strategy="reuse",
+            reason="static_post_generate_violation")
+        status = c.conduct(self._refs(), "generate")
+        self.assertEqual(status, "pass")
+        reopens = [cap for s, cap in c.calls if s == "reopen-phase"]
+        self.assertEqual(len(reopens), 1)
+        self.assertEqual(reopens[0]["--from-phase"], "generate")
+        self.assertEqual(reopens[0]["--reason"], "static_post_generate_violation")
+        # generate ran twice (static-fail attempt, then clean attempt)
         gen_writes = [cap for s, cap in c.calls
                       if s == "write-step-result" and cap["--step"] == "generate"]
         self.assertEqual(len(gen_writes), 2)
@@ -1775,6 +1805,16 @@ class BuildLaunchRequestResolvedDependenciesTest(unittest.TestCase):
         self.assertTrue(any(p.endswith("/lint_meta.json") for p in outs))
         # lint does not author model/runner sources
         self.assertFalse(any(p.endswith("_model.f90") for p in outs))
+        # generate.static is deterministic too: no resolved_dependencies / skill, and its
+        # only allowed output is static_meta.json (no sources, no command_log).
+        static_req = self._build("generate", "static", (self.DEP,))
+        self.assertNotIn("resolved_dependencies", static_req)
+        self.assertNotIn("skill_name", static_req)
+        self.assertTrue(static_req["deterministic"])
+        static_outs = static_req["allowed_output_paths"]
+        self.assertEqual(
+            [p for p in static_outs if p.endswith("/static_meta.json")], static_outs)
+        self.assertFalse(any(p.endswith("_model.f90") for p in static_outs))
 
     def test_omitted_for_compile(self) -> None:
         self.assertNotIn(
@@ -2714,6 +2754,137 @@ class DeterministicLintTest(unittest.TestCase):
             d = c.classify_failure(refs, "generate", outcomes)
             self.assertEqual((d.action, d.target_phase, d.repair_strategy), ("retry", "generate", "reuse"))
             self.assertTrue(d.reason.startswith("lint_"))
+
+
+class DeterministicStaticTest(unittest.TestCase):
+    """generate.static runs in-process (no leaf): the conductor runs validate_workspace_root +
+    validate_pipeline_semantics --stage post_generate and authors static_meta.json; a violation
+    is a content failure routed to generate.generate (warm resume)."""
+
+    def _conductor(self, repo: Path) -> "wc.Conductor":
+        return wc.Conductor(repo_root=repo, orchestration_id="t",
+                            orchestration_agent_run_id="x", backend="claude", env={})
+
+    def _refs(self) -> wc.NodeRefs:
+        return wc.NodeRefs(
+            node_key="component/spec_x@0.1.0", spec_path="spec/component/spec_x",
+            ir_id="x_1", pipeline_id="x_1", source_id="src_1", binary_id="bin_1")
+
+    def _seed(self, repo: Path, refs: wc.NodeRefs) -> None:
+        (repo / refs.source_dir()).mkdir(parents=True, exist_ok=True)
+
+    def _patch_run(self, fn):
+        from unittest import mock
+        return mock.patch.object(wc.subprocess, "run", fn)
+
+    @staticmethod
+    def _fake_run(ws_rc: int, pg_rc: int):
+        def run(cmd, **kwargs):
+            script = next((c for c in cmd if c.endswith(".py")), "")
+            if script.endswith("validate_workspace_root.py"):
+                return wc.subprocess.CompletedProcess(cmd, ws_rc, "ws-out", "ws-err")
+            if script.endswith("validate_pipeline_semantics.py"):
+                return wc.subprocess.CompletedProcess(cmd, pg_rc, "pg-out", "pg-err")
+            raise AssertionError(f"unexpected subprocess: {cmd}")
+        return run
+
+    def test_static_inproc_pass_writes_meta(self) -> None:
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            refs = self._refs()
+            self._seed(repo, refs)
+            c = self._conductor(repo)
+            with self._patch_run(self._fake_run(0, 0)):
+                out = c._static_inproc(refs, "child-1", "captok")
+            self.assertEqual(out["returncode"], 0)
+            meta = json.loads((repo / refs.source_dir() / "static_meta.json").read_text())
+            self.assertEqual(meta["status"], "pass")
+            self.assertIsNone(meta["failure_category"])
+
+    def test_static_inproc_post_generate_violation_is_content_fail(self) -> None:
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            refs = self._refs()
+            self._seed(repo, refs)
+            c = self._conductor(repo)
+            with self._patch_run(self._fake_run(0, 1)):
+                out = c._static_inproc(refs, "child-1", "captok")
+            self.assertEqual(out["returncode"], 0)  # content fail, not transport
+            meta = json.loads((repo / refs.source_dir() / "static_meta.json").read_text())
+            self.assertEqual(meta["status"], "fail")
+            self.assertEqual(meta["failure_category"], "post_generate_violation")
+            self.assertIn("pg-out", meta["failure_excerpt"])
+
+    def test_static_inproc_workspace_root_violation_short_circuits(self) -> None:
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            refs = self._refs()
+            self._seed(repo, refs)
+            c = self._conductor(repo)
+            # workspace_root fails first; post_generate must NOT run (pg_rc would also fail,
+            # but the category proves the short-circuit picked workspace_root).
+            with self._patch_run(self._fake_run(1, 1)):
+                out = c._static_inproc(refs, "child-1", "captok")
+            self.assertEqual(out["returncode"], 0)
+            meta = json.loads((repo / refs.source_dir() / "static_meta.json").read_text())
+            self.assertEqual(meta["status"], "fail")
+            self.assertEqual(meta["failure_category"], "workspace_root_violation")
+
+    def test_static_inproc_exception_is_transport_fail(self) -> None:
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            refs = self._refs()
+            self._seed(repo, refs)
+            c = self._conductor(repo)
+
+            def boom(cmd, **kwargs):
+                raise OSError("python3 not found")
+
+            # Routed through _run_deterministic_substep, an unexpected error becomes a
+            # transport failure (rc != 0), NOT a content failure.
+            request = {"step": "generate", "substep": "static"}
+            with self._patch_run(boom), \
+                    __import__("unittest").mock.patch.object(
+                        c, "_capability_token", lambda arid: "captok"):
+                proc = c._run_deterministic_substep(refs, "generate", "static", "child-1", request)
+            self.assertNotEqual(proc.returncode, 0)
+
+    def test_determine_substep_status_static_branch(self) -> None:
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            refs = self._refs()
+            (repo / refs.source_dir()).mkdir(parents=True, exist_ok=True)
+            c = self._conductor(repo)
+            meta_path = repo / refs.source_dir() / "static_meta.json"
+            paths = [refs.source_dir() + "/static_meta.json"]
+            meta_path.write_text(json.dumps({"status": "pass"}), encoding="utf-8")
+            self.assertEqual(
+                c.determine_substep_status(refs, "generate", "static", paths)[0], "pass")
+            meta_path.write_text(json.dumps({"status": "fail"}), encoding="utf-8")
+            self.assertEqual(
+                c.determine_substep_status(refs, "generate", "static", paths)[0], "fail")
+
+    def test_classify_failure_routes_static_violation_to_generate_reuse(self) -> None:
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            refs = self._refs()
+            (repo / refs.source_dir()).mkdir(parents=True, exist_ok=True)
+            (repo / refs.source_dir() / "static_meta.json").write_text(
+                json.dumps({"failure_category": "post_generate_violation"}), encoding="utf-8")
+            c = self._conductor(repo)
+            # outcomes models generate(pass), lint(pass), static(fail) — static is index 2.
+            outcomes = [wc.SubstepOutcome("g", "pass", [], 0),
+                        wc.SubstepOutcome("l", "pass", [], 0),
+                        wc.SubstepOutcome("s", "fail", [], 0)]
+            d = c.classify_failure(refs, "generate", outcomes)
+            self.assertEqual((d.action, d.target_phase, d.repair_strategy), ("retry", "generate", "reuse"))
+            self.assertTrue(d.reason.startswith("static_"))
 
 
 class ExecutePromoterTest(unittest.TestCase):

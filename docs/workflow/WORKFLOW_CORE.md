@@ -26,7 +26,7 @@ This document defines the workflow's phase sequence, inter-phase input/output co
 - `step` is treated as the orchestration-level execution unit corresponding to one phase.
 - `substep` refers to a lower execution unit decomposed from a `step`.
   - `Compile` has the 2 substeps `generate` and `verify`.
-  - `Generate` has the 3 substeps `generate`, `lint`, and `verify` — `lint` is a deterministic conductor-run substep (no leaf) between `generate` and `verify`; a lint finding warm-resumes `generate`.
+  - `Generate` has the 4 substeps `generate`, `lint`, `static`, and `verify` — `lint` and `static` are deterministic conductor-run substeps (no leaf) between `generate` and `verify` (`static` runs `validate_pipeline_semantics --stage post_generate` + `validate_workspace_root`); a `lint` or `static` finding warm-resumes `generate`, so the LLM `verify` is reached only on a deterministically-clean source.
   - `Validate` has the 2 substeps `execute` and `judge`.
   - `Build` is a single step that has no standard substep.
 - `stage` is used only as existing field names such as `generated_by_stage`, `<stage>_meta.json`, and `write_scope_baseline.json.stage`. It must not be used as a synonym for `phase` or `step` in the body text.
@@ -268,6 +268,7 @@ In this section, the input of each phase is described separately as `execution i
 - verification input: `spec.ir.yaml`, `controlled_spec.md` (verify-only, requirement-fidelity cross-check), the generated `source/<source_id>/src/`
 - output: `source/<source_id>/src/`, `source_meta.json`, `lint_meta.json` (the conductor-authored `Generate.lint` deliverable; see next bullet)
 - Before `Generate` completes, the conductor's deterministic `Generate.lint` substep runs the MCP `run_linter` consistent with `impl_defaults.toolchain.language` of `spec.ir.yaml` and writes both `source/<source_id>/lint_meta.json` (the freshness-gated deliverable recording the `run_linter` verdict) and the host-authored lint evidence (`<pipeline_root>/lint_evidence/<source_id>.json`, each element with `command_id`, `command_log_ref`, and `preset`); `post_generate` certifies it. The leaf does not run `run_linter`.
+- After `Generate.lint` and before `Generate.verify`, the conductor's deterministic `Generate.static` substep runs `validate_workspace_root.py` then `validate_pipeline_semantics --stage post_generate` (writing `source/<source_id>/static_meta.json`) — the purely-static gates the verify leaf used to own. A violation warm-resumes `generate`; otherwise `Generate.verify` runs as a pure LLM semantic pass that launches no validator gate. The leaf does not run these validators.
 - `Generate` must include in its official output a preset-compatible quality path with which `Validate.execute` can run using only the `preset` of `run_quality_checks`. On shortage, it is `Generate fail`.
 - With `toolchain.build_system=make` and `toolchain.language=fortran` / `c` / `cpp` / `mixed` families, a `test` or `check` target must be defined in `source/<source_id>/src/Makefile`. On absence, it is `Generate fail`.
 
@@ -292,7 +293,7 @@ The contract details per phase use the files under [phases/](phases/) as the can
 |-------|----------|---------|
 | 0 Spec (manual) | [phases/phase_00_spec.md](phases/phase_00_spec.md) | - |
 | 1 Compile | [phases/phase_01_compile.md](phases/phase_01_compile.md) | generate / verify |
-| 2 Generate | [phases/phase_02_generate.md](phases/phase_02_generate.md) | generate / lint / verify |
+| 2 Generate | [phases/phase_02_generate.md](phases/phase_02_generate.md) | generate / lint / static / verify |
 | 3 Build | [phases/phase_03_build.md](phases/phase_03_build.md) | - |
 | 4 Validate | [phases/phase_04_validate.md](phases/phase_04_validate.md) | execute / judge |
 

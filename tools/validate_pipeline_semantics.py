@@ -3045,8 +3045,9 @@ def _validate_source_meta_json_files(
             elif key == "context_isolated" and not isinstance(val, bool):
                 violations.append(f"{meta_path}:context_isolated must be boolean")
         # NOTE: lint is no longer recorded in source_meta.lint_command_ref (the leaf does
-        # not run run_linter); the conductor-run lint is certified by post_generate against
-        # the host-authored lint evidence (_validate_generate_lint_command_logs).
+        # not run run_linter); the conductor-run lint is certified by post_generate (which now
+        # runs in the deterministic generate.static substep, before verify) against the
+        # host-authored lint evidence (_validate_generate_lint_command_logs).
 
 
 def _validate_ir_meta_json(ir_dir: Path, violations: list[str]) -> None:
@@ -3800,7 +3801,7 @@ def _validate_generate_outputs(
 # and only surfaces at the build step as a compile_error, which forces an
 # expensive regenerate -> rebuild retry loop (observed in a past run: an
 # over-63-char subroutine name). Catching it here at post_generate fails the
-# cheap generate.verify substep instead, before the build phase ever runs.
+# cheap deterministic generate.static substep instead, before the build phase ever runs.
 # (See docs/workflow/phases/phase_02_generate.md; the generated code uses the
 # f2008 standard series — cf. the C003 / -std=f2008 note there.)
 _FORTRAN_NAME_LIMIT = 63
@@ -4566,8 +4567,25 @@ def _validate_generate_lint_command_logs(
     certificate cannot be forged by the leaf (the pipeline root is read-only inside the
     sandbox), so this validates against it rather than the former leaf-written
     `source_meta.lint_command_ref` (which is now ignored)."""
+    # meta_path = <pipeline_root>/source/<source_id>/source_meta.json
+    source_id = meta_path.parent.name
+    pipeline_root = meta_path.parents[2]
+    from tools.hooks.lint_evidence import lint_evidence_path, read_lint_evidence
+
+    # post_generate now runs in the deterministic `generate.static` substep, which executes
+    # BEFORE `generate.verify` sets verification_status=pass — but the conductor already wrote
+    # the lint evidence in `generate.lint`. Certify whenever that evidence exists (the
+    # static-stage flow) OR the leaf is claiming pass (legacy/back-compat). Skip only when
+    # neither holds (e.g. a manual or pre-lint invocation on an un-certified source), matching
+    # the prior "only certify a pass" behavior so unrelated callers are unaffected.
     status = data.get("verification_status")
-    if not isinstance(status, str) or status.strip().lower() != "pass":
+    verified_pass = isinstance(status, str) and status.strip().lower() == "pass"
+    try:
+        evidence_present = lint_evidence_path(
+            pipeline_root=pipeline_root, source_id=source_id).exists()
+    except ValueError:
+        evidence_present = False
+    if not verified_pass and not evidence_present:
         return
 
     if not impl_language:
@@ -4582,11 +4600,6 @@ def _validate_generate_lint_command_logs(
             f"{meta_path}: toolchain.language={impl_language!r} has no static lint mapping"
         )
         return
-
-    # meta_path = <pipeline_root>/source/<source_id>/source_meta.json
-    source_id = meta_path.parent.name
-    pipeline_root = meta_path.parents[2]
-    from tools.hooks.lint_evidence import read_lint_evidence
 
     try:
         evidence = read_lint_evidence(pipeline_root=pipeline_root, source_id=source_id)

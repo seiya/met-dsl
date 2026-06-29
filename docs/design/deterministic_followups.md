@@ -583,3 +583,71 @@ classification". Intra-phase iteration is unchanged.
 - Tests: dev `validate→generate` / `validate→compile` / execute-no-verdict rollback → `fail_closed`
   on first occurrence; same in prod → reopen/retry as today; dev intra-phase generate verify loop
   still retries (`DevPhaseRollbackTest`).
+
+## G1 — deterministic `Generate.static` substep: post_generate + workspace_root before LLM verify (IMPLEMENTED 2026-06-29)
+
+**Problem.** The purely-static post_generate gate
+(`validate_pipeline_semantics --stage post_generate` + `validate_workspace_root.py`) ran
+*inside* the LLM `Generate.verify` leaf as a SKILL responsibility. A full, cold,
+separate-persona verify pass (G1–G7 semantic checks) ran first and was thrown away whenever a
+purely structural defect (63-char identifier, `F0`/`L` descriptor, hardcoded snapshot name,
+forbidden runner output, makefile/naming/io_contract violation) tripped the gate at completion —
+wasted tokens with zero accuracy benefit.
+
+**Shape (nested loop the design realizes).**
+
+```
+loop1 (outer):
+  loop2 (inner): generate.generate (LLM, warm resume) -> lint -> static   # deterministic gates
+  generate.verify (pure LLM semantic G1-G7)
+```
+
+This is produced by the existing conductor machinery, not a new literal loop: the `run_phase`
+substep loop **breaks on the first non-pass substep**, and a `lint`/`static` finding routes to a
+**same-phase warm-resume reopen** of `generate.generate`. So `verify` is reached only when every
+deterministic gate is clean, and the producer leaf stays warm across inner iterations.
+
+**Decision — new `static` substep (not folded into `lint`).** `SUBSTEPS["generate"]` becomes
+`("generate", "lint", "static", "verify")`. A distinct substep keeps a distinct
+`failure_category` (`post_generate_violation` / `workspace_root_violation`) and routing reason
+(`static_*`) — mirroring how Build keeps `validate_post_build_violation` distinct from
+`compile_error` — and is low-risk because `classify_failure` maps the failed substep **by name**,
+not index. It also makes the three substep-aware phases symmetric:
+`compile→post_build`, `generate→post_generate`, `validate→post_execute`.
+
+**Where implemented (`tools/workflow_conductor.py`).**
+- `SUBSTEPS["generate"]` + `STATIC_FAILURE_ROUTING` + `classify_static_failure` (mirrors the lint
+  table/classifier).
+- `_is_deterministic_substep` and `_run_deterministic_substep` dispatch `generate.static` →
+  new `_static_inproc`, which runs the two validators via `subprocess.run` (same idiom as the
+  post_build gate in `_build_inproc`) and writes `static_meta.json` (`status` +
+  `failure_category` + `failure_excerpt`). A violation is a CONTENT failure (rc 0) routed via the
+  table; only an unexpected exception becomes a transport `fail_closed`.
+- `determine_substep_status` and `classify_failure` gain `generate.static` branches reading
+  `static_meta.json`.
+- The same-phase warm-reopen guard in `conduct` widened from `.startswith("lint_")` to
+  `.startswith(("lint_", "static_"))`. (Cleaner long-term form: a `same_phase_reopen` bool on
+  `RouteDecision`; deferred for minimal diff.)
+- `build_launch_request` gains a `static` arm with `allowed_output_paths=[<src>/static_meta.json]`.
+  `static_meta.json` is intentionally NOT a `phase_required_outputs` entry (parity with
+  `lint_meta.json`); the substep freshness gate covers it.
+
+**Ownership transfer (`tools/orchestration_runtime.py`).**
+`ALLOWED_VALIDATE_PIPELINE_STAGES[("generate","verify")]` set to `frozenset()`;
+`("generate","static"): frozenset()` added (keeps the table total). `_render_runbook`'s
+`generate.verify` branch removed → it returns `""`. `generate.verify` therefore launches **no**
+validator gate and is a pure LLM semantic pass.
+
+**SKILL/doc updates.** `skills/workflow-generate-verify/SKILL.md` drops the post_generate +
+workspace_root leaf responsibility (old Operations Rules 6/7). `phase_02_generate.md`,
+`WORKFLOW_CORE.md`, `ORCHESTRATION.md` updated to `generate → lint → static → verify`.
+
+**Non-regression notes.**
+- The verify leaf invoked `validate_workspace_root.py` **without** `--write-scope-baseline`; the
+  baseline branch was never reached. `_static_inproc` reproduces the exact bare invocation — no
+  dropped argument. (Do not "correct" this by adding a baseline.)
+- `post_generate` is purely static and does **not** read `source_meta.verification_status`, so
+  running it before verify is acyclic. It certifies `lint_evidence`, which the conductor wrote in
+  `_lint_inproc` earlier in the same attempt — i.e. it certifies conductor-owned evidence.
+- `static_meta.json` lives under `source/<id>/` (the substep's own write_root), so unlike the
+  pipeline-root `lint_evidence` certificate it needs no `record-agent-run` write exemption.

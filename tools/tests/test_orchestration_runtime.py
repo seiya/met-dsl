@@ -1428,11 +1428,22 @@ shell_tool                       stable             true
         with self.assertRaisesRegex(ValueError, "agent_model"):
             _validate_launch_request_payload(lint)
 
-        # A deterministic flag on a non-lint generate substep IS rejected by the allowlist.
+        # A deterministic flag on a non-lint/static generate substep IS rejected.
         forged = {"node_key": "component/spec_x@0.1.0", "step": "generate",
                   "substep": "generate", "deterministic": True}
         with self.assertRaisesRegex(ValueError, "deterministic=True is only valid"):
             _validate_launch_request_payload(forged)
+
+    def test_validate_launch_request_payload_accepts_deterministic_generate_static(self) -> None:
+        """The deterministic-flag allowlist must also include generate.static (else every
+        generate node fails at the static substep's record-launch). Like lint, a static payload
+        that passes the allowlist falls through to the agent_model error."""
+        from tools.orchestration_runtime import _validate_launch_request_payload
+
+        static = {"node_key": "component/spec_x@0.1.0", "step": "generate",
+                  "substep": "static", "deterministic": True}
+        with self.assertRaisesRegex(ValueError, "agent_model"):
+            _validate_launch_request_payload(static)
 
     def test_writes_orchestration_artifacts_in_canonical_layout(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -2591,6 +2602,62 @@ shell_tool                       stable             true
         )
         self.assertIn(lint_meta, out)
         self.assertIn(command_log, out)
+
+    def test_generate_static_launch_accepts_static_meta_json(self) -> None:
+        """The deterministic Generate.static substep declares
+        source/<source_id>/static_meta.json as its conductor-authored deliverable
+        (workflow_conductor._static_inproc). It sits at the source root, so the generate phase
+        contract must accept it — else every generate node fails at the static substep's
+        record-launch with "outside phase contract outputs for step='generate'".
+        """
+        from tools.orchestration_runtime import _allowed_output_paths_for_launch
+
+        src_id = "src_static_meta_001"
+        static_meta = f"{_FIX_PIPE_REF}/source/{src_id}/static_meta.json"
+        req = {
+            "agent_role": "substep",
+            "node_key": "problem/shallow_water2d@0.3.0",
+            "step": "generate",
+            "substep": "static",
+            "ir_ref": _FIX_IR_REF,
+            "pipeline_ref": _FIX_PIPE_REF,
+            "source_id": src_id,
+            "allowed_output_paths": [static_meta],
+        }
+        out = _allowed_output_paths_for_launch(
+            request_payload=req,
+            write_roots=[f"{_FIX_PIPE_REF}/source/"],
+        )
+        self.assertIn(static_meta, out)
+
+    def test_generate_non_static_launch_rejects_static_meta_json(self) -> None:
+        """static_meta.json is conductor-authored and leaf-non-writable. A
+        Generate.generate / Generate.verify leaf launch must NOT be able to list it as an
+        output (it would auto-authorize overwriting the static verdict). The generate phase
+        contract accepts static_meta.json for the deterministic Generate.static substep ONLY.
+        """
+        from tools.orchestration_runtime import _allowed_output_paths_for_launch
+
+        src_id = "src_static_meta_002"
+        static_meta = f"{_FIX_PIPE_REF}/source/{src_id}/static_meta.json"
+        model_src = f"{_FIX_PIPE_REF}/source/{src_id}/src/m_model.f90"
+        for substep in ("generate", "verify"):
+            with self.subTest(substep=substep):
+                req = {
+                    "agent_role": "substep",
+                    "node_key": "problem/shallow_water2d@0.3.0",
+                    "step": "generate",
+                    "substep": substep,
+                    "ir_ref": _FIX_IR_REF,
+                    "pipeline_ref": _FIX_PIPE_REF,
+                    "source_id": src_id,
+                    "allowed_output_paths": [model_src, static_meta],
+                }
+                with self.assertRaisesRegex(ValueError, "outside phase contract outputs"):
+                    _allowed_output_paths_for_launch(
+                        request_payload=req,
+                        write_roots=[f"{_FIX_PIPE_REF}/source/"],
+                    )
 
     def test_generate_non_lint_launch_rejects_lint_meta_json(self) -> None:
         """lint_meta.json is conductor-authored and leaf-non-writable. A
@@ -15322,15 +15389,16 @@ class GateRunbookTests(unittest.TestCase):
 
         for (step, substep), allowed in ALLOWED_VALIDATE_PIPELINE_STAGES.items():
             if (step == "build" or (step == "validate" and substep == "execute")
-                    or (step == "generate" and substep == "lint")):
+                    or (step == "generate" and substep in ("lint", "static"))):
                 continue  # deterministic — covered separately
             with self.subTest(step=step, substep=substep):
                 rb = _build_gate_runbook(self._payload(step, substep))
-                self.assertTrue(rb, "LLM phase must produce a runbook")
                 stages = set(_re.findall(
                     r"validate_pipeline_semantics\.py --stage (\w+)", rb))
                 # Every emitted vps stage must be in the allow-set; empty allow-set
-                # means no vps command at all.
+                # means no vps command at all. (generate.verify now has an empty allow-set
+                # and emits NO runbook — its gates moved to the deterministic generate.static
+                # substep — so an empty rb is legitimate here.)
                 self.assertTrue(stages <= set(allowed),
                                 f"emitted {stages} not subset of allowed {set(allowed)}")
                 if not allowed:
@@ -15359,16 +15427,23 @@ class GateRunbookTests(unittest.TestCase):
             "--pipeline-root workspace/pipelines/component__demo_dep_top__0.1.0/d_002", rb)
         self.assertIn("--run-id run_20260626_001", rb)
 
-    def test_runbook_generate_verify_includes_source_id_when_present(self) -> None:
-        from tools.orchestration_runtime import _build_gate_runbook
+    def test_runbook_generate_verify_emits_no_gate(self) -> None:
+        # The post_generate + workspace_root gates moved to the conductor's deterministic
+        # generate.static substep, so generate.verify is a pure LLM pass that emits NO runbook.
+        from tools.orchestration_runtime import (
+            _build_gate_runbook,
+            ALLOWED_VALIDATE_PIPELINE_STAGES,
+        )
 
-        rb = _build_gate_runbook(self._payload("generate", "verify"))
-        self.assertIn("--stage post_generate", rb)
-        self.assertIn("--source-id src_20260626_001", rb)
-        # Without source_id the flag is omitted (no stray "--source-id").
-        rb2 = _build_gate_runbook(self._payload("generate", "verify", source_id=""))
-        self.assertIn("--stage post_generate", rb2)
-        self.assertNotIn("--source-id", rb2)
+        self.assertEqual(_build_gate_runbook(self._payload("generate", "verify")), "")
+        # The substep table maps both generate.verify and the deterministic generate.static
+        # to the empty stage set (keeps the table total; no validator gate from either).
+        self.assertEqual(ALLOWED_VALIDATE_PIPELINE_STAGES[("generate", "verify")], frozenset())
+        self.assertEqual(ALLOWED_VALIDATE_PIPELINE_STAGES[("generate", "static")], frozenset())
+        # generate.static is deterministic -> empty runbook (the deterministic short-circuit).
+        self.assertEqual(
+            _build_gate_runbook(
+                self._payload("generate", "static", deterministic=True)), "")
 
     def test_runbook_empty_for_deterministic_and_unmapped(self) -> None:
         from tools.orchestration_runtime import _build_gate_runbook
@@ -15388,11 +15463,13 @@ class GateRunbookTests(unittest.TestCase):
             _validate_launch_prompt_text,
         )
 
+        # generate.verify is intentionally excluded: its gates moved to the deterministic
+        # generate.static substep, so it now renders with no Gate Runbook (covered by
+        # test_rendered_prompt_unmapped_phase_no_stray_marker's empty-runbook behavior).
         for step, substep in (
             ("compile", "generate"),
             ("compile", "verify"),
             ("generate", "generate"),
-            ("generate", "verify"),
             ("validate", "judge"),
         ):
             with self.subTest(step=step, substep=substep):
@@ -24667,6 +24744,28 @@ class ReopenPhaseTest(unittest.TestCase):
             result = reopen_phase(
                 repo_root, oid, node_key=self.NODE_KEY, from_phase="generate",
                 reason="lint_lint_findings", trigger_agent_run_id="generate-lint-1")
+            self.assertEqual(result["status"], "reopened")
+            self.assertEqual(result["affected_phases"], ["generate", "build", "validate"])
+
+    def test_reopen_accepts_same_phase_generate_static_trigger(self) -> None:
+        # The carve-out extends to generate.static: a failed static substep (post_generate /
+        # workspace_root violation) may reopen generate itself so generate.generate
+        # warm-resumes to fix its source — same mechanism as lint.
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            oid = "orch_reopen_static"
+            self._build_fixture(repo_root, oid)
+            root = repo_root / "workspace" / "orchestrations" / oid
+            with (root / "agent_runs.jsonl").open("a", encoding="utf-8") as f:
+                f.write(json.dumps({
+                    "agent_run_id": "generate-static-1", "agent_role": "substep",
+                    "step": "generate", "substep": "static", "status": "fail",
+                    "node_key": self.NODE_KEY,
+                }) + "\n")
+            result = reopen_phase(
+                repo_root, oid, node_key=self.NODE_KEY, from_phase="generate",
+                reason="static_post_generate_violation",
+                trigger_agent_run_id="generate-static-1")
             self.assertEqual(result["status"], "reopened")
             self.assertEqual(result["affected_phases"], ["generate", "build", "validate"])
 

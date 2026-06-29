@@ -4853,6 +4853,13 @@ def _allowed_output_paths_for_launch(
                 # also excludes lint_meta.json from the auto-derived file-tool set.
                 if substep_token == "lint" and path.endswith("/lint_meta.json"):
                     return True
+                # Generate.static deliverable: the conductor-authored, freshness-gated
+                # static_meta.json sits at the source root (source/<source_id>/static_meta.json),
+                # a sibling of source_meta.json. Gated to the deterministic Generate.static
+                # substep ONLY (same rationale as lint_meta.json above: leaf launches must not
+                # be able to list a conductor-authored verdict as their own output).
+                if substep_token == "static" and path.endswith("/static_meta.json"):
+                    return True
             return False
         if step_token == "build":
             # Cross-phase exception: in-source Make builds for Fortran/C
@@ -5405,6 +5412,10 @@ def _allowed_file_tool_paths_for_launch(
             # .../src/) is an ordinary leaf output and stays writable (and _matches_phase_
             # contract already accepts it via its /src/ rule, checked first).
             and not (path.endswith("/lint_meta.json") and "/src/" not in path)
+            # Same treatment for the Generate.static deliverable static_meta.json
+            # (source/<source_id>/static_meta.json, conductor-authored in-process by
+            # workflow_conductor._static_inproc): never leaf-writable.
+            and not (path.endswith("/static_meta.json") and "/src/" not in path)
         }
         result = sorted(derived)
         _assert_mandatory_file_tool_pins_present(
@@ -5434,6 +5445,12 @@ def _allowed_file_tool_paths_for_launch(
             raise ValueError(
                 f"allowed_file_tool_paths[{idx}] must not include the conductor-authored "
                 f"lint deliverable: {path!r} (written exclusively by Generate.lint in-process)"
+            )
+        # Same for the source-ROOT static_meta.json (Generate.static in-process deliverable).
+        if path.endswith("/static_meta.json") and "/src/" not in path:
+            raise ValueError(
+                f"allowed_file_tool_paths[{idx}] must not include the conductor-authored "
+                f"static deliverable: {path!r} (written exclusively by Generate.static in-process)"
             )
         # Phase-2: managed `.json` / `.txt` artifacts are written directly by the
         # confined leaf (FS-diff attribution), so they are no longer rejected here
@@ -5479,8 +5496,9 @@ def _mandatory_file_tool_pins_for_launch(
     # substep inspects src/ and writes source_meta.json — granting it Makefile
     # (build-control) write authority would let the verifier mutate the very
     # artifact it is supposed to judge, so it must be excluded. The deterministic
-    # Generate.lint substep (conductor-run, no leaf) writes no Makefile either.
-    if step_token != "generate" or substep_token in ("verify", "lint") or not pipeline_ref:
+    # Generate.lint / Generate.static substeps (conductor-run, no leaf) write no Makefile
+    # either (static writes only static_meta.json).
+    if step_token != "generate" or substep_token in ("verify", "lint", "static") or not pipeline_ref:
         return []
     # When the conductor authors src/Makefile host-side (_write_makefile: make AND fortran,
     # leaf OR dependency) it is NOT a leaf deliverable and must not be pinned (the file already
@@ -5547,7 +5565,7 @@ def _mandatory_phase_outputs_for_launch(
     # Phase-2: the pipeline ``lineage.json`` is no longer a leaf output — it sits at the
     # pipeline root, which must stay non-writable to the sandboxed leaf (the Edit/Write
     # tools' atomic temp-sibling+rename would need the whole root writable). The conductor
-    # authors it host-side (workflow_conductor._write_lineage) before generate.verify's
+    # authors it host-side (workflow_conductor._write_lineage) before generate.static's
     # post_generate gate runs, so it is NOT injected into the generate child's
     # allowed_output_paths (historical audit: orch_20260615T095217Z_74450292 predates this).
     if step_token != "validate" or substep_token != "execute" or not pipeline_ref:
@@ -8208,7 +8226,6 @@ def _build_gate_runbook(request_payload: dict[str, Any]) -> str:
     ir_ref = str(request_payload.get("ir_ref", "")).strip().rstrip("/")
     pipeline_ref = str(request_payload.get("pipeline_ref", "")).strip().rstrip("/")
     run_id = str(request_payload.get("run_id", "")).strip()
-    source_id = str(request_payload.get("source_id", "")).strip()
 
     # Per-(step, substep) gate command sequence. Each command is a single logical line
     # (no `\` continuation) so the gate-allowlist stage scanner reads `--stage` within
@@ -8232,17 +8249,11 @@ def _build_gate_runbook(request_payload: dict[str, Any]) -> str:
         commands = [
             "python3 tools/validate_workspace_root.py",
         ]
-    elif step == "generate" and substep == "verify":
-        post_generate = (
-            "python3 tools/validate_pipeline_semantics.py --stage post_generate "
-            f"--pipeline-root {pipeline_ref}"
-        )
-        if source_id:
-            post_generate += f" --source-id {source_id}"
-        commands = [
-            "python3 tools/validate_workspace_root.py",
-            post_generate,
-        ]
+    # generate.verify emits NO gate runbook: the post_generate + workspace_root gates it used
+    # to run now execute deterministically in the conductor's generate.static substep
+    # (Conductor._static_inproc) BEFORE verify, so verify is reached only on a
+    # deterministically-clean source and is a pure LLM semantic (G1-G7) pass. It therefore
+    # falls through to the `else` branch below and returns "" (no runbook).
     elif step == "validate" and substep == "judge":
         # Scoped pre_judge: `--pipeline-root`/`--run-id` confine the loaded executions to
         # this run so historically-broken sibling pipelines/runs cannot fail an otherwise-
@@ -9040,11 +9051,14 @@ ALLOWED_VALIDATE_PIPELINE_STAGES: dict[tuple[str, str], frozenset[str]] = {
     ("compile", "generate"): frozenset(),
     ("compile", "verify"): frozenset({"compile"}),
     ("generate", "generate"): frozenset(),
-    # generate.lint is the deterministic in-process lint substep (no leaf, no
-    # validate_pipeline_semantics invocation); the empty set keeps the table total so a
-    # lookup for it never KeyErrors.
+    # generate.lint and generate.static are deterministic in-process substeps (no leaf, no
+    # validate_pipeline_semantics invocation); the empty sets keep the table total so a
+    # lookup for them never KeyErrors. The post_generate gate that generate.verify used to
+    # own now runs in the conductor's generate.static substep (Conductor._static_inproc), so
+    # generate.verify is a pure LLM semantic pass that invokes no validator gate.
     ("generate", "lint"): frozenset(),
-    ("generate", "verify"): frozenset({"post_generate"}),
+    ("generate", "static"): frozenset(),
+    ("generate", "verify"): frozenset(),
     ("build", ""): frozenset({"post_build"}),
     ("validate", "execute"): frozenset({"post_execute"}),
     ("validate", "judge"): frozenset({"pre_judge"}),
@@ -10457,19 +10471,19 @@ def _validate_launch_request_payload(request_payload: dict[str, Any]) -> None:
     if not isinstance(step, str) or not step.strip():
         raise ValueError("launch request must include non-empty step")
     # Defense-in-depth: `deterministic` (in-process, skill-/constraint-line-exempt) is
-    # only legitimate for the non-LLM substeps Build, Validate.execute and Generate.lint.
-    # Reject the flag on any other step so a forged/buggy payload cannot claim the reduced
-    # launch-prompt guards while being a leaf step. (The flag is host-set by the conductor
-    # today; this makes the invariant explicit at the validation chokepoint.)
+    # only legitimate for the non-LLM substeps Build, Validate.execute, Generate.lint and
+    # Generate.static. Reject the flag on any other step so a forged/buggy payload cannot
+    # claim the reduced launch-prompt guards while being a leaf step. (The flag is host-set by
+    # the conductor today; this makes the invariant explicit at the validation chokepoint.)
     if request_payload.get("deterministic"):
         step_l = step.strip().lower()
         substep_l = str(substep).strip().lower() if isinstance(substep, str) else ""
         if not (step_l == "build"
                 or (step_l == "validate" and substep_l == "execute")
-                or (step_l == "generate" and substep_l == "lint")):
+                or (step_l == "generate" and substep_l in ("lint", "static"))):
             raise ValueError(
                 "launch request: deterministic=True is only valid for step=build, "
-                "step=validate substep=execute, or step=generate substep=lint "
+                "step=validate substep=execute, or step=generate substep=lint|static "
                 f"(got step={step!r} substep={substep!r})"
             )
     # agent_model identifies the LLM that produced the child's artifacts. At launch
@@ -14844,15 +14858,16 @@ def reopen_phase(
         )
     trig_step = str(trigger.get("step") or "").strip().lower()
     trig_substep = str(trigger.get("substep") or "").strip().lower()
-    # Same-phase carve-out: a `generate.lint` finding reopens generate itself
-    # (from_phase == trigger phase) so the SAME generate.generate leaf warm-resumes to fix
-    # its source. This is the ONLY permitted same-phase reopen. It stays anti-abuse-safe:
-    # the trigger must still be a terminal NON-PASS generate.lint substep (checked below),
-    # so a passing pipeline can never be erased, and generate.generate / generate.verify can
-    # never reopen their own phase. Every other trigger must be strictly downstream.
-    same_phase_lint = trig_step == from_token == "generate" and trig_substep == "lint"
+    # Same-phase carve-out: a `generate.lint` or `generate.static` finding reopens generate
+    # itself (from_phase == trigger phase) so the SAME generate.generate leaf warm-resumes to
+    # fix its source. These are the ONLY permitted same-phase reopens. It stays anti-abuse-safe:
+    # the trigger must still be a terminal NON-PASS generate.lint/static substep (checked
+    # below), so a passing pipeline can never be erased, and generate.generate / generate.verify
+    # can never reopen their own phase. Every other trigger must be strictly downstream.
+    same_phase_det = (trig_step == from_token == "generate"
+                      and trig_substep in ("lint", "static"))
     if trig_step not in STEP_KEYS_FOR_NODE_STATE or (
-        STEP_KEYS_FOR_NODE_STATE.index(trig_step) <= from_idx and not same_phase_lint
+        STEP_KEYS_FOR_NODE_STATE.index(trig_step) <= from_idx and not same_phase_det
     ):
         raise RuntimeError(
             f"reopen-phase: trigger phase {trig_step!r} must be strictly downstream of "

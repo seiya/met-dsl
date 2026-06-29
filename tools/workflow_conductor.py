@@ -65,11 +65,15 @@ PHASE_ORDER: tuple[str, ...] = ("compile", "generate", "build", "validate")
 # represented as [None] so the loop body is uniform.
 SUBSTEPS: dict[str, tuple[str | None, ...]] = {
     "compile": ("generate", "verify"),
-    # generate.lint is a deterministic in-process substep run by the conductor
-    # (Conductor._lint_inproc) AFTER generate.generate produces source/<id>/src/ and
-    # BEFORE generate.verify. The leaf no longer invokes run_linter; lint findings route
-    # back to generate.generate via a warm-resume reopen (LINT_FAILURE_ROUTING).
-    "generate": ("generate", "lint", "verify"),
+    # generate.lint and generate.static are deterministic in-process substeps run by the
+    # conductor AFTER generate.generate produces source/<id>/src/ and BEFORE generate.verify:
+    #   - lint   (Conductor._lint_inproc):   runs run_linter; the leaf no longer invokes it.
+    #   - static (Conductor._static_inproc): runs validate_pipeline_semantics --stage
+    #     post_generate + validate_workspace_root; the verify leaf no longer invokes them, so
+    #     verify is a pure LLM semantic (G1-G7) pass reached only on a deterministically-clean
+    #     source. Both substeps route findings back to generate.generate via a warm-resume
+    #     reopen (LINT_FAILURE_ROUTING / STATIC_FAILURE_ROUTING).
+    "generate": ("generate", "lint", "static", "verify"),
     "build": (None,),
     "validate": ("execute", "judge"),
 }
@@ -129,6 +133,16 @@ BUILD_FAILURE_ROUTING: dict[str, tuple[str, str]] = {
 # while the failing substep is generate.lint); conduct() handles that case specially.
 LINT_FAILURE_ROUTING: dict[str, tuple[str, str]] = {
     "lint_findings": ("generate", "reuse"),
+}
+
+# Static-gate (generate.static) failure_category -> (retry_target_phase, repair_strategy).
+# The deterministic post_generate / workspace_root gates run AFTER generate.lint and BEFORE
+# generate.verify; a structural violation re-runs generate.generate with a warm resume
+# (reuse) exactly like a lint finding, so the same leaf fixes its own source with context
+# intact. Like lint, this is a SAME-PHASE reopen handled specially by conduct().
+STATIC_FAILURE_ROUTING: dict[str, tuple[str, str]] = {
+    "post_generate_violation": ("generate", "reuse"),
+    "workspace_root_violation": ("generate", "reuse"),
 }
 
 # Validate.judge (failure_class, attribution) -> routing action.
@@ -195,6 +209,17 @@ def classify_lint_failure(failure_category: str | None) -> RouteDecision:
     target, strategy = routed
     return RouteDecision("retry", target_phase=target, repair_strategy=strategy,
                          reason=f"lint_{failure_category}")
+
+
+def classify_static_failure(failure_category: str | None) -> RouteDecision:
+    if not failure_category:
+        return RouteDecision("escalate", reason="static_fail_no_category")
+    routed = STATIC_FAILURE_ROUTING.get(failure_category)
+    if routed is None:
+        return RouteDecision("escalate", reason=f"static_unknown_category:{failure_category}")
+    target, strategy = routed
+    return RouteDecision("retry", target_phase=target, repair_strategy=strategy,
+                         reason=f"static_{failure_category}")
 
 
 def classify_validate_judge(failure_class: str | None, attribution: str | None) -> RouteDecision:
@@ -421,11 +446,11 @@ def build_launch_request(
     spec = refs.spec_path
     skill = _skill_name(step, substep)
     role = child_agent_role(step)
-    # Build, Validate.execute and Generate.lint run in-process (no leaf), so they carry no
-    # skill / leaf prompt — only the bookkeeping the capability/phase_state need.
+    # Build, Validate.execute, Generate.lint and Generate.static run in-process (no leaf), so
+    # they carry no skill / leaf prompt — only the bookkeeping the capability/phase_state need.
     deterministic = (step == "build"
                      or (step == "validate" and substep == "execute")
-                     or (step == "generate" and substep == "lint"))
+                     or (step == "generate" and substep in ("lint", "static")))
     rep = {
         "issue_severity": "none",
         "repair_strategy": "none",
@@ -516,6 +541,14 @@ def build_launch_request(
             req["allowed_output_paths"] = [
                 f"{src}/lint_meta.json",
                 f"{src}/src/command_log.jsonl",
+            ]
+        elif substep == "static":
+            # Deterministic in-process static gate: the conductor authors static_meta.json
+            # (the only freshness-gated deliverable) from validate_pipeline_semantics
+            # --stage post_generate + validate_workspace_root. Those validators do not append
+            # to command_log.jsonl, so it is not listed here.
+            req["allowed_output_paths"] = [
+                f"{src}/static_meta.json",
             ]
         else:  # verify
             must_read += [
@@ -1321,6 +1354,15 @@ clean:
             meta = _read_json(self.repo_root / refs.source_dir() / "lint_meta.json") or {}
             status = "pass" if (meta.get("lint_status") == "pass"
                                 and _fresh_deliverables_written(allowed_output_paths)) else "fail"
+        elif phase == "generate" and substep == "static":
+            # Deterministic static gate: the conductor-authored static_meta records the
+            # post_generate + workspace_root verdict. A violation is status=fail with rc 0, so
+            # the substep fails here and classify_static_failure routes back to
+            # generate.generate (warm resume), not transport fail_closed. static_meta.json is
+            # the only freshness-gated deliverable.
+            meta = _read_json(self.repo_root / refs.source_dir() / "static_meta.json") or {}
+            status = "pass" if (meta.get("status") == "pass"
+                                and _fresh_deliverables_written(allowed_output_paths)) else "fail"
         elif phase == "validate" and substep == "execute":
             # Deterministic execute: trial_meta.status reflects run_program +
             # quality_check + post_execute gate; content failures (rc 0) route via the
@@ -1391,7 +1433,7 @@ clean:
     def _is_deterministic_substep(phase: str, substep: str | None) -> bool:
         return (phase == "build"
                 or (phase == "validate" and substep == "execute")
-                or (phase == "generate" and substep == "lint"))
+                or (phase == "generate" and substep in ("lint", "static")))
 
     def _capability_token(self, child_arid: str) -> str:
         path = (self.repo_root / "workspace" / "orchestrations" / self.orchestration_id
@@ -1460,6 +1502,8 @@ clean:
                 out = self._execute_inproc(refs, child_arid, cap_token)
             elif phase == "generate" and substep == "lint":
                 out = self._lint_inproc(refs, child_arid, cap_token)
+            elif phase == "generate" and substep == "static":
+                out = self._static_inproc(refs, child_arid, cap_token)
             else:
                 raise RuntimeError(f"no deterministic body for {phase}.{substep}")
         except Exception as exc:  # noqa: BLE001 - surfaced as transport failure
@@ -1804,6 +1848,62 @@ clean:
         return {"returncode": 0,
                 "stdout": "",
                 "stderr": "" if ok else (failure_excerpt or "")}
+
+    def _static_inproc(self, refs: NodeRefs, child_arid: str, cap_token: str) -> dict[str, str]:
+        """Deterministic Generate.static: run the purely-static post_generate gates that the
+        verify leaf used to own (so verify is now a pure LLM semantic G1-G7 pass reached only
+        on a deterministically-clean source). Runs validate_workspace_root.py (bare, as the
+        leaf did - no --write-scope-baseline) and validate_pipeline_semantics --stage
+        post_generate, in the same order/idiom as the post_build gate in _build_inproc. A
+        violation is a CONTENT failure (status=fail + failure_category, rc 0) routed by
+        classify_static_failure back to generate.generate via a warm-resume reopen; only an
+        unexpected error surfaces as a transport fail_closed (caught in
+        _run_deterministic_substep). The conductor wrote lint_evidence earlier this attempt
+        (_lint_inproc), so the post_generate certification certifies conductor-owned evidence.
+        """
+        status = "pass"
+        failure_category: str | None = None
+        failure_excerpt: str | None = None
+        stderr = ""
+
+        # workspace_root first (global layout/scope), then post_generate (src/io_contract).
+        ws = subprocess.run(
+            ["python3", "tools/validate_workspace_root.py"],
+            cwd=self.repo_root, env=self.env, text=True, capture_output=True, check=False)
+        if ws.returncode != 0:
+            status = "fail"
+            failure_category = "workspace_root_violation"
+            failure_excerpt = "\n".join((ws.stdout + ws.stderr).splitlines()[-50:])
+            stderr = "[workspace_root gate fail]\n" + ws.stdout + ws.stderr
+        else:
+            pg = subprocess.run(
+                ["python3", "tools/validate_pipeline_semantics.py", "--stage", "post_generate",
+                 "--pipeline-root", refs.pipeline_ref, "--source-id", refs.source_id or ""],
+                cwd=self.repo_root, env=self.env, text=True, capture_output=True, check=False)
+            if pg.returncode != 0:
+                status = "fail"
+                failure_category = "post_generate_violation"
+                failure_excerpt = "\n".join((pg.stdout + pg.stderr).splitlines()[-50:])
+                stderr = "[post_generate gate fail]\n" + pg.stdout + pg.stderr
+
+        static_meta: dict[str, Any] = {
+            "source_id": refs.source_id,
+            "node_key": refs.node_key,
+            "pipeline_id": refs.pipeline_id,
+            "attempt_count": 1,
+            "status": status,
+            "verification_status": status,
+            "failure_category": failure_category,
+            "failure_excerpt": failure_excerpt,
+        }
+        meta_path = self.repo_root / refs.source_dir() / "static_meta.json"
+        meta_path.parent.mkdir(parents=True, exist_ok=True)
+        meta_path.write_text(
+            json.dumps(static_meta, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+
+        # Content failure returns rc 0 so run_phase routes it via classify_static_failure ->
+        # generate.generate (warm resume). determine_substep_status reads static_meta.status.
+        return {"returncode": 0, "stdout": "", "stderr": stderr}
 
     # -- deterministic Validate.execute (run + quality_check + evidence promote) --
 
@@ -2350,7 +2450,7 @@ clean:
         self.workflow_launch_check(node_key, phase, child_agent_role(phase))
         self._ensure_fresh_producer_id(refs, phase)
         # Author/refresh the pipeline lineage.json host-side BEFORE the substeps run:
-        # generate.verify's post_generate gate requires it, and the sandboxed leaf cannot
+        # generate.static's post_generate gate requires it, and the sandboxed leaf cannot
         # write it (pipeline-root file; see _write_lineage). Pipeline phases only —
         # compile writes under workspace/ir/, not the pipeline root.
         dep_facts: tuple[dict[str, str], ...] = ()
@@ -2358,7 +2458,7 @@ clean:
             dep_facts = tuple(self._write_lineage(refs))
         # The conductor authors src/Makefile deterministically (runtime-owned, like
         # lineage.json) for every make+fortran node BEFORE the substeps run: the generate leaf
-        # must not author it, and generate.verify's post_generate gate inspects it. The
+        # must not author it, and generate.static's post_generate gate inspects it. The
         # template encodes the fixed runner->model use-graph and, for a dependency node, the
         # closure object rules (Model B); the dep sources are staged at build (see
         # _stage_dependency_sources). c/cpp/mixed keep LLM authoring (see _write_makefile).
@@ -2495,13 +2595,16 @@ clean:
             return classify_build_failure(meta.get("failure_category"))
         if phase == "generate" and outcomes and outcomes[-1].status != "pass":
             # The substep that failed is the last one the run_phase loop ran (it breaks on
-            # first failure), so it maps to SUBSTEPS["generate"][len(outcomes)-1]. A lint
-            # failure routes via the deterministic lint table (warm resume); generate.generate
+            # first failure), so it maps to SUBSTEPS["generate"][len(outcomes)-1]. A lint or
+            # static failure routes via its deterministic table (warm resume); generate.generate
             # / generate.verify fall through to the verify-severity gate below.
             failed_substep = SUBSTEPS["generate"][len(outcomes) - 1]
             if failed_substep == "lint":
                 meta = _read_json(self.repo_root / refs.source_dir() / "lint_meta.json") or {}
                 return classify_lint_failure(meta.get("failure_category"))
+            if failed_substep == "static":
+                meta = _read_json(self.repo_root / refs.source_dir() / "static_meta.json") or {}
+                return classify_static_failure(meta.get("failure_category"))
         if phase == "validate":
             # An execute-substep failure (deterministic) means judge never ran, so there
             # is no verdict.json. The runner produced bad/missing primary evidence (a
@@ -2638,18 +2741,19 @@ clean:
                                 reason_detail=f"{target} exceeded {MAX_ATTEMPTS_PER_PHASE}")
                 return "fail_closed"
 
-            # Same-phase warm reopen for a generate.lint finding: re-run generate.generate
-            # with a reuse repair so the SAME leaf fixes its own source (context intact),
-            # instead of terminalizing here as the generic same/downstream branch does. The
-            # deterministic lint substep runs once per attempt (run_phase does NOT exhaust an
-            # in-place retry the way a verify failure does), so a same-phase re-run is the
-            # correct recovery, not a terminal. Bounded by attempts[target] above. The dev
-            # rollback guard (target_idx < idx) does not fire (this is a within-phase reopen,
-            # consistent with the dev "auto-retry within a single phase" policy).
+            # Same-phase warm reopen for a generate.lint or generate.static finding: re-run
+            # generate.generate with a reuse repair so the SAME leaf fixes its own source
+            # (context intact), instead of terminalizing here as the generic same/downstream
+            # branch does. The deterministic lint/static substeps run once per attempt
+            # (run_phase does NOT exhaust an in-place retry the way a verify failure does), so a
+            # same-phase re-run is the correct recovery, not a terminal. Bounded by
+            # attempts[target] above. The dev rollback guard (target_idx < idx) does not fire
+            # (this is a within-phase reopen, consistent with the dev "auto-retry within a
+            # single phase" policy).
             if (target_idx == idx and target == "generate"
                     and decision.action == "retry"
                     and decision.repair_strategy == "reuse"
-                    and (decision.reason or "").startswith("lint_")):
+                    and (decision.reason or "").startswith(("lint_", "static_"))):
                 trigger = outcome.failed_substeps[-1] if outcome.failed_substeps else None
                 if trigger is None:
                     self.set_status("fail", reason_code="generate_fail",

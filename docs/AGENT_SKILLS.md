@@ -38,6 +38,8 @@ This document defines the reference conventions for the `skills` used in the pro
 - `Compile generate`: `skills/workflow-compile-generate/SKILL.md`
 - `Compile verify`: `skills/workflow-compile-verify/SKILL.md`
 - `Generate generate`: `skills/workflow-generate-generate/SKILL.md`
+- `Generate lint`: conductor in-process (no SKILL; deterministic `run_linter`, see `docs/workflow/phases/phase_02_generate.md`)
+- `Generate static`: conductor in-process (no SKILL; deterministic `validate_workspace_root` + `validate_pipeline_semantics --stage post_generate`, see `docs/workflow/phases/phase_02_generate.md`)
 - `Generate verify`: `skills/workflow-generate-verify/SKILL.md`
 - `Build`: conductor in-process (no SKILL; see `docs/workflow/phases/phase_03_build.md`)
 - `Validate execute`: conductor in-process (no SKILL; see `docs/workflow/phases/phase_04_validate.md`)

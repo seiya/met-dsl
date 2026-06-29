@@ -7682,6 +7682,35 @@ shallow_water2d_runner.o: shallow_water2d_runner.f90 shallow_water2d_model.mod
                 violations,
             )
 
+    def test_validate_generate_lint_certifies_at_static_without_pass(self) -> None:
+        # New flow: post_generate runs in generate.static BEFORE verify sets
+        # verification_status=pass. The cert must still run (and catch a bad evidence)
+        # purely because the conductor's lint_evidence is present — not gated on pass.
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            meta_path = self._lint_evidence_fixture(repo_root, {
+                "checked_at": "t", "source_id": "src_x", "preset": "cppcheck",
+                "ok": True,
+                "run_linter": [{"preset": "cppcheck", "command_id": "a",
+                                "command_log_ref": "workspace/x/command_log.jsonl"}],
+            })
+            violations: list[str] = []
+            _validate_generate_lint_command_logs(
+                repo_root, meta_path, {"verification_status": "fail"}, "fortran", violations)
+            self.assertTrue(
+                any("evidence preset must be 'fortitude'" in v for v in violations), violations)
+
+    def test_validate_generate_lint_skips_when_no_evidence_and_not_pass(self) -> None:
+        # No conductor evidence and not claiming pass (e.g. a manual/pre-lint invocation):
+        # nothing to certify, so it must skip silently (no false-positive violation).
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            meta_path = self._lint_evidence_fixture(repo_root, None)
+            violations: list[str] = []
+            _validate_generate_lint_command_logs(
+                repo_root, meta_path, {"verification_status": "fail"}, "fortran", violations)
+            self.assertEqual(violations, [])
+
     def test_validate_post_build_stage_passes(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
@@ -9855,7 +9884,7 @@ class FortranIdentifierLengthTests(unittest.TestCase):
 
     An over-limit name only fails at the Build step as a compile_error,
     forcing a regenerate -> rebuild retry. Catching it at post_generate fails
-    the cheap generate.verify substep first.
+    the cheap deterministic generate.static substep first.
     """
 
     def _src_dir(self, body: str) -> Path:

@@ -141,8 +141,10 @@ It canonicalizes, per `(step, substep)`, the `validate_pipeline_semantics --stag
 |---|---|---|---|
 | compile | generate | (none) | gate calls are limited to `validate_workspace_root` / `check_artifact_syntax --expect-top object`. `io_contract`-related is the `Compile.verify` responsibility. |
 | compile | verify | `compile` | required before verify completes after `io_contract` derivation. |
-| generate | generate | (none) | `--stage post_generate` is the `Generate.verify` responsibility. |
-| generate | verify | `post_generate` | |
+| generate | generate | (none) | `--stage post_generate` is the conductor's deterministic `Generate.static` substep responsibility (no leaf). |
+| generate | lint | (none) | deterministic conductor substep (`run_linter`); no leaf, no `validate_pipeline_semantics`. |
+| generate | static | (none) | deterministic conductor substep; the conductor (not a leaf) runs `validate_workspace_root` + `--stage post_generate` in-process. |
+| generate | verify | (none) | pure LLM semantic pass; the static gates moved to `Generate.static`, so verify launches no `validate_pipeline_semantics`. |
 | build | — | `post_build` | invoked after the MCP `compile_project` call. |
 | validate | execute | `post_execute` | invoked for the judgment of the `run_program` / `run_quality_checks` result. |
 | validate | judge | `pre_judge` | the final validation before `aggregate_verdict` finalization. |
@@ -153,7 +155,7 @@ It canonicalizes, per `(step, substep)`, the `validate_pipeline_semantics --stag
 
 **negative constraint:** do not state in the launch prompt of this `(step, substep)` a `validate_pipeline_semantics` call with a `--stage` not permitted in the table above. Example: including `validate_pipeline_semantics --stage compile` in the `Compile.generate` prompt invades the `Compile.verify` responsibility and fires `noncanonical_phase_write_attempt`. A mere mention of an MCP tool name (`compile_project` etc.) (in explanatory text, a negative constraint, etc.) is outside the scope of this lint.
 
-**negative constraint (MCP write tool):** do not state in the `generate/verify` launch prompt the execution of a `build-runtime` MCP write tool such as `run_linter`. lint is the conductor's deterministic `generate.lint` substep — no LLM leaf runs `run_linter` (`docs/workflow/phases/phase_02_generate.md` 2-1), and execution in verify induces a write to `command_log.jsonl` that verify's `allowed_output_paths` does not authorize and invites an `unauthorized_write_violation` → `fail_closed`. This constraint targets only the `build-runtime` MCP write tool, and the read-only `validate_workspace_root.py` and `validate_pipeline_semantics --stage post_generate` (table above) remain permitted.
+**negative constraint (MCP write tool):** do not state in the `generate/verify` launch prompt the execution of a `build-runtime` MCP write tool such as `run_linter`. lint is the conductor's deterministic `generate.lint` substep — no LLM leaf runs `run_linter` (`docs/workflow/phases/phase_02_generate.md` 2-1), and execution in verify induces a write to `command_log.jsonl` that verify's `allowed_output_paths` does not authorize and invites an `unauthorized_write_violation` → `fail_closed`. This constraint targets only the `build-runtime` MCP write tool. The `generate/verify` launch prompt also launches **no** `validate_pipeline_semantics` gate at all: `validate_workspace_root.py` and `--stage post_generate` moved to the conductor's deterministic `Generate.static` substep (table above), so verify maps to `(none)`.
 
 `record-launch`, inside `_validate_launch_prompt_text`, reconciles the text of `launch_prompt_ref` against the per-(step, substep) allowed-stage set. It scans only actionable invocation lines (lines containing `python3` / `tools/validate_pipeline_semantics.py` / `--gate validate_pipeline_semantics`), extracts both the direct CLI form and the canonical run-gate JSON form (`--args-json '{"stage": "..."}'`), and rejects with a `ValueError` if it is outside the allowed-stage (`tools/orchestration_runtime.py::_lint_launch_prompt_gate_allowlist` and `ALLOWED_VALIDATE_PIPELINE_STAGES` are the canonical implementation). For an emergency rollback, the lint can be disabled with the env `METDSL_ENFORCE_GATE_ALLOWLIST=0` (default is enabled).
 
