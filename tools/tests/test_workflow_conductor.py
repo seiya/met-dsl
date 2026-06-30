@@ -159,6 +159,125 @@ class BuildLaunchRequestTest(unittest.TestCase):
         )
         self.assertNotIn("launch_prompt_full", req)
 
+    def _generate_refs(self) -> wc.NodeRefs:
+        return wc.NodeRefs(node_key="component/x@0.1.0", spec_path="spec/component/x",
+                           ir_id="x_20260101_001", pipeline_id="x_20260101_001",
+                           source_id="src_20260101_002")
+
+    def _reuse_repair(self) -> dict[str, str]:
+        return {
+            "issue_severity": "major", "repair_strategy": "reuse",
+            "repair_target_agent_run_id": "child-1", "repair_reason": "lint_lint_findings",
+            "repair_findings": "x_model.f90:61:17: C061 argument 'u_l' missing 'intent'",
+        }
+
+    def test_build_launch_request_sets_warm_resume_findings(self) -> None:
+        # warm_resume + reuse repair carrying findings -> slim signal + emptied must-read.
+        req = wc.build_launch_request(
+            self._generate_refs(), step="generate", substep="generate",
+            orchestration_id="orch_x", orchestration_agent_run_id="parent",
+            child_agent_run_id="child-2", agent_model="m", workflow_mode="dev",
+            repair=self._reuse_repair(), warm_resume=True)
+        self.assertTrue(req.get("warm_resume"))
+        self.assertEqual(req["skill_must_read_refs"], "")
+        self.assertEqual(req["repair_findings"], self._reuse_repair()["repair_findings"])
+
+    def test_build_launch_request_no_warm_resume_keeps_full_must_read(self) -> None:
+        # Same reuse repair but warm_resume=False (session not resumable) -> full prompt:
+        # no slim signal and the must-read list stays populated.
+        req = wc.build_launch_request(
+            self._generate_refs(), step="generate", substep="generate",
+            orchestration_id="orch_x", orchestration_agent_run_id="parent",
+            child_agent_run_id="child-2", agent_model="m", workflow_mode="dev",
+            repair=self._reuse_repair(), warm_resume=False)
+        self.assertNotIn("warm_resume", req)
+        self.assertNotEqual(req["skill_must_read_refs"], "")
+
+
+class ReuseResumeAndFindingsTest(unittest.TestCase):
+    """The warm-resume eligibility resolver and the findings-excerpt reader that feed the
+    slim repair turn."""
+
+    def _conductor(self, env: dict) -> "_FakeConductor":
+        c = _FakeConductor(repo_root=Path("/tmp/repo"), orchestration_id="orch_x",
+                           orchestration_agent_run_id="ORCH", backend="claude", env=env)
+        c.calls = []
+        c.emit = lambda *a, **k: None  # type: ignore[assignment]
+        return c
+
+    def test_resolve_reuse_resume_returns_target_when_resumable(self) -> None:
+        c = self._conductor({"METDSL_CONDUCTOR_REUSE_RESUME": "1"})
+        c._claude_session_resumable = lambda s: True  # type: ignore[assignment]
+        repair = {"repair_strategy": "reuse", "repair_target_agent_run_id": "child-1"}
+        self.assertEqual(c._resolve_reuse_resume(repair, "generate", "generate"), "child-1")
+
+    def test_resolve_reuse_resume_falls_back_cold_when_unresumable(self) -> None:
+        c = self._conductor({"METDSL_CONDUCTOR_REUSE_RESUME": "1"})
+        c._claude_session_resumable = lambda s: False  # type: ignore[assignment]
+        emitted: list[str] = []
+        c.emit = lambda ev, **k: emitted.append(ev)  # type: ignore[assignment]
+        repair = {"repair_strategy": "reuse", "repair_target_agent_run_id": "child-1"}
+        self.assertIsNone(c._resolve_reuse_resume(repair, "generate", "generate"))
+        self.assertIn("resume_session_unavailable", emitted)
+
+    def test_resolve_reuse_resume_none_when_flag_off(self) -> None:
+        c = self._conductor({})  # METDSL_CONDUCTOR_REUSE_RESUME unset
+        c._claude_session_resumable = lambda s: True  # type: ignore[assignment]
+        repair = {"repair_strategy": "reuse", "repair_target_agent_run_id": "child-1"}
+        self.assertIsNone(c._resolve_reuse_resume(repair, "generate", "generate"))
+
+    def test_resolve_reuse_resume_none_for_restart_strategy(self) -> None:
+        # restart stays cold (no resume) to avoid anchoring on the defective reasoning.
+        c = self._conductor({"METDSL_CONDUCTOR_REUSE_RESUME": "1"})
+        c._claude_session_resumable = lambda s: True  # type: ignore[assignment]
+        repair = {"repair_strategy": "restart", "repair_target_agent_run_id": "child-1"}
+        self.assertIsNone(c._resolve_reuse_resume(repair, "generate", "generate"))
+
+    def test_resolve_reuse_resume_none_for_non_claude_backend(self) -> None:
+        # Warm --resume is a claude-only capability.
+        c = _FakeConductor(repo_root=Path("/tmp/repo"), orchestration_id="orch_x",
+                           orchestration_agent_run_id="ORCH", backend="codex",
+                           env={"METDSL_CONDUCTOR_REUSE_RESUME": "1"})
+        c.calls = []
+        c.emit = lambda *a, **k: None  # type: ignore[assignment]
+        c._claude_session_resumable = lambda s: True  # type: ignore[assignment]
+        repair = {"repair_strategy": "reuse", "repair_target_agent_run_id": "child-1"}
+        self.assertIsNone(c._resolve_reuse_resume(repair, "generate", "generate"))
+
+    def test_resolve_reuse_resume_none_when_no_repair(self) -> None:
+        c = self._conductor({"METDSL_CONDUCTOR_REUSE_RESUME": "1"})
+        c._claude_session_resumable = lambda s: True  # type: ignore[assignment]
+        self.assertIsNone(c._resolve_reuse_resume(None, "generate", "generate"))
+
+    def test_resolve_reuse_resume_none_when_target_placeholder(self) -> None:
+        # A reuse repair with no concrete producer arid (literal "none") cannot resume.
+        c = self._conductor({"METDSL_CONDUCTOR_REUSE_RESUME": "1"})
+        c._claude_session_resumable = lambda s: True  # type: ignore[assignment]
+        repair = {"repair_strategy": "reuse", "repair_target_agent_run_id": "none"}
+        self.assertIsNone(c._resolve_reuse_resume(repair, "generate", "generate"))
+
+    def test_read_repair_findings_reads_lint_excerpt(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            refs = wc.NodeRefs(node_key="component/spec_x@0.1.0",
+                               spec_path="spec/component/spec_x",
+                               ir_id="x_1", pipeline_id="x_1", source_id="src_1")
+            meta_dir = repo / refs.source_dir()
+            meta_dir.mkdir(parents=True)
+            (meta_dir / "lint_meta.json").write_text(
+                json.dumps({"failure_excerpt": "C061 argument 'u_l'"}), encoding="utf-8")
+            c = _FakeConductor(repo_root=repo, orchestration_id="o",
+                               orchestration_agent_run_id="ORCH", backend="claude", env={})
+            self.assertEqual(
+                c._read_repair_findings(refs, "lint_lint_findings"), "C061 argument 'u_l'")
+            # Non lint/static reason -> None (no excerpt threaded).
+            self.assertIsNone(c._read_repair_findings(refs, "verify_minor"))
+            # Missing meta file -> None (falls back to full prompt).
+            refs2 = wc.NodeRefs(node_key="component/spec_x@0.1.0",
+                                spec_path="spec/component/spec_x",
+                                ir_id="x_1", pipeline_id="x_1", source_id="src_missing")
+            self.assertIsNone(c._read_repair_findings(refs2, "static_post_generate_violation"))
+
 
 class NodeRefsTest(unittest.TestCase):
     def test_safe_and_spec_id(self) -> None:
@@ -611,6 +730,9 @@ class ConductRoutingTest(unittest.TestCase):
         c.decision_fn = lambda phase, outcomes: wc.RouteDecision(
             "retry", target_phase="generate", repair_strategy="reuse",
             reason="lint_lint_findings")
+        # Stub the on-disk excerpt read so the threading assertion does not need a real
+        # lint_meta.json (the disk read itself is covered by ReuseResumeAndFindingsTest).
+        c._read_repair_findings = lambda refs, reason: "C061 argument 'u_l'"  # type: ignore[assignment]
         status = c.conduct(self._refs(), "generate")
         self.assertEqual(status, "pass")
         reopens = [cap for s, cap in c.calls if s == "reopen-phase"]
@@ -621,6 +743,15 @@ class ConductRoutingTest(unittest.TestCase):
         gen_writes = [cap for s, cap in c.calls
                       if s == "write-step-result" and cap["--step"] == "generate"]
         self.assertEqual(len(gen_writes), 2)
+        # The repair (2nd) generate.generate launch carries the findings excerpt; the
+        # first (cold) launch does not.
+        gen_launches = [cap["--request-json"] for s, cap in c.calls
+                        if s == "record-launch"
+                        and cap.get("--request-json", {}).get("step") == "generate"
+                        and cap["--request-json"].get("substep") == "generate"]
+        self.assertEqual(len(gen_launches), 2)
+        self.assertNotIn("repair_findings", gen_launches[0])
+        self.assertEqual(gen_launches[1].get("repair_findings"), "C061 argument 'u_l'")
 
     def test_static_finding_warm_reopens_generate_same_phase(self) -> None:
         # A generate.static finding routes retry/generate/reuse(static_*); conduct must do a

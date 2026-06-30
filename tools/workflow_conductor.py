@@ -429,6 +429,7 @@ def build_launch_request(
     makefile_host_authored: bool = False,
     repair: dict[str, str] | None = None,
     resolved_dependencies: tuple[dict[str, str], ...] = (),
+    warm_resume: bool = False,
 ) -> dict[str, Any]:
     """Construct the record-launch --request-json payload for one substep.
 
@@ -642,6 +643,16 @@ def build_launch_request(
     if resolved_dependencies and not deterministic and step in ("generate", "validate"):
         req["resolved_dependencies"] = list(resolved_dependencies)
     req.update(rep)
+    # Slim warm-resume repair turn: when the conductor has decided the producer session is
+    # resumable (warm_resume) AND this is a reuse repair carrying findings, mark the request
+    # so the runtime renders the findings-only slim prompt and empty the must-read (the
+    # resumed leaf already read them). Emptied in BOTH assembly paths (here +
+    # prepare_launch_request_payload) or the launch-integrity validator rejects the prompt.
+    if (warm_resume and not deterministic
+            and rep.get("repair_strategy") == "reuse"
+            and str(rep.get("repair_findings", "")).strip()):
+        req["warm_resume"] = True
+        req["skill_must_read_refs"] = ""
     return req
 
 
@@ -712,6 +723,44 @@ class Conductor:
         return str(self.env.get("METDSL_CONDUCTOR_REUSE_RESUME", "")).strip().lower() in {
             "1", "true", "yes",
         }
+
+    def _reuse_slim_prompt_enabled(self) -> bool:
+        """Opt-in (default off) for the SLIM warm-resume repair turn. Gates only slim-vs-full
+        within the already-warm reuse path (so `METDSL_CONDUCTOR_REUSE_RESUME` can stay on
+        while slim is verified/rolled back independently); toggled via env
+        `METDSL_CONDUCTOR_REUSE_SLIM_PROMPT`. When on AND a warm resume actually fires AND
+        the findings excerpt is available, the conductor sends a ~1-2KB findings-only turn
+        instead of re-injecting the full cold-start prompt the resumed leaf already holds."""
+        return str(self.env.get("METDSL_CONDUCTOR_REUSE_SLIM_PROMPT", "")).strip().lower() in {
+            "1", "true", "yes",
+        }
+
+    def _resolve_reuse_resume(self, repair: dict[str, str] | None,
+                              phase: str, substep: str | None) -> str | None:
+        """The producer session id to warm-`--resume`, or None for a cold launch.
+
+        Resolved BEFORE building the launch request (not after) so the slim-vs-full prompt
+        choice, what `record_launch` persists, and what `spawn_leaf` actually sends all stay
+        consistent. Minor-fix reuse (claude only, opt-in): resume the producer leaf's session
+        so the repair inherits its context (and design intent) instead of cold-starting;
+        `restart` stays cold (no resume) to avoid anchoring on the defective reasoning. The
+        producer's session id == its agent_run_id (pinned via --session-id at its own launch),
+        so it is addressable by repair_target_agent_run_id. Warm-resume only if the producer's
+        session transcript still exists (Claude Code may have expired/GC'd it); if it is gone,
+        fall back to a cold launch (return None) rather than letting `claude --resume <missing>`
+        fail the leaf and fail-close the phase."""
+        if not (self.backend == "claude"
+                and self._reuse_resume_enabled()
+                and repair is not None
+                and repair.get("repair_strategy") == "reuse"):
+            return None
+        target = str(repair.get("repair_target_agent_run_id") or "").strip()
+        if not target or target == "none":
+            return None
+        if self._claude_session_resumable(target):
+            return target
+        self.emit("resume_session_unavailable", phase=phase, substep=substep or "", target=target)
+        return None
 
     def _claude_session_resumable(self, session_id: str) -> bool:
         """True if a claude session transcript for `session_id` still exists under
@@ -2259,6 +2308,16 @@ clean:
         # safety net for the record-launch-less diagnostician leaf.
         self._ensure_codex_feature_cache()
         child_arid = self.new_agent_run_id()
+        # Resolve the warm-resume decision BEFORE building the request so the slim-vs-full
+        # prompt choice (build_launch_request) matches what record_launch persists and what
+        # spawn_leaf sends below. None => cold launch (full prompt). Deterministic substeps
+        # run in-process (no leaf to resume), so skip the resolver entirely — it keeps the
+        # session-transcript glob and the `resume_session_unavailable` emit side-effect-free
+        # for them even if a reuse repair ever reaches one.
+        deterministic = self._is_deterministic_substep(phase, substep)
+        resume_session_id = (None if deterministic
+                             else self._resolve_reuse_resume(repair, phase, substep))
+        warm_resume = resume_session_id is not None and self._reuse_slim_prompt_enabled()
         request = build_launch_request(
             refs, step=phase, substep=substep,
             orchestration_id=self.orchestration_id,
@@ -2275,12 +2334,13 @@ clean:
             makefile_host_authored=(phase == "generate" and self._conductor_authors_makefile(refs)),
             repair=repair,
             resolved_dependencies=resolved_dependencies,
+            warm_resume=warm_resume,
         )
         rec = self.record_launch(child_arid, request)
         # Capture the launch instant so a producer substep only passes on outputs
         # (re)written during this child window, not stale files from a prior attempt.
         launched_at = time.time()
-        if self._is_deterministic_substep(phase, substep):
+        if deterministic:
             # Non-LLM step: run the body in-process and play the child-return ourselves
             # (no `claude -p` leaf). record_launch above + record-child-return here +
             # finalize_child below keep the executor a normal step/substep agent_run_id,
@@ -2293,29 +2353,8 @@ clean:
                 "--agent-run-id", child_arid, "--return-token", token,
             ])
         else:
-            # Minor-fix reuse (claude only, opt-in): resume the producer leaf's session so
-            # the repair inherits its context (and design intent) instead of cold-starting.
-            # restart stays cold (no resume) to avoid anchoring on the defective reasoning.
-            # The producer's session id == its agent_run_id (pinned via --session-id at its
-            # own launch), so it is addressable by repair_target_agent_run_id.
-            resume_session_id: str | None = None
-            if (
-                self.backend == "claude"
-                and self._reuse_resume_enabled()
-                and repair is not None
-                and repair.get("repair_strategy") == "reuse"
-            ):
-                target = str(repair.get("repair_target_agent_run_id") or "").strip()
-                if target and target != "none":
-                    # Warm resume only if the producer's session transcript still exists
-                    # (Claude Code may have expired/GC'd it). If it is gone, fall back to a
-                    # cold launch (drop resume_session_id) rather than letting `claude
-                    # --resume <missing>` fail the leaf and fail-close the phase.
-                    if self._claude_session_resumable(target):
-                        resume_session_id = target
-                    else:
-                        self.emit("resume_session_unavailable", phase=phase,
-                                  substep=substep or "", target=target)
+            # resume_session_id was resolved before build_launch_request (above) so the
+            # slim-vs-full prompt selection is consistent with what is actually sent here.
             proc = self.spawn_leaf(
                 rec["launch_prompt_text"], self._child_env(child_arid),
                 session_id=child_arid, resume_session_id=resume_session_id,
@@ -2416,13 +2455,41 @@ clean:
                 seq = _next_seq(self.repo_root / refs.pipeline_ref / "runs", f"run_{date}")
                 refs.run_id = f"run_{date}_{seq}"
 
-    def _repair_payload(self, decision: RouteDecision, target_arid: str | None) -> dict[str, str]:
-        return {
+    def _repair_payload(self, decision: RouteDecision, target_arid: str | None,
+                        findings: str | None = None) -> dict[str, str]:
+        payload = {
             "issue_severity": "major",
             "repair_strategy": decision.repair_strategy or "restart",
             "repair_target_agent_run_id": target_arid or "none",
             "repair_reason": decision.reason or "route_repair",
         }
+        # The lint/static findings excerpt to fix, threaded to the (warm) repair leaf so it
+        # can fix the exact reported lines instead of re-discovering them. Only carried for a
+        # generate lint/static reopen (see _read_repair_findings); empty otherwise.
+        if findings and findings.strip():
+            payload["repair_findings"] = findings.strip()
+        return payload
+
+    def _read_repair_findings(self, refs: NodeRefs, reason: str | None) -> str | None:
+        """The failing source's lint/static `failure_excerpt`, selected by the route reason
+        (`lint_*` -> lint_meta.json, `static_*` -> static_meta.json). Read at the conduct
+        reopen point where `refs.source_id` still names the FAILED source (rotation to the
+        fresh id happens later, inside run_phase -> _ensure_fresh_producer_id). Returns None
+        when unavailable so the repair simply falls back to the full prompt."""
+        r = (reason or "")
+        if r.startswith("lint_"):
+            meta_name = "lint_meta.json"
+        elif r.startswith("static_"):
+            meta_name = "static_meta.json"
+        else:
+            return None
+        meta_path = self.repo_root / refs.source_dir() / meta_name
+        try:
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return None
+        excerpt = meta.get("failure_excerpt") if isinstance(meta, dict) else None
+        return excerpt if isinstance(excerpt, str) and excerpt.strip() else None
 
     def run_phase(self, refs: NodeRefs, phase: str,
                   repair: dict[str, str] | None = None) -> PhaseOutcome:
@@ -2772,10 +2839,13 @@ clean:
                     self.set_status("fail", reason_code="generate_fail",
                                     reason_detail="lint_reopen_no_trigger")
                     return "fail"
+                # Read the findings excerpt BEFORE reopen_phase/rotation while refs still
+                # names the failed source (its {lint,static}_meta.json holds failure_excerpt).
+                findings = self._read_repair_findings(refs, decision.reason)
                 self.reopen_phase(refs.node_key, from_phase="generate", trigger_arid=trigger,
                                   reason=decision.reason or "lint_reopen")
                 pending_repair["generate"] = self._repair_payload(
-                    decision, self._producer_arid.get("generate", "none"))
+                    decision, self._producer_arid.get("generate", "none"), findings=findings)
                 continue  # idx unchanged -> re-run generate with the reuse repair
 
             if target_idx >= idx:

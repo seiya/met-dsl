@@ -651,3 +651,70 @@ workspace_root leaf responsibility (old Operations Rules 6/7). `phase_02_generat
   `_lint_inproc` earlier in the same attempt — i.e. it certifies conductor-owned evidence.
 - `static_meta.json` lives under `source/<id>/` (the substep's own write_root), so unlike the
   pipeline-root `lint_evidence` certificate it needs no `record-agent-run` write exemption.
+
+### G1-slim — slim warm-resume repair turn (findings-only prompt)
+
+**Context.** The `lint`/`static` finding reopen re-runs `generate.generate` with
+`repair_strategy=reuse`, which (claude, `METDSL_CONDUCTOR_REUSE_RESUME=1`) warm-`--resume`s the
+producer leaf's session so its context is intact. Empirically that already roughly halves the
+generate substep wall-time (one observed node: 544s cold → 225s warm). But the warm turn still
+re-sent the **full ~11.5KB cold-start prompt** and did **not** include the findings: `lint` runs
+in-process **after** the generate leaf finishes, so the resumed leaf never saw its own findings and
+fixed them by re-reading its source and *guessing* (a real correctness risk — e.g. the subtle C061
+case-insensitive `u_L`≡`U_L` collision). It also `find`s the rotated new source dir because its
+warm context holds the **stale** old paths.
+
+**Decision.** When a warm resume actually fires, send a **slim** repair turn instead of the full
+prompt: inject the `failure_excerpt` and EVERY rotated per-agent path the resumed context now
+holds stale — `agent_run_id`/`source_id`/`allowed_output_paths`/`output_manifest_path`/
+`capability_doc_path`/`read_manifest_path` (the capability file is per-arid: the leaf must read its
+`capability_token` fresh from the NEW path or `run-gate` fails with a capability mismatch) — and drop
+the SKILL boilerplate, must-read header,
+dependency facts and gate runbook (the resumed leaf already holds them). The win is **correctness
++ orientation** (fix the exact reported lines; no stale-path `find`), not primarily wall-time —
+the warm leaf already skips re-reading the must-read docs on its own. Token cost drops ~11.5KB→
+~1–2KB as a secondary benefit.
+
+**Gate.** Behind its own opt-in env `METDSL_CONDUCTOR_REUSE_SLIM_PROMPT` (default off), so slim is
+verified/rolled back independently while `METDSL_CONDUCTOR_REUSE_RESUME` stays on. Slim applies
+**only** when a warm resume is actually resolved (session resumable); a cold fallback keeps the
+full prompt unchanged.
+
+**Where implemented.**
+- `tools/workflow_conductor.py`: `_resolve_reuse_resume` (extracted from `run_substep` so the
+  resume decision is made **before** `build_launch_request` — the slim/full choice, the
+  `record_launch`-persisted prompt and the `spawn_leaf` args must all agree); `_read_repair_findings`
+  (reads the failed source's `{lint,static}_meta.json` `failure_excerpt` at the reopen point, before
+  source-id rotation); `_repair_payload(..., findings=...)` → `repair_findings`; `build_launch_request`
+  gains `warm_resume` → sets `req["warm_resume"]` and empties `skill_must_read_refs`;
+  `_reuse_slim_prompt_enabled`.
+- `tools/orchestration_runtime.py`: `_is_slim_repair_request` + `SLIM_REPAIR_PROMPT_SENTINEL` +
+  `_render_slim_repair_launch_prompt` (built directly like the deterministic prompt, branched in
+  `_render_launch_prompt_template`); `prepare_launch_request_payload` empties `skill_must_read_refs`
+  for slim (**both** must-read assembly paths must agree or `_validate_launch_prompt_text` rejects the
+  persisted prompt); `_required_launch_prompt_markers` / `_required_launch_prompt_constraint_lines`
+  gain slim branches.
+
+**Non-regression notes.**
+- Emptying `skill_must_read_refs` does **not** lose read access: `build_access_policy_payload`'s base
+  `allowed_read_roots` already blanket-grants `docs/`, `spec/`, `ir_ref/` and `pipeline_ref/` (the
+  source), plus `skill_ref`. Must-read only adds a redundant force-read list.
+- `repair_findings` is threaded into `pending_repair` regardless of `warm_resume`; only the
+  `warm_resume` flag + emptied must-read are gated on an actually-resolved resume, so a cold fallback
+  still carries the (unused) findings without changing the full prompt.
+- The slim deliverables block lists the **leaf-writable** paths from
+  `_allowed_file_tool_paths_for_launch` — NOT the raw `allowed_output_paths`. The raw set includes
+  MCP-owned `command_log.jsonl` (integrity-protected) and the conductor-authored in-process
+  `lint_meta.json` / `static_meta.json`; listing those under "re-write the deliverables below" would
+  have the resumed leaf Edit/Write the command log and trip the write guard / corrupt the MCP audit
+  artifact. The full prompt already derives the same file-tool subset, so slim matches its posture.
+- The gate-allowlist lint (`_lint_launch_prompt_gate_allowlist`) scans only the conductor-authored
+  prefix for a slim turn (`_gate_allowlist_scan_text` fences out the findings region at
+  `SLIM_REPAIR_FINDINGS_HEADER`): the injected `failure_excerpt` is uncontrolled, quoted gate output
+  (DATA, not a leaf instruction), so a `validate_pipeline_semantics` string inside it must not
+  fail-close the launch under the empty `(generate,generate)` allow-set.
+- Prompt-injection hardening: the `failure_excerpt` is the ONE untrusted span in the slim prompt
+  (it quotes the leaf's own source, which the leaf authored), so it is wrapped in a data-only fence
+  (`SLIM_REPAIR_FINDINGS_WARNING` + `SLIM_REPAIR_FINDINGS_FENCE_BEGIN`/`_END`) that tells the resumed
+  LLM to treat everything between the markers strictly as data to fix and never as instructions to
+  follow.
