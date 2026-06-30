@@ -117,7 +117,8 @@ workspace/
 │           ├── spec.ir.yaml                       (output of the Compile/generate substep)
 │           │                                       # the single structural IR that integrates and holds the 5 sections
 │           │                                       # case / algorithm / impl_defaults / io_contract / dependency
-│           └── ir_meta.json                       (Compile/generate; verification_status by Compile/verify)
+│           ├── ir_meta.json                       (Compile/generate; verification_status by Compile/verify)
+│           └── compile_static_meta.json            (conductor-authored Compile.static deliverable; --stage compile verdict)
 │
 └── pipelines/
     └── <node_key_safe>/
@@ -182,9 +183,11 @@ workspace/
 |---|---|---|---|---|
 | `workspace/ir/.../<ir_id>/spec.ir.yaml` | Compile/generate | substep agent (Edit/Write) | all of Generate onward | the single structural IR. The notation rules for `temporaries[].shape_expr` etc. are `spec/schema/plan/shape_expr.schema.json` |
 | `workspace/ir/.../<ir_id>/ir_meta.json` | Compile/generate / verify | substep agent (Edit/Write) | runtime / validator | `verification_status` is assigned only when verify passes |
+| `workspace/ir/.../<ir_id>/compile_static_meta.json` | Compile (`Compile.static`) | conductor (deterministic in-process; `_compile_static_inproc`) | conductor routing | records the `--stage compile` / `check_artifact_syntax` / `workspace_root` verdict; the leaf cannot write it |
 | `workspace/pipelines/.../<pipeline_id>/source/<source_id>/src/` | Generate | substep agent | subsequent phases | |
 | `workspace/pipelines/.../<pipeline_id>/source/<source_id>/source_meta.json` | Generate | substep agent (Edit/Write) | Build / validator | |
 | `workspace/pipelines/.../<pipeline_id>/source/<source_id>/lint_meta.json` | Generate (`Generate.lint`) | conductor (deterministic in-process; `_lint_inproc`) | validator (`post_generate`) | records the `run_linter` verdict; the leaf cannot write it |
+| `workspace/pipelines/.../<pipeline_id>/source/<source_id>/static_meta.json` | Generate (`Generate.static`) | conductor (deterministic in-process; `_static_inproc`) | conductor routing | records the `post_generate` / `workspace_root` verdict; the leaf cannot write it |
 | `workspace/pipelines/.../<pipeline_id>/binary/<binary_id>/binary_meta.json` | Build | step agent (Edit/Write) | Validate / validator | pins `source_source_id` |
 | `workspace/pipelines/.../<pipeline_id>/runs/<run_id>/<node_key_safe>/verdict.json` | Validate/judge | substep agent (Edit/Write) | runtime / validator / upper node | |
 | `workspace/pipelines/.../<pipeline_id>/lineage.json` | added by each phase | (via write-step-result) | runtime / validator | the phase id lineage |

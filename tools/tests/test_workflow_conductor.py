@@ -289,7 +289,7 @@ class NodeRefsTest(unittest.TestCase):
 
 class PhaseStructureTest(unittest.TestCase):
     def test_substeps_and_roles(self) -> None:
-        self.assertEqual(wc.SUBSTEPS["compile"], ("generate", "verify"))
+        self.assertEqual(wc.SUBSTEPS["compile"], ("generate", "static", "verify"))
         self.assertEqual(wc.SUBSTEPS["generate"], ("generate", "lint", "static", "verify"))
         self.assertEqual(wc.SUBSTEPS["build"], (None,))
         self.assertEqual(wc.SUBSTEPS["validate"], ("execute", "judge"))
@@ -431,8 +431,10 @@ class ConductHappyPathTest(unittest.TestCase):
         # conductor issues their record-child-return); compile/generate/judge are leaves.
         expected = (
             ["check-step-completed", "workflow-launch-check",
-             "record-launch", "finalize-child", "record-launch", "finalize-child",
-             "write-step-result"]  # compile (2 leaf substeps)
+             "record-launch", "finalize-child",  # compile.generate (leaf)
+             "record-launch", "record-child-return", "finalize-child",  # compile.static (deterministic)
+             "record-launch", "finalize-child",  # compile.verify (leaf)
+             "write-step-result"]  # compile (2 leaf + 1 deterministic substep)
             + ["check-step-completed", "workflow-launch-check",
                "record-launch", "finalize-child",  # generate.generate (leaf)
                "record-launch", "record-child-return", "finalize-child",  # generate.lint (deterministic)
@@ -455,8 +457,9 @@ class ConductHappyPathTest(unittest.TestCase):
         by_step = {cap["--step"]: cap for cap in wsr}
         for substep_aware in ("compile", "generate", "validate"):
             self.assertEqual(by_step[substep_aware]["--agent-run-id"], "ORCH")
-            # generate now has 4 substeps (generate, lint, static, verify); compile/validate have 2.
-            expected_substeps = 4 if substep_aware == "generate" else 2
+            # generate has 4 substeps (generate, lint, static, verify); compile has 3
+            # (generate, static, verify); validate has 2 (execute, judge).
+            expected_substeps = {"generate": 4, "compile": 3, "validate": 2}[substep_aware]
             self.assertEqual(
                 len(by_step[substep_aware]["--result-json"]["substep_agent_run_ids"]),
                 expected_substeps)
@@ -729,7 +732,7 @@ class ConductRoutingTest(unittest.TestCase):
         c.status_fn = status_fn
         c.decision_fn = lambda phase, outcomes: wc.RouteDecision(
             "retry", target_phase="generate", repair_strategy="reuse",
-            reason="lint_lint_findings")
+            reason="lint_lint_findings", same_phase_reopen=True)
         # Stub the on-disk excerpt read so the threading assertion does not need a real
         # lint_meta.json (the disk read itself is covered by ReuseResumeAndFindingsTest).
         c._read_repair_findings = lambda refs, reason: "C061 argument 'u_l'"  # type: ignore[assignment]
@@ -755,7 +758,7 @@ class ConductRoutingTest(unittest.TestCase):
 
     def test_static_finding_warm_reopens_generate_same_phase(self) -> None:
         # A generate.static finding routes retry/generate/reuse(static_*); conduct must do a
-        # SAME-PHASE warm reopen exactly like a lint finding (the broadened startswith guard),
+        # SAME-PHASE warm reopen exactly like a lint finding (RouteDecision.same_phase_reopen),
         # not terminalize like the generic same/downstream branch.
         c = self._conductor()
         state = {"static_failed": False}
@@ -769,7 +772,7 @@ class ConductRoutingTest(unittest.TestCase):
         c.status_fn = status_fn
         c.decision_fn = lambda phase, outcomes: wc.RouteDecision(
             "retry", target_phase="generate", repair_strategy="reuse",
-            reason="static_post_generate_violation")
+            reason="static_post_generate_violation", same_phase_reopen=True)
         status = c.conduct(self._refs(), "generate")
         self.assertEqual(status, "pass")
         reopens = [cap for s, cap in c.calls if s == "reopen-phase"]
@@ -780,6 +783,33 @@ class ConductRoutingTest(unittest.TestCase):
         gen_writes = [cap for s, cap in c.calls
                       if s == "write-step-result" and cap["--step"] == "generate"]
         self.assertEqual(len(gen_writes), 2)
+
+    def test_compile_static_finding_warm_reopens_compile_same_phase(self) -> None:
+        # A compile.static finding routes retry/compile/reuse with same_phase_reopen; conduct
+        # must do a SAME-PHASE warm reopen (reopen-phase --from-phase compile) and re-run
+        # compile, exactly like a generate.static finding reopens generate.
+        c = self._conductor()
+        state = {"static_failed": False}
+
+        def status_fn(phase, substep, n):
+            if phase == "compile" and substep == "static" and not state["static_failed"]:
+                state["static_failed"] = True
+                return "fail"
+            return "pass"
+
+        c.status_fn = status_fn
+        c.decision_fn = lambda phase, outcomes: wc.RouteDecision(
+            "retry", target_phase="compile", repair_strategy="reuse",
+            reason="compile_static_compile_static_violation", same_phase_reopen=True)
+        status = c.conduct(self._refs(), "compile")
+        self.assertEqual(status, "pass")
+        reopens = [cap for s, cap in c.calls if s == "reopen-phase"]
+        self.assertEqual(len(reopens), 1)
+        self.assertEqual(reopens[0]["--from-phase"], "compile")
+        # compile ran twice (static-fail attempt, then clean attempt)
+        compile_writes = [cap for s, cap in c.calls
+                          if s == "write-step-result" and cap["--step"] == "compile"]
+        self.assertEqual(len(compile_writes), 2)
 
     def test_fail_closed_on_spec_attribution(self) -> None:
         c = self._conductor()
@@ -817,7 +847,8 @@ class ConductRoutingTest(unittest.TestCase):
         rj = compile_wsr[0]["--result-json"]
         self.assertEqual(rj["status"], "fail")
         self.assertIsNone(rj["retry_decisions"])  # never emits retry_decisions
-        self.assertEqual(len(rj["substep_agent_run_ids"]), 2)  # one attempt: generate + verify
+        # one attempt: generate + static + verify (verify failed, so all 3 ran)
+        self.assertEqual(len(rj["substep_agent_run_ids"]), 3)
 
 
 class DevPhaseRollbackTest(unittest.TestCase):
@@ -1950,6 +1981,31 @@ class BuildLaunchRequestResolvedDependenciesTest(unittest.TestCase):
     def test_omitted_for_compile(self) -> None:
         self.assertNotIn(
             "resolved_dependencies", self._build("compile", "verify", (self.DEP,)))
+        # compile.static is deterministic: no resolved_dependencies / skill, deterministic flag
+        # set, and its only allowed output is compile_static_meta.json (under the IR dir, no
+        # spec.ir.yaml / ir_meta.json authoring).
+        cs_req = self._build("compile", "static", (self.DEP,))
+        self.assertNotIn("resolved_dependencies", cs_req)
+        self.assertNotIn("skill_name", cs_req)
+        self.assertTrue(cs_req["deterministic"])
+        cs_outs = cs_req["allowed_output_paths"]
+        self.assertEqual(
+            [p for p in cs_outs if p.endswith("/compile_static_meta.json")], cs_outs)
+        self.assertEqual(len(cs_outs), 1)
+        # compile.static is deterministic -> empty must-read (no leaf reads the NL spec/tests).
+        self.assertEqual(cs_req["skill_must_read_refs"], "")
+        # compile.generate authors the IR (spec.ir.yaml) + ir_meta.json.
+        gen_outs = self._build("compile", "generate", ())["allowed_output_paths"]
+        self.assertTrue(any(p.endswith("/spec.ir.yaml") for p in gen_outs))
+        self.assertTrue(any(p.endswith("/ir_meta.json") for p in gen_outs))
+        # compile.verify authors NOTHING in the IR (io_contract moved to generate; Compile.static
+        # gated it): its sole write is ir_meta.json, so it cannot mutate spec.ir.yaml post-gate.
+        ver_outs = self._build("compile", "verify", ())["allowed_output_paths"]
+        self.assertEqual([p for p in ver_outs if p.endswith("/ir_meta.json")], ver_outs)
+        self.assertFalse(any(p.endswith("/spec.ir.yaml") for p in ver_outs))
+        # but verify still READS spec.ir.yaml to check it (must-read, not a write target).
+        self.assertIn("/spec.ir.yaml",
+                      self._build("compile", "verify", ())["skill_must_read_refs"])
 
 
 class SnapshotDeliverableGapTest(unittest.TestCase):
@@ -3016,6 +3072,200 @@ class DeterministicStaticTest(unittest.TestCase):
             d = c.classify_failure(refs, "generate", outcomes)
             self.assertEqual((d.action, d.target_phase, d.repair_strategy), ("retry", "generate", "reuse"))
             self.assertTrue(d.reason.startswith("static_"))
+
+    def test_generate_verify_requires_fresh_source_meta_scoped(self) -> None:
+        # generate.verify (pure semantic pass post-G1) must RE-AUTHOR source_meta.json this
+        # attempt to pass; a no-op verify reading a stale verification_status=pass from
+        # generate.generate must NOT pass. The freshness gate is scoped to source_meta.json ONLY:
+        # generate.verify's allowed_output_paths also lists the producer sources (model/runner.f90)
+        # it does not rewrite, so a STALE source must NOT cause a false-fail when source_meta is fresh.
+        import os
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            refs = self._refs()
+            src = repo / refs.source_dir()
+            (src / "src").mkdir(parents=True, exist_ok=True)
+            model = src / "src" / f"{refs.spec_id}_model.f90"
+            model.write_text("module m\nend module\n", encoding="utf-8")
+            # Make the producer source OLD so it would fail a whole-set freshness check.
+            os.utime(model, (1_000.0, 1_000.0))
+            meta_path = src / "source_meta.json"
+            meta_path.write_text(json.dumps({"verification_status": "pass"}), encoding="utf-8")
+            c = self._conductor(repo)
+            allowed = [f"{refs.source_dir()}/src/{refs.spec_id}_model.f90",
+                       f"{refs.source_dir()}/source_meta.json"]
+            mtime = meta_path.stat().st_mtime
+            # Fresh source_meta + STALE source -> pass (gate scoped to source_meta, ignores source).
+            self.assertEqual(
+                c.determine_substep_status(refs, "generate", "verify", allowed,
+                                           min_mtime=mtime - 100)[0], "pass")
+            # Stale source_meta (no-op verify) -> fail.
+            self.assertEqual(
+                c.determine_substep_status(refs, "generate", "verify", allowed,
+                                           min_mtime=mtime + 100)[0], "fail")
+
+
+class DeterministicCompileStaticTest(unittest.TestCase):
+    """compile.static runs in-process (no leaf): the conductor runs validate_workspace_root +
+    check_artifact_syntax + validate_pipeline_semantics --stage compile and authors
+    compile_static_meta.json under the IR dir; a violation is a content failure routed to
+    compile.generate (warm resume)."""
+
+    def _conductor(self, repo: Path) -> "wc.Conductor":
+        return wc.Conductor(repo_root=repo, orchestration_id="t",
+                            orchestration_agent_run_id="x", backend="claude", env={})
+
+    def _refs(self) -> wc.NodeRefs:
+        return wc.NodeRefs(
+            node_key="component/spec_x@0.1.0", spec_path="spec/component/spec_x",
+            ir_id="x_1", pipeline_id="x_1", source_id="src_1", binary_id="bin_1")
+
+    def _seed(self, repo: Path, refs: wc.NodeRefs) -> None:
+        (repo / refs.ir_ref).mkdir(parents=True, exist_ok=True)
+
+    def _patch_run(self, fn):
+        from unittest import mock
+        return mock.patch.object(wc.subprocess, "run", fn)
+
+    @staticmethod
+    def _fake_run(ws_rc: int, syntax_rc: int, compile_rc: int):
+        def run(cmd, **kwargs):
+            script = next((c for c in cmd if c.endswith(".py")), "")
+            if script.endswith("validate_workspace_root.py"):
+                return wc.subprocess.CompletedProcess(cmd, ws_rc, "ws-out", "ws-err")
+            if script.endswith("check_artifact_syntax.py"):
+                return wc.subprocess.CompletedProcess(cmd, syntax_rc, "syn-out", "syn-err")
+            if script.endswith("validate_pipeline_semantics.py"):
+                return wc.subprocess.CompletedProcess(cmd, compile_rc, "cmp-out", "cmp-err")
+            raise AssertionError(f"unexpected subprocess: {cmd}")
+        return run
+
+    def _meta(self, repo: Path, refs: wc.NodeRefs) -> dict:
+        return json.loads((repo / refs.ir_ref / "compile_static_meta.json").read_text())
+
+    def test_compile_static_inproc_pass_writes_meta(self) -> None:
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            refs = self._refs()
+            self._seed(repo, refs)
+            c = self._conductor(repo)
+            with self._patch_run(self._fake_run(0, 0, 0)):
+                out = c._compile_static_inproc(refs, "child-1", "captok")
+            self.assertEqual(out["returncode"], 0)
+            meta = self._meta(repo, refs)
+            self.assertEqual(meta["status"], "pass")
+            self.assertIsNone(meta["failure_category"])
+
+    def test_compile_static_inproc_compile_stage_violation_is_content_fail(self) -> None:
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            refs = self._refs()
+            self._seed(repo, refs)
+            c = self._conductor(repo)
+            with self._patch_run(self._fake_run(0, 0, 1)):
+                out = c._compile_static_inproc(refs, "child-1", "captok")
+            self.assertEqual(out["returncode"], 0)  # content fail, not transport
+            meta = self._meta(repo, refs)
+            self.assertEqual(meta["status"], "fail")
+            self.assertEqual(meta["failure_category"], "compile_static_violation")
+            self.assertIn("cmp-out", meta["failure_excerpt"])
+
+    def test_compile_static_inproc_workspace_root_short_circuits(self) -> None:
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            refs = self._refs()
+            self._seed(repo, refs)
+            c = self._conductor(repo)
+            # workspace_root fails first; syntax + --stage compile must NOT run.
+            with self._patch_run(self._fake_run(1, 1, 1)):
+                out = c._compile_static_inproc(refs, "child-1", "captok")
+            self.assertEqual(out["returncode"], 0)
+            meta = self._meta(repo, refs)
+            self.assertEqual(meta["status"], "fail")
+            self.assertEqual(meta["failure_category"], "compile_static_violation")
+            self.assertIn("ws-out", meta["failure_excerpt"])
+
+    def test_compile_static_inproc_exception_is_transport_fail(self) -> None:
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            refs = self._refs()
+            self._seed(repo, refs)
+            c = self._conductor(repo)
+
+            def boom(cmd, **kwargs):
+                raise OSError("python3 not found")
+
+            request = {"step": "compile", "substep": "static"}
+            with self._patch_run(boom), \
+                    __import__("unittest").mock.patch.object(
+                        c, "_capability_token", lambda arid: "captok"):
+                proc = c._run_deterministic_substep(refs, "compile", "static", "child-1", request)
+            self.assertNotEqual(proc.returncode, 0)
+
+    def test_determine_substep_status_compile_static_branch(self) -> None:
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            refs = self._refs()
+            self._seed(repo, refs)
+            c = self._conductor(repo)
+            meta_path = repo / refs.ir_ref / "compile_static_meta.json"
+            paths = [refs.ir_ref + "/compile_static_meta.json"]
+            meta_path.write_text(json.dumps({"status": "pass"}), encoding="utf-8")
+            self.assertEqual(
+                c.determine_substep_status(refs, "compile", "static", paths)[0], "pass")
+            meta_path.write_text(json.dumps({"status": "fail"}), encoding="utf-8")
+            self.assertEqual(
+                c.determine_substep_status(refs, "compile", "static", paths)[0], "fail")
+
+    def test_classify_failure_routes_compile_static_violation_to_compile_reuse(self) -> None:
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            refs = self._refs()
+            self._seed(repo, refs)
+            (repo / refs.ir_ref / "compile_static_meta.json").write_text(
+                json.dumps({"failure_category": "compile_static_violation"}), encoding="utf-8")
+            c = self._conductor(repo)
+            # outcomes models compile.generate(pass), compile.static(fail) — static is index 1.
+            outcomes = [wc.SubstepOutcome("g", "pass", [], 0),
+                        wc.SubstepOutcome("s", "fail", [], 0)]
+            d = c.classify_failure(refs, "compile", outcomes)
+            self.assertEqual((d.action, d.target_phase, d.repair_strategy),
+                             ("retry", "compile", "reuse"))
+            self.assertTrue(d.reason.startswith("compile_static_"))
+            self.assertTrue(d.same_phase_reopen)
+
+    def test_compile_verify_requires_fresh_ir_meta(self) -> None:
+        # compile.verify is a pure-semantic pass whose sole deliverable is ir_meta.json. It must
+        # RE-AUTHOR ir_meta this attempt to pass; a no-op verify that reads a stale
+        # verification_status=pass left by Compile.generate (the IR author) must NOT pass — the
+        # freshness gate (mtime >= this substep's launch time) enforces "an inspect-only verify
+        # that writes nothing cannot terminate pass".
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            refs = self._refs()
+            self._seed(repo, refs)
+            c = self._conductor(repo)
+            meta_path = repo / refs.ir_ref / "ir_meta.json"
+            meta_path.write_text(json.dumps({"verification_status": "pass"}), encoding="utf-8")
+            paths = [refs.ir_ref + "/ir_meta.json"]
+            mtime = meta_path.stat().st_mtime
+            # Fresh: ir_meta was (re)authored at/after the substep launch -> pass.
+            self.assertEqual(
+                c.determine_substep_status(refs, "compile", "verify", paths,
+                                           min_mtime=mtime - 100)[0], "pass")
+            # Stale: a no-op verify did not rewrite ir_meta (its mtime predates this substep's
+            # launch) -> fail, even though verification_status is still "pass".
+            self.assertEqual(
+                c.determine_substep_status(refs, "compile", "verify", paths,
+                                           min_mtime=mtime + 100)[0], "fail")
 
 
 class ExecutePromoterTest(unittest.TestCase):

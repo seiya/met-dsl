@@ -36,6 +36,7 @@ This document defines the reference conventions for the `skills` used in the pro
 
 ## phase-to-Skill correspondence table (core workflow)
 - `Compile generate`: `skills/workflow-compile-generate/SKILL.md`
+- `Compile static`: conductor in-process (no SKILL; deterministic `validate_workspace_root` + `check_artifact_syntax` + `validate_pipeline_semantics --stage compile`, see `docs/workflow/phases/phase_01_compile.md`)
 - `Compile verify`: `skills/workflow-compile-verify/SKILL.md`
 - `Generate generate`: `skills/workflow-generate-generate/SKILL.md`
 - `Generate lint`: conductor in-process (no SKILL; deterministic `run_linter`, see `docs/workflow/phases/phase_02_generate.md`)

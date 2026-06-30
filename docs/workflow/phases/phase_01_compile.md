@@ -10,7 +10,8 @@ The phase that integrates the natural-language specification (`controlled_spec.m
 
 ## substep structure
 - `Compile.generate`: the LLM substep that generates `spec.ir.yaml`.
-- `Compile.verify`: an independent LLM substep that self-checks the structural invariants (context-isolated from `Compile.generate`).
+- `Compile.static`: a **deterministic conductor in-process substep** (no LLM leaf) run AFTER `Compile.generate` and BEFORE `Compile.verify`. The conductor (`workflow_conductor._compile_static_inproc`) runs the purely-static IR gates — `validate_workspace_root.py`, `check_artifact_syntax.py` on `spec.ir.yaml` + `ir_meta.json`, and `validate_pipeline_semantics --stage compile` — and authors `compile_static_meta.json`. A violation is a content failure routed back to `Compile.generate` via a warm-resume reopen (mirrors `Generate.static`). So `Compile.verify` is reached only on a deterministically-clean IR.
+- `Compile.verify`: an independent LLM substep that self-checks the structural invariants (context-isolated from `Compile.generate`). It launches **no** `validate_pipeline_semantics` gate (that responsibility moved to `Compile.static`); it is a pure semantic pass over the spec-cross-reference invariants (V1 case substance, V3 recompute-sufficiency / `tests.md §3` diagnostics coverage, V5 impl_defaults).
 
 ## `spec.ir.yaml` schema
 
@@ -191,8 +192,9 @@ The required invariant set for the self-check (finalized as a **minimal set**):
 - The combination of `impl_defaults.target.class` and `impl_defaults.target.backend` is identifiable by `impl_defaults.selected.backend_key`.
 
 #### Verification tools
-- Before `Compile` completes, check syntax validity using `python3 tools/check_artifact_syntax.py --format yaml --expect-top object spec.ir.yaml`, and on `fail` it must be a `Compile fail`. Check `ir_meta.json` with the same tool.
-- Before `Compile.verify` completes, run `python3 tools/validate_pipeline_semantics.py --stage compile --ir-ref workspace/ir/<node_key_safe>/<ir_id>/`, and `exit code 0` is required. On `fail`, `verification_status=pass` must not be assigned to `ir_meta.json`.
+These deterministic gates run in the conductor's `Compile.static` substep (`_compile_static_inproc`), NOT inside the `Compile.verify` leaf:
+- Syntax validity via `python3 tools/check_artifact_syntax.py --expect-top object <ir_ref>/spec.ir.yaml <ir_ref>/ir_meta.json`; on `fail` it is a `Compile fail` (routed to `Compile.generate`).
+- `python3 tools/validate_pipeline_semantics.py --stage compile --ir-ref workspace/ir/<node_key_safe>/<ir_id>/`, with `exit code 0` required. The result is recorded in `compile_static_meta.json`; on `fail` the substep fails before `Compile.verify` runs, so `verification_status=pass` is never reached on a structurally-invalid IR. (The `--stage compile` validator checks the internal-consistency / shape-grammar invariants; the spec-cross-reference invariants are the `Compile.verify` LLM responsibility — see the substep structure note.)
 
 ## On-failure behavior
 - When the input (`controlled_spec.md` / `tests.md` / `deps.yaml`) is insufficient, it is a `Compile fail`, and guessed completion is forbidden.

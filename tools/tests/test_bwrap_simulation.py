@@ -58,7 +58,9 @@ _LEAF_SCRIPT = textwrap.dedent(
         print("ATOMIC_NEW:FAIL", repr(e), flush=True)
 
     # (b/d) rewrite the read-INPUT file (spec.ir.yaml) via atomic rename -- the EBUSY case.
-    # spec.ir.yaml is both a read input AND written (compile.verify appends io_contract).
+    # This exercises the generic capability of rewriting a file that is both a read input and a
+    # writable output inside a write_root (e.g. generate.verify rewriting source_meta.json);
+    # spec.ir.yaml is used here only as a representative such file.
     try:
         t = IR + "/.spec.tmp"; Path(t).write_text("meta: {}\\nio_contract: {}\\n")
         os.replace(t, IR + "/spec.ir.yaml"); report("REWRITE_READINPUT", True)

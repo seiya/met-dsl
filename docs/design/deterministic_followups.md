@@ -718,3 +718,95 @@ full prompt unchanged.
   (`SLIM_REPAIR_FINDINGS_WARNING` + `SLIM_REPAIR_FINDINGS_FENCE_BEGIN`/`_END`) that tells the resumed
   LLM to treat everything between the markers strictly as data to fix and never as instructions to
   follow.
+
+## G2 — deterministic `Compile.static` substep: hoist `--stage compile` out of the LLM `Compile.verify` leaf (IMPLEMENTED 2026-06-30)
+
+**Problem (the G1 pattern, one phase up).** The purely-static IR gate
+(`validate_pipeline_semantics --stage compile` + `check_artifact_syntax` + `validate_workspace_root`)
+ran *inside* the LLM `Compile.verify` leaf. A full, cold, separate-persona verify pass ran first and
+was thrown away whenever a purely structural IR defect (forbidden `shape_expr` form `vector(N)`,
+non-scalar `time_shape_expr`, undefined `steps[]` token binding, null knob, malformed `ir_meta`)
+tripped the gate at completion — wasted tokens with zero accuracy benefit. This is exactly the
+generate.verify→generate.static situation (G1), one phase up.
+
+**Decision — new `static` substep.** `SUBSTEPS["compile"]` becomes `("generate", "static", "verify")`.
+The conductor's `Compile.static` (`_compile_static_inproc`) runs the three gates the old
+`compile.verify` runbook emitted — `validate_workspace_root`, `check_artifact_syntax` on
+`spec.ir.yaml` + `ir_meta.json`, and `validate_pipeline_semantics --stage compile` — and authors
+`compile_static_meta.json` under the IR dir. A violation is a CONTENT failure (rc 0) routed via
+`COMPILE_STATIC_FAILURE_ROUTING` (`compile_static_violation → ("compile","reuse")`) as a SAME-PHASE
+warm reopen of `Compile.generate`; only an unexpected exception is a transport `fail_closed`.
+
+**`Compile.verify` is NOT eliminated.** `--stage compile` reads no `controlled_spec.md` and parses
+`tests.md` only for a regex test_id-set check, so it covers the internal-consistency / shape-grammar
+invariants only. The genuinely-semantic spec-cross-reference invariants stay LLM: V1 case substance,
+V3 recompute-sufficiency + `tests.md §3` diagnostics coverage (`_validate_diagnostics_contract`
+explicitly defers §3 coverage to the LLM), V5 impl_defaults. So `compile.verify` becomes a pure LLM
+semantic pass (like generate.verify post-G1) that launches no validator gate.
+
+**Prerequisite — `io_contract` authorship moved to `Compile.generate` (review-driven correction).**
+The first cut mirrored G1 mechanically and was WRONG: unlike `generate.verify` (a pure judge),
+`compile.verify` was a *producer* — the compile SKILLs had it AUTHOR the `io_contract` section of
+`spec.ir.yaml`. `--stage compile` hard-requires a structurally-complete `io_contract`
+(`_validate_io_contract_file` is unconditional), so running it in a pre-verify `Compile.static`
+validated an IR whose `io_contract` did not exist yet → every fresh compile node would `fail_closed`
+(the mock-stubbed tests were blind to it). Fix (the only one that makes a pre-verify static gate
+coherent AND delivers the fail-fast value): **`Compile.generate` now authors all 5 sections including
+`io_contract`** (this already matched `phase_01_compile.md` §1-1; only the two compile SKILLs +
+GLOSSARY dissented — they were realigned), and `Compile.verify` only CHECKS `io_contract` (V3),
+writing nothing but `ir_meta.json`. Structurally this makes `compile.generate`→`compile.static`→
+`compile.verify` a true analog of `generate.generate`→`generate.static`→`generate.verify`: producer →
+deterministic structural gate → pure semantic judge. (Reconciled: `skills/workflow-compile-generate`
+gains the authoring rules, `skills/workflow-compile-verify` drops them, `docs/GLOSSARY.md`
+`diagnostics_contract` provenance, compile-generate SKILL ceiling 10800→11500.)
+
+**`compile.verify` freshness gate (Codex P2 follow-up).** Because the `--stage compile` gate moved
+OUT of `compile.verify` (to `compile.static`), the verify leaf lost the implicit "must do work"
+enforcement its own end-of-substep gate used to provide. Its status check
+(`determine_substep_status`) read `ir_meta.verification_status == "pass"` with NO freshness gate, so a
+no-op verify (exit 0 without re-authoring `ir_meta.json`) would pass by reading a stale
+`verification_status=pass` that `Compile.generate` — now the IR author — may have left (the `--stage
+compile` gate only requires a non-empty string, not a specific value). Fix: the compile.verify branch
+now ANDs `_fresh_deliverables_written(allowed_output_paths)` (allowed_output_paths == `[ir_meta.json]`
+after the verify write-restriction), enforcing the SKILL's "an inspect-only verify that writes nothing
+cannot terminate pass". A compliant verify re-authors `ir_meta.json` (refreshing `verify_attempts`) so
+it passes; a no-op verify fails. Test: `test_compile_verify_requires_fresh_ir_meta`. The symmetric
+`generate.verify` branch had the same latent gap post-G1 and is fixed the same way, but **scoped to
+`source_meta.json` only** (`_fresh_deliverables_written([f"{source_dir}/source_meta.json"])`) — its
+`allowed_output_paths` also lists the producer sources (model/runner.f90) it does NOT rewrite, so a
+whole-set freshness check would false-fail a verify that legitimately only re-authors `source_meta.json`.
+Test: `test_generate_verify_requires_fresh_source_meta_scoped` (asserts a STALE source does not
+false-fail when source_meta is fresh).
+
+**Where implemented.**
+- `tools/workflow_conductor.py`: `SUBSTEPS["compile"]`; `COMPILE_STATIC_FAILURE_ROUTING` +
+  `classify_compile_static_failure`; `_compile_static_inproc`; `build_launch_request` compile branch
+  (scope must-read to non-deterministic substeps + a `static` arm = `[<ir_ref>/compile_static_meta.json]`,
+  widen the `deterministic` predicate); `determine_substep_status` / `_is_deterministic_substep` /
+  `_run_deterministic_substep` / `classify_failure` compile.static branches.
+- **Same-phase reopen generalized.** The conduct() warm-reopen guard was hardcoded to
+  `target=="generate"` + a route-reason prefix match. With compile now a third same-phase-reopen case,
+  it is keyed on a new `RouteDecision.same_phase_reopen` bool (set by
+  `classify_{lint,static,compile_static}_failure`) and `target == phase`; `reopen_phase(from_phase=phase)`
+  and `_read_repair_findings` (reads `compile_static_meta.json` under `ir_ref` for a `compile_static_*`
+  reason) are generalized off the hardcoded "generate".
+- `tools/orchestration_runtime.py` enforcement sites (the G1 checklist, compile analog): CP-1
+  `_allowed_output_paths_for_launch` authorizes `compile_static_meta.json` for `substep=="static"`
+  ONLY (the compile contract is an exact-set match, so this is load-bearing — without it record-launch
+  fail-closes the real flow while mock tests stay green); CP-7 `_validate_launch_request_payload`
+  deterministic-flag allowlist adds `compile.static`; CP-6 `ALLOWED_VALIDATE_PIPELINE_STAGES`
+  `("compile","verify")→frozenset()` + add `("compile","static"): frozenset()`; CP-5 `_build_gate_runbook`
+  drops the compile.verify branch (now empty → `""`); CP-8 `reopen_phase` same-phase carve-out adds the
+  compile.static trigger; CP-2 `_allowed_file_tool_paths_for_launch` excludes `compile_static_meta.json`
+  (defense-in-depth). No write-exemption (CP-4) needed: `--stage compile` is read-only and the meta lands
+  inside the substep's own `ir_ref` write_root (authorized by containment), unlike generate's pipeline-root
+  `lint_evidence`.
+
+**Non-regression notes.**
+- `compile.static` is deterministic (no leaf) → minimal deterministic launch prompt (phase-agnostic
+  renderer keyed on the `deterministic` flag), empty `skill_must_read_refs`, no `_build_gate_runbook`.
+- `_ensure_fresh_producer_id` already rotates `ir_id` for a `compile` re-run, so a same-phase reopen
+  writes a fresh IR dir (the failed `compile_static_meta.json` is read for findings BEFORE rotation).
+- Doc-size: `phase_01_compile.md` ceiling bumped 17000→18200 (it is force-read by compile.generate/verify;
+  the Compile.static documentation + the "verify is now pure semantic" note add ~1.3KB).
+- Default-on (no env flag), mirroring G1.static. Real verification is a billed E2E run.

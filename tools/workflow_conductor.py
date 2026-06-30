@@ -64,7 +64,15 @@ PHASE_ORDER: tuple[str, ...] = ("compile", "generate", "build", "validate")
 # Ordered substeps per phase. Build is a single "step" agent (no substeps),
 # represented as [None] so the loop body is uniform.
 SUBSTEPS: dict[str, tuple[str | None, ...]] = {
-    "compile": ("generate", "verify"),
+    # compile.static is a deterministic in-process substep run by the conductor AFTER
+    # compile.generate produces spec.ir.yaml/ir_meta.json and BEFORE compile.verify:
+    #   - static (Conductor._compile_static_inproc): runs validate_workspace_root +
+    #     check_artifact_syntax + validate_pipeline_semantics --stage compile; the verify
+    #     leaf no longer invokes them, so compile.verify is a pure LLM semantic pass (the
+    #     spec-cross-reference invariants V1/V3/V5) reached only on a deterministically-clean
+    #     IR. A finding routes back to compile.generate via a warm-resume reopen
+    #     (COMPILE_STATIC_FAILURE_ROUTING). Mirrors generate.static.
+    "compile": ("generate", "static", "verify"),
     # generate.lint and generate.static are deterministic in-process substeps run by the
     # conductor AFTER generate.generate produces source/<id>/src/ and BEFORE generate.verify:
     #   - lint   (Conductor._lint_inproc):   runs run_linter; the leaf no longer invokes it.
@@ -145,6 +153,17 @@ STATIC_FAILURE_ROUTING: dict[str, tuple[str, str]] = {
     "workspace_root_violation": ("generate", "reuse"),
 }
 
+# Compile static-gate (compile.static) failure_category -> (retry_target_phase, repair_strategy).
+# The deterministic workspace_root / check_artifact_syntax / --stage compile gates run AFTER
+# compile.generate and BEFORE compile.verify; a structural IR violation re-runs
+# compile.generate with a warm resume (reuse), exactly like a generate.static finding, so the
+# same leaf fixes its own IR with context intact. Like lint/static this is a SAME-PHASE reopen
+# handled specially by conduct(). Compile is the first phase, so the target is necessarily the
+# current phase.
+COMPILE_STATIC_FAILURE_ROUTING: dict[str, tuple[str, str]] = {
+    "compile_static_violation": ("compile", "reuse"),
+}
+
 # Validate.judge (failure_class, attribution) -> routing action.
 # Action is one of:
 #   ("generate", strategy) | ("compile", "reopen") | ("validate", "re_execute")
@@ -181,6 +200,11 @@ class RouteDecision:
     target_phase: str | None = None
     repair_strategy: str | None = None
     reason: str | None = None
+    # True when this is a deterministic-gate finding (lint/static/compile.static) that
+    # warm-resumes the SAME phase's producer substep instead of terminalizing. Set by the
+    # classify_*_failure helpers below and consumed by conduct()'s same-phase reopen guard,
+    # replacing the former fragile route-reason prefix match.
+    same_phase_reopen: bool = False
 
 
 class SandboxEnforcementError(RuntimeError):
@@ -208,7 +232,7 @@ def classify_lint_failure(failure_category: str | None) -> RouteDecision:
         return RouteDecision("escalate", reason=f"lint_unknown_category:{failure_category}")
     target, strategy = routed
     return RouteDecision("retry", target_phase=target, repair_strategy=strategy,
-                         reason=f"lint_{failure_category}")
+                         reason=f"lint_{failure_category}", same_phase_reopen=True)
 
 
 def classify_static_failure(failure_category: str | None) -> RouteDecision:
@@ -219,7 +243,19 @@ def classify_static_failure(failure_category: str | None) -> RouteDecision:
         return RouteDecision("escalate", reason=f"static_unknown_category:{failure_category}")
     target, strategy = routed
     return RouteDecision("retry", target_phase=target, repair_strategy=strategy,
-                         reason=f"static_{failure_category}")
+                         reason=f"static_{failure_category}", same_phase_reopen=True)
+
+
+def classify_compile_static_failure(failure_category: str | None) -> RouteDecision:
+    if not failure_category:
+        return RouteDecision("escalate", reason="compile_static_fail_no_category")
+    routed = COMPILE_STATIC_FAILURE_ROUTING.get(failure_category)
+    if routed is None:
+        return RouteDecision("escalate",
+                             reason=f"compile_static_unknown_category:{failure_category}")
+    target, strategy = routed
+    return RouteDecision("retry", target_phase=target, repair_strategy=strategy,
+                         reason=f"compile_static_{failure_category}", same_phase_reopen=True)
 
 
 def classify_validate_judge(failure_class: str | None, attribution: str | None) -> RouteDecision:
@@ -451,7 +487,8 @@ def build_launch_request(
     # they carry no skill / leaf prompt — only the bookkeeping the capability/phase_state need.
     deterministic = (step == "build"
                      or (step == "validate" and substep == "execute")
-                     or (step == "generate" and substep in ("lint", "static")))
+                     or (step == "generate" and substep in ("lint", "static"))
+                     or (step == "compile" and substep == "static"))
     rep = {
         "issue_severity": "none",
         "repair_strategy": "none",
@@ -492,17 +529,39 @@ def build_launch_request(
 
     if step == "compile":
         req["dependency_ref"] = f"{spec}/deps.yaml"
-        must_read += [
-            f"{refs.ir_ref}/spec.ir.yaml" if substep == "verify" else None,
-            f"{spec}/controlled_spec.md",
-            f"{spec}/tests.md",
-            f"{spec}/deps.yaml",
-        ]
-        must_read = [m for m in must_read if m]
-        req["allowed_output_paths"] = [
-            f"{refs.ir_ref}/spec.ir.yaml",
-            f"{refs.ir_ref}/ir_meta.json",
-        ]
+        if substep == "static":
+            # Deterministic in-process compile gate: the conductor authors
+            # compile_static_meta.json (the only freshness-gated deliverable) from
+            # validate_workspace_root + check_artifact_syntax + validate_pipeline_semantics
+            # --stage compile. No leaf, no must-read (deterministic), no IR authoring.
+            req["allowed_output_paths"] = [
+                f"{refs.ir_ref}/compile_static_meta.json",
+            ]
+        else:
+            # generate/verify LLM substeps read the NL spec + tests + deps. spec.ir.yaml is a
+            # must-read only for verify (generate authors it).
+            must_read += [
+                f"{refs.ir_ref}/spec.ir.yaml" if substep == "verify" else None,
+                f"{spec}/controlled_spec.md",
+                f"{spec}/tests.md",
+                f"{spec}/deps.yaml",
+            ]
+            must_read = [m for m in must_read if m]
+            if substep == "verify":
+                # Compile.verify authors NOTHING in spec.ir.yaml — all 5 sections (incl.
+                # io_contract) are authored by Compile.generate and the deterministic
+                # Compile.static gate validated the IR before verify runs. Verify's sole write
+                # is ir_meta.json (verification_status), so the IR cannot be mutated post-gate
+                # (which would bypass --stage compile). spec.ir.yaml stays a must-read (verify
+                # reads it to check), but is NOT a write target.
+                req["allowed_output_paths"] = [
+                    f"{refs.ir_ref}/ir_meta.json",
+                ]
+            else:  # generate authors the IR + its meta
+                req["allowed_output_paths"] = [
+                    f"{refs.ir_ref}/spec.ir.yaml",
+                    f"{refs.ir_ref}/ir_meta.json",
+                ]
     elif step == "generate":
         req["source_id"] = refs.source_id
         req["dependency_ref"] = refs.ir_ref
@@ -1377,12 +1436,42 @@ clean:
                 return False
             return all((self.repo_root / p).stat().st_mtime >= min_mtime for p in present)
 
-        if phase == "compile" and substep == "verify":
+        if phase == "compile" and substep == "static":
+            # Deterministic compile gate: the conductor-authored compile_static_meta records the
+            # workspace_root + check_artifact_syntax + --stage compile verdict. A violation is
+            # status=fail with rc 0, so the substep fails here and classify_compile_static_failure
+            # routes back to compile.generate (warm resume), not transport fail_closed.
+            # compile_static_meta.json is the only freshness-gated deliverable.
+            meta = _read_json(self.repo_root / refs.ir_ref / "compile_static_meta.json") or {}
+            status = "pass" if (meta.get("status") == "pass"
+                                and _fresh_deliverables_written(allowed_output_paths)) else "fail"
+        elif phase == "compile" and substep == "verify":
+            # The pure-semantic verify leaf's SOLE deliverable is ir_meta.json; it must
+            # RE-AUTHOR it this attempt (verification_status + a refreshed idempotent field) to
+            # pass — an inspect-only verify that writes nothing cannot terminate pass (the SKILL
+            # contract). The freshness gate is load-bearing here: Compile.generate authors
+            # ir_meta.json and may leave verification_status=pass (the --stage compile gate only
+            # requires a non-empty string), and the gate that used to force verify to do work
+            # (its own end-of-substep --stage compile) moved to Compile.static, so without this
+            # a no-op verify (exit 0, no rewrite) would pass on generate's stale status.
+            # allowed_output_paths == [ir_meta.json], so _fresh_deliverables_written checks
+            # exactly that file's mtime against this substep's launch time.
             meta = _read_json(self.repo_root / refs.ir_ref / "ir_meta.json") or {}
-            status = "pass" if meta.get("verification_status") == "pass" else "fail"
+            status = "pass" if (meta.get("verification_status") == "pass"
+                                and _fresh_deliverables_written(allowed_output_paths)) else "fail"
         elif phase == "generate" and substep == "verify":
-            meta = _read_json(self.repo_root / refs.source_dir() / "source_meta.json") or {}
-            status = "pass" if meta.get("verification_status") == "pass" else "fail"
+            # Same freshness requirement as compile.verify: post-G1 generate.verify is a pure
+            # semantic pass whose meta deliverable is source_meta.json, and it must RE-AUTHOR it
+            # this attempt to pass (an inspect-only verify that writes nothing cannot terminate
+            # pass). Without the gate a no-op verify (exit 0, no rewrite) would pass on a stale
+            # verification_status=pass that generate.generate left. The gate is scoped to
+            # source_meta.json ONLY — generate.verify's allowed_output_paths also lists the
+            # producer sources (model/runner.f90) it does NOT rewrite, so checking the whole set
+            # would false-fail a verify that legitimately only re-authors source_meta.json.
+            src_meta = f"{refs.source_dir()}/source_meta.json"
+            meta = _read_json(self.repo_root / src_meta) or {}
+            status = "pass" if (meta.get("verification_status") == "pass"
+                                and _fresh_deliverables_written([src_meta])) else "fail"
         elif phase == "validate" and substep == "judge":
             agg = _read_json(self.repo_root / refs.run_node_dir() / "aggregate_verdict.json") or {}
             status = "pass" if str(agg.get("aggregate_verdict") or agg.get("overall")) in ("pass", "xfail") else "fail"
@@ -1482,7 +1571,8 @@ clean:
     def _is_deterministic_substep(phase: str, substep: str | None) -> bool:
         return (phase == "build"
                 or (phase == "validate" and substep == "execute")
-                or (phase == "generate" and substep in ("lint", "static")))
+                or (phase == "generate" and substep in ("lint", "static"))
+                or (phase == "compile" and substep == "static"))
 
     def _capability_token(self, child_arid: str) -> str:
         path = (self.repo_root / "workspace" / "orchestrations" / self.orchestration_id
@@ -1553,6 +1643,8 @@ clean:
                 out = self._lint_inproc(refs, child_arid, cap_token)
             elif phase == "generate" and substep == "static":
                 out = self._static_inproc(refs, child_arid, cap_token)
+            elif phase == "compile" and substep == "static":
+                out = self._compile_static_inproc(refs, child_arid, cap_token)
             else:
                 raise RuntimeError(f"no deterministic body for {phase}.{substep}")
         except Exception as exc:  # noqa: BLE001 - surfaced as transport failure
@@ -1952,6 +2044,66 @@ clean:
 
         # Content failure returns rc 0 so run_phase routes it via classify_static_failure ->
         # generate.generate (warm resume). determine_substep_status reads static_meta.status.
+        return {"returncode": 0, "stdout": "", "stderr": stderr}
+
+    def _compile_static_inproc(self, refs: NodeRefs, child_arid: str,
+                               cap_token: str) -> dict[str, str]:
+        """Deterministic Compile.static: run the purely-static IR gates the verify leaf used to
+        own (so verify is now a pure LLM semantic pass — the spec-cross-reference invariants
+        V1/V3/V5 — reached only on a deterministically-clean IR). Runs, in the same order/idiom
+        as the post_build gate in _build_inproc, the three gates the old compile.verify runbook
+        emitted: validate_workspace_root.py (bare), check_artifact_syntax.py on
+        spec.ir.yaml + ir_meta.json, then validate_pipeline_semantics --stage compile. A
+        violation is a CONTENT failure (status=fail + failure_category, rc 0) routed by
+        classify_compile_static_failure back to compile.generate via a warm-resume reopen; only
+        an unexpected error surfaces as a transport fail_closed (caught in
+        _run_deterministic_substep). The --stage compile validator is read-only on the IR and the
+        only artifact written is compile_static_meta.json under the substep's own write_root
+        (refs.ir_ref), so it needs no host write-exemption (authorized by containment).
+        """
+        status = "pass"
+        failure_category: str | None = None
+        failure_excerpt: str | None = None
+        stderr = ""
+
+        ir_ref = refs.ir_ref
+        # workspace_root (global layout) -> syntax (yaml/json well-formed) -> --stage compile
+        # (structural IR invariants). The first failing gate short-circuits.
+        gates = [
+            (["python3", "tools/validate_workspace_root.py"], "workspace_root"),
+            (["python3", "tools/check_artifact_syntax.py", "--expect-top", "object",
+              f"{ir_ref}/spec.ir.yaml", f"{ir_ref}/ir_meta.json"], "artifact_syntax"),
+            (["python3", "tools/validate_pipeline_semantics.py", "--stage", "compile",
+              "--ir-ref", ir_ref], "compile_stage"),
+        ]
+        for cmd, label in gates:
+            proc = subprocess.run(
+                cmd, cwd=self.repo_root, env=self.env, text=True,
+                capture_output=True, check=False)
+            if proc.returncode != 0:
+                status = "fail"
+                failure_category = "compile_static_violation"
+                failure_excerpt = "\n".join((proc.stdout + proc.stderr).splitlines()[-50:])
+                stderr = f"[compile {label} gate fail]\n" + proc.stdout + proc.stderr
+                break
+
+        compile_static_meta: dict[str, Any] = {
+            "ir_id": refs.ir_id,
+            "node_key": refs.node_key,
+            "attempt_count": 1,
+            "status": status,
+            "verification_status": status,
+            "failure_category": failure_category,
+            "failure_excerpt": failure_excerpt,
+        }
+        meta_path = self.repo_root / ir_ref / "compile_static_meta.json"
+        meta_path.parent.mkdir(parents=True, exist_ok=True)
+        meta_path.write_text(
+            json.dumps(compile_static_meta, indent=2, ensure_ascii=False) + "\n",
+            encoding="utf-8")
+
+        # Content failure returns rc 0 so run_phase routes it via classify_compile_static_failure
+        # -> compile.generate (warm resume). determine_substep_status reads the meta status.
         return {"returncode": 0, "stdout": "", "stderr": stderr}
 
     # -- deterministic Validate.execute (run + quality_check + evidence promote) --
@@ -2471,19 +2623,23 @@ clean:
         return payload
 
     def _read_repair_findings(self, refs: NodeRefs, reason: str | None) -> str | None:
-        """The failing source's lint/static `failure_excerpt`, selected by the route reason
-        (`lint_*` -> lint_meta.json, `static_*` -> static_meta.json). Read at the conduct
-        reopen point where `refs.source_id` still names the FAILED source (rotation to the
-        fresh id happens later, inside run_phase -> _ensure_fresh_producer_id). Returns None
-        when unavailable so the repair simply falls back to the full prompt."""
+        """The failing artifact's deterministic-gate `failure_excerpt`, selected by the route
+        reason (`lint_*` -> source/lint_meta.json, `static_*` -> source/static_meta.json,
+        `compile_static_*` -> ir/compile_static_meta.json). Read at the conduct reopen point
+        where `refs` still names the FAILED artifact (rotation to the fresh id happens later,
+        inside run_phase -> _ensure_fresh_producer_id). Returns None when unavailable so the
+        repair simply falls back to the full prompt."""
         r = (reason or "")
-        if r.startswith("lint_"):
-            meta_name = "lint_meta.json"
+        # compile_static_ is checked before static_ for clarity; the two share no prefix
+        # ("compile_static_..." does not start with "static_"), so order is not load-bearing.
+        if r.startswith("compile_static_"):
+            meta_path = self.repo_root / refs.ir_ref / "compile_static_meta.json"
+        elif r.startswith("lint_"):
+            meta_path = self.repo_root / refs.source_dir() / "lint_meta.json"
         elif r.startswith("static_"):
-            meta_name = "static_meta.json"
+            meta_path = self.repo_root / refs.source_dir() / "static_meta.json"
         else:
             return None
-        meta_path = self.repo_root / refs.source_dir() / meta_name
         try:
             meta = json.loads(meta_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
@@ -2685,6 +2841,16 @@ clean:
             if failed_substep == "static":
                 meta = _read_json(self.repo_root / refs.source_dir() / "static_meta.json") or {}
                 return classify_static_failure(meta.get("failure_category"))
+        if phase == "compile" and outcomes and outcomes[-1].status != "pass":
+            # Mirror of the generate branch: SUBSTEPS["compile"] == ("generate","static","verify")
+            # and run_phase breaks on first failure, so the failed substep is index len-1. A
+            # compile.static failure routes via its deterministic table (warm resume to
+            # compile.generate); compile.generate / compile.verify fall through to the
+            # verify-severity gate below.
+            failed_substep = SUBSTEPS["compile"][len(outcomes) - 1]
+            if failed_substep == "static":
+                meta = _read_json(self.repo_root / refs.ir_ref / "compile_static_meta.json") or {}
+                return classify_compile_static_failure(meta.get("failure_category"))
         if phase == "validate":
             # An execute-substep failure (deterministic) means judge never ran, so there
             # is no verdict.json. The runner produced bad/missing primary evidence (a
@@ -2821,32 +2987,35 @@ clean:
                                 reason_detail=f"{target} exceeded {MAX_ATTEMPTS_PER_PHASE}")
                 return "fail_closed"
 
-            # Same-phase warm reopen for a generate.lint or generate.static finding: re-run
-            # generate.generate with a reuse repair so the SAME leaf fixes its own source
-            # (context intact), instead of terminalizing here as the generic same/downstream
-            # branch does. The deterministic lint/static substeps run once per attempt
+            # Same-phase warm reopen for a deterministic-gate finding (generate.lint /
+            # generate.static / compile.static): re-run the SAME phase's producer substep
+            # (generate.generate / compile.generate) with a reuse repair so the SAME leaf fixes
+            # its own artifact (context intact), instead of terminalizing here as the generic
+            # same/downstream branch does. The deterministic gate substeps run once per attempt
             # (run_phase does NOT exhaust an in-place retry the way a verify failure does), so a
             # same-phase re-run is the correct recovery, not a terminal. Bounded by
             # attempts[target] above. The dev rollback guard (target_idx < idx) does not fire
             # (this is a within-phase reopen, consistent with the dev "auto-retry within a
-            # single phase" policy).
-            if (target_idx == idx and target == "generate"
+            # single phase" policy). Keyed on RouteDecision.same_phase_reopen (set by the
+            # classify_{lint,static,compile_static}_failure helpers), not a route-reason prefix.
+            if (target_idx == idx and target == phase
                     and decision.action == "retry"
                     and decision.repair_strategy == "reuse"
-                    and (decision.reason or "").startswith(("lint_", "static_"))):
+                    and decision.same_phase_reopen):
                 trigger = outcome.failed_substeps[-1] if outcome.failed_substeps else None
                 if trigger is None:
-                    self.set_status("fail", reason_code="generate_fail",
-                                    reason_detail="lint_reopen_no_trigger")
+                    self.set_status("fail", reason_code=f"{phase}_fail",
+                                    reason_detail="det_gate_reopen_no_trigger")
                     return "fail"
                 # Read the findings excerpt BEFORE reopen_phase/rotation while refs still
-                # names the failed source (its {lint,static}_meta.json holds failure_excerpt).
+                # names the failed artifact (its {lint,static,compile_static}_meta.json holds
+                # failure_excerpt).
                 findings = self._read_repair_findings(refs, decision.reason)
-                self.reopen_phase(refs.node_key, from_phase="generate", trigger_arid=trigger,
-                                  reason=decision.reason or "lint_reopen")
-                pending_repair["generate"] = self._repair_payload(
-                    decision, self._producer_arid.get("generate", "none"), findings=findings)
-                continue  # idx unchanged -> re-run generate with the reuse repair
+                self.reopen_phase(refs.node_key, from_phase=phase, trigger_arid=trigger,
+                                  reason=decision.reason or "det_gate_reopen")
+                pending_repair[phase] = self._repair_payload(
+                    decision, self._producer_arid.get(phase, "none"), findings=findings)
+                continue  # idx unchanged -> re-run the phase producer with the reuse repair
 
             if target_idx >= idx:
                 # same/downstream target reaching conduct means run_phase already

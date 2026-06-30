@@ -1569,6 +1569,23 @@ shell_tool                       stable             true
         with self.assertRaisesRegex(ValueError, "agent_model"):
             _validate_launch_request_payload(static)
 
+    def test_validate_launch_request_payload_accepts_deterministic_compile_static(self) -> None:
+        """The deterministic-flag allowlist must also include compile.static (else every compile
+        node fails at the static substep's record-launch). Like generate.static, a compile.static
+        payload that passes the allowlist falls through to the agent_model error; a non-static
+        deterministic compile substep is still rejected."""
+        from tools.orchestration_runtime import _validate_launch_request_payload
+
+        static = {"node_key": "component/spec_x@0.1.0", "step": "compile",
+                  "substep": "static", "deterministic": True}
+        with self.assertRaisesRegex(ValueError, "agent_model"):
+            _validate_launch_request_payload(static)
+
+        forged = {"node_key": "component/spec_x@0.1.0", "step": "compile",
+                  "substep": "verify", "deterministic": True}
+        with self.assertRaisesRegex(ValueError, "deterministic=True is only valid"):
+            _validate_launch_request_payload(forged)
+
     def test_writes_orchestration_artifacts_in_canonical_layout(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
@@ -2781,6 +2798,90 @@ shell_tool                       stable             true
                     _allowed_output_paths_for_launch(
                         request_payload=req,
                         write_roots=[f"{_FIX_PIPE_REF}/source/"],
+                    )
+
+    def test_compile_static_launch_accepts_compile_static_meta_json(self) -> None:
+        """The deterministic Compile.static substep declares
+        <ir_ref>/compile_static_meta.json as its conductor-authored deliverable
+        (workflow_conductor._compile_static_inproc). It sits at the IR root (a sibling of
+        spec.ir.yaml / ir_meta.json), so the compile phase contract must accept it for the
+        static substep — else every compile node fails at the static substep's record-launch.
+        """
+        from tools.orchestration_runtime import _allowed_output_paths_for_launch
+
+        compile_static_meta = f"{_FIX_IR_REF}/compile_static_meta.json"
+        req = {
+            "agent_role": "substep",
+            "node_key": "problem/shallow_water2d@0.3.0",
+            "step": "compile",
+            "substep": "static",
+            "ir_ref": _FIX_IR_REF,
+            "pipeline_ref": _FIX_PIPE_REF,
+            "allowed_output_paths": [compile_static_meta],
+        }
+        out = _allowed_output_paths_for_launch(
+            request_payload=req,
+            write_roots=[f"{_FIX_IR_REF}/"],
+        )
+        self.assertIn(compile_static_meta, out)
+
+    def test_compile_verify_launch_rejects_spec_ir_yaml_write(self) -> None:
+        """Compile.verify authors NOTHING in spec.ir.yaml (io_contract moved to Compile.generate;
+        Compile.static gated the IR before verify). Its sole write is ir_meta.json, so a verify
+        launch that lists spec.ir.yaml as an output is rejected — preventing verify from mutating
+        the IR post-gate (which would bypass --stage compile). ir_meta.json alone is accepted.
+        """
+        from tools.orchestration_runtime import _allowed_output_paths_for_launch
+
+        ir_meta = f"{_FIX_IR_REF}/ir_meta.json"
+        ir_yaml = f"{_FIX_IR_REF}/spec.ir.yaml"
+        base = {
+            "agent_role": "substep", "node_key": "problem/shallow_water2d@0.3.0",
+            "step": "compile", "substep": "verify",
+            "ir_ref": _FIX_IR_REF, "pipeline_ref": _FIX_PIPE_REF,
+        }
+        # ir_meta.json alone is accepted.
+        out = _allowed_output_paths_for_launch(
+            request_payload={**base, "allowed_output_paths": [ir_meta]},
+            write_roots=[f"{_FIX_IR_REF}/"])
+        self.assertEqual(out, [ir_meta])
+        # listing spec.ir.yaml is rejected for verify.
+        with self.assertRaisesRegex(ValueError, "outside phase contract outputs"):
+            _allowed_output_paths_for_launch(
+                request_payload={**base, "allowed_output_paths": [ir_yaml, ir_meta]},
+                write_roots=[f"{_FIX_IR_REF}/"])
+        # ...but Compile.generate (the author) may still list spec.ir.yaml.
+        gen_out = _allowed_output_paths_for_launch(
+            request_payload={**base, "substep": "generate",
+                             "allowed_output_paths": [ir_yaml, ir_meta]},
+            write_roots=[f"{_FIX_IR_REF}/"])
+        self.assertIn(ir_yaml, gen_out)
+
+    def test_compile_non_static_launch_rejects_compile_static_meta_json(self) -> None:
+        """compile_static_meta.json is conductor-authored and leaf-non-writable. A
+        Compile.generate / Compile.verify leaf launch must NOT be able to list it as an output
+        (it would auto-authorize overwriting the static verdict). The compile phase contract
+        accepts compile_static_meta.json for the deterministic Compile.static substep ONLY.
+        """
+        from tools.orchestration_runtime import _allowed_output_paths_for_launch
+
+        compile_static_meta = f"{_FIX_IR_REF}/compile_static_meta.json"
+        ir_yaml = f"{_FIX_IR_REF}/spec.ir.yaml"
+        for substep in ("generate", "verify"):
+            with self.subTest(substep=substep):
+                req = {
+                    "agent_role": "substep",
+                    "node_key": "problem/shallow_water2d@0.3.0",
+                    "step": "compile",
+                    "substep": substep,
+                    "ir_ref": _FIX_IR_REF,
+                    "pipeline_ref": _FIX_PIPE_REF,
+                    "allowed_output_paths": [ir_yaml, compile_static_meta],
+                }
+                with self.assertRaisesRegex(ValueError, "outside phase contract outputs"):
+                    _allowed_output_paths_for_launch(
+                        request_payload=req,
+                        write_roots=[f"{_FIX_IR_REF}/"],
                     )
 
     def test_generate_non_lint_launch_rejects_lint_meta_json(self) -> None:
@@ -15532,7 +15633,9 @@ class GateRunbookTests(unittest.TestCase):
         from tools.orchestration_runtime import _build_gate_runbook
         import re as _re
 
-        rb = _build_gate_runbook(self._payload("compile", "verify"))
+        # compile.generate (compile.verify's gates moved to the deterministic compile.static
+        # substep, so verify now emits no runbook — see test_runbook_compile_verify_emits_no_gate).
+        rb = _build_gate_runbook(self._payload("compile", "generate"))
         # ir_ref / orchestration_id / agent_run_id resolved to literals.
         self.assertIn("workspace/ir/component__demo_dep_top__0.1.0/d_002/spec.ir.yaml", rb)
         self.assertIn("--orchestration-id orch_RUNBOOK_001", rb)
@@ -15569,6 +15672,25 @@ class GateRunbookTests(unittest.TestCase):
             _build_gate_runbook(
                 self._payload("generate", "static", deterministic=True)), "")
 
+    def test_runbook_compile_verify_emits_no_gate(self) -> None:
+        # The workspace_root + check_artifact_syntax + --stage compile gates moved to the
+        # conductor's deterministic compile.static substep, so compile.verify is a pure LLM
+        # semantic pass that emits NO runbook (mirrors generate.verify).
+        from tools.orchestration_runtime import (
+            _build_gate_runbook,
+            ALLOWED_VALIDATE_PIPELINE_STAGES,
+        )
+
+        self.assertEqual(_build_gate_runbook(self._payload("compile", "verify")), "")
+        # The substep table maps both compile.verify and the deterministic compile.static to
+        # the empty stage set (keeps the table total; no validator gate from either).
+        self.assertEqual(ALLOWED_VALIDATE_PIPELINE_STAGES[("compile", "verify")], frozenset())
+        self.assertEqual(ALLOWED_VALIDATE_PIPELINE_STAGES[("compile", "static")], frozenset())
+        # compile.static is deterministic -> empty runbook (the deterministic short-circuit).
+        self.assertEqual(
+            _build_gate_runbook(
+                self._payload("compile", "static", deterministic=True)), "")
+
     def test_runbook_empty_for_deterministic_and_unmapped(self) -> None:
         from tools.orchestration_runtime import _build_gate_runbook
 
@@ -15587,12 +15709,12 @@ class GateRunbookTests(unittest.TestCase):
             _validate_launch_prompt_text,
         )
 
-        # generate.verify is intentionally excluded: its gates moved to the deterministic
-        # generate.static substep, so it now renders with no Gate Runbook (covered by
-        # test_rendered_prompt_unmapped_phase_no_stray_marker's empty-runbook behavior).
+        # generate.verify and compile.verify are intentionally excluded: their gates moved to
+        # the deterministic generate.static / compile.static substeps, so they now render with
+        # no Gate Runbook (covered by test_rendered_prompt_unmapped_phase_no_stray_marker's
+        # empty-runbook behavior).
         for step, substep in (
             ("compile", "generate"),
-            ("compile", "verify"),
             ("generate", "generate"),
             ("validate", "judge"),
         ):
@@ -24604,9 +24726,19 @@ class ChildContextDocSizeTests(unittest.TestCase):
         "docs/workflow/RUNNER_OUTPUT_CONTRACT.md": 8500,
         # Still force-read by compile.generate/verify (its IR schema is the contract
         # the compile SKILL defers to).
-        "docs/workflow/phases/phase_01_compile.md": 17000,
+        # Bumped 17000->18200: documented the deterministic Compile.static substep (G2,
+        # docs/design/deterministic_followups.md) — the workspace_root + check_artifact_syntax
+        # + --stage compile gates moved out of the Compile.verify leaf into the conductor's
+        # in-process Compile.static, so phase_01 now describes the new substep + that verify is
+        # a pure spec-cross-reference semantic pass.
+        "docs/workflow/phases/phase_01_compile.md": 18200,
         # Per-substep SKILLs — each force-read by its own LLM leaf.
-        "skills/workflow-compile-generate/SKILL.md": 10800,
+        # Bumped 10800->11500: Compile.generate now authors the io_contract section (G2 /
+        # docs/design/deterministic_followups.md) — it was moved here from Compile.verify so the
+        # deterministic Compile.static gate (--stage compile, requires a complete io_contract)
+        # runs on a complete IR before verify. The authoring rules (recompute-sufficiency etc.)
+        # add ~0.9KB; the bulk of the io_contract detail stays in the force-read phase_01.
+        "skills/workflow-compile-generate/SKILL.md": 11500,
         "skills/workflow-compile-verify/SKILL.md": 11800,
         # Bumped 22000->22400: inlined the leaf-actionable C003 directive placement
         # + the f2008 63-char identifier limit (previously only in phase_02, which
@@ -24892,6 +25024,48 @@ class ReopenPhaseTest(unittest.TestCase):
                 trigger_agent_run_id="generate-static-1")
             self.assertEqual(result["status"], "reopened")
             self.assertEqual(result["affected_phases"], ["generate", "build", "validate"])
+
+    def test_reopen_accepts_same_phase_compile_static_trigger(self) -> None:
+        # The carve-out extends to compile.static: a failed static substep (--stage compile /
+        # syntax / workspace_root violation) may reopen compile itself so compile.generate
+        # warm-resumes to fix its IR — same mechanism as generate.lint/static.
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            oid = "orch_reopen_compile_static"
+            self._build_fixture(repo_root, oid)
+            root = repo_root / "workspace" / "orchestrations" / oid
+            with (root / "agent_runs.jsonl").open("a", encoding="utf-8") as f:
+                f.write(json.dumps({
+                    "agent_run_id": "compile-static-1", "agent_role": "substep",
+                    "step": "compile", "substep": "static", "status": "fail",
+                    "node_key": self.NODE_KEY,
+                }) + "\n")
+            result = reopen_phase(
+                repo_root, oid, node_key=self.NODE_KEY, from_phase="compile",
+                reason="compile_static_compile_static_violation",
+                trigger_agent_run_id="compile-static-1")
+            self.assertEqual(result["status"], "reopened")
+            self.assertEqual(result["affected_phases"],
+                             ["compile", "generate", "build", "validate"])
+
+    def test_reopen_rejects_same_phase_compile_verify_trigger(self) -> None:
+        # The compile same-phase carve-out is static-ONLY: a compile.verify same-phase trigger
+        # must still be rejected so verify/generate can never reopen their own phase (anti-abuse).
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            oid = "orch_reopen_compile_verify"
+            self._build_fixture(repo_root, oid)
+            root = repo_root / "workspace" / "orchestrations" / oid
+            with (root / "agent_runs.jsonl").open("a", encoding="utf-8") as f:
+                f.write(json.dumps({
+                    "agent_run_id": "compile-verify-fail-1", "agent_role": "substep",
+                    "step": "compile", "substep": "verify", "status": "fail",
+                    "node_key": self.NODE_KEY,
+                }) + "\n")
+            with self.assertRaises(RuntimeError):
+                reopen_phase(
+                    repo_root, oid, node_key=self.NODE_KEY, from_phase="compile",
+                    reason="x", trigger_agent_run_id="compile-verify-fail-1")
 
     def test_reopen_rejects_same_phase_generate_verify_trigger(self) -> None:
         # The same-phase carve-out is lint-ONLY: a generate.verify same-phase trigger must

@@ -4831,6 +4831,24 @@ def _allowed_output_paths_for_launch(
                         return True
             return False
         if step_token == "compile":
+            # Compile.static deliverable: the conductor-authored, freshness-gated
+            # compile_static_meta.json sits at the IR root (<ir_ref>/compile_static_meta.json),
+            # a sibling of spec.ir.yaml / ir_meta.json. Gated to the deterministic Compile.static
+            # substep ONLY (same rationale as generate's lint_meta/static_meta above: a
+            # Compile.generate / Compile.verify leaf launch must NOT be able to list a
+            # conductor-authored verdict as its own output). The --stage compile validator is
+            # read-only on the IR; only this meta is written, inside the substep's own write_root.
+            # Compile.static's ONLY deliverable is compile_static_meta.json (exhaustive, like
+            # the generate.static branch — a static request listing any other compile path is
+            # rejected, not silently accepted via the compile_required fall-through).
+            if substep_token == "static":
+                return bool(ir_ref) and path == f"{ir_ref}/compile_static_meta.json"
+            # Compile.verify authors NOTHING in spec.ir.yaml — generate authors all 5 sections
+            # (incl. io_contract) and Compile.static validated the IR before verify runs. Verify's
+            # sole write is ir_meta.json; restricting its contract here prevents verify from
+            # mutating the IR post-gate (which would bypass --stage compile).
+            if substep_token == "verify":
+                return bool(ir_ref) and path == f"{ir_ref}/ir_meta.json"
             return path in compile_required
         if step_token == "generate":
             # lineage.json is NOT a generate leaf output (it is authored host-side by the
@@ -5416,6 +5434,11 @@ def _allowed_file_tool_paths_for_launch(
             # (source/<source_id>/static_meta.json, conductor-authored in-process by
             # workflow_conductor._static_inproc): never leaf-writable.
             and not (path.endswith("/static_meta.json") and "/src/" not in path)
+            # And for the Compile.static deliverable compile_static_meta.json
+            # (<ir_ref>/compile_static_meta.json, conductor-authored in-process by
+            # workflow_conductor._compile_static_inproc): never leaf-writable. Defense-in-depth
+            # (CP-1 already keeps it out of any compile leaf's allowed_output_paths).
+            and not path.endswith("/compile_static_meta.json")
         }
         result = sorted(derived)
         _assert_mandatory_file_tool_pins_present(
@@ -5451,6 +5474,13 @@ def _allowed_file_tool_paths_for_launch(
             raise ValueError(
                 f"allowed_file_tool_paths[{idx}] must not include the conductor-authored "
                 f"static deliverable: {path!r} (written exclusively by Generate.static in-process)"
+            )
+        # Same for the IR-ROOT compile_static_meta.json (Compile.static in-process deliverable).
+        if path.endswith("/compile_static_meta.json"):
+            raise ValueError(
+                f"allowed_file_tool_paths[{idx}] must not include the conductor-authored "
+                f"compile static deliverable: {path!r} (written exclusively by Compile.static "
+                "in-process)"
             )
         # Phase-2: managed `.json` / `.txt` artifacts are written directly by the
         # confined leaf (FS-diff attribution), so they are no longer rejected here
@@ -6285,8 +6315,8 @@ def render_bwrap_command(
         # Do NOT ro-bind a read input that lives inside a writable write_root: the rw
         # write_root bind already exposes it, and an ro file-pin would make it unwritable,
         # breaking an in-place rewrite (git apply / atomic rename -> EBUSY) of a file that
-        # is both a read input and a managed output (e.g. compile.verify appending
-        # io_contract to spec.ir.yaml).
+        # is both a read input and a managed output (e.g. generate.verify rewriting
+        # source_meta.json, which it both reads and writes).
         if any(abs_path == w or abs_path.is_relative_to(w) for w in _write_abs):
             continue
         abs_token = str(abs_path)
@@ -8238,13 +8268,12 @@ def _build_gate_runbook(request_payload: dict[str, Any]) -> str:
             "python3 tools/validate_workspace_root.py",
             f"python3 tools/check_artifact_syntax.py --expect-top object {ir_ref}/spec.ir.yaml",
         ]
-    elif step == "compile" and substep == "verify":
-        commands = [
-            "python3 tools/validate_workspace_root.py",
-            "python3 tools/check_artifact_syntax.py --expect-top object "
-            f"{ir_ref}/spec.ir.yaml {ir_ref}/ir_meta.json",
-            f"python3 tools/validate_pipeline_semantics.py --stage compile --ir-ref {ir_ref}",
-        ]
+    # compile.verify emits NO gate runbook: the workspace_root + check_artifact_syntax +
+    # --stage compile gates it used to run now execute deterministically in the conductor's
+    # compile.static substep (Conductor._compile_static_inproc) BEFORE verify, so verify is
+    # reached only on a deterministically-clean IR and is a pure LLM semantic pass (the
+    # spec-cross-reference invariants V1/V3/V5). It therefore falls through to the `else` branch
+    # below and returns "" (no runbook) — mirroring generate.verify.
     elif step == "generate" and substep == "generate":
         commands = [
             "python3 tools/validate_workspace_root.py",
@@ -8636,8 +8665,9 @@ def _render_slim_repair_launch_prompt(request_payload: dict[str, Any]) -> str:
     # Paragraph 1 (no blank lines — `build_launch_prompt_text` keys on the first blank
     # line): sentinel + identity + ids + rotated paths + findings header.
     lines = [
-        f"{SLIM_REPAIR_PROMPT_SENTINEL}: your prior generate session is resumed and its "
-        "context is intact. Fix ONLY the findings below, then re-write your deliverables. "
+        f"{SLIM_REPAIR_PROMPT_SENTINEL}: your prior producer-leaf session (the `{vals['step']}."
+        f"{vals['substep']}` producer — `generate.generate` or `compile.generate`) is resumed "
+        "and its context is intact. Fix ONLY the findings below, then re-write your deliverables. "
         "Do NOT re-read the must-read docs or re-derive the design — you already have them.",
         f"Target node_key: {vals['node_key']}",
         f"Target step: {vals['step']}",
@@ -8649,7 +8679,8 @@ def _render_slim_repair_launch_prompt(request_payload: dict[str, Any]) -> str:
         f"repair_reason: {vals['repair_reason']}",
         f"repair_target_agent_run_id: {vals['repair_target_agent_run_id']}",
         f"source_id: {str(p.get('source_id', ''))}",
-        "NOTE: agent_run_id and source_id are NEW for this repair attempt — every per-agent "
+        "NOTE: your agent_run_id and the rotated per-attempt id (source_id for generate, ir_id "
+        "for compile) are NEW for this repair attempt — every per-agent "
         "path your resumed context remembers is STALE. Use the NEW paths below: write your "
         "deliverables to the new allowed_output_paths; reference (READ — do NOT write) the "
         "new output_manifest_path as the canonical source of your allowed paths, it is "
@@ -9175,7 +9206,14 @@ ALLOWED_VALIDATE_PIPELINE_STAGES: dict[tuple[str, str], frozenset[str]] = {
     # the corresponding verify substep. This was the exact pattern that
     # triggered the original `noncanonical_phase_write_attempt` failure.
     ("compile", "generate"): frozenset(),
-    ("compile", "verify"): frozenset({"compile"}),
+    # compile.static is a deterministic in-process substep (no leaf, no
+    # validate_pipeline_semantics invocation); the empty set keeps the table total. The
+    # `--stage compile` gate (plus workspace_root + check_artifact_syntax) that compile.verify
+    # used to own now runs in the conductor's compile.static substep
+    # (Conductor._compile_static_inproc), so compile.verify is a pure LLM semantic pass (the
+    # spec-cross-reference invariants V1/V3/V5) that invokes no validator gate.
+    ("compile", "static"): frozenset(),
+    ("compile", "verify"): frozenset(),
     ("generate", "generate"): frozenset(),
     # generate.lint and generate.static are deterministic in-process substeps (no leaf, no
     # validate_pipeline_semantics invocation); the empty sets keep the table total so a
@@ -10611,20 +10649,22 @@ def _validate_launch_request_payload(request_payload: dict[str, Any]) -> None:
     if not isinstance(step, str) or not step.strip():
         raise ValueError("launch request must include non-empty step")
     # Defense-in-depth: `deterministic` (in-process, skill-/constraint-line-exempt) is
-    # only legitimate for the non-LLM substeps Build, Validate.execute, Generate.lint and
-    # Generate.static. Reject the flag on any other step so a forged/buggy payload cannot
-    # claim the reduced launch-prompt guards while being a leaf step. (The flag is host-set by
-    # the conductor today; this makes the invariant explicit at the validation chokepoint.)
+    # only legitimate for the non-LLM substeps Build, Validate.execute, Generate.lint,
+    # Generate.static and Compile.static. Reject the flag on any other step so a forged/buggy
+    # payload cannot claim the reduced launch-prompt guards while being a leaf step. (The flag
+    # is host-set by the conductor today; this makes the invariant explicit at the validation
+    # chokepoint.)
     if request_payload.get("deterministic"):
         step_l = step.strip().lower()
         substep_l = str(substep).strip().lower() if isinstance(substep, str) else ""
         if not (step_l == "build"
                 or (step_l == "validate" and substep_l == "execute")
-                or (step_l == "generate" and substep_l in ("lint", "static"))):
+                or (step_l == "generate" and substep_l in ("lint", "static"))
+                or (step_l == "compile" and substep_l == "static")):
             raise ValueError(
                 "launch request: deterministic=True is only valid for step=build, "
-                "step=validate substep=execute, or step=generate substep=lint|static "
-                f"(got step={step!r} substep={substep!r})"
+                "step=validate substep=execute, step=generate substep=lint|static, or "
+                f"step=compile substep=static (got step={step!r} substep={substep!r})"
             )
     # agent_model identifies the LLM that produced the child's artifacts. At launch
     # only the unpinned spec-side ALIAS is known (e.g. "opus"); the exact version is
@@ -14998,14 +15038,18 @@ def reopen_phase(
         )
     trig_step = str(trigger.get("step") or "").strip().lower()
     trig_substep = str(trigger.get("substep") or "").strip().lower()
-    # Same-phase carve-out: a `generate.lint` or `generate.static` finding reopens generate
-    # itself (from_phase == trigger phase) so the SAME generate.generate leaf warm-resumes to
-    # fix its source. These are the ONLY permitted same-phase reopens. It stays anti-abuse-safe:
-    # the trigger must still be a terminal NON-PASS generate.lint/static substep (checked
-    # below), so a passing pipeline can never be erased, and generate.generate / generate.verify
-    # can never reopen their own phase. Every other trigger must be strictly downstream.
-    same_phase_det = (trig_step == from_token == "generate"
-                      and trig_substep in ("lint", "static"))
+    # Same-phase carve-out: a deterministic-gate finding reopens its own phase
+    # (from_phase == trigger phase) so the SAME producer leaf warm-resumes to fix its artifact:
+    #   - generate.lint / generate.static  -> reopen generate (generate.generate)
+    #   - compile.static                    -> reopen compile  (compile.generate)
+    # These are the ONLY permitted same-phase reopens. It stays anti-abuse-safe: the trigger
+    # must still be a terminal NON-PASS deterministic-gate substep (checked below), so a passing
+    # pipeline can never be erased, and a producer/verify substep can never reopen its own phase.
+    # Every other trigger must be strictly downstream.
+    same_phase_det = (
+        (trig_step == from_token == "generate" and trig_substep in ("lint", "static"))
+        or (trig_step == from_token == "compile" and trig_substep == "static")
+    )
     if trig_step not in STEP_KEYS_FOR_NODE_STATE or (
         STEP_KEYS_FOR_NODE_STATE.index(trig_step) <= from_idx and not same_phase_det
     ):
