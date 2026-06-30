@@ -86,6 +86,7 @@ io_contract:
   inputs:
     - name: "<name>"
       shape_expr: "<scalar | [d1,d2,...] | (d1,d2,...)>"
+      evidence_ref: "raw/state_snapshots | raw/diagnostics | ..."  # required non-empty string, same form as outputs[].evidence_ref
   outputs:
     - name: "<name>"
       shape_expr: "<...>"
@@ -93,7 +94,7 @@ io_contract:
       raw_variables: ["<name1>", ...]  # when evidence_ref=raw/state_snapshots, a non-empty array is required
   raw_requirements:
     required_evidence:
-      - artifact: "<state_snapshots|metrics_basis|execution_trace|...>"
+      - artifact: "<state_snapshots | metrics_basis.json | execution_trace.json>"  # normalizes to this enum (optional raw/ prefix, case-insensitive); author the canonical bare form, with the .json suffix on metrics_basis.json / execution_trace.json
         required: true|false
         min_samples: <int>
         schema:               # required when artifact=state_snapshots
@@ -175,6 +176,8 @@ The required invariant set for the self-check (finalized as a **minimal set**):
 - `algorithm.iteration_contract` is not an empty object when `algorithm.execution_mode=iterative`.
 
 #### V3. io_contract consistency
+- Every `io_contract.inputs[]` entry holds a non-empty `evidence_ref` string (same form as `outputs[].evidence_ref`, e.g. `raw/state_snapshots`); an input with a missing or empty `evidence_ref` is a `fail`.
+- Each `io_contract.raw_requirements.required_evidence[].artifact` normalizes (case-insensitively, with an optional `raw/` prefix) to one of `state_snapshots` / `metrics_basis.json` / `execution_trace.json`; author the canonical bare form (`metrics_basis.json`, not `raw/metrics_basis.json`). A token that does not normalize to the enum — e.g. `metrics_basis` without the `.json` suffix — is a `fail`.
 - Each `name` of `io_contract.outputs[]` appears in one of the `outputs` of `algorithm.steps[]`, or is derived by `algorithm.derived_field_rules`.
 - When `io_contract.outputs[].evidence_ref=raw/state_snapshots`, `raw_variables` is a non-empty array, and each element references `io_contract.raw_requirements.required_evidence[].schema.variables[].name` or `time_variable`.
 - `io_contract.test_evidence_requirements[].required_raw_variables` covers all `test_id` of `tests.md`, and for each `test_id` is **sufficient for independent recomputation** of that test's judgment: it includes the recompute *inputs* (e.g. `U_L`/`U_R` for a `F*=F(U_L)` judgment), and every listed variable resolves to a `raw_requirements.required_evidence[].schema.variables[].name` (so the inputs are also present in the `state_snapshots` schema). A `required_raw_variables` that lists only outputs while the judgment needs the inputs is a `fail`.
