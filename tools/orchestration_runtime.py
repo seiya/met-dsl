@@ -4997,19 +4997,20 @@ def _allowed_output_paths_for_launch(
             ):
                 return False
             rel_under_node = "/".join(tail_parts[2:])
+            # G6: the judge authors ONLY verdict.json + semantic_review.json. The
+            # deterministically-derivable aggregate_verdict / summary / validate_meta are
+            # conductor-authored in the post_judge substep (see below).
             allowed_files = {
                 "semantic_review.json",
                 "verdict.json",
-                "aggregate_verdict.json",
-                "summary.json",
-                "validate_meta.json",
             }
             return rel_under_node in allowed_files
         if step_token == "validate" and substep_token in ("pre_judge", "post_judge"):
-            # G4: the deterministic Validate gate substeps' ONLY deliverable is their own meta
-            # (pre_judge_meta.json / post_judge_meta.json), conductor-authored in-process under
-            # the run-node dir. Exhaustive exact-match (like compile.static / the judge branch),
-            # with the same canonical run_id enforcement as execute/judge.
+            # G4/G6: the deterministic Validate gate substeps, conductor-authored in-process
+            # under the run-node dir, with the same canonical run_id enforcement as
+            # execute/judge. pre_judge authors ONLY its own meta (exact-match). post_judge
+            # authors post_judge_meta.json PLUS the G6 derived artifacts
+            # (aggregate_verdict / summary / validate_meta hoisted out of the judge leaf).
             if not validate_prefix or not node_safe:
                 return False
             if not path.startswith(validate_prefix):
@@ -5021,7 +5022,15 @@ def _allowed_output_paths_for_launch(
                 or not _RUN_ID_RE.fullmatch(tail_parts[0])
             ):
                 return False
-            return "/".join(tail_parts[2:]) == f"{substep_token}_meta.json"
+            rel_under_node = "/".join(tail_parts[2:])
+            if substep_token == "post_judge":
+                return rel_under_node in {
+                    "post_judge_meta.json",
+                    "aggregate_verdict.json",
+                    "summary.json",
+                    "validate_meta.json",
+                }
+            return rel_under_node == "pre_judge_meta.json"
         # NOTE: `tune` / `promote` step branches below are out-of-scope for
         # core 5-phase workflow (see _write_roots_for_launch for context).
         # They remain to satisfy the optional-flow capability contract.
@@ -5462,6 +5471,14 @@ def _allowed_file_tool_paths_for_launch(
             # leaf-writable (the judge leaf's allowed_output_paths never lists them).
             and not path.endswith("/pre_judge_meta.json")
             and not path.endswith("/post_judge_meta.json")
+            # G6: the run-node aggregate_verdict.json / summary.json / validate_meta.json are
+            # now conductor-authored in the post_judge substep (_author_derived_validate_
+            # artifacts), so no Validate leaf may write them. Scoped to the run-node dir
+            # (`/runs/`) so an unrelated file of the same generic name stays writable.
+            and not ("/runs/" in path and (
+                path.endswith("/aggregate_verdict.json")
+                or path.endswith("/summary.json")
+                or path.endswith("/validate_meta.json")))
         }
         result = sorted(derived)
         _assert_mandatory_file_tool_pins_present(
@@ -5512,6 +5529,18 @@ def _allowed_file_tool_paths_for_launch(
                 f"allowed_file_tool_paths[{idx}] must not include the conductor-authored "
                 f"validate gate deliverable: {path!r} (written exclusively by "
                 "Validate.pre_judge / Validate.post_judge in-process)"
+            )
+        # G6: the run-node aggregate_verdict.json / summary.json / validate_meta.json are
+        # conductor-authored in the post_judge substep (hoisted out of the judge leaf).
+        if "/runs/" in path and (
+            path.endswith("/aggregate_verdict.json")
+            or path.endswith("/summary.json")
+            or path.endswith("/validate_meta.json")
+        ):
+            raise ValueError(
+                f"allowed_file_tool_paths[{idx}] must not include the conductor-authored "
+                f"derived validate deliverable: {path!r} (written exclusively by "
+                "Validate.post_judge in-process — G6)"
             )
         # Phase-2: managed `.json` / `.txt` artifacts are written directly by the
         # confined leaf (FS-diff attribution), so they are no longer rejected here

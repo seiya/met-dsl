@@ -201,14 +201,18 @@ VALIDATE_JUDGE_ROUTING: dict[tuple[str, str], tuple[str, str | None]] = {
 # violation strings (no structured category), each prefixed with the offending artifact
 # path, so the classifier keys on that leading path token.
 #
-#   - recoverable   : the violation is in a file the JUDGE LLM authors, so re-running the
-#                     judge (warm resume) can actually rewrite it. Scoped to EXACTLY the judge's
-#                     deliverables (phase_04 §4-2): semantic_review.json (incl. the review_method
-#                     literal), verdict.json, aggregate_verdict.json, summary.json,
-#                     validate_meta.json. NOT the execute-authored evidence
-#                     (diagnostics/perf/trial_meta/raw) — the judge cannot rewrite those, so a
-#                     violation there would warm-resume uselessly; it falls to `unknown` (below)
-#                     and fail_closes immediately instead of wasting judge spawns.
+#   - recoverable   : the violation is judge-fixable by re-running the judge (warm resume).
+#                     Scoped to the judge's own deliverables — semantic_review.json (incl. the
+#                     review_method literal) and verdict.json — PLUS the three G6 conductor-
+#                     derived artifacts (aggregate_verdict.json / summary.json / validate_meta.json):
+#                     although post_judge now authors those correct-by-construction, any gate
+#                     violation naming one of them (e.g. a summary.counts mismatch) traces to a
+#                     defect in the judge's verdict.json (a duplicate/invalid test_id), so warm-
+#                     resuming the judge to fix verdict.json + re-deriving them is the right repair.
+#                     NOT the execute-authored evidence (diagnostics/perf/trial_meta/raw) — the
+#                     judge cannot rewrite those, so a violation there would warm-resume uselessly;
+#                     it falls to `unknown` (below) and escalates/fail_closes instead of wasting
+#                     judge spawns.
 #   - unrecoverable : orchestration-record / cross-pipeline dependency-DAG integrity. Re-running
 #                     the judge cannot fix these. Sources: _validate_orchestration_hierarchy
 #                     (agent_graph.json / step_result.json / an orchestrations/ root) and the
@@ -825,8 +829,14 @@ def build_launch_request(
         elif substep == "post_judge":
             # Deterministic post-return `--stage pre_judge` gate + severity classifier. The
             # conductor authors post_judge_meta.json (status + violations + disposition)
-            # in-process after the judge leaf returns.
-            req["allowed_output_paths"] = [f"{rundir}/post_judge_meta.json"]
+            # AND, G6, the deterministically-derivable aggregate_verdict / summary /
+            # validate_meta (all in-process after the judge leaf returns).
+            req["allowed_output_paths"] = [
+                f"{rundir}/post_judge_meta.json",
+                f"{rundir}/aggregate_verdict.json",
+                f"{rundir}/summary.json",
+                f"{rundir}/validate_meta.json",
+            ]
         elif substep == "execute":
             req["source_id"] = refs.source_id
             req["source_binary_id"] = refs.source_binary_id
@@ -864,12 +874,12 @@ def build_launch_request(
                 f"{refs.binary_dir()}/binary_meta.json",
                 f"{spec}/tests.md",
             ]
+            # G6: the judge authors ONLY its two LLM-bound deliverables. The
+            # deterministically-derivable aggregate_verdict / summary / validate_meta are
+            # conductor-authored in post_judge (see _author_derived_validate_artifacts).
             req["allowed_output_paths"] = [
                 f"{rundir}/semantic_review.json",
                 f"{rundir}/verdict.json",
-                f"{rundir}/aggregate_verdict.json",
-                f"{rundir}/summary.json",
-                f"{rundir}/validate_meta.json",
             ]
     else:  # pragma: no cover - guarded by SUBSTEPS keys
         raise ValueError(f"unknown step: {step}")
@@ -1647,13 +1657,30 @@ clean:
             status = "pass" if (meta.get("status") == "pass"
                                 and _fresh_deliverables_written(allowed_output_paths)) else "fail"
         elif phase == "validate" and substep == "judge":
-            # Post-G3-split judge: a PURE LLM semantic pass. It passes on the LLM verdict alone
-            # (aggregate_verdict pass/xfail); the structural `--stage pre_judge` gate moved OUT
-            # to the post_judge substep, so its AND is no longer applied here.
-            agg = _read_json(self.repo_root / refs.run_node_dir() / "aggregate_verdict.json") or {}
-            status = ("pass"
-                      if str(agg.get("aggregate_verdict") or agg.get("overall")) in ("pass", "xfail")
-                      else "fail")
+            # Post-G6 judge: a PURE LLM semantic pass authoring only verdict.json +
+            # semantic_review.json (the deterministically-derivable aggregate_verdict / summary /
+            # validate_meta are conductor-authored in post_judge, so aggregate_verdict.json does
+            # not exist yet here). The judge passes iff its own two deliverables agree the node
+            # is physics-clean: verdict.per_test is a non-empty list with no `fail` entry AND
+            # semantic_review.decision == "pass". A per_test `fail` or a decision=="fail" breaks
+            # run_phase before post_judge; classify_failure then routes on verdict.failure_class
+            # + semantic_review.findings[0].attribution (routing preserved). An all-xfail node
+            # passes ("no fail" admits it, matching the old aggregate ∈ {pass,xfail} gate).
+            node_dir = self.repo_root / refs.run_node_dir()
+            verdict = _read_json(node_dir / "verdict.json") or {}
+            sem = _read_json(node_dir / "semantic_review.json") or {}
+            per_test = verdict.get("per_test")
+            # Every entry must be a clean, certifiable outcome — pass/xfail/skipped. Any
+            # `fail` OR `blocked` (both non-certifying) fails the judge, matching the old
+            # `aggregate ∈ {pass,xfail}` gate. A non-dict entry or an unknown status also
+            # fails (the post_judge counts gate would reject it anyway).
+            per_test_ok = isinstance(per_test, list) and bool(per_test) and all(
+                isinstance(e, dict)
+                and str(e.get("status") if e.get("status") is not None else e.get("outcome")
+                         or "").strip().lower() in ("pass", "xfail", "skipped")
+                for e in per_test)
+            decision_ok = str(sem.get("decision") or "").strip().lower() == "pass"
+            status = "pass" if (per_test_ok and decision_ok) else "fail"
         elif phase == "validate" and substep == "post_judge":
             # Deterministic post-return gate: the conductor-authored post_judge_meta records
             # the `--stage pre_judge` verdict (orchestration-record + cross-pipeline DAG
@@ -2950,12 +2977,221 @@ clean:
         return {"returncode": 0, "stdout": "",
                 "stderr": ("[pre_judge dag incomplete]\n" + block) if block else ""}
 
+    def _author_derived_validate_artifacts(self, refs: NodeRefs) -> None:
+        """G6: deterministically author the derived Validate artifacts the judge leaf used
+        to write — `aggregate_verdict.json` / `summary.json` / `validate_meta.json` — from
+        the judge's `verdict.json#per_test` plus the dependency set's `aggregate_verdict`s.
+        These are 100% deterministically derivable, so the conductor authors them
+        correct-by-construction (closing the previously un-gated aggregate/`blocked`-DAG
+        composition hole) instead of the LLM. Called at the TOP of `_post_judge_inproc`,
+        before the `--stage pre_judge` gate re-validates `summary.counts` vs
+        `verdict.per_test` (`_validate_tests_verdict_summary_consistency`). Idempotent on a
+        warm-resume re-run (re-derived from the re-authored `verdict.json`). The judge now
+        authors only `verdict.json` + `semantic_review.json`."""
+        from tools.orchestration_runtime import _resolve_dependency_facts
+
+        node_dir = self.repo_root / refs.run_node_dir()
+        verdict = _read_json(node_dir / "verdict.json") or {}
+        per_test = verdict.get("per_test")
+        per_test = per_test if isinstance(per_test, list) else []
+
+        # counts over per_test statuses (status/outcome, normalized) — must equal the
+        # `summary.counts` the `--stage pre_judge` gate cross-checks. `blocked` is a legal
+        # per-test TEST_OUTCOME value (validate_pipeline_semantics.TEST_OUTCOME_VALUES), so it
+        # is counted and non-certifying here too (else an all-`blocked` verdict would slip
+        # through as pass — the gate excludes `blocked` from both sides when the key is absent).
+        outcome_keys = ("pass", "fail", "xfail", "skipped", "blocked")
+        counts = {k: 0 for k in outcome_keys}
+        for item in per_test:
+            if not isinstance(item, dict):
+                continue
+            st = item.get("status")
+            if st is None:
+                st = item.get("outcome")
+            st = str(st or "").strip().lower()
+            if st in counts:
+                counts[st] += 1
+        total = sum(counts.values())
+
+        # self_verdict reduce: fail if any entry fails OR is blocked (a per-test `blocked` is
+        # not certifiable); else xfail if every non-skipped entry is xfail; else pass
+        # (skipped is non-failing).
+        if counts["fail"] > 0 or counts["blocked"] > 0:
+            self_verdict = "fail"
+        elif counts["xfail"] > 0 and counts["pass"] == 0:
+            self_verdict = "xfail"
+        else:
+            self_verdict = "pass"
+
+        # Direct-dependency `blocked` rule. The blocking decision uses the SAME readiness
+        # predicate the pre_judge substep and the `--stage pre_judge` gate use
+        # (`_closure_node_validated_in_own_pipeline` — a dep is ready iff any binary-bound
+        # verdict in its own pipeline is pass/xfail), so the derived `aggregate_verdict` can
+        # never contradict a readiness gate that already passed (a dep that regressed to a
+        # newer `fail` verdict but retains an older bound pass is still ready — pre_judge
+        # admits it, so we must not blindly block on its LATEST verdict). `_resolve_dependency_
+        # facts` (orientation-only, latest bound verdict) supplies each dep's display verdict +
+        # pipeline/run refs; it is NEVER the blocking signal.
+        from tools.validate_pipeline_semantics import (
+            _closure_node_validated_in_own_pipeline,
+            _dependency_expected_node_keys, _normalize_node_key_token)
+        ir = _read_yaml(self.repo_root / refs.ir_ref / "spec.ir.yaml") or {}
+        dep = (ir.get("dependency") or {}) if isinstance(ir, dict) else {}
+        if not isinstance(dep, dict):
+            dep = {}
+        facts_by_token: dict[str, dict[str, Any]] = {}
+        for fact in _resolve_dependency_facts(self.repo_root, refs.ir_ref):
+            try:
+                facts_by_token[_normalize_node_key_token(str(fact.get("node_key")))] = fact
+            except Exception:
+                continue
+        dependency_nodes: list[dict[str, Any]] = []
+        dep_counts = {"total": 0, "pass": 0, "xfail": 0, "fail": 0, "blocked": 0}
+        blocking_direct_deps: list[str] = []
+        fold_order = {"pass": 0, "xfail": 1, "fail": 2, "blocked": 3}
+        fold_inv = {0: "pass", 1: "xfail", 2: "fail", 3: "blocked"}
+        worst = fold_order.get(self_verdict, 0)
+        direct_deps = dep.get("direct_deps") if isinstance(dep.get("direct_deps"), list) else []
+        for entry in direct_deps:
+            node_key = entry.get("node_key") if isinstance(entry, dict) else entry
+            if not isinstance(node_key, str) or not node_key.strip():
+                continue
+            node_key = node_key.strip()
+            try:
+                token = _normalize_node_key_token(node_key)
+                ready = _closure_node_validated_in_own_pipeline(self.repo_root, token)
+            except Exception:
+                ready = False
+                token = None
+            fact = facts_by_token.get(token, {}) if token else {}
+            # Display verdict = the dep's latest bound aggregate (informational; may show a
+            # regression), else pass/unknown per readiness.
+            agg_ref = fact.get("aggregate_verdict_ref")
+            display = ""
+            if isinstance(agg_ref, str) and agg_ref.strip():
+                dep_doc = _read_json(self.repo_root / agg_ref) or {}
+                display = str(dep_doc.get("aggregate_verdict") or "").strip().lower()
+            if not display:
+                display = "pass" if ready else "unknown"
+            dependency_nodes.append({
+                "node_key": node_key,
+                "aggregate_verdict": display,
+                "ready": ready,
+                "pipeline_ref": fact.get("pipeline_ref"),
+                "run_id": fact.get("run_id"),
+            })
+            dep_counts["total"] += 1
+            if not ready:
+                blocking_direct_deps.append(node_key)
+                dep_counts["blocked"] += 1
+                worst = max(worst, fold_order["blocked"])
+            else:
+                # A ready dep is bound pass/xfail; fold its readiness-consistent contribution
+                # (xfail only when its latest bound verdict is xfail, else pass — never
+                # fail/blocked, which would contradict readiness).
+                contrib = "xfail" if display == "xfail" else "pass"
+                dep_counts[contrib] += 1
+                worst = max(worst, fold_order[contrib])
+
+        # aggregate_verdict: `blocked` when any immediate dep is not ready; else the transitive
+        # fold (precedence blocked > fail > xfail > pass) over {self_verdict} + ready-dep
+        # contributions. On the post_judge path (judge passed → self_verdict ∈ {pass,xfail} and
+        # every dep ready) this is always ∈ {pass,xfail}.
+        blocked = bool(blocking_direct_deps)
+        blocked_reason: str | None = None
+        if blocked:
+            aggregate_verdict = "blocked"
+            blocked_reason = ("immediate dependency not built+validated in its own pipeline: "
+                              + ", ".join(blocking_direct_deps))
+        else:
+            aggregate_verdict = fold_inv[worst]
+
+        # dependency_set: the transitive closure node tokens from the IR (self excluded),
+        # matching the readiness check's derivation.
+        dependency_set: list[str] = []
+        try:
+            self_token = _normalize_node_key_token(refs.node_key)
+            dependency_set = sorted(
+                t for t in _dependency_expected_node_keys(dep) if t != self_token)
+        except Exception:
+            dependency_set = []
+
+        agg_doc: dict[str, Any] = {
+            "aggregate_verdict": aggregate_verdict,
+            "self_verdict": self_verdict,
+            "blocked": blocked,
+            "dependency_set": dependency_set,
+            "dependency_nodes": dependency_nodes,
+        }
+        if blocked:
+            agg_doc["blocked_reason"] = blocked_reason
+            agg_doc["blocking_direct_deps"] = blocking_direct_deps
+        self._write_run_node_meta(refs, "aggregate_verdict.json", agg_doc)
+
+        failure_class = verdict.get("failure_class")
+        summary_doc: dict[str, Any] = {
+            "self_summary": {
+                "verdict": self_verdict,
+                "failure_class": failure_class,
+                "total": total,
+                "pass": counts["pass"],
+                "xfail": counts["xfail"],
+                "fail": counts["fail"],
+                "skipped": counts["skipped"],
+                "blocked": counts["blocked"],
+            },
+            "dependency_summary": {
+                "total": dep_counts["total"],
+                "pass": dep_counts["pass"],
+                "xfail": dep_counts["xfail"],
+                "fail": dep_counts["fail"],
+                "blocked": dep_counts["blocked"],
+            },
+            "counts": {
+                "pass": counts["pass"],
+                "fail": counts["fail"],
+                "xfail": counts["xfail"],
+                "skipped": counts["skipped"],
+                "blocked": counts["blocked"],
+            },
+        }
+        qc = _read_json(node_dir / "quality_check.json")
+        if isinstance(qc, dict):
+            qc_checks = qc.get("checks") if isinstance(qc.get("checks"), dict) else {}
+            summary_doc["quality_check"] = {
+                "target_class": qc.get("target_class"),
+                "status": qc.get("status"),
+                "diagnostics_match": qc_checks.get("diagnostics_match"),
+                "verdict_match": qc_checks.get("verdict_match"),
+            }
+        self._write_run_node_meta(refs, "summary.json", summary_doc)
+
+        # validate_meta.json bookkeeping (not gate-validated; keys per phase_04 §"required
+        # keys"). last_fail_reason reads the PRIOR post_judge_meta (present only on a
+        # warm-resume re-run; None on the first pass).
+        prior_post = _read_json(node_dir / "post_judge_meta.json") or {}
+        last_fail_reason = prior_post.get("failure_excerpt") or None
+        attempt_count = getattr(self, "_judge_attempt_count", {}).get(refs.node_key, 1)
+        self._write_run_node_meta(refs, "validate_meta.json", {
+            "run_id": refs.run_id,
+            "node_key": refs.node_key,
+            "pipeline_id": refs.pipeline_id,
+            "attempt_count": attempt_count,
+            "verification_status": "pass",
+            "last_fail_reason": last_fail_reason,
+            "debug_mode": (self.workflow_mode == "dev"),
+            "context_isolated": True,
+            "judge_command_ref": f"{refs.run_node_dir()}/semantic_review.json",
+        })
+
     def _post_judge_inproc(self, refs: NodeRefs, child_arid: str,
                            cap_token: str) -> dict[str, str]:
-        """Deterministic Validate.post_judge: run `validate_pipeline_semantics --stage
-        pre_judge` (the gate the judge leaf used to own, G3) AFTER the judge returns its
-        verdict, then classify the violation severity into a `disposition`. Authors
-        post_judge_meta.json {status, violations, disposition}.
+        """Deterministic Validate.post_judge: FIRST author the derived artifacts
+        (`_author_derived_validate_artifacts` — G6: aggregate_verdict/summary/validate_meta),
+        then run `validate_pipeline_semantics --stage pre_judge` (the gate the judge leaf
+        used to own, G3) AFTER the judge returns its verdict, then classify the violation
+        severity into a `disposition`. Authors post_judge_meta.json
+        {status, violations, disposition}.
 
         Scoped to this run (`--pipeline-root`/`--run-id`) so historically-broken sibling
         pipelines cannot fail an otherwise-conformant node. `--in-flight-agent-run-id` names
@@ -2971,6 +3207,10 @@ clean:
         (run_phase warm-resumes the judge in place); unrecoverable (orchestration-record /
         cross-pipeline DAG integrity) -> fail_closed; unknown -> fail_closed (conservative;
         an escalate-LLM adjudicator is a deferred follow-up)."""
+        # G6: the conductor authors the deterministically-derivable artifacts (aggregate_verdict
+        # / summary / validate_meta) from the judge's verdict.json + the dependency set BEFORE
+        # the gate, so `--stage pre_judge` re-validates the conductor's own summary.counts.
+        self._author_derived_validate_artifacts(refs)
         judge_arid = getattr(self, "_pending_judge_arid", {}).get(refs.node_key, "")
         cmd = ["python3", "tools/validate_pipeline_semantics.py", "--stage", "pre_judge",
                "--orchestration-id", self.orchestration_id,
@@ -3078,6 +3318,10 @@ clean:
                 # outcome; run_phase's transport branch / classify_validate_judge takes over.
                 return outcomes[:-1]
             self._pending_judge_arid[refs.node_key] = judge_oc.agent_run_id
+            if not hasattr(self, "_judge_attempt_count"):
+                self._judge_attempt_count = {}
+            self._judge_attempt_count[refs.node_key] = (
+                self._judge_attempt_count.get(refs.node_key, 0) + 1)
             post_oc = self.run_substep(refs, "validate", "post_judge",
                                        resolved_dependencies=dep_facts)
             outcomes[-1] = post_oc
@@ -3170,6 +3414,12 @@ clean:
                 if not hasattr(self, "_pending_judge_arid"):
                     self._pending_judge_arid: dict[str, str] = {}
                 self._pending_judge_arid[refs.node_key] = oc.agent_run_id
+                # G6: track judge attempts for validate_meta.attempt_count (best-effort; not
+                # gate-validated). Incremented again per warm-resume judge re-run.
+                if not hasattr(self, "_judge_attempt_count"):
+                    self._judge_attempt_count: dict[str, int] = {}
+                self._judge_attempt_count[refs.node_key] = (
+                    self._judge_attempt_count.get(refs.node_key, 0) + 1)
             if oc.status != "pass":
                 break
         # Warm-resume mini-loop: a RECOVERABLE post_judge conformance violation (e.g. a wrong
@@ -3433,7 +3683,18 @@ clean:
             review = _read_json(self.repo_root / refs.run_node_dir() / "semantic_review.json") or {}
             findings = review.get("findings") or []
             attribution = findings[0].get("attribution") if findings and isinstance(findings[0], dict) else None
-            return classify_validate_judge(verdict.get("failure_class"), attribution)
+            failure_class = verdict.get("failure_class")
+            # G6: the judge substep now fails on `semantic_review.decision == "fail"` even when the
+            # mechanical per_test is clean (a fabrication / consistency finding on passing tests). In
+            # that case `verdict.failure_class` may still be `pass`, and classify_validate_judge would
+            # treat `pass` as `advance` — silently dropping the finding and terminalizing the failed
+            # phase as a generic `fail`. Route it to the diagnostician instead (it reads
+            # semantic_review + verdict and decides reuse/restart/reopen/fail_closed), matching how an
+            # under-specified judge output (missing class/attribution) already escalates.
+            if (str(review.get("decision") or "").strip().lower() == "fail"
+                    and failure_class in (None, "", "pass")):
+                return RouteDecision("escalate", reason="judge_semantic_review_fail")
+            return classify_validate_judge(failure_class, attribution)
         # compile / generate: verify severity gate. A failed phase with no
         # recorded severity (e.g. the producing substep itself failed) is
         # unclassifiable -> escalate to the diagnostician rather than guessing.

@@ -1092,3 +1092,71 @@ one-shot escalate leaf can never re-emit `escalate`).
 `_diagnosis_prompt` + `_load_escalate_persona`); new `skills/workflow-escalate/SKILL.md`; docs
 (`AGENT_SKILLS.md`, `LAUNCH_PROMPT_REFERENCE.md`). Tests: extended `DiagnosticianTest`, new
 `resolve_severity_directive` + post_judge-escalate wiring tests.
+
+## G6 — hoist the deterministically-derivable Validate artifacts out of the judge LLM leaf (IMPLEMENTED 2026-07-01)
+
+**Motivation.** After G4 split `Validate` into `(pre_judge, execute, judge, post_judge)`, the LLM `judge`
+still authored **5** artifacts: `verdict.json`, `semantic_review.json`, `aggregate_verdict.json`,
+`summary.json`, `validate_meta.json`. Three of those are **100% deterministically derivable** from the
+LLM's `verdict.json#per_test` plus the dependency set's `aggregate_verdict`s. Two problems: (a) the LLM
+wastes output and injects nondeterminism authoring them; (b) **a silent correctness hole** — the
+composition of `aggregate_verdict.json` (the transitive fold + the `blocked` DAG logic) was **never
+structurally validated** by any gate; only its top-level `aggregate_verdict` field is read downstream
+(dependency readiness), so an LLM mistake in the fold/`blocked` logic silently corrupted downstream
+state. (This is "proposal 2", deferred from G4.)
+
+**Change.** The conductor now authors `aggregate_verdict.json` / `summary.json` / `validate_meta.json`
+correct-by-construction; the judge authors only `verdict.json` + `semantic_review.json`.
+- **Option B (no 5th substep).** A new `_author_derived_validate_artifacts(refs)` is called at the TOP of
+  the existing `_post_judge_inproc`, BEFORE the `--stage pre_judge` gate subprocess — so the gate then
+  re-validates the conductor's own `summary.counts` vs `verdict.per_test`
+  (`_validate_tests_verdict_summary_consistency`): correct-by-construction AND gate-verified. Folding into
+  `post_judge` avoids the index-fragile `outcomes[-2]==judge` warm-resume + judge-idx `launch_request_ref`
+  invariants a 5th substep would perturb. Idempotent on a warm-resume re-run (re-derived from the
+  re-authored `verdict.json`).
+- **Derivation.** `self_verdict` = reduce `per_test` (`fail` if any entry is `fail` or `blocked`; else
+  `xfail` if every non-skipped entry is `xfail`; else `pass`; `blocked` is a legal per-test outcome that
+  must be counted and non-certifying). `blocked` rule: a direct dep that is **not built+validated in its
+  own pipeline** (`validate_pipeline_semantics._closure_node_validated_in_own_pipeline` — the SAME
+  readiness predicate `pre_judge` and the `--stage pre_judge` gate use) → `aggregate_verdict="blocked"` +
+  `blocking_direct_deps`; else the transitive fold (precedence `blocked > fail > xfail > pass`) over
+  `{self_verdict}` + each ready dep's readiness-consistent contribution (`xfail`/`pass`, never
+  `fail`/`blocked`). Using the readiness predicate — not the dep's *latest* verdict from
+  `orchestration_runtime._resolve_dependency_facts` (which supplies display verdict + pipeline/run refs
+  only, NEVER the blocking signal) — guarantees the derived `aggregate_verdict` can never contradict a
+  readiness gate that already passed. `summary.json` carries `self_summary` + `dependency_summary` + the
+  gate-checked `counts` (including `blocked`).
+- **Judge pass criterion (`determine_substep_status`).** `aggregate_verdict.json` no longer exists at
+  judge-completion, so the judge branch now passes iff `verdict.json#per_test` is a non-empty list with no
+  `fail` entry AND `semantic_review.json#decision == "pass"`. A per_test `fail` or a `decision=="fail"`
+  breaks `run_phase` before `post_judge`; `classify_failure` still routes on `verdict.failure_class` +
+  `semantic_review.findings[0].attribution` (routing preserved; both stay LLM-authored). An all-`xfail`
+  node still passes. Because the criterion now fails the judge on `decision=="fail"` even when the
+  mechanical `per_test` is clean (a fabrication finding on passing tests), `classify_failure`'s judge
+  branch special-cases a `decision=="fail"` with a `pass`/missing `failure_class`: it escalates
+  (`judge_semantic_review_fail`) to the diagnostician instead of letting `classify_validate_judge` treat
+  `failure_class=="pass"` as `advance` and silently drop the finding (Codex P2).
+- **Contract / non-writable wiring.** The judge's `allowed_output_paths` + `_matches_phase_contract`
+  `allowed_files` shrink to `{verdict.json, semantic_review.json}`; `post_judge` accepts
+  `{post_judge_meta.json, aggregate_verdict.json, summary.json, validate_meta.json}` (pre_judge stays
+  exact-match on its own meta). The three derived artifacts are added to the leaf-non-writable exclusions
+  (scoped to `/runs/`) in both `_allowed_file_tool_paths_for_launch` branches.
+
+**Decisions.** (1) **Option B** — fold into `_post_judge_inproc`, no 5th substep. (2) **Conservative SKILL
+slim** — remove only the now-conductor-owned aggregate/summary *authoring* instructions; **keep** the
+SKILL's structural coverage checks (metrics_basis / diagnostics_contract) as belt-and-suspenders with the
+gates.
+
+**Deferred.** The spec-general per-contract **recompute engine stays in the LLM** (io_contract acceptance
+is arbitrary per-spec named diagnostics with no fixed metric; recompute from `raw/` + reconcile with
+`diagnostics.json`, and `verdict.per_test[].status` / `failure_class` / `semantic_review`
+fabrication+attribution, all remain LLM). Only the deterministically-derivable *artifacts* move. A future
+pass could remove the kept SKILL structural checks once gate confidence is established.
+
+**Files.** `tools/workflow_conductor.py` (`_author_derived_validate_artifacts` + its call, the judge pass
+criterion, `_judge_attempt_count`, judge/post_judge `allowed_output_paths`); `tools/orchestration_runtime.py`
+(`_matches_phase_contract` judge + pre/post_judge, leaf-non-writable exclusions in both branches); docs
+(`phase_04_validate.md`, `LAUNCH_PROMPT_REFERENCE.md`, `skills/workflow-validate-judge/SKILL.md`). Tests:
+`_author_derived_validate_artifacts` (single-node / deps-present / `blocked`), the G6 judge criterion, the
+judge+post_judge contract split, and the conductor-derived `summary.counts` gate consistency (+ a mutated
+negative).

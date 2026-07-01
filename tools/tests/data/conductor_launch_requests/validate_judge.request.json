@@ -17,10 +17,7 @@
  "skill_must_read_refs": "skills/workflow-validate-judge/SKILL.md,docs/AGENT_CONTRACT.md,docs/workflow/RUNNER_OUTPUT_CONTRACT.md,workspace/ir/component__dynamics_advdiff_flux_1d_upwind_center2__0.1.0/advdiff-flux-1d-uc2_20260620_001/spec.ir.yaml,workspace/pipelines/component__dynamics_advdiff_flux_1d_upwind_center2__0.1.0/advdiff-flux-1d-uc2_20260620_002/source/src_20260620_002/source_meta.json,workspace/pipelines/component__dynamics_advdiff_flux_1d_upwind_center2__0.1.0/advdiff-flux-1d-uc2_20260620_002/binary/bin_20260620_002/binary_meta.json,spec/component/dynamics/advection_diffusion/dynamics_advdiff_flux_1d_upwind_center2/tests.md",
  "allowed_output_paths": [
   "workspace/pipelines/component__dynamics_advdiff_flux_1d_upwind_center2__0.1.0/advdiff-flux-1d-uc2_20260620_002/runs/run_20260620_002/component__dynamics_advdiff_flux_1d_upwind_center2__0.1.0/semantic_review.json",
-  "workspace/pipelines/component__dynamics_advdiff_flux_1d_upwind_center2__0.1.0/advdiff-flux-1d-uc2_20260620_002/runs/run_20260620_002/component__dynamics_advdiff_flux_1d_upwind_center2__0.1.0/verdict.json",
-  "workspace/pipelines/component__dynamics_advdiff_flux_1d_upwind_center2__0.1.0/advdiff-flux-1d-uc2_20260620_002/runs/run_20260620_002/component__dynamics_advdiff_flux_1d_upwind_center2__0.1.0/aggregate_verdict.json",
-  "workspace/pipelines/component__dynamics_advdiff_flux_1d_upwind_center2__0.1.0/advdiff-flux-1d-uc2_20260620_002/runs/run_20260620_002/component__dynamics_advdiff_flux_1d_upwind_center2__0.1.0/summary.json",
-  "workspace/pipelines/component__dynamics_advdiff_flux_1d_upwind_center2__0.1.0/advdiff-flux-1d-uc2_20260620_002/runs/run_20260620_002/component__dynamics_advdiff_flux_1d_upwind_center2__0.1.0/validate_meta.json"
+  "workspace/pipelines/component__dynamics_advdiff_flux_1d_upwind_center2__0.1.0/advdiff-flux-1d-uc2_20260620_002/runs/run_20260620_002/component__dynamics_advdiff_flux_1d_upwind_center2__0.1.0/verdict.json"
  ],
  "issue_severity": "none",
  "repair_strategy": "none",

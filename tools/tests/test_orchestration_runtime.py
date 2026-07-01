@@ -3250,7 +3250,7 @@ shell_tool                       stable             true
             "pipeline_ref": _FIX_PIPE_REF,
             "run_id": run_id,
             "allowed_output_paths": [
-                f"{run_dir}/aggregate_verdict.json",
+                f"{run_dir}/verdict.json",
             ],
         }
         out = _allowed_output_paths_for_launch(
@@ -13416,6 +13416,8 @@ class TestPhase3RunGate(unittest.TestCase):
             )
 
     def test_allowed_output_paths_for_launch_allows_judge_contract_path(self) -> None:
+        # G6: the judge's contract deliverables are verdict.json + semantic_review.json
+        # (aggregate_verdict / summary / validate_meta are conductor-authored in post_judge).
         req = {
             "agent_role": "step",
             "node_key": "problem/shallow_water2d@0.3.0",
@@ -13423,7 +13425,7 @@ class TestPhase3RunGate(unittest.TestCase):
             "ir_ref": _FIX_IR_REF,
             "pipeline_ref": _FIX_PIPE_REF,
             "allowed_output_paths": [
-                f"{_FIX_PIPE_REF}/runs/run_20260101_001/problem__shallow_water2d__0.3.0/summary.json"
+                f"{_FIX_PIPE_REF}/runs/run_20260101_001/problem__shallow_water2d__0.3.0/verdict.json"
             ],
         }
         out = _allowed_output_paths_for_launch(
@@ -13432,7 +13434,7 @@ class TestPhase3RunGate(unittest.TestCase):
         )
         self.assertEqual(
             out,
-            [f"{_FIX_PIPE_REF}/runs/run_20260101_001/problem__shallow_water2d__0.3.0/summary.json"],
+            [f"{_FIX_PIPE_REF}/runs/run_20260101_001/problem__shallow_water2d__0.3.0/verdict.json"],
         )
 
     def test_allowed_output_paths_for_launch_rejects_judge_path_under_legacy_judge_root(self) -> None:
@@ -22913,11 +22915,12 @@ class CanonicalIdEnforcementTests(unittest.TestCase):
     def test_validate_judge_rejects_non_canonical_run_id(self) -> None:
         from tools.orchestration_runtime import _allowed_output_paths_for_launch
         node_safe = "problem__shallow_water2d__0.3.0"
-        good = f"{_FIX_PIPE_REF}/runs/run_20260101_001/{node_safe}/aggregate_verdict.json"
+        # G6: verdict.json is a judge deliverable (aggregate_verdict moved to post_judge).
+        good = f"{_FIX_PIPE_REF}/runs/run_20260101_001/{node_safe}/verdict.json"
         # `ex_001` is non-canonical; `run-rsn-p0_20260605_001` is slug-shaped
         # but still not a canonical run_id (no literal `run_` prefix).
         for bad_run_id in ("ex_001", "run-rsn-p0_20260605_001"):
-            bad = f"{_FIX_PIPE_REF}/runs/{bad_run_id}/{node_safe}/aggregate_verdict.json"
+            bad = f"{_FIX_PIPE_REF}/runs/{bad_run_id}/{node_safe}/verdict.json"
             with self.assertRaises(ValueError) as ctx:
                 _allowed_output_paths_for_launch(
                     request_payload=self._build_payload("validate", "judge", [bad]),
@@ -22929,6 +22932,37 @@ class CanonicalIdEnforcementTests(unittest.TestCase):
             write_roots=[f"{_FIX_PIPE_REF}/runs/"],
         )
         self.assertIn(good, ok_list)
+
+    def test_g6_judge_rejects_derived_artifacts_post_judge_accepts(self) -> None:
+        """G6: the judge contract accepts only verdict.json + semantic_review.json;
+        aggregate_verdict / summary / validate_meta moved to the post_judge contract."""
+        from tools.orchestration_runtime import _allowed_output_paths_for_launch
+        node_safe = "problem__shallow_water2d__0.3.0"
+        run_dir = f"{_FIX_PIPE_REF}/runs/run_20260101_001/{node_safe}"
+        derived = [f"{run_dir}/aggregate_verdict.json", f"{run_dir}/summary.json",
+                   f"{run_dir}/validate_meta.json"]
+        # judge: its own deliverables pass; each derived artifact is rejected.
+        for good in (f"{run_dir}/verdict.json", f"{run_dir}/semantic_review.json"):
+            self.assertIn(good, _allowed_output_paths_for_launch(
+                request_payload=self._build_payload("validate", "judge", [good]),
+                write_roots=[f"{_FIX_PIPE_REF}/runs/"]))
+        for bad in derived:
+            with self.assertRaises(ValueError) as ctx:
+                _allowed_output_paths_for_launch(
+                    request_payload=self._build_payload("validate", "judge", [bad]),
+                    write_roots=[f"{_FIX_PIPE_REF}/runs/"])
+            self.assertIn("outside phase contract", str(ctx.exception))
+        # post_judge: post_judge_meta + all three derived artifacts pass.
+        for good in ([f"{run_dir}/post_judge_meta.json"] + derived):
+            self.assertIn(good, _allowed_output_paths_for_launch(
+                request_payload=self._build_payload("validate", "post_judge", [good]),
+                write_roots=[f"{_FIX_PIPE_REF}/runs/"]))
+        # pre_judge stays exact-match on its own meta (rejects the derived artifacts).
+        for bad in derived:
+            with self.assertRaises(ValueError):
+                _allowed_output_paths_for_launch(
+                    request_payload=self._build_payload("validate", "pre_judge", [bad]),
+                    write_roots=[f"{_FIX_PIPE_REF}/runs/"])
 
 
 class FreshnessSelectorStrictGrammarTests(unittest.TestCase):

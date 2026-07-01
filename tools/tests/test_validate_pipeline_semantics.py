@@ -10106,5 +10106,51 @@ class ModelSourceNotFoundMessageTests(unittest.TestCase):
         self.assertEqual(violations, [])
 
 
+class ConductorDerivedSummaryConsistencyTest(unittest.TestCase):
+    """G6: the conductor authors summary.json (counts) from verdict.json#per_test; the
+    `--stage pre_judge` gate (`_validate_tests_verdict_summary_consistency`) re-validates
+    it, so a correct-by-construction summary passes and a mutated one still bites."""
+
+    def _execution(self, tmp: Path) -> vps.NodeExecution:
+        node_dir = tmp / "node"
+        node_dir.mkdir(parents=True, exist_ok=True)
+        return vps.NodeExecution(
+            node_key="component/spec_x@0.1.0", node_dir=node_dir,
+            exec_dir=node_dir, pipeline_dir=tmp)
+
+    def _seed(self, tmp: Path, ex: vps.NodeExecution, counts: dict) -> None:
+        tests_md = tmp / "tests.md"
+        tests_md.write_text("### 1-1. `t1`\n### 1-2. `t2`\n", encoding="utf-8")
+        self._orig = vps._tests_path_for_execution
+        vps._tests_path_for_execution = lambda repo, execution: tests_md
+        self.addCleanup(setattr, vps, "_tests_path_for_execution", self._orig)
+        (ex.node_dir / "verdict.json").write_text(json.dumps({
+            "per_test": [{"test_id": "t1", "status": "pass"},
+                         {"test_id": "t2", "status": "xfail"}],
+        }), encoding="utf-8")
+        (ex.node_dir / "summary.json").write_text(json.dumps({"counts": counts}),
+                                                  encoding="utf-8")
+
+    def test_correct_summary_counts_pass(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            ex = self._execution(tmp)
+            self._seed(tmp, ex, {"pass": 1, "fail": 0, "xfail": 1, "skipped": 0})
+            violations: list[str] = []
+            vps._validate_tests_verdict_summary_consistency(tmp, ex, violations)
+            self.assertEqual(violations, [])
+
+    def test_mutated_summary_counts_flagged(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            ex = self._execution(tmp)
+            # pass count does not match the verdict.per_test aggregate (1).
+            self._seed(tmp, ex, {"pass": 2, "fail": 0, "xfail": 1, "skipped": 0})
+            violations: list[str] = []
+            vps._validate_tests_verdict_summary_consistency(tmp, ex, violations)
+            self.assertTrue(any("counts.pass must equal" in v for v in violations),
+                            violations)
+
+
 if __name__ == "__main__":
     unittest.main()

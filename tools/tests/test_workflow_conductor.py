@@ -3378,6 +3378,40 @@ class DeterministicBuildTest(unittest.TestCase):
             self.assertEqual(decision.target_phase, "generate")
             self.assertEqual(decision.repair_strategy, "restart")
 
+    def test_semantic_review_fail_on_clean_verdict_escalates(self) -> None:
+        # G6 (Codex P2): the judge substep fails on semantic_review.decision=="fail" even when
+        # the mechanical per_test is clean (failure_class stays "pass"). classify_validate_judge
+        # would treat failure_class=="pass" as `advance`, silently dropping the finding; the
+        # classify_failure judge branch must route it to the diagnostician (escalate) instead.
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            c = wc.Conductor(repo_root=repo, orchestration_id="o",
+                             orchestration_agent_run_id="O", backend="claude", env={})
+            refs = self._refs()
+            rn = repo / refs.run_node_dir()
+            rn.mkdir(parents=True, exist_ok=True)
+            (rn / "verdict.json").write_text(json.dumps(
+                {"per_test": [{"test_id": "t1", "status": "pass"}], "failure_class": "pass"}),
+                encoding="utf-8")
+            (rn / "semantic_review.json").write_text(json.dumps(
+                {"decision": "fail",
+                 "findings": [{"attribution": "code", "description": "fabrication suspected"}]}),
+                encoding="utf-8")
+            # judge is the failed substep (index 2): [pre_judge(pass), execute(pass), judge(fail)].
+            judge_fail = [wc.SubstepOutcome("pj", "pass", [], 0),
+                          wc.SubstepOutcome("ex", "pass", [], 0),
+                          wc.SubstepOutcome("jd", "fail", [], 0)]
+            decision = c.classify_failure(refs, "validate", judge_fail)
+            self.assertEqual(decision.action, "escalate")
+            self.assertEqual(decision.reason, "judge_semantic_review_fail")
+            # a genuine physics failure_class still routes via the decision table (not escalate).
+            (rn / "verdict.json").write_text(json.dumps(
+                {"per_test": [{"test_id": "t1", "status": "fail"}],
+                 "failure_class": "physics_fail"}), encoding="utf-8")
+            decision2 = c.classify_failure(refs, "validate", judge_fail)
+            self.assertEqual((decision2.action, decision2.target_phase), ("retry", "generate"))
+
     def test_recurring_execute_failure_escalates_to_compile(self) -> None:
         # C2 backstop: a first execute failure (no verdict.json) routes to Generate
         # restart; a second consecutive one on the same node escalates to a Compile
@@ -3933,22 +3967,224 @@ class G3JudgeGateSubstepTest(unittest.TestCase):
         from unittest import mock
         return mock.patch.object(wc.subprocess, "run", fn)
 
-    def _seed_agg(self, repo: Path, refs: wc.NodeRefs, agg: str) -> None:
+    def _seed_judge(self, repo: Path, refs: wc.NodeRefs, *, per_test: list,
+                    decision: str) -> None:
+        """G6: seed the judge's OWN two deliverables (verdict.json#per_test +
+        semantic_review.json#decision) — aggregate_verdict.json no longer exists at
+        judge-completion (post_judge authors it)."""
         rn = repo / refs.run_node_dir()
         rn.mkdir(parents=True, exist_ok=True)
-        (rn / "aggregate_verdict.json").write_text(
-            json.dumps({"aggregate_verdict": agg}), encoding="utf-8")
+        (rn / "verdict.json").write_text(
+            json.dumps({"per_test": per_test}), encoding="utf-8")
+        (rn / "semantic_review.json").write_text(
+            json.dumps({"decision": decision}), encoding="utf-8")
 
-    # -- determine_substep_status: judge (verdict only), pre_judge/post_judge (meta) -------
+    # -- determine_substep_status: judge (verdict+semantic_review), pre/post_judge (meta) --
     def test_determine_judge_passes_on_verdict_alone(self) -> None:
         import tempfile
         with tempfile.TemporaryDirectory() as td:
             repo, refs = Path(td), self._refs()
             c = self._conductor(repo)
-            self._seed_agg(repo, refs, "pass")  # post-G3-split: no gate AND in the judge branch
+            # G6: pass iff per_test non-empty with no `fail` AND decision == pass.
+            self._seed_judge(repo, refs,
+                             per_test=[{"test_id": "t1", "status": "pass"}], decision="pass")
             self.assertEqual(
                 c.determine_substep_status(refs, "validate", "judge", [])[0], "pass")
-            self._seed_agg(repo, refs, "fail")
+            # all-xfail node still passes ("no fail" admits it)
+            self._seed_judge(repo, refs,
+                             per_test=[{"test_id": "t1", "status": "xfail"}], decision="pass")
+            self.assertEqual(
+                c.determine_substep_status(refs, "validate", "judge", [])[0], "pass")
+            # a per_test fail -> judge fail
+            self._seed_judge(repo, refs,
+                             per_test=[{"test_id": "t1", "status": "fail"}], decision="pass")
+            self.assertEqual(
+                c.determine_substep_status(refs, "validate", "judge", [])[0], "fail")
+            # a semantic_review fail on clean per_test -> judge fail
+            self._seed_judge(repo, refs,
+                             per_test=[{"test_id": "t1", "status": "pass"}], decision="fail")
+            self.assertEqual(
+                c.determine_substep_status(refs, "validate", "judge", [])[0], "fail")
+            # empty per_test -> judge fail
+            self._seed_judge(repo, refs, per_test=[], decision="pass")
+            self.assertEqual(
+                c.determine_substep_status(refs, "validate", "judge", [])[0], "fail")
+
+    # -- G6: _author_derived_validate_artifacts (conductor-authored aggregate/summary/meta) --
+    def _seed_verdict(self, repo: Path, refs: wc.NodeRefs, per_test: list,
+                      *, failure_class="pass", quality_check: dict | None = None) -> None:
+        rn = repo / refs.run_node_dir()
+        rn.mkdir(parents=True, exist_ok=True)
+        (rn / "verdict.json").write_text(
+            json.dumps({"per_test": per_test, "failure_class": failure_class}),
+            encoding="utf-8")
+        (rn / "semantic_review.json").write_text(
+            json.dumps({"decision": "pass"}), encoding="utf-8")
+        if quality_check is not None:
+            (rn / "quality_check.json").write_text(
+                json.dumps(quality_check), encoding="utf-8")
+
+    def test_author_derived_single_node(self) -> None:
+        import tempfile
+        from unittest import mock
+        with tempfile.TemporaryDirectory() as td:
+            repo, refs = Path(td), self._refs()
+            c = self._conductor(repo)
+            self._seed_verdict(
+                repo, refs,
+                [{"test_id": "t1", "status": "pass"}, {"test_id": "t2", "status": "xfail"}],
+                quality_check={"target_class": "cpu", "status": "pass",
+                               "checks": {"diagnostics_match": True, "verdict_match": True}})
+            with mock.patch("tools.orchestration_runtime._resolve_dependency_facts",
+                            return_value=[]):
+                c._author_derived_validate_artifacts(refs)
+            rn = repo / refs.run_node_dir()
+            agg = json.loads((rn / "aggregate_verdict.json").read_text())
+            self.assertEqual(agg["aggregate_verdict"], "pass")
+            self.assertEqual(agg["self_verdict"], "pass")
+            self.assertFalse(agg["blocked"])
+            self.assertEqual(agg["dependency_nodes"], [])
+            summary = json.loads((rn / "summary.json").read_text())
+            # counts equal the verdict.per_test aggregate (what the gate cross-checks)
+            self.assertEqual(summary["counts"],
+                             {"pass": 1, "fail": 0, "xfail": 1, "skipped": 0, "blocked": 0})
+            self.assertEqual(summary["self_summary"]["verdict"], "pass")
+            self.assertEqual(summary["self_summary"]["total"], 2)
+            self.assertEqual(summary["dependency_summary"],
+                             {"total": 0, "pass": 0, "xfail": 0, "fail": 0, "blocked": 0})
+            self.assertEqual(summary["quality_check"]["status"], "pass")
+            vmeta = json.loads((rn / "validate_meta.json").read_text())
+            self.assertEqual(vmeta["verification_status"], "pass")
+            self.assertTrue(vmeta["context_isolated"])
+            self.assertIsNone(vmeta["last_fail_reason"])
+            self.assertTrue(vmeta["judge_command_ref"].endswith("/semantic_review.json"))
+
+    def test_author_derived_all_xfail_self_verdict(self) -> None:
+        import tempfile
+        from unittest import mock
+        with tempfile.TemporaryDirectory() as td:
+            repo, refs = Path(td), self._refs()
+            c = self._conductor(repo)
+            self._seed_verdict(
+                repo, refs,
+                [{"test_id": "t1", "status": "xfail"}, {"test_id": "t2", "status": "skipped"}])
+            with mock.patch("tools.orchestration_runtime._resolve_dependency_facts",
+                            return_value=[]):
+                c._author_derived_validate_artifacts(refs)
+            agg = json.loads((repo / refs.run_node_dir() / "aggregate_verdict.json").read_text())
+            # every non-skipped entry is xfail -> self_verdict xfail (no fail admits it)
+            self.assertEqual(agg["self_verdict"], "xfail")
+            self.assertEqual(agg["aggregate_verdict"], "xfail")
+
+    def _seed_ir_with_dep(self, repo: Path, refs: wc.NodeRefs, dep_node_key: str) -> None:
+        ir_dir = repo / refs.ir_ref
+        ir_dir.mkdir(parents=True, exist_ok=True)
+        (ir_dir / "spec.ir.yaml").write_text(
+            json.dumps({"dependency": {"direct_deps": [{"node_key": dep_node_key}],
+                                       "all_nodes": [dep_node_key, refs.node_key]}}),
+            encoding="utf-8")
+
+    def test_author_derived_deps_present(self) -> None:
+        import tempfile
+        from unittest import mock
+        with tempfile.TemporaryDirectory() as td:
+            repo, refs = Path(td), self._refs()
+            c = self._conductor(repo)
+            self._seed_verdict(repo, refs, [{"test_id": "t1", "status": "pass"}])
+            self._seed_ir_with_dep(repo, refs, "component/dep@0.1.0")
+            # display verdict comes from the resolved fact; blocking uses the readiness predicate.
+            dep_agg = repo / "dep_agg.json"
+            dep_agg.write_text(json.dumps({"aggregate_verdict": "pass"}), encoding="utf-8")
+            fact = {"node_key": "component/dep@0.1.0", "pipeline_ref": "workspace/pipelines/dep",
+                    "run_id": "run_dep_001", "aggregate_verdict_ref": "dep_agg.json"}
+            with mock.patch("tools.orchestration_runtime._resolve_dependency_facts",
+                            return_value=[fact]), \
+                 mock.patch("tools.validate_pipeline_semantics._closure_node_validated_in_own_pipeline",
+                            return_value=True):
+                c._author_derived_validate_artifacts(refs)
+            rn = repo / refs.run_node_dir()
+            agg = json.loads((rn / "aggregate_verdict.json").read_text())
+            self.assertFalse(agg["blocked"])
+            self.assertEqual(agg["aggregate_verdict"], "pass")
+            self.assertEqual(agg["dependency_nodes"][0]["node_key"], "component/dep@0.1.0")
+            self.assertEqual(agg["dependency_nodes"][0]["aggregate_verdict"], "pass")
+            self.assertTrue(agg["dependency_nodes"][0]["ready"])
+            summary = json.loads((rn / "summary.json").read_text())
+            self.assertEqual(summary["dependency_summary"]["total"], 1)
+            self.assertEqual(summary["dependency_summary"]["pass"], 1)
+
+    def test_author_derived_blocked_case(self) -> None:
+        import tempfile
+        from unittest import mock
+        with tempfile.TemporaryDirectory() as td:
+            repo, refs = Path(td), self._refs()
+            c = self._conductor(repo)
+            self._seed_verdict(repo, refs, [{"test_id": "t1", "status": "pass"}])
+            self._seed_ir_with_dep(repo, refs, "component/dep@0.1.0")
+            fact = {"node_key": "component/dep@0.1.0", "pipeline_ref": "workspace/pipelines/dep",
+                    "run_id": "run_dep_001", "aggregate_verdict_ref": None}
+            # a direct dep that is NOT validated in its own pipeline (readiness predicate=False)
+            # -> node blocked, regardless of any latest-verdict display value.
+            with mock.patch("tools.orchestration_runtime._resolve_dependency_facts",
+                            return_value=[fact]), \
+                 mock.patch("tools.validate_pipeline_semantics._closure_node_validated_in_own_pipeline",
+                            return_value=False):
+                c._author_derived_validate_artifacts(refs)
+            rn = repo / refs.run_node_dir()
+            agg = json.loads((rn / "aggregate_verdict.json").read_text())
+            self.assertTrue(agg["blocked"])
+            self.assertEqual(agg["aggregate_verdict"], "blocked")
+            self.assertEqual(agg["blocking_direct_deps"], ["component/dep@0.1.0"])
+            self.assertFalse(agg["dependency_nodes"][0]["ready"])
+            summary = json.loads((rn / "summary.json").read_text())
+            self.assertEqual(summary["dependency_summary"]["blocked"], 1)
+
+    def test_author_derived_regressed_dep_not_blocked(self) -> None:
+        """G6 review finding #3: a dep whose LATEST verdict is `fail` but that is still
+        validated-in-own-pipeline (an older bound pass) must NOT block — the blocking
+        decision uses the same readiness predicate pre_judge/the gate use, so the derived
+        aggregate can never contradict a readiness gate that already passed."""
+        import tempfile
+        from unittest import mock
+        with tempfile.TemporaryDirectory() as td:
+            repo, refs = Path(td), self._refs()
+            c = self._conductor(repo)
+            self._seed_verdict(repo, refs, [{"test_id": "t1", "status": "pass"}])
+            self._seed_ir_with_dep(repo, refs, "component/dep@0.1.0")
+            dep_agg = repo / "dep_agg.json"
+            dep_agg.write_text(json.dumps({"aggregate_verdict": "fail"}), encoding="utf-8")
+            fact = {"node_key": "component/dep@0.1.0", "pipeline_ref": "workspace/pipelines/dep",
+                    "run_id": "run_dep_001", "aggregate_verdict_ref": "dep_agg.json"}
+            with mock.patch("tools.orchestration_runtime._resolve_dependency_facts",
+                            return_value=[fact]), \
+                 mock.patch("tools.validate_pipeline_semantics._closure_node_validated_in_own_pipeline",
+                            return_value=True):
+                c._author_derived_validate_artifacts(refs)
+            agg = json.loads((repo / refs.run_node_dir() / "aggregate_verdict.json").read_text())
+            self.assertFalse(agg["blocked"])
+            # aggregate stays pass (ready dep folds pass; its regressed latest verdict is
+            # display-only), never contradicting the pass phase.
+            self.assertEqual(agg["aggregate_verdict"], "pass")
+            self.assertEqual(agg["dependency_nodes"][0]["aggregate_verdict"], "fail")
+            self.assertTrue(agg["dependency_nodes"][0]["ready"])
+
+    def test_author_derived_blocked_per_test_not_certifiable(self) -> None:
+        """G6 review finding #2: an all-`blocked` per_test must not certify as pass."""
+        import tempfile
+        from unittest import mock
+        with tempfile.TemporaryDirectory() as td:
+            repo, refs = Path(td), self._refs()
+            c = self._conductor(repo)
+            self._seed_verdict(repo, refs, [{"test_id": "t1", "status": "blocked"}])
+            with mock.patch("tools.orchestration_runtime._resolve_dependency_facts",
+                            return_value=[]):
+                c._author_derived_validate_artifacts(refs)
+            rn = repo / refs.run_node_dir()
+            agg = json.loads((rn / "aggregate_verdict.json").read_text())
+            self.assertEqual(agg["self_verdict"], "fail")
+            summary = json.loads((rn / "summary.json").read_text())
+            self.assertEqual(summary["counts"]["blocked"], 1)
+            # judge criterion also rejects a per_test `blocked`.
             self.assertEqual(
                 c.determine_substep_status(refs, "validate", "judge", [])[0], "fail")
 
