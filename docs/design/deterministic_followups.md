@@ -1023,9 +1023,10 @@ the gate that G3 achieved with a verdict-conditional), and routes via `classify_
 pass step_result's `launch_request_ref` points at the JUDGE substep (not the trailing post_judge) so
 the judge completion hook still enforces `semantic_review`.
 
-**Deferred.** The escalate-LLM adjudicator for `unknown` violations (initially `fail_closed`), and
-hoisting the deterministic parts still inside the judge leaf (structural start-condition checks / raw
-recompute) out to the conductor.
+**Deferred.** The escalate-LLM adjudicator for `unknown` violations — **implemented in G5 below**
+(a post_judge `unknown` now routes to the unified escalate LLM in prod). Still deferred: hoisting the
+deterministic parts inside the judge leaf (structural start-condition checks / raw recompute) out to
+the conductor.
 
 **Files.** `tools/workflow_conductor.py` (SUBSTEPS, `_is_deterministic_substep`, `_pre_judge_inproc` /
 `_post_judge_inproc` / `_maybe_warm_resume_post_judge`, `classify_post_judge_violations`,
@@ -1035,3 +1036,59 @@ recompute) out to the conductor.
 `skills/workflow-validate-judge/SKILL.md` + `docs/workflow/phases/phase_04_validate.md` (pin the
 `review_method` literal). Tests: `PostJudgeClassifierTest`, `G3JudgeGateSubstepTest`, updated
 `ConductHappyPathTest` / `TransportFailureTest` (incl. the new warm-resume recovery test).
+
+## G5 — unify the escalate LLM: severity-aware reuse/discard + wire the post_judge `unknown` (IMPLEMENTED 2026-07-01)
+
+**Motivation.** The orchestrator already has ONE escalate LLM — the **diagnostician** (`Conductor.escalate()`),
+a one-shot read-only separate-persona leaf every escalate site funnels through (`conduct` dispatch). It
+already jointly decides **how far to roll back** (`target_phase`) and **reuse-vs-discard**
+(`repair_strategy`: `reuse`=warm keep vs `restart`=cold supersede+fresh id). Three gaps: it output no
+**severity level**; the G4 post_judge `unknown` disposition was a blind `fail_closed` (never reached the
+diagnostician); and its persona was a fully-inline prompt, not a SKILL.
+
+**Change.** Make the diagnostician the single severity-aware adjudicator used at every escalate site,
+including the post_judge `unknown`:
+- **Directive gains `severity ∈ {minor, major, critical}`** (`_DIRECTIVE_SCHEMA` / `_parse_directive`;
+  absent → default `major` for back-compat). `RouteDecision` gains an optional `severity`.
+- **Severity governs reuse-vs-discard** via `resolve_severity_directive` (called in `escalate()` after
+  parse): `minor` → `reuse` (forced); `major` → `reuse` by default, honors an explicit LLM `restart`
+  (escalate-to-discard); `critical` → `restart`/discard (forced). `re_execute` passes through
+  (orthogonal). **`target_phase` is NOT clamped** by severity — the LLM's rollback distance is honored
+  as-is (`conduct`'s `dev_phase_rollback` gate still catches a dev cross-phase reopen). "Discard" is the
+  existing `restart` (id-rotation + `reopen_phase` supersede; nothing is deleted) — no new primitive.
+- **post_judge `unknown` → escalate.** `_post_judge_inproc`'s disposition dict maps `unknown` →
+  `"escalate"` (was `fail_closed`); `recoverable` → `warm_resume` and `unrecoverable` → `fail_closed`
+  unchanged. `run_phase`'s G4 branch forks on the `escalate` disposition: **prod** returns
+  `RouteDecision("escalate", reason="validate_post_judge_unknown")` (tombstoning the attempt's orphan
+  arids, skip-write posture) → `conduct` reuses its existing escalate dispatch → the resolved directive
+  reopens generate/compile (reuse/discard) or `fail_closed`s; **dev** keeps the fail-fast `fail_closed`
+  (no billed escalate leaf). The judge warm-resume stays exclusively the deterministic `recoverable`
+  path (a `validate` same-phase target terminalizes — the LLM cannot certify a validate pass).
+- **`_gather_failure_context`** now embeds `post_judge_meta.json` + `pre_judge_meta.json` (so the
+  read-only leaf reasons over the violation list / disposition without reading the FS).
+- **SKILL.** New `skills/workflow-escalate/SKILL.md` is the canonical persona + directive + severity
+  policy. It is **conductor-consumed, host-rendered** (Option A): `_diagnosis_prompt` reads the SKILL
+  body host-side (memoized, frontmatter stripped) and embeds it, keeping the read-only leaf pure (reads
+  nothing). Falls back to a minimal inline persona if the file is missing. `_DIRECTIVE_SCHEMA` stays the
+  machine-checkable final-line contract; SKILL prose and `_DIRECTIVE_SCHEMA` are kept in lockstep.
+
+**Decisions (operator sign-off).** (1) reuse/discard is derived from severity with a bounded LLM
+override; (2) no rollback clamp; (3) dev keeps `fail_closed` for post_judge `unknown`, only prod
+escalates; (4) the `classify_verify_severity` pre-escalate gate is kept (dev major/critical still
+fail-fast before any escalate) — the LLM's severity is authoritative only for the sites with no
+upstream severity.
+
+**No new enforcement surface.** `VALID_ISSUE_SEVERITIES` already = `{none,minor,major,critical}`; the
+policy emits only `reuse`/`restart` into repair payloads (`VALID_REPAIR_STRATEGIES`; `re_execute` is
+conductor-internal, never in a launch payload); the `validate_post_judge_unknown` reason funnels into
+the allowlisted `conductor_phase_fail_closed`; `MAX_ATTEMPTS_PER_PHASE` stays the sole loop bound (the
+one-shot escalate leaf can never re-emit `escalate`).
+
+**Deferred.** Migrating `classify_verify_severity` into the LLM (decision #4); a rollback clamp
+(decision #2); fully merging the post_judge free-text taxonomy with minor/major/critical.
+
+**Files.** `tools/workflow_conductor.py` (directive schema/parser, `resolve_severity_directive` +
+`_SEVERITY_FORCED_STRATEGY`, post_judge disposition + run_phase G4 fork, `_gather_failure_context`,
+`_diagnosis_prompt` + `_load_escalate_persona`); new `skills/workflow-escalate/SKILL.md`; docs
+(`AGENT_SKILLS.md`, `LAUNCH_PROMPT_REFERENCE.md`). Tests: extended `DiagnosticianTest`, new
+`resolve_severity_directive` + post_judge-escalate wiring tests.

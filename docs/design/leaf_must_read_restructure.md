@@ -45,7 +45,7 @@ Implementation notes (what shipped vs the proposal):
   validate-judge SKILL citations (+ inlined C003 placement + 63-char limit in
   generate-generate), conductor fixtures, `LeafContractDocPolicyTests`, and
   doc-size ceilings.
-- **Launch-prompt template reconciled** (`skills/workflow-orchestration/references/launch_prompts.md`):
+- **Launch-prompt template reconciled** (`tools/prompt_templates/`):
   the static "MCP command-log & program-output placement" boilerplate line used to
   instruct Generate leaves to *read* `MCP_COMMAND_LOG_PLACEMENT.md` — which would
   re-force the demoted doc at render time regardless of `skill_must_read_refs`
@@ -243,7 +243,7 @@ contracts (phase_03 MCP/binary_meta, phase_04 execute), design rationale.
 2. `tools/tests/test_workflow_conductor.py` (+ any
    `test_orchestration_runtime` / `test_validate_pipeline_semantics` that assert
    must_read composition) — update expected must-read sets.
-3. `skills/workflow-orchestration/references/launch_prompts.md` — shrink the
+3. `tools/prompt_templates/` — shrink the
    re-inlined contract prose to a pointer to AGENT_CONTRACT, keeping the
    guard-required inline constraint lines (§4.4) intact.
 4. `docs/AGENT_SKILLS.md` — update the responsibility-decision flow and the

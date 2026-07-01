@@ -16,13 +16,13 @@ Choose the path for obtaining CLI argument information based on the target subco
 
 - Frequent subcommands of `tools/orchestration_runtime.py` (the 12 Tier-A listed above): this document is canonical (complex payload schema, per-phase required-argument switching — `--help` alone is insufficient).
 - Rare subcommands of `tools/orchestration_runtime.py` (`init` / `preflight` / `preflight-status` / `record-timeout` / `read-checkpoint` / `verify-checkpoint-integrity` / `check-step-completed` / `orchestration-read` / `repair-agent-runs` / `repair-step-result-executor` / `reopen-phase` / `add-superseded-runs` / `dismiss-violation`), and `tools/run_workflow.py` / `tools/validate_pipeline_semantics.py` / `tools/audit_orchestration.py`: `<tool> [<sub>] --help` is canonical. [docs/CLI_REFERENCE_RARE.md](CLI_REFERENCE_RARE.md) retains only an overview of the rare subcommands.
-- `tools/new_agent_run_id.py` takes no arguments. A step / substep (leaf) agent does not consult this policy: its `run-gate` invocations use the literal embedded in its launch prompt (rendered from `skills/workflow-orchestration/references/launch_prompts.md`).
+- `tools/new_agent_run_id.py` takes no arguments. A step / substep (leaf) agent does not consult this policy: its `run-gate` invocations use the literal embedded in its launch prompt (rendered from `tools/prompt_templates/`).
 - During workflow execution, reading the `.py` implementations under `tools/` directly via the `Read` tool / `grep` / `sed` / `cat` etc. is forbidden (`forbid_tools_direct_read`, `read_manifest_read_guard`); the argparse output via `--help` is not blocked. During repository improvement / maintenance / testing / refactoring, `tools/*.py` is ordinary source code and may be inspected directly.
 
 Related canonical sources:
 - rare subcommand overview: [docs/CLI_REFERENCE_RARE.md](CLI_REFERENCE_RARE.md)
 - workflow operation / startup: [docs/RUNBOOK.md](RUNBOOK.md) (operator procedure) and [docs/ORCHESTRATION.md](ORCHESTRATION.md) (conductor/orchestration contract)
-- launch prompt templates (rendered by the conductor's `record-launch`): `skills/workflow-orchestration/references/launch_prompts.md`
+- launch prompt templates (rendered by the conductor's `record-launch`): `tools/prompt_templates/`
 - workspace artifact placement: `docs/WORKSPACE_LAYOUT.md`
 - hook recovery cheat sheet: `docs/RUNBOOK.md#hook-recovery`
 

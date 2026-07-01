@@ -278,6 +278,9 @@ class RouteDecision:
     target_phase: str | None = None
     repair_strategy: str | None = None
     reason: str | None = None
+    # The escalate LLM's graded severity (minor | major | critical | None). Governs
+    # reuse-vs-discard via resolve_severity_directive (G5); None for non-escalate decisions.
+    severity: str | None = None
 
 
 class SandboxEnforcementError(RuntimeError):
@@ -376,23 +379,64 @@ def classify_verify_severity(issue_severity: str | None, workflow_mode: str) -> 
 _DIRECTIVE_SCHEMA = (
     'Output EXACTLY ONE JSON object as the FINAL line, with keys:\n'
     '- "action": "retry" | "reopen" | "fail_closed"\n'
-    '- "target_phase": "compile" | "generate" | "build" | "validate" | null\n'
-    '- "repair_strategy": "reuse" | "restart" | "re_execute" | null\n'
+    '- "target_phase": "compile" | "generate" | null\n'
+    '- "severity": "minor" | "major" | "critical"\n'
+    '- "repair_strategy": "reuse" | "restart" | null\n'
     '- "reason": short string\n'
-    'Routing guidance: code defect -> action=retry target_phase=generate; IR defect -> '
-    'action=reopen target_phase=compile; missing/insufficient evidence -> action=retry '
-    'target_phase=validate repair_strategy=re_execute; spec defect or genuinely '
-    'unrecoverable -> action=fail_closed.'
+    'severity grades how disruptive the defect is and GOVERNS whether existing artifacts are '
+    'reused (warm-repaired in place) or discarded (regenerated from scratch): minor -> reuse; '
+    'major -> reuse by default (set repair_strategy="restart" only if the existing artifacts '
+    'are too compromised to repair); critical -> discard (restart). Routing guidance: code '
+    'defect OR wrong/insufficient primary evidence (the runner emits bad evidence — a bare '
+    're-run reproduces it) -> action=retry target_phase=generate; IR defect -> action=reopen '
+    'target_phase=compile; spec defect or genuinely unrecoverable -> action=fail_closed. '
+    '(target_phase=build/validate and repair_strategy=re_execute are NOT actionable here — '
+    'the conductor cannot re-run a downstream phase in place; regenerate upstream instead.)'
 )
 
 
+# G5: the escalate persona is the workflow-escalate SKILL body, read host-side and rendered
+# into the diagnostician prompt (Option A — the read-only leaf reads nothing; everything is
+# embedded). Falls back to a minimal inline persona if the SKILL is missing (partial checkout)
+# so escalate never crashes. Keep this fallback and the SKILL's persona in lockstep.
+_ESCALATE_SKILL_REL = "skills/workflow-escalate/SKILL.md"
+_ESCALATE_PERSONA_FALLBACK = (
+    "You are a workflow failure diagnostician. Read-only, one shot: reason over "
+    "the artifacts below and emit a single routing directive. Do NOT write files "
+    "or call tools."
+)
+_escalate_persona_cache: dict[str, str] = {}
+
+
+def _load_escalate_persona(repo_root: Path) -> str:
+    """Return the workflow-escalate SKILL body (frontmatter stripped), memoized per repo_root,
+    falling back to _ESCALATE_PERSONA_FALLBACK if the file is absent/unreadable."""
+    key = str(repo_root)
+    cached = _escalate_persona_cache.get(key)
+    if cached is not None:
+        return cached
+    persona = _ESCALATE_PERSONA_FALLBACK
+    try:
+        text = (repo_root / _ESCALATE_SKILL_REL).read_text(encoding="utf-8")
+        # Strip the leading YAML frontmatter (--- ... ---); the body is the persona.
+        if text.startswith("---"):
+            parts = text.split("---", 2)
+            text = parts[2] if len(parts) == 3 else text
+        body = text.strip()
+        if body:
+            persona = body
+    except OSError:
+        pass
+    _escalate_persona_cache[key] = persona
+    return persona
+
+
 def _diagnosis_prompt(node_key: str, phase: str, failed_arids: list[str],
-                      context: dict[str, Any], workflow_mode: str) -> str:
+                      context: dict[str, Any], workflow_mode: str,
+                      persona: str = _ESCALATE_PERSONA_FALLBACK) -> str:
     ctx_json = json.dumps(context, indent=1, ensure_ascii=False)[:6000]
     return (
-        "You are a workflow failure diagnostician. Read-only, one shot: reason over "
-        "the artifacts below and emit a single routing directive. Do NOT write files "
-        "or call tools.\n\n"
+        f"{persona}\n\n"
         f"node_key: {node_key}\n"
         f"failed phase: {phase}\n"
         f"workflow_mode: {workflow_mode}\n"
@@ -423,6 +467,13 @@ def _last_json_object(text: str) -> Any:
     return best
 
 
+# The only rollback targets the diagnostician may name (the LLM-authored producers the
+# conductor can regenerate). `build` / `validate` are deterministic phases the conductor cannot
+# re-run in place to fix a defect, so an out-of-contract target -> None -> fail_closed rather
+# than a wasted reopen. Matches the _DIRECTIVE_SCHEMA / workflow-escalate SKILL enum.
+_DIAGNOSTICIAN_TARGET_PHASES: frozenset[str] = frozenset({"compile", "generate"})
+
+
 def _parse_directive(stdout: str) -> RouteDecision | None:
     """Parse + validate the diagnostician's JSON directive into a RouteDecision.
     Returns None on any malformed/out-of-vocabulary directive (caller fails closed)."""
@@ -433,21 +484,61 @@ def _parse_directive(stdout: str) -> RouteDecision | None:
     if action not in ("retry", "reopen", "fail_closed"):
         return None
     target = obj.get("target_phase")
-    if target is not None and target not in PHASE_ORDER:
+    if target is not None and target not in _DIAGNOSTICIAN_TARGET_PHASES:
         return None
     strategy = obj.get("repair_strategy")
-    if strategy not in (None, "reuse", "restart", "re_execute"):
+    if strategy not in (None, "reuse", "restart"):
         strategy = None
+    # G5: severity governs reuse-vs-discard (resolve_severity_directive). Default to `major`
+    # when absent so legacy directives (and the pre-G5 DiagnosticianTest fixtures) still parse;
+    # an out-of-vocab value also defaults to major rather than rejecting the whole directive.
+    severity = obj.get("severity")
+    if severity not in ("minor", "major", "critical"):
+        severity = "major"
     reason = str(obj.get("reason") or "diagnostician")[:120]
     if action == "fail_closed":
-        return RouteDecision("fail_closed", reason=reason)
+        return RouteDecision("fail_closed", reason=reason, severity=severity)
     if action == "reopen":
         if target is None:
             return None
         # Preserve repair_strategy for reopen too: both the SAME-phase producer reopen and the
         # cross-phase reopen honor it (reuse → warm-resume the producer, restart/none → cold).
-        return RouteDecision("reopen", target_phase=target, repair_strategy=strategy, reason=reason)
-    return RouteDecision("retry", target_phase=target, repair_strategy=strategy, reason=reason)
+        return RouteDecision("reopen", target_phase=target, repair_strategy=strategy,
+                             reason=reason, severity=severity)
+    return RouteDecision("retry", target_phase=target, repair_strategy=strategy,
+                         reason=reason, severity=severity)
+
+
+# G5 canonical severity -> repair_strategy policy (single source of truth). Derived with a
+# bounded LLM override: minor forces reuse; major defaults to reuse but honors an explicit
+# LLM restart; critical forces restart (discard). `re_execute` (validate evidence re-run) is
+# orthogonal to reuse/discard and passes through unchanged. `target_phase` is NOT clamped by
+# severity (the LLM's rollback distance is honored as-is; conduct's dev_phase_rollback gate
+# still catches a dev cross-phase reopen). "Discard" == the existing `restart` strategy
+# (_ensure_fresh_producer_id id-rotation + reopen_phase supersede; nothing is deleted).
+_SEVERITY_FORCED_STRATEGY: dict[str, str] = {
+    "minor": "reuse",      # forced — an LLM restart is ignored
+    "critical": "restart",  # forced — an LLM reuse is ignored
+}
+
+
+def resolve_severity_directive(decision: RouteDecision) -> RouteDecision:
+    """Normalize an escalate directive's `repair_strategy` from its `severity` per the G5
+    policy. No-op for a fail_closed decision, one carrying no severity, or one with no explicit
+    `target_phase` (an ambiguous/incomplete directive that must terminalize, NOT be turned into
+    a same-phase producer reopen — synthesizing a strategy would make `conduct` default the
+    null target to the current phase and fire the reopen branch). `re_execute` is passed through
+    (orthogonal to reuse/discard)."""
+    if decision.action == "fail_closed" or not decision.severity or not decision.target_phase:
+        return decision
+    if decision.repair_strategy == "re_execute":
+        return decision
+    forced = _SEVERITY_FORCED_STRATEGY.get(decision.severity)
+    if forced is not None:  # minor -> reuse, critical -> restart
+        strategy = forced
+    else:  # major -> reuse by default; honor an explicit LLM restart (escalate-to-discard)
+        strategy = "restart" if decision.repair_strategy == "restart" else "reuse"
+    return replace(decision, repair_strategy=strategy)
 
 
 # --- node_key / path derivation ------------------------------------------------
@@ -513,10 +604,10 @@ class NodeRefs:
 # --- launch-request payload builder -------------------------------------------
 #
 # Reproduces, deterministically, the request payload the LLM orchestration agent
-# assembles by following references/launch_prompts.md. Validated field-for-field
+# assembles by following the tools/prompt_templates/ templates. Validated field-for-field
 # against real working launches/*.request.json (test_workflow_conductor.py).
 # NOTE: `launch_prompt_full` is intentionally OMITTED so record-launch renders the
-# canonical prompt and returns it as `launch_prompt_text` (launch_prompts.md template).
+# canonical prompt and returns it as `launch_prompt_text` (tools/prompt_templates/).
 
 # The contract docs every LLM leaf force-reads are derived by the single canonical
 # policy `orchestration_runtime.leaf_contract_doc_refs(step)` (imported lazily where
@@ -2914,10 +3005,15 @@ clean:
         # The validator prints each violation as a `- {line}` bullet after a FAIL header.
         violations = [ln[2:] for ln in combined.splitlines() if ln.startswith("- ")]
         severity = classify_post_judge_violations(violations)
+        # G5: an `unknown` violation (unclassifiable by the deterministic path-prefix rules) is
+        # no longer a blind fail_closed — it routes to the unified escalate LLM. `recoverable`
+        # (judge-authored) still warm-resumes deterministically; `unrecoverable` (integrity)
+        # still fail_closes. run_phase turns the `escalate` disposition into an escalate
+        # RouteDecision in prod (dev keeps fail_closed — no billed escalate leaf).
         disposition = {
             "recoverable": "warm_resume",
             "unrecoverable": "fail_closed",
-            "unknown": "fail_closed",
+            "unknown": "escalate",
         }[severity]
         self._write_run_node_meta(refs, "post_judge_meta.json", {
             "run_id": refs.run_id, "node_key": refs.node_key,
@@ -3164,13 +3260,33 @@ clean:
                 cat = gate_meta.get("failure_category") or (
                     "pre_judge_dag_incomplete" if failed_sub == "pre_judge"
                     else "pre_judge_violation")
+                # G5: a prod post_judge `unknown` (disposition="escalate") routes to the unified
+                # escalate LLM. Return the escalate decision WITHOUT pre-tombstoning the orphan
+                # arids: conduct() runs the diagnostician and, on a reopen directive, calls
+                # reopen_phase(trigger=this failed post_judge arid) — which NO-OPs if the trigger
+                # is already in superseded_runs.json (idempotency guard), so the trigger MUST
+                # stay live to drive the rollback. reopen_phase supersedes the whole validate
+                # attempt (incl. this trigger) as part of the upstream reopen; a fail_closed
+                # resolution is terminal (no completion vouch runs). Skip-write posture is
+                # preserved (no step_result written here).
+                is_post_judge_escalate = (failed_sub == "post_judge"
+                                          and gate_meta.get("disposition") == "escalate")
+                if is_post_judge_escalate and self.workflow_mode != "dev":
+                    decision = RouteDecision("escalate", reason="validate_post_judge_unknown")
+                    return PhaseOutcome(phase, status, substep_arids, failed, decision)
+                # Terminal fail_closed cases (pre_judge / integrity / dev unknown / warm-resume
+                # budget exhausted): skip-write + tombstone the orphan arids (they have no
+                # step_result home, and no reopen will consume them as a trigger).
                 orphan_arids = [oc.agent_run_id for oc in outcomes]
                 if orphan_arids:
                     self._add_superseded_run_ids(
                         orphan_arids, reason=f"validate_gate_fail_orphan: {cat}")
-                reason = ("validate_pre_judge_dag_incomplete"
-                          if cat == "pre_judge_dag_incomplete" else f"validate_{cat}")
-                decision = RouteDecision("fail_closed", reason=reason)
+                if is_post_judge_escalate:  # dev fail-fast (no billed escalate leaf)
+                    decision = RouteDecision("fail_closed", reason="validate_post_judge_unknown")
+                else:
+                    reason = ("validate_pre_judge_dag_incomplete"
+                              if cat == "pre_judge_dag_incomplete" else f"validate_{cat}")
+                    decision = RouteDecision("fail_closed", reason=reason)
                 return PhaseOutcome(phase, status, substep_arids, failed, decision)
 
         self.write_step_result(node_key, phase, executor, result)
@@ -3188,6 +3304,11 @@ clean:
             "verdict.json": f"{refs.run_node_dir()}/verdict.json",
             "semantic_review.json": f"{refs.run_node_dir()}/semantic_review.json",
             "aggregate_verdict.json": f"{refs.run_node_dir()}/aggregate_verdict.json",
+            # G5: the deterministic validate gate metas — post_judge_meta carries the
+            # `violations` / `failure_excerpt` / `disposition` that drive a post_judge
+            # `unknown` escalate; pre_judge_meta carries the dependency-DAG readiness result.
+            "post_judge_meta.json": f"{refs.run_node_dir()}/post_judge_meta.json",
+            "pre_judge_meta.json": f"{refs.run_node_dir()}/pre_judge_meta.json",
             "binary_meta.json": f"{refs.binary_dir()}/binary_meta.json",
             "ir_meta.json": f"{refs.ir_ref}/ir_meta.json",
             "source_meta.json": f"{refs.source_dir()}/source_meta.json",
@@ -3206,7 +3327,8 @@ clean:
         An unparsable/invalid directive is conservatively terminal (fail_closed)."""
         context = self._gather_failure_context(refs, phase)
         prompt = _diagnosis_prompt(refs.node_key, phase, outcome.failed_substeps,
-                                   context, self.workflow_mode)
+                                   context, self.workflow_mode,
+                                   persona=_load_escalate_persona(self.repo_root))
         try:
             # The diagnostician has no record-launch profile (no child_arid); under
             # bwrap-enforced mode build a dedicated read-only profile (repo ro, no
@@ -3230,7 +3352,9 @@ clean:
         decision = _parse_directive(proc.stdout)
         if decision is None:
             return RouteDecision("fail_closed", reason=f"{phase}_diagnose_unparsable")
-        return decision
+        # G5: normalize reuse-vs-discard from the graded severity so every escalate site
+        # (generate/compile verify, judge, the post_judge unknown) shares one policy.
+        return resolve_severity_directive(decision)
 
     def classify_failure(self, refs: NodeRefs, phase: str,
                          outcomes: list[SubstepOutcome]) -> RouteDecision:
@@ -3361,24 +3485,37 @@ clean:
 
             decision = outcome.decision or RouteDecision("escalate", reason="no_decision")
             if decision.action == "escalate":
+                # escalate() runs resolve_severity_directive, so a retry/reopen directive always
+                # arrives here with a concrete repair_strategy derived from its graded severity
+                # (G5: minor/major -> reuse, major-override/critical -> restart, re_execute
+                # passthrough). No conduct-side strategy normalization is needed — the severity
+                # policy is the single source of truth. A same-phase (compile/generate) target
+                # with a reuse/restart strategy fires the producer reopen below; a null / build /
+                # validate target terminalizes as before.
+                escalate_source = decision.reason
                 decision = self.escalate(refs, phase, outcome)
-                # The diagnostician may route a SAME-PHASE producer re-run (target == this phase
-                # — e.g. "regenerate the IR" for compile, or retry generate). Its directive
-                # carries no repair_strategy (_parse_directive omits it for reopen / when the LLM
-                # leaves it off), which the same-phase producer-reopen branch requires; default it
-                # to `restart` (cold — an escalated failure is significant, so regenerate fresh)
-                # so the re-run actually fires instead of terminalizing. Scoped to compile/generate
-                # (the only phases with a re-runnable LLM producer + a reopen_phase same-phase
-                # carve-out); a same-phase build/validate escalate keeps no strategy and still
-                # terminalizes. An explicit reuse/restart/re_execute from the diagnostician is kept.
-                # Require an EXPLICIT same-phase target: a null target_phase is an ambiguous /
-                # incomplete directive (the schema permits null) and must terminalize as malformed,
-                # NOT be silently normalized into a producer restart.
-                if (decision.action in ("retry", "reopen")
-                        and phase in ("compile", "generate")
-                        and decision.target_phase == phase
-                        and decision.repair_strategy not in ("reuse", "restart", "re_execute")):
-                    decision = replace(decision, repair_strategy="restart")
+                # G5: the validate post_judge escalate returned WITHOUT tombstoning its orphan
+                # arids (skip-write posture) so that a diagnostician UPSTREAM REOPEN's trigger
+                # stays live (reopen_phase no-ops on an already-superseded trigger). For EVERY
+                # terminal, non-reopen resolution — fail_closed, an unparsable/sandbox directive,
+                # a null/out-of-scope target that falls to the `target_idx >= idx` terminal
+                # `fail`, or a budget-exhausted reopen — no reopen supersedes the attempt, so
+                # tombstone the orphans here (matching the transport/integrity terminal branches)
+                # to keep a later resume/pass completion vouch from tripping. Only an upstream
+                # reopen that will actually fire supersedes them via reopen_phase, so exclude
+                # exactly that case (mirroring conduct's own reopen conditions below: an in-scope
+                # upstream target with budget remaining).
+                if escalate_source == "validate_post_judge_unknown" and outcome.substep_arids:
+                    tgt = decision.target_phase
+                    will_upstream_reopen = (
+                        decision.action in ("retry", "reopen")
+                        and tgt in phases
+                        and phases.index(tgt) < idx
+                        and attempts[tgt] + 1 <= MAX_ATTEMPTS_PER_PHASE)
+                    if not will_upstream_reopen:
+                        self._add_superseded_run_ids(
+                            list(outcome.substep_arids),
+                            reason="validate_post_judge_escalate_terminal_orphan")
             if decision.action == "fail_closed":
                 reason = decision.reason or ""
                 # Map to an allowlisted FAIL_CLOSED_REASON_CODES value (the runtime

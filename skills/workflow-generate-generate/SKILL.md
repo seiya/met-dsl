@@ -13,7 +13,7 @@ Fix the generation responsibility of the Generate stage, and create a `Build`-ab
 - the work of generating `source_meta.json`
 
 ## Requirements
-- The validator gates this substep can launch use the "substep ↔ allowed validator gate correspondence table" of `skills/workflow-orchestration/references/launch_prompts.md` as the canonical source.
+- The validator gates this substep can launch use the "substep ↔ allowed validator gate correspondence table" of `docs/workflow/LAUNCH_PROMPT_REFERENCE.md` as the canonical source.
 - Immediately after starting work, read the `spec.ir.yaml` of `ir_ref`, enumerate for all elements of `io_contract.raw_requirements.required_evidence` the `artifact`, `required`, `min_samples`, and (when `artifact=state_snapshots` and `required=true`) `schema.variables[].name` and `time_variable`, reconcile them with the `runner`'s `raw/` output design and the index design of `raw/metrics_basis.json`, then start the implementation. When `state_snapshots` is required, design the `runner` to write **one snapshot per case** at `raw/state_snapshots/<case_id>.json`, keyed on the `case_id` it receives on argv (`--cases <spec.ir.yaml> <case_id>...`) — see the runner-output bullet below.
 - The input is `spec.ir.yaml` (the 5 sections `case` / `algorithm` / `impl_defaults` / `io_contract` / `dependency`).
 - Do not take `controlled_spec.md` as direct input. The requirement definition of the operation composition must be interpreted from `spec.ir.yaml.algorithm`.

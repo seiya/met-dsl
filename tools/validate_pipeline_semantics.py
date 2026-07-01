@@ -7640,7 +7640,7 @@ def _validate_orchestration_hierarchy(
                                 ]
                                 if missing_markers:
                                     violations.append(
-                                        f"{runs_path}:line {idx + 1} {key} missing workflow-orchestration template markers ({', '.join(missing_markers)})"
+                                        f"{runs_path}:line {idx + 1} {key} missing launch-prompt template markers ({', '.join(missing_markers)})"
                                     )
 
                     for key in ("agent_result_ref", "agent_summary_ref"):

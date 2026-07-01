@@ -5030,7 +5030,7 @@ shell_tool                       stable             true
                 "skill_name: workflow-compile-generate",
             ) + "\n\nRequired requirements:\n- Complete the contracted substep.\n"
             with self.assertRaisesRegex(
-                ValueError, "must preserve workflow-orchestration template field values"
+                ValueError, "must preserve launch-prompt template field values"
             ):
                 record_launch(
                     repo_root=repo_root,

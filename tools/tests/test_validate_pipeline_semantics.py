@@ -6665,7 +6665,7 @@ end program shallow_water2d_runner
                 require_orchestration=True,
             )
             self.assertTrue(
-                any("launch_prompt_ref missing workflow-orchestration template markers" in v for v in violations)
+                any("launch_prompt_ref missing launch-prompt template markers" in v for v in violations)
             )
 
     def test_validate_compile_stage_passes_for_resolved_plan_directory(self) -> None:

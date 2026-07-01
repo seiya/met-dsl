@@ -36,7 +36,7 @@ the per-turn accumulation. The leaf substeps (the irreducible creative work) are
 |---|---|
 | phase/substep loop | `Conductor.conduct` / `run_phase` / `run_substep` |
 | bookkeeping | reuse `record-launch` / `finalize-child` / `write-step-result` / `check-step-completed` / `workflow-launch-check` / `reserve-phase-root` / `set-status` / `reopen-phase` via subprocess (same guards fire as on the LLM path) |
-| launch-request assembly | `build_launch_request` — reproduces, field-for-field, the payload the LLM assembled from `launch_prompts.md` (validated against real `launches/*.request.json`) |
+| launch-request assembly | `build_launch_request` — reproduces, field-for-field, the payload the LLM assembled from the `tools/prompt_templates/` templates (validated against real `launches/*.request.json`) |
 | substep pass/fail | `determine_substep_status` reads the canonical artifacts: verify→`*_meta.json#verification_status`, judge→`aggregate_verdict.json`, producers→deliverable existence |
 | failure routing | `classify_failure` + the decision tables `BUILD_FAILURE_ROUTING` (`phase_03_build.md`) and `VALIDATE_JUDGE_ROUTING` (`phase_04_validate.md`); dev-mode severity gate |
 | cross-phase reopen | `conduct` reopens an upstream (checkpointed-pass) phase via `reopen-phase`, capped by a per-phase budget; a re-run allocates a fresh producer id (`_ensure_fresh_producer_id`). In-place same-phase retry is intentionally NOT done (its `retry_decisions`/effective-pass bookkeeping is error-prone) — a same-phase decision terminalizes |

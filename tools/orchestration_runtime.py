@@ -8204,47 +8204,39 @@ def _is_placeholder_ref(value: str) -> bool:
     return "agent-determined" in token or ("<" in token and ">" in token)
 
 
-def _launch_prompt_template_path() -> Path:
-    return (
-        Path(__file__).resolve().parent.parent
-        / "skills"
-        / "workflow-orchestration"
-        / "references"
-        / "launch_prompts.md"
-    )
+# The conductor-consumed launch-prompt templates: one plain-text file per template type
+# under tools/prompt_templates/. These are the ONLY machine-parsed launch-prompt material.
+# The human-facing reference that used to be co-located (phase↔skill / substep↔gate
+# correspondence tables, the repair_strategy=reuse and allowed_tmp_root usage contracts)
+# lives in docs/workflow/LAUNCH_PROMPT_REFERENCE.md. The templates are host-rendered by
+# record-launch and are deliberately NOT leaf-readable: tools/ is outside every leaf's
+# read_manifest and additionally blocked by forbid_tools_direct_read.
+_PROMPT_TEMPLATE_DIR = Path(__file__).resolve().parent / "prompt_templates"
+_PROMPT_TEMPLATE_FILES = {
+    "step agent": "step_agent.txt",
+    "substep agent": "substep_agent.txt",
+    "common boilerplate": "common_boilerplate.txt",
+}
 
 
 @lru_cache(maxsize=1)
 def _load_launch_prompt_templates() -> dict[str, str]:
-    """Load the templates and the shared boilerplate from launch_prompts.md.
+    """Load the step / substep / common-boilerplate launch-prompt templates from
+    tools/prompt_templates/ (verbatim — no trimming, so the rendered prompt is byte-identical
+    to the historic single-file form).
 
     Returns:
         dict with keys "step agent", "substep agent", and "common boilerplate".
         The "step agent" / "substep agent" values contain the `{{COMMON_BOILERPLATE}}` placeholder.
         The "common boilerplate" value contains the `{{ACTOR_ROLE}}` placeholder.
     """
-    text = _launch_prompt_template_path().read_text(encoding="utf-8")
-    pattern = re.compile(
-        r"## `(?P<name>step agent|substep agent)` launch request template\s+```text\n(?P<body>.*?)\n```",
-        re.DOTALL,
-    )
     templates: dict[str, str] = {}
-    for match in pattern.finditer(text):
-        templates[match.group("name")] = match.group("body")
-    if set(templates) != {"step agent", "substep agent"}:
-        raise RuntimeError("launch prompt templates must define step agent and substep agent")
-    # Extract the shared boilerplate section (## Common agent contract boilerplate).
-    shared_pattern = re.compile(
-        r"## Common agent contract boilerplate\b.*?```text\n(?P<body>.*?)\n```",
-        re.DOTALL,
-    )
-    shared_match = shared_pattern.search(text)
-    if shared_match is None:
-        raise RuntimeError(
-            "launch_prompts.md must define '## Common agent contract boilerplate' "
-            "with a ```text block for {{COMMON_BOILERPLATE}} expansion"
-        )
-    templates["common boilerplate"] = shared_match.group("body")
+    for key, fname in _PROMPT_TEMPLATE_FILES.items():
+        path = _PROMPT_TEMPLATE_DIR / fname
+        try:
+            templates[key] = path.read_text(encoding="utf-8")
+        except OSError as exc:
+            raise RuntimeError(f"launch prompt template missing: {path} ({exc})") from exc
     return templates
 
 
@@ -9072,7 +9064,7 @@ def _required_launch_prompt_constraint_lines(request_payload: dict[str, Any]) ->
 
 # Issue 1 of the recurrence-prevention plan: per-(step, substep) allowed
 # `validate_pipeline_semantics --stage <X>` invocations. Canonical source:
-# `skills/workflow-orchestration/references/launch_prompts.md` "substep ↔
+# `docs/workflow/LAUNCH_PROMPT_REFERENCE.md` "substep ↔
 # allowed validator gate correspondence table". `record-launch` rejects any launch
 # prompt where an actionable invocation line targets a stage outside the
 # substep's allow-set. Override with env `METDSL_ENFORCE_GATE_ALLOWLIST=0`
@@ -9209,7 +9201,7 @@ def _find_stage_near_invocation(
 ALLOWED_VALIDATE_PIPELINE_STAGES: dict[tuple[str, str], frozenset[str]] = {
     # Strict per-substep mapping. Authoritative source: the "substep ↔
     # allowed validator gate correspondence table" in
-    # `skills/workflow-orchestration/references/launch_prompts.md`. Each
+    # `docs/workflow/LAUNCH_PROMPT_REFERENCE.md`. Each
     # substep is restricted to the single canonical `--stage` it owns;
     # cross-substep / `full` invocations are rejected at `record-launch`
     # because they widen the substep's responsibility surface beyond the
@@ -9382,28 +9374,28 @@ def _validate_launch_prompt_text(request_payload: dict[str, Any], prompt_text: s
                 raise ValueError(
                     f"launch prompt for step={step_raw!r} substep={substep_raw!r} "
                     f"violates substep ↔ allowed validator gate correspondence table: {violations}. "
-                    f"See skills/workflow-orchestration/references/launch_prompts.md "
+                    f"See docs/workflow/LAUNCH_PROMPT_REFERENCE.md "
                     f"for the canonical allowlist."
                 )
         return
     missing_markers = [marker for marker in required_markers if marker not in prompt_text]
     if missing_markers:
         raise ValueError(
-            "launch prompt text must preserve workflow-orchestration template markers: "
+            "launch prompt text must preserve launch-prompt template markers: "
             + ", ".join(missing_markers)
         )
     required_lines = _required_launch_prompt_lines(request_payload)
     missing_lines = [line for line in required_lines if line not in prompt_text]
     if missing_lines:
         raise ValueError(
-            "launch prompt text must preserve workflow-orchestration template field values: "
+            "launch prompt text must preserve launch-prompt template field values: "
             + ", ".join(missing_lines)
         )
     required_constraint_lines = _required_launch_prompt_constraint_lines(request_payload)
     missing_constraint_lines = [line for line in required_constraint_lines if line not in prompt_text]
     if missing_constraint_lines:
         raise ValueError(
-            "launch prompt text must preserve workflow-orchestration shell-write constraints: "
+            "launch prompt text must preserve launch-prompt template shell-write constraints: "
             + ", ".join(missing_constraint_lines)
         )
     # Issue 1 of the recurrence-prevention plan: regex-based forbidden
@@ -9419,7 +9411,7 @@ def _validate_launch_prompt_text(request_payload: dict[str, Any], prompt_text: s
             raise ValueError(
                 f"launch prompt for step={step_raw!r} substep={substep_raw!r} "
                 f"contains forbidden gate keyword(s): {hits}. "
-                f"See skills/workflow-orchestration/references/launch_prompts.md "
+                f"See docs/workflow/LAUNCH_PROMPT_REFERENCE.md "
                 f"`substep ↔ allowed validator gate correspondence table` for the canonical allowlist."
             )
 
@@ -13102,7 +13094,7 @@ def record_launch(
         # The exact prompt text record-launch rendered and wrote to
         # launches/<child_arid>.prompt.txt. Returned so the orchestration agent
         # can pass it verbatim to the Agent tool WITHOUT reading the template
-        # (launch_prompts.md) or the written prompt file (both blocked for the
+        # (the tools/prompt_templates/ templates) or the written prompt file (both blocked for the
         # orchestration). The Agent-tool prompt is then identical in content to
         # the recorded artifact by construction (audit 1-to-1); the .prompt.txt
         # file only differs by a trailing newline the text writer appends.

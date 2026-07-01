@@ -877,12 +877,12 @@ class ConductRoutingTest(unittest.TestCase):
                           if s == "write-step-result" and cap["--step"] == "compile"]
         self.assertEqual(len(compile_writes), 2)  # verify-fail attempt, then clean attempt
 
-    def test_escalate_same_phase_producer_reopens_via_normalization(self) -> None:
-        # The escalate diagnostician routes a same-phase producer re-run, but its directive
-        # carries NO repair_strategy (_parse_directive omits it). conduct must NORMALIZE that to
-        # `restart` (cold) so the same-phase producer reopen actually fires — not terminalize.
-        # This drives the real escalate→normalize path with the no-strategy decision the
-        # diagnostician actually emits (not a hand-constructed restart, which would mask the gap).
+    def test_escalate_same_phase_producer_reopens(self) -> None:
+        # The escalate diagnostician routes a same-phase producer re-run. G5: escalate() runs
+        # resolve_severity_directive, so its directive arrives with a concrete repair_strategy
+        # derived from severity (major -> reuse here); conduct's same-phase producer-reopen
+        # branch then fires (no conduct-side strategy normalization). The strategy derivation
+        # itself is unit-tested in DiagnosticianTest.test_resolve_severity_directive.
         c = self._conductor()
         state = {"verify_failed": False}
 
@@ -894,9 +894,11 @@ class ConductRoutingTest(unittest.TestCase):
 
         c.status_fn = status_fn
         c.decision_fn = lambda phase, outcomes: wc.RouteDecision("escalate", reason="unclassified")
-        # The diagnostician's parsed directive: re-run this phase's producer, NO strategy.
+        # The diagnostician's resolved directive: re-run this phase's producer with a severity-
+        # derived strategy (as escalate()/resolve_severity_directive produces in the real flow).
         c.escalate = lambda refs, phase, outcome: wc.RouteDecision(  # type: ignore[assignment]
-            "retry", target_phase="compile", reason="diagnostician_regenerate_ir")
+            "retry", target_phase="compile", repair_strategy="reuse", severity="major",
+            reason="diagnostician_regenerate_ir")
         status = c.conduct(self._refs(), "compile")
         self.assertEqual(status, "pass")
         reopens = [cap for s, cap in c.calls if s == "reopen-phase"]
@@ -1355,6 +1357,158 @@ class TransportFailureTest(unittest.TestCase):
             self.assertEqual(oc.decision.target_phase, "generate")
             self.assertIn("write-step-result", [s for s, _ in c.calls])
 
+    def _post_judge_unknown_conductor(self, repo, mode):
+        class _C(_FakeConductor):
+            def _write_lineage(self, r):  # type: ignore[override]
+                return []
+            def _ensure_fresh_producer_id(self, r, phase):  # type: ignore[override]
+                return None
+        c = _C(repo_root=repo, orchestration_id="orch_x",
+               orchestration_agent_run_id="ORCH", backend="claude", env={})
+        c.workflow_mode = mode
+        c.calls = []
+        rn = repo / self._refs().run_node_dir()
+        rn.mkdir(parents=True, exist_ok=True)
+        (rn / "aggregate_verdict.json").write_text(
+            json.dumps({"aggregate_verdict": "pass"}), encoding="utf-8")
+        # post_judge fails with an UNKNOWN violation -> disposition="escalate".
+        c.post_judge_meta_fn = lambda n: {
+            "status": "fail", "failure_category": "pre_judge_violation",
+            "failure_excerpt": "workspace/runs/n/diagnostics.json: weird evidence violation",
+            "violations": ["workspace/runs/n/diagnostics.json: weird evidence violation"],
+            "disposition": "escalate"}
+        c.status_fn = lambda phase, substep, n: (
+            "fail" if (phase == "validate" and substep == "post_judge") else "pass")
+        return c
+
+    def test_post_gate_unknown_escalates_in_prod(self) -> None:
+        # G5: a post_judge `unknown` disposition routes to the unified escalate LLM in PROD —
+        # run_phase returns a RouteDecision("escalate", reason="validate_post_judge_unknown"),
+        # writes no step_result, and does NOT fail_closed itself. It must NOT pre-tombstone the
+        # failed post_judge arid: conduct's diagnostician reopen uses it as the trigger, and
+        # reopen_phase no-ops on an already-superseded trigger, so the trigger stays live.
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            c = self._post_judge_unknown_conductor(repo, "prod")
+            oc = c.run_phase(self._refs(), "validate")
+            self.assertEqual(oc.status, "fail")
+            self.assertEqual(oc.decision.action, "escalate")
+            self.assertEqual(oc.decision.reason, "validate_post_judge_unknown")
+            subs = [s for s, _ in c.calls]
+            self.assertNotIn("write-step-result", subs)
+            # No pre-tombstone on the escalate path (the trigger must drive the upstream reopen).
+            self.assertNotIn("add-superseded-runs", subs)
+
+    def test_post_gate_unknown_fails_closed_in_dev(self) -> None:
+        # G5 sign-off #3: in DEV a post_judge `unknown` keeps the fail-fast fail_closed
+        # (no billed escalate leaf), with reason validate_post_judge_unknown for observability.
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            c = self._post_judge_unknown_conductor(repo, "dev")
+            oc = c.run_phase(self._refs(), "validate")
+            self.assertEqual(oc.status, "fail")
+            self.assertEqual(oc.decision.action, "fail_closed")
+            self.assertEqual(oc.decision.reason, "validate_post_judge_unknown")
+            subs = [s for s, _ in c.calls]
+            self.assertNotIn("write-step-result", subs)
+            # Terminal fail_closed DOES tombstone (no reopen will consume the arids).
+            self.assertIn("add-superseded-runs", subs)
+
+    def test_post_gate_unknown_escalate_terminal_tombstones(self) -> None:
+        # G5: when a prod post_judge unknown escalates and the diagnostician TERMINALIZES (no
+        # upstream reopen), conduct must tombstone the orphaned validate arids (run_phase
+        # deliberately left them live for a potential reopen trigger). Otherwise a later
+        # resume/pass completion vouch trips on the orphaned, step_result-less arids. This must
+        # cover EVERY terminal non-reopen outcome, not just fail_closed:
+        import tempfile
+        # (a) an explicit fail_closed directive, and
+        # (b) a parse-valid null-target retry that falls to conduct's terminal `fail` branch.
+        for stub in (
+            lambda refs, phase, outcome: wc.RouteDecision("fail_closed", reason="diag_unrecoverable"),
+            lambda refs, phase, outcome: wc.RouteDecision("retry", target_phase=None, reason="ambig"),
+        ):
+            with tempfile.TemporaryDirectory() as td:
+                repo = Path(td)
+                c = self._post_judge_unknown_conductor(repo, "prod")
+                c.escalate = stub  # type: ignore[assignment]
+                status = c.conduct(self._refs(), "validate")
+                self.assertIn(status, ("fail", "fail_closed"))
+                sup = [cap for s, cap in c.calls if s == "add-superseded-runs"]
+                self.assertTrue(
+                    any("validate_post_judge_escalate_terminal_orphan" in cap["--reason"]
+                        for cap in sup),
+                    f"expected terminal-orphan tombstone for {stub}")
+
+    def test_post_gate_unknown_escalate_reopen_does_not_terminal_tombstone(self) -> None:
+        # G5: when the diagnostician routes an upstream REOPEN (with budget remaining), conduct
+        # must NOT terminal-tombstone — doing so would pre-supersede the reopen trigger and make
+        # reopen_phase no-op. The reopen fires; reopen_phase supersedes the attempt instead.
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            repo, refs = Path(td), self._refs()
+
+            class _C(_FakeConductor):
+                def _write_lineage(self, r):  # type: ignore[override]
+                    return []
+                def _ensure_fresh_producer_id(self, r, phase):  # type: ignore[override]
+                    return None
+            c = _C(repo_root=repo, orchestration_id="orch_x",
+                   orchestration_agent_run_id="ORCH", backend="claude", env={})
+            c.workflow_mode = "prod"
+            c.calls = []
+            rn = repo / refs.run_node_dir()
+            rn.mkdir(parents=True, exist_ok=True)
+            (rn / "aggregate_verdict.json").write_text(
+                json.dumps({"aggregate_verdict": "pass"}), encoding="utf-8")
+            # post_judge fails (escalate) on the FIRST validate attempt, then passes after the
+            # reopen — so the reopen resolves cleanly (no loop to budget exhaustion).
+            st = {"n": 0}
+            def _post_meta(n):
+                st["n"] += 1
+                if st["n"] == 1:
+                    return {"status": "fail", "failure_category": "pre_judge_violation",
+                            "violations": ["x"], "disposition": "escalate"}
+                return {"status": "pass", "disposition": None}
+            c.post_judge_meta_fn = _post_meta
+            fp = {"n": 0}
+            def _status(phase, substep, n):
+                if phase == "validate" and substep == "post_judge":
+                    fp["n"] += 1
+                    return "fail" if fp["n"] == 1 else "pass"
+                return "pass"
+            c.status_fn = _status
+            c.escalate = lambda refs, phase, outcome: wc.RouteDecision(  # type: ignore[assignment]
+                "reopen", target_phase="compile", repair_strategy="restart", severity="critical",
+                reason="diag_ir")
+            c.conduct(refs, "validate")
+            subs = [s for s, _ in c.calls]
+            self.assertIn("reopen-phase", subs)  # the upstream reopen fired
+            sup = [cap for s, cap in c.calls if s == "add-superseded-runs"]
+            self.assertFalse(
+                any("validate_post_judge_escalate_terminal_orphan" in cap["--reason"] for cap in sup),
+                "reopen resolution must not terminal-tombstone (reopen_phase supersedes)")
+
+    def test_gather_failure_context_includes_gate_metas(self) -> None:
+        # G5: _gather_failure_context embeds post_judge_meta.json / pre_judge_meta.json so the
+        # read-only escalate leaf reasons over the violations without touching the FS.
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            repo, refs = Path(td), self._refs()
+            c = _FakeConductor(repo_root=repo, orchestration_id="orch_x",
+                               orchestration_agent_run_id="ORCH", backend="claude", env={})
+            rn = repo / refs.run_node_dir()
+            rn.mkdir(parents=True, exist_ok=True)
+            (rn / "post_judge_meta.json").write_text(
+                json.dumps({"disposition": "escalate", "violations": ["v"]}), encoding="utf-8")
+            (rn / "pre_judge_meta.json").write_text(
+                json.dumps({"status": "pass"}), encoding="utf-8")
+            ctx = c._gather_failure_context(refs, "validate")
+            self.assertIn("post_judge_meta.json", ctx)
+            self.assertIn("pre_judge_meta.json", ctx)
+            self.assertEqual(ctx["post_judge_meta.json"]["disposition"], "escalate")
+
     def test_failing_judge_verdict_skips_gate_and_routes_normally(self) -> None:
         # G3 regression guard (Codex P1): a legitimate physics/evidence FAIL judge
         # (aggregate_verdict=fail) must NOT run the post_judge gate — that gate flags
@@ -1505,6 +1659,83 @@ class DiagnosticianTest(unittest.TestCase):
         self.assertIsNone(wc._parse_directive('{"action":"reopen","target_phase":null}'))
         self.assertIsNone(wc._parse_directive('{"action":"retry","target_phase":"whoops"}'))
         self.assertIsNone(wc._parse_directive("garbage, no object"))
+
+    def test_parse_directive_rejects_non_actionable_targets(self) -> None:
+        # G5: build/validate are NOT actionable diagnostician targets (the conductor cannot
+        # re-run a deterministic phase in place to fix a defect) -> rejected -> fail_closed,
+        # not a wasted reopen. re_execute is likewise dropped (coerced to None).
+        self.assertIsNone(wc._parse_directive('{"action":"reopen","target_phase":"build","reason":"x"}'))
+        self.assertIsNone(
+            wc._parse_directive('{"action":"retry","target_phase":"validate","repair_strategy":"re_execute","reason":"x"}'))
+        d = wc._parse_directive('{"action":"retry","target_phase":"generate","repair_strategy":"re_execute","reason":"x"}')
+        self.assertEqual((d.target_phase, d.repair_strategy), ("generate", None))
+
+    def test_parse_directive_severity(self) -> None:
+        # G5: severity is parsed; absent or out-of-vocab -> default `major` (back-compat).
+        for sev in ("minor", "major", "critical"):
+            d = wc._parse_directive(
+                '{"action":"reopen","target_phase":"compile","severity":"%s","reason":"r"}' % sev)
+            self.assertEqual(d.severity, sev)
+        self.assertEqual(  # absent -> major
+            wc._parse_directive('{"action":"retry","target_phase":"generate","reason":"r"}').severity,
+            "major")
+        self.assertEqual(  # out-of-vocab -> major (not a whole-directive reject)
+            wc._parse_directive(
+                '{"action":"retry","target_phase":"generate","severity":"apocalyptic","reason":"r"}'
+            ).severity, "major")
+
+    def test_resolve_severity_directive(self) -> None:
+        # G5 policy: minor forces reuse; major default reuse (honors LLM restart override);
+        # critical forces restart; re_execute passthrough; fail_closed/no-severity untouched;
+        # target_phase is NEVER clamped.
+        def r(action, target, strat, sev):
+            return wc.resolve_severity_directive(
+                wc.RouteDecision(action, target_phase=target, repair_strategy=strat, severity=sev))
+        self.assertEqual(r("reopen", "compile", "restart", "minor").repair_strategy, "reuse")
+        self.assertEqual(r("reopen", "compile", None, "major").repair_strategy, "reuse")
+        self.assertEqual(r("reopen", "compile", "restart", "major").repair_strategy, "restart")
+        self.assertEqual(r("reopen", "compile", "reuse", "critical").repair_strategy, "restart")
+        self.assertEqual(r("retry", "validate", "re_execute", "critical").repair_strategy, "re_execute")
+        # null target_phase -> no-op: an ambiguous/incomplete directive (no explicit target) must
+        # NOT be synthesized into a strategy (which conduct would turn into a same-phase producer
+        # reopen); it stays strategy-less so conduct terminalizes it.
+        self.assertIsNone(r("retry", None, None, "major").repair_strategy)
+        # target_phase is honored as-is under every severity (no clamp).
+        self.assertEqual(r("reopen", "compile", None, "minor").target_phase, "compile")
+        # fail_closed and no-severity decisions are untouched.
+        self.assertEqual(
+            wc.resolve_severity_directive(
+                wc.RouteDecision("fail_closed", reason="x", severity="critical")).repair_strategy,
+            None)
+        self.assertEqual(
+            wc.resolve_severity_directive(
+                wc.RouteDecision("retry", target_phase="generate", repair_strategy="reuse")
+            ).repair_strategy, "reuse")
+
+    def test_escalate_severity_governs_reuse_discard(self) -> None:
+        # End-to-end through escalate(): a critical directive that asks to reuse is forced to
+        # restart (discard) by resolve_severity_directive.
+        c = self._conductor()
+        c.spawn_leaf = lambda prompt, env, **kw: wc.ProcResult(  # type: ignore[assignment]
+            0, '{"action":"reopen","target_phase":"compile","severity":"critical",'
+               '"repair_strategy":"reuse","reason":"ir_rot"}', "")
+        d = c.escalate(self._refs(), "validate", wc.PhaseOutcome("validate", "fail"))
+        self.assertEqual((d.action, d.target_phase, d.repair_strategy, d.severity),
+                         ("reopen", "compile", "restart", "critical"))
+
+    def test_diagnosis_prompt_renders_escalate_skill(self) -> None:
+        # G5: the persona is the workflow-escalate SKILL body (host-rendered), with a
+        # missing-file fallback to the inline default.
+        repo = Path(__file__).resolve().parents[2]
+        persona = wc._load_escalate_persona(repo)
+        self.assertIn("Failure Diagnostician", persona)
+        self.assertFalse(persona.startswith("---"))  # frontmatter stripped
+        prompt = wc._diagnosis_prompt("n", "validate", [], {}, "prod", persona=persona)
+        self.assertIn("Failure Diagnostician", prompt)
+        self.assertIn("severity", prompt)  # directive schema appended
+        # Missing SKILL -> inline fallback (never crashes escalate).
+        self.assertEqual(
+            wc._load_escalate_persona(Path("/no/such/repo")), wc._ESCALATE_PERSONA_FALLBACK)
 
     def test_escalate_routes_from_diagnostician(self) -> None:
         c = self._conductor()
