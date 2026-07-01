@@ -2311,6 +2311,9 @@ class SubstepEventTests(unittest.TestCase):
             def _conductor_authors_makefile(self, *_a, **_k):
                 return False
 
+            def _judge_pre_spawn_dag_block(self, *_a, **_k):
+                return None
+
             def run_substep(self, refs, phase, substep, repair=None,
                             resolved_dependencies=()):
                 return wc.SubstepOutcome(

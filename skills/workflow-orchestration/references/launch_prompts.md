@@ -149,7 +149,7 @@ It canonicalizes, per `(step, substep)`, the `validate_pipeline_semantics --stag
 | generate | verify | (none) | pure LLM semantic pass; the static gates moved to `Generate.static`, so verify launches no `validate_pipeline_semantics`. |
 | build | — | `post_build` | invoked after the MCP `compile_project` call. |
 | validate | execute | `post_execute` | invoked for the judgment of the `run_program` / `run_quality_checks` result. |
-| validate | judge | `pre_judge` | the final validation before `aggregate_verdict` finalization. |
+| validate | judge | (none) | pure LLM semantic pass; the `--stage pre_judge` gate moved to the conductor (a pre-spawn dependency-DAG readiness check + a post-return gate authoring `judge_gate_meta.json`), so the judge leaf launches no `validate_pipeline_semantics`. |
 
 `--stage full` is a debug stage that performs end-to-end validation, and is not explicitly included in the allow-list for any of the (step, substep) above (the steady workflow uses per-phase stages as canonical). The exhaustive list of canonical `--stage` values uses the argparse `choices` of `tools/validate_pipeline_semantics.py` (`compile` / `post_generate` / `post_build` / `post_execute` / `pre_judge` / `full`) as the primary source.
 

@@ -1460,8 +1460,17 @@ clean:
             status = "pass" if (meta.get("verification_status") == "pass"
                                 and _fresh_deliverables_written([src_meta])) else "fail"
         elif phase == "validate" and substep == "judge":
+            # Judge passes only when the LLM verdict is pass/xfail AND the conductor-owned
+            # pre_judge post-gate passed (judge_gate_meta.status == pass, written by
+            # _run_judge_pre_judge_gate after the leaf returned). The gate is load-bearing
+            # here: the `--stage pre_judge` structural gate moved OUT of the judge leaf, so a
+            # judge that semantically passed (aggregate_verdict=pass) but tripped an
+            # orchestration-record/DAG integrity violation must still fail the substep — a
+            # missing judge_gate_meta (e.g. a crashed judge) reads as fail too.
             agg = _read_json(self.repo_root / refs.run_node_dir() / "aggregate_verdict.json") or {}
-            status = "pass" if str(agg.get("aggregate_verdict") or agg.get("overall")) in ("pass", "xfail") else "fail"
+            gate = _read_json(self.repo_root / refs.run_node_dir() / "judge_gate_meta.json") or {}
+            verdict_ok = str(agg.get("aggregate_verdict") or agg.get("overall")) in ("pass", "xfail")
+            status = "pass" if (verdict_ok and gate.get("status") == "pass") else "fail"
         elif phase == "build":
             # Deterministic build: the conductor-authored binary_meta records the compile
             # + post_build-gate verdict. A content failure (compile/link error, post_build
@@ -2509,6 +2518,24 @@ clean:
             # not hook-guarded, so they don't trip the output-manifest guard.
             self._persist_leaf_output(child_arid, proc)
             token = self.read_parent_return_token(child_arid)
+            # Conductor-owned pre_judge POST-GATE (G3): now that the judge leaf produced its
+            # verdict, run the `--stage pre_judge` gate the leaf used to own and record
+            # judge_gate_meta.json. Scoped to an OTHERWISE-PASSING judge (aggregate_verdict
+            # pass/xfail): pre_judge's `_validate_llm_semantic_review` treats
+            # `semantic_review.decision != "pass"` as a violation, so running it on a legitimate
+            # physics/evidence FAIL verdict would mislabel that routeable failure as an integrity
+            # blocker (fail_closed) and rob classify_failure of the retry/attribution routing. A
+            # non-pass verdict skips the gate and flows to classify_failure's decision tables
+            # exactly as before (like the leaf era, where the completion pre_judge ran only on a
+            # judge terminating pass). The structural gate matters only when a node is about to be
+            # CERTIFIED pass. A nonzero leaf exit is a transport failure handled by run_phase.
+            if phase == "validate" and substep == "judge" and proc.returncode == 0:
+                agg = _read_json(
+                    self.repo_root / refs.run_node_dir() / "aggregate_verdict.json") or {}
+                verdict_ok = str(
+                    agg.get("aggregate_verdict") or agg.get("overall")) in ("pass", "xfail")
+                if verdict_ok and not self._run_judge_pre_judge_gate(refs, child_arid):
+                    proc.stderr = (proc.stderr or "") + "\n[pre_judge gate fail]\n"
         status, output_refs = self.determine_substep_status(
             refs, phase, substep, request["allowed_output_paths"], min_mtime=launched_at)
         # A nonzero leaf exit (crash / transport failure) fails the substep even if
@@ -2649,6 +2676,121 @@ clean:
         excerpt = meta.get(field) if isinstance(meta, dict) else None
         return excerpt if isinstance(excerpt, str) and excerpt.strip() else None
 
+    # -- Validate.judge conductor-owned pre_judge gate (G3) --------------------
+    # The purely-structural `--stage pre_judge` gate (orchestration-record integrity +
+    # the cross-pipeline dependency DAG) used to run INSIDE the LLM judge leaf as its final
+    # step. It is hoisted to the conductor for canonical single-ownership, mirroring the
+    # G1/G2 deterministic-gate hoists one and two phases up:
+    #   - pre-spawn (`_judge_pre_spawn_dag_block`): before spawning a COLD judge, fail fast
+    #     when a --with-deps dependency closure is not built+validated in its own pipeline.
+    #   - post-gate (`_run_judge_pre_judge_gate`): after the judge returns its verdict, run
+    #     pre_judge and record `judge_gate_meta.json`; a violation is a non-physics INTEGRITY
+    #     blocker that run_phase terminalizes as fail_closed (see run_phase).
+    # The judge leaf itself no longer invokes any validator gate (ALLOWED_VALIDATE_PIPELINE_
+    # STAGES[(validate,judge)] == frozenset()), so it is a pure LLM semantic pass.
+
+    def _judge_pre_spawn_dag_block(self, refs: NodeRefs) -> str | None:
+        """Pre-spawn Validate.judge dependency-DAG readiness (multi-node closures only).
+
+        The `--with-deps` model builds+validates each dependency node in its OWN separate
+        pipeline, then runs the dependent. Before spawning a cold judge (and before even
+        running execute), verify every closure node has its own fully built+validated
+        pipeline. Returns a human-readable excerpt when some closure node is not ready
+        (caller fails fast); None for a ready closure OR a single-node run (empty closure,
+        zero overhead — the common case).
+
+        Provably a STRICT SUBSET of the post-gate: it derives the closure from the SAME
+        source and normalization the post-gate's pre_judge DAG check uses
+        (`dependency.all_nodes` -> normalized `<kind>/<spec_id>` tokens via
+        `_dependency_expected_node_keys`) and consults the SAME cross-pipeline predicate
+        (`_closure_node_validated_in_own_pipeline`), so anything blocked here would also
+        fail pre_judge — it never fails a run the post-gate would pass; it only saves the
+        wasted execute+judge cost when the closure is genuinely incomplete. Reading
+        `all_nodes` directly (not `_dependency_closure_nodes`) also skips that helper's L6
+        diamond guard, which is a Build/Model-B staging concern irrelevant to DAG readiness
+        (and would otherwise mis-raise for a c/cpp/mixed node at validate time)."""
+        ir = _read_yaml(self.repo_root / refs.ir_ref / "spec.ir.yaml") or {}
+        dep = (ir.get("dependency") or {}) if isinstance(ir, dict) else {}
+        if not isinstance(dep, dict):
+            return None
+        from tools.validate_pipeline_semantics import (
+            _closure_node_validated_in_own_pipeline,
+            _dependency_expected_node_keys, _normalize_node_key_token)
+        # Exclude self: its own pipeline is the one under validation now, not a
+        # separately-completed dependency.
+        self_token = _normalize_node_key_token(refs.node_key)
+        closure = {t for t in _dependency_expected_node_keys(dep) if t != self_token}
+        if not closure:
+            return None
+        missing = sorted(t for t in closure
+                         if not _closure_node_validated_in_own_pipeline(self.repo_root, t))
+        if not missing:
+            return None
+        return ("dependency closure not built+validated in its own pipeline; missing node "
+                f"workflows {missing} (run the dependency closure first, e.g. via "
+                "run_workflow.py --with-deps)")
+
+    def _write_judge_gate_meta(self, refs: NodeRefs, *, status: str,
+                               failure_category: str | None,
+                               failure_excerpt: str | None) -> None:
+        """Author the conductor-owned `judge_gate_meta.json` recording the pre_judge gate
+        verdict under the run-node dir (the same host-written area as trial_meta /
+        aggregate_verdict; not a leaf deliverable). determine_substep_status ANDs its
+        `status` into the judge pass condition, and run_phase terminalizes a `fail` as a
+        fail_closed integrity blocker."""
+        meta = {
+            "run_id": refs.run_id,
+            "node_key": refs.node_key,
+            "pipeline_id": refs.pipeline_id,
+            "status": status,
+            "validation_stage": "pre_judge",
+            "failure_category": failure_category,
+            "failure_excerpt": failure_excerpt,
+        }
+        path = self.repo_root / refs.run_node_dir() / "judge_gate_meta.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps(meta, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+
+    def _run_judge_pre_judge_gate(self, refs: NodeRefs, child_arid: str) -> bool:
+        """Conductor-owned post-gate: run `validate_pipeline_semantics --stage pre_judge`
+        after the judge leaf returns, and author judge_gate_meta.json with the verdict.
+        Returns True on pass.
+
+        Scoped to this run (`--pipeline-root`/`--run-id`) so historically-broken sibling
+        pipelines cannot fail an otherwise-conformant node; the cross-pipeline dependency
+        DAG check inside pre_judge still validates dependencies built in their own
+        `--with-deps` pipelines. `--in-flight-agent-run-id` is the judge child (recorded +
+        returned but not yet finalized -> no step_result yet), the same in-flight scoping
+        the leaf used when it owned the gate. Mirrors the _build_inproc post_build idiom
+        (rc-checked subprocess, check=False).
+
+        A subprocess-launch failure (OSError, e.g. an unresolvable `python3`) is caught and
+        recorded as a gate failure so run_phase terminalizes cleanly `fail_closed` instead of
+        an uncaught crash — matching the transport-fail posture the deterministic in-process
+        gates get for free from `_run_deterministic_substep`'s exception wrapper (which does
+        not wrap this leaf-branch post-gate)."""
+        try:
+            gate = subprocess.run(
+                ["python3", "tools/validate_pipeline_semantics.py", "--stage", "pre_judge",
+                 "--orchestration-id", self.orchestration_id,
+                 "--in-flight-agent-run-id", child_arid,
+                 "--pipeline-root", refs.pipeline_ref,
+                 "--run-id", str(refs.run_id)],
+                cwd=self.repo_root, env=self.env, text=True, capture_output=True, check=False)
+        except OSError as exc:
+            self._write_judge_gate_meta(
+                refs, status="fail", failure_category="pre_judge_gate_error",
+                failure_excerpt=f"pre_judge gate subprocess failed to launch: {exc}"[:400])
+            return False
+        ok = gate.returncode == 0
+        self._write_judge_gate_meta(
+            refs, status="pass" if ok else "fail",
+            failure_category=None if ok else "pre_judge_violation",
+            failure_excerpt=None if ok
+            else "\n".join((gate.stdout + gate.stderr).splitlines()[-50:]))
+        return ok
+
     def run_phase(self, refs: NodeRefs, phase: str,
                   repair: dict[str, str] | None = None) -> PhaseOutcome:
         """Run one phase as a single attempt and write one terminal step_result.
@@ -2672,6 +2814,18 @@ clean:
                 self._producer_arid[phase] = producer
             return PhaseOutcome(phase, "pass", decision=RouteDecision("advance"),
                                 skipped=True)
+        # Pre-spawn Validate.judge DAG readiness (G3): a --with-deps dependent must not spawn
+        # a cold judge — or even run execute — when its dependency closure is not built+
+        # validated in its own pipeline. Fail fast as a non-physics integrity blocker BEFORE
+        # any substep/leaf, so no judge launch is recorded (and the judge pre_phase_complete
+        # hook, which would require a semantic_review the leaf never wrote, is never reached).
+        # No-op for a single-node run (empty closure).
+        if phase == "validate":
+            block = self._judge_pre_spawn_dag_block(refs)
+            if block is not None:
+                self.emit("judge_pre_spawn_blocked", node_key=node_key, detail=block[:200])
+                return PhaseOutcome(phase, "fail", decision=RouteDecision(
+                    "fail_closed", reason="validate_pre_judge_dag_incomplete"))
         self.workflow_launch_check(node_key, phase, child_agent_role(phase))
         self._ensure_fresh_producer_id(refs, phase)
         # Author/refresh the pipeline lineage.json host-side BEFORE the substeps run:
@@ -2765,6 +2919,26 @@ clean:
                 "fail_closed",
                 reason=f"leaf_transport_error: leaf_exit={transport.leaf_returncode}")
             return PhaseOutcome(phase, status, substep_arids, failed, decision)
+
+        # G3: a conductor-run pre_judge POST-GATE failure (judge_gate_meta.status == fail) is a
+        # non-physics INTEGRITY blocker — the judge may have passed on physics
+        # (semantic_review.decision == pass) yet the orchestration-record / dependency-DAG
+        # integrity gate failed, which is unrecoverable in the current run (the documented
+        # `blocked` posture). Terminalize as fail_closed WITHOUT writing a routeable validate
+        # step_result: the judge pre_phase_complete hook forbids a `fail` step_result atop a
+        # `pass` semantic_review, so this follows the transport branch's skip-write + tombstone
+        # shape rather than routing through classify_failure. Reached only when the judge leaf
+        # returned cleanly (rc 0) — a crashed judge is caught by the transport branch above.
+        if phase == "validate" and status != "pass":
+            gate = _read_json(self.repo_root / refs.run_node_dir() / "judge_gate_meta.json") or {}
+            if gate.get("status") == "fail":
+                cat = gate.get("failure_category") or "pre_judge_violation"
+                orphan_arids = [oc.agent_run_id for oc in outcomes]
+                if orphan_arids:
+                    self._add_superseded_run_ids(
+                        orphan_arids, reason=f"validate_pre_judge_gate_fail_orphan: {cat}")
+                decision = RouteDecision("fail_closed", reason=f"validate_{cat}")
+                return PhaseOutcome(phase, status, substep_arids, failed, decision)
 
         self.write_step_result(node_key, phase, executor, result)
         if status == "pass":

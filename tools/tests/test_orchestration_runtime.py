@@ -15644,15 +15644,20 @@ class GateRunbookTests(unittest.TestCase):
         leftover = set(_re.findall(r"<([a-zA-Z_]+)>", rb))
         self.assertEqual(leftover, {"capability_token", "PATH"})
 
-    def test_runbook_judge_scopes_pre_judge_to_own_run(self) -> None:
-        from tools.orchestration_runtime import _build_gate_runbook
+    def test_runbook_judge_emits_no_gate(self) -> None:
+        # G3: the `--stage pre_judge` gate moved out of the judge leaf to the conductor (a
+        # pre-spawn dependency-DAG readiness check + a post-return pre_judge gate that authors
+        # judge_gate_meta.json), so validate.judge is a pure LLM semantic pass that emits NO
+        # runbook (mirrors compile.verify / generate.verify).
+        from tools.orchestration_runtime import (
+            _build_gate_runbook,
+            ALLOWED_VALIDATE_PIPELINE_STAGES,
+        )
 
         rb = _build_gate_runbook(self._payload("validate", "judge"))
-        self.assertIn("--stage pre_judge", rb)
-        self.assertIn("--in-flight-agent-run-id arid-RUNBOOK", rb)
-        self.assertIn(
-            "--pipeline-root workspace/pipelines/component__demo_dep_top__0.1.0/d_002", rb)
-        self.assertIn("--run-id run_20260626_001", rb)
+        self.assertEqual(rb, "")
+        self.assertNotIn("--stage pre_judge", rb)
+        self.assertEqual(ALLOWED_VALIDATE_PIPELINE_STAGES[("validate", "judge")], frozenset())
 
     def test_runbook_generate_verify_emits_no_gate(self) -> None:
         # The post_generate + workspace_root gates moved to the conductor's deterministic
@@ -15709,14 +15714,14 @@ class GateRunbookTests(unittest.TestCase):
             _validate_launch_prompt_text,
         )
 
-        # generate.verify and compile.verify are intentionally excluded: their gates moved to
-        # the deterministic generate.static / compile.static substeps, so they now render with
-        # no Gate Runbook (covered by test_rendered_prompt_unmapped_phase_no_stray_marker's
-        # empty-runbook behavior).
+        # generate.verify, compile.verify AND validate.judge are intentionally excluded: their
+        # validator gates moved to the deterministic generate.static / compile.static substeps
+        # and (for judge) to the conductor-owned pre_judge gate, so they now render with no Gate
+        # Runbook (covered by test_rendered_prompt_unmapped_phase_no_stray_marker's empty-runbook
+        # behavior and test_runbook_judge_emits_no_gate).
         for step, substep in (
             ("compile", "generate"),
             ("generate", "generate"),
-            ("validate", "judge"),
         ):
             with self.subTest(step=step, substep=substep):
                 payload = prepare_launch_request_payload(self._payload(step, substep))
@@ -15725,6 +15730,12 @@ class GateRunbookTests(unittest.TestCase):
                 self.assertIn("Gate Runbook", rendered)
                 # Must not raise (gate-allowlist lint + constraint-line checks).
                 _validate_launch_prompt_text(payload, rendered)
+        # validate.judge renders cleanly with NO runbook (empty <gate_runbook> collapsed).
+        judge_payload = prepare_launch_request_payload(self._payload("validate", "judge"))
+        judge_rendered = render_launch_prompt_text(judge_payload)
+        self.assertNotIn("<gate_runbook>", judge_rendered)
+        self.assertNotIn("Gate Runbook", judge_rendered)
+        _validate_launch_prompt_text(judge_payload, judge_rendered)
 
     def test_rendered_prompt_unmapped_phase_no_stray_marker(self) -> None:
         """An LLM phase with no runbook mapping (e.g. tune/*) must still render with the

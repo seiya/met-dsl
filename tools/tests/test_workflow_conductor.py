@@ -400,6 +400,16 @@ class _FakeConductor(wc.Conductor):
     def read_case_ids(self, refs):  # type: ignore[override]
         return ()
 
+    # G3 judge gates: offline no-ops so the stubbed determine_substep_status drives the
+    # outcome (a real _run_judge_pre_judge_gate would spawn a subprocess + write under the
+    # fake repo_root; a real _judge_pre_spawn_dag_block would read a nonexistent IR). The
+    # real gates are exercised by the dedicated JudgePreJudgeGate / JudgePreSpawnDag tests.
+    def _judge_pre_spawn_dag_block(self, refs):  # type: ignore[override]
+        return None
+
+    def _run_judge_pre_judge_gate(self, refs, child_arid):  # type: ignore[override]
+        return True
+
     # configurable hooks (default: everything passes)
     status_fn = None  # (phase, substep, n) -> "pass"|"fail"
     decision_fn = None  # (phase, outcomes) -> RouteDecision
@@ -1126,6 +1136,109 @@ class TransportFailureTest(unittest.TestCase):
         subs = [s for s, _ in c.calls]
         self.assertIn("write-step-result", subs)
         self.assertNotIn("add-superseded-runs", subs)
+
+    def test_pre_spawn_dag_incomplete_fails_closed_without_spawning(self) -> None:
+        # G3: a not-built+validated dependency closure fails the validate phase closed BEFORE
+        # any substep/leaf runs — no record-launch, no write-step-result (the judge hook that
+        # would demand a semantic_review the leaf never wrote is never reached).
+        class _C(self._C):  # type: ignore[misc]
+            def _judge_pre_spawn_dag_block(self, refs):  # type: ignore[override]
+                return "dependency closure not built+validated ... missing ['component/dep']"
+        c = _C(repo_root=Path("/tmp/repo"), orchestration_id="orch_x",
+               orchestration_agent_run_id="ORCH", backend="claude", env={})
+        c.calls = []
+        oc = c.run_phase(self._refs(), "validate")
+        self.assertEqual(oc.status, "fail")
+        self.assertEqual(oc.decision.action, "fail_closed")
+        self.assertEqual(oc.decision.reason, "validate_pre_judge_dag_incomplete")
+        subs = [s for s, _ in c.calls]
+        self.assertNotIn("record-launch", subs)
+        self.assertNotIn("write-step-result", subs)
+
+    def test_post_gate_pre_judge_violation_fails_closed_and_tombstones(self) -> None:
+        # G3: a PASSING judge (aggregate_verdict=pass) returned cleanly (rc 0) but the
+        # conductor-owned pre_judge post-gate failed on a real record-integrity violation -> a
+        # non-physics integrity blocker terminalized as fail_closed WITHOUT write-step-result (so
+        # the judge pre_phase_complete hook never rejects a fail step_result atop a pass
+        # semantic_review), tombstoning the attempt's arids.
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            refs = self._refs()
+
+            class _C(_FakeConductor):
+                def _write_lineage(self, r):  # type: ignore[override]
+                    return []
+                def _ensure_fresh_producer_id(self, r, phase):  # type: ignore[override]
+                    return None  # keep run_id stable so the seeded run-node dir is read back
+                # judge substep runs (rc 0); the post-gate authors a FAIL judge_gate_meta.
+                def _run_judge_pre_judge_gate(self, r, child_arid):  # type: ignore[override]
+                    self._write_judge_gate_meta(
+                        r, status="fail", failure_category="pre_judge_violation",
+                        failure_excerpt="record-integrity boom")
+                    return False
+
+            c = _C(repo_root=repo, orchestration_id="orch_x",
+                   orchestration_agent_run_id="ORCH", backend="claude", env={})
+            c.calls = []
+            # A PASSING judge verdict on disk so the post-gate actually runs (verdict_ok True).
+            rn = repo / refs.run_node_dir()
+            rn.mkdir(parents=True, exist_ok=True)
+            (rn / "aggregate_verdict.json").write_text(
+                json.dumps({"aggregate_verdict": "pass"}), encoding="utf-8")
+            # execute passes, judge substep resolves fail (stubbed determine reflects the gate fail).
+            c.status_fn = lambda phase, substep, n: (
+                "fail" if (phase == "validate" and substep == "judge") else "pass")
+            oc = c.run_phase(refs, "validate")
+            self.assertEqual(oc.status, "fail")
+            self.assertEqual(oc.decision.action, "fail_closed")
+            self.assertEqual(oc.decision.reason, "validate_pre_judge_violation")
+            subs = [s for s, _ in c.calls]
+            self.assertNotIn("write-step-result", subs)
+            sup = [cap for s, cap in c.calls if s == "add-superseded-runs"]
+            self.assertEqual(len(sup), 1)
+            self.assertIn("validate_pre_judge_gate_fail_orphan", sup[0]["--reason"])
+
+    def test_failing_judge_verdict_skips_gate_and_routes_normally(self) -> None:
+        # G3 regression guard (Codex P1): a legitimate physics/evidence FAIL judge
+        # (aggregate_verdict=fail) must NOT run the pre_judge post-gate — that gate flags
+        # semantic_review.decision != pass as a violation, which would mislabel the routeable
+        # failure as an integrity blocker. The gate is skipped, no judge_gate_meta is written,
+        # and run_phase writes the step_result + routes via classify_failure (NOT fail_closed).
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            refs = self._refs()
+            gate_calls = {"n": 0}
+
+            class _C(_FakeConductor):
+                def _write_lineage(self, r):  # type: ignore[override]
+                    return []
+                def _ensure_fresh_producer_id(self, r, phase):  # type: ignore[override]
+                    return None
+                def _run_judge_pre_judge_gate(self, r, child_arid):  # type: ignore[override]
+                    gate_calls["n"] += 1  # must NOT be called for a failing verdict
+                    return True
+
+            c = _C(repo_root=repo, orchestration_id="orch_x",
+                   orchestration_agent_run_id="ORCH", backend="claude", env={})
+            c.calls = []
+            rn = repo / refs.run_node_dir()
+            rn.mkdir(parents=True, exist_ok=True)
+            (rn / "aggregate_verdict.json").write_text(
+                json.dumps({"aggregate_verdict": "fail"}), encoding="utf-8")
+            c.status_fn = lambda phase, substep, n: (
+                "fail" if (phase == "validate" and substep == "judge") else "pass")
+            c.decision_fn = lambda phase, outcomes: wc.RouteDecision(
+                "retry", target_phase="generate", repair_strategy="reuse", reason="judge_physics_fail_code")
+            oc = c.run_phase(refs, "validate")
+            self.assertEqual(gate_calls["n"], 0)  # gate skipped for a non-pass verdict
+            self.assertEqual(oc.status, "fail")
+            self.assertEqual(oc.decision.action, "retry")  # routed, NOT fail_closed
+            self.assertEqual(oc.decision.target_phase, "generate")
+            subs = [s for s, _ in c.calls]
+            self.assertIn("write-step-result", subs)  # routeable fail writes a step_result
+            self.assertNotIn("add-superseded-runs", subs)  # not tombstoned
 
     def test_build_transport_failure_tombstones_step_agent(self) -> None:
         # Build is NOT substep-aware (substep_arids == []); a build in-process exception
@@ -3356,6 +3469,186 @@ class DeterministicCompileStaticTest(unittest.TestCase):
             self.assertEqual(
                 c.determine_substep_status(refs, "compile", "verify", paths,
                                            min_mtime=mtime + 100)[0], "fail")
+
+
+class G3JudgePreJudgeGateTest(unittest.TestCase):
+    """G3: the `--stage pre_judge` gate is hoisted out of the judge leaf into the conductor —
+    a pre-spawn dependency-DAG readiness check plus a post-return gate authoring
+    judge_gate_meta.json, ANDed into the judge pass condition."""
+
+    def _conductor(self, repo: Path) -> "wc.Conductor":
+        return wc.Conductor(repo_root=repo, orchestration_id="t",
+                            orchestration_agent_run_id="x", backend="claude", env={})
+
+    def _refs(self) -> wc.NodeRefs:
+        return wc.NodeRefs(
+            node_key="component/spec_x@0.1.0", spec_path="spec/component/spec_x",
+            ir_id="x_1", pipeline_id="x_1", source_id="src_1", binary_id="bin_1",
+            run_id="run_1")
+
+    def _seed_run_node(self, repo: Path, refs: wc.NodeRefs, *,
+                       agg: str | None, gate: dict | None) -> list[str]:
+        rn = repo / refs.run_node_dir()
+        rn.mkdir(parents=True, exist_ok=True)
+        if agg is not None:
+            (rn / "aggregate_verdict.json").write_text(
+                json.dumps({"aggregate_verdict": agg}), encoding="utf-8")
+        if gate is not None:
+            (rn / "judge_gate_meta.json").write_text(json.dumps(gate), encoding="utf-8")
+        return []
+
+    # -- determine_substep_status judge branch (verdict AND gate) --------------
+    def test_determine_judge_passes_only_when_verdict_and_gate_pass(self) -> None:
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            repo, refs = Path(td), self._refs()
+            c = self._conductor(repo)
+            # pass verdict + pass gate -> pass
+            self._seed_run_node(repo, refs, agg="pass", gate={"status": "pass"})
+            self.assertEqual(
+                c.determine_substep_status(refs, "validate", "judge", [])[0], "pass")
+            # pass verdict + FAIL gate (structural pre_judge violation) -> fail
+            self._seed_run_node(repo, refs, agg="pass", gate={"status": "fail"})
+            self.assertEqual(
+                c.determine_substep_status(refs, "validate", "judge", [])[0], "fail")
+            # pass verdict + MISSING gate (e.g. crashed judge, gate never ran) -> fail
+            self._seed_run_node(repo, refs, agg="pass", gate=None)
+            (repo / refs.run_node_dir() / "judge_gate_meta.json").unlink(missing_ok=True)
+            self.assertEqual(
+                c.determine_substep_status(refs, "validate", "judge", [])[0], "fail")
+            # FAIL verdict + pass gate -> fail (physics failure)
+            self._seed_run_node(repo, refs, agg="fail", gate={"status": "pass"})
+            self.assertEqual(
+                c.determine_substep_status(refs, "validate", "judge", [])[0], "fail")
+
+    # -- _run_judge_pre_judge_gate post-gate (subprocess -> judge_gate_meta) ---
+    def _patch_run(self, fn):
+        from unittest import mock
+        return mock.patch.object(wc.subprocess, "run", fn)
+
+    def test_post_gate_pass_writes_pass_meta(self) -> None:
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            repo, refs = Path(td), self._refs()
+            (repo / refs.run_node_dir()).mkdir(parents=True, exist_ok=True)
+            c = self._conductor(repo)
+            with self._patch_run(lambda cmd, **k: wc.subprocess.CompletedProcess(cmd, 0, "", "")):
+                ok = c._run_judge_pre_judge_gate(refs, "child-judge")
+            self.assertTrue(ok)
+            meta = json.loads((repo / refs.run_node_dir() / "judge_gate_meta.json").read_text())
+            self.assertEqual(meta["status"], "pass")
+            self.assertIsNone(meta["failure_category"])
+
+    def test_post_gate_fail_writes_fail_meta_with_excerpt(self) -> None:
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            repo, refs = Path(td), self._refs()
+            (repo / refs.run_node_dir()).mkdir(parents=True, exist_ok=True)
+            c = self._conductor(repo)
+            with self._patch_run(
+                    lambda cmd, **k: wc.subprocess.CompletedProcess(cmd, 1, "boom-out", "boom-err")):
+                ok = c._run_judge_pre_judge_gate(refs, "child-judge")
+            self.assertFalse(ok)
+            meta = json.loads((repo / refs.run_node_dir() / "judge_gate_meta.json").read_text())
+            self.assertEqual(meta["status"], "fail")
+            self.assertEqual(meta["failure_category"], "pre_judge_violation")
+            self.assertIn("boom", meta["failure_excerpt"])
+
+    def test_post_gate_subprocess_launch_failure_records_gate_error(self) -> None:
+        # A subprocess-launch failure (OSError) is caught and recorded as a gate failure so
+        # run_phase terminalizes fail_closed instead of crashing — not an uncaught exception.
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            repo, refs = Path(td), self._refs()
+            (repo / refs.run_node_dir()).mkdir(parents=True, exist_ok=True)
+            c = self._conductor(repo)
+
+            def boom(cmd, **k):
+                raise OSError("python3 not found")
+
+            with self._patch_run(boom):
+                ok = c._run_judge_pre_judge_gate(refs, "child-judge")
+            self.assertFalse(ok)
+            meta = json.loads((repo / refs.run_node_dir() / "judge_gate_meta.json").read_text())
+            self.assertEqual(meta["status"], "fail")
+            self.assertEqual(meta["failure_category"], "pre_judge_gate_error")
+
+    def test_post_gate_emits_scoped_pre_judge_args(self) -> None:
+        # The conductor-owned gate must run --stage pre_judge scoped to its own run
+        # (--pipeline-root/--run-id) with the judge child as --in-flight-agent-run-id.
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            repo, refs = Path(td), self._refs()
+            (repo / refs.run_node_dir()).mkdir(parents=True, exist_ok=True)
+            c = self._conductor(repo)
+            seen = {}
+
+            def run(cmd, **k):
+                seen["cmd"] = cmd
+                return wc.subprocess.CompletedProcess(cmd, 0, "", "")
+
+            with self._patch_run(run):
+                c._run_judge_pre_judge_gate(refs, "child-judge")
+            cmd = seen["cmd"]
+            self.assertIn("--stage", cmd)
+            self.assertEqual(cmd[cmd.index("--stage") + 1], "pre_judge")
+            self.assertEqual(cmd[cmd.index("--in-flight-agent-run-id") + 1], "child-judge")
+            self.assertEqual(cmd[cmd.index("--pipeline-root") + 1], refs.pipeline_ref)
+            self.assertEqual(cmd[cmd.index("--run-id") + 1], "run_1")
+
+    # -- _judge_pre_spawn_dag_block (multi-node fail / single-node skip) -------
+    def _patch_closure_validated(self, fn):
+        from unittest import mock
+        import tools.validate_pipeline_semantics as vps
+        return mock.patch.object(vps, "_closure_node_validated_in_own_pipeline", fn)
+
+    def _seed_ir_closure(self, repo: Path, refs: wc.NodeRefs, closure: list[str]) -> None:
+        # Seed spec.ir.yaml with dependency.all_nodes = self + closure (the SAME source the
+        # post-gate pre_judge DAG check reads). JSON is valid YAML, so _read_yaml parses it.
+        ir_dir = repo / refs.ir_ref
+        ir_dir.mkdir(parents=True, exist_ok=True)
+        all_nodes = [{"node_key": refs.node_key}] + [{"node_key": nk} for nk in closure]
+        (ir_dir / "spec.ir.yaml").write_text(
+            json.dumps({"dependency": {"all_nodes": all_nodes}}), encoding="utf-8")
+
+    def test_pre_spawn_single_node_skips(self) -> None:
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            repo, refs = Path(td), self._refs()
+            self._seed_ir_closure(repo, refs, [])  # only self in all_nodes
+            c = self._conductor(repo)
+            # Empty closure -> None without ever consulting the (unpatched) validator.
+            self.assertIsNone(c._judge_pre_spawn_dag_block(refs))
+
+    def test_pre_spawn_absent_ir_skips(self) -> None:
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            # No spec.ir.yaml at all (defensive) -> empty dep -> None.
+            c = self._conductor(Path(td))
+            self.assertIsNone(c._judge_pre_spawn_dag_block(self._refs()))
+
+    def test_pre_spawn_multi_node_all_ready_proceeds(self) -> None:
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            repo, refs = Path(td), self._refs()
+            self._seed_ir_closure(repo, refs, ["component/base@0.1.0", "component/mid@0.2.0"])
+            c = self._conductor(repo)
+            with self._patch_closure_validated(lambda repo_root, tok: True):
+                self.assertIsNone(c._judge_pre_spawn_dag_block(refs))
+
+    def test_pre_spawn_multi_node_incomplete_blocks(self) -> None:
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            repo, refs = Path(td), self._refs()
+            self._seed_ir_closure(repo, refs, ["component/base@0.1.0", "component/mid@0.2.0"])
+            c = self._conductor(repo)
+            # base ready, mid not -> block, and the excerpt names the missing normalized token.
+            with self._patch_closure_validated(
+                    lambda repo_root, tok: tok == "component/base"):
+                block = c._judge_pre_spawn_dag_block(refs)
+            self.assertIsInstance(block, str)
+            self.assertIn("component/mid", block)
+            self.assertNotIn("component/base", block)
 
 
 class ExecutePromoterTest(unittest.TestCase):

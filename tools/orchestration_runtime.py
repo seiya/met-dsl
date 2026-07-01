@@ -8254,8 +8254,6 @@ def _build_gate_runbook(request_payload: dict[str, Any]) -> str:
     oid = str(request_payload.get("orchestration_id", "")).strip()
     arid = str(request_payload.get("agent_run_id", "")).strip()
     ir_ref = str(request_payload.get("ir_ref", "")).strip().rstrip("/")
-    pipeline_ref = str(request_payload.get("pipeline_ref", "")).strip().rstrip("/")
-    run_id = str(request_payload.get("run_id", "")).strip()
 
     # Per-(step, substep) gate command sequence. Each command is a single logical line
     # (no `\` continuation) so the gate-allowlist stage scanner reads `--stage` within
@@ -8283,26 +8281,12 @@ def _build_gate_runbook(request_payload: dict[str, Any]) -> str:
     # (Conductor._static_inproc) BEFORE verify, so verify is reached only on a
     # deterministically-clean source and is a pure LLM semantic (G1-G7) pass. It therefore
     # falls through to the `else` branch below and returns "" (no runbook).
-    elif step == "validate" and substep == "judge":
-        # Scoped pre_judge: `--pipeline-root`/`--run-id` confine the loaded executions to
-        # this run so historically-broken sibling pipelines/runs cannot fail an otherwise-
-        # conformant node (the exact friction the leaf wasted ~73s rediscovering). This
-        # scoping does NOT relax dependency validation: the cross-pipeline dependency-DAG
-        # check (token-None "validation scope" branch, which accepts a dependency built in
-        # its own separate `--with-deps` pipeline) and the launch-time dependency readiness
-        # check both still run, so a dependent node need not list its dependency pipeline
-        # here.
-        pre_judge = (
-            "python3 tools/validate_pipeline_semantics.py --stage pre_judge "
-            f"--orchestration-id {oid} --in-flight-agent-run-id {arid} "
-            f"--pipeline-root {pipeline_ref}"
-        )
-        if run_id:
-            pre_judge += f" --run-id {run_id}"
-        commands = [
-            "python3 tools/validate_workspace_root.py",
-            pre_judge,
-        ]
+    # validate.judge emits NO gate runbook: the `--stage pre_judge` gate it used to run as its
+    # final step now executes in the conductor — a pre-spawn dependency-DAG readiness check plus
+    # a post-return pre_judge gate (Conductor._run_judge_pre_judge_gate) that authors
+    # judge_gate_meta.json — so the judge is reached only on a DAG-ready closure and is a pure LLM
+    # semantic pass. It falls through to the `else` below and returns "" (no runbook), mirroring
+    # compile.verify / generate.verify.
     else:
         # Unknown / not-yet-mapped (step, substep): emit no runbook rather than guess.
         return ""
@@ -8453,9 +8437,9 @@ def _build_dependency_facts(request_payload: dict[str, Any]) -> str:
         return ""
     lines = [
         "**Dependency facts (conductor-resolved — orientation for your semantic review, "
-        "NOT a gate argument):** your pre_judge is already scoped to your own pipeline, "
-        "and each dependency's PASS is resolved from your lineage. These are the on-disk "
-        "artifacts each direct dependency was certified to:",
+        "NOT a gate argument):** the conductor runs the pre_judge integrity gate for you "
+        "(you invoke no validator gate); each dependency's PASS is resolved from your "
+        "lineage. These are the on-disk artifacts each direct dependency was certified to:",
     ]
     for dep in deps:
         if not isinstance(dep, dict):
@@ -9226,7 +9210,13 @@ ALLOWED_VALIDATE_PIPELINE_STAGES: dict[tuple[str, str], frozenset[str]] = {
     ("generate", "verify"): frozenset(),
     ("build", ""): frozenset({"post_build"}),
     ("validate", "execute"): frozenset({"post_execute"}),
-    ("validate", "judge"): frozenset({"pre_judge"}),
+    # validate.judge invokes NO validator gate: the `--stage pre_judge` gate it used to own
+    # (orchestration-record integrity + the cross-pipeline dependency DAG) now runs in the
+    # conductor — a pre-spawn DAG readiness check plus a post-return gate that authors
+    # judge_gate_meta.json (Conductor._run_judge_pre_judge_gate) — so the judge leaf is a pure
+    # LLM semantic pass, mirroring compile.verify / generate.verify. The empty set keeps the
+    # table total and makes _build_gate_runbook emit no pre_judge line for judge.
+    ("validate", "judge"): frozenset(),
 }
 
 

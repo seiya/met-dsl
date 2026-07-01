@@ -878,3 +878,91 @@ failed can reopen its producer. Docs reconciled: `WORKFLOW_CORE.md` §100, `AGEN
 `test_dev_verify_severity_gate`, `test_verify_minor_finding_warm_reopens_same_phase`,
 `_read_repair_findings` verify branch, `reopen_phase` accept-verify-fail / reject-verify-pass,
 the dev same-phase-no-repair_strategy terminalize boundary tests.
+
+## G3 — hoist `--stage pre_judge` out of the LLM `Validate.judge` leaf into the conductor (IMPLEMENTED 2026-07-01)
+
+**Problem (the G1/G2 pattern, one more phase down).** The purely-structural `--stage pre_judge` gate
+(orchestration-record integrity + the cross-pipeline dependency DAG) ran *inside* the LLM
+`Validate.judge` leaf as its final step. This is the same "LLM leaf owns a deterministic gate"
+shape G1/G2 removed one and two phases up (`ALLOWED_VALIDATE_PIPELINE_STAGES[(validate, judge)]`
+was `{"pre_judge"}`). Two costs: (a) a full, cold, separate-persona judge ran before a purely
+structural blocker was even checked; (b) in a `--with-deps` run a dependent whose dependency
+closure was not yet built+validated still spawned a cold judge that could only fail.
+
+**Decision — NOT a new deterministic substep; a conductor-owned two-sided gate.** Unlike
+compile/generate, the judge's independent LLM semantic check is essential, so `judge` stays an LLM
+leaf. Only the *gate* is hoisted:
+- **Pre-spawn (`Conductor._judge_pre_spawn_dag_block`).** Before spawning the cold judge — and
+  before running `Validate.execute` (the check is placed at the top of `run_phase` for `validate`)
+  — verify every `spec.ir.yaml.dependency.all_nodes` closure node is built+validated in its own
+  pipeline. It derives the closure from the SAME source and normalization the post-gate uses
+  (`dependency.all_nodes` → normalized `<kind>/<spec_id>` tokens via
+  `validate_pipeline_semantics._dependency_expected_node_keys`, self excluded) and consults the SAME
+  cross-pipeline predicate (`_closure_node_validated_in_own_pipeline`) the `pre_judge` DAG check uses
+  for a closure node absent from the current validation scope. A missing node fails the phase
+  `fail_closed` immediately, with **no record-launch** — so the judge `pre_phase_complete` hook
+  (which would demand a `semantic_review` the leaf never wrote) is never reached. Empty closure
+  (single-node run) → skip, zero overhead. Because it shares both the node-set source and the
+  predicate, it is a rigorous STRICT SUBSET of the post-gate: anything it blocks would also fail
+  `pre_judge`, so it never fails a run the post-gate would pass; it only saves the wasted
+  execute+judge cost. (Reading `all_nodes` directly — not `_dependency_closure_nodes` — also skips
+  that helper's L6 diamond guard, a Build/Model-B staging concern irrelevant to DAG readiness that
+  would otherwise mis-raise for a c/cpp/mixed node at validate.)
+- **Post-return (`Conductor._run_judge_pre_judge_gate`).** After the judge leaf returns its verdict
+  (in `run_substep`, guarded on a clean rc 0 **AND an `aggregate_verdict` of `pass`/`xfail`**), run
+  `validate_pipeline_semantics --stage pre_judge` scoped to this run (`--orchestration-id` /
+  `--in-flight-agent-run-id <judge_arid>` / `--pipeline-root` / `--run-id`, the same scoping the leaf
+  used) — the `_build_inproc` post_build idiom — and author `judge_gate_meta.json` under the run-node
+  dir recording the verdict. **The pass/xfail scope is load-bearing (Codex P1):** `pre_judge`'s
+  `_validate_llm_semantic_review` treats `semantic_review.decision != "pass"` as a violation, so
+  running it on a legitimate physics/evidence `fail` verdict would fail the gate and (via the
+  terminalize below) convert a *routeable* Validate.judge failure into a terminal `fail_closed`,
+  robbing `classify_failure` of the retry/attribution routing. A non-pass verdict therefore skips the
+  gate (no `judge_gate_meta` written) and flows to the decision tables exactly as in the leaf era,
+  where the completion `pre_judge` ran only on a judge terminating `pass`. The structural gate matters
+  only when a node is about to be CERTIFIED `pass`.
+
+**Reconciliation — a `pre_judge` violation is a `fail_closed` integrity blocker, NOT a routeable
+`fail` (deviation from the initial plan, driven by the judge integrity hook).** The plan first
+proposed routing a `pre_judge_violation` to `("generate","reuse")` via a normal `fail`
+step_result. That fights `_pre_phase_complete_judge_checks`: for a launch whose substep is `judge`
+it REQUIRES a `semantic_review.json` and **forbids a `fail` step_result atop a `pass`
+`semantic_review`** (the common case — the judge passed on physics but tripped a structural
+integrity gate). A structural `pre_judge` violation is exactly the documented non-physics `blocked`
+posture ("could not be CERTIFIED due to a non-physics blocker, unrecoverable in the current run"),
+so the coherent terminal is `fail_closed`. Wiring:
+- `determine_substep_status` (validate.judge branch) ANDs `judge_gate_meta.status == "pass"` into
+  the pass condition (verdict pass/xfail AND gate pass), so a gate `fail` on an otherwise-passing
+  judge fails the substep; a missing meta reads as fail too (harmless for the two cases it arises: a
+  crashed judge, or a non-pass verdict that intentionally skipped the gate — both already fail on the
+  verdict check).
+- `run_phase` (after the transport branch, before `write_step_result`) detects
+  `judge_gate_meta.status == "fail"` and terminalizes `fail_closed` WITHOUT writing a step_result
+  (the transport branch's skip-write + tombstone shape) — so `classify_failure` is bypassed and the
+  judge hook is never reached. The pre-spawn block is terminalized `fail_closed` even earlier (no
+  substep runs at all).
+
+**Where implemented.**
+- `tools/workflow_conductor.py`: `_judge_pre_spawn_dag_block` / `_write_judge_gate_meta` /
+  `_run_judge_pre_judge_gate`; the `run_phase` pre-spawn early-return + post-gate `fail_closed`
+  terminalize; the `run_substep` post-gate call; the `determine_substep_status` judge branch.
+- `tools/orchestration_runtime.py`: CP-6 `ALLOWED_VALIDATE_PIPELINE_STAGES[(validate, judge)]` →
+  `frozenset()`; CP-5 `_build_gate_runbook` drops the judge branch (now `""` — mirrors
+  compile.verify / generate.verify); the `_build_dependency_facts` orientation prose updated (the
+  conductor runs pre_judge). **Recording layer kept unchanged** (intentional): `write-step-result`'s
+  `validation_stage` allow-set still lists `pre_judge`, `PHASE_VALIDATION_STAGE["validate"]` stays
+  `pre_judge`, and the `validate_pre_judge_step_result_executor_integrity` / repair machinery is
+  untouched — the conductor now RUNS the gate, but the step_result still records the stage. Timing
+  is preserved: the leaf used to run pre_judge as its LAST step (before the conductor writes the
+  step_result), and the conductor now runs it at that same point (judge child recorded + returned,
+  not yet finalized → `--in-flight-agent-run-id` scoping unchanged).
+
+**Non-regression notes.**
+- Default-on (no env flag), mirroring G1/G2. Real verification is a billed E2E run: a single-node
+  spec (empty closure → pre-spawn skip, post-gate pass → `aggregate_verdict=pass`) and the
+  `demo_dep_top` `--with-deps` chain (multi-node closure → pre-spawn readiness holds → pass).
+- Tests: `G3JudgePreJudgeGateTest` (determine_substep_status verdict∧gate; post-gate pass/fail meta
+  + scoped args; pre-spawn single-node skip / multi-node ready / multi-node incomplete block),
+  `TransportFailureTest.test_pre_spawn_dag_incomplete_fails_closed_without_spawning` /
+  `test_post_gate_pre_judge_violation_fails_closed_and_tombstones`, and the runtime
+  `test_runbook_judge_emits_no_gate` + ALLOWED-table coherence.
