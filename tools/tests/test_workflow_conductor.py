@@ -206,13 +206,14 @@ class ReuseResumeAndFindingsTest(unittest.TestCase):
         return c
 
     def test_resolve_reuse_resume_returns_target_when_resumable(self) -> None:
-        c = self._conductor({"METDSL_CONDUCTOR_REUSE_RESUME": "1"})
+        # Warm resume is always active for a reuse repair (no env gate).
+        c = self._conductor({})
         c._claude_session_resumable = lambda s: True  # type: ignore[assignment]
         repair = {"repair_strategy": "reuse", "repair_target_agent_run_id": "child-1"}
         self.assertEqual(c._resolve_reuse_resume(repair, "generate", "generate"), "child-1")
 
     def test_resolve_reuse_resume_falls_back_cold_when_unresumable(self) -> None:
-        c = self._conductor({"METDSL_CONDUCTOR_REUSE_RESUME": "1"})
+        c = self._conductor({})
         c._claude_session_resumable = lambda s: False  # type: ignore[assignment]
         emitted: list[str] = []
         c.emit = lambda ev, **k: emitted.append(ev)  # type: ignore[assignment]
@@ -220,15 +221,11 @@ class ReuseResumeAndFindingsTest(unittest.TestCase):
         self.assertIsNone(c._resolve_reuse_resume(repair, "generate", "generate"))
         self.assertIn("resume_session_unavailable", emitted)
 
-    def test_resolve_reuse_resume_none_when_flag_off(self) -> None:
-        c = self._conductor({})  # METDSL_CONDUCTOR_REUSE_RESUME unset
-        c._claude_session_resumable = lambda s: True  # type: ignore[assignment]
-        repair = {"repair_strategy": "reuse", "repair_target_agent_run_id": "child-1"}
-        self.assertIsNone(c._resolve_reuse_resume(repair, "generate", "generate"))
-
     def test_resolve_reuse_resume_none_for_restart_strategy(self) -> None:
-        # restart stays cold (no resume) to avoid anchoring on the defective reasoning.
-        c = self._conductor({"METDSL_CONDUCTOR_REUSE_RESUME": "1"})
+        # restart stays cold (no resume) to avoid anchoring on the defective reasoning — this
+        # strategy-driven warm/cold selection is preserved (LLM verify-attributed restarts stay
+        # cold; only reuse repairs warm-resume).
+        c = self._conductor({})
         c._claude_session_resumable = lambda s: True  # type: ignore[assignment]
         repair = {"repair_strategy": "restart", "repair_target_agent_run_id": "child-1"}
         self.assertIsNone(c._resolve_reuse_resume(repair, "generate", "generate"))
@@ -236,8 +233,7 @@ class ReuseResumeAndFindingsTest(unittest.TestCase):
     def test_resolve_reuse_resume_none_for_non_claude_backend(self) -> None:
         # Warm --resume is a claude-only capability.
         c = _FakeConductor(repo_root=Path("/tmp/repo"), orchestration_id="orch_x",
-                           orchestration_agent_run_id="ORCH", backend="codex",
-                           env={"METDSL_CONDUCTOR_REUSE_RESUME": "1"})
+                           orchestration_agent_run_id="ORCH", backend="codex", env={})
         c.calls = []
         c.emit = lambda *a, **k: None  # type: ignore[assignment]
         c._claude_session_resumable = lambda s: True  # type: ignore[assignment]
@@ -245,13 +241,13 @@ class ReuseResumeAndFindingsTest(unittest.TestCase):
         self.assertIsNone(c._resolve_reuse_resume(repair, "generate", "generate"))
 
     def test_resolve_reuse_resume_none_when_no_repair(self) -> None:
-        c = self._conductor({"METDSL_CONDUCTOR_REUSE_RESUME": "1"})
+        c = self._conductor({})
         c._claude_session_resumable = lambda s: True  # type: ignore[assignment]
         self.assertIsNone(c._resolve_reuse_resume(None, "generate", "generate"))
 
     def test_resolve_reuse_resume_none_when_target_placeholder(self) -> None:
         # A reuse repair with no concrete producer arid (literal "none") cannot resume.
-        c = self._conductor({"METDSL_CONDUCTOR_REUSE_RESUME": "1"})
+        c = self._conductor({})
         c._claude_session_resumable = lambda s: True  # type: ignore[assignment]
         repair = {"repair_strategy": "reuse", "repair_target_agent_run_id": "none"}
         self.assertIsNone(c._resolve_reuse_resume(repair, "generate", "generate"))
@@ -270,8 +266,24 @@ class ReuseResumeAndFindingsTest(unittest.TestCase):
                                orchestration_agent_run_id="ORCH", backend="claude", env={})
             self.assertEqual(
                 c._read_repair_findings(refs, "lint_lint_findings"), "C061 argument 'u_l'")
-            # Non lint/static reason -> None (no excerpt threaded).
-            self.assertIsNone(c._read_repair_findings(refs, "verify_minor"))
+            # verify_* reason -> reads the phase's verify meta last_fail_reason. Absent -> None;
+            # present -> returned (generate phase reads source_meta.json).
+            self.assertIsNone(c._read_repair_findings(refs, "verify_minor", "generate"))
+            (meta_dir / "source_meta.json").write_text(
+                json.dumps({"last_fail_reason": "responsibility split violated"}),
+                encoding="utf-8")
+            self.assertEqual(
+                c._read_repair_findings(refs, "verify_minor", "generate"),
+                "responsibility split violated")
+            # compile phase reads ir_meta.json#last_fail_reason instead.
+            ir_dir = repo / refs.ir_ref
+            ir_dir.mkdir(parents=True, exist_ok=True)
+            (ir_dir / "ir_meta.json").write_text(
+                json.dumps({"last_fail_reason": "io_contract recompute-insufficient"}),
+                encoding="utf-8")
+            self.assertEqual(
+                c._read_repair_findings(refs, "verify_minor", "compile"),
+                "io_contract recompute-insufficient")
             # Missing meta file -> None (falls back to full prompt).
             refs2 = wc.NodeRefs(node_key="component/spec_x@0.1.0",
                                 spec_path="spec/component/spec_x",
@@ -324,11 +336,17 @@ class DecisionTableTest(unittest.TestCase):
 
     def test_dev_verify_severity_gate(self) -> None:
         self.assertEqual(wc.classify_verify_severity("none", "dev").action, "advance")
-        self.assertEqual(wc.classify_verify_severity("minor", "dev").action, "retry")
+        # minor (both modes): warm (reuse) SAME-PHASE producer repair — not tolerated, not fail.
+        # (A same-phase target + repair_strategy is what conduct keys the producer reopen on.)
+        for mode in ("dev", "prod"):
+            d = wc.classify_verify_severity("minor", mode)
+            self.assertEqual((d.action, d.target_phase, d.repair_strategy),
+                             ("retry", None, "reuse"), mode)
+        # major/critical: dev hard-fails (fast feedback); prod escalates to the diagnostician.
         self.assertEqual(wc.classify_verify_severity("major", "dev").action, "fail_closed")
         self.assertEqual(wc.classify_verify_severity("critical", "dev").action, "fail_closed")
-        # prod does not hard-fail on major (subject to retry limits elsewhere)
         self.assertEqual(wc.classify_verify_severity("major", "prod").action, "escalate")
+        self.assertEqual(wc.classify_verify_severity("critical", "prod").action, "escalate")
 
 
 class _FakeConductor(wc.Conductor):
@@ -732,10 +750,10 @@ class ConductRoutingTest(unittest.TestCase):
         c.status_fn = status_fn
         c.decision_fn = lambda phase, outcomes: wc.RouteDecision(
             "retry", target_phase="generate", repair_strategy="reuse",
-            reason="lint_lint_findings", same_phase_reopen=True)
+            reason="lint_lint_findings")
         # Stub the on-disk excerpt read so the threading assertion does not need a real
         # lint_meta.json (the disk read itself is covered by ReuseResumeAndFindingsTest).
-        c._read_repair_findings = lambda refs, reason: "C061 argument 'u_l'"  # type: ignore[assignment]
+        c._read_repair_findings = lambda refs, reason, phase=None: "C061 argument 'u_l'"  # type: ignore[assignment]
         status = c.conduct(self._refs(), "generate")
         self.assertEqual(status, "pass")
         reopens = [cap for s, cap in c.calls if s == "reopen-phase"]
@@ -758,7 +776,7 @@ class ConductRoutingTest(unittest.TestCase):
 
     def test_static_finding_warm_reopens_generate_same_phase(self) -> None:
         # A generate.static finding routes retry/generate/reuse(static_*); conduct must do a
-        # SAME-PHASE warm reopen exactly like a lint finding (RouteDecision.same_phase_reopen),
+        # SAME-PHASE warm reopen exactly like a lint finding (same-phase target + reuse),
         # not terminalize like the generic same/downstream branch.
         c = self._conductor()
         state = {"static_failed": False}
@@ -772,7 +790,7 @@ class ConductRoutingTest(unittest.TestCase):
         c.status_fn = status_fn
         c.decision_fn = lambda phase, outcomes: wc.RouteDecision(
             "retry", target_phase="generate", repair_strategy="reuse",
-            reason="static_post_generate_violation", same_phase_reopen=True)
+            reason="static_post_generate_violation")
         status = c.conduct(self._refs(), "generate")
         self.assertEqual(status, "pass")
         reopens = [cap for s, cap in c.calls if s == "reopen-phase"]
@@ -785,7 +803,7 @@ class ConductRoutingTest(unittest.TestCase):
         self.assertEqual(len(gen_writes), 2)
 
     def test_compile_static_finding_warm_reopens_compile_same_phase(self) -> None:
-        # A compile.static finding routes retry/compile/reuse with same_phase_reopen; conduct
+        # A compile.static finding routes retry/compile/reuse (same-phase); conduct
         # must do a SAME-PHASE warm reopen (reopen-phase --from-phase compile) and re-run
         # compile, exactly like a generate.static finding reopens generate.
         c = self._conductor()
@@ -800,7 +818,7 @@ class ConductRoutingTest(unittest.TestCase):
         c.status_fn = status_fn
         c.decision_fn = lambda phase, outcomes: wc.RouteDecision(
             "retry", target_phase="compile", repair_strategy="reuse",
-            reason="compile_static_compile_static_violation", same_phase_reopen=True)
+            reason="compile_static_compile_static_violation")
         status = c.conduct(self._refs(), "compile")
         self.assertEqual(status, "pass")
         reopens = [cap for s, cap in c.calls if s == "reopen-phase"]
@@ -810,6 +828,85 @@ class ConductRoutingTest(unittest.TestCase):
         compile_writes = [cap for s, cap in c.calls
                           if s == "write-step-result" and cap["--step"] == "compile"]
         self.assertEqual(len(compile_writes), 2)
+
+    def test_verify_minor_finding_warm_reopens_same_phase(self) -> None:
+        # A minor verify finding is NOT tolerated: it routes retry/reuse (same-phase)
+        # (via classify_verify_severity), so conduct warm-reopens the phase and re-runs the
+        # producer (compile.generate) to fix it — instead of passing/terminalizing.
+        c = self._conductor()
+        state = {"verify_failed": False}
+
+        def status_fn(phase, substep, n):
+            if phase == "compile" and substep == "verify" and not state["verify_failed"]:
+                state["verify_failed"] = True
+                return "fail"
+            return "pass"
+
+        c.status_fn = status_fn
+        c.decision_fn = lambda phase, outcomes: wc.classify_verify_severity("minor", "prod")
+        status = c.conduct(self._refs(), "compile")
+        self.assertEqual(status, "pass")
+        reopens = [cap for s, cap in c.calls if s == "reopen-phase"]
+        self.assertEqual(len(reopens), 1)
+        self.assertEqual(reopens[0]["--from-phase"], "compile")
+        compile_writes = [cap for s, cap in c.calls
+                          if s == "write-step-result" and cap["--step"] == "compile"]
+        self.assertEqual(len(compile_writes), 2)  # verify-fail attempt, then clean attempt
+
+    def test_escalate_same_phase_producer_reopens_via_normalization(self) -> None:
+        # The escalate diagnostician routes a same-phase producer re-run, but its directive
+        # carries NO repair_strategy (_parse_directive omits it). conduct must NORMALIZE that to
+        # `restart` (cold) so the same-phase producer reopen actually fires — not terminalize.
+        # This drives the real escalate→normalize path with the no-strategy decision the
+        # diagnostician actually emits (not a hand-constructed restart, which would mask the gap).
+        c = self._conductor()
+        state = {"verify_failed": False}
+
+        def status_fn(phase, substep, n):
+            if phase == "compile" and substep == "verify" and not state["verify_failed"]:
+                state["verify_failed"] = True
+                return "fail"
+            return "pass"
+
+        c.status_fn = status_fn
+        c.decision_fn = lambda phase, outcomes: wc.RouteDecision("escalate", reason="unclassified")
+        # The diagnostician's parsed directive: re-run this phase's producer, NO strategy.
+        c.escalate = lambda refs, phase, outcome: wc.RouteDecision(  # type: ignore[assignment]
+            "retry", target_phase="compile", reason="diagnostician_regenerate_ir")
+        status = c.conduct(self._refs(), "compile")
+        self.assertEqual(status, "pass")
+        reopens = [cap for s, cap in c.calls if s == "reopen-phase"]
+        self.assertEqual(len(reopens), 1)
+        self.assertEqual(reopens[0]["--from-phase"], "compile")
+        compile_writes = [cap for s, cap in c.calls
+                          if s == "write-step-result" and cap["--step"] == "compile"]
+        self.assertEqual(len(compile_writes), 2)
+
+    def test_escalate_ambiguous_null_target_terminalizes(self) -> None:
+        # An ambiguous diagnostician directive (target_phase=None — the schema permits null) must
+        # NOT be normalized into a same-phase producer restart; it terminalizes as malformed.
+        c = self._conductor()
+        c.status_fn = lambda phase, substep, n: "fail" if (phase == "compile" and substep == "verify") else "pass"
+        c.decision_fn = lambda phase, outcomes: wc.RouteDecision("escalate", reason="unclassified")
+        c.escalate = lambda refs, phase, outcome: wc.RouteDecision(  # type: ignore[assignment]
+            "retry", target_phase=None, reason="diag_ambiguous")
+        status = c.conduct(self._refs(), "compile")
+        self.assertIn(status, ("fail", "fail_closed"))
+        self.assertEqual([s for s, _ in c.calls if s == "reopen-phase"], [])
+
+    def test_escalate_same_phase_build_validate_does_not_reopen(self) -> None:
+        # The same-phase producer reopen is scoped to compile/generate (the only phases with a
+        # re-runnable LLM producer + reopen_phase carve-out). A diagnostician same-phase decision
+        # for validate (even with an explicit restart) must NOT fire the producer-reopen branch
+        # (which would crash reopen_phase) — it terminalizes.
+        c = self._conductor()
+        c.status_fn = lambda phase, substep, n: "fail" if (phase == "validate" and substep == "judge") else "pass"
+        c.decision_fn = lambda phase, outcomes: wc.RouteDecision("escalate", reason="unclassified")
+        c.escalate = lambda refs, phase, outcome: wc.RouteDecision(  # type: ignore[assignment]
+            "retry", target_phase="validate", repair_strategy="restart", reason="diag")
+        status = c.conduct(self._refs(), "validate")
+        self.assertIn(status, ("fail", "fail_closed"))
+        self.assertEqual([s for s, _ in c.calls if s == "reopen-phase"], [])
 
     def test_fail_closed_on_spec_attribution(self) -> None:
         c = self._conductor()
@@ -832,12 +929,13 @@ class ConductRoutingTest(unittest.TestCase):
         self.assertEqual(len(reopens), wc.MAX_ATTEMPTS_PER_PHASE)
 
     def test_same_phase_retry_terminalises_without_retry_decisions(self) -> None:
-        # In-place retry is intentionally not done; a same-phase "retry" decision
-        # (e.g. verify-minor) terminalizes via conduct rather than emitting the
-        # error-prone retry_decisions bookkeeping.
+        # In-place retry is intentionally not done; a same-phase "retry" decision with NO
+        # repair_strategy (a malformed/unflagged retry) terminalizes via conduct rather than
+        # emitting the error-prone retry_decisions bookkeeping. (A real verify-minor carries
+        # repair_strategy=reuse and warm-reopens the producer — covered separately.)
         c = self._conductor()
         c.status_fn = lambda phase, substep, n: "fail" if (phase == "compile" and substep == "verify") else "pass"
-        c.decision_fn = lambda phase, outcomes: wc.RouteDecision("retry", reason="verify_minor")
+        c.decision_fn = lambda phase, outcomes: wc.RouteDecision("retry", reason="unflagged_retry")
         status = c.conduct(self._refs(), "compile")
         self.assertIn(status, ("fail", "fail_closed"))
         self.assertEqual([s for s, _ in c.calls if s == "reopen-phase"], [])  # no cross-phase reopen
@@ -951,14 +1049,15 @@ class DevPhaseRollbackTest(unittest.TestCase):
         self.assertNotEqual(ss.get("--reason-code"), "dev_phase_rollback")
 
     def test_dev_intra_phase_same_phase_retry_not_rollback(self) -> None:
-        # A same-phase decision (target == current phase, e.g. verify-minor) is intra-phase,
-        # not a backward rollback: dev terminalizes it as plain `fail` (no in-place retry at
+        # A same-phase decision (target == current phase) WITHOUT a repair_strategy (so it is not
+        # a producer reopen) is intra-phase, not a backward rollback: dev terminalizes it as plain
+        # `fail` (no in-place retry at
         # conduct level), NOT a dev_phase_rollback fail_closed. The within-phase substep loop
         # (generate.generate -> generate.verify -> regenerate) is what dev keeps; this asserts
         # the conduct gate does not mistake a same-phase route for a cross-phase rollback.
         c = self._conductor("dev")
         c.status_fn = lambda phase, substep, n: "fail" if (phase == "compile" and substep == "verify") else "pass"
-        c.decision_fn = lambda phase, outcomes: wc.RouteDecision("retry", reason="verify_minor")
+        c.decision_fn = lambda phase, outcomes: wc.RouteDecision("retry", reason="unflagged_retry")
         status = c.conduct(self._refs(), "compile")
         self.assertEqual(status, "fail")  # same-phase terminal, not fail_closed
         self.assertEqual([s for s, _ in c.calls if s == "reopen-phase"], [])
@@ -1463,10 +1562,6 @@ class LeafSpawnTest(unittest.TestCase):
              "--session-id", "new-arid", "-p", "P"],
         )
 
-    def test_reuse_resume_flag_default_off(self) -> None:
-        self.assertFalse(self._c(env={})._reuse_resume_enabled())
-        self.assertTrue(self._c(env={"METDSL_CONDUCTOR_REUSE_RESUME": "1"})._reuse_resume_enabled())
-
     def test_nonzero_leaf_exit_fails_substep(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             c = _FakeConductor(repo_root=Path(tmp), orchestration_id="o",
@@ -1554,21 +1649,18 @@ class LeafSpawnTest(unittest.TestCase):
                 c.run_substep(refs, "generate", "generate", repair=repair)
             return cap
 
-        # flag ON + reuse → resume the producer session; new arid pinned as session_id.
-        cap = run({"METDSL_CONDUCTOR_REUSE_RESUME": "1"}, reuse)
+        # reuse → always resume the producer session (no env gate); new arid pinned as session_id.
+        cap = run({}, reuse)
         self.assertEqual(cap.get("session_id"), "child-1")
         self.assertEqual(cap.get("resume_session_id"), "producer-arid")
-        # flag OFF → no resume even on reuse (session_id still pinned).
-        off = run({}, reuse)
-        self.assertEqual(off.get("session_id"), "child-1")
-        self.assertIsNone(off.get("resume_session_id"))
-        # restart never resumes (avoid anchoring on the defective reasoning), flag or not.
-        restart = run({"METDSL_CONDUCTOR_REUSE_RESUME": "1"},
+        # restart never resumes (avoid anchoring on the defective reasoning) — the strategy-driven
+        # warm/cold selection is preserved.
+        restart = run({},
                       {"repair_strategy": "restart", "repair_target_agent_run_id": "producer-arid"})
         self.assertIsNone(restart.get("resume_session_id"))
 
     def test_run_substep_reuse_resume_cold_fallback_when_session_missing(self) -> None:
-        """flag ON + reuse but the producer session transcript is gone → cold launch
+        """reuse but the producer session transcript is gone → cold launch
         (drop resume_session_id) instead of failing the leaf with `--resume <missing>`."""
         refs = wc.NodeRefs(node_key="component/spec_x@0.1.0", spec_path="spec/component/spec_x",
                            ir_id="x_1_001", pipeline_id="x_1_001", source_id="src_1")
@@ -1576,8 +1668,7 @@ class LeafSpawnTest(unittest.TestCase):
         cap: dict = {}
         with tempfile.TemporaryDirectory() as tmp:
             c = _FakeConductor(repo_root=Path(tmp), orchestration_id="o",
-                               orchestration_agent_run_id="ORCH", backend="claude",
-                               env={"METDSL_CONDUCTOR_REUSE_RESUME": "1"})
+                               orchestration_agent_run_id="ORCH", backend="claude", env={})
             c.calls = []
 
             def spawn(prompt, env_, **kw):
@@ -3239,7 +3330,6 @@ class DeterministicCompileStaticTest(unittest.TestCase):
             self.assertEqual((d.action, d.target_phase, d.repair_strategy),
                              ("retry", "compile", "reuse"))
             self.assertTrue(d.reason.startswith("compile_static_"))
-            self.assertTrue(d.same_phase_reopen)
 
     def test_compile_verify_requires_fresh_ir_meta(self) -> None:
         # compile.verify is a pure-semantic pass whose sole deliverable is ir_meta.json. It must

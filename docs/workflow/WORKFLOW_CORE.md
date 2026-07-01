@@ -97,7 +97,7 @@ This document defines the workflow's phase sequence, inter-phase input/output co
 - `validate_meta.json` requires the common keys above, and only when `verification_status=pass` requires the evidence of the LLM semantic check in `judge_command_ref`.
 - With `debug_mode=false`, do not save failed-attempt artifacts. When saved with `debug_mode=true`, record the saved count and storage location in metadata.
 - The execution mode at workflow start is specified by `--mode` of `tools/run_workflow.py`, with a default of `dev`.
-- In `dev` mode, the `verify substep` can continue treating only `issue_severity=minor` as a minor problem, and must treat `major` / `critical` as `fail`.
+- A `verify substep` finding is **not tolerated** — it sets `verification_status=fail` regardless of severity, and the conductor routes by `issue_severity`: `minor` → a **warm (reuse) same-phase repair** (re-run the phase's producer substep, resuming its session, to fix the exact finding); `major` / `critical` → `dev`: `fail_closed` (fast operator feedback) / `prod`: `escalate` (the diagnostician decides reuse/restart/reopen/fail_closed). A `minor` finding is never left unaddressed (no "continue/pass with a minor note").
 - When the workflow `fail` in `dev` mode, it must generate `workspace/orchestrations/<orchestration_id>/failure_analysis.json` and record the failure reason, the related `agent_run`, the related `step_result`, and an auxiliary log summary.
 
 ### Agent hierarchical execution

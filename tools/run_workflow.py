@@ -1062,13 +1062,12 @@ def main(argv: list[str] | None = None) -> int:
     base_env["METDSL_WORKFLOW_MODE"] = "1"
     base_env["METDSL_WORKFLOW_EXEC_MODE"] = workflow_mode
     base_env["METDSL_MISSING_ORCHESTRATION_ID_POLICY"] = "strict"
-    # Warm-resume minor-fix repairs (claude only): a generate.lint / generate.static /
-    # compile.static finding (and the build->generate reuse repairs) re-run the phase's producer
-    # substep (generate.generate / compile.generate) by resuming the prior leaf's session with
-    # context intact, instead of a cold restart — avoiding the cold-start re-read cost. The
-    # conductor falls back to a cold launch if the session is gone.
-    # Respect an explicit operator override (e.g. set to "0" to force cold).
-    base_env.setdefault("METDSL_CONDUCTOR_REUSE_RESUME", "1")
+    # Warm-resume minor-fix repairs are ALWAYS active (claude only; no env gate): a
+    # generate.lint / generate.static / compile.static finding (and the build->generate reuse
+    # repairs) re-run the phase's producer substep (generate.generate / compile.generate) by
+    # resuming the prior leaf's session with context intact, instead of a cold restart —
+    # avoiding the cold-start re-read cost. `restart` repairs stay cold (anchoring avoidance).
+    # The conductor falls back to a cold launch if the producer session transcript is gone.
     base_env["PYTHONPATH"] = str(repo_root) + (
         f":{base_env['PYTHONPATH']}" if base_env.get("PYTHONPATH") else ""
     )

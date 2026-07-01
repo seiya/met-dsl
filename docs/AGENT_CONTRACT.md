@@ -37,7 +37,7 @@
 - If `skill_name` and `skill_ref` are unspecified, stop with fail. Read only the single file `skill_ref` specified in the launch prompt, and **do not additionally Read a SKILL.md of any phase other than your own**.
 - **Do not `Read` anything under `skills/workflow-orchestration/references/` (including `launch_prompts.md`).** It is a conductor-side render template, not in the `read_manifest`, and is blocked fail-closed by `read_manifest_read_guard`. The required contract is this file (`docs/AGENT_CONTRACT.md`), your launch prompt, `docs/`, and the `skill_ref` / `skill_must_read_refs` passed at launch; resolve all requirements from those sources only.
 - On input shortage, do not complete by guessing; stop with fail.
-- With `workflow_mode=dev`, stop with fail the moment `issue_severity=major|critical` is detected in a verify-family judgment.
+- A verify-family finding always sets `verification_status=fail` (record `issue_severity` accurately); `minor` is not tolerated/passed. With `workflow_mode=dev`, a `major|critical` verify finding stops with fail immediately (the conductor warm-repairs `minor`).
 - When it fails with `workflow_mode=dev`, include in the reply the basis needed to generate `failure_analysis.json` (the failure reason, related output_refs, a summary of the main logs).
 
 ## Workflow behavioral invariants (every leaf)

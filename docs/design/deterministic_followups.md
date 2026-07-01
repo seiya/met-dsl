@@ -626,8 +626,9 @@ not index. It also makes the three substep-aware phases symmetric:
 - `determine_substep_status` and `classify_failure` gain `generate.static` branches reading
   `static_meta.json`.
 - The same-phase warm-reopen guard in `conduct` widened from `.startswith("lint_")` to
-  `.startswith(("lint_", "static_"))`. (Cleaner long-term form: a `same_phase_reopen` bool on
-  `RouteDecision`; deferred for minimal diff.)
+  `.startswith(("lint_", "static_"))`. (Later superseded — see the "Same-phase producer reopen is
+  now a first-class routing outcome" note below: the guard is now the structural condition
+  same-phase target + concrete `repair_strategy`, no route-reason prefix and no flag.)
 - `build_launch_request` gains a `static` arm with `allowed_output_paths=[<src>/static_meta.json]`.
   `static_meta.json` is intentionally NOT a `phase_required_outputs` entry (parity with
   `lint_meta.json`); the substep freshness gate covers it.
@@ -655,7 +656,7 @@ workspace_root leaf responsibility (old Operations Rules 6/7). `phase_02_generat
 ### G1-slim — slim warm-resume repair turn (findings-only prompt)
 
 **Context.** The `lint`/`static` finding reopen re-runs `generate.generate` with
-`repair_strategy=reuse`, which (claude, `METDSL_CONDUCTOR_REUSE_RESUME=1`) warm-`--resume`s the
+`repair_strategy=reuse`, which (claude) warm-`--resume`s the
 producer leaf's session so its context is intact. Empirically that already roughly halves the
 generate substep wall-time (one observed node: 544s cold → 225s warm). But the warm turn still
 re-sent the **full ~11.5KB cold-start prompt** and did **not** include the findings: `lint` runs
@@ -675,19 +676,24 @@ dependency facts and gate runbook (the resumed leaf already holds them). The win
 the warm leaf already skips re-reading the must-read docs on its own. Token cost drops ~11.5KB→
 ~1–2KB as a secondary benefit.
 
-**Gate.** Behind its own opt-in env `METDSL_CONDUCTOR_REUSE_SLIM_PROMPT` (default off), so slim is
-verified/rolled back independently while `METDSL_CONDUCTOR_REUSE_RESUME` stays on. Slim applies
-**only** when a warm resume is actually resolved (session resumable); a cold fallback keeps the
-full prompt unchanged.
+**Gate.** Always-on — the former opt-in env flags `METDSL_CONDUCTOR_REUSE_SLIM_PROMPT` and
+`METDSL_CONDUCTOR_REUSE_RESUME` were removed (warm resume + slim are now the default). Slim applies
+**only** when a warm resume is actually resolved (session resumable) AND a findings excerpt is
+present — i.e. the `Generate.lint`/`Generate.static`/`Compile.static` deterministic-gate reopens;
+a warm reuse without findings (e.g. a cross-phase code repair) or a cold fallback keeps the full
+prompt unchanged. The warm/cold selection itself stays driven by `repair_strategy`
+(`reuse`→warm, `restart`→cold).
 
 **Where implemented.**
 - `tools/workflow_conductor.py`: `_resolve_reuse_resume` (extracted from `run_substep` so the
   resume decision is made **before** `build_launch_request` — the slim/full choice, the
   `record_launch`-persisted prompt and the `spawn_leaf` args must all agree); `_read_repair_findings`
-  (reads the failed source's `{lint,static}_meta.json` `failure_excerpt` at the reopen point, before
-  source-id rotation); `_repair_payload(..., findings=...)` → `repair_findings`; `build_launch_request`
-  gains `warm_resume` → sets `req["warm_resume"]` and empties `skill_must_read_refs`;
-  `_reuse_slim_prompt_enabled`.
+  (reads the failed source's `{lint,static,compile_static}_meta.json` `failure_excerpt` at the reopen
+  point, before id rotation); `_repair_payload(..., findings=...)` → `repair_findings`;
+  `build_launch_request` sets `req["warm_resume"]` (when a warm resume resolved AND findings present)
+  and empties `skill_must_read_refs`. (Update 2026-06-30: warm resume + slim are now ALWAYS-ON — the
+  former opt-in env flags and their `_reuse_resume_enabled` / `_reuse_slim_prompt_enabled` gates were
+  removed; `run_substep` sets `warm_resume = resume_session_id is not None`.)
 - `tools/orchestration_runtime.py`: `_is_slim_repair_request` + `SLIM_REPAIR_PROMPT_SENTINEL` +
   `_render_slim_repair_launch_prompt` (built directly like the deterministic prompt, branched in
   `_render_launch_prompt_template`); `prepare_launch_request_payload` empties `skill_must_read_refs`
@@ -785,11 +791,11 @@ false-fail when source_meta is fresh).
   widen the `deterministic` predicate); `determine_substep_status` / `_is_deterministic_substep` /
   `_run_deterministic_substep` / `classify_failure` compile.static branches.
 - **Same-phase reopen generalized.** The conduct() warm-reopen guard was hardcoded to
-  `target=="generate"` + a route-reason prefix match. With compile now a third same-phase-reopen case,
-  it is keyed on a new `RouteDecision.same_phase_reopen` bool (set by
-  `classify_{lint,static,compile_static}_failure`) and `target == phase`; `reopen_phase(from_phase=phase)`
-  and `_read_repair_findings` (reads `compile_static_meta.json` under `ir_ref` for a `compile_static_*`
-  reason) are generalized off the hardcoded "generate".
+  `target=="generate"` + a route-reason prefix match. It was generalized to `target == phase` with
+  `reopen_phase(from_phase=phase)` and a phase-aware `_read_repair_findings`. (The signal went
+  through a brief `RouteDecision.same_phase_reopen` bool, then was finalized as the structural
+  condition `same-phase target + repair_strategy ∈ {reuse, restart}` — see the verify-minor section
+  near the end of this doc; the bool was removed.)
 - `tools/orchestration_runtime.py` enforcement sites (the G1 checklist, compile analog): CP-1
   `_allowed_output_paths_for_launch` authorizes `compile_static_meta.json` for `substep=="static"`
   ONLY (the compile contract is an exact-set match, so this is load-bearing — without it record-launch
@@ -810,3 +816,65 @@ false-fail when source_meta is fresh).
 - Doc-size: `phase_01_compile.md` ceiling bumped 17000→18200 (it is force-read by compile.generate/verify;
   the Compile.static documentation + the "verify is now pure semantic" note add ~1.3KB).
 - Default-on (no env flag), mirroring G1.static. Real verification is a billed E2E run.
+
+## Verify-minor → warm same-phase repair; warm-resume/slim always-on (2026-06-30)
+
+Two operator-directed changes to the repair loop, on top of G2:
+
+**Warm-resume + slim are now always-on (env flags removed).** The opt-in env flags
+`METDSL_CONDUCTOR_REUSE_RESUME` / `METDSL_CONDUCTOR_REUSE_SLIM_PROMPT` and their
+`_reuse_resume_enabled` / `_reuse_slim_prompt_enabled` gates were deleted. `_resolve_reuse_resume`
+warm-`--resume`s (forks) the producer session for ANY `repair_strategy=reuse` repair (claude,
+session resumable); `restart` stays cold (anchoring avoidance) — so warm/cold is driven purely by
+`repair_strategy`. `run_substep` sets `warm_resume = resume_session_id is not None`, and the slim
+findings-only turn is rendered whenever a warm resume fires AND a findings excerpt is present.
+
+**A verify finding is no longer tolerated — `minor` warm-repairs the producer.** Previously a
+`minor` verify finding was a non-blocking note (the leaf could pass with it; "minor exception
+allowed" in prod), deferring real correctness to Validate (hybrid-verification). Per operator
+decision that is reversed: a verify finding ALWAYS sets `verification_status=fail`, and
+`classify_verify_severity` routes by severity —
+- `minor` → `RouteDecision(retry, repair_strategy=reuse)`: a SAME-PHASE warm reopen of the phase's
+  producer (`compile.generate` / `generate.generate`) with the finding injected (slim).
+  `_read_repair_findings` gained a `verify_*` branch reading the phase's verify meta
+  `last_fail_reason` (compile→`ir_meta.json`, generate→`source_meta.json`).
+- `major`/`critical` → `dev`: `fail_closed` (fast operator feedback); `prod`: `escalate` → the
+  diagnostician decides how far back to go — including the SAME phase's own producer (see below).
+
+**Same-phase producer reopen is now a first-class routing outcome (not deterministic-gate-only).**
+The conductor's same-phase branch was generalized: a decision that targets the current phase
+(`compile`/`generate` only — the phases with a re-runnable LLM producer) with `action ∈ {retry,
+reopen}` and `repair_strategy ∈ {reuse, restart}` re-runs the phase's producer (rotating its id;
+`reuse`→warm, `restart`→cold), instead of terminalizing. This covers the deterministic gates and
+verify-minor (`reuse`→warm) AND the escalate **diagnostician** when it judges the right recovery
+level is "this phase's own producer" (e.g. a major IR defect regenerated from scratch). The previous
+"a same-phase decision terminalizes" rule was a vestige of the era before the same-phase reopen
+mechanism existed (it predated lint/static); the escalate path was never updated, so a diagnostician
+that wanted to re-run `compile.generate` terminalized.
+
+Two subtleties made this actually reachable + crash-safe (found in review):
+- The diagnostician's parsed directive carries NO `repair_strategy` (`_parse_directive` omits it for
+  `reopen` and the schema doesn't require it for `retry`), so a same-phase diagnostician decision
+  would not satisfy the branch's `repair_strategy ∈ {reuse, restart}` guard. Fix: after `escalate`,
+  conduct **normalizes** a same-phase (`compile`/`generate`) `retry`/`reopen` decision with no
+  concrete strategy to `restart` (cold — an escalated failure is significant; an explicit
+  reuse/restart/re_execute is preserved, and `_parse_directive` now keeps the strategy for `reopen`).
+- The branch is **scoped to `compile`/`generate`**. Without that scope, a diagnostician same-phase
+  `validate`/`build` decision (e.g. `retry/validate/restart`) would fire the branch and call
+  `reopen_phase` with a phase its carve-out doesn't support → `RuntimeError` (uncaught) → conductor
+  crash. Scoped out, such a decision terminalizes (build/validate have no producer-reopen).
+
+The redundant `RouteDecision.same_phase_reopen` bool (briefly added) was **removed** — the structural
+condition (same-phase compile/generate target + concrete `repair_strategy`) is the signal; a
+same-phase decision with NO `repair_strategy` that did NOT come from `escalate` (a malformed/unflagged
+retry) still terminalizes.
+
+**Anti-abuse guard narrowly relaxed.** `reopen_phase`'s same-phase carve-out previously forbade a
+`verify` trigger (only `lint`/`static`/`compile_static`). It now allows a `compile.verify` /
+`generate.verify` trigger too — but ONLY a terminal NON-PASS one (the existing pass-check still
+rejects a passing trigger), so a passing pipeline still can never be erased; only a verify that
+failed can reopen its producer. Docs reconciled: `WORKFLOW_CORE.md` §100, `AGENT_CONTRACT.md`,
+`ORCHESTRATION.md`, both verify SKILLs (minor no longer tolerated). Tests:
+`test_dev_verify_severity_gate`, `test_verify_minor_finding_warm_reopens_same_phase`,
+`_read_repair_findings` verify branch, `reopen_phase` accept-verify-fail / reject-verify-pass,
+the dev same-phase-no-repair_strategy terminalize boundary tests.

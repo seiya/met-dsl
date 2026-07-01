@@ -31,7 +31,7 @@ import shlex
 import shutil
 import subprocess
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -200,11 +200,6 @@ class RouteDecision:
     target_phase: str | None = None
     repair_strategy: str | None = None
     reason: str | None = None
-    # True when this is a deterministic-gate finding (lint/static/compile.static) that
-    # warm-resumes the SAME phase's producer substep instead of terminalizing. Set by the
-    # classify_*_failure helpers below and consumed by conduct()'s same-phase reopen guard,
-    # replacing the former fragile route-reason prefix match.
-    same_phase_reopen: bool = False
 
 
 class SandboxEnforcementError(RuntimeError):
@@ -232,7 +227,7 @@ def classify_lint_failure(failure_category: str | None) -> RouteDecision:
         return RouteDecision("escalate", reason=f"lint_unknown_category:{failure_category}")
     target, strategy = routed
     return RouteDecision("retry", target_phase=target, repair_strategy=strategy,
-                         reason=f"lint_{failure_category}", same_phase_reopen=True)
+                         reason=f"lint_{failure_category}")
 
 
 def classify_static_failure(failure_category: str | None) -> RouteDecision:
@@ -243,7 +238,7 @@ def classify_static_failure(failure_category: str | None) -> RouteDecision:
         return RouteDecision("escalate", reason=f"static_unknown_category:{failure_category}")
     target, strategy = routed
     return RouteDecision("retry", target_phase=target, repair_strategy=strategy,
-                         reason=f"static_{failure_category}", same_phase_reopen=True)
+                         reason=f"static_{failure_category}")
 
 
 def classify_compile_static_failure(failure_category: str | None) -> RouteDecision:
@@ -255,7 +250,7 @@ def classify_compile_static_failure(failure_category: str | None) -> RouteDecisi
                              reason=f"compile_static_unknown_category:{failure_category}")
     target, strategy = routed
     return RouteDecision("retry", target_phase=target, repair_strategy=strategy,
-                         reason=f"compile_static_{failure_category}", same_phase_reopen=True)
+                         reason=f"compile_static_{failure_category}")
 
 
 def classify_validate_judge(failure_class: str | None, attribution: str | None) -> RouteDecision:
@@ -281,14 +276,20 @@ def classify_validate_judge(failure_class: str | None, attribution: str | None) 
 
 
 def classify_verify_severity(issue_severity: str | None, workflow_mode: str) -> RouteDecision:
-    """dev-mode verify/judge severity gate: major|critical => fail, minor => retry."""
+    """verify severity gate. A verify finding is NOT tolerated — it routes by severity:
+    - minor          => warm (reuse) SAME-PHASE repair: re-run the phase's producer substep
+                        (compile.generate / generate.generate) resuming its session, with the
+                        finding injected (slim), to fix the exact issue inheriting its context.
+    - major|critical => dev: fail_closed (fast operator feedback); prod: escalate (the
+                        diagnostician decides reuse/restart/reopen/fail_closed)."""
     sev = (issue_severity or "none").lower()
     if sev in ("none", ""):
         return RouteDecision("advance")
     if workflow_mode == "dev" and sev in ("major", "critical"):
         return RouteDecision("fail_closed", reason=f"dev_verify_{sev}")
     if sev == "minor":
-        return RouteDecision("retry", reason="verify_minor")
+        return RouteDecision("retry", repair_strategy="reuse",
+                             reason="verify_minor")
     return RouteDecision("escalate", reason=f"verify_severity_{sev}")
 
 
@@ -365,7 +366,9 @@ def _parse_directive(stdout: str) -> RouteDecision | None:
     if action == "reopen":
         if target is None:
             return None
-        return RouteDecision("reopen", target_phase=target, reason=reason)
+        # Preserve repair_strategy for reopen too: both the SAME-phase producer reopen and the
+        # cross-phase reopen honor it (reuse → warm-resume the producer, restart/none → cold).
+        return RouteDecision("reopen", target_phase=target, repair_strategy=strategy, reason=reason)
     return RouteDecision("retry", target_phase=target, repair_strategy=strategy, reason=reason)
 
 
@@ -775,41 +778,25 @@ class Conductor:
             raise RuntimeError(f"new_agent_run_id failed: {proc.stderr.strip()}")
         return proc.stdout.strip()
 
-    def _reuse_resume_enabled(self) -> bool:
-        """Opt-in (default off) for minor-fix reuse session resume (claude only).
-        Off by default until verified by a live integration run; toggled via env
-        `METDSL_CONDUCTOR_REUSE_RESUME` (run_workflow.py sets it for live runs)."""
-        return str(self.env.get("METDSL_CONDUCTOR_REUSE_RESUME", "")).strip().lower() in {
-            "1", "true", "yes",
-        }
-
-    def _reuse_slim_prompt_enabled(self) -> bool:
-        """Opt-in (default off) for the SLIM warm-resume repair turn. Gates only slim-vs-full
-        within the already-warm reuse path (so `METDSL_CONDUCTOR_REUSE_RESUME` can stay on
-        while slim is verified/rolled back independently); toggled via env
-        `METDSL_CONDUCTOR_REUSE_SLIM_PROMPT`. When on AND a warm resume actually fires AND
-        the findings excerpt is available, the conductor sends a ~1-2KB findings-only turn
-        instead of re-injecting the full cold-start prompt the resumed leaf already holds."""
-        return str(self.env.get("METDSL_CONDUCTOR_REUSE_SLIM_PROMPT", "")).strip().lower() in {
-            "1", "true", "yes",
-        }
-
     def _resolve_reuse_resume(self, repair: dict[str, str] | None,
                               phase: str, substep: str | None) -> str | None:
         """The producer session id to warm-`--resume`, or None for a cold launch.
 
         Resolved BEFORE building the launch request (not after) so the slim-vs-full prompt
         choice, what `record_launch` persists, and what `spawn_leaf` actually sends all stay
-        consistent. Minor-fix reuse (claude only, opt-in): resume the producer leaf's session
-        so the repair inherits its context (and design intent) instead of cold-starting;
-        `restart` stays cold (no resume) to avoid anchoring on the defective reasoning. The
+        consistent. Warm resume is ALWAYS active for a `reuse` repair (claude only): resume the
+        producer leaf's session so the repair inherits its context (and design intent) instead
+        of cold-starting. The warm/cold choice is therefore driven by the failure
+        classification's `repair_strategy`: deterministic-gate findings (lint/static/
+        compile_static) route `reuse` -> warm; `restart` stays cold (no resume) to avoid
+        anchoring on the defective reasoning — that strategy-driven selection is intentionally
+        preserved (LLM verify-attributed restarts stay cold; reuse repairs warm-resume). The
         producer's session id == its agent_run_id (pinned via --session-id at its own launch),
         so it is addressable by repair_target_agent_run_id. Warm-resume only if the producer's
         session transcript still exists (Claude Code may have expired/GC'd it); if it is gone,
         fall back to a cold launch (return None) rather than letting `claude --resume <missing>`
         fail the leaf and fail-close the phase."""
         if not (self.backend == "claude"
-                and self._reuse_resume_enabled()
                 and repair is not None
                 and repair.get("repair_strategy") == "reuse"):
             return None
@@ -2469,7 +2456,11 @@ clean:
         deterministic = self._is_deterministic_substep(phase, substep)
         resume_session_id = (None if deterministic
                              else self._resolve_reuse_resume(repair, phase, substep))
-        warm_resume = resume_session_id is not None and self._reuse_slim_prompt_enabled()
+        # Slim repair turn is always used when a warm resume actually fires (build_launch_request
+        # further requires a findings excerpt to be present, so in practice slim is scoped to the
+        # deterministic-gate reopens — lint/static/compile_static — which carry one; a warm reuse
+        # without findings, e.g. a cross-phase code repair, still re-sends the full prompt).
+        warm_resume = resume_session_id is not None
         request = build_launch_request(
             refs, step=phase, substep=substep,
             orchestration_id=self.orchestration_id,
@@ -2622,14 +2613,20 @@ clean:
             payload["repair_findings"] = findings.strip()
         return payload
 
-    def _read_repair_findings(self, refs: NodeRefs, reason: str | None) -> str | None:
-        """The failing artifact's deterministic-gate `failure_excerpt`, selected by the route
-        reason (`lint_*` -> source/lint_meta.json, `static_*` -> source/static_meta.json,
-        `compile_static_*` -> ir/compile_static_meta.json). Read at the conduct reopen point
-        where `refs` still names the FAILED artifact (rotation to the fresh id happens later,
-        inside run_phase -> _ensure_fresh_producer_id). Returns None when unavailable so the
-        repair simply falls back to the full prompt."""
+    def _read_repair_findings(self, refs: NodeRefs, reason: str | None,
+                              phase: str | None = None) -> str | None:
+        """The failing artifact's finding text to inject into the (warm/slim) repair, selected
+        by the route reason:
+          `lint_*`           -> source/lint_meta.json#failure_excerpt
+          `static_*`         -> source/static_meta.json#failure_excerpt
+          `compile_static_*` -> ir/compile_static_meta.json#failure_excerpt
+          `verify_*`         -> the phase's verify meta #last_fail_reason
+                                (compile -> ir/ir_meta.json, generate -> source/source_meta.json)
+        Read at the conduct reopen point where `refs` still names the FAILED artifact (rotation
+        to the fresh id happens later, inside run_phase -> _ensure_fresh_producer_id). Returns
+        None when unavailable so the repair simply falls back to the full prompt."""
         r = (reason or "")
+        field = "failure_excerpt"
         # compile_static_ is checked before static_ for clarity; the two share no prefix
         # ("compile_static_..." does not start with "static_"), so order is not load-bearing.
         if r.startswith("compile_static_"):
@@ -2638,13 +2635,18 @@ clean:
             meta_path = self.repo_root / refs.source_dir() / "lint_meta.json"
         elif r.startswith("static_"):
             meta_path = self.repo_root / refs.source_dir() / "static_meta.json"
+        elif r.startswith("verify_"):
+            # The verify substep records its finding in the phase's meta `last_fail_reason`.
+            field = "last_fail_reason"
+            meta_path = (self.repo_root / refs.ir_ref / "ir_meta.json" if phase == "compile"
+                         else self.repo_root / refs.source_dir() / "source_meta.json")
         else:
             return None
         try:
             meta = json.loads(meta_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
             return None
-        excerpt = meta.get("failure_excerpt") if isinstance(meta, dict) else None
+        excerpt = meta.get(field) if isinstance(meta, dict) else None
         return excerpt if isinstance(excerpt, str) and excerpt.strip() else None
 
     def run_phase(self, refs: NodeRefs, phase: str,
@@ -2938,6 +2940,23 @@ clean:
             decision = outcome.decision or RouteDecision("escalate", reason="no_decision")
             if decision.action == "escalate":
                 decision = self.escalate(refs, phase, outcome)
+                # The diagnostician may route a SAME-PHASE producer re-run (target == this phase
+                # — e.g. "regenerate the IR" for compile, or retry generate). Its directive
+                # carries no repair_strategy (_parse_directive omits it for reopen / when the LLM
+                # leaves it off), which the same-phase producer-reopen branch requires; default it
+                # to `restart` (cold — an escalated failure is significant, so regenerate fresh)
+                # so the re-run actually fires instead of terminalizing. Scoped to compile/generate
+                # (the only phases with a re-runnable LLM producer + a reopen_phase same-phase
+                # carve-out); a same-phase build/validate escalate keeps no strategy and still
+                # terminalizes. An explicit reuse/restart/re_execute from the diagnostician is kept.
+                # Require an EXPLICIT same-phase target: a null target_phase is an ambiguous /
+                # incomplete directive (the schema permits null) and must terminalize as malformed,
+                # NOT be silently normalized into a producer restart.
+                if (decision.action in ("retry", "reopen")
+                        and phase in ("compile", "generate")
+                        and decision.target_phase == phase
+                        and decision.repair_strategy not in ("reuse", "restart", "re_execute")):
+                    decision = replace(decision, repair_strategy="restart")
             if decision.action == "fail_closed":
                 reason = decision.reason or ""
                 # Map to an allowlisted FAIL_CLOSED_REASON_CODES value (the runtime
@@ -2987,35 +3006,38 @@ clean:
                                 reason_detail=f"{target} exceeded {MAX_ATTEMPTS_PER_PHASE}")
                 return "fail_closed"
 
-            # Same-phase warm reopen for a deterministic-gate finding (generate.lint /
-            # generate.static / compile.static): re-run the SAME phase's producer substep
-            # (generate.generate / compile.generate) with a reuse repair so the SAME leaf fixes
-            # its own artifact (context intact), instead of terminalizing here as the generic
-            # same/downstream branch does. The deterministic gate substeps run once per attempt
-            # (run_phase does NOT exhaust an in-place retry the way a verify failure does), so a
-            # same-phase re-run is the correct recovery, not a terminal. Bounded by
-            # attempts[target] above. The dev rollback guard (target_idx < idx) does not fire
-            # (this is a within-phase reopen, consistent with the dev "auto-retry within a
-            # single phase" policy). Keyed on RouteDecision.same_phase_reopen (set by the
-            # classify_{lint,static,compile_static}_failure helpers), not a route-reason prefix.
+            # Same-phase producer reopen: re-run the SAME phase's producer substep
+            # (compile.generate / generate.generate) to fix a finding, instead of terminalizing.
+            # This is the canonical recovery for any decision that targets the current phase with
+            # a concrete repair_strategy — the deterministic gates (generate.lint/static,
+            # compile.static) and verify-minor (all `reuse` -> warm), AND the escalate
+            # diagnostician when it judges the right level is "this phase's own producer"
+            # (`reuse` -> warm / `restart` -> cold, e.g. a major IR defect regenerated from
+            # scratch). The producer id is rotated on re-run (_ensure_fresh_producer_id), avoiding
+            # the error-prone in-place-retry bookkeeping the old design forbade. A same-phase
+            # decision with NO repair_strategy (a malformed/unflagged retry) still terminalizes
+            # via the `target_idx >= idx` branch below. Bounded by attempts[target]. The dev
+            # rollback guard (target_idx < idx) does not fire — this is a within-phase reopen,
+            # which dev keeps (F1 confines dev fail-fast to cross-phase rollbacks).
             if (target_idx == idx and target == phase
-                    and decision.action == "retry"
-                    and decision.repair_strategy == "reuse"
-                    and decision.same_phase_reopen):
+                    and phase in ("compile", "generate")
+                    and decision.action in ("retry", "reopen")
+                    and decision.repair_strategy in ("reuse", "restart")):
                 trigger = outcome.failed_substeps[-1] if outcome.failed_substeps else None
                 if trigger is None:
                     self.set_status("fail", reason_code=f"{phase}_fail",
-                                    reason_detail="det_gate_reopen_no_trigger")
+                                    reason_detail="same_phase_reopen_no_trigger")
                     return "fail"
-                # Read the findings excerpt BEFORE reopen_phase/rotation while refs still
-                # names the failed artifact (its {lint,static,compile_static}_meta.json holds
-                # failure_excerpt).
-                findings = self._read_repair_findings(refs, decision.reason)
+                # Read the findings excerpt BEFORE reopen_phase/rotation while refs still names
+                # the failed artifact (its {lint,static,compile_static}_meta.json failure_excerpt,
+                # or the verify meta last_fail_reason). None for a diagnostician reason -> the
+                # repair falls back to the full prompt (a cold restart re-derives anyway).
+                findings = self._read_repair_findings(refs, decision.reason, phase)
                 self.reopen_phase(refs.node_key, from_phase=phase, trigger_arid=trigger,
-                                  reason=decision.reason or "det_gate_reopen")
+                                  reason=decision.reason or "same_phase_reopen")
                 pending_repair[phase] = self._repair_payload(
                     decision, self._producer_arid.get(phase, "none"), findings=findings)
-                continue  # idx unchanged -> re-run the phase producer with the reuse repair
+                continue  # idx unchanged -> re-run the phase producer with the repair
 
             if target_idx >= idx:
                 # same/downstream target reaching conduct means run_phase already

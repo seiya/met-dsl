@@ -24731,14 +24731,18 @@ class ChildContextDocSizeTests(unittest.TestCase):
         # + --stage compile gates moved out of the Compile.verify leaf into the conductor's
         # in-process Compile.static, so phase_01 now describes the new substep + that verify is
         # a pure spec-cross-reference semantic pass.
-        "docs/workflow/phases/phase_01_compile.md": 18200,
+        # Bumped 18200->19100: the G2 commit (4ec8d79, "enhance documentation") expanded the
+        # phase_01 prose alongside the substep change (io_contract authorship now Compile.generate).
+        "docs/workflow/phases/phase_01_compile.md": 19100,
         # Per-substep SKILLs — each force-read by its own LLM leaf.
         # Bumped 10800->11500: Compile.generate now authors the io_contract section (G2 /
         # docs/design/deterministic_followups.md) — it was moved here from Compile.verify so the
         # deterministic Compile.static gate (--stage compile, requires a complete io_contract)
         # runs on a complete IR before verify. The authoring rules (recompute-sufficiency etc.)
         # add ~0.9KB; the bulk of the io_contract detail stays in the force-read phase_01.
-        "skills/workflow-compile-generate/SKILL.md": 11500,
+        # Bumped 11500->12100: the G2 commit (4ec8d79, "enhance documentation") further expanded
+        # the compile-generate SKILL prose alongside the io_contract authorship move.
+        "skills/workflow-compile-generate/SKILL.md": 12100,
         "skills/workflow-compile-verify/SKILL.md": 11800,
         # Bumped 22000->22400: inlined the leaf-actionable C003 directive placement
         # + the f2008 63-char identifier limit (previously only in phase_02, which
@@ -25048,9 +25052,9 @@ class ReopenPhaseTest(unittest.TestCase):
             self.assertEqual(result["affected_phases"],
                              ["compile", "generate", "build", "validate"])
 
-    def test_reopen_rejects_same_phase_compile_verify_trigger(self) -> None:
-        # The compile same-phase carve-out is static-ONLY: a compile.verify same-phase trigger
-        # must still be rejected so verify/generate can never reopen their own phase (anti-abuse).
+    def test_reopen_accepts_same_phase_compile_verify_fail_trigger(self) -> None:
+        # The carve-out extends to compile.verify: a TERMINAL NON-PASS verify substep (a minor
+        # verify finding) may reopen compile itself so compile.generate warm-resumes to fix it.
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
             oid = "orch_reopen_compile_verify"
@@ -25062,14 +25066,32 @@ class ReopenPhaseTest(unittest.TestCase):
                     "step": "compile", "substep": "verify", "status": "fail",
                     "node_key": self.NODE_KEY,
                 }) + "\n")
+            result = reopen_phase(
+                repo_root, oid, node_key=self.NODE_KEY, from_phase="compile",
+                reason="verify_minor", trigger_agent_run_id="compile-verify-fail-1")
+            self.assertEqual(result["status"], "reopened")
+
+    def test_reopen_rejects_same_phase_passing_verify_trigger(self) -> None:
+        # Anti-abuse preserved: a PASSING verify trigger can never reopen its own phase (a pass
+        # cannot be erased). Only a terminal NON-PASS verify (minor finding) may.
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            oid = "orch_reopen_gen_verify_pass"
+            self._build_fixture(repo_root, oid)
+            root = repo_root / "workspace" / "orchestrations" / oid
+            with (root / "agent_runs.jsonl").open("a", encoding="utf-8") as f:
+                f.write(json.dumps({
+                    "agent_run_id": "generate-verify-pass-1", "agent_role": "substep",
+                    "step": "generate", "substep": "verify", "status": "pass",
+                    "node_key": self.NODE_KEY,
+                }) + "\n")
             with self.assertRaises(RuntimeError):
                 reopen_phase(
-                    repo_root, oid, node_key=self.NODE_KEY, from_phase="compile",
-                    reason="x", trigger_agent_run_id="compile-verify-fail-1")
+                    repo_root, oid, node_key=self.NODE_KEY, from_phase="generate",
+                    reason="verify_minor", trigger_agent_run_id="generate-verify-pass-1")
 
-    def test_reopen_rejects_same_phase_generate_verify_trigger(self) -> None:
-        # The same-phase carve-out is lint-ONLY: a generate.verify same-phase trigger must
-        # still be rejected so verify/generate can never reopen their own phase (anti-abuse).
+    def test_reopen_accepts_same_phase_generate_verify_fail_trigger(self) -> None:
+        # A terminal NON-PASS generate.verify (minor finding) may reopen generate to warm-fix it.
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
             oid = "orch_reopen_gen_verify"
@@ -25081,10 +25103,34 @@ class ReopenPhaseTest(unittest.TestCase):
                     "step": "generate", "substep": "verify", "status": "fail",
                     "node_key": self.NODE_KEY,
                 }) + "\n")
-            with self.assertRaises(RuntimeError):
-                reopen_phase(
-                    repo_root, oid, node_key=self.NODE_KEY, from_phase="generate",
-                    reason="x", trigger_agent_run_id="generate-verify-fail-1")
+            result = reopen_phase(
+                repo_root, oid, node_key=self.NODE_KEY, from_phase="generate",
+                reason="verify_minor", trigger_agent_run_id="generate-verify-fail-1")
+            self.assertEqual(result["status"], "reopened")
+
+    def test_reopen_accepts_same_phase_producer_trigger(self) -> None:
+        # Regression: the escalate diagnostician can route a SAME-PHASE producer re-run (e.g. a
+        # producer rc=0 content-fail -> escalate -> "retry compile/generate"), whose trigger is the
+        # PRODUCER substep (substep name "generate"). reopen_phase must accept a terminal NON-PASS
+        # producer same-phase trigger (it was previously rejected -> conductor crash).
+        for from_phase, step in (("compile", "compile"), ("generate", "generate")):
+            with self.subTest(from_phase=from_phase):
+                with tempfile.TemporaryDirectory() as tmp:
+                    repo_root = Path(tmp)
+                    oid = f"orch_reopen_producer_{from_phase}"
+                    self._build_fixture(repo_root, oid)
+                    root = repo_root / "workspace" / "orchestrations" / oid
+                    with (root / "agent_runs.jsonl").open("a", encoding="utf-8") as f:
+                        f.write(json.dumps({
+                            "agent_run_id": f"{step}-generate-fail-1", "agent_role": "substep",
+                            "step": step, "substep": "generate", "status": "fail",
+                            "node_key": self.NODE_KEY,
+                        }) + "\n")
+                    result = reopen_phase(
+                        repo_root, oid, node_key=self.NODE_KEY, from_phase=from_phase,
+                        reason="escalate_same_phase_producer",
+                        trigger_agent_run_id=f"{step}-generate-fail-1")
+                    self.assertEqual(result["status"], "reopened")
 
     def test_reopen_rejects_unknown_trigger(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
