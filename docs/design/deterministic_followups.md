@@ -966,3 +966,72 @@ so the coherent terminal is `fail_closed`. Wiring:
   `TransportFailureTest.test_pre_spawn_dag_incomplete_fails_closed_without_spawning` /
   `test_post_gate_pre_judge_violation_fails_closed_and_tombstones`, and the runtime
   `test_runbook_judge_emits_no_gate` + ALLOWED-table coherence.
+
+## G4 — split `Validate.judge` into `pre_judge / execute / judge / post_judge` substeps + severity-classify the post_judge gate (IMPLEMENTED 2026-07-01)
+
+**Motivation.** G3's initial billed E2E (orch `…76cd1743`) failed `fail_closed` because the judge
+leaf wrote `semantic_review.json` with `review_method: "llm_semantic_recompute"` but the gate requires
+the literal `"llm_semantic_review"` (the value lived only in gate code). Under G3 that trivial,
+leaf-authored conformance error was **unrecoverable**: the pre_judge gate has no severity dimension
+(any violation fails), and the judge `pre_phase_complete` hook forbids a `fail` step_result atop a
+`pass` semantic_review, so a minor typo terminalizes exactly like a genuine record-integrity breach.
+
+**Change.** Promote G3's two conductor-owned gates into explicit deterministic substeps so the
+validate phase is `("pre_judge", "execute", "judge", "post_judge")`, then classify post_judge
+violations by severity and warm-resume the judge for the recoverable class:
+- `pre_judge` (`Conductor._pre_judge_inproc`, index 0): the pre-spawn dependency-DAG readiness check
+  (was a run_phase pre-loop branch), authoring `pre_judge_meta.json`. A not-ready closure fails
+  `fail_closed` (integrity blocker; never warm-resumed — no judge has run).
+- `judge` (LLM leaf, index 2): unchanged semantic pass, minus the inline post-gate. `determine_substep_
+  status` reduces its pass condition to `aggregate_verdict ∈ {pass,xfail}` (the gate AND moved out).
+- `post_judge` (`Conductor._post_judge_inproc`, index 3): runs `validate_pipeline_semantics --stage
+  pre_judge` and CLASSIFIES the free-text violations via `classify_post_judge_violations`, authoring
+  `post_judge_meta.json` with a `disposition`. **NOTE the naming**: the substep is `post_judge` (runs
+  after the judge) but the validator STAGE is still literally `pre_judge` (before pass-certification).
+- **Severity classifier** (`classify_post_judge_violations`, precedence unrecoverable > unknown >
+  recoverable): keys on the leading artifact-path token of each violation. The JUDGE's own
+  deliverables `semantic_review.json` / `verdict.json` / `aggregate_verdict.json` / `summary.json` /
+  `validate_meta.json` → **recoverable** (judge-authored → warm_resume). `agent_graph.json` /
+  `step_result.json` / `lineage.json` / an `orchestrations/` path / the literal `copy_based_artifact_
+  reuse detected` / `dependency DAG incomplete` → **unrecoverable** (fail_closed). Anything else —
+  including execute-authored evidence (`diagnostics.json` / `perf.json` / `trial_meta.json` / `raw/`),
+  which the judge re-run cannot rewrite — → **unknown** → conservatively **fail_closed** (an
+  escalate-LLM adjudicator is a deferred follow-up).
+- **Warm-resume mini-loop** (`Conductor._maybe_warm_resume_post_judge`): on a `warm_resume`
+  disposition, tombstone the judge+post_judge attempt, warm-`--resume` the judge with a slim
+  findings-only prompt (reusing the G1-slim `_resolve_reuse_resume` machinery — it re-authors
+  `semantic_review.json`), then re-run the deterministic post_judge gate. Bounded by
+  `MAX_ATTEMPTS_PER_PHASE`. Self-contained — it drives `run_substep("validate","judge", repair=…)`
+  directly, so the "repair reaches only substep index 0" rule and the compile/generate-only
+  same-phase reopen (`conduct` / `reopen_phase`, which crashes for a validate trigger) are never
+  touched. This is a `post_judge → judge` in-phase substep retry, which dev-mode F1 already permits.
+
+**In-flight scoping.** post_judge runs the gate AFTER the judge returns, so post_judge's OWN
+agent_graph edge is the dangling in-flight one (not the judge's, which is already recorded). The gate's
+in-flight filter (`_validate_orchestration_hierarchy`) now accepts substep ∈ {judge, post_judge}, and
+`_post_judge_inproc` declares both the judge arid (`_pending_judge_arid`) and its own `child_arid` via
+repeated `--in-flight-agent-run-id`.
+
+**fail_closed posture preserved.** A terminal pre_judge / post_judge failure terminalizes `fail_closed`
+WITHOUT a routeable step_result (skip-write + tombstone), reading `pre_judge_meta` / `post_judge_meta`
+in run_phase. A physics/evidence judge fail breaks the loop BEFORE post_judge runs (structural skip of
+the gate that G3 achieved with a verdict-conditional), and routes via `classify_failure`
+(index-based over `SUBSTEPS["validate"]`).
+
+**Recording layer unchanged** (as in G3): `PHASE_VALIDATION_STAGE["validate"]` and
+`STEP_REQUIRED_VALIDATION_STAGES["validate"]` stay `pre_judge`; `post_judge` is not a stage token. The
+pass step_result's `launch_request_ref` points at the JUDGE substep (not the trailing post_judge) so
+the judge completion hook still enforces `semantic_review`.
+
+**Deferred.** The escalate-LLM adjudicator for `unknown` violations (initially `fail_closed`), and
+hoisting the deterministic parts still inside the judge leaf (structural start-condition checks / raw
+recompute) out to the conductor.
+
+**Files.** `tools/workflow_conductor.py` (SUBSTEPS, `_is_deterministic_substep`, `_pre_judge_inproc` /
+`_post_judge_inproc` / `_maybe_warm_resume_post_judge`, `classify_post_judge_violations`,
+`determine_substep_status`, `run_phase`, `classify_failure`); `tools/orchestration_runtime.py`
+(deterministic allow-list, `ALLOWED_VALIDATE_PIPELINE_STAGES`, leaf-non-writable meta exclusions);
+`tools/validate_pipeline_semantics.py` (in-flight filter accepts post_judge); doc fix in
+`skills/workflow-validate-judge/SKILL.md` + `docs/workflow/phases/phase_04_validate.md` (pin the
+`review_method` literal). Tests: `PostJudgeClassifierTest`, `G3JudgeGateSubstepTest`, updated
+`ConductHappyPathTest` / `TransportFailureTest` (incl. the new warm-resume recovery test).

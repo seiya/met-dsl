@@ -5005,6 +5005,23 @@ def _allowed_output_paths_for_launch(
                 "validate_meta.json",
             }
             return rel_under_node in allowed_files
+        if step_token == "validate" and substep_token in ("pre_judge", "post_judge"):
+            # G4: the deterministic Validate gate substeps' ONLY deliverable is their own meta
+            # (pre_judge_meta.json / post_judge_meta.json), conductor-authored in-process under
+            # the run-node dir. Exhaustive exact-match (like compile.static / the judge branch),
+            # with the same canonical run_id enforcement as execute/judge.
+            if not validate_prefix or not node_safe:
+                return False
+            if not path.startswith(validate_prefix):
+                return False
+            tail_parts = [p for p in path[len(validate_prefix):].split("/") if p]
+            if (
+                len(tail_parts) < 3
+                or tail_parts[1] != node_safe
+                or not _RUN_ID_RE.fullmatch(tail_parts[0])
+            ):
+                return False
+            return "/".join(tail_parts[2:]) == f"{substep_token}_meta.json"
         # NOTE: `tune` / `promote` step branches below are out-of-scope for
         # core 5-phase workflow (see _write_roots_for_launch for context).
         # They remain to satisfy the optional-flow capability contract.
@@ -5439,6 +5456,12 @@ def _allowed_file_tool_paths_for_launch(
             # workflow_conductor._compile_static_inproc): never leaf-writable. Defense-in-depth
             # (CP-1 already keeps it out of any compile leaf's allowed_output_paths).
             and not path.endswith("/compile_static_meta.json")
+            # And for the Validate.pre_judge / Validate.post_judge deliverables
+            # (<run_node_dir>/pre_judge_meta.json / post_judge_meta.json, conductor-authored
+            # in-process by workflow_conductor._pre_judge_inproc / _post_judge_inproc): never
+            # leaf-writable (the judge leaf's allowed_output_paths never lists them).
+            and not path.endswith("/pre_judge_meta.json")
+            and not path.endswith("/post_judge_meta.json")
         }
         result = sorted(derived)
         _assert_mandatory_file_tool_pins_present(
@@ -5481,6 +5504,14 @@ def _allowed_file_tool_paths_for_launch(
                 f"allowed_file_tool_paths[{idx}] must not include the conductor-authored "
                 f"compile static deliverable: {path!r} (written exclusively by Compile.static "
                 "in-process)"
+            )
+        # Same for the run-node pre_judge_meta.json / post_judge_meta.json
+        # (Validate.pre_judge / Validate.post_judge in-process deliverables).
+        if path.endswith("/pre_judge_meta.json") or path.endswith("/post_judge_meta.json"):
+            raise ValueError(
+                f"allowed_file_tool_paths[{idx}] must not include the conductor-authored "
+                f"validate gate deliverable: {path!r} (written exclusively by "
+                "Validate.pre_judge / Validate.post_judge in-process)"
             )
         # Phase-2: managed `.json` / `.txt` artifacts are written directly by the
         # confined leaf (FS-diff attribution), so they are no longer rejected here
@@ -8282,11 +8313,12 @@ def _build_gate_runbook(request_payload: dict[str, Any]) -> str:
     # deterministically-clean source and is a pure LLM semantic (G1-G7) pass. It therefore
     # falls through to the `else` branch below and returns "" (no runbook).
     # validate.judge emits NO gate runbook: the `--stage pre_judge` gate it used to run as its
-    # final step now executes in the conductor — a pre-spawn dependency-DAG readiness check plus
-    # a post-return pre_judge gate (Conductor._run_judge_pre_judge_gate) that authors
-    # judge_gate_meta.json — so the judge is reached only on a DAG-ready closure and is a pure LLM
-    # semantic pass. It falls through to the `else` below and returns "" (no runbook), mirroring
-    # compile.verify / generate.verify.
+    # final step now executes in the conductor as two deterministic substeps wrapping the judge —
+    # the pre-spawn dependency-DAG readiness check (Conductor._pre_judge_inproc, authoring
+    # pre_judge_meta.json) and the post-return gate + severity classifier
+    # (Conductor._post_judge_inproc, authoring post_judge_meta.json) — so the judge is reached only
+    # on a DAG-ready closure and is a pure LLM semantic pass. It falls through to the `else` below
+    # and returns "" (no runbook), mirroring compile.verify / generate.verify.
     else:
         # Unknown / not-yet-mapped (step, substep): emit no runbook rather than guess.
         return ""
@@ -9210,13 +9242,16 @@ ALLOWED_VALIDATE_PIPELINE_STAGES: dict[tuple[str, str], frozenset[str]] = {
     ("generate", "verify"): frozenset(),
     ("build", ""): frozenset({"post_build"}),
     ("validate", "execute"): frozenset({"post_execute"}),
-    # validate.judge invokes NO validator gate: the `--stage pre_judge` gate it used to own
-    # (orchestration-record integrity + the cross-pipeline dependency DAG) now runs in the
-    # conductor — a pre-spawn DAG readiness check plus a post-return gate that authors
-    # judge_gate_meta.json (Conductor._run_judge_pre_judge_gate) — so the judge leaf is a pure
-    # LLM semantic pass, mirroring compile.verify / generate.verify. The empty set keeps the
-    # table total and makes _build_gate_runbook emit no pre_judge line for judge.
+    # validate's judge region is a deterministic-LLM-deterministic sandwich; only the LLM
+    # judge is a leaf, and it invokes NO validator gate. pre_judge and post_judge are
+    # deterministic in-process substeps (no leaf) that run their gates via direct subprocess,
+    # so all three map to frozenset() (keeps the table total; _build_gate_runbook emits no
+    # gate line). The `--stage pre_judge` gate the judge leaf used to own now runs in
+    # Conductor._pre_judge_inproc (pre-spawn DAG readiness) + Conductor._post_judge_inproc
+    # (post-return gate + severity classification, authoring post_judge_meta.json).
+    ("validate", "pre_judge"): frozenset(),
     ("validate", "judge"): frozenset(),
+    ("validate", "post_judge"): frozenset(),
 }
 
 
@@ -10640,21 +10675,22 @@ def _validate_launch_request_payload(request_payload: dict[str, Any]) -> None:
     if not isinstance(step, str) or not step.strip():
         raise ValueError("launch request must include non-empty step")
     # Defense-in-depth: `deterministic` (in-process, skill-/constraint-line-exempt) is
-    # only legitimate for the non-LLM substeps Build, Validate.execute, Generate.lint,
-    # Generate.static and Compile.static. Reject the flag on any other step so a forged/buggy
-    # payload cannot claim the reduced launch-prompt guards while being a leaf step. (The flag
-    # is host-set by the conductor today; this makes the invariant explicit at the validation
-    # chokepoint.)
+    # only legitimate for the non-LLM substeps Build, Validate.pre_judge, Validate.execute,
+    # Validate.post_judge, Generate.lint, Generate.static and Compile.static. Reject the flag
+    # on any other step so a forged/buggy payload cannot claim the reduced launch-prompt guards
+    # while being a leaf step. (The flag is host-set by the conductor today; this makes the
+    # invariant explicit at the validation chokepoint.)
     if request_payload.get("deterministic"):
         step_l = step.strip().lower()
         substep_l = str(substep).strip().lower() if isinstance(substep, str) else ""
         if not (step_l == "build"
-                or (step_l == "validate" and substep_l == "execute")
+                or (step_l == "validate" and substep_l in ("pre_judge", "execute", "post_judge"))
                 or (step_l == "generate" and substep_l in ("lint", "static"))
                 or (step_l == "compile" and substep_l == "static")):
             raise ValueError(
                 "launch request: deterministic=True is only valid for step=build, "
-                "step=validate substep=execute, step=generate substep=lint|static, or "
+                "step=validate substep=pre_judge|execute|post_judge, "
+                "step=generate substep=lint|static, or "
                 f"step=compile substep=static (got step={step!r} substep={substep!r})"
             )
     # agent_model identifies the LLM that produced the child's artifacts. At launch

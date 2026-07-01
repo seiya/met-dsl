@@ -304,7 +304,8 @@ class PhaseStructureTest(unittest.TestCase):
         self.assertEqual(wc.SUBSTEPS["compile"], ("generate", "static", "verify"))
         self.assertEqual(wc.SUBSTEPS["generate"], ("generate", "lint", "static", "verify"))
         self.assertEqual(wc.SUBSTEPS["build"], (None,))
-        self.assertEqual(wc.SUBSTEPS["validate"], ("execute", "judge"))
+        self.assertEqual(wc.SUBSTEPS["validate"],
+                         ("pre_judge", "execute", "judge", "post_judge"))
         self.assertEqual(wc.child_agent_role("build"), "step")
         self.assertEqual(wc.child_agent_role("compile"), "substep")
 
@@ -389,9 +390,25 @@ class _FakeConductor(wc.Conductor):
     def spawn_leaf(self, prompt_text, child_env, **kwargs):  # type: ignore[override]
         return wc.ProcResult(0, "", "")
 
+    # Configurable meta payloads the fake writes for the deterministic validate gate substeps
+    # (pre_judge / post_judge), so run_phase's gate-fail branch + the warm-resume mini-loop
+    # read realistic metas without spawning the real subprocess bodies. Default None -> no
+    # write (the stubbed determine_substep_status/status_fn drives the outcome). The real
+    # bodies are exercised by the dedicated Validate gate tests.
+    pre_judge_meta_fn = None   # (n) -> dict
+    post_judge_meta_fn = None  # (n) -> dict
+
     def _run_deterministic_substep(self, refs, phase, substep, child_arid, request):  # type: ignore[override]
-        # Build / Validate.execute always run in-process; the fake body is a clean
-        # success so the stubbed determine_substep_status/status_fn drives the outcome.
+        # Build / Validate.{pre_judge,execute,post_judge} run in-process; the fake body is a
+        # clean success. When a *_meta_fn is configured, author the corresponding gate meta so
+        # run_phase's gate-fail branch + mini-loop see it.
+        self._detn = getattr(self, "_detn", 0) + 1
+        if phase == "validate" and substep == "pre_judge" and self.pre_judge_meta_fn:
+            self._write_run_node_meta(refs, "pre_judge_meta.json",
+                                      self.pre_judge_meta_fn(self._detn))
+        if phase == "validate" and substep == "post_judge" and self.post_judge_meta_fn:
+            self._write_run_node_meta(refs, "post_judge_meta.json",
+                                      self.post_judge_meta_fn(self._detn))
         return wc.ProcResult(0, "", "")
 
     def read_parent_return_token(self, child_arid):  # type: ignore[override]
@@ -400,15 +417,10 @@ class _FakeConductor(wc.Conductor):
     def read_case_ids(self, refs):  # type: ignore[override]
         return ()
 
-    # G3 judge gates: offline no-ops so the stubbed determine_substep_status drives the
-    # outcome (a real _run_judge_pre_judge_gate would spawn a subprocess + write under the
-    # fake repo_root; a real _judge_pre_spawn_dag_block would read a nonexistent IR). The
-    # real gates are exercised by the dedicated JudgePreJudgeGate / JudgePreSpawnDag tests.
+    # A no-op DAG readiness check so the fake's pre_judge substep passes by default (a real
+    # _judge_pre_spawn_dag_block would read a nonexistent IR under the fake repo_root).
     def _judge_pre_spawn_dag_block(self, refs):  # type: ignore[override]
         return None
-
-    def _run_judge_pre_judge_gate(self, refs, child_arid):  # type: ignore[override]
-        return True
 
     # configurable hooks (default: everything passes)
     status_fn = None  # (phase, substep, n) -> "pass"|"fail"
@@ -473,9 +485,11 @@ class ConductHappyPathTest(unittest.TestCase):
                "record-launch", "record-child-return", "finalize-child",
                "write-step-result"]  # build (1 deterministic step)
             + ["check-step-completed", "workflow-launch-check",
+               "record-launch", "record-child-return", "finalize-child",  # pre_judge (deterministic)
                "record-launch", "record-child-return", "finalize-child",  # execute (deterministic)
                "record-launch", "finalize-child",  # judge (leaf)
-               "write-step-result"]  # validate
+               "record-launch", "record-child-return", "finalize-child",  # post_judge (deterministic)
+               "write-step-result"]  # validate (3 deterministic + 1 leaf substep)
             + ["set-status"]
         )
         self.assertEqual(subs, expected)
@@ -486,8 +500,8 @@ class ConductHappyPathTest(unittest.TestCase):
         for substep_aware in ("compile", "generate", "validate"):
             self.assertEqual(by_step[substep_aware]["--agent-run-id"], "ORCH")
             # generate has 4 substeps (generate, lint, static, verify); compile has 3
-            # (generate, static, verify); validate has 2 (execute, judge).
-            expected_substeps = {"generate": 4, "compile": 3, "validate": 2}[substep_aware]
+            # (generate, static, verify); validate has 4 (pre_judge, execute, judge, post_judge).
+            expected_substeps = {"generate": 4, "compile": 3, "validate": 4}[substep_aware]
             self.assertEqual(
                 len(by_step[substep_aware]["--result-json"]["substep_agent_run_ids"]),
                 expected_substeps)
@@ -920,7 +934,8 @@ class ConductRoutingTest(unittest.TestCase):
 
     def test_fail_closed_on_spec_attribution(self) -> None:
         c = self._conductor()
-        c.status_fn = lambda phase, substep, n: "fail" if phase == "validate" else "pass"
+        c.status_fn = lambda phase, substep, n: (
+            "fail" if (phase == "validate" and substep == "judge") else "pass")
         c.decision_fn = lambda phase, outcomes: wc.RouteDecision("fail_closed", reason="physics_fail_spec")
         status = c.conduct(self._refs(), "validate")
         self.assertEqual(status, "fail_closed")
@@ -930,7 +945,8 @@ class ConductRoutingTest(unittest.TestCase):
         c = self._conductor()
         c.workflow_mode = "prod"  # cross-phase reopen budget is prod-only (dev fail_closes; F1)
         # validate always fails and always routes to reopen compile -> budget caps it.
-        c.status_fn = lambda phase, substep, n: "fail" if phase == "validate" else "pass"
+        c.status_fn = lambda phase, substep, n: (
+            "fail" if (phase == "validate" and substep == "judge") else "pass")
         c.decision_fn = lambda phase, outcomes: wc.RouteDecision(
             "reopen", target_phase="compile", reason="judge_ir")
         status = c.conduct(self._refs(), "validate")
@@ -1099,7 +1115,7 @@ class TransportFailureTest(unittest.TestCase):
 
     def test_judge_transport_failure_fails_closed_and_tombstones(self) -> None:
         c = self._conductor()
-        # validate.execute is deterministic (rc 0, pass); the judge leaf hits a session limit.
+        # pre_judge + execute are deterministic (rc 0, pass); the judge leaf hits a session limit.
         c.spawn_leaf = lambda *a, **k: wc.ProcResult(1, "", "Claude usage limit reached")  # type: ignore[assignment]
         oc = c.run_phase(self._refs(), "validate")
         self.assertEqual(oc.status, "fail")
@@ -1108,10 +1124,10 @@ class TransportFailureTest(unittest.TestCase):
         subs = [s for s, _ in c.calls]
         # the core Bug-2 assertion: no write-step-result (so the judge gate never crashes)
         self.assertNotIn("write-step-result", subs)
-        # the Bug-1 tombstone: both substep arids superseded
+        # the Bug-1 tombstone: the three substep arids that ran (pre_judge, execute, judge)
         sup = [cap for s, cap in c.calls if s == "add-superseded-runs"]
         self.assertEqual(len(sup), 1)
-        self.assertEqual(sup[0]["--run-ids"], ["child-1", "child-2"])
+        self.assertEqual(sup[0]["--run-ids"], ["child-1", "child-2", "child-3"])
         self.assertIn("leaf_transport_error_orphan", sup[0]["--reason"])
 
     def test_non_transport_content_fail_writes_and_routes(self) -> None:
@@ -1137,10 +1153,12 @@ class TransportFailureTest(unittest.TestCase):
         self.assertIn("write-step-result", subs)
         self.assertNotIn("add-superseded-runs", subs)
 
-    def test_pre_spawn_dag_incomplete_fails_closed_without_spawning(self) -> None:
-        # G3: a not-built+validated dependency closure fails the validate phase closed BEFORE
-        # any substep/leaf runs — no record-launch, no write-step-result (the judge hook that
-        # would demand a semantic_review the leaf never wrote is never reached).
+    def test_pre_spawn_dag_guard_fails_closed_before_any_launch(self) -> None:
+        # A not-built+validated dependency closure fails the validate phase closed at the
+        # PRE-LAUNCH guard (before workflow_launch_check and before any substep's record-launch).
+        # This is load-bearing: record-launch is itself dependency-gated, so the readiness check
+        # must fire here — otherwise workflow_launch_check would raise `dependency_not_ready` as
+        # an uncaught RuntimeError before the pre_judge substep could run. No launch is recorded.
         class _C(self._C):  # type: ignore[misc]
             def _judge_pre_spawn_dag_block(self, refs):  # type: ignore[override]
                 return "dependency closure not built+validated ... missing ['component/dep']"
@@ -1152,15 +1170,52 @@ class TransportFailureTest(unittest.TestCase):
         self.assertEqual(oc.decision.action, "fail_closed")
         self.assertEqual(oc.decision.reason, "validate_pre_judge_dag_incomplete")
         subs = [s for s, _ in c.calls]
-        self.assertNotIn("record-launch", subs)
+        self.assertNotIn("record-launch", subs)  # guard fires before any substep launch
         self.assertNotIn("write-step-result", subs)
 
+    def test_pre_judge_substep_dag_incomplete_fails_closed(self) -> None:
+        # Defensive in-substep path (a TOCTOU where the closure becomes unready between the
+        # pre-launch guard and the substep, or the fake bypasses the guard): the pre_judge
+        # substep (index 0) authors a FAIL pre_judge_meta, the loop breaks there (no
+        # execute/judge/post_judge), and the phase terminalizes fail_closed with NO
+        # write-step-result (skip-write + tombstone).
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            repo, refs = Path(td), self._refs()
+
+            class _C(_FakeConductor):
+                def _write_lineage(self, r):  # type: ignore[override]
+                    return []
+                def _ensure_fresh_producer_id(self, r, phase):  # type: ignore[override]
+                    return None
+                # Guard passes (None); drive the failure at the substep instead.
+                def _judge_pre_spawn_dag_block(self, r):  # type: ignore[override]
+                    return None
+            c = _C(repo_root=repo, orchestration_id="orch_x",
+                   orchestration_agent_run_id="ORCH", backend="claude", env={})
+            c.calls = []
+            c.pre_judge_meta_fn = lambda n: {
+                "status": "fail", "failure_category": "pre_judge_dag_incomplete",
+                "failure_excerpt": "missing ['component/dep']"}
+            c.status_fn = lambda phase, substep, n: (
+                "fail" if (phase == "validate" and substep == "pre_judge") else "pass")
+            oc = c.run_phase(refs, "validate")
+            self.assertEqual(oc.status, "fail")
+            self.assertEqual(oc.decision.action, "fail_closed")
+            self.assertEqual(oc.decision.reason, "validate_pre_judge_dag_incomplete")
+            subs = [s for s, _ in c.calls]
+            self.assertNotIn("write-step-result", subs)
+            sup = [cap for s, cap in c.calls if s == "add-superseded-runs"]
+            self.assertEqual(len(sup), 1)
+            self.assertEqual(sup[0]["--run-ids"], ["child-1"])  # only pre_judge ran
+            self.assertIn("validate_gate_fail_orphan", sup[0]["--reason"])
+
     def test_post_gate_pre_judge_violation_fails_closed_and_tombstones(self) -> None:
-        # G3: a PASSING judge (aggregate_verdict=pass) returned cleanly (rc 0) but the
-        # conductor-owned pre_judge post-gate failed on a real record-integrity violation -> a
-        # non-physics integrity blocker terminalized as fail_closed WITHOUT write-step-result (so
-        # the judge pre_phase_complete hook never rejects a fail step_result atop a pass
-        # semantic_review), tombstoning the attempt's arids.
+        # G3: a PASSING judge (aggregate_verdict=pass) but the deterministic post_judge gate
+        # failed on a record-integrity violation classified UNRECOVERABLE (disposition
+        # fail_closed) -> a non-physics integrity blocker terminalized fail_closed WITHOUT
+        # write-step-result (so the judge pre_phase_complete hook never rejects a fail
+        # step_result atop a pass semantic_review), tombstoning the attempt's arids.
         import tempfile
         with tempfile.TemporaryDirectory() as td:
             repo = Path(td)
@@ -1171,24 +1226,23 @@ class TransportFailureTest(unittest.TestCase):
                     return []
                 def _ensure_fresh_producer_id(self, r, phase):  # type: ignore[override]
                     return None  # keep run_id stable so the seeded run-node dir is read back
-                # judge substep runs (rc 0); the post-gate authors a FAIL judge_gate_meta.
-                def _run_judge_pre_judge_gate(self, r, child_arid):  # type: ignore[override]
-                    self._write_judge_gate_meta(
-                        r, status="fail", failure_category="pre_judge_violation",
-                        failure_excerpt="record-integrity boom")
-                    return False
 
             c = _C(repo_root=repo, orchestration_id="orch_x",
                    orchestration_agent_run_id="ORCH", backend="claude", env={})
             c.calls = []
-            # A PASSING judge verdict on disk so the post-gate actually runs (verdict_ok True).
             rn = repo / refs.run_node_dir()
             rn.mkdir(parents=True, exist_ok=True)
             (rn / "aggregate_verdict.json").write_text(
                 json.dumps({"aggregate_verdict": "pass"}), encoding="utf-8")
-            # execute passes, judge substep resolves fail (stubbed determine reflects the gate fail).
+            # post_judge substep authors a FAIL post_judge_meta with an UNRECOVERABLE
+            # disposition; the mini-loop skips it and run_phase terminalizes fail_closed.
+            c.post_judge_meta_fn = lambda n: {
+                "status": "fail", "failure_category": "pre_judge_violation",
+                "failure_excerpt": "record-integrity boom",
+                "violations": ["workspace/.../agent_graph.json: dangling edge"],
+                "disposition": "fail_closed"}
             c.status_fn = lambda phase, substep, n: (
-                "fail" if (phase == "validate" and substep == "judge") else "pass")
+                "fail" if (phase == "validate" and substep == "post_judge") else "pass")
             oc = c.run_phase(refs, "validate")
             self.assertEqual(oc.status, "fail")
             self.assertEqual(oc.decision.action, "fail_closed")
@@ -1197,14 +1251,117 @@ class TransportFailureTest(unittest.TestCase):
             self.assertNotIn("write-step-result", subs)
             sup = [cap for s, cap in c.calls if s == "add-superseded-runs"]
             self.assertEqual(len(sup), 1)
-            self.assertIn("validate_pre_judge_gate_fail_orphan", sup[0]["--reason"])
+            self.assertIn("validate_gate_fail_orphan", sup[0]["--reason"])
+
+    def test_post_gate_recoverable_violation_warm_resumes_judge_to_pass(self) -> None:
+        # G4: a RECOVERABLE post_judge conformance violation (disposition warm_resume) is NOT
+        # terminal — the mini-loop warm-resumes the judge, which re-authors semantic_review, and
+        # the re-run post_judge passes -> the phase certifies PASS (write-step-result, advance).
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            repo, refs = Path(td), self._refs()
+
+            class _C(_FakeConductor):
+                def _write_lineage(self, r):  # type: ignore[override]
+                    return []
+                def _ensure_fresh_producer_id(self, r, phase):  # type: ignore[override]
+                    return None
+
+            c = _C(repo_root=repo, orchestration_id="orch_x",
+                   orchestration_agent_run_id="ORCH", backend="claude", env={})
+            c.calls = []
+            rn = repo / refs.run_node_dir()
+            rn.mkdir(parents=True, exist_ok=True)
+            (rn / "aggregate_verdict.json").write_text(
+                json.dumps({"aggregate_verdict": "pass"}), encoding="utf-8")
+            # post_judge fails RECOVERABLE on the first attempt (detn 1..3 == pre_judge/execute/
+            # post_judge of the first pass), then passes on the mini-loop's re-run.
+            state = {"post_attempts": 0}
+            def _post_meta(n):
+                state["post_attempts"] += 1
+                if state["post_attempts"] == 1:
+                    return {"status": "fail", "failure_category": "pre_judge_violation",
+                            "failure_excerpt": "semantic_review.json: review_method must be "
+                                               "llm_semantic_review",
+                            "violations": ["workspace/.../semantic_review.json: review_method "
+                                           "must be llm_semantic_review"],
+                            "disposition": "warm_resume"}
+                return {"status": "pass", "failure_category": None, "failure_excerpt": None,
+                        "violations": [], "disposition": None}
+            c.post_judge_meta_fn = _post_meta
+            # First pass: post_judge fails. Mini-loop re-runs judge (pass) + post_judge (pass).
+            calls = {"n": 0}
+            def _status(phase, substep, n):
+                if phase == "validate" and substep == "post_judge":
+                    calls["n"] += 1
+                    return "fail" if calls["n"] == 1 else "pass"
+                return "pass"
+            c.status_fn = _status
+            oc = c.run_phase(refs, "validate")
+            self.assertEqual(oc.status, "pass")
+            self.assertEqual(oc.decision.action, "advance")
+            subs = [s for s, _ in c.calls]
+            self.assertIn("write-step-result", subs)
+            # the superseded (first) judge + post_judge arids were tombstoned by the mini-loop
+            sup = [cap for s, cap in c.calls if s == "add-superseded-runs"]
+            self.assertEqual(len(sup), 1)
+            self.assertIn("validate_post_judge_warm_resume_orphan", sup[0]["--reason"])
+
+    def test_warm_resumed_judge_physics_fail_routes_not_fail_closed(self) -> None:
+        # Subtle: after a warm-resume attempt the ON-DISK post_judge_meta is STALE (status fail
+        # from the superseded attempt). If the warm-resumed judge itself physics-fails, run_phase
+        # must route via classify_failure (judge physics) — NOT fail_closed on the stale meta.
+        # The fail_closed branch is gated on the ACTUALLY-failed substep (judge here), not the
+        # meta file, so the stale post_judge_meta is ignored.
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            repo, refs = Path(td), self._refs()
+
+            class _C(_FakeConductor):
+                def _write_lineage(self, r):  # type: ignore[override]
+                    return []
+                def _ensure_fresh_producer_id(self, r, phase):  # type: ignore[override]
+                    return None
+
+            c = _C(repo_root=repo, orchestration_id="orch_x",
+                   orchestration_agent_run_id="ORCH", backend="claude", env={})
+            c.calls = []
+            rn = repo / refs.run_node_dir()
+            rn.mkdir(parents=True, exist_ok=True)
+            (rn / "aggregate_verdict.json").write_text(
+                json.dumps({"aggregate_verdict": "pass"}), encoding="utf-8")
+            # First post_judge run fails RECOVERABLE (warm_resume). On the mini-loop's re-run the
+            # judge physics-fails, so post_judge never runs a second time and its meta stays stale.
+            c.post_judge_meta_fn = lambda n: {
+                "status": "fail", "failure_category": "pre_judge_violation",
+                "failure_excerpt": "semantic_review.json: review_method must be llm_semantic_review",
+                "violations": ["workspace/runs/n/semantic_review.json: review_method must be "
+                               "llm_semantic_review"],
+                "disposition": "warm_resume"}
+            judge_runs = {"n": 0}
+            def _status(phase, substep, n):
+                if phase == "validate" and substep == "judge":
+                    judge_runs["n"] += 1
+                    return "pass" if judge_runs["n"] == 1 else "fail"  # re-run judge fails
+                if phase == "validate" and substep == "post_judge":
+                    return "fail"  # first post_judge fails (warm_resume)
+                return "pass"
+            c.status_fn = _status
+            c.decision_fn = lambda phase, outcomes: wc.RouteDecision(
+                "retry", target_phase="generate", repair_strategy="reuse", reason="judge_physics")
+            oc = c.run_phase(refs, "validate")
+            self.assertEqual(oc.status, "fail")
+            self.assertEqual(oc.decision.action, "retry")  # routed, NOT fail_closed
+            self.assertEqual(oc.decision.target_phase, "generate")
+            self.assertIn("write-step-result", [s for s, _ in c.calls])
 
     def test_failing_judge_verdict_skips_gate_and_routes_normally(self) -> None:
         # G3 regression guard (Codex P1): a legitimate physics/evidence FAIL judge
-        # (aggregate_verdict=fail) must NOT run the pre_judge post-gate — that gate flags
+        # (aggregate_verdict=fail) must NOT run the post_judge gate — that gate flags
         # semantic_review.decision != pass as a violation, which would mislabel the routeable
-        # failure as an integrity blocker. The gate is skipped, no judge_gate_meta is written,
-        # and run_phase writes the step_result + routes via classify_failure (NOT fail_closed).
+        # failure as an integrity blocker. In the substep model this is STRUCTURAL: a failing
+        # judge substep breaks the run_phase loop before post_judge runs. run_phase writes the
+        # step_result + routes via classify_failure (NOT fail_closed).
         import tempfile
         with tempfile.TemporaryDirectory() as td:
             repo = Path(td)
@@ -1216,9 +1373,6 @@ class TransportFailureTest(unittest.TestCase):
                     return []
                 def _ensure_fresh_producer_id(self, r, phase):  # type: ignore[override]
                     return None
-                def _run_judge_pre_judge_gate(self, r, child_arid):  # type: ignore[override]
-                    gate_calls["n"] += 1  # must NOT be called for a failing verdict
-                    return True
 
             c = _C(repo_root=repo, orchestration_id="orch_x",
                    orchestration_agent_run_id="ORCH", backend="claude", env={})
@@ -1227,12 +1381,17 @@ class TransportFailureTest(unittest.TestCase):
             rn.mkdir(parents=True, exist_ok=True)
             (rn / "aggregate_verdict.json").write_text(
                 json.dumps({"aggregate_verdict": "fail"}), encoding="utf-8")
+            # A post_judge run would call this; a failing judge must break the loop first.
+            def _post(n):
+                gate_calls["n"] += 1
+                return {"status": "pass", "disposition": None}
+            c.post_judge_meta_fn = _post
             c.status_fn = lambda phase, substep, n: (
                 "fail" if (phase == "validate" and substep == "judge") else "pass")
             c.decision_fn = lambda phase, outcomes: wc.RouteDecision(
                 "retry", target_phase="generate", repair_strategy="reuse", reason="judge_physics_fail_code")
             oc = c.run_phase(refs, "validate")
-            self.assertEqual(gate_calls["n"], 0)  # gate skipped for a non-pass verdict
+            self.assertEqual(gate_calls["n"], 0)  # post_judge never ran (loop broke at judge)
             self.assertEqual(oc.status, "fail")
             self.assertEqual(oc.decision.action, "retry")  # routed, NOT fail_closed
             self.assertEqual(oc.decision.target_phase, "generate")
@@ -2979,8 +3138,11 @@ class DeterministicBuildTest(unittest.TestCase):
             c = wc.Conductor(repo_root=repo, orchestration_id="o",
                              orchestration_agent_run_id="O", backend="claude", env={})
             refs = self._refs()
-            # no verdict.json under the run node dir -> execute failed before judge
-            decision = c.classify_failure(refs, "validate", [])
+            # execute is the failed substep (index 1): outcomes == [pre_judge(pass), execute(fail)].
+            # No verdict.json under the run node dir -> runner code defect.
+            ex_fail = [wc.SubstepOutcome("pj", "pass", [], 0),
+                       wc.SubstepOutcome("ex", "fail", [], 0)]
+            decision = c.classify_failure(refs, "validate", ex_fail)
             self.assertEqual(decision.action, "retry")
             self.assertEqual(decision.target_phase, "generate")
             self.assertEqual(decision.repair_strategy, "restart")
@@ -2995,17 +3157,20 @@ class DeterministicBuildTest(unittest.TestCase):
             c = wc.Conductor(repo_root=repo, orchestration_id="o",
                              orchestration_agent_run_id="O", backend="claude", env={})
             refs = self._refs()
-            first = c.classify_failure(refs, "validate", [])
+            # execute is the failed substep (index 1): [pre_judge(pass), execute(fail)].
+            ex_fail = [wc.SubstepOutcome("pj", "pass", [], 0),
+                       wc.SubstepOutcome("ex", "fail", [], 0)]
+            first = c.classify_failure(refs, "validate", ex_fail)
             self.assertEqual((first.action, first.target_phase), ("retry", "generate"))
-            second = c.classify_failure(refs, "validate", [])
+            second = c.classify_failure(refs, "validate", ex_fail)
             self.assertEqual((second.action, second.target_phase), ("reopen", "compile"))
             self.assertEqual(second.reason, "validate_execute_fail_ir")
             # After escalating to Compile the counter resets: the Compile reopen
             # regenerates the IR, so the next execute failure (fresh artifacts) gets its
             # own Generate-retry-first cycle rather than immediately re-escalating.
-            third = c.classify_failure(refs, "validate", [])
+            third = c.classify_failure(refs, "validate", ex_fail)
             self.assertEqual((third.action, third.target_phase), ("retry", "generate"))
-            fourth = c.classify_failure(refs, "validate", [])
+            fourth = c.classify_failure(refs, "validate", ex_fail)
             self.assertEqual((fourth.action, fourth.target_phase), ("reopen", "compile"))
 
 
@@ -3471,10 +3636,57 @@ class DeterministicCompileStaticTest(unittest.TestCase):
                                            min_mtime=mtime + 100)[0], "fail")
 
 
-class G3JudgePreJudgeGateTest(unittest.TestCase):
-    """G3: the `--stage pre_judge` gate is hoisted out of the judge leaf into the conductor —
-    a pre-spawn dependency-DAG readiness check plus a post-return gate authoring
-    judge_gate_meta.json, ANDed into the judge pass condition."""
+class PostJudgeClassifierTest(unittest.TestCase):
+    """G4: post_judge severity classification of free-text `--stage pre_judge` violations."""
+
+    def test_recoverable_is_judge_authored_only(self) -> None:
+        # ONLY the judge's own deliverables are warm-resume-recoverable.
+        for base in ("semantic_review.json", "verdict.json", "aggregate_verdict.json",
+                     "summary.json", "validate_meta.json"):
+            self.assertEqual(
+                wc.classify_post_judge_violations(
+                    [f"workspace/pipelines/x/runs/r/n/{base}: review_method must be llm_semantic_review"]),
+                "recoverable", base)
+        # Execute-authored evidence is NOT judge-fixable -> unknown (fail_closed), no wasted
+        # warm-resume: the judge re-run cannot rewrite diagnostics/perf/trial_meta.
+        for base in ("perf.json", "diagnostics.json", "trial_meta.json"):
+            self.assertEqual(
+                wc.classify_post_judge_violations(
+                    [f"workspace/pipelines/x/runs/r/n/{base}: some execute-evidence violation"]),
+                "unknown", base)
+
+    def test_unrecoverable_integrity(self) -> None:
+        for line in (
+            "workspace/orchestrations/orch_x/agent_graph.json:edges[3] child not found",
+            "workspace/orchestrations/orch_x/steps/n/validate/x/step_result.json: missing",
+            "workspace/pipelines/x/lineage.json: node pipelines not issued",
+            "copy_based_artifact_reuse detected: workspace/...",
+            "dependency DAG incomplete for x; missing node workflows ['a']",
+            "workspace/orchestrations/orch_x: agent_runs.jsonl must include substep role",
+        ):
+            self.assertEqual(wc.classify_post_judge_violations([line]), "unrecoverable", line)
+
+    def test_unknown_and_precedence(self) -> None:
+        self.assertEqual(wc.classify_post_judge_violations([]), "unknown")
+        self.assertEqual(wc.classify_post_judge_violations(["something/weird.txt: huh"]), "unknown")
+        # Precedence: any unrecoverable dominates a recoverable in the same batch.
+        self.assertEqual(
+            wc.classify_post_judge_violations([
+                "workspace/runs/n/semantic_review.json: review_method must be llm_semantic_review",
+                "workspace/orchestrations/o/agent_graph.json: dangling edge",
+            ]), "unrecoverable")
+        # A single unknown forces escalation over a recoverable (no optimistic warm resume).
+        self.assertEqual(
+            wc.classify_post_judge_violations([
+                "workspace/runs/n/semantic_review.json: review_method must be llm_semantic_review",
+                "something/weird.txt: huh",
+            ]), "unknown")
+
+
+class G3JudgeGateSubstepTest(unittest.TestCase):
+    """G3/G4: the `--stage pre_judge` gate is two deterministic substeps wrapping the judge —
+    pre_judge (pre-spawn DAG readiness) authoring pre_judge_meta.json and post_judge (the gate +
+    severity classifier) authoring post_judge_meta.json."""
 
     def _conductor(self, repo: Path) -> "wc.Conductor":
         return wc.Conductor(repo_root=repo, orchestration_id="t",
@@ -3486,77 +3698,119 @@ class G3JudgePreJudgeGateTest(unittest.TestCase):
             ir_id="x_1", pipeline_id="x_1", source_id="src_1", binary_id="bin_1",
             run_id="run_1")
 
-    def _seed_run_node(self, repo: Path, refs: wc.NodeRefs, *,
-                       agg: str | None, gate: dict | None) -> list[str]:
-        rn = repo / refs.run_node_dir()
-        rn.mkdir(parents=True, exist_ok=True)
-        if agg is not None:
-            (rn / "aggregate_verdict.json").write_text(
-                json.dumps({"aggregate_verdict": agg}), encoding="utf-8")
-        if gate is not None:
-            (rn / "judge_gate_meta.json").write_text(json.dumps(gate), encoding="utf-8")
-        return []
-
-    # -- determine_substep_status judge branch (verdict AND gate) --------------
-    def test_determine_judge_passes_only_when_verdict_and_gate_pass(self) -> None:
-        import tempfile
-        with tempfile.TemporaryDirectory() as td:
-            repo, refs = Path(td), self._refs()
-            c = self._conductor(repo)
-            # pass verdict + pass gate -> pass
-            self._seed_run_node(repo, refs, agg="pass", gate={"status": "pass"})
-            self.assertEqual(
-                c.determine_substep_status(refs, "validate", "judge", [])[0], "pass")
-            # pass verdict + FAIL gate (structural pre_judge violation) -> fail
-            self._seed_run_node(repo, refs, agg="pass", gate={"status": "fail"})
-            self.assertEqual(
-                c.determine_substep_status(refs, "validate", "judge", [])[0], "fail")
-            # pass verdict + MISSING gate (e.g. crashed judge, gate never ran) -> fail
-            self._seed_run_node(repo, refs, agg="pass", gate=None)
-            (repo / refs.run_node_dir() / "judge_gate_meta.json").unlink(missing_ok=True)
-            self.assertEqual(
-                c.determine_substep_status(refs, "validate", "judge", [])[0], "fail")
-            # FAIL verdict + pass gate -> fail (physics failure)
-            self._seed_run_node(repo, refs, agg="fail", gate={"status": "pass"})
-            self.assertEqual(
-                c.determine_substep_status(refs, "validate", "judge", [])[0], "fail")
-
-    # -- _run_judge_pre_judge_gate post-gate (subprocess -> judge_gate_meta) ---
     def _patch_run(self, fn):
         from unittest import mock
         return mock.patch.object(wc.subprocess, "run", fn)
 
-    def test_post_gate_pass_writes_pass_meta(self) -> None:
+    def _seed_agg(self, repo: Path, refs: wc.NodeRefs, agg: str) -> None:
+        rn = repo / refs.run_node_dir()
+        rn.mkdir(parents=True, exist_ok=True)
+        (rn / "aggregate_verdict.json").write_text(
+            json.dumps({"aggregate_verdict": agg}), encoding="utf-8")
+
+    # -- determine_substep_status: judge (verdict only), pre_judge/post_judge (meta) -------
+    def test_determine_judge_passes_on_verdict_alone(self) -> None:
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            repo, refs = Path(td), self._refs()
+            c = self._conductor(repo)
+            self._seed_agg(repo, refs, "pass")  # post-G3-split: no gate AND in the judge branch
+            self.assertEqual(
+                c.determine_substep_status(refs, "validate", "judge", [])[0], "pass")
+            self._seed_agg(repo, refs, "fail")
+            self.assertEqual(
+                c.determine_substep_status(refs, "validate", "judge", [])[0], "fail")
+
+    def test_determine_pre_and_post_judge_meta_branches(self) -> None:
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            repo, refs = Path(td), self._refs()
+            c = self._conductor(repo)
+            rn = repo / refs.run_node_dir()
+            rn.mkdir(parents=True, exist_ok=True)
+            for sub, fname in (("pre_judge", "pre_judge_meta.json"),
+                               ("post_judge", "post_judge_meta.json")):
+                p = rn / fname
+                paths = [refs.run_node_dir() + "/" + fname]
+                p.write_text(json.dumps({"status": "pass"}), encoding="utf-8")
+                mtime = p.stat().st_mtime
+                self.assertEqual(
+                    c.determine_substep_status(refs, "validate", sub, paths,
+                                               min_mtime=mtime - 100)[0], "pass")
+                p.write_text(json.dumps({"status": "fail"}), encoding="utf-8")
+                self.assertEqual(
+                    c.determine_substep_status(refs, "validate", sub, paths,
+                                               min_mtime=p.stat().st_mtime - 100)[0], "fail")
+
+    # -- _pre_judge_inproc -----------------------------------------------------
+    def test_pre_judge_inproc_pass_and_fail(self) -> None:
+        import tempfile
+        from unittest import mock
+        with tempfile.TemporaryDirectory() as td:
+            repo, refs = Path(td), self._refs()
+            (repo / refs.run_node_dir()).mkdir(parents=True, exist_ok=True)
+            c = self._conductor(repo)
+            # empty closure -> pass
+            with mock.patch.object(c, "_judge_pre_spawn_dag_block", lambda r: None):
+                out = c._pre_judge_inproc(refs, "child-pj", "captok")
+            self.assertEqual(out["returncode"], 0)
+            meta = json.loads((repo / refs.run_node_dir() / "pre_judge_meta.json").read_text())
+            self.assertEqual(meta["status"], "pass")
+            # incomplete closure -> fail with dag category
+            with mock.patch.object(c, "_judge_pre_spawn_dag_block",
+                                   lambda r: "missing ['component/dep']"):
+                out = c._pre_judge_inproc(refs, "child-pj", "captok")
+            self.assertEqual(out["returncode"], 0)  # content failure, not transport
+            meta = json.loads((repo / refs.run_node_dir() / "pre_judge_meta.json").read_text())
+            self.assertEqual(meta["status"], "fail")
+            self.assertEqual(meta["failure_category"], "pre_judge_dag_incomplete")
+
+    # -- _post_judge_inproc (subprocess -> post_judge_meta + disposition) ------
+    def test_post_judge_pass_writes_pass_meta(self) -> None:
         import tempfile
         with tempfile.TemporaryDirectory() as td:
             repo, refs = Path(td), self._refs()
             (repo / refs.run_node_dir()).mkdir(parents=True, exist_ok=True)
             c = self._conductor(repo)
             with self._patch_run(lambda cmd, **k: wc.subprocess.CompletedProcess(cmd, 0, "", "")):
-                ok = c._run_judge_pre_judge_gate(refs, "child-judge")
-            self.assertTrue(ok)
-            meta = json.loads((repo / refs.run_node_dir() / "judge_gate_meta.json").read_text())
+                out = c._post_judge_inproc(refs, "child-post", "captok")
+            self.assertEqual(out["returncode"], 0)
+            meta = json.loads((repo / refs.run_node_dir() / "post_judge_meta.json").read_text())
             self.assertEqual(meta["status"], "pass")
-            self.assertIsNone(meta["failure_category"])
+            self.assertIsNone(meta["disposition"])
 
-    def test_post_gate_fail_writes_fail_meta_with_excerpt(self) -> None:
+    def test_post_judge_recoverable_violation_sets_warm_resume(self) -> None:
         import tempfile
         with tempfile.TemporaryDirectory() as td:
             repo, refs = Path(td), self._refs()
             (repo / refs.run_node_dir()).mkdir(parents=True, exist_ok=True)
             c = self._conductor(repo)
-            with self._patch_run(
-                    lambda cmd, **k: wc.subprocess.CompletedProcess(cmd, 1, "boom-out", "boom-err")):
-                ok = c._run_judge_pre_judge_gate(refs, "child-judge")
-            self.assertFalse(ok)
-            meta = json.loads((repo / refs.run_node_dir() / "judge_gate_meta.json").read_text())
+            out = ("pipeline semantic validation: FAIL\n"
+                   "- workspace/runs/n/semantic_review.json: review_method must be "
+                   "llm_semantic_review\n")
+            with self._patch_run(lambda cmd, **k: wc.subprocess.CompletedProcess(cmd, 1, out, "")):
+                res = c._post_judge_inproc(refs, "child-post", "captok")
+            self.assertEqual(res["returncode"], 0)  # content failure, not transport
+            meta = json.loads((repo / refs.run_node_dir() / "post_judge_meta.json").read_text())
             self.assertEqual(meta["status"], "fail")
             self.assertEqual(meta["failure_category"], "pre_judge_violation")
-            self.assertIn("boom", meta["failure_excerpt"])
+            self.assertEqual(meta["disposition"], "warm_resume")
+            self.assertTrue(any("review_method" in v for v in meta["violations"]))
 
-    def test_post_gate_subprocess_launch_failure_records_gate_error(self) -> None:
-        # A subprocess-launch failure (OSError) is caught and recorded as a gate failure so
-        # run_phase terminalizes fail_closed instead of crashing — not an uncaught exception.
+    def test_post_judge_unrecoverable_violation_sets_fail_closed(self) -> None:
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            repo, refs = Path(td), self._refs()
+            (repo / refs.run_node_dir()).mkdir(parents=True, exist_ok=True)
+            c = self._conductor(repo)
+            out = ("pipeline semantic validation: FAIL\n"
+                   "- workspace/orchestrations/o/agent_graph.json:edges[1] child not found\n")
+            with self._patch_run(lambda cmd, **k: wc.subprocess.CompletedProcess(cmd, 1, out, "")):
+                c._post_judge_inproc(refs, "child-post", "captok")
+            meta = json.loads((repo / refs.run_node_dir() / "post_judge_meta.json").read_text())
+            self.assertEqual(meta["disposition"], "fail_closed")
+
+    def test_post_judge_subprocess_launch_failure_records_gate_error(self) -> None:
         import tempfile
         with tempfile.TemporaryDirectory() as td:
             repo, refs = Path(td), self._refs()
@@ -3567,20 +3821,22 @@ class G3JudgePreJudgeGateTest(unittest.TestCase):
                 raise OSError("python3 not found")
 
             with self._patch_run(boom):
-                ok = c._run_judge_pre_judge_gate(refs, "child-judge")
-            self.assertFalse(ok)
-            meta = json.loads((repo / refs.run_node_dir() / "judge_gate_meta.json").read_text())
+                res = c._post_judge_inproc(refs, "child-post", "captok")
+            self.assertEqual(res["returncode"], 0)
+            meta = json.loads((repo / refs.run_node_dir() / "post_judge_meta.json").read_text())
             self.assertEqual(meta["status"], "fail")
-            self.assertEqual(meta["failure_category"], "pre_judge_gate_error")
+            self.assertEqual(meta["failure_category"], "post_judge_gate_error")
+            self.assertEqual(meta["disposition"], "fail_closed")
 
-    def test_post_gate_emits_scoped_pre_judge_args(self) -> None:
-        # The conductor-owned gate must run --stage pre_judge scoped to its own run
-        # (--pipeline-root/--run-id) with the judge child as --in-flight-agent-run-id.
+    def test_post_judge_emits_scoped_args_with_both_in_flight(self) -> None:
+        # post_judge runs --stage pre_judge scoped to its own run, declaring BOTH the judge and
+        # the post_judge (self) arids in-flight (post_judge's own graph edge is dangling).
         import tempfile
         with tempfile.TemporaryDirectory() as td:
             repo, refs = Path(td), self._refs()
             (repo / refs.run_node_dir()).mkdir(parents=True, exist_ok=True)
             c = self._conductor(repo)
+            c._pending_judge_arid = {refs.node_key: "child-judge"}
             seen = {}
 
             def run(cmd, **k):
@@ -3588,13 +3844,14 @@ class G3JudgePreJudgeGateTest(unittest.TestCase):
                 return wc.subprocess.CompletedProcess(cmd, 0, "", "")
 
             with self._patch_run(run):
-                c._run_judge_pre_judge_gate(refs, "child-judge")
+                c._post_judge_inproc(refs, "child-post", "captok")
             cmd = seen["cmd"]
-            self.assertIn("--stage", cmd)
             self.assertEqual(cmd[cmd.index("--stage") + 1], "pre_judge")
-            self.assertEqual(cmd[cmd.index("--in-flight-agent-run-id") + 1], "child-judge")
             self.assertEqual(cmd[cmd.index("--pipeline-root") + 1], refs.pipeline_ref)
             self.assertEqual(cmd[cmd.index("--run-id") + 1], "run_1")
+            inflight = [cmd[i + 1] for i, t in enumerate(cmd) if t == "--in-flight-agent-run-id"]
+            self.assertIn("child-post", inflight)
+            self.assertIn("child-judge", inflight)
 
     # -- _judge_pre_spawn_dag_block (multi-node fail / single-node skip) -------
     def _patch_closure_validated(self, fn):

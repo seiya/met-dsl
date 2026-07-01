@@ -7362,9 +7362,16 @@ def _validate_orchestration_hierarchy(
             step_name = req_doc.get("step")
             substep_name = req_doc.get("substep")
             node_key = req_doc.get("node_key")
+            # The live caller running --stage pre_judge is either the judge leaf itself
+            # (historic, self-judging) or the deterministic post_judge substep (G3 split:
+            # post_judge runs the gate AFTER the judge returns, so post_judge's own
+            # agent_graph edge is the dangling in-flight one). Accept both validate substeps;
+            # any other (step, substep) declared in-flight is ignored so the flag can never
+            # suppress unrelated missing-record violations.
             if not (
                 isinstance(step_name, str) and step_name.strip().lower() == "validate"
-                and isinstance(substep_name, str) and substep_name.strip().lower() == "judge"
+                and isinstance(substep_name, str)
+                and substep_name.strip().lower() in ("judge", "post_judge")
             ):
                 continue
             inflight_exempt_arids.add(arid)

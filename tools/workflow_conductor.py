@@ -83,7 +83,23 @@ SUBSTEPS: dict[str, tuple[str | None, ...]] = {
     #     reopen (LINT_FAILURE_ROUTING / STATIC_FAILURE_ROUTING).
     "generate": ("generate", "lint", "static", "verify"),
     "build": (None,),
-    "validate": ("execute", "judge"),
+    # validate wraps the LLM judge in two deterministic conductor-in-process gates,
+    # mirroring the compile/generate deterministic-interleave model:
+    #   - pre_judge  (Conductor._pre_judge_inproc):  the pre-spawn dependency-DAG readiness
+    #     check (a --with-deps closure not built+validated in its own pipeline). Runs BEFORE
+    #     execute so a cold judge is never spawned for an incomplete closure. A failure is a
+    #     non-physics integrity blocker -> fail_closed (never warm-resumed; no judge has run).
+    #   - execute    (Conductor._execute_inproc):    unchanged binary run + evidence capture.
+    #   - judge      (LLM leaf):                      pure LLM semantic pass; invokes NO
+    #     validator gate (ALLOWED_VALIDATE_PIPELINE_STAGES[(validate,judge)] == frozenset()).
+    #   - post_judge (Conductor._post_judge_inproc):  runs `validate_pipeline_semantics
+    #     --stage pre_judge` (the gate the judge leaf used to own) and CLASSIFIES the
+    #     violation severity. A recoverable (leaf/judge-authored conformance) violation
+    #     warm-resumes the judge in place; an orchestration-record/DAG integrity violation
+    #     (or an unknown one) is fail_closed. NOTE the naming: the substep is `post_judge`
+    #     (it runs AFTER the judge) but the validator STAGE it invokes is literally named
+    #     `pre_judge` ("before pass-certification") — do not confuse the two.
+    "validate": ("pre_judge", "execute", "judge", "post_judge"),
 }
 
 # Build is the only phase whose step_result executor is the (child) step agent;
@@ -179,6 +195,68 @@ VALIDATE_JUDGE_ROUTING: dict[tuple[str, str], tuple[str, str | None]] = {
     ("structural_violation", "code"): ("generate", "reuse"),
     ("structural_violation", "ir"): ("compile", "reopen"),
 }
+
+
+# post_judge severity classification. The `--stage pre_judge` gate accumulates FREE-TEXT
+# violation strings (no structured category), each prefixed with the offending artifact
+# path, so the classifier keys on that leading path token.
+#
+#   - recoverable   : the violation is in a file the JUDGE LLM authors, so re-running the
+#                     judge (warm resume) can actually rewrite it. Scoped to EXACTLY the judge's
+#                     deliverables (phase_04 §4-2): semantic_review.json (incl. the review_method
+#                     literal), verdict.json, aggregate_verdict.json, summary.json,
+#                     validate_meta.json. NOT the execute-authored evidence
+#                     (diagnostics/perf/trial_meta/raw) — the judge cannot rewrite those, so a
+#                     violation there would warm-resume uselessly; it falls to `unknown` (below)
+#                     and fail_closes immediately instead of wasting judge spawns.
+#   - unrecoverable : orchestration-record / cross-pipeline dependency-DAG integrity. Re-running
+#                     the judge cannot fix these. Sources: _validate_orchestration_hierarchy
+#                     (agent_graph.json / step_result.json / an orchestrations/ root) and the
+#                     cross-pipeline DAG check (lineage.json / the literal DAG messages).
+#   - unknown       : anything else (incl. execute-authored evidence) -> conservatively terminal
+#                     (fail_closed) for now; a future escalate-LLM adjudicator would decide here.
+_POST_JUDGE_RECOVERABLE_BASENAMES: frozenset[str] = frozenset({
+    "semantic_review.json", "verdict.json", "aggregate_verdict.json", "summary.json",
+    "validate_meta.json",
+})
+_POST_JUDGE_UNRECOVERABLE_BASENAMES: frozenset[str] = frozenset({
+    "agent_graph.json", "step_result.json", "lineage.json",
+})
+_POST_JUDGE_UNRECOVERABLE_MARKERS: tuple[str, ...] = (
+    "copy_based_artifact_reuse detected", "dependency DAG incomplete",
+)
+
+
+def classify_post_judge_violations(violations: list[str]) -> str:
+    """Classify a post_judge `--stage pre_judge` violation list into one of
+    {"recoverable", "unrecoverable", "unknown"}.
+
+    Precedence is strict: unrecoverable > unknown > recoverable. Any single
+    orchestration-record/DAG integrity violation dominates (the node is not certifiable in
+    this run); a single unclassifiable line forces escalation/terminalization rather than an
+    optimistic warm resume. An empty list is "unknown" (a FAIL with no parsable bullet is not
+    a recoverable conformance issue)."""
+    if not violations:
+        return "unknown"
+    saw_recoverable = False
+    saw_unknown = False
+    for raw in violations:
+        line = raw.strip()
+        # The offending artifact path is the leading token, delimited by ':' or whitespace.
+        head = line.split(":", 1)[0].strip()
+        token = head.split()[0] if head.split() else head
+        basename = token.rsplit("/", 1)[-1]
+        if (basename in _POST_JUDGE_UNRECOVERABLE_BASENAMES
+                or "orchestrations/" in token
+                or any(m in line for m in _POST_JUDGE_UNRECOVERABLE_MARKERS)):
+            return "unrecoverable"
+        if basename in _POST_JUDGE_RECOVERABLE_BASENAMES:
+            saw_recoverable = True
+        else:
+            saw_unknown = True
+    if saw_unknown:
+        return "unknown"
+    return "recoverable" if saw_recoverable else "unknown"
 
 
 # Bound the deterministic retry/reopen loop so a persistently-failing node cannot
@@ -489,7 +567,7 @@ def build_launch_request(
     # Build, Validate.execute, Generate.lint and Generate.static run in-process (no leaf), so
     # they carry no skill / leaf prompt — only the bookkeeping the capability/phase_state need.
     deterministic = (step == "build"
-                     or (step == "validate" and substep == "execute")
+                     or (step == "validate" and substep in ("pre_judge", "execute", "post_judge"))
                      or (step == "generate" and substep in ("lint", "static"))
                      or (step == "compile" and substep == "static"))
     rep = {
@@ -648,7 +726,17 @@ def build_launch_request(
         req["run_id"] = refs.run_id
         req["dependency_ref"] = refs.pipeline_ref
         rundir = refs.run_node_dir()
-        if substep == "execute":
+        if substep == "pre_judge":
+            # Deterministic pre-spawn dependency-DAG readiness gate. The conductor authors
+            # pre_judge_meta.json (the only freshness-gated deliverable) in-process; no leaf,
+            # no must-read, no run evidence yet.
+            req["allowed_output_paths"] = [f"{rundir}/pre_judge_meta.json"]
+        elif substep == "post_judge":
+            # Deterministic post-return `--stage pre_judge` gate + severity classifier. The
+            # conductor authors post_judge_meta.json (status + violations + disposition)
+            # in-process after the judge leaf returns.
+            req["allowed_output_paths"] = [f"{rundir}/post_judge_meta.json"]
+        elif substep == "execute":
             req["source_id"] = refs.source_id
             req["source_binary_id"] = refs.source_binary_id
             must_read += [
@@ -1459,18 +1547,31 @@ clean:
             meta = _read_json(self.repo_root / src_meta) or {}
             status = "pass" if (meta.get("verification_status") == "pass"
                                 and _fresh_deliverables_written([src_meta])) else "fail"
+        elif phase == "validate" and substep == "pre_judge":
+            # Deterministic pre-spawn DAG readiness: the conductor-authored pre_judge_meta
+            # records whether every --with-deps closure node is built+validated in its own
+            # pipeline. A not-ready closure is status=fail with rc 0, so the substep fails
+            # here and classify_failure routes it to fail_closed (integrity blocker).
+            meta = _read_json(self.repo_root / refs.run_node_dir() / "pre_judge_meta.json") or {}
+            status = "pass" if (meta.get("status") == "pass"
+                                and _fresh_deliverables_written(allowed_output_paths)) else "fail"
         elif phase == "validate" and substep == "judge":
-            # Judge passes only when the LLM verdict is pass/xfail AND the conductor-owned
-            # pre_judge post-gate passed (judge_gate_meta.status == pass, written by
-            # _run_judge_pre_judge_gate after the leaf returned). The gate is load-bearing
-            # here: the `--stage pre_judge` structural gate moved OUT of the judge leaf, so a
-            # judge that semantically passed (aggregate_verdict=pass) but tripped an
-            # orchestration-record/DAG integrity violation must still fail the substep — a
-            # missing judge_gate_meta (e.g. a crashed judge) reads as fail too.
+            # Post-G3-split judge: a PURE LLM semantic pass. It passes on the LLM verdict alone
+            # (aggregate_verdict pass/xfail); the structural `--stage pre_judge` gate moved OUT
+            # to the post_judge substep, so its AND is no longer applied here.
             agg = _read_json(self.repo_root / refs.run_node_dir() / "aggregate_verdict.json") or {}
-            gate = _read_json(self.repo_root / refs.run_node_dir() / "judge_gate_meta.json") or {}
-            verdict_ok = str(agg.get("aggregate_verdict") or agg.get("overall")) in ("pass", "xfail")
-            status = "pass" if (verdict_ok and gate.get("status") == "pass") else "fail"
+            status = ("pass"
+                      if str(agg.get("aggregate_verdict") or agg.get("overall")) in ("pass", "xfail")
+                      else "fail")
+        elif phase == "validate" and substep == "post_judge":
+            # Deterministic post-return gate: the conductor-authored post_judge_meta records
+            # the `--stage pre_judge` verdict (orchestration-record + cross-pipeline DAG
+            # integrity). A violation is status=fail with rc 0; run_phase reads its
+            # `disposition` to decide warm-resume-judge vs fail_closed. This is where the old
+            # judge-gate AND now lives (a certified-pass node must clear this gate).
+            meta = _read_json(self.repo_root / refs.run_node_dir() / "post_judge_meta.json") or {}
+            status = "pass" if (meta.get("status") == "pass"
+                                and _fresh_deliverables_written(allowed_output_paths)) else "fail"
         elif phase == "build":
             # Deterministic build: the conductor-authored binary_meta records the compile
             # + post_build-gate verdict. A content failure (compile/link error, post_build
@@ -1566,7 +1667,7 @@ clean:
     @staticmethod
     def _is_deterministic_substep(phase: str, substep: str | None) -> bool:
         return (phase == "build"
-                or (phase == "validate" and substep == "execute")
+                or (phase == "validate" and substep in ("pre_judge", "execute", "post_judge"))
                 or (phase == "generate" and substep in ("lint", "static"))
                 or (phase == "compile" and substep == "static"))
 
@@ -1633,6 +1734,10 @@ clean:
             cap_token = self._capability_token(child_arid)
             if phase == "build":
                 out = self._build_inproc(refs, child_arid, cap_token)
+            elif phase == "validate" and substep == "pre_judge":
+                out = self._pre_judge_inproc(refs, child_arid, cap_token)
+            elif phase == "validate" and substep == "post_judge":
+                out = self._post_judge_inproc(refs, child_arid, cap_token)
             elif phase == "validate" and substep == "execute":
                 out = self._execute_inproc(refs, child_arid, cap_token)
             elif phase == "generate" and substep == "lint":
@@ -2518,24 +2623,10 @@ clean:
             # not hook-guarded, so they don't trip the output-manifest guard.
             self._persist_leaf_output(child_arid, proc)
             token = self.read_parent_return_token(child_arid)
-            # Conductor-owned pre_judge POST-GATE (G3): now that the judge leaf produced its
-            # verdict, run the `--stage pre_judge` gate the leaf used to own and record
-            # judge_gate_meta.json. Scoped to an OTHERWISE-PASSING judge (aggregate_verdict
-            # pass/xfail): pre_judge's `_validate_llm_semantic_review` treats
-            # `semantic_review.decision != "pass"` as a violation, so running it on a legitimate
-            # physics/evidence FAIL verdict would mislabel that routeable failure as an integrity
-            # blocker (fail_closed) and rob classify_failure of the retry/attribution routing. A
-            # non-pass verdict skips the gate and flows to classify_failure's decision tables
-            # exactly as before (like the leaf era, where the completion pre_judge ran only on a
-            # judge terminating pass). The structural gate matters only when a node is about to be
-            # CERTIFIED pass. A nonzero leaf exit is a transport failure handled by run_phase.
-            if phase == "validate" and substep == "judge" and proc.returncode == 0:
-                agg = _read_json(
-                    self.repo_root / refs.run_node_dir() / "aggregate_verdict.json") or {}
-                verdict_ok = str(
-                    agg.get("aggregate_verdict") or agg.get("overall")) in ("pass", "xfail")
-                if verdict_ok and not self._run_judge_pre_judge_gate(refs, child_arid):
-                    proc.stderr = (proc.stderr or "") + "\n[pre_judge gate fail]\n"
+            # G3 split: the `--stage pre_judge` gate that used to run here inline after the
+            # judge leaf is now the deterministic `post_judge` substep
+            # (Conductor._post_judge_inproc), so the judge leaf is a pure LLM semantic pass and
+            # run_substep no longer runs any gate for it.
         status, output_refs = self.determine_substep_status(
             refs, phase, substep, request["allowed_output_paths"], min_mtime=launched_at)
         # A nonzero leaf exit (crash / transport failure) fails the substep even if
@@ -2679,15 +2770,17 @@ clean:
     # -- Validate.judge conductor-owned pre_judge gate (G3) --------------------
     # The purely-structural `--stage pre_judge` gate (orchestration-record integrity +
     # the cross-pipeline dependency DAG) used to run INSIDE the LLM judge leaf as its final
-    # step. It is hoisted to the conductor for canonical single-ownership, mirroring the
-    # G1/G2 deterministic-gate hoists one and two phases up:
-    #   - pre-spawn (`_judge_pre_spawn_dag_block`): before spawning a COLD judge, fail fast
-    #     when a --with-deps dependency closure is not built+validated in its own pipeline.
-    #   - post-gate (`_run_judge_pre_judge_gate`): after the judge returns its verdict, run
-    #     pre_judge and record `judge_gate_meta.json`; a violation is a non-physics INTEGRITY
-    #     blocker that run_phase terminalizes as fail_closed (see run_phase).
-    # The judge leaf itself no longer invokes any validator gate (ALLOWED_VALIDATE_PIPELINE_
-    # STAGES[(validate,judge)] == frozenset()), so it is a pure LLM semantic pass.
+    # step. It is hoisted to the conductor as two deterministic substeps wrapping the judge,
+    # mirroring the G1/G2 deterministic-gate hoists one and two phases up:
+    #   - pre_judge  (`_pre_judge_inproc`, index 0): before running execute or spawning a COLD
+    #     judge, fail fast when a --with-deps dependency closure is not built+validated in its
+    #     own pipeline (via `_judge_pre_spawn_dag_block`). A failure is fail_closed.
+    #   - post_judge (`_post_judge_inproc`, index 3): after the judge returns its verdict, run
+    #     `--stage pre_judge` and record `post_judge_meta.json` with a severity `disposition`;
+    #     a recoverable (leaf/judge-authored) violation warm-resumes the judge, an integrity
+    #     violation is fail_closed.
+    # The judge leaf itself invokes no validator gate (ALLOWED_VALIDATE_PIPELINE_STAGES for
+    # all three of pre_judge/judge/post_judge == frozenset()), so it is a pure LLM semantic pass.
 
     def _judge_pre_spawn_dag_block(self, refs: NodeRefs) -> str | None:
         """Pre-spawn Validate.judge dependency-DAG readiness (multi-node closures only).
@@ -2730,66 +2823,174 @@ clean:
                 f"workflows {missing} (run the dependency closure first, e.g. via "
                 "run_workflow.py --with-deps)")
 
-    def _write_judge_gate_meta(self, refs: NodeRefs, *, status: str,
-                               failure_category: str | None,
-                               failure_excerpt: str | None) -> None:
-        """Author the conductor-owned `judge_gate_meta.json` recording the pre_judge gate
-        verdict under the run-node dir (the same host-written area as trial_meta /
-        aggregate_verdict; not a leaf deliverable). determine_substep_status ANDs its
-        `status` into the judge pass condition, and run_phase terminalizes a `fail` as a
-        fail_closed integrity blocker."""
-        meta = {
+    def _write_run_node_meta(self, refs: NodeRefs, filename: str,
+                             meta: dict[str, Any]) -> None:
+        """Author a conductor-owned meta JSON under the run-node dir (the same host-written
+        area as trial_meta / aggregate_verdict; not a leaf deliverable)."""
+        path = self.repo_root / refs.run_node_dir() / filename
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps(meta, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+
+    def _pre_judge_inproc(self, refs: NodeRefs, child_arid: str,
+                          cap_token: str) -> dict[str, str]:
+        """Deterministic Validate.pre_judge: the pre-spawn dependency-DAG readiness gate,
+        promoted from a run_phase pre-loop branch to a recorded substep at index 0. Runs
+        BEFORE execute so a --with-deps closure that is not built+validated in its own
+        pipeline fails fast (no execute, no cold judge spawned). Authors pre_judge_meta.json;
+        a not-ready closure is a CONTENT failure (status=fail, rc 0) that classify_failure
+        routes to fail_closed (a non-physics integrity blocker — never warm-resumed, since no
+        judge has run). A single-node run (empty closure) passes with zero overhead."""
+        block = self._judge_pre_spawn_dag_block(refs)
+        status = "fail" if block is not None else "pass"
+        self._write_run_node_meta(refs, "pre_judge_meta.json", {
             "run_id": refs.run_id,
             "node_key": refs.node_key,
             "pipeline_id": refs.pipeline_id,
             "status": status,
             "validation_stage": "pre_judge",
-            "failure_category": failure_category,
-            "failure_excerpt": failure_excerpt,
-        }
-        path = self.repo_root / refs.run_node_dir() / "judge_gate_meta.json"
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(
-            json.dumps(meta, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+            "failure_category": "pre_judge_dag_incomplete" if block else None,
+            "failure_excerpt": block,
+        })
+        if block is not None:
+            self.emit("judge_pre_spawn_blocked", node_key=refs.node_key, detail=block[:200])
+        # Content failure returns rc 0 so run_phase routes it via classify_failure ->
+        # fail_closed; determine_substep_status reads pre_judge_meta.status.
+        return {"returncode": 0, "stdout": "",
+                "stderr": ("[pre_judge dag incomplete]\n" + block) if block else ""}
 
-    def _run_judge_pre_judge_gate(self, refs: NodeRefs, child_arid: str) -> bool:
-        """Conductor-owned post-gate: run `validate_pipeline_semantics --stage pre_judge`
-        after the judge leaf returns, and author judge_gate_meta.json with the verdict.
-        Returns True on pass.
+    def _post_judge_inproc(self, refs: NodeRefs, child_arid: str,
+                           cap_token: str) -> dict[str, str]:
+        """Deterministic Validate.post_judge: run `validate_pipeline_semantics --stage
+        pre_judge` (the gate the judge leaf used to own, G3) AFTER the judge returns its
+        verdict, then classify the violation severity into a `disposition`. Authors
+        post_judge_meta.json {status, violations, disposition}.
 
         Scoped to this run (`--pipeline-root`/`--run-id`) so historically-broken sibling
-        pipelines cannot fail an otherwise-conformant node; the cross-pipeline dependency
-        DAG check inside pre_judge still validates dependencies built in their own
-        `--with-deps` pipelines. `--in-flight-agent-run-id` is the judge child (recorded +
-        returned but not yet finalized -> no step_result yet), the same in-flight scoping
-        the leaf used when it owned the gate. Mirrors the _build_inproc post_build idiom
-        (rc-checked subprocess, check=False).
+        pipelines cannot fail an otherwise-conformant node. `--in-flight-agent-run-id` names
+        BOTH the judge substep (recorded+returned) AND this post_judge substep's own arid:
+        post_judge's agent_graph edge is written by record_launch but its agent_runs.jsonl
+        row is appended only after this body returns, so its own edge is dangling RIGHT NOW
+        and must be declared in-flight or `_validate_orchestration_hierarchy` flags it (the
+        gate's in-flight filter accepts substep ∈ {judge, post_judge}). The judge arid is
+        declared too (harmless: it is already recorded, so it is a no-op that documents the
+        live judge region).
 
-        A subprocess-launch failure (OSError, e.g. an unresolvable `python3`) is caught and
-        recorded as a gate failure so run_phase terminalizes cleanly `fail_closed` instead of
-        an uncaught crash — matching the transport-fail posture the deterministic in-process
-        gates get for free from `_run_deterministic_substep`'s exception wrapper (which does
-        not wrap this leaf-branch post-gate)."""
+        disposition: recoverable (leaf/judge-authored conformance violation) -> warm_resume
+        (run_phase warm-resumes the judge in place); unrecoverable (orchestration-record /
+        cross-pipeline DAG integrity) -> fail_closed; unknown -> fail_closed (conservative;
+        an escalate-LLM adjudicator is a deferred follow-up)."""
+        judge_arid = getattr(self, "_pending_judge_arid", {}).get(refs.node_key, "")
+        cmd = ["python3", "tools/validate_pipeline_semantics.py", "--stage", "pre_judge",
+               "--orchestration-id", self.orchestration_id,
+               "--pipeline-root", refs.pipeline_ref, "--run-id", str(refs.run_id),
+               "--in-flight-agent-run-id", child_arid]
+        if judge_arid:
+            cmd += ["--in-flight-agent-run-id", judge_arid]
         try:
             gate = subprocess.run(
-                ["python3", "tools/validate_pipeline_semantics.py", "--stage", "pre_judge",
-                 "--orchestration-id", self.orchestration_id,
-                 "--in-flight-agent-run-id", child_arid,
-                 "--pipeline-root", refs.pipeline_ref,
-                 "--run-id", str(refs.run_id)],
-                cwd=self.repo_root, env=self.env, text=True, capture_output=True, check=False)
+                cmd, cwd=self.repo_root, env=self.env, text=True,
+                capture_output=True, check=False)
         except OSError as exc:
-            self._write_judge_gate_meta(
-                refs, status="fail", failure_category="pre_judge_gate_error",
-                failure_excerpt=f"pre_judge gate subprocess failed to launch: {exc}"[:400])
-            return False
-        ok = gate.returncode == 0
-        self._write_judge_gate_meta(
-            refs, status="pass" if ok else "fail",
-            failure_category=None if ok else "pre_judge_violation",
-            failure_excerpt=None if ok
-            else "\n".join((gate.stdout + gate.stderr).splitlines()[-50:]))
-        return ok
+            self._write_run_node_meta(refs, "post_judge_meta.json", {
+                "run_id": refs.run_id, "node_key": refs.node_key,
+                "pipeline_id": refs.pipeline_id, "status": "fail",
+                "validation_stage": "pre_judge",
+                "failure_category": "post_judge_gate_error",
+                "failure_excerpt": f"pre_judge gate subprocess failed to launch: {exc}"[:400],
+                "violations": [], "disposition": "fail_closed",
+            })
+            return {"returncode": 0, "stdout": "",
+                    "stderr": f"[post_judge gate launch fail] {exc}"}
+        if gate.returncode == 0:
+            self._write_run_node_meta(refs, "post_judge_meta.json", {
+                "run_id": refs.run_id, "node_key": refs.node_key,
+                "pipeline_id": refs.pipeline_id, "status": "pass",
+                "validation_stage": "pre_judge", "failure_category": None,
+                "failure_excerpt": None, "violations": [], "disposition": None,
+            })
+            return {"returncode": 0, "stdout": "", "stderr": ""}
+        combined = gate.stdout + gate.stderr
+        # The validator prints each violation as a `- {line}` bullet after a FAIL header.
+        violations = [ln[2:] for ln in combined.splitlines() if ln.startswith("- ")]
+        severity = classify_post_judge_violations(violations)
+        disposition = {
+            "recoverable": "warm_resume",
+            "unrecoverable": "fail_closed",
+            "unknown": "fail_closed",
+        }[severity]
+        self._write_run_node_meta(refs, "post_judge_meta.json", {
+            "run_id": refs.run_id, "node_key": refs.node_key,
+            "pipeline_id": refs.pipeline_id, "status": "fail",
+            "validation_stage": "pre_judge",
+            "failure_category": "pre_judge_violation",
+            "failure_excerpt": "\n".join(combined.splitlines()[-50:]),
+            "violations": violations, "disposition": disposition,
+        })
+        return {"returncode": 0, "stdout": "", "stderr": "[post_judge gate fail]\n" + combined}
+
+    def _maybe_warm_resume_post_judge(
+            self, refs: NodeRefs, outcomes: list["SubstepOutcome"],
+            dep_facts: tuple[dict[str, str], ...]) -> list["SubstepOutcome"]:
+        """Recover a RECOVERABLE post_judge conformance violation in place instead of
+        terminalizing fail_closed. When the failed substep is `post_judge` with
+        disposition=="warm_resume" (a leaf/judge-authored violation like a wrong
+        semantic_review.review_method literal), warm-resume the judge — re-authoring its
+        semantic_review.json with context intact via the slim findings-only prompt — then
+        re-run the deterministic post_judge gate. Bounded by MAX_ATTEMPTS_PER_PHASE.
+
+        Self-contained by design (does NOT go through conduct/reopen_phase): reopen_phase
+        re-runs the whole phase from index 0, passes repair only to index 0, refuses a
+        passing pipeline, and crashes for a validate trigger. This loop drives the warm-resume
+        primitives (`_resolve_reuse_resume`, the slim prompt) directly on the judge substep,
+        so the "repair only to index 0" rule is never consulted and the judge's index is
+        irrelevant. An unrecoverable/unknown disposition, or a judge re-run that itself fails,
+        falls through unchanged to run_phase's fail_closed posture."""
+        # Trigger only when the LAST (failed) substep is post_judge with a warm_resume verdict.
+        # These guards touch no filesystem so a passing phase returns before reading anything.
+        if not outcomes or outcomes[-1].status == "pass":
+            return outcomes
+        if SUBSTEPS["validate"][len(outcomes) - 1] != "post_judge":
+            return outcomes
+        node_dir = self.repo_root / refs.run_node_dir()
+        meta = _read_json(node_dir / "post_judge_meta.json") or {}
+        if meta.get("disposition") != "warm_resume":
+            return outcomes
+
+        for attempt in range(MAX_ATTEMPTS_PER_PHASE):
+            self.emit("post_judge_warm_resume", node_key=refs.node_key, attempt=attempt + 1)
+            judge_arid = getattr(self, "_pending_judge_arid", {}).get(refs.node_key, "")
+            findings = meta.get("failure_excerpt") or "post_judge conformance violation"
+            # Tombstone the superseded judge + post_judge attempt (outcomes[-2] is always the
+            # judge here: a post_judge failure implies the judge passed and both ran).
+            self._add_superseded_run_ids(
+                [outcomes[-2].agent_run_id, outcomes[-1].agent_run_id],
+                reason="validate_post_judge_warm_resume_orphan")
+            repair = {
+                "issue_severity": "major",
+                "repair_strategy": "reuse",
+                "repair_target_agent_run_id": judge_arid,
+                "repair_reason": "post_judge_conformance",
+                "repair_findings": findings,
+            }
+            judge_oc = self.run_substep(refs, "validate", "judge", repair=repair,
+                                        resolved_dependencies=dep_facts)
+            outcomes[-2] = judge_oc
+            if judge_oc.status != "pass":
+                # The warm-resumed judge failed (a fresh non-pass verdict or a transport
+                # error). Drop the stale post_judge so the failed judge is the terminal
+                # outcome; run_phase's transport branch / classify_validate_judge takes over.
+                return outcomes[:-1]
+            self._pending_judge_arid[refs.node_key] = judge_oc.agent_run_id
+            post_oc = self.run_substep(refs, "validate", "post_judge",
+                                       resolved_dependencies=dep_facts)
+            outcomes[-1] = post_oc
+            if post_oc.status == "pass":
+                return outcomes  # recovered: 4 passing substeps -> phase pass
+            meta = _read_json(node_dir / "post_judge_meta.json") or {}
+            if meta.get("disposition") != "warm_resume":
+                break  # became unrecoverable/unknown -> fail_closed
+        return outcomes
 
     def run_phase(self, refs: NodeRefs, phase: str,
                   repair: dict[str, str] | None = None) -> PhaseOutcome:
@@ -2814,12 +3015,17 @@ clean:
                 self._producer_arid[phase] = producer
             return PhaseOutcome(phase, "pass", decision=RouteDecision("advance"),
                                 skipped=True)
-        # Pre-spawn Validate.judge DAG readiness (G3): a --with-deps dependent must not spawn
-        # a cold judge — or even run execute — when its dependency closure is not built+
-        # validated in its own pipeline. Fail fast as a non-physics integrity blocker BEFORE
-        # any substep/leaf, so no judge launch is recorded (and the judge pre_phase_complete
-        # hook, which would require a semantic_review the leaf never wrote, is never reached).
-        # No-op for a single-node run (empty closure).
+        # Validate dependency-DAG readiness is checked HERE, before the generic launch gate.
+        # This is load-bearing: workflow_launch_check (and EVERY substep's own record-launch,
+        # including pre_judge's) is itself dependency-gated (`_dependency_ready`), so a
+        # not-built+validated closure would raise `dependency_not_ready` as an uncaught
+        # RuntimeError before the `pre_judge` substep could ever run. Fail fast with the clean
+        # `validate_pre_judge_dag_incomplete` fail_closed (the historic pre-spawn behavior).
+        # `_dependency_ready` only checks DIRECT deps, whereas `_judge_pre_spawn_dag_block`
+        # checks the full `dependency.all_nodes` closure, so this also catches transitive gaps
+        # the launch gate would miss. The deterministic `pre_judge` substep (index 0) re-runs
+        # the same check on the ready path and records `pre_judge_meta.json` (its in-body fail
+        # path is defensive — this pre-launch guard is the primary readiness check).
         if phase == "validate":
             block = self._judge_pre_spawn_dag_block(refs)
             if block is not None:
@@ -2862,8 +3068,19 @@ clean:
                       agent_run_id=oc.agent_run_id,
                       elapsed_seconds=round(time.monotonic() - substep_started, 2))
             outcomes.append(oc)
+            if phase == "validate" and substep == "judge":
+                # post_judge (the next substep) runs `--stage pre_judge` and must declare the
+                # judge's arid in-flight; stash it before post_judge is dispatched.
+                if not hasattr(self, "_pending_judge_arid"):
+                    self._pending_judge_arid: dict[str, str] = {}
+                self._pending_judge_arid[refs.node_key] = oc.agent_run_id
             if oc.status != "pass":
                 break
+        # Warm-resume mini-loop: a RECOVERABLE post_judge conformance violation (e.g. a wrong
+        # semantic_review.review_method literal) warm-resumes the judge in place and re-runs
+        # the deterministic post_judge gate, instead of terminalizing fail_closed.
+        if phase == "validate":
+            outcomes = self._maybe_warm_resume_post_judge(refs, outcomes, dep_facts)
         self._producer_arid[phase] = outcomes[0].agent_run_id
 
         if phase in SUBSTEP_AWARE_PHASES:
@@ -2887,14 +3104,20 @@ clean:
             "retry_decisions": None,
             "validation_stage": PHASE_VALIDATION_STAGE[phase],
         }
-        # Every terminal Validate step_result (pass OR fail) must carry a
-        # launch_request_ref so the pre_phase_complete judge hook can resolve the
-        # execution dir — use the last substep that ran (judge on pass; execute on
-        # an execute-failure where the judge never ran).
+        # Every terminal Validate step_result (pass OR fail) must carry a launch_request_ref
+        # so the pre_phase_complete judge hook can resolve the execution dir. Point it at the
+        # JUDGE substep whenever the judge ran (index 2): on a pass the last substep is the
+        # deterministic post_judge, and a post_judge launch_request_ref would make
+        # _pre_phase_complete_judge_checks skip the semantic_review enforcement (it keys on
+        # substep=="judge"). When the judge never ran (pre_judge/execute failure) fall back to
+        # the last substep that ran — its request points at a non-judge substep, so the hook
+        # correctly skips the semantic-review requirement.
         if phase == "validate" and outcomes:
+            judge_idx = SUBSTEPS["validate"].index("judge")
+            ref_oc = outcomes[judge_idx] if len(outcomes) > judge_idx else outcomes[-1]
             result["launch_request_ref"] = (
                 f"workspace/orchestrations/{self.orchestration_id}"
-                f"/launches/{outcomes[-1].agent_run_id}.request.json")
+                f"/launches/{ref_oc.agent_run_id}.request.json")
         # A nonzero leaf exit is an infra/transport failure (token limit, OOM, transport,
         # session limit) the decision tables cannot classify — route straight to fail_closed
         # so the operator can --resume. This is checked BEFORE write_step_result: a transport
@@ -2920,24 +3143,34 @@ clean:
                 reason=f"leaf_transport_error: leaf_exit={transport.leaf_returncode}")
             return PhaseOutcome(phase, status, substep_arids, failed, decision)
 
-        # G3: a conductor-run pre_judge POST-GATE failure (judge_gate_meta.status == fail) is a
-        # non-physics INTEGRITY blocker — the judge may have passed on physics
-        # (semantic_review.decision == pass) yet the orchestration-record / dependency-DAG
-        # integrity gate failed, which is unrecoverable in the current run (the documented
-        # `blocked` posture). Terminalize as fail_closed WITHOUT writing a routeable validate
-        # step_result: the judge pre_phase_complete hook forbids a `fail` step_result atop a
-        # `pass` semantic_review, so this follows the transport branch's skip-write + tombstone
-        # shape rather than routing through classify_failure. Reached only when the judge leaf
-        # returned cleanly (rc 0) — a crashed judge is caught by the transport branch above.
-        if phase == "validate" and status != "pass":
-            gate = _read_json(self.repo_root / refs.run_node_dir() / "judge_gate_meta.json") or {}
-            if gate.get("status") == "fail":
-                cat = gate.get("failure_category") or "pre_judge_violation"
+        # G4: the deterministic validate gate substeps (pre_judge / post_judge) fail the phase
+        # as non-physics INTEGRITY blockers, terminalized fail_closed WITHOUT a routeable
+        # step_result (skip-write + tombstone, matching the transport branch shape). Gate on the
+        # ACTUALLY-failed substep (index len-1), NOT a meta status on disk: a warm-resumed judge
+        # that physics-fails leaves a STALE post_judge_meta from a superseded attempt, and must
+        # route via classify_failure (judge physics), not fail_closed on the stale meta. Cases:
+        #   - pre_judge (index 0): a --with-deps closure not built+validated. No judge ran, so
+        #     this preserves the historic pre-spawn terminal behavior (no step_result written).
+        #   - post_judge (index 3): the `--stage pre_judge` gate failed with a terminal
+        #     disposition (an integrity violation, or a recoverable one whose warm-resume budget
+        #     was exhausted). The judge passed physics; the pre_phase_complete hook forbids a
+        #     `fail` step_result atop a `pass` semantic_review, so the write is skipped.
+        if phase == "validate" and status != "pass" and outcomes:
+            failed_sub = SUBSTEPS["validate"][len(outcomes) - 1]
+            if failed_sub in ("pre_judge", "post_judge"):
+                fname = ("pre_judge_meta.json" if failed_sub == "pre_judge"
+                         else "post_judge_meta.json")
+                gate_meta = _read_json(self.repo_root / refs.run_node_dir() / fname) or {}
+                cat = gate_meta.get("failure_category") or (
+                    "pre_judge_dag_incomplete" if failed_sub == "pre_judge"
+                    else "pre_judge_violation")
                 orphan_arids = [oc.agent_run_id for oc in outcomes]
                 if orphan_arids:
                     self._add_superseded_run_ids(
-                        orphan_arids, reason=f"validate_pre_judge_gate_fail_orphan: {cat}")
-                decision = RouteDecision("fail_closed", reason=f"validate_{cat}")
+                        orphan_arids, reason=f"validate_gate_fail_orphan: {cat}")
+                reason = ("validate_pre_judge_dag_incomplete"
+                          if cat == "pre_judge_dag_incomplete" else f"validate_{cat}")
+                decision = RouteDecision("fail_closed", reason=reason)
                 return PhaseOutcome(phase, status, substep_arids, failed, decision)
 
         self.write_step_result(node_key, phase, executor, result)
@@ -3027,13 +3260,28 @@ clean:
             if failed_substep == "static":
                 meta = _read_json(self.repo_root / refs.ir_ref / "compile_static_meta.json") or {}
                 return classify_compile_static_failure(meta.get("failure_category"))
-        if phase == "validate":
-            # An execute-substep failure (deterministic) means judge never ran, so there
-            # is no verdict.json. The runner produced bad/missing primary evidence (a
-            # runtime error or a post_execute structural violation), which is a code
-            # defect -> regenerate. Route to Generate deterministically rather than
-            # escalating with no verdict (the judge-centric table can't classify it).
-            if not (self.repo_root / refs.run_node_dir() / "verdict.json").is_file():
+        if phase == "validate" and outcomes:
+            # SUBSTEPS["validate"] == ("pre_judge","execute","judge","post_judge") and run_phase
+            # breaks on first failure (a recovered post_judge warm-resume passes and never
+            # reaches here), so the failed substep is index len-1.
+            failed_substep = SUBSTEPS["validate"][len(outcomes) - 1]
+            if failed_substep == "pre_judge":
+                # Deterministic DAG-readiness failure: a non-physics integrity blocker (a
+                # --with-deps closure not built+validated in its own pipeline). No judge ran,
+                # so a normal fail step_result is legal (the launch_request_ref points at the
+                # pre_judge deterministic substep, so the judge completion hook is skipped).
+                return RouteDecision("fail_closed", reason="validate_pre_judge_dag_incomplete")
+            if failed_substep == "post_judge":
+                # Defensive: a post_judge gate failure is terminalized fail_closed in run_phase
+                # (the post_judge_meta.status==fail branch) BEFORE classify_failure. Reaching
+                # here would mean a post_judge failure with no meta — treat as integrity blocker.
+                return RouteDecision("fail_closed", reason="validate_post_judge_violation")
+            if failed_substep == "execute":
+                # An execute-substep failure (deterministic) means judge never ran, so there
+                # is no verdict.json. The runner produced bad/missing primary evidence (a
+                # runtime error or a post_execute structural violation), which is a code
+                # defect -> regenerate. Route to Generate deterministically rather than
+                # escalating with no verdict (the judge-centric table can't classify it).
                 # Backstop (C2): a Generate restart regenerates the RUNNER, which cannot
                 # fix an IR-rooted structural mismatch (the runner keeps emitting its
                 # natural shape; the IR is the wrong side). Count execute (no-verdict)

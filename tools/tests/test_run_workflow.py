@@ -2328,7 +2328,7 @@ class SubstepEventTests(unittest.TestCase):
                 return None
 
         stub = _Stub()
-        # Validate uses two substeps (execute, judge) so we get a 2-pair pattern.
+        # Validate uses four substeps (pre_judge, execute, judge, post_judge).
         refs = wc.NodeRefs(
             node_key="component/x@0.1.0", spec_path="spec/x",
             ir_id="ir1", pipeline_id="pl1",
@@ -2339,10 +2339,13 @@ class SubstepEventTests(unittest.TestCase):
         starts = [e for e in captured if e["event"] == "substep_start"]
         completes = [e for e in captured if e["event"] == "substep_complete"]
         self.assertEqual([(e["phase"], e["substep"]) for e in starts],
-                         [("validate", "execute"), ("validate", "judge")])
+                         [("validate", "pre_judge"), ("validate", "execute"),
+                          ("validate", "judge"), ("validate", "post_judge")])
         self.assertEqual([(e["phase"], e["substep"], e["result"]) for e in completes],
-                         [("validate", "execute", "pass"),
-                          ("validate", "judge", "pass")])
+                         [("validate", "pre_judge", "pass"),
+                          ("validate", "execute", "pass"),
+                          ("validate", "judge", "pass"),
+                          ("validate", "post_judge", "pass")])
         # Every complete carries a numeric elapsed_seconds and the substep's arid.
         for e in completes:
             self.assertIsInstance(e["elapsed_seconds"], (int, float))

@@ -27,7 +27,7 @@ This document defines the workflow's phase sequence, inter-phase input/output co
 - `substep` refers to a lower execution unit decomposed from a `step`.
   - `Compile` has the 3 substeps `generate`, `static`, and `verify` — `static` is a deterministic conductor-run substep (no leaf) between `generate` and `verify` that runs `validate_workspace_root` + `check_artifact_syntax` + `validate_pipeline_semantics --stage compile`; a `static` finding warm-resumes `generate`, so the LLM `verify` is reached only on a deterministically-clean IR and is a pure spec-cross-reference semantic pass.
   - `Generate` has the 4 substeps `generate`, `lint`, `static`, and `verify` — `lint` and `static` are deterministic conductor-run substeps (no leaf) between `generate` and `verify` (`static` runs `validate_pipeline_semantics --stage post_generate` + `validate_workspace_root`); a `lint` or `static` finding warm-resumes `generate`, so the LLM `verify` is reached only on a deterministically-clean source.
-  - `Validate` has the 2 substeps `execute` and `judge`. The `--stage pre_judge` gate (orchestration-record integrity + the cross-pipeline dependency DAG) is conductor-run, not a `judge`-leaf responsibility: the conductor gates on both sides of the judge — a pre-spawn dependency-DAG readiness check (a not-yet-built+validated `dependency.all_nodes` closure fails the phase `fail_closed` before the cold judge is spawned) and a post-return `pre_judge` run recorded in `judge_gate_meta.json` — so the LLM `judge` launches no validator gate and is a pure semantic pass. A `pre_judge` `fail` is a non-physics integrity blocker terminalized `fail_closed`.
+  - `Validate` has the 4 substeps `pre_judge` / `execute` / `judge` / `post_judge`. The `--stage pre_judge` gate (orchestration-record integrity + the cross-pipeline dependency DAG) is conductor-run as two deterministic substeps wrapping the LLM `judge`, not a `judge`-leaf responsibility: the deterministic `pre_judge` substep (index 0) is the pre-spawn dependency-DAG readiness check (a not-yet-built+validated `dependency.all_nodes` closure fails the phase `fail_closed` before execute/judge run, authoring `pre_judge_meta.json`), and the deterministic `post_judge` substep (index 3) runs the `--stage pre_judge` validator after the judge returns and records the verdict + a severity `disposition` in `post_judge_meta.json` — so the LLM `judge` launches no validator gate and is a pure semantic pass. (Naming caution: the `post_judge` substep runs the validator stage literally named `pre_judge`.) A `post_judge` violation in a judge-authored deliverable is **recoverable** — the conductor warm-resumes the judge to re-author it — while an orchestration-record/DAG integrity (or unknown) violation, and any `pre_judge` `fail`, is a non-physics integrity blocker terminalized `fail_closed`.
   - `Build` is a single step that has no standard substep.
 - `stage` is used only as existing field names such as `generated_by_stage`, `<stage>_meta.json`, and `write_scope_baseline.json.stage`. It must not be used as a synonym for `phase` or `step` in the body text.
 
@@ -281,7 +281,7 @@ In this section, the input of each phase is described separately as `execution i
 - execution input: `binary/<binary_id>/bin/`, `spec.ir.yaml`, `tests.md`
 - verification input: `spec.ir.yaml`, `source/<source_id>/`, the `raw/` / `diagnostics.json` / `perf.json` / `quality_check.json` under the same `run_id`
 - output: `diagnostics.json`, `perf.json`, `quality_check.json`, `raw/`, `stdout.log`, `stderr.log`, `semantic_review.json`, `verdict.json`, `aggregate_verdict.json`, `summary.json`, `trial_meta.json`, `validate_meta.json`, the `command_id` and `command_log_ref` of `run_program`
-- `Validate` has the `execute` substep and the `judge` substep. The `execute` substep calls `run_program` via MCP to generate execution evidence, and the `judge` substep finalizes the `verdict` by an LLM semantic check and judgment-metric recomputation.
+- `Validate` has the `pre_judge`, `execute`, `judge`, and `post_judge` substeps. The deterministic `pre_judge` substep runs the dependency-DAG readiness check; the `execute` substep calls `run_program` via MCP to generate execution evidence; the `judge` substep finalizes the `verdict` by an LLM semantic check and judgment-metric recomputation; the deterministic `post_judge` substep runs the `--stage pre_judge` gate and classifies violation severity.
 
 ## Phase details (reference)
 
@@ -295,7 +295,7 @@ The contract details per phase use the files under [phases/](phases/) as the can
 | 1 Compile | [phases/phase_01_compile.md](phases/phase_01_compile.md) | generate / static / verify |
 | 2 Generate | [phases/phase_02_generate.md](phases/phase_02_generate.md) | generate / lint / static / verify |
 | 3 Build | [phases/phase_03_build.md](phases/phase_03_build.md) | - |
-| 4 Validate | [phases/phase_04_validate.md](phases/phase_04_validate.md) | execute / judge |
+| 4 Validate | [phases/phase_04_validate.md](phases/phase_04_validate.md) | pre_judge / execute / judge / post_judge |
 
 ## Agent reference scope
 

@@ -1586,6 +1586,49 @@ shell_tool                       stable             true
         with self.assertRaisesRegex(ValueError, "deterministic=True is only valid"):
             _validate_launch_request_payload(forged)
 
+    def test_validate_launch_request_payload_accepts_deterministic_validate_gates(self) -> None:
+        """The deterministic-flag allowlist must include the validate gate substeps
+        pre_judge and post_judge (else every validate node fails at their record-launch);
+        the LLM judge substep must NOT be allowed to claim the deterministic flag."""
+        from tools.orchestration_runtime import _validate_launch_request_payload
+
+        for sub in ("pre_judge", "post_judge"):
+            payload = {"node_key": "component/spec_x@0.1.0", "step": "validate",
+                       "substep": sub, "deterministic": True}
+            with self.assertRaisesRegex(ValueError, "agent_model"):
+                _validate_launch_request_payload(payload)
+
+        forged = {"node_key": "component/spec_x@0.1.0", "step": "validate",
+                  "substep": "judge", "deterministic": True}
+        with self.assertRaisesRegex(ValueError, "deterministic=True is only valid"):
+            _validate_launch_request_payload(forged)
+
+    def test_phase_contract_accepts_validate_gate_meta_outputs(self) -> None:
+        """record-launch's phase-contract check (`_allowed_output_paths_for_launch`) must accept
+        the pre_judge/post_judge deterministic substeps' ONLY deliverable — their run-node meta —
+        or every validate node crashes at the first substep's record-launch in the real flow.
+        Drives the REAL contract function (not the _FakeConductor stub) so the mock gap that hid
+        this cannot recur."""
+        from tools.orchestration_runtime import _allowed_output_paths_for_launch
+
+        pipeline = "workspace/pipelines/component__spec_x__0.1.0/spec-x_20260101_001"
+        node_key = "component/spec_x@0.1.0"
+        node_safe = "component__spec_x__0.1.0"
+        run_id = "run_20260101_001"
+        for sub in ("pre_judge", "post_judge"):
+            good = f"{pipeline}/runs/{run_id}/{node_safe}/{sub}_meta.json"
+            payload = {"agent_role": "substep", "step": "validate", "substep": sub,
+                       "pipeline_ref": pipeline, "node_key": node_key,
+                       "allowed_output_paths": [good]}
+            self.assertEqual(
+                _allowed_output_paths_for_launch(request_payload=payload, write_roots=[]),
+                [good])
+            # The gate substep may declare ONLY its own meta — not the judge's artifacts.
+            forged = dict(payload, allowed_output_paths=[
+                f"{pipeline}/runs/{run_id}/{node_safe}/semantic_review.json"])
+            with self.assertRaisesRegex(ValueError, "outside phase contract outputs"):
+                _allowed_output_paths_for_launch(request_payload=forged, write_roots=[])
+
     def test_writes_orchestration_artifacts_in_canonical_layout(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
@@ -15658,6 +15701,11 @@ class GateRunbookTests(unittest.TestCase):
         self.assertEqual(rb, "")
         self.assertNotIn("--stage pre_judge", rb)
         self.assertEqual(ALLOWED_VALIDATE_PIPELINE_STAGES[("validate", "judge")], frozenset())
+        # G4: the deterministic pre_judge / post_judge gate substeps map to the empty stage set
+        # (they invoke the validator in-process, not via a leaf prompt) — keeps the table total
+        # so a validate record-launch never KeyErrors on a missing key.
+        self.assertEqual(ALLOWED_VALIDATE_PIPELINE_STAGES[("validate", "pre_judge")], frozenset())
+        self.assertEqual(ALLOWED_VALIDATE_PIPELINE_STAGES[("validate", "post_judge")], frozenset())
 
     def test_runbook_generate_verify_emits_no_gate(self) -> None:
         # The post_generate + workspace_root gates moved to the conductor's deterministic

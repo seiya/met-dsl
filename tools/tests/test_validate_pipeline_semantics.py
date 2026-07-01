@@ -4014,6 +4014,56 @@ end program shallow_water2d_runner
             violations = validate(repo_root=repo_root, workspace_root="workspace")
             self.assertTrue(any("semantic_review.json: missing" in v for v in violations))
 
+    def test_detects_wrong_review_method_literal(self) -> None:
+        # Drift guard for the doc claim (SKILL.md / phase_04_validate.md): the gate
+        # requires the EXACT literal `review_method: "llm_semantic_review"`. A billed E2E
+        # once failed fail_closed because the judge wrote "llm_semantic_recompute". If this
+        # literal ever changes in the gate, this test forces the docs to be updated too.
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            _seed_shape_expr_schema_into(repo_root)
+            model_text = """module shallow_water2d_model
+use dynamics_shallow_water_flux_2d_rusanov_p0_model
+implicit none
+contains
+subroutine solve(flag)
+  logical, intent(out) :: flag
+  call dynamics_shallow_water_flux_2d_rusanov_p0__compute_flux(flag)
+end subroutine solve
+end module shallow_water2d_model
+"""
+            runner_text = """program shallow_water2d_runner
+implicit none
+write(*,*) 'ok'
+end program shallow_water2d_runner
+"""
+            _create_minimal_execution_tree(
+                repo_root,
+                dep_spec_id="dynamics_shallow_water_flux_2d_rusanov_p0",
+                model_text=model_text,
+                runner_text=runner_text,
+                run_command=["./simulate", "workspace/spec.ir.yaml", "workspace/outdir"],
+            )
+
+            review_path = (
+                repo_root
+                / "workspace"
+                / "pipelines"
+                / "problem__shallow_water2d__0.3.0"
+                / "shallow-water2d_20260415_001"
+                / "runs"
+                / "run_test_001"
+                / "problem__shallow_water2d__0.3.0"
+                / "semantic_review.json"
+            )
+            review = json.loads(review_path.read_text())
+            review["review_method"] = "llm_semantic_recompute"
+            review_path.write_text(json.dumps(review))
+
+            violations = validate(repo_root=repo_root, workspace_root="workspace")
+            self.assertTrue(
+                any("review_method must be llm_semantic_review" in v for v in violations))
+
     def test_detects_dependency_call_outputs_not_used_in_out_dataflow(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
