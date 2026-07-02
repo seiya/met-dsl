@@ -970,7 +970,10 @@ def main(argv: list[str] | None = None) -> int:
     try:
         workflow_mode = _normalize_workflow_mode(mode_in)
         if not until_phase_in:
-            raise ValueError("until_phase is required unless --resume is set")
+            raise ValueError(
+                "until_phase is required unless --resume is set; "
+                f"choose one of: {', '.join(PHASE_ORDER)}"
+            )
         until_phase = _normalize_phase(until_phase_in)
         llm = llm_in
         # The conductor only has a leaf launcher for claude/codex; reject an
