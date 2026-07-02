@@ -3784,6 +3784,11 @@ def _validate_generate_outputs(
         )
 
     _validate_fortran_identifier_length(src_dir, violations)
+    _validate_fortran_implicit_none_spec_list(
+        src_dir,
+        _impl_standard_from_pipeline_dir(repo_root, execution.pipeline_dir),
+        violations,
+    )
     _validate_fortran_makefile_src_dir(src_dir, violations)
     _build_system, _language = _impl_toolchain_from_pipeline_dir(
         repo_root, execution.pipeline_dir
@@ -3812,6 +3817,18 @@ _FORTRAN_NAME_LIMIT = 63
 # in a comment as an over-limit identifier; they are intentionally excluded.
 _FORTRAN_SOURCE_SUFFIXES = (".f90", ".f95", ".f03", ".f08")
 _FORTRAN_IDENT_RE = re.compile(r"[A-Za-z][A-Za-z0-9_]*")
+# The F2018 spec-list form `implicit none (external)` / `implicit none (type, external)`
+# is what fortitude rule C003 wants, but under `-std=f2008` it is a compile_error
+# (`Error: Fortran 2018: IMPLICIT NONE with spec list`). A parenthesised argument list
+# after `implicit none` is the tell; plain `implicit none` (no `(`) never matches.
+_FORTRAN_IMPLICIT_NONE_SPEC_LIST_RE = re.compile(
+    r"\bimplicit\s+none\s*\(", re.IGNORECASE
+)
+# Fortran standards that DO accept the `implicit none` spec-list form. When the
+# resolved toolchain standard is one of these the check below stays silent;
+# f2008 (and unresolved/None, treated as the f2008 series the generator targets)
+# get the compile_error flagged early.
+_IMPLICIT_NONE_SPEC_LIST_STANDARDS = frozenset({"f2018", "f2023"})
 
 
 def _strip_fortran_comments_and_strings(
@@ -3870,6 +3887,53 @@ def _validate_fortran_identifier_length(src_dir: Path, violations: list[str]) ->
                         f"{path}: Fortran identifier exceeds the {_FORTRAN_NAME_LIMIT}-char "
                         f"f2008 name limit ({len(tok)} chars): {tok!r}"
                     )
+
+
+def _validate_fortran_implicit_none_spec_list(
+    src_dir: Path, standard: str | None, violations: list[str]
+) -> None:
+    """Flag the F2018 spec-list `implicit none (...)` form under `-std=f2008`.
+
+    fortitude rule C003 wants the spec-list form, but under the f2008 standard it
+    is a compile_error that lint and the (non-compiling) post_generate static gate
+    both miss — it only surfaces at Build or the standard-aware verify persona
+    (observed in orch_20260702T032026Z_75ad595e). Catching it here fails the cheap
+    deterministic generate.static substep and warm-resumes Generate.generate first.
+    The check stays silent when the toolchain standard explicitly accepts the form
+    (f2018/f2023); f2008 and unresolved/None (the f2008 series the generator
+    targets) are flagged. Reuses the free-form comment/string stripper so a
+    spec-list inside a comment or literal is never false-flagged; reports each file
+    once. See docs/workflow/phases/phase_02_generate.md §2-1 (C003 workaround).
+
+    Accepted limitation (same as _validate_fortran_identifier_length): a
+    `implicit none &`-continued onto the next line before the `(` is scanned as
+    two physical lines and not flagged. This can only under-report, never
+    false-flag; the generator emits the form on one line and the Build step is
+    the backstop.
+    """
+    if standard in _IMPLICIT_NONE_SPEC_LIST_STANDARDS:
+        return
+    if not src_dir.is_dir():
+        return
+    for path in sorted(src_dir.iterdir()):
+        if not path.is_file() or path.suffix.lower() not in _FORTRAN_SOURCE_SUFFIXES:
+            continue
+        try:
+            text = path.read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            continue
+        quote: str | None = None
+        flagged = False
+        for raw in text.splitlines():
+            code, quote = _strip_fortran_comments_and_strings(raw, quote)
+            if not flagged and _FORTRAN_IMPLICIT_NONE_SPEC_LIST_RE.search(code):
+                flagged = True
+                violations.append(
+                    f"{path}: F2018 spec-list `implicit none (...)` is a compile_error "
+                    f"under -std=f2008 (Fortran 2018: IMPLICIT NONE with spec list); use "
+                    f"plain `implicit none` with the `! allow(C003)` directive on the line "
+                    f"immediately before it (see docs/workflow/phases/phase_02_generate.md §2-1)"
+                )
 
 
 def _validate_generate_outputs_for_generation(
@@ -3954,6 +4018,11 @@ def _validate_generate_outputs_for_generation(
         )
 
     _validate_fortran_identifier_length(src_dir, violations)
+    _validate_fortran_implicit_none_spec_list(
+        src_dir,
+        _impl_standard_from_pipeline_dir(repo_root, execution.pipeline_dir),
+        violations,
+    )
     _validate_fortran_makefile_src_dir(src_dir, violations)
     _build_system, _language = _impl_toolchain_from_pipeline_dir(
         repo_root, execution.pipeline_dir
@@ -4130,6 +4199,37 @@ def _impl_toolchain_from_pipeline_dir(
         return value.strip().lower() if isinstance(value, str) and value.strip() else None
 
     return (_norm(toolchain.get("build_system")), _norm(toolchain.get("language")))
+
+
+def _impl_standard_from_pipeline_dir(
+    repo_root: Path, pipeline_dir: Path
+) -> str | None:
+    """Resolve `spec.ir.yaml#impl_defaults.toolchain.standard` (lowercased), or
+    None when unresolvable. Sibling of `_impl_toolchain_from_pipeline_dir` — kept
+    separate so that function's `(build_system, language)` return arity (3+ call
+    sites) stays unchanged. Used to gate the `implicit none` spec-list check."""
+    ir_dir = _ir_dir_from_pipeline_dir(repo_root, pipeline_dir)
+    if ir_dir is None:
+        return None
+    contract_path = ir_dir / "spec.ir.yaml"
+    if not contract_path.exists():
+        return None
+    try:
+        data = _read_yaml(contract_path)
+    except (json.JSONDecodeError, yaml.YAMLError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    impl_defaults = data.get("impl_defaults")
+    toolchain = (
+        impl_defaults.get("toolchain")
+        if isinstance(impl_defaults, dict)
+        else data.get("toolchain")
+    )
+    if not isinstance(toolchain, dict):
+        return None
+    standard = toolchain.get("standard")
+    return standard.strip().lower() if isinstance(standard, str) and standard.strip() else None
 
 
 def _io_contract_for_execution(

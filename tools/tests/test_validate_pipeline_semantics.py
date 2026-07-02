@@ -23,6 +23,7 @@ from tools.validate_pipeline_semantics import (
     _validate_diagnostics_contract,
     _validate_diagnostics_contract_output,
     _validate_fortran_identifier_length,
+    _validate_fortran_implicit_none_spec_list,
     _validate_fortran_makefile_src_dir,
     _impl_toolchain_from_pipeline_dir,
     _validate_generate_lint_command_logs,
@@ -6902,6 +6903,140 @@ shallow_water2d_runner.o: shallow_water2d_runner.f90 shallow_water2d_model.mod
             )
             self.assertEqual(violations, [])
 
+    def test_validate_post_generate_stage_rejects_implicit_none_spec_list_under_f2008(
+        self,
+    ) -> None:
+        """The F2018 `implicit none (external)` form is a compile_error under the
+        default f2008 toolchain; post_generate must flag it so generate warm-resumes
+        instead of it reaching Build/verify (orch_20260702T032026Z_75ad595e)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            _seed_shape_expr_schema_into(repo_root)
+            dep_model_text = (
+                "module dynamics_shallow_water_flux_2d_rusanov_p0_model\n"
+                "implicit none\ncontains\n"
+                "subroutine dynamics_shallow_water_flux_2d_rusanov_p0__compute_flux(flag)\n"
+                "  logical, intent(out) :: flag\n  flag = .true.\n"
+                "end subroutine dynamics_shallow_water_flux_2d_rusanov_p0__compute_flux\n"
+                "end module dynamics_shallow_water_flux_2d_rusanov_p0_model\n"
+            )
+            # Model uses the spec-list form fortitude C003 suggests — build-breaking under f2008.
+            model_text = (
+                "module shallow_water2d_model\n"
+                "use dynamics_shallow_water_flux_2d_rusanov_p0_model\n"
+                "implicit none (external)\ncontains\n"
+                "subroutine solve(flag)\n  logical, intent(out) :: flag\n"
+                "  call dynamics_shallow_water_flux_2d_rusanov_p0__compute_flux(flag)\n"
+                "end subroutine solve\nend module shallow_water2d_model\n"
+            )
+            runner_text = (
+                "program shallow_water2d_runner\nimplicit none\n"
+                "write(*,*) 'ok'\nend program shallow_water2d_runner\n"
+            )
+            makefile_text = (
+                "FC ?= gfortran\nOBJS = dynamics_shallow_water_flux_2d_rusanov_p0_model.o "
+                "shallow_water2d_model.o shallow_water2d_runner.o\n\n"
+                "simulate: $(OBJS)\n\t$(FC) -o $@ $(OBJS)\n"
+            )
+            _create_minimal_execution_tree(
+                repo_root,
+                dep_spec_id="dynamics_shallow_water_flux_2d_rusanov_p0",
+                model_text=model_text,
+                runner_text=runner_text,
+                run_command=["x", "y"],
+                extra_sources={
+                    "dynamics_shallow_water_flux_2d_rusanov_p0_model.f90": dep_model_text
+                },
+                makefile_text=makefile_text,
+            )
+            violations = validate_post_generate_stage(
+                repo_root,
+                "workspace",
+                "workspace/pipelines/problem__shallow_water2d__0.3.0/"
+                "shallow-water2d_20260415_001",
+                source_id="src_20260415_001",
+            )
+            self.assertTrue(
+                any("spec-list" in v for v in violations),
+                f"expected an implicit-none spec-list violation, got: {violations}",
+            )
+
+    def test_validate_post_generate_stage_allows_implicit_none_spec_list_under_f2018(
+        self,
+    ) -> None:
+        """Under an f2018 toolchain the spec-list `implicit none (external)` form is
+        legal, so the check must stay silent (no false positive)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            _seed_shape_expr_schema_into(repo_root)
+            dep_model_text = (
+                "module dynamics_shallow_water_flux_2d_rusanov_p0_model\n"
+                "implicit none\ncontains\n"
+                "subroutine dynamics_shallow_water_flux_2d_rusanov_p0__compute_flux(flag)\n"
+                "  logical, intent(out) :: flag\n  flag = .true.\n"
+                "end subroutine dynamics_shallow_water_flux_2d_rusanov_p0__compute_flux\n"
+                "end module dynamics_shallow_water_flux_2d_rusanov_p0_model\n"
+            )
+            model_text = (
+                "module shallow_water2d_model\n"
+                "use dynamics_shallow_water_flux_2d_rusanov_p0_model\n"
+                "implicit none (external)\ncontains\n"
+                "subroutine solve(flag)\n  logical, intent(out) :: flag\n"
+                "  call dynamics_shallow_water_flux_2d_rusanov_p0__compute_flux(flag)\n"
+                "end subroutine solve\nend module shallow_water2d_model\n"
+            )
+            runner_text = (
+                "program shallow_water2d_runner\nimplicit none\n"
+                "write(*,*) 'ok'\nend program shallow_water2d_runner\n"
+            )
+            makefile_text = (
+                "FC ?= gfortran\nOBJS = dynamics_shallow_water_flux_2d_rusanov_p0_model.o "
+                "shallow_water2d_model.o shallow_water2d_runner.o\n\n"
+                "simulate: $(OBJS)\n\t$(FC) -o $@ $(OBJS)\n"
+            )
+            impl_resolved = {
+                "target": {
+                    "class": "cpu",
+                    "backend": "fortran",
+                    "architecture": "x86_64",
+                },
+                "toolchain": {
+                    "language": "fortran",
+                    "standard": "f2018",
+                    "build_system": "make",
+                },
+                "selected": {"backend_key": "cpu/x86_64/fortran/make"},
+                "abstract": {
+                    "parallelism": "none",
+                    "layout": "scalar_interfaces",
+                    "fusion": "none",
+                },
+                "backend_overrides": [],
+            }
+            _create_minimal_execution_tree(
+                repo_root,
+                dep_spec_id="dynamics_shallow_water_flux_2d_rusanov_p0",
+                model_text=model_text,
+                runner_text=runner_text,
+                run_command=["x", "y"],
+                extra_sources={
+                    "dynamics_shallow_water_flux_2d_rusanov_p0_model.f90": dep_model_text
+                },
+                makefile_text=makefile_text,
+                impl_resolved=impl_resolved,
+            )
+            violations = validate_post_generate_stage(
+                repo_root,
+                "workspace",
+                "workspace/pipelines/problem__shallow_water2d__0.3.0/"
+                "shallow-water2d_20260415_001",
+                source_id="src_20260415_001",
+            )
+            self.assertFalse(
+                any("spec-list" in v for v in violations),
+                f"spec-list check must be silent under f2018, got: {violations}",
+            )
+
     def test_validate_post_generate_stage_rejects_bad_top_level_pipeline_id(self) -> None:
         """post_generate must enforce the lineage top-level pipeline_id schema (the
         same check post_execute runs), so a malformed pipeline_id surfaces at Generate
@@ -10123,6 +10258,102 @@ class FortranIdentifierLengthTests(unittest.TestCase):
         (d / "legacy.for").write_text(f"* another comment {long_word}\n", encoding="utf-8")
         violations: list[str] = []
         _validate_fortran_identifier_length(d, violations)
+        self.assertEqual(violations, [])
+
+
+class FortranImplicitNoneSpecListTests(unittest.TestCase):
+    """post_generate flags the F2018 spec-list `implicit none (...)` under f2008.
+
+    That form is what fortitude C003 wants but is a compile_error under
+    `-std=f2008` (`Fortran 2018: IMPLICIT NONE with spec list`); lint and the
+    non-compiling static gate both miss it, so it only surfaces at Build or
+    verify (observed in orch_20260702T032026Z_75ad595e). Catching it here fails
+    the cheap deterministic generate.static substep and warm-resumes generate.
+    """
+
+    def _src_dir(self, body: str) -> Path:
+        d = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, d, ignore_errors=True)
+        (d / "mod.f90").write_text(body, encoding="utf-8")
+        return d
+
+    def test_external_spec_list_flagged_under_f2008(self) -> None:
+        src = self._src_dir("module m\n  implicit none (external)\nend module m\n")
+        violations: list[str] = []
+        _validate_fortran_implicit_none_spec_list(src, "f2008", violations)
+        self.assertEqual(len(violations), 1, msg=violations)
+        self.assertIn("spec-list", violations[0])
+
+    def test_type_external_spec_list_flagged(self) -> None:
+        src = self._src_dir("module m\n  implicit none (type, external)\nend\n")
+        violations: list[str] = []
+        _validate_fortran_implicit_none_spec_list(src, "f2008", violations)
+        self.assertEqual(len(violations), 1, msg=violations)
+
+    def test_plain_implicit_none_is_clean(self) -> None:
+        src = self._src_dir("module m\n  ! allow(C003)\n  implicit none\nend\n")
+        violations: list[str] = []
+        _validate_fortran_implicit_none_spec_list(src, "f2008", violations)
+        self.assertEqual(violations, [])
+
+    def test_not_flagged_when_standard_is_f2018(self) -> None:
+        # f2018/f2023 accept the spec-list form, so the check stays silent.
+        src = self._src_dir("module m\n  implicit none (external)\nend\n")
+        violations: list[str] = []
+        _validate_fortran_implicit_none_spec_list(src, "f2018", violations)
+        self.assertEqual(violations, [])
+
+    def test_flagged_when_standard_unresolved(self) -> None:
+        # None -> treated as the f2008 series the generator targets (protective).
+        src = self._src_dir("module m\n  implicit none (external)\nend\n")
+        violations: list[str] = []
+        _validate_fortran_implicit_none_spec_list(src, None, violations)
+        self.assertEqual(len(violations), 1, msg=violations)
+
+    def test_spec_list_in_comment_or_string_ignored(self) -> None:
+        src = self._src_dir(
+            "module m\n"
+            "  ! implicit none (external) mentioned in a comment\n"
+            '  character(*), parameter :: s = "implicit none (external)"\n'
+            "  implicit none\nend\n"
+        )
+        violations: list[str] = []
+        _validate_fortran_implicit_none_spec_list(src, "f2008", violations)
+        self.assertEqual(violations, [])
+
+    def test_reports_each_file_once(self) -> None:
+        src = self._src_dir(
+            "module m\n  implicit none (external)\ncontains\n"
+            "  subroutine s()\n    implicit none (external)\n  end subroutine\n"
+            "end module m\n"
+        )
+        violations: list[str] = []
+        _validate_fortran_implicit_none_spec_list(src, "f2008", violations)
+        self.assertEqual(len(violations), 1, msg=violations)
+
+    def test_only_scans_fortran_suffixes(self) -> None:
+        d = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, d, ignore_errors=True)
+        (d / "notes.txt").write_text("implicit none (external)\n", encoding="utf-8")
+        violations: list[str] = []
+        _validate_fortran_implicit_none_spec_list(d, "f2008", violations)
+        self.assertEqual(violations, [])
+
+    def test_missing_src_dir_is_safe(self) -> None:
+        missing = Path(tempfile.mkdtemp()) / "does_not_exist"
+        violations: list[str] = []
+        _validate_fortran_implicit_none_spec_list(missing, "f2008", violations)
+        self.assertEqual(violations, [])
+
+    def test_line_continuation_split_is_accepted_limitation(self) -> None:
+        # Documented accepted limitation (mirrors the identifier-length check): an
+        # `implicit none &` continued onto the next line before the `(` is seen as
+        # two physical lines and NOT flagged — under-report only, Build is the
+        # backstop. This test pins the behavior so a future reader does not assume
+        # completeness. (The generator emits the form on one line.)
+        src = self._src_dir("module m\n  implicit none &\n    (external)\nend\n")
+        violations: list[str] = []
+        _validate_fortran_implicit_none_spec_list(src, "f2008", violations)
         self.assertEqual(violations, [])
 
 
