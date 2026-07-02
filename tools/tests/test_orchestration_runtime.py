@@ -34,6 +34,7 @@ from tools.orchestration_runtime import (
     _pre_phase_complete_judge_checks,
     _required_child_agent_kind,
     _build_artifact_hashes,
+    _capture_repo_revision,
     _compute_sha256,
     _is_within_preflight_ttl,
     _live_preflight_mode,
@@ -2130,6 +2131,122 @@ shell_tool                       stable             true
             ]
             orch_row = next(r for r in rows if r["agent_role"] == "orchestration")
             self.assertNotIn("agent_model", orch_row)
+
+    def _read_meta_dict(self, repo_root: Path, orchestration_id: str) -> dict:
+        meta_path = (
+            repo_root
+            / "workspace"
+            / "orchestrations"
+            / orchestration_id
+            / "orchestration_meta.json"
+        )
+        return json.loads(meta_path.read_text(encoding="utf-8"))
+
+    def _git(self, repo_root: Path, *args: str) -> str:
+        return subprocess.run(
+            ["git", "-C", str(repo_root), *args],
+            check=True, capture_output=True, text=True,
+        ).stdout.strip()
+
+    def _seed_git_repo(self, repo_root: Path) -> str:
+        """Init a clean git repo with workspace/ gitignored (mirroring the real
+        repo) and one commit; return the HEAD SHA."""
+        self._git(repo_root, "init")
+        self._git(repo_root, "config", "user.email", "t@example.com")
+        self._git(repo_root, "config", "user.name", "Test")
+        (repo_root / "seed.txt").write_text("seed\n", encoding="utf-8")
+        # workspace/ is gitignored in the real repo, so orchestration artifacts
+        # init writes there must not flip the dirty flag.
+        (repo_root / ".gitignore").write_text("workspace/\n", encoding="utf-8")
+        self._git(repo_root, "add", "-A")
+        self._git(repo_root, "commit", "-m", "seed")
+        return self._git(repo_root, "rev-parse", "HEAD")
+
+    def test_init_records_repo_revision_commit_and_dirty_in_git_repo(self) -> None:
+        """A run under a git checkout records the HEAD SHA and clean/dirty state
+        so its artifacts can be traced back to the exact source that produced them."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            head = self._seed_git_repo(repo_root)
+
+            init_orchestration(repo_root=repo_root, orchestration_id="orch_001")
+            rev = self._read_meta_dict(repo_root, "orch_001").get("repo_revision")
+            self.assertEqual(rev, {"commit": head, "dirty": False})
+
+    def test_init_records_repo_revision_dirty_when_tracked_source_modified(self) -> None:
+        """dirty must flow from a genuine tracked-file modification, not from the
+        gitignored workspace/ artifacts init itself writes."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            head = self._seed_git_repo(repo_root)
+            # Modify a tracked source file so the working tree is genuinely dirty.
+            (repo_root / "seed.txt").write_text("seed modified\n", encoding="utf-8")
+
+            init_orchestration(repo_root=repo_root, orchestration_id="orch_001")
+            rev = self._read_meta_dict(repo_root, "orch_001").get("repo_revision")
+            self.assertEqual(rev, {"commit": head, "dirty": True})
+
+    def test_init_preserves_repo_revision_across_reinit(self) -> None:
+        """repo_revision is captured once at the initial start and preserved on a
+        later init (e.g. resume), so a subsequent commit does not overwrite the
+        SHA of the source that produced the run."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            first_head = self._seed_git_repo(repo_root)
+            init_orchestration(repo_root=repo_root, orchestration_id="orch_001")
+
+            # Advance HEAD, then re-init the same orchestration.
+            (repo_root / "seed.txt").write_text("seed v2\n", encoding="utf-8")
+            self._git(repo_root, "commit", "-am", "second")
+            second_head = self._git(repo_root, "rev-parse", "HEAD")
+            self.assertNotEqual(first_head, second_head)
+
+            init_orchestration(repo_root=repo_root, orchestration_id="orch_001")
+            rev = self._read_meta_dict(repo_root, "orch_001").get("repo_revision")
+            self.assertEqual(rev, {"commit": first_head, "dirty": False})
+
+    def test_init_omits_repo_revision_outside_git_checkout(self) -> None:
+        """A non-git run directory yields no revision so absent stays
+        distinguishable from clean/dirty."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            init_orchestration(repo_root=repo_root, orchestration_id="orch_001")
+            self.assertNotIn("repo_revision", self._read_meta_dict(repo_root, "orch_001"))
+
+    def test_capture_repo_revision_dirty_none_when_status_fails(self) -> None:
+        """HEAD resolvable but status failing records the commit with dirty=None
+        rather than dropping the revision entirely."""
+        def fake_runner(cmd, **kwargs):
+            if "rev-parse" in cmd:
+                return subprocess.CompletedProcess(cmd, 0, stdout="abc123\n", stderr="")
+            return subprocess.CompletedProcess(cmd, 128, stdout="", stderr="fatal")
+
+        rev = _capture_repo_revision(Path("/nonexistent"), runner=fake_runner)
+        self.assertEqual(rev, {"commit": "abc123", "dirty": None})
+
+    def test_capture_repo_revision_none_when_git_absent(self) -> None:
+        """A missing git binary (OSError on rev-parse) yields no revision."""
+        def fake_runner(cmd, **kwargs):
+            raise FileNotFoundError("git not found")
+
+        self.assertIsNone(_capture_repo_revision(Path("/nonexistent"), runner=fake_runner))
+
+    def test_capture_repo_revision_none_when_head_unresolvable(self) -> None:
+        """An empty repo with no commits (rev-parse HEAD fails) yields no revision."""
+        def fake_runner(cmd, **kwargs):
+            return subprocess.CompletedProcess(cmd, 128, stdout="", stderr="fatal: bad revision")
+
+        self.assertIsNone(_capture_repo_revision(Path("/nonexistent"), runner=fake_runner))
+
+    def test_capture_repo_revision_dirty_none_when_status_raises_oserror(self) -> None:
+        """HEAD resolvable but status raising OSError records commit with dirty=None."""
+        def fake_runner(cmd, **kwargs):
+            if "rev-parse" in cmd:
+                return subprocess.CompletedProcess(cmd, 0, stdout="abc123\n", stderr="")
+            raise OSError("status blew up")
+
+        rev = _capture_repo_revision(Path("/nonexistent"), runner=fake_runner)
+        self.assertEqual(rev, {"commit": "abc123", "dirty": None})
 
     def test_record_launch_strips_child_agent_run_id_for_tmp_and_manifest_paths(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

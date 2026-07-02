@@ -12513,6 +12513,50 @@ def probe_codex_cli(
     )
 
 
+def _capture_repo_revision(
+    repo_root: Path,
+    runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
+) -> dict[str, Any] | None:
+    """Best-effort capture of the git HEAD SHA and working-tree dirty state.
+
+    Records the repository version at run time so a run's artifacts can be
+    traced back to the exact source that produced them.  The value is resolved
+    at run time (not pinned to a constant), mirroring the model-alias
+    convention.  Returns None when the directory is not a git checkout or git
+    is unavailable, so an absent revision stays distinguishable from a
+    clean/dirty one.
+    """
+    try:
+        head = runner(
+            ["git", "-C", str(repo_root), "rev-parse", "HEAD"],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+    except OSError:
+        return None
+    if head.returncode != 0:
+        return None
+    commit = (head.stdout or "").strip()
+    if not commit:
+        return None
+    try:
+        status = runner(
+            ["git", "-C", str(repo_root), "status", "--porcelain"],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+    except OSError:
+        return {"commit": commit, "dirty": None}
+    if status.returncode != 0:
+        # HEAD is known but the dirty state could not be determined; record the
+        # commit with dirty=None rather than dropping the revision entirely.
+        return {"commit": commit, "dirty": None}
+    dirty = any(line.strip() for line in (status.stdout or "").splitlines())
+    return {"commit": commit, "dirty": dirty}
+
+
 def init_orchestration(
     repo_root: Path,
     orchestration_id: str,
@@ -12550,12 +12594,19 @@ def init_orchestration(
         except (OSError, json.JSONDecodeError):
             existing = None
         if isinstance(existing, dict):
-            for key in ("parallel_nodes_explicit", "parallel_nodes_policy"):
+            # repo_revision is captured once at the initial start and preserved
+            # across re-init / resume, so the recorded SHA stays the source that
+            # produced the run rather than being overwritten by a later HEAD.
+            for key in ("parallel_nodes_explicit", "parallel_nodes_policy", "repo_revision"):
                 if key in existing:
                     meta.setdefault(key, existing[key])
             existing_run_id = existing.get("orchestration_agent_run_id")
             if isinstance(existing_run_id, str) and existing_run_id.strip():
                 orchestration_agent_run_id = existing_run_id.strip()
+    if "repo_revision" not in meta:
+        repo_revision = _capture_repo_revision(repo_root)
+        if repo_revision:
+            meta["repo_revision"] = repo_revision
     if not orchestration_agent_run_id:
         orchestration_agent_run_id = str(uuid.uuid4())
     backend_token = str(agent_backend).strip().lower()
