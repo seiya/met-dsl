@@ -433,11 +433,66 @@ def _has_informative_agent_summary(text: str) -> bool:
 
 DETERMINISTIC_PROMPT_SENTINEL = "Conductor-executed deterministic step"
 
+# Mirror of the warm-resume slim repair prompt's identifying strings in
+# orchestration_runtime.py (SLIM_REPAIR_PROMPT_SENTINEL / SLIM_REPAIR_FINDINGS_HEADER).
+# Copied literals (the validator intentionally does not import orchestration_runtime,
+# matching the DETERMINISTIC_PROMPT_SENTINEL duplication); a cross-module equality test
+# guards against drift.
+SLIM_REPAIR_PROMPT_SENTINEL = "Warm-resume slim repair turn"
+SLIM_REPAIR_FINDINGS_HEADER = "Findings to fix (from the lint/static gate or verify finding):"
+
+
+def _is_slim_launch_prompt_text(launch_text: str) -> bool:
+    """True when a recorded launch_prompt_ref body is shaped like a warm-resume slim repair turn.
+
+    Detect by the sentinel's POSITION (first line), NOT a whole-body substring: the FULL
+    substep template documents the slim mechanism in its always-rendered boilerplate (see
+    tools/prompt_templates/substep_agent.txt), so the sentinel string appears inside every
+    full substep prompt. The slim renderer (orchestration_runtime._render_slim_repair_launch_prompt)
+    always emits the sentinel as the very first line, so anchoring on the prefix is exact.
+
+    This is a NECESSARY but not SUFFICIENT signal for downgrading the required marker set:
+    the authoritative signal is the structured launch request (see
+    _launch_request_is_slim_repair). A record is treated as slim only when both agree."""
+    return launch_text.lstrip().startswith(SLIM_REPAIR_PROMPT_SENTINEL)
+
+
+def _launch_request_is_slim_repair(request_payload: dict) -> bool:
+    """True when the structured launch REQUEST payload is a warm-resume slim repair.
+
+    Mirror of orchestration_runtime._is_slim_repair_request (the renderer's own authoritative
+    predicate; the validator intentionally does not import orchestration_runtime, matching the
+    SLIM_REPAIR_PROMPT_SENTINEL duplication — a cross-module parity test guards against drift).
+    Gating the reduced marker set on this — not on prompt text alone — prevents a non-slim
+    launch record whose prompt was replaced with a slim-looking body from escaping the full
+    skill / must-read / requirements markers (an inconsistent record would otherwise pass)."""
+    if request_payload.get("deterministic"):
+        return False
+    if not request_payload.get("warm_resume"):
+        return False
+    if str(request_payload.get("repair_strategy", "")).strip() != "reuse":
+        return False
+    return bool(str(request_payload.get("repair_findings", "")).strip())
+
 
 def _required_launch_prompt_markers_for_role(
     role: str,
     deterministic: bool = False,
+    slim: bool = False,
 ) -> list[str]:
+    if slim:
+        # Warm-resume slim repair turn: the conductor renders a reduced body (built
+        # directly, not from the template) because the resumed producer leaf already holds
+        # the SKILL / must-read / requirements sections. Mirror the renderer's reduced
+        # marker set (orchestration_runtime._required_launch_prompt_markers, slim branch)
+        # so this pipeline-semantic re-check does not false-reject a legitimate slim prompt.
+        return [
+            SLIM_REPAIR_PROMPT_SENTINEL,
+            "Target node_key:", "Target step:", "Target substep:",
+            "orchestration_id:", "agent_run_id:", "parent_agent_run_id:",
+            "source_id:", "capability_doc_path:", "allowed_output_paths:",
+            "output_manifest_path:", SLIM_REPAIR_FINDINGS_HEADER,
+        ]
     if deterministic:
         # Build / Validate.execute run in-process (no leaf); their minimal launch prompt
         # carries no skill section or leaf instructions — only the sentinel + core ids
@@ -7774,9 +7829,33 @@ def _validate_orchestration_hierarchy(
                                     f"{runs_path}:line {idx + 1} {key} target must be non-empty ({ref_token})"
                                 )
                             if key == "launch_prompt_ref":
+                                # Downgrade to the reduced slim marker set ONLY when the
+                                # structured launch REQUEST confirms a warm-resume slim repair
+                                # (_launch_request_is_slim_repair) AND the recorded prompt is
+                                # actually slim-shaped (sentinel anchored at line 0). Relying on
+                                # prompt text alone would let a non-slim record whose prompt was
+                                # replaced with a slim-looking body escape the full markers.
+                                request_confirms_slim = False
+                                req_ref = launch_refs.get("launch_request_ref")
+                                if isinstance(req_ref, str):
+                                    req_path = workspace_path.parent / req_ref
+                                    if req_path.is_file():
+                                        try:
+                                            req_payload = _read_json(req_path)
+                                        except json.JSONDecodeError:
+                                            req_payload = None
+                                        if isinstance(req_payload, dict):
+                                            request_confirms_slim = _launch_request_is_slim_repair(
+                                                req_payload)
+                                # Anchored slim detection takes precedence over the substring-based
+                                # deterministic check when a slim prompt's untrusted findings excerpt
+                                # happens to embed the deterministic sentinel.
+                                is_slim = (
+                                    request_confirms_slim
+                                    and _is_slim_launch_prompt_text(launch_text))
                                 is_deterministic = DETERMINISTIC_PROMPT_SENTINEL in launch_text
                                 required_markers = _required_launch_prompt_markers_for_role(
-                                    role_l, deterministic=is_deterministic)
+                                    role_l, deterministic=is_deterministic, slim=is_slim)
                                 missing_markers = [
                                     marker
                                     for marker in required_markers

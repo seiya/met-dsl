@@ -9032,6 +9032,246 @@ class DeterministicLaunchPromptMarkerTest(unittest.TestCase):
                               if not _launch_prompt_marker_present(m, prompt)], [])
 
 
+class SlimRepairLaunchPromptMarkerTest(unittest.TestCase):
+    """A warm-resume slim repair turn (Generate.lint / Generate.static / Compile.static
+    finding) is rendered directly by the conductor with a REDUCED body — no skill /
+    must-read / requirements markers, since the resumed producer leaf already holds them.
+    The pipeline-semantic re-check must apply the same reduced marker set (mirror of
+    orchestration_runtime._required_launch_prompt_markers slim branch) so it does not
+    false-reject the recorded slim launch_prompt_ref. Regression: orch_20260702T065946Z_f05a7224
+    (validate.post_judge -> validate_pre_judge_violation)."""
+
+    def _slim_payload(self) -> dict:
+        # A minimal request that satisfies _is_slim_repair_request (warm_resume + reuse +
+        # non-empty findings) for a generate.generate producer repair.
+        return {
+            "node_key": "component/dynamics_shallow_water_flux_2d_rusanov_p0@0.1.0",
+            "step": "generate",
+            "substep": "generate",
+            "orchestration_id": "orch_test_slim_001",
+            "agent_run_id": "arid_slim_001",
+            "parent_agent_run_id": "orch_run_001",
+            "source_id": "src_20260702_002",
+            "warm_resume": True,
+            "repair_strategy": "reuse",
+            "repair_reason": "lint_lint_findings",
+            "repair_target_agent_run_id": "arid_prev_000",
+            "repair_findings": "runner.f90:270:19: C072 assumed size without intent(in)",
+            "allowed_output_paths": [
+                "workspace/pipelines/component__x__0.1.0/p_001/source/src_20260702_002/"
+                "src/dynamics_shallow_water_flux_2d_rusanov_p0_model.f90",
+            ],
+        }
+
+    def test_sentinel_constants_match_across_modules(self) -> None:
+        # The validator detects slim prompts by text (sentinel in launch_text); the runtime
+        # renders them. A desync would silently break the marker exemption.
+        from tools.validate_pipeline_semantics import (
+            SLIM_REPAIR_PROMPT_SENTINEL as V_SENT,
+            SLIM_REPAIR_FINDINGS_HEADER as V_HDR)
+        from tools.orchestration_runtime import (
+            SLIM_REPAIR_PROMPT_SENTINEL as R_SENT,
+            SLIM_REPAIR_FINDINGS_HEADER as R_HDR)
+        self.assertEqual(V_SENT, R_SENT)
+        self.assertEqual(V_HDR, R_HDR)
+
+    def test_slim_request_predicate_matches_runtime(self) -> None:
+        # The validator gates the reduced marker set on the structured launch request via
+        # _launch_request_is_slim_repair, a copied mirror of the renderer's own
+        # orchestration_runtime._is_slim_repair_request. Guard against behavioral drift.
+        from tools.validate_pipeline_semantics import _launch_request_is_slim_repair as V
+        from tools.orchestration_runtime import _is_slim_repair_request as R
+        base = {"warm_resume": True, "repair_strategy": "reuse", "repair_findings": "x"}
+        payloads = [
+            base,
+            {**base, "warm_resume": False},                 # not warm-resumed
+            {**base, "repair_strategy": "restart"},         # not reuse
+            {**base, "repair_findings": "   "},             # empty findings
+            {**base, "repair_findings": ""},                # missing findings
+            {**base, "deterministic": True},                # deterministic never slim
+            {},                                             # empty payload
+        ]
+        for p in payloads:
+            self.assertEqual(V(p), R(p), f"slim-request predicate drift for {p}")
+
+    def test_reduced_markers_exclude_skill(self) -> None:
+        from tools.validate_pipeline_semantics import (
+            _required_launch_prompt_markers_for_role, SLIM_REPAIR_PROMPT_SENTINEL,
+            SLIM_REPAIR_FINDINGS_HEADER)
+        slim = _required_launch_prompt_markers_for_role("substep", slim=True)
+        self.assertIn(SLIM_REPAIR_PROMPT_SENTINEL, slim)
+        self.assertIn(SLIM_REPAIR_FINDINGS_HEADER, slim)
+        for excluded in ("skill_ref:", "skill_name:", "skill_must_read_refs:",
+                         "Required requirements:", "You are a substep agent."):
+            self.assertNotIn(excluded, slim)
+        # the full (non-slim, non-deterministic) set still requires them
+        full = _required_launch_prompt_markers_for_role("substep")
+        self.assertIn("skill_ref:", full)
+        self.assertIn("Required requirements:", full)
+
+    def test_rendered_slim_prompt_satisfies_reduced_markers(self) -> None:
+        # The real reproduction: render a genuine slim prompt via the runtime, then run the
+        # validator's actual marker logic against it. Before the fix (slim=False) the slim
+        # prompt is reported as missing the full markers; with slim detection it passes.
+        from tools.orchestration_runtime import (
+            render_launch_prompt_text, _is_slim_repair_request)
+        from tools.validate_pipeline_semantics import (
+            _required_launch_prompt_markers_for_role, _launch_prompt_marker_present,
+            _is_slim_launch_prompt_text,
+            SLIM_REPAIR_PROMPT_SENTINEL, DETERMINISTIC_PROMPT_SENTINEL)
+        payload = self._slim_payload()
+        self.assertTrue(_is_slim_repair_request(payload))
+        prompt = render_launch_prompt_text(payload)
+        self.assertIn(SLIM_REPAIR_PROMPT_SENTINEL, prompt)
+        # Drive the SAME detection the validator call site uses.
+        is_slim = _is_slim_launch_prompt_text(prompt)
+        is_det = DETERMINISTIC_PROMPT_SENTINEL in prompt
+        self.assertTrue(is_slim)
+        self.assertFalse(is_det)
+        slim_markers = _required_launch_prompt_markers_for_role(
+            "substep", deterministic=is_det, slim=is_slim)
+        self.assertEqual(
+            [m for m in slim_markers if not _launch_prompt_marker_present(m, prompt)],
+            [],
+            "rendered slim prompt must satisfy the reduced slim marker set",
+        )
+        # Guard against the branch being too permissive: treated as a FULL prompt (the
+        # pre-fix behavior), the slim prompt IS missing the full skill/requirements markers.
+        full_markers = _required_launch_prompt_markers_for_role("substep")
+        self.assertTrue(
+            [m for m in full_markers if not _launch_prompt_marker_present(m, prompt)],
+            "slim prompt should still be missing the FULL marker set (bug reproduction)",
+        )
+
+    def test_full_substep_prompt_not_misclassified_as_slim(self) -> None:
+        # Regression: the FULL substep template documents the slim mechanism in its
+        # always-rendered boilerplate, so the slim SENTINEL STRING appears inside every full
+        # substep prompt. A whole-body substring `SENTINEL in launch_text` would misclassify
+        # the full prompt as slim and false-reject it (missing the slim-only findings header).
+        # Detection must anchor on the sentinel's position (first line), matching the call
+        # site's `launch_text.lstrip().startswith(...)`.
+        import tools.workflow_conductor as wc
+        from tools.orchestration_runtime import (
+            render_launch_prompt_text, prepare_launch_request_payload)
+        from tools.validate_pipeline_semantics import (
+            _required_launch_prompt_markers_for_role, _launch_prompt_marker_present,
+            _is_slim_launch_prompt_text,
+            SLIM_REPAIR_PROMPT_SENTINEL, DETERMINISTIC_PROMPT_SENTINEL)
+        refs = wc.NodeRefs(node_key="component/spec_x@0.1.0", spec_path="spec/component/spec_x",
+                           ir_id="x_1", pipeline_id="x_1", source_id="src_1", binary_id="bin_1",
+                           run_id="run_1", source_binary_id="bin_1")
+        req = wc.build_launch_request(
+            refs, step="generate", substep="generate", orchestration_id="o",
+            orchestration_agent_run_id="p", child_agent_run_id="c", agent_model="m",
+            workflow_mode="dev")
+        prompt = render_launch_prompt_text(prepare_launch_request_payload(req))
+        # The sentinel string IS present (in boilerplate) but NOT at the prompt's start —
+        # so the production detection must NOT classify this full prompt as slim. Driving the
+        # real _is_slim_launch_prompt_text here makes this a true regression test: reverting
+        # the call site to a whole-body substring check fails this assertion.
+        self.assertIn(SLIM_REPAIR_PROMPT_SENTINEL, prompt)
+        is_slim = _is_slim_launch_prompt_text(prompt)
+        is_det = DETERMINISTIC_PROMPT_SENTINEL in prompt
+        self.assertFalse(is_slim)
+        self.assertFalse(is_det)
+        markers = _required_launch_prompt_markers_for_role(
+            "substep", deterministic=is_det, slim=is_slim)
+        # It is classified full and satisfies the full marker set (no false-reject).
+        self.assertIn("skill_ref:", markers)
+        self.assertEqual(
+            [m for m in markers if not _launch_prompt_marker_present(m, prompt)],
+            [],
+            "full substep prompt must satisfy the full marker set (not misclassified as slim)",
+        )
+
+    def test_slim_marker_list_matches_runtime(self) -> None:
+        # Drift guard on the marker LIST (not just the sentinel constants): the validator's
+        # reduced slim set must equal the renderer's slim branch in
+        # orchestration_runtime._required_launch_prompt_markers.
+        from tools.validate_pipeline_semantics import _required_launch_prompt_markers_for_role
+        from tools.orchestration_runtime import _required_launch_prompt_markers
+        runtime_slim = _required_launch_prompt_markers(self._slim_payload())
+        validator_slim = _required_launch_prompt_markers_for_role("substep", slim=True)
+        self.assertEqual(validator_slim, runtime_slim)
+
+    def test_end_to_end_validate_marker_check_uses_request_and_prompt(self) -> None:
+        # Integration: drive the real _validate_orchestration_hierarchy call site (not just
+        # the detection helpers in isolation) by seeding a substep launch_prompt_ref + its
+        # launch request on disk and running validate(require_orchestration=True). Cases:
+        #   full     : REAL rendered FULL prompt (carries the slim sentinel in its
+        #              always-rendered boilerplate), full request -> not slim -> no violation.
+        #              Catches the R1 substring bug + R2 wiring end-to-end.
+        #   slim     : REAL rendered SLIM prompt, request confirms warm-resume reuse repair
+        #              -> slim -> reduced markers -> no violation (the original bug).
+        #   mismatch : REAL rendered SLIM-looking prompt but a FULL (non-slim) request -> must
+        #              NOT be downgraded -> full markers required -> violation (the Codex P2:
+        #              the exemption is gated on the structured request, not prompt text alone).
+        import json as _json
+        import tools.workflow_conductor as wc
+        from tools.orchestration_runtime import (
+            render_launch_prompt_text, prepare_launch_request_payload)
+        model_text = "module m\nimplicit none\nend module m\n"
+        runner_text = "program r\nimplicit none\nend program r\n"
+        refs = wc.NodeRefs(node_key="component/spec_x@0.1.0", spec_path="spec/component/spec_x",
+                           ir_id="x_1", pipeline_id="x_1", source_id="src_1", binary_id="bin_1",
+                           run_id="run_1", source_binary_id="bin_1")
+        full_req = wc.build_launch_request(
+            refs, step="generate", substep="generate", orchestration_id="orch_test_001",
+            orchestration_agent_run_id="p", child_agent_run_id="c", agent_model="m",
+            workflow_mode="dev")
+        full_prompt = render_launch_prompt_text(prepare_launch_request_payload(full_req))
+        slim_prompt = render_launch_prompt_text(self._slim_payload())
+        # (label, prompt body, seed a slim request?, expect a missing-markers violation)
+        cases = [
+            ("full", full_prompt, False, False),
+            ("slim", slim_prompt, True, False),
+            ("mismatch", slim_prompt, False, True),
+        ]
+        for label, prompt_text, request_is_slim, expect_violation in cases:
+            with self.subTest(case=label), tempfile.TemporaryDirectory() as tmp:
+                repo_root = Path(tmp)
+                _seed_shape_expr_schema_into(repo_root)
+                _create_minimal_execution_tree(
+                    repo_root,
+                    dep_spec_id="dynamics_shallow_water_flux_2d_rusanov_p0",
+                    model_text=model_text,
+                    runner_text=runner_text,
+                    run_command=["./simulate", "workspace/spec.ir.yaml", "workspace/outdir"],
+                )
+                _create_minimal_orchestration_tree(repo_root)
+                launches = (repo_root / "workspace" / "orchestrations" / "orch_test_001"
+                            / "launches")
+                # Overwrite the generate.generate substep's recorded launch prompt.
+                prompt_path = launches / "substep_run_generate_generate_001.prompt.txt"
+                self.assertTrue(prompt_path.exists())
+                prompt_path.write_text(prompt_text, encoding="utf-8")
+                if request_is_slim:
+                    # Make the structured request confirm a warm-resume slim repair so the
+                    # marker check downgrades to the reduced set (as a real slim record does).
+                    req_path = launches / "substep_run_generate_generate_001.request.json"
+                    req = _json.loads(req_path.read_text(encoding="utf-8"))
+                    req.update({"warm_resume": True, "repair_strategy": "reuse",
+                                "repair_findings": "runner.f90:1:1: C000 x"})
+                    req_path.write_text(_json.dumps(req), encoding="utf-8")
+                violations = validate(
+                    repo_root=repo_root, workspace_root="workspace",
+                    require_orchestration=True,
+                )
+                marker_violations = [
+                    v for v in violations
+                    if "missing launch-prompt template markers" in v]
+                if expect_violation:
+                    self.assertTrue(
+                        marker_violations,
+                        f"{label}: slim-looking prompt with a non-slim request must be flagged",
+                    )
+                else:
+                    self.assertEqual(
+                        marker_violations, [],
+                        f"{label} substep prompt must not be flagged for missing markers",
+                    )
+
+
 class MakefileBinNotPinnedTest(unittest.TestCase):
     """post_generate does not pin the Makefile BIN to a specific VALUE, but BIN must be
     declared OVERRIDABLE (`BIN ?=`): Build and Validate.execute impose the canonical
