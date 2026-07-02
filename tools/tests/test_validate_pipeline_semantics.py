@@ -29,6 +29,8 @@ from tools.validate_pipeline_semantics import (
     _validate_makefile_test_no_relink,
     _validate_makefile_test_invokes_cases,
     _validate_source_meta_json_files,
+    _validate_compile_dependency_consistency,
+    _dependency_expected_node_keys,
     validate,
     validate_compile_stage,
     validate_post_build_stage,
@@ -56,6 +58,67 @@ def _seed_shape_expr_schema_into(repo_root: Path) -> None:
 def _write_json(path: Path, data: object) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+
+def _write_dep_graph_sidecar(ir_dir: Path, *, node_key: str,
+                             all_nodes: list, transitive_deps: list) -> None:
+    """Author a conductor-shaped dependency_graph.json sidecar (the derived closure/topo
+    graph the consumers read now; see workflow_conductor._write_dependency_graph)."""
+    _write_json(ir_dir / "dependency_graph.json", {
+        "node_key": node_key,
+        "all_nodes": all_nodes,
+        "transitive_deps": transitive_deps,
+        "generated_by": "conductor",
+    })
+
+
+def _write_dep_graph_sidecar_from_resolved(ir_dir: Path, dependency_resolved: dict) -> None:
+    """Author the conductor-shaped dependency_graph.json sidecar for the shared fixture.
+
+    When `dependency_resolved` provides an explicit `all_nodes` list, the sidecar HONORS it
+    (the derived closure the run-stage DAG check reads) and derives the sidecar transitive_deps
+    as `all_nodes − self − direct_deps`. Otherwise it emits a LEAF sidecar (`all_nodes={self}`).
+
+    Rationale: the historical default fixture declared `direct_deps=[dep]` ONLY to exercise the
+    dependency-operation-usage check (which still reads the IR's direct_deps); its
+    `_dependency_expected_node_keys` result was `{self}` (all_nodes absent + node_key present),
+    so the run-stage DAG-completeness check required NO separate dep pipeline. The derived graph
+    now lives in the sidecar, so a leaf sidecar reproduces that exact DAG behavior, while a
+    fixture that explicitly declares `all_nodes` (a genuine multi-node closure test) drives the
+    DAG check as before."""
+    from tools.validate_pipeline_semantics import _normalize_node_key_token
+
+    def _nk(entry: object) -> object:
+        return entry.get("node_key") if isinstance(entry, dict) else entry
+
+    self_nk = dependency_resolved.get("node_key") or "problem/shallow_water2d@0.3.0"
+    explicit_all = dependency_resolved.get("all_nodes")
+    if not (isinstance(explicit_all, list) and explicit_all):
+        _write_dep_graph_sidecar(
+            ir_dir, node_key=self_nk,
+            all_nodes=[{"node_key": self_nk, "topo_level": 0}],
+            transitive_deps=[])
+        return
+    self_tok = _normalize_node_key_token(self_nk)
+    direct_toks = {
+        _normalize_node_key_token(_nk(d))
+        for d in (dependency_resolved.get("direct_deps") or [])
+        if isinstance(_nk(d), str) and _nk(d).strip()
+    }
+    all_nodes: list[dict] = []
+    for entry in explicit_all:
+        nk = _nk(entry)
+        if not (isinstance(nk, str) and nk.strip()):
+            continue
+        level = entry.get("topo_level") if isinstance(entry, dict) else None
+        all_nodes.append({"node_key": nk, "topo_level": level if isinstance(level, int) else 0})
+    trans_side = [
+        {"node_key": n["node_key"], "via": []}
+        for n in all_nodes
+        if _normalize_node_key_token(n["node_key"]) not in (direct_toks | {self_tok})
+    ]
+    _write_dep_graph_sidecar(
+        ir_dir, node_key=self_nk, all_nodes=all_nodes, transitive_deps=trans_side)
 
 
 _STEP_PHASE_PATH = {
@@ -196,6 +259,14 @@ def _create_minimal_execution_tree(
             "debug_mode": False,
             "context_isolated": True,
         },
+    )
+    # Author the conductor-authored dependency-graph sidecar consistent with the IR's
+    # dependency block (the derived closure/topo graph lives here now; see
+    # _write_dependency_graph). Built so host_direct = {all_nodes} - {self} - {transitive}
+    # equals the IR direct_deps, and every transitive node is present in all_nodes.
+    _write_dep_graph_sidecar_from_resolved(
+        workspace / "ir" / "problem__shallow_water2d__0.3.0" / "shallow-water2d_20260415_001",
+        dependency_resolved,
     )
     if algorithm_contract is None:
         algorithm_contract = {
@@ -6678,6 +6749,19 @@ end program shallow_water2d_runner
                 model_text="module m\nimplicit none\nend module m\n",
                 runner_text="program r\nimplicit none\nend program r\n",
                 run_command=["x", "y"],
+                # Coherent closure so the deterministic direct_deps consistency gate
+                # (_validate_compile_dependency_consistency) recovers host_direct == direct_deps.
+                dependency_resolved={
+                    "node_key": "problem/shallow_water2d@0.3.0",
+                    "direct_deps": ["component/dynamics_shallow_water_flux_2d_rusanov_p0@0.1.0"],
+                    "transitive_deps": [],
+                    "topo_level": 1,
+                    "all_nodes": [
+                        {"node_key": "component/dynamics_shallow_water_flux_2d_rusanov_p0@0.1.0",
+                         "topo_level": 0},
+                        {"node_key": "problem/shallow_water2d@0.3.0", "topo_level": 1},
+                    ],
+                },
             )
             violations = validate_compile_stage(
                 repo_root,
@@ -10150,6 +10234,150 @@ class ConductorDerivedSummaryConsistencyTest(unittest.TestCase):
             vps._validate_tests_verdict_summary_consistency(tmp, ex, violations)
             self.assertTrue(any("counts.pass must equal" in v for v in violations),
                             violations)
+
+
+class CompileDependencyConsistencyTests(unittest.TestCase):
+    """_validate_compile_dependency_consistency: the deterministic V4 direct_deps gate
+    cross-checking the IR's LLM-authored direct_deps against the conductor-authored sidecar."""
+
+    def _seed(self, ir_dir: Path, *, ir_dependency: dict, sidecar: dict | None) -> None:
+        _write_json(ir_dir / "spec.ir.yaml", {"dependency": ir_dependency})
+        if sidecar is not None:
+            _write_json(ir_dir / "dependency_graph.json", sidecar)
+
+    def test_matching_direct_deps_no_violation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            ir_dir = Path(tmp)
+            self._seed(
+                ir_dir,
+                ir_dependency={"node_key": "component/top@0.1.0",
+                               "direct_deps": [{"node_key": "component/mid@0.1.0"}]},
+                sidecar={"node_key": "component/top@0.1.0",
+                         "all_nodes": [
+                             {"node_key": "component/base@0.1.0", "topo_level": 0},
+                             {"node_key": "component/mid@0.1.0", "topo_level": 1},
+                             {"node_key": "component/top@0.1.0", "topo_level": 2}],
+                         "transitive_deps": [
+                             {"node_key": "component/base@0.1.0", "via": ["component/mid@0.1.0"]}],
+                         "generated_by": "conductor"})
+            violations: list[str] = []
+            _validate_compile_dependency_consistency(Path(tmp), ir_dir, violations)
+            self.assertEqual(violations, [])
+
+    def test_leaf_matching_no_violation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            ir_dir = Path(tmp)
+            self._seed(
+                ir_dir,
+                ir_dependency={"node_key": "component/base@0.1.0", "direct_deps": []},
+                sidecar={"node_key": "component/base@0.1.0",
+                         "all_nodes": [{"node_key": "component/base@0.1.0", "topo_level": 0}],
+                         "transitive_deps": [], "generated_by": "conductor"})
+            violations: list[str] = []
+            _validate_compile_dependency_consistency(Path(tmp), ir_dir, violations)
+            self.assertEqual(violations, [])
+
+    def test_direct_deps_mismatch_flagged(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            ir_dir = Path(tmp)
+            # IR claims `base` is a direct dep, but the closure says it is transitive (via mid).
+            self._seed(
+                ir_dir,
+                ir_dependency={"node_key": "component/top@0.1.0",
+                               "direct_deps": [{"node_key": "component/base@0.1.0"}]},
+                sidecar={"node_key": "component/top@0.1.0",
+                         "all_nodes": [
+                             {"node_key": "component/base@0.1.0", "topo_level": 0},
+                             {"node_key": "component/mid@0.1.0", "topo_level": 1},
+                             {"node_key": "component/top@0.1.0", "topo_level": 2}],
+                         "transitive_deps": [
+                             {"node_key": "component/base@0.1.0", "via": ["component/mid@0.1.0"]}],
+                         "generated_by": "conductor"})
+            violations: list[str] = []
+            _validate_compile_dependency_consistency(Path(tmp), ir_dir, violations)
+            self.assertTrue(any("direct_deps disagrees" in v for v in violations), violations)
+            self.assertTrue(any("component/mid" in v for v in violations), violations)
+
+    def test_version_drift_is_soft_not_flagged(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            ir_dir = Path(tmp)
+            # IR pins @0.2.0 but the closure resolved @0.1.0: version-agnostic gate accepts it
+            # (gfortran/link backstop catches a wrong version at Build).
+            self._seed(
+                ir_dir,
+                ir_dependency={"node_key": "component/top@0.1.0",
+                               "direct_deps": [{"node_key": "component/mid@0.2.0"}]},
+                sidecar={"node_key": "component/top@0.1.0",
+                         "all_nodes": [
+                             {"node_key": "component/mid@0.1.0", "topo_level": 0},
+                             {"node_key": "component/top@0.1.0", "topo_level": 1}],
+                         "transitive_deps": [], "generated_by": "conductor"})
+            violations: list[str] = []
+            _validate_compile_dependency_consistency(Path(tmp), ir_dir, violations)
+            self.assertEqual(violations, [])
+
+    def test_missing_sidecar_flagged(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            ir_dir = Path(tmp)
+            self._seed(
+                ir_dir,
+                ir_dependency={"node_key": "component/top@0.1.0",
+                               "direct_deps": [{"node_key": "component/mid@0.1.0"}]},
+                sidecar=None)
+            violations: list[str] = []
+            _validate_compile_dependency_consistency(Path(tmp), ir_dir, violations)
+            self.assertTrue(any("dependency_graph.json sidecar is missing" in v for v in violations),
+                            violations)
+
+    def test_self_not_in_all_nodes_flagged(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            ir_dir = Path(tmp)
+            self._seed(
+                ir_dir,
+                ir_dependency={"node_key": "component/top@0.1.0", "direct_deps": []},
+                sidecar={"node_key": "component/top@0.1.0",
+                         "all_nodes": [{"node_key": "component/mid@0.1.0", "topo_level": 0}],
+                         "transitive_deps": [], "generated_by": "conductor"})
+            violations: list[str] = []
+            _validate_compile_dependency_consistency(Path(tmp), ir_dir, violations)
+            self.assertTrue(any("not present in all_nodes" in v for v in violations), violations)
+
+
+class DependencyExpectedNodeKeysTests(unittest.TestCase):
+    """_dependency_expected_node_keys: the fallback to direct_deps is keyed on all_nodes being
+    ABSENT (not on the set being empty), so a missing sidecar cannot collapse a node with real
+    deps to a self-only closure that bypasses the DAG-completeness gate."""
+
+    def test_all_nodes_present_is_trusted_exactly_including_leaf(self) -> None:
+        # A leaf sidecar (all_nodes=[self]) is trusted exactly even though the IR block also
+        # carries a direct_deps entry (a test/operation-usage artifact) — expected = {self}.
+        dep = {
+            "node_key": "component/top@0.1.0",
+            "all_nodes": [{"node_key": "component/top@0.1.0", "topo_level": 0}],
+            "direct_deps": [{"node_key": "component/base@0.1.0"}],
+        }
+        self.assertEqual(_dependency_expected_node_keys(dep), {"component/top"})
+
+    def test_missing_all_nodes_falls_back_to_direct_deps(self) -> None:
+        # No all_nodes (sidecar missing) but node_key + direct_deps present: must include the
+        # direct dep (fail-closed), NOT collapse to self-only.
+        dep = {
+            "node_key": "component/top@0.1.0",
+            "direct_deps": [{"node_key": "component/base@0.1.0"}],
+        }
+        self.assertEqual(_dependency_expected_node_keys(dep),
+                         {"component/top", "component/base"})
+
+    def test_all_nodes_superset_of_direct(self) -> None:
+        dep = {
+            "node_key": "component/top@0.1.0",
+            "all_nodes": [
+                {"node_key": "component/top@0.1.0", "topo_level": 1},
+                {"node_key": "component/base@0.1.0", "topo_level": 0}],
+            "direct_deps": [{"node_key": "component/base@0.1.0"}],
+        }
+        self.assertEqual(_dependency_expected_node_keys(dep),
+                         {"component/top", "component/base"})
 
 
 if __name__ == "__main__":

@@ -1160,3 +1160,92 @@ criterion, `_judge_attempt_count`, judge/post_judge `allowed_output_paths`); `to
 `_author_derived_validate_artifacts` (single-node / deps-present / `blocked`), the G6 judge criterion, the
 judge+post_judge contract split, and the conductor-derived `summary.counts` gate consistency (+ a mutated
 negative).
+
+
+## G7 — host-author the derived dependency graph (`dependency_graph.json` sidecar) (IMPLEMENTED 2026-07-01)
+
+**Motivation (the host-author sibling of G2/G3, applied to the dependency graph).** The IR's
+`dependency` section mixed two very different fields: the low-mutation **directly-read** edge
+(`node_key` + `direct_deps[]`, straight from `deps.yaml`) and the **derived closure/topo graph**
+(`all_nodes` with `topo_level`, `transitive_deps` with `via`). The derived graph is a pure
+function of `deps.yaml` + `spec/registry/spec_catalog.yaml` — the SAME closure
+`run_workflow.py --with-deps` resolves — yet `compile.generate` (the LLM) authored it by
+"guessing" the transitive closure and topological order, carrying mutation risk (wrong
+`topo_level`, dropped `transitive` edge, closure ≠ `deps.yaml`). Worse, the V4 consistency
+invariants (closure == all_nodes / expected_node_set == all_nodes / topo) were checked by the
+LLM `Compile.verify` ONLY — `--stage compile` never looked at `dependency`.
+
+**Change (partial hoist — graph structure only).** The conductor authors the derived graph
+host-side, mirroring the `lineage.json` / `Makefile` / D5 published-interface precedents.
+
+- **Sidecar, not IR rewrite (operator decision).** The conductor writes a separate file
+  `<ir_ref>/dependency_graph.json` (`{node_key, all_nodes:[{node_key, topo_level}],
+  transitive_deps:[{node_key, via:[...]}], generated_by:"conductor"}`, no `operations`) at
+  Compile phase start (`workflow_conductor._write_dependency_graph`, before any substep's
+  record-launch baseline). The IR keeps only `node_key` + `direct_deps[]` (with the semantic
+  `operations`, which has no host data source and stays LLM-authored). The host directly-required
+  set is recoverable as `{all_nodes} − {self} − {transitive_deps}`.
+- **Builder** `tools/dependency_graph.build_dependency_graph` reuses the runtime closure helpers
+  (`_read_deps_yaml` / `_parse_dep_entries` / `_matching_dep_versions` / `resolve_spec_ref_for` /
+  `_load_spec_catalog`); a post-order DFS records child edges → `topo_level` = height (leaf 0),
+  `via` = the lexicographically-smallest intermediate path (byte-reproducible, re-authored every
+  compile). Error taxonomy is identical to `_resolve_dependency_closure` (cycle / unresolvable /
+  version_conflict / identity_conflict / deps_unreadable / deps_malformed / spec_ref_unresolved /
+  spec_catalog_corrupt); fail-closed, no partial sidecar. The L6 diamond guard stays in
+  `_dependency_closure_nodes` (a Model-B staging concern, not a graph-structure concern).
+- **Compile fail_closed** on a builder error (deps.yaml/catalog structurally broken — not
+  LLM-fixable content), same contract as the closure driver.
+- **Write authorization (3-layer exclusion, the `compile_static_meta.json` pattern — a write_root
+  path that is host-authored):** absent from `compile.generate`'s `allowed_output_paths`; rejected
+  by `_matches_phase_contract`'s exact-set `compile_required`; and excluded (auto-derive `and not
+  path.endswith("/dependency_graph.json")` + explicit-list `raise ValueError`) in
+  `_allowed_file_tool_paths_for_launch`. No FS-diff exemption needed (host-write at phase start,
+  inside `workspace/ir/...` write_roots, in no substep window).
+- **Consumer switch** to the shared reader
+  `validate_pipeline_semantics._read_dependency_graph_sidecar`:
+  `_dependency_closure_nodes` (Build/Model-B), `_judge_pre_spawn_dag_block` (G3 pre-spawn),
+  `_author_derived_validate_artifacts`'s `dependency_set` (G6), and the run-stage
+  `_dependency_resolved_for_execution` + lineage-loop (which now merge the sidecar's `all_nodes`
+  over the IR block). `_is_leaf_node` / `_resolve_dependency_facts` / `_write_lineage` are
+  unchanged (they read `direct_deps`, which stays in the IR).
+- **New deterministic gate** `_validate_compile_dependency_consistency` in `--stage compile`
+  (`compile.static`): sidecar present + internally consistent (self ∈ all_nodes, transitive ⊆
+  all_nodes, non-negative int topo_level), and the IR's `direct_deps` `(kind, spec_id)` set ==
+  `{all_nodes} − {self} − {transitive}`. A mismatch routes to `compile.generate` (warm reopen).
+  Version drift is soft (gfortran/link backstop). This closes the V4a/V4b/topo determinism gap —
+  the LLM `Compile.verify` now checks only **V4c** (`operations ⊆ published`).
+
+**Migration (clean-cut, no IR fallback).** An IR fallback would re-trust LLM `all_nodes` and break
+correct-by-construction, so it was not kept. The one on-disk IR
+(`component__demo_dep_base__0.1.0/.../spec.ir.yaml`, a leaf, E2E-untested) was trimmed
+(`all_nodes` / `transitive_deps` dropped, `direct_deps: []` kept) and its leaf sidecar authored;
+future compiles author the sidecar automatically.
+
+**Files.** `tools/dependency_graph.py` (new builder + `tools/tests/test_dependency_graph.py`);
+`tools/workflow_conductor.py` (`_write_dependency_graph` + the compile branch in `run_phase`,
+consumer switches); `tools/orchestration_runtime.py` (3-layer file-tool exclusion + comments);
+`tools/validate_pipeline_semantics.py` (`_read_dependency_graph_sidecar`,
+`_validate_compile_dependency_consistency`, run-stage sidecar merge); docs
+(`phase_01_compile.md`, `AGENT_CONTRACT.md`, compile-generate/verify SKILLs, and the reference
+docs that name `all_nodes` / `topo_level`). Tests: builder taxonomy, the consistency gate
+(match/mismatch/leaf/version-drift/missing-sidecar/self-absent), the conductor sidecar author +
+fail-closed, the file-tool exclusion, and consumer-switch fixture splits (IR = node_key +
+direct_deps / sidecar = all_nodes + transitive). **Real verification is a billed E2E run**
+(single-node: sidecar `all_nodes:[self@0]` + direct_deps gate; `--with-deps demo_dep_top`:
+multi-node closure/topo, build order from sidecar topo_level, pre_judge DAG reads sidecar
+all_nodes, `aggregate_verdict=pass`).
+
+**Known limitation (accepted, deferred to multi-version support).** The sidecar pins each
+dependency node to the HIGHEST catalog version satisfying the consumer constraint
+(`matched[0]`), matching the closure driver's `node_label` (`run_workflow.py`
+`spec_versions[0]`). Three EXISTING version conventions are mutually inconsistent when a spec
+has >1 catalog version: `resolve_node` builds the dependency under the FIRST catalog entry
+(ignoring the constraint), `_dependency_node_ready` accepts ANY matching version, and
+`node_label`/sidecar/`_stage_dependency_sources` use the highest. For a spec with a single
+catalog version (all 12 today) these coincide and the pin is exact. If they ever diverge,
+`_stage_dependency_sources` FAILS CLOSED ("no ready pipeline") rather than substitute a sibling
+version (which could link stale/constraint-incompatible code) — the same fail-closed stance as
+the L6 diamond guard. This host-author change did NOT introduce the asymmetry (pre-change,
+LLM-authored `all_nodes` fed staging identically); reconciling it is part of the deferred
+multi-version effort (unify `resolve_node`/readiness/staging into one constraint-aware version
+selection), not this change. (Codex review P1, accepted as documented 2026-07-02.)

@@ -3976,6 +3976,28 @@ def _validate_generate_outputs_for_generation(
         )
 
 
+def _read_dependency_graph_sidecar(repo_root: Path, ir_ref: str | None) -> dict[str, Any] | None:
+    """Load the conductor-authored dependency-graph sidecar ``<ir_ref>/dependency_graph.json``.
+
+    The derived dependency graph — ``all_nodes`` (each with ``topo_level``) and
+    ``transitive_deps`` (each with ``via``) — is host-authored here by
+    ``workflow_conductor._write_dependency_graph`` at Compile phase start; it no
+    longer lives in ``spec.ir.yaml.dependency`` (which keeps only the LLM-authored
+    ``node_key`` + ``direct_deps``). Returns the parsed dict, or ``None`` when
+    ``ir_ref`` is unusable, the sidecar is absent, or it is malformed. Callers that
+    read ``all_nodes`` / ``transitive_deps`` merge this over the IR dependency block."""
+    if not isinstance(ir_ref, str) or not ir_ref.startswith("workspace/"):
+        return None
+    path = repo_root / ir_ref / "dependency_graph.json"
+    if not path.is_file():
+        return None
+    try:
+        data = _read_json(path)
+    except (json.JSONDecodeError, OSError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
 def _dependency_doc_path(repo_root: Path, dep_path: Path, ir_ref: str | None) -> Path | None:
     """Resolve the dependency document from a dependency_ref.
 
@@ -4028,11 +4050,24 @@ def _dependency_resolved_for_execution(repo_root: Path, execution: NodeExecution
         return None
     # New IR nests the dependency block under spec.ir.yaml.dependency. Unwrap
     # it so callers continue to see the legacy flat keys.
+    base = dep_data
     if isinstance(dep_data.get("dependency"), dict):
         nested = dep_data["dependency"]
         if "direct_deps" in nested or "transitive_deps" in nested or "node_key" in nested:
-            return nested
-    return dep_data
+            base = nested
+    # Merge the conductor-authored derived graph: all_nodes / transitive_deps now
+    # live in <ir_ref>/dependency_graph.json (host-authored), NOT the IR. The IR
+    # supplies node_key + direct_deps; the sidecar supplies the derived closure the
+    # DAG-completeness check (_dependency_expected_node_keys) reads. When no sidecar
+    # is present the base block is returned unchanged (defensive).
+    graph = _read_dependency_graph_sidecar(repo_root, lineage.get("ir_ref"))
+    if isinstance(graph, dict):
+        merged = dict(base)
+        for key in ("all_nodes", "transitive_deps"):
+            if isinstance(graph.get(key), list):
+                merged[key] = graph[key]
+        return merged
+    return base
 
 
 def _ir_dir_from_pipeline_dir(repo_root: Path, pipeline_dir: Path) -> Path | None:
@@ -6234,7 +6269,8 @@ def _dependency_expected_node_keys(dep_data: dict[str, Any]) -> set[str]:
     expected: set[str] = set()
 
     all_nodes = dep_data.get("all_nodes")
-    if isinstance(all_nodes, list):
+    has_all_nodes = isinstance(all_nodes, list)
+    if has_all_nodes:
         for item in all_nodes:
             expected.update(_dep_node_key_tokens(item))
 
@@ -6242,15 +6278,23 @@ def _dependency_expected_node_keys(dep_data: dict[str, Any]) -> set[str]:
     if isinstance(node_key, str) and node_key.strip():
         expected.update(_dep_node_key_tokens(node_key))
 
-    if not expected:
+    # Fall back to the directly-read deps when `all_nodes` is ABSENT — keyed on the presence
+    # of `all_nodes`, NOT on `expected` being empty. When `all_nodes` is present it IS the
+    # authoritative complete closure (the conductor-authored dependency_graph.json sidecar,
+    # merged in by the callers), so it is trusted exactly — even a bare `[self]` for a leaf.
+    # But when `all_nodes` is missing (a sidecar that is absent/corrupt, or a pre-sidecar IR),
+    # the IR block carries only `node_key` + `direct_deps`; without this a node WITH real
+    # dependencies would collapse to a self-only set (node_key makes `expected` non-empty and
+    # the old `if not expected` guard skipped the fallback), silently bypassing the
+    # DAG-completeness / pre-spawn readiness gate. Requiring at least the direct deps keeps
+    # that degenerate state fail-closed.
+    if not has_all_nodes:
         for field in ("direct_deps", "transitive_deps"):
             deps = dep_data.get(field)
             if not isinstance(deps, list):
                 continue
             for item in deps:
                 expected.update(_dep_node_key_tokens(item))
-        if isinstance(node_key, str) and node_key.strip():
-            expected.update(_dep_node_key_tokens(node_key))
 
     return expected
 
@@ -8206,8 +8250,115 @@ def _validate_compile_stage_impl(
     for optional in ("spec.ir.yaml", "spec.ir.yaml", "spec.ir.yaml"):
         _try_load_optional_plan_yaml(ir_dir, optional, violations)
     _validate_ir_meta_json(ir_dir, violations)
+    _validate_compile_dependency_consistency(repo_root, ir_dir, violations)
 
     return violations
+
+
+def _validate_compile_dependency_consistency(
+    repo_root: Path, ir_dir: Path, violations: list[str]
+) -> None:
+    """Deterministic V4 closure gate: the IR's LLM-authored ``dependency.direct_deps`` must
+    agree with the conductor-authored sidecar ``dependency_graph.json`` (which encodes
+    ``deps.yaml`` + ``spec_catalog.yaml`` and is correct-by-construction; see
+    ``workflow_conductor._write_dependency_graph``). ``direct_deps`` is the ONLY graph-shaped
+    field still authored by the compile.generate LLM, so this is the remaining deterministic
+    check on it — the derived ``all_nodes`` / ``transitive_deps`` moved host-side and no longer
+    need V4a/V4b/topo LLM verification.
+
+    A violation is a content failure routed (via ``classify_compile_static_failure``) back to
+    ``compile.generate`` for a warm reopen (the LLM re-authors ``direct_deps`` to match
+    ``deps.yaml``). Checks: sidecar present + parseable; ``all_nodes`` well-formed with the self
+    node present and every ``transitive_deps`` node in ``all_nodes``; and the version-agnostic
+    ``(kind, spec_id)`` set of IR ``direct_deps`` equals the host directly-required set
+    ``{all_nodes} − {self} − {transitive}``. Version drift is deliberately NOT flagged here
+    (soft — the gfortran/link backstop catches a wrong dependency version at Build; the sidecar
+    pins the resolved version)."""
+    sidecar_path = ir_dir / "dependency_graph.json"
+    if not sidecar_path.is_file():
+        violations.append(
+            f"{sidecar_path}: dependency_graph.json sidecar is missing (conductor-authored "
+            "at Compile phase start)")
+        return
+    try:
+        graph = _read_json(sidecar_path)
+    except (json.JSONDecodeError, OSError):
+        violations.append(f"{sidecar_path}: dependency_graph.json is not valid JSON")
+        return
+    if not isinstance(graph, dict):
+        violations.append(f"{sidecar_path}: dependency_graph.json must be a JSON object")
+        return
+
+    self_token = _normalize_node_key_token(str(graph.get("node_key") or ""))
+    all_nodes = graph.get("all_nodes")
+    if not isinstance(all_nodes, list) or not all_nodes:
+        violations.append(f"{sidecar_path}: all_nodes must be a non-empty list")
+        return
+    all_tokens: set[str] = set()
+    for entry in all_nodes:
+        nk = entry.get("node_key") if isinstance(entry, dict) else None
+        if not (isinstance(nk, str) and nk.strip()):
+            violations.append(f"{sidecar_path}: all_nodes entry missing node_key")
+            return
+        level = entry.get("topo_level")
+        if not isinstance(level, int) or isinstance(level, bool) or level < 0:
+            violations.append(
+                f"{sidecar_path}: all_nodes[{nk!r}] topo_level must be a non-negative int")
+            return
+        all_tokens.add(_normalize_node_key_token(nk))
+    if not self_token or self_token not in all_tokens:
+        violations.append(
+            f"{sidecar_path}: node_key {graph.get('node_key')!r} not present in all_nodes")
+        return
+
+    transitive = graph.get("transitive_deps")
+    transitive = transitive if isinstance(transitive, list) else []
+    trans_tokens: set[str] = set()
+    for entry in transitive:
+        nk = entry.get("node_key") if isinstance(entry, dict) else entry
+        if not (isinstance(nk, str) and nk.strip()):
+            violations.append(f"{sidecar_path}: transitive_deps entry missing node_key")
+            return
+        tok = _normalize_node_key_token(nk)
+        if tok not in all_tokens:
+            violations.append(
+                f"{sidecar_path}: transitive_deps node {nk!r} not present in all_nodes")
+            return
+        trans_tokens.add(tok)
+
+    host_direct = all_tokens - {self_token} - trans_tokens
+
+    ir_path = ir_dir / "spec.ir.yaml"
+    ir: Any = None
+    if ir_path.is_file():
+        try:
+            ir = _read_yaml(ir_path)
+        except (yaml.YAMLError, OSError):
+            ir = None
+    dep = ir.get("dependency") if isinstance(ir, dict) else None
+    dep = dep if isinstance(dep, dict) else {}
+    ir_self = dep.get("node_key")
+    if isinstance(ir_self, str) and ir_self.strip():
+        if _normalize_node_key_token(ir_self) != self_token:
+            violations.append(
+                f"{ir_dir / 'spec.ir.yaml'}: dependency.node_key {ir_self!r} disagrees with "
+                f"dependency_graph.json node_key {graph.get('node_key')!r}")
+            return
+    ir_direct = dep.get("direct_deps")
+    ir_direct = ir_direct if isinstance(ir_direct, list) else []
+    ir_direct_tokens: set[str] = set()
+    for entry in ir_direct:
+        nk = entry.get("node_key") if isinstance(entry, dict) else entry
+        if isinstance(nk, str) and nk.strip():
+            ir_direct_tokens.add(_normalize_node_key_token(nk))
+
+    if ir_direct_tokens != host_direct:
+        missing = sorted(host_direct - ir_direct_tokens)
+        extra = sorted(ir_direct_tokens - host_direct)
+        violations.append(
+            f"{ir_dir / 'spec.ir.yaml'}: dependency.direct_deps disagrees with the "
+            f"deterministic dependency closure (deps.yaml via dependency_graph.json); "
+            f"missing direct deps {missing}; unexpected direct deps {extra}")
 
 
 def _lineage_node_key_and_ir_ref(
@@ -8554,22 +8705,32 @@ def _validate_impl(
         if not dep_path.exists():
             continue
         dep_doc_path = _dependency_doc_path(repo_root, dep_path, lineage.ir_ref)
-        if dep_doc_path is None:
-            continue
-        try:
-            dep_data = _read_yaml(dep_doc_path)
-        except (json.JSONDecodeError, yaml.YAMLError, OSError):
+        dep_data: Any = None
+        if dep_doc_path is not None:
             try:
-                dep_data = _read_json(dep_doc_path)
-            except (json.JSONDecodeError, OSError):
-                continue
+                dep_data = _read_yaml(dep_doc_path)
+            except (json.JSONDecodeError, yaml.YAMLError, OSError):
+                try:
+                    dep_data = _read_json(dep_doc_path)
+                except (json.JSONDecodeError, OSError):
+                    dep_data = None
         if not isinstance(dep_data, dict):
-            continue
-        # Unwrap spec.ir.yaml.dependency for the new IR
+            dep_data = {}
+        # Unwrap spec.ir.yaml.dependency for the new IR (node_key + direct_deps).
         if isinstance(dep_data.get("dependency"), dict):
             nested = dep_data["dependency"]
-            if "direct_deps" in nested or "all_nodes" in nested or "node_key" in nested:
+            if "direct_deps" in nested or "node_key" in nested:
                 dep_data = nested
+        # all_nodes / transitive_deps now live in the dependency node's own
+        # conductor-authored sidecar <ir_ref>/dependency_graph.json, not its
+        # spec.ir.yaml. Merge them over the IR block (keeping node_key / resolved_at).
+        graph = _read_dependency_graph_sidecar(repo_root, lineage.ir_ref)
+        if isinstance(graph, dict):
+            merged = dict(dep_data)
+            for key in ("all_nodes", "transitive_deps"):
+                if isinstance(graph.get(key), list):
+                    merged[key] = graph[key]
+            dep_data = merged
         all_nodes = dep_data.get("all_nodes")
         if not isinstance(all_nodes, list) or not all_nodes:
             continue

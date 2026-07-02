@@ -34,7 +34,7 @@ Detect structural-invariant violations of the Compile stage output, and judge th
 - Check the fixed / knob layer boundary of `impl_defaults`. Check that all fixed sub-keys (`target.class` / `target.backend` / `target.architecture` / `toolchain.language` / `toolchain.standard` / `toolchain.build_system` / `selected.backend_key`) have a value (V6 invariant), and that the leaf values of the knob sub-keys (`abstract.*` / `backend_overrides.*`) are not a plug-hole (`null` / `<TBD>`) (V7 invariant). For details, `docs/workflow/phases/phase_01_compile.md`.
 - Check the default-application rules. The targets are the language default, the `toolchain.build_system` default, and the `OpenMP` default.
 - The case where the `ir_ref` and `ir_meta.json.verification_status` of an immediate dependency `node` cannot be confirmed is a `dependency compile missing` and a `fail`.
-- Check the consistency of the `node_key`, the dependency set, and `topo_level` of `spec.ir.yaml.dependency`.
+- Check **V4c only**: each `direct_deps[].operations` is in the published `operation_id` set of the dependency `node` (from the dependency IR if generated, else `spec_catalog.yaml`). The closure/topo consistency (former node_key / dependency-set / topo_level check) is now correct-by-construction — conductor-authored to the `dependency_graph.json` sidecar and cross-checked by `--stage compile` — so you no longer verify it.
 - Check the diff against a `spec.ir.yaml` regenerated from the same input, and detect a determinism violation.
 - When the information needed to derive a structural invariant is insufficient, it is a `fail`, and `pass` must not be assigned by guessed completion.
 - The workflow mode uses `METDSL_WORKFLOW_EXEC_MODE` as the canonical source, and applies `dev` when unset.

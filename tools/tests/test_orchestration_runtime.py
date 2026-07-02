@@ -2995,6 +2995,48 @@ shell_tool                       stable             true
                 allowed_output_paths=[lint_meta, model_src, command_log],
             )
 
+    def test_dependency_graph_sidecar_not_file_tool_writable(self) -> None:
+        """The conductor-authored dependency-graph sidecar <ir_ref>/dependency_graph.json
+        must stay out of the auto-derived allowed_file_tool_paths set (no compile leaf may
+        Edit/Write it), and an explicit request listing it is rejected."""
+        from tools.orchestration_runtime import _allowed_file_tool_paths_for_launch
+
+        sidecar = f"{_FIX_IR_REF}/dependency_graph.json"
+        ir_yaml = f"{_FIX_IR_REF}/spec.ir.yaml"
+        ir_meta = f"{_FIX_IR_REF}/ir_meta.json"
+        req = {
+            "agent_role": "substep",
+            "node_key": "problem/shallow_water2d@0.3.0",
+            "step": "compile",
+            "substep": "generate",
+            "ir_ref": _FIX_IR_REF,
+            "pipeline_ref": _FIX_PIPE_REF,
+        }
+        derived = _allowed_file_tool_paths_for_launch(
+            request_payload=req,
+            allowed_output_paths=[ir_yaml, ir_meta, sidecar],
+        )
+        self.assertNotIn(sidecar, derived)
+        self.assertIn(ir_yaml, derived)
+        req_explicit = {**req, "allowed_file_tool_paths": [ir_yaml, sidecar]}
+        with self.assertRaisesRegex(ValueError, "dependency-graph sidecar"):
+            _allowed_file_tool_paths_for_launch(
+                request_payload=req_explicit,
+                allowed_output_paths=[ir_yaml, ir_meta, sidecar],
+            )
+        # Scoping (P3): the exclusion is the IR-ROOT sidecar only. A generate leaf's
+        # source-tree file that happens to be named dependency_graph.json (under
+        # source/<id>/src/) is an ordinary leaf output and stays writable.
+        src_named = f"{_FIX_PIPE_REF}/source/src_x/src/dependency_graph.json"
+        gen_req = {
+            "agent_role": "substep", "node_key": "problem/shallow_water2d@0.3.0",
+            "step": "generate", "substep": "generate",
+            "ir_ref": _FIX_IR_REF, "pipeline_ref": _FIX_PIPE_REF, "source_id": "src_x",
+        }
+        gen_derived = _allowed_file_tool_paths_for_launch(
+            request_payload=gen_req, allowed_output_paths=[src_named])
+        self.assertIn(src_named, gen_derived)
+
     def test_src_tree_file_named_lint_meta_stays_writable(self) -> None:
         """The conductor-owned deliverable is ONLY the source-ROOT
         source/<source_id>/lint_meta.json. A legitimately generated source-tree
@@ -24804,7 +24846,10 @@ class ChildContextDocSizeTests(unittest.TestCase):
         # AGENT_CONTRACT is the single common leaf contract; it absorbed
         # WORKFLOW_CORE.md's leaf-actionable invariants + stage-meta keys + the
         # command_log placement one-liner (bumped 16800->17400 for that).
-        "docs/AGENT_CONTRACT.md": 17400,
+        # Bumped 17400->17600: the G7 sidecar note (Compile.generate must not write
+        # the conductor-authored <ir_ref>/dependency_graph.json; it authors only the
+        # IR's node_key + direct_deps) — deterministic_followups.md G7.
+        "docs/AGENT_CONTRACT.md": 17600,
         # Consolidated runner-output contract (was duplicated across phase_02/04 +
         # PERF §2/§6); leaf must-read for generate.generate/verify + validate.judge.
         # Bumped 7600->8100: §3 disambiguated the guard-case snapshot rule (declared
@@ -24826,7 +24871,10 @@ class ChildContextDocSizeTests(unittest.TestCase):
         # a pure spec-cross-reference semantic pass.
         # Bumped 18200->19100: the G2 commit (4ec8d79, "enhance documentation") expanded the
         # phase_01 prose alongside the substep change (io_contract authorship now Compile.generate).
-        "docs/workflow/phases/phase_01_compile.md": 19100,
+        # Bumped 19100->20400: G7 adds the dependency_graph.json sidecar schema + section and the
+        # deterministic direct_deps consistency gate, and rewrites V4 to V4c-only (the derived
+        # closure/topo graph is now conductor-authored) — deterministic_followups.md G7.
+        "docs/workflow/phases/phase_01_compile.md": 20400,
         # Per-substep SKILLs — each force-read by its own LLM leaf.
         # Bumped 10800->11500: Compile.generate now authors the io_contract section (G2 /
         # docs/design/deterministic_followups.md) — it was moved here from Compile.verify so the
@@ -24835,8 +24883,12 @@ class ChildContextDocSizeTests(unittest.TestCase):
         # add ~0.9KB; the bulk of the io_contract detail stays in the force-read phase_01.
         # Bumped 11500->12100: the G2 commit (4ec8d79, "enhance documentation") further expanded
         # the compile-generate SKILL prose alongside the io_contract authorship move.
-        "skills/workflow-compile-generate/SKILL.md": 12100,
-        "skills/workflow-compile-verify/SKILL.md": 11800,
+        # Bumped 12100->12300: G7 — dependency section records node_key + direct_deps only; the
+        # derived closure/topo graph is conductor-authored to dependency_graph.json (G7).
+        "skills/workflow-compile-generate/SKILL.md": 12300,
+        # Bumped 11800->12100: G7 — compile.verify checks V4c only (operations ⊆ published); the
+        # closure/topo consistency is conductor-authored + gate-checked, no longer LLM-verified (G7).
+        "skills/workflow-compile-verify/SKILL.md": 12100,
         # Bumped 22000->22400: inlined the leaf-actionable C003 directive placement
         # + the f2008 63-char identifier limit (previously only in phase_02, which
         # generate.generate no longer force-reads) to avoid a lint/build round-trip.

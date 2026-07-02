@@ -422,6 +422,13 @@ class _FakeConductor(wc.Conductor):
     def _judge_pre_spawn_dag_block(self, refs):  # type: ignore[override]
         return None
 
+    # A no-op dependency-graph sidecar author so the Compile phase passes under the fake
+    # repo_root (a real _write_dependency_graph would read a nonexistent deps.yaml and
+    # fail_closed). The real builder is covered by test_dependency_graph.py and the
+    # dedicated conductor tests that seed a real deps.yaml + catalog.
+    def _write_dependency_graph(self, refs):  # type: ignore[override]
+        return None
+
     # configurable hooks (default: everything passes)
     status_fn = None  # (phase, substep, n) -> "pass"|"fail"
     decision_fn = None  # (phase, outcomes) -> RouteDecision
@@ -2351,6 +2358,66 @@ class FailSummaryContractTest(unittest.TestCase):
         self.assertIn("output_refs:", text)
 
 
+class WriteDependencyGraphTest(unittest.TestCase):
+    """The conductor authors <ir_ref>/dependency_graph.json host-side at Compile start from
+    deps.yaml + spec_catalog.yaml (the derived closure/topo graph moved out of the IR)."""
+
+    def _conductor(self, repo: Path) -> _FakeConductor:
+        return _FakeConductor(
+            repo_root=repo, orchestration_id="o",
+            orchestration_agent_run_id="ORCH", backend="claude", env={})
+
+    def _seed(self, repo: Path) -> None:
+        from tools.orchestration_runtime import _load_spec_catalog
+        _load_spec_catalog.cache_clear()
+        (repo / "spec" / "registry").mkdir(parents=True, exist_ok=True)
+        (repo / "spec" / "registry" / "spec_catalog.yaml").write_text(
+            "catalog_version: 0.2.0\nupdated_at: 2026-06-18\nspecs:\n"
+            "  - spec_kind: component\n    spec_id: top\n    spec_version: \"0.1.0\"\n"
+            "    deps_path: spec/component/top/deps.yaml\n"
+            "  - spec_kind: component\n    spec_id: base\n    spec_version: \"0.1.0\"\n"
+            "    deps_path: spec/component/base/deps.yaml\n", encoding="utf-8")
+        (repo / "spec" / "component" / "top").mkdir(parents=True, exist_ok=True)
+        (repo / "spec" / "component" / "top" / "deps.yaml").write_text(
+            "spec_id: top\nspec_kind: component\ndependencies:\n"
+            "  components:\n    - component_id: base\n      version_constraint: \">=0.1.0 <1.0.0\"\n"
+            "  profiles: []\n", encoding="utf-8")
+        (repo / "spec" / "component" / "base").mkdir(parents=True, exist_ok=True)
+        (repo / "spec" / "component" / "base" / "deps.yaml").write_text(
+            "spec_id: base\nspec_kind: component\ndependencies:\n"
+            "  components: []\n  profiles: []\n", encoding="utf-8")
+
+    def test_authors_sidecar_from_deps(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            self._seed(repo)
+            refs = wc.NodeRefs(node_key="component/top@0.1.0", spec_path="spec/component/top",
+                               ir_id="i", pipeline_id="p", source_id="s", binary_id="b")
+            c = self._conductor(repo)
+            # Call the REAL method (the fake no-ops it for the run_phase happy path).
+            err = wc.Conductor._write_dependency_graph(c, refs)
+            self.assertIsNone(err)
+            graph = json.loads(
+                (repo / refs.ir_ref / "dependency_graph.json").read_text(encoding="utf-8"))
+            self.assertEqual(graph["node_key"], "component/top@0.1.0")
+            self.assertEqual(graph["generated_by"], "conductor")
+            self.assertEqual(graph["all_nodes"], [
+                {"node_key": "component/base@0.1.0", "topo_level": 0},
+                {"node_key": "component/top@0.1.0", "topo_level": 1}])
+            self.assertNotIn("operations", json.dumps(graph))
+
+    def test_fail_closed_on_missing_deps(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)  # no deps.yaml anywhere
+            refs = wc.NodeRefs(node_key="component/top@0.1.0", spec_path="spec/component/top",
+                               ir_id="i", pipeline_id="p", source_id="s", binary_id="b")
+            c = self._conductor(repo)
+            err = wc.Conductor._write_dependency_graph(c, refs)
+            self.assertIsInstance(err, dict)
+            self.assertEqual(err["reason"], "dependency_deps_unreadable")
+            self.assertFalse((repo / refs.ir_ref / "dependency_graph.json").exists())
+
+
 class WriteLineageTest(unittest.TestCase):
     """P2: lineage.json is authored host-side by the conductor (it lives at the pipeline
     root, which must stay non-writable to the sandboxed leaf)."""
@@ -2854,10 +2921,25 @@ class WriteMakefileTest(unittest.TestCase):
     # makefile has no leaf gate). E2E-UNVERIFIED only in that no real dependency spec has run
     # the full compile->validate path yet; these synthetic-IR tests pin the generated structure. ---
 
+    def _write_dep_graph_sidecar(self, repo: Path, refs: wc.NodeRefs, *,
+                                 all_nodes: list, transitive_deps: list) -> None:
+        """Author the conductor-authored dependency-graph sidecar the consumers now read
+        (the derived closure/topo graph moved out of the IR; see _write_dependency_graph)."""
+        ir_dir = repo / refs.ir_ref
+        ir_dir.mkdir(parents=True, exist_ok=True)
+        (ir_dir / "dependency_graph.json").write_text(json.dumps({
+            "node_key": refs.node_key,
+            "all_nodes": all_nodes,
+            "transitive_deps": transitive_deps,
+            "generated_by": "conductor",
+        }, indent=2) + "\n", encoding="utf-8")
+
     def _write_dep_ir(self, repo: Path, refs: wc.NodeRefs) -> None:
-        # Contract-faithful (phase_01 §V4): `transitive_deps` lists ONLY the indirect deps
-        # (base, reached `via` mid); the direct dep (mid) is in `direct_deps` only. The build
-        # closure is the union of the two — exercises that union (not transitive_deps alone).
+        # The IR keeps only node_key + direct_deps (the low-mutation directly-read edge);
+        # `mid` is the direct dep. The derived closure/topo graph (all_nodes / transitive_deps
+        # with topo_level / via) lives in the conductor-authored sidecar dependency_graph.json:
+        # `base` is reached transitively `via` mid. The build closure is the sidecar's all_nodes
+        # minus self.
         ir_dir = repo / refs.ir_ref
         ir_dir.mkdir(parents=True, exist_ok=True)
         (ir_dir / "spec.ir.yaml").write_text(
@@ -2865,14 +2947,15 @@ class WriteMakefileTest(unittest.TestCase):
             "    build_system: make\n  target:\n    backend: openmp\n"
             "dependency:\n"
             '  node_key: "component/top@0.1.0"\n'
-            "  direct_deps:\n    - node_key: \"component/mid@0.1.0\"\n"
-            "  transitive_deps:\n"
-            '    - node_key: "component/base@0.1.0"\n      via: ["component/mid@0.1.0"]\n'
-            "  all_nodes:\n"
-            '    - node_key: "component/base@0.1.0"\n      topo_level: 0\n'
-            '    - node_key: "component/mid@0.1.0"\n      topo_level: 1\n'
-            '    - node_key: "component/top@0.1.0"\n      topo_level: 2\n',
+            "  direct_deps:\n    - node_key: \"component/mid@0.1.0\"\n",
             encoding="utf-8")
+        self._write_dep_graph_sidecar(repo, refs, all_nodes=[
+            {"node_key": "component/base@0.1.0", "topo_level": 0},
+            {"node_key": "component/mid@0.1.0", "topo_level": 1},
+            {"node_key": "component/top@0.1.0", "topo_level": 2},
+        ], transitive_deps=[
+            {"node_key": "component/base@0.1.0", "via": ["component/mid@0.1.0"]},
+        ])
 
     def test_dependency_closure_is_deepest_first(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -2897,12 +2980,12 @@ class WriteMakefileTest(unittest.TestCase):
                 "impl_defaults:\n  toolchain:\n    language: fortran\n    build_system: make\n"
                 "dependency:\n"
                 '  node_key: "component/top@0.1.0"\n'
-                "  direct_deps:\n    - node_key: \"component/base@0.1.0\"\n"
-                "  transitive_deps: []\n"
-                "  all_nodes:\n"
-                '    - node_key: "component/base@0.1.0"\n      topo_level: 0\n'
-                '    - node_key: "component/top@0.1.0"\n      topo_level: 1\n',
+                "  direct_deps:\n    - node_key: \"component/base@0.1.0\"\n",
                 encoding="utf-8")
+            self._write_dep_graph_sidecar(repo, refs, all_nodes=[
+                {"node_key": "component/base@0.1.0", "topo_level": 0},
+                {"node_key": "component/top@0.1.0", "topo_level": 1},
+            ], transitive_deps=[])
             c = self._conductor(repo)
             self.assertEqual(c._dependency_closure_nodes(refs), ["component/base@0.1.0"])
             self.assertEqual(c._dependency_closure(refs), ["base"])
@@ -2926,13 +3009,13 @@ class WriteMakefileTest(unittest.TestCase):
                 '  node_key: "component/top@0.1.0"\n'
                 "  direct_deps:\n"
                 '    - node_key: "component/foo@1.0.0"\n'
-                '    - node_key: "component/foo@2.0.0"\n'
-                "  transitive_deps: []\n"
-                "  all_nodes:\n"
-                '    - node_key: "component/foo@1.0.0"\n      topo_level: 0\n'
-                '    - node_key: "component/foo@2.0.0"\n      topo_level: 0\n'
-                '    - node_key: "component/top@0.1.0"\n      topo_level: 1\n',
+                '    - node_key: "component/foo@2.0.0"\n',
                 encoding="utf-8")
+            self._write_dep_graph_sidecar(repo, refs, all_nodes=[
+                {"node_key": "component/foo@1.0.0", "topo_level": 0},
+                {"node_key": "component/foo@2.0.0", "topo_level": 0},
+                {"node_key": "component/top@0.1.0", "topo_level": 1},
+            ], transitive_deps=[])
             c = self._conductor(repo)
             with self.assertRaisesRegex(RuntimeError, "spec_id basename collision"):
                 c._dependency_closure_nodes(refs)
@@ -3020,8 +3103,13 @@ class WriteMakefileTest(unittest.TestCase):
             ir_dir.mkdir(parents=True, exist_ok=True)
             (ir_dir / "spec.ir.yaml").write_text(
                 "impl_defaults:\n  toolchain:\n    language: fortran\n    build_system: make\n"
-                "dependency:\n  direct_deps:\n    - node_key: \"component/base@0.1.0\"\n",
+                "dependency:\n  node_key: \"component/top@0.1.0\"\n"
+                "  direct_deps:\n    - node_key: \"component/base@0.1.0\"\n",
                 encoding="utf-8")
+            self._write_dep_graph_sidecar(repo, refs, all_nodes=[
+                {"node_key": "component/base@0.1.0", "topo_level": 0},
+                {"node_key": "component/top@0.1.0", "topo_level": 1},
+            ], transitive_deps=[])
             # certified binary built from src_cert; lineage advanced to src_new (unverified).
             self._seed_dep_pipeline(
                 repo, "component/base@0.1.0", "base_20260101_001", "src_cert",
@@ -3060,16 +3148,42 @@ class WriteMakefileTest(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 self._conductor(repo)._stage_dependency_sources(refs, obj_dir)
 
-    def test_stage_dependency_sources_raises_on_malformed_ir(self) -> None:
-        # direct_deps non-empty but its entries carry no resolvable node_key -> the union
-        # closure resolves empty (a compile-contract violation). Fail closed instead of
+    def test_stage_dependency_sources_raises_on_empty_closure_with_direct_deps(self) -> None:
+        # IR declares direct_deps but the closure (now from the dependency_graph.json sidecar's
+        # all_nodes) resolves empty — a missing/leaf-shaped sidecar. Fail closed instead of
         # staging a leaf-shaped build.
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp)
             refs = self._refs()
-            self._write_ir(repo, refs, direct_deps="[{operations: [x]}]")
+            self._write_ir(repo, refs, direct_deps="[{operations: [x]}]")  # no sidecar authored
             obj_dir = repo / "workspace" / "tmp" / "arid_x" / "build"
-            with self.assertRaisesRegex(RuntimeError, "closure resolved empty"):
+            with self.assertRaisesRegex(RuntimeError, "empty build closure"):
+                self._conductor(repo)._stage_dependency_sources(refs, obj_dir)
+
+    def test_stage_dependency_sources_fails_closed_on_version_mismatch(self) -> None:
+        # The sidecar pins base@0.2.0, but only base@0.1.0 is built. Staging must FAIL CLOSED
+        # (not substitute the sibling version, which could link stale/constraint-incompatible
+        # code) — the L6-deferred multi-version case. (Unreachable for single-version specs.)
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            refs = wc.NodeRefs(node_key="component/top@0.1.0", spec_path="spec/component/top",
+                               ir_id="i", pipeline_id="p", source_id="s", binary_id="b")
+            ir_dir = repo / refs.ir_ref
+            ir_dir.mkdir(parents=True, exist_ok=True)
+            (ir_dir / "spec.ir.yaml").write_text(
+                "impl_defaults:\n  toolchain:\n    language: fortran\n    build_system: make\n"
+                "dependency:\n  node_key: \"component/top@0.1.0\"\n"
+                "  direct_deps:\n    - node_key: \"component/base@0.2.0\"\n",
+                encoding="utf-8")
+            self._write_dep_graph_sidecar(repo, refs, all_nodes=[
+                {"node_key": "component/base@0.2.0", "topo_level": 0},
+                {"node_key": "component/top@0.1.0", "topo_level": 1},
+            ], transitive_deps=[])
+            # Only base@0.1.0 is built — NOT the pinned 0.2.0.
+            self._seed_dep_pipeline(repo, "component/base@0.1.0", "base_20260101_001",
+                                    "src_base", "module base_model\nend module base_model\n")
+            obj_dir = repo / "workspace" / "tmp" / "arid_x" / "build"
+            with self.assertRaisesRegex(RuntimeError, "no ready pipeline"):
                 self._conductor(repo)._stage_dependency_sources(refs, obj_dir)
 
     def test_stage_dependency_sources_noop_for_non_fortran(self) -> None:
@@ -4327,13 +4441,16 @@ class G3JudgeGateSubstepTest(unittest.TestCase):
         return mock.patch.object(vps, "_closure_node_validated_in_own_pipeline", fn)
 
     def _seed_ir_closure(self, repo: Path, refs: wc.NodeRefs, closure: list[str]) -> None:
-        # Seed spec.ir.yaml with dependency.all_nodes = self + closure (the SAME source the
-        # post-gate pre_judge DAG check reads). JSON is valid YAML, so _read_yaml parses it.
+        # Seed the conductor-authored sidecar dependency_graph.json with all_nodes = self +
+        # closure (the SAME source the post-gate pre_judge DAG check reads now — the derived
+        # graph moved out of spec.ir.yaml).
         ir_dir = repo / refs.ir_ref
         ir_dir.mkdir(parents=True, exist_ok=True)
         all_nodes = [{"node_key": refs.node_key}] + [{"node_key": nk} for nk in closure]
-        (ir_dir / "spec.ir.yaml").write_text(
-            json.dumps({"dependency": {"all_nodes": all_nodes}}), encoding="utf-8")
+        (ir_dir / "dependency_graph.json").write_text(
+            json.dumps({"node_key": refs.node_key, "all_nodes": all_nodes,
+                        "transitive_deps": [], "generated_by": "conductor"}),
+            encoding="utf-8")
 
     def test_pre_spawn_single_node_skips(self) -> None:
         import tempfile
@@ -4350,6 +4467,26 @@ class G3JudgeGateSubstepTest(unittest.TestCase):
             # No spec.ir.yaml at all (defensive) -> empty dep -> None.
             c = self._conductor(Path(td))
             self.assertIsNone(c._judge_pre_spawn_dag_block(self._refs()))
+
+    def test_pre_spawn_missing_sidecar_falls_back_to_ir_direct_deps(self) -> None:
+        # No dependency_graph.json sidecar (resumed pre-sidecar / corrupt), but the IR still
+        # declares direct_deps: the pre-spawn gate must fall back to the IR block and BLOCK on
+        # the unbuilt dep rather than wave the run through with an empty closure.
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            repo, refs = Path(td), self._refs()
+            ir_dir = repo / refs.ir_ref
+            ir_dir.mkdir(parents=True, exist_ok=True)
+            (ir_dir / "spec.ir.yaml").write_text(
+                json.dumps({"dependency": {
+                    "node_key": refs.node_key,
+                    "direct_deps": [{"node_key": "component/base@0.1.0"}]}}),
+                encoding="utf-8")  # NOTE: no dependency_graph.json authored
+            c = self._conductor(repo)
+            with self._patch_closure_validated(lambda repo_root, tok: False):
+                block = c._judge_pre_spawn_dag_block(refs)
+            self.assertIsInstance(block, str)
+            self.assertIn("component/base", block)
 
     def test_pre_spawn_multi_node_all_ready_proceeds(self) -> None:
         import tempfile

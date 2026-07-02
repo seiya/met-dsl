@@ -118,19 +118,27 @@ io_contract:
     required_sources: ["<var1>", "<var2>", ...]   # a non-empty string array
 
 dependency:
-  # equivalent to the former dependency.resolved.yaml
+  # LLM-authored: ONLY node_key + direct_deps (the directly-read edge + semantic `operations`).
+  # Do NOT author all_nodes / transitive_deps — the conductor derives them (sidecar, below).
   node_key: "<spec_kind>/<spec_id>@<spec_version>"
   direct_deps:
     - node_key: "<spec_kind>/<spec_id>@<spec_version>"
       kind: "<component|profile|problem>"
       operations: ["<operation_id>", ...]
-  transitive_deps:
-    - node_key: "<...>"
-      via: ["<intermediate_node_key>", ...]
-  all_nodes:
-    - node_key: "<...>"
-      topo_level: <int>
 ```
+
+### `<ir_ref>/dependency_graph.json` sidecar (conductor-authored)
+The conductor writes this at Compile phase start (`workflow_conductor._write_dependency_graph`)
+from `deps.yaml` + `spec_catalog.yaml` — a leaf-non-writable managed path (like
+`compile_static_meta.json`; no `operations`):
+```yaml
+{ "node_key": "<kind>/<id>@<v>",
+  "all_nodes":       [{"node_key": "...", "topo_level": <int>}, ...],   # incl. self; topo_level = height
+  "transitive_deps": [{"node_key": "...", "via": ["<intermediate>", ...]}, ...],
+  "generated_by": "conductor" }
+```
+The host directly-required set is `{all_nodes} − {self} − {transitive_deps}`; the `--stage compile`
+gate cross-checks it against the IR's `direct_deps`.
 
 ### `shape_expr` allowed forms
 `spec/schema/plan/shape_expr.schema.json` is the canonical source. Limited to the 3 forms `scalar` (case-insensitive) / `[d1, d2, ...]` / `(d1, d2, ...)`. Function-call notation such as `vector(N)` / `matrix(M,N)` / `tensor` is forbidden and is a `Compile fail`.
@@ -157,7 +165,7 @@ Only `boundary_apply` / `reconstruct` / `flux_compute` / `source_term` / `time_i
 
 ### 1-1. Compile.generate substep
 - Read the physics algorithm (A) of the `Controlled Spec`, deterministically expand the input conditions and `sweep` / `refinement` from `tests.md`, and generate the 5 sections `case` / `algorithm` / `impl_defaults` / `io_contract` / `dependency` of `spec.ir.yaml`.
-- Perform dependency resolution from `deps.yaml` and `spec/registry/spec_catalog.yaml`, and hold `direct_deps` / `transitive_deps` / `all_nodes` in the `dependency` section.
+- Author `dependency.node_key` and `dependency.direct_deps[]` (each with `kind` + `operations`) — the directly-read dependencies from `deps.yaml`. Do NOT author `transitive_deps` / `all_nodes`: the conductor derives that closure/topo graph host-side into `<ir_ref>/dependency_graph.json` (a pure function of `deps.yaml` + `spec_catalog.yaml`).
 - The default values of `impl_defaults` follow the rules of `IMPL_PLAN_SPEC.md` (existing). Considering variant exploration in the Tune optional flow, express the knob set of `abstract` / `backend_overrides` in the IR.
 - When the intent of `controlled_spec.md` does not fit the schema during generation, do not extend the schema; instead treat it as `Compile fail`, record "IR schema insufficiency" in `last_fail_reason`, and stop. For schema extension, separately update the `spec.ir.yaml` schema design by hand, then retry.
 
@@ -186,9 +194,14 @@ The required invariant set for the self-check (finalized as a **minimal set**):
 - `io_contract.semantic_dependency.required_sources` is a non-empty string array.
 
 #### V4. dependency consistency
-- The closure of the union of `dependency.direct_deps[]` and `dependency.transitive_deps[]` matches `dependency.all_nodes` (no node_key duplication or omission).
-- The node_key set of the `expected_node_set` reconstructed from `deps.yaml` and `spec/registry/spec_catalog.yaml` matches `dependency.all_nodes`.
-- Each `direct_deps[].operations` is included in the published `operation_id` set of the dependency `node` (reconcile when the dependency IR exists, and obtain from `spec_catalog.yaml` when not yet generated).
+The derived-closure invariants (former V4a `direct∪transitive == all_nodes`, V4b
+`expected_node_set == all_nodes`, and topo ordering) are now **correct-by-construction** — the
+conductor authors the closure/topo graph into the sidecar and the `--stage compile` gate
+cross-checks the IR's `direct_deps` against it (see below); the LLM no longer verifies them. The
+one remaining LLM-verified invariant:
+- **V4c (operations ⊆ published)**: each `direct_deps[].operations` is in the published
+  `operation_id` set of the dependency `node` (from the dependency IR if generated, else
+  `spec_catalog.yaml`). `operations` is semantic with no host data source, so it stays LLM-verified.
 
 #### V5. impl_defaults consistency
 - The combination of `impl_defaults.toolchain.language` and `impl_defaults.toolchain.build_system` is consistent with the default-value rules of `IMPL_PLAN_SPEC.md`.
@@ -198,6 +211,7 @@ The required invariant set for the self-check (finalized as a **minimal set**):
 These deterministic gates run in the conductor's `Compile.static` substep (`_compile_static_inproc`), NOT inside the `Compile.verify` leaf:
 - Syntax validity via `python3 tools/check_artifact_syntax.py --expect-top object <ir_ref>/spec.ir.yaml <ir_ref>/ir_meta.json`; on `fail` it is a `Compile fail` (routed to `Compile.generate`).
 - `python3 tools/validate_pipeline_semantics.py --stage compile --ir-ref workspace/ir/<node_key_safe>/<ir_id>/`, with `exit code 0` required. The result is recorded in `compile_static_meta.json`; on `fail` the substep fails before `Compile.verify` runs, so `verification_status=pass` is never reached on a structurally-invalid IR. (The `--stage compile` validator checks the internal-consistency / shape-grammar invariants; the spec-cross-reference invariants are the `Compile.verify` LLM responsibility — see the substep structure note.)
+  - **dependency direct_deps consistency** (`_validate_compile_dependency_consistency`): the IR's `dependency.direct_deps` (`(kind, spec_id)` set, version-agnostic) must equal `{all_nodes} − {self} − {transitive}` from the `dependency_graph.json` sidecar. A mismatch is a `Compile fail` routed to `Compile.generate`. Version drift is soft (gfortran backstop). Closes the former V4a/V4b gap.
 
 ## On-failure behavior
 - When the input (`controlled_spec.md` / `tests.md` / `deps.yaml`) is insufficient, it is a `Compile fail`, and guessed completion is forbidden.

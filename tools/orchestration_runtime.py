@@ -4841,6 +4841,11 @@ def _allowed_output_paths_for_launch(
             # Compile.static's ONLY deliverable is compile_static_meta.json (exhaustive, like
             # the generate.static branch — a static request listing any other compile path is
             # rejected, not silently accepted via the compile_required fall-through).
+            # NOTE: the dependency-graph sidecar <ir_ref>/dependency_graph.json is
+            # conductor-authored (workflow_conductor._write_dependency_graph) and NOT a leaf
+            # deliverable — it is absent from compile_required (the exact-set
+            # {spec.ir.yaml, algorithm.summary.md, ir_meta.json}), so a compile.generate /
+            # compile.verify leaf declaring it as an output is rejected here.
             if substep_token == "static":
                 return bool(ir_ref) and path == f"{ir_ref}/compile_static_meta.json"
             # Compile.verify authors NOTHING in spec.ir.yaml — generate authors all 5 sections
@@ -5465,6 +5470,16 @@ def _allowed_file_tool_paths_for_launch(
             # workflow_conductor._compile_static_inproc): never leaf-writable. Defense-in-depth
             # (CP-1 already keeps it out of any compile leaf's allowed_output_paths).
             and not path.endswith("/compile_static_meta.json")
+            # And for the IR-ROOT dependency-graph sidecar dependency_graph.json
+            # (<ir_ref>/dependency_graph.json, conductor-authored at Compile phase start by
+            # workflow_conductor._write_dependency_graph): the derived closure/topo graph is a
+            # pure function of deps.yaml + spec_catalog.yaml, so no compile leaf may write it.
+            # Scoped to the IR-root placement (NOT under a source "/src/" tree), mirroring the
+            # lint_meta/static_meta guards: a generate leaf could legitimately emit a source
+            # file happening to be named dependency_graph.json under source/<id>/src/, which
+            # stays writable. Defense-in-depth (the sidecar is already absent from every compile
+            # leaf's allowed_output_paths — compile.generate lists only spec.ir.yaml+ir_meta.json).
+            and not (path.endswith("/dependency_graph.json") and "/src/" not in path)
             # And for the Validate.pre_judge / Validate.post_judge deliverables
             # (<run_node_dir>/pre_judge_meta.json / post_judge_meta.json, conductor-authored
             # in-process by workflow_conductor._pre_judge_inproc / _post_judge_inproc): never
@@ -5521,6 +5536,16 @@ def _allowed_file_tool_paths_for_launch(
                 f"allowed_file_tool_paths[{idx}] must not include the conductor-authored "
                 f"compile static deliverable: {path!r} (written exclusively by Compile.static "
                 "in-process)"
+            )
+        # Same for the IR-ROOT dependency_graph.json (conductor-authored at Compile phase
+        # start by workflow_conductor._write_dependency_graph — the derived closure/topo graph).
+        # Scoped to the IR-root placement (NOT under a source "/src/" tree): a legitimately
+        # generated source file named dependency_graph.json under source/<id>/src/ stays writable.
+        if path.endswith("/dependency_graph.json") and "/src/" not in path:
+            raise ValueError(
+                f"allowed_file_tool_paths[{idx}] must not include the conductor-authored "
+                f"dependency-graph sidecar: {path!r} (written exclusively by the conductor at "
+                "Compile phase start)"
             )
         # Same for the run-node pre_judge_meta.json / post_judge_meta.json
         # (Validate.pre_judge / Validate.post_judge in-process deliverables).

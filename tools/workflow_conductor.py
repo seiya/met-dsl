@@ -734,6 +734,11 @@ def build_launch_request(
                     f"{refs.ir_ref}/ir_meta.json",
                 ]
             else:  # generate authors the IR + its meta
+                # dependency_graph.json is deliberately NOT listed: the derived
+                # closure/topo graph is conductor-authored at Compile phase start
+                # (_write_dependency_graph); compile.generate authors only the IR's
+                # direct_deps. Keeping it out of allowed_output_paths (and the
+                # file-tool set derived from it) makes the sidecar leaf-non-writable.
                 req["allowed_output_paths"] = [
                     f"{refs.ir_ref}/spec.ir.yaml",
                     f"{refs.ir_ref}/ir_meta.json",
@@ -1271,6 +1276,37 @@ class Conductor:
         path.write_text(json.dumps(lineage, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
         return facts
 
+    def _write_dependency_graph(self, refs: NodeRefs) -> dict[str, str] | None:
+        """Author `<ir_ref>/dependency_graph.json` host-side at Compile phase start.
+
+        The derived dependency graph — `all_nodes` (each with `topo_level`) and
+        `transitive_deps` (each with `via`) — is a pure function of `deps.yaml` +
+        `spec_catalog.yaml` (`tools.dependency_graph.build_dependency_graph`), so
+        the conductor authors it deterministically instead of trusting the
+        compile.generate LLM (which could mutate topo_level, drop a transitive
+        edge, or diverge the closure from deps.yaml). Sister of `_write_lineage`
+        / `_write_makefile` — a host-author precedent. The IR retains only the
+        low-mutation directly-read `direct_deps` (with the semantic `operations`);
+        the sidecar carries NO `operations`. The sidecar lives under `<ir_ref>/`
+        (a leaf-non-writable managed path, like `compile_static_meta.json`), so it
+        is authored host-side, not by any compile leaf.
+
+        Returns the builder's `{reason, detail}` error dict on failure (deps.yaml
+        / catalog structurally broken — fail-closed, NO partial sidecar written),
+        else None. Called only for the compile phase (the only phase whose
+        producer is the IR)."""
+        from tools.dependency_graph import build_dependency_graph
+        graph, err = build_dependency_graph(
+            self.repo_root, target_spec_ref=refs.spec_path,
+            target_node_key=refs.node_key)
+        if err is not None:
+            return err
+        path = self.repo_root / refs.ir_ref / "dependency_graph.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps(graph, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+        return None
+
     def _is_leaf_node(self, refs: NodeRefs) -> bool:
         """A node whose `dependency.direct_deps` is explicitly present and empty. An absent
         dependency block / absent direct_deps returns False (undeterminable -> treat as
@@ -1289,8 +1325,9 @@ class Conductor:
     def _conductor_authors_makefile(self, refs: NodeRefs) -> bool:
         """The conductor authors `src/Makefile` iff build_system=make AND language=fortran —
         exactly the scope of `_write_makefile`, for BOTH leaf and dependency nodes. The
-        dependency Makefile is as IR-determined as the leaf one (the closure + per-dep object
-        rules come from `dependency.transitive_deps`/`all_nodes`; Model B), so the conductor
+        dependency Makefile is as deterministic as the leaf one (the closure + per-dep object
+        rules come from the conductor-authored `dependency_graph.json` sidecar's `all_nodes`;
+        Model B), so the conductor
         authors it too and the generate leaf must not. Single source of truth for the live
         author call AND the write-authorization removal, so they cannot disagree (which would
         orphan the Makefile, or leave it double-owned). c/cpp/mixed keep LLM authoring."""
@@ -1301,35 +1338,35 @@ class Conductor:
                 and str(tc.get("language") or "fortran").lower() == "fortran")
 
     def _dependency_closure_nodes(self, refs: NodeRefs) -> list[str]:
-        """Dependency node_keys in compile order (deepest first) from the IR closure.
+        """Dependency node_keys in compile order (deepest first) from the closure sidecar.
 
-        The build closure is the **union** of `dependency.direct_deps[]` and
-        `dependency.transitive_deps[]` (per the compile V4 contract, phase_01 §V4: their union
-        matches `all_nodes`). `transitive_deps` lists only the INDIRECT deps reached `via` an
-        intermediate, so a one-hop dependency (e.g. `top -> base` with `base` a leaf) has a
-        non-empty `direct_deps` and an empty `transitive_deps` — reading only `transitive_deps`
-        would resolve the closure empty and wrongly block the build. Deduped (first occurrence
-        wins) and ordered by `dependency.all_nodes[].topo_level` ascending (deepest deps, which
-        provide modules the shallower ones `use`, compile first). The node_keys carry the
-        resolved `@<version>`, so the staging path (`_stage_dependency_sources`) and the
-        Makefile object names (`_dependency_closure` -> spec_ids) derive from a single ordered
-        list and cannot disagree on which dep / which version. The spec_id basenames must
-        nonetheless be unique across the closure (the staged `<spec_id>_model.f90` / object
-        rules are keyed on the bare spec_id); a same-spec_id clash (diamond) raises here (L6)."""
-        ir = _read_yaml(self.repo_root / refs.ir_ref / "spec.ir.yaml") or {}
-        dep = (ir.get("dependency") or {}) if isinstance(ir, dict) else {}
+        The complete closure is `dependency_graph.json`'s `all_nodes` (the conductor-authored
+        derived graph; see `_write_dependency_graph`). `all_nodes` includes the target itself,
+        so self is excluded here; the remainder — direct + transitive deps — is the build
+        closure, ordered by `topo_level` ascending (deepest deps, which provide modules the
+        shallower ones `use`, compile first). Reading the sidecar's `all_nodes` directly
+        replaces the old union of the IR's `direct_deps[]` + `transitive_deps[]` (the derived
+        graph no longer lives in the IR). The node_keys carry the resolved `@<version>`, so the
+        staging path (`_stage_dependency_sources`) and the Makefile object names
+        (`_dependency_closure` -> spec_ids) derive from a single ordered list and cannot disagree
+        on which dep / which version. The spec_id basenames must nonetheless be unique across the
+        closure (the staged `<spec_id>_model.f90` / object rules are keyed on the bare spec_id);
+        a same-spec_id clash (diamond) raises here (L6)."""
+        from tools.validate_pipeline_semantics import _read_dependency_graph_sidecar
+        graph = _read_dependency_graph_sidecar(self.repo_root, refs.ir_ref) or {}
+        all_nodes = graph.get("all_nodes") if isinstance(graph, dict) else None
         levels: dict[str, int] = {}
-        for n in dep.get("all_nodes") or []:
-            if isinstance(n, dict) and isinstance(n.get("node_key"), str):
-                levels[n["node_key"]] = n.get("topo_level") or 0
         closure: list[str] = []
         seen: set[str] = set()
-        for list_key in ("direct_deps", "transitive_deps"):
-            for d in dep.get(list_key) or []:
-                nk = d.get("node_key") if isinstance(d, dict) else d
-                if isinstance(nk, str) and nk.strip() and nk != refs.node_key and nk not in seen:
-                    seen.add(nk)
-                    closure.append(nk)
+        for n in all_nodes or []:
+            if not (isinstance(n, dict) and isinstance(n.get("node_key"), str)):
+                continue
+            nk = n["node_key"].strip()
+            if not nk or nk == refs.node_key or nk in seen:
+                continue
+            seen.add(nk)
+            levels[nk] = n.get("topo_level") or 0
+            closure.append(nk)
         closure.sort(key=lambda nk: levels.get(nk, 0))
         # L6 guard: the Model B staged source basename (`<spec_id>_model.f90`) and the
         # Makefile object rules (`$(OBJDIR)/<spec_id>_model.o`) are keyed on the bare
@@ -1912,22 +1949,17 @@ clean:
             dep = (ir.get("dependency") or {}) if isinstance(ir, dict) else {}
             if dep.get("direct_deps"):
                 raise RuntimeError(
-                    f"malformed IR for {refs.node_key}: dependency.direct_deps is non-empty "
-                    f"but the build closure resolved empty (no resolvable node_key in "
-                    f"direct_deps/transitive_deps); recompile (phase_01 §V4 closure contract)")
+                    f"empty build closure for {refs.node_key} despite non-empty "
+                    f"dependency.direct_deps: the closure now derives from the "
+                    f"conductor-authored dependency_graph.json sidecar's all_nodes, so this "
+                    f"means the sidecar is missing/unreadable/leaf-shaped (recompile to "
+                    f"re-author it; phase_01 §V4 closure contract)")
             return []
         obj_dir.mkdir(parents=True, exist_ok=True)
         staged: list[str] = []
         for nk in nodes:
             safe = node_key_safe(nk)
             sid = spec_id_of(nk)
-            pipe_dir = _latest_pipeline_dir(
-                self.repo_root / "workspace" / "pipelines" / safe)
-            if pipe_dir is None:
-                raise RuntimeError(
-                    f"dependency {nk}: no ready pipeline under workspace/pipelines/{safe} "
-                    f"to stage {sid}_model.f90 from (build the dependency closure first, "
-                    f"e.g. run_workflow.py --with-deps)")
             # Bind the staged source to the SAME binary the readiness gate certified, NOT to
             # the pipeline-level lineage.json. `_verify_dep_stage` certifies the latest
             # `binary/*/binary_meta.json` (selected by id) and binds the aggregate_verdict to
@@ -1940,6 +1972,22 @@ clean:
             # `_certified_model_source` is the single-sourced selection the Generate-time
             # interface hint (`_resolve_dependency_facts`) reads too, so the interface a
             # consumer is SHOWN equals the source Build COMPILES (no drift).
+            # Locate the dependency's own pipeline by its EXACT sidecar-pinned version. The
+            # sidecar pins the highest catalog version satisfying the consumer constraint
+            # (matching run_workflow's node_label / `--with-deps` scheduling), so a correctly
+            # built closure has that exact version's pipeline. If it is absent, FAIL CLOSED
+            # rather than substitute a sibling version: staging a different version could link
+            # stale/constraint-incompatible dependency code, and the version-tolerant readiness
+            # gate (which accepts any matching version) diverging from exact-version staging is
+            # the L6-deferred multi-version concern — kept fail-closed until that lands. (All
+            # current specs are single-version, so the pinned version == the built version.)
+            pipe_dir = _latest_pipeline_dir(
+                self.repo_root / "workspace" / "pipelines" / safe)
+            if pipe_dir is None:
+                raise RuntimeError(
+                    f"dependency {nk}: no ready pipeline under workspace/pipelines/{safe} "
+                    f"to stage {sid}_model.f90 from (build the dependency closure first, "
+                    f"e.g. run_workflow.py --with-deps)")
             model_src = _certified_model_source(pipe_dir, sid)
             if model_src is None:
                 raise RuntimeError(
@@ -2912,25 +2960,37 @@ clean:
 
         Provably a STRICT SUBSET of the post-gate: it derives the closure from the SAME
         source and normalization the post-gate's pre_judge DAG check uses
-        (`dependency.all_nodes` -> normalized `<kind>/<spec_id>` tokens via
-        `_dependency_expected_node_keys`) and consults the SAME cross-pipeline predicate
+        (the conductor-authored sidecar `dependency_graph.json`'s `all_nodes` -> normalized
+        `<kind>/<spec_id>` tokens via `_dependency_expected_node_keys`) and consults the SAME
+        cross-pipeline predicate
         (`_closure_node_validated_in_own_pipeline`), so anything blocked here would also
         fail pre_judge — it never fails a run the post-gate would pass; it only saves the
         wasted execute+judge cost when the closure is genuinely incomplete. Reading
         `all_nodes` directly (not `_dependency_closure_nodes`) also skips that helper's L6
         diamond guard, which is a Build/Model-B staging concern irrelevant to DAG readiness
         (and would otherwise mis-raise for a c/cpp/mixed node at validate time)."""
-        ir = _read_yaml(self.repo_root / refs.ir_ref / "spec.ir.yaml") or {}
-        dep = (ir.get("dependency") or {}) if isinstance(ir, dict) else {}
-        if not isinstance(dep, dict):
-            return None
         from tools.validate_pipeline_semantics import (
             _closure_node_validated_in_own_pipeline,
-            _dependency_expected_node_keys, _normalize_node_key_token)
+            _dependency_expected_node_keys, _normalize_node_key_token,
+            _read_dependency_graph_sidecar)
+        # The closure (`all_nodes`) is read from the conductor-authored sidecar
+        # <ir_ref>/dependency_graph.json, not the IR (the derived graph moved there). When the
+        # sidecar is absent (a resumed pre-sidecar node whose compile predates this change, or
+        # a corrupt/missing graph), fall back to the IR `dependency` block so a node that still
+        # declares `direct_deps` is NOT waved through the readiness gate with an empty closure:
+        # `_dependency_expected_node_keys` derives the closure from `direct_deps` when
+        # `all_nodes` is absent, keeping this fail-closed. A genuine leaf (empty direct_deps and
+        # a leaf `all_nodes=[self]`) still yields an empty closure -> None (zero overhead).
+        graph = _read_dependency_graph_sidecar(self.repo_root, refs.ir_ref)
+        if not isinstance(graph, dict):
+            ir = _read_yaml(self.repo_root / refs.ir_ref / "spec.ir.yaml") or {}
+            graph = (ir.get("dependency") or {}) if isinstance(ir, dict) else {}
+            if not isinstance(graph, dict):
+                return None
         # Exclude self: its own pipeline is the one under validation now, not a
         # separately-completed dependency.
         self_token = _normalize_node_key_token(refs.node_key)
-        closure = {t for t in _dependency_expected_node_keys(dep) if t != self_token}
+        closure = {t for t in _dependency_expected_node_keys(graph) if t != self_token}
         if not closure:
             return None
         missing = sorted(t for t in closure
@@ -3034,7 +3094,8 @@ clean:
         # pipeline/run refs; it is NEVER the blocking signal.
         from tools.validate_pipeline_semantics import (
             _closure_node_validated_in_own_pipeline,
-            _dependency_expected_node_keys, _normalize_node_key_token)
+            _dependency_expected_node_keys, _normalize_node_key_token,
+            _read_dependency_graph_sidecar)
         ir = _read_yaml(self.repo_root / refs.ir_ref / "spec.ir.yaml") or {}
         dep = (ir.get("dependency") or {}) if isinstance(ir, dict) else {}
         if not isinstance(dep, dict):
@@ -3106,13 +3167,15 @@ clean:
         else:
             aggregate_verdict = fold_inv[worst]
 
-        # dependency_set: the transitive closure node tokens from the IR (self excluded),
-        # matching the readiness check's derivation.
+        # dependency_set: the transitive closure node tokens (self excluded), from the
+        # conductor-authored dependency-graph sidecar (`all_nodes` lives there now, not the
+        # IR), matching the readiness check's derivation.
         dependency_set: list[str] = []
         try:
             self_token = _normalize_node_key_token(refs.node_key)
+            graph = _read_dependency_graph_sidecar(self.repo_root, refs.ir_ref) or {}
             dependency_set = sorted(
-                t for t in _dependency_expected_node_keys(dep) if t != self_token)
+                t for t in _dependency_expected_node_keys(graph) if t != self_token)
         except Exception:
             dependency_set = []
 
@@ -3389,6 +3452,22 @@ clean:
         # _stage_dependency_sources). c/cpp/mixed keep LLM authoring (see _write_makefile).
         if phase == "generate" and self._conductor_authors_makefile(refs):
             self._write_makefile(refs)
+        # Author the dependency-graph sidecar host-side at Compile start (before any
+        # substep's record-launch baseline): the derived closure/topo graph is a pure
+        # function of deps.yaml + spec_catalog.yaml, so the conductor writes
+        # <ir_ref>/dependency_graph.json deterministically and the compile.generate leaf
+        # authors only direct_deps. Mirrors the lineage/Makefile host-author blocks above.
+        # cycle / unresolvable / version-conflict / catalog-corrupt are deps.yaml/catalog
+        # structural breaks, not content the LLM can fix — fail_closed (same contract as
+        # run_workflow._resolve_dependency_closure), NOT a compile.generate content retry.
+        if phase == "compile":
+            err = self._write_dependency_graph(refs)
+            if err is not None:
+                self.emit("compile_dependency_graph_failed", node_key=node_key,
+                          detail=str(err)[:200])
+                return PhaseOutcome(phase, "fail", decision=RouteDecision(
+                    "fail_closed",
+                    reason=f"compile_dependency_graph_{err['reason']}"))
 
         outcomes: list[SubstepOutcome] = []
         for i, substep in enumerate(SUBSTEPS[phase]):

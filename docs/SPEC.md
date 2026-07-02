@@ -50,7 +50,7 @@ Using the `Controlled Spec` and `tests` as the canonical source, generate, at op
   - `algorithm`: the structural representation of the physics algorithm (A). It requires the vocabulary `execution_mode` / `steps[]` / `ordering` / `control_condition` / `iteration_contract` / `update_semantics` / `temporaries` / `derived_field_rules` / `invariants` / `splitting_policy`.
   - `impl_defaults`: the default values for implementation discretion. It includes `target.backend`, `target.architecture`, `toolchain.language`, and `toolchain.build_system`.
   - `io_contract`: the verification contract. It holds `inputs` / `outputs` / `semantic_dependency.required_sources` / `raw_requirements.required_evidence` / `test_evidence_requirements`.
-  - `dependency`: the dependency-resolution result (`direct_deps` / `transitive_deps` / `topo_level`).
+  - `dependency`: the LLM-authored `node_key` + `direct_deps[]` only (the directly-read edge). The derived closure/topo graph (`all_nodes` / `transitive_deps` / `topo_level`) is conductor-authored to the `<ir_ref>/dependency_graph.json` sidecar, not the IR.
 - The physics algorithm (A) is determined by the `algorithm` section, and case dependence is held by the `case` section.
 - The **default values for implementation discretion (B) are stored in `impl_defaults`, but in the core workflow these are fixed values**. Variant exploration of implementation discretion is the responsibility of the optional flow `Tune`; `Tune` treats `spec.ir.yaml` as invariant, separately reads `tuning.spec`, and generates code variants.
 - The `name`, `shape_expr`, and `evidence_ref` of judgment-target outputs are managed in `io_contract.outputs` of `spec.ir.yaml`.
