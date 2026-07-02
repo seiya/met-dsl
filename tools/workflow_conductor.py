@@ -1769,6 +1769,16 @@ clean:
             status = "pass" if _fresh_deliverables_written(allowed_output_paths) else "fail"
         return status, output_refs
 
+    def _judge_semantic_decision(self, refs: NodeRefs) -> str:
+        """Normalized `semantic_review.json#decision` for the judge substep (lower-cased,
+        stripped; `""` when the file or field is absent). Used by run_phase to decide whether a
+        failed judge substep can safely write a `fail` step_result: the pre_phase_complete hook
+        forbids a `fail` step_result unless the decision is present and `"fail"`, so a `pass`
+        (or missing/empty) decision must skip the write and route as a conformance violation
+        rather than crash the runtime write-step-result."""
+        sem = _read_json(self.repo_root / refs.run_node_dir() / "semantic_review.json") or {}
+        return str(sem.get("decision") or "").strip().lower()
+
     def _agent_run_json(self, refs: NodeRefs, phase: str, substep: str | None,
                         child_arid: str, status: str,
                         output_refs: list[str],
@@ -3580,38 +3590,61 @@ clean:
         #     disposition (an integrity violation, or a recoverable one whose warm-resume budget
         #     was exhausted). The judge passed physics; the pre_phase_complete hook forbids a
         #     `fail` step_result atop a `pass` semantic_review, so the write is skipped.
+        #   - judge (index 2) with semantic_review.decision != "fail" (pass, or missing/empty):
+        #     a judge deliverable inconsistency the hook cannot express — either verdict.json is
+        #     malformed (per_test uses a wrong field name / non-certifying value) while decision
+        #     stays `pass`, or the judge left a stray `fail`/`blocked` per_test entry yet reported
+        #     decision `pass` (a routeable failure MUST carry decision=="fail"). Either way the
+        #     pre_phase_complete hook forbids a `fail` step_result atop a non-`fail`
+        #     semantic_review, so a naive write_step_result would raise a hard conductor_error
+        #     (physics-pass here is per the leaf's own decision, which may be the very bug).
+        #     Route it like the integrity blockers: skip-write + escalate (prod) / fail_closed
+        #     (dev). A present decision=="fail" is a routeable physics/semantic failure and falls
+        #     through to write_step_result + classify_failure unchanged (the hook allows fail+fail).
         if phase == "validate" and status != "pass" and outcomes:
             failed_sub = SUBSTEPS["validate"][len(outcomes) - 1]
-            if failed_sub in ("pre_judge", "post_judge"):
-                fname = ("pre_judge_meta.json" if failed_sub == "pre_judge"
-                         else "post_judge_meta.json")
-                gate_meta = _read_json(self.repo_root / refs.run_node_dir() / fname) or {}
-                cat = gate_meta.get("failure_category") or (
-                    "pre_judge_dag_incomplete" if failed_sub == "pre_judge"
-                    else "pre_judge_violation")
-                # G5: a prod post_judge `unknown` (disposition="escalate") routes to the unified
-                # escalate LLM. Return the escalate decision WITHOUT pre-tombstoning the orphan
-                # arids: conduct() runs the diagnostician and, on a reopen directive, calls
-                # reopen_phase(trigger=this failed post_judge arid) — which NO-OPs if the trigger
-                # is already in superseded_runs.json (idempotency guard), so the trigger MUST
-                # stay live to drive the rollback. reopen_phase supersedes the whole validate
-                # attempt (incl. this trigger) as part of the upstream reopen; a fail_closed
-                # resolution is terminal (no completion vouch runs). Skip-write posture is
-                # preserved (no step_result written here).
-                is_post_judge_escalate = (failed_sub == "post_judge"
-                                          and gate_meta.get("disposition") == "escalate")
-                if is_post_judge_escalate and self.workflow_mode != "dev":
-                    decision = RouteDecision("escalate", reason="validate_post_judge_unknown")
+            judge_conformance_block = False
+            if failed_sub == "judge":
+                judge_conformance_block = self._judge_semantic_decision(refs) != "fail"
+            if failed_sub in ("pre_judge", "post_judge") or judge_conformance_block:
+                if judge_conformance_block:
+                    cat = "judge_conformance_violation"
+                    # A judge-authored conformance violation is routed to the escalate
+                    # diagnostician in prod (it reads verdict.json + semantic_review.json).
+                    is_escalate = True
+                else:
+                    fname = ("pre_judge_meta.json" if failed_sub == "pre_judge"
+                             else "post_judge_meta.json")
+                    gate_meta = _read_json(self.repo_root / refs.run_node_dir() / fname) or {}
+                    cat = gate_meta.get("failure_category") or (
+                        "pre_judge_dag_incomplete" if failed_sub == "pre_judge"
+                        else "pre_judge_violation")
+                    # G5: a prod post_judge `unknown` (disposition="escalate") routes to the
+                    # unified escalate LLM.
+                    is_escalate = (failed_sub == "post_judge"
+                                   and gate_meta.get("disposition") == "escalate")
+                escalate_reason = ("validate_judge_conformance_violation"
+                                   if judge_conformance_block else "validate_post_judge_unknown")
+                # Return the escalate decision WITHOUT pre-tombstoning the orphan arids:
+                # conduct() runs the diagnostician and, on a reopen directive, calls
+                # reopen_phase(trigger=this failed arid) — which NO-OPs if the trigger is already
+                # in superseded_runs.json (idempotency guard), so the trigger MUST stay live to
+                # drive the rollback. reopen_phase supersedes the whole validate attempt (incl.
+                # this trigger) as part of the upstream reopen; a fail_closed resolution is
+                # terminal (no completion vouch runs). Skip-write posture is preserved (no
+                # step_result written here).
+                if is_escalate and self.workflow_mode != "dev":
+                    decision = RouteDecision("escalate", reason=escalate_reason)
                     return PhaseOutcome(phase, status, substep_arids, failed, decision)
-                # Terminal fail_closed cases (pre_judge / integrity / dev unknown / warm-resume
+                # Terminal fail_closed cases (pre_judge / integrity / dev escalate / warm-resume
                 # budget exhausted): skip-write + tombstone the orphan arids (they have no
                 # step_result home, and no reopen will consume them as a trigger).
                 orphan_arids = [oc.agent_run_id for oc in outcomes]
                 if orphan_arids:
                     self._add_superseded_run_ids(
                         orphan_arids, reason=f"validate_gate_fail_orphan: {cat}")
-                if is_post_judge_escalate:  # dev fail-fast (no billed escalate leaf)
-                    decision = RouteDecision("fail_closed", reason="validate_post_judge_unknown")
+                if is_escalate:  # dev fail-fast (no billed escalate leaf)
+                    decision = RouteDecision("fail_closed", reason=escalate_reason)
                 else:
                     reason = ("validate_pre_judge_dag_incomplete"
                               if cat == "pre_judge_dag_incomplete" else f"validate_{cat}")
@@ -3834,9 +3867,10 @@ clean:
                 # validate target terminalizes as before.
                 escalate_source = decision.reason
                 decision = self.escalate(refs, phase, outcome)
-                # G5: the validate post_judge escalate returned WITHOUT tombstoning its orphan
-                # arids (skip-write posture) so that a diagnostician UPSTREAM REOPEN's trigger
-                # stays live (reopen_phase no-ops on an already-superseded trigger). For EVERY
+                # G5: the validate post_judge / judge-conformance escalate returned WITHOUT
+                # tombstoning its orphan arids (skip-write posture) so that a diagnostician
+                # UPSTREAM REOPEN's trigger stays live (reopen_phase no-ops on an
+                # already-superseded trigger). For EVERY
                 # terminal, non-reopen resolution — fail_closed, an unparsable/sandbox directive,
                 # a null/out-of-scope target that falls to the `target_idx >= idx` terminal
                 # `fail`, or a budget-exhausted reopen — no reopen supersedes the attempt, so
@@ -3845,7 +3879,8 @@ clean:
                 # reopen that will actually fire supersedes them via reopen_phase, so exclude
                 # exactly that case (mirroring conduct's own reopen conditions below: an in-scope
                 # upstream target with budget remaining).
-                if escalate_source == "validate_post_judge_unknown" and outcome.substep_arids:
+                if escalate_source in ("validate_post_judge_unknown",
+                                       "validate_judge_conformance_violation") and outcome.substep_arids:
                     tgt = decision.target_phase
                     will_upstream_reopen = (
                         decision.action in ("retry", "reopen")
@@ -3853,9 +3888,12 @@ clean:
                         and phases.index(tgt) < idx
                         and attempts[tgt] + 1 <= MAX_ATTEMPTS_PER_PHASE)
                     if not will_upstream_reopen:
+                        orphan_reason = (
+                            "validate_judge_conformance_escalate_terminal_orphan"
+                            if escalate_source == "validate_judge_conformance_violation"
+                            else "validate_post_judge_escalate_terminal_orphan")
                         self._add_superseded_run_ids(
-                            list(outcome.substep_arids),
-                            reason="validate_post_judge_escalate_terminal_orphan")
+                            list(outcome.substep_arids), reason=orphan_reason)
             if decision.action == "fail_closed":
                 reason = decision.reason or ""
                 # Map to an allowlisted FAIL_CLOSED_REASON_CODES value (the runtime

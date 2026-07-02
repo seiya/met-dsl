@@ -433,6 +433,16 @@ class _FakeConductor(wc.Conductor):
     status_fn = None  # (phase, substep, n) -> "pass"|"fail"
     decision_fn = None  # (phase, outcomes) -> RouteDecision
 
+    # Normalized semantic_review.json#decision for a failed judge substep. Default "fail"
+    # represents a genuine physics/semantic judge fail (the routeable case: run_phase writes
+    # the step_result and routes via classify_failure). A test that exercises the
+    # judge-conformance guard (decision != "fail" -> skip-write + escalate/fail_closed) sets
+    # this to "pass"/"" to model a malformed/inconsistent verdict atop a pass semantic_review.
+    judge_semantic_decision_value = "fail"
+
+    def _judge_semantic_decision(self, refs):  # type: ignore[override]
+        return self.judge_semantic_decision_value
+
     def determine_substep_status(self, refs, phase, substep, allowed_output_paths,
                                  min_mtime=0.0):  # type: ignore[override]
         if self.status_fn is not None:
@@ -1153,6 +1163,77 @@ class TransportFailureTest(unittest.TestCase):
         self.assertIn("write-step-result", subs)
         self.assertNotIn("add-superseded-runs", subs)
 
+    def test_judge_conformance_block_escalates_in_prod(self) -> None:
+        # Fix: a judge substep that fails determine_substep_status while its semantic_review
+        # decision != "fail" (e.g. decision=pass with a malformed per_test using the `result`
+        # key) is a judge-AUTHORED conformance violation. The pre_phase_complete hook forbids a
+        # `fail` step_result atop a non-`fail` semantic_review, so run_phase must SKIP the write
+        # and route to the escalate diagnostician in prod — NOT crash the runtime
+        # write-step-result (orch_20260702T041436Z_a901797b). No tombstone here: the escalate
+        # trigger must stay live for a possible upstream reopen.
+        c = self._C(repo_root=Path("/tmp/repo"), orchestration_id="orch_x",
+                    orchestration_agent_run_id="ORCH", backend="claude", env={},
+                    workflow_mode="prod")
+        c.calls = []
+        c.status_fn = lambda phase, substep, n: (
+            "fail" if (phase == "validate" and substep == "judge") else "pass")
+        c.judge_semantic_decision_value = "pass"
+        oc = c.run_phase(self._refs(), "validate")
+        self.assertEqual(oc.status, "fail")
+        self.assertEqual(oc.decision.action, "escalate")
+        self.assertEqual(oc.decision.reason, "validate_judge_conformance_violation")
+        subs = [s for s, _ in c.calls]
+        self.assertNotIn("write-step-result", subs)    # no crash on the judge gate
+        self.assertNotIn("add-superseded-runs", subs)  # escalate keeps the trigger live
+
+    def test_judge_conformance_block_fails_closed_in_dev(self) -> None:
+        # Same conformance violation in dev: fail-fast (no billed escalate leaf) -> skip-write +
+        # tombstone the orphan arids (pre_judge/execute/judge) + fail_closed.
+        c = self._conductor()  # default workflow_mode="dev"
+        c.status_fn = lambda phase, substep, n: (
+            "fail" if (phase == "validate" and substep == "judge") else "pass")
+        c.judge_semantic_decision_value = "pass"
+        oc = c.run_phase(self._refs(), "validate")
+        self.assertEqual(oc.status, "fail")
+        self.assertEqual(oc.decision.action, "fail_closed")
+        self.assertEqual(oc.decision.reason, "validate_judge_conformance_violation")
+        subs = [s for s, _ in c.calls]
+        self.assertNotIn("write-step-result", subs)
+        sup = [cap for s, cap in c.calls if s == "add-superseded-runs"]
+        self.assertEqual(len(sup), 1)
+        self.assertEqual(sup[0]["--run-ids"], ["child-1", "child-2", "child-3"])
+        self.assertIn("validate_gate_fail_orphan", sup[0]["--reason"])
+
+    def test_judge_missing_decision_also_blocks_not_crashes(self) -> None:
+        # A judge fail with an ABSENT/empty semantic_review decision ("" != "fail") is treated
+        # like decision=pass: the hook would reject the `fail` step_result (or require
+        # semantic_review.json), so run_phase skips the write and conformance-blocks rather than
+        # crash.
+        c = self._conductor()  # dev
+        c.status_fn = lambda phase, substep, n: (
+            "fail" if (phase == "validate" and substep == "judge") else "pass")
+        c.judge_semantic_decision_value = ""
+        oc = c.run_phase(self._refs(), "validate")
+        self.assertEqual(oc.decision.action, "fail_closed")
+        self.assertEqual(oc.decision.reason, "validate_judge_conformance_violation")
+        self.assertNotIn("write-step-result", [s for s, _ in c.calls])
+
+    def test_judge_physics_fail_with_decision_fail_still_routes(self) -> None:
+        # Guard scoping: a GENUINE physics/semantic judge fail (decision=="fail") is a routeable
+        # failure — run_phase writes the step_result (the hook allows fail+fail) and routes via
+        # classify_failure, unchanged by the conformance guard.
+        c = self._conductor()
+        c.status_fn = lambda phase, substep, n: (
+            "fail" if (phase == "validate" and substep == "judge") else "pass")
+        c.judge_semantic_decision_value = "fail"
+        c.decision_fn = lambda phase, outcomes: wc.RouteDecision(
+            "retry", target_phase="generate", repair_strategy="restart", reason="physics_fail")
+        oc = c.run_phase(self._refs(), "validate")
+        self.assertEqual(oc.decision.action, "retry")
+        subs = [s for s, _ in c.calls]
+        self.assertIn("write-step-result", subs)
+        self.assertNotIn("add-superseded-runs", subs)
+
     def test_pass_path_unchanged(self) -> None:
         c = self._conductor()
         oc = c.run_phase(self._refs(), "validate")
@@ -1496,6 +1577,69 @@ class TransportFailureTest(unittest.TestCase):
             self.assertFalse(
                 any("validate_post_judge_escalate_terminal_orphan" in cap["--reason"] for cap in sup),
                 "reopen resolution must not terminal-tombstone (reopen_phase supersedes)")
+
+    def test_judge_conformance_escalate_terminal_tombstones(self) -> None:
+        # Conduct-level counterpart of test_post_gate_unknown_escalate_terminal_tombstones for
+        # the judge-conformance escalate: a prod judge-substep fail with decision != "fail"
+        # escalates (run_phase leaves the orphan arids live for a possible reopen); when the
+        # diagnostician TERMINALIZES, conduct must tombstone them with the judge-specific reason,
+        # and never crash on write-step-result.
+        import tempfile
+        for stub in (
+            lambda refs, phase, outcome: wc.RouteDecision("fail_closed", reason="diag_unrecoverable"),
+            lambda refs, phase, outcome: wc.RouteDecision("retry", target_phase=None, reason="ambig"),
+        ):
+            with tempfile.TemporaryDirectory() as td:
+                repo, refs = Path(td), self._refs()
+
+                class _C(_FakeConductor):
+                    def _write_lineage(self, r):  # type: ignore[override]
+                        return []
+                    def _ensure_fresh_producer_id(self, r, phase):  # type: ignore[override]
+                        return None
+                c = _C(repo_root=repo, orchestration_id="orch_x",
+                       orchestration_agent_run_id="ORCH", backend="claude", env={})
+                c.workflow_mode = "prod"
+                c.calls = []
+                c.judge_semantic_decision_value = "pass"
+                c.status_fn = lambda phase, substep, n: (
+                    "fail" if (phase == "validate" and substep == "judge") else "pass")
+                c.escalate = stub  # type: ignore[assignment]
+                status = c.conduct(refs, "validate")
+                self.assertIn(status, ("fail", "fail_closed"))
+                # The validate step_result is never written (the crash we fixed); earlier phases
+                # (compile/generate/build) legitimately write their own.
+                self.assertEqual(
+                    [cap for s, cap in c.calls
+                     if s == "write-step-result" and cap.get("--step") == "validate"], [])
+                sup = [cap for s, cap in c.calls if s == "add-superseded-runs"]
+                self.assertTrue(
+                    any("validate_judge_conformance_escalate_terminal_orphan" in cap["--reason"]
+                        for cap in sup),
+                    f"expected judge-conformance terminal-orphan tombstone for {stub}")
+
+    def test_judge_semantic_decision_reads_and_normalizes(self) -> None:
+        # Direct coverage of the REAL helper (the _FakeConductor override is bypassed here): it
+        # reads semantic_review.json#decision, normalizes case/whitespace, and returns "" when
+        # the file or the field is absent (the "" path is what makes a missing/empty decision a
+        # conformance block rather than a crash).
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            repo, refs = Path(td), self._refs()
+            c = wc.Conductor(repo_root=repo, orchestration_id="orch_x",
+                             orchestration_agent_run_id="ORCH", backend="claude", env={})
+            rn = repo / refs.run_node_dir()
+            rn.mkdir(parents=True, exist_ok=True)
+            self.assertEqual(c._judge_semantic_decision(refs), "")  # missing file
+            (rn / "semantic_review.json").write_text(
+                json.dumps({"decision": "  PASS "}), encoding="utf-8")
+            self.assertEqual(c._judge_semantic_decision(refs), "pass")
+            (rn / "semantic_review.json").write_text(
+                json.dumps({"decision": "Fail"}), encoding="utf-8")
+            self.assertEqual(c._judge_semantic_decision(refs), "fail")
+            (rn / "semantic_review.json").write_text(
+                json.dumps({}), encoding="utf-8")
+            self.assertEqual(c._judge_semantic_decision(refs), "")  # missing field
 
     def test_gather_failure_context_includes_gate_metas(self) -> None:
         # G5: _gather_failure_context embeds post_judge_meta.json / pre_judge_meta.json so the

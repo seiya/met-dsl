@@ -24900,7 +24900,12 @@ class ChildContextDocSizeTests(unittest.TestCase):
         # match run_program's argv) after a validate.execute failure where a bare
         # `make test` aborted a `--cases`-only runner (orch_20260629T065607Z_011f8fc6).
         "skills/workflow-generate-verify/SKILL.md": 21700,
-        "skills/workflow-validate-judge/SKILL.md": 10000,
+        # Bumped 10000->10400: documented the verdict.json#per_test entry schema
+        # (field name `status`/`outcome` + the pass/fail/xfail/skipped enum, with `blocked`
+        # called out as conductor-derived not judge-written) so the judge leaf no longer
+        # guesses `result`/`expected_outcome` — the value/field lived only in gate code
+        # before (orch_20260702T041436Z_a901797b crash).
+        "skills/workflow-validate-judge/SKILL.md": 10400,
     }
 
     def test_child_context_docs_within_budget(self) -> None:
