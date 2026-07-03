@@ -11063,6 +11063,147 @@ class CheckpointResumeRuntimeTests(unittest.TestCase):
             )
             self.assertEqual(meta.get("spec_ref"), "keep-me")
 
+    def _read_meta(self, repo: Path, oid: str) -> dict:
+        return json.loads(
+            (repo / "workspace/orchestrations" / oid / "orchestration_meta.json")
+            .read_text(encoding="utf-8")
+        )
+
+    def test_init_persists_invocation_block(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            inv = {"argv": ["spec/problem/a", "validate", "--with-deps"],
+                   "closure_id": "orch_target"}
+            init_orchestration(repo_root=repo, orchestration_id="o1", invocation=inv)
+            meta = self._read_meta(repo, "o1")
+            self.assertEqual(meta.get("invocation"), inv)
+
+    def test_init_invocation_overwritten_on_cold_reinit_with_new_block(self) -> None:
+        # invocation is load-bearing for closure-aware resume: a cold re-init that
+        # supplies a fresh block (e.g. reusing an --orchestration-id for a different
+        # --with-deps target) must OVERWRITE, so a later --resume does not read a
+        # stale closure back-link. (repo_revision stays immutable — contrast below.)
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            init_orchestration(repo_root=repo, orchestration_id="o1",
+                               invocation={"closure_target_spec_ref": "spec/problem/first"})
+            init_orchestration(repo_root=repo, orchestration_id="o1",
+                               invocation={"closure_target_spec_ref": "spec/problem/second"})
+            meta = self._read_meta(repo, "o1")
+            self.assertEqual(meta["invocation"],
+                             {"closure_target_spec_ref": "spec/problem/second"})
+
+    def test_init_invocation_preserved_on_reinit_without_new_block(self) -> None:
+        # A re-init that does NOT supply an invocation preserves the existing block
+        # (an internal re-init must not wipe provenance to null).
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            init_orchestration(repo_root=repo, orchestration_id="o1",
+                               invocation={"closure_id": "keep"})
+            init_orchestration(repo_root=repo, orchestration_id="o1")
+            meta = self._read_meta(repo, "o1")
+            self.assertEqual(meta["invocation"], {"closure_id": "keep"})
+
+    def test_invocation_preserved_across_checkpoint_resume(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            init_orchestration(repo_root=repo, orchestration_id="o1",
+                               invocation={"closure_id": "orch_target"})
+            _mark_dependencies_ready(repo, "o1")
+            enable_checkpoint_resume(repo, "o1", spec_ref="new-spec")
+            meta = self._read_meta(repo, "o1")
+            self.assertTrue(meta.get("resume_enabled"))
+            self.assertEqual(meta.get("spec_ref"), "new-spec")
+            self.assertEqual(meta["invocation"], {"closure_id": "orch_target"})
+
+    def test_resume_retarget_drops_stale_closure_link(self) -> None:
+        # Escape hatch: resuming a closure node with a DIFFERENT spec retargets the
+        # orchestration; the recorded closure back-link no longer applies and must be
+        # dropped so a later plain --resume does not re-drive the old closure target.
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            init_orchestration(
+                repo_root=repo, orchestration_id="o1", spec_ref="spec/problem/top",
+                invocation={"spec_ref": "spec/problem/top", "closure_id": "o1",
+                            "closure_target_spec_ref": "spec/problem/top",
+                            "closure_until_phase": "Validate"})
+            enable_checkpoint_resume(repo, "o1", spec_ref="spec/problem/other")
+            meta = self._read_meta(repo, "o1")
+            self.assertEqual(meta["spec_ref"], "spec/problem/other")
+            inv = meta["invocation"]
+            self.assertEqual(inv["spec_ref"], "spec/problem/other")
+            self.assertNotIn("closure_id", inv)
+            self.assertNotIn("closure_target_spec_ref", inv)
+            self.assertNotIn("closure_until_phase", inv)
+
+    def test_resume_same_spec_keeps_closure_link(self) -> None:
+        # A normal resume (or a closure-driven node resume) passes the node's own
+        # spec == invocation.spec_ref, so the closure back-link must survive.
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            init_orchestration(
+                repo_root=repo, orchestration_id="o1", spec_ref="spec/problem/top",
+                invocation={"spec_ref": "spec/problem/top", "closure_id": "o1",
+                            "closure_target_spec_ref": "spec/problem/top",
+                            "closure_until_phase": "Validate"})
+            enable_checkpoint_resume(repo, "o1", spec_ref="spec/problem/top")
+            inv = self._read_meta(repo, "o1")["invocation"]
+            self.assertEqual(inv["closure_id"], "o1")
+            self.assertEqual(inv["closure_target_spec_ref"], "spec/problem/top")
+
+    def test_resume_refreshes_closure_until_on_linked_node(self) -> None:
+        # A phase-override closure resume refreshes the node's persisted
+        # closure_until_phase, so the override is durable on the dependency itself.
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            init_orchestration(
+                repo_root=repo, orchestration_id="dep_c", spec_ref="spec/component/c",
+                invocation={"spec_ref": "spec/component/c", "closure_id": "ORCHT",
+                            "closure_target_spec_ref": "spec/problem/a",
+                            "closure_until_phase": "Compile"})
+            enable_checkpoint_resume(repo, "dep_c", spec_ref="spec/component/c",
+                                     closure_until_phase="Validate")
+            inv = self._read_meta(repo, "dep_c")["invocation"]
+            self.assertEqual(inv["closure_until_phase"], "Validate")
+            self.assertEqual(inv["closure_id"], "ORCHT")
+
+    def test_resume_no_closure_refresh_without_link(self) -> None:
+        # A node without a closure link must not gain closure_until_phase.
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            init_orchestration(
+                repo_root=repo, orchestration_id="solo", spec_ref="spec/problem/x",
+                invocation={"spec_ref": "spec/problem/x"})
+            enable_checkpoint_resume(repo, "solo", spec_ref="spec/problem/x",
+                                     closure_until_phase="Validate")
+            inv = self._read_meta(repo, "solo")["invocation"]
+            self.assertNotIn("closure_until_phase", inv)
+
+    def test_init_cli_invocation_json_roundtrip(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            inv = {"spec_ref": "spec/problem/a", "closure_id": "orch_target"}
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                rc = main([
+                    "init", "--repo-root", str(repo),
+                    "--orchestration-id", "o1",
+                    "--invocation-json", json.dumps(inv),
+                ])
+            self.assertEqual(rc, 0)
+            meta = self._read_meta(repo, "o1")
+            self.assertEqual(meta.get("invocation"), inv)
+
+    def test_init_cli_invocation_json_rejects_non_object(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            with self.assertRaises(ValueError):
+                main([
+                    "init", "--repo-root", str(repo),
+                    "--orchestration-id", "o1",
+                    "--invocation-json", "[1, 2, 3]",
+                ])
+
     def test_check_step_completed_cli_json(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp)

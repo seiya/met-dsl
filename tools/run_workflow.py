@@ -7,6 +7,7 @@ import argparse
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -110,6 +111,49 @@ def _new_orchestration_id() -> str:
     ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     suffix = uuid.uuid4().hex[:8]
     return f"orch_{ts}_{suffix}"
+
+
+def _build_invocation_record(
+    *,
+    argv: list[str] | None,
+    spec_ref: str,
+    until_phase: str,
+    llm: str,
+    llm_command: str,
+    workflow_mode: str,
+    agent_model: str | None,
+    with_deps: bool,
+    closure_id: str | None = None,
+    closure_target_spec_ref: str | None = None,
+    closure_until_phase: str | None = None,
+) -> dict[str, Any]:
+    """Assemble the reproduction/provenance record persisted to
+    `orchestration_meta.json#invocation`.
+
+    Records BOTH the raw argv (as invoked) and the resolved/canonical params: spec
+    paths are canonicalized by `_canonicalize_spec_ref`, so the raw argv alone is not
+    enough to reproduce the run. The `closure_*` fields are present only for nodes of
+    a `--with-deps` closure; closure-aware resume reads `closure_id` /
+    `closure_target_spec_ref` / `closure_until_phase` from here to detect closure
+    membership and re-derive the closure (`_index_closure_orchestrations`)."""
+    raw_argv = list(argv) if argv is not None else list(sys.argv[1:])
+    record: dict[str, Any] = {
+        "argv": raw_argv,
+        "command": shlex.join(["python3", "tools/run_workflow.py", *raw_argv]),
+        "spec_ref": spec_ref,
+        "until_phase": until_phase,
+        "llm": llm,
+        "llm_command": llm_command,
+        "mode": workflow_mode,
+        "with_deps": bool(with_deps),
+    }
+    if agent_model:
+        record["agent_model"] = agent_model
+    if closure_id:
+        record["closure_id"] = closure_id
+        record["closure_target_spec_ref"] = closure_target_spec_ref or ""
+        record["closure_until_phase"] = closure_until_phase or ""
+    return record
 
 
 def _runtime_command(repo_root: Path, env: dict[str, str], args: list[str]) -> RuntimeResult:
@@ -681,6 +725,42 @@ def _find_latest_orchestration(repo_root: Path) -> str | None:
     return max(candidates, key=lambda item: (item[0], item[1]))[1]
 
 
+def _index_closure_orchestrations(repo_root: Path, closure_id: str) -> dict[str, str]:
+    """Map `spec_ref -> orchestration_id` for every orchestration recorded as part of
+    the given closure (`orchestration_meta.json#invocation.closure_id == closure_id`).
+
+    Keeps the latest per `spec_ref` by `started_at` (id as a deterministic tie-break),
+    mirroring `_find_latest_orchestration`'s ranking, so a dependency that was run more
+    than once under one closure resolves to its most recent orchestration. Used by
+    closure-aware resume to find each not-ready node's prior orchestration so it can be
+    resumed (warm, from its checkpoint) rather than re-run cold."""
+    orch_root = repo_root / "workspace" / "orchestrations"
+    if not orch_root.is_dir():
+        return {}
+    # spec_ref -> (started_at_key, orch_id) best seen so far
+    best: dict[str, tuple[str, str]] = {}
+    for path in orch_root.iterdir():
+        if not path.is_dir():
+            continue
+        meta = _read_json_if_exists(path / "orchestration_meta.json")
+        if not isinstance(meta, dict):
+            continue
+        invocation = meta.get("invocation")
+        if not isinstance(invocation, dict) or invocation.get("closure_id") != closure_id:
+            continue
+        spec_ref = meta.get("spec_ref")
+        if not isinstance(spec_ref, str) or not spec_ref.strip():
+            continue
+        spec_ref = spec_ref.strip()
+        started_at = meta.get("started_at")
+        started_key = started_at.strip() if isinstance(started_at, str) else ""
+        candidate = (started_key, path.name)
+        prior = best.get(spec_ref)
+        if prior is None or candidate > prior:
+            best[spec_ref] = candidate
+    return {spec_ref: value[1] for spec_ref, value in best.items()}
+
+
 def _extract_prompt_params(prompt_text: str) -> dict[str, str]:
     """Recover startup params embedded by _build_orchestration_prompt().
 
@@ -714,7 +794,11 @@ def _load_resume_params(repo_root: Path, orchestration_id: str) -> dict[str, str
     - llm                              ← preflight.json#backend
     - llm_command                      ← preflight.json#probe_command
     - until_phase / mode               ← launches/orchestration.start.prompt.txt
-    Missing/unparseable values are returned as None for the caller to validate.
+    - closure_id / closure_target_spec_ref / closure_until_phase
+                                       ← orchestration_meta.json#invocation
+    Missing/unparseable values are returned as None for the caller to validate. The
+    `closure_*` keys are set only when the run was a `--with-deps` node (older
+    orchestrations lack the `invocation` block → None → single-node resume).
     """
     orch_root = repo_root / "workspace" / "orchestrations" / orchestration_id
     meta = _read_json_if_exists(orch_root / "orchestration_meta.json") or {}
@@ -722,6 +806,8 @@ def _load_resume_params(repo_root: Path, orchestration_id: str) -> dict[str, str
     prompt_path = orch_root / "launches" / "orchestration.start.prompt.txt"
     prompt_text = prompt_path.read_text(encoding="utf-8") if prompt_path.exists() else ""
     prompt_params = _extract_prompt_params(prompt_text)
+    invocation = meta.get("invocation")
+    invocation = invocation if isinstance(invocation, dict) else {}
 
     def _clean(value: Any) -> str | None:
         return value.strip() if isinstance(value, str) and value.strip() else None
@@ -736,6 +822,9 @@ def _load_resume_params(repo_root: Path, orchestration_id: str) -> dict[str, str
         "llm_command": _clean(preflight.get("probe_command")),
         "until_phase": prompt_params.get("until_phase"),
         "mode": prompt_params.get("mode"),
+        "closure_id": _clean(invocation.get("closure_id")),
+        "closure_target_spec_ref": _clean(invocation.get("closure_target_spec_ref")),
+        "closure_until_phase": _clean(invocation.get("closure_until_phase")),
     }
 
 
@@ -762,7 +851,9 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
         help=(
             "Resume the latest orchestration (or --orchestration-id) from its checkpoint. "
             "spec_ref / until_phase / --llm / --mode are recovered from the resumed "
-            "orchestration when omitted."
+            "orchestration when omitted. When the resumed orchestration is a node of a "
+            "--with-deps closure (recorded in orchestration_meta.json#invocation), the "
+            "whole closure is re-derived and continued to the target — not just one node."
         ),
     )
     parser.add_argument(
@@ -795,7 +886,9 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
             "node's workflow bottom-up (dependency order), one orchestration per "
             "node. Dependency nodes run to Compile when the target ends at compile, "
             "else to Validate (matching compile / execution readiness). Already-ready "
-            "dependencies are skipped. Ignored with --resume (target only)."
+            "dependencies are skipped. On --resume the closure is re-derived and "
+            "continued automatically from the recorded invocation (no need to re-pass "
+            "--with-deps)."
         ),
     )
     parser.add_argument("--repo-root", default=".")
@@ -842,6 +935,10 @@ def _resolve_existing_ref_path(repo_root: Path, ref: str, *, field_name: str) ->
 
 def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
+    # Raw command line as invoked, for the reproduction record persisted to
+    # orchestration_meta.json#invocation. Captured before any normalization so it
+    # reflects exactly what the operator typed.
+    raw_argv = list(argv) if argv is not None else list(sys.argv[1:])
     missing_tools = _check_required_cli_tools()
     if missing_tools:
         print(
@@ -872,6 +969,10 @@ def main(argv: list[str] | None = None) -> int:
     resume_recovered_dep_ref: str | None = None
     resume_recovered_llm: str | None = None
     resume_recovered_llm_command: str | None = None
+    # Closure-aware resume state (populated in the resume branch when the resumed
+    # orchestration is a node of a `--with-deps` closure).
+    resume_is_closure = False
+    resume_closure_id: str | None = None
     if resume_mode:
         explicit_id = bool(args.orchestration_id)
         orchestration_id = args.orchestration_id or _find_latest_orchestration(repo_root)
@@ -922,8 +1023,51 @@ def main(argv: list[str] | None = None) -> int:
         if spec_ref_arg and not until_phase_arg and spec_ref_arg.strip().lower() in PHASE_ALIASES:
             until_phase_arg = spec_ref_arg
             spec_ref_arg = None
-        spec_ref_in = spec_ref_arg or recovered.get("spec_ref")
-        until_phase_in = until_phase_arg or recovered.get("until_phase")
+        # Closure-aware resume: if the resumed orchestration is a node of a
+        # `--with-deps` closure (recorded in orchestration_meta.json#invocation), the
+        # whole closure is re-walked and driven to the TARGET spec — not just this one
+        # node. Retarget spec_ref/until_phase to the closure target so the shared
+        # startup validation below canonicalizes the target and discovers the target's
+        # dependency ref. An explicit spec override (a non-phase positional) is the
+        # escape hatch back to single-node resume of that spec.
+        closure_id_recovered = recovered.get("closure_id")
+        closure_target_recovered = recovered.get("closure_target_spec_ref")
+        closure_until_recovered = recovered.get("closure_until_phase")
+        # The closure end-phase lives authoritatively on the TARGET orchestration: its
+        # start-prompt end-phase is rewritten by _run_node on every run/resume, so a
+        # prior phase override survives there, whereas a DEPENDENCY node's copied
+        # closure_until_phase goes stale. When we entered via a dependency (entry id !=
+        # closure/target id) AND the target orchestration exists and belongs to this
+        # closure (its own invocation.closure_id matches — guarding a reused
+        # --orchestration-id that names an unrelated run), prefer the target's
+        # recovered until_phase. When we entered via the target itself, its own
+        # recovered value is already freshest (and must not override the partial-block
+        # guard below).
+        if closure_id_recovered and closure_id_recovered != orchestration_id:
+            target_recovered = _load_resume_params(repo_root, closure_id_recovered)
+            if (
+                target_recovered.get("closure_id") == closure_id_recovered
+                and target_recovered.get("until_phase")
+            ):
+                closure_until_recovered = target_recovered.get("until_phase")
+        force_single_node = bool(spec_ref_arg)
+        # All three closure fields are co-written by _build_invocation_record, so
+        # require all three: if any is missing (corrupt/partial block), fall back to
+        # single-node resume rather than driving the closure with a wrong until_phase
+        # (the recovered dep until_phase, e.g. Compile, is NOT the target's).
+        if (
+            closure_id_recovered
+            and closure_target_recovered
+            and closure_until_recovered
+            and not force_single_node
+        ):
+            resume_is_closure = True
+            resume_closure_id = closure_id_recovered
+            spec_ref_in = closure_target_recovered
+            until_phase_in = until_phase_arg or closure_until_recovered
+        else:
+            spec_ref_in = spec_ref_arg or recovered.get("spec_ref")
+            until_phase_in = until_phase_arg or recovered.get("until_phase")
         llm_in = args.llm or recovered.get("llm")
         mode_in = args.mode or recovered.get("mode")
         # Carry the recovered values; the reuse decision happens in the try block
@@ -1085,10 +1229,34 @@ def main(argv: list[str] | None = None) -> int:
     # `python3 tools/...` invocations the agent makes.
     base_env.setdefault("PYTHONDONTWRITEBYTECODE", "1")
 
+    # Closure-aware resume: the resumed orchestration is a node of a `--with-deps`
+    # closure, so re-derive the closure and drive it to the TARGET (spec_ref is the
+    # closure target here). Prior node orchestrations are resumed; not-yet-run nodes
+    # run fresh; already-ready nodes are skipped.
+    if resume_mode and resume_is_closure and resume_closure_id:
+        prior_map = _index_closure_orchestrations(repo_root, resume_closure_id)
+        return _run_with_dependency_closure(
+            repo_root=repo_root,
+            base_env=base_env,
+            target_orchestration_id=resume_closure_id,
+            target_spec_ref=spec_ref,
+            target_source_dependency_ref=source_dependency_ref,
+            until_phase=until_phase,
+            llm=llm,
+            llm_command=llm_command,
+            workflow_mode=workflow_mode,
+            agent_model=args.agent_model,
+            status=args.status,
+            invoke_llm=args.invoke_llm,
+            stdout_format=args.stdout_format,
+            resume=True,
+            prior_orch_by_spec=prior_map,
+            raw_argv=raw_argv,
+        )
+
     # `--with-deps` runs the target's transitive dependency closure bottom-up
-    # (one orchestration per node) before the target. Scoped to fresh runs:
-    # `--resume` re-enters a single existing orchestration (the target), so the
-    # closure is not re-walked there.
+    # (one orchestration per node) before the target. Scoped to fresh runs: a
+    # `--resume` of a `--with-deps` run is handled by the closure-aware branch above.
     if getattr(args, "with_deps", False) and not resume_mode:
         return _run_with_dependency_closure(
             repo_root=repo_root,
@@ -1104,8 +1272,27 @@ def main(argv: list[str] | None = None) -> int:
             status=args.status,
             invoke_llm=args.invoke_llm,
             stdout_format=args.stdout_format,
+            resume=False,
+            prior_orch_by_spec=None,
+            raw_argv=raw_argv,
         )
 
+    # Plain single node. A cold run records the reproduction block (no closure); a
+    # single-node resume passes None (the runtime preserves the existing block).
+    single_node_invocation = (
+        None
+        if resume_mode
+        else _build_invocation_record(
+            argv=raw_argv,
+            spec_ref=spec_ref,
+            until_phase=until_phase,
+            llm=llm,
+            llm_command=llm_command,
+            workflow_mode=workflow_mode,
+            agent_model=args.agent_model,
+            with_deps=False,
+        )
+    )
     return _run_node(
         repo_root=repo_root,
         base_env=base_env,
@@ -1120,6 +1307,7 @@ def main(argv: list[str] | None = None) -> int:
         status=args.status,
         invoke_llm=args.invoke_llm,
         resume_mode=resume_mode,
+        invocation=single_node_invocation,
         stdout_format=args.stdout_format,
     )
 
@@ -1370,6 +1558,8 @@ def _run_node(
     status: str,
     invoke_llm: bool,
     resume_mode: bool,
+    invocation: dict[str, Any] | None = None,
+    closure_until_phase: str | None = None,
     extra_output: dict[str, Any] | None = None,
     stdout_format: str = "jsonl",
 ) -> int:
@@ -1379,7 +1569,10 @@ def _run_node(
     dependency-closure driver can run one orchestration per node without
     cross-node env/tmp leakage. `extra_output`, when given, is merged into the
     final ok/fail JSON (used to carry the `dependency_runs` summary onto the
-    target node's result)."""
+    target node's result). `invocation`, when given, is persisted immutably to
+    `orchestration_meta.json#invocation` on the COLD init path only (the resume
+    path preserves the existing block); it carries the reproduction record and the
+    closure back-link that drives closure-aware resume."""
     env = dict(base_env)
     env["METDSL_ORCHESTRATION_ID"] = orchestration_id
 
@@ -1449,6 +1642,11 @@ def _run_node(
             # derives the run's actual model, which is more accurate than a default.
             if agent_model:
                 init_args += ["--agent-model", agent_model]
+            # Refresh this node's persisted closure end-phase to the effective closure
+            # until_phase, so an operator phase override survives on the dependency
+            # nodes themselves (durable even if the target orchestration never starts).
+            if closure_until_phase:
+                init_args += ["--closure-until-phase", closure_until_phase]
         else:
             init_args = [
                 "init",
@@ -1481,6 +1679,12 @@ def _run_node(
                 orchestration_model = _default_claude_agent_model()
             if orchestration_model:
                 init_args += ["--agent-model", orchestration_model]
+            # Persist the reproduction/closure record on the cold init only. On the
+            # resume branch above the runtime preserves the original block, so we must
+            # not re-pass it there (that would be a no-op at best, and risks recording
+            # a divergent block if the immutability guard were ever relaxed).
+            if invocation:
+                init_args += ["--invocation-json", json.dumps(invocation, ensure_ascii=False)]
         try:
             init_result = _runtime_command(repo_root, env, init_args).payload
             orchestration_agent_run_id = str(init_result.get("orchestration_agent_run_id", "")).strip()
@@ -1927,14 +2131,34 @@ def _run_with_dependency_closure(
     status: str,
     invoke_llm: bool,
     stdout_format: str = "jsonl",
+    resume: bool = False,
+    prior_orch_by_spec: dict[str, str] | None = None,
+    raw_argv: list[str] | None = None,
 ) -> int:
     """Run the target's dependency closure bottom-up, then the target.
 
-    Each dependency node runs as its own fresh orchestration (one per node).
-    Nodes already satisfying the required readiness are skipped. On the first
+    Each not-ready dependency node runs as its own orchestration (one per node);
+    nodes already satisfying the required readiness are skipped. On the first
     dependency failure the run stops (the target is not launched). The target's
     final JSON result carries a `dependency_runs` summary.
+
+    This drives BOTH the fresh `--with-deps` path and closure-aware `--resume`:
+    - Fresh (`resume=False`, `prior_orch_by_spec=None`): every not-ready node gets a
+      fresh orchestration id and a cold run. Behavior is unchanged from before, with
+      the one additive effect that each node now records an `invocation` block whose
+      `closure_id` = `target_orchestration_id`, which is what makes a LATER resume
+      closure-aware.
+    - Resume (`resume=True`): `prior_orch_by_spec` maps a node's spec_ref to its prior
+      orchestration id; a not-ready node with a prior orchestration is resumed (warm,
+      from its checkpoint) instead of re-run cold, and the target reuses
+      `target_orchestration_id` (= closure_id), resumed when its orchestration dir
+      already exists. The closure itself is re-derived here deterministically, so
+      already-ready deps are skipped and any deps.yaml/catalog change is reflected.
+
+    `raw_argv` is threaded into each node's `invocation` record so the reproduction
+    command is captured on every closure node.
     """
+    prior_orch_by_spec = prior_orch_by_spec or {}
     ordered, error = _resolve_dependency_closure(repo_root, target_spec_ref)
     if error is not None:
         _emit_closure_event(
@@ -1968,7 +2192,12 @@ def _run_with_dependency_closure(
             )
             continue
 
-        dep_orch_id = _new_orchestration_id()
+        # Closure-aware resume: a not-ready node with a prior orchestration under this
+        # closure is resumed (warm) from its checkpoint; otherwise mint a fresh id and
+        # cold-run it. Fresh `--with-deps` runs pass an empty map → always fresh/cold.
+        prior_dep_orch_id = prior_orch_by_spec.get(spec_ref) if resume else None
+        dep_orch_id = prior_dep_orch_id or _new_orchestration_id()
+        dep_resume = prior_dep_orch_id is not None
         try:
             dep_source_dependency_ref = _discover_source_dependency_ref(repo_root, spec_ref)
         except ValueError as exc:
@@ -1996,8 +2225,24 @@ def _run_with_dependency_closure(
                 "spec_ref": spec_ref,
                 "until_phase": dep_until_phase,
                 "orchestration_id": dep_orch_id,
+                "resume": dep_resume,
             },
             stdout_format,
+        )
+        # Cold run records the reproduction/closure block; a resumed node preserves
+        # the block it already carries, so pass None there.
+        dep_invocation = None if dep_resume else _build_invocation_record(
+            argv=raw_argv,
+            spec_ref=spec_ref,
+            until_phase=dep_until_phase,
+            llm=llm,
+            llm_command=llm_command,
+            workflow_mode=workflow_mode,
+            agent_model=agent_model,
+            with_deps=True,
+            closure_id=target_orchestration_id,
+            closure_target_spec_ref=target_spec_ref,
+            closure_until_phase=until_phase,
         )
         rc = _run_node(
             repo_root=repo_root,
@@ -2012,7 +2257,12 @@ def _run_with_dependency_closure(
             agent_model=agent_model,
             status=status,
             invoke_llm=invoke_llm,
-            resume_mode=False,
+            resume_mode=dep_resume,
+            invocation=dep_invocation,
+            # On resume, refresh this dep's persisted closure end-phase to the
+            # effective closure until_phase so an operator phase override stays durable
+            # on the dependency nodes even if the target orchestration is never created.
+            closure_until_phase=until_phase if dep_resume else None,
             stdout_format=stdout_format,
         )
         dependency_runs.append(
@@ -2020,6 +2270,7 @@ def _run_with_dependency_closure(
                 "node": node_label,
                 "spec_ref": spec_ref,
                 "skipped": False,
+                "resumed": dep_resume,
                 "orchestration_id": dep_orch_id,
                 "exit_code": rc,
             }
@@ -2068,7 +2319,43 @@ def _run_with_dependency_closure(
             )
             return 2
 
-    # All dependencies are ready — run the target node, carrying the summary.
+    # All dependencies are ready — run the target node, carrying the summary. On
+    # closure-aware resume, reuse the closure id as the target orchestration id and
+    # resume it when its orchestration is actually THIS closure's target from a prior
+    # attempt (it may have failed after the deps, or never started). Warm-resume ONLY
+    # when the existing meta is linked to this closure — its own invocation.closure_id
+    # equals the closure/target id — AND its spec matches. A reserved id that already
+    # named an UNRELATED pre-existing orchestration (a reused --orchestration-id, even
+    # one for the SAME spec from a standalone run) must be cold-initialized as the
+    # intended target, not resumed off the unrelated run's stale checkpoint/phase state.
+    target_meta_path = (
+        repo_root / "workspace" / "orchestrations" / target_orchestration_id
+        / "orchestration_meta.json"
+    )
+    target_meta = _read_json_if_exists(target_meta_path) if resume else None
+    target_meta_invocation = (
+        target_meta.get("invocation") if isinstance(target_meta, dict) else None
+    )
+    target_resume = (
+        resume
+        and isinstance(target_meta, dict)
+        and target_meta.get("spec_ref") == target_spec_ref
+        and isinstance(target_meta_invocation, dict)
+        and target_meta_invocation.get("closure_id") == target_orchestration_id
+    )
+    target_invocation = None if target_resume else _build_invocation_record(
+        argv=raw_argv,
+        spec_ref=target_spec_ref,
+        until_phase=until_phase,
+        llm=llm,
+        llm_command=llm_command,
+        workflow_mode=workflow_mode,
+        agent_model=agent_model,
+        with_deps=True,
+        closure_id=target_orchestration_id,
+        closure_target_spec_ref=target_spec_ref,
+        closure_until_phase=until_phase,
+    )
     return _run_node(
         repo_root=repo_root,
         base_env=base_env,
@@ -2082,7 +2369,9 @@ def _run_with_dependency_closure(
         agent_model=agent_model,
         status=status,
         invoke_llm=invoke_llm,
-        resume_mode=False,
+        resume_mode=target_resume,
+        invocation=target_invocation,
+        closure_until_phase=until_phase if target_resume else None,
         extra_output={"dependency_runs": dependency_runs},
         stdout_format=stdout_format,
     )

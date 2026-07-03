@@ -353,23 +353,25 @@ class RunWorkflowTests(unittest.TestCase):
         started_at: str = "2026-01-01T00:00:00.000000Z",
         source_dependency_ref: str = "spec/problem/deps.yaml",
         probe_command: str | None = None,
+        status: str = "fail",
+        invocation: dict | None = None,
     ) -> None:
         """Create the on-disk artifacts a resume recovers params from."""
         orch_root = repo_root / "workspace" / "orchestrations" / orchestration_id
         (orch_root / "launches").mkdir(parents=True, exist_ok=True)
         dep_ref = source_dependency_ref
+        meta = {
+            "orchestration_id": orchestration_id,
+            "status": status,
+            "started_at": started_at,
+            "spec_ref": spec_ref,
+            "source_dependency_ref": dep_ref,
+            "orchestration_agent_run_id": "orch_agent_prev",
+        }
+        if invocation is not None:
+            meta["invocation"] = invocation
         (orch_root / "orchestration_meta.json").write_text(
-            json.dumps(
-                {
-                    "orchestration_id": orchestration_id,
-                    "status": "fail",
-                    "started_at": started_at,
-                    "spec_ref": spec_ref,
-                    "source_dependency_ref": dep_ref,
-                    "orchestration_agent_run_id": "orch_agent_prev",
-                },
-                ensure_ascii=False,
-            ),
+            json.dumps(meta, ensure_ascii=False),
             encoding="utf-8",
         )
         (orch_root / "preflight.json").write_text(
@@ -1007,6 +1009,349 @@ class RunWorkflowTests(unittest.TestCase):
             self.assertEqual(out["reason"], "resume_params_unrecoverable")
             self.assertIn("until_phase", out["detail"])
             self.assertEqual(calls, [])
+
+    # ------------------------------------------------------------------
+    # invocation record + closure-aware resume
+    # ------------------------------------------------------------------
+    def test_build_invocation_record_single_node_has_no_closure(self) -> None:
+        rec = run_workflow._build_invocation_record(
+            argv=["spec/problem/a", "validate"],
+            spec_ref="spec/problem/a",
+            until_phase="Validate",
+            llm="claude",
+            llm_command="claude",
+            workflow_mode="dev",
+            agent_model="opus",
+            with_deps=False,
+        )
+        self.assertEqual(rec["argv"], ["spec/problem/a", "validate"])
+        self.assertIn("python3 tools/run_workflow.py", rec["command"])
+        self.assertEqual(rec["spec_ref"], "spec/problem/a")
+        self.assertEqual(rec["until_phase"], "Validate")
+        self.assertEqual(rec["agent_model"], "opus")
+        self.assertFalse(rec["with_deps"])
+        self.assertNotIn("closure_id", rec)
+
+    def test_build_invocation_record_closure_fields_present(self) -> None:
+        rec = run_workflow._build_invocation_record(
+            argv=["spec/problem/a", "validate", "--with-deps"],
+            spec_ref="spec/component/c",
+            until_phase="Validate",
+            llm="claude",
+            llm_command="claude",
+            workflow_mode="dev",
+            agent_model=None,
+            with_deps=True,
+            closure_id="orch_target",
+            closure_target_spec_ref="spec/problem/a",
+            closure_until_phase="Validate",
+        )
+        self.assertTrue(rec["with_deps"])
+        self.assertEqual(rec["closure_id"], "orch_target")
+        self.assertEqual(rec["closure_target_spec_ref"], "spec/problem/a")
+        self.assertEqual(rec["closure_until_phase"], "Validate")
+        # agent_model omitted when falsy
+        self.assertNotIn("agent_model", rec)
+
+    def test_load_resume_params_recovers_closure_from_invocation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._seed_spec_tree(repo_root)
+            oid = "orch_20260101T000000Z_dep00000"
+            self._seed_resumable_orchestration(
+                repo_root, oid, spec_ref="spec/component/c",
+                until_phase="Validate", mode="dev", backend="claude",
+                invocation={
+                    "closure_id": "orch_target",
+                    "closure_target_spec_ref": "spec/problem/a",
+                    "closure_until_phase": "Validate",
+                },
+            )
+            params = run_workflow._load_resume_params(repo_root, oid)
+            self.assertEqual(params["closure_id"], "orch_target")
+            self.assertEqual(params["closure_target_spec_ref"], "spec/problem/a")
+            self.assertEqual(params["closure_until_phase"], "Validate")
+
+    def test_load_resume_params_closure_none_when_no_invocation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._seed_spec_tree(repo_root)
+            oid = "orch_20260101T000000Z_legacy00"
+            self._seed_resumable_orchestration(
+                repo_root, oid, spec_ref="spec/problem/test.md",
+                until_phase="Validate", mode="dev", backend="claude",
+            )
+            params = run_workflow._load_resume_params(repo_root, oid)
+            self.assertIsNone(params["closure_id"])
+            self.assertIsNone(params["closure_target_spec_ref"])
+            self.assertIsNone(params["closure_until_phase"])
+            # non-closure params still recovered
+            self.assertEqual(params["spec_ref"], "spec/problem/test.md")
+
+    def test_index_closure_orchestrations_latest_wins_and_filters(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._seed_spec_tree(repo_root)
+
+            def seed(oid, spec, closure, started):
+                self._seed_resumable_orchestration(
+                    repo_root, oid, spec_ref=spec, until_phase="Validate",
+                    mode="dev", backend="claude", started_at=started,
+                    invocation={"closure_id": closure},
+                )
+
+            # two orchs for the same spec under one closure — latest started_at wins
+            seed("orch_c_old", "spec/component/c", "orch_target",
+                 "2026-01-01T00:00:00.000000Z")
+            seed("orch_c_new", "spec/component/c", "orch_target",
+                 "2026-02-01T00:00:00.000000Z")
+            seed("orch_b", "spec/component/b", "orch_target",
+                 "2026-01-15T00:00:00.000000Z")
+            # a foreign closure — must be excluded
+            seed("orch_foreign", "spec/component/c", "orch_other",
+                 "2026-03-01T00:00:00.000000Z")
+
+            index = run_workflow._index_closure_orchestrations(repo_root, "orch_target")
+            self.assertEqual(index, {
+                "spec/component/c": "orch_c_new",
+                "spec/component/b": "orch_b",
+            })
+
+    def _run_main_with_closure_spy(self, argv):
+        """Run main() with _run_with_dependency_closure and _run_node replaced by
+        spies. Returns (code, closure_kwargs_or_None, run_node_kwargs_or_None)."""
+        closure_kwargs: dict = {}
+        run_node_kwargs: dict = {}
+
+        def spy_closure(**kw):
+            closure_kwargs.update(kw)
+            return 0
+
+        def spy_run_node(**kw):
+            run_node_kwargs.update(kw)
+            return 0
+
+        orig_closure = run_workflow._run_with_dependency_closure
+        orig_run_node = run_workflow._run_node
+        buf = io.StringIO()
+        argv2 = list(argv)
+        if "--stdout-format" not in argv2:
+            argv2 += ["--stdout-format", "jsonl"]
+        try:
+            run_workflow._run_with_dependency_closure = spy_closure  # type: ignore[assignment]
+            run_workflow._run_node = spy_run_node  # type: ignore[assignment]
+            with redirect_stdout(buf):
+                code = run_workflow.main(argv2)
+        finally:
+            run_workflow._run_with_dependency_closure = orig_closure  # type: ignore[assignment]
+            run_workflow._run_node = orig_run_node  # type: ignore[assignment]
+        return (
+            code,
+            closure_kwargs or None,
+            run_node_kwargs or None,
+        )
+
+    def _seed_closure_target_specs(self, repo_root: Path) -> None:
+        """Minimal on-disk target spec + deps.yaml so main()'s startup validation
+        (canonicalize + discover dep ref) succeeds for the closure target."""
+        _write_deps(repo_root, "spec/problem/a", "problem", "a",
+                    components=[("c", ">=0.1.0 <1.0.0")])
+        _write_deps(repo_root, "spec/component/c", "component", "c")
+
+    def test_resume_enters_closure_driver_when_closure_present(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._seed_spec_tree(repo_root)
+            self._seed_closure_target_specs(repo_root)
+            # entry orch is a dependency node carrying the closure back-link
+            self._seed_resumable_orchestration(
+                repo_root, "orch_target", spec_ref="spec/component/c",
+                until_phase="Validate", mode="dev", backend="claude",
+                source_dependency_ref="spec/component/c/deps.yaml",
+                invocation={
+                    "closure_id": "orch_target",
+                    "closure_target_spec_ref": "spec/problem/a",
+                    "closure_until_phase": "Validate",
+                },
+            )
+            code, closure_kwargs, run_node_kwargs = self._run_main_with_closure_spy(
+                ["--resume", "--repo-root", str(repo_root), "--no-invoke-llm"]
+            )
+            self.assertEqual(code, 0)
+            self.assertIsNotNone(closure_kwargs, "should enter closure driver")
+            self.assertIsNone(run_node_kwargs, "must not fall through to single _run_node")
+            self.assertTrue(closure_kwargs["resume"])
+            self.assertEqual(closure_kwargs["target_orchestration_id"], "orch_target")
+            self.assertEqual(closure_kwargs["target_spec_ref"], "spec/problem/a")
+            self.assertEqual(closure_kwargs["until_phase"], "Validate")
+            self.assertEqual(
+                closure_kwargs["prior_orch_by_spec"],
+                {"spec/component/c": "orch_target"},
+            )
+
+    def test_resume_without_closure_uses_single_node(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._seed_spec_tree(repo_root)
+            self._seed_resumable_orchestration(
+                repo_root, "orch_legacy", spec_ref="spec/problem/test.md",
+                until_phase="Validate", mode="dev", backend="claude",
+            )
+            code, closure_kwargs, run_node_kwargs = self._run_main_with_closure_spy(
+                ["--resume", "--repo-root", str(repo_root), "--no-invoke-llm"]
+            )
+            self.assertEqual(code, 0)
+            self.assertIsNone(closure_kwargs, "legacy resume must not enter closure driver")
+            self.assertIsNotNone(run_node_kwargs)
+            self.assertTrue(run_node_kwargs["resume_mode"])
+
+    def _find_init_invocation(self, observed_calls) -> dict | None:
+        for args in observed_calls:
+            if args and args[0] == "init" and "--invocation-json" in args:
+                return json.loads(args[args.index("--invocation-json") + 1])
+        return None
+
+    def test_cold_single_node_init_carries_invocation_json(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._seed_spec_tree(repo_root)
+            code, out, calls = self._run_main_with_fake_runtime(
+                ["spec/problem/test.md", "validate", "--repo-root", str(repo_root),
+                 "--no-invoke-llm"]
+            )
+            self.assertEqual(code, 0)
+            inv = self._find_init_invocation(calls)
+            self.assertIsNotNone(inv, "cold init must carry --invocation-json")
+            self.assertFalse(inv["with_deps"])
+            self.assertNotIn("closure_id", inv)
+            self.assertEqual(inv["spec_ref"], "spec/problem/test.md")
+
+    def test_cold_with_deps_init_carries_closure_invocation(self) -> None:
+        from tools.orchestration_runtime import _load_spec_catalog
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            _seed_shape_expr_schema_into(repo_root)
+            (repo_root / "tools").mkdir(parents=True, exist_ok=True)
+            (repo_root / "workspace").mkdir(parents=True, exist_ok=True)
+            # Full diamond (catalog + deps) so the real closure resolver runs.
+            DependencyClosureTests._seed_diamond(self, repo_root)
+            _load_spec_catalog.cache_clear()
+            code, out, calls = self._run_main_with_fake_runtime(
+                ["spec/problem/a", "validate", "--with-deps",
+                 "--repo-root", str(repo_root), "--no-invoke-llm"]
+            )
+            # closure stops at the first dep (not ready after a no-op run), but its
+            # cold init must already carry the closure back-link.
+            inv = self._find_init_invocation(calls)
+            self.assertIsNotNone(inv)
+            self.assertTrue(inv["with_deps"])
+            self.assertEqual(inv["closure_target_spec_ref"], "spec/problem/a")
+            self.assertTrue(inv["closure_id"])  # = the target orchestration id
+
+    def test_resume_closure_until_recovered_from_target_prompt(self) -> None:
+        # After a phase-override resume, the target's own prompt end-phase is the
+        # authoritative closure end-phase; a later plain resume entering via a dep
+        # (whose copied closure_until_phase is stale "Compile") must recover the
+        # refreshed "Validate" from the target, not revert to Compile.
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._seed_spec_tree(repo_root)
+            self._seed_closure_target_specs(repo_root)
+            self._seed_resumable_orchestration(
+                repo_root, "orch_dep_c", spec_ref="spec/component/c",
+                until_phase="Validate", mode="dev", backend="claude",
+                source_dependency_ref="spec/component/c/deps.yaml",
+                invocation={"spec_ref": "spec/component/c", "closure_id": "ORCHT",
+                            "closure_target_spec_ref": "spec/problem/a",
+                            "closure_until_phase": "Compile"})
+            # target ORCHT belongs to this closure; its prompt end-phase is Validate
+            self._seed_resumable_orchestration(
+                repo_root, "ORCHT", spec_ref="spec/problem/a",
+                until_phase="Validate", mode="dev", backend="claude",
+                source_dependency_ref="spec/problem/a/deps.yaml",
+                invocation={"spec_ref": "spec/problem/a", "closure_id": "ORCHT",
+                            "closure_target_spec_ref": "spec/problem/a",
+                            "closure_until_phase": "Compile"})
+            code, closure_kwargs, _ = self._run_main_with_closure_spy(
+                ["--resume", "--orchestration-id", "orch_dep_c",
+                 "--repo-root", str(repo_root), "--no-invoke-llm"])
+            self.assertEqual(code, 0)
+            self.assertIsNotNone(closure_kwargs)
+            self.assertEqual(closure_kwargs["until_phase"], "Validate")
+
+    def test_resume_closure_until_ignores_unrelated_target(self) -> None:
+        # If the reserved target id names an UNRELATED orchestration (its own
+        # invocation.closure_id differs), its phase must NOT be trusted; keep the
+        # entry node's recorded closure_until_phase.
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._seed_spec_tree(repo_root)
+            self._seed_closure_target_specs(repo_root)
+            self._seed_resumable_orchestration(
+                repo_root, "orch_dep_c", spec_ref="spec/component/c",
+                until_phase="Validate", mode="dev", backend="claude",
+                source_dependency_ref="spec/component/c/deps.yaml",
+                invocation={"spec_ref": "spec/component/c", "closure_id": "ORCHT",
+                            "closure_target_spec_ref": "spec/problem/a",
+                            "closure_until_phase": "Compile"})
+            # ORCHT prompt says Validate, but it belongs to a DIFFERENT closure
+            self._seed_resumable_orchestration(
+                repo_root, "ORCHT", spec_ref="spec/problem/a",
+                until_phase="Validate", mode="dev", backend="claude",
+                source_dependency_ref="spec/problem/a/deps.yaml",
+                invocation={"spec_ref": "spec/problem/a", "closure_id": "OTHER"})
+            code, closure_kwargs, _ = self._run_main_with_closure_spy(
+                ["--resume", "--orchestration-id", "orch_dep_c",
+                 "--repo-root", str(repo_root), "--no-invoke-llm"])
+            self.assertEqual(code, 0)
+            self.assertIsNotNone(closure_kwargs)
+            self.assertEqual(closure_kwargs["until_phase"], "Compile")
+
+    def test_resume_partial_closure_block_falls_back_to_single_node(self) -> None:
+        # A corrupt/partial invocation block (missing closure_until_phase) must NOT
+        # drive the closure with a wrong until_phase; fall back to single-node resume.
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._seed_spec_tree(repo_root)
+            self._seed_resumable_orchestration(
+                repo_root, "orch_partial", spec_ref="spec/problem/test.md",
+                until_phase="Validate", mode="dev", backend="claude",
+                invocation={
+                    "closure_id": "orch_partial",
+                    "closure_target_spec_ref": "spec/problem/a",
+                    # closure_until_phase intentionally omitted
+                },
+            )
+            code, closure_kwargs, run_node_kwargs = self._run_main_with_closure_spy(
+                ["--resume", "--repo-root", str(repo_root), "--no-invoke-llm"]
+            )
+            self.assertEqual(code, 0)
+            self.assertIsNone(closure_kwargs, "partial closure block must not drive closure")
+            self.assertIsNotNone(run_node_kwargs)
+
+    def test_resume_explicit_spec_override_forces_single_node(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._seed_spec_tree(repo_root)
+            self._seed_closure_target_specs(repo_root)
+            self._seed_resumable_orchestration(
+                repo_root, "orch_target", spec_ref="spec/component/c",
+                until_phase="Validate", mode="dev", backend="claude",
+                source_dependency_ref="spec/component/c/deps.yaml",
+                invocation={
+                    "closure_id": "orch_target",
+                    "closure_target_spec_ref": "spec/problem/a",
+                    "closure_until_phase": "Validate",
+                },
+            )
+            # explicit spec positional (non-phase) → single-node escape hatch
+            code, closure_kwargs, run_node_kwargs = self._run_main_with_closure_spy(
+                ["spec/component/c", "--resume", "--orchestration-id", "orch_target",
+                 "--repo-root", str(repo_root), "--no-invoke-llm"]
+            )
+            self.assertEqual(code, 0)
+            self.assertIsNone(closure_kwargs)
+            self.assertIsNotNone(run_node_kwargs)
 
     def test_main_writes_prompt_file(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1758,6 +2103,175 @@ class DependencyClosureTests(unittest.TestCase):
                              ["spec/component/c", "spec/component/b", "spec/problem/a"])
             # target until_phase >= generate → deps run to Validate.
             self.assertTrue(all(c[1] == "Validate" for c in calls))
+
+    def _drive_closure_capture(self, repo_root, *, resume, prior_orch_by_spec):
+        """Run the closure driver over the seeded diamond with _run_node captured.
+        Nodes become ready once run. Returns the list of _run_node kwargs dicts."""
+        from tools.orchestration_runtime import _load_spec_catalog
+        _load_spec_catalog.cache_clear()
+        captured: list[dict] = []
+        ran: set[str] = set()
+
+        def fake_run_node(**kw):
+            captured.append(kw)
+            ran.add(kw["spec_ref"])
+            return 0
+
+        def fake_ready(repo_root, node, required_stages):
+            return node["spec_ref"] in ran
+
+        orig = run_workflow._run_node
+        orig_ready = run_workflow._dependency_node_ready
+        run_workflow._run_node = fake_run_node  # type: ignore[assignment]
+        run_workflow._dependency_node_ready = fake_ready  # type: ignore[assignment]
+        try:
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                rc = run_workflow._run_with_dependency_closure(
+                    repo_root=repo_root,
+                    base_env={"PATH": os.environ.get("PATH", "")},
+                    target_orchestration_id="orch_target",
+                    target_spec_ref="spec/problem/a",
+                    target_source_dependency_ref="spec/problem/a/deps.yaml",
+                    until_phase="Validate",
+                    llm="claude",
+                    llm_command="claude",
+                    workflow_mode="dev",
+                    agent_model=None,
+                    status="running",
+                    invoke_llm=False,
+                    resume=resume,
+                    prior_orch_by_spec=prior_orch_by_spec,
+                    raw_argv=["spec/problem/a", "validate", "--with-deps"],
+                )
+        finally:
+            run_workflow._run_node = orig  # type: ignore[assignment]
+            run_workflow._dependency_node_ready = orig_ready  # type: ignore[assignment]
+        self.assertEqual(rc, 0)
+        return captured
+
+    def test_fresh_closure_records_closure_id_on_every_node(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            _seed_shape_expr_schema_into(repo_root)
+            self._seed_diamond(repo_root)
+            captured = self._drive_closure_capture(
+                repo_root, resume=False, prior_orch_by_spec=None)
+            # c, b, then target a
+            self.assertEqual([c["spec_ref"] for c in captured],
+                             ["spec/component/c", "spec/component/b", "spec/problem/a"])
+            for kw in captured:
+                self.assertFalse(kw["resume_mode"])
+                self.assertIsNotNone(kw["invocation"])
+                self.assertEqual(kw["invocation"]["closure_id"], "orch_target")
+                self.assertEqual(kw["invocation"]["closure_target_spec_ref"],
+                                 "spec/problem/a")
+                self.assertTrue(kw["invocation"]["with_deps"])
+
+    def test_closure_resume_reuses_prior_orch_ids(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            _seed_shape_expr_schema_into(repo_root)
+            self._seed_diamond(repo_root)
+            captured = self._drive_closure_capture(
+                repo_root, resume=True,
+                prior_orch_by_spec={"spec/component/c": "orch_c_prev"})
+            by_spec = {c["spec_ref"]: c for c in captured}
+            # c has a prior orch → resumed warm, no fresh invocation
+            self.assertEqual(by_spec["spec/component/c"]["orchestration_id"], "orch_c_prev")
+            self.assertTrue(by_spec["spec/component/c"]["resume_mode"])
+            self.assertIsNone(by_spec["spec/component/c"]["invocation"])
+            # b has no prior orch → fresh, records the closure invocation
+            self.assertFalse(by_spec["spec/component/b"]["resume_mode"])
+            self.assertIsNotNone(by_spec["spec/component/b"]["invocation"])
+            self.assertEqual(
+                by_spec["spec/component/b"]["invocation"]["closure_id"], "orch_target")
+
+    def test_closure_resume_refreshes_closure_until_on_resumed_deps(self) -> None:
+        # A resumed dependency gets the effective closure until_phase forwarded so its
+        # persisted copy stays current (durable phase override); a freshly cold-inited
+        # node relies on its written invocation, not this arg.
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            _seed_shape_expr_schema_into(repo_root)
+            self._seed_diamond(repo_root)
+            captured = self._drive_closure_capture(
+                repo_root, resume=True,
+                prior_orch_by_spec={"spec/component/c": "orch_c_prev"})
+            by_spec = {c["spec_ref"]: c for c in captured}
+            # c is resumed → closure_until_phase forwarded (= the closure until)
+            self.assertEqual(by_spec["spec/component/c"]["closure_until_phase"], "Validate")
+            # b is fresh → not forwarded (cold init writes it via invocation)
+            self.assertIsNone(by_spec["spec/component/b"]["closure_until_phase"])
+
+    def test_closure_resume_target_resume_mode(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            _seed_shape_expr_schema_into(repo_root)
+            self._seed_diamond(repo_root)
+            # target orchestration already exists AND is this closure's prior target
+            # run (matching spec_ref AND invocation.closure_id) → target is warm-resumed.
+            target_meta = (repo_root / "workspace" / "orchestrations"
+                           / "orch_target" / "orchestration_meta.json")
+            target_meta.parent.mkdir(parents=True, exist_ok=True)
+            target_meta.write_text(json.dumps(
+                {"spec_ref": "spec/problem/a",
+                 "invocation": {"closure_id": "orch_target"}}),
+                encoding="utf-8")
+            captured = self._drive_closure_capture(
+                repo_root, resume=True, prior_orch_by_spec={})
+            target = [c for c in captured if c["spec_ref"] == "spec/problem/a"][0]
+            self.assertEqual(target["orchestration_id"], "orch_target")
+            self.assertTrue(target["resume_mode"])
+            self.assertIsNone(target["invocation"])
+
+    def test_closure_resume_target_unrelated_meta_cold_inits(self) -> None:
+        # The reserved target id already holds an UNRELATED pre-existing
+        # orchestration (different spec) that the failed closure never reached.
+        # It must be cold-initialized as the intended target, NOT warm-resumed off
+        # the unrelated run's checkpoint.
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            _seed_shape_expr_schema_into(repo_root)
+            self._seed_diamond(repo_root)
+            target_meta = (repo_root / "workspace" / "orchestrations"
+                           / "orch_target" / "orchestration_meta.json")
+            target_meta.parent.mkdir(parents=True, exist_ok=True)
+            target_meta.write_text(
+                json.dumps({"spec_ref": "spec/problem/UNRELATED", "status": "pass"}),
+                encoding="utf-8")
+            captured = self._drive_closure_capture(
+                repo_root, resume=True, prior_orch_by_spec={})
+            target = [c for c in captured if c["spec_ref"] == "spec/problem/a"][0]
+            self.assertEqual(target["orchestration_id"], "orch_target")
+            self.assertFalse(target["resume_mode"], "unrelated meta must not warm-resume")
+            # cold init → a fresh closure invocation is written for the real target
+            self.assertIsNotNone(target["invocation"])
+            self.assertEqual(target["invocation"]["closure_target_spec_ref"],
+                             "spec/problem/a")
+
+    def test_closure_resume_target_same_spec_unlinked_cold_inits(self) -> None:
+        # The reserved target id holds an orchestration for the SAME spec but not
+        # created as THIS closure's target (e.g. a standalone run under a reused id):
+        # no invocation.closure_id link. Must cold-init, not warm-resume its stale
+        # checkpoint. Guards spec-match-only false positive.
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            _seed_shape_expr_schema_into(repo_root)
+            self._seed_diamond(repo_root)
+            target_meta = (repo_root / "workspace" / "orchestrations"
+                           / "orch_target" / "orchestration_meta.json")
+            target_meta.parent.mkdir(parents=True, exist_ok=True)
+            # same spec as the target, but NO closure link (standalone prior run)
+            target_meta.write_text(
+                json.dumps({"spec_ref": "spec/problem/a", "status": "pass"}),
+                encoding="utf-8")
+            captured = self._drive_closure_capture(
+                repo_root, resume=True, prior_orch_by_spec={})
+            target = [c for c in captured if c["spec_ref"] == "spec/problem/a"][0]
+            self.assertFalse(target["resume_mode"],
+                             "same-spec but unlinked orch must not warm-resume")
+            self.assertIsNotNone(target["invocation"])
 
     def test_driver_renders_closure_events_in_human_mode(self) -> None:
         # In human mode the closure-level events (dependency_node_begin and the

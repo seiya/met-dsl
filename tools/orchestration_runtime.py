@@ -10029,6 +10029,7 @@ def enable_checkpoint_resume(
     *,
     spec_ref: str | None = None,
     source_dependency_ref: str | None = None,
+    closure_until_phase: str | None = None,
 ) -> dict[str, Any]:
     """Set resume_enabled=true in orchestration_meta.json.
 
@@ -10063,6 +10064,40 @@ def enable_checkpoint_resume(
         meta["spec_ref"] = spec_ref.strip()
     if isinstance(source_dependency_ref, str) and source_dependency_ref.strip():
         meta["source_dependency_ref"] = source_dependency_ref.strip()
+    # A resume that RETARGETS the orchestration to a different spec (the run_workflow
+    # single-node escape hatch, `--resume <other_spec>`) invalidates any recorded
+    # closure back-link: this orchestration is no longer a node of that closure. Drop
+    # the closure_* fields (and realign invocation.spec_ref) so a later plain
+    # `--resume` does not read the stale link and re-drive the OLD closure target.
+    # A normal resume — including a closure-driven node resume — passes the node's own
+    # spec, which equals invocation.spec_ref, so nothing is dropped and the closure
+    # linkage survives.
+    invocation_block = meta.get("invocation")
+    if (
+        isinstance(spec_ref, str)
+        and spec_ref.strip()
+        and isinstance(invocation_block, dict)
+        and isinstance(invocation_block.get("spec_ref"), str)
+        and invocation_block.get("spec_ref") != spec_ref.strip()
+    ):
+        for _closure_key in ("closure_id", "closure_target_spec_ref", "closure_until_phase"):
+            invocation_block.pop(_closure_key, None)
+        invocation_block["spec_ref"] = spec_ref.strip()
+    # Persist the effective closure end-phase onto THIS node when the closure is
+    # resumed with a phase override. Each node of a --with-deps closure carries a
+    # copy of the target's end-phase (invocation.closure_until_phase); on an override
+    # resume the driver passes the new value so the copy stays current. This makes the
+    # override durable on the dependency nodes themselves — so a later plain --resume
+    # recovers the overridden phase even if the target orchestration was never created
+    # (the closure kept failing at a dependency, leaving no target prompt to read).
+    # Only applies to a node that still carries a closure link (not a retargeted one).
+    if (
+        isinstance(closure_until_phase, str)
+        and closure_until_phase.strip()
+        and isinstance(invocation_block, dict)
+        and invocation_block.get("closure_id")
+    ):
+        invocation_block["closure_until_phase"] = closure_until_phase.strip()
     prior_status = meta.get("status")
     terminal_reset = (
         isinstance(prior_status, str) and prior_status in IDEMPOTENT_TERMINAL_STATUSES
@@ -12566,6 +12601,7 @@ def init_orchestration(
     status: str = "running",
     agent_backend: str = "codex",
     agent_model: str | None = None,
+    invocation: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     root = _orchestration_root(repo_root, orchestration_id)
     root.mkdir(parents=True, exist_ok=True)
@@ -12597,7 +12633,12 @@ def init_orchestration(
             # repo_revision is captured once at the initial start and preserved
             # across re-init / resume, so the recorded SHA stays the source that
             # produced the run rather than being overwritten by a later HEAD.
-            for key in ("parallel_nodes_explicit", "parallel_nodes_policy", "repo_revision"):
+            for key in (
+                "parallel_nodes_explicit",
+                "parallel_nodes_policy",
+                "repo_revision",
+                "invocation",
+            ):
                 if key in existing:
                     meta.setdefault(key, existing[key])
             existing_run_id = existing.get("orchestration_agent_run_id")
@@ -12607,6 +12648,18 @@ def init_orchestration(
         repo_revision = _capture_repo_revision(repo_root)
         if repo_revision:
             meta["repo_revision"] = repo_revision
+    # Reproduction/provenance record: raw command + resolved params (+ closure
+    # back-link). UNLIKE repo_revision (pure provenance, immutable), invocation is
+    # load-bearing for closure-aware resume, so it must always describe the run that
+    # currently (re)starts this orchestration. A cold (re-)init that supplies a fresh
+    # invocation therefore OVERWRITES any prior block — e.g. reusing an
+    # --orchestration-id for a different --with-deps target must not leave the old
+    # closure back-link behind (which would misdirect a later --resume). The
+    # preservation loop above keeps the existing block only when no fresh invocation
+    # is supplied (an internal re-init). Real --resume goes through
+    # enable_checkpoint_resume, which never re-supplies invocation and preserves it.
+    if isinstance(invocation, dict) and invocation:
+        meta["invocation"] = invocation
     if not orchestration_agent_run_id:
         orchestration_agent_run_id = str(uuid.uuid4())
     backend_token = str(agent_backend).strip().lower()
@@ -16246,6 +16299,26 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="Enable checkpoint resume on an existing orchestration (sets resume_enabled; resets a terminal status back to running).",
     )
+    init_parser.add_argument(
+        "--invocation-json",
+        default=None,
+        help=(
+            "JSON object recording how this run was invoked (raw command + resolved "
+            "params + closure back-link), persisted to orchestration_meta.json#invocation "
+            "for reproduction and closure-aware resume. Only used on a cold init; on "
+            "--resume-from-checkpoint the existing block is preserved."
+        ),
+    )
+    init_parser.add_argument(
+        "--closure-until-phase",
+        default=None,
+        help=(
+            "On --resume-from-checkpoint of a --with-deps closure node, refresh this "
+            "node's invocation.closure_until_phase to the effective closure end-phase, "
+            "so an operator phase override persists on the dependency nodes themselves "
+            "(recoverable by a later plain --resume even if the target never started)."
+        ),
+    )
 
     preflight_parser = subparsers.add_parser("preflight")
     preflight_parser.add_argument("--repo-root", required=True)
@@ -16802,6 +16875,7 @@ def main(argv: list[str] | None = None) -> int:
                 orchestration_id=args.orchestration_id,
                 spec_ref=args.spec_ref,
                 source_dependency_ref=args.source_dependency_ref,
+                closure_until_phase=getattr(args, "closure_until_phase", None),
             )
             # Self-heal any step_result.json whose executor arid is a verify-substep
             # arid instead of the orchestration arid (the
@@ -16836,6 +16910,18 @@ def main(argv: list[str] | None = None) -> int:
                     "step_result_executor_repair": step_executor_repair,
                 }
         else:
+            invocation_record: dict[str, Any] | None = None
+            invocation_json = getattr(args, "invocation_json", None)
+            if isinstance(invocation_json, str) and invocation_json.strip():
+                try:
+                    parsed_invocation = json.loads(invocation_json)
+                except json.JSONDecodeError as exc:
+                    raise ValueError(
+                        f"--invocation-json must be valid JSON: {exc}"
+                    ) from exc
+                if not isinstance(parsed_invocation, dict):
+                    raise ValueError("--invocation-json must be a JSON object")
+                invocation_record = parsed_invocation
             result = init_orchestration(
                 repo_root=repo_root,
                 orchestration_id=args.orchestration_id,
@@ -16844,6 +16930,7 @@ def main(argv: list[str] | None = None) -> int:
                 status=args.status,
                 agent_backend=args.agent_backend,
                 agent_model=args.agent_model,
+                invocation=invocation_record,
             )
     elif args.command == "preflight":
         agent_command = args.agent_command
