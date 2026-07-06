@@ -1322,3 +1322,46 @@ SKILLs, `LAUNCH_PROMPT_REFERENCE.md`, `AGENT_CONTRACT.md`); the two conductor la
 fixtures. **Real verification is a billed E2E** (single component node: judge runs on
 `semantic_review` alone, verdict host-authored, `aggregate_verdict=pass`; timing-audit for the
 validate-cost delta). Unit suite green (1942).
+
+## R5 / M2 — certified exemplar injection into generate.generate (IMPLEMENTED 2026-07-06)
+
+Canonical design: `docs/design/workflow_scaling_redesign.md` §R5 (first tranche, M2). The
+per-node re-derivation of cross-node-identical runner plumbing is the dominant thinking cost
+(measured baseline); R5 trades cheap, cacheable input tokens for that expensive thinking by
+showing the authoring leaf a known-good sibling implementation.
+
+**Change.** A new host-side selector `orchestration_runtime._resolve_exemplar_source(repo_root,
+ir_ref)` resolves, for the target node, a previously-certified SIBLING node's source in the same
+`(family, spec_kind, language)` — family/spec_kind from `spec_catalog.yaml`
+(`_catalog_family_index`), language from the IR — EXCLUDING the target itself. Discovery mirrors
+the dependency certified-source selection (`_verify_dep_stage` / `_certified_model_source`):
+latest pipeline → latest binary → the bound `aggregate_verdict ∈ {pass, xfail}` (a genuinely
+certified node, not merely built); across siblings the globally most-recent certified pipeline
+(by canonical `(date, seq)`) wins. Pre-R1 the injected sources are the certified
+`<spec_id>_model.f90` + `<spec_id>_runner.f90`; post-R1 (harness node) this becomes model +
+checks. The corpus is self-bootstrapping (every certified node exemplifies its siblings).
+Best-effort — the selector NEVER raises, and any miss simply omits the exemplar.
+
+The conductor resolves it in `run_substep` ONLY for `generate.generate` (the sole authoring
+leaf, not on a warm-resume slim repair) and threads it via `build_launch_request(exemplar=...)`
+onto `request_payload["exemplar"]`. `_build_exemplar` renders the `<exemplar>` template
+placeholder (new, in `step_agent.txt` / `substep_agent.txt`, next to `<dependency_facts>`;
+registered in `_template_placeholder_values`) as a data-fenced `Certified exemplar` block —
+guard-safe like `<dependency_facts>`, empty for any non-`generate.generate` request. It is PRIOR
+ART, never a gate and never the node's own past source (self is excluded): the leaf uses it as a
+structural reference for the plumbing and authors THIS node's physics from its own spec.
+
+**Docs.** `AGENT_CONTRACT.md` — the past-artifact-reference prohibition gains the
+conductor-injected-exemplar exception (host-selected, not a spontaneous leaf read).
+`skills/workflow-generate-generate/SKILL.md` — the exemplar-usage rule (structural reference,
+do not copy physics, do not self-read other nodes' sources).
+
+**Files.** `tools/orchestration_runtime.py` (`_resolve_exemplar_source`, `_catalog_family_index`,
+`_build_exemplar`, `_template_placeholder_values`); `tools/workflow_conductor.py`
+(`_resolve_exemplar`, `build_launch_request` exemplar param + `run_substep` wiring);
+`tools/prompt_templates/{step,substep}_agent.txt`; docs + ceilings. Tests: selector unit
+(certified sibling / self-exclude / uncertified / family+kind mismatch / non-fortran /
+most-recent-across-siblings), `_build_exemplar` render gating, and the build_launch_request
+attach scope. **Real verification is a billed E2E** (a node in a family with a certified sibling;
+attempt-1 pass rate + thinking-token delta via the timing-audit — ride-along with M1's E2E).
+Unit suite green (1972).

@@ -642,6 +642,7 @@ def build_launch_request(
     makefile_host_authored: bool = False,
     repair: dict[str, str] | None = None,
     resolved_dependencies: tuple[dict[str, str], ...] = (),
+    exemplar: dict[str, Any] | None = None,
     warm_resume: bool = False,
 ) -> dict[str, Any]:
     """Construct the record-launch --request-json payload for one substep.
@@ -904,6 +905,13 @@ def build_launch_request(
     # are omitted there. The `<dependency_facts>` renderer drops them when empty.
     if resolved_dependencies and not deterministic and step in ("generate", "validate"):
         req["resolved_dependencies"] = list(resolved_dependencies)
+    # R5: a conductor-resolved certified sibling exemplar, injected ONLY for the sole authoring
+    # leaf (generate.generate). Prior art to raise first-attempt pass rate; the `<exemplar>`
+    # renderer drops it for any other (step, substep). Not attached to warm-resume slim prompts
+    # (the resumed leaf already saw it) — build_launch_request's slim branch below empties the
+    # must-read but the slim renderer never reads `exemplar`, so it is naturally absent there.
+    if exemplar and step == "generate" and substep == "generate":
+        req["exemplar"] = exemplar
     req.update(rep)
     # Slim warm-resume repair turn: when the conductor has decided the producer session is
     # resumable (warm_resume) AND this is a reuse repair carrying findings, mark the request
@@ -1631,6 +1639,16 @@ clean:
         (fail-closed) and violate phase_04 §44 for IRs that declare no state_snapshots."""
         ir = _read_yaml(self.repo_root / refs.ir_ref / "spec.ir.yaml") or {}
         return tuple(self._required_evidence_artifacts(ir))
+
+    def _resolve_exemplar(self, refs: NodeRefs) -> dict[str, Any] | None:
+        """R5: host-resolve a certified sibling exemplar (model+runner source) for the
+        generate.generate leaf, or None. Best-effort — the selector never raises, and any
+        failure simply omits the exemplar (Generate proceeds without it)."""
+        from tools.orchestration_runtime import _resolve_exemplar_source
+        try:
+            return _resolve_exemplar_source(self.repo_root, refs.ir_ref)
+        except Exception:
+            return None
 
     def determine_substep_status(self, refs: NodeRefs, phase: str, substep: str | None,
                                  allowed_output_paths: list[str],
@@ -2812,6 +2830,12 @@ clean:
         # deterministic-gate reopens — lint/static/compile_static — which carry one; a warm reuse
         # without findings, e.g. a cross-phase code repair, still re-sends the full prompt).
         warm_resume = resume_session_id is not None
+        # R5: resolve a certified sibling exemplar for the authoring leaf only (generate.generate),
+        # and NOT on a warm-resume slim repair (the resumed leaf already has it). build_launch_request
+        # attaches it solely for generate.generate; other substeps ignore the value.
+        exemplar = (self._resolve_exemplar(refs)
+                    if (phase == "generate" and substep == "generate"
+                        and not deterministic and not warm_resume) else None)
         request = build_launch_request(
             refs, step=phase, substep=substep,
             orchestration_id=self.orchestration_id,
@@ -2828,6 +2852,7 @@ clean:
             makefile_host_authored=(phase == "generate" and self._conductor_authors_makefile(refs)),
             repair=repair,
             resolved_dependencies=resolved_dependencies,
+            exemplar=exemplar,
             warm_resume=warm_resume,
         )
         rec = self.record_launch(child_arid, request)

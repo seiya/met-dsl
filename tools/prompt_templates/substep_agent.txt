@@ -25,6 +25,8 @@ repair_reason: <repair_reason>
 
 <dependency_facts>
 
+<exemplar>
+
 Required requirements:
 - **Do not `Read` your own launch prompt body (`launches/<agent_run_id>.prompt.txt`).** Because the prompt is already passed as the input of the `Agent` tool, re-reading is unnecessary, and that path is blocked fail-closed by `read_manifest_read_guard`. `launches/<agent_run_id>.prompt.txt` is the canonical artifact that stores, 1-to-1, the original text passed to the `Agent` tool for audit / replay use.
 - Read only the contracted input.
