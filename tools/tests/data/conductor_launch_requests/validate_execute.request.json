@@ -21,6 +21,7 @@
     "workspace/pipelines/component__dynamics_advdiff_flux_1d_upwind_center2__0.1.0/advdiff-flux-1d-uc2_20260620_002/runs/run_20260620_003/component__dynamics_advdiff_flux_1d_upwind_center2__0.1.0/perf.json",
     "workspace/pipelines/component__dynamics_advdiff_flux_1d_upwind_center2__0.1.0/advdiff-flux-1d-uc2_20260620_002/runs/run_20260620_003/component__dynamics_advdiff_flux_1d_upwind_center2__0.1.0/trial_meta.json",
     "workspace/pipelines/component__dynamics_advdiff_flux_1d_upwind_center2__0.1.0/advdiff-flux-1d-uc2_20260620_002/runs/run_20260620_003/component__dynamics_advdiff_flux_1d_upwind_center2__0.1.0/quality_check.json",
+    "workspace/pipelines/component__dynamics_advdiff_flux_1d_upwind_center2__0.1.0/advdiff-flux-1d-uc2_20260620_002/runs/run_20260620_003/component__dynamics_advdiff_flux_1d_upwind_center2__0.1.0/verdict.json",
     "workspace/pipelines/component__dynamics_advdiff_flux_1d_upwind_center2__0.1.0/advdiff-flux-1d-uc2_20260620_002/runs/run_20260620_003/component__dynamics_advdiff_flux_1d_upwind_center2__0.1.0/raw/metrics_basis.json",
     "workspace/pipelines/component__dynamics_advdiff_flux_1d_upwind_center2__0.1.0/advdiff-flux-1d-uc2_20260620_002/runs/run_20260620_003/component__dynamics_advdiff_flux_1d_upwind_center2__0.1.0/raw/state_snapshots/l0_constant_state_flux_pass.json",
     "workspace/pipelines/component__dynamics_advdiff_flux_1d_upwind_center2__0.1.0/advdiff-flux-1d-uc2_20260620_002/runs/run_20260620_003/component__dynamics_advdiff_flux_1d_upwind_center2__0.1.0/raw/state_snapshots/l0_invalid_a_xfail.json",

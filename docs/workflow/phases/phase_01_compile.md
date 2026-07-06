@@ -116,6 +116,32 @@ io_contract:
       fields: ["overall", "failed_checks"]   # the verdict.* keys the runner must self-emit in diagnostics.json (required when required=true)
   semantic_dependency:
     required_sources: ["<var1>", "<var2>", ...]   # a non-empty string array
+  test_predicates:
+    # R2 deterministic per-test verdict DSL: one entry per tests.md test_id (set equality).
+    # Validate.execute evaluates these against diagnostics.json to author verdict.json in-process
+    # (the judge no longer authors per_test). Formalize each tests.md §4 pass_when / §7 rule.
+    - test_id: "<test_id>"                 # exactly the tests.md test_ids, no more/less
+      expected_outcome: "pass"             # pass | xfail (the certifying outcome when pass_when holds)
+      target_cases: ["<case_id>", ...]     # case.test_case_set case_ids this predicate ranges over
+      pass_when:
+        all:                               # `all` is the only combinator (conjunction)
+          - ref: "verdict.overall"         # dotted path into diagnostics.json (see ref vocabulary below)
+            op: "eq"                        # eq | ne | le | ge | lt | gt | includes
+            value: "pass"                   # literal, OR {per_case: {<case_id>: v}} for nx-dependent thresholds
+            # an ordered op (le/ge/lt/gt) REQUIRES a numeric threshold written as a YAML float
+            # WITH a decimal point: `1.0e-10` (NOT `1e-10`, which YAML 1.1 parses as a string and
+            # the --stage compile gate rejects). `includes` takes a list-member literal.
+            per_case: false                 # optional: resolve `ref` inside each target case's diagnostics slice
+            na_allowed: false               # optional: a null/absent lhs counts as satisfied (a "not applied" metric)
+  # test_predicates ref vocabulary (all resolvable at --stage compile):
+  #   verdict.<field>   -> a diagnostics_contract.verdict.fields entry (overall/failed_checks)
+  #   checks.<id>...    -> an id in diagnostics_contract.checks (the runner emits checks.<id>.pass|status)
+  #   <metric address>  -> any other head (metrics.*/errors.*/cfl.*/convergence.*) MUST be pinned in
+  #                        diagnostics_contract.metrics (below). The runner emits every numeric judgment
+  #                        already reduced to a field, so predicates do no arithmetic.
+  # diagnostics_contract.metrics (OPTIONAL): per-case metric addresses the predicates reference; the
+  # intermediate per-case addressing pin for problem specs (until R1 fixes the harness output shape). e.g.
+  #   metrics: ["cfl.max", "metrics.mass_drift_rel", "errors.analytic_h.l2_rel_tend", "convergence.n32_to_n64.analytic_h_order"]
 
 dependency:
   # LLM-authored: ONLY node_key + direct_deps (the directly-read edge + semantic `operations`).
@@ -192,6 +218,7 @@ The required invariant set for the self-check (finalized as a **minimal set**):
 - `io_contract.diagnostics_contract.checks[].id` covers every `checks.<id>` key named in `tests.md §3` (neither more nor less).
 - When any `tests.md §4` test's `pass_when` references `verdict.*`, `io_contract.diagnostics_contract.verdict.required=true` and `verdict.fields` covers the referenced keys (e.g. `overall` / `failed_checks`). When no test references `verdict.*`, `verdict.required=false` is allowed.
 - `io_contract.semantic_dependency.required_sources` is a non-empty string array.
+- **`io_contract.test_predicates` (R2) faithfully encodes every `tests.md §6/§7` pass rule.** The `--stage compile` gate (`_validate_test_predicates` → `verdict_evaluator.validate_predicate_schema`) enforces the schema mechanically (op/outcome enums, non-empty `pass_when.all`, `target_cases ⊆ case.test_case_set`, `ref` resolves against the declared `verdict.fields` / `checks[].id` / `diagnostics_contract.metrics` vocabulary, `test_id` set == `tests.md`); this V3 invariant is the SEMANTIC check `Compile.verify` owns: each predicate's conjunction is a truthful translation of that test's prose judgment (correct `op`/threshold direction, the right check/metric `ref`, per-case thresholds matching the nx map, `na_allowed` only where `tests.md` marks the metric "not applied"). A schema-valid but semantically-wrong predicate (e.g. `ge` where the prose says `le`) is a V3 `fail` — this is where the judge-time nondeterminism R2 removed becomes a reviewable compile-time artifact.
 
 #### V4. dependency consistency
 The derived-closure invariants (former V4a `direct∪transitive == all_nodes`, V4b

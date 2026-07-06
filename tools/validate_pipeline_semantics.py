@@ -107,6 +107,12 @@ QUALITY_CHECK_ALLOWED_COMMANDS = {"make", "ctest", "pytest"}
 FORBIDDEN_QUALITY_CHECK_EXECUTABLES = {"python", "python3", "pypy", "bash", "sh", "zsh"}
 MAKE_QUALITY_CHECK_REQUIRED_LANGUAGES = {"fortran", "c", "cpp", "mixed"}
 TEST_ID_HEADING_PATTERN = re.compile(r"^###\s+\d+-\d+\.\s+`([^`]+)`\s*$")
+# tests.md test-id declarations come in two forms: the problem-spec heading form
+# (`### 6-1. `<id>``, matched above) and the component/profile bullet form
+# (`- `test_id`: `<id>``). The bullet form captures the SECOND backtick group (the id),
+# not the literal `test_id` label; anchoring on the `test_id`: key excludes sibling bullets
+# like `- `pass_when`:` / `- `suite.pass_rule`:`.
+TEST_ID_BULLET_PATTERN = re.compile(r"^-\s+`test_id`\s*:\s*`([^`]+)`")
 TEST_OUTCOME_VALUES = {"pass", "fail", "xfail", "skipped", "blocked"}
 # Bundled schema lives next to this validator; used as the canonical fallback
 # when no target repo_root is in scope (tests, ad-hoc invocation) and as the
@@ -4647,7 +4653,7 @@ def _parse_test_ids_from_tests_md(tests_path: Path) -> list[str]:
     seen: set[str] = set()
     for raw_line in tests_path.read_text(encoding="utf-8", errors="ignore").splitlines():
         line = raw_line.strip()
-        match = TEST_ID_HEADING_PATTERN.match(line)
+        match = TEST_ID_HEADING_PATTERN.match(line) or TEST_ID_BULLET_PATTERN.match(line)
         if not match:
             continue
         test_id = match.group(1).strip()
@@ -8545,8 +8551,138 @@ def _validate_compile_stage_impl(
         _try_load_optional_plan_yaml(ir_dir, optional, violations)
     _validate_ir_meta_json(ir_dir, violations)
     _validate_compile_dependency_consistency(repo_root, ir_dir, violations)
+    _validate_test_predicates(repo_root, ir_dir, violations)
 
     return violations
+
+
+def _validate_test_predicates(
+    repo_root: Path, ir_dir: Path, violations: list[str]
+) -> None:
+    """R2 deterministic predicate gate: ``io_contract.test_predicates`` formalizes each
+    ``tests.md`` test's pass rule as a machine-evaluable predicate that ``Validate.execute``
+    evaluates against ``diagnostics.json`` to author ``verdict.json`` in-process (moving the
+    per-test judgment off the judge leaf). This gate makes the DSL correct-by-construction at
+    Compile so the judge-time nondeterminism it replaces cannot regress into a compile-time
+    authoring error.
+
+    Checks (via ``verdict_evaluator.validate_predicate_schema``): the DSL is present and
+    well-formed (op / expected_outcome enums, non-empty ``pass_when.all``, each condition
+    carries a ``value``); the predicate ``test_id`` set equals the node's canonical test-id set;
+    every ``target_cases`` entry is a declared ``case.test_case_set`` case; and every predicate
+    ``ref`` resolves against the declared diagnostics vocabulary — ``verdict.<field>`` /
+    ``checks.<id>`` / a per-case metric address pinned in ``diagnostics_contract.metrics``.
+
+    The canonical test-id set is resolved robustly (this gate is the SOLE enforcer of
+    predicate-set == tests.md, so it must not silently no-op): the ``tests.md`` set via
+    ``meta.source_refs.tests`` (present in every real IR) is preferred, and — as of the R2
+    fail-closed hardening — a ``meta.source_refs.tests`` that resolves to a file yielding ZERO
+    test_ids is itself a violation (never a silent fallback). Only when the ref is
+    absent/unresolvable does it fall back to the same-IR ``io_contract.test_evidence_requirements``
+    id set as a best-effort same-IR reference (note: the separate ``test_evidence_requirements``
+    gate resolves tests.md via ``io_contract.source.tests``, absent in current IRs, so it does NOT
+    independently pin TER to tests.md — the fallback is best-effort, and on real IRs the primary
+    ``meta.source_refs.tests`` path always resolves so it never fires). A degenerate IR carrying
+    NEITHER (which fails the io_contract gate anyway) degrades to the predicate ids (a no-op).
+
+    A violation routes (via ``classify_compile_static_failure``) back to ``compile.generate``
+    to re-author the predicates."""
+    from tools.verdict_evaluator import validate_predicate_schema
+
+    derived_path = ir_dir / "spec.ir.yaml"
+    if not derived_path.exists():
+        return  # missing IR already flagged upstream
+    try:
+        ir = _read_yaml(derived_path)
+    except yaml.YAMLError:
+        return  # malformed IR already flagged upstream
+    if not isinstance(ir, dict):
+        return
+
+    io_contract = ir.get("io_contract")
+    io_contract = io_contract if isinstance(io_contract, dict) else {}
+    predicates = io_contract.get("test_predicates")
+
+    case_block = ir.get("case")
+    tcs = case_block.get("test_case_set") if isinstance(case_block, dict) else None
+    case_ids = {
+        str(c.get("case_id"))
+        for c in (tcs if isinstance(tcs, list) else [])
+        if isinstance(c, dict) and c.get("case_id")
+    }
+
+    dc = io_contract.get("diagnostics_contract")
+    dc = dc if isinstance(dc, dict) else {}
+    check_ids = {
+        str(c.get("id"))
+        for c in (dc.get("checks") if isinstance(dc.get("checks"), list) else [])
+        if isinstance(c, dict) and c.get("id")
+    }
+    # verdict.<field> refs resolve ONLY against the fields the diagnostics_contract actually
+    # declares AND requires (no unconditional overall/failed_checks default): per phase_01 V3, a
+    # predicate referencing verdict.* requires diagnostics_contract.verdict.required=true with
+    # the referenced field in verdict.fields. When required is false the runner is NOT contracted
+    # to emit a `verdict` object, so a verdict ref would pass Compile then become a
+    # structural_violation at execute instead of being repaired here — hence the required gate.
+    verdict_fields: set[str] = set()
+    verdict_block = dc.get("verdict") if isinstance(dc.get("verdict"), dict) else {}
+    if verdict_block.get("required") is True and isinstance(verdict_block.get("fields"), list):
+        verdict_fields |= {str(f) for f in verdict_block["fields"]}
+    metric_addrs = {
+        str(m) for m in (dc.get("metrics") if isinstance(dc.get("metrics"), list) else [])
+    }
+
+    # Canonical test-id set. Prefer tests.md (via meta.source_refs.tests — present in every
+    # real IR); fall back to the same-IR test_evidence_requirements set (which the io_contract
+    # gate requires to cover tests.md); only a degenerate IR carrying neither degrades to the
+    # predicate ids (a no-op — but that IR fails the io_contract gate on its own).
+    meta = ir.get("meta") if isinstance(ir.get("meta"), dict) else {}
+    source_refs = meta.get("source_refs") if isinstance(meta.get("source_refs"), dict) else {}
+    tests_ref = source_refs.get("tests")
+    test_ids: list[str] | None = None
+    if isinstance(tests_ref, str) and tests_ref.strip():
+        tests_path = Path(tests_ref.strip())
+        if not tests_path.is_absolute():
+            tests_path = repo_root / tests_path
+        if tests_path.is_file():
+            test_ids = _parse_test_ids_from_tests_md(tests_path)
+            # Fail-closed: a RESOLVABLE tests.md that parses to ZERO test_ids means the file's
+            # test-id form isn't recognized (a parser/format drift). Silently degrading to the
+            # same-leaf test_evidence_requirements would let a common-mode drop of a tests.md test
+            # (from both TER and the predicates) certify undetected. Flag it so the equality pin
+            # is never a silent no-op when tests.md is present.
+            if not test_ids:
+                violations.append(
+                    f"{derived_path}:tests.md ({tests_ref}) resolved but parsed 0 test_ids "
+                    "(unrecognized test-id form — cannot pin test_predicates set == tests.md)")
+    # `not test_ids` (not `is None`): fall through to the same-IR fallback (TER, then predicate
+    # ids) for the rest of the schema check so it does not ALSO spuriously report every predicate
+    # as an unknown test_id; the resolved-but-empty case above already fails the gate.
+    if not test_ids:
+        ter = io_contract.get("test_evidence_requirements")
+        ter_ids = [
+            e["test_id"].strip()
+            for e in (ter if isinstance(ter, list) else [])
+            if isinstance(e, dict) and isinstance(e.get("test_id"), str) and e["test_id"].strip()
+        ]
+        if ter_ids:
+            test_ids = ter_ids
+    if not test_ids:
+        test_ids = [
+            p["test_id"].strip()
+            for p in (predicates if isinstance(predicates, list) else [])
+            if isinstance(p, dict) and isinstance(p.get("test_id"), str) and p["test_id"].strip()
+        ]
+
+    for msg in validate_predicate_schema(
+        predicates,
+        case_ids=case_ids,
+        test_ids=test_ids,
+        check_ids=check_ids,
+        verdict_fields=verdict_fields,
+        metric_addrs=metric_addrs,
+    ):
+        violations.append(f"{derived_path}:{msg}")
 
 
 def _validate_compile_dependency_consistency(

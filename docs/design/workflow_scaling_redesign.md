@@ -45,7 +45,7 @@ This generalizes the established host-authored `src/Makefile` decision (correct-
 
 ### R2. Deterministic per-test verdict
 
-Formalize each test's pass rule (`tests.md` `pass_when` / `judgment`) into a machine-evaluable predicate in `spec.ir.yaml` during Compile. `validate.post_judge` computes `verdict.json#per_test` deterministically from `diagnostics.json` and the predicates; the judge leaf authors `semantic_review.json` only. This removes the judge-nondeterminism failure class (`xfail_verdict_contract_gap`) and the per-test schema-fabrication class, and is a precondition for scale: probabilistic judge variance multiplied by thousands of nodes is not acceptable. Continues the G6/G7 trajectory.
+Formalize each test's pass rule (`tests.md` `pass_when` / `judgment`) into a machine-evaluable predicate in `spec.ir.yaml` during Compile. `validate.execute` computes `verdict.json#per_test` deterministically from `diagnostics.json` and the predicates at the end of its in-process run (implementation note: moved from the originally-proposed `validate.post_judge` to `execute` so a predicate failure short-circuits the judge spawn entirely — see `deterministic_followups.md` G8); the judge leaf authors `semantic_review.json` only. This removes the judge-nondeterminism failure class (`xfail_verdict_contract_gap`) and the per-test schema-fabrication class, and is a precondition for scale: probabilistic judge variance multiplied by thousands of nodes is not acceptable. Continues the G6/G7 trajectory.
 
 ### R3. Oracle-free verification stack
 

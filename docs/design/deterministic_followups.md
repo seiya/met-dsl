@@ -1272,3 +1272,53 @@ the L6 diamond guard. This host-author change did NOT introduce the asymmetry (p
 LLM-authored `all_nodes` fed staging identically); reconciling it is part of the deferred
 multi-version effort (unify `resolve_node`/readiness/staging into one constraint-aware version
 selection), not this change. (Codex review P1, accepted as documented 2026-07-02.)
+
+## G8 — deterministic per-test verdict: host-author `verdict.json` at `execute` from IR predicates (R2) (IMPLEMENTED 2026-07-06)
+
+Canonical design: `docs/design/workflow_scaling_redesign.md` §R2 (first tranche;
+implementation plan in the sleepy-snacking-kitten plan). This is the last leg of the
+G6/G7 trajectory: the per-test pass/fail was the remaining LLM-authored, nondeterministic
+Validate artifact (`xfail_verdict_contract_gap` / per_test schema-fabrication classes).
+
+**Change.** Each `tests.md` test's `pass_when` / `judgment` prose is formalized at Compile as a
+machine-evaluable predicate in `io_contract.test_predicates`
+(`{test_id, expected_outcome, target_cases, pass_when.all:[{ref, op, value, per_case?, na_allowed?}]}`;
+op ∈ eq/ne/le/ge/lt/gt/includes). `Validate.execute` evaluates the predicates against the
+runner's `diagnostics.json` (pure module `tools/verdict_evaluator.py`, imported by both the
+conductor and the validator — same shape as `dependency_graph.py`) and authors `verdict.json`
+(`per_test[].status` + machine `basis` + `failure_class`) in-process, right after the
+`post_execute` structural gate + quality-check pass. A per-test predicate `fail`
+(`self_verdict=fail`) fails the execute substep so the judge leaf is **not spawned** (the R2
+cost lever); `classify_failure` routes it on `verdict.json#failure_class` — `physics_fail` /
+`structural_violation` → escalate diagnostician (prod, for attribution) / `fail_closed` (dev,
+F1). The judge leaf now authors **only** `semantic_review.json` (its `determine_substep_status`
+is `decision == pass`); it reconciles `diagnostics.json` vs `raw/` and catches fabrication /
+semantic-intent mismatch the mechanical predicate cannot. `verdict.json` moved out of the judge
+`allowed_output_paths` into execute's, and from `_POST_JUDGE_RECOVERABLE_BASENAMES` to
+unrecoverable (host-authored → a gate violation naming it is a conductor derivation defect, not
+judge-fixable).
+
+**Evaluation point moved from the design's `post_judge` to `execute`** (deliberate, to align with
+the measured cost baseline — execute already reads `diagnostics.json`, and evaluating there lets a
+predicate fail short-circuit the judge spawn entirely).
+
+**Compile-stage gate.** `validate_pipeline_semantics --stage compile` gains
+`_validate_test_predicates` (→ `verdict_evaluator.validate_predicate_schema`): presence +
+schema (op/outcome enums, non-empty `pass_when.all`), `target_cases ⊆ case.test_case_set`, `ref`
+resolution against the declared diagnostics vocabulary (`verdict.<field>` / `checks.<id>` / a
+per-case metric address pinned in the new optional `diagnostics_contract.metrics`), and
+`test_id` set == `tests.md` (backstopped by the pre_judge `_validate_tests_verdict_summary_consistency`).
+`Compile.verify` V3 owns the SEMANTIC check that each predicate faithfully translates the prose
+(right op/threshold direction) — the judge-time variance becomes a reviewable compile-time artifact.
+
+**Files.** `tools/verdict_evaluator.py` (new + `tools/tests/test_verdict_evaluator.py`, incl. the
+12-spec DSL-expressibility proof: component boolean, profile per-case map, problem nx-dependent
+thresholds + convergence order + N/A rules, inverted-guard xfail); `tools/workflow_conductor.py`
+(`_author_execute_verdict` + execute gate restructure, judge `determine_substep_status`
+simplification, recoverable-basename move, `classify_failure` execute physics branch, judge
+allowed_output_paths); `tools/validate_pipeline_semantics.py` (`_validate_test_predicates`); docs
+(`phase_01_compile.md` schema + V3, `phase_04_validate.md`, compile-generate + validate-judge
+SKILLs, `LAUNCH_PROMPT_REFERENCE.md`, `AGENT_CONTRACT.md`); the two conductor launch-request golden
+fixtures. **Real verification is a billed E2E** (single component node: judge runs on
+`semantic_review` alone, verdict host-authored, `aggregate_verdict=pass`; timing-audit for the
+validate-cost delta). Unit suite green (1942).

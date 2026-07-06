@@ -3588,6 +3588,43 @@ class DeterministicBuildTest(unittest.TestCase):
             self.assertEqual(env["CASES"], "c_alpha c_beta")  # read_case_ids is sorted
             self.assertEqual(env["BIN"], "spec_x_runner")
 
+    def test_execute_inproc_clears_stale_verdict_on_runtime_error(self) -> None:
+        # R2 guard: a structural (runtime-error) execute failure must leave NO verdict.json, so a
+        # STALE one from a prior run cannot make classify_failure misroute the runner failure as a
+        # predicate failure. Force run_program to fail after seeding a stale failing verdict.
+        import sys
+        import tempfile
+        from unittest import mock
+        sys.path.insert(0, str(Path("mcp_servers").resolve()))
+        import build_runtime_server  # type: ignore
+
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            c = wc.Conductor(repo_root=repo, orchestration_id="t",
+                             orchestration_agent_run_id="x", backend="claude", env={})
+            refs = wc.NodeRefs(
+                node_key="component/spec_x@0.1.0", spec_path="spec/component/spec_x",
+                ir_id="x_1", pipeline_id="x_1", source_id="src_1", binary_id="bin_1",
+                run_id="run_1", source_binary_id="bin_1")
+            (repo / refs.ir_ref).mkdir(parents=True, exist_ok=True)
+            (repo / refs.ir_ref / "spec.ir.yaml").write_text(
+                "impl_defaults:\n  toolchain:\n    language: fortran\n    build_system: make\n"
+                "  target:\n    class: cpu\n", encoding="utf-8")
+            (repo / refs.source_dir() / "src").mkdir(parents=True, exist_ok=True)
+            node_dir = repo / refs.run_node_dir()
+            node_dir.mkdir(parents=True, exist_ok=True)
+            (node_dir / "verdict.json").write_text(
+                json.dumps({"self_verdict": "fail", "failure_class": "physics_fail"}),
+                encoding="utf-8")
+
+            with mock.patch.object(build_runtime_server, "tool_run_program",
+                                   lambda a: {"ok": False, "stderr": "boom"}):
+                out = c._execute_inproc(refs, "child-1", "captok")
+            # runtime error returns rc 0 (content failure) AND leaves no verdict.json ->
+            # classify_failure sees no failure_class -> the Generate/C2 runner-failure path.
+            self.assertEqual(out["returncode"], 0)
+            self.assertFalse((node_dir / "verdict.json").exists())
+
     def test_build_content_failure_routes_to_generate_not_transport(self) -> None:
         # Codex finding 1: a build content failure (rc 0 + binary_meta verification_status
         # =fail) must route via classify_build_failure -> Generate, NOT leaf_transport_error
@@ -3648,6 +3685,80 @@ class DeterministicBuildTest(unittest.TestCase):
             self.assertEqual(decision.action, "retry")
             self.assertEqual(decision.target_phase, "generate")
             self.assertEqual(decision.repair_strategy, "restart")
+
+    def _predicate_ir(self) -> dict:
+        return {"io_contract": {"test_predicates": [
+            {"test_id": "l0_scale_identity_pass", "expected_outcome": "pass",
+             "target_cases": ["l0_scale_identity_pass"],
+             "pass_when": {"all": [{"ref": "checks.scale_identity.pass", "op": "eq", "value": True},
+                                   {"ref": "verdict.overall", "op": "eq", "value": "pass"}]}},
+            {"test_id": "l0_invalid_length_xfail", "expected_outcome": "xfail",
+             "target_cases": ["l0_invalid_length_xfail"],
+             "pass_when": {"all": [{"ref": "checks.input_guard.pass", "op": "eq", "value": True},
+                                   {"ref": "verdict.overall", "op": "eq", "value": "pass"}]}}]}}
+
+    def test_author_execute_verdict_pass_and_physics(self) -> None:
+        # R2: execute authors verdict.json deterministically from the IR predicates + the
+        # runner's diagnostics.json — the judge no longer writes it.
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            c = wc.Conductor(repo_root=repo, orchestration_id="o",
+                             orchestration_agent_run_id="O", backend="claude", env={})
+            refs = self._refs()
+            ir = self._predicate_ir()
+            good = {"checks": {"scale_identity": {"pass": True}, "input_guard": {"pass": True}},
+                    "verdict": {"overall": "pass", "failed_checks": []}}
+            doc = c._author_execute_verdict(refs, ir, good)
+            self.assertEqual(doc["self_verdict"], "pass")
+            self.assertEqual(doc["failure_class"], "pass")
+            on_disk = json.loads((repo / refs.run_node_dir() / "verdict.json").read_text())
+            self.assertEqual([p["status"] for p in on_disk["per_test"]], ["pass", "xfail"])
+            # a physics failure (scale check false) -> self_verdict fail / physics_fail
+            bad = {"checks": {"scale_identity": {"pass": False}, "input_guard": {"pass": True}},
+                   "verdict": {"overall": "fail", "failed_checks": ["scale_identity"]}}
+            doc2 = c._author_execute_verdict(refs, ir, bad)
+            self.assertEqual(doc2["self_verdict"], "fail")
+            self.assertEqual(doc2["failure_class"], "physics_fail")
+
+    def test_author_execute_verdict_missing_predicates_is_structural(self) -> None:
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            c = wc.Conductor(repo_root=repo, orchestration_id="o",
+                             orchestration_agent_run_id="O", backend="claude", env={})
+            refs = self._refs()
+            doc = c._author_execute_verdict(refs, {"io_contract": {}}, {"verdict": {"overall": "pass"}})
+            self.assertEqual(doc["self_verdict"], "fail")
+            self.assertEqual(doc["failure_class"], "structural_violation")
+            self.assertIn("predicate_error", doc)
+
+    def test_execute_physics_fail_routes_escalate_prod_failclosed_dev(self) -> None:
+        # R2: an execute-authored physics/contract verdict fail routes to the escalate
+        # diagnostician in prod (attribution needs reasoning) and fail_closed in dev.
+        import tempfile
+        for fclass in ("physics_fail", "structural_violation"):
+            with tempfile.TemporaryDirectory() as td:
+                repo = Path(td)
+                refs = self._refs()
+                rn = repo / refs.run_node_dir()
+                rn.mkdir(parents=True, exist_ok=True)
+                (rn / "verdict.json").write_text(json.dumps(
+                    {"self_verdict": "fail", "failure_class": fclass, "per_test": []}),
+                    encoding="utf-8")
+                ex_fail = [wc.SubstepOutcome("pj", "pass", [], 0),
+                           wc.SubstepOutcome("ex", "fail", [], 0)]
+                prod = wc.Conductor(repo_root=repo, orchestration_id="o",
+                                    orchestration_agent_run_id="O", backend="claude",
+                                    env={}, workflow_mode="prod")
+                d_prod = prod.classify_failure(refs, "validate", ex_fail)
+                self.assertEqual(d_prod.action, "escalate", fclass)
+                self.assertEqual(d_prod.reason, f"validate_execute_{fclass}")
+                dev = wc.Conductor(repo_root=repo, orchestration_id="o",
+                                   orchestration_agent_run_id="O", backend="claude",
+                                   env={}, workflow_mode="dev")
+                d_dev = dev.classify_failure(refs, "validate", ex_fail)
+                self.assertEqual(d_dev.action, "fail_closed", fclass)
 
     def test_semantic_review_fail_on_clean_verdict_escalates(self) -> None:
         # G6 (Codex P2): the judge substep fails on semantic_review.decision=="fail" even when
@@ -4176,13 +4287,21 @@ class PostJudgeClassifierTest(unittest.TestCase):
     """G4: post_judge severity classification of free-text `--stage pre_judge` violations."""
 
     def test_recoverable_is_judge_authored_only(self) -> None:
-        # ONLY the judge's own deliverables are warm-resume-recoverable.
-        for base in ("semantic_review.json", "verdict.json", "aggregate_verdict.json",
-                     "summary.json", "validate_meta.json"):
+        # R2: semantic_review.json is the judge's ONLY deliverable, so it is the only
+        # warm-resume-recoverable artifact.
+        self.assertEqual(
+            wc.classify_post_judge_violations(
+                ["workspace/pipelines/x/runs/r/n/semantic_review.json: review_method must be llm_semantic_review"]),
+            "recoverable")
+        # R2: verdict.json is host-authored at execute; the derived aggregate_verdict / summary /
+        # validate_meta are host-authored at post_judge from that same verdict. A gate violation
+        # naming any of them is a conductor derivation defect the judge cannot fix (re-running it
+        # would re-derive identically) -> unrecoverable (no wasted warm-resume).
+        for base in ("verdict.json", "aggregate_verdict.json", "summary.json", "validate_meta.json"):
             self.assertEqual(
                 wc.classify_post_judge_violations(
-                    [f"workspace/pipelines/x/runs/r/n/{base}: review_method must be llm_semantic_review"]),
-                "recoverable", base)
+                    [f"workspace/pipelines/x/runs/r/n/{base}: counts must equal per_test aggregate"]),
+                "unrecoverable", base)
         # Execute-authored evidence is NOT judge-fixable -> unknown (fail_closed), no wasted
         # warm-resume: the judge re-run cannot rewrite diagnostics/perf/trial_meta.
         for base in ("perf.json", "diagnostics.json", "trial_meta.json"):
@@ -4250,34 +4369,32 @@ class G3JudgeGateSubstepTest(unittest.TestCase):
         (rn / "semantic_review.json").write_text(
             json.dumps({"decision": decision}), encoding="utf-8")
 
-    # -- determine_substep_status: judge (verdict+semantic_review), pre/post_judge (meta) --
-    def test_determine_judge_passes_on_verdict_alone(self) -> None:
+    # -- determine_substep_status: judge (semantic_review only), pre/post_judge (meta) --
+    def test_determine_judge_passes_on_semantic_decision_only(self) -> None:
         import tempfile
         with tempfile.TemporaryDirectory() as td:
             repo, refs = Path(td), self._refs()
             c = self._conductor(repo)
-            # G6: pass iff per_test non-empty with no `fail` AND decision == pass.
+            # R2: the judge authors semantic_review.json only; verdict.json is host-authored
+            # at execute (and is ∈ {pass,xfail} whenever the judge runs). So the judge passes
+            # iff semantic_review.decision == "pass", regardless of per_test.
             self._seed_judge(repo, refs,
                              per_test=[{"test_id": "t1", "status": "pass"}], decision="pass")
             self.assertEqual(
                 c.determine_substep_status(refs, "validate", "judge", [])[0], "pass")
-            # all-xfail node still passes ("no fail" admits it)
+            # an all-xfail execute verdict still passes the judge on a pass decision
             self._seed_judge(repo, refs,
                              per_test=[{"test_id": "t1", "status": "xfail"}], decision="pass")
             self.assertEqual(
                 c.determine_substep_status(refs, "validate", "judge", [])[0], "pass")
-            # a per_test fail -> judge fail
-            self._seed_judge(repo, refs,
-                             per_test=[{"test_id": "t1", "status": "fail"}], decision="pass")
-            self.assertEqual(
-                c.determine_substep_status(refs, "validate", "judge", [])[0], "fail")
-            # a semantic_review fail on clean per_test -> judge fail
+            # a semantic_review fail -> judge fail (independent of the execute verdict)
             self._seed_judge(repo, refs,
                              per_test=[{"test_id": "t1", "status": "pass"}], decision="fail")
             self.assertEqual(
                 c.determine_substep_status(refs, "validate", "judge", [])[0], "fail")
-            # empty per_test -> judge fail
-            self._seed_judge(repo, refs, per_test=[], decision="pass")
+            # a missing/empty decision -> judge fail (a judge that produced no clear verdict)
+            self._seed_judge(repo, refs,
+                             per_test=[{"test_id": "t1", "status": "pass"}], decision="")
             self.assertEqual(
                 c.determine_substep_status(refs, "validate", "judge", [])[0], "fail")
 
@@ -4455,9 +4572,6 @@ class G3JudgeGateSubstepTest(unittest.TestCase):
             self.assertEqual(agg["self_verdict"], "fail")
             summary = json.loads((rn / "summary.json").read_text())
             self.assertEqual(summary["counts"]["blocked"], 1)
-            # judge criterion also rejects a per_test `blocked`.
-            self.assertEqual(
-                c.determine_substep_status(refs, "validate", "judge", [])[0], "fail")
 
     def test_determine_pre_and_post_judge_meta_branches(self) -> None:
         import tempfile

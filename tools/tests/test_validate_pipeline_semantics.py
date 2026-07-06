@@ -6925,35 +6925,190 @@ end program shallow_water2d_runner
             )
 
     def test_validate_compile_stage_passes_for_resolved_plan_directory(self) -> None:
+        # A fully-formed IR (incl. a valid R2 test_predicates DSL + the diagnostics_contract
+        # vocabulary its refs resolve against) passes the compile stage cleanly.
         with tempfile.TemporaryDirectory() as tmp:
-            repo_root = Path(tmp)
-            _seed_shape_expr_schema_into(repo_root)
+            preds = [{"test_id": "t1", "expected_outcome": "pass", "target_cases": ["c1"],
+                      "pass_when": {"all": [
+                          {"ref": "verdict.overall", "op": "eq", "value": "pass"},
+                          {"ref": "checks.g.status", "op": "eq", "value": "pass"}]}}]
+            v = self._compile_with_io_contract(
+                Path(tmp), self._io_contract_with_predicates(preds))
+            self.assertEqual(v, [])
+
+    def _compile_with_io_contract(self, repo_root: Path, io_contract: dict):
+        _seed_shape_expr_schema_into(repo_root)
+        _create_minimal_execution_tree(
+            repo_root,
+            dep_spec_id="dynamics_shallow_water_flux_2d_rusanov_p0",
+            model_text="module m\nimplicit none\nend module m\n",
+            runner_text="program r\nimplicit none\nend program r\n",
+            run_command=["x", "y"],
+            io_contract=io_contract,
+            dependency_resolved={
+                "node_key": "problem/shallow_water2d@0.3.0",
+                "direct_deps": ["component/dynamics_shallow_water_flux_2d_rusanov_p0@0.1.0"],
+                "transitive_deps": [],
+                "topo_level": 1,
+                "all_nodes": [
+                    {"node_key": "component/dynamics_shallow_water_flux_2d_rusanov_p0@0.1.0",
+                     "topo_level": 0},
+                    {"node_key": "problem/shallow_water2d@0.3.0", "topo_level": 1},
+                ],
+            },
+        )
+        # add a case block for the predicate target_cases to resolve against
+        ir_path = (repo_root / "workspace/ir/problem__shallow_water2d__0.3.0"
+                   "/shallow-water2d_20260415_001/spec.ir.yaml")
+        doc = json.loads(ir_path.read_text())
+        doc["case"] = {"test_case_set": [{"case_id": "c1", "inputs": {}}]}
+        ir_path.write_text(json.dumps(doc))
+        return validate_compile_stage(
+            repo_root, "workspace",
+            "workspace/ir/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001")
+
+    def _io_contract_with_predicates(self, predicates) -> dict:
+        return {
+            "inputs": [{"name": "case_resolved", "source": "spec.ir.yaml",
+                        "evidence_ref": "spec.ir.yaml"}],
+            "outputs": [{"name": "metric", "shape_expr": "scalar",
+                         "evidence_ref": "raw/metrics_basis.json",
+                         "raw_variables": ["h", "hu", "hv", "time"]}],
+            "semantic_dependency": {"required_sources": []},
+            "raw_requirements": {"required_evidence": [
+                {"artifact": "metrics_basis.json", "required": True},
+                {"artifact": "execution_trace.json", "required": True},
+                {"artifact": "state_snapshots", "required": True, "min_samples": 1,
+                 "schema": {"variables": [{"name": "h", "shape_expr": "[2,2]"},
+                                          {"name": "hu", "shape_expr": "[2,2]"},
+                                          {"name": "hv", "shape_expr": "[2,2]"}],
+                            "time_variable": "time", "time_shape_expr": "scalar"}}]},
+            "diagnostics_contract": {
+                "checks": [{"id": "g"}],
+                "verdict": {"required": True, "fields": ["overall", "failed_checks"]},
+                "metrics": ["metrics.mass_drift_rel"]},
+            "test_predicates": predicates,
+        }
+
+    def test_compile_predicate_gate_accepts_valid_dsl(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            # Note: the ordered-op threshold must be a YAML float (a decimal point). Bare
+            # exponential notation like `1e-10` is parsed by YAML 1.1 as a STRING and is
+            # (correctly) rejected by the numeric-threshold gate; use `1.0e-10` / `0.1`.
+            preds = [{"test_id": "t1", "expected_outcome": "pass", "target_cases": ["c1"],
+                      "pass_when": {"all": [
+                          {"ref": "verdict.overall", "op": "eq", "value": "pass"},
+                          {"ref": "checks.g.status", "op": "eq", "value": "pass"},
+                          {"ref": "metrics.mass_drift_rel", "op": "le", "value": 0.1,
+                           "per_case": True}]}}]
+            v = self._compile_with_io_contract(Path(tmp), self._io_contract_with_predicates(preds))
+            self.assertEqual(v, [])
+
+    def test_compile_predicate_gate_rejects_missing_predicates(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            io = self._io_contract_with_predicates([])
+            io.pop("test_predicates")
+            v = self._compile_with_io_contract(Path(tmp), io)
+            self.assertTrue(any("test_predicates must be a non-empty list" in x for x in v), v)
+
+    def test_compile_predicate_gate_rejects_unknown_case_and_ref(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            preds = [{"test_id": "t1", "expected_outcome": "pass", "target_cases": ["nope"],
+                      "pass_when": {"all": [{"ref": "checks.absent.status", "op": "eq",
+                                             "value": "pass"}]}}]
+            v = self._compile_with_io_contract(Path(tmp), self._io_contract_with_predicates(preds))
+            self.assertTrue(any("unknown case_id" in x for x in v), v)
+            self.assertTrue(any("diagnostics_contract.checks" in x for x in v), v)
+
+    def test_compile_predicate_gate_uses_test_evidence_requirements_fallback(self) -> None:
+        # F2: with no resolvable tests.md (the fixture has no meta.source_refs.tests + no spec
+        # file), the gate falls back to the same-IR test_evidence_requirements id set — so a
+        # predicate id that is NOT in test_evidence_requirements is still caught.
+        with tempfile.TemporaryDirectory() as tmp:
+            io = self._io_contract_with_predicates(
+                [{"test_id": "not_in_ter", "expected_outcome": "pass", "target_cases": ["c1"],
+                  "pass_when": {"all": [{"ref": "verdict.overall", "op": "eq", "value": "pass"}]}}])
+            io["test_evidence_requirements"] = [
+                {"test_id": "t1", "required_raw_variables": ["h"]}]
+            v = self._compile_with_io_contract(Path(tmp), io)
+            self.assertTrue(any("unknown test_id not in tests.md" in x for x in v)
+                            or any("missing tests" in x for x in v), v)
+
+    def test_parse_test_ids_handles_heading_and_bullet_forms(self) -> None:
+        from tools.validate_pipeline_semantics import _parse_test_ids_from_tests_md
+        with tempfile.TemporaryDirectory() as tmp:
+            # problem-spec heading form (a `case_id`/`N/A` heading with trailing prose is excluded)
+            heading = Path(tmp) / "h.md"
+            heading.write_text(
+                "### 4-2. `case_id` generation rule\n"
+                "### 6-1. `l1_refinement`\n### 6-2. `l0_cfl_guard_xfail`\n", encoding="utf-8")
+            self.assertEqual(_parse_test_ids_from_tests_md(heading),
+                             ["l1_refinement", "l0_cfl_guard_xfail"])
+            # component/profile bullet form (sibling `- `pass_when`:` bullets excluded)
+            bullet = Path(tmp) / "b.md"
+            bullet.write_text(
+                "## 6. Test definitions\n"
+                "- `test_id`: `l0_scale_identity_pass`\n"
+                "  - `expected_outcome`: `pass`\n"
+                "- `test_id`: `l0_invalid_length_xfail`\n"
+                "- `pass_when`: `checks.input_guard.pass == true`\n", encoding="utf-8")
+            self.assertEqual(_parse_test_ids_from_tests_md(bullet),
+                             ["l0_scale_identity_pass", "l0_invalid_length_xfail"])
+
+    def test_compile_predicate_gate_flags_tests_md_resolved_but_empty(self) -> None:
+        # Fail-closed: a resolvable tests.md that parses to 0 test_ids (unrecognized form) must
+        # be a violation, not a silent fall-back to test_evidence_requirements.
+        with tempfile.TemporaryDirectory() as tmp:
+            io = self._io_contract_with_predicates(
+                [{"test_id": "t1", "expected_outcome": "pass", "target_cases": ["c1"],
+                  "pass_when": {"all": [{"ref": "verdict.overall", "op": "eq", "value": "pass"}]}}])
+            _seed_shape_expr_schema_into(Path(tmp))
             _create_minimal_execution_tree(
-                repo_root,
-                dep_spec_id="dynamics_shallow_water_flux_2d_rusanov_p0",
-                model_text="module m\nimplicit none\nend module m\n",
-                runner_text="program r\nimplicit none\nend program r\n",
-                run_command=["x", "y"],
-                # Coherent closure so the deterministic direct_deps consistency gate
-                # (_validate_compile_dependency_consistency) recovers host_direct == direct_deps.
+                Path(tmp), dep_spec_id="dynamics_shallow_water_flux_2d_rusanov_p0",
+                model_text="module m\nend module m\n", runner_text="program r\nend program r\n",
+                run_command=["x", "y"], io_contract=io,
                 dependency_resolved={
                     "node_key": "problem/shallow_water2d@0.3.0",
                     "direct_deps": ["component/dynamics_shallow_water_flux_2d_rusanov_p0@0.1.0"],
-                    "transitive_deps": [],
-                    "topo_level": 1,
+                    "transitive_deps": [], "topo_level": 1,
                     "all_nodes": [
                         {"node_key": "component/dynamics_shallow_water_flux_2d_rusanov_p0@0.1.0",
                          "topo_level": 0},
-                        {"node_key": "problem/shallow_water2d@0.3.0", "topo_level": 1},
-                    ],
-                },
-            )
-            violations = validate_compile_stage(
-                repo_root,
-                "workspace",
-                "workspace/ir/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001",
-            )
-            self.assertEqual(violations, [])
+                        {"node_key": "problem/shallow_water2d@0.3.0", "topo_level": 1}]})
+            ir_path = (Path(tmp) / "workspace/ir/problem__shallow_water2d__0.3.0"
+                       "/shallow-water2d_20260415_001/spec.ir.yaml")
+            doc = json.loads(ir_path.read_text())
+            doc["case"] = {"test_case_set": [{"case_id": "c1", "inputs": {}}]}
+            # point meta.source_refs.tests at a real file whose form yields 0 test_ids
+            empty_tests = Path(tmp) / "spec" / "empty_tests.md"
+            empty_tests.parent.mkdir(parents=True, exist_ok=True)
+            empty_tests.write_text("## Tests\nno recognizable test-id lines here\n", encoding="utf-8")
+            doc["meta"] = {"source_refs": {"tests": "spec/empty_tests.md"}}
+            ir_path.write_text(json.dumps(doc))
+            v = validate_compile_stage(
+                Path(tmp), "workspace",
+                "workspace/ir/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001")
+            self.assertTrue(any("resolved but parsed 0 test_ids" in x for x in v), v)
+
+    def test_compile_predicate_gate_rejects_verdict_ref_when_not_required(self) -> None:
+        # A verdict.* ref is only allowed when diagnostics_contract.verdict.required=true;
+        # with required=false the runner is not contracted to emit verdict -> reject at Compile.
+        with tempfile.TemporaryDirectory() as tmp:
+            io = self._io_contract_with_predicates(
+                [{"test_id": "t1", "expected_outcome": "pass", "target_cases": ["c1"],
+                  "pass_when": {"all": [{"ref": "verdict.overall", "op": "eq", "value": "pass"}]}}])
+            io["diagnostics_contract"]["verdict"] = {
+                "required": False, "fields": ["overall", "failed_checks"]}
+            v = self._compile_with_io_contract(Path(tmp), io)
+            self.assertTrue(any("verdict.overall" in x for x in v), v)
+
+    def test_compile_predicate_gate_rejects_unpinned_metric(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            preds = [{"test_id": "t1", "expected_outcome": "pass", "target_cases": ["c1"],
+                      "pass_when": {"all": [{"ref": "errors.analytic_h.l2_rel_tend", "op": "le",
+                                             "value": 0.2, "per_case": True}]}}]
+            v = self._compile_with_io_contract(Path(tmp), self._io_contract_with_predicates(preds))
+            self.assertTrue(any("diagnostics_contract.metrics" in x for x in v), v)
 
     def test_validate_compile_stage_rejects_non_plans_path(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

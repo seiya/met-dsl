@@ -1630,6 +1630,35 @@ shell_tool                       stable             true
             with self.assertRaisesRegex(ValueError, "outside phase contract outputs"):
                 _allowed_output_paths_for_launch(request_payload=forged, write_roots=[])
 
+    def test_phase_contract_execute_authors_verdict_judge_does_not(self) -> None:
+        """R2: verdict.json is part of the Validate.EXECUTE write-contract (host-authored from
+        io_contract.test_predicates) and is NOT a Validate.judge deliverable. Drives the REAL
+        _allowed_output_paths_for_launch (not the _FakeConductor stub) so the mock gap that hid
+        the execute record-launch crash cannot recur."""
+        from tools.orchestration_runtime import _allowed_output_paths_for_launch
+
+        pipeline = "workspace/pipelines/component__spec_x__0.1.0/spec-x_20260101_001"
+        node_key = "component/spec_x@0.1.0"
+        node_safe = "component__spec_x__0.1.0"
+        run_id = "run_20260101_001"
+        verdict = f"{pipeline}/runs/{run_id}/{node_safe}/verdict.json"
+        # execute may declare verdict.json (else record-launch crashes before it runs)
+        execute = {"agent_role": "substep", "step": "validate", "substep": "execute",
+                   "pipeline_ref": pipeline, "node_key": node_key,
+                   "allowed_output_paths": [verdict]}
+        self.assertIn(
+            verdict, _allowed_output_paths_for_launch(request_payload=execute, write_roots=[]))
+        # the judge may NOT declare verdict.json (it authors only semantic_review.json)
+        judge = {"agent_role": "substep", "step": "validate", "substep": "judge",
+                 "pipeline_ref": pipeline, "node_key": node_key,
+                 "allowed_output_paths": [verdict]}
+        with self.assertRaisesRegex(ValueError, "outside phase contract outputs"):
+            _allowed_output_paths_for_launch(request_payload=judge, write_roots=[])
+        sem = f"{pipeline}/runs/{run_id}/{node_safe}/semantic_review.json"
+        judge_ok = dict(judge, allowed_output_paths=[sem])
+        self.assertEqual(
+            _allowed_output_paths_for_launch(request_payload=judge_ok, write_roots=[]), [sem])
+
     def test_writes_orchestration_artifacts_in_canonical_layout(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
@@ -3409,7 +3438,7 @@ shell_tool                       stable             true
             "pipeline_ref": _FIX_PIPE_REF,
             "run_id": run_id,
             "allowed_output_paths": [
-                f"{run_dir}/verdict.json",
+                f"{run_dir}/semantic_review.json",
             ],
         }
         out = _allowed_output_paths_for_launch(
@@ -13716,26 +13745,28 @@ class TestPhase3RunGate(unittest.TestCase):
             )
 
     def test_allowed_output_paths_for_launch_allows_judge_contract_path(self) -> None:
-        # G6: the judge's contract deliverables are verdict.json + semantic_review.json
-        # (aggregate_verdict / summary / validate_meta are conductor-authored in post_judge).
+        # R2: the judge's ONLY deliverable is semantic_review.json (verdict.json is host-authored
+        # at execute; aggregate_verdict / summary / validate_meta are conductor-authored in
+        # post_judge).
+        base = f"{_FIX_PIPE_REF}/runs/run_20260101_001/problem__shallow_water2d__0.3.0"
         req = {
             "agent_role": "step",
             "node_key": "problem/shallow_water2d@0.3.0",
             "step": "validate", "substep": "judge",
             "ir_ref": _FIX_IR_REF,
             "pipeline_ref": _FIX_PIPE_REF,
-            "allowed_output_paths": [
-                f"{_FIX_PIPE_REF}/runs/run_20260101_001/problem__shallow_water2d__0.3.0/verdict.json"
-            ],
+            "allowed_output_paths": [f"{base}/semantic_review.json"],
         }
         out = _allowed_output_paths_for_launch(
             request_payload=req,
             write_roots=[f"{_FIX_PIPE_REF}/runs/"],
         )
-        self.assertEqual(
-            out,
-            [f"{_FIX_PIPE_REF}/runs/run_20260101_001/problem__shallow_water2d__0.3.0/verdict.json"],
-        )
+        self.assertEqual(out, [f"{base}/semantic_review.json"])
+        # R2: the judge may NOT declare verdict.json (host-authored at execute).
+        forged = dict(req, allowed_output_paths=[f"{base}/verdict.json"])
+        with self.assertRaisesRegex(ValueError, "outside phase contract outputs"):
+            _allowed_output_paths_for_launch(
+                request_payload=forged, write_roots=[f"{_FIX_PIPE_REF}/runs/"])
 
     def test_allowed_output_paths_for_launch_rejects_judge_path_under_legacy_judge_root(self) -> None:
         req = {
@@ -23515,12 +23546,12 @@ class CanonicalIdEnforcementTests(unittest.TestCase):
     def test_validate_judge_rejects_non_canonical_run_id(self) -> None:
         from tools.orchestration_runtime import _allowed_output_paths_for_launch
         node_safe = "problem__shallow_water2d__0.3.0"
-        # G6: verdict.json is a judge deliverable (aggregate_verdict moved to post_judge).
-        good = f"{_FIX_PIPE_REF}/runs/run_20260101_001/{node_safe}/verdict.json"
+        # R2: semantic_review.json is the judge's only deliverable (verdict.json moved to execute).
+        good = f"{_FIX_PIPE_REF}/runs/run_20260101_001/{node_safe}/semantic_review.json"
         # `ex_001` is non-canonical; `run-rsn-p0_20260605_001` is slug-shaped
         # but still not a canonical run_id (no literal `run_` prefix).
         for bad_run_id in ("ex_001", "run-rsn-p0_20260605_001"):
-            bad = f"{_FIX_PIPE_REF}/runs/{bad_run_id}/{node_safe}/verdict.json"
+            bad = f"{_FIX_PIPE_REF}/runs/{bad_run_id}/{node_safe}/semantic_review.json"
             with self.assertRaises(ValueError) as ctx:
                 _allowed_output_paths_for_launch(
                     request_payload=self._build_payload("validate", "judge", [bad]),
@@ -23534,19 +23565,20 @@ class CanonicalIdEnforcementTests(unittest.TestCase):
         self.assertIn(good, ok_list)
 
     def test_g6_judge_rejects_derived_artifacts_post_judge_accepts(self) -> None:
-        """G6: the judge contract accepts only verdict.json + semantic_review.json;
-        aggregate_verdict / summary / validate_meta moved to the post_judge contract."""
+        """R2/G6: the judge contract accepts only semantic_review.json; verdict.json is
+        host-authored at execute and aggregate_verdict / summary / validate_meta are authored in
+        the post_judge contract — the judge may write none of them."""
         from tools.orchestration_runtime import _allowed_output_paths_for_launch
         node_safe = "problem__shallow_water2d__0.3.0"
         run_dir = f"{_FIX_PIPE_REF}/runs/run_20260101_001/{node_safe}"
         derived = [f"{run_dir}/aggregate_verdict.json", f"{run_dir}/summary.json",
                    f"{run_dir}/validate_meta.json"]
-        # judge: its own deliverables pass; each derived artifact is rejected.
-        for good in (f"{run_dir}/verdict.json", f"{run_dir}/semantic_review.json"):
-            self.assertIn(good, _allowed_output_paths_for_launch(
-                request_payload=self._build_payload("validate", "judge", [good]),
-                write_roots=[f"{_FIX_PIPE_REF}/runs/"]))
-        for bad in derived:
+        # judge: its own deliverable passes; verdict.json + each derived artifact is rejected.
+        self.assertIn(f"{run_dir}/semantic_review.json", _allowed_output_paths_for_launch(
+            request_payload=self._build_payload(
+                "validate", "judge", [f"{run_dir}/semantic_review.json"]),
+            write_roots=[f"{_FIX_PIPE_REF}/runs/"]))
+        for bad in ([f"{run_dir}/verdict.json"] + derived):
             with self.assertRaises(ValueError) as ctx:
                 _allowed_output_paths_for_launch(
                     request_payload=self._build_payload("validate", "judge", [bad]),
@@ -25407,7 +25439,10 @@ class ChildContextDocSizeTests(unittest.TestCase):
         # Bumped 17400->17600: the G7 sidecar note (Compile.generate must not write
         # the conductor-authored <ir_ref>/dependency_graph.json; it authors only the
         # IR's node_key + direct_deps) — deterministic_followups.md G7.
-        "docs/AGENT_CONTRACT.md": 17600,
+        # Bumped 17600->17800: R2 (G8) — verdict.json / aggregate_verdict.json are now
+        # conductor-derived (verdict at execute from test_predicates + diagnostics), not
+        # leaf-authored; the artifact-authoring norm is updated to say so.
+        "docs/AGENT_CONTRACT.md": 17800,
         # Consolidated runner-output contract (was duplicated across phase_02/04 +
         # PERF §2/§6); leaf must-read for generate.generate/verify + validate.judge.
         # Bumped 7600->8100: §3 disambiguated the guard-case snapshot rule (declared
@@ -25432,7 +25467,13 @@ class ChildContextDocSizeTests(unittest.TestCase):
         # Bumped 19100->20400: G7 adds the dependency_graph.json sidecar schema + section and the
         # deterministic direct_deps consistency gate, and rewrites V4 to V4c-only (the derived
         # closure/topo graph is now conductor-authored) — deterministic_followups.md G7.
-        "docs/workflow/phases/phase_01_compile.md": 20400,
+        # Bumped 20400->23600: R2 (G8) adds the io_contract.test_predicates DSL schema (per-test
+        # verdict predicates + ref vocabulary + diagnostics_contract.metrics pin) and the V3
+        # invariant that Compile.verify checks the predicate translation faithfully — the
+        # judge-time nondeterminism this removes becomes a reviewable compile-time artifact.
+        # Bumped 23600->23900: the R2 predicate schema notes the YAML-float threshold rule for
+        # ordered ops (1.0e-10 not 1e-10) + the includes list-member form (a Codex-review gap).
+        "docs/workflow/phases/phase_01_compile.md": 23900,
         # Per-substep SKILLs — each force-read by its own LLM leaf.
         # Bumped 10800->11500: Compile.generate now authors the io_contract section (G2 /
         # docs/design/deterministic_followups.md) — it was moved here from Compile.verify so the
@@ -25443,10 +25484,18 @@ class ChildContextDocSizeTests(unittest.TestCase):
         # the compile-generate SKILL prose alongside the io_contract authorship move.
         # Bumped 12100->12300: G7 — dependency section records node_key + direct_deps only; the
         # derived closure/topo graph is conductor-authored to dependency_graph.json (G7).
-        "skills/workflow-compile-generate/SKILL.md": 12300,
+        # Bumped 12300->13900: R2 (G8) — Compile.generate now authors io_contract.test_predicates
+        # (the deterministic per-test verdict DSL Validate.execute evaluates), so the SKILL adds
+        # the predicate-authoring rule (schema, ref vocabulary, per-case thresholds, na_allowed).
+        # Bumped 13900->14300: Codex-review hardening — the predicate rule now states the
+        # YAML-float threshold requirement, per-case-map full coverage, and verdict.required gate.
+        "skills/workflow-compile-generate/SKILL.md": 14300,
         # Bumped 11800->12100: G7 — compile.verify checks V4c only (operations ⊆ published); the
         # closure/topo consistency is conductor-authored + gate-checked, no longer LLM-verified (G7).
-        "skills/workflow-compile-verify/SKILL.md": 12100,
+        # Bumped 12100->13100: R2 (G8) — compile.verify owns the SEMANTIC test_predicates fidelity
+        # check (the prose→predicate translation is this design's first-priority risk); the gate
+        # does the mechanical schema, the leaf verifies faithfulness.
+        "skills/workflow-compile-verify/SKILL.md": 13100,
         # Bumped 22000->22400: inlined the leaf-actionable C003 directive placement
         # + the f2008 63-char identifier limit (previously only in phase_02, which
         # generate.generate no longer force-reads) to avoid a lint/build round-trip.
@@ -25472,7 +25521,11 @@ class ChildContextDocSizeTests(unittest.TestCase):
         # called out as conductor-derived not judge-written) so the judge leaf no longer
         # guesses `result`/`expected_outcome` — the value/field lived only in gate code
         # before (orch_20260702T041436Z_a901797b crash).
-        "skills/workflow-validate-judge/SKILL.md": 10400,
+        # Lowered 10400->8200: R2 (G8) — the judge no longer authors verdict.json (host-authored
+        # at execute from io_contract.test_predicates); the SKILL is now a pure semantic-review
+        # contract (semantic_review.json only), so the per_test/failure_class authoring prose is
+        # removed. The ceiling is tightened to the new (smaller) footprint.
+        "skills/workflow-validate-judge/SKILL.md": 8200,
     }
 
     def test_child_context_docs_within_budget(self) -> None:

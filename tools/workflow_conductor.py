@@ -202,29 +202,30 @@ VALIDATE_JUDGE_ROUTING: dict[tuple[str, str], tuple[str, str | None]] = {
 # path, so the classifier keys on that leading path token.
 #
 #   - recoverable   : the violation is judge-fixable by re-running the judge (warm resume).
-#                     Scoped to the judge's own deliverables — semantic_review.json (incl. the
-#                     review_method literal) and verdict.json — PLUS the three G6 conductor-
-#                     derived artifacts (aggregate_verdict.json / summary.json / validate_meta.json):
-#                     although post_judge now authors those correct-by-construction, any gate
-#                     violation naming one of them (e.g. a summary.counts mismatch) traces to a
-#                     defect in the judge's verdict.json (a duplicate/invalid test_id), so warm-
-#                     resuming the judge to fix verdict.json + re-deriving them is the right repair.
-#                     NOT the execute-authored evidence (diagnostics/perf/trial_meta/raw) — the
-#                     judge cannot rewrite those, so a violation there would warm-resume uselessly;
-#                     it falls to `unknown` (below) and escalates/fail_closes instead of wasting
-#                     judge spawns.
-#   - unrecoverable : orchestration-record / cross-pipeline dependency-DAG integrity. Re-running
-#                     the judge cannot fix these. Sources: _validate_orchestration_hierarchy
-#                     (agent_graph.json / step_result.json / an orchestrations/ root) and the
-#                     cross-pipeline DAG check (lineage.json / the literal DAG messages).
+#                     As of R2 this is scoped to the judge's ONLY deliverable —
+#                     semantic_review.json (incl. the review_method literal). NOTHING else is
+#                     judge-fixable: verdict.json is HOST-authored at execute, and the derived
+#                     aggregate_verdict.json / summary.json / validate_meta.json are HOST-authored
+#                     at post_judge (correct-by-construction from the host verdict.json). A
+#                     warm-resume re-runs the judge but NOT execute, and re-derives the artifacts
+#                     from the SAME verdict.json, so a violation naming any of them would repeat
+#                     identically until the budget is exhausted — a conductor/derivation defect,
+#                     not a judge one, so it must terminalize instead of wasting judge spawns.
+#   - unrecoverable : orchestration-record / cross-pipeline dependency-DAG integrity, OR a
+#                     host-authored artifact defect (verdict.json / the post_judge-derived
+#                     aggregate_verdict.json / summary.json / validate_meta.json). Re-running the
+#                     judge cannot fix these. Sources: _validate_orchestration_hierarchy
+#                     (agent_graph.json / step_result.json / an orchestrations/ root), the
+#                     cross-pipeline DAG check (lineage.json / the literal DAG messages), and the
+#                     host-authored verdict/derived artifacts.
 #   - unknown       : anything else (incl. execute-authored evidence) -> conservatively terminal
 #                     (fail_closed) for now; a future escalate-LLM adjudicator would decide here.
 _POST_JUDGE_RECOVERABLE_BASENAMES: frozenset[str] = frozenset({
-    "semantic_review.json", "verdict.json", "aggregate_verdict.json", "summary.json",
-    "validate_meta.json",
+    "semantic_review.json",
 })
 _POST_JUDGE_UNRECOVERABLE_BASENAMES: frozenset[str] = frozenset({
-    "agent_graph.json", "step_result.json", "lineage.json",
+    "agent_graph.json", "step_result.json", "lineage.json", "verdict.json",
+    "aggregate_verdict.json", "summary.json", "validate_meta.json",
 })
 _POST_JUDGE_UNRECOVERABLE_MARKERS: tuple[str, ...] = (
     "copy_based_artifact_reuse detected", "dependency DAG incomplete",
@@ -856,6 +857,10 @@ def build_launch_request(
                 f"{rundir}/perf.json",
                 f"{rundir}/trial_meta.json",
                 f"{rundir}/quality_check.json",
+                # R2: execute authors verdict.json deterministically (per-test predicate
+                # evaluation of diagnostics.json), so the judge leaf authors only
+                # semantic_review.json. Moved out of the judge's allowed_output_paths (below).
+                f"{rundir}/verdict.json",
                 f"{rundir}/raw/metrics_basis.json",
             ]
             # Raw-evidence deliverables are IR-driven (phase_04 §44): only require the
@@ -879,12 +884,13 @@ def build_launch_request(
                 f"{refs.binary_dir()}/binary_meta.json",
                 f"{spec}/tests.md",
             ]
-            # G6: the judge authors ONLY its two LLM-bound deliverables. The
-            # deterministically-derivable aggregate_verdict / summary / validate_meta are
-            # conductor-authored in post_judge (see _author_derived_validate_artifacts).
+            # R2: the judge authors ONLY semantic_review.json. verdict.json (per_test +
+            # failure_class) is now deterministically host-authored at execute from the IR
+            # predicates + diagnostics.json; the deterministically-derivable aggregate_verdict /
+            # summary / validate_meta are conductor-authored in post_judge (G6,
+            # _author_derived_validate_artifacts). The judge is a pure semantic pass.
             req["allowed_output_paths"] = [
                 f"{rundir}/semantic_review.json",
-                f"{rundir}/verdict.json",
             ]
     else:  # pragma: no cover - guarded by SUBSTEPS keys
         raise ValueError(f"unknown step: {step}")
@@ -1694,30 +1700,16 @@ clean:
             status = "pass" if (meta.get("status") == "pass"
                                 and _fresh_deliverables_written(allowed_output_paths)) else "fail"
         elif phase == "validate" and substep == "judge":
-            # Post-G6 judge: a PURE LLM semantic pass authoring only verdict.json +
-            # semantic_review.json (the deterministically-derivable aggregate_verdict / summary /
-            # validate_meta are conductor-authored in post_judge, so aggregate_verdict.json does
-            # not exist yet here). The judge passes iff its own two deliverables agree the node
-            # is physics-clean: verdict.per_test is a non-empty list with no `fail` entry AND
-            # semantic_review.decision == "pass". A per_test `fail` or a decision=="fail" breaks
-            # run_phase before post_judge; classify_failure then routes on verdict.failure_class
-            # + semantic_review.findings[0].attribution (routing preserved). An all-xfail node
-            # passes ("no fail" admits it, matching the old aggregate ∈ {pass,xfail} gate).
-            node_dir = self.repo_root / refs.run_node_dir()
-            verdict = _read_json(node_dir / "verdict.json") or {}
-            sem = _read_json(node_dir / "semantic_review.json") or {}
-            per_test = verdict.get("per_test")
-            # Every entry must be a clean, certifiable outcome — pass/xfail/skipped. Any
-            # `fail` OR `blocked` (both non-certifying) fails the judge, matching the old
-            # `aggregate ∈ {pass,xfail}` gate. A non-dict entry or an unknown status also
-            # fails (the post_judge counts gate would reject it anyway).
-            per_test_ok = isinstance(per_test, list) and bool(per_test) and all(
-                isinstance(e, dict)
-                and str(e.get("status") if e.get("status") is not None else e.get("outcome")
-                         or "").strip().lower() in ("pass", "xfail", "skipped")
-                for e in per_test)
-            decision_ok = str(sem.get("decision") or "").strip().lower() == "pass"
-            status = "pass" if (per_test_ok and decision_ok) else "fail"
+            # R2 judge: a PURE LLM semantic pass authoring ONLY semantic_review.json. The
+            # per-test verdict (verdict.json) is now deterministically host-authored at execute
+            # from the IR predicates, and a physics/contract fail there fails the execute
+            # substep before the judge is ever spawned. So when the judge runs, verdict is
+            # already ∈ {pass, xfail}; the judge passes iff its own semantic finding agrees the
+            # node is clean: semantic_review.decision == "pass". A decision=="fail" (a
+            # fabrication / consistency finding on otherwise-passing tests) breaks run_phase
+            # before post_judge; classify_failure then routes it (via the diagnostician).
+            sem = _read_json(self.repo_root / refs.run_node_dir() / "semantic_review.json") or {}
+            status = "pass" if str(sem.get("decision") or "").strip().lower() == "pass" else "fail"
         elif phase == "validate" and substep == "post_judge":
             # Deterministic post-return gate: the conductor-authored post_judge_meta records
             # the `--stage pre_judge` verdict (orchestration-record + cross-pipeline DAG
@@ -2590,6 +2582,18 @@ clean:
         (run_tmp / "raw" / "state_snapshots").mkdir(parents=True, exist_ok=True)
         qc_tmp.mkdir(parents=True, exist_ok=True)
 
+        # R2 invariant guard: clear any pre-existing verdict.json in this run node dir so that,
+        # after this substep, `verdict.json present` ⟺ `THIS execute authored it`. A structural
+        # failure (bad/missing evidence) returns WITHOUT authoring a verdict, and classify_failure
+        # routes on `verdict.json#failure_class` — so a stale verdict from a prior run would
+        # misroute a runner failure as a predicate failure (escalate/dev fail_closed instead of the
+        # Generate/C2 path). run_id rotation (_ensure_fresh_producer_id) already gives each attempt
+        # a fresh dir, making this a no-op in practice; enforcing it here removes the reliance on
+        # that external invariant for a correctness-critical routing decision.
+        _prev_verdict = node_dir / "verdict.json"
+        if _prev_verdict.exists():
+            _prev_verdict.unlink()
+
         gate_args = {"orchestration_id": self.orchestration_id,
                      "agent_run_id": child_arid, "capability_token": cap_token,
                      # so the MCP orchestration gate resolves the right orchestration root
@@ -2701,10 +2705,14 @@ clean:
             ["python3", "tools/validate_pipeline_semantics.py", "--stage", "post_execute",
              "--pipeline-root", refs.pipeline_ref, "--run-id", refs.run_id or ""],
             cwd=self.repo_root, env=self.env, text=True, capture_output=True, check=False)
-        if syn.returncode != 0 or gate.returncode != 0 or qc_status != "pass" or snapshot_gap:
-            # Content failure: record it in trial_meta.status (read by
-            # determine_substep_status) and return rc 0 so run_phase routes it via the
-            # validate tables / diagnostician, NOT transport fail_closed.
+        structural_ok = (syn.returncode == 0 and gate.returncode == 0
+                         and qc_status == "pass" and not snapshot_gap)
+        if not structural_ok:
+            # Structural content failure (bad/missing evidence): record it in
+            # trial_meta.status (read by determine_substep_status) and return rc 0 so
+            # run_phase routes it via the validate tables / diagnostician, NOT transport
+            # fail_closed. No verdict.json is authored — classify_failure's execute branch
+            # sees no failure_class and routes to Generate (regenerate the runner/code).
             stderr += ("\n[execute fail]\n" + syn.stdout + syn.stderr
                        + gate.stdout + gate.stderr)
             if snapshot_gap:
@@ -2724,7 +2732,60 @@ clean:
             trial_meta["status"] = "fail"
             (node_dir / "trial_meta.json").write_text(
                 json.dumps(trial_meta, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+            return {"returncode": 0, "stdout": stdout, "stderr": stderr}
+
+        # 5. R2: the run is structurally valid (evidence present, post_execute gate + quality
+        # check clean), so author verdict.json deterministically from the IR predicates +
+        # diagnostics.json. A per-test predicate failure (physics_fail / structural_violation)
+        # fails the execute substep WITHOUT spawning the judge leaf (the R2 cost lever) —
+        # classify_failure reads verdict.json#failure_class to route it. An all-clean verdict
+        # (self_verdict ∈ {pass, xfail}) leaves the execute substep passing; the judge then
+        # authors semantic_review.json only.
+        verdict_doc = self._author_execute_verdict(refs, ir, run_diag)
+        if verdict_doc.get("self_verdict") == "fail":
+            trial_meta["status"] = "fail"
+            (node_dir / "trial_meta.json").write_text(
+                json.dumps(trial_meta, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+            stderr += (
+                f"\n[execute fail: verdict] deterministic per-test verdict is fail "
+                f"(failure_class={verdict_doc.get('failure_class')}); the judge leaf was not "
+                f"spawned. See verdict.json#per_test for the failing predicate(s).")
         return {"returncode": 0, "stdout": stdout, "stderr": stderr}
+
+    def _author_execute_verdict(self, refs: NodeRefs, ir: dict[str, Any],
+                                run_diag: dict[str, Any]) -> dict[str, Any]:
+        """R2: author verdict.json from ``io_contract.test_predicates`` + the runner's
+        diagnostics.json (``run_diag``). Returns the authored doc. A missing / malformed
+        predicate DSL (which the Compile-stage gate forbids) is authored as a
+        ``structural_violation`` verdict; classify_failure's execute branch then routes it to the
+        escalate diagnostician (prod) / fail_closed (dev) — the diagnostician can reopen Compile
+        for the IR defect — rather than crashing execute."""
+        from tools.verdict_evaluator import evaluate_verdict, PredicateError
+
+        io_contract = (ir.get("io_contract") or {}) if isinstance(ir, dict) else {}
+        predicates = io_contract.get("test_predicates") if isinstance(io_contract, dict) else None
+        try:
+            if not isinstance(predicates, list) or not predicates:
+                raise PredicateError(
+                    "io_contract.test_predicates missing/empty (Compile must author it)")
+            doc = evaluate_verdict(predicates, run_diag,
+                                   run_id=refs.run_id, node_key=refs.node_key)
+        except Exception as exc:  # noqa: BLE001 - any evaluation failure is an IR/contract defect
+            # Catch broadly (not just PredicateError): a malformed IR must always route via the
+            # deterministic structural_violation path (escalate/fail_closed), never crash execute
+            # into a blunt transport fail_closed. evaluate_verdict provably raises only
+            # PredicateError today; catching Exception keeps that guarantee robust to evaluator
+            # evolution (e.g. a future op that could raise TypeError/ZeroDivisionError).
+            doc = {
+                "node_key": refs.node_key,
+                "run_id": refs.run_id,
+                "self_verdict": "fail",
+                "failure_class": "structural_violation",
+                "per_test": [],
+                "predicate_error": f"{type(exc).__name__}: {exc}"[:400],
+            }
+        self._write_run_node_meta(refs, "verdict.json", doc)
+        return doc
 
     def run_substep(self, refs: NodeRefs, phase: str, substep: str | None,
                     repair: dict[str, str] | None = None,
@@ -3056,8 +3117,8 @@ clean:
         composition hole) instead of the LLM. Called at the TOP of `_post_judge_inproc`,
         before the `--stage pre_judge` gate re-validates `summary.counts` vs
         `verdict.per_test` (`_validate_tests_verdict_summary_consistency`). Idempotent on a
-        warm-resume re-run (re-derived from the re-authored `verdict.json`). The judge now
-        authors only `verdict.json` + `semantic_review.json`."""
+        warm-resume re-run (re-derived from the execute-authored `verdict.json`). As of R2 the
+        judge authors only `semantic_review.json`; `verdict.json` is host-authored at execute."""
         from tools.orchestration_runtime import _resolve_dependency_facts
 
         node_dir = self.repo_root / refs.run_node_dir()
@@ -3763,11 +3824,32 @@ clean:
                 # here would mean a post_judge failure with no meta — treat as integrity blocker.
                 return RouteDecision("fail_closed", reason="validate_post_judge_violation")
             if failed_substep == "execute":
-                # An execute-substep failure (deterministic) means judge never ran, so there
-                # is no verdict.json. The runner produced bad/missing primary evidence (a
-                # runtime error or a post_execute structural violation), which is a code
-                # defect -> regenerate. Route to Generate deterministically rather than
-                # escalating with no verdict (the judge-centric table can't classify it).
+                # R2: an execute failure now has two kinds, disambiguated by whether execute
+                # authored a verdict.json with a failure_class:
+                #   (a) a per-test PREDICATE failure (physics_fail / structural_violation):
+                #       evidence was structurally valid, but a deterministic predicate over
+                #       diagnostics.json failed, so the judge leaf was intentionally not
+                #       spawned. Attribution (code / ir / spec) needs reasoning, so route to
+                #       the escalate diagnostician in prod (it reads verdict.json#per_test.basis)
+                #       and fail_closed in dev (F1 cross-phase rollback posture). This preserves
+                #       the routing the judge's failure_class x attribution used to drive.
+                verdict = _read_json(self.repo_root / refs.run_node_dir() / "verdict.json") or {}
+                fclass = verdict.get("failure_class")
+                if fclass in ("physics_fail", "structural_violation"):
+                    # A predicate failure is a DIFFERENT class than a no-verdict runner failure,
+                    # so it breaks any run of consecutive no-verdict failures — reset the C2
+                    # counter so it counts only CONSECUTIVE no-verdict execute failures (else a
+                    # physics fail sandwiched between two runner failures would trip the Compile
+                    # reopen one attempt early).
+                    if hasattr(self, "_validate_execute_fail_count"):
+                        self._validate_execute_fail_count[refs.node_key] = 0
+                    if self.workflow_mode == "dev":
+                        return RouteDecision("fail_closed", reason=f"validate_execute_{fclass}")
+                    return RouteDecision("escalate", reason=f"validate_execute_{fclass}")
+                #   (b) a STRUCTURAL/runtime execute failure (no verdict.json): the runner
+                # produced bad/missing primary evidence (a runtime error or a post_execute
+                # structural violation), which is a code defect -> regenerate. Route to Generate
+                # deterministically rather than escalating with no verdict.
                 # Backstop (C2): a Generate restart regenerates the RUNNER, which cannot
                 # fix an IR-rooted structural mismatch (the runner keeps emitting its
                 # natural shape; the IR is the wrong side). Count execute (no-verdict)
@@ -3796,9 +3878,9 @@ clean:
             findings = review.get("findings") or []
             attribution = findings[0].get("attribution") if findings and isinstance(findings[0], dict) else None
             failure_class = verdict.get("failure_class")
-            # G6: the judge substep now fails on `semantic_review.decision == "fail"` even when the
-            # mechanical per_test is clean (a fabrication / consistency finding on passing tests). In
-            # that case `verdict.failure_class` may still be `pass`, and classify_validate_judge would
+            # R2: the judge substep fails on `semantic_review.decision == "fail"` even when the
+            # host-authored (execute) per_test is clean (a fabrication / consistency finding on
+            # passing tests). In that case `verdict.failure_class` is `pass`, and classify_validate_judge would
             # treat `pass` as `advance` — silently dropping the finding and terminalizing the failed
             # phase as a generic `fail`. Route it to the diagnostician instead (it reads
             # semantic_review + verdict and decides reuse/restart/reopen/fail_closed), matching how an

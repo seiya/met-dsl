@@ -5317,6 +5317,11 @@ def _allowed_output_paths_for_launch(
                 # MCP `run_program` / `run_quality_checks` side-effect log
                 # (phase_04_validate.md).
                 "command_log.jsonl",
+                # R2: execute authors verdict.json deterministically (per-test predicate
+                # evaluation of diagnostics.json), so it is part of the execute write-contract
+                # (moved off the judge substep, below). Without this, record_launch for the
+                # deterministic execute substep would reject its own allowed_output_paths.
+                "verdict.json",
             }
             return rel_under_node in allowed_files or rel_under_node.startswith("raw/")
         if step_token == "validate" and substep_token == "judge":
@@ -5339,12 +5344,12 @@ def _allowed_output_paths_for_launch(
             ):
                 return False
             rel_under_node = "/".join(tail_parts[2:])
-            # G6: the judge authors ONLY verdict.json + semantic_review.json. The
-            # deterministically-derivable aggregate_verdict / summary / validate_meta are
-            # conductor-authored in the post_judge substep (see below).
+            # R2: the judge authors ONLY semantic_review.json. verdict.json is host-authored at
+            # execute (per-test predicate evaluation) — removed here so a judge leaf is not even
+            # authorized to overwrite the host-authored verdict. aggregate_verdict / summary /
+            # validate_meta are conductor-authored in the post_judge substep (G6, see below).
             allowed_files = {
                 "semantic_review.json",
-                "verdict.json",
             }
             return rel_under_node in allowed_files
         if step_token == "validate" and substep_token in ("pre_judge", "post_judge"):
