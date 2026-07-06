@@ -135,3 +135,14 @@ specs:
     tests_path: spec/component/demo/dep_chain/demo_dep_top/tests.md
     deps_path: spec/component/demo/dep_chain/demo_dep_top/deps.yaml
     official_releases: []
+
+  - spec_kind: infrastructure
+    spec_id: harness_fortran_cpu
+    spec_version: 0.1.0
+    status: controlled_draft
+    domain: infra
+    family: harness
+    controlled_spec_path: spec/infrastructure/infra/harness/harness_fortran_cpu/controlled_spec.md
+    tests_path: spec/infrastructure/infra/harness/harness_fortran_cpu/tests.md
+    deps_path: spec/infrastructure/infra/harness/harness_fortran_cpu/deps.yaml
+    official_releases: []

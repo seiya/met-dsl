@@ -25523,15 +25523,20 @@ class ChildContextDocSizeTests(unittest.TestCase):
         # Bumped 23450->24400: R5 (M2) — the generate leaf may use a conductor-injected
         # `Certified exemplar` block as structural prior art (not this node's spec; do not copy
         # its physics, do not self-read other nodes' sources).
-        "skills/workflow-generate-generate/SKILL.md": 24400,
+        # Bumped 24400->24700: R1 (M3b) — the "no physics duplication in runner" rule is scoped
+        # for an infrastructure harness node (model publishes plumbing, runner calls it).
+        "skills/workflow-generate-generate/SKILL.md": 24700,
         # Bumped 21400->21700: the test/check target must invoke the runner with
         # `--cases $(SPEC) $(CASES)` (the runner aborts without it; make test must
         # match run_program's argv) after a validate.execute failure where a bare
         # `make test` aborted a `--cases`-only runner (orch_20260629T065607Z_011f8fc6).
+        # Bumped 22300->22500: R1 (M3b) — the "runner aggregated into model calls / no physics
+        # duplication" check is scoped for an infrastructure harness node (verify the self-test
+        # calls the published plumbing, do not fail for "no physics").
         # Bumped 21700->22300: verify must also check argument rank/shape against the
         # published dummy ranks (the rank-2-slice-in-a-loop case), same failure
         # (orch_20260703T065033Z_4be45da7).
-        "skills/workflow-generate-verify/SKILL.md": 22300,
+        "skills/workflow-generate-verify/SKILL.md": 22500,
         # Bumped 10000->10400: documented the verdict.json#per_test entry schema
         # (field name `status`/`outcome` + the pass/fail/xfail/skipped enum, with `blocked`
         # called out as conductor-derived not judge-written) so the judge leaf no longer

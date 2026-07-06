@@ -18,7 +18,7 @@ Fix the generation responsibility of the Generate stage, and create a `Build`-ab
 - The input is `spec.ir.yaml` (the 5 sections `case` / `algorithm` / `impl_defaults` / `io_contract` / `dependency`).
 - Do not take `controlled_spec.md` as direct input. The requirement definition of the operation composition must be interpreted from `spec.ir.yaml.algorithm`.
 - The implementation code separates `model` and `runner`, and the `runner` uses the `model` via `call` / `use` / `import`.
-- Do not duplicate the physics-update logic in the `runner`.
+- Do not duplicate the physics-update logic in the `runner`. (Scope: for an `infrastructure` harness node — `spec_kind: infrastructure` — there is NO physics; the `model` publishes the runner-plumbing operations and the self-test `runner` legitimately CALLS them, so "do not duplicate" here means the runner must not reimplement an operation the `model` publishes — it must `call` it.)
 - When `spec.ir.yaml.impl_defaults.toolchain.language` is a `fortran` / `c` / `cpp` / `mixed` family, an external interpreter such as `python` / `bash` / `sh` / `node` must not be launched from the `runner`.
 - The `model` implements the operation contract of the target `node`, and a fixed-value-return-only, fixed-`JSON`-output-only, or `no-op`-only implementation is forbidden.
 - A `node` that is `problem` and whose `spec_id` includes `2d` or `3d` reads the state-update contract of `spec.ir.yaml.algorithm` as input, and uses `state_variables` for the update computation as required.

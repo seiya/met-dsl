@@ -1,0 +1,5 @@
+spec_id: harness_fortran_cpu
+spec_kind: infrastructure
+dependencies:
+  components: []
+  profiles: []
