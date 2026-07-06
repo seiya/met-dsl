@@ -474,6 +474,29 @@ Cross-ref: D1 (Model B staging), L6 (spec_id basename keying). Tests:
 `ResolveDependencyFactsTests` / `DependencyFactsRenderTests`. **Residual:** billed `--with-deps`
 E2E re-run to confirm the consumer emits the correct order on attempt 1 (operator-gated).
 
+**D5.1 — surface each dummy's rank/type/intent, not only argument order (2026-07-06).**
+The original D5 pinned the argument *order* but `_extract_subroutine_interface` parsed only the
+subroutine *header line* (bare dummy names), so the consumer learned the order yet still guessed
+each dummy's **rank/shape**. Symptom (orch `…065033Z_4be45da7`, `shallow_water2d`): the consumer
+passed its full rank-3 state `u_ext(ncomp,:,:)` to the certified boundary op declared
+`real(dp), intent(inout) :: U(:,:)` (rank-2, a single field) → `Error: Rank mismatch in argument
+'u' (rank-2 and rank-3)` → Build fail → dev `dev_phase_rollback` fail_closed. **Fix (same
+variance-reduction posture — no new gate):** `_extract_subroutine_interface` now also parses the
+body declarations (new `_parse_fortran_dummy_declarations` + `_parse_one_declaration` /
+`_rank_of_shape` helpers) and returns an additive `arguments:[{name,type,intent,rank,dimension}]`
+aligned 1:1 with `argument_order`. `_published_operations_lines` renders a per-dummy line
+(`U: real(dp), intent(inout), rank-2 (:,:)`) and the block header now instructs Generate to MATCH
+each dummy's rank/shape — looping over components and passing lower-rank slices when the dummy is
+lower-rank than the full state array. Omit-on-doubt: an unparseable/conflicting declaration renders
+an explicit "declaration not resolved" marker, never a guessed rank; the datum is orientation-only,
+never a gate; Build's compiler stays the deterministic backstop. Docs: `phase_02_generate.md`
+§ author/§ verify, generate/verify SKILLs (ceilings bumped). Tests: extended
+`ExtractSubroutineInterfaceTests` (assumed-shape/explicit/assumed-size/`dimension`-attr/multi-entity/
+`character(len=*)`/`double precision`/`real*8`/coarray/not-found/conflict), `ResolveDependencyFactsTests`
+(`test_published_operations_carry_rank_for_boundary_op`), `DependencyFactsRenderTests`,
+`WriteLineageTest.test_persists_published_operations_for_fortran_consumer`. **Residual:** billed E2E
+re-run confirming Build passes on attempt 1 (operator-gated).
+
 ## L (latent / low severity — fix opportunistically)
 - **L1 — DONE (2026-06-25).** Generated Makefile emitted a harmless `make` warning
   `target '.' given more than once` for the `$(OBJDIR) $(BINDIR):` rule when `OBJDIR==BINDIR=="."`.

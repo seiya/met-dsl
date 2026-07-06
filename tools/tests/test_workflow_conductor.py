@@ -2700,7 +2700,11 @@ class WriteLineageTest(unittest.TestCase):
             src_dir.mkdir(parents=True)
             (src_dir / "base_model.f90").write_text(
                 "module base_model\ncontains\n"
-                "  subroutine base__scale(x, n, y)\n  end subroutine\n"
+                "  subroutine base__scale(x, n, y)\n"
+                "    integer, intent(in) :: n\n"
+                "    real(8), intent(in) :: x(n)\n"
+                "    real(8), intent(out) :: y(n)\n"
+                "  end subroutine\n"
                 "end module base_model\n", encoding="utf-8")
             rd = pipe / "runs" / "run_20260622_001" / safe
             rd.mkdir(parents=True)
@@ -2714,6 +2718,15 @@ class WriteLineageTest(unittest.TestCase):
             pub = facts[0]["published_operations"]
             self.assertEqual(pub[0]["operation"], "base__scale")
             self.assertEqual(pub[0]["argument_order"], ["x", "n", "y"])
+            # Per-argument type/rank/intent is surfaced and persisted into lineage.
+            self.assertEqual(pub[0]["arguments"], [
+                {"name": "x", "type": "real(8)", "intent": "in",
+                 "rank": 1, "dimension": "n"},
+                {"name": "n", "type": "integer", "intent": "in",
+                 "rank": 0, "dimension": None},
+                {"name": "y", "type": "real(8)", "intent": "out",
+                 "rank": 1, "dimension": "n"},
+            ])
             lin = json.loads((repo / refs.pipeline_ref / "lineage.json").read_text(encoding="utf-8"))
             self.assertEqual(lin["resolved_dependencies"], facts)
 

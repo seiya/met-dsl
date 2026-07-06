@@ -16296,6 +16296,68 @@ class DependencyFactsRenderTests(unittest.TestCase):
             dict(self.BASE, resolved_dependencies=[self.DEP]))
         self.assertNotIn("Published dependency operations", block)
 
+    DEP_WITH_ARG_DETAILS = {
+        **DEP,
+        "published_operations": [
+            {"operation": "bc__apply",
+             "interface": "subroutine bc__apply(U)",
+             "argument_order": ["U"],
+             "arguments": [
+                 {"name": "U", "type": "real(dp)", "intent": "inout",
+                  "rank": 2, "dimension": ":, :"}]},
+        ],
+    }
+
+    def test_published_operations_render_argument_rank_and_shape(self) -> None:
+        from tools.orchestration_runtime import _build_dependency_facts
+
+        block = _build_dependency_facts(
+            dict(self.BASE, resolved_dependencies=[self.DEP_WITH_ARG_DETAILS]))
+        # The rank/shape the consumer's Generate was previously missing is now shown.
+        self.assertIn("U: real(dp), intent(inout), rank-2 (:, :)", block)
+        # New rank/shape-matching instruction is present alongside the retained order rule.
+        self.assertIn("MATCH the dummy's rank and shape", block)
+        self.assertIn("LOOP over the extra component/dimension", block)
+        self.assertIn("EXACTLY this argument order", block)
+
+    def test_published_operations_render_falls_back_to_header_when_no_arguments(self) -> None:
+        # A published op without `arguments` (older/unparseable) renders header-only: no
+        # per-argument lines, fully backward-compatible.
+        from tools.orchestration_runtime import _build_dependency_facts
+
+        block = _build_dependency_facts(
+            dict(self.BASE, resolved_dependencies=[self.DEP_WITH_OPS]))
+        self.assertIn(
+            "- component/demo_dep_base@0.1.0 :: "
+            "subroutine demo_dep_base__scale(x, n, y)", block)
+        # No indented per-argument detail lines are rendered in the fallback path,
+        # and the header does not over-promise a per-argument list that never follows.
+        self.assertNotIn("\n    ", block)
+        self.assertNotIn("listed under its header", block)
+        self.assertIn("EXACTLY this argument order", block)
+
+    def test_published_operations_render_all_unresolved_falls_back_to_header(self) -> None:
+        # `arguments` present but every entry unresolved (rank None) -> header-only order
+        # text, an explicit-unknown marker per arg is suppressed (no known rank at all).
+        from tools.orchestration_runtime import _build_dependency_facts
+
+        dep = {
+            **self.DEP,
+            "published_operations": [
+                {"operation": "o", "interface": "subroutine o(a, b)",
+                 "argument_order": ["a", "b"],
+                 "arguments": [
+                     {"name": "a", "type": None, "intent": None,
+                      "rank": None, "dimension": None},
+                     {"name": "b", "type": None, "intent": None,
+                      "rank": None, "dimension": None}]},
+            ],
+        }
+        block = _build_dependency_facts(
+            dict(self.BASE, resolved_dependencies=[dep]))
+        self.assertNotIn("\n    ", block)
+        self.assertNotIn("listed under its header", block)
+
     def test_render_judge_carries_verdict_path_and_no_dep_does_not(self) -> None:
         from tools.orchestration_runtime import (
             prepare_launch_request_payload,
@@ -16505,6 +16567,49 @@ class ResolveDependencyFactsTests(unittest.TestCase):
             self.assertEqual(pub[0]["operation"], "dep_base__scale")
             self.assertEqual(pub[0]["argument_order"], ["x", "n", "y"])
             self.assertEqual(pub[0]["interface"], "subroutine dep_base__scale(x, n, y)")
+            # The per-argument type/rank/intent now flows through into published_operations.
+            self.assertEqual(pub[0]["arguments"], [
+                {"name": "x", "type": "real(8)", "intent": "in",
+                 "rank": 1, "dimension": "n"},
+                {"name": "n", "type": "integer", "intent": "in",
+                 "rank": 0, "dimension": None},
+                {"name": "y", "type": "real(8)", "intent": "out",
+                 "rank": 1, "dimension": "n"},
+            ])
+
+    _BOUNDARY_MODEL = (
+        "module bc_model\n"
+        "  integer, parameter :: dp = kind(1.0d0)\n"
+        "contains\n"
+        "  subroutine bc__apply(U, nx, ny, ng, guard_pass)\n"
+        "    real(dp), intent(inout) :: U(:, :)\n"
+        "    integer, intent(in) :: nx, ny, ng\n"
+        "    logical, intent(out) :: guard_pass\n"
+        "  end subroutine bc__apply\n"
+        "end module bc_model\n"
+    )
+
+    def test_published_operations_carry_rank_for_boundary_op(self) -> None:
+        # End-to-end reproduction of the Build rank-mismatch: the certified boundary op takes
+        # a rank-2 `U(:,:)`; the consumer must see that (not guess rank-3).
+        from tools.orchestration_runtime import _resolve_dependency_facts
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._write_dep_pipeline(
+                repo_root, "component__bc__0.1.0", "p_20260601_002", "bin_20260601_002",
+                "run_20260601_002", source_id="src_20260601_001", spec_id="bc",
+                model_text=self._BOUNDARY_MODEL)
+            self._write_ir(
+                repo_root, "workspace/ir/component__dep_top__0.1.0/top_001",
+                [{"node_key": "component/bc@0.1.0", "kind": "component",
+                  "operations": ["bc__apply"]}],
+                impl_defaults={"toolchain": {"language": "fortran"}})
+            facts = _resolve_dependency_facts(
+                repo_root, "workspace/ir/component__dep_top__0.1.0/top_001")
+            u = facts[0]["published_operations"][0]["arguments"][0]
+            self.assertEqual(u["name"], "U")
+            self.assertEqual(u["rank"], 2)
+            self.assertEqual(u["intent"], "inout")
 
     def test_non_fortran_consumer_gets_no_interfaces_but_keeps_verdict(self) -> None:
         from tools.orchestration_runtime import _resolve_dependency_facts
@@ -16583,13 +16688,22 @@ class ExtractSubroutineInterfaceTests(unittest.TestCase):
     """_extract_subroutine_interface pins the dependency call-site argument order; robust to
     continuations / comments / prefixes / multiple subroutines; never raises."""
 
+    @staticmethod
+    def _unknown(*names: str) -> list[dict[str, object]]:
+        return [
+            {"name": n, "type": None, "intent": None, "rank": None, "dimension": None}
+            for n in names
+        ]
+
     def test_simple_signature(self) -> None:
         from tools.orchestration_runtime import _extract_subroutine_interface
         src = "subroutine foo__bar(a, b, c)\nend subroutine\n"
+        # No body declarations -> `arguments` carries all-unknown entries (never guessed).
         self.assertEqual(
             _extract_subroutine_interface(src, "foo__bar"),
             {"interface": "subroutine foo__bar(a, b, c)",
-             "argument_order": ["a", "b", "c"]})
+             "argument_order": ["a", "b", "c"],
+             "arguments": self._unknown("a", "b", "c")})
 
     def test_continuation_and_comments(self) -> None:
         from tools.orchestration_runtime import _extract_subroutine_interface
@@ -16617,7 +16731,8 @@ class ExtractSubroutineInterfaceTests(unittest.TestCase):
         self.assertEqual(
             _extract_subroutine_interface(src, "foo__bar"),
             {"interface": "subroutine foo__bar(a, b, c)",
-             "argument_order": ["a", "b", "c"]})
+             "argument_order": ["a", "b", "c"],
+             "arguments": self._unknown("a", "b", "c")})
 
     def test_case_insensitive_and_prefixes(self) -> None:
         from tools.orchestration_runtime import _extract_subroutine_interface
@@ -16643,6 +16758,191 @@ class ExtractSubroutineInterfaceTests(unittest.TestCase):
         self.assertIsNone(
             _extract_subroutine_interface("function f(x)\nend function\n", "f"))
         self.assertIsNone(_extract_subroutine_interface("", "x"))
+
+    # --- dummy-argument type/rank/intent resolution (arguments field) -------------------
+
+    @staticmethod
+    def _args(body: str, arglist: str, op: str = "s"):
+        from tools.orchestration_runtime import _extract_subroutine_interface
+        src = f"subroutine {op}({arglist})\n{body}\nend subroutine\n"
+        out = _extract_subroutine_interface(src, op)
+        assert out is not None
+        return {a["name"]: a for a in out["arguments"]}, out
+
+    def test_arguments_assumed_shape_rank_two(self) -> None:
+        # The real Build failure's dummy: a rank-2 `(:,:)` field.
+        args, _ = self._args("real(dp), intent(inout) :: U(:, :)", "U")
+        self.assertEqual(
+            args["U"],
+            {"name": "U", "type": "real(dp)", "intent": "inout",
+             "rank": 2, "dimension": ":, :"})
+
+    def test_arguments_explicit_shape_rank(self) -> None:
+        args, _ = self._args(
+            "real(8), intent(in) :: x(n)\ninteger, intent(in) :: n\n"
+            "real, intent(out) :: y(nx, ny)", "x, n, y")
+        self.assertEqual(args["x"]["rank"], 1)
+        self.assertEqual(args["n"]["rank"], 0)
+        self.assertEqual(args["y"]["rank"], 2)
+
+    def test_arguments_assumed_size(self) -> None:
+        args, _ = self._args("real :: a(*)\nreal :: b(n, *)", "a, b")
+        self.assertEqual(args["a"]["rank"], 1)
+        self.assertEqual(args["b"]["rank"], 2)
+
+    def test_dimension_attribute_form(self) -> None:
+        args, _ = self._args("real, dimension(:, :), intent(in) :: U", "U")
+        self.assertEqual(args["U"]["rank"], 2)
+        self.assertEqual(args["U"]["intent"], "in")
+
+    def test_multi_entity_per_entity_overrides_dimension(self) -> None:
+        # Bare `a` inherits nothing (rank 0); `b(:,:)` overrides via per-entity shape.
+        args, _ = self._args("real(dp), intent(in) :: a, b(:, :)", "a, b")
+        self.assertEqual(args["a"]["rank"], 0)
+        self.assertEqual(args["b"]["rank"], 2)
+        # With a shared dimension attribute, a bare entity inherits it; a shaped one overrides.
+        args2, _ = self._args("real, dimension(:), intent(in) :: c, d(:, :)", "c, d")
+        self.assertEqual(args2["c"]["rank"], 1)
+        self.assertEqual(args2["d"]["rank"], 2)
+
+    def test_scalar_rank_zero(self) -> None:
+        args, _ = self._args("integer, intent(in) :: n", "n")
+        self.assertEqual(args["n"]["rank"], 0)
+        self.assertIsNone(args["n"]["dimension"])
+
+    def test_character_len_star_not_counted_as_shape(self) -> None:
+        args, _ = self._args("character(len=*), intent(in) :: name", "name")
+        self.assertEqual(args["name"]["type"], "character(len=*)")
+        self.assertEqual(args["name"]["rank"], 0)
+
+    def test_intent_absent_marked_none(self) -> None:
+        args, _ = self._args("real(dp) :: work(:)", "work")
+        self.assertIsNone(args["work"]["intent"])
+        self.assertEqual(args["work"]["rank"], 1)
+
+    def test_legacy_char_star_len_type_text_preserved(self) -> None:
+        args, _ = self._args("character*(*), intent(in) :: s", "s")
+        self.assertEqual(args["s"]["type"], "character*(*)")
+        self.assertEqual(args["s"]["rank"], 0)
+
+    def test_double_precision_and_star_kind(self) -> None:
+        args, _ = self._args(
+            "double precision, intent(out) :: r\nreal*8 :: s(3)", "r, s")
+        self.assertEqual(args["r"]["type"], "double precision")
+        self.assertEqual(args["r"]["rank"], 0)
+        self.assertEqual(args["s"]["type"], "real*8")
+        self.assertEqual(args["s"]["rank"], 1)
+
+    def test_declaration_in_continuation(self) -> None:
+        args, _ = self._args(
+            "real(dp), &\n  intent(in) :: v(:, :)", "v")
+        self.assertEqual(args["v"]["rank"], 2)
+        self.assertEqual(args["v"]["intent"], "in")
+
+    def test_declaration_not_found_marks_unknown(self) -> None:
+        args, _ = self._args("real(dp), intent(in) :: x", "x, missing")
+        self.assertEqual(args["x"]["rank"], 0)
+        self.assertEqual(
+            args["missing"],
+            {"name": "missing", "type": None, "intent": None,
+             "rank": None, "dimension": None})
+
+    def test_conflicting_declarations_marked_unknown(self) -> None:
+        args, _ = self._args("real :: z(:)\nreal :: z(:, :)", "z")
+        self.assertIsNone(args["z"]["rank"])
+
+    def test_coarray_codimension_not_counted(self) -> None:
+        args, _ = self._args("real, intent(in) :: w(:)[*]", "w")
+        self.assertEqual(args["w"]["rank"], 1)
+
+    def test_nested_type_def_does_not_poison_same_named_dummy(self) -> None:
+        # A derived-type component sharing a dummy's name must NOT record the component's
+        # rank for the dummy; the dummy `x` is a scalar type(mytype).
+        args, _ = self._args(
+            "integer, intent(in) :: n\n"
+            "type :: mytype\n  real :: x(3, 3)\nend type mytype\n"
+            "type(mytype), intent(inout) :: x", "x, n")
+        self.assertEqual(args["x"]["rank"], 0)
+        self.assertEqual(args["x"]["type"], "type(mytype)")
+
+    def test_nested_type_def_does_not_drop_later_dummies(self) -> None:
+        # `end type` must not be mistaken for the routine terminator: dummies declared after
+        # a derived-type definition are still resolved.
+        args, _ = self._args(
+            "type :: config_t\n  integer :: nx, ny\nend type config_t\n"
+            "type(config_t), intent(in) :: cfg\nreal, intent(inout) :: u(:, :)", "cfg, u")
+        self.assertEqual(args["u"]["rank"], 2)
+        self.assertEqual(args["cfg"]["rank"], 0)
+
+    def test_assumed_rank_marked_unknown_not_rank_one(self) -> None:
+        # Assumed-rank `(..)` has no statically-known rank -> unknown (None), never a wrong
+        # number (the design forbids emitting a wrong rank).
+        args, _ = self._args("real, intent(in) :: x(..)", "x")
+        self.assertIsNone(args["x"]["rank"])
+        args2, _ = self._args("real, dimension(..), intent(in) :: y", "y")
+        self.assertIsNone(args2["y"]["rank"])
+
+    def test_name_suffixed_end_type_does_not_drop_later_dummies(self) -> None:
+        # `end type config_t` / `endtype config_t` (name-suffixed) must still close the block.
+        body = ("type :: config_t\n  integer :: k\nend type config_t\n"
+                "type(config_t), intent(in) :: cfg\nreal, intent(inout) :: u(:, :)")
+        args, _ = self._args(body, "cfg, u")
+        self.assertEqual(args["u"]["rank"], 2)
+        args2, _ = self._args(body.replace("end type config_t", "endtype config_t"), "cfg, u")
+        self.assertEqual(args2["u"]["rank"], 2)
+
+    def test_enum_def_does_not_drop_later_dummies(self) -> None:
+        # An `enum, bind(c)` spec-part block: its `end enum` must not terminate the scan.
+        args, _ = self._args(
+            "enum, bind(c)\n  enumerator :: red, green\nend enum\n"
+            "real, intent(inout) :: u(:, :)", "u")
+        self.assertEqual(args["u"]["rank"], 2)
+
+    def test_block_construct_local_does_not_shadow_dummy_rank(self) -> None:
+        # An F2008 `block` construct's locals are not dummies: a block-local shadow must not
+        # record a rank for a same-named (here implicitly-typed, unresolved) dummy.
+        args, _ = self._args("block\n  real :: a(3, 3)\nend block", "a")
+        self.assertIsNone(args["a"]["rank"])
+        # A resolved dummy keeps its spec-part rank; the block interior is skipped.
+        args2, _ = self._args(
+            "real, intent(in) :: u(:, :)\nblock\n  real :: u2(9, 9)\nend block", "u")
+        self.assertEqual(args2["u"]["rank"], 2)
+
+    def test_named_block_does_not_drop_later_dummies(self) -> None:
+        args, _ = self._args(
+            "myblk: block\n  real :: t(3, 3)\nend block myblk\n"
+            "real, intent(inout) :: z(:, :)", "z")
+        self.assertEqual(args["z"]["rank"], 2)
+
+    def test_dummy_named_block_still_resolves(self) -> None:
+        # A dummy literally named `block` must not be mistaken for a `block` construct opener.
+        args, _ = self._args("real, intent(in) :: block(:)", "block")
+        self.assertEqual(args["block"]["rank"], 1)
+
+    def test_abstract_interface_block_is_skipped(self) -> None:
+        # `abstract interface` opens an interface block; an inner name colliding with a dummy
+        # must not record the inner rank for the dummy (would be a wrong number).
+        args, _ = self._args(
+            "abstract interface\n  subroutine ai(y)\n    real :: y(:, :, :)\n"
+            "  end subroutine\nend interface\n"
+            "real, intent(in) :: y\nreal, intent(inout) :: z(:, :)", "y, z")
+        self.assertEqual(args["y"]["rank"], 0)
+        self.assertEqual(args["z"]["rank"], 2)
+
+    def test_select_type_guard_not_treated_as_type_def(self) -> None:
+        # `type is (...)` in a select-type construct must not open a definition block; the
+        # dummies declared before it resolve normally.
+        args, _ = self._args(
+            "real, intent(in) :: a(:)\nclass(*), intent(in) :: b\n"
+            "select type(b)\ntype is (integer)\nend select", "a, b")
+        self.assertEqual(args["a"]["rank"], 1)
+        self.assertEqual(args["b"]["rank"], 0)
+
+    def test_arguments_aligned_to_argument_order(self) -> None:
+        _, out = self._args(
+            "real(dp), intent(inout) :: U(:, :)\ninteger, intent(in) :: nx, ny", "U, nx, ny")
+        self.assertEqual([a["name"] for a in out["arguments"]], out["argument_order"])
+        self.assertEqual(len(out["arguments"]), len(out["argument_order"]))
 
 
 class AccessLogWritableBindTests(unittest.TestCase):
@@ -25152,12 +25452,21 @@ class ChildContextDocSizeTests(unittest.TestCase):
         # generate.generate no longer force-reads) to avoid a lint/build round-trip.
         # Bumped 22400->22700: test/check target must invoke the runner with
         # `--cases $(SPEC) $(CASES)` (orch_20260629T065607Z_011f8fc6).
-        "skills/workflow-generate-generate/SKILL.md": 22700,
+        # Bumped 22700->23300: dependency call-sites must match each dummy's declared
+        # rank/shape (now surfaced in <dependency_facts>), incl. the loop-over-components
+        # + rank-2-slice rule for a lower-rank dummy, after a Build rank-mismatch where the
+        # consumer passed a rank-3 state to a rank-2 `U(:,:)` op (orch_20260703T065033Z_4be45da7).
+        # Bumped 23300->23450: the unresolved-rank fallback must NOT direct a read of the
+        # dependency source (outside a leaf's read scope) — pass per role + let Build verify.
+        "skills/workflow-generate-generate/SKILL.md": 23450,
         # Bumped 21400->21700: the test/check target must invoke the runner with
         # `--cases $(SPEC) $(CASES)` (the runner aborts without it; make test must
         # match run_program's argv) after a validate.execute failure where a bare
         # `make test` aborted a `--cases`-only runner (orch_20260629T065607Z_011f8fc6).
-        "skills/workflow-generate-verify/SKILL.md": 21700,
+        # Bumped 21700->22300: verify must also check argument rank/shape against the
+        # published dummy ranks (the rank-2-slice-in-a-loop case), same failure
+        # (orch_20260703T065033Z_4be45da7).
+        "skills/workflow-generate-verify/SKILL.md": 22300,
         # Bumped 10000->10400: documented the verdict.json#per_test entry schema
         # (field name `status`/`outcome` + the pass/fail/xfail/skipped enum, with `blocked`
         # called out as conductor-derived not judge-written) so the judge leaf no longer

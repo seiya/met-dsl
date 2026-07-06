@@ -964,7 +964,7 @@ def _extract_subroutine_interface(source_text: str, op_name: str) -> dict[str, A
         if buf.strip():
             logical.append(buf.strip())
         # 2) Find the `subroutine <op_name>(...)` header among possibly several.
-        for line in logical:
+        for idx, line in enumerate(logical):
             m = _FORTRAN_SUBROUTINE_RE.match(line)
             if m is None or m.group("name").lower() != op_name.lower():
                 continue
@@ -984,7 +984,24 @@ def _extract_subroutine_interface(source_text: str, op_name: str) -> dict[str, A
             inner = line[open_idx + 1:close_idx]
             args = [a.strip() for a in inner.split(",") if a.strip()]
             header = line[: close_idx + 1].strip()
-            return {"interface": header, "argument_order": args}
+            # 3) Resolve each dummy's declared type/intent/rank from the body (orientation
+            #    for the consumer's call authoring; best-effort, unknown when unparseable).
+            decls = _parse_fortran_dummy_declarations(logical, idx, args)
+            arguments = [
+                {
+                    "name": a,
+                    **decls.get(
+                        a.lower(),
+                        {"type": None, "intent": None, "rank": None, "dimension": None},
+                    ),
+                }
+                for a in args
+            ]
+            return {
+                "interface": header,
+                "argument_order": args,
+                "arguments": arguments,
+            }
         return None
     except Exception:
         return None
@@ -1002,6 +1019,326 @@ def _strip_fortran_comment(line: str) -> str:
         elif ch == "!":
             return line[:i]
     return line
+
+
+# Type keywords that open a Fortran declaration. `double precision` is two words and must be
+# matched before `real`-style single tokens. Case-insensitive at the call site.
+_FORTRAN_TYPE_KEYWORDS = (
+    "double precision",
+    "real",
+    "integer",
+    "logical",
+    "complex",
+    "character",
+    "type",
+    "class",
+)
+
+
+def _split_top_level_commas(text: str) -> list[str]:
+    """Split `text` on commas at paren/bracket depth 0 (nested `(...)`/`[...]` kept intact)."""
+    parts: list[str] = []
+    depth = 0
+    buf = ""
+    for ch in text:
+        if ch in "([":
+            depth += 1
+            buf += ch
+        elif ch in ")]":
+            depth -= 1
+            buf += ch
+        elif ch == "," and depth == 0:
+            parts.append(buf)
+            buf = ""
+        else:
+            buf += ch
+    parts.append(buf)
+    return parts
+
+
+def _rank_of_shape(shape: str) -> int | None:
+    """Rank implied by a Fortran array-spec string: depth-aware count of top-level, non-empty
+    comma segments. A trailing coarray codimension `[...]` does not add array rank. Returns
+    ``None`` for an assumed-rank dummy ``(..)`` — its rank is not statically known, so
+    omit-on-doubt (never emit a wrong number).
+
+    `:,:`->2, `nx,ny`->2, `n`->1, `*`->1, `n,*`->2, `size(x),n`->2, empty->0, `..`->None.
+    """
+    s = shape.strip()
+    if s.endswith("]") and "[" in s:
+        s = s[: s.rindex("[")].strip()
+    if not s:
+        return 0
+    segs = [seg.strip() for seg in _split_top_level_commas(s) if seg.strip()]
+    if any(seg == ".." for seg in segs):
+        return None
+    return len(segs)
+
+
+def _paren_inner(text: str) -> str | None:
+    """Content of the first balanced `(...)` group at the start of `text` (leading spaces
+    allowed), or ``None`` when `text` does not open with a balanced paren group."""
+    s = text.lstrip()
+    if not s.startswith("("):
+        return None
+    depth = 0
+    for i, ch in enumerate(s):
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth == 0:
+                return s[1:i]
+    return None
+
+
+def _split_first_double_colon(line: str) -> tuple[str | None, str]:
+    """Split `line` on the first `::` at paren/bracket depth 0. Returns ``(None, line)`` when
+    there is no top-level `::`."""
+    depth = 0
+    i = 0
+    while i < len(line) - 1:
+        ch = line[i]
+        if ch in "([":
+            depth += 1
+        elif ch in ")]":
+            depth -= 1
+        elif ch == ":" and line[i + 1] == ":" and depth == 0:
+            return line[:i], line[i + 2:]
+        i += 1
+    return None, line
+
+
+def _consume_type_spec(left: str, type_kw: str) -> tuple[str, str]:
+    """Given a declaration LEFT side starting with `type_kw`, split off the verbatim type-spec
+    (keyword + immediately-adjacent `(kind/len)` or legacy `*N`) from the trailing attributes.
+
+    Returns ``(type_text, rest)``; `rest` still leads with the attribute list (typically a
+    leading comma). `character(len=*)` keeps its parens as PART OF THE TYPE, never a shape.
+    """
+    idx = len(type_kw)
+    rest = left[idx:]
+    stripped = rest.lstrip()
+    lead_ws = rest[: len(rest) - len(stripped)]
+    if stripped.startswith("("):
+        inner = _paren_inner(stripped)
+        if inner is not None:
+            plen = len(inner) + 2
+            type_text = left[:idx] + lead_ws + stripped[:plen]
+            return type_text.strip(), stripped[plen:]
+    elif stripped.startswith("*"):
+        after_star = stripped[1:].lstrip()
+        # legacy `*(*)` / `*(len)` char-length spec — keep the parens as part of the type.
+        if after_star.startswith("("):
+            inner = _paren_inner(after_star)
+            if inner is not None:
+                star_ws = stripped[1: len(stripped) - len(after_star)]
+                consumed = "*" + star_ws + after_star[: len(inner) + 2]
+                type_text = left[:idx] + lead_ws + consumed
+                return type_text.strip(), after_star[len(inner) + 2:]
+        # legacy `*N` kind/length.
+        m = re.match(r"\*\s*\d+", stripped)
+        if m:
+            type_text = left[:idx] + lead_ws + m.group(0)
+            return type_text.strip(), stripped[m.end():]
+    return left[:idx].strip(), rest
+
+
+def _is_type_def_open(low: str) -> bool:
+    """True when a lowercased logical line OPENS a derived-type definition block
+    (``type :: t`` / ``type, bind(c) :: t`` / obsolescent ``type t``), as opposed to a
+    variable declaration ``type(foo) :: x`` or a ``type is (...)`` select-type guard."""
+    if not low.startswith("type"):
+        return False
+    rest = low[4:]
+    if not rest:
+        return True                      # bare `type` (defensive)
+    if rest[0] == "(":
+        return False                     # `type(foo) :: x` — a variable declaration
+    if rest[0] in ",:":
+        return True                      # `type, ... :: t` / `type :: t`
+    if rest[0] == " ":
+        nxt = rest.strip()
+        # `type is (...)` / `type is(...)` is a select-type guard, not a definition.
+        if nxt.startswith("is") and (len(nxt) == 2 or not (nxt[2].isalnum() or nxt[2] == "_")):
+            return False
+        return True                      # `type name` (obsolescent definition form)
+    return False
+
+
+def _is_enum_open(low: str) -> bool:
+    """True when a lowercased logical line OPENS an ``enum, bind(c)`` definition block —
+    distinct from an ``enumerator`` statement (which also starts with ``enum``)."""
+    return low == "enum" or low.startswith("enum,") or low.startswith("enum ")
+
+
+def _is_block_open(low: str) -> bool:
+    """True when a lowercased logical line OPENS an F2008 ``block`` construct (with an optional
+    construct label ``name: block``) — distinct from a ``block data`` program unit or an
+    identifier that merely starts with ``block``."""
+    m = re.match(r"(?:[a-z]\w*\s*:\s*)?block\b", low)
+    if m is None:
+        return False
+    return not (low.startswith("blockdata") or low.startswith("block data"))
+
+
+def _parse_one_declaration(
+    line: str,
+) -> tuple[str, str | None, list[tuple[str, int | None, str | None]]] | None:
+    """Parse a Fortran type-declaration statement into ``(type_text, intent, entities)`` where
+    `entities` is ``[(name, rank, dimension), ...]``. Returns ``None`` when `line` is not a
+    confidently-parseable type declaration (no top-level `::`, or the leading token is not a
+    recognized type keyword). Never raises for a parse miss — the caller treats it as unknown.
+    """
+    if "::" not in line:
+        return None
+    left, right = _split_first_double_colon(line)
+    if left is None:
+        return None
+    low_left = left.strip().lower()
+    type_kw = None
+    for kw in _FORTRAN_TYPE_KEYWORDS:
+        if (
+            low_left == kw
+            or low_left.startswith(kw + " ")
+            or low_left.startswith(kw + "(")
+            or low_left.startswith(kw + "*")
+            or low_left.startswith(kw + ",")
+        ):
+            type_kw = kw
+            break
+    if type_kw is None:
+        return None
+    type_text, rest = _consume_type_spec(left.strip(), type_kw)
+    intent: str | None = None
+    shared_shape: str | None = None
+    for attr in _split_top_level_commas(rest):
+        al = attr.strip().lower()
+        if al.startswith("intent"):
+            m = re.search(r"intent\s*\(\s*(in\s*out|inout|in|out)\s*\)", al)
+            if m:
+                intent = m.group(1).replace(" ", "")
+        elif al.startswith("dimension"):
+            inner = _paren_inner(attr.strip()[len("dimension"):])
+            if inner is not None:
+                shared_shape = inner
+    # `has_dim_attr` distinguishes "no dimension attribute" (a bare entity is a scalar, rank 0)
+    # from "dimension attribute present but its rank is unknown" (e.g. `dimension(..)` -> None).
+    has_dim_attr = shared_shape is not None
+    shared_rank = _rank_of_shape(shared_shape) if has_dim_attr else None
+    entities: list[tuple[str, int | None, str | None]] = []
+    for ent in _split_top_level_commas(right):
+        ent = ent.strip()
+        if not ent:
+            continue
+        mname = re.match(r"([A-Za-z]\w*)", ent)
+        if not mname:
+            continue
+        name = mname.group(1)
+        after = ent[mname.end():].lstrip()
+        if after.startswith("("):
+            shape = _paren_inner(after)
+            if shape is not None:
+                entities.append((name, _rank_of_shape(shape), shape))
+                continue
+        if has_dim_attr:
+            entities.append((name, shared_rank, shared_shape))
+        else:
+            entities.append((name, 0, None))
+    if not entities:
+        return None
+    return type_text, intent, entities
+
+
+def _parse_fortran_dummy_declarations(
+    logical: list[str], header_idx: int, argument_order: list[str]
+) -> dict[str, dict[str, Any]]:
+    """Resolve each dummy argument's declared ``{type, intent, rank, dimension}`` from the
+    subroutine-body statements in `logical` following `header_idx`.
+
+    Best-effort / never raises. Omit-on-doubt: a dummy whose declaration cannot be confidently
+    parsed, or that is declared twice with a CONFLICTING rank, is left out of the returned map
+    (the caller renders it as unknown). Only names in `argument_order` are recorded. A nested
+    ``interface`` block and a derived-type definition (``type :: t`` … ``end type``) in the
+    specification part are skipped — both declare names that are NOT this routine's dummies (an
+    inner name colliding with a dummy must not poison it, and an ``end type`` must not be
+    mistaken for the routine terminator). Scanning stops at the routine's ``contains`` / ``end``
+    boundary.
+    """
+    wanted = {a.lower() for a in argument_order}
+    resolved: dict[str, dict[str, Any]] = {}
+    conflicted: set[str] = set()
+    try:
+        in_interface = 0
+        in_type_def = 0
+        in_block = 0
+        for line in logical[header_idx + 1:]:
+            low = line.strip().lower()
+            if not low:
+                continue
+            # `abstract interface` opens an interface block too (its procedures' dummies are
+            # NOT this routine's) — strip the `abstract` prefix before the opener test.
+            tok = low[len("abstract "):].lstrip() if low.startswith("abstract ") else low
+            if tok.startswith("interface") and not tok.startswith("interface("):
+                in_interface += 1
+                continue
+            if low.startswith("end interface") or low.startswith("endinterface"):
+                in_interface = max(0, in_interface - 1)
+                continue
+            if in_interface:
+                continue
+            # A derived-type / enum DEFINITION block declares components/enumerators, not this
+            # routine's dummies. Skip its interior and, crucially, its `end type` / `end enum`
+            # (else the terminator break below would stop the scan before later dummies / would
+            # record an inner name's rank for a same-named dummy).
+            if (
+                low.startswith("end type") or low.startswith("endtype")
+                or low.startswith("end enum") or low.startswith("endenum")
+            ):
+                in_type_def = max(0, in_type_def - 1)
+                continue
+            if _is_type_def_open(low) or _is_enum_open(low):
+                in_type_def += 1
+                continue
+            if in_type_def:
+                continue
+            # An F2008 `block` construct's local declarations are NOT dummies (a dummy can only
+            # be declared in the specification part). Skip its interior and its `end block` so a
+            # block-local name never shadows a dummy's rank and `end block` is not mistaken for
+            # the routine terminator. Handles an optional construct label `name: block`.
+            if low.startswith("end block") or low.startswith("endblock"):
+                in_block = max(0, in_block - 1)
+                continue
+            if _is_block_open(low):
+                in_block += 1
+                continue
+            if in_block:
+                continue
+            head_tok = low.split("(", 1)[0].split()[0] if low.split() else ""
+            if head_tok in ("end", "endsubroutine", "endfunction", "contains"):
+                break
+            parsed = _parse_one_declaration(line)
+            if parsed is None:
+                continue
+            decl_type, intent, entities = parsed
+            for name, rank, dim in entities:
+                lname = name.lower()
+                if lname not in wanted or lname in conflicted:
+                    continue
+                prev = resolved.get(lname)
+                if prev is not None and prev.get("rank") != rank:
+                    del resolved[lname]
+                    conflicted.add(lname)
+                    continue
+                resolved[lname] = {
+                    "type": decl_type,
+                    "intent": intent,
+                    "rank": rank,
+                    "dimension": dim,
+                }
+    except Exception:
+        return resolved
+    return resolved
 
 
 def _resolve_dependency_facts(repo_root: Path, ir_ref: Any) -> list[dict[str, Any]]:
@@ -8552,6 +8889,7 @@ def _published_operations_lines(deps: list[Any]) -> list[str]:
     conductor-resolved orientation, never itself a gate.
     """
     rows: list[str] = []
+    any_detail = False
     for dep in deps:
         if not isinstance(dep, dict):
             continue
@@ -8566,17 +8904,90 @@ def _published_operations_lines(deps: list[Any]) -> list[str]:
             if not iface:
                 continue
             rows.append(f"- {node_key} :: {iface}")
+            detail = _argument_detail_lines(op.get("arguments"))
+            if detail:
+                any_detail = True
+                rows.extend(detail)
     if not rows:
         return []
-    return [
-        "**Published dependency operations (conductor-resolved from each dependency's "
-        "CERTIFIED source — the exact source Build will compile/link):** Fortran arguments "
-        "are positional; call each operation with EXACTLY this argument order. A wrong "
-        "order builds against a type/rank mismatch and fails the build (routed back to "
-        "Generate). For generate.generate this is authoring-binding; for verify/validate "
-        "it is the authoritative order to check the emitted `call` against.",
-        *rows,
-    ]
+    # The rank/shape guidance is only added when per-argument detail lines are actually
+    # rendered — otherwise (older lineage without `arguments`, or all-unresolved ops) the
+    # header would promise a per-argument list that does not follow.
+    if any_detail:
+        header = (
+            "**Published dependency operations (conductor-resolved from each dependency's "
+            "CERTIFIED source — the exact source Build will compile/link):** Fortran arguments "
+            "are positional; call each operation with EXACTLY this argument order. Each dummy "
+            "argument's declared type, intent, and rank/shape is listed under its header — the "
+            "actual argument you pass must MATCH the dummy's rank and shape. When a dummy is "
+            "lower-rank than your full state array (e.g. a rank-2 `(:,:)` dummy vs. your rank-3 "
+            "`(ncomp,:,:)` state), LOOP over the extra component/dimension and pass lower-rank "
+            "slices; do NOT pass the whole higher-rank array. A wrong order OR a rank/shape "
+            "mismatch builds against a type/rank mismatch and fails the build (routed back to "
+            "Generate). For generate.generate this is authoring-binding; for verify/validate "
+            "it is the authoritative order to check the emitted `call` against."
+        )
+    else:
+        header = (
+            "**Published dependency operations (conductor-resolved from each dependency's "
+            "CERTIFIED source — the exact source Build will compile/link):** Fortran arguments "
+            "are positional; call each operation with EXACTLY this argument order. A wrong "
+            "order builds against a type/rank mismatch and fails the build (routed back to "
+            "Generate). For generate.generate this is authoring-binding; for verify/validate "
+            "it is the authoritative order to check the emitted `call` against."
+        )
+    return [header, *rows]
+
+
+def _argument_detail_lines(arguments: Any) -> list[str]:
+    """Render indented per-dummy-argument ``type / intent / rank-N (shape)`` lines for one
+    published operation, or ``[]`` when `arguments` is absent or every entry is unresolved
+    (fully backward-compatible header-only fallback). Orientation-only: an unresolved rank is
+    marked explicitly and NEVER implied as a number.
+    """
+    if not isinstance(arguments, list) or not arguments:
+        return []
+    # A resolved rank is a plain int (bool excluded); anything else is treated as unknown so a
+    # malformed/hand-edited entry can never render a garbage `rank-<x>` line.
+    def _known_rank(a: Any) -> bool:
+        return isinstance(a, dict) and isinstance(a.get("rank"), int) and not isinstance(
+            a.get("rank"), bool)
+
+    if not any(_known_rank(a) for a in arguments):
+        return []
+    lines: list[str] = []
+    for arg in arguments:
+        if not isinstance(arg, dict):
+            continue
+        name = str(arg.get("name", "")).strip()
+        if not name:
+            continue
+        if not _known_rank(arg):
+            # Rank could not be resolved host-side. Do NOT tell the leaf to read the
+            # dependency source — a dependency's pipeline is outside a leaf's read scope
+            # (allowed_read_roots covers only its own ir_ref/pipeline_ref). Give an
+            # actionable fallback instead: pass the argument per the operation's role and
+            # let Build's compiler verify the final rank.
+            lines.append(
+                f"    {name}: (rank/shape not resolved — pass this argument per the "
+                "operation's role; Build verifies the final rank)"
+            )
+            continue
+        rank = arg.get("rank")
+        parts: list[str] = []
+        atype = str(arg.get("type") or "").strip()
+        if atype:
+            parts.append(atype)
+        intent = arg.get("intent")
+        if intent:
+            parts.append(f"intent({intent})")
+        if rank == 0:
+            parts.append("rank-0 (scalar)")
+        else:
+            dim = str(arg.get("dimension") or "").strip()
+            parts.append(f"rank-{rank} ({dim})" if dim else f"rank-{rank}")
+        lines.append(f"    {name}: " + ", ".join(parts))
+    return lines
 
 
 def _template_placeholder_values(request_payload: dict[str, Any]) -> dict[str, str]:
