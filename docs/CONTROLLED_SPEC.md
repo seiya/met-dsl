@@ -9,14 +9,15 @@ The `Controlled Spec` is the project's **sole physics-specification canonical so
 This project divides the specification into the following 2 layers.
 
 1. `Controlled Spec` (this document)
-- The `Controlled Spec` has a `spec_kind` and is classified into the 3 kinds `problem` / `component` / `profile`.
+- The `Controlled Spec` has a `spec_kind` and is classified into the 4 kinds `problem` / `component` / `profile` / `infrastructure`.
 - `problem` defines the equation system to be integrated and the runtime input contract, and references the dependent `component` and adopted `profile`.
 - `component` defines the input/output contract of a reusable physics operation and the published `operation`.
 - `profile` defines the selection rules and parameter constraints for a `component`.
+- `infrastructure` (R1 harness) defines the shared runner plumbing (argv/case parsing, case-loop driver, JSON/snapshot/perf emission) as a certified node per `(language, hardware)` target, carrying no physics.
 
 2. `tests` (`tests.md`)
 - It describes the input conditions used in verification (initial conditions, execution conditions, case expansion) and the judgment thresholds.
-- `tests` applies to all of `problem` / `component` / `profile`.
+- `tests` applies to all of `problem` / `component` / `profile` / `infrastructure`.
 - The description discipline uses `TESTS.md` as the canonical source and is defined natural-language-first.
 
 Note:
@@ -123,6 +124,28 @@ Place **0. Meta information** at the top. The subsequent sections are fixed per 
 - Required statement: state the correspondence rule for the keys and values fixed into the `case` section of `spec.ir.yaml`.
 
 6. **tests reference**
+- Required statement: state the reference path of the corresponding `tests.md` and the `test_profile_version`.
+
+### Required sections of an `infrastructure spec` (R1 harness)
+1. **Responsibility and scope**
+- Required statement: state the runner plumbing this harness provides (argv/`--cases` parsing, the case-loop driver, JSON/snapshot/perf/`metrics_basis` emission) and the `(language, hardware)` target it serves; state explicitly that it carries no physics.
+
+2. **Published harness API contract**
+- Required statement: state the `<spec_id>__*` operations a physics-node runner calls (e.g. case-set parse, per-case snapshot/JSON writers, rank-N array emitters, perf/diagnostics/metrics_basis writers), with each operation's argument roles.
+
+3. **Runner output contract produced**
+- Required statement: state the `diagnostics.json` / `perf.json` / `raw/*` (snapshot / `metrics_basis.json`) shapes the harness emits, and the numeric/boolean descriptor rules (per `docs/workflow/RUNNER_OUTPUT_CONTRACT.md`).
+
+4. **Failure conditions and constraints**
+- Required statement: state the guard behaviors (e.g. missing `--cases` aborts) and the invariants the harness enforces.
+
+5. **Prohibitions**
+- Required statement: state what the harness must NOT do (embed physics, write `verdict.json` / `aggregate_verdict.json` / `summary.json` / `trial_meta.json`, hard-code case-specific values).
+
+6. **Traceability**
+- Required statement: state the correspondence rule for the keys and values fixed into `spec.ir.yaml`.
+
+7. **tests reference**
 - Required statement: state the reference path of the corresponding `tests.md` and the `test_profile_version`.
 
 ## Usage criteria for structured blocks

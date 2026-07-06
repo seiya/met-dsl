@@ -24066,6 +24066,10 @@ class FreshLeafLaunchableWithoutPyYAMLTests(unittest.TestCase):
             b"dependencies:\n  components: []\n  profiles: []\n",
             b"dependencies:\n  profiles: []\n  components: []\n",
             b"# leading comment\ndependencies:\n  components: []\n  profiles: []\n",
+            # M3a: the optional empty `infrastructure` key is still a canonical leaf (any order),
+            # so an R1 leaf stays launchable under the PyYAML-unavailable byte path.
+            b"dependencies:\n  components: []\n  profiles: []\n  infrastructure: []\n",
+            b"dependencies:\n  infrastructure: []\n  profiles: []\n  components: []\n",
         ]
         for sample in good:
             self.assertTrue(_deps_yaml_bytes_are_canonical_empty(sample), sample)
@@ -24078,6 +24082,12 @@ class FreshLeafLaunchableWithoutPyYAMLTests(unittest.TestCase):
             b"spec_id: x\ndependencies:\n  components: []\n  profiles: []\n",
             b"",
             b"dependencies:\n",
+            # M3a: a POPULATED infrastructure list is not a leaf; a duplicate key, a missing
+            # required key, and an unknown key must all still fall through to full parse.
+            b"dependencies:\n  components: []\n  profiles: []\n  infrastructure:\n    - infrastructure_id: harness_fortran_cpu\n",
+            b"dependencies:\n  components: []\n  profiles: []\n  widgets: []\n",
+            b"dependencies:\n  components: []\n  infrastructure: []\n",  # missing required profiles
+            b"dependencies:\n  components: []\n  components: []\n  profiles: []\n",  # duplicate
         ]
         for sample in bad:
             self.assertFalse(_deps_yaml_bytes_are_canonical_empty(sample), sample)
@@ -26756,6 +26766,46 @@ class ModelResolutionTests(unittest.TestCase):
             home = Path(tmp)
             self.assertIsNone(resolve_claude_model_from_transcript("nope", home))
             self.assertIsNone(resolve_claude_model_from_transcript("", home))
+
+
+class InfrastructureSpecKindTests(unittest.TestCase):
+    """M3a (R1): the new `infrastructure` spec_kind — deps.yaml gains an OPTIONAL
+    `infrastructure` dependency key, and node_key parsing is kind-agnostic."""
+
+    def test_deps_infrastructure_key_optional(self) -> None:
+        from tools.orchestration_runtime import _parse_dep_entries
+        # existing shape (no infrastructure) stays well-formed — no migration needed
+        self.assertEqual(_parse_dep_entries({"dependencies": {"components": [], "profiles": []}}),
+                         ([], True))
+        # an infrastructure dependency parses as an `infrastructure`-kind entry
+        entries, ok = _parse_dep_entries({"dependencies": {
+            "components": [], "profiles": [],
+            "infrastructure": [{"infrastructure_id": "harness_fortran_cpu",
+                                "version_constraint": ">=0.1.0 <1.0.0"}]}})
+        self.assertTrue(ok)
+        self.assertEqual(entries, [("infrastructure", "harness_fortran_cpu", ">=0.1.0 <1.0.0")])
+
+    def test_deps_still_rejects_unknown_key_and_missing_required(self) -> None:
+        from tools.orchestration_runtime import _parse_dep_entries
+        # unknown key still fail-closed
+        self.assertEqual(
+            _parse_dep_entries({"dependencies": {"components": [], "profiles": [], "widgets": []}})[1],
+            False)
+        # a required key still cannot be missing (infrastructure does NOT substitute for it)
+        self.assertEqual(
+            _parse_dep_entries({"dependencies": {"components": [],
+                                                 "infrastructure": []}})[1], False)
+        # infrastructure present but not a list -> malformed
+        self.assertEqual(
+            _parse_dep_entries({"dependencies": {"components": [], "profiles": [],
+                                                 "infrastructure": {}}})[1], False)
+
+    def test_node_key_parse_accepts_infrastructure(self) -> None:
+        from tools.orchestration_runtime import _parse_node_key_strict, _node_key_to_safe
+        self.assertEqual(_parse_node_key_strict("infrastructure/harness_fortran_cpu@0.1.0"),
+                         ("infrastructure", "harness_fortran_cpu", "0.1.0"))
+        self.assertEqual(_node_key_to_safe("infrastructure/harness_fortran_cpu@0.1.0"),
+                         "infrastructure__harness_fortran_cpu__0.1.0")
 
 
 class R5ExemplarSelectorTests(unittest.TestCase):

@@ -52,7 +52,7 @@ Group findings by severity:
 2. `deps.yaml` states `spec_id` and `spec_kind`.
 3. `tests.md §0` states `test_profile_id`, `test_profile_version`, `status`, and the `spec_ref` fields (`spec_kind`, `spec_id`, `spec_version`, `controlled_spec_path`).
 4. `spec_id` matches the form `^[a-z][a-z0-9_]{2,63}$`; for a `component` spec, also check the recommended form `<domain>_<family>_<operator>_<dim>d_<scheme>` (recommendation → `info`, not a `blocker`).
-5. `spec_kind` is one of `problem` / `component` / `profile`.
+5. `spec_kind` is one of `problem` / `component` / `profile` / `infrastructure` (`infrastructure` = the R1 harness node kind).
 6. `domain` / `family` match the classification vocabulary in `docs/GLOSSARY.md`.
 
 ### C. Cross-file consistency (contradictions)
@@ -68,6 +68,7 @@ Confirm every required section for the declared `spec_kind` exists and is non-em
 - `problem`: sections 1–10 (Problem definition; Variables and coordinates; Domain and boundary-condition types; Dependent `component` and adopted `profile`; Integration algorithm; Model parameters and runtime input contract; Prohibitions; Traceability; tests reference; AD preparation information).
 - `component`: sections 1–9 (Responsibility and scope; input/output contract; Operation definition; Failure conditions and constraints; Public API and compatibility; Prohibitions; Traceability; tests reference; AD preparation information).
 - `profile`: sections 1–6 (Target `component` and compatibility range; Selection rules; Parameter constraints; Fallback rules; Traceability; tests reference).
+- `infrastructure` (R1 harness): sections 1–7 (Responsibility and scope — the runner plumbing it provides; Published harness API contract — the `<spec_id>__*` operations physics-node runners call; Runner output contract produced — the `diagnostics.json` / `perf.json` / `raw/*` shapes it emits; Failure conditions and constraints; Prohibitions; Traceability; tests reference), per `docs/CONTROLLED_SPEC.md`.
 
 A missing required section is a `blocker`. A section present but empty or a stub is a `warning`.
 
@@ -79,10 +80,11 @@ A missing required section is a `blocker`. A section present but empty or a stub
    - `component`: each published `operation` has at least one normal case and one guard case (`fail` / `xfail`).
    - `profile`: tests cover the selection-establishment, exclusion, and fallback-prohibition conditions, plus a guard case for out-of-compatibility input.
    - `problem`: execution control, case expansion, judgment expressions, and pass/fail aggregation rules are defined; a non-applicable validity item defines `N/A` and `reason_na`.
+   - `infrastructure` (R1 harness): each published harness operation has at least one normal case and one guard case (`fail` / `xfail`) — e.g. numeric-round-trip, boolean-literal, case fan-out → per-case snapshot naming, missing-`--cases` guard, per-test index completeness.
 5. Every `xfail` defines both `xfail_condition` and `pass_when`.
 
 ### F. deps.yaml and dependency resolvability
-1. `deps.yaml` declares the `dependencies` block with `components` and `profiles` lists (empty lists are valid for a leaf `component`).
+1. `deps.yaml` declares the `dependencies` block with `components` and `profiles` lists (empty lists are valid for a leaf `component`); it MAY additionally carry an optional `infrastructure` list (the R1 harness dependency each physics node's runner is built against). An `infrastructure` spec itself is typically a leaf (empty `components`/`profiles`).
 2. A `problem` spec declares its dependent `component`s and its adopted `profile`(s) (`docs/SPEC.md` req. 10). A `problem` with an empty `components` list is a `blocker`.
 3. Each declared `component_id` / `profile_id` carries a `version_constraint`.
 4. Each declared dependency is registered in `spec/registry/spec_catalog.yaml` and its files exist on disk. An unregistered or missing dependency is a `blocker` (`docs/SPEC.md` req. 11).

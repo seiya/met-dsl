@@ -3,8 +3,8 @@
 This document set is organized so that "the reading order = the way to proceed".
 
 ## Shortest reading order
-1. `SPEC.md` (invariant principles, final goal, `spec_kind` 3-layer design)
-2. `CONTROLLED_SPEC.md` (format and required items for `problem` / `component` / `profile`)
+1. `SPEC.md` (invariant principles, final goal, `spec_kind` design)
+2. `CONTROLLED_SPEC.md` (format and required items for `problem` / `component` / `profile` / `infrastructure`)
 3. `TESTS.md` (format and required items for `tests`)
 4. `PHYSICAL_VALIDATION.md` (requirements for physical-validity judgment)
 5. `GLOSSARY.md` (`Artifacts` / `terms`)

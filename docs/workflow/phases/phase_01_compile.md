@@ -22,7 +22,7 @@ schema_version: "1.0"
 
 meta:
   node_key: "<spec_kind>/<spec_id>@<spec_version>"
-  spec_kind: "<problem|component|profile>"
+  spec_kind: "<problem|component|profile|infrastructure>"
   spec_id: "<spec_id>"
   spec_version: "<semver>"
   source_refs:
@@ -149,7 +149,7 @@ dependency:
   node_key: "<spec_kind>/<spec_id>@<spec_version>"
   direct_deps:
     - node_key: "<spec_kind>/<spec_id>@<spec_version>"
-      kind: "<component|profile|problem>"
+      kind: "<component|profile|problem|infrastructure>"
       operations: ["<operation_id>", ...]
 ```
 

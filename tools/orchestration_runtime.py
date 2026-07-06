@@ -137,20 +137,26 @@ def _read_deps_yaml(repo_root: Path, spec_ref: Any) -> dict[str, Any] | None:
         return None
 
 
-def _deps_yaml_bytes_are_canonical_empty(deps_bytes: bytes) -> bool:
-    """Codex round 34 F1: a CONSERVATIVE byte-level recognizer for the
-    canonical empty-deps form of `deps.yaml`. Returns True only when the
-    file content unambiguously declares both `components: []` and
-    `profiles: []` under a single `dependencies:` key — any deviation
-    (extra keys, populated lists, exotic YAML syntax) returns False so
-    the caller falls back to full YAML parsing.
+# A single canonical empty-deps line: `  <key>: []` for one of the deps keys (2-space indent,
+# empty list). Keyed on the same key vocabulary as `_parse_dep_entries` (byte-level, no parse).
+_EMPTY_DEPS_LINE_RE = re.compile(r"^  (components|profiles|infrastructure): \[\]$")
 
-    This lets `_compute_initial_dependency_readiness` recognize a true
-    leaf without invoking PyYAML, so a brand-new no-deps orchestration
-    remains launchable during a controller packaging issue. The recognizer
-    is intentionally strict: false negatives are safe (caller parses with
-    PyYAML if available, else fails closed); false positives would be a
-    fail-open (orchestration treated as leaf when it actually has deps).
+
+def _deps_yaml_bytes_are_canonical_empty(deps_bytes: bytes) -> bool:
+    """Codex round 34 F1 (+ R1/M3a): a CONSERVATIVE byte-level recognizer for the canonical
+    empty-deps form of `deps.yaml`. Returns True only when the file declares, under a single
+    `dependencies:` key, an empty list `[]` for BOTH required keys `components` / `profiles`
+    and — optionally — the R1 `infrastructure` key, in ANY ordering, with NO other key and NO
+    populated list. Any deviation (extra keys, populated lists, exotic YAML syntax) returns
+    False so the caller falls back to full YAML parsing.
+
+    This lets `_compute_initial_dependency_readiness` recognize a true leaf without invoking
+    PyYAML, so a brand-new no-deps orchestration remains launchable during a controller
+    packaging issue. Intentionally strict: false negatives are safe (caller parses with PyYAML if
+    available, else fails closed); false positives would be a fail-open (orchestration treated as
+    leaf when it actually has deps). Extending it to the empty `infrastructure: []` variant keeps
+    an R1 leaf (a harness node, or any node that spells out an empty infrastructure list)
+    launchable in the PyYAML-unavailable mode — the byte form must track `_parse_dep_entries`.
     """
     text = deps_bytes.decode("utf-8", errors="ignore")
     significant: list[str] = []
@@ -160,12 +166,17 @@ def _deps_yaml_bytes_are_canonical_empty(deps_bytes: bytes) -> bool:
         if line.strip() == "":
             continue
         significant.append(line)
-    # Only accept the two key orderings, with optional trailing newline.
-    canonical_forms = [
-        ["dependencies:", "  components: []", "  profiles: []"],
-        ["dependencies:", "  profiles: []", "  components: []"],
-    ]
-    return significant in canonical_forms
+    if not significant or significant[0] != "dependencies:":
+        return False
+    seen_keys: set[str] = set()
+    for line in significant[1:]:
+        m = _EMPTY_DEPS_LINE_RE.match(line)
+        if m is None or m.group(1) in seen_keys:  # non-empty/unknown key, or a duplicate
+            return False
+        seen_keys.add(m.group(1))
+    # Both required keys present (infrastructure optional); the regex already bounds the key set
+    # to the allowed vocabulary, so no unknown key can slip through.
+    return _DEPS_YAML_REQUIRED_KEYS <= seen_keys
 
 
 class SpecCatalogCorruption(Exception):
@@ -537,7 +548,17 @@ def _resolve_dep_version(
     return matched[0] if matched else None
 
 
-_DEPS_YAML_ALLOWED_KEYS: frozenset[str] = frozenset({"components", "profiles"})
+# Required deps.yaml `dependencies:` keys (present in every deps.yaml). `infrastructure` (the R1
+# harness dependency) is OPTIONAL — added to the allowed set but NOT required, so the existing
+# deps.yaml corpus (components + profiles only) stays well-formed without migration.
+_DEPS_YAML_REQUIRED_KEYS: frozenset[str] = frozenset({"components", "profiles"})
+_DEPS_YAML_ALLOWED_KEYS: frozenset[str] = frozenset({"components", "profiles", "infrastructure"})
+# (deps key, per-item id field). `kind = key.rstrip("s")` yields component/profile/infrastructure.
+_DEPS_KEY_KIND_FIELDS: tuple[tuple[str, str], ...] = (
+    ("components", "component_id"),
+    ("profiles", "profile_id"),
+    ("infrastructure", "infrastructure_id"),
+)
 
 # Codex round 15 F2: identifiers from deps.yaml / spec_catalog.yaml are
 # interpolated into workspace/<kind>/<safe>/ paths. ANY of `spec_kind`,
@@ -577,28 +598,33 @@ def _parse_dep_entries(
       MUST treat well_formed=False as fail-closed.
 
     Strict schema enforced (Codex round 12 F1): the `dependencies` block must
-    be a dict containing EXACTLY the canonical keys `{"components", "profiles"}`
-    and nothing else. Unknown keys (e.g. typoed `component:`) or missing
-    canonical keys mark the document as malformed — previously these silently
-    yielded an empty entry list which `_verify_dependency_readiness` collapsed
-    to vacuous-true readiness.
+    be a dict containing the REQUIRED keys `{"components", "profiles"}`, MAY also
+    carry the optional `infrastructure` key (the R1 harness dependency), and
+    NOTHING else. An unknown key (e.g. typoed `component:`) or a missing required
+    key marks the document as malformed — previously these silently yielded an
+    empty entry list which `_verify_dependency_readiness` collapsed to
+    vacuous-true readiness. `infrastructure` is optional so the pre-R1 corpus
+    (components + profiles only) stays well-formed with no migration.
     """
     entries: list[tuple[str, str, str | None]] = []
     deps = deps_doc.get("dependencies")
     if not isinstance(deps, dict):
         return entries, False
     keys = set(deps.keys())
-    if keys - _DEPS_YAML_ALLOWED_KEYS:
+    if keys - _DEPS_YAML_ALLOWED_KEYS:  # unknown key
         return entries, False
-    if keys != _DEPS_YAML_ALLOWED_KEYS:
+    if _DEPS_YAML_REQUIRED_KEYS - keys:  # a required key is missing
         return entries, False
     well_formed = True
-    for kind_key, id_field in (("components", "component_id"), ("profiles", "profile_id")):
+    for kind_key, id_field in _DEPS_KEY_KIND_FIELDS:
+        if kind_key not in deps:
+            # Optional key (infrastructure) omitted — skip without penalty.
+            continue
         items = deps.get(kind_key)
         if not isinstance(items, list):
             well_formed = False
             continue
-        kind = kind_key.rstrip("s")  # "components" -> "component"
+        kind = kind_key.rstrip("s")  # components->component, profiles->profile, infrastructure->infrastructure
         for item in items:
             if not isinstance(item, dict):
                 # Codex round 22 F1: only canonical dict form is accepted.

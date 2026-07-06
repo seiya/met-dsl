@@ -64,13 +64,13 @@ Using the `Controlled Spec` and `tests` as the canonical source, generate, at op
 - Maintain identifier / dependency / artifact traceability even as the generation targets increase.
 
 ### Scope
-- The `spec` hierarchy (`problem` / `component` / `profile`)
+- The `spec` kinds (`problem` / `component` / `profile` / `infrastructure`) and their dependency hierarchy
 - The naming rules for `spec` / `component` / `operation`
 - Inter-`spec` dependency declaration and registry consistency
 - The placement rules for official-version artifacts (`releases/`)
 
 ### Requirements
-1. A `spec` requires `spec_kind`, and the value allows only `problem` / `component` / `profile`.
+1. A `spec` requires `spec_kind`, and the value allows only `problem` / `component` / `profile` / `infrastructure`. (`infrastructure` is the R1 harness kind: a per-`(language, hardware)` target node that the workflow generates + certifies to supply the shared runner plumbing every physics node's runner is built against — humans author only its `controlled_spec.md` / `tests.md` / `deps.yaml`, like any other `spec`.)
 2. A `spec` requires the following hierarchy.
 
 ```text
@@ -92,6 +92,13 @@ spec/
           tests.md
           deps.yaml
   profile/
+    <domain>/
+      <family>/
+        <spec_id>/
+          controlled_spec.md
+          tests.md
+          deps.yaml
+  infrastructure/
     <domain>/
       <family>/
         <spec_id>/
