@@ -31,6 +31,8 @@ from tools.validate_pipeline_semantics import (
     _validate_makefile_test_invokes_cases,
     _validate_source_meta_json_files,
     _validate_compile_dependency_consistency,
+    _validate_infrastructure_public_api,
+    _parse_public_api_from_controlled_spec,
     _dependency_expected_node_keys,
     validate,
     validate_compile_stage,
@@ -59,6 +61,10 @@ def _seed_shape_expr_schema_into(repo_root: Path) -> None:
 def _write_json(path: Path, data: object) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+
+# Sentinel for "omit this key entirely" in test fixtures (distinct from a None value).
+_OMIT = object()
 
 
 def _write_dep_graph_sidecar(ir_dir: Path, *, node_key: str,
@@ -11151,6 +11157,215 @@ class CompileDependencyConsistencyTests(unittest.TestCase):
             violations: list[str] = []
             _validate_compile_dependency_consistency(Path(tmp), ir_dir, violations)
             self.assertTrue(any("not present in all_nodes" in v for v in violations), violations)
+
+
+class InfrastructurePublicApiGateTests(unittest.TestCase):
+    """_validate_infrastructure_public_api: the R1 deterministic gate pinning an
+    infrastructure node's IR public_api == controlled_spec §5 published surface."""
+
+    _SPEC_ID = "hx"
+
+    def _controlled_spec(self) -> str:
+        # A §5 section in the same shape the harness spec uses: an "operation_ids are
+        # exactly" list plus a "derived type `<id>__h_named`" sentence.
+        return (
+            "# Controlled Spec\n"
+            "## 3. Operation definition\n"
+            "- `hx__emit_int(i) result(s)` — helper.\n"
+            "## 5. Public API and compatibility\n"
+            "The published `operation_id`s are exactly: `hx__emit_real`, `hx__emit_int`, "
+            "`hx__write_metrics_basis`. The module also publishes the derived type "
+            "`hx__h_named` used by `__box`. A change breaking `major` compatibility is renamed.\n"
+            "## 6. Prohibitions\n- none.\n")
+
+    def _seed(self, tmp: Path, *, public_api: object, spec_kind: str = "infrastructure",
+              cs_ref: str | None = "cs.md", write_cs: bool = True) -> Path:
+        ir_dir = tmp
+        if write_cs:
+            (tmp / "cs.md").write_text(self._controlled_spec(), encoding="utf-8")
+        meta = {"spec_kind": spec_kind, "spec_id": self._SPEC_ID}
+        if cs_ref is not None:
+            meta["source_refs"] = {"controlled_spec": cs_ref}
+        ir: dict = {"meta": meta}
+        if public_api is not _OMIT:
+            ir["public_api"] = public_api
+        _write_json(ir_dir / "spec.ir.yaml", ir)
+        return ir_dir
+
+    def test_parser_extracts_ops_and_types(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cs = Path(tmp) / "cs.md"
+            cs.write_text(self._controlled_spec(), encoding="utf-8")
+            ops, types = _parse_public_api_from_controlled_spec(cs, self._SPEC_ID)
+            self.assertEqual(ops, {"hx__emit_real", "hx__emit_int", "hx__write_metrics_basis"})
+            self.assertEqual(types, {"hx__h_named"})
+
+    def _parse_section5(self, body: str) -> tuple[set, set]:
+        with tempfile.TemporaryDirectory() as tmp:
+            cs = Path(tmp) / "cs.md"
+            cs.write_text(f"## 5. Public API\n{body}\n## 6. x\n", encoding="utf-8")
+            return _parse_public_api_from_controlled_spec(cs, "hx")
+
+    def test_parser_captures_op_written_with_signature(self) -> None:
+        # An op listed in the §3 signature style must NOT be dropped — dropping it would be a
+        # false-accept (the gate would miss the exact drift it exists to catch).
+        ops, types = self._parse_section5(
+            "exactly: `hx__parse_cases(tokens, ok)`, `hx__emit_real`.")
+        self.assertEqual(ops, {"hx__parse_cases", "hx__emit_real"})
+        self.assertEqual(types, set())
+
+    def test_parser_classifies_type_plural_and_paren_forms(self) -> None:
+        for body in (
+            "ops: `hx__emit_real`. The module publishes the derived types `hx__h_named`.",
+            "ops: `hx__emit_real`. A derived-type record `hx__h_named` is public.",
+            "ops: `hx__emit_real`. The record `type(hx__h_named)` is public.",
+        ):
+            ops, types = self._parse_section5(body)
+            self.assertEqual(ops, {"hx__emit_real"}, body)
+            self.assertEqual(types, {"hx__h_named"}, body)
+
+    def test_parser_classifies_multi_type_list(self) -> None:
+        # "the derived types `A`, `B`" — the derived-type phrase carries across pure list
+        # separators so BOTH are types (not just the first).
+        ops, types = self._parse_section5(
+            "ops: `hx__emit_real`. The module publishes the derived types "
+            "`hx__h_a`, `hx__h_b` and `hx__h_c`.")
+        self.assertEqual(ops, {"hx__emit_real"})
+        self.assertEqual(types, {"hx__h_a", "hx__h_b", "hx__h_c"})
+
+    def test_parser_type_run_stops_at_prose(self) -> None:
+        # An op after a derived-type span in the SAME sentence must NOT be swept into types —
+        # the intervening words are not a pure list separator.
+        ops, types = self._parse_section5(
+            "The derived type `hx__h_named` is consumed by operation `hx__foo`.")
+        self.assertEqual(ops, {"hx__foo"})
+        self.assertEqual(types, {"hx__h_named"})
+
+    def test_parser_does_not_misclassify_op_on_type_substring(self) -> None:
+        # Bare-substring "type" in the lead-in (prototype / typedef / "return type" / a
+        # "type-generic" parenthetical leaking from the previous op) must NOT turn the op into
+        # a type — that would be an unrepairable false Compile rejection. Requires the phrase
+        # "derived type" for a type, so these all stay operations.
+        for body in (
+            "The prototype `hx__foo` returns.",
+            "A typedef `hx__foo` exists.",
+            "The return type of `hx__foo` is real.",
+            "exactly: `hx__box` (the type-generic constructor), `hx__foo`.",
+        ):
+            ops, types = self._parse_section5(body)
+            self.assertIn("hx__foo", ops, body)
+            self.assertEqual(types, set(), body)
+
+    def _full_api(self) -> dict:
+        return {
+            "published_operations": [
+                {"operation_id": "hx__emit_real"},
+                {"operation_id": "hx__emit_int", "exercised_by": []},
+                {"operation_id": "hx__write_metrics_basis"},
+            ],
+            "published_types": ["hx__h_named"],
+        }
+
+    def test_exact_match_no_violation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            ir_dir = self._seed(Path(tmp), public_api=self._full_api())
+            violations: list[str] = []
+            _validate_infrastructure_public_api(Path(tmp), ir_dir, violations)
+            self.assertEqual(violations, [])
+
+    def test_dropped_operation_flagged(self) -> None:
+        # The exact E2E #2 failure: a published helper writer/emitter omitted from the IR.
+        with tempfile.TemporaryDirectory() as tmp:
+            api = self._full_api()
+            api["published_operations"] = [
+                e for e in api["published_operations"]
+                if e["operation_id"] not in ("hx__emit_int", "hx__write_metrics_basis")]
+            ir_dir = self._seed(Path(tmp), public_api=api)
+            violations: list[str] = []
+            _validate_infrastructure_public_api(Path(tmp), ir_dir, violations)
+            self.assertTrue(any("omits controlled_spec §5 operation_id 'hx__emit_int'" in v
+                                for v in violations), violations)
+            self.assertTrue(any("hx__write_metrics_basis" in v for v in violations), violations)
+
+    def test_extra_operation_flagged(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            api = self._full_api()
+            api["published_operations"].append({"operation_id": "hx__not_in_spec"})
+            ir_dir = self._seed(Path(tmp), public_api=api)
+            violations: list[str] = []
+            _validate_infrastructure_public_api(Path(tmp), ir_dir, violations)
+            self.assertTrue(any("declares operation_id 'hx__not_in_spec' absent" in v
+                                for v in violations), violations)
+
+    def test_type_mismatch_flagged(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            api = self._full_api()
+            api["published_types"] = ["h_named"]  # short alias, not fully-qualified
+            ir_dir = self._seed(Path(tmp), public_api=api)
+            violations: list[str] = []
+            _validate_infrastructure_public_api(Path(tmp), ir_dir, violations)
+            self.assertTrue(any("omits controlled_spec §5 derived type 'hx__h_named'" in v
+                                for v in violations), violations)
+            self.assertTrue(any("declares type 'h_named' absent" in v for v in violations),
+                            violations)
+
+    def test_missing_public_api_flagged(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            ir_dir = self._seed(Path(tmp), public_api=_OMIT)
+            violations: list[str] = []
+            _validate_infrastructure_public_api(Path(tmp), ir_dir, violations)
+            self.assertTrue(any("public_api missing" in v for v in violations), violations)
+
+    def test_unresolvable_controlled_spec_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            ir_dir = self._seed(Path(tmp), public_api=self._full_api(), write_cs=False)
+            violations: list[str] = []
+            _validate_infrastructure_public_api(Path(tmp), ir_dir, violations)
+            self.assertTrue(any("unresolvable" in v for v in violations), violations)
+
+    def test_missing_controlled_spec_ref_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            ir_dir = self._seed(Path(tmp), public_api=self._full_api(), cs_ref=None)
+            violations: list[str] = []
+            _validate_infrastructure_public_api(Path(tmp), ir_dir, violations)
+            self.assertTrue(any("source_refs.controlled_spec missing" in v for v in violations),
+                            violations)
+
+    def test_missing_spec_id_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "cs.md").write_text(self._controlled_spec(), encoding="utf-8")
+            _write_json(Path(tmp) / "spec.ir.yaml", {
+                "meta": {"spec_kind": "infrastructure",
+                         "source_refs": {"controlled_spec": "cs.md"}},
+                "public_api": self._full_api()})
+            violations: list[str] = []
+            _validate_infrastructure_public_api(Path(tmp), Path(tmp), violations)
+            self.assertTrue(any("meta.spec_id missing" in v for v in violations), violations)
+
+    def test_section5_parsing_zero_ops_fails_closed(self) -> None:
+        # A resolvable controlled_spec whose §5 yields no operation_ids (unrecognized form) is a
+        # violation, never a silent pass.
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "cs.md").write_text(
+                "## 5. Public API\nNo backtick operation tokens here.\n## 6. x\n",
+                encoding="utf-8")
+            _write_json(Path(tmp) / "spec.ir.yaml", {
+                "meta": {"spec_kind": "infrastructure", "spec_id": self._SPEC_ID,
+                         "source_refs": {"controlled_spec": "cs.md"}},
+                "public_api": self._full_api()})
+            violations: list[str] = []
+            _validate_infrastructure_public_api(Path(tmp), Path(tmp), violations)
+            self.assertTrue(any("parsed 0 published operation_ids" in v for v in violations),
+                            violations)
+
+    def test_non_infrastructure_is_noop(self) -> None:
+        # A physics node has no exact-published contract; the gate must not fire even with
+        # no public_api present.
+        with tempfile.TemporaryDirectory() as tmp:
+            ir_dir = self._seed(Path(tmp), public_api=_OMIT, spec_kind="component")
+            violations: list[str] = []
+            _validate_infrastructure_public_api(Path(tmp), ir_dir, violations)
+            self.assertEqual(violations, [])
 
 
 class DependencyExpectedNodeKeysTests(unittest.TestCase):

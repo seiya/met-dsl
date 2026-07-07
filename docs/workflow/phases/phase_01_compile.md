@@ -151,6 +151,17 @@ dependency:
     - node_key: "<spec_kind>/<spec_id>@<spec_version>"
       kind: "<component|profile|problem|infrastructure>"
       operations: ["<operation_id>", ...]
+
+public_api:
+  # infrastructure nodes ONLY (spec_kind: infrastructure); OMIT for component/profile/problem.
+  # The COMPLETE published surface controlled_spec §5 declares ("operation_ids are exactly: ...") —
+  # every operation incl. helper emitters/writers no test exercises directly — so Generate
+  # publishes all of them and the runner CALLS them, not reimplements. The --stage compile gate
+  # (_validate_infrastructure_public_api) pins these sets == §5 (V8).
+  published_operations:
+    - operation_id: "<spec_id>__<name>"   # every §5 operation_id (set equality with §5)
+      exercised_by: ["<test_id>", ...]    # optional: tests exercising it ([] for a helper)
+  published_types: ["<spec_id>__<type>", ...]   # every §5 published derived type (set equality)
 ```
 
 ### `<ir_ref>/dependency_graph.json` sidecar (conductor-authored)
@@ -190,7 +201,7 @@ Only `boundary_apply` / `reconstruct` / `flux_compute` / `source_term` / `time_i
 ## substep details
 
 ### 1-1. Compile.generate substep
-- Read the physics algorithm (A) of the `Controlled Spec`, deterministically expand the input conditions and `sweep` / `refinement` from `tests.md`, and generate the 5 sections `case` / `algorithm` / `impl_defaults` / `io_contract` / `dependency` of `spec.ir.yaml`.
+- Read the physics algorithm (A) of the `Controlled Spec`, deterministically expand the input conditions and `sweep` / `refinement` from `tests.md`, and generate the 5 sections `case` / `algorithm` / `impl_defaults` / `io_contract` / `dependency` of `spec.ir.yaml`. For an `infrastructure` node additionally author the `public_api` section — the COMPLETE published surface controlled_spec §5 declares (every `operation_id`, incl. helper emitters/writers no test exercises directly, plus every published derived type); the gate pins it == §5 (V8).
 - Author `dependency.node_key` and `dependency.direct_deps[]` (each with `kind` + `operations`) — the directly-read dependencies from `deps.yaml`. Do NOT author `transitive_deps` / `all_nodes`: the conductor derives that closure/topo graph host-side into `<ir_ref>/dependency_graph.json` (a pure function of `deps.yaml` + `spec_catalog.yaml`).
 - The default values of `impl_defaults` follow the rules of `IMPL_PLAN_SPEC.md` (existing). Considering variant exploration in the Tune optional flow, express the knob set of `abstract` / `backend_overrides` in the IR.
 - When the intent of `controlled_spec.md` does not fit the schema during generation, do not extend the schema; instead treat it as `Compile fail`, record "IR schema insufficiency" in `last_fail_reason`, and stop. For schema extension, separately update the `spec.ir.yaml` schema design by hand, then retry.
@@ -234,15 +245,19 @@ one remaining LLM-verified invariant:
 - The combination of `impl_defaults.toolchain.language` and `impl_defaults.toolchain.build_system` is consistent with the default-value rules of `IMPL_PLAN_SPEC.md`.
 - The combination of `impl_defaults.target.class` and `impl_defaults.target.backend` is identifiable by `impl_defaults.selected.backend_key`.
 
+#### V8. public_api surface (`infrastructure` nodes only)
+- **`public_api` enumerates EXACTLY the controlled_spec §5 published surface** (else physics nodes omit it; their interface is derived post-hoc). The `--stage compile` gate (`_validate_infrastructure_public_api`) parses §5's "operation_ids are exactly" contract and pins `published_operations[].operation_id` == §5 ops and `published_types` == §5 types; a dropped/extra entry is a `Compile fail` to `Compile.generate`. Closes the R1 mode where Compile→IR kept only test-exercised ops, so Generate never published the helper emitters/writers a consuming runner links against. The LLM only enumerates §5 faithfully; the gate enforces equality. (V6/V7 are the `impl_defaults` fixed/knob invariants in the boundary section below.)
+
 #### Verification tools
 These deterministic gates run in the conductor's `Compile.static` substep (`_compile_static_inproc`), NOT inside the `Compile.verify` leaf:
 - Syntax validity via `python3 tools/check_artifact_syntax.py --expect-top object <ir_ref>/spec.ir.yaml <ir_ref>/ir_meta.json`; on `fail` it is a `Compile fail` (routed to `Compile.generate`).
 - `python3 tools/validate_pipeline_semantics.py --stage compile --ir-ref workspace/ir/<node_key_safe>/<ir_id>/`, with `exit code 0` required. The result is recorded in `compile_static_meta.json`; on `fail` the substep fails before `Compile.verify` runs, so `verification_status=pass` is never reached on a structurally-invalid IR. (The `--stage compile` validator checks the internal-consistency / shape-grammar invariants; the spec-cross-reference invariants are the `Compile.verify` LLM responsibility — see the substep structure note.)
   - **dependency direct_deps consistency** (`_validate_compile_dependency_consistency`): the IR's `dependency.direct_deps` (`(kind, spec_id)` set, version-agnostic) must equal `{all_nodes} − {self} − {transitive}` from the `dependency_graph.json` sidecar. A mismatch is a `Compile fail` routed to `Compile.generate`. Version drift is soft (gfortran backstop). Closes the former V4a/V4b gap.
+  - **infrastructure public_api surface** (`_validate_infrastructure_public_api`, infra nodes only): `public_api.published_operations`/`published_types` must equal the controlled_spec §5 surface. A missing controlled_spec ref, a §5 parsing to zero ops, an absent `public_api`, or a set mismatch is a `Compile fail` to `Compile.generate` (V8).
 
 ## On-failure behavior
 - When the input (`controlled_spec.md` / `tests.md` / `deps.yaml`) is insufficient, it is a `Compile fail`, and guessed completion is forbidden.
-- When any self-check invariant `fail`, it is a `Compile fail`, and the violated invariant ID (V1–V5) and details are recorded in `ir_meta.json.last_fail_reason`.
+- When any self-check invariant `fail`, it is a `Compile fail`, and the violated invariant ID (V1–V8) and details are recorded in `ir_meta.json.last_fail_reason`.
 - The repair_strategy defaults to `reuse`, and `restart` is chosen only when a structurally substantial reconstruction is needed.
 
 ## Acceptance of retry from Validate

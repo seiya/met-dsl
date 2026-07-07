@@ -25486,7 +25486,12 @@ class ChildContextDocSizeTests(unittest.TestCase):
         # judge-time nondeterminism this removes becomes a reviewable compile-time artifact.
         # Bumped 23600->23900: the R2 predicate schema notes the YAML-float threshold rule for
         # ordered ops (1.0e-10 not 1e-10) + the includes list-member form (a Codex-review gap).
-        "docs/workflow/phases/phase_01_compile.md": 23900,
+        # Bumped 23900->26000: R1 (M3b-fix) adds the IR `public_api` section (infrastructure nodes
+        # enumerate their complete controlled_spec §5 published surface) + the V8 invariant + the
+        # deterministic `_validate_infrastructure_public_api` gate registry entry — after E2E #2
+        # surfaced Compile→IR dropping helper ops (emit_int/write_metrics_basis) the harness must
+        # publish for a consuming runner to link against.
+        "docs/workflow/phases/phase_01_compile.md": 26000,
         # Per-substep SKILLs — each force-read by its own LLM leaf.
         # Bumped 10800->11500: Compile.generate now authors the io_contract section (G2 /
         # docs/design/deterministic_followups.md) — it was moved here from Compile.verify so the
@@ -25502,7 +25507,10 @@ class ChildContextDocSizeTests(unittest.TestCase):
         # the predicate-authoring rule (schema, ref vocabulary, per-case thresholds, na_allowed).
         # Bumped 13900->14300: Codex-review hardening — the predicate rule now states the
         # YAML-float threshold requirement, per-case-map full coverage, and verdict.required gate.
-        "skills/workflow-compile-generate/SKILL.md": 14300,
+        # Bumped 14300->14900: R1 (M3b-fix) — Compile.generate authors the IR `public_api` section
+        # for an infrastructure node (the complete controlled_spec §5 published surface, incl.
+        # helper emitters/writers), pinned == §5 by the --stage compile gate (V8).
+        "skills/workflow-compile-generate/SKILL.md": 14900,
         # Bumped 11800->12100: G7 — compile.verify checks V4c only (operations ⊆ published); the
         # closure/topo consistency is conductor-authored + gate-checked, no longer LLM-verified (G7).
         # Bumped 12100->13100: R2 (G8) — compile.verify owns the SEMANTIC test_predicates fidelity
@@ -25525,7 +25533,11 @@ class ChildContextDocSizeTests(unittest.TestCase):
         # its physics, do not self-read other nodes' sources).
         # Bumped 24400->24700: R1 (M3b) — the "no physics duplication in runner" rule is scoped
         # for an infrastructure harness node (model publishes plumbing, runner calls it).
-        "skills/workflow-generate-generate/SKILL.md": 24700,
+        # Bumped 24700->25300: R1 (M3b-fix) — for an infrastructure node the model must publish
+        # EXACTLY the IR public_api set (every operation incl. helper emitters/writers, types by
+        # fully-qualified name; runner calls them, never reimplements) — after E2E #2 surfaced the
+        # runner reimplementing __write_metrics_basis and inlining __emit_int.
+        "skills/workflow-generate-generate/SKILL.md": 25300,
         # Bumped 21400->21700: the test/check target must invoke the runner with
         # `--cases $(SPEC) $(CASES)` (the runner aborts without it; make test must
         # match run_program's argv) after a validate.execute failure where a bare

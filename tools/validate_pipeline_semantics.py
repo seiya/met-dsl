@@ -4664,6 +4664,97 @@ def _parse_test_ids_from_tests_md(tests_path: Path) -> list[str]:
     return test_ids
 
 
+# Matches a top-level numbered controlled_spec heading `## <n>. Title`. The `(?:\s|$)`
+# after the dot ensures a decimal subsection like `## 5.1 Foo` is NOT read as section 5.
+_CONTROLLED_SPEC_SECTION_HEADING = re.compile(r"^##\s+(\d+)\.(?:\s|$)")
+
+
+def _extract_controlled_spec_section(text: str, section_num: str) -> str | None:
+    """Return the body of a ``## <n>.`` controlled_spec section (the lines between that
+    heading and the next ``## <m>.`` heading), or ``None`` when the section is absent.
+
+    controlled_spec sections are numbered ``## 0.`` .. ``## 8.``; only these top-level
+    numbered headings delimit a section (a ``### `` subsection does not)."""
+    lines = text.splitlines()
+    start: int | None = None
+    for i, line in enumerate(lines):
+        match = _CONTROLLED_SPEC_SECTION_HEADING.match(line.strip())
+        if match and match.group(1) == section_num:
+            start = i
+            break
+    if start is None:
+        return None
+    body: list[str] = []
+    for line in lines[start + 1 :]:
+        if _CONTROLLED_SPEC_SECTION_HEADING.match(line.strip()):
+            break
+        body.append(line)
+    return "\n".join(body)
+
+
+def _parse_public_api_from_controlled_spec(
+    controlled_spec_path: Path, spec_id: str
+) -> tuple[set[str], set[str]]:
+    """Extract the exact published ``operation_id`` set and derived-type set an
+    ``infrastructure`` node declares in its controlled_spec §5 ('Public API and
+    compatibility' — the authoritative "the published operation_ids are exactly: ..."
+    contract). An infrastructure node's whole purpose is to publish a reusable surface
+    that consuming physics nodes link against, so this parser feeds the deterministic
+    ``--stage compile`` gate that pins the IR's ``public_api`` to §5.
+
+    Returns ``(operation_ids, type_ids)``. Every ``<spec_id>__X`` identifier appearing inside
+    a backtick span in §5 is a published symbol; it is classified as a TYPE (not an operation)
+    when its span is a ``type(<spec_id>__X)`` reference, or the lead-in words that introduce it
+    (since the last sentence break / previous backtick) contain the phrase "derived type" —
+    so "derived type `<id>__X`", plural/hyphenated "derived types" / "derived-type", and
+    ``type(<id>__X)`` all resolve to a type, and everything else to an operation. The phrase
+    "derived type" (not bare "type") is required precisely so an op whose lead-in merely
+    contains the substring "type" — "prototype", "typedef", "return type", a "type-generic"
+    parenthetical leaking from the previous op — is NOT misread as a type (a false Compile
+    rejection the LLM could not repair, since the drift would be in the spec prose). Matching
+    the identifier ANYWHERE in the span (not the whole token) means an op written with its
+    signature — ```<id>__op(args)``` — is still captured, so a §5 authored in the §3 signature
+    style does not silently drop ops (which would be a false-accept: the gate would miss the
+    very drift it exists to catch). Short forms (```__box```) and unprefixed prose
+    (```h_named```, ```values(:)```) never match the ``<spec_id>__`` anchor. A "derived type(s)"
+    phrase carries across a comma-separated backtick run — "the derived types `A`, `B`"
+    classifies BOTH as types — but only over pure list separators (``,`` / ``and`` / ``or`` /
+    ``/`` / whitespace), never across intervening prose, so a following op in the same sentence
+    is not swept in. A published type introduced WITHOUT "derived type" / ``type(...)`` degrades
+    to op-classified — a fail-closed set mismatch (a visible Compile fail), never a silent
+    accept."""
+    text = controlled_spec_path.read_text(encoding="utf-8", errors="ignore")
+    section = _extract_controlled_spec_section(text, "5")
+    if section is None:
+        return (set(), set())
+    ident_re = re.compile(re.escape(spec_id) + r"__[A-Za-z0-9_]+")
+    separator_re = re.compile(r"[\s,]*(?:and|or|/)?[\s,]*", re.IGNORECASE)
+    all_tokens: set[str] = set()
+    type_tokens: set[str] = set()
+    prev_end = 0
+    prev_is_type = False
+    for match in re.finditer(r"`([^`]*)`", section):
+        span = match.group(1)
+        idents = set(ident_re.findall(span))
+        between = section[prev_end : match.start()]
+        prev_end = match.end()
+        if not idents:
+            prev_is_type = False  # a non-identifier span breaks any list run
+            continue
+        all_tokens |= idents
+        lead_in = re.split(r"[.`]", section[: match.start()])[-1].lower()
+        is_type = bool(
+            re.search(r"type\s*\(", span.lower())
+            or re.search(r"derived[\s-]types?\b", lead_in)
+            # a derived-type run continues over a pure list separator (no intervening prose)
+            or (prev_is_type and separator_re.fullmatch(between))
+        )
+        if is_type:
+            type_tokens |= idents
+        prev_is_type = is_type
+    return (all_tokens - type_tokens, type_tokens)
+
+
 def _contract_test_evidence_requirements(
     contract: dict[str, Any],
 ) -> dict[str, set[str]]:
@@ -8552,8 +8643,119 @@ def _validate_compile_stage_impl(
     _validate_ir_meta_json(ir_dir, violations)
     _validate_compile_dependency_consistency(repo_root, ir_dir, violations)
     _validate_test_predicates(repo_root, ir_dir, violations)
+    _validate_infrastructure_public_api(repo_root, ir_dir, violations)
 
     return violations
+
+
+def _validate_infrastructure_public_api(
+    repo_root: Path, ir_dir: Path, violations: list[str]
+) -> None:
+    """R1 deterministic public-API gate (``infrastructure`` nodes only): the IR's
+    ``public_api`` block must enumerate EXACTLY the published surface the controlled_spec
+    §5 declares ("the published operation_ids are exactly: ..."). An infrastructure node
+    (the R1 runner harness) exists to publish a reusable operation surface that consuming
+    physics-node runners link against; if Compile→IR drops a published operation that no
+    single test exercises as its primary op (e.g. a helper emitter or a writer), Generate
+    never publishes it and the runner reimplements it locally — defeating the harness. This
+    gate pins the surface at Compile (cheap, pre-Generate) instead of leaving the drift for
+    the ~17-min Generate.verify leaf to catch nondeterministically.
+
+    Checks: ``meta.spec_kind == "infrastructure"`` (else no-op — physics nodes have no
+    exact-published contract; their interface is derived post-hoc). The controlled_spec is
+    resolved via ``meta.source_refs.controlled_spec`` and its §5 parsed with
+    ``_parse_public_api_from_controlled_spec``; the IR's
+    ``public_api.published_operations[].operation_id`` set must equal the §5 operation set
+    and ``public_api.published_types`` must equal the §5 derived-type set. Fail-closed
+    (never a silent no-op): a missing/unresolvable controlled_spec ref, a §5 parsing to zero
+    operations, or an absent ``public_api`` block is itself a violation.
+
+    A violation routes (via ``classify_compile_static_failure``) back to ``compile.generate``
+    to re-author the IR's ``public_api``."""
+    derived_path = ir_dir / "spec.ir.yaml"
+    if not derived_path.exists():
+        return  # missing IR already flagged upstream
+    try:
+        ir = _read_yaml(derived_path)
+    except yaml.YAMLError:
+        return  # malformed IR already flagged upstream
+    if not isinstance(ir, dict):
+        return
+
+    meta = ir.get("meta") if isinstance(ir.get("meta"), dict) else {}
+    if meta.get("spec_kind") != "infrastructure":
+        return  # exact-published-surface contract is infrastructure-only
+
+    spec_id = meta.get("spec_id")
+    if not isinstance(spec_id, str) or not spec_id.strip():
+        violations.append(
+            f"{derived_path}:meta.spec_id missing "
+            "(required to pin an infrastructure node's public_api to controlled_spec §5)")
+        return
+    spec_id = spec_id.strip()
+
+    source_refs = meta.get("source_refs") if isinstance(meta.get("source_refs"), dict) else {}
+    cs_ref = source_refs.get("controlled_spec")
+    if not isinstance(cs_ref, str) or not cs_ref.strip():
+        violations.append(
+            f"{derived_path}:meta.source_refs.controlled_spec missing "
+            "(cannot pin infrastructure public_api to §5)")
+        return
+    cs_path = Path(cs_ref.strip())
+    if not cs_path.is_absolute():
+        cs_path = repo_root / cs_path
+    if not cs_path.is_file():
+        violations.append(
+            f"{derived_path}:controlled_spec ({cs_ref}) unresolvable "
+            "(cannot pin infrastructure public_api to §5)")
+        return
+
+    spec_ops, spec_types = _parse_public_api_from_controlled_spec(cs_path, spec_id)
+    if not spec_ops:
+        violations.append(
+            f"{derived_path}:controlled_spec ({cs_ref}) §5 parsed 0 published operation_ids "
+            "(unrecognized 'published operation_ids are exactly' form — cannot pin public_api)")
+        return
+
+    public_api = ir.get("public_api")
+    if not isinstance(public_api, dict):
+        violations.append(
+            f"{derived_path}:public_api missing — an infrastructure node must enumerate its "
+            "complete controlled_spec §5 published surface (public_api.published_operations "
+            "and public_api.published_types)")
+        return
+
+    ops_raw = public_api.get("published_operations")
+    ir_ops = {
+        entry["operation_id"].strip()
+        for entry in (ops_raw if isinstance(ops_raw, list) else [])
+        if isinstance(entry, dict)
+        and isinstance(entry.get("operation_id"), str)
+        and entry["operation_id"].strip()
+    }
+    for missing in sorted(spec_ops - ir_ops):
+        violations.append(
+            f"{derived_path}:public_api.published_operations omits controlled_spec §5 "
+            f"operation_id '{missing}'")
+    for extra in sorted(ir_ops - spec_ops):
+        violations.append(
+            f"{derived_path}:public_api.published_operations declares operation_id '{extra}' "
+            "absent from controlled_spec §5")
+
+    types_raw = public_api.get("published_types")
+    ir_types = {
+        token.strip()
+        for token in (types_raw if isinstance(types_raw, list) else [])
+        if isinstance(token, str) and token.strip()
+    }
+    for missing in sorted(spec_types - ir_types):
+        violations.append(
+            f"{derived_path}:public_api.published_types omits controlled_spec §5 "
+            f"derived type '{missing}'")
+    for extra in sorted(ir_types - spec_types):
+        violations.append(
+            f"{derived_path}:public_api.published_types declares type '{extra}' "
+            "absent from controlled_spec §5")
 
 
 def _validate_test_predicates(
