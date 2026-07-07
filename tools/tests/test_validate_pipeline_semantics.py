@@ -11165,9 +11165,36 @@ class InfrastructurePublicApiGateTests(unittest.TestCase):
 
     _SPEC_ID = "hx"
 
-    def _controlled_spec(self) -> str:
+    # A canonical §5.1 interface block matching the §5 surface (3 ops + 1 type). The gate's
+    # cross-check requires §5.1's symbol set == §5's; the containment check pins these lines.
+    _SECTION_51 = (
+        "### 5.1 Canonical interface block\n"
+        "```fortran\n"
+        "integer, parameter :: dp = real64\n"
+        "type :: hx__h_named\n"
+        "  character(len=:), allocatable :: name\n"
+        "  character(len=:), allocatable :: json\n"
+        "end type hx__h_named\n"
+        "function hx__emit_real(x) result(s)\n"
+        "  real(dp), intent(in) :: x\n"
+        "  character(len=:), allocatable :: s\n"
+        "end function hx__emit_real\n"
+        "function hx__emit_int(i) result(s)\n"
+        "  integer, intent(in) :: i\n"
+        "  character(len=:), allocatable :: s\n"
+        "end function hx__emit_int\n"
+        "subroutine hx__write_metrics_basis(entries, n)\n"
+        "  type(hx__h_named), intent(in) :: entries(:)\n"
+        "  integer, intent(in) :: n\n"
+        "end subroutine hx__write_metrics_basis\n"
+        "```\n"
+    )
+
+    def _controlled_spec(self, section_51: str | None = None) -> str:
         # A §5 section in the same shape the harness spec uses: an "operation_ids are
-        # exactly" list plus a "derived type `<id>__h_named`" sentence.
+        # exactly" list, a "derived type `<id>__h_named`" sentence, and the §5.1 fenced block.
+        if section_51 is None:
+            section_51 = self._SECTION_51
         return (
             "# Controlled Spec\n"
             "## 3. Operation definition\n"
@@ -11176,6 +11203,7 @@ class InfrastructurePublicApiGateTests(unittest.TestCase):
             "The published `operation_id`s are exactly: `hx__emit_real`, `hx__emit_int`, "
             "`hx__write_metrics_basis`. The module also publishes the derived type "
             "`hx__h_named` used by `__box`. A change breaking `major` compatibility is renamed.\n"
+            + section_51 +
             "## 6. Prohibitions\n- none.\n")
 
     def _seed(self, tmp: Path, *, public_api: object, spec_kind: str = "infrastructure",
@@ -11256,6 +11284,31 @@ class InfrastructurePublicApiGateTests(unittest.TestCase):
             self.assertIn("hx__foo", ops, body)
             self.assertEqual(types, set(), body)
 
+    # public_api.signatures transcribing the _SECTION_51 fence (the leaf's source of the
+    # signatures). Formatting may differ from §5.1 — the gate compares normalized.
+    _SIGNATURES = [
+        {"symbol": "hx__h_named", "interface":
+            "type :: hx__h_named\n"
+            "  character(len=:), allocatable :: name\n"
+            "  character(len=:), allocatable :: json\n"
+            "end type hx__h_named\n"},
+        {"symbol": "hx__emit_real", "interface":
+            "function hx__emit_real(x) result(s)\n"
+            "  real(dp), intent(in) :: x\n"
+            "  character(len=:), allocatable :: s\n"
+            "end function hx__emit_real\n"},
+        {"symbol": "hx__emit_int", "interface":
+            "function hx__emit_int(i) result(s)\n"
+            "  integer, intent(in) :: i\n"
+            "  character(len=:), allocatable :: s\n"
+            "end function hx__emit_int\n"},
+        {"symbol": "hx__write_metrics_basis", "interface":
+            "subroutine hx__write_metrics_basis(entries, n)\n"
+            "  type(hx__h_named), intent(in) :: entries(:)\n"
+            "  integer, intent(in) :: n\n"
+            "end subroutine hx__write_metrics_basis\n"},
+    ]
+
     def _full_api(self) -> dict:
         return {
             "published_operations": [
@@ -11264,6 +11317,7 @@ class InfrastructurePublicApiGateTests(unittest.TestCase):
                 {"operation_id": "hx__write_metrics_basis"},
             ],
             "published_types": ["hx__h_named"],
+            "signatures": [dict(s) for s in self._SIGNATURES],
         }
 
     def test_exact_match_no_violation(self) -> None:
@@ -11366,6 +11420,523 @@ class InfrastructurePublicApiGateTests(unittest.TestCase):
             violations: list[str] = []
             _validate_infrastructure_public_api(Path(tmp), ir_dir, violations)
             self.assertEqual(violations, [])
+
+    def test_signatures_missing_flagged(self) -> None:
+        # public_api present but without a `signatures` block: the leaf would have no source of
+        # the signatures to publish, so this is a Compile fail.
+        with tempfile.TemporaryDirectory() as tmp:
+            api = self._full_api()
+            del api["signatures"]
+            ir_dir = self._seed(Path(tmp), public_api=api)
+            violations: list[str] = []
+            _validate_infrastructure_public_api(Path(tmp), ir_dir, violations)
+            self.assertTrue(any("public_api.signatures missing" in v for v in violations),
+                            violations)
+
+    def test_signatures_type_drift_flagged(self) -> None:
+        # An IR signature that drifts from §5.1 (here: change entries' element type) is flagged —
+        # it is exactly what the leaf would transcribe into the model.
+        with tempfile.TemporaryDirectory() as tmp:
+            api = self._full_api()
+            api["signatures"][3]["interface"] = (
+                "subroutine hx__write_metrics_basis(entries, n)\n"
+                "  character(len=*), intent(in) :: entries(:)\n"
+                "  integer, intent(in) :: n\n"
+                "end subroutine hx__write_metrics_basis\n")
+            ir_dir = self._seed(Path(tmp), public_api=api)
+            violations: list[str] = []
+            _validate_infrastructure_public_api(Path(tmp), ir_dir, violations)
+            self.assertTrue(any("signatures['hx__write_metrics_basis'] does not match" in v
+                                for v in violations), violations)
+
+    def test_signatures_component_reorder_flagged(self) -> None:
+        # Reordering a derived type's components keeps the line SET identical but is a real
+        # compatibility (positional-construction) drift — the ordered comparison must catch it.
+        with tempfile.TemporaryDirectory() as tmp:
+            api = self._full_api()
+            api["signatures"][0]["interface"] = (
+                "type :: hx__h_named\n"
+                "  character(len=:), allocatable :: json\n"
+                "  character(len=:), allocatable :: name\n"
+                "end type hx__h_named\n")
+            ir_dir = self._seed(Path(tmp), public_api=api)
+            violations: list[str] = []
+            _validate_infrastructure_public_api(Path(tmp), ir_dir, violations)
+            self.assertTrue(any("signatures['hx__h_named'] does not match" in v
+                                for v in violations), violations)
+
+    def test_signatures_lying_symbol_flagged(self) -> None:
+        # A `symbol` that disagrees with the interface it carries is fail-closed.
+        with tempfile.TemporaryDirectory() as tmp:
+            api = self._full_api()
+            api["signatures"][1]["symbol"] = "hx__not_emit_real"
+            ir_dir = self._seed(Path(tmp), public_api=api)
+            violations: list[str] = []
+            _validate_infrastructure_public_api(Path(tmp), ir_dir, violations)
+            self.assertTrue(any("declares a different symbol" in v for v in violations),
+                            violations)
+
+    def test_signatures_non_dict_entry_flagged(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            api = self._full_api()
+            api["signatures"].append("not a mapping")
+            ir_dir = self._seed(Path(tmp), public_api=api)
+            violations: list[str] = []
+            _validate_infrastructure_public_api(Path(tmp), ir_dir, violations)
+            self.assertTrue(any("is not a mapping" in v for v in violations), violations)
+
+    def test_signatures_formatting_difference_passes(self) -> None:
+        # A signature transcribed with different alignment / a split continuation still matches
+        # (normalized comparison).
+        with tempfile.TemporaryDirectory() as tmp:
+            api = self._full_api()
+            api["signatures"][3]["interface"] = (
+                "subroutine hx__write_metrics_basis(entries, &\n"
+                "    n)\n"
+                "  type(hx__h_named),   intent(in) :: entries(:)   ! boxed\n"
+                "  integer,             intent(in) :: n\n"
+                "end subroutine hx__write_metrics_basis\n")
+            ir_dir = self._seed(Path(tmp), public_api=api)
+            violations: list[str] = []
+            _validate_infrastructure_public_api(Path(tmp), ir_dir, violations)
+            self.assertEqual(violations, [])
+
+    def test_section51_missing_fence_fails_closed(self) -> None:
+        # An infra controlled_spec whose §5 carries no §5.1 canonical interface block is a
+        # violation — the spec must pin its own signatures machine-readably.
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "cs.md").write_text(
+                self._controlled_spec(section_51=""), encoding="utf-8")
+            _write_json(Path(tmp) / "spec.ir.yaml", {
+                "meta": {"spec_kind": "infrastructure", "spec_id": self._SPEC_ID,
+                         "source_refs": {"controlled_spec": "cs.md"}},
+                "public_api": self._full_api()})
+            violations: list[str] = []
+            _validate_infrastructure_public_api(Path(tmp), Path(tmp), violations)
+            self.assertTrue(any("§5.1" in v and "missing" in v for v in violations), violations)
+
+    def test_section51_op_set_mismatch_flagged(self) -> None:
+        # §5.1 omitting an op that §5 lists (here: drop hx__emit_int from the fence) is a
+        # spec-internal-consistency violation caught at Compile.
+        broken_fence = self._SECTION_51.replace(
+            "function hx__emit_int(i) result(s)\n"
+            "  integer, intent(in) :: i\n"
+            "  character(len=:), allocatable :: s\n"
+            "end function hx__emit_int\n", "")
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "cs.md").write_text(
+                self._controlled_spec(section_51=broken_fence), encoding="utf-8")
+            _write_json(Path(tmp) / "spec.ir.yaml", {
+                "meta": {"spec_kind": "infrastructure", "spec_id": self._SPEC_ID,
+                         "source_refs": {"controlled_spec": "cs.md"}},
+                "public_api": self._full_api()})
+            violations: list[str] = []
+            _validate_infrastructure_public_api(Path(tmp), Path(tmp), violations)
+            self.assertTrue(any("§5.1 omits a signature for §5 operation_id 'hx__emit_int'" in v
+                                for v in violations), violations)
+
+    def test_section51_extra_type_flagged(self) -> None:
+        # §5.1 defining a type absent from §5's derived-type list is flagged.
+        extra_fence = self._SECTION_51.replace(
+            "```\n",
+            "type :: hx__h_extra\n"
+            "  integer :: v\n"
+            "end type hx__h_extra\n"
+            "```\n", 1)
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "cs.md").write_text(
+                self._controlled_spec(section_51=extra_fence), encoding="utf-8")
+            _write_json(Path(tmp) / "spec.ir.yaml", {
+                "meta": {"spec_kind": "infrastructure", "spec_id": self._SPEC_ID,
+                         "source_refs": {"controlled_spec": "cs.md"}},
+                "public_api": self._full_api()})
+            violations: list[str] = []
+            _validate_infrastructure_public_api(Path(tmp), Path(tmp), violations)
+            self.assertTrue(any("defines a derived type 'hx__h_extra' absent" in v
+                                for v in violations), violations)
+
+
+class CanonicalInterfaceParserTests(unittest.TestCase):
+    """_parse_canonical_interface_from_controlled_spec + the Fortran normalization helpers:
+    parse the §5.1 fenced interface block into per-symbol stanzas, fail-closed on a
+    missing/duplicate/unterminated fence."""
+
+    _FENCE = InfrastructurePublicApiGateTests._SECTION_51
+
+    def _cs(self, section_51: str) -> Path:
+        tmp = Path(tempfile.mkdtemp())
+        if section_51 and "### 5.1" not in section_51:
+            section_51 = "### 5.1 Canonical interface block\n" + section_51
+        (tmp / "cs.md").write_text(
+            "## 5. Public API\nprose.\n" + section_51 + "## 6. x\n", encoding="utf-8")
+        return tmp / "cs.md"
+
+    def test_parses_op_and_type_stanzas(self) -> None:
+        ops, types, err = vps._parse_canonical_interface_from_controlled_spec(self._cs(self._FENCE))
+        self.assertIsNone(err)
+        self.assertEqual(set(ops), {"hx__emit_real", "hx__emit_int", "hx__write_metrics_basis"})
+        self.assertEqual(set(types), {"hx__h_named"})
+        # a proc stanza is header + dummy decls, EXCLUDING the `end` line;
+        # a type stanza INCLUDES its `end type` line.
+        self.assertEqual(ops["hx__emit_real"][0], "function hx__emit_real(x) result(s)")
+        self.assertTrue(all("end function" not in l for l in ops["hx__emit_real"]))
+        self.assertIn("end type hx__h_named", types["hx__h_named"])
+        # a top-level `parameter` declaration is not a stanza
+        self.assertNotIn("dp", ops)
+
+    def test_missing_fence_errors(self) -> None:
+        _, _, err = vps._parse_canonical_interface_from_controlled_spec(self._cs(""))
+        self.assertIsNotNone(err)
+        self.assertIn("missing", err)
+
+    def test_multiple_fences_errors(self) -> None:
+        _, _, err = vps._parse_canonical_interface_from_controlled_spec(
+            self._cs(self._FENCE + "```fortran\ninteger :: x\n```\n"))
+        self.assertIsNotNone(err)
+        self.assertIn("multiple", err)
+
+    def test_unterminated_stanza_errors(self) -> None:
+        bad = "```fortran\nsubroutine hx__foo(a)\n  integer, intent(in) :: a\n```\n"
+        _, _, err = vps._parse_canonical_interface_from_controlled_spec(self._cs(bad))
+        self.assertIsNotNone(err)
+        self.assertIn("unterminated", err)
+
+    def test_duplicate_stanza_errors(self) -> None:
+        # A malformed first copy must not hide behind a correct second (dict-overwrite would).
+        dup = (
+            "```fortran\n"
+            "function hx__foo(a) result(s)\n  integer, intent(in) :: a\n"
+            "  character(len=:), allocatable :: s\nend function hx__foo\n"
+            "function hx__foo(a, b) result(s)\n  integer, intent(in) :: a\n"
+            "  integer, intent(in) :: b\n  character(len=:), allocatable :: s\n"
+            "end function hx__foo\n```\n")
+        _, _, err = vps._parse_canonical_interface_from_controlled_spec(self._cs(dup))
+        self.assertIsNotNone(err)
+        self.assertIn("duplicate", err)
+
+    def test_declaration_atoms_split_combined_declarators(self) -> None:
+        # A combined declarator splits into one atom per entity; array-spec commas stay intact.
+        self.assertEqual(
+            vps._declaration_atoms("integer, intent(in) :: steps, cells_updated"),
+            ["integer, intent(in) :: steps", "integer, intent(in) :: cells_updated"])
+        self.assertEqual(
+            vps._declaration_atoms("real(dp), intent(in) :: a(:), b(2,2)"),
+            ["real(dp), intent(in) :: a(:)", "real(dp), intent(in) :: b(2,2)"])
+        # A header (no ::) passes through unchanged.
+        self.assertEqual(
+            vps._declaration_atoms("subroutine hx__foo(a, b)"), ["subroutine hx__foo(a, b)"])
+
+    def test_combined_and_split_declarations_compare_equal(self) -> None:
+        combined = vps._stanza_atoms(["integer, intent(in) :: a, b"])
+        split = vps._stanza_atoms(
+            ["integer, intent(in) :: a", "integer, intent(in) :: b"])
+        self.assertEqual(combined, split)
+
+    def test_bare_end_does_not_swallow_following_procedure(self) -> None:
+        # A bare `end` (legal for a module procedure) must not consume the next procedure's header.
+        fence = (
+            "```fortran\n"
+            "function hx__a(x) result(s)\n  real, intent(in) :: x\n  real :: s\nend\n"
+            "function hx__b(y) result(s)\n  real, intent(in) :: y\n  real :: s\n"
+            "end function hx__b\n```\n")
+        ops, types, err = vps._parse_canonical_interface_from_controlled_spec(self._cs(fence))
+        self.assertEqual(set(ops), {"hx__a", "hx__b"})
+
+    def test_type_missing_end_type_is_unterminated(self) -> None:
+        # A derived type MUST close with `end type` (a bare `end` does not close a type). A type
+        # stanza terminated by the next header without `end type` is malformed → fail-closed, while
+        # the next symbol still registers (no cascade).
+        block = (
+            "```fortran\n"
+            "type :: hx__a\n  integer :: x\n"
+            "type :: hx__b\n  integer :: y\nend type hx__b\n```\n")
+        ops, types, err = vps._parse_canonical_interface_from_controlled_spec(self._cs(block))
+        self.assertIsNotNone(err)
+        self.assertIn("unterminated", err)
+        self.assertIn("hx__a", err)
+
+    def test_end_line_canonicalizes_trailing_name(self) -> None:
+        # bare `end type` compares equal to `end type NAME` (the name is pinned by the header).
+        with_name = vps._stanza_atoms(
+            ["type :: hx__t", "  integer :: a", "end type hx__t"])
+        bare = vps._stanza_atoms(["type :: hx__t", "  integer :: a", "end type"])
+        self.assertEqual(with_name, bare)
+
+    def test_no_space_end_keyword_closes_stanza(self) -> None:
+        # `endfunction` / `endtype` (legal free-form) must close a stanza, not swallow the next.
+        fence = (
+            "```fortran\n"
+            "function hx__a(x) result(s)\n  real, intent(in) :: x\n"
+            "  real :: s\nendfunction hx__a\n"
+            "function hx__b(y) result(s)\n  real, intent(in) :: y\n"
+            "  real :: s\nend function hx__b\n```\n")
+        ops, types, err = vps._parse_canonical_interface_from_controlled_spec(self._cs(fence))
+        self.assertIsNone(err)
+        self.assertEqual(set(ops), {"hx__a", "hx__b"})
+
+    def test_continuation_join_skips_interleaved_comment_and_blank(self) -> None:
+        # Free-form Fortran allows blank / full-comment lines inside a `&` continuation; the join
+        # must span them (the §5.1 write_perf header is >132 cols and MUST wrap).
+        joined = vps._fortran_logical_lines(
+            "subroutine hx__wp(a, &\n"
+            "  ! a comment inside the wrap\n"
+            "\n"
+            "    b, c)\n")
+        self.assertEqual(len(joined), 1)
+        self.assertEqual(vps._normalize_fortran_line(joined[0]), "subroutinehx__wp(a,b,c)")
+
+    def test_unrelated_fence_before_subsection_ignored(self) -> None:
+        # A code fence in §5 prose BEFORE ### 5.1 must not be mistaken for the interface block.
+        body = "```text\nan illustrative example\n```\n" + self._FENCE
+        ops, types, err = vps._parse_canonical_interface_from_controlled_spec(self._cs(body))
+        self.assertIsNone(err)
+        self.assertEqual(set(ops), {"hx__emit_real", "hx__emit_int", "hx__write_metrics_basis"})
+        self.assertEqual(set(types), {"hx__h_named"})
+
+    def test_parameter_lines_extracted(self) -> None:
+        params = vps._section51_parameter_lines(self._cs(self._FENCE))
+        self.assertEqual([vps._normalize_fortran_line(p) for p in params],
+                         ["integer,parameter::dp=real64"])
+
+    def test_normalization_joins_continuations_and_folds_case(self) -> None:
+        # A continuation-split, differently-cased, comment-bearing header normalizes to the
+        # same canonical line as its single-line form.
+        joined = vps._fortran_logical_lines(
+            "SUBROUTINE Hx__Foo(a, &  ! keep going\n     b)  ! done\n")
+        self.assertEqual(len(joined), 1)
+        self.assertEqual(
+            vps._normalize_fortran_line(joined[0]), "subroutinehx__foo(a,b)")
+
+    def test_comment_strip_honors_strings(self) -> None:
+        line = vps._strip_fortran_comment("s = '! not a comment' ! real comment")
+        self.assertEqual(vps._normalize_fortran_line(line), "s='!notacomment'")
+
+
+class InfrastructureGeneratedSignatureGateTests(unittest.TestCase):
+    """_validate_infrastructure_generated_signatures: the Generate.static gate pinning the
+    generated model source against the §5.1 canonical signatures."""
+
+    _FENCE = InfrastructurePublicApiGateTests._SECTION_51
+
+    # A model source that publishes all three §5.1 ops + the type, with DIFFERENT formatting
+    # (alignment whitespace, split continuation, local vars, a body) — must still pass.
+    _GOOD_SOURCE = (
+        "module hx_model\n"
+        "  use, intrinsic :: iso_fortran_env, only: real64\n"
+        "  implicit none\n"
+        "  integer, parameter :: dp = real64\n"
+        "  type :: hx__h_named\n"
+        "    character(len=:), allocatable :: name\n"
+        "    character(len=:), allocatable :: json\n"
+        "  end type hx__h_named\n"
+        "contains\n"
+        "  function hx__emit_real(x)   result(s)\n"
+        "    real(dp),          intent(in) :: x\n"
+        "    character(len=:), allocatable :: s\n"
+        "    character(len=32) :: buf\n"
+        "    write(buf, '(ES24.16E3)') x\n"
+        "    s = trim(adjustl(buf))\n"
+        "  end function hx__emit_real\n"
+        "  function hx__emit_int(i) result(s)\n"
+        "    integer, intent(in) :: i\n"
+        "    character(len=:), allocatable :: s\n"
+        "    s = 'x'\n"
+        "  end function hx__emit_int\n"
+        "  subroutine hx__write_metrics_basis(entries, &\n"
+        "      n)\n"
+        "    type(hx__h_named), intent(in) :: entries(:)\n"
+        "    integer,           intent(in) :: n\n"
+        "  end subroutine hx__write_metrics_basis\n"
+        "end module hx_model\n"
+    )
+
+    def _seed(self, tmp: Path, *, source: str, spec_kind: str = "infrastructure",
+              section_51: str | None = None) -> NodeExecution:
+        ir_ref = "workspace/ir/x"
+        ir_dir = tmp / ir_ref
+        ir_dir.mkdir(parents=True)
+        (tmp / "cs.md").write_text(
+            "## 5. Public API\nprose.\n" + (self._FENCE if section_51 is None else section_51)
+            + "## 6. x\n", encoding="utf-8")
+        _write_json(ir_dir / "spec.ir.yaml", {
+            "meta": {"spec_kind": spec_kind, "spec_id": "hx",
+                     "source_refs": {"controlled_spec": "cs.md"}}})
+        pipe = tmp / "pipe"
+        src_dir = pipe / "src"
+        src_dir.mkdir(parents=True)
+        (pipe / "lineage.json").write_text(
+            json.dumps({"ir_ref": ir_ref}), encoding="utf-8")
+        model = src_dir / "hx_model.f90"
+        model.write_text(source, encoding="utf-8")
+        return NodeExecution(
+            node_key=f"{spec_kind}/hx@0.2.0", node_dir=pipe, exec_dir=pipe, pipeline_dir=pipe)
+
+    def _run(self, execution: NodeExecution, tmp: Path) -> list[str]:
+        model = tmp / "pipe" / "src" / "hx_model.f90"
+        violations: list[str] = []
+        vps._validate_infrastructure_generated_signatures(
+            tmp, execution, [model], violations)
+        return violations
+
+    def test_faithful_source_passes(self) -> None:
+        with tempfile.TemporaryDirectory() as t:
+            tmp = Path(t)
+            ex = self._seed(tmp, source=self._GOOD_SOURCE)
+            self.assertEqual(self._run(ex, tmp), [])
+
+    def test_argument_name_drift_flagged(self) -> None:
+        # rename dummy `n` -> `count` in the writer's header AND its decl: the pinned header line
+        # is no longer present.
+        drift = self._GOOD_SOURCE.replace(
+            "  subroutine hx__write_metrics_basis(entries, &\n"
+            "      n)\n"
+            "    type(hx__h_named), intent(in) :: entries(:)\n"
+            "    integer,           intent(in) :: n\n",
+            "  subroutine hx__write_metrics_basis(entries, count)\n"
+            "    type(hx__h_named), intent(in) :: entries(:)\n"
+            "    integer,           intent(in) :: count\n")
+        with tempfile.TemporaryDirectory() as t:
+            tmp = Path(t)
+            ex = self._seed(tmp, source=drift)
+            violations = self._run(ex, tmp)
+            self.assertTrue(any("hx__write_metrics_basis" in v and "pinned interface line" in v
+                                for v in violations), violations)
+
+    def test_argument_type_drift_flagged(self) -> None:
+        # change entries' element type: the pinned decl line no longer matches.
+        drift = self._GOOD_SOURCE.replace(
+            "    type(hx__h_named), intent(in) :: entries(:)\n",
+            "    character(len=*), intent(in) :: entries(:)\n")
+        with tempfile.TemporaryDirectory() as t:
+            tmp = Path(t)
+            ex = self._seed(tmp, source=drift)
+            violations = self._run(ex, tmp)
+            self.assertTrue(any("hx__write_metrics_basis" in v for v in violations), violations)
+
+    def test_type_component_drift_flagged(self) -> None:
+        drift = self._GOOD_SOURCE.replace(
+            "    character(len=:), allocatable :: json\n",
+            "    integer :: json\n")
+        with tempfile.TemporaryDirectory() as t:
+            tmp = Path(t)
+            ex = self._seed(tmp, source=drift)
+            violations = self._run(ex, tmp)
+            self.assertTrue(any("hx__h_named" in v for v in violations), violations)
+
+    def test_drift_not_masked_by_identical_decl_in_other_proc(self) -> None:
+        # The published proc drifts its `n` to intent(out), but a DECOY helper elsewhere declares
+        # `integer, intent(in) :: n` verbatim. A global source line-set would false-accept; the
+        # per-symbol check must still flag the published proc.
+        drift = self._GOOD_SOURCE.replace(
+            "    integer,           intent(in) :: n\n"
+            "  end subroutine hx__write_metrics_basis\n",
+            "    integer,           intent(out) :: n\n"
+            "  end subroutine hx__write_metrics_basis\n"
+            "  subroutine hx__decoy(n)\n"
+            "    integer, intent(in) :: n\n"
+            "  end subroutine hx__decoy\n")
+        with tempfile.TemporaryDirectory() as t:
+            tmp = Path(t)
+            ex = self._seed(tmp, source=drift)
+            violations = self._run(ex, tmp)
+            self.assertTrue(any("hx__write_metrics_basis" in v and "intent(in) :: n" in v
+                                for v in violations), violations)
+
+    def test_combined_declarations_pass(self) -> None:
+        # A source that combines the type's two same-type components onto one line (legal Fortran,
+        # ABI-identical) must NOT be flagged — the contract permits formatting differences.
+        combined = self._GOOD_SOURCE.replace(
+            "    character(len=:), allocatable :: name\n"
+            "    character(len=:), allocatable :: json\n",
+            "    character(len=:), allocatable :: name, json\n")
+        with tempfile.TemporaryDirectory() as t:
+            tmp = Path(t)
+            ex = self._seed(tmp, source=combined)
+            self.assertEqual(self._run(ex, tmp), [])
+
+    def test_bare_end_type_passes(self) -> None:
+        # A generated type closed with bare `end type` (no repeated name) is legal + ABI-identical.
+        combined = self._GOOD_SOURCE.replace(
+            "  end type hx__h_named\n", "  end type\n")
+        with tempfile.TemporaryDirectory() as t:
+            tmp = Path(t)
+            ex = self._seed(tmp, source=combined)
+            self.assertEqual(self._run(ex, tmp), [])
+
+    def test_extra_type_component_flagged(self) -> None:
+        # Inserting an extra published component into a derived type widens its layout — the
+        # exact ordered atom-list equality must reject it (set equality or subsequence would not).
+        widened = self._GOOD_SOURCE.replace(
+            "    character(len=:), allocatable :: name\n"
+            "    character(len=:), allocatable :: json\n",
+            "    character(len=:), allocatable :: name\n"
+            "    integer :: secret_extra\n"
+            "    character(len=:), allocatable :: json\n")
+        with tempfile.TemporaryDirectory() as t:
+            tmp = Path(t)
+            ex = self._seed(tmp, source=widened)
+            violations = self._run(ex, tmp)
+            self.assertTrue(any("hx__h_named" in v and "component layout" in v
+                                for v in violations), violations)
+
+    def test_type_component_reorder_flagged(self) -> None:
+        # Source reorders h_named's components: set membership would pass, but the exact ordered
+        # atom-list equality flags the layout drift.
+        drift = self._GOOD_SOURCE.replace(
+            "  type :: hx__h_named\n"
+            "    character(len=:), allocatable :: name\n"
+            "    character(len=:), allocatable :: json\n"
+            "  end type hx__h_named\n",
+            "  type :: hx__h_named\n"
+            "    character(len=:), allocatable :: json\n"
+            "    character(len=:), allocatable :: name\n"
+            "  end type hx__h_named\n")
+        with tempfile.TemporaryDirectory() as t:
+            tmp = Path(t)
+            ex = self._seed(tmp, source=drift)
+            violations = self._run(ex, tmp)
+            self.assertTrue(any("hx__h_named" in v and "component layout" in v
+                                for v in violations), violations)
+
+    def test_non_infrastructure_is_noop(self) -> None:
+        with tempfile.TemporaryDirectory() as t:
+            tmp = Path(t)
+            # a component node with a garbage source: gate must not fire
+            ex = self._seed(tmp, source="module m\nend module m\n", spec_kind="component")
+            self.assertEqual(self._run(ex, tmp), [])
+
+    def test_parameter_value_drift_flagged(self) -> None:
+        # A drifted `dp = real32` (vs §5.1 `real64`) changes the published ABI but the symbolic
+        # `real(dp)` decls still match — the parameter pin must catch the value drift.
+        drift = self._GOOD_SOURCE.replace(
+            "integer, parameter :: dp = real64", "integer, parameter :: dp = real32")
+        with tempfile.TemporaryDirectory() as t:
+            tmp = Path(t)
+            ex = self._seed(tmp, source=drift)
+            violations = self._run(ex, tmp)
+            self.assertTrue(any("module parameter" in v and "dp = real64" in v
+                                for v in violations), violations)
+
+    def test_infra_missing_ir_fails_closed(self) -> None:
+        # An infrastructure node (per node_key) whose IR cannot be resolved must fail closed —
+        # never silently skip the signature pin.
+        with tempfile.TemporaryDirectory() as t:
+            tmp = Path(t)
+            pipe = tmp / "pipe"
+            (pipe / "src").mkdir(parents=True)
+            (pipe / "src" / "hx_model.f90").write_text("module m\nend module m\n")
+            # no lineage.json -> IR unresolvable
+            ex = NodeExecution(node_key="infrastructure/hx@0.2.0", node_dir=pipe,
+                               exec_dir=pipe, pipeline_dir=pipe)
+            violations = self._run(ex, tmp)
+            self.assertTrue(any("fail-closed" in v for v in violations), violations)
+
+    def test_unparseable_fence_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as t:
+            tmp = Path(t)
+            ex = self._seed(tmp, source=self._GOOD_SOURCE, section_51="")
+            violations = self._run(ex, tmp)
+            self.assertTrue(any("§5.1" in v for v in violations), violations)
 
 
 class DependencyExpectedNodeKeysTests(unittest.TestCase):

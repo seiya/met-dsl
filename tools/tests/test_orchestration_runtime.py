@@ -25491,7 +25491,11 @@ class ChildContextDocSizeTests(unittest.TestCase):
         # deterministic `_validate_infrastructure_public_api` gate registry entry — after E2E #2
         # surfaced Compile→IR dropping helper ops (emit_int/write_metrics_basis) the harness must
         # publish for a consuming runner to link against.
-        "docs/workflow/phases/phase_01_compile.md": 26000,
+        # Bumped 26000->28200: R1 (M3c-α) — V8 + the public_api schema + §1-1 document the §5.1
+        # canonical interface block cross-check, the IR `public_api.signatures` block (Compile
+        # transcribes §5.1 into it because Generate.generate is walled off from controlled_spec),
+        # and that the signature bodies are pinned against the generated source at Generate.static.
+        "docs/workflow/phases/phase_01_compile.md": 28200,
         # Per-substep SKILLs — each force-read by its own LLM leaf.
         # Bumped 10800->11500: Compile.generate now authors the io_contract section (G2 /
         # docs/design/deterministic_followups.md) — it was moved here from Compile.verify so the
@@ -25510,7 +25514,10 @@ class ChildContextDocSizeTests(unittest.TestCase):
         # Bumped 14300->14900: R1 (M3b-fix) — Compile.generate authors the IR `public_api` section
         # for an infrastructure node (the complete controlled_spec §5 published surface, incl.
         # helper emitters/writers), pinned == §5 by the --stage compile gate (V8).
-        "skills/workflow-compile-generate/SKILL.md": 14900,
+        # Bumped 14900->15600: R1 (M3c-α) — Compile.generate now also authors public_api.signatures
+        # (transcribe the §5.1 canonical interface block verbatim; it is the leaf's only carrier of
+        # the signatures since Generate.generate cannot read controlled_spec), pinned == §5.1 (V8).
+        "skills/workflow-compile-generate/SKILL.md": 15600,
         # Bumped 11800->12100: G7 — compile.verify checks V4c only (operations ⊆ published); the
         # closure/topo consistency is conductor-authored + gate-checked, no longer LLM-verified (G7).
         # Bumped 12100->13100: R2 (G8) — compile.verify owns the SEMANTIC test_predicates fidelity
@@ -25537,7 +25544,12 @@ class ChildContextDocSizeTests(unittest.TestCase):
         # EXACTLY the IR public_api set (every operation incl. helper emitters/writers, types by
         # fully-qualified name; runner calls them, never reimplements) — after E2E #2 surfaced the
         # runner reimplementing __write_metrics_basis and inlining __emit_int.
-        "skills/workflow-generate-generate/SKILL.md": 25300,
+        # Bumped 25300->26400: R1 (M3c-α) — the model must publish each public_api symbol with its
+        # IR public_api.signatures[].interface VERBATIM (arg name/order/type/rank/intent/result;
+        # the leaf reads the IR, not controlled_spec); the deterministic Generate.static gate
+        # (_validate_infrastructure_generated_signatures) pins the generated .f90 against §5.1,
+        # moving signature-exactness off the Generate.verify leaf.
+        "skills/workflow-generate-generate/SKILL.md": 26400,
         # Bumped 21400->21700: the test/check target must invoke the runner with
         # `--cases $(SPEC) $(CASES)` (the runner aborts without it; make test must
         # match run_program's argv) after a validate.execute failure where a bare
@@ -25548,7 +25560,10 @@ class ChildContextDocSizeTests(unittest.TestCase):
         # Bumped 21700->22300: verify must also check argument rank/shape against the
         # published dummy ranks (the rank-2-slice-in-a-loop case), same failure
         # (orch_20260703T065033Z_4be45da7).
-        "skills/workflow-generate-verify/SKILL.md": 22500,
+        # Bumped 22500->22800: R1 (M3c-α) — the infra self-test scope note adds that published
+        # signatures are pinned == §5.1 by the Generate.static gate, so verify need not re-audit
+        # them (focus on semantic use of the published surface).
+        "skills/workflow-generate-verify/SKILL.md": 22800,
         # Bumped 10000->10400: documented the verdict.json#per_test entry schema
         # (field name `status`/`outcome` + the pass/fail/xfail/skipped enum, with `blocked`
         # called out as conductor-derived not judge-written) so the judge leaf no longer

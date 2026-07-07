@@ -2,11 +2,11 @@
 
 ## 0. Meta information
 - `test_profile_id`: `harness_fortran_cpu_l0`
-- `test_profile_version`: `0.1.0`
+- `test_profile_version`: `0.2.0`
 - `status`: `draft`
 - `spec_ref.spec_kind`: `infrastructure`
 - `spec_ref.spec_id`: `harness_fortran_cpu`
-- `spec_ref.spec_version`: `0.1.0`
+- `spec_ref.spec_version`: `0.2.0`
 - `spec_ref.controlled_spec_path`: `spec/infrastructure/infra/harness/harness_fortran_cpu/controlled_spec.md`
 
 ## 1. Test purpose
@@ -23,7 +23,7 @@ This suite verifies the published runner-plumbing operations of `harness_fortran
 The suite defines one `case` per `test_id` (no sweep), and `case_id == test_id` for every case (the six `case.test_case_set[].case_id` are exactly the six `test_id`s below). Each `case_id` selects the plumbing aspect that case verifies. The multi-case run itself is the `case_fanout` evidence: each case writes exactly one `raw/state_snapshots/<case_id>.json`. Each snapshot holds that case's `required_raw_variables` (listed per test in §6) plus the scalar time variable `t` (value `0.0`; a single `steps=1` step).
 
 ## 5. Diagnostics contract
-- Require outputting, in `diagnostics.json`, a top-level `checks` object holding `checks.numeric_roundtrip`, `checks.boolean_literal`, `checks.array_emit`, `checks.case_fanout`, `checks.perf_derived`, and `checks.input_guard` (each `{ "status": "pass"|"fail", ... }`), a top-level `verdict` object with `overall` and `failed_checks`, and a `per_case` map giving each `case_id` its own `{ checks, verdict }`.
+- Require outputting, in `diagnostics.json`, a top-level `checks` object holding `checks.numeric_roundtrip`, `checks.boolean_literal`, `checks.array_emit`, `checks.case_fanout`, `checks.perf_derived`, and `checks.input_guard` (each `{ "status": "pass"|"fail" }`), a top-level `verdict` object with `overall` and `failed_checks`, and a `per_case` map giving each `case_id` its own `{ checks, verdict, metrics }`. The `metrics` object is assembled by `harness_fortran_cpu__write_diagnostics` from each case's supplied `h_metric` list; the self-test supplies no metrics, so every per-case `metrics` is the empty object `{}` (the metric-leaf / NA encoding is exercised by consuming physics nodes, not by this L0 self-test). The whole `diagnostics.json` is assembled inside `__write_diagnostics` from the caller-supplied `h_case_result` records (each carrying its `expected_xfail` flag); the caller supplies only honest per-case data, and the harness performs every fold.
 - The invalid-input case (`l0_missing_cases_xfail`) is reported as a **failing** guard at the PER-CASE level only: `per_case.l0_missing_cases_xfail.verdict.overall == fail` with `input_guard` in its `failed_checks` (the guard correctly firing on a missing `--cases`). This expected `xfail` failure is EXCLUDED from the top-level aggregation: the top-level `verdict.overall` stays `pass`, top-level `failed_checks` is `[]`, and top-level `checks.input_guard.status == pass` (the guard behaved as expected). Only a NON-`xfail` case failure would set the top-level `overall` to `fail`.
 
 ## 6. Test definitions

@@ -4220,6 +4220,12 @@ def _validate_generate_outputs_for_generation(
             model_files, dep_spec_ids, violations
         )
 
+    # R1/M3c-α: an infrastructure node's generated model must publish every §5.1 canonical
+    # signature verbatim (no-op for physics nodes, whose interface is derived post-hoc).
+    _validate_infrastructure_generated_signatures(
+        repo_root, execution, model_files, violations
+    )
+
 
 def _read_dependency_graph_sidecar(repo_root: Path, ir_ref: str | None) -> dict[str, Any] | None:
     """Load the conductor-authored dependency-graph sidecar ``<ir_ref>/dependency_graph.json``.
@@ -4727,6 +4733,11 @@ def _parse_public_api_from_controlled_spec(
     section = _extract_controlled_spec_section(text, "5")
     if section is None:
         return (set(), set())
+    # §5.1's canonical interface block (a fenced code block) lives inside §5's body; its
+    # ``<spec_id>__X`` identifiers are NOT backtick-wrapped prose and must not be mined as
+    # published-surface tokens (the fence is parsed separately by
+    # _parse_canonical_interface_from_controlled_spec). Strip fenced blocks first.
+    section = _strip_fenced_blocks(section)
     ident_re = re.compile(re.escape(spec_id) + r"__[A-Za-z0-9_]+")
     separator_re = re.compile(r"[\s,]*(?:and|or|/)?[\s,]*", re.IGNORECASE)
     all_tokens: set[str] = set()
@@ -4753,6 +4764,267 @@ def _parse_public_api_from_controlled_spec(
             type_tokens |= idents
         prev_is_type = is_type
     return (all_tokens - type_tokens, type_tokens)
+
+
+# --- R1/M3c-α: canonical interface block (§5.1) parsing + Fortran normalization ---
+#
+# §5.1 gives the exact published surface as a fenced Fortran interface block. Two deterministic
+# gates consume it: the ``--stage compile`` gate cross-checks its symbol set against §5, and the
+# ``Generate.static`` gate pins the generated model source against each signature's interface
+# lines. Both compare after a normalization that erases every non-semantic difference — inline
+# comments, ``&`` continuations, case, and whitespace — so a signature authored one way in §5.1
+# and formatted another way in the generated source still matches (and a genuine argument-name /
+# type / rank / intent drift still fails).
+
+_FENCED_BLOCK_RE = re.compile(r"(?ms)^```[^\n]*\n(.*?)^```[^\n]*$")
+_IFACE_PROC_START = re.compile(
+    r"^\s*(?:pure\s+|elemental\s+|recursive\s+)*(subroutine|function)\s+([A-Za-z0-9_]+)",
+    re.IGNORECASE,
+)
+# ``end\s*`` (space optional) accepts the legal no-space free-form keywords endsubroutine /
+# endfunction / endtype as well as the spaced forms.
+_IFACE_PROC_END = re.compile(r"^\s*end\s*(?:subroutine|function)\b", re.IGNORECASE)
+# A type DEFINITION header: ``type :: name`` or ``type, attrs :: name`` — never a component
+# declaration ``type(...) :: x`` (a ``(`` immediately follows ``type`` there, so ``::`` at the
+# end is preceded by the parenthesized kind, not a bare/attributed ``type``).
+_IFACE_TYPE_START = re.compile(
+    r"^\s*type\s*(?:,\s*[^:()]*?)?::\s*([A-Za-z0-9_]+)\s*$", re.IGNORECASE
+)
+_IFACE_TYPE_END = re.compile(r"^\s*end\s*type\b", re.IGNORECASE)
+
+
+def _strip_fenced_blocks(text: str) -> str:
+    """Remove fenced code blocks (```...```) from Markdown text."""
+    return _FENCED_BLOCK_RE.sub("", text)
+
+
+def _strip_fortran_comment(line: str) -> str:
+    """Drop a trailing ``!`` comment, honoring single/double-quoted strings (so a ``!`` inside a
+    string literal is not treated as a comment)."""
+    quote: str | None = None
+    for i, ch in enumerate(line):
+        if quote is not None:
+            if ch == quote:
+                quote = None
+        elif ch in ("'", '"'):
+            quote = ch
+        elif ch == "!":
+            return line[:i]
+    return line
+
+
+def _fortran_logical_lines(text: str) -> list[str]:
+    """Split Fortran source/interface text into logical lines: comments stripped and ``&``
+    continuation lines joined (a leading ``&`` on a continued line is consumed). Whitespace and
+    case are preserved here (normalization happens per-line in ``_normalize_fortran_line``).
+
+    Free-form Fortran permits blank and full-line-comment lines *between* a ``&``-terminated line
+    and its continuation — they are ignored, not statement terminators — so while a continuation is
+    open such lines are skipped rather than flushing a truncated logical line. This matters: the
+    §5.1 ``write_perf`` header exceeds the 132-column free-form limit and must be wrapped, so a
+    legally-formatted source with a comment inside that wrap must still join to one logical line."""
+    logical: list[str] = []
+    buf: str | None = None  # None: not continuing; str: accumulated continuation (trailing & removed)
+    for raw in text.splitlines():
+        piece = _strip_fortran_comment(raw)
+        if buf is not None:
+            # Mid-continuation: a blank / pure-comment line does not terminate the statement.
+            if not piece.strip():
+                continue
+            stripped = piece.lstrip()
+            if stripped.startswith("&"):
+                stripped = stripped[1:]
+            combined = buf + stripped
+        else:
+            combined = piece
+        rstripped = combined.rstrip()
+        if rstripped.endswith("&"):
+            buf = rstripped[:-1]
+            continue
+        buf = None
+        logical.append(combined)
+    if buf is not None:
+        logical.append(buf)
+    return logical
+
+
+def _normalize_fortran_line(logical_line: str) -> str:
+    """Canonical form of a (comment-stripped, continuation-joined) logical line: lower-cased with
+    ALL whitespace removed, so formatting/alignment differences do not defeat an equality test."""
+    return re.sub(r"\s+", "", logical_line).lower()
+
+
+_END_STMT_RE = re.compile(r"^\s*end\s*(type|subroutine|function)\b", re.IGNORECASE)
+
+
+def _canonicalize_end_line(line: str) -> str:
+    """Reduce a closing ``end [type|subroutine|function] [name]`` to just ``end <kind>`` — the
+    optional trailing construct name is legal to omit (bare ``end type`` is the common style) and
+    is redundant with the header, so a stanza that drops it must still compare equal."""
+    m = _END_STMT_RE.match(line)
+    return f"end {m.group(1).lower()}" if m else line
+
+
+def _parse_interface_stanzas(
+    block_body: str,
+) -> tuple[dict[str, list[str]], dict[str, list[str]], list[str]]:
+    """Parse a §5.1 canonical Fortran interface block into per-symbol *stanzas*.
+
+    Returns ``(op_stanzas, type_stanzas, errors)``. Each stanza value is the ordered list of that
+    symbol's interface logical lines (comment-stripped, continuation-joined, but NOT yet
+    whitespace-normalized — kept readable for gate messages):
+    - a procedure stanza is its ``subroutine``/``function`` header + every dummy-argument /
+      ``result`` declaration up to (but excluding) the ``end`` line;
+    - a type stanza is its ``type :: name`` header + component declarations + the ``end type``
+      line (inclusive, so the closing name is pinned too).
+    Lines outside any stanza (the public ``parameter`` declarations, comments, blanks) are
+    ignored. An unterminated stanza OR a duplicate symbol name is reported in ``errors``
+    (fail-closed at the caller — a duplicate must never silently overwrite, which would let a
+    malformed first copy hide behind a correct second)."""
+    lines = _fortran_logical_lines(block_body)
+    op_stanzas: dict[str, list[str]] = {}
+    type_stanzas: dict[str, list[str]] = {}
+    errors: list[str] = []
+    seen: set[str] = set()
+    i = 0
+    n = len(lines)
+    while i < n:
+        line = lines[i].strip()
+        if not line:
+            i += 1
+            continue
+        m_type = _IFACE_TYPE_START.match(line)
+        m_proc = _IFACE_PROC_START.match(line)
+        if m_type:
+            name = m_type.group(1)
+            stanza = [line]
+            i += 1
+            closed = False
+            while i < n:
+                cur = lines[i].strip()
+                # A following stanza header terminates this one so it cannot swallow the next
+                # symbol — but a derived type MUST close with `end type` (a bare `end` does NOT
+                # close a type in Fortran), so reaching a header first leaves `closed` False and
+                # the stanza is reported unterminated (fail-closed). Reprocess the header on the
+                # outer loop (do not advance).
+                if cur and (_IFACE_TYPE_START.match(cur) or _IFACE_PROC_START.match(cur)):
+                    break
+                if cur:
+                    stanza.append(cur)
+                if cur and _IFACE_TYPE_END.match(cur):
+                    closed = True
+                    i += 1
+                    break
+                i += 1
+            if not closed:
+                errors.append(f"unterminated derived-type definition '{name}'")
+            if name in seen:
+                errors.append(f"duplicate signature for symbol '{name}'")
+            seen.add(name)
+            type_stanzas[name] = stanza
+        elif m_proc:
+            name = m_proc.group(2)
+            stanza = [line]
+            i += 1
+            closed = False
+            while i < n:
+                cur = lines[i].strip()
+                if cur and _IFACE_PROC_END.match(cur):
+                    closed = True
+                    i += 1
+                    break
+                # A bare `end` (legal for a module procedure) is not matched above; terminate on the
+                # next stanza header so it cannot swallow the following symbol (reprocess it).
+                if cur and (_IFACE_PROC_START.match(cur) or _IFACE_TYPE_START.match(cur)):
+                    closed = True
+                    break
+                if cur:
+                    stanza.append(cur)
+                i += 1
+            if not closed:
+                errors.append(f"unterminated procedure interface '{name}'")
+            if name in seen:
+                errors.append(f"duplicate signature for symbol '{name}'")
+            seen.add(name)
+            op_stanzas[name] = stanza
+        else:
+            i += 1
+    return op_stanzas, type_stanzas, errors
+
+
+_SUBSECTION_51_HEADING = re.compile(r"^###\s+5\.1(?:[.\s]|$)")
+
+
+def _extract_subsection_51(section5_body: str) -> str | None:
+    """Return the body of the ``### 5.1`` subsection within a §5 body, or ``None`` when absent.
+    Scoping the fence search to this subsection means an unrelated illustrative code fence
+    elsewhere in §5 prose does not brick certification (it would otherwise look like a second
+    interface block)."""
+    lines = section5_body.splitlines()
+    start: int | None = None
+    for i, line in enumerate(lines):
+        if _SUBSECTION_51_HEADING.match(line.strip()):
+            start = i
+            break
+    if start is None:
+        return None
+    body: list[str] = []
+    for line in lines[start + 1 :]:
+        if re.match(r"^#{1,6}\s", line.strip()):  # any following heading ends the subsection
+            break
+        body.append(line)
+    return "\n".join(body)
+
+
+def _section51_fence_body(controlled_spec_path: Path) -> tuple[str | None, str | None]:
+    """Return ``(fence_body, error)`` for the §5.1 canonical interface fence (the sole fenced block
+    inside the ``### 5.1`` subsection). Fail-closed on a missing subsection, a missing fence, or
+    multiple fences within §5.1."""
+    text = controlled_spec_path.read_text(encoding="utf-8", errors="ignore")
+    section = _extract_controlled_spec_section(text, "5")
+    if section is None:
+        return (None, "controlled_spec has no §5 section")
+    subsection = _extract_subsection_51(section)
+    if subsection is None:
+        return (None, "§5.1 canonical interface subsection (### 5.1) is missing")
+    blocks = _FENCED_BLOCK_RE.findall(subsection)
+    if not blocks:
+        return (None, "§5.1 canonical interface block (a fenced code block) is missing")
+    if len(blocks) > 1:
+        return (None, "§5.1 has multiple fenced code blocks (the interface block must be the only one)")
+    return (blocks[0], None)
+
+
+def _section51_parameter_lines(controlled_spec_path: Path) -> list[str]:
+    """The §5.1 module-level ``parameter`` declaration lines (e.g. ``integer, parameter :: dp =
+    real64``). These are part of the published ABI a consuming node sees but are not stanzas, so
+    they are pinned separately against the generated source."""
+    body, err = _section51_fence_body(controlled_spec_path)
+    if err or body is None:
+        return []
+    return [
+        line for line in _fortran_logical_lines(body)
+        if "::" in line and re.search(r"\bparameter\b", line, re.IGNORECASE)
+    ]
+
+
+def _parse_canonical_interface_from_controlled_spec(
+    controlled_spec_path: Path,
+) -> tuple[dict[str, list[str]], dict[str, list[str]], str | None]:
+    """Extract and parse an infrastructure node's §5.1 canonical interface block.
+
+    Returns ``(op_stanzas, type_stanzas, error)``. ``error`` is a non-``None`` message when the
+    block is missing, duplicated, unterminated, or parses to zero signatures — every such case is
+    fail-closed at the gate (a spec that fails to pin its own surface cannot certify)."""
+    body, err = _section51_fence_body(controlled_spec_path)
+    if err or body is None:
+        return ({}, {}, err)
+    op_stanzas, type_stanzas, errors = _parse_interface_stanzas(body)
+    if errors:
+        return (op_stanzas, type_stanzas, "; ".join(errors))
+    if not op_stanzas and not type_stanzas:
+        return ({}, {}, "§5.1 canonical interface block parsed 0 signatures")
+    return (op_stanzas, type_stanzas, None)
 
 
 def _contract_test_evidence_requirements(
@@ -8756,6 +9028,336 @@ def _validate_infrastructure_public_api(
         violations.append(
             f"{derived_path}:public_api.published_types declares type '{extra}' "
             "absent from controlled_spec §5")
+
+    # §5.1 canonical interface block: cross-check its signature set against §5's name lists so
+    # the two halves of the spec (prose surface + machine-readable signatures) cannot drift, and
+    # pin the IR's public_api.signatures == §5.1 so the Generate.generate leaf — which is walled
+    # off from controlled_spec.md (phase_02 §2-1) — carries the exact signatures to publish in
+    # its IR. The signature bodies are pinned against the GENERATED source separately by the
+    # Generate.static gate (_validate_infrastructure_generated_signatures).
+    op_stanzas, type_stanzas, iface_err = _parse_canonical_interface_from_controlled_spec(cs_path)
+    if iface_err:
+        violations.append(
+            f"{derived_path}:controlled_spec ({cs_ref}) §5.1 {iface_err} — the canonical "
+            "interface block must fence exactly the §5 published surface")
+        return
+    iface_ops = set(op_stanzas)
+    iface_types = set(type_stanzas)
+    for missing in sorted(spec_ops - iface_ops):
+        violations.append(
+            f"{derived_path}:controlled_spec §5.1 omits a signature for §5 operation_id "
+            f"'{missing}'")
+    for extra in sorted(iface_ops - spec_ops):
+        violations.append(
+            f"{derived_path}:controlled_spec §5.1 declares a procedure signature '{extra}' "
+            "absent from the §5 operation list")
+    for missing in sorted(spec_types - iface_types):
+        violations.append(
+            f"{derived_path}:controlled_spec §5.1 omits a definition for §5 derived type "
+            f"'{missing}'")
+    for extra in sorted(iface_types - spec_types):
+        violations.append(
+            f"{derived_path}:controlled_spec §5.1 defines a derived type '{extra}' absent from "
+            "the §5 derived-type list")
+
+    # IR public_api.signatures == §5.1 (the leaf's only source of the signatures to publish).
+    _validate_ir_signatures_against_section51(
+        derived_path, public_api, op_stanzas, type_stanzas, violations)
+
+
+def _split_top_level_commas(text: str) -> list[str]:
+    """Split ``text`` on commas that are not inside ``()`` / ``[]`` — so an entity list
+    ``a(:), b(2,2), c`` splits into ``a(:)`` / ``b(2,2)`` / ``c`` (the comma inside ``(2,2)`` is
+    NOT a separator)."""
+    parts: list[str] = []
+    depth = 0
+    cur: list[str] = []
+    for ch in text:
+        if ch in "([":
+            depth += 1
+            cur.append(ch)
+        elif ch in ")]":
+            depth = max(0, depth - 1)
+            cur.append(ch)
+        elif ch == "," and depth == 0:
+            parts.append("".join(cur))
+            cur = []
+        else:
+            cur.append(ch)
+    parts.append("".join(cur))
+    return parts
+
+
+def _declaration_atoms(logical_line: str) -> list[str]:
+    """Canonicalize a declaration into one line per declared entity, so a combined declarator
+    (``integer, intent(in) :: a, b`` — legal Fortran, ABI-identical, and explicitly permitted by
+    §5.1's "formatting may differ") compares equal to the one-per-line form. Non-declarations (a
+    ``subroutine``/``function`` header, an ``end`` line — no ``::``) pass through unchanged. The
+    shared type-spec + attributes (before ``::``) is prefixed onto each comma-separated entity of
+    the entity list (after ``::``, split on top-level commas so an array-spec comma stays intact).
+    """
+    if "::" not in logical_line:
+        return [logical_line]
+    lhs, _sep, rhs = logical_line.partition("::")
+    entities = [e.strip() for e in _split_top_level_commas(rhs)]
+    entities = [e for e in entities if e]
+    if not entities:
+        return [logical_line]
+    lhs = lhs.strip()
+    return [f"{lhs} :: {entity}" for entity in entities]
+
+
+def _stanza_atoms(lines: list[str]) -> tuple[str, ...]:
+    """Ordered, normalized, per-entity atoms of a stanza — every declaration split into one atom
+    per declared name (``_declaration_atoms``) then normalized. This is the canonical comparison
+    unit for both gates: it makes combined vs one-per-line declarations, and formatting /
+    continuation / comment / case / whitespace differences, all compare equal, while a genuine
+    name / type / rank / intent / component drift still differs. A closing ``end [type|subroutine|
+    function] [name]`` is canonicalized to drop the optional trailing name (bare ``end type`` — the
+    common Fortran style — is byte-for-ABI identical to ``end type <name>``; the type/proc name is
+    already pinned by the header)."""
+    out: list[str] = []
+    for line in lines:
+        line = _canonicalize_end_line(line)
+        for atom in _declaration_atoms(line):
+            norm = _normalize_fortran_line(atom)
+            if norm:
+                out.append(norm)
+    return tuple(out)
+
+
+def _stanza_line_set(lines: list[str]) -> frozenset[str]:
+    """Per-entity atom SET of a stanza — used where declaration order is immaterial (a procedure's
+    dummy-argument declarations, which Fortran permits in any order and which the header line
+    already pins for call order)."""
+    return frozenset(_stanza_atoms(lines))
+
+
+def _stanza_line_list(lines: list[str]) -> tuple[str, ...]:
+    """Per-entity atom LIST of a stanza, order preserved — used where order is part of the contract
+    (a derived type's component layout; a verbatim IR transcription)."""
+    return _stanza_atoms(lines)
+
+
+def _validate_ir_signatures_against_section51(
+    derived_path: Path,
+    public_api: dict[str, Any],
+    op_stanzas: dict[str, list[str]],
+    type_stanzas: dict[str, list[str]],
+    violations: list[str],
+) -> None:
+    """Pin the IR's ``public_api.signatures`` == the controlled_spec §5.1 canonical interface
+    block. Each entry is ``{symbol, interface}`` (``symbol`` names the published op/type; ``interface``
+    is its verbatim Fortran stanza). Validation: every entry is a mapping with a non-empty string
+    ``symbol`` + ``interface``; each ``interface`` parses to EXACTLY ONE stanza whose own header name
+    equals the declared ``symbol`` (a lying ``symbol`` or a multi/zero-stanza interface is fail-closed);
+    no symbol is declared twice; the symbol set equals §5.1's; and each symbol's normalized
+    interface-line LIST equals §5.1's (ordered — a derived type's component layout is part of the
+    §5 compatibility contract, so a component reorder must NOT be accepted). A drift here becomes a
+    drift in the model the Generate leaf transcribes, so it is a Compile fail to Compile.generate."""
+    spec51: dict[str, tuple[str, ...]] = {}
+    for name, lines in {**op_stanzas, **type_stanzas}.items():
+        spec51[name] = _stanza_line_list(lines)
+
+    sigs_raw = public_api.get("signatures")
+    if not isinstance(sigs_raw, list) or not sigs_raw:
+        violations.append(
+            f"{derived_path}:public_api.signatures missing — an infrastructure node must "
+            "transcribe every controlled_spec §5.1 signature (each {symbol, interface}) so the "
+            "Generate leaf can publish them verbatim")
+        return
+
+    ir_stanzas: dict[str, tuple[str, ...]] = {}
+    for idx, entry in enumerate(sigs_raw):
+        if not isinstance(entry, dict):
+            violations.append(
+                f"{derived_path}:public_api.signatures[{idx}] is not a mapping "
+                "(expected {symbol, interface})")
+            continue
+        symbol = entry.get("symbol")
+        interface = entry.get("interface")
+        if not isinstance(symbol, str) or not symbol.strip():
+            violations.append(
+                f"{derived_path}:public_api.signatures[{idx}] missing a non-empty 'symbol'")
+            continue
+        symbol = symbol.strip()
+        if not isinstance(interface, str) or not interface.strip():
+            violations.append(
+                f"{derived_path}:public_api.signatures['{symbol}'] missing a non-empty 'interface'")
+            continue
+        e_ops, e_types, e_errors = _parse_interface_stanzas(interface)
+        for err in e_errors:
+            violations.append(f"{derived_path}:public_api.signatures['{symbol}'] {err}")
+        parsed = {**e_ops, **e_types}
+        if len(parsed) != 1:
+            violations.append(
+                f"{derived_path}:public_api.signatures['{symbol}'].interface must contain exactly "
+                f"one signature stanza (found {len(parsed)})")
+            continue
+        (parsed_name, parsed_lines), = parsed.items()
+        if parsed_name != symbol:
+            violations.append(
+                f"{derived_path}:public_api.signatures['{symbol}'].interface declares a different "
+                f"symbol '{parsed_name}'")
+            continue
+        if symbol in ir_stanzas:
+            violations.append(
+                f"{derived_path}:public_api.signatures declares symbol '{symbol}' more than once")
+            continue
+        ir_stanzas[symbol] = _stanza_line_list(parsed_lines)
+
+    for missing in sorted(set(spec51) - set(ir_stanzas)):
+        violations.append(
+            f"{derived_path}:public_api.signatures omits controlled_spec §5.1 signature "
+            f"'{missing}'")
+    for extra in sorted(set(ir_stanzas) - set(spec51)):
+        violations.append(
+            f"{derived_path}:public_api.signatures declares a signature '{extra}' absent from "
+            "controlled_spec §5.1")
+    for name in sorted(set(spec51) & set(ir_stanzas)):
+        # A derived type's component ORDER is part of the §5 compatibility contract, so it is
+        # compared as an ordered list; a procedure's dummy-declaration order is Fortran-immaterial
+        # (the header line already pins call order) and is compared as a set.
+        if name in type_stanzas:
+            match = ir_stanzas[name] == spec51[name]
+        else:
+            match = frozenset(ir_stanzas[name]) == frozenset(spec51[name])
+        if not match:
+            violations.append(
+                f"{derived_path}:public_api.signatures['{name}'] does not match controlled_spec "
+                "§5.1 (argument name/type/rank/intent/result or component-layout/order drift)")
+
+
+def _validate_infrastructure_generated_signatures(
+    repo_root: Path, execution: NodeExecution, model_files: list[Path], violations: list[str]
+) -> None:
+    """R1/M3c-α deterministic signature gate (``infrastructure`` nodes only, ``Generate.static``):
+    the generated model source must publish every §5.1 canonical signature verbatim (normalized:
+    comments stripped, ``&`` continuations joined, case-folded, whitespace-insensitive).
+
+    The Compile-stage ``_validate_infrastructure_public_api`` pins the published *names* (the IR's
+    ``public_api`` set == §5 == §5.1). This gate pins the published *signatures*: each argument
+    name, order, type, rank, ``intent``, and ``result`` name the §5.1 block declares must appear
+    in the generated ``<spec_id>_model.f90``. It closes the known scope gap where the exact
+    published signature of the generated ``.f90`` rested on the ~17-min ``Generate.verify`` leaf
+    plus a Build link error — moving it to a cheap deterministic ``Generate.static`` check so a
+    signature drift routes straight back to ``Generate.generate``.
+
+    Infra-only: resolved via the IR ``meta.spec_kind``. A non-infra node is a no-op. But when the
+    node is INFRASTRUCTURE (per its ``node_key``) yet the IR / §5.1 cannot be resolved, that is
+    fail-closed, never a silent skip — Compile has already certified the IR + §5.1 exist, so their
+    absence at Generate is a real regression that must not let a drifted model pass unchecked."""
+    infra_by_key = str(execution.node_key).split("/", 1)[0].strip() == "infrastructure"
+
+    def _fail_closed_if_infra(reason: str) -> None:
+        if infra_by_key:
+            violations.append(
+                f"{execution.pipeline_dir}: infrastructure node's published signatures cannot be "
+                f"pinned at Generate.static ({reason}) — Compile certified them, so this is "
+                "fail-closed")
+
+    ir_dir = _ir_dir_for_execution(repo_root, execution)
+    if ir_dir is None:
+        _fail_closed_if_infra("IR unresolvable from lineage")
+        return
+    ir_path = ir_dir / "spec.ir.yaml"
+    if not ir_path.is_file():
+        _fail_closed_if_infra("IR spec.ir.yaml missing")
+        return
+    try:
+        ir = _read_yaml(ir_path)
+    except yaml.YAMLError:
+        _fail_closed_if_infra("IR spec.ir.yaml is malformed YAML")
+        return
+    if not isinstance(ir, dict):
+        _fail_closed_if_infra("IR spec.ir.yaml is not a mapping")
+        return
+    meta = ir.get("meta") if isinstance(ir.get("meta"), dict) else {}
+    if meta.get("spec_kind") != "infrastructure":
+        _fail_closed_if_infra("IR meta.spec_kind is not 'infrastructure'")
+        return
+    # Past this point the IR confirms an infrastructure node, so a missing/unresolvable
+    # controlled_spec is fail-closed here too (Compile certified it resolves).
+    source_refs = meta.get("source_refs") if isinstance(meta.get("source_refs"), dict) else {}
+    cs_ref = source_refs.get("controlled_spec")
+    if not isinstance(cs_ref, str) or not cs_ref.strip():
+        _fail_closed_if_infra("IR meta.source_refs.controlled_spec missing")
+        return
+    cs_path = Path(cs_ref.strip())
+    if not cs_path.is_absolute():
+        cs_path = repo_root / cs_path
+    if not cs_path.is_file():
+        _fail_closed_if_infra(f"controlled_spec ({cs_ref}) unresolvable")
+        return
+
+    op_stanzas, type_stanzas, iface_err = _parse_canonical_interface_from_controlled_spec(cs_path)
+    if iface_err:
+        violations.append(
+            f"{cs_path}: §5.1 canonical interface block {iface_err} — cannot pin the generated "
+            "model signatures against it")
+        return
+
+    target = model_files[0] if model_files else (repo_root / "<model>")
+    # Parse the generated source into per-symbol stanzas (a procedure stanza is header + its
+    # declarations + body; a type stanza is its full block) so each pinned signature is checked
+    # WITHIN its own procedure/type. A GLOBAL source line-set would let a drifted declaration in
+    # one procedure be masked by an identical (correct) declaration in another — `intent(in) :: n`
+    # is common — so the scoping is load-bearing, not cosmetic.
+    combined = "\n".join(
+        model_file.read_text(encoding="utf-8", errors="ignore") for model_file in model_files
+    )
+    src_ops, src_types, _src_errors = _parse_interface_stanzas(combined)
+    src_lists: dict[str, tuple[str, ...]] = {}
+    for name, lines in {**src_ops, **src_types}.items():
+        src_lists[name] = _stanza_line_list(lines)
+
+    for name in sorted({**op_stanzas, **type_stanzas}):
+        spec_lines = op_stanzas.get(name) or type_stanzas.get(name) or []
+        is_type = name in type_stanzas
+        kind = "derived type" if is_type else "procedure"
+        have = src_lists.get(name)
+        if have is None:
+            violations.append(
+                f"{target}: generated model source does not publish controlled_spec §5.1 {kind} "
+                f"'{name}' (no {kind} of that name/header found — the published surface must match "
+                "the pinned §5.1 signature)")
+            continue
+        if is_type:
+            # A derived type's WHOLE component layout — names, types, and ORDER, with nothing
+            # inserted — is part of the compatibility contract (§5), so the source type block must
+            # equal §5.1's atom list EXACTLY. Ordered-subsequence would accept an inserted extra
+            # component (widening the published layout); set equality would accept a reorder.
+            if have != _stanza_line_list(spec_lines):
+                violations.append(
+                    f"{target}: derived type '{name}' drifts from controlled_spec §5.1 — its "
+                    "published component layout (names/types/order, no extras) does not match the "
+                    "pinned definition")
+            continue
+        # A procedure's dummy-argument declarations may be in any order (Fortran-legal, and the
+        # header line already pins call order), so membership — not order — is checked here.
+        have_set = frozenset(have)
+        for orig in spec_lines:
+            missing_atoms = [a for a in _stanza_atoms([orig]) if a not in have_set]
+            if missing_atoms:
+                violations.append(
+                    f"{target}: procedure '{name}' drifts from controlled_spec §5.1 — missing the "
+                    f"pinned interface line `{orig.strip()}` (argument name/type/rank/intent/"
+                    "result drift from the published surface)")
+
+    # The §5.1 module-level `parameter` declarations (dp / case_id_len) are part of the published
+    # ABI but are not stanzas; pin their exact declaration (name AND value) against the source —
+    # a `case_id_len = 32` drift would otherwise be invisible (the symbolic decls still match). Use
+    # per-entity atoms so a combined `integer, parameter :: dp = real64, case_id_len = 64` matches.
+    all_src_atoms = frozenset(
+        atom for line in _fortran_logical_lines(combined) for atom in _stanza_atoms([line])
+    )
+    for pline in _section51_parameter_lines(cs_path):
+        missing_atoms = [a for a in _stanza_atoms([pline]) if a not in all_src_atoms]
+        if missing_atoms:
+            violations.append(
+                f"{target}: generated model source is missing the §5.1 module parameter "
+                f"declaration `{pline.strip()}` (a drifted parameter value silently changes the "
+                "published ABI)")
 
 
 def _validate_test_predicates(

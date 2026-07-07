@@ -1365,3 +1365,77 @@ most-recent-across-siblings), `_build_exemplar` render gating, and the build_lau
 attach scope. **Real verification is a billed E2E** (a node in a family with a certified sibling;
 attempt-1 pass rate + thinking-token delta via the timing-audit — ride-along with M1's E2E).
 Unit suite green (1972).
+
+## R1 / M3c-α — infrastructure published surface as a signature-level contract (IMPLEMENTED 2026-07-07)
+
+Canonical plan: `~/.claude/plans/dapper-baking-thompson.md` (M3c-α). M3b-cert certified the
+harness but exposed that the certified implementation had DRIFTED from its `controlled_spec` §3
+prose (string-carrying `h_named`, flat `write_diagnostics`), and the `public_api` gate pinned only
+NAMES, so "the spec is the contract" did not hold at the signature level. M3c-α makes an
+`infrastructure` node's published Fortran surface a binding, machine-checked, signature-level
+contract — the cheapest moment to do it (zero consumers yet).
+
+**Spec (v2, `spec/infrastructure/infra/harness/harness_fortran_cpu/`, `spec_version 0.2.0`).** §3
+was rewritten to (a) ACKNOWLEDGE the certified signatures byte-for-byte where the implementation
+was right (`h_named{name,json}`, non-generic `__box(name,json)`, the `__emit_*` family,
+`__parse_cases`, `__write_snapshot`, the 8-arg `__write_perf`) and (b) RESPEC the two writers
+record-driven (`__write_diagnostics(results, n)` / `__write_metrics_basis(entries, n)`) with four
+new published derived types (`h_check`, `h_metric`, `h_case_result`, `h_mb_entry`), so the JSON
+envelope assembly + verdict fold live only inside the certified operations (a per-language glue
+renderer holds zero serialization knowledge — M3c-β). A new **§5.1 canonical interface block** (a
+fenced Fortran interface: every published type + operation signature) is the machine-readable
+source of truth. `tests.md`/catalog bumped to 0.2.0 (in-place respec — no consumers).
+
+**Gates (`tools/validate_pipeline_semantics.py`).** A §5.1 parser
+(`_parse_canonical_interface_from_controlled_spec` → per-symbol *stanzas*; `_parse_interface_stanzas`,
+`_fortran_logical_lines`, `_normalize_fortran_line`, `_strip_fortran_comment`) normalizes away
+comments, `&` continuations (spanning interleaved blank/comment lines — the §5.1 `write_perf`
+header is >132 cols and MUST wrap), case, and whitespace. Three deterministic pins:
+- **Compile** (`_validate_infrastructure_public_api` + `_validate_ir_signatures_against_section51`):
+  §5-prose name set == §5.1 symbol set, AND the IR's `public_api.signatures` (`{symbol, interface}`,
+  authored by Compile.generate transcribing §5.1) == §5.1. A derived type's component layout is
+  compared ORDERED (positional-construction ABI); a procedure's dummy decls as a SET (the header
+  already pins call order). Malformed / mislabeled / duplicated entries are fail-closed.
+- **Generate.static** (`_validate_infrastructure_generated_signatures`): the generated
+  `<spec_id>_model.f90` must publish every §5.1 signature — checked PER-SYMBOL (a drift in one
+  procedure cannot be masked by an identical decl in another), types ORDERED, procs by membership,
+  plus the §5.1 module `parameter` declarations (`dp` / `case_id_len`) pinned by value. Infra-only;
+  fail-closed when a node is infrastructure (by `node_key`) but its IR/§5.1 cannot be resolved.
+
+`public_api.signatures` exists because `Generate.generate` is walled off from `controlled_spec.md`
+(phase_02 §2-1): the IR is the leaf's ONLY carrier of the signatures it must publish. This moves
+signature-exactness off the ~17-min `Generate.verify` leaf (and the Build link error) to two cheap
+deterministic checks.
+
+**Docs.** `phase_01_compile.md` (V8 + `public_api.signatures` schema + §1-1), `phase_02_generate.md`
+(the new Generate.static signature gate), `skills/workflow-{compile-generate,generate-generate,
+generate-verify}` (author/transcribe §5.1 verbatim; verify no longer re-audits signatures). Ceilings
+bumped with justifications.
+
+**Review.** Multiple independent adversarial passes (general sub-agents + Codex), iterated to
+convergence (the last two rounds found no actionable defect). Fixed across rounds: the
+whole-file-line-set false-accept (a drifted decl masked by an identical decl elsewhere → per-symbol
+scoping); component-order false-accept (set→ordered-list for types) and an inserted-extra-component
+false-accept (subsequence→exact-list); combined-declarator false-reject (`integer, intent(in) :: a,
+b` → per-entity `_declaration_atoms` splitting on top-level commas); no-space `endfunction`/`endtype`
+and bare `end type`/bare `end` (→ `end\s*` + `_canonicalize_end_line` dropping the trailing name +
+stanza loops terminating on the next header so a bare `end` can't swallow the following symbol —
+while a derived type missing its mandatory `end type` still fails closed, since a bare `end` does
+not close a type);
+`&`-continuation join across interleaved comment/blank lines (the `write_perf` header is >132 cols
+and must wrap); unpinned §5.1 parameters; duplicate-stanza overwrite; unvalidated `signatures`
+`symbol`; infra fail-closed on an unresolvable/malformed/non-infra IR; and scoping the fence to the
+`### 5.1` subsection (so an unrelated §5 fence can't brick certification). The comparison unit is a
+per-entity, end-canonicalized **atom** so every semantics-preserving Fortran formatting difference
+compares equal while a genuine name/type/rank/intent/component/order drift still fails. Remaining
+false-reject-only limitations (interface-block dummies, type-prefixed `real(dp) function` headers,
+`pure`/`elemental` prefixes, `character(4)` vs `character(len=4)`) are unreachable by the harness
+§5.1 as written and self-correcting under the verbatim-transcription instruction. Two further Codex
+passes found (a) a residual fail-open — a §5.1 type missing `end type` before the next header was
+silently accepted — now fixed (fail-closed while still bounding the cascade); and (b) a spec-wording
+error: §3/§5.1 called `dp`/`case_id_len` "public", but the certified harness keeps them module-
+private (its runner hardcodes `character(len=64)`), so the wording was corrected to "internal,
+value-pinned, not exported" rather than adding a visibility check that would false-reject a correct
+harness. **Real verification is a billed E2E #2′** (operator-run: harness single-node re-certification at 0.2.0,
+`aggregate_verdict=pass`, the strengthened gates forcing correct signatures from attempt 1). Unit
+suite green (2034). M3c-β (physical-node narrowing + host-rendered glue) and M3d (recovery) follow.
