@@ -22,9 +22,6 @@ from tools.validate_pipeline_semantics import (
     _required_raw_evidence,
     _validate_diagnostics_contract,
     _validate_diagnostics_contract_output,
-    _validate_fortran_identifier_length,
-    _validate_fortran_implicit_none_spec_list,
-    _validate_fortran_stop_code_constant,
     _validate_fortran_makefile_src_dir,
     _impl_toolchain_from_pipeline_dir,
     _validate_generate_lint_command_logs,
@@ -248,6 +245,7 @@ def _create_minimal_execution_tree(
         },
     )
     lint_command_id = "lint_cmd_fixture_001"
+    syntax_command_id = "syntax_cmd_fixture_001"
     rel_lint_log = (
         f"workspace/pipelines/{node_safe}/{pipeline_id}/source/src_20260415_001/src/command_log.jsonl"
     )
@@ -520,6 +518,20 @@ shallow_water2d_runner.o: shallow_water2d_runner.f90 shallow_water2d_model.mod
             },
             ensure_ascii=False,
         )
+        + "\n"
+        + json.dumps(
+            {
+                "command_id": syntax_command_id,
+                "tool_name": "run_syntax_check",
+                "command": [
+                    "gfortran", "-fsyntax-only", "-std=f2008",
+                    "-J", ".mods", "-I", ".mods",
+                    "shallow_water2d_model.f90", "shallow_water2d_runner.f90",
+                ],
+                "ok": True,
+            },
+            ensure_ascii=False,
+        )
         + "\n",
         encoding="utf-8",
     )
@@ -546,6 +558,25 @@ shallow_water2d_runner.o: shallow_water2d_runner.f90 shallow_water2d_model.mod
                 {
                     "preset": "fortitude",
                     "command_id": lint_command_id,
+                    "command_log_ref": rel_lint_log,
+                }
+            ],
+        },
+    )
+    # Conductor-authored, leaf-non-writable syntax evidence (pipeline-root). post_generate
+    # certifies the conductor-run generate.syntax gate (gfortran -fsyntax-only) against it.
+    _write_json(
+        pipeline_dir / "syntax_evidence" / "src_20260415_001.json",
+        {
+            "checked_at": "2026-04-15T00:00:00Z",
+            "source_id": "src_20260415_001",
+            "ok": True,
+            "stages": [
+                {
+                    "compiler": "gfortran",
+                    "status": "pass",
+                    "compiler_version": "GNU Fortran (fixture) 13.0.0",
+                    "command_id": syntax_command_id,
                     "command_log_ref": rel_lint_log,
                 }
             ],
@@ -7016,140 +7047,6 @@ shallow_water2d_runner.o: shallow_water2d_runner.f90 shallow_water2d_model.mod
             )
             self.assertEqual(violations, [])
 
-    def test_validate_post_generate_stage_rejects_implicit_none_spec_list_under_f2008(
-        self,
-    ) -> None:
-        """The F2018 `implicit none (external)` form is a compile_error under the
-        default f2008 toolchain; post_generate must flag it so generate warm-resumes
-        instead of it reaching Build/verify (orch_20260702T032026Z_75ad595e)."""
-        with tempfile.TemporaryDirectory() as tmp:
-            repo_root = Path(tmp)
-            _seed_shape_expr_schema_into(repo_root)
-            dep_model_text = (
-                "module dynamics_shallow_water_flux_2d_rusanov_p0_model\n"
-                "implicit none\ncontains\n"
-                "subroutine dynamics_shallow_water_flux_2d_rusanov_p0__compute_flux(flag)\n"
-                "  logical, intent(out) :: flag\n  flag = .true.\n"
-                "end subroutine dynamics_shallow_water_flux_2d_rusanov_p0__compute_flux\n"
-                "end module dynamics_shallow_water_flux_2d_rusanov_p0_model\n"
-            )
-            # Model uses the spec-list form fortitude C003 suggests — build-breaking under f2008.
-            model_text = (
-                "module shallow_water2d_model\n"
-                "use dynamics_shallow_water_flux_2d_rusanov_p0_model\n"
-                "implicit none (external)\ncontains\n"
-                "subroutine solve(flag)\n  logical, intent(out) :: flag\n"
-                "  call dynamics_shallow_water_flux_2d_rusanov_p0__compute_flux(flag)\n"
-                "end subroutine solve\nend module shallow_water2d_model\n"
-            )
-            runner_text = (
-                "program shallow_water2d_runner\nimplicit none\n"
-                "write(*,*) 'ok'\nend program shallow_water2d_runner\n"
-            )
-            makefile_text = (
-                "FC ?= gfortran\nOBJS = dynamics_shallow_water_flux_2d_rusanov_p0_model.o "
-                "shallow_water2d_model.o shallow_water2d_runner.o\n\n"
-                "simulate: $(OBJS)\n\t$(FC) -o $@ $(OBJS)\n"
-            )
-            _create_minimal_execution_tree(
-                repo_root,
-                dep_spec_id="dynamics_shallow_water_flux_2d_rusanov_p0",
-                model_text=model_text,
-                runner_text=runner_text,
-                run_command=["x", "y"],
-                extra_sources={
-                    "dynamics_shallow_water_flux_2d_rusanov_p0_model.f90": dep_model_text
-                },
-                makefile_text=makefile_text,
-            )
-            violations = validate_post_generate_stage(
-                repo_root,
-                "workspace",
-                "workspace/pipelines/problem__shallow_water2d__0.3.0/"
-                "shallow-water2d_20260415_001",
-                source_id="src_20260415_001",
-            )
-            self.assertTrue(
-                any("spec-list" in v for v in violations),
-                f"expected an implicit-none spec-list violation, got: {violations}",
-            )
-
-    def test_validate_post_generate_stage_allows_implicit_none_spec_list_under_f2018(
-        self,
-    ) -> None:
-        """Under an f2018 toolchain the spec-list `implicit none (external)` form is
-        legal, so the check must stay silent (no false positive)."""
-        with tempfile.TemporaryDirectory() as tmp:
-            repo_root = Path(tmp)
-            _seed_shape_expr_schema_into(repo_root)
-            dep_model_text = (
-                "module dynamics_shallow_water_flux_2d_rusanov_p0_model\n"
-                "implicit none\ncontains\n"
-                "subroutine dynamics_shallow_water_flux_2d_rusanov_p0__compute_flux(flag)\n"
-                "  logical, intent(out) :: flag\n  flag = .true.\n"
-                "end subroutine dynamics_shallow_water_flux_2d_rusanov_p0__compute_flux\n"
-                "end module dynamics_shallow_water_flux_2d_rusanov_p0_model\n"
-            )
-            model_text = (
-                "module shallow_water2d_model\n"
-                "use dynamics_shallow_water_flux_2d_rusanov_p0_model\n"
-                "implicit none (external)\ncontains\n"
-                "subroutine solve(flag)\n  logical, intent(out) :: flag\n"
-                "  call dynamics_shallow_water_flux_2d_rusanov_p0__compute_flux(flag)\n"
-                "end subroutine solve\nend module shallow_water2d_model\n"
-            )
-            runner_text = (
-                "program shallow_water2d_runner\nimplicit none\n"
-                "write(*,*) 'ok'\nend program shallow_water2d_runner\n"
-            )
-            makefile_text = (
-                "FC ?= gfortran\nOBJS = dynamics_shallow_water_flux_2d_rusanov_p0_model.o "
-                "shallow_water2d_model.o shallow_water2d_runner.o\n\n"
-                "simulate: $(OBJS)\n\t$(FC) -o $@ $(OBJS)\n"
-            )
-            impl_resolved = {
-                "target": {
-                    "class": "cpu",
-                    "backend": "fortran",
-                    "architecture": "x86_64",
-                },
-                "toolchain": {
-                    "language": "fortran",
-                    "standard": "f2018",
-                    "build_system": "make",
-                },
-                "selected": {"backend_key": "cpu/x86_64/fortran/make"},
-                "abstract": {
-                    "parallelism": "none",
-                    "layout": "scalar_interfaces",
-                    "fusion": "none",
-                },
-                "backend_overrides": [],
-            }
-            _create_minimal_execution_tree(
-                repo_root,
-                dep_spec_id="dynamics_shallow_water_flux_2d_rusanov_p0",
-                model_text=model_text,
-                runner_text=runner_text,
-                run_command=["x", "y"],
-                extra_sources={
-                    "dynamics_shallow_water_flux_2d_rusanov_p0_model.f90": dep_model_text
-                },
-                makefile_text=makefile_text,
-                impl_resolved=impl_resolved,
-            )
-            violations = validate_post_generate_stage(
-                repo_root,
-                "workspace",
-                "workspace/pipelines/problem__shallow_water2d__0.3.0/"
-                "shallow-water2d_20260415_001",
-                source_id="src_20260415_001",
-            )
-            self.assertFalse(
-                any("spec-list" in v for v in violations),
-                f"spec-list check must be silent under f2018, got: {violations}",
-            )
-
     def test_validate_post_generate_stage_rejects_bad_top_level_pipeline_id(self) -> None:
         """post_generate must enforce the lineage top-level pipeline_id schema (the
         same check post_execute runs), so a malformed pipeline_id surfaces at Generate
@@ -8090,6 +7987,207 @@ shallow_water2d_runner.o: shallow_water2d_runner.f90 shallow_water2d_model.mod
             meta_path = self._lint_evidence_fixture(repo_root, None)
             violations: list[str] = []
             _validate_generate_lint_command_logs(
+                repo_root, meta_path, {"verification_status": "fail"}, "fortran", violations)
+            self.assertEqual(violations, [])
+
+    def _syntax_evidence_fixture(self, repo_root: Path, evidence: dict | None) -> Path:
+        """Build <repo>/workspace/pipelines/p/pid/source/src_x/source_meta.json and
+        (optionally) the conductor syntax evidence at the pipeline root. Returns meta_path."""
+        pipe = repo_root / "workspace" / "pipelines" / "p" / "pid"
+        gen_dir = pipe / "source" / "src_x"
+        gen_dir.mkdir(parents=True, exist_ok=True)
+        meta_path = gen_dir / "source_meta.json"
+        if evidence is not None:
+            _write_json(pipe / "syntax_evidence" / "src_x.json", evidence)
+        return meta_path
+
+    def _seed_syntax_command_log(self, repo_root: Path, records: list[dict]) -> str:
+        """Write records into the canonical <gen>/src/command_log.jsonl and return its
+        repo-relative ref."""
+        log_rel = "workspace/pipelines/p/pid/source/src_x/src/command_log.jsonl"
+        log_path = repo_root / log_rel
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        log_path.write_text(
+            "\n".join(json.dumps(r, ensure_ascii=False) for r in records) + "\n",
+            encoding="utf-8")
+        return log_rel
+
+    def test_validate_generate_syntax_rejects_pass_without_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            meta_path = self._syntax_evidence_fixture(repo_root, None)
+            violations: list[str] = []
+            vps._validate_generate_syntax_command_logs(
+                repo_root, meta_path, {"verification_status": "pass"}, "fortran", violations)
+            self.assertTrue(
+                any("missing conductor syntax evidence" in v for v in violations), violations)
+
+    def test_validate_generate_syntax_skips_for_non_fortran_language(self) -> None:
+        # cpp has no syntax-check adapter: the gate passes through with no evidence, so
+        # certification must not demand it even when verify claims pass.
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            meta_path = self._syntax_evidence_fixture(repo_root, None)
+            violations: list[str] = []
+            vps._validate_generate_syntax_command_logs(
+                repo_root, meta_path, {"verification_status": "pass"}, "cpp", violations)
+            self.assertEqual(violations, [])
+
+    def test_validate_generate_syntax_rejects_evidence_not_ok(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            meta_path = self._syntax_evidence_fixture(repo_root, {
+                "checked_at": "t", "source_id": "src_x", "ok": False,
+                "stages": [{"compiler": "gfortran", "status": "fail",
+                            "command_id": "a",
+                            "command_log_ref": "workspace/x/command_log.jsonl"}],
+            })
+            violations: list[str] = []
+            vps._validate_generate_syntax_command_logs(
+                repo_root, meta_path, {"verification_status": "pass"}, "fortran", violations)
+            self.assertTrue(
+                any("syntax gate did not succeed" in v for v in violations), violations)
+
+    def test_validate_generate_syntax_rejects_skipped_gfortran_stage(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            meta_path = self._syntax_evidence_fixture(repo_root, {
+                "checked_at": "t", "source_id": "src_x", "ok": True,
+                "stages": [{"compiler": "gfortran", "status": "skipped",
+                            "reason": "compiler not available: gfortran"}],
+            })
+            violations: list[str] = []
+            vps._validate_generate_syntax_command_logs(
+                repo_root, meta_path, {"verification_status": "pass"}, "fortran", violations)
+            self.assertTrue(
+                any("mandatory gfortran" in v for v in violations), violations)
+
+    def test_validate_generate_syntax_rejects_missing_gfortran_stage(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            log_rel = self._seed_syntax_command_log(repo_root, [{
+                "command_id": "a", "tool_name": "run_syntax_check",
+                "command": ["frt", "-c", "x.f90"], "ok": True,
+            }])
+            meta_path = self._syntax_evidence_fixture(repo_root, {
+                "checked_at": "t", "source_id": "src_x", "ok": True,
+                "stages": [{"compiler": "frt", "status": "pass",
+                            "command_id": "a", "command_log_ref": log_rel}],
+            })
+            violations: list[str] = []
+            vps._validate_generate_syntax_command_logs(
+                repo_root, meta_path, {"verification_status": "pass"}, "fortran", violations)
+            self.assertTrue(
+                any("must record a passing gfortran stage" in v for v in violations),
+                violations)
+
+    def test_validate_generate_syntax_allows_skipped_optional_stage(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            log_rel = self._seed_syntax_command_log(repo_root, [{
+                "command_id": "a", "tool_name": "run_syntax_check",
+                "command": ["gfortran", "-fsyntax-only", "-std=f2008", "x.f90"],
+                "ok": True,
+            }])
+            meta_path = self._syntax_evidence_fixture(repo_root, {
+                "checked_at": "t", "source_id": "src_x", "ok": True,
+                "stages": [
+                    {"compiler": "gfortran", "status": "pass",
+                     "command_id": "a", "command_log_ref": log_rel},
+                    {"compiler": "frt", "status": "skipped",
+                     "reason": "compiler not available: frt"},
+                ],
+            })
+            violations: list[str] = []
+            vps._validate_generate_syntax_command_logs(
+                repo_root, meta_path, {"verification_status": "pass"}, "fortran", violations)
+            self.assertEqual(violations, [])
+
+    def test_validate_generate_syntax_rejects_command_mismatch(self) -> None:
+        # The logged argv[0] must match the declared stage compiler — a forged evidence
+        # entry pointing at some other tool's record is rejected.
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            log_rel = self._seed_syntax_command_log(repo_root, [{
+                "command_id": "a", "tool_name": "run_syntax_check",
+                "command": ["fortitude", "check", "."], "ok": True,
+            }])
+            meta_path = self._syntax_evidence_fixture(repo_root, {
+                "checked_at": "t", "source_id": "src_x", "ok": True,
+                "stages": [{"compiler": "gfortran", "status": "pass",
+                            "command_id": "a", "command_log_ref": log_rel}],
+            })
+            violations: list[str] = []
+            vps._validate_generate_syntax_command_logs(
+                repo_root, meta_path, {"verification_status": "pass"}, "fortran", violations)
+            self.assertTrue(
+                any("does not match compiler 'gfortran'" in v for v in violations),
+                violations)
+
+    def test_validate_generate_syntax_rejects_wrong_tool_name_record(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            log_rel = self._seed_syntax_command_log(repo_root, [{
+                "command_id": "a", "tool_name": "run_linter",
+                "command": ["gfortran", "-fsyntax-only", "x.f90"], "ok": True,
+            }])
+            meta_path = self._syntax_evidence_fixture(repo_root, {
+                "checked_at": "t", "source_id": "src_x", "ok": True,
+                "stages": [{"compiler": "gfortran", "status": "pass",
+                            "command_id": "a", "command_log_ref": log_rel}],
+            })
+            violations: list[str] = []
+            vps._validate_generate_syntax_command_logs(
+                repo_root, meta_path, {"verification_status": "pass"}, "fortran", violations)
+            self.assertTrue(
+                any("tool_name must be run_syntax_check" in v for v in violations),
+                violations)
+
+    def test_validate_generate_syntax_rejects_noncanonical_log_ref(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            forged_rel = "workspace/pipelines/p/pid/source/src_x/src/notes/command_log.jsonl"
+            forged = repo_root / forged_rel
+            forged.parent.mkdir(parents=True, exist_ok=True)
+            forged.write_text(json.dumps({
+                "command_id": "a", "tool_name": "run_syntax_check",
+                "command": ["gfortran", "-fsyntax-only", "x.f90"], "ok": True,
+            }) + "\n", encoding="utf-8")
+            meta_path = self._syntax_evidence_fixture(repo_root, {
+                "checked_at": "t", "source_id": "src_x", "ok": True,
+                "stages": [{"compiler": "gfortran", "status": "pass",
+                            "command_id": "a", "command_log_ref": forged_rel}],
+            })
+            violations: list[str] = []
+            vps._validate_generate_syntax_command_logs(
+                repo_root, meta_path, {"verification_status": "pass"}, "fortran", violations)
+            self.assertTrue(
+                any("canonical MCP audit log placement" in v for v in violations),
+                violations)
+
+    def test_validate_generate_syntax_certifies_at_static_without_pass(self) -> None:
+        # Like lint: the cert runs whenever the conductor evidence exists, not only on a
+        # verify pass (post_generate runs in generate.static BEFORE verify).
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            meta_path = self._syntax_evidence_fixture(repo_root, {
+                "checked_at": "t", "source_id": "src_x", "ok": False,
+                "stages": [{"compiler": "gfortran", "status": "fail",
+                            "command_id": "a",
+                            "command_log_ref": "workspace/x/command_log.jsonl"}],
+            })
+            violations: list[str] = []
+            vps._validate_generate_syntax_command_logs(
+                repo_root, meta_path, {"verification_status": "fail"}, "fortran", violations)
+            self.assertTrue(
+                any("syntax gate did not succeed" in v for v in violations), violations)
+
+    def test_validate_generate_syntax_skips_when_no_evidence_and_not_pass(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            meta_path = self._syntax_evidence_fixture(repo_root, None)
+            violations: list[str] = []
+            vps._validate_generate_syntax_command_logs(
                 repo_root, meta_path, {"verification_status": "fail"}, "fortran", violations)
             self.assertEqual(violations, [])
 
@@ -10499,444 +10597,6 @@ class DiagnosticsContractOutputTest(unittest.TestCase):
 
     def test_no_contract_means_no_check(self) -> None:
         self.assertEqual([], self._run({"cases": []}, contract={"io_contract": {}}))
-
-
-class FortranIdentifierLengthTests(unittest.TestCase):
-    """post_generate flags over-63-char Fortran identifiers (f2008 name limit).
-
-    An over-limit name only fails at the Build step as a compile_error,
-    forcing a regenerate -> rebuild retry. Catching it at post_generate fails
-    the cheap deterministic generate.static substep first.
-    """
-
-    def _src_dir(self, body: str) -> Path:
-        d = Path(tempfile.mkdtemp())
-        self.addCleanup(shutil.rmtree, d, ignore_errors=True)
-        (d / "mod.f90").write_text(body, encoding="utf-8")
-        return d
-
-    def test_boundary_63_ok_64_flagged(self) -> None:
-        ok = "a" * 63
-        bad = "b" * 64
-        src = self._src_dir(
-            f"subroutine {ok}()\nend subroutine\n"
-            f"subroutine {bad}(x)\nend subroutine\n"
-        )
-        violations: list[str] = []
-        _validate_fortran_identifier_length(src, violations)
-        self.assertEqual(len(violations), 1, msg=violations)
-        self.assertIn(bad, violations[0])
-        self.assertNotIn(ok, violations[0])
-
-    def test_ignores_comments_and_strings(self) -> None:
-        long_tok = "c" * 70
-        src = self._src_dir(
-            f"! a comment with {long_tok}\n"
-            f'call foo("{long_tok}")\n'
-        )
-        violations: list[str] = []
-        _validate_fortran_identifier_length(src, violations)
-        self.assertEqual(violations, [])
-
-    def test_reports_each_distinct_name_once(self) -> None:
-        bad = "d" * 80
-        src = self._src_dir(
-            f"call {bad}(1)\ncall {bad}(2)\ninteger :: {bad}\n"
-        )
-        violations: list[str] = []
-        _validate_fortran_identifier_length(src, violations)
-        self.assertEqual(len(violations), 1, msg=violations)
-
-    def test_only_scans_fortran_suffixes(self) -> None:
-        d = Path(tempfile.mkdtemp())
-        self.addCleanup(shutil.rmtree, d, ignore_errors=True)
-        (d / "notes.txt").write_text("e" * 80 + "\n", encoding="utf-8")
-        violations: list[str] = []
-        _validate_fortran_identifier_length(d, violations)
-        self.assertEqual(violations, [])
-
-    def test_ignores_long_word_in_continued_string_literal(self) -> None:
-        # A free-form `&`-continued character literal carries its in-string state
-        # to the continuation line; a long word there must not be flagged.
-        long_word = "x" * 80
-        src = self._src_dir(
-            'print *, "a long diagnostic message that wraps &\n'
-            f'&with {long_word} inside the string"\n'
-            "end\n"
-        )
-        violations: list[str] = []
-        _validate_fortran_identifier_length(src, violations)
-        self.assertEqual(violations, [])
-
-    def test_still_flags_long_identifier_after_continued_string(self) -> None:
-        # State must reset once the string closes: a real over-limit identifier
-        # on a later line is still caught.
-        long_word = "y" * 80
-        bad = "z" * 64
-        src = self._src_dir(
-            'print *, "wrapped &\n'
-            f'&{long_word}"\n'
-            f"call {bad}()\n"
-        )
-        violations: list[str] = []
-        _validate_fortran_identifier_length(src, violations)
-        self.assertEqual(len(violations), 1, msg=violations)
-        self.assertIn(bad, violations[0])
-
-    def test_identifier_split_across_continuation_is_not_flagged(self) -> None:
-        # Documented accepted limitation: an identifier split by a free-form `&`
-        # continuation is seen as two short tokens, so it is NOT flagged here —
-        # the build step's compile_error is the backstop. This test pins that
-        # behavior so a future reader does not assume completeness.
-        half = "n" * 40  # each half < 63, joined name would be 80 > 63
-        src = self._src_dir(f"subroutine very_{half}&\n&{half}()\nend subroutine\n")
-        violations: list[str] = []
-        _validate_fortran_identifier_length(src, violations)
-        self.assertEqual(violations, [])
-
-    def test_missing_src_dir_is_safe(self) -> None:
-        missing = Path(tempfile.mkdtemp()) / "does_not_exist"
-        violations: list[str] = []
-        _validate_fortran_identifier_length(missing, violations)
-        self.assertEqual(violations, [])
-
-    def test_does_not_scan_fixed_form_sources(self) -> None:
-        # Fixed-form .f / .for use column-1 C/c/* comment markers the free-form
-        # stripper does not understand; scanning them would mis-flag a long word
-        # in a comment. The generator emits free-form .f90, so they are skipped.
-        d = Path(tempfile.mkdtemp())
-        self.addCleanup(shutil.rmtree, d, ignore_errors=True)
-        long_word = "f" * 80
-        (d / "legacy.f").write_text(f"C this fixed-form comment has {long_word}\n", encoding="utf-8")
-        (d / "legacy.for").write_text(f"* another comment {long_word}\n", encoding="utf-8")
-        violations: list[str] = []
-        _validate_fortran_identifier_length(d, violations)
-        self.assertEqual(violations, [])
-
-
-class FortranImplicitNoneSpecListTests(unittest.TestCase):
-    """post_generate flags the F2018 spec-list `implicit none (...)` under f2008.
-
-    That form is what fortitude C003 wants but is a compile_error under
-    `-std=f2008` (`Fortran 2018: IMPLICIT NONE with spec list`); lint and the
-    non-compiling static gate both miss it, so it only surfaces at Build or
-    verify (observed in orch_20260702T032026Z_75ad595e). Catching it here fails
-    the cheap deterministic generate.static substep and warm-resumes generate.
-    """
-
-    def _src_dir(self, body: str) -> Path:
-        d = Path(tempfile.mkdtemp())
-        self.addCleanup(shutil.rmtree, d, ignore_errors=True)
-        (d / "mod.f90").write_text(body, encoding="utf-8")
-        return d
-
-    def test_external_spec_list_flagged_under_f2008(self) -> None:
-        src = self._src_dir("module m\n  implicit none (external)\nend module m\n")
-        violations: list[str] = []
-        _validate_fortran_implicit_none_spec_list(src, "f2008", violations)
-        self.assertEqual(len(violations), 1, msg=violations)
-        self.assertIn("spec-list", violations[0])
-
-    def test_type_external_spec_list_flagged(self) -> None:
-        src = self._src_dir("module m\n  implicit none (type, external)\nend\n")
-        violations: list[str] = []
-        _validate_fortran_implicit_none_spec_list(src, "f2008", violations)
-        self.assertEqual(len(violations), 1, msg=violations)
-
-    def test_plain_implicit_none_is_clean(self) -> None:
-        src = self._src_dir("module m\n  ! allow(C003)\n  implicit none\nend\n")
-        violations: list[str] = []
-        _validate_fortran_implicit_none_spec_list(src, "f2008", violations)
-        self.assertEqual(violations, [])
-
-    def test_not_flagged_when_standard_is_f2018(self) -> None:
-        # f2018/f2023 accept the spec-list form, so the check stays silent.
-        src = self._src_dir("module m\n  implicit none (external)\nend\n")
-        violations: list[str] = []
-        _validate_fortran_implicit_none_spec_list(src, "f2018", violations)
-        self.assertEqual(violations, [])
-
-    def test_flagged_when_standard_unresolved(self) -> None:
-        # None -> treated as the f2008 series the generator targets (protective).
-        src = self._src_dir("module m\n  implicit none (external)\nend\n")
-        violations: list[str] = []
-        _validate_fortran_implicit_none_spec_list(src, None, violations)
-        self.assertEqual(len(violations), 1, msg=violations)
-
-    def test_spec_list_in_comment_or_string_ignored(self) -> None:
-        src = self._src_dir(
-            "module m\n"
-            "  ! implicit none (external) mentioned in a comment\n"
-            '  character(*), parameter :: s = "implicit none (external)"\n'
-            "  implicit none\nend\n"
-        )
-        violations: list[str] = []
-        _validate_fortran_implicit_none_spec_list(src, "f2008", violations)
-        self.assertEqual(violations, [])
-
-    def test_reports_each_file_once(self) -> None:
-        src = self._src_dir(
-            "module m\n  implicit none (external)\ncontains\n"
-            "  subroutine s()\n    implicit none (external)\n  end subroutine\n"
-            "end module m\n"
-        )
-        violations: list[str] = []
-        _validate_fortran_implicit_none_spec_list(src, "f2008", violations)
-        self.assertEqual(len(violations), 1, msg=violations)
-
-
-class FortranStopCodeConstantTests(unittest.TestCase):
-    """post_generate flags a non-constant STOP/ERROR STOP code under f2008.
-
-    Under `-std=f2008` a STOP code must be a scalar CHARACTER/INTEGER constant
-    expression; a `//` concatenation folding in a variable (`'unknown case: '//cid`)
-    is a `build_compile_error` that lint and the non-compiling static gate both miss —
-    it surfaced on the harness self-test runner in orch_20260708T082701Z_356befd7.
-    Catching it here warm-resumes generate.generate instead of a dev_phase_rollback.
-    """
-
-    def _src_dir(self, body: str, name: str = "runner.f90") -> Path:
-        d = Path(tempfile.mkdtemp())
-        self.addCleanup(shutil.rmtree, d, ignore_errors=True)
-        (d / name).write_text(body, encoding="utf-8")
-        return d
-
-    def _src_dir_multi(self, files: dict[str, str]) -> Path:
-        d = Path(tempfile.mkdtemp())
-        self.addCleanup(shutil.rmtree, d, ignore_errors=True)
-        for name, body in files.items():
-            (d / name).write_text(body, encoding="utf-8")
-        return d
-
-    def test_imported_parameter_from_sibling_module_is_clean(self) -> None:
-        # A CHARACTER parameter declared in a sibling module (same src/) and `use`d here is
-        # a constant expr — gfortran -std=f2008 accepts `PFX//'boom'`. Parameter names are
-        # collected as the UNION across every file, so it must NOT be flagged.
-        src = self._src_dir_multi({
-            "consts.f90":
-                "module consts\n  character(*), parameter :: PFX = 'err: '\nend module consts\n",
-            "prog.f90":
-                "program p\n  use consts, only: PFX\n  error stop PFX//'boom'\nend program p\n",
-        })
-        violations: list[str] = []
-        _validate_fortran_stop_code_constant(src, "f2008", violations)
-        self.assertEqual(violations, [], msg=violations)
-
-    def test_stop_array_and_component_assignment_ignored(self) -> None:
-        # `stop(i) = ..` / `stop%c = ..` are assignments to a variable named `stop`, not STOP
-        # statements — the code half carries an assignment `=`, so they are skipped.
-        for body in (
-            "program p\n character(:),allocatable::stop(:),a,b\n stop(1) = a//b\nend program p\n",
-            "program p\n type t\n  character(:),allocatable::f\n end type\n"
-            " type(t)::stop\n character(:),allocatable::a,b\n stop%f = a//b\nend program p\n",
-        ):
-            src = self._src_dir(body)
-            violations: list[str] = []
-            _validate_fortran_stop_code_constant(src, "f2008", violations)
-            self.assertEqual(violations, [], msg=body)
-
-    def test_literal_concat_variable_flagged(self) -> None:
-        # The exact recurring flake.
-        src = self._src_dir(
-            "program p\n  character(:), allocatable :: cid\n"
-            "  error stop 'harness runner: unknown case_id: '//cid\n"
-            "end program p\n")
-        violations: list[str] = []
-        _validate_fortran_stop_code_constant(src, "f2008", violations)
-        self.assertEqual(len(violations), 1, msg=violations)
-        self.assertIn("STOP", violations[0])
-
-    def test_variable_leading_concat_flagged(self) -> None:
-        src = self._src_dir("program p\n  stop cid//' bad'\nend program p\n")
-        violations: list[str] = []
-        _validate_fortran_stop_code_constant(src, "f2008", violations)
-        self.assertEqual(len(violations), 1, msg=violations)
-
-    def test_constant_literal_and_integer_codes_clean(self) -> None:
-        src = self._src_dir(
-            "program p\n"
-            "  if (bad) error stop 'a fixed message'\n"
-            "  error stop 42\n"
-            "  stop\n"
-            "  error stop 'a'//'b'\n"  # all-literal concat is a constant expr
-            "end program p\n")
-        violations: list[str] = []
-        _validate_fortran_stop_code_constant(src, "f2008", violations)
-        self.assertEqual(violations, [], msg=violations)
-
-    def test_not_flagged_when_standard_is_f2018(self) -> None:
-        # F2018 allows a non-constant stop code, so the check stays silent.
-        src = self._src_dir("program p\n  error stop 'x: '//cid\nend program p\n")
-        violations: list[str] = []
-        _validate_fortran_stop_code_constant(src, "f2018", violations)
-        self.assertEqual(violations, [])
-
-    def test_flagged_when_standard_unresolved(self) -> None:
-        src = self._src_dir("program p\n  error stop 'x: '//cid\nend program p\n")
-        violations: list[str] = []
-        _validate_fortran_stop_code_constant(src, None, violations)
-        self.assertEqual(len(violations), 1, msg=violations)
-
-    def test_stop_as_variable_assignment_ignored(self) -> None:
-        # `stop` is a legal variable name; `stop = a//b` is an assignment, not a STOP.
-        src = self._src_dir(
-            "program p\n  character(:), allocatable :: stop, a, b\n"
-            "  stop = a//b\nend program p\n")
-        violations: list[str] = []
-        _validate_fortran_stop_code_constant(src, "f2008", violations)
-        self.assertEqual(violations, [])
-
-    def test_concat_in_condition_or_later_statement_ignored(self) -> None:
-        # A `//` in the IF condition (before the code) or in a later `;` statement
-        # is not part of the STOP code.
-        src = self._src_dir(
-            "program p\n"
-            "  if (a//b == c) error stop 7\n"
-            "  error stop 3; s = p//q\n"
-            "end program p\n")
-        violations: list[str] = []
-        _validate_fortran_stop_code_constant(src, "f2008", violations)
-        self.assertEqual(violations, [])
-
-    def test_concat_in_comment_or_string_ignored(self) -> None:
-        src = self._src_dir(
-            "program p\n"
-            "  ! error stop 'x: '//cid mentioned in a comment\n"
-            '  character(*), parameter :: s = "error stop bad: "//""\n'
-            "  error stop 'ok'\nend program p\n")
-        violations: list[str] = []
-        _validate_fortran_stop_code_constant(src, "f2008", violations)
-        self.assertEqual(violations, [])
-
-    def test_reports_each_file_once(self) -> None:
-        src = self._src_dir(
-            "program p\n  error stop 'a: '//x\n  error stop 'b: '//y\nend program p\n")
-        violations: list[str] = []
-        _validate_fortran_stop_code_constant(src, "f2008", violations)
-        self.assertEqual(len(violations), 1, msg=violations)
-
-    def test_named_parameter_concat_is_clean(self) -> None:
-        # `pre//suf` where both are CHARACTER parameters is a constant expr — gfortran
-        # -std=f2008 accepts it, so the gate must be parameter-aware and NOT flag it.
-        src = self._src_dir(
-            "program p\n"
-            "  character(*), parameter :: pre = 'a: ', suf = 'b'\n"
-            "  error stop pre//suf\n"
-            "end program p\n")
-        violations: list[str] = []
-        _validate_fortran_stop_code_constant(src, "f2008", violations)
-        self.assertEqual(violations, [], msg=violations)
-
-    def test_constant_intrinsic_call_concat_is_clean(self) -> None:
-        # `'x'//new_line('a')` is a constant expr (gfortran -std=f2008 accepts it); a
-        # `name(...)` operand is treated leniently as constant to avoid this false positive.
-        src = self._src_dir(
-            "program p\n  error stop 'line1'//new_line('a')\nend program p\n")
-        violations: list[str] = []
-        _validate_fortran_stop_code_constant(src, "f2008", violations)
-        self.assertEqual(violations, [], msg=violations)
-
-    def test_parameter_concatenated_with_variable_flagged(self) -> None:
-        # A parameter concatenated with a VARIABLE is non-constant (gfortran rejects it).
-        src = self._src_dir(
-            "program p\n"
-            "  character(*), parameter :: pre = 'a: '\n"
-            "  character(:), allocatable :: v\n"
-            "  v = 'x'\n"
-            "  error stop pre//v\n"
-            "end program p\n")
-        violations: list[str] = []
-        _validate_fortran_stop_code_constant(src, "f2008", violations)
-        self.assertEqual(len(violations), 1, msg=violations)
-
-    def test_parameter_name_on_continuation_line_is_clean(self) -> None:
-        # A parameter whose name (or the `, parameter ::` head) wraps across a `&`
-        # continuation must still be collected, else a legal `pre//suf` is false-flagged.
-        # Both forms below compile under gfortran -std=f2008.
-        for body in (
-            "program p\n"
-            "  character(*), parameter :: pre = 'a: ', &\n"
-            "                             suf = 'b'\n"
-            "  error stop pre//suf\nend program p\n",
-            "program p\n"
-            "  character(*), &\n"
-            "    parameter :: pre = 'a: ', suf = 'b'\n"
-            "  error stop pre//suf\nend program p\n",
-        ):
-            src = self._src_dir(body)
-            violations: list[str] = []
-            _validate_fortran_stop_code_constant(src, "f2008", violations)
-            self.assertEqual(violations, [], msg=body)
-
-    def test_component_reference_operand_is_lenient(self) -> None:
-        # `base%comp` is treated leniently (a component of a derived-type parameter is a
-        # constant expr); not false-flagged even without a symbol table for `base`. The
-        # spaced form `base % comp` must be handled symmetrically on both operand sides.
-        for body in (
-            "program p\n  error stop cfg%msg//' end'\nend program p\n",
-            "program p\n  error stop 'x: '//cfg%msg\nend program p\n",
-            "program p\n  error stop cfg % msg//' end'\nend program p\n",
-            "program p\n  error stop 'x: '//cfg % msg\nend program p\n",
-        ):
-            src = self._src_dir(body)
-            violations: list[str] = []
-            _validate_fortran_stop_code_constant(src, "f2008", violations)
-            self.assertEqual(violations, [], msg=body)
-
-    def test_stop_variable_in_write_list_ignored(self) -> None:
-        # `write(*,*) stop//x` — `stop` is a variable in an output list, and the `)` closes
-        # a `write(...)`, not a control guard, so it must NOT be read as a STOP statement.
-        src = self._src_dir(
-            "program p\n character(:),allocatable::stop,x\n write(*,*) stop//x\nend program p\n")
-        violations: list[str] = []
-        _validate_fortran_stop_code_constant(src, "f2008", violations)
-        self.assertEqual(violations, [], msg=violations)
-
-    def test_if_guard_stop_flake_flagged(self) -> None:
-        # The `)`-position IS a statement when the `)` closes an `if (..)` guard.
-        src = self._src_dir(
-            "program p\n character(:),allocatable::cid\n if (bad) stop 'x: '//cid\nend program p\n")
-        violations: list[str] = []
-        _validate_fortran_stop_code_constant(src, "f2008", violations)
-        self.assertEqual(len(violations), 1, msg=violations)
-
-    def test_stop_as_variable_operand_ignored(self) -> None:
-        # `stop` is a legal identifier; used as a `//` operand (not at statement position)
-        # it must NOT be read as a STOP statement.
-        for body in (
-            "program p\n character(:),allocatable::stop,y\n x = stop // y\nend program p\n",
-            "program p\n character(:),allocatable::stop,bar\n call foo(stop//bar)\nend program p\n",
-            "program p\n character(:),allocatable::stop,suf\n z = trim(stop)//suf\nend program p\n",
-        ):
-            src = self._src_dir(body)
-            violations: list[str] = []
-            _validate_fortran_stop_code_constant(src, "f2008", violations)
-            self.assertEqual(violations, [], msg=body)
-
-    def test_only_scans_fortran_suffixes(self) -> None:
-        d = Path(tempfile.mkdtemp())
-        self.addCleanup(shutil.rmtree, d, ignore_errors=True)
-        (d / "notes.txt").write_text("implicit none (external)\n", encoding="utf-8")
-        violations: list[str] = []
-        _validate_fortran_implicit_none_spec_list(d, "f2008", violations)
-        self.assertEqual(violations, [])
-
-    def test_missing_src_dir_is_safe(self) -> None:
-        missing = Path(tempfile.mkdtemp()) / "does_not_exist"
-        violations: list[str] = []
-        _validate_fortran_implicit_none_spec_list(missing, "f2008", violations)
-        self.assertEqual(violations, [])
-
-    def test_line_continuation_split_is_accepted_limitation(self) -> None:
-        # Documented accepted limitation (mirrors the identifier-length check): an
-        # `implicit none &` continued onto the next line before the `(` is seen as
-        # two physical lines and NOT flagged — under-report only, Build is the
-        # backstop. This test pins the behavior so a future reader does not assume
-        # completeness. (The generator emits the form on one line.)
-        src = self._src_dir("module m\n  implicit none &\n    (external)\nend\n")
-        violations: list[str] = []
-        _validate_fortran_implicit_none_spec_list(src, "f2008", violations)
-        self.assertEqual(violations, [])
 
 
 class ModelSourceNotFoundMessageTests(unittest.TestCase):

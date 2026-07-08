@@ -1,0 +1,56 @@
+{
+  "name": "run_syntax_check",
+  "description": "Run a compiler front-end in syntax-only mode over staged Fortran sources (Generate-stage gate). Registered compiler adapters only (gfortran); no custom command, no build artifacts, does not route through build_system.",
+  "arguments": {
+    "type": "object",
+    "properties": {
+      "project_dir": {
+        "type": "string",
+        "default": "."
+      },
+      "compiler": {
+        "type": "string",
+        "default": "gfortran",
+        "description": "Registered compiler adapter id (gfortran)."
+      },
+      "std": {
+        "type": "string",
+        "default": "f2008",
+        "description": "Language standard from impl_defaults.toolchain.standard."
+      },
+      "openmp": {
+        "type": "boolean",
+        "default": false,
+        "description": "Enable the adapter's OpenMP flag (target.backend=openmp)."
+      },
+      "sources": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        },
+        "description": "Source file names in compile order. Omit to let the tool order the project_dir Fortran sources by a module/use scan."
+      },
+      "timeout_sec": {
+        "type": "integer",
+        "minimum": 1
+      },
+      "capture_limit": {
+        "type": "integer",
+        "minimum": 1000
+      },
+      "command_log_path": {
+        "type": "string",
+        "description": "JSONL path for command logs. Relative paths are resolved from project_dir."
+      },
+      "env": {
+        "type": "object",
+        "additionalProperties": {
+          "type": "string"
+        }
+      }
+    },
+    "required": [
+      "project_dir"
+    ]
+  }
+}

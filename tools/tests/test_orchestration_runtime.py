@@ -778,7 +778,7 @@ shell_tool                       stable             true
     def test_probe_claude_mcp_registry_passes_when_individual_tool_permissions_granted(
         self,
     ) -> None:
-        """Permission passes if the required 4 tools are individually allowed, even without a server-level grant."""
+        """Permission passes if the required 5 tools are individually allowed, even without a server-level grant."""
         with tempfile.TemporaryDirectory() as td:
             repo_root = Path(td)
             self._write_project_settings(
@@ -786,6 +786,7 @@ shell_tool                       stable             true
                 enabled_mcpjson_servers=["build-runtime"],
                 allow_permissions=[
                     "mcp__build-runtime__run_linter",
+                    "mcp__build-runtime__run_syntax_check",
                     "mcp__build-runtime__compile_project",
                     "mcp__build-runtime__run_program",
                     "mcp__build-runtime__run_quality_checks",
@@ -805,7 +806,7 @@ shell_tool                       stable             true
     def test_probe_claude_mcp_registry_fails_when_individual_tool_permissions_incomplete(
         self,
     ) -> None:
-        """Permission fails when the individual grant falls short of the required 4 tools (run_quality_checks missing)."""
+        """Permission fails when the individual grant falls short of the required 5 tools (run_syntax_check / run_quality_checks missing)."""
         with tempfile.TemporaryDirectory() as td:
             repo_root = Path(td)
             self._write_project_settings(
@@ -904,6 +905,7 @@ shell_tool                       stable             true
                 enabled_mcpjson_servers=["build_runtime"],
                 allow_permissions=[
                     "mcp__build_runtime__run_linter",
+                    "mcp__build_runtime__run_syntax_check",
                     "mcp__build_runtime__compile_project",
                     "mcp__build_runtime__run_program",
                     "mcp__build_runtime__run_quality_checks",
@@ -989,6 +991,7 @@ shell_tool                       stable             true
                 # intentionally omit detect_build_system
                 allow_permissions=[
                     "mcp__build-runtime__run_linter",
+                    "mcp__build-runtime__run_syntax_check",
                     "mcp__build-runtime__compile_project",
                     "mcp__build-runtime__run_program",
                     "mcp__build-runtime__run_quality_checks",
@@ -15235,6 +15238,42 @@ class TerminalLintEvidenceExemptionTests(unittest.TestCase):
             self.assertNotIn(self._EVIDENCE_REL, unauth)
 
 
+class TerminalSyntaxEvidenceExemptionTests(TerminalLintEvidenceExemptionTests):
+    """The conductor-run generate.syntax substep writes the analogous host-authored
+    certificate at <pipeline_ref>/syntax_evidence/<source_id>.json (Conductor.
+    _syntax_inproc -> write_syntax_evidence). Reuses the lint exemption suite with the
+    syntax paths/substep: the same exemption semantics (exact file, step==generate ∧
+    substep==syntax only) must hold."""
+
+    _SOURCE_ID = TerminalLintEvidenceExemptionTests._SOURCE_ID
+    _EVIDENCE_REL = f"{_FIX_PIPE_REF}/syntax_evidence/{_SOURCE_ID}.json"
+    _LINT_META_REL = f"{_FIX_PIPE_REF}/source/{_SOURCE_ID}/syntax_meta.json"
+    _OTHER_EVIDENCE_REL = f"{_FIX_PIPE_REF}/syntax_evidence/src_other_999.json"
+
+    def _setup(self, repo_root: Path, *, orch: str, run_id: str,
+               substep: str | None, step: str = "generate",
+               source_id: str | None = _SOURCE_ID) -> None:
+        # The inherited tests pass substep="lint"/"generate": map the exempt substep
+        # to "syntax" so each inherited scenario exercises the syntax gate instead
+        # (the non-exempt actors — generate.generate / a non-generate step — stay as-is).
+        if substep == "lint":
+            substep = "syntax"
+        super()._setup(repo_root, orch=orch, run_id=run_id, substep=substep,
+                       step=step, source_id=source_id)
+
+    def test_lint_substep_does_not_exempt_syntax_evidence(self) -> None:
+        # Cross-substep scoping: the generate.lint substep must NOT be exempt for the
+        # SYNTAX certificate (each substep is exempt only for its own evidence file).
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            orch, run_id = "orch_syn_ev_005", "substep_syn_ev_005"
+            # Call the base _setup directly so substep stays literally "lint".
+            TerminalLintEvidenceExemptionTests._setup(
+                self, repo_root, orch=orch, run_id=run_id, substep="lint")
+            self._write_evidence_and_meta(repo_root)
+            self._assert_evidence_rejected(repo_root, orch, run_id)
+
+
 class LoadWriteRootsFromCapTests(unittest.TestCase):
     """Tests for _load_write_roots_from_cap normalization and rejection rules."""
 
@@ -25632,7 +25671,11 @@ class ChildContextDocSizeTests(unittest.TestCase):
         # Bumped 26400->28300: R1/M3c-β — the M3c branch (author model + checks only; the
         # runner + Makefile are host-rendered; no `use harness_*`; checks does no file I/O; the
         # fixed checks ABI) + the exemplar model+checks note.
-        "skills/workflow-generate-generate/SKILL.md": 28300,
+        # Bumped 28300->29100: the deterministic Generate.syntax gate (gfortran -fsyntax-only
+        # via MCP run_syntax_check) — the leaf must not run it, and must write
+        # standard-conforming f2008 that passes the real compiler front-end on the first
+        # attempt (replaces the retired post_generate compiler-mimic text heuristics).
+        "skills/workflow-generate-generate/SKILL.md": 29100,
         # Bumped 21400->21700: the test/check target must invoke the runner with
         # `--cases $(SPEC) $(CASES)` (the runner aborts without it; make test must
         # match run_program's argv) after a validate.execute failure where a bare
@@ -25649,7 +25692,9 @@ class ChildContextDocSizeTests(unittest.TestCase):
         # Bumped 22800->24000: R1/M3c-β — the M3c branch (verify model + checks only against
         # the fixed ABI; do NOT flag the host-rendered runner, which would be a permanent false
         # regenerate loop).
-        "skills/workflow-generate-verify/SKILL.md": 24000,
+        # Bumped 24000->24400: the deterministic Generate.syntax gate — verify must not run
+        # run_syntax_check and post_generate certifies the syntax evidence alongside lint.
+        "skills/workflow-generate-verify/SKILL.md": 24400,
         # Bumped 10000->10400: documented the verdict.json#per_test entry schema
         # (field name `status`/`outcome` + the pass/fail/xfail/skipped enum, with `blocked`
         # called out as conductor-derived not judge-written) so the judge leaf no longer

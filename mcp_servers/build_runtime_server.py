@@ -9,7 +9,9 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shlex
+import shutil
 import subprocess
 import sys
 import time
@@ -745,6 +747,210 @@ def tool_run_linter(args: dict[str, Any]) -> dict[str, Any]:
     raise ValueError(f"unsupported preset: {preset}. supported={supported}")
 
 
+# --- run_syntax_check: compiler-frontend syntax gate (Generate stage only) ----------------
+#
+# Runs a real compiler front-end in syntax-only mode over the staged Fortran sources so the
+# Generate stage catches, before Build, the whole class of syntax / standard-conformance
+# errors the (non-compiling) post_generate text heuristics could only approximate one
+# observed failure at a time. Producing NO build artifacts (module files go to a throwaway
+# scratch dir inside project_dir), this is lint-class, not a build — it sits with
+# run_linter outside the "compile must go through a standard build tool" rule.
+#
+# Compilers are an adapter REGISTRY (no custom commands, mirroring run_linter's
+# preset-only rule). Each adapter builds the full argv from (std, scratch_dir, openmp,
+# sources); the scratch dir is passed so a future adapter without a true syntax-only mode
+# (e.g. Fujitsu frt, which would `-c` with objects discarded into the scratch dir) fits
+# the same interface. Module files are compiler-/version-specific formats: every call
+# gets its own scratch dir and must never share Build's $(OBJDIR).
+
+_FORTRAN_SYNTAX_SOURCE_SUFFIXES = (".f90", ".f95", ".f03", ".f08")
+_SYNTAX_SCRATCH_DIR_NAME = ".mods"
+
+
+def _gfortran_syntax_argv(
+    std: str, scratch_dir: str, openmp: bool, sources: list[str]
+) -> list[str]:
+    argv = ["gfortran", "-fsyntax-only", f"-std={std}", "-J", scratch_dir, "-I", scratch_dir]
+    if openmp:
+        argv.append("-fopenmp")
+    return argv + list(sources)
+
+
+_SYNTAX_COMPILER_ADAPTERS: dict[str, dict[str, Any]] = {
+    "gfortran": {
+        "exe": "gfortran",
+        "argv": _gfortran_syntax_argv,
+        "version_argv": ["gfortran", "--version"],
+    },
+}
+
+# `module <name>` definitions (excluding submodule-procedure headers) and `use <name>`
+# references, scanned to order the staged sources so each module is compiled before its
+# consumers within ONE compiler invocation (gfortran resolves same-invocation `use`
+# against the module files it just wrote to the scratch dir, even under -fsyntax-only).
+# Deliberately approximate: a mis-ordering only reorders the argv and the compiler then
+# reports the real diagnosis; correctness judgment always stays with the compiler.
+_FORTRAN_MODULE_DECL_RE = re.compile(
+    r"^\s*module\s+(?!procedure\b|subroutine\b|function\b)([a-z][a-z0-9_]*)\s*(?:!.*)?$",
+    re.IGNORECASE | re.MULTILINE,
+)
+_FORTRAN_USE_STMT_RE = re.compile(
+    r"^\s*use\s*(?:,\s*(?:non_)?intrinsic\s*)?(?:::)?\s*([a-z][a-z0-9_]*)",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+
+def _fortran_syntax_source_order(project_dir: Path) -> list[str]:
+    """Topologically order the free-form Fortran sources in `project_dir` (define-before-use).
+
+    `use` of a module no local file defines (intrinsic modules, and genuinely missing
+    dependencies) is ignored for ordering — if it is a real omission the compiler emits
+    the authoritative "Cannot open module file" finding. On a definition cycle the
+    remaining files are appended name-sorted and the compiler diagnoses the cycle.
+    """
+    names = sorted(
+        p.name
+        for p in project_dir.iterdir()
+        if p.is_file() and p.suffix.lower() in _FORTRAN_SYNTAX_SOURCE_SUFFIXES
+    )
+    provided_by: dict[str, str] = {}
+    uses: dict[str, set[str]] = {}
+    for name in names:
+        try:
+            text = (project_dir / name).read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            text = ""
+        for mod in _FORTRAN_MODULE_DECL_RE.findall(text):
+            provided_by.setdefault(mod.lower(), name)
+        uses[name] = {mod.lower() for mod in _FORTRAN_USE_STMT_RE.findall(text)}
+
+    ordered: list[str] = []
+    placed: set[str] = set()
+    remaining = list(names)
+    while remaining:
+        progressed = False
+        for name in list(remaining):
+            deps = {
+                provided_by[mod]
+                for mod in uses.get(name, set())
+                if mod in provided_by and provided_by[mod] != name
+            }
+            if deps <= placed:
+                ordered.append(name)
+                placed.add(name)
+                remaining.remove(name)
+                progressed = True
+        if not progressed:
+            ordered.extend(remaining)
+            break
+    return ordered
+
+
+def _syntax_compiler_version(version_argv: list[str]) -> str | None:
+    try:
+        proc = subprocess.run(
+            version_argv, text=True, capture_output=True, timeout=30, check=False
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    first_line = (proc.stdout or proc.stderr or "").strip().splitlines()
+    return first_line[0].strip() if first_line else None
+
+
+def tool_run_syntax_check(args: dict[str, Any]) -> dict[str, Any]:
+    """Run a compiler front-end in syntax-only mode over staged Fortran sources.
+
+    Adapter-registry only; arbitrary user commands are not allowed. Produces no
+    build artifacts (lint-class, not a build; does not route through build_system).
+    A missing compiler binary returns {ok: True, skipped: True, ...} — whether a
+    stage may be skipped (optional target-compiler stage) or must hard-fail
+    (the mandatory gfortran stage) is the caller's policy, not this tool's.
+    """
+    project_dir = str(args.get("project_dir", "."))
+    _maybe_enforce_orchestration_mcp_gate(
+        tool_name="run_syntax_check",
+        project_dir=project_dir,
+        args=args,
+    )
+    timeout_sec = int(args.get("timeout_sec", 1800))
+    capture_limit = int(args.get("capture_limit", 120000))
+    command_log_path = args.get("command_log_path")
+    if command_log_path is not None and not isinstance(command_log_path, str):
+        raise ValueError("command_log_path must be a string")
+    env = args.get("env")
+    if env is not None and not isinstance(env, dict):
+        raise ValueError("env must be an object")
+    compiler = str(args.get("compiler", "gfortran")).strip().lower()
+    std = str(args.get("std", "f2008")).strip().lower()
+    openmp = bool(args.get("openmp", False))
+
+    if "command" in args:
+        raise ValueError(
+            "run_syntax_check does not allow custom command; use a registered compiler adapter"
+        )
+
+    adapter = _SYNTAX_COMPILER_ADAPTERS.get(compiler)
+    if adapter is None:
+        supported = ", ".join(sorted(_SYNTAX_COMPILER_ADAPTERS))
+        raise ValueError(f"unsupported compiler: {compiler}. supported={supported}")
+
+    sources = args.get("sources")
+    if sources is not None and (
+        not isinstance(sources, list) or not all(isinstance(s, str) for s in sources)
+    ):
+        raise ValueError("sources must be an array of source file names")
+
+    proj = Path(project_dir)
+    if not proj.is_dir():
+        raise ValueError(f"project_dir is not a directory: {project_dir}")
+
+    if shutil.which(str(adapter["exe"])) is None:
+        return {
+            "ok": True,
+            "skipped": True,
+            "compiler": compiler,
+            "std": std,
+            "reason": f"compiler not available: {adapter['exe']}",
+        }
+
+    ordered_sources = list(sources) if sources is not None else _fortran_syntax_source_order(proj)
+    if not ordered_sources:
+        return {
+            "ok": True,
+            "skipped": True,
+            "compiler": compiler,
+            "std": std,
+            "reason": "no fortran sources found",
+        }
+
+    (proj / _SYNTAX_SCRATCH_DIR_NAME).mkdir(exist_ok=True)
+
+    run_env: dict[str, str] | None
+    if env is None:
+        run_env = None
+    else:
+        run_env = {str(k): str(v) for k, v in env.items()}
+
+    argv_builder: Callable[[str, str, bool, list[str]], list[str]] = adapter["argv"]
+    command = argv_builder(std, _SYNTAX_SCRATCH_DIR_NAME, openmp, ordered_sources)
+    result = _run_command(
+        command=command,
+        cwd=project_dir,
+        tool_name="run_syntax_check",
+        timeout_sec=timeout_sec,
+        env=run_env,
+        capture_limit=capture_limit,
+        command_log_path=command_log_path,
+    )
+    return result | {
+        "compiler": compiler,
+        "compiler_version": _syntax_compiler_version(list(adapter["version_argv"])),
+        "std": std,
+        "openmp": openmp,
+        "skipped": False,
+    }
+
+
 TOOLS: dict[str, Tool] = {
     "detect_build_system": Tool(
         name="detect_build_system",
@@ -884,6 +1090,56 @@ TOOLS: dict[str, Tool] = {
             "required": ["project_dir"],
         },
         handler=tool_run_linter,
+    ),
+    "run_syntax_check": Tool(
+        name="run_syntax_check",
+        description=(
+            "Run a compiler front-end in syntax-only mode over staged Fortran sources "
+            "(Generate-stage gate). Registered compiler adapters only (gfortran); "
+            "no custom command, no build artifacts, does not route through build_system."
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "project_dir": {"type": "string", "default": "."},
+                "compiler": {
+                    "type": "string",
+                    "default": "gfortran",
+                    "description": "Registered compiler adapter id (gfortran).",
+                },
+                "std": {
+                    "type": "string",
+                    "default": "f2008",
+                    "description": "Language standard from impl_defaults.toolchain.standard.",
+                },
+                "openmp": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": "Enable the adapter's OpenMP flag (target.backend=openmp).",
+                },
+                "sources": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": (
+                        "Source file names in compile order. Omit to let the tool order "
+                        "the project_dir Fortran sources by a module/use scan."
+                    ),
+                },
+                "timeout_sec": {"type": "integer", "minimum": 1},
+                "capture_limit": {"type": "integer", "minimum": 1000},
+                "command_log_path": {
+                    "type": "string",
+                    "description": "JSONL path for command logs. Relative paths are resolved from project_dir.",
+                },
+                "env": {
+                    "type": "object",
+                    "additionalProperties": {"type": "string"},
+                },
+                **_ORCHESTRATION_GATE_PROPERTIES,
+            },
+            "required": ["project_dir"],
+        },
+        handler=tool_run_syntax_check,
     ),
 }
 

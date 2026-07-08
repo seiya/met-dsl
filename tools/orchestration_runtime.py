@@ -3501,7 +3501,10 @@ def _mcp_permissions_for_launch(role: str, step: str) -> list[str]:
     if r not in {"step", "substep"}:
         return []
     if st == "generate":
-        return ["run_linter"]
+        # run_linter for the deterministic generate.lint substep, run_syntax_check for the
+        # deterministic generate.syntax substep (both conductor in-process; no LLM leaf
+        # calls either — the capability is per-step, so both substeps share this grant).
+        return ["run_linter", "run_syntax_check"]
     if st == "build":
         return ["compile_project"]
     if st == "validate":
@@ -5430,6 +5433,13 @@ def _allowed_output_paths_for_launch(
                 # also excludes lint_meta.json from the auto-derived file-tool set.
                 if substep_token == "lint" and path.endswith("/lint_meta.json"):
                     return True
+                # Generate.syntax deliverable: the conductor-authored, freshness-gated
+                # syntax_meta.json sits at the source root (source/<source_id>/syntax_meta.json),
+                # a sibling of source_meta.json. Gated to the deterministic Generate.syntax
+                # substep ONLY (same rationale as lint_meta.json above: leaf launches must not
+                # be able to list a conductor-authored verdict as their own output).
+                if substep_token == "syntax" and path.endswith("/syntax_meta.json"):
+                    return True
                 # Generate.static deliverable: the conductor-authored, freshness-gated
                 # static_meta.json sits at the source root (source/<source_id>/static_meta.json),
                 # a sibling of source_meta.json. Gated to the deterministic Generate.static
@@ -6020,6 +6030,10 @@ def _allowed_file_tool_paths_for_launch(
             # .../src/) is an ordinary leaf output and stays writable (and _matches_phase_
             # contract already accepts it via its /src/ rule, checked first).
             and not (path.endswith("/lint_meta.json") and "/src/" not in path)
+            # Same treatment for the Generate.syntax deliverable syntax_meta.json
+            # (source/<source_id>/syntax_meta.json, conductor-authored in-process by
+            # workflow_conductor._syntax_inproc): never leaf-writable.
+            and not (path.endswith("/syntax_meta.json") and "/src/" not in path)
             # Same treatment for the Generate.static deliverable static_meta.json
             # (source/<source_id>/static_meta.json, conductor-authored in-process by
             # workflow_conductor._static_inproc): never leaf-writable.
@@ -6082,6 +6096,12 @@ def _allowed_file_tool_paths_for_launch(
             raise ValueError(
                 f"allowed_file_tool_paths[{idx}] must not include the conductor-authored "
                 f"lint deliverable: {path!r} (written exclusively by Generate.lint in-process)"
+            )
+        # Same for the source-ROOT syntax_meta.json (Generate.syntax in-process deliverable).
+        if path.endswith("/syntax_meta.json") and "/src/" not in path:
+            raise ValueError(
+                f"allowed_file_tool_paths[{idx}] must not include the conductor-authored "
+                f"syntax deliverable: {path!r} (written exclusively by Generate.syntax in-process)"
             )
         # Same for the source-ROOT static_meta.json (Generate.static in-process deliverable).
         if path.endswith("/static_meta.json") and "/src/" not in path:
@@ -6170,9 +6190,9 @@ def _mandatory_file_tool_pins_for_launch(
     # substep inspects src/ and writes source_meta.json — granting it Makefile
     # (build-control) write authority would let the verifier mutate the very
     # artifact it is supposed to judge, so it must be excluded. The deterministic
-    # Generate.lint / Generate.static substeps (conductor-run, no leaf) write no Makefile
-    # either (static writes only static_meta.json).
-    if step_token != "generate" or substep_token in ("verify", "lint", "static") or not pipeline_ref:
+    # Generate.lint / Generate.syntax / Generate.static substeps (conductor-run, no leaf)
+    # write no Makefile either (static writes only static_meta.json).
+    if step_token != "generate" or substep_token in ("verify", "lint", "syntax", "static") or not pipeline_ref:
         return []
     # When the conductor authors src/Makefile host-side (_write_makefile: make AND fortran,
     # leaf OR dependency) it is NOT a leaf deliverable and must not be pinned (the file already
@@ -8027,26 +8047,30 @@ def _is_violation_dismissed(
     return unauthorized_normalized <= dismissed_set
 
 
-def _expected_lint_evidence_rel_path(
+def _expected_host_evidence_rel_path(
     repo_root: Path,
     orchestration_id: str,
     *,
     agent_run_id: str,
     cap_doc: dict[str, Any],
     write_roots: list[str],
+    substep: str,
+    evidence_dirname: str,
 ) -> str | None:
-    """The single host-authored generate.lint certificate path that is exempt from
-    write-attribution: ``<pipeline_ref>/lint_evidence/<source_id>.json``.
+    """The single host-authored generate.<substep> certificate path that is exempt from
+    write-attribution: ``<pipeline_ref>/<evidence_dirname>/<source_id>.json``
+    (``lint_evidence/`` for generate.lint, ``syntax_evidence/`` for generate.syntax).
 
     Returns None (no exemption -> the write is flagged, fail-closed) unless the actor is the
-    ``generate.lint`` substep AND both the pipeline root and a safe bare ``source_id`` resolve.
-    The exemption is bound to this EXACT file (not the whole ``lint_evidence/`` directory) so
-    an unexpected/stale sibling under that dir is still rejected. ``source_id`` is read from
-    the host-authored, leaf-non-writable launch request (``build_launch_request`` records it
-    for every generate launch), so a sandboxed leaf cannot influence it."""
+    matching deterministic generate substep AND both the pipeline root and a safe bare
+    ``source_id`` resolve. The exemption is bound to this EXACT file (not the whole evidence
+    directory) so an unexpected/stale sibling under that dir is still rejected. ``source_id``
+    is read from the host-authored, leaf-non-writable launch request
+    (``build_launch_request`` records it for every generate launch), so a sandboxed leaf
+    cannot influence it."""
     if str(cap_doc.get("step") or "").strip().lower() != "generate":
         return None
-    if str(cap_doc.get("substep") or "").strip().lower() != "lint":
+    if str(cap_doc.get("substep") or "").strip().lower() != substep:
         return None
     # generate write_root is exactly <pipeline_ref>/source/ (_write_roots_for_launch); the
     # pipeline root is its parent. Derive it rather than re-deriving pipeline_ref elsewhere.
@@ -8071,10 +8095,40 @@ def _expected_lint_evidence_rel_path(
         return None
     sid = sid_obj.strip()
     # Reject anything that is not a bare, traversal-free component so a malformed source_id
-    # cannot widen the exempt path outside lint_evidence/ (mirrors lint_evidence._safe_component).
+    # cannot widen the exempt path outside the evidence dir (mirrors lint_evidence._safe_component).
     if not sid or sid in {".", ".."} or "/" in sid or "\\" in sid or "\x00" in sid:
         return None
-    return _normalize_rel_posix(f"{pipe_prefix}lint_evidence/{sid}.json")
+    return _normalize_rel_posix(f"{pipe_prefix}{evidence_dirname}/{sid}.json")
+
+
+def _expected_lint_evidence_rel_path(
+    repo_root: Path,
+    orchestration_id: str,
+    *,
+    agent_run_id: str,
+    cap_doc: dict[str, Any],
+    write_roots: list[str],
+) -> str | None:
+    return _expected_host_evidence_rel_path(
+        repo_root, orchestration_id,
+        agent_run_id=agent_run_id, cap_doc=cap_doc, write_roots=write_roots,
+        substep="lint", evidence_dirname="lint_evidence",
+    )
+
+
+def _expected_syntax_evidence_rel_path(
+    repo_root: Path,
+    orchestration_id: str,
+    *,
+    agent_run_id: str,
+    cap_doc: dict[str, Any],
+    write_roots: list[str],
+) -> str | None:
+    return _expected_host_evidence_rel_path(
+        repo_root, orchestration_id,
+        agent_run_id=agent_run_id, cap_doc=cap_doc, write_roots=write_roots,
+        substep="syntax", evidence_dirname="syntax_evidence",
+    )
 
 
 def _validate_actual_write_paths(
@@ -8139,8 +8193,19 @@ def _validate_actual_write_paths(
     # root regardless). write_roots stays minimal — like lineage.json, the certificate is NOT
     # a capability write_root.
     lint_evidence_expected_path: str | None = None
+    syntax_evidence_expected_path: str | None = None
     if actor_role == "substep":
         lint_evidence_expected_path = _expected_lint_evidence_rel_path(
+            repo_root,
+            orchestration_id,
+            agent_run_id=run_id,
+            cap_doc=cap_doc,
+            write_roots=write_roots,
+        )
+        # generate.syntax writes the analogous host-authored certificate at
+        # <pipeline_ref>/syntax_evidence/<source_id>.json (workflow_conductor.Conductor.
+        # _syntax_inproc -> write_syntax_evidence); same exact-file scoping as lint above.
+        syntax_evidence_expected_path = _expected_syntax_evidence_rel_path(
             repo_root,
             orchestration_id,
             agent_run_id=run_id,
@@ -8275,6 +8340,9 @@ def _validate_actual_write_paths(
             continue
         if lint_evidence_expected_path is not None and path == lint_evidence_expected_path:
             # Conductor host write of the exact generate.lint certificate (see above).
+            continue
+        if syntax_evidence_expected_path is not None and path == syntax_evidence_expected_path:
+            # Conductor host write of the exact generate.syntax certificate (see above).
             continue
         if write_roots and not _path_under_any_write_root(path, write_roots):
             unauthorized.append(path)
@@ -9371,7 +9439,7 @@ SLIM_REPAIR_PROMPT_SENTINEL = "Warm-resume slim repair turn"
 # Header that fences the (uncontrolled) injected findings excerpt from the conductor-
 # authored prefix. Shared by the renderer, the marker validator, and the gate-allowlist
 # scan-text helper so the three never drift.
-SLIM_REPAIR_FINDINGS_HEADER = "Findings to fix (from the lint/static gate or verify finding):"
+SLIM_REPAIR_FINDINGS_HEADER = "Findings to fix (from the lint/syntax/static gate or verify finding):"
 # Data-only fence around the findings excerpt. The excerpt is VERBATIM finding text — a
 # deterministic-gate excerpt or a verify substep's `last_fail_reason` — so it can contain
 # arbitrary text including strings that read as instructions. The warning + BEGIN/END markers
@@ -10040,12 +10108,14 @@ ALLOWED_VALIDATE_PIPELINE_STAGES: dict[tuple[str, str], frozenset[str]] = {
     ("compile", "static"): frozenset(),
     ("compile", "verify"): frozenset(),
     ("generate", "generate"): frozenset(),
-    # generate.lint and generate.static are deterministic in-process substeps (no leaf, no
-    # validate_pipeline_semantics invocation); the empty sets keep the table total so a
-    # lookup for them never KeyErrors. The post_generate gate that generate.verify used to
-    # own now runs in the conductor's generate.static substep (Conductor._static_inproc), so
-    # generate.verify is a pure LLM semantic pass that invokes no validator gate.
+    # generate.lint, generate.syntax and generate.static are deterministic in-process
+    # substeps (no leaf, no validate_pipeline_semantics invocation); the empty sets keep the
+    # table total so a lookup for them never KeyErrors. The post_generate gate that
+    # generate.verify used to own now runs in the conductor's generate.static substep
+    # (Conductor._static_inproc), so generate.verify is a pure LLM semantic pass that
+    # invokes no validator gate.
     ("generate", "lint"): frozenset(),
+    ("generate", "syntax"): frozenset(),
     ("generate", "static"): frozenset(),
     ("generate", "verify"): frozenset(),
     ("build", ""): frozenset({"post_build"}),
@@ -11553,12 +11623,12 @@ def _validate_launch_request_payload(request_payload: dict[str, Any]) -> None:
         substep_l = str(substep).strip().lower() if isinstance(substep, str) else ""
         if not (step_l == "build"
                 or (step_l == "validate" and substep_l in ("pre_judge", "execute", "post_judge"))
-                or (step_l == "generate" and substep_l in ("lint", "static"))
+                or (step_l == "generate" and substep_l in ("lint", "syntax", "static"))
                 or (step_l == "compile" and substep_l == "static")):
             raise ValueError(
                 "launch request: deterministic=True is only valid for step=build, "
                 "step=validate substep=pre_judge|execute|post_judge, "
-                "step=generate substep=lint|static, or "
+                "step=generate substep=lint|syntax|static, or "
                 f"step=compile substep=static (got step={step!r} substep={substep!r})"
             )
     # agent_model identifies the LLM that produced the child's artifacts. At launch
@@ -12795,9 +12865,9 @@ _CLAUDE_PROJECT_LOCAL_SETTINGS_RELPATH = ".claude/settings.local.json"
 _MCP_JSON_RELPATH = ".mcp.json"
 _CLAUDE_MCP_REMEDIATION = (
     "build-runtime MCP server is not enabled for this project via the repo-committed "
-    "`.claude/settings.json`. Required tools (run_linter, compile_project, run_program, "
-    "run_quality_checks) are needed by Generate/Build/Validate phases (detect_build_system "
-    "is advisory — provided by the server but not gated). "
+    "`.claude/settings.json`. Required tools (run_linter, run_syntax_check, compile_project, "
+    "run_program, run_quality_checks) are needed by Generate/Build/Validate phases "
+    "(detect_build_system is advisory — provided by the server but not gated). "
     "Remediation: add `\"enabledMcpjsonServers\": [\"build-runtime\"]` (or "
     "`\"enableAllProjectMcpServers\": true`) to the top level of the committed "
     "`.claude/settings.json`, and ensure no `disabledMcpjsonServers` entry for build-runtime "
@@ -12809,9 +12879,10 @@ _CLAUDE_MCP_REMEDIATION = (
 # The canonical (hyphen) token for displaying the remediation message.
 _CLAUDE_MCP_SERVER_PERMISSION_TOKEN = "mcp__build-runtime"
 # The individual tool names required for the granted decision. detect_build_system is advisory (not
-# included in the granted decision) — only the 4 tools that Generate/Build/Validate require are gated.
+# included in the granted decision) — only the 5 tools that Generate/Build/Validate require are gated.
 _CLAUDE_MCP_REQUIRED_TOOL_NAMES = (
     "run_linter",
+    "run_syntax_check",
     "compile_project",
     "run_program",
     "run_quality_checks",
@@ -12829,11 +12900,12 @@ _CLAUDE_MCP_PERMISSION_REMEDIATION = (
     "orchestration's spawned child Agent sessions. Add the server-level grant "
     "`\"mcp__build-runtime\"` to `permissions.allow` in the repo-committed "
     "`.claude/settings.json` (this grants all build-runtime tools — run_linter, "
-    "compile_project, run_program, run_quality_checks, detect_build_system). Claude Code "
+    "run_syntax_check, compile_project, run_program, run_quality_checks, "
+    "detect_build_system). Claude Code "
     "permission rules do NOT support a tool-name wildcard (`mcp__build-runtime__*`), so use "
     "the server-level token; to grant individually, list "
-    "`mcp__build-runtime__run_linter` / `__compile_project` / `__run_program` / "
-    "`__run_quality_checks`. Ensure no matching `permissions.deny` entry exists in "
+    "`mcp__build-runtime__run_linter` / `__run_syntax_check` / `__compile_project` / "
+    "`__run_program` / `__run_quality_checks`. Ensure no matching `permissions.deny` entry exists in "
     "`.claude/settings.json` / `.claude/settings.local.json`. Reference: `mcp_servers/README.md`."
 )
 
@@ -13024,9 +13096,9 @@ def _evaluate_build_runtime_tool_permission(
       - `permissions.defaultMode == "bypassPermissions"` (unconditional permission for all tools)
       - a server-level grant (`mcp__<enabled-alias>`) is in allow, and there is neither a server-level deny
         nor an individual deny of a required tool
-      - the required 4 tools (`run_linter` / `compile_project` / `run_program` /
-        `run_quality_checks`) each "have at least 1 allow of an enabled alias and are not denied"
-        (and there is no server-level deny)
+      - the required 5 tools (`run_linter` / `run_syntax_check` / `compile_project` /
+        `run_program` / `run_quality_checks`) each "have at least 1 allow of an enabled
+        alias and are not denied" (and there is no server-level deny)
     Claude Code's deny rule takes precedence over allow. Because a tool-specific deny cancels a server-level allow,
     and a server-level deny cancels an individual tool allow, granted=false if either deny exists
     (false-pass prevention). `detect_build_system` is advisory (out of gate scope because no phase invokes it).
@@ -16014,7 +16086,7 @@ def reopen_phase(
     # Every other (cross-phase) trigger must be strictly downstream.
     same_phase_det = (
         (trig_step == from_token == "generate"
-         and trig_substep in ("generate", "lint", "static", "verify"))
+         and trig_substep in ("generate", "lint", "syntax", "static", "verify"))
         or (trig_step == from_token == "compile" and trig_substep in ("generate", "static", "verify"))
     )
     if trig_step not in STEP_KEYS_FOR_NODE_STATE or (

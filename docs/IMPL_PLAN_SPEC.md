@@ -48,6 +48,7 @@ Rules:
 - `toolchain.compiler` / `toolchain.linker` are **optional**.
 - State them only when you want to fix the compiler type/version (emphasizing CI reproducibility).
 - When not fixed, use the execution environment's default compiler.
+- With `build_system=make` ∧ `language=fortran`, the conductor-authored `src/Makefile` pins `FC` to `toolchain.compiler` when it is set (else `gfortran`), so a future non-gfortran build (e.g. Fujitsu `frt`) only needs this field plus a `run_syntax_check` compiler adapter (`mcp_servers/README.md`). The deterministic `Generate.syntax` gate always runs its mandatory `gfortran -fsyntax-only` stage against `toolchain.standard` regardless of the build compiler (standard conformance is the contract; the build compiler is an implementation detail).
 - The operation of directly calling `gcc` / `clang` / `gfortran` for a one-off build is forbidden; always build via `toolchain.build_system`.
 
 ## 4. Composition rules of the output (common across languages)

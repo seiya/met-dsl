@@ -73,15 +73,21 @@ SUBSTEPS: dict[str, tuple[str | None, ...]] = {
     #     IR. A finding routes back to compile.generate via a warm-resume reopen
     #     (COMPILE_STATIC_FAILURE_ROUTING). Mirrors generate.static.
     "compile": ("generate", "static", "verify"),
-    # generate.lint and generate.static are deterministic in-process substeps run by the
-    # conductor AFTER generate.generate produces source/<id>/src/ and BEFORE generate.verify:
+    # generate.lint, generate.syntax and generate.static are deterministic in-process
+    # substeps run by the conductor AFTER generate.generate produces source/<id>/src/ and
+    # BEFORE generate.verify:
     #   - lint   (Conductor._lint_inproc):   runs run_linter; the leaf no longer invokes it.
+    #   - syntax (Conductor._syntax_inproc): runs the MCP run_syntax_check compiler
+    #     front-end gate (gfortran -fsyntax-only, plus optional target-compiler stages from
+    #     METDSL_SYNTAX_COMPILERS) over the staged node + dependency-closure sources, so the
+    #     whole class of syntax / standard-conformance compile_errors surfaces here instead
+    #     of at Build (fortran-language nodes only; non-fortran passes through).
     #   - static (Conductor._static_inproc): runs validate_pipeline_semantics --stage
     #     post_generate + validate_workspace_root; the verify leaf no longer invokes them, so
     #     verify is a pure LLM semantic (G1-G7) pass reached only on a deterministically-clean
-    #     source. Both substeps route findings back to generate.generate via a warm-resume
-    #     reopen (LINT_FAILURE_ROUTING / STATIC_FAILURE_ROUTING).
-    "generate": ("generate", "lint", "static", "verify"),
+    #     source. All three substeps route findings back to generate.generate via a warm-resume
+    #     reopen (LINT_FAILURE_ROUTING / SYNTAX_FAILURE_ROUTING / STATIC_FAILURE_ROUTING).
+    "generate": ("generate", "lint", "syntax", "static", "verify"),
     "build": (None,),
     # validate wraps the LLM judge in two deterministic conductor-in-process gates,
     # mirroring the compile/generate deterministic-interleave model:
@@ -157,6 +163,15 @@ BUILD_FAILURE_ROUTING: dict[str, tuple[str, str]] = {
 # while the failing substep is generate.lint); conduct() handles that case specially.
 LINT_FAILURE_ROUTING: dict[str, tuple[str, str]] = {
     "lint_findings": ("generate", "reuse"),
+}
+
+# Compiler syntax-gate (generate.syntax) failure_category -> (retry_target_phase,
+# repair_strategy). The deterministic run_syntax_check gate (gfortran -fsyntax-only over
+# the staged node + dependency-closure sources) runs AFTER generate.lint and BEFORE
+# generate.static; a compiler finding re-runs generate.generate with a warm resume (reuse)
+# exactly like a lint finding — a SAME-PHASE reopen handled specially by conduct().
+SYNTAX_FAILURE_ROUTING: dict[str, tuple[str, str]] = {
+    "syntax_error": ("generate", "reuse"),
 }
 
 # Static-gate (generate.static) failure_category -> (retry_target_phase, repair_strategy).
@@ -314,6 +329,17 @@ def classify_lint_failure(failure_category: str | None) -> RouteDecision:
     target, strategy = routed
     return RouteDecision("retry", target_phase=target, repair_strategy=strategy,
                          reason=f"lint_{failure_category}")
+
+
+def classify_syntax_failure(failure_category: str | None) -> RouteDecision:
+    if not failure_category:
+        return RouteDecision("escalate", reason="syntax_fail_no_category")
+    routed = SYNTAX_FAILURE_ROUTING.get(failure_category)
+    if routed is None:
+        return RouteDecision("escalate", reason=f"syntax_unknown_category:{failure_category}")
+    target, strategy = routed
+    return RouteDecision("retry", target_phase=target, repair_strategy=strategy,
+                         reason=f"syntax_{failure_category}")
 
 
 def classify_static_failure(failure_category: str | None) -> RouteDecision:
@@ -662,11 +688,12 @@ def build_launch_request(
     spec = refs.spec_path
     skill = _skill_name(step, substep)
     role = child_agent_role(step)
-    # Build, Validate.execute, Generate.lint and Generate.static run in-process (no leaf), so
-    # they carry no skill / leaf prompt — only the bookkeeping the capability/phase_state need.
+    # Build, Validate.execute, Generate.lint, Generate.syntax and Generate.static run
+    # in-process (no leaf), so they carry no skill / leaf prompt — only the bookkeeping the
+    # capability/phase_state need.
     deterministic = (step == "build"
                      or (step == "validate" and substep in ("pre_judge", "execute", "post_judge"))
-                     or (step == "generate" and substep in ("lint", "static"))
+                     or (step == "generate" and substep in ("lint", "syntax", "static"))
                      or (step == "compile" and substep == "static"))
     rep = {
         "issue_severity": "none",
@@ -798,6 +825,16 @@ def build_launch_request(
             # leaf output and is intentionally omitted from allowed_output_paths.
             req["allowed_output_paths"] = [
                 f"{src}/lint_meta.json",
+                f"{src}/src/command_log.jsonl",
+            ]
+        elif substep == "syntax":
+            # Deterministic in-process compiler syntax gate: the conductor authors
+            # syntax_meta.json (the freshness-gated deliverable) and run_syntax_check
+            # appends to the canonical src/command_log.jsonl. The host-authored syntax
+            # evidence (pipeline-root, leaf-non-writable) is NOT a leaf output and is
+            # intentionally omitted from allowed_output_paths (mirrors lint).
+            req["allowed_output_paths"] = [
+                f"{src}/syntax_meta.json",
                 f"{src}/src/command_log.jsonl",
             ]
         elif substep == "static":
@@ -1351,6 +1388,24 @@ class Conductor:
             return False
         return not dep.get("direct_deps")
 
+    def _read_toolchain(self, refs: NodeRefs) -> dict[str, str]:
+        """The structured `impl_defaults.toolchain`/`target` fields the host-side authors
+        share. Single read so the Makefile FC/FFLAGS derivation, the lint preset pick, and
+        the syntax gate's std/openmp flags cannot diverge from each other. `compiler` is
+        the OPTIONAL `toolchain.compiler` (docs/IMPL_PLAN_SPEC.md) — empty string when the
+        spec does not pin one (the environment default, gfortran, is then used)."""
+        ir = _read_yaml(self.repo_root / refs.ir_ref / "spec.ir.yaml") or {}
+        impl = (ir.get("impl_defaults") or {}) if isinstance(ir, dict) else {}
+        tc = (impl.get("toolchain") or {}) if isinstance(impl, dict) else {}
+        target = (impl.get("target") or {}) if isinstance(impl, dict) else {}
+        return {
+            "language": str(tc.get("language") or "fortran").lower(),
+            "standard": str(tc.get("standard") or "f2008").lower(),
+            "build_system": str(tc.get("build_system") or "make").lower(),
+            "compiler": str(tc.get("compiler") or "").strip(),
+            "backend": str(target.get("backend") or "").lower(),
+        }
+
     def _conductor_authors_makefile(self, refs: NodeRefs) -> bool:
         """The conductor authors `src/Makefile` iff build_system=make AND language=fortran —
         exactly the scope of `_write_makefile`, for BOTH leaf and dependency nodes. The
@@ -1544,16 +1599,16 @@ class Conductor:
         authors this for every make+fortran node (leaf or dependency) — see
         `_conductor_authors_makefile`.
         """
-        ir = _read_yaml(self.repo_root / refs.ir_ref / "spec.ir.yaml") or {}
-        impl = (ir.get("impl_defaults") or {}) if isinstance(ir, dict) else {}
-        tc = (impl.get("toolchain") or {}) if isinstance(impl, dict) else {}
-        language = str(tc.get("language") or "fortran").lower()
-        standard = str(tc.get("standard") or "f2008")
-        build_system = str(tc.get("build_system") or "make").lower()
+        tc = self._read_toolchain(refs)
+        language = tc["language"]
+        standard = tc["standard"]
+        build_system = tc["build_system"]
         if build_system != "make" or language != "fortran":
             return  # c/cpp/mixed (or non-make) keep LLM authoring — out of scope.
-        target = (impl.get("target") or {}) if isinstance(impl, dict) else {}
-        backend = str(target.get("backend") or "").lower()
+        backend = tc["backend"]
+        # The optional toolchain.compiler pins FC (a Fujitsu frt build only needs this IR
+        # field plus a run_syntax_check adapter); unset keeps the gfortran default.
+        fc = tc["compiler"] or "gfortran"
 
         model = f"{refs.spec_id}_model"
         runner = f"{refs.spec_id}_runner"
@@ -1616,11 +1671,12 @@ class Conductor:
 
 # FC is pinned with := (not ?=): make ships a built-in FC=f77 (origin default), and ?= does
 # NOT override a default-origin variable, so `FC ?= gfortran` would silently leave FC=f77.
+# The pinned value is impl_defaults.toolchain.compiler when the spec sets it, else gfortran.
 # The dirs/BIN stay ?= because Build/Validate.execute inject them via command line / env.
 # SPEC/CASES stay ?= because Validate.execute injects them via the make-test env so the
 # `make test` re-run invokes the runner identically to run_program (`--cases <spec> <ids>`);
 # the ?= defaults keep a local `make all test` runnable standalone.
-FC      := gfortran
+FC      := {fc}
 OBJDIR  ?= .
 BINDIR  ?= .
 RUNDIR  ?= .
@@ -1881,6 +1937,15 @@ clean:
             meta = _read_json(self.repo_root / refs.source_dir() / "lint_meta.json") or {}
             status = "pass" if (meta.get("lint_status") == "pass"
                                 and _fresh_deliverables_written(allowed_output_paths)) else "fail"
+        elif phase == "generate" and substep == "syntax":
+            # Deterministic compiler syntax gate: the conductor-authored syntax_meta records
+            # the run_syntax_check verdict. Compiler findings are syntax_status=fail with
+            # rc 0, so the substep fails here and classify_syntax_failure routes back to
+            # generate.generate (warm resume), not transport fail_closed. syntax_meta.json is
+            # the only freshness-gated deliverable (command_log.jsonl is an optional basename).
+            meta = _read_json(self.repo_root / refs.source_dir() / "syntax_meta.json") or {}
+            status = "pass" if (meta.get("syntax_status") == "pass"
+                                and _fresh_deliverables_written(allowed_output_paths)) else "fail"
         elif phase == "generate" and substep == "static":
             # Deterministic static gate: the conductor-authored static_meta records the
             # post_generate + workspace_root verdict. A violation is status=fail with rc 0, so
@@ -1970,7 +2035,7 @@ clean:
     def _is_deterministic_substep(phase: str, substep: str | None) -> bool:
         return (phase == "build"
                 or (phase == "validate" and substep in ("pre_judge", "execute", "post_judge"))
-                or (phase == "generate" and substep in ("lint", "static"))
+                or (phase == "generate" and substep in ("lint", "syntax", "static"))
                 or (phase == "compile" and substep == "static"))
 
     def _capability_token(self, child_arid: str) -> str:
@@ -2044,6 +2109,8 @@ clean:
                 out = self._execute_inproc(refs, child_arid, cap_token)
             elif phase == "generate" and substep == "lint":
                 out = self._lint_inproc(refs, child_arid, cap_token)
+            elif phase == "generate" and substep == "syntax":
+                out = self._syntax_inproc(refs, child_arid, cap_token)
             elif phase == "generate" and substep == "static":
                 out = self._static_inproc(refs, child_arid, cap_token)
             elif phase == "compile" and substep == "static":
@@ -2306,10 +2373,7 @@ clean:
         from tools.validate_pipeline_semantics import _LINT_PRESET_FOR_LANGUAGE
         from tools.hooks.lint_evidence import write_lint_evidence
 
-        ir = _read_yaml(self.repo_root / refs.ir_ref / "spec.ir.yaml") or {}
-        impl = (ir.get("impl_defaults") or {}) if isinstance(ir, dict) else {}
-        toolchain = (impl.get("toolchain") or {}) if isinstance(impl, dict) else {}
-        language = str(toolchain.get("language") or "fortran")
+        language = self._read_toolchain(refs)["language"]
         preset = _LINT_PRESET_FOR_LANGUAGE.get(language)
         if preset is None:
             # No static-lint mapping for this language: a precondition error, not a content
@@ -2400,6 +2464,161 @@ clean:
         # A content failure (lint findings) returns rc 0 so run_phase routes it via
         # classify_lint_failure -> generate.generate (warm resume), NOT transport
         # fail_closed. determine_substep_status reads lint_meta.lint_status.
+        return {"returncode": 0,
+                "stdout": "",
+                "stderr": "" if ok else (failure_excerpt or "")}
+
+    # Free-form suffixes only, matching the generated-source contract (phase_02 §<module>.f90)
+    # and the run_syntax_check tool's own source discovery.
+    _SYNTAX_SOURCE_SUFFIXES: tuple[str, ...] = (".f90", ".f95", ".f03", ".f08")
+
+    def _syntax_inproc(self, refs: NodeRefs, child_arid: str, cap_token: str) -> dict[str, str]:
+        """Deterministic Generate.syntax: in-process run_syntax_check (a real compiler
+        front-end, gfortran -fsyntax-only) over the staged node + dependency-closure
+        sources, plus a conductor-authored syntax_meta.json and a host-side
+        (leaf-non-writable) syntax evidence certificate. This catches the whole class of
+        syntax / standard-conformance compile_errors BEFORE Build (where they would force
+        the expensive regenerate->rebuild loop) — replacing the retired post_generate text
+        heuristics that could only mimic gfortran one observed failure at a time.
+
+        Compiler findings are a CONTENT failure (syntax_status=fail, rc 0) routed by
+        classify_syntax_failure back to generate.generate via a warm-resume reopen. A
+        missing MANDATORY gfortran (or a genuine tool/infra error) raises and surfaces as
+        a transport fail_closed — an environment problem, not something the generate
+        retry loop could fix. Optional additional stages from METDSL_SYNTAX_COMPILERS
+        (comma-separated adapter ids, e.g. "gfortran,frt" — the future target-compiler
+        second stage) are recorded as skipped when their binary is not installed, so one
+        configuration runs on machines with and without the target compiler.
+
+        Staging: each compiler stage gets its own throwaway dir under
+        workspace/tmp/<child_arid>/syntax/<compiler>/ holding the node's src *.f90 plus
+        the certified dependency-closure `<dep>_model.f90` (`_stage_dependency_sources`).
+        Module files are compiler-/version-specific, so stages never share a dir and
+        never touch Build's $(OBJDIR). Non-fortran languages (c/cpp/mixed/cuda_*) pass
+        through: gfortran cannot check them, Build stays their backstop."""
+        import sys as _sys
+        mcp_dir = str(self.repo_root / "mcp_servers")
+        if mcp_dir not in _sys.path:
+            _sys.path.insert(0, mcp_dir)
+        from build_runtime_server import tool_run_syntax_check
+        from tools.hooks.syntax_evidence import write_syntax_evidence
+
+        tc = self._read_toolchain(refs)
+        language = tc["language"]
+        src_dir = self.repo_root / refs.source_dir() / "src"
+        command_log_ref = self._rel(src_dir / "command_log.jsonl")
+
+        ok = True
+        failure_category: str | None = None
+        failure_excerpt: str | None = None
+        skipped_reason: str | None = None
+        stages: list[dict[str, Any]] = []
+
+        node_sources = sorted(
+            p for p in src_dir.iterdir()
+            if p.is_file() and p.suffix.lower() in self._SYNTAX_SOURCE_SUFFIXES
+        ) if src_dir.is_dir() else []
+
+        if language != "fortran":
+            skipped_reason = f"language={language}: no syntax-check adapter (fortran only)"
+        elif not node_sources:
+            ok = False
+            failure_category = "syntax_error"
+            failure_excerpt = (
+                f"{self._rel(src_dir)}: no free-form Fortran source "
+                f"({'/'.join(self._SYNTAX_SOURCE_SUFFIXES)}) to syntax-check"
+            )
+        else:
+            raw = self.env.get("METDSL_SYNTAX_COMPILERS", "gfortran")
+            compilers = [c.strip().lower() for c in raw.split(",") if c.strip()]
+            # gfortran is the mandatory gate regardless of the env list's content/order:
+            # it is the one stage post_generate certification requires to have passed.
+            if "gfortran" in compilers:
+                compilers.remove("gfortran")
+            compilers.insert(0, "gfortran")
+            for compiler in compilers:
+                stage_dir = (self.repo_root / "workspace" / "tmp" / child_arid
+                             / "syntax" / compiler)
+                stage_dir.mkdir(parents=True, exist_ok=True)
+                for p in node_sources:
+                    shutil.copy2(p, stage_dir / p.name)
+                self._stage_dependency_sources(refs, stage_dir)
+                result = tool_run_syntax_check({
+                    "compiler": compiler,
+                    "std": tc["standard"],
+                    "openmp": tc["backend"] == "openmp",
+                    "project_dir": str(stage_dir),
+                    "repo_root": str(self.repo_root),
+                    "command_log_path": str(src_dir / "command_log.jsonl"),
+                    "capture_limit": _FULL_CAPTURE_LIMIT,
+                    "orchestration_id": self.orchestration_id,
+                    "agent_run_id": child_arid,
+                    "capability_token": cap_token,
+                })
+                if result.get("skipped"):
+                    if compiler == "gfortran":
+                        raise RuntimeError(
+                            f"generate.syntax: mandatory gfortran stage unavailable "
+                            f"({result.get('reason')})")
+                    stages.append({
+                        "compiler": compiler,
+                        "status": "skipped",
+                        "reason": str(result.get("reason") or ""),
+                    })
+                    continue
+                stage_ok = bool(result.get("ok"))
+                stages.append({
+                    "compiler": compiler,
+                    "status": "pass" if stage_ok else "fail",
+                    "compiler_version": result.get("compiler_version"),
+                    "command_id": str(result.get("command_id") or ""),
+                    "command_log_ref": command_log_ref,
+                })
+                if not stage_ok:
+                    ok = False
+                    failure_category = "syntax_error"
+                    excerpt = ((result.get("stdout", "") or "")
+                               + (result.get("stderr", "") or ""))
+                    tail = "\n".join(excerpt.splitlines()[-80:])
+                    failure_excerpt = (
+                        f"[{compiler} {tc['standard']} syntax check fail]\n{tail}"
+                        if failure_excerpt is None
+                        else failure_excerpt
+                        + f"\n[{compiler} {tc['standard']} syntax check fail]\n{tail}")
+
+        syntax_meta: dict[str, Any] = {
+            "source_id": refs.source_id,
+            "node_key": refs.node_key,
+            "pipeline_id": refs.pipeline_id,
+            "attempt_count": 1,
+            "syntax_status": "pass" if ok else "fail",
+            "verification_status": "pass" if ok else "fail",
+            "status": "pass" if ok else "fail",
+            "language": language,
+            "stages": stages,
+            "skipped_reason": skipped_reason,
+            "failure_category": failure_category,
+            "failure_excerpt": failure_excerpt,
+        }
+        meta_path = self.repo_root / refs.source_dir() / "syntax_meta.json"
+        meta_path.parent.mkdir(parents=True, exist_ok=True)
+        meta_path.write_text(
+            json.dumps(syntax_meta, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+
+        # Host-side, leaf-non-writable certificate the post_generate validator certifies
+        # against (mirrors write_lint_evidence). Only written when the gate actually ran
+        # stages (fortran nodes); certification requires it for language=fortran only.
+        if language == "fortran" and stages:
+            write_syntax_evidence(
+                pipeline_root=self.repo_root / refs.pipeline_ref,
+                source_id=refs.source_id or "",
+                ok=ok,
+                stages=stages,
+            )
+
+        # A content failure (compiler findings) returns rc 0 so run_phase routes it via
+        # classify_syntax_failure -> generate.generate (warm resume), NOT transport
+        # fail_closed. determine_substep_status reads syntax_meta.syntax_status.
         return {"returncode": 0,
                 "stdout": "",
                 "stderr": "" if ok else (failure_excerpt or "")}
@@ -3128,6 +3347,7 @@ clean:
         """The failing artifact's finding text to inject into the (warm/slim) repair, selected
         by the route reason:
           `lint_*`           -> source/lint_meta.json#failure_excerpt
+          `syntax_*`         -> source/syntax_meta.json#failure_excerpt
           `static_*`         -> source/static_meta.json#failure_excerpt
           `compile_static_*` -> ir/compile_static_meta.json#failure_excerpt
           `verify_*`         -> the phase's verify meta #last_fail_reason
@@ -3143,6 +3363,8 @@ clean:
             meta_path = self.repo_root / refs.ir_ref / "compile_static_meta.json"
         elif r.startswith("lint_"):
             meta_path = self.repo_root / refs.source_dir() / "lint_meta.json"
+        elif r.startswith("syntax_"):
+            meta_path = self.repo_root / refs.source_dir() / "syntax_meta.json"
         elif r.startswith("static_"):
             meta_path = self.repo_root / refs.source_dir() / "static_meta.json"
         elif r.startswith("verify_"):
@@ -3965,6 +4187,9 @@ clean:
             if failed_substep == "lint":
                 meta = _read_json(self.repo_root / refs.source_dir() / "lint_meta.json") or {}
                 return classify_lint_failure(meta.get("failure_category"))
+            if failed_substep == "syntax":
+                meta = _read_json(self.repo_root / refs.source_dir() / "syntax_meta.json") or {}
+                return classify_syntax_failure(meta.get("failure_category"))
             if failed_substep == "static":
                 meta = _read_json(self.repo_root / refs.source_dir() / "static_meta.json") or {}
                 return classify_static_failure(meta.get("failure_category"))

@@ -333,7 +333,8 @@ class NodeRefsTest(unittest.TestCase):
 class PhaseStructureTest(unittest.TestCase):
     def test_substeps_and_roles(self) -> None:
         self.assertEqual(wc.SUBSTEPS["compile"], ("generate", "static", "verify"))
-        self.assertEqual(wc.SUBSTEPS["generate"], ("generate", "lint", "static", "verify"))
+        self.assertEqual(wc.SUBSTEPS["generate"],
+                         ("generate", "lint", "syntax", "static", "verify"))
         self.assertEqual(wc.SUBSTEPS["build"], (None,))
         self.assertEqual(wc.SUBSTEPS["validate"],
                          ("pre_judge", "execute", "judge", "post_judge"))
@@ -526,9 +527,10 @@ class ConductHappyPathTest(unittest.TestCase):
             + ["check-step-completed", "workflow-launch-check",
                "record-launch", "finalize-child",  # generate.generate (leaf)
                "record-launch", "record-child-return", "finalize-child",  # generate.lint (deterministic)
+               "record-launch", "record-child-return", "finalize-child",  # generate.syntax (deterministic)
                "record-launch", "record-child-return", "finalize-child",  # generate.static (deterministic)
                "record-launch", "finalize-child",  # generate.verify (leaf)
-               "write-step-result"]  # generate (2 leaf + 2 deterministic substeps)
+               "write-step-result"]  # generate (2 leaf + 3 deterministic substeps)
             + ["check-step-completed", "workflow-launch-check",
                "record-launch", "record-child-return", "finalize-child",
                "write-step-result"]  # build (1 deterministic step)
@@ -547,9 +549,9 @@ class ConductHappyPathTest(unittest.TestCase):
         by_step = {cap["--step"]: cap for cap in wsr}
         for substep_aware in ("compile", "generate", "validate"):
             self.assertEqual(by_step[substep_aware]["--agent-run-id"], "ORCH")
-            # generate has 4 substeps (generate, lint, static, verify); compile has 3
+            # generate has 5 substeps (generate, lint, syntax, static, verify); compile has 3
             # (generate, static, verify); validate has 4 (pre_judge, execute, judge, post_judge).
-            expected_substeps = {"generate": 4, "compile": 3, "validate": 4}[substep_aware]
+            expected_substeps = {"generate": 5, "compile": 3, "validate": 4}[substep_aware]
             self.assertEqual(
                 len(by_step[substep_aware]["--result-json"]["substep_agent_run_ids"]),
                 expected_substeps)
@@ -4210,6 +4212,236 @@ class DeterministicLintTest(unittest.TestCase):
             self.assertTrue(d.reason.startswith("lint_"))
 
 
+class DeterministicSyntaxTest(unittest.TestCase):
+    """generate.syntax runs in-process (no leaf): the conductor stages the node (+ dep
+    closure) sources, runs the MCP run_syntax_check compiler gate (mandatory gfortran,
+    optional METDSL_SYNTAX_COMPILERS stages), and authors syntax_meta.json + the
+    host-side syntax evidence; compiler findings are a content failure routed to
+    generate.generate."""
+
+    def _conductor(self, repo: Path, env: dict[str, str] | None = None) -> "wc.Conductor":
+        return wc.Conductor(repo_root=repo, orchestration_id="t",
+                            orchestration_agent_run_id="x", backend="claude",
+                            env=env or {})
+
+    def _refs(self) -> wc.NodeRefs:
+        return wc.NodeRefs(
+            node_key="component/spec_x@0.1.0", spec_path="spec/component/spec_x",
+            ir_id="x_1", pipeline_id="x_1", source_id="src_1", binary_id="bin_1")
+
+    def _seed(self, repo: Path, refs: wc.NodeRefs, language: str = "fortran",
+              sources: dict[str, str] | None = None) -> None:
+        src = repo / refs.source_dir() / "src"
+        src.mkdir(parents=True, exist_ok=True)
+        if sources is None:
+            sources = {"spec_x_model.f90": "module spec_x_model\nend module spec_x_model\n"}
+        for name, text in sources.items():
+            (src / name).write_text(text, encoding="utf-8")
+        ir_dir = repo / refs.ir_ref
+        ir_dir.mkdir(parents=True, exist_ok=True)
+        (ir_dir / "spec.ir.yaml").write_text(
+            f"impl_defaults:\n  toolchain:\n    language: {language}\n"
+            f"    standard: f2008\n  target:\n    backend: openmp\n", encoding="utf-8")
+
+    def _patch_syntax(self, fn):
+        import sys
+        from unittest import mock
+        sys.path.insert(0, str(Path("mcp_servers").resolve()))
+        import build_runtime_server  # type: ignore
+        return mock.patch.object(build_runtime_server, "tool_run_syntax_check", fn)
+
+    def test_syntax_inproc_pass_writes_meta_and_evidence(self) -> None:
+        import tempfile
+        from tools.hooks.syntax_evidence import read_syntax_evidence
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            refs = self._refs()
+            self._seed(repo, refs)
+            c = self._conductor(repo)
+            seen_args: list[dict] = []
+
+            def fake(args):
+                seen_args.append(args)
+                return {"ok": True, "return_code": 0, "command_id": "sid",
+                        "compiler": args["compiler"], "compiler_version": "GNU Fortran 13",
+                        "skipped": False}
+
+            with self._patch_syntax(fake):
+                out = c._syntax_inproc(refs, "child-1", "captok")
+            self.assertEqual(out["returncode"], 0)
+            self.assertEqual(seen_args[0]["compiler"], "gfortran")
+            self.assertEqual(seen_args[0]["std"], "f2008")
+            self.assertTrue(seen_args[0]["openmp"])  # target.backend: openmp
+            # staging dir is a per-compiler throwaway under workspace/tmp, never src/
+            self.assertIn("workspace/tmp/child-1/syntax/gfortran", seen_args[0]["project_dir"])
+            # the log still lands at the canonical <src>/command_log.jsonl placement
+            self.assertTrue(
+                seen_args[0]["command_log_path"].endswith("/src/command_log.jsonl"))
+            meta = json.loads((repo / refs.source_dir() / "syntax_meta.json").read_text())
+            self.assertEqual(meta["syntax_status"], "pass")
+            self.assertIsNone(meta["failure_category"])
+            ev = read_syntax_evidence(pipeline_root=repo / refs.pipeline_ref, source_id="src_1")
+            assert ev is not None
+            self.assertTrue(ev["ok"])
+            self.assertEqual(ev["stages"][0]["compiler"], "gfortran")
+            self.assertEqual(ev["stages"][0]["status"], "pass")
+            self.assertEqual(ev["stages"][0]["command_id"], "sid")
+            self.assertTrue(
+                ev["stages"][0]["command_log_ref"].endswith("/src/command_log.jsonl"))
+
+    def test_syntax_inproc_compile_error_is_content_fail(self) -> None:
+        import tempfile
+        from tools.hooks.syntax_evidence import read_syntax_evidence
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            refs = self._refs()
+            self._seed(repo, refs)
+            c = self._conductor(repo)
+            with self._patch_syntax(
+                lambda args: {"ok": False, "return_code": 1, "command_id": "sid",
+                              "skipped": False,
+                              "stderr": "Error: IMPLICIT NONE with spec list"}):
+                out = c._syntax_inproc(refs, "child-1", "captok")
+            self.assertEqual(out["returncode"], 0)  # content fail, not transport
+            meta = json.loads((repo / refs.source_dir() / "syntax_meta.json").read_text())
+            self.assertEqual(meta["syntax_status"], "fail")
+            self.assertEqual(meta["failure_category"], "syntax_error")
+            self.assertIn("IMPLICIT NONE", meta["failure_excerpt"])
+            ev = read_syntax_evidence(pipeline_root=repo / refs.pipeline_ref, source_id="src_1")
+            assert ev is not None
+            self.assertFalse(ev["ok"])
+            self.assertEqual(ev["stages"][0]["status"], "fail")
+
+    def test_syntax_inproc_non_fortran_passes_through(self) -> None:
+        import tempfile
+        from tools.hooks.syntax_evidence import syntax_evidence_path
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            refs = self._refs()
+            self._seed(repo, refs, language="cpp", sources={"m.cpp": "int main(){}\n"})
+            c = self._conductor(repo)
+
+            def fake(args):  # must never be called for a non-fortran node
+                raise AssertionError("run_syntax_check must not run for language=cpp")
+
+            with self._patch_syntax(fake):
+                out = c._syntax_inproc(refs, "child-1", "captok")
+            self.assertEqual(out["returncode"], 0)
+            meta = json.loads((repo / refs.source_dir() / "syntax_meta.json").read_text())
+            self.assertEqual(meta["syntax_status"], "pass")
+            self.assertIn("language=cpp", meta["skipped_reason"])
+            self.assertEqual(meta["stages"], [])
+            self.assertFalse(
+                syntax_evidence_path(pipeline_root=repo / refs.pipeline_ref,
+                                     source_id="src_1").exists())
+
+    def test_syntax_inproc_no_sources_is_content_fail(self) -> None:
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            refs = self._refs()
+            self._seed(repo, refs, sources={})
+            c = self._conductor(repo)
+            with self._patch_syntax(lambda args: {"ok": True, "skipped": False}):
+                out = c._syntax_inproc(refs, "child-1", "captok")
+            self.assertEqual(out["returncode"], 0)
+            meta = json.loads((repo / refs.source_dir() / "syntax_meta.json").read_text())
+            self.assertEqual(meta["syntax_status"], "fail")
+            self.assertEqual(meta["failure_category"], "syntax_error")
+
+    def test_syntax_inproc_missing_gfortran_is_transport_fail(self) -> None:
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            refs = self._refs()
+            self._seed(repo, refs)
+            c = self._conductor(repo)
+            with self._patch_syntax(
+                lambda args: {"ok": True, "skipped": True,
+                              "reason": "compiler not available: gfortran"}):
+                with self.assertRaises(RuntimeError):
+                    c._syntax_inproc(refs, "child-1", "captok")
+
+    def test_syntax_inproc_optional_stage_skipped_records_and_passes(self) -> None:
+        import tempfile
+        from tools.hooks.syntax_evidence import read_syntax_evidence
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            refs = self._refs()
+            self._seed(repo, refs)
+            # frt listed but not installed: recorded skipped, gate still passes.
+            c = self._conductor(repo, env={"METDSL_SYNTAX_COMPILERS": "frt,gfortran"})
+
+            def fake(args):
+                if args["compiler"] == "frt":
+                    return {"ok": True, "skipped": True,
+                            "reason": "compiler not available: frt"}
+                return {"ok": True, "return_code": 0, "command_id": "sid",
+                        "compiler_version": "GNU Fortran 13", "skipped": False}
+
+            with self._patch_syntax(fake):
+                out = c._syntax_inproc(refs, "child-1", "captok")
+            self.assertEqual(out["returncode"], 0)
+            meta = json.loads((repo / refs.source_dir() / "syntax_meta.json").read_text())
+            self.assertEqual(meta["syntax_status"], "pass")
+            ev = read_syntax_evidence(pipeline_root=repo / refs.pipeline_ref, source_id="src_1")
+            assert ev is not None
+            by_compiler = {s["compiler"]: s for s in ev["stages"]}
+            # gfortran is forced to run first (the mandatory gate) even though the env
+            # var listed frt first.
+            self.assertEqual(ev["stages"][0]["compiler"], "gfortran")
+            self.assertEqual(by_compiler["gfortran"]["status"], "pass")
+            self.assertEqual(by_compiler["frt"]["status"], "skipped")
+
+    def test_determine_substep_status_syntax_branch(self) -> None:
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            refs = self._refs()
+            (repo / refs.source_dir()).mkdir(parents=True, exist_ok=True)
+            c = self._conductor(repo)
+            meta_path = repo / refs.source_dir() / "syntax_meta.json"
+            paths = [refs.source_dir() + "/syntax_meta.json"]
+            meta_path.write_text(json.dumps({"syntax_status": "pass"}), encoding="utf-8")
+            self.assertEqual(
+                c.determine_substep_status(refs, "generate", "syntax", paths)[0], "pass")
+            meta_path.write_text(json.dumps({"syntax_status": "fail"}), encoding="utf-8")
+            self.assertEqual(
+                c.determine_substep_status(refs, "generate", "syntax", paths)[0], "fail")
+
+    def test_classify_failure_routes_syntax_error_to_generate_reuse(self) -> None:
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            refs = self._refs()
+            (repo / refs.source_dir()).mkdir(parents=True, exist_ok=True)
+            (repo / refs.source_dir() / "syntax_meta.json").write_text(
+                json.dumps({"failure_category": "syntax_error"}), encoding="utf-8")
+            c = self._conductor(repo)
+            # outcomes models generate(pass), lint(pass), syntax(fail) — syntax is index 2.
+            outcomes = [wc.SubstepOutcome("g", "pass", [], 0),
+                        wc.SubstepOutcome("l", "pass", [], 0),
+                        wc.SubstepOutcome("x", "fail", [], 0)]
+            d = c.classify_failure(refs, "generate", outcomes)
+            self.assertEqual((d.action, d.target_phase, d.repair_strategy),
+                             ("retry", "generate", "reuse"))
+            self.assertTrue(d.reason.startswith("syntax_"))
+
+    def test_read_repair_findings_reads_syntax_excerpt(self) -> None:
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            refs = self._refs()
+            (repo / refs.source_dir()).mkdir(parents=True, exist_ok=True)
+            (repo / refs.source_dir() / "syntax_meta.json").write_text(
+                json.dumps({"failure_excerpt": "[gfortran f2008 syntax check fail]\nError: x"}),
+                encoding="utf-8")
+            c = self._conductor(repo)
+            found = c._read_repair_findings(refs, "syntax_syntax_error", phase="generate")
+            self.assertIsNotNone(found)
+            self.assertIn("Error: x", found)
+
+
 class DeterministicStaticTest(unittest.TestCase):
     """generate.static runs in-process (no leaf): the conductor runs validate_workspace_root +
     validate_pipeline_semantics --stage post_generate and authors static_meta.json; a violation
@@ -4332,9 +4564,11 @@ class DeterministicStaticTest(unittest.TestCase):
             (repo / refs.source_dir() / "static_meta.json").write_text(
                 json.dumps({"failure_category": "post_generate_violation"}), encoding="utf-8")
             c = self._conductor(repo)
-            # outcomes models generate(pass), lint(pass), static(fail) — static is index 2.
+            # outcomes models generate(pass), lint(pass), syntax(pass), static(fail) —
+            # static is index 3.
             outcomes = [wc.SubstepOutcome("g", "pass", [], 0),
                         wc.SubstepOutcome("l", "pass", [], 0),
+                        wc.SubstepOutcome("x", "pass", [], 0),
                         wc.SubstepOutcome("s", "fail", [], 0)]
             d = c.classify_failure(refs, "generate", outcomes)
             self.assertEqual((d.action, d.target_phase, d.repair_strategy), ("retry", "generate", "reuse"))

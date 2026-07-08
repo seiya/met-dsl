@@ -445,7 +445,7 @@ DETERMINISTIC_PROMPT_SENTINEL = "Conductor-executed deterministic step"
 # matching the DETERMINISTIC_PROMPT_SENTINEL duplication); a cross-module equality test
 # guards against drift.
 SLIM_REPAIR_PROMPT_SENTINEL = "Warm-resume slim repair turn"
-SLIM_REPAIR_FINDINGS_HEADER = "Findings to fix (from the lint/static gate or verify finding):"
+SLIM_REPAIR_FINDINGS_HEADER = "Findings to fix (from the lint/syntax/static gate or verify finding):"
 
 
 def _is_slim_launch_prompt_text(launch_text: str) -> bool:
@@ -3753,17 +3753,6 @@ def _validate_generate_outputs(
             violations=violations,
         )
 
-    _validate_fortran_identifier_length(src_dir, violations)
-    _validate_fortran_implicit_none_spec_list(
-        src_dir,
-        _impl_standard_from_pipeline_dir(repo_root, execution.pipeline_dir),
-        violations,
-    )
-    _validate_fortran_stop_code_constant(
-        src_dir,
-        _impl_standard_from_pipeline_dir(repo_root, execution.pipeline_dir),
-        violations,
-    )
     _validate_fortran_makefile_src_dir(src_dir, violations)
     _build_system, _language = _impl_toolchain_from_pipeline_dir(
         repo_root, execution.pipeline_dir
@@ -3777,379 +3766,14 @@ def _validate_generate_outputs(
 
 
 # Fortran 2008 (and the earlier standards the generated code targets) limit a
-# name (identifier) to 63 characters. An over-limit identifier compiles nowhere
-# and only surfaces at the build step as a compile_error, which forces an
-# expensive regenerate -> rebuild retry loop (observed in a past run: an
-# over-63-char subroutine name). Catching it here at post_generate fails the
-# cheap deterministic generate.static substep instead, before the build phase ever runs.
-# (See docs/workflow/phases/phase_02_generate.md; the generated code uses the
-# f2008 standard series — cf. the C003 / -std=f2008 note there.)
+# name (identifier) to 63 characters. Used by the module-name check below to fail an
+# over-limit `<spec_id>_model` as a spec-level problem (the spec_id is too long) at
+# post_generate. General over-limit identifiers in the generated source are caught by
+# the real compiler front-end in the deterministic `generate.syntax` substep
+# (gfortran -fsyntax-only via MCP run_syntax_check), which replaced the retired
+# post_generate text heuristics (identifier length / `implicit none` spec-list /
+# non-constant STOP code) that could only mimic gfortran one observed failure at a time.
 _FORTRAN_NAME_LIMIT = 63
-# Free-form suffixes only. The workflow generates free-form Fortran (`.f90`),
-# and the stripper below handles free-form `!` comments. Fixed-form sources
-# (`.f` / `.for`) use column-1 `C` / `c` / `*` comment markers that this
-# stripper does not understand, so scanning them would mis-report a long word
-# in a comment as an over-limit identifier; they are intentionally excluded.
-_FORTRAN_SOURCE_SUFFIXES = (".f90", ".f95", ".f03", ".f08")
-_FORTRAN_IDENT_RE = re.compile(r"[A-Za-z][A-Za-z0-9_]*")
-# The F2018 spec-list form `implicit none (external)` / `implicit none (type, external)`
-# is what fortitude rule C003 wants, but under `-std=f2008` it is a compile_error
-# (`Error: Fortran 2018: IMPLICIT NONE with spec list`). A parenthesised argument list
-# after `implicit none` is the tell; plain `implicit none` (no `(`) never matches.
-_FORTRAN_IMPLICIT_NONE_SPEC_LIST_RE = re.compile(
-    r"\bimplicit\s+none\s*\(", re.IGNORECASE
-)
-# Fortran standards that DO accept the `implicit none` spec-list form. When the
-# resolved toolchain standard is one of these the check below stays silent;
-# f2008 (and unresolved/None, treated as the f2008 series the generator targets)
-# get the compile_error flagged early.
-_IMPLICIT_NONE_SPEC_LIST_STANDARDS = frozenset({"f2018", "f2023"})
-
-
-def _strip_fortran_comments_and_strings(
-    line: str, quote: str | None = None
-) -> tuple[str, str | None]:
-    """Drop quoted strings and the trailing free-form ``!`` comment from a line.
-
-    Returns ``(code, quote)`` where ``quote`` is the still-open string delimiter
-    at end of line (or ``None``). Pass it back in for the next physical line so a
-    `&`-continued character literal carries its in-string state across lines —
-    otherwise a long word on the continuation line would be scanned as code and
-    falsely flagged. Free-form only — see _FORTRAN_SOURCE_SUFFIXES for why
-    fixed-form sources are not scanned. (A token inside a string is never an
-    identifier, so over-carrying state can only under-report, never false-flag;
-    the build step remains the backstop.)
-    """
-    out: list[str] = []
-    for ch in line:
-        if quote is not None:
-            if ch == quote:
-                quote = None
-            continue
-        if ch in ("'", '"'):
-            quote = ch
-            continue
-        if ch == "!":
-            break
-        out.append(ch)
-    return "".join(out), quote
-
-
-def _validate_fortran_identifier_length(src_dir: Path, violations: list[str]) -> None:
-    """Flag any Fortran identifier exceeding the 63-char f2008 name limit.
-
-    Any identifier-like token longer than 63 characters is necessarily an
-    invalid name (no keyword or intrinsic is that long), so reporting it is
-    safe. Each distinct offending name is reported once per file.
-    """
-    if not src_dir.is_dir():
-        return
-    for path in sorted(src_dir.iterdir()):
-        if not path.is_file() or path.suffix.lower() not in _FORTRAN_SOURCE_SUFFIXES:
-            continue
-        try:
-            text = path.read_text(encoding="utf-8", errors="ignore")
-        except OSError:
-            continue
-        seen: set[str] = set()
-        quote: str | None = None
-        for raw in text.splitlines():
-            code, quote = _strip_fortran_comments_and_strings(raw, quote)
-            for tok in _FORTRAN_IDENT_RE.findall(code):
-                if len(tok) > _FORTRAN_NAME_LIMIT and tok not in seen:
-                    seen.add(tok)
-                    violations.append(
-                        f"{path}: Fortran identifier exceeds the {_FORTRAN_NAME_LIMIT}-char "
-                        f"f2008 name limit ({len(tok)} chars): {tok!r}"
-                    )
-
-
-def _validate_fortran_implicit_none_spec_list(
-    src_dir: Path, standard: str | None, violations: list[str]
-) -> None:
-    """Flag the F2018 spec-list `implicit none (...)` form under `-std=f2008`.
-
-    fortitude rule C003 wants the spec-list form, but under the f2008 standard it
-    is a compile_error that lint and the (non-compiling) post_generate static gate
-    both miss — it only surfaces at Build or the standard-aware verify persona
-    (observed in orch_20260702T032026Z_75ad595e). Catching it here fails the cheap
-    deterministic generate.static substep and warm-resumes Generate.generate first.
-    The check stays silent when the toolchain standard explicitly accepts the form
-    (f2018/f2023); f2008 and unresolved/None (the f2008 series the generator
-    targets) are flagged. Reuses the free-form comment/string stripper so a
-    spec-list inside a comment or literal is never false-flagged; reports each file
-    once. See docs/workflow/phases/phase_02_generate.md §2-1 (C003 workaround).
-
-    Accepted limitation (same as _validate_fortran_identifier_length): a
-    `implicit none &`-continued onto the next line before the `(` is scanned as
-    two physical lines and not flagged. This can only under-report, never
-    false-flag; the generator emits the form on one line and the Build step is
-    the backstop.
-    """
-    if standard in _IMPLICIT_NONE_SPEC_LIST_STANDARDS:
-        return
-    if not src_dir.is_dir():
-        return
-    for path in sorted(src_dir.iterdir()):
-        if not path.is_file() or path.suffix.lower() not in _FORTRAN_SOURCE_SUFFIXES:
-            continue
-        try:
-            text = path.read_text(encoding="utf-8", errors="ignore")
-        except OSError:
-            continue
-        quote: str | None = None
-        flagged = False
-        for raw in text.splitlines():
-            code, quote = _strip_fortran_comments_and_strings(raw, quote)
-            if not flagged and _FORTRAN_IMPLICIT_NONE_SPEC_LIST_RE.search(code):
-                flagged = True
-                violations.append(
-                    f"{path}: F2018 spec-list `implicit none (...)` is a compile_error "
-                    f"under -std=f2008 (Fortran 2018: IMPLICIT NONE with spec list); use "
-                    f"plain `implicit none` with the `! allow(C003)` directive on the line "
-                    f"immediately before it (see docs/workflow/phases/phase_02_generate.md §2-1)"
-                )
-
-
-# Under `-std=f2008` a STOP / ERROR STOP code must be a scalar default CHARACTER or
-# INTEGER CONSTANT expression; a run-time value folded in via concatenation
-# (`'unknown case: '//cid`, where `cid` is a variable) is `Error: STOP code at (1) must be
-# a scalar default CHARACTER or INTEGER constant expression`. F2018 relaxed this to allow a
-# non-constant code, so f2018/f2023 accept it and the check stays silent there. Lint
-# (fortitude) and the non-compiling post_generate gate both miss it — it only surfaces at
-# Build (observed on the harness self-test runner in orch_20260708T082701Z_356befd7,
-# `error stop 'harness runner: unknown case_id: '//cid`), which is a `build_compile_error`
-# = a dev_phase_rollback with no in-phase retry. Catching it here warm-resumes
-# Generate.generate instead. Verified against gfortran -std=f2008: `'a'//'b'` and
-# `pre//suf` (named `parameter`s) and `'x'//new_line('a')` COMPILE (constant exprs), while
-# `pre//v` (v a variable) does NOT — so the gate must be parameter-aware, not just
-# "identifier operand => non-constant".
-_F2018_NONCONST_STOP_STANDARDS = frozenset({"f2018", "f2023"})
-_FORTRAN_STOP_STMT_RE = re.compile(r"(?i)\b(error\s+stop|stop)\b")
-_FORTRAN_IDENT_HEAD_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
-_FORTRAN_IDENT_TAIL_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*$")
-# A `parameter` attribute declaration: `<type>, parameter [,attrs] :: N1 = .., N2(..) = ..`.
-_FORTRAN_PARAMETER_ATTR_RE = re.compile(r"(?i),\s*parameter\b")
-# The old statement form: `parameter (N1 = .., N2 = ..)`.
-_FORTRAN_PARAMETER_STMT_RE = re.compile(r"(?i)\bparameter\s*\(([^)]*)\)")
-# A lone assignment `=` (NOT `==` / `/=` / `<=` / `>=`). A STOP statement's code never
-# contains one, so its presence in `stop`'s code half means `stop` is a variable being
-# assigned (`stop = ..`, `stop(i) = ..`, `stop%c = ..`), not a STOP statement.
-_FORTRAN_ASSIGN_RE = re.compile(r"(?<![=/<>])=(?!=)")
-# A bare `stop` after a `)` is a STOP statement only when the `)` closes a control-construct
-# guard (`if (..) stop`, `where (..)`, `forall (..)`) — NOT the `)` of a `write(..)` /
-# function-call whose output/result is then concatenated (`write(*,*) stop//x`, where `stop`
-# is a variable). Requiring a guard keyword avoids reading such a `stop` as a statement.
-_FORTRAN_CONTROL_GUARD_RE = re.compile(r"(?i)\b(if|where|forall)\b")
-
-
-def _fortran_line_mask_strings(line: str, quote: str | None = None) -> tuple[str, str | None]:
-    """Drop the trailing free-form ``!`` comment and replace character-literal spans with
-    ``#`` placeholders — preserving that a *literal* (not a variable) sat there, so a
-    constant concatenation (``'a'//'b'`` -> ``###//###``) is distinguishable from a
-    variable one (``'a'//v`` -> ``###//v``). Carries an open-string delimiter across ``&``
-    continuations (pass the returned ``quote`` back in) so a literal spanning lines stays
-    masked. Unlike ``_strip_fortran_comments_and_strings`` it keeps a placeholder rather
-    than deleting the span, which is what the ``//``-operand analysis below needs."""
-    out: list[str] = []
-    for ch in line:
-        if quote is not None:
-            out.append("#")
-            if ch == quote:
-                quote = None
-            continue
-        if ch in ("'", '"'):
-            quote = ch
-            out.append("#")
-            continue
-        if ch == "!":
-            break
-        out.append(ch)
-    return "".join(out), quote
-
-
-def _fortran_join_continuations(masked_lines: list[str]) -> list[str]:
-    """Fold free-form ``&`` continuations in already-masked lines into logical lines.
-
-    A line whose last non-blank char is ``&`` continues onto the next; that next line may
-    begin (after whitespace) with a leading ``&`` which is elided. Used so
-    ``_fortran_parameter_names`` sees a `parameter` declaration whose name list (or the
-    `, parameter ::` head itself) is wrapped across lines as ONE line — otherwise a name on
-    the continuation is missed and a legal `pre//suf` STOP code is false-flagged. (Strings
-    are already masked to ``#``, so a trailing ``&`` here is a real continuation, never one
-    inside a literal.)"""
-    out: list[str] = []
-    buf = ""
-    pending = False
-    for line in masked_lines:
-        cur = line
-        if pending and cur.lstrip().startswith("&"):
-            cur = cur.lstrip()[1:]
-        if cur.rstrip().endswith("&"):
-            buf += cur.rstrip()[:-1]
-            pending = True
-            continue
-        out.append(buf + cur)
-        buf = ""
-        pending = False
-    if buf:
-        out.append(buf)
-    return out
-
-
-def _fortran_parameter_names(masked_lines: list[str]) -> set[str]:
-    """Collect the (lowercased) names declared with the ``parameter`` attribute in a
-    file's masked source lines. A ``//`` operand that is one of these is a compile-time
-    CONSTANT, so concatenating it into a STOP code is legal — it must NOT be flagged.
-
-    Over-collection (treating a non-parameter as a parameter) can only SUPPRESS a flag —
-    the safe direction (Build is the backstop). Under-collection would false-flag, so the
-    two declaration forms are both parsed. The value after ``=`` is ignored (only the LHS
-    name matters), so a comma inside an array-constructor value cannot mint a false name
-    (a split fragment not starting with an identifier yields nothing)."""
-    names: set[str] = set()
-
-    def _first_ident(part: str) -> None:
-        m = _FORTRAN_IDENT_HEAD_RE.match(part.strip())
-        if m:
-            names.add(m.group(0).lower())
-
-    for line in masked_lines:
-        if "parameter" not in line.lower():
-            continue
-        if "::" in line and _FORTRAN_PARAMETER_ATTR_RE.search(line.split("::", 1)[0]):
-            for part in line.split("::", 1)[1].split(","):
-                _first_ident(part)
-        stmt = _FORTRAN_PARAMETER_STMT_RE.search(line)
-        if stmt:
-            for part in stmt.group(1).split(","):
-                _first_ident(part)
-    return names
-
-
-def _stop_code_has_nonconstant_concat(expr: str, param_names: set[str]) -> bool:
-    """True when the STOP code ``expr`` (character-literals masked to ``#``) has a ``//``
-    concatenation with a provably NON-constant operand — a bare identifier that is not a
-    known ``parameter``. Constant operands are left unflagged: a masked literal (``#``), a
-    named ``parameter``, and — leniently — any ``name(...)`` reference or ``base%comp``
-    component (a constant intrinsic like ``new_line('a')`` / ``achar(9)``, and a component of
-    a derived-type ``parameter``, are constant but indistinguishable from a non-constant
-    ``trim(var)`` / ``var%comp`` without more analysis, so both are treated as constant to
-    avoid a false positive on the common idioms; the rarer non-constant call/component shape
-    falls to the Build backstop). This matches gfortran -std=f2008's own accept/reject split."""
-    for m in re.finditer(r"//", expr):
-        # Left operand: the token ending at the `//`. A trailing `)` (call/array ref) or a
-        # component reference (`base%comp`, the tail identifier preceded by `%`) is treated
-        # as constant (a component of a derived-type `parameter` is a constant expression).
-        left = expr[: m.start()].rstrip()
-        if left and left[-1] != "#" and left[-1] != ")":
-            tail = _FORTRAN_IDENT_TAIL_RE.search(left)
-            # `base % comp` (a component ref — possibly with spaces around `%`) is a
-            # constant when `base` is a derived-type parameter; treat it leniently.
-            if (tail and not left[: tail.start()].rstrip().endswith("%")
-                    and tail.group(0).lower() not in param_names):
-                return True
-        # Right operand: the token starting after the `//`. A following `(` (call/array) or
-        # `%` (component reference) is treated as constant, same as the left side.
-        right = expr[m.end():].lstrip()
-        if right and right[0] != "#":
-            head = _FORTRAN_IDENT_HEAD_RE.match(right)
-            if head:
-                after = right[head.end():].lstrip()
-                if (not after.startswith("(") and not after.startswith("%")
-                        and head.group(0).lower() not in param_names):
-                    return True
-    return False
-
-
-def _validate_fortran_stop_code_constant(
-    src_dir: Path, standard: str | None, violations: list[str]
-) -> None:
-    """Flag a non-constant STOP / ERROR STOP code under `-std=f2008` (a `build_compile_error`).
-
-    The recurring generation flake is a `//` concatenation folding a VARIABLE into the code
-    (`'unknown case_id: '//cid`). The gate is parameter-aware and call-lenient (see
-    `_stop_code_has_nonconstant_concat`) so it does NOT false-flag a legal constant
-    concatenation — `'a'//'b'`, `pre//suf` (named `parameter`s), or `'x'//new_line('a')` —
-    which gfortran -std=f2008 accepts. `parameter` names are collected as the UNION across
-    EVERY Fortran file in `src_dir` (all compiled sources are staged there — model / checks /
-    host-rendered runner / dependency modules), so a constant `use`d from a sibling module
-    (`use consts, only: PFX` then `error stop PFX//'x'`) is recognised, not just an in-file
-    one. A bare-variable code with no concatenation (`error stop rc`) is NOT flagged: a named
-    INTEGER/CHARACTER `parameter` there is legal and there is nothing to disambiguate it from
-    a variable, so the Build step stays the backstop for that rarer shape. Silent when the
-    toolchain standard accepts a non-constant code (f2018/f2023). Reuses the free-form
-    comment/string masker so a `//` inside a comment or literal never false-flags; reports
-    each file once.
-
-    A bare `stop` keyword is only a STOP statement at statement position (line start, after
-    a numeric label, or after `)` / `;`) AND when its code half carries no assignment `=`;
-    `stop` used as a variable operand (`x = stop//y`, `foo(stop//bar)`) or assigned
-    (`stop = ..`, `stop(i) = ..`, `stop%c = ..`) is skipped. `error stop` is unambiguous (two
-    adjacent identifiers are never a valid expression), so it needs no such guard.
-
-    Accepted limitations (Build is the backstop, so each can only cost a rare extra rebuild):
-    a STOP code split by a `&` continuation before the `//` is scanned per physical line and
-    not flagged; and a parameter brought in under a `use, only: alias => remote` RENAME is
-    seen only under its declared name, so `error stop alias//'x'` (alias of a CHARACTER
-    parameter) could false-flag — renames are uncollectable without `use`-graph resolution,
-    and this shape does not occur in generated code. Both under-report/rare-false-flag only;
-    the generator emits STOP statements on one line with in-scope names."""
-    if standard in _F2018_NONCONST_STOP_STANDARDS:
-        return
-    if not src_dir.is_dir():
-        return
-    masked_by_path: dict[Path, list[str]] = {}
-    param_names: set[str] = set()
-    for path in sorted(src_dir.iterdir()):
-        if not path.is_file() or path.suffix.lower() not in _FORTRAN_SOURCE_SUFFIXES:
-            continue
-        try:
-            text = path.read_text(encoding="utf-8", errors="ignore")
-        except OSError:
-            continue
-        masked_lines: list[str] = []
-        quote: str | None = None
-        for raw in text.splitlines():
-            masked, quote = _fortran_line_mask_strings(raw, quote)
-            masked_lines.append(masked)
-        masked_by_path[path] = masked_lines
-        # Union across files: a parameter declared in a sibling module (staged in the same
-        # src/) is a constant when `use`d here, so it must suppress a flag on this file too.
-        param_names |= _fortran_parameter_names(_fortran_join_continuations(masked_lines))
-    for path, masked_lines in masked_by_path.items():
-        flagged = False
-        for masked in masked_lines:
-            if flagged:
-                break
-            for m in _FORTRAN_STOP_STMT_RE.finditer(masked):
-                before = masked[: m.start()].rstrip()
-                # The STOP code runs to the statement end (`;` separates free-form
-                # statements); anything after a `;` is a different statement.
-                rest = masked[m.end():].split(";", 1)[0]
-                if m.group(1).lower() == "stop":
-                    # A bare `stop` is a STOP statement only at statement position; as a
-                    # variable operand (`x = stop//y`, `foo(stop//bar)`, `trim(stop)`,
-                    # `write(*,*) stop//x`) it is preceded by an operator / `(` / identifier
-                    # char, or by a non-guard `)` — skip those.
-                    if not (before == "" or before.isdigit() or before.endswith(";")
-                            or (before.endswith(")")
-                                and _FORTRAN_CONTROL_GUARD_RE.search(before))):
-                        continue
-                    # An assignment to a variable named `stop` (`stop = ..`, `stop(i) = ..`,
-                    # `stop%c = ..`) is not a STOP statement — a lone `=` in the code half.
-                    if _FORTRAN_ASSIGN_RE.search(rest):
-                        continue
-                if _stop_code_has_nonconstant_concat(rest, param_names):
-                    flagged = True
-                    violations.append(
-                        f"{path}: non-constant STOP/ERROR STOP code (a `//` concatenation "
-                        f"folds in a variable) is a compile_error under -std=f2008 (STOP code "
-                        f"must be a scalar CHARACTER/INTEGER constant expression); use a "
-                        f"constant literal message, or print the run-time value then `error "
-                        f"stop <int>` (see docs/workflow/phases/phase_02_generate.md §2-1)"
-                    )
-                    break
 
 
 # R1/M3c-β: the fixed public ABI of a physics node's `<spec_id>_checks.f90`
@@ -4457,17 +4081,6 @@ def _validate_generate_outputs_for_generation(
             violations=violations,
         )
 
-    _validate_fortran_identifier_length(src_dir, violations)
-    _validate_fortran_implicit_none_spec_list(
-        src_dir,
-        _impl_standard_from_pipeline_dir(repo_root, execution.pipeline_dir),
-        violations,
-    )
-    _validate_fortran_stop_code_constant(
-        src_dir,
-        _impl_standard_from_pipeline_dir(repo_root, execution.pipeline_dir),
-        violations,
-    )
     _validate_fortran_makefile_src_dir(src_dir, violations)
     _build_system, _language = _impl_toolchain_from_pipeline_dir(
         repo_root, execution.pipeline_dir
@@ -4664,39 +4277,6 @@ def _impl_toolchain_from_pipeline_dir(
         return value.strip().lower() if isinstance(value, str) and value.strip() else None
 
     return (_norm(toolchain.get("build_system")), _norm(toolchain.get("language")))
-
-
-def _impl_standard_from_pipeline_dir(
-    repo_root: Path, pipeline_dir: Path
-) -> str | None:
-    """Resolve `spec.ir.yaml#impl_defaults.toolchain.standard` (lowercased), or
-    None when unresolvable. Sibling of `_impl_toolchain_from_pipeline_dir` — kept
-    separate so that function's `(build_system, language)` return arity (3+ call
-    sites) stays unchanged. Used to gate the `implicit none` spec-list check."""
-    ir_dir = _ir_dir_from_pipeline_dir(repo_root, pipeline_dir)
-    if ir_dir is None:
-        return None
-    contract_path = ir_dir / "spec.ir.yaml"
-    if not contract_path.exists():
-        return None
-    try:
-        data = _read_yaml(contract_path)
-    except (json.JSONDecodeError, yaml.YAMLError):
-        return None
-    if not isinstance(data, dict):
-        return None
-    impl_defaults = data.get("impl_defaults")
-    toolchain = (
-        impl_defaults.get("toolchain")
-        if isinstance(impl_defaults, dict)
-        else data.get("toolchain")
-    )
-    if not isinstance(toolchain, dict):
-        return None
-    standard = toolchain.get("standard")
-    return standard.strip().lower() if isinstance(standard, str) and standard.strip() else None
-
-
 def _io_contract_for_execution(
     repo_root: Path, execution: NodeExecution
 ) -> dict[str, Any] | None:
@@ -5715,6 +5295,173 @@ def _validate_generate_lint_command_logs(
                 f"{meta_path}: lint evidence run_linter[{idx}]: logged command does not match "
                 f"preset {preset_decl_l!r} (inferred {inferred!r})"
             )
+
+
+def _validate_generate_syntax_command_logs(
+    repo_root: Path,
+    meta_path: Path,
+    data: dict[str, Any],
+    impl_language: str | None,
+    violations: list[str],
+) -> None:
+    """Certify the conductor-run compiler syntax gate for Generate against its
+    host-authored, leaf-non-writable evidence
+    (`<pipeline_root>/syntax_evidence/<source_id>.json`).
+
+    The syntax gate is the deterministic `generate.syntax` substep run in-process by the
+    conductor (Conductor._syntax_inproc -> MCP run_syntax_check). Mirrors
+    `_validate_generate_lint_command_logs`: the certificate cannot be forged by the leaf
+    (the pipeline root is read-only inside the sandbox). Required only for
+    toolchain.language=fortran (the only language with a syntax-check adapter); the
+    MANDATORY stage is gfortran and must have passed. Optional additional stages (the
+    METDSL_SYNTAX_COMPILERS target-compiler stages) may be recorded as `skipped` when
+    their compiler is not installed; a recorded `fail` stage always fails certification."""
+    source_id = meta_path.parent.name
+    pipeline_root = meta_path.parents[2]
+    from tools.hooks.syntax_evidence import read_syntax_evidence, syntax_evidence_path
+
+    # fortran is the only language the gate runs for; other languages pass through the
+    # generate.syntax substep without evidence, so there is nothing to certify.
+    if not impl_language or impl_language.strip().lower() != "fortran":
+        return
+
+    # Same trigger rule as the lint certification: certify whenever the conductor-run
+    # evidence exists (the static-stage flow) OR the leaf is claiming pass; skip only when
+    # neither holds (e.g. a manual or pre-syntax invocation on an un-certified source).
+    status = data.get("verification_status")
+    verified_pass = isinstance(status, str) and status.strip().lower() == "pass"
+    try:
+        evidence_present = syntax_evidence_path(
+            pipeline_root=pipeline_root, source_id=source_id).exists()
+    except ValueError:
+        evidence_present = False
+    if not verified_pass and not evidence_present:
+        return
+
+    try:
+        evidence = read_syntax_evidence(pipeline_root=pipeline_root, source_id=source_id)
+    except ValueError as exc:
+        violations.append(
+            f"{meta_path}: malformed conductor syntax evidence "
+            f"({pipeline_root.name}/syntax_evidence/{source_id}.json): {exc}"
+        )
+        return
+    if evidence is None:
+        violations.append(
+            f"{meta_path}: missing conductor syntax evidence "
+            f"(expected {pipeline_root.name}/syntax_evidence/{source_id}.json) when "
+            "verification_status=pass; the syntax gate is run by the conductor "
+            "(generate.syntax)"
+        )
+        return
+    if evidence.get("ok") is not True:
+        violations.append(
+            f"{meta_path}: conductor syntax evidence reports the syntax gate did not "
+            "succeed (ok must be true)"
+        )
+        return
+    stages = evidence.get("stages")
+    if not isinstance(stages, list) or not stages:
+        violations.append(
+            f"{meta_path}: conductor syntax evidence stages must be a non-empty array"
+        )
+        return
+
+    gfortran_passed = False
+    for idx, entry in enumerate(stages):
+        if not isinstance(entry, dict):
+            violations.append(
+                f"{meta_path}: syntax evidence stages[{idx}] must be object"
+            )
+            continue
+        compiler = str(entry.get("compiler") or "").strip().lower()
+        stage_status = str(entry.get("status") or "").strip().lower()
+        if stage_status == "fail":
+            violations.append(
+                f"{meta_path}: syntax evidence stages[{idx}] ({compiler}) recorded a "
+                "failed syntax check"
+            )
+            continue
+        if stage_status == "skipped":
+            if compiler == "gfortran":
+                violations.append(
+                    f"{meta_path}: syntax evidence stages[{idx}]: the mandatory gfortran "
+                    "stage must not be skipped"
+                )
+            continue
+        if stage_status != "pass":
+            violations.append(
+                f"{meta_path}: syntax evidence stages[{idx}].status invalid "
+                f"(got {stage_status!r})"
+            )
+            continue
+
+        command_id = entry.get("command_id")
+        log_ref = entry.get("command_log_ref")
+        if not isinstance(command_id, str) or not command_id.strip():
+            violations.append(
+                f"{meta_path}: syntax evidence stages[{idx}].command_id invalid"
+            )
+            continue
+        if not isinstance(log_ref, str) or not log_ref.strip():
+            violations.append(
+                f"{meta_path}: syntax evidence stages[{idx}].command_log_ref invalid"
+            )
+            continue
+
+        # Same canonical placement as the lint records: <gen_dir>/src/command_log.jsonl.
+        canonical_refs = _canonical_mcp_log_refs_for_lint(meta_path, repo_root)
+        log_ref_norm = log_ref.strip().rstrip("/")
+        if canonical_refs and log_ref_norm not in canonical_refs:
+            violations.append(
+                f"{meta_path}: syntax evidence stages[{idx}].command_log_ref "
+                f"must be the canonical MCP audit log placement "
+                f"(expected one of {sorted(canonical_refs)!r}, got {log_ref_norm!r}). "
+                "Non-canonical placements are rejected to prevent forged tool-execution "
+                "evidence."
+            )
+            continue
+
+        matched = _find_command_log_record(repo_root, command_id.strip(), log_ref.strip())
+        if matched is None:
+            violations.append(
+                f"{meta_path}: syntax evidence stages[{idx}]: command log not found "
+                f"for command_id={command_id!r}"
+            )
+            continue
+        if matched.get("tool_name") != "run_syntax_check":
+            violations.append(
+                f"{meta_path}: syntax evidence stages[{idx}]: command_id={command_id!r} "
+                "tool_name must be run_syntax_check"
+            )
+            continue
+        if matched.get("ok") is not True:
+            violations.append(
+                f"{meta_path}: syntax evidence stages[{idx}]: command_id={command_id!r} "
+                "run_syntax_check did not succeed (ok must be true)"
+            )
+            continue
+        command = matched.get("command")
+        if not isinstance(command, list) or not command:
+            violations.append(
+                f"{meta_path}: syntax evidence stages[{idx}]: command log missing command"
+            )
+            continue
+        exe_basename = Path(str(command[0])).name.strip().lower()
+        if exe_basename != compiler:
+            violations.append(
+                f"{meta_path}: syntax evidence stages[{idx}]: logged command does not "
+                f"match compiler {compiler!r} (argv[0] is {command[0]!r})"
+            )
+            continue
+        if compiler == "gfortran":
+            gfortran_passed = True
+
+    if not gfortran_passed:
+        violations.append(
+            f"{meta_path}: syntax evidence must record a passing gfortran stage "
+            "(the mandatory syntax gate for toolchain.language=fortran)"
+        )
 
 
 def _find_command_log_record(
@@ -10124,6 +9871,9 @@ def _validate_post_generate_stage_impl(
                         repo_root, (repo_root / ir_ref).resolve()
                     )
                 _validate_generate_lint_command_logs(
+                    repo_root, meta_path, meta_data, impl_lang, violations
+                )
+                _validate_generate_syntax_command_logs(
                     repo_root, meta_path, meta_data, impl_lang, violations
                 )
 

@@ -56,14 +56,14 @@ These are the workflow common norms a leaf must obey while authoring/verifying a
 Every LLM substep produces its phase's `<stage>_meta.json` (`ir_meta.json` for Compile, `source_meta.json` for Generate, `validate_meta.json` for Validate) as a required output.
 
 - Common required keys: `attempt_count`, `verification_status`, `last_fail_reason`, `debug_mode`, `context_isolated`. When `context_isolated=false`, `constraint_reason` is required.
-- `source_meta.json`: does not record lint — `static lint` is the conductor-run `Generate.lint` substep, certified by `post_generate` against the host-authored `lint_evidence/<source_id>.json`.
+- `source_meta.json`: does not record lint or the syntax gate — `static lint` is the conductor-run `Generate.lint` substep and the compiler syntax gate is the conductor-run `Generate.syntax` substep, certified by `post_generate` against the host-authored `lint_evidence/<source_id>.json` / `syntax_evidence/<source_id>.json`.
 - `validate_meta.json`: additionally requires the LLM semantic-check evidence in `judge_command_ref` **only when** `verification_status=pass`.
 - With `debug_mode=false`, do not save failed-attempt artifacts. `verification_status` presumes `fail_closed`: unperformed/unjudgeable verification must never be recorded `pass`.
 - **verify-family substeps (`compile.verify` / `generate.verify`):** a `pass` must (re-)author the verified meta with the `Write`/`Edit` tool even when the inspection finds nothing to change (refresh an idempotent field such as `verify_attempts`). An inspect-only verify that writes nothing cannot terminate `pass`.
 
 ## MCP `command_log.jsonl` placement
 
-The MCP `build-runtime` server writes `command_log.jsonl` itself as a side effect of `run_linter` / `compile_project` / `run_program` / `run_quality_checks`. It appears in your `allowed_output_paths` at the canonical per-phase path (already enumerated in your manifest / task card) but **not** in `allowed_file_tool_paths` — never write it with a file tool. (Full per-phase placement reference: `docs/workflow/MCP_COMMAND_LOG_PLACEMENT.md`, readable under `docs/` but not a leaf must-read.)
+The MCP `build-runtime` server writes `command_log.jsonl` itself as a side effect of `run_linter` / `run_syntax_check` / `compile_project` / `run_program` / `run_quality_checks`. It appears in your `allowed_output_paths` at the canonical per-phase path (already enumerated in your manifest / task card) but **not** in `allowed_file_tool_paths` — never write it with a file tool. (Full per-phase placement reference: `docs/workflow/MCP_COMMAND_LOG_PLACEMENT.md`, readable under `docs/` but not a leaf must-read.)
 
 ## Artifact write — direct `Write` / `Edit` tool procedure
 

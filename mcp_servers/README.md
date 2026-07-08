@@ -1,7 +1,7 @@
 # MCP Server: Build/Runtime Operations
 
 ## Purpose
-This directory provides the implementation for running `compile` / `run` / `quality check` / `static lint` for `Generate` via the MCP server.
+This directory provides the implementation for running `compile` / `run` / `quality check` / `static lint` / `syntax check` for `Generate` via the MCP server.
 
 ## Provided server
 - `build_runtime_server.py`
@@ -12,6 +12,7 @@ This directory provides the implementation for running `compile` / `run` / `qual
     - `run_program`
     - `run_quality_checks`
     - `run_linter`
+    - `run_syntax_check`
 
 ## Important operational rules
 - `compile_project` allows only standard build tools that can handle dependencies.
@@ -23,7 +24,8 @@ This directory provides the implementation for running `compile` / `run` / `qual
 - `run_quality_checks` allows only the `preset` specification, and forbids the execution of an arbitrary `command`.
 - The `preset=pytest` of `run_quality_checks` prepends `project_dir` to `PYTHONPATH` to ensure the reproducibility of import resolution.
 - `run_linter` allows only the `preset` specification, and forbids the execution of an arbitrary `command`.
-- `compile_project` / `run_program` / `run_quality_checks` / `run_linter` always record the executed command in `JSONL` format.
+- `run_syntax_check` is the tool for `Generate`'s deterministic `Generate.syntax` gate: it runs a REGISTERED compiler adapter's syntax-only mode (`gfortran -fsyntax-only -std=<toolchain.standard>`, module files into a throwaway `.mods` scratch dir inside `project_dir`) over the staged Fortran sources in module/use dependency order. Because it produces **no build artifacts**, it is lint-class, not a build — like `run_linter` it is outside the scope of the norm that requires `compile` to go through a standard build tool (the "no one-off `gfortran`" rule above targets builds). Adapters are a registry (`_SYNTAX_COMPILER_ADAPTERS`; currently `gfortran`) — a future target compiler (e.g. Fujitsu `frt`, whose adapter may compile with `-c` into the scratch dir) is added by extending the registry, and the conductor selects stages via the `METDSL_SYNTAX_COMPILERS` env var (default `gfortran`; a stage whose compiler binary is absent is reported `skipped`). It forbids the execution of an arbitrary `command`.
+- `compile_project` / `run_program` / `run_quality_checks` / `run_linter` / `run_syntax_check` always record the executed command in `JSONL` format.
 - The default for `command_log_path` when unspecified is `<project_dir>/command_log.jsonl`.
 - The execution result returns `command_id`, `executed_command`, and `command_log_path`, and when the log is under the repository, returns `command_log_ref`.
 
