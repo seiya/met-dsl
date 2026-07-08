@@ -10,6 +10,15 @@
 > the conductor) take their contract from `phase_03_build.md` /
 > `phase_04_validate.md`; this file is the LLM-facing slice.
 
+> **Scope note (R1/M3c-β).** On an *M3c node* (a make+fortran physics node with
+> exactly one `infrastructure`/harness dependency) the `runner` is **host-rendered**
+> by the conductor, not leaf-authored — the leaf authors `<spec_id>_model.f90` +
+> `<spec_id>_checks.f90` (see `CHECKS_MODULE_CONTRACT.md`), and the harness owns the
+> JSON assembly + verdict fold. For such a node this document describes the output
+> the rendered runner produces (still the contract the `Validate.judge` reviews);
+> the *authoring* rules below apply to a leaf-authored runner (an `infrastructure`
+> self-test runner, or a legacy node without a harness dependency).
+
 The `runner` emits **only** `diagnostics.json`, `perf.json`, and the `raw/`
 primary evidence (plus `stdout.log` / `stderr.log`). It must **never** write
 `verdict.json`, `aggregate_verdict.json`, `summary.json`, or `trial_meta.json`

@@ -4112,6 +4112,148 @@ def _validate_fortran_implicit_none_spec_list(
                 )
 
 
+# R1/M3c-β: the fixed public ABI of a physics node's `<spec_id>_checks.f90`
+# (see docs/workflow/CHECKS_MODULE_CONTRACT.md). Non-prefixed names — module scope
+# makes them collision-free (the harness is `harness_fortran_cpu__*`, the model is
+# `<spec_id>__*`), and they keep every identifier under the f2008 63-char limit.
+_CHECKS_PUBLIC_NAMES = (
+    "case_setup", "case_run", "get_time",
+    "get_scalar", "get_r1", "get_r2", "get_r3", "get_r4",
+    "checks_compute", "metric_compute",
+)
+
+
+def _infra_direct_dep_node_keys(ir: dict[str, Any]) -> list[str]:
+    """The ``infrastructure/...`` direct-dependency node_keys of an IR, accepting BOTH the
+    dict form (``{node_key: ...}``) AND the bare-string form (``"infrastructure/..."``) —
+    the same dual shape the conductor's ``_infra_direct_deps`` and the rest of the dep
+    machinery (``_component_dep_spec_ids`` / ``_dep_node_key_tokens``) accept. Keeping the M3c
+    predicate's parse identical across the conductor / Generate.static / Compile consumers is
+    load-bearing: a shape one side counts and another drops would host-render the runner while
+    the other side skips the checks gate (fail-open) — see docs/design/deterministic_followups."""
+    dep = ir.get("dependency") if isinstance(ir.get("dependency"), dict) else {}
+    out: list[str] = []
+    for d in (dep.get("direct_deps") or []) if isinstance(dep, dict) else []:
+        nk = d.get("node_key") if isinstance(d, dict) else (d if isinstance(d, str) else None)
+        if isinstance(nk, str) and nk.strip() and nk.split("/", 1)[0].strip() == "infrastructure":
+            out.append(nk.strip())
+    return out
+
+
+def _execution_is_m3c(repo_root: Path, execution: NodeExecution) -> bool:
+    """True iff the node is an M3c physics node: make+fortran, ``spec_kind`` !=
+    ``infrastructure``, with exactly one ``infrastructure`` (runner-harness) direct
+    dependency. On such a node the runner is host-rendered and the leaf authors
+    ``<spec_id>_checks.f90`` — mirrors ``workflow_conductor._conductor_authors_runner``."""
+    ir_dir = _ir_dir_for_execution(repo_root, execution)
+    if ir_dir is None:
+        return False
+    ir_path = ir_dir / "spec.ir.yaml"
+    if not ir_path.is_file():
+        return False
+    try:
+        ir = _read_yaml(ir_path)
+    except (json.JSONDecodeError, yaml.YAMLError):
+        return False
+    if not isinstance(ir, dict):
+        return False
+    meta = ir.get("meta") if isinstance(ir.get("meta"), dict) else {}
+    if str(meta.get("spec_kind") or "").strip() == "infrastructure":
+        return False
+    impl = ir.get("impl_defaults") if isinstance(ir.get("impl_defaults"), dict) else {}
+    tc = impl.get("toolchain") if isinstance(impl.get("toolchain"), dict) else {}
+    if str(tc.get("build_system") or "make").lower() != "make":
+        return False
+    if str(tc.get("language") or "fortran").lower() != "fortran":
+        return False
+    return len(_infra_direct_dep_node_keys(ir)) == 1
+
+
+def _validate_checks_source_files(
+    execution: NodeExecution, src_dir: Path, model_files: list[Path], violations: list[str]
+) -> None:
+    """R1/M3c-β deterministic gate: an M3c physics node's leaf-authored
+    ``<spec_id>_checks.f90`` must satisfy the fixed-ABI contract
+    (docs/workflow/CHECKS_MODULE_CONTRACT.md). Checks: the file exists; it declares
+    ``module <spec_id>_checks``; it publishes all ten ABI names; NEITHER the checks NOR
+    the model source ``use``s the harness (the physics sources never depend on it — the
+    host-rendered runner is the sole harness caller); the checks module does no file I/O
+    (``open(``); and it writes no forbidden judge-artifact filename. A violation routes
+    back to Generate.generate to re-author the checks source."""
+    spec_id = _spec_id_from_node_key(execution.node_key)
+    if spec_id is None:
+        return
+    checks_path = src_dir / f"{spec_id}_checks.f90"
+    if not checks_path.is_file():
+        violations.append(
+            f"{checks_path}: an M3c physics node must author {spec_id}_checks.f90 (the "
+            "fixed-ABI checks module the host-rendered runner drives) — see "
+            "docs/workflow/CHECKS_MODULE_CONTRACT.md")
+        return
+    text = checks_path.read_text(encoding="utf-8", errors="ignore")
+    logical = _fortran_logical_lines(text)
+
+    if not any(re.match(rf"(?i)^\s*module\s+{re.escape(spec_id)}_checks\b", ln)
+               for ln in logical):
+        violations.append(
+            f"{checks_path}: must declare `module {spec_id}_checks` (the fixed ABI module)")
+
+    public_ids: set[str] = set()
+    defined_procs: set[str] = set()
+    all_public = False
+    for ln in logical:
+        m = re.match(r"(?i)^\s*public\b\s*(::)?\s*(.*)$", ln.strip())
+        if m:
+            body = m.group(2).strip()
+            if not body:  # a bare `public` makes the module's default accessibility public
+                all_public = True
+            else:
+                for tok in re.split(r"[,\s]+", body):
+                    if re.fullmatch(r"[A-Za-z]\w*", tok):
+                        public_ids.add(tok.lower())
+            continue
+        # A `subroutine <name>` / `function <name>` definition (so a bare-`public` module
+        # still has its ABL names verified: a name is published iff it is DEFINED, and a
+        # missing definition is caught even when no explicit `public ::` lists it).
+        dm = re.match(r"(?i)^\s*(?:pure\s+|elemental\s+|recursive\s+)*"
+                      r"(?:subroutine|function)\s+([A-Za-z]\w*)", ln.strip())
+        if dm:
+            defined_procs.add(dm.group(1).lower())
+    # Under an explicit-public module, a name is published iff it is in a `public ::` list;
+    # under a default-public (bare `public`) module, iff it is defined as a procedure.
+    published = (public_ids | defined_procs) if all_public else public_ids
+    missing = [n for n in _CHECKS_PUBLIC_NAMES if n not in published]
+    if missing:
+        violations.append(
+            f"{checks_path}: checks module must publish the fixed ABI names "
+            f"{list(_CHECKS_PUBLIC_NAMES)}; missing {missing}")
+
+    # Neither the checks nor the model source may `use` the harness module. Tolerate the
+    # optional `, <attr>` (e.g. `, intrinsic`) and `::` forms — `use harness_x`,
+    # `use :: harness_x`, and `use, non_intrinsic :: harness_x` must all be caught.
+    use_harness_re = re.compile(r"(?i)^\s*use\b\s*(?:,\s*\w+\s*)?(?:::\s*)?harness_")
+    for f in [checks_path, *model_files]:
+        ftext = f.read_text(encoding="utf-8", errors="ignore")
+        if any(use_harness_re.match(ln.strip())
+               for ln in _fortran_logical_lines(ftext)):
+            violations.append(
+                f"{f}: a physics source must not `use` the harness module — the physics "
+                "node never depends on the harness at the source level (the host-rendered "
+                "runner is the sole `use harness_*` site)")
+
+    # The checks module does no file I/O (emission is the harness/runner's exclusive job).
+    if any(re.search(r"(?i)\bopen\s*\(", ln) for ln in logical):
+        violations.append(
+            f"{checks_path}: checks module must not do file I/O (`open(`) — emission is the "
+            "harness's job; the checks module only computes state/checks/metrics")
+
+    lowered = text.lower()
+    for output_name in FORBIDDEN_RUNNER_OUTPUTS:
+        if output_name in lowered:
+            violations.append(
+                f"{checks_path}: forbidden judge-artifact filename detected ({output_name})")
+
+
 def _validate_generate_outputs_for_generation(
     repo_root: Path,
     execution: NodeExecution,
@@ -4209,11 +4351,21 @@ def _validate_generate_outputs_for_generation(
     _validate_makefile_test_invokes_cases(
         src_dir, violations, build_system=_build_system, language=_language
     )
+    # R1/M3c-β: on an M3c node the runner is host-rendered, so the two LLM-fabrication
+    # heuristics (diagnostics-dependency / nonphysical-casepath) are skipped — their target
+    # (a leaf-authored runner) is gone and they can false-positive on the deterministic
+    # rendered join. The cheap deterministic backstops (name / forbidden-output /
+    # json-serialization / snapshot-filename) still run against the rendered runner.
+    is_m3c = _execution_is_m3c(repo_root, execution)
     runner_files = sorted(src_dir.glob("*_runner.f90"))
     _validate_runner_source_files(
         execution, runner_files, violations,
         known_case_ids=_case_ids_for_execution(repo_root, execution),
+        skip_llm_heuristics=is_m3c,
     )
+    # R1/M3c-β: the leaf-authored checks module (fixed ABI) is gated only on an M3c node.
+    if is_m3c:
+        _validate_checks_source_files(execution, src_dir, model_files, violations)
 
     if dep_spec_ids:
         _validate_dependency_operation_on_model_files(
@@ -7163,6 +7315,7 @@ def _validate_runner_source_files(
     runner_files: list[Path],
     violations: list[str],
     known_case_ids: set[str] | None = None,
+    skip_llm_heuristics: bool = False,
 ) -> None:
     # B2 (cosmetic): the runner source is found by `*_runner.f90` glob, which is
     # looser than generate's write-authorization (allowed_output_paths pins exactly
@@ -7187,18 +7340,22 @@ def _validate_runner_source_files(
                 violations.append(
                     f"{runner_file}: forbidden runner output write detected ({output_name})"
                 )
-        _validate_problem_runner_diagnostics_dependency(
-            execution=execution,
-            runner_file=runner_file,
-            lowered=text,
-            violations=violations,
-        )
-        _validate_problem_runner_nonphysical_casepath_input(
-            execution=execution,
-            runner_file=runner_file,
-            lowered=text,
-            violations=violations,
-        )
+        # R1/M3c-β: skip the two LLM-fabrication heuristics on an M3c node (the runner is
+        # host-rendered, so there is no leaf runner to police and the deterministic join can
+        # trip them). The forbidden-output / name / serialization backstops above + below stay.
+        if not skip_llm_heuristics:
+            _validate_problem_runner_diagnostics_dependency(
+                execution=execution,
+                runner_file=runner_file,
+                lowered=text,
+                violations=violations,
+            )
+            _validate_problem_runner_nonphysical_casepath_input(
+                execution=execution,
+                runner_file=runner_file,
+                lowered=text,
+                violations=violations,
+            )
         _validate_runner_json_serialization(
             runner_file=runner_file,
             text=text,
@@ -7215,12 +7372,14 @@ def _validate_runner_source_files(
 def _validate_runner_outputs(
     execution: NodeExecution, src_dir: Path, violations: list[str],
     known_case_ids: set[str] | None = None,
+    skip_llm_heuristics: bool = False,
 ) -> None:
     runner_files = sorted(src_dir.glob("*_runner.f90"))
     if not runner_files:
         return
     _validate_runner_source_files(
-        execution, runner_files, violations, known_case_ids=known_case_ids
+        execution, runner_files, violations, known_case_ids=known_case_ids,
+        skip_llm_heuristics=skip_llm_heuristics,
     )
 
 
@@ -8916,8 +9075,63 @@ def _validate_compile_stage_impl(
     _validate_compile_dependency_consistency(repo_root, ir_dir, violations)
     _validate_test_predicates(repo_root, ir_dir, violations)
     _validate_infrastructure_public_api(repo_root, ir_dir, violations)
+    _validate_harness_dependency_consistency(repo_root, ir_dir, violations)
 
     return violations
+
+
+def _validate_harness_dependency_consistency(
+    repo_root: Path, ir_dir: Path, violations: list[str]
+) -> None:
+    """R1/M3c-β deterministic compile gate: an M3c physics node that declares an
+    ``infrastructure`` (runner-harness) dependency must declare EXACTLY the harness derived
+    from its own target — ``harness_<language>_<target.class>`` (e.g. ``harness_fortran_cpu``).
+    A wrong / multiple / mistyped harness dependency is caught at Compile (cheap) rather than
+    surfacing as a render / link failure, because the runner glue is host-rendered against
+    exactly this harness.
+
+    No-op when the node declares NO infrastructure dependency (a pre-M3c legacy node keeps
+    its leaf-authored runner — the mass opt-in is M3d) or when the node is itself an
+    infrastructure node. Routes (via ``classify_compile_static_failure``) back to
+    ``compile.generate`` to re-author ``dependency.direct_deps``."""
+    derived_path = ir_dir / "spec.ir.yaml"
+    if not derived_path.exists():
+        return
+    try:
+        ir = _read_yaml(derived_path)
+    except (json.JSONDecodeError, yaml.YAMLError):
+        return
+    if not isinstance(ir, dict):
+        return
+    meta = ir.get("meta") if isinstance(ir.get("meta"), dict) else {}
+    if str(meta.get("spec_kind") or "").strip() == "infrastructure":
+        return
+    infra = _infra_direct_dep_node_keys(ir)
+    if not infra:
+        return  # no harness dependency declared -> legacy path, nothing to pin
+    impl = ir.get("impl_defaults") if isinstance(ir.get("impl_defaults"), dict) else {}
+    tc = impl.get("toolchain") if isinstance(impl.get("toolchain"), dict) else {}
+    target = impl.get("target") if isinstance(impl.get("target"), dict) else {}
+    language = str(tc.get("language") or "").strip().lower()
+    hw_class = str(target.get("class") or "").strip().lower()
+    if not language or not hw_class:
+        violations.append(
+            f"{derived_path}: node declares an infrastructure dependency but "
+            "impl_defaults.toolchain.language / impl_defaults.target.class is missing — "
+            "cannot derive the expected harness id")
+        return
+    expected = f"harness_{language}_{hw_class}"
+    if len(infra) != 1:
+        violations.append(
+            f"{derived_path}: a physics node must declare exactly one infrastructure (harness) "
+            f"dependency; found {infra} (expected the single {expected!r})")
+        return
+    dep_spec = _spec_id_from_node_key(infra[0])
+    if dep_spec != expected:
+        violations.append(
+            f"{derived_path}: declared infrastructure dependency {infra[0]!r} (spec_id "
+            f"{dep_spec!r}) does not match the harness derived from this node's target "
+            f"(language={language}, class={hw_class}): expected {expected!r}")
 
 
 def _validate_infrastructure_public_api(
@@ -9907,6 +10121,8 @@ def _validate_impl(
             _validate_runner_outputs(
                 execution, in_scope_src_dir, violations,
                 known_case_ids=_case_ids_for_execution(repo_root, execution),
+                # R1/M3c-β: skip the LLM-fabrication heuristics on the host-rendered runner.
+                skip_llm_heuristics=_execution_is_m3c(repo_root, execution),
             )
         _validate_run_program_inputs(repo_root, execution, violations)
         _validate_quality_check_commands(repo_root, execution, violations)

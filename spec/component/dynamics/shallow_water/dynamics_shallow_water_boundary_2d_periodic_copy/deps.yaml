@@ -3,3 +3,9 @@ spec_kind: component
 dependencies:
   components: []
   profiles: []
+  # R1/M3c-β: the (fortran, cpu) runner harness. This makes the node an M3c node —
+  # its runner is host-rendered glue over the certified harness plumbing + the
+  # leaf-authored <spec_id>_checks.f90 (see docs/workflow/CHECKS_MODULE_CONTRACT.md).
+  infrastructure:
+    - infrastructure_id: harness_fortran_cpu
+      version_constraint: ">=0.2.0 <1.0.0"

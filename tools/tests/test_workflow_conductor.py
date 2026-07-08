@@ -3355,6 +3355,198 @@ class WriteMakefileTest(unittest.TestCase):
             self.assertEqual(self._conductor(repo)._stage_dependency_sources(refs, obj_dir), [])
 
 
+class WriteRunnerTest(unittest.TestCase):
+    """R1/M3c-β: the conductor host-renders `<spec_id>_runner.f90` for an M3c physics node
+    (make+fortran, non-infra, exactly one infrastructure/harness dep), and the Makefile
+    compiles the leaf-authored `<spec_id>_checks.f90` between model and runner."""
+
+    SID = "boundary_x"
+
+    def _conductor(self, repo: Path) -> _FakeConductor:
+        c = _FakeConductor(repo_root=repo, orchestration_id="o",
+                           orchestration_agent_run_id="ORCH", backend="claude", env={})
+        c.calls = []
+        return c
+
+    def _refs(self) -> wc.NodeRefs:
+        return wc.NodeRefs(
+            node_key=f"component/{self.SID}@0.1.0", spec_path=f"spec/component/{self.SID}",
+            ir_id="i1", pipeline_id="p1", source_id="s1", binary_id="b1")
+
+    def _write_consumer_ir(self, repo: Path, refs: wc.NodeRefs, *, infra=1) -> None:
+        from tools.tests.test_runner_renderer import _boundary_ir
+        import yaml as _yaml
+        ir = _boundary_ir()
+        deps = [{"node_key": "infrastructure/harness_fortran_cpu@0.2.0"}] * infra
+        if infra == 2:
+            deps = [{"node_key": "infrastructure/harness_fortran_cpu@0.2.0"},
+                    {"node_key": "infrastructure/harness_other_cpu@0.2.0"}]
+        ir["dependency"]["direct_deps"] = deps
+        ir_dir = repo / refs.ir_ref
+        ir_dir.mkdir(parents=True, exist_ok=True)
+        (ir_dir / "spec.ir.yaml").write_text(_yaml.safe_dump(ir), encoding="utf-8")
+
+    def _seed_harness_pipeline(self, repo: Path, *, tamper_source: bool = False) -> None:
+        from tools.tests.test_runner_renderer import (
+            _HARNESS_STUB, _harness_signatures)
+        import yaml as _yaml
+        safe = "infrastructure__harness_fortran_cpu__0.2.0"
+        pipe = repo / "workspace" / "pipelines" / safe / "harness-fortran-cpu_20260707_002"
+        src_dir = pipe / "source" / "src_20260707_002" / "src"
+        src_dir.mkdir(parents=True, exist_ok=True)
+        source = _HARNESS_STUB
+        if tamper_source:
+            source = source.replace(
+                "function harness_fortran_cpu__box(name, json) result(nv)",
+                "function harness_fortran_cpu__box(key, json) result(nv)")
+        (src_dir / "harness_fortran_cpu_model.f90").write_text(source, encoding="utf-8")
+        harness_ir_ref = "workspace/ir/" + safe + "/harness-fortran-cpu_20260707_002"
+        (src_dir.parent / "source_meta.json").write_text(
+            json.dumps({"ir_ref": harness_ir_ref}), encoding="utf-8")
+        (pipe / "binary" / "bin_20260707_001").mkdir(parents=True, exist_ok=True)
+        (pipe / "binary" / "bin_20260707_001" / "binary_meta.json").write_text(
+            json.dumps({"source_source_id": "src_20260707_002"}), encoding="utf-8")
+        hir_dir = repo / harness_ir_ref
+        hir_dir.mkdir(parents=True, exist_ok=True)
+        (hir_dir / "spec.ir.yaml").write_text(
+            _yaml.safe_dump({"public_api": {"signatures": _harness_signatures()}}),
+            encoding="utf-8")
+
+    def test_conductor_authors_runner_truth_matrix(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            refs = self._refs()
+            c = self._conductor(repo)
+            self._write_consumer_ir(repo, refs, infra=1)
+            self.assertTrue(c._conductor_authors_runner(refs))
+            # zero infra deps -> legacy path (leaf-authored runner)
+            self._write_consumer_ir(repo, refs, infra=0)
+            self.assertFalse(c._conductor_authors_runner(refs))
+            # two infra deps -> not M3c
+            self._write_consumer_ir(repo, refs, infra=2)
+            self.assertFalse(c._conductor_authors_runner(refs))
+
+    def test_conductor_authors_runner_false_for_infra_node(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            refs = self._refs()
+            from tools.tests.test_runner_renderer import _boundary_ir
+            import yaml as _yaml
+            ir = _boundary_ir()
+            ir["meta"]["spec_kind"] = "infrastructure"
+            ir["dependency"]["direct_deps"] = [
+                {"node_key": "infrastructure/harness_fortran_cpu@0.2.0"}]
+            (repo / refs.ir_ref).mkdir(parents=True, exist_ok=True)
+            (repo / refs.ir_ref / "spec.ir.yaml").write_text(_yaml.safe_dump(ir))
+            self.assertFalse(self._conductor(repo)._conductor_authors_runner(refs))
+
+    def test_write_runner_renders_and_pins(self) -> None:
+        from tools.runner_renderer import render_runner
+        from tools.tests.test_runner_renderer import _boundary_ir
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            refs = self._refs()
+            self._write_consumer_ir(repo, refs, infra=1)
+            self._seed_harness_pipeline(repo)
+            c = self._conductor(repo)
+            c._write_runner(refs)
+            runner = repo / refs.source_dir() / "src" / f"{self.SID}_runner.f90"
+            self.assertTrue(runner.is_file())
+            # host-rendered output == render_runner(ir, spec_id, harness) exactly
+            ir = _boundary_ir()
+            ir["dependency"]["direct_deps"] = [
+                {"node_key": "infrastructure/harness_fortran_cpu@0.2.0"}]
+            expected = render_runner(ir, self.SID, "harness_fortran_cpu")
+            self.assertEqual(runner.read_text(encoding="utf-8"), expected)
+
+    def test_write_runner_fail_closed_on_missing_harness(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            refs = self._refs()
+            self._write_consumer_ir(repo, refs, infra=1)
+            # no harness pipeline seeded -> build precondition failure
+            with self.assertRaises(RuntimeError):
+                self._conductor(repo)._write_runner(refs)
+
+    def test_write_runner_fail_closed_on_pin_drift(self) -> None:
+        from tools.runner_renderer import RenderError
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            refs = self._refs()
+            self._write_consumer_ir(repo, refs, infra=1)
+            self._seed_harness_pipeline(repo, tamper_source=True)
+            with self.assertRaises(RenderError):
+                self._conductor(repo)._write_runner(refs)
+
+    def test_run_phase_routes_render_failure_to_fail_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            refs = self._refs()
+            self._write_consumer_ir(repo, refs, infra=1)  # M3c, but no harness seeded
+            c = self._conductor(repo)
+            outcome = c.run_phase(refs, "generate")
+            self.assertEqual(outcome.status, "fail")
+            self.assertEqual(outcome.decision.action, "fail_closed")
+            self.assertEqual(outcome.decision.reason, "generate_runner_render_failed")
+
+    def test_makefile_has_checks_rule_for_m3c(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            refs = self._refs()
+            self._write_consumer_ir(repo, refs, infra=1)
+            (repo / refs.ir_ref / "dependency_graph.json").write_text(json.dumps({
+                "all_nodes": [
+                    {"node_key": f"component/{self.SID}@0.1.0", "topo_level": 1},
+                    {"node_key": "infrastructure/harness_fortran_cpu@0.2.0", "topo_level": 0},
+                ]}), encoding="utf-8")
+            self._conductor(repo)._write_makefile(refs)
+            text = (repo / refs.source_dir() / "src" / "Makefile").read_text(encoding="utf-8")
+            self.assertIn(f"CHECKS_SRC = {self.SID}_checks.f90", text)
+            self.assertIn(f"CHECKS_OBJ = $(OBJDIR)/{self.SID}_checks.o", text)
+            self.assertIn("$(CHECKS_OBJ): $(CHECKS_SRC) $(MODEL_OBJ) | $(OBJDIR)", text)
+            self.assertIn("$(RUNNER_OBJ): $(RUNNER_SRC) $(CHECKS_OBJ) $(MODEL_OBJ)", text)
+            self.assertIn(
+                "$(DEP_OBJS) $(MODEL_OBJ) $(CHECKS_OBJ) $(RUNNER_OBJ) -o $(BINDIR)/$(BIN)", text)
+
+    def test_makefile_no_checks_rule_for_legacy_node(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            refs = self._refs()
+            self._write_consumer_ir(repo, refs, infra=0)  # legacy leaf, no harness dep
+            self._conductor(repo)._write_makefile(refs)
+            text = (repo / refs.source_dir() / "src" / "Makefile").read_text(encoding="utf-8")
+            self.assertNotIn("CHECKS_SRC", text)
+            self.assertIn("$(RUNNER_OBJ): $(RUNNER_SRC) $(MODEL_OBJ)", text)
+
+    def test_build_launch_request_swaps_runner_for_checks(self) -> None:
+        refs = self._refs()
+        for substep in ("generate", "verify"):
+            built = wc.build_launch_request(
+                refs, step="generate", substep=substep, orchestration_id="o",
+                orchestration_agent_run_id="ORCH", child_agent_run_id="c",
+                agent_model="m", workflow_mode="prod", runner_host_authored=True)
+            outs = built["allowed_output_paths"]
+            self.assertIn(f"{refs.source_dir()}/src/{self.SID}_checks.f90", outs)
+            self.assertNotIn(f"{refs.source_dir()}/src/{self.SID}_runner.f90", outs)
+            self.assertIn(f"{refs.source_dir()}/src/{self.SID}_model.f90", outs)
+        # default (legacy) keeps the runner
+        legacy = wc.build_launch_request(
+            refs, step="generate", substep="generate", orchestration_id="o",
+            orchestration_agent_run_id="ORCH", child_agent_run_id="c",
+            agent_model="m", workflow_mode="prod")
+        self.assertIn(f"{refs.source_dir()}/src/{self.SID}_runner.f90",
+                      legacy["allowed_output_paths"])
+
+    def test_phase_required_outputs_symmetry(self) -> None:
+        refs = self._refs()
+        m3c = wc.phase_required_outputs(refs, "generate", makefile_required=False,
+                                        runner_host_authored=True)
+        self.assertIn(f"{refs.source_dir()}/src/{self.SID}_checks.f90", m3c)
+        self.assertNotIn(f"{refs.source_dir()}/src/{self.SID}_runner.f90", m3c)
+        legacy = wc.phase_required_outputs(refs, "generate")
+        self.assertIn(f"{refs.source_dir()}/src/{self.SID}_runner.f90", legacy)
+
+
 class GenerateLeafAuthorizationTest(unittest.TestCase):
     """For a leaf node, src/Makefile is conductor-authored, so it is dropped from the leaf's
     generate allowed_output_paths and required_outputs (it must not author it)."""

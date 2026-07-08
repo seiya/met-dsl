@@ -11976,5 +11976,167 @@ class DependencyExpectedNodeKeysTests(unittest.TestCase):
                          {"component/top", "component/base"})
 
 
+_CHECKS_OK = """\
+module bx_checks
+  use, intrinsic :: iso_fortran_env, only: real64
+  ! allow(C003)
+  implicit none
+  private
+  public :: case_setup, case_run, get_time
+  public :: get_scalar, get_r1, get_r2, get_r3, get_r4
+  public :: checks_compute, metric_compute
+contains
+  subroutine case_setup(case_id, ok)
+    character(len=*), intent(in) :: case_id
+    logical, intent(out) :: ok
+    ok = .true.
+    if (len_trim(case_id) < 0) continue
+  end subroutine case_setup
+end module bx_checks
+"""
+
+_MODEL_OK = "module bx_model\n! allow(C003)\nimplicit none\nend module bx_model\n"
+
+
+class ChecksSourceGateTests(unittest.TestCase):
+    """R1/M3c-β `_validate_checks_source_files`: the leaf-authored fixed-ABI checks module."""
+
+    def _exec(self, tmp: Path) -> NodeExecution:
+        return NodeExecution(node_key="component/bx@0.1.0", node_dir=tmp,
+                             exec_dir=tmp, pipeline_dir=tmp)
+
+    def _run(self, checks: str | None, model: str = _MODEL_OK) -> list[str]:
+        with tempfile.TemporaryDirectory() as t:
+            tmp = Path(t)
+            src = tmp / "src"
+            src.mkdir()
+            (src / "bx_model.f90").write_text(model)
+            if checks is not None:
+                (src / "bx_checks.f90").write_text(checks)
+            violations: list[str] = []
+            vps._validate_checks_source_files(
+                self._exec(tmp), src, [src / "bx_model.f90"], violations)
+            return violations
+
+    def test_clean_checks_passes(self) -> None:
+        self.assertEqual(self._run(_CHECKS_OK), [])
+
+    def test_missing_checks_file(self) -> None:
+        self.assertTrue(any("must author bx_checks.f90" in v for v in self._run(None)))
+
+    def test_wrong_module_name(self) -> None:
+        bad = _CHECKS_OK.replace("module bx_checks", "module bx_wrong", 1).replace(
+            "end module bx_checks", "end module bx_wrong")
+        self.assertTrue(any("module bx_checks" in v for v in self._run(bad)))
+
+    def test_missing_public_name(self) -> None:
+        bad = _CHECKS_OK.replace("checks_compute, metric_compute", "checks_compute")
+        v = self._run(bad)
+        self.assertTrue(any("metric_compute" in x for x in v), v)
+
+    def test_checks_uses_harness_forbidden(self) -> None:
+        bad = _CHECKS_OK.replace(
+            "  private\n", "  private\n  use harness_fortran_cpu_model\n")
+        self.assertTrue(any("must not `use` the harness" in v for v in self._run(bad)))
+
+    def test_checks_uses_harness_double_colon_form_forbidden(self) -> None:
+        # `use :: harness_...` and `use, intrinsic :: ...` must also be caught.
+        for form in ("use :: harness_fortran_cpu_model",
+                     "use, non_intrinsic :: harness_fortran_cpu_model"):
+            bad = _CHECKS_OK.replace("  private\n", f"  private\n  {form}\n")
+            self.assertTrue(any("must not `use` the harness" in v for v in self._run(bad)),
+                            form)
+
+    def test_bare_public_missing_definition_caught(self) -> None:
+        # A default-public (bare `public`) module that never DEFINES an ABI name is caught.
+        bad = ("module bx_checks\n  implicit none\n  public\ncontains\n"
+               "  subroutine case_setup(case_id, ok)\n"
+               "    character(len=*), intent(in) :: case_id\n"
+               "    logical, intent(out) :: ok\n    ok = .true.\n"
+               "  end subroutine case_setup\nend module bx_checks\n")
+        v = self._run(bad)
+        self.assertTrue(any("metric_compute" in x for x in v), v)
+
+    def test_bare_public_all_defined_passes(self) -> None:
+        # A bare-`public` module that DEFINES all ten ABI names passes the name check.
+        body = "".join(
+            f"  subroutine {n}()\n  end subroutine {n}\n"
+            for n in ("case_setup", "case_run", "get_time", "get_scalar",
+                      "get_r1", "get_r2", "get_r3", "get_r4",
+                      "checks_compute", "metric_compute"))
+        ok = f"module bx_checks\n  implicit none\n  public\ncontains\n{body}end module bx_checks\n"
+        # (only the ABI-name check is asserted here; other rules are satisfied)
+        self.assertFalse(any("must publish the fixed ABI names" in v for v in self._run(ok)))
+
+    def test_model_uses_harness_forbidden(self) -> None:
+        bad_model = "module bx_model\nuse harness_fortran_cpu_model\nend module bx_model\n"
+        self.assertTrue(any("must not `use` the harness" in v
+                            for v in self._run(_CHECKS_OK, model=bad_model)))
+
+    def test_checks_file_io_forbidden(self) -> None:
+        bad = _CHECKS_OK.replace(
+            "    ok = .true.\n",
+            "    ok = .true.\n    open(unit=9, file='x.json')\n")
+        self.assertTrue(any("file I/O" in v for v in self._run(bad)))
+
+    def test_checks_forbidden_output_filename(self) -> None:
+        bad = _CHECKS_OK.replace(
+            "    ok = .true.\n", "    ok = .true.\n    ! writes verdict.json\n")
+        self.assertTrue(any("verdict.json" in v for v in self._run(bad)))
+
+
+class HarnessDependencyConsistencyTests(unittest.TestCase):
+    """R1/M3c-β `_validate_harness_dependency_consistency` (compile stage)."""
+
+    def _run(self, *, spec_kind="component", language="fortran", hw_class="cpu",
+             infra_ids: list[str] | None = None, bare_string: bool = False) -> list[str]:
+        infra_ids = ["harness_fortran_cpu"] if infra_ids is None else infra_ids
+        deps: list = (
+            [f"infrastructure/{i}@0.2.0" for i in infra_ids] if bare_string
+            else [{"node_key": f"infrastructure/{i}@0.2.0"} for i in infra_ids])
+        with tempfile.TemporaryDirectory() as t:
+            tmp = Path(t)
+            ir_dir = tmp / "ir"
+            ir_dir.mkdir()
+            ir: dict = {
+                "meta": {"spec_kind": spec_kind, "spec_id": "bx"},
+                "impl_defaults": {"toolchain": {"language": language},
+                                  "target": {"class": hw_class}},
+                "dependency": {"direct_deps": deps},
+            }
+            (ir_dir / "spec.ir.yaml").write_text(yaml.safe_dump(ir))
+            violations: list[str] = []
+            vps._validate_harness_dependency_consistency(tmp, ir_dir, violations)
+            return violations
+
+    def test_correct_harness_passes(self) -> None:
+        self.assertEqual(self._run(), [])
+
+    def test_no_infra_dep_is_noop(self) -> None:
+        self.assertEqual(self._run(infra_ids=[]), [])
+
+    def test_infra_node_is_noop(self) -> None:
+        self.assertEqual(self._run(spec_kind="infrastructure"), [])
+
+    def test_wrong_harness_id(self) -> None:
+        v = self._run(infra_ids=["harness_fortran_gpu"])
+        self.assertTrue(any("expected 'harness_fortran_cpu'" in x for x in v), v)
+
+    def test_bare_string_infra_dep_is_parsed(self) -> None:
+        # A bare-string infra dep must be seen identically to the dict form — else the
+        # conductor host-renders while this gate (and the checks gate) treat it as legacy.
+        self.assertEqual(self._run(bare_string=True), [])
+        v = self._run(infra_ids=["harness_fortran_gpu"], bare_string=True)
+        self.assertTrue(any("expected 'harness_fortran_cpu'" in x for x in v), v)
+
+    def test_two_infra_deps(self) -> None:
+        v = self._run(infra_ids=["harness_fortran_cpu", "harness_other_cpu"])
+        self.assertTrue(any("exactly one infrastructure" in x for x in v), v)
+
+    def test_missing_target_class(self) -> None:
+        v = self._run(hw_class="")
+        self.assertTrue(any("cannot derive the expected harness id" in x for x in v), v)
+
+
 if __name__ == "__main__":
     unittest.main()

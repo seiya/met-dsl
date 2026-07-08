@@ -16481,6 +16481,35 @@ class ResolveDependencyFactsTests(unittest.TestCase):
                 _verify_dep_stage(repo_root, "component", "dep_base", "0.1.0",
                                   "aggregate_verdict"))
 
+    def test_infra_dep_published_operations_suppressed(self) -> None:
+        # R1/M3c-β: an infrastructure (harness) dependency never surfaces published_operations
+        # to the leaf (the physics leaf never calls the harness API), even if `operations` is
+        # non-empty and the source resolves — while a component dep still does.
+        from tools.orchestration_runtime import _resolve_dependency_facts
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            model_text = (
+                "module harness_fortran_cpu_model\ncontains\n"
+                "subroutine harness_fortran_cpu__box(name, json)\n"
+                "  character(len=*), intent(in) :: name, json\n"
+                "end subroutine\nend module\n")
+            self._write_dep_pipeline(
+                repo_root, "infrastructure__harness_fortran_cpu__0.2.0",
+                "harness_20260601_002", "bin_20260601_002", "run_20260601_002",
+                source_id="src_20260601_002", spec_id="harness_fortran_cpu",
+                model_text=model_text)
+            self._write_ir(
+                repo_root, "workspace/ir/component__bx__0.1.0/bx_001",
+                [{"node_key": "infrastructure/harness_fortran_cpu@0.2.0",
+                  "kind": "infrastructure",
+                  "operations": ["harness_fortran_cpu__box"]}],
+                impl_defaults={"toolchain": {"language": "fortran"}})
+            facts = _resolve_dependency_facts(
+                repo_root, "workspace/ir/component__bx__0.1.0/bx_001")
+            self.assertEqual(len(facts), 1)
+            self.assertEqual(facts[0]["node_key"], "infrastructure/harness_fortran_cpu@0.2.0")
+            self.assertNotIn("published_operations", facts[0])
+
     def test_verdict_bound_to_chosen_binary_else_skipped(self) -> None:
         """Mirror _verify_dep_stage's Codex-round-24 binding: when the latest binary has
         no verdict and only an OLDER binary's verdict exists, the dep does not resolve (the
@@ -25367,8 +25396,10 @@ class LeafContractDocPolicyTests(unittest.TestCase):
         AC = "docs/AGENT_CONTRACT.md"
         P1 = "docs/workflow/phases/phase_01_compile.md"
         RUN = "docs/workflow/RUNNER_OUTPUT_CONTRACT.md"
+        CHK = "docs/workflow/CHECKS_MODULE_CONTRACT.md"
         self.assertEqual(leaf_contract_doc_refs("compile"), [AC, P1])
-        self.assertEqual(leaf_contract_doc_refs("generate"), [AC, RUN])
+        # Generate leaves also carry the M3c checks-module ABI contract; validate does not.
+        self.assertEqual(leaf_contract_doc_refs("generate"), [AC, RUN, CHK])
         self.assertEqual(leaf_contract_doc_refs("validate"), [AC, RUN])
         # AGENT_CONTRACT is always present; WORKFLOW_CORE never is.
         for step in ("compile", "generate", "validate", "build", "", None, "bogus"):
@@ -25395,6 +25426,7 @@ class LeafContractDocPolicyTests(unittest.TestCase):
         gen = refs_for("generate", "generate")
         self.assertIn("docs/AGENT_CONTRACT.md", gen)
         self.assertIn("docs/workflow/RUNNER_OUTPUT_CONTRACT.md", gen)
+        self.assertIn("docs/workflow/CHECKS_MODULE_CONTRACT.md", gen)
         for absent in (
             "docs/workflow/WORKFLOW_CORE.md",
             "docs/workflow/phases/phase_02_generate.md",
@@ -25408,6 +25440,8 @@ class LeafContractDocPolicyTests(unittest.TestCase):
         self.assertIn("docs/workflow/RUNNER_OUTPUT_CONTRACT.md", judge)
         self.assertNotIn("docs/workflow/WORKFLOW_CORE.md", judge)
         self.assertNotIn("docs/workflow/phases/phase_04_validate.md", judge)
+        # The checks-module ABI is a generate-only contract — never carried to the judge.
+        self.assertNotIn("docs/workflow/CHECKS_MODULE_CONTRACT.md", judge)
 
         comp = refs_for("compile", "generate")
         self.assertIn("docs/workflow/phases/phase_01_compile.md", comp)
@@ -25435,6 +25469,7 @@ class ChildContextDocSizeTests(unittest.TestCase):
     # (docs/design/leaf_must_read_restructure.md) the leaf-read files are:
     #   - AGENT_CONTRACT.md          (every leaf)
     #   - RUNNER_OUTPUT_CONTRACT.md  (generate.generate / generate.verify / validate.judge)
+    #   - CHECKS_MODULE_CONTRACT.md  (generate.generate / generate.verify — M3c checks ABI)
     #   - phase_01_compile.md        (compile.generate / compile.verify — IR schema)
     #   - skills/workflow-<step>-<substep>/SKILL.md  (each read by its own substep leaf)
     # WORKFLOW_CORE.md, phase_02/03/04, PERFORMANCE_DIAGNOSTICS.md, and
@@ -25467,7 +25502,15 @@ class ChildContextDocSizeTests(unittest.TestCase):
         # runner may require `--cases`; make test forwards the same argv) after an E2E
         # validate.execute failure where a bare `make test` aborted a `--cases`-only
         # runner (orch_20260629T065607Z_011f8fc6).
-        "docs/workflow/RUNNER_OUTPUT_CONTRACT.md": 8500,
+        # Bumped 8500->9200: R1/M3c-β scope note — on an M3c node the runner is host-rendered,
+        # so this doc describes the rendered output + scopes its authoring rules to a
+        # leaf-authored runner (infra self-test / legacy no-harness node).
+        "docs/workflow/RUNNER_OUTPUT_CONTRACT.md": 9200,
+        # R1/M3c-β: the fixed-ABI contract for a physics node's `<spec_id>_checks.f90`
+        # (leaf-authored callbacks the host-rendered runner drives). Leaf must-read for
+        # every generate LLM leaf (its SKILL branches on whether the node is M3c).
+        # 8300->8500: metrics-basis first-target-case scope note (review round 2).
+        "docs/workflow/CHECKS_MODULE_CONTRACT.md": 8500,
         # Still force-read by compile.generate/verify (its IR schema is the contract
         # the compile SKILL defers to).
         # Bumped 17000->18200: documented the deterministic Compile.static substep (G2,
@@ -25517,7 +25560,10 @@ class ChildContextDocSizeTests(unittest.TestCase):
         # Bumped 14900->15600: R1 (M3c-α) — Compile.generate now also authors public_api.signatures
         # (transcribe the §5.1 canonical interface block verbatim; it is the leaf's only carrier of
         # the signatures since Generate.generate cannot read controlled_spec), pinned == §5.1 (V8).
-        "skills/workflow-compile-generate/SKILL.md": 15600,
+        # Bumped 15600->16700: R1/M3c-β — an infrastructure direct_dep carries operations:[]
+        # + the harness-id consistency pin (harness_<lang>_<class>), and the predicate bullet
+        # gains the harness fold-alignment note (per-case verdict fold + xfail exclusion).
+        "skills/workflow-compile-generate/SKILL.md": 16700,
         # Bumped 11800->12100: G7 — compile.verify checks V4c only (operations ⊆ published); the
         # closure/topo consistency is conductor-authored + gate-checked, no longer LLM-verified (G7).
         # Bumped 12100->13100: R2 (G8) — compile.verify owns the SEMANTIC test_predicates fidelity
@@ -25549,7 +25595,10 @@ class ChildContextDocSizeTests(unittest.TestCase):
         # the leaf reads the IR, not controlled_spec); the deterministic Generate.static gate
         # (_validate_infrastructure_generated_signatures) pins the generated .f90 against §5.1,
         # moving signature-exactness off the Generate.verify leaf.
-        "skills/workflow-generate-generate/SKILL.md": 26400,
+        # Bumped 26400->28300: R1/M3c-β — the M3c branch (author model + checks only; the
+        # runner + Makefile are host-rendered; no `use harness_*`; checks does no file I/O; the
+        # fixed checks ABI) + the exemplar model+checks note.
+        "skills/workflow-generate-generate/SKILL.md": 28300,
         # Bumped 21400->21700: the test/check target must invoke the runner with
         # `--cases $(SPEC) $(CASES)` (the runner aborts without it; make test must
         # match run_program's argv) after a validate.execute failure where a bare
@@ -25563,7 +25612,10 @@ class ChildContextDocSizeTests(unittest.TestCase):
         # Bumped 22500->22800: R1 (M3c-α) — the infra self-test scope note adds that published
         # signatures are pinned == §5.1 by the Generate.static gate, so verify need not re-audit
         # them (focus on semantic use of the published surface).
-        "skills/workflow-generate-verify/SKILL.md": 22800,
+        # Bumped 22800->24000: R1/M3c-β — the M3c branch (verify model + checks only against
+        # the fixed ABI; do NOT flag the host-rendered runner, which would be a permanent false
+        # regenerate loop).
+        "skills/workflow-generate-verify/SKILL.md": 24000,
         # Bumped 10000->10400: documented the verdict.json#per_test entry schema
         # (field name `status`/`outcome` + the pass/fail/xfail/skipped enum, with `blocked`
         # called out as conductor-derived not judge-written) so the judge leaf no longer
@@ -26859,15 +26911,20 @@ class R5ExemplarSelectorTests(unittest.TestCase):
         self._write(repo / "spec" / "registry" / "spec_catalog.yaml", "\n".join(lines) + "\n")
 
     def _target_ir(self, repo: Path, kind: str, sid: str, ver: str,
-                   language: str = "fortran") -> str:
+                   language: str = "fortran", *, infra_dep: bool = False) -> str:
         ir_ref = f"workspace/ir/{kind}__{sid}__{ver}/{sid}-node_20260101_001"
-        self._write(repo / ir_ref / "spec.ir.yaml",
-                    f"meta:\n  spec_kind: {kind}\n  spec_id: {sid}\n"
-                    f"impl_defaults:\n  toolchain:\n    language: {language}\n")
+        text = (f"meta:\n  spec_kind: {kind}\n  spec_id: {sid}\n"
+                f"impl_defaults:\n  toolchain:\n    language: {language}\n")
+        # An M3c target: exactly one infrastructure/harness direct dependency.
+        if infra_dep:
+            text += ("dependency:\n  direct_deps:\n"
+                     "    - node_key: infrastructure/harness_fortran_cpu@0.2.0\n")
+        self._write(repo / ir_ref / "spec.ir.yaml", text)
         return ir_ref
 
     def _seed_certified_sibling(self, repo: Path, kind: str, sid: str, ver: str, *,
-                                certified: bool = True, date: str = "20260101") -> None:
+                                certified: bool = True, date: str = "20260101",
+                                with_checks: bool = False) -> None:
         safe = f"{kind}__{sid}__{ver}"
         # the pipeline dir id must match the canonical `<hyphen-slug>_<date>_<seq>` grammar
         slug = sid.replace("_", "-")
@@ -26884,6 +26941,9 @@ class R5ExemplarSelectorTests(unittest.TestCase):
         src = pipe / "source" / src_id / "src"
         self._write(src / f"{sid}_model.f90", f"! model for {sid}\nmodule {sid}\nend module\n")
         self._write(src / f"{sid}_runner.f90", f"! runner for {sid}\nprogram {sid}_r\nend program\n")
+        if with_checks:
+            self._write(src / f"{sid}_checks.f90",
+                        f"! checks for {sid}\nmodule {sid}_checks\nend module\n")
 
     def test_resolves_certified_sibling(self) -> None:
         from tools.orchestration_runtime import _resolve_exemplar_source
@@ -26901,6 +26961,37 @@ class R5ExemplarSelectorTests(unittest.TestCase):
             self.assertEqual(ex["node_key"], "component/adv_bndry@0.1.0")
             self.assertEqual({s["filename"] for s in ex["sources"]},
                              {"adv_bndry_model.f90", "adv_bndry_runner.f90"})
+
+    def test_m3c_target_selects_model_and_checks(self) -> None:
+        # R1/M3c-β: an M3c target (one infrastructure dep) exemplifies a sibling's
+        # model + checks (NOT model + runner — the runner is host-rendered).
+        from tools.orchestration_runtime import _resolve_exemplar_source
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            self._catalog(repo, [
+                ("component", "adv_flux", "0.1.0", "advection_diffusion"),
+                ("component", "adv_bndry", "0.1.0", "advection_diffusion")])
+            ir_ref = self._target_ir(repo, "component", "adv_flux", "0.1.0", infra_dep=True)
+            self._seed_certified_sibling(repo, "component", "adv_bndry", "0.1.0",
+                                         with_checks=True)
+            ex = _resolve_exemplar_source(repo, ir_ref)
+            self.assertIsNotNone(ex)
+            self.assertEqual({s["filename"] for s in ex["sources"]},
+                             {"adv_bndry_model.f90", "adv_bndry_checks.f90"})
+
+    def test_m3c_target_skips_sibling_without_checks(self) -> None:
+        # An M3c target must NOT inject a pre-M3c sibling's legacy runner: a sibling lacking
+        # a checks.f90 is skipped entirely (both model + checks required).
+        from tools.orchestration_runtime import _resolve_exemplar_source
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            self._catalog(repo, [
+                ("component", "adv_flux", "0.1.0", "advection_diffusion"),
+                ("component", "adv_bndry", "0.1.0", "advection_diffusion")])
+            ir_ref = self._target_ir(repo, "component", "adv_flux", "0.1.0", infra_dep=True)
+            self._seed_certified_sibling(repo, "component", "adv_bndry", "0.1.0",
+                                         with_checks=False)  # pre-M3c: model+runner only
+            self.assertIsNone(_resolve_exemplar_source(repo, ir_ref))
 
     def test_excludes_self(self) -> None:
         from tools.orchestration_runtime import _resolve_exemplar_source

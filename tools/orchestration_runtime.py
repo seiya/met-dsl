@@ -1477,8 +1477,14 @@ def _resolve_dependency_facts(repo_root: Path, ir_ref: Any) -> list[dict[str, An
             # Pin each called op's certified Fortran interface (argument order) so the
             # consumer's Generate need not guess it. Extracted from the SAME certified
             # source Build stages (`_certified_model_source`). Best-effort, never raises.
+            # R1/M3c-β: an `infrastructure` (harness) dependency publishes NO call-site
+            # interface to the leaf — the physics leaf never calls the harness API (the
+            # host-rendered runner is the sole caller), so surfacing the harness surface
+            # would only tempt a `use harness_*` the checks/model contract forbids. Skip it
+            # (the IR also authors `operations: []` for an infra dep, so `ops` is empty).
+            is_infra_dep = node_key.split("/", 1)[0].strip() == "infrastructure"
             ops = entry.get("operations") if isinstance(entry, dict) else None
-            if consumer_is_fortran and isinstance(ops, list) and ops:
+            if consumer_is_fortran and not is_infra_dep and isinstance(ops, list) and ops:
                 try:
                     dep_spec_id = _parse_node_key_strict(node_key)[1]
                     model_src = _certified_model_source(pipe_dir, dep_spec_id)
@@ -1580,6 +1586,22 @@ def _resolve_exemplar_source(repo_root: Path, ir_ref: Any) -> dict[str, Any] | N
         # c/cpp/mixed target would need a same-language exemplar (extend when those land).
         if language != "fortran":
             return None
+        # R1/M3c-β: an M3c target (a physics node with exactly one infrastructure/harness
+        # dependency) authors model + checks (its runner is host-rendered), so its exemplar
+        # is a sibling's model + checks — NOT the pre-M3c model + runner (injecting a legacy
+        # 600-line self-authored runner would be misleading prior art). Both files must be
+        # present (a pre-M3c sibling without a checks.f90 is skipped, not partially injected).
+        # Mirror the conductor's `_conductor_authors_runner` predicate exactly (make ∧ fortran ∧
+        # non-infra ∧ one infra dep) so the exemplar shape matches what the leaf actually authors.
+        build_system = (str(toolchain.get("build_system") or "make").strip().lower()
+                        if isinstance(toolchain, dict) else "make")
+        dep = ir_doc.get("dependency") if isinstance(ir_doc.get("dependency"), dict) else {}
+        infra_deps = [d for d in (dep.get("direct_deps") or [])
+                      if (isinstance(d, dict) and isinstance(d.get("node_key"), str)
+                          and d["node_key"].split("/", 1)[0].strip() == "infrastructure")
+                      or (isinstance(d, str) and d.split("/", 1)[0].strip() == "infrastructure")]
+        target_is_m3c = (self_kind != "infrastructure" and build_system == "make"
+                         and len(infra_deps) == 1)
 
         catalog = _catalog_family_index(repo_root)
         self_family = next(
@@ -1631,15 +1653,25 @@ def _resolve_exemplar_source(repo_root: Path, ir_ref: Any) -> dict[str, Any] | N
                 model_src = _certified_model_source(pipe_dir, cand_id)
                 if model_src is None:
                     continue
+                exemplar_files = (
+                    (f"{cand_id}_model.f90", f"{cand_id}_checks.f90") if target_is_m3c
+                    else (f"{cand_id}_model.f90", f"{cand_id}_runner.f90"))
                 sources: list[dict[str, str]] = []
-                for fname in (f"{cand_id}_model.f90", f"{cand_id}_runner.f90"):
+                missing = False
+                for fname in exemplar_files:
                     fpath = model_src.parent / fname
                     if fpath.is_file():
                         try:
                             sources.append({"filename": fname,
                                             "text": fpath.read_text(encoding="utf-8")})
                         except Exception:
-                            continue
+                            missing = True
+                    else:
+                        missing = True
+                # M3c: require BOTH model + checks — a sibling lacking checks.f90 is pre-M3c
+                # and its legacy runner must not be injected, so skip it entirely.
+                if target_is_m3c and missing:
+                    continue
                 if not sources:
                     continue
                 key = _freshness_key_from_id(pipe_dir.name)
@@ -2355,6 +2387,11 @@ DEFAULT_BACKEND_COMMANDS = {
 # Consolidated runner-output contract, read by the substeps that author/verify/
 # judge runner output (generate.generate, generate.verify, validate.judge).
 RUNNER_OUTPUT_CONTRACT_REF = "docs/workflow/RUNNER_OUTPUT_CONTRACT.md"
+# R1/M3c-β: the fixed-ABI contract for a physics node's `<spec_id>_checks.f90`
+# (the leaf-authored callbacks the host-rendered runner drives). A leaf must-read
+# for every `generate` LLM leaf (its SKILL branches on whether the node is M3c);
+# NOT read by validate.judge (it never sees the checks source).
+CHECKS_MODULE_CONTRACT_REF = "docs/workflow/CHECKS_MODULE_CONTRACT.md"
 # Canonical step -> phase-doc map. Of these, only `compile` is a leaf must-read
 # (see leaf_contract_doc_refs); the rest are retained as the canonical reference
 # mapping (phase docs stay readable under docs/, just not force-read by leaves).
@@ -9541,6 +9578,10 @@ def leaf_contract_doc_refs(step: str | None) -> list[str]:
       must-reads — orchestration/operator material that stays readable under docs/).
     - Compile: + phase_01 (its IR schema is the contract the compile SKILL defers to).
     - Generate / Validate.judge: + the consolidated runner-output contract.
+    - Generate (only): + the checks-module ABI contract (R1/M3c-β — an M3c physics
+      node's generate leaf authors `<spec_id>_checks.f90` against it; the SKILL
+      branches on whether the node is M3c). validate.judge never sees the checks
+      source, so it is NOT carried there.
       (Build / Validate.execute are deterministic — no leaf reaches here.)
 
     Canonical: docs/design/leaf_must_read_restructure.md.
@@ -9551,6 +9592,8 @@ def leaf_contract_doc_refs(step: str | None) -> list[str]:
         refs.append(WORKFLOW_PHASE_DOC_BY_STEP["compile"])
     elif step_norm in ("generate", "validate"):
         refs.append(RUNNER_OUTPUT_CONTRACT_REF)
+    if step_norm == "generate":
+        refs.append(CHECKS_MODULE_CONTRACT_REF)
     return refs
 
 

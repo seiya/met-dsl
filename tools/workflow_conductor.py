@@ -640,6 +640,7 @@ def build_launch_request(
     evidence_artifacts: tuple[str, ...] = ("state_snapshots",),
     exe_name: str | None = None,
     makefile_host_authored: bool = False,
+    runner_host_authored: bool = False,
     repair: dict[str, str] | None = None,
     resolved_dependencies: tuple[dict[str, str], ...] = (),
     exemplar: dict[str, Any] | None = None,
@@ -754,6 +755,12 @@ def build_launch_request(
         # allowed_output_paths (and required outputs) exactly like lineage.json. c/cpp/mixed
         # keep LLM authoring, so the leaf still lists it there.
         make_entry = [] if makefile_host_authored else [f"{src}/src/Makefile"]
+        # R1/M3c-β: on a harness-backed node the conductor host-renders the runner glue
+        # (_write_runner), so the leaf authors <spec_id>_checks.f90 instead — swap it into the
+        # write set. The model is leaf-authored either way. c/cpp/mixed + legacy fortran nodes
+        # keep the leaf-authored <spec_id>_runner.f90.
+        runner_or_checks = (f"{src}/src/{refs.spec_id}_checks.f90" if runner_host_authored
+                            else f"{src}/src/{refs.spec_id}_runner.f90")
         if substep == "generate":
             # Contract docs (incl. the consolidated runner-output contract) come from
             # leaf_contract_doc_refs above; here only node-specific spec artifacts.
@@ -771,7 +778,7 @@ def build_launch_request(
             # sandboxed leaf. So it is NOT in the leaf's allowed_output_paths.
             req["allowed_output_paths"] = [
                 f"{src}/src/{refs.spec_id}_model.f90",
-                f"{src}/src/{refs.spec_id}_runner.f90",
+                runner_or_checks,
                 *make_entry,
                 f"{src}/src/command_log.jsonl",
                 f"{src}/source_meta.json",
@@ -803,7 +810,7 @@ def build_launch_request(
             ]
             req["allowed_output_paths"] = [
                 f"{src}/src/{refs.spec_id}_model.f90",
-                f"{src}/src/{refs.spec_id}_runner.f90",
+                runner_or_checks,
                 *make_entry,
                 f"{src}/src/command_log.jsonl",
                 f"{src}/source_meta.json",
@@ -1351,6 +1358,102 @@ class Conductor:
         return (str(tc.get("build_system") or "make").lower() == "make"
                 and str(tc.get("language") or "fortran").lower() == "fortran")
 
+    def _conductor_authors_runner(self, refs: NodeRefs) -> bool:
+        """The conductor host-renders `src/<spec_id>_runner.f90` (R1/M3c-β) iff the node is a
+        make+fortran PHYSICS node with exactly one `infrastructure` (runner-harness) direct
+        dependency. On such a node the runner is glue over the certified harness plumbing + the
+        leaf-authored `<spec_id>_checks.f90`, so it is a pure function of the IR + the harness
+        interface (`tools/runner_renderer.render_runner`) — the leaf authors model+checks, not
+        the runner. Nodes without an infra dep keep the leaf-authored runner (legacy path); an
+        `infrastructure` node authors its own self-test runner (not glue). Migration is per-node
+        (add the infra dep to deps.yaml + recompile), with no flag day. Single source of truth for
+        the live render call (`_write_runner`), the write-authorization swap (`build_launch_request`
+        / `phase_required_outputs`), and the Makefile CHECKS rule, so they cannot disagree."""
+        ir = _read_yaml(self.repo_root / refs.ir_ref / "spec.ir.yaml") or {}
+        if not isinstance(ir, dict):
+            return False
+        impl = (ir.get("impl_defaults") or {}) if isinstance(ir, dict) else {}
+        tc = (impl.get("toolchain") or {}) if isinstance(impl, dict) else {}
+        if str(tc.get("build_system") or "make").lower() != "make":
+            return False
+        if str(tc.get("language") or "fortran").lower() != "fortran":
+            return False
+        meta = (ir.get("meta") or {}) if isinstance(ir, dict) else {}
+        if str(meta.get("spec_kind") or "").strip() == "infrastructure":
+            return False
+        return len(self._infra_direct_deps(ir)) == 1
+
+    @staticmethod
+    def _infra_direct_deps(ir: dict[str, Any]) -> list[str]:
+        """The `infrastructure/...` direct-dependency node_keys of an IR (the harness deps)."""
+        dep = (ir.get("dependency") or {}) if isinstance(ir, dict) else {}
+        out: list[str] = []
+        for d in (dep.get("direct_deps") or []) if isinstance(dep, dict) else []:
+            nk = d.get("node_key") if isinstance(d, dict) else (d if isinstance(d, str) else None)
+            if isinstance(nk, str) and nk.strip() and nk.split("/", 1)[0].strip() == "infrastructure":
+                out.append(nk.strip())
+        return out
+
+    def _write_runner(self, refs: NodeRefs) -> None:
+        """Host-render `src/<spec_id>_runner.f90` for an M3c node (see `_conductor_authors_runner`).
+
+        Resolves the single infrastructure dependency's CERTIFIED harness — the exact
+        `<harness>_model.f90` Build stages/links (`_certified_model_source`) and the IR
+        `public_api.signatures` that source was certified against (the IR the certified binary
+        was built from, via the source's `source_meta.json` `ir_ref`) — runs the signature pin
+        (`assert_harness_pin`), then renders the runner from the IR alone (`render_runner`).
+
+        Raises RuntimeError on an unresolvable/unbuilt harness (a build precondition — run
+        `--with-deps` first), a harness-interface drift (the pin), or an unrenderable IR (the
+        render-error matrix). run_phase routes the raise to transport fail_closed (operator
+        `--resume`), NOT a Generate content retry. Mirrors `_write_makefile` (host-authored,
+        runtime-owned, before the substeps run so the write is outside the FS-diff window)."""
+        from tools.runner_renderer import render_runner, assert_harness_pin
+        from tools.orchestration_runtime import _certified_model_source, _latest_pipeline_dir
+        ir = _read_yaml(self.repo_root / refs.ir_ref / "spec.ir.yaml") or {}
+        infra = self._infra_direct_deps(ir)
+        if len(infra) != 1:
+            raise RuntimeError(
+                f"M3c runner authoring for {refs.node_key} requires exactly one infrastructure "
+                f"dependency, found {infra}")
+        harness_nk = infra[0]
+        harness_sid = spec_id_of(harness_nk)
+        safe = node_key_safe(harness_nk)
+        pipe_dir = _latest_pipeline_dir(self.repo_root / "workspace" / "pipelines" / safe)
+        if pipe_dir is None:
+            raise RuntimeError(
+                f"harness dependency {harness_nk}: no ready pipeline under "
+                f"workspace/pipelines/{safe} to render {refs.spec_id}_runner.f90 against "
+                f"(build the dependency closure first, e.g. run_workflow.py --with-deps)")
+        model_src = _certified_model_source(pipe_dir, harness_sid)
+        if model_src is None:
+            raise RuntimeError(
+                f"harness dependency {harness_nk}: cannot resolve certified "
+                f"{harness_sid}_model.f90 under {self._rel(pipe_dir)} (harness not built ready — "
+                f"run_workflow.py --with-deps first)")
+        source_text = model_src.read_text(encoding="utf-8")
+        # The certified harness IR (public_api.signatures) is the IR the certified binary's source
+        # was generated from — pinned in the source's source_meta.json (`ir_ref`), so the pin uses
+        # the IR that matches the exact source Build links.
+        harness_signatures: Any = None
+        meta_path = model_src.parent.parent / "source_meta.json"
+        if meta_path.is_file():
+            try:
+                smeta = json.loads(meta_path.read_text(encoding="utf-8"))
+            except Exception:
+                smeta = {}
+            ir_ref = smeta.get("ir_ref") if isinstance(smeta, dict) else None
+            if isinstance(ir_ref, str) and ir_ref.strip():
+                harness_ir = _read_yaml(self.repo_root / ir_ref.strip() / "spec.ir.yaml") or {}
+                pub = harness_ir.get("public_api") if isinstance(harness_ir, dict) else None
+                if isinstance(pub, dict):
+                    harness_signatures = pub.get("signatures")
+        assert_harness_pin(ir, refs.spec_id, harness_sid, harness_signatures, source_text)
+        runner_text = render_runner(ir, refs.spec_id, harness_sid)
+        path = self.repo_root / refs.source_dir() / "src" / f"{refs.spec_id}_runner.f90"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(runner_text, encoding="utf-8")
+
     def _dependency_closure_nodes(self, refs: NodeRefs) -> list[str]:
         """Dependency node_keys in compile order (deepest first) from the closure sidecar.
 
@@ -1446,7 +1549,12 @@ class Conductor:
 
         model = f"{refs.spec_id}_model"
         runner = f"{refs.spec_id}_runner"
+        checks = f"{refs.spec_id}_checks"
         exe = self._resolve_exe_name(refs)  # canonical <spec_id>_runner
+        # R1/M3c-β: a harness-backed physics node also compiles a leaf-authored
+        # <spec_id>_checks.f90 (which `use`s the model kernel) between the model and the
+        # host-rendered runner: model.o <- checks.o <- runner.o, checks.o added to the link.
+        authors_runner = self._conductor_authors_runner(refs)
         # CASES default baked from the IR so a local `make all test` runs the full
         # case set standalone; Validate.execute overrides CASES/SPEC via the env so
         # `make test` invokes the runner identically to run_program (`--cases <spec>
@@ -1482,6 +1590,17 @@ class Conductor:
                     f"\t$(FC) $(FFLAGS) -c $(OBJDIR)/{d}_model.f90 -o $(OBJDIR)/{d}_model.o\n")
             dep_rules = "\n" + "\n".join(parts)
 
+        # M3c checks-module blocks (empty for a non-M3c node -> the template is emitted
+        # byte-for-byte as before). checks.o `use`s the model, so it depends on MODEL_OBJ; the
+        # runner links against it, so it is a runner prereq + link input.
+        checks_src_decl = f"CHECKS_SRC = {checks}.f90\n" if authors_runner else ""
+        checks_obj_decl = f"CHECKS_OBJ = $(OBJDIR)/{checks}.o\n" if authors_runner else ""
+        checks_prereq = "$(CHECKS_OBJ) " if authors_runner else ""
+        checks_rule = (
+            "$(CHECKS_OBJ): $(CHECKS_SRC) $(MODEL_OBJ) | $(OBJDIR)\n"
+            "\t$(FC) $(FFLAGS) -c $(CHECKS_SRC) -o $(CHECKS_OBJ)\n\n"
+            if authors_runner else "")
+
         template = f"""\
 # Deterministic Makefile authored by the conductor (build_system=make, language=fortran).
 # Out-of-source capable: OBJDIR/BINDIR/RUNDIR default to "." and are overridden by
@@ -1504,10 +1623,10 @@ SPEC ?= spec.ir.yaml
 CASES ?= {cases_default}
 
 MODEL_SRC  = {model}.f90
-RUNNER_SRC = {runner}.f90
+{checks_src_decl}RUNNER_SRC = {runner}.f90
 
 MODEL_OBJ  = $(OBJDIR)/{model}.o
-RUNNER_OBJ = $(OBJDIR)/{runner}.o
+{checks_obj_decl}RUNNER_OBJ = $(OBJDIR)/{runner}.o
 {dep_objs_line}
 .PHONY: all test clean
 .DEFAULT_GOAL := all
@@ -1517,11 +1636,11 @@ all: $(BINDIR)/$(BIN)
 $(MODEL_OBJ): $(MODEL_SRC){model_dep_prereq} | $(OBJDIR)
 \t$(FC) $(FFLAGS) -c $(MODEL_SRC) -o $(MODEL_OBJ)
 
-$(RUNNER_OBJ): $(RUNNER_SRC) $(MODEL_OBJ) | $(OBJDIR)
+{checks_rule}$(RUNNER_OBJ): $(RUNNER_SRC) {checks_prereq}$(MODEL_OBJ) | $(OBJDIR)
 \t$(FC) $(FFLAGS) -c $(RUNNER_SRC) -o $(RUNNER_OBJ)
 
-$(BINDIR)/$(BIN): {link_dep_prereq}$(MODEL_OBJ) $(RUNNER_OBJ) | $(BINDIR)
-\t$(FC) $(FFLAGS) {link_dep_prereq}$(MODEL_OBJ) $(RUNNER_OBJ) -o $(BINDIR)/$(BIN)
+$(BINDIR)/$(BIN): {link_dep_prereq}$(MODEL_OBJ) {checks_prereq}$(RUNNER_OBJ) | $(BINDIR)
+\t$(FC) $(FFLAGS) {link_dep_prereq}$(MODEL_OBJ) {checks_prereq}$(RUNNER_OBJ) -o $(BINDIR)/$(BIN)
 
 # $(sort ...) dedups the target list: when OBJDIR==BINDIR (in-source make, both ".")
 # it collapses to a single target, avoiding the harmless `target '.' given more than
@@ -2850,6 +2969,9 @@ clean:
             # leaf generate: src/Makefile is conductor-authored, so drop it from the leaf's
             # allowed_output_paths (it must not author it).
             makefile_host_authored=(phase == "generate" and self._conductor_authors_makefile(refs)),
+            # leaf generate: on an M3c node the runner is conductor-rendered, so the leaf authors
+            # <spec_id>_checks.f90 instead of <spec_id>_runner.f90 (build_launch_request swaps it).
+            runner_host_authored=(phase == "generate" and self._conductor_authors_runner(refs)),
             repair=repair,
             resolved_dependencies=resolved_dependencies,
             exemplar=exemplar,
@@ -3548,6 +3670,21 @@ clean:
         # _stage_dependency_sources). c/cpp/mixed keep LLM authoring (see _write_makefile).
         if phase == "generate" and self._conductor_authors_makefile(refs):
             self._write_makefile(refs)
+        # R1/M3c-β: for a physics node with a harness dependency the conductor host-renders
+        # src/<spec_id>_runner.f90 (glue over the certified harness plumbing + the leaf-authored
+        # <spec_id>_checks.f90), BEFORE the substeps run — so, like the Makefile, the write is
+        # outside the substep FS-diff window (no write-attribution regression) and re-renders on
+        # each attempt after the source_id rotate (_ensure_fresh_producer_id, above). An
+        # unresolvable/unbuilt harness, a harness-interface drift (signature pin), or an
+        # unrenderable IR is a fail_closed precondition (operator --resume), NOT a Generate retry.
+        if phase == "generate" and self._conductor_authors_runner(refs):
+            try:
+                self._write_runner(refs)
+            except Exception as exc:  # RuntimeError/RenderError -> transport fail_closed
+                self.emit("generate_runner_render_failed", node_key=node_key,
+                          detail=str(exc)[:200])
+                return PhaseOutcome(phase, "fail", decision=RouteDecision(
+                    "fail_closed", reason="generate_runner_render_failed"))
         # Author the dependency-graph sidecar host-side at Compile start (before any
         # substep's record-launch baseline): the derived closure/topo graph is a pure
         # function of deps.yaml + spec_catalog.yaml, so the conductor writes
@@ -3618,7 +3755,8 @@ clean:
             "required_outputs": phase_required_outputs(
                 refs, phase,
                 exe_name=(self._resolve_exe_name(refs) if phase == "build" else None),
-                makefile_required=not (phase == "generate" and self._conductor_authors_makefile(refs))),
+                makefile_required=not (phase == "generate" and self._conductor_authors_makefile(refs)),
+                runner_host_authored=(phase == "generate" and self._conductor_authors_runner(refs))),
             "executor_agent_run_id": executor,
             "substep_agent_run_ids": substep_arids,
             "failed_substeps": failed,
@@ -4121,7 +4259,8 @@ PHASE_VALIDATION_STAGE: dict[str, str] = {
 
 
 def phase_required_outputs(refs: NodeRefs, phase: str, exe_name: str | None = None,
-                           *, makefile_required: bool = True) -> list[str]:
+                           *, makefile_required: bool = True,
+                           runner_host_authored: bool = False) -> list[str]:
     if phase == "compile":
         return [f"{refs.ir_ref}/spec.ir.yaml", f"{refs.ir_ref}/ir_meta.json"]
     if phase == "generate":
@@ -4130,11 +4269,15 @@ def phase_required_outputs(refs: NodeRefs, phase: str, exe_name: str | None = No
         # output_ref, so it is NOT a step required_output (which must be covered by the
         # producer leaf's output_refs). post_generate still verifies it independently. For a
         # leaf node src/Makefile is likewise conductor-authored (_write_makefile), so it is
-        # excluded when makefile_required is False (same rationale as lineage).
+        # excluded when makefile_required is False (same rationale as lineage). On an M3c node
+        # the runner is conductor-rendered (_write_runner) and the leaf authors _checks.f90
+        # instead — swap it symmetrically (same rationale as the Makefile).
         make_entry = [f"{src}/src/Makefile"] if makefile_required else []
+        runner_or_checks = (f"{src}/src/{refs.spec_id}_checks.f90" if runner_host_authored
+                            else f"{src}/src/{refs.spec_id}_runner.f90")
         return [
             f"{src}/src/{refs.spec_id}_model.f90",
-            f"{src}/src/{refs.spec_id}_runner.f90",
+            runner_or_checks,
             *make_entry,
             f"{src}/source_meta.json",
         ]
