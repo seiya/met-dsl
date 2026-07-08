@@ -948,21 +948,6 @@ def _validate_problem_metric_only_scalar_kernel(
         )
 
 
-def _extract_first_diagnostics_block(lowered: str) -> str | None:
-    start = -1
-    for marker in ("/diagnostics.json", "'diagnostics.json'", "\"diagnostics.json\""):
-        start = lowered.find(marker)
-        if start >= 0:
-            break
-    if start < 0:
-        return None
-
-    close_idx = lowered.find("close(", start)
-    if close_idx < 0:
-        return lowered[start:]
-    return lowered[start:close_idx]
-
-
 def _extract_first_output_block(lowered: str, output_name: str) -> str | None:
     start = -1
     for marker in (f"/{output_name}", f"'{output_name}'", f'"{output_name}"'):
@@ -1000,127 +985,6 @@ def _iter_fortran_calls(text: str) -> list[tuple[str, str, int]]:
             args = text[open_pos + 1 :]
         calls.append((name, args, start))
     return calls
-
-
-def _extract_call_arg_vars(lowered: str) -> list[str]:
-    for _, args_raw, _ in _iter_fortran_calls(lowered):
-        names = _split_fortran_names(args_raw)
-        if names:
-            return names
-    return []
-
-
-def _model_import_names(lowered: str, spec_id: str) -> set[str]:
-    """Names imported from the node's `use <spec_id>_model, only: ...` clause.
-
-    Continuation lines (`&`) are joined first so a multi-line `only:` list is
-    parsed as one clause. Renames (`local => remote`) contribute the local name.
-    """
-    joined = re.sub(r"&\s*\n\s*&?", " ", lowered)
-    names: set[str] = set()
-    pattern = re.compile(
-        rf"\buse\s+{re.escape(spec_id)}_model\b[^\n]*?,\s*only\s*:\s*([^\n]+)"
-    )
-    for match in pattern.finditer(joined):
-        for token in match.group(1).split(","):
-            local = re.sub(r"=>.*", "", token).strip()
-            if re.fullmatch(r"[a-z_][a-z0-9_]*", local):
-                names.add(local)
-    return names
-
-
-def _extract_model_call_arg_vars(lowered: str, execution: NodeExecution) -> list[str]:
-    """Arg-vars of calls to the node's model routines (not the first call in the file).
-
-    A model call is one whose callee is imported from `<spec_id>_model` via `only:`,
-    or (fallback for an `only:`-less `use`) whose callee is prefixed by the spec id.
-    Falls back to `_extract_call_arg_vars` when nothing matches so prior behavior is
-    preserved for runners that expose neither signal.
-    """
-    spec_id = _spec_id_from_node_key(execution.node_key)
-    model_ops = _model_import_names(lowered, spec_id) if spec_id else set()
-    ordered: list[str] = []
-    seen: set[str] = set()
-    spec_prefix = f"{spec_id}_" if spec_id else None
-    for callee, args_raw, _ in _iter_fortran_calls(lowered):
-        # Prefix fallback (for an `only:`-less `use`) requires a name boundary so a
-        # short spec id cannot match an unrelated infra routine that merely starts
-        # with the same letters (e.g. spec `flux` vs callee `flux_logger`). Model
-        # routines are named `<spec_id>_<op>` or `<spec_id>__<op>`.
-        is_model = callee in model_ops or (
-            spec_prefix is not None and callee.startswith(spec_prefix)
-        )
-        if not is_model:
-            continue
-        for name in _split_fortran_names(args_raw):
-            if name and name not in seen:
-                seen.add(name)
-                ordered.append(name)
-    if ordered:
-        return ordered
-    return _extract_call_arg_vars(lowered)
-
-
-def _strip_quoted_strings(text: str) -> str:
-    no_single = re.sub(r"'(?:''|[^'])*'", "''", text)
-    return re.sub(r"\"(?:\"\"|[^\"])*\"", "\"\"", no_single)
-
-
-# A standalone numeric literal (int or float), optionally carrying a Fortran kind
-# suffix (`0.72_real64`, `12_8`, `1.0e-12_dp`). The LEADING `(?<![\w.])` is what
-# distinguishes a real literal from an identifier-embedded digit: a genuine literal is
-# preceded by a non-word char (`:`, `,`, space, `(`), whereas digits inside a JSON key
-# like "n32_to_n64" or a name like "l2_rel" are preceded by a letter and rejected. The
-# trailing boundary sits AFTER the optional `_kind` so kind-suffixed constants are still
-# counted. Module constant so the diagnostics gate and its tests share one definition.
-_STANDALONE_NUMERIC_RE = re.compile(
-    r"(?<![\w.])[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[de][-+]?\d+)?(?:_\w+)?(?![\w.])"
-)
-
-
-def _write_statement_data_regions(block: str) -> list[str]:
-    """The data-output list of each ``write(<control>) <data>`` statement in a block.
-
-    This is the text a diagnostics block actually emits: numeric literals here are
-    output values, whether baked into a payload string (``'{"cfl":0.72}'``) or passed
-    as a bare formatted write argument (``write(u,'(a,f8.3)') '"cfl":', 0.72``). Two
-    things are deliberately NOT in a data region, so their digits are never counted:
-    the format descriptor and unit (they live inside the ``write(...)`` control-list
-    parens), and integer check-ordinals / indices (those are ``call`` arguments to
-    helper subroutines, not ``write`` data).
-
-    Parsing is quote-aware so parens inside a format string like ``'(a,f8.3)'`` do not
-    confuse control-list matching; ``&`` continuations are joined first so a data list
-    spanning lines is captured whole.
-    """
-    joined = re.sub(r"&[ \t]*\n[ \t]*&?", " ", block)
-    regions: list[str] = []
-    for match in re.finditer(r"\bwrite\s*\(", joined):
-        i = match.end() - 1  # position of the opening '(' of the control list
-        depth = 0
-        quote: str | None = None
-        n = len(joined)
-        while i < n:
-            ch = joined[i]
-            if quote is not None:
-                if ch == quote:
-                    quote = None
-            elif ch in "'\"":
-                quote = ch
-            elif ch == "(":
-                depth += 1
-            elif ch == ")":
-                depth -= 1
-                if depth == 0:
-                    break
-            i += 1
-        if depth != 0:  # unterminated control list; skip defensively
-            continue
-        end = joined.find("\n", i)
-        if end < 0:
-            end = n
-        regions.append(joined[i + 1 : end])
-    return regions
 
 
 def _makefile_logical_lines(text: str) -> list[str]:
@@ -2185,76 +2049,6 @@ def _validate_makefile_test_invokes_cases(
                 "injects the authoritative SPEC/CASES via the env, which override the "
                 "`?=` defaults kept for local use) "
                 "(docs/workflow/RUNNER_OUTPUT_CONTRACT.md §5 / phase_04_validate.md §4-1)"
-            )
-
-
-def _validate_problem_runner_diagnostics_dependency(
-    execution: NodeExecution,
-    runner_file: Path,
-    lowered: str,
-    violations: list[str],
-) -> None:
-    if not execution.node_key.startswith("problem/"):
-        return
-
-    diagnostics_block = _extract_first_diagnostics_block(lowered)
-    if diagnostics_block is None:
-        return
-
-    call_args = _extract_model_call_arg_vars(lowered, execution)
-    if not call_args:
-        return
-
-    diagnostics_no_strings = _strip_quoted_strings(diagnostics_block)
-    referenced_args = [
-        name
-        for name in call_args
-        if re.search(rf"\b{re.escape(name)}\b", diagnostics_no_strings)
-    ]
-    # Count numeric literals (int OR float) hard-coded in what the block *emits* — the
-    # data list of each `write` statement. Fabricated diagnostics bake constants into
-    # the output, whether inside a payload string (`'{"cfl":0.72}'`, a bare `0`/`1`) or
-    # as a formatted write argument (`write(u,'(a,f8.3)') '"cfl":', 0.72`). A legitimate
-    # block's only bare numbers are check ordinals / indices passed to `call` helpers or
-    # sitting inside `write(...)` format descriptors, neither of which is a data region.
-    numeric_literal_count = sum(
-        len(_STANDALONE_NUMERIC_RE.findall(region))
-        for region in _write_statement_data_regions(diagnostics_block)
-    )
-    if not referenced_args and numeric_literal_count >= 5:
-        violations.append(
-            f"{runner_file}: diagnostics block does not reference model call arguments and appears constant-heavy"
-        )
-
-
-def _validate_problem_runner_nonphysical_casepath_input(
-    execution: NodeExecution,
-    runner_file: Path,
-    lowered: str,
-    violations: list[str],
-) -> None:
-    if not execution.node_key.startswith("problem/"):
-        return
-
-    if "get_command_argument(1,case_path)" in lowered.replace(" ", ""):
-        call_args = _extract_call_arg_vars(lowered)
-        if not call_args:
-            return
-
-        suspicious_inputs: set[str] = set()
-        assign_pattern = re.compile(
-            r"^\s*([a-z_][a-z0-9_]*)\s*=\s*([^\n!]+)",
-            re.MULTILINE,
-        )
-        for match in assign_pattern.finditer(lowered):
-            lhs = match.group(1).strip()
-            rhs = match.group(2).lower()
-            if "len_trim(case_path)" in rhs or "command_argument_count()" in rhs:
-                suspicious_inputs.add(lhs)
-
-        if suspicious_inputs.intersection(call_args):
-            violations.append(
-                f"{runner_file}: model call input depends on case_path length/argument count and is non-physical"
             )
 
 
@@ -4433,19 +4227,23 @@ def _validate_generate_outputs_for_generation(
     _validate_makefile_test_invokes_cases(
         src_dir, violations, build_system=_build_system, language=_language
     )
-    # R1/M3c-β: on an M3c node the runner is host-rendered, so the two LLM-fabrication
-    # heuristics (diagnostics-dependency / nonphysical-casepath) are skipped — their target
-    # (a leaf-authored runner) is gone and they can false-positive on the deterministic
-    # rendered join. The cheap deterministic backstops (name / forbidden-output /
-    # json-serialization / snapshot-filename) still run against the rendered runner.
-    is_m3c = _execution_is_m3c(repo_root, execution)
+    # The cheap deterministic runner backstops (name / forbidden-output / json-serialization
+    # / snapshot-filename) run against every runner — leaf-authored (infra self-test / legacy)
+    # or host-rendered (M3c). (The two LLM-fabrication heuristics — constant-heavy diagnostics
+    # and non-physical case_path input — were removed in M3d: they were unreliable
+    # `problem/`-scoped guesses with a known false-positive history, and once the physics
+    # nodes host-render there is little leaf-authored physics-runner surface left for them to
+    # police. NOTE they are NOT a full no-op: a legacy no-harness `problem/` node — currently
+    # only `advdiff1d_linear` — still authors its own runner, so removing them accepts that its
+    # fabrication is caught by the LLM verify/judge + these deterministic backstops, not by the
+    # two deleted heuristics.)
     runner_files = sorted(src_dir.glob("*_runner.f90"))
     _validate_runner_source_files(
         execution, runner_files, violations,
         known_case_ids=_case_ids_for_execution(repo_root, execution),
-        skip_llm_heuristics=is_m3c,
     )
     # R1/M3c-β: the leaf-authored checks module (fixed ABI) is gated only on an M3c node.
+    is_m3c = _execution_is_m3c(repo_root, execution)
     if is_m3c:
         _validate_checks_source_files(execution, src_dir, model_files, violations)
 
@@ -7397,7 +7195,6 @@ def _validate_runner_source_files(
     runner_files: list[Path],
     violations: list[str],
     known_case_ids: set[str] | None = None,
-    skip_llm_heuristics: bool = False,
 ) -> None:
     # B2 (cosmetic): the runner source is found by `*_runner.f90` glob, which is
     # looser than generate's write-authorization (allowed_output_paths pins exactly
@@ -7422,22 +7219,6 @@ def _validate_runner_source_files(
                 violations.append(
                     f"{runner_file}: forbidden runner output write detected ({output_name})"
                 )
-        # R1/M3c-β: skip the two LLM-fabrication heuristics on an M3c node (the runner is
-        # host-rendered, so there is no leaf runner to police and the deterministic join can
-        # trip them). The forbidden-output / name / serialization backstops above + below stay.
-        if not skip_llm_heuristics:
-            _validate_problem_runner_diagnostics_dependency(
-                execution=execution,
-                runner_file=runner_file,
-                lowered=text,
-                violations=violations,
-            )
-            _validate_problem_runner_nonphysical_casepath_input(
-                execution=execution,
-                runner_file=runner_file,
-                lowered=text,
-                violations=violations,
-            )
         _validate_runner_json_serialization(
             runner_file=runner_file,
             text=text,
@@ -7454,14 +7235,12 @@ def _validate_runner_source_files(
 def _validate_runner_outputs(
     execution: NodeExecution, src_dir: Path, violations: list[str],
     known_case_ids: set[str] | None = None,
-    skip_llm_heuristics: bool = False,
 ) -> None:
     runner_files = sorted(src_dir.glob("*_runner.f90"))
     if not runner_files:
         return
     _validate_runner_source_files(
         execution, runner_files, violations, known_case_ids=known_case_ids,
-        skip_llm_heuristics=skip_llm_heuristics,
     )
 
 
@@ -10278,8 +10057,6 @@ def _validate_impl(
             _validate_runner_outputs(
                 execution, in_scope_src_dir, violations,
                 known_case_ids=_case_ids_for_execution(repo_root, execution),
-                # R1/M3c-β: skip the LLM-fabrication heuristics on the host-rendered runner.
-                skip_llm_heuristics=_execution_is_m3c(repo_root, execution),
             )
         _validate_run_program_inputs(repo_root, execution, violations)
         _validate_quality_check_commands(repo_root, execution, violations)

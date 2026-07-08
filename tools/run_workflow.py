@@ -1990,6 +1990,7 @@ def _resolve_dependency_closure(
         _read_deps_yaml,
         resolve_spec_ref_for,
     )
+    from tools.runner_renderer import spec_id_length_violation
 
     # The catalog is loaded lazily — only once a dependency edge is actually
     # encountered. A leaf target (empty deps.yaml) needs no catalog, so a
@@ -2022,6 +2023,17 @@ def _resolve_dependency_closure(
                 "reason": "dependency_cycle",
                 "detail": f"dependency cycle detected at {spec_ref}",
             }
+            return
+        # M3d spec-input gate at closure-build: reject an over-length spec_id here, before
+        # any node runs. resolve_node gates each node's own run, but an ALREADY-READY
+        # dependency is skipped before it reaches `_run_node` → resolve_node — so gating
+        # only there could let an over-length ready dep slip past. Checking every visited
+        # spec (target + all deps) here is the closure-level mirror of resolve_node's bound
+        # (runner_renderer.MAX_SPEC_ID_LEN). A >55 fortran node cannot certify (so cannot be
+        # ready), but this makes the canonical capture point robust regardless.
+        _sid_violation = spec_id_length_violation(Path(spec_ref).name)
+        if _sid_violation:
+            error = {"reason": "spec_id_too_long", "detail": f"{spec_ref}: {_sid_violation}"}
             return
         visiting.add(spec_ref)
         deps_doc = _read_deps_yaml(repo_root, spec_ref)

@@ -25398,9 +25398,16 @@ class LeafContractDocPolicyTests(unittest.TestCase):
         RUN = "docs/workflow/RUNNER_OUTPUT_CONTRACT.md"
         CHK = "docs/workflow/CHECKS_MODULE_CONTRACT.md"
         self.assertEqual(leaf_contract_doc_refs("compile"), [AC, P1])
-        # Generate leaves also carry the M3c checks-module ABI contract; validate does not.
+        # M3d node-aware: a NON-M3c generate leaf (infra self-test / legacy no-harness
+        # node) still authors a runner, so it KEEPS the runner-output contract + the
+        # checks ABI. The default (no flag) is that safe superset.
         self.assertEqual(leaf_contract_doc_refs("generate"), [AC, RUN, CHK])
+        # An M3c physics generate leaf authors no runner → the runner-output contract
+        # is dropped; only the checks ABI remains.
+        self.assertEqual(leaf_contract_doc_refs("generate", is_m3c_physics=True), [AC, CHK])
+        # Validate.judge always keeps the runner-output contract (it reviews emitted output).
         self.assertEqual(leaf_contract_doc_refs("validate"), [AC, RUN])
+        self.assertEqual(leaf_contract_doc_refs("validate", is_m3c_physics=True), [AC, RUN])
         # AGENT_CONTRACT is always present; WORKFLOW_CORE never is.
         for step in ("compile", "generate", "validate", "build", "", None, "bogus"):
             refs = leaf_contract_doc_refs(step)
@@ -25423,10 +25430,17 @@ class LeafContractDocPolicyTests(unittest.TestCase):
                 payload.update(extra)
             return build_skill_must_read_refs(payload)
 
+        # A non-M3c generate leaf (no runner_host_authored flag) keeps the runner-output
+        # contract — it authors a runner (infra self-test / legacy node).
         gen = refs_for("generate", "generate")
         self.assertIn("docs/AGENT_CONTRACT.md", gen)
-        self.assertIn("docs/workflow/RUNNER_OUTPUT_CONTRACT.md", gen)
         self.assertIn("docs/workflow/CHECKS_MODULE_CONTRACT.md", gen)
+        self.assertIn("docs/workflow/RUNNER_OUTPUT_CONTRACT.md", gen)
+        # An M3c physics generate leaf (runner host-rendered) drops the runner-output
+        # contract — the record-launch path must mirror the conductor via the payload flag.
+        gen_m3c = refs_for("generate", "generate", {"runner_host_authored": True})
+        self.assertIn("docs/workflow/CHECKS_MODULE_CONTRACT.md", gen_m3c)
+        self.assertNotIn("docs/workflow/RUNNER_OUTPUT_CONTRACT.md", gen_m3c)
         for absent in (
             "docs/workflow/WORKFLOW_CORE.md",
             "docs/workflow/phases/phase_02_generate.md",
@@ -25447,11 +25461,31 @@ class LeafContractDocPolicyTests(unittest.TestCase):
         self.assertIn("docs/workflow/phases/phase_01_compile.md", comp)
         self.assertNotIn("docs/workflow/WORKFLOW_CORE.md", comp)
 
+    def test_runner_host_authored_flag_is_strict_true(self) -> None:
+        # Security-boundary hardening: only the boolean True marks a payload M3c-physics.
+        # A malformed truthy non-boolean (e.g. the string "false") must NOT drop the
+        # runner-output contract — the safe fallback is the non-M3c superset (keep it).
+        from tools.orchestration_runtime import _payload_is_m3c_physics
+        RUN = "docs/workflow/RUNNER_OUTPUT_CONTRACT.md"
+        self.assertTrue(_payload_is_m3c_physics({"runner_host_authored": True}))
+        for bad in ("true", "false", 1, {}, [], None):
+            self.assertFalse(
+                _payload_is_m3c_physics({"runner_host_authored": bad}),
+                msg=f"non-True value {bad!r} must not count as M3c")
+        # And the safe fallback keeps RUNNER for a generate leaf with a malformed flag.
+        gen = build_skill_must_read_refs({
+            "step": "generate", "substep": "generate",
+            "skill_ref": "skills/workflow-generate-generate/SKILL.md",
+            "runner_host_authored": "false",
+        })
+        self.assertIn(RUN, gen)
+
 
 class ChildContextDocSizeTests(unittest.TestCase):
     """Regression guard: the files each child step/substep LLM leaf FORCE-READS after
     launch (its SKILL + AGENT_CONTRACT + phase_01 for Compile + RUNNER_OUTPUT_CONTRACT
-    for Generate/Validate.judge — see leaf_contract_doc_refs) are resident every child
+    for Validate.judge and non-M3c runner-authoring Generate — see leaf_contract_doc_refs)
+    are resident every child
     turn, and child subagents are the majority of a node's token cost (their cache_read
     scales with this floor × turns × children). Cap the per-child doc floor to catch
     re-bloat. Only force-read files are guarded — a doc that left the leaf must-read set
@@ -25468,7 +25502,7 @@ class ChildContextDocSizeTests(unittest.TestCase):
     # leaf context. After the leaf-must-read restructure
     # (docs/design/leaf_must_read_restructure.md) the leaf-read files are:
     #   - AGENT_CONTRACT.md          (every leaf)
-    #   - RUNNER_OUTPUT_CONTRACT.md  (generate.generate / generate.verify / validate.judge)
+    #   - RUNNER_OUTPUT_CONTRACT.md  (validate.judge + non-M3c runner-authoring generate; M3d)
     #   - CHECKS_MODULE_CONTRACT.md  (generate.generate / generate.verify — M3c checks ABI)
     #   - phase_01_compile.md        (compile.generate / compile.verify — IR schema)
     #   - skills/workflow-<step>-<substep>/SKILL.md  (each read by its own substep leaf)
@@ -25492,7 +25526,7 @@ class ChildContextDocSizeTests(unittest.TestCase):
         # spontaneous filesystem read).
         "docs/AGENT_CONTRACT.md": 18300,
         # Consolidated runner-output contract (was duplicated across phase_02/04 +
-        # PERF §2/§6); leaf must-read for generate.generate/verify + validate.judge.
+        # PERF §2/§6); M3d: a validate.judge-only leaf must-read (generate dropped it).
         # Bumped 7600->8100: §3 disambiguated the guard-case snapshot rule (declared
         # required vars must be present even when empty + shape-valid: 1-D as [],
         # rank-≥2 must still shape-match its shape_expr) + correct/wrong examples,

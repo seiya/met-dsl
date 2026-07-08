@@ -696,15 +696,22 @@ def build_launch_request(
         req["skill_ref"] = f"skills/{skill}/SKILL.md"
     if substep is not None:
         req["substep"] = substep
+    if runner_host_authored:
+        # M3c physics node (runner host-rendered). Stamp it into the payload so the
+        # record-launch security-boundary path (`_payload_is_m3c_physics`) derives the
+        # SAME physics-narrowed contract-doc set as this conductor path — no drift.
+        req["runner_host_authored"] = True
 
     # Base leaf must-read = its SKILL + the contract docs from the single canonical
     # policy (AGENT_CONTRACT for every leaf; phase_01 for Compile; runner-output
-    # contract for Generate/Validate). The same helper is used by record-launch, so
-    # the two assembly paths cannot drift. The node-specific spec artifacts are
-    # appended per-step below.
+    # contract for Validate.judge and for a NON-M3c runner-authoring Generate leaf;
+    # M3c physics Generate drops it — see leaf_contract_doc_refs). The same helper is
+    # used by record-launch, so the two assembly paths cannot drift. The node-specific
+    # spec artifacts are appended per-step below.
     from tools.orchestration_runtime import leaf_contract_doc_refs
     must_read: list[str] = ([] if deterministic
-                            else [f"skills/{skill}/SKILL.md", *leaf_contract_doc_refs(step)])
+                            else [f"skills/{skill}/SKILL.md",
+                                  *leaf_contract_doc_refs(step, is_m3c_physics=runner_host_authored)])
 
     if step == "compile":
         req["dependency_ref"] = f"{spec}/deps.yaml"
@@ -762,8 +769,9 @@ def build_launch_request(
         runner_or_checks = (f"{src}/src/{refs.spec_id}_checks.f90" if runner_host_authored
                             else f"{src}/src/{refs.spec_id}_runner.f90")
         if substep == "generate":
-            # Contract docs (incl. the consolidated runner-output contract) come from
-            # leaf_contract_doc_refs above; here only node-specific spec artifacts.
+            # Contract docs come from leaf_contract_doc_refs above (node-aware: an M3c
+            # physics leaf gets the checks ABI and no runner-output contract; a non-M3c
+            # runner-authoring leaf keeps it). Here only node-specific spec artifacts.
             must_read += [
                 f"{refs.ir_ref}/spec.ir.yaml",
                 # controlled_spec.md is intentionally NOT must-read here: phase_02
@@ -4368,6 +4376,21 @@ def resolve_node(repo_root: Path, spec_ref: str) -> tuple[str, str]:
     ref = Path(spec_ref.strip().rstrip("/"))
     spec_dir = ref.parent if ref.name in _SPEC_REF_FILE_NAMES else ref
     spec_id = spec_dir.name
+    # M3d spec-input gate: bound spec_id length before any phase runs. A spec_id
+    # over MAX_SPEC_ID_LEN is a node-IDENTITY defect (the compile.static hoist
+    # excludes it because a re-author cannot shorten a spec_id) that would otherwise
+    # fail-close at conductor render time on a harness-backed node — a workflow-kill.
+    # This is the canonical capture point (see runner_renderer.spec_id_length_violation).
+    # Deliberately spec-input (pre-IR), so it is language/phase-agnostic: the 55-char
+    # bound reflects the f2008 identifier limit of the ONLY current backend (fortran),
+    # where every >55 spec_id is doomed regardless of phase. It also rejects a >55 spec
+    # on a Compile-only run — acceptable while every backend is fortran. When a backend
+    # with a different identifier limit is added, move the bound to a language-aware point.
+    from tools.runner_renderer import spec_id_length_violation
+    _sid_violation = spec_id_length_violation(spec_id)
+    if _sid_violation:
+        raise ValueError(
+            f"spec-input rejected: {_sid_violation} (from spec_ref {spec_ref})")
     catalog = _read_yaml(repo_root / "spec" / "registry" / "spec_catalog.yaml") or {}
     for entry in catalog.get("specs") or []:
         if isinstance(entry, dict) and entry.get("spec_id") == spec_id:

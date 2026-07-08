@@ -19,11 +19,13 @@ from pathlib import Path
 
 from tools.runner_renderer import (
     EXPECTED_HARNESS_SPEC_ID,
+    MAX_SPEC_ID_LEN,
     RenderError,
     _HARNESS_V2_INTERFACE,
     assert_harness_pin,
     ir_content_violations,
     render_runner,
+    spec_id_length_violation,
 )
 from tools.validate_pipeline_semantics import _parse_interface_stanzas
 
@@ -881,6 +883,38 @@ class IrContentViolationsTest(unittest.TestCase):
             path(ir)
             v = ir_content_violations(ir, BOUNDARY_SID, HARNESS)
             self.assertTrue(v, v)  # non-empty, and no exception escaped
+
+
+class SpecIdLengthGateTest(unittest.TestCase):
+    """M3d spec-input gate: `spec_id_length_violation` bounds spec_id ≤ MAX_SPEC_ID_LEN.
+    This is the canonical capture point for the one node-IDENTITY render precondition the
+    compile.static hoist excludes (a re-author cannot shorten a spec_id); the conductor's
+    resolve_node calls it so a too-long spec_id fails before any phase, not at render-kill."""
+
+    def test_ok_at_or_below_limit(self) -> None:
+        self.assertIsNone(spec_id_length_violation("shallow_water2d"))
+        self.assertIsNone(spec_id_length_violation("x" * MAX_SPEC_ID_LEN))
+        # 54-char real catalog id (the longest currently-safe one) passes.
+        self.assertIsNone(
+            spec_id_length_violation("dynamics_advection_diffusion_boundary_1d_periodic_copy"))
+
+    def test_violation_above_limit(self) -> None:
+        # The known 61-char catalog offender.
+        offender = "dynamics_advection_diffusion_profile_1d_upwind_center2_euler1"
+        msg = spec_id_length_violation(offender)
+        self.assertIsNotNone(msg)
+        self.assertIn(str(len(offender)), msg)
+        self.assertIn(str(MAX_SPEC_ID_LEN), msg)
+        # One char over the limit is already a violation; the limit itself is not.
+        self.assertIsNotNone(spec_id_length_violation("y" * (MAX_SPEC_ID_LEN + 1)))
+        self.assertIsNone(spec_id_length_violation("y" * MAX_SPEC_ID_LEN))
+
+    def test_non_string_and_whitespace(self) -> None:
+        self.assertIsNone(spec_id_length_violation(None))
+        self.assertIsNone(spec_id_length_violation(123))
+        # Surrounding whitespace is stripped before measuring.
+        self.assertIsNone(spec_id_length_violation("  short  "))
+        self.assertIsNotNone(spec_id_length_violation("  " + "z" * (MAX_SPEC_ID_LEN + 1) + "  "))
 
 
 class LineWidthTest(unittest.TestCase):

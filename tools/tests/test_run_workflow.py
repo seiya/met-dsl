@@ -2008,6 +2008,29 @@ class DependencyClosureTests(unittest.TestCase):
             self.assertEqual(ordered, [])
             self.assertEqual(err["reason"], "dependency_cycle")
 
+    def test_overlong_spec_id_dependency_fails_closed(self) -> None:
+        # M3d closure-build gate: an over-length dependency spec_id is rejected at closure
+        # resolution — before any node runs and before an already-ready dep is skipped, so
+        # it cannot slip the per-node resolve_node gate. Mirrors runner_renderer.MAX_SPEC_ID_LEN.
+        from tools.runner_renderer import MAX_SPEC_ID_LEN
+        long_id = "d" * (MAX_SPEC_ID_LEN + 6)
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            _write_catalog(repo_root, [
+                {"spec_kind": "problem", "spec_id": "a", "spec_version": "0.3.0",
+                 "deps_path": "spec/problem/a/deps.yaml"},
+                {"spec_kind": "component", "spec_id": long_id, "spec_version": "0.1.0",
+                 "deps_path": f"spec/component/{long_id}/deps.yaml"},
+            ])
+            _write_deps(repo_root, "spec/problem/a", "problem", "a",
+                        components=[(long_id, ">=0.1.0 <1.0.0")])
+            _write_deps(repo_root, f"spec/component/{long_id}", "component", long_id)
+            ordered, err = run_workflow._resolve_dependency_closure(
+                repo_root, "spec/problem/a")
+            self.assertEqual(ordered, [])
+            self.assertEqual(err["reason"], "spec_id_too_long")
+            self.assertIn(str(MAX_SPEC_ID_LEN), err["detail"])
+
     def test_unresolvable_dependency_fails_closed(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)

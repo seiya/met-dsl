@@ -193,6 +193,37 @@ class BuildLaunchRequestTest(unittest.TestCase):
         self.assertNotIn("warm_resume", req)
         self.assertNotEqual(req["skill_must_read_refs"], "")
 
+    def test_m3d_runner_contract_narrowing_survives_record_launch(self) -> None:
+        # M3d node-aware must-read: an M3c physics generate leaf (runner host-rendered)
+        # drops RUNNER_OUTPUT_CONTRACT and keeps the checks ABI; a non-M3c leaf keeps
+        # RUNNER. The conductor stamps `runner_host_authored` into the payload so the
+        # record-launch security-boundary recompute derives the SAME set — end-to-end
+        # proof (beyond the synthetic-payload drift test) that the two paths cannot drift.
+        from tools.orchestration_runtime import build_skill_must_read_refs
+        RUN = "docs/workflow/RUNNER_OUTPUT_CONTRACT.md"
+        CHK = "docs/workflow/CHECKS_MODULE_CONTRACT.md"
+
+        m3c = wc.build_launch_request(
+            self._generate_refs(), step="generate", substep="generate",
+            orchestration_id="o", orchestration_agent_run_id="p",
+            child_agent_run_id="c", agent_model="m", workflow_mode="dev",
+            runner_host_authored=True)
+        self.assertTrue(m3c.get("runner_host_authored"))
+        self.assertNotIn(RUN, m3c["skill_must_read_refs"])
+        self.assertIn(CHK, m3c["skill_must_read_refs"])
+        # The record-launch recompute reads runner_host_authored off the SAME payload,
+        # so it must NOT re-add RUNNER (a drift would leak it back in).
+        self.assertNotIn(RUN, build_skill_must_read_refs(m3c))
+
+        legacy = wc.build_launch_request(
+            self._generate_refs(), step="generate", substep="generate",
+            orchestration_id="o", orchestration_agent_run_id="p",
+            child_agent_run_id="c", agent_model="m", workflow_mode="dev",
+            runner_host_authored=False)
+        self.assertNotIn("runner_host_authored", legacy)  # non-M3c: not stamped
+        self.assertIn(RUN, legacy["skill_must_read_refs"])
+        self.assertIn(RUN, build_skill_must_read_refs(legacy))
+
 
 class ReuseResumeAndFindingsTest(unittest.TestCase):
     """The warm-resume eligibility resolver and the findings-excerpt reader that feed the
@@ -1752,6 +1783,17 @@ class NodeAllocationTest(unittest.TestCase):
     def test_resolve_node_unknown_raises(self) -> None:
         with self.assertRaises(ValueError):
             wc.resolve_node(REPO_ROOT, "spec/component/does/not/exist_spec_zzz")
+
+    def test_resolve_node_rejects_overlong_spec_id(self) -> None:
+        # M3d spec-input gate: a spec_id over MAX_SPEC_ID_LEN is rejected before the
+        # catalog lookup (the length check precedes _read_yaml), so this needs no real
+        # spec on disk — the message names spec-input and the char count.
+        from tools.runner_renderer import MAX_SPEC_ID_LEN
+        overlong = "component/dynamics/" + "z" * (MAX_SPEC_ID_LEN + 3)
+        with self.assertRaises(ValueError) as ctx:
+            wc.resolve_node(REPO_ROOT, "spec/" + overlong)
+        self.assertIn("spec-input rejected", str(ctx.exception))
+        self.assertIn(str(MAX_SPEC_ID_LEN + 3), str(ctx.exception))
 
     def test_resolve_node_accepts_file_style_spec_ref(self) -> None:
         base = "spec/component/dynamics/advection_diffusion/dynamics_advdiff_flux_1d_upwind_center2"

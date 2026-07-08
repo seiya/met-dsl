@@ -1,23 +1,23 @@
 # Runner output contract (diagnostics.json / perf.json / raw/)
 
-> **Audience: the LLM substeps that author, verify, or judge the `runner`'s
-> program output — `Generate.generate`, `Generate.verify`, `Validate.judge`.**
-> This is the single canonical source for *what the `runner` must emit* and
-> *how it must serialize it*. It supersedes the runner-output rules that were
-> previously duplicated in `phase_02_generate.md` §2-1, `phase_04_validate.md`
-> §4-1, and `PERFORMANCE_DIAGNOSTICS.md` §2/§6. Those docs now reference this
-> file. The deterministic `Build` / `Validate.execute` steps (run in-process by
-> the conductor) take their contract from `phase_03_build.md` /
-> `phase_04_validate.md`; this file is the LLM-facing slice.
+> **Audience: `Validate.judge` and a runner-authoring `Generate` leaf.** The single
+> canonical source for *what the `runner` must emit* and *how it serializes it* — §1
+> (`diagnostics.json`) and §3 (`raw/` evidence) are what the judge recomputes against
+> the runner's output. It supersedes the runner-output rules once duplicated in
+> `phase_02_generate.md` §2-1, `phase_04_validate.md` §4-1, and
+> `PERFORMANCE_DIAGNOSTICS.md` §2/§6. The deterministic `Build` / `Validate.execute`
+> steps take their contract from `phase_03_build.md` / `phase_04_validate.md`.
 
-> **Scope note (R1/M3c-β).** On an *M3c node* (a make+fortran physics node with
-> exactly one `infrastructure`/harness dependency) the `runner` is **host-rendered**
-> by the conductor, not leaf-authored — the leaf authors `<spec_id>_model.f90` +
-> `<spec_id>_checks.f90` (see `CHECKS_MODULE_CONTRACT.md`), and the harness owns the
-> JSON assembly + verdict fold. For such a node this document describes the output
-> the rendered runner produces (still the contract the `Validate.judge` reviews);
-> the *authoring* rules below apply to a leaf-authored runner (an `infrastructure`
-> self-test runner, or a legacy node without a harness dependency).
+> **Scope note (R1/M3c-β → M3d).** On an *M3c node* (make+fortran physics node with
+> exactly one `infrastructure`/harness dependency) the `runner` is **host-rendered** —
+> the leaf authors `<spec_id>_model.f90` + `<spec_id>_checks.f90` (see
+> `CHECKS_MODULE_CONTRACT.md`) and the harness owns the JSON assembly + verdict fold.
+> Since M3d this doc is **not a must-read for a physics `Generate` leaf** (it authors
+> no runner). It IS still a must-read for a runner-authoring `Generate` leaf — the
+> `infrastructure` harness self-test (whose §3 cites §4 here) or a legacy no-harness
+> node — and for `Validate.judge`. The *authoring* rules below also survive as
+> **deterministic backstops** (name / forbidden-output / JSON-descriptor /
+> snapshot-filename gates in `validate_pipeline_semantics.py`).
 
 The `runner` emits **only** `diagnostics.json`, `perf.json`, and the `raw/`
 primary evidence (plus `stdout.log` / `stderr.log`). It must **never** write

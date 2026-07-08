@@ -59,6 +59,31 @@ CHECK_STATUS_WIDTH = 4
 MAX_SPEC_ID_LEN = 55
 MAX_IDENTIFIER_LEN = 63
 
+
+def spec_id_length_violation(spec_id: Any) -> str | None:
+    """Spec-input bound on spec_id length — the M3d mass-opt-in prerequisite gate.
+
+    Returns an actionable violation message when ``spec_id`` exceeds
+    ``MAX_SPEC_ID_LEN``, else ``None``. On a make+fortran node the derived
+    ``<spec_id>_runner``/``_checks``/``_model`` identifiers (spec_id + 7) breach the
+    f2008 ``MAX_IDENTIFIER_LEN``-char limit, and on a harness-backed M3c node the
+    host-rendered runner additionally fail-closes at ``_check_identifier_lengths``
+    (a workflow-kill a compile.generate re-author cannot repair — the spec_id is
+    node IDENTITY, not authored IR content). This helper is the canonical
+    *spec-input* capture point for exactly that identity precondition, which the
+    compile.static hoist deliberately excludes: bounding here — before any phase
+    runs — turns an unrepairable late render-kill into an early, clear rejection.
+    The renderer keeps the same bound as a defense-in-depth backstop."""
+    sid = spec_id.strip() if isinstance(spec_id, str) else ""
+    if len(sid) > MAX_SPEC_ID_LEN:
+        return (
+            f"spec_id {sid!r} is {len(sid)} chars (>{MAX_SPEC_ID_LEN}); the derived "
+            f"`<spec_id>_runner`/`_checks`/`_model` identifiers would breach the f2008 "
+            f"{MAX_IDENTIFIER_LEN}-char limit (and fail-close a harness-backed node's "
+            f"host-render). Rename the spec to ≤{MAX_SPEC_ID_LEN} chars.")
+    return None
+
+
 # The deterministic Generate.lint column limit (fortitude S001). The rendered runner must stay
 # within it because it is host-authored (a leaf cannot edit it to fix an overlong line).
 MAX_RENDERED_LINE = 100

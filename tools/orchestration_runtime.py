@@ -2384,8 +2384,12 @@ DEFAULT_BACKEND_COMMANDS = {
 # + stage-meta keys live in AGENT_CONTRACT.md); it stays readable under docs/, so
 # no module constant points at it. Canonical rationale:
 # docs/design/leaf_must_read_restructure.md.
-# Consolidated runner-output contract, read by the substeps that author/verify/
-# judge runner output (generate.generate, generate.verify, validate.judge).
+# Consolidated runner-output contract. Read by Validate.judge (§1/§3 are what it
+# recomputes against the runner's emitted diagnostics.json / raw evidence) and by a
+# runner-authoring Generate leaf. M3d node-aware: an M3c PHYSICS generate leaf drops it
+# (it authors model+checks, host-rendered runner); a NON-M3c generate leaf (infra
+# self-test / legacy no-harness node) keeps it — its runner's spec cites §4. See
+# leaf_contract_doc_refs.
 RUNNER_OUTPUT_CONTRACT_REF = "docs/workflow/RUNNER_OUTPUT_CONTRACT.md"
 # R1/M3c-β: the fixed-ABI contract for a physics node's `<spec_id>_checks.f90`
 # (the leaf-authored callbacks the host-rendered runner drives). A leaf must-read
@@ -9561,7 +9565,7 @@ def _merge_unique_refs(*ref_groups: list[str]) -> list[str]:
     return merged
 
 
-def leaf_contract_doc_refs(step: str | None) -> list[str]:
+def leaf_contract_doc_refs(step: str | None, *, is_m3c_physics: bool = False) -> list[str]:
     """The contract docs every LLM leaf of `step` force-reads, in canonical order.
 
     SINGLE SOURCE OF TRUTH for the leaf contract-doc policy, shared by both
@@ -9573,16 +9577,33 @@ def leaf_contract_doc_refs(step: str | None) -> list[str]:
     node-specific spec artifacts it alone knows; this helper covers only the contract
     docs, not the SKILL ref or node artifacts.)
 
+    `is_m3c_physics` is the node's M3c-physics flag (make+fortran, non-infrastructure,
+    exactly one infra/harness dep — i.e. the runner is host-rendered): both callers pass
+    the same signal the conductor computes as `runner_host_authored`, so the two paths
+    stay in lockstep. It defaults to False (the safe superset — a caller lacking the
+    signal keeps the runner-output contract for a generate leaf rather than stranding a
+    runner-authoring leaf without it).
+
     - docs/AGENT_CONTRACT.md: every leaf (carries the leaf-actionable WORKFLOW_CORE
       invariants + stage-meta keys; WORKFLOW_CORE.md / ORCHESTRATION.md are NOT leaf
       must-reads — orchestration/operator material that stays readable under docs/).
     - Compile: + phase_01 (its IR schema is the contract the compile SKILL defers to).
-    - Generate / Validate.judge: + the consolidated runner-output contract.
-    - Generate (only): + the checks-module ABI contract (R1/M3c-β — an M3c physics
-      node's generate leaf authors `<spec_id>_checks.f90` against it; the SKILL
-      branches on whether the node is M3c). validate.judge never sees the checks
-      source, so it is NOT carried there.
+    - Validate.judge: + the consolidated runner-output contract (§1/§3 are what the
+      judge recomputes against the runner's emitted diagnostics.json / raw evidence).
+    - Generate: + the checks-module ABI contract (R1/M3c-β — an M3c physics node's
+      generate leaf authors `<spec_id>_checks.f90` against it; the SKILL branches on
+      whether the node is M3c). validate.judge never sees the checks source, so it is
+      NOT carried there.
       (Build / Validate.execute are deterministic — no leaf reaches here.)
+
+    M3d: the runner-output contract is dropped from a **physics** generate leaf's
+    must-read (`is_m3c_physics` — it authors model+checks, its runner is host-rendered
+    glue over the certified harness, so the contract binds nothing it writes). A
+    NON-M3c generate leaf still authors a runner and KEEPS the contract: the
+    `infrastructure` harness self-test (whose controlled_spec §3 cites §4 here for
+    numeric serialization) and a legacy no-harness `problem`/`component` node (which
+    hand-rolls its own JSON emission and needs the descriptor rules directly). This is
+    exactly "exclude from the physics-node must-read", node-aware.
 
     Canonical: docs/design/leaf_must_read_restructure.md.
     """
@@ -9590,15 +9611,45 @@ def leaf_contract_doc_refs(step: str | None) -> list[str]:
     step_norm = step.strip().lower() if isinstance(step, str) and step.strip() else ""
     if step_norm == "compile":
         refs.append(WORKFLOW_PHASE_DOC_BY_STEP["compile"])
-    elif step_norm in ("generate", "validate"):
+    elif step_norm == "validate":
+        refs.append(RUNNER_OUTPUT_CONTRACT_REF)
+    elif step_norm == "generate" and not is_m3c_physics:
+        # A runner-authoring generate leaf (infra self-test / legacy no-harness node)
+        # keeps the runner-output contract; an M3c physics leaf authors no runner.
         refs.append(RUNNER_OUTPUT_CONTRACT_REF)
     if step_norm == "generate":
         refs.append(CHECKS_MODULE_CONTRACT_REF)
     return refs
 
 
+def _payload_is_m3c_physics(request_payload: dict[str, Any]) -> bool:
+    """Whether the launch payload targets an M3c physics node (runner host-rendered).
+
+    Reads the `runner_host_authored` flag the conductor stamps into the request payload
+    (`build_launch_request`), so the record-launch security-boundary path derives the
+    SAME contract-doc set as the conductor without re-loading the IR. The conductor only
+    ever stamps the boolean `True`; anything else (absent, a truthy non-boolean like the
+    string ``"false"``, a malformed payload) is treated as non-M3c so the fallback is the
+    SAFE superset — KEEP the runner-output contract for a runner-authoring generate leaf,
+    never silently drop it. Hence the strict `is True` (not a truthy `bool(...)`).
+
+    DELIBERATELY payload-trusted (not IR-re-derived like `_resolved_makefile_host_authored`):
+    this flag only selects which contract DOC a leaf is provisioned, never a write
+    authorization or gate. The narrowing is doc-provisioning, so a wrong value cannot escalate
+    capability, and `build_skill_must_read_refs` UNION-merges the recompute with the
+    conductor's persisted set — so it can only ever add docs, never drop one the conductor
+    kept (a stranded runner-authoring leaf is structurally impossible). The makefile flag, by
+    contrast, suppresses a mandatory write-authorization pin, so it MUST be IR-re-derived. If a
+    future change ever makes this narrowed must-read load-bearing for a gate, switch to
+    IR-re-derivation (mirror `_ir_is_m3c_physics` off `ir_ref`) like the makefile flag."""
+    return request_payload.get("runner_host_authored") is True
+
+
 def _workflow_contract_refs_for_launch(request_payload: dict[str, Any]) -> list[str]:
-    return leaf_contract_doc_refs(request_payload.get("step"))
+    return leaf_contract_doc_refs(
+        request_payload.get("step"),
+        is_m3c_physics=_payload_is_m3c_physics(request_payload),
+    )
 
 
 def build_skill_must_read_refs(request_payload: dict[str, Any]) -> list[str]:

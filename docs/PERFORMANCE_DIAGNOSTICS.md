@@ -47,6 +47,7 @@
 - Example: fail if throughput drops 10% or more below the baseline (but considering noise, it is preferable to handle it statistically).
 
 ## 6. Coordination with the runner
+- On an M3c physics node the `runner` (and its `perf.json`/JSON emission) is host-rendered by the conductor over the certified harness writers, so the Fortran descriptor rules below are enforced as **deterministic backstops** on that output rather than authored by a leaf; they still bind a runner-authoring leaf (an `infrastructure` self-test / legacy no-harness node). See phase_02 §2-1.
 - The runner can read `perf.json` and append the performance check to `verdict.json`.
 - On a physics fail, skip the performance evaluation (it has little meaning).
 - A `perf.json` with `parallelism` missing is treated as invalid input and made unjudgeable (error).

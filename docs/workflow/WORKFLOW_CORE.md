@@ -35,7 +35,7 @@ This document defines the workflow's phase sequence, inter-phase input/output co
 ### phase sequence
 0. `Spec` (manual): create `controlled_spec.md`, `tests.md`, and `deps.yaml`.
 1. `Compile`: integrate the natural-language specification + dependency resolution into a **single structural IR** (`spec.ir.yaml`).
-2. `Generate`: take the IR as input and generate the source of `model` and `runner`.
+2. `Generate`: take the IR as input and generate the source of `model` and `runner`. (On an M3c physics node — make+fortran with one `infrastructure`/harness dep — the leaf authors `model` + `<spec_id>_checks.f90` and the `runner` is host-rendered by the conductor; see phase_02 §2-1.)
 3. `Build`: deterministically turn the generated source into a binary with a standard build tool.
 4. `Validate`: run the binary, recompute the judgment metrics from the primary evidence, and finalize the `verdict`.
 

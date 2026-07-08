@@ -1366,6 +1366,60 @@ attach scope. **Real verification is a billed E2E** (a node in a family with a c
 attempt-1 pass rate + thinking-token delta via the timing-audit — ride-along with M1's E2E).
 Unit suite green (1972).
 
+## R1 / M3d — recovery: spec-input spec_id bound, heuristic deletion, node-aware runner-contract narrowing (IMPLEMENTED 2026-07-08)
+
+Canonical plan: `~/.claude/plans/dapper-baking-thompson.md` (M3d). With the harness host-render path
+proven (M3c-β / billed E2E #3), M3d recovers the now-obsolete leaf-authored-runner scaffolding and
+adds the mass-opt-in prerequisite gate. Five parts:
+
+1. **spec_id ≤ 55 spec-input gate.** New `runner_renderer.spec_id_length_violation(spec_id)` (reuses
+   `MAX_SPEC_ID_LEN`), called from `workflow_conductor.resolve_node` BEFORE the catalog read, so a
+   too-long spec_id fails at spec-input for the explicit target AND every `--with-deps` closure member
+   (each runs through `run_conductor → resolve_node`), with a **closure-build mirror** in
+   `run_workflow._resolve_dependency_closure`'s `visit()` so an already-ready dependency — skipped
+   before it would reach `_run_node`/`resolve_node` — cannot slip the gate. This is the canonical capture point for the ONE
+   node-IDENTITY render precondition the compile.static hoist deliberately excludes (a re-author cannot
+   shorten a spec_id); the renderer's `_check_identifier_lengths` keeps the same bound as a
+   defense-in-depth backstop. Deliberately spec-input (pre-IR) ⇒ language/phase-agnostic; the 55 bound
+   reflects the f2008 limit of the only current backend (fortran). The known 61-char catalog offender
+   `dynamics_advection_diffusion_profile_1d_upwind_center2_euler1` is thus blocked from harness adoption
+   until renamed (it is excluded from the mass-add below).
+2. **Deleted the two LLM-fabrication heuristics** (`_validate_problem_runner_diagnostics_dependency`,
+   `_validate_problem_runner_nonphysical_casepath_input`) + their now-dead private helpers +
+   `skip_llm_heuristics` threading + 4 tests. They were unreliable `problem/`-scoped guesses with a
+   known false-positive history; the cheap deterministic backstops (name / forbidden-output /
+   json-serialization / snapshot-filename) stay for every runner. Not a full no-op: the one remaining
+   legacy no-harness `problem/` node (`advdiff1d_linear`) now relies on LLM verify/judge + backstops
+   for fabrication, not these heuristics.
+3. **Node-aware runner-output-contract narrowing.** `leaf_contract_doc_refs(step, *, is_m3c_physics)`
+   drops `RUNNER_OUTPUT_CONTRACT.md` from an M3c PHYSICS generate leaf (authors model+checks, runner
+   host-rendered) but KEEPS it for `Validate.judge` and for a NON-M3c runner-authoring generate leaf
+   (the `infrastructure` harness self-test — its §3 cites §4 — and legacy no-harness nodes that
+   hand-roll JSON). The conductor stamps `runner_host_authored` into the request payload; the
+   record-launch security-boundary path reads it via `_payload_is_m3c_physics`, so both must-read
+   assembly paths compute the identical set (the stamp is load-bearing against drift). This is exactly
+   the plan's "exclude from the physics-node must-read", not a blanket generate removal (which would
+   strand the certified infra harness leaf on its next re-cert).
+4. **Doc retargeting.** Scope notes added to `RUNNER_OUTPUT_CONTRACT.md`, `AGENT_SKILLS.md`,
+   `phase_02_generate.md` §2-1, `WORKFLOW_CORE.md`, `PERFORMANCE_DIAGNOSTICS.md` §6, and the
+   generate-verify SKILL — all node-aware (host-rendered on M3c; leaf-authored + contract-read on
+   non-M3c). The architectural "the system produces a runner" statements (SPEC/CONTROLLED_SPEC/GLOSSARY/
+   RUNBOOK) stay true (a runner is still produced, just host-rendered for physics) and were left.
+5. **deps.yaml mass-add (E2E #4 prep).** The `infrastructure: harness_fortran_cpu >=0.2.0 <1.0.0`
+   dep was added to the 4 `shallow_water2d`-closure nodes lacking it (boundary got it in M3c-β) — the
+   exact set billed E2E #4 re-certifies. The advection_diffusion family is deferred: its closure
+   (`advdiff1d_linear`) pulls in the 61-char offender, which the new spec-input gate would reject, so
+   that family opts in only after the offender is renamed.
+
+Unit suite green (2134). Two independent adversarial reviews (general + Codex) converged — no confirmed
+correctness bug. The general pass drove rationale/caveat fixes (accurate `advdiff1d_linear` coverage
+note, mono-fortran-backend caveat) and an end-to-end two-path consistency test; the Codex pass drove two
+robustness hardenings: (a) `_payload_is_m3c_physics` now reads the flag strictly (`is True`, not a
+truthy `bool(...)`) so a malformed non-boolean falls back to the SAFE superset (keep RUNNER); and (b)
+the closure-build `spec_id` mirror above (an over-length ALREADY-READY dep could otherwise skip the
+per-node gate). **Real verification is billed E2E #4** (operator-run: `shallow_water2d --with-deps`
+full-closure re-certification + timing-audit before/after).
+
 ## R1 / M3c-α — infrastructure published surface as a signature-level contract (IMPLEMENTED 2026-07-07)
 
 Canonical plan: `~/.claude/plans/dapper-baking-thompson.md` (M3c-α). M3b-cert certified the
