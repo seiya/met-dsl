@@ -24,6 +24,7 @@ from tools.validate_pipeline_semantics import (
     _validate_diagnostics_contract_output,
     _validate_fortran_identifier_length,
     _validate_fortran_implicit_none_spec_list,
+    _validate_fortran_stop_code_constant,
     _validate_fortran_makefile_src_dir,
     _impl_toolchain_from_pipeline_dir,
     _validate_generate_lint_command_logs,
@@ -10682,6 +10683,235 @@ class FortranImplicitNoneSpecListTests(unittest.TestCase):
         violations: list[str] = []
         _validate_fortran_implicit_none_spec_list(src, "f2008", violations)
         self.assertEqual(len(violations), 1, msg=violations)
+
+
+class FortranStopCodeConstantTests(unittest.TestCase):
+    """post_generate flags a non-constant STOP/ERROR STOP code under f2008.
+
+    Under `-std=f2008` a STOP code must be a scalar CHARACTER/INTEGER constant
+    expression; a `//` concatenation folding in a variable (`'unknown case: '//cid`)
+    is a `build_compile_error` that lint and the non-compiling static gate both miss —
+    it surfaced on the harness self-test runner in orch_20260708T082701Z_356befd7.
+    Catching it here warm-resumes generate.generate instead of a dev_phase_rollback.
+    """
+
+    def _src_dir(self, body: str, name: str = "runner.f90") -> Path:
+        d = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, d, ignore_errors=True)
+        (d / name).write_text(body, encoding="utf-8")
+        return d
+
+    def _src_dir_multi(self, files: dict[str, str]) -> Path:
+        d = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, d, ignore_errors=True)
+        for name, body in files.items():
+            (d / name).write_text(body, encoding="utf-8")
+        return d
+
+    def test_imported_parameter_from_sibling_module_is_clean(self) -> None:
+        # A CHARACTER parameter declared in a sibling module (same src/) and `use`d here is
+        # a constant expr — gfortran -std=f2008 accepts `PFX//'boom'`. Parameter names are
+        # collected as the UNION across every file, so it must NOT be flagged.
+        src = self._src_dir_multi({
+            "consts.f90":
+                "module consts\n  character(*), parameter :: PFX = 'err: '\nend module consts\n",
+            "prog.f90":
+                "program p\n  use consts, only: PFX\n  error stop PFX//'boom'\nend program p\n",
+        })
+        violations: list[str] = []
+        _validate_fortran_stop_code_constant(src, "f2008", violations)
+        self.assertEqual(violations, [], msg=violations)
+
+    def test_stop_array_and_component_assignment_ignored(self) -> None:
+        # `stop(i) = ..` / `stop%c = ..` are assignments to a variable named `stop`, not STOP
+        # statements — the code half carries an assignment `=`, so they are skipped.
+        for body in (
+            "program p\n character(:),allocatable::stop(:),a,b\n stop(1) = a//b\nend program p\n",
+            "program p\n type t\n  character(:),allocatable::f\n end type\n"
+            " type(t)::stop\n character(:),allocatable::a,b\n stop%f = a//b\nend program p\n",
+        ):
+            src = self._src_dir(body)
+            violations: list[str] = []
+            _validate_fortran_stop_code_constant(src, "f2008", violations)
+            self.assertEqual(violations, [], msg=body)
+
+    def test_literal_concat_variable_flagged(self) -> None:
+        # The exact recurring flake.
+        src = self._src_dir(
+            "program p\n  character(:), allocatable :: cid\n"
+            "  error stop 'harness runner: unknown case_id: '//cid\n"
+            "end program p\n")
+        violations: list[str] = []
+        _validate_fortran_stop_code_constant(src, "f2008", violations)
+        self.assertEqual(len(violations), 1, msg=violations)
+        self.assertIn("STOP", violations[0])
+
+    def test_variable_leading_concat_flagged(self) -> None:
+        src = self._src_dir("program p\n  stop cid//' bad'\nend program p\n")
+        violations: list[str] = []
+        _validate_fortran_stop_code_constant(src, "f2008", violations)
+        self.assertEqual(len(violations), 1, msg=violations)
+
+    def test_constant_literal_and_integer_codes_clean(self) -> None:
+        src = self._src_dir(
+            "program p\n"
+            "  if (bad) error stop 'a fixed message'\n"
+            "  error stop 42\n"
+            "  stop\n"
+            "  error stop 'a'//'b'\n"  # all-literal concat is a constant expr
+            "end program p\n")
+        violations: list[str] = []
+        _validate_fortran_stop_code_constant(src, "f2008", violations)
+        self.assertEqual(violations, [], msg=violations)
+
+    def test_not_flagged_when_standard_is_f2018(self) -> None:
+        # F2018 allows a non-constant stop code, so the check stays silent.
+        src = self._src_dir("program p\n  error stop 'x: '//cid\nend program p\n")
+        violations: list[str] = []
+        _validate_fortran_stop_code_constant(src, "f2018", violations)
+        self.assertEqual(violations, [])
+
+    def test_flagged_when_standard_unresolved(self) -> None:
+        src = self._src_dir("program p\n  error stop 'x: '//cid\nend program p\n")
+        violations: list[str] = []
+        _validate_fortran_stop_code_constant(src, None, violations)
+        self.assertEqual(len(violations), 1, msg=violations)
+
+    def test_stop_as_variable_assignment_ignored(self) -> None:
+        # `stop` is a legal variable name; `stop = a//b` is an assignment, not a STOP.
+        src = self._src_dir(
+            "program p\n  character(:), allocatable :: stop, a, b\n"
+            "  stop = a//b\nend program p\n")
+        violations: list[str] = []
+        _validate_fortran_stop_code_constant(src, "f2008", violations)
+        self.assertEqual(violations, [])
+
+    def test_concat_in_condition_or_later_statement_ignored(self) -> None:
+        # A `//` in the IF condition (before the code) or in a later `;` statement
+        # is not part of the STOP code.
+        src = self._src_dir(
+            "program p\n"
+            "  if (a//b == c) error stop 7\n"
+            "  error stop 3; s = p//q\n"
+            "end program p\n")
+        violations: list[str] = []
+        _validate_fortran_stop_code_constant(src, "f2008", violations)
+        self.assertEqual(violations, [])
+
+    def test_concat_in_comment_or_string_ignored(self) -> None:
+        src = self._src_dir(
+            "program p\n"
+            "  ! error stop 'x: '//cid mentioned in a comment\n"
+            '  character(*), parameter :: s = "error stop bad: "//""\n'
+            "  error stop 'ok'\nend program p\n")
+        violations: list[str] = []
+        _validate_fortran_stop_code_constant(src, "f2008", violations)
+        self.assertEqual(violations, [])
+
+    def test_reports_each_file_once(self) -> None:
+        src = self._src_dir(
+            "program p\n  error stop 'a: '//x\n  error stop 'b: '//y\nend program p\n")
+        violations: list[str] = []
+        _validate_fortran_stop_code_constant(src, "f2008", violations)
+        self.assertEqual(len(violations), 1, msg=violations)
+
+    def test_named_parameter_concat_is_clean(self) -> None:
+        # `pre//suf` where both are CHARACTER parameters is a constant expr — gfortran
+        # -std=f2008 accepts it, so the gate must be parameter-aware and NOT flag it.
+        src = self._src_dir(
+            "program p\n"
+            "  character(*), parameter :: pre = 'a: ', suf = 'b'\n"
+            "  error stop pre//suf\n"
+            "end program p\n")
+        violations: list[str] = []
+        _validate_fortran_stop_code_constant(src, "f2008", violations)
+        self.assertEqual(violations, [], msg=violations)
+
+    def test_constant_intrinsic_call_concat_is_clean(self) -> None:
+        # `'x'//new_line('a')` is a constant expr (gfortran -std=f2008 accepts it); a
+        # `name(...)` operand is treated leniently as constant to avoid this false positive.
+        src = self._src_dir(
+            "program p\n  error stop 'line1'//new_line('a')\nend program p\n")
+        violations: list[str] = []
+        _validate_fortran_stop_code_constant(src, "f2008", violations)
+        self.assertEqual(violations, [], msg=violations)
+
+    def test_parameter_concatenated_with_variable_flagged(self) -> None:
+        # A parameter concatenated with a VARIABLE is non-constant (gfortran rejects it).
+        src = self._src_dir(
+            "program p\n"
+            "  character(*), parameter :: pre = 'a: '\n"
+            "  character(:), allocatable :: v\n"
+            "  v = 'x'\n"
+            "  error stop pre//v\n"
+            "end program p\n")
+        violations: list[str] = []
+        _validate_fortran_stop_code_constant(src, "f2008", violations)
+        self.assertEqual(len(violations), 1, msg=violations)
+
+    def test_parameter_name_on_continuation_line_is_clean(self) -> None:
+        # A parameter whose name (or the `, parameter ::` head) wraps across a `&`
+        # continuation must still be collected, else a legal `pre//suf` is false-flagged.
+        # Both forms below compile under gfortran -std=f2008.
+        for body in (
+            "program p\n"
+            "  character(*), parameter :: pre = 'a: ', &\n"
+            "                             suf = 'b'\n"
+            "  error stop pre//suf\nend program p\n",
+            "program p\n"
+            "  character(*), &\n"
+            "    parameter :: pre = 'a: ', suf = 'b'\n"
+            "  error stop pre//suf\nend program p\n",
+        ):
+            src = self._src_dir(body)
+            violations: list[str] = []
+            _validate_fortran_stop_code_constant(src, "f2008", violations)
+            self.assertEqual(violations, [], msg=body)
+
+    def test_component_reference_operand_is_lenient(self) -> None:
+        # `base%comp` is treated leniently (a component of a derived-type parameter is a
+        # constant expr); not false-flagged even without a symbol table for `base`. The
+        # spaced form `base % comp` must be handled symmetrically on both operand sides.
+        for body in (
+            "program p\n  error stop cfg%msg//' end'\nend program p\n",
+            "program p\n  error stop 'x: '//cfg%msg\nend program p\n",
+            "program p\n  error stop cfg % msg//' end'\nend program p\n",
+            "program p\n  error stop 'x: '//cfg % msg\nend program p\n",
+        ):
+            src = self._src_dir(body)
+            violations: list[str] = []
+            _validate_fortran_stop_code_constant(src, "f2008", violations)
+            self.assertEqual(violations, [], msg=body)
+
+    def test_stop_variable_in_write_list_ignored(self) -> None:
+        # `write(*,*) stop//x` — `stop` is a variable in an output list, and the `)` closes
+        # a `write(...)`, not a control guard, so it must NOT be read as a STOP statement.
+        src = self._src_dir(
+            "program p\n character(:),allocatable::stop,x\n write(*,*) stop//x\nend program p\n")
+        violations: list[str] = []
+        _validate_fortran_stop_code_constant(src, "f2008", violations)
+        self.assertEqual(violations, [], msg=violations)
+
+    def test_if_guard_stop_flake_flagged(self) -> None:
+        # The `)`-position IS a statement when the `)` closes an `if (..)` guard.
+        src = self._src_dir(
+            "program p\n character(:),allocatable::cid\n if (bad) stop 'x: '//cid\nend program p\n")
+        violations: list[str] = []
+        _validate_fortran_stop_code_constant(src, "f2008", violations)
+        self.assertEqual(len(violations), 1, msg=violations)
+
+    def test_stop_as_variable_operand_ignored(self) -> None:
+        # `stop` is a legal identifier; used as a `//` operand (not at statement position)
+        # it must NOT be read as a STOP statement.
+        for body in (
+            "program p\n character(:),allocatable::stop,y\n x = stop // y\nend program p\n",
+            "program p\n character(:),allocatable::stop,bar\n call foo(stop//bar)\nend program p\n",
+            "program p\n character(:),allocatable::stop,suf\n z = trim(stop)//suf\nend program p\n",
+        ):
+            src = self._src_dir(body)
+            violations: list[str] = []
+            _validate_fortran_stop_code_constant(src, "f2008", violations)
+            self.assertEqual(violations, [], msg=body)
 
     def test_only_scans_fortran_suffixes(self) -> None:
         d = Path(tempfile.mkdtemp())

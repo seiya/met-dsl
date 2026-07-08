@@ -3759,6 +3759,11 @@ def _validate_generate_outputs(
         _impl_standard_from_pipeline_dir(repo_root, execution.pipeline_dir),
         violations,
     )
+    _validate_fortran_stop_code_constant(
+        src_dir,
+        _impl_standard_from_pipeline_dir(repo_root, execution.pipeline_dir),
+        violations,
+    )
     _validate_fortran_makefile_src_dir(src_dir, violations)
     _build_system, _language = _impl_toolchain_from_pipeline_dir(
         repo_root, execution.pipeline_dir
@@ -3904,6 +3909,247 @@ def _validate_fortran_implicit_none_spec_list(
                     f"plain `implicit none` with the `! allow(C003)` directive on the line "
                     f"immediately before it (see docs/workflow/phases/phase_02_generate.md §2-1)"
                 )
+
+
+# Under `-std=f2008` a STOP / ERROR STOP code must be a scalar default CHARACTER or
+# INTEGER CONSTANT expression; a run-time value folded in via concatenation
+# (`'unknown case: '//cid`, where `cid` is a variable) is `Error: STOP code at (1) must be
+# a scalar default CHARACTER or INTEGER constant expression`. F2018 relaxed this to allow a
+# non-constant code, so f2018/f2023 accept it and the check stays silent there. Lint
+# (fortitude) and the non-compiling post_generate gate both miss it — it only surfaces at
+# Build (observed on the harness self-test runner in orch_20260708T082701Z_356befd7,
+# `error stop 'harness runner: unknown case_id: '//cid`), which is a `build_compile_error`
+# = a dev_phase_rollback with no in-phase retry. Catching it here warm-resumes
+# Generate.generate instead. Verified against gfortran -std=f2008: `'a'//'b'` and
+# `pre//suf` (named `parameter`s) and `'x'//new_line('a')` COMPILE (constant exprs), while
+# `pre//v` (v a variable) does NOT — so the gate must be parameter-aware, not just
+# "identifier operand => non-constant".
+_F2018_NONCONST_STOP_STANDARDS = frozenset({"f2018", "f2023"})
+_FORTRAN_STOP_STMT_RE = re.compile(r"(?i)\b(error\s+stop|stop)\b")
+_FORTRAN_IDENT_HEAD_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+_FORTRAN_IDENT_TAIL_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*$")
+# A `parameter` attribute declaration: `<type>, parameter [,attrs] :: N1 = .., N2(..) = ..`.
+_FORTRAN_PARAMETER_ATTR_RE = re.compile(r"(?i),\s*parameter\b")
+# The old statement form: `parameter (N1 = .., N2 = ..)`.
+_FORTRAN_PARAMETER_STMT_RE = re.compile(r"(?i)\bparameter\s*\(([^)]*)\)")
+# A lone assignment `=` (NOT `==` / `/=` / `<=` / `>=`). A STOP statement's code never
+# contains one, so its presence in `stop`'s code half means `stop` is a variable being
+# assigned (`stop = ..`, `stop(i) = ..`, `stop%c = ..`), not a STOP statement.
+_FORTRAN_ASSIGN_RE = re.compile(r"(?<![=/<>])=(?!=)")
+# A bare `stop` after a `)` is a STOP statement only when the `)` closes a control-construct
+# guard (`if (..) stop`, `where (..)`, `forall (..)`) — NOT the `)` of a `write(..)` /
+# function-call whose output/result is then concatenated (`write(*,*) stop//x`, where `stop`
+# is a variable). Requiring a guard keyword avoids reading such a `stop` as a statement.
+_FORTRAN_CONTROL_GUARD_RE = re.compile(r"(?i)\b(if|where|forall)\b")
+
+
+def _fortran_line_mask_strings(line: str, quote: str | None = None) -> tuple[str, str | None]:
+    """Drop the trailing free-form ``!`` comment and replace character-literal spans with
+    ``#`` placeholders — preserving that a *literal* (not a variable) sat there, so a
+    constant concatenation (``'a'//'b'`` -> ``###//###``) is distinguishable from a
+    variable one (``'a'//v`` -> ``###//v``). Carries an open-string delimiter across ``&``
+    continuations (pass the returned ``quote`` back in) so a literal spanning lines stays
+    masked. Unlike ``_strip_fortran_comments_and_strings`` it keeps a placeholder rather
+    than deleting the span, which is what the ``//``-operand analysis below needs."""
+    out: list[str] = []
+    for ch in line:
+        if quote is not None:
+            out.append("#")
+            if ch == quote:
+                quote = None
+            continue
+        if ch in ("'", '"'):
+            quote = ch
+            out.append("#")
+            continue
+        if ch == "!":
+            break
+        out.append(ch)
+    return "".join(out), quote
+
+
+def _fortran_join_continuations(masked_lines: list[str]) -> list[str]:
+    """Fold free-form ``&`` continuations in already-masked lines into logical lines.
+
+    A line whose last non-blank char is ``&`` continues onto the next; that next line may
+    begin (after whitespace) with a leading ``&`` which is elided. Used so
+    ``_fortran_parameter_names`` sees a `parameter` declaration whose name list (or the
+    `, parameter ::` head itself) is wrapped across lines as ONE line — otherwise a name on
+    the continuation is missed and a legal `pre//suf` STOP code is false-flagged. (Strings
+    are already masked to ``#``, so a trailing ``&`` here is a real continuation, never one
+    inside a literal.)"""
+    out: list[str] = []
+    buf = ""
+    pending = False
+    for line in masked_lines:
+        cur = line
+        if pending and cur.lstrip().startswith("&"):
+            cur = cur.lstrip()[1:]
+        if cur.rstrip().endswith("&"):
+            buf += cur.rstrip()[:-1]
+            pending = True
+            continue
+        out.append(buf + cur)
+        buf = ""
+        pending = False
+    if buf:
+        out.append(buf)
+    return out
+
+
+def _fortran_parameter_names(masked_lines: list[str]) -> set[str]:
+    """Collect the (lowercased) names declared with the ``parameter`` attribute in a
+    file's masked source lines. A ``//`` operand that is one of these is a compile-time
+    CONSTANT, so concatenating it into a STOP code is legal — it must NOT be flagged.
+
+    Over-collection (treating a non-parameter as a parameter) can only SUPPRESS a flag —
+    the safe direction (Build is the backstop). Under-collection would false-flag, so the
+    two declaration forms are both parsed. The value after ``=`` is ignored (only the LHS
+    name matters), so a comma inside an array-constructor value cannot mint a false name
+    (a split fragment not starting with an identifier yields nothing)."""
+    names: set[str] = set()
+
+    def _first_ident(part: str) -> None:
+        m = _FORTRAN_IDENT_HEAD_RE.match(part.strip())
+        if m:
+            names.add(m.group(0).lower())
+
+    for line in masked_lines:
+        if "parameter" not in line.lower():
+            continue
+        if "::" in line and _FORTRAN_PARAMETER_ATTR_RE.search(line.split("::", 1)[0]):
+            for part in line.split("::", 1)[1].split(","):
+                _first_ident(part)
+        stmt = _FORTRAN_PARAMETER_STMT_RE.search(line)
+        if stmt:
+            for part in stmt.group(1).split(","):
+                _first_ident(part)
+    return names
+
+
+def _stop_code_has_nonconstant_concat(expr: str, param_names: set[str]) -> bool:
+    """True when the STOP code ``expr`` (character-literals masked to ``#``) has a ``//``
+    concatenation with a provably NON-constant operand — a bare identifier that is not a
+    known ``parameter``. Constant operands are left unflagged: a masked literal (``#``), a
+    named ``parameter``, and — leniently — any ``name(...)`` reference or ``base%comp``
+    component (a constant intrinsic like ``new_line('a')`` / ``achar(9)``, and a component of
+    a derived-type ``parameter``, are constant but indistinguishable from a non-constant
+    ``trim(var)`` / ``var%comp`` without more analysis, so both are treated as constant to
+    avoid a false positive on the common idioms; the rarer non-constant call/component shape
+    falls to the Build backstop). This matches gfortran -std=f2008's own accept/reject split."""
+    for m in re.finditer(r"//", expr):
+        # Left operand: the token ending at the `//`. A trailing `)` (call/array ref) or a
+        # component reference (`base%comp`, the tail identifier preceded by `%`) is treated
+        # as constant (a component of a derived-type `parameter` is a constant expression).
+        left = expr[: m.start()].rstrip()
+        if left and left[-1] != "#" and left[-1] != ")":
+            tail = _FORTRAN_IDENT_TAIL_RE.search(left)
+            # `base % comp` (a component ref — possibly with spaces around `%`) is a
+            # constant when `base` is a derived-type parameter; treat it leniently.
+            if (tail and not left[: tail.start()].rstrip().endswith("%")
+                    and tail.group(0).lower() not in param_names):
+                return True
+        # Right operand: the token starting after the `//`. A following `(` (call/array) or
+        # `%` (component reference) is treated as constant, same as the left side.
+        right = expr[m.end():].lstrip()
+        if right and right[0] != "#":
+            head = _FORTRAN_IDENT_HEAD_RE.match(right)
+            if head:
+                after = right[head.end():].lstrip()
+                if (not after.startswith("(") and not after.startswith("%")
+                        and head.group(0).lower() not in param_names):
+                    return True
+    return False
+
+
+def _validate_fortran_stop_code_constant(
+    src_dir: Path, standard: str | None, violations: list[str]
+) -> None:
+    """Flag a non-constant STOP / ERROR STOP code under `-std=f2008` (a `build_compile_error`).
+
+    The recurring generation flake is a `//` concatenation folding a VARIABLE into the code
+    (`'unknown case_id: '//cid`). The gate is parameter-aware and call-lenient (see
+    `_stop_code_has_nonconstant_concat`) so it does NOT false-flag a legal constant
+    concatenation — `'a'//'b'`, `pre//suf` (named `parameter`s), or `'x'//new_line('a')` —
+    which gfortran -std=f2008 accepts. `parameter` names are collected as the UNION across
+    EVERY Fortran file in `src_dir` (all compiled sources are staged there — model / checks /
+    host-rendered runner / dependency modules), so a constant `use`d from a sibling module
+    (`use consts, only: PFX` then `error stop PFX//'x'`) is recognised, not just an in-file
+    one. A bare-variable code with no concatenation (`error stop rc`) is NOT flagged: a named
+    INTEGER/CHARACTER `parameter` there is legal and there is nothing to disambiguate it from
+    a variable, so the Build step stays the backstop for that rarer shape. Silent when the
+    toolchain standard accepts a non-constant code (f2018/f2023). Reuses the free-form
+    comment/string masker so a `//` inside a comment or literal never false-flags; reports
+    each file once.
+
+    A bare `stop` keyword is only a STOP statement at statement position (line start, after
+    a numeric label, or after `)` / `;`) AND when its code half carries no assignment `=`;
+    `stop` used as a variable operand (`x = stop//y`, `foo(stop//bar)`) or assigned
+    (`stop = ..`, `stop(i) = ..`, `stop%c = ..`) is skipped. `error stop` is unambiguous (two
+    adjacent identifiers are never a valid expression), so it needs no such guard.
+
+    Accepted limitations (Build is the backstop, so each can only cost a rare extra rebuild):
+    a STOP code split by a `&` continuation before the `//` is scanned per physical line and
+    not flagged; and a parameter brought in under a `use, only: alias => remote` RENAME is
+    seen only under its declared name, so `error stop alias//'x'` (alias of a CHARACTER
+    parameter) could false-flag — renames are uncollectable without `use`-graph resolution,
+    and this shape does not occur in generated code. Both under-report/rare-false-flag only;
+    the generator emits STOP statements on one line with in-scope names."""
+    if standard in _F2018_NONCONST_STOP_STANDARDS:
+        return
+    if not src_dir.is_dir():
+        return
+    masked_by_path: dict[Path, list[str]] = {}
+    param_names: set[str] = set()
+    for path in sorted(src_dir.iterdir()):
+        if not path.is_file() or path.suffix.lower() not in _FORTRAN_SOURCE_SUFFIXES:
+            continue
+        try:
+            text = path.read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            continue
+        masked_lines: list[str] = []
+        quote: str | None = None
+        for raw in text.splitlines():
+            masked, quote = _fortran_line_mask_strings(raw, quote)
+            masked_lines.append(masked)
+        masked_by_path[path] = masked_lines
+        # Union across files: a parameter declared in a sibling module (staged in the same
+        # src/) is a constant when `use`d here, so it must suppress a flag on this file too.
+        param_names |= _fortran_parameter_names(_fortran_join_continuations(masked_lines))
+    for path, masked_lines in masked_by_path.items():
+        flagged = False
+        for masked in masked_lines:
+            if flagged:
+                break
+            for m in _FORTRAN_STOP_STMT_RE.finditer(masked):
+                before = masked[: m.start()].rstrip()
+                # The STOP code runs to the statement end (`;` separates free-form
+                # statements); anything after a `;` is a different statement.
+                rest = masked[m.end():].split(";", 1)[0]
+                if m.group(1).lower() == "stop":
+                    # A bare `stop` is a STOP statement only at statement position; as a
+                    # variable operand (`x = stop//y`, `foo(stop//bar)`, `trim(stop)`,
+                    # `write(*,*) stop//x`) it is preceded by an operator / `(` / identifier
+                    # char, or by a non-guard `)` — skip those.
+                    if not (before == "" or before.isdigit() or before.endswith(";")
+                            or (before.endswith(")")
+                                and _FORTRAN_CONTROL_GUARD_RE.search(before))):
+                        continue
+                    # An assignment to a variable named `stop` (`stop = ..`, `stop(i) = ..`,
+                    # `stop%c = ..`) is not a STOP statement — a lone `=` in the code half.
+                    if _FORTRAN_ASSIGN_RE.search(rest):
+                        continue
+                if _stop_code_has_nonconstant_concat(rest, param_names):
+                    flagged = True
+                    violations.append(
+                        f"{path}: non-constant STOP/ERROR STOP code (a `//` concatenation "
+                        f"folds in a variable) is a compile_error under -std=f2008 (STOP code "
+                        f"must be a scalar CHARACTER/INTEGER constant expression); use a "
+                        f"constant literal message, or print the run-time value then `error "
+                        f"stop <int>` (see docs/workflow/phases/phase_02_generate.md §2-1)"
+                    )
+                    break
 
 
 # R1/M3c-β: the fixed public ABI of a physics node's `<spec_id>_checks.f90`
@@ -4213,6 +4459,11 @@ def _validate_generate_outputs_for_generation(
 
     _validate_fortran_identifier_length(src_dir, violations)
     _validate_fortran_implicit_none_spec_list(
+        src_dir,
+        _impl_standard_from_pipeline_dir(repo_root, execution.pipeline_dir),
+        violations,
+    )
+    _validate_fortran_stop_code_constant(
         src_dir,
         _impl_standard_from_pipeline_dir(repo_root, execution.pipeline_dir),
         violations,
