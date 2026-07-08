@@ -80,7 +80,19 @@ class RenderError(RuntimeError):
     Raised for a structural impossibility (bad shape_expr, rank>4, reserved-key
     collision, unsupported verdict.fields, >1 infra dep, over-long identifier).
     The conductor routes it to transport fail_closed — it is a spec/IR defect,
-    not content a Generate retry could repair by re-authoring the model."""
+    not content a Generate retry could repair by re-authoring the model.
+
+    ``identity=True`` marks the subset whose offending value is the node's IDENTITY
+    (spec_id / a derived module-name length, or >1 infra dep) rather than authored IR
+    *content*. Re-authoring the IR cannot repair an identity defect, so the compile.static
+    mirror (``ir_content_violations``) excludes it — it belongs to spec-input validation,
+    NOT a compile.generate warm-resume retry. Every other RenderError (``identity=False``) is
+    Compile-authored content the compile gate hoists so a defect routes to compile.generate
+    instead of killing the workflow at conductor render time."""
+
+    def __init__(self, message: str, *, identity: bool = False) -> None:
+        super().__init__(message)
+        self.identity = identity
 
 
 # --- IR extraction helpers (all defensive: tolerate missing/mistyped nodes) ---
@@ -367,20 +379,65 @@ def _used_harness_ops(ir: dict[str, Any]) -> list[str]:
 
 
 def _check_identifier_lengths(spec_id: str, harness_spec_id: str) -> None:
+    # These are node-IDENTITY defects (a re-author cannot shorten the spec_id / harness id),
+    # so they are `identity=True`: the compile.static mirror excludes them (spec-input concern).
     if len(spec_id) > MAX_SPEC_ID_LEN:
         raise RenderError(
             f"spec_id {spec_id!r} is {len(spec_id)} chars (>{MAX_SPEC_ID_LEN}); "
             "the derived `<spec_id>_checks`/`_runner` identifiers would risk the "
-            f"f2008 {MAX_IDENTIFIER_LEN}-char limit")
+            f"f2008 {MAX_IDENTIFIER_LEN}-char limit", identity=True)
     for derived in (f"{spec_id}_runner", f"{spec_id}_checks", f"{spec_id}_model"):
         if len(derived) > MAX_IDENTIFIER_LEN:
             raise RenderError(
-                f"identifier {derived!r} is {len(derived)} chars (>{MAX_IDENTIFIER_LEN})")
+                f"identifier {derived!r} is {len(derived)} chars (>{MAX_IDENTIFIER_LEN})",
+                identity=True)
     for sym in (*_HARNESS_TYPES, *_HARNESS_CORE_OPS):
         name = _hname(harness_spec_id, sym)
         if len(name) > MAX_IDENTIFIER_LEN:
             raise RenderError(
-                f"harness identifier {name!r} is {len(name)} chars (>{MAX_IDENTIFIER_LEN})")
+                f"harness identifier {name!r} is {len(name)} chars (>{MAX_IDENTIFIER_LEN})",
+                identity=True)
+
+
+def ir_content_violations(ir: dict[str, Any], spec_id: str, harness_spec_id: str) -> list[str]:
+    """The Compile-authored render preconditions of an M3c physics node's host-rendered runner,
+    as a list of human-readable messages (``[]`` when the IR renders, or when the only defect is
+    a node-identity one this deliberately excludes — see below).
+
+    The ``compile.static`` gate (``validate_pipeline_semantics._validate_harness_render_pre
+    conditions``) calls this so a defect in an M3c node's IR routes back to ``compile.generate``
+    (a cheap warm re-author) instead of surfacing only as ``render_runner``'s Generate-time
+    fail_closed — which, running inside the conductor's host render, kills the whole workflow
+    rather than retrying (the E2E #3 ``time_variable`` failure class: a Compile-authored value ×
+    a renderer fail-close at an unrecoverable position).
+
+    It is an EXACT mirror by construction: it invokes ``render_runner`` itself (a pure,
+    side-effect-free, deterministic ~ms render) with the SAME ``(ir, spec_id, harness_spec_id)``
+    the conductor's ``_write_runner`` passes, and reports whatever ``RenderError`` the render
+    raises. No hand-maintained list of preconditions to drift out of sync — every current and
+    future content fail-close (reserved-key collision, rank>4, verdict.fields, a control char in
+    an IR name, an over-100-column rendered line, …) is caught here the instant the renderer
+    rejects it.
+
+    It EXCLUDES only ``RenderError``s flagged ``identity=True`` — the node-identity defects a
+    re-author cannot repair (``_check_identifier_lengths``: spec_id/derived-name length; and >1
+    infra dep, itself unreachable for an M3c node, which has exactly one infra dep by
+    construction). Those belong to spec-input validation, NOT a compile.generate retry; they
+    remain ``render_runner`` fail-closes as a backstop (see the module docstring)."""
+    try:
+        render_runner(ir, spec_id, harness_spec_id)
+    except RenderError as exc:
+        return [] if exc.identity else [str(exc)]
+    except Exception as exc:  # noqa: BLE001
+        # `render_runner`'s contract is "bad IR -> RenderError", but a truthy non-iterable IR
+        # field (e.g. `verdict.fields: 5`, where `_dget(...) or []` yields `5` and `for f in 5`
+        # raises TypeError) can still escape as a bare exception. Running INSIDE the compile
+        # validator, an uncaught exception would abort `_validate_compile_stage_impl` and discard
+        # every violation the sibling gates already collected, replacing the actionable list with
+        # a renderer-internals traceback. Convert it to a violation instead: the IR is unrenderable
+        # either way, so it routes to compile.generate with an intelligible message.
+        return [f"IR is not renderable ({type(exc).__name__}: {exc})"]
+    return []
 
 
 def render_runner(ir: dict[str, Any], spec_id: str, harness_spec_id: str) -> str:
@@ -390,22 +447,29 @@ def render_runner(ir: dict[str, Any], spec_id: str, harness_spec_id: str) -> str
     (``harness_fortran_cpu``). See module docstring for the render-error matrix.
     The returned text is the complete Fortran source (trailing newline included).
     """
+    # `spec_id`/`harness_spec_id` empty and IR-not-a-mapping are node-identity/caller defects,
+    # not authored content — flag identity so the compile.static mirror excludes them.
     if not isinstance(ir, dict):
-        raise RenderError("IR is not a mapping")
+        raise RenderError("IR is not a mapping", identity=True)
     spec_id = (spec_id or "").strip()
     harness_spec_id = (harness_spec_id or "").strip()
     if not spec_id:
-        raise RenderError("spec_id is empty")
+        raise RenderError("spec_id is empty", identity=True)
     if not harness_spec_id:
-        raise RenderError("harness_spec_id is empty")
+        raise RenderError("harness_spec_id is empty", identity=True)
     _check_identifier_lengths(spec_id, harness_spec_id)
 
     infra = _infra_dep_count(ir)
     if infra > 1:
         raise RenderError(
             f"node declares {infra} infrastructure dependencies; an M3c node depends on "
-            "exactly one harness (the runner glue is rendered against a single plumbing surface)")
+            "exactly one harness (the runner glue is rendered against a single plumbing "
+            "surface)", identity=True)
 
+    # Everything from here down is Compile-authored IR *content*: any RenderError it raises is
+    # `identity=False`, so `ir_content_violations` (which invokes this function) surfaces it at
+    # compile.static and routes the defect to compile.generate instead of this workflow-killing
+    # render. No mirroring to maintain — the gate runs THIS code.
     schema_vars, time_var = _snapshot_schema(ir)
     # The certified harness writes the per-case snapshot time under the FIXED key `t`
     # (harness controlled_spec §2/§3: `__write_snapshot(case_id, values, time)` takes a time

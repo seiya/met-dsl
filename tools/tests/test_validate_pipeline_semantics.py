@@ -12243,5 +12243,143 @@ class HarnessDependencyConsistencyTests(unittest.TestCase):
         self.assertTrue(any("cannot derive the expected harness id" in x for x in v), v)
 
 
+class HarnessRenderPreconditionsTests(unittest.TestCase):
+    """R1/M3c-β `_validate_harness_render_preconditions` (compile stage): mirror every
+    Compile-authored render precondition of an M3c physics node's host-rendered runner, so a
+    defect routes to compile.generate instead of render_runner's workflow-killing fail-close.
+    The renderer-side unit `IrContentViolationsTest` pins the content surface exhaustively;
+    these pin the M3c gating (no-op off M3c) and the compile-path wiring."""
+
+    def _baseline_ir(self, *, spec_kind="component", language="fortran",
+                     build_system="make", infra: bool = True) -> dict:
+        deps: list = ([{"node_key": "infrastructure/harness_fortran_cpu@0.2.0"}]
+                      if infra else [])
+        return {
+            "meta": {"spec_kind": spec_kind, "spec_id": "bx"},
+            "impl_defaults": {"toolchain": {"language": language,
+                                            "build_system": build_system},
+                              "target": {"class": "cpu"}},
+            "dependency": {"direct_deps": deps},
+            "case": {"test_case_set": [{"case_id": "c_a"}]},
+            "io_contract": {
+                "raw_requirements": {"required_evidence": [
+                    {"artifact": "state_snapshots", "required": True, "schema": {
+                        "time_variable": "t",
+                        "variables": [{"name": "U", "shape_expr": "[nx, ny]"}]}}]},
+                "diagnostics_contract": {
+                    "checks": [{"id": "c1"}],
+                    "verdict": {"required": True, "fields": ["overall", "failed_checks"]}},
+                "test_predicates": [
+                    {"test_id": "t1", "expected_outcome": "pass", "target_cases": ["c_a"]}],
+                "test_evidence_requirements": [
+                    {"test_id": "t1", "required_raw_variables": ["U"]}],
+            },
+        }
+
+    def _run(self, ir: dict) -> list[str]:
+        with tempfile.TemporaryDirectory() as t:
+            tmp = Path(t)
+            ir_dir = tmp / "ir"
+            ir_dir.mkdir()
+            (ir_dir / "spec.ir.yaml").write_text(yaml.safe_dump(ir))
+            violations: list[str] = []
+            vps._validate_harness_render_preconditions(tmp, ir_dir, violations)
+            return violations
+
+    def test_clean_baseline_passes(self) -> None:
+        self.assertEqual(self._run(self._baseline_ir()), [])
+
+    def test_absent_time_variable_is_noop(self) -> None:
+        # Omitted time_variable defaults to `t` in the renderer — not a violation.
+        ir = self._baseline_ir()
+        del ir["io_contract"]["raw_requirements"]["required_evidence"][0]["schema"][
+            "time_variable"]
+        self.assertEqual(self._run(ir), [])
+
+    def test_wrong_time_variable_fails(self) -> None:
+        ir = self._baseline_ir()
+        ir["io_contract"]["raw_requirements"]["required_evidence"][0]["schema"][
+            "time_variable"] = "time"
+        v = self._run(ir)
+        self.assertTrue(any("time_variable is 'time'" in x and "'t'" in x for x in v), v)
+
+    def test_missing_meta_spec_id_still_hoists_via_node_key(self) -> None:
+        # Codex P2: `meta.spec_id` absent must NOT skip the gate. The conductor host-renders with
+        # the node key regardless, so a content defect (time_variable) must still surface at
+        # compile — derived from the `dependency.node_key` identity, not optional metadata.
+        ir = self._baseline_ir()
+        ir["meta"].pop("spec_id", None)
+        ir["dependency"]["node_key"] = "component/foo_bar@0.1.0"
+        ir["io_contract"]["raw_requirements"]["required_evidence"][0]["schema"][
+            "time_variable"] = "time"
+        v = self._run(ir)
+        self.assertTrue(any("time_variable is 'time'" in x for x in v), v)
+
+    def test_missing_all_identity_still_hoists(self) -> None:
+        # Even with neither meta.spec_id nor dependency.node_key, an M3c node's content defect
+        # must surface (a placeholder spec_id is used — content checks are spec_id-independent).
+        ir = self._baseline_ir()
+        ir["meta"].pop("spec_id", None)
+        ir["io_contract"]["raw_requirements"]["required_evidence"][0]["schema"][
+            "time_variable"] = "time"
+        v = self._run(ir)
+        self.assertTrue(any("time_variable is 'time'" in x for x in v), v)
+
+    def test_reserved_key_collision_fails(self) -> None:
+        ir = self._baseline_ir()
+        ir["io_contract"]["raw_requirements"]["required_evidence"][0]["schema"][
+            "variables"].append({"name": "step", "shape_expr": "scalar"})
+        v = self._run(ir)
+        self.assertTrue(any("'step'" in x and "reserved" in x for x in v), v)
+
+    def test_verdict_fields_unsupported_fails(self) -> None:
+        ir = self._baseline_ir()
+        ir["io_contract"]["diagnostics_contract"]["verdict"]["fields"] = [
+            "overall", "failed_checks", "score"]
+        v = self._run(ir)
+        self.assertTrue(any("verdict.fields" in x and "score" in x for x in v), v)
+
+    def test_rank_over_4_fails(self) -> None:
+        ir = self._baseline_ir()
+        ir["io_contract"]["raw_requirements"]["required_evidence"][0]["schema"][
+            "variables"][0]["shape_expr"] = "[2, 2, 2, 2, 2]"
+        v = self._run(ir)
+        self.assertTrue(any("rank 5" in x for x in v), v)
+
+    def test_no_state_snapshots_fails(self) -> None:
+        # The host-rendered runner needs a snapshot schema; absence is a render fail-close on
+        # an M3c node, so the gate hoists it (previously a no-op under the time-only gate).
+        ir = self._baseline_ir()
+        ir["io_contract"]["raw_requirements"]["required_evidence"] = []
+        v = self._run(ir)
+        self.assertTrue(any("state_snapshots" in x for x in v), v)
+
+    def test_prefixes_ir_path(self) -> None:
+        ir = self._baseline_ir()
+        ir["io_contract"]["raw_requirements"]["required_evidence"][0]["schema"][
+            "time_variable"] = "time"
+        v = self._run(ir)
+        self.assertTrue(v and all("spec.ir.yaml:" in x for x in v), v)
+
+    def test_non_m3c_node_is_noop(self) -> None:
+        # No harness dep -> legacy leaf-authored runner; the gate never inspects content.
+        ir = self._baseline_ir(infra=False)
+        ir["io_contract"]["raw_requirements"]["required_evidence"][0]["schema"][
+            "time_variable"] = "time"
+        self.assertEqual(self._run(ir), [])
+
+    def test_infra_node_is_noop(self) -> None:
+        ir = self._baseline_ir(spec_kind="infrastructure")
+        ir["io_contract"]["raw_requirements"]["required_evidence"][0]["schema"][
+            "time_variable"] = "time"
+        self.assertEqual(self._run(ir), [])
+
+    def test_non_make_node_is_noop(self) -> None:
+        ir = self._baseline_ir(build_system="cmake")
+        ir["io_contract"]["raw_requirements"]["required_evidence"][0]["schema"][
+            "time_variable"] = "time"
+        self.assertEqual(self._run(ir), [])
+
+
 if __name__ == "__main__":
     unittest.main()

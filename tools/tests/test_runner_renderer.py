@@ -22,6 +22,7 @@ from tools.runner_renderer import (
     RenderError,
     _HARNESS_V2_INTERFACE,
     assert_harness_pin,
+    ir_content_violations,
     render_runner,
 )
 from tools.validate_pipeline_semantics import _parse_interface_stanzas
@@ -773,6 +774,113 @@ class RenderErrorMatrixTest(unittest.TestCase):
             ir["io_contract"]["test_predicates"][0]["test_id"] = long_id
             ir["io_contract"]["test_predicates"][0]["target_cases"] = [long_id]
         self._expect(mut)
+
+
+def _long_name_mut(ir: dict) -> None:
+    long_id = "c_" + "x" * 95
+    ir["case"]["test_case_set"][0]["case_id"] = long_id
+    ir["io_contract"]["test_evidence_requirements"][0]["test_id"] = long_id
+    ir["io_contract"]["test_predicates"][0]["test_id"] = long_id
+    ir["io_contract"]["test_predicates"][0]["target_cases"] = [long_id]
+
+
+# (label, mutate, spec_id, is_identity): each mutation of _boundary_ir makes render_runner raise.
+# `is_identity` = the RenderError is a node-identity defect (`identity=True`) a re-author cannot
+# repair, which `ir_content_violations` excludes; otherwise it is Compile-authored content that
+# must surface at compile.static. This table is the classification contract.
+_RENDER_FAILCLOSE_CASES = [
+    ("rank_over_4", lambda ir: ir["io_contract"]["raw_requirements"]["required_evidence"][0]
+     ["schema"]["variables"][0].__setitem__("shape_expr", "[2,2,2,2,2]"), BOUNDARY_SID, False),
+    ("bad_shape_expr", lambda ir: ir["io_contract"]["raw_requirements"]["required_evidence"][0]
+     ["schema"]["variables"][2].__setitem__("shape_expr", "banana"), BOUNDARY_SID, False),
+    ("reserved_key_collision", lambda ir: ir["io_contract"]["raw_requirements"]
+     ["required_evidence"][0]["schema"]["variables"][2].__setitem__("name", "t"),
+     BOUNDARY_SID, False),
+    ("verdict_fields_unsupported", lambda ir: ir["io_contract"]["diagnostics_contract"]
+     ["verdict"].__setitem__("fields", ["overall", "failed_checks", "score"]),
+     BOUNDARY_SID, False),
+    ("required_raw_not_in_schema", lambda ir: ir["io_contract"]["test_evidence_requirements"]
+     [0]["required_raw_variables"].append("ghost_field_typo"), BOUNDARY_SID, False),
+    ("duplicate_case_id", lambda ir: ir["case"]["test_case_set"].append(
+        {"case_id": "l0_periodic_x_wrap_pass"}), BOUNDARY_SID, False),
+    ("multi_target_metrics", lambda ir: ir["io_contract"]["test_predicates"][0].__setitem__(
+        "target_cases", ["l0_periodic_x_wrap_pass", "l0_periodic_y_wrap_pass"]),
+     BOUNDARY_SID, False),
+    ("non_t_time_variable", lambda ir: ir["io_contract"]["raw_requirements"]
+     ["required_evidence"][0]["schema"].__setitem__("time_variable", "tau"), BOUNDARY_SID, False),
+    ("no_checks", lambda ir: ir["io_contract"]["diagnostics_contract"].__setitem__(
+        "checks", []), BOUNDARY_SID, False),
+    # These two USED to be render-only backstops; the render-based mirror now hoists them
+    # (they are Compile-authored names, not node identity) — the R1-F1 gap fix.
+    ("control_char_in_name", lambda ir: ir["case"]["test_case_set"][0].__setitem__(
+        "case_id", "l0\nx"), BOUNDARY_SID, False),
+    ("over_100_col_line", _long_name_mut, BOUNDARY_SID, False),
+    # Node-identity defects: excluded from the hoist (unrepairable by a re-author).
+    ("two_infra_deps", lambda ir: ir["dependency"]["direct_deps"].append(
+        {"node_key": "infrastructure/other@1.0.0"}), BOUNDARY_SID, True),
+    ("over_long_spec_id", None, "z" * 56, True),
+]
+
+
+class IrContentViolationsTest(unittest.TestCase):
+    """``ir_content_violations`` is the compile.static mirror of ``render_runner``: it INVOKES
+    the renderer with the same ``(ir, spec_id, harness_spec_id)`` the conductor uses and reports
+    its ``RenderError`` unless the error is ``identity=True``. So the mirror is exact by
+    construction — no hand-maintained precondition list to drift. These tests pin the
+    content-vs-identity classification (the routing contract) so the E2E #3 workflow-kill class
+    cannot silently reopen (e.g. a plausible ~50-char metric address or a control char in an IR
+    name — R1-F1 — now surfaces at compile instead of killing the workflow at render)."""
+
+    def test_clean_ir_has_no_violations(self) -> None:
+        self.assertEqual(ir_content_violations(_boundary_ir(), BOUNDARY_SID, HARNESS), [])
+        self.assertEqual(ir_content_violations(_metrics_ir(), "prob_x", HARNESS), [])
+        self.assertEqual(ir_content_violations(_rank34_metrics_ir(), RANK_SID, HARNESS), [])
+
+    def test_content_vs_identity_classification(self) -> None:
+        for label, mutate, spec_id, is_identity in _RENDER_FAILCLOSE_CASES:
+            with self.subTest(label):
+                ir = copy.deepcopy(_boundary_ir())
+                if mutate is not None:
+                    mutate(ir)
+                # Sanity: every table row is a genuine render fail-close.
+                with self.assertRaises(RenderError):
+                    render_runner(ir, spec_id, HARNESS)
+                v = ir_content_violations(ir, spec_id, HARNESS)
+                if is_identity:
+                    self.assertEqual(v, [], f"{label}: identity defect must be excluded")
+                else:
+                    self.assertTrue(v, f"{label}: content defect must be hoisted")
+
+    def test_time_variable_message_is_actionable(self) -> None:
+        ir = copy.deepcopy(_boundary_ir())
+        ir["io_contract"]["raw_requirements"]["required_evidence"][0]["schema"][
+            "time_variable"] = "tau"
+        v = ir_content_violations(ir, BOUNDARY_SID, HARNESS)
+        self.assertTrue(any("time_variable is 'tau'" in x and "'t'" in x for x in v), v)
+
+    def test_malformed_non_iterable_field_does_not_crash(self) -> None:
+        # A truthy non-iterable where a list is expected (e.g. `verdict.fields: 5`) makes
+        # render_runner raise a bare TypeError, not a RenderError. Running inside the compile
+        # validator, that must NOT escape (it would abort the gate and discard sibling
+        # violations); it is converted to a renderable-failure violation instead.
+        for field, value in (
+            ("fields", 5),  # under diagnostics_contract.verdict
+        ):
+            ir = copy.deepcopy(_boundary_ir())
+            ir["io_contract"]["diagnostics_contract"]["verdict"] = {
+                "required": False, field: value}
+            v = ir_content_violations(ir, BOUNDARY_SID, HARNESS)
+            self.assertTrue(v and any("not renderable" in x for x in v), v)
+        # a few more non-iterable field shapes, each must be caught (not raised)
+        for path in (
+            lambda ir: ir["io_contract"]["diagnostics_contract"].__setitem__("checks", 5),
+            lambda ir: ir["io_contract"].__setitem__("test_predicates", 5),
+            lambda ir: ir["case"].__setitem__("test_case_set", 5),
+        ):
+            ir = copy.deepcopy(_boundary_ir())
+            path(ir)
+            v = ir_content_violations(ir, BOUNDARY_SID, HARNESS)
+            self.assertTrue(v, v)  # non-empty, and no exception escaped
 
 
 class LineWidthTest(unittest.TestCase):

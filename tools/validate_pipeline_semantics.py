@@ -4140,21 +4140,11 @@ def _infra_direct_dep_node_keys(ir: dict[str, Any]) -> list[str]:
     return out
 
 
-def _execution_is_m3c(repo_root: Path, execution: NodeExecution) -> bool:
-    """True iff the node is an M3c physics node: make+fortran, ``spec_kind`` !=
+def _ir_is_m3c_physics(ir: dict[str, Any]) -> bool:
+    """True iff the IR dict describes an M3c physics node: make+fortran, ``spec_kind`` !=
     ``infrastructure``, with exactly one ``infrastructure`` (runner-harness) direct
     dependency. On such a node the runner is host-rendered and the leaf authors
     ``<spec_id>_checks.f90`` — mirrors ``workflow_conductor._conductor_authors_runner``."""
-    ir_dir = _ir_dir_for_execution(repo_root, execution)
-    if ir_dir is None:
-        return False
-    ir_path = ir_dir / "spec.ir.yaml"
-    if not ir_path.is_file():
-        return False
-    try:
-        ir = _read_yaml(ir_path)
-    except (json.JSONDecodeError, yaml.YAMLError):
-        return False
     if not isinstance(ir, dict):
         return False
     meta = ir.get("meta") if isinstance(ir.get("meta"), dict) else {}
@@ -4167,6 +4157,21 @@ def _execution_is_m3c(repo_root: Path, execution: NodeExecution) -> bool:
     if str(tc.get("language") or "fortran").lower() != "fortran":
         return False
     return len(_infra_direct_dep_node_keys(ir)) == 1
+
+
+def _execution_is_m3c(repo_root: Path, execution: NodeExecution) -> bool:
+    """True iff the node is an M3c physics node (see ``_ir_is_m3c_physics``)."""
+    ir_dir = _ir_dir_for_execution(repo_root, execution)
+    if ir_dir is None:
+        return False
+    ir_path = ir_dir / "spec.ir.yaml"
+    if not ir_path.is_file():
+        return False
+    try:
+        ir = _read_yaml(ir_path)
+    except (json.JSONDecodeError, yaml.YAMLError):
+        return False
+    return _ir_is_m3c_physics(ir) if isinstance(ir, dict) else False
 
 
 def _validate_checks_source_files(
@@ -9153,6 +9158,7 @@ def _validate_compile_stage_impl(
     _validate_test_predicates(repo_root, ir_dir, violations)
     _validate_infrastructure_public_api(repo_root, ir_dir, violations)
     _validate_harness_dependency_consistency(repo_root, ir_dir, violations)
+    _validate_harness_render_preconditions(repo_root, ir_dir, violations)
 
     return violations
 
@@ -9209,6 +9215,80 @@ def _validate_harness_dependency_consistency(
             f"{derived_path}: declared infrastructure dependency {infra[0]!r} (spec_id "
             f"{dep_spec!r}) does not match the harness derived from this node's target "
             f"(language={language}, class={hw_class}): expected {expected!r}")
+
+
+def _validate_harness_render_preconditions(
+    repo_root: Path, ir_dir: Path, violations: list[str]
+) -> None:
+    """R1/M3c-β deterministic compile gate: pre-empt every Compile-authored render
+    precondition of an M3c physics node's host-rendered runner.
+
+    A harness-backed (M3c) node's ``<spec_id>_runner.f90`` is rendered host-side by the
+    conductor (``runner_renderer.render_runner``) from the IR alone. Any IR *content* the
+    renderer cannot faithfully render (a ``time_variable`` other than the harness's fixed key
+    ``t``; a snapshot variable colliding with a reserved key ``t``/``case_id``/``step``; an
+    unparseable ``shape_expr`` or rank>4; a ``verdict.fields`` outside the harness fold surface
+    ``{overall, failed_checks}``; a required raw variable absent from the snapshot schema; a
+    multi-target metrics-basis test) makes ``render_runner`` raise ``RenderError``. That render
+    runs *inside the conductor* before the Generate substeps, so its fail_closed kills the whole
+    workflow rather than retrying — the E2E #3 failure class (orch ``…dcf0533e``): a
+    Compile-authored value caught at an unrecoverable position.
+
+    This gate mirrors those preconditions at Compile (cheap, pre-Generate) by delegating to
+    ``runner_renderer.ir_content_violations``, which INVOKES ``render_runner`` itself with the
+    same ``(ir, spec_id, harness_spec_id)`` the conductor's ``_write_runner`` uses — an exact
+    mirror by construction, so a defect routes back to ``compile.generate`` (warm re-author)
+    instead. The renderer keeps every assertion as a defense-in-depth backstop.
+
+    EXCLUDED (by ``ir_content_violations``, via ``RenderError.identity``): node-identity defects
+    a re-author cannot repair — the spec_id / derived-name length and >1 infra dep. These are
+    NOT hoisted here (routing an unrepairable defect to a warm-resume retry would only spin).
+    The spec_id-length case is a KNOWN residual: no earlier phase gate bounds spec_id length
+    today (Generate's model-name check only fires at >63 for ``<spec_id>_model``), so a spec_id
+    over 55 chars still fail-closes at the render backstop (a workflow-kill); the derived
+    ``<spec_id>_runner``/``_checks`` names (spec_id + 7) additionally breach the f2008 63-char
+    limit at spec_id ≥ 57. This is NOT hypothetical: the catalog already holds a 61-char spec_id
+    (``dynamics_advection_diffusion_profile_1d_upwind_center2_euler1``) — harmless only because
+    it is not harness-backed today. Bounding spec_id ≤ 55 at spec-input is therefore a
+    PREREQUISITE for M3d's mass opt-in of physics nodes to the harness (tracked in the M3c/M3d
+    plan), not a low-likelihood edge.
+
+    No-op only when the node is not M3c (legacy leaf-authored runner)."""
+    derived_path = ir_dir / "spec.ir.yaml"
+    if not derived_path.exists():
+        return
+    try:
+        ir = _read_yaml(derived_path)
+    except (json.JSONDecodeError, yaml.YAMLError):
+        return
+    if not isinstance(ir, dict) or not _ir_is_m3c_physics(ir):
+        return
+    # Derive the node's spec_id from its node IDENTITY — the same source the conductor's
+    # `_write_runner` uses (`refs.spec_id`, from the node key), NOT the optional `meta.spec_id`.
+    # Gating on `meta.spec_id` was a defect: a harness-backed IR with `meta.spec_id` absent or
+    # stale skipped this gate while the conductor still host-rendered (using the node key) and
+    # fail-closed at render on the very content errors this gate must hoist (time_variable,
+    # reserved keys). Prefer `dependency.node_key` (gated for consistency against the
+    # dependency_graph sidecar), then `meta.spec_id`, then a placeholder — and never skip. The
+    # CONTENT preconditions hoisted here are independent of the spec_id VALUE (only the excluded
+    # identity/length checks use it), so any non-empty spec_id surfaces them identically.
+    dep = ir.get("dependency") if isinstance(ir.get("dependency"), dict) else {}
+    node_key = dep.get("node_key")
+    spec_id = _spec_id_from_node_key(node_key) if isinstance(node_key, str) and node_key else None
+    if not spec_id:
+        meta = ir.get("meta") if isinstance(ir.get("meta"), dict) else {}
+        ms = meta.get("spec_id")
+        spec_id = ms.strip() if isinstance(ms, str) and ms.strip() else "node"
+    # Mirror the conductor's `_write_runner`: the harness spec_id is the single infrastructure
+    # direct dep's spec_id (`_ir_is_m3c_physics` guarantees exactly one).
+    infra = _infra_direct_dep_node_keys(ir)
+    if len(infra) != 1:  # defensive; _ir_is_m3c_physics already pins this
+        return
+    harness_sid = infra[0].partition("@")[0].partition("/")[2]
+    from tools.runner_renderer import ir_content_violations
+
+    for msg in ir_content_violations(ir, spec_id.strip(), harness_sid):
+        violations.append(f"{derived_path}: {msg}")
 
 
 def _validate_infrastructure_public_api(
