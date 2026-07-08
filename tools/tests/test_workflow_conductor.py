@@ -3373,14 +3373,18 @@ class WriteRunnerTest(unittest.TestCase):
             node_key=f"component/{self.SID}@0.1.0", spec_path=f"spec/component/{self.SID}",
             ir_id="i1", pipeline_id="p1", source_id="s1", binary_id="b1")
 
-    def _write_consumer_ir(self, repo: Path, refs: wc.NodeRefs, *, infra=1) -> None:
+    def _write_consumer_ir(self, repo: Path, refs: wc.NodeRefs, *, infra=1,
+                           bare_string: bool = False) -> None:
         from tools.tests.test_runner_renderer import _boundary_ir
         import yaml as _yaml
         ir = _boundary_ir()
-        deps = [{"node_key": "infrastructure/harness_fortran_cpu@0.2.0"}] * infra
+        ids = ["harness_fortran_cpu"] * infra
         if infra == 2:
-            deps = [{"node_key": "infrastructure/harness_fortran_cpu@0.2.0"},
-                    {"node_key": "infrastructure/harness_other_cpu@0.2.0"}]
+            ids = ["harness_fortran_cpu", "harness_other_cpu"]
+        if bare_string:  # deps.yaml also permits a bare `infrastructure/<id>@ver` string
+            deps: list = [f"infrastructure/{i}@0.2.0" for i in ids]
+        else:
+            deps = [{"node_key": f"infrastructure/{i}@0.2.0"} for i in ids]
         ir["dependency"]["direct_deps"] = deps
         ir_dir = repo / refs.ir_ref
         ir_dir.mkdir(parents=True, exist_ok=True)
@@ -3424,6 +3428,19 @@ class WriteRunnerTest(unittest.TestCase):
             self.assertFalse(c._conductor_authors_runner(refs))
             # two infra deps -> not M3c
             self._write_consumer_ir(repo, refs, infra=2)
+            self.assertFalse(c._conductor_authors_runner(refs))
+
+    def test_conductor_authors_runner_bare_string_dep_parity(self) -> None:
+        # deps.yaml permits a bare-string infra dep as well as the dict form; the conductor
+        # predicate must count it identically to the gate (a divergence = host-render vs
+        # checks-gate skew = fail-open). Locks the prior HIGH parity bug's fix.
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            refs = self._refs()
+            c = self._conductor(repo)
+            self._write_consumer_ir(repo, refs, infra=1, bare_string=True)
+            self.assertTrue(c._conductor_authors_runner(refs))
+            self._write_consumer_ir(repo, refs, infra=2, bare_string=True)
             self.assertFalse(c._conductor_authors_runner(refs))
 
     def test_conductor_authors_runner_false_for_infra_node(self) -> None:

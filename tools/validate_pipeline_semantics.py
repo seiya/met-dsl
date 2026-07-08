@@ -4199,29 +4199,106 @@ def _validate_checks_source_files(
             f"{checks_path}: must declare `module {spec_id}_checks` (the fixed ABI module)")
 
     public_ids: set[str] = set()
+    private_ids: set[str] = set()
     defined_procs: set[str] = set()
-    all_public = False
+    module_default_private = False  # a bare module-level `private` flips the default
+    type_depth = 0  # a bare `private` inside a derived-type def is a component attr, not the module default
+    in_interface = False  # a subroutine/function header inside an interface block is a proto, not a def
+    proc_depth = 0  # nesting of procedure defs; only depth-0 (module-level) procs are published
+    in_target_module = False  # only defs INSIDE `module <spec_id>_checks` are its published ABI
+    target_module = f"{spec_id}_checks".lower()
+    # A subroutine/function definition header. `function` may carry a type-spec prefix; the
+    # `end <proc>` case is handled before this so the leading-token alternation can't match it.
+    proc_start = re.compile(
+        r"(?i)^\s*(?:(?:module|pure|impure|elemental|recursive|non_recursive)\s+)*"
+        r"(?:(?:integer|real|double\s+precision|complex|logical|character|type|class)\b[^!]*\s+)?"
+        r"(?:subroutine|function)\s+([A-Za-z]\w*)")
     for ln in logical:
-        m = re.match(r"(?i)^\s*public\b\s*(::)?\s*(.*)$", ln.strip())
+        s = ln.strip()
+        # Enter/leave the TARGET checks module. A `module <name>` statement (not `module
+        # subroutine/function/procedure`, which carry more tokens) opens a module; only
+        # definitions/accessibility INSIDE `module <spec_id>_checks` are importable via
+        # `use <spec_id>_checks` — procs after `end module` or in a second module are not.
+        mo = re.match(r"(?i)^\s*module\s+([A-Za-z]\w*)\s*$", s)
+        if mo:
+            in_target_module = mo.group(1).lower() == target_module
+            proc_depth, type_depth, in_interface = 0, 0, False
+            continue
+        if re.match(r"(?i)^\s*end\s*module\b", s):
+            in_target_module = False
+            proc_depth, type_depth, in_interface = 0, 0, False
+            continue
+        # An `interface` / `abstract interface` block declares procedure PROTOTYPES, not
+        # definitions — its subroutine/function headers must not count as `defined_procs`
+        # (else a module could publish an ABI name it only prototypes but never defines).
+        if not in_interface and re.match(r"(?i)^\s*(?:abstract\s+)?interface\b", s):
+            in_interface = True
+            continue
+        if in_interface:
+            if re.match(r"(?i)^\s*end\s*interface\b", s):
+                in_interface = False
+            continue
+        # Track derived-type nesting so a component-level bare `private` isn't mistaken
+        # for the module default. `type :: name` / `type name` / `type, attrs :: name`
+        # open a def; `type(...)` decls and `type is (...)` guards do not.
+        if type_depth == 0 and re.match(r"(?i)^\s*type\b", s) \
+                and not re.match(r"(?i)^\s*type\s*\(", s) \
+                and not re.match(r"(?i)^\s*type\s+is\b", s):
+            type_depth = 1
+            continue
+        if type_depth > 0:
+            if re.match(r"(?i)^\s*end\s*type\b", s):
+                type_depth = 0
+            continue
+        # `end subroutine/function/procedure` closes a proc scope. A bare `end` closes the
+        # innermost program unit: a procedure when we are inside one, else the module itself.
+        # (`end module` is handled above; construct ends `end do`/`end if`/… fall through.)
+        if re.match(r"(?i)^\s*end\s*(?:subroutine|function|procedure)\b", s):
+            if proc_depth > 0:
+                proc_depth -= 1
+            continue
+        if re.match(r"(?i)^\s*end\s*$", s):
+            if proc_depth > 0:
+                proc_depth -= 1
+            else:
+                in_target_module = False  # bare `end` at unit level closes the (target) module
+            continue
+        # A subroutine/function definition. Only a MODULE-LEVEL (depth-0) definition INSIDE the
+        # target checks module is a published entity the runner can `use ... only:`; a nested
+        # internal procedure, or one in another module / after `end module`, is not.
+        pm2 = proc_start.match(s)
+        if pm2:
+            if in_target_module and proc_depth == 0:
+                defined_procs.add(pm2.group(1).lower())
+            proc_depth += 1
+            continue
+        # `public` / `private` statements only publish/hide the target module's own entities,
+        # and only in its specification part (depth 0, not inside a procedure body).
+        if proc_depth > 0 or not in_target_module:
+            continue
+        m = re.match(r"(?i)^\s*public\b\s*(::)?\s*(.*)$", s)
         if m:
-            body = m.group(2).strip()
-            if not body:  # a bare `public` makes the module's default accessibility public
-                all_public = True
+            for tok in re.split(r"[,\s]+", m.group(2).strip()):
+                if re.fullmatch(r"[A-Za-z]\w*", tok):
+                    public_ids.add(tok.lower())
+            continue
+        pm = re.match(r"(?i)^\s*private\b\s*(::)?\s*(.*)$", s)
+        if pm:
+            body = pm.group(2).strip()
+            if not body:  # a bare module-level `private` makes the default accessibility private
+                module_default_private = True
             else:
                 for tok in re.split(r"[,\s]+", body):
                     if re.fullmatch(r"[A-Za-z]\w*", tok):
-                        public_ids.add(tok.lower())
+                        private_ids.add(tok.lower())
             continue
-        # A `subroutine <name>` / `function <name>` definition (so a bare-`public` module
-        # still has its ABL names verified: a name is published iff it is DEFINED, and a
-        # missing definition is caught even when no explicit `public ::` lists it).
-        dm = re.match(r"(?i)^\s*(?:pure\s+|elemental\s+|recursive\s+)*"
-                      r"(?:subroutine|function)\s+([A-Za-z]\w*)", ln.strip())
-        if dm:
-            defined_procs.add(dm.group(1).lower())
-    # Under an explicit-public module, a name is published iff it is in a `public ::` list;
-    # under a default-public (bare `public`) module, iff it is defined as a procedure.
-    published = (public_ids | defined_procs) if all_public else public_ids
+    # Fortran module default accessibility is PUBLIC unless a bare `private` statement flips
+    # it. Under the (default) public module, a name is published iff it is DEFINED and not
+    # explicitly `private ::`'d; under a bare-`private` module, iff it is `public ::`'d.
+    if module_default_private:
+        published = public_ids - private_ids
+    else:
+        published = (public_ids | defined_procs) - private_ids
     missing = [n for n in _CHECKS_PUBLIC_NAMES if n not in published]
     if missing:
         violations.append(

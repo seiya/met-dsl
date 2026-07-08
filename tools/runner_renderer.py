@@ -156,6 +156,14 @@ def _case_ids(ir: dict[str, Any]) -> list[str]:
             out.append(cid.strip())
     if not out:
         raise RenderError("IR case.test_case_set is empty (no cases to run)")
+    # Duplicate case_ids would render two identical `case ('id')` labels in the runner's
+    # `select case`, a hard gfortran error the leaf cannot repair (host-rendered runner).
+    # Fail closed rather than emit a non-compiling, unrepairable runner.
+    dups = sorted({c for c in out if out.count(c) > 1})
+    if dups:
+        raise RenderError(
+            f"IR case.test_case_set has duplicate case_id(s) {dups}; the runner's "
+            "select-case would emit overlapping case labels that do not compile")
     return out
 
 
@@ -175,13 +183,17 @@ def _xfail_cases(ir: dict[str, Any]) -> set[str]:
     return xfail
 
 
-def _first_target_case(ir: dict[str, Any], test_id: str) -> str | None:
+def _target_cases(ir: dict[str, Any], test_id: str) -> list[str]:
+    """All distinct case ids targeted by the predicate(s) for ``test_id``, in
+    declaration order. Used to fail-close (rather than silently record partial
+    evidence) when a metrics-basis test targets more than one case."""
+    seen: list[str] = []
     for p in _test_predicates(ir):
         if str(p.get("test_id") or "").strip() == test_id:
             for tc in p.get("target_cases") or []:
-                if isinstance(tc, str) and tc.strip():
-                    return tc.strip()
-    return None
+                if isinstance(tc, str) and tc.strip() and tc.strip() not in seen:
+                    seen.append(tc.strip())
+    return seen
 
 
 def _per_case_vars(ir: dict[str, Any], schema_vars: dict[str, str]) -> dict[str, list[str]]:
@@ -615,11 +627,21 @@ def render_runner(ir: dict[str, Any], spec_id: str, harness_spec_id: str) -> str
     a("  ! --- per-test metrics-basis entries (first target case's primary evidence) ---")
     a(f"  allocate(mb_entries({len(evidence)}))")
     for k, (tid, req_vars) in enumerate(evidence, start=1):
-        tcase = _first_target_case(ir, tid)
-        if tcase is None:
+        tcases = _target_cases(ir, tid)
+        if not tcases:
             raise RenderError(
                 f"test {tid!r} in test_evidence_requirements has no target case in "
                 "any test predicate (cannot resolve its metrics-basis source case)")
+        if len(tcases) > 1:
+            # Fail closed rather than silently record only the first case: a multi-target
+            # metrics-basis test needs EVERY targeted case's evidence, which this renderer
+            # does not yet serve (see the scope note above + CHECKS_MODULE_CONTRACT.md §2).
+            raise RenderError(
+                f"test {tid!r} targets {len(tcases)} cases {tcases} but this renderer "
+                "records per-test metrics-basis evidence from a single case only "
+                "(M3c-β single-case-per-test scope; multi-target convergence/resolution "
+                "sweeps are an R3 test-kind). Refusing to emit partial evidence.")
+        tcase = tcases[0]
         for rv in req_vars:
             if rv not in schema_vars:
                 raise RenderError(

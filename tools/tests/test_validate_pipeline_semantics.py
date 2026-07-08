@@ -12068,6 +12068,111 @@ class ChecksSourceGateTests(unittest.TestCase):
         # (only the ABI-name check is asserted here; other rules are satisfied)
         self.assertFalse(any("must publish the fixed ABI names" in v for v in self._run(ok)))
 
+    def _module_defining_all(self, extra_spec: str = "", private_stmt: str = "") -> str:
+        body = "".join(
+            f"  subroutine {n}()\n  end subroutine {n}\n"
+            for n in ("case_setup", "case_run", "get_time", "get_scalar",
+                      "get_r1", "get_r2", "get_r3", "get_r4",
+                      "checks_compute", "metric_compute"))
+        return (f"module bx_checks\n  implicit none\n{private_stmt}{extra_spec}"
+                f"contains\n{body}end module bx_checks\n")
+
+    def test_no_accessibility_statement_all_defined_passes(self) -> None:
+        # A module with NEITHER `private` NOR `public` is default-PUBLIC in Fortran; a
+        # conformant module that defines all ten ABI names must not be false-rejected.
+        ok = self._module_defining_all()
+        self.assertFalse(any("must publish the fixed ABI names" in v for v in self._run(ok)),
+                         self._run(ok))
+
+    def test_bare_private_without_public_is_caught(self) -> None:
+        # A bare module-level `private` flips the default; without an explicit `public ::`
+        # the ABI names are NOT exposed and the gate must catch it (no fail-open).
+        bad = self._module_defining_all(private_stmt="  private\n")
+        self.assertTrue(any("must publish the fixed ABI names" in v for v in self._run(bad)), bad)
+
+    def test_private_entity_excludes_name(self) -> None:
+        # Default-public module, but one ABI name is explicitly `private ::`'d → not published.
+        bad = self._module_defining_all(extra_spec="  private :: metric_compute\n")
+        v = self._run(bad)
+        self.assertTrue(any("metric_compute" in x for x in v), v)
+
+    def test_interface_prototype_is_not_a_definition(self) -> None:
+        # A default-public module that only PROTOTYPES an ABI name in an `interface` block
+        # (never defining it) must still be caught — an interface header is not a definition.
+        body = "".join(
+            f"  subroutine {n}()\n  end subroutine {n}\n"
+            for n in ("case_setup", "case_run", "get_time", "get_scalar",
+                      "get_r1", "get_r2", "get_r3", "get_r4", "checks_compute"))
+        proto = ("  abstract interface\n    subroutine metric_compute()\n"
+                 "    end subroutine metric_compute\n  end interface\n")
+        bad = f"module bx_checks\n  implicit none\n{proto}contains\n{body}end module bx_checks\n"
+        v = self._run(bad)
+        self.assertTrue(any("metric_compute" in x for x in v), v)
+
+    def test_nested_internal_procedure_is_not_a_definition(self) -> None:
+        # A default-public module that defines an ABI name ONLY as an internal procedure
+        # nested inside another procedure's `contains` must be caught — an internal
+        # procedure is not a module entity the host-rendered runner can `use ... only:`.
+        nine = "".join(
+            f"  subroutine {n}()\n  end subroutine {n}\n"
+            for n in ("case_setup", "case_run", "get_time", "get_scalar",
+                      "get_r1", "get_r2", "get_r3", "get_r4", "checks_compute"))
+        holder = ("  subroutine holder()\n  contains\n"
+                  "    subroutine metric_compute()\n    end subroutine metric_compute\n"
+                  "  end subroutine holder\n")
+        bad = f"module bx_checks\n  implicit none\ncontains\n{nine}{holder}end module bx_checks\n"
+        v = self._run(bad)
+        self.assertTrue(any("metric_compute" in x for x in v), v)
+
+    def test_abi_defined_in_second_module_is_caught(self) -> None:
+        # ABI procedures defined in a SECOND module (or after `end module <sid>_checks`) are
+        # not importable via `use <sid>_checks, only:` — only the target module's own
+        # definitions count, so an empty/partial target module must be caught.
+        ten = "".join(
+            f"  subroutine {n}()\n  end subroutine {n}\n"
+            for n in ("case_setup", "case_run", "get_time", "get_scalar",
+                      "get_r1", "get_r2", "get_r3", "get_r4",
+                      "checks_compute", "metric_compute"))
+        bad = (f"module bx_checks\n  implicit none\nend module bx_checks\n"
+               f"module other\n  implicit none\ncontains\n{ten}end module other\n")
+        self.assertTrue(any("must publish the fixed ABI names" in v for v in self._run(bad)), bad)
+
+    def test_target_module_second_in_file_passes(self) -> None:
+        # The target checks module need not be the first module in the file; its own
+        # module-level definitions still count wherever it appears.
+        ten = "".join(
+            f"  subroutine {n}()\n  end subroutine {n}\n"
+            for n in ("case_setup", "case_run", "get_time", "get_scalar",
+                      "get_r1", "get_r2", "get_r3", "get_r4",
+                      "checks_compute", "metric_compute"))
+        ok = ("module other\n  implicit none\ncontains\n"
+              "  subroutine junk()\n  end subroutine junk\nend module other\n"
+              f"module bx_checks\n  implicit none\ncontains\n{ten}end module bx_checks\n")
+        self.assertFalse(any("must publish the fixed ABI names" in v for v in self._run(ok)),
+                         self._run(ok))
+
+    def test_module_level_proc_with_nested_helper_passes(self) -> None:
+        # Nesting alone must not cause a false-reject: all ten ABI names ARE module-level;
+        # one of them additionally carries an internal helper.
+        ten = "".join(
+            f"  subroutine {n}()\n  end subroutine {n}\n"
+            for n in ("case_setup", "case_run", "get_time", "get_scalar",
+                      "get_r1", "get_r2", "get_r3", "get_r4",
+                      "checks_compute", "metric_compute"))
+        extra = ("  subroutine another()\n  contains\n    subroutine inner()\n"
+                 "    end subroutine inner\n  end subroutine another\n")
+        ok = f"module bx_checks\n  implicit none\ncontains\n{ten}{extra}end module bx_checks\n"
+        self.assertFalse(any("must publish the fixed ABI names" in v for v in self._run(ok)),
+                         self._run(ok))
+
+    def test_private_component_type_does_not_flip_module_default(self) -> None:
+        # A bare `private` INSIDE a derived-type def is a component attribute, not the
+        # module default — it must not turn a default-public module into a false-reject.
+        type_def = ("  type :: box\n    private\n    real :: x\n  end type box\n")
+        ok = self._module_defining_all(extra_spec=type_def)
+        self.assertFalse(any("must publish the fixed ABI names" in v for v in self._run(ok)),
+                         self._run(ok))
+
     def test_model_uses_harness_forbidden(self) -> None:
         bad_model = "module bx_model\nuse harness_fortran_cpu_model\nend module bx_model\n"
         self.assertTrue(any("must not `use` the harness" in v

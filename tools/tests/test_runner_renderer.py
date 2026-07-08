@@ -122,6 +122,159 @@ def _metrics_ir() -> dict:
     }
 
 
+RANK_SID = "prob_rank"
+
+
+def _rank34_metrics_ir() -> dict:
+    """A problem IR exercising the rank-3 + rank-4 emitter/getter paths AND the
+    metrics path together — the code families the boundary IR never compiles."""
+    return {
+        "meta": {"spec_id": RANK_SID, "spec_kind": "problem"},
+        "case": {"test_case_set": [{"case_id": "c0"}]},
+        "impl_defaults": {
+            "target": {"class": "cpu", "backend": "openmp"},
+            "backend_overrides": {"openmp": {"num_threads": 2}},
+        },
+        "io_contract": {
+            "raw_requirements": {"required_evidence": [
+                {"artifact": "state_snapshots", "schema": {
+                    "variables": [
+                        {"name": "a3", "shape_expr": "[2, 2, 2]"},
+                        {"name": "a4", "shape_expr": "[2, 2, 2, 2]"},
+                        {"name": "s", "shape_expr": "scalar"},
+                    ],
+                    "time_variable": "t",
+                }},
+            ]},
+            "test_evidence_requirements": [
+                {"test_id": "c0", "required_raw_variables": ["a3", "a4", "s"]},
+            ],
+            "diagnostics_contract": {
+                "checks": [{"id": "c1"}],
+                "metrics": ["m.one", "m.two"],
+                "verdict": {"fields": ["overall", "failed_checks"]},
+            },
+            "test_predicates": [
+                {"test_id": "c0", "expected_outcome": "pass", "target_cases": ["c0"]},
+            ],
+        },
+        "dependency": {"node_key": f"problem/{RANK_SID}@0.1.0",
+                       "direct_deps": [{"node_key": "infrastructure/harness_fortran_cpu@0.2.0"}]},
+    }
+
+
+# A checks stub matching _rank34_metrics_ir: rank-3 + rank-4 + scalar getters with real
+# data, one check, two metrics — enough to compile+link+run against the harness stub.
+_RANK_CHECKS_STUB = textwrap.dedent(f"""\
+    module {RANK_SID}_checks
+      use, intrinsic :: iso_fortran_env, only: real64
+      ! allow(C003)
+      implicit none
+      private
+      integer, parameter :: dp = real64
+      real(dp) :: a3(2, 2, 2) = 0.0_dp
+      real(dp) :: a4(2, 2, 2, 2) = 0.0_dp
+      real(dp) :: s = 0.0_dp
+      public :: case_setup, case_run, get_time
+      public :: get_scalar, get_r1, get_r2, get_r3, get_r4
+      public :: checks_compute, metric_compute
+    contains
+      subroutine case_setup(case_id, ok)
+        character(len=*), intent(in) :: case_id
+        logical, intent(out) :: ok
+        a3 = 1.0_dp
+        a4 = 2.0_dp
+        s = 3.0_dp
+        ok = len_trim(case_id) > 0
+      end subroutine case_setup
+      subroutine case_run(case_id, steps, cells_updated, ok)
+        character(len=*), intent(in) :: case_id
+        integer, intent(out) :: steps, cells_updated
+        logical, intent(out) :: ok
+        steps = 1
+        cells_updated = 8
+        ok = len_trim(case_id) > 0
+      end subroutine case_run
+      subroutine get_time(t)
+        real(dp), intent(out) :: t
+        t = 0.0_dp
+      end subroutine get_time
+      subroutine get_scalar(name, val, found)
+        character(len=*), intent(in) :: name
+        real(dp), intent(out) :: val
+        logical, intent(out) :: found
+        found = trim(name) == 's'
+        val = s
+      end subroutine get_scalar
+      subroutine get_r1(name, arr, found)
+        character(len=*), intent(in) :: name
+        real(dp), allocatable, intent(out) :: arr(:)
+        logical, intent(out) :: found
+        allocate(arr(1))
+        arr = 0.0_dp
+        found = .false.
+        if (len_trim(name) < 0) continue
+      end subroutine get_r1
+      subroutine get_r2(name, arr, found)
+        character(len=*), intent(in) :: name
+        real(dp), allocatable, intent(out) :: arr(:,:)
+        logical, intent(out) :: found
+        allocate(arr(1, 1))
+        arr = 0.0_dp
+        found = .false.
+        if (len_trim(name) < 0) continue
+      end subroutine get_r2
+      subroutine get_r3(name, arr, found)
+        character(len=*), intent(in) :: name
+        real(dp), allocatable, intent(out) :: arr(:,:,:)
+        logical, intent(out) :: found
+        found = trim(name) == 'a3'
+        allocate(arr(2, 2, 2))
+        arr = a3
+      end subroutine get_r3
+      subroutine get_r4(name, arr, found)
+        character(len=*), intent(in) :: name
+        real(dp), allocatable, intent(out) :: arr(:,:,:,:)
+        logical, intent(out) :: found
+        found = trim(name) == 'a4'
+        allocate(arr(2, 2, 2, 2))
+        arr = a4
+      end subroutine get_r4
+      subroutine checks_compute(case_id, ncheck, check_ids, status)
+        character(len=*), intent(in) :: case_id
+        integer, intent(out) :: ncheck
+        character(len=32), intent(out) :: check_ids(:)
+        character(len=4), intent(out) :: status(:)
+        ncheck = 1
+        check_ids(1) = 'c1'
+        status(1) = 'pass'
+        if (len_trim(case_id) < 0) continue
+      end subroutine checks_compute
+      subroutine metric_compute(case_id, name, val, is_na, reason_na, found)
+        character(len=*), intent(in) :: case_id
+        character(len=*), intent(in) :: name
+        real(dp), intent(out) :: val
+        logical, intent(out) :: is_na
+        character(len=:), allocatable, intent(out) :: reason_na
+        logical, intent(out) :: found
+        is_na = .false.
+        reason_na = ''
+        found = .true.
+        select case (trim(name))
+        case ('m.one')
+          val = 1.5_dp
+        case ('m.two')
+          val = 2.5_dp
+        case default
+          val = 0.0_dp
+          found = .false.
+        end select
+        if (len_trim(case_id) < 0) continue
+      end subroutine metric_compute
+    end module {RANK_SID}_checks
+    """)
+
+
 def _harness_signatures() -> list[dict]:
     """The certified harness IR public_api.signatures, synthesized from §5.1."""
     ops, types, errs = _parse_interface_stanzas(_HARNESS_V2_INTERFACE)
@@ -587,6 +740,19 @@ class RenderErrorMatrixTest(unittest.TestCase):
         self._expect(lambda ir: ir["io_contract"]["test_evidence_requirements"][0]
                      ["required_raw_variables"].append("ghost_field_typo"))
 
+    def test_duplicate_case_id_fails_closed(self) -> None:
+        # Two entries with the same case_id would emit overlapping `case ('id')` labels in
+        # the runner's select-case — a hard gfortran error the leaf cannot repair. Fail closed.
+        self._expect(lambda ir: ir["case"]["test_case_set"].append(
+            {"case_id": "l0_periodic_x_wrap_pass"}))
+
+    def test_multi_target_metrics_test_fails_closed(self) -> None:
+        # A metrics-basis test whose predicate targets >1 case cannot be faithfully
+        # rendered (only the first case's evidence would be recorded); fail closed rather
+        # than silently emit partial evidence (M3c-β single-case-per-test scope).
+        self._expect(lambda ir: ir["io_contract"]["test_predicates"][0].__setitem__(
+            "target_cases", ["l0_periodic_x_wrap_pass", "l0_periodic_y_wrap_pass"]))
+
     def test_non_t_time_variable(self) -> None:
         # The harness writes the snapshot time under the fixed key 't'; a different
         # time_variable cannot be honored, so fail closed.
@@ -720,6 +886,37 @@ class HarnessPinTest(unittest.TestCase):
         with self.assertRaises(RenderError):
             assert_harness_pin(self.ir, BOUNDARY_SID, HARNESS, pruned, self.src)
 
+    def test_empty_signatures_fail_closed(self) -> None:
+        # An uncertified / absent harness IR (empty or None public_api.signatures) must
+        # NOT false-pass the pin — the whole safety net rests on this.
+        with self.assertRaises(RenderError):
+            assert_harness_pin(self.ir, BOUNDARY_SID, HARNESS, [], self.src)
+        with self.assertRaises(RenderError):
+            assert_harness_pin(self.ir, BOUNDARY_SID, HARNESS, None, self.src)
+
+    def test_empty_source_fail_closed(self) -> None:
+        with self.assertRaises(RenderError):
+            assert_harness_pin(self.ir, BOUNDARY_SID, HARNESS, self.sigs, "")
+
+    def test_signature_entry_without_interface_fail_closed(self) -> None:
+        junk = [{"symbol": e["symbol"]} for e in self.sigs]  # symbol present, interface dropped
+        with self.assertRaises(RenderError):
+            assert_harness_pin(self.ir, BOUNDARY_SID, HARNESS, junk, self.src)
+
+    def test_type_component_reorder_drift(self) -> None:
+        # Derived-type components are compared as an ORDERED list (component layout is ABI);
+        # reordering two components of h_case_result must be caught as drift.
+        bad = [dict(e) for e in self.sigs]
+        for e in bad:
+            if e["symbol"].endswith("__h_case_result"):
+                lines = e["interface"].split("\n")
+                cid = next(i for i, ln in enumerate(lines) if ":: case_id" in ln)
+                xf = next(i for i, ln in enumerate(lines) if ":: expected_xfail" in ln)
+                lines[cid], lines[xf] = lines[xf], lines[cid]
+                e["interface"] = "\n".join(lines)
+        with self.assertRaises(RenderError):
+            assert_harness_pin(self.ir, BOUNDARY_SID, HARNESS, bad, self.src)
+
 
 @unittest.skipUnless(_HAVE_GFORTRAN, "gfortran not available")
 class GfortranSmokeTest(unittest.TestCase):
@@ -761,6 +958,46 @@ class GfortranSmokeTest(unittest.TestCase):
             self.assertTrue((d / "raw" / "metrics_basis.json").is_file())
             diag = (d / "diagnostics.json").read_text()
             self.assertIn("input_guard", diag)
+
+    def test_metrics_and_high_rank_runner_compiles_and_runs(self) -> None:
+        # The boundary smoke only covers the no-metrics, scalar+rank-2 family. This one
+        # compiles+links+runs the metrics path AND the rank-3/rank-4 emitter/getter path,
+        # so a future edit that makes either produce invalid Fortran cannot ship green.
+        runner = render_runner(_rank34_metrics_ir(), RANK_SID, HARNESS)
+        with tempfile.TemporaryDirectory() as td:
+            d = Path(td)
+            (d / "harness_fortran_cpu_model.f90").write_text(_HARNESS_STUB)
+            (d / f"{RANK_SID}_checks.f90").write_text(_RANK_CHECKS_STUB)
+            (d / f"{RANK_SID}_runner.f90").write_text(runner)
+
+            def fc(*srcs: str) -> None:
+                r = subprocess.run(
+                    ["gfortran", "-std=f2008", "-c", *srcs],
+                    cwd=d, capture_output=True, text=True)
+                self.assertEqual(r.returncode, 0, r.stderr)
+
+            fc("harness_fortran_cpu_model.f90")
+            fc(f"{RANK_SID}_checks.f90")
+            fc(f"{RANK_SID}_runner.f90")
+            link = subprocess.run(
+                ["gfortran", "harness_fortran_cpu_model.o",
+                 f"{RANK_SID}_checks.o", f"{RANK_SID}_runner.o", "-o", "runner"],
+                cwd=d, capture_output=True, text=True)
+            self.assertEqual(link.returncode, 0, link.stderr)
+
+            (d / "raw" / "state_snapshots").mkdir(parents=True)
+            run = subprocess.run(
+                ["./runner", "--cases", "spec.ir.yaml", "c0"],
+                cwd=d, capture_output=True, text=True)
+            self.assertEqual(run.returncode, 0, run.stderr)
+            self.assertTrue((d / "raw" / "state_snapshots" / "c0.json").is_file())
+            self.assertTrue((d / "raw" / "metrics_basis.json").is_file())
+            self.assertTrue((d / "diagnostics.json").is_file())
+            self.assertTrue((d / "perf.json").is_file())
+            # the rank-3/rank-4 snapshot values were emitted as nested JSON arrays
+            snap = (d / "raw" / "state_snapshots" / "c0.json").read_text()
+            self.assertIn("\"a3\"", snap)
+            self.assertIn("\"a4\"", snap)
 
 
 if __name__ == "__main__":
