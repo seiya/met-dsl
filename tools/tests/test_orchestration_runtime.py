@@ -73,6 +73,11 @@ from tools.orchestration_runtime import (
     _build_step_agents_missing_step_result,
     _load_invalid_run_records,
     _derive_unauthorized_write_resume_directive,
+    _derive_dev_validate_execute_resume_directive,
+    DEV_VALIDATE_EXECUTE_RESUME_SOURCE,
+    _DEV_VALIDATE_EXECUTE_REUSE_CATEGORIES,
+    _DEV_VALIDATE_EXECUTE_REASON_PREFIX,
+    _DEV_RESUME_FINDINGS_MAX_CHARS,
     _node_key_to_safe,
     _validate_orchestration_completion_for_pass,
     reserve_phase_root,
@@ -26470,6 +26475,223 @@ class ReopenPhaseTest(unittest.TestCase):
             ns = json.loads((root / "phase_state.json").read_text(encoding="utf-8"))["node_states"][arids["node_safe"]]
             self.assertEqual(ns["compile"], "not_started")
             self.assertIn(arids["v_judge"], _load_superseded_run_ids(repo_root, oid))
+
+
+class DevValidateExecuteResumeDirectiveTest(unittest.TestCase):
+    """B2: a dev `--resume` after F1 fail_closed a structural validate.execute failure
+    derives a directive that reopens Generate and carries the gate's violation text."""
+
+    NODE_KEY = "component/foo@0.1.0"
+    EXEC_ARID = "validate-exec-fail-1"
+    EXCERPT = ("[execute fail]\npost_execute: metrics_basis entry 'l0_case' is missing "
+               "required_raw_variables {'a1'}")
+
+    def _seed(self, repo_root: Path, oid: str, *, status: str = "fail",
+              write_trial_meta: bool = True, write_request: bool = True) -> Path:
+        """An orchestration whose only failed run is a structural validate.execute substep."""
+        root = repo_root / "workspace" / "orchestrations" / oid
+        (root / "launches").mkdir(parents=True, exist_ok=True)
+        rundir = f"workspace/pipelines/{oid}/runs/run_1"
+        rows = [
+            {"agent_run_id": "generate-sub-1", "agent_role": "substep", "step": "generate",
+             "substep": "generate", "status": "pass", "node_key": self.NODE_KEY},
+            {"agent_run_id": self.EXEC_ARID, "agent_role": "substep", "step": "validate",
+             "substep": "execute", "status": status, "node_key": self.NODE_KEY},
+        ]
+        with (root / "agent_runs.jsonl").open("a", encoding="utf-8") as f:
+            for row in rows:
+                f.write(json.dumps(row) + "\n")
+        (root / "failure_analysis.json").write_text(
+            json.dumps({"orchestration_id": oid, "status": "fail",
+                        "failed_agent_run": rows[-1]}),
+            encoding="utf-8",
+        )
+        if write_request:
+            (root / "launches" / f"{self.EXEC_ARID}.request.json").write_text(
+                json.dumps({"agent_run_id": self.EXEC_ARID, "step": "validate",
+                            "substep": "execute", "deterministic": True,
+                            "allowed_output_paths": [f"{rundir}/diagnostics.json",
+                                                     f"{rundir}/trial_meta.json"]}),
+                encoding="utf-8",
+            )
+        if write_trial_meta:
+            trial = repo_root / rundir / "trial_meta.json"
+            trial.parent.mkdir(parents=True, exist_ok=True)
+            trial.write_text(
+                json.dumps({"run_id": "run_1", "node_key": self.NODE_KEY, "status": "fail",
+                            "failure_category": "post_execute_violation",
+                            "failure_excerpt": self.EXCERPT}),
+                encoding="utf-8",
+            )
+        return root
+
+    def test_directive_reopens_generate_with_trial_meta_findings(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            oid = "orch_dev_exec_directive"
+            init_orchestration(repo_root=repo_root, orchestration_id=oid)
+            self._seed(repo_root, oid)
+
+            directive = _derive_dev_validate_execute_resume_directive(
+                repo_root, oid, "dev_phase_rollback", "validate_execute_post_execute_violation")
+
+            self.assertEqual(directive["reopen_from"], "generate")
+            self.assertEqual(directive["node_key"], self.NODE_KEY)
+            self.assertEqual(directive["trigger_agent_run_id"], self.EXEC_ARID)
+            self.assertEqual(directive["failure_category"], "post_execute_violation")
+            self.assertEqual(directive["source"], DEV_VALIDATE_EXECUTE_RESUME_SOURCE)
+            self.assertEqual(directive["repair_findings"], self.EXCERPT)
+
+    def test_directive_gated_on_reason_code_and_category(self) -> None:
+        """Only `dev_phase_rollback` + a reuse-routed category fires. The cold-restart
+        `validate_execute_fail` (runner runtime error) and the per-test predicate reasons
+        share the prefix and must keep the plain resume."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            oid = "orch_dev_exec_gate"
+            init_orchestration(repo_root=repo_root, orchestration_id=oid)
+            self._seed(repo_root, oid)
+            for reason_code, detail in (
+                ("retry_budget_exhausted", "validate_execute_post_execute_violation"),
+                (None, "validate_execute_post_execute_violation"),
+                ("dev_phase_rollback", "validate_execute_fail"),
+                # the C2 backstop's Compile reopen — reopening Generate would be wrong
+                ("dev_phase_rollback", "validate_execute_fail_ir"),
+                ("dev_phase_rollback", "validate_execute_physics_fail"),
+                ("dev_phase_rollback", "validate_execute_structural_violation"),
+                ("dev_phase_rollback", "generate->compile"),
+                ("dev_phase_rollback", None),
+            ):
+                self.assertIsNone(
+                    _derive_dev_validate_execute_resume_directive(
+                        repo_root, oid, reason_code, detail),
+                    f"{reason_code!r}/{detail!r} must not emit a directive")
+            # The reuse-routed categories all fire.
+            for category in ("post_execute_violation", "snapshot_deliverable_gap",
+                             "quality_check_mismatch"):
+                self.assertIsNotNone(_derive_dev_validate_execute_resume_directive(
+                    repo_root, oid, "dev_phase_rollback", f"validate_execute_{category}"))
+
+    def test_directive_requires_a_failed_execute_run(self) -> None:
+        """A passing execute run (a stale failure_analysis) is never a reopen trigger."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            oid = "orch_dev_exec_pass"
+            init_orchestration(repo_root=repo_root, orchestration_id=oid)
+            self._seed(repo_root, oid, status="pass")
+            self.assertIsNone(_derive_dev_validate_execute_resume_directive(
+                repo_root, oid, "dev_phase_rollback", "validate_execute_post_execute_violation"))
+
+    def test_directive_rejects_a_superseded_trigger(self) -> None:
+        """A trigger a prior reopen already consumed makes `reopen_phase` a noop, which would
+        leave Generate checkpointed and silently drop the repair. Emit no directive instead."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            oid = "orch_dev_exec_superseded"
+            init_orchestration(repo_root=repo_root, orchestration_id=oid)
+            root = self._seed(repo_root, oid)
+            (root / "reopen").mkdir(exist_ok=True)
+            (root / "reopen" / "superseded_runs.json").write_text(
+                json.dumps({"orchestration_id": oid,
+                            "superseded_agent_run_ids": [self.EXEC_ARID]}),
+                encoding="utf-8")
+            self.assertIsNone(_derive_dev_validate_execute_resume_directive(
+                repo_root, oid, "dev_phase_rollback", "validate_execute_post_execute_violation"))
+
+    def test_directive_falls_back_to_step_result_and_stderr_log(self) -> None:
+        """No failure_analysis -> the newest non-pass validate step_result names the trigger;
+        no readable trial_meta -> the `[execute fail]` block of the substep's stderr log."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            oid = "orch_dev_exec_fallback"
+            init_orchestration(repo_root=repo_root, orchestration_id=oid)
+            root = self._seed(repo_root, oid, write_trial_meta=False)
+            (root / "failure_analysis.json").unlink()
+            sr = root / "steps" / _node_key_to_safe(self.NODE_KEY) / "validate" / "exec-1"
+            sr.mkdir(parents=True, exist_ok=True)
+            (sr / "step_result.json").write_text(
+                json.dumps({"status": "fail", "failed_substeps": [self.EXEC_ARID]}),
+                encoding="utf-8")
+            dialogs = root / "agents" / self.EXEC_ARID / "dialogs"
+            dialogs.mkdir(parents=True, exist_ok=True)
+            (dialogs / "deterministic.stderr.log").write_text(
+                "runner stdout noise\n" + self.EXCERPT + "\n", encoding="utf-8")
+
+            directive = _derive_dev_validate_execute_resume_directive(
+                repo_root, oid, "dev_phase_rollback", "validate_execute_post_execute_violation")
+            self.assertEqual(directive["trigger_agent_run_id"], self.EXEC_ARID)
+            self.assertEqual(directive["repair_findings"], self.EXCERPT)
+
+    def test_directive_without_findings_when_no_evidence_survives(self) -> None:
+        """The directive still reopens Generate when neither trial_meta nor the stderr log
+        is readable — only the findings are lost (the repair degrades to a full prompt)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            oid = "orch_dev_exec_nofindings"
+            init_orchestration(repo_root=repo_root, orchestration_id=oid)
+            self._seed(repo_root, oid, write_trial_meta=False, write_request=False)
+            directive = _derive_dev_validate_execute_resume_directive(
+                repo_root, oid, "dev_phase_rollback", "validate_execute_post_execute_violation")
+            self.assertEqual(directive["trigger_agent_run_id"], self.EXEC_ARID)
+            self.assertNotIn("repair_findings", directive)
+
+    def test_findings_are_bounded(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            oid = "orch_dev_exec_bounded"
+            init_orchestration(repo_root=repo_root, orchestration_id=oid)
+            root = self._seed(repo_root, oid, write_trial_meta=False)
+            dialogs = root / "agents" / self.EXEC_ARID / "dialogs"
+            dialogs.mkdir(parents=True, exist_ok=True)
+            (dialogs / "deterministic.stderr.log").write_text(
+                "[execute fail]\n" + ("x" * 9000), encoding="utf-8")
+            directive = _derive_dev_validate_execute_resume_directive(
+                repo_root, oid, "dev_phase_rollback", "validate_execute_snapshot_deliverable_gap")
+            self.assertEqual(len(directive["repair_findings"]), 4000)
+
+    def test_resume_sets_and_drops_the_directive(self) -> None:
+        """cmd_init's terminal_reset chain records the directive on the matching dev
+        fail_closed and drops a stale one on any other resume."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            oid = "orch_dev_exec_resume"
+            init_orchestration(repo_root=repo_root, orchestration_id=oid)
+            root = self._seed(repo_root, oid)
+            meta_path = root / "orchestration_meta.json"
+
+            update_orchestration_status(
+                repo_root=repo_root, orchestration_id=oid, status="fail_closed",
+                reason_code="dev_phase_rollback",
+                reason_detail="validate_execute_post_execute_violation")
+            enable_checkpoint_resume(repo_root, oid)
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            directive = meta["resume_directive"]
+            self.assertEqual(directive["source"], DEV_VALIDATE_EXECUTE_RESUME_SOURCE)
+            self.assertEqual(directive["trigger_agent_run_id"], self.EXEC_ARID)
+            self.assertEqual(directive["repair_findings"], self.EXCERPT)
+            self.assertEqual(meta["resumed_from_reason_detail"],
+                             "validate_execute_post_execute_violation")
+
+            # A later, unrelated terminal failure drops the stale directive.
+            update_orchestration_status(
+                repo_root=repo_root, orchestration_id=oid, status="fail",
+                reason_code="validate_fail", reason_detail="something else")
+            enable_checkpoint_resume(repo_root, oid)
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            self.assertNotIn("resume_directive", meta)
+
+    def test_reuse_category_parity_with_conductor_routing_table(self) -> None:
+        """The literal category set here mirrors the conductor's routing table (the
+        conductor imports this module, so the constant cannot be shared the other way)."""
+        import tools.workflow_conductor as wc
+
+        self.assertEqual(
+            set(_DEV_VALIDATE_EXECUTE_REUSE_CATEGORIES),
+            {c for c, (target, strategy) in wc.VALIDATE_EXECUTE_FAILURE_ROUTING.items()
+             if (target, strategy) == ("generate", "reuse")},
+        )
+        self.assertEqual(_DEV_VALIDATE_EXECUTE_REASON_PREFIX, wc.VALIDATE_EXECUTE_REASON_PREFIX)
+        self.assertEqual(_DEV_RESUME_FINDINGS_MAX_CHARS, wc._EXECUTE_EXCERPT_MAX_CHARS)
 
 
 class CompletionValidatorSupersededTest(unittest.TestCase):

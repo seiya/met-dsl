@@ -10880,6 +10880,213 @@ def _derive_unauthorized_write_resume_directive(
     }
 
 
+# --- dev `--resume` after a structural validate.execute failure ----------------
+#
+# In dev, a structural validate.execute failure routes to ("generate", "reuse") (B1), which is a
+# cross-phase backward rollback — F1 fail_closes it as `dev_phase_rollback` on the first
+# occurrence rather than auto-retrying. The operator's `--resume` then re-runs only Validate
+# against the SAME binary and reproduces the failure deterministically (the deadlock this
+# directive exists to break). The three literals below mirror
+# `workflow_conductor.VALIDATE_EXECUTE_FAILURE_ROUTING` / `VALIDATE_EXECUTE_REASON_PREFIX`; the
+# conductor imports this module, so the dependency cannot be inverted — a parity test pins the
+# copies together (the same cross-module-literal convention as SLIM_REPAIR_FINDINGS_HEADER).
+_DEV_VALIDATE_EXECUTE_REASON_PREFIX = "validate_execute_"
+_DEV_VALIDATE_EXECUTE_REUSE_CATEGORIES: frozenset[str] = frozenset(
+    {"post_execute_violation", "snapshot_deliverable_gap", "quality_check_mismatch"}
+)
+# `source` marker of the directive below; the conductor's `_consume_resume_directive` keys on it.
+DEV_VALIDATE_EXECUTE_RESUME_SOURCE = "dev_validate_execute_structural"
+# Bound on the findings text rendered into the resumed repair prompt (matches the conductor's
+# own `_EXECUTE_EXCERPT_MAX_CHARS`; applied again here because the stderr-log fallback below
+# reads a source the conductor never bounded).
+_DEV_RESUME_FINDINGS_MAX_CHARS = 4000
+_EXECUTE_FAIL_MARKER = "[execute fail]"
+
+
+def _dev_execute_failure_arid(
+    repo_root: Path,
+    root: Path,
+    runs: dict[str, dict[str, Any]],
+    superseded: set[str],
+) -> tuple[str, dict[str, Any]] | None:
+    """The failed `validate.execute` substep run of the prior dev attempt, or None.
+
+    Primary source is `failure_analysis.json#failed_agent_run` (the host writes it on every
+    dev failure). Fallback is the last non-pass `steps/*/validate/*/step_result.json`'s final
+    `failed_substeps` entry — needed when the analysis is missing/stale (e.g. a re-collect
+    wrote a different run's record). Either way the candidate is re-validated against
+    `agent_runs.jsonl`, which is what supplies the authoritative node_key and is the same
+    record `reopen_phase` will check as a trigger.
+
+    An already-superseded arid (consumed by a prior reopen) is rejected: `reopen_phase` would
+    return `noop` for it, so a directive naming it would reopen nothing while claiming to —
+    the conductor would skip the still-checkpointed Generate and the repair would be silently
+    dropped. Better to emit no directive and let the plain resume run (same rationale as
+    `_derive_unauthorized_write_resume_directive`'s superseded-candidate exclusion)."""
+
+    def _accept(arid: object) -> tuple[str, dict[str, Any]] | None:
+        if not (isinstance(arid, str) and arid.strip()):
+            return None
+        if arid.strip() in superseded:
+            return None
+        rec = runs.get(arid.strip())
+        if not isinstance(rec, dict):
+            return None
+        if str(rec.get("agent_role") or "").strip().lower() != "substep":
+            return None
+        if str(rec.get("step") or "").strip().lower() != "validate":
+            return None
+        if str(rec.get("substep") or "").strip().lower() != "execute":
+            return None
+        status = str(rec.get("status") or "").strip().lower()
+        if status not in TERMINAL_STATUSES or status == "pass":
+            return None
+        if not str(rec.get("node_key") or "").strip():
+            return None
+        return arid.strip(), rec
+
+    fa_path = root / "failure_analysis.json"
+    if fa_path.exists():
+        try:
+            fa = _read_json(fa_path)
+        except (OSError, json.JSONDecodeError):
+            fa = None
+        if isinstance(fa, dict) and isinstance(fa.get("failed_agent_run"), dict):
+            accepted = _accept(fa["failed_agent_run"].get("agent_run_id"))
+            if accepted is not None:
+                return accepted
+
+    # Fallback: the newest non-pass validate step_result names its failed substeps.
+    candidates = sorted(
+        root.glob("steps/*/validate/*/step_result.json"),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )
+    for path in candidates:
+        try:
+            sr = _read_json(path)
+        except (OSError, json.JSONDecodeError):
+            continue
+        if not isinstance(sr, dict):
+            continue
+        if str(sr.get("status") or "").strip().lower() == "pass":
+            continue
+        failed = sr.get("failed_substeps")
+        if not isinstance(failed, list) or not failed:
+            continue
+        accepted = _accept(failed[-1])
+        if accepted is not None:
+            return accepted
+    return None
+
+
+def _dev_execute_failure_findings(repo_root: Path, root: Path, arid: str) -> str | None:
+    """The failing gate's own violation text for the failed execute run `arid`.
+
+    Canonical source is `trial_meta.json#failure_excerpt` (authored by `_execute_inproc` for
+    exactly the structural categories this directive gates on). Its path is not derivable from
+    the orchestration root alone — the run node dir lives under `workspace/pipelines/` — so it is
+    recovered from the run's own `launches/<arid>.request.json#allowed_output_paths`, which is
+    where the conductor declared it. Fallback is the `[execute fail]` block the conductor
+    persisted to the substep's `deterministic.stderr.log` (the same text, unbounded), used when
+    the run node dir was rotated away or the request is unreadable. None when neither survives —
+    the resumed repair then falls back to the full prompt, as an expired session already would."""
+    excerpt: str | None = None
+    try:
+        request = _read_json(root / "launches" / f"{arid}.request.json")
+    except (OSError, json.JSONDecodeError):
+        request = None
+    if isinstance(request, dict):
+        outs = request.get("allowed_output_paths")
+        trial_ref = next(
+            (
+                p
+                for p in (outs if isinstance(outs, list) else [])
+                if isinstance(p, str) and p.endswith("/trial_meta.json")
+            ),
+            None,
+        )
+        if trial_ref:
+            try:
+                trial = _read_json(repo_root / trial_ref)
+            except (OSError, json.JSONDecodeError):
+                trial = None
+            if isinstance(trial, dict) and str(trial.get("status") or "").strip() == "fail":
+                value = trial.get("failure_excerpt")
+                if isinstance(value, str) and value.strip():
+                    excerpt = value.strip()
+
+    if excerpt is None:
+        log_path = root / "agents" / arid / "dialogs" / "deterministic.stderr.log"
+        try:
+            text = log_path.read_text(encoding="utf-8")
+        except OSError:
+            return None
+        marker = text.rfind(_EXECUTE_FAIL_MARKER)
+        if marker < 0:
+            return None
+        excerpt = text[marker:].strip()
+        if not excerpt:
+            return None
+
+    if len(excerpt) > _DEV_RESUME_FINDINGS_MAX_CHARS:
+        excerpt = excerpt[-_DEV_RESUME_FINDINGS_MAX_CHARS:]
+    return excerpt
+
+
+def _derive_dev_validate_execute_resume_directive(
+    repo_root: Path,
+    orchestration_id: str,
+    reason_code: str | None,
+    reason_detail: str | None,
+) -> dict[str, Any] | None:
+    """Build a `resume_directive` when a dev run fail_closed on the F1 guard because a
+    STRUCTURAL validate.execute failure routed back to Generate.
+
+    Without it, `--resume` skips the checkpointed Compile/Generate/Build phases and re-runs
+    Validate against the identical binary, so the deterministic gate fails identically — a
+    deadlock. The directive records the parameters `Conductor._consume_resume_directive` feeds
+    to `reopen_phase` (reopen Generate, triggered by the failed execute run) plus the gate's own
+    violation text, so the resumed Generate producer is warm-resumed with the findings that
+    prod's B1 retry would have carried. F1 itself is unchanged: an in-run automatic rollback
+    still fail_closes; this fires only on an operator `--resume`.
+
+    Nothing new is persisted — the directive is a cache derived from `failure_analysis.json`,
+    `agent_runs.jsonl`, the launch request and `trial_meta.json`. Returns None (plain resume)
+    whenever the reason does not name a reuse-routed category or the evidence is incomplete."""
+    if not isinstance(reason_code, str) or reason_code.strip() != "dev_phase_rollback":
+        return None
+    detail = reason_detail.strip() if isinstance(reason_detail, str) else ""
+    if not detail.startswith(_DEV_VALIDATE_EXECUTE_REASON_PREFIX):
+        return None
+    # Match on the CATEGORY suffix, never the prefix alone: the cold-restart
+    # `validate_execute_fail` (a runner runtime error) and the per-test predicate reasons
+    # (`validate_execute_physics_fail`) share it and must keep the plain resume.
+    category = detail[len(_DEV_VALIDATE_EXECUTE_REASON_PREFIX):]
+    if category not in _DEV_VALIDATE_EXECUTE_REUSE_CATEGORIES:
+        return None
+
+    root = _orchestration_root(repo_root, orchestration_id)
+    found = _dev_execute_failure_arid(
+        repo_root, root, _load_run_records(root),
+        _load_superseded_run_ids(repo_root, orchestration_id))
+    if found is None:
+        return None
+    trigger_arid, rec = found
+    directive: dict[str, Any] = {
+        "reopen_from": "generate",
+        "node_key": str(rec.get("node_key")).strip(),
+        "trigger_agent_run_id": trigger_arid,
+        "reason_code": reason_code.strip(),
+        "failure_category": category,
+        "source": DEV_VALIDATE_EXECUTE_RESUME_SOURCE,
+    }
+    findings = _dev_execute_failure_findings(repo_root, root, trigger_arid)
+    if findings:
+        directive["repair_findings"] = findings
+    return directive
+
+
 def enable_checkpoint_resume(
     repo_root: Path,
     orchestration_id: str,
@@ -10965,6 +11172,9 @@ def enable_checkpoint_resume(
         # forward transition from `running` rather than a rejected terminal-to-terminal one.
         meta["resumed_from_status"] = prior_status
         prior_reason_code = meta.get("reason_code")
+        # Captured before the archive loop below pops it into `resumed_from_reason_detail`;
+        # the dev validate.execute deriver routes on the failure_category it carries.
+        prior_reason_detail = meta.get("reason_detail")
         for live_field, archive_field in (
             ("reason_code", "resumed_from_reason_code"),
             ("reason_detail", "resumed_from_reason_detail"),
@@ -10992,6 +11202,17 @@ def enable_checkpoint_resume(
                 repo_root,
                 orchestration_id,
                 prior_reason_code if isinstance(prior_reason_code, str) else None,
+            )
+        # When a dev run fail_closed on the F1 cross-phase guard because validate.execute
+        # failed a STRUCTURAL gate, point the resumed conductor at a Generate reopen and carry
+        # the gate's violation text as repair findings — otherwise the resume skips the
+        # checkpointed Generate/Build and re-runs the same binary into the same failure.
+        if directive is None:
+            directive = _derive_dev_validate_execute_resume_directive(
+                repo_root,
+                orchestration_id,
+                prior_reason_code if isinstance(prior_reason_code, str) else None,
+                prior_reason_detail if isinstance(prior_reason_detail, str) else None,
             )
         if directive is not None:
             meta["resume_directive"] = directive

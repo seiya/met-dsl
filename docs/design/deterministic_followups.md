@@ -1556,3 +1556,68 @@ runtime-error branch writing no trial_meta and the stale-trial_meta guard, the p
 reopen with `refs` still naming the failed run, `warm_resume` + emptied must-read on the repair launch)
 and the dev fail_closed detail. The route fires only on a real structural execute failure, so its live
 exercise is opportunistic; B2 (dev `--resume` → generate + findings injection) follows.
+
+## B2 — dev `--resume` after a structural `Validate.execute` failure (IMPLEMENTED 2026-07-09)
+
+Canonical plan: `~/.claude/plans/floofy-cuddling-octopus.md` (Part B / B2). In dev, B1's
+`("generate", "reuse")` route is a cross-phase backward rollback, so the F1 guard fail_closes it as
+`dev_phase_rollback` on the first occurrence. The operator's `--resume` then skipped the checkpointed
+`Compile` / `Generate` / `Build` phases and re-ran `Validate` against the **same binary**, so the
+deterministic gate failed identically — a deadlock the operator could only escape with a fresh full
+run. B2 makes that resume reopen `Generate` and hand it the violation text, i.e. the operator-initiated
+equivalent of prod's automatic B1 retry. **F1 itself is unchanged**: an in-run automatic rollback still
+fail_closes; the directive fires only on `--resume`.
+
+1. **Deriver.** `_derive_dev_validate_execute_resume_directive` (`tools/orchestration_runtime.py`) gates
+   on `reason_code == "dev_phase_rollback"` **and** a `reason_detail` of `validate_execute_<category>`
+   whose **category suffix** is one of B1's reuse-routed keys — never the prefix alone, so the
+   cold-restart `validate_execute_fail` and the per-test predicate reasons keep the plain resume. The
+   trigger and `node_key` come from `failure_analysis.json#failed_agent_run` (fallback: the newest
+   non-pass `steps/*/validate/*/step_result.json#failed_substeps[-1]`), re-validated against
+   `agent_runs.jsonl` as a terminal non-pass `validate.execute` substep that a prior reopen has **not**
+   already superseded — the same record `reopen_phase` will accept as a trigger, and a consumed one
+   would make it a `noop` (reopening nothing while the conductor skips the still-checkpointed Generate
+   and drops the repair). The findings are the failed run's `trial_meta.json#failure_excerpt`, whose
+   path is recovered from that run's `launches/<arid>.request.json#allowed_output_paths` (the run node
+   dir is not derivable from the orchestration root); the fallback is the `[execute fail]` block of
+   `agents/<arid>/dialogs/deterministic.stderr.log`, bounded to 4000 characters. **Nothing new is
+   persisted** — the directive is a derived cache on `meta["resume_directive"]`, like the two derivers
+   beside it. `cmd_init --resume-from-checkpoint` wires it third in the `terminal_reset` chain (after
+   the `_ir` and unauthorized-write derivers), capturing `reason_detail` before the archive loop moves
+   it to `resumed_from_reason_detail`; a resume whose terminal failure does not match drops the stale
+   directive, as before.
+2. **Consumer.** `Conductor._consume_resume_directive`, called at the top of `conduct()`, is the
+   **first consumer** of `resume_directive` (the earlier two are honored by the operator/agent
+   following `RUNBOOK.md` §3-1). It acts only on `source == "dev_validate_execute_structural"` with a
+   matching `node_key` and `generate` in scope. The producer arid is recovered from the checkpointed
+   step_result **before** `reopen_phase`, which drops the entry it is read from. It then calls
+   `reopen_phase(from_phase="generate", trigger_arid=<failed execute arid>)` — the anti-abuse gate
+   accepts it because the trigger is a recorded terminal non-pass substep strictly downstream of
+   `generate` — and returns a `pending_repair["generate"]` of
+   `{issue_severity: major, repair_strategy: reuse, repair_target_agent_run_id: <producer>,
+   repair_reason: validate_execute_structural_resume, repair_findings: <excerpt>}` for `conduct` to
+   merge. A `Generate` that is **not** checkpointed-complete is a no-op (the plain resume re-runs it
+   anyway, and reopening would archive the in-progress attempt); a rejected reopen emits
+   `resume_directive_reopen_failed` and degrades to the plain resume rather than crashing; a `noop`
+   reopen — the superseded-trigger case the deriver already rejects — seeds no repair, so a dropped
+   repair can never masquerade as an applied one.
+3. **No new channel.** The repair payload flows through the existing G1-slim mechanism exactly as B1's
+   does: `run_phase(repair=...)` → `_resolve_reuse_resume` warm-`--resume`s the `generate.generate`
+   producer → the slim prompt renders the findings inside its untrusted fence. A garbage-collected
+   session degrades to the cold full prompt (findings dropped), as every other `reuse` repair does.
+4. **Cross-module literals.** `_DEV_VALIDATE_EXECUTE_REUSE_CATEGORIES` /
+   `_DEV_VALIDATE_EXECUTE_REASON_PREFIX` / `_DEV_RESUME_FINDINGS_MAX_CHARS` duplicate the conductor's
+   `VALIDATE_EXECUTE_FAILURE_ROUTING` / `VALIDATE_EXECUTE_REASON_PREFIX` / `_EXECUTE_EXCERPT_MAX_CHARS`
+   because `workflow_conductor` imports `orchestration_runtime` and the dependency cannot be inverted.
+   A parity test pins the copies, following the `SLIM_REPAIR_FINDINGS_HEADER` precedent.
+
+Unit suite green (2212), including: the deriver's reason/category gate (each non-firing reason and each
+firing category), a passing execute run and a superseded one rejected as triggers, both fallbacks
+(step_result → trigger, stderr log → findings), the 4000-character bound, the directive-without-findings
+reopen, the `cmd_init` set/drop integration, the routing-table parity, and — conductor-side — the reopen
+call with its repair payload, the four no-op gates (wrong source / wrong node / no trigger / `generate`
+out of scope), the incomplete-`Generate` no-op, the `noop`-reopen no-op, and the reopen-exception
+degradation. Like B1 the route fires only on a
+real structural execute failure, so a billed E2E exercises it only opportunistically: when E2E #4 passes
+on the clarified spec (Part A) the directive never fires, and when it fails structurally B2 replaces the
+deadlock.

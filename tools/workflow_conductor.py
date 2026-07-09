@@ -4430,6 +4430,74 @@ clean:
             return RouteDecision("escalate", reason=f"{phase}_fail_unclassified")
         return classify_verify_severity(sev, self.workflow_mode)
 
+    def _consume_resume_directive(self, refs: NodeRefs,
+                                  phases: list[str]) -> dict[str, dict[str, str]]:
+        """Act on a `resume_directive` left in orchestration_meta.json by the resume
+        (`cmd_init --resume-from-checkpoint`), returning the `pending_repair` it seeds.
+
+        Only the dev structural-validate.execute directive
+        (`_derive_dev_validate_execute_resume_directive`) is honored: in dev, F1 fail_closes
+        such a failure as `dev_phase_rollback` instead of retrying, and a plain `--resume`
+        would skip the checkpointed Generate/Build and re-run the identical binary into the
+        identical deterministic gate failure. Reopening Generate here — with the gate's own
+        violation text as warm repair findings — is the operator-initiated equivalent of the
+        `("generate","reuse")` route prod takes automatically (B1). F1 is unchanged: an
+        in-run automatic rollback still fail_closes.
+
+        The producer arid is recovered BEFORE `reopen_phase`, which drops the checkpoint entry
+        it is read from. A reopen failure degrades to a plain resume (no repair seeded) rather
+        than crashing the run; the phases then simply re-run cold from Generate.
+        """
+        from tools.orchestration_runtime import DEV_VALIDATE_EXECUTE_RESUME_SOURCE
+
+        meta = _read_json(self.repo_root / "workspace" / "orchestrations"
+                          / self.orchestration_id / "orchestration_meta.json") or {}
+        directive = meta.get("resume_directive")
+        if not isinstance(directive, dict):
+            return {}
+        if directive.get("source") != DEV_VALIDATE_EXECUTE_RESUME_SOURCE:
+            return {}
+        if str(directive.get("node_key") or "").strip() != refs.node_key:
+            return {}
+        if str(directive.get("reopen_from") or "").strip() != "generate" or "generate" not in phases:
+            return {}
+        trigger = str(directive.get("trigger_agent_run_id") or "").strip()
+        if not trigger:
+            return {}
+        # A Generate that is NOT checkpointed-complete will be re-run by the plain resume
+        # anyway, and reopening it would archive the in-progress attempt. Nothing to do.
+        completed = self.check_step_completed(refs.node_key, "generate")
+        if completed is None:
+            return {}
+        producer = self._completed_producer_arid(
+            refs.node_key, "generate", completed.get("agent_run_id"))
+        try:
+            result = self.reopen_phase(refs.node_key, from_phase="generate", trigger_arid=trigger,
+                                       reason="dev_resume_validate_execute_structural")
+        except Exception as exc:  # noqa: BLE001 - degrade to a plain resume
+            self.emit("resume_directive_reopen_failed", node_key=refs.node_key,
+                      detail=str(exc)[:200])
+            return {}
+        # A `noop` means a prior reopen already consumed this trigger, so Generate was NOT
+        # reopened and stays checkpointed — run_phase would skip it and silently drop the repair.
+        # The deriver already rejects superseded triggers; this is the second guard.
+        if str(result.get("status") or "").strip() == "noop":
+            self.emit("resume_directive_reopen_noop", node_key=refs.node_key, trigger=trigger)
+            return {}
+        payload: dict[str, str] = {
+            "issue_severity": "major",
+            "repair_strategy": "reuse",
+            "repair_target_agent_run_id": producer or "none",
+            "repair_reason": "validate_execute_structural_resume",
+        }
+        findings = directive.get("repair_findings")
+        if isinstance(findings, str) and findings.strip():
+            payload["repair_findings"] = findings.strip()
+        self.emit("resume_directive_consumed", node_key=refs.node_key, phase="generate",
+                  failure_category=str(directive.get("failure_category") or ""),
+                  findings=bool(payload.get("repair_findings")))
+        return {"generate": payload}
+
     def conduct(self, refs: NodeRefs, until_phase: str) -> str:
         """Drive the phases, acting on each phase's cross-phase routing decision:
         reopen an upstream (already-passed) phase, fail_closed, or escalate. The
@@ -4437,6 +4505,9 @@ clean:
         phases = phases_through(until_phase)
         attempts: dict[str, int] = {p: 0 for p in phases}
         pending_repair: dict[str, dict[str, str]] = {}
+        # A resume may carry a directive to reopen an already-passed phase and repair it with
+        # the findings of the failure that terminalized the prior run (dev F1 deadlock break).
+        pending_repair.update(self._consume_resume_directive(refs, phases))
         idx = 0
         while idx < len(phases):
             phase = phases[idx]

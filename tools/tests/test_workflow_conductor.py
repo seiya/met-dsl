@@ -17,6 +17,7 @@ import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
 
+import tools.orchestration_runtime as wc_runtime
 import tools.workflow_conductor as wc
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -746,6 +747,187 @@ class ConductHappyPathTest(unittest.TestCase):
         # only the first phase (compile) should have been attempted
         steps = [cap.get("--step") for s, cap in c.calls if s == "write-step-result"]
         self.assertEqual(steps, ["compile"])
+
+
+class ConsumeResumeDirectiveTest(unittest.TestCase):
+    """B2: `conduct` honors the dev structural-validate.execute `resume_directive` by
+    reopening Generate and seeding a warm repair carrying the gate's findings."""
+
+    NODE_KEY = "component/spec_x@0.1.0"
+    OID = "orch_resume"
+    TRIGGER = "validate-exec-fail-1"
+    PRODUCER = "generate-sub-1"
+    FINDINGS = "[execute fail]\npost_execute: missing required_raw_variables {'a1'}"
+
+    def _refs(self) -> wc.NodeRefs:
+        return wc.NodeRefs(
+            node_key=self.NODE_KEY, spec_path="spec/component/spec_x",
+            ir_id="x_20260101_001", pipeline_id="x_20260101_001",
+            source_id="src_20260101_001", binary_id="bin_20260101_001",
+            run_id="run_20260101_001", source_binary_id="bin_20260101_001",
+        )
+
+    def _conductor(self, repo_root: Path, directive: dict | None, *,
+                   generate_completed: bool = True,
+                   reopen_raises: bool = False,
+                   reopen_noop: bool = False) -> _FakeConductor:
+        root = repo_root / "workspace" / "orchestrations" / self.OID
+        root.mkdir(parents=True, exist_ok=True)
+        meta: dict = {"orchestration_id": self.OID}
+        if directive is not None:
+            meta["resume_directive"] = directive
+        (root / "orchestration_meta.json").write_text(json.dumps(meta), encoding="utf-8")
+        sr = root / "steps" / wc.node_key_safe(self.NODE_KEY) / "generate" / "ORCH"
+        sr.mkdir(parents=True, exist_ok=True)
+        (sr / "step_result.json").write_text(
+            json.dumps({"status": "pass", "executor_agent_run_id": "ORCH",
+                        "substep_agent_run_ids": [self.PRODUCER, "generate-sub-2"]}),
+            encoding="utf-8")
+
+        class _C(_FakeConductor):
+            def runtime(self, args):  # type: ignore[override]
+                if args[0] == "check-step-completed":
+                    if not generate_completed and "generate" in args:
+                        return {}
+                    return {"integrity": "ok", "agent_run_id": "ORCH"}
+                if args[0] == "reopen-phase":
+                    if reopen_raises:
+                        raise RuntimeError("reopen-phase: trigger not found")
+                    if reopen_noop:
+                        super().runtime(args)  # still record the call
+                        return {"status": "noop"}
+                return super().runtime(args)
+
+        c = _C(repo_root=repo_root, orchestration_id=self.OID,
+               orchestration_agent_run_id="ORCH", backend="claude", env={})
+        c.calls = []
+        return c
+
+    def _directive(self, **over) -> dict:
+        base = {
+            "reopen_from": "generate",
+            "node_key": self.NODE_KEY,
+            "trigger_agent_run_id": self.TRIGGER,
+            "reason_code": "dev_phase_rollback",
+            "failure_category": "post_execute_violation",
+            "source": wc_runtime.DEV_VALIDATE_EXECUTE_RESUME_SOURCE,
+            "repair_findings": self.FINDINGS,
+        }
+        base.update(over)
+        return base
+
+    def test_directive_reopens_generate_and_seeds_warm_repair(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            c = self._conductor(repo_root, self._directive())
+            repair = c._consume_resume_directive(self._refs(), ["compile", "generate",
+                                                               "build", "validate"])
+            reopens = [cap for s, cap in c.calls if s == "reopen-phase"]
+            self.assertEqual(len(reopens), 1)
+            self.assertEqual(reopens[0]["--from-phase"], "generate")
+            self.assertEqual(reopens[0]["--trigger-agent-run-id"], self.TRIGGER)
+            self.assertEqual(reopens[0]["--reason"], "dev_resume_validate_execute_structural")
+            self.assertEqual(repair, {"generate": {
+                "issue_severity": "major",
+                "repair_strategy": "reuse",
+                # recovered from the checkpointed step_result BEFORE reopen dropped it
+                "repair_target_agent_run_id": self.PRODUCER,
+                "repair_reason": "validate_execute_structural_resume",
+                "repair_findings": self.FINDINGS,
+            }})
+
+    def test_no_directive_is_a_noop(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            for directive in (None,
+                              self._directive(source="failure_analysis.original_finding"),
+                              self._directive(node_key="component/other@0.1.0"),
+                              self._directive(trigger_agent_run_id=""),
+                              self._directive(reopen_from="compile")):
+                c = self._conductor(repo_root, directive)
+                self.assertEqual(
+                    c._consume_resume_directive(self._refs(),
+                                                ["compile", "generate", "build", "validate"]),
+                    {})
+                self.assertEqual([s for s, _ in c.calls if s == "reopen-phase"], [])
+
+    def test_generate_out_of_scope_is_a_noop(self) -> None:
+        """A `--until compile` run never reaches Generate; nothing to reopen."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            c = self._conductor(repo_root, self._directive())
+            self.assertEqual(c._consume_resume_directive(self._refs(), ["compile"]), {})
+            self.assertEqual([s for s, _ in c.calls if s == "reopen-phase"], [])
+
+    def test_incomplete_generate_is_a_noop(self) -> None:
+        """Generate is not checkpointed (a prior reopen already dropped it): the plain
+        resume re-runs it, and reopening would archive the in-progress attempt."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            c = self._conductor(repo_root, self._directive(), generate_completed=False)
+            self.assertEqual(
+                c._consume_resume_directive(self._refs(),
+                                            ["compile", "generate", "build", "validate"]),
+                {})
+            self.assertEqual([s for s, _ in c.calls if s == "reopen-phase"], [])
+
+    def test_reopen_failure_degrades_to_plain_resume(self) -> None:
+        """A rejected reopen must not crash the run and must not seed a repair."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            c = self._conductor(repo_root, self._directive(), reopen_raises=True)
+            self.assertEqual(
+                c._consume_resume_directive(self._refs(),
+                                            ["compile", "generate", "build", "validate"]),
+                {})
+
+    def test_reopen_noop_seeds_no_repair(self) -> None:
+        """A trigger a prior reopen already consumed leaves Generate checkpointed, so
+        run_phase would skip it — seeding a repair there would drop it silently."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            c = self._conductor(repo_root, self._directive(), reopen_noop=True)
+            self.assertEqual(
+                c._consume_resume_directive(self._refs(),
+                                            ["compile", "generate", "build", "validate"]),
+                {})
+
+    def test_missing_findings_still_reopens(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            d = self._directive()
+            d.pop("repair_findings")
+            c = self._conductor(repo_root, d)
+            repair = c._consume_resume_directive(self._refs(), ["compile", "generate",
+                                                                "build", "validate"])
+            self.assertNotIn("repair_findings", repair["generate"])
+            self.assertEqual(repair["generate"]["repair_strategy"], "reuse")
+
+    def test_conduct_repairs_generate_from_the_directive(self) -> None:
+        """End-to-end at the conduct level: the reopened Generate's producer substep is
+        launched with the warm repair payload (findings in the request)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            c = self._conductor(repo_root, self._directive())
+            # Generate is reopened by the directive; every phase then passes. The fake's
+            # check-step-completed reports "completed" for every phase, so only the reopened
+            # Generate is re-run... which the fake cannot model. Assert on the payload the
+            # conductor hands run_phase instead.
+            captured: list = []
+            orig = c.run_phase
+
+            def _run_phase(refs, phase, repair=None):
+                captured.append((phase, repair))
+                return wc.PhaseOutcome(phase, "pass", decision=wc.RouteDecision("advance"),
+                                       skipped=True)
+
+            c.run_phase = _run_phase  # type: ignore[assignment]
+            self.assertEqual(c.conduct(self._refs(), "validate"), "pass")
+            del orig
+            repairs = {phase: rep for phase, rep in captured if rep}
+            self.assertEqual(list(repairs), ["generate"])
+            self.assertEqual(repairs["generate"]["repair_findings"], self.FINDINGS)
+            self.assertEqual(repairs["generate"]["repair_target_agent_run_id"], self.PRODUCER)
 
 
 class ConductRoutingTest(unittest.TestCase):
