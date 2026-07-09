@@ -9091,15 +9091,17 @@ def _validate_harness_render_preconditions(
     EXCLUDED (by ``ir_content_violations``, via ``RenderError.identity``): node-identity defects
     a re-author cannot repair — the spec_id / derived-name length and >1 infra dep. These are
     NOT hoisted here (routing an unrepairable defect to a warm-resume retry would only spin).
-    The spec_id-length case is a KNOWN residual: no earlier phase gate bounds spec_id length
-    today (Generate's model-name check only fires at >63 for ``<spec_id>_model``), so a spec_id
-    over 55 chars still fail-closes at the render backstop (a workflow-kill); the derived
-    ``<spec_id>_runner``/``_checks`` names (spec_id + 7) additionally breach the f2008 63-char
-    limit at spec_id ≥ 57. This is NOT hypothetical: the catalog already holds a 61-char spec_id
-    (``dynamics_advection_diffusion_profile_1d_upwind_center2_euler1``) — harmless only because
-    it is not harness-backed today. Bounding spec_id ≤ 55 at spec-input is therefore a
-    PREREQUISITE for M3d's mass opt-in of physics nodes to the harness (tracked in the M3c/M3d
-    plan), not a low-likelihood edge.
+    Neither identity defect can reach the render backstop from a live run. M3d bounds spec_id
+    length at SPEC-INPUT, before any phase runs: ``runner_renderer.spec_id_length_violation`` is
+    the canonical capture point, enforced unconditionally by ``resolve_node`` (workflow_conductor)
+    and mirrored over the whole closure by run_workflow's dependency visit — so a spec_id over 55
+    is an early, clear rejection rather than a late workflow-kill, and the derived
+    ``<spec_id>_runner``/``_checks``/``_model`` names (spec_id + 7) stay inside the f2008 63-char
+    limit. A node declaring >1 infrastructure dep is not M3c (``_conductor_authors_runner``
+    requires exactly one), so its runner is never host-rendered. The renderer keeps both as
+    defense-in-depth backstops. The catalog's one remaining over-length spec_id (an
+    ``advection_diffusion`` profile node) is therefore blocked at spec-input and must be renamed
+    before that node runs again.
 
     No-op only when the node is not M3c (legacy leaf-authored runner)."""
     derived_path = ir_dir / "spec.ir.yaml"

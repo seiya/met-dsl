@@ -99,6 +99,18 @@ Pinned widths (the rendered runner declares matching actuals, so they must
 match): `check_ids` is `character(len=32)`, `status` is `character(len=4)`.
 `reason_na` is a deferred-length allocatable (`character(len=:), allocatable`).
 
+The ten names must be published from `module <spec_id>_checks` **itself**. The
+`Generate.static` gate (`_validate_checks_source_files`) resolves the published set
+from that module alone: the names its `public` statements list, plus — only while
+the module keeps Fortran's default public accessibility — the procedures the module
+**defines at module level**, minus the names any `private`
+statement hides. Authoring the three `public ::` lines above verbatim, in the
+specification part (never inside a procedure body), satisfies the gate under either
+accessibility default; a bare module-level `private` without them publishes nothing
+and fails. Where the fallback applies, a name that is only prototyped in an
+`interface` block, defined as an internal procedure of another procedure, or defined
+in a submodule / a second module / after `end module` does not count as defined.
+
 ## 2. Semantics the harness relies on
 
 - **Snapshot getters return shape-valid values even for a rejected case.** A
@@ -125,6 +137,13 @@ match): `check_ids` is `character(len=32)`, `status` is `character(len=4)`.
   (a convergence/resolution sweep needing evidence from *every* targeted case) is an
   R3 test-kind not yet served by the renderer — do not author such a test on an M3c
   node until R3 extends the metrics-basis shape.
+- **Metrics-basis values must not be uniformly zero.** The harness fills
+  `raw/metrics_basis.json` from the values the snapshot getters return for each
+  test's `required_raw_variables`, so those getters must return the values the run
+  computed. The zeros a rejected guard case returns are admissible only alongside
+  cases that return real values; a metrics_basis zero-filled across the whole run
+  fails `post_execute` (`trivial placeholder detected`). The exact rejection
+  condition is canonical in `RUNNER_OUTPUT_CONTRACT.md` §3.
 
 ## 3. Module-level state is expected
 

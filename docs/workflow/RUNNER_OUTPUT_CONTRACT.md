@@ -81,6 +81,10 @@ source; do not uniformly require a fixed minimal composition.
   `test_id` must not overwrite each other.
   - Correct: `{"test_id":"l0_emit_pass","a1":[0.5,1.5],"max_abs_deviation":0.0}`
   - Wrong: `{"test_id":"l0_emit_pass","values":{"a1":[0.5,1.5],"max_abs_deviation":0.0}}` → `post_execute` fails with "missing required_raw_variables", naming the unrecognized wrapper key.
+  - **Never a zero-filled skeleton.** `post_execute` also rejects a file whose nested
+    numeric leaves (booleans excluded) are **all** `0` or `null`:
+    `all numeric fields are zero or null (trivial placeholder detected)`. Emit the
+    values the run computed.
 - **`raw/state_snapshots/<case_id>.json`** — when `state_snapshots` is required,
   the runner writes **exactly one snapshot per case**, named from the `case_id`
   it receives on argv (`--cases <spec.ir.yaml> <case_id>...`, one positional per
@@ -105,6 +109,12 @@ source; do not uniformly require a fixed minimal composition.
   required variable.
   - Correct (rejected length-0 guard case): `{"case_id":"l0_invalid_length_xfail","step":0,"n":0,"x":[],"invalid_rejected":true}` — required `x` present as `[]` (1-D, extent 0).
   - Wrong: `{"case_id":"l0_invalid_length_xfail","step":0,"invalid_rejected":true}` — drops the required `x` (and any other required var) → `post_execute` fails with "declared state_variables missing".
+  - **No placeholder text.** `post_execute` scans every file under
+    `raw/state_snapshots/` (`snapshot_schema.json` included), spaces and newlines
+    removed, for `"dummy"` / `"placeholder"` / `"sample": "state_recorded"`; a hit
+    fails (`placeholder content detected`). Each pattern carries its own quotes, so
+    the fail condition is a key or string value exactly `dummy` or `placeholder`, or
+    a `sample` field valued `state_recorded` — anywhere in the file.
 
   When `required_evidence` does not declare `state_snapshots` as required,
   `raw/state_snapshots/` must not be required.

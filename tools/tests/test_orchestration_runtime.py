@@ -25582,12 +25582,23 @@ class ChildContextDocSizeTests(unittest.TestCase):
         # sibling keys of test_id, never wrapped under `values`) plus a correct/wrong pair.
         # The rule lived only in gate code before, and a runner-authoring leaf that wrapped the
         # evidence under `values` failed post_execute with no doc to correct it against.
-        "docs/workflow/RUNNER_OUTPUT_CONTRACT.md": 9600,
+        # Bumped 9600->10400: two more post_execute rules that lived only in gate code —
+        # `_validate_metrics_basis_not_trivial` (an all-zero/all-null metrics_basis is rejected)
+        # and the `raw/state_snapshots/` placeholder-text scan ("dummy" / "placeholder" /
+        # "sample": "state_recorded"). A leaf could not correct against an undocumented gate.
+        "docs/workflow/RUNNER_OUTPUT_CONTRACT.md": 10400,
         # R1/M3c-β: the fixed-ABI contract for a physics node's `<spec_id>_checks.f90`
         # (leaf-authored callbacks the host-rendered runner drives). Leaf must-read for
         # every generate LLM leaf (its SKILL branches on whether the node is M3c).
         # 8300->8500: metrics-basis first-target-case scope note (review round 2).
-        "docs/workflow/CHECKS_MODULE_CONTRACT.md": 8500,
+        # Bumped 8500->9900: (a) how `_validate_checks_source_files` resolves the published ABI
+        # set (the module's own `public` statements, plus module-level definitions only while the
+        # default accessibility is public, minus `private`) — a bare module-level `private`
+        # without the three `public ::` lines publishes nothing and failed the gate silently;
+        # (b) §2 gains the `_validate_metrics_basis_not_trivial` rule, because the harness fills
+        # metrics_basis.json from THIS module's getters yet an M3c leaf never reads
+        # RUNNER_OUTPUT_CONTRACT.md (its scope note excludes it), so §3's copy was unreachable.
+        "docs/workflow/CHECKS_MODULE_CONTRACT.md": 9900,
         # Still force-read by compile.generate/verify (its IR schema is the contract
         # the compile SKILL defers to).
         # Bumped 17000->18200: documented the deterministic Compile.static substep (G2,
@@ -25615,7 +25626,12 @@ class ChildContextDocSizeTests(unittest.TestCase):
         # canonical interface block cross-check, the IR `public_api.signatures` block (Compile
         # transcribes §5.1 into it because Generate.generate is walled off from controlled_spec),
         # and that the signature bodies are pinned against the generated source at Generate.static.
-        "docs/workflow/phases/phase_01_compile.md": 28200,
+        # Bumped 28200->30600: the `_validate_harness_render_preconditions` rules an M3c
+        # node's host-rendered runner imposes on the IR (time_variable `t`, reserved snapshot
+        # keys, shape_expr form/rank, verdict.fields, distinct case_id, one target case per
+        # test_id, embeddable names) + the excluded node-identity ones. Undocumented, these
+        # surfaced only as a render fail_closed that kills the workflow (E2E #3, orch …dcf0533e).
+        "docs/workflow/phases/phase_01_compile.md": 30600,
         # Per-substep SKILLs — each force-read by its own LLM leaf.
         # Bumped 10800->11500: Compile.generate now authors the io_contract section (G2 /
         # docs/design/deterministic_followups.md) — it was moved here from Compile.verify so the
@@ -25640,7 +25656,10 @@ class ChildContextDocSizeTests(unittest.TestCase):
         # Bumped 15600->16700: R1/M3c-β — an infrastructure direct_dep carries operations:[]
         # + the harness-id consistency pin (harness_<lang>_<class>), and the predicate bullet
         # gains the harness fold-alignment note (per-case verdict fold + xfail exclusion).
-        "skills/workflow-compile-generate/SKILL.md": 16700,
+        # Bumped 16700->17000: the time_variable rule now points at the canonical harness
+        # render-precondition list in phase_01 (a force-read doc for this leaf) instead of
+        # restating a hand-maintained subset here, which could drift from the renderer.
+        "skills/workflow-compile-generate/SKILL.md": 17000,
         # Bumped 11800->12100: G7 — compile.verify checks V4c only (operations ⊆ published); the
         # closure/topo consistency is conductor-authored + gate-checked, no longer LLM-verified (G7).
         # Bumped 12100->13100: R2 (G8) — compile.verify owns the SEMANTIC test_predicates fidelity
