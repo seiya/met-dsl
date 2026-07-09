@@ -914,6 +914,305 @@ class LegacyLaunchPromptMarkerTests(unittest.TestCase):
         self.assertEqual(missing_en, [], f"english prompt rejected: {missing_en}")
 
 
+def _seed_metrics_basis_per_test_tree(repo_root: Path, metrics_basis: object) -> None:
+    """Seed a tree whose contract demands raw variables `h` and `time` for `test_a`."""
+    _seed_shape_expr_schema_into(repo_root)
+    tests_path = (
+        repo_root
+        / "spec"
+        / "problem"
+        / "mock_domain"
+        / "mock_family"
+        / "mock_spec"
+        / "tests.md"
+    )
+    tests_path.parent.mkdir(parents=True, exist_ok=True)
+    tests_path.write_text(
+        "## 7. Test definitions\n### 7-1. `test_a`\n",
+        encoding="utf-8",
+    )
+    model_text = """module shallow_water2d_model
+use dynamics_shallow_water_flux_2d_rusanov_p0_model
+implicit none
+contains
+subroutine solve(flag)
+  logical, intent(out) :: flag
+  call dynamics_shallow_water_flux_2d_rusanov_p0__compute_flux(flag)
+end subroutine solve
+end module shallow_water2d_model
+"""
+    runner_text = """program shallow_water2d_runner
+implicit none
+write(*,*) 'ok'
+end program shallow_water2d_runner
+"""
+    _create_minimal_execution_tree(
+        repo_root,
+        dep_spec_id="dynamics_shallow_water_flux_2d_rusanov_p0",
+        model_text=model_text,
+        runner_text=runner_text,
+        run_command=["./simulate", "workspace/spec.ir.yaml", "workspace/outdir"],
+        io_contract={
+            "source": {"tests": "spec/problem/mock_domain/mock_family/mock_spec/tests.md"},
+            "inputs": [{"name": "case_resolved", "source": "spec.ir.yaml"}],
+            "outputs": [
+                {
+                    "name": "metric",
+                    "shape_expr": "scalar",
+                    "evidence_ref": "raw/metrics_basis.json",
+                    "raw_variables": ["h", "time"],
+                }
+            ],
+            "semantic_dependency": {"required_sources": []},
+            "raw_requirements": {
+                "required_evidence": [
+                    {"artifact": "metrics_basis.json", "required": True},
+                    {"artifact": "execution_trace.json", "required": True},
+                    {
+                        "artifact": "state_snapshots",
+                        "required": True,
+                        "min_samples": 1,
+                        "schema": {
+                            "variables": [{"name": "h", "shape_expr": "[2,2]"}],
+                            "time_variable": "time",
+                            "time_shape_expr": "scalar",
+                        },
+                    },
+                ]
+            },
+            "test_evidence_requirements": [
+                {
+                    "test_id": "test_a",
+                    "required_raw_variables": ["h", "time"],
+                }
+            ],
+        },
+        metrics_basis=metrics_basis,
+    )
+
+
+class MetricsBasisWrapperGuidanceTests(unittest.TestCase):
+    """The `values`-wrapper repair guidance appended to the missing-variable violation.
+
+    Acceptance must not move: only the message text changes.
+
+    The `stay_accepted` cases assert an absence, so they would pass vacuously if
+    the fixture ever stopped reaching this gate. `test_values_wrapper_...` seeds
+    the same tree and asserts the violation *is* raised, so a fixture that fails
+    to reach the gate fails there loudly rather than silently greening these.
+    """
+
+    _MISSING_PREFIX = (
+        "metrics_basis.json: test_id test_a missing required_raw_variables"
+    )
+
+    def _violations_for(self, metrics_basis: object) -> list[str]:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            _seed_metrics_basis_per_test_tree(repo_root, metrics_basis)
+            return validate(repo_root=repo_root, workspace_root="workspace")
+
+    def test_values_wrapper_violation_names_the_wrapper_and_shows_sibling_form(self) -> None:
+        violations = self._violations_for(
+            {
+                "per_test": [
+                    {
+                        "test_id": "test_a",
+                        "values": {
+                            "h": [[1.0, 1.0], [1.0, 1.0]],
+                            "time": 0.5,
+                        },
+                    }
+                ]
+            }
+        )
+        matched = [v for v in violations if self._MISSING_PREFIX in v]
+        self.assertEqual(len(matched), 1, violations)
+        message = matched[0]
+        self.assertIn("missing required_raw_variables (['h', 'time'])", message)
+        self.assertIn("unrecognized wrapper key 'values'", message)
+        self.assertIn("direct sibling key of test_id", message)
+        self.assertIn('{"test_id": ..., "h": ...}', message)
+        self.assertIn("do not wrap them under 'values'", message)
+
+    def test_partial_coverage_message_claims_only_what_the_wrapper_holds(self) -> None:
+        violations = self._violations_for(
+            {
+                "per_test": [
+                    {
+                        "test_id": "test_a",
+                        "aa": {"h": [[1.0, 1.0], [1.0, 1.0]]},
+                        "zz": {"time": 0.5},
+                    }
+                ]
+            }
+        )
+        matched = [v for v in violations if self._MISSING_PREFIX in v]
+        self.assertEqual(len(matched), 1, violations)
+        message = matched[0]
+        self.assertIn("missing required_raw_variables (['h', 'time'])", message)
+        self.assertIn("the missing variables ['h'] are nested under", message)
+        self.assertIn("unrecognized wrapper key 'aa'", message)
+        self.assertIn('{"test_id": ..., "h": ...}', message)
+
+    def test_missing_variable_without_wrapper_keeps_the_bare_message(self) -> None:
+        violations = self._violations_for(
+            {
+                "per_test": [
+                    {
+                        "test_id": "test_a",
+                        "raw_variables": {"h": [[1.0, 1.0], [1.0, 1.0]]},
+                    }
+                ]
+            }
+        )
+        matched = [v for v in violations if self._MISSING_PREFIX in v]
+        self.assertEqual(len(matched), 1, violations)
+        self.assertTrue(matched[0].endswith("missing required_raw_variables (['time'])"))
+        self.assertNotIn("wrapper", matched[0])
+
+    def test_recognized_nesting_keys_stay_accepted(self) -> None:
+        for field_name in ("raw_variables", "variables", "evidence"):
+            with self.subTest(field_name=field_name):
+                violations = self._violations_for(
+                    {
+                        "per_test": [
+                            {
+                                "test_id": "test_a",
+                                field_name: {
+                                    "h": [[1.0, 1.0], [1.0, 1.0]],
+                                    "time": 0.5,
+                                },
+                            }
+                        ]
+                    }
+                )
+                self.assertEqual(
+                    [v for v in violations if self._MISSING_PREFIX in v], [], violations
+                )
+
+    def test_flat_sibling_entry_stays_accepted(self) -> None:
+        violations = self._violations_for(
+            {
+                "per_test": [
+                    {
+                        "test_id": "test_a",
+                        "h": [[1.0, 1.0], [1.0, 1.0]],
+                        "time": 0.5,
+                    }
+                ]
+            }
+        )
+        self.assertEqual(
+            [v for v in violations if self._MISSING_PREFIX in v], [], violations
+        )
+
+
+class MetricsBasisUnrecognizedWrapperUnitTests(unittest.TestCase):
+    def test_returns_none_when_no_dict_valued_key_holds_a_missing_variable(self) -> None:
+        entry = {"test_id": "t", "h": [1.0], "notes": {"h": "irrelevant"}}
+        self.assertIsNone(
+            vps._metrics_basis_unrecognized_wrapper(entry, ["time"], {"h", "time"})
+        )
+
+    def test_bookkeeping_keys_are_never_reported_as_wrappers(self) -> None:
+        entry = {"test_id": "t", "meta": {"time": 0.5}, "artifacts": {"time": 0.5}}
+        self.assertIsNone(
+            vps._metrics_basis_unrecognized_wrapper(entry, ["time"], {"time"})
+        )
+
+    def test_recognized_nesting_keys_are_never_reported_as_wrappers(self) -> None:
+        entry = {"test_id": "t", "raw_variables": {"h": 1.0}}
+        self.assertIsNone(
+            vps._metrics_basis_unrecognized_wrapper(entry, ["time"], {"h", "time"})
+        )
+
+    def test_shadowed_nesting_key_is_never_reported_as_a_wrapper(self) -> None:
+        """`evidence` is ignored by the reader only because `raw_variables` wins.
+
+        It is still a contract-recognized nesting name, so calling it
+        "unrecognized" would misdirect the repair turn.
+        """
+        entry = {
+            "test_id": "t",
+            "raw_variables": {"h": 1.0},
+            "evidence": {"time": 0.5},
+        }
+        self.assertIsNone(
+            vps._metrics_basis_unrecognized_wrapper(entry, ["time"], {"h", "time"})
+        )
+
+    def test_padded_nesting_key_is_reported_verbatim_because_the_reader_rejects_it(
+        self,
+    ) -> None:
+        """`_metrics_basis_variable_keys` matches nesting fields via exact `get()`.
+
+        A padded variant is therefore a real wrapper, not a recognized field, and
+        it must be reported with its padding intact — reporting the stripped name
+        would call the recognized nesting key "unrecognized".
+        """
+        entry = {"test_id": "t", " raw_variables ": {"h": 1.0, "time": 0.5}}
+        self.assertEqual(
+            vps._metrics_basis_unrecognized_wrapper(
+                entry, ["h", "time"], {"h", "time"}
+            ),
+            (" raw_variables ", ["h", "time"]),
+        )
+
+    def test_keys_differing_only_by_padding_resolve_deterministically(self) -> None:
+        forward = {"test_id": "t", "values": {"time": 0.5}, " values ": {"time": 0.5}}
+        reverse = {"test_id": "t", " values ": {"time": 0.5}, "values": {"time": 0.5}}
+        self.assertEqual(
+            vps._metrics_basis_unrecognized_wrapper(forward, ["time"], {"time"}),
+            vps._metrics_basis_unrecognized_wrapper(reverse, ["time"], {"time"}),
+        )
+
+    def test_dict_valued_contract_variable_is_not_named_as_its_own_wrapper(self) -> None:
+        """`h` is an accepted flat variable; only `time` is missing.
+
+        Naming `h` would tell the model not to wrap under a key it must emit.
+        """
+        entry = {"test_id": "t", "h": {"time": 0.5}}
+        self.assertEqual(vps._metrics_basis_variable_keys(entry), {"h"})
+        self.assertIsNone(
+            vps._metrics_basis_unrecognized_wrapper(entry, ["time"], {"h", "time"})
+        )
+
+    def test_reports_the_wrapper_covering_the_most_missing_variables(self) -> None:
+        entry = {
+            "test_id": "t",
+            "zz_payload": {"h": 1.0, "time": 0.5},
+            "aa_partial": {"h": 1.0},
+        }
+        self.assertEqual(
+            vps._metrics_basis_unrecognized_wrapper(entry, ["h", "time"], {"h", "time"}),
+            ("zz_payload", ["h", "time"]),
+        )
+
+    def test_reports_only_the_variables_the_winning_wrapper_actually_holds(self) -> None:
+        """Two wrappers, one variable each: the winner must not claim both."""
+        entry = {"test_id": "t", "aa": {"h": 1.0}, "zz": {"time": 0.5}}
+        self.assertEqual(
+            vps._metrics_basis_unrecognized_wrapper(entry, ["h", "time"], {"h", "time"}),
+            ("aa", ["h"]),
+        )
+
+    def test_equal_coverage_ties_break_lexicographically(self) -> None:
+        entry = {"test_id": "t", "zz": {"time": 0.5}, "aa": {"time": 0.5}}
+        self.assertEqual(
+            vps._metrics_basis_unrecognized_wrapper(entry, ["time"], {"time"}),
+            ("aa", ["time"]),
+        )
+
+    def test_tie_break_is_independent_of_insertion_order(self) -> None:
+        forward = {"test_id": "t", "aa": {"time": 0.5}, "zz": {"time": 0.5}}
+        reverse = {"test_id": "t", "zz": {"time": 0.5}, "aa": {"time": 0.5}}
+        self.assertEqual(
+            vps._metrics_basis_unrecognized_wrapper(forward, ["time"], {"time"}),
+            vps._metrics_basis_unrecognized_wrapper(reverse, ["time"], {"time"}),
+        )
+
+
 class ValidatePipelineSemanticsTests(unittest.TestCase):
     def test_rejects_noncanonical_workspace_root_argument(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -4983,81 +5282,9 @@ end program shallow_water2d_runner
     def test_detects_metrics_basis_missing_required_variable_in_per_test_entry(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
-            _seed_shape_expr_schema_into(repo_root)
-            tests_path = (
-                repo_root
-                / "spec"
-                / "problem"
-                / "mock_domain"
-                / "mock_family"
-                / "mock_spec"
-                / "tests.md"
-            )
-            tests_path.parent.mkdir(parents=True, exist_ok=True)
-            tests_path.write_text(
-                "## 7. Test definitions\n"
-                "### 7-1. `test_a`\n",
-                encoding="utf-8",
-            )
-            model_text = """module shallow_water2d_model
-use dynamics_shallow_water_flux_2d_rusanov_p0_model
-implicit none
-contains
-subroutine solve(flag)
-  logical, intent(out) :: flag
-  call dynamics_shallow_water_flux_2d_rusanov_p0__compute_flux(flag)
-end subroutine solve
-end module shallow_water2d_model
-"""
-            runner_text = """program shallow_water2d_runner
-implicit none
-write(*,*) 'ok'
-end program shallow_water2d_runner
-"""
-            _create_minimal_execution_tree(
+            _seed_metrics_basis_per_test_tree(
                 repo_root,
-                dep_spec_id="dynamics_shallow_water_flux_2d_rusanov_p0",
-                model_text=model_text,
-                runner_text=runner_text,
-                run_command=["./simulate", "workspace/spec.ir.yaml", "workspace/outdir"],
-                io_contract={
-                    "source": {"tests": "spec/problem/mock_domain/mock_family/mock_spec/tests.md"},
-                    "inputs": [{"name": "case_resolved", "source": "spec.ir.yaml"}],
-                        "outputs": [
-                            {
-                                "name": "metric",
-                                "shape_expr": "scalar",
-                                "evidence_ref": "raw/metrics_basis.json",
-                                "raw_variables": ["h", "time"],
-                            }
-                        ],
-                    "semantic_dependency": {"required_sources": []},
-                    "raw_requirements": {
-                        "required_evidence": [
-                            {"artifact": "metrics_basis.json", "required": True},
-                            {"artifact": "execution_trace.json", "required": True},
-                            {
-                                "artifact": "state_snapshots",
-                                "required": True,
-                                "min_samples": 1,
-                                "schema": {
-                                    "variables": [
-                                        {"name": "h", "shape_expr": "[2,2]"}
-                                    ],
-                                    "time_variable": "time",
-                                    "time_shape_expr": "scalar",
-                                },
-                            },
-                        ]
-                    },
-                    "test_evidence_requirements": [
-                        {
-                            "test_id": "test_a",
-                            "required_raw_variables": ["h", "time"],
-                        }
-                    ],
-                },
-                metrics_basis={
+                {
                     "per_test": [
                         {
                             "test_id": "test_a",

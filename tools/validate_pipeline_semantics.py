@@ -5021,17 +5021,10 @@ def _metrics_basis_entries(
     return entries, problems
 
 
-def _metrics_basis_variable_keys(entry: dict[str, Any]) -> set[str]:
-    for field_name in ("raw_variables", "variables", "evidence"):
-        raw_value = entry.get(field_name)
-        if isinstance(raw_value, dict):
-            return {
-                key.strip()
-                for key in raw_value
-                if isinstance(key, str) and key.strip()
-            }
+_METRICS_BASIS_NESTED_VARIABLE_FIELDS = ("raw_variables", "variables", "evidence")
 
-    ignored_keys = {
+_METRICS_BASIS_BOOKKEEPING_KEYS = frozenset(
+    {
         "test_id",
         "case_id",
         "case_ids",
@@ -5042,11 +5035,83 @@ def _metrics_basis_variable_keys(entry: dict[str, Any]) -> set[str]:
         "meta",
         "artifacts",
     }
+)
+
+
+def _metrics_basis_variable_keys(entry: dict[str, Any]) -> set[str]:
+    for field_name in _METRICS_BASIS_NESTED_VARIABLE_FIELDS:
+        raw_value = entry.get(field_name)
+        if isinstance(raw_value, dict):
+            return {
+                key.strip()
+                for key in raw_value
+                if isinstance(key, str) and key.strip()
+            }
+
     return {
         key.strip()
         for key in entry
-        if isinstance(key, str) and key.strip() and key not in ignored_keys
+        if isinstance(key, str)
+        and key.strip()
+        and key not in _METRICS_BASIS_BOOKKEEPING_KEYS
     }
+
+
+def _metrics_basis_unrecognized_wrapper(
+    entry: dict[str, Any],
+    missing_variables: list[str],
+    required_variables: set[str],
+) -> tuple[str, list[str]] | None:
+    """Name the wrapper key hiding `missing_variables` one level below `test_id`.
+
+    Returns the wrapper and the missing variables it actually holds, so the
+    caller can scope its claim: with two wrappers hiding one variable each,
+    naming only the winner and asserting it holds *the* missing variables
+    would be false.
+
+    Diagnostic only: the result feeds repair guidance, never a verdict, so the
+    keys accepted by `_metrics_basis_variable_keys` stay exactly as they were.
+    Ties are broken by coverage then lexically so the message is deterministic.
+
+    Key recognition mirrors `_metrics_basis_variable_keys` exactly: bookkeeping
+    and nesting fields are matched against the raw key, because that reader only
+    honours them unpadded. A padded `" raw_variables "` is therefore a wrapper
+    to both, and a contract variable is never named as the thing wrapping it.
+
+    The raw key is what gets reported, so padding stays visible in the message;
+    ordering uses the stripped form, which is the identity the reader compares.
+    """
+    wanted = set(missing_variables)
+    best: tuple[int, str, str, tuple[str, ...]] | None = None
+    for raw_key, value in entry.items():
+        if not isinstance(raw_key, str) or not isinstance(value, dict):
+            continue
+        if raw_key in _METRICS_BASIS_BOOKKEEPING_KEYS:
+            continue
+        if raw_key in _METRICS_BASIS_NESTED_VARIABLE_FIELDS:
+            continue
+        key = raw_key.strip()
+        if not key or key in required_variables:
+            continue
+        covered = tuple(
+            sorted(
+                {
+                    nested.strip()
+                    for nested in value
+                    if isinstance(nested, str) and nested.strip()
+                }
+                & wanted
+            )
+        )
+        if not covered:
+            continue
+        candidate = (len(covered), key, raw_key, covered)
+        if best is None or (
+            candidate[0] > best[0]
+            or (candidate[0] == best[0] and candidate[1:3] < best[1:3])
+        ):
+            best = candidate
+    return None if best is None else (best[2], list(best[3]))
 
 
 def _impl_language_from_plan_dir(repo_root: Path, ir_dir: Path) -> str | None:
@@ -6870,9 +6935,28 @@ def _validate_metrics_basis_per_test(
         variable_keys = _metrics_basis_variable_keys(entry)
         missing_variables = sorted(required_variables - variable_keys)
         if missing_variables:
-            violations.append(
+            message = (
                 f"{metrics_basis_path}: test_id {test_id} missing required_raw_variables ({missing_variables})"
             )
+            found = _metrics_basis_unrecognized_wrapper(
+                entry, missing_variables, required_variables
+            )
+            if found is not None:
+                wrapper, covered = found
+                # Naming the whole missing set would lie when a second wrapper
+                # holds the rest; only claim what this wrapper actually hides.
+                subject = (
+                    "the missing variables"
+                    if covered == missing_variables
+                    else f"the missing variables {covered}"
+                )
+                message += (
+                    f" — {subject} are nested under the unrecognized wrapper key '{wrapper}'; "
+                    "emit each required variable as a direct sibling key of test_id "
+                    f'(e.g. {{"test_id": ..., "{covered[0]}": ...}}); '
+                    f"do not wrap them under '{wrapper}'"
+                )
+            violations.append(message)
 
 
 def _component_dep_spec_ids(repo_root: Path, execution: NodeExecution) -> list[str]:
